@@ -1,0 +1,16 @@
+[package]
+name = "calibre_oxide"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+log = "0.4"
+env_logger = "0.10"
+calibre_utils = { path = "../crates/calibre_utils" }
+calibre_db = { path = "../crates/calibre_db" }
+calibre_ebooks = { path = "../crates/calibre_ebooks" }
+iced = { version = "0.12", features = ["debug", "image"] }
+
+[[bin]]
+name = "calibre_oxide"
+# path = "src/main.rs" # Standard layout

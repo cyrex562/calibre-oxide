@@ -1,0 +1,10 @@
+[package]
+name = "calibre_devices"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rusb = "0.9"
+thiserror = "1.0"
+anyhow = "1.0"
+log = "0.4"

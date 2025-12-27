@@ -1,0 +1,11 @@
+[package]
+name = "calibre_ebooks"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+calibre_utils = { path = "../calibre_utils" }
+roxmltree = "0.18"
+zip = "0.6"
+thiserror = "1.0"
+anyhow = "1.0"
