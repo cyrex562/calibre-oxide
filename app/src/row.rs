@@ -1,7 +1,7 @@
+use calibre_db::Book;
+use iced::widget::image; // Import module/function to avoid ambiguity in list
 use iced::widget::{button, column, row, text};
 use iced::{Element, Length};
-use iced::widget::image; // Import module/function to avoid ambiguity in list
-use calibre_db::Book;
 
 // Note: We need to know what Message to emit.
 // Ideally, `Message` in main.rs should have variants like `EditBook(i32)` and `DeleteBook(i32)`.
@@ -9,16 +9,21 @@ use calibre_db::Book;
 // The simplest way in Iced is to pass a function that creates the message.
 
 pub fn view<'a, Message>(
-    book: &Book, 
+    book: &Book,
     cover: Option<image::Handle>,
+    on_view: impl Fn(i32) -> Message + 'a,
     on_edit: impl Fn(i32) -> Message + 'a,
     on_delete: impl Fn(i32) -> Message + 'a,
-) -> Element<'a, Message> 
-where 
-    Message: Clone + 'a
+) -> Element<'a, Message>
+where
+    Message: Clone + 'a,
 {
     let title = text(&book.title).size(18);
-    let author = text(book.author_sort.as_deref().unwrap_or("Unknown")).size(14).style(iced::theme::Text::Color(iced::Color::from_rgb(0.5, 0.5, 0.5)));
+    let author = text(book.author_sort.as_deref().unwrap_or("Unknown"))
+        .size(14)
+        .style(iced::theme::Text::Color(iced::Color::from_rgb(
+            0.5, 0.5, 0.5,
+        )));
 
     let cover_image: Element<'a, Message> = if let Some(handle) = cover {
         image(handle)
@@ -38,19 +43,19 @@ where
     let details = column![title, author].spacing(5).width(Length::Fill);
 
     let actions = row![
+        button("View").on_press(on_view(book.id)).padding(5),
         button("Edit").on_press(on_edit(book.id)).padding(5),
-        button("Delete").on_press(on_delete(book.id)).padding(5).style(iced::theme::Button::Destructive),
-    ].spacing(10);
-
-    row![
-        cover_image,
-        details,
-        actions
+        button("Delete")
+            .on_press(on_delete(book.id))
+            .padding(5)
+            .style(iced::theme::Button::Destructive),
     ]
-    .spacing(10)
-    .padding(10)
-    .width(Length::Fill)
-    .align_items(iced::Alignment::Center)
-    .into()
-}
+    .spacing(10);
 
+    row![cover_image, details, actions]
+        .spacing(10)
+        .padding(10)
+        .width(Length::Fill)
+        .align_items(iced::Alignment::Center)
+        .into()
+}

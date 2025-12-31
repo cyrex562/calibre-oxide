@@ -9,14 +9,15 @@ This document outlines the remaining work required to make `calibre-oxide` a ful
     - [x] Implement `INSERT`, `UPDATE`, `DELETE` operations in `calibre_db`.
     - [x] Handle transaction safety and `metadata.db` schema consistency.
 - [/] **File Management**:
-    - [ ] Logic to move/rename book files on disk when metadata changes (Author/Title).
+    - [X] Logic to move/rename book files on disk when metadata changes (Author/Title).
     - [x] Logic to import new files (copy to library folder, create DB records).
 - [x] **Metadata Editing GUI**:
     - [x] Create an "Edit Metadata" dialog in Iced.
     - [x] Two-way binding between GUI forms and `calibre_db`.
 - [/] **Cover Management**:
     - [x] Render book covers in the `BookList` view (optimizing for performance).
-    - [ ] Support replacing/downloading cover images.
+    - [x] Support replacing cover images (from local file).
+    - [ ] Support downloading cover images (metadata fetching).
 
 ## Phase 6: Device Integration
 *Current Status: Not Started*

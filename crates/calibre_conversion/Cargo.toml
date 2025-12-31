@@ -1,0 +1,19 @@
+[package]
+name = "calibre_conversion"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+calibre_ebooks = { path = "../calibre_ebooks" }
+calibre_utils = { path = "../calibre_utils" }
+thiserror = "1.0"
+log = "0.4"
+anyhow = "1.0"
+zip = "0.6"
+tempfile = "3.8"
+roxmltree = "0.19"
+# Future dependencies for HTML/CSS processing
+html5ever = "0.26"
+markup5ever_rcdom = "0.2"
+clap = { version = "4.4", features = ["derive"] }
+env_logger = "0.10"
