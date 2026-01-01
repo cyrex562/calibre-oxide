@@ -1,11 +1,12 @@
-use crate::opf::{parse_opf, OpfMetadata};
+use crate::metadata::MetaInformation;
+use crate::opf::parse_opf;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use zip::ZipArchive;
 use anyhow::{Context, Result};
 
-pub fn read_epub_metadata(path: &Path) -> Result<OpfMetadata> {
+pub fn read_epub_metadata(path: &Path) -> Result<MetaInformation> {
     let file = File::open(path).context("Failed to open file")?;
     let mut archive = ZipArchive::new(file).context("Failed to read zip")?;
 

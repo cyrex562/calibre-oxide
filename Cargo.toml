@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "app",
-    "crates/*",
+    "crates/calibre_ai",
+    "crates/calibre_customize",
 ]
 resolver = "2"

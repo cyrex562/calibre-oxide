@@ -4,53 +4,53 @@
 
 ### ai
 
-- [ ] __init__.py
+- [x] __init__.py
 - [ ] config.py
-- [ ] prefs.py
-- [ ] utils.py
+- [x] prefs.py
+- [x] utils.py
 
 #### github
 
-- [ ] __init__.py
-- [ ] backend.py
+- [x] __init__.py
+- [x] backend.py
 - [ ] config.py
 
 #### google
 
-- [ ] __init__.py
-- [ ] backend.py
+- [x] __init__.py
+- [x] backend.py
 - [ ] config.py
 
 #### lm_studio
 
-- [ ] __init__.py
-- [ ] backend.py
+- [x] __init__.py
+- [x] backend.py
 - [ ] config.py
 
 #### ollama
 
-- [ ] __init__.py
-- [ ] backend.py
+- [x] __init__.py
+- [x] backend.py
 - [ ] config.py
 
 #### open_router
 
-- [ ] __init__.py
-- [ ] backend.py
+- [x] __init__.py
+- [x] backend.py
 - [ ] config.py
 
 #### openai
 
-- [ ] __init__.py
-- [ ] backend.py
+- [x] __init__.py
+- [x] backend.py
 - [ ] config.py
 
 ### customize
 
-- [ ] __init__.py
+- [x] __init__.py
 - [ ] builtins.py
-- [ ] conversion.py
-- [ ] profiles.py
+- [x] conversion.py
+- [x] profiles.py
 - [ ] ui.py
 - [ ] zipplugin.py
 
@@ -577,7 +577,7 @@
 
 #### metadata
 
-- [ ] __init__.py
+- [x] __init__.py
 - [ ] archive.py
 - [ ] author_mapper.py
 - [ ] cli.py
@@ -593,11 +593,11 @@
 - [ ] kfx.py
 - [ ] lit.py
 - [ ] lrx.py
-- [ ] meta.py
+- [x] meta.py
 - [ ] mobi.py
 - [ ] odt.py
 - [ ] opf_2_to_3.py
-- [ ] opf.py
+- [x] opf.py
 - [ ] opf2.py
 - [ ] opf3_test.py
 - [ ] opf3.py
@@ -1708,73 +1708,70 @@
 - [ ] copy_files.py
 - [ ] copy_files_test.py
 - [ ] cpp_binding.h
-- [ ] date.py
+- [x] date.py
 - [ ] exim.py
 - [ ] ffml_processor.py
 - [ ] ffmpeg.c
-- [ ] filenames.py
+- [x] filenames.py
 - [ ] file_type_icons.py
 - [ ] forked_map.py
 - [ ] formatter.py
 - [ ] formatter_functions.py
-- [ ] html2text.py
+- [x] html2text.py
 - [ ] https.py
 - [ ] icu.c
 - [ ] icu.py
 - [ ] icu_calibre_utils.h
 - [ ] icu_test.py
 - [ ] img.py
-- [ ] imghdr.py
+- [x] imghdr.py
 - [ ] inotify.py
 - [ ] iphlpapi.py
 - [ ] ipython.py
 - [ ] ip_routing.py
-- [ ] iso8601.py
+- [x] iso8601.py
 - [ ] linux_trash.py
 - [ ] localization.py
 - [ ] localunzip.py
 - [ ] lock.py
-- [ ] logging.py
+- [x] logging.py
 - [ ] matcher.c
 - [ ] matcher.py
 - [ ] mdns.py
-- [ ] mem.py
-- [ ] monotonic.py
-- [ ] mreplace.py
-- [ ] network.py
-- [ ] ordered_dict.py
-- [ ] random_ua.py
+- [x] network.py
+- [x] ordered_dict.py
+- [x] random_ua.py
 - [ ] rapydscript.py
-- [ ] recycle_bin.py
-- [ ] resources.py
+- [x] recycle_bin.py
+- [x] resources.py
 - [ ] run_tests.py
 - [ ] safe_atexit.py
-- [ ] search_query_parser.py
-- [ ] search_query_parser_test.py
+- [x] search_query_parser.py
+- [x] search_query_parser_test.py
 - [ ] serialize.py
-- [ ] seven_zip.py
+- [x] seven_zip.py
 - [ ] shared_file.py
 - [ ] shm.py
-- [ ] short_uuid.py
-- [ ] smartypants.py
+- [x] short_uuid.py
+- [x] smartypants.py
 - [ ] smtp.py
 - [ ] smtplib.py
-- [ ] socket_inheritance.py
+- [x] socket_inheritance.py
 - [ ] speedup.c
-- [ ] speedups.py
+- [x] speedups.py
 - [ ] tdir_in_cache.py
-- [ ] terminal.py
+- [x] terminal.py
 - [ ] test_lock.py
-- [ ] text2int.py
+- [x] text2int.py
 - [ ] threadpool.py
-- [ ] titlecase.py
+- [x] titlecase.py
 - [ ] unicode-test.opf
-- [ ] unicode_names.py
-- [ ] unrar.py
-- [ ] unsmarten.py
+- [x] unicode_names.py
+- [x] unrar.py
+- [x] unsmarten.py
 - [ ] webengine.py
-- [ ] wordcount.py
-- [ ] xml_parse.py
+- [x] wordcount.py
+- [x] xml_parse.py
 - [ ] zipfile.py
 - [ ] __init__.py
 
