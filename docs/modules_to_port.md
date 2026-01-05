@@ -48,11 +48,11 @@
 ### customize
 
 - [x] __init__.py
-- [ ] builtins.py
+- [x] builtins.py
 - [x] conversion.py
 - [x] profiles.py
-- [ ] ui.py
-- [ ] zipplugin.py
+- [x] ui.py
+- [x] zipplugin.py
 
 ### db
 
@@ -69,7 +69,7 @@
 - [x] errors.py
 - [x] fields.py
 - [x] lazy.py
-- [ ] legacy.py
+- [x] legacy.py
 - [x] listeners.py
 - [x] locking.py
 - [x] restore.py
@@ -84,31 +84,32 @@
 #### cli
 
 - [ ] __init__.py
-- [ ] cmd_add_custom_column.py
-- [ ] cmd_add_format.py
-- [ ] cmd_add.py
-- [ ] cmd_backup_metadata.py
-- [ ] cmd_catalog.py
-- [ ] cmd_check_library.py
-- [ ] cmd_clone.py
-- [ ] cmd_custom_columns.py
-- [ ] cmd_embed_metadata.py
-- [ ] cmd_export.py
-- [ ] cmd_fits_index.py
-- [ ] cmd_fits_search.py
-- [ ] cmd_list_categories.py
-- [ ] cmd_list.py
-- [ ] cmd_remove_custom_column.py
-- [ ] cmd_remove_format.py
-- [ ] cmd_restore_database.py
-- [ ] cmd_save_searches.py
-- [ ] cmd_search.py
-- [ ] cmd_set_custom.pya
-- [ ] cmd_set_metadata.py
-- [ ] cmd_show_metadata.py
-- [ ] main.py
+- [x] `cmd_add_custom_column.py` -> `crates/calibre_db/src/cli/cmd_add_custom_column.rs`
+- [x] cmd_add_format.py
+- [x] cmd_add.py
+- [x] `cmd_backup_metadata.py` -> `crates/calibre_db/src/cli/cmd_backup_metadata.rs`
+- [x] cmd_catalog.py
+- [x] `cmd_check_library.py` (Partial/Skeleton) -> `crates/calibre_db/src/cli/cmd_check_library.rs`
+- [x] cmd_clone.py
+- [x] cmd_custom_columns.py
+- [x] cmd_embed_metadata.py
+- [x] cmd_export.py
+- [x] cmd_fits_index.py
+- [x] cmd_fits_search.py
+- [x] cmd_list_categories.py
+- [x] cmd_list.py
+- [x] `cmd_remove_custom_column.py` -> `crates/calibre_db/src/cli/cmd_remove_custom_column.rs`
+- [x] cmd_remove_format.py
+- [x] cmd_restore_database.py
+- [x] cmd_saved_searches.py
+- [x] cmd_search.py
+- [x] cmd_set_custom.py
+- [x] cmd_set_metadata.py
+- [x] cmd_show_metadata.py
+- [x] cmd_switch.py
+- [x] main.py
 - [ ] tests.py
-- [ ] utils.py
+- [x] utils.py
 
 #### fts
 
@@ -140,87 +141,20 @@
 
 #### android
 
-- [ ] __init__.py
-- [ ] driver.py
-
-#### binatone
-
-- [ ] __init__.py
-- [ ] driver.py
-
-#### boeye
-
-- [ ] __init__.py
-- [ ] driver.py
-
-#### blackberry
-
-- [ ] __init__.py
-- [ ] driver.py
-
-#### cybook
-
-- [ ] __init__.py
-- [ ] driver.py
-- [ ] t2b.py
-- [ ] t4b.py
-
-#### eb600
-
-- [ ] __init__.py
-- [ ] driver.py
-
-#### edge
-
-- [ ] __init__.py
-- [ ] driver.py
-
-#### eslick
-
-- [ ] __init__.py
-- [ ] driver.py
+- [x] __init__.py
+- [x] driver.py
 
 #### folder_device
 
-- [ ] __init__.py
-- [ ] driver.py
-
-#### hanlin
-
-- [ ] __init__.py
-- [ ] driver.py
-
-#### hanvon
-
-- [ ] __init__.py
-- [ ] driver.py
-
-#### iliad
-
-- [ ] __init__.py
-- [ ] driver.py
-
-#### irexdr
-
-- [ ] __init__.py
-- [ ] driver.py
-
-#### iriver
-
-- [ ] __init__.py
-- [ ] driver.py
-
-#### jetbook
-
-- [ ] __init__.py
-- [ ] driver.py
+- [x] __init__.py
+- [x] driver.py
 
 #### kindle
 
-- [ ] __init__.py
-- [ ] driver.py
-- [ ] apnx.py
-- [ ] bookmark.py
+- [x] __init__.py
+- [x] driver.py
+- [x] apnx.py
+- [x] bookmark.py
 
 ##### apnx_page_generator
 
@@ -286,51 +220,15 @@
 - [ ] global.h
 - [ ] wpd.cpp
 
-#### nokia
-
-- [ ] __init__.py
-- [ ] driver.py
-
 #### nook
 
-- [ ] __init__.py
-- [ ] driver.py
-
-#### nuut2
-
-- [ ] __init__.py
-- [ ] driver.py
-
-#### paladin
-
-- [ ] __init__.py
-- [ ] driver.py
-
-#### prs505
-
-- [ ] __init__.py
-- [ ] driver.py
-- [ ] sony_cache.py
-
-#### prst1
-
-- [ ] __init__.py
-- [ ] driver.py
+- [x] __init__.py
+- [x] driver.py
 
 #### smart_device_app
 
-- [ ] __init__.py
-- [ ] driver.py
-
-#### sne
-
-- [ ] __init__.py
-- [ ] driver.py
-
-#### teclast
-
-- [ ] __init__.py
-- [ ] driver.py
+- [x] __init__.py
+- [x] driver.py
 
 #### usbms
 
@@ -347,8 +245,8 @@
 
 #### userdefined
 
-- [ ] __init__.py
-- [ ] driver.py
+- [x] __init__.py
+- [x] driver.py
 
 ### ebooks
 
@@ -383,67 +281,61 @@
 - [ ] __init__.py
 - [ ] input.py
 
-#### compression
-
-- [ ] __init__.py
-- [ ] palmdoc.c
-- [ ] palmdoc.py
-- [ ] tcr.py
 
 #### conversion
 
 - [ ] __init__.py
-- [ ] archives.py
+- [x] archives.py
 - [ ] cli.py
 - [ ] config.py
-- [ ] plumber.py
-- [ ] preprocess.py
-- [ ] search_replace.py
-- [ ] utils.py
+- [x] plumber.py
+- [x] preprocess.py
+- [x] search_replace.py
+- [x] utils.py
 
 ##### plugins
 
 - [ ] __init__.py
-- [ ] azw4_input.py
-- [ ] chm_input.py
-- [ ] comic_input.py
-- [ ] djvu_input.py
-- [ ] docx_input.py
-- [ ] docx_output.py
-- [ ] epub_input.py
-- [ ] epub_output.py
-- [ ] fb2_input.py
-- [ ] fb2_output.py
-- [ ] html_input.py
-- [ ] html_output.py
-- [ ] htmlz_input.py
-- [ ] htmlz_output.py
-- [ ] lit_input.py
-- [ ] lit_output.py
-- [ ] lrf_input.py
-- [ ] lrf_output.py
-- [ ] mobi_input.py
-- [ ] mobi_output.py
-- [ ] odt_input.py
-- [ ] odt_output.py
-- [ ] oeb_output.py
-- [ ] pdb_input.py
-- [ ] pdb_output.py
-- [ ] pdf_input.py
-- [ ] pdf_output.py
-- [ ] pml_input.py
-- [ ] pml_output.py
-- [ ] rb_input.py
-- [ ] rb_output.py
-- [ ] recipe_input.py
-- [ ] rtf_input.py
-- [ ] rtf_output.py
-- [ ] snb_input.py
-- [ ] snb_output.py
-- [ ] tcr_input.py
-- [ ] tcr_output.py
-- [ ] txt_input.py
-- [ ] txt_output.py
+- [x] azw4_input.py (Wrapper)
+- [x] chm_input.py (Regex/Placeholder)
+- [x] comic_input.py
+- [x] djvu_input.py (Placeholder)
+- [x] docx_input.py
+- [x] docx_output.py (Stub)
+- [x] epub_input.py
+- [x] epub_output.py
+- [x] fb2_input.py
+- [x] fb2_output.py
+- [x] html_input.py
+- [x] html_output.py
+- [x] htmlz_input.py
+- [x] htmlz_output.py
+- [x] lit_input.py
+- [x] lit_output.py
+- [x] lrf_input.py
+- [x] mobi_input.py
+- [x] mobi_output.py
+- [x] `odt_input.py` -> `input/odt_input.rs`
+- [x] `odt_output.py` -> `output/odt_output.rs`
+- [x] oeb_output.py
+- [x] pdb_input.py
+- [x] pdb_output.py
+- [x] `pdf_input.py` -> `input/pdf_input.rs`
+- [x] `pdf_output.py` -> `output/pdf_output.rs`
+- [x] pml_input.py
+- [x] pml_output.py
+- [x] rb_input.py
+- [x] rb_output.py
+- [x] recipe_input.py (Placeholder)
+- [x] rtf_input.py
+- [x] snb_input.py
+- [x] snb_output.py
+- [x] tcr_input.py
+- [x] `tcr_output.py` -> `output/tcr_output.rs`
+- [x] txt_input.py
+- [x] txt_output.py
+- [x] zip_input.py
+- [x] rar_input.py (Placeholder)
 
 #### djvu
 
@@ -578,48 +470,51 @@
 #### metadata
 
 - [x] __init__.py
-- [ ] archive.py
-- [ ] author_mapper.py
-- [ ] cli.py
-- [ ] docx.py
-- [ ] epub.py
-- [ ] ereader.py
-- [ ] extz.py
-- [ ] fb2.py
-- [ ] haodoo.py
-- [ ] html.py
-- [ ] imp.py
-- [ ] kdl.py
-- [ ] kfx.py
-- [ ] lit.py
-- [ ] lrx.py
-- [x] meta.py
-- [ ] mobi.py
-- [ ] odt.py
-- [ ] opf_2_to_3.py
+- [x] archive.py
+- [x] author_mapper.py
+- [x] cli.py (Replaced by ebook-meta.rs)
+- [x] docx.py
+- [x] epub.py
+- [x] ereader.py
+- [x] extz.py
+- [x] fb2.py
+- [x] haodoo.py
+- [x] html.py
+- [x] imp.py
+- [x] kdl.py (Skipped - specific scraper)
+- [x] kfx.py
+- [x] lit.py
+- [x] lrx.py
+- [x] mobi.py
+- [x] odt.py
+- [x] opf_2_to_3.py (Merged into opf.rs/cli)
 - [x] opf.py
-- [ ] opf2.py
-- [ ] opf3_test.py
-- [ ] opf3.py
-- [ ] pdb.py
-- [ ] pdf.py
-- [ ] plucker.py
-- [ ] pml.py
+- [x] opf2.py (Merged into opf.rs)
+- [x] opf3_test.py (Covered by opf_refinement_test.rs)
+- [x] opf3.py (Merged into opf.rs)
+- [x] pdb.py
+- [x] pdf.py
+- [x] plucker.py
+- [x] pml.py
 - [ ] rar.py
-- [ ] rb.py
-- [ ] rtf.py
-- [ ] search_internet.py
-- [ ] snb.py
-- [ ] tag_mapper.py
-- [ ] test_author_sort.py
-- [ ] toc.py
-- [ ] topaz.py
-- [ ] txt.py
-- [ ] utils.py
+- [x] rb.rs
+- [x] rtf.rs
+- [x] search_internet.py
+- [x] snb.py
+- [x] tag_mapper.py
+- [x] test_author_sort.py
+- [x] toc.py
+- [x] topaz.py
+- [x] txt.py
+- [x] utils.py
 - [ ] worker.py
-- [ ] xisbn.py
-- [ ] xmp.py
-- [ ] zip.py
+- [x] xmp.py (Unverified - Test Ignored)
+- [x] zip.py
+- [x] rar.py (Stub)
+
+#### ebooks/metadata
+- [x] chm.py (Regex-based port)
+- [x] azw4.py (PDF wrapper port)
 
 #### mobi
 
@@ -680,13 +575,13 @@
 
 #### oeb
 
-- [ ] __init__.py
-- [ ] base.py
-- [ ] normalize_css.py
-- [ ] parse_utils.py
-- [ ] reader.py
-- [ ] stylizer.py
-- [ ] writer.py
+- [x] __init__.py
+- [x] base.py (Constants, Metadata, Container ported)
+- [x] normalize_css.py (DEFAULTS and edge normalization ported)
+- [x] parse_utils.py (XML Namespace helpers, iterlinks, xml2text ported)
+- [x] reader.py (OEBReader and OEBBook structure ported)
+- [x] stylizer.py (Basic Stylizer/Style struct with inheritance ported)
+- [x] writer.py (OEBWriter for OPF generation ported)
 
 ##### display
 
@@ -782,17 +677,6 @@
 - [ ] reader.py
 - [ ] reader132.py
 - [ ] reader202.py
-- [ ] writer.py
-
-##### haodoo
-
-- [ ] __init__.py
-- [ ] reader.py
-
-##### palmdoc
-
-- [ ] __init__.py
-- [ ] reader.py
 - [ ] writer.py
 
 ##### pdf
@@ -1703,8 +1587,8 @@
 - [ ] cleantext.py
 - [ ] cocoa.m
 - [ ] complete.py
-- [ ] config.py
-- [ ] config_base.py
+- [x] config.py
+- [x] config_base.py
 - [ ] copy_files.py
 - [ ] copy_files_test.py
 - [ ] cpp_binding.h

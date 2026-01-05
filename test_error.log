@@ -1,0 +1,921 @@
+warning: unused import: `ToSocketAddrs`
+ --> crates\calibre_utils\src\network.rs:1:24
+  |
+1 | use std::net::{IpAddr, ToSocketAddrs};
+  |                        ^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `std::os::windows::io::AsRawSocket`
+  --> crates\calibre_utils\src\socket_inheritance.rs:32:5
+   |
+32 | use std::os::windows::io::AsRawSocket;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> crates\calibre_utils\src\config.rs:125:13
+    |
+125 |         let mut prefs: GlobalPrefs = serde_json::from_str(&content)?;
+    |             ----^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+  --> crates\calibre_utils\src\seven_zip.rs:30:10
+   |
+30 |      let mut archive = open_archive(path)?;
+   |          ----^^^^^^^
+   |          |
+   |          help: remove this `mut`
+
+warning: `calibre_utils` (lib) generated 4 warnings (run `cargo fix --lib -p calibre_utils` to apply 4 suggestions)
+warning: unused import: `anyhow::Result`
+ --> crates\calibre_ebooks\src\conversion\utils.rs:1:5
+  |
+1 | use anyhow::Result;
+  |     ^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `encoding_rs::Encoding`
+ --> crates\calibre_ebooks\src\html\input.rs:2:5
+  |
+2 | use encoding_rs::Encoding;
+  |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `Seek`
+ --> crates\calibre_ebooks\src\input\azw4_input.rs:5:21
+  |
+5 | use std::io::{Read, Seek};
+  |                     ^^^^
+
+warning: unused import: `std::io::Read`
+ --> crates\calibre_ebooks\src\input\comic_input.rs:7:5
+  |
+7 | use std::io::Read;
+  |     ^^^^^^^^^^^^^
+
+warning: unused import: `PathBuf`
+  --> crates\calibre_ebooks\src\input\fb2_input.rs:10:23
+   |
+10 | use std::path::{Path, PathBuf};
+   |                       ^^^^^^^
+
+warning: unused import: `Context`
+ --> crates\calibre_ebooks\src\input\htmlz_input.rs:4:14
+  |
+4 | use anyhow::{Context, Result};
+  |              ^^^^^^^
+
+warning: unused import: `Context`
+ --> crates\calibre_ebooks\src\input\lrf_input.rs:4:14
+  |
+4 | use anyhow::{Context, Result};
+  |              ^^^^^^^
+
+warning: unused import: `std::collections::HashMap`
+ --> crates\calibre_ebooks\src\input\pml_input.rs:8:5
+  |
+8 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `PathBuf`
+  --> crates\calibre_ebooks\src\input\pml_input.rs:11:23
+   |
+11 | use std::path::{Path, PathBuf};
+   |                       ^^^^^^^
+
+warning: unused import: `std::collections::HashMap`
+ --> crates\calibre_ebooks\src\input\rb_input.rs:6:5
+  |
+6 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `PathBuf`
+ --> crates\calibre_ebooks\src\input\txt_input.rs:5:23
+  |
+5 | use std::path::{Path, PathBuf};
+  |                       ^^^^^^^
+
+warning: unused import: `crate::oeb::spine::SpineItem`
+ --> crates\calibre_ebooks\src\input\zip_input.rs:4:5
+  |
+4 | use crate::oeb::spine::SpineItem;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `Context`
+ --> crates\calibre_ebooks\src\lit\reader.rs:2:14
+  |
+2 | use anyhow::{Context, Result};
+  |              ^^^^^^^
+
+warning: unused import: `SeekFrom`
+ --> crates\calibre_ebooks\src\lit\reader.rs:3:27
+  |
+3 | use std::io::{Read, Seek, SeekFrom};
+  |                           ^^^^^^^^
+
+warning: unused import: `ITOLITLS`
+ --> crates\calibre_ebooks\src\metadata\lit.rs:1:37
+  |
+1 | use crate::lit::header::{LitHeader, ITOLITLS};
+  |                                     ^^^^^^^^
+
+warning: unused import: `MAGIC`
+ --> crates\calibre_ebooks\src\metadata\rb.rs:2:47
+  |
+2 | use crate::rb::header::{RbHeader, RbTocEntry, MAGIC};
+  |                                               ^^^^^
+
+warning: unused imports: `LittleEndian` and `ReadBytesExt`
+ --> crates\calibre_ebooks\src\metadata\rb.rs:4:17
+  |
+4 | use byteorder::{LittleEndian, ReadBytesExt};
+  |                 ^^^^^^^^^^^^  ^^^^^^^^^^^^
+
+warning: unused import: `bail`
+ --> crates\calibre_ebooks\src\metadata\snb.rs:2:14
+  |
+2 | use anyhow::{bail, Context, Result};
+  |              ^^^^
+
+warning: unused imports: `BigEndian` and `ReadBytesExt`
+ --> crates\calibre_ebooks\src\metadata\snb.rs:3:17
+  |
+3 | use byteorder::{BigEndian, ReadBytesExt};
+  |                 ^^^^^^^^^  ^^^^^^^^^^^^
+
+warning: unused imports: `Cursor` and `SeekFrom`
+ --> crates\calibre_ebooks\src\metadata\snb.rs:4:15
+  |
+4 | use std::io::{Cursor, Read, Seek, SeekFrom};
+  |               ^^^^^^              ^^^^^^^^
+
+warning: unused import: `Context`
+ --> crates\calibre_ebooks\src\mobi\headers.rs:1:20
+  |
+1 | use anyhow::{bail, Context, Result};
+  |                    ^^^^^^^
+
+warning: unused import: `crate::compression::palmdoc`
+ --> crates\calibre_ebooks\src\mobi\writer.rs:1:5
+  |
+1 | use crate::compression::palmdoc;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `Context`
+ --> crates\calibre_ebooks\src\mobi\writer.rs:4:14
+  |
+4 | use anyhow::{Context, Result};
+  |              ^^^^^^^
+
+warning: unused import: `std::collections::HashMap`
+ --> crates\calibre_ebooks\src\oeb\stylizer.rs:3:5
+  |
+3 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::oeb::constants::*`
+ --> crates\calibre_ebooks\src\oeb\writer.rs:2:5
+  |
+2 | use crate::oeb::constants::*;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `Node`
+ --> crates\calibre_ebooks\src\opf.rs:3:27
+  |
+3 | use roxmltree::{Document, Node};
+  |                           ^^^^
+
+warning: unused import: `self`
+ --> crates\calibre_ebooks\src\output\htmlz_output.rs:4:15
+  |
+4 | use std::fs::{self, File};
+  |               ^^^^
+
+warning: unused import: `Context`
+ --> crates\calibre_ebooks\src\output\lrf_output.rs:2:14
+  |
+2 | use anyhow::{Context, Result};
+  |              ^^^^^^^
+
+warning: unused import: `Context`
+ --> crates\calibre_ebooks\src\output\odt_output.rs:2:14
+  |
+2 | use anyhow::{Context, Result};
+  |              ^^^^^^^
+
+warning: unused import: `Context`
+ --> crates\calibre_ebooks\src\output\pdb_output.rs:3:14
+  |
+3 | use anyhow::{Context, Result};
+  |              ^^^^^^^
+
+warning: unused import: `std::collections::BTreeMap`
+ --> crates\calibre_ebooks\src\output\pdf_output.rs:5:5
+  |
+5 | use std::collections::BTreeMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `bail`
+ --> crates\calibre_ebooks\src\pdb\reader.rs:2:14
+  |
+2 | use anyhow::{bail, Result};
+  |              ^^^^
+
+warning: unreachable statement
+   --> crates\calibre_ebooks\src\metadata\tag_mapper.rs:206:17
+    |
+ 93 | /                 match action {
+ 94 | |                     "remove" => break,
+ 95 | |                     "keep" => {
+ 96 | |                         ans.push(current_tag.clone());
+...   |
+205 | |                 }
+    | |_________________- any code following this `match` expression is unreachable, as all arms diverge
+206 |                   break;
+    |                   ^^^^^^ unreachable statement
+    |
+    = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+  --> crates\calibre_ebooks\src\conversion\plumber.rs:44:13
+   |
+44 |         let mut book;
+   |             ----^^^^
+   |             |
+   |             help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+  --> crates\calibre_ebooks\src\docx\container.rs:21:13
+   |
+21 |         let mut zip = ZipArchive::new(reader)?;
+   |             ----^^^
+   |             |
+   |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> crates\calibre_ebooks\src\input\azw4_input.rs:46:25
+   |
+46 |                     let mut book = pdf_input
+   |                         ----^^^^
+   |                         |
+   |                         help: remove this `mut`
+
+warning: unused variable: `exth`
+  --> crates\calibre_ebooks\src\input\mobi_input.rs:53:21
+   |
+53 |         if let Some(exth) = &section.exth {
+   |                     ^^^^ help: if this is intentional, prefix it with an underscore: `_exth`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `input_path`
+  --> crates\calibre_ebooks\src\input\tcr_input.rs:15:27
+   |
+15 |     pub fn convert(&self, input_path: &Path, output_dir: &Path) -> Result<OEBBook> {
+   |                           ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_input_path`
+
+warning: unused variable: `version_low`
+  --> crates\calibre_ebooks\src\metadata\haodoo.rs:64:9
+   |
+64 |     let version_low = pdb.version as u8; // pdb.version is u16 read as BE.
+   |         ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_version_low`
+
+warning: unused variable: `pos`
+   --> crates\calibre_ebooks\src\metadata\haodoo.rs:132:21
+    |
+132 |         if let Some(pos) = data.iter().position(|&b| b == 0x1b) {
+    |                     ^^^ help: if this is intentional, prefix it with an underscore: `_pos`
+
+warning: variable does not need to be mutable
+   --> crates\calibre_ebooks\src\opf.rs:169:21
+    |
+169 |                 let mut event = node.attribute((OPF_NS, "event")).map(|s| s.to_string());
+    |                     ----^^^^^
+    |                     |
+    |                     help: remove this `mut`
+
+warning: field `reader` is never read
+ --> crates\calibre_ebooks\src\lit\reader.rs:6:5
+  |
+5 | pub struct LitReader<R> {
+  |            --------- field in this struct
+6 |     reader: R,
+  |     ^^^^^^
+  |
+  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `name`, `section`, `offset`, and `size` are never read
+  --> crates\calibre_ebooks\src\metadata\lit.rs:9:5
+   |
+ 8 | struct DirectoryEntry {
+   |        -------------- fields in this struct
+ 9 |     name: String,
+   |     ^^^^
+10 |     section: u32,
+   |     ^^^^^^^
+11 |     offset: u32,
+   |     ^^^^^^
+12 |     size: u32,
+   |     ^^^^
+
+warning: field `path` is never read
+   --> crates\calibre_ebooks\src\mobi\reader.rs:109:5
+    |
+106 | pub struct MobiReader {
+    |            ---------- field in this struct
+...
+109 |     path: PathBuf,
+    |     ^^^^
+
+warning: `calibre_ebooks` (lib) generated 44 warnings (run `cargo fix --lib -p calibre_ebooks` to apply 40 suggestions)
+warning: unused import: `std::cmp::Ordering`
+ --> crates\calibre_db\src\annotations.rs:2:5
+  |
+2 | use std::cmp::Ordering;
+  |     ^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `Context`
+ --> crates\calibre_db\src\cli\cmd_add.rs:2:14
+  |
+2 | use anyhow::{Context, Result};
+  |              ^^^^^^^
+
+warning: unused import: `Path`
+ --> crates\calibre_db\src\cli\cmd_clone.rs:4:17
+  |
+4 | use std::path::{Path, PathBuf};
+  |                 ^^^^
+
+warning: unused import: `serde_json::Value`
+ --> crates\calibre_db\src\cli\cmd_custom_columns.rs:2:5
+  |
+2 | use serde_json::Value;
+  |     ^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::collections::HashMap`
+ --> crates\calibre_db\src\cli\cmd_custom_columns.rs:3:5
+  |
+3 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `Write` and `self`
+ --> crates\calibre_db\src\cli\cmd_list.rs:3:15
+  |
+3 | use std::io::{self, Write};
+  |               ^^^^  ^^^^^
+
+warning: unused import: `crate::backend::Backend`
+ --> crates\calibre_db\src\copy_to_library.rs:2:5
+  |
+2 | use crate::backend::Backend;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::utils::find_identical_books`
+ --> crates\calibre_db\src\copy_to_library.rs:4:5
+  |
+4 | use crate::utils::find_identical_books;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `HashMap` and `HashSet`
+ --> crates\calibre_db\src\copy_to_library.rs:6:24
+  |
+6 | use std::collections::{HashMap, HashSet};
+  |                        ^^^^^^^  ^^^^^^^
+
+warning: unused import: `std::fs`
+ --> crates\calibre_db\src\copy_to_library.rs:7:5
+  |
+7 | use std::fs;
+  |     ^^^^^^^
+
+warning: unused import: `PathBuf`
+ --> crates\calibre_db\src\restore.rs:6:23
+  |
+6 | use std::path::{Path, PathBuf};
+  |                       ^^^^^^^
+
+warning: unused variable: `arg`
+  --> crates\calibre_db\src\cli\cmd_list.rs:35:17
+   |
+35 |                 arg => {
+   |                 ^^^ help: if this is intentional, prefix it with an underscore: `_arg`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `guard`
+  --> crates\calibre_db\src\copy_to_library.rs:42:13
+   |
+42 |         let guard = dest_cache.lock().unwrap();
+   |             ^^^^^ help: if this is intentional, prefix it with an underscore: `_guard`
+
+warning: unused variable: `dest_guard`
+  --> crates\calibre_db\src\copy_to_library.rs:77:13
+   |
+77 |         let dest_guard = dest_cache.lock().unwrap();
+   |             ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_dest_guard`
+
+warning: unused variable: `src_path_abs`
+  --> crates\calibre_db\src\copy_to_library.rs:79:13
+   |
+79 |         let src_path_abs = src_guard.backend.library_path.join(&path_rel);
+   |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_src_path_abs`
+
+warning: variable does not need to be mutable
+   --> crates\calibre_db\src\library.rs:851:13
+    |
+851 |         let mut stmt = self
+    |             ----^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `all_authors` is never read
+  --> crates\calibre_db\src\check_library.rs:65:5
+   |
+45 | pub struct CheckLibrary<'a> {
+   |            ------------ field in this struct
+...
+65 |     all_authors: HashSet<String>,
+   |     ^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `metadata` is never read
+  --> crates\calibre_db\src\tables.rs:31:5
+   |
+30 | pub struct AuthorsTable {
+   |            ------------ field in this struct
+31 |     metadata: TableMetadata,
+   |     ^^^^^^^^
+
+warning: field `thumbnail_size` is never read
+  --> crates\calibre_db\src\utils.rs:46:5
+   |
+42 | struct CacheEntry {
+   |        ---------- field in this struct
+...
+46 |     thumbnail_size: (u32, u32),
+   |     ^^^^^^^^^^^^^^
+   |
+   = note: `CacheEntry` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: variable does not need to be mutable
+  --> crates\calibre_db\src\cli\cmd_backup_metadata.rs:64:13
+   |
+64 |         let mut db = Library::open_test().unwrap();
+   |             ----^^
+   |             |
+   |             help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+  --> crates\calibre_db\src\cli\cmd_list.rs:93:13
+   |
+93 |         let mut db = Library::open_test().unwrap();
+   |             ----^^
+   |             |
+   |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> crates\calibre_db\src\cli\cmd_search.rs:66:13
+   |
+66 |         let mut db = Library::open_test().unwrap();
+   |             ----^^
+   |             |
+   |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> crates\calibre_db\src\cli\cmd_show_metadata.rs:63:13
+   |
+63 |         let mut db = Library::open_test().unwrap();
+   |             ----^^
+   |             |
+   |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> crates\calibre_db\src\library.rs:851:13
+    |
+851 |         let mut stmt = self
+    |             ----^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: `calibre_db` (lib) generated 19 warnings (run `cargo fix --lib -p calibre_db` to apply 16 suggestions)
+warning: `calibre_db` (lib test) generated 23 warnings (18 duplicates) (run `cargo fix --lib -p calibre_db --tests` to apply 5 suggestions)
+warning: unused import: `std::fs`
+ --> crates\calibre_db\tests\connection_test.rs:4:5
+  |
+4 | use std::fs;
+  |     ^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `id_int`
+   --> crates\calibre_db\tests\custom_columns_test.rs:132:9
+    |
+132 |     let id_int = db
+    |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_id_int`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling calibre_db v0.1.0 (C:\Users\cyrex\files\projects\calibre-oxide\crates\calibre_db)
+warning: variable does not need to be mutable
+  --> crates\calibre_db\tests\restore_database_test.rs:14:13
+   |
+14 | ...   let mut library = Library::create(library_path.clone()).expect("Failed to create lib...
+   |           ----^^^^^^^
+   |           |
+   |           help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `library`
+  --> crates\calibre_db\tests\restore_database_test.rs:14:13
+   |
+14 |         let mut library = Library::create(library_path.clone()).expect("Failed to create l...
+   |             ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_library`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `calibre_db` (test "connection_test") generated 1 warning (run `cargo fix --test "connection_test" -p calibre_db` to apply 1 suggestion)
+warning: `calibre_db` (test "custom_columns_test") generated 1 warning (run `cargo fix --test "custom_columns_test" -p calibre_db` to apply 1 suggestion)
+warning: `calibre_db` (test "restore_database_test") generated 2 warnings (run `cargo fix --test "restore_database_test" -p calibre_db` to apply 2 suggestions)
+warning: unused imports: `Arc` and `Mutex`
+ --> crates\calibre_db\tests\fts_test.rs:3:17
+  |
+3 | use std::sync::{Arc, Mutex};
+  |                 ^^^  ^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `calibre_db::cli::cmd_show_metadata::CmdShowMetadata`
+ --> crates\calibre_db\tests\cli_remaining_p2_test.rs:4:5
+  |
+4 | use calibre_db::cli::cmd_show_metadata::CmdShowMetadata;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `calibre_db::cli::cmd_add::CmdAdd`
+ --> crates\calibre_db\tests\cli_stubs_test.rs:1:5
+  |
+1 | use calibre_db::cli::cmd_add::CmdAdd;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `calibre_db::cli::cmd_list::CmdList`
+ --> crates\calibre_db\tests\cli_search_test.rs:1:5
+  |
+1 | use calibre_db::cli::cmd_list::CmdList;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `calibre_db::cli::cmd_add_format::CmdAddFormat`
+ --> crates\calibre_db\tests\cli_stubs_test.rs:3:5
+  |
+3 | use calibre_db::cli::cmd_add_format::CmdAddFormat;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::path::Path`
+ --> crates\calibre_db\tests\cli_stubs_test.rs:4:5
+  |
+4 | use std::path::Path;
+  |     ^^^^^^^^^^^^^^^
+
+warning: unused import: `calibre_db::cli::cmd_search::CmdSearch`
+ --> crates\calibre_db\tests\cli_search_test.rs:3:5
+  |
+3 | use calibre_db::cli::cmd_search::CmdSearch;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `Arc` and `Mutex`
+ --> crates\calibre_db\tests\notes_test.rs:3:17
+  |
+3 | use std::sync::{Arc, Mutex};
+  |                 ^^^  ^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+error[E0616]: field `conn` of struct `Library` is private
+  --> crates\calibre_db\tests\cli_catalog_test.rs:14:13
+   |
+14 |         lib.conn.execute_batch(
+   |             ^^^^ private field
+   |
+help: a method `conn` also exists, call it with parentheses
+   |
+14 |         lib.conn().execute_batch(
+   |                 ++
+
+error[E0616]: field `conn` of struct `Library` is private
+  --> crates\calibre_db\tests\cli_export_test.rs:12:9
+   |
+12 |     lib.conn.execute_batch(
+   |         ^^^^ private field
+   |
+help: a method `conn` also exists, call it with parentheses
+   |
+12 |     lib.conn().execute_batch(
+   |             ++
+
+error[E0616]: field `conn` of struct `Library` is private
+  --> crates\calibre_db\tests\cli_catalog_test.rs:20:13
+   |
+20 |         lib.conn.execute(
+   |             ^^^^ private field
+   |
+help: a method `conn` also exists, call it with parentheses
+   |
+20 |         lib.conn().execute(
+   |                 ++
+
+error[E0616]: field `conn` of struct `Library` is private
+  --> crates\calibre_db\tests\cli_export_test.rs:25:9
+   |
+25 |     lib.conn.execute(
+   |         ^^^^ private field
+   |
+help: a method `conn` also exists, call it with parentheses
+   |
+25 |     lib.conn().execute(
+   |             ++
+
+error[E0616]: field `conn` of struct `Library` is private
+  --> crates\calibre_db\tests\cli_export_test.rs:30:23
+   |
+30 |     let book_id = lib.conn.last_insert_rowid() as i32;
+   |                       ^^^^ private field
+   |
+help: a method `conn` also exists, call it with parentheses
+   |
+30 |     let book_id = lib.conn().last_insert_rowid() as i32;
+   |                           ++
+
+error[E0616]: field `conn` of struct `Library` is private
+  --> crates\calibre_db\tests\cli_export_test.rs:32:9
+   |
+32 |     lib.conn.execute(
+   |         ^^^^ private field
+   |
+help: a method `conn` also exists, call it with parentheses
+   |
+32 |     lib.conn().execute(
+   |             ++
+
+For more information about this error, try `rustc --explain E0616`.
+error: could not compile `calibre_db` (test "cli_catalog_test") due to 2 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `calibre_db` (test "cli_export_test") due to 4 previous errors
+error[E0061]: this method takes 2 arguments but 0 arguments were supplied
+  --> crates\calibre_db\tests\cli_search_test.rs:8:18
+   |
+ 8 |     assert!(cats.run().is_err());
+   |                  ^^^-- two arguments of type `&Library` and `&[String]` are missing
+   |
+note: method defined here
+  --> C:\Users\cyrex\files\projects\calibre-oxide\crates\calibre_db\src\cli\cmd_list_categories.rs:10:12
+   |
+10 |     pub fn run(&self, library: &crate::Library, args: &[String]) -> Result<()> {
+   |            ^^^
+help: provide the arguments
+   |
+ 8 |     assert!(cats.run(/* &Library */, /* &[String] */).is_err());
+   |                      +++++++++++++++++++++++++++++++
+
+For more information about this error, try `rustc --explain E0061`.
+error[E0061]: this method takes 2 arguments but 1 argument was supplied
+  --> crates\calibre_db\tests\cli_remaining_p1_test.rs:10:19
+   |
+10 |     assert!(embed.run(&[1, 2, 3]).is_err());
+   |                   ^^^------------
+   |                      ||
+   |                      |expected `&Library`, found `&[{integer}; 3]`
+   |                      argument #2 of type `&calibre_db::cli::cmd_embed_metadata::RunArgs` is missing
+   |
+   = note: expected reference `&Library`
+              found reference `&[{integer}; 3]`
+note: method defined here
+  --> C:\Users\cyrex\files\projects\calibre-oxide\crates\calibre_db\src\cli\cmd_embed_metadata.rs:18:12
+   |
+18 |     pub fn run(&self, db: &crate::Library, args: &RunArgs) -> Result<()> {
+   |            ^^^
+help: provide the argument
+   |
+10 -     assert!(embed.run(&[1, 2, 3]).is_err());
+10 +     assert!(embed.run(/* &Library */, /* &calibre_db::cli::cmd_embed_metadata::RunArgs */).is_err());
+   |
+
+error[E0308]: arguments to this method are incorrect
+  --> crates\calibre_db\tests\cli_maintenance_test.rs:19:21
+   |
+19 |     assert!(catalog.run(p, "csv").is_err());
+   |                     ^^^ -  ----- expected `&RunArgs`, found `&str`
+   |                         |
+   |                         expected `&Library`, found `&Path`
+   |
+   = note: expected reference `&Library`
+              found reference `&Path`
+   = note: expected reference `&calibre_db::cli::cmd_catalog::RunArgs`
+              found reference `&'static str`
+note: method defined here
+  --> C:\Users\cyrex\files\projects\calibre-oxide\crates\calibre_db\src\cli\cmd_catalog.rs:28:12
+   |
+28 |     pub fn run(&self, db: &crate::Library, args: &RunArgs) -> anyhow::Result<()> {
+   |            ^^^
+
+error[E0308]: arguments to this method are incorrect
+  --> crates\calibre_db\tests\cli_remaining_p2_test.rs:11:19
+   |
+11 |     assert!(saved.run("my_search", "add").is_err());
+   |                   ^^^ ----------- types differ in mutability
+   |
+   = note: expected mutable reference `&mut Library`
+                      found reference `&'static str`
+note: expected `&[String]`, found `&str`
+  --> crates\calibre_db\tests\cli_remaining_p2_test.rs:11:36
+   |
+11 |     assert!(saved.run("my_search", "add").is_err());
+   |                                    ^^^^^
+   = note: expected reference `&[String]`
+              found reference `&'static str`
+note: method defined here
+  --> C:\Users\cyrex\files\projects\calibre-oxide\crates\calibre_db\src\cli\cmd_saved_searches.rs:12:12
+   |
+12 |     pub fn run(&self, db: &mut Library, args: &[String]) -> Result<()> {
+   |            ^^^
+
+error[E0061]: this method takes 2 arguments but 3 arguments were supplied
+  --> crates\calibre_db\tests\cli_stubs_test.rs:12:17
+   |
+12 |     assert!(cmd.run("label", "Name", "text").is_err()); // Expect stub error
+   |                 ^^^ -------          ------ unexpected argument #3 of type `&'static str`
+   |                     |
+   |                     types differ in mutability
+   |
+   = note: expected mutable reference `&mut Library`
+                      found reference `&'static str`
+note: expected `&[String]`, found `&str`
+  --> crates\calibre_db\tests\cli_stubs_test.rs:12:30
+   |
+12 |     assert!(cmd.run("label", "Name", "text").is_err()); // Expect stub error
+   |                              ^^^^^^
+   = note: expected reference `&[String]`
+              found reference `&'static str`
+note: method defined here
+  --> C:\Users\cyrex\files\projects\calibre-oxide\crates\calibre_db\src\cli\cmd_add_custom_column.rs:11:12
+   |
+11 |     pub fn run(&self, db: &mut Library, args: &[String]) -> Result<()> {
+   |            ^^^
+help: remove the extra argument
+   |
+12 -     assert!(cmd.run("label", "Name", "text").is_err()); // Expect stub error
+12 +     assert!(cmd.run(/* &mut Library */, /* &[String] */).is_err()); // Expect stub error
+   |
+
+error[E0061]: this method takes 2 arguments but 1 argument was supplied
+  --> crates\calibre_db\tests\cli_remaining_p1_test.rs:13:20
+   |
+13 |     assert!(export.run(Path::new("export_dir")).is_err());
+   |                    ^^^-------------------------
+   |                       ||
+   |                       |expected `&Library`, found `&Path`
+   |                       argument #2 of type `&calibre_db::cli::cmd_export::RunArgs` is missing
+   |
+   = note: expected reference `&Library`
+              found reference `&Path`
+note: method defined here
+  --> C:\Users\cyrex\files\projects\calibre-oxide\crates\calibre_db\src\cli\cmd_export.rs:28:12
+   |
+28 |     pub fn run(&self, db: &crate::Library, args: &RunArgs) -> anyhow::Result<()> {
+   |            ^^^
+help: provide the argument
+   |
+13 -     assert!(export.run(Path::new("export_dir")).is_err());
+13 +     assert!(export.run(/* &Library */, /* &calibre_db::cli::cmd_export::RunArgs */).is_err());
+   |
+
+warning: `calibre_db` (test "cli_search_test") generated 2 warnings
+error: could not compile `calibre_db` (test "cli_search_test") due to 1 previous error; 2 warnings emitted
+error[E0061]: this method takes 1 argument but 0 arguments were supplied
+  --> crates\calibre_db\tests\cli_remaining_p1_test.rs:16:22
+   |
+16 |     assert!(fits_idx.run().is_err());
+   |                      ^^^-- argument #1 of type `&calibre_db::cli::cmd_fits_index::RunArgs` is missing
+   |
+note: method defined here
+  --> C:\Users\cyrex\files\projects\calibre-oxide\crates\calibre_db\src\cli\cmd_fits_index.rs:16:12
+   |
+16 |     pub fn run(&self, _args: &RunArgs) -> Result<()> {
+   |            ^^^
+help: provide the argument
+   |
+16 |     assert!(fits_idx.run(/* &calibre_db::cli::cmd_fits_index::RunArgs */).is_err());
+   |                          +++++++++++++++++++++++++++++++++++++++++++++++
+
+error[E0061]: this method takes 2 arguments but 3 arguments were supplied
+  --> crates\calibre_db\tests\cli_remaining_p2_test.rs:14:22
+   |
+14 |     assert!(set_cust.run(1, "col", "val").is_err());
+   |                      ^^^ -         ----- unexpected argument #3 of type `&'static str`
+   |                          |
+   |                          expected `&mut Library`, found integer
+   |
+note: expected `&[String]`, found `&str`
+  --> crates\calibre_db\tests\cli_remaining_p2_test.rs:14:29
+   |
+14 |     assert!(set_cust.run(1, "col", "val").is_err());
+   |                             ^^^^^
+   = note: expected reference `&[String]`
+              found reference `&'static str`
+note: method defined here
+  --> C:\Users\cyrex\files\projects\calibre-oxide\crates\calibre_db\src\cli\cmd_set_custom.rs:11:12
+   |
+11 |     pub fn run(&self, db: &mut Library, args: &[String]) -> Result<()> {
+   |            ^^^
+help: remove the extra argument
+   |
+14 -     assert!(set_cust.run(1, "col", "val").is_err());
+14 +     assert!(set_cust.run(/* &mut Library */, /* &[String] */).is_err());
+   |
+
+For more information about this error, try `rustc --explain E0308`.
+error[E0308]: mismatched types
+  --> crates\calibre_db\tests\cli_remaining_p1_test.rs:19:29
+   |
+19 |     assert!(fits_search.run("query").is_err());
+   |                         --- ^^^^^^^ expected `&RunArgs`, found `&str`
+   |                         |
+   |                         arguments to this method are incorrect
+   |
+   = note: expected reference `&calibre_db::cli::cmd_fits_search::RunArgs`
+              found reference `&'static str`
+note: method defined here
+  --> C:\Users\cyrex\files\projects\calibre-oxide\crates\calibre_db\src\cli\cmd_fits_search.rs:18:12
+   |
+18 |     pub fn run(&self, _args: &RunArgs) -> Result<()> {
+   |            ^^^
+
+error[E0061]: this method takes 2 arguments but 3 arguments were supplied
+  --> crates\calibre_db\tests\cli_remaining_p2_test.rs:17:22
+   |
+17 |     assert!(set_meta.run(1, "title", "New Title").is_err());
+   |                      ^^^ -           ----------- unexpected argument #3 of type `&'static str`
+   |                          |
+   |                          expected `&mut Library`, found integer
+   |
+note: expected `&[String]`, found `&str`
+  --> crates\calibre_db\tests\cli_remaining_p2_test.rs:17:29
+   |
+17 |     assert!(set_meta.run(1, "title", "New Title").is_err());
+   |                             ^^^^^^^
+   = note: expected reference `&[String]`
+              found reference `&'static str`
+note: method defined here
+  --> C:\Users\cyrex\files\projects\calibre-oxide\crates\calibre_db\src\cli\cmd_set_metadata.rs:11:12
+   |
+11 |     pub fn run(&self, db: &mut Library, args: &[String]) -> Result<()> {
+   |            ^^^
+help: remove the extra argument
+   |
+17 -     assert!(set_meta.run(1, "title", "New Title").is_err());
+17 +     assert!(set_meta.run(/* &mut Library */, /* &[String] */).is_err());
+   |
+
+error: could not compile `calibre_db` (test "cli_maintenance_test") due to 1 previous error
+error[E0308]: mismatched types
+  --> crates\calibre_db\tests\cli_remaining_p2_test.rs:20:24
+   |
+20 |     assert!(switch.run(Path::new("new_lib")).is_err());
+   |                    --- ^^^^^^^^^^^^^^^^^^^^ expected `&[String]`, found `&Path`
+   |                    |
+   |                    arguments to this method are incorrect
+   |
+   = note: expected reference `&[String]`
+              found reference `&Path`
+note: method defined here
+  --> C:\Users\cyrex\files\projects\calibre-oxide\crates\calibre_db\src\cli\cmd_switch.rs:12:12
+   |
+12 |     pub fn run(&self, args: &[String]) -> Result<()> {
+   |            ^^^
+
+warning: `calibre_db` (test "cli_stubs_test") generated 3 warnings
+error: could not compile `calibre_db` (test "cli_stubs_test") due to 1 previous error; 3 warnings emitted
+Some errors have detailed explanations: E0061, E0308.
+For more information about an error, try `rustc --explain E0061`.
+error: could not compile `calibre_db` (test "cli_remaining_p1_test") due to 4 previous errors
+warning: `calibre_db` (test "cli_remaining_p2_test") generated 1 warning
+error: could not compile `calibre_db` (test "cli_remaining_p2_test") due to 4 previous errors; 1 warning emitted
+warning: `calibre_db` (test "fts_test") generated 1 warning (run `cargo fix --test "fts_test" -p calibre_db` to apply 1 suggestion)
+warning: `calibre_db` (test "notes_test") generated 1 warning (run `cargo fix --test "notes_test" -p calibre_db` to apply 1 suggestion)

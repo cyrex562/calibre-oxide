@@ -10,9 +10,9 @@ pub struct NotesConnection {
 
 impl NotesConnection {
     pub fn new(conn: Arc<Mutex<Connection>>, library_path: &Path) -> Self {
-        let notes_dir = library_path.join("metadata_db_prefs_backup"); // Using a safe default or based on python's NOTES_DIR_NAME which is usually related to library root.
-                                                                       // Python: self.notes_dir = os.path.join(libdir, NOTES_DIR_NAME) where NOTES_DIR_NAME is often ".calnotes" or similar?
-                                                                       // Actually constants.py says NOTES_DIR_NAME = '.calnotes'.
+        // Using a safe default or based on python's NOTES_DIR_NAME which is usually related to library root.
+        // Python: self.notes_dir = os.path.join(libdir, NOTES_DIR_NAME) where NOTES_DIR_NAME is often ".calnotes" or similar?
+        // Actually constants.py says NOTES_DIR_NAME = '.calnotes'.
         let notes_dir = library_path.join(".calnotes");
 
         NotesConnection { conn, notes_dir }

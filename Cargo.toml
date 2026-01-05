@@ -2,6 +2,11 @@
 members = [
     "app",
     "crates/calibre_ai",
+    "crates/calibre_conversion",
     "crates/calibre_customize",
+    "crates/calibre_db",
+    "crates/calibre_devices",
+    "crates/calibre_ebooks",
+    "crates/calibre_utils",
 ]
 resolver = "2"

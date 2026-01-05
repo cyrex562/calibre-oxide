@@ -1,0 +1,275 @@
+warning: unused import: `std::os::windows::io::AsRawSocket`
+  --> crates\calibre_utils\src\socket_inheritance.rs:32:5
+   |
+32 | use std::os::windows::io::AsRawSocket;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `ToSocketAddrs`
+ --> crates\calibre_utils\src\network.rs:1:24
+  |
+1 | use std::net::{IpAddr, ToSocketAddrs};
+  |                        ^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+  --> crates\calibre_utils\src\seven_zip.rs:30:10
+   |
+30 |      let mut archive = open_archive(path)?;
+   |          ----^^^^^^^
+   |          |
+   |          help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `calibre_utils` (lib) generated 3 warnings (run `cargo fix --lib -p calibre_utils` to apply 3 suggestions)
+    Checking calibre_ebooks v0.1.0 (C:\Users\cyrex\files\projects\calibre-oxide\crates\calibre_ebooks)
+warning: unused import: `encoding_rs::Encoding`
+ --> crates\calibre_ebooks\src\html\input.rs:2:5
+  |
+2 | use encoding_rs::Encoding;
+  |     ^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `std::io::Read`
+ --> crates\calibre_ebooks\src\input\comic_input.rs:7:5
+  |
+7 | use std::io::Read;
+  |     ^^^^^^^^^^^^^
+
+warning: unused import: `PathBuf`
+  --> crates\calibre_ebooks\src\input\fb2_input.rs:10:23
+   |
+10 | use std::path::{Path, PathBuf};
+   |                       ^^^^^^^
+
+warning: unused import: `Context`
+ --> crates\calibre_ebooks\src\input\htmlz_input.rs:4:14
+  |
+4 | use anyhow::{Context, Result};
+  |              ^^^^^^^
+
+warning: unused import: `Context`
+ --> crates\calibre_ebooks\src\input\lrf_input.rs:4:14
+  |
+4 | use anyhow::{Context, Result};
+  |              ^^^^^^^
+
+warning: unused import: `std::collections::HashMap`
+ --> crates\calibre_ebooks\src\input\pml_input.rs:8:5
+  |
+8 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `PathBuf`
+  --> crates\calibre_ebooks\src\input\pml_input.rs:11:23
+   |
+11 | use std::path::{Path, PathBuf};
+   |                       ^^^^^^^
+
+warning: unused import: `std::collections::HashMap`
+ --> crates\calibre_ebooks\src\input\rb_input.rs:6:5
+  |
+6 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `PathBuf`
+ --> crates\calibre_ebooks\src\input\txt_input.rs:5:23
+  |
+5 | use std::path::{Path, PathBuf};
+  |                       ^^^^^^^
+
+warning: unused import: `Context`
+ --> crates\calibre_ebooks\src\lit\reader.rs:2:14
+  |
+2 | use anyhow::{Context, Result};
+  |              ^^^^^^^
+
+warning: unused import: `SeekFrom`
+ --> crates\calibre_ebooks\src\lit\reader.rs:3:27
+  |
+3 | use std::io::{Read, Seek, SeekFrom};
+  |                           ^^^^^^^^
+
+warning: unused import: `ITOLITLS`
+ --> crates\calibre_ebooks\src\metadata\lit.rs:1:37
+  |
+1 | use crate::lit::header::{LitHeader, ITOLITLS};
+  |                                     ^^^^^^^^
+
+warning: unused import: `MAGIC`
+ --> crates\calibre_ebooks\src\metadata\rb.rs:2:47
+  |
+2 | use crate::rb::header::{RbHeader, RbTocEntry, MAGIC};
+  |                                               ^^^^^
+
+warning: unused imports: `LittleEndian` and `ReadBytesExt`
+ --> crates\calibre_ebooks\src\metadata\rb.rs:4:17
+  |
+4 | use byteorder::{LittleEndian, ReadBytesExt};
+  |                 ^^^^^^^^^^^^  ^^^^^^^^^^^^
+
+warning: unused import: `bail`
+ --> crates\calibre_ebooks\src\metadata\snb.rs:2:14
+  |
+2 | use anyhow::{bail, Context, Result};
+  |              ^^^^
+
+warning: unused imports: `BigEndian` and `ReadBytesExt`
+ --> crates\calibre_ebooks\src\metadata\snb.rs:3:17
+  |
+3 | use byteorder::{BigEndian, ReadBytesExt};
+  |                 ^^^^^^^^^  ^^^^^^^^^^^^
+
+warning: unused imports: `Cursor` and `SeekFrom`
+ --> crates\calibre_ebooks\src\metadata\snb.rs:4:15
+  |
+4 | use std::io::{Cursor, Read, Seek, SeekFrom};
+  |               ^^^^^^              ^^^^^^^^
+
+warning: unused import: `Context`
+ --> crates\calibre_ebooks\src\mobi\headers.rs:1:20
+  |
+1 | use anyhow::{bail, Context, Result};
+  |                    ^^^^^^^
+
+warning: unused import: `crate::compression::palmdoc`
+ --> crates\calibre_ebooks\src\mobi\writer.rs:1:5
+  |
+1 | use crate::compression::palmdoc;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `Context`
+ --> crates\calibre_ebooks\src\mobi\writer.rs:4:14
+  |
+4 | use anyhow::{Context, Result};
+  |              ^^^^^^^
+
+warning: unused import: `std::collections::HashMap`
+ --> crates\calibre_ebooks\src\oeb\stylizer.rs:3:5
+  |
+3 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::oeb::constants::*`
+ --> crates\calibre_ebooks\src\oeb\writer.rs:2:5
+  |
+2 | use crate::oeb::constants::*;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `self`
+ --> crates\calibre_ebooks\src\output\htmlz_output.rs:4:15
+  |
+4 | use std::fs::{self, File};
+  |               ^^^^
+
+warning: unused import: `Context`
+ --> crates\calibre_ebooks\src\output\lrf_output.rs:2:14
+  |
+2 | use anyhow::{Context, Result};
+  |              ^^^^^^^
+
+warning: unused import: `Context`
+ --> crates\calibre_ebooks\src\output\pdb_output.rs:3:14
+  |
+3 | use anyhow::{Context, Result};
+  |              ^^^^^^^
+
+warning: unused import: `std::collections::BTreeMap`
+ --> crates\calibre_ebooks\src\output\pdf_output.rs:5:5
+  |
+5 | use std::collections::BTreeMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `bail`
+ --> crates\calibre_ebooks\src\pdb\reader.rs:2:14
+  |
+2 | use anyhow::{bail, Result};
+  |              ^^^^
+
+error[E0599]: no method named `clone` found for struct `PdbHeader` in the current scope
+  --> crates\calibre_ebooks\src\input\pdb_input.rs:21:36
+   |
+21 |         let header = reader.header.clone();
+   |                                    ^^^^^ method not found in `PdbHeader`
+   |
+  ::: crates\calibre_ebooks\src\pdb\header.rs:7:1
+   |
+ 7 | pub struct PdbHeader {
+   | -------------------- method `clone` not found for this struct
+   |
+   = help: items from traits can only be used if the trait is implemented and in scope
+   = note: the following trait defines an item `clone`, perhaps you need to implement it:
+           candidate #1: `Clone`
+
+warning: unreachable statement
+   --> crates\calibre_ebooks\src\metadata\tag_mapper.rs:206:17
+    |
+ 93 | /                 match action {
+ 94 | |                     "remove" => break,
+ 95 | |                     "keep" => {
+ 96 | |                         ans.push(current_tag.clone());
+...   |
+205 | |                 }
+    | |_________________- any code following this `match` expression is unreachable, as all arms diverge
+206 |                   break;
+    |                   ^^^^^^ unreachable statement
+    |
+    = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+  --> crates\calibre_ebooks\src\conversion\plumber.rs:44:13
+   |
+44 |         let mut book;
+   |             ----^^^^
+   |             |
+   |             help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+  --> crates\calibre_ebooks\src\docx\container.rs:21:13
+   |
+21 |         let mut zip = ZipArchive::new(reader)?;
+   |             ----^^^
+   |             |
+   |             help: remove this `mut`
+
+warning: unused variable: `exth`
+  --> crates\calibre_ebooks\src\input\mobi_input.rs:53:21
+   |
+53 |         if let Some(exth) = &section.exth {
+   |                     ^^^^ help: if this is intentional, prefix it with an underscore: `_exth`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `input_path`
+  --> crates\calibre_ebooks\src\input\tcr_input.rs:15:27
+   |
+15 |     pub fn convert(&self, input_path: &Path, output_dir: &Path) -> Result<OEBBook> {
+   |                           ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_input_path`
+
+warning: unused variable: `version_low`
+  --> crates\calibre_ebooks\src\metadata\haodoo.rs:64:9
+   |
+64 |     let version_low = pdb.version as u8; // pdb.version is u16 read as BE.
+   |         ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_version_low`
+
+warning: unused variable: `pos`
+   --> crates\calibre_ebooks\src\metadata\haodoo.rs:132:21
+    |
+132 |         if let Some(pos) = data.iter().position(|&b| b == 0x1b) {
+    |                     ^^^ help: if this is intentional, prefix it with an underscore: `_pos`
+
+warning: variable does not need to be mutable
+   --> crates\calibre_ebooks\src\opf.rs:167:21
+    |
+167 |                 let mut event = node
+    |                     ----^^^^^
+    |                     |
+    |                     help: remove this `mut`
+
+For more information about this error, try `rustc --explain E0599`.
+warning: `calibre_ebooks` (lib) generated 35 warnings
+error: could not compile `calibre_ebooks` (lib) due to 1 previous error; 35 warnings emitted

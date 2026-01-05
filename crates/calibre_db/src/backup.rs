@@ -1,6 +1,6 @@
 use crate::cache::Cache;
 use anyhow::{Context, Result};
-use calibre_ebooks::opf::OpfMetadata;
+use calibre_ebooks::metadata::MetaInformation;
 use std::fs;
 use std::sync::{Arc, Mutex};
 
@@ -19,8 +19,8 @@ pub fn backup_metadata(cache: &Arc<Mutex<Cache>>, book_id: i32) -> Result<()> {
         .field_for(book_id, "path")?
         .context("Book path missing")?;
 
-    // Construct OpfMetadata
-    let mut meta = OpfMetadata::default();
+    // Construct MetaInformation
+    let mut meta = MetaInformation::default();
     meta.title = title;
     meta.authors = vec![author_sort]; // In a real app we'd parse authors correctly or fetch from authors table
     meta.uuid = uuid;

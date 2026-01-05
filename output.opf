@@ -1,0 +1,12 @@
+<?xml version='1.0' encoding='utf-8'?>
+<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="uuid_id" version="2.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
+    <dc:title>Quick Start Guide</dc:title>
+    <dc:creator opf:role="aut" opf:file-as="John Schember">John Schember</dc:creator>
+    <dc:identifier id="uuid_id" opf:scheme="uuid">2c3272a4-731b-4348-909d-6f38b97b18eb</dc:identifier>
+    <dc:description>calibre Quick Start Guide</dc:description>
+    <meta name="calibre:timestamp" content="2026-01-02T16:26:36.309711400+00:00"/>
+    <dc:date opf:event="modification">2026-01-02T16:26:36.309711400+00:00</dc:date>
+  </metadata>
+  <guide/>
+</package>

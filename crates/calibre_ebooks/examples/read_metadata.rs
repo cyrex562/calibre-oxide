@@ -29,20 +29,20 @@ fn main() -> anyhow::Result<()> {
         } else if ext.eq_ignore_ascii_case("epub") {
             read_epub_metadata(&path)?
         } else {
-             eprintln!("Unsupported extension: {}", ext);
-             std::process::exit(1);
+            eprintln!("Unsupported extension: {}", ext);
+            std::process::exit(1);
         }
     } else {
-         eprintln!("No extension found");
-         std::process::exit(1);
+        eprintln!("No extension found");
+        std::process::exit(1);
     };
 
     println!("Title: {}", meta.title);
     println!("Authors: {:?}", meta.authors);
-    println!("Language: {:?}", meta.language);
+    println!("Language: {:?}", meta.languages);
     println!("UUID: {:?}", meta.uuid);
     println!("Cover ID: {:?}", meta.cover_id);
-    println!("Description: {:?}", meta.description);
+    println!("Description: {:?}", meta.comments);
 
     Ok(())
 }

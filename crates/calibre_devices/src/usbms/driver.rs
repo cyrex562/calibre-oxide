@@ -10,19 +10,19 @@ use std::path::{Path, PathBuf};
 const METADATA_CACHE: &str = "metadata.calibre";
 
 #[derive(Debug, Serialize, Deserialize)]
-struct BookMetadata {
-    title: String,
-    authors: Vec<String>,
-    lpath: String,
-    size: u64,
+pub struct BookMetadata {
+    pub title: String,
+    pub authors: Vec<String>,
+    pub lpath: String,
+    pub size: u64,
     #[serde(default)]
-    uuid: Option<String>,
+    pub uuid: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct MetadataCache {
+pub struct MetadataCache {
     #[serde(default)]
-    books: Vec<BookMetadata>,
+    pub books: Vec<BookMetadata>,
 }
 
 pub struct USBMSDevice {
@@ -50,7 +50,7 @@ impl USBMSDevice {
         device
     }
 
-    fn get_prefix(&self, on_card: Option<&str>) -> Result<&Path> {
+    pub fn get_prefix(&self, on_card: Option<&str>) -> Result<&Path> {
         match on_card {
             Some("carda") => self
                 .card_a_prefix
@@ -67,7 +67,7 @@ impl USBMSDevice {
         }
     }
 
-    fn read_metadata_cache(&self, prefix: &Path) -> Result<MetadataCache> {
+    pub fn read_metadata_cache(&self, prefix: &Path) -> Result<MetadataCache> {
         let cache_path = prefix.join(METADATA_CACHE);
         if cache_path.exists() {
             let content =
@@ -78,7 +78,7 @@ impl USBMSDevice {
         }
     }
 
-    fn write_metadata_cache(&self, prefix: &Path, cache: &MetadataCache) -> Result<()> {
+    pub fn write_metadata_cache(&self, prefix: &Path, cache: &MetadataCache) -> Result<()> {
         let cache_path = prefix.join(METADATA_CACHE);
         let content =
             serde_json::to_string_pretty(cache).context("Failed to serialize metadata cache")?;
@@ -90,7 +90,7 @@ impl USBMSDevice {
         Ok(())
     }
 
-    fn scan_books(&self, prefix: &Path) -> Result<Vec<DeviceBook>> {
+    pub fn scan_books(&self, prefix: &Path) -> Result<Vec<DeviceBook>> {
         let mut books = Vec::new();
         let mut cache = self
             .read_metadata_cache(prefix)

@@ -241,3 +241,33 @@ pub fn find_identical_books(
 
     ans
 }
+
+// --- Range Parsing ---
+
+pub fn integers_from_string(s: &str) -> Vec<i32> {
+    let mut ids = HashSet::new();
+    for part in s.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if part.contains('-') {
+            let ranges: Vec<&str> = part.split('-').collect();
+            if ranges.len() == 2 {
+                if let (Ok(start), Ok(end)) = (
+                    ranges[0].trim().parse::<i32>(),
+                    ranges[1].trim().parse::<i32>(),
+                ) {
+                    for i in start..=end {
+                        ids.insert(i);
+                    }
+                }
+            }
+        } else if let Ok(id) = part.parse::<i32>() {
+            ids.insert(id);
+        }
+    }
+    let mut result: Vec<i32> = ids.into_iter().collect();
+    result.sort();
+    result
+}

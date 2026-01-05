@@ -1,3 +1,9 @@
+pub mod android;
+pub mod folder_device;
 pub mod interface;
+pub mod kindle;
+pub mod nook;
 pub mod scanner;
+pub mod smart_device_app;
 pub mod usbms;
+pub mod userdefined;

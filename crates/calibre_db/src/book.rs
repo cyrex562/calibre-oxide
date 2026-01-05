@@ -1,5 +1,6 @@
+use serde::Serialize;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Book {
     pub id: i32,
     pub title: String,

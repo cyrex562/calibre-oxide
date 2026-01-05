@@ -1,7 +1,7 @@
 - [ ] Support downloading cover images (metadata fetching).
 - [ ] **Device Detection**:
     - Port `calibre.devices` logic to detect USB storage and MTP devices.
-    - specialized drivers for Kindle, Kobo, Nook, etc.
+    - specialized drivers for Kindle, Kobo, Nook, etc. [/]
 - [ ] **Device View**:
     - A GUI view to show books currently on the connected device.
 - [ ] **Transfer Logic**:
@@ -33,4 +33,4 @@
 
 
 
-select the next set of files to port to rust, port them to rust, then mark them complete in modules_to_port.md
+select the next set of files to port to rust, port them to rust, then mark them complete in modules_to_port.md. If you decide to create a stub mark it as such in docs/stubs_to_complete.md. Ensure that each ported module has passing property and/or unit tests.

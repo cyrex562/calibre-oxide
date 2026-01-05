@@ -61,3 +61,138 @@ This document outlines the remaining work required to make `calibre-oxide` a ful
 1. **Cover Rendering**: It makes the app feel "real".
 2. **Add Book**: The most essential library function.
 3. **Edit Metadata**: To fix import errors.
+
+## tasks moved from modules_to_port.md
+
+### src/calibre/devices
+
+
+#### binatone
+
+- [ ] __init__.py
+- [ ] driver.py
+
+#### boeye
+
+- [ ] __init__.py
+- [ ] driver.py
+
+#### blackberry
+
+- [ ] __init__.py
+- [ ] driver.py
+
+#### cybook
+
+- [ ] __init__.py
+- [ ] driver.py
+- [ ] t2b.py
+- [ ] t4b.py
+
+#### eb600
+
+- [ ] __init__.py
+- [ ] driver.py
+
+#### edge
+
+- [ ] __init__.py
+- [ ] driver.py
+
+#### eslick
+
+- [ ] __init__.py
+- [ ] driver.py
+
+#### hanlin
+
+- [ ] __init__.py
+- [ ] driver.py
+
+#### hanvon
+
+- [ ] __init__.py
+- [ ] driver.py
+
+#### iliad
+
+- [ ] __init__.py
+- [ ] driver.py
+
+#### irexdr
+
+- [ ] __init__.py
+- [ ] driver.py
+
+#### iriver
+
+- [ ] __init__.py
+- [ ] driver.py
+
+#### jetbook
+
+- [ ] __init__.py
+- [ ] driver.py
+
+
+#### nokia
+
+- [ ] __init__.py
+- [ ] driver.py
+
+
+#### nuut2
+
+- [ ] __init__.py
+- [ ] driver.py
+
+#### paladin
+
+- [ ] __init__.py
+- [ ] driver.py
+
+#### prs505
+
+- [ ] __init__.py
+- [ ] driver.py
+- [ ] sony_cache.py
+
+#### prst1
+
+- [ ] __init__.py
+- [ ] driver.py
+
+
+#### sne
+
+- [ ] __init__.py
+- [ ] driver.py
+
+#### teclast
+
+- [ ] __init__.py
+- [ ] driver.py
+
+### src/calibre/ebooks
+
+#### compression (Legacy Palm/Psion formats - Future Nice-to-Have)
+
+> **Note:** These are obsolete 1990s Palm/Psion compression formats with no public specifications.
+> Marked as low priority for future implementation if needed.
+
+- [ ] __init__.py
+- [x] palmdoc.c
+- [x] palmdoc.py (PalmDoc compression - proprietary Palm format)
+- [ ] tcr.py (TCR compression - proprietary Psion format)
+
+
+##### haodoo
+
+- [ ] __init__.py
+- [ ] reader.py
+
+##### palmdoc
+
+- [ ] __init__.py
+- [ ] reader.py
+- [ ] writer.py
