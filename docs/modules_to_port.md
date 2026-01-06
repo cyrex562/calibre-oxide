@@ -174,12 +174,12 @@
 
 #### kobo
 
-- [ ] __init__.py
-- [ ] driver.py
-- [ ] bookmark.py
-- [ ] books.py
-- [ ] db.py
-- [ ] kobotouch_config.py
+- [x] __init__.py
+- [x] driver.py (Stub)
+- [x] bookmark.py (Stub)
+- [x] books.py (Stub)
+- [x] db.py (Stub)
+- [x] kobotouch_config.py (Stub)
 
 #### libusb
 
@@ -519,12 +519,14 @@
 #### mobi
 
 - [ ] __init__.py
-- [ ] huffcdic.py
-- [ ] langcodes.py
-- [ ] mobiml.py
+- [x] huffcdic.py
+- [x] langcodes.py
+- [x] mobiml.py (Stub)
+
 - [ ] tbs_periodicals.rst
-- [ ] tweak.py
-- [ ] utils.py
+- [x] tweak.py (Stub)
+
+- [x] utils.py
 
 ##### debug
 
@@ -539,13 +541,13 @@
 ##### reader
 
 - [ ] __init__.py
-- [ ] containers.py
-- [ ] headers.py
-- [ ] index.py
-- [ ] markup.py
+- [x] containers.py
+- [x] headers.py
+- [x] index.py
+- [x] markup.py
 - [ ] mobi6.py
 - [ ] mobi8.py
-- [ ] ncx.py
+- [x] ncx.py
 
 ##### writer2
 

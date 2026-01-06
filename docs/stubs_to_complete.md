@@ -9,7 +9,12 @@ The following modules have been ported as stubs or placeholders and need full im
 | `crates/calibre_devices/src/android/driver.rs` | `calibre/devices/android/driver.py` | Implementation of Android MTP/ADB communication. |
 | `crates/calibre_devices/src/nook/driver.rs` | `calibre/devices/nook/driver.py` | Driver for Barnes & Noble Nook devices. |
 | `crates/calibre_devices/src/smart_device_app/driver.rs` | `calibre/devices/smart_device_app/driver.py` | Support for Calibre Companion and similar apps. |
-| `crates/calibre_devices/src/userdefined/driver.rs` | `calibre/devices/userdefined/driver.py` | User-configurable device specifications. |
+| `crates/calibre_devices/src/kobo/driver.rs` | `calibre/devices/kobo/driver.py` | Driver for Kobo eReaders. |
+| `crates/calibre_devices/src/kobo/bookmark.rs` | `calibre/devices/kobo/bookmark.py` | Kobo bookmark handling. |
+| `crates/calibre_devices/src/kobo/books.rs` | `calibre/devices/kobo/books.py` | Kobo book metadata handling. |
+| `crates/calibre_devices/src/kobo/db.rs` | `calibre/devices/kobo/db.py` | Kobo internal SQLite DB interaction. |
+| `crates/calibre_devices/src/kobo/kobotouch_config.rs` | `calibre/devices/kobo/kobotouch_config.py` | KoboTouch specific configuration. |
+
 
 
 ## Ebook Input Plugins
@@ -46,3 +51,13 @@ The following modules have been ported as stubs or placeholders and need full im
 | `crates/calibre_db/src/legacy.rs` | `calibre/db/legacy.py` | Logic for detecting and migrating old database schemas. |
 | `crates/calibre_ebooks/src/conversion/archives.rs` | `calibre/ebooks/conversion/archives.py` | RAR and 7z extraction (currently stubs in `ArchiveHandler`). |
 | `crates/calibre_ebooks/src/conversion/preprocess.rs` | `calibre/ebooks/conversion/preprocess.py` | HTML/CSS preprocessing logic. |
+
+## Mobi
+
+| Rust File | Original Python File | Description |
+|-----------|----------------------|-------------|
+| `crates/calibre_ebooks/src/mobi/tweak.rs` | `calibre/ebooks/mobi/tweak.py` | Explode/Rebuild MOBI functionality. Stubbed due to missing dependencies (`MobiReader`, `Plumber`). |
+| `crates/calibre_ebooks/src/mobi/mobiml.rs` | `calibre/ebooks/mobi/mobiml.py` | XHTML to MobiML conversion. Stubbed due to complexity. |
+| `crates/calibre_ebooks/src/mobi/utils.rs` | `calibre/ebooks/mobi/utils.py` | `mobify_image` and `rescale_image` are stubs requiring image processing library. |
+| `crates/calibre_ebooks/src/mobi/mobi6.rs` | `calibre/ebooks/mobi/reader/mobi6.py` | Implementation of MOBI 6 reading logic (Headers ported, content extraction stubbed). |
+
