@@ -1,9 +1,11 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use byteorder::{BigEndian, ReadBytesExt};
 use std::io::{Read, Seek, SeekFrom};
 
 /// The common header for all PDB-based files is handled loosely here or via `pdb` module.
 /// Here we focus on the specific MOBI headers which follow the PDB header's Record 0.
+
+pub const NULL_INDEX: u32 = 0xFFFFFFFF;
 
 #[derive(Debug, Clone)]
 pub struct PalmDocHeader {
@@ -74,6 +76,12 @@ pub struct MobiHeader {
     pub drm_count: u32,
     pub drm_size: u32,
     pub drm_flags: u32,
+    // KF8 specific fields
+    pub ncx_index: u32,
+    pub skel_index: u32,
+    pub div_index: u32,
+    pub fdst_index: u32,
+    pub fdst_count: u32,
 }
 
 impl MobiHeader {
@@ -131,11 +139,34 @@ impl MobiHeader {
         let drm_size = reader.read_u32::<BigEndian>()?;
         let drm_flags = reader.read_u32::<BigEndian>()?;
 
-        // Skip rest of header based on header_length
-        // Bytes read so far: 4 (MOBI) + 4 (len) + ~150...
-        // We know we are at 112 + 32 + 16 = 160 bytes relative to start of MOBI header.
-        // if header_length > 160, skip delta.
-        // Typically it is >= 232 for recent files.
+        // Current position: 160 (16 + 4*24 + 32 + 4*4)
+        // ncx_index is at 0xF4 (244) relative to start (if we started at 0)
+        // Only read if header_length is large enough
+
+        let mut ncx_index = NULL_INDEX;
+        let mut skel_index = NULL_INDEX;
+        let mut div_index = NULL_INDEX;
+        let mut fdst_index = NULL_INDEX;
+        let mut fdst_count = 0;
+
+        if header_length >= 248 {
+            // Require enough bytes for ncx_index
+            // Skip from 160 to 244: 84 bytes
+            reader.seek(SeekFrom::Current(84))?;
+            ncx_index = reader.read_u32::<BigEndian>()?;
+        }
+
+        if header_length >= 264 {
+            // KF8 Header fields
+            // Skip from 248 (244+4) to 264: 16 bytes
+            reader.seek(SeekFrom::Current(16))?;
+            skel_index = reader.read_u32::<BigEndian>()?;
+            div_index = reader.read_u32::<BigEndian>()?;
+            fdst_index = reader.read_u32::<BigEndian>()?;
+            fdst_count = reader.read_u32::<BigEndian>()?;
+        }
+
+        // We assume we don't need to be perfectly at end of header for now
 
         Ok(MobiHeader {
             identifier,
@@ -171,10 +202,16 @@ impl MobiHeader {
             drm_count,
             drm_size,
             drm_flags,
+            ncx_index,
+            skel_index,
+            div_index,
+            fdst_index,
+            fdst_count,
         })
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct ExthHeader {
     pub records: Vec<(u32, Vec<u8>)>,
 }
@@ -205,5 +242,98 @@ impl ExthHeader {
         }
 
         Ok(ExthHeader { records })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BookHeader {
+    pub palmdoc: PalmDocHeader,
+    pub mobi: MobiHeader,
+    pub exth: Option<ExthHeader>,
+    pub title: String,
+    pub codec: String,
+    pub compression_type: u16,
+    pub encryption_type: u16,
+    pub first_image_index: u32,
+    pub mobi_version: u32,
+    pub huff_offset: Option<u32>,
+    pub huff_number: Option<u32>,
+}
+
+impl BookHeader {
+    pub fn parse(raw: &[u8], user_encoding: Option<&str>) -> Result<Self> {
+        let mut reader = std::io::Cursor::new(raw);
+        let palmdoc = PalmDocHeader::parse(&mut reader)?;
+
+        let identifier_offset = 16;
+        reader.seek(SeekFrom::Start(identifier_offset))?;
+        // Removed identifier reading check here as MobiHeader::parse does it.
+
+        reader.seek(SeekFrom::Start(identifier_offset))?;
+        let mobi = MobiHeader::parse(&mut reader)?;
+
+        let mut exth = None;
+        if (mobi.exth_flags & 0x40) != 0 {
+            // calculated offset: 16 (PalmDoc) + mobi.header_length
+            let mobi_header_start = 16;
+            let exth_start = mobi_header_start + mobi.header_length as u64;
+            reader.seek(SeekFrom::Start(exth_start))?;
+
+            if let Ok(e) = ExthHeader::parse(&mut reader) {
+                exth = Some(e);
+            }
+        }
+
+        let codec = if mobi.text_encoding == 65001 {
+            "utf-8".to_string()
+        } else {
+            match mobi.text_encoding {
+                1252 => "cp1252".to_string(),
+                _ => user_encoding.unwrap_or("cp1252").to_string(),
+            }
+        };
+
+        let title_start = mobi.full_name_offset as u64;
+        let title_len = mobi.full_name_length as usize;
+        let mut title = String::from("Unknown");
+
+        if (title_start as usize) < raw.len() {
+            reader.seek(SeekFrom::Start(title_start))?;
+            let mut title_bytes = vec![0u8; title_len];
+            if reader.read_exact(&mut title_bytes).is_ok() {
+                if codec == "utf-8" {
+                    title = String::from_utf8_lossy(&title_bytes).to_string();
+                } else {
+                    // Basic fallback for now
+                    let (cow, _, _) = encoding_rs::WINDOWS_1252.decode(&title_bytes);
+                    title = cow.to_string();
+                }
+            }
+        }
+
+        let mut huff_offset = None;
+        let mut huff_number = None;
+        if palmdoc.compression == 17480 {
+            // 'DH'
+            huff_offset = Some(mobi.huffman_record_offset);
+            huff_number = Some(mobi.huffman_record_count);
+        }
+
+        let compression_type = palmdoc.compression;
+        let encryption_type = palmdoc.encryption_type;
+
+        Ok(BookHeader {
+            palmdoc,
+            mobi: mobi.clone(),
+            exth,
+            title,
+            codec,
+            compression_type,
+            encryption_type,
+            first_image_index: mobi.first_image_index,
+            mobi_version: mobi.file_version,
+            huff_offset,
+            huff_number,
+        })
     }
 }
