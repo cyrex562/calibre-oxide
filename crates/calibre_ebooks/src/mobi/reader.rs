@@ -1,5 +1,6 @@
 use crate::compression::palmdoc::decompress;
 use crate::mobi::headers::{ExthHeader, MobiHeader, PalmDocHeader};
+use crate::mobi::huffcdic::HuffReader;
 use crate::pdb::header::PdbHeader;
 use anyhow::{Context, Result};
 use byteorder::{BigEndian, ReadBytesExt};
@@ -12,7 +13,8 @@ pub struct MobiSection {
     pub palmdoc: PalmDocHeader,
     pub mobi: MobiHeader,
     pub exth: Option<ExthHeader>,
-    pub start_record: usize, // Index in PDB records
+    pub start_record: usize,
+    pub huff_reader: Option<HuffReader>,
 }
 
 impl MobiSection {
@@ -36,22 +38,59 @@ impl MobiSection {
             }
         }
 
+        // Load Huff/CDIC if compression is 17480
+        let mut huff_reader = None;
+        if palmdoc.compression == 17480 {
+            let huff_offset = mobi.huffman_record_offset;
+            let huff_count = mobi.huffman_record_count;
+
+            if huff_count > 0 {
+                let mut huff_records = Vec::new();
+                for i in 0..huff_count {
+                    let rec_idx = (huff_offset + i) as usize;
+                    if rec_idx < pdb_header.records.len() {
+                        let rec = &pdb_header.records[rec_idx];
+                        reader.seek(SeekFrom::Start(rec.offset as u64))?;
+                        // How much to read? Next record offset - this record offset
+                        let next_offset = if rec_idx + 1 < pdb_header.records.len() {
+                            pdb_header.records[rec_idx + 1].offset as u64
+                        } else {
+                            // Assuming EOF or last record
+                            // We don't easily know file size here without querying metadata, which we can do if we pass File, but we pass Read+Seek
+                            // However, usually we can just read enough? Or seek end.
+                            reader.seek(SeekFrom::End(0))?
+                        };
+                        let len = next_offset - rec.offset as u64;
+                        reader.seek(SeekFrom::Start(rec.offset as u64))?;
+
+                        let mut buf = vec![0u8; len as usize];
+                        reader.read_exact(&mut buf)?;
+                        huff_records.push(buf);
+                    }
+                }
+
+                if !huff_records.is_empty() {
+                    match HuffReader::new(&huff_records) {
+                        Ok(hr) => huff_reader = Some(hr),
+                        Err(e) => eprintln!("Failed to init HuffReader: {}", e),
+                    }
+                }
+            }
+        }
+
         Ok(MobiSection {
             palmdoc,
             mobi,
             exth,
             start_record: record_index,
+            huff_reader,
         })
     }
 
-    pub fn extract_text(&self, path: &Path, pdb_header: &PdbHeader) -> Result<String> {
+    pub fn extract_text(&mut self, path: &Path, pdb_header: &PdbHeader) -> Result<String> {
         let mut f = File::open(path)?;
         let mut content_data = Vec::new();
 
-        // Text records start after header.
-        // For primary section (Rec 0), text starts at Rec 1.
-        // For KF8 section, text starts at `start_record + 1`?
-        // Yes, typically the header record is immediately followed by text records.
         let fst_txt_rec = self.start_record + 1;
         let lst_txt_rec = fst_txt_rec + self.palmdoc.record_count as usize;
 
@@ -78,11 +117,15 @@ impl MobiSection {
                 2 => decompress(&buf)?,
                 1 => buf,
                 17480 => {
-                    // HUFF/CDIC
-                    // Not implemented yet, return raw or empty?
-                    // Warn and return raw for debugging
-                    eprintln!("Warning: HUFF/CDIC compression not supported yet.");
-                    buf
+                    if let Some(hr) = &mut self.huff_reader {
+                        hr.unpack(&buf)?
+                    } else {
+                        // Warn and return raw for debugging
+                        eprintln!(
+                            "Warning: HUFF/CDIC compression required but reader not initialized."
+                        );
+                        buf
+                    }
                 }
                 _ => anyhow::bail!("Unsupported compression type: {}", self.palmdoc.compression),
             };
