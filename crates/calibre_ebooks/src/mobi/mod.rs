@@ -1,3 +1,13 @@
+pub mod containers;
 pub mod headers;
+pub mod huffcdic;
+pub mod index;
+pub mod langcodes;
+pub mod markup;
+pub mod mobi6;
+pub mod mobiml;
+pub mod ncx;
 pub mod reader;
+pub mod tweak;
+pub mod utils;
 pub mod writer;
