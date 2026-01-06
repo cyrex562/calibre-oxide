@@ -1,2 +1,2 @@
 pub mod driver;
-pub use driver::UserDefinedDevice;
+pub use driver::{UserDefinedConfig, UserDefinedDevice};
