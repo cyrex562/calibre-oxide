@@ -12,21 +12,23 @@ impl MOBIInput {
 
     pub fn convert(&self, input_path: &Path, output_dir: &Path) -> Result<OEBBook> {
         println!("Reading MOBI...");
-        let reader = MobiReader::new(input_path)?;
+        let mut reader = MobiReader::new(input_path)?;
+        let pdb_header = &reader.pdb_header;
+        let sections = &mut reader.sections;
 
         // Select best section (KF8 preferred)
-        let section = if reader.sections.len() > 1 {
+        let section = if sections.len() > 1 {
             println!("Joint MOBI detected. Using KF8 section.");
-            &reader.sections[1]
+            &mut sections[1]
         } else {
-            &reader.sections[0]
+            &mut sections[0]
         };
 
         println!(
             "Extracting text from section (Start Record: {})...",
             section.start_record
         );
-        let raw_text = section.extract_text(input_path, &reader.pdb_header)?;
+        let raw_text = section.extract_text(input_path, pdb_header)?;
 
         // Basic OEB Book Construction
         use crate::oeb::container::DirContainer;
