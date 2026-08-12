@@ -19,7 +19,7 @@
 
 - [x] __init__.py
 - [x] backend.py
-- [ ] config.py
+- [x] config.py
 
 #### lm_studio
 

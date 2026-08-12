@@ -9,7 +9,9 @@ use std::path::PathBuf;
 
 const API_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const MODELS_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=500";
-const PLUGIN_NAME: &str = "GoogleAI";
+pub(crate) const PLUGIN_NAME: &str = "GoogleAI";
+
+pub mod config;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Price {
