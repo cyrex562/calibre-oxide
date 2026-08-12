@@ -8,5 +8,6 @@ members = [
     "crates/calibre_devices",
     "crates/calibre_ebooks",
     "crates/calibre_utils",
+    "tools/harness",
 ]
 resolver = "2"

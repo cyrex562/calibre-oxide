@@ -28,7 +28,7 @@ impl OutputPlugin for MockOutput {
         // create a copy or just move fields if we could, but we can't consume.
         // We'll just manufacture a copy for the test check
         let copy = OebBook {
-            metadata: calibre_ebooks::opf::OpfMetadata {
+            metadata: calibre_ebooks::metadata::MetaInformation {
                 title: book.metadata.title.clone(),
                 authors: book.metadata.authors.clone(),
                 ..Default::default()

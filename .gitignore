@@ -32,6 +32,13 @@ ENV/
 .env
 .venv
 
+# Node / Tauri
+node_modules/
+app/dist/
+app/src-tauri/target/
+pnpm-debug.log*
+npm-debug.log*
+
 # IDEs
 .idea/
 .vscode/
@@ -41,3 +48,29 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
+
+# Harness scratch
+.harness/logs/
+.harness/tmp/
+.harness/state.json
+
+# Test / build artifacts left at repo root during development.
+# These should live in .harness/logs/ or under target/, never at root.
+/build_err*.txt
+/build_error*.log
+/check*.log
+/check*.txt
+/check_output*.txt
+/debug_output*.txt
+/err*.txt
+/error*.log
+/lit_err*.txt
+/lit_success*.txt
+/oeb_reader_error*.txt
+/stderr*.txt
+/test_error*.log
+/test_output*.txt
+/test_results*.txt
+/output*.txt
+/output*.opf
+/output*.epub

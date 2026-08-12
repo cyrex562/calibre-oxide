@@ -1,4 +1,4 @@
-use calibre_ebooks::opf::OpfMetadata;
+use calibre_ebooks::metadata::MetaInformation;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -31,7 +31,7 @@ pub struct GuideReference {
 /// Based on the Open eBook (OEB) format used by Calibre.
 #[derive(Debug, Default)]
 pub struct OebBook {
-    pub metadata: OpfMetadata,
+    pub metadata: MetaInformation,
     pub manifest: HashMap<String, ManifestItem>,
     pub spine: Vec<SpineItem>,
     pub guide: Vec<GuideReference>,

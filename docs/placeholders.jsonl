@@ -1,0 +1,3 @@
+{"crate_name":"harness","path":"tools/harness/src/commands/playtest.rs","line":17,"kind":"comment","reason":"walk merges since `since`, group by cluster, emit"}
+{"crate_name":"harness","path":"tools/harness/src/commands/run.rs","line":48,"kind":"comment","reason":"implement iteration loop — see docs/HARNESS.md §Iteration loop."}
+{"crate_name":"harness","path":"tools/harness/src/commands/sweep.rs","line":16,"kind":"comment","reason":"iterate state.green_judged_prs, re-verify each, gh pr merge --squash --auto."}
