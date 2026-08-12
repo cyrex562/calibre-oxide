@@ -357,6 +357,12 @@ fn is_deferred(stack: &[String], file: &str) -> bool {
         "nook",
         // MTP unix / windows native drivers — will wire Android via ADB, not raw MTP.
         "mtp",
+        // macOS-only IOKit extension. get_usb_devices is superseded by
+        // the cross-platform calibre_devices::libusb port; the other
+        // functions (mounted-filesystem enumeration, locale, MTP probe)
+        // are macOS-specific and out of scope for the user's
+        // Windows/Linux/Android platforms.
+        "usbobserver",
     ];
     for name in obsolete_devices {
         if full.split('/').any(|s| s == name) {
@@ -400,6 +406,10 @@ mod tests {
         assert!(is_deferred(&["src/calibre".into(), "devices".into(), "nook".into()], "driver.py"));
         assert!(is_deferred(&["src/pyj".into(), "book_list".into()], "add.pyj"));
         assert!(is_deferred(&["src/pyj".into(), "read_book".into()], "cfi.pyj"));
+        assert!(is_deferred(
+            &["src/calibre".into(), "devices".into(), "usbobserver".into()],
+            "usbobserver.c"
+        ));
         assert!(is_deferred(&["src/perfect-hashing".into(), "frozen".into()], "map.h"));
         assert!(is_deferred(&["src/calibre".into(), "gui2".into(), "viewer".into()], "main.py"));
         assert!(is_deferred(&["src/calibre".into(), "headless".into()], "main.cpp"));
