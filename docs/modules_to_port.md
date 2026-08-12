@@ -284,10 +284,10 @@
 
 #### conversion
 
-- [ ] __init__.py
+- [x] __init__.py
 - [x] archives.py
-- [ ] cli.py
-- [ ] config.py
+- [x] cli.py (ported into `calibre_conversion::cli_helpers` — input/output validation, USAGE banner, HEURISTIC_OPTIONS. Plugin-driven option assembly deferred to #126)
+- [x] config.py (ported into `calibre_conversion::config` — GuiRecommendations JSON roundtrip, OPTIONS registry, format-preference helpers, atomic save/load. DB-integrated `*_specifics` deferred to #93 LibraryHandle)
 - [x] plumber.py
 - [x] preprocess.py
 - [x] search_replace.py
