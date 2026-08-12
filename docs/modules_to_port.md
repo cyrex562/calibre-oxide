@@ -183,7 +183,7 @@
 
 #### libusb
 
-- [ ] libusb.c
+- [x] libusb.c (ported to `calibre_devices::libusb` using pure-Rust `nusb`)
 
 #### mtp
 
