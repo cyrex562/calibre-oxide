@@ -166,11 +166,11 @@
 
 ###### generators
 
-- [ ] __init__.py
-- [ ] accurate_page_generator.py
-- [ ] exact_page_generator.py
-- [ ] fast_page_generator.py
-- [ ] pagebreak_page_generator.py
+- [x] __init__.py
+- [x] accurate_page_generator.py
+- [x] exact_page_generator.py
+- [x] fast_page_generator.py
+- [x] pagebreak_page_generator.py
 
 #### kobo
 

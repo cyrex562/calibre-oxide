@@ -470,6 +470,7 @@ dependencies = [
  "calibre_ebooks",
  "calibre_utils",
  "log",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

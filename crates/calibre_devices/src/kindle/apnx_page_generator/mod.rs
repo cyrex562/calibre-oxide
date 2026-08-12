@@ -6,12 +6,13 @@
 //! (Fast/Accurate/Exact/Pagebreak) live under `generators/` and are a
 //! separate issue.
 
+pub mod generators;
 pub mod i_page_generator;
 pub mod page_group;
 pub mod page_number_type;
 pub mod pages;
 
-pub use i_page_generator::{mobi_html_length, IPageGenerator};
+pub use i_page_generator::{mobi_html, mobi_html_length, IPageGenerator};
 pub use page_group::PageGroup;
 pub use page_number_type::PageNumberType;
 pub use pages::Pages;

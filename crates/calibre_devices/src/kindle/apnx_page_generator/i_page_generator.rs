@@ -1,12 +1,12 @@
 //! Port of `i_page_generator.py`.
 //!
-//! The abstract-base-class + free helper functions. Concrete
-//! generator implementations (Fast/Accurate/Exact/Pagebreak) live
-//! under `generators/` — separate issue.
+//! The abstract-base-class + free helper functions used by the
+//! concrete `generators/*` implementations.
 
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
+use calibre_ebooks::mobi::reader::MobiReader;
 
 use super::pages::Pages;
 
@@ -84,6 +84,30 @@ pub fn mobi_html_length(mobi_file_path: &Path) -> Result<u32> {
     let mut text_len_buf = [0u8; 4];
     f.read_exact(&mut text_len_buf).context("read text length")?;
     Ok(u32::from_be_bytes(text_len_buf))
+}
+
+/// Port of `mobi_html` — decompress a MOBI file's text stream and
+/// return it as lowercased UTF-8 bytes. Errors if the book is
+/// DRMed (matches Python `raise Exception('DRMed book')`).
+///
+/// The Accurate + Pagebreak generators feed the resulting bytes to
+/// ASCII-only state machines / regexes, so returning `Vec<u8>` is
+/// correct and matches the Python `as_bytes(mr.mobi_html.lower())`.
+pub fn mobi_html(mobi_file_path: &Path) -> Result<Vec<u8>> {
+    let mut reader = MobiReader::new(mobi_file_path)
+        .with_context(|| format!("open MOBI {:?}", mobi_file_path))?;
+    if reader.sections.is_empty() {
+        return Err(anyhow!("MOBI has no sections"));
+    }
+    if reader.sections[0].palmdoc.encryption_type != 0 {
+        return Err(anyhow!("DRMed book"));
+    }
+
+    let pdb_header = reader.pdb_header.clone();
+    let text = reader.sections[0]
+        .extract_text(mobi_file_path, &pdb_header)
+        .context("extract MOBI text")?;
+    Ok(text.to_lowercase().into_bytes())
 }
 
 #[cfg(test)]
