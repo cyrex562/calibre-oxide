@@ -241,7 +241,7 @@
 
 #### usbobserver
 
-- [ ] usbobserver.c
+- [x] usbobserver.c (Deferred: macOS-only IOKit/CoreFoundation extension. Out of scope per user's Windows/Linux/Android platform decision. `get_usb_devices` is superseded by cross-platform `calibre_devices::libusb`.)
 
 #### userdefined
 
