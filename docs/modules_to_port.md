@@ -346,26 +346,26 @@
 
 #### docx
 
-- [ ] __init__.py
-- [ ] block_styles.py
-- [ ] char_styles.py
-- [ ] cleanup.py
-- [ ] container.py
-- [ ] dump.py
-- [ ] fields.py
-- [ ] fonts.py
-- [ ] footnotes.py
-- [ ] images.py
-- [ ] index.py
-- [ ] lcid.py
-- [ ] names.py
-- [ ] numbering.py
-- [ ] settings.py
-- [ ] styles.py
-- [ ] tables.py
-- [ ] theme.py
-- [ ] to_html.py
-- [ ] toc.py
+- [x] `__init__.py` (`InvalidDOCX`) -> `docx/error.rs`
+- [x] `block_styles.py` -> `docx/block_styles.rs`
+- [x] `char_styles.py` -> `docx/char_styles.rs`
+- [ ] cleanup.py (needs the mutable HTML tree — see #130)
+- [x] `container.py` -> `docx/container.rs`
+- [x] `dump.py` -> `docx/dump.rs`
+- [ ] fields.py (needs the mutable HTML tree — see #130)
+- [ ] fonts.py (needs a font scanner — see #130)
+- [x] `footnotes.py` -> `docx/footnotes.rs`
+- [ ] images.py (needs the mutable HTML tree — see #130)
+- [ ] index.py (needs the mutable HTML tree — see #130)
+- [x] `lcid.py` -> `docx/lcid.rs`
+- [x] `names.py` -> `docx/names.rs`
+- [ ] numbering.py (see #130)
+- [x] `settings.py` -> `docx/settings.rs`
+- [ ] styles.py (needs numbering + TableStyle — see #130)
+- [ ] tables.py (see #130)
+- [x] `theme.py` -> `docx/theme.rs`
+- [ ] to_html.py (`docx/to_html.rs` is a provisional sketch, not the port — see #130)
+- [ ] toc.py (needs the mutable HTML tree — see #130)
 
 ##### writer
 
