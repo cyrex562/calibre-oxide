@@ -108,7 +108,7 @@
 - [x] cmd_show_metadata.py
 - [x] cmd_switch.py
 - [x] main.py
-- [ ] tests.py
+- [x] tests.py (ported as unit tests in `cli/cmd_check_library.rs`; extracted `write_check_library_results` for testability)
 - [x] utils.py
 
 #### fts
