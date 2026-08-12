@@ -1,3 +1,5 @@
+pub mod cli_helpers;
+pub mod config;
 pub mod oeb;
 pub mod pipeline;
 pub mod plugins;
