@@ -5,6 +5,11 @@ pub struct TOCNode {
     pub id: Option<String>,
     pub klass: Option<String>,
     pub play_order: i32,
+    /// Article summary. Set by news recipes and consumed by the
+    /// periodical writers — see `crate::epub::periodical`.
+    pub description: Option<String>,
+    /// Article byline, likewise recipe-supplied.
+    pub author: Option<String>,
     pub children: Vec<TOCNode>,
 }
 
@@ -16,6 +21,8 @@ impl TOCNode {
             id: None,
             klass: None,
             play_order: 0,
+            description: None,
+            author: None,
             children: Vec::new(),
         }
     }

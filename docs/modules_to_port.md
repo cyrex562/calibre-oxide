@@ -383,9 +383,9 @@
 
 #### epub
 
-- [ ] __init__.py
-- [ ] pages.py
-- [ ] periodical.py
+- [x] `__init__.py` -> `epub.rs` (`simple_container_xml`, `initialize_container`; `rules()` needs a CSS object model, not ported)
+- [x] `pages.py` -> `epub/pages.rs` (element selection is the caller's — no XPath engine; `add_page_map`'s unreachable writer call is not reproduced)
+- [x] `periodical.py` -> `epub/periodical.rs`
 
 ##### cfi
 

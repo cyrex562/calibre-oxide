@@ -32,13 +32,7 @@ impl EPUBOutput {
         }
         let container_xml = meta_inf.join("container.xml");
         if !container_xml.exists() {
-            let xml = r#"<?xml version="1.0"?>
-<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
-   <rootfiles>
-      <rootfile full-path="content.opf" media-type="application/oebps-package+xml"/>
-   </rootfiles>
-</container>"#;
-            fs::write(&container_xml, xml)?;
+            fs::write(&container_xml, crate::epub::simple_container_xml("content.opf", ""))?;
         }
 
         // 3. Create ZIP at output_path
