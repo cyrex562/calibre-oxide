@@ -75,7 +75,7 @@
 - [x] restore.py
 - [x] schema_upgrades.py
 - [x] search.py
-- [ ] sqlite_extension.cpp
+- [x] sqlite_extension.cpp (semantic port: tokenizer + stemmer; FTS5 registration deferred to #93)
 - [x] tables.py
 - [x] utils.py
 - [x] view.py
