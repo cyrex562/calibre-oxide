@@ -278,8 +278,8 @@
 
 #### comic
 
-- [ ] __init__.py
-- [ ] input.py
+- [x] __init__.py
+- [x] input.py (archive extraction + page enumeration; Qt-based PageProcessor rendering pipeline deferred to follow-up issue)
 
 
 #### conversion
