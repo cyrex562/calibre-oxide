@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "app",
+    "app/src-tauri",
     "crates/calibre_ai",
     "crates/calibre_conversion",
     "crates/calibre_customize",
@@ -10,4 +10,7 @@ members = [
     "crates/calibre_utils",
     "tools/harness",
 ]
+# The old iced-based prototype lives in app-iced-prototype/ for reference —
+# not a workspace member.
+exclude = ["app-iced-prototype"]
 resolver = "2"
