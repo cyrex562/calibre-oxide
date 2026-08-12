@@ -30,5 +30,7 @@ pulldown-cmark = "0.13.0"
 pathdiff = "0.2"
 mime_guess = "2.0"
 html-escape = "0.2"
+chardetng = "1.0"
+hyphenation = { version = "0.8", features = ["embed_en-us"] }
 
 [dev-dependencies]
