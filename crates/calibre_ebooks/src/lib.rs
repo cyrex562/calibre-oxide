@@ -1,5 +1,6 @@
 pub mod beautiful_soup;
 pub mod chardet;
+pub mod chm;
 pub mod compression;
 pub mod constants;
 pub mod conversion;

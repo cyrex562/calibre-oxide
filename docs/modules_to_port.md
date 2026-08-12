@@ -272,9 +272,9 @@
 
 #### chm
 
-- [ ] __init__.py
-- [ ] reader.py
-- [ ] metadata.py
+- [x] __init__.py
+- [x] reader.py (ported to `chm/reader.rs` using pure-Rust `libchm`; TOC/HHC parsing deferred to #121 html5ever wiring)
+- [x] metadata.py (ported into `metadata/chm.rs::get_metadata` — now uses `ChmReader` instead of returning default)
 
 #### comic
 
