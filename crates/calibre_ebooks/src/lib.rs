@@ -1,9 +1,13 @@
+pub mod beautiful_soup;
+pub mod chardet;
 pub mod compression;
 pub mod constants;
 pub mod conversion;
 pub mod docx;
 pub mod epub;
 pub mod html;
+pub mod html_entities;
+pub mod hyphenate;
 pub mod input;
 pub mod lit;
 pub mod metadata;

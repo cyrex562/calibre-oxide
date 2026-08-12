@@ -250,20 +250,20 @@
 
 ### ebooks
 
-- [ ] __init__.py
-- [ ] BeautifulSoup.py
-- [ ] chardet.py
-- [ ] constants.py
-- [ ] covers.py
-- [ ] css_transform_rules.py
-- [ ] html_entities.c
-- [ ] html_entities.h
-- [ ] html_entities.py
-- [ ] html_transform_rules.py
-- [ ] hyphenate.py
-- [ ] render_html.py
-- [ ] tweak.py
-- [ ] uchardet.c
+- [x] __init__.py
+- [x] BeautifulSoup.py (ported to `beautiful_soup.rs` — preprocess pipeline; html5ever parser wiring is a follow-up)
+- [x] chardet.py (ported to `chardet.rs` — chardetng + encoding_rs)
+- [x] constants.py (already ported to `constants.rs`)
+- [ ] covers.py (deferred — Qt image generation; needs Tauri wiring, will land with the app cover generator)
+- [ ] css_transform_rules.py (deferred — 472-LOC rules engine, its own PR)
+- [x] html_entities.c (ported to `html_entities.rs` — `html-escape` crate supersedes the C lookup table)
+- [x] html_entities.h (ported — the 5000-line table is now `html-escape`'s embedded WHATWG data)
+- [x] html_entities.py (ported to `html_entities.rs`)
+- [ ] html_transform_rules.py (deferred — 669-LOC rules engine, its own PR)
+- [x] hyphenate.py (ported to `hyphenate.rs` — `hyphenation` crate with Knuth-Liang patterns)
+- [ ] render_html.py (deferred — Qt WebEngine; new viewer is a Tauri panel)
+- [ ] tweak.py (deferred — CLI tool needing libunzip + TempDir wiring, its own PR)
+- [x] uchardet.c (superseded by `chardet.rs` via chardetng — pure Rust replaces C wrapper)
 
 #### azw4
 
