@@ -25,25 +25,25 @@
 
 - [x] __init__.py
 - [x] backend.py
-- [ ] config.py
+- [x] config.py
 
 #### ollama
 
 - [x] __init__.py
 - [x] backend.py
-- [ ] config.py
+- [x] config.py
 
 #### open_router
 
 - [x] __init__.py
 - [x] backend.py
-- [ ] config.py
+- [x] config.py
 
 #### openai
 
 - [x] __init__.py
 - [x] backend.py
-- [ ] config.py
+- [x] config.py
 
 ### customize
 

@@ -7,8 +7,10 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use url::Url;
 
-const PLUGIN_NAME: &str = "LMStudio";
-const DEFAULT_URL: &str = "http://localhost:1234";
+pub(crate) const PLUGIN_NAME: &str = "LMStudio";
+pub(crate) const DEFAULT_URL: &str = "http://localhost:1234";
+
+pub mod config;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Model {

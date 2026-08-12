@@ -8,8 +8,10 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
 use url::Url;
 
-const PLUGIN_NAME: &str = "OllamaAI";
-const DEFAULT_URL: &str = "http://localhost:11434";
+pub(crate) const PLUGIN_NAME: &str = "OllamaAI";
+pub(crate) const DEFAULT_URL: &str = "http://localhost:11434";
+
+pub mod config;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Model {
