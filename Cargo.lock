@@ -508,6 +508,7 @@ dependencies = [
  "html-escape",
  "hyphenation",
  "ignore",
+ "indexmap 2.12.1",
  "lazy_static",
  "libchm",
  "lopdf",

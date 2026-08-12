@@ -1,4 +1,4 @@
-use crate::docx::container::DOCX;
+use crate::docx::container::Docx;
 use crate::docx::to_html::DOCXToHTML;
 use crate::input::html_input::HTMLInput;
 use crate::oeb::book::OEBBook;
@@ -16,7 +16,7 @@ impl DOCXInput {
     pub fn convert(&self, input_path: &Path, output_dir: &Path) -> Result<OEBBook> {
         let file = File::open(input_path).context("Failed to open DOCX file")?;
 
-        let mut docx = DOCX::new(file).map_err(|e| anyhow::anyhow!("DOCX Error: {}", e))?;
+        let mut docx = Docx::new(file).map_err(|e| anyhow::anyhow!("DOCX Error: {}", e))?;
 
         // Create source dir for HTML output
         let source_dir = output_dir.join("docx_source");

@@ -1,6 +1,18 @@
-use super::container::DOCX;
+//! Provisional DOCX → HTML conversion.
+//!
+//! **This is not the port of `to_html.py`.** It is the sketch that
+//! predates this module's port — paragraphs, runs, hyperlinks and
+//! images, with heading levels guessed from `w:pStyle` and no style
+//! resolution whatsoever. It stays only so the DOCX input plugin keeps
+//! producing something while the real conversion (which needs the
+//! style engine in [`super::block_styles`]/[`super::char_styles`] plus
+//! a mutable HTML tree) is written.
+//!
+//! Anything here may be deleted wholesale when that lands.
+
+use super::container::Docx;
 use super::error::DocxError;
-use super::names::DOCXNamespaces;
+use super::names::DocxNamespace;
 use roxmltree::{Document, Node};
 use std::collections::HashMap;
 use std::io::{Read, Seek};
@@ -10,9 +22,10 @@ pub struct DOCXToHTML;
 
 impl DOCXToHTML {
     pub fn convert<R: Read + Seek>(
-        docx: &mut DOCX<R>,
+        docx: &mut Docx<R>,
         dest_dir: &Path,
     ) -> Result<String, DocxError> {
+        let ns = DocxNamespace::new(docx.is_transitional());
         let doc_name = docx.document_name()?;
 
         // 1. Read Document Relationships
@@ -25,7 +38,7 @@ impl DOCXToHTML {
         let rels_path_str = rels_path.to_string_lossy().replace("\\", "/");
 
         let mut doc_rels = HashMap::new();
-        if let Ok(content) = docx.read_file(&rels_path_str) {
+        if let Ok(content) = docx.read(&rels_path_str) {
             let text = String::from_utf8(content).unwrap_or_default();
             if let Ok(doc) = Document::parse(&text) {
                 for node in doc.descendants() {
@@ -39,7 +52,7 @@ impl DOCXToHTML {
         }
 
         // 2. Read Document Content
-        let content = docx.read_file(&doc_name)?;
+        let content = docx.read(&doc_name)?;
         let text = String::from_utf8(content).map_err(|e| DocxError::InvalidDocx(e.to_string()))?;
         let doc = Document::parse(&text)?;
 
@@ -48,7 +61,7 @@ impl DOCXToHTML {
 
         for node in doc.descendants() {
             if node.tag_name().name() == "p" {
-                Self::process_paragraph(node, &mut html, &doc_rels, docx, dest_dir);
+                Self::process_paragraph(node, &mut html, &doc_rels, docx, dest_dir, &ns);
             }
         }
 
@@ -60,8 +73,9 @@ impl DOCXToHTML {
         node: Node,
         html: &mut String,
         rels: &HashMap<String, String>,
-        docx: &mut DOCX<R>,
+        docx: &mut Docx<R>,
         dest_dir: &Path,
+        ns: &DocxNamespace,
     ) {
         // Determine Tag (p, h1-h6) based on pPr/pStyle
         let mut tag = "p";
@@ -92,16 +106,16 @@ impl DOCXToHTML {
 
         for child in node.children() {
             if child.tag_name().name() == "r" {
-                Self::process_run(child, html, rels, docx, dest_dir);
+                Self::process_run(child, html, rels, docx, dest_dir, ns);
             } else if child.tag_name().name() == "hyperlink" {
                 // Handle hyperlink
-                let rid = child.attribute((DOCXNamespaces::R, "id"));
+                let rid = ns.get(child, "r:id");
                 if let Some(rid) = rid {
                     if let Some(target) = rels.get(rid) {
                         html.push_str(&format!("<a href=\"{}\">", target));
                         for sub in child.children() {
                             if sub.tag_name().name() == "r" {
-                                Self::process_run(sub, html, rels, docx, dest_dir);
+                                Self::process_run(sub, html, rels, docx, dest_dir, ns);
                             }
                         }
                         html.push_str("</a>");
@@ -117,8 +131,9 @@ impl DOCXToHTML {
         node: Node,
         html: &mut String,
         rels: &HashMap<String, String>,
-        docx: &mut DOCX<R>,
+        docx: &mut Docx<R>,
         dest_dir: &Path,
+        ns: &DocxNamespace,
     ) {
         for child in node.children() {
             match child.tag_name().name() {
@@ -134,7 +149,7 @@ impl DOCXToHTML {
                     // Or similar structure
                     for desc in child.descendants() {
                         if desc.tag_name().name() == "blip" {
-                            if let Some(rid) = desc.attribute((DOCXNamespaces::R, "embed")) {
+                            if let Some(rid) = ns.get(desc, "r:embed") {
                                 if let Some(target) = rels.get(rid) {
                                     // target is relative to document.xml usually, e.g. "media/image1.jpeg"
                                     // We need to resolve it relative to DOCX root (word/media/image1.jpeg)
@@ -144,7 +159,7 @@ impl DOCXToHTML {
                                         .to_string_lossy()
                                         .replace("\\", "/");
 
-                                    if let Ok(data) = docx.read_file(&image_path) {
+                                    if let Ok(data) = docx.read(&image_path) {
                                         // Write to dest_dir
                                         let file_name =
                                             Path::new(target).file_name().unwrap_or_default();
