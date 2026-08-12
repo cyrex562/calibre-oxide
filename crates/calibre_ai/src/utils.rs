@@ -2,9 +2,112 @@ use crate::{ChatMessage, ChatMessageType, ChatResponse};
 use anyhow::{anyhow, Result};
 use lazy_static::lazy_static;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
+
+/// Strategy for picking a model when the user hasn't pinned one.
+/// String round-trip with Python prefs uses lowercase.
+///
+/// Port of `model_choice_strategy_config_widget` in
+/// `old_src/src/calibre/ai/utils.py` — but only the semantic half
+/// (the enum + parse/serialize); Vue owns the widget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelChoiceStrategy {
+    Low,
+    Medium,
+    High,
+}
+
+impl Default for ModelChoiceStrategy {
+    fn default() -> Self {
+        ModelChoiceStrategy::Medium
+    }
+}
+
+impl ModelChoiceStrategy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ModelChoiceStrategy::Low => "low",
+            ModelChoiceStrategy::Medium => "medium",
+            ModelChoiceStrategy::High => "high",
+        }
+    }
+
+    /// Parse from the string form written by Calibre prefs. Unknown
+    /// values fall back to `Medium` — a deliberate safer default than
+    /// the Python `QComboBox.findData(-1)` → index 0 → "low" pattern.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "low" => ModelChoiceStrategy::Low,
+            "high" => ModelChoiceStrategy::High,
+            _ => ModelChoiceStrategy::Medium,
+        }
+    }
+
+    pub fn human_label(&self) -> &'static str {
+        match self {
+            ModelChoiceStrategy::Low => "Cheap and fastest",
+            ModelChoiceStrategy::Medium => "Medium",
+            ModelChoiceStrategy::High => "High quality, expensive and slower",
+        }
+    }
+}
+
+/// How much reasoning effort a model should invest when answering.
+/// Port of `reasoning_strategy_config_widget` in the Python utils.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningStrategy {
+    Auto,
+    Low,
+    Medium,
+    High,
+    None,
+}
+
+impl Default for ReasoningStrategy {
+    fn default() -> Self {
+        ReasoningStrategy::Auto
+    }
+}
+
+impl ReasoningStrategy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReasoningStrategy::Auto => "auto",
+            ReasoningStrategy::Low => "low",
+            ReasoningStrategy::Medium => "medium",
+            ReasoningStrategy::High => "high",
+            ReasoningStrategy::None => "none",
+        }
+    }
+
+    /// Parse from prefs. Unknown values → `Auto` (matches Python
+    /// default when `findData` returns -1 and we clamp to 0 = "auto").
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "low" => ReasoningStrategy::Low,
+            "medium" => ReasoningStrategy::Medium,
+            "high" => ReasoningStrategy::High,
+            "none" => ReasoningStrategy::None,
+            _ => ReasoningStrategy::Auto,
+        }
+    }
+
+    pub fn human_label(&self) -> &'static str {
+        match self {
+            ReasoningStrategy::Auto => "Automatic",
+            ReasoningStrategy::Low => "Low",
+            ReasoningStrategy::Medium => "Medium",
+            ReasoningStrategy::High => "High",
+            ReasoningStrategy::None => "No reasoning",
+        }
+    }
+}
+
 
 // SSE Parser
 pub fn read_streaming_response(reader: impl Read) -> impl Iterator<Item = Result<Value>> {

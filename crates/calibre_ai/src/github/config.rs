@@ -15,55 +15,7 @@ use crate::github::PLUGIN_NAME;
 use crate::prefs::{
     decode_secret, encode_secret, pref_for_provider, set_prefs_for_provider,
 };
-
-/// Strategy for picking a model when the user hasn't pinned one.
-/// Enum values match the string keys the Python UI stored in prefs
-/// (`low`, `medium`, `high`) — critical for round-trip compatibility
-/// with an existing Calibre install.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ModelChoiceStrategy {
-    Low,
-    Medium,
-    High,
-}
-
-impl Default for ModelChoiceStrategy {
-    fn default() -> Self {
-        // Matches the Python `pref('model_choice_strategy', 'medium')`.
-        ModelChoiceStrategy::Medium
-    }
-}
-
-impl ModelChoiceStrategy {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ModelChoiceStrategy::Low => "low",
-            ModelChoiceStrategy::Medium => "medium",
-            ModelChoiceStrategy::High => "high",
-        }
-    }
-
-    pub fn parse(s: &str) -> Self {
-        match s {
-            "low" => ModelChoiceStrategy::Low,
-            "high" => ModelChoiceStrategy::High,
-            // Any other value — including empty and legacy names —
-            // falls back to Medium, matching the Python
-            // `findData(current_val)` returning -1 and being clamped
-            // to 0 (the "low" item), but with a safer default.
-            _ => ModelChoiceStrategy::Medium,
-        }
-    }
-
-    pub fn human_label(&self) -> &'static str {
-        match self {
-            ModelChoiceStrategy::Low => "Cheap and fastest",
-            ModelChoiceStrategy::Medium => "Medium",
-            ModelChoiceStrategy::High => "High quality, expensive and slower",
-        }
-    }
-}
+use crate::utils::ModelChoiceStrategy;
 
 /// A user-chosen text model. Kept as `{name, id}` for round-trip
 /// compatibility with the Python prefs shape (`text_model: {name, id}`).
