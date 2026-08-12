@@ -12,22 +12,62 @@ lazy_static! {
     static ref ISBN_PATTERN: Regex = Regex::new(r"(?i)isbn").unwrap();
 }
 
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, Write};
+use std::path::Path;
 
-pub fn get_metadata<R: Read + Seek>(_stream: R) -> Result<MetaInformation> {
-    // CHM is a complex binary format (ITSS/LZX).
-    // Without a CHM reader implementation (which is complex),
-    // we cannot extract the "home" HTML file to parse.
-    // This is a placeholder that would normally read the CHM, extract the home HTML,
-    // and pass it to parsing logic.
-    // For now, we return empty metadata or error.
-    // In a real implementation with a CHM crate, we would:
-    // 1. Read CHM directory.
-    // 2. Find home/index file.
-    // 3. metadata_from_html(content)
+use crate::chm::ChmReader;
 
-    // Returning default for now to satisfy interface,
-    // or we could error "CHM reading not supported".
+/// Port of `old_src/src/calibre/ebooks/chm/metadata.py::get_metadata`.
+///
+/// The Python version wrote the incoming stream to a temp file then
+/// opened it with `CHMReader`. Rust does the same — libchm needs a
+/// path, and copying via a temp file keeps callers stream-only.
+///
+/// If the reader fails to open or the home page isn't readable, we
+/// fall back to `MetaInformation::default()` matching the Python
+/// silent-fallback behavior for unreadable CHMs.
+pub fn get_metadata<R: Read + Seek>(mut stream: R) -> Result<MetaInformation> {
+    let tmp = tempfile::Builder::new()
+        .suffix(".chm")
+        .tempfile()
+        .map_err(|e| anyhow::anyhow!("chm: create tempfile: {e}"))?;
+    {
+        let mut w = std::fs::File::create(tmp.path())
+            .map_err(|e| anyhow::anyhow!("chm: open tempfile for write: {e}"))?;
+        std::io::copy(&mut stream, &mut w)
+            .map_err(|e| anyhow::anyhow!("chm: copy stream to tempfile: {e}"))?;
+        w.flush().ok();
+    }
+    Ok(get_metadata_from_path(tmp.path()).unwrap_or_default())
+}
+
+/// Direct-from-path variant. Preferred when the caller already has a
+/// path on disk (avoids the stream→tempfile copy).
+pub fn get_metadata_from_path(path: &Path) -> Result<MetaInformation> {
+    let mut reader = ChmReader::open(path)
+        .map_err(|e| anyhow::anyhow!("chm: open reader: {e}"))?;
+    let home_bytes = reader
+        .get_home()
+        .map_err(|e| anyhow::anyhow!("chm: read home page: {e}"))?;
+    // The home page is HTML with an unknown encoding. Try the
+    // reader's declared encoding via /#SYSTEM if we ever wire it;
+    // for now decode as UTF-8 with lossy fallback.
+    let html = String::from_utf8_lossy(&home_bytes).into_owned();
+    let mut mi = metadata_from_html(&html);
+    // Prefer the CHM's declared title over any title in the HTML.
+    if let Some(bytes) = reader.system().title_bytes.as_ref() {
+        let (decoded, _, _) = encoding_rs::WINDOWS_1252.decode(bytes);
+        let title = decoded.trim().to_string();
+        if !title.is_empty() {
+            mi.title = title;
+        }
+    }
+    Ok(mi)
+}
+
+// Kept for callers that still use the placeholder-shaped fn.
+#[allow(dead_code)]
+pub fn get_metadata_placeholder<R: Read + Seek>(_stream: R) -> Result<MetaInformation> {
     Ok(MetaInformation::default())
 }
 
@@ -90,13 +130,30 @@ mod tests {
 
     #[test]
     fn test_chm_html_parsing() {
-        eprintln!("DEBUG: Starting CHM test");
         let html = r#"<html><head><title>Test Book Title</title><meta name="Author" content="John Doe"></head><body><h1>Welcome</h1></body></html>"#;
 
         let mi = metadata_from_html(html);
-        eprintln!("Parsed Title: '{}'", mi.title);
-        eprintln!("Parsed Authors: {:?}", mi.authors);
         assert_eq!(mi.title, "Test Book Title");
         assert_eq!(mi.authors, vec!["John Doe"]);
+    }
+
+    #[test]
+    fn get_metadata_from_bogus_stream_returns_default() {
+        // Stream that isn't a CHM — the port should silently fall
+        // back to MetaInformation::default() rather than propagating
+        // an error, matching the Python behavior.
+        use std::io::Cursor;
+        let bogus = Cursor::new(b"not a CHM file".to_vec());
+        let mi = get_metadata(bogus).unwrap();
+        assert_eq!(mi.title, MetaInformation::default().title);
+    }
+
+    #[test]
+    fn get_metadata_from_missing_path_errors() {
+        // Direct-from-path variant surfaces the error rather than
+        // masking — this is where callers who care about failure can
+        // observe it.
+        let err = get_metadata_from_path(Path::new("/does-not-exist.chm"));
+        assert!(err.is_err());
     }
 }

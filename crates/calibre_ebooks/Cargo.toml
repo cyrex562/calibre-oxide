@@ -32,5 +32,6 @@ mime_guess = "2.0"
 html-escape = "0.2"
 chardetng = "1.0"
 hyphenation = { version = "0.8", features = ["embed_en-us"] }
+libchm = "0.2.0"
 
 [dev-dependencies]
