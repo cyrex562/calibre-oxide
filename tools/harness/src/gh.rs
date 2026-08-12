@@ -16,18 +16,70 @@ pub fn ensure_gh_available() -> Result<()> {
     Ok(())
 }
 
+/// Return the origin remote's owner/repo, e.g. `cyrex562/calibre-oxide`.
+///
+/// Deliberately does NOT use `gh repo view`: when the repo is a fork with
+/// an `upstream` remote pointing at the parent, `gh` returns the parent's
+/// slug (kovidgoyal/calibre here), which is not what the harness wants to
+/// touch. Instead we parse the origin URL directly.
 pub fn repo_slug() -> Result<String> {
-    let out = Command::new("gh")
-        .args(["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"])
+    let out = Command::new("git")
+        .args(["config", "--get", "remote.origin.url"])
         .output()
-        .context("gh repo view failed")?;
+        .context("git config remote.origin.url failed")?;
     if !out.status.success() {
         return Err(anyhow!(
-            "gh repo view failed: {}",
+            "git config remote.origin.url failed: {}",
             String::from_utf8_lossy(&out.stderr)
         ));
     }
-    Ok(String::from_utf8(out.stdout)?.trim().to_string())
+    let url = String::from_utf8(out.stdout)?.trim().to_string();
+    parse_repo_slug(&url).ok_or_else(|| anyhow!("could not parse repo slug from `{}`", url))
+}
+
+fn parse_repo_slug(url: &str) -> Option<String> {
+    // Handle: https://github.com/OWNER/REPO(.git)  or  git@github.com:OWNER/REPO(.git)
+    let after_host = url
+        .strip_prefix("https://github.com/")
+        .or_else(|| url.strip_prefix("git@github.com:"))
+        .or_else(|| url.strip_prefix("ssh://git@github.com/"))?;
+    let stripped = after_host.trim_end_matches(".git").trim_end_matches('/');
+    if stripped.matches('/').count() == 1 {
+        Some(stripped.to_string())
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_slug_https() {
+        assert_eq!(
+            parse_repo_slug("https://github.com/cyrex562/calibre-oxide.git"),
+            Some("cyrex562/calibre-oxide".to_string())
+        );
+        assert_eq!(
+            parse_repo_slug("https://github.com/cyrex562/calibre-oxide"),
+            Some("cyrex562/calibre-oxide".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_slug_ssh() {
+        assert_eq!(
+            parse_repo_slug("git@github.com:cyrex562/calibre-oxide.git"),
+            Some("cyrex562/calibre-oxide".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_slug_rejects_nonsense() {
+        assert_eq!(parse_repo_slug("not-a-url"), None);
+        assert_eq!(parse_repo_slug("https://gitlab.com/foo/bar"), None);
+    }
 }
 
 #[derive(Debug, Deserialize)]
