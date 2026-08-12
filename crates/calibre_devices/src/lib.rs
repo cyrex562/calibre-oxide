@@ -2,6 +2,7 @@ pub mod android;
 pub mod folder_device;
 pub mod interface;
 pub mod kindle;
+pub mod libusb;
 pub mod kobo;
 pub mod nook;
 pub mod scanner;
