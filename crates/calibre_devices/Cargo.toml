@@ -13,6 +13,7 @@ calibre_utils = { path = "../calibre_utils" }
 calibre_ebooks = { path = "../calibre_ebooks" }
 uuid = { version = "1.0", features = ["v4"] }
 byteorder = "1.4"
+regex = "1.10"
 
 [dev-dependencies]
 tempfile = "3.10"
