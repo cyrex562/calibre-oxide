@@ -5,6 +5,7 @@ pub mod comic;
 pub mod compression;
 pub mod constants;
 pub mod conversion;
+pub mod djvu;
 pub mod docx;
 pub mod epub;
 pub mod html;

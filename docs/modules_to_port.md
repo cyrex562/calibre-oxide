@@ -339,10 +339,10 @@
 
 #### djvu
 
-- [ ] __init__.py
-- [ ] bzzdecoder.c
-- [ ] djvu.py
-- [ ] djvubzzdec.py
+- [x] `__init__.py` -> `djvu/mod.rs`
+- [x] `bzzdecoder.c` -> `djvu/bzz.rs`
+- [x] `djvu.py` -> `djvu/file.rs`
+- [x] `djvubzzdec.py` -> `djvu/bzz.rs`
 
 #### docx
 
