@@ -158,11 +158,11 @@
 
 ##### apnx_page_generator
 
-- [ ] __init__.py
-- [ ] i_page_generator.py
-- [ ] page_group.py
-- [ ] page_number_type.py
-- [ ] pages.py
+- [x] __init__.py
+- [x] i_page_generator.py
+- [x] page_group.py
+- [x] page_number_type.py
+- [x] pages.py
 
 ###### generators
 
