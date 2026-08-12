@@ -23,6 +23,9 @@
 //! `toc.py` and `cleanup.py`, plus a real `to_html.py`. Those build and
 //! mutate an HTML element tree, which this crate does not yet have.
 //!
+//! The output half of the module — `writer/` — is issue #23 and lives
+//! in [`writer`].
+//!
 //! [`to_html`] is **not** part of that port: it is the pre-existing
 //! sketch — paragraphs, runs, and images, no style resolution at all —
 //! left in place so the DOCX input plugin keeps working until the real
@@ -48,6 +51,7 @@ pub mod names;
 pub mod settings;
 pub mod theme;
 pub mod to_html;
+pub mod writer;
 
 pub use block_styles::{Border, Borders, Css, Edge, Frame, ParagraphStyle};
 pub use char_styles::RunStyle;

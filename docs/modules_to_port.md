@@ -369,17 +369,17 @@
 
 ##### writer
 
-- [ ] __init__.py
-- [ ] container.py
-- [ ] fonts.py
-- [ ] from_html.py
-- [ ] images.py
-- [ ] links.py
-- [ ] lists.py
-- [ ] styles.py
-- [ ] tables.py
-- [ ] TODO
-- [ ] utils.py
+- [x] `__init__.py` -> `docx/writer/mod.rs`
+- [x] `container.py` -> `docx/writer/container.rs` (plus `writer/xml.rs`, the element builder replacing `lxml.builder`)
+- [x] `fonts.py` -> `docx/writer/fonts.rs`
+- [ ] from_html.py (needs a real OEB stylizer — see #132)
+- [ ] images.py (see #132)
+- [ ] links.py (see #132)
+- [ ] lists.py (see #132)
+- [ ] styles.py (needs a real OEB stylizer — see #132)
+- [ ] tables.py (see #132)
+- [ ] TODO (upstream notes file, nothing to port)
+- [x] `utils.py` -> `docx/writer/utils.rs` (with the `tinycss.color3` colour grammar it depends on)
 
 #### epub
 
