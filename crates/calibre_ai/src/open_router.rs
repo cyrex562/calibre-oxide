@@ -7,9 +7,11 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-const PLUGIN_NAME: &str = "OpenRouter";
+pub(crate) const PLUGIN_NAME: &str = "OpenRouter";
 const MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
 const CHAT_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
+
+pub mod config;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Pricing {
