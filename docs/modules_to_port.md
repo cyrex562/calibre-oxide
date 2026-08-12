@@ -389,10 +389,10 @@
 
 ##### cfi
 
-- [ ] __init__.py
-- [ ] epublfi.ebnf
-- [ ] parse.py
-- [ ] tests.py
+- [x] `__init__.py` (empty upstream; the module root is `epub/cfi/mod.rs`)
+- [x] `epubcfi.ebnf` -> reproduced as the grammar in `epub/cfi/mod.rs` docs (issue #25 spells it `epublfi.ebnf`)
+- [x] `parse.py` -> `epub/cfi/parse.rs`
+- [x] `tests.py` -> unit tests in `epub/cfi/parse.rs`, plus `tests/epub_cfi_test.rs` cross-validation
 
 #### fb2
 
