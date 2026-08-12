@@ -126,19 +126,30 @@ can true-up cost weekly.
 
 ## Cross-validation via Python calibre
 
-If `.harness/py/venv/bin/python` (or `Scripts/python.exe` on Windows) can
-import `calibre`, the harness will:
+Calibre proper doesn't install cleanly from source on Windows (per
+`old_src/INSTALL.rst`) — it requires a huge native-dep dev environment.
+Instead, the harness invokes the **official Calibre binary**, which
+bundles Python + all C extensions and can run arbitrary calibre Python:
 
-1. Discover matching Python entry points for each new Rust port
-   (e.g., `ebook-meta` in the metadata subsystem).
-2. Run the Python command against fixtures in `.harness/fixtures/<subsystem>/`.
-3. Run the Rust command against the same fixtures.
-4. Diff outputs. Byte-for-byte where the format is deterministic (JSON
+- Windows: `C:\Program Files\Calibre2\calibre-debug.exe`
+- Linux: `calibre-debug` (from the distro's `calibre` package)
+- macOS: `/Applications/calibre.app/Contents/MacOS/calibre-debug`
+
+The harness discovers this at startup and stores the path in
+`.harness/config.toml`. If no binary is found, cross-validation is
+skipped with a warning and the judge is informed — missing infrastructure
+never causes test failures.
+
+Cross-validation pattern per format:
+
+1. Fixture files live in `.harness/fixtures/<subsystem>/`.
+2. For each fixture, the harness runs both:
+   - `calibre-debug -c "<py snippet that prints canonical JSON>"`
+   - The Rust equivalent (e.g. `cargo run -p calibre_ebooks --bin ebook-meta`).
+3. Diff outputs. Byte-for-byte where the format is deterministic (JSON
    with sorted keys, sorted OPF, etc.); structural diff otherwise.
-
-If the venv is missing or Python calibre fails to import, cross-validation
-is skipped with a warning and the judge is told so — no failing tests for
-missing infrastructure.
+4. The judge sees the diff and either accepts (semantic match) or
+   rejects with a specific reason.
 
 ## Playtest flow
 

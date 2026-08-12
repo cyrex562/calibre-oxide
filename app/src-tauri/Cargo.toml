@@ -1,0 +1,30 @@
+[package]
+name = "calibre_oxide_app"
+version = "0.1.0"
+edition = "2021"
+description = "calibre-oxide desktop app (Tauri + Vue)"
+
+# The default Cargo layout would use src/main.rs for the binary. Tauri v2
+# splits into a lib for the entry point (so mobile targets can re-use it)
+# and a thin main.rs that calls into the lib.
+[lib]
+name = "calibre_oxide_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6", features = [] }
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tauri = { version = "2.11", features = [] }
+
+# Wire in the workspace crates that back the UI.
+calibre_db = { path = "../../crates/calibre_db" }
+calibre_ebooks = { path = "../../crates/calibre_ebooks" }
+calibre_utils = { path = "../../crates/calibre_utils" }
+
+[features]
+# Feature used for production builds or when a dev server is not specified,
+# DO NOT REMOVE!
+custom-protocol = ["tauri/custom-protocol"]

@@ -49,10 +49,8 @@ npm-debug.log*
 .DS_Store
 Thumbs.db
 
-# Harness scratch
-.harness/logs/
-.harness/tmp/
-.harness/state.json
+# Harness scratch — nothing in .harness/ is ever checked in.
+.harness/
 
 # Test / build artifacts left at repo root during development.
 # These should live in .harness/logs/ or under target/, never at root.
