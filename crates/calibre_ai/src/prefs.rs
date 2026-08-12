@@ -60,6 +60,15 @@ pub fn set_prefs_for_provider(name: &str, pref_map: HashMap<String, Value>) {
     // In real impl, save to disk here
 }
 
+/// Write the currently-selected provider for a given purpose into the
+/// `purpose_map`. Called from `ConfigureAI::commit`.
+pub fn set_purpose_selection(purpose: &AICapabilities, provider_name: &str) {
+    let mut prefs = PREFS.write().unwrap();
+    prefs
+        .purpose_map
+        .insert(purpose.purpose(), provider_name.to_string());
+}
+
 pub fn plugins_for_purpose(purpose: AICapabilities) -> impl Iterator<Item = Arc<dyn AIProviderPlugin>> {
     let plugins = available_ai_provider_plugins();
     // Sort by name (primary_sort_key in python, here just string sort)

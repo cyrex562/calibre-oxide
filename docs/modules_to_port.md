@@ -5,7 +5,7 @@
 ### ai
 
 - [x] __init__.py
-- [ ] config.py
+- [x] config.py
 - [x] prefs.py
 - [x] utils.py
 

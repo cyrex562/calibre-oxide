@@ -278,6 +278,7 @@ impl AICapabilities {
 }
 
 // Module declarations
+pub mod config;
 pub mod prefs;
 pub mod utils;
 pub mod github;
