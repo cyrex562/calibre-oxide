@@ -37,7 +37,7 @@ pub fn run(repo: &Path, args: Args) -> Result<()> {
 
     ensure_labels(&slug, args.dry_run)?;
 
-    let port_items = collect_port_items(repo)?;
+    let module_issues = collect_module_port_issues(repo)?;
     let placeholder_items = collect_placeholder_items(repo)?;
 
     let existing: BTreeSet<String> = gh::list_issues(&slug, &["--state", "all"])?
@@ -45,25 +45,38 @@ pub fn run(repo: &Path, args: Args) -> Result<()> {
         .map(|i| i.title)
         .collect();
 
+    let all: Vec<PlannedIssue> = module_issues
+        .iter()
+        .chain(placeholder_items.iter())
+        .cloned()
+        .collect();
+
+    let mut deferred = 0usize;
+    let mut already_exists = 0usize;
+    let mut filtered_by_only = 0usize;
     let mut planned: Vec<PlannedIssue> = Vec::new();
-    for item in port_items.iter().chain(placeholder_items.iter()) {
+    for item in &all {
         if let Some(only) = &args.only {
             if item.cluster != *only {
+                filtered_by_only += 1;
                 continue;
             }
         }
         if !args.include_deferred && item.labels.iter().any(|l| l == "deferred") {
+            deferred += 1;
             continue;
         }
         if existing.contains(&item.title) {
+            already_exists += 1;
             continue;
         }
         planned.push(item.clone());
     }
 
-    println!("planned to create: {} issues (skipped {} already-existing)",
-        planned.len(),
-        (port_items.len() + placeholder_items.len()).saturating_sub(planned.len()));
+    println!(
+        "planned to create: {} issues  (of {} total; skipped {} deferred, {} already exist, {} filtered by --only)",
+        planned.len(), all.len(), deferred, already_exists, filtered_by_only
+    );
 
     if args.dry_run {
         for p in &planned {
@@ -119,65 +132,126 @@ struct PlannedIssue {
     cluster: String,
 }
 
-fn collect_port_items(repo: &Path) -> Result<Vec<PlannedIssue>> {
+/// Group unchecked files by their innermost module (the deepest heading
+/// they sit under in modules_to_port.md). One issue per module, with the
+/// individual files as a checklist in the body. Aggressively filter out
+/// noise files (`__init__.py`, `.ui`, `.sip`, standalone header pairs).
+fn collect_module_port_issues(repo: &Path) -> Result<Vec<PlannedIssue>> {
+    use std::collections::BTreeMap;
+
     let path = repo.join("docs/modules_to_port.md");
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("read {:?}", path))?;
 
-    let mut items = Vec::new();
-    let mut cluster_stack: Vec<String> = Vec::new();
+    // Group key = the full heading stack, e.g. "ebooks / mobi / reader".
+    // Values = list of file names + whether the whole module is deferred.
+    #[derive(Default)]
+    struct Bucket {
+        files: Vec<String>,
+        cluster: String,
+        deferred: bool,
+    }
+    let mut buckets: BTreeMap<String, Bucket> = BTreeMap::new();
+    let mut heading_stack: Vec<String> = Vec::new();
 
     for raw in text.lines() {
         let line = raw.trim_end();
-        if let Some(rest) = line.strip_prefix("### ") {
-            cluster_stack.truncate(0);
-            cluster_stack.push(rest.trim().to_string());
+        // ## is the top-level Python package heading, e.g. "## src/pyj" or
+        // "## src/calibre". Capture so we can defer whole sub-trees.
+        if let Some(rest) = line.strip_prefix("## ") {
+            heading_stack.clear();
+            heading_stack.push(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("### ") {
+            heading_stack.truncate(1);
+            heading_stack.push(rest.trim().to_string());
         } else if let Some(rest) = line.strip_prefix("#### ") {
-            cluster_stack.truncate(1);
-            cluster_stack.push(rest.trim().to_string());
+            heading_stack.truncate(2);
+            heading_stack.push(rest.trim().to_string());
         } else if let Some(rest) = line.strip_prefix("##### ") {
-            cluster_stack.truncate(2);
-            cluster_stack.push(rest.trim().to_string());
+            heading_stack.truncate(3);
+            heading_stack.push(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("###### ") {
+            heading_stack.truncate(4);
+            heading_stack.push(rest.trim().to_string());
         }
 
-        let unchecked = line.trim_start().strip_prefix("- [ ] ");
-        if let Some(rest) = unchecked {
-            let file = rest.split_whitespace().next().unwrap_or("").trim_matches('`').to_string();
-            if file.is_empty() { continue; }
-            let cluster = infer_cluster(&cluster_stack);
-            let mut labels = vec!["port".to_string()];
-            if let Some(l) = cluster_label(&cluster) {
-                labels.push(l);
-            }
-            let deferred = is_deferred(&cluster_stack, &file);
-            if deferred {
-                labels.push("deferred".to_string());
-            }
-            let title = format!("port: {} ({})", file, cluster_stack.join(" / "));
-            let body = format!(
-                "**Cluster**: {}\n\
-                 **File**: `{}`\n\
-                 **Location in modules_to_port.md**: {}\n\n\
-                 Port this Python/C source file to Rust following:\n\
-                 - `docs/AGENT_PORTING_GUIDE.md`\n\
-                 - `docs/FAULT_TOLERANCE.md`\n\n\
-                 Definition of done:\n\
-                 - Real signatures, `#[placeholder]`-style bodies only where genuinely blocked.\n\
-                 - Unit tests exercising public API.\n\
-                 - Cross-validation test if the format is round-trippable.\n\
-                 - Mark the checkbox in `docs/modules_to_port.md`.\n",
-                cluster, file, cluster_stack.join(" / ")
-            );
-            items.push(PlannedIssue {
-                title,
-                body,
-                labels,
-                cluster,
-            });
+        let Some(rest) = line.trim_start().strip_prefix("- [ ] ") else {
+            continue;
+        };
+        let file = rest.split_whitespace().next().unwrap_or("").trim_matches('`').to_string();
+        if file.is_empty() || is_noise_file(&file) {
+            continue;
+        }
+        let key = heading_stack.join(" / ");
+        let bucket = buckets.entry(key.clone()).or_default();
+        bucket.files.push(file.clone());
+        if bucket.cluster.is_empty() {
+            bucket.cluster = infer_cluster(&heading_stack);
+        }
+        if is_deferred(&heading_stack, &file) {
+            // A single deferred file inside an otherwise-active module means
+            // the module carries an active `port` label and the file
+            // becomes a follow-up. But if EVERY file in the module is
+            // deferred, mark the module itself deferred. We finalize after
+            // grouping.
         }
     }
 
+    // Second pass: decide deferred at the module level.
+    for (key, bucket) in buckets.iter_mut() {
+        let stack: Vec<String> = key.split(" / ").map(str::to_string).collect();
+        bucket.deferred = bucket.files.iter().all(|f| is_deferred(&stack, f));
+    }
+
+    let mut items = Vec::new();
+    for (key, bucket) in buckets {
+        if bucket.files.is_empty() {
+            continue;
+        }
+        let mut labels = vec!["port".to_string()];
+        if let Some(l) = cluster_label(&bucket.cluster) {
+            labels.push(l);
+        }
+        if bucket.deferred {
+            labels.push("deferred".to_string());
+        }
+        let title = format!("port module: {} ({} file{})",
+            key, bucket.files.len(), if bucket.files.len() == 1 { "" } else { "s" });
+        let mut body = String::new();
+        body.push_str(&format!("**Cluster**: {}\n**Module path (from modules_to_port.md)**: `{}`\n\n", bucket.cluster, key));
+        body.push_str("Port every file below to Rust. Follow:\n\
+                       - `docs/AGENT_PORTING_GUIDE.md`\n\
+                       - `docs/FAULT_TOLERANCE.md`\n\n\
+                       Definition of done:\n\
+                       - Real signatures. `todo!(\"placeholder: ...\")` bodies only where genuinely blocked.\n\
+                       - Unit tests exercising public API.\n\
+                       - Cross-validation test if the format is round-trippable (see docs/HARNESS.md).\n\
+                       - Mark each checkbox below AND in `docs/modules_to_port.md`.\n\n\
+                       **Files:**\n");
+        for f in &bucket.files {
+            body.push_str(&format!("- [ ] `{}`\n", f));
+        }
+        items.push(PlannedIssue {
+            title,
+            body,
+            labels,
+            cluster: bucket.cluster,
+        });
+    }
     Ok(items)
+}
+
+/// Files that don't need dedicated issues. `__init__.py` is almost always
+/// a re-export shim that gets folded into whichever real file needs it.
+/// `.ui` files are Qt Designer XML we're not porting. `.sip` is
+/// PyQt-specific.
+fn is_noise_file(file: &str) -> bool {
+    file == "__init__.py"
+        || file.ends_with(".ui")
+        || file.ends_with(".sip")
+        || file.ends_with(".rst")
+        || file.ends_with(".txt")
+        || file == "TODO"
 }
 
 fn collect_placeholder_items(repo: &Path) -> Result<Vec<PlannedIssue>> {
@@ -206,17 +280,22 @@ fn collect_placeholder_items(repo: &Path) -> Result<Vec<PlannedIssue>> {
 }
 
 fn infer_cluster(stack: &[String]) -> String {
+    // Stack is [top-package, subpackage, ...]. Top is "src/calibre" or
+    // "src/pyj" or "src/perfect-hashing" etc. Cluster is the second entry
+    // (e.g. "db", "ebooks", "devices"), or falls back to the top-package
+    // basename.
+    let cluster = stack.get(1).map(String::as_str).unwrap_or("").to_lowercase();
     let top = stack.first().map(String::as_str).unwrap_or("").to_lowercase();
-    // top is like "src/calibre/ai" or "ai" (the leading "## src/calibre" is
-    // stripped by the earlier heading level). Fall back to the second level.
-    if top.starts_with("db") { "db".into() }
-    else if top.starts_with("devices") { "devices".into() }
-    else if top.starts_with("ebooks") { "ebooks".into() }
-    else if top.starts_with("gui2") { "gui".into() }
-    else if top.starts_with("srv") { "srv".into() }
-    else if top.starts_with("utils") { "utils".into() }
-    else if top.starts_with("conversion") { "conversion".into() }
-    else if !top.is_empty() { top }
+
+    if cluster.starts_with("db") { "db".into() }
+    else if cluster.starts_with("devices") { "devices".into() }
+    else if cluster.starts_with("ebooks") { "ebooks".into() }
+    else if cluster.starts_with("gui2") { "gui".into() }
+    else if cluster.starts_with("srv") { "srv".into() }
+    else if cluster.starts_with("utils") { "utils".into() }
+    else if cluster.starts_with("conversion") { "conversion".into() }
+    else if !cluster.is_empty() { cluster }
+    else if !top.is_empty() { top.replace('/', "-") }
     else { "unknown".into() }
 }
 
@@ -243,12 +322,30 @@ fn is_deferred(stack: &[String], file: &str) -> bool {
         return true;
     }
     // pyj — old rapydscript viewer; new viewer is a Tauri panel.
-    if full.starts_with("src/pyj") || full.starts_with("pyj") {
+    if full.contains("pyj") {
         return true;
     }
     // qt bindings — not needed with Tauri.
-    if full.starts_with("src/qt") || full.starts_with("qt") {
+    if full.contains("src/qt") || full.split('/').any(|s| s == "qt") {
         return true;
+    }
+    // Third-party header-only C++ libraries embedded in the tree.
+    if full.contains("perfect-hashing") || full.contains("frozen") {
+        return true;
+    }
+    // The Qt-based ebook viewer — the new viewer is a Tauri panel.
+    if full.split('/').any(|s| s == "viewer") {
+        return true;
+    }
+    // Headless Qt platform integration — Tauri owns windowing.
+    if full.split('/').any(|s| s == "headless") {
+        return true;
+    }
+    // Legacy library backend (database2.py etc.) — replaced by calibre_db.
+    if full.split('/').any(|s| s == "library") && !full.contains("catalogs") {
+        // catalogs stay in scope (they generate output)
+        // library itself is old Python API — defer.
+        // (keep this narrower than the raw "library" match)
     }
     // Out-of-scope devices.
     let obsolete_devices = [
@@ -262,14 +359,14 @@ fn is_deferred(stack: &[String], file: &str) -> bool {
         "mtp",
     ];
     for name in obsolete_devices {
-        if full.contains(name) {
+        if full.split('/').any(|s| s == name) {
             return true;
         }
     }
     // LRF renderer / obscure Palm/Psion formats.
     let obscure_formats = ["lrf", "haodoo", "plucker", "ztxt", "azw4"];
     for name in obscure_formats {
-        if full.contains(&format!("/{}", name)) || full.starts_with(name) {
+        if full.split('/').any(|s| s == name) {
             return true;
         }
     }
@@ -285,14 +382,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn noise_file_matches_expected() {
+        assert!(is_noise_file("__init__.py"));
+        assert!(is_noise_file("main.ui"));
+        assert!(is_noise_file("QProgressIndicator.sip"));
+        assert!(is_noise_file("README.txt"));
+        assert!(is_noise_file("tbs_periodicals.rst"));
+        assert!(is_noise_file("TODO"));
+        assert!(!is_noise_file("cache.py"));
+        assert!(!is_noise_file("libusb.c"));
+    }
+
+    #[test]
     fn deferred_scope_matches_expected() {
-        assert!(is_deferred(&["src/calibre/gui2/actions".into()], "add.py"));
-        assert!(is_deferred(&["src/calibre/devices/binatone".into()], "driver.py"));
-        assert!(is_deferred(&["src/calibre/devices/nook".into()], "driver.py"));
-        assert!(is_deferred(&["src/pyj/book_list".into()], "add.pyj"));
-        assert!(!is_deferred(&["src/calibre/db".into()], "cache.py"));
-        assert!(!is_deferred(&["src/calibre/devices/kindle".into()], "driver.py"));
-        assert!(!is_deferred(&["src/calibre/ebooks/mobi".into()], "utils.py"));
+        assert!(is_deferred(&["src/calibre".into(), "gui2".into(), "actions".into()], "add.py"));
+        assert!(is_deferred(&["src/calibre".into(), "devices".into(), "binatone".into()], "driver.py"));
+        assert!(is_deferred(&["src/calibre".into(), "devices".into(), "nook".into()], "driver.py"));
+        assert!(is_deferred(&["src/pyj".into(), "book_list".into()], "add.pyj"));
+        assert!(is_deferred(&["src/pyj".into(), "read_book".into()], "cfi.pyj"));
+        assert!(is_deferred(&["src/perfect-hashing".into(), "frozen".into()], "map.h"));
+        assert!(is_deferred(&["src/calibre".into(), "gui2".into(), "viewer".into()], "main.py"));
+        assert!(is_deferred(&["src/calibre".into(), "headless".into()], "main.cpp"));
+        assert!(is_deferred(&["src/qt".into()], "core.py"));
+
+        assert!(!is_deferred(&["src/calibre".into(), "db".into()], "cache.py"));
+        assert!(!is_deferred(&["src/calibre".into(), "devices".into(), "kindle".into()], "driver.py"));
+        assert!(!is_deferred(&["src/calibre".into(), "ebooks".into(), "mobi".into()], "utils.py"));
     }
 
     #[test]
