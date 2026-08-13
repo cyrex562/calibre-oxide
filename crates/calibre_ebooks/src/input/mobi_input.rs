@@ -1,9 +1,28 @@
-use crate::mobi::reader::MobiReader;
+//! Port of `calibre.ebooks.conversion.plugins.mobi_input.MOBIInput`.
+//!
+//! Reads a `.mobi`/`.prc`/`.azw`/`.azw3` file and produces an [`OEBBook`]:
+//! [`crate::mobi::mobi6::MobiReader`] handles the MOBI6 case
+//! (`kf8_type().is_none()`) directly; when the file carries a KF8 payload
+//! (`standalone` or `joint` with a MOBI6 fallback), extraction is handed
+//! off to [`crate::mobi::mobi8::Mobi8Reader`], matching Python's dispatch
+//! in `MOBIInput.convert`.
+
+use crate::mobi::mobi6::MobiReader;
+use crate::mobi::mobi8::Mobi8Reader;
+use crate::mobi::MobiLog;
 use crate::oeb::book::OEBBook;
-use anyhow::Result;
+use crate::oeb::container::DirContainer;
+use crate::oeb::reader::OEBReader;
+use anyhow::{Context, Result};
 use std::path::Path;
 
 pub struct MOBIInput;
+
+impl Default for MOBIInput {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl MOBIInput {
     pub fn new() -> Self {
@@ -11,72 +30,37 @@ impl MOBIInput {
     }
 
     pub fn convert(&self, input_path: &Path, output_dir: &Path) -> Result<OEBBook> {
-        println!("Reading MOBI...");
-        let mut reader = MobiReader::new(input_path)?;
-        let pdb_header = &reader.pdb_header;
-        let sections = &mut reader.sections;
+        std::fs::create_dir_all(output_dir)?;
+        let raw = std::fs::read(input_path)
+            .with_context(|| format!("Failed to read {:?}", input_path))?;
 
-        // Select best section (KF8 preferred)
-        let section = if sections.len() > 1 {
-            println!("Joint MOBI detected. Using KF8 section.");
-            &mut sections[1]
+        let mut reader = MobiReader::new(&raw).context("Failed to parse MOBI headers")?;
+        let is_kf8 = reader.kf8_type.is_some();
+
+        let opf_path = if is_kf8 {
+            let log = MobiLog::default();
+            let mut mobi8 = Mobi8Reader::new(reader, log, false);
+            mobi8
+                .run(output_dir)
+                .context("Failed to extract KF8 content")?;
+            output_dir.join("metadata.opf")
         } else {
-            &mut sections[0]
+            reader
+                .extract_content(output_dir)
+                .context("Failed to extract MOBI6 content")?;
+            reader
+                .created_opf_path
+                .clone()
+                .unwrap_or_else(|| output_dir.join("index.opf"))
         };
 
-        println!(
-            "Extracting text from section (Start Record: {})...",
-            section.start_record
-        );
-        let raw_text = section.extract_text(input_path, pdb_header)?;
-
-        // Basic OEB Book Construction
-        use crate::oeb::container::DirContainer;
-        std::fs::create_dir_all(output_dir)?;
         let container = Box::new(DirContainer::new(output_dir));
         let mut book = OEBBook::new(container);
+        let oeb_reader = OEBReader::new();
+        let rel_opf = opf_path.strip_prefix(output_dir).unwrap_or(&opf_path);
+        let opf_str = rel_opf.to_str().context("Non-UTF8 OPF path")?;
+        oeb_reader.read_opf(&mut book, opf_str)?;
 
-        // Save content to file
-        let content_filename = "index.html";
-        let content_path = output_dir.join(content_filename);
-        std::fs::write(&content_path, &raw_text)?;
-
-        // Add Metadata
-        use crate::oeb::metadata::Item as MetaItem;
-
-        let title = "Converted MOBI".to_string();
-
-        book.metadata.items.push(MetaItem {
-            term: "dc:title".to_string(),
-            value: title,
-            attrib: Default::default(),
-        });
-
-        if let Some(exth) = &section.exth {
-            // Try to find title (Record 503)
-        }
-
-        // Add Manifest
-        use crate::oeb::manifest::ManifestItem;
-        book.manifest.items.insert(
-            "item1".to_string(),
-            ManifestItem {
-                id: "item1".to_string(),
-                href: content_filename.to_string(),
-                media_type: "application/xhtml+xml".to_string(),
-                fallback: None,
-                linear: true,
-            },
-        );
-
-        // Add Spine
-        use crate::oeb::spine::SpineItem;
-        book.spine.items.push(SpineItem {
-            idref: "item1".to_string(),
-            linear: true,
-        });
-
-        println!("Extracted {} bytes of text.", raw_text.len());
         Ok(book)
     }
 }

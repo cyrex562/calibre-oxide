@@ -1,8 +1,20 @@
 use crate::mobi::utils::{decint, decode_string};
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use byteorder::{BigEndian, ReadBytesExt};
-use std::collections::{BTreeMap, HashMap};
-use std::io::{Cursor, Read};
+use indexmap::IndexMap;
+use std::collections::BTreeMap;
+use std::io::Cursor;
+
+/// A per-record tag map: tag id -> decoded integer values.
+pub type TagMap = BTreeMap<u8, Vec<u64>>;
+/// The identifier -> tag-map table an INDX section decodes to, in
+/// on-disk/physical order (an `IndexMap` rather than a `BTreeMap`
+/// specifically *because* several consumers -- `mobi8.py`'s skeleton/div
+/// table reconstruction, `ncx.py`'s NCX-entry numbering -- rely on
+/// encounter order matching the original index-record order, not
+/// lexicographic order of the (often unpadded, numeric-as-string)
+/// identifiers.
+pub type IndexTable = IndexMap<String, TagMap>;
 
 #[derive(Debug, Clone)]
 pub struct TagX {
@@ -100,38 +112,40 @@ fn parse_indx_header(data: &[u8]) -> Result<IndxHeader> {
     let mut ordt2_raw = Vec::new();
     let mut ordt_map = String::new();
 
-    if ordt1 > 0 && data.len() >= (ordt1 as usize + 4 + oentries as usize) {
-        if &data[ordt1 as usize..ordt1 as usize + 4] == b"ORDT" {
-            let start = ordt1 as usize + 4;
-            let end = start + oentries as usize;
-            ordt1_raw = data[start..end].to_vec();
-        }
+    if ordt1 > 0
+        && data.len() >= (ordt1 as usize + 4 + oentries as usize)
+        && &data[ordt1 as usize..ordt1 as usize + 4] == b"ORDT"
+    {
+        let start = ordt1 as usize + 4;
+        let end = start + oentries as usize;
+        ordt1_raw = data[start..end].to_vec();
     }
 
-    if ordt2 > 0 && data.len() >= (ordt2 as usize + 4 + 2 * oentries as usize) {
-        if &data[ordt2 as usize..ordt2 as usize + 4] == b"ORDT" {
-            let start = ordt2 as usize + 4;
-            let end = start + 2 * oentries as usize;
-            ordt2_raw = data[start..end].to_vec();
+    if ordt2 > 0
+        && data.len() >= (ordt2 as usize + 4 + 2 * oentries as usize)
+        && &data[ordt2 as usize..ordt2 as usize + 4] == b"ORDT"
+    {
+        let start = ordt2 as usize + 4;
+        let end = start + 2 * oentries as usize;
+        ordt2_raw = data[start..end].to_vec();
 
-            if code == 65002 {
-                let mut parsed = Vec::new();
-                for i in (0..ordt2_raw.len()).step_by(2) {
-                    if i + 1 < ordt2_raw.len() {
-                        let b = ordt2_raw[i + 1];
-                        if b > 0x20 && b < 0x7F {
-                            parsed.push(b);
-                        } else {
-                            parsed.push(b'?');
-                        }
+        if code == 65002 {
+            let mut parsed = Vec::new();
+            for i in (0..ordt2_raw.len()).step_by(2) {
+                if i + 1 < ordt2_raw.len() {
+                    let b = ordt2_raw[i + 1];
+                    if b > 0x20 && b < 0x7F {
+                        parsed.push(b);
                     } else {
                         parsed.push(b'?');
                     }
+                } else {
+                    parsed.push(b'?');
                 }
-                ordt_map = String::from_utf8(parsed).unwrap_or_default();
-            } else {
-                ordt_map = "?".repeat(oentries as usize);
             }
+            ordt_map = String::from_utf8(parsed).unwrap_or_default();
+        } else {
+            ordt_map = "?".repeat(oentries as usize);
         }
     }
 
@@ -193,7 +207,6 @@ impl CNCXReader {
                             // Error logging?
                             eprintln!("CNCX entry out of bounds at offset {}", pos + record_offset);
                             map.insert(pos + record_offset, format_bytes(&raw[pos..]));
-                            pos = raw.len();
                             break;
                         }
                     }
@@ -249,7 +262,7 @@ fn get_tag_map(
     tagx: &[TagX],
     data: &[u8],
     _strict: bool,
-) -> Result<BTreeMap<u8, Vec<u64>>> {
+) -> Result<TagMap> {
     let control_byte_count = control_byte_count as usize;
     if data.len() < control_byte_count {
         bail!("Data too short for control bytes");
@@ -334,7 +347,7 @@ fn get_tag_map(
                 // Hmm, `decint` in `utils.rs` returns `(u64, usize)`.
 
                 reading_data = &reading_data[consumed..];
-                values.push(byts as u64); // Integer value
+                values.push(byts); // Integer value
             }
         } else if let Some(vb) = x.value_bytes {
             let mut total_consumed = 0;
@@ -342,7 +355,7 @@ fn get_tag_map(
                 let (byts, consumed) = decint(reading_data, true)?;
                 reading_data = &reading_data[consumed..];
                 total_consumed += consumed;
-                values.push(byts as u64);
+                values.push(byts);
             }
         }
         ans.insert(x.tag, values);
@@ -354,7 +367,7 @@ fn get_tag_map(
 }
 
 fn parse_index_record(
-    table: &mut BTreeMap<String, BTreeMap<u8, Vec<u64>>>,
+    table: &mut IndexTable,
     data: &[u8],
     control_byte_count: u32,
     tags: &[TagX],
@@ -423,14 +436,12 @@ fn get_tag_section_start(data: &[u8], indx_header: &IndxHeader) -> usize {
 }
 
 pub fn read_index(
-    sections: &[(Vec<u8>, (u32, u32, u32, u32, u32))], // mimicking sections structure passing?
-    // In reader.rs, sections are `Vec<MobiSection>`. But `reader.py` just passes `self.sections` which are `(data, header_tuple)`.
-    // I should adapt to `Vec<Vec<u8>>` for data to be simpler.
+    sections: &[Vec<u8>],
     idx: usize,
     codec: &str,
-) -> Result<(BTreeMap<String, BTreeMap<u8, Vec<u64>>>, CNCXReader)> {
-    let mut table = BTreeMap::new();
-    let data = &sections[idx].0;
+) -> Result<(IndexTable, CNCXReader)> {
+    let mut table = IndexMap::new();
+    let data = &sections[idx];
 
     let indx_header = parse_indx_header(data)?;
     let indx_count = indx_header.count as usize;
@@ -442,7 +453,7 @@ pub fn read_index(
         let mut cncx_records = Vec::new();
         for i in 0..indx_header.ncncx as usize {
             if off + i < sections.len() {
-                cncx_records.push(sections[off + i].0.clone());
+                cncx_records.push(sections[off + i].clone());
             }
         }
         cncx = CNCXReader::new(&cncx_records, codec);
@@ -453,7 +464,7 @@ pub fn read_index(
 
     for i in (idx + 1)..(idx + 1 + indx_count) {
         if i < sections.len() {
-            let record_data = &sections[i].0;
+            let record_data = &sections[i];
             parse_index_record(
                 &mut table,
                 record_data,

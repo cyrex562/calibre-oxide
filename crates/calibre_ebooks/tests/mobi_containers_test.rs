@@ -3,10 +3,11 @@ use calibre_ebooks::mobi::containers::{find_imgtype, Container};
 
 #[test]
 fn test_find_imgtype() {
-    assert_eq!(find_imgtype(b"\xFF\xD8\xFF\xE0"), Some("jpeg"));
-    assert_eq!(find_imgtype(b"\x89PNG\r\n\x1A\n"), Some("png"));
-    assert_eq!(find_imgtype(b"GIF89a"), Some("gif"));
-    assert_eq!(find_imgtype(b"Garbage"), None);
+    assert_eq!(find_imgtype(b"\xFF\xD8\xFF\xE0"), "jpeg");
+    assert_eq!(find_imgtype(b"\x89PNG\r\n\x1A\n"), "png");
+    assert_eq!(find_imgtype(b"GIF89a"), "gif");
+    assert_eq!(find_imgtype(b"BM\x00\x00\x00\x00"), "bmp");
+    assert_eq!(find_imgtype(b"Garbage"), "unknown");
 }
 
 #[test]
