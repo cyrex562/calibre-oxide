@@ -496,7 +496,7 @@
 - [x] pdf.py
 - [x] plucker.py
 - [x] pml.py
-- [ ] rar.py
+- [x] rar.py
 - [x] rb.rs
 - [x] rtf.rs
 - [x] search_internet.py
@@ -507,10 +507,9 @@
 - [x] topaz.py
 - [x] txt.py
 - [x] utils.py
-- [ ] worker.py
+- [x] worker.py
 - [x] xmp.py (Unverified - Test Ignored)
 - [x] zip.py
-- [x] rar.py (Stub)
 
 #### ebooks/metadata
 - [x] chm.py (Regex-based port)

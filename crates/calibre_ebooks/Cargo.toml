@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 calibre_utils = { path = "../calibre_utils" }
+calibre_customize = { path = "../calibre_customize" }
+uuid = { version = "1.0", features = ["v4"] }
 roxmltree = "0.18"
 zip = "0.6"
 thiserror = "1.0"
