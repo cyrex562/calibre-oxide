@@ -197,7 +197,9 @@ impl Plumber {
                 }
             }
             let output_plugin = LitOutput::new();
-            output_plugin.convert(&book, &self.output_path)?;
+            for warning in output_plugin.convert(&mut book, &self.output_path)? {
+                eprintln!("Warning: {warning}");
+            }
         } else if ["txt", "md", "markdown", "text"].contains(&output_ext.as_str()) {
             use crate::output::txt_output::TXTOutput;
             // Ensure dir exists
