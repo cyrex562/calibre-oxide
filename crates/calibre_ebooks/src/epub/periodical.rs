@@ -22,7 +22,6 @@
 
 use chrono::{DateTime, Datelike, Utc};
 
-use crate::html_entities::xml_replace_entities;
 use crate::oeb::book::OEBBook;
 use crate::oeb::toc::TOCNode;
 
@@ -89,20 +88,8 @@ const SONY_ATOM_ENTRY: &str = r##"<entry>
 </entry>
 "##;
 
-/// Resolve entity references, then escape the XML metacharacters.
-///
-/// Port of calibre's `prepare_string_for_xml`. `attribute` additionally
-/// escapes the quote characters.
-pub fn prepare_string_for_xml(raw: &str, attribute: bool) -> String {
-    let mut out = xml_replace_entities(raw)
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;");
-    if attribute {
-        out = out.replace('"', "&quot;").replace('\'', "&apos;");
-    }
-    out
-}
+/// Re-exported so the FB2 and EPUB writers share one escaper.
+pub use crate::xml_util::prepare_string_for_xml;
 
 /// Substitute `{name}` placeholders in a template.
 ///
