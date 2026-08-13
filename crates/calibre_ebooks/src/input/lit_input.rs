@@ -1,4 +1,10 @@
-use crate::lit::reader::LitReader;
+//! LIT input plugin.
+//!
+//! Port of the reading half of `src/calibre/ebooks/lit/input.py`: open
+//! the LIT container, write everything it holds out as a directory, and
+//! hand back an [`OEBBook`] over it.
+
+use crate::lit::reader::LitContainer;
 use crate::oeb::book::OEBBook;
 use crate::oeb::container::DirContainer;
 use crate::oeb::manifest::ManifestItem;
@@ -7,49 +13,76 @@ use std::fs;
 use std::io::BufReader;
 use std::path::Path;
 
+/// The LIT input conversion plugin.
 pub struct LitInput;
 
+impl Default for LitInput {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LitInput {
+    /// Build the plugin.
     pub fn new() -> Self {
         LitInput
     }
 
+    /// Extract `input_path` into `output_dir` and describe it as an
+    /// OEB book.
     pub fn convert(&self, input_path: &Path, output_dir: &Path) -> Result<OEBBook> {
         let file = fs::File::open(input_path).context("Failed to open LIT file")?;
         let reader = BufReader::new(file);
-        let mut lit_reader = LitReader::new(reader).context("Failed to parse LIT header")?;
+        let name = input_path.file_name().and_then(|n| n.to_str());
+        let mut container =
+            LitContainer::new(reader, name).context("Failed to parse LIT container")?;
 
-        // Prepare Output
         fs::create_dir_all(output_dir)?;
 
-        // Extract Content
-        // Since extraction is limited, we might just write a placeholder or metadata.
-        let content = lit_reader.extract_content()?;
+        // The OPF is reconstructed from the tokenised `/meta` entry.
+        let opf = container
+            .get_metadata()
+            .context("Failed to read LIT metadata")?;
+        let opf_path = container.litfile.opf_path.clone();
+        fs::write(output_dir.join(&opf_path), opf.as_bytes())?;
 
-        let content_filename = "content.html";
-        let content_path = output_dir.join(content_filename);
-        let html_content = format!(
-            "<html><body><h1>LIT Conversion</h1><p>{}</p></body></html>",
-            content
-        );
-        fs::write(&content_path, &html_content)?;
+        let mut book = OEBBook::new(Box::new(DirContainer::new(output_dir)));
 
-        // Build OEBBook
-        let container = Box::new(DirContainer::new(output_dir));
-        let mut book = OEBBook::new(container);
+        // Manifest order is not meaningful, but a stable one keeps the
+        // extracted directory reproducible.
+        let mut internals: Vec<String> = container.litfile.manifest.keys().cloned().collect();
+        internals.sort();
 
-        // Add Content to Manifest & Spine
-        let id = "content".to_string();
-        let href = content_filename.to_string();
+        for internal in internals {
+            let item = container.litfile.manifest[&internal].clone();
+            let data = container
+                .read(&item.path)
+                .with_context(|| format!("Failed to read {} from LIT file", item.path))?;
 
-        book.manifest.items.insert(
-            id.clone(),
-            ManifestItem::new(&id, &href, "application/xhtml+xml"),
-        );
-        book.manifest.hrefs.insert(href.clone(), id.clone());
-        book.spine.add(&id, true);
+            let target = output_dir.join(&item.path);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&target, &data)?;
 
-        book.metadata.add("title", "Converted LIT Book");
+            let media_type = if item.state.contains("spine") {
+                "application/xhtml+xml"
+            } else {
+                item.mime_type.as_str()
+            };
+            book.manifest.items.insert(
+                item.internal.clone(),
+                ManifestItem::new(&item.internal, &item.path, media_type),
+            );
+            book.manifest
+                .hrefs
+                .insert(item.path.clone(), item.internal.clone());
+            if item.state == "spine" {
+                book.spine.add(&item.internal, true);
+            } else if item.state == "not spine" {
+                book.spine.add(&item.internal, false);
+            }
+        }
 
         Ok(book)
     }
