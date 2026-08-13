@@ -1,4 +1,4 @@
-use crate::html::input::traverse;
+use crate::html::input::get_filelist;
 use crate::oeb::book::OEBBook;
 use crate::oeb::container::DirContainer;
 use crate::oeb::manifest::ManifestItem;
@@ -18,7 +18,9 @@ impl HTMLInput {
     pub fn convert(&self, input_path: &Path, output_dir: &Path) -> Result<OEBBook> {
         println!("Crawling HTML file: {:?}", input_path);
 
-        let file_list = traverse(input_path, 5).context("Failed to traverse HTML")?;
+        // Depth-first, which is calibre's default ordering.
+        let file_list = get_filelist(input_path, 5, None, false)
+            .map_err(|e| anyhow::anyhow!("Failed to traverse HTML: {}", e.message))?;
         println!("Found {} files", file_list.len());
 
         fs::create_dir_all(output_dir)?;

@@ -401,10 +401,10 @@
 
 #### html
 
-- [ ] __init__.py
-- [ ] input.py
-- [ ] meta.py
-- [ ] to_zip.py
+- [x] `__init__.py` (docstring only) -> `html/mod.rs`
+- [x] `input.py` -> `html/input.rs`
+- [x] `meta.py` -> `html/meta.rs`
+- [x] `to_zip.py` -> `html/to_zip.rs` (settings + packaging; the `gui_convert` input dump `run()` needs is #147, and `do_user_config` is Qt)
 
 #### htmlz
 
