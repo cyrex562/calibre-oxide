@@ -2,7 +2,7 @@ use anyhow::Result;
 use byteorder::{BigEndian, ReadBytesExt};
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 
 /// Text record size (uncompressed). `RECORD_SIZE` in `mobi/utils.py`.
 pub const RECORD_SIZE: usize = 0x1000;
@@ -334,125 +334,6 @@ pub fn is_guide_ref_start(title: Option<&str>, type_: Option<&str>) -> bool {
     false
 }
 
-/// Result of [`read_font_record`]. Port of the dict returned by
-/// `mobi/utils.py`'s `read_font_record`.
-#[derive(Debug, Clone, Default)]
-pub struct FontRecordHeaders {
-    pub usize: u32,
-    pub flags: u32,
-    pub xor_len: u32,
-    pub xor_start: u32,
-    pub dstart: u32,
-}
-
-#[derive(Debug, Clone)]
-pub struct FontRecord {
-    pub raw_data: Vec<u8>,
-    pub font_data: Option<Vec<u8>>,
-    pub err: Option<String>,
-    /// "ttf", "otf", "dat" or "failed".
-    pub ext: String,
-    pub headers: Option<FontRecordHeaders>,
-    pub encrypted: bool,
-}
-
-/// Port of `mobi/utils.py`'s `read_font_record`: decodes a MOBI FONT
-/// record (optionally XOR-obfuscated and/or zlib-compressed) into
-/// TrueType/OpenType font bytes.
-pub fn read_font_record(data: &[u8], extent: Option<usize>) -> FontRecord {
-    let mut ans = FontRecord {
-        raw_data: data.to_vec(),
-        font_data: None,
-        err: None,
-        ext: "failed".to_string(),
-        headers: None,
-        encrypted: false,
-    };
-
-    if data.len() < 24 {
-        ans.err = Some("Failed to read font record header fields".to_string());
-        return ans;
-    }
-
-    let mut c = Cursor::new(&data[4..24]);
-    let (usize_, flags, dstart, xor_len, xor_start) = match (
-        c.read_u32::<BigEndian>(),
-        c.read_u32::<BigEndian>(),
-        c.read_u32::<BigEndian>(),
-        c.read_u32::<BigEndian>(),
-        c.read_u32::<BigEndian>(),
-    ) {
-        (Ok(a), Ok(b), Ok(c_), Ok(d), Ok(e)) => (a, b, c_, d, e),
-        _ => {
-            ans.err = Some("Failed to read font record header fields".to_string());
-            return ans;
-        }
-    };
-
-    if dstart as usize > data.len() {
-        ans.err = Some("Failed to read font record header fields".to_string());
-        return ans;
-    }
-    let mut font_data = data[dstart as usize..].to_vec();
-    ans.headers = Some(FontRecordHeaders {
-        usize: usize_,
-        flags,
-        xor_len,
-        xor_start,
-        dstart,
-    });
-
-    if flags & 0b10 != 0 {
-        // De-obfuscate the data
-        let xs = xor_start as usize;
-        let xl = xor_len as usize;
-        if xl == 0 || xs + xl > data.len() {
-            ans.err = Some("Invalid XOR key range in font record".to_string());
-            return ans;
-        }
-        let key = &data[xs..xs + xl];
-        let extent = extent.unwrap_or(font_data.len()).min(font_data.len());
-        for (n, byte) in font_data.iter_mut().take(extent).enumerate() {
-            *byte ^= key[n % xl];
-        }
-        ans.encrypted = true;
-    }
-
-    if flags & 0b1 != 0 {
-        // ZLIB compressed data
-        use std::io::Read as _;
-        let mut decoder = flate2::read::ZlibDecoder::new(&font_data[..]);
-        let mut out = Vec::new();
-        match decoder.read_to_end(&mut out) {
-            Ok(_) => font_data = out,
-            Err(e) => {
-                ans.err = Some(format!("Failed to zlib decompress font data ({e})"));
-                return ans;
-            }
-        }
-        if font_data.len() != usize_ as usize {
-            ans.err = Some("Uncompressed font size mismatch".to_string());
-            return ans;
-        }
-    }
-
-    let sig = if font_data.len() >= 4 {
-        &font_data[..4]
-    } else {
-        &font_data[..]
-    };
-    ans.ext = if sig == b"\0\x01\0\0" || sig == b"true" || sig == b"ttcf" {
-        "ttf".to_string()
-    } else if sig == b"OTTO" {
-        "otf".to_string()
-    } else {
-        "dat".to_string()
-    };
-    ans.font_data = Some(font_data);
-
-    ans
-}
-
 // Stub implementations
 pub fn mobify_image(data: &[u8]) -> Result<Vec<u8>> {
     Ok(data.to_vec())
@@ -466,9 +347,109 @@ pub fn rescale_image(
     Ok(Vec::new())
 }
 
+/// A decoded `FONT` record. `read_font_record`'s return dict in
+/// `mobi/utils.py`, typed.
+#[derive(Debug, Clone)]
+pub struct FontRecordInfo {
+    /// The record's raw bytes, unmodified.
+    pub raw_data: Vec<u8>,
+    /// The de-obfuscated/decompressed font payload, if decoding
+    /// succeeded.
+    pub font_data: Option<Vec<u8>>,
+    /// Why decoding failed, if it did.
+    pub err: Option<String>,
+    /// `ttf`, `otf`, `dat` (undetermined), or `failed`.
+    pub ext: &'static str,
+    /// Whether the payload was XOR-obfuscated.
+    pub encrypted: bool,
+}
+
+/// Decode the font embedded in a MOBI `FONT` record.
+///
+/// Port of `read_font_record` in `mobi/utils.py`. Layout:
+/// `FONT` (4) + uncompressed size (4) + flags (4) + offset to
+/// compressed data (4) + XOR key length (4) + offset to XOR key (4),
+/// all big-endian, followed by the payload. Flag bit 0 is zlib
+/// compression, bit 1 is XOR obfuscation.
+///
+/// `extent` bounds how many bytes of the payload get XORed — every
+/// font calibre has ever encountered obfuscates exactly 1040 bytes,
+/// which is `DEFAULT_FONT_XOR_EXTENT`.
+pub fn read_font_record(data: &[u8], extent: usize) -> FontRecordInfo {
+    let raw_data = data.to_vec();
+    let mut info = FontRecordInfo {
+        raw_data: raw_data.clone(),
+        font_data: None,
+        err: None,
+        ext: "failed",
+        encrypted: false,
+    };
+
+    if data.len() < 24 {
+        info.err = Some("Failed to read font record header fields".to_string());
+        return info;
+    }
+    let usize_ = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
+    let flags = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+    let dstart = u32::from_be_bytes([data[12], data[13], data[14], data[15]]) as usize;
+    let xor_len = u32::from_be_bytes([data[16], data[17], data[18], data[19]]) as usize;
+    let xor_start = u32::from_be_bytes([data[20], data[21], data[22], data[23]]) as usize;
+
+    if dstart > data.len() {
+        info.err = Some("Failed to read font record header fields".to_string());
+        return info;
+    }
+    let mut font_data = data[dstart..].to_vec();
+
+    if flags & 0b10 != 0 {
+        if xor_len == 0 || xor_start + xor_len > data.len() {
+            info.err = Some("Failed to read font record header fields".to_string());
+            return info;
+        }
+        let key = &data[xor_start..xor_start + xor_len];
+        let extent = extent.min(font_data.len());
+        for (n, byte) in font_data.iter_mut().enumerate().take(extent) {
+            *byte ^= key[n % xor_len];
+        }
+        info.encrypted = true;
+    }
+
+    if flags & 0b1 != 0 {
+        let mut decoder = flate2::read::ZlibDecoder::new(&font_data[..]);
+        let mut decompressed = Vec::new();
+        match decoder.read_to_end(&mut decompressed) {
+            Ok(_) if decompressed.len() == usize_ => font_data = decompressed,
+            Ok(_) => {
+                info.err = Some("Uncompressed font size mismatch".to_string());
+                return info;
+            }
+            Err(e) => {
+                info.err = Some(format!("Failed to zlib decompress font data ({e})"));
+                return info;
+            }
+        }
+    }
+
+    let sig = &font_data[..font_data.len().min(4)];
+    info.ext = if matches!(sig, b"\0\x01\0\0" | b"true" | b"ttcf") {
+        "ttf"
+    } else if sig == b"OTTO" {
+        "otf"
+    } else {
+        "dat"
+    };
+    info.font_data = Some(font_data);
+    info
+}
+
+/// The default XOR extent every font record calibre has encountered
+/// uses. `read_font_record(data, extent=1040)` in `mobi/utils.py`.
+pub const DEFAULT_FONT_XOR_EXTENT: usize = 1040;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn test_encint_decint() {
@@ -543,5 +524,81 @@ mod tests {
         let data2 = vec![1, 2, 3, 4];
         let aligned2 = align_block(&data2, 4, 0);
         assert_eq!(aligned2, vec![1, 2, 3, 4]);
+    }
+
+    fn build_font_record(payload: &[u8], compress: bool, obfuscate: bool) -> Vec<u8> {
+        let mut body = payload.to_vec();
+        let usize_ = body.len() as u32;
+        let mut flags: u32 = 0;
+        if compress {
+            flags |= 0b1;
+            let mut enc =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            enc.write_all(&body).unwrap();
+            body = enc.finish().unwrap();
+        }
+        let key: Vec<u8> = vec![0x5A, 0x3C, 0x91, 0x7E];
+        if obfuscate {
+            flags |= 0b10;
+            let extent = body.len().min(DEFAULT_FONT_XOR_EXTENT);
+            for (i, b) in body.iter_mut().enumerate().take(extent) {
+                *b ^= key[i % key.len()];
+            }
+        }
+        let dstart = 24u32;
+        let xor_start = dstart + body.len() as u32; // placed after payload
+        let mut rec = Vec::new();
+        rec.extend_from_slice(b"FONT");
+        rec.extend_from_slice(&usize_.to_be_bytes());
+        rec.extend_from_slice(&flags.to_be_bytes());
+        rec.extend_from_slice(&dstart.to_be_bytes());
+        rec.extend_from_slice(&(key.len() as u32).to_be_bytes());
+        rec.extend_from_slice(&xor_start.to_be_bytes());
+        rec.extend_from_slice(&body);
+        if obfuscate {
+            // Only present (and only read) when the obfuscation flag
+            // is set; otherwise it would be read as trailing payload.
+            rec.extend_from_slice(&key);
+        }
+        rec
+    }
+
+    #[test]
+    fn read_font_record_round_trips_a_plain_ttf() {
+        let mut payload = b"\x00\x01\x00\x00".to_vec();
+        payload.extend_from_slice(b"rest of a fake sfnt font table directory here");
+        let rec = build_font_record(&payload, false, false);
+        let info = read_font_record(&rec, DEFAULT_FONT_XOR_EXTENT);
+        assert!(info.err.is_none(), "{:?}", info.err);
+        assert_eq!(info.ext, "ttf");
+        assert!(!info.encrypted);
+        assert_eq!(info.font_data.as_deref(), Some(payload.as_slice()));
+    }
+
+    #[test]
+    fn read_font_record_deobfuscates_and_decompresses_an_otf() {
+        let mut payload = b"OTTO".to_vec();
+        payload.extend_from_slice(&[7u8; 200]);
+        let rec = build_font_record(&payload, true, true);
+        let info = read_font_record(&rec, DEFAULT_FONT_XOR_EXTENT);
+        assert!(info.err.is_none(), "{:?}", info.err);
+        assert_eq!(info.ext, "otf");
+        assert!(info.encrypted);
+        assert_eq!(info.font_data.as_deref(), Some(payload.as_slice()));
+    }
+
+    #[test]
+    fn read_font_record_reports_a_truncated_header() {
+        let info = read_font_record(b"FONT", DEFAULT_FONT_XOR_EXTENT);
+        assert!(info.err.is_some());
+        assert_eq!(info.ext, "failed");
+    }
+
+    #[test]
+    fn read_font_record_falls_back_to_dat_for_unknown_signatures() {
+        let payload = b"not a real font signature at all, just bytes".to_vec();
+        let rec = build_font_record(&payload, false, false);
+        let info = read_font_record(&rec, DEFAULT_FONT_XOR_EXTENT);
+        assert_eq!(info.ext, "dat");
     }
 }

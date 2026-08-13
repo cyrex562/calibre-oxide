@@ -24,7 +24,7 @@ use crate::mobi::markup::{expand_mobi8_markup, FlowInfo as MarkupFlowInfo, MobiR
 use crate::mobi::mobi6::MobiReader;
 use crate::mobi::ncx::{build_toc, read_ncx};
 use crate::mobi::opf_writer::{self, GuideRef};
-use crate::mobi::utils::read_font_record;
+use crate::mobi::utils::{read_font_record, DEFAULT_FONT_XOR_EXTENT};
 use crate::mobi::MobiLog;
 
 lazy_static! {
@@ -715,8 +715,8 @@ impl Mobi8Reader {
                 ) {
                     // Ignore these records.
                 } else if typ == b"FONT" {
-                    let font = read_font_record(data, Some(1040));
-                    let ext = font.ext.clone();
+                    let font = read_font_record(data, DEFAULT_FONT_XOR_EXTENT);
+                    let ext = font.ext;
                     let h = format!("fonts/{fname_idx:05}.{ext}");
                     if let Some(err) = &font.err {
                         self.log
