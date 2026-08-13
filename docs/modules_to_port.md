@@ -408,8 +408,8 @@
 
 #### htmlz
 
-- [ ] __init__.py
-- [ ] oeb2html.py
+- [x] `__init__.py` (empty upstream) -> `htmlz/mod.rs`
+- [x] `oeb2html.py` -> `htmlz/oeb2html.rs` (the three subclasses become `CssMode`; resolved CSS comes from `oeb::stylizer::StyleProvider`)
 
 #### iterator
 

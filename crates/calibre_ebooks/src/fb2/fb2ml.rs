@@ -87,99 +87,13 @@ impl Default for Fb2Options {
     }
 }
 
-/// The resolved style of one element, reduced to what this conversion
-/// asks of it.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Style {
-    pub display: String,
-    pub visibility: String,
-    pub font_weight: String,
-    pub font_style: String,
-    pub text_decoration: String,
-    /// Top margin in points.
-    pub margin_top: f64,
-    /// Font size in points; the ratio to `margin_top` becomes a count
-    /// of blank lines.
-    pub font_size: f64,
-}
-
-impl Default for Style {
-    fn default() -> Self {
-        Self {
-            display: "inline".to_string(),
-            visibility: "visible".to_string(),
-            font_weight: "normal".to_string(),
-            font_style: "normal".to_string(),
-            text_decoration: "none".to_string(),
-            margin_top: 0.0,
-            font_size: 12.0,
-        }
-    }
-}
-
-/// Supplies the resolved style of an element.
+/// The style seam FB2 conversion needs.
 ///
-/// Stands in for `calibre.ebooks.oeb.stylizer.Stylizer`.
-pub trait Stylizer {
-    fn style(&self, node: Node) -> Style;
-}
-
-/// A stylizer that knows only the HTML defaults: which elements are
-/// blocks, and which imply bold or italic.
-///
-/// Enough for documents that carry their formatting in their markup,
-/// which is what FB2 can represent anyway. A real CSS cascade would
-/// replace this without changing the conversion.
-#[derive(Debug, Default, Clone)]
-pub struct TagStylizer;
-
-impl Stylizer for TagStylizer {
-    fn style(&self, node: Node) -> Style {
-        let tag = node.tag_name().name();
-        let mut style = Style::default();
-        if matches!(
-            tag,
-            "html"
-                | "body"
-                | "div"
-                | "p"
-                | "h1"
-                | "h2"
-                | "h3"
-                | "h4"
-                | "h5"
-                | "h6"
-                | "ul"
-                | "ol"
-                | "li"
-                | "blockquote"
-                | "table"
-                | "tr"
-                | "td"
-                | "th"
-                | "section"
-                | "article"
-        ) {
-            style.display = "block".to_string();
-        }
-        if matches!(tag, "head" | "script" | "style" | "title" | "meta" | "link") {
-            style.display = "none".to_string();
-        }
-        if matches!(
-            tag,
-            "b" | "strong" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
-        ) {
-            style.font_weight = "bold".to_string();
-        }
-        if matches!(tag, "i" | "em" | "cite" | "dfn" | "var") {
-            style.font_style = "italic".to_string();
-        }
-        if matches!(tag, "del" | "s" | "strike") {
-            style.text_decoration = "line-through".to_string();
-        }
-        style
-    }
-}
+/// These were defined here when this was the only consumer; they now
+/// live in [`crate::oeb::stylizer`] so the HTMLZ writer can share them.
+/// Re-exported under their original names so this module reads as it
+/// did.
+pub use crate::oeb::stylizer::{ResolvedStyle as Style, StyleProvider as Stylizer, TagStylizer};
 
 /// Converts an image to JPEG for embedding.
 ///

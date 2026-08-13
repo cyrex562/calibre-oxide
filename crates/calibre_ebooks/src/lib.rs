@@ -11,6 +11,7 @@ pub mod epub;
 pub mod fb2;
 pub mod html;
 pub mod html_entities;
+pub mod htmlz;
 pub mod hyphenate;
 pub mod input;
 pub mod lit;
