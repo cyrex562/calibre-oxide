@@ -417,17 +417,17 @@
 
 #### lit
 
-- [ ] __init__.py
-- [ ] lzx.py
-- [ ] mssha1.py
-- [ ] reader.py
-- [ ] writer.py
+- [x] __init__.py
+- [x] lzx.py
+- [x] mssha1.py
+- [x] reader.py
+- [x] writer.py
 
 ##### maps
 
-- [ ] __init__.py
-- [ ] html.py
-- [ ] opf.py
+- [x] __init__.py
+- [x] html.py
+- [x] opf.py
 
 #### lrf
 
@@ -1726,16 +1726,17 @@
 
 #### lzx
 
-- [ ] compressor.c
-- [ ] lzc.c
-- [ ] lzc.h
-- [ ] lzxc.c
-- [ ] lzxc.h
-- [ ] lzxd.c
-- [ ] lzxd.h
-- [ ] lzxmodule.c
-- [ ] mspack.h
-- [ ] system.h
+- [x] compressor.c
+- [x] lzc.c
+- [x] lzc.h
+- [x] lzxc.c
+- [x] lzxc.h
+- [x] lzxd.c
+- [x] lzxd.h
+- [x] lzxmodule.c
+- [x] mspack.h (only the `mspack_system` glue the LZX codec uses; the
+      rest of libmspack's CAB/CHM/etc. readers are out of scope)
+- [x] system.h (build-time portability shims; no Rust equivalent needed)
 
 #### magick
 
@@ -1745,10 +1746,10 @@
 
 #### msdes
 
-- [ ] d3des.h
-- [ ] des.c
-- [ ] msdesmodule.c
-- [ ] spr.h
+- [x] d3des.h
+- [x] des.c
+- [x] msdesmodule.c
+- [x] spr.h
 
 #### open_with
 
