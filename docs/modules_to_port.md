@@ -401,15 +401,15 @@
 
 #### html
 
-- [ ] __init__.py
-- [ ] input.py
-- [ ] meta.py
-- [ ] to_zip.py
+- [x] `__init__.py` (docstring only) -> `html/mod.rs`
+- [x] `input.py` -> `html/input.rs`
+- [x] `meta.py` -> `html/meta.rs`
+- [x] `to_zip.py` -> `html/to_zip.rs` (settings + packaging; the `gui_convert` input dump `run()` needs is #147, and `do_user_config` is Qt)
 
 #### htmlz
 
-- [ ] __init__.py
-- [ ] oeb2html.py
+- [x] `__init__.py` (empty upstream) -> `htmlz/mod.rs`
+- [x] `oeb2html.py` -> `htmlz/oeb2html.rs` (the three subclasses become `CssMode`; resolved CSS comes from `oeb::stylizer::StyleProvider`)
 
 #### iterator
 
