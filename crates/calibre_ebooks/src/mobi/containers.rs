@@ -1,23 +1,12 @@
 use byteorder::{BigEndian, ReadBytesExt};
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::io::{Cursor, Seek, SeekFrom};
 
-/// Detects image type from data signature.
-/// A simple replacement for `calibre.utils.imghdr.what`.
-pub fn find_imgtype(data: &[u8]) -> Option<&str> {
-    if data.len() < 4 {
-        return None;
-    }
-    if &data[0..3] == b"\xFF\xD8\xFF" {
-        return Some("jpeg");
-    }
-    if &data[0..4] == b"\x89PNG" {
-        return Some("png");
-    }
-    if &data[0..4] == b"GIF8" {
-        return Some("gif");
-    }
-    // Add more if needed
-    None
+/// Port of `calibre.ebooks.mobi.reader.containers.find_imgtype`:
+/// `what(None, data) or 'unknown'`. Delegates signature sniffing to
+/// `calibre_utils::imghdr::what` (jpeg/png/gif/bmp/tiff/webp/jpeg2000),
+/// which mirrors `calibre.utils.imghdr`.
+pub fn find_imgtype(data: &[u8]) -> &'static str {
+    calibre_utils::imghdr::what(data).unwrap_or("unknown")
 }
 
 pub struct Container {
@@ -84,7 +73,7 @@ impl Container {
                         }
 
                         current_pos += size;
-                        if let Err(_) = cursor.seek(SeekFrom::Start(current_pos as u64)) {
+                        if cursor.seek(SeekFrom::Start(current_pos as u64)).is_err() {
                             break;
                         }
                     } else {
@@ -100,24 +89,17 @@ impl Container {
         }
     }
 
+    /// Port of `Container.load_image`: strips the 12-byte CRES prefix and
+    /// sniffs the remaining bytes. Returns `(None, None)` if this
+    /// container isn't an image container or the type can't be
+    /// identified.
     pub fn load_image<'a>(&mut self, data: &'a [u8]) -> (Option<&'a [u8]>, Option<&'static str>) {
         self.resource_index += 1;
-        if self.is_image_container {
-            // Python checks check_signature for 'USE ' at start? No, it just does data[12:]
-            // Python code: data = data[12:]
-            if data.len() > 12 {
-                let img_data = &data[12..];
-                if let Some(imgtype) = find_imgtype(img_data) {
-                    return (
-                        Some(img_data),
-                        Some(match imgtype {
-                            "jpeg" => "jpeg",
-                            "png" => "png",
-                            "gif" => "gif",
-                            _ => "unknown",
-                        }),
-                    );
-                }
+        if self.is_image_container && data.len() > 12 {
+            let img_data = &data[12..];
+            let imgtype = find_imgtype(img_data);
+            if imgtype != "unknown" {
+                return (Some(img_data), Some(imgtype));
             }
         }
         (None, None)

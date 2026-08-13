@@ -1,8 +1,11 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
+use byteorder::{BigEndian, ReadBytesExt};
 
 use std::collections::{BTreeMap, HashMap};
-use std::fmt::Write as FmtWrite;
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::io::Cursor;
+
+/// Text record size (uncompressed). `RECORD_SIZE` in `mobi/utils.py`.
+pub const RECORD_SIZE: usize = 0x1000;
 
 /// Encode the integer `value` as a variable width integer and return the Vec<u8> corresponding to it.
 /// If forward is true, the bytes returned are suitable for prepending to the output buffer,
@@ -97,10 +100,11 @@ pub fn encode_string(raw: &[u8]) -> Vec<u8> {
     ans
 }
 
-pub fn get_trailing_data(
-    record: &[u8],
-    extra_data_flags: u32,
-) -> Result<(BTreeMap<u32, Vec<u8>>, Vec<u8>)> {
+/// Trailing-entry index -> raw bytes, plus the record with all trailing
+/// entries stripped off.
+pub type TrailingData = (BTreeMap<u32, Vec<u8>>, Vec<u8>);
+
+pub fn get_trailing_data(record: &[u8], extra_data_flags: u32) -> Result<TrailingData> {
     let mut data = BTreeMap::new();
     let mut flags = extra_data_flags >> 1;
     let mut record_slice = record;
@@ -163,7 +167,7 @@ pub fn encode_trailing_data(raw: &[u8]) -> Vec<u8> {
 pub fn encode_fvwi(val: u64, flags: u32, flag_size: u32) -> Vec<u8> {
     let mut ans = val << flag_size;
     for i in 0..flag_size {
-        ans |= (flags as u64 & (1 << i));
+        ans |= flags as u64 & (1 << i);
     }
     encint(ans, true)
 }
@@ -194,12 +198,10 @@ pub fn decode_tbs(byts: &[u8], flag_size: u32) -> Result<(u64, HashMap<u32, u64>
         consumed += c;
         extra.insert(0b0010, x);
     }
-    if (flags & 0b0100) != 0 {
-        if !current_slice.is_empty() {
-            extra.insert(0b0100, current_slice[0] as u64);
-            current_slice = &current_slice[1..];
-            consumed += 1;
-        }
+    if (flags & 0b0100) != 0 && !current_slice.is_empty() {
+        extra.insert(0b0100, current_slice[0] as u64);
+        current_slice = &current_slice[1..];
+        consumed += 1;
     }
     if (flags & 0b0001) != 0 {
         let (x, c) = decint(current_slice, true)?;
@@ -306,7 +308,7 @@ pub fn align_block(raw: &[u8], multiple: usize, pad: u8) -> Vec<u8> {
         return raw.to_vec();
     }
     let mut res = raw.to_vec();
-    res.extend(std::iter::repeat(pad).take(multiple - extra));
+    res.extend(std::iter::repeat_n(pad, multiple - extra));
     res
 }
 
@@ -330,6 +332,125 @@ pub fn is_guide_ref_start(title: Option<&str>, type_: Option<&str>) -> bool {
         }
     }
     false
+}
+
+/// Result of [`read_font_record`]. Port of the dict returned by
+/// `mobi/utils.py`'s `read_font_record`.
+#[derive(Debug, Clone, Default)]
+pub struct FontRecordHeaders {
+    pub usize: u32,
+    pub flags: u32,
+    pub xor_len: u32,
+    pub xor_start: u32,
+    pub dstart: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct FontRecord {
+    pub raw_data: Vec<u8>,
+    pub font_data: Option<Vec<u8>>,
+    pub err: Option<String>,
+    /// "ttf", "otf", "dat" or "failed".
+    pub ext: String,
+    pub headers: Option<FontRecordHeaders>,
+    pub encrypted: bool,
+}
+
+/// Port of `mobi/utils.py`'s `read_font_record`: decodes a MOBI FONT
+/// record (optionally XOR-obfuscated and/or zlib-compressed) into
+/// TrueType/OpenType font bytes.
+pub fn read_font_record(data: &[u8], extent: Option<usize>) -> FontRecord {
+    let mut ans = FontRecord {
+        raw_data: data.to_vec(),
+        font_data: None,
+        err: None,
+        ext: "failed".to_string(),
+        headers: None,
+        encrypted: false,
+    };
+
+    if data.len() < 24 {
+        ans.err = Some("Failed to read font record header fields".to_string());
+        return ans;
+    }
+
+    let mut c = Cursor::new(&data[4..24]);
+    let (usize_, flags, dstart, xor_len, xor_start) = match (
+        c.read_u32::<BigEndian>(),
+        c.read_u32::<BigEndian>(),
+        c.read_u32::<BigEndian>(),
+        c.read_u32::<BigEndian>(),
+        c.read_u32::<BigEndian>(),
+    ) {
+        (Ok(a), Ok(b), Ok(c_), Ok(d), Ok(e)) => (a, b, c_, d, e),
+        _ => {
+            ans.err = Some("Failed to read font record header fields".to_string());
+            return ans;
+        }
+    };
+
+    if dstart as usize > data.len() {
+        ans.err = Some("Failed to read font record header fields".to_string());
+        return ans;
+    }
+    let mut font_data = data[dstart as usize..].to_vec();
+    ans.headers = Some(FontRecordHeaders {
+        usize: usize_,
+        flags,
+        xor_len,
+        xor_start,
+        dstart,
+    });
+
+    if flags & 0b10 != 0 {
+        // De-obfuscate the data
+        let xs = xor_start as usize;
+        let xl = xor_len as usize;
+        if xl == 0 || xs + xl > data.len() {
+            ans.err = Some("Invalid XOR key range in font record".to_string());
+            return ans;
+        }
+        let key = &data[xs..xs + xl];
+        let extent = extent.unwrap_or(font_data.len()).min(font_data.len());
+        for (n, byte) in font_data.iter_mut().take(extent).enumerate() {
+            *byte ^= key[n % xl];
+        }
+        ans.encrypted = true;
+    }
+
+    if flags & 0b1 != 0 {
+        // ZLIB compressed data
+        use std::io::Read as _;
+        let mut decoder = flate2::read::ZlibDecoder::new(&font_data[..]);
+        let mut out = Vec::new();
+        match decoder.read_to_end(&mut out) {
+            Ok(_) => font_data = out,
+            Err(e) => {
+                ans.err = Some(format!("Failed to zlib decompress font data ({e})"));
+                return ans;
+            }
+        }
+        if font_data.len() != usize_ as usize {
+            ans.err = Some("Uncompressed font size mismatch".to_string());
+            return ans;
+        }
+    }
+
+    let sig = if font_data.len() >= 4 {
+        &font_data[..4]
+    } else {
+        &font_data[..]
+    };
+    ans.ext = if sig == b"\0\x01\0\0" || sig == b"true" || sig == b"ttcf" {
+        "ttf".to_string()
+    } else if sig == b"OTTO" {
+        "otf".to_string()
+    } else {
+        "dat".to_string()
+    };
+    ans.font_data = Some(font_data);
+
+    ans
 }
 
 // Stub implementations

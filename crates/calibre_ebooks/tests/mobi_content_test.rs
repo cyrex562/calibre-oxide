@@ -78,13 +78,20 @@ fn test_mobi_content_extraction() {
 
     // Run MOBIInput
     let plugin = MOBIInput::new();
-    let book = plugin
+    let _book = plugin
         .convert(&mobi_path, &output_dir)
         .expect("Conversion failed");
 
-    // Verify output file
+    // Verify output file. `MOBIInput::convert` now runs the real
+    // `MobiReader::extract_content` pipeline (HTML5 parse + upshift +
+    // OPF/CSS generation), so the decompressed text is reconstructed
+    // into a full XHTML document rather than dumped verbatim -- check
+    // it round-tripped inside that document instead of an exact match.
     let content_path = output_dir.join("index.html");
     assert!(content_path.exists());
     let content = fs::read_to_string(content_path).unwrap();
-    assert_eq!(content, "abcabc");
+    assert!(content.contains("abcabc"), "{content}");
+    assert!(content.contains("<html"), "{content}");
+
+    assert!(output_dir.join("index.opf").exists());
 }

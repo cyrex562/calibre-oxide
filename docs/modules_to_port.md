@@ -545,8 +545,8 @@
 - [x] headers.py
 - [x] index.py
 - [x] markup.py
-- [ ] mobi6.py
-- [ ] mobi8.py
+- [x] mobi6.py
+- [x] mobi8.py
 - [x] ncx.py
 
 ##### writer2

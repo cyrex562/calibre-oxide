@@ -1,8 +1,8 @@
 use crate::mobi::headers::NULL_INDEX;
-use crate::mobi::index::{read_index, CNCXReader};
+use crate::mobi::index::{read_index, CNCXReader, IndexTable};
 use anyhow::Result;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 #[derive(Debug, Clone)]
@@ -53,10 +53,8 @@ impl Default for NCXEntry {
     }
 }
 
-pub fn parse_ncx_from_index(
-    table: &BTreeMap<String, BTreeMap<u8, Vec<u64>>>,
-    cncx: &CNCXReader,
-) -> Vec<NCXEntry> {
+#[allow(clippy::field_reassign_with_default)]
+pub fn parse_ncx_from_index(table: &IndexTable, cncx: &CNCXReader) -> Vec<NCXEntry> {
     let mut index_entries = Vec::new();
 
     for (num, (text, tag_map)) in table.iter().enumerate() {
@@ -131,11 +129,7 @@ pub fn parse_ncx_from_index(
     index_entries
 }
 
-pub fn read_ncx(
-    sections: &[(Vec<u8>, (u32, u32, u32, u32, u32))],
-    index: u32,
-    codec: &str,
-) -> Result<Vec<NCXEntry>> {
+pub fn read_ncx(sections: &[Vec<u8>], index: u32, codec: &str) -> Result<Vec<NCXEntry>> {
     if index == NULL_INDEX {
         return Ok(Vec::new());
     }
@@ -219,11 +213,12 @@ pub fn build_toc(index_entries: Vec<NCXEntry>) -> TOC {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indexmap::IndexMap;
     use std::collections::BTreeMap;
 
     #[test]
     fn test_parse_ncx_from_index() {
-        let mut table = BTreeMap::new();
+        let mut table = IndexMap::new();
         let mut tag_map = BTreeMap::new();
         // text maps to tag 3 (offset index in cncx)
         tag_map.insert(3, vec![0]);
