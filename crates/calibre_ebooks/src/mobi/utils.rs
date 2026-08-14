@@ -1,8 +1,7 @@
 use anyhow::Result;
-use byteorder::{BigEndian, ReadBytesExt};
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::{Cursor, Read};
+use std::io::Read;
 
 use crate::oeb::toc::TOC;
 
