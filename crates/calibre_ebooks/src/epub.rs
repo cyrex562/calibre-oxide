@@ -6,12 +6,14 @@
 //! | Python | Rust |
 //! | --- | --- |
 //! | `__init__.py` | this module |
+//! | `cfi/` | [`cfi`] |
 //! | `pages.py` | [`pages`] |
 //! | `periodical.py` | [`periodical`] |
 //!
 //! `__init__.py`'s `rules()` is not ported: it walks cssutils
 //! stylesheet objects, and this crate has no CSS object model to walk.
 
+pub mod cfi;
 pub mod pages;
 pub mod periodical;
 
