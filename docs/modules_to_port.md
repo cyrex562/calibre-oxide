@@ -574,8 +574,8 @@
 
 #### odt
 
-- [ ] __init__.py
-- [ ] input.py
+- [x] __init__.py
+- [x] input.py
 
 #### oeb
 

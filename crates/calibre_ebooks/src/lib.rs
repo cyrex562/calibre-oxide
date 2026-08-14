@@ -17,6 +17,7 @@ pub mod input;
 pub mod lit;
 pub mod metadata;
 pub mod mobi;
+pub mod odt;
 pub mod oeb;
 pub mod opf;
 pub mod output;
