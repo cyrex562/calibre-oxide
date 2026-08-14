@@ -1,13 +1,27 @@
 //! Build the MOBI `EXTH` metadata header.
 //!
-//! Port of `calibre.ebooks.mobi.writer8.exth.build_exth`. That file
-//! physically lives under the still-unported `mobi/writer8` package, but
-//! `writer2/main.py`'s *standalone* MOBI 6 path (`kf8 = None`, squarely
-//! in scope for this port) calls it unconditionally to build `record0`'s
-//! EXTH block -- there is no way to produce a real, non-stub record0
-//! without it, and `build_exth` itself has no dependency on any
-//! unported KF8 machinery. So it is ported here, narrowly, as the one
-//! slice of `writer8` the in-scope path actually needs.
+//! Port of `calibre.ebooks.mobi.writer8.exth.build_exth`.
+//!
+//! # History
+//!
+//! Issue #34 (`port: ebooks/mobi/writer2`) needed this function for its
+//! standalone-MOBI6 path before `mobi/writer8` itself was ported, and
+//! discovered that Python's real `build_exth` lives here (imported
+//! locally at writer2's call sites). It was ported at the time directly
+//! into `mobi::writer2::exth`, narrowly, as "the one slice of `writer8`
+//! the in-scope path actually needs" -- with a documented intent to
+//! relocate it once `writer8` itself was in scope. Issue #35 (this
+//! module) is that relocation: the file now lives at its real Python
+//! path, `mobi::writer2::exth` re-exports from here instead of the
+//! reverse, and there is exactly one copy of `build_exth`.
+//!
+//! `start_offset` is `Option<u32>` (a single value) rather than Python's
+//! `start_offset: int | Sequence[int] | None` -- every call site in both
+//! `writer2/main.py` and `writer8/mobi.py` (`self.start_offset`, set by
+//! `Serializer`/`KF8Writer.create_guide` from a single `<guide
+//! type="start">` reference) only ever passes a single optional value or
+//! `None`, never a real sequence, so the simpler shape is a faithful
+//! match for every real caller.
 //!
 //! Two small pieces of the Python original are simplified rather than
 //! fully reproduced, both because their backing tables
@@ -24,7 +38,7 @@ use std::collections::HashMap;
 
 use anyhow::{bail, Result};
 
-use crate::mobi::utils::to_base;
+use crate::mobi::utils::{to_base, utf8_text};
 use crate::oeb::metadata::Metadata;
 
 /// `EXTH_CODES` in `writer8/exth.py`.
@@ -89,17 +103,6 @@ pub struct ExthParams {
 
 fn collapse_whitespace(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// `utf8_text` in `mobi/utils.py`: a non-empty, whitespace-collapsed
-/// UTF-8 encoding of `text`, or `"Unknown"` if `text` is empty/blank.
-fn utf8_text(text: &str) -> Vec<u8> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        b"Unknown".to_vec()
-    } else {
-        trimmed.as_bytes().to_vec()
-    }
 }
 
 /// Simplified stand-in for `authors_to_sort_string`: "Firstname ...

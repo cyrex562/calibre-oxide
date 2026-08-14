@@ -8,14 +8,26 @@
 //! # Scope: joint MOBI6+KF8 (`.azw3`) output
 //!
 //! Python's `MobiWriter.__init__` takes an optional `kf8` (a
-//! `Mobi8Writer` from the still-unported `mobi/writer8`), and when
-//! present, `dump_stream` calls `generate_joint_record0` instead of
-//! `generate_record0` to interleave a second, KF8-format `record0` and
-//! record set into the same file. `mobi/writer8` has not been ported
-//! (a separate, future issue -- see `writer2/mod.rs`'s module doc), so
+//! `Mobi8Writer` from `mobi/writer8`), and when present, `dump_stream`
+//! calls `generate_joint_record0` instead of `generate_record0` to
+//! interleave a second, KF8-format `record0` and record set into the
+//! same file. `mobi/writer8` is now ported (issue #35 --
+//! `crate::mobi::writer8`, notably `writer8::main::KF8Writer` and
+//! `writer8::mobi::KF8Book`, whose `for_joint` flag already skips
+//! serializing its own resource records so a joint caller can share one
+//! resource block), but *wiring the two writers together* into one PDB
+//! (interleaving both `record0`s, adjusting each side's resource/EXTH
+//! offsets to account for the shared block, and writing a single combined
+//! record list with a KF8-boundary EXTH marker for the reader's
+//! `kf8_type == "joint"` detection) is still real, unwritten integration
+//! work -- left as a documented gap rather than attempted under issue
+//! #35's time budget (that issue's actual deliverable is the standalone
+//! `writer8` module set, which is complete and round-trip tested; wiring
+//! joint output was called out there as a bonus, not a blocker).
 //! [`MobiWriter::write_joint`] takes the real Python call shape
-//! (`kf8: Option<&()>` standing in for the not-yet-existing
-//! `Mobi8Writer` trait/type) and is a documented `todo!()`. The
+//! (`kf8: Option<&()>` standing in for a `KF8Writer`/`KF8Book` pair,
+//! since the exact shared-`Resources`-and-offset-patching integration
+//! hasn't been designed yet) and is a documented `todo!()`. The
 //! standalone path ([`MobiWriter::write`], `kf8 = None` in Python) is
 //! fully implemented.
 
@@ -29,11 +41,11 @@ use crate::mobi::langcodes::iana2mobi;
 use crate::mobi::utils::{
     create_text_record, detect_periodical, encode_trailing_data, RECORD_SIZE,
 };
-use crate::mobi::writer2::exth::{build_exth, ExthParams};
 use crate::mobi::writer2::indexer::Indexer;
 use crate::mobi::writer2::resources::{ResourceOpts, Resources};
 use crate::mobi::writer2::serializer::{urlnormalize, Serializer};
 use crate::mobi::writer2::{PALMDOC, UNCOMPRESSED};
+use crate::mobi::writer8::exth::{build_exth, ExthParams};
 use crate::mobi::MobiLog;
 use crate::oeb::book::OEBBook;
 
@@ -233,11 +245,16 @@ impl MobiWriter {
 
     /// Placeholder for the joint MOBI6+KF8 (`.azw3`) output path.
     ///
-    /// `kf8` stands in for Python's `Mobi8Writer` (`mobi/writer8/main.py`,
-    /// not yet ported). See the module scope note.
+    /// `kf8` stands in for a `writer8::main::KF8Writer` +
+    /// `writer8::mobi::KF8Book` pair (`mobi/writer8/main.py`'s
+    /// `Mobi8Writer` in Python) -- `mobi/writer8` itself is ported (issue
+    /// #35), but the interleaving logic this function needs (shared
+    /// `Resources`, offset patching between the two `record0`s, a single
+    /// combined record list, the KF8-boundary EXTH marker) is not yet
+    /// written. See the module scope note.
     pub fn write_joint(&mut self, _oeb: &OEBBook, _kf8: Option<&()>) -> Result<Vec<u8>> {
         todo!(
-            "placeholder: joint KF8 output requires mobi/writer8, not yet ported — see issue #34 scope note"
+            "placeholder: joint KF8 output needs writer2+writer8 interleaving logic, not yet written — see issue #35 scope note"
         )
     }
 

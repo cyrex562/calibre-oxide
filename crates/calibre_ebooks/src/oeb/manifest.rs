@@ -59,6 +59,34 @@ impl Manifest {
         self.hrefs.get(href).and_then(|id| self.items.get(id))
     }
 
+    /// A fresh, unused `(id, href)` pair built from `id_prefix`/
+    /// `href_prefix`. Port of `oeb.manifest.generate(id_prefix,
+    /// href_prefix)` (used by `mobi::writer8::toc::TocAdder` to name a
+    /// generated inline-TOC document, matching
+    /// `oeb.manifest.generate('contents', 'contents.xhtml')`).
+    pub fn generate(&self, id_prefix: &str, href_prefix: &str) -> (String, String) {
+        let mut n = 1u32;
+        loop {
+            let id = if n == 1 {
+                id_prefix.to_string()
+            } else {
+                format!("{id_prefix}{n}")
+            };
+            let href = if n == 1 {
+                href_prefix.to_string()
+            } else {
+                match href_prefix.rsplit_once('.') {
+                    Some((base, ext)) => format!("{base}{n}.{ext}"),
+                    None => format!("{href_prefix}{n}"),
+                }
+            };
+            if !self.items.contains_key(&id) && !self.hrefs.contains_key(&href) {
+                return (id, href);
+            }
+            n += 1;
+        }
+    }
+
     pub fn remove(&mut self, id: &str) {
         // `shift_remove`, not `remove`/`swap_remove`: this preserves
         // the relative order of every other item, matching Python's

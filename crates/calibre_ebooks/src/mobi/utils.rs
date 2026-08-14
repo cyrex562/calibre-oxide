@@ -303,6 +303,23 @@ impl CNCX {
     }
 }
 
+/// A non-empty, NFC-normalized UTF-8 encoding of `text.trim()`, or
+/// `b"Unknown"` if `text` is empty/blank after trimming.
+///
+/// Port of `utf8_text` in `mobi/utils.py`. Used by
+/// `writer8::exth::build_exth` for metadata values and by
+/// `writer8::mobi::MOBIHeader`'s `full_title` field.
+pub fn utf8_text(text: &str) -> Vec<u8> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        b"Unknown".to_vec()
+    } else {
+        let normalized: String =
+            unicode_normalization::UnicodeNormalization::nfc(trimmed).collect();
+        normalized.into_bytes()
+    }
+}
+
 pub fn align_block(raw: &[u8], multiple: usize, pad: u8) -> Vec<u8> {
     let extra = raw.len() % multiple;
     if extra == 0 {

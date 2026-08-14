@@ -244,6 +244,35 @@ impl Dom {
         out
     }
 
+    /// Renders just `id`'s opening tag (`<tag attr="val" ...>`), with no
+    /// children or closing tag. Used by
+    /// [`crate::mobi::writer8::skeleton`] to measure exactly how many
+    /// bytes an element's open tag occupies in the serialized skeleton,
+    /// consistently with what [`Dom::serialize`] would produce for the
+    /// same element (both share the same attribute-writing logic).
+    /// Void elements still render as `<tag ... />` here even though
+    /// `serialize` only does that when they have no children -- callers
+    /// measuring open-tag length for a *non*-void element (the only kind
+    /// `writer8::skeleton` ever calls this on, since only elements able
+    /// to carry an `aid` are measured) are unaffected either way.
+    pub fn serialize_open_tag(&self, id: NodeId) -> String {
+        let node = &self.nodes[id];
+        let mut out = String::new();
+        if let NodeKind::Element(tag) = &node.kind {
+            out.push('<');
+            out.push_str(tag);
+            for (k, v) in &node.attrs {
+                out.push(' ');
+                out.push_str(k);
+                out.push_str("=\"");
+                out.push_str(&html_escape::encode_double_quoted_attribute(v));
+                out.push('"');
+            }
+            out.push('>');
+        }
+        out
+    }
+
     /// Serializes the subtree rooted at `id` as HTML.
     pub fn serialize(&self, id: NodeId) -> String {
         let mut out = String::new();
