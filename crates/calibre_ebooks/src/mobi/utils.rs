@@ -1,8 +1,9 @@
 use anyhow::Result;
-use byteorder::{BigEndian, ReadBytesExt};
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::{Cursor, Read};
+use std::io::Read;
+
+use crate::oeb::toc::TOC;
 
 /// Text record size (uncompressed). `RECORD_SIZE` in `mobi/utils.py`.
 pub const RECORD_SIZE: usize = 0x1000;
@@ -445,6 +446,198 @@ pub fn read_font_record(data: &[u8], extent: usize) -> FontRecordInfo {
 /// The default XOR extent every font record calibre has encountered
 /// uses. `read_font_record(data, extent=1040)` in `mobi/utils.py`.
 pub const DEFAULT_FONT_XOR_EXTENT: usize = 1040;
+
+/// Encode a ttf/otf font as a MOBI `FONT` record.
+///
+/// Port of `write_font_record` in `mobi/utils.py`. Inverse of
+/// [`read_font_record`]: header layout is `FONT` + 5 big-endian u32s
+/// (uncompressed size, flags, data start offset, xor key length, xor key
+/// start offset), followed by the (optional) XOR key and then the
+/// (optionally compressed, optionally obfuscated) font payload.
+///
+/// Obfuscation only applies (as in the Python) when the *compressed*
+/// payload is at least [`DEFAULT_FONT_XOR_EXTENT`] bytes long -- short
+/// fonts are left in the clear.
+pub fn write_font_record(data: &[u8], obfuscate: bool, compress: bool) -> Vec<u8> {
+    let key_len = 20usize;
+    let usize_ = data.len() as u32;
+    let mut flags: u32 = 0;
+    let mut payload = data.to_vec();
+    let mut xor_key: Vec<u8> = Vec::new();
+
+    if compress {
+        flags |= 0b1;
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(9));
+        // A `Vec<u8>` writer never fails, so these are infallible in
+        // practice; propagate defensively rather than unwrap.
+        if std::io::Write::write_all(&mut enc, &payload).is_ok() {
+            if let Ok(compressed) = enc.finish() {
+                payload = compressed;
+            }
+        }
+    }
+
+    if obfuscate && payload.len() >= 1040 {
+        flags |= 0b10;
+        xor_key = (0..key_len).map(|_| rand::random::<u8>()).collect();
+        let extent = payload.len().min(1040);
+        for (i, b) in payload.iter_mut().enumerate().take(extent) {
+            *b ^= xor_key[i % key_len];
+        }
+    }
+
+    let key_start = 4u32 * 5 + 4; // struct.calcsize('>5L') + len('FONT')
+    let data_start = key_start + xor_key.len() as u32;
+
+    let mut header = Vec::with_capacity(24);
+    header.extend_from_slice(b"FONT");
+    header.extend_from_slice(&usize_.to_be_bytes());
+    header.extend_from_slice(&flags.to_be_bytes());
+    header.extend_from_slice(&data_start.to_be_bytes());
+    header.extend_from_slice(&(xor_key.len() as u32).to_be_bytes());
+    header.extend_from_slice(&key_start.to_be_bytes());
+
+    let mut out = header;
+    out.extend_from_slice(&xor_key);
+    out.extend_from_slice(&payload);
+    out
+}
+
+/// Render `num` in `base` (up to 36: digits then uppercase letters),
+/// left-padded with zeros to `min_num_digits` if given.
+///
+/// Port of `to_base` in `mobi/utils.py`. Used for the `kf8_thumbnail_uri`
+/// EXTH value (`kindle:embed:XXXX`, base 32, 4 digits).
+pub fn to_base(mut num: i64, base: i64, min_num_digits: Option<usize>) -> String {
+    const DIGITS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let sign = if num >= 0 { 1 } else { -1 };
+    if num == 0 {
+        return match min_num_digits {
+            Some(n) => "0".repeat(n.max(1)),
+            None => "0".to_string(),
+        };
+    }
+    num *= sign;
+    let mut chars = Vec::new();
+    while num != 0 {
+        let digit = (num % base) as usize;
+        chars.push(DIGITS[digit.min(DIGITS.len() - 1)]);
+        num /= base;
+    }
+    if let Some(min) = min_num_digits {
+        while chars.len() < min {
+            chars.push(b'0');
+        }
+    }
+    if sign < 0 {
+        chars.push(b'-');
+    }
+    chars.reverse();
+    String::from_utf8(chars).unwrap_or_default()
+}
+
+/// Split the byte-length of a UTF-8 lead byte (ASCII or a 2/3/4-byte
+/// sequence start). Continuation bytes and invalid lead bytes are
+/// treated as length-1 so callers can't loop forever on malformed input.
+fn utf8_lead_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b & 0xE0 == 0xC0 {
+        2
+    } else if b & 0xF0 == 0xE0 {
+        3
+    } else if b & 0xF8 == 0xF0 {
+        4
+    } else {
+        1
+    }
+}
+
+/// Slice one PalmDOC-record-sized (<= [`RECORD_SIZE`] byte) chunk out of
+/// `text` starting at `*pos`, plus any extra "overlap" bytes needed to
+/// complete a UTF-8 character that would otherwise be split across the
+/// record boundary. Advances `*pos` to the next record boundary (i.e.
+/// *not* including the overlap, matching `text.seek(npos)` in Python).
+///
+/// Port of `create_text_record` in `mobi/utils.py`. The Python
+/// implementation finds the boundary by repeatedly attempting a UTF-8
+/// decode of a growing trailing slice; since `text` here is always known
+/// to be valid UTF-8 as a whole (it's our own serializer's output), this
+/// is reimplemented as a direct UTF-8 lead-byte scan for the same
+/// result, rather than transliterating the decode-and-retry loop.
+pub fn create_text_record(text: &[u8], pos: &mut usize) -> (Vec<u8>, Vec<u8>) {
+    let opos = *pos;
+    let total = text.len();
+    let npos = (opos + RECORD_SIZE).min(total);
+
+    let mut extra = 0usize;
+    if npos < total && npos > opos {
+        let mut j = npos;
+        let mut steps = 0;
+        while j > opos && steps < 4 {
+            j -= 1;
+            steps += 1;
+            let b = text[j];
+            if b < 0x80 || (b & 0xC0) != 0x80 {
+                let clen = utf8_lead_len(b);
+                if j + clen > npos {
+                    extra = (j + clen).min(total) - npos;
+                }
+                break;
+            }
+        }
+    }
+
+    let data = text[opos..npos].to_vec();
+    let overlap = text[npos..npos + extra].to_vec();
+    *pos = npos;
+    (data, overlap)
+}
+
+/// Detect whether `toc` has the exact three-level
+/// periodical/section/article shape kindlegen requires to generate a
+/// periodical (as opposed to an ordinary book).
+///
+/// Port of `detect_periodical` in `mobi/utils.py`.
+pub fn detect_periodical(toc: &TOC, mut log: Option<&mut crate::mobi::MobiLog>) -> bool {
+    if toc.count() < 1 {
+        return false;
+    }
+    let Some(first) = toc.first() else {
+        return false;
+    };
+    if first.klass.as_deref() != Some("periodical") {
+        return false;
+    }
+    for node in toc.iter_descendants(false) {
+        let depth = node.depth();
+        if depth == 1 && node.klass.as_deref() != Some("article") {
+            if let Some(l) = log.as_deref_mut() {
+                l.debug("Not a periodical: Deepest node does not have class=\"article\"");
+            }
+            return false;
+        }
+        if depth == 2 && node.klass.as_deref() != Some("section") {
+            if let Some(l) = log.as_deref_mut() {
+                l.debug("Not a periodical: Second deepest node does not have class=\"section\"");
+            }
+            return false;
+        }
+        if depth == 3 && node.klass.as_deref() != Some("periodical") {
+            if let Some(l) = log.as_deref_mut() {
+                l.debug("Not a periodical: Third deepest node does not have class=\"periodical\"");
+            }
+            return false;
+        }
+        if depth > 3 {
+            if let Some(l) = log.as_deref_mut() {
+                l.debug("Not a periodical: Has nodes of depth > 3");
+            }
+            return false;
+        }
+    }
+    true
+}
 
 #[cfg(test)]
 mod tests {

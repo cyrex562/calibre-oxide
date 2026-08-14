@@ -14,7 +14,7 @@ pub mod opf_writer;
 pub mod reader;
 pub mod tweak;
 pub mod utils;
-pub mod writer;
+pub mod writer2;
 
 /// Errors specific to the MOBI reader pipeline, mirroring the exception
 /// classes `mobi6.py`/`mobi8.py`/`calibre.ebooks.mobi` raise: `MobiError`

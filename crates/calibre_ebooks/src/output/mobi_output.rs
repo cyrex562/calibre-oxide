@@ -1,11 +1,17 @@
-use crate::mobi::writer::MobiWriter;
+use crate::mobi::writer2::main::{MobiWriter, MobiWriterOpts};
 use crate::oeb::book::OEBBook;
 use anyhow::{Context, Result};
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::Write;
 use std::path::Path;
 
 pub struct MOBIOutput;
+
+impl Default for MOBIOutput {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl MOBIOutput {
     pub fn new() -> Self {
@@ -13,11 +19,14 @@ impl MOBIOutput {
     }
 
     pub fn convert(&self, book: &OEBBook, output_path: &Path) -> Result<()> {
-        let file = File::create(output_path).context("Failed to create output MOBI file")?;
-        let mut writer = BufWriter::new(file);
+        let mut writer = MobiWriter::new(MobiWriterOpts::default());
+        let bytes = writer
+            .write(book)
+            .context("Failed to encode MOBI content")?;
 
-        let mobi_writer = MobiWriter::new();
-        mobi_writer.write(book, &mut writer)?;
+        let mut file = File::create(output_path).context("Failed to create output MOBI file")?;
+        file.write_all(&bytes)
+            .context("Failed to write MOBI content")?;
 
         Ok(())
     }

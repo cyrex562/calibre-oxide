@@ -1,3 +1,4 @@
+use indexmap::IndexMap;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -25,14 +26,20 @@ impl ManifestItem {
 
 #[derive(Debug, Clone, Default)]
 pub struct Manifest {
-    pub items: HashMap<String, ManifestItem>, // Map id -> Item
-    pub hrefs: HashMap<String, String>,       // Map href -> id
+    // `IndexMap` (not `HashMap`): item order matters. Several ported
+    // modules (e.g. `mobi::writer2::resources::Resources`) assign
+    // sequential record/image indices by manifest iteration order, and
+    // that order must be stable and match insertion order (as Python's
+    // `OrderedDict`-backed manifest does) for the assigned indices to be
+    // reproducible.
+    pub items: IndexMap<String, ManifestItem>, // Map id -> Item
+    pub hrefs: HashMap<String, String>,        // Map href -> id
 }
 
 impl Manifest {
     pub fn new() -> Self {
         Manifest {
-            items: HashMap::new(),
+            items: IndexMap::new(),
             hrefs: HashMap::new(),
         }
     }
@@ -53,7 +60,10 @@ impl Manifest {
     }
 
     pub fn remove(&mut self, id: &str) {
-        if let Some(item) = self.items.remove(id) {
+        // `shift_remove`, not `remove`/`swap_remove`: this preserves
+        // the relative order of every other item, matching Python's
+        // `OrderedDict`-backed manifest (see the `items` field doc).
+        if let Some(item) = self.items.shift_remove(id) {
             self.hrefs.remove(&item.href);
         }
     }

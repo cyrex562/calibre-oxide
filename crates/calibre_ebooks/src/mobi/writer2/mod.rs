@@ -1,0 +1,43 @@
+//! The MOBI 6 writer: OEB -> `.mobi` bytes.
+//!
+//! Port of `calibre.ebooks.mobi.writer2`, i.e. the four files
+//! `indexer.py`, `main.py`, `resources.py`, `serializer.py` plus the
+//! four constants that used to live in `writer2/__init__.py`.
+//!
+//! This is the *encoder* side of the format the reader half of this
+//! crate (`crate::mobi::mobi6`/`mobi8`, `crate::mobi::index`) already
+//! decodes. The wire format (SKEL/SECT/NCX/GUIDE INDX trees, TAGX tags,
+//! trailing byte sequences) mirrors `crate::mobi::index`'s decoder --
+//! `indexer.rs` here is deliberately read as index.rs's inverse rather
+//! than re-derived independently.
+//!
+//! Scope note: the joint MOBI6+KF8 (`.azw3`) output path
+//! (`main.py`'s `kf8`-present branches) requires `mobi/writer8`, which
+//! has not been ported yet (a separate, future issue). Those branches
+//! are represented here with a real signature and a documented
+//! `todo!()` -- see `main::MobiWriter::generate_joint_record0`.
+
+pub mod exth;
+pub mod indexer;
+pub mod main;
+pub mod resources;
+pub mod serializer;
+
+/// PalmDOC record compression disabled. `UNCOMPRESSED` in
+/// `mobi/writer2/__init__.py`.
+pub const UNCOMPRESSED: u16 = 1;
+/// PalmDOC LZ77 compression. `PALMDOC` in `mobi/writer2/__init__.py`.
+pub const PALMDOC: u16 = 2;
+/// HUFF/CDIC compression -- calibre's writer never produces this, only
+/// its reader decodes it. `HUFFDIC` in `mobi/writer2/__init__.py`.
+pub const HUFFDIC: u32 = 17480;
+/// Largest image calibre will embed unmodified into a MOBI 6 file
+/// before it must be rescaled. `PALM_MAX_IMAGE_SIZE` in
+/// `mobi/writer2/__init__.py`.
+pub const PALM_MAX_IMAGE_SIZE: usize = 63 * 1024;
+
+/// Largest cover thumbnail (bytes). `MAX_THUMB_SIZE` in `mobi/__init__.py`.
+pub const MAX_THUMB_SIZE: usize = 16 * 1024;
+/// Cover thumbnail target dimensions (w, h). `MAX_THUMB_DIMEN` in
+/// `mobi/__init__.py`.
+pub const MAX_THUMB_DIMEN: (u32, u32) = (180, 240);
