@@ -37,4 +37,17 @@ impl Guide {
     pub fn get(&self, type_: &str) -> Option<&Reference> {
         self.references.get(type_)
     }
+
+    /// Port of `oeb.guide.remove(type_)`.
+    pub fn remove(&mut self, type_: &str) {
+        self.references.remove(type_);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.references.is_empty()
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &Reference> {
+        self.references.values()
+    }
 }

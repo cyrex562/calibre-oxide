@@ -561,16 +561,16 @@
 
 ##### writer8
 
-- [ ] __init__.py
-- [ ] cleanup.py
-- [ ] exth.py
-- [ ] header.py
-- [ ] index.py
-- [ ] main.py
-- [ ] mobi.py
-- [ ] skeleton.py
-- [ ] tbs.py
-- [ ] toc.py
+- [x] __init__.py
+- [x] cleanup.py
+- [x] exth.py
+- [x] header.py
+- [x] index.py
+- [x] main.py
+- [x] mobi.py
+- [x] skeleton.py
+- [x] tbs.py
+- [x] toc.py
 
 #### odt
 

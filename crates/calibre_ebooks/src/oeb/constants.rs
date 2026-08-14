@@ -41,3 +41,7 @@ pub const OEB_DOCS: &[&str] = &[XHTML_MIME, HTML_MIME, OEB_DOC_MIME];
 /// Media types the MOBI writer will embed as raster image records.
 /// `OEB_RASTER_IMAGES` in `oeb/base.py`.
 pub const OEB_RASTER_IMAGES: &[&str] = &[GIF_MIME, JPEG_MIME, PNG_MIME, WEBP_MIME];
+
+/// Media types treated as CSS stylesheets. `OEB_STYLES` in
+/// `oeb/base.py`.
+pub const OEB_STYLES: &[&str] = &[CSS_MIME, OEB_CSS_MIME];
