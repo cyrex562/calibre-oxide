@@ -595,9 +595,9 @@
 ##### iterator
 
 - [ ] __init__.py
-- [ ] book.py
-- [ ] bookmarks.py
-- [ ] spine.py
+- [x] book.py (EbookIterator: extraction via Plumber's refactored input dispatch, paginated/indexed spine, search)
+- [x] bookmarks.py (BookmarksMixin trait, parse/serialize_bookmarks, safe_replace-backed in-file copy)
+- [x] spine.py (SpineItem, IndexEntry, create_indexing_data, character_count/anchor_map/all_links)
 
 ##### polish
 
