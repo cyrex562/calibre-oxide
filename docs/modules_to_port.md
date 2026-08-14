@@ -553,11 +553,11 @@
 
 ##### writer2
 
-- [ ] __init__.py
-- [ ] indexer.py
-- [ ] main.py
-- [ ] resources.py
-- [ ] serializer.py
+- [x] __init__.py
+- [x] indexer.py
+- [x] main.py
+- [x] resources.py
+- [x] serializer.py
 
 ##### writer8
 

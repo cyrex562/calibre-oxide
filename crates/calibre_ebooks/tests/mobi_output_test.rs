@@ -23,6 +23,9 @@ fn test_mobi_output_conversion() {
         .add("page", "page.html", "application/xhtml+xml");
     book.spine.add("page", true);
     book.metadata.add("title", "MOBI Test Book");
+    // The real writer2 EXTH builder (issue #34) requires a date or
+    // timestamp, matching Python's `build_exth`.
+    book.metadata.add("date", "2024-01-01T00:00:00+00:00");
 
     // Output
     let tmp_out = tempdir().unwrap();

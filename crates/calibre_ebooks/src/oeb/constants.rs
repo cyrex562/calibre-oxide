@@ -33,3 +33,11 @@ pub const SVG_MIME: &str = "image/svg+xml";
 pub const WEBP_MIME: &str = "image/webp";
 pub const HTML_MIME: &str = "text/html";
 pub const XML_MIME: &str = "text/xml";
+
+/// Media types treated as XHTML-family text content. `OEB_DOCS` in
+/// `oeb/base.py`.
+pub const OEB_DOCS: &[&str] = &[XHTML_MIME, HTML_MIME, OEB_DOC_MIME];
+
+/// Media types the MOBI writer will embed as raster image records.
+/// `OEB_RASTER_IMAGES` in `oeb/base.py`.
+pub const OEB_RASTER_IMAGES: &[&str] = &[GIF_MIME, JPEG_MIME, PNG_MIME, WEBP_MIME];
