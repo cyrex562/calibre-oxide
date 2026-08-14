@@ -3,6 +3,7 @@ pub mod constants;
 pub mod container;
 pub mod display;
 pub mod guide;
+pub mod iterator;
 pub mod manifest;
 pub mod metadata;
 pub mod normalize_css;

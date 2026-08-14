@@ -25,3 +25,4 @@ pub mod pdb;
 pub mod rb;
 pub mod snb;
 pub mod xml_util;
+pub mod zipfile_safe_replace;
