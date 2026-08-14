@@ -1,6 +1,7 @@
 pub mod book;
 pub mod constants;
 pub mod container;
+pub mod display;
 pub mod guide;
 pub mod manifest;
 pub mod metadata;
