@@ -44,8 +44,7 @@ pub fn get_metadata<R: Read + Seek>(mut stream: R) -> Result<MetaInformation> {
 /// Direct-from-path variant. Preferred when the caller already has a
 /// path on disk (avoids the stream→tempfile copy).
 pub fn get_metadata_from_path(path: &Path) -> Result<MetaInformation> {
-    let mut reader = ChmReader::open(path)
-        .map_err(|e| anyhow::anyhow!("chm: open reader: {e}"))?;
+    let mut reader = ChmReader::open(path).map_err(|e| anyhow::anyhow!("chm: open reader: {e}"))?;
     let home_bytes = reader
         .get_home()
         .map_err(|e| anyhow::anyhow!("chm: read home page: {e}"))?;

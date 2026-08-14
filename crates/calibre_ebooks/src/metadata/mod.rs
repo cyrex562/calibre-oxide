@@ -32,6 +32,7 @@ pub mod toc;
 pub mod topaz;
 pub mod txt;
 pub mod utils;
+pub mod worker;
 pub mod xmp;
 pub mod zip;
 

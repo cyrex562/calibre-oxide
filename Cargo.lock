@@ -443,6 +443,7 @@ dependencies = [
  "anyhow",
  "bitflags 2.13.1",
  "serde",
+ "tempfile",
  "thiserror 1.0.69",
 ]
 
@@ -499,6 +500,7 @@ dependencies = [
  "base64 0.21.7",
  "byteorder",
  "bzip2",
+ "calibre_customize",
  "calibre_utils",
  "chardetng",
  "chrono",
@@ -525,6 +527,7 @@ dependencies = [
  "thiserror 1.0.69",
  "url",
  "urlencoding",
+ "uuid",
  "walkdir",
  "zip",
 ]
@@ -566,6 +569,7 @@ dependencies = [
  "serde_json",
  "sevenz-rust",
  "socket2 0.6.1",
+ "tempfile",
  "thiserror 1.0.69",
  "trash",
  "unicode_names2",

@@ -186,6 +186,32 @@ impl MetaInformation {
             ));
         }
 
+        // Other identifiers (ISBN, DOI, etc), scheme upper-cased as
+        // `metadata_to_opf` does with `icu_upper(key)`.
+        let mut identifier_keys: Vec<&String> = self.identifiers.keys().collect();
+        identifier_keys.sort();
+        for key in identifier_keys {
+            out.push_str(&format!(
+                "    <dc:identifier opf:scheme=\"{}\">{}</dc:identifier>\n",
+                xml_escape(&key.to_uppercase()),
+                xml_escape(&self.identifiers[key])
+            ));
+        }
+
+        // Languages. `metadata_to_opf` skips "und" (the "undetermined
+        // language" placeholder our own `Default` fills in) as well as
+        // empty strings, so a book with no real language information
+        // emits no `dc:language` at all.
+        for lang in &self.languages {
+            if lang.is_empty() || lang.eq_ignore_ascii_case("und") {
+                continue;
+            }
+            out.push_str(&format!(
+                "    <dc:language>{}</dc:language>\n",
+                xml_escape(lang)
+            ));
+        }
+
         // Description
         if let Some(desc) = &self.comments {
             out.push_str(&format!(
@@ -259,4 +285,44 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_xml_emits_real_languages_but_skips_und() {
+        let mi = MetaInformation::default(); // languages: ["und"]
+        assert!(!mi.to_xml().contains("dc:language"));
+
+        let mut mi = MetaInformation::default();
+        mi.languages = vec!["en".to_string(), "und".to_string(), String::new()];
+        let xml = mi.to_xml();
+        assert!(xml.contains("<dc:language>en</dc:language>"));
+        // Exactly one language element, not three.
+        assert_eq!(xml.matches("dc:language").count(), 2); // open + close tag
+    }
+
+    #[test]
+    fn to_xml_emits_identifiers_with_uppercased_scheme() {
+        let mut mi = MetaInformation::default();
+        mi.set_identifier("isbn", "9780306406157");
+        let xml = mi.to_xml();
+        assert!(xml.contains(r#"opf:scheme="ISBN">9780306406157"#));
+    }
+
+    #[test]
+    fn to_xml_round_trips_through_parse_opf() {
+        let mut mi = MetaInformation::default();
+        mi.title = "Round Trip".to_string();
+        mi.authors = vec!["Author A".to_string()];
+        mi.languages = vec!["fr".to_string()];
+        mi.set_identifier("isbn", "1234567890");
+        let xml = mi.to_xml();
+
+        let parsed = crate::opf::parse_opf(&xml).expect("parses");
+        assert_eq!(parsed.title, "Round Trip");
+        assert_eq!(parsed.authors, vec!["Author A".to_string()]);
+    }
 }
