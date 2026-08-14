@@ -193,9 +193,7 @@ impl MobiWriter {
         // Rec 0
         writer.write_u32::<BigEndian>(current_offset)?;
         writer.write_u8(0)?; // Attr
-        writer.write_u24::<BigEndian>(0)?; // UID (using u24 helper... wait, manual)
-                                           // Manual u24
-        writer.write_all(&[0, 0, 0])?;
+        writer.write_all(&[0, 0, 0])?; // UID (3 bytes)
         current_offset += record0.len() as u32;
 
         // Text Records

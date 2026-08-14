@@ -529,13 +529,16 @@
 
 ##### debug
 
-- [ ] __init__.py
-- [ ] containers.py
-- [ ] headers.py
-- [ ] index.py
-- [ ] main.py
-- [ ] mobi6.py
-- [ ] mobi8.py
+- [x] __init__.py
+- [x] containers.py
+- [x] headers.py
+- [x] index.py
+- [x] main.py
+- [x] mobi6.py (TBS periodical section/article-transition narration not
+      reproduced — narrow, try/except-guarded even in the Python)
+- [x] mobi8.py (`read_tbs`'s cross-check against the unported
+      `mobi/writer8/tbs.py` deferred; decoding the TBS bytes actually
+      present is not)
 
 ##### reader
 

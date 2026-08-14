@@ -56,10 +56,15 @@ pub struct IndxHeader {
     pub ordt1_raw: Vec<u8>,
     pub ordt2_raw: Vec<u8>,
     pub ordt_map: String,
+    /// The 27 reserved `u32` fields between `ncncx` and `ocnt` — Python
+    /// exposes these individually as `unknown0`..`unknown26` in
+    /// `INDEX_HEADER_FIELDS`; kept here as a single vec since nothing
+    /// currently reads them by name.
+    pub unknowns: Vec<u32>,
 }
 
 // Helper to format bytes like python
-fn format_bytes(byts: &[u8]) -> String {
+pub(crate) fn format_bytes(byts: &[u8]) -> String {
     byts.iter()
         .map(|b| format!("{:x}", b))
         .collect::<Vec<String>>()
@@ -77,7 +82,7 @@ pub fn check_signature(data: &[u8], signature: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn parse_indx_header(data: &[u8]) -> Result<IndxHeader> {
+pub(crate) fn parse_indx_header(data: &[u8]) -> Result<IndxHeader> {
     check_signature(data, b"INDX")?;
     let mut cursor = Cursor::new(&data[4..]);
 
@@ -96,8 +101,9 @@ fn parse_indx_header(data: &[u8]) -> Result<IndxHeader> {
     let ncncx = cursor.read_u32::<BigEndian>()?;
 
     // Unknowns (27 * 4 bytes)
+    let mut unknowns = Vec::with_capacity(27);
     for _ in 0..27 {
-        let _ = cursor.read_u32::<BigEndian>()?;
+        unknowns.push(cursor.read_u32::<BigEndian>()?);
     }
 
     let ocnt = cursor.read_u32::<BigEndian>()?;
@@ -172,6 +178,7 @@ fn parse_indx_header(data: &[u8]) -> Result<IndxHeader> {
         ordt1_raw,
         ordt2_raw,
         ordt_map,
+        unknowns,
     })
 }
 
@@ -226,7 +233,7 @@ impl CNCXReader {
     }
 }
 
-fn parse_tagx_section(data: &[u8]) -> Result<(u32, Vec<TagX>)> {
+pub(crate) fn parse_tagx_section(data: &[u8]) -> Result<(u32, Vec<TagX>)> {
     check_signature(data, b"TAGX")?;
 
     let mut cursor = Cursor::new(&data[4..]);
@@ -257,7 +264,7 @@ fn parse_tagx_section(data: &[u8]) -> Result<(u32, Vec<TagX>)> {
     Ok((control_byte_count, tags))
 }
 
-fn get_tag_map(
+pub(crate) fn get_tag_map(
     control_byte_count: u32,
     tagx: &[TagX],
     data: &[u8],
@@ -366,7 +373,7 @@ fn get_tag_map(
     Ok(ans)
 }
 
-fn parse_index_record(
+pub(crate) fn parse_index_record(
     table: &mut IndexTable,
     data: &[u8],
     control_byte_count: u32,
@@ -419,7 +426,7 @@ fn parse_index_record(
     Ok(header)
 }
 
-fn get_tag_section_start(data: &[u8], indx_header: &IndxHeader) -> usize {
+pub(crate) fn get_tag_section_start(data: &[u8], indx_header: &IndxHeader) -> usize {
     let mut tag_section_start = indx_header.tagx as usize;
     if tag_section_start + 4 <= data.len()
         && &data[tag_section_start..tag_section_start + 4] != b"TAGX"

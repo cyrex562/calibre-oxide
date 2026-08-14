@@ -965,3 +965,136 @@ pub fn mobi2iana(langcode: u32, sublangcode: u32) -> String {
 
     "und".to_string()
 }
+
+/// `main_language` in `mobi/langcodes.py`.
+pub fn main_language(code: u8) -> &'static str {
+    match code {
+        0 => "NEUTRAL",
+        54 => "AFRIKAANS",
+        28 => "ALBANIAN",
+        1 => "ARABIC",
+        43 => "ARMENIAN",
+        77 => "ASSAMESE",
+        44 => "AZERI",
+        45 => "BASQUE",
+        35 => "BELARUSIAN",
+        69 => "BENGALI",
+        2 => "BULGARIAN",
+        3 => "CATALAN",
+        4 => "CHINESE",
+        5 => "CZECH",
+        6 => "DANISH",
+        19 => "DUTCH",
+        9 => "ENGLISH",
+        37 => "ESTONIAN",
+        56 => "FAEROESE",
+        41 => "FARSI",
+        11 => "FINNISH",
+        12 => "FRENCH",
+        55 => "GEORGIAN",
+        7 => "GERMAN",
+        8 => "GREEK",
+        71 => "GUJARATI",
+        13 => "HEBREW",
+        57 => "HINDI",
+        14 => "HUNGARIAN",
+        15 => "ICELANDIC",
+        33 => "INDONESIAN",
+        16 => "ITALIAN",
+        17 => "JAPANESE",
+        75 => "KANNADA",
+        63 => "KAZAK",
+        87 => "KONKANI",
+        18 => "KOREAN",
+        38 => "LATVIAN",
+        39 => "LITHUANIAN",
+        47 => "MACEDONIAN",
+        62 => "MALAY",
+        76 => "MALAYALAM",
+        58 => "MALTESE",
+        78 => "MARATHI",
+        97 => "NEPALI",
+        20 => "NORWEGIAN",
+        72 => "ORIYA",
+        21 => "POLISH",
+        22 => "PORTUGUESE",
+        70 => "PUNJABI",
+        23 => "RHAETOROMANIC",
+        24 => "ROMANIAN",
+        25 => "RUSSIAN",
+        59 => "SAMI",
+        79 => "SANSKRIT",
+        26 => "SERBIAN",
+        27 => "SLOVAK",
+        36 => "SLOVENIAN",
+        46 => "SORBIAN",
+        10 => "SPANISH",
+        48 => "SUTU",
+        65 => "SWAHILI",
+        29 => "SWEDISH",
+        73 => "TAMIL",
+        68 => "TATAR",
+        74 => "TELUGU",
+        30 => "THAI",
+        49 => "TSONGA",
+        50 => "TSWANA",
+        31 => "TURKISH",
+        34 => "UKRAINIAN",
+        32 => "URDU",
+        67 => "UZBEK",
+        42 => "VIETNAMESE",
+        52 => "XHOSA",
+        53 => "ZULU",
+        _ => "ENGLISH",
+    }
+}
+
+/// `sub_language` in `mobi/langcodes.py`.
+pub fn sub_language(code: u8) -> &'static str {
+    match code {
+        0 => "NEUTRAL",
+        3 => "SERBIAN_CYRILLIC",
+        4 => "SPANISH_GUATEMALA",
+        5 => "SPANISH_COSTA_RICA",
+        6 => "SPANISH_PANAMA",
+        7 => "SPANISH_DOMINICAN_REPUBLIC",
+        8 => "SPANISH_VENEZUELA",
+        9 => "SPANISH_COLOMBIA",
+        10 => "SPANISH_PERU",
+        11 => "SPANISH_ARGENTINA",
+        12 => "SPANISH_ECUADOR",
+        13 => "SPANISH_CHILE",
+        14 => "SPANISH_URUGUAY",
+        15 => "SPANISH_PARAGUAY",
+        16 => "SPANISH_BOLIVIA",
+        17 => "SPANISH_EL_SALVADOR",
+        18 => "SPANISH_HONDURAS",
+        19 => "SPANISH_NICARAGUA",
+        20 => "SPANISH_PUERTO_RICO",
+        1 => "UZBEK_LATIN",
+        2 => "UZBEK_CYRILLIC",
+        _ => "NEUTRAL",
+    }
+}
+
+#[cfg(test)]
+mod main_sub_language_tests {
+    use super::*;
+
+    #[test]
+    fn known_codes_resolve() {
+        assert_eq!(main_language(9), "ENGLISH");
+        assert_eq!(main_language(7), "GERMAN");
+        assert_eq!(sub_language(0), "NEUTRAL");
+        assert_eq!(sub_language(3), "SERBIAN_CYRILLIC");
+    }
+
+    #[test]
+    fn unknown_codes_fall_back_to_the_pythons_defaults() {
+        // `MOBIHeader.__init__` in debug/headers.py:
+        // `main_language.get(langid, 'ENGLISH')`,
+        // `sub_language.get(sublangid, 'NEUTRAL')`.
+        assert_eq!(main_language(255), "ENGLISH");
+        assert_eq!(sub_language(255), "NEUTRAL");
+    }
+}
