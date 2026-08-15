@@ -670,9 +670,9 @@
 #### pdb
 
 - [ ] __init__.py
-- [ ] formatreader.py
-- [ ] formatwriter.py
-- [ ] header.py
+- [x] formatreader.py
+- [x] formatwriter.py
+- [x] header.py
 
 ##### ereader
 
