@@ -45,5 +45,8 @@ cssparser = "0.37.0"
 unicode-segmentation = "1.11"
 image = { version = "0.24", default-features = false, features = ["png", "jpeg", "gif"] }
 jpeg-decoder = "0.3"
+resvg = "0.48"
+usvg = "0.48"
+tiny-skia = "0.12"
 
 [dev-dependencies]
