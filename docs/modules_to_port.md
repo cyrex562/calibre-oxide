@@ -626,7 +626,7 @@
 - [ ] split.py
 - [ ] stats.py
 - [x] subset.py
-- [ ] toc.py
+- [x] toc.py
 - [ ] tts.py
 - [ ] upgrade.py
 - [x] utils.py
