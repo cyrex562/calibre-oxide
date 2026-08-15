@@ -54,6 +54,33 @@ impl Metadata {
     pub fn get(&self, term: &str) -> Vec<&Item> {
         self.items.iter().filter(|i| i.term == term).collect()
     }
+
+    /// Port of `oeb.metadata.clear(term)`: drop every item with this
+    /// term.
+    pub fn clear(&mut self, term: &str) {
+        self.items.retain(|i| i.term != term);
+    }
+
+    /// Port of `oeb.metadata.filter(term, predicate)`: drop every item
+    /// with this term for which `should_remove` returns `true` (Python's
+    /// `predicate`).
+    pub fn filter(&mut self, term: &str, mut should_remove: impl FnMut(&Item) -> bool) {
+        self.items.retain(|i| i.term != term || !should_remove(i));
+    }
+
+    /// The first item with this term, if any (`str(m.title[0])` and
+    /// similar single-valued accesses in Python).
+    pub fn first(&self, term: &str) -> Option<&Item> {
+        self.items.iter().find(|i| i.term == term)
+    }
+
+    /// Mutable access to every item with this term, e.g. to update an
+    /// existing `identifier` item's value in place by matching its
+    /// `scheme` attribute (`meta_info_to_oeb_metadata`'s `x.content =
+    /// val` loop).
+    pub fn iter_mut<'a>(&'a mut self, term: &'a str) -> impl Iterator<Item = &'a mut Item> {
+        self.items.iter_mut().filter(move |i| i.term == term)
+    }
 }
 
 // Helper functions moved to parse_utils.rs

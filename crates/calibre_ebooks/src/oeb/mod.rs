@@ -14,4 +14,5 @@ pub mod reader;
 pub mod spine;
 pub mod stylizer;
 pub mod toc;
+pub mod transforms;
 pub mod writer;

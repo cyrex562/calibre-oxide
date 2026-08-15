@@ -43,11 +43,23 @@ impl Guide {
         self.references.remove(type_);
     }
 
+    /// Port of `oeb.guide.remove_by_href(href)`: drop every reference
+    /// pointing at `href`.
+    pub fn remove_by_href(&mut self, href: &str) {
+        self.references.retain(|_, r| r.href != href);
+    }
+
     pub fn is_empty(&self) -> bool {
         self.references.is_empty()
     }
 
     pub fn values(&self) -> impl Iterator<Item = &Reference> {
         self.references.values()
+    }
+
+    /// Port of `oeb.guide.iterkeys()`/`__iter__`: the reference type
+    /// identifiers currently present.
+    pub fn types(&self) -> impl Iterator<Item = &String> {
+        self.references.keys()
     }
 }

@@ -99,4 +99,14 @@ impl Manifest {
     pub fn iter(&self) -> impl Iterator<Item = &ManifestItem> {
         self.items.values()
     }
+
+    /// Port of `Manifest.main_stylesheet`: the first manifest item whose
+    /// media type is a CSS stylesheet, in manifest order. Used by
+    /// `transforms::page_margin::RemoveFakeMargins` to find the "flattened
+    /// CSS" sheet it edits.
+    pub fn main_stylesheet(&self) -> Option<&ManifestItem> {
+        self.items
+            .values()
+            .find(|i| crate::oeb::constants::OEB_STYLES.contains(&i.media_type.as_str()))
+    }
 }
