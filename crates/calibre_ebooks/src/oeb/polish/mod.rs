@@ -27,13 +27,27 @@
 //! and each retrofitted function's own docs for what's real now and what
 //! (narrower, still-documented) gaps remain.
 //!
-//! The remaining ~11 feature files under
-//! `old_src/src/calibre/ebooks/oeb/polish/` (spell-check, cover editing,
-//! split/merge, Kobo conversion, text-to-speech, link-checking, ...) are
-//! out of scope for this slice and are tracked as follow-up work.
+//! `cover.py`/`create.py`/`split.py` (issue #166, follow-up to #39/#162/
+//! #163, and to `replace.py`'s `LinkRebaser`/`get_recommended_folders`):
+//! EPUB cover detection/setting (`cover.rs`), empty-book creation
+//! (`create.rs`), and real HTML split/merge (`split.rs`). The
+//! AZW3-specific functions in `cover.py`/`create.py` (`set_azw3_cover`,
+//! `get_azw3_raster_cover_name`, `mark_as_cover_azw3`, and `create_book`'s
+//! `fmt == "azw3"` path) are `todo!()`, referencing the same
+//! `Azw3Container`/`opf_to_azw3` gap `container.rs` (issue #161) already
+//! documents -- `create_book`'s `docx` path looks like it needs the same
+//! treatment but doesn't: `docx::writer::container::DocxWriter::new`
+//! already starts from an empty document, so it's real, not stubbed.
+//!
+//! The remaining feature files under
+//! `old_src/src/calibre/ebooks/oeb/polish/` (Kobo conversion,
+//! text-to-speech, link-checking, jacket/report generation, ...) are out
+//! of scope for this slice and are tracked as follow-up work.
 
 pub mod cascade;
 pub mod container;
+pub mod cover;
+pub mod create;
 pub mod css;
 pub mod download;
 pub mod embed;
@@ -48,6 +62,7 @@ pub mod pretty;
 pub mod replace;
 pub mod smartypants;
 pub mod spell;
+pub mod split;
 pub mod stats;
 pub mod subset;
 pub mod toc;

@@ -361,8 +361,10 @@ fn lang_as_iso639_1(lang: &str) -> Option<String> {
 /// UUIDv4 (already a workspace dependency, see `container.rs`'s
 /// `uuid::Uuid` usage) rendered without hyphens produces an equally
 /// unique, equally valid XML NCName (starts with the required `u`
-/// letter) -- just via a different, simpler encoding.
-fn uuid_id() -> String {
+/// letter) -- just via a different, simpler encoding. `pub(crate)`:
+/// `oeb::polish::cover`'s `create_epub_cover` (`cover.py`'s own `from
+/// calibre.ebooks.oeb.base import uuid_id`) needs the same helper.
+pub(crate) fn uuid_id() -> String {
     format!("u{}", uuid::Uuid::new_v4().simple())
 }
 
@@ -1368,7 +1370,13 @@ pub fn from_files(container: &mut Container) -> Result<Toc> {
 // Adding a TOC entry at a clicked location (GUI click-to-add-entry)
 // ===================================================================
 
-fn node_from_loc(dom: &Dom, locs: &[usize], totals: Option<&[usize]>) -> Result<NodeId> {
+/// `pub(crate)`: also used directly by `oeb::polish::split`'s [`split`]
+/// (the ported `split.py`'s `from calibre.ebooks.oeb.polish.toc import
+/// node_from_loc`) to resolve a click-to-split location the same way a
+/// click-to-add-TOC-entry location is resolved here.
+///
+/// [`split`]: super::split::split
+pub(crate) fn node_from_loc(dom: &Dom, locs: &[usize], totals: Option<&[usize]>) -> Result<NodeId> {
     let mut node = dom
         .find_first_tag_global("body")
         .ok_or_else(|| PolishError::MalformedMarkup("document has no <body>".to_string()))?;
