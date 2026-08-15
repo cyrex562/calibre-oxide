@@ -279,7 +279,13 @@ fn element_or_comment_children(dom: &Dom, id: NodeId) -> Vec<NodeId> {
         .collect()
 }
 
-fn leading_text(dom: &Dom, id: NodeId) -> Option<String> {
+/// `pub(crate)`: `leading_text`/`set_leading_text`/`dom_tail`/
+/// `set_dom_tail` are lxml's `elem.text`/`elem.tail` read/write, ported
+/// once here against the [`Dom`] sibling-text-node model (see the module
+/// docs). `oeb::polish::split`'s `do_split` (`split.py`'s tree-splitting
+/// core) needs the exact same `.text`/`.tail` read/write primitives, so
+/// it reuses these instead of duplicating them.
+pub(crate) fn leading_text(dom: &Dom, id: NodeId) -> Option<String> {
     match dom.children(id).first() {
         Some(&f) => match &dom.node(f).kind {
             NodeKind::Text(t) => Some(t.clone()),
@@ -289,7 +295,7 @@ fn leading_text(dom: &Dom, id: NodeId) -> Option<String> {
     }
 }
 
-fn set_leading_text(dom: &mut Dom, id: NodeId, text: &str) {
+pub(crate) fn set_leading_text(dom: &mut Dom, id: NodeId, text: &str) {
     if let Some(&first) = dom.children(id).first() {
         if let NodeKind::Text(_) = dom.node(first).kind {
             dom.node_mut(first).kind = NodeKind::Text(text.to_string());
@@ -300,7 +306,7 @@ fn set_leading_text(dom: &mut Dom, id: NodeId, text: &str) {
     dom.insert_child(id, 0, t);
 }
 
-fn dom_tail(dom: &Dom, id: NodeId) -> Option<String> {
+pub(crate) fn dom_tail(dom: &Dom, id: NodeId) -> Option<String> {
     let parent = dom.parent(id)?;
     let pos = dom.index_in_parent(id)?;
     let next = *dom.children(parent).get(pos + 1)?;
@@ -310,7 +316,7 @@ fn dom_tail(dom: &Dom, id: NodeId) -> Option<String> {
     }
 }
 
-fn set_dom_tail(dom: &mut Dom, id: NodeId, text: &str) {
+pub(crate) fn set_dom_tail(dom: &mut Dom, id: NodeId, text: &str) {
     let Some(parent) = dom.parent(id) else {
         return;
     };

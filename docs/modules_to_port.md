@@ -604,8 +604,8 @@
 - [ ] __init__.py
 - [x] cascade.py
 - [x] container.py
-- [ ] cover.py
-- [ ] create.py
+- [x] cover.py
+- [x] create.py
 - [x] css.py
 - [x] download.py
 - [x] embed.py
@@ -623,7 +623,7 @@
 - [x] replace.py
 - [ ] report.py
 - [x] spell.py
-- [ ] split.py
+- [x] split.py
 - [x] stats.py
 - [x] subset.py
 - [x] toc.py

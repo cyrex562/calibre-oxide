@@ -38,6 +38,7 @@ pub struct Node {
     pub parent: Option<NodeId>,
 }
 
+#[derive(Clone)]
 pub struct Dom {
     pub nodes: Vec<Node>,
     pub root: NodeId,

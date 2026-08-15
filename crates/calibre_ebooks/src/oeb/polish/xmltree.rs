@@ -429,9 +429,10 @@ impl Xml {
     /// A narrow XPath subset covering exactly the shapes
     /// `container.py`/`opf.py` use against the OPF tree:
     /// `//prefix:tag(/prefix:tag)*` optionally followed on the final
-    /// step by `[@attr]`/`[@attr1 and @attr2 ...]` (attribute
-    /// *existence* only -- no value-equality/functions/other axes).
-    /// `*` matches any element regardless of namespace. This is *not* a
+    /// step by `[@attr]`/`[@attr1 and @attr2 ...]`, where each clause is
+    /// either bare attribute *existence* (`@attr`) or an exact-value
+    /// equality test (`@attr="value"`) -- no functions/other axes. `*`
+    /// matches any element regardless of namespace. This is *not* a
     /// general XPath engine (calibre's own `opf_xpath` call sites never
     /// need one); building one is out of scope, see
     /// `docs/AGENT_PORTING_GUIDE.md`'s "simplify deeply nested
@@ -444,7 +445,7 @@ impl Xml {
     /// anywhere, then its direct `opf:item` children).
     pub fn opf_xpath(&self, expr: &str, ns: &HashMap<&str, &str>) -> Vec<XmlNodeId> {
         let body = expr.strip_prefix("//").unwrap_or(expr);
-        let raw_steps: Vec<&str> = body.split('/').collect();
+        let raw_steps: Vec<&str> = split_steps(body);
         if raw_steps.is_empty() {
             return Vec::new();
         }
@@ -467,8 +468,8 @@ impl Xml {
                 }
             }
             if i == last_idx {
-                if let Some(attrs) = predicate {
-                    next.retain(|&id| attrs.iter().all(|a| self.has_attr(id, a)));
+                if let Some(preds) = &predicate {
+                    next.retain(|&id| preds.iter().all(|p| p.matches(self, id)));
                 }
             }
             current = next;
@@ -509,9 +510,54 @@ impl Xml {
     }
 }
 
-/// Splits `item[@href and @media-type]` into `("item", Some(["href",
-/// "media-type"]))`, or `item` into `("item", None)`.
-fn split_predicate(step: &str) -> (&str, Option<Vec<&str>>) {
+/// Splits an XPath body on `/` at bracket depth 0 only, so a predicate
+/// value that itself contains a literal `/` (overwhelmingly common for
+/// this crate's real queries -- MIME types like `text/css`,
+/// `image/png`, `application/xhtml+xml`) isn't mistaken for a step
+/// separator. `[`/`]` never legitimately nest in the predicate shapes
+/// this engine supports (see [`Xml::opf_xpath`]'s docs), so plain depth
+/// tracking is sufficient.
+fn split_steps(body: &str) -> Vec<&str> {
+    let mut steps = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, c) in body.char_indices() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth -= 1,
+            '/' if depth == 0 => {
+                steps.push(&body[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    steps.push(&body[start..]);
+    steps
+}
+
+/// One `[@attr]`/`[@attr="value"]` predicate clause.
+enum AttrPredicate<'a> {
+    /// `@attr`: the attribute is present, regardless of value.
+    Exists(&'a str),
+    /// `@attr="value"`: the attribute is present and its value matches
+    /// exactly (quotes -- `"..."` or `'...'` -- stripped).
+    Equals(&'a str, &'a str),
+}
+
+impl AttrPredicate<'_> {
+    fn matches(&self, xml: &Xml, id: XmlNodeId) -> bool {
+        match self {
+            AttrPredicate::Exists(name) => xml.has_attr(id, name),
+            AttrPredicate::Equals(name, value) => xml.get_attr(id, name) == Some(*value),
+        }
+    }
+}
+
+/// Splits `item[@href and @media-type]` into `("item", Some([Exists("href"),
+/// Exists("media-type")]))`, `item[@type="cover"]` into `("item",
+/// Some([Equals("type", "cover")]))`, or `item` into `("item", None)`.
+fn split_predicate(step: &str) -> (&str, Option<Vec<AttrPredicate<'_>>>) {
     match step.find('[') {
         None => (step, None),
         Some(open) => {
@@ -519,7 +565,16 @@ fn split_predicate(step: &str) -> (&str, Option<Vec<&str>>) {
             let inner = step[open + 1..].trim_end_matches(']');
             let attrs = inner
                 .split(" and ")
-                .filter_map(|p| p.trim().strip_prefix('@'))
+                .filter_map(|p| {
+                    let p = p.trim().strip_prefix('@')?;
+                    Some(match p.split_once('=') {
+                        Some((name, value)) => {
+                            let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+                            AttrPredicate::Equals(name.trim(), value)
+                        }
+                        None => AttrPredicate::Exists(p),
+                    })
+                })
                 .collect();
             (tag, Some(attrs))
         }
@@ -628,6 +683,22 @@ mod tests {
         let langs = xml.opf_xpath("//dc:language", &ns);
         assert_eq!(langs.len(), 1);
         assert_eq!(xml.element_text(langs[0]), Some("en"));
+    }
+
+    #[test]
+    fn value_equality_predicate() {
+        let xml = Xml::parse(SAMPLE).unwrap();
+        let ns = opf_ns();
+        let css_only = xml.opf_xpath(r#"//opf:manifest/opf:item[@media-type="text/css"]"#, &ns);
+        assert_eq!(css_only.len(), 1);
+        assert_eq!(xml.get_attr(css_only[0], "id"), Some("css"));
+
+        let combined = xml.opf_xpath(r#"//opf:manifest/opf:item[@id="c1" and @href]"#, &ns);
+        assert_eq!(combined.len(), 1);
+        assert_eq!(xml.get_attr(combined[0], "href"), Some("chap1.html"));
+
+        let none = xml.opf_xpath(r#"//opf:manifest/opf:item[@media-type="image/png"]"#, &ns);
+        assert!(none.is_empty());
     }
 
     #[test]
