@@ -12,79 +12,6 @@ impl PMLOutput {
         PMLOutput
     }
 
-    fn convert_html_to_pml(&self, html: &str) -> String {
-        // Very basic PML converter
-        // \p = paragraph
-        // \b = bold
-        // \i = italic
-
-        // We use roxmltree for parsing if it were XML, but HTML can be messy.
-        // For robustness, maybe just string replacement or regex for this batch?
-        // Or better: use a proper HTML parser if we had one handy and robust.
-        // `html2text` is available but produces text.
-
-        // Let's use a simplified approach:
-        // 1. naive tag replacement for known tags.
-        // 2. strip unknown tags.
-
-        let mut pml = String::new();
-
-        // Normalize
-        let content = html.replace("\r\n", "\n").replace("\r", "\n");
-
-        // Simple state machine or just regex replacements?
-        // Regex is fragile but efficient for "porting prototypes".
-        // Let's iterate chars or use a crate if possible.
-        // Actually, we can use `roxmltree` if we trust the input is XHTML (which OEB content should be).
-
-        if let Ok(doc) = roxmltree::Document::parse(&content) {
-            self.visit_node(doc.root(), &mut pml);
-        } else {
-            // Fallback: Just text? Or Regex?
-            // If parsing fails (loose HTML), let's just dump text for now.
-            pml.push_str(&html); // This is bad, implies raw HTML.
-                                 // Maybe remove tags?
-        }
-
-        pml
-    }
-
-    fn visit_node(&self, node: roxmltree::Node, out: &mut String) {
-        if node.is_text() {
-            if let Some(text) = node.text() {
-                // Determine if we need to escape anything?
-                // PML doesn't need much escaping usually, except maybe backslashes.
-                // But \ is the control char.
-                let safe_text = text.replace("\\", "\\\\");
-                out.push_str(&safe_text);
-            }
-            return;
-        }
-
-        let tag = node.tag_name().name();
-
-        // Enter
-        match tag {
-            "p" | "div" => out.push_str("\\p"),
-            "b" | "strong" | "h1" | "h2" | "h3" => out.push_str("\\b"),
-            "i" | "em" => out.push_str("\\i"),
-            "br" => out.push_str("\n"),
-            _ => {}
-        }
-
-        for child in node.children() {
-            self.visit_node(child, out);
-        }
-
-        // Exit
-        match tag {
-            "p" | "div" => out.push_str("\n"),
-            "b" | "strong" | "h1" | "h2" | "h3" => out.push_str("\\b"),
-            "i" | "em" => out.push_str("\\i"),
-            _ => {}
-        }
-    }
-
     pub fn convert(&self, book: &OEBBook, output_path: &Path) -> Result<()> {
         let title = book
             .metadata
@@ -105,7 +32,7 @@ impl PMLOutput {
                 // Load content
                 if let Ok(content_bytes) = book.container.read(&manifest_item.href) {
                     let content = String::from_utf8_lossy(&content_bytes);
-                    let pml_chunk = self.convert_html_to_pml(&content);
+                    let pml_chunk = html_to_pml(&content);
                     full_pml.push_str(&pml_chunk);
                     full_pml.push_str("\\p"); // break between chapters
                 }
@@ -126,5 +53,81 @@ impl PMLOutput {
         pdb_writer.write(&title, &encoded_bytes, &mut writer)?;
 
         Ok(())
+    }
+}
+
+impl Default for PMLOutput {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Basic (X)HTML -> PML markup converter.
+///
+/// This is a *narrow* stand-in for `calibre.ebooks.pml.pmlml`'s
+/// `PMLMLizer` (a full OEB-walking converter that also tracks image
+/// hrefs, page/chapter markers, and CSS-driven styling). Porting that
+/// converter is tracked separately under `#### pml` in
+/// `docs/modules_to_port.md` (`pmlml.py`, still unchecked as of this
+/// writing) -- it isn't part of this module's own file list, so this
+/// function only maps the handful of tags (`p`, `div`, `b`/`strong`,
+/// headings, `i`/`em`, `br`) needed for a readable round trip.
+///
+/// Extracted to a free function (was a private `PMLOutput` method) so
+/// `crate::pdb::ereader::writer` can reuse the same conversion instead
+/// of duplicating it, per this crate's established "don't duplicate a
+/// codec that already exists once" pattern.
+pub fn html_to_pml(html: &str) -> String {
+    let mut pml = String::new();
+
+    // Normalize
+    let content = html.replace("\r\n", "\n").replace('\r', "\n");
+
+    // We can use `roxmltree` if we trust the input is XHTML (which OEB
+    // content should be).
+    if let Ok(doc) = roxmltree::Document::parse(&content) {
+        visit_node(doc.root(), &mut pml);
+    } else {
+        // Fallback: parsing failed (loose HTML) -- just dump the raw
+        // text rather than losing the content entirely.
+        pml.push_str(html);
+    }
+
+    pml
+}
+
+fn visit_node(node: roxmltree::Node, out: &mut String) {
+    if node.is_text() {
+        if let Some(text) = node.text() {
+            // Determine if we need to escape anything?
+            // PML doesn't need much escaping usually, except maybe backslashes.
+            // But \ is the control char.
+            let safe_text = text.replace('\\', "\\\\");
+            out.push_str(&safe_text);
+        }
+        return;
+    }
+
+    let tag = node.tag_name().name();
+
+    // Enter
+    match tag {
+        "p" | "div" => out.push_str("\\p"),
+        "b" | "strong" | "h1" | "h2" | "h3" => out.push_str("\\b"),
+        "i" | "em" => out.push_str("\\i"),
+        "br" => out.push('\n'),
+        _ => {}
+    }
+
+    for child in node.children() {
+        visit_node(child, out);
+    }
+
+    // Exit
+    match tag {
+        "p" | "div" => out.push('\n'),
+        "b" | "strong" | "h1" | "h2" | "h3" => out.push_str("\\b"),
+        "i" | "em" => out.push_str("\\i"),
+        _ => {}
     }
 }

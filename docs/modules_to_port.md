@@ -676,12 +676,12 @@
 
 ##### ereader
 
-- [ ] __init__.py
-- [ ] inspector.py
-- [ ] reader.py
-- [ ] reader132.py
-- [ ] reader202.py
-- [ ] writer.py
+- [x] __init__.py
+- [x] inspector.py
+- [x] reader.py
+- [x] reader132.py
+- [x] reader202.py
+- [x] writer.py
 
 ##### pdf
 

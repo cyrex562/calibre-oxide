@@ -1,3 +1,4 @@
+pub mod ereader;
 pub mod formatreader;
 pub mod formatwriter;
 pub mod header;
