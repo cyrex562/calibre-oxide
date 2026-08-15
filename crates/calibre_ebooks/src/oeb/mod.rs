@@ -8,6 +8,7 @@ pub mod manifest;
 pub mod metadata;
 pub mod normalize_css;
 pub mod parse_utils;
+pub mod polish;
 pub mod reader;
 pub mod spine;
 pub mod stylizer;
