@@ -649,21 +649,21 @@
 - [x] alt_text.py
 - [x] cover.py
 - [x] data_url.py
-- [ ] embed_fonts.py
+- [x] embed_fonts.py
 - [x] filenames.py
-- [ ] flatcss.py
+- [x] flatcss.py
 - [x] guide.py
 - [x] htmltoc.py
-- [ ] jacket.py
+- [x] jacket.py
 - [x] linearize_tables.py
 - [x] manglecase.py
 - [x] metadata.py
 - [x] page_margin.py
-- [ ] rasterize.py
+- [x] rasterize.py
 - [x] rescale.py
-- [ ] split.py
+- [x] split.py
 - [x] structure.py
-- [ ] subset.py
+- [x] subset.py
 - [x] trimmanifest.py
 - [x] unsmarten.py
 

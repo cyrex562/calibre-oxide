@@ -9,22 +9,29 @@
 //! parsed on demand with [`crate::mobi::dom::Dom`] when a transform needs
 //! to walk or mutate markup.
 //!
-//! This module (issue #41, batch 1) ports the 14 files with no
-//! dependency on the other 6 (`embed_fonts.py`, `flatcss.py`,
-//! `jacket.py`, `rasterize.py`, `split.py`, `subset.py` -- batch 2).
+//! Issue #41 batch 1 ported the 14 files with no dependency on the
+//! other 6; batch 2 ports those remaining 6 (`embed_fonts.rs`,
+//! `flatcss.rs`, `jacket.rs`, `rasterize.rs`, `split.rs`, `subset.rs`),
+//! closing out the full `oeb/transforms/` directory.
 
 pub mod alt_text;
 pub mod cover;
 pub mod data_url;
+pub mod embed_fonts;
 pub mod filenames;
+pub mod flatcss;
 pub mod guide;
 pub mod htmltoc;
+pub mod jacket;
 pub mod linearize_tables;
 pub mod manglecase;
 pub mod metadata;
 pub mod page_margin;
+pub mod rasterize;
 pub mod rescale;
+pub mod split;
 pub mod structure;
+pub mod subset;
 pub mod trimmanifest;
 pub mod unsmarten;
 
