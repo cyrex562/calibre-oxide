@@ -646,26 +646,26 @@
 ##### transforms
 
 - [ ] __init__.py
-- [ ] alt_text.py
-- [ ] cover.py
-- [ ] data_url.py
+- [x] alt_text.py
+- [x] cover.py
+- [x] data_url.py
 - [ ] embed_fonts.py
-- [ ] filenames.py
+- [x] filenames.py
 - [ ] flatcss.py
-- [ ] guide.py
-- [ ] htmltoc.py
+- [x] guide.py
+- [x] htmltoc.py
 - [ ] jacket.py
-- [ ] linearize_tables.py
-- [ ] manglecase.py
-- [ ] metadata.py
-- [ ] page_margin.py
+- [x] linearize_tables.py
+- [x] manglecase.py
+- [x] metadata.py
+- [x] page_margin.py
 - [ ] rasterize.py
-- [ ] rescale.py
+- [x] rescale.py
 - [ ] split.py
-- [ ] structure.py
+- [x] structure.py
 - [ ] subset.py
-- [ ] trimmanifest.py
-- [ ] unsmarten.py
+- [x] trimmanifest.py
+- [x] unsmarten.py
 
 #### pdb
 
