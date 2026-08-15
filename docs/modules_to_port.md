@@ -603,13 +603,13 @@
 
 - [ ] __init__.py
 - [ ] cascade.py
-- [ ] container.py
+- [x] container.py
 - [ ] cover.py
 - [ ] create.py
 - [ ] css.py
 - [ ] download.py
 - [ ] embed.py
-- [ ] errors.py
+- [x] errors.py
 - [ ] fonts.py
 - [ ] hyphenation.py
 - [ ] images.py
@@ -617,8 +617,8 @@
 - [ ] jacket.py
 - [ ] kepubify.py
 - [ ] main.py
-- [ ] opf.py
-- [ ] parsing.py
+- [x] opf.py
+- [x] parsing.py
 - [ ] pretty.py
 - [ ] replace.py
 - [ ] report.py
@@ -629,7 +629,7 @@
 - [ ] toc.py
 - [ ] tts.py
 - [ ] upgrade.py
-- [ ] utils.py
+- [x] utils.py
 
 ###### check
 

@@ -160,6 +160,69 @@ pub fn safe_replace(zip_path: &Path, name: &str, data: &[u8], add_missing: bool)
     Ok(())
 }
 
+/// Atomically (re)builds a brand-new zip archive at `dest_path`: `build`
+/// is handed a [`ZipWriter`] over a temp file created next to
+/// `dest_path`, and once it returns successfully the temp file is
+/// `fsync`ed and renamed into place. On any error (from `build` or from
+/// finalizing/renaming), `dest_path` is left untouched and the temp file
+/// is removed.
+///
+/// This is the same write-temp/fsync/rename discipline as
+/// [`safe_replace`] (`docs/FAULT_TOLERANCE.md` §2), factored out for
+/// callers that need to write a *whole new* archive from scratch rather
+/// than replace one entry inside an existing one -- notably
+/// `oeb::polish::container::EpubContainer::commit_epub`, which rewrites
+/// the entire zip from its exploded-directory working copy on every
+/// commit (port of `calibre.ebooks.tweak.zip_rebuilder`). `safe_replace`
+/// itself isn't reusable for that: it opens and iterates an *existing*
+/// archive's entries, which doesn't fit "rebuild from a directory tree"
+/// at all.
+pub fn build_zip_atomic(
+    dest_path: &Path,
+    build: impl FnOnce(&mut ZipWriter<File>) -> Result<()>,
+) -> Result<()> {
+    let parent = dest_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let tmp_path = parent.join(format!(
+        ".{}.tmp-{}",
+        dest_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "archive".to_string()),
+        uuid::Uuid::new_v4().simple()
+    ));
+
+    let write_result = (|| -> Result<()> {
+        let tmp_file = File::create(&tmp_path)
+            .with_context(|| format!("Failed to create {}", tmp_path.display()))?;
+        let mut writer = ZipWriter::new(tmp_file);
+        build(&mut writer)?;
+        let tmp_file = writer.finish().context("Failed to finalize zip archive")?;
+        tmp_file.sync_all().context("Failed to fsync temp file")?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    fs::rename(&tmp_path, dest_path).with_context(|| {
+        format!(
+            "Failed to move newly built archive into place at {}",
+            dest_path.display()
+        )
+    })?;
+
+    if let Ok(dir) = File::open(parent) {
+        let _ = dir.sync_all();
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,5 +311,31 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
             .collect();
         assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn build_zip_atomic_writes_new_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("book.epub");
+        build_zip_atomic(&zip_path, |writer| {
+            writer.start_file("mimetype", FileOptions::default())?;
+            writer.write_all(b"application/epub+zip")?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            read_entry(&zip_path, "mimetype").unwrap(),
+            b"application/epub+zip"
+        );
+    }
+
+    #[test]
+    fn build_zip_atomic_leaves_existing_archive_untouched_on_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("book.epub");
+        make_zip(&zip_path, &[("a.txt", b"old")]);
+        let result = build_zip_atomic(&zip_path, |_writer| anyhow::bail!("boom"));
+        assert!(result.is_err());
+        assert_eq!(read_entry(&zip_path, "a.txt").unwrap(), b"old");
     }
 }
