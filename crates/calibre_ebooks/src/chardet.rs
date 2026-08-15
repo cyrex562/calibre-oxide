@@ -41,8 +41,8 @@ fn canonicalize_encoding(name: &str) -> String {
         "x-sjis" => "shift-jis".to_string(),
         "mac-centraleurope" => "cp1250".to_string(),
         // MS Word gb2312 → gbk workaround (Python `xml_to_unicode`).
-        "gb2312" | "chinese" | "csiso58gb231280" | "euc-cn" | "euccn"
-        | "eucgb2312-cn" | "gb2312-1980" | "gb2312-80" | "iso-ir-58" => "gbk".to_string(),
+        "gb2312" | "chinese" | "csiso58gb231280" | "euc-cn" | "euccn" | "eucgb2312-cn"
+        | "gb2312-1980" | "gb2312-80" | "iso-ir-58" => "gbk".to_string(),
         // ASCII → utf-8 (Python `force_encoding`).
         "ascii" => "utf-8".to_string(),
         _ => n,
@@ -86,6 +86,47 @@ pub fn strip_encoding_declarations(raw: &[u8], limit: usize, preserve_newlines: 
     }
     prefix.extend_from_slice(suffix);
     prefix
+}
+
+/// Port of `replace_encoding_declarations`: rewrites the encoding name
+/// captured by each declaration pattern to `enc` (leaving the rest of
+/// the declaration -- and any text outside the captured group -- byte
+/// for byte identical), within the first `limit` bytes. Returns the
+/// possibly-modified bytes and whether anything actually changed
+/// (`false` when every declaration already named `enc`, case
+/// insensitively, or none were found). Sibling of
+/// [`strip_encoding_declarations`], which removes the declaration
+/// entirely instead of retargeting it; this is what
+/// `oeb::polish::check::parsing`'s `NonUTF8` fix uses to retarget a
+/// file's declared encoding to UTF-8 without disturbing anything else
+/// in the declaration.
+pub fn replace_encoding_declarations(raw: &[u8], enc: &str, limit: usize) -> (Vec<u8>, bool) {
+    let split_at = raw.len().min(limit);
+    let (prefix, suffix) = raw.split_at(split_at);
+    let mut prefix = prefix.to_vec();
+    let mut changed = false;
+    let enc_lower = enc.to_ascii_lowercase();
+    for pat in declared_patterns() {
+        prefix = pat
+            .replace_all(&prefix, |caps: &regex::bytes::Captures| {
+                let whole = caps.get(0).unwrap();
+                let group = caps.get(1).unwrap();
+                let current = String::from_utf8_lossy(group.as_bytes()).to_ascii_lowercase();
+                if current == enc_lower {
+                    return whole.as_bytes().to_vec();
+                }
+                changed = true;
+                let start = group.start() - whole.start();
+                let end = group.end() - whole.start();
+                let mut out = whole.as_bytes()[..start].to_vec();
+                out.extend_from_slice(enc.as_bytes());
+                out.extend_from_slice(&whole.as_bytes()[end..]);
+                out
+            })
+            .into_owned();
+    }
+    prefix.extend_from_slice(suffix);
+    (prefix, changed)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -190,6 +231,35 @@ mod tests {
         assert_eq!(canonicalize_encoding("gb2312"), "gbk");
         assert_eq!(canonicalize_encoding("ASCII"), "utf-8");
         assert_eq!(canonicalize_encoding("UTF-8"), "utf-8");
+    }
+
+    #[test]
+    fn replace_encoding_declarations_retargets_xml_declaration() {
+        let raw = b"<?xml version=\"1.0\" encoding=\"iso-8859-1\"?><root/>";
+        let (new_raw, changed) = replace_encoding_declarations(raw, "utf-8", 1024);
+        assert!(changed);
+        assert_eq!(
+            String::from_utf8(new_raw).unwrap(),
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?><root/>"
+        );
+    }
+
+    #[test]
+    fn replace_encoding_declarations_no_op_when_already_target() {
+        let raw = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><root/>";
+        let (new_raw, changed) = replace_encoding_declarations(raw, "utf-8", 1024);
+        assert!(!changed);
+        assert_eq!(new_raw, raw);
+    }
+
+    #[test]
+    fn replace_encoding_declarations_retargets_html_meta_charset() {
+        let raw = b"<html><head><meta charset='iso-8859-1'></head></html>";
+        let (new_raw, changed) = replace_encoding_declarations(raw, "utf-8", 1024);
+        assert!(changed);
+        assert!(String::from_utf8(new_raw)
+            .unwrap()
+            .contains("charset='utf-8'"));
     }
 
     #[test]

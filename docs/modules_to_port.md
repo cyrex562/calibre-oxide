@@ -633,15 +633,15 @@
 
 ###### check
 
-- [ ] __init__.py
-- [ ] base.py
-- [ ] css.py
-- [ ] fonts.py
-- [ ] images.py
-- [ ] links.py
-- [ ] main.py
-- [ ] opf.py
-- [ ] parsing.py
+- [x] __init__.py
+- [x] base.py
+- [x] css.py
+- [x] fonts.py
+- [x] images.py
+- [x] links.py
+- [x] main.py
+- [x] opf.py
+- [x] parsing.py
 
 ##### transforms
 
