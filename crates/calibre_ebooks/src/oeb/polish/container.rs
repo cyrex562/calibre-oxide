@@ -1444,11 +1444,11 @@ impl Container {
         Ok(mismatches.join("\n"))
     }
 
-    /// Port of `rename`. The `LinkRebaser`-based cross-file link update
-    /// when a file moves between directories depends on `replace.py`
-    /// (not yet ported, out of this port's scope -- see this crate's
-    /// module docs); everything else (manifest/spine/OPF bookkeeping,
-    /// the actual file move) is real.
+    /// Port of `rename`. Real end to end: the cross-directory case
+    /// (rebasing every relative link *inside* the moved file itself, so
+    /// they still resolve after the move) uses
+    /// [`super::replace::LinkRebaser`], ported in issue #165 -- this
+    /// closes the gap issue #161 left here.
     pub fn rename(&mut self, current_name: &str, new_name: &str) -> Result<()> {
         if self.names_that_must_not_be_changed().contains(current_name) {
             bail!("Renaming of {current_name} is not allowed");
@@ -1502,19 +1502,17 @@ impl Container {
             self.opf_name = new_name.to_string();
         }
         if old_path.parent() != self.name_to_abspath(new_name).parent() {
-            // Cross-directory rename: every other file's links to
-            // `current_name` need rebasing. Port of `replace.py`'s
-            // `LinkRebaser`, which is out of scope for this slice (one
-            // of the ~23 not-yet-ported `polish` feature files) --
-            // real link rewriting here needs that machinery.
-            todo!(
-                "placeholder: cross-directory rename needs LinkRebaser from \
-                 oeb::polish::replace (not yet ported -- one of the ~23 \
-                 follow-up polish files). The manifest/spine/OPF update and \
-                 the actual file move above are real; only the \
-                 rewrite-every-other-file's-links-to-{current_name} step is \
-                 missing."
-            );
+            // Cross-directory rename: the file's own relative links now
+            // resolve from a different directory, so they need
+            // rebasing to still point at the same targets. Port of
+            // `container.py`'s `rename`: only the *moved* file's own
+            // links are touched here -- links *to* it from other files
+            // are a separate, bulk operation (`replace.py`'s
+            // `rename_files`, which calls `LinkReplacer` across the
+            // whole container).
+            let mut repl = super::replace::LinkRebaser::new(self, current_name, new_name);
+            self.replace_links(new_name, |url, _ft| repl.rebase(url))?;
+            self.dirty(new_name);
         }
         Ok(())
     }
@@ -2880,6 +2878,60 @@ mod tests {
         assert!(dir.path().join("renamed.html").exists());
         assert!(c.has_name("renamed.html"));
         assert!(!c.has_name("chap2.html"));
+    }
+
+    #[test]
+    fn rename_across_directories_rebases_the_moved_files_own_links() {
+        // Issue #161 left this case as a `todo!()` waiting on
+        // `replace.py`'s `LinkRebaser` (issue #165). A file with a
+        // relative link to a sibling moves into a subdirectory; its own
+        // link must be rewritten to keep resolving to the same target
+        // now that its base directory changed, even though `rename`
+        // never touches *other* files' links (see the sibling test
+        // above).
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("text")).unwrap();
+        fs::write(
+            dir.path().join("content.opf"),
+            br#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" xmlns:dc="http://purl.org/dc/elements/1.1/" version="2.0" unique-identifier="bookid">
+  <metadata>
+    <dc:title>Cross Dir Book</dc:title>
+    <dc:identifier id="bookid">x</dc:identifier>
+  </metadata>
+  <manifest>
+    <item id="c1" href="text/index.html" media-type="application/xhtml+xml"/>
+    <item id="css" href="style.css" media-type="text/css"/>
+  </manifest>
+  <spine>
+    <itemref idref="c1"/>
+  </spine>
+</package>"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("text/index.html"),
+            b"<html><head><link rel=\"stylesheet\" href=\"../style.css\"/></head>\
+              <body><p>hi</p></body></html>",
+        )
+        .unwrap();
+        fs::write(dir.path().join("style.css"), b"body{color:red}").unwrap();
+
+        let mut c = Container::open(dir.path(), &dir.path().join("content.opf")).unwrap();
+        c.rename("text/index.html", "index.html").unwrap();
+
+        assert!(c.has_name("index.html"));
+        assert!(dir.path().join("index.html").exists());
+        c.ensure_parsed("index.html").unwrap();
+        let dom = c.get_xhtml("index.html").unwrap();
+        let link = dom.find_first_tag_global("link").unwrap();
+        // The file moved from `text/` to the root, so its relerative
+        // link to the (unmoved) `style.css` must become `style.css`,
+        // not the stale `../style.css`.
+        assert_eq!(
+            dom.node(link).attrs.get("href").map(|s| s.as_str()),
+            Some("style.css")
+        );
     }
 
     #[test]

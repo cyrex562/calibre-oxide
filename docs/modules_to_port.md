@@ -620,15 +620,15 @@
 - [x] opf.py
 - [x] parsing.py
 - [x] pretty.py
-- [ ] replace.py
+- [x] replace.py
 - [ ] report.py
-- [ ] spell.py
+- [x] spell.py
 - [ ] split.py
 - [x] stats.py
 - [x] subset.py
 - [x] toc.py
 - [ ] tts.py
-- [ ] upgrade.py
+- [x] upgrade.py
 - [x] utils.py
 
 ###### check
