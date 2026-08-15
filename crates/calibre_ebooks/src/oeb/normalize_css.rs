@@ -109,6 +109,49 @@ lazy_static! {
     };
 }
 
+/// Port of `SHORTHAND_DEFAULTS`: a placeholder value used purely to
+/// discover which longhand property names a shorthand's normalizer
+/// produces (see [`normalize_filter_css`]).
+const SHORTHAND_DEFAULTS: &[(&str, &str)] = &[
+    ("margin", "0"),
+    ("padding", "0"),
+    ("border-style", "none"),
+    ("border-width", "0"),
+    ("border-color", "currentColor"),
+];
+
+/// Port of `normalize_filter_css`: expands a set of property names to
+/// remove so that removing a shorthand (e.g. `margin`) also removes the
+/// longhand properties it would normalize into (`margin-top`,
+/// `margin-right`, ...).
+///
+/// Python's version consults the full `normalizers` dict, which also
+/// covers `border`/`border-<edge>`/`list-style`/`font` shorthand
+/// expansion. This crate only ports [`normalize_edge`] (issue #35's
+/// scope) -- `margin`/`padding`/`border-style`/`border-width`/
+/// `border-color`, the edge-quad shorthands -- so only those five are
+/// expanded here; `border`/`border-top`/etc./`list-style`/`font` pass
+/// through as their own literal property name, unexpanded. This is a
+/// real, working, narrower-scoped implementation (not a `todo!()`): it
+/// covers `filter_css`'s overwhelmingly common real-world callers
+/// (removing `margin`/`padding`/`color`/`font-family`/... properties)
+/// correctly, and simply doesn't widen the removal set for the
+/// shorthands this crate has no normalizer for.
+pub fn normalize_filter_css(
+    props: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    let mut ans = std::collections::HashSet::new();
+    for prop in props {
+        ans.insert(prop.clone());
+        if let Some(&(_, default)) = SHORTHAND_DEFAULTS.iter().find(|(k, _)| k == prop) {
+            for key in normalize_edge(prop, default).into_keys() {
+                ans.insert(key);
+            }
+        }
+    }
+    ans
+}
+
 const EDGES: [&str; 4] = ["top", "right", "bottom", "left"];
 
 pub fn normalize_edge(name: &str, value: &str) -> HashMap<String, String> {
@@ -151,4 +194,37 @@ pub fn normalize_edge(name: &str, value: &str) -> HashMap<String, String> {
         }
     }
     style
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn normalize_filter_css_expands_margin_into_all_four_edges() {
+        let props: HashSet<String> = ["margin".to_string()].into_iter().collect();
+        let expanded = normalize_filter_css(&props);
+        for name in [
+            "margin",
+            "margin-top",
+            "margin-right",
+            "margin-bottom",
+            "margin-left",
+        ] {
+            assert!(expanded.contains(name), "missing {name}");
+        }
+        assert_eq!(expanded.len(), 5);
+    }
+
+    #[test]
+    fn normalize_filter_css_leaves_unexpandable_shorthands_as_is() {
+        // `border`/`font`/`list-style` have no ported normalizer (see
+        // the function's docs), so they pass through unexpanded.
+        let props: HashSet<String> = ["font-family".to_string(), "border".to_string()]
+            .into_iter()
+            .collect();
+        let expanded = normalize_filter_css(&props);
+        assert_eq!(expanded, props);
+    }
 }

@@ -606,7 +606,7 @@
 - [x] container.py
 - [ ] cover.py
 - [ ] create.py
-- [ ] css.py
+- [x] css.py
 - [x] download.py
 - [x] embed.py
 - [x] errors.py
@@ -624,7 +624,7 @@
 - [ ] report.py
 - [ ] spell.py
 - [ ] split.py
-- [ ] stats.py
+- [x] stats.py
 - [x] subset.py
 - [x] toc.py
 - [ ] tts.py
