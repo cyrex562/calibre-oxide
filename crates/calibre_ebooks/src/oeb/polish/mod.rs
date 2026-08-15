@@ -39,12 +39,21 @@
 //! treatment but doesn't: `docx::writer::container::DocxWriter::new`
 //! already starts from an empty document, so it's real, not stubbed.
 //!
+//! `check/` (issue #40, follow-up to #39/#161-#166): the "Check Book"
+//! validator -- structural/XML/link/OPF/id/naming checks over an EPUB,
+//! most with auto-fix support. See [`check`]'s module docs for its own
+//! scope notes (its `base.py` port's one-struct-plus-closure design, and
+//! its two genuine external-capability gaps: `check/css.py`'s stylelint/
+//! QWebEngine linting step, and `check/images.py`'s Qt-based CMYK
+//! auto-fix).
+//!
 //! The remaining feature files under
 //! `old_src/src/calibre/ebooks/oeb/polish/` (Kobo conversion,
-//! text-to-speech, link-checking, jacket/report generation, ...) are out
-//! of scope for this slice and are tracked as follow-up work.
+//! text-to-speech, jacket/report generation, ...) are out of scope for
+//! this slice and are tracked as follow-up work.
 
 pub mod cascade;
+pub mod check;
 pub mod container;
 pub mod cover;
 pub mod create;
