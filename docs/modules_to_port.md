@@ -602,30 +602,30 @@
 ##### polish
 
 - [ ] __init__.py
-- [ ] cascade.py
+- [x] cascade.py
 - [x] container.py
 - [ ] cover.py
 - [ ] create.py
 - [ ] css.py
-- [ ] download.py
-- [ ] embed.py
+- [x] download.py
+- [x] embed.py
 - [x] errors.py
-- [ ] fonts.py
-- [ ] hyphenation.py
-- [ ] images.py
-- [ ] import_book.py
+- [x] fonts.py
+- [x] hyphenation.py
+- [x] images.py
+- [x] import_book.py
 - [ ] jacket.py
 - [ ] kepubify.py
 - [ ] main.py
 - [x] opf.py
 - [x] parsing.py
-- [ ] pretty.py
+- [x] pretty.py
 - [ ] replace.py
 - [ ] report.py
 - [ ] spell.py
 - [ ] split.py
 - [ ] stats.py
-- [ ] subset.py
+- [x] subset.py
 - [ ] toc.py
 - [ ] tts.py
 - [ ] upgrade.py
