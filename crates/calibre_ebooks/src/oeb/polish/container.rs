@@ -99,15 +99,17 @@ pub enum ParsedItem {
     Xhtml(Dom),
     /// OPF/NCX/OCF-family strict XML, via [`Xml`].
     Xml(Xml),
-    /// CSS text. **Not** a structured stylesheet object -- no general
-    /// CSS declaration/rule parser exists in this crate (issues
-    /// #34/#35/#36 established this boundary; see
-    /// `oeb::polish::utils::parse_css`'s docs). Storing the decoded raw
-    /// text (rather than refusing to cache CSS files at all) keeps
-    /// generic file management -- read/write/rename/commit -- working
-    /// for CSS files; only genuinely CSS-*structural* operations
-    /// (link-rewriting inside `url(...)`) are blocked, and are marked
-    /// `todo!()` exactly where they're needed, not here.
+    /// CSS text. **Not** a structured stylesheet object, even though
+    /// [`crate::css::Stylesheet`] exists (see its module docs for issue
+    /// #164, which added it): callers that need structure call
+    /// [`Container::parsed_stylesheet`] to parse this text on demand and
+    /// [`Container::set_css_text`] to write mutations back, matching how
+    /// Python's `css_parser` objects are used -- parse, mutate,
+    /// re-serialize -- without this crate's file cache having to hold a
+    /// live, in-place-mutable object graph the way `get_xml`/`get_xhtml`
+    /// do for OPF/NCX/XHTML. Storing the decoded raw text keeps generic
+    /// file management -- read/write/rename/commit -- working uniformly
+    /// for every file kind.
     Css(String),
     /// Anything else (images, fonts, ...): raw bytes, unparsed.
     Raw(Vec<u8>),
@@ -450,6 +452,47 @@ impl Container {
             Some(_) => bail!("{name} is not an XHTML document"),
             None => bail!("{name} has not been parsed"),
         }
+    }
+
+    /// Returns the raw (unparsed) CSS text cached for `name`. See
+    /// [`ParsedItem::Css`]'s docs for why this crate caches CSS as text
+    /// rather than a structured object: turning it into a
+    /// [`crate::css::Stylesheet`] on demand is [`Container::parsed_stylesheet`]'s
+    /// job, not the cache's.
+    pub fn get_css_text(&self, name: &str) -> Result<&str> {
+        match self.base.parsed_cache.get(name) {
+            Some(ParsedItem::Css(s)) => Ok(s.as_str()),
+            Some(_) => bail!("{name} is not a CSS document"),
+            None => bail!("{name} has not been parsed"),
+        }
+    }
+
+    /// Overwrites the cached CSS text for `name` (port of the effect of
+    /// Python's `style.text = ...`/`sheet.cssText = ...` mutating the
+    /// cached, live `CSSStyleSheet` object in place -- since this crate
+    /// caches CSS as text rather than a mutable object graph, the
+    /// equivalent is: parse a copy, mutate it, then write the
+    /// serialized result back here). Does **not** call
+    /// [`Container::dirty`]; callers that changed the content are
+    /// expected to do that themselves, matching every real call site in
+    /// `css.py` (which always calls `container.dirty(name)` right after
+    /// assigning `sheet.cssText`/`style.text`).
+    pub fn set_css_text(&mut self, name: &str, text: impl Into<String>) {
+        self.base
+            .parsed_cache
+            .insert(name.to_string(), ParsedItem::Css(text.into()));
+    }
+
+    /// Port of `container.parsed(name)` for a CSS file: ensures `name`
+    /// is read and cached as text, then parses that text into a fresh
+    /// [`crate::css::Stylesheet`]. Unlike `get_xml`/`get_xhtml`, the
+    /// parsed object is **not** cached -- see [`ParsedItem::Css`]'s
+    /// docs; callers that mutate the result must write it back via
+    /// [`Container::set_css_text`] (with
+    /// `sheet.to_css_text()`) themselves.
+    pub fn parsed_stylesheet(&mut self, name: &str) -> Result<crate::css::Stylesheet> {
+        self.ensure_parsed(name)?;
+        Ok(crate::css::Stylesheet::parse(self.get_css_text(name)?))
     }
 
     /// Port of the `opf` property.

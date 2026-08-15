@@ -5,14 +5,12 @@
 //! resolution, and inheritance, built on Python's `css_parser`
 //! (stylesheet/rule/declaration parsing), `css_selectors` (selector
 //! matching against the DOM) and `tinycss.fonts3` (`font`/`font-family`
-//! shorthand parsing). None of those exist in this crate -- issues
-//! #34/#35/#36 and #161's foundation PR already established there is no
-//! general CSS parser or selector-matching engine here (see
-//! `oeb::polish::utils::parse_css`'s docs and `oeb::stylizer`'s module
-//! docs for the narrower, already-real alternative this crate has
-//! instead).
-//!
-//! What *doesn't* need CSS parsing is ported for real:
+//! shorthand parsing). Issue #164 added real equivalents for all three
+//! ([`crate::css`], and [`crate::oeb::fonts3`] for the narrow
+//! `font-family` piece), closing every `todo!()` this file previously
+//! had -- see each function's docs below for exactly what it does (and,
+//! for a couple, the narrower-than-Python scope it settles for instead
+//! of a `todo!()`).
 //!
 //! - [`INHERITED`] (the property-name data itself).
 //! - [`Specificity`]/[`StyleDeclaration`]/[`PropertyValue`] (the value
@@ -29,29 +27,30 @@
 //!   elements).
 //! - [`defvals`] (wraps [`crate::oeb::normalize_css::DEFAULTS`] as
 //!   `PropertyValue`s).
-//!
-//! What genuinely can't be ported without a CSS parser and selector
-//! engine -- `todo!()`, one per blocked capability:
-//!
-//! - [`html_css_stylesheet`]: needs [`super::utils::parse_css`].
-//! - [`media_ok`]/[`media_allowed`]: needs a CSS3 media-query grammar
-//!   parser (Python's `tinycss.mediaquery3.CSSMedia3Parser`) to handle
-//!   negation/media-type/media-feature expressions -- this is itself a
-//!   small CSS grammar, not just string matching, so it's the same kind
-//!   of gap as `parse_css`, not a simplification of it.
-//! - [`iterrules`]: needs `CSSRule`/`CSSStyleSheet` objects from a real
-//!   parse.
-//! - [`normalize_style_declaration`]/[`iterdeclaration`]: need
-//!   `css_parser.Property` objects plus `tinycss.fonts3`'s
-//!   `font-family` normalization.
-//! - [`resolve_styles`]: the top-level orchestrator; needs all of the
-//!   above plus `css_selectors.Select` selector matching.
+//! - [`html_css_stylesheet`]: parses the bundled user-agent stylesheet
+//!   (`templates/html.css`, embedded via `include_str!`) once, cached.
+//! - [`media_ok`]/[`media_allowed`]: a scoped media-query-list parser
+//!   (comma-separated `[not|only] <type> [and (<feature>[: <value>])]*`)
+//!   -- real, but narrower than `tinycss.mediaquery3.CSSMedia3Parser`:
+//!   feature *values* are never evaluated (matching Python's own
+//!   `IGNORED_MEDIA_FEATURES` table, which always fails a query on any
+//!   device-specific feature regardless of its value), and an
+//!   unparseable query string is treated as "allowed" (matching
+//!   Python's `except Exception: return True`).
+//! - [`iterrules`]: walks `@import`/`@media` for real against
+//!   [`crate::css::Stylesheet`].
+//! - [`normalize_style_declaration`]/[`iterdeclaration`]: real, with one
+//!   documented narrowing -- see [`iterdeclaration`]'s docs.
+//! - [`resolve_styles`]: the top-level orchestrator, real end to end.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use anyhow::Result;
 
+use crate::css::{Rule, RuleType, Select, SelectorList, Stylesheet};
 use crate::mobi::dom::{Dom, NodeId};
+use crate::oeb::fonts3::{parse_font_family, serialize_font_family};
 use crate::oeb::normalize_css::DEFAULTS;
 
 use super::container::Container;
@@ -314,79 +313,707 @@ pub fn resolve_pseudo_property(
     defvals().get(name).cloned()
 }
 
-// -- genuinely blocked: needs a real CSS parser/selector engine --------
+// -- now real, built on `crate::css` -----------------------------------
 
-/// Port of `html_css_stylesheet`: the built-in user-agent stylesheet
-/// (`templates/html.css`), parsed once and cached. Needs
-/// [`super::utils::parse_css`].
-pub fn html_css_stylesheet(_container: &mut Container) -> Result<()> {
-    todo!(
-        "placeholder: needs a real CSS parser to parse templates/html.css \
-         into a stylesheet object -- see oeb::polish::utils::parse_css's docs \
-         (same gap as issues #34/#35/#36)"
-    )
+/// The bundled user-agent stylesheet's source text (`templates/html.css`
+/// from calibre's own resources, copied into this crate -- see
+/// [`html_css_stylesheet`]'s docs).
+const HTML_CSS: &str = include_str!("../../../resources/templates/html.css");
+
+/// Port of `html_css_stylesheet`: the built-in user-agent stylesheet,
+/// parsed once and cached (Python caches it in a module-level global;
+/// this uses [`OnceLock`] for the same effect). Takes no `Container`
+/// parameter -- Python's only used it to call `container.parse_css`,
+/// which needed no state from the container itself; parsing bundled,
+/// static text needs none either.
+pub fn html_css_stylesheet() -> &'static Stylesheet {
+    static SHEET: OnceLock<Stylesheet> = OnceLock::new();
+    SHEET.get_or_init(|| Stylesheet::parse(HTML_CSS))
 }
 
-/// Port of `media_ok`. Needs a CSS3 media-query grammar parser (Python's
-/// `tinycss.mediaquery3.CSSMedia3Parser`) to evaluate negation,
-/// media-type and media-feature expressions -- a small CSS grammar in
-/// its own right, not something reducible to plain string matching.
-pub fn media_ok(_media_text: &str) -> bool {
-    todo!(
-        "placeholder: evaluating a CSS3 media query needs a real media-query \
-         parser (Python's tinycss.mediaquery3.CSSMedia3Parser), which this \
-         crate doesn't have -- same category of gap as parse_css"
-    )
+/// Port of `stylizer.ALLOWED_MEDIA_TYPES`.
+const ALLOWED_MEDIA_TYPES: &[&str] = &["screen", "all", "aural", "amzn-kf8"];
+
+/// Port of `stylizer.IGNORED_MEDIA_FEATURES`: device-specific media
+/// features that always fail a query, regardless of the value tested
+/// against them (this port never evaluates the value -- see
+/// [`media_ok`]'s docs).
+const IGNORED_MEDIA_FEATURES: &[&str] = &[
+    "width",
+    "min-width",
+    "max-width",
+    "height",
+    "min-height",
+    "max-height",
+    "device-width",
+    "min-device-width",
+    "max-device-width",
+    "device-height",
+    "min-device-height",
+    "max-device-height",
+    "aspect-ratio",
+    "min-aspect-ratio",
+    "max-aspect-ratio",
+    "device-aspect-ratio",
+    "min-device-aspect-ratio",
+    "max-device-aspect-ratio",
+    "color",
+    "min-color",
+    "max-color",
+    "color-index",
+    "min-color-index",
+    "max-color-index",
+    "monochrome",
+    "min-monochrome",
+    "max-monochrome",
+    "-webkit-min-device-pixel-ratio",
+    "resolution",
+    "min-resolution",
+    "max-resolution",
+    "scan",
+    "grid",
+];
+
+struct MediaQuery {
+    media_type: String,
+    negated: bool,
+    features: Vec<String>,
 }
 
-/// Port of `media_allowed`. Needs a parsed `@media` rule's `mediaText`.
-pub fn media_allowed(_media_text: Option<&str>) -> bool {
-    todo!("placeholder: needs media_ok, see its docs")
+/// A scoped media-query-list parser: `query (, query)*` where `query` is
+/// `[not|only]? <ident> (and \( <feature-ident> (: ...)? \))*`. This is
+/// not a general CSS3 Media Queries grammar (feature *values* -- the
+/// `100px` in `(max-width: 100px)` -- are never parsed or evaluated,
+/// only feature *names*, since [`IGNORED_MEDIA_FEATURES`] only ever
+/// tests presence); real-world `@media`/`media=""` text in e-books is
+/// overwhelmingly this shape. Returns `None` on anything it can't make
+/// sense of, matching [`media_ok`]'s permissive fallback.
+fn parse_media_query_list(raw: &str) -> Option<Vec<MediaQuery>> {
+    let mut out = Vec::new();
+    for part in raw.split(',') {
+        out.push(parse_one_media_query(part.trim())?);
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
-/// Port of `iterrules`. Needs `CSSRule`/`CSSStyleSheet` objects from a
-/// real CSS parse (import/media rule resolution).
-pub fn iterrules(_container: &mut Container, _sheet_name: &str) -> Result<Vec<()>> {
-    todo!(
-        "placeholder: iterating CSS rules (resolving @import/@media) needs a \
-         real CSS parser producing CSSRule/CSSStyleSheet objects -- see \
-         oeb::polish::utils::parse_css's docs"
-    )
+fn parse_one_media_query(text: &str) -> Option<MediaQuery> {
+    let lower = text.to_ascii_lowercase();
+    let (negated, rest) = if let Some(r) = lower.strip_prefix("not ") {
+        (true, &text[text.len() - r.len()..])
+    } else if let Some(r) = lower.strip_prefix("only ") {
+        (false, &text[text.len() - r.len()..])
+    } else {
+        (false, text)
+    };
+    let rest = rest.trim_start();
+    let type_end = rest
+        .find(|c: char| c.is_whitespace() || c == '(')
+        .unwrap_or(rest.len());
+    let media_type = rest[..type_end].trim().to_ascii_lowercase();
+    if media_type.is_empty() {
+        return None;
+    }
+    let mut features = Vec::new();
+    let mut cursor = rest[type_end..].trim_start();
+    loop {
+        if let Some(r) = cursor.strip_prefix("and") {
+            cursor = r.trim_start();
+        }
+        let Some(inner) = cursor.strip_prefix('(') else {
+            break;
+        };
+        let close = inner.find(')')?;
+        let feature_name = inner[..close]
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if !feature_name.is_empty() {
+            features.push(feature_name);
+        }
+        cursor = inner[close + 1..].trim_start();
+    }
+    Some(MediaQuery {
+        media_type,
+        negated,
+        features,
+    })
 }
 
-/// Port of `normalize_style_declaration`/`iterdeclaration`. Needs
-/// `css_parser.Property` objects (from a real CSS declaration parse)
-/// plus `tinycss.fonts3`'s `font-family` shorthand normalization.
+fn query_ok(mq: &MediaQuery) -> bool {
+    let mut matched = ALLOWED_MEDIA_TYPES.contains(&mq.media_type.as_str());
+    for f in &mq.features {
+        if IGNORED_MEDIA_FEATURES.contains(&f.as_str()) {
+            matched = false;
+        }
+    }
+    mq.negated ^ matched
+}
+
+/// Port of `media_ok`. `""` (Python's falsy `raw`) is always allowed.
+/// See [`parse_media_query_list`]'s docs for the scoped grammar this
+/// evaluates against, and its "unparseable -> allowed" fallback (Python:
+/// `except Exception: pass; return True`).
+pub fn media_ok(media_text: &str) -> bool {
+    let raw = media_text.trim();
+    if raw.is_empty() {
+        return true;
+    }
+    if raw == "amzn-mobi" {
+        return false;
+    }
+    match parse_media_query_list(raw) {
+        None => true,
+        Some(queries) => queries.iter().any(query_ok),
+    }
+}
+
+/// Port of `media_allowed`: `None`/empty is always allowed.
+pub fn media_allowed(media_text: Option<&str>) -> bool {
+    match media_text {
+        None => true,
+        Some(t) if t.trim().is_empty() => true,
+        Some(t) => media_ok(t),
+    }
+}
+
+/// Port of `iterrules`: every rule in `sheet_name` (or `rules`, if
+/// given), resolving `@import`/`@media` recursively and, if `rule_type`
+/// is given, filtering to just that [`RuleType`]. Rules are returned as
+/// owned clones (rather than borrowing from a cached parse the way
+/// `get_xml`/`get_xhtml` do) since [`Container`] does not cache a
+/// structured [`Stylesheet`] -- see [`Container::parsed_stylesheet`]'s
+/// docs; this keeps `iterrules`' recursion free of any borrow conflict
+/// with the `&mut Container` it needs for `href_to_name`/`has_name`/
+/// re-parsing an imported sheet.
+#[allow(clippy::too_many_arguments)]
+pub fn iterrules(
+    container: &mut Container,
+    sheet_name: &str,
+    rules: Option<&[Rule]>,
+    rule_index_counter: &mut u64,
+    rule_type: Option<RuleType>,
+    importing: &mut std::collections::HashSet<String>,
+) -> Result<Vec<(Rule, String, u64)>> {
+    importing.insert(sheet_name.to_string());
+    let owned_rules;
+    let rules_slice: &[Rule] = match rules {
+        Some(r) => r,
+        None => {
+            owned_rules = container.parsed_stylesheet(sheet_name)?.rules;
+            &owned_rules
+        }
+    };
+    let mut out = Vec::new();
+    for rule in rules_slice {
+        match rule {
+            Rule::Import(imp) => {
+                if media_allowed(imp.media_text.as_deref()) {
+                    if let Some(name) = container.href_to_name(&imp.href, Some(sheet_name)) {
+                        if container.has_name(&name) && !importing.contains(&name) {
+                            let csheet = container.parsed_stylesheet(&name)?;
+                            let sub = iterrules(
+                                container,
+                                &name,
+                                Some(&csheet.rules),
+                                rule_index_counter,
+                                rule_type,
+                                importing,
+                            )?;
+                            out.extend(sub);
+                        }
+                        // A recursive import (`name` already in
+                        // `importing`) is silently ignored, matching
+                        // the effect of Python's `container.log.error`
+                        // path (this crate's `Container` has no
+                        // logging facility to route the diagnostic
+                        // through).
+                    }
+                }
+            }
+            Rule::Media(m) => {
+                if media_allowed(Some(&m.media_text)) {
+                    let sub = iterrules(
+                        container,
+                        sheet_name,
+                        Some(&m.rules),
+                        rule_index_counter,
+                        rule_type,
+                        importing,
+                    )?;
+                    out.extend(sub);
+                }
+            }
+            other => {
+                if rule_type.is_none() || Some(other.rule_type()) == rule_type {
+                    let idx = *rule_index_counter;
+                    *rule_index_counter += 1;
+                    out.push((other.clone(), sheet_name.to_string(), idx));
+                }
+            }
+        }
+    }
+    importing.remove(sheet_name);
+    Ok(out)
+}
+
+/// Port of `iterdeclaration`: every declaration in `decl`, in source
+/// order.
+///
+/// Python's version first runs each declaration through
+/// `calibre.ebooks.oeb.normalize_css.normalizers` -- a table that
+/// expands shorthand properties (`margin`, `border`, `font`,
+/// `list-style`, ...) into their longhand equivalents before the
+/// cascade sees them. This crate only ports [`crate::oeb::normalize_css::normalize_edge`]
+/// (issue #35's scope: `margin`/`padding`/`border-style`/
+/// `border-width`/`border-color`), not the full `normalizers` dict
+/// (`border`/`border-<edge>`/`font`/`list-style` shorthand expansion).
+/// This function is therefore a **documented narrowing, not a
+/// `todo!()`**: it yields every declaration exactly as written, which
+/// is correct behavior for any property Python's `normalizers.get(name)`
+/// would also have returned `None` for (the overwhelming majority), and
+/// under-expands only those five specific shorthands relative to
+/// Python. Real-world stylesheets set the properties `stats.py`/
+/// `cascade.py`'s callers actually resolve (`font-family`, `font-size`,
+/// `font-weight`, `font-style`, `font-stretch`, `display`,
+/// `text-transform`, `font-variant`, ...) directly far more often than
+/// via those shorthands.
+pub fn iterdeclaration(decl: &crate::css::StyleDeclarationBlock) -> Vec<crate::css::Declaration> {
+    decl.properties.clone()
+}
+
+/// Port of `normalize_style_declaration`: every declaration in `decl`
+/// (via [`iterdeclaration`]), with `font-family` values re-serialized
+/// through [`parse_font_family`]/[`serialize_font_family`] (matching
+/// Python's `cssutils`-workaround comment: normalizing whitespace/
+/// quoting around commas in a `font-family` list).
 pub fn normalize_style_declaration(
-    _decl_css_text: &str,
-    _sheet_name: &str,
+    decl: &crate::css::StyleDeclarationBlock,
+    sheet_name: &str,
 ) -> HashMap<String, PropertyValue> {
-    todo!(
-        "placeholder: needs a real CSS declaration parser (css_parser.Property) \
-         plus tinycss.fonts3's font-family normalization -- see \
-         oeb::polish::utils::parse_css's docs"
-    )
+    let mut ans = HashMap::new();
+    for prop in iterdeclaration(decl) {
+        let value = if prop.name.eq_ignore_ascii_case("font-family") {
+            serialize_font_family(&parse_font_family(&prop.value))
+        } else {
+            prop.value
+        };
+        ans.insert(
+            prop.name,
+            PropertyValue::new(value, Some(sheet_name.to_string()), prop.important),
+        );
+    }
+    ans
 }
 
-/// Port of `resolve_styles`: the top-level cascade resolver. Needs
-/// everything above (real parsing) plus `css_selectors.Select` selector
-/// matching against the DOM, which this crate also does not have.
-pub fn resolve_styles(_container: &mut Container, _name: &str) -> Result<()> {
-    todo!(
-        "placeholder: full cascade resolution needs a real CSS parser AND a \
-         CSS selector-matching engine (Python's css_selectors.Select), \
-         neither of which exists in this crate -- see this module's docs for \
-         which pieces (resolve_declarations, resolve_property, INHERITED, ...) \
-         *are* ported for real"
-    )
+/// The two maps [`resolve_styles`] builds, ready to drive
+/// [`resolve_property`]/[`resolve_pseudo_property`] directly -- the Rust
+/// shape of Python's `partial(resolve_property, style_map)`/
+/// `partial(resolve_pseudo_property, style_map, pseudo_style_map)`
+/// closures (a bound closure over owned data doesn't need inventing here
+/// since both functions already take `style_map`/`pseudo_style_map` as
+/// explicit parameters).
+pub struct ResolvedStyles {
+    pub style_map: HashMap<NodeId, HashMap<String, PropertyValue>>,
+    pub pseudo_style_map: HashMap<NodeId, HashMap<String, HashMap<String, PropertyValue>>>,
+}
+
+/// A callback invoked once per top-level sheet [`resolve_styles`]
+/// processes (port of Python's `sheet_callback(sheet, sheet_name)`).
+/// `container` is passed explicitly rather than captured so the
+/// callback can itself call container methods -- e.g. `iterrules` for
+/// `@font-face` rules, as `stats.rs`'s `collect_font_face_rules` does --
+/// without conflicting with `resolve_styles`' own `&mut Container`
+/// borrow.
+pub type SheetCallback<'a> = dyn FnMut(&mut Container, &Stylesheet, &str) -> Result<()> + 'a;
+
+/// Port of `resolve_styles`: resolves the full cascade for spine item
+/// `name` -- the user-agent stylesheet, every linked/embedded
+/// stylesheet and `<style>` tag, and every `style=""` attribute -- into
+/// per-element declaration maps.
+pub fn resolve_styles(
+    container: &mut Container,
+    name: &str,
+    mut sheet_callback: Option<&mut SheetCallback<'_>>,
+) -> Result<ResolvedStyles> {
+    container.ensure_parsed(name)?;
+
+    // Phase 1: pull everything needed out of the DOM into owned data,
+    // so the borrow of `container.get_xhtml(name)` ends before any
+    // `&mut Container` call below (href_to_name/parsed_stylesheet/...).
+    struct StyleTag {
+        text: String,
+    }
+    struct LinkTag {
+        href: String,
+    }
+    let (style_tags, link_tags, style_attrs): (Vec<StyleTag>, Vec<LinkTag>, Vec<(NodeId, String)>) = {
+        let dom = container.get_xhtml(name)?;
+        let mut style_tags = Vec::new();
+        let mut link_tags = Vec::new();
+        let mut style_attrs = Vec::new();
+        for id in dom.preorder_elements(dom.root) {
+            match dom.tag(id) {
+                Some("style") => {
+                    let ty = dom
+                        .node(id)
+                        .attrs
+                        .get("type")
+                        .map(|s| s.as_str())
+                        .unwrap_or("text/css");
+                    if ty.eq_ignore_ascii_case("text/css") {
+                        let text = dom.text_content(id);
+                        if !text.trim().is_empty() {
+                            style_tags.push(StyleTag { text });
+                        }
+                    }
+                }
+                Some("link") => {
+                    let attrs = &dom.node(id).attrs;
+                    let ty = attrs.get("type").map(|s| s.as_str()).unwrap_or("text/css");
+                    let rel = attrs.get("rel").map(|s| s.as_str()).unwrap_or("stylesheet");
+                    let media = attrs.get("media").map(|s| s.as_str()).unwrap_or("");
+                    if let Some(href) = attrs.get("href") {
+                        if crate::oeb::constants::OEB_STYLES
+                            .iter()
+                            .any(|m| m.eq_ignore_ascii_case(ty))
+                            && rel.eq_ignore_ascii_case("stylesheet")
+                            && media_ok(media)
+                        {
+                            link_tags.push(LinkTag { href: href.clone() });
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if let Some(style) = dom.node(id).attrs.get("style") {
+                if !style.trim().is_empty() {
+                    style_attrs.push((id, style.clone()));
+                }
+            }
+        }
+        (style_tags, link_tags, style_attrs)
+    };
+
+    // Phase 2: process every top-level sheet (user-agent + <style> tags
+    // + <link>ed sheets), collecting every STYLE_RULE (recursively
+    // through @import/@media) with a shared, monotonic rule index --
+    // `&mut Container` is free to use here since no Dom borrow is held.
+    let mut rule_index_counter: u64 = 0;
+    let mut collected: Vec<(crate::css::StyleRule, String, u64)> = Vec::new();
+    let mut process_sheet = |container: &mut Container,
+                             sheet: Stylesheet,
+                             sheet_name: String,
+                             rule_index_counter: &mut u64,
+                             collected: &mut Vec<(crate::css::StyleRule, String, u64)>|
+     -> Result<()> {
+        if let Some(cb) = sheet_callback.as_mut() {
+            cb(container, &sheet, &sheet_name)?;
+        }
+        let mut importing = std::collections::HashSet::new();
+        let rules = iterrules(
+            container,
+            &sheet_name,
+            Some(&sheet.rules),
+            rule_index_counter,
+            Some(RuleType::Style),
+            &mut importing,
+        )?;
+        for (rule, rn, idx) in rules {
+            if let Rule::Style(sr) = rule {
+                collected.push((sr, rn, idx));
+            }
+        }
+        Ok(())
+    };
+
+    process_sheet(
+        container,
+        html_css_stylesheet().clone(),
+        "user-agent.css".to_string(),
+        &mut rule_index_counter,
+        &mut collected,
+    )?;
+    for style_tag in &style_tags {
+        let sheet = Stylesheet::parse(&style_tag.text);
+        process_sheet(
+            container,
+            sheet,
+            name.to_string(),
+            &mut rule_index_counter,
+            &mut collected,
+        )?;
+    }
+    for link in &link_tags {
+        let Some(sheet_name) = container.href_to_name(&link.href, Some(name)) else {
+            continue;
+        };
+        if !container.has_name(&sheet_name) {
+            continue;
+        }
+        let sheet = container.parsed_stylesheet(&sheet_name)?;
+        process_sheet(
+            container,
+            sheet,
+            sheet_name,
+            &mut rule_index_counter,
+            &mut collected,
+        )?;
+    }
+
+    // Phase 3: match every collected rule's selectors against the DOM
+    // and bucket the resulting per-element declarations.
+    let mut style_map: HashMap<NodeId, Vec<StyleDeclaration>> = HashMap::new();
+    let mut pseudo_map: HashMap<NodeId, Vec<StyleDeclaration>> = HashMap::new();
+    {
+        let dom = container.get_xhtml(name)?;
+        let select = Select::for_dom(dom);
+        for (rule, sheet_name, rule_index) in &collected {
+            let style = normalize_style_declaration(&rule.style, sheet_name);
+            for selector in &rule.selectors.0 {
+                let single = SelectorList(vec![selector.clone()]);
+                let matches = select.matching(&single);
+                let idx = specificity(*rule_index, selector.specificity, false);
+                for elem in matches {
+                    let decl = StyleDeclaration {
+                        index: idx,
+                        declaration: style.clone(),
+                        pseudo_element: selector.pseudo_element.clone(),
+                    };
+                    if selector.pseudo_element.is_none() {
+                        style_map.entry(elem.id).or_default().push(decl);
+                    } else {
+                        pseudo_map.entry(elem.id).or_default().push(decl);
+                    }
+                }
+            }
+        }
+    }
+    for (id, style_text) in &style_attrs {
+        let decl_block = crate::css::parser::parse_declaration_list(style_text);
+        let style = normalize_style_declaration(&decl_block, name);
+        style_map.entry(*id).or_default().push(StyleDeclaration {
+            index: Specificity {
+                is_style: true,
+                num_id: 0,
+                num_class: 0,
+                num_elem: 0,
+                rule_index: 0,
+            },
+            declaration: style,
+            pseudo_element: None,
+        });
+    }
+
+    for decls in style_map.values_mut() {
+        decls.sort_by_key(|d| std::cmp::Reverse(d.index));
+    }
+    for decls in pseudo_map.values_mut() {
+        decls.sort_by_key(|d| std::cmp::Reverse(d.index));
+    }
+
+    let style_map = style_map
+        .into_iter()
+        .map(|(k, v)| (k, resolve_declarations(&v)))
+        .collect();
+    let pseudo_style_map = pseudo_map
+        .into_iter()
+        .map(|(k, v)| {
+            let resolved = resolve_pseudo_declarations(&v);
+            let by_name: HashMap<String, HashMap<String, PropertyValue>> = resolved
+                .into_iter()
+                .filter_map(|(k, v)| k.map(|k| (k, v)))
+                .collect();
+            (k, by_name)
+        })
+        .collect();
+
+    Ok(ResolvedStyles {
+        style_map,
+        pseudo_style_map,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn pv(text: &str, important: bool) -> PropertyValue {
         PropertyValue::new(text, None, important)
+    }
+
+    fn make_container(files: &[(&str, &str, &str)]) -> (tempfile::TempDir, Container) {
+        let dir = tempfile::tempdir().unwrap();
+        let opf_path = dir.path().join("content.opf");
+        let mut manifest_items = String::new();
+        let mut spine_items = String::new();
+        for (name, mt, content) in files {
+            fs::write(dir.path().join(name), content).unwrap();
+            manifest_items.push_str(&format!(
+                r#"<item id="{name}" href="{name}" media-type="{mt}"/>"#
+            ));
+            if mt.contains("html") {
+                spine_items.push_str(&format!(r#"<itemref idref="{name}"/>"#));
+            }
+        }
+        let opf = format!(
+            r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title><dc:identifier id="bookid">x</dc:identifier></metadata>
+  <manifest>{manifest_items}</manifest>
+  <spine>{spine_items}</spine>
+</package>"#
+        );
+        fs::write(&opf_path, opf).unwrap();
+        let container = Container::open(dir.path(), &opf_path).unwrap();
+        (dir, container)
+    }
+
+    #[test]
+    fn html_css_stylesheet_parses_the_bundled_user_agent_sheet_and_is_cached() {
+        let sheet = html_css_stylesheet();
+        // A handful of rules real callers depend on: block-level tags,
+        // hidden elements, and the multi-selector `img, object, svg|svg`
+        // rule that exercises the "drop the unsupported part, keep the
+        // rest" selector-list behavior (see `css::selector`'s docs).
+        assert!(sheet
+            .style_rules()
+            .any(|r| r.selector_text == "div, map, dt, isindex, form"));
+        let img_rule = sheet
+            .style_rules()
+            .find(|r| r.selector_text.contains("img"))
+            .expect("the img/object/svg|svg rule");
+        assert_eq!(
+            img_rule.selectors.0.len(),
+            2,
+            "svg|svg should be dropped, img/object kept"
+        );
+        assert!(
+            std::ptr::eq(html_css_stylesheet(), html_css_stylesheet()),
+            "must be cached, not reparsed"
+        );
+    }
+
+    #[test]
+    fn media_ok_allows_screen_and_empty_and_rejects_amzn_mobi() {
+        assert!(media_ok(""));
+        assert!(media_ok("screen"));
+        assert!(media_ok("screen, print"));
+        assert!(!media_ok("amzn-mobi"));
+        assert!(media_allowed(None));
+    }
+
+    #[test]
+    fn media_ok_rejects_a_pure_device_feature_query() {
+        // `print` is not in ALLOWED_MEDIA_TYPES, so this query never
+        // matches under any type; `min-width` is a device feature that
+        // always fails regardless of value.
+        assert!(!media_ok("print and (min-width: 400px)"));
+        // `screen` alone (no feature) is allowed.
+        assert!(media_ok("screen and (min-width: 400px), screen"));
+    }
+
+    #[test]
+    fn resolve_styles_resolves_a_linked_sheet_inline_style_and_inheritance() {
+        let (_dir, mut container) = make_container(&[
+            (
+                "index.html",
+                "application/xhtml+xml",
+                "<html><head><link rel=\"stylesheet\" href=\"style.css\"/></head><body><div class=\"a\">\
+                 <p id=\"x\" style=\"font-weight: bold\">hi</p></div></body></html>",
+            ),
+            ("style.css", "text/css", "div.a { color: red; } p { color: blue; text-align: center }"),
+        ]);
+
+        let resolved = resolve_styles(&mut container, "index.html", None).unwrap();
+        let dom = container.get_xhtml("index.html").unwrap();
+        let p = dom.find_first_tag_global("p").unwrap();
+
+        // The inline style="" attribute (specificity trumps everything)
+        // wins for font-weight.
+        let fw = resolve_property(&resolved.style_map, dom, p, "font-weight").unwrap();
+        assert_eq!(fw.css_text, "bold");
+        // `p { color: blue }` has higher specificity (element selector on
+        // `p` directly) than the inherited `div.a { color: red }` --
+        // both are real candidates, but `color` was set directly on `p`
+        // so no inheritance walk is even needed.
+        let color = resolve_property(&resolved.style_map, dom, p, "color").unwrap();
+        assert_eq!(color.css_text, "blue");
+        let ta = resolve_property(&resolved.style_map, dom, p, "text-align").unwrap();
+        assert_eq!(ta.css_text, "center");
+    }
+
+    #[test]
+    fn resolve_styles_resolves_pseudo_element_declarations() {
+        let (_dir, mut container) = make_container(&[(
+            "index.html",
+            "application/xhtml+xml",
+            "<html><head><style>.fl::first-line { font-family: X }</style></head>\
+             <body><p class=\"fl\">abc</p></body></html>",
+        )]);
+        let resolved = resolve_styles(&mut container, "index.html", None).unwrap();
+        let dom = container.get_xhtml("index.html").unwrap();
+        let p = dom.find_first_tag_global("p").unwrap();
+        let val = resolve_pseudo_property(
+            &resolved.style_map,
+            &resolved.pseudo_style_map,
+            dom,
+            p,
+            "first-line",
+            "font-family",
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(val.css_text, "X");
+    }
+
+    #[test]
+    fn iterrules_resolves_import_and_media_and_assigns_monotonic_indices() {
+        let (_dir, mut container) = make_container(&[
+            (
+                "index.html",
+                "application/xhtml+xml",
+                "<html><body/></html>",
+            ),
+            (
+                "a.css",
+                "text/css",
+                "@import url(b.css); .a { color: red } @media screen { .c { color: green } }",
+            ),
+            ("b.css", "text/css", ".b { color: blue }"),
+        ]);
+        let mut counter = 0u64;
+        let mut importing = std::collections::HashSet::new();
+        let rules = iterrules(
+            &mut container,
+            "a.css",
+            None,
+            &mut counter,
+            Some(RuleType::Style),
+            &mut importing,
+        )
+        .unwrap();
+        let selectors: Vec<String> = rules
+            .iter()
+            .filter_map(|(r, _, _)| r.as_style().map(|s| s.selector_text.clone()))
+            .collect();
+        assert!(selectors.contains(&".b".to_string()), "{selectors:?}");
+        assert!(selectors.contains(&".a".to_string()), "{selectors:?}");
+        assert!(selectors.contains(&".c".to_string()), "{selectors:?}");
+        // Indices are unique and monotonic across the whole recursive
+        // walk (import + media).
+        let mut indices: Vec<u64> = rules.iter().map(|(_, _, idx)| *idx).collect();
+        indices.sort_unstable();
+        indices.dedup();
+        assert_eq!(indices.len(), rules.len());
     }
 
     #[test]

@@ -2,6 +2,7 @@ pub mod book;
 pub mod constants;
 pub mod container;
 pub mod display;
+pub mod fonts3;
 pub mod guide;
 pub mod iterator;
 pub mod manifest;
