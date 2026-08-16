@@ -728,10 +728,10 @@
 
 #### rb
 
-- [ ] __init__.py
-- [ ] rbml.py
-- [ ] reader.py
-- [ ] writer.py
+- [x] __init__.py
+- [x] rbml.py
+- [x] reader.py
+- [x] writer.py
 
 #### readability
 

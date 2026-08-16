@@ -73,7 +73,7 @@ mod tests {
         buffer.extend_from_slice(&[0u8; 10]); // 10 bytes -> pos 24
 
         buffer.write_u32::<LittleEndian>(toc_start)?; // 4 bytes -> pos 28
-        buffer.write_u32::<LittleEndian>(0)?; // Padding/Junk -> pos 32
+        buffer.write_u32::<LittleEndian>(0)?; // total-size placeholder, patched below -> pos 32
 
         // now at 32: TOC
         // TOC Count: 2
@@ -102,6 +102,11 @@ mod tests {
 
         buffer.write_all(&toc_buffer)?;
         buffer.write_all(info_content.as_bytes())?;
+
+        // `RbHeader::parse` now verifies the byte-28 total-size field
+        // against the real stream length -- patch in the real length.
+        let total_size = buffer.len() as u32;
+        (&mut buffer[28..32]).write_u32::<LittleEndian>(total_size)?;
 
         let mut stream = Cursor::new(buffer);
         let mi = get_metadata(&mut stream)?;
