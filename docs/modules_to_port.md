@@ -712,13 +712,13 @@
 
 ##### render
 
-- [ ] __init__.py
-- [ ] common.py
-- [ ] fonts.py
-- [ ] gradients.py
-- [ ] graphics.py
-- [ ] links.py
-- [ ] serialize.py
+- [x] __init__.py
+- [x] common.py
+- [x] fonts.py
+- [x] gradients.py
+- [x] graphics.py
+- [x] links.py
+- [x] serialize.py
 
 #### pml
 
