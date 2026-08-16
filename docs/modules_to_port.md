@@ -754,22 +754,22 @@
 - [ ] add_brackets.py
 - [ ] body_styles.py
 - [ ] border_parse.py
-- [ ] char_set.py
-- [ ] check_brackets.py
-- [ ] check_encoding.py
+- [x] char_set.py
+- [x] check_brackets.py
+- [x] check_encoding.py
 - [ ] colors.py
 - [ ] combine_borders.py
 - [ ] configure_txt.py
 - [ ] convert_to_tags.py
-- [ ] copy.py
-- [ ] default_encoding.py
+- [x] copy.py
+- [x] default_encoding.py
 - [ ] delete_info.py
 - [ ] field_strings.py
 - [ ] fields_large.py
 - [ ] fields_small.py
 - [ ] fonts.py
 - [ ] footnote.py
-- [ ] get_char_map.py
+- [x] get_char_map.py
 - [ ] get_options.py
 - [ ] group_borders.py
 - [ ] group_styles.py
@@ -778,7 +778,7 @@
 - [ ] hex_2_utf8.py
 - [ ] info.py
 - [ ] inline.py
-- [ ] line_endings.py
+- [x] line_endings.py
 - [ ] list_numbers.py
 - [ ] list_table.py
 - [ ] make_lists.py
@@ -792,13 +792,13 @@
 - [ ] pict.py
 - [ ] preamble_div.py
 - [ ] preamble_rest.py
-- [ ] process_tokens.py
-- [ ] replace_illegals.py
+- [x] process_tokens.py
+- [x] replace_illegals.py
 - [ ] sections.py
 - [ ] styles.py
 - [ ] table_info.py
 - [ ] table.py
-- [ ] tokenize.py
+- [x] tokenize.py
 
 #### snb
 
