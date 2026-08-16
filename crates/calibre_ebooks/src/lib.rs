@@ -23,6 +23,7 @@ pub mod oeb;
 pub mod opf;
 pub mod output;
 pub mod pdb;
+pub mod pdf;
 pub mod rb;
 pub mod snb;
 pub mod xml_util;
