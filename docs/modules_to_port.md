@@ -735,11 +735,11 @@
 
 #### readability
 
-- [ ] __init__.py
-- [ ] cleaners.py
-- [ ] debug.py
-- [ ] htmls.py
-- [ ] readability.py
+- [x] __init__.py
+- [x] cleaners.py
+- [x] debug.py
+- [x] htmls.py
+- [x] readability.py
 
 #### rtf
 

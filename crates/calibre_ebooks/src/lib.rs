@@ -26,6 +26,7 @@ pub mod pdb;
 pub mod pdf;
 pub mod pml;
 pub mod rb;
+pub mod readability;
 pub mod snb;
 pub mod xml_util;
 pub mod zipfile_safe_replace;

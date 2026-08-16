@@ -109,6 +109,23 @@ impl Dom {
             .find(|&c| matches!(self.nodes[c].kind, NodeKind::Element(_)))
     }
 
+    /// The literal previous sibling (of any kind -- text, comment, or
+    /// element). Matches lxml's `el.itersiblings(preceding=True)` walked
+    /// one step, or (for the element-only case) `tag.getprevious()`.
+    /// Added for `calibre::ebooks::readability`'s `sanitize`, which walks
+    /// preceding siblings to sum up nearby content length; every other
+    /// caller of this module only ever needed `next_sibling`.
+    pub fn prev_sibling(&self, id: NodeId) -> Option<NodeId> {
+        let parent = self.nodes[id].parent?;
+        let siblings = &self.nodes[parent].children;
+        let pos = siblings.iter().position(|&c| c == id)?;
+        if pos == 0 {
+            None
+        } else {
+            siblings.get(pos - 1).copied()
+        }
+    }
+
     pub fn index_in_parent(&self, id: NodeId) -> Option<usize> {
         let parent = self.nodes[id].parent?;
         self.nodes[parent].children.iter().position(|&c| c == id)
@@ -418,6 +435,16 @@ mod tests {
         let body = dom.find_first_tag_global("body").unwrap();
         let out = dom.serialize(body);
         assert!(out.contains("<span class=\"italic\">hello</span>"), "{out}");
+    }
+
+    #[test]
+    fn prev_sibling_walks_backward() {
+        let dom = Dom::parse("<html><body><p>a</p><p>b</p><p>c</p></body></html>");
+        let ps = dom.find_all_tag_global("p");
+        assert_eq!(ps.len(), 3);
+        assert_eq!(dom.prev_sibling(ps[0]), None);
+        assert_eq!(dom.prev_sibling(ps[1]), Some(ps[0]));
+        assert_eq!(dom.prev_sibling(ps[2]), Some(ps[1]));
     }
 
     #[test]
