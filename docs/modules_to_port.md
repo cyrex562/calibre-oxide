@@ -752,50 +752,50 @@
 
 - [ ] __init__.py
 - [ ] add_brackets.py
-- [ ] body_styles.py
+- [x] body_styles.py
 - [ ] border_parse.py
 - [x] char_set.py
 - [x] check_brackets.py
 - [x] check_encoding.py
-- [ ] colors.py
-- [ ] combine_borders.py
+- [x] colors.py
+- [x] combine_borders.py
 - [ ] configure_txt.py
 - [ ] convert_to_tags.py
 - [x] copy.py
 - [x] default_encoding.py
-- [ ] delete_info.py
+- [x] delete_info.py
 - [ ] field_strings.py
 - [ ] fields_large.py
 - [ ] fields_small.py
-- [ ] fonts.py
-- [ ] footnote.py
+- [x] fonts.py
+- [x] footnote.py
 - [x] get_char_map.py
 - [ ] get_options.py
 - [ ] group_borders.py
 - [ ] group_styles.py
-- [ ] header.py
+- [x] header.py
 - [ ] headings_to_sections.py
-- [ ] hex_2_utf8.py
-- [ ] info.py
+- [x] hex_2_utf8.py
+- [x] info.py
 - [ ] inline.py
 - [x] line_endings.py
-- [ ] list_numbers.py
+- [x] list_numbers.py
 - [ ] list_table.py
 - [ ] make_lists.py
-- [ ] old_rtf.py
+- [x] old_rtf.py
 - [ ] options_trem.py
 - [ ] output.py
 - [ ] override_table.py
-- [ ] paragraph_def.py
-- [ ] paragraphs.py
+- [x] paragraph_def.py
+- [x] paragraphs.py
 - [ ] ParseRtf.py
-- [ ] pict.py
-- [ ] preamble_div.py
-- [ ] preamble_rest.py
+- [x] pict.py
+- [x] preamble_div.py
+- [x] preamble_rest.py
 - [x] process_tokens.py
 - [x] replace_illegals.py
-- [ ] sections.py
-- [ ] styles.py
+- [x] sections.py
+- [x] styles.py
 - [ ] table_info.py
 - [ ] table.py
 - [x] tokenize.py

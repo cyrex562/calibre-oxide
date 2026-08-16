@@ -41,26 +41,98 @@
 //! - [`copy`]: the pipeline's debug-snapshot helper (not Python's
 //!   standard library `copy` module -- see that module's own docs).
 //!
+//! # Early structure & preamble passes
+//!
+//! Issue #187's follow-up: the first 18 of the ~35 later-stage
+//! file-to-file passes, in `ParseRtf.parse_rtf()`'s actual call order.
+//! Each operates on -- and (mostly) returns -- the intermediate-format
+//! text described in [`process_tokens`]'s docs, taking `&str` content
+//! and returning transformed content/structs directly rather than
+//! reopening files, matching [`check_brackets`]'s convention (the
+//! temp-file / [`copy`] / rename dance around each pass in the real
+//! pipeline is plumbing, not ported at this layer -- see
+//! [`process_tokens::process_tokens`]'s own doc for the same call).
+//!
+//! - [`delete_info`]: drop the `\info` document-info group.
+//! - [`info`]: closely related to `delete_info` (both handle the same
+//!   `\info` group; `info` extracts/renames its fields instead of
+//!   deleting them wholesale) -- see that module's docs for exactly
+//!   how the two relate in the real pipeline.
+//! - [`pict`]: extract embedded picture (`\pict`) sub-groups' raw RTF
+//!   text out to a sibling `.rtf` file, leaving placeholder marker tags
+//!   behind in the main stream.
+//! - [`combine_borders`]: merge a border's `cw<bd<...` opening line and
+//!   its following `cw<bt<...` sub-attribute lines into one combined
+//!   `cw<bd<...` line.
+//! - [`footnote`]: separates footnote text out of the main body stream
+//!   (`separate_footnotes`), and -- much later in the real pipeline,
+//!   after passes out of scope here -- reinserts it (`join_footnotes`).
+//! - [`header`]: the same separate/rejoin shape as [`footnote`], for
+//!   headers/footers.
+//! - [`list_numbers`]: resolve list/bullet numbering tokens.
+//! - [`preamble_div`]: carve the preamble into its named divisions
+//!   (font table, color table, style sheet, etc).
+//! - [`hex_2_utf8`]: resolve `\'HH` hex bytes (and, in the body pass
+//!   out of scope here, symbol-font code points) to UTF-8/entities.
+//! - [`fonts`]: parse the font table into per-font attributes.
+//! - [`colors`]: parse the color table into per-color attributes.
+//! - [`styles`]: parse the style sheet into per-style attributes.
+//! - [`preamble_rest`]: catch-all cleanup pass for whatever preamble
+//!   material the more specific passes above didn't already consume.
+//! - [`old_rtf`]: compatibility shims for older/nonstandard RTF
+//!   producers, run only at higher run levels.
+//! - [`sections`]: parse section-break/section-property tokens.
+//! - [`paragraphs`]: mark paragraph boundaries.
+//! - [`paragraph_def`]: assemble per-paragraph attribute dictionaries
+//!   into `paragraph-definition` tags, returning the body-style strings
+//!   [`body_styles`] threads back in.
+//! - [`body_styles`]: insert [`paragraph_def`]'s collected body-style
+//!   strings after the style table.
+//!
+//! Four more follow-up issues cover the rest of the ~35 passes
+//! (fields/tables, lists/grouping/tag-conversion, and the
+//! `ParseRtf.py` orchestrator itself), built on top of the shapes
+//! established here and in the foundation below.
+//!
 //! # Not here
 //!
 //! Everything else in `old_src/src/calibre/ebooks/rtf2xml/`:
-//! `ParseRtf.py` and the ~35 later-stage transformation passes
-//! (`add_brackets`, `body_styles`, `border_parse`, `colors`,
-//! `combine_borders`, `convert_to_tags`, `fields_*`, `fonts`,
-//! `footnote`, `header`, `headings_to_sections`, `hex_2_utf8`,
-//! `inline`, `list_*`, `make_lists`, `output`, `paragraph*`, `pict`,
-//! `sections`, `styles`, `table*`, and the rest). Those are tracked by
-//! this crate's follow-up rtf2xml issues, built on top of the shapes
-//! established here -- most importantly [`process_tokens`]'s
-//! intermediate format.
+//! `ParseRtf.py` and the remaining later-stage transformation passes
+//! (`add_brackets`, `border_parse` (except as a private, non-`pub`
+//! dependency independently inlined into both [`paragraph_def`] and
+//! [`styles`] -- see those modules' own docs), `convert_to_tags`,
+//! `fields_*`, `group_borders`,
+//! `headings_to_sections`, `inline`, `list_*` (besides
+//! [`list_numbers`]), `make_lists`, `output`, `table*`, and the rest).
+//! Those are tracked by this crate's follow-up rtf2xml issues, built on
+//! top of the shapes established here -- most importantly
+//! [`process_tokens`]'s intermediate format.
 
+pub mod body_styles;
 pub mod char_set;
 pub mod check_brackets;
 pub mod check_encoding;
+pub mod colors;
+pub mod combine_borders;
 pub mod copy;
 pub mod default_encoding;
+pub mod delete_info;
+pub mod fonts;
+pub mod footnote;
 pub mod get_char_map;
+pub mod header;
+pub mod hex_2_utf8;
+pub mod info;
 pub mod line_endings;
+pub mod list_numbers;
+pub mod old_rtf;
+pub mod paragraph_def;
+pub mod paragraphs;
+pub mod pict;
+pub mod preamble_div;
+pub mod preamble_rest;
 pub mod process_tokens;
 pub mod replace_illegals;
+pub mod sections;
+pub mod styles;
 pub mod tokenize;
