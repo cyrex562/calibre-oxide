@@ -25,4 +25,5 @@ pub mod html_writer;
 pub mod image_writer;
 pub mod pdftohtml;
 pub mod reflow;
+pub mod render;
 pub mod utils;

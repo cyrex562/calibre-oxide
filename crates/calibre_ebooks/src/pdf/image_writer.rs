@@ -4,12 +4,17 @@
 //! **Documented gap**: the actual page-drawing (`draw_image_page`,
 //! `convert`) needs `calibre.ebooks.pdf.render.common`/
 //! `calibre.ebooks.pdf.render.serialize.PDFStream` - calibre's own native
-//! PDF *serializer* at `old_src/src/calibre/ebooks/pdf/render/`, tracked
-//! separately in `docs/modules_to_port.md` under its own `##### render`
-//! section (not part of issue #45's six files, and out of scope to port
-//! here) - plus Qt `QPageLayout`/`QPageSize` for page geometry. Both
-//! `[todo!()]`-marked functions below reference that module by name rather
-//! than re-deriving the explanation.
+//! PDF *serializer* at `old_src/src/calibre/ebooks/pdf/render/`. That
+//! module is now ported for real, as `crate::pdf::render` (issue #46) -
+//! but wiring these two functions up to it is still out of scope *here*
+//! (issue #45's scope was the six files in this directory, not
+//! integrating them with `render`'s output). Both `[todo!()]`-marked
+//! functions below reference `crate::pdf::render` by name rather than
+//! re-deriving the explanation; the missing piece is Qt itself
+//! (`QPageLayout`/`QPageSize` for page geometry, and driving
+//! `crate::pdf::render::graphics::Graphics` from a live paint engine -
+//! see that module's own documented gap), not the PDF serializer, which
+//! is now available.
 //!
 //! What *is* separable and genuinely portable: the page-size/unit-
 //! conversion math (`parse_pdf_page_size`, `get_page_size`,
@@ -260,8 +265,9 @@ pub fn get_page_layout(opts: &PageLayoutOpts, for_comic: bool) -> PageLayoutPoin
 
 /// Port of `Image` (image_writer.py lines 92-103): a decoded source image
 /// ready to be drawn onto a PDF page. `todo!()`d because decoding here
-/// exists only to feed `draw_image_page`, which needs the unported
-/// `pdf/render/` PDF serializer.
+/// exists only to feed `draw_image_page`, which needs Qt-driven page
+/// assembly - see module doc comment (`crate::pdf::render`'s PDF
+/// serializer itself is now available, but that's not this file's gap).
 #[derive(Debug, Clone)]
 pub struct ImageWriterImage {
     pub img_data: Vec<u8>,
@@ -275,9 +281,10 @@ impl ImageWriterImage {
         todo!(
             "placeholder: image_writer.py's Image.__init__ decodes via calibre.utils.img \
              (image_and_format_from_data) purely to hand pixel data to draw_image_page, which \
-             needs calibre.ebooks.pdf.render.serialize.PDFStream (old_src/src/calibre/ebooks/pdf/render/) \
-             - a separate, unported native PDF serializer tracked under docs/modules_to_port.md's \
-             `##### render` section, out of scope for issue #45"
+             needs Qt QPageLayout/QPageSize page geometry and calibre.ebooks.pdf.render.graphics's \
+             live QPaintEngine-driven Graphics - both out of scope for this file (see module doc \
+             comment); calibre.ebooks.pdf.render.serialize.PDFStream, the PDF serializer itself, is \
+             now ported for real as crate::pdf::render::serialize::PdfStream (issue #46)"
         )
     }
 }
@@ -286,8 +293,9 @@ impl ImageWriterImage {
 /// center an image on a PDF page, then draw it via the PDF serializer.
 pub fn draw_image_page(_img: &ImageWriterImage, _preserve_aspect_ratio: bool) {
     todo!(
-        "placeholder: needs calibre.ebooks.pdf.render.serialize.PDFStream's writer \
-         (add_jpeg_image/add_image/draw_image_with_transform) - see module doc comment"
+        "placeholder: needs Qt QPageLayout/QPageSize page geometry to drive \
+         crate::pdf::render::serialize::PdfStream's writer (add_jpeg_image/add_image/ \
+         draw_image_with_transform, all real - see crate::pdf::render::serialize) - see module doc comment"
     )
 }
 
@@ -300,9 +308,10 @@ pub fn convert(
     _metadata: Option<MetaInformation>,
 ) {
     todo!(
-        "placeholder: needs calibre.ebooks.pdf.render.serialize.PDFStream (PDF byte-stream \
-         serialization) - see module doc comment; page-layout math is available for real via \
-         get_page_layout in this module"
+        "placeholder: needs Qt QImage decoding plus crate::pdf::render::serialize::PdfStream's \
+         page-assembly driven by draw_image_page (see that function's own todo!) - see module doc \
+         comment; page-layout math is available for real via get_page_layout in this module, and \
+         the PDF serializer itself is available for real via crate::pdf::render::serialize"
     )
 }
 
