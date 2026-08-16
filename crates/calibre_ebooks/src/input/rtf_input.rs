@@ -75,6 +75,16 @@ impl RTFInput {
         // Strip RTF tags for a plain text approximation?
         // Or just put it in a block.
         // For this port, we acknowledge we are not writing a full RTF engine.
+        //
+        // `crate::rtf::preprocess` (issue #50) now ports the real RTF
+        // tokenizer/token-parser (`old_src/.../rtf/preprocess.py`) for
+        // real -- it can split raw RTF bytes into a faithful token
+        // stream and reserialize it. What is still missing here is
+        // everything *above* that layer: the actual RTF-to-XHTML
+        // structural conversion belongs to the separate, unported
+        // `calibre.ebooks.rtf2xml.*` pipeline (a chain of XSLT
+        // transforms over that token stream), which is genuinely out
+        // of scope for issue #50 and remains a real gap.
         format!(
             "<html><body><h1>RTF Content</h1><pre>{}</pre></body></html>",
             html_escape::encode_text(rtf)

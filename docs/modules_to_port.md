@@ -744,9 +744,9 @@
 #### rtf
 
 - [ ] __init__.py
-- [ ] input.py
-- [ ] preprocess.py
-- [ ] rtfml.py
+- [x] input.py
+- [x] preprocess.py
+- [x] rtfml.py
 
 #### rtf2xml
 
