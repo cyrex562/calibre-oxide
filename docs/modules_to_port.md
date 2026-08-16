@@ -686,7 +686,7 @@
 ##### pdf
 
 - [ ] __init__.py
-- [ ] reader.py
+- [x] reader.py
 
 ##### plucker
 
