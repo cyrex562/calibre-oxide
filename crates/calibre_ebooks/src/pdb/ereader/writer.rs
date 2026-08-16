@@ -2,18 +2,15 @@
 //! to eReader v2.02 bytes (compression code 10 / zlib, matching
 //! `_header_record`'s hard-coded `compression = 10`).
 //!
-//! PML markup generation reuses [`crate::output::pml_output::html_to_pml`]
-//! (extracted from `output::pml_output::PMLOutput` as part of this port)
-//! rather than porting `calibre.ebooks.pml.pmlml.PMLMLizer` -- see that
-//! function's docs for why the full converter (image-href tracking,
-//! chapter/page markers, CSS-driven styling) is tracked as a separate,
-//! not-yet-ported module (`#### pml` in `docs/modules_to_port.md`).
-//! One consequence: `PMLMLizer.image_hrefs` (which pairs each inline
-//! `<img>` tag with an assigned eReader image name) has no equivalent
-//! here, so [`Writer::build_images`] takes the simpler approach of
-//! embedding every raster image already present in the OEB manifest,
-//! rather than only the ones actually referenced by an `<img>` tag in
-//! the generated PML.
+//! PML markup generation uses [`crate::pml::pmlml::PmlMlizer`] (issue
+//! #47's port of `calibre.ebooks.pml.pmlml.PMLMLizer`), matching
+//! Python's `write_content`, which builds one `PMLMLizer` and calls
+//! `extract_content` once for the whole book rather than converting
+//! each spine item separately. [`Writer::build_images`] in turn now
+//! mirrors Python's `_images(oeb_book.manifest, pmlmlizer.image_hrefs)`:
+//! only images the generated PML actually references (`PmlMlizer`'s
+//! `image_hrefs` map) are embedded, not every raster image in the
+//! manifest.
 
 use std::io::Write;
 
@@ -28,11 +25,11 @@ use crate::metadata::authors_to_string;
 use crate::metadata::MetaInformation;
 use crate::oeb::book::OEBBook;
 use crate::oeb::constants::OEB_RASTER_IMAGES;
+use crate::oeb::stylizer::TagStylizer;
 use crate::oeb::transforms::rescale::fit_image;
-use crate::output::pml_output::html_to_pml;
-use crate::pdb::ereader::image_name;
 use crate::pdb::formatwriter::FormatWriter;
 use crate::pdb::header::PdbHeaderBuilder;
+use crate::pml::pmlml::{PmlMlizer, PmlOptions};
 
 const IDENTITY: &str = "PNRdPPrs";
 
@@ -149,18 +146,27 @@ impl Writer {
         out
     }
 
-    /// Port of `_images`. See this module's docs for why this embeds
-    /// every raster image in the manifest rather than only ones
-    /// referenced by an inline `<img>` tag in the generated PML.
+    /// Port of `_images`: embeds only the images `PmlMlizer` actually
+    /// referenced (`image_hrefs`, href -> assigned PML name, e.g.
+    /// `"cover.png"`/`"3.png"`), using that already-assigned name
+    /// directly as the header's name field -- matching Python, which
+    /// does not call `image_name` a second time here (only
+    /// `PmlMlizer::dump_text` does, while generating the PML).
     /// Returns `(header, data)` pairs, port of the Python's tuple list.
-    fn build_images(&self, oeb_book: &OEBBook) -> Vec<(Vec<u8>, Vec<u8>)> {
+    fn build_images(
+        &self,
+        oeb_book: &OEBBook,
+        image_hrefs: &std::collections::HashMap<String, String>,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
         let mut images = Vec::new();
-        let mut taken_names: Vec<String> = Vec::new();
 
         for item in oeb_book.manifest.iter() {
             if !OEB_RASTER_IMAGES.contains(&item.media_type.as_str()) {
                 continue;
             }
+            let Some(assigned_name) = image_hrefs.get(&item.href) else {
+                continue;
+            };
             let Ok(raw) = oeb_book.container.read(&item.href) else {
                 continue;
             };
@@ -182,13 +188,10 @@ impl Writer {
             }
             let data = buf.into_inner();
 
-            let name_field = image_name(&item.href, &taken_names);
-            let name_str: String = name_field
-                .iter()
-                .take_while(|&&b| b != 0)
-                .map(|&b| b as char)
-                .collect();
-            taken_names.push(name_str);
+            let mut name_field = [0u8; 32];
+            let bytes = assigned_name.as_bytes();
+            let len = bytes.len().min(32);
+            name_field[..len].copy_from_slice(&bytes[..len]);
 
             let mut header = b"PNG ".to_vec();
             header.extend_from_slice(&name_field);
@@ -358,15 +361,12 @@ impl FormatWriter for Writer {
         output_stream: &mut dyn Write,
         metadata: Option<&MetaInformation>,
     ) -> Result<()> {
-        let mut full_pml = String::new();
-        for item in &oeb_book.spine.items {
-            if let Some(manifest_item) = oeb_book.manifest.get_by_id(&item.idref) {
-                if let Ok(content_bytes) = oeb_book.container.read(&manifest_item.href) {
-                    let content = String::from_utf8_lossy(&content_bytes);
-                    full_pml.push_str(&html_to_pml(&content));
-                }
-            }
-        }
+        // Port of Python's `PMLMLizer(self.log); pml =
+        // str(pmlmlizer.extract_content(oeb_book, self.opts))`: one
+        // whole-book pass (cover, spine, image/anchor bookkeeping),
+        // not a per-spine-item conversion.
+        let mut mlizer = PmlMlizer::new();
+        let full_pml = mlizer.extract_content(oeb_book, &PmlOptions::default(), &TagStylizer);
         let (cow, _, _) = WINDOWS_1252.encode(&full_pml);
         let pml = cow.into_owned();
 
@@ -382,7 +382,7 @@ impl FormatWriter for Writer {
         chapter_index.extend(Self::index_item(&re_lower_x, &pml, false));
         let link_index = Self::index_item(&re_link, &pml, false);
 
-        let images = self.build_images(oeb_book);
+        let images = self.build_images(oeb_book, &mlizer.image_hrefs);
         let (metadata_bytes, title) = self.build_metadata(oeb_book, metadata);
 
         let hr = Self::header_record(
