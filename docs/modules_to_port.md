@@ -802,9 +802,9 @@
 
 #### snb
 
-- [ ] __init__.py
-- [ ] snbfile.py
-- [ ] snbml.py
+- [x] __init__.py
+- [x] snbfile.py
+- [x] snbml.py
 
 #### tcr
 
