@@ -2,6 +2,7 @@ use crate::compression::palmdoc::decompress;
 use crate::oeb::book::OEBBook;
 use crate::oeb::container::DirContainer;
 use crate::pdb::reader::PdbReader;
+use crate::pml::pmlconverter::pml_to_html;
 use anyhow::{Context, Result};
 use byteorder::{BigEndian, ReadBytesExt};
 use html_escape::encode_text;
@@ -95,113 +96,4 @@ impl Default for PMLInput {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Basic PML markup -> HTML fragment converter.
-///
-/// This is a *narrow* stand-in for `calibre.ebooks.pml.pmlconverter`'s
-/// `PML_HTMLizer`/`pml_to_html` (a ~500-line state machine handling
-/// headings, TOC generation, footnotes/sidebars, indentation, links,
-/// and font-size codes). Porting that state machine is tracked
-/// separately under `#### pml` in `docs/modules_to_port.md`
-/// (`pmlconverter.py`/`pmlml.py`, still unchecked as of this writing) --
-/// it isn't part of this module's own file list, so this function only
-/// handles the handful of codes (`\p`, `\b`, `\i`, `\U`, `\o`, `\n`,
-/// `\\`) needed for a readable round trip.
-///
-/// Extracted to a free function (was a private `PMLInput` method) so
-/// `crate::pdb::ereader::reader132`/`reader202` can reuse the same
-/// conversion instead of duplicating it, per this crate's established
-/// "don't duplicate a codec that already exists once" pattern.
-pub fn pml_to_html(pml: &str) -> String {
-    // Codes: \p (paragraph), \b (bold), \i (italic), \U (underline), \o (strikethrough)
-    // \v (invisible), \t (indent), \n (newline - implied by \p?)
-    // \x (image - complex), \a (anchor)
-    // \w, \k (keywords/links)
-
-    // We will do a simple pass.
-    // Note: PML codes are often toggles or singletons?
-    // \b is specific: "Toggle bold".
-    // \i is "Toggle italic".
-
-    let mut html = String::new();
-    let mut chars = pml.chars().peekable();
-
-    let mut in_bold = false;
-    let mut in_italic = false;
-    let mut in_underline = false;
-    let mut in_strike = false;
-
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            if let Some(code) = chars.next() {
-                match code {
-                    'p' => html.push_str("<p>"),
-                    'b' => {
-                        if in_bold {
-                            html.push_str("</strong>");
-                        } else {
-                            html.push_str("<strong>");
-                        }
-                        in_bold = !in_bold;
-                    }
-                    'i' => {
-                        if in_italic {
-                            html.push_str("</em>");
-                        } else {
-                            html.push_str("<em>");
-                        }
-                        in_italic = !in_italic;
-                    }
-                    'U' => {
-                        if in_underline {
-                            html.push_str("</u>");
-                        } else {
-                            html.push_str("<u>");
-                        }
-                        in_underline = !in_underline;
-                    }
-                    'o' => {
-                        if in_strike {
-                            html.push_str("</s>");
-                        } else {
-                            html.push_str("<s>");
-                        }
-                        in_strike = !in_strike;
-                    }
-                    'n' => html.push_str("<br/>"),
-                    '\\' => html.push('\\'), // Escaped backslash
-                    _ => {
-                        // Ignore unknown or handle specially
-                        // E.g. \x1234 image?
-                        // For now, ignore unknown codes
-                    }
-                }
-            }
-        } else {
-            // Escape HTML chars
-            match c {
-                '<' => html.push_str("&lt;"),
-                '>' => html.push_str("&gt;"),
-                '&' => html.push_str("&amp;"),
-                _ => html.push(c),
-            }
-        }
-    }
-
-    // Close open tags
-    if in_strike {
-        html.push_str("</s>");
-    }
-    if in_underline {
-        html.push_str("</u>");
-    }
-    if in_italic {
-        html.push_str("</em>");
-    }
-    if in_bold {
-        html.push_str("</strong>");
-    }
-
-    html
 }

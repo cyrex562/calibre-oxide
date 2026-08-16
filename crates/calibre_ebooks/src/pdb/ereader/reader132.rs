@@ -16,7 +16,6 @@ use flate2::read::ZlibDecoder;
 use regex::Regex;
 
 use crate::compression::palmdoc;
-use crate::input::pml_input::pml_to_html;
 use crate::metadata::ereader::get_metadata as get_ereader_metadata;
 use crate::metadata::toc::TOC;
 use crate::metadata::MetaInformation;
@@ -24,6 +23,7 @@ use crate::mobi::opf_writer::{auto_manifest, write_ncx, write_opf};
 use crate::pdb::ereader::EreaderError;
 use crate::pdb::formatreader::FormatReader;
 use crate::pdb::header::PdbHeader;
+use crate::pml::pmlconverter::{footnote_to_html, sidebar_to_html, PmlHtmlizer};
 
 /// The first record in the file is always the header record. It holds
 /// information related to the location of text, images, and so on in
@@ -315,14 +315,10 @@ impl FormatReader for Reader132 {
         for i in 1..=self.header_record.num_text_pages.max(0) {
             pml.push_str(&self.get_text_page(i)?);
         }
-        html.push_str(&pml_to_html(&pml));
+        let mut hizer = PmlHtmlizer::new();
+        html.push_str(&hizer.parse_pml(&pml, "index.html"));
+        let toc = hizer.get_toc();
 
-        // Footnotes / sidebar. `pmlconverter.py`'s `footnote_to_html`/
-        // `sidebar_to_html` add "return" anchors tied into the full
-        // `PML_HTMLizer`'s id scheme; that whole converter isn't ported
-        // (see `pml_to_html`'s docs), so this uses a narrower rendering:
-        // each entry is still extracted and converted, just without the
-        // cross-linked anchors.
         if self.header_record.footnote_count > 0 {
             html.push_str("<br /><h1>Footnotes</h1>");
             let ids = self.section_ids(self.header_record.footnote_offset as usize)?;
@@ -332,7 +328,7 @@ impl FormatReader for Reader132 {
             for (fid, i) in (start..end).enumerate() {
                 let text = self.decompress_text(i as usize)?;
                 let id = ids.get(fid).cloned().unwrap_or_default();
-                html.push_str(&format!("<div id=\"fn-{id}\">{}</div>", pml_to_html(&text)));
+                html.push_str(&footnote_to_html(&id, &text));
             }
         }
 
@@ -345,7 +341,7 @@ impl FormatReader for Reader132 {
             for (sid, i) in (start..end).enumerate() {
                 let text = self.decompress_text(i as usize)?;
                 let id = ids.get(sid).cloned().unwrap_or_default();
-                html.push_str(&format!("<div id=\"sb-{id}\">{}</div>", pml_to_html(&text)));
+                html.push_str(&sidebar_to_html(&id, &text));
             }
         }
 
@@ -362,7 +358,7 @@ impl FormatReader for Reader132 {
             std::fs::write(images_dir.join(&name), &img)?;
         }
 
-        self.create_opf(output_dir, &images, TOC::new())?;
+        self.create_opf(output_dir, &images, toc)?;
 
         Ok(())
     }
@@ -524,7 +520,13 @@ mod tests {
         reader.extract_content(tmp.path()).unwrap();
 
         let html = std::fs::read_to_string(tmp.path().join("index.html")).unwrap();
-        assert!(html.contains("<strong>bold</strong>"), "{html}");
+        // The real `PML_HTMLizer` renders `\b` as an inline-styled
+        // `<span>`, not `<strong>` (see `crate::pml::pmlconverter`'s
+        // `STATES_TAGS`).
+        assert!(
+            html.contains("<span style=\"font-weight: bold;\">bold</span>"),
+            "{html}"
+        );
         assert!(tmp.path().join("metadata.opf").exists());
         assert!(tmp.path().join("toc.ncx").exists());
     }

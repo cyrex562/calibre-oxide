@@ -9,13 +9,13 @@ use byteorder::{BigEndian, ByteOrder};
 use encoding_rs::{Encoding, WINDOWS_1252};
 
 use crate::compression::palmdoc;
-use crate::input::pml_input::pml_to_html;
 use crate::metadata::ereader::get_metadata as get_ereader_metadata;
 use crate::metadata::MetaInformation;
 use crate::mobi::opf_writer::{auto_manifest, write_opf};
 use crate::pdb::ereader::EreaderError;
 use crate::pdb::formatreader::FormatReader;
 use crate::pdb::header::PdbHeader;
+use crate::pml::pmlconverter::pml_to_html;
 
 fn u16_at(raw: &[u8], offset: usize) -> Result<u16> {
     let end = offset + 2;
