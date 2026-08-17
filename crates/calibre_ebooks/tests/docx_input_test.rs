@@ -67,7 +67,8 @@ fn test_docx_input_conversion() {
         .iter()
         .find(|i| i.href == "index.html")
         .expect("index.html missing");
-    let content = std::fs::read_to_string(&html_item.path).expect("Failed to read output html");
+    let content = std::fs::read_to_string(output_dir.join(&html_item.href))
+        .expect("Failed to read output html");
 
     assert!(content.contains("<h1>Chapter 1</h1>"));
     assert!(content.contains("<p>Hello World</p>"));
