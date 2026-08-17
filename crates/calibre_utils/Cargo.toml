@@ -11,6 +11,7 @@ env_logger = "0.10"
 thiserror = "1.0"
 anyhow = "1.0"
 regex = "1.10"
+fancy-regex = "0.19"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.0", features = ["v4", "v5"] }
 unidecode = "0.3"

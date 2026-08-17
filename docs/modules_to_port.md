@@ -812,9 +812,9 @@
 
 #### textile
 
-- [ ] __init__.py
-- [ ] functions.py
-- [ ] unsmarten.py
+- [x] __init__.py
+- [x] functions.py
+- [x] unsmarten.py
 
 #### txt
 

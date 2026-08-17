@@ -12,6 +12,7 @@ zip = "0.6"
 thiserror = "1.0"
 anyhow = "1.0"
 regex = "1.10"
+fancy-regex = "0.19"
 lazy_static = "1.4"
 indexmap = "2"
 chrono = { version = "0.4", features = ["serde"] }
