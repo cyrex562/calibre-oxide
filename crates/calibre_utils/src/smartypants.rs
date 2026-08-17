@@ -101,151 +101,178 @@ pub fn smarty_pants(text: &str, attr: &str) -> String {
     }
 
     let (do_dashes, do_backticks, do_quotes, do_ellipses, do_stupefy) = parse_attr(attr);
-    
+
     // We iterate tokens similar to Python: (tag, text)
     // Python _tokenize splits by tags.
     // Simplifying: Rust regex find_iter could work if we construct a tokenizer.
-    // For now, let's implement the core transforms on the whole string if safe, 
+    // For now, let's implement the core transforms on the whole string if safe,
     // but Calibre carefully skips tags.
-    
+
     // Simple tokenizer: split by <...>
     // Regex for tags: <[^>]*> matches widely but <...> might contain > in quotes.
     // Python SmartyPants uses:
     // _tokenize implementation (not fully shown in snippet but usually regex split).
     // Let's assume we can split by tags.
-    
-    // Basic implementation: 
+
+    // Basic implementation:
     // Just split by simple tag regex.
     let tag_regex = Regex::new(r"(<!--.*?-->|<[^>]*>)").unwrap();
-    
+
     let mut result = String::new();
     let mut last_char: Option<char> = None;
     let mut in_pre = false;
     let mut skipped_tag_stack: Vec<String> = Vec::new();
     let mut last_end = 0;
-    
+
     // ...
     // Note: In Python, skipped tags also update prev_token_last_char?
     // "prev_token_last_char = last_char" happens at end of loop.
     // "last_char = t[-1:]".
     // So even tags update context.
-    
+
     for mat in tag_regex.find_iter(text) {
         let start = mat.start();
         let end = mat.end();
-        
+
         // Text before tag
         if start > last_end {
             let t = &text[last_end..start];
-            let processed = process_token(t, do_dashes, do_backticks, do_quotes, do_ellipses, do_stupefy, in_pre, last_char);
+            let processed = process_token(
+                t,
+                do_dashes,
+                do_backticks,
+                do_quotes,
+                do_ellipses,
+                do_stupefy,
+                in_pre,
+                last_char,
+            );
             result.push_str(&processed);
-            
+
             if let Some(c) = t.chars().last() {
                 last_char = Some(c);
             }
         }
-        
+
         // The tag itself
         let tag = mat.as_str();
         result.push_str(tag);
-        
+
         // Update last_char from tag
         if let Some(c) = tag.chars().last() {
             last_char = Some(c);
         }
-        
+
         // Handle skip tags
         if let Some(cap) = TAGS_TO_SKIP_REGEX.captures(tag) {
-             let is_close = !cap.get(1).map_or(true, |m| m.as_str().is_empty()); // "/" group 1
-             let tag_name = cap.get(2).unwrap().as_str().to_lowercase();
-             let is_self_closing = SELF_CLOSING_REGEX.is_match(tag);
-             
-             if !is_self_closing {
-                 if !is_close {
-                     // open
-                     skipped_tag_stack.push(tag_name);
-                     in_pre = true;
-                 } else {
-                     // close
-                     if let Some(last) = skipped_tag_stack.last() {
-                         if *last == tag_name {
-                             skipped_tag_stack.pop();
-                         }
-                     }
-                     if skipped_tag_stack.is_empty() {
-                         in_pre = false;
-                     }
-                 }
-             }
+            let is_close = !cap.get(1).map_or(true, |m| m.as_str().is_empty()); // "/" group 1
+            let tag_name = cap.get(2).unwrap().as_str().to_lowercase();
+            let is_self_closing = SELF_CLOSING_REGEX.is_match(tag);
+
+            if !is_self_closing {
+                if !is_close {
+                    // open
+                    skipped_tag_stack.push(tag_name);
+                    in_pre = true;
+                } else {
+                    // close
+                    if let Some(last) = skipped_tag_stack.last() {
+                        if *last == tag_name {
+                            skipped_tag_stack.pop();
+                        }
+                    }
+                    if skipped_tag_stack.is_empty() {
+                        in_pre = false;
+                    }
+                }
+            }
         }
-        
+
         last_end = end;
     }
-    
+
     // Remaining text
     if last_end < text.len() {
         let t = &text[last_end..];
-        let processed = process_token(t, do_dashes, do_backticks, do_quotes, do_ellipses, do_stupefy, in_pre, last_char);
+        let processed = process_token(
+            t,
+            do_dashes,
+            do_backticks,
+            do_quotes,
+            do_ellipses,
+            do_stupefy,
+            in_pre,
+            last_char,
+        );
         result.push_str(&processed);
     }
-    
+
     result
 }
 
 fn process_token(
-    text: &str, 
-    do_dashes: i32, 
-    do_backticks: i32, 
-    do_quotes: i32, 
-    do_ellipses: i32, 
+    text: &str,
+    do_dashes: i32,
+    do_backticks: i32,
+    do_quotes: i32,
+    do_ellipses: i32,
     do_stupefy: i32,
     in_pre: bool,
-    prev_last_char: Option<char>
+    prev_last_char: Option<char>,
 ) -> String {
     if in_pre {
         return text.to_string();
     }
-    
+
     let mut t = text.to_string();
     t = process_escapes(&t);
     t = t.replace("&quot;", "\"");
-    
-    if do_dashes == 1 { t = educate_dashes(&t); }
-    else if do_dashes == 2 { t = educate_dashes_old_school(&t); }
-    else if do_dashes == 3 { t = educate_dashes_old_school_inverted(&t); }
-    
-    if do_ellipses == 1 { t = educate_ellipses(&t); }
-    
-    if do_backticks == 1 { t = educate_backticks(&t); }
-    else if do_backticks == 2 { t = educate_single_backticks(&educate_backticks(&t)); }
-    
+
+    if do_dashes == 1 {
+        t = educate_dashes(&t);
+    } else if do_dashes == 2 {
+        t = educate_dashes_old_school(&t);
+    } else if do_dashes == 3 {
+        t = educate_dashes_old_school_inverted(&t);
+    }
+
+    if do_ellipses == 1 {
+        t = educate_ellipses(&t);
+    }
+
+    if do_backticks == 1 {
+        t = educate_backticks(&t);
+    } else if do_backticks == 2 {
+        t = educate_single_backticks(&educate_backticks(&t));
+    }
+
     if do_quotes != 0 {
         if t == "'" {
-             // Special case: single-character ' token
-             // if re.match(r'\S', prev_token_last_char):
-             let is_whitespace = prev_last_char.map_or(true, |c| c.is_whitespace());
-             if !is_whitespace {
-                 t = "&#8217;".to_string();
-             } else {
-                 t = "&#8216;".to_string();
-             }
+            // Special case: single-character ' token
+            // if re.match(r'\S', prev_token_last_char):
+            let is_whitespace = prev_last_char.map_or(true, |c| c.is_whitespace());
+            if !is_whitespace {
+                t = "&#8217;".to_string();
+            } else {
+                t = "&#8216;".to_string();
+            }
         } else if t == "\"" {
-             // Special case: single-character " token
-             let is_whitespace = prev_last_char.map_or(true, |c| c.is_whitespace());
-             if !is_whitespace {
-                 t = "&#8221;".to_string();
-             } else {
-                 t = "&#8220;".to_string();
-             }
+            // Special case: single-character " token
+            let is_whitespace = prev_last_char.map_or(true, |c| c.is_whitespace());
+            if !is_whitespace {
+                t = "&#8221;".to_string();
+            } else {
+                t = "&#8220;".to_string();
+            }
         } else {
-             t = educate_quotes(&t);
+            t = educate_quotes(&t);
         }
     }
-    
+
     if do_stupefy == 1 {
         t = stupefy_entities(&t);
     }
-    
+
     t
 }
 
@@ -255,13 +282,22 @@ fn parse_attr(attr: &str) -> (i32, i32, i32, i32, i32) {
     let mut do_quotes = 0;
     let mut do_ellipses = 0;
     let mut do_stupefy = 0;
-    
+
     if attr == "1" {
-        do_quotes = 1; do_backticks = 1; do_dashes = 1; do_ellipses = 1;
+        do_quotes = 1;
+        do_backticks = 1;
+        do_dashes = 1;
+        do_ellipses = 1;
     } else if attr == "2" {
-        do_quotes = 1; do_backticks = 1; do_dashes = 2; do_ellipses = 1;
+        do_quotes = 1;
+        do_backticks = 1;
+        do_dashes = 2;
+        do_ellipses = 1;
     } else if attr == "3" {
-        do_quotes = 1; do_backticks = 1; do_dashes = 3; do_ellipses = 1;
+        do_quotes = 1;
+        do_backticks = 1;
+        do_dashes = 3;
+        do_ellipses = 1;
     } else if attr == "-1" {
         do_stupefy = 1;
     } else {
@@ -311,15 +347,27 @@ fn educate_quotes(text: &str) -> String {
 
     // Special case if the very first character is a quote followed by
     // punctuation at a non-word-break. Close the quotes by brute force.
-    text = RE_LEADING_SINGLE_QUOTE.replace_all(&text, "&#8217;").into_owned();
-    text = RE_LEADING_DOUBLE_QUOTE.replace_all(&text, "&#8221;").into_owned();
+    text = RE_LEADING_SINGLE_QUOTE
+        .replace_all(&text, "&#8217;")
+        .into_owned();
+    text = RE_LEADING_DOUBLE_QUOTE
+        .replace_all(&text, "&#8221;")
+        .into_owned();
 
     // Special case for double sets of quotes, e.g.:
     //   He said, "'Quoted' words in a larger quote."
-    text = RE_DOUBLE_SINGLE_OPEN.replace_all(&text, "&#8220;&#8216;").into_owned();
-    text = RE_SINGLE_DOUBLE_OPEN.replace_all(&text, "&#8216;&#8220;").into_owned();
-    text = RE_DOUBLE_DOUBLE_OPEN.replace_all(&text, "&#8220;&#8220;").into_owned();
-    text = RE_SINGLE_SINGLE_OPEN.replace_all(&text, "&#8216;&#8216;").into_owned();
+    text = RE_DOUBLE_SINGLE_OPEN
+        .replace_all(&text, "&#8220;&#8216;")
+        .into_owned();
+    text = RE_SINGLE_DOUBLE_OPEN
+        .replace_all(&text, "&#8216;&#8220;")
+        .into_owned();
+    text = RE_DOUBLE_DOUBLE_OPEN
+        .replace_all(&text, "&#8220;&#8220;")
+        .into_owned();
+    text = RE_SINGLE_SINGLE_OPEN
+        .replace_all(&text, "&#8216;&#8216;")
+        .into_owned();
 
     // Four independent, sequential literal substring replacements
     // (Python's `text.replace(...)`, not regex).
@@ -338,10 +386,18 @@ fn educate_quotes(text: &str) -> String {
 
     // Special case for quotes nested inside other entities, e.g.:
     //   A double quote--"within dashes"--would be nice.
-    text = RE_NESTED_OPEN_DOUBLE.replace_all(&text, "&#8220;").into_owned();
-    text = RE_NESTED_OPEN_SINGLE.replace_all(&text, "&#8216;").into_owned();
-    text = RE_NESTED_CLOSE_DOUBLE.replace_all(&text, "&#8221;").into_owned();
-    text = RE_NESTED_CLOSE_SINGLE.replace_all(&text, "&#8217;").into_owned();
+    text = RE_NESTED_OPEN_DOUBLE
+        .replace_all(&text, "&#8220;")
+        .into_owned();
+    text = RE_NESTED_OPEN_SINGLE
+        .replace_all(&text, "&#8216;")
+        .into_owned();
+    text = RE_NESTED_CLOSE_DOUBLE
+        .replace_all(&text, "&#8221;")
+        .into_owned();
+    text = RE_NESTED_CLOSE_SINGLE
+        .replace_all(&text, "&#8217;")
+        .into_owned();
 
     // Get most opening single quotes:
     text = OPENING_SINGLE_QUOTES_REGEX
@@ -451,10 +507,7 @@ mod tests {
     #[test]
     fn nested_double_then_single_quotes() {
         assert_eq!(
-            smarty_pants(
-                "He said, \"'Quoted' words in a larger quote.\"",
-                "q"
-            ),
+            smarty_pants("He said, \"'Quoted' words in a larger quote.\"", "q"),
             "He said, &#8220;&#8216;Quoted&#8217; words in a larger quote.&#8221;"
         );
     }
@@ -462,16 +515,16 @@ mod tests {
     #[test]
     fn quotes_nested_inside_dashes() {
         assert_eq!(
-            smarty_pants(
-                "A double quote--\"within dashes\"--would be nice.",
-                "q"
-            ),
+            smarty_pants("A double quote--\"within dashes\"--would be nice.", "q"),
             "A double quote--&#8220;within dashes&#8221;--would be nice."
         );
     }
 
     #[test]
     fn attr_zero_is_a_no_op() {
-        assert_eq!(smarty_pants("don't \"quote\" me", "0"), "don't \"quote\" me");
+        assert_eq!(
+            smarty_pants("don't \"quote\" me", "0"),
+            "don't \"quote\" me"
+        );
     }
 }
