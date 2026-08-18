@@ -89,7 +89,7 @@ impl Backend {
         })?;
         let db_path = library_path.join("metadata.db");
 
-        let conn = Connection::open(&db_path)?;
+        let mut conn = Connection::open(&db_path)?;
 
         // Port of `Connection.__init__`'s pragmas.
         conn.execute_batch(
@@ -104,16 +104,13 @@ impl Backend {
             conn.execute_batch(SCHEMA_SQL)?;
         }
 
-        // Port of `schema_upgrades::SchemaUpgrade::upgrade_to_latest` (still a
-        // stub for existing older-schema libraries -- see schema_upgrades.rs).
-        {
-            let mut conn_for_upgrade = Connection::open(&db_path)?;
-            crate::schema_upgrades::SchemaUpgrade::upgrade_to_latest(
-                &mut conn_for_upgrade,
-                &library_path,
-            )
-            .ok();
-        }
+        // Port of `schema_upgrades::SchemaUpgrade::upgrade_to_latest`, for an
+        // *existing* library at an older schema version (a no-op loop for a
+        // library that was just created above, since it's already at the
+        // latest version). Reuses the same `conn` `register_functions` just
+        // set up -- many migration steps call `title_sort`/`uuid4`/etc., so a
+        // second, functions-less connection here would fail on them.
+        crate::schema_upgrades::SchemaUpgrade::upgrade_to_latest(&mut conn, &library_path)?;
 
         // Port of `DB.__init__`'s legacy author-sort trigger fixup, run
         // unconditionally on every open (not just for new libraries).
@@ -337,7 +334,7 @@ impl Backend {
 
 /// Port of `Connection.__init__`'s custom function/collation/aggregate
 /// registration.
-fn register_functions(conn: &Connection) -> SqlResult<()> {
+pub(crate) fn register_functions(conn: &Connection) -> SqlResult<()> {
     conn.create_collation("PYNOCASE", |a: &str, b: &str| -> Ordering {
         a.to_lowercase().cmp(&b.to_lowercase())
     })?;
