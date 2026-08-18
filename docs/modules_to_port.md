@@ -56,30 +56,38 @@
 
 ### db
 
+**See #201**: an audit found most of the `[x]` marks below were false —
+`crates/calibre_db`'s core files are ~1-15% of their real Python
+counterpart's size and, on inspection, silently stub out core behavior
+(schema upgrades, search, sort, cache invalidation) rather than
+implementing it. Corrected here; do not trust the remaining `[x]` marks
+in this section without spot-checking against #201's methodology
+either -- this pass wasn't exhaustive.
+
 - [ ] __init__.py
-- [x] adding.py
+- [ ] adding.py (#201: ~12% of source size)
 - [x] annotations.py
-- [x] backend.py
+- [ ] backend.py (#201: ~5% of source size)
 - [x] backup.py
-- [x] cache.py
-- [x] categories.py
+- [ ] cache.py (#201: ~1% of source size -- the central `Cache` class)
+- [ ] categories.py (#201: ~10% of source size)
 - [x] constants.py
-- [x] copy_to_library.py
+- [ ] copy_to_library.py (#201: duplicate detection stubbed to always report none)
 - [x] covers.py
 - [x] errors.py
-- [x] fields.py
+- [ ] fields.py (#201: ~4% of source size)
 - [x] lazy.py
-- [x] legacy.py
+- [ ] legacy.py (#201: ~3% of source size; `migrate()` always errors, `check_compatibility()` always returns true)
 - [x] listeners.py
 - [x] locking.py
-- [x] restore.py
-- [x] schema_upgrades.py
-- [x] search.py
+- [ ] restore.py (#201: ~41% of source size)
+- [ ] schema_upgrades.py (#201: reads `PRAGMA user_version` and does nothing else -- no migrations exist)
+- [ ] search.py (#201: entire engine is `WHERE lower(title) LIKE '%query%'`; none of the real search syntax exists)
 - [x] sqlite_extension.cpp (semantic port: tokenizer + stemmer; FTS5 registration deferred to #93)
-- [x] tables.py
+- [ ] tables.py (#201: ~14% of source size)
 - [x] utils.py
-- [x] view.py
-- [x] write.py
+- [ ] view.py (#201: `sort()`'s `field` parameter is unused -- always sorts by internal ID)
+- [ ] write.py (#201: ~8% of source size)
 
 #### cli
 
@@ -94,8 +102,8 @@
 - [x] cmd_custom_columns.py
 - [x] cmd_embed_metadata.py
 - [x] cmd_export.py
-- [x] cmd_fits_index.py
-- [x] cmd_fits_search.py
+- [ ] cmd_fits_index.py (#201: `Err(anyhow!("... is a stub"))`)
+- [ ] cmd_fits_search.py (#201: `Err(anyhow!("... is a stub"))`)
 - [x] cmd_list_categories.py
 - [x] cmd_list.py
 - [x] `cmd_remove_custom_column.py` -> `crates/calibre_db/src/cli/cmd_remove_custom_column.rs`
@@ -114,16 +122,16 @@
 #### fts
 
 - [x] __init__.py
-- [x] connect.py
-- [x] pool.py
+- [ ] connect.py (#201: ~48% of source size)
+- [ ] pool.py (#201: no Rust counterpart exists at all -- `fts/mod.rs` only declares `connection`)
 - [x] schema_upgrade.py
 - [x] text.py
 
 #### notes
 
 - [x] __init__.py
-- [x] connect.py
-- [x] exim.py
+- [ ] connect.py (#201: ~23% of source size)
+- [ ] exim.py (#201: "Stubbed implementation for now as we lack full HTML parsing capabilities" -- calibre_ebooks now has HTML parsing (html5ever) if this is revisited)
 - [x] schema_upgrade.py
 
 ### devices
