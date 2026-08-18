@@ -827,16 +827,18 @@
 
 #### unihandecode
 
-- [ ] __init__.py
-- [ ] jacodepoints.py
-- [ ] jadecoder.py
-- [ ] krcodepoints.py
-- [ ] krdecoder.py
-- [ ] unicodepoints.py
-- [ ] unidecoder.py
-- [ ] vncodepoints.py
-- [ ] vndecoder.py
-- [ ] zhcodepoints.py
+- [x] __init__.py
+- [x] jacodepoints.py
+- [x] jadecoder.py (codepoint-table fallback only; upstream's pykakasi-based
+      Japanese analysis pass is not ported -- no Rust equivalent, see
+      `jadecoder.rs`'s docs)
+- [x] krcodepoints.py
+- [x] krdecoder.py
+- [x] unicodepoints.py
+- [x] unidecoder.py
+- [x] vncodepoints.py
+- [x] vndecoder.py
+- [x] zhcodepoints.py
 
 ### gui2
 
