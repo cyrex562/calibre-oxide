@@ -81,7 +81,7 @@ either -- this pass wasn't exhaustive.
 - [x] listeners.py
 - [x] locking.py
 - [ ] restore.py (#201: ~41% of source size)
-- [ ] schema_upgrades.py (#201: reads `PRAGMA user_version` and does nothing else -- no migrations exist)
+- [x] schema_upgrades.py (all 25 migration steps (versions 1-26) ported and verified end-to-end against a hand-derived version-1 starting schema. NOT ported: `upgrade_version_19`'s custom-recipe-to-file export (no recipes/feeds subsystem exists) and `upgrade_version_24`'s FTS reindex trigger (no FTS pipeline exists) -- neither makes schema/data changes, so skipping their bodies doesn't desync later steps. `upgrade_version_10`/`_11`'s field_metadata-driven tag-browser-view creation is ported for the fixed set of built-in categorized fields only, not custom columns (not supported yet). See schema_upgrades.rs's module docs.)
 - [ ] search.py (#201: entire engine is `WHERE lower(title) LIKE '%query%'`; none of the real search syntax exists)
 - [x] sqlite_extension.cpp (semantic port: tokenizer + stemmer; FTS5 registration deferred to #93)
 - [ ] tables.py (#201: ~14% of source size)
