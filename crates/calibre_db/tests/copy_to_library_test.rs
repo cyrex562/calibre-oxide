@@ -9,29 +9,17 @@ fn test_copy_book_basic() {
     let src_dir = tempdir().unwrap();
     let dest_dir = tempdir().unwrap();
 
-    // Setup Src DB
+    // Setup Src DB: `Backend::new` creates the real calibre schema for
+    // a fresh dir -- just seed one row into it.
     let src_cache = {
         let backend = Backend::new(src_dir.path()).unwrap();
         let conn = backend.conn.lock().unwrap();
-        conn.execute(
-            "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, sort TEXT, author_sort TEXT, uuid TEXT, path TEXT, series_index REAL DEFAULT 1.0)", 
-            []
-        ).unwrap();
         conn.execute("INSERT INTO books (title, sort, author_sort, uuid, path) VALUES ('Source Book', 'Source Book', 'Author A', 'uuid-src', 'book_path')", []).unwrap();
         Arc::new(Mutex::new(Cache::new(src_dir.path()).unwrap()))
     };
 
-    // Setup Dest DB
-    let dest_cache = {
-        let backend = Backend::new(dest_dir.path()).unwrap();
-        let conn = backend.conn.lock().unwrap();
-        conn.execute(
-            "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, sort TEXT, author_sort TEXT, uuid TEXT, path TEXT, series_index REAL DEFAULT 1.0)", 
-            []
-        ).unwrap();
-        // Dest is empty
-        Arc::new(Mutex::new(Cache::new(dest_dir.path()).unwrap()))
-    };
+    // Setup Dest DB (empty).
+    let dest_cache = Arc::new(Mutex::new(Cache::new(dest_dir.path()).unwrap()));
 
     // Perform Copy
     let new_id = copy_one_book(&src_cache, &dest_cache, 1, false)

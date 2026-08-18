@@ -9,25 +9,11 @@ use tempfile::tempdir;
 fn test_covers_and_categories() {
     let dir = tempdir().unwrap();
 
-    // Setup DB
+    // Setup DB: `Backend::new` creates the real calibre schema for a
+    // fresh dir -- just seed reference data into it.
     {
         let backend = Backend::new(dir.path()).unwrap();
         let conn = backend.conn.lock().unwrap();
-        // Schema simplified for test
-        conn.execute(
-            "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, sort TEXT, author_sort TEXT, uuid TEXT, path TEXT, series_index REAL DEFAULT 1.0)", 
-            []
-        ).unwrap();
-        conn.execute(
-            "CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT, link TEXT DEFAULT '')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "CREATE TABLE series (id INTEGER PRIMARY KEY, name TEXT, sort TEXT)",
-            [],
-        )
-        .unwrap();
 
         // Insert dummy reference data
         conn.execute(

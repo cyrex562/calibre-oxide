@@ -8,14 +8,11 @@ use tempfile::tempdir;
 fn test_backup_restore_roundtrip() {
     let dir = tempdir().unwrap();
 
-    // Setup DB
+    // Setup DB: `Backend::new` creates the real calibre schema for a
+    // fresh dir -- just seed one row into it.
     {
         let backend = Backend::new(dir.path()).unwrap();
         let conn = backend.conn.lock().unwrap();
-        conn.execute(
-            "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, sort TEXT, author_sort TEXT, uuid TEXT, path TEXT, series_index REAL DEFAULT 1.0)", 
-            []
-        ).unwrap();
         conn.execute("INSERT INTO books (title, author_sort, uuid, path) VALUES ('Original Title', 'Original Author', 'uuid-1', 'BookPath')", []).unwrap();
     }
 
