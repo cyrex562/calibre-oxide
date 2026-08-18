@@ -818,12 +818,12 @@
 
 #### txt
 
-- [ ] __init__.py
-- [ ] markdownml.py
-- [ ] newlines.py
-- [ ] processor.py
-- [ ] textileml.py
-- [ ] txtml.py
+- [x] __init__.py
+- [x] markdownml.py
+- [x] newlines.py
+- [x] processor.py
+- [x] textileml.py
+- [x] txtml.py
 
 #### unihandecode
 

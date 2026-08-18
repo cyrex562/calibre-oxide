@@ -31,5 +31,6 @@ pub mod rtf;
 pub mod rtf2xml;
 pub mod snb;
 pub mod textile;
+pub mod txt;
 pub mod xml_util;
 pub mod zipfile_safe_replace;
