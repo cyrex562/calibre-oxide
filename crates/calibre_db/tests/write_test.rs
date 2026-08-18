@@ -8,14 +8,11 @@ use tempfile::tempdir;
 fn test_write_title_author() {
     let dir = tempdir().unwrap();
 
-    // Setup DB
+    // Setup DB: `Backend::new` creates the real calibre schema for a
+    // fresh dir -- just seed a row into it.
     {
         let backend = Backend::new(dir.path()).unwrap();
         let conn = backend.conn.lock().unwrap();
-        conn.execute(
-            "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, sort TEXT, author_sort TEXT, uuid TEXT, series_index REAL DEFAULT 1.0)", 
-            []
-        ).unwrap();
         conn.execute(
             "INSERT INTO books (id, title, sort, author_sort, uuid) VALUES 
             (1, 'Old Title', 'Old Title', 'Old Author', 'u1')",

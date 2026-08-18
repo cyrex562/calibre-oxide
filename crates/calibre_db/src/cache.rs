@@ -8,22 +8,12 @@ pub struct Cache {
 
 impl Cache {
     pub fn new<P: AsRef<Path>>(library_path: P) -> Result<Self> {
-        let mut backend = Backend::new(library_path)?;
-        // In a real scenario, we might want to lazy load prefs or load them here
-        backend.load_prefs().unwrap_or_else(|e| {
-            eprintln!("Failed to load prefs: {}", e);
-        });
-
+        let backend = Backend::new(library_path)?;
         Ok(Cache { backend })
     }
 
     pub fn library_id(&self) -> String {
-        // This is typically stored in prefs or generated
-        self.backend
-            .prefs
-            .get("library_id")
-            .cloned()
-            .unwrap_or_default()
+        self.backend.library_id().unwrap_or_default()
     }
     pub fn field_for(&self, book_id: i32, field_name: &str) -> Result<Option<String>> {
         self.backend.field_for(book_id, field_name)

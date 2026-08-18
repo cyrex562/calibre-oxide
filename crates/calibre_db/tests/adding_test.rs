@@ -1,5 +1,4 @@
 use calibre_db::adding;
-use calibre_db::backend::Backend;
 use calibre_db::cache::Cache;
 use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
@@ -8,17 +7,8 @@ use tempfile::tempdir;
 fn test_add_book() {
     let dir = tempdir().unwrap();
 
-    // Setup DB
-    {
-        let backend = Backend::new(dir.path()).unwrap();
-        let conn = backend.conn.lock().unwrap();
-        // Schema simplified for test, but ensure fields match insert_book
-        conn.execute(
-            "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, sort TEXT, author_sort TEXT, uuid TEXT, series_index REAL DEFAULT 1.0)", 
-            []
-        ).unwrap();
-    }
-
+    // `Cache::new` opens (and, for a fresh dir, creates) the real
+    // calibre schema via `Backend::new` -- no need to hand-roll one.
     let cache = Arc::new(Mutex::new(Cache::new(dir.path()).unwrap()));
 
     let authors = vec!["Author One".to_string(), "Author Two".to_string()];

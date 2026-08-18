@@ -8,14 +8,11 @@ use tempfile::tempdir;
 fn test_view_search_and_sort() {
     let dir = tempdir().unwrap();
 
-    // Setup DB
+    // Setup DB: `Backend::new` creates the real calibre schema for a
+    // fresh dir -- just seed rows into it.
     {
         let backend = Backend::new(dir.path()).unwrap();
         let conn = backend.conn.lock().unwrap();
-        conn.execute(
-            "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, sort TEXT, author_sort TEXT, uuid TEXT)", 
-            []
-        ).unwrap();
         conn.execute(
             "INSERT INTO books (id, title, sort, author_sort, uuid) VALUES 
             (1, 'The Rust Book', 'Rust Book, The', 'Klabnik, Steve', 'u1'),

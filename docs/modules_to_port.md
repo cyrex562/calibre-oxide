@@ -67,7 +67,7 @@ either -- this pass wasn't exhaustive.
 - [ ] __init__.py
 - [ ] adding.py (#201: ~12% of source size)
 - [x] annotations.py
-- [ ] backend.py (#201: ~5% of source size)
+- [x] backend.py (#203: real connection setup, custom SQL functions/collations/aggregates, brand-new-library schema creation via the bundled DDL, author-sort trigger fixup, `library_id`, and JSON-typed `preferences` get/set/delete -- all verified against upstream. NOT ported: default-pref population/migration, dynamic custom-column tables, the in-memory field/table model, notes/FTS bootstrap, trash dir, file/cover storage, library move/backup. See #204 for the field/table model, cache.py's territory.)
 - [x] backup.py
 - [ ] cache.py (#201: ~1% of source size -- the central `Cache` class)
 - [ ] categories.py (#201: ~10% of source size)
