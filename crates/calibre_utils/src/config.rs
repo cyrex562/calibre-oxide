@@ -8,6 +8,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock; // Use std::sync::RwLock instead of parking_lot for now to avoid adding dep if not needed, or add parking_lot if preferred. adhering to std is safer for now.
 
+fn default_series_index_auto_increment() -> String {
+    "next".to_string()
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct GlobalPrefs {
     pub database_path: String,
@@ -35,6 +39,17 @@ pub struct GlobalPrefs {
     pub case_sensitive: bool,
     pub numeric_collation: bool,
     pub migrated: bool,
+    /// Port of the `series_index_auto_increment` *tweak* (a separate,
+    /// lower-level config system from `prefs` upstream -- this crate
+    /// doesn't distinguish the two, so it lives here). One of `"next"`
+    /// (default)/`"first_free"`/`"next_free"`/`"last_free"`, or a
+    /// fixed number as a string (e.g. `"1"`); see
+    /// [`crate::series::get_next_series_num_for_list`].
+    /// `#[serde(default)]` so an existing saved config file (from
+    /// before this field existed) still loads instead of falling all
+    /// the way back to `GlobalPrefs::default()` for every field.
+    #[serde(default = "default_series_index_auto_increment")]
+    pub series_index_auto_increment: String,
 }
 
 impl Default for GlobalPrefs {
@@ -77,6 +92,7 @@ impl Default for GlobalPrefs {
             case_sensitive: false,
             numeric_collation: false,
             migrated: false,
+            series_index_auto_increment: "next".to_string(),
         }
     }
 }
