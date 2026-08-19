@@ -50,14 +50,24 @@
 //! # Not ported
 //!
 //! Everything else: `set_field`/writes beyond what `write.rs` already
-//! has, custom columns, notes, FTS, composite fields, virtual
-//! libraries, saved searches, categories, trash, cover/format storage
-//! beyond what `covers.rs`/`add_format` already do, dump/restore,
-//! `move_library_to`. Each is its own follow-up.
+//! has, notes, FTS, composite fields, virtual libraries, saved
+//! searches, categories, trash, dump/restore, `move_library_to`. Each
+//! is its own follow-up.
+//!
+//! Two later, separately-issued follow-ups also live in this file now:
+//! real custom-column support (issue #214) and real filesystem book/
+//! format/cover/rename/clone management (issue #216) -- both moved
+//! here from `library.rs`'s original duplicate implementations once
+//! #212 unified `Library`/`Backend` onto the same real schema and
+//! connection. See their own doc comments below for what's faithfully
+//! ported vs. disclosed simplification in each.
 
 use crate::backend::Backend;
+use calibre_ebooks::metadata::MetaInformation;
+use calibre_utils::filenames::sanitize_file_name;
 use rusqlite::{OptionalExtension, Result};
 use std::collections::HashMap;
+use std::fs;
 use std::path::Path;
 
 pub struct Cache {
@@ -250,6 +260,327 @@ impl Cache {
     pub fn update_memory(&mut self, _book_id: i32, _field: &str, _value: &str) {
         // Placeholder for future in-memory cache invalidation.
         // Currently, field_for hits the DB directly so no cache to clear.
+    }
+
+    /// Real filesystem book/format/cover management (issue #214
+    /// follow-up), moved here from `library.rs`'s previously
+    /// Cache-side-only duplicate of the same logic -- `Library`'s
+    /// equivalents now delegate to these instead of hand-rolling their
+    /// own file operations. Folder-per-book layout matches upstream:
+    /// `<library>/<sanitized author>/<sanitized title>/`. Fixed two
+    /// real gaps while porting (both present in `Library`'s original,
+    /// never-faithful-to-upstream version too): `add_format` never
+    /// inserted a row into the `data` table, so `data`-driven reads
+    /// (`field_for(id, "formats"/"size")`, `Library::format_files`)
+    /// never saw a book's real formats; `add_book_db_entry` used to set
+    /// `uuid` via the `INSERT` itself, but the real schema's
+    /// `books_insert_trg` unconditionally overwrites `uuid`/`sort` on
+    /// every insert (matching real calibre) -- fixed the same way #212
+    /// fixed it in `library.rs`: an explicit `UPDATE` after insert.
+    pub fn add_book(&self, source_path: &Path, metadata: &MetaInformation) -> anyhow::Result<i32> {
+        let author_name = metadata
+            .authors
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("Unknown");
+        let author_folder = sanitize_file_name(author_name);
+        let title_folder = sanitize_file_name(&metadata.title);
+        let rel_path = Path::new(&author_folder).join(&title_folder);
+        let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
+
+        let book_id = self.add_book_db_entry(metadata, &rel_path_str)?;
+
+        // Delegate the actual file copy to `add_format` (same naming
+        // scheme, same `data` table row) rather than duplicating it --
+        // the initial format a book is added with is still just a
+        // format, and needs the same `data` row every other one gets
+        // for `field_for(id, "formats"/"size")` to see it.
+        let ext = source_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default();
+        self.add_format(book_id, source_path, ext, true)?;
+
+        Ok(book_id)
+    }
+
+    /// Adds a book entry to the database without copying files (used
+    /// by `restore.rs`'s OPF-driven restore). See this section's docs
+    /// for the `uuid`-preservation fix.
+    pub fn add_book_db_entry(
+        &self,
+        metadata: &MetaInformation,
+        rel_path: &str,
+    ) -> anyhow::Result<i32> {
+        let mut conn = self.backend.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        let author_name = metadata
+            .authors
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("Unknown");
+
+        tx.execute(
+            "INSERT INTO books (title, author_sort, path, has_cover, timestamp, pubdate, series_index)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)",
+            (
+                &metadata.title,
+                author_name,
+                rel_path,
+                metadata.timestamp.unwrap_or_else(chrono::Utc::now).to_rfc3339(),
+                metadata.pubdate.unwrap_or_else(chrono::Utc::now).to_rfc3339(),
+                metadata.series_index,
+            ),
+        )?;
+        let book_id = tx.last_insert_rowid() as i32;
+
+        if let Some(uuid) = metadata.uuid.as_deref() {
+            tx.execute("UPDATE books SET uuid = ?1 WHERE id = ?2", (uuid, book_id))?;
+        }
+
+        let author_id: i32 = {
+            let mut stmt = tx.prepare("SELECT id FROM authors WHERE name = ?1")?;
+            let mut rows = stmt.query([author_name])?;
+            if let Some(row) = rows.next()? {
+                row.get(0)?
+            } else {
+                tx.execute("INSERT INTO authors (name) VALUES (?1)", [author_name])?;
+                tx.last_insert_rowid() as i32
+            }
+        };
+
+        tx.execute(
+            "INSERT INTO books_authors_link (book, author) VALUES (?1, ?2)",
+            (book_id, author_id),
+        )?;
+
+        tx.commit()?;
+        Ok(book_id)
+    }
+
+    /// Copies `source_path` into the book's folder as `<title>.<fmt>`
+    /// and records it in the `data` table (`UNIQUE(book, format)`, so
+    /// re-adding the same format with `replace=true` overwrites the
+    /// row). Returns `Ok(false)` without copying if the destination
+    /// already exists and `replace` is false.
+    pub fn add_format(
+        &self,
+        book_id: i32,
+        source_path: &Path,
+        format: &str,
+        replace: bool,
+    ) -> anyhow::Result<bool> {
+        let path_rel = self
+            .field_for(book_id, "path")?
+            .ok_or_else(|| anyhow::anyhow!("Book {book_id} not found"))?;
+        if path_rel.is_empty() {
+            anyhow::bail!("Book has no path");
+        }
+        let title = self.field_for(book_id, "title")?.unwrap_or_default();
+
+        let book_dir = self.backend.library_path.join(&path_rel);
+        if !book_dir.exists() {
+            fs::create_dir_all(&book_dir)?;
+        }
+
+        let file_name = format!("{}.{}", sanitize_file_name(&title), format.to_lowercase());
+        let dest_path = book_dir.join(&file_name);
+        if dest_path.exists() && !replace {
+            return Ok(false);
+        }
+
+        fs::copy(source_path, &dest_path)?;
+        let size = fs::metadata(&dest_path)?.len() as i64;
+
+        let conn = self.backend.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE books SET timestamp = datetime('now') WHERE id = ?1",
+            (book_id,),
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO data (book, format, uncompressed_size, name) VALUES (?1, ?2, ?3, ?4)",
+            (book_id, format.to_uppercase(), size, sanitize_file_name(&title)),
+        )?;
+
+        Ok(true)
+    }
+
+    /// Removes the first on-disk file matching `fmt`'s extension from
+    /// the book's folder and its `data` table row, if any.
+    pub fn remove_format(&self, book_id: i32, fmt: &str) -> anyhow::Result<()> {
+        let path_rel = match self.field_for(book_id, "path")? {
+            Some(p) if !p.is_empty() => p,
+            _ => return Ok(()),
+        };
+        let book_dir = self.backend.library_path.join(&path_rel);
+        let target_ext = fmt.to_lowercase();
+
+        if let Ok(entries) = fs::read_dir(&book_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                        if ext.to_lowercase() == target_ext {
+                            fs::remove_file(&path)?;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let conn = self.backend.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM data WHERE book = ?1 AND format = ?2",
+            (book_id, fmt.to_uppercase()),
+        )?;
+        Ok(())
+    }
+
+    /// Deletes a book's row (the real schema's `books_delete_trg`
+    /// cascades cleanup of every link/data/comments/identifiers row
+    /// for it) and its on-disk folder.
+    pub fn delete_book(&self, book_id: i32) -> anyhow::Result<()> {
+        let path_rel = self.field_for(book_id, "path")?;
+        {
+            let conn = self.backend.conn.lock().unwrap();
+            conn.execute("DELETE FROM books WHERE id = ?1", (book_id,))?;
+        }
+        if let Some(rel_path) = path_rel {
+            if !rel_path.is_empty() {
+                let dir_path = self.backend.library_path.join(rel_path);
+                if dir_path.exists() {
+                    // A failed cleanup shouldn't undo the already-committed
+                    // DB delete; warn and move on, same as the original
+                    // `library.rs` behavior this replaces.
+                    if let Err(e) = fs::remove_dir_all(&dir_path) {
+                        eprintln!("Warning: failed to delete directory {dir_path:?}: {e}");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Moves a book's folder to match a new title/author and renames
+    /// its non-special files (`cover.jpg`/`metadata.opf` are left
+    /// alone) to match the new title, then updates the `path` column.
+    /// A no-op if the book has no path yet, or the computed new folder
+    /// is identical to the old one.
+    fn rename_book_files(
+        &self,
+        book_id: i32,
+        new_title: &str,
+        new_author: &str,
+    ) -> anyhow::Result<()> {
+        let old_rel_path = self.field_for(book_id, "path")?.unwrap_or_default();
+        if old_rel_path.is_empty() {
+            return Ok(());
+        }
+        let library_path = &self.backend.library_path;
+        let old_full_dir = library_path.join(&old_rel_path);
+        if !old_full_dir.exists() {
+            return Ok(());
+        }
+
+        let new_author_folder = sanitize_file_name(new_author);
+        let new_title_folder = sanitize_file_name(new_title);
+        let new_rel_path = Path::new(&new_author_folder).join(&new_title_folder);
+        let new_full_dir = library_path.join(&new_rel_path);
+
+        if old_full_dir == new_full_dir {
+            return Ok(());
+        }
+
+        let new_author_full_path = library_path.join(&new_author_folder);
+        if !new_author_full_path.exists() {
+            fs::create_dir_all(&new_author_full_path)?;
+        }
+
+        fs::rename(&old_full_dir, &new_full_dir)?;
+
+        for entry in fs::read_dir(&new_full_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                    if file_name == "cover.jpg" || file_name == "metadata.opf" {
+                        continue;
+                    }
+                    if let Some(extension) = path.extension().and_then(|e| e.to_str()) {
+                        let new_file_name =
+                            format!("{}.{}", sanitize_file_name(new_title), extension);
+                        let new_file_path = new_full_dir.join(new_file_name);
+                        if path != new_file_path {
+                            let _ = fs::rename(path, new_file_path);
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(parent) = old_full_dir.parent() {
+            if parent.exists() && fs::read_dir(parent)?.next().is_none() {
+                let _ = fs::remove_dir(parent);
+            }
+        }
+
+        let new_rel_path_str = new_rel_path.to_string_lossy().replace('\\', "/");
+        let conn = self.backend.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE books SET path = ?1 WHERE id = ?2",
+            (&new_rel_path_str, book_id),
+        )?;
+        Ok(())
+    }
+
+    /// Renames the book's folder/files (via [`Cache::rename_book_files`])
+    /// then updates `title`/`author_sort` and the `authors`/
+    /// `books_authors_link` rows to match.
+    pub fn update_book_metadata(
+        &self,
+        book_id: i32,
+        title: &str,
+        author: &str,
+    ) -> anyhow::Result<()> {
+        self.rename_book_files(book_id, title, author)?;
+
+        let mut conn = self.backend.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        tx.execute(
+            "UPDATE books SET title = ?1, author_sort = ?2 WHERE id = ?3",
+            (title, author, book_id),
+        )?;
+        tx.execute("DELETE FROM books_authors_link WHERE book = ?1", (book_id,))?;
+
+        let author_id: i32 = {
+            let mut stmt = tx.prepare("SELECT id FROM authors WHERE name = ?1")?;
+            let mut rows = stmt.query([author])?;
+            if let Some(row) = rows.next()? {
+                row.get(0)?
+            } else {
+                tx.execute("INSERT INTO authors (name) VALUES (?1)", [author])?;
+                tx.last_insert_rowid() as i32
+            }
+        };
+        tx.execute(
+            "INSERT INTO books_authors_link (book, author) VALUES (?1, ?2)",
+            (book_id, author_id),
+        )?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Recursively copies the entire library directory to `dest`.
+    pub fn clone_to(&self, dest: &Path) -> anyhow::Result<()> {
+        if !dest.exists() {
+            fs::create_dir_all(dest)?;
+        }
+        copy_dir_recursive(&self.backend.library_path, dest)?;
+        Ok(())
     }
 
     /// Real custom-column support (issue #212 follow-up), moved here
@@ -493,6 +824,23 @@ fn join_many_to_many(
     } else {
         Ok(Some(values.join(sep)))
     }
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if !dst.exists() {
+        fs::create_dir_all(dst)?;
+    }
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let path = entry.path();
+        let dest_path = dst.join(entry.file_name());
+        if path.is_dir() {
+            copy_dir_recursive(&path, &dest_path)?;
+        } else {
+            fs::copy(&path, &dest_path)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -815,5 +1163,165 @@ mod tests {
         assert_eq!(entry["name"], "My Column");
         assert_eq!(entry["datatype"], "int");
         assert_eq!(entry["is_multiple"], true);
+    }
+
+    // --- filesystem book/format/cover management ---
+
+    fn write_temp_file(dir: &Path, name: &str, content: &[u8]) -> std::path::PathBuf {
+        let p = dir.join(name);
+        fs::write(&p, content).unwrap();
+        p
+    }
+
+    #[test]
+    fn add_book_creates_the_author_title_folder_and_copies_the_file() {
+        let (dir, cache) = open_test_cache();
+        let source = write_temp_file(dir.path(), "src.epub", b"epub bytes");
+
+        let mut meta = MetaInformation::default();
+        meta.title = "My Title".to_string();
+        meta.authors = vec!["My Author".to_string()];
+
+        let book_id = cache.add_book(&source, &meta).unwrap();
+
+        assert_eq!(
+            cache.field_for(book_id, "path").unwrap(),
+            Some("My Author/My Title".to_string())
+        );
+        let dest = dir.path().join("My Author/My Title/My Title.epub");
+        assert_eq!(fs::read(dest).unwrap(), b"epub bytes");
+    }
+
+    #[test]
+    fn add_book_db_entry_preserves_a_caller_supplied_uuid_past_the_insert_trigger() {
+        let (_dir, cache) = open_test_cache();
+        let mut meta = MetaInformation::default();
+        meta.title = "T".to_string();
+        meta.authors = vec!["A".to_string()];
+        meta.uuid = Some("caller-uuid-123".to_string());
+
+        let book_id = cache.add_book_db_entry(&meta, "A/T").unwrap();
+
+        assert_eq!(
+            cache.field_for(book_id, "uuid").unwrap(),
+            Some("caller-uuid-123".to_string())
+        );
+    }
+
+    #[test]
+    fn add_format_records_the_format_in_the_data_table() {
+        let (dir, cache) = open_test_cache();
+        let source = write_temp_file(dir.path(), "src.epub", b"epub bytes");
+        let mut meta = MetaInformation::default();
+        meta.title = "T".to_string();
+        meta.authors = vec!["A".to_string()];
+        let book_id = cache.add_book(&source, &meta).unwrap();
+
+        cache.add_format(book_id, &source, "epub", true).unwrap();
+
+        // This is the real bug fix: `formats`/`size` read from the
+        // `data` table via `field_for`, which `add_format` never
+        // populated before this pass.
+        assert_eq!(
+            cache.field_for(book_id, "formats").unwrap(),
+            Some("EPUB".to_string())
+        );
+        assert_eq!(
+            cache.field_for(book_id, "size").unwrap(),
+            Some(b"epub bytes".len().to_string())
+        );
+    }
+
+    #[test]
+    fn add_format_does_not_replace_an_existing_file_when_replace_is_false() {
+        let (dir, cache) = open_test_cache();
+        // `add_book` itself already adds the source file as its first
+        // format (via `add_format(..., replace=true)` internally).
+        let source = write_temp_file(dir.path(), "src.epub", b"first");
+        let mut meta = MetaInformation::default();
+        meta.title = "T".to_string();
+        meta.authors = vec!["A".to_string()];
+        let book_id = cache.add_book(&source, &meta).unwrap();
+
+        let source2 = write_temp_file(dir.path(), "src2.epub", b"second");
+        assert!(!cache.add_format(book_id, &source2, "epub", false).unwrap());
+
+        let dest = dir.path().join("A/T/T.epub");
+        assert_eq!(fs::read(&dest).unwrap(), b"first");
+
+        assert!(cache.add_format(book_id, &source2, "epub", true).unwrap());
+        assert_eq!(fs::read(&dest).unwrap(), b"second");
+    }
+
+    #[test]
+    fn remove_format_deletes_the_file_and_its_data_row() {
+        let (dir, cache) = open_test_cache();
+        let source = write_temp_file(dir.path(), "src.epub", b"epub bytes");
+        let mut meta = MetaInformation::default();
+        meta.title = "T".to_string();
+        meta.authors = vec!["A".to_string()];
+        let book_id = cache.add_book(&source, &meta).unwrap();
+        cache.add_format(book_id, &source, "epub", true).unwrap();
+
+        cache.remove_format(book_id, "epub").unwrap();
+
+        assert!(!dir.path().join("A/T/T.epub").exists());
+        assert_eq!(cache.field_for(book_id, "formats").unwrap(), None);
+    }
+
+    #[test]
+    fn delete_book_removes_the_row_and_the_folder() {
+        let (dir, cache) = open_test_cache();
+        let source = write_temp_file(dir.path(), "src.epub", b"x");
+        let mut meta = MetaInformation::default();
+        meta.title = "T".to_string();
+        meta.authors = vec!["A".to_string()];
+        let book_id = cache.add_book(&source, &meta).unwrap();
+        assert!(dir.path().join("A/T").exists());
+
+        cache.delete_book(book_id).unwrap();
+
+        assert_eq!(cache.field_for(book_id, "title").unwrap(), None);
+        assert!(!dir.path().join("A/T").exists());
+    }
+
+    #[test]
+    fn update_book_metadata_renames_the_folder_and_updates_the_author_link() {
+        let (dir, cache) = open_test_cache();
+        let source = write_temp_file(dir.path(), "src.epub", b"x");
+        let mut meta = MetaInformation::default();
+        meta.title = "Old Title".to_string();
+        meta.authors = vec!["Old Author".to_string()];
+        let book_id = cache.add_book(&source, &meta).unwrap();
+
+        cache
+            .update_book_metadata(book_id, "New Title", "New Author")
+            .unwrap();
+
+        assert_eq!(
+            cache.field_for(book_id, "title").unwrap(),
+            Some("New Title".to_string())
+        );
+        assert_eq!(
+            cache.field_for(book_id, "authors").unwrap(),
+            Some("New Author".to_string())
+        );
+        assert!(dir.path().join("New Author/New Title").exists());
+        assert!(!dir.path().join("Old Author").exists());
+    }
+
+    #[test]
+    fn clone_to_recursively_copies_the_library_directory() {
+        let (dir, cache) = open_test_cache();
+        let source = write_temp_file(dir.path(), "src.epub", b"x");
+        let mut meta = MetaInformation::default();
+        meta.title = "T".to_string();
+        meta.authors = vec!["A".to_string()];
+        cache.add_book(&source, &meta).unwrap();
+
+        let dest_dir = tempdir().unwrap();
+        cache.clone_to(dest_dir.path()).unwrap();
+
+        assert!(dest_dir.path().join("A/T/T.epub").exists());
     }
 }

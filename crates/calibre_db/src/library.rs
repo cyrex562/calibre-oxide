@@ -247,96 +247,21 @@ impl Library {
         source_path: &Path,
         metadata: &MetaInformation,
     ) -> Result<i32, LibraryError> {
-        // Simple sanitization for folder name
-        let author_name = metadata
-            .authors
-            .first()
-            .map(|s| s.as_str())
-            .unwrap_or("Unknown");
-        let author_folder = sanitize_filename(author_name);
-        let title_folder = sanitize_filename(&metadata.title);
-        let rel_path = Path::new(&author_folder).join(&title_folder);
-        // "Author/Title"
-        let rel_path_str = rel_path.to_string_lossy().replace("\\", "/");
-
-        let book_id = self.add_book_db_entry(metadata, &rel_path_str)?;
-
-        let dest_dir = self.path.join(&rel_path);
-        fs::create_dir_all(&dest_dir)?;
-
-        let ext = source_path.extension().unwrap_or_default();
-        let dest_file = dest_dir
-            .join(sanitize_filename(&metadata.title))
-            .with_extension(ext);
-
-        fs::copy(source_path, dest_file)?;
-
-        Ok(book_id)
+        self.as_cache()
+            .add_book(source_path, metadata)
+            .map_err(|e| LibraryError::Transaction(e.to_string()))
     }
 
-    /// adds a book entry to the database without copying files.
-    /// used for restore_database.
-    ///
-    /// `books_insert_trg` (real schema) unconditionally overwrites
-    /// `sort`/`uuid` right after the `INSERT` fires, so a caller-
-    /// supplied `metadata.uuid` (e.g. from an OPF backup being
-    /// restored) is restored via an explicit `UPDATE` afterward --
-    /// same pattern real calibre's own restore path uses. A book with
-    /// no supplied uuid just keeps the trigger's freshly generated one.
+    /// Adds a book entry to the database without copying files (used
+    /// by `restore_database`).
     pub fn add_book_db_entry(
         &mut self,
         metadata: &MetaInformation,
         rel_path: &str,
     ) -> Result<i32, LibraryError> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-
-        // 1. Author Logic
-        let author_name = metadata
-            .authors
-            .first()
-            .map(|s| s.as_str())
-            .unwrap_or("Unknown");
-
-        // 2. Insert Book
-        tx.execute(
-            "INSERT INTO books (title, author_sort, path, has_cover, timestamp, pubdate, series_index)
-             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)",
-            (
-                &metadata.title,
-                author_name,
-                rel_path,
-                metadata.timestamp.unwrap_or(chrono::Utc::now()).to_rfc3339(),
-                metadata.pubdate.unwrap_or(chrono::Utc::now()).to_rfc3339(),
-                metadata.series_index,
-            ),
-        )?;
-        let book_id = tx.last_insert_rowid() as i32;
-
-        if let Some(uuid) = metadata.uuid.as_deref() {
-            tx.execute("UPDATE books SET uuid = ?1 WHERE id = ?2", (uuid, book_id))?;
-        }
-
-        // 3. Insert/Get Author
-        let author_id: i32 = {
-            let mut stmt = tx.prepare("SELECT id FROM authors WHERE name = ?1")?;
-            let mut rows = stmt.query([author_name])?;
-            if let Some(row) = rows.next()? {
-                row.get(0)?
-            } else {
-                tx.execute("INSERT INTO authors (name) VALUES (?1)", [author_name])?;
-                tx.last_insert_rowid() as i32
-            }
-        };
-
-        // 4. Link
-        tx.execute(
-            "INSERT INTO books_authors_link (book, author) VALUES (?1, ?2)",
-            (book_id, author_id),
-        )?;
-
-        tx.commit()?;
-        Ok(book_id)
+        self.as_cache()
+            .add_book_db_entry(metadata, rel_path)
+            .map_err(|e| LibraryError::Transaction(e.to_string()))
     }
 
     pub fn update_book_metadata(
@@ -345,45 +270,9 @@ impl Library {
         title: &str,
         author: &str,
     ) -> Result<(), LibraryError> {
-        // Warning: Transaction safety with file ops is hard.
-        // Ideally we do file ops after commit, or rollback file ops if DB fails.
-        // For this simple implementation, we try file ops first, then commit.
-        // If file ops fail, we abort.
-        self.rename_book_files(book_id, title, author)
-            .map_err(LibraryError::Io)?;
-
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-
-        // 1. Update Title in Books
-        // Note: rename_book_files already updated the path column if it
-        // succeeded; this still needs to update title/author_sort.
-        tx.execute(
-            "UPDATE books SET title = ?1, author_sort = ?2 WHERE id = ?3",
-            (title, author, book_id),
-        )?;
-
-        // 2. Update Author
-        tx.execute("DELETE FROM books_authors_link WHERE book = ?1", (book_id,))?;
-
-        let author_id: i32 = {
-            let mut stmt = tx.prepare("SELECT id FROM authors WHERE name = ?1")?;
-            let mut rows = stmt.query([author])?;
-            if let Some(row) = rows.next()? {
-                row.get(0)?
-            } else {
-                tx.execute("INSERT INTO authors (name) VALUES (?1)", [author])?;
-                tx.last_insert_rowid() as i32
-            }
-        };
-
-        tx.execute(
-            "INSERT INTO books_authors_link (book, author) VALUES (?1, ?2)",
-            (book_id, author_id),
-        )?;
-
-        tx.commit()?;
-        Ok(())
+        self.as_cache()
+            .update_book_metadata(book_id, title, author)
+            .map_err(|e| LibraryError::Transaction(e.to_string()))
     }
 
     pub fn add_format(
@@ -393,132 +282,9 @@ impl Library {
         format: &str,
         replace: bool,
     ) -> Result<bool, LibraryError> {
-        let book_opt = self.get_book(book_id)?;
-        if let Some(book) = book_opt {
-            let book_rel_path = book.path;
-            if book_rel_path.is_empty() {
-                return Err(LibraryError::Transaction("Book has no path".to_string()));
-            }
-
-            let book_dir = self.path.join(&book_rel_path);
-            if !book_dir.exists() {
-                std::fs::create_dir_all(&book_dir)?;
-            }
-
-            // Construct destination filename: Title.EXT
-            // For safety, we should probably stick to the title in the DB, sanitized.
-            // But usually Calibre uses the filename of the book record (which matches title usually).
-            let file_name = format!(
-                "{}.{}",
-                sanitize_filename(&book.title),
-                format.to_lowercase()
-            );
-            let dest_path = book_dir.join(&file_name);
-
-            if dest_path.exists() && !replace {
-                return Ok(false);
-            }
-
-            std::fs::copy(source_path, dest_path)?;
-
-            // Update timestamp of the book
-            self.conn().execute(
-                "UPDATE books SET timestamp = datetime('now') WHERE id = ?1",
-                (book_id,),
-            )?;
-
-            Ok(true)
-        } else {
-            Err(LibraryError::Transaction(format!(
-                "Book {} not found",
-                book_id
-            )))
-        }
-    }
-
-    fn rename_book_files(
-        &mut self,
-        book_id: i32,
-        new_title: &str,
-        new_author: &str,
-    ) -> std::io::Result<()> {
-        // Query old path
-        let old_rel_path: String = self
-            .conn()
-            .query_row("SELECT path FROM books WHERE id = ?1", [book_id], |row| {
-                row.get(0)
-            })
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-
-        if old_rel_path.is_empty() {
-            return Ok(()); // Nothing to rename
-        }
-
-        let old_full_dir = self.path.join(&old_rel_path);
-        if !old_full_dir.exists() {
-            return Ok(()); // Directory missing, can't rename
-        }
-
-        let new_author_folder = sanitize_filename(new_author);
-        let new_title_folder = sanitize_filename(new_title);
-        let new_rel_path = Path::new(&new_author_folder).join(&new_title_folder);
-        let new_full_dir = self.path.join(&new_rel_path);
-
-        if old_full_dir == new_full_dir {
-            return Ok(());
-        }
-
-        // Create new parent dir (Author) if needed
-        let new_author_full_path = self.path.join(&new_author_folder);
-        if !new_author_full_path.exists() {
-            fs::create_dir_all(&new_author_full_path)?;
-        }
-
-        // Move the book directory
-        fs::rename(&old_full_dir, &new_full_dir)?;
-
-        // Rename files inside
-        for entry in fs::read_dir(&new_full_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_file() {
-                if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                    // preserve special files
-                    if file_name == "cover.jpg" || file_name == "metadata.opf" {
-                        continue;
-                    }
-
-                    if let Some(extension) = path.extension().and_then(|e| e.to_str()) {
-                        // Simple heuristic: rename all other files to match new title
-                        // This aligns with Calibre's behavior for the main book files
-                        let new_file_name =
-                            format!("{}.{}", sanitize_filename(new_title), extension);
-                        let new_file_path = new_full_dir.join(new_file_name);
-                        if path != new_file_path {
-                            let _ = fs::rename(path, new_file_path);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Cleanup old author dir if empty
-        if let Some(parent) = old_full_dir.parent() {
-            if parent.exists() && fs::read_dir(parent)?.next().is_none() {
-                let _ = fs::remove_dir(parent); // Ignore error if not empty
-            }
-        }
-
-        // Update DB with NEW path
-        let new_rel_path_str = new_rel_path.to_string_lossy().replace("\\", "/");
-        self.conn()
-            .execute(
-                "UPDATE books SET path = ?1 WHERE id = ?2",
-                (&new_rel_path_str, book_id),
-            )
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-
-        Ok(())
+        self.as_cache()
+            .add_format(book_id, source_path, format, replace)
+            .map_err(|e| LibraryError::Transaction(e.to_string()))
     }
 
     pub fn update_book_cover(
@@ -526,63 +292,16 @@ impl Library {
         book_id: i32,
         new_cover_path: &Path,
     ) -> Result<(), LibraryError> {
-        let path_query: Option<String> = self
-            .conn()
-            .query_row("SELECT path FROM books WHERE id = ?1", (book_id,), |row| {
-                row.get(0)
-            })
-            .ok();
-
-        if let Some(rel_path) = path_query {
-            if !rel_path.is_empty() {
-                let dir_path = self.path.join(rel_path);
-                if dir_path.exists() {
-                    let dest_path = dir_path.join("cover.jpg");
-                    fs::copy(new_cover_path, dest_path)?;
-
-                    // Update DB
-                    self.conn()
-                        .execute("UPDATE books SET has_cover = 1 WHERE id = ?1", (book_id,))?;
-                }
-            }
-        }
-        Ok(())
+        let data = fs::read(new_cover_path)?;
+        let cache = Arc::new(Mutex::new(self.as_cache()));
+        crate::covers::set_cover(&cache, book_id, &data)
+            .map_err(|e| LibraryError::Transaction(e.to_string()))
     }
 
     pub fn delete_book(&mut self, book_id: i32) -> Result<(), LibraryError> {
-        // Get path before deleting to remove files
-        let path_query: Option<String> = self
-            .conn()
-            .query_row("SELECT path FROM books WHERE id = ?1", (book_id,), |row| {
-                row.get(0)
-            })
-            .ok();
-
-        {
-            let mut conn = self.conn();
-            let tx = conn.transaction()?;
-            tx.execute("DELETE FROM books WHERE id = ?1", (book_id,))?;
-            // Note: the real schema's `books_delete_trg` already cascades
-            // this cleanup (books_authors_link and more); left explicit
-            // here too since it's harmless (no-op on an already-empty set).
-            tx.execute("DELETE FROM books_authors_link WHERE book = ?1", (book_id,))?;
-            tx.commit()?;
-        }
-
-        // File Cleanup
-        if let Some(rel_path) = path_query {
-            if !rel_path.is_empty() {
-                let dir_path = self.path.join(rel_path);
-                if dir_path.exists() {
-                    // Try to remove the directory (and contents)
-                    if let Err(e) = fs::remove_dir_all(&dir_path) {
-                        eprintln!("Warning: Failed to delete directory {:?}: {}", dir_path, e);
-                    }
-                }
-            }
-        }
-
-        Ok(())
+        self.as_cache()
+            .delete_book(book_id)
+            .map_err(|e| LibraryError::Transaction(e.to_string()))
     }
 
     /// Shares this `Library`'s own live connection with a fresh
@@ -655,34 +374,16 @@ impl Library {
 
     pub fn backup_metadata_to_opf(&self, book_id: i32) -> Result<(), LibraryError> {
         let book_opt = self.get_book(book_id)?;
-        if let Some(book) = book_opt {
-            let book_rel_path = book.path;
-            if book_rel_path.is_empty() {
-                // Should we error or skip? Python skips invisible books or similar?
-                // For now, if no path, we can't write OPF.
-                return Ok(());
-            }
-
-            let book_dir = self.path.join(&book_rel_path);
-            if !book_dir.exists() {
-                std::fs::create_dir_all(&book_dir)?;
-            }
-
-            let mut meta = MetaInformation::default();
-            meta.title = book.title;
-            meta.authors = vec![book.author_sort.unwrap_or_default()];
-            // TODO: Fill more metadata from DB?
-            // For now, basic metadata is enough for a port start
-            meta.uuid = book.uuid;
-
-            let xml = meta.to_xml();
-            let opf_path = book_dir.join("metadata.opf");
-            fs::write(opf_path, xml)?;
-
-            Ok(())
-        } else {
-            Err(LibraryError::InvalidPath) // Or BookNotFound
+        let Some(book) = book_opt else {
+            return Err(LibraryError::InvalidPath); // Or BookNotFound
+        };
+        if book.path.is_empty() {
+            // Python skips invisible/pathless books rather than erroring.
+            return Ok(());
         }
+        let cache = Arc::new(Mutex::new(self.as_cache()));
+        crate::backup::backup_metadata(&cache, book_id)
+            .map_err(|e| LibraryError::Transaction(e.to_string()))
     }
 
     pub fn vacuum(&self, vacuum_fts: bool) -> Result<(), LibraryError> {
@@ -723,54 +424,15 @@ impl Library {
     }
 
     pub fn remove_format(&mut self, book_id: i32, fmt: &str) -> Result<(), LibraryError> {
-        let book_opt = self.get_book(book_id)?;
-        if let Some(book) = book_opt {
-            let book_rel_path = book.path;
-            if book_rel_path.is_empty() {
-                return Ok(()); // Or fail?
-            }
-
-            let book_dir = self.path.join(&book_rel_path);
-            if !book_dir.exists() {
-                return Ok(());
-            }
-
-            // Construct filename.
-            // Warning: We need to know the exact filename.
-            // If we constructed it in add_format using title, we should try that.
-            // Or scan directory for extensions?
-            // Python: "fmt should be a file extension like LRF or TXT or EPUB"
-
-            // Strategy: Look for file with extension in the directory.
-            // Since we don't store exact filenames in DB (only path to dir),
-            // we have to search.
-            let target_ext = fmt.to_lowercase();
-
-            if let Ok(entries) = fs::read_dir(&book_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_file() {
-                        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                            if ext.to_lowercase() == target_ext {
-                                fs::remove_file(path)?;
-                                // Only remove one? Or all matching?
-                                // Ideally there is only one per format.
-                                // I'll stop after one.
-                                return Ok(());
-                            }
-                        }
-                    }
-                }
-            }
-
-            // If not found, do nothing?
-            Ok(())
-        } else {
-            Err(LibraryError::Transaction(format!(
+        if self.get_book(book_id)?.is_none() {
+            return Err(LibraryError::Transaction(format!(
                 "Book {} not found",
                 book_id
-            )))
+            )));
         }
+        self.as_cache()
+            .remove_format(book_id, fmt)
+            .map_err(|e| LibraryError::Transaction(e.to_string()))
     }
 
     pub fn all_authors(&self) -> Result<Vec<(i32, String)>, LibraryError> {
@@ -807,30 +469,9 @@ impl Library {
     }
 
     pub fn clone_to(&self, dest: &Path) -> Result<(), LibraryError> {
-        if !dest.exists() {
-            fs::create_dir_all(dest)?;
-        }
-
-        self.copy_recursive(&self.path, dest)
-            .map_err(LibraryError::Io)?;
-        Ok(())
-    }
-
-    fn copy_recursive(&self, src: &Path, dst: &Path) -> std::io::Result<()> {
-        if !dst.exists() {
-            fs::create_dir_all(dst)?;
-        }
-        for entry in fs::read_dir(src)? {
-            let entry = entry?;
-            let path = entry.path();
-            let dest_path = dst.join(entry.file_name());
-            if path.is_dir() {
-                self.copy_recursive(&path, &dest_path)?;
-            } else {
-                fs::copy(&path, &dest_path)?;
-            }
-        }
-        Ok(())
+        self.as_cache()
+            .clone_to(dest)
+            .map_err(|e| LibraryError::Transaction(e.to_string()))
     }
 
     pub fn has_cover(&self, book_id: i32) -> Result<bool, LibraryError> {
@@ -972,15 +613,6 @@ impl Library {
             .remove_custom_column(label)
             .map_err(|e| LibraryError::Transaction(e.to_string()))
     }
-}
-
-fn sanitize_filename(name: &str) -> String {
-    name.replace("/", "_")
-        .replace("\\", "_")
-        .replace(":", "_")
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '_' || *c == '-')
-        .collect()
 }
 
 #[cfg(test)]
