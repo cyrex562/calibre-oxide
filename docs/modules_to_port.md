@@ -64,30 +64,30 @@ implementing it. Corrected here; do not trust the remaining `[x]` marks
 in this section without spot-checking against #201's methodology
 either -- this pass wasn't exhaustive.
 
-- [ ] __init__.py
-- [ ] adding.py (#201: ~12% of source size)
+- [ ] __init__.py (#218: `FTSQueryError`, series-index auto-increment (`_get_next_series_num_for_list`), `_get_series_values` bracket-suffix parsing, `get_data_as_dict` bulk export -- none ported anywhere in this crate)
+- [ ] adding.py (#219: ~12% of source size -- and even that's misleading: real `adding.py` is bulk directory-import scanning, not single-book add (that's `Cache.add_books`, real since #216); `adding.rs` today is an unrelated narrow DB-only helper used by `copy_to_library.rs`)
 - [x] annotations.py
 - [x] backend.py (#203: real connection setup, custom SQL functions/collations/aggregates, brand-new-library schema creation via the bundled DDL, author-sort trigger fixup, `library_id`, and JSON-typed `preferences` get/set/delete -- all verified against upstream. NOT ported: default-pref population/migration, dynamic custom-column tables, the in-memory field/table model, notes/FTS bootstrap, trash dir, file/cover storage, library move/backup. See #204 for the field/table model, cache.py's territory.)
 - [x] backup.py
 - [x] cache.py (#204: real `all_book_ids`, real `field_for` for every standard field -- scalar `books` columns, `comments`, `series`/`publisher`/`rating` many-to-one, `authors`/`tags`/`languages`/`formats` many-to-many, `identifiers`, `size` -- and real `pref`/`set_pref` including namespaced keys, all verified against the real schema. Multi-value fields return a joined string, not upstream's tuple/dict shape -- a disclosed simplification, see `cache.rs`'s module docs. NOT ported: writes beyond `write.rs`, notes, FTS, composite fields, virtual libraries, saved searches, categories, trash, dump/restore, `move_library_to` -- each its own follow-up. Also fixed real bugs in `search.rs`/`view.rs` that depended on this: `search.rs` had misleading stale comments describing a hardcoded id-range fallback that was never actually implemented (the real query was already correct); `view.rs::sort()` previously ignored its `field` argument entirely and always sorted by internal id. #214 (#201/#212 follow-up) later added real custom-column support (`Cache::add_custom_column`/`get_custom_column_value`/`set_custom_column_value`/`remove_custom_column`/`custom_column_label_map`) -- a `custom_columns` metadata row plus a dynamic `custom_column_N` value table per column, the same shape `library.rs` originally hand-rolled, just hosted on `Cache`'s connection now so `Library` can delegate instead of duplicating the SQL. This is NOT a port of upstream's real `tables.py`/`fields.py` custom-column architecture (see those entries below) -- it's a narrower, same-shape extension of this file's existing per-call-SQL strategy, not the in-memory bulk-loaded `Table` object model. #216 (same follow-up chain) then added real filesystem book/format/cover/rename/clone management (`Cache::add_book`/`add_format`/`remove_format`/`delete_book`/`update_book_metadata`/`clone_to`), again moved from `library.rs`'s original duplicate implementation -- with two real gaps fixed along the way: `add_format` (and `add_book`'s own initial file copy, which used to bypass it) never inserted a row into the `data` table, so `field_for(id, "formats"/"size")` never saw a book's real formats; `covers.rs::set_cover` never flipped `has_cover` in the `books` table. With #212/#214/#216 landed, `Library` and `Cache` share one schema and one connection, and every method they both had is now `Library` delegating to `Cache` via `as_cache()` rather than duplicating SQL/file logic -- `Library` itself is now mostly a thin CLI-facing wrapper (argument/error-type translation) plus the `Book` struct-returning read methods (`get_book`/`list_books`) `Cache` doesn't have an equivalent of yet.)
-- [ ] categories.py (#201: ~10% of source size)
+- [ ] categories.py (#220: ~10% of source size -- only computes an `authors` category; real tag-browser (series/tags/publishers/ratings/custom columns, per-item counts, average ratings, user-category tree) not ported)
 - [x] constants.py
-- [ ] copy_to_library.py (#201: duplicate detection stubbed to always report none)
+- [ ] copy_to_library.py (#221: duplicate detection stubbed to always report none even when `check_duplicates: true` -- `crate::utils::find_identical_books` already exists real/tested and is simply unused here)
 - [x] covers.py
 - [x] errors.py
-- [ ] fields.py (#201: ~4% of source size; #214 added custom-column support directly to `cache.rs` without porting this file's real `Field`/custom-column-field-wrapper classes -- see the `cache.py` entry above)
+- [ ] fields.py (#222: ~4% of source size; #214 added custom-column support directly to `cache.rs` without porting this file's real `Field`/custom-column-field-wrapper classes -- see the `cache.py` entry above)
 - [x] lazy.py
-- [ ] legacy.py (#201: ~3% of source size; `migrate()` always errors, `check_compatibility()` always returns true)
+- [ ] legacy.py (#223: ~3% of source size; `migrate()` always errors, `check_compatibility()` always returns true -- the modern `db/` package's own compat-shim layer, distinct from the pre-2013 `library/*.py` module #56 was scoped against and closed won't-fix)
 - [x] listeners.py
 - [x] locking.py
-- [ ] restore.py (#201: ~41% of source size)
+- [ ] restore.py (#224: ~41% of source size -- the real thing (OPF-driven book row restore, `Cache::add_book_db_entry`-backed since #216) works and is tested (`restore_database_test`), but doesn't yet cover cover/format-file rediscovery, custom-column rebuild, or corrupt-OPF handling like the real `Restore` class does)
 - [x] schema_upgrades.py (all 25 migration steps (versions 1-26) ported and verified end-to-end against a hand-derived version-1 starting schema. NOT ported: `upgrade_version_19`'s custom-recipe-to-file export (no recipes/feeds subsystem exists) and `upgrade_version_24`'s FTS reindex trigger (no FTS pipeline exists) -- neither makes schema/data changes, so skipping their bodies doesn't desync later steps. `upgrade_version_10`/`_11`'s field_metadata-driven tag-browser-view creation is ported for the fixed set of built-in categorized fields only, not custom columns (not supported yet). See schema_upgrades.rs's module docs.)
 - [x] search.py (#210, #201 follow-up: real `DateSearch`/`NumericSearch`/`BooleanSearch`/`KeyPairSearch` matchers plus a real `And`/`Or`/`Not`/`Token` tree evaluator matching upstream's exact candidate-narrowing semantics, wired to `Cache::field_for`'s fixed field set via a hardcoded location-alias table (no `field_metadata` system exists in this crate). NOT ported: `template:`/`@usercategory`/`vl:`/`search:savedname` search, the `#=N` count operator, grouped-search-terms expansion, the `LRUCache` query cache, and real ICU primary-collation matching (`ACCENT_MATCH`/primary `CONTAINS_MATCH` are NFD-diacritic-stripping approximations). Follow-up #212 unified `crates/calibre_db/src/library.rs`'s schema with `Backend`'s real bundled one and wired `Library::search()` to this engine for real -- the CLI `search` subcommand now uses it, see `library.rs`'s module docs.)
 - [x] sqlite_extension.cpp (semantic port: tokenizer + stemmer; FTS5 registration deferred to #93)
-- [ ] tables.py (#201: ~14% of source size; #214 added custom-column support directly to `cache.rs` without porting this file's real in-memory bulk-loaded `Table`/`OneToOneTable`/`ManyToOneTable`/`ManyToManyTable` object model -- see the `cache.py` entry above)
+- [ ] tables.py (#222: ~14% of source size; #214 added custom-column support directly to `cache.rs` without porting this file's real in-memory bulk-loaded `Table`/`OneToOneTable`/`ManyToOneTable`/`ManyToManyTable` object model -- see the `cache.py` entry above and #222, tracked jointly with `fields.py`)
 - [x] utils.py
-- [ ] view.py (#201: `sort()`'s `field` parameter is unused -- always sorts by internal ID)
-- [ ] write.py (#201: ~8% of source size)
+- [x] view.py (`sort()`'s `field` argument was fixed to be used for real as part of #204 -- this line was stale, corrected 2026-08-19; previously wrongly left unchecked describing a bug that was already gone)
+- [ ] write.py (#225: ~8% of source size -- only `set_title`/`set_author_sort`/`update_field` against `Backend::update`'s narrow whitelist; real `write.py` is a generic datatype-dispatched write API with proper link-table diffing for many-to-many fields)
 
 #### cli
 
@@ -102,8 +102,8 @@ either -- this pass wasn't exhaustive.
 - [x] cmd_custom_columns.py
 - [x] cmd_embed_metadata.py
 - [x] cmd_export.py
-- [ ] cmd_fits_index.py (#201: `Err(anyhow!("... is a stub"))`)
-- [ ] cmd_fits_search.py (#201: `Err(anyhow!("... is a stub"))`)
+- [ ] cmd_fts_index.py (#226: `Err(anyhow!("... is a stub"))` -- ported as `cli/cmd_fits_index.rs`, a naming typo ("fits" vs. real upstream "fts"/full-text-search) worth fixing alongside the real implementation; tracked jointly with the rest of the FTS subsystem)
+- [ ] cmd_fts_search.py (#226: `Err(anyhow!("... is a stub"))` -- same naming-typo note as `cmd_fts_index.py` above)
 - [x] cmd_list_categories.py
 - [x] cmd_list.py
 - [x] `cmd_remove_custom_column.py` -> `crates/calibre_db/src/cli/cmd_remove_custom_column.rs`
@@ -122,16 +122,16 @@ either -- this pass wasn't exhaustive.
 #### fts
 
 - [x] __init__.py
-- [ ] connect.py (#201: ~48% of source size)
-- [ ] pool.py (#201: no Rust counterpart exists at all -- `fts/mod.rs` only declares `connection`)
+- [ ] connect.py (#226: ~48% of source size -- real connection setup exists, real query/index-management surface doesn't; tracked jointly with `pool.py` and the two `cmd_fts_*` CLI commands as one subsystem, since none is independently useful without the others)
+- [ ] pool.py (#226: no Rust counterpart exists at all -- `fts/mod.rs` only declares `connection`)
 - [x] schema_upgrade.py
 - [x] text.py
 
 #### notes
 
 - [x] __init__.py
-- [ ] connect.py (#201: ~23% of source size)
-- [ ] exim.py (#201: "Stubbed implementation for now as we lack full HTML parsing capabilities" -- calibre_ebooks now has HTML parsing (html5ever) if this is revisited)
+- [ ] connect.py (#227: ~23% of source size -- partial connection/schema setup, not the real notes content/attachment/full-text-search feature surface)
+- [ ] exim.py (#228: "Stubbed implementation for now as we lack full HTML parsing capabilities" -- that blocker is gone, `calibre_ebooks` now has real HTML parsing (html5ever); sequenced after #227 since export/import needs real notes storage to round-trip)
 - [x] schema_upgrade.py
 
 ### devices
