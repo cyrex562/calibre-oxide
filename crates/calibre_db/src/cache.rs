@@ -47,12 +47,16 @@
 //! per-item structure (e.g. to add/remove one tag) need a typed API
 //! this pass doesn't add.
 //!
+//! [`Cache::set_field`] (issue #223 follow-up) adds a real generic
+//! writer for the same standard-field set, backing `legacy.rs`'s
+//! setter API -- see its own doc comment for what's faithfully ported
+//! vs. simplified.
+//!
 //! # Not ported
 //!
-//! Everything else: `set_field`/writes beyond what `write.rs` already
-//! has, notes, FTS, composite fields, virtual libraries, saved
-//! searches, categories, trash, dump/restore, `move_library_to`. Each
-//! is its own follow-up.
+//! Everything else: notes, FTS, composite fields, virtual libraries,
+//! saved searches, categories, trash, dump/restore, `move_library_to`.
+//! Each is its own follow-up.
 //!
 //! Two later, separately-issued follow-ups also live in this file now:
 //! real custom-column support (issue #214) and real filesystem book/
@@ -1028,6 +1032,266 @@ impl Cache {
         tx.commit()?;
         Ok(())
     }
+
+    pub fn has_cover(&self, book_id: i32) -> anyhow::Result<bool> {
+        let conn = self.backend.conn.lock().unwrap();
+        let has_cover: Option<i64> = conn
+            .query_row(
+                "SELECT has_cover FROM books WHERE id = ?1",
+                [book_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(has_cover.unwrap_or(0) != 0)
+    }
+
+    /// Real generic field writer backing `legacy.rs`'s (#223) setter
+    /// API. Upstream's `Cache.set_field` is ~250 lines handling every
+    /// field (including composites), `allow_case_change`, dirtying,
+    /// and change notification; this ports the write path for each
+    /// *standard* field [`Cache::field_for`] already reads (the same
+    /// set, minus `id`/`path`/`last_modified`/`size`, none of which
+    /// upstream's own legacy setter API exposes either), using the
+    /// same get-or-create-by-name pattern [`Cache::add_book_db_entry`]
+    /// already uses for authors.
+    ///
+    /// # Disclosed simplifications
+    ///
+    /// - Many-to-many fields (`tags`/`languages`/`authors`) take
+    ///   `value` pre-joined the same way [`Cache::field_for`] returns
+    ///   them (`", "` for tags/languages, `" & "` for authors) and
+    ///   replace the entire set -- no single-item add/remove, no
+    ///   `allow_case_change` merge-on-rename behavior.
+    /// - `identifiers` takes the same `"type:val,type:val"` string
+    ///   [`Cache::field_for`] returns and replaces the entire set.
+    /// - No dirtying/notification, no composite-field recalculation
+    ///   (e.g. setting `authors` does not recompute `author_sort`).
+    pub fn set_field(&self, book_id: i32, field: &str, value: &str) -> anyhow::Result<()> {
+        match field {
+            "title" | "sort" | "uuid" if value.is_empty() => {
+                // Matches upstream: these three fields silently no-op
+                // on an empty value rather than clearing it.
+            }
+            "title" | "sort" | "author_sort" | "uuid" => {
+                let conn = self.backend.conn.lock().unwrap();
+                conn.execute(
+                    &format!("UPDATE books SET {field} = ?1 WHERE id = ?2"),
+                    (value, book_id),
+                )?;
+            }
+            "series_index" => {
+                let val: f64 = value.parse().unwrap_or(1.0);
+                let conn = self.backend.conn.lock().unwrap();
+                conn.execute(
+                    "UPDATE books SET series_index = ?1 WHERE id = ?2",
+                    (val, book_id),
+                )?;
+            }
+            "timestamp" | "pubdate" => {
+                let conn = self.backend.conn.lock().unwrap();
+                conn.execute(
+                    &format!("UPDATE books SET {field} = ?1 WHERE id = ?2"),
+                    (value, book_id),
+                )?;
+            }
+            "comments" => {
+                let conn = self.backend.conn.lock().unwrap();
+                conn.execute("DELETE FROM comments WHERE book = ?1", (book_id,))?;
+                if !value.is_empty() {
+                    conn.execute(
+                        "INSERT INTO comments (book, text) VALUES (?1, ?2)",
+                        (book_id, value),
+                    )?;
+                }
+            }
+            "has_cover" | "cover" => {
+                let flag = matches!(value, "1" | "true" | "True");
+                let conn = self.backend.conn.lock().unwrap();
+                conn.execute(
+                    "UPDATE books SET has_cover = ?1 WHERE id = ?2",
+                    (flag as i32, book_id),
+                )?;
+            }
+            "series" => {
+                self.set_many_to_one_field(book_id, "series", "books_series_link", "series", value)?
+            }
+            "publisher" => self.set_many_to_one_field(
+                book_id,
+                "publishers",
+                "books_publishers_link",
+                "publisher",
+                value,
+            )?,
+            "rating" => self.set_rating_field(book_id, value)?,
+            "tags" => self.set_many_to_many_field(
+                book_id,
+                "tags",
+                "name",
+                "books_tags_link",
+                "tag",
+                ", ",
+                value,
+            )?,
+            "languages" => self.set_many_to_many_field(
+                book_id,
+                "languages",
+                "lang_code",
+                "books_languages_link",
+                "lang_code",
+                ", ",
+                value,
+            )?,
+            "authors" => self.set_many_to_many_field(
+                book_id,
+                "authors",
+                "name",
+                "books_authors_link",
+                "author",
+                " & ",
+                value,
+            )?,
+            "identifiers" => self.set_identifiers_field(book_id, value)?,
+            _ => anyhow::bail!("Field '{}' is not writable by this port's set_field", field),
+        }
+        Ok(())
+    }
+
+    fn set_many_to_one_field(
+        &self,
+        book_id: i32,
+        table: &str,
+        link_table: &str,
+        link_col: &str,
+        value: &str,
+    ) -> anyhow::Result<()> {
+        let mut conn = self.backend.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            &format!("DELETE FROM {link_table} WHERE book = ?1"),
+            (book_id,),
+        )?;
+        let value = value.trim();
+        if !value.is_empty() {
+            let item_id: i32 = {
+                let mut stmt = tx.prepare(&format!("SELECT id FROM {table} WHERE name = ?1"))?;
+                let mut rows = stmt.query([value])?;
+                if let Some(row) = rows.next()? {
+                    row.get(0)?
+                } else {
+                    tx.execute(&format!("INSERT INTO {table} (name) VALUES (?1)"), [value])?;
+                    tx.last_insert_rowid() as i32
+                }
+            };
+            tx.execute(
+                &format!("INSERT INTO {link_table} (book, {link_col}) VALUES (?1, ?2)"),
+                (book_id, item_id),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn set_many_to_many_field(
+        &self,
+        book_id: i32,
+        table: &str,
+        name_col: &str,
+        link_table: &str,
+        link_col: &str,
+        sep: &str,
+        value: &str,
+    ) -> anyhow::Result<()> {
+        let items: Vec<&str> = value
+            .split(sep)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut conn = self.backend.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            &format!("DELETE FROM {link_table} WHERE book = ?1"),
+            (book_id,),
+        )?;
+        for (idx, item) in items.iter().enumerate() {
+            let item_id: i32 = {
+                let mut stmt =
+                    tx.prepare(&format!("SELECT id FROM {table} WHERE {name_col} = ?1"))?;
+                let mut rows = stmt.query([*item])?;
+                if let Some(row) = rows.next()? {
+                    row.get(0)?
+                } else {
+                    tx.execute(
+                        &format!("INSERT INTO {table} ({name_col}) VALUES (?1)"),
+                        [*item],
+                    )?;
+                    tx.last_insert_rowid() as i32
+                }
+            };
+            if link_table == "books_languages_link" {
+                tx.execute(
+                    &format!(
+                        "INSERT INTO {link_table} (book, {link_col}, item_order) VALUES (?1, ?2, ?3)"
+                    ),
+                    (book_id, item_id, idx as i32),
+                )?;
+            } else {
+                tx.execute(
+                    &format!("INSERT INTO {link_table} (book, {link_col}) VALUES (?1, ?2)"),
+                    (book_id, item_id),
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn set_rating_field(&self, book_id: i32, value: &str) -> anyhow::Result<()> {
+        let rating: i32 = value.parse().unwrap_or(0);
+        let mut conn = self.backend.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM books_ratings_link WHERE book = ?1", (book_id,))?;
+        if rating > 0 {
+            let rating_id: i32 = {
+                let mut stmt = tx.prepare("SELECT id FROM ratings WHERE rating = ?1")?;
+                let mut rows = stmt.query([rating])?;
+                if let Some(row) = rows.next()? {
+                    row.get(0)?
+                } else {
+                    tx.execute("INSERT INTO ratings (rating) VALUES (?1)", [rating])?;
+                    tx.last_insert_rowid() as i32
+                }
+            };
+            tx.execute(
+                "INSERT INTO books_ratings_link (book, rating) VALUES (?1, ?2)",
+                (book_id, rating_id),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn set_identifiers_field(&self, book_id: i32, value: &str) -> anyhow::Result<()> {
+        let mut conn = self.backend.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM identifiers WHERE book = ?1", (book_id,))?;
+        for pair in value.split(',') {
+            let pair = pair.trim();
+            if pair.is_empty() {
+                continue;
+            }
+            if let Some((k, v)) = pair.split_once(':') {
+                if !k.is_empty() && !v.is_empty() {
+                    tx.execute(
+                        "INSERT INTO identifiers (book, type, val) VALUES (?1, ?2, ?3)",
+                        (book_id, k, v),
+                    )?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 /// Runs a many-to-many field's SELECT (already scoped to one book,
@@ -1653,5 +1917,121 @@ mod tests {
 
         let data = cache.get_data_as_dict(None, false, None, false).unwrap();
         assert_eq!(data[0]["mycol"], "hello");
+    }
+
+    #[test]
+    fn set_field_writes_scalar_book_columns() {
+        let (_dir, cache) = open_test_cache();
+        let id = insert_book(&cache, "Old Title");
+        cache.set_field(id, "title", "New Title").unwrap();
+        cache.set_field(id, "series_index", "3.5").unwrap();
+        assert_eq!(
+            cache.field_for(id, "title").unwrap(),
+            Some("New Title".to_string())
+        );
+        assert_eq!(
+            cache.field_for(id, "series_index").unwrap(),
+            Some("3.5".to_string())
+        );
+    }
+
+    #[test]
+    fn set_field_replaces_the_entire_many_to_many_set() {
+        let (_dir, cache) = open_test_cache();
+        let id = insert_book(&cache, "T");
+        cache.set_field(id, "tags", "fiction, adventure").unwrap();
+        assert_eq!(
+            cache.field_for(id, "tags").unwrap(),
+            Some("fiction, adventure".to_string())
+        );
+
+        // Replacing drops tags not in the new set.
+        cache.set_field(id, "tags", "adventure, thriller").unwrap();
+        assert_eq!(
+            cache.field_for(id, "tags").unwrap(),
+            Some("adventure, thriller".to_string())
+        );
+    }
+
+    #[test]
+    fn set_field_reuses_an_existing_item_row_by_name() {
+        let (_dir, cache) = open_test_cache();
+        let a = insert_book(&cache, "A");
+        let b = insert_book(&cache, "B");
+        cache.set_field(a, "tags", "fiction").unwrap();
+        cache.set_field(b, "tags", "fiction").unwrap();
+
+        let conn = cache.backend.conn.lock().unwrap();
+        let count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tags WHERE name = 'fiction'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn set_field_replaces_a_many_to_one_link() {
+        let (_dir, cache) = open_test_cache();
+        let id = insert_book(&cache, "T");
+        cache.set_field(id, "series", "First Series").unwrap();
+        assert_eq!(
+            cache.field_for(id, "series").unwrap(),
+            Some("First Series".to_string())
+        );
+        cache.set_field(id, "series", "Second Series").unwrap();
+        assert_eq!(
+            cache.field_for(id, "series").unwrap(),
+            Some("Second Series".to_string())
+        );
+    }
+
+    #[test]
+    fn set_field_rating_zero_clears_the_rating() {
+        let (_dir, cache) = open_test_cache();
+        let id = insert_book(&cache, "T");
+        cache.set_field(id, "rating", "8").unwrap();
+        assert_eq!(
+            cache.field_for(id, "rating").unwrap(),
+            Some("8".to_string())
+        );
+        cache.set_field(id, "rating", "0").unwrap();
+        assert_eq!(cache.field_for(id, "rating").unwrap(), None);
+    }
+
+    #[test]
+    fn set_field_identifiers_replaces_the_whole_set() {
+        let (_dir, cache) = open_test_cache();
+        let id = insert_book(&cache, "T");
+        cache
+            .set_field(id, "identifiers", "isbn:123,doi:abc")
+            .unwrap();
+        assert_eq!(
+            cache.field_for(id, "identifiers").unwrap(),
+            Some("isbn:123,doi:abc".to_string())
+        );
+        cache.set_field(id, "identifiers", "isbn:456").unwrap();
+        assert_eq!(
+            cache.field_for(id, "identifiers").unwrap(),
+            Some("isbn:456".to_string())
+        );
+    }
+
+    #[test]
+    fn set_field_rejects_unwritable_fields() {
+        let (_dir, cache) = open_test_cache();
+        let id = insert_book(&cache, "T");
+        assert!(cache.set_field(id, "size", "1").is_err());
+    }
+
+    #[test]
+    fn has_cover_reflects_the_books_column() {
+        let (_dir, cache) = open_test_cache();
+        let id = insert_book(&cache, "T");
+        assert!(!cache.has_cover(id).unwrap());
+        cache.set_field(id, "has_cover", "1").unwrap();
+        assert!(cache.has_cover(id).unwrap());
     }
 }
