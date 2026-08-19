@@ -316,6 +316,23 @@ impl Cache {
         metadata: &MetaInformation,
         rel_path: &str,
     ) -> anyhow::Result<i32> {
+        self.add_book_db_entry_with_id(metadata, rel_path, None)
+    }
+
+    /// Same as [`Cache::add_book_db_entry`] but supports inserting
+    /// with an explicit `id` -- used by `restore.rs` (#224) to
+    /// preserve each book's original id (recovered from its OPF's
+    /// embedded `calibre` identifier) across a restore, instead of
+    /// every restored book silently getting a fresh autoincrement id.
+    /// `explicit_id` is used only if no row with that id already
+    /// exists; otherwise this falls back to autoincrement, same as
+    /// `add_book_db_entry`.
+    pub fn add_book_db_entry_with_id(
+        &self,
+        metadata: &MetaInformation,
+        rel_path: &str,
+        explicit_id: Option<i32>,
+    ) -> anyhow::Result<i32> {
         let mut conn = self.backend.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
@@ -325,19 +342,62 @@ impl Cache {
             .map(|s| s.as_str())
             .unwrap_or("Unknown");
 
-        tx.execute(
-            "INSERT INTO books (title, author_sort, path, has_cover, timestamp, pubdate, series_index)
-             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)",
-            (
-                &metadata.title,
-                author_name,
-                rel_path,
-                metadata.timestamp.unwrap_or_else(chrono::Utc::now).to_rfc3339(),
-                metadata.pubdate.unwrap_or_else(chrono::Utc::now).to_rfc3339(),
-                metadata.series_index,
-            ),
-        )?;
-        let book_id = tx.last_insert_rowid() as i32;
+        let taken_id = match explicit_id {
+            Some(id) => {
+                let count: i64 =
+                    tx.query_row("SELECT COUNT(*) FROM books WHERE id = ?1", [id], |r| {
+                        r.get(0)
+                    })?;
+                if count > 0 {
+                    None
+                } else {
+                    Some(id)
+                }
+            }
+            None => None,
+        };
+
+        let book_id = match taken_id {
+            Some(id) => {
+                tx.execute(
+                    "INSERT INTO books (id, title, author_sort, path, has_cover, timestamp, pubdate, series_index)
+                     VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7)",
+                    (
+                        id,
+                        &metadata.title,
+                        author_name,
+                        rel_path,
+                        metadata.timestamp.unwrap_or_else(chrono::Utc::now).to_rfc3339(),
+                        metadata.pubdate.unwrap_or_else(chrono::Utc::now).to_rfc3339(),
+                        metadata.series_index,
+                    ),
+                )?;
+                id
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO books (title, author_sort, path, has_cover, timestamp, pubdate, series_index)
+                     VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)",
+                    (
+                        &metadata.title,
+                        author_name,
+                        rel_path,
+                        metadata.timestamp.unwrap_or_else(chrono::Utc::now).to_rfc3339(),
+                        metadata.pubdate.unwrap_or_else(chrono::Utc::now).to_rfc3339(),
+                        metadata.series_index,
+                    ),
+                )?;
+                tx.last_insert_rowid() as i32
+            }
+        };
+
+        // `books_insert_trg` unconditionally overwrites `sort` via
+        // `title_sort()` on every INSERT -- restore a saved
+        // `title_sort` from the OPF over that computed default, same
+        // as `uuid` below.
+        if let Some(sort) = metadata.title_sort.as_deref() {
+            tx.execute("UPDATE books SET sort = ?1 WHERE id = ?2", (sort, book_id))?;
+        }
 
         if let Some(uuid) = metadata.uuid.as_deref() {
             tx.execute("UPDATE books SET uuid = ?1 WHERE id = ?2", (uuid, book_id))?;
