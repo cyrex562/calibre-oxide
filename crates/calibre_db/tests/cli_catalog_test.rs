@@ -11,12 +11,7 @@ fn test_catalog_csv() {
 
     // Setup DB
     {
-        let mut lib = Library::open(temp_dir.path().to_path_buf()).unwrap();
-        lib.conn().execute_batch(
-            "CREATE TABLE books ( id INTEGER PRIMARY KEY, title TEXT, sort TEXT, timestamp TEXT, pubdate TEXT, series_index REAL, author_sort TEXT, isbn TEXT, lccn TEXT, path TEXT, has_cover INTEGER, uuid TEXT );
-             CREATE TABLE authors ( id INTEGER PRIMARY KEY, name TEXT UNIQUE, sort TEXT, link TEXT );
-             CREATE TABLE books_authors_link ( id INTEGER PRIMARY KEY, book INTEGER, author INTEGER );"
-        ).unwrap();
+        let lib = Library::open(temp_dir.path().to_path_buf()).unwrap();
 
         lib.conn().execute(
             "INSERT INTO books (title, sort, author_sort, path, has_cover, timestamp, pubdate, uuid, series_index)

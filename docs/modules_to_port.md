@@ -82,7 +82,7 @@ either -- this pass wasn't exhaustive.
 - [x] locking.py
 - [ ] restore.py (#201: ~41% of source size)
 - [x] schema_upgrades.py (all 25 migration steps (versions 1-26) ported and verified end-to-end against a hand-derived version-1 starting schema. NOT ported: `upgrade_version_19`'s custom-recipe-to-file export (no recipes/feeds subsystem exists) and `upgrade_version_24`'s FTS reindex trigger (no FTS pipeline exists) -- neither makes schema/data changes, so skipping their bodies doesn't desync later steps. `upgrade_version_10`/`_11`'s field_metadata-driven tag-browser-view creation is ported for the fixed set of built-in categorized fields only, not custom columns (not supported yet). See schema_upgrades.rs's module docs.)
-- [x] search.py (#210, #201 follow-up: real `DateSearch`/`NumericSearch`/`BooleanSearch`/`KeyPairSearch` matchers plus a real `And`/`Or`/`Not`/`Token` tree evaluator matching upstream's exact candidate-narrowing semantics, wired to `Cache::field_for`'s fixed field set via a hardcoded location-alias table (no `field_metadata` system exists in this crate). NOT ported: `template:`/`@usercategory`/`vl:`/`search:savedname` search, the `#=N` count operator, grouped-search-terms expansion, the `LRUCache` query cache, and real ICU primary-collation matching (`ACCENT_MATCH`/primary `CONTAINS_MATCH` are NFD-diacritic-stripping approximations). `crates/calibre_db/src/library.rs`'s separate `Library::search()` (a second, `Cache`-disconnected data-access layer) still has the old `LIKE` stub -- see `search.rs`'s module docs.)
+- [x] search.py (#210, #201 follow-up: real `DateSearch`/`NumericSearch`/`BooleanSearch`/`KeyPairSearch` matchers plus a real `And`/`Or`/`Not`/`Token` tree evaluator matching upstream's exact candidate-narrowing semantics, wired to `Cache::field_for`'s fixed field set via a hardcoded location-alias table (no `field_metadata` system exists in this crate). NOT ported: `template:`/`@usercategory`/`vl:`/`search:savedname` search, the `#=N` count operator, grouped-search-terms expansion, the `LRUCache` query cache, and real ICU primary-collation matching (`ACCENT_MATCH`/primary `CONTAINS_MATCH` are NFD-diacritic-stripping approximations). Follow-up #212 unified `crates/calibre_db/src/library.rs`'s schema with `Backend`'s real bundled one and wired `Library::search()` to this engine for real -- the CLI `search` subcommand now uses it, see `library.rs`'s module docs.)
 - [x] sqlite_extension.cpp (semantic port: tokenizer + stemmer; FTS5 registration deferred to #93)
 - [ ] tables.py (#201: ~14% of source size)
 - [x] utils.py
@@ -110,7 +110,7 @@ either -- this pass wasn't exhaustive.
 - [x] cmd_remove_format.py
 - [x] cmd_restore_database.py
 - [x] cmd_saved_searches.py
-- [x] cmd_search.py
+- [x] cmd_search.py (#212: now backed by the real query-syntax engine via `Library::search` -- see the `search.py`/`search.rs` entry above)
 - [x] cmd_set_custom.py
 - [x] cmd_set_metadata.py
 - [x] cmd_show_metadata.py

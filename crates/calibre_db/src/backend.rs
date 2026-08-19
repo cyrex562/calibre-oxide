@@ -67,6 +67,11 @@ use calibre_ebooks::metadata::meta::title_sort as real_title_sort;
 /// user_version=26` that marks it current.
 const SCHEMA_SQL: &str = include_str!("../resources/metadata_sqlite.sql");
 
+/// `Clone` is cheap and shares the same live connection (`conn` is an
+/// `Arc<Mutex<Connection>>`) -- used by [`crate::library::Library`] to
+/// hand its own connection to [`crate::cache::Cache`]/`search.rs`
+/// without opening a second connection to the same file.
+#[derive(Clone)]
 pub struct Backend {
     pub library_path: PathBuf,
     pub db_path: PathBuf,

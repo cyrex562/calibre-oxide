@@ -10,13 +10,7 @@ fn test_export() {
     // Setup DB and Source File
     let db_path = temp_dir.path().join("metadata.db");
     std::fs::File::create(&db_path).unwrap();
-    let mut lib = Library::open(temp_dir.path().to_path_buf()).unwrap();
-    lib.conn().execute_batch(
-        "CREATE TABLE books ( id INTEGER PRIMARY KEY, title TEXT, sort TEXT, timestamp TEXT, pubdate TEXT, series_index REAL, author_sort TEXT, isbn TEXT, lccn TEXT, path TEXT, has_cover INTEGER, uuid TEXT );
-         CREATE TABLE authors ( id INTEGER PRIMARY KEY, name TEXT UNIQUE, sort TEXT, link TEXT );
-         CREATE TABLE books_authors_link ( id INTEGER PRIMARY KEY, book INTEGER, author INTEGER );
-         CREATE TABLE data ( id INTEGER PRIMARY KEY, book INTEGER, format TEXT, uncompressed_size INTEGER, name TEXT );"
-    ).unwrap();
+    let lib = Library::open(temp_dir.path().to_path_buf()).unwrap();
 
     let rel_path = "Author_A/Test_Book";
     let full_src_dir = temp_dir.path().join(rel_path);

@@ -1,8 +1,70 @@
+//! `Library` -- the CLI's data-access layer (`src/cli/cmd_*.rs`
+//! operates on this, not `Cache`/`Backend` directly).
+//!
+//! # Schema unification (issue #201 follow-up)
+//!
+//! Until this pass, `Library` created its own ad hoc, minimal 6-table
+//! schema (`init_schema`, since removed) and registered no-op stub SQL
+//! functions (`title_sort`/`author_to_author_sort` that just echoed
+//! their input back). That schema was missing every table
+//! `crate::cache::Cache`/`crate::search::search` (issues #204/#210)
+//! depend on -- `comments`, `series`, `tags`, `identifiers`,
+//! `books_series_link`, `books_tags_link`, `library_id`, and more --
+//! which is why the CLI's real query-syntax search engine was
+//! unreachable from any CLI command: `Library` and `Backend`/`Cache`
+//! were two entirely disconnected data-access layers over
+//! incompatible schemas. See the #201 audit for the full writeup.
+//!
+//! `Library::open`/`create`/`open_test` now all delegate schema
+//! creation and SQL function/collation registration to
+//! [`crate::backend::Backend::new`] -- the same real, bundled
+//! `metadata_sqlite.sql` DDL and real function ports `Cache` uses.
+//! [`Library::search`] shares that same live connection with a
+//! [`crate::cache::Cache`]/[`crate::search::search`] call (via
+//! `Backend`'s cheap `Clone`, not a second connection), so the CLI's
+//! `search` subcommand now gets the real query-syntax engine
+//! (`author:`, `tag:`, date ranges, boolean operators, `AND`/`OR`/
+//! `NOT`) instead of the old `title LIKE '%q%'` stub.
+//!
+//! One real behavioral consequence of the real schema: it includes
+//! `books_insert_trg`, which unconditionally overwrites `sort` and
+//! `uuid` on every `INSERT INTO books` (`sort=title_sort(NEW.title),
+//! uuid=uuid4()`) -- exactly what real calibre does. Callers that want
+//! a *specific* `uuid` preserved (`add_book_db_entry`, used by
+//! `restore.rs`'s OPF-driven restore) can't set it via the `INSERT`
+//! itself anymore; it now does an explicit `UPDATE` afterward, the
+//! same pattern real calibre's own restore path uses.
+//!
+//! [`Library::open_test`] now backs its database with a real temp
+//! directory (auto-cleaned via [`TestDirGuard`]'s `Drop`) instead of
+//! an in-memory `:memory:` connection -- `Backend::new` always creates
+//! a real file at `<library_path>/metadata.db`, and this crate has no
+//! separate in-memory code path for it. A side effect: every method
+//! that used to special-case `self.path == PathBuf::from(":memory:")`
+//! to skip real file operations during tests now always does them for
+//! real, which is strictly more faithful test coverage, not less.
+//!
+//! # Not unified in this pass
+//!
+//! `Library` still owns real functionality `Cache`/`Backend` has not
+//! grown yet -- all filesystem book/format/cover management
+//! (folder-per-book layout, rename-on-metadata-change, format file
+//! add/remove, cover copy, clone-library, delete-with-cleanup) and all
+//! custom-column support (dynamic `custom_column_N` tables). None of
+//! that has been ported to `Cache` yet (`cache.rs`'s own module docs
+//! list custom columns as not-yet-ported), so `Library` keeps doing it
+//! itself, just against the real schema now instead of its own ad hoc
+//! one. Fully collapsing `Library` into `Cache` -- so the CLI operates
+//! on one data-access layer instead of two -- would require porting
+//! that functionality first; out of scope here.
+
+use crate::backend::Backend;
 use crate::book::Book;
 use calibre_ebooks::metadata::MetaInformation;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Result};
+use rusqlite::{Connection, OptionalExtension, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -24,44 +86,62 @@ pub struct Category {
     // Add other fields as needed (rating, etc)
 }
 
+/// Auto-cleans up [`Library::open_test`]'s backing temp directory when
+/// the `Library` (and this guard along with it) drops.
+struct TestDirGuard(PathBuf);
+
+impl Drop for TestDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 pub struct Library {
-    conn: Connection,
+    backend: Backend,
     path: PathBuf,
+    _test_dir: Option<TestDirGuard>,
 }
 
 impl Library {
+    /// Opens an existing library. Errors if `metadata.db` doesn't
+    /// exist yet -- use [`Library::create`] for a brand-new one.
     pub fn open(path: PathBuf) -> Result<Self, LibraryError> {
         let db_path = path.join("metadata.db");
         if !db_path.exists() {
             return Err(LibraryError::InvalidPath);
         }
-
-        let conn = Connection::open_with_flags(
-            &db_path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
-        )?;
-
-        // Register custom functions expected by Calibre triggers
-        Self::register_functions(&conn)?;
-
-        Ok(Library { conn, path })
+        let backend = Backend::new(&path)?;
+        Ok(Library {
+            backend,
+            path,
+            _test_dir: None,
+        })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    pub fn conn(&self) -> &Connection {
-        &self.conn
+    /// Locks and returns the underlying connection. Callers that need
+    /// to run raw SQL (mostly test setup) can chain straight off this,
+    /// e.g. `lib.conn().execute(...)`, same as before -- the returned
+    /// guard derefs to `&Connection`/`&mut Connection`.
+    pub fn conn(&self) -> MutexGuard<'_, Connection> {
+        self.backend.conn.lock().unwrap()
     }
 
-    /// Open an in-memory database for testing
+    /// Opens a fresh library backed by a real (auto-cleaned-up) temp
+    /// directory, for tests. See this module's docs for why it's a
+    /// real directory now rather than an in-memory connection.
     pub fn open_test() -> Result<Self, LibraryError> {
-        let conn = Connection::open_in_memory()?;
-        Self::init_schema(&conn)?;
+        let path =
+            std::env::temp_dir().join(format!("calibre_oxide_libtest_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&path)?;
+        let backend = Backend::new(&path)?;
         Ok(Library {
-            conn,
-            path: PathBuf::from(":memory:"),
+            backend,
+            path: path.clone(),
+            _test_dir: Some(TestDirGuard(path)),
         })
     }
 
@@ -74,122 +154,34 @@ impl Library {
                 "Database already exists".to_string(),
             ));
         }
-
-        let conn = Connection::open_with_flags(
-            &db_path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_URI,
-        )?;
-
-        Self::init_schema(&conn)?;
-
-        // Register custom functions (same as open)
-        Self::register_functions(&conn)?;
-
-        Ok(Library { conn, path })
-    }
-
-    fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
-        conn.execute_batch(
-            "CREATE TABLE books (
-                id INTEGER PRIMARY KEY,
-                title TEXT,
-                sort TEXT,
-                timestamp TEXT,
-                pubdate TEXT,
-                series_index REAL,
-                author_sort TEXT,
-                isbn TEXT,
-                lccn TEXT,
-                path TEXT,
-                has_cover INTEGER,
-                uuid TEXT
-            );
-            CREATE TABLE authors (
-                id INTEGER PRIMARY KEY,
-                name TEXT UNIQUE,
-                sort TEXT,
-                link TEXT
-            );
-            CREATE TABLE books_authors_link (
-                id INTEGER PRIMARY KEY,
-                book INTEGER,
-                author INTEGER
-            );
-            CREATE TABLE custom_columns (
-                id INTEGER PRIMARY KEY,
-                label TEXT UNIQUE,
-                name TEXT,
-                datatype TEXT,
-                mark_for_delete INTEGER DEFAULT 0,
-                editable INTEGER DEFAULT 1,
-                display TEXT DEFAULT '{}',
-                is_multiple INTEGER DEFAULT 0,
-                normalized INTEGER DEFAULT 0
-            );
-            CREATE TABLE preferences (
-                key TEXT PRIMARY KEY,
-                val TEXT
-            );
-            CREATE TABLE data (
-                id INTEGER PRIMARY KEY,
-                book INTEGER,
-                format TEXT, 
-                uncompressed_size INTEGER,
-                name TEXT
-            );",
-        )
-    }
-
-    fn register_functions(conn: &Connection) -> Result<(), rusqlite::Error> {
-        conn.create_scalar_function(
-            "title_sort",
-            1,
-            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
-            |ctx| {
-                let title: String = ctx.get(0)?;
-                Ok(title)
-            },
-        )?;
-
-        conn.create_scalar_function(
-            "author_to_author_sort",
-            1,
-            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
-            |ctx| {
-                let author: String = ctx.get(0)?;
-                Ok(author)
-            },
-        )?;
-
-        conn.create_scalar_function(
-            "uuid4",
-            0,
-            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
-            |_ctx| Ok(uuid::Uuid::new_v4().to_string()),
-        )?;
-        Ok(())
+        let backend = Backend::new(&path)?;
+        Ok(Library {
+            backend,
+            path,
+            _test_dir: None,
+        })
     }
 
     pub fn insert_test_book(&self, title: &str) -> Result<(), LibraryError> {
-        self.conn.execute(
-            "INSERT INTO books (title, sort, author_sort, has_cover, series_index, path) 
-             VALUES (?1, ?1, 'Author', 0, 1.0, '')",
+        self.conn().execute(
+            "INSERT INTO books (title, author_sort, has_cover, series_index, path)
+             VALUES (?1, 'Author', 0, 1.0, '')",
             (title,),
         )?;
         Ok(())
     }
 
     pub fn book_count(&self) -> Result<i32, LibraryError> {
-        let mut stmt = self.conn.prepare("SELECT COUNT(*) FROM books")?;
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT COUNT(*) FROM books")?;
         let count: i32 = stmt.query_row([], |row| row.get(0))?;
         Ok(count)
     }
 
     pub fn list_books(&self) -> Result<Vec<Book>, LibraryError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, title, sort, timestamp, pubdate, series_index, author_sort, isbn, lccn, path, has_cover, uuid 
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, sort, timestamp, pubdate, series_index, author_sort, isbn, lccn, path, has_cover, uuid
              FROM books"
         )?;
 
@@ -269,30 +261,35 @@ impl Library {
 
         let book_id = self.add_book_db_entry(metadata, &rel_path_str)?;
 
-        // 5. File System Operations
-        if self.path != PathBuf::from(":memory:") {
-            let dest_dir = self.path.join(&rel_path);
-            fs::create_dir_all(&dest_dir)?;
+        let dest_dir = self.path.join(&rel_path);
+        fs::create_dir_all(&dest_dir)?;
 
-            let ext = source_path.extension().unwrap_or_default();
-            let dest_file = dest_dir
-                .join(sanitize_filename(&metadata.title))
-                .with_extension(ext);
+        let ext = source_path.extension().unwrap_or_default();
+        let dest_file = dest_dir
+            .join(sanitize_filename(&metadata.title))
+            .with_extension(ext);
 
-            fs::copy(source_path, dest_file)?;
-        }
+        fs::copy(source_path, dest_file)?;
 
         Ok(book_id)
     }
 
     /// adds a book entry to the database without copying files.
     /// used for restore_database.
+    ///
+    /// `books_insert_trg` (real schema) unconditionally overwrites
+    /// `sort`/`uuid` right after the `INSERT` fires, so a caller-
+    /// supplied `metadata.uuid` (e.g. from an OPF backup being
+    /// restored) is restored via an explicit `UPDATE` afterward --
+    /// same pattern real calibre's own restore path uses. A book with
+    /// no supplied uuid just keeps the trigger's freshly generated one.
     pub fn add_book_db_entry(
         &mut self,
         metadata: &MetaInformation,
         rel_path: &str,
     ) -> Result<i32, LibraryError> {
-        let tx = self.conn.transaction()?;
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
 
         // 1. Author Logic
         let author_name = metadata
@@ -302,21 +299,23 @@ impl Library {
             .unwrap_or("Unknown");
 
         // 2. Insert Book
-        // 2. Insert Book
         tx.execute(
-            "INSERT INTO books (title, sort, author_sort, path, has_cover, timestamp, pubdate, uuid, series_index)
-             VALUES (?1, ?1, ?2, ?3, 0, ?5, ?6, ?4, ?7)",
+            "INSERT INTO books (title, author_sort, path, has_cover, timestamp, pubdate, series_index)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)",
             (
                 &metadata.title,
                 author_name,
                 rel_path,
-                metadata.uuid.as_deref().unwrap_or(""),
                 metadata.timestamp.unwrap_or(chrono::Utc::now()).to_rfc3339(),
                 metadata.pubdate.unwrap_or(chrono::Utc::now()).to_rfc3339(),
                 metadata.series_index,
             ),
         )?;
         let book_id = tx.last_insert_rowid() as i32;
+
+        if let Some(uuid) = metadata.uuid.as_deref() {
+            tx.execute("UPDATE books SET uuid = ?1 WHERE id = ?2", (uuid, book_id))?;
+        }
 
         // 3. Insert/Get Author
         let author_id: i32 = {
@@ -325,10 +324,7 @@ impl Library {
             if let Some(row) = rows.next()? {
                 row.get(0)?
             } else {
-                tx.execute(
-                    "INSERT INTO authors (name, sort) VALUES (?1, ?1)",
-                    [author_name],
-                )?;
+                tx.execute("INSERT INTO authors (name) VALUES (?1)", [author_name])?;
                 tx.last_insert_rowid() as i32
             }
         };
@@ -351,28 +347,19 @@ impl Library {
     ) -> Result<(), LibraryError> {
         // Warning: Transaction safety with file ops is hard.
         // Ideally we do file ops after commit, or rollback file ops if DB fails.
-        // For this simple implementation, we try file ops first (if not memory), then commit.
+        // For this simple implementation, we try file ops first, then commit.
         // If file ops fail, we abort.
+        self.rename_book_files(book_id, title, author)
+            .map_err(LibraryError::Io)?;
 
-        if self.path != PathBuf::from(":memory:") {
-            self.rename_book_files(book_id, title, author)
-                .map_err(|e| LibraryError::Io(e))?;
-        }
-
-        let tx = self.conn.transaction()?;
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
 
         // 1. Update Title in Books
-        // Note: rename_book_files might have already updated the path in DB?
-        // Actually, rename_book_files needs to know the NEW path, so it calculates it.
-        // But it should also update the path in the DB.
-
-        // Re-calculate path to save in DB
-        // Logic duplicated from rename for safety, or we rely on rename_book_files to do it?
-        // Let's rely on rename_book_files to UPDATE the path column if it succeeds.
-        // But we still need to update Title/Author columns here.
-
+        // Note: rename_book_files already updated the path column if it
+        // succeeded; this still needs to update title/author_sort.
         tx.execute(
-            "UPDATE books SET title = ?1, sort = ?1, author_sort = ?2 WHERE id = ?3",
+            "UPDATE books SET title = ?1, author_sort = ?2 WHERE id = ?3",
             (title, author, book_id),
         )?;
 
@@ -385,7 +372,7 @@ impl Library {
             if let Some(row) = rows.next()? {
                 row.get(0)?
             } else {
-                tx.execute("INSERT INTO authors (name, sort) VALUES (?1, ?1)", [author])?;
+                tx.execute("INSERT INTO authors (name) VALUES (?1)", [author])?;
                 tx.last_insert_rowid() as i32
             }
         };
@@ -396,10 +383,6 @@ impl Library {
         )?;
 
         tx.commit()?;
-        // tx.commit()?; // Already committed above? No, wait.
-        // The original code had tx.commit()?; at line 309.
-        // My previous edit added another one.
-        // So I just need to remove one.
         Ok(())
     }
 
@@ -412,11 +395,6 @@ impl Library {
     ) -> Result<bool, LibraryError> {
         let book_opt = self.get_book(book_id)?;
         if let Some(book) = book_opt {
-            if self.path == PathBuf::from(":memory:") {
-                // In-memory support is limited for file ops, but we can pretend
-                return Ok(true);
-            }
-
             let book_rel_path = book.path;
             if book_rel_path.is_empty() {
                 return Err(LibraryError::Transaction("Book has no path".to_string()));
@@ -444,7 +422,7 @@ impl Library {
             std::fs::copy(source_path, dest_path)?;
 
             // Update timestamp of the book
-            self.conn.execute(
+            self.conn().execute(
                 "UPDATE books SET timestamp = datetime('now') WHERE id = ?1",
                 (book_id,),
             )?;
@@ -466,7 +444,7 @@ impl Library {
     ) -> std::io::Result<()> {
         // Query old path
         let old_rel_path: String = self
-            .conn
+            .conn()
             .query_row("SELECT path FROM books WHERE id = ?1", [book_id], |row| {
                 row.get(0)
             })
@@ -533,7 +511,7 @@ impl Library {
 
         // Update DB with NEW path
         let new_rel_path_str = new_rel_path.to_string_lossy().replace("\\", "/");
-        self.conn
+        self.conn()
             .execute(
                 "UPDATE books SET path = ?1 WHERE id = ?2",
                 (&new_rel_path_str, book_id),
@@ -549,21 +527,21 @@ impl Library {
         new_cover_path: &Path,
     ) -> Result<(), LibraryError> {
         let path_query: Option<String> = self
-            .conn
+            .conn()
             .query_row("SELECT path FROM books WHERE id = ?1", (book_id,), |row| {
                 row.get(0)
             })
             .ok();
 
         if let Some(rel_path) = path_query {
-            if self.path != PathBuf::from(":memory:") && !rel_path.is_empty() {
+            if !rel_path.is_empty() {
                 let dir_path = self.path.join(rel_path);
                 if dir_path.exists() {
                     let dest_path = dir_path.join("cover.jpg");
                     fs::copy(new_cover_path, dest_path)?;
 
                     // Update DB
-                    self.conn
+                    self.conn()
                         .execute("UPDATE books SET has_cover = 1 WHERE id = ?1", (book_id,))?;
                 }
             }
@@ -574,24 +552,26 @@ impl Library {
     pub fn delete_book(&mut self, book_id: i32) -> Result<(), LibraryError> {
         // Get path before deleting to remove files
         let path_query: Option<String> = self
-            .conn
+            .conn()
             .query_row("SELECT path FROM books WHERE id = ?1", (book_id,), |row| {
                 row.get(0)
             })
             .ok();
 
-        let tx = self.conn.transaction()?;
-
-        tx.execute("DELETE FROM books WHERE id = ?1", (book_id,))?;
-        tx.execute("DELETE FROM books_authors_link WHERE book = ?1", (book_id,))?;
-        // Note: Authors are left even if they have no books, typical Calibre behavior (or maybe cleanup?)
-        // We leave them for now.
-
-        tx.commit()?;
+        {
+            let mut conn = self.conn();
+            let tx = conn.transaction()?;
+            tx.execute("DELETE FROM books WHERE id = ?1", (book_id,))?;
+            // Note: the real schema's `books_delete_trg` already cascades
+            // this cleanup (books_authors_link and more); left explicit
+            // here too since it's harmless (no-op on an already-empty set).
+            tx.execute("DELETE FROM books_authors_link WHERE book = ?1", (book_id,))?;
+            tx.commit()?;
+        }
 
         // File Cleanup
         if let Some(rel_path) = path_query {
-            if self.path != PathBuf::from(":memory:") && !rel_path.is_empty() {
+            if !rel_path.is_empty() {
                 let dir_path = self.path.join(rel_path);
                 if dir_path.exists() {
                     // Try to remove the directory (and contents)
@@ -608,7 +588,8 @@ impl Library {
     pub fn get_custom_column_label_map(
         &self,
     ) -> Result<std::collections::HashMap<String, serde_json::Value>, LibraryError> {
-        let mut stmt = self.conn.prepare("SELECT id, label, name, datatype, mark_for_delete, editable, display, is_multiple, normalized FROM custom_columns")?;
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT id, label, name, datatype, mark_for_delete, editable, display, is_multiple, normalized FROM custom_columns")?;
 
         let rows = stmt.query_map([], |row| {
             let id: i32 = row.get(0)?;
@@ -650,25 +631,22 @@ impl Library {
         Ok(custom_columns)
     }
 
+    /// Real query-syntax search (issue #210): shares this `Library`'s
+    /// own live connection with a [`crate::cache::Cache`] (via
+    /// `Backend`'s cheap `Clone` -- no second connection opened) and
+    /// delegates to [`crate::search::search`]. See this module's docs
+    /// for why that engine was previously unreachable from the CLI.
     pub fn search(&self, query: &str) -> Result<Vec<i32>, LibraryError> {
-        // TODO: Implement full search syntax parsing.
-        // For now, simple LIKE on title
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id FROM books WHERE title LIKE ?1 OR author_sort LIKE ?1")?;
-        let pattern = format!("%{}%", query);
-        let rows = stmt.query_map([&pattern], |row| row.get(0))?;
-
-        let mut ids = Vec::new();
-        for row in rows {
-            ids.push(row?);
-        }
-        Ok(ids)
+        let cache = Arc::new(Mutex::new(crate::cache::Cache {
+            backend: self.backend.clone(),
+        }));
+        crate::search::search(&cache, query).map_err(|e| LibraryError::Transaction(e.to_string()))
     }
 
     pub fn get_book(&self, id: i32) -> Result<Option<Book>, LibraryError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, title, sort, timestamp, pubdate, series_index, author_sort, isbn, lccn, path, has_cover, uuid 
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, sort, timestamp, pubdate, series_index, author_sort, isbn, lccn, path, has_cover, uuid
              FROM books WHERE id = ?1"
         )?;
 
@@ -693,8 +671,10 @@ impl Library {
             Ok(None)
         }
     }
+
     pub fn all_book_ids(&self) -> Result<Vec<i32>, LibraryError> {
-        let mut stmt = self.conn.prepare("SELECT id FROM books")?;
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT id FROM books")?;
         let rows = stmt.query_map([], |row| row.get(0))?;
 
         let mut ids = Vec::new();
@@ -707,10 +687,6 @@ impl Library {
     pub fn backup_metadata_to_opf(&self, book_id: i32) -> Result<(), LibraryError> {
         let book_opt = self.get_book(book_id)?;
         if let Some(book) = book_opt {
-            if self.path == PathBuf::from(":memory:") {
-                return Ok(());
-            }
-
             let book_rel_path = book.path;
             if book_rel_path.is_empty() {
                 // Should we error or skip? Python skips invisible books or similar?
@@ -741,7 +717,7 @@ impl Library {
     }
 
     pub fn vacuum(&self, vacuum_fts: bool) -> Result<(), LibraryError> {
-        self.conn.execute("VACUUM", [])?;
+        self.conn().execute("VACUUM", [])?;
         if vacuum_fts {
             // Placeholder: functionality for FTS vacuum if we have FTS db
         }
@@ -754,7 +730,8 @@ impl Library {
         let mut categories = std::collections::HashMap::new();
 
         // 1. Authors
-        let mut stmt = self.conn.prepare("SELECT name, (SELECT COUNT(*) FROM books_authors_link WHERE author = authors.id) as count FROM authors")?;
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT name, (SELECT COUNT(*) FROM books_authors_link WHERE author = authors.id) as count FROM authors")?;
         let author_rows = stmt.query_map([], |row| {
             Ok(Category {
                 name: row.get(0)?,
@@ -770,7 +747,7 @@ impl Library {
 
         // TODO: Add other categories (Series, Tags, etc.)
         // For series:
-        // let mut stmt = self.conn.prepare("SELECT name, (SELECT COUNT(*) FROM books WHERE series_index IS NOT NULL) ...")?
+        // let mut stmt = self.conn().prepare("SELECT name, (SELECT COUNT(*) FROM books WHERE series_index IS NOT NULL) ...")?
         // We'll tackle series when we have a series table or clearer schema.
 
         Ok(categories)
@@ -779,10 +756,6 @@ impl Library {
     pub fn remove_format(&mut self, book_id: i32, fmt: &str) -> Result<(), LibraryError> {
         let book_opt = self.get_book(book_id)?;
         if let Some(book) = book_opt {
-            if self.path == PathBuf::from(":memory:") {
-                return Ok(());
-            }
-
             let book_rel_path = book.path;
             if book_rel_path.is_empty() {
                 return Ok(()); // Or fail?
@@ -813,10 +786,6 @@ impl Library {
                                 fs::remove_file(path)?;
                                 // Only remove one? Or all matching?
                                 // Ideally there is only one per format.
-                                // We'll break after first match to match standard behavior?
-                                // Actually better to remove all if duplicates exist?
-                                // Python calls db.remove_formats(fmt_map).
-                                // Let's stop after one for safety or continue.
                                 // I'll stop after one.
                                 return Ok(());
                             }
@@ -836,7 +805,8 @@ impl Library {
     }
 
     pub fn all_authors(&self) -> Result<Vec<(i32, String)>, LibraryError> {
-        let mut stmt = self.conn.prepare("SELECT id, name FROM authors")?;
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT id, name FROM authors")?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
 
         let mut authors = Vec::new();
@@ -848,9 +818,8 @@ impl Library {
 
     pub fn format_files(&self, book_id: i32) -> Result<Vec<(String, String)>, LibraryError> {
         // Query 'data' table for formats
-        let mut stmt = self
-            .conn
-            .prepare("SELECT name, format FROM data WHERE book = ?1");
+        let conn = self.conn();
+        let stmt = conn.prepare("SELECT name, format FROM data WHERE book = ?1");
 
         match stmt {
             Ok(mut s) => {
@@ -869,12 +838,6 @@ impl Library {
     }
 
     pub fn clone_to(&self, dest: &Path) -> Result<(), LibraryError> {
-        if self.path == PathBuf::from(":memory:") {
-            return Err(LibraryError::Transaction(
-                "Cannot clone memory library to disk".to_string(),
-            ));
-        }
-
         if !dest.exists() {
             fs::create_dir_all(dest)?;
         }
@@ -902,9 +865,8 @@ impl Library {
     }
 
     pub fn has_cover(&self, book_id: i32) -> Result<bool, LibraryError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT has_cover FROM books WHERE id = ?1")?;
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT has_cover FROM books WHERE id = ?1")?;
         let has_cover: Option<i32> = stmt.query_row([book_id], |row| row.get(0)).ok();
         Ok(has_cover.unwrap_or(0) != 0)
     }
@@ -920,8 +882,10 @@ impl Library {
         datatype: &str,
         is_multiple: bool,
     ) -> Result<i32, LibraryError> {
+        let mut conn = self.conn();
+
         // Validation: Verify label is unique
-        let count: i32 = self.conn.query_row(
+        let count: i32 = conn.query_row(
             "SELECT COUNT(*) FROM custom_columns WHERE label = ?1",
             [label],
             |row| row.get(0),
@@ -933,11 +897,11 @@ impl Library {
             )));
         }
 
-        let tx = self.conn.transaction()?;
+        let tx = conn.transaction()?;
 
         // 1. Insert into custom_columns
         tx.execute(
-            "INSERT INTO custom_columns 
+            "INSERT INTO custom_columns
             (label, name, datatype, mark_for_delete, editable, display, is_multiple, normalized)
             VALUES (?1, ?2, ?3, 0, 1, '{}', ?4, 0)",
             (label, name, datatype, is_multiple),
@@ -970,38 +934,22 @@ impl Library {
                 )?;
             }
             "text" | "comments" | "series" => {
-                if is_multiple || datatype == "series" {
-                    if is_multiple {
-                        return Err(LibraryError::Transaction(
-                            "Multiple-value text columns not yet supported in this port"
-                                .to_string(),
-                        ));
-                    }
-
-                    tx.execute(
-                        &format!(
-                            "CREATE TABLE {} (id INTEGER PRIMARY KEY, book INTEGER, value TEXT)",
-                            table_name
-                        ),
-                        [],
-                    )?;
-                    tx.execute(
-                        &format!("CREATE INDEX idx_{}_book ON {} (book)", col_id, table_name),
-                        [],
-                    )?;
-                } else {
-                    tx.execute(
-                        &format!(
-                            "CREATE TABLE {} (id INTEGER PRIMARY KEY, book INTEGER, value TEXT)",
-                            table_name
-                        ),
-                        [],
-                    )?;
-                    tx.execute(
-                        &format!("CREATE INDEX idx_{}_book ON {} (book)", col_id, table_name),
-                        [],
-                    )?;
+                if is_multiple {
+                    return Err(LibraryError::Transaction(
+                        "Multiple-value text columns not yet supported in this port".to_string(),
+                    ));
                 }
+                tx.execute(
+                    &format!(
+                        "CREATE TABLE {} (id INTEGER PRIMARY KEY, book INTEGER, value TEXT)",
+                        table_name
+                    ),
+                    [],
+                )?;
+                tx.execute(
+                    &format!("CREATE INDEX idx_{}_book ON {} (book)", col_id, table_name),
+                    [],
+                )?;
             }
             _ => {
                 tx.execute(
@@ -1026,7 +974,7 @@ impl Library {
     ) -> Result<(), LibraryError> {
         // 1. Get column info
         let col_info: Option<(i32, String)> = self
-            .conn
+            .conn()
             .query_row(
                 "SELECT id, datatype FROM custom_columns WHERE label = ?1",
                 [label],
@@ -1041,7 +989,7 @@ impl Library {
             match datatype.as_str() {
                 "bool" => {
                     let val = value.parse::<bool>().unwrap_or(false);
-                    self.conn.execute(
+                    self.conn().execute(
                         &format!(
                             "INSERT OR REPLACE INTO {} (book, value) VALUES (?1, ?2)",
                             table_name
@@ -1051,7 +999,7 @@ impl Library {
                 }
                 "int" => {
                     let val = value.parse::<i32>().unwrap_or(0);
-                    self.conn.execute(
+                    self.conn().execute(
                         &format!(
                             "INSERT OR REPLACE INTO {} (book, value) VALUES (?1, ?2)",
                             table_name
@@ -1061,7 +1009,7 @@ impl Library {
                 }
                 "float" | "rating" => {
                     let val = value.parse::<f64>().unwrap_or(0.0);
-                    self.conn.execute(
+                    self.conn().execute(
                         &format!(
                             "INSERT OR REPLACE INTO {} (book, value) VALUES (?1, ?2)",
                             table_name
@@ -1071,7 +1019,7 @@ impl Library {
                 }
                 _ => {
                     // Text and others
-                    self.conn.execute(
+                    self.conn().execute(
                         &format!(
                             "INSERT OR REPLACE INTO {} (book, value) VALUES (?1, ?2)",
                             table_name
@@ -1090,15 +1038,14 @@ impl Library {
     }
 
     pub fn get_preference(&self, key: &str) -> Result<Option<String>, LibraryError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT val FROM preferences WHERE key = ?1")?;
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT val FROM preferences WHERE key = ?1")?;
         let val: Option<String> = stmt.query_row([key], |row| row.get(0)).optional()?;
         Ok(val)
     }
 
     pub fn set_preference(&mut self, key: &str, val: &str) -> Result<(), LibraryError> {
-        self.conn.execute(
+        self.conn().execute(
             "INSERT OR REPLACE INTO preferences (key, val) VALUES (?1, ?2)",
             (key, val),
         )?;
@@ -1111,7 +1058,7 @@ impl Library {
         label: &str,
     ) -> Result<Option<String>, LibraryError> {
         let col_info: Option<(i32, String)> = self
-            .conn
+            .conn()
             .query_row(
                 "SELECT id, datatype FROM custom_columns WHERE label = ?1",
                 [label],
@@ -1122,7 +1069,7 @@ impl Library {
         if let Some((col_id, datatype)) = col_info {
             let table_name = format!("custom_column_{}", col_id);
             let val: Option<String> = self
-                .conn
+                .conn()
                 .query_row(
                     &format!("SELECT value FROM {} WHERE book = ?1", table_name),
                     [book_id],
@@ -1146,9 +1093,10 @@ impl Library {
     }
 
     pub fn get_authors(&self, book_id: i32) -> Result<Vec<String>, LibraryError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT a.name FROM authors a 
-             JOIN books_authors_link bal ON a.id = bal.author 
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT a.name FROM authors a
+             JOIN books_authors_link bal ON a.id = bal.author
              WHERE bal.book = ?1",
         )?;
         let rows = stmt.query_map([book_id], |row| row.get(0))?;
@@ -1162,16 +1110,9 @@ impl Library {
 
     pub fn remove_books(&mut self, ids: &[i32], permanent: bool) -> Result<(), LibraryError> {
         if !permanent {
-            // TODO: Implement recycle bin / trash support
-            // For now, we will warn/log and proceed with permanent deletion or return error?
-            // Python implementation moves to trash.
-            // "trash_name()" is used.
-            // Since we don't have trash support yet, let's just delete but print a warning if we could.
-            // Or strictly speaking, we could error.
-            // But to unblock, let's treat as permanent for now or maybe implement a simple trash?
-            // "crates/calibre_utils/src/recycle_bin.rs" appears to be ported?
-            // But from modules_to_port.md it says [x] recycle_bin.py.
-            // Let's assume for this PR we just do permanent delete to match delete_book.
+            // TODO: Implement recycle bin / trash support. Real calibre
+            // moves to trash; this crate doesn't have that wired up yet
+            // for `Library`, so we do a permanent delete and warn.
             eprintln!("Warning: Trash not supported yet, deleting permanently.");
         }
 
@@ -1203,15 +1144,15 @@ impl Library {
             }
             "sort" | "author_sort" | "isbn" | "lccn" | "uuid" => {
                 let sql = format!("UPDATE books SET {} = ?1 WHERE id = ?2", field);
-                self.conn.execute(&sql, (value, book_id))?;
+                self.conn().execute(&sql, (value, book_id))?;
             }
             "pubdate" | "timestamp" => {
                 let sql = format!("UPDATE books SET {} = ?1 WHERE id = ?2", field);
-                self.conn.execute(&sql, (value, book_id))?;
+                self.conn().execute(&sql, (value, book_id))?;
             }
             "series_index" => {
                 let val = value.parse::<f64>().unwrap_or(1.0);
-                self.conn.execute(
+                self.conn().execute(
                     "UPDATE books SET series_index = ?1 WHERE id = ?2",
                     (val, book_id),
                 )?;
@@ -1227,8 +1168,8 @@ impl Library {
     }
 
     pub fn remove_custom_column(&mut self, label: &str) -> Result<(), LibraryError> {
-        let col_id: Option<i32> = self
-            .conn
+        let mut conn = self.conn();
+        let col_id: Option<i32> = conn
             .query_row(
                 "SELECT id FROM custom_columns WHERE label = ?1",
                 [label],
@@ -1237,7 +1178,7 @@ impl Library {
             .optional()?;
 
         if let Some(id) = col_id {
-            let tx = self.conn.transaction()?;
+            let tx = conn.transaction()?;
 
             // 1. Delete meta
             tx.execute("DELETE FROM custom_columns WHERE id = ?1", [id])?;
@@ -1247,8 +1188,6 @@ impl Library {
             // We use format! string since we can't parametrize table names.
             // id is an integer controlled by us, so injection risk is minimal/none.
             tx.execute(&format!("DROP TABLE IF EXISTS {}", table_name), [])?;
-
-            // Also drop indices? SQLite drops indices when table is dropped usually.
 
             tx.commit()?;
             Ok(())
@@ -1284,21 +1223,18 @@ mod tests {
     fn test_update_book_metadata() {
         let mut lib = Library::open_test().unwrap();
         // Insert manually for test since add_book requires MetaInformation
-        lib.conn.execute(
-            "INSERT INTO books (title, sort, author_sort, path, has_cover, timestamp, pubdate, uuid, series_index) VALUES ('Old Title', 'Old Title', 'Old Author', '', 0, '', '', '', 1.0)", 
+        lib.conn().execute(
+            "INSERT INTO books (title, author_sort, path, has_cover, timestamp, pubdate, series_index) VALUES ('Old Title', 'Old Author', '', 0, '', '', 1.0)",
             [],
         ).unwrap();
-        let book_id = lib.conn.last_insert_rowid() as i32;
+        let book_id = lib.conn().last_insert_rowid() as i32;
 
         // Link author
-        lib.conn
-            .execute(
-                "INSERT INTO authors (name, sort) VALUES ('Old Author', 'Old Author')",
-                [],
-            )
+        lib.conn()
+            .execute("INSERT INTO authors (name) VALUES ('Old Author')", [])
             .unwrap();
-        let auth_id = lib.conn.last_insert_rowid();
-        lib.conn
+        let auth_id = lib.conn().last_insert_rowid();
+        lib.conn()
             .execute(
                 "INSERT INTO books_authors_link (book, author) VALUES (?1, ?2)",
                 (book_id, auth_id),
@@ -1310,28 +1246,13 @@ mod tests {
             .unwrap();
 
         // Verify Book
-        let book: Book = lib.conn.query_row("SELECT id, title, sort, timestamp, pubdate, series_index, author_sort, isbn, lccn, path, has_cover, uuid FROM books WHERE id = ?1", [book_id], |row| {
-             Ok(Book {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                sort: row.get(2)?,
-                timestamp: row.get(3)?,
-                pubdate: row.get(4)?,
-                series_index: row.get(5)?,
-                author_sort: row.get(6)?,
-                isbn: row.get(7)?,
-                lccn: row.get(8)?,
-                path: row.get(9)?,
-                has_cover: row.get::<_, i32>(10)? != 0,
-                uuid: row.get(11)?,
-            })
-        }).unwrap();
+        let book = lib.get_book(book_id).unwrap().unwrap();
 
         assert_eq!(book.title, "New Title");
-        assert_eq!(book.author_sort, Some("New Author".to_string())); // In our simple logic, author_sort = author name
+        assert_eq!(book.author_sort, Some("New Author".to_string()));
 
         // Verify Author Link
-        let auth_name: String = lib.conn.query_row(
+        let auth_name: String = lib.conn().query_row(
             "SELECT name FROM authors JOIN books_authors_link ON authors.id = books_authors_link.author WHERE books_authors_link.book = ?1",
             [book_id],
             |row| row.get(0)
@@ -1342,15 +1263,15 @@ mod tests {
     #[test]
     fn test_delete_book() {
         let mut lib = Library::open_test().unwrap();
-        lib.conn
+        lib.conn()
             .execute("INSERT INTO books (title) VALUES ('To Delete')", [])
             .unwrap();
-        let book_id = lib.conn.last_insert_rowid() as i32;
+        let book_id = lib.conn().last_insert_rowid() as i32;
 
         lib.delete_book(book_id).unwrap();
 
         let count: i32 = lib
-            .conn
+            .conn()
             .query_row(
                 "SELECT COUNT(*) FROM books WHERE id = ?1",
                 [book_id],
@@ -1362,49 +1283,9 @@ mod tests {
 
     #[test]
     fn test_rename_book() {
-        // Use a temp dir for real FS test
-        let temp_dir = std::env::temp_dir().join("calibre_oxide_test_rename");
-        if temp_dir.exists() {
-            std::fs::remove_dir_all(&temp_dir).unwrap();
-        }
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        // Touch metadata.db
-        std::fs::File::create(temp_dir.join("metadata.db")).unwrap();
+        let mut lib = Library::open_test().unwrap();
+        let temp_dir = lib.path().to_path_buf();
 
-        let mut lib = Library::open(temp_dir.clone()).unwrap();
-
-        // Manual migration for test
-        lib.conn
-            .execute_batch(
-                "CREATE TABLE books (
-                    id INTEGER PRIMARY KEY,
-                    title TEXT,
-                    sort TEXT,
-                    timestamp TEXT,
-                    pubdate TEXT,
-                    series_index REAL,
-                    author_sort TEXT,
-                    isbn TEXT,
-                    lccn TEXT,
-                    path TEXT,
-                    has_cover INTEGER,
-                    uuid TEXT
-                );
-                CREATE TABLE authors (
-                    id INTEGER PRIMARY KEY,
-                    name TEXT UNIQUE,
-                    sort TEXT,
-                    link TEXT
-                );
-                CREATE TABLE books_authors_link (
-                    id INTEGER PRIMARY KEY,
-                    book INTEGER,
-                    author INTEGER
-                );",
-            )
-            .unwrap();
-
-        // 1. Add Book (Manual insert to bypass MetaInformation requirement for now, mimicking add_book logic partially)
         let old_author = "Old Author";
         let old_title = "Old Title";
         let old_rel_path = "Old_Author/Old_Title"; // Sanitized
@@ -1414,22 +1295,19 @@ mod tests {
         std::fs::create_dir_all(&full_book_dir).unwrap();
         std::fs::write(full_book_dir.join("Old Title.mock"), "content").unwrap();
 
-        lib.conn.execute(
-                "INSERT INTO books (title, sort, author_sort, path, has_cover, timestamp, pubdate, uuid, series_index) 
-                 VALUES (?1, ?1, ?2, ?3, 0, '', '', '', 1.0)",
+        lib.conn().execute(
+                "INSERT INTO books (title, author_sort, path, has_cover, timestamp, pubdate, series_index)
+                 VALUES (?1, ?2, ?3, 0, '', '', 1.0)",
                 (old_title, old_author, old_rel_path),
             ).unwrap();
-        let book_id = lib.conn.last_insert_rowid() as i32;
+        let book_id = lib.conn().last_insert_rowid() as i32;
 
         // Link Author
-        lib.conn
-            .execute(
-                "INSERT INTO authors (name, sort) VALUES (?1, ?1)",
-                [old_author],
-            )
+        lib.conn()
+            .execute("INSERT INTO authors (name) VALUES (?1)", [old_author])
             .unwrap();
-        let auth_id = lib.conn.last_insert_rowid();
-        lib.conn
+        let auth_id = lib.conn().last_insert_rowid();
+        lib.conn()
             .execute(
                 "INSERT INTO books_authors_link (book, author) VALUES (?1, ?2)",
                 (book_id, auth_id),
@@ -1442,7 +1320,7 @@ mod tests {
 
         // 3. Verify DB Update
         let new_path: String = lib
-            .conn
+            .conn()
             .query_row("SELECT path FROM books WHERE id = ?1", [book_id], |row| {
                 row.get(0)
             })
@@ -1471,30 +1349,12 @@ mod tests {
             !old_author_dir.exists(),
             "Old author directory should be gone (empty)"
         );
-
-        // Cleanup
-        drop(lib); // Close DB connection to allow cleanup
-        std::fs::remove_dir_all(&temp_dir).unwrap();
     }
 
     #[test]
     fn test_update_book_cover() {
-        let temp_dir = std::env::temp_dir().join("calibre_oxide_test_cover");
-        if temp_dir.exists() {
-            std::fs::remove_dir_all(&temp_dir).unwrap();
-        }
-        std::fs::create_dir_all(&temp_dir).unwrap();
-
-        // Touch metadata.db
-        std::fs::File::create(temp_dir.join("metadata.db")).unwrap();
-        // Use real library with manual schema
-        let mut lib = Library::open(temp_dir.clone()).unwrap();
-        // Manual Schema Init
-        lib.conn.execute_batch(
-             "CREATE TABLE books ( id INTEGER PRIMARY KEY, title TEXT, sort TEXT, timestamp TEXT, pubdate TEXT, series_index REAL, author_sort TEXT, isbn TEXT, lccn TEXT, path TEXT, has_cover INTEGER, uuid TEXT );
-              CREATE TABLE authors ( id INTEGER PRIMARY KEY, name TEXT UNIQUE, sort TEXT, link TEXT );
-              CREATE TABLE books_authors_link ( id INTEGER PRIMARY KEY, book INTEGER, author INTEGER );"
-        ).unwrap();
+        let mut lib = Library::open_test().unwrap();
+        let temp_dir = lib.path().to_path_buf();
 
         // 1. Add Book
         let author = "Cover Author";
@@ -1503,12 +1363,12 @@ mod tests {
         let full_book_dir = temp_dir.join(rel_path);
         std::fs::create_dir_all(&full_book_dir).unwrap();
 
-        lib.conn.execute(
-            "INSERT INTO books (title, sort, author_sort, path, has_cover, timestamp, pubdate, uuid, series_index)
-             VALUES (?1, ?1, ?2, ?3, 0, '', '', '', 1.0)",
+        lib.conn().execute(
+            "INSERT INTO books (title, author_sort, path, has_cover, timestamp, pubdate, series_index)
+             VALUES (?1, ?2, ?3, 0, '', '', 1.0)",
             (title, author, rel_path),
         ).unwrap();
-        let book_id = lib.conn.last_insert_rowid() as i32;
+        let book_id = lib.conn().last_insert_rowid() as i32;
 
         // 2. Create a dummy cover source
         let cover_source = temp_dir.join("source_cover.jpg");
@@ -1519,7 +1379,7 @@ mod tests {
 
         // 4. Verify DB
         let has_cover: i32 = lib
-            .conn
+            .conn()
             .query_row(
                 "SELECT has_cover FROM books WHERE id = ?1",
                 [book_id],
@@ -1531,8 +1391,29 @@ mod tests {
         // 5. Verify File
         let dest_cover = full_book_dir.join("cover.jpg");
         assert!(dest_cover.exists());
+    }
 
-        drop(lib); // Close DB connection
-        std::fs::remove_dir_all(&temp_dir).unwrap();
+    #[test]
+    fn search_uses_the_real_query_engine_not_the_old_like_stub() {
+        let mut lib = Library::open_test().unwrap();
+        lib.insert_test_book("Foundation").unwrap();
+        lib.conn()
+            .execute("INSERT INTO books (title) VALUES ('Dune')", [])
+            .unwrap();
+
+        // A bare word still matches via the "all" location, same as
+        // the old LIKE-on-title-or-author_sort stub did.
+        assert_eq!(lib.search("foundation").unwrap(), vec![1]);
+
+        // But real query syntax (AND/location prefixes) now works too,
+        // which the old stub never supported at all.
+        assert_eq!(
+            lib.search("title:foundation or title:dune").unwrap().len(),
+            2
+        );
+        assert!(lib
+            .search("title:foundation and title:dune")
+            .unwrap()
+            .is_empty());
     }
 }

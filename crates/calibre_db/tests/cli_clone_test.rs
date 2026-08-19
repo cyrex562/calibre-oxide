@@ -19,35 +19,6 @@ fn test_clone_library() {
     fs::File::create(temp_dir_src.join("metadata.db")).unwrap();
 
     let mut lib = Library::open(temp_dir_src.clone()).unwrap();
-    lib.conn()
-        .execute_batch(
-            "CREATE TABLE books (
-            id INTEGER PRIMARY KEY,
-            title TEXT,
-            sort TEXT,
-            timestamp TEXT,
-            pubdate TEXT,
-            series_index REAL,
-            author_sort TEXT,
-            isbn TEXT,
-            lccn TEXT,
-            path TEXT,
-            has_cover INTEGER,
-            uuid TEXT
-        );
-        CREATE TABLE authors (
-            id INTEGER PRIMARY KEY,
-            name TEXT UNIQUE,
-            sort TEXT,
-            link TEXT
-        );
-        CREATE TABLE books_authors_link (
-            id INTEGER PRIMARY KEY,
-            book INTEGER,
-            author INTEGER
-        );",
-        )
-        .unwrap();
 
     // Add a book
     let meta = MetaInformation {
