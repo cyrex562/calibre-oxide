@@ -79,13 +79,6 @@ pub enum LibraryError {
     Transaction(String),
 }
 
-#[derive(Debug, serde::Serialize)]
-pub struct Category {
-    pub name: String,
-    pub count: i32,
-    // Add other fields as needed (rating, etc)
-}
-
 /// Auto-cleans up [`Library::open_test`]'s backing temp directory when
 /// the `Library` (and this guard along with it) drops.
 struct TestDirGuard(PathBuf);
@@ -394,33 +387,18 @@ impl Library {
         Ok(())
     }
 
+    /// Real tag-browser categories (issue #220): `authors`/`tags`/
+    /// `series`/`publisher`/`languages`, each with a real per-item
+    /// book count and average rating -- see `categories.rs`'s module
+    /// docs for what's not covered (composite/user categories,
+    /// hierarchical categories, the `ratings` category itself).
     pub fn get_categories(
         &self,
-    ) -> Result<std::collections::HashMap<String, Vec<Category>>, LibraryError> {
-        let mut categories = std::collections::HashMap::new();
-
-        // 1. Authors
-        let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT name, (SELECT COUNT(*) FROM books_authors_link WHERE author = authors.id) as count FROM authors")?;
-        let author_rows = stmt.query_map([], |row| {
-            Ok(Category {
-                name: row.get(0)?,
-                count: row.get(1)?,
-            })
-        })?;
-
-        let mut authors = Vec::new();
-        for row in author_rows {
-            authors.push(row?);
-        }
-        categories.insert("authors".to_string(), authors);
-
-        // TODO: Add other categories (Series, Tags, etc.)
-        // For series:
-        // let mut stmt = self.conn().prepare("SELECT name, (SELECT COUNT(*) FROM books WHERE series_index IS NOT NULL) ...")?
-        // We'll tackle series when we have a series table or clearer schema.
-
-        Ok(categories)
+    ) -> Result<std::collections::HashMap<String, Vec<crate::categories::Tag>>, LibraryError> {
+        let cache = Arc::new(Mutex::new(self.as_cache()));
+        let cats = crate::categories::get_categories(&cache, "name", None)
+            .map_err(|e| LibraryError::Transaction(e.to_string()))?;
+        Ok(cats.into_iter().collect())
     }
 
     pub fn remove_format(&mut self, book_id: i32, fmt: &str) -> Result<(), LibraryError> {
