@@ -25,13 +25,23 @@ pub fn cover_path(cache: &Arc<Mutex<Cache>>, book_id: i32) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Sets the cover image for a book.
+/// Sets the cover image for a book and flips `has_cover` on. A no-op
+/// if the book has no path yet (nothing has been added to it), same
+/// as this crate's other file-management operations.
 ///
 /// # Arguments
 /// * `cache` - The database cache.
 /// * `book_id` - The ID of the book.
 /// * `data` - The raw image data.
 pub fn set_cover(cache: &Arc<Mutex<Cache>>, book_id: i32, data: &[u8]) -> Result<()> {
+    {
+        let guard = cache.lock().unwrap();
+        match guard.field_for(book_id, "path")? {
+            Some(p) if !p.is_empty() => {}
+            _ => return Ok(()),
+        }
+    }
+
     let path = cover_path(cache, book_id)?;
 
     // Ensure parent directory exists
@@ -40,6 +50,12 @@ pub fn set_cover(cache: &Arc<Mutex<Cache>>, book_id: i32, data: &[u8]) -> Result
     }
 
     fs::write(path, data)?;
+
+    {
+        let guard = cache.lock().unwrap();
+        let conn = guard.backend.conn.lock().unwrap();
+        conn.execute("UPDATE books SET has_cover = 1 WHERE id = ?1", (book_id,))?;
+    }
 
     // Invalidate thumbnail cache if it existed (TODO)
     Ok(())
