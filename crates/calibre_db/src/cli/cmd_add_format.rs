@@ -64,35 +64,32 @@ mod tests {
 
     #[test]
     fn test_cmd_add_format() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let db_path = temp_dir.path().to_path_buf();
-        // Setup library
-        fs::create_dir_all(db_path.join("metadata.db")).unwrap(); // Placeholder implies existing DB logic usually, but here we use open_test mostly?
-                                                                  // usage of open_test creates in-memory DB but with path set to :memory:. add_format skips file ops for memory.
-                                                                  // We need a real file backed test for add_format to test file ops, OR we rely on the memory check in add_format returning true.
-                                                                  // Let's use open_test() which is memory. add_format returns Ok(true) immediately.
-                                                                  // To test real logic we need a real DB on disk.
-
-        // Actually Library::open takes a path.
-        // We need to initialize the DB schema if we use a real path.
-        // Library::open_test() handles schema init but uses :memory: path.
-        // Let's modify Library::open_test to optionally take a path or make a helper.
-        // Or just use the :memory: one and verify it returns Ok.
-
         let mut db = Library::open_test().unwrap();
-        db.insert_test_book("Test Book").unwrap();
-        let book_id = 1;
+        // `add_format` requires the book to already have a folder
+        // (`insert_test_book`'s default empty path won't do), so
+        // insert one directly with a real relative path.
+        db.conn()
+            .execute(
+                "INSERT INTO books (title, path) VALUES ('Test Book', 'Author/Test Book')",
+                [],
+            )
+            .unwrap();
+        let book_id = db.conn().last_insert_rowid() as i32;
 
         let cmd = CmdAddFormat::new();
 
-        // Create a dummy file
-        let file_path = temp_dir.path().join("book.epub");
+        let file_path = db.path().join("source.epub");
         let mut f = fs::File::create(&file_path).unwrap();
         f.write_all(b"dummy content").unwrap();
 
-        // Test running
         let args = vec![book_id.to_string(), file_path.to_string_lossy().to_string()];
-        let res = cmd.run(&mut db, &args);
-        assert!(res.is_ok());
+        cmd.run(&mut db, &args).unwrap();
+
+        let dest = db.path().join("Author/Test Book/Test Book.epub");
+        assert!(
+            dest.exists(),
+            "format file should be copied into the book's folder"
+        );
+        assert_eq!(fs::read_to_string(dest).unwrap(), "dummy content");
     }
 }

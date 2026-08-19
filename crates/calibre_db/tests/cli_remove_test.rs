@@ -14,37 +14,6 @@ fn test_remove_format() {
     fs::File::create(temp_dir.join("metadata.db")).unwrap();
 
     let mut lib = Library::open(temp_dir.clone()).unwrap();
-    // Init DB schema (simplest way is to use existing migration logic or manual as in library.rs tests)
-    // For now manual manual schema setup as in library.rs tests seems safest without migration system setup
-    lib.conn()
-        .execute_batch(
-            "CREATE TABLE books (
-            id INTEGER PRIMARY KEY,
-            title TEXT,
-            sort TEXT,
-            timestamp TEXT,
-            pubdate TEXT,
-            series_index REAL,
-            author_sort TEXT,
-            isbn TEXT,
-            lccn TEXT,
-            path TEXT,
-            has_cover INTEGER,
-            uuid TEXT
-        );
-        CREATE TABLE authors (
-            id INTEGER PRIMARY KEY,
-            name TEXT UNIQUE,
-            sort TEXT,
-            link TEXT
-        );
-        CREATE TABLE books_authors_link (
-            id INTEGER PRIMARY KEY,
-            book INTEGER,
-            author INTEGER
-        );",
-        )
-        .unwrap();
 
     let meta = MetaInformation {
         title: "Test Book".to_string(),
@@ -110,35 +79,6 @@ fn test_remove_books() {
     fs::File::create(temp_dir.join("metadata.db")).unwrap();
 
     let mut lib = Library::open(temp_dir.clone()).unwrap();
-    lib.conn()
-        .execute_batch(
-            "CREATE TABLE books (
-            id INTEGER PRIMARY KEY,
-            title TEXT,
-            sort TEXT,
-            timestamp TEXT,
-            pubdate TEXT,
-            series_index REAL,
-            author_sort TEXT,
-            isbn TEXT,
-            lccn TEXT,
-            path TEXT,
-            has_cover INTEGER,
-            uuid TEXT
-        );
-        CREATE TABLE authors (
-            id INTEGER PRIMARY KEY,
-            name TEXT UNIQUE,
-            sort TEXT,
-            link TEXT
-        );
-        CREATE TABLE books_authors_link (
-            id INTEGER PRIMARY KEY,
-            book INTEGER,
-            author INTEGER
-        );",
-        )
-        .unwrap();
 
     // Add books
     lib.conn()
