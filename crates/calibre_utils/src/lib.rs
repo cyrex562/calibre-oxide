@@ -18,6 +18,7 @@ pub mod random_ua;
 pub mod recycle_bin;
 pub mod resources;
 pub mod search_query_parser;
+pub mod series;
 pub mod seven_zip;
 pub mod short_uuid;
 pub mod smartypants;

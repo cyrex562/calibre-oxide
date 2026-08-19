@@ -339,21 +339,30 @@ impl Cache {
             tx.execute("UPDATE books SET uuid = ?1 WHERE id = ?2", (uuid, book_id))?;
         }
 
-        let author_id: i32 = {
-            let mut stmt = tx.prepare("SELECT id FROM authors WHERE name = ?1")?;
-            let mut rows = stmt.query([author_name])?;
-            if let Some(row) = rows.next()? {
-                row.get(0)?
-            } else {
-                tx.execute("INSERT INTO authors (name) VALUES (?1)", [author_name])?;
-                tx.last_insert_rowid() as i32
-            }
+        // Link every author, not just the first -- `author_name`
+        // above is only used for `author_sort`, which upstream also
+        // derives from just the primary author.
+        let link_names: Vec<&str> = if metadata.authors.is_empty() {
+            vec!["Unknown"]
+        } else {
+            metadata.authors.iter().map(|s| s.as_str()).collect()
         };
-
-        tx.execute(
-            "INSERT INTO books_authors_link (book, author) VALUES (?1, ?2)",
-            (book_id, author_id),
-        )?;
+        for name in link_names {
+            let author_id: i32 = {
+                let mut stmt = tx.prepare("SELECT id FROM authors WHERE name = ?1")?;
+                let mut rows = stmt.query([name])?;
+                if let Some(row) = rows.next()? {
+                    row.get(0)?
+                } else {
+                    tx.execute("INSERT INTO authors (name) VALUES (?1)", [name])?;
+                    tx.last_insert_rowid() as i32
+                }
+            };
+            tx.execute(
+                "INSERT INTO books_authors_link (book, author) VALUES (?1, ?2)",
+                (book_id, author_id),
+            )?;
+        }
 
         tx.commit()?;
         Ok(book_id)
@@ -581,6 +590,224 @@ impl Cache {
         }
         copy_dir_recursive(&self.backend.library_path, dest)?;
         Ok(())
+    }
+
+    /// Port of `old_src/src/calibre/db/__init__.py`'s `get_data_as_dict`
+    /// (issue #218): bulk metadata export as a list of JSON objects,
+    /// including custom columns and resolved cover/format paths.
+    ///
+    /// `prefix` defaults to the library path (matching upstream);
+    /// format/cover paths are rewritten relative to it when it's a
+    /// different directory (e.g. `calibredb catalog`-style export
+    /// consumers that want portable relative paths).
+    ///
+    /// # Disclosed simplifications
+    ///
+    /// - Custom-column values are included in the standard
+    ///   `label -> value` shape, but the `{label}_index` companion
+    ///   field upstream adds for `series`-datatype custom columns is
+    ///   not -- this crate's custom-column model (#214) has no
+    ///   dedicated index sub-column for any datatype, series included.
+    /// - Format paths are resolved by re-deriving the filename
+    ///   `add_format` (#216) would have used
+    ///   (`sanitize_file_name(title).<fmt>`) and checking it exists,
+    ///   not upstream's real `format_abspath` (which resolves via the
+    ///   `data` table's own `name` column -- the two agree today since
+    ///   `add_format`/`add_book` always write that same filename, but
+    ///   a format added some other way with a different on-disk name
+    ///   wouldn't be found by this).
+    pub fn get_data_as_dict(
+        &self,
+        prefix: Option<&Path>,
+        authors_as_string: bool,
+        ids: Option<&std::collections::HashSet<i32>>,
+        convert_to_local_tz: bool,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        let library_path = self.backend.library_path.clone();
+        let prefix = prefix
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| library_path.clone());
+        let custom_columns = self.custom_column_label_map()?;
+
+        let book_ids: Vec<i32> = match ids {
+            Some(set) => {
+                let mut v: Vec<i32> = set.iter().copied().collect();
+                v.sort_unstable();
+                v
+            }
+            None => self.all_book_ids()?,
+        };
+
+        let mut out = Vec::with_capacity(book_ids.len());
+        for book_id in book_ids {
+            let Some(title) = self.field_for(book_id, "title")? else {
+                continue;
+            };
+            let mut x = serde_json::Map::new();
+            x.insert("id".into(), serde_json::json!(book_id));
+            x.insert("title".into(), serde_json::json!(title));
+            x.insert(
+                "sort".into(),
+                serde_json::json!(self.field_for(book_id, "sort")?),
+            );
+            x.insert(
+                "author_sort".into(),
+                serde_json::json!(self.field_for(book_id, "author_sort")?),
+            );
+            x.insert(
+                "publisher".into(),
+                serde_json::json!(self.field_for(book_id, "publisher")?),
+            );
+            x.insert(
+                "rating".into(),
+                serde_json::json!(self
+                    .field_for(book_id, "rating")?
+                    .and_then(|s| s.parse::<f64>().ok())),
+            );
+            x.insert(
+                "size".into(),
+                serde_json::json!(self
+                    .field_for(book_id, "size")?
+                    .and_then(|s| s.parse::<i64>().ok())),
+            );
+            x.insert(
+                "series".into(),
+                serde_json::json!(self.field_for(book_id, "series")?),
+            );
+            x.insert(
+                "series_index".into(),
+                serde_json::json!(self
+                    .field_for(book_id, "series_index")?
+                    .and_then(|s| s.parse::<f64>().ok())),
+            );
+            x.insert(
+                "uuid".into(),
+                serde_json::json!(self.field_for(book_id, "uuid")?),
+            );
+            x.insert(
+                "comments".into(),
+                serde_json::json!(self.field_for(book_id, "comments")?),
+            );
+            x.insert(
+                "isbn".into(),
+                serde_json::json!(self.field_for(book_id, "isbn")?.unwrap_or_default()),
+            );
+            x.insert(
+                "identifiers".into(),
+                serde_json::json!(self.field_for(book_id, "identifiers")?.unwrap_or_default()),
+            );
+
+            let authors: Vec<String> = match self.field_for(book_id, "authors")? {
+                Some(s) if !s.is_empty() => s.split(" & ").map(|a| a.to_string()).collect(),
+                _ => vec!["Unknown".to_string()],
+            };
+            x.insert(
+                "authors".into(),
+                if authors_as_string {
+                    serde_json::json!(authors.join(" & "))
+                } else {
+                    serde_json::json!(authors)
+                },
+            );
+
+            let tags: Vec<String> = self
+                .field_for(book_id, "tags")?
+                .map(|s| s.split(", ").map(|t| t.trim().to_string()).collect())
+                .unwrap_or_default();
+            x.insert("tags".into(), serde_json::json!(tags));
+
+            let languages: Vec<String> = self
+                .field_for(book_id, "languages")?
+                .map(|s| s.split(", ").map(|t| t.to_string()).collect())
+                .unwrap_or_default();
+            x.insert("languages".into(), serde_json::json!(languages));
+
+            for field in ["timestamp", "pubdate", "last_modified"] {
+                let raw = self.field_for(book_id, field)?;
+                let value = if convert_to_local_tz {
+                    raw.as_deref()
+                        .and_then(|s| calibre_utils::date::parse_date(s, true))
+                        .map(|dt| dt.with_timezone(&chrono::Local).to_rfc3339())
+                } else {
+                    raw
+                };
+                x.insert(field.into(), serde_json::json!(value));
+            }
+
+            let path_rel = self.field_for(book_id, "path")?.unwrap_or_default();
+            let has_cover: bool = {
+                let conn = self.backend.conn.lock().unwrap();
+                conn.query_row(
+                    "SELECT has_cover FROM books WHERE id = ?1",
+                    [book_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .unwrap_or(0)
+                    != 0
+            };
+            x.insert(
+                "cover".into(),
+                serde_json::json!(if has_cover {
+                    Some(
+                        prefix
+                            .join(&path_rel)
+                            .join("cover.jpg")
+                            .to_string_lossy()
+                            .to_string(),
+                    )
+                } else {
+                    None
+                }),
+            );
+
+            let mut formats = Vec::new();
+            let mut available_formats = Vec::new();
+            let mut data_formats: Vec<String> = Vec::new();
+            {
+                let conn = self.backend.conn.lock().unwrap();
+                let mut stmt = conn.prepare("SELECT format FROM data WHERE book = ?1")?;
+                let rows = stmt.query_map([book_id], |row| row.get::<_, String>(0))?;
+                for row in rows {
+                    data_formats.push(row?);
+                }
+            }
+            for fmt in &data_formats {
+                available_formats.push(fmt.to_uppercase());
+                let file_name = format!("{}.{}", sanitize_file_name(&title), fmt.to_lowercase());
+                let abs_path = library_path.join(&path_rel).join(&file_name);
+                if abs_path.exists() {
+                    let out_path = if prefix != library_path {
+                        match abs_path.strip_prefix(&library_path) {
+                            Ok(rel) => prefix.join(rel),
+                            Err(_) => abs_path.clone(),
+                        }
+                    } else {
+                        abs_path.clone()
+                    };
+                    let out_path_str = out_path.to_string_lossy().to_string();
+                    x.insert(
+                        format!("fmt_{}", fmt.to_lowercase()),
+                        serde_json::json!(out_path_str),
+                    );
+                    formats.push(out_path_str);
+                }
+            }
+            x.insert("formats".into(), serde_json::json!(formats));
+            x.insert(
+                "available_formats".into(),
+                serde_json::json!(available_formats),
+            );
+
+            for label in custom_columns.keys() {
+                let val = self.get_custom_column_value(book_id, label)?;
+                x.insert(label.clone(), serde_json::json!(val));
+            }
+
+            out.push(serde_json::Value::Object(x));
+        }
+
+        Ok(out)
     }
 
     /// Real custom-column support (issue #212 follow-up), moved here
@@ -1323,5 +1550,108 @@ mod tests {
         cache.clone_to(dest_dir.path()).unwrap();
 
         assert!(dest_dir.path().join("A/T/T.epub").exists());
+    }
+
+    // --- get_data_as_dict ---
+
+    #[test]
+    fn get_data_as_dict_includes_core_fields_authors_and_tags() {
+        let (dir, cache) = open_test_cache();
+        let source = write_temp_file(dir.path(), "src.epub", b"x");
+        let mut meta = MetaInformation::default();
+        meta.title = "My Book".to_string();
+        meta.authors = vec!["Alice".to_string(), "Bob".to_string()];
+        let book_id = cache.add_book(&source, &meta).unwrap();
+        {
+            let conn = cache.backend.conn.lock().unwrap();
+            for tag in ["fiction", "classic"] {
+                conn.execute("INSERT INTO tags (name) VALUES (?1)", [tag])
+                    .unwrap();
+                let tag_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO books_tags_link (book, tag) VALUES (?1, ?2)",
+                    (book_id, tag_id),
+                )
+                .unwrap();
+            }
+        }
+
+        let data = cache.get_data_as_dict(None, false, None, false).unwrap();
+        assert_eq!(data.len(), 1);
+        let rec = &data[0];
+        assert_eq!(rec["id"], book_id);
+        assert_eq!(rec["title"], "My Book");
+        assert_eq!(rec["authors"], serde_json::json!(["Alice", "Bob"]));
+        assert_eq!(rec["tags"], serde_json::json!(["fiction", "classic"]));
+    }
+
+    #[test]
+    fn get_data_as_dict_joins_authors_as_a_string_when_asked() {
+        let (dir, cache) = open_test_cache();
+        let source = write_temp_file(dir.path(), "src.epub", b"x");
+        let mut meta = MetaInformation::default();
+        meta.title = "T".to_string();
+        meta.authors = vec!["Alice".to_string(), "Bob".to_string()];
+        cache.add_book(&source, &meta).unwrap();
+
+        let data = cache.get_data_as_dict(None, true, None, false).unwrap();
+        assert_eq!(data[0]["authors"], "Alice & Bob");
+    }
+
+    #[test]
+    fn get_data_as_dict_resolves_a_real_format_path_and_available_formats() {
+        let (dir, cache) = open_test_cache();
+        let source = write_temp_file(dir.path(), "src.epub", b"epub bytes");
+        let mut meta = MetaInformation::default();
+        meta.title = "T".to_string();
+        meta.authors = vec!["A".to_string()];
+        cache.add_book(&source, &meta).unwrap();
+
+        let data = cache.get_data_as_dict(None, false, None, false).unwrap();
+        let rec = &data[0];
+        assert_eq!(rec["available_formats"], serde_json::json!(["EPUB"]));
+        let formats = rec["formats"].as_array().unwrap();
+        assert_eq!(formats.len(), 1);
+        assert!(formats[0].as_str().unwrap().ends_with("T.epub"));
+        assert_eq!(rec["fmt_epub"], formats[0]);
+    }
+
+    #[test]
+    fn get_data_as_dict_filters_by_the_given_ids() {
+        let (dir, cache) = open_test_cache();
+        let source = write_temp_file(dir.path(), "src.epub", b"x");
+        let mut meta = MetaInformation::default();
+        meta.title = "Keep Me".to_string();
+        meta.authors = vec!["A".to_string()];
+        let keep_id = cache.add_book(&source, &meta).unwrap();
+        meta.title = "Skip Me".to_string();
+        cache.add_book(&source, &meta).unwrap();
+
+        let ids: std::collections::HashSet<i32> = [keep_id].into_iter().collect();
+        let data = cache
+            .get_data_as_dict(None, false, Some(&ids), false)
+            .unwrap();
+
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["title"], "Keep Me");
+    }
+
+    #[test]
+    fn get_data_as_dict_includes_custom_column_values() {
+        let (dir, cache) = open_test_cache();
+        let source = write_temp_file(dir.path(), "src.epub", b"x");
+        let mut meta = MetaInformation::default();
+        meta.title = "T".to_string();
+        meta.authors = vec!["A".to_string()];
+        let book_id = cache.add_book(&source, &meta).unwrap();
+        cache
+            .add_custom_column("mycol", "My Column", "text", false)
+            .unwrap();
+        cache
+            .set_custom_column_value(book_id, "mycol", "hello")
+            .unwrap();
+
+        let data = cache.get_data_as_dict(None, false, None, false).unwrap();
+        assert_eq!(data[0]["mycol"], "hello");
     }
 }
