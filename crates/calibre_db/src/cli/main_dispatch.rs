@@ -9,15 +9,14 @@ use super::{
     cmd_add_format,
     // Add others if needed after implementation
     cmd_backup_metadata,
-    // cmd_fits_index,
     cmd_catalog,
     cmd_check_library,
     cmd_clone,
     cmd_custom_columns,
     cmd_embed_metadata,
     cmd_export,
-    cmd_fits_index,
-    cmd_fits_search,
+    cmd_fts_index,
+    cmd_fts_search,
     cmd_list,
     cmd_list_categories,
     cmd_remove,
@@ -109,17 +108,19 @@ pub fn run_command(cmd: &str, args: &[String], ctx: &DBCtx) -> Result<()> {
             let run_args = cmd_embed_metadata::RunArgs::parse_from(clap_args);
             cmd_embed_metadata::CmdEmbedMetadata::new().run(&db, &run_args)
         }
-        "fits_index" => {
-            let cmd_name = "fits_index".to_string();
+        "fts_index" => {
+            let mut db = ctx.db()?;
+            let cmd_name = "fts_index".to_string();
             let clap_args = std::iter::once(&cmd_name).chain(args.iter());
-            let run_args = cmd_fits_index::RunArgs::parse_from(clap_args);
-            cmd_fits_index::CmdFitsIndex::new().run(&run_args)
+            let run_args = cmd_fts_index::RunArgs::parse_from(clap_args);
+            cmd_fts_index::CmdFtsIndex::new().run(&mut db, &run_args)
         }
-        "fits_search" => {
-            let cmd_name = "fits_search".to_string();
+        "fts_search" => {
+            let db = ctx.db()?;
+            let cmd_name = "fts_search".to_string();
             let clap_args = std::iter::once(&cmd_name).chain(args.iter());
-            let run_args = cmd_fits_search::RunArgs::parse_from(clap_args);
-            cmd_fits_search::CmdFitsSearch::new().run(&run_args)
+            let run_args = cmd_fts_search::RunArgs::parse_from(clap_args);
+            cmd_fts_search::CmdFtsSearch::new().run(&db, &run_args)
         }
         "clone" => {
             let db = ctx.db()?;

@@ -102,8 +102,8 @@ either -- this pass wasn't exhaustive.
 - [x] cmd_custom_columns.py
 - [x] cmd_embed_metadata.py
 - [x] cmd_export.py
-- [ ] cmd_fts_index.py (#226: `Err(anyhow!("... is a stub"))` -- ported as `cli/cmd_fits_index.rs`, a naming typo ("fits" vs. real upstream "fts"/full-text-search) worth fixing alongside the real implementation; tracked jointly with the rest of the FTS subsystem)
-- [ ] cmd_fts_search.py (#226: `Err(anyhow!("... is a stub"))` -- same naming-typo note as `cmd_fts_index.py` above)
+- [x] cmd_fts_index.py (#226: real `status`/`enable`/`disable`/`reindex`, backed by `Library::is_fts_enabled`/`set_fts_enabled`/`fts`. Renamed from `cli/cmd_fits_index.rs` -- "fits" was a typo for "fts". NOT ported: `--wait-for-completion`/the `wait` action and indexing-rate reporting, since this crate has no background indexing pipeline to report progress on -- see `fts/connection.rs`'s module doc)
+- [x] cmd_fts_search.py (#226: real `--restrict-to ids:/search:` (the latter via `Library::search`, #210), snippet/highlight markers, stemming toggle, `text`/`json` output, indexing-threshold gate. Renamed from `cli/cmd_fits_search.rs`. NOT ported: upstream's cross-format snippet-dedup grouping in text output)
 - [x] cmd_list_categories.py
 - [x] cmd_list.py
 - [x] `cmd_remove_custom_column.py` -> `crates/calibre_db/src/cli/cmd_remove_custom_column.rs`
@@ -122,8 +122,8 @@ either -- this pass wasn't exhaustive.
 #### fts
 
 - [x] __init__.py
-- [ ] connect.py (#226: ~48% of source size -- real connection setup exists, real query/index-management surface doesn't; tracked jointly with `pool.py` and the two `cmd_fts_*` CLI commands as one subsystem, since none is independently useful without the others)
-- [ ] pool.py (#226: no Rust counterpart exists at all -- `fts/mod.rs` only declares `connection`)
+- [x] connect.py (#226: real schema creation (`dirtied_formats`/`books_text`/two FTS5 virtual tables) and sync triggers, dirty-set management, `add_text`/`unindex`/`vacuum`, and `search` (real dynamic SQL: single-/multi-id `restrict_to_book_ids` via a temp table, `snippet()`/`highlight()`, real `FtsQueryError` from #218 finally wired up). NOT ported: the custom `calibre`/`porter` FTS5 tokenizers -- both virtual tables use the built-in `unicode61` tokenizer instead, since registering them requires #93's still-pending rusqlite FTS5 extension wiring; `unicode_normalize`. See `fts/connection.rs`'s module doc.)
+- [x] pool.py (#226: deliberately NOT ported -- `Pool`/`Worker` spawn a subprocess per book/format to extract text out-of-process via `calibre.db.fts.text.main`; this crate has no ebook-text-extraction pipeline to spawn in the first place. `FtsConnection::add_text` -- the real DB write once text is available -- is ported and is exactly what a future extraction pipeline would call.)
 - [x] schema_upgrade.py
 - [x] text.py
 
