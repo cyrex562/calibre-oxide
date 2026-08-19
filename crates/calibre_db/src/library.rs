@@ -585,61 +585,30 @@ impl Library {
         Ok(())
     }
 
+    /// Shares this `Library`'s own live connection with a fresh
+    /// [`crate::cache::Cache`] (via `Backend`'s cheap `Clone` -- no
+    /// second connection opened), for delegating to `Cache`-side
+    /// functionality (real search, real custom columns) instead of
+    /// `Library` hand-rolling its own duplicate SQL.
+    fn as_cache(&self) -> crate::cache::Cache {
+        crate::cache::Cache {
+            backend: self.backend.clone(),
+        }
+    }
+
     pub fn get_custom_column_label_map(
         &self,
     ) -> Result<std::collections::HashMap<String, serde_json::Value>, LibraryError> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT id, label, name, datatype, mark_for_delete, editable, display, is_multiple, normalized FROM custom_columns")?;
-
-        let rows = stmt.query_map([], |row| {
-            let id: i32 = row.get(0)?;
-            let label: String = row.get(1)?;
-            let name: String = row.get(2)?;
-            let datatype: String = row.get(3)?;
-            let mark_for_delete: bool = row.get(4)?;
-            let editable: bool = row.get(5)?;
-            let display: String = row.get(6)?;
-            let is_multiple: bool = row.get(7)?;
-            let normalized: bool = row.get(8)?;
-
-            let mut map = serde_json::Map::new();
-            map.insert("num".to_string(), serde_json::json!(id));
-            map.insert("label".to_string(), serde_json::json!(label.clone()));
-            map.insert("name".to_string(), serde_json::json!(name));
-            map.insert("datatype".to_string(), serde_json::json!(datatype));
-            map.insert(
-                "mark_for_delete".to_string(),
-                serde_json::json!(mark_for_delete),
-            );
-            map.insert("editable".to_string(), serde_json::json!(editable));
-            map.insert(
-                "display".to_string(),
-                serde_json::from_str(&display).unwrap_or(serde_json::json!({})),
-            );
-            map.insert("is_multiple".to_string(), serde_json::json!(is_multiple));
-            map.insert("normalized".to_string(), serde_json::json!(normalized));
-
-            Ok((label, serde_json::Value::Object(map)))
-        })?;
-
-        let mut custom_columns = std::collections::HashMap::new();
-        for row in rows {
-            let (label, data) = row?;
-            custom_columns.insert(label, data);
-        }
-
-        Ok(custom_columns)
+        self.as_cache()
+            .custom_column_label_map()
+            .map_err(LibraryError::Connection)
     }
 
-    /// Real query-syntax search (issue #210): shares this `Library`'s
-    /// own live connection with a [`crate::cache::Cache`] (via
-    /// `Backend`'s cheap `Clone` -- no second connection opened) and
-    /// delegates to [`crate::search::search`]. See this module's docs
-    /// for why that engine was previously unreachable from the CLI.
+    /// Real query-syntax search (issue #210), via [`Library::as_cache`].
+    /// See this module's docs for why that engine was previously
+    /// unreachable from the CLI.
     pub fn search(&self, query: &str) -> Result<Vec<i32>, LibraryError> {
-        let cache = Arc::new(Mutex::new(crate::cache::Cache {
-            backend: self.backend.clone(),
-        }));
+        let cache = Arc::new(Mutex::new(self.as_cache()));
         crate::search::search(&cache, query).map_err(|e| LibraryError::Transaction(e.to_string()))
     }
 
@@ -882,88 +851,9 @@ impl Library {
         datatype: &str,
         is_multiple: bool,
     ) -> Result<i32, LibraryError> {
-        let mut conn = self.conn();
-
-        // Validation: Verify label is unique
-        let count: i32 = conn.query_row(
-            "SELECT COUNT(*) FROM custom_columns WHERE label = ?1",
-            [label],
-            |row| row.get(0),
-        )?;
-        if count > 0 {
-            return Err(LibraryError::Transaction(format!(
-                "Column with label '{}' already exists",
-                label
-            )));
-        }
-
-        let tx = conn.transaction()?;
-
-        // 1. Insert into custom_columns
-        tx.execute(
-            "INSERT INTO custom_columns
-            (label, name, datatype, mark_for_delete, editable, display, is_multiple, normalized)
-            VALUES (?1, ?2, ?3, 0, 1, '{}', ?4, 0)",
-            (label, name, datatype, is_multiple),
-        )?;
-        let col_id = tx.last_insert_rowid() as i32;
-
-        // 2. Create the table for the column
-        // Calibre naming convention: custom_column_{id}
-        let table_name = format!("custom_column_{}", col_id);
-
-        // Simplified schema generation based on generic behavior
-        match datatype {
-            "bool" | "int" | "float" | "rating" => {
-                // One-to-one mapping
-                tx.execute(
-                    &format!(
-                        "CREATE TABLE {} (id INTEGER PRIMARY KEY, book INTEGER, value {})",
-                        table_name,
-                        if datatype == "float" || datatype == "rating" {
-                            "REAL"
-                        } else {
-                            "INTEGER"
-                        }
-                    ),
-                    [],
-                )?;
-                tx.execute(
-                    &format!("CREATE INDEX idx_{}_book ON {} (book)", col_id, table_name),
-                    [],
-                )?;
-            }
-            "text" | "comments" | "series" => {
-                if is_multiple {
-                    return Err(LibraryError::Transaction(
-                        "Multiple-value text columns not yet supported in this port".to_string(),
-                    ));
-                }
-                tx.execute(
-                    &format!(
-                        "CREATE TABLE {} (id INTEGER PRIMARY KEY, book INTEGER, value TEXT)",
-                        table_name
-                    ),
-                    [],
-                )?;
-                tx.execute(
-                    &format!("CREATE INDEX idx_{}_book ON {} (book)", col_id, table_name),
-                    [],
-                )?;
-            }
-            _ => {
-                tx.execute(
-                    &format!(
-                        "CREATE TABLE {} (id INTEGER PRIMARY KEY, book INTEGER, value TEXT)",
-                        table_name
-                    ),
-                    [],
-                )?;
-            }
-        }
-
-        tx.commit()?;
-        Ok(col_id)
+        self.as_cache()
+            .add_custom_column(label, name, datatype, is_multiple)
+            .map_err(|e| LibraryError::Transaction(e.to_string()))
     }
 
     pub fn set_custom_column_value(
@@ -972,69 +862,9 @@ impl Library {
         label: &str,
         value: &str,
     ) -> Result<(), LibraryError> {
-        // 1. Get column info
-        let col_info: Option<(i32, String)> = self
-            .conn()
-            .query_row(
-                "SELECT id, datatype FROM custom_columns WHERE label = ?1",
-                [label],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-
-        if let Some((col_id, datatype)) = col_info {
-            let table_name = format!("custom_column_{}", col_id);
-
-            // 2. Validate/Convert value based on datatype
-            match datatype.as_str() {
-                "bool" => {
-                    let val = value.parse::<bool>().unwrap_or(false);
-                    self.conn().execute(
-                        &format!(
-                            "INSERT OR REPLACE INTO {} (book, value) VALUES (?1, ?2)",
-                            table_name
-                        ),
-                        (book_id, val as i32),
-                    )?;
-                }
-                "int" => {
-                    let val = value.parse::<i32>().unwrap_or(0);
-                    self.conn().execute(
-                        &format!(
-                            "INSERT OR REPLACE INTO {} (book, value) VALUES (?1, ?2)",
-                            table_name
-                        ),
-                        (book_id, val),
-                    )?;
-                }
-                "float" | "rating" => {
-                    let val = value.parse::<f64>().unwrap_or(0.0);
-                    self.conn().execute(
-                        &format!(
-                            "INSERT OR REPLACE INTO {} (book, value) VALUES (?1, ?2)",
-                            table_name
-                        ),
-                        (book_id, val),
-                    )?;
-                }
-                _ => {
-                    // Text and others
-                    self.conn().execute(
-                        &format!(
-                            "INSERT OR REPLACE INTO {} (book, value) VALUES (?1, ?2)",
-                            table_name
-                        ),
-                        (book_id, value),
-                    )?;
-                }
-            }
-            Ok(())
-        } else {
-            Err(LibraryError::Transaction(format!(
-                "Custom column with label '{}' not found",
-                label
-            )))
-        }
+        self.as_cache()
+            .set_custom_column_value(book_id, label, value)
+            .map_err(|e| LibraryError::Transaction(e.to_string()))
     }
 
     pub fn get_preference(&self, key: &str) -> Result<Option<String>, LibraryError> {
@@ -1057,39 +887,9 @@ impl Library {
         book_id: i32,
         label: &str,
     ) -> Result<Option<String>, LibraryError> {
-        let col_info: Option<(i32, String)> = self
-            .conn()
-            .query_row(
-                "SELECT id, datatype FROM custom_columns WHERE label = ?1",
-                [label],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-
-        if let Some((col_id, datatype)) = col_info {
-            let table_name = format!("custom_column_{}", col_id);
-            let val: Option<String> = self
-                .conn()
-                .query_row(
-                    &format!("SELECT value FROM {} WHERE book = ?1", table_name),
-                    [book_id],
-                    |row| match datatype.as_str() {
-                        "int" | "bool" => {
-                            let v: i32 = row.get(0)?;
-                            Ok(v.to_string())
-                        }
-                        "float" | "rating" => {
-                            let v: f64 = row.get(0)?;
-                            Ok(v.to_string())
-                        }
-                        _ => row.get(0),
-                    },
-                )
-                .optional()?;
-            Ok(val)
-        } else {
-            Ok(None)
-        }
+        self.as_cache()
+            .get_custom_column_value(book_id, label)
+            .map_err(LibraryError::Connection)
     }
 
     pub fn get_authors(&self, book_id: i32) -> Result<Vec<String>, LibraryError> {
@@ -1168,35 +968,9 @@ impl Library {
     }
 
     pub fn remove_custom_column(&mut self, label: &str) -> Result<(), LibraryError> {
-        let mut conn = self.conn();
-        let col_id: Option<i32> = conn
-            .query_row(
-                "SELECT id FROM custom_columns WHERE label = ?1",
-                [label],
-                |row| row.get(0),
-            )
-            .optional()?;
-
-        if let Some(id) = col_id {
-            let tx = conn.transaction()?;
-
-            // 1. Delete meta
-            tx.execute("DELETE FROM custom_columns WHERE id = ?1", [id])?;
-
-            // 2. Drop table
-            let table_name = format!("custom_column_{}", id);
-            // We use format! string since we can't parametrize table names.
-            // id is an integer controlled by us, so injection risk is minimal/none.
-            tx.execute(&format!("DROP TABLE IF EXISTS {}", table_name), [])?;
-
-            tx.commit()?;
-            Ok(())
-        } else {
-            Err(LibraryError::Transaction(format!(
-                "Column '{}' not found",
-                label
-            )))
-        }
+        self.as_cache()
+            .remove_custom_column(label)
+            .map_err(|e| LibraryError::Transaction(e.to_string()))
     }
 }
 
