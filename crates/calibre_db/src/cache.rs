@@ -57,6 +57,7 @@
 
 use crate::backend::Backend;
 use rusqlite::{OptionalExtension, Result};
+use std::collections::HashMap;
 use std::path::Path;
 
 pub struct Cache {
@@ -249,6 +250,225 @@ impl Cache {
     pub fn update_memory(&mut self, _book_id: i32, _field: &str, _value: &str) {
         // Placeholder for future in-memory cache invalidation.
         // Currently, field_for hits the DB directly so no cache to clear.
+    }
+
+    /// Real custom-column support (issue #212 follow-up), moved here
+    /// from `library.rs`'s previously Cache-side-only duplicate of the
+    /// same logic -- `Library::add_custom_column`/etc. now delegate to
+    /// these instead of hand-rolling their own SQL, now that both
+    /// share the real schema (#212). NOT a port of upstream's real
+    /// `tables.py`/`fields.py` custom-column architecture (per-column
+    /// `Table` subclasses bulk-loaded into memory on library open,
+    /// `CustomColumns`/`initialize_custom_columns` in `backend.py`) --
+    /// that's a much larger, separate rearchitecture of how this
+    /// crate accesses fields at all (`Cache::field_for` already hits
+    /// the DB directly per call rather than an in-memory table model,
+    /// its own disclosed simplification -- see this module's docs).
+    /// This is a narrower, same-shape extension of that existing
+    /// per-call SQL strategy to custom columns: a `custom_columns`
+    /// metadata row plus a dynamic `custom_column_N` value table per
+    /// column, same as `Library`'s original implementation, just
+    /// hosted on `Cache`'s connection instead of a second one.
+    pub fn custom_column_label_map(&self) -> Result<HashMap<String, serde_json::Value>> {
+        let conn = self.backend.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, label, name, datatype, mark_for_delete, editable, display, is_multiple, normalized FROM custom_columns",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let id: i32 = row.get(0)?;
+            let label: String = row.get(1)?;
+            let name: String = row.get(2)?;
+            let datatype: String = row.get(3)?;
+            let mark_for_delete: bool = row.get(4)?;
+            let editable: bool = row.get(5)?;
+            let display: String = row.get(6)?;
+            let is_multiple: bool = row.get(7)?;
+            let normalized: bool = row.get(8)?;
+
+            let mut map = serde_json::Map::new();
+            map.insert("num".to_string(), serde_json::json!(id));
+            map.insert("label".to_string(), serde_json::json!(label.clone()));
+            map.insert("name".to_string(), serde_json::json!(name));
+            map.insert("datatype".to_string(), serde_json::json!(datatype));
+            map.insert(
+                "mark_for_delete".to_string(),
+                serde_json::json!(mark_for_delete),
+            );
+            map.insert("editable".to_string(), serde_json::json!(editable));
+            map.insert(
+                "display".to_string(),
+                serde_json::from_str(&display).unwrap_or(serde_json::json!({})),
+            );
+            map.insert("is_multiple".to_string(), serde_json::json!(is_multiple));
+            map.insert("normalized".to_string(), serde_json::json!(normalized));
+
+            Ok((label, serde_json::Value::Object(map)))
+        })?;
+
+        let mut out = HashMap::new();
+        for row in rows {
+            let (label, data) = row?;
+            out.insert(label, data);
+        }
+        Ok(out)
+    }
+
+    /// `datatype` is one of `bool`/`int`/`float`/`rating` (one-to-one
+    /// numeric value table) or `text`/`comments`/`series` (one-to-one
+    /// text value table, non-`is_multiple` only -- see the error
+    /// below); anything else falls back to a generic text value table,
+    /// same as `Library`'s original behavior.
+    pub fn add_custom_column(
+        &self,
+        label: &str,
+        name: &str,
+        datatype: &str,
+        is_multiple: bool,
+    ) -> anyhow::Result<i32> {
+        let mut conn = self.backend.conn.lock().unwrap();
+
+        let count: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM custom_columns WHERE label = ?1",
+            [label],
+            |row| row.get(0),
+        )?;
+        if count > 0 {
+            anyhow::bail!("Column with label '{}' already exists", label);
+        }
+
+        let tx = conn.transaction()?;
+
+        tx.execute(
+            "INSERT INTO custom_columns
+            (label, name, datatype, mark_for_delete, editable, display, is_multiple, normalized)
+            VALUES (?1, ?2, ?3, 0, 1, '{}', ?4, 0)",
+            (label, name, datatype, is_multiple),
+        )?;
+        let col_id = tx.last_insert_rowid() as i32;
+        let table_name = format!("custom_column_{}", col_id);
+
+        match datatype {
+            "bool" | "int" | "float" | "rating" => {
+                let value_type = if datatype == "float" || datatype == "rating" {
+                    "REAL"
+                } else {
+                    "INTEGER"
+                };
+                tx.execute(
+                    &format!(
+                        "CREATE TABLE {table_name} (id INTEGER PRIMARY KEY, book INTEGER, value {value_type})"
+                    ),
+                    [],
+                )?;
+                tx.execute(
+                    &format!("CREATE INDEX idx_{col_id}_book ON {table_name} (book)"),
+                    [],
+                )?;
+            }
+            "text" | "comments" | "series" => {
+                if is_multiple {
+                    anyhow::bail!("Multiple-value text columns not yet supported in this port");
+                }
+                tx.execute(
+                    &format!(
+                        "CREATE TABLE {table_name} (id INTEGER PRIMARY KEY, book INTEGER, value TEXT)"
+                    ),
+                    [],
+                )?;
+                tx.execute(
+                    &format!("CREATE INDEX idx_{col_id}_book ON {table_name} (book)"),
+                    [],
+                )?;
+            }
+            _ => {
+                tx.execute(
+                    &format!(
+                        "CREATE TABLE {table_name} (id INTEGER PRIMARY KEY, book INTEGER, value TEXT)"
+                    ),
+                    [],
+                )?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(col_id)
+    }
+
+    fn custom_column_lookup(&self, label: &str) -> Result<Option<(i32, String)>> {
+        let conn = self.backend.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, datatype FROM custom_columns WHERE label = ?1",
+            [label],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+    }
+
+    pub fn get_custom_column_value(&self, book_id: i32, label: &str) -> Result<Option<String>> {
+        let Some((col_id, datatype)) = self.custom_column_lookup(label)? else {
+            return Ok(None);
+        };
+        let table_name = format!("custom_column_{col_id}");
+        let conn = self.backend.conn.lock().unwrap();
+        conn.query_row(
+            &format!("SELECT value FROM {table_name} WHERE book = ?1"),
+            [book_id],
+            |row| match datatype.as_str() {
+                "int" | "bool" => row.get::<_, i32>(0).map(|v| v.to_string()),
+                "float" | "rating" => row.get::<_, f64>(0).map(|v| v.to_string()),
+                _ => row.get(0),
+            },
+        )
+        .optional()
+    }
+
+    pub fn set_custom_column_value(
+        &self,
+        book_id: i32,
+        label: &str,
+        value: &str,
+    ) -> anyhow::Result<()> {
+        let Some((col_id, datatype)) = self.custom_column_lookup(label)? else {
+            anyhow::bail!("Custom column with label '{}' not found", label);
+        };
+        let table_name = format!("custom_column_{col_id}");
+        let conn = self.backend.conn.lock().unwrap();
+        let sql = format!("INSERT OR REPLACE INTO {table_name} (book, value) VALUES (?1, ?2)");
+        match datatype.as_str() {
+            "bool" => conn.execute(
+                &sql,
+                (book_id, value.parse::<bool>().unwrap_or(false) as i32),
+            ),
+            "int" => conn.execute(&sql, (book_id, value.parse::<i32>().unwrap_or(0))),
+            "float" | "rating" => {
+                conn.execute(&sql, (book_id, value.parse::<f64>().unwrap_or(0.0)))
+            }
+            _ => conn.execute(&sql, (book_id, value)),
+        }?;
+        Ok(())
+    }
+
+    pub fn remove_custom_column(&self, label: &str) -> anyhow::Result<()> {
+        let mut conn = self.backend.conn.lock().unwrap();
+        let col_id: Option<i32> = conn
+            .query_row(
+                "SELECT id FROM custom_columns WHERE label = ?1",
+                [label],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(id) = col_id else {
+            anyhow::bail!("Column '{}' not found", label);
+        };
+
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM custom_columns WHERE id = ?1", [id])?;
+        // `id` is an integer we control (from the `custom_columns` row
+        // just looked up), not user input -- no injection risk from
+        // building the table name via `format!`.
+        tx.execute(&format!("DROP TABLE IF EXISTS custom_column_{id}"), [])?;
+        tx.commit()?;
+        Ok(())
     }
 }
 
@@ -508,5 +728,92 @@ mod tests {
         let (_dir, cache) = open_test_cache();
         let id = insert_book(&cache, "T");
         assert_eq!(cache.field_for(id, "not_a_real_field").unwrap(), None);
+    }
+
+    #[test]
+    fn custom_column_round_trips_a_text_value() {
+        let (_dir, cache) = open_test_cache();
+        let id = insert_book(&cache, "T");
+        cache
+            .add_custom_column("mycol", "My Column", "text", false)
+            .unwrap();
+        assert_eq!(cache.get_custom_column_value(id, "mycol").unwrap(), None);
+        cache.set_custom_column_value(id, "mycol", "hello").unwrap();
+        assert_eq!(
+            cache.get_custom_column_value(id, "mycol").unwrap(),
+            Some("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn custom_column_round_trips_numeric_datatypes() {
+        let (_dir, cache) = open_test_cache();
+        let id = insert_book(&cache, "T");
+        cache.add_custom_column("n", "N", "int", false).unwrap();
+        cache.set_custom_column_value(id, "n", "42").unwrap();
+        assert_eq!(
+            cache.get_custom_column_value(id, "n").unwrap(),
+            Some("42".to_string())
+        );
+
+        cache.add_custom_column("f", "F", "float", false).unwrap();
+        cache.set_custom_column_value(id, "f", "3.5").unwrap();
+        assert_eq!(
+            cache.get_custom_column_value(id, "f").unwrap(),
+            Some("3.5".to_string())
+        );
+    }
+
+    #[test]
+    fn add_custom_column_rejects_a_duplicate_label() {
+        let (_dir, cache) = open_test_cache();
+        cache
+            .add_custom_column("dup", "Dup", "text", false)
+            .unwrap();
+        assert!(cache
+            .add_custom_column("dup", "Dup 2", "text", false)
+            .is_err());
+    }
+
+    #[test]
+    fn set_custom_column_value_errors_for_an_unknown_label() {
+        let (_dir, cache) = open_test_cache();
+        let id = insert_book(&cache, "T");
+        assert!(cache.set_custom_column_value(id, "nope", "x").is_err());
+    }
+
+    #[test]
+    fn remove_custom_column_drops_the_column_and_its_value_table() {
+        let (_dir, cache) = open_test_cache();
+        let id = insert_book(&cache, "T");
+        cache
+            .add_custom_column("temp", "Temp", "text", false)
+            .unwrap();
+        cache.set_custom_column_value(id, "temp", "x").unwrap();
+
+        cache.remove_custom_column("temp").unwrap();
+
+        assert!(cache.get_custom_column_value(id, "temp").unwrap().is_none());
+        assert!(!cache
+            .custom_column_label_map()
+            .unwrap()
+            .contains_key("temp"));
+        // Re-adding the same label should work again now that it's gone.
+        assert!(cache
+            .add_custom_column("temp", "Temp", "text", false)
+            .is_ok());
+    }
+
+    #[test]
+    fn custom_column_label_map_reports_metadata_for_every_column() {
+        let (_dir, cache) = open_test_cache();
+        cache
+            .add_custom_column("mycol", "My Column", "int", true)
+            .unwrap();
+        let map = cache.custom_column_label_map().unwrap();
+        let entry = map.get("mycol").unwrap();
+        assert_eq!(entry["name"], "My Column");
+        assert_eq!(entry["datatype"], "int");
+        assert_eq!(entry["is_multiple"], true);
     }
 }
