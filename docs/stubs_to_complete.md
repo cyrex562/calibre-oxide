@@ -46,9 +46,6 @@ The following modules have been ported as stubs or placeholders and need full im
 
 | Rust File | Original Python File | Description |
 |-----------|----------------------|-------------|
-| `crates/calibre_db/src/cli/cmd_fits_index.rs` | `calibre/db/cli/cmd_fits_index.py` | Index FITS files. |
-| `crates/calibre_db/src/cli/cmd_fits_search.rs` | `calibre/db/cli/cmd_fits_search.py` | Search FITS index. |
-| `crates/calibre_db/src/legacy.rs` | `calibre/db/legacy.py` | Logic for detecting and migrating old database schemas. |
 | `crates/calibre_ebooks/src/conversion/archives.rs` | `calibre/ebooks/conversion/archives.py` | RAR and 7z extraction (currently stubs in `ArchiveHandler`). |
 | `crates/calibre_ebooks/src/conversion/preprocess.rs` | `calibre/ebooks/conversion/preprocess.py` | HTML/CSS preprocessing logic. |
 

@@ -486,6 +486,58 @@ impl Library {
             .map_err(|e| LibraryError::Transaction(e.to_string()))
     }
 
+    /// A real [`crate::fts::connection::FtsConnection`] over this
+    /// library's `full-text-search.db`, sharing this library's live
+    /// connection (via `Backend`'s cheap `Clone`, same pattern
+    /// [`Library::as_cache`] uses) -- issue #226.
+    pub fn fts(&self) -> crate::fts::connection::FtsConnection {
+        crate::fts::connection::FtsConnection::new(self.backend.conn.clone(), &self.backend.db_path)
+    }
+
+    /// Whether FTS indexing has been turned on for this library --
+    /// port of `is_fts_enabled`, backed by the same `preferences`
+    /// table [`Library::get_preference`]/[`Library::set_preference`]
+    /// use (a plain string flag, not `Cache`/`Backend`'s separate
+    /// JSON-preference storage).
+    pub fn is_fts_enabled(&self) -> Result<bool, LibraryError> {
+        Ok(self.get_preference("fts.enabled")?.as_deref() == Some("true"))
+    }
+
+    /// Port of `enable_fts`: turns FTS indexing on (marking every
+    /// existing format dirty so a real indexing pipeline -- not part
+    /// of this crate, see `fts/connection.rs`'s module doc -- would
+    /// pick them all up) or off.
+    pub fn set_fts_enabled(&mut self, enabled: bool) -> Result<(), LibraryError> {
+        self.set_preference("fts.enabled", if enabled { "true" } else { "false" })?;
+        if enabled {
+            self.fts()
+                .initialize()
+                .map_err(|e| LibraryError::Transaction(e.to_string()))?;
+            self.fts()
+                .dirty_existing()
+                .map_err(|e| LibraryError::Transaction(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Port of `fts_indexing_progress`'s `(left, total)` -- the real
+    /// `rate` (indexing throughput) has no meaning here since this
+    /// crate has no background indexing pipeline to measure (see
+    /// `fts/connection.rs`'s module doc), so callers that want
+    /// upstream's 3-tuple just treat rate as always unavailable.
+    pub fn fts_indexing_progress(&self) -> Result<(i64, i64), LibraryError> {
+        let fts = self.fts();
+        fts.initialize()
+            .map_err(|e| LibraryError::Transaction(e.to_string()))?;
+        let left = fts
+            .number_dirtied()
+            .map_err(|e| LibraryError::Transaction(e.to_string()))?;
+        let indexed = fts
+            .number_indexed()
+            .map_err(|e| LibraryError::Transaction(e.to_string()))?;
+        Ok((left, left + indexed))
+    }
+
     pub fn get_preference(&self, key: &str) -> Result<Option<String>, LibraryError> {
         let conn = self.conn();
         let mut stmt = conn.prepare("SELECT val FROM preferences WHERE key = ?1")?;
