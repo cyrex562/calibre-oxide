@@ -44,7 +44,7 @@ use std::sync::{Arc, Mutex};
 /// Builds the three lookup maps [`find_identical_books`] needs
 /// (lowercase author name -> author ids, author id -> book ids, book
 /// id -> title) from every book currently in `cache`.
-fn duplicate_detection_maps(
+pub(crate) fn duplicate_detection_maps(
     cache: &Cache,
 ) -> Result<(
     IndexMap<String, Vec<i32>>,
