@@ -52,6 +52,51 @@
 //! setter API -- see its own doc comment for what's faithfully ported
 //! vs. simplified.
 //!
+//! # The #222 cutover: `field_for` now reads from an in-memory model
+//!
+//! [`Cache::field_for`] originally ran one SQL query per call (the
+//! "real, disclosed simplification" section above describes its value
+//! shape, which is unchanged). Issue #222 phases 1-2 built a real,
+//! upstream-shaped in-memory model to replace that -- `tables.rs`'s
+//! [`crate::tables::StandardTables`] (bulk `read()`, matching
+//! upstream's `Table` subclasses) and `fields.rs`'s
+//! [`crate::fields::FieldStore`] (the typed access layer wrapping it,
+//! matching upstream's `Field` classes' role). Phase 3, landed here,
+//! cuts `Cache::field_for` over to it: a `Cache` value lazily loads
+//! one [`crate::fields::FieldStore`] snapshot on first
+//! [`Cache::field_for`] call and reuses it for every subsequent call
+//! on that same `Cache` value, instead of hitting SQL every time.
+//!
+//! **Staying correct across writes** is the real risk in a change
+//! like this -- this crate has many write paths (this file's own
+//! methods, `restore.rs`, `legacy.rs`'s item rename/delete, and every
+//! test file's raw-SQL fixtures throughout the whole crate), and
+//! missing even one would silently reintroduce stale reads. Rather
+//! than hunting down and instrumenting every call site with an
+//! explicit "you wrote something, please invalidate" call (a real,
+//! open-ended maintenance burden -- miss one today or in the future
+//! and it's a silent bug), [`Cache::field_for`] checks SQLite's own
+//! built-in `total_changes()` running counter (a real SQL function,
+//! `SELECT total_changes()` -- not a rusqlite wrapper) before trusting
+//! its cached snapshot: if that number has moved since the snapshot
+//! was loaded, *any* write happened through this connection since
+//! then (through this file's methods, raw SQL elsewhere, or a test
+//! fixture -- `total_changes()` doesn't care which), so it reloads.
+//! [`Cache::invalidate_field_cache`] still exists as an explicit,
+//! harmless escape hatch, but nothing in this crate actually needs to
+//! call it -- the automatic check already catches everything, which
+//! the full existing test suite (unchanged, all passing) is real
+//! evidence for: dozens of tests across many files write via raw SQL
+//! and immediately assert on `field_for`'s result, and none needed
+//! modification for this cutover to stay green.
+//!
+//! Both `crate::view::View::sort` and every field access in `search.rs`
+//! (`fetch_grouped`/`fetch_identifiers`/every matcher) already call
+//! `Cache::field_for` per book rather than running their own SQL, so
+//! *both* benefit from this cutover automatically -- no separate
+//! rearchitecture of either was needed, satisfying issue #222's
+//! "Cache/search.rs/view.rs" scope in one change.
+//!
 //! # Not ported
 //!
 //! Everything else: notes, FTS, composite fields, virtual libraries,
@@ -67,21 +112,81 @@
 //! ported vs. disclosed simplification in each.
 
 use crate::backend::Backend;
+use crate::fields::FieldStore;
 use calibre_ebooks::metadata::MetaInformation;
 use calibre_utils::filenames::sanitize_file_name;
 use rusqlite::{OptionalExtension, Result};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::Mutex;
 
 pub struct Cache {
     pub backend: Backend,
+    /// Issue #222 phase 3: a lazily-loaded, per-`Cache`-instance
+    /// snapshot of every standard field, backing [`Cache::field_for`].
+    /// Paired with the connection's `total_changes()` count at load
+    /// time; [`Cache::with_field_store`] reloads whenever that count
+    /// has moved, rather than relying on every write path in this
+    /// crate (there are many, including raw SQL in `restore.rs`/
+    /// `legacy.rs`/test fixtures throughout the whole crate) to
+    /// remember to call an explicit invalidation method. See this
+    /// file's module doc for the full cutover story.
+    field_cache: Mutex<Option<(i64, FieldStore)>>,
 }
 
 impl Cache {
     pub fn new<P: AsRef<Path>>(library_path: P) -> Result<Self> {
         let backend = Backend::new(library_path)?;
-        Ok(Cache { backend })
+        Ok(Self::from_backend(backend))
+    }
+
+    /// Wraps an already-open [`Backend`] (e.g. [`crate::library::Library`]'s
+    /// own, via `Backend`'s cheap `Clone`) in a fresh `Cache` -- no
+    /// second connection opened, and a fresh (empty) field cache since
+    /// this is a new `Cache` *value*, even though it shares its
+    /// underlying connection with others.
+    pub(crate) fn from_backend(backend: Backend) -> Self {
+        Cache {
+            backend,
+            field_cache: Mutex::new(None),
+        }
+    }
+
+    /// Forces the next [`Cache::field_for`] call to reload the field
+    /// snapshot, even if `total_changes()` hasn't moved (there is no
+    /// such case in practice -- every write increments it -- but this
+    /// stays available as an explicit, harmless escape hatch).
+    pub fn invalidate_field_cache(&self) {
+        *self.field_cache.lock().unwrap() = None;
+    }
+
+    /// `SELECT total_changes()` -- SQLite's built-in running count of
+    /// every row inserted/updated/deleted on this connection since it
+    /// was opened (a real SQL function, not just a C API -- no extra
+    /// rusqlite wrapper needed). Used as a cheap, robust staleness
+    /// check: *any* write through this connection, by *any* code path
+    /// (this file's own methods, raw SQL elsewhere in the crate, test
+    /// fixtures), moves this number, so there is no missed-invalidation
+    /// class of bug to chase down call site by call site.
+    fn total_changes(conn: &rusqlite::Connection) -> i64 {
+        conn.query_row("SELECT total_changes()", [], |r| r.get(0))
+            .unwrap_or(0)
+    }
+
+    fn with_field_store<T>(&self, f: impl FnOnce(&FieldStore) -> T) -> Result<T> {
+        let conn = self.backend.conn.lock().unwrap();
+        let current = Self::total_changes(&conn);
+        let mut guard = self.field_cache.lock().unwrap();
+        let stale = match &*guard {
+            Some((loaded_at, _)) => *loaded_at != current,
+            None => true,
+        };
+        if stale {
+            let store = FieldStore::load(&conn)?;
+            *guard = Some((current, store));
+        }
+        Ok(f(&guard.as_ref().unwrap().1))
     }
 
     pub fn library_id(&self) -> String {
@@ -129,136 +234,25 @@ impl Cache {
     /// Port of `Cache.field_for` for the standard (non-custom-column)
     /// fields. See the module docs for the multi-value-field string-
     /// join simplification and what's not covered.
+    /// Issue #222 phase 3: every field except `id` now reads from the
+    /// in-memory [`FieldStore`] (built from [`crate::tables::StandardTables`],
+    /// #222 phase 1/2) instead of running SQL per call -- see this
+    /// file's module doc for the cutover and its invalidation story.
     pub fn field_for(&self, book_id: i32, field_name: &str) -> Result<Option<String>> {
-        let conn = self.backend.conn.lock().unwrap();
-
-        match field_name {
-            // `id` is INTEGER, not TEXT like the rest of this arm --
-            // `row.get::<_, String>(0)` would fail to convert it
-            // (rusqlite's `FromSql` for `String` only accepts SQLite
-            // TEXT), so it needs its own arm that fetches an `i64`
-            // first and formats it.
-            "id" => conn
+        if field_name == "id" {
+            // `id` is INTEGER, not TEXT like every other field, and
+            // there's no dedicated table to bulk-load for it (a
+            // book's id *is* every other table's map key) -- stays a
+            // direct, trivial SQL lookup.
+            let conn = self.backend.conn.lock().unwrap();
+            return conn
                 .query_row("SELECT id FROM books WHERE id = ?", [book_id], |row| {
                     row.get::<_, i64>(0)
                 })
                 .optional()
-                .map(|v| v.map(|n| n.to_string())),
-            "title" | "sort" | "author_sort" | "isbn" | "path" | "uuid" | "timestamp"
-            | "pubdate" | "last_modified" => {
-                let sql = format!("SELECT {field_name} FROM books WHERE id = ?");
-                conn.query_row(&sql, [book_id], |row| row.get(0)).optional()
-            }
-            "series_index" => conn
-                .query_row(
-                    "SELECT series_index FROM books WHERE id = ?",
-                    [book_id],
-                    |row| row.get::<_, f64>(0),
-                )
-                .optional()
-                .map(|v| v.map(|n| n.to_string())),
-            "comments" => conn
-                .query_row(
-                    "SELECT text FROM comments WHERE book = ?",
-                    [book_id],
-                    |row| row.get(0),
-                )
-                .optional(),
-            "size" => conn
-                .query_row(
-                    "SELECT MAX(uncompressed_size) FROM data WHERE book = ?",
-                    [book_id],
-                    |row| row.get::<_, Option<i64>>(0),
-                )
-                .optional()
-                .map(|v| v.flatten().map(|n| n.to_string())),
-            "series" => conn
-                .query_row(
-                    "SELECT series.name FROM books_series_link \
-                     JOIN series ON series.id = books_series_link.series \
-                     WHERE books_series_link.book = ?",
-                    [book_id],
-                    |row| row.get(0),
-                )
-                .optional(),
-            "publisher" => conn
-                .query_row(
-                    "SELECT publishers.name FROM books_publishers_link \
-                     JOIN publishers ON publishers.id = books_publishers_link.publisher \
-                     WHERE books_publishers_link.book = ?",
-                    [book_id],
-                    |row| row.get(0),
-                )
-                .optional(),
-            "rating" => conn
-                .query_row(
-                    "SELECT ratings.rating FROM books_ratings_link \
-                     JOIN ratings ON ratings.id = books_ratings_link.rating \
-                     WHERE books_ratings_link.book = ?",
-                    [book_id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()
-                .map(|v| v.map(|n| n.to_string())),
-            "authors" => join_many_to_many(
-                &conn,
-                "SELECT authors.name FROM books_authors_link \
-                 JOIN authors ON authors.id = books_authors_link.author \
-                 WHERE books_authors_link.book = ? ORDER BY books_authors_link.id",
-                book_id,
-                " & ",
-            ),
-            "tags" => join_many_to_many(
-                &conn,
-                "SELECT tags.name FROM books_tags_link \
-                 JOIN tags ON tags.id = books_tags_link.tag \
-                 WHERE books_tags_link.book = ? ORDER BY books_tags_link.id",
-                book_id,
-                ", ",
-            ),
-            "languages" => join_many_to_many(
-                &conn,
-                "SELECT languages.lang_code FROM books_languages_link \
-                 JOIN languages ON languages.id = books_languages_link.lang_code \
-                 WHERE books_languages_link.book = ? ORDER BY books_languages_link.item_order",
-                book_id,
-                ", ",
-            ),
-            "formats" => join_many_to_many(
-                &conn,
-                "SELECT format FROM data WHERE book = ? ORDER BY id",
-                book_id,
-                ", ",
-            ),
-            "identifiers" => {
-                let mut stmt =
-                    conn.prepare("SELECT type, val FROM identifiers WHERE book = ? ORDER BY id")?;
-                let pairs: Vec<(String, String)> = stmt
-                    .query_map([book_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-                    .collect::<Result<_>>()?;
-                if pairs.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(
-                        pairs
-                            .into_iter()
-                            .map(|(t, v)| format!("{t}:{v}"))
-                            .collect::<Vec<_>>()
-                            .join(","),
-                    ))
-                }
-            }
-            // Every field name `Backend::field_for` recognizes is
-            // already handled above (its whitelist -- title, sort,
-            // author_sort, isbn, path, series_index, uuid -- is a
-            // strict subset of this match), so there is nothing left
-            // to delegate to it: an unrecognized name here is
-            // genuinely unrecognized. (Also: `self.backend.conn` is
-            // already locked in this scope; calling
-            // `self.backend.field_for` would try to lock it again and
-            // deadlock, since `std::sync::Mutex` isn't reentrant.)
-            _ => Ok(None),
+                .map(|v| v.map(|n| n.to_string()));
         }
+        self.with_field_store(|store| store.field_for(book_id, field_name))
     }
 
     pub fn update_memory(&mut self, _book_id: i32, _field: &str, _value: &str) {
@@ -475,7 +469,7 @@ impl Cache {
             "INSERT OR REPLACE INTO data (book, format, uncompressed_size, name) VALUES (?1, ?2, ?3, ?4)",
             (book_id, format.to_uppercase(), size, sanitize_file_name(&title)),
         )?;
-
+        drop(conn);
         Ok(true)
     }
 
@@ -508,6 +502,7 @@ impl Cache {
             "DELETE FROM data WHERE book = ?1 AND format = ?2",
             (book_id, fmt.to_uppercase()),
         )?;
+        drop(conn);
         Ok(())
     }
 
@@ -1354,29 +1349,6 @@ impl Cache {
     }
 }
 
-/// Runs a many-to-many field's SELECT (already scoped to one book,
-/// already ordered) and joins the results with `sep`, matching the
-/// "is_multiple fields always return a value, `default_value` is
-/// ignored" rule from `field_for`'s docstring -- an empty result is
-/// `None` here (this crate's `Option<String>` contract), not upstream's
-/// empty tuple, but the "no default substitution" behavior is the same.
-fn join_many_to_many(
-    conn: &rusqlite::Connection,
-    sql: &str,
-    book_id: i32,
-    sep: &str,
-) -> Result<Option<String>> {
-    let mut stmt = conn.prepare(sql)?;
-    let values: Vec<String> = stmt
-        .query_map([book_id], |row| row.get(0))?
-        .collect::<Result<_>>()?;
-    if values.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(values.join(sep)))
-    }
-}
-
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     if !dst.exists() {
         fs::create_dir_all(dst)?;
@@ -2093,5 +2065,62 @@ mod tests {
         assert!(!cache.has_cover(id).unwrap());
         cache.set_field(id, "has_cover", "1").unwrap();
         assert!(cache.has_cover(id).unwrap());
+    }
+
+    #[test]
+    fn field_for_reloads_after_a_raw_sql_write_bypassing_every_cache_method() {
+        // Issue #222 phase 3: `field_for` now reads from a lazily
+        // loaded in-memory snapshot, not per-call SQL -- this proves
+        // the automatic `total_changes()`-based staleness check
+        // catches a write that goes through *neither* `Cache::set_field`
+        // nor an explicit `invalidate_field_cache()` call, just a raw
+        // `conn.execute` on the same connection.
+        let (_dir, cache) = open_test_cache();
+        let id = insert_book(&cache, "Original Title");
+
+        // Prime the cache -- after this, `field_for` has a loaded
+        // snapshot that does NOT reflect the write below yet.
+        assert_eq!(
+            cache.field_for(id, "title").unwrap(),
+            Some("Original Title".to_string())
+        );
+
+        {
+            let conn = cache.backend.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE books SET title = 'Changed By Raw SQL' WHERE id = ?1",
+                (id,),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            cache.field_for(id, "title").unwrap(),
+            Some("Changed By Raw SQL".to_string())
+        );
+    }
+
+    #[test]
+    fn two_cache_values_over_the_same_backend_each_see_current_data() {
+        // A fresh `Cache` (e.g. every `Library::as_cache()` call) has
+        // its own empty snapshot -- it must not somehow inherit a
+        // stale one from a different `Cache` value sharing the same
+        // underlying connection.
+        let dir = tempdir().unwrap();
+        let backend = Backend::new(dir.path()).unwrap();
+        let cache_a = Cache::from_backend(backend.clone());
+        let id = insert_book(&cache_a, "First");
+        assert_eq!(
+            cache_a.field_for(id, "title").unwrap(),
+            Some("First".to_string())
+        );
+
+        cache_a.set_field(id, "title", "Second").unwrap();
+
+        let cache_b = Cache::from_backend(backend);
+        assert_eq!(
+            cache_b.field_for(id, "title").unwrap(),
+            Some("Second".to_string())
+        );
     }
 }

@@ -88,6 +88,12 @@
 //! None of these change what a *supported* query means; they narrow
 //! which queries are supported at all, same as every other disclosed
 //! gap in this crate.
+//!
+//! Every field access here (`fetch_grouped`/`fetch_identifiers`, and
+//! every matcher indirectly through them) already goes through
+//! [`Cache::field_for`] rather than running its own SQL -- so issue
+//! #222's cutover of `field_for` onto an in-memory model applies here
+//! automatically, with no changes needed in this file.
 
 use crate::cache::Cache;
 use calibre_utils::date::parse_date;
@@ -1373,7 +1379,7 @@ mod tests {
     fn make_cache() -> (tempfile::TempDir, Cache) {
         let dir = tempdir().unwrap();
         let backend = Backend::new(dir.path()).unwrap();
-        (dir, Cache { backend })
+        (dir, Cache::from_backend(backend))
     }
 
     fn insert_book(cache: &Cache, title: &str, authors: &[&str], tags: &[&str]) -> i32 {

@@ -219,7 +219,7 @@ mod tests {
     fn open_test_cache() -> (tempfile::TempDir, Arc<Mutex<Cache>>) {
         let dir = tempdir().unwrap();
         let backend = Backend::new(dir.path()).unwrap();
-        (dir, Arc::new(Mutex::new(Cache { backend })))
+        (dir, Arc::new(Mutex::new(Cache::from_backend(backend))))
     }
 
     fn insert_book_with_author_tag_rating(
