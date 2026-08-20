@@ -303,9 +303,7 @@ impl Library {
     /// functionality (real search, real custom columns) instead of
     /// `Library` hand-rolling its own duplicate SQL.
     fn as_cache(&self) -> crate::cache::Cache {
-        crate::cache::Cache {
-            backend: self.backend.clone(),
-        }
+        crate::cache::Cache::from_backend(self.backend.clone())
     }
 
     pub fn get_custom_column_label_map(

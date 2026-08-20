@@ -13,23 +13,24 @@
 //! searching/sorting/categories all go through instead of hitting SQL
 //! per call. That's the real target architecture.
 //!
-//! This pass ports the **read side only**: real `read()` bulk-loading
-//! for every standard field `Cache::field_for` (#204) already
-//! supports, faithfully matching upstream's map shapes. It does
-//! **not** yet wire this into `Cache`, `search.rs`, or `view.rs` --
-//! those still use the existing real, tested, per-call-SQL strategy.
-//! It also does **not** port the mutation side (`remove_books`/
+//! This pass ports the **read side**: real `read()` bulk-loading for
+//! every standard field, faithfully matching upstream's map shapes.
+//! It does **not** port the mutation side (`remove_books`/
 //! `remove_items`/`rename_item`/`set_links`/`fix_link_table`/
-//! `fix_case_duplicates`/format-specific mutators) -- those only
-//! matter once something is actually consuming and keeping this
-//! in-memory model in sync on writes, which is a later phase.
+//! `fix_case_duplicates`/format-specific mutators) -- writes still go
+//! through `Cache`'s existing real, tested, per-call-SQL write
+//! methods, which invalidate the read-side snapshot this file
+//! provides rather than updating it incrementally in place; see
+//! `cache.rs`'s module doc for that story.
 //!
-//! Think of this as the foundation poured, not the building wired up:
-//! real, tested, standalone data structures that a later phase can
-//! cut `Cache`/`search.rs`/`view.rs` over to -- a deliberate,
-//! incremental approach to a rearchitecture large enough that doing
-//! it in one uncheckable pass would be reckless (see #222's own issue
-//! body for why this wasn't started as a single all-at-once change).
+//! **Phase 3 (the cutover) has landed**: [`StandardTables`] (via
+//! [`crate::fields::FieldStore`]) is what [`crate::cache::Cache::field_for`]
+//! actually reads from now, not per-call SQL. Both `crate::view::View::sort`
+//! and every field access in `search.rs` already go through
+//! `Cache::field_for` themselves rather than running their own SQL, so
+//! both benefit automatically -- no separate rearchitecture of either
+//! was needed. See `cache.rs`'s module doc for the cutover's
+//! cache-invalidation-on-write story.
 //!
 //! # Disclosed simplifications
 //!
@@ -67,6 +68,7 @@
 //!   feature, so it's ported here even though this phase is otherwise
 //!   read-only.
 
+use indexmap::IndexMap;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, Result};
 use serde::{Deserialize, Serialize};
@@ -282,12 +284,20 @@ pub struct ManyToManyTable {
 }
 
 impl ManyToManyTable {
+    /// `order_by` is the link table's own ordering column -- `"id"`
+    /// (link-row insertion order) for most many-to-many fields, but
+    /// `"item_order"` for `languages` specifically: the real schema's
+    /// `books_languages_link` has its own explicit display-order
+    /// column, separate from insertion order (`Cache::set_field`'s
+    /// many-to-many setter, #223, writes it explicitly for exactly
+    /// this reason).
     pub fn read(
         conn: &Connection,
         item_table: &str,
         item_column: &str,
         link_table: &str,
         link_column: &str,
+        order_by: &str,
     ) -> Result<Self> {
         let mut id_map = HashMap::new();
         let mut link_map = HashMap::new();
@@ -313,7 +323,7 @@ impl ManyToManyTable {
         let mut col_book_map: HashMap<i32, HashSet<i32>> = HashMap::new();
         let mut book_col_map: HashMap<i32, Vec<i32>> = HashMap::new();
         {
-            let sql = format!("SELECT book, {link_column} FROM {link_table} ORDER BY id");
+            let sql = format!("SELECT book, {link_column} FROM {link_table} ORDER BY {order_by}");
             let mut stmt = conn.prepare(&sql)?;
             let rows =
                 stmt.query_map([], |row| Ok((row.get::<_, i32>(0)?, row.get::<_, i32>(1)?)))?;
@@ -456,19 +466,24 @@ impl FormatsTable {
 
 /// Port of `IdentifiersTable`: keyed by identifier type (e.g.
 /// `"isbn"`), not an integer item id -- same "no item table, link
-/// rows are the items" shape as [`FormatsTable`].
+/// rows are the items" shape as [`FormatsTable`]. Each book's inner
+/// map is an [`IndexMap`], not a plain `HashMap`, and the read query
+/// is explicitly `ORDER BY id` -- both needed so a consumer joining
+/// a book's identifiers into a single string (`Cache::field_for`'s
+/// `"type:val,type:val"` contract) gets a deterministic, insertion-
+/// order result instead of `HashMap`'s unspecified iteration order.
 #[derive(Debug, Default, Clone)]
 pub struct IdentifiersTable {
-    pub book_col_map: HashMap<i32, HashMap<String, String>>,
+    pub book_col_map: HashMap<i32, IndexMap<String, String>>,
     pub col_book_map: HashMap<String, HashSet<i32>>,
 }
 
 impl IdentifiersTable {
     pub fn read(conn: &Connection) -> Result<Self> {
-        let mut book_col_map: HashMap<i32, HashMap<String, String>> = HashMap::new();
+        let mut book_col_map: HashMap<i32, IndexMap<String, String>> = HashMap::new();
         let mut col_book_map: HashMap<String, HashSet<i32>> = HashMap::new();
 
-        let mut stmt = conn.prepare("SELECT book, type, val FROM identifiers")?;
+        let mut stmt = conn.prepare("SELECT book, type, val FROM identifiers ORDER BY id")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, i32>(0)?,
@@ -541,13 +556,14 @@ impl StandardTables {
                 "publisher",
             )?,
             rating: read_rating_table(conn)?,
-            tags: ManyToManyTable::read(conn, "tags", "name", "books_tags_link", "tag")?,
+            tags: ManyToManyTable::read(conn, "tags", "name", "books_tags_link", "tag", "id")?,
             languages: ManyToManyTable::read(
                 conn,
                 "languages",
                 "lang_code",
                 "books_languages_link",
                 "lang_code",
+                "item_order",
             )?,
             authors: AuthorsTable::read(conn)?,
             formats: FormatsTable::read(conn)?,
@@ -685,7 +701,8 @@ mod tests {
             .unwrap();
         }
 
-        let table = ManyToManyTable::read(&conn, "tags", "name", "books_tags_link", "tag").unwrap();
+        let table =
+            ManyToManyTable::read(&conn, "tags", "name", "books_tags_link", "tag", "id").unwrap();
         let names: Vec<&String> = table.book_col_map[&id]
             .iter()
             .map(|id| table.id_map.get(id).unwrap())
