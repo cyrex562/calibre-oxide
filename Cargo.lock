@@ -478,6 +478,7 @@ name = "calibre_db"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.21.7",
  "calibre_ebooks",
  "calibre_utils",
  "chrono",
@@ -486,6 +487,7 @@ dependencies = [
  "indexmap 2.12.1",
  "lazy_static",
  "log",
+ "mime_guess",
  "regex",
  "rusqlite",
  "rust-stemmers",
@@ -496,6 +498,7 @@ dependencies = [
  "unicode-normalization",
  "unicode-segmentation",
  "unicode-width 0.2.2",
+ "urlencoding",
  "uuid",
  "walkdir",
 ]
