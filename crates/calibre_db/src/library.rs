@@ -494,6 +494,13 @@ impl Library {
         crate::fts::connection::FtsConnection::new(self.backend.conn.clone(), &self.backend.db_path)
     }
 
+    /// A real [`crate::notes::connection::NotesConnection`] over this
+    /// library's `.calnotes/notes.db`, sharing this library's live
+    /// connection (same pattern as [`Library::fts`]) -- issue #227.
+    pub fn notes(&self) -> crate::notes::connection::NotesConnection {
+        crate::notes::connection::NotesConnection::new(self.backend.conn.clone(), &self.path)
+    }
+
     /// Whether FTS indexing has been turned on for this library --
     /// port of `is_fts_enabled`, backed by the same `preferences`
     /// table [`Library::get_preference`]/[`Library::set_preference`]
