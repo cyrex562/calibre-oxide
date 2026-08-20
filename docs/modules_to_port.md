@@ -130,7 +130,7 @@ either -- this pass wasn't exhaustive.
 #### notes
 
 - [x] __init__.py
-- [ ] connect.py (#227: ~23% of source size -- partial connection/schema setup, not the real notes content/attachment/full-text-search feature surface)
+- [x] connect.py (#227: real schema (`notes`/`resources`/`notes_resources_link`/two FTS5 virtual tables) and sync/cascade-delete triggers; core CRUD (`set_note`/`get_note`/`get_note_data`/`rename_note`/`delete_field`/`items_with_notes_for_field`/`all_items_with_notes`); resource attachment storage with real content-addressed dedup and orphaned-file cleanup (`add_resource`/`get_resource_data`/`remove_unreferenced_resources`); real search (`all_notes`/`search`, the latter raising the real `FtsQueryError` from #218/#226). Wired up as `Library::notes()`, same pattern as `Library::fts()` (#226). NOT ported: the retire/backup/undo-trail (a note delete is just a delete, no recovery history), `.metadata` JSON sidecars, `field_metadata`/`supports_notes` gating (no such subsystem, the recurring #201 gap), export/restore integration, and the custom `calibre`/`porter` FTS5 tokenizers (same #93 dependency as #226 -- `unicode61` fallback). `export_note`/`import_note` stay out of scope here, tracked as #228 below. See `notes/connection.rs`'s module doc.)
 - [ ] exim.py (#228: "Stubbed implementation for now as we lack full HTML parsing capabilities" -- that blocker is gone, `calibre_ebooks` now has real HTML parsing (html5ever); sequenced after #227 since export/import needs real notes storage to round-trip)
 - [x] schema_upgrade.py
 
