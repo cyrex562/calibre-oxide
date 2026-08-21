@@ -67,6 +67,30 @@ fn test_covers_and_categories() {
     // Verify File Exists
     let cover_path = covers::cover_path(&cache, book_id).expect("cover_path failed");
     assert!(cover_path.exists());
-    let read_data = fs::read(cover_path).unwrap();
+    let read_data = fs::read(&cover_path).unwrap();
     assert_eq!(read_data, fake_image_data);
+
+    // set_cover also records a real BLAKE3 checksum (issue #93 §8) --
+    // verifying against the file as it stands now must match, and a
+    // direct on-disk tamper must be caught.
+    {
+        let guard = cache.lock().unwrap();
+        assert_eq!(
+            guard
+                .checksums()
+                .verify_file(book_id, "cover", "", &cover_path)
+                .unwrap(),
+            calibre_db::checksums::VerifyOutcome::Match
+        );
+    }
+    fs::write(&cover_path, b"tampered").unwrap();
+    {
+        let guard = cache.lock().unwrap();
+        assert!(matches!(
+            guard
+                .checksums()
+                .verify_file(book_id, "cover", "", &cover_path),
+            Err(calibre_db::checksums::ChecksumError::Mismatch { .. })
+        ));
+    }
 }

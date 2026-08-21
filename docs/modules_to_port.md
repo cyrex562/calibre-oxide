@@ -97,7 +97,7 @@ either -- this pass wasn't exhaustive.
 - [x] cmd_add.py
 - [x] `cmd_backup_metadata.py` -> `crates/calibre_db/src/cli/cmd_backup_metadata.rs`
 - [x] cmd_catalog.py
-- [x] `cmd_check_library.py` (Partial/Skeleton) -> `crates/calibre_db/src/cli/cmd_check_library.rs`
+- [x] `cmd_check_library.py` (Partial/Skeleton) -> `crates/calibre_db/src/cli/cmd_check_library.rs` (#93 §8 follow-up: `check_library.rs`'s per-book scan now also verifies each present format/cover file's content against a real BLAKE3 checksum recorded at add time, reporting real mismatches as `corrupted_formats`/`corrupted_covers` -- printed as new "Corrupted book formats"/"Corrupted cover files" sections. Fixed a real pre-existing bug found while wiring this in: `check_library.rs`'s own `IGNORE_AT_TOP_LEVEL` set held placeholder `".trash"`/`".notes"` strings that never matched the real `crate::constants::TRASH_DIR_NAME`/`NOTES_DIR_NAME` (`.caltrash`/`.calnotes`), so `scan_library` was spuriously flagging every real trash/notes directory as an invalid top-level entry; also added `.calibre-oxide` itself, missing since #93 phase 1 introduced it. See `checksums.rs`'s module doc for the full checksum-store design.)
 - [x] cmd_clone.py
 - [x] cmd_custom_columns.py
 - [x] cmd_embed_metadata.py

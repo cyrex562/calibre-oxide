@@ -63,7 +63,13 @@ pub fn backup_metadata(cache: &Arc<Mutex<Cache>>, book_id: i32) -> Result<()> {
         fs::create_dir_all(&book_dir)?;
     }
     let opf_path = book_dir.join("metadata.opf");
-    fs::write(opf_path, xml)?;
+    fs::write(&opf_path, xml)?;
+
+    // Port of docs/FAULT_TOLERANCE.md §8: "sidecar files: same rule"
+    // as book-format files.
+    guard
+        .checksums()
+        .record_file(book_id, "opf", "", &opf_path)?;
 
     Ok(())
 }

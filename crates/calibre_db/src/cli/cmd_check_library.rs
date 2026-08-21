@@ -58,6 +58,8 @@ pub fn all_checks<'a>(
         ("Cover files not in database", &checker.extra_covers),
         ("Malformed formats", &checker.malformed_formats),
         ("Malformed book paths", &checker.malformed_paths),
+        ("Corrupted book formats", &checker.corrupted_formats),
+        ("Corrupted cover files", &checker.corrupted_covers),
     ]
 }
 
@@ -173,7 +175,14 @@ mod tests {
             .records()
             .map(|r| r.unwrap().iter().map(str::to_string).collect())
             .collect();
-        assert_eq!(records, vec![vec![LABEL.to_string(), "first".to_string(), "second".to_string()]]);
+        assert_eq!(
+            records,
+            vec![vec![
+                LABEL.to_string(),
+                "first".to_string(),
+                "second".to_string()
+            ]]
+        );
     }
 
     #[test]
@@ -195,7 +204,11 @@ mod tests {
             .collect();
         assert_eq!(
             records,
-            vec![vec![LABEL.to_string(), "I, Caesar".to_string(), "second".to_string()]]
+            vec![vec![
+                LABEL.to_string(),
+                "I, Caesar".to_string(),
+                "second".to_string()
+            ]]
         );
     }
 
@@ -206,10 +219,8 @@ mod tests {
         // print its label as a "false positive".
         let empty: Vec<(String, String, i32)> = Vec::new();
         let populated = vec![("t".to_string(), "u".to_string(), 0)];
-        let checks: Vec<(&'static str, &[(String, String, i32)])> = vec![
-            ("Empty Check", &empty),
-            ("Populated Check", &populated),
-        ];
+        let checks: Vec<(&'static str, &[(String, String, i32)])> =
+            vec![("Empty Check", &empty), ("Populated Check", &populated)];
         let mut buf: Vec<u8> = Vec::new();
         write_check_library_results(&mut buf, &checks, false).unwrap();
         let text = String::from_utf8(buf).unwrap();

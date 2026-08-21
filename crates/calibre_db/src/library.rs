@@ -499,6 +499,14 @@ impl Library {
         crate::notes::connection::NotesConnection::new(self.backend.conn.clone(), &self.path)
     }
 
+    /// A real [`crate::checksums::ChecksumStore`] over this library's
+    /// `.calibre-oxide/checksums.db`, sharing this library's live
+    /// connection (same pattern as [`Library::fts`]/[`Library::notes`])
+    /// -- issue #93 §8.
+    pub fn checksums(&self) -> crate::checksums::ChecksumStore {
+        crate::checksums::ChecksumStore::new(self.backend.conn.clone(), &self.path)
+    }
+
     /// Whether FTS indexing has been turned on for this library --
     /// port of `is_fts_enabled`, backed by the same `preferences`
     /// table [`Library::get_preference`]/[`Library::set_preference`]

@@ -11,6 +11,10 @@ pub const LIBRARY_HANDLE_DIR_NAME: &str = ".calibre-oxide";
 pub const WRITER_LOCK_FILE_NAME: &str = "writer.lock";
 pub const JOURNAL_DIR_NAME: &str = "journal";
 pub const JOURNAL_CHECKPOINT_FILE_NAME: &str = "journal_checkpoint";
+/// Port of `docs/FAULT_TOLERANCE.md` §8's book-file/cover/sidecar
+/// checksum store (issue #93) -- sits alongside the writer lock and
+/// journal under `<library>/.calibre-oxide/`.
+pub const CHECKSUMS_DB_NAME: &str = "checksums.db";
 pub const DATA_DIR_NAME: &str = "data";
 // DATA_FILE_PATTERN needs format! or similar if usage requires it, but constant strings are fine here.
 // In Rust, we can't easily do f-string constants with runtime vars, but this looks static.
