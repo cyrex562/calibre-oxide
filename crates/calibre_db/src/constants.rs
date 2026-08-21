@@ -6,9 +6,10 @@ pub const NOTES_DIR_NAME: &str = ".calnotes";
 pub const NOTES_DB_NAME: &str = "notes.db";
 /// Port of `docs/FAULT_TOLERANCE.md`'s `<library>/.calibre-oxide/`
 /// convention (issue #93) -- home for [`crate::library_handle::LibraryHandle`]'s
-/// writer lock and (a later phase's) write-ahead journal.
+/// writer lock and write-ahead journal.
 pub const LIBRARY_HANDLE_DIR_NAME: &str = ".calibre-oxide";
 pub const WRITER_LOCK_FILE_NAME: &str = "writer.lock";
+pub const JOURNAL_DIR_NAME: &str = "journal";
 pub const DATA_DIR_NAME: &str = "data";
 // DATA_FILE_PATTERN needs format! or similar if usage requires it, but constant strings are fine here.
 // In Rust, we can't easily do f-string constants with runtime vars, but this looks static.

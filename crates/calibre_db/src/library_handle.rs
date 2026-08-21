@@ -1,8 +1,8 @@
-//! `LibraryHandle` (issue #93, phase 1): the single gateway every
-//! durable write to a library folder is meant to go through, per
+//! `LibraryHandle` (issue #93): the single gateway every durable write
+//! to a library folder is meant to go through, per
 //! `docs/FAULT_TOLERANCE.md`.
 //!
-//! # Scope of this phase
+//! # Scope so far
 //!
 //! The design doc describes a large system: storage-tier
 //! classification, a writer lock, atomic write primitives, a
@@ -11,10 +11,9 @@
 //! network-storage writes, and (per its own "definition of done") a
 //! crate-wide retrofit so no other file in this crate touches a
 //! library path with a raw `fs::write`/`fs::rename`. That is
-//! realistically several more PRs' worth of work -- this one, phase
-//! 1, ships the foundation the rest builds on, real and independently
-//! useful on its own:
+//! realistically several more PRs' worth of work. Landed so far:
 //!
+//! **Phase 1**:
 //! - [`StorageTier`] classification (§1): real on Unix (parses
 //!   `/proc/mounts` for the longest-prefix-matching mount, checks its
 //!   fstype against a known-network-filesystem table, and consults
@@ -26,58 +25,91 @@
 //!   this project's Rust version -- no OS-specific FFI needed here).
 //!   Released automatically on drop (including process crash/kill,
 //!   since the OS releases an advisory lock when the holding file
-//!   descriptor closes for any reason) -- exactly the "don't leave a
-//!   stale lock after a crash" property the design doc wants.
-//! - Atomic write primitives (§2 step 3, minus the journal wrapper):
-//!   [`LibraryHandle::write_atomic`] (write-temp / fsync-temp / rename
-//!   / fsync-parent-directory) and [`LibraryHandle::rename_atomic`]
-//!   (POSIX `rename` is already atomic; this adds the fsync-parent-
-//!   directory step upstream's own discipline requires). Directory
-//!   fsync is real on Unix (`File::open` on a directory + `sync_all`,
-//!   a standard POSIX technique); a no-op on Windows, which has a
-//!   different durability model for directory entries (the design
-//!   doc's own Windows answer is `MoveFileExW` with
-//!   `MOVEFILE_WRITE_THROUGH`, not directory fsync -- not implemented
-//!   here, same disclosed Windows gap as tier classification).
+//!   descriptor closes for any reason).
 //! - Lifecycle states ([`HandleState`]): `Open`/`Suspended`/`Detached`
-//!   exist as real types with a real `Detached` error contract
-//!   ([`LibraryHandleError::DeviceDetached`]), but nothing in this
-//!   phase ever transitions a handle away from `Open` -- that's what
-//!   the device-notification (§4) and power-state (§5) phases wire
-//!   up. A `LibraryHandle` today is always `Open` for its whole
-//!   lifetime.
-//! - Fault-injection testing of the write-atomic sequence
-//!   (`docs/FAULT_TOLERANCE.md`'s "testable invariants"): rather than
-//!   pulling in the `fail` crate (an extra dependency for a single
-//!   file's tests), [`LibraryHandle`] has an internal, always-compiled
-//!   (but only ever exercised by tests) `write_atomic_impl` that takes
-//!   an optional fault-injection point and simulates a crash
-//!   immediately after each step of the sequence; the tests assert
-//!   the one invariant `write_atomic` itself can guarantee without a
-//!   journal: the *original* target file is left completely untouched
-//!   by a failure at any point before the rename commits.
+//!   exist as real types with a real `Detached`/`Suspended` error
+//!   contract, but nothing yet transitions a handle away from `Open`
+//!   -- that's the device-notification (§4) and power-state (§5)
+//!   phases, still not started.
 //!
-//! # Not in this phase (disclosed, tracked as later work under #93)
+//! **Phase 2 (this pass)**: the write-ahead journal and crash
+//! recovery (§2 steps 1-2, 4-5), and journal-entry BLAKE3 chaining
+//! (§8's "the journal itself is BLAKE3-chained"). Every
+//! [`LibraryHandle::write_atomic`]/[`LibraryHandle::rename_atomic`]
+//! call now:
 //!
-//! - The write-ahead journal and crash-recovery replay (§2 steps 1-2,
-//!   4-5) -- `write_atomic`/`rename_atomic` are atomic *individual*
-//!   operations already (real, useful today), but nothing here yet
-//!   records a journal entry beforehand or replays one on reopen.
-//!   BLAKE3 checksums (§8) are part of this same later phase.
+//! 1. Writes a journal entry (`<library>/.calibre-oxide/journal/<uuid>.op`)
+//!    describing the operation -- a monotonic sequence number, the
+//!    previous entry's hash (`prev_head`), the operation descriptor,
+//!    and a BLAKE3 hash of that descriptor -- and `fsync`s the entry
+//!    file and the journal directory, *before* touching the real
+//!    target.
+//! 2. Performs the operation (phase 1's write-temp/fsync/rename/
+//!    fsync-dir sequence -- the temp file's name is derived from this
+//!    same journal entry's uuid, so recovery can find it).
+//! 3. Writes a `<uuid>.committed` marker, fsynced.
+//!
+//! [`LibraryHandle::open`] runs a real recovery scan of the journal
+//! directory before returning: it verifies the whole hash chain
+//! (tamper/corruption detection -- a broken chain or a
+//! self-inconsistent entry is a real, hard [`LibraryHandleError::Corruption`]),
+//! then for every entry without a `.committed` marker, determines
+//! whether the operation actually completed on disk (by re-hashing the
+//! target file's content against the entry's recorded checksum, for
+//! writes; by checking which of `from`/`to` exist, for renames) and
+//! either finalizes the missing commit marker (the operation
+//! completed, only the marker write was interrupted -- "safe to
+//! consider done", matching upstream's "committed-but-unacked, safe
+//! to re-apply" language) or cleans up an orphaned temp file (the
+//! operation never completed -- the real target is untouched, so
+//! there's nothing to roll back at the target level, just garbage to
+//! remove).
+//!
+//! # Disclosed simplifications (phase 2)
+//!
+//! - **No pruning.** Every journal entry, once written, stays on disk
+//!   forever -- the journal directory grows without bound over a
+//!   library's lifetime. A real system would eventually archive or
+//!   truncate old, fully-committed entries; not implemented here, and
+//!   deliberately so for now: pruning interacts with hash-chain
+//!   verification (a pruned entry can no longer be checked against by
+//!   anything after it, which either needs a persisted rolling
+//!   checkpoint or accepts a weaker "verify only what's currently on
+//!   disk" guarantee) and that tradeoff deserves its own scoped pass
+//!   rather than being bundled in here.
+//! - **No full-payload replay.** The journal entry for a write stores
+//!   a BLAKE3 checksum of the intended content, not the content
+//!   itself (matching upstream's "operation descriptor," not "the
+//!   payload"). Recovery can therefore *detect* whether a write
+//!   completed and *verify* its integrity, but if a write never made
+//!   it to `target` at all (crashed before or during the temp-file
+//!   write), there is nothing to replay -- the caller is expected to
+//!   retry the whole operation. This is consistent with write-temp-
+//!   then-rename's actual atomicity guarantee: an operation either
+//!   fully happened or fully didn't, there's no partial state to
+//!   resume from.
+//! - **Journal entries serialize `PathBuf`s via serde's default
+//!   encoding** (platform `OsString`-based) -- not guaranteed to
+//!   round-trip identically across platforms for non-UTF-8 paths. Not
+//!   a concern for this crate's actual usage (library paths are
+//!   expected to be valid UTF-8), disclosed for completeness.
+//!
+//! # Not done yet (disclosed, tracked as later work under #93)
+//!
 //! - Device-removal notifications (§4) and the `Detached` transition.
 //! - Sleep/resume notifications (§5) and the `Suspended` transition.
 //! - Network-storage two-phase writes (§6) -- [`StorageTier::Network`]
 //!   is detected and stored, but nothing yet changes behavior based on
 //!   it.
+//! - Book-file BLAKE3 checksums stored in `metadata.db` at add time
+//!   (§8's other half) -- this phase's checksums live only inside
+//!   journal entries, not integrated with `Cache`/the schema yet.
 //! - **The crate-wide retrofit.** Every existing `fs::write`/
 //!   `fs::rename`/`fs::copy` call against a library path elsewhere in
 //!   this crate (`cache.rs`, `restore.rs`, `notes/connection.rs`,
 //!   `covers.rs`, `adding.rs`, and more) still calls `std::fs`
 //!   directly, not through this handle. Retrofitting all of them is
-//!   its own large, separately-reviewable change -- doing it in the
-//!   same pass as introducing the primitive would combine two very
-//!   different kinds of risk (new-code-correctness and regressing
-//!   many already-shipped, tested write paths at once).
+//!   its own large, separately-reviewable change.
 //! - Windows implementations of tier classification and directory
 //!   durability (see above) -- this workspace has no way to compile-
 //!   check or test Windows-specific code, so rather than ship
@@ -89,8 +121,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use thiserror::Error;
+use uuid::Uuid;
 
-use crate::constants::{LIBRARY_HANDLE_DIR_NAME, WRITER_LOCK_FILE_NAME};
+use crate::constants::{JOURNAL_DIR_NAME, LIBRARY_HANDLE_DIR_NAME, WRITER_LOCK_FILE_NAME};
 
 /// Port of `docs/FAULT_TOLERANCE.md` §1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,8 +137,8 @@ pub enum StorageTier {
 }
 
 /// Port of `docs/FAULT_TOLERANCE.md` §4-5's lifecycle states. Nothing
-/// in this phase transitions a handle out of `Open` -- see this
-/// module's doc comment.
+/// yet transitions a handle out of `Open` -- see this module's doc
+/// comment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandleState {
     Open,
@@ -120,25 +153,62 @@ pub enum LibraryHandleError {
     #[error("another process already holds the writer lock for this library")]
     AlreadyLocked,
     /// Real per docs/FAULT_TOLERANCE.md §4's contract ("no retries
-    /// hidden in the handle"); reserved -- nothing in this phase ever
-    /// produces this yet (see module doc).
+    /// hidden in the handle"); reserved -- nothing yet produces this
+    /// (see module doc).
     #[error("the library's storage device has been detached")]
     DeviceDetached,
     /// Reserved for the power-state phase (§5).
     #[error("the library handle is suspended")]
     Suspended,
-    /// Reserved for the checksum phase (§8).
+    /// Real as of phase 2: raised by journal recovery when a journal
+    /// entry's own hash doesn't match its content, the hash chain is
+    /// broken, or a recovered file's content doesn't match its
+    /// recorded checksum.
     #[error("data corruption detected: {0}")]
     Corruption(String),
 }
 
+/// What a journal entry describes -- upstream's "operation
+/// descriptor" (§2 step 2). `content_hash`/matching are hex BLAKE3.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+enum OperationDescriptor {
+    WriteFile {
+        target: PathBuf,
+        content_hash: String,
+    },
+    RenameFile {
+        from: PathBuf,
+        to: PathBuf,
+    },
+}
+
+/// One journal entry -- port of §2 step 2's four fields exactly:
+/// sequence number, previous head, descriptor, BLAKE3 of the
+/// descriptor.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct JournalEntry {
+    seq: u64,
+    prev_head: Option<String>,
+    op: OperationDescriptor,
+    descriptor_hash: String,
+}
+
+/// The journal's current tip, used to chain the next entry.
+#[derive(Debug, Clone)]
+struct JournalHead {
+    next_seq: u64,
+    prev_hash: Option<String>,
+}
+
 /// The single gateway every durable write to a library folder is
 /// meant to go through. See this module's doc comment for exactly
-/// what's real in this phase.
+/// what's real so far.
 pub struct LibraryHandle {
     library_path: PathBuf,
     tier: StorageTier,
     state: Mutex<HandleState>,
+    journal_dir: PathBuf,
+    journal_head: Mutex<JournalHead>,
     /// Held open for the handle's whole lifetime -- the OS releases
     /// the advisory lock automatically when this (and every other
     /// clone of the fd, which there are none of here) closes, which
@@ -148,11 +218,14 @@ pub struct LibraryHandle {
 }
 
 impl LibraryHandle {
-    /// Opens (creating `<library>/.calibre-oxide/` if needed) and
-    /// acquires the exclusive writer lock. Fails with
-    /// [`LibraryHandleError::AlreadyLocked`] if another `LibraryHandle`
-    /// (in this or another process) already holds it -- no blocking,
-    /// no retry loop, matching §7's "one writer per library" rule.
+    /// Opens (creating `<library>/.calibre-oxide/` if needed),
+    /// acquires the exclusive writer lock, and runs journal recovery
+    /// (see module doc). Fails with [`LibraryHandleError::AlreadyLocked`]
+    /// if another `LibraryHandle` (in this or another process) already
+    /// holds the lock -- no blocking, no retry loop, matching §7's
+    /// "one writer per library" rule. Fails with
+    /// [`LibraryHandleError::Corruption`] if the journal's hash chain
+    /// doesn't verify.
     pub fn open(library_path: &Path) -> Result<Self, LibraryHandleError> {
         let handle_dir = library_path.join(LIBRARY_HANDLE_DIR_NAME);
         fs::create_dir_all(&handle_dir)?;
@@ -168,10 +241,15 @@ impl LibraryHandle {
             Err(fs::TryLockError::Error(e)) => return Err(LibraryHandleError::Io(e)),
         }
 
+        let journal_dir = handle_dir.join(JOURNAL_DIR_NAME);
+        let head = recover_journal(&journal_dir)?;
+
         Ok(LibraryHandle {
             library_path: library_path.to_path_buf(),
             tier: classify_storage_tier(library_path),
             state: Mutex::new(HandleState::Open),
+            journal_dir,
+            journal_head: Mutex::new(head),
             _lock_file: lock_file,
         })
     }
@@ -196,28 +274,23 @@ impl LibraryHandle {
         }
     }
 
-    /// Port of §2 step 3: write-temp / fsync-temp / rename / fsync-
-    /// parent-directory. `target` must be an absolute path (or at
-    /// least caller-resolved -- this doesn't re-root it under
-    /// `library_path`, callers do that).
+    /// Port of §2 steps 1-4 for a file write: journal, write-temp /
+    /// fsync-temp / rename / fsync-parent-directory, mark committed.
+    /// `target` must be an absolute path (or at least caller-resolved
+    /// -- this doesn't re-root it under `library_path`, callers do
+    /// that).
     pub fn write_atomic(&self, target: &Path, bytes: &[u8]) -> Result<(), LibraryHandleError> {
         self.write_atomic_impl(target, bytes, None)
     }
 
-    /// Port of §2 step 3's rename half, for callers that already have
-    /// the payload written to its final form elsewhere (e.g. a format
-    /// file copied by a caller, then atomically published into place)
-    /// -- POSIX `rename` is already atomic; this adds the durability-
-    /// relevant fsync of the parent director(ies) upstream's
-    /// discipline requires.
+    /// Port of §2 steps 1-4 for a rename, for callers that already
+    /// have the payload written to its final form elsewhere (e.g. a
+    /// format file copied by a caller, then atomically published into
+    /// place) -- POSIX `rename` is already atomic; this adds the
+    /// journal entry and the durability-relevant fsync of the parent
+    /// director(ies) upstream's discipline requires.
     pub fn rename_atomic(&self, from: &Path, to: &Path) -> Result<(), LibraryHandleError> {
-        self.check_open()?;
-        fs::rename(from, to)?;
-        fsync_dir(from.parent())?;
-        if to.parent() != from.parent() {
-            fsync_dir(to.parent())?;
-        }
-        Ok(())
+        self.rename_atomic_impl(from, to, None)
     }
 
     /// `fail_after` is a test-only fault-injection hook (see module
@@ -231,22 +304,22 @@ impl LibraryHandle {
         fail_after: Option<FailPoint>,
     ) -> Result<(), LibraryHandleError> {
         self.check_open()?;
+        let uuid = Uuid::new_v4();
+        let content_hash = blake3_hex(bytes);
+        let op = OperationDescriptor::WriteFile {
+            target: target.to_path_buf(),
+            content_hash,
+        };
+        self.journal_write(uuid, op)?;
+        if fail_after == Some(FailPoint::JournalWrite) {
+            return Err(simulated_crash());
+        }
+
         let parent = target.parent();
         if let Some(parent) = parent {
             fs::create_dir_all(parent)?;
         }
-        let tmp_name = format!(
-            "{}.tmp-{}",
-            target
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("file"),
-            uuid::Uuid::new_v4()
-        );
-        let tmp_path = match parent {
-            Some(p) => p.join(&tmp_name),
-            None => PathBuf::from(&tmp_name),
-        };
+        let tmp_path = temp_path_for(target, uuid);
 
         let tmp_file = File::create(&tmp_path)?;
         {
@@ -269,25 +342,257 @@ impl LibraryHandle {
         }
 
         fsync_dir(parent)?;
+        if fail_after == Some(FailPoint::BeforeCommit) {
+            return Err(simulated_crash());
+        }
+
+        self.journal_commit(uuid)?;
+        Ok(())
+    }
+
+    fn rename_atomic_impl(
+        &self,
+        from: &Path,
+        to: &Path,
+        fail_after: Option<FailPoint>,
+    ) -> Result<(), LibraryHandleError> {
+        self.check_open()?;
+        let uuid = Uuid::new_v4();
+        let op = OperationDescriptor::RenameFile {
+            from: from.to_path_buf(),
+            to: to.to_path_buf(),
+        };
+        self.journal_write(uuid, op)?;
+        if fail_after == Some(FailPoint::JournalWrite) {
+            return Err(simulated_crash());
+        }
+
+        fs::rename(from, to)?;
+        if fail_after == Some(FailPoint::Rename) {
+            return Err(simulated_crash());
+        }
+
+        fsync_dir(from.parent())?;
+        if to.parent() != from.parent() {
+            fsync_dir(to.parent())?;
+        }
+        if fail_after == Some(FailPoint::BeforeCommit) {
+            return Err(simulated_crash());
+        }
+
+        self.journal_commit(uuid)?;
+        Ok(())
+    }
+
+    /// Port of §2 step 2: write the journal entry, fsync it, fsync
+    /// the journal directory, then advance the in-memory head.
+    fn journal_write(&self, uuid: Uuid, op: OperationDescriptor) -> Result<(), LibraryHandleError> {
+        let descriptor_hash =
+            blake3_hex(&serde_json::to_vec(&op).expect("OperationDescriptor always serializes"));
+        let mut head = self.journal_head.lock().unwrap();
+        let entry = JournalEntry {
+            seq: head.next_seq,
+            prev_head: head.prev_hash.clone(),
+            op,
+            descriptor_hash: descriptor_hash.clone(),
+        };
+
+        let path = self.journal_dir.join(format!("{uuid}.op"));
+        let json = serde_json::to_vec(&entry).expect("JournalEntry always serializes");
+        let file = File::create(&path)?;
+        {
+            use std::io::Write;
+            (&file).write_all(&json)?;
+        }
+        file.sync_all()?;
+        fsync_dir(Some(&self.journal_dir))?;
+
+        head.next_seq += 1;
+        head.prev_hash = Some(descriptor_hash);
+        Ok(())
+    }
+
+    /// Port of §2 step 4: a single-byte status file, fsynced.
+    fn journal_commit(&self, uuid: Uuid) -> Result<(), LibraryHandleError> {
+        let path = self.journal_dir.join(format!("{uuid}.committed"));
+        let file = File::create(&path)?;
+        {
+            use std::io::Write;
+            (&file).write_all(b"1")?;
+        }
+        file.sync_all()?;
         Ok(())
     }
 }
 
-/// Test-only fault-injection points within [`LibraryHandle::write_atomic_impl`]
-/// (always compiled, since it's a plain enum with no runtime cost --
-/// avoids `#[cfg(test)]` on a function-call argument, which isn't
-/// stable syntax).
+/// Test-only fault-injection points (always compiled, since it's a
+/// plain enum with no runtime cost -- avoids `#[cfg(test)]` on a
+/// function-call argument, which isn't stable syntax).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FailPoint {
+    /// Right after the journal entry is written+fsynced, before the
+    /// real operation is touched at all.
+    JournalWrite,
     WriteTemp,
     FsyncTemp,
     Rename,
+    /// Right after the operation itself (and its directory fsync)
+    /// fully completed, before the commit marker is written.
+    BeforeCommit,
 }
 
 fn simulated_crash() -> LibraryHandleError {
     LibraryHandleError::Io(io::Error::other(
         "simulated crash (test-only fault injection)",
     ))
+}
+
+fn blake3_hex(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+/// `<parent>/<target-file-name>.tmp-<uuid>` -- deterministic from
+/// `target` + `uuid` alone, so recovery can reconstruct it without
+/// storing it separately in the journal entry.
+fn temp_path_for(target: &Path, uuid: Uuid) -> PathBuf {
+    let tmp_name = format!(
+        "{}.tmp-{}",
+        target
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file"),
+        uuid
+    );
+    match target.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.join(tmp_name),
+        _ => PathBuf::from(tmp_name),
+    }
+}
+
+/// Port of §2's recovery-on-startup: scan the journal directory,
+/// verify the hash chain, and settle every entry that isn't already
+/// marked `committed` -- see module doc for the full algorithm.
+fn recover_journal(journal_dir: &Path) -> Result<JournalHead, LibraryHandleError> {
+    fs::create_dir_all(journal_dir)?;
+
+    let mut entries: Vec<(Uuid, JournalEntry)> = Vec::new();
+    for dir_entry in fs::read_dir(journal_dir)? {
+        let dir_entry = dir_entry?;
+        let path = dir_entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("op") {
+            continue;
+        }
+        let Some(uuid) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| Uuid::parse_str(s).ok())
+        else {
+            continue;
+        };
+        let content = fs::read(&path)?;
+        let parsed: JournalEntry = serde_json::from_slice(&content).map_err(|e| {
+            LibraryHandleError::Corruption(format!("malformed journal entry {uuid}: {e}"))
+        })?;
+        entries.push((uuid, parsed));
+    }
+    entries.sort_by_key(|(_, e)| e.seq);
+
+    let mut prev_hash: Option<String> = None;
+    let mut next_seq: u64 = 0;
+    for (uuid, entry) in &entries {
+        let recomputed = blake3_hex(
+            &serde_json::to_vec(&entry.op).expect("OperationDescriptor always serializes"),
+        );
+        if recomputed != entry.descriptor_hash {
+            return Err(LibraryHandleError::Corruption(format!(
+                "journal entry {uuid} descriptor hash does not match its own content"
+            )));
+        }
+        if entry.prev_head != prev_hash {
+            return Err(LibraryHandleError::Corruption(format!(
+                "journal entry {uuid} breaks the hash chain"
+            )));
+        }
+        prev_hash = Some(entry.descriptor_hash.clone());
+        next_seq = entry.seq + 1;
+
+        recover_one(journal_dir, *uuid, entry)?;
+    }
+
+    Ok(JournalHead {
+        next_seq,
+        prev_hash,
+    })
+}
+
+fn recover_one(
+    journal_dir: &Path,
+    uuid: Uuid,
+    entry: &JournalEntry,
+) -> Result<(), LibraryHandleError> {
+    let committed_path = journal_dir.join(format!("{uuid}.committed"));
+    if committed_path.exists() {
+        // Already known-complete. A write's target content is
+        // re-verified against its recorded checksum as a real
+        // integrity check (§8's spirit); a mismatch here means the
+        // file changed out from under the journal after it was
+        // marked committed -- genuine corruption, not a recovery
+        // scenario the design doc's replay logic covers.
+        if let OperationDescriptor::WriteFile {
+            target,
+            content_hash,
+        } = &entry.op
+        {
+            if let Ok(bytes) = fs::read(target) {
+                if blake3_hex(&bytes) != *content_hash {
+                    return Err(LibraryHandleError::Corruption(format!(
+                        "{} does not match its recorded checksum",
+                        target.display()
+                    )));
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    match &entry.op {
+        OperationDescriptor::WriteFile {
+            target,
+            content_hash,
+        } => {
+            let applied = fs::read(target)
+                .map(|bytes| blake3_hex(&bytes) == *content_hash)
+                .unwrap_or(false);
+            if applied {
+                mark_committed(&committed_path)?;
+            } else {
+                let tmp_path = temp_path_for(target, uuid);
+                if tmp_path.exists() {
+                    fs::remove_file(&tmp_path)?;
+                }
+                // Else: crashed before the temp file was even
+                // created -- nothing was touched, nothing to clean.
+            }
+        }
+        OperationDescriptor::RenameFile { from, to } => {
+            let applied = !from.exists() && to.exists();
+            if applied {
+                mark_committed(&committed_path)?;
+            }
+            // Else: the rename never happened (or `from` still
+            // exists) -- nothing was touched, nothing to roll back.
+        }
+    }
+    Ok(())
+}
+
+fn mark_committed(path: &Path) -> io::Result<()> {
+    let file = File::create(path)?;
+    {
+        use std::io::Write;
+        (&file).write_all(b"1")?;
+    }
+    file.sync_all()
 }
 
 /// `fsync`s a directory so a just-`rename`d entry survives a crash --
@@ -497,8 +802,7 @@ mod tests {
 
     // --- fault-injection: docs/FAULT_TOLERANCE.md's "kill process at
     // random point" testable invariant, for write_atomic specifically
-    // (the one operation in this phase real enough to have a
-    // meaningful "crash mid-sequence" story) {{{
+    // {{{
 
     #[test]
     fn a_crash_right_after_writing_the_temp_file_leaves_the_original_untouched() {
@@ -527,10 +831,10 @@ mod tests {
     #[test]
     fn a_crash_right_after_the_rename_has_already_committed_the_new_content() {
         // Once `rename` has happened, the write is durable regardless
-        // of whether the subsequent directory-fsync step completes --
-        // this is exactly why write-temp-then-rename is the right
-        // shape: the commit point is a single atomic filesystem
-        // operation, not a multi-step window.
+        // of whether subsequent steps complete -- this is exactly why
+        // write-temp-then-rename is the right shape: the commit point
+        // is a single atomic filesystem operation, not a multi-step
+        // window.
         let dir = tempdir().unwrap();
         let handle = LibraryHandle::open(dir.path()).unwrap();
         let target = dir.path().join("metadata.opf");
@@ -539,6 +843,234 @@ mod tests {
         let err = handle.write_atomic_impl(&target, b"new", Some(FailPoint::Rename));
         assert!(err.is_err());
         assert_eq!(fs::read(&target).unwrap(), b"new");
+    }
+
+    // }}}
+
+    // --- journal: real writes, chaining, and crash recovery {{{
+
+    #[test]
+    fn write_atomic_journals_an_entry_and_marks_it_committed() {
+        let dir = tempdir().unwrap();
+        let handle = LibraryHandle::open(dir.path()).unwrap();
+        let target = dir.path().join("metadata.opf");
+
+        handle.write_atomic(&target, b"content").unwrap();
+
+        let journal_dir = dir.path().join(".calibre-oxide").join("journal");
+        let op_files: Vec<_> = fs::read_dir(&journal_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("op"))
+            .collect();
+        assert_eq!(op_files.len(), 1);
+
+        let uuid = op_files[0]
+            .path()
+            .file_stem()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(journal_dir.join(format!("{uuid}.committed")).exists());
+
+        let entry: JournalEntry =
+            serde_json::from_slice(&fs::read(op_files[0].path()).unwrap()).unwrap();
+        assert_eq!(entry.seq, 0);
+        assert_eq!(entry.prev_head, None);
+        match entry.op {
+            OperationDescriptor::WriteFile {
+                target: t,
+                content_hash,
+            } => {
+                assert_eq!(t, target);
+                assert_eq!(content_hash, blake3_hex(b"content"));
+            }
+            _ => panic!("expected WriteFile"),
+        }
+    }
+
+    #[test]
+    fn sequential_writes_chain_correctly() {
+        let dir = tempdir().unwrap();
+        let handle = LibraryHandle::open(dir.path()).unwrap();
+        handle
+            .write_atomic(&dir.path().join("a.opf"), b"a")
+            .unwrap();
+        handle
+            .write_atomic(&dir.path().join("b.opf"), b"b")
+            .unwrap();
+
+        let journal_dir = dir.path().join(".calibre-oxide").join("journal");
+        let mut entries: Vec<JournalEntry> = fs::read_dir(&journal_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("op"))
+            .map(|e| serde_json::from_slice(&fs::read(e.path()).unwrap()).unwrap())
+            .collect();
+        entries.sort_by_key(|e| e.seq);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].seq, 0);
+        assert_eq!(entries[1].seq, 1);
+        assert_eq!(
+            entries[1].prev_head,
+            Some(entries[0].descriptor_hash.clone())
+        );
+    }
+
+    #[test]
+    fn reopening_after_a_crash_before_rename_cleans_up_the_orphaned_temp_file() {
+        let dir = tempdir().unwrap();
+        {
+            let handle = LibraryHandle::open(dir.path()).unwrap();
+            let target = dir.path().join("metadata.opf");
+            let err = handle.write_atomic_impl(&target, b"new", Some(FailPoint::WriteTemp));
+            assert!(err.is_err());
+            // The temp file exists right now, mid-"crash".
+            let leftovers: Vec<_> = fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+                .collect();
+            assert_eq!(leftovers.len(), 1);
+        }
+        // Simulates the process restarting: a fresh `open()` call runs
+        // recovery.
+        let handle = LibraryHandle::open(dir.path()).unwrap();
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "orphaned temp file should be cleaned up"
+        );
+        assert!(!dir.path().join("metadata.opf").exists());
+        drop(handle);
+    }
+
+    #[test]
+    fn reopening_after_a_crash_right_after_rename_finalizes_the_commit_marker() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("metadata.opf");
+        {
+            let handle = LibraryHandle::open(dir.path()).unwrap();
+            let err =
+                handle.write_atomic_impl(&target, b"new content", Some(FailPoint::BeforeCommit));
+            assert!(err.is_err());
+            // The rename already happened -- the real content is
+            // already there, just unmarked.
+            assert_eq!(fs::read(&target).unwrap(), b"new content");
+        }
+
+        let handle = LibraryHandle::open(dir.path()).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"new content");
+
+        let journal_dir = dir.path().join(".calibre-oxide").join("journal");
+        let committed: Vec<_> = fs::read_dir(&journal_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("committed"))
+            .collect();
+        assert_eq!(
+            committed.len(),
+            1,
+            "recovery should finalize the missing commit marker"
+        );
+
+        // Reopening again is stable -- no further changes, no error.
+        drop(handle);
+        let handle2 = LibraryHandle::open(dir.path()).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"new content");
+        drop(handle2);
+    }
+
+    #[test]
+    fn reopening_after_a_crash_before_the_journal_write_even_finished_has_nothing_to_recover() {
+        // The very first fault-injection point: nothing was ever
+        // journaled successfully, so there's no entry to recover at
+        // all. (Simulated here by never calling write_atomic in the
+        // first place -- the interesting assertion is just that
+        // `open()` on a library with an empty journal doesn't error.)
+        let dir = tempdir().unwrap();
+        let handle = LibraryHandle::open(dir.path()).unwrap();
+        assert_eq!(handle.state(), HandleState::Open);
+    }
+
+    #[test]
+    fn recovery_detects_a_tampered_journal_entry_as_corruption() {
+        let dir = tempdir().unwrap();
+        let journal_dir = dir.path().join(".calibre-oxide").join("journal");
+        fs::create_dir_all(&journal_dir).unwrap();
+
+        let op = OperationDescriptor::WriteFile {
+            target: dir.path().join("metadata.opf"),
+            content_hash: blake3_hex(b"whatever"),
+        };
+        let real_hash = blake3_hex(&serde_json::to_vec(&op).unwrap());
+        let entry = JournalEntry {
+            seq: 0,
+            prev_head: None,
+            op,
+            // Tampered: doesn't match a fresh hash of `op`.
+            descriptor_hash: format!("not-{real_hash}"),
+        };
+        let uuid = Uuid::new_v4();
+        fs::write(
+            journal_dir.join(format!("{uuid}.op")),
+            serde_json::to_vec(&entry).unwrap(),
+        )
+        .unwrap();
+
+        let result = LibraryHandle::open(dir.path());
+        assert!(matches!(result, Err(LibraryHandleError::Corruption(_))));
+    }
+
+    #[test]
+    fn recovery_detects_a_broken_chain_as_corruption() {
+        let dir = tempdir().unwrap();
+        let journal_dir = dir.path().join(".calibre-oxide").join("journal");
+        fs::create_dir_all(&journal_dir).unwrap();
+
+        let op1 = OperationDescriptor::WriteFile {
+            target: dir.path().join("a.opf"),
+            content_hash: blake3_hex(b"a"),
+        };
+        let hash1 = blake3_hex(&serde_json::to_vec(&op1).unwrap());
+        let entry1 = JournalEntry {
+            seq: 0,
+            prev_head: None,
+            op: op1,
+            descriptor_hash: hash1,
+        };
+        fs::write(
+            journal_dir.join(format!("{}.op", Uuid::new_v4())),
+            serde_json::to_vec(&entry1).unwrap(),
+        )
+        .unwrap();
+
+        let op2 = OperationDescriptor::WriteFile {
+            target: dir.path().join("b.opf"),
+            content_hash: blake3_hex(b"b"),
+        };
+        let hash2 = blake3_hex(&serde_json::to_vec(&op2).unwrap());
+        let entry2 = JournalEntry {
+            seq: 1,
+            // Wrong -- should reference entry1's descriptor_hash.
+            prev_head: Some("bogus".to_string()),
+            op: op2,
+            descriptor_hash: hash2,
+        };
+        fs::write(
+            journal_dir.join(format!("{}.op", Uuid::new_v4())),
+            serde_json::to_vec(&entry2).unwrap(),
+        )
+        .unwrap();
+
+        let result = LibraryHandle::open(dir.path());
+        assert!(matches!(result, Err(LibraryHandleError::Corruption(_))));
     }
 
     // }}}
