@@ -1,3 +1,8 @@
+use crate::checksums::{ChecksumError, ChecksumStore};
+use crate::constants::{
+    LIBRARY_HANDLE_DIR_NAME, NOTES_DIR_NAME as REAL_NOTES_DIR_NAME,
+    TRASH_DIR_NAME as REAL_TRASH_DIR_NAME,
+};
 use crate::Library;
 
 use regex::Regex;
@@ -9,8 +14,6 @@ use std::path::{Path, PathBuf};
 const COVER_FILE_NAME: &str = "cover.jpg";
 const METADATA_FILE_NAME: &str = "metadata.opf";
 const DATA_DIR_NAME: &str = "data"; // Example
-const TRASH_DIR_NAME: &str = ".trash"; // Example
-const NOTES_DIR_NAME: &str = ".notes"; // Example
 
 lazy_static::lazy_static! {
     static ref BOOK_EXTENSIONS: HashSet<&'static str> = {
@@ -36,8 +39,18 @@ lazy_static::lazy_static! {
         s.insert("metadata_db_prefs_backup.json");
         s.insert("metadata_pre_restore.db");
         s.insert("full-text-search.db");
-        s.insert(TRASH_DIR_NAME);
-        s.insert(NOTES_DIR_NAME);
+        // Real oxide-only sidecar directory names (`.caltrash`/
+        // `.calnotes`, not the `".trash"`/`".notes"` placeholders this
+        // set previously held -- those never matched
+        // `crate::constants`'s real values, so `scan_library` was
+        // spuriously flagging every real trash/notes directory as an
+        // invalid top-level entry; caught while adding
+        // `LIBRARY_HANDLE_DIR_NAME` below for the same reason: an
+        // unrecognized `.calibre-oxide` failed a checksum test written
+        // against this module).
+        s.insert(REAL_TRASH_DIR_NAME);
+        s.insert(REAL_NOTES_DIR_NAME);
+        s.insert(LIBRARY_HANDLE_DIR_NAME);
         s
     };
 }
@@ -60,6 +73,15 @@ pub struct CheckLibrary<'a> {
     pub malformed_formats: Vec<(String, String, i32)>,
     pub malformed_paths: Vec<(String, String, i32)>,
     pub failed_folders: Vec<(String, String, Vec<String>)>,
+    /// Port of `docs/FAULT_TOLERANCE.md` §8: a format/cover file whose
+    /// on-disk content no longer matches its recorded BLAKE3 -- see
+    /// `checksums.rs`'s module doc for why this check lives here.
+    /// Only covers files that have a recorded checksum in the first
+    /// place; one added before this feature existed (or by real
+    /// calibre, which never writes this sidecar) is silently skipped,
+    /// not reported as either healthy or corrupt.
+    pub corrupted_formats: Vec<(String, String, i32)>,
+    pub corrupted_covers: Vec<(String, String, i32)>,
 
     // Internal Cache
     all_authors: HashSet<String>,
@@ -73,6 +95,7 @@ pub struct CheckLibrary<'a> {
     db_id_regexp: Regex,
     book_dirs: Vec<(String, String, String)>, // (db_path, title_dir, id_str)
     malformed_paths_ids: HashSet<i32>,
+    checksums: ChecksumStore,
 }
 
 impl<'a> CheckLibrary<'a> {
@@ -118,6 +141,8 @@ impl<'a> CheckLibrary<'a> {
             malformed_formats: Vec::new(),
             malformed_paths: Vec::new(),
             failed_folders: Vec::new(),
+            corrupted_formats: Vec::new(),
+            corrupted_covers: Vec::new(),
             all_authors,
             all_ids,
             all_dbpaths,
@@ -127,6 +152,7 @@ impl<'a> CheckLibrary<'a> {
             db_id_regexp,
             book_dirs: Vec::new(),
             malformed_paths_ids: HashSet::new(),
+            checksums: db.checksums(),
         }
     }
 
@@ -403,6 +429,52 @@ impl<'a> CheckLibrary<'a> {
                 book_id,
             ));
         }
+
+        // Checksum verification (docs/FAULT_TOLERANCE.md §8) -- only
+        // for files present on disk AND recorded in the DB; already-
+        // reported missing/extra formats above aren't also checksum-
+        // checked, and a file with no recorded checksum (see
+        // checksums.rs's module doc) is neither healthy nor corrupt,
+        // just unverifiable, so it's silently skipped here too.
+        if let Ok(list) = self.db.format_files(book_id) {
+            for (name, format) in list {
+                let file_name_lc = format!("{}.{}", name, format).to_lowercase();
+                let Some(orig_name) = filenames_lc.get(&file_name_lc) else {
+                    continue;
+                };
+                let file_path = full_path.join(orig_name);
+                if let Err(ChecksumError::Mismatch { .. }) = self.checksums.verify_file(
+                    book_id,
+                    "format",
+                    &format.to_uppercase(),
+                    &file_path,
+                ) {
+                    self.corrupted_formats.push((
+                        title_dir.clone(),
+                        file_path.to_string_lossy().to_string(),
+                        book_id,
+                    ));
+                }
+            }
+        }
+
+        if has_cover_disk {
+            let cover_name = filenames_lc
+                .get("cover.jpg")
+                .cloned()
+                .unwrap_or_else(|| COVER_FILE_NAME.to_string());
+            let cover_path = full_path.join(cover_name);
+            if let Err(ChecksumError::Mismatch { .. }) =
+                self.checksums
+                    .verify_file(book_id, "cover", "", &cover_path)
+            {
+                self.corrupted_covers.push((
+                    title_dir.clone(),
+                    cover_path.to_string_lossy().to_string(),
+                    book_id,
+                ));
+            }
+        }
     }
 
     fn check_missing_books(&mut self) {
@@ -459,5 +531,119 @@ impl<'a> CheckLibrary<'a> {
         } else {
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::Backend;
+    use crate::checksums::ChecksumStore;
+    use tempfile::tempdir;
+
+    /// Seeds one book directly via SQL (bypassing `Cache::add_book`,
+    /// whose folder-naming convention doesn't include the `" (id)"`
+    /// suffix this module's own `db_id_regexp` requires to recognize
+    /// a book directory at all -- a real, pre-existing gap between
+    /// the two, unrelated to checksums, not something this pass
+    /// fixes) with a format file on disk and a real recorded
+    /// checksum for it. Returns the format file's absolute path.
+    fn seed_book_with_format(dir: &Path, book_id: i32, bytes: &[u8]) -> PathBuf {
+        let backend = Backend::new(dir).unwrap();
+        let rel_path = format!("Author A/My Book ({book_id})");
+        {
+            let conn = backend.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO books (id, title, author_sort, path) VALUES (?1, 'My Book', 'Author A', ?2)",
+                (book_id, &rel_path),
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO data (book, format, uncompressed_size, name) VALUES (?1, 'EPUB', ?2, 'My Book')",
+                (book_id, bytes.len() as i64),
+            )
+            .unwrap();
+        }
+        let book_dir = dir.join(&rel_path);
+        fs::create_dir_all(&book_dir).unwrap();
+        let file_path = book_dir.join("My Book.epub");
+        fs::write(&file_path, bytes).unwrap();
+
+        ChecksumStore::new(backend.conn.clone(), dir)
+            .record_file(book_id, "format", "EPUB", &file_path)
+            .unwrap();
+        file_path
+    }
+
+    #[test]
+    fn scan_library_flags_a_format_file_whose_content_no_longer_matches_its_checksum() {
+        let dir = tempdir().unwrap();
+        let file_path = seed_book_with_format(dir.path(), 1, b"original bytes");
+        fs::write(&file_path, b"corrupted on disk").unwrap();
+
+        let lib = Library::open(dir.path().to_path_buf()).unwrap();
+        let mut checker = CheckLibrary::new(dir.path().to_path_buf(), &lib);
+        checker.scan_library(vec![], vec![]);
+
+        assert!(
+            checker.invalid_titles.is_empty(),
+            "{:?}",
+            checker.invalid_titles
+        );
+        assert_eq!(checker.corrupted_formats.len(), 1);
+        assert_eq!(checker.corrupted_formats[0].2, 1);
+        assert!(checker.corrupted_covers.is_empty());
+    }
+
+    #[test]
+    fn scan_library_does_not_flag_a_format_file_with_no_recorded_checksum() {
+        // A file whose checksum was never recorded (predates this
+        // feature, or was added by real calibre, which never writes
+        // this sidecar) is unverifiable, not corrupt -- see
+        // `checksums.rs`'s module doc.
+        let dir = tempdir().unwrap();
+        seed_book_with_format(dir.path(), 1, b"original bytes");
+        {
+            let backend = Backend::new(dir.path()).unwrap();
+            ChecksumStore::new(backend.conn.clone(), dir.path())
+                .remove(1, "format", "EPUB")
+                .unwrap();
+        }
+
+        let lib = Library::open(dir.path().to_path_buf()).unwrap();
+        let mut checker = CheckLibrary::new(dir.path().to_path_buf(), &lib);
+        checker.scan_library(vec![], vec![]);
+
+        assert!(checker.corrupted_formats.is_empty());
+        assert!(checker.missing_formats.is_empty());
+        assert!(checker.extra_formats.is_empty());
+    }
+
+    #[test]
+    fn scan_library_flags_a_tampered_cover() {
+        let dir = tempdir().unwrap();
+        seed_book_with_format(dir.path(), 1, b"original bytes");
+        let cover_path = dir.path().join("Author A/My Book (1)/cover.jpg");
+        fs::write(&cover_path, b"real cover bytes").unwrap();
+        {
+            let backend = Backend::new(dir.path()).unwrap();
+            backend
+                .conn
+                .lock()
+                .unwrap()
+                .execute("UPDATE books SET has_cover = 1 WHERE id = 1", [])
+                .unwrap();
+            ChecksumStore::new(backend.conn.clone(), dir.path())
+                .record_file(1, "cover", "", &cover_path)
+                .unwrap();
+        }
+        fs::write(&cover_path, b"tampered cover").unwrap();
+
+        let lib = Library::open(dir.path().to_path_buf()).unwrap();
+        let mut checker = CheckLibrary::new(dir.path().to_path_buf(), &lib);
+        checker.scan_library(vec![], vec![]);
+
+        assert_eq!(checker.corrupted_covers.len(), 1);
+        assert_eq!(checker.corrupted_covers[0].2, 1);
     }
 }

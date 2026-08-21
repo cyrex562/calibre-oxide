@@ -49,10 +49,13 @@ pub fn set_cover(cache: &Arc<Mutex<Cache>>, book_id: i32, data: &[u8]) -> Result
         fs::create_dir_all(parent)?;
     }
 
-    fs::write(path, data)?;
+    fs::write(&path, data)?;
 
     {
         let guard = cache.lock().unwrap();
+        // Port of docs/FAULT_TOLERANCE.md §8: "cover images... same
+        // rule" as book-format files.
+        guard.checksums().record_file(book_id, "cover", "", &path)?;
         let conn = guard.backend.conn.lock().unwrap();
         conn.execute("UPDATE books SET has_cover = 1 WHERE id = ?1", (book_id,))?;
     }

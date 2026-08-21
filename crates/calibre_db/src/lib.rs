@@ -6,6 +6,7 @@ pub mod book;
 pub mod cache;
 pub mod categories;
 pub mod check_library;
+pub mod checksums;
 pub mod cli;
 pub mod constants;
 pub mod copy_to_library;

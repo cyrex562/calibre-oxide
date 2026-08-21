@@ -27,6 +27,19 @@ fn test_backup_restore_roundtrip() {
     let opf_content = std::fs::read_to_string(&opf_path).unwrap();
     assert!(opf_content.contains("<dc:title>Original Title</dc:title>"));
 
+    // backup_metadata also records a real BLAKE3 checksum for the
+    // sidecar OPF (issue #93 §8's "sidecar files: same rule").
+    {
+        let guard = cache.lock().unwrap();
+        assert_eq!(
+            guard
+                .checksums()
+                .verify_file(book_id, "opf", "", &opf_path)
+                .unwrap(),
+            calibre_db::checksums::VerifyOutcome::Match
+        );
+    }
+
     // 2. Modify DB (Simulate data loss/change)
     {
         let guard = cache.lock().unwrap();

@@ -161,6 +161,13 @@ impl Cache {
         *self.field_cache.lock().unwrap() = None;
     }
 
+    /// A real [`crate::checksums::ChecksumStore`] over this library's
+    /// `.calibre-oxide/checksums.db`, sharing this `Cache`'s connection
+    /// -- issue #93 §8.
+    pub fn checksums(&self) -> crate::checksums::ChecksumStore {
+        crate::checksums::ChecksumStore::new(self.backend.conn.clone(), &self.backend.library_path)
+    }
+
     /// `SELECT total_changes()` -- SQLite's built-in running count of
     /// every row inserted/updated/deleted on this connection since it
     /// was opened (a real SQL function, not just a C API -- no extra
@@ -460,6 +467,13 @@ impl Cache {
         fs::copy(source_path, &dest_path)?;
         let size = fs::metadata(&dest_path)?.len() as i64;
 
+        // Port of docs/FAULT_TOLERANCE.md §8: "every book file's
+        // BLAKE3 is stored... at add time" -- see checksums.rs's
+        // module doc for why this lives in its own sidecar db rather
+        // than a new metadata.db column.
+        self.checksums()
+            .record_file(book_id, "format", &format.to_uppercase(), &dest_path)?;
+
         let conn = self.backend.conn.lock().unwrap();
         conn.execute(
             "UPDATE books SET timestamp = datetime('now') WHERE id = ?1",
@@ -497,6 +511,12 @@ impl Cache {
             }
         }
 
+        // The file is gone -- drop its stale checksum record too, so
+        // the sidecar store doesn't keep asserting a hash for a format
+        // that no longer exists.
+        self.checksums()
+            .remove(book_id, "format", &fmt.to_uppercase())?;
+
         let conn = self.backend.conn.lock().unwrap();
         conn.execute(
             "DELETE FROM data WHERE book = ?1 AND format = ?2",
@@ -511,6 +531,7 @@ impl Cache {
     /// for it) and its on-disk folder.
     pub fn delete_book(&self, book_id: i32) -> anyhow::Result<()> {
         let path_rel = self.field_for(book_id, "path")?;
+        self.checksums().remove_all_for_book(book_id)?;
         {
             let conn = self.backend.conn.lock().unwrap();
             conn.execute("DELETE FROM books WHERE id = ?1", (book_id,))?;
@@ -1793,6 +1814,60 @@ mod tests {
     }
 
     #[test]
+    fn add_book_records_a_real_blake3_checksum_for_the_initial_format() {
+        // Port of docs/FAULT_TOLERANCE.md §8: "every book file's
+        // BLAKE3 is stored... at add time". `add_book` delegates its
+        // initial format to `add_format`, so this exercises the same
+        // recording path `add_format_records_the_format_in_the_data_table`
+        // covers for the `data` row.
+        let (dir, cache) = open_test_cache();
+        let source = write_temp_file(dir.path(), "src.epub", b"epub bytes");
+        let mut meta = MetaInformation::default();
+        meta.title = "T".to_string();
+        meta.authors = vec!["A".to_string()];
+        let book_id = cache.add_book(&source, &meta).unwrap();
+
+        let dest = dir.path().join("A/T/T.epub");
+        assert_eq!(
+            cache
+                .checksums()
+                .verify_file(book_id, "format", "EPUB", &dest)
+                .unwrap(),
+            crate::checksums::VerifyOutcome::Match
+        );
+
+        // Corrupt the file on disk directly, bypassing every write
+        // path -- the stored checksum must catch it.
+        fs::write(&dest, b"corrupted!").unwrap();
+        assert!(matches!(
+            cache
+                .checksums()
+                .verify_file(book_id, "format", "EPUB", &dest),
+            Err(crate::checksums::ChecksumError::Mismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn remove_format_deletes_its_checksum_record_too() {
+        let (dir, cache) = open_test_cache();
+        let source = write_temp_file(dir.path(), "src.epub", b"epub bytes");
+        let mut meta = MetaInformation::default();
+        meta.title = "T".to_string();
+        meta.authors = vec!["A".to_string()];
+        let book_id = cache.add_book(&source, &meta).unwrap();
+
+        cache.remove_format(book_id, "epub").unwrap();
+
+        assert_eq!(
+            cache
+                .checksums()
+                .verify_bytes(book_id, "format", "EPUB", b"epub bytes")
+                .unwrap(),
+            crate::checksums::VerifyOutcome::NoRecord
+        );
+    }
+
+    #[test]
     fn delete_book_removes_the_row_and_the_folder() {
         let (dir, cache) = open_test_cache();
         let source = write_temp_file(dir.path(), "src.epub", b"x");
@@ -1806,6 +1881,26 @@ mod tests {
 
         assert_eq!(cache.field_for(book_id, "title").unwrap(), None);
         assert!(!dir.path().join("A/T").exists());
+    }
+
+    #[test]
+    fn delete_book_clears_its_checksum_records() {
+        let (dir, cache) = open_test_cache();
+        let source = write_temp_file(dir.path(), "src.epub", b"x");
+        let mut meta = MetaInformation::default();
+        meta.title = "T".to_string();
+        meta.authors = vec!["A".to_string()];
+        let book_id = cache.add_book(&source, &meta).unwrap();
+
+        cache.delete_book(book_id).unwrap();
+
+        assert_eq!(
+            cache
+                .checksums()
+                .verify_bytes(book_id, "format", "EPUB", b"x")
+                .unwrap(),
+            crate::checksums::VerifyOutcome::NoRecord
+        );
     }
 
     #[test]
