@@ -55,14 +55,26 @@
 //!   silently treated as verified and not flagged as corrupt either.
 //!   Honest about what was never recorded rather than pretending
 //!   coverage that doesn't exist.
-//! - **Not wired into every read path.** Per this file's module doc
-//!   above, verification lives in `check_library.rs`'s scan, not in
-//!   every function that ever opens a book file (export, convert,
-//!   catalog generation, ...). Those still read files directly; a
-//!   corrupted file is caught the next time a library check runs, not
-//!   at the moment of use. Extending re-verification to more call
-//!   sites is part of the same still-open "crate-wide retrofit" item
-//!   phases 1-3 already track under #93.
+//! - **Not wired into every read path.** Verification lives in
+//!   `check_library.rs`'s scan and, as of this pass,
+//!   `cli/cmd_export.rs`'s per-book copy (a real BLAKE3 mismatch
+//!   there skips exporting that book rather than copying corrupted
+//!   bytes out of the library -- matching §8's "the operation aborts
+//!   before mutating anything", scoped to the one book, not the whole
+//!   export run, consistent with this loop's existing "skip and
+//!   continue" handling for a missing file). Catalog generation and
+//!   any other function that opens a book file still reads it
+//!   directly; a corrupted file there is caught the next time a
+//!   library check runs, not at the moment of use. There is
+//!   deliberately **no** "convert" call site wired in: this repo has
+//!   no `cmd_convert` command that resolves a book_id/format through
+//!   `Library`/`Cache` at all yet (`calibre_conversion`'s
+//!   `ebook_convert` binary is a standalone file-to-file converter
+//!   with no concept of a library or book id) -- there is nothing to
+//!   wire re-verification into until that command exists. Extending
+//!   re-verification to more call sites (catalog generation, and
+//!   convert once it exists) is part of the same still-open
+//!   "crate-wide retrofit" item phases 1-3 already track under #93.
 //! - **No re-verification on `metadata.db` itself** -- this covers
 //!   book/cover/OPF *files*, not the SQLite database's own integrity
 //!   (SQLite's own WAL/page-checksum machinery is the relevant

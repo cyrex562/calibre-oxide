@@ -1,3 +1,4 @@
+use crate::checksums::ChecksumError;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
@@ -46,6 +47,34 @@ impl CmdExport {
                     // Determine destination filename
                     // Ideally use templating, but for now: Author - Title.ext
                     let ext = src_path.extension().and_then(|s| s.to_str()).unwrap_or("");
+
+                    // Port of docs/FAULT_TOLERANCE.md §8: "re-verified
+                    // on any operation that touches the file... the
+                    // operation aborts before mutating anything" --
+                    // export is exactly such an operation. A real
+                    // BLAKE3 mismatch skips *this book's* export
+                    // (not the whole run, matching this loop's
+                    // existing "skip and continue" handling for a
+                    // missing file below) rather than copying
+                    // possibly-corrupted bytes out of the library. No
+                    // recorded checksum at all (a file added before
+                    // this feature existed) is not a failure -- see
+                    // `checksums.rs`'s module doc.
+                    if let Err(ChecksumError::Mismatch {
+                        expected, actual, ..
+                    }) = db.checksums().verify_file(
+                        book.id,
+                        "format",
+                        &ext.to_uppercase(),
+                        &src_path,
+                    ) {
+                        eprintln!(
+                            "Corruption detected, skipping export of book {} ({}): expected BLAKE3 {expected}, found {actual}",
+                            book.id, book.title
+                        );
+                        continue;
+                    }
+
                     let safe_title = calibre_utils::filenames::sanitize_file_name(&book.title);
                     let safe_author = calibre_utils::filenames::sanitize_file_name(
                         book.author_sort.as_deref().unwrap_or("Unknown"),

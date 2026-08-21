@@ -101,7 +101,7 @@ either -- this pass wasn't exhaustive.
 - [x] cmd_clone.py
 - [x] cmd_custom_columns.py
 - [x] cmd_embed_metadata.py
-- [x] cmd_export.py
+- [x] cmd_export.py (#93 §8 follow-up: `CmdExport::run` now re-verifies each book's format file against its recorded BLAKE3 checksum before copying it out -- a real mismatch skips exporting that one book, printed to stderr, rather than copying corrupted bytes; a book with no recorded checksum exports unchanged, same as before this pass. No "convert" command exists anywhere in this repo that resolves a book_id/format through `Library`/`Cache` -- `calibre_conversion`'s `ebook_convert` binary is a standalone file-to-file converter with no library concept -- so there was nothing to wire re-verification into on that side; see `checksums.rs`'s module doc.)
 - [x] cmd_fts_index.py (#226: real `status`/`enable`/`disable`/`reindex`, backed by `Library::is_fts_enabled`/`set_fts_enabled`/`fts`. Renamed from `cli/cmd_fits_index.rs` -- "fits" was a typo for "fts". NOT ported: `--wait-for-completion`/the `wait` action and indexing-rate reporting, since this crate has no background indexing pipeline to report progress on -- see `fts/connection.rs`'s module doc)
 - [x] cmd_fts_search.py (#226: real `--restrict-to ids:/search:` (the latter via `Library::search`, #210), snippet/highlight markers, stemming toggle, `text`/`json` output, indexing-threshold gate. Renamed from `cli/cmd_fits_search.rs`. NOT ported: upstream's cross-format snippet-dedup grouping in text output)
 - [x] cmd_list_categories.py
