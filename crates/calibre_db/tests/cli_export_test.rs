@@ -60,3 +60,62 @@ fn test_export() {
 
     assert!(found, "Exported file not found with expected content");
 }
+
+#[test]
+fn test_export_skips_a_book_whose_format_file_fails_checksum_verification() {
+    let temp_dir = tempdir().unwrap();
+
+    let db_path = temp_dir.path().join("metadata.db");
+    std::fs::File::create(&db_path).unwrap();
+    let lib = Library::open(temp_dir.path().to_path_buf()).unwrap();
+
+    let rel_path = "Author_A/Test_Book";
+    let full_src_dir = temp_dir.path().join(rel_path);
+    fs::create_dir_all(&full_src_dir).unwrap();
+    let src_file = full_src_dir.join("Test Book.epub");
+    fs::write(&src_file, "epub content").unwrap();
+
+    lib.conn().execute(
+        "INSERT INTO books (title, sort, author_sort, path, has_cover, timestamp, pubdate, uuid, series_index)
+         VALUES ('Test Book', 'Test Book', 'Author A', ?1, 0, '2023-01-01', '2023-01-01', 'uuid1', 1.0)",
+        (rel_path,),
+    ).unwrap();
+    let book_id = lib.conn().last_insert_rowid() as i32;
+
+    lib.conn().execute(
+        "INSERT INTO data (book, format, uncompressed_size, name) VALUES (?1, 'EPUB', 100, 'Test Book')",
+        (book_id,),
+    ).unwrap();
+
+    // Record a real checksum against the original content, then
+    // corrupt the file on disk directly (bypassing every write path)
+    // -- the same "tamper after the fact" shape `check_library.rs`'s
+    // own corruption tests use (issue #93 §8).
+    lib.checksums()
+        .record_file(book_id, "format", "EPUB", &src_file)
+        .unwrap();
+    fs::write(&src_file, "TAMPERED CONTENT").unwrap();
+
+    let export_dir = temp_dir.path().join("export");
+    let args = cmd_export::RunArgs {
+        ids: vec![book_id.to_string()],
+        all: false,
+        to_dir: export_dir.to_string_lossy().to_string(),
+        single_dir: false,
+        progress: false,
+    };
+
+    let cmd = cmd_export::CmdExport::new();
+    cmd.run(&lib, &args).unwrap();
+
+    // The export must not have copied the corrupted bytes out.
+    let copied_anything = export_dir.exists()
+        && walkdir::WalkDir::new(&export_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .any(|e| e.path().is_file());
+    assert!(
+        !copied_anything,
+        "a corrupted format file must not be exported"
+    );
+}
