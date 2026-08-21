@@ -65,18 +65,49 @@
 //! there's nothing to roll back at the target level, just garbage to
 //! remove).
 //!
-//! # Disclosed simplifications (phase 2)
+//! **Phase 3 (this pass)**: journal pruning, via a persisted rolling
+//! checkpoint. [`LibraryHandle::open`] now prunes the journal *after*
+//! recovery settles every entry: once more than
+//! [`JOURNAL_PRUNE_RETENTION`] entries are live, it writes a
+//! checkpoint file (`<library>/.calibre-oxide/journal_checkpoint`)
+//! recording the sequence number and hash-chain value immediately
+//! after the newest entry being dropped, then deletes that entry's and
+//! every older entry's `.op`/`.committed` files. The next recovery
+//! trusts the checkpoint as its starting point instead of requiring
+//! the chain from seq 0 -- this is the "persisted rolling checkpoint"
+//! option the phase 2 module doc flagged as the alternative to a
+//! weaker "verify only what's on disk" guarantee; a pruned entry is
+//! still provably part of an unbroken chain, it's just not the chain
+//! recovery re-derives from scratch every time.
 //!
-//! - **No pruning.** Every journal entry, once written, stays on disk
-//!   forever -- the journal directory grows without bound over a
-//!   library's lifetime. A real system would eventually archive or
-//!   truncate old, fully-committed entries; not implemented here, and
-//!   deliberately so for now: pruning interacts with hash-chain
-//!   verification (a pruned entry can no longer be checked against by
-//!   anything after it, which either needs a persisted rolling
-//!   checkpoint or accepts a weaker "verify only what's currently on
-//!   disk" guarantee) and that tradeoff deserves its own scoped pass
-//!   rather than being bundled in here.
+//! Pruning the checkpoint write and the entry deletions are two
+//! separate filesystem operations, not one atomic unit -- so pruning
+//! is designed to be safely interruptible and idempotent instead:
+//! the checkpoint is written (temp/fsync/rename/fsync-dir) *before*
+//! any old entry is deleted, so a crash between the two just leaves
+//! stale, already-superseded entries on disk. The next recovery scan
+//! reads the checkpoint, ignores (and finishes deleting) any entry
+//! below its boundary, and verifies the chain starting from the
+//! checkpoint's recorded hash -- so an interrupted prune self-heals on
+//! the next open rather than needing its own recovery path.
+//!
+//! Pruning only runs at [`LibraryHandle::open`] time, not continuously
+//! during a long-lived process -- see "disclosed simplifications"
+//! below for why.
+//!
+//! # Disclosed simplifications (phase 2-3)
+//!
+//! - **Pruning is open-time only.** A process that opens a library
+//!   once and then writes to it for a very long time will still grow
+//!   the journal without bound until it's reopened. Pruning mid-session
+//!   would need to distinguish "an old, fully-settled entry" from "an
+//!   entry another thread is mid-way through writing right now," which
+//!   the current design doesn't track (the writer-lock model assumes
+//!   one process per library, but says nothing about multiple threads
+//!   racing inside that process); rather than guess, pruning is
+//!   confined to the point where recovery has already proven every
+//!   on-disk entry is settled -- right after `open()` acquires the
+//!   lock and before any new write can start.
 //! - **No full-payload replay.** The journal entry for a write stores
 //!   a BLAKE3 checksum of the intended content, not the content
 //!   itself (matching upstream's "operation descriptor," not "the
@@ -123,7 +154,17 @@ use std::sync::Mutex;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::constants::{JOURNAL_DIR_NAME, LIBRARY_HANDLE_DIR_NAME, WRITER_LOCK_FILE_NAME};
+use crate::constants::{
+    JOURNAL_CHECKPOINT_FILE_NAME, JOURNAL_DIR_NAME, LIBRARY_HANDLE_DIR_NAME, WRITER_LOCK_FILE_NAME,
+};
+
+/// How many of the most recent journal entries [`LibraryHandle::open`]
+/// keeps on disk before pruning older, already-settled ones. Each
+/// entry is a tiny JSON file, so this is chosen generously (plenty of
+/// forensic history) rather than tightly -- the point of pruning is
+/// bounding growth over a library's *lifetime*, not minimizing disk
+/// use day to day.
+const JOURNAL_PRUNE_RETENTION: u64 = 500;
 
 /// Port of `docs/FAULT_TOLERANCE.md` §1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,6 +241,16 @@ struct JournalHead {
     prev_hash: Option<String>,
 }
 
+/// Persisted rolling checkpoint (phase 3): the chain-verification
+/// starting point after pruning. Entries with `seq < boundary_seq` are
+/// no longer on disk; the first remaining entry's `prev_head` is
+/// expected to equal `boundary_hash`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct JournalCheckpoint {
+    boundary_seq: u64,
+    boundary_hash: Option<String>,
+}
+
 /// The single gateway every durable write to a library folder is
 /// meant to go through. See this module's doc comment for exactly
 /// what's real so far.
@@ -227,6 +278,14 @@ impl LibraryHandle {
     /// [`LibraryHandleError::Corruption`] if the journal's hash chain
     /// doesn't verify.
     pub fn open(library_path: &Path) -> Result<Self, LibraryHandleError> {
+        Self::open_impl(library_path, JOURNAL_PRUNE_RETENTION)
+    }
+
+    /// `retention` is a test-only hook (see module doc's fault-
+    /// injection pattern) letting tests exercise pruning without
+    /// writing hundreds of entries; always [`JOURNAL_PRUNE_RETENTION`]
+    /// from the public [`LibraryHandle::open`].
+    fn open_impl(library_path: &Path, retention: u64) -> Result<Self, LibraryHandleError> {
         let handle_dir = library_path.join(LIBRARY_HANDLE_DIR_NAME);
         fs::create_dir_all(&handle_dir)?;
 
@@ -242,7 +301,8 @@ impl LibraryHandle {
         }
 
         let journal_dir = handle_dir.join(JOURNAL_DIR_NAME);
-        let head = recover_journal(&journal_dir)?;
+        let checkpoint_path = handle_dir.join(JOURNAL_CHECKPOINT_FILE_NAME);
+        let head = recover_journal(&journal_dir, &checkpoint_path, retention)?;
 
         Ok(LibraryHandle {
             library_path: library_path.to_path_buf(),
@@ -471,9 +531,20 @@ fn temp_path_for(target: &Path, uuid: Uuid) -> PathBuf {
 
 /// Port of §2's recovery-on-startup: scan the journal directory,
 /// verify the hash chain, and settle every entry that isn't already
-/// marked `committed` -- see module doc for the full algorithm.
-fn recover_journal(journal_dir: &Path) -> Result<JournalHead, LibraryHandleError> {
+/// marked `committed` -- see module doc for the full algorithm. Also
+/// runs phase 3's pruning pass once every entry has been settled.
+fn recover_journal(
+    journal_dir: &Path,
+    checkpoint_path: &Path,
+    retention: u64,
+) -> Result<JournalHead, LibraryHandleError> {
     fs::create_dir_all(journal_dir)?;
+
+    let checkpoint: Option<JournalCheckpoint> = fs::read(checkpoint_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let boundary_seq = checkpoint.as_ref().map_or(0, |c| c.boundary_seq);
+    let boundary_hash = checkpoint.and_then(|c| c.boundary_hash);
 
     let mut entries: Vec<(Uuid, JournalEntry)> = Vec::new();
     for dir_entry in fs::read_dir(journal_dir)? {
@@ -497,9 +568,22 @@ fn recover_journal(journal_dir: &Path) -> Result<JournalHead, LibraryHandleError
     }
     entries.sort_by_key(|(_, e)| e.seq);
 
-    let mut prev_hash: Option<String> = None;
-    let mut next_seq: u64 = 0;
+    let mut prev_hash = boundary_hash;
+    let mut next_seq = boundary_seq;
+    // (seq, uuid, descriptor_hash) for every live entry, in order --
+    // used below to find the hash a new checkpoint boundary should
+    // record if pruning kicks in.
+    let mut live: Vec<(u64, Uuid, String)> = Vec::new();
     for (uuid, entry) in &entries {
+        if entry.seq < boundary_seq {
+            // Leftover from a prune whose checkpoint write committed
+            // but whose deletions didn't finish -- already superseded,
+            // not part of the chain recovery verifies. Finish deleting
+            // it (self-heals an interrupted prune) and move on.
+            remove_journal_entry_files(journal_dir, *uuid)?;
+            continue;
+        }
+
         let recomputed = blake3_hex(
             &serde_json::to_vec(&entry.op).expect("OperationDescriptor always serializes"),
         );
@@ -515,14 +599,89 @@ fn recover_journal(journal_dir: &Path) -> Result<JournalHead, LibraryHandleError
         }
         prev_hash = Some(entry.descriptor_hash.clone());
         next_seq = entry.seq + 1;
+        live.push((entry.seq, *uuid, entry.descriptor_hash.clone()));
 
         recover_one(journal_dir, *uuid, entry)?;
     }
+
+    prune_if_needed(journal_dir, checkpoint_path, boundary_seq, retention, &live)?;
 
     Ok(JournalHead {
         next_seq,
         prev_hash,
     })
+}
+
+/// Phase 3: if more than `retention` entries are live, write a new
+/// checkpoint recording the chain state just after the newest entry
+/// being dropped, then delete every entry at or below that boundary.
+/// The checkpoint is written -- fsynced and renamed into place --
+/// before any deletion, so an interruption partway through just leaves
+/// stale files that the next recovery scan finishes cleaning up (see
+/// `recover_journal`'s `entry.seq < boundary_seq` branch).
+fn prune_if_needed(
+    journal_dir: &Path,
+    checkpoint_path: &Path,
+    old_boundary_seq: u64,
+    retention: u64,
+    live: &[(u64, Uuid, String)],
+) -> Result<(), LibraryHandleError> {
+    let live_count = live.len() as u64;
+    if live_count <= retention {
+        return Ok(());
+    }
+
+    let drop_count = (live_count - retention) as usize;
+    let new_boundary_seq = live[drop_count - 1].0 + 1;
+    let new_boundary_hash = Some(live[drop_count - 1].2.clone());
+    debug_assert!(old_boundary_seq <= new_boundary_seq);
+
+    write_checkpoint(
+        checkpoint_path,
+        &JournalCheckpoint {
+            boundary_seq: new_boundary_seq,
+            boundary_hash: new_boundary_hash,
+        },
+    )?;
+
+    for (_, uuid, _) in &live[..drop_count] {
+        remove_journal_entry_files(journal_dir, *uuid)?;
+    }
+    fsync_dir(Some(journal_dir))?;
+    Ok(())
+}
+
+fn remove_journal_entry_files(journal_dir: &Path, uuid: Uuid) -> io::Result<()> {
+    let op_path = journal_dir.join(format!("{uuid}.op"));
+    if op_path.exists() {
+        fs::remove_file(&op_path)?;
+    }
+    let committed_path = journal_dir.join(format!("{uuid}.committed"));
+    if committed_path.exists() {
+        fs::remove_file(&committed_path)?;
+    }
+    Ok(())
+}
+
+/// Write-temp/fsync/rename/fsync-dir, same discipline as
+/// [`LibraryHandle::write_atomic_impl`], but standalone: the
+/// checkpoint is the journal's own bookkeeping, not a library-content
+/// write, so it deliberately isn't itself journaled (that would be
+/// unbounded recursion -- a journal entry for writing the journal's
+/// own checkpoint).
+fn write_checkpoint(path: &Path, checkpoint: &JournalCheckpoint) -> Result<(), LibraryHandleError> {
+    let bytes = serde_json::to_vec(checkpoint).expect("JournalCheckpoint always serializes");
+    let tmp_path = path.with_extension("tmp");
+    let tmp_file = File::create(&tmp_path)?;
+    {
+        use std::io::Write;
+        (&tmp_file).write_all(&bytes)?;
+    }
+    tmp_file.sync_all()?;
+    drop(tmp_file);
+    fs::rename(&tmp_path, path)?;
+    fsync_dir(path.parent())?;
+    Ok(())
 }
 
 fn recover_one(
@@ -1071,6 +1230,152 @@ mod tests {
 
         let result = LibraryHandle::open(dir.path());
         assert!(matches!(result, Err(LibraryHandleError::Corruption(_))));
+    }
+
+    // }}}
+
+    // --- journal pruning (phase 3) {{{
+
+    fn journal_dir_of(dir: &Path) -> PathBuf {
+        dir.join(".calibre-oxide").join("journal")
+    }
+
+    fn op_file_count(journal_dir: &Path) -> usize {
+        fs::read_dir(journal_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("op"))
+            .count()
+    }
+
+    #[test]
+    fn reopening_under_the_retention_limit_prunes_nothing() {
+        let dir = tempdir().unwrap();
+        {
+            let handle = LibraryHandle::open_impl(dir.path(), 3).unwrap();
+            for i in 0..3 {
+                handle
+                    .write_atomic(&dir.path().join(format!("{i}.opf")), b"x")
+                    .unwrap();
+            }
+        }
+        LibraryHandle::open_impl(dir.path(), 3).unwrap();
+        assert_eq!(op_file_count(&journal_dir_of(dir.path())), 3);
+        assert!(!dir
+            .path()
+            .join(".calibre-oxide")
+            .join("journal_checkpoint")
+            .exists());
+    }
+
+    #[test]
+    fn reopening_over_the_retention_limit_prunes_the_oldest_entries() {
+        let dir = tempdir().unwrap();
+        {
+            let handle = LibraryHandle::open_impl(dir.path(), 3).unwrap();
+            for i in 0..5 {
+                handle
+                    .write_atomic(&dir.path().join(format!("{i}.opf")), b"x")
+                    .unwrap();
+            }
+        }
+        // Recovery on this open settles all 5, then prunes down to 3.
+        LibraryHandle::open_impl(dir.path(), 3).unwrap();
+        let journal_dir = journal_dir_of(dir.path());
+        assert_eq!(op_file_count(&journal_dir), 3);
+
+        let checkpoint_path = dir.path().join(".calibre-oxide").join("journal_checkpoint");
+        assert!(checkpoint_path.exists());
+        let checkpoint: JournalCheckpoint =
+            serde_json::from_slice(&fs::read(&checkpoint_path).unwrap()).unwrap();
+        assert_eq!(checkpoint.boundary_seq, 2);
+
+        let mut remaining: Vec<JournalEntry> = fs::read_dir(&journal_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("op"))
+            .map(|e| serde_json::from_slice(&fs::read(e.path()).unwrap()).unwrap())
+            .collect();
+        remaining.sort_by_key(|e| e.seq);
+        assert_eq!(
+            remaining.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            [2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn writes_after_pruning_still_chain_correctly_from_the_checkpoint() {
+        let dir = tempdir().unwrap();
+        {
+            let handle = LibraryHandle::open_impl(dir.path(), 2).unwrap();
+            for i in 0..4 {
+                handle
+                    .write_atomic(&dir.path().join(format!("{i}.opf")), b"x")
+                    .unwrap();
+            }
+        }
+        // This open prunes seq 0-1 away, keeping 2-3.
+        let handle = LibraryHandle::open_impl(dir.path(), 2).unwrap();
+        handle
+            .write_atomic(&dir.path().join("new.opf"), b"y")
+            .unwrap();
+        drop(handle);
+
+        // A fresh open must still verify cleanly -- the new entry's
+        // prev_head chains onto the last pre-prune entry's hash, which
+        // the checkpoint (not a deleted file) now supplies.
+        let handle = LibraryHandle::open_impl(dir.path(), 2).unwrap();
+        assert_eq!(handle.state(), HandleState::Open);
+        assert_eq!(fs::read(dir.path().join("new.opf")).unwrap(), b"y");
+    }
+
+    #[test]
+    fn an_interrupted_prune_self_heals_on_the_next_open() {
+        // Simulates a crash between the checkpoint write and the
+        // deletion pass: write a checkpoint that's already past some
+        // still-present entries, and confirm the next open both
+        // succeeds and finishes deleting them.
+        let dir = tempdir().unwrap();
+        {
+            let handle = LibraryHandle::open_impl(dir.path(), 100).unwrap();
+            for i in 0..3 {
+                handle
+                    .write_atomic(&dir.path().join(format!("{i}.opf")), b"x")
+                    .unwrap();
+            }
+        }
+        let journal_dir = journal_dir_of(dir.path());
+        let mut entries: Vec<(Uuid, JournalEntry)> = fs::read_dir(&journal_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("op"))
+            .map(|e| {
+                let uuid =
+                    Uuid::parse_str(e.path().file_stem().unwrap().to_str().unwrap()).unwrap();
+                let entry = serde_json::from_slice(&fs::read(e.path()).unwrap()).unwrap();
+                (uuid, entry)
+            })
+            .collect();
+        entries.sort_by_key(|(_, e)| e.seq);
+
+        // Hand-write a checkpoint as if entries 0-1 were already
+        // pruned, without actually deleting their files -- the "crash
+        // right after the checkpoint rename" scenario.
+        let checkpoint = JournalCheckpoint {
+            boundary_seq: 2,
+            boundary_hash: Some(entries[1].1.descriptor_hash.clone()),
+        };
+        fs::write(
+            dir.path().join(".calibre-oxide").join("journal_checkpoint"),
+            serde_json::to_vec(&checkpoint).unwrap(),
+        )
+        .unwrap();
+
+        let handle = LibraryHandle::open_impl(dir.path(), 100).unwrap();
+        assert_eq!(handle.state(), HandleState::Open);
+        // The stale, already-superseded entry 0 and 1 files are
+        // cleaned up by the recovery scan itself.
+        assert_eq!(op_file_count(&journal_dir), 1);
     }
 
     // }}}
