@@ -16,6 +16,7 @@ pub mod fts;
 pub mod lazy;
 pub mod legacy;
 pub mod library;
+pub mod library_handle;
 pub mod listeners;
 pub mod locking;
 pub mod notes;
