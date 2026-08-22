@@ -201,8 +201,25 @@ impl ChecksumStore {
         key: &str,
         bytes: &[u8],
     ) -> Result<(), ChecksumError> {
-        self.initialize()?;
         let hash = blake3::hash(bytes).to_hex().to_string();
+        self.record_hash(book_id, kind, key, &hash, bytes.len() as i64)
+    }
+
+    /// Records a BLAKE3 already computed elsewhere -- the large-file-
+    /// safe counterpart to [`ChecksumStore::record_file`], for a
+    /// caller (e.g. [`crate::library_handle::LibraryHandle::copy_atomic`]'s
+    /// streaming copy) that already hashed the content without ever
+    /// buffering the whole file in memory, so this doesn't need a
+    /// second full read of it just to hash it again.
+    pub fn record_hash(
+        &self,
+        book_id: i32,
+        kind: &str,
+        key: &str,
+        hash: &str,
+        size: i64,
+    ) -> Result<(), ChecksumError> {
+        self.initialize()?;
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO checksums_db.file_checksums
@@ -212,14 +229,16 @@ impl ChecksumStore {
                 blake3_hex = excluded.blake3_hex,
                 size = excluded.size,
                 updated_at = excluded.updated_at",
-            (book_id, kind, key, &hash, bytes.len() as i64),
+            (book_id, kind, key, hash, size),
         )?;
         Ok(())
     }
 
     /// Reads `path` and records its BLAKE3 -- the "at add time" half
     /// of §8. Call right after the write that created/replaced `path`
-    /// succeeds.
+    /// succeeds. Buffers the whole file in memory to hash it; prefer
+    /// [`ChecksumStore::record_hash`] with an already-streamed hash
+    /// when `path` could be large.
     pub fn record_file(
         &self,
         book_id: i32,
