@@ -58,8 +58,10 @@
 //!   -- the latter is explicitly tracked separately as `notes/exim.rs`
 //!   (a distinct, already-filed issue per #227's own description).
 
+use crate::backend::Backend;
 use crate::constants::{NOTES_DB_NAME, NOTES_DIR_NAME};
 use crate::errors::FtsQueryError;
+use crate::library_handle::LibraryHandleError;
 use calibre_utils::filenames::sanitize_file_name;
 use rusqlite::{Connection, OptionalExtension, Result as SqlResult};
 use std::collections::HashSet;
@@ -109,18 +111,41 @@ fn now_secs() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// [`add_resource`](NotesConnection::add_resource)/
+/// [`remove_unreferenced_resources`](NotesConnection::remove_unreferenced_resources)
+/// still return `SqlResult` (this module's established return type
+/// throughout), so a real `LibraryHandleError` from the write-path
+/// retrofit needs to fit through that -- `ToSqlConversionFailure` is
+/// rusqlite's own escape hatch for exactly this ("a Rust-side error
+/// that isn't literally a SQL error"), not a perfect semantic match
+/// but the standard one.
+fn handle_err_to_sql(e: LibraryHandleError) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(e))
+}
+
 pub struct NotesConnection {
     conn: Arc<Mutex<Connection>>,
+    /// Issue #93's crate-wide write-path retrofit: kept so
+    /// [`NotesConnection::add_resource`]/
+    /// [`NotesConnection::remove_unreferenced_resources`] can reach
+    /// [`Backend::write_handle`] -- sharing the *same* lazily-opened
+    /// `LibraryHandle` every other write in this crate reached through
+    /// this `Backend` uses, rather than each opening its own (which
+    /// would collide with `AlreadyLocked` the moment both are held at
+    /// once in the same process).
+    backend: Backend,
     notes_dir: PathBuf,
     resources_dir: PathBuf,
 }
 
 impl NotesConnection {
-    pub fn new(conn: Arc<Mutex<Connection>>, library_path: &Path) -> Self {
+    pub fn new(backend: Backend, library_path: &Path) -> Self {
         let notes_dir = library_path.join(NOTES_DIR_NAME);
         let resources_dir = notes_dir.join("resources");
+        let conn = backend.conn.clone();
         NotesConnection {
             conn,
+            backend,
             notes_dir,
             resources_dir,
         }
@@ -215,6 +240,15 @@ impl NotesConnection {
 
     /// Real orphan cleanup: any resource file no longer referenced by
     /// any note's link row is deleted from disk and from `resources`.
+    ///
+    /// Port of issue #93's crate-wide write-path retrofit: the file
+    /// removal now goes through the real `LibraryHandle` instead of a
+    /// raw `fs::remove_file`. A failed removal is warned about and the
+    /// sweep continues (same "don't undo already-committed work over
+    /// one failure" convention as `Cache::delete_book`) -- the DB row
+    /// is still dropped either way, matching this method's pre-
+    /// existing behavior of ignoring the file-removal outcome
+    /// entirely.
     pub fn remove_unreferenced_resources(&self) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap();
         let orphans: Vec<String> = {
@@ -226,7 +260,14 @@ impl NotesConnection {
             collected?
         };
         for hash in &orphans {
-            let _ = fs::remove_file(self.path_for_resource(hash));
+            let path = self.path_for_resource(hash);
+            if let Err(e) = self
+                .backend
+                .write_handle()
+                .and_then(|handle| handle.remove_atomic(&path))
+            {
+                eprintln!("Warning: failed to remove resource file {path:?}: {e}");
+            }
             conn.execute("DELETE FROM notes_db.resources WHERE hash=?1", [hash])?;
         }
         Ok(())
@@ -247,6 +288,16 @@ impl NotesConnection {
     /// registering it in `resources` under `name` (sanitized,
     /// disambiguated with a `-1`/`-2`/... suffix on a name collision
     /// with a *different* resource). Returns the resource hash.
+    ///
+    /// Port of issue #93's crate-wide write-path retrofit: the write
+    /// now goes through the real `LibraryHandle` (journaled, crash-
+    /// safe, creates the parent directory itself) instead of a raw
+    /// `fs::write`. This also fixes a real pre-existing bug: the old
+    /// `fs::write(...).ok()` silently swallowed any write failure and
+    /// then unconditionally registered the resource in the DB anyway
+    /// -- a disk-full or permissions error could leave `resources`
+    /// claiming a file exists that was never actually written.
+    /// `write_atomic`'s error now propagates for real.
     pub fn add_resource(&self, data: &[u8], name: &str) -> SqlResult<String> {
         let hash = hash_data(data);
         let path = self.path_for_resource(&hash);
@@ -254,10 +305,10 @@ impl NotesConnection {
             .map(|m| m.len() as usize != data.len())
             .unwrap_or(true);
         if needs_write {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).ok();
-            }
-            fs::write(&path, data).ok();
+            self.backend
+                .write_handle()
+                .and_then(|handle| handle.write_atomic(&path, data))
+                .map_err(handle_err_to_sql)?;
         }
 
         let sanitized = sanitize_file_name(name);
