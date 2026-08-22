@@ -72,9 +72,9 @@ use std::collections::HashMap;
 use std::io;
 use std::mem;
 use std::os::fd::RawFd;
-use std::sync::{Mutex, Weak};
+use std::sync::Weak;
 
-use crate::library_handle::HandleState;
+use crate::library_handle::{HandleState, Shared};
 
 const AF_NETLINK: libc::c_int = libc::AF_NETLINK;
 const NETLINK_KOBJECT_UEVENT: libc::c_int = 15;
@@ -181,14 +181,14 @@ pub(crate) fn is_removal_of(fields: &HashMap<String, String>, device_name: &str)
 }
 
 /// Spawns the best-effort background watcher described in this
-/// module's doc. `state` should be a [`Weak`] downgraded from the
+/// module's doc. `shared` should be a [`Weak`] downgraded from the
 /// same `Arc` [`crate::library_handle::LibraryHandle`] holds, so the
 /// thread never keeps the handle alive by itself.
-pub(crate) fn spawn_device_monitor(device_name: String, state: Weak<Mutex<HandleState>>) {
+pub(crate) fn spawn_device_monitor(device_name: String, shared: Weak<Shared>) {
     std::thread::Builder::new()
         .name(format!("device-monitor-{device_name}"))
         .spawn(move || {
-            if let Err(e) = run(&device_name, &state) {
+            if let Err(e) = run(&device_name, &shared) {
                 eprintln!(
                     "device-removal monitor for {device_name} not started ({e}) -- \
                      continuing without device-removal detection"
@@ -199,18 +199,18 @@ pub(crate) fn spawn_device_monitor(device_name: String, state: Weak<Mutex<Handle
                // best-effort as the socket failing -- see module doc.
 }
 
-fn run(device_name: &str, state: &Weak<Mutex<HandleState>>) -> io::Result<()> {
+fn run(device_name: &str, shared: &Weak<Shared>) -> io::Result<()> {
     let sock = open_uevent_socket()?;
     let mut buf = [0u8; 8192];
     loop {
-        if state.upgrade().is_none() {
+        if shared.upgrade().is_none() {
             return Ok(()); // The handle is gone; nothing left to watch for.
         }
         let Some(n) = recv_or_timeout(&sock, &mut buf)? else {
             continue; // Plain timeout -- loop back to the upgrade check.
         };
         let fields = parse_uevent(&buf[..n]);
-        if apply_event(&fields, device_name, state) {
+        if apply_event(&fields, device_name, shared) {
             return Ok(()); // Job done -- see module doc.
         }
     }
@@ -219,20 +219,16 @@ fn run(device_name: &str, state: &Weak<Mutex<HandleState>>) -> io::Result<()> {
 /// The actual per-event decision, factored out of [`run`] so it's
 /// testable against a synthetic event without a real socket: real
 /// bytes only ever reach here already parsed by [`parse_uevent`].
-/// Returns `true` (and flips `state` to `Detached`) exactly when
-/// `fields` reports `device_name`'s removal.
-fn apply_event(
-    fields: &HashMap<String, String>,
-    device_name: &str,
-    state: &Weak<Mutex<HandleState>>,
-) -> bool {
+/// Returns `true` (and flips the handle's state to `Detached`) exactly
+/// when `fields` reports `device_name`'s removal.
+fn apply_event(fields: &HashMap<String, String>, device_name: &str, shared: &Weak<Shared>) -> bool {
     if !is_removal_of(fields, device_name) {
         return false;
     }
-    let Some(state) = state.upgrade() else {
+    let Some(shared) = shared.upgrade() else {
         return true; // Matched, but the handle's already gone -- still "done".
     };
-    *state.lock().unwrap() = HandleState::Detached;
+    shared.set_state(HandleState::Detached);
     true
 }
 
@@ -319,34 +315,40 @@ mod tests {
 
     #[test]
     fn apply_event_flips_a_matching_devices_state_to_detached() {
-        let state = std::sync::Arc::new(Mutex::new(HandleState::Open));
-        let weak = std::sync::Arc::downgrade(&state);
+        let _flock_test_guard = crate::library_handle::flock_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let shared = crate::library_handle::shared_for_test(dir.path());
+        let weak = std::sync::Arc::downgrade(&shared);
         let event = block_remove_event("sdb1");
 
         let handled = apply_event(&event, "sdb1", &weak);
 
         assert!(handled);
-        assert_eq!(*state.lock().unwrap(), HandleState::Detached);
+        assert_eq!(shared.state(), HandleState::Detached);
     }
 
     #[test]
     fn apply_event_leaves_a_non_matching_devices_state_alone() {
-        let state = std::sync::Arc::new(Mutex::new(HandleState::Open));
-        let weak = std::sync::Arc::downgrade(&state);
+        let _flock_test_guard = crate::library_handle::flock_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let shared = crate::library_handle::shared_for_test(dir.path());
+        let weak = std::sync::Arc::downgrade(&shared);
         let event = block_remove_event("sdb1");
 
         let handled = apply_event(&event, "sdb2", &weak);
 
         assert!(!handled);
-        assert_eq!(*state.lock().unwrap(), HandleState::Open);
+        assert_eq!(shared.state(), HandleState::Open);
     }
 
     #[test]
     fn spawn_device_monitor_exits_once_the_handle_drops() {
-        let state = std::sync::Arc::new(Mutex::new(HandleState::Open));
-        let weak = std::sync::Arc::downgrade(&state);
+        let _flock_test_guard = crate::library_handle::flock_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let shared = crate::library_handle::shared_for_test(dir.path());
+        let weak = std::sync::Arc::downgrade(&shared);
         spawn_device_monitor("a-device-name-that-will-never-match".to_string(), weak);
-        drop(state);
+        drop(shared);
         // The monitor's receive timeout is 2s; give it real margin to
         // notice and exit without making this test itself flaky.
         std::thread::sleep(std::time::Duration::from_secs(3));

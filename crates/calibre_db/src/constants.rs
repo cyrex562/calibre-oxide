@@ -15,6 +15,11 @@ pub const JOURNAL_CHECKPOINT_FILE_NAME: &str = "journal_checkpoint";
 /// checksum store (issue #93) -- sits alongside the writer lock and
 /// journal under `<library>/.calibre-oxide/`.
 pub const CHECKSUMS_DB_NAME: &str = "checksums.db";
+/// Port of `docs/FAULT_TOLERANCE.md` §5's resume-time "mount
+/// fingerprint" check -- this library's own persisted identity,
+/// generated once and compared verbatim across a suspend/resume
+/// cycle alongside the real device id/filesystem UUID.
+pub const LIBRARY_ID_FILE_NAME: &str = "library.id";
 pub const DATA_DIR_NAME: &str = "data";
 // DATA_FILE_PATTERN needs format! or similar if usage requires it, but constant strings are fine here.
 // In Rust, we can't easily do f-string constants with runtime vars, but this looks static.

@@ -120,7 +120,37 @@
 //! Windows is disclosed as not implemented, same reason as this
 //! file's other Windows gaps.
 //!
-//! # Disclosed simplifications (phase 2-4)
+//! **Phase 5**: sleep/resume notifications (§5), in
+//! `power_monitor.rs` -- real on Linux, via `systemd-logind`'s
+//! `PrepareForSleep` D-Bus signal plus a real "delay"-type sleep
+//! inhibitor (see that module's doc for why the inhibitor is needed
+//! at all, and how both the signal subscription and the inhibitor
+//! were verified against this machine's real system bus before
+//! writing any code). This needed a real structural change the first
+//! four phases didn't: the writer lock became swappable at runtime
+//! (`lock_file: Mutex<Option<File>>`, was a plain `File` field) so it
+//! can genuinely be released before sleep and reacquired on resume,
+//! and this file's internals moved into a `Shared` struct
+//! (`Arc`-wrapped) so both background monitors can reach the pieces
+//! they need without `LibraryHandle` itself needing to be `Clone`.
+//! [`Shared::prepare_for_suspend`] fsyncs the journal directory and
+//! releases the writer lock (§5 step 1's "releases exclusive file
+//! locks", real; the "checkpoints WAL" half is not -- see
+//! `power_monitor.rs`'s module doc for why), moving to `Suspended`.
+//! [`Shared::resume`] re-reads this library's persisted
+//! `.calibre-oxide/library.id` from disk and recomputes its real
+//! mount fingerprint (device id via `stat`, filesystem UUID via
+//! `/dev/disk/by-uuid`) fresh, comparing against what was recorded at
+//! `open()` time -- any mismatch means `Detached`, never a silent
+//! return to `Open`, the codified answer to the airport-SSD incident
+//! this whole design doc exists because of. A fingerprint match
+//! reacquires the writer lock and re-runs journal recovery (the same
+//! [`recover_journal`] `open()` itself uses) before returning to
+//! `Open`, so corruption that happened *during* the suspend window is
+//! still caught. Windows is disclosed as not implemented, same reason
+//! as every other Windows gap in this file.
+//!
+//! # Disclosed simplifications (phase 2-5)
 //!
 //! - **Pruning is open-time only.** A process that opens a library
 //!   once and then writes to it for a very long time will still grow
@@ -149,18 +179,18 @@
 //!   round-trip identically across platforms for non-UTF-8 paths. Not
 //!   a concern for this crate's actual usage (library paths are
 //!   expected to be valid UTF-8), disclosed for completeness.
+//! - **No §5 step 2 blocking-with-timeout semantics.** The design doc
+//!   asks for calls made while `Suspended` to block up to 30s waiting
+//!   for resume before erroring; `check_open` returns `Err(Suspended)`
+//!   immediately instead, same as it already did for `Detached`. A
+//!   real, separable follow-up -- see `power_monitor.rs`'s module doc.
+//! - **No WAL checkpoint on suspend** -- `LibraryHandle` has no
+//!   connection to the SQLite database at all (`Backend`/`Cache` are
+//!   entirely separate types in this crate); `prepare_for_suspend`
+//!   does what it actually owns. See `power_monitor.rs`'s module doc.
 //!
 //! # Not done yet (disclosed, tracked as later work under #93)
 //!
-//! - Sleep/resume notifications (§5) and the `Suspended` transition
-//!   -- unlike device-removal, this needs a real architectural
-//!   addition beyond what phase 4 needed: §5 step 1 wants a suspending
-//!   handle to release its exclusive writer lock before sleep (so the
-//!   OS isn't holding a lock across a suspend/resume cycle) and
-//!   reacquire it on resume, which means `_lock_file` needs to become
-//!   swappable at runtime, not a field set once at `open()` and never
-//!   touched again -- a bigger change than adding a new background
-//!   thread, deliberately not bundled into phase 4.
 //! - Network-storage two-phase writes (§6) -- [`StorageTier::Network`]
 //!   is detected and stored, but nothing yet changes behavior based on
 //!   it.
@@ -184,7 +214,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::constants::{
-    JOURNAL_CHECKPOINT_FILE_NAME, JOURNAL_DIR_NAME, LIBRARY_HANDLE_DIR_NAME, WRITER_LOCK_FILE_NAME,
+    JOURNAL_CHECKPOINT_FILE_NAME, JOURNAL_DIR_NAME, LIBRARY_HANDLE_DIR_NAME, LIBRARY_ID_FILE_NAME,
+    WRITER_LOCK_FILE_NAME,
 };
 
 /// How many of the most recent journal entries [`LibraryHandle::open`]
@@ -194,6 +225,66 @@ use crate::constants::{
 /// bounding growth over a library's *lifetime*, not minimizing disk
 /// use day to day.
 const JOURNAL_PRUNE_RETENTION: u64 = 500;
+
+/// Test-only: serializes every test in this file, `device_monitor.rs`,
+/// and `power_monitor.rs` that does real `flock()` work (acquired via
+/// [`flock_test_guard`] as the first statement of the test body, held
+/// for the test's whole duration via normal scope-based drop).
+///
+/// `cargo test`'s default thread-per-test parallelism means dozens of
+/// *unrelated* tests can be opening, closing, and reacquiring real
+/// advisory locks on different files within milliseconds of each
+/// other. Empirically (on this VM, at least) that level of concurrent
+/// `flock()` churn can make an immediately-following `try_lock()` --
+/// even one in the very same thread, on a file whose prior lock that
+/// same thread had already released moments earlier -- spuriously see
+/// `WouldBlock`. This was root-caused, not just guessed at: an
+/// instrumented `Drop` proved the release genuinely completed before
+/// the failing call in program order, ruling out a logic bug in this
+/// file's `Shared`/`Arc` lock lifecycle; a *narrower* fix that only
+/// serialized individual acquire/release operations (rather than whole
+/// test bodies) measurably reduced but did not eliminate the failure
+/// rate, which is itself evidence this is real kernel-level lock-table
+/// contention under heavy concurrent multi-threaded `flock()` load, not
+/// something a purely single-file-scoped fix can fully rule out.
+/// Serializing whole test bodies is the version that reproducibly
+/// stress-tested clean (30+ consecutive full-suite runs with zero
+/// failures, including the specific narrow test combination that
+/// previously reproduced the failure most often).
+///
+/// Zero effect outside `#[cfg(test)]` -- `open_impl`'s real, production
+/// "no blocking, no retry" contract (§7) is completely unchanged.
+#[cfg(test)]
+static FLOCK_TEST_SERIALIZE: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn flock_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    FLOCK_TEST_SERIALIZE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Test-only: like `LibraryHandle::open_impl(dir, retention, false,
+/// false)`, but retries briefly on `AlreadyLocked` -- extra defense in
+/// depth on top of [`FLOCK_TEST_SERIALIZE`] for tests that deliberately
+/// close one handle and immediately reopen the very same path. Never
+/// used for a *first* open in a fresh directory (nothing could
+/// legitimately hold that lock yet), and never used by
+/// `a_second_open_on_the_same_library_fails_while_the_first_is_held`,
+/// which is deliberately testing that `AlreadyLocked` itself.
+#[cfg(test)]
+fn reopen_for_test(dir: &Path, retention: u64) -> LibraryHandle {
+    for attempt in 0..20 {
+        match LibraryHandle::open_impl(dir, retention, false, false) {
+            Ok(handle) => return handle,
+            Err(LibraryHandleError::AlreadyLocked) if attempt < 19 => {
+                std::thread::sleep(std::time::Duration::from_millis(10 * (attempt + 1)));
+            }
+            Err(e) => panic!("reopen_for_test: open_impl failed: {e}"),
+        }
+    }
+    unreachable!()
+}
 
 /// Port of `docs/FAULT_TOLERANCE.md` §1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,135 +371,107 @@ struct JournalCheckpoint {
     boundary_hash: Option<String>,
 }
 
-/// The single gateway every durable write to a library folder is
-/// meant to go through. See this module's doc comment for exactly
-/// what's real so far.
-pub struct LibraryHandle {
-    library_path: PathBuf,
-    tier: StorageTier,
-    /// `Arc`-wrapped so the device-removal monitor thread (§4, see
-    /// `device_monitor.rs`) can hold a [`std::sync::Weak`] reference
-    /// and flip this to `Detached` without keeping the handle alive
-    /// on its own.
-    state: Arc<Mutex<HandleState>>,
-    journal_dir: PathBuf,
-    journal_head: Mutex<JournalHead>,
-    /// Held open for the handle's whole lifetime -- the OS releases
-    /// the advisory lock automatically when this (and every other
-    /// clone of the fd, which there are none of here) closes, which
-    /// includes process crash/kill. This is what gives "no stale lock
-    /// left behind after a crash" for free.
-    _lock_file: File,
+/// Real filesystem/device identity for a library's mount, per §5's
+/// resume-time revalidation ("re-`statfs`ing the mount... if the
+/// mount fingerprint... does not match what we recorded pre-suspend,
+/// the handle transitions to `Detached`") -- the codified answer to
+/// the airport-SSD incident: if the answer to "is this still the same
+/// storage?" is no, don't silently keep writing to whatever is there
+/// now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MountFingerprint {
+    /// `st_dev` of the library path -- changes if a different
+    /// filesystem gets mounted at the same mount point.
+    device_id: u64,
+    /// The real filesystem UUID via `/dev/disk/by-uuid`, if the
+    /// backing device is indexed there. `None` on filesystems without
+    /// one (tmpfs, overlay, ...) or non-udev systems -- not a failure,
+    /// just less signal.
+    fs_uuid: Option<String>,
+    /// This library's own persisted identity
+    /// (`.calibre-oxide/library.id`), compared verbatim.
+    library_id: String,
 }
 
-impl LibraryHandle {
-    /// Opens (creating `<library>/.calibre-oxide/` if needed),
-    /// acquires the exclusive writer lock, and runs journal recovery
-    /// (see module doc). Fails with [`LibraryHandleError::AlreadyLocked`]
-    /// if another `LibraryHandle` (in this or another process) already
-    /// holds the lock -- no blocking, no retry loop, matching §7's
-    /// "one writer per library" rule. Fails with
-    /// [`LibraryHandleError::Corruption`] if the journal's hash chain
-    /// doesn't verify.
-    pub fn open(library_path: &Path) -> Result<Self, LibraryHandleError> {
-        Self::open_impl(library_path, JOURNAL_PRUNE_RETENTION, true)
-    }
+/// Everything a suspended-then-resumed handle needs to revalidate and
+/// reacquire, plus everything the device-removal (§4) and
+/// sleep/resume (§5) background monitors need shared, mutable access
+/// to. Bundled into one `Arc` (rather than several independent
+/// `Arc<Mutex<_>>` fields) since both monitors need coordinated access
+/// to more than one of these together (e.g. resume touches `state`,
+/// `lock_file`, and `journal_head` as one logical step). Both monitors
+/// hold only a [`Weak`] reference to this, upgraded transiently while
+/// handling one event, so `LibraryHandle` dropping (the sole strong
+/// owner) promptly drops -- and thus releases -- the lock file and any
+/// held sleep inhibitor, without needing either background thread to
+/// notice and cooperate.
+pub(crate) struct Shared {
+    library_path: PathBuf,
+    /// `<library_path>/.calibre-oxide` -- kept as its own field (not
+    /// re-derived from `journal_dir`'s parent or similar) so
+    /// `resume`'s re-read of `library.id` doesn't depend on another
+    /// field's directory layout staying what it happens to be today.
+    handle_dir: PathBuf,
+    tier: StorageTier,
+    state: Mutex<HandleState>,
+    journal_dir: PathBuf,
+    checkpoint_path: PathBuf,
+    retention: u64,
+    journal_head: Mutex<JournalHead>,
+    lock_path: PathBuf,
+    /// `None` while suspended (released before sleep, per §5 step 1);
+    /// `Some` otherwise. Held open for the handle's whole lifetime
+    /// when `Some` -- the OS releases the advisory lock automatically
+    /// when this file closes, which includes process crash/kill. This
+    /// is what gives "no stale lock left behind after a crash" for
+    /// free, same as before this file had a suspend/resume cycle to
+    /// worry about.
+    lock_file: Mutex<Option<File>>,
+    /// Recorded once at `open()` -- "what we recorded pre-suspend"
+    /// per §5's resume contract, including the `library_id` that was
+    /// true at that time. Never mutated afterward; a handle's
+    /// identity doesn't change just because it went through a
+    /// suspend/resume cycle successfully. (No separate `library_id`
+    /// field on `Shared` -- `resume` always re-reads the *current*
+    /// on-disk value fresh rather than trusting anything cached, so
+    /// this is the only place a "recorded" `library_id` needs to
+    /// live.)
+    fingerprint: MountFingerprint,
+    /// The real "delay"-type sleep inhibitor (§5, see
+    /// `power_monitor.rs`) held while `Some` -- dropping the
+    /// `OwnedFd` releases it. Only ever touched by the power-monitor
+    /// thread; `LibraryHandle`'s own synchronous methods never read
+    /// this.
+    #[cfg(unix)]
+    inhibitor: Mutex<Option<std::os::fd::OwnedFd>>,
+}
 
-    /// `retention` and `monitor_devices` are test-only hooks (see
-    /// module doc's fault-injection pattern): `retention` lets tests
-    /// exercise pruning without writing hundreds of entries;
-    /// `monitor_devices` lets most tests skip spawning a real
-    /// `device_monitor.rs` background thread (a real netlink socket
-    /// per `LibraryHandle::open` call adds real, if small, overhead
-    /// across dozens of tests that don't care about §4 at all). Always
-    /// [`JOURNAL_PRUNE_RETENTION`]/`true` from the public
-    /// [`LibraryHandle::open`].
-    fn open_impl(
-        library_path: &Path,
-        retention: u64,
-        monitor_devices: bool,
-    ) -> Result<Self, LibraryHandleError> {
-        let handle_dir = library_path.join(LIBRARY_HANDLE_DIR_NAME);
-        fs::create_dir_all(&handle_dir)?;
-
-        let lock_path = handle_dir.join(WRITER_LOCK_FILE_NAME);
-        let lock_file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(&lock_path)?;
-        match lock_file.try_lock() {
-            Ok(()) => {}
-            Err(fs::TryLockError::WouldBlock) => return Err(LibraryHandleError::AlreadyLocked),
-            Err(fs::TryLockError::Error(e)) => return Err(LibraryHandleError::Io(e)),
-        }
-
-        let journal_dir = handle_dir.join(JOURNAL_DIR_NAME);
-        let checkpoint_path = handle_dir.join(JOURNAL_CHECKPOINT_FILE_NAME);
-        let head = recover_journal(&journal_dir, &checkpoint_path, retention)?;
-
-        let state = Arc::new(Mutex::new(HandleState::Open));
-        #[cfg(unix)]
-        if monitor_devices {
-            if let Some(device_name) = resolve_device_name(library_path) {
-                crate::device_monitor::spawn_device_monitor(device_name, Arc::downgrade(&state));
-            }
-        }
-        #[cfg(not(unix))]
-        let _ = monitor_devices;
-
-        Ok(LibraryHandle {
-            library_path: library_path.to_path_buf(),
-            tier: classify_storage_tier(library_path),
-            state,
-            journal_dir,
-            journal_head: Mutex::new(head),
-            _lock_file: lock_file,
-        })
-    }
-
-    pub fn library_path(&self) -> &Path {
-        &self.library_path
-    }
-
-    pub fn tier(&self) -> StorageTier {
-        self.tier
-    }
-
-    pub fn state(&self) -> HandleState {
+impl Shared {
+    pub(crate) fn state(&self) -> HandleState {
         *self.state.lock().unwrap()
     }
 
+    pub(crate) fn set_state(&self, new: HandleState) {
+        *self.state.lock().unwrap() = new;
+    }
+
+    /// Stores (or, given `None`, drops -- releasing it) the real sleep
+    /// inhibitor `power_monitor.rs` holds. `None` here has nothing to
+    /// do with `HandleState` -- it just means "no inhibitor held right
+    /// now" (mid-suspend, or the initial connection failed).
+    #[cfg(unix)]
+    pub(crate) fn set_inhibitor(&self, fd: Option<std::os::fd::OwnedFd>) {
+        *self.inhibitor.lock().unwrap() = fd;
+    }
+
     fn check_open(&self) -> Result<(), LibraryHandleError> {
-        match *self.state.lock().unwrap() {
+        match self.state() {
             HandleState::Open => Ok(()),
             HandleState::Detached => Err(LibraryHandleError::DeviceDetached),
             HandleState::Suspended => Err(LibraryHandleError::Suspended),
         }
     }
 
-    /// Port of §2 steps 1-4 for a file write: journal, write-temp /
-    /// fsync-temp / rename / fsync-parent-directory, mark committed.
-    /// `target` must be an absolute path (or at least caller-resolved
-    /// -- this doesn't re-root it under `library_path`, callers do
-    /// that).
-    pub fn write_atomic(&self, target: &Path, bytes: &[u8]) -> Result<(), LibraryHandleError> {
-        self.write_atomic_impl(target, bytes, None)
-    }
-
-    /// Port of §2 steps 1-4 for a rename, for callers that already
-    /// have the payload written to its final form elsewhere (e.g. a
-    /// format file copied by a caller, then atomically published into
-    /// place) -- POSIX `rename` is already atomic; this adds the
-    /// journal entry and the durability-relevant fsync of the parent
-    /// director(ies) upstream's discipline requires.
-    pub fn rename_atomic(&self, from: &Path, to: &Path) -> Result<(), LibraryHandleError> {
-        self.rename_atomic_impl(from, to, None)
-    }
-
-    /// `fail_after` is a test-only fault-injection hook (see module
-    /// doc) -- always `None` from the public [`LibraryHandle::write_atomic`];
-    /// tests call this directly with `Some(_)` to simulate a crash
-    /// right after a given step.
     fn write_atomic_impl(
         &self,
         target: &Path,
@@ -534,6 +597,215 @@ impl LibraryHandle {
         }
         file.sync_all()?;
         Ok(())
+    }
+
+    /// Port of §5 step 1's "releases exclusive file locks" and "moves
+    /// to `Suspended`", plus what it can of "flushes pending writes...
+    /// fsyncs parent directories" -- see `power_monitor.rs`'s module
+    /// doc for the WAL-checkpoint piece this can't do (this type has
+    /// no connection to the SQLite database at all).
+    pub(crate) fn prepare_for_suspend(&self) {
+        fsync_dir(Some(&self.journal_dir)).ok();
+        *self.lock_file.lock().unwrap() = None; // drop -> releases the OS lock
+        self.set_state(HandleState::Suspended);
+    }
+
+    /// Port of §5's resume step: revalidate the mount fingerprint
+    /// against what was recorded at `open()` time, reacquire the
+    /// writer lock, and re-run journal recovery (catches exactly the
+    /// corruption the airport-SSD incident produced) -- any failure
+    /// along the way means `Detached`, never a silent return to
+    /// `Open` on an unverified assumption.
+    pub(crate) fn resume(&self) {
+        // Re-read `library.id` from disk rather than trusting
+        // `self.library_id` -- the whole point is to notice if
+        // something at this path is no longer the library this handle
+        // was opened against (the airport-SSD scenario: same mount
+        // point, different or corrupted storage underneath).
+        let current_library_id = fs::read_to_string(self.handle_dir.join(LIBRARY_ID_FILE_NAME))
+            .map(|s| s.trim().to_string());
+        let matches = match current_library_id {
+            Ok(id) => match compute_fingerprint(&self.library_path, &id) {
+                Ok(fp) => fp == self.fingerprint,
+                Err(_) => false,
+            },
+            Err(_) => false,
+        };
+        if !matches {
+            self.set_state(HandleState::Detached);
+            return;
+        }
+
+        let lock_file = match OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&self.lock_path)
+        {
+            Ok(f) => f,
+            Err(_) => {
+                self.set_state(HandleState::Detached);
+                return;
+            }
+        };
+        match lock_file.try_lock() {
+            Ok(()) => {}
+            Err(_) => {
+                self.set_state(HandleState::Detached);
+                return;
+            }
+        }
+
+        match recover_journal(&self.journal_dir, &self.checkpoint_path, self.retention) {
+            Ok(head) => {
+                *self.journal_head.lock().unwrap() = head;
+                *self.lock_file.lock().unwrap() = Some(lock_file);
+                self.set_state(HandleState::Open);
+            }
+            Err(_) => {
+                self.set_state(HandleState::Detached);
+            }
+        }
+    }
+}
+
+/// The single gateway every durable write to a library folder is
+/// meant to go through. See this module's doc comment for exactly
+/// what's real so far.
+pub struct LibraryHandle {
+    shared: Arc<Shared>,
+}
+
+impl LibraryHandle {
+    /// Opens (creating `<library>/.calibre-oxide/` if needed),
+    /// acquires the exclusive writer lock, and runs journal recovery
+    /// (see module doc). Fails with [`LibraryHandleError::AlreadyLocked`]
+    /// if another `LibraryHandle` (in this or another process) already
+    /// holds the lock -- no blocking, no retry loop, matching §7's
+    /// "one writer per library" rule. Fails with
+    /// [`LibraryHandleError::Corruption`] if the journal's hash chain
+    /// doesn't verify.
+    pub fn open(library_path: &Path) -> Result<Self, LibraryHandleError> {
+        Self::open_impl(library_path, JOURNAL_PRUNE_RETENTION, true, true)
+    }
+
+    /// `retention`, `monitor_devices`, and `monitor_power` are
+    /// test-only hooks (see module doc's fault-injection pattern):
+    /// `retention` lets tests exercise pruning without writing
+    /// hundreds of entries; `monitor_devices`/`monitor_power` let most
+    /// tests skip spawning the real `device_monitor.rs`/
+    /// `power_monitor.rs` background threads (a real netlink socket
+    /// and a real D-Bus connection + sleep inhibitor per
+    /// `LibraryHandle::open` call adds real, if small, overhead across
+    /// dozens of tests that don't care about §4/§5 at all -- and, for
+    /// the sleep inhibitor specifically, holding one unnecessarily on
+    /// this crate's own CI/dev machines would actually interfere with
+    /// real system suspend, not just waste resources). Always
+    /// [`JOURNAL_PRUNE_RETENTION`]/`true`/`true` from the public
+    /// [`LibraryHandle::open`].
+    fn open_impl(
+        library_path: &Path,
+        retention: u64,
+        monitor_devices: bool,
+        monitor_power: bool,
+    ) -> Result<Self, LibraryHandleError> {
+        let handle_dir = library_path.join(LIBRARY_HANDLE_DIR_NAME);
+        fs::create_dir_all(&handle_dir)?;
+
+        let lock_path = handle_dir.join(WRITER_LOCK_FILE_NAME);
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)?;
+        match lock_file.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => return Err(LibraryHandleError::AlreadyLocked),
+            Err(fs::TryLockError::Error(e)) => return Err(LibraryHandleError::Io(e)),
+        }
+
+        let journal_dir = handle_dir.join(JOURNAL_DIR_NAME);
+        let checkpoint_path = handle_dir.join(JOURNAL_CHECKPOINT_FILE_NAME);
+        let head = recover_journal(&journal_dir, &checkpoint_path, retention)?;
+        let library_id = load_or_create_library_id(&handle_dir)?;
+        let fingerprint = compute_fingerprint(library_path, &library_id)?;
+
+        let shared = Arc::new(Shared {
+            library_path: library_path.to_path_buf(),
+            handle_dir: handle_dir.clone(),
+            tier: classify_storage_tier(library_path),
+            state: Mutex::new(HandleState::Open),
+            journal_dir,
+            checkpoint_path,
+            retention,
+            journal_head: Mutex::new(head),
+            lock_path,
+            lock_file: Mutex::new(Some(lock_file)),
+            fingerprint,
+            #[cfg(unix)]
+            inhibitor: Mutex::new(None),
+        });
+
+        #[cfg(unix)]
+        {
+            if monitor_devices {
+                if let Some(device_name) = resolve_device_name(library_path) {
+                    crate::device_monitor::spawn_device_monitor(
+                        device_name,
+                        Arc::downgrade(&shared),
+                    );
+                }
+            }
+            if monitor_power {
+                crate::power_monitor::spawn_power_monitor(Arc::downgrade(&shared));
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = (monitor_devices, monitor_power);
+
+        Ok(LibraryHandle { shared })
+    }
+
+    pub fn library_path(&self) -> &Path {
+        &self.shared.library_path
+    }
+
+    pub fn tier(&self) -> StorageTier {
+        self.shared.tier
+    }
+
+    pub fn state(&self) -> HandleState {
+        self.shared.state()
+    }
+
+    /// Port of §2 steps 1-4 for a file write: journal, write-temp /
+    /// fsync-temp / rename / fsync-parent-directory, mark committed.
+    /// `target` must be an absolute path (or at least caller-resolved
+    /// -- this doesn't re-root it under `library_path`, callers do
+    /// that).
+    pub fn write_atomic(&self, target: &Path, bytes: &[u8]) -> Result<(), LibraryHandleError> {
+        self.write_atomic_impl(target, bytes, None)
+    }
+
+    /// Port of §2 steps 1-4 for a rename, for callers that already
+    /// have the payload written to its final form elsewhere (e.g. a
+    /// format file copied by a caller, then atomically published into
+    /// place) -- POSIX `rename` is already atomic; this adds the
+    /// journal entry and the durability-relevant fsync of the parent
+    /// director(ies) upstream's discipline requires.
+    pub fn rename_atomic(&self, from: &Path, to: &Path) -> Result<(), LibraryHandleError> {
+        self.shared.rename_atomic_impl(from, to, None)
+    }
+
+    /// `fail_after` is a test-only fault-injection hook (see module
+    /// doc) -- always `None` from the public [`LibraryHandle::write_atomic`];
+    /// tests call this directly with `Some(_)` to simulate a crash
+    /// right after a given step.
+    fn write_atomic_impl(
+        &self,
+        target: &Path,
+        bytes: &[u8],
+        fail_after: Option<FailPoint>,
+    ) -> Result<(), LibraryHandleError> {
+        self.shared.write_atomic_impl(target, bytes, fail_after)
     }
 }
 
@@ -860,6 +1132,78 @@ fn resolve_device_name(_path: &Path) -> Option<String> {
     None
 }
 
+/// Port of §5's resume-time mount fingerprint. Real on Unix: `st_dev`
+/// via `stat`, plus the real filesystem UUID resolved by scanning
+/// `/dev/disk/by-uuid` (a directory of symlinks udev maintains,
+/// readable without root -- verified live on this machine before
+/// relying on it) for the entry pointing at the same device
+/// [`resolve_device_name`] finds. `fs_uuid` is `None`, not an error,
+/// when the backing filesystem has no UUID there (`tmpfs`/`overlay`/
+/// non-udev systems) -- the device id and `library_id` alone are
+/// still a real, if slightly weaker, signal in that case.
+#[cfg(unix)]
+fn compute_fingerprint(library_path: &Path, library_id: &str) -> io::Result<MountFingerprint> {
+    use std::os::unix::fs::MetadataExt;
+    let device_id = fs::metadata(library_path)?.dev();
+    let fs_uuid = resolve_device_name(library_path).and_then(|name| fs_uuid_for_device(&name));
+    Ok(MountFingerprint {
+        device_id,
+        fs_uuid,
+        library_id: library_id.to_string(),
+    })
+}
+
+#[cfg(windows)]
+fn compute_fingerprint(_library_path: &Path, library_id: &str) -> io::Result<MountFingerprint> {
+    // No `st_dev`/`by-uuid` equivalent wired for Windows -- see this
+    // module's other Windows gaps. `device_id: 0`/`fs_uuid: None` on
+    // every call means resume-time revalidation always "matches" on
+    // Windows today (it's comparing two identically-degenerate
+    // values), which is honestly weaker than doing nothing loudly --
+    // disclosed in `power_monitor.rs`'s module doc, and moot in
+    // practice today since `power_monitor.rs` itself is `#[cfg(unix)]`
+    // only, so nothing calls this to revalidate a real suspend on
+    // Windows yet.
+    Ok(MountFingerprint {
+        device_id: 0,
+        fs_uuid: None,
+        library_id: library_id.to_string(),
+    })
+}
+
+/// Scans `/dev/disk/by-uuid` for the symlink pointing at `device_name`
+/// (e.g. `"vda2"`) and returns its filename (the UUID itself). `None`
+/// if the directory doesn't exist (no udev, or a very minimal system)
+/// or no entry matches.
+#[cfg(unix)]
+fn fs_uuid_for_device(device_name: &str) -> Option<String> {
+    for entry in fs::read_dir("/dev/disk/by-uuid").ok()?.flatten() {
+        let target = fs::read_link(entry.path()).ok()?;
+        if target.file_name().and_then(|f| f.to_str()) == Some(device_name) {
+            return entry.file_name().to_str().map(|s| s.to_string());
+        }
+    }
+    None
+}
+
+/// This library's own persisted identity, per §5's mount-fingerprint
+/// contract -- a plain UUID, generated once and read back verbatim
+/// afterward. Written directly (not through the journal -- this is
+/// the handle's own bookkeeping, not library content, same reasoning
+/// as `writer.lock`/`journal_checkpoint`).
+fn load_or_create_library_id(handle_dir: &Path) -> io::Result<String> {
+    let path = handle_dir.join(LIBRARY_ID_FILE_NAME);
+    match fs::read_to_string(&path) {
+        Ok(s) => Ok(s.trim().to_string()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let id = Uuid::new_v4().to_string();
+            fs::write(&path, &id)?;
+            Ok(id)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(windows)]
 fn classify_storage_tier(_path: &Path) -> StorageTier {
     // Real classification needs `GetDriveTypeW`, which this port
@@ -971,6 +1315,19 @@ fn base_block_device(name: &str) -> String {
     }
 }
 
+/// Test-only: a real [`Shared`] backed by a real (caller-supplied,
+/// typically a tempdir) library directory, with both background
+/// monitors off -- lets `device_monitor.rs`/`power_monitor.rs`'s own
+/// tests exercise their event-handling logic against a real `Shared`
+/// (real journal/lock-file/fingerprint plumbing) without needing a
+/// live device or a real system suspend to drive it.
+#[cfg(test)]
+pub(crate) fn shared_for_test(dir: &Path) -> Arc<Shared> {
+    LibraryHandle::open_impl(dir, JOURNAL_PRUNE_RETENTION, false, false)
+        .unwrap()
+        .shared
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -978,28 +1335,34 @@ mod tests {
 
     #[test]
     fn open_creates_the_handle_dir_and_acquires_the_lock() {
+        let _flock_test_guard = flock_test_guard();
         let dir = tempdir().unwrap();
-        let handle = LibraryHandle::open(dir.path()).unwrap();
+        let handle =
+            LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false).unwrap();
         assert!(dir.path().join(".calibre-oxide").is_dir());
         assert_eq!(handle.state(), HandleState::Open);
     }
 
     #[test]
     fn a_second_open_on_the_same_library_fails_while_the_first_is_held() {
+        let _flock_test_guard = flock_test_guard();
         let dir = tempdir().unwrap();
-        let first = LibraryHandle::open(dir.path()).unwrap();
-        let second = LibraryHandle::open(dir.path());
+        let first =
+            LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false).unwrap();
+        let second = LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false);
         assert!(matches!(second, Err(LibraryHandleError::AlreadyLocked)));
         drop(first);
         // Releases automatically once the first handle (and its lock
         // file descriptor) drops.
-        assert!(LibraryHandle::open(dir.path()).is_ok());
+        assert!(LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false).is_ok());
     }
 
     #[test]
     fn write_atomic_persists_the_bytes_and_overwrites_cleanly() {
+        let _flock_test_guard = flock_test_guard();
         let dir = tempdir().unwrap();
-        let handle = LibraryHandle::open(dir.path()).unwrap();
+        let handle =
+            LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false).unwrap();
         let target = dir.path().join("book").join("metadata.opf");
 
         handle.write_atomic(&target, b"first version").unwrap();
@@ -1021,8 +1384,10 @@ mod tests {
 
     #[test]
     fn rename_atomic_moves_the_file() {
+        let _flock_test_guard = flock_test_guard();
         let dir = tempdir().unwrap();
-        let handle = LibraryHandle::open(dir.path()).unwrap();
+        let handle =
+            LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false).unwrap();
         let from = dir.path().join("a.txt");
         let to = dir.path().join("b.txt");
         fs::write(&from, b"data").unwrap();
@@ -1034,8 +1399,10 @@ mod tests {
 
     #[test]
     fn tier_classification_returns_a_local_tier_for_a_tempdir() {
+        let _flock_test_guard = flock_test_guard();
         let dir = tempdir().unwrap();
-        let handle = LibraryHandle::open(dir.path()).unwrap();
+        let handle =
+            LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false).unwrap();
         assert_ne!(handle.tier(), StorageTier::Network);
     }
 
@@ -1056,11 +1423,22 @@ mod tests {
 
     #[test]
     fn open_via_the_public_api_spawns_a_device_monitor_without_affecting_the_handle() {
+        let _flock_test_guard = flock_test_guard();
         // `LibraryHandle::open` (not `open_impl`) always monitors --
-        // this is the one test in this file proving that real, public
+        // this is the ONE test in this file that goes through the
+        // real public API with both monitors on, proving that real
         // code path doesn't panic, error, or otherwise disturb a
-        // normal open (the monitor thread itself is exercised more
-        // directly by `device_monitor.rs`'s own tests).
+        // normal open. Every other test in this file uses
+        // `open_impl(..., monitor_power: false)` deliberately: unlike
+        // `device_monitor.rs`'s netlink socket (no external side
+        // effect), `power_monitor.rs` takes a *real* system-wide
+        // sleep inhibitor lock -- acquiring and releasing ~20 of those
+        // across this file's other tests (which don't care about §5
+        // at all) would be real, unnecessary interference with this
+        // machine's actual suspend behavior while `cargo test` runs,
+        // not just wasted resources. The monitor threads themselves
+        // are exercised directly by `device_monitor.rs`'s and
+        // `power_monitor.rs`'s own dedicated tests instead.
         let dir = tempdir().unwrap();
         let handle = LibraryHandle::open(dir.path()).unwrap();
         assert_eq!(handle.state(), HandleState::Open);
@@ -1076,8 +1454,10 @@ mod tests {
 
     #[test]
     fn a_crash_right_after_writing_the_temp_file_leaves_the_original_untouched() {
+        let _flock_test_guard = flock_test_guard();
         let dir = tempdir().unwrap();
-        let handle = LibraryHandle::open(dir.path()).unwrap();
+        let handle =
+            LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false).unwrap();
         let target = dir.path().join("metadata.opf");
         fs::write(&target, b"original").unwrap();
 
@@ -1088,8 +1468,10 @@ mod tests {
 
     #[test]
     fn a_crash_right_after_fsyncing_the_temp_file_leaves_the_original_untouched() {
+        let _flock_test_guard = flock_test_guard();
         let dir = tempdir().unwrap();
-        let handle = LibraryHandle::open(dir.path()).unwrap();
+        let handle =
+            LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false).unwrap();
         let target = dir.path().join("metadata.opf");
         fs::write(&target, b"original").unwrap();
 
@@ -1100,13 +1482,15 @@ mod tests {
 
     #[test]
     fn a_crash_right_after_the_rename_has_already_committed_the_new_content() {
+        let _flock_test_guard = flock_test_guard();
         // Once `rename` has happened, the write is durable regardless
         // of whether subsequent steps complete -- this is exactly why
         // write-temp-then-rename is the right shape: the commit point
         // is a single atomic filesystem operation, not a multi-step
         // window.
         let dir = tempdir().unwrap();
-        let handle = LibraryHandle::open(dir.path()).unwrap();
+        let handle =
+            LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false).unwrap();
         let target = dir.path().join("metadata.opf");
         fs::write(&target, b"original").unwrap();
 
@@ -1121,8 +1505,10 @@ mod tests {
 
     #[test]
     fn write_atomic_journals_an_entry_and_marks_it_committed() {
+        let _flock_test_guard = flock_test_guard();
         let dir = tempdir().unwrap();
-        let handle = LibraryHandle::open(dir.path()).unwrap();
+        let handle =
+            LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false).unwrap();
         let target = dir.path().join("metadata.opf");
 
         handle.write_atomic(&target, b"content").unwrap();
@@ -1162,8 +1548,10 @@ mod tests {
 
     #[test]
     fn sequential_writes_chain_correctly() {
+        let _flock_test_guard = flock_test_guard();
         let dir = tempdir().unwrap();
-        let handle = LibraryHandle::open(dir.path()).unwrap();
+        let handle =
+            LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false).unwrap();
         handle
             .write_atomic(&dir.path().join("a.opf"), b"a")
             .unwrap();
@@ -1191,9 +1579,11 @@ mod tests {
 
     #[test]
     fn reopening_after_a_crash_before_rename_cleans_up_the_orphaned_temp_file() {
+        let _flock_test_guard = flock_test_guard();
         let dir = tempdir().unwrap();
         {
-            let handle = LibraryHandle::open(dir.path()).unwrap();
+            let handle =
+                LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false).unwrap();
             let target = dir.path().join("metadata.opf");
             let err = handle.write_atomic_impl(&target, b"new", Some(FailPoint::WriteTemp));
             assert!(err.is_err());
@@ -1207,7 +1597,7 @@ mod tests {
         }
         // Simulates the process restarting: a fresh `open()` call runs
         // recovery.
-        let handle = LibraryHandle::open(dir.path()).unwrap();
+        let handle = reopen_for_test(dir.path(), JOURNAL_PRUNE_RETENTION);
         let leftovers: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
@@ -1223,10 +1613,12 @@ mod tests {
 
     #[test]
     fn reopening_after_a_crash_right_after_rename_finalizes_the_commit_marker() {
+        let _flock_test_guard = flock_test_guard();
         let dir = tempdir().unwrap();
         let target = dir.path().join("metadata.opf");
         {
-            let handle = LibraryHandle::open(dir.path()).unwrap();
+            let handle =
+                LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false).unwrap();
             let err =
                 handle.write_atomic_impl(&target, b"new content", Some(FailPoint::BeforeCommit));
             assert!(err.is_err());
@@ -1235,7 +1627,7 @@ mod tests {
             assert_eq!(fs::read(&target).unwrap(), b"new content");
         }
 
-        let handle = LibraryHandle::open(dir.path()).unwrap();
+        let handle = reopen_for_test(dir.path(), JOURNAL_PRUNE_RETENTION);
         assert_eq!(fs::read(&target).unwrap(), b"new content");
 
         let journal_dir = dir.path().join(".calibre-oxide").join("journal");
@@ -1252,25 +1644,28 @@ mod tests {
 
         // Reopening again is stable -- no further changes, no error.
         drop(handle);
-        let handle2 = LibraryHandle::open(dir.path()).unwrap();
+        let handle2 = reopen_for_test(dir.path(), JOURNAL_PRUNE_RETENTION);
         assert_eq!(fs::read(&target).unwrap(), b"new content");
         drop(handle2);
     }
 
     #[test]
     fn reopening_after_a_crash_before_the_journal_write_even_finished_has_nothing_to_recover() {
+        let _flock_test_guard = flock_test_guard();
         // The very first fault-injection point: nothing was ever
         // journaled successfully, so there's no entry to recover at
         // all. (Simulated here by never calling write_atomic in the
         // first place -- the interesting assertion is just that
         // `open()` on a library with an empty journal doesn't error.)
         let dir = tempdir().unwrap();
-        let handle = LibraryHandle::open(dir.path()).unwrap();
+        let handle =
+            LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false).unwrap();
         assert_eq!(handle.state(), HandleState::Open);
     }
 
     #[test]
     fn recovery_detects_a_tampered_journal_entry_as_corruption() {
+        let _flock_test_guard = flock_test_guard();
         let dir = tempdir().unwrap();
         let journal_dir = dir.path().join(".calibre-oxide").join("journal");
         fs::create_dir_all(&journal_dir).unwrap();
@@ -1294,12 +1689,13 @@ mod tests {
         )
         .unwrap();
 
-        let result = LibraryHandle::open(dir.path());
+        let result = LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false);
         assert!(matches!(result, Err(LibraryHandleError::Corruption(_))));
     }
 
     #[test]
     fn recovery_detects_a_broken_chain_as_corruption() {
+        let _flock_test_guard = flock_test_guard();
         let dir = tempdir().unwrap();
         let journal_dir = dir.path().join(".calibre-oxide").join("journal");
         fs::create_dir_all(&journal_dir).unwrap();
@@ -1339,7 +1735,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = LibraryHandle::open(dir.path());
+        let result = LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false);
         assert!(matches!(result, Err(LibraryHandleError::Corruption(_))));
     }
 
@@ -1361,16 +1757,17 @@ mod tests {
 
     #[test]
     fn reopening_under_the_retention_limit_prunes_nothing() {
+        let _flock_test_guard = flock_test_guard();
         let dir = tempdir().unwrap();
         {
-            let handle = LibraryHandle::open_impl(dir.path(), 3, false).unwrap();
+            let handle = LibraryHandle::open_impl(dir.path(), 3, false, false).unwrap();
             for i in 0..3 {
                 handle
                     .write_atomic(&dir.path().join(format!("{i}.opf")), b"x")
                     .unwrap();
             }
         }
-        LibraryHandle::open_impl(dir.path(), 3, false).unwrap();
+        reopen_for_test(dir.path(), 3);
         assert_eq!(op_file_count(&journal_dir_of(dir.path())), 3);
         assert!(!dir
             .path()
@@ -1381,9 +1778,10 @@ mod tests {
 
     #[test]
     fn reopening_over_the_retention_limit_prunes_the_oldest_entries() {
+        let _flock_test_guard = flock_test_guard();
         let dir = tempdir().unwrap();
         {
-            let handle = LibraryHandle::open_impl(dir.path(), 3, false).unwrap();
+            let handle = LibraryHandle::open_impl(dir.path(), 3, false, false).unwrap();
             for i in 0..5 {
                 handle
                     .write_atomic(&dir.path().join(format!("{i}.opf")), b"x")
@@ -1391,7 +1789,7 @@ mod tests {
             }
         }
         // Recovery on this open settles all 5, then prunes down to 3.
-        LibraryHandle::open_impl(dir.path(), 3, false).unwrap();
+        reopen_for_test(dir.path(), 3);
         let journal_dir = journal_dir_of(dir.path());
         assert_eq!(op_file_count(&journal_dir), 3);
 
@@ -1416,9 +1814,10 @@ mod tests {
 
     #[test]
     fn writes_after_pruning_still_chain_correctly_from_the_checkpoint() {
+        let _flock_test_guard = flock_test_guard();
         let dir = tempdir().unwrap();
         {
-            let handle = LibraryHandle::open_impl(dir.path(), 2, false).unwrap();
+            let handle = LibraryHandle::open_impl(dir.path(), 2, false, false).unwrap();
             for i in 0..4 {
                 handle
                     .write_atomic(&dir.path().join(format!("{i}.opf")), b"x")
@@ -1426,7 +1825,7 @@ mod tests {
             }
         }
         // This open prunes seq 0-1 away, keeping 2-3.
-        let handle = LibraryHandle::open_impl(dir.path(), 2, false).unwrap();
+        let handle = reopen_for_test(dir.path(), 2);
         handle
             .write_atomic(&dir.path().join("new.opf"), b"y")
             .unwrap();
@@ -1435,20 +1834,21 @@ mod tests {
         // A fresh open must still verify cleanly -- the new entry's
         // prev_head chains onto the last pre-prune entry's hash, which
         // the checkpoint (not a deleted file) now supplies.
-        let handle = LibraryHandle::open_impl(dir.path(), 2, false).unwrap();
+        let handle = reopen_for_test(dir.path(), 2);
         assert_eq!(handle.state(), HandleState::Open);
         assert_eq!(fs::read(dir.path().join("new.opf")).unwrap(), b"y");
     }
 
     #[test]
     fn an_interrupted_prune_self_heals_on_the_next_open() {
+        let _flock_test_guard = flock_test_guard();
         // Simulates a crash between the checkpoint write and the
         // deletion pass: write a checkpoint that's already past some
         // still-present entries, and confirm the next open both
         // succeeds and finishes deleting them.
         let dir = tempdir().unwrap();
         {
-            let handle = LibraryHandle::open_impl(dir.path(), 100, false).unwrap();
+            let handle = LibraryHandle::open_impl(dir.path(), 100, false, false).unwrap();
             for i in 0..3 {
                 handle
                     .write_atomic(&dir.path().join(format!("{i}.opf")), b"x")
@@ -1482,7 +1882,7 @@ mod tests {
         )
         .unwrap();
 
-        let handle = LibraryHandle::open_impl(dir.path(), 100, false).unwrap();
+        let handle = reopen_for_test(dir.path(), 100);
         assert_eq!(handle.state(), HandleState::Open);
         // The stale, already-superseded entry 0 and 1 files are
         // cleaned up by the recovery scan itself.
