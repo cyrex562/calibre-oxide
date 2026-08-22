@@ -1,7 +1,6 @@
 use crate::cache::Cache;
 use anyhow::{Context, Result};
 use calibre_ebooks::metadata::MetaInformation;
-use std::fs;
 use std::sync::{Arc, Mutex};
 
 /// Backs up the metadata for a book to an OPF file in its directory.
@@ -57,13 +56,15 @@ pub fn backup_metadata(cache: &Arc<Mutex<Cache>>, book_id: i32) -> Result<()> {
     // Generate XML
     let xml = meta.to_xml();
 
-    // Write to file
+    // Write to file. Port of issue #93's crate-wide write-path
+    // retrofit: real, journaled, crash-safe write through
+    // `LibraryHandle` instead of a raw `fs::write` (`write_atomic`
+    // creates the parent book directory itself).
     let book_dir = backend.library_path.join(path_rel);
-    if !book_dir.exists() {
-        fs::create_dir_all(&book_dir)?;
-    }
     let opf_path = book_dir.join("metadata.opf");
-    fs::write(&opf_path, xml)?;
+    backend
+        .write_handle()?
+        .write_atomic(&opf_path, xml.as_bytes())?;
 
     // Port of docs/FAULT_TOLERANCE.md §8: "sidecar files: same rule"
     // as book-format files.

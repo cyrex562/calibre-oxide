@@ -1,6 +1,5 @@
 use crate::cache::Cache;
 use anyhow::{Context, Result};
-use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -44,12 +43,15 @@ pub fn set_cover(cache: &Arc<Mutex<Cache>>, book_id: i32, data: &[u8]) -> Result
 
     let path = cover_path(cache, book_id)?;
 
-    // Ensure parent directory exists
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    fs::write(&path, data)?;
+    // Port of issue #93's crate-wide write-path retrofit: real,
+    // journaled, crash-safe write through `LibraryHandle` instead of
+    // a raw `fs::write` (`write_atomic` creates the parent directory
+    // itself, so no separate `create_dir_all` is needed here anymore).
+    let handle = {
+        let guard = cache.lock().unwrap();
+        guard.backend.write_handle()?
+    };
+    handle.write_atomic(&path, data)?;
 
     {
         let guard = cache.lock().unwrap();

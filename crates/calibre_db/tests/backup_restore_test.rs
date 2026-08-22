@@ -27,6 +27,17 @@ fn test_backup_restore_roundtrip() {
     let opf_content = std::fs::read_to_string(&opf_path).unwrap();
     assert!(opf_content.contains("<dc:title>Original Title</dc:title>"));
 
+    // backup_metadata now goes through the real LibraryHandle (issue
+    // #93's crate-wide write-path retrofit), not a raw `fs::write` --
+    // prove it by checking a real journal entry landed.
+    let journal_dir = dir.path().join(".calibre-oxide").join("journal");
+    let op_files: Vec<_> = std::fs::read_dir(&journal_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("op"))
+        .collect();
+    assert_eq!(op_files.len(), 1, "expected a real journaled write");
+
     // backup_metadata also records a real BLAKE3 checksum for the
     // sidecar OPF (issue #93 §8's "sidecar files: same rule").
     {

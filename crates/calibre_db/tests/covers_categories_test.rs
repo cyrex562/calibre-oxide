@@ -70,6 +70,17 @@ fn test_covers_and_categories() {
     let read_data = fs::read(&cover_path).unwrap();
     assert_eq!(read_data, fake_image_data);
 
+    // set_cover now goes through the real LibraryHandle (issue #93's
+    // crate-wide write-path retrofit), not a raw `fs::write` -- prove
+    // it by checking a real journal entry landed.
+    let journal_dir = dir.path().join(".calibre-oxide").join("journal");
+    let op_files: Vec<_> = fs::read_dir(&journal_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("op"))
+        .collect();
+    assert_eq!(op_files.len(), 1, "expected a real journaled write");
+
     // set_cover also records a real BLAKE3 checksum (issue #93 §8) --
     // verifying against the file as it stands now must match, and a
     // direct on-disk tamper must be caught.

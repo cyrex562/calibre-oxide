@@ -194,12 +194,32 @@
 //! - Network-storage two-phase writes (§6) -- [`StorageTier::Network`]
 //!   is detected and stored, but nothing yet changes behavior based on
 //!   it.
-//! - **The crate-wide retrofit.** Every existing `fs::write`/
-//!   `fs::rename`/`fs::copy` call against a library path elsewhere in
-//!   this crate (`cache.rs`, `restore.rs`, `notes/connection.rs`,
-//!   `covers.rs`, `adding.rs`, and more) still calls `std::fs`
-//!   directly, not through this handle. Retrofitting all of them is
-//!   its own large, separately-reviewable change.
+//! - **The crate-wide retrofit -- started, far from complete.**
+//!   [`Backend::write_handle`](crate::backend::Backend::write_handle)
+//!   is the real entry point: lazily opens (and caches, shared across
+//!   every clone of that `Backend`) a `LibraryHandle` the first time
+//!   something actually needs to write, deliberately *not* on every
+//!   `Backend::new`/`Cache::new` -- opening a `Backend`/`Cache` must
+//!   stay safe to do many times over the same library (read-only CLI
+//!   commands, tests constructing more than one `Backend`/`Cache`
+//!   over one directory), so the real exclusive §7 lock is acquired
+//!   only when a write is actually about to happen. `covers::set_cover`
+//!   and `backup::backup_metadata` are converted so far -- both were
+//!   a single `fs::write` of a byte buffer already in hand, the
+//!   simplest possible shape. Everything else (`cache.rs`'s
+//!   `add_format`/`remove_format`/`delete_book`/`rename_book_files`,
+//!   `restore.rs`, `notes/connection.rs`'s resource storage) is still
+//!   raw `std::fs`, and several of those sites need real design work
+//!   this handle doesn't have yet before they *can* convert: there is
+//!   no delete primitive at all (`remove_file`/`remove_dir_all` have
+//!   no `LibraryHandle` equivalent -- the journal's
+//!   `OperationDescriptor` only has `WriteFile`/`RenameFile`), and no
+//!   way to atomically publish a copied file without reading the
+//!   whole source into memory first (`write_atomic` only takes
+//!   `&[u8]`; the documented pattern for large files is
+//!   copy-to-temp-then-`rename_atomic`, but there's no helper for the
+//!   temp-copy-and-fsync part). Each remaining module is its own
+//!   separately-reviewable follow-up.
 //! - Windows implementations of tier classification and directory
 //!   durability (see above) -- this workspace has no way to compile-
 //!   check or test Windows-specific code, so rather than ship
