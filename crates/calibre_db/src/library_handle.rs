@@ -222,10 +222,24 @@
 //!   right next to the now-converted stale-backup removal) is
 //!   deliberately left as a raw `fs::rename` -- it's the one flagged
 //!   below as needing its own design pass, not a blind swap.
-//!   `cache.rs`'s `rename_book_files` (a directory rename) and
-//!   `notes/connection.rs`'s resource storage remain raw `std::fs` and
-//!   still need their own design work. Each remaining module is its
-//!   own separately-reviewable follow-up.
+//!   `cache.rs`'s `rename_book_files` is converted too: every
+//!   individual directory/file rename and the empty-old-directory
+//!   cleanup go through [`LibraryHandle::rename_atomic`]/
+//!   [`LibraryHandle::remove_atomic`], but the *sequence* as a whole
+//!   (directory move, then per-file renames, then a DB `path` update)
+//!   is still not one atomic transaction -- this crate's journal has
+//!   no concept of a multi-operation batch spanning several
+//!   `LibraryHandle` calls, only single-operation entries, so a crash
+//!   between two of those steps can still leave a book in an
+//!   inconsistent intermediate state, exactly the same window that
+//!   existed before this conversion. What changed is that every
+//!   individual step is now itself crash-safe and recovery-verified,
+//!   not that the whole move became transactional; see
+//!   `Cache::rename_book_files`'s own doc comment for the same
+//!   disclosure at the call site. `notes/connection.rs`'s resource
+//!   storage remains raw `std::fs` and still needs its own design
+//!   work. Each remaining module is its own separately-reviewable
+//!   follow-up.
 //! - Windows implementations of tier classification and directory
 //!   durability (see above) -- this workspace has no way to compile-
 //!   check or test Windows-specific code, so rather than ship
