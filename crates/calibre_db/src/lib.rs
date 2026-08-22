@@ -23,6 +23,8 @@ pub mod library_handle;
 pub mod listeners;
 pub mod locking;
 pub mod notes;
+#[cfg(unix)]
+mod power_monitor;
 pub mod restore;
 pub mod schema_upgrades;
 pub mod search;
