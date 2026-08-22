@@ -206,20 +206,20 @@
 //!   only when a write is actually about to happen. `covers::set_cover`
 //!   and `backup::backup_metadata` are converted so far -- both were
 //!   a single `fs::write` of a byte buffer already in hand, the
-//!   simplest possible shape. Everything else (`cache.rs`'s
-//!   `add_format`/`remove_format`/`delete_book`/`rename_book_files`,
-//!   `restore.rs`, `notes/connection.rs`'s resource storage) is still
-//!   raw `std::fs`, and several of those sites need real design work
-//!   this handle doesn't have yet before they *can* convert: there is
-//!   no delete primitive at all (`remove_file`/`remove_dir_all` have
-//!   no `LibraryHandle` equivalent -- the journal's
-//!   `OperationDescriptor` only has `WriteFile`/`RenameFile`), and no
-//!   way to atomically publish a copied file without reading the
-//!   whole source into memory first (`write_atomic` only takes
-//!   `&[u8]`; the documented pattern for large files is
-//!   copy-to-temp-then-`rename_atomic`, but there's no helper for the
-//!   temp-copy-and-fsync part). Each remaining module is its own
-//!   separately-reviewable follow-up.
+//!   simplest possible shape. [`LibraryHandle::remove_atomic`] is a
+//!   real, journaled, recovery-aware delete primitive (file or
+//!   directory, recursively) -- but nothing in this crate calls it
+//!   yet; `cache.rs`'s `remove_format`/`delete_book` and
+//!   `restore.rs`'s stale-backup cleanup are its obvious first callers
+//!   whenever this gets picked back up. `cache.rs`'s `add_format`/
+//!   `rename_book_files` and `notes/connection.rs`'s resource storage
+//!   remain raw `std::fs` and still need real design work this handle
+//!   doesn't have: there is still no way to atomically publish a
+//!   copied file without reading the whole source into memory first
+//!   (`write_atomic` only takes `&[u8]`; the documented pattern for
+//!   large files is copy-to-temp-then-`rename_atomic`, but there's no
+//!   helper for the temp-copy-and-fsync part). Each remaining module
+//!   is its own separately-reviewable follow-up.
 //! - Windows implementations of tier classification and directory
 //!   durability (see above) -- this workspace has no way to compile-
 //!   check or test Windows-specific code, so rather than ship
@@ -360,6 +360,16 @@ enum OperationDescriptor {
     RenameFile {
         from: PathBuf,
         to: PathBuf,
+    },
+    /// A file *or* directory (recursively) to remove. Unlike
+    /// `WriteFile`/`RenameFile`, this deliberately carries no content
+    /// hash -- there's nothing left to verify once `target` is gone,
+    /// and deletion is naturally idempotent (retrying a delete that
+    /// already happened is always safe), so recovery doesn't need one
+    /// to decide what to do. See [`Shared::remove_atomic_impl`] and
+    /// `recover_one`'s `DeleteFile` arm.
+    DeleteFile {
+        target: PathBuf,
     },
 }
 
@@ -571,6 +581,53 @@ impl Shared {
         if to.parent() != from.parent() {
             fsync_dir(to.parent())?;
         }
+        if fail_after == Some(FailPoint::BeforeCommit) {
+            return Err(simulated_crash());
+        }
+
+        self.journal_commit(uuid)?;
+        Ok(())
+    }
+
+    /// Real delete primitive (issue #93's crate-wide write-path
+    /// retrofit): journal, remove, fsync-parent-directory, mark
+    /// committed -- the same §2 discipline `write_atomic`/
+    /// `rename_atomic` use, adapted for an operation with no "new
+    /// content" to write-temp-then-publish. `target` may be a file or
+    /// a directory (removed recursively); already-absent is treated
+    /// as success (deletion is idempotent -- a caller retrying after
+    /// an interrupted delete, or a delete racing recovery's own
+    /// idempotent completion of the same entry, must not error).
+    ///
+    /// Unlike `write_atomic`, a directory removal is **not** a single
+    /// atomic syscall (`remove_dir_all` is iterative) -- a crash
+    /// partway through can leave a partially-emptied directory on
+    /// disk. That partial state is never *unsafe* to observe (there's
+    /// no "wrong content" a partially-deleted directory could present,
+    /// only incomplete cleanup), which is exactly what makes recovery
+    /// simply finishing the removal the correct fix rather than
+    /// needing a rename-to-trash-first scheme.
+    fn remove_atomic_impl(
+        &self,
+        target: &Path,
+        fail_after: Option<FailPoint>,
+    ) -> Result<(), LibraryHandleError> {
+        self.check_open()?;
+        let uuid = Uuid::new_v4();
+        let op = OperationDescriptor::DeleteFile {
+            target: target.to_path_buf(),
+        };
+        self.journal_write(uuid, op)?;
+        if fail_after == Some(FailPoint::JournalWrite) {
+            return Err(simulated_crash());
+        }
+
+        remove_path(target)?;
+        if fail_after == Some(FailPoint::Removed) {
+            return Err(simulated_crash());
+        }
+
+        fsync_dir(target.parent())?;
         if fail_after == Some(FailPoint::BeforeCommit) {
             return Err(simulated_crash());
         }
@@ -815,6 +872,16 @@ impl LibraryHandle {
         self.shared.rename_atomic_impl(from, to, None)
     }
 
+    /// Real delete primitive: journal, remove (file or directory,
+    /// recursively), fsync-parent-directory, mark committed. Already-
+    /// absent is success, not an error. See
+    /// [`Shared::remove_atomic_impl`]'s doc for the full design,
+    /// including why a non-atomic directory removal is still safe
+    /// under this discipline.
+    pub fn remove_atomic(&self, target: &Path) -> Result<(), LibraryHandleError> {
+        self.remove_atomic_impl(target, None)
+    }
+
     /// `fail_after` is a test-only fault-injection hook (see module
     /// doc) -- always `None` from the public [`LibraryHandle::write_atomic`];
     /// tests call this directly with `Some(_)` to simulate a crash
@@ -826,6 +893,16 @@ impl LibraryHandle {
         fail_after: Option<FailPoint>,
     ) -> Result<(), LibraryHandleError> {
         self.shared.write_atomic_impl(target, bytes, fail_after)
+    }
+
+    /// Test-only fault-injection wrapper for [`LibraryHandle::remove_atomic`],
+    /// same shape as [`LibraryHandle::write_atomic_impl`].
+    fn remove_atomic_impl(
+        &self,
+        target: &Path,
+        fail_after: Option<FailPoint>,
+    ) -> Result<(), LibraryHandleError> {
+        self.shared.remove_atomic_impl(target, fail_after)
     }
 }
 
@@ -840,6 +917,9 @@ enum FailPoint {
     WriteTemp,
     FsyncTemp,
     Rename,
+    /// Right after `remove_atomic_impl`'s actual `remove_file`/
+    /// `remove_dir_all` call, before the directory fsync.
+    Removed,
     /// Right after the operation itself (and its directory fsync)
     /// fully completed, before the commit marker is written.
     BeforeCommit,
@@ -870,6 +950,21 @@ fn temp_path_for(target: &Path, uuid: Uuid) -> PathBuf {
     match target.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.join(tmp_name),
         _ => PathBuf::from(tmp_name),
+    }
+}
+
+/// Removes `target` (file or directory, recursively) if it exists;
+/// already-absent is success, not an error -- the shared idempotent
+/// core both [`Shared::remove_atomic_impl`] and `recover_one`'s
+/// `DeleteFile` arm use, so "delete" and "finish an interrupted
+/// delete" are the exact same code path, not two implementations that
+/// could drift.
+fn remove_path(target: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(target) {
+        Ok(meta) if meta.is_dir() => fs::remove_dir_all(target),
+        Ok(_) => fs::remove_file(target),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
     }
 }
 
@@ -1084,6 +1179,17 @@ fn recover_one(
             }
             // Else: the rename never happened (or `from` still
             // exists) -- nothing was touched, nothing to roll back.
+        }
+        OperationDescriptor::DeleteFile { target } => {
+            // Deletion is idempotent -- whether the crash happened
+            // before the removal even started, partway through a
+            // directory tree, or after it finished but before the
+            // commit marker, "finish removing `target` now" is always
+            // the correct recovery action (see `remove_atomic_impl`'s
+            // doc for why a partial directory removal is never unsafe
+            // to complete this way).
+            remove_path(target)?;
+            mark_committed(&committed_path)?;
         }
     }
     Ok(())
@@ -1757,6 +1863,194 @@ mod tests {
 
         let result = LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false);
         assert!(matches!(result, Err(LibraryHandleError::Corruption(_))));
+    }
+
+    // }}}
+
+    // --- delete primitive (issue #93 crate-wide write-path retrofit) {{{
+
+    #[test]
+    fn remove_atomic_deletes_a_file() {
+        let dir = tempdir().unwrap();
+        let _flock_test_guard = flock_test_guard();
+        let handle =
+            LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false).unwrap();
+        let target = dir.path().join("metadata.opf");
+        fs::write(&target, b"gone soon").unwrap();
+
+        handle.remove_atomic(&target).unwrap();
+
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn remove_atomic_deletes_a_directory_recursively() {
+        let dir = tempdir().unwrap();
+        let _flock_test_guard = flock_test_guard();
+        let handle =
+            LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false).unwrap();
+        let book_dir = dir.path().join("Author A").join("Some Book");
+        fs::create_dir_all(&book_dir).unwrap();
+        fs::write(book_dir.join("book.epub"), b"epub bytes").unwrap();
+        fs::write(book_dir.join("cover.jpg"), b"cover bytes").unwrap();
+
+        handle.remove_atomic(&book_dir).unwrap();
+
+        assert!(!book_dir.exists());
+    }
+
+    #[test]
+    fn remove_atomic_on_an_already_absent_target_is_a_no_op_success() {
+        let dir = tempdir().unwrap();
+        let _flock_test_guard = flock_test_guard();
+        let handle =
+            LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false).unwrap();
+        let target = dir.path().join("never-existed.opf");
+
+        // Deletion is idempotent -- a caller retrying after an
+        // interrupted delete (or racing recovery's own completion of
+        // the same entry) must not get an error.
+        handle.remove_atomic(&target).unwrap();
+        handle.remove_atomic(&target).unwrap();
+    }
+
+    #[test]
+    fn remove_atomic_journals_an_entry_and_marks_it_committed() {
+        let dir = tempdir().unwrap();
+        let _flock_test_guard = flock_test_guard();
+        let handle =
+            LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false).unwrap();
+        let target = dir.path().join("metadata.opf");
+        fs::write(&target, b"content").unwrap();
+
+        handle.remove_atomic(&target).unwrap();
+
+        let journal_dir = dir.path().join(".calibre-oxide").join("journal");
+        let op_files: Vec<_> = fs::read_dir(&journal_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("op"))
+            .collect();
+        assert_eq!(op_files.len(), 1);
+
+        let uuid = op_files[0]
+            .path()
+            .file_stem()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(journal_dir.join(format!("{uuid}.committed")).exists());
+
+        let entry: JournalEntry =
+            serde_json::from_slice(&fs::read(op_files[0].path()).unwrap()).unwrap();
+        match entry.op {
+            OperationDescriptor::DeleteFile { target: t } => assert_eq!(t, target),
+            _ => panic!("expected DeleteFile"),
+        }
+    }
+
+    #[test]
+    fn a_crash_right_after_the_journal_write_leaves_the_target_untouched() {
+        let dir = tempdir().unwrap();
+        let _flock_test_guard = flock_test_guard();
+        let handle =
+            LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false).unwrap();
+        let target = dir.path().join("metadata.opf");
+        fs::write(&target, b"still here").unwrap();
+
+        let err = handle.remove_atomic_impl(&target, Some(FailPoint::JournalWrite));
+        assert!(err.is_err());
+        assert!(target.exists());
+    }
+
+    #[test]
+    fn a_crash_right_after_removal_has_already_committed_the_delete() {
+        // Same shape as write_atomic's equivalent test: once the real
+        // removal syscall(s) have happened, the delete is durable
+        // regardless of whether the commit marker itself made it to
+        // disk -- recovery's job (proven below) is to just finish
+        // writing that marker, not redo anything.
+        let dir = tempdir().unwrap();
+        let _flock_test_guard = flock_test_guard();
+        let handle =
+            LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false).unwrap();
+        let target = dir.path().join("metadata.opf");
+        fs::write(&target, b"content").unwrap();
+
+        let err = handle.remove_atomic_impl(&target, Some(FailPoint::Removed));
+        assert!(err.is_err());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn reopening_after_a_crash_right_after_removal_finalizes_the_commit_marker() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("metadata.opf");
+        {
+            let _flock_test_guard = flock_test_guard();
+            let handle =
+                LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false).unwrap();
+            fs::write(&target, b"content").unwrap();
+            let err = handle.remove_atomic_impl(&target, Some(FailPoint::Removed));
+            assert!(err.is_err());
+            assert!(!target.exists());
+        }
+
+        let handle = reopen_for_test(dir.path(), JOURNAL_PRUNE_RETENTION);
+        assert!(!target.exists());
+
+        let journal_dir = dir.path().join(".calibre-oxide").join("journal");
+        let committed: Vec<_> = fs::read_dir(&journal_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("committed"))
+            .collect();
+        assert_eq!(
+            committed.len(),
+            1,
+            "recovery should finalize the missing commit marker"
+        );
+        drop(handle);
+    }
+
+    #[test]
+    fn reopening_after_a_crash_before_the_removal_ever_started_still_completes_it() {
+        // Hand-constructs the "journaled but the process died before
+        // touching the filesystem at all" case -- `remove_atomic_impl`
+        // can't be crashed *before* `remove_path` via a `FailPoint`
+        // (there's no step between the journal write and the removal
+        // itself to inject at), so this writes the same journal entry
+        // `journal_write` would have, directly.
+        let dir = tempdir().unwrap();
+        let book_dir = dir.path().join("Author A").join("Some Book");
+        fs::create_dir_all(&book_dir).unwrap();
+        fs::write(book_dir.join("book.epub"), b"epub bytes").unwrap();
+
+        let journal_dir = dir.path().join(".calibre-oxide").join("journal");
+        fs::create_dir_all(&journal_dir).unwrap();
+        let op = OperationDescriptor::DeleteFile {
+            target: book_dir.clone(),
+        };
+        let descriptor_hash = blake3_hex(&serde_json::to_vec(&op).unwrap());
+        let entry = JournalEntry {
+            seq: 0,
+            prev_head: None,
+            op,
+            descriptor_hash,
+        };
+        fs::write(
+            journal_dir.join(format!("{}.op", Uuid::new_v4())),
+            serde_json::to_vec(&entry).unwrap(),
+        )
+        .unwrap();
+
+        let handle = reopen_for_test(dir.path(), JOURNAL_PRUNE_RETENTION);
+        assert!(
+            !book_dir.exists(),
+            "recovery should finish a delete that never even started"
+        );
+        drop(handle);
     }
 
     // }}}
