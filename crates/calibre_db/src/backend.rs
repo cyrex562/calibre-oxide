@@ -186,6 +186,29 @@ impl Backend {
         Ok(handle)
     }
 
+    /// Test-only: pre-seeds this `Backend`'s cached write handle with
+    /// one forced to report [`crate::library_handle::StorageTier::Network`],
+    /// so a later real [`Backend::write_handle`] call (e.g. from
+    /// `Cache::rename_book_files`) returns it instead of opening a
+    /// fresh, really-classified handle -- lets a caller's tier-
+    /// branching logic be exercised end to end against a real
+    /// `Network`-tier handle without needing an actual network mount.
+    ///
+    /// Drops any already-cached handle *before* opening the new one --
+    /// if a real handle had already been opened (e.g. by an earlier
+    /// write in the same test), it's still holding the real writer
+    /// lock; opening a second handle on the same library while that
+    /// one is still alive would fail with `AlreadyLocked`.
+    #[cfg(test)]
+    pub(crate) fn install_network_tier_handle_for_test(&self) {
+        let mut guard = self.write_handle.lock().unwrap();
+        *guard = None;
+        let handle =
+            crate::library_handle::LibraryHandle::open_for_network_tier_test(&self.library_path)
+                .unwrap();
+        *guard = Some(Arc::new(handle));
+    }
+
     /// Port of `DB.library_id` (get-or-create): the UUID for this
     /// library, stored in the dedicated `library_id` table.
     pub fn library_id(&self) -> SqlResult<String> {
