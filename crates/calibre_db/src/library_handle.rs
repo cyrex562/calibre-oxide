@@ -150,7 +150,53 @@
 //! still caught. Windows is disclosed as not implemented, same reason
 //! as every other Windows gap in this file.
 //!
-//! # Disclosed simplifications (phase 2-5)
+//! **Phase 6** (split off from #93 as issue #257, since it's separable
+//! follow-up rather than part of #93's own definition of done):
+//! per-operation §6 safety for [`StorageTier::Network`].
+//! [`LibraryHandle::write_atomic`]/[`LibraryHandle::copy_atomic`]/
+//! [`LibraryHandle::rename_atomic`]/[`LibraryHandle::remove_atomic`]
+//! all branch on the handle's tier; on `Network`, a write/copy stages
+//! its payload in a genuinely local scratch file first (never under
+//! `library_path`, which may itself be the network mount), uploads it
+//! in one `fs::copy`, renames it into place, then reads `target` back
+//! and re-hashes it to confirm the round trip didn't silently corrupt
+//! it -- §6's "assemble... locally... upload... verify by reading
+//! back and comparing BLAKE3" almost verbatim. A rename additionally
+//! checks the destination really exists (and the source really
+//! doesn't) afterward, since §6 explicitly calls out that "server-side
+//! rename semantics" can differ from POSIX. The whole sequence for
+//! every one of these four operations is retried with exponential
+//! backoff (capped at 60s per attempt, giving up and bubbling up the
+//! last error after 5 minutes of total elapsed time) on any I/O error
+//! or hash mismatch -- §6's retry policy verbatim. See the "§6
+//! network-storage write-path safety" fold in this file's source for
+//! the implementation and its own, more detailed disclosure.
+//!
+//! **Deliberately not done in phase 6**: §6's "two-phase variant of
+//! the journal" for operations that mutate *multiple* network files
+//! at once (e.g. a book-move = directory rename + `metadata.db`
+//! update, staged together, only committed once both succeed). This
+//! crate's journal has no multi-operation batch concept spanning
+//! several `LibraryHandle` calls at all -- each call is its own
+//! independently-recoverable unit (`Cache::rename_book_files`'s own
+//! doc comment discloses the exact same gap for local storage). Making
+//! *that* genuinely two-phase-safe on network storage is a materially
+//! bigger feature, tracked as a real, separate follow-up rather than
+//! silently left implicit.
+//!
+//! No real network filesystem (SMB/NFS/WebDAV) exists on this dev box
+//! to test phase 6 against. What's verified is the logic -- local-
+//! scratch staging, read-back-verification catching a real injected
+//! mismatch, and the retry/backoff/give-up arithmetic -- against a
+//! plain local filesystem standing in for "network", via the same
+//! fault-injection technique this file already uses for crash-recovery
+//! tests. Real network failure modes (latency spikes, mid-transfer
+//! disconnects, non-POSIX server rename semantics) are unverified
+//! against an actual network mount -- disclosed plainly rather than
+//! implied, same honesty as phase 4's real-vs-simulated device-removal
+//! gap.
+//!
+//! # Disclosed simplifications (phase 2-6)
 //!
 //! - **Pruning is open-time only.** A process that opens a library
 //!   once and then writes to it for a very long time will still grow
@@ -189,11 +235,17 @@
 //!   entirely separate types in this crate); `prepare_for_suspend`
 //!   does what it actually owns. See `power_monitor.rs`'s module doc.
 //!
-//! # Not done yet (disclosed, tracked as later work under #93)
+//! # Not done yet (disclosed, tracked as later work)
 //!
-//! - Network-storage two-phase writes (§6) -- [`StorageTier::Network`]
-//!   is detected and stored, but nothing yet changes behavior based on
-//!   it.
+//! - **§6 network-storage two-phase writes (issue #257) -- per-
+//!   operation safety done (phase 6, above), the multi-file batch
+//!   case not started.** Every individual `write_atomic`/
+//!   `copy_atomic`/`rename_atomic`/`remove_atomic` call is now real
+//!   and safe on `StorageTier::Network`; an operation that mutates
+//!   *multiple* network files as one logical unit (e.g. a book move)
+//!   is not yet staged/committed as a true two-phase unit -- see phase
+//!   6's own paragraph above for why that's a separate, bigger
+//!   feature.
 //! - **The crate-wide write-path retrofit -- done.**
 //!   [`Backend::write_handle`](crate::backend::Backend::write_handle)
 //!   is the real entry point: lazily opens (and caches, shared across
@@ -257,6 +309,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -470,6 +523,13 @@ pub(crate) struct Shared {
     /// field's directory layout staying what it happens to be today.
     handle_dir: PathBuf,
     tier: StorageTier,
+    /// §6's retry policy for [`StorageTier::Network`] writes/renames/
+    /// removals -- [`REAL_NETWORK_RETRY_POLICY`] outside tests, a
+    /// much faster policy under a test-only override (see
+    /// [`LibraryHandle::open_impl_network_test`]) so retry/give-up
+    /// logic can be exercised in milliseconds instead of minutes.
+    /// Unused (and irrelevant) for any other tier.
+    network_retry_policy: RetryPolicy,
     state: Mutex<HandleState>,
     journal_dir: PathBuf,
     checkpoint_path: PathBuf,
@@ -540,7 +600,7 @@ impl Shared {
         let content_hash = blake3_hex(bytes);
         let op = OperationDescriptor::WriteFile {
             target: target.to_path_buf(),
-            content_hash,
+            content_hash: content_hash.clone(),
         };
         self.journal_write(uuid, op)?;
         if fail_after == Some(FailPoint::JournalWrite) {
@@ -553,27 +613,37 @@ impl Shared {
         }
         let tmp_path = temp_path_for(target, uuid);
 
-        let tmp_file = File::create(&tmp_path)?;
-        {
-            use std::io::Write;
-            (&tmp_file).write_all(bytes)?;
-        }
-        if fail_after == Some(FailPoint::WriteTemp) {
-            return Err(simulated_crash());
-        }
+        if self.tier == StorageTier::Network {
+            publish_over_network(
+                target,
+                &tmp_path,
+                &content_hash,
+                &self.network_retry_policy,
+                |scratch| fs::write(scratch, bytes),
+            )?;
+        } else {
+            let tmp_file = File::create(&tmp_path)?;
+            {
+                use std::io::Write;
+                (&tmp_file).write_all(bytes)?;
+            }
+            if fail_after == Some(FailPoint::WriteTemp) {
+                return Err(simulated_crash());
+            }
 
-        tmp_file.sync_all()?;
-        drop(tmp_file);
-        if fail_after == Some(FailPoint::FsyncTemp) {
-            return Err(simulated_crash());
-        }
+            tmp_file.sync_all()?;
+            drop(tmp_file);
+            if fail_after == Some(FailPoint::FsyncTemp) {
+                return Err(simulated_crash());
+            }
 
-        fs::rename(&tmp_path, target)?;
-        if fail_after == Some(FailPoint::Rename) {
-            return Err(simulated_crash());
-        }
+            fs::rename(&tmp_path, target)?;
+            if fail_after == Some(FailPoint::Rename) {
+                return Err(simulated_crash());
+            }
 
-        fsync_dir(parent)?;
+            fsync_dir(parent)?;
+        }
         if fail_after == Some(FailPoint::BeforeCommit) {
             return Err(simulated_crash());
         }
@@ -621,27 +691,43 @@ impl Shared {
         }
         let tmp_path = temp_path_for(target, uuid);
 
-        let mut tmp_file = File::create(&tmp_path)?;
-        {
-            let mut src_file = File::open(source)?;
-            io::copy(&mut src_file, &mut tmp_file)?;
-        }
-        if fail_after == Some(FailPoint::WriteTemp) {
-            return Err(simulated_crash());
-        }
+        if self.tier == StorageTier::Network {
+            let source = source.to_path_buf();
+            publish_over_network(
+                target,
+                &tmp_path,
+                &content_hash,
+                &self.network_retry_policy,
+                move |scratch| {
+                    let mut src_file = File::open(&source)?;
+                    let mut scratch_file = File::create(scratch)?;
+                    io::copy(&mut src_file, &mut scratch_file)?;
+                    Ok(())
+                },
+            )?;
+        } else {
+            let mut tmp_file = File::create(&tmp_path)?;
+            {
+                let mut src_file = File::open(source)?;
+                io::copy(&mut src_file, &mut tmp_file)?;
+            }
+            if fail_after == Some(FailPoint::WriteTemp) {
+                return Err(simulated_crash());
+            }
 
-        tmp_file.sync_all()?;
-        drop(tmp_file);
-        if fail_after == Some(FailPoint::FsyncTemp) {
-            return Err(simulated_crash());
-        }
+            tmp_file.sync_all()?;
+            drop(tmp_file);
+            if fail_after == Some(FailPoint::FsyncTemp) {
+                return Err(simulated_crash());
+            }
 
-        fs::rename(&tmp_path, target)?;
-        if fail_after == Some(FailPoint::Rename) {
-            return Err(simulated_crash());
-        }
+            fs::rename(&tmp_path, target)?;
+            if fail_after == Some(FailPoint::Rename) {
+                return Err(simulated_crash());
+            }
 
-        fsync_dir(parent)?;
+            fsync_dir(parent)?;
+        }
         if fail_after == Some(FailPoint::BeforeCommit) {
             return Err(simulated_crash());
         }
@@ -667,9 +753,31 @@ impl Shared {
             return Err(simulated_crash());
         }
 
-        fs::rename(from, to)?;
-        if fail_after == Some(FailPoint::Rename) {
-            return Err(simulated_crash());
+        if self.tier == StorageTier::Network {
+            // No payload to stage locally -- a rename moves existing
+            // bytes, it doesn't create new content that could be
+            // corrupted in transit. What §6 actually protects against
+            // here is a transient failure (or a server whose rename
+            // isn't really atomic/didn't take effect) getting retried
+            // instead of surfaced immediately.
+            retry_network_op(&self.network_retry_policy, || {
+                fs::rename(from, to)?;
+                if to.exists() && !from.exists() {
+                    Ok(())
+                } else {
+                    Err(io::Error::other(format!(
+                        "rename from {} to {} did not take effect as expected \
+                         (server-side rename semantics may differ from POSIX)",
+                        from.display(),
+                        to.display()
+                    )))
+                }
+            })?;
+        } else {
+            fs::rename(from, to)?;
+            if fail_after == Some(FailPoint::Rename) {
+                return Err(simulated_crash());
+            }
         }
 
         fsync_dir(from.parent())?;
@@ -717,9 +825,13 @@ impl Shared {
             return Err(simulated_crash());
         }
 
-        remove_path(target)?;
-        if fail_after == Some(FailPoint::Removed) {
-            return Err(simulated_crash());
+        if self.tier == StorageTier::Network {
+            retry_network_op(&self.network_retry_policy, || remove_path(target))?;
+        } else {
+            remove_path(target)?;
+            if fail_after == Some(FailPoint::Removed) {
+                return Err(simulated_crash());
+            }
         }
 
         fsync_dir(target.parent())?;
@@ -840,6 +952,211 @@ impl Shared {
     }
 }
 
+// --- §6 network-storage write-path safety (issue #93, split off as #257) {{{
+//
+// Per-operation safety for `StorageTier::Network`: `write_atomic`/
+// `copy_atomic`/`rename_atomic`/`remove_atomic` all branch on `self.tier`
+// and, when it's `Network`, route through the functions below instead of
+// their local-tier sequence. Scope, deliberately: this makes each
+// *individual* operation safe against transient network failures and
+// silent corruption -- it does NOT implement §6's "two-phase variant of
+// the journal" for operations that mutate multiple network files at once
+// (e.g. a book-move = directory rename + `metadata.db` update); that's a
+// materially bigger feature (this crate's journal has no multi-operation
+// batch concept spanning several `LibraryHandle` calls at all -- see
+// `rename_book_files`'s own disclosure) and is tracked separately.
+//
+// No real network filesystem (SMB/NFS/WebDAV) is available on this dev
+// box to test against. What's verified here is the *logic* -- local-
+// scratch staging, read-back-verification catching a real injected
+// mismatch, and the retry/backoff/give-up arithmetic -- against a plain
+// local filesystem standing in for "network", using the same fault-
+// injection technique this file already uses for crash-recovery tests.
+// Real network failure modes (latency spikes, mid-transfer disconnects,
+// server-side rename semantics that differ from POSIX) are NOT verified
+// against an actual network mount. Disclosed plainly rather than implied.
+
+/// §6's own wording: "exponential backoff up to 60s, then bubble up.
+/// Never retry silently for more than 5 minutes."
+const REAL_NETWORK_RETRY_POLICY: RetryPolicy = RetryPolicy {
+    initial_delay: Duration::from_secs(1),
+    max_delay: Duration::from_secs(60),
+    total_budget: Duration::from_secs(5 * 60),
+};
+
+#[derive(Debug, Clone, Copy)]
+struct RetryPolicy {
+    initial_delay: Duration,
+    max_delay: Duration,
+    total_budget: Duration,
+}
+
+/// Retries `attempt` with exponential backoff (doubling each time, up
+/// to `policy.max_delay` per sleep) until it succeeds or
+/// `policy.total_budget` of wall-clock time has elapsed since the
+/// first attempt, at which point the last error is returned. Real
+/// `std::thread::sleep`/`Instant` -- tests use a `policy` with
+/// millisecond-scale durations instead of mocking time, so this stays
+/// a plain, direct implementation of exactly what §6 asks for.
+fn retry_with_backoff<T>(
+    policy: &RetryPolicy,
+    mut attempt: impl FnMut() -> Result<T, LibraryHandleError>,
+) -> Result<T, LibraryHandleError> {
+    let start = Instant::now();
+    let mut delay = policy.initial_delay;
+    loop {
+        match attempt() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                let elapsed = start.elapsed();
+                if elapsed >= policy.total_budget {
+                    return Err(e);
+                }
+                let remaining = policy.total_budget - elapsed;
+                std::thread::sleep(delay.min(remaining));
+                delay = (delay * 2).min(policy.max_delay);
+            }
+        }
+    }
+}
+
+/// A genuinely local path (never under `library_path`, which may
+/// itself be the network mount) to stage a payload in before
+/// uploading it -- §6's "assemble the full payload locally in a
+/// scratch dir". Unique per call (via a fresh UUID) so concurrent
+/// operations, and retries of the same operation, never collide;
+/// callers remove it themselves once done with it (success or final
+/// failure) rather than leaving it for someone else to clean up.
+fn local_scratch_path() -> PathBuf {
+    std::env::temp_dir().join(format!("calibre-oxide-scratch-{}", Uuid::new_v4()))
+}
+
+/// Publishes content to `target` via `tmp_path`, per §6: `stage`
+/// writes the payload into a genuinely local scratch file (never
+/// touching `target`/`tmp_path` itself), the scratch file is fsynced,
+/// then uploaded to `tmp_path` in one `fs::copy` ("upload in one
+/// operation"), renamed into place, and finally `target` is read back
+/// and re-hashed to confirm the round trip didn't silently corrupt it
+/// -- §6's own wording almost verbatim. The whole sequence (stage,
+/// upload, rename, verify) is retried with `policy`'s backoff on any
+/// I/O error or hash mismatch.
+///
+/// Shared by `write_atomic_impl` (writes an in-memory buffer into the
+/// scratch file) and `copy_atomic_impl` (streams from its own
+/// `source` file into the scratch file instead) so both funnel
+/// through one retry/verify/publish sequence rather than duplicating
+/// it.
+fn publish_over_network(
+    target: &Path,
+    tmp_path: &Path,
+    expected_hash: &str,
+    policy: &RetryPolicy,
+    stage: impl Fn(&Path) -> io::Result<()>,
+) -> Result<(), LibraryHandleError> {
+    retry_with_backoff(policy, || -> Result<(), LibraryHandleError> {
+        if take_simulated_network_fault() {
+            return Err(simulated_network_fault());
+        }
+
+        let scratch_path = local_scratch_path();
+        let outcome: io::Result<()> = (|| {
+            stage(&scratch_path)?;
+            let scratch_file = File::open(&scratch_path)?;
+            scratch_file.sync_all()?;
+            drop(scratch_file);
+
+            fs::copy(&scratch_path, tmp_path)?;
+            let tmp_file = File::open(tmp_path)?;
+            tmp_file.sync_all()?;
+            drop(tmp_file);
+
+            fs::rename(tmp_path, target)?;
+            Ok(())
+        })();
+        let _ = fs::remove_file(&scratch_path);
+        outcome?;
+
+        fsync_dir(target.parent())?;
+
+        let actual_hash = blake3_hash_file(target)?;
+        if actual_hash != expected_hash {
+            return Err(LibraryHandleError::Corruption(format!(
+                "{} did not match its expected checksum after a network write \
+                 (read back {actual_hash}, expected {expected_hash})",
+                target.display()
+            )));
+        }
+        Ok(())
+    })
+}
+
+/// Retries `attempt` (a rename or removal with no payload to stage)
+/// with `policy`'s backoff on any I/O error -- the same retry
+/// discipline as [`publish_over_network`], without the local-staging/
+/// read-back-verify parts, since there's no new content to assemble
+/// or corrupt: a rename moves existing bytes, a removal has nothing
+/// left to verify once it's gone (same reasoning `remove_atomic`'s
+/// own doc comment already gives for why deletion doesn't need a
+/// write-temp-style scheme at all).
+fn retry_network_op(
+    policy: &RetryPolicy,
+    mut attempt: impl FnMut() -> io::Result<()>,
+) -> Result<(), LibraryHandleError> {
+    retry_with_backoff(policy, || -> Result<(), LibraryHandleError> {
+        if take_simulated_network_fault() {
+            return Err(simulated_network_fault());
+        }
+        attempt().map_err(LibraryHandleError::Io)
+    })
+}
+
+fn simulated_network_fault() -> LibraryHandleError {
+    LibraryHandleError::Io(io::Error::other("simulated network fault (test-only)"))
+}
+
+/// Test-only fault injection for the §6 retry paths, deliberately
+/// shaped differently from [`FailPoint`]: `FailPoint` simulates a
+/// *permanent* crash at a given step (testing journal-recovery-on-
+/// reopen); this simulates *transient* network flakiness within a
+/// single call (testing that the retry loop actually retries the
+/// right number of times and either recovers or gives up). A
+/// thread-local counter rather than a parameter threaded through
+/// every §6-touching function -- every test that uses this resets it
+/// to the exact count it wants as its first action, which is
+/// sufficient to neutralize whatever a previous test on the same
+/// `cargo test` worker thread happened to leave behind (a non-network
+/// test never reaches this at all, since it's only consulted from the
+/// `StorageTier::Network` branch of each operation).
+#[cfg(test)]
+thread_local! {
+    static NETWORK_FAULT_COUNTDOWN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn set_simulated_network_fault_countdown(n: u32) {
+    NETWORK_FAULT_COUNTDOWN.with(|c| c.set(n));
+}
+
+#[cfg(test)]
+fn take_simulated_network_fault() -> bool {
+    NETWORK_FAULT_COUNTDOWN.with(|c| {
+        let n = c.get();
+        if n > 0 {
+            c.set(n - 1);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+#[cfg(not(test))]
+fn take_simulated_network_fault() -> bool {
+    false
+}
+
+// }}}
+
 /// The single gateway every durable write to a library folder is
 /// meant to go through. See this module's doc comment for exactly
 /// what's real so far.
@@ -880,6 +1197,45 @@ impl LibraryHandle {
         monitor_devices: bool,
         monitor_power: bool,
     ) -> Result<Self, LibraryHandleError> {
+        Self::open_impl_inner(
+            library_path,
+            retention,
+            monitor_devices,
+            monitor_power,
+            None,
+        )
+    }
+
+    /// Test-only: forces the handle's [`StorageTier`] to `Network` and
+    /// its §6 retry policy to `policy` (instead of the real, much
+    /// slower [`REAL_NETWORK_RETRY_POLICY`]) -- lets tests exercise
+    /// the §6 retry/backoff/give-up logic in milliseconds instead of
+    /// minutes. Real tier classification and device/power monitoring
+    /// are skipped entirely (there's no real network device/mount to
+    /// classify or monitor), same shape as [`reopen_for_test`]'s
+    /// "fast, focused" test hook.
+    #[cfg(test)]
+    fn open_impl_network_test(
+        library_path: &Path,
+        retention: u64,
+        policy: RetryPolicy,
+    ) -> Result<Self, LibraryHandleError> {
+        Self::open_impl_inner(
+            library_path,
+            retention,
+            false,
+            false,
+            Some((StorageTier::Network, policy)),
+        )
+    }
+
+    fn open_impl_inner(
+        library_path: &Path,
+        retention: u64,
+        monitor_devices: bool,
+        monitor_power: bool,
+        force_tier_and_policy: Option<(StorageTier, RetryPolicy)>,
+    ) -> Result<Self, LibraryHandleError> {
         let handle_dir = library_path.join(LIBRARY_HANDLE_DIR_NAME);
         fs::create_dir_all(&handle_dir)?;
 
@@ -900,10 +1256,19 @@ impl LibraryHandle {
         let library_id = load_or_create_library_id(&handle_dir)?;
         let fingerprint = compute_fingerprint(library_path, &library_id)?;
 
+        let (tier, network_retry_policy) = match force_tier_and_policy {
+            Some((tier, policy)) => (tier, policy),
+            None => (
+                classify_storage_tier(library_path),
+                REAL_NETWORK_RETRY_POLICY,
+            ),
+        };
+
         let shared = Arc::new(Shared {
             library_path: library_path.to_path_buf(),
             handle_dir: handle_dir.clone(),
-            tier: classify_storage_tier(library_path),
+            tier,
+            network_retry_policy,
             state: Mutex::new(HandleState::Open),
             journal_dir,
             checkpoint_path,
@@ -2484,6 +2849,258 @@ mod tests {
         // The stale, already-superseded entry 0 and 1 files are
         // cleaned up by the recovery scan itself.
         assert_eq!(op_file_count(&journal_dir), 1);
+    }
+
+    // }}}
+
+    // --- §6 network-storage write-path safety (issue #93, #257) {{{
+
+    fn open_network_test(dir: &Path, policy: RetryPolicy) -> LibraryHandle {
+        let _flock_test_guard = flock_test_guard();
+        LibraryHandle::open_impl_network_test(dir, JOURNAL_PRUNE_RETENTION, policy).unwrap()
+    }
+
+    /// Milliseconds, not minutes -- so the "gives up after the total
+    /// budget" tests below complete near-instantly instead of taking
+    /// real minutes, while still exercising the exact same doubling/
+    /// capping/give-up arithmetic `REAL_NETWORK_RETRY_POLICY` uses.
+    const FAST_TEST_RETRY_POLICY: RetryPolicy = RetryPolicy {
+        initial_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(4),
+        total_budget: Duration::from_millis(30),
+    };
+
+    #[test]
+    fn retry_with_backoff_succeeds_immediately_without_retrying() {
+        let mut calls = 0;
+        let result = retry_with_backoff(
+            &FAST_TEST_RETRY_POLICY,
+            || -> Result<(), LibraryHandleError> {
+                calls += 1;
+                Ok(())
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn retry_with_backoff_retries_and_eventually_succeeds() {
+        let mut calls = 0;
+        let result = retry_with_backoff(&FAST_TEST_RETRY_POLICY, || {
+            calls += 1;
+            if calls < 3 {
+                Err(simulated_network_fault())
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_ok());
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn retry_with_backoff_gives_up_after_the_total_budget_and_returns_the_last_error() {
+        let mut calls = 0;
+        let result = retry_with_backoff(
+            &FAST_TEST_RETRY_POLICY,
+            || -> Result<(), LibraryHandleError> {
+                calls += 1;
+                Err(simulated_network_fault())
+            },
+        );
+        assert!(result.is_err());
+        // More than one attempt was made (it's genuinely retrying),
+        // but it did eventually give up rather than looping forever.
+        assert!(calls > 1);
+    }
+
+    #[test]
+    fn write_atomic_on_network_tier_writes_and_verifies_via_read_back_hash() {
+        set_simulated_network_fault_countdown(0);
+        let dir = tempdir().unwrap();
+        let handle = open_network_test(dir.path(), FAST_TEST_RETRY_POLICY);
+        let target = dir.path().join("book").join("metadata.opf");
+
+        handle.write_atomic(&target, b"network content").unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"network content");
+
+        // No leftover temp files under the target's own directory --
+        // the scratch file lives elsewhere (a genuinely local temp
+        // dir) and is cleaned up regardless of outcome.
+        let leftovers: Vec<_> = fs::read_dir(target.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn write_atomic_on_network_tier_retries_transient_faults_and_succeeds() {
+        set_simulated_network_fault_countdown(2);
+        let dir = tempdir().unwrap();
+        let handle = open_network_test(dir.path(), FAST_TEST_RETRY_POLICY);
+        let target = dir.path().join("metadata.opf");
+
+        handle.write_atomic(&target, b"content").unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"content");
+        set_simulated_network_fault_countdown(0);
+    }
+
+    #[test]
+    fn write_atomic_on_network_tier_gives_up_after_the_retry_budget_and_bubbles_up_the_error() {
+        set_simulated_network_fault_countdown(u32::MAX);
+        let dir = tempdir().unwrap();
+        let handle = open_network_test(dir.path(), FAST_TEST_RETRY_POLICY);
+        let target = dir.path().join("metadata.opf");
+
+        let result = handle.write_atomic(&target, b"content");
+
+        assert!(result.is_err());
+        assert!(!target.exists());
+        set_simulated_network_fault_countdown(0);
+    }
+
+    #[test]
+    fn write_atomic_on_network_tier_journals_exactly_one_entry_even_after_retries() {
+        set_simulated_network_fault_countdown(2);
+        let dir = tempdir().unwrap();
+        let handle = open_network_test(dir.path(), FAST_TEST_RETRY_POLICY);
+        let target = dir.path().join("metadata.opf");
+
+        handle.write_atomic(&target, b"content").unwrap();
+
+        let journal_dir = dir.path().join(".calibre-oxide").join("journal");
+        let op_files: Vec<_> = fs::read_dir(&journal_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("op"))
+            .collect();
+        assert_eq!(
+            op_files.len(),
+            1,
+            "retrying the upload must not journal a second entry"
+        );
+        let uuid = op_files[0]
+            .path()
+            .file_stem()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(journal_dir.join(format!("{uuid}.committed")).exists());
+        set_simulated_network_fault_countdown(0);
+    }
+
+    #[test]
+    fn copy_atomic_on_network_tier_copies_and_verifies_via_read_back_hash() {
+        set_simulated_network_fault_countdown(0);
+        let dir = tempdir().unwrap();
+        let handle = open_network_test(dir.path(), FAST_TEST_RETRY_POLICY);
+        let source = dir.path().join("source.epub");
+        fs::write(&source, b"epub bytes").unwrap();
+        let target = dir.path().join("book.epub");
+
+        let hash = handle.copy_atomic(&source, &target).unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"epub bytes");
+        assert_eq!(hash, blake3_hex(b"epub bytes"));
+        assert!(source.exists(), "copy, not a move");
+    }
+
+    #[test]
+    fn copy_atomic_on_network_tier_retries_transient_faults_and_succeeds() {
+        set_simulated_network_fault_countdown(2);
+        let dir = tempdir().unwrap();
+        let handle = open_network_test(dir.path(), FAST_TEST_RETRY_POLICY);
+        let source = dir.path().join("source.epub");
+        fs::write(&source, b"epub bytes").unwrap();
+        let target = dir.path().join("book.epub");
+
+        handle.copy_atomic(&source, &target).unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"epub bytes");
+        set_simulated_network_fault_countdown(0);
+    }
+
+    #[test]
+    fn rename_atomic_on_network_tier_renames() {
+        set_simulated_network_fault_countdown(0);
+        let dir = tempdir().unwrap();
+        let handle = open_network_test(dir.path(), FAST_TEST_RETRY_POLICY);
+        let from = dir.path().join("a.txt");
+        let to = dir.path().join("b.txt");
+        fs::write(&from, b"data").unwrap();
+
+        handle.rename_atomic(&from, &to).unwrap();
+
+        assert!(!from.exists());
+        assert_eq!(fs::read(&to).unwrap(), b"data");
+    }
+
+    #[test]
+    fn rename_atomic_on_network_tier_retries_transient_faults_and_succeeds() {
+        set_simulated_network_fault_countdown(2);
+        let dir = tempdir().unwrap();
+        let handle = open_network_test(dir.path(), FAST_TEST_RETRY_POLICY);
+        let from = dir.path().join("a.txt");
+        let to = dir.path().join("b.txt");
+        fs::write(&from, b"data").unwrap();
+
+        handle.rename_atomic(&from, &to).unwrap();
+
+        assert!(!from.exists());
+        assert_eq!(fs::read(&to).unwrap(), b"data");
+        set_simulated_network_fault_countdown(0);
+    }
+
+    #[test]
+    fn remove_atomic_on_network_tier_removes() {
+        set_simulated_network_fault_countdown(0);
+        let dir = tempdir().unwrap();
+        let handle = open_network_test(dir.path(), FAST_TEST_RETRY_POLICY);
+        let target = dir.path().join("a.txt");
+        fs::write(&target, b"data").unwrap();
+
+        handle.remove_atomic(&target).unwrap();
+
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn remove_atomic_on_network_tier_retries_transient_faults_and_succeeds() {
+        set_simulated_network_fault_countdown(2);
+        let dir = tempdir().unwrap();
+        let handle = open_network_test(dir.path(), FAST_TEST_RETRY_POLICY);
+        let target = dir.path().join("a.txt");
+        fs::write(&target, b"data").unwrap();
+
+        handle.remove_atomic(&target).unwrap();
+
+        assert!(!target.exists());
+        set_simulated_network_fault_countdown(0);
+    }
+
+    #[test]
+    fn publish_over_network_retries_and_gives_up_when_the_content_never_matches_the_expected_hash()
+    {
+        set_simulated_network_fault_countdown(0);
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        let tmp_path = dir.path().join("target.txt.tmp-test");
+
+        let result = publish_over_network(
+            &target,
+            &tmp_path,
+            "not-the-real-hash-of-anything",
+            &FAST_TEST_RETRY_POLICY,
+            |scratch| fs::write(scratch, b"real content"),
+        );
+
+        assert!(matches!(result, Err(LibraryHandleError::Corruption(_))));
     }
 
     // }}}
