@@ -81,6 +81,16 @@ pub struct Backend {
     /// table. Kept only because it's `pub` API; never populated -- always empty.
     #[deprecated(note = "use get_pref/set_pref instead; this was never a faithful port")]
     pub prefs: HashMap<String, String>,
+    /// Lazily-opened, shared across every clone of this `Backend`
+    /// (issue #93's crate-wide write-path retrofit). `Backend::new`
+    /// deliberately does *not* open this up front -- unlike
+    /// `LibraryHandle::open` itself, opening a `Backend`/`Cache` must
+    /// stay safe to do many times over the same library (read-only CLI
+    /// commands, tests that construct more than one `Backend`/`Cache`
+    /// over the same directory), so the real exclusive writer lock is
+    /// only ever acquired the first time something actually needs to
+    /// write. See [`Backend::write_handle`].
+    write_handle: Arc<Mutex<Option<Arc<crate::library_handle::LibraryHandle>>>>,
 }
 
 impl Backend {
@@ -142,6 +152,7 @@ impl Backend {
             conn: Arc::new(Mutex::new(conn)),
             #[allow(deprecated)]
             prefs: HashMap::new(),
+            write_handle: Arc::new(Mutex::new(None)),
         };
 
         // Port of `DB.__init__`'s `self.library_id` access: "Guarantee
@@ -149,6 +160,30 @@ impl Backend {
         backend.library_id()?;
 
         Ok(backend)
+    }
+
+    /// The real [`crate::library_handle::LibraryHandle`] for this
+    /// library (issue #93's crate-wide write-path retrofit) --
+    /// opened, and its exclusive writer lock acquired, on first call;
+    /// every subsequent call (including from any clone of this
+    /// `Backend`, since `write_handle` is `Arc`-shared) returns the
+    /// same handle rather than attempting a second, doomed-to-fail
+    /// `open()`. Call this only from a path that is actually about to
+    /// write to the library -- it's the real exclusive lock from §7,
+    /// not a formality.
+    pub fn write_handle(
+        &self,
+    ) -> Result<Arc<crate::library_handle::LibraryHandle>, crate::library_handle::LibraryHandleError>
+    {
+        let mut guard = self.write_handle.lock().unwrap();
+        if let Some(handle) = guard.as_ref() {
+            return Ok(Arc::clone(handle));
+        }
+        let handle = Arc::new(crate::library_handle::LibraryHandle::open(
+            &self.library_path,
+        )?);
+        *guard = Some(Arc::clone(&handle));
+        Ok(handle)
     }
 
     /// Port of `DB.library_id` (get-or-create): the UUID for this
@@ -564,6 +599,53 @@ mod tests {
         let dir = tempdir().unwrap();
         let backend = Backend::new(dir.path()).expect("Backend::new should succeed");
         (dir, backend)
+    }
+
+    #[test]
+    fn multiple_backends_over_the_same_directory_never_touch_the_writer_lock() {
+        // The whole point of `write_handle` being lazy: opening a
+        // `Backend` (or several, over the same library) must stay
+        // safe and lock-free as long as nothing actually writes --
+        // read-only CLI commands, and this crate's own tests that
+        // construct more than one `Backend`/`Cache` over one
+        // directory, both depend on this.
+        let dir = tempdir().unwrap();
+        let _first = Backend::new(dir.path()).unwrap();
+        let _second = Backend::new(dir.path()).unwrap();
+        assert!(!dir.path().join(".calibre-oxide").exists());
+    }
+
+    #[test]
+    fn write_handle_is_cached_across_calls_on_the_same_backend() {
+        let (_dir, backend) = open_test_library();
+        let first = backend.write_handle().unwrap();
+        let second = backend.write_handle().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn write_handle_is_shared_across_clones_of_the_same_backend() {
+        let (_dir, backend) = open_test_library();
+        let first = backend.write_handle().unwrap();
+        let second = backend.clone().write_handle().unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a clone must reuse the already-open handle, not attempt a second (doomed) open()"
+        );
+    }
+
+    #[test]
+    fn a_second_independent_backend_cannot_get_a_write_handle_while_the_first_holds_one() {
+        let dir = tempdir().unwrap();
+        let first = Backend::new(dir.path()).unwrap();
+        let _handle = first.write_handle().unwrap();
+
+        let second = Backend::new(dir.path()).unwrap();
+        let result = second.write_handle();
+        assert!(matches!(
+            result,
+            Err(crate::library_handle::LibraryHandleError::AlreadyLocked)
+        ));
     }
 
     #[test]
