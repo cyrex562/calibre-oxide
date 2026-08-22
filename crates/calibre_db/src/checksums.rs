@@ -56,25 +56,44 @@
 //!   Honest about what was never recorded rather than pretending
 //!   coverage that doesn't exist.
 //! - **Not wired into every read path.** Verification lives in
-//!   `check_library.rs`'s scan and, as of this pass,
+//!   `check_library.rs`'s scan and, as of the export pass, in
 //!   `cli/cmd_export.rs`'s per-book copy (a real BLAKE3 mismatch
 //!   there skips exporting that book rather than copying corrupted
 //!   bytes out of the library -- matching §8's "the operation aborts
 //!   before mutating anything", scoped to the one book, not the whole
 //!   export run, consistent with this loop's existing "skip and
-//!   continue" handling for a missing file). Catalog generation and
-//!   any other function that opens a book file still reads it
-//!   directly; a corrupted file there is caught the next time a
-//!   library check runs, not at the moment of use. There is
-//!   deliberately **no** "convert" call site wired in: this repo has
-//!   no `cmd_convert` command that resolves a book_id/format through
-//!   `Library`/`Cache` at all yet (`calibre_conversion`'s
+//!   continue" handling for a missing file). Any other function that
+//!   opens a book file directly still reads it unverified; a
+//!   corrupted file there is caught the next time a library check
+//!   runs, not at the moment of use.
+//!
+//!   There is deliberately **no** "convert" call site wired in: this
+//!   repo has no `cmd_convert` command that resolves a book_id/format
+//!   through `Library`/`Cache` at all yet (`calibre_conversion`'s
 //!   `ebook_convert` binary is a standalone file-to-file converter
 //!   with no concept of a library or book id) -- there is nothing to
-//!   wire re-verification into until that command exists. Extending
-//!   re-verification to more call sites (catalog generation, and
-//!   convert once it exists) is part of the same still-open
-//!   "crate-wide retrofit" item phases 1-3 already track under #93.
+//!   wire re-verification into until that command exists.
+//!
+//!   There is also deliberately **no** "catalog generation" call
+//!   site: checked directly (issue #93 follow-up) rather than assumed
+//!   -- `cli/cmd_catalog.rs` (its only implemented format is CSV;
+//!   anything else is a hard "unsupported format" error) writes only
+//!   DB metadata fields (title/author/pubdate/isbn/`path`-the-string)
+//!   into the CSV. It never opens a format file, a cover, or any
+//!   other on-disk book file at all, so there is no book-file byte
+//!   read here to verify against. (An earlier draft of this doc
+//!   claimed catalog generation "still reads a book file directly" --
+//!   that was an unverified assumption, not a checked fact; corrected
+//!   here after actually reading `cmd_catalog.rs`.) Real upstream
+//!   `catalog.py` -- unported, tracked separately in
+//!   `docs/modules_to_port.md` -- generates richer catalog formats
+//!   that *do* embed cover thumbnails; if that ever gets ported, its
+//!   cover-reading code would be a real site to wire in.
+//!
+//!   Extending re-verification to more call sites (convert, once it
+//!   exists; anywhere else that reads a book file directly) is part
+//!   of the same still-open "crate-wide retrofit" item phases 1-3
+//!   already track under #93.
 //! - **No re-verification on `metadata.db` itself** -- this covers
 //!   book/cover/OPF *files*, not the SQLite database's own integrity
 //!   (SQLite's own WAL/page-checksum machinery is the relevant
