@@ -580,6 +580,23 @@ impl Cache {
     /// alone) to match the new title, then updates the `path` column.
     /// A no-op if the book has no path yet, or the computed new folder
     /// is identical to the old one.
+    ///
+    /// Port of issue #93's crate-wide write-path retrofit: every
+    /// individual rename/removal below goes through the real
+    /// `LibraryHandle` (journaled, crash-safe, recovery-verified on
+    /// the next open) instead of a raw `fs::rename`/`fs::remove_dir`.
+    /// This does NOT make the whole directory-move-then-file-renames-
+    /// then-DB-update sequence itself transactional -- a crash between
+    /// two of these steps can still leave a book with its directory
+    /// moved but not every file inside renamed yet, or with the files
+    /// moved but the DB `path` column not yet updated, exactly the
+    /// same window this method had before this pass (a multi-operation
+    /// journal transaction spanning several `LibraryHandle` calls
+    /// doesn't exist in this crate -- each call is its own
+    /// independently-recoverable unit). What this pass adds is that
+    /// every individual step is now itself crash-safe and detectable
+    /// (no half-renamed *file*, no silent data loss on one step), not
+    /// that the whole multi-step move became one atomic operation.
     fn rename_book_files(
         &self,
         book_id: i32,
@@ -610,7 +627,8 @@ impl Cache {
             fs::create_dir_all(&new_author_full_path)?;
         }
 
-        fs::rename(&old_full_dir, &new_full_dir)?;
+        let handle = self.backend.write_handle()?;
+        handle.rename_atomic(&old_full_dir, &new_full_dir)?;
 
         for entry in fs::read_dir(&new_full_dir)? {
             let entry = entry?;
@@ -625,7 +643,11 @@ impl Cache {
                             format!("{}.{}", sanitize_file_name(new_title), extension);
                         let new_file_path = new_full_dir.join(new_file_name);
                         if path != new_file_path {
-                            let _ = fs::rename(path, new_file_path);
+                            if let Err(e) = handle.rename_atomic(&path, &new_file_path) {
+                                eprintln!(
+                                    "Warning: failed to rename {path:?} to {new_file_path:?}: {e}"
+                                );
+                            }
                         }
                     }
                 }
@@ -634,7 +656,9 @@ impl Cache {
 
         if let Some(parent) = old_full_dir.parent() {
             if parent.exists() && fs::read_dir(parent)?.next().is_none() {
-                let _ = fs::remove_dir(parent);
+                if let Err(e) = handle.remove_atomic(parent) {
+                    eprintln!("Warning: failed to remove empty directory {parent:?}: {e}");
+                }
             }
         }
 
@@ -1997,6 +2021,56 @@ mod tests {
         );
         assert!(dir.path().join("New Author/New Title").exists());
         assert!(!dir.path().join("Old Author").exists());
+
+        // The book's own file was renamed to match the new title too,
+        // not just the directory.
+        assert!(dir
+            .path()
+            .join("New Author/New Title/New Title.epub")
+            .exists());
+        assert!(!dir
+            .path()
+            .join("New Author/New Title/Old Title.epub")
+            .exists());
+
+        // rename_book_files now goes through the real LibraryHandle
+        // (issue #93's crate-wide write-path retrofit), not raw
+        // `fs::rename`/`fs::remove_dir` calls -- prove it by checking
+        // real journaled entries landed: one `RenameFile` for the
+        // directory move, one more for the book file's own rename,
+        // and one `DeleteFile` for the now-empty old author directory
+        // (`add_book`'s own initial `add_format` also journals a
+        // `WriteFile`, which is why this doesn't just count every
+        // `.op` file -- see `journaled_op_count`'s doc comment).
+        assert_eq!(journaled_op_count(dir.path(), "RenameFile"), 2);
+        assert_eq!(journaled_delete_count(dir.path()), 1);
+    }
+
+    #[test]
+    fn update_book_metadata_leaves_the_old_author_directory_when_another_book_still_uses_it() {
+        let (dir, cache) = open_test_cache();
+
+        let source_a = write_temp_file(dir.path(), "a.epub", b"a");
+        let mut meta_a = MetaInformation::default();
+        meta_a.title = "Book A".to_string();
+        meta_a.authors = vec!["Shared Author".to_string()];
+        let book_a = cache.add_book(&source_a, &meta_a).unwrap();
+
+        let source_b = write_temp_file(dir.path(), "b.epub", b"b");
+        let mut meta_b = MetaInformation::default();
+        meta_b.title = "Book B".to_string();
+        meta_b.authors = vec!["Shared Author".to_string()];
+        cache.add_book(&source_b, &meta_b).unwrap();
+
+        cache
+            .update_book_metadata(book_a, "Book A", "Solo Author")
+            .unwrap();
+
+        // "Shared Author" is still not empty (Book B's directory is
+        // still under it) -- the empty-parent cleanup must not remove
+        // it.
+        assert!(dir.path().join("Shared Author/Book B").exists());
+        assert!(dir.path().join("Solo Author/Book A").exists());
     }
 
     #[test]
