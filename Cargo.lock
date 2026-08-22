@@ -487,6 +487,7 @@ dependencies = [
  "csv",
  "indexmap 2.12.1",
  "lazy_static",
+ "libc",
  "log",
  "mime_guess",
  "regex",

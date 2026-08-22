@@ -11,6 +11,8 @@ pub mod cli;
 pub mod constants;
 pub mod copy_to_library;
 pub mod covers;
+#[cfg(unix)]
+mod device_monitor;
 pub mod errors;
 pub mod fields;
 pub mod fts;

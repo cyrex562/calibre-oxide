@@ -95,7 +95,32 @@
 //! during a long-lived process -- see "disclosed simplifications"
 //! below for why.
 //!
-//! # Disclosed simplifications (phase 2-3)
+//! **Book-file/cover/sidecar BLAKE3 checksums** (§8's other half, not
+//! numbered as a phase of this file since it lives in its own module)
+//! shipped separately in `checksums.rs` -- see that module's doc for
+//! the full design (a sidecar db, not a `metadata.db` column) and
+//! everywhere it's wired in (`Cache::add_format`/`add_book`,
+//! `covers::set_cover`, `backup.rs`, `check_library.rs`'s scan,
+//! `cmd_export.rs`'s copy).
+//!
+//! **Phase 4**: device-removal notifications (§4), in
+//! `device_monitor.rs` -- real on Linux, via a raw
+//! `NETLINK_KOBJECT_UEVENT` socket (not `libudev`; see that module's
+//! doc for why, and for how its exact wire-format assumptions were
+//! verified against a real captured kernel message on this machine
+//! rather than just documentation). [`LibraryHandle::open`] resolves
+//! the `/dev/...` device backing the library's mount and, if one
+//! exists, spawns a best-effort background thread watching for its
+//! removal; seeing one flips `state` to `Detached`, and every
+//! subsequent call through this handle then fails with
+//! [`LibraryHandleError::DeviceDetached`] -- real per §4's "no retry
+//! loop, no silent corruption path" contract, not just the reserved
+//! error variant phases 1-3 left sitting unused. No implicit
+//! re-attach: per §4, a caller must explicitly `open()` again.
+//! Windows is disclosed as not implemented, same reason as this
+//! file's other Windows gaps.
+//!
+//! # Disclosed simplifications (phase 2-4)
 //!
 //! - **Pruning is open-time only.** A process that opens a library
 //!   once and then writes to it for a very long time will still grow
@@ -127,14 +152,18 @@
 //!
 //! # Not done yet (disclosed, tracked as later work under #93)
 //!
-//! - Device-removal notifications (§4) and the `Detached` transition.
-//! - Sleep/resume notifications (§5) and the `Suspended` transition.
+//! - Sleep/resume notifications (§5) and the `Suspended` transition
+//!   -- unlike device-removal, this needs a real architectural
+//!   addition beyond what phase 4 needed: §5 step 1 wants a suspending
+//!   handle to release its exclusive writer lock before sleep (so the
+//!   OS isn't holding a lock across a suspend/resume cycle) and
+//!   reacquire it on resume, which means `_lock_file` needs to become
+//!   swappable at runtime, not a field set once at `open()` and never
+//!   touched again -- a bigger change than adding a new background
+//!   thread, deliberately not bundled into phase 4.
 //! - Network-storage two-phase writes (§6) -- [`StorageTier::Network`]
 //!   is detected and stored, but nothing yet changes behavior based on
 //!   it.
-//! - Book-file BLAKE3 checksums stored in `metadata.db` at add time
-//!   (§8's other half) -- this phase's checksums live only inside
-//!   journal entries, not integrated with `Cache`/the schema yet.
 //! - **The crate-wide retrofit.** Every existing `fs::write`/
 //!   `fs::rename`/`fs::copy` call against a library path elsewhere in
 //!   this crate (`cache.rs`, `restore.rs`, `notes/connection.rs`,
@@ -150,7 +179,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -257,7 +286,11 @@ struct JournalCheckpoint {
 pub struct LibraryHandle {
     library_path: PathBuf,
     tier: StorageTier,
-    state: Mutex<HandleState>,
+    /// `Arc`-wrapped so the device-removal monitor thread (§4, see
+    /// `device_monitor.rs`) can hold a [`std::sync::Weak`] reference
+    /// and flip this to `Detached` without keeping the handle alive
+    /// on its own.
+    state: Arc<Mutex<HandleState>>,
     journal_dir: PathBuf,
     journal_head: Mutex<JournalHead>,
     /// Held open for the handle's whole lifetime -- the OS releases
@@ -278,14 +311,23 @@ impl LibraryHandle {
     /// [`LibraryHandleError::Corruption`] if the journal's hash chain
     /// doesn't verify.
     pub fn open(library_path: &Path) -> Result<Self, LibraryHandleError> {
-        Self::open_impl(library_path, JOURNAL_PRUNE_RETENTION)
+        Self::open_impl(library_path, JOURNAL_PRUNE_RETENTION, true)
     }
 
-    /// `retention` is a test-only hook (see module doc's fault-
-    /// injection pattern) letting tests exercise pruning without
-    /// writing hundreds of entries; always [`JOURNAL_PRUNE_RETENTION`]
-    /// from the public [`LibraryHandle::open`].
-    fn open_impl(library_path: &Path, retention: u64) -> Result<Self, LibraryHandleError> {
+    /// `retention` and `monitor_devices` are test-only hooks (see
+    /// module doc's fault-injection pattern): `retention` lets tests
+    /// exercise pruning without writing hundreds of entries;
+    /// `monitor_devices` lets most tests skip spawning a real
+    /// `device_monitor.rs` background thread (a real netlink socket
+    /// per `LibraryHandle::open` call adds real, if small, overhead
+    /// across dozens of tests that don't care about §4 at all). Always
+    /// [`JOURNAL_PRUNE_RETENTION`]/`true` from the public
+    /// [`LibraryHandle::open`].
+    fn open_impl(
+        library_path: &Path,
+        retention: u64,
+        monitor_devices: bool,
+    ) -> Result<Self, LibraryHandleError> {
         let handle_dir = library_path.join(LIBRARY_HANDLE_DIR_NAME);
         fs::create_dir_all(&handle_dir)?;
 
@@ -304,10 +346,20 @@ impl LibraryHandle {
         let checkpoint_path = handle_dir.join(JOURNAL_CHECKPOINT_FILE_NAME);
         let head = recover_journal(&journal_dir, &checkpoint_path, retention)?;
 
+        let state = Arc::new(Mutex::new(HandleState::Open));
+        #[cfg(unix)]
+        if monitor_devices {
+            if let Some(device_name) = resolve_device_name(library_path) {
+                crate::device_monitor::spawn_device_monitor(device_name, Arc::downgrade(&state));
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = monitor_devices;
+
         Ok(LibraryHandle {
             library_path: library_path.to_path_buf(),
             tier: classify_storage_tier(library_path),
-            state: Mutex::new(HandleState::Open),
+            state,
             journal_dir,
             journal_head: Mutex::new(head),
             _lock_file: lock_file,
@@ -780,6 +832,34 @@ fn classify_storage_tier(path: &Path) -> StorageTier {
     classify_from_device_and_fstype(&device, &fstype)
 }
 
+/// The bare device name (`/proc/mounts`'s device column with its
+/// `/dev/` prefix stripped, e.g. `"sdb1"`) backing `path`'s mount --
+/// what `device_monitor.rs`'s netlink watcher matches a `remove`
+/// uevent's `DEVNAME` field against. `None` if `path`'s mount can't be
+/// determined (no `/dev/...` device, e.g. `tmpfs`/`overlay`, or
+/// `/proc/mounts` itself is unavailable) -- there is nothing for a
+/// device-removal monitor to usefully watch in that case, so
+/// [`LibraryHandle::open_impl`] simply doesn't spawn one.
+#[cfg(unix)]
+fn resolve_device_name(path: &Path) -> Option<String> {
+    let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let mounts = fs::read_to_string("/proc/mounts").ok()?;
+    let (device, _fstype) = best_matching_mount(&mounts, &target)?;
+    device.strip_prefix("/dev/").map(|s| s.to_string())
+}
+
+#[cfg(windows)]
+fn resolve_device_name(_path: &Path) -> Option<String> {
+    // Real device-removal monitoring on Windows needs
+    // `RegisterDeviceNotificationW` -- see this crate's
+    // `device_monitor.rs` module doc for why that isn't implemented
+    // here. `None` means `LibraryHandle::open_impl` simply doesn't
+    // spawn a monitor thread on Windows, the same "disclosed
+    // no-op, not a guess" shape every other Windows gap in this
+    // module uses.
+    None
+}
+
 #[cfg(windows)]
 fn classify_storage_tier(_path: &Path) -> StorageTier {
     // Real classification needs `GetDriveTypeW`, which this port
@@ -957,6 +1037,37 @@ mod tests {
         let dir = tempdir().unwrap();
         let handle = LibraryHandle::open(dir.path()).unwrap();
         assert_ne!(handle.tier(), StorageTier::Network);
+    }
+
+    #[test]
+    fn resolve_device_name_finds_a_real_device_for_a_tempdir() {
+        // tempdir() lives on a real mounted filesystem (this
+        // machine's actual disk, not a synthetic/virtual one), so
+        // there should be a real `/dev/...`-derived name to resolve
+        // -- and, critically, this must not panic regardless.
+        let dir = tempdir().unwrap();
+        let name = resolve_device_name(dir.path());
+        assert!(
+            name.as_ref()
+                .map_or(true, |n| !n.is_empty() && !n.contains('/')),
+            "device name = {name:?}"
+        );
+    }
+
+    #[test]
+    fn open_via_the_public_api_spawns_a_device_monitor_without_affecting_the_handle() {
+        // `LibraryHandle::open` (not `open_impl`) always monitors --
+        // this is the one test in this file proving that real, public
+        // code path doesn't panic, error, or otherwise disturb a
+        // normal open (the monitor thread itself is exercised more
+        // directly by `device_monitor.rs`'s own tests).
+        let dir = tempdir().unwrap();
+        let handle = LibraryHandle::open(dir.path()).unwrap();
+        assert_eq!(handle.state(), HandleState::Open);
+        handle
+            .write_atomic(&dir.path().join("x.opf"), b"y")
+            .unwrap();
+        assert_eq!(handle.state(), HandleState::Open);
     }
 
     // --- fault-injection: docs/FAULT_TOLERANCE.md's "kill process at
@@ -1252,14 +1363,14 @@ mod tests {
     fn reopening_under_the_retention_limit_prunes_nothing() {
         let dir = tempdir().unwrap();
         {
-            let handle = LibraryHandle::open_impl(dir.path(), 3).unwrap();
+            let handle = LibraryHandle::open_impl(dir.path(), 3, false).unwrap();
             for i in 0..3 {
                 handle
                     .write_atomic(&dir.path().join(format!("{i}.opf")), b"x")
                     .unwrap();
             }
         }
-        LibraryHandle::open_impl(dir.path(), 3).unwrap();
+        LibraryHandle::open_impl(dir.path(), 3, false).unwrap();
         assert_eq!(op_file_count(&journal_dir_of(dir.path())), 3);
         assert!(!dir
             .path()
@@ -1272,7 +1383,7 @@ mod tests {
     fn reopening_over_the_retention_limit_prunes_the_oldest_entries() {
         let dir = tempdir().unwrap();
         {
-            let handle = LibraryHandle::open_impl(dir.path(), 3).unwrap();
+            let handle = LibraryHandle::open_impl(dir.path(), 3, false).unwrap();
             for i in 0..5 {
                 handle
                     .write_atomic(&dir.path().join(format!("{i}.opf")), b"x")
@@ -1280,7 +1391,7 @@ mod tests {
             }
         }
         // Recovery on this open settles all 5, then prunes down to 3.
-        LibraryHandle::open_impl(dir.path(), 3).unwrap();
+        LibraryHandle::open_impl(dir.path(), 3, false).unwrap();
         let journal_dir = journal_dir_of(dir.path());
         assert_eq!(op_file_count(&journal_dir), 3);
 
@@ -1307,7 +1418,7 @@ mod tests {
     fn writes_after_pruning_still_chain_correctly_from_the_checkpoint() {
         let dir = tempdir().unwrap();
         {
-            let handle = LibraryHandle::open_impl(dir.path(), 2).unwrap();
+            let handle = LibraryHandle::open_impl(dir.path(), 2, false).unwrap();
             for i in 0..4 {
                 handle
                     .write_atomic(&dir.path().join(format!("{i}.opf")), b"x")
@@ -1315,7 +1426,7 @@ mod tests {
             }
         }
         // This open prunes seq 0-1 away, keeping 2-3.
-        let handle = LibraryHandle::open_impl(dir.path(), 2).unwrap();
+        let handle = LibraryHandle::open_impl(dir.path(), 2, false).unwrap();
         handle
             .write_atomic(&dir.path().join("new.opf"), b"y")
             .unwrap();
@@ -1324,7 +1435,7 @@ mod tests {
         // A fresh open must still verify cleanly -- the new entry's
         // prev_head chains onto the last pre-prune entry's hash, which
         // the checkpoint (not a deleted file) now supplies.
-        let handle = LibraryHandle::open_impl(dir.path(), 2).unwrap();
+        let handle = LibraryHandle::open_impl(dir.path(), 2, false).unwrap();
         assert_eq!(handle.state(), HandleState::Open);
         assert_eq!(fs::read(dir.path().join("new.opf")).unwrap(), b"y");
     }
@@ -1337,7 +1448,7 @@ mod tests {
         // succeeds and finishes deleting them.
         let dir = tempdir().unwrap();
         {
-            let handle = LibraryHandle::open_impl(dir.path(), 100).unwrap();
+            let handle = LibraryHandle::open_impl(dir.path(), 100, false).unwrap();
             for i in 0..3 {
                 handle
                     .write_atomic(&dir.path().join(format!("{i}.opf")), b"x")
@@ -1371,7 +1482,7 @@ mod tests {
         )
         .unwrap();
 
-        let handle = LibraryHandle::open_impl(dir.path(), 100).unwrap();
+        let handle = LibraryHandle::open_impl(dir.path(), 100, false).unwrap();
         assert_eq!(handle.state(), HandleState::Open);
         // The stale, already-superseded entry 0 and 1 files are
         // cleaned up by the recovery scan itself.
