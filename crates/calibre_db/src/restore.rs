@@ -273,7 +273,16 @@ where
     if db_path.exists() {
         let backup_path = lib_path.join("metadata_pre_restore.db");
         if backup_path.exists() {
-            fs::remove_file(&backup_path).context("Failed to remove old backup DB")?;
+            // Port of issue #93's crate-wide write-path retrofit: real,
+            // journaled, crash-safe removal of the stale backup through
+            // `LibraryHandle` instead of a raw `fs::remove_file`. The
+            // `metadata.db` swap just below stays a raw `fs::rename`
+            // deliberately -- it needs its own design pass (see
+            // `library_handle.rs`'s module doc), not a blind swap.
+            crate::library_handle::LibraryHandle::open(lib_path)
+                .context("Failed to open library handle")?
+                .remove_atomic(&backup_path)
+                .context("Failed to remove old backup DB")?;
         }
         fs::rename(&db_path, &backup_path).context("Failed to backup existing DB")?;
         progress_callback(format!("Backed up existing database to {:?}", backup_path));

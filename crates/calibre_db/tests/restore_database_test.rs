@@ -66,6 +66,47 @@ fn restore_preserves_the_original_book_id_from_the_opfs_calibre_identifier() {
 }
 
 #[test]
+fn restore_database_removes_a_stale_pre_restore_backup_through_the_real_library_handle() {
+    let dir = tempdir().unwrap();
+    let library_path = dir.path().to_path_buf();
+
+    {
+        let _library = Library::create(library_path.clone()).expect("Failed to create library");
+        let book_dir = library_path.join("Test Author").join("Test Book");
+        let mut meta = MetaInformation::default();
+        meta.title = "Test Book".to_string();
+        meta.authors = vec!["Test Author".to_string()];
+        write_opf(&book_dir, &meta);
+    }
+
+    // Leave `metadata.db` in place (unlike the other tests above) so
+    // `restore_database`'s backup branch runs, and pre-seed a stale
+    // backup from some earlier restore attempt so the removal branch
+    // actually executes.
+    let backup_path = library_path.join("metadata_pre_restore.db");
+    fs::write(&backup_path, b"stale backup").unwrap();
+
+    let report = restore::restore_database(&library_path, |_| {}).expect("Restore failed");
+    assert_eq!(report.restored, 1);
+
+    // The stale backup was removed and replaced by the just-backed-up
+    // real `metadata.db` -- not left as the old stale content.
+    assert_ne!(fs::read(&backup_path).unwrap(), b"stale backup");
+
+    // restore_database now removes the stale backup through the real
+    // LibraryHandle (issue #93's crate-wide write-path retrofit), not
+    // a raw `fs::remove_file` -- prove it by checking a real journal
+    // entry landed.
+    let journal_dir = library_path.join(".calibre-oxide").join("journal");
+    let op_files: Vec<_> = fs::read_dir(&journal_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("op"))
+        .collect();
+    assert_eq!(op_files.len(), 1, "expected a real journaled delete");
+}
+
+#[test]
 fn restore_relinks_tags_series_publisher_rating_and_identifiers() {
     let dir = tempdir().unwrap();
     let library_path = dir.path().to_path_buf();
