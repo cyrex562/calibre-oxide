@@ -172,17 +172,33 @@
 //! network-storage write-path safety" fold in this file's source for
 //! the implementation and its own, more detailed disclosure.
 //!
-//! **Deliberately not done in phase 6**: §6's "two-phase variant of
-//! the journal" for operations that mutate *multiple* network files
-//! at once (e.g. a book-move = directory rename + `metadata.db`
-//! update, staged together, only committed once both succeed). This
-//! crate's journal has no multi-operation batch concept spanning
-//! several `LibraryHandle` calls at all -- each call is its own
-//! independently-recoverable unit (`Cache::rename_book_files`'s own
-//! doc comment discloses the exact same gap for local storage). Making
-//! *that* genuinely two-phase-safe on network storage is a materially
-//! bigger feature, tracked as a real, separate follow-up rather than
-//! silently left implicit.
+//! **Phase 6b** (also issue #257): §6's "two-phase variant of the
+//! journal" for an operation that mutates *multiple* network files at
+//! once -- §6's own named example, and this crate's one real caller,
+//! is a book move (`Cache::rename_book_files`): a directory rename
+//! plus each of its files' own rename. [`LibraryHandle::begin_network_batch`]/
+//! [`NetworkBatch`] journal the *whole* set of steps as one
+//! `OperationDescriptor::Batch` entry before any of them run, then
+//! executes each step in order; `Cache::rename_book_files` uses it
+//! whenever the handle's tier is `Network` (discovering every rename
+//! it'll need from the *pre-move* directory listing, since the local-
+//! tier code's "list the directory after moving it" approach doesn't
+//! work when nothing may move until the whole batch is staged). See
+//! [`NetworkBatch`]'s own doc for the full design, in particular why
+//! forward-only idempotent completion (not true transactional
+//! rollback) is the right recovery model for a batch of renames/
+//! removals specifically.
+//!
+//! **Deliberately out of scope, even for phase 6b**: including the
+//! `metadata.db` update ("flip references") inside the same atomic
+//! unit §6's own wording describes. `LibraryHandle` has no connection
+//! to any SQLite connection at all -- the same architectural boundary
+//! issue #260 tracks separately for WAL checkpointing -- so the DB
+//! update stays the caller's own separate step immediately after a
+//! successful `commit()`, same as every other `LibraryHandle` write
+//! primitive already works. A crash between a successful batch commit
+//! and the DB update is a real, smaller, different-shaped gap than
+//! the one phase 6b closes; not addressed here.
 //!
 //! No real network filesystem (SMB/NFS/WebDAV) exists on this dev box
 //! to test phase 6 against. What's verified is the logic -- local-
@@ -237,15 +253,19 @@
 //!
 //! # Not done yet (disclosed, tracked as later work)
 //!
-//! - **§6 network-storage two-phase writes (issue #257) -- per-
-//!   operation safety done (phase 6, above), the multi-file batch
-//!   case not started.** Every individual `write_atomic`/
-//!   `copy_atomic`/`rename_atomic`/`remove_atomic` call is now real
-//!   and safe on `StorageTier::Network`; an operation that mutates
-//!   *multiple* network files as one logical unit (e.g. a book move)
-//!   is not yet staged/committed as a true two-phase unit -- see phase
-//!   6's own paragraph above for why that's a separate, bigger
-//!   feature.
+//! - **§6 network-storage writes (issue #257) -- done, both halves.**
+//!   Every individual `write_atomic`/`copy_atomic`/`rename_atomic`/
+//!   `remove_atomic` call is real and safe on `StorageTier::Network`
+//!   (phase 6), and an operation that mutates *multiple* network files
+//!   as one logical unit (§6's own "book move" example) is now staged/
+//!   committed as a real two-phase batch via [`NetworkBatch`] (phase
+//!   6b) -- see both paragraphs above. The one thing still explicitly
+//!   out of scope: folding the `metadata.db` update into that same
+//!   atomic unit, which would need `LibraryHandle` to gain a
+//!   connection to the SQLite database it doesn't have (issue #260's
+//!   territory). Also still open: real validation against an actual
+//!   network mount (#262 NFS, #263 SMB, #264 S3-backed FUSE, #265
+//!   Google Drive) -- everything here is logic-verified only.
 //! - **The crate-wide write-path retrofit -- done.**
 //!   [`Backend::write_handle`](crate::backend::Backend::write_handle)
 //!   is the real entry point: lazily opens (and caches, shared across
@@ -451,6 +471,26 @@ enum OperationDescriptor {
     DeleteFile {
         target: PathBuf,
     },
+    /// §6's "two-phase variant of the journal" for a
+    /// [`StorageTier::Network`] operation that mutates multiple files
+    /// as one logical unit -- §6's own named example, and this
+    /// crate's one real caller: a book move (`Cache::rename_book_files`)
+    /// is a directory rename plus each of its files' own rename. See
+    /// [`NetworkBatch`]'s doc for the full design and why forward-only
+    /// idempotent completion (not true rollback) is the right recovery
+    /// model here.
+    Batch {
+        steps: Vec<BatchStep>,
+    },
+}
+
+/// One step inside an [`OperationDescriptor::Batch`]. Deliberately
+/// narrower than a general transaction primitive -- only what
+/// `Cache::rename_book_files` (the one real caller today) needs.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+enum BatchStep {
+    Rename { from: PathBuf, to: PathBuf },
+    Delete { target: PathBuf },
 }
 
 /// One journal entry -- port of §2 step 2's four fields exactly:
@@ -939,7 +979,12 @@ impl Shared {
             }
         }
 
-        match recover_journal(&self.journal_dir, &self.checkpoint_path, self.retention) {
+        match recover_journal(
+            &self.journal_dir,
+            &self.checkpoint_path,
+            self.retention,
+            &self.network_retry_policy,
+        ) {
             Ok(head) => {
                 *self.journal_head.lock().unwrap() = head;
                 *self.lock_file.lock().unwrap() = Some(lock_file);
@@ -957,14 +1002,18 @@ impl Shared {
 // Per-operation safety for `StorageTier::Network`: `write_atomic`/
 // `copy_atomic`/`rename_atomic`/`remove_atomic` all branch on `self.tier`
 // and, when it's `Network`, route through the functions below instead of
-// their local-tier sequence. Scope, deliberately: this makes each
-// *individual* operation safe against transient network failures and
-// silent corruption -- it does NOT implement §6's "two-phase variant of
-// the journal" for operations that mutate multiple network files at once
-// (e.g. a book-move = directory rename + `metadata.db` update); that's a
-// materially bigger feature (this crate's journal has no multi-operation
-// batch concept spanning several `LibraryHandle` calls at all -- see
-// `rename_book_files`'s own disclosure) and is tracked separately.
+// their local-tier sequence -- makes each *individual* operation safe
+// against transient network failures and silent corruption.
+//
+// This section also has §6's "two-phase variant of the journal" for an
+// operation that mutates multiple network files at once (`NetworkBatch`,
+// used by `Cache::rename_book_files` on `Network` tier) -- journals the
+// whole set of steps as one entry before any of them run, then drives
+// them forward to completion, in order. What it deliberately does NOT
+// do: fold the `metadata.db` update ("flip references") into that same
+// atomic unit -- `LibraryHandle` has no connection to any SQLite
+// connection at all (issue #260's territory), so that stays the
+// caller's own separate step right after a successful `commit()`.
 //
 // No real network filesystem (SMB/NFS/WebDAV) is available on this dev
 // box to test against. What's verified here is the *logic* -- local-
@@ -1114,6 +1163,132 @@ fn simulated_network_fault() -> LibraryHandleError {
     LibraryHandleError::Io(io::Error::other("simulated network fault (test-only)"))
 }
 
+/// Idempotently completes one [`BatchStep`] -- shared by
+/// [`NetworkBatch::commit`]'s live execution and `recover_one`'s
+/// `Batch` arm, so "finish this step" is one real code path rather
+/// than two hand-written near-duplicates that could drift (same
+/// discipline `remove_atomic_impl`'s doc already establishes for
+/// `DeleteFile`). An already-applied step is detected and skipped --
+/// exactly what lets a crash-then-reopen finish only the *remaining*
+/// steps of a partially-completed batch instead of blindly redoing
+/// (and potentially erroring on) ones that already succeeded.
+fn complete_batch_step(step: &BatchStep, policy: &RetryPolicy) -> Result<(), LibraryHandleError> {
+    match step {
+        BatchStep::Rename { from, to } => {
+            if to.exists() && !from.exists() {
+                return Ok(());
+            }
+            retry_network_op(policy, || {
+                fs::rename(from, to)?;
+                if to.exists() && !from.exists() {
+                    Ok(())
+                } else {
+                    Err(io::Error::other(format!(
+                        "rename from {} to {} did not take effect as expected \
+                         (server-side rename semantics may differ from POSIX)",
+                        from.display(),
+                        to.display()
+                    )))
+                }
+            })
+        }
+        BatchStep::Delete { target } => retry_network_op(policy, || remove_path(target)),
+    }
+}
+
+/// §6's "two-phase variant of the journal" for a
+/// [`StorageTier::Network`] operation that mutates multiple files as
+/// one logical unit -- built via [`LibraryHandle::begin_network_batch`],
+/// staged with [`NetworkBatch::stage_rename`]/[`NetworkBatch::stage_remove`],
+/// and made real with [`NetworkBatch::commit`].
+///
+/// Deliberately scoped to file operations only -- §6 also mentions
+/// "flip references in metadata.db" as part of the same two-phase
+/// unit, but `LibraryHandle` has no connection to any SQLite
+/// connection at all (the same architectural boundary issue #260
+/// tracks separately for WAL checkpointing), and folding a DB update
+/// into this primitive would mean deciding that question here too
+/// instead of on its own terms. The DB update stays the caller's own
+/// separate step immediately after a successful `commit()`, same as
+/// every other `LibraryHandle` write primitive.
+///
+/// # Why "prepare all changes, then flip" doesn't need true rollback
+///
+/// A real two-phase-commit protocol needs to be able to undo already-
+/// applied steps if a later step permanently fails. This one doesn't,
+/// because every [`BatchStep`] is individually idempotent-to-complete-
+/// forward: a rename either hasn't happened yet (safe to do now) or
+/// already has (safe to skip), and a delete is already idempotent by
+/// design (`remove_atomic`'s own doc explains why). So instead of
+/// rollback, `commit()` and `recover_one`'s `Batch` arm share one
+/// operation (`complete_batch_step`) that always drives every step
+/// *forward* to completion, in order, skipping whatever's already
+/// done. The one thing that has to happen before any of that is
+/// allowed to run is journaling the *whole* batch as a single
+/// `OperationDescriptor::Batch` entry, up front -- that's the actual
+/// "prepare" step: once it's durably on disk, the set of steps still
+/// to complete is fully known regardless of when or where a crash
+/// happens, so recovery on the next [`LibraryHandle::open`] can always
+/// finish the job non-interactively, without needing the original
+/// caller (long gone if the process actually crashed) around to
+/// decide anything.
+pub struct NetworkBatch<'a> {
+    handle: &'a LibraryHandle,
+    steps: Vec<BatchStep>,
+}
+
+impl<'a> NetworkBatch<'a> {
+    pub fn stage_rename(&mut self, from: &Path, to: &Path) {
+        self.steps.push(BatchStep::Rename {
+            from: from.to_path_buf(),
+            to: to.to_path_buf(),
+        });
+    }
+
+    pub fn stage_remove(&mut self, target: &Path) {
+        self.steps.push(BatchStep::Delete {
+            target: target.to_path_buf(),
+        });
+    }
+
+    /// Journals the whole batch as one atomic unit, then completes
+    /// every staged step in order. An empty batch (nothing staged) is
+    /// a no-op -- no journal entry, nothing to commit.
+    pub fn commit(self) -> Result<(), LibraryHandleError> {
+        self.commit_impl(None)
+    }
+
+    /// `fail_after_step` is a test-only fault-injection hook (see
+    /// module doc's fault-injection pattern): `Some(i)` simulates a
+    /// crash right after step `i` completes, before any later step
+    /// runs and before the batch's own commit marker is written --
+    /// leaving the journal entry outstanding for the next
+    /// `LibraryHandle::open`'s recovery to pick up and finish.
+    fn commit_impl(self, fail_after_step: Option<usize>) -> Result<(), LibraryHandleError> {
+        let shared = &self.handle.shared;
+        shared.check_open()?;
+        if self.steps.is_empty() {
+            return Ok(());
+        }
+
+        let uuid = Uuid::new_v4();
+        let op = OperationDescriptor::Batch {
+            steps: self.steps.clone(),
+        };
+        shared.journal_write(uuid, op)?;
+
+        for (i, step) in self.steps.iter().enumerate() {
+            complete_batch_step(step, &shared.network_retry_policy)?;
+            if fail_after_step == Some(i) {
+                return Err(simulated_crash());
+            }
+        }
+
+        shared.journal_commit(uuid)?;
+        Ok(())
+    }
+}
+
 /// Test-only fault injection for the §6 retry paths, deliberately
 /// shaped differently from [`FailPoint`]: `FailPoint` simulates a
 /// *permanent* crash at a given step (testing journal-recovery-on-
@@ -1229,6 +1404,26 @@ impl LibraryHandle {
         )
     }
 
+    /// Test-only, `pub(crate)`: the same forced-`Network`-tier
+    /// construction as [`LibraryHandle::open_impl_network_test`], with
+    /// the real (not sped-up) §6 retry policy -- for other modules'
+    /// tests (e.g. `cache.rs`'s) that need a real `Network`-tier
+    /// handle to exercise a caller's tier-branching logic end to end,
+    /// but aren't themselves testing retry/backoff timing (so don't
+    /// need [`RetryPolicy`] exposed to them at all). Kept as a plain
+    /// free function rather than widening `RetryPolicy`'s or
+    /// `open_impl_network_test`'s own visibility beyond this module.
+    #[cfg(test)]
+    pub(crate) fn open_for_network_tier_test(
+        library_path: &Path,
+    ) -> Result<Self, LibraryHandleError> {
+        Self::open_impl_network_test(
+            library_path,
+            JOURNAL_PRUNE_RETENTION,
+            REAL_NETWORK_RETRY_POLICY,
+        )
+    }
+
     fn open_impl_inner(
         library_path: &Path,
         retention: u64,
@@ -1250,12 +1445,6 @@ impl LibraryHandle {
             Err(fs::TryLockError::Error(e)) => return Err(LibraryHandleError::Io(e)),
         }
 
-        let journal_dir = handle_dir.join(JOURNAL_DIR_NAME);
-        let checkpoint_path = handle_dir.join(JOURNAL_CHECKPOINT_FILE_NAME);
-        let head = recover_journal(&journal_dir, &checkpoint_path, retention)?;
-        let library_id = load_or_create_library_id(&handle_dir)?;
-        let fingerprint = compute_fingerprint(library_path, &library_id)?;
-
         let (tier, network_retry_policy) = match force_tier_and_policy {
             Some((tier, policy)) => (tier, policy),
             None => (
@@ -1263,6 +1452,17 @@ impl LibraryHandle {
                 REAL_NETWORK_RETRY_POLICY,
             ),
         };
+
+        let journal_dir = handle_dir.join(JOURNAL_DIR_NAME);
+        let checkpoint_path = handle_dir.join(JOURNAL_CHECKPOINT_FILE_NAME);
+        let head = recover_journal(
+            &journal_dir,
+            &checkpoint_path,
+            retention,
+            &network_retry_policy,
+        )?;
+        let library_id = load_or_create_library_id(&handle_dir)?;
+        let fingerprint = compute_fingerprint(library_path, &library_id)?;
 
         let shared = Arc::new(Shared {
             library_path: library_path.to_path_buf(),
@@ -1354,6 +1554,20 @@ impl LibraryHandle {
     /// under this discipline.
     pub fn remove_atomic(&self, target: &Path) -> Result<(), LibraryHandleError> {
         self.remove_atomic_impl(target, None)
+    }
+
+    /// §6's two-phase multi-file batch for [`StorageTier::Network`]
+    /// (issue #257's remaining scope) -- see [`NetworkBatch`]'s doc
+    /// for the full design. Works regardless of the handle's actual
+    /// tier (no artificial restriction here); it's the caller's job
+    /// to decide when reaching for a batch is warranted, same as
+    /// every other `LibraryHandle` primitive doesn't gate itself on
+    /// tier either.
+    pub fn begin_network_batch(&self) -> NetworkBatch<'_> {
+        NetworkBatch {
+            handle: self,
+            steps: Vec::new(),
+        }
     }
 
     /// `fail_after` is a test-only fault-injection hook (see module
@@ -1474,6 +1688,7 @@ fn recover_journal(
     journal_dir: &Path,
     checkpoint_path: &Path,
     retention: u64,
+    network_retry_policy: &RetryPolicy,
 ) -> Result<JournalHead, LibraryHandleError> {
     fs::create_dir_all(journal_dir)?;
 
@@ -1538,7 +1753,7 @@ fn recover_journal(
         next_seq = entry.seq + 1;
         live.push((entry.seq, *uuid, entry.descriptor_hash.clone()));
 
-        recover_one(journal_dir, *uuid, entry)?;
+        recover_one(journal_dir, *uuid, entry, network_retry_policy)?;
     }
 
     prune_if_needed(journal_dir, checkpoint_path, boundary_seq, retention, &live)?;
@@ -1625,6 +1840,7 @@ fn recover_one(
     journal_dir: &Path,
     uuid: Uuid,
     entry: &JournalEntry,
+    network_retry_policy: &RetryPolicy,
 ) -> Result<(), LibraryHandleError> {
     let committed_path = journal_dir.join(format!("{uuid}.committed"));
     if committed_path.exists() {
@@ -1687,6 +1903,21 @@ fn recover_one(
             // doc for why a partial directory removal is never unsafe
             // to complete this way).
             remove_path(target)?;
+            mark_committed(&committed_path)?;
+        }
+        OperationDescriptor::Batch { steps } => {
+            // Same idempotent-forward-completion reasoning as
+            // `DeleteFile` above, applied per step -- see
+            // `NetworkBatch`'s doc for why this is safe (and correct)
+            // instead of needing true rollback: every step is
+            // individually idempotent to complete, and the whole set
+            // was journaled as this one entry *before* any of them
+            // ran, so finishing whichever ones didn't complete yet is
+            // always the right recovery action regardless of where a
+            // crash landed.
+            for step in steps {
+                complete_batch_step(step, network_retry_policy)?;
+            }
             mark_committed(&committed_path)?;
         }
     }
@@ -2855,8 +3086,15 @@ mod tests {
 
     // --- §6 network-storage write-path safety (issue #93, #257) {{{
 
+    /// Deliberately does NOT call `flock_test_guard()` itself --
+    /// `std::sync::Mutex` isn't reentrant, and a test that needs the
+    /// guard held for its *whole* body (anything that reopens the
+    /// same directory, not just a single call to this helper) would
+    /// deadlock locking it twice on the same thread. Every test that
+    /// needs the guard acquires it itself, as its first statement,
+    /// same convention as every other `open_impl`-based test in this
+    /// file.
     fn open_network_test(dir: &Path, policy: RetryPolicy) -> LibraryHandle {
-        let _flock_test_guard = flock_test_guard();
         LibraryHandle::open_impl_network_test(dir, JOURNAL_PRUNE_RETENTION, policy).unwrap()
     }
 
@@ -2917,6 +3155,7 @@ mod tests {
 
     #[test]
     fn write_atomic_on_network_tier_writes_and_verifies_via_read_back_hash() {
+        let _flock_test_guard = flock_test_guard();
         set_simulated_network_fault_countdown(0);
         let dir = tempdir().unwrap();
         let handle = open_network_test(dir.path(), FAST_TEST_RETRY_POLICY);
@@ -2939,6 +3178,7 @@ mod tests {
 
     #[test]
     fn write_atomic_on_network_tier_retries_transient_faults_and_succeeds() {
+        let _flock_test_guard = flock_test_guard();
         set_simulated_network_fault_countdown(2);
         let dir = tempdir().unwrap();
         let handle = open_network_test(dir.path(), FAST_TEST_RETRY_POLICY);
@@ -2952,6 +3192,7 @@ mod tests {
 
     #[test]
     fn write_atomic_on_network_tier_gives_up_after_the_retry_budget_and_bubbles_up_the_error() {
+        let _flock_test_guard = flock_test_guard();
         set_simulated_network_fault_countdown(u32::MAX);
         let dir = tempdir().unwrap();
         let handle = open_network_test(dir.path(), FAST_TEST_RETRY_POLICY);
@@ -2966,6 +3207,7 @@ mod tests {
 
     #[test]
     fn write_atomic_on_network_tier_journals_exactly_one_entry_even_after_retries() {
+        let _flock_test_guard = flock_test_guard();
         set_simulated_network_fault_countdown(2);
         let dir = tempdir().unwrap();
         let handle = open_network_test(dir.path(), FAST_TEST_RETRY_POLICY);
@@ -2997,6 +3239,7 @@ mod tests {
 
     #[test]
     fn copy_atomic_on_network_tier_copies_and_verifies_via_read_back_hash() {
+        let _flock_test_guard = flock_test_guard();
         set_simulated_network_fault_countdown(0);
         let dir = tempdir().unwrap();
         let handle = open_network_test(dir.path(), FAST_TEST_RETRY_POLICY);
@@ -3013,6 +3256,7 @@ mod tests {
 
     #[test]
     fn copy_atomic_on_network_tier_retries_transient_faults_and_succeeds() {
+        let _flock_test_guard = flock_test_guard();
         set_simulated_network_fault_countdown(2);
         let dir = tempdir().unwrap();
         let handle = open_network_test(dir.path(), FAST_TEST_RETRY_POLICY);
@@ -3028,6 +3272,7 @@ mod tests {
 
     #[test]
     fn rename_atomic_on_network_tier_renames() {
+        let _flock_test_guard = flock_test_guard();
         set_simulated_network_fault_countdown(0);
         let dir = tempdir().unwrap();
         let handle = open_network_test(dir.path(), FAST_TEST_RETRY_POLICY);
@@ -3043,6 +3288,7 @@ mod tests {
 
     #[test]
     fn rename_atomic_on_network_tier_retries_transient_faults_and_succeeds() {
+        let _flock_test_guard = flock_test_guard();
         set_simulated_network_fault_countdown(2);
         let dir = tempdir().unwrap();
         let handle = open_network_test(dir.path(), FAST_TEST_RETRY_POLICY);
@@ -3059,6 +3305,7 @@ mod tests {
 
     #[test]
     fn remove_atomic_on_network_tier_removes() {
+        let _flock_test_guard = flock_test_guard();
         set_simulated_network_fault_countdown(0);
         let dir = tempdir().unwrap();
         let handle = open_network_test(dir.path(), FAST_TEST_RETRY_POLICY);
@@ -3072,6 +3319,7 @@ mod tests {
 
     #[test]
     fn remove_atomic_on_network_tier_retries_transient_faults_and_succeeds() {
+        let _flock_test_guard = flock_test_guard();
         set_simulated_network_fault_countdown(2);
         let dir = tempdir().unwrap();
         let handle = open_network_test(dir.path(), FAST_TEST_RETRY_POLICY);
@@ -3101,6 +3349,262 @@ mod tests {
         );
 
         assert!(matches!(result, Err(LibraryHandleError::Corruption(_))));
+    }
+
+    #[test]
+    fn network_batch_commits_every_staged_step() {
+        let _flock_test_guard = flock_test_guard();
+        set_simulated_network_fault_countdown(0);
+        let dir = tempdir().unwrap();
+        let handle = open_network_test(dir.path(), FAST_TEST_RETRY_POLICY);
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        fs::write(&a, b"a").unwrap();
+        fs::write(&b, b"b").unwrap();
+        let a2 = dir.path().join("a2.txt");
+        let b2 = dir.path().join("b2.txt");
+
+        let mut batch = handle.begin_network_batch();
+        batch.stage_rename(&a, &a2);
+        batch.stage_rename(&b, &b2);
+        batch.commit().unwrap();
+
+        assert!(!a.exists());
+        assert!(!b.exists());
+        assert_eq!(fs::read(&a2).unwrap(), b"a");
+        assert_eq!(fs::read(&b2).unwrap(), b"b");
+    }
+
+    #[test]
+    fn network_batch_supports_staged_removal() {
+        let _flock_test_guard = flock_test_guard();
+        set_simulated_network_fault_countdown(0);
+        let dir = tempdir().unwrap();
+        let handle = open_network_test(dir.path(), FAST_TEST_RETRY_POLICY);
+        let a = dir.path().join("a.txt");
+        let old_dir = dir.path().join("now-empty");
+        fs::create_dir_all(&old_dir).unwrap();
+        fs::write(&a, b"a").unwrap();
+        let a2 = dir.path().join("a2.txt");
+
+        let mut batch = handle.begin_network_batch();
+        batch.stage_rename(&a, &a2);
+        batch.stage_remove(&old_dir);
+        batch.commit().unwrap();
+
+        assert_eq!(fs::read(&a2).unwrap(), b"a");
+        assert!(!old_dir.exists());
+    }
+
+    #[test]
+    fn network_batch_with_no_steps_is_a_no_op_and_journals_nothing() {
+        let _flock_test_guard = flock_test_guard();
+        set_simulated_network_fault_countdown(0);
+        let dir = tempdir().unwrap();
+        let handle = open_network_test(dir.path(), FAST_TEST_RETRY_POLICY);
+
+        handle.begin_network_batch().commit().unwrap();
+
+        let journal_dir = dir.path().join(".calibre-oxide").join("journal");
+        let op_files: Vec<_> = fs::read_dir(&journal_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("op"))
+            .collect();
+        assert!(op_files.is_empty());
+    }
+
+    #[test]
+    fn network_batch_journals_exactly_one_entry_for_the_whole_batch() {
+        let _flock_test_guard = flock_test_guard();
+        set_simulated_network_fault_countdown(0);
+        let dir = tempdir().unwrap();
+        let handle = open_network_test(dir.path(), FAST_TEST_RETRY_POLICY);
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        fs::write(&a, b"a").unwrap();
+        fs::write(&b, b"b").unwrap();
+
+        let mut batch = handle.begin_network_batch();
+        batch.stage_rename(&a, dir.path().join("a2.txt").as_path());
+        batch.stage_rename(&b, dir.path().join("b2.txt").as_path());
+        batch.commit().unwrap();
+
+        let journal_dir = dir.path().join(".calibre-oxide").join("journal");
+        let op_files: Vec<_> = fs::read_dir(&journal_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("op"))
+            .collect();
+        assert_eq!(
+            op_files.len(),
+            1,
+            "a 2-step batch must journal one entry, not one per step"
+        );
+        let uuid = op_files[0]
+            .path()
+            .file_stem()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(journal_dir.join(format!("{uuid}.committed")).exists());
+    }
+
+    #[test]
+    fn network_batch_retries_a_transient_fault_within_one_step_and_succeeds() {
+        let _flock_test_guard = flock_test_guard();
+        set_simulated_network_fault_countdown(2);
+        let dir = tempdir().unwrap();
+        let handle = open_network_test(dir.path(), FAST_TEST_RETRY_POLICY);
+        let a = dir.path().join("a.txt");
+        fs::write(&a, b"a").unwrap();
+        let a2 = dir.path().join("a2.txt");
+
+        let mut batch = handle.begin_network_batch();
+        batch.stage_rename(&a, &a2);
+        batch.commit().unwrap();
+
+        assert_eq!(fs::read(&a2).unwrap(), b"a");
+        set_simulated_network_fault_countdown(0);
+    }
+
+    #[test]
+    fn complete_batch_step_skips_a_rename_thats_already_applied() {
+        let dir = tempdir().unwrap();
+        let from = dir.path().join("from.txt");
+        let to = dir.path().join("to.txt");
+        // The rename already happened by some other means -- `from`
+        // is gone, `to` already has the real content.
+        fs::write(&to, b"already moved").unwrap();
+
+        let step = BatchStep::Rename {
+            from: from.clone(),
+            to: to.clone(),
+        };
+        complete_batch_step(&step, &FAST_TEST_RETRY_POLICY).unwrap();
+
+        // Untouched -- `complete_batch_step` must not have tried to
+        // rename a nonexistent `from` onto `to` (which would error).
+        assert_eq!(fs::read(&to).unwrap(), b"already moved");
+    }
+
+    #[test]
+    fn a_crash_right_after_the_first_batch_step_leaves_the_second_step_undone() {
+        let dir = tempdir().unwrap();
+        let _flock_test_guard = flock_test_guard();
+        let handle = open_network_test(dir.path(), FAST_TEST_RETRY_POLICY);
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        fs::write(&a, b"a").unwrap();
+        fs::write(&b, b"b").unwrap();
+        let a2 = dir.path().join("a2.txt");
+        let b2 = dir.path().join("b2.txt");
+
+        let mut batch = handle.begin_network_batch();
+        batch.stage_rename(&a, &a2);
+        batch.stage_rename(&b, &b2);
+        let err = batch.commit_impl(Some(0));
+
+        assert!(err.is_err());
+        assert!(a2.exists(), "step 0 should have completed");
+        assert!(b.exists(), "step 1 should NOT have run yet");
+        assert!(!b2.exists());
+    }
+
+    #[test]
+    fn reopening_after_a_crash_mid_batch_completes_only_the_remaining_steps() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        let a2 = dir.path().join("a2.txt");
+        let b2 = dir.path().join("b2.txt");
+        {
+            let _flock_test_guard = flock_test_guard();
+            let handle = open_network_test(dir.path(), FAST_TEST_RETRY_POLICY);
+            fs::write(&a, b"a").unwrap();
+            fs::write(&b, b"b").unwrap();
+
+            let mut batch = handle.begin_network_batch();
+            batch.stage_rename(&a, &a2);
+            batch.stage_rename(&b, &b2);
+            let err = batch.commit_impl(Some(0));
+            assert!(err.is_err());
+            assert!(a2.exists());
+            assert!(b.exists());
+        }
+
+        let handle = open_network_test(dir.path(), FAST_TEST_RETRY_POLICY);
+
+        // Recovery finished the whole batch: step 0 (already done)
+        // was left alone, step 1 (never ran) was completed.
+        assert!(a2.exists());
+        assert_eq!(fs::read(&a2).unwrap(), b"a");
+        assert!(!b.exists());
+        assert_eq!(fs::read(&b2).unwrap(), b"b");
+
+        let journal_dir = dir.path().join(".calibre-oxide").join("journal");
+        let committed: Vec<_> = fs::read_dir(&journal_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("committed"))
+            .collect();
+        assert_eq!(
+            committed.len(),
+            1,
+            "recovery should finalize the batch's commit marker"
+        );
+        drop(handle);
+    }
+
+    #[test]
+    fn reopening_after_a_crash_before_the_batch_ever_started_still_completes_it() {
+        // Same shape as the delete primitive's equivalent test: hand-
+        // constructs the "journaled but the process died before
+        // touching the filesystem at all" case directly, rather than
+        // via `commit_impl`'s fault injection (which can only crash
+        // *after* a step, not before the very first one).
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        fs::write(&a, b"a").unwrap();
+        fs::write(&b, b"b").unwrap();
+        let a2 = dir.path().join("a2.txt");
+        let b2 = dir.path().join("b2.txt");
+
+        let journal_dir = dir.path().join(".calibre-oxide").join("journal");
+        fs::create_dir_all(&journal_dir).unwrap();
+        let op = OperationDescriptor::Batch {
+            steps: vec![
+                BatchStep::Rename {
+                    from: a.clone(),
+                    to: a2.clone(),
+                },
+                BatchStep::Rename {
+                    from: b.clone(),
+                    to: b2.clone(),
+                },
+            ],
+        };
+        let descriptor_hash = blake3_hex(&serde_json::to_vec(&op).unwrap());
+        let entry = JournalEntry {
+            seq: 0,
+            prev_head: None,
+            op,
+            descriptor_hash,
+        };
+        fs::write(
+            journal_dir.join(format!("{}.op", Uuid::new_v4())),
+            serde_json::to_vec(&entry).unwrap(),
+        )
+        .unwrap();
+
+        let handle = reopen_for_test(dir.path(), JOURNAL_PRUNE_RETENTION);
+        assert!(
+            a2.exists() && b2.exists(),
+            "recovery should complete a batch that never even started"
+        );
+        drop(handle);
     }
 
     // }}}

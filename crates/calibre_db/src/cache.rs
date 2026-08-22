@@ -585,18 +585,27 @@ impl Cache {
     /// individual rename/removal below goes through the real
     /// `LibraryHandle` (journaled, crash-safe, recovery-verified on
     /// the next open) instead of a raw `fs::rename`/`fs::remove_dir`.
-    /// This does NOT make the whole directory-move-then-file-renames-
-    /// then-DB-update sequence itself transactional -- a crash between
-    /// two of these steps can still leave a book with its directory
-    /// moved but not every file inside renamed yet, or with the files
-    /// moved but the DB `path` column not yet updated, exactly the
-    /// same window this method had before this pass (a multi-operation
-    /// journal transaction spanning several `LibraryHandle` calls
-    /// doesn't exist in this crate -- each call is its own
-    /// independently-recoverable unit). What this pass adds is that
-    /// every individual step is now itself crash-safe and detectable
-    /// (no half-renamed *file*, no silent data loss on one step), not
-    /// that the whole multi-step move became one atomic operation.
+    ///
+    /// On [`crate::library_handle::StorageTier::Network`] (issue
+    /// #257's remaining scope), the directory rename, every file's own
+    /// rename, and the empty-old-directory cleanup are staged and
+    /// committed as one real two-phase batch via
+    /// [`crate::library_handle::LibraryHandle::begin_network_batch`] --
+    /// a crash mid-batch is recovered by finishing whichever steps
+    /// hadn't completed yet, not left as an inconsistent intermediate
+    /// state. On every other tier, each rename/removal below is its
+    /// own independently-recoverable `LibraryHandle` call, same as
+    /// before -- a crash between two of them can still leave a book
+    /// with its directory moved but not every file inside renamed yet,
+    /// same window this method always had on local storage (a multi-
+    /// operation journal transaction spanning several `LibraryHandle`
+    /// calls doesn't exist for the local-tier path, unlike the network
+    /// one). On **every** tier, the DB `path` update at the end is
+    /// still its own separate step after the file-level work
+    /// succeeds -- `LibraryHandle` has no connection to the SQLite
+    /// database at all (issue #260's territory), so a crash between a
+    /// successful rename/batch and the DB update is a real, smaller,
+    /// separate gap not addressed here.
     fn rename_book_files(
         &self,
         book_id: i32,
@@ -628,36 +637,89 @@ impl Cache {
         }
 
         let handle = self.backend.write_handle()?;
-        handle.rename_atomic(&old_full_dir, &new_full_dir)?;
 
-        for entry in fs::read_dir(&new_full_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_file() {
-                if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                    if file_name == "cover.jpg" || file_name == "metadata.opf" {
-                        continue;
-                    }
-                    if let Some(extension) = path.extension().and_then(|e| e.to_str()) {
-                        let new_file_name =
-                            format!("{}.{}", sanitize_file_name(new_title), extension);
-                        let new_file_path = new_full_dir.join(new_file_name);
-                        if path != new_file_path {
-                            if let Err(e) = handle.rename_atomic(&path, &new_file_path) {
-                                eprintln!(
-                                    "Warning: failed to rename {path:?} to {new_file_path:?}: {e}"
-                                );
+        if handle.tier() == crate::library_handle::StorageTier::Network {
+            // Issue #257's remaining scope: §6's own named example is
+            // exactly this operation (a book move = a directory rename
+            // plus each of its files' own rename). Every step has to be
+            // discovered and staged *before* anything moves -- listing
+            // `new_full_dir`'s contents (the local-tier approach just
+            // below) only works because the directory rename has
+            // already happened by the time it runs; on network storage
+            // that would defeat the whole point of staging the batch
+            // atomically up front. See `NetworkBatch`'s doc for the
+            // full design.
+            let mut batch = handle.begin_network_batch();
+            batch.stage_rename(&old_full_dir, &new_full_dir);
+
+            for entry in fs::read_dir(&old_full_dir)? {
+                let entry = entry?;
+                let old_path = entry.path();
+                if old_path.is_file() {
+                    if let Some(file_name) = old_path.file_name().and_then(|n| n.to_str()) {
+                        if file_name == "cover.jpg" || file_name == "metadata.opf" {
+                            continue;
+                        }
+                        if let Some(extension) = old_path.extension().and_then(|e| e.to_str()) {
+                            let new_file_name =
+                                format!("{}.{}", sanitize_file_name(new_title), extension);
+                            // Where this file will be immediately after
+                            // the directory-rename step above (which
+                            // runs first within this same batch) -- not
+                            // its current path under `old_full_dir`.
+                            let post_dir_move_path = new_full_dir.join(file_name);
+                            let new_file_path = new_full_dir.join(new_file_name);
+                            if post_dir_move_path != new_file_path {
+                                batch.stage_rename(&post_dir_move_path, &new_file_path);
                             }
                         }
                     }
                 }
             }
-        }
 
-        if let Some(parent) = old_full_dir.parent() {
-            if parent.exists() && fs::read_dir(parent)?.next().is_none() {
-                if let Err(e) = handle.remove_atomic(parent) {
-                    eprintln!("Warning: failed to remove empty directory {parent:?}: {e}");
+            if let Some(parent) = old_full_dir.parent() {
+                if parent.exists() && fs::read_dir(parent)?.count() == 1 {
+                    // `old_full_dir` is the only entry under `parent`
+                    // right now -- it'll be empty once the directory
+                    // rename above takes effect, so stage its removal
+                    // as the batch's final step.
+                    batch.stage_remove(parent);
+                }
+            }
+
+            batch.commit()?;
+        } else {
+            handle.rename_atomic(&old_full_dir, &new_full_dir)?;
+
+            for entry in fs::read_dir(&new_full_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                        if file_name == "cover.jpg" || file_name == "metadata.opf" {
+                            continue;
+                        }
+                        if let Some(extension) = path.extension().and_then(|e| e.to_str()) {
+                            let new_file_name =
+                                format!("{}.{}", sanitize_file_name(new_title), extension);
+                            let new_file_path = new_full_dir.join(new_file_name);
+                            if path != new_file_path {
+                                if let Err(e) = handle.rename_atomic(&path, &new_file_path) {
+                                    eprintln!(
+                                        "Warning: failed to rename {path:?} to {new_file_path:?}: {e}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(parent) = old_full_dir.parent() {
+                if parent.exists() && fs::read_dir(parent)?.next().is_none() {
+                    if let Err(e) = handle.remove_atomic(parent) {
+                        eprintln!("Warning: failed to remove empty directory {parent:?}: {e}");
+                    }
                 }
             }
         }
@@ -2071,6 +2133,64 @@ mod tests {
         // it.
         assert!(dir.path().join("Shared Author/Book B").exists());
         assert!(dir.path().join("Solo Author/Book A").exists());
+    }
+
+    #[test]
+    fn rename_book_files_on_network_tier_uses_a_two_phase_batch() {
+        let (dir, cache) = open_test_cache();
+
+        // Force the cached write handle to report Network tier
+        // *before* any real handle has ever been opened on this
+        // `Backend` -- issue #257's remaining scope, the two-phase
+        // multi-file batch case. Installing it first (rather than
+        // after `add_book` already opened a real one) avoids a
+        // release-then-immediately-reacquire sequence on the same
+        // lock file, which a heavily parallel `cargo test` run can
+        // make `try_lock()` spuriously report `WouldBlock` for (see
+        // `flock_test_guard`'s own doc comment for the full
+        // investigation this project already did into that).
+        cache.backend.install_network_tier_handle_for_test();
+
+        let source = write_temp_file(dir.path(), "src.epub", b"epub bytes");
+        let mut meta = MetaInformation::default();
+        meta.title = "Old Title".to_string();
+        meta.authors = vec!["Old Author".to_string()];
+        let book_id = cache.add_book(&source, &meta).unwrap();
+
+        cache
+            .update_book_metadata(book_id, "New Title", "New Author")
+            .unwrap();
+
+        assert_eq!(
+            cache.field_for(book_id, "title").unwrap(),
+            Some("New Title".to_string())
+        );
+        assert!(dir.path().join("New Author/New Title").exists());
+        assert!(!dir.path().join("Old Author").exists());
+        assert!(dir
+            .path()
+            .join("New Author/New Title/New Title.epub")
+            .exists());
+        assert!(!dir
+            .path()
+            .join("New Author/New Title/Old Title.epub")
+            .exists());
+
+        // A real Batch entry landed (not a series of individual
+        // RenameFile entries) -- proves the Network-tier branch
+        // actually ran, not just that the end state happens to match.
+        let journal_dir = dir.path().join(".calibre-oxide").join("journal");
+        let batch_entries: Vec<_> = fs::read_dir(&journal_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("op"))
+            .filter(|e| {
+                fs::read_to_string(e.path())
+                    .map(|content| content.contains("Batch"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(batch_entries.len(), 1, "expected exactly one Batch entry");
     }
 
     #[test]
