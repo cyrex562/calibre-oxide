@@ -204,14 +204,16 @@
 //!   commands, tests constructing more than one `Backend`/`Cache`
 //!   over one directory), so the real exclusive §7 lock is acquired
 //!   only when a write is actually about to happen. `covers::set_cover`
-//!   and `backup::backup_metadata` are converted so far -- both were
-//!   a single `fs::write` of a byte buffer already in hand, the
-//!   simplest possible shape. [`LibraryHandle::remove_atomic`] is a
-//!   real, journaled, recovery-aware delete primitive (file or
-//!   directory, recursively) -- but nothing in this crate calls it
-//!   yet; `cache.rs`'s `remove_format`/`delete_book` and
-//!   `restore.rs`'s stale-backup cleanup are its obvious first callers
-//!   whenever this gets picked back up. `cache.rs`'s `add_format`/
+//!   and `backup::backup_metadata` are converted (writes), and
+//!   `cache.rs`'s `remove_format`/`delete_book` plus `restore.rs`'s
+//!   stale-`metadata_pre_restore.db` cleanup are converted (deletes,
+//!   via [`LibraryHandle::remove_atomic`] -- a real, journaled,
+//!   recovery-aware delete primitive for a file or directory,
+//!   recursively). `restore.rs`'s actual `metadata.db` swap
+//!   (`fs::rename(db_path, backup_path)`, right next to the now-
+//!   converted stale-backup removal) is deliberately left as a raw
+//!   `fs::rename` -- it's the one flagged below as needing its own
+//!   design pass, not a blind swap. `cache.rs`'s `add_format`/
 //!   `rename_book_files` and `notes/connection.rs`'s resource storage
 //!   remain raw `std::fs` and still need real design work this handle
 //!   doesn't have: there is still no way to atomically publish a

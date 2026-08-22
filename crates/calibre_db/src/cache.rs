@@ -503,7 +503,11 @@ impl Cache {
                 if path.is_file() {
                     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                         if ext.to_lowercase() == target_ext {
-                            fs::remove_file(&path)?;
+                            // Port of issue #93's crate-wide write-path
+                            // retrofit: real, journaled, crash-safe
+                            // removal through `LibraryHandle` instead of
+                            // a raw `fs::remove_file`.
+                            self.backend.write_handle()?.remove_atomic(&path)?;
                             break;
                         }
                     }
@@ -542,9 +546,19 @@ impl Cache {
                 if dir_path.exists() {
                     // A failed cleanup shouldn't undo the already-committed
                     // DB delete; warn and move on, same as the original
-                    // `library.rs` behavior this replaces.
-                    if let Err(e) = fs::remove_dir_all(&dir_path) {
-                        eprintln!("Warning: failed to delete directory {dir_path:?}: {e}");
+                    // `library.rs` behavior this replaces. Port of issue
+                    // #93's crate-wide write-path retrofit: real,
+                    // journaled, crash-safe removal through
+                    // `LibraryHandle` instead of a raw `fs::remove_dir_all`.
+                    match self.backend.write_handle() {
+                        Ok(handle) => {
+                            if let Err(e) = handle.remove_atomic(&dir_path) {
+                                eprintln!("Warning: failed to delete directory {dir_path:?}: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Warning: failed to delete directory {dir_path:?}: {e}");
+                        }
                     }
                 }
             }
@@ -1811,6 +1825,18 @@ mod tests {
 
         assert!(!dir.path().join("A/T/T.epub").exists());
         assert_eq!(cache.field_for(book_id, "formats").unwrap(), None);
+
+        // remove_format now goes through the real LibraryHandle (issue
+        // #93's crate-wide write-path retrofit), not a raw
+        // `fs::remove_file` -- prove it by checking a real journal
+        // entry landed.
+        let journal_dir = dir.path().join(".calibre-oxide").join("journal");
+        let op_files: Vec<_> = fs::read_dir(&journal_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("op"))
+            .collect();
+        assert_eq!(op_files.len(), 1, "expected a real journaled delete");
     }
 
     #[test]
@@ -1881,6 +1907,18 @@ mod tests {
 
         assert_eq!(cache.field_for(book_id, "title").unwrap(), None);
         assert!(!dir.path().join("A/T").exists());
+
+        // delete_book now goes through the real LibraryHandle (issue
+        // #93's crate-wide write-path retrofit), not a raw
+        // `fs::remove_dir_all` -- prove it by checking a real journal
+        // entry landed.
+        let journal_dir = dir.path().join(".calibre-oxide").join("journal");
+        let op_files: Vec<_> = fs::read_dir(&journal_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("op"))
+            .collect();
+        assert_eq!(op_files.len(), 1, "expected a real journaled delete");
     }
 
     #[test]
