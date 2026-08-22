@@ -93,17 +93,66 @@ fn restore_database_removes_a_stale_pre_restore_backup_through_the_real_library_
     // real `metadata.db` -- not left as the old stale content.
     assert_ne!(fs::read(&backup_path).unwrap(), b"stale backup");
 
-    // restore_database now removes the stale backup through the real
-    // LibraryHandle (issue #93's crate-wide write-path retrofit), not
-    // a raw `fs::remove_file` -- prove it by checking a real journal
-    // entry landed.
+    // restore_database now removes the stale backup and renames
+    // metadata.db to the backup path through the real LibraryHandle
+    // (issue #93's crate-wide write-path retrofit), not raw
+    // `fs::remove_file`/`fs::rename` -- prove it by checking real
+    // journal entries landed for both (tag-substring match, not real
+    // deserialization: `OperationDescriptor`/`JournalEntry` are
+    // private to `library_handle.rs`).
     let journal_dir = library_path.join(".calibre-oxide").join("journal");
-    let op_files: Vec<_> = fs::read_dir(&journal_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("op"))
-        .collect();
-    assert_eq!(op_files.len(), 1, "expected a real journaled delete");
+    let journaled_op_count = |tag: &str| {
+        fs::read_dir(&journal_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("op"))
+            .filter(|e| {
+                fs::read_to_string(e.path())
+                    .map(|content| content.contains(tag))
+                    .unwrap_or(false)
+            })
+            .count()
+    };
+    assert_eq!(
+        journaled_op_count("DeleteFile"),
+        1,
+        "expected a real journaled delete of the stale backup"
+    );
+    assert_eq!(
+        journaled_op_count("RenameFile"),
+        1,
+        "expected a real journaled rename of metadata.db to the backup path"
+    );
+}
+
+#[test]
+fn restore_database_fails_fast_if_another_writer_already_holds_the_library_lock() {
+    // Port of issue #93's crate-wide write-path retrofit: restore_database
+    // now acquires LibraryHandle's real exclusive writer lock (§7) up
+    // front and holds it for the whole rebuild, not just around the
+    // metadata.db backup rename -- the point being that the long book-
+    // rescanning loop is protected too, not just the one rename step.
+    // Proving that directly would need a race (start a real restore in
+    // a background thread, try to grab a second handle mid-run), which
+    // is exactly the kind of timing-dependent test this project avoids.
+    // This proves the equivalent, deterministic half instead: if
+    // something else already holds the lock *before* restore_database
+    // even starts, it fails immediately rather than proceeding --
+    // which only happens if it's really acquiring the same real lock
+    // up front, not lazily deep inside the loop.
+    let dir = tempdir().unwrap();
+    let library_path = dir.path().to_path_buf();
+    {
+        let _library = Library::create(library_path.clone()).expect("Failed to create library");
+    }
+
+    let _handle = calibre_db::library_handle::LibraryHandle::open(&library_path).unwrap();
+
+    let err = restore::restore_database(&library_path, |_| {}).unwrap_err();
+    assert!(
+        err.chain().any(|e| e.to_string().contains("writer lock")),
+        "expected an AlreadyLocked-flavored error somewhere in the chain, got: {err:#}"
+    );
 }
 
 #[test]

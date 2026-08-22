@@ -194,7 +194,7 @@
 //! - Network-storage two-phase writes (§6) -- [`StorageTier::Network`]
 //!   is detected and stored, but nothing yet changes behavior based on
 //!   it.
-//! - **The crate-wide retrofit -- started, far from complete.**
+//! - **The crate-wide write-path retrofit -- done.**
 //!   [`Backend::write_handle`](crate::backend::Backend::write_handle)
 //!   is the real entry point: lazily opens (and caches, shared across
 //!   every clone of that `Backend`) a `LibraryHandle` the first time
@@ -203,7 +203,7 @@
 //!   stay safe to do many times over the same library (read-only CLI
 //!   commands, tests constructing more than one `Backend`/`Cache`
 //!   over one directory), so the real exclusive §7 lock is acquired
-//!   only when a write is actually about to happen. Converted so far:
+//!   only when a write is actually about to happen. Converted:
 //!   `covers::set_cover`/`backup::backup_metadata` (writes of an
 //!   in-memory buffer); `cache.rs`'s `add_format` (a large-file-safe
 //!   copy-in via [`LibraryHandle::copy_atomic`] -- streams both its
@@ -218,29 +218,35 @@
 //!   a whole still isn't one atomic transaction, since this crate's
 //!   journal has no multi-operation batch concept spanning several
 //!   `LibraryHandle` calls; see `Cache::rename_book_files`'s own doc
-//!   comment for that disclosure in full); and `notes/connection.rs`'s
+//!   comment for that disclosure in full); `notes/connection.rs`'s
 //!   `add_resource`/`remove_unreferenced_resources` (which also fixed
 //!   a real pre-existing bug: a failed resource write used to be
 //!   silently swallowed while the DB still recorded the resource as
 //!   present -- `NotesConnection` gained a `Backend` field so it
 //!   shares the same lazily-opened handle as everything else reached
 //!   through that `Backend`, rather than risking a second, colliding
-//!   `LibraryHandle::open`). Journal recovery's own `WriteFile`
-//!   verification was switched from a full `fs::read` to a streaming
-//!   hash at the same time as the `copy_atomic` work -- otherwise a
-//!   large recovered file would still get fully buffered into memory
-//!   on every `LibraryHandle::open` that has to verify it.
+//!   `LibraryHandle::open`); and `restore.rs`'s `restore_database`,
+//!   which holds the writer lock for its *entire* run rather than
+//!   just around the `metadata.db` backup rename -- the rename itself
+//!   is already atomic on its own, but the long book-rescanning loop
+//!   after it is not one SQL transaction and can run for a real amount
+//!   of wall-clock time, so it needs real isolation from a concurrent
+//!   writer through a different `Backend`/`Cache`, not just the
+//!   rename step. A concurrent write attempt during a restore now
+//!   fails fast with `AlreadyLocked` rather than racing the rebuild --
+//!   the same tradeoff a real database's `VACUUM`/`REINDEX` makes.
+//!   Journal recovery's own `WriteFile` verification was switched from
+//!   a full `fs::read` to a streaming hash at the same time as the
+//!   `copy_atomic` work -- otherwise a large recovered file would
+//!   still get fully buffered into memory on every `LibraryHandle::open`
+//!   that has to verify it.
 //!
-//!   **What's left**: `restore.rs`'s actual `metadata.db` swap
-//!   (`fs::rename(db_path, backup_path)`, right next to the already-
-//!   converted stale-backup removal) is deliberately left as a raw
-//!   `fs::rename` -- it needs an explicit decision about how long the
-//!   writer lock should be held (just around that rename, matching
-//!   every other conversion's minimal footprint, vs. across the whole
-//!   `restore_database` rebuild, which would be a real, larger
-//!   behavior change: a concurrent writer would start failing with
-//!   `AlreadyLocked` instead of racing against the rebuild). That's
-//!   the one remaining piece of this retrofit.
+//!   What's *not* covered, by design rather than omission: plain
+//!   bootstrap directory creation (`.calibre-oxide` itself, `notes/`'s
+//!   `resources/` subdirectory, ...) stays a raw, idempotent
+//!   `fs::create_dir_all` -- the same category as `library.id`'s own
+//!   file, treated as the handle's own bookkeeping rather than a
+//!   journaled library write.
 //! - Windows implementations of tier classification and directory
 //!   durability (see above) -- this workspace has no way to compile-
 //!   check or test Windows-specific code, so rather than ship

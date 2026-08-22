@@ -260,6 +260,24 @@ pub struct RestoreReport {
 /// A directory whose OPF is missing/unreadable/unparseable is recorded
 /// in the returned [`RestoreReport::failed`] and skipped, rather than
 /// aborting the whole restore.
+///
+/// Port of issue #93's crate-wide write-path retrofit: this holds the
+/// real `LibraryHandle`'s exclusive writer lock (§7) for the entire
+/// run, not just around the `metadata.db` backup rename. The rename
+/// itself is already atomic (POSIX `rename` plus the fsync discipline
+/// `rename_atomic` adds) regardless of whether a lock is held around
+/// it -- what actually needs the lock is the much longer, much more
+/// exposed loop just below, which walks every book directory and
+/// inserts rows into the freshly-created (initially near-empty)
+/// database one at a time. That loop is not one SQL transaction; a
+/// concurrent writer through a *different* `Backend`/`Cache` over the
+/// same library (adding a book, deleting one, renaming a folder)
+/// could otherwise interleave with it mid-walk -- a real isolation
+/// violation, not just a theoretical one, since this function can run
+/// for a long time on a real library. Holding the lock for the whole
+/// run means a concurrent write attempt fails fast with
+/// `AlreadyLocked` instead of racing the rebuild -- the same tradeoff
+/// a real database's `VACUUM`/`REINDEX` makes.
 pub fn restore_database<P: AsRef<Path>, F>(
     library_path: P,
     mut progress_callback: F,
@@ -268,23 +286,22 @@ where
     F: FnMut(String),
 {
     let lib_path = library_path.as_ref();
+
+    let handle = crate::library_handle::LibraryHandle::open(lib_path)
+        .context("Failed to open library handle")?;
+
     let db_path = lib_path.join("metadata.db");
 
     if db_path.exists() {
         let backup_path = lib_path.join("metadata_pre_restore.db");
         if backup_path.exists() {
-            // Port of issue #93's crate-wide write-path retrofit: real,
-            // journaled, crash-safe removal of the stale backup through
-            // `LibraryHandle` instead of a raw `fs::remove_file`. The
-            // `metadata.db` swap just below stays a raw `fs::rename`
-            // deliberately -- it needs its own design pass (see
-            // `library_handle.rs`'s module doc), not a blind swap.
-            crate::library_handle::LibraryHandle::open(lib_path)
-                .context("Failed to open library handle")?
+            handle
                 .remove_atomic(&backup_path)
                 .context("Failed to remove old backup DB")?;
         }
-        fs::rename(&db_path, &backup_path).context("Failed to backup existing DB")?;
+        handle
+            .rename_atomic(&db_path, &backup_path)
+            .context("Failed to backup existing DB")?;
         progress_callback(format!("Backed up existing database to {:?}", backup_path));
     }
 
