@@ -454,9 +454,6 @@ impl Cache {
         let title = self.field_for(book_id, "title")?.unwrap_or_default();
 
         let book_dir = self.backend.library_path.join(&path_rel);
-        if !book_dir.exists() {
-            fs::create_dir_all(&book_dir)?;
-        }
 
         let file_name = format!("{}.{}", sanitize_file_name(&title), format.to_lowercase());
         let dest_path = book_dir.join(&file_name);
@@ -464,15 +461,27 @@ impl Cache {
             return Ok(false);
         }
 
-        fs::copy(source_path, &dest_path)?;
+        // Port of issue #93's crate-wide write-path retrofit: real,
+        // journaled, crash-safe, large-file-safe copy-in through
+        // `LibraryHandle` instead of a raw `fs::copy` (creates
+        // `book_dir` itself, no separate `create_dir_all` needed).
+        // `copy_atomic` streams both its hashing and copying passes,
+        // so this never buffers a whole book file in memory even for
+        // a large audiobook/PDF.
+        let hash = self
+            .backend
+            .write_handle()?
+            .copy_atomic(source_path, &dest_path)?;
         let size = fs::metadata(&dest_path)?.len() as i64;
 
         // Port of docs/FAULT_TOLERANCE.md §8: "every book file's
         // BLAKE3 is stored... at add time" -- see checksums.rs's
         // module doc for why this lives in its own sidecar db rather
-        // than a new metadata.db column.
+        // than a new metadata.db column. Uses the hash `copy_atomic`
+        // already computed while streaming, rather than
+        // `record_file`'s whole-file re-read.
         self.checksums()
-            .record_file(book_id, "format", &format.to_uppercase(), &dest_path)?;
+            .record_hash(book_id, "format", &format.to_uppercase(), &hash, size)?;
 
         let conn = self.backend.conn.lock().unwrap();
         conn.execute(
@@ -1731,6 +1740,29 @@ mod tests {
         p
     }
 
+    /// Counts real journaled entries under `library_path` whose op tag
+    /// matches `tag` (`"DeleteFile"`/`"WriteFile"`/`"RenameFile"`) --
+    /// `OperationDescriptor`/`JournalEntry` are private to
+    /// `library_handle.rs`, so this checks for the serde tag as a
+    /// substring rather than deserializing the real type.
+    fn journaled_op_count(library_path: &Path, tag: &str) -> usize {
+        let journal_dir = library_path.join(".calibre-oxide").join("journal");
+        fs::read_dir(&journal_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("op"))
+            .filter(|e| {
+                fs::read_to_string(e.path())
+                    .map(|content| content.contains(tag))
+                    .unwrap_or(false)
+            })
+            .count()
+    }
+
+    fn journaled_delete_count(library_path: &Path) -> usize {
+        journaled_op_count(library_path, "DeleteFile")
+    }
+
     #[test]
     fn add_book_creates_the_author_title_folder_and_copies_the_file() {
         let (dir, cache) = open_test_cache();
@@ -1788,6 +1820,14 @@ mod tests {
             cache.field_for(book_id, "size").unwrap(),
             Some(b"epub bytes".len().to_string())
         );
+
+        // add_format now goes through the real LibraryHandle (issue
+        // #93's crate-wide write-path retrofit) via `copy_atomic`, not
+        // a raw `fs::copy` -- prove it by checking real journaled
+        // `WriteFile` entries landed: one from `add_book`'s own
+        // initial `add_format` call above, one from this explicit
+        // `add_format` call.
+        assert_eq!(journaled_op_count(dir.path(), "WriteFile"), 2);
     }
 
     #[test]
@@ -1828,15 +1868,12 @@ mod tests {
 
         // remove_format now goes through the real LibraryHandle (issue
         // #93's crate-wide write-path retrofit), not a raw
-        // `fs::remove_file` -- prove it by checking a real journal
-        // entry landed.
-        let journal_dir = dir.path().join(".calibre-oxide").join("journal");
-        let op_files: Vec<_> = fs::read_dir(&journal_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("op"))
-            .collect();
-        assert_eq!(op_files.len(), 1, "expected a real journaled delete");
+        // `fs::remove_file` -- prove it by checking a real journaled
+        // `DeleteFile` entry landed (not just any entry: `add_book`/
+        // `add_format` above also journal their own `WriteFile`
+        // entries via `copy_atomic`, so this specifically looks for
+        // the delete rather than asserting a total count).
+        assert_eq!(journaled_delete_count(dir.path()), 1);
     }
 
     #[test]
@@ -1910,15 +1947,11 @@ mod tests {
 
         // delete_book now goes through the real LibraryHandle (issue
         // #93's crate-wide write-path retrofit), not a raw
-        // `fs::remove_dir_all` -- prove it by checking a real journal
-        // entry landed.
-        let journal_dir = dir.path().join(".calibre-oxide").join("journal");
-        let op_files: Vec<_> = fs::read_dir(&journal_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("op"))
-            .collect();
-        assert_eq!(op_files.len(), 1, "expected a real journaled delete");
+        // `fs::remove_dir_all` -- prove it by checking a real
+        // journaled `DeleteFile` entry landed (see the comment in
+        // `remove_format_deletes_the_file_and_its_data_row` for why
+        // this doesn't just count every `.op` file).
+        assert_eq!(journaled_delete_count(dir.path()), 1);
     }
 
     #[test]

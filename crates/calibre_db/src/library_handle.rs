@@ -204,24 +204,28 @@
 //!   commands, tests constructing more than one `Backend`/`Cache`
 //!   over one directory), so the real exclusive §7 lock is acquired
 //!   only when a write is actually about to happen. `covers::set_cover`
-//!   and `backup::backup_metadata` are converted (writes), and
-//!   `cache.rs`'s `remove_format`/`delete_book` plus `restore.rs`'s
-//!   stale-`metadata_pre_restore.db` cleanup are converted (deletes,
-//!   via [`LibraryHandle::remove_atomic`] -- a real, journaled,
-//!   recovery-aware delete primitive for a file or directory,
-//!   recursively). `restore.rs`'s actual `metadata.db` swap
-//!   (`fs::rename(db_path, backup_path)`, right next to the now-
-//!   converted stale-backup removal) is deliberately left as a raw
-//!   `fs::rename` -- it's the one flagged below as needing its own
-//!   design pass, not a blind swap. `cache.rs`'s `add_format`/
-//!   `rename_book_files` and `notes/connection.rs`'s resource storage
-//!   remain raw `std::fs` and still need real design work this handle
-//!   doesn't have: there is still no way to atomically publish a
-//!   copied file without reading the whole source into memory first
-//!   (`write_atomic` only takes `&[u8]`; the documented pattern for
-//!   large files is copy-to-temp-then-`rename_atomic`, but there's no
-//!   helper for the temp-copy-and-fsync part). Each remaining module
-//!   is its own separately-reviewable follow-up.
+//!   and `backup::backup_metadata` are converted (writes of an
+//!   in-memory buffer), `cache.rs`'s `add_format` is converted (a
+//!   large-file-safe copy-in via [`LibraryHandle::copy_atomic`] --
+//!   streams both its hashing and copying passes, so it never buffers
+//!   a whole book file in memory), and `cache.rs`'s `remove_format`/
+//!   `delete_book` plus `restore.rs`'s stale-`metadata_pre_restore.db`
+//!   cleanup are converted (deletes, via
+//!   [`LibraryHandle::remove_atomic`] -- a real, journaled, recovery-
+//!   aware delete primitive for a file or directory, recursively).
+//!   Journal recovery's own `WriteFile` verification was switched from
+//!   a full `fs::read` to the same streaming hash at the same time --
+//!   otherwise a large `copy_atomic`-written file would still get
+//!   fully buffered into memory on every `LibraryHandle::open` that
+//!   has to verify it, silently defeating the point. `restore.rs`'s
+//!   actual `metadata.db` swap (`fs::rename(db_path, backup_path)`,
+//!   right next to the now-converted stale-backup removal) is
+//!   deliberately left as a raw `fs::rename` -- it's the one flagged
+//!   below as needing its own design pass, not a blind swap.
+//!   `cache.rs`'s `rename_book_files` (a directory rename) and
+//!   `notes/connection.rs`'s resource storage remain raw `std::fs` and
+//!   still need their own design work. Each remaining module is its
+//!   own separately-reviewable follow-up.
 //! - Windows implementations of tier classification and directory
 //!   durability (see above) -- this workspace has no way to compile-
 //!   check or test Windows-specific code, so rather than ship
@@ -557,6 +561,74 @@ impl Shared {
         Ok(())
     }
 
+    /// Large-file-safe counterpart to [`Shared::write_atomic_impl`]:
+    /// same journal / write-temp / fsync-temp / rename / fsync-dir /
+    /// commit discipline, but for a caller that has an already-formed
+    /// source *file* to publish (e.g. a book format being added to
+    /// the library) rather than an in-memory buffer. Never holds the
+    /// whole file in memory -- both the hashing pass and the copy
+    /// pass stream in bounded chunks. Two full reads of `source`
+    /// (hash, then copy) rather than one, trading I/O for the
+    /// "journal-entry-before-any-managed-path-mutation" invariant
+    /// `write_atomic_impl` also relies on: the hash has to be known
+    /// before the journal entry is written, and computing it can't
+    /// itself touch `target` or the temp file first. Returns the
+    /// content's BLAKE3 hex so callers that also record a checksum
+    /// (e.g. `checksums.rs`) don't need to re-read `target` to get
+    /// one.
+    fn copy_atomic_impl(
+        &self,
+        source: &Path,
+        target: &Path,
+        fail_after: Option<FailPoint>,
+    ) -> Result<String, LibraryHandleError> {
+        self.check_open()?;
+        let uuid = Uuid::new_v4();
+        let content_hash = blake3_hash_file(source)?;
+        let op = OperationDescriptor::WriteFile {
+            target: target.to_path_buf(),
+            content_hash: content_hash.clone(),
+        };
+        self.journal_write(uuid, op)?;
+        if fail_after == Some(FailPoint::JournalWrite) {
+            return Err(simulated_crash());
+        }
+
+        let parent = target.parent();
+        if let Some(parent) = parent {
+            fs::create_dir_all(parent)?;
+        }
+        let tmp_path = temp_path_for(target, uuid);
+
+        let mut tmp_file = File::create(&tmp_path)?;
+        {
+            let mut src_file = File::open(source)?;
+            io::copy(&mut src_file, &mut tmp_file)?;
+        }
+        if fail_after == Some(FailPoint::WriteTemp) {
+            return Err(simulated_crash());
+        }
+
+        tmp_file.sync_all()?;
+        drop(tmp_file);
+        if fail_after == Some(FailPoint::FsyncTemp) {
+            return Err(simulated_crash());
+        }
+
+        fs::rename(&tmp_path, target)?;
+        if fail_after == Some(FailPoint::Rename) {
+            return Err(simulated_crash());
+        }
+
+        fsync_dir(parent)?;
+        if fail_after == Some(FailPoint::BeforeCommit) {
+            return Err(simulated_crash());
+        }
+
+        self.journal_commit(uuid)?;
+        Ok(content_hash)
+    }
+
     fn rename_atomic_impl(
         &self,
         from: &Path,
@@ -864,6 +936,20 @@ impl LibraryHandle {
         self.write_atomic_impl(target, bytes, None)
     }
 
+    /// Large-file-safe counterpart to [`LibraryHandle::write_atomic`]
+    /// for a caller that has `source` as an already-formed file on
+    /// disk (e.g. a book format being added from outside the
+    /// library) rather than a buffer already in memory -- never reads
+    /// the whole file into memory. Same journal / write-temp / fsync-
+    /// temp / rename / fsync-parent-directory / commit discipline.
+    /// Returns the copied content's BLAKE3 hex, so a caller that also
+    /// wants to record a checksum doesn't need a second full read of
+    /// `target` to get one. See [`Shared::copy_atomic_impl`]'s doc for
+    /// why this costs two passes over `source` instead of one.
+    pub fn copy_atomic(&self, source: &Path, target: &Path) -> Result<String, LibraryHandleError> {
+        self.copy_atomic_impl(source, target, None)
+    }
+
     /// Port of §2 steps 1-4 for a rename, for callers that already
     /// have the payload written to its final form elsewhere (e.g. a
     /// format file copied by a caller, then atomically published into
@@ -895,6 +981,17 @@ impl LibraryHandle {
         fail_after: Option<FailPoint>,
     ) -> Result<(), LibraryHandleError> {
         self.shared.write_atomic_impl(target, bytes, fail_after)
+    }
+
+    /// Test-only fault-injection wrapper for [`LibraryHandle::copy_atomic`],
+    /// same shape as [`LibraryHandle::write_atomic_impl`].
+    fn copy_atomic_impl(
+        &self,
+        source: &Path,
+        target: &Path,
+        fail_after: Option<FailPoint>,
+    ) -> Result<String, LibraryHandleError> {
+        self.shared.copy_atomic_impl(source, target, fail_after)
     }
 
     /// Test-only fault-injection wrapper for [`LibraryHandle::remove_atomic`],
@@ -935,6 +1032,19 @@ fn simulated_crash() -> LibraryHandleError {
 
 fn blake3_hex(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
+}
+
+/// Streaming BLAKE3 of a file on disk -- unlike [`blake3_hex`], never
+/// buffers the whole file in memory. Used for anything that hashes a
+/// file that could be large (a copied-in book format, a recovered
+/// write's target during crash recovery), as opposed to content a
+/// caller already holds as an in-memory buffer (a cover image, a
+/// small XML sidecar).
+fn blake3_hash_file(path: &Path) -> io::Result<String> {
+    let mut file = File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    io::copy(&mut file, &mut hasher)?;
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 /// `<parent>/<target-file-name>.tmp-<uuid>` -- deterministic from
@@ -1143,8 +1253,8 @@ fn recover_one(
             content_hash,
         } = &entry.op
         {
-            if let Ok(bytes) = fs::read(target) {
-                if blake3_hex(&bytes) != *content_hash {
+            if let Ok(hash) = blake3_hash_file(target) {
+                if hash != *content_hash {
                     return Err(LibraryHandleError::Corruption(format!(
                         "{} does not match its recorded checksum",
                         target.display()
@@ -1160,8 +1270,8 @@ fn recover_one(
             target,
             content_hash,
         } => {
-            let applied = fs::read(target)
-                .map(|bytes| blake3_hex(&bytes) == *content_hash)
+            let applied = blake3_hash_file(target)
+                .map(|hash| hash == *content_hash)
                 .unwrap_or(false);
             if applied {
                 mark_committed(&committed_path)?;
@@ -1865,6 +1975,156 @@ mod tests {
 
         let result = LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false);
         assert!(matches!(result, Err(LibraryHandleError::Corruption(_))));
+    }
+
+    // }}}
+
+    // --- large-file-safe copy-in primitive (issue #93 crate-wide write-path retrofit) {{{
+
+    #[test]
+    fn copy_atomic_copies_the_file_and_returns_its_real_hash() {
+        let _flock_test_guard = flock_test_guard();
+        let dir = tempdir().unwrap();
+        let handle =
+            LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false).unwrap();
+        let source = dir.path().join("source.epub");
+        fs::write(&source, b"epub bytes").unwrap();
+        let target = dir.path().join("book").join("book.epub");
+
+        let hash = handle.copy_atomic(&source, &target).unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"epub bytes");
+        assert_eq!(hash, blake3_hex(b"epub bytes"));
+        // The source is untouched -- this is a copy, not a move.
+        assert!(source.exists());
+
+        // No leftover temp files.
+        let leftovers: Vec<_> = fs::read_dir(target.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn copy_atomic_overwrites_an_existing_target_cleanly() {
+        let _flock_test_guard = flock_test_guard();
+        let dir = tempdir().unwrap();
+        let handle =
+            LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false).unwrap();
+        let target = dir.path().join("book.epub");
+        handle.write_atomic(&target, b"old content").unwrap();
+
+        let source = dir.path().join("new.epub");
+        fs::write(&source, b"new content").unwrap();
+        handle.copy_atomic(&source, &target).unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"new content");
+    }
+
+    #[test]
+    fn copy_atomic_journals_a_write_file_entry_with_the_real_content_hash() {
+        let _flock_test_guard = flock_test_guard();
+        let dir = tempdir().unwrap();
+        let handle =
+            LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false).unwrap();
+        let source = dir.path().join("source.epub");
+        fs::write(&source, b"epub bytes").unwrap();
+        let target = dir.path().join("book.epub");
+
+        handle.copy_atomic(&source, &target).unwrap();
+
+        let journal_dir = dir.path().join(".calibre-oxide").join("journal");
+        let op_files: Vec<_> = fs::read_dir(&journal_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("op"))
+            .collect();
+        assert_eq!(op_files.len(), 1);
+
+        let uuid = op_files[0]
+            .path()
+            .file_stem()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(journal_dir.join(format!("{uuid}.committed")).exists());
+
+        let entry: JournalEntry =
+            serde_json::from_slice(&fs::read(op_files[0].path()).unwrap()).unwrap();
+        match entry.op {
+            OperationDescriptor::WriteFile {
+                target: t,
+                content_hash,
+            } => {
+                assert_eq!(t, target);
+                assert_eq!(content_hash, blake3_hex(b"epub bytes"));
+            }
+            _ => panic!("expected WriteFile"),
+        }
+    }
+
+    #[test]
+    fn a_crash_right_after_copy_atomics_journal_write_leaves_the_target_untouched() {
+        let dir = tempdir().unwrap();
+        let _flock_test_guard = flock_test_guard();
+        let handle =
+            LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false).unwrap();
+        let source = dir.path().join("source.epub");
+        fs::write(&source, b"epub bytes").unwrap();
+        let target = dir.path().join("book.epub");
+
+        let err = handle.copy_atomic_impl(&source, &target, Some(FailPoint::JournalWrite));
+        assert!(err.is_err());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn a_crash_right_after_copy_atomics_rename_has_already_committed_the_write() {
+        let dir = tempdir().unwrap();
+        let _flock_test_guard = flock_test_guard();
+        let handle =
+            LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false).unwrap();
+        let source = dir.path().join("source.epub");
+        fs::write(&source, b"epub bytes").unwrap();
+        let target = dir.path().join("book.epub");
+
+        let err = handle.copy_atomic_impl(&source, &target, Some(FailPoint::Rename));
+        assert!(err.is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"epub bytes");
+    }
+
+    #[test]
+    fn reopening_after_a_crash_right_after_copy_atomics_rename_finalizes_the_commit_marker() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("book.epub");
+        {
+            let _flock_test_guard = flock_test_guard();
+            let handle =
+                LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false).unwrap();
+            let source = dir.path().join("source.epub");
+            fs::write(&source, b"epub bytes").unwrap();
+            let err = handle.copy_atomic_impl(&source, &target, Some(FailPoint::Rename));
+            assert!(err.is_err());
+        }
+
+        let handle = reopen_for_test(dir.path(), JOURNAL_PRUNE_RETENTION);
+        assert_eq!(fs::read(&target).unwrap(), b"epub bytes");
+
+        let journal_dir = dir.path().join(".calibre-oxide").join("journal");
+        let committed: Vec<_> = fs::read_dir(&journal_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("committed"))
+            .collect();
+        assert_eq!(
+            committed.len(),
+            1,
+            "recovery should finalize the missing commit marker"
+        );
+        drop(handle);
     }
 
     // }}}
