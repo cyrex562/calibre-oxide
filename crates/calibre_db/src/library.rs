@@ -496,7 +496,7 @@ impl Library {
     /// library's `.calnotes/notes.db`, sharing this library's live
     /// connection (same pattern as [`Library::fts`]) -- issue #227.
     pub fn notes(&self) -> crate::notes::connection::NotesConnection {
-        crate::notes::connection::NotesConnection::new(self.backend.conn.clone(), &self.path)
+        crate::notes::connection::NotesConnection::new(self.backend.clone(), &self.path)
     }
 
     /// A real [`crate::checksums::ChecksumStore`] over this library's

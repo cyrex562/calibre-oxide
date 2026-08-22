@@ -8,7 +8,7 @@ use tempfile::tempdir;
 
 fn open_notes(dir: &std::path::Path) -> NotesConnection {
     let backend = Backend::new(dir).unwrap();
-    let notes = NotesConnection::new(backend.conn.clone(), dir);
+    let notes = NotesConnection::new(backend, dir);
     notes.initialize().unwrap();
     notes
 }

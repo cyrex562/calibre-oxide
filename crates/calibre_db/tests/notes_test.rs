@@ -5,7 +5,7 @@ use tempfile::tempdir;
 
 fn open(dir: &std::path::Path) -> NotesConnection {
     let backend = Backend::new(dir).unwrap();
-    let notes = NotesConnection::new(backend.conn.clone(), dir);
+    let notes = NotesConnection::new(backend, dir);
     notes.initialize().expect("Failed to init notes");
     notes
 }
@@ -129,6 +129,54 @@ fn add_resource_is_idempotent_for_the_same_content_and_name() {
 
     let data = notes.get_resource_data(&hash1).unwrap().unwrap();
     assert_eq!(data.name, "file.txt");
+}
+
+#[test]
+fn add_resource_journals_a_real_write_through_the_library_handle() {
+    let dir = tempdir().unwrap();
+    let notes = open(dir.path());
+
+    notes.add_resource(b"resource bytes", "file.txt").unwrap();
+
+    // add_resource now goes through the real LibraryHandle (issue
+    // #93's crate-wide write-path retrofit), not a raw `fs::write` --
+    // prove it by checking a real journal entry landed.
+    let journal_dir = dir.path().join(".calibre-oxide").join("journal");
+    let op_files: Vec<_> = std::fs::read_dir(&journal_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("op"))
+        .collect();
+    assert_eq!(op_files.len(), 1, "expected a real journaled write");
+}
+
+#[test]
+fn remove_unreferenced_resources_journals_a_real_delete_through_the_library_handle() {
+    let dir = tempdir().unwrap();
+    let notes = open(dir.path());
+    let hash = notes.add_resource(b"data", "f.txt").unwrap();
+    let mut resources = HashSet::new();
+    resources.insert(hash);
+    notes
+        .set_note("tags", 1, "v", "<p>note</p>", &resources)
+        .unwrap();
+    // Drop the note so its resource becomes unreferenced.
+    notes.set_note("tags", 1, "v", "", &HashSet::new()).unwrap();
+
+    notes.remove_unreferenced_resources().unwrap();
+
+    let journal_dir = dir.path().join(".calibre-oxide").join("journal");
+    let delete_entries = std::fs::read_dir(&journal_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("op"))
+        .filter(|e| {
+            std::fs::read_to_string(e.path())
+                .map(|content| content.contains("DeleteFile"))
+                .unwrap_or(false)
+        })
+        .count();
+    assert_eq!(delete_entries, 1, "expected a real journaled delete");
 }
 
 #[test]

@@ -203,43 +203,44 @@
 //!   stay safe to do many times over the same library (read-only CLI
 //!   commands, tests constructing more than one `Backend`/`Cache`
 //!   over one directory), so the real exclusive §7 lock is acquired
-//!   only when a write is actually about to happen. `covers::set_cover`
-//!   and `backup::backup_metadata` are converted (writes of an
-//!   in-memory buffer), `cache.rs`'s `add_format` is converted (a
-//!   large-file-safe copy-in via [`LibraryHandle::copy_atomic`] --
-//!   streams both its hashing and copying passes, so it never buffers
-//!   a whole book file in memory), and `cache.rs`'s `remove_format`/
-//!   `delete_book` plus `restore.rs`'s stale-`metadata_pre_restore.db`
-//!   cleanup are converted (deletes, via
-//!   [`LibraryHandle::remove_atomic`] -- a real, journaled, recovery-
-//!   aware delete primitive for a file or directory, recursively).
-//!   Journal recovery's own `WriteFile` verification was switched from
-//!   a full `fs::read` to the same streaming hash at the same time --
-//!   otherwise a large `copy_atomic`-written file would still get
-//!   fully buffered into memory on every `LibraryHandle::open` that
-//!   has to verify it, silently defeating the point. `restore.rs`'s
-//!   actual `metadata.db` swap (`fs::rename(db_path, backup_path)`,
-//!   right next to the now-converted stale-backup removal) is
-//!   deliberately left as a raw `fs::rename` -- it's the one flagged
-//!   below as needing its own design pass, not a blind swap.
-//!   `cache.rs`'s `rename_book_files` is converted too: every
-//!   individual directory/file rename and the empty-old-directory
-//!   cleanup go through [`LibraryHandle::rename_atomic`]/
-//!   [`LibraryHandle::remove_atomic`], but the *sequence* as a whole
-//!   (directory move, then per-file renames, then a DB `path` update)
-//!   is still not one atomic transaction -- this crate's journal has
-//!   no concept of a multi-operation batch spanning several
-//!   `LibraryHandle` calls, only single-operation entries, so a crash
-//!   between two of those steps can still leave a book in an
-//!   inconsistent intermediate state, exactly the same window that
-//!   existed before this conversion. What changed is that every
-//!   individual step is now itself crash-safe and recovery-verified,
-//!   not that the whole move became transactional; see
-//!   `Cache::rename_book_files`'s own doc comment for the same
-//!   disclosure at the call site. `notes/connection.rs`'s resource
-//!   storage remains raw `std::fs` and still needs its own design
-//!   work. Each remaining module is its own separately-reviewable
-//!   follow-up.
+//!   only when a write is actually about to happen. Converted so far:
+//!   `covers::set_cover`/`backup::backup_metadata` (writes of an
+//!   in-memory buffer); `cache.rs`'s `add_format` (a large-file-safe
+//!   copy-in via [`LibraryHandle::copy_atomic`] -- streams both its
+//!   hashing and copying passes, so it never buffers a whole book
+//!   file in memory); `cache.rs`'s `remove_format`/`delete_book` and
+//!   `restore.rs`'s stale-`metadata_pre_restore.db` cleanup (deletes,
+//!   via [`LibraryHandle::remove_atomic`] -- a real, journaled,
+//!   recovery-aware delete primitive for a file or directory,
+//!   recursively); `cache.rs`'s `rename_book_files` (every individual
+//!   directory/file rename and the empty-old-directory cleanup, via
+//!   `rename_atomic`/`remove_atomic` -- though the 3-step sequence as
+//!   a whole still isn't one atomic transaction, since this crate's
+//!   journal has no multi-operation batch concept spanning several
+//!   `LibraryHandle` calls; see `Cache::rename_book_files`'s own doc
+//!   comment for that disclosure in full); and `notes/connection.rs`'s
+//!   `add_resource`/`remove_unreferenced_resources` (which also fixed
+//!   a real pre-existing bug: a failed resource write used to be
+//!   silently swallowed while the DB still recorded the resource as
+//!   present -- `NotesConnection` gained a `Backend` field so it
+//!   shares the same lazily-opened handle as everything else reached
+//!   through that `Backend`, rather than risking a second, colliding
+//!   `LibraryHandle::open`). Journal recovery's own `WriteFile`
+//!   verification was switched from a full `fs::read` to a streaming
+//!   hash at the same time as the `copy_atomic` work -- otherwise a
+//!   large recovered file would still get fully buffered into memory
+//!   on every `LibraryHandle::open` that has to verify it.
+//!
+//!   **What's left**: `restore.rs`'s actual `metadata.db` swap
+//!   (`fs::rename(db_path, backup_path)`, right next to the already-
+//!   converted stale-backup removal) is deliberately left as a raw
+//!   `fs::rename` -- it needs an explicit decision about how long the
+//!   writer lock should be held (just around that rename, matching
+//!   every other conversion's minimal footprint, vs. across the whole
+//!   `restore_database` rebuild, which would be a real, larger
+//!   behavior change: a concurrent writer would start failing with
+//!   `AlreadyLocked` instead of racing against the rebuild). That's
+//!   the one remaining piece of this retrofit.
 //! - Windows implementations of tier classification and directory
 //!   durability (see above) -- this workspace has no way to compile-
 //!   check or test Windows-specific code, so rather than ship
