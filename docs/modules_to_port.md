@@ -360,7 +360,7 @@ either -- this pass wasn't exhaustive.
 - [ ] cleanup.py (needs the mutable HTML tree — see #130)
 - [x] `container.py` -> `docx/container.rs`
 - [x] `dump.py` -> `docx/dump.rs`
-- [ ] fields.py (needs the mutable HTML tree — see #130)
+- [ ] fields.py (pure field-instruction parsing half ported to `docx/fields.rs` — `Field`/scanner/`parse_hyperlink`/`parse_xe`/`parse_index`/`parse_ref`/`parse_noteref`, cross-validated against Python's own `test_parse_fields` cases — the `Fields` orchestrator itself needs `parse_xe`'s source-tree bookmark insertion resolved plus `index.py` for `parse_index`/`polish_markup` — see #130/#290)
 - [ ] fonts.py (`is_symbol_font`/`map_symbol_text`/`SYMBOL_MAPS` ported to `docx/fonts.rs`; the `Fonts` class itself still needs a system font scanner — see #130)
 - [x] `footnotes.py` -> `docx/footnotes.rs`
 - [ ] images.py (pure geometry/CSS half ported to `docx/images.rs` — `image_filename`/`emu_to_pt`/`pt_to_emu`/`get_image_properties`/`get_image_margins`/`get_hpos`/`get_float_properties`, two upstream bugs reproduced faithfully — the `Images` struct itself (embedded-image extraction/resize, `w:drawing`/`w:pict` → `<img>` markup) still needs the mutable HTML tree — see #130/#289)
