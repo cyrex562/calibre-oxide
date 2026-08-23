@@ -63,10 +63,17 @@
 //!   #288's class-generation half; `fields.polish_markup`/
 //!   `cleanup_markup`/`write` remain, each blocked on its own unported
 //!   file).
+//! - [`convert_footnotes`]: appends the notes section -- an `<h1>`
+//!   heading and one `<dl class="footnote">` per referenced footnote/
+//!   endnote, each converted via [`convert_p`] exactly like the main
+//!   body (issue #284, closed -- turned out not to need any `Images`
+//!   dependency after all, since this port already threads
+//!   relationships through `convert_p`/`convert_body` as an explicit
+//!   parameter rather than Python's mutable `self.current_rels`).
 //!
-//! Not yet wired into `DOCXToHTML` -- that still needs the footnote
-//! body conversion (#284) and everything downstream (the rest of
-//! `apply_frames`, TOC, OPF writing), none of which exist here yet.
+//! Not yet wired into `DOCXToHTML` -- that still needs everything
+//! downstream (the rest of `apply_frames`, TOC, OPF writing), none of
+//! which exist here yet.
 //!
 //! # What `convert_run` defers, and why
 //!
@@ -104,7 +111,7 @@ use super::char_styles::RunStyle;
 use super::container::{Docx, Relationships};
 use super::error::DocxError;
 use super::fonts::{is_symbol_font, map_symbol_text};
-use super::footnotes::Footnotes;
+use super::footnotes::{Footnotes, Note};
 use super::names::DocxNamespace;
 use super::numbering::Numbering;
 use super::settings::Settings;
@@ -2162,6 +2169,125 @@ pub fn assign_style_classes<'a, 'i>(
                 .insert("class".to_string(), cls.to_string());
         }
     }
+}
+
+/// Appends the notes section: an `<h1>` heading (returned, so a later
+/// pass can retag it to match the document's own first heading level
+/// -- Python's `Convert.__call__` does this too, not yet ported here),
+/// then one `<dl class="footnote">` per footnote/endnote, each holding
+/// a back-reference `<dt>[<a href="#back_N">←N</a>]</dt>` and a `<dd>`
+/// containing the note's own converted body (via [`convert_p`], reused
+/// exactly as the main body walk uses it -- including
+/// [`Styles::apply_contextual_spacing`]/[`mark_block_runs`] over the
+/// note's own paragraphs).
+///
+/// Every note carries its *own* [`super::container::Relationships`]
+/// (`Note::rels`, since footnotes/endnotes live in their own part,
+/// e.g. `footnotes.xml.rels`) -- passed straight into `convert_p` as
+/// its `rels` argument. Python instead temporarily overwrites
+/// `self.images.rid_map`/`self.current_rels` (mutable instance state)
+/// for the duration of each note, restoring it afterward; this port
+/// already threads relationships through as an explicit parameter
+/// (since PR #294), so no such swap-and-restore, and no `Images` type
+/// at all, is needed here.
+///
+/// One deliberate gap: Python also records `self.page_map[wp] =
+/// self.current_page` for any `w:tbl` found inside a note. There is no
+/// `page_map` in scope here to write into -- that's `read_page_properties`'s
+/// own, locally-built map, not yet threaded through a real orchestrator
+/// (issue #130's remaining wiring work). The table itself is still
+/// registered (`Styles::register_table`), just without a page-properties
+/// entry; whoever wires the real orchestrator needs to fold this note's
+/// tables into that map too.
+///
+/// Returns `None` (matching Python's `notes_header = None`) when there
+/// are no notes to convert.
+///
+/// Port of the `if self.footnotes.has_notes: ...` block inside the
+/// Python `Convert.__call__`.
+#[allow(clippy::too_many_arguments)]
+pub fn convert_footnotes<'a, 'i>(
+    dom: &mut Dom,
+    body: NodeId,
+    state: &mut ConvertState<'a, 'i>,
+    footnotes: &mut Footnotes<'a, 'i>,
+    styles: &mut Styles<'a, 'i>,
+    settings: &Settings,
+    theme: &Theme,
+    doc_lang: Option<&str>,
+    uuid: &str,
+    notes_text: &str,
+    ns: &DocxNamespace,
+) -> Option<NodeId> {
+    if !footnotes.has_notes() {
+        return None;
+    }
+
+    let header = dom.new_element("h1");
+    let header_text = dom.new_text(notes_text);
+    dom.append_child(header, header_text);
+    dom.node_mut(header)
+        .attrs
+        .insert("class".to_string(), "notes-header".to_string());
+    dom.append_child(body, header);
+
+    // Snapshot into owned values before the loop: `convert_p` needs
+    // `&mut footnotes` (to resolve any footnote/endnote reference a
+    // note's own body might somehow carry), which can't coexist with
+    // an iterator still borrowing `footnotes` for the outer walk.
+    let entries: Vec<(String, String, Note<'a, 'i>)> = footnotes
+        .iter()
+        .map(|(anchor, text, note)| (anchor.to_string(), text.to_string(), note.clone()))
+        .collect();
+
+    for (anchor, text, note) in entries {
+        let dl = dom.new_element("dl");
+        dom.node_mut(dl)
+            .attrs
+            .insert("id".to_string(), anchor.clone());
+        dom.node_mut(dl)
+            .attrs
+            .insert("class".to_string(), "footnote".to_string());
+        dom.append_child(body, dl);
+
+        let dt = dom.new_element("dt");
+        let open_bracket = dom.new_text("[");
+        dom.append_child(dt, open_bracket);
+        let back_link = dom.new_element("a");
+        dom.node_mut(back_link)
+            .attrs
+            .insert("href".to_string(), format!("#back_{anchor}"));
+        dom.node_mut(back_link)
+            .attrs
+            .insert("title".to_string(), text.clone());
+        let back_link_text = dom.new_text(&format!("\u{2190}{text}"));
+        dom.append_child(back_link, back_link_text);
+        dom.append_child(dt, back_link);
+        let close_bracket = dom.new_text("]");
+        dom.append_child(dt, close_bracket);
+        dom.append_child(dl, dt);
+
+        let dd = dom.new_element("dd");
+        dom.append_child(dl, dd);
+
+        let mut paras: Vec<Node<'a, 'i>> = Vec::new();
+        for wp in note.blocks(ns) {
+            if ns.is_tag(wp, "w:tbl") {
+                styles.register_table(wp, ns);
+            } else {
+                let p = convert_p(
+                    dom, state, wp, styles, footnotes, settings, theme, doc_lang, uuid, &note.rels,
+                    ns,
+                );
+                dom.append_child(dd, p);
+                paras.push(wp);
+            }
+        }
+        styles.apply_contextual_spacing(&paras, ns);
+        mark_block_runs(state, &paras, styles, ns);
+    }
+
+    Some(header)
 }
 
 #[cfg(test)]
@@ -4788,5 +4914,178 @@ mod assign_style_classes_tests {
         assert_eq!(h.dom.tag(frame), Some("div"));
         let cls = h.dom.node(frame).attrs.get("class").cloned();
         assert!(cls.as_deref().is_some_and(|c| c.starts_with("frame_")));
+    }
+}
+
+#[cfg(test)]
+mod convert_footnotes_tests {
+    use super::*;
+    use crate::docx::tables::Tables;
+    use roxmltree::Document;
+
+    const DOC_OPEN: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:xml="http://www.w3.org/XML/1998/namespace""#;
+
+    fn parse_root(body: &str) -> (Document<'static>, DocxNamespace) {
+        let xml: &'static str =
+            Box::leak(format!("<w:root {DOC_OPEN}>{body}</w:root>").into_boxed_str());
+        (
+            Document::parse(xml).expect("valid XML"),
+            DocxNamespace::default(),
+        )
+    }
+
+    struct Harness<'a, 'i> {
+        dom: Dom,
+        state: ConvertState<'a, 'i>,
+        styles: Styles<'a, 'i>,
+        footnotes: Footnotes<'a, 'i>,
+        settings: Settings,
+        theme: Theme,
+    }
+
+    impl<'a, 'i> Harness<'a, 'i> {
+        fn new() -> Self {
+            Harness {
+                dom: Dom::empty(),
+                state: ConvertState::new(),
+                styles: Styles::new(Tables::default()),
+                footnotes: Footnotes::new(),
+                settings: Settings::new(),
+                theme: Theme::new(),
+            }
+        }
+
+        fn body(&mut self, doc: Node<'a, 'i>, ns: &DocxNamespace) -> NodeId {
+            convert_body(
+                &mut self.dom,
+                doc,
+                &mut self.state,
+                &mut self.styles,
+                &mut self.footnotes,
+                &self.settings,
+                &self.theme,
+                None,
+                "test-uuid",
+                &Relationships::default(),
+                ns,
+            )
+            .0
+        }
+    }
+
+    #[test]
+    fn a_referenced_footnote_gets_a_notes_header_and_a_dl_entry() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p><w:r><w:t>see</w:t><w:footnoteReference w:id="7"/></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+
+        // The footnote definition must be loaded *before* the body
+        // walk, so convert_run's w:footnoteReference handling
+        // (append_note_ref -> Footnotes::get_ref) can actually
+        // resolve id "7" and populate Footnotes::notes.
+        let notes_xml: &'static str = Box::leak(
+            format!(
+                r#"<w:footnotes {DOC_OPEN}><w:footnote w:id="7"><w:p><w:r><w:t>note text</w:t></w:r></w:p></w:footnote></w:footnotes>"#
+            )
+            .into_boxed_str(),
+        );
+        let notes_doc = Box::leak(Box::new(Document::parse(notes_xml).unwrap()));
+        h.footnotes.load(
+            Some(notes_doc.root_element()),
+            std::rc::Rc::new(Default::default()),
+            None,
+            std::rc::Rc::new(Default::default()),
+            &ns,
+        );
+
+        let body = h.body(document, &ns);
+        assert!(h.footnotes.has_notes());
+
+        let header = convert_footnotes(
+            &mut h.dom,
+            body,
+            &mut h.state,
+            &mut h.footnotes,
+            &mut h.styles,
+            &h.settings,
+            &h.theme,
+            None,
+            "test-uuid",
+            "Notes",
+            &ns,
+        );
+
+        let header = header.expect("notes exist");
+        assert_eq!(h.dom.tag(header), Some("h1"));
+        assert_eq!(
+            h.dom.node(header).attrs.get("class").map(String::as_str),
+            Some("notes-header")
+        );
+        assert_eq!(
+            h.dom.serialize(header),
+            "<h1 class=\"notes-header\">Notes</h1>"
+        );
+
+        let body_children = h.dom.children(body);
+        // The referencing paragraph, the notes header, and one <dl>.
+        assert_eq!(body_children.len(), 3);
+        let dl = body_children[2];
+        assert_eq!(h.dom.tag(dl), Some("dl"));
+        assert_eq!(
+            h.dom.node(dl).attrs.get("id").map(String::as_str),
+            Some("note_1")
+        );
+        assert_eq!(
+            h.dom.node(dl).attrs.get("class").map(String::as_str),
+            Some("footnote")
+        );
+
+        let dl_children = h.dom.children(dl);
+        assert_eq!(dl_children.len(), 2);
+        let (dt, dd) = (dl_children[0], dl_children[1]);
+        assert_eq!(h.dom.tag(dt), Some("dt"));
+        assert_eq!(
+            h.dom.serialize(dt),
+            "<dt>[<a href=\"#back_note_1\" title=\"1\">\u{2190}1</a>]</dt>"
+        );
+        assert_eq!(h.dom.tag(dd), Some("dd"));
+        assert_eq!(
+            h.dom.serialize(dd),
+            "<dd><p><span>note text</span></p></dd>"
+        );
+    }
+
+    #[test]
+    fn no_referenced_footnotes_returns_none_and_adds_nothing() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p><w:r><w:t>plain</w:t></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let body = h.body(document, &ns);
+        let before = h.dom.children(body).len();
+
+        let header = convert_footnotes(
+            &mut h.dom,
+            body,
+            &mut h.state,
+            &mut h.footnotes,
+            &mut h.styles,
+            &h.settings,
+            &h.theme,
+            None,
+            "test-uuid",
+            "Notes",
+            &ns,
+        );
+
+        assert!(header.is_none());
+        assert_eq!(h.dom.children(body).len(), before);
     }
 }
