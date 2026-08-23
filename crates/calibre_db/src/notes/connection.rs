@@ -170,6 +170,13 @@ impl NotesConnection {
         if attached == 0 {
             let db_path = self.notes_dir.join(NOTES_DB_NAME);
             conn.execute("ATTACH DATABASE ? AS notes_db", [db_path.to_str().unwrap()])?;
+            // docs/FAULT_TOLERANCE.md §3 (issue #260): each attached
+            // sidecar database needs its own journal_mode/synchronous
+            // pragma -- unqualified PRAGMA journal_mode only applies
+            // to `main`, not to an ATTACHed schema.
+            conn.execute_batch(
+                "PRAGMA notes_db.journal_mode=WAL; PRAGMA notes_db.synchronous=FULL;",
+            )?;
 
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS notes_db.notes (

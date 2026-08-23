@@ -111,6 +111,17 @@ impl Backend {
             "PRAGMA cache_size=-5000; PRAGMA temp_store=2; PRAGMA foreign_keys=ON;",
         )?;
 
+        // docs/FAULT_TOLERANCE.md §3 (issue #93/#260, not an upstream
+        // port -- real calibre doesn't set these): WAL mode +
+        // synchronous=FULL, unconditionally, on every open. Never
+        // journal_mode=MEMORY/synchronous=OFF on any tier, per §3's
+        // own explicit prohibition -- there's nothing tier-dependent
+        // about turning WAL on in the first place, only about how
+        // aggressively it gets checkpointed afterward (still not
+        // implemented -- see this crate's `library_handle.rs` module
+        // doc and issue #260 for exactly what's deferred and why).
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
+
         register_functions(&conn)?;
 
         // Port of `DB.__init__`: `if self.user_version == 0: self.initialize_database()`.
@@ -636,6 +647,25 @@ mod tests {
         let _first = Backend::new(dir.path()).unwrap();
         let _second = Backend::new(dir.path()).unwrap();
         assert!(!dir.path().join(".calibre-oxide").exists());
+    }
+
+    #[test]
+    fn new_opens_metadata_db_in_wal_mode_with_synchronous_full() {
+        // docs/FAULT_TOLERANCE.md §3 (issue #260): real, not just
+        // documented -- query the pragmas back from the live
+        // connection rather than trusting the `execute_batch` call
+        // silently succeeded.
+        let (_dir, backend) = open_test_library();
+        let conn = backend.conn.lock().unwrap();
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode.to_lowercase(), "wal");
+        // synchronous: 0=OFF, 1=NORMAL, 2=FULL, 3=EXTRA -- FULL is 2.
+        let synchronous: i64 = conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 2);
     }
 
     #[test]

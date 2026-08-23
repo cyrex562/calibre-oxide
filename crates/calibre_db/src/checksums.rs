@@ -179,6 +179,13 @@ impl ChecksumStore {
                 "ATTACH DATABASE ? AS checksums_db",
                 [self.db_path.to_str().unwrap()],
             )?;
+            // docs/FAULT_TOLERANCE.md §3 (issue #260): each attached
+            // sidecar database needs its own journal_mode/synchronous
+            // pragma -- unqualified PRAGMA journal_mode only applies
+            // to `main`, not to an ATTACHed schema.
+            conn.execute_batch(
+                "PRAGMA checksums_db.journal_mode=WAL; PRAGMA checksums_db.synchronous=FULL;",
+            )?;
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS checksums_db.file_checksums (
                     book_id INTEGER NOT NULL,
@@ -337,6 +344,27 @@ mod tests {
     fn store(dir: &Path) -> ChecksumStore {
         let conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
         ChecksumStore::new(conn, dir)
+    }
+
+    #[test]
+    fn checksums_db_is_attached_in_wal_mode_with_synchronous_full() {
+        // docs/FAULT_TOLERANCE.md §3 (issue #260): real, not just
+        // documented -- query the pragmas back from the live
+        // connection. Unqualified `PRAGMA journal_mode` only reports
+        // `main` (here an in-memory test connection, which can't be
+        // WAL at all), so this queries the attached schema by name.
+        let dir = tempdir().unwrap();
+        let store = store(dir.path());
+        store.initialize().unwrap();
+        let conn = store.conn.lock().unwrap();
+        let journal_mode: String = conn
+            .query_row("PRAGMA checksums_db.journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode.to_lowercase(), "wal");
+        let synchronous: i64 = conn
+            .query_row("PRAGMA checksums_db.synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 2);
     }
 
     #[test]

@@ -11,6 +11,26 @@ fn open(dir: &std::path::Path) -> NotesConnection {
 }
 
 #[test]
+fn notes_db_is_attached_in_wal_mode_with_synchronous_full() {
+    // docs/FAULT_TOLERANCE.md §3 (issue #260): real, not just
+    // documented -- query the pragmas back from the live connection.
+    let dir = tempdir().unwrap();
+    let backend = Backend::new(dir.path()).unwrap();
+    let notes = NotesConnection::new(backend.clone(), dir.path());
+    notes.initialize().unwrap();
+
+    let conn = backend.conn.lock().unwrap();
+    let journal_mode: String = conn
+        .query_row("PRAGMA notes_db.journal_mode", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(journal_mode.to_lowercase(), "wal");
+    let synchronous: i64 = conn
+        .query_row("PRAGMA notes_db.synchronous", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(synchronous, 2);
+}
+
+#[test]
 fn test_notes_crud() {
     let dir = tempdir().unwrap();
     let notes = open(dir.path());
