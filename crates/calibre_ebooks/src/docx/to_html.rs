@@ -11,21 +11,22 @@
 //! itself: `images.py`, `fields.py`, `toc.py`, `cleanup.py`) is ready
 //! to replace it wholesale.
 //!
-//! [`convert_run`], [`convert_p`], [`read_page_properties`] and
-//! [`convert_body`] are the real port so far: `w:r` -> a `<span>`,
-//! `w:p` -> a `<p>`/`<h1>`..`<h6>` (using the real
-//! [`super::styles::Styles::resolve_run`]/`resolve_paragraph`, issue
-//! #130's styles/numbering/tables cluster, landed before this),
+//! [`convert_run`], [`convert_p`], [`read_page_properties`],
+//! [`convert_body`] and [`read_block_anchors`] are the real port so
+//! far: `w:r` -> a `<span>`, `w:p` -> a `<p>`/`<h1>`..`<h6>` (using the
+//! real [`super::styles::Styles::resolve_run`]/`resolve_paragraph`,
+//! issue #130's styles/numbering/tables cluster, landed before this),
 //! carrying the per-document state ([`ConvertState`]) both need across
 //! the whole body walk; the paragraph/table -> [`PageProperties`] map
-//! (plus `w:tbl` registration) that walk consumes; and
-//! [`convert_body`] itself, which actually runs that walk -- builds a
-//! `<body>`, converts and appends every `w:p` in document order, and
-//! applies [`super::styles::Styles::apply_contextual_spacing`]/
+//! (plus `w:tbl` registration) that walk consumes; [`convert_body`]
+//! itself, which actually runs that walk -- builds a `<body>`,
+//! converts and appends every `w:p` in document order, and applies
+//! [`super::styles::Styles::apply_contextual_spacing`]/
 //! [`super::styles::Styles::apply_section_page_breaks`] afterward, all
-//! matching `Convert.__call__`'s paragraph loop. Not yet wired into
-//! `DOCXToHTML` -- that still needs `read_block_anchors`,
-//! `mark_block_runs`, and everything downstream (links, frames,
+//! matching `Convert.__call__`'s paragraph loop; and
+//! [`read_block_anchors`], which assigns ids to paragraphs a top-level
+//! bookmark precedes. Not yet wired into `DOCXToHTML` -- that still
+//! needs `mark_block_runs` and everything downstream (links, frames,
 //! tables/numbering markup, TOC, OPF writing), none of which exist
 //! here yet.
 //!
@@ -51,7 +52,7 @@
 //! string once serialized -- see `crate::dom`'s own module docs for
 //! why this representation was chosen.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek};
 use std::path::Path;
 
@@ -731,7 +732,7 @@ fn apply_new_anchor(
     current_anchor: &mut Option<String>,
 ) -> String {
     let old_anchor = current_anchor.clone();
-    let existing: std::collections::HashSet<String> = state.anchor_map.values().cloned().collect();
+    let existing: HashSet<String> = state.anchor_map.values().cloned().collect();
     let new_anchor = super::names::generate_anchor(&key, &existing);
     state.anchor_map.insert(key, new_anchor.clone());
     *current_anchor = Some(new_anchor.clone());
@@ -892,6 +893,82 @@ pub fn convert_body<'a, 'i>(
     }
 
     (body, paras)
+}
+
+/// Assigns an `id` to every converted paragraph that a top-level (a
+/// direct child of `w:body`) `w:bookmarkStart[@w:name]` immediately
+/// precedes, and records each such bookmark name in
+/// `state.anchor_map` pointing at that id -- letting later
+/// cross-reference/hyperlink resolution (not yet ported) turn an
+/// internal `w:anchor` reference into `href="#id"`.
+///
+/// A bookmark that lands *inside* a paragraph (on a run, mid-text) is
+/// a different case entirely, already handled by [`convert_p`] itself
+/// -- this only covers bookmarks Word placed as siblings of the
+/// paragraphs they name, which is how Word marks e.g. a whole
+/// heading. Skips (but does not drop) any pending bookmark names when
+/// the immediately-following `w:p` wasn't itself converted (not
+/// present in `state.object_map` -- e.g. it lives inside a table cell,
+/// handled later by the unported `Tables::apply_markup`): the names
+/// simply carry over to whichever converted paragraph comes next,
+/// matching Python's own carry-over behaviour.
+///
+/// Port of the Python `Convert.read_block_anchors`. One deliberate
+/// difference: Python picks an arbitrary name from a `set` (hash
+/// order, effectively undefined) to seed the generated id when the
+/// paragraph doesn't already have one; this always picks the first
+/// bookmark name encountered in document order, a deterministic
+/// choice with no semantic effect on the *set* of names mapped to
+/// that id afterward -- only on which name happens to also become the
+/// literal id text.
+pub fn read_block_anchors<'a, 'i>(
+    dom: &mut Dom,
+    doc: Node<'a, 'i>,
+    state: &mut ConvertState<'a, 'i>,
+    ns: &DocxNamespace,
+) {
+    let Some(body) = ns.first_child(doc, "w:body") else {
+        return;
+    };
+    let doc_anchors: HashSet<Node<'a, 'i>> = ns
+        .children(body, &["w:bookmarkStart"])
+        .into_iter()
+        .filter(|&n| ns.get(n, "w:name").is_some())
+        .collect();
+    if doc_anchors.is_empty() {
+        return;
+    }
+
+    let rmap: HashMap<Node<'a, 'i>, NodeId> =
+        state.object_map.iter().map(|(&id, &n)| (n, id)).collect();
+
+    let mut current_bm: Vec<String> = Vec::new();
+    for p in ns.descendants(doc, &["w:p", "w:bookmarkStart"]) {
+        if ns.is_tag(p, "w:p") {
+            if current_bm.is_empty() {
+                continue;
+            }
+            let Some(&para) = rmap.get(&p) else {
+                continue;
+            };
+            if !dom.node(para).attrs.contains_key("id") {
+                let existing: HashSet<String> = state.anchor_map.values().cloned().collect();
+                let id = super::names::generate_anchor(&current_bm[0], &existing);
+                dom.node_mut(para).attrs.insert("id".to_string(), id);
+            }
+            if let Some(id) = dom.node(para).attrs.get("id").cloned() {
+                for name in current_bm.drain(..) {
+                    state.anchor_map.insert(name, id.clone());
+                }
+            }
+        } else if doc_anchors.contains(&p) {
+            if let Some(anchor) = ns.get(p, "w:name") {
+                if !current_bm.iter().any(|n| n == anchor) {
+                    current_bm.push(anchor.to_string());
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1706,5 +1783,195 @@ mod convert_body_tests {
             Some(true),
             "the second section's start paragraph gets a leading break"
         );
+    }
+}
+
+#[cfg(test)]
+mod read_block_anchors_tests {
+    use super::*;
+    use crate::docx::tables::Tables;
+    use roxmltree::Document;
+
+    const DOC_OPEN: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:xml="http://www.w3.org/XML/1998/namespace""#;
+
+    fn parse_root(body: &str) -> (Document<'static>, DocxNamespace) {
+        let xml: &'static str =
+            Box::leak(format!("<w:root {DOC_OPEN}>{body}</w:root>").into_boxed_str());
+        (
+            Document::parse(xml).expect("valid XML"),
+            DocxNamespace::default(),
+        )
+    }
+
+    struct Harness<'a, 'i> {
+        dom: Dom,
+        state: ConvertState<'a, 'i>,
+        styles: Styles<'a, 'i>,
+        footnotes: Footnotes<'a, 'i>,
+        settings: Settings,
+        theme: Theme,
+    }
+
+    impl<'a, 'i> Harness<'a, 'i> {
+        fn new() -> Self {
+            Harness {
+                dom: Dom::empty(),
+                state: ConvertState::new(),
+                styles: Styles::new(Tables::default()),
+                footnotes: Footnotes::new(),
+                settings: Settings::new(),
+                theme: Theme::new(),
+            }
+        }
+
+        fn body(&mut self, doc: Node<'a, 'i>, ns: &DocxNamespace) -> NodeId {
+            convert_body(
+                &mut self.dom,
+                doc,
+                &mut self.state,
+                &mut self.styles,
+                &mut self.footnotes,
+                &self.settings,
+                &self.theme,
+                None,
+                "test-uuid",
+                ns,
+            )
+            .0
+        }
+    }
+
+    #[test]
+    fn a_top_level_bookmark_before_a_paragraph_assigns_an_id_and_maps_the_name() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:bookmarkStart w:id="0" w:name="chap1"/>
+                 <w:p><w:r><w:t>hi</w:t></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let body = h.body(document, &ns);
+        read_block_anchors(&mut h.dom, document, &mut h.state, &ns);
+
+        let p = h.dom.children(body)[0];
+        let id = h.dom.node(p).attrs.get("id").cloned().expect("id was set");
+        assert_eq!(h.state.anchor_map.get("chap1"), Some(&id));
+    }
+
+    #[test]
+    fn two_top_level_bookmarks_before_one_paragraph_both_map_to_its_single_id() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:bookmarkStart w:id="0" w:name="chap1"/>
+                 <w:bookmarkStart w:id="1" w:name="intro"/>
+                 <w:p><w:r><w:t>hi</w:t></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let body = h.body(document, &ns);
+        read_block_anchors(&mut h.dom, document, &mut h.state, &ns);
+
+        let p = h.dom.children(body)[0];
+        let id = h.dom.node(p).attrs.get("id").cloned().expect("id was set");
+        assert_eq!(h.state.anchor_map.get("chap1"), Some(&id));
+        assert_eq!(h.state.anchor_map.get("intro"), Some(&id));
+    }
+
+    #[test]
+    fn a_paragraph_that_already_has_an_id_is_not_overwritten() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:bookmarkStart w:id="0" w:name="chap1"/>
+                 <w:p><w:bookmarkStart w:id="1" w:name="inner"/><w:r><w:t>hi</w:t></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let body = h.body(document, &ns);
+        let p = h.dom.children(body)[0];
+        let existing_id = h
+            .dom
+            .node(p)
+            .attrs
+            .get("id")
+            .cloned()
+            .expect("convert_p already set an id from the inline bookmark");
+
+        read_block_anchors(&mut h.dom, document, &mut h.state, &ns);
+
+        assert_eq!(h.dom.node(p).attrs.get("id"), Some(&existing_id));
+        assert_eq!(h.state.anchor_map.get("chap1"), Some(&existing_id));
+    }
+
+    #[test]
+    fn a_pending_bookmark_carries_over_to_the_next_converted_paragraph_when_one_is_skipped() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:bookmarkStart w:id="0" w:name="chap1"/>
+                 <w:p><w:r><w:t>skipped</w:t></w:r></w:p>
+                 <w:p><w:r><w:t>kept</w:t></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let body = h.body(document, &ns);
+        let children = h.dom.children(body);
+        let (first_p, second_p) = (children[0], children[1]);
+        // Simulate the first paragraph never having been converted
+        // (e.g. content `object_map` never reaches) by dropping its
+        // entry -- proves the pending bookmark carries over rather
+        // than being discarded, matching Python's own carry-over.
+        h.state.object_map.shift_remove(&first_p);
+
+        read_block_anchors(&mut h.dom, document, &mut h.state, &ns);
+
+        assert!(h.dom.node(first_p).attrs.get("id").is_none());
+        let id = h
+            .dom
+            .node(second_p)
+            .attrs
+            .get("id")
+            .cloned()
+            .expect("id was set");
+        assert_eq!(h.state.anchor_map.get("chap1"), Some(&id));
+    }
+
+    #[test]
+    fn a_bookmark_nested_inside_a_paragraph_is_not_treated_as_a_top_level_anchor() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p><w:bookmarkStart w:id="0" w:name="inner"/><w:r><w:t>x</w:t></w:r></w:p>
+                 <w:p><w:r><w:t>y</w:t></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let body = h.body(document, &ns);
+        read_block_anchors(&mut h.dom, document, &mut h.state, &ns);
+
+        // "inner" was already resolved by `convert_p` onto the first
+        // paragraph -- it was never a pending top-level bookmark, so
+        // the second paragraph gets no id from `read_block_anchors`.
+        let second_p = h.dom.children(body)[1];
+        assert!(h.dom.node(second_p).attrs.get("id").is_none());
+    }
+
+    #[test]
+    fn no_top_level_bookmarks_is_a_no_op() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p><w:r><w:t>a</w:t></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let body = h.body(document, &ns);
+        read_block_anchors(&mut h.dom, document, &mut h.state, &ns);
+
+        let p = h.dom.children(body)[0];
+        assert!(h.dom.node(p).attrs.get("id").is_none());
+        assert!(h.state.anchor_map.is_empty());
     }
 }
