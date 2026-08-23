@@ -765,6 +765,19 @@ impl<'a, 'i> Styles<'a, 'i> {
         self.classes.get(&key).map(|(name, _)| name.as_str())
     }
 
+    /// The reverse of [`class_name`](Self::class_name): every
+    /// registered class name mapped back to its CSS. Port of
+    /// `cleanup.py`'s `class_map = dict(styles.classes.values())`
+    /// idiom (`docx/cleanup.rs`, issue #291) -- `self.classes`'
+    /// values are `(name, css)` pairs, so this is just that dict
+    /// built the other way round.
+    pub fn class_map(&self) -> HashMap<String, Css> {
+        self.classes
+            .values()
+            .map(|(name, css)| (name.clone(), css.clone()))
+            .collect()
+    }
+
     /// Registers a CSS class for every cached paragraph/run style with
     /// non-empty CSS.
     ///
