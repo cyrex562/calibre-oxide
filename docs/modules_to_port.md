@@ -372,7 +372,7 @@ either -- this pass wasn't exhaustive.
 - [ ] styles.py (`PageProperties`/`Style` and the full `Styles` paragraph/run cascade orchestrator ported to `docx/styles.rs` — `Styles::cascade` (needs an `is-link`/`layers` concept only `to_html.rs` can produce) and `generate_css` (needs `fonts.py`'s system font matching) remain — see #130)
 - [ ] tables.py (`RowStyle`/`CellStyle`/`TableStyle` and full `Table`/`Tables` row/cell/paragraph style resolution ported to `docx/tables.rs` — `handle_merged_cells`'s cell removal is a tracked exclusion set, not source-tree mutation; only `apply_markup` (HTML `<table>` construction) remains, needs `crate::dom` wired into the docx module — see #130)
 - [x] `theme.py` -> `docx/theme.rs`
-- [ ] to_html.py (`docx/to_html.rs`'s `DOCXToHTML` is still the provisional sketch, wired into `input/docx_input.rs`; `convert_run` is the first real piece ported, not yet wired in — see #130)
+- [ ] to_html.py (`docx/to_html.rs`'s `DOCXToHTML` is still the provisional sketch, wired into `input/docx_input.rs`; `convert_run`/`convert_p` are ported, not yet wired in — the main body-walking loop, page properties, links, frames, tables/numbering markup, TOC, and OPF writing remain — see #130)
 - [ ] toc.py (needs the mutable HTML tree — see #130)
 
 ##### writer

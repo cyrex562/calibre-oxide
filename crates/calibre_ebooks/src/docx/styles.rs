@@ -595,6 +595,18 @@ impl<'a, 'i> Styles<'a, 'i> {
         }
     }
 
+    /// Clears a cached run's border, the same write-back need as
+    /// [`Styles::set_run_font_family`] but for `to_html.py`'s
+    /// `convert_p`, which moves a run of same-bordered spans' border
+    /// onto a single wrapping element and calls
+    /// `style.clear_border_css()` on each original run so its own
+    /// (now redundant) border CSS isn't also emitted.
+    pub fn clear_run_border(&mut self, r: Node<'a, 'i>) {
+        if let Some(cached) = self.run_cache.get_mut(&r) {
+            cached.clear_border_css();
+        }
+    }
+
     /// Discards a named paragraph style's own `w:numPr` level in
     /// favour of the level `numbering.xml` actually links to that
     /// style (Word ignores a level set directly inside a style
