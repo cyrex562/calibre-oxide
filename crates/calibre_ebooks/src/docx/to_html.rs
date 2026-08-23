@@ -5,22 +5,25 @@
 //! heading levels guessed from `w:pStyle` and no style resolution
 //! whatsoever. It stays wired into the DOCX input plugin (see
 //! `input/docx_input.rs`) and keeps producing *something* until real
-//! `Convert::__call__` orchestration (page properties, the footnote/
-//! numbering/table passes, links, frames, TOC, OPF writing -- most of
-//! which are still blocked, several on files issue #130 lists
-//! alongside `to_html.py` itself: `images.py`, `fields.py`,
-//! `toc.py`, `cleanup.py`) is ready to replace it wholesale.
+//! `Convert::__call__` orchestration (the footnote/numbering/table
+//! passes, links, frames, TOC, OPF writing -- most of which are still
+//! blocked, several on files issue #130 lists alongside `to_html.py`
+//! itself: `images.py`, `fields.py`, `toc.py`, `cleanup.py`) is ready
+//! to replace it wholesale.
 //!
-//! [`convert_run`] and [`convert_p`] are the real port so far: `w:r` ->
-//! a `<span>`, `w:p` -> a `<p>`/`<h1>`..`<h6>` (using the real
+//! [`convert_run`], [`convert_p`] and [`read_page_properties`] are the
+//! real port so far: `w:r` -> a `<span>`, `w:p` -> a `<p>`/`<h1>`..
+//! `<h6>` (using the real
 //! [`super::styles::Styles::resolve_run`]/`resolve_paragraph`, issue
 //! #130's styles/numbering/tables cluster, landed before this),
 //! carrying the per-document state ([`ConvertState`]) both need across
-//! the whole body walk. Not yet wired into `DOCXToHTML` -- that needs
-//! the main body-walking loop (`Convert.__call__`'s `for wp,
-//! page_properties in self.page_map.items(): ...`), page properties,
-//! and everything downstream (links, frames, tables/numbering markup,
-//! TOC, OPF writing), none of which exist here yet.
+//! the whole body walk, and the paragraph/table -> [`PageProperties`]
+//! map (plus `w:tbl` registration) that walk consumes. Not yet wired
+//! into `DOCXToHTML` -- that needs the main body-walking loop
+//! (`Convert.__call__`'s `for wp, page_properties in
+//! self.page_map.items(): ...`) and everything downstream (links,
+//! frames, tables/numbering markup, TOC, OPF writing), none of which
+//! exist here yet.
 //!
 //! # What `convert_run` defers, and why
 //!
@@ -59,7 +62,7 @@ use super::fonts::{is_symbol_font, map_symbol_text};
 use super::footnotes::Footnotes;
 use super::names::DocxNamespace;
 use super::settings::Settings;
-use super::styles::Styles;
+use super::styles::{PageProperties, Styles};
 use super::theme::Theme;
 
 pub struct DOCXToHTML;
@@ -757,6 +760,62 @@ fn wrap_elems(dom: &mut Dom, parent: NodeId, elems: &[NodeId]) -> NodeId {
     wrapper
 }
 
+/// Walks `doc` (the `w:document` root) for every `w:p`/`w:tbl`,
+/// grouping consecutive elements into the [`PageProperties`] of the
+/// `w:sectPr` that ends their section, registering each `w:tbl`
+/// encountered along the way, and recording each section's first
+/// element in `section_starts`.
+///
+/// Returns `(page_map, section_starts)` in document order --
+/// `page_map` an [`IndexMap`] since later callers (the main body-walk
+/// loop, `apply_section_page_breaks`) depend on iteration order
+/// matching Python's `OrderedDict`.
+///
+/// Port of the Python `Convert.read_page_properties`.
+pub fn read_page_properties<'a, 'i>(
+    doc: Node<'a, 'i>,
+    styles: &mut Styles<'a, 'i>,
+    ns: &DocxNamespace,
+) -> (IndexMap<Node<'a, 'i>, PageProperties>, Vec<Node<'a, 'i>>) {
+    let mut current: Vec<Node<'a, 'i>> = Vec::new();
+    let mut page_map: IndexMap<Node<'a, 'i>, PageProperties> = IndexMap::new();
+    let mut section_starts: Vec<Node<'a, 'i>> = Vec::new();
+
+    for p in ns.descendants(doc, &["w:p", "w:tbl"]) {
+        if ns.is_tag(p, "w:tbl") {
+            styles.register_table(p, ns);
+            current.push(p);
+            continue;
+        }
+        let sect = ns.descendants(p, &["w:sectPr"]);
+        if !sect.is_empty() {
+            let pr = PageProperties::from_sect_prs(&sect, ns);
+            current.push(p);
+            for &x in &current {
+                page_map.insert(x, pr);
+            }
+            section_starts.push(current[0]);
+            current.clear();
+        } else {
+            current.push(p);
+        }
+    }
+
+    if !current.is_empty() {
+        section_starts.push(current[0]);
+        let body = ns.first_child(doc, "w:body");
+        let last = body
+            .map(|b| ns.children(b, &["w:sectPr"]))
+            .unwrap_or_default();
+        let pr = PageProperties::from_sect_prs(&last, ns);
+        for &x in &current {
+            page_map.insert(x, pr);
+        }
+    }
+
+    (page_map, section_starts)
+}
+
 #[cfg(test)]
 mod convert_run_tests {
     use super::*;
@@ -1303,5 +1362,105 @@ mod convert_p_tests {
             html.contains(">c<"),
             "the mismatching run's own text still renders: {html}"
         );
+    }
+}
+
+#[cfg(test)]
+mod read_page_properties_tests {
+    use super::*;
+    use crate::docx::tables::Tables;
+    use roxmltree::Document;
+
+    const DOC_OPEN: &str =
+        r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main""#;
+
+    fn parse_doc(body: &str) -> (Document<'static>, DocxNamespace) {
+        let xml: &'static str = Box::leak(
+            format!("<w:document {DOC_OPEN}><w:body>{body}</w:body></w:document>").into_boxed_str(),
+        );
+        (
+            Document::parse(xml).expect("valid XML"),
+            DocxNamespace::default(),
+        )
+    }
+
+    fn sect_pr(width: u32) -> String {
+        format!(r#"<w:sectPr><w:pgSz w:w="{width}" w:h="16838"/></w:sectPr>"#)
+    }
+
+    #[test]
+    fn every_paragraph_before_the_final_section_break_maps_to_that_sections_properties() {
+        let (doc, ns) = parse_doc(&format!(
+            "<w:p><w:r><w:t>a</w:t></w:r></w:p><w:p><w:r><w:t>b</w:t></w:r>{}</w:p>",
+            sect_pr(1000)
+        ));
+        let mut styles = Styles::new(Tables::default());
+        let root = doc.root_element();
+        let (page_map, section_starts) = read_page_properties(root, &mut styles, &ns);
+
+        let ps: Vec<Node> = ns.descendants(root, &["w:p"]);
+        assert_eq!(page_map.len(), 2);
+        assert!((page_map[&ps[0]].width - 50.0).abs() < 0.01);
+        assert!((page_map[&ps[1]].width - 50.0).abs() < 0.01);
+        assert_eq!(section_starts, vec![ps[0]]);
+    }
+
+    #[test]
+    fn trailing_paragraphs_after_the_last_section_break_use_the_body_level_sectpr() {
+        let (doc, ns) = parse_doc(&format!(
+            "<w:p><w:r><w:t>a</w:t></w:r>{}</w:p><w:p><w:r><w:t>b</w:t></w:r></w:p>{}",
+            sect_pr(1000),
+            sect_pr(2000)
+        ));
+        let mut styles = Styles::new(Tables::default());
+        let root = doc.root_element();
+        let (page_map, section_starts) = read_page_properties(root, &mut styles, &ns);
+
+        let ps: Vec<Node> = ns.descendants(root, &["w:p"]);
+        assert!((page_map[&ps[0]].width - 50.0).abs() < 0.01);
+        assert!((page_map[&ps[1]].width - 100.0).abs() < 0.01);
+        assert_eq!(section_starts, vec![ps[0], ps[1]]);
+    }
+
+    #[test]
+    fn a_table_before_a_section_break_paragraph_is_registered_and_mapped() {
+        let (doc, ns) = parse_doc(&format!(
+            "<w:tbl><w:tr><w:tc><w:p/></w:tc></w:tr></w:tbl><w:p><w:r><w:t>a</w:t></w:r>{}</w:p>",
+            sect_pr(1000)
+        ));
+        let mut styles = Styles::new(Tables::default());
+        let root = doc.root_element();
+        let (page_map, section_starts) = read_page_properties(root, &mut styles, &ns);
+
+        let tbl = ns.descendants(root, &["w:tbl"])[0];
+        // `descendants` walks the whole tree, so the table's own inner
+        // (empty) cell paragraph is a separate match from the
+        // top-level paragraph carrying the section break -- both land
+        // in `page_map`, matching Python's `namespace.descendants`
+        // (not clipped to skip a matched `w:tbl`'s own children).
+        let ps: Vec<Node> = ns.descendants(root, &["w:p"]);
+        assert_eq!(ps.len(), 2);
+        assert_eq!(page_map.len(), 3);
+        assert!(page_map.contains_key(&tbl));
+        assert!((page_map[&ps[0]].width - 50.0).abs() < 0.01);
+        assert!((page_map[&ps[1]].width - 50.0).abs() < 0.01);
+        assert_eq!(section_starts, vec![tbl]);
+    }
+
+    #[test]
+    fn no_section_breaks_at_all_maps_everything_to_the_body_sectpr() {
+        let (doc, ns) = parse_doc(&format!(
+            "<w:p><w:r><w:t>a</w:t></w:r></w:p><w:p><w:r><w:t>b</w:t></w:r></w:p>{}",
+            sect_pr(3000)
+        ));
+        let mut styles = Styles::new(Tables::default());
+        let root = doc.root_element();
+        let (page_map, section_starts) = read_page_properties(root, &mut styles, &ns);
+
+        let ps: Vec<Node> = ns.descendants(root, &["w:p"]);
+        assert_eq!(page_map.len(), 2);
+        assert!((page_map[&ps[0]].width - 150.0).abs() < 0.01);
+        assert!((page_map[&ps[1]].width - 150.0).abs() < 0.01);
+        assert_eq!(section_starts, vec![ps[0]]);
     }
 }

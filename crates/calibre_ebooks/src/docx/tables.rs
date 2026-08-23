@@ -55,7 +55,7 @@
 //! dict threaded through every recursive sub-table construction so
 //! `Tables.para_style`/`run_style` can later find which `Table` owns a
 //! given paragraph. Neither needs the full (not-yet-ported) `Styles`
-//! cascade orchestrator: [`Table::new`] takes `named_styles: &HashMap<String, Style>`
+//! cascade orchestrator: [`Table::new`] takes `named_styles: &IndexMap<String, Style>`
 //! directly (`Styles::id_map`, once that type exists), and
 //! [`Tables::para_style`]/[`Tables::run_style`] are backed by a flat
 //! map [`Tables`] builds itself by copying each registered `Table`'s
@@ -905,7 +905,7 @@ impl<'a, 'i> Table<'a, 'i> {
     /// why there is no `para_map` parameter.
     pub fn new(
         tbl: Node<'a, 'i>,
-        named_styles: &HashMap<String, Style>,
+        named_styles: &IndexMap<String, Style>,
         ns: &DocxNamespace,
         is_sub_table: bool,
     ) -> Table<'a, 'i> {
@@ -1335,7 +1335,7 @@ impl<'a, 'i> Tables<'a, 'i> {
     pub fn register(
         &mut self,
         tbl: Node<'a, 'i>,
-        named_styles: &HashMap<String, Style>,
+        named_styles: &IndexMap<String, Style>,
         ns: &DocxNamespace,
     ) {
         if self.sub_table_nodes.contains(&tbl) {
@@ -1565,7 +1565,7 @@ mod tests {
     #[test]
     fn table_construction_populates_cell_map_and_style_maps() {
         let (doc, ns) = parse_tbl(simple_2x2_table());
-        let table = Table::new(doc.root_element(), &HashMap::new(), &ns, false);
+        let table = Table::new(doc.root_element(), &IndexMap::new(), &ns, false);
         assert_eq!(table.cell_map.len(), 2, "two rows");
         assert_eq!(table.cell_map[0].len(), 2, "two cells per row");
         assert_eq!(table.paragraphs.len(), 4, "one paragraph per cell");
@@ -1582,7 +1582,7 @@ mod tests {
             r#"<w:tblPr><w:tblStyle w:val="MyTable"/><w:tblW w:w="5000" w:type="pct"/></w:tblPr>
                <w:tr><w:tc><w:p/></w:tc></w:tr>"#,
         );
-        let mut named_styles = HashMap::new();
+        let mut named_styles = IndexMap::new();
         let mut style = Style::default();
         style.table_style = Some({
             let mut ts = TableStyle::new();
@@ -1607,7 +1607,7 @@ mod tests {
     #[test]
     fn get_overrides_flags_corners_and_edges_on_a_2x2_table() {
         let (doc, ns) = parse_tbl(simple_2x2_table());
-        let table = Table::new(doc.root_element(), &HashMap::new(), &ns, false);
+        let table = Table::new(doc.root_element(), &IndexMap::new(), &ns, false);
         // Every band/look bit is off by default, so `override_allowed`
         // only lets through "*Cell"/"wholeTable" names -- band overrides
         // never survive the filter under default `look`.
@@ -1623,7 +1623,7 @@ mod tests {
         let (doc, ns) = parse_tbl(
             r#"<w:tblPr><w:tblLook w:val="0020"/></w:tblPr><w:tr><w:tc><w:p/></w:tc></w:tr>"#,
         );
-        let table = Table::new(doc.root_element(), &HashMap::new(), &ns, false);
+        let table = Table::new(doc.root_element(), &IndexMap::new(), &ns, false);
         assert!(table.override_allowed("firstRow"), "0x0020 allows firstRow");
         assert!(!table.override_allowed("lastRow"), "0x0040 not set");
     }
@@ -1634,7 +1634,7 @@ mod tests {
             r#"<w:tblPr><w:tblCellMar><w:left w:w="200" w:type="dxa"/></w:tblCellMar></w:tblPr>
                <w:tr><w:tc><w:p/></w:tc></w:tr>"#,
         );
-        let table = Table::new(doc.root_element(), &HashMap::new(), &ns, false);
+        let table = Table::new(doc.root_element(), &IndexMap::new(), &ns, false);
         let tc = table.cell_map[0][0];
         let cs = &table.style_map_cell[&tc];
         assert_eq!(
@@ -1654,7 +1654,7 @@ mod tests {
         let (doc, ns) = parse_tbl(
             r#"<w:tr><w:tc><w:p/></w:tc><w:tc><w:tcPr><w:tcBorders><w:left w:val="none"/></w:tcBorders></w:tcPr><w:p/></w:tc></w:tr>"#,
         );
-        let table = Table::new(doc.root_element(), &HashMap::new(), &ns, false);
+        let table = Table::new(doc.root_element(), &IndexMap::new(), &ns, false);
         let second_tc = table.cell_map[0][1];
         let cs = &table.style_map_cell[&second_tc];
         assert_eq!(
@@ -1668,7 +1668,7 @@ mod tests {
         let (doc2, ns2) = parse_tbl(
             r#"<w:tr><w:tc><w:tcPr><w:tcBorders><w:left w:val="none"/></w:tcBorders></w:tcPr><w:p/></w:tc></w:tr>"#,
         );
-        let table2 = Table::new(doc2.root_element(), &HashMap::new(), &ns2, false);
+        let table2 = Table::new(doc2.root_element(), &IndexMap::new(), &ns2, false);
         let first_tc = table2.cell_map[0][0];
         let cs2 = &table2.style_map_cell[&first_tc];
         assert_eq!(cs2.borders.left.style.as_deref(), Some("hidden"));
@@ -1681,7 +1681,7 @@ mod tests {
                <w:tr><w:tc><w:tcPr><w:vMerge w:val="continue"/></w:tcPr><w:p/></w:tc></w:tr>
                <w:tr><w:tc><w:tcPr><w:vMerge w:val="continue"/></w:tcPr><w:p/></w:tc></w:tr>"#,
         );
-        let table = Table::new(doc.root_element(), &HashMap::new(), &ns, false);
+        let table = Table::new(doc.root_element(), &IndexMap::new(), &ns, false);
         let head = table.cell_map[0][0];
         let cont1 = table.cell_map[1][0];
         let cont2 = table.cell_map[2][0];
@@ -1699,7 +1699,7 @@ mod tests {
                 <w:tc><w:tcPr><w:hMerge w:val="continue"/></w:tcPr><w:p/></w:tc>
                </w:tr>"#,
         );
-        let table = Table::new(doc.root_element(), &HashMap::new(), &ns, false);
+        let table = Table::new(doc.root_element(), &IndexMap::new(), &ns, false);
         let head = table.cell_map[0][0];
         let cont = table.cell_map[0][1];
         assert_eq!(table.style_map_cell[&head].col_span, Some(2));
@@ -1714,7 +1714,7 @@ mod tests {
                 <w:tc><w:tcPr><w:hMerge w:val="continue"/></w:tcPr><w:p/></w:tc>
                </w:tr>"#,
         );
-        let table = Table::new(doc.root_element(), &HashMap::new(), &ns, false);
+        let table = Table::new(doc.root_element(), &IndexMap::new(), &ns, false);
         let second = table.cell_map[0][1];
         // The gridSpan cell breaks the run, so the lone "continue" cell
         // starts (and immediately ends) its own single-element run,
@@ -1730,7 +1730,7 @@ mod tests {
                 <w:tbl><w:tr><w:tc><w:p/></w:tc></w:tr></w:tbl>
                </w:tc></w:tr>"#,
         );
-        let table = Table::new(doc.root_element(), &HashMap::new(), &ns, false);
+        let table = Table::new(doc.root_element(), &IndexMap::new(), &ns, false);
         assert_eq!(table.sub_tables.len(), 1);
         // The outer table's own paragraph collection only looks at
         // `./w:tc/w:p` (direct children), so the nested tbl's paragraph
@@ -1746,7 +1746,7 @@ mod tests {
                </w:tc></w:tr>"#,
         );
         let mut tables = Tables::new();
-        tables.register(doc.root_element(), &HashMap::new(), &ns);
+        tables.register(doc.root_element(), &IndexMap::new(), &ns);
         assert_eq!(tables.tables.len(), 1);
 
         let outer = &tables.tables[0];
@@ -1759,7 +1759,7 @@ mod tests {
 
         // Registering the nested tbl node directly (as a caller's own
         // top-level `w:tbl` walk would also encounter it) is a no-op.
-        tables.register(sub_tbl_node, &HashMap::new(), &ns);
+        tables.register(sub_tbl_node, &IndexMap::new(), &ns);
         assert_eq!(
             tables.tables.len(),
             1,
