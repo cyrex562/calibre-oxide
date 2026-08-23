@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 
 use crate::css::{Rule, Stylesheet};
-use crate::mobi::dom::NodeId;
+use crate::dom::NodeId;
 use crate::oeb::constants::{OEB_DOCS, OEB_STYLES};
 use crate::oeb::fonts3::parse_font_family;
 use crate::oeb::polish::fonts::{change_font_in_declaration, style_tag_is_css, unquote};
@@ -442,7 +442,7 @@ fn fix_sheet(sheet: &mut Stylesheet, css_name: &str, font_name: &str) -> bool {
 }
 
 /// Replaces `id`'s children with a single text node containing `text`.
-fn set_dom_element_text(dom: &mut crate::mobi::dom::Dom, id: NodeId, text: &str) {
+fn set_dom_element_text(dom: &mut crate::dom::Dom, id: NodeId, text: &str) {
     let children = dom.node(id).children.clone();
     for c in children {
         dom.detach(c);

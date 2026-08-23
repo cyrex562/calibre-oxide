@@ -1,6 +1,5 @@
 pub mod containers;
 pub mod debug;
-pub mod dom;
 pub mod headers;
 pub mod huffcdic;
 pub mod index;

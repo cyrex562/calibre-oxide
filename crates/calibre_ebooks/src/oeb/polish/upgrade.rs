@@ -13,7 +13,7 @@
 //!
 //! - [`ensure_namespace_prefix_epub`] replaces
 //!   `ensure_namespace_prefixes(root, {'epub': EPUB_NS})`: this crate's
-//!   HTML5-tag-soup `Dom` (see `mobi::dom`'s module docs) has no XML
+//!   HTML5-tag-soup `Dom` (see `crate::dom`'s module docs) has no XML
 //!   namespace-declaration concept at all, so "ensure the `epub:`
 //!   prefix is declared" reduces to "ensure an `xmlns:epub` attribute is
 //!   present on the document's root element".
@@ -226,7 +226,7 @@ pub fn migrate_obfuscated_fonts(container: &mut EpubContainer) -> Result<()> {
 /// whether to mark the document dirty, rather than Python's
 /// unconditional dirty-on-every-call -- see [`collect_properties`]'s
 /// docs for that divergence).
-pub fn ensure_namespace_prefix_epub(dom: &mut crate::mobi::dom::Dom) -> bool {
+pub fn ensure_namespace_prefix_epub(dom: &mut crate::dom::Dom) -> bool {
     let root = dom.root;
     let html = dom
         .children(root)
@@ -366,7 +366,7 @@ pub fn create_nav(
     container: &mut Container,
     toc: &Toc,
     mut landmarks: Vec<Landmark>,
-    previous_nav: Option<(String, crate::mobi::dom::Dom)>,
+    previous_nav: Option<(String, crate::dom::Dom)>,
 ) -> Result<()> {
     let mut lang = get_book_language(container)?;
     if lang.as_deref() == Some("und") {
@@ -402,7 +402,7 @@ pub fn create_nav(
 pub fn epub_2_to_3(
     container: &mut EpubContainer,
     mut report: impl FnMut(&str),
-    previous_nav: Option<(String, crate::mobi::dom::Dom)>,
+    previous_nav: Option<(String, crate::dom::Dom)>,
     remove_ncx: bool,
 ) -> Result<()> {
     {

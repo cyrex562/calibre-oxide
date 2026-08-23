@@ -6,10 +6,10 @@
 //! (OPF/NCX -- [`crate::oeb::polish::xmltree::Xml`], parsed via
 //! `roxmltree`) gets a real line/column, exactly like Python's
 //! `lxml`-backed `elem.sourceline`. Errors that reference a position
-//! inside an *XHTML content document* ([`crate::mobi::dom::Dom`], parsed
+//! inside an *XHTML content document* ([`crate::dom::Dom`], parsed
 //! via `html5ever` through `oeb::polish::parsing::parse_html5`) get
 //! `None` for line/column: unlike `lxml`, `Dom`'s arena does not record
-//! source positions for parsed elements (see `mobi::dom`'s module docs).
+//! source positions for parsed elements (see `crate::dom`'s module docs).
 //! This is a real, pre-existing property of the already-merged `Dom`
 //! type (not something this port narrows), and does not affect whether
 //! an error is *detected* -- only how precisely its location is
@@ -522,13 +522,13 @@ fn bare_text_in_body_fix(container: &mut Container, name: &str) -> Result<bool> 
         for child in children {
             let is_bare_text = matches!(
                 &dom.node(child).kind,
-                crate::mobi::dom::NodeKind::Text(t) if !t.trim().is_empty()
+                crate::dom::NodeKind::Text(t) if !t.trim().is_empty()
             );
             if !is_bare_text {
                 continue;
             }
             let text = match &dom.node(child).kind {
-                crate::mobi::dom::NodeKind::Text(t) => t.trim().to_string(),
+                crate::dom::NodeKind::Text(t) => t.trim().to_string(),
                 _ => continue,
             };
             let idx = dom.index_in_parent(child).unwrap_or(0);
@@ -828,7 +828,7 @@ pub fn check_markup(container: &mut Container) -> Result<Vec<CheckError>> {
         let mut has_bare_text = false;
         for body in dom.find_all_tag_global("body") {
             for child in &dom.node(body).children {
-                if let crate::mobi::dom::NodeKind::Text(t) = &dom.node(*child).kind {
+                if let crate::dom::NodeKind::Text(t) = &dom.node(*child).kind {
                     if !t.trim().is_empty() {
                         has_bare_text = true;
                         break;

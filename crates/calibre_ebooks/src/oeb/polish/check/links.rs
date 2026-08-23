@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use crate::mobi::dom::Dom;
+use crate::dom::Dom;
 use crate::oeb::constants::{OEB_DOCS, OEB_STYLES, XHTML_MIME};
 use crate::oeb::polish::cover::get_raster_cover_name;
 use crate::oeb::polish::parsing::parse_html5;

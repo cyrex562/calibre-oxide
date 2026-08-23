@@ -3,14 +3,14 @@
 //! Python's `css_selectors.Select`. See the `css`/`selector` module docs
 //! for what selector syntax is supported.
 
-use crate::mobi::dom::{Dom, NodeId};
+use crate::dom::{Dom, NodeId};
 use crate::oeb::polish::xmltree::{Xml, XmlNodeId, XmlNodeKind};
 
 use super::selector::{AttrSelector, Combinator, Selector, SelectorList};
 
 /// The minimal element-tree surface selector matching needs: a tag name,
 /// attribute lookup, and a parent link. Implemented for
-/// [`crate::mobi::dom::Dom`] (XHTML content documents) and
+/// [`crate::dom::Dom`] (XHTML content documents) and
 /// [`crate::oeb::polish::xmltree::Xml`] (OPF/NCX-shaped documents) node
 /// references -- see the `css` module docs for why this trait exists
 /// instead of adopting Servo's `selectors::Element`.

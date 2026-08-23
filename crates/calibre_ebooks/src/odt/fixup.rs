@@ -1,11 +1,11 @@
 //! Port of `Extract.fix_markup` and the methods it calls
 //! (`filter_css`/`extract_css`/`epubify_markup`/`apply_list_starts`),
-//! operating on [`crate::mobi::dom::Dom`] (the mutable HTML arena from
+//! operating on [`crate::dom::Dom`] (the mutable HTML arena from
 //! issue #33) instead of `lxml.etree`, since this crate has no `lxml`
 //! equivalent and `dom.rs` already exists for exactly this kind of
 //! post-conversion tree-walk-and-mutate pass.
 
-use crate::mobi::dom::{Dom, NodeId};
+use crate::dom::{Dom, NodeId};
 use crate::odt::css::{self, CssRule};
 use std::collections::HashMap;
 

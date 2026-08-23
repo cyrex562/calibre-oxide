@@ -30,7 +30,7 @@ use std::collections::HashSet;
 use anyhow::Result;
 
 use crate::css::Stylesheet;
-use crate::mobi::dom::{Dom, NodeId, NodeKind};
+use crate::dom::{Dom, NodeId, NodeKind};
 use crate::oeb::book::OEBBook;
 use crate::oeb::constants::CSS_MIME;
 use crate::oeb::polish::embed::{font_key, FontDescriptor};

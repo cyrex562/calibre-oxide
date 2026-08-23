@@ -48,7 +48,7 @@ use anyhow::{anyhow, Result};
 use base64::Engine;
 use regex::Regex;
 
-use crate::mobi::dom::{Dom, NodeId};
+use crate::dom::{Dom, NodeId};
 use crate::oeb::book::OEBBook;
 use crate::oeb::constants::{OEB_RASTER_IMAGES, PNG_MIME, SVG_MIME};
 

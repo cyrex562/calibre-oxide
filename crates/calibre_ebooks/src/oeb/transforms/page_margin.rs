@@ -3,7 +3,7 @@
 use indexmap::IndexMap;
 
 use crate::css::Stylesheet;
-use crate::mobi::dom::{Dom, NodeId};
+use crate::dom::{Dom, NodeId};
 use crate::oeb::book::OEBBook;
 
 const ADOBE_TEMPLATE_MEDIA_TYPES: &[&str] = &[

@@ -13,7 +13,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 
-use crate::mobi::dom::{Dom, NodeId};
+use crate::dom::{Dom, NodeId};
 
 /// Port of `save_to_file`: writes `text` to `filename` as UTF-8-encoded
 /// HTML, prefixed with a `Content-Type` meta tag (the Python opens the

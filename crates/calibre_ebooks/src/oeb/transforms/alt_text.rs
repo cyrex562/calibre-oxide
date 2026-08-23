@@ -19,7 +19,7 @@
 
 use roxmltree::Document;
 
-use crate::mobi::dom::Dom;
+use crate::dom::Dom;
 use crate::oeb::book::OEBBook;
 
 /// Port of `read_text_from_container`: pick the best `rdf:li` child text

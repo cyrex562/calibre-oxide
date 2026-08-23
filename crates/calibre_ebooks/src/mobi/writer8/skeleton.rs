@@ -11,7 +11,7 @@
 //! # DOM reuse
 //!
 //! Python walks an lxml tree with `.text`/`.tail` properties on each
-//! element. [`crate::mobi::dom::Dom`] instead represents text as ordinary
+//! element. [`crate::dom::Dom`] instead represents text as ordinary
 //! interleaved `Text` children (the same model `writer2::serializer`
 //! already uses) -- a `Text` child that comes before any `Element`
 //! sibling is exactly lxml's `tag.text`; a `Text` child that comes right
@@ -24,8 +24,8 @@
 //! This does not attempt to reproduce lxml/kindlegen's exact
 //! serialization bytes (attribute quoting/ordering, self-closing-tag
 //! rewriting, XML declarations). What matters for correctness is
-//! *internal* consistency: the same [`crate::mobi::dom::Dom::serialize`]/
-//! [`crate::mobi::dom::Dom::serialize_open_tag`] routines are used both to
+//! *internal* consistency: the same [`crate::dom::Dom::serialize`]/
+//! [`crate::dom::Dom::serialize_open_tag`] routines are used both to
 //! produce the skeleton bytes and to measure the metrics
 //! ([`calculate_metrics`]) that place chunks back into it, so
 //! [`Skeleton::rebuild`] reconstructs a byte-identical document regardless
@@ -39,7 +39,7 @@ use anyhow::{bail, Context, Result};
 use lazy_static::lazy_static;
 use regex::bytes::Regex as BytesRegex;
 
-use crate::mobi::dom::{Dom, NodeId, NodeKind};
+use crate::dom::{Dom, NodeId, NodeKind};
 use crate::mobi::utils::to_base;
 use crate::mobi::writer8::index::{ChunkTableEntry, SkelTableEntry};
 

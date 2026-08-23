@@ -36,7 +36,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 
 use crate::css::{Rule, StyleDeclarationBlock, Stylesheet};
-use crate::mobi::dom::{Dom, NodeId, NodeKind};
+use crate::dom::{Dom, NodeId, NodeKind};
 use crate::oeb::book::OEBBook;
 use crate::oeb::fonts3::parse_font_family;
 

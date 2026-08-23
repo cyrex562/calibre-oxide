@@ -29,7 +29,7 @@ const STRIPPED_ATTRS: &[&str] = &[
 pub struct LinearizeTables;
 
 impl LinearizeTables {
-    fn linearize(&self, dom: &mut crate::mobi::dom::Dom) {
+    fn linearize(&self, dom: &mut crate::dom::Dom) {
         for tag in TABLE_TAGS {
             for el in dom.find_all_tag_global(tag) {
                 dom.set_tag(el, "div");
@@ -54,7 +54,7 @@ impl LinearizeTables {
                 continue;
             };
             let html = String::from_utf8_lossy(&raw);
-            let mut dom = crate::mobi::dom::Dom::parse(&html);
+            let mut dom = crate::dom::Dom::parse(&html);
             self.linearize(&mut dom);
             let rendered = dom.serialize(dom.root).into_bytes();
             let _ = oeb.container.write(&href, &rendered);

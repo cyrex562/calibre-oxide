@@ -12,7 +12,7 @@
 //!
 //! [`crate::oeb::polish::cascade::resolve_property`] is exactly the
 //! right tool for the *inheritance* half of this (ancestor-chain walk
-//! over a `style_map`, against [`crate::mobi::dom::Dom`] -- already
+//! over a `style_map`, against [`crate::dom::Dom`] -- already
 //! `pub`, no loosening needed, reused as-is). What it does *not* provide
 //! outside `oeb::polish` is the *sheet collection* half
 //! (`resolve_styles`/`iterrules`, which take a `polish::Container` that
@@ -34,7 +34,7 @@
 use std::collections::HashMap;
 
 use crate::css::Stylesheet;
-use crate::mobi::dom::{Dom, NodeId, NodeKind};
+use crate::dom::{Dom, NodeId, NodeKind};
 use crate::oeb::book::OEBBook;
 use crate::oeb::constants::CSS_MIME;
 use crate::oeb::polish::cascade::{resolve_property, PropertyValue};

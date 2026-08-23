@@ -8,7 +8,7 @@
 
 use calibre_utils::unsmarten::unsmarten_text;
 
-use crate::mobi::dom::{Dom, NodeId, NodeKind};
+use crate::dom::{Dom, NodeId, NodeKind};
 use crate::oeb::book::OEBBook;
 use crate::oeb::constants::OEB_DOCS;
 

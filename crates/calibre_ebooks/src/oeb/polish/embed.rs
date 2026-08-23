@@ -32,7 +32,7 @@ use std::collections::HashSet;
 
 use anyhow::Result;
 
-use crate::mobi::dom::{Dom, NodeId};
+use crate::dom::{Dom, NodeId};
 
 use super::container::Container;
 

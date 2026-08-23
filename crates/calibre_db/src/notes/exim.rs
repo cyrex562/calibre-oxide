@@ -7,7 +7,7 @@
 //!
 //! Originally stubbed with the explicit comment "we lack full HTML
 //! parsing capabilities" -- that's no longer true:
-//! `calibre_ebooks::mobi::dom::Dom` (an html5ever-backed, mutable DOM
+//! `calibre_ebooks::dom::Dom` (an html5ever-backed, mutable DOM
 //! tree, built for the MOBI reader's own lxml-shaped HTML mutation
 //! needs) is reused here exactly the way
 //! `calibre_ebooks::oeb::transforms::data_url` already uses it for a
@@ -52,7 +52,7 @@
 
 use crate::constants::RESOURCE_URL_SCHEME;
 use base64::Engine;
-use calibre_ebooks::mobi::dom::Dom;
+use calibre_ebooks::dom::Dom;
 use calibre_ebooks::oeb::polish::utils::guess_type;
 use calibre_ebooks::oeb::transforms::rasterize::data_url;
 use calibre_utils::html2text::html2text;

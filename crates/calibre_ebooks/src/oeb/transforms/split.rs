@@ -29,7 +29,7 @@ use anyhow::Result;
 
 use crate::css::matcher::DomElement;
 use crate::css::{selector::parse_selector_list, Select, SelectorList};
-use crate::mobi::dom::{Dom, NodeId, NodeKind};
+use crate::dom::{Dom, NodeId, NodeKind};
 use crate::oeb::book::OEBBook;
 use crate::oeb::constants::OEB_STYLES;
 use crate::oeb::polish::split::do_split;

@@ -20,7 +20,7 @@
 
 use anyhow::{Context, Result};
 
-use crate::mobi::dom::{Dom, NodeId};
+use crate::dom::{Dom, NodeId};
 use crate::mobi::writer2::serializer::urlnormalize;
 use crate::oeb::book::OEBBook;
 use crate::oeb::constants::XHTML_MIME;

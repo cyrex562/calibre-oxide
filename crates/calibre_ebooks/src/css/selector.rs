@@ -3,7 +3,7 @@
 //! docs for why: `selectors` requires implementing its
 //! `selectors::Element` trait (pseudo-class queries, full
 //! sibling/ancestor iteration protocols, tree-mutation hooks) across
-//! [`crate::xmltree::Xml`]/[`crate::mobi::dom::Dom`], neither of which
+//! [`crate::xmltree::Xml`]/[`crate::dom::Dom`], neither of which
 //! has that surface today, making it a much larger and more intrusive
 //! integration than `css.py`/`cascade.py`'s actual needs (`Select(root)
 //! .has_matches(selector_text)`, specificity ordering).
@@ -589,7 +589,7 @@ mod tests {
             list.0[0].compounds[0].simple.type_name.as_deref(),
             Some("a")
         );
-        let dom = crate::mobi::dom::Dom::parse("<html><body><a href=\"x\">x</a></body></html>");
+        let dom = crate::dom::Dom::parse("<html><body><a href=\"x\">x</a></body></html>");
         let a = dom.find_first_tag_global("a").unwrap();
         let elem = super::super::matcher::DomElement { dom: &dom, id: a };
         assert!(list.matches(elem));

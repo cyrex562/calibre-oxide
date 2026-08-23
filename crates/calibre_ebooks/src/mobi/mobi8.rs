@@ -17,7 +17,7 @@ use std::path::Path;
 
 use crate::metadata::toc::{TOCNode, TOC};
 use crate::mobi::containers::{find_imgtype, Container};
-use crate::mobi::dom::Dom;
+use crate::dom::Dom;
 use crate::mobi::headers::NULL_INDEX;
 use crate::mobi::index::read_index;
 use crate::mobi::markup::{expand_mobi8_markup, FlowInfo as MarkupFlowInfo, MobiReaderTrait};
@@ -1097,7 +1097,7 @@ impl Mobi8Reader {
     }
 }
 
-fn node_depth(dom: &Dom, el: crate::mobi::dom::NodeId) -> usize {
+fn node_depth(dom: &Dom, el: crate::dom::NodeId) -> usize {
     let mut depth = 0;
     let mut parent = dom.parent(el);
     while let Some(p) = parent {

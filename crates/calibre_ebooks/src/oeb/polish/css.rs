@@ -67,7 +67,7 @@ use anyhow::Result;
 
 use crate::css::model::UnknownAtRule;
 use crate::css::{Rule, Select, SelectorList, StyleDeclarationBlock, Stylesheet};
-use crate::mobi::dom::{Dom, NodeId};
+use crate::dom::{Dom, NodeId};
 use crate::oeb::constants::{OEB_DOCS, OEB_STYLES};
 use crate::oeb::normalize_css::normalize_filter_css;
 use crate::oeb::polish::fonts::{set_dom_element_text_only, style_tag_is_css};

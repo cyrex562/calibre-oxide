@@ -40,7 +40,7 @@
 //! sweeps the manifest. What's narrowed: Python's `replace_resource_links`
 //! also rewrites image references inside any non-spine *XHTML* manifest
 //! item (e.g. a fragment referenced only via `<object>`); this port only
-//! rewrites spine items, since [`crate::mobi::dom::Dom`] instances are
+//! rewrites spine items, since [`crate::dom::Dom`] instances are
 //! only built for spine content here.
 
 use std::collections::{HashMap, HashSet};
@@ -48,7 +48,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 
 use crate::compression::palmdoc::compress;
-use crate::mobi::dom::{Dom, NodeId, NodeKind};
+use crate::dom::{Dom, NodeId, NodeKind};
 use crate::mobi::utils::{create_text_record, to_base};
 use crate::mobi::writer2::resources::{ResourceOpts, Resources};
 use crate::mobi::writer2::serializer::{abshref, is_guide_ref_start, urldefrag, urlnormalize};

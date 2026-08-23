@@ -9,7 +9,7 @@
 use lazy_static::lazy_static;
 use regex::Regex;
 
-use crate::mobi::dom::{Dom, NodeId, NodeKind};
+use crate::dom::{Dom, NodeId, NodeKind};
 
 lazy_static! {
     /// Port of `htmlstrip` in `cleaners.py`. The Python builds this from
@@ -91,7 +91,7 @@ pub fn normalize_spaces(s: &str) -> String {
 ///   are dropped.
 /// - `comments=True`: HTML comment nodes are dropped.
 /// - `processing_instructions=True`: processing instructions are
-///   dropped. **This is a no-op in this port**: `crate::mobi::dom::Dom`'s
+///   dropped. **This is a no-op in this port**: `crate::dom::Dom`'s
 ///   `html5ever`-backed parser (see `convert()` in `dom.rs`) already
 ///   collapses every `RcNodeData::ProcessingInstruction` into an empty
 ///   `NodeKind::Comment(String::new())` node *at parse time*, before this

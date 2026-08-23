@@ -4,7 +4,7 @@ use indexmap::IndexSet;
 use regex::Regex;
 
 use crate::chardet::xml_to_unicode;
-use crate::mobi::dom::{Dom, NodeId};
+use crate::dom::{Dom, NodeId};
 
 use super::cleaners::{clean_attributes, normalize_spaces};
 use super::direct_text;
