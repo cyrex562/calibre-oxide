@@ -48,6 +48,25 @@
 //! numeral-aware natural sorting). A genuine ICU binding is out of
 //! scope for this pass; this is a documented approximation; true `NOCASE`-style
 //! but not ICU-faithful ordering.
+//!
+//! # §3's per-write WAL checkpoint cadence (issue #260, not an
+//! upstream concept)
+//!
+//! `docs/FAULT_TOLERANCE.md` §3 asks for a periodic `PRAGMA
+//! wal_checkpoint` after write activity -- every write on network
+//! storage, every 32 writes or 5s on local-internal. `new_inner`
+//! registers a real SQLite `commit_hook` on the connection (fires on
+//! every committed transaction; since `Backend`, `Cache`, and every
+//! sidecar module share this one connection, this one registration
+//! covers all of this crate's write paths without touching any of
+//! their individual call sites) that only increments a counter, plus
+//! a background thread ([`spawn_checkpoint_thread`]) that polls that
+//! counter and performs the real checkpoint once due. See
+//! `spawn_checkpoint_thread`'s own doc for why the checkpoint isn't
+//! issued synchronously from inside the hook (a first attempt at that
+//! deadlocked -- confirmed with a real, isolated reproduction before
+//! this design was chosen) and what that costs relative to §3's exact
+//! wording.
 
 use rusqlite::functions::{Aggregate, Context, FunctionFlags};
 use rusqlite::{Connection, Error as SqlError, Result as SqlResult};
@@ -56,6 +75,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use calibre_ebooks::metadata::authors::author_to_author_sort as real_author_to_author_sort;
 use calibre_ebooks::metadata::meta::title_sort as real_title_sort;
@@ -66,6 +86,124 @@ use calibre_ebooks::metadata::meta::title_sort as real_title_sort;
 /// triggers real calibre creates, including the trailing `PRAGMA
 /// user_version=26` that marks it current.
 const SCHEMA_SQL: &str = include_str!("../resources/metadata_sqlite.sql");
+
+/// docs/FAULT_TOLERANCE.md §3's per-write checkpoint cadence (issue
+/// #260's deferred half): "every write on network storage, every 32
+/// writes or 5s on local-internal." `write_threshold`/`time_threshold`
+/// implement the local-tier half; `Network` always checkpoints
+/// regardless of either. `poll_interval` is this crate's own real
+/// addition, not from the design doc -- see the module-level doc
+/// comment above [`spawn_checkpoint_thread`] for why an async poller
+/// exists at all and what it costs relative to §3's literal wording.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CheckpointCadencePolicy {
+    write_threshold: u32,
+    time_threshold: Duration,
+    poll_interval: Duration,
+}
+
+/// §3's own numbers, verbatim, plus a real (not spec'd) poll interval
+/// chosen to keep the worst-case "write happened, checkpoint hasn't
+/// run yet" window small without polling wastefully often.
+const REAL_CHECKPOINT_CADENCE: CheckpointCadencePolicy = CheckpointCadencePolicy {
+    write_threshold: 32,
+    time_threshold: Duration::from_secs(5),
+    poll_interval: Duration::from_millis(200),
+};
+
+/// The mutable half of the commit-hook checkpoint cadence -- how many
+/// writes and how much time have passed since the connection's last
+/// checkpoint. `Arc`-shared between the commit hook (which holds a
+/// strong reference -- it lives exactly as long as the connection
+/// does) and [`spawn_checkpoint_thread`]'s background thread (which
+/// holds only a [`std::sync::Weak`] one, so it can notice the
+/// connection is gone and exit on its own rather than being kept
+/// alive by, or needing to be explicitly stopped alongside, a
+/// `Backend` it doesn't otherwise reference).
+struct CheckpointCadenceState {
+    writes_since_checkpoint: u32,
+    last_checkpoint: Instant,
+}
+
+/// §3's per-write checkpoint cadence, the async half: a background
+/// thread that polls [`CheckpointCadenceState`] and performs the real
+/// checkpoint (via [`crate::library_handle::checkpoint_wal_best_effort`])
+/// once the configured cadence is due.
+///
+/// # Why not checkpoint synchronously, from the commit hook itself
+///
+/// The first real attempt at this did exactly that -- register a
+/// `commit_hook` (fires on every committed transaction on this
+/// connection) that, once due, opened its own short-lived connection
+/// and checkpointed immediately, inline, before the hook returned.
+/// This does not work: SQLite's own documentation for
+/// `sqlite3_commit_hook` explicitly warns the callback must not touch
+/// the connection that invoked it, because the originating
+/// transaction's writer lock is not yet fully released at the moment
+/// the hook fires -- and empirically (a standalone probe outside this
+/// crate, run before committing to this design), even a *separate*
+/// connection's checkpoint attempt at that exact moment either
+/// reports `busy` and can't fully `TRUNCATE`, or on a subsequent
+/// commit, deadlocks outright. `sqlite3_wal_hook` (which fires *after*
+/// a commit is fully durable, and is what SQLite's own default
+/// auto-checkpoint uses internally) would avoid this, but the
+/// `rusqlite` version this crate depends on doesn't expose it, and
+/// raising that -- either upgrading `rusqlite` significantly or
+/// hand-writing unsafe FFI directly against `sqlite3_wal_hook` -- was
+/// judged a bigger, riskier change than an async poller for this
+/// pass.
+///
+/// # The real, disclosed cost of this choice
+///
+/// §3's own wording is "checkpoints... after the operation is
+/// journaled and before it is acked." A commit hook could have
+/// honored "before acked" literally (if it didn't deadlock); this
+/// poller cannot -- the write's own call already returned to its
+/// caller by the time this thread notices and acts, up to
+/// `cadence.poll_interval` later. Chosen deliberately, with the
+/// user's explicit sign-off, over the two alternatives that could
+/// have preserved the literal ordering (unsafe FFI to `wal_hook`, or
+/// reverting to an explicit checkpoint call retrofitted into all 66+
+/// individual write call sites this crate has).
+fn spawn_checkpoint_thread(
+    library_path: PathBuf,
+    tier: crate::library_handle::StorageTier,
+    cadence: CheckpointCadencePolicy,
+    state: std::sync::Weak<Mutex<CheckpointCadenceState>>,
+) {
+    let _ = std::thread::Builder::new()
+        .name("calibre-oxide-wal-checkpoint".to_string())
+        .spawn(move || loop {
+            std::thread::sleep(cadence.poll_interval);
+            let Some(state) = state.upgrade() else {
+                // The connection (and its commit hook, the only other
+                // strong owner of this state) is gone -- nothing left
+                // to poll for.
+                return;
+            };
+            let due = {
+                let guard = state.lock().unwrap();
+                if guard.writes_since_checkpoint == 0 {
+                    false
+                } else {
+                    match tier {
+                        crate::library_handle::StorageTier::Network => true,
+                        _ => {
+                            guard.writes_since_checkpoint >= cadence.write_threshold
+                                || guard.last_checkpoint.elapsed() >= cadence.time_threshold
+                        }
+                    }
+                }
+            };
+            if due {
+                // Do the real I/O without holding the state lock.
+                crate::library_handle::checkpoint_wal_best_effort(&library_path);
+                let mut guard = state.lock().unwrap();
+                guard.writes_since_checkpoint = 0;
+                guard.last_checkpoint = Instant::now();
+            }
+        });
+}
 
 /// `Clone` is cheap and shares the same live connection (`conn` is an
 /// `Arc<Mutex<Connection>>`) -- used by [`crate::library::Library`] to
@@ -95,6 +233,31 @@ pub struct Backend {
 
 impl Backend {
     pub fn new<P: AsRef<Path>>(library_path: P) -> SqlResult<Self> {
+        Self::new_inner(library_path, None, None)
+    }
+
+    /// Test-only: forces the §3 per-write checkpoint cadence to
+    /// `cadence` instead of the real [`REAL_CHECKPOINT_CADENCE`] (32
+    /// writes/5s), and optionally forces the tier the cadence decision
+    /// branches on (real classification otherwise) -- lets tests
+    /// exercise the commit-hook checkpoint logic with a tiny write-
+    /// count/time threshold, and a `Network`-tier "checkpoint every
+    /// write" cadence, without a real network mount or waiting real
+    /// seconds.
+    #[cfg(test)]
+    pub(crate) fn new_with_checkpoint_cadence_test<P: AsRef<Path>>(
+        library_path: P,
+        force_tier: Option<crate::library_handle::StorageTier>,
+        cadence: CheckpointCadencePolicy,
+    ) -> SqlResult<Self> {
+        Self::new_inner(library_path, force_tier, Some(cadence))
+    }
+
+    fn new_inner<P: AsRef<Path>>(
+        library_path: P,
+        force_tier: Option<crate::library_handle::StorageTier>,
+        force_cadence: Option<CheckpointCadencePolicy>,
+    ) -> SqlResult<Self> {
         let library_path = library_path.as_ref().to_path_buf();
         std::fs::create_dir_all(&library_path).map_err(|e| {
             SqlError::SqliteFailure(
@@ -169,6 +332,47 @@ impl Backend {
         // Port of `DB.__init__`'s `self.library_id` access: "Guarantee
         // that the library_id is set."
         backend.library_id()?;
+
+        // docs/FAULT_TOLERANCE.md §3's per-write checkpoint cadence
+        // (issue #260's previously-deferred half). `commit_hook` fires
+        // once per committed transaction on *this* connection -- since
+        // `Backend`, `Cache`, and every sidecar module (`notes.db`/
+        // `checksums.db`/`full-text-search.db`) all share this one
+        // `Connection` (they `ATTACH` onto it rather than opening
+        // their own), this one registration covers every write path
+        // in the crate without touching any of their 66+ individual
+        // call sites. The hook itself only increments a counter --
+        // real DB work (issuing the checkpoint) happens on a separate
+        // background thread instead of inline in the hook; see
+        // `spawn_checkpoint_thread`'s own doc for exactly why (a first
+        // attempt that checkpointed synchronously from inside the hook
+        // deadlocked, confirmed via a real standalone probe before
+        // this design was chosen). Registered only now, after schema
+        // creation/migration/the trigger fixup *and* `library_id()`'s
+        // own bootstrap write above, so a brand-new or freshly-
+        // migrated library's bootstrap doesn't trigger wasted
+        // checkpoint attempts (or silently consume part of the real
+        // write-count threshold) on an essentially-empty WAL.
+        let tier = force_tier
+            .unwrap_or_else(|| crate::library_handle::classify_storage_tier(&backend.library_path));
+        let cadence = force_cadence.unwrap_or(REAL_CHECKPOINT_CADENCE);
+        let cadence_state = Arc::new(Mutex::new(CheckpointCadenceState {
+            writes_since_checkpoint: 0,
+            last_checkpoint: Instant::now(),
+        }));
+        spawn_checkpoint_thread(
+            backend.library_path.clone(),
+            tier,
+            cadence,
+            Arc::downgrade(&cadence_state),
+        );
+        {
+            let cadence_state = Arc::clone(&cadence_state);
+            backend.conn.lock().unwrap().commit_hook(Some(move || {
+                cadence_state.lock().unwrap().writes_since_checkpoint += 1;
+                false // never request a rollback
+            }));
+        }
 
         Ok(backend)
     }
@@ -666,6 +870,129 @@ mod tests {
             .query_row("PRAGMA synchronous", [], |row| row.get(0))
             .unwrap();
         assert_eq!(synchronous, 2);
+    }
+
+    fn wal_len(dir: &Path) -> u64 {
+        std::fs::metadata(dir.join("metadata.db-wal"))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
+    fn write_one_book(backend: &Backend, n: usize) {
+        backend
+            .insert_book("T", "T", "A", &format!("uuid-{n}"))
+            .unwrap();
+    }
+
+    const FAST_TEST_CHECKPOINT_POLL: Duration = Duration::from_millis(5);
+
+    /// The checkpoint thread is async (see `spawn_checkpoint_thread`'s
+    /// doc for why) -- polls up to `deadline` for `wal_len(dir)` to
+    /// become 0, rather than asserting immediately after the
+    /// triggering write.
+    fn wait_for_checkpoint(dir: &Path, deadline: Duration) {
+        let start = Instant::now();
+        loop {
+            if wal_len(dir) == 0 {
+                return;
+            }
+            if start.elapsed() >= deadline {
+                panic!(
+                    "expected a checkpoint to truncate the WAL within {deadline:?}, \
+                     still {} bytes after waiting",
+                    wal_len(dir)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn checkpoint_cadence_does_not_fire_before_the_write_threshold_on_local_tier() {
+        let dir = tempdir().unwrap();
+        let backend = Backend::new_with_checkpoint_cadence_test(
+            dir.path(),
+            None, // real classification -- a tempdir is local
+            CheckpointCadencePolicy {
+                write_threshold: 3,
+                time_threshold: Duration::from_secs(600), // effectively disabled
+                poll_interval: FAST_TEST_CHECKPOINT_POLL,
+            },
+        )
+        .unwrap();
+
+        for n in 0..2 {
+            write_one_book(&backend, n);
+        }
+        // Give the poller several chances to (wrongly) fire before
+        // asserting it didn't.
+        std::thread::sleep(FAST_TEST_CHECKPOINT_POLL * 5);
+
+        assert!(
+            wal_len(dir.path()) > 0,
+            "2 writes under a 3-write threshold must not have checkpointed"
+        );
+    }
+
+    #[test]
+    fn checkpoint_cadence_fires_once_the_write_threshold_is_reached_on_local_tier() {
+        let dir = tempdir().unwrap();
+        let backend = Backend::new_with_checkpoint_cadence_test(
+            dir.path(),
+            None,
+            CheckpointCadencePolicy {
+                write_threshold: 3,
+                time_threshold: Duration::from_secs(600),
+                poll_interval: FAST_TEST_CHECKPOINT_POLL,
+            },
+        )
+        .unwrap();
+
+        for n in 0..3 {
+            write_one_book(&backend, n);
+        }
+
+        wait_for_checkpoint(dir.path(), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn checkpoint_cadence_fires_after_the_time_threshold_even_under_the_write_threshold() {
+        let dir = tempdir().unwrap();
+        let backend = Backend::new_with_checkpoint_cadence_test(
+            dir.path(),
+            None,
+            CheckpointCadencePolicy {
+                write_threshold: 1000, // effectively disabled
+                time_threshold: Duration::from_millis(20),
+                poll_interval: FAST_TEST_CHECKPOINT_POLL,
+            },
+        )
+        .unwrap();
+
+        write_one_book(&backend, 0);
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(wal_len(dir.path()) > 0, "not checkpointed yet");
+
+        wait_for_checkpoint(dir.path(), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn checkpoint_cadence_fires_on_every_single_write_on_network_tier() {
+        let dir = tempdir().unwrap();
+        let backend = Backend::new_with_checkpoint_cadence_test(
+            dir.path(),
+            Some(crate::library_handle::StorageTier::Network),
+            CheckpointCadencePolicy {
+                write_threshold: 1000, // irrelevant on Network -- every write checkpoints
+                time_threshold: Duration::from_secs(600),
+                poll_interval: FAST_TEST_CHECKPOINT_POLL,
+            },
+        )
+        .unwrap();
+
+        write_one_book(&backend, 0);
+
+        wait_for_checkpoint(dir.path(), Duration::from_secs(2));
     }
 
     #[test]
