@@ -46,13 +46,16 @@
 //! - [`apply_tables_markup`]/[`apply_table_markup`]: builds real
 //!   `<table>`/`<tr>`/`<td>` markup and moves each cell's
 //!   already-built paragraphs into place (issue #286's `tables.py`
-//!   half; `numbering.py`'s `<ol>`/`<ul>`/`<li>` half is separate,
-//!   still open).
+//!   half).
+//! - [`apply_numbering_markup`]: retags numbered/bulleted paragraphs
+//!   as `<li>`, groups consecutive same-list runs into `<ol>`/`<ul>`
+//!   (via [`commit_list_run`]), and rewrites custom-bullet-text lists
+//!   into a CSS-table layout (issue #286's `numbering.py` half --
+//!   closes #286).
 //!
 //! Not yet wired into `DOCXToHTML` -- that still needs the footnote
-//! body conversion (#284) and everything downstream (numbering
-//! markup, frames, TOC, OPF writing), none of which exist
-//! here yet.
+//! body conversion (#284) and everything downstream (frames, TOC,
+//! OPF writing), none of which exist here yet.
 //!
 //! # What `convert_run` defers, and why
 //!
@@ -92,6 +95,7 @@ use super::error::DocxError;
 use super::fonts::{is_symbol_font, map_symbol_text};
 use super::footnotes::Footnotes;
 use super::names::DocxNamespace;
+use super::numbering::Numbering;
 use super::settings::Settings;
 use super::styles::{PageProperties, Styles};
 use super::tables::Table;
@@ -1690,6 +1694,295 @@ pub fn apply_table_markup<'a, 'i>(
         let prefix = dom.tag(elem).unwrap_or("td").to_string();
         let cls = styles.register(css, &prefix);
         dom.node_mut(elem).attrs.insert("class".to_string(), cls);
+    }
+}
+
+/// Retags every numbered/bulleted paragraph as `<li>`, groups
+/// consecutive same-list runs of `<li>` siblings into `<ol>`/`<ul>`
+/// wrappers, and (for custom bullet-text levels) rewrites those into
+/// a CSS-table layout so the literal bullet text lines up in its own
+/// column.
+///
+/// Three phases, matching Python's `Numbering.apply_markup` exactly:
+///
+/// 1. Walks every `(html_obj, num_id, ilvl)` triple recovered from
+///    `Styles::calibre_num_ids` (Python's `calibre_num_id="lvl:num_id"`
+///    HTML attribute -- already split into `(i32, String)` by the
+///    tracked map, no string parsing needed here), retagging each
+///    paragraph `<li>` and stamping scratch `value`/`list-lvl`/
+///    `list-id`/`list-template` attributes from the numbering
+///    instance's running counter (`Numbering::counters`, shared
+///    across every `w:num` that points at the same `w:abstractNum`).
+/// 2. Walks the whole body for `<li>` elements, groups consecutive
+///    same-`(list-id, list-lvl)` siblings, and wraps each run in a new
+///    `<ol>`/`<ul>` via [`commit_list_run`].
+/// 3. Rewrites every custom-bullet-text `<ol lvlid="...">` (tagged as
+///    such by `commit_list_run`) into `<div style="display:table">`/
+///    `display:table-row`/`display:table-cell`, since CSS
+///    `list-style` can't render arbitrary bullet text.
+///
+/// `rid_map` is accepted for parity with Python's call signature but
+/// currently unused -- [`super::numbering::Level::css`] defers the one
+/// picture-bullet branch that would need it (see its own docs).
+pub fn apply_numbering_markup<'a, 'i>(
+    numbering: &mut Numbering,
+    dom: &mut Dom,
+    _body: NodeId,
+    styles: &mut Styles<'a, 'i>,
+    object_map: &IndexMap<NodeId, Node<'a, 'i>>,
+    ns: &DocxNamespace,
+) {
+    // `_body` is accepted for parity with Python's call signature
+    // (`Numbering.apply_markup(items, body, ...)`) but never read: the
+    // whole-document `<li>` scan below matches Python's
+    // `body.iterdescendants('li')`, which (despite the name) isn't
+    // actually scoped to `body` any more narrowly than the document
+    // itself -- see this function's own Phase 2.
+
+    // Phase 1: assign counters, retag paragraphs as <li>.
+    let mut numbered: Vec<(NodeId, String, i64)> = Vec::new();
+    for (&html_obj, &wp) in object_map {
+        if let Some((lvl, num_id)) = styles.calibre_num_ids.get(&wp) {
+            numbered.push((html_obj, num_id.clone(), *lvl as i64));
+        }
+    }
+
+    let mut seen_instances: HashSet<String> = HashSet::new();
+    for (html_obj, num_id, ilvl) in &numbered {
+        let Some(d) = numbering.instances.get(num_id) else {
+            continue;
+        };
+        let Some(lvl) = d.levels.get(ilvl) else {
+            continue;
+        };
+        let an_id = d.abstract_numbering_definition_id.clone();
+        let levels = d.levels.clone();
+        let counter = numbering.counters.entry(an_id).or_default();
+        if !counter.contains_key(ilvl) || !seen_instances.contains(num_id) {
+            let start = numbering
+                .starts
+                .get(num_id)
+                .and_then(|s| s.get(ilvl))
+                .copied()
+                .unwrap_or(0);
+            counter.insert(*ilvl, start);
+        }
+        seen_instances.insert(num_id.clone());
+
+        dom.set_tag(*html_obj, "li");
+        let value = *counter.get(ilvl).unwrap();
+        let attrs = &mut dom.node_mut(*html_obj).attrs;
+        attrs.insert("value".to_string(), value.to_string());
+        attrs.insert("list-lvl".to_string(), ilvl.to_string());
+        attrs.insert("list-id".to_string(), num_id.clone());
+        let template = lvl
+            .num_template
+            .as_deref()
+            .or(lvl.bullet_template.as_deref());
+        if let Some(template) = template {
+            let rendered = lvl.format_template(counter, *ilvl, template);
+            dom.node_mut(*html_obj)
+                .attrs
+                .insert("list-template".to_string(), rendered);
+        }
+        Numbering::update_counter(counter, *ilvl, &levels);
+    }
+
+    // Phase 2: group <li> siblings into <ol>/<ul> wrappers.
+    let mut parents: IndexMap<NodeId, ()> = IndexMap::new();
+    for li in dom.find_all_tag_global("li") {
+        if let Some(p) = dom.parent(li) {
+            parents.insert(p, ());
+        }
+    }
+    for parent in parents.keys().copied().collect::<Vec<_>>() {
+        let mut run: Vec<NodeId> = Vec::new();
+        for child in dom.children(parent) {
+            if dom.tag(child) == Some("li") {
+                if let Some(&last) = run.last() {
+                    if list_key(dom, last) != list_key(dom, child) {
+                        commit_list_run(&run, dom, styles, numbering);
+                        run.clear();
+                    }
+                }
+                run.push(child);
+            } else {
+                commit_list_run(&run, dom, styles, numbering);
+                run.clear();
+            }
+        }
+        commit_list_run(&run, dom, styles, numbering);
+    }
+
+    // Phase 3: custom-bullet-text lists become table-layout divs.
+    for wrap in dom.find_all_tag_global("ol") {
+        if !dom.node(wrap).attrs.contains_key("lvlid") {
+            continue;
+        }
+        dom.node_mut(wrap).attrs.shift_remove("lvlid");
+        dom.set_tag(wrap, "div");
+        dom.node_mut(wrap)
+            .attrs
+            .insert("style".to_string(), "display:table".to_string());
+        let mut i = 0usize;
+        for li in dom.children(wrap) {
+            if dom.tag(li) != Some("li") {
+                continue;
+            }
+            dom.set_tag(li, "div");
+            dom.node_mut(li).attrs.shift_remove("value");
+            dom.node_mut(li)
+                .attrs
+                .insert("style".to_string(), "display:table-row".to_string());
+            if let Some(&wp) = object_map.get(&li) {
+                let mut style = styles.resolve_paragraph(wp, ns);
+                let margin = style.margin_left.clone().unwrap_or_else(|| "0".to_string());
+                if i == 0 {
+                    dom.node_mut(wrap).attrs.insert(
+                        "style".to_string(),
+                        format!("display:table; padding-left:{margin}"),
+                    );
+                }
+                style.margin_left = None;
+                styles.set_paragraph_style(wp, style);
+            }
+            for child in dom.children(li) {
+                dom.node_mut(child)
+                    .attrs
+                    .insert("style".to_string(), "display:table-cell".to_string());
+            }
+            i += 1;
+        }
+    }
+}
+
+/// `(list-id, list-lvl)` for one `<li>`, the run-grouping key
+/// [`apply_numbering_markup`]'s Phase 2 compares consecutive siblings
+/// on.
+fn list_key(dom: &Dom, li: NodeId) -> (Option<String>, Option<String>) {
+    let attrs = &dom.node(li).attrs;
+    (
+        attrs.get("list-id").cloned(),
+        attrs.get("list-lvl").cloned(),
+    )
+}
+
+/// Wraps one maximal run of same-`(list-id, list-lvl)` `<li>` siblings
+/// in a new `<ol>` (numbered levels, and every custom-bullet-text
+/// level regardless of numbered-ness) or `<ul>` (plain bullets),
+/// inserted at the run's original position. For a custom-bullet-text
+/// run, also splits each `<li>`'s content into a template-text
+/// `<span>` followed by a content-wrapping `<span>`, and tags the
+/// wrapper `lvlid` for Phase 3 to find later. Strips the scratch
+/// `list-lvl`/`list-id`/`list-template` attributes from every `<li>`,
+/// and its `value` attribute specifically unless it represents a real
+/// break in the sequence (not just "+1 from the previous item", and
+/// not the natural first item of a `<ol>` starting at 1) -- `<ul>`
+/// never keeps `value` at all.
+///
+/// A no-op on an empty run (Python's `if not current_run: return`,
+/// naturally covered here by every loop below being over an empty
+/// slice).
+///
+/// Port of the Python `Numbering.apply_markup`'s nested `commit`
+/// closure -- a free function for the same reason
+/// [`process_block_run`] is: Rust closures can't capture `&mut Styles`
+/// and `&mut Numbering` from the same enclosing scope across repeated
+/// calls the way Python's closure captures `self`. Python's
+/// `templates` dict (written here, `templates[lvlid] = span.text`) is
+/// omitted entirely -- confirmed, by reading the whole file, never
+/// read anywhere in `numbering.py`; a genuinely inert write, unlike
+/// the bug-for-bug quirks this crate otherwise deliberately
+/// reproduces.
+fn commit_list_run<'a, 'i>(
+    run: &[NodeId],
+    dom: &mut Dom,
+    styles: &mut Styles<'a, 'i>,
+    numbering: &Numbering,
+) {
+    let Some(&start) = run.first() else {
+        return;
+    };
+    let Some(parent) = dom.parent(start) else {
+        return;
+    };
+    let idx = dom.index_in_parent(start).unwrap_or(0);
+
+    let (num_id, ilvl_str) = list_key(dom, start);
+    let Some(num_id) = num_id else { return };
+    let Some(ilvl) = ilvl_str.as_deref().and_then(|v| v.parse::<i64>().ok()) else {
+        return;
+    };
+    let Some(d) = numbering.instances.get(&num_id) else {
+        return;
+    };
+    let Some(lvl) = d.levels.get(&ilvl) else {
+        return;
+    };
+    let has_template = dom.node(start).attrs.contains_key("list-template");
+
+    let wrap = dom.new_element(if lvl.is_numbered || has_template {
+        "ol"
+    } else {
+        "ul"
+    });
+    if has_template {
+        dom.node_mut(wrap)
+            .attrs
+            .insert("lvlid".to_string(), format!("{num_id}{ilvl}"));
+    } else {
+        let cls = styles.register(lvl.css(), "list");
+        dom.node_mut(wrap).attrs.insert("class".to_string(), cls);
+    }
+    let char_css = lvl.char_css();
+    let ccss_class = if !char_css.is_empty() {
+        Some(styles.register(char_css, "bullet"))
+    } else {
+        None
+    };
+    dom.insert_child(parent, idx, wrap);
+
+    let mut last_val: Option<i64> = None;
+    for &child in run {
+        dom.append_child(wrap, child);
+        if has_template {
+            let content = dom.new_element("span");
+            for grandchild in dom.children(child) {
+                dom.append_child(content, grandchild);
+            }
+            dom.insert_child(child, 0, content);
+
+            let template_text = dom
+                .node(child)
+                .attrs
+                .get("list-template")
+                .cloned()
+                .unwrap_or_default();
+            let template_span = dom.new_element("span");
+            let t = dom.new_text(&template_text);
+            dom.append_child(template_span, t);
+            if let Some(cls) = &ccss_class {
+                dom.node_mut(template_span)
+                    .attrs
+                    .insert("class".to_string(), cls.clone());
+            }
+            dom.insert_child(child, 0, template_span);
+        }
+        for attr in ["list-lvl", "list-id", "list-template"] {
+            dom.node_mut(child).attrs.shift_remove(attr);
+        }
+        let val: i64 = dom
+            .node(child)
+            .attrs
+            .get("value")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let is_continuation = last_val == Some(val - 1);
+        let is_natural_first = last_val.is_none() && val == 1;
+        if is_continuation || dom.tag(wrap) == Some("ul") || is_natural_first {
+            dom.node_mut(child).attrs.shift_remove("value");
+        }
+        last_val = Some(val);
     }
 }
 
@@ -3720,6 +4013,254 @@ mod apply_tables_markup_tests {
         assert_eq!(
             h.dom.node(table).attrs.get("dir").map(String::as_str),
             Some("rtl")
+        );
+    }
+}
+
+#[cfg(test)]
+mod apply_numbering_markup_tests {
+    use super::*;
+    use crate::docx::tables::Tables;
+    use roxmltree::Document;
+
+    const DOC_OPEN: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:xml="http://www.w3.org/XML/1998/namespace""#;
+
+    fn parse_root(body: &str) -> (Document<'static>, DocxNamespace) {
+        let xml: &'static str =
+            Box::leak(format!("<w:root {DOC_OPEN}>{body}</w:root>").into_boxed_str());
+        (
+            Document::parse(xml).expect("valid XML"),
+            DocxNamespace::default(),
+        )
+    }
+
+    fn numbering_from(fragment: &str) -> Numbering {
+        let xml: &'static str = Box::leak(
+            format!(
+                r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">{fragment}</w:numbering>"#
+            )
+            .into_boxed_str(),
+        );
+        let doc: &'static Document<'static> =
+            Box::leak(Box::new(Document::parse(xml).expect("valid XML")));
+        let ns = DocxNamespace::default();
+        let mut numbering = Numbering::new();
+        numbering.call(doc.root_element(), &HashMap::new(), &ns);
+        numbering
+    }
+
+    const DECIMAL_LIST: &str = r#"<w:abstractNum w:abstractNumId="1">
+            <w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl>
+        </w:abstractNum>
+        <w:num w:numId="9"><w:abstractNumId w:val="1"/></w:num>"#;
+
+    const BULLET_LIST: &str = r#"<w:abstractNum w:abstractNumId="2">
+            <w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/><w:lvlText w:val="o"/></w:lvl>
+        </w:abstractNum>
+        <w:num w:numId="10"><w:abstractNumId w:val="2"/></w:num>"#;
+
+    struct Harness<'a, 'i> {
+        dom: Dom,
+        state: ConvertState<'a, 'i>,
+        styles: Styles<'a, 'i>,
+        footnotes: Footnotes<'a, 'i>,
+        settings: Settings,
+        theme: Theme,
+    }
+
+    impl<'a, 'i> Harness<'a, 'i> {
+        fn new() -> Self {
+            Harness {
+                dom: Dom::empty(),
+                state: ConvertState::new(),
+                styles: Styles::new(Tables::default()),
+                footnotes: Footnotes::new(),
+                settings: Settings::new(),
+                theme: Theme::new(),
+            }
+        }
+
+        fn body(&mut self, doc: Node<'a, 'i>, ns: &DocxNamespace) -> NodeId {
+            convert_body(
+                &mut self.dom,
+                doc,
+                &mut self.state,
+                &mut self.styles,
+                &mut self.footnotes,
+                &self.settings,
+                &self.theme,
+                None,
+                "test-uuid",
+                &Relationships::default(),
+                ns,
+            )
+            .0
+        }
+    }
+
+    #[test]
+    fn two_consecutive_numbered_paragraphs_become_one_ordered_list() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="9"/></w:numPr></w:pPr><w:r><w:t>a</w:t></w:r></w:p>
+                 <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="9"/></w:numPr></w:pPr><w:r><w:t>b</w:t></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let body = h.body(document, &ns);
+        let mut numbering = numbering_from(DECIMAL_LIST);
+
+        apply_numbering_markup(
+            &mut numbering,
+            &mut h.dom,
+            body,
+            &mut h.styles,
+            &h.state.object_map,
+            &ns,
+        );
+
+        let body_children = h.dom.children(body);
+        assert_eq!(body_children.len(), 1);
+        let ol = body_children[0];
+        assert_eq!(h.dom.tag(ol), Some("ol"));
+        let cls = h.dom.node(ol).attrs.get("class").cloned();
+        assert!(cls.as_deref().is_some_and(|c| c.starts_with("list_")));
+
+        let items = h.dom.children(ol);
+        assert_eq!(items.len(), 2);
+        for item in &items {
+            assert_eq!(h.dom.tag(*item), Some("li"));
+            // Both the natural first item and the plain +1 continuation
+            // strip their `value` attribute -- the browser's own
+            // default numbering already produces 1, 2.
+            assert!(h.dom.node(*item).attrs.get("value").is_none());
+            assert!(h.dom.node(*item).attrs.get("list-lvl").is_none());
+            assert!(h.dom.node(*item).attrs.get("list-id").is_none());
+        }
+    }
+
+    #[test]
+    fn a_non_numbered_paragraph_splits_the_list_in_two() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="9"/></w:numPr></w:pPr><w:r><w:t>a</w:t></w:r></w:p>
+                 <w:p><w:r><w:t>plain</w:t></w:r></w:p>
+                 <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="9"/></w:numPr></w:pPr><w:r><w:t>b</w:t></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let body = h.body(document, &ns);
+        let mut numbering = numbering_from(DECIMAL_LIST);
+
+        apply_numbering_markup(
+            &mut numbering,
+            &mut h.dom,
+            body,
+            &mut h.styles,
+            &h.state.object_map,
+            &ns,
+        );
+
+        let body_children = h.dom.children(body);
+        // <ol>, <p>plain</p>, <ol> -- two separate lists, not merged
+        // across the intervening plain paragraph.
+        assert_eq!(body_children.len(), 3);
+        assert_eq!(h.dom.tag(body_children[0]), Some("ol"));
+        assert_eq!(h.dom.tag(body_children[1]), Some("p"));
+        assert_eq!(h.dom.tag(body_children[2]), Some("ol"));
+        // The counter is keyed by num_id/abstract-num, not by <ol>
+        // run, and an intervening unrelated paragraph doesn't reset
+        // it -- matching real Word behavior, a numbered list resumes
+        // its count across an interruption using the same numId. So
+        // the second list's first item is really item #2 in the
+        // overall sequence: not "last+1" (no last_val in this new
+        // run) and not "the natural first" (val is 2, not 1), so it
+        // must keep an explicit value for the browser to render "2."
+        // instead of restarting at "1."
+        let second_item = h.dom.children(body_children[2])[0];
+        assert_eq!(
+            h.dom
+                .node(second_item)
+                .attrs
+                .get("value")
+                .map(String::as_str),
+            Some("2")
+        );
+    }
+
+    #[test]
+    fn a_bullet_level_becomes_an_unordered_list_and_always_strips_value() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="10"/></w:numPr></w:pPr><w:r><w:t>a</w:t></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let body = h.body(document, &ns);
+        let mut numbering = numbering_from(BULLET_LIST);
+
+        apply_numbering_markup(
+            &mut numbering,
+            &mut h.dom,
+            body,
+            &mut h.styles,
+            &h.state.object_map,
+            &ns,
+        );
+
+        let ul = h.dom.children(body)[0];
+        assert_eq!(h.dom.tag(ul), Some("ul"));
+        let item = h.dom.children(ul)[0];
+        assert!(h.dom.node(item).attrs.get("value").is_none());
+    }
+
+    #[test]
+    fn a_third_item_after_a_deeper_level_restart_keeps_its_explicit_value() {
+        // Two level-0 items, then a level-1 item (different list-lvl,
+        // so it starts its own run/counter), then back to level 0 --
+        // the returning item's value (3) isn't "last + 1" relative to
+        // the level-1 item it followed, so it must keep an explicit
+        // value for the browser to render the right number.
+        let fragment = r#"<w:abstractNum w:abstractNumId="1">
+                <w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl>
+                <w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%2."/></w:lvl>
+            </w:abstractNum>
+            <w:num w:numId="9"><w:abstractNumId w:val="1"/></w:num>"#;
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="9"/></w:numPr></w:pPr><w:r><w:t>a</w:t></w:r></w:p>
+                 <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="9"/></w:numPr></w:pPr><w:r><w:t>b</w:t></w:r></w:p>
+                 <w:p><w:pPr><w:numPr><w:ilvl w:val="1"/><w:numId w:val="9"/></w:numPr></w:pPr><w:r><w:t>c</w:t></w:r></w:p>
+                 <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="9"/></w:numPr></w:pPr><w:r><w:t>d</w:t></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let body = h.body(document, &ns);
+        let mut numbering = numbering_from(fragment);
+
+        apply_numbering_markup(
+            &mut numbering,
+            &mut h.dom,
+            body,
+            &mut h.styles,
+            &h.state.object_map,
+            &ns,
+        );
+
+        // <ol>[a,b] <ol>[c] <ol>[d] -- three runs, since each level
+        // change (0 -> 1 -> 0) breaks the (list-id, list-lvl) key.
+        let body_children = h.dom.children(body);
+        assert_eq!(body_children.len(), 3);
+        let last_ol = body_children[2];
+        let d_item = h.dom.children(last_ol)[0];
+        assert_eq!(
+            h.dom.node(d_item).attrs.get("value").map(String::as_str),
+            Some("3"),
+            "not a +1 continuation of the level-1 item, so value is kept"
         );
     }
 }
