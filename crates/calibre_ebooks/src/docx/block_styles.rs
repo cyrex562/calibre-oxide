@@ -38,7 +38,10 @@ pub fn format_g3(value: f64) -> String {
     format_g(value, 3)
 }
 
-fn format_g(value: f64, precision: usize) -> String {
+/// `pub(crate)` since `docx::images` (issue #289) also needs Python's
+/// plain `{:g}` (default precision 6), not just the `.3g` most CSS
+/// values here use.
+pub(crate) fn format_g(value: f64, precision: usize) -> String {
     if !value.is_finite() {
         return format!("{value}");
     }

@@ -22,6 +22,7 @@
 //! | `styles.py` (partial) | [`styles`] |
 //! | `fonts.py` (partial) | [`fonts`] |
 //! | `toc.py` | [`toc`] |
+//! | `images.py` (partial) | [`images`] |
 //!
 //! The four "partial" rows above port everything except HTML-markup
 //! construction: `numbering.rs` has `Level`/`NumberingDefinition`/
@@ -41,14 +42,17 @@
 //! extraction, `family_for`'s system-installed-font matching), which
 //! needs a font scanner with no Rust counterpart.
 //! `to_html.py`'s own orchestration, and the remaining unported files
-//! (`images.py`, `fields.py`, `index.py`, `cleanup.py`) are tracked
-//! separately in issue #130 -- they build and mutate an HTML element
-//! tree ([`crate::dom`] as of that issue), and (for `fields.py`/
-//! `index.py`'s synthetic-element insertion) a mutable *source*-document
-//! tree ([`crate::xmltree`], relocated for this reason but not yet
-//! wired into the docx module). `toc.py` is ported ([`toc`]) but, like
+//! (`fields.py`, `index.py`, `cleanup.py`) are tracked separately in
+//! issue #130 -- they build and mutate an HTML element tree
+//! ([`crate::dom`] as of that issue), and (for `fields.py`/`index.py`'s
+//! synthetic-element insertion) a mutable *source*-document tree
+//! ([`crate::xmltree`], relocated for this reason but not yet wired
+//! into the docx module). `toc.py` is ported ([`toc`]) but, like
 //! everything above, not yet wired into a `to_html.py` orchestrator --
-//! see issue #288.
+//! see issue #288. `images.py`'s pure geometry/CSS half is ported
+//! ([`images`], issue #289); the `Images` struct itself (embedded-image
+//! extraction, resizing, `w:drawing`/`w:pict` -> `<img>` markup) is
+//! still a separate follow-up.
 //!
 //! The output half of the module — `writer/` — is issue #23 and lives
 //! in [`writer`].
@@ -74,6 +78,7 @@ pub mod dump;
 pub mod error;
 pub mod fonts;
 pub mod footnotes;
+pub mod images;
 pub mod lcid;
 pub mod names;
 pub mod numbering;
