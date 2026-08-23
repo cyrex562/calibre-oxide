@@ -607,6 +607,19 @@ impl<'a, 'i> Styles<'a, 'i> {
         }
     }
 
+    /// Registers a `w:tbl` with this instance's [`Tables`].
+    ///
+    /// `to_html.py`'s `Convert.tables` and `Convert.styles` are two
+    /// separate attributes referring to the same object -- Python
+    /// mutates `self.tables` directly (e.g. in `read_page_properties`)
+    /// and the change is visible through `self.styles.tables` too.
+    /// Here [`Styles::new`] takes ownership of the one `Tables`
+    /// instance instead, so callers outside this module go through
+    /// this method rather than holding their own handle to it.
+    pub fn register_table(&mut self, tbl: Node<'a, 'i>, ns: &DocxNamespace) {
+        self.tables.register(tbl, &self.id_map, ns);
+    }
+
     /// Discards a named paragraph style's own `w:numPr` level in
     /// favour of the level `numbering.xml` actually links to that
     /// style (Word ignores a level set directly inside a style
