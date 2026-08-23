@@ -479,6 +479,16 @@ impl<'a, 'i> Styles<'a, 'i> {
         }
     }
 
+    /// Overwrites a cached paragraph's entire resolved style -- the
+    /// same write-back need as [`Styles::set_paragraph_text_indent`],
+    /// but for `mark_block_runs`, which mutates a resolved
+    /// [`ParagraphStyle`]'s borders/margins/padding across half a
+    /// dozen fields at once (merging a run of bordered paragraphs into
+    /// one visual block) rather than touching a single field.
+    pub fn set_paragraph_style(&mut self, p: Node<'a, 'i>, style: ParagraphStyle) {
+        self.para_cache.insert(p, style);
+    }
+
     /// The final, fully cascaded style for one `w:r`, cached by node
     /// identity. Font resolution stops short of `fonts.py`'s system
     /// font matching -- see the module docs.
