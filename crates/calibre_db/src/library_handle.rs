@@ -241,11 +241,19 @@
 //!   round-trip identically across platforms for non-UTF-8 paths. Not
 //!   a concern for this crate's actual usage (library paths are
 //!   expected to be valid UTF-8), disclosed for completeness.
-//! - **No §5 step 2 blocking-with-timeout semantics.** The design doc
-//!   asks for calls made while `Suspended` to block up to 30s waiting
-//!   for resume before erroring; `check_open` returns `Err(Suspended)`
-//!   immediately instead, same as it already did for `Detached`. A
-//!   real, separable follow-up -- see `power_monitor.rs`'s module doc.
+//! - **§5 step 2 blocking-with-timeout semantics -- real, as of issue
+//!   #259.** `check_open` now blocks (via a [`Condvar`] paired with
+//!   `state`) for up to [`REAL_SUSPENDED_BLOCK_TIMEOUT`] (30s, §5
+//!   step 2's own number) while the handle is `Suspended`, waiting for
+//!   `resume()` to bring it back to `Open` -- `set_state` notifies the
+//!   condvar on every transition, so a resume wakes a blocked caller
+//!   immediately rather than making it wait out the rest of the
+//!   timeout. A transition straight to `Detached` while blocked also
+//!   wakes it immediately, with the right error, rather than treating
+//!   `Detached` as just another `Suspended`-flavored wait -- `Detached`
+//!   still fails fast with no blocking at all when the handle is
+//!   already in that state at the time of the call, matching §4's "no
+//!   retries hidden in the handle" contract exactly as before.
 //! - **WAL checkpoint on suspend -- real, as of issue #260.**
 //!   `prepare_for_suspend` calls [`checkpoint_wal_best_effort`], which
 //!   opens its own short-lived connection to `metadata.db` and each
@@ -333,7 +341,7 @@ use rusqlite::Connection as SqliteConnection;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use uuid::Uuid;
@@ -351,6 +359,10 @@ use crate::constants::{
 /// bounding growth over a library's *lifetime*, not minimizing disk
 /// use day to day.
 const JOURNAL_PRUNE_RETENTION: u64 = 500;
+
+/// §5 step 2's own number (issue #259): "blocks with a timeout of
+/// 30s waiting for [resume], then errors."
+const REAL_SUSPENDED_BLOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Test-only: serializes every test in this file, `device_monitor.rs`,
 /// and `power_monitor.rs` that does real `flock()` work (acquired via
@@ -577,6 +589,20 @@ pub(crate) struct Shared {
     /// Unused (and irrelevant) for any other tier.
     network_retry_policy: RetryPolicy,
     state: Mutex<HandleState>,
+    /// Paired with `state`: `set_state` notifies this on every
+    /// transition, and `check_open` waits on it while `state` is
+    /// `Suspended` -- §5 step 2's "blocks with a timeout of 30s
+    /// waiting for resume" (issue #259). A transition straight to
+    /// `Detached` while something is blocked wakes it immediately too
+    /// (not just a resume) so a caller doesn't wait out the full
+    /// timeout only to learn the device is gone.
+    state_changed: Condvar,
+    /// §5 step 2's blocking timeout -- [`REAL_SUSPENDED_BLOCK_TIMEOUT`]
+    /// outside tests, a much shorter one under a test-only override
+    /// (see [`LibraryHandle::open_impl_suspend_test`]) so give-up
+    /// behavior can be exercised in milliseconds instead of 30 real
+    /// seconds.
+    suspended_block_timeout: Duration,
     journal_dir: PathBuf,
     checkpoint_path: PathBuf,
     retention: u64,
@@ -616,6 +642,11 @@ impl Shared {
 
     pub(crate) fn set_state(&self, new: HandleState) {
         *self.state.lock().unwrap() = new;
+        // Wakes anything blocked in `check_open` -- both the resume
+        // case it's waiting for, and a transition straight to
+        // `Detached`, so a blocked caller doesn't wait out the full
+        // timeout only to learn the device is gone.
+        self.state_changed.notify_all();
     }
 
     /// Stores (or, given `None`, drops -- releasing it) the real sleep
@@ -627,11 +658,37 @@ impl Shared {
         *self.inhibitor.lock().unwrap() = fd;
     }
 
+    /// §5 step 2 (issue #259): `Detached` still fails immediately --
+    /// there's nothing to wait for, the caller has to explicitly
+    /// reopen. `Suspended` blocks instead, waiting up to
+    /// `self.suspended_block_timeout` for `resume()` to bring the
+    /// handle back to `Open` (or for it to drop straight to `Detached`
+    /// instead, which also wakes this immediately rather than making
+    /// it wait out the rest of the timeout). Re-checks the real state
+    /// on every wakeup rather than trusting a single `wait_timeout`
+    /// call, since `Condvar::wait_timeout` can wake up spuriously.
     fn check_open(&self) -> Result<(), LibraryHandleError> {
-        match self.state() {
-            HandleState::Open => Ok(()),
-            HandleState::Detached => Err(LibraryHandleError::DeviceDetached),
-            HandleState::Suspended => Err(LibraryHandleError::Suspended),
+        let mut state = self.state.lock().unwrap();
+        let deadline = Instant::now() + self.suspended_block_timeout;
+        loop {
+            match *state {
+                HandleState::Open => return Ok(()),
+                HandleState::Detached => return Err(LibraryHandleError::DeviceDetached),
+                HandleState::Suspended => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(LibraryHandleError::Suspended);
+                    }
+                    let (guard, _timeout_result) =
+                        self.state_changed.wait_timeout(state, remaining).unwrap();
+                    state = guard;
+                    // Loop back regardless of whether this wakeup was
+                    // the real state change, a spurious one, or the
+                    // timeout firing -- the match above re-derives the
+                    // right outcome from the actual current state
+                    // either way.
+                }
+            }
         }
     }
 
@@ -1426,6 +1483,7 @@ impl LibraryHandle {
             monitor_devices,
             monitor_power,
             None,
+            None,
         )
     }
 
@@ -1449,7 +1507,23 @@ impl LibraryHandle {
             false,
             false,
             Some((StorageTier::Network, policy)),
+            None,
         )
+    }
+
+    /// Test-only: forces §5 step 2's blocking timeout to `timeout`
+    /// (instead of the real, much slower [`REAL_SUSPENDED_BLOCK_TIMEOUT`])
+    /// -- lets tests exercise `check_open`'s block-then-give-up
+    /// behavior in milliseconds instead of 30 real seconds. Real tier
+    /// classification and device/power monitoring are skipped
+    /// entirely, same shape as [`LibraryHandle::open_impl_network_test`].
+    #[cfg(test)]
+    fn open_impl_suspend_test(
+        library_path: &Path,
+        retention: u64,
+        timeout: Duration,
+    ) -> Result<Self, LibraryHandleError> {
+        Self::open_impl_inner(library_path, retention, false, false, None, Some(timeout))
     }
 
     /// Test-only, `pub(crate)`: the same forced-`Network`-tier
@@ -1478,6 +1552,7 @@ impl LibraryHandle {
         monitor_devices: bool,
         monitor_power: bool,
         force_tier_and_policy: Option<(StorageTier, RetryPolicy)>,
+        force_suspended_block_timeout: Option<Duration>,
     ) -> Result<Self, LibraryHandleError> {
         let handle_dir = library_path.join(LIBRARY_HANDLE_DIR_NAME);
         fs::create_dir_all(&handle_dir)?;
@@ -1500,6 +1575,8 @@ impl LibraryHandle {
                 REAL_NETWORK_RETRY_POLICY,
             ),
         };
+        let suspended_block_timeout =
+            force_suspended_block_timeout.unwrap_or(REAL_SUSPENDED_BLOCK_TIMEOUT);
 
         let journal_dir = handle_dir.join(JOURNAL_DIR_NAME);
         let checkpoint_path = handle_dir.join(JOURNAL_CHECKPOINT_FILE_NAME);
@@ -1518,6 +1595,8 @@ impl LibraryHandle {
             tier,
             network_retry_policy,
             state: Mutex::new(HandleState::Open),
+            state_changed: Condvar::new(),
+            suspended_block_timeout,
             journal_dir,
             checkpoint_path,
             retention,
@@ -3653,6 +3732,125 @@ mod tests {
             "recovery should complete a batch that never even started"
         );
         drop(handle);
+    }
+
+    // }}}
+
+    // --- §5 step 2: blocking-with-timeout while Suspended (issue #259) {{{
+
+    const FAST_TEST_SUSPEND_TIMEOUT: Duration = Duration::from_millis(50);
+
+    fn open_suspend_test(dir: &Path, timeout: Duration) -> LibraryHandle {
+        LibraryHandle::open_impl_suspend_test(dir, JOURNAL_PRUNE_RETENTION, timeout).unwrap()
+    }
+
+    #[test]
+    fn check_open_succeeds_immediately_when_state_is_open() {
+        let _flock_test_guard = flock_test_guard();
+        let dir = tempdir().unwrap();
+        let handle = open_suspend_test(dir.path(), Duration::from_secs(5));
+
+        let start = Instant::now();
+        handle
+            .write_atomic(&dir.path().join("x.txt"), b"data")
+            .unwrap();
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "an Open handle must not block at all"
+        );
+    }
+
+    #[test]
+    fn check_open_fails_immediately_when_already_detached() {
+        let _flock_test_guard = flock_test_guard();
+        let dir = tempdir().unwrap();
+        let handle = open_suspend_test(dir.path(), Duration::from_secs(5));
+        handle.shared.set_state(HandleState::Detached);
+
+        let start = Instant::now();
+        let result = handle.write_atomic(&dir.path().join("x.txt"), b"data");
+        assert!(matches!(result, Err(LibraryHandleError::DeviceDetached)));
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "Detached must fail fast, never block -- there's nothing to wait for"
+        );
+    }
+
+    #[test]
+    fn check_open_blocks_while_suspended_and_succeeds_once_resumed() {
+        let _flock_test_guard = flock_test_guard();
+        let dir = tempdir().unwrap();
+        // Generous timeout -- the point of this test is that resume
+        // wins the race well before it, not that the timeout itself
+        // fires.
+        let handle = open_suspend_test(dir.path(), Duration::from_secs(5));
+        handle.shared.set_state(HandleState::Suspended);
+
+        let shared = Arc::clone(&handle.shared);
+        let resumer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            shared.set_state(HandleState::Open);
+        });
+
+        let start = Instant::now();
+        handle
+            .write_atomic(&dir.path().join("x.txt"), b"data")
+            .unwrap();
+        let elapsed = start.elapsed();
+        resumer.join().unwrap();
+
+        assert!(
+            elapsed >= Duration::from_millis(40),
+            "should have genuinely blocked until resume, not returned instantly: {elapsed:?}"
+        );
+        assert_eq!(fs::read(dir.path().join("x.txt")).unwrap(), b"data");
+    }
+
+    #[test]
+    fn check_open_gives_up_after_the_timeout_and_returns_suspended() {
+        let _flock_test_guard = flock_test_guard();
+        let dir = tempdir().unwrap();
+        let handle = open_suspend_test(dir.path(), FAST_TEST_SUSPEND_TIMEOUT);
+        handle.shared.set_state(HandleState::Suspended);
+
+        let start = Instant::now();
+        let result = handle.write_atomic(&dir.path().join("x.txt"), b"data");
+        let elapsed = start.elapsed();
+
+        assert!(matches!(result, Err(LibraryHandleError::Suspended)));
+        assert!(
+            elapsed >= FAST_TEST_SUSPEND_TIMEOUT,
+            "should have waited out the full timeout before giving up: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn check_open_wakes_immediately_on_a_transition_straight_to_detached() {
+        let _flock_test_guard = flock_test_guard();
+        let dir = tempdir().unwrap();
+        // Generous timeout -- the point is that the Detached
+        // transition wakes this well before the timeout would ever
+        // fire on its own.
+        let handle = open_suspend_test(dir.path(), Duration::from_secs(5));
+        handle.shared.set_state(HandleState::Suspended);
+
+        let shared = Arc::clone(&handle.shared);
+        let detacher = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            shared.set_state(HandleState::Detached);
+        });
+
+        let start = Instant::now();
+        let result = handle.write_atomic(&dir.path().join("x.txt"), b"data");
+        let elapsed = start.elapsed();
+        detacher.join().unwrap();
+
+        assert!(matches!(result, Err(LibraryHandleError::DeviceDetached)));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "should have woken immediately on the Detached transition, \
+             not waited out the 5s timeout: {elapsed:?}"
+        );
     }
 
     // }}}
