@@ -12,7 +12,7 @@
 //! Python object, holding a `parent` back-reference and a `children`
 //! list of more `TOC` objects. Rust has no straightforward equivalent of
 //! that shape without `Rc<RefCell<_>>` boilerplate throughout, so -- like
-//! [`super::xmltree::Xml`] and [`crate::dom::Dom`] before it -- this
+//! [`crate::xmltree::Xml`] and [`crate::dom::Dom`] before it -- this
 //! is ported as an **arena**: [`Toc`] owns a flat `Vec<TocNode>`, and
 //! every node is referred to by a small `Copy` handle, [`TocNodeId`].
 //! [`TocNode`]'s fields mirror `TOC`'s instance attributes 1:1
@@ -57,7 +57,7 @@ use super::container::{name_to_href_at, Container, ParsedItem};
 use super::errors::PolishError;
 use super::pretty::{pretty_dom_xml_tree, pretty_html_tree};
 use super::utils::guess_type;
-use super::xmltree::{Xml, XmlNodeId};
+use crate::xmltree::{Xml, XmlNodeId};
 
 fn whitespace_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();

@@ -49,7 +49,7 @@
 //!   is not supported).
 //! - [`matcher`]: the [`matcher::Element`] trait (implemented for
 //!   [`crate::dom::Dom`] node references and
-//!   [`crate::oeb::polish::xmltree::Xml`] node references) plus
+//!   [`crate::xmltree::Xml`] node references) plus
 //!   [`matcher::Select`], a small per-document index mirroring Python's
 //!   `css_selectors.Select` (`select.has_matches(selector_text)`).
 //!

@@ -76,7 +76,7 @@ use crate::oeb::constants::{DC11_NS, NCX_MIME, OEB_DOCS, OEB_STYLES, OPF2_NS};
 use super::errors::PolishError;
 use super::parsing;
 use super::utils::{adjust_mime_for_epub, guess_type, NameLookup};
-use super::xmltree::{Xml, XmlNodeId};
+use crate::xmltree::{Xml, XmlNodeId};
 
 /// `OPF_NAMESPACES` -- the `opf:`/`dc:` prefixes `opf_xpath` resolves
 /// against, matching every real call site in `container.py`/`opf.py`.

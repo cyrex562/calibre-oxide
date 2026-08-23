@@ -1,6 +1,18 @@
-//! A small, mutable, namespace-aware XML arena for the "real XML"
-//! documents `oeb::polish::container` edits in place: OPF, NCX,
-//! `META-INF/container.xml`, `META-INF/encryption.xml`.
+//! A small, mutable, namespace-aware XML arena for "real", strict XML
+//! documents -- as opposed to tag-soup HTML5, see [`crate::dom`]. Built
+//! for the OPF/NCX/OCF documents `oeb::polish::container` edits in
+//! place (OPF, NCX, `META-INF/container.xml`,
+//! `META-INF/encryption.xml`); reused as of the docx HTML-generation
+//! port (issue #130) for OOXML's `word/document.xml` and
+//! `word/numbering.xml`, whose source-tree mutation needs (merged-cell
+//! removal in `docx::tables`, synthetic-element insertion in the
+//! not-yet-ported `fields.py`/`index.py`) are the same shape. It lived
+//! under `oeb::polish::xmltree` until that reuse made the location
+//! misleading; it was moved to the crate root without any behavior
+//! change. Nothing in this module is actually OPF-specific -- the
+//! namespace URI/prefix table any query needs is always supplied by
+//! the caller (see [`Xml::opf_xpath`]'s `ns` parameter) -- the name
+//! just predates its reuse.
 //!
 //! `container.py`'s heavy tree work is split across two very different
 //! kinds of documents:

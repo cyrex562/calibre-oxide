@@ -18,7 +18,7 @@
 //!   prefix is declared" reduces to "ensure an `xmlns:epub` attribute is
 //!   present on the document's root element".
 //! - [`upgrade_metadata`] ports `opf_2_to_3.py`'s `upgrade_metadata`
-//!   pipeline directly against this crate's [`super::xmltree::Xml`]
+//!   pipeline directly against this crate's [`crate::xmltree::Xml`]
 //!   arena, with a deliberately bounded reimplementation of the small
 //!   slice of `opf3.py` it depends on (`ensure_id`/`set_refines`/a
 //!   calibre-prefix-only `ensure_prefix` -- see each helper's docs).
@@ -62,7 +62,7 @@ use calibre_utils::short_uuid::uuid4;
 use super::container::{
     opf_namespaces, Container, EpubContainer, ADOBE_OBFUSCATION, IDPF_OBFUSCATION,
 };
-use super::xmltree::{Xml, XmlNodeId};
+use crate::xmltree::{Xml, XmlNodeId};
 
 const CALIBRE_PREFIX: &str = "https://calibre-ebook.com";
 
@@ -951,7 +951,7 @@ mod tests {
     fn upgrade_metadata_reshapes_identifiers_language_and_rating() {
         let dir = tempfile::tempdir().unwrap();
         write_epub2_book(dir.path());
-        let mut xml = super::super::xmltree::Xml::parse(
+        let mut xml = crate::xmltree::Xml::parse(
             &fs::read_to_string(dir.path().join("content.opf")).unwrap(),
         )
         .unwrap();

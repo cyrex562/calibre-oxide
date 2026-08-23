@@ -10,7 +10,7 @@
 //!
 //! In this port, the two paths would return genuinely different Rust
 //! types (a strict-XML tree vs. [`crate::dom::Dom`]'s HTML5-arena
-//! -- see `oeb::polish::xmltree`'s module docs for why OPF-family XML
+//! -- see `crate::xmltree`'s module docs for why OPF-family XML
 //! needs its own strict tree type and content documents don't), and
 //! unifying them is exactly the kind of "second tree abstraction" this
 //! project's scope note says not to build. Since HTML5 tag-soup parsing
@@ -24,8 +24,8 @@
 use unicode_normalization::UnicodeNormalization;
 
 use crate::chardet::{detect_bom as chardet_detect_bom, xml_to_unicode};
-use crate::html_entities::xml_replace_entities;
 use crate::dom::Dom;
+use crate::html_entities::xml_replace_entities;
 
 pub const XHTML_NS: &str = "http://www.w3.org/1999/xhtml";
 

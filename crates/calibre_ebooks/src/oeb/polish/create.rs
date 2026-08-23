@@ -45,7 +45,7 @@ use super::parsing;
 use super::pretty::{pretty_html_tree, pretty_xml_tree};
 use super::toc::{create_ncx, Toc};
 use super::utils::guess_type;
-use super::xmltree::Xml;
+use crate::xmltree::Xml;
 
 /// Port of `valid_empty_formats`.
 const VALID_EMPTY_FORMATS: &[&str] = &["epub", "txt", "docx", "azw3", "md"];

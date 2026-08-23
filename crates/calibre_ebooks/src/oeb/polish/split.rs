@@ -36,7 +36,7 @@
 //! documentation promises (`//h:div[@id="split_here"]`) and what
 //! [`multisplit`] needs internally (`//*[@calibre-split-point="i"]`),
 //! mirroring the same, deliberately-narrower-than-lxml precedent
-//! [`super::xmltree::Xml::opf_xpath`] already set for OPF documents.
+//! [`crate::xmltree::Xml::opf_xpath`] already set for OPF documents.
 //!
 //! **Cross-file element moves go through [`clone_into`].** `merge_html`
 //! copies element subtrees from one file's `Dom` into another's; since

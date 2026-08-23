@@ -3,7 +3,7 @@
 //! # Scope note: source positions on content documents
 //!
 //! Every error here that references a byte offset inside *strict XML*
-//! (OPF/NCX -- [`crate::oeb::polish::xmltree::Xml`], parsed via
+//! (OPF/NCX -- [`crate::xmltree::Xml`], parsed via
 //! `roxmltree`) gets a real line/column, exactly like Python's
 //! `lxml`-backed `elem.sourceline`. Errors that reference a position
 //! inside an *XHTML content document* ([`crate::dom::Dom`], parsed
@@ -647,7 +647,7 @@ fn scan_and_blank_entities(raw: &[u8], is_oeb_doc: bool) -> EntityScan {
 
 /// Port of `check_xml_parsing`. Real, strict-XML validation of `raw`
 /// (using [`roxmltree`] directly rather than through
-/// [`crate::oeb::polish::xmltree::Xml`], so a parse failure's position
+/// [`crate::xmltree::Xml`], so a parse failure's position
 /// is available even though the document never becomes a usable tree).
 /// See the module docs for why HTML-family errors don't carry
 /// as-precise a location as their XML counterparts do.

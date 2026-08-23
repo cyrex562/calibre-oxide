@@ -5,7 +5,7 @@ use anyhow::Result;
 use crate::oeb::constants::OPF2_NS;
 
 use super::container::Container;
-use super::xmltree::XmlNodeId;
+use crate::xmltree::XmlNodeId;
 
 /// Narrow stand-in for `calibre.utils.localization.canonicalize_lang`
 /// (a multi-thousand-entry ISO-639 table). A second, independent copy
