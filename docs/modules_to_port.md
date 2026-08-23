@@ -370,9 +370,9 @@ either -- this pass wasn't exhaustive.
 - [ ] numbering.py (`Level`/`NumberingDefinition`/`Numbering` reading ported to `docx/numbering.rs`; `apply_markup` still needs the mutable HTML tree — see #130)
 - [x] `settings.py` -> `docx/settings.rs`
 - [ ] styles.py (`PageProperties`/`Style` and the full `Styles` paragraph/run cascade orchestrator ported to `docx/styles.rs`; `Styles.cascade` ported as `docx/to_html.rs`'s `cascade` — only `generate_css` (needs `fonts.py`'s system font matching) remains — see #130)
-- [ ] tables.py (`RowStyle`/`CellStyle`/`TableStyle` and full `Table`/`Tables` row/cell/paragraph style resolution ported to `docx/tables.rs` — `handle_merged_cells`'s cell removal is a tracked exclusion set, not source-tree mutation; only `apply_markup` (HTML `<table>` construction) remains, needs `crate::dom` wired into the docx module — see #130)
+- [x] tables.py (`RowStyle`/`CellStyle`/`TableStyle` and full `Table`/`Tables` row/cell/paragraph style resolution in `docx/tables.rs`; `apply_markup` (HTML `<table>`/`<tr>`/`<td>` construction) ported as `docx/to_html.rs`'s `apply_table_markup`/`apply_tables_markup` — `handle_merged_cells`'s tracked exclusion set (`removed_cells`) is honoured there — see #130/#286)
 - [x] `theme.py` -> `docx/theme.rs`
-- [ ] to_html.py (`docx/to_html.rs`'s `DOCXToHTML` is still the provisional sketch, wired into `input/docx_input.rs`; `convert_run`/`convert_p`/`read_page_properties`/`convert_body`/`read_block_anchors`/`apply_tab_indentation`/`mark_block_runs`/`resolve_links` (direct `w:hyperlink`s only)/`cascade` are ported, not yet wired in — remaining work tracked as issues #284/#286/#287/#288 — see #130)
+- [ ] to_html.py (`docx/to_html.rs`'s `DOCXToHTML` is still the provisional sketch, wired into `input/docx_input.rs`; `convert_run`/`convert_p`/`read_page_properties`/`convert_body`/`read_block_anchors`/`apply_tab_indentation`/`mark_block_runs`/`resolve_links` (direct `w:hyperlink`s only)/`cascade`/`apply_tables_markup` are ported, not yet wired in — remaining work tracked as issues #284/#286 (numbering half)/#287/#288 — see #130)
 - [ ] toc.py (needs the mutable HTML tree — see #130)
 
 ##### writer

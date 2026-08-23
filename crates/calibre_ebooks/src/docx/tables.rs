@@ -4,10 +4,15 @@
 //! ([`Table`]/[`Tables`]).
 //!
 //! Partial port of `old_src/src/calibre/ebooks/docx/tables.py`.
-//! `Table::apply_markup`/`Tables::apply_markup` (which build the actual
-//! HTML `<table>`/`<tr>`/`<td>` markup) are deferred to the same
-//! follow-up as `to_html.rs`'s real port -- they need [`crate::dom`],
-//! which isn't wired into the docx module yet. See issue #130.
+//! `Table.apply_markup`/`Tables.apply_markup` (which build the actual
+//! HTML `<table>`/`<tr>`/`<td>` markup) live in `to_html.rs` instead,
+//! as [`super::to_html::apply_table_markup`]/
+//! [`super::to_html::apply_tables_markup`] -- free functions rather
+//! than methods here, since they need [`crate::dom::Dom`]/
+//! `super::styles::Styles` alongside `Table`/`Tables`, matching where
+//! this module's other `Dom`-needing orchestration
+//! (`mark_block_runs`, `cascade`, `resolve_links`) already lives. See
+//! issue #130/#286.
 //!
 //! # `handle_merged_cells`: a tracked exclusion set, not tree mutation
 //!
@@ -24,18 +29,19 @@
 //! `Table::__init__`/`handle_merged_cells`) runs, in full, *before*
 //! the top-level paragraph-to-HTML walk even starts, and the only
 //! source-tree walk over `w:tr`/`w:tc` anywhere outside `tables.py`
-//! itself is `Table.apply_markup`'s own re-walk (which must honour the
-//! exclusion set once ported). Critically, the top-level walk does
+//! itself is `apply_table_markup`'s own re-walk (`to_html.rs`, which
+//! does honour the exclusion set). Critically, the top-level walk does
 //! **not** check removal status -- Python's own `w:p`/`w:tbl`
 //! descendant search is evaluated eagerly into a list before any
 //! removal happens, so a merged-away cell's paragraph still gets HTML
 //! built and appended as a stray top-level element; only
-//! `apply_markup`'s fresh tree walk (which no longer finds the removed
-//! `w:tc`) fails to ever move it into the table. This is a real,
+//! `apply_table_markup`'s fresh tree walk (which skips anything in
+//! `removed_cells`) never moves it into the table. This was a real,
 //! observable upstream leak (duplicate/orphaned empty paragraphs for
-//! merged-away cells), not a hypothetical -- whoever ports `to_html.rs`
-//! should reproduce it (do **not** gate the top-level walk on
-//! `removed_cells`) rather than silently fix it.
+//! merged-away cells), not a hypothetical, and is deliberately
+//! reproduced as-is: `apply_table_markup` gates its own re-walk on
+//! `removed_cells`, but the top-level walk (`convert_body`) is not
+//! also gated on it.
 //!
 //! # Sharing with `block_styles`
 //!
@@ -875,8 +881,8 @@ impl TableStyle {
 }
 
 /// A `<w:tbl>`'s resolved row/cell/paragraph style maps and merged-cell
-/// bookkeeping. See the module docs for what's deferred (`apply_markup`)
-/// and how merged-cell removal is represented here.
+/// bookkeeping. See the module docs for where `apply_markup` lives
+/// (`to_html.rs`) and how merged-cell removal is represented here.
 ///
 /// Port of the Python `Table`.
 #[derive(Debug, Clone)]
@@ -1003,6 +1009,23 @@ impl<'a, 'i> Table<'a, 'i> {
 
     fn bidi(&self) -> bool {
         self.table_style.bidi == Some(true)
+    }
+
+    /// The first paragraph anywhere in this table, recursing into
+    /// sub-tables when a table's own cells hold no direct paragraph
+    /// (rare -- OOXML requires a `w:tc` to end in a block-level
+    /// element, almost always a `w:p`, but a cell containing only a
+    /// nested table is technically possible). Used by `apply_markup`
+    /// (`to_html.rs`) to find where the rendered `<table>` belongs.
+    ///
+    /// Port of the effect of Python's `next(iter(self))`, where
+    /// `Table.__iter__` yields `self.paragraphs` then recurses into
+    /// `self.sub_tables.values()`.
+    pub fn first_paragraph(&self) -> Option<Node<'a, 'i>> {
+        self.paragraphs
+            .first()
+            .copied()
+            .or_else(|| self.sub_tables.values().find_map(|t| t.first_paragraph()))
     }
 
     /// Port of the Python `Table.override_allowed`.
@@ -1315,7 +1338,8 @@ impl<'a, 'i> Table<'a, 'i> {
 /// consult.
 ///
 /// Port of the Python `Tables` -- reading (`register`) and the two
-/// style lookups only; `apply_markup` is deferred (see the module docs).
+/// style lookups; `apply_markup` lives in `to_html.rs` (see the module
+/// docs).
 #[derive(Debug, Clone, Default)]
 pub struct Tables<'a, 'i> {
     pub tables: Vec<Table<'a, 'i>>,

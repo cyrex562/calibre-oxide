@@ -666,6 +666,15 @@ impl<'a, 'i> Styles<'a, 'i> {
         self.tables.register(tbl, &self.id_map, ns);
     }
 
+    /// The tables registered so far (via [`Styles::register_table`],
+    /// called inline from `read_page_properties` for every `w:tbl`
+    /// encountered). Needed by `to_html.rs`'s `apply_tables_markup`,
+    /// since `Styles` owns the sole `Tables` instance -- see
+    /// [`Styles::register_table`]'s own docs for why.
+    pub fn tables(&self) -> &Tables<'a, 'i> {
+        &self.tables
+    }
+
     /// Discards a named paragraph style's own `w:numPr` level in
     /// favour of the level `numbering.xml` actually links to that
     /// style (Word ignores a level set directly inside a style
