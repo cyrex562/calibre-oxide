@@ -17,11 +17,21 @@
 //! | `settings.py` | [`settings`] |
 //! | `footnotes.py` | [`footnotes`] |
 //! | `dump.py` | [`dump`] |
+//! | `numbering.py` (partial) | [`numbering`] |
+//! | `tables.py` (partial) | [`tables`] |
+//! | `styles.py` (partial) | [`styles`] |
 //!
-//! Still to come, tracked separately: `styles.py`, `numbering.py`,
-//! `tables.py`, `fonts.py`, `images.py`, `fields.py`, `index.py`,
-//! `toc.py` and `cleanup.py`, plus a real `to_html.py`. Those build and
-//! mutate an HTML element tree, which this crate does not yet have.
+//! The three "partial" rows above port the property-model classes
+//! only (`Level`/`NumberingDefinition`/`Numbering`'s reading half,
+//! `RowStyle`/`CellStyle`/`TableStyle`, `PageProperties`/`Style`).
+//! Their tree-mutating orchestrators (`Numbering::apply_markup`,
+//! `Table`/`Tables`, `Styles`) and `fonts.py`, `images.py`,
+//! `fields.py`, `index.py`, `toc.py`, `cleanup.py` and a real
+//! `to_html.py` are tracked separately in issue #130 -- they build
+//! and mutate an HTML element tree ([`crate::dom`] as of that issue),
+//! and (for `Table`'s merged-cell handling, `fields.py`, `index.py`)
+//! a mutable *source*-document tree the DOCX side doesn't have yet
+//! either.
 //!
 //! The output half of the module — `writer/` — is issue #23 and lives
 //! in [`writer`].
@@ -48,7 +58,10 @@ pub mod error;
 pub mod footnotes;
 pub mod lcid;
 pub mod names;
+pub mod numbering;
 pub mod settings;
+pub mod styles;
+pub mod tables;
 pub mod theme;
 pub mod to_html;
 pub mod writer;
@@ -59,5 +72,8 @@ pub use container::{Docx, Relationships};
 pub use error::DocxError;
 pub use footnotes::{Footnotes, Note};
 pub use names::DocxNamespace;
+pub use numbering::{Level, Numbering, NumberingDefinition};
 pub use settings::Settings;
+pub use styles::{PageProperties, Style};
+pub use tables::{CellStyle, RowStyle, TableStyle};
 pub use theme::Theme;
