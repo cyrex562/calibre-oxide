@@ -373,7 +373,7 @@ either -- this pass wasn't exhaustive.
 - [x] tables.py (`RowStyle`/`CellStyle`/`TableStyle` and full `Table`/`Tables` row/cell/paragraph style resolution in `docx/tables.rs`; `apply_markup` (HTML `<table>`/`<tr>`/`<td>` construction) ported as `docx/to_html.rs`'s `apply_table_markup`/`apply_tables_markup` — `handle_merged_cells`'s tracked exclusion set (`removed_cells`) is honoured there — see #130/#286)
 - [x] `theme.py` -> `docx/theme.rs`
 - [ ] to_html.py (`docx/to_html.rs`'s `DOCXToHTML` is still the provisional sketch, wired into `input/docx_input.rs`; `convert_run`/`convert_p`/`read_page_properties`/`convert_body`/`read_block_anchors`/`apply_tab_indentation`/`mark_block_runs`/`resolve_links` (direct `w:hyperlink`s only)/`cascade`/`apply_tables_markup`/`apply_numbering_markup`/`apply_block_run_frames`/`apply_paragraph_frames` (both halves of `apply_frames`)/`assign_style_classes`/`convert_footnotes` are ported, not yet wired in — remaining work tracked as issue #288 (`fields.polish_markup`/`cleanup_markup`/`write`) — see #130)
-- [ ] toc.py (needs the mutable HTML tree — see #130)
+- [x] toc.py (`from_headings`/`from_toc`/`structure_toc`/`link_to_txt`/`create_toc` and a `Toc`/`TocNode` arena port of `calibre.ebooks.metadata.toc.TOC` in `docx/toc.rs`; not yet wired into an orchestrator — see #130/#288)
 
 ##### writer
 

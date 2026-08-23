@@ -1011,8 +1011,10 @@ fn ensure_id(dom: &mut Dom, elem: NodeId, all_ids: &mut HashSet<String>) -> (boo
     }
 }
 
-/// Port of `elem_to_toc_text`.
-fn elem_to_toc_text(dom: &Dom, elem: NodeId, prefer_title: bool) -> String {
+/// Port of `elem_to_toc_text`. `pub(crate)` since `docx::toc` (issue
+/// #292) imports it too, matching Python's own `from
+/// calibre.ebooks.oeb.polish.toc import elem_to_toc_text`.
+pub(crate) fn elem_to_toc_text(dom: &Dom, elem: NodeId, prefer_title: bool) -> String {
     let mut text = dom.text_content(elem).trim().to_string();
     if prefer_title {
         let title_trim = dom
