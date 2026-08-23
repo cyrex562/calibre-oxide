@@ -24,6 +24,7 @@
 //! | `toc.py` | [`toc`] |
 //! | `images.py` (partial) | [`images`] |
 //! | `fields.py` (partial) | [`fields`] |
+//! | `index.py` (partial) | [`index`] |
 //!
 //! The four "partial" rows above port everything except HTML-markup
 //! construction: `numbering.rs` has `Level`/`NumberingDefinition`/
@@ -42,13 +43,10 @@
 //! system dependency) but not the `Fonts` class itself (embedded-font
 //! extraction, `family_for`'s system-installed-font matching), which
 //! needs a font scanner with no Rust counterpart.
-//! `to_html.py`'s own orchestration, and the remaining unported files
-//! (`index.py`, `cleanup.py`) are tracked separately in issue #130 --
-//! they build and mutate an HTML element tree ([`crate::dom`] as of
-//! that issue), and (for `index.py`'s synthetic-element insertion) a
-//! mutable *source*-document tree ([`crate::xmltree`], relocated for
-//! this reason but not yet wired into the docx module). `toc.py` is
-//! ported ([`toc`]) but, like everything above, not yet wired into a
+//! `to_html.py`'s own orchestration, and `cleanup.py`, are tracked
+//! separately in issue #130 -- they build and mutate an HTML element
+//! tree ([`crate::dom`] as of that issue). `toc.py` is ported
+//! ([`toc`]) but, like everything above, not yet wired into a
 //! `to_html.py` orchestrator -- see issue #288. `images.py`'s pure
 //! geometry/CSS half is ported ([`images`], issue #289); the `Images`
 //! struct itself (embedded-image extraction, resizing, `w:drawing`/
@@ -56,9 +54,13 @@
 //! `fields.py`'s pure field-instruction parsing half is ported
 //! ([`fields`], issue #290); the `Fields` orchestrator itself (the
 //! source-tree field scanner, plus `parse_xe`'s synthetic-bookmark
-//! insertion and `parse_index`/`polish_markup`'s dependency on the
-//! still-unported `index.py`) is a separate follow-up -- see
-//! `fields`'s module docs.
+//! insertion) is a separate follow-up -- see `fields`'s module docs.
+//! `index.py`'s `polish_index_markup` half (the HTML-DOM-mutating
+//! block-merge algorithm) is ported ([`index`], issue #293); its
+//! `make_block`/`add_xe`/`process_index` (source-tree-mutating) half
+//! is not, needing the same `crate::xmltree`-vs-side-table decision
+//! `fields.rs`'s `parse_xe` is blocked on -- see `index`'s module
+//! docs.
 //!
 //! The output half of the module — `writer/` — is issue #23 and lives
 //! in [`writer`].
@@ -86,6 +88,7 @@ pub mod fields;
 pub mod fonts;
 pub mod footnotes;
 pub mod images;
+pub mod index;
 pub mod lcid;
 pub mod names;
 pub mod numbering;
