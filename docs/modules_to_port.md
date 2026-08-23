@@ -370,7 +370,7 @@ either -- this pass wasn't exhaustive.
 - [ ] numbering.py (`Level`/`NumberingDefinition`/`Numbering` reading ported to `docx/numbering.rs`; `apply_markup` still needs the mutable HTML tree — see #130)
 - [x] `settings.py` -> `docx/settings.rs`
 - [ ] styles.py (`PageProperties`/`Style` ported to `docx/styles.rs`; the `Styles` cascade orchestrator still needs `Tables` — see #130)
-- [ ] tables.py (`RowStyle`/`CellStyle`/`TableStyle` ported to `docx/tables.rs`; `Table`/`Tables` still need a mutable tree, both for HTML output and for `handle_merged_cells`'s *source*-tree cell removal — see #130)
+- [ ] tables.py (`RowStyle`/`CellStyle`/`TableStyle` and full `Table`/`Tables` row/cell/paragraph style resolution ported to `docx/tables.rs` — `handle_merged_cells`'s cell removal is a tracked exclusion set, not source-tree mutation; only `apply_markup` (HTML `<table>` construction) remains, needs `crate::dom` wired into the docx module — see #130)
 - [x] `theme.py` -> `docx/theme.rs`
 - [ ] to_html.py (`docx/to_html.rs` is a provisional sketch, not the port — see #130)
 - [ ] toc.py (needs the mutable HTML tree — see #130)

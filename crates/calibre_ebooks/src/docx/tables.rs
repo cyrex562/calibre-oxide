@@ -1,14 +1,41 @@
 //! Table, row and cell formatting: reading `w:tblPr`/`w:trPr`/`w:tcPr`
-//! into property sets and turning them into CSS.
+//! into property sets and turning them into CSS, plus resolving a
+//! `<w:tbl>`'s full row/cell/paragraph style maps and merged cells
+//! ([`Table`]/[`Tables`]).
 //!
-//! Partial port of `old_src/src/calibre/ebooks/docx/tables.py` — the
-//! `Style`/`RowStyle`/`CellStyle`/`TableStyle` property models only.
-//! `Table`/`Tables` (which build the HTML `<table>` markup and, in
-//! `handle_merged_cells`, remove merged-away `w:tc` elements from the
-//! *source* document tree) are deferred to the same follow-up as
-//! `to_html.rs`'s real port: both need a mutable tree, and the source
-//! tree is currently read-only `roxmltree` just like the HTML side
-//! was before [`crate::dom`]. See issue #130.
+//! Partial port of `old_src/src/calibre/ebooks/docx/tables.py`.
+//! `Table::apply_markup`/`Tables::apply_markup` (which build the actual
+//! HTML `<table>`/`<tr>`/`<td>` markup) are deferred to the same
+//! follow-up as `to_html.rs`'s real port -- they need [`crate::dom`],
+//! which isn't wired into the docx module yet. See issue #130.
+//!
+//! # `handle_merged_cells`: a tracked exclusion set, not tree mutation
+//!
+//! Python's `handle_merged_cells` calls `tc.getparent().remove(tc)` on
+//! the *source* document tree to drop cells absorbed by a `vMerge`/
+//! `hMerge` run. [`Table::removed_cells`] tracks the same set of
+//! excluded `w:tc` nodes without mutating the (still read-only,
+//! `roxmltree`-backed) source tree that every other property-model
+//! reader in this crate depends on.
+//!
+//! This is checked to be behaviorally equivalent to real removal --
+//! **but only downstream of `Table` itself**. Confirmed against
+//! `to_html.py`'s actual pipeline: `Tables.register` (and therefore
+//! `Table::__init__`/`handle_merged_cells`) runs, in full, *before*
+//! the top-level paragraph-to-HTML walk even starts, and the only
+//! source-tree walk over `w:tr`/`w:tc` anywhere outside `tables.py`
+//! itself is `Table.apply_markup`'s own re-walk (which must honour the
+//! exclusion set once ported). Critically, the top-level walk does
+//! **not** check removal status -- Python's own `w:p`/`w:tbl`
+//! descendant search is evaluated eagerly into a list before any
+//! removal happens, so a merged-away cell's paragraph still gets HTML
+//! built and appended as a stray top-level element; only
+//! `apply_markup`'s fresh tree walk (which no longer finds the removed
+//! `w:tc`) fails to ever move it into the table. This is a real,
+//! observable upstream leak (duplicate/orphaned empty paragraphs for
+//! merged-away cells), not a hypothetical -- whoever ports `to_html.rs`
+//! should reproduce it (do **not** gate the top-level walk on
+//! `removed_cells`) rather than silently fix it.
 //!
 //! # Sharing with `block_styles`
 //!
@@ -19,6 +46,26 @@
 //! inventing a parallel border type — [`super::block_styles::Border`],
 //! [`super::block_styles::read_border`] and
 //! [`super::block_styles::border_to_css`] are reused as-is.
+//!
+//! # A narrower `Table::new` signature than Python's
+//!
+//! Python's `Table.__init__(self, namespace, tbl, styles, para_map, ...)`
+//! takes the whole `Styles` collection just to call `styles.get(style_id)`
+//! (a named-style lookup) -- and a shared, mutated-in-place `para_map`
+//! dict threaded through every recursive sub-table construction so
+//! `Tables.para_style`/`run_style` can later find which `Table` owns a
+//! given paragraph. Neither needs the full (not-yet-ported) `Styles`
+//! cascade orchestrator: [`Table::new`] takes `named_styles: &HashMap<String, Style>`
+//! directly (`Styles::id_map`, once that type exists), and
+//! [`Tables::para_style`]/[`Tables::run_style`] are backed by a flat
+//! map [`Tables`] builds itself by copying each registered `Table`'s
+//! (and all its nested sub-tables', recursively) resolved paragraph
+//! styles out -- rather than storing `Table` references in `para_map`,
+//! which Rust's ownership model makes awkward for no behavioral
+//! benefit here (nothing downstream needs the *owning* `Table`, only
+//! the style data it resolved).
+
+use std::collections::{HashMap, HashSet};
 
 use indexmap::IndexMap;
 use roxmltree::Node;
@@ -28,6 +75,7 @@ use super::block_styles::{
 };
 use super::char_styles::RunStyle;
 use super::names::DocxNamespace;
+use super::styles::Style;
 
 const BORDER_EDGES: [Edge; 6] = Edge::ALL_TABLE;
 
@@ -638,6 +686,18 @@ impl TableStyle {
         self.bidi = Some(true);
     }
 
+    /// The cell-padding fallback [`Table::resolve_cell_style`] uses
+    /// when a cell doesn't specify its own.
+    fn cell_padding(&self, edge: Edge) -> &Option<String> {
+        match edge {
+            Edge::Left => &self.cell_padding_left,
+            Edge::Top => &self.cell_padding_top,
+            Edge::Right => &self.cell_padding_right,
+            Edge::Bottom => &self.cell_padding_bottom,
+            Edge::Between | Edge::InsideH | Edge::InsideV => &None,
+        }
+    }
+
     /// Port of the Python `TableStyle.update`.
     pub fn update(&mut self, other: &TableStyle) {
         macro_rules! overlay {
@@ -811,6 +871,504 @@ impl TableStyle {
         }
         c.extend(convert_border_css(&self.borders, self.bidi == Some(true)));
         c
+    }
+}
+
+/// A `<w:tbl>`'s resolved row/cell/paragraph style maps and merged-cell
+/// bookkeeping. See the module docs for what's deferred (`apply_markup`)
+/// and how merged-cell removal is represented here.
+///
+/// Port of the Python `Table`.
+#[derive(Debug, Clone)]
+pub struct Table<'a, 'i> {
+    pub tbl: Node<'a, 'i>,
+    pub is_sub_table: bool,
+    pub table_style: TableStyle,
+    pub paragraph_style: Option<ParagraphStyle>,
+    pub run_style: Option<RunStyle>,
+    overrides: IndexMap<String, TableStyleOverride>,
+    pub style_map_row: HashMap<Node<'a, 'i>, RowStyle>,
+    pub style_map_cell: HashMap<Node<'a, 'i>, CellStyle>,
+    pub style_map_para: HashMap<Node<'a, 'i>, (Option<ParagraphStyle>, Option<RunStyle>)>,
+    pub paragraphs: Vec<Node<'a, 'i>>,
+    pub cell_map: Vec<Vec<Node<'a, 'i>>>,
+    pub sub_tables: HashMap<Node<'a, 'i>, Table<'a, 'i>>,
+    /// `w:tc` nodes absorbed by a `vMerge`/`hMerge` run -- see the
+    /// module docs' "tracked exclusion set, not tree mutation" section.
+    pub removed_cells: HashSet<Node<'a, 'i>>,
+}
+
+impl<'a, 'i> Table<'a, 'i> {
+    /// Port of `Table(namespace, tbl, styles, para_map, is_sub_table)`.
+    /// See the module docs for why this takes `named_styles` directly
+    /// rather than the whole (not yet ported) `Styles` collection, and
+    /// why there is no `para_map` parameter.
+    pub fn new(
+        tbl: Node<'a, 'i>,
+        named_styles: &HashMap<String, Style>,
+        ns: &DocxNamespace,
+        is_sub_table: bool,
+    ) -> Table<'a, 'i> {
+        let mut table_style = TableStyle::new();
+        let mut paragraph_style: Option<ParagraphStyle> = None;
+        let mut run_style: Option<RunStyle> = None;
+
+        for tblpr in ns.children(tbl, &["w:tblPr"]) {
+            for ts in ns.children(tblpr, &["w:tblStyle"]) {
+                if let Some(style_id) = ns.get(ts, "w:val") {
+                    if let Some(s) = named_styles.get(style_id) {
+                        if let Some(t) = &s.table_style {
+                            table_style.update(t);
+                        }
+                        if let Some(p) = &s.paragraph_style {
+                            match &mut paragraph_style {
+                                None => paragraph_style = Some(p.clone()),
+                                Some(existing) => existing.update(p),
+                            }
+                        }
+                        if let Some(c) = &s.character_style {
+                            match &mut run_style {
+                                None => run_style = Some(c.clone()),
+                                Some(existing) => existing.update(c),
+                            }
+                        }
+                    }
+                }
+            }
+            table_style.update(&TableStyle::from_tblpr(tblpr, ns));
+        }
+
+        let overrides = table_style.overrides.clone().unwrap_or_default();
+        if let Some(whole) = overrides.get("wholeTable") {
+            if let Some(t) = whole.table.clone() {
+                table_style.update(&t);
+            }
+        }
+
+        let mut table = Table {
+            tbl,
+            is_sub_table,
+            table_style,
+            paragraph_style,
+            run_style,
+            overrides,
+            style_map_row: HashMap::new(),
+            style_map_cell: HashMap::new(),
+            style_map_para: HashMap::new(),
+            paragraphs: Vec::new(),
+            cell_map: Vec::new(),
+            sub_tables: HashMap::new(),
+            removed_cells: HashSet::new(),
+        };
+
+        let rows = ns.children(tbl, &["w:tr"]);
+        let num_rows = rows.len();
+        for (r, &tr) in rows.iter().enumerate() {
+            let row_overrides = table.get_overrides(r, None, num_rows, None);
+            table.resolve_row_style(tr, &row_overrides, ns);
+            let cells = ns.children(tr, &["w:tc"]);
+            let num_cols = cells.len();
+            let mut row_cells = Vec::new();
+            for (c, &tc) in cells.iter().enumerate() {
+                let cell_overrides = table.get_overrides(r, Some(c), num_rows, Some(num_cols));
+                table.resolve_cell_style(tc, &cell_overrides, r, c, num_rows, num_cols, ns);
+                row_cells.push(tc);
+                for p in ns.children(tc, &["w:p"]) {
+                    table.paragraphs.push(p);
+                    table.resolve_para_style(p, &cell_overrides);
+                }
+            }
+            table.cell_map.push(row_cells);
+        }
+
+        table.handle_merged_cells();
+
+        // Port of `./w:tr/w:tc/w:tbl` -- direct nested tables only, one
+        // level relative to `tbl`. Deliberately not a full descendant
+        // search: a table nested two or more levels deep is not in
+        // *this* table's `sub_tables` (Python's own XPath scope is the
+        // same one level), only in its immediate parent's -- see
+        // `Tables::register`'s docs for why that matters.
+        for &tr in &rows {
+            for tc in ns.children(tr, &["w:tc"]) {
+                for sub_tbl in ns.children(tc, &["w:tbl"]) {
+                    let sub = Table::new(sub_tbl, named_styles, ns, true);
+                    table.sub_tables.insert(sub_tbl, sub);
+                }
+            }
+        }
+
+        table
+    }
+
+    fn bidi(&self) -> bool {
+        self.table_style.bidi == Some(true)
+    }
+
+    /// Port of the Python `Table.override_allowed`.
+    fn override_allowed(&self, name: &str) -> bool {
+        if name.ends_with("Cell") || name == "wholeTable" {
+            return true;
+        }
+        let look = self.table_style.look;
+        if (look & 0x0020 != 0 && name == "firstRow")
+            || (look & 0x0040 != 0 && name == "lastRow")
+            || (look & 0x0080 != 0 && name == "firstCol")
+            || (look & 0x0100 != 0 && name == "lastCol")
+        {
+            return true;
+        }
+        if let Some(suffix) = name.strip_prefix("band") {
+            if suffix.ends_with("Horz") {
+                return look & 0x0200 == 0;
+            }
+            if suffix.ends_with("Vert") {
+                return look & 0x0400 == 0;
+            }
+        }
+        false
+    }
+
+    /// Port of the Python `Table.get_overrides`.
+    fn get_overrides(
+        &self,
+        r: usize,
+        c: Option<usize>,
+        num_of_rows: usize,
+        num_of_cols_in_row: Option<usize>,
+    ) -> Vec<String> {
+        // Python's `(m - (m % n)) // n` is plain floor division for
+        // the non-negative operands real documents produce; guarded
+        // against a malformed `band_size` of 0 (which Python would
+        // raise `ZeroDivisionError` on) rather than reproduced, since
+        // that's an input-validation concern, not an author-intended
+        // quirk.
+        fn divisor(m: usize, n: i64) -> i64 {
+            m as i64 / n.max(1)
+        }
+
+        let mut overrides = vec!["wholeTable".to_string()];
+        if let Some(c) = c {
+            let odd_column_band = divisor(c, self.table_style.col_band_size) % 2 == 1;
+            overrides.push(format!("band{}Vert", if odd_column_band { 1 } else { 2 }));
+        }
+        let odd_row_band = divisor(r, self.table_style.row_band_size) % 2 == 1;
+        overrides.push(format!("band{}Horz", if odd_row_band { 1 } else { 2 }));
+
+        if let Some(c) = c {
+            if c == 0 {
+                overrides.push("firstCol".to_string());
+            }
+            if let Some(n) = num_of_cols_in_row {
+                if c + 1 >= n {
+                    overrides.push("lastCol".to_string());
+                }
+            }
+        }
+        if r == 0 {
+            overrides.push("firstRow".to_string());
+        }
+        if r + 1 >= num_of_rows {
+            overrides.push("lastRow".to_string());
+        }
+        if let Some(c) = c {
+            if r == 0 {
+                if c == 0 {
+                    overrides.push("nwCell".to_string());
+                }
+                if num_of_cols_in_row == Some(c + 1) {
+                    overrides.push("neCell".to_string());
+                }
+            }
+            if r + 1 == num_of_rows {
+                if c == 0 {
+                    overrides.push("swCell".to_string());
+                }
+                if num_of_cols_in_row == Some(c + 1) {
+                    overrides.push("seCell".to_string());
+                }
+            }
+        }
+
+        overrides
+            .into_iter()
+            .filter(|o| self.override_allowed(o))
+            .collect()
+    }
+
+    /// Port of the Python `Table.resolve_row_style`.
+    fn resolve_row_style(&mut self, tr: Node<'a, 'i>, overrides: &[String], ns: &DocxNamespace) {
+        let mut rs = RowStyle::new();
+        for o in overrides {
+            if let Some(ovr) = self.overrides.get(o) {
+                if let Some(ors) = &ovr.row {
+                    rs.update(ors);
+                }
+            }
+        }
+        for trpr in ns.children(tr, &["w:trPr"]) {
+            rs.update(&RowStyle::from_trpr(trpr, ns));
+        }
+        if self.bidi() {
+            rs.apply_bidi();
+        }
+        self.style_map_row.insert(tr, rs);
+    }
+
+    /// Port of the Python `Table.resolve_cell_style`.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_cell_style(
+        &mut self,
+        tc: Node<'a, 'i>,
+        overrides: &[String],
+        row: usize,
+        col: usize,
+        rows: usize,
+        cols_in_row: usize,
+        ns: &DocxNamespace,
+    ) {
+        let mut cs = CellStyle::new();
+        for o in overrides {
+            if let Some(ovr) = self.overrides.get(o) {
+                if let Some(ors) = &ovr.cell {
+                    cs.update(ors);
+                }
+            }
+        }
+        for tcpr in ns.children(tc, &["w:tcPr"]) {
+            cs.update(&CellStyle::from_tcpr(tcpr, ns));
+        }
+
+        for edge in Edge::CSS_EDGES {
+            if cs.cell_padding(edge).is_none() {
+                let fallback = self.table_style.cell_padding(edge).clone();
+                *cs.cell_padding_mut(edge) = fallback;
+            }
+
+            let is_inside_edge = match edge {
+                Edge::Left => col > 0,
+                Edge::Top => row > 0,
+                Edge::Right => col + 1 < cols_in_row,
+                Edge::Bottom => row + 1 < rows,
+                _ => false,
+            };
+            let inside_edge = is_inside_edge.then(|| {
+                if matches!(edge, Edge::Top | Edge::Bottom) {
+                    Edge::InsideH
+                } else {
+                    Edge::InsideV
+                }
+            });
+
+            if cs.borders.edge(edge).color.is_none() {
+                if let Some(inside) = inside_edge {
+                    let v = cs
+                        .borders
+                        .edge(inside)
+                        .color
+                        .clone()
+                        .or_else(|| self.table_style.borders.edge(inside).color.clone());
+                    cs.borders.edge_mut(edge).color = v;
+                }
+            }
+
+            if cs.borders.edge(edge).style.is_none() {
+                if let Some(inside) = inside_edge {
+                    let v = cs
+                        .borders
+                        .edge(inside)
+                        .style
+                        .clone()
+                        .or_else(|| self.table_style.borders.edge(inside).style.clone());
+                    cs.borders.edge_mut(edge).style = v;
+                }
+            }
+            if !is_inside_edge && cs.borders.edge(edge).style.as_deref() == Some("none") {
+                cs.borders.edge_mut(edge).style = Some("hidden".to_string());
+            }
+
+            if cs.borders.edge(edge).width.is_none() {
+                if let Some(inside) = inside_edge {
+                    let v = cs.borders.edge(inside).width.or(self
+                        .table_style
+                        .borders
+                        .edge(inside)
+                        .width);
+                    cs.borders.edge_mut(edge).width = v;
+                }
+            }
+        }
+
+        if self.bidi() {
+            cs.apply_bidi();
+        }
+        self.style_map_cell.insert(tc, cs);
+    }
+
+    /// Port of the Python `Table.resolve_para_style`.
+    fn resolve_para_style(&mut self, p: Node<'a, 'i>, overrides: &[String]) {
+        let mut para = self.paragraph_style.clone();
+        let mut run = self.run_style.clone();
+        for o in overrides {
+            if let Some(ovr) = self.overrides.get(o) {
+                if let Some(ops) = &ovr.para {
+                    match &mut para {
+                        None => para = Some(ops.clone()),
+                        Some(existing) => existing.update(ops),
+                    }
+                }
+                if let Some(ops) = &ovr.run {
+                    match &mut run {
+                        None => run = Some(ops.clone()),
+                        Some(existing) => existing.update(ops),
+                    }
+                }
+            }
+        }
+        self.style_map_para.insert(p, (para, run));
+    }
+
+    /// Marks cells absorbed by a `vMerge`/`hMerge` run as removed
+    /// (added to [`Table::removed_cells`]) and records `row_span`/
+    /// `col_span` on the surviving cell's [`CellStyle`]. See the
+    /// module docs for why this doesn't mutate the source tree.
+    ///
+    /// Port of the Python `Table.handle_merged_cells`.
+    fn handle_merged_cells(&mut self) {
+        if self.cell_map.is_empty() {
+            return;
+        }
+
+        // Vertical merges (vMerge / row_span), column by column.
+        let max_col_num = self.cell_map.iter().map(|r| r.len()).max().unwrap_or(0);
+        for c in 0..max_col_num {
+            let cells: Vec<Option<Node<'a, 'i>>> = self
+                .cell_map
+                .iter()
+                .map(|row| row.get(c).copied())
+                .collect();
+            let mut runs: Vec<Vec<Node<'a, 'i>>> = vec![Vec::new()];
+            for cell in cells {
+                let s = cell
+                    .and_then(|c| self.style_map_cell.get(&c))
+                    .cloned()
+                    .unwrap_or_default();
+                match (cell, s.v_merge.as_deref()) {
+                    (Some(c), Some("restart")) => runs.push(vec![c]),
+                    (Some(c), Some("continue")) => {
+                        if let Some(last) = runs.last_mut() {
+                            last.push(c);
+                        }
+                    }
+                    _ => runs.push(Vec::new()),
+                }
+            }
+            self.commit_merge_run(runs, |cs, len| cs.row_span = Some(len));
+        }
+
+        // Horizontal merges (hMerge / col_span), row by row.
+        for cells in self.cell_map.clone() {
+            let mut runs: Vec<Vec<Node<'a, 'i>>> = vec![Vec::new()];
+            for cell in cells {
+                let s = self.style_map_cell.get(&cell).cloned().unwrap_or_default();
+                if s.col_span.is_some() {
+                    runs.push(Vec::new());
+                    continue;
+                }
+                match s.h_merge.as_deref() {
+                    Some("restart") => runs.push(vec![cell]),
+                    Some("continue") => {
+                        if let Some(last) = runs.last_mut() {
+                            last.push(cell);
+                        }
+                    }
+                    _ => runs.push(Vec::new()),
+                }
+            }
+            self.commit_merge_run(runs, |cs, len| cs.col_span = Some(len));
+        }
+    }
+
+    fn commit_merge_run(
+        &mut self,
+        runs: Vec<Vec<Node<'a, 'i>>>,
+        set_span: impl Fn(&mut CellStyle, i64),
+    ) {
+        for run in runs {
+            if run.len() > 1 {
+                if let Some(&head) = run.first() {
+                    if let Some(cs) = self.style_map_cell.get_mut(&head) {
+                        set_span(cs, run.len() as i64);
+                    }
+                }
+                for &tc in &run[1..] {
+                    self.removed_cells.insert(tc);
+                }
+            }
+        }
+    }
+}
+
+/// Every table in a document, plus a flattened paragraph-style lookup
+/// across all of them (including nested sub-tables) for
+/// `Styles::resolve_paragraph`/`resolve_run` (not yet ported) to
+/// consult.
+///
+/// Port of the Python `Tables` -- reading (`register`) and the two
+/// style lookups only; `apply_markup` is deferred (see the module docs).
+#[derive(Debug, Clone, Default)]
+pub struct Tables<'a, 'i> {
+    pub tables: Vec<Table<'a, 'i>>,
+    para_styles: HashMap<Node<'a, 'i>, (Option<ParagraphStyle>, Option<RunStyle>)>,
+    /// Every `w:tbl` node that is a *direct* sub-table (one level, see
+    /// [`Table::new`]'s docs) of some already-registered table, so a
+    /// caller's own top-level `w:tbl` walk doesn't double-register it.
+    sub_table_nodes: HashSet<Node<'a, 'i>>,
+}
+
+impl<'a, 'i> Tables<'a, 'i> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Port of the Python `Tables.register`.
+    pub fn register(
+        &mut self,
+        tbl: Node<'a, 'i>,
+        named_styles: &HashMap<String, Style>,
+        ns: &DocxNamespace,
+    ) {
+        if self.sub_table_nodes.contains(&tbl) {
+            return;
+        }
+        let table = Table::new(tbl, named_styles, ns, false);
+        self.collect_para_styles(&table);
+        for &sub in table.sub_tables.keys() {
+            self.sub_table_nodes.insert(sub);
+        }
+        self.tables.push(table);
+    }
+
+    /// Recursively (all nesting depths, unlike [`Table::sub_tables`]'s
+    /// own one-level-deep XPath scope) copies each table's resolved
+    /// paragraph styles into the flat [`Tables::para_styles`] map.
+    fn collect_para_styles(&mut self, table: &Table<'a, 'i>) {
+        for (&p, styles) in &table.style_map_para {
+            self.para_styles.insert(p, styles.clone());
+        }
+        for sub in table.sub_tables.values() {
+            self.collect_para_styles(sub);
+        }
+    }
+
+    /// Port of the Python `Tables.para_style`.
+    pub fn para_style(&self, p: Node<'a, 'i>) -> Option<&ParagraphStyle> {
+        self.para_styles.get(&p)?.0.as_ref()
+    }
+
+    /// Port of the Python `Tables.run_style`.
+    pub fn run_style(&self, p: Node<'a, 'i>) -> Option<&RunStyle> {
+        self.para_styles.get(&p)?.1.as_ref()
     }
 }
 
@@ -993,5 +1551,219 @@ mod tests {
             .expect("firstRow override present");
         let cell = first_row.cell.as_ref().expect("tcPr override present");
         assert_eq!(cell.background_color.as_deref(), Some("#FF0000"));
+    }
+
+    fn parse_tbl(body: &str) -> (Document<'static>, DocxNamespace) {
+        parse("w:tbl", body)
+    }
+
+    fn simple_2x2_table() -> &'static str {
+        r#"<w:tr><w:tc><w:p/></w:tc><w:tc><w:p/></w:tc></w:tr>
+           <w:tr><w:tc><w:p/></w:tc><w:tc><w:p/></w:tc></w:tr>"#
+    }
+
+    #[test]
+    fn table_construction_populates_cell_map_and_style_maps() {
+        let (doc, ns) = parse_tbl(simple_2x2_table());
+        let table = Table::new(doc.root_element(), &HashMap::new(), &ns, false);
+        assert_eq!(table.cell_map.len(), 2, "two rows");
+        assert_eq!(table.cell_map[0].len(), 2, "two cells per row");
+        assert_eq!(table.paragraphs.len(), 4, "one paragraph per cell");
+        assert_eq!(table.style_map_row.len(), 2);
+        assert_eq!(table.style_map_cell.len(), 4);
+        assert_eq!(table.style_map_para.len(), 4);
+        assert!(table.sub_tables.is_empty());
+        assert!(table.removed_cells.is_empty());
+    }
+
+    #[test]
+    fn table_style_is_read_from_a_named_style_and_direct_formatting() {
+        let (doc, ns) = parse_tbl(
+            r#"<w:tblPr><w:tblStyle w:val="MyTable"/><w:tblW w:w="5000" w:type="pct"/></w:tblPr>
+               <w:tr><w:tc><w:p/></w:tc></w:tr>"#,
+        );
+        let mut named_styles = HashMap::new();
+        let mut style = Style::default();
+        style.table_style = Some({
+            let mut ts = TableStyle::new();
+            ts.background_color = Some("#00ff00".to_string());
+            ts
+        });
+        named_styles.insert("MyTable".to_string(), style);
+
+        let table = Table::new(doc.root_element(), &named_styles, &ns, false);
+        assert_eq!(
+            table.table_style.background_color.as_deref(),
+            Some("#00ff00"),
+            "inherited from the named style"
+        );
+        assert_eq!(
+            table.table_style.width.as_deref(),
+            Some("100%"),
+            "direct tblW overlays on top of the named style"
+        );
+    }
+
+    #[test]
+    fn get_overrides_flags_corners_and_edges_on_a_2x2_table() {
+        let (doc, ns) = parse_tbl(simple_2x2_table());
+        let table = Table::new(doc.root_element(), &HashMap::new(), &ns, false);
+        // Every band/look bit is off by default, so `override_allowed`
+        // only lets through "*Cell"/"wholeTable" names -- band overrides
+        // never survive the filter under default `look`.
+        let nw = table.get_overrides(0, Some(0), 2, Some(2));
+        assert!(nw.contains(&"wholeTable".to_string()));
+        assert!(nw.contains(&"nwCell".to_string()));
+        let se = table.get_overrides(1, Some(1), 2, Some(2));
+        assert!(se.contains(&"seCell".to_string()));
+    }
+
+    #[test]
+    fn override_allowed_respects_the_tbl_look_bitmask() {
+        let (doc, ns) = parse_tbl(
+            r#"<w:tblPr><w:tblLook w:val="0020"/></w:tblPr><w:tr><w:tc><w:p/></w:tc></w:tr>"#,
+        );
+        let table = Table::new(doc.root_element(), &HashMap::new(), &ns, false);
+        assert!(table.override_allowed("firstRow"), "0x0020 allows firstRow");
+        assert!(!table.override_allowed("lastRow"), "0x0040 not set");
+    }
+
+    #[test]
+    fn cell_style_inherits_padding_from_the_table_style() {
+        let (doc, ns) = parse_tbl(
+            r#"<w:tblPr><w:tblCellMar><w:left w:w="200" w:type="dxa"/></w:tblCellMar></w:tblPr>
+               <w:tr><w:tc><w:p/></w:tc></w:tr>"#,
+        );
+        let table = Table::new(doc.root_element(), &HashMap::new(), &ns, false);
+        let tc = table.cell_map[0][0];
+        let cs = &table.style_map_cell[&tc];
+        assert_eq!(
+            cs.css().get("padding-left").map(String::as_str),
+            Some("10pt"),
+            "cell has no cellMar of its own, falls back to the table's"
+        );
+    }
+
+    #[test]
+    fn cell_border_falls_back_to_the_inside_edge_then_to_hidden() {
+        // A 1x2 row: the second cell's left edge is an inside edge
+        // (col > 0), so with no explicit border anywhere it should
+        // fall back through insideV -- which is also unset here, so it
+        // stays unset (not "none"->"hidden", since that swap is only
+        // for the *outer* edges).
+        let (doc, ns) = parse_tbl(
+            r#"<w:tr><w:tc><w:p/></w:tc><w:tc><w:tcPr><w:tcBorders><w:left w:val="none"/></w:tcBorders></w:tcPr><w:p/></w:tc></w:tr>"#,
+        );
+        let table = Table::new(doc.root_element(), &HashMap::new(), &ns, false);
+        let second_tc = table.cell_map[0][1];
+        let cs = &table.style_map_cell[&second_tc];
+        assert_eq!(
+            cs.borders.left.style.as_deref(),
+            Some("none"),
+            "an inside edge keeps a literal none rather than becoming hidden"
+        );
+
+        // The *first* cell's left edge is an outer edge (col == 0); an
+        // explicit "none" there does become "hidden".
+        let (doc2, ns2) = parse_tbl(
+            r#"<w:tr><w:tc><w:tcPr><w:tcBorders><w:left w:val="none"/></w:tcBorders></w:tcPr><w:p/></w:tc></w:tr>"#,
+        );
+        let table2 = Table::new(doc2.root_element(), &HashMap::new(), &ns2, false);
+        let first_tc = table2.cell_map[0][0];
+        let cs2 = &table2.style_map_cell[&first_tc];
+        assert_eq!(cs2.borders.left.style.as_deref(), Some("hidden"));
+    }
+
+    #[test]
+    fn vertical_merge_sets_row_span_and_marks_continuations_removed() {
+        let (doc, ns) = parse_tbl(
+            r#"<w:tr><w:tc><w:tcPr><w:vMerge w:val="restart"/></w:tcPr><w:p/></w:tc></w:tr>
+               <w:tr><w:tc><w:tcPr><w:vMerge w:val="continue"/></w:tcPr><w:p/></w:tc></w:tr>
+               <w:tr><w:tc><w:tcPr><w:vMerge w:val="continue"/></w:tcPr><w:p/></w:tc></w:tr>"#,
+        );
+        let table = Table::new(doc.root_element(), &HashMap::new(), &ns, false);
+        let head = table.cell_map[0][0];
+        let cont1 = table.cell_map[1][0];
+        let cont2 = table.cell_map[2][0];
+        assert_eq!(table.style_map_cell[&head].row_span, Some(3));
+        assert!(table.removed_cells.contains(&cont1));
+        assert!(table.removed_cells.contains(&cont2));
+        assert!(!table.removed_cells.contains(&head));
+    }
+
+    #[test]
+    fn horizontal_merge_sets_col_span_and_marks_continuations_removed() {
+        let (doc, ns) = parse_tbl(
+            r#"<w:tr>
+                <w:tc><w:tcPr><w:hMerge w:val="restart"/></w:tcPr><w:p/></w:tc>
+                <w:tc><w:tcPr><w:hMerge w:val="continue"/></w:tcPr><w:p/></w:tc>
+               </w:tr>"#,
+        );
+        let table = Table::new(doc.root_element(), &HashMap::new(), &ns, false);
+        let head = table.cell_map[0][0];
+        let cont = table.cell_map[0][1];
+        assert_eq!(table.style_map_cell[&head].col_span, Some(2));
+        assert!(table.removed_cells.contains(&cont));
+    }
+
+    #[test]
+    fn a_cell_with_its_own_grid_span_is_never_treated_as_an_hmerge_continuation() {
+        let (doc, ns) = parse_tbl(
+            r#"<w:tr>
+                <w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr><w:p/></w:tc>
+                <w:tc><w:tcPr><w:hMerge w:val="continue"/></w:tcPr><w:p/></w:tc>
+               </w:tr>"#,
+        );
+        let table = Table::new(doc.root_element(), &HashMap::new(), &ns, false);
+        let second = table.cell_map[0][1];
+        // The gridSpan cell breaks the run, so the lone "continue" cell
+        // starts (and immediately ends) its own single-element run,
+        // which is never long enough to be marked removed.
+        assert!(!table.removed_cells.contains(&second));
+    }
+
+    #[test]
+    fn nested_table_is_ported_as_a_one_level_deep_sub_table() {
+        let (doc, ns) = parse_tbl(
+            r#"<w:tr><w:tc>
+                <w:p/>
+                <w:tbl><w:tr><w:tc><w:p/></w:tc></w:tr></w:tbl>
+               </w:tc></w:tr>"#,
+        );
+        let table = Table::new(doc.root_element(), &HashMap::new(), &ns, false);
+        assert_eq!(table.sub_tables.len(), 1);
+        // The outer table's own paragraph collection only looks at
+        // `./w:tc/w:p` (direct children), so the nested tbl's paragraph
+        // is not double-counted here.
+        assert_eq!(table.paragraphs.len(), 1);
+    }
+
+    #[test]
+    fn tables_register_flattens_para_styles_across_sub_tables_and_skips_double_registration() {
+        let (doc, ns) = parse_tbl(
+            r#"<w:tr><w:tc>
+                <w:tbl><w:tr><w:tc><w:p/></w:tc></w:tr></w:tbl>
+               </w:tc></w:tr>"#,
+        );
+        let mut tables = Tables::new();
+        tables.register(doc.root_element(), &HashMap::new(), &ns);
+        assert_eq!(tables.tables.len(), 1);
+
+        let outer = &tables.tables[0];
+        let (&sub_tbl_node, sub_table) = outer.sub_tables.iter().next().unwrap();
+        let inner_p = sub_table.paragraphs[0];
+        assert!(
+            tables.para_styles.contains_key(&inner_p),
+            "sub-table paragraphs are collected recursively into the flat lookup"
+        );
+
+        // Registering the nested tbl node directly (as a caller's own
+        // top-level `w:tbl` walk would also encounter it) is a no-op.
+        tables.register(sub_tbl_node, &HashMap::new(), &ns);
+        assert_eq!(
+            tables.tables.len(),
+            1,
+            "already a sub-table, not re-registered"
+        );
     }
 }

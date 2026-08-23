@@ -21,17 +21,24 @@
 //! | `tables.py` (partial) | [`tables`] |
 //! | `styles.py` (partial) | [`styles`] |
 //!
-//! The three "partial" rows above port the property-model classes
-//! only (`Level`/`NumberingDefinition`/`Numbering`'s reading half,
-//! `RowStyle`/`CellStyle`/`TableStyle`, `PageProperties`/`Style`).
-//! Their tree-mutating orchestrators (`Numbering::apply_markup`,
-//! `Table`/`Tables`, `Styles`) and `fonts.py`, `images.py`,
-//! `fields.py`, `index.py`, `toc.py`, `cleanup.py` and a real
-//! `to_html.py` are tracked separately in issue #130 -- they build
-//! and mutate an HTML element tree ([`crate::dom`] as of that issue),
-//! and (for `Table`'s merged-cell handling, `fields.py`, `index.py`)
-//! a mutable *source*-document tree the DOCX side doesn't have yet
-//! either.
+//! The three "partial" rows above port everything except HTML-markup
+//! construction: `numbering.rs` has `Level`/`NumberingDefinition`/
+//! `Numbering`'s full reading half (not `apply_markup`); `tables.rs`
+//! has `RowStyle`/`CellStyle`/`TableStyle` *and* the full `Table`/
+//! `Tables` row/cell/paragraph style resolution and merged-cell
+//! bookkeeping (not `apply_markup`) -- merged-cell removal is a
+//! tracked exclusion set rather than source-tree mutation, see
+//! `tables`'s module docs; `styles.rs` has `PageProperties`/`Style`
+//! only, since the `Styles` cascade orchestrator needs `Tables` (now
+//! available) *and* `Numbering` wired together, not yet done.
+//! `Numbering::apply_markup`, `Table`/`Tables::apply_markup`, `Styles`,
+//! and `fonts.py`, `images.py`, `fields.py`, `index.py`, `toc.py`,
+//! `cleanup.py` and a real `to_html.py` are tracked separately in
+//! issue #130 -- they build and mutate an HTML element tree
+//! ([`crate::dom`] as of that issue), and (for `fields.py`/`index.py`'s
+//! synthetic-element insertion) a mutable *source*-document tree
+//! ([`crate::xmltree`], relocated for this reason but not yet wired
+//! into the docx module).
 //!
 //! The output half of the module — `writer/` — is issue #23 and lives
 //! in [`writer`].
