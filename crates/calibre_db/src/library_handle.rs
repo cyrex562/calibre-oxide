@@ -246,10 +246,14 @@
 //!   for resume before erroring; `check_open` returns `Err(Suspended)`
 //!   immediately instead, same as it already did for `Detached`. A
 //!   real, separable follow-up -- see `power_monitor.rs`'s module doc.
-//! - **No WAL checkpoint on suspend** -- `LibraryHandle` has no
-//!   connection to the SQLite database at all (`Backend`/`Cache` are
-//!   entirely separate types in this crate); `prepare_for_suspend`
-//!   does what it actually owns. See `power_monitor.rs`'s module doc.
+//! - **WAL checkpoint on suspend -- real, as of issue #260.**
+//!   `prepare_for_suspend` calls [`checkpoint_wal_best_effort`], which
+//!   opens its own short-lived connection to `metadata.db` and each
+//!   sidecar database purely to checkpoint it -- no connection to a
+//!   live `Backend`/`Cache` needed at all, since SQLite lets any
+//!   connection to a database file request its WAL be checkpointed.
+//!   See `power_monitor.rs`'s module doc and [`checkpoint_wal_best_effort`]'s
+//!   own doc for the full reasoning.
 //!
 //! # Not done yet (disclosed, tracked as later work)
 //!
@@ -325,6 +329,7 @@
 //!   plausible-looking but unverified FFI, both fall back to a
 //!   disclosed, conservative default.
 
+use rusqlite::Connection as SqliteConnection;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -334,7 +339,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::constants::{
-    JOURNAL_CHECKPOINT_FILE_NAME, JOURNAL_DIR_NAME, LIBRARY_HANDLE_DIR_NAME, LIBRARY_ID_FILE_NAME,
+    CHECKSUMS_DB_NAME, FTS_DB_NAME, JOURNAL_CHECKPOINT_FILE_NAME, JOURNAL_DIR_NAME,
+    LIBRARY_HANDLE_DIR_NAME, LIBRARY_ID_FILE_NAME, NOTES_DB_NAME, NOTES_DIR_NAME,
     WRITER_LOCK_FILE_NAME,
 };
 
@@ -923,12 +929,19 @@ impl Shared {
         Ok(())
     }
 
-    /// Port of §5 step 1's "releases exclusive file locks" and "moves
-    /// to `Suspended`", plus what it can of "flushes pending writes...
-    /// fsyncs parent directories" -- see `power_monitor.rs`'s module
-    /// doc for the WAL-checkpoint piece this can't do (this type has
-    /// no connection to the SQLite database at all).
+    /// Port of §5 step 1's "flushes pending writes, checkpoints WAL,
+    /// fsyncs parent directories, releases exclusive file locks" --
+    /// real, all of it, as of issue #260. The WAL checkpoint doesn't
+    /// need `Shared` to hold or know about any live `Backend`
+    /// connection: SQLite lets *any* connection to a database file
+    /// request `wal_checkpoint(TRUNCATE)` on it, so this just opens
+    /// its own short-lived connection to `metadata.db` and each
+    /// sidecar database purely to issue the checkpoint, then closes
+    /// it -- see [`checkpoint_wal_best_effort`]'s doc for exactly why
+    /// that sidesteps the "multiple independent `Backend` instances"
+    /// complexity a registry-based design would have needed.
     pub(crate) fn prepare_for_suspend(&self) {
+        checkpoint_wal_best_effort(&self.library_path);
         fsync_dir(Some(&self.journal_dir)).ok();
         *self.lock_file.lock().unwrap() = None; // drop -> releases the OS lock
         self.set_state(HandleState::Suspended);
@@ -993,6 +1006,41 @@ impl Shared {
             Err(_) => {
                 self.set_state(HandleState::Detached);
             }
+        }
+    }
+}
+
+/// §5 step 1's WAL-checkpoint half (issue #260): opens a short-lived
+/// connection to `metadata.db` and each real sidecar database
+/// (`checksums.db`, `notes.db`, `full-text-search.db`) purely to issue
+/// `PRAGMA wal_checkpoint(TRUNCATE)`, then closes it. Deliberately
+/// doesn't reuse or reach into any `Backend`'s own live connection --
+/// SQLite lets *any* connection to a database file request a
+/// checkpoint on it, so `Shared` doesn't need a registry of whichever
+/// `Backend` instances happen to be open right now (a library can
+/// have several, independently, per the crate-wide retrofit's opt-in-
+/// lock design), and doesn't need `Backend`/`Cache` to know about
+/// `LibraryHandle` at all to make this work. Best-effort throughout --
+/// a missing sidecar (never created yet) or a checkpoint that can't
+/// fully complete (e.g. another connection has an open read
+/// transaction, so SQLite can't `TRUNCATE` the WAL file down to
+/// nothing) is not an error; §5 step 1 is "flush what you can before
+/// suspending", not a hard precondition for suspending at all.
+fn checkpoint_wal_best_effort(library_path: &Path) {
+    let candidates = [
+        library_path.join("metadata.db"),
+        library_path
+            .join(LIBRARY_HANDLE_DIR_NAME)
+            .join(CHECKSUMS_DB_NAME),
+        library_path.join(NOTES_DIR_NAME).join(NOTES_DB_NAME),
+        library_path.join(FTS_DB_NAME),
+    ];
+    for db_path in candidates {
+        if !db_path.exists() {
+            continue;
+        }
+        if let Ok(conn) = SqliteConnection::open(&db_path) {
+            let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
         }
     }
 }

@@ -4,6 +4,9 @@ pub const DEFAULT_TRASH_EXPIRY_TIME_SECONDS: u64 = 14 * 86400;
 pub const TRASH_DIR_NAME: &str = ".caltrash";
 pub const NOTES_DIR_NAME: &str = ".calnotes";
 pub const NOTES_DB_NAME: &str = "notes.db";
+/// Sibling of `metadata.db`, directly under the library root (not
+/// under `.calibre-oxide/` or `.calnotes/` like the other sidecars).
+pub const FTS_DB_NAME: &str = "full-text-search.db";
 /// Port of `docs/FAULT_TOLERANCE.md`'s `<library>/.calibre-oxide/`
 /// convention (issue #93) -- home for [`crate::library_handle::LibraryHandle`]'s
 /// writer lock and write-ahead journal.

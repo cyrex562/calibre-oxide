@@ -57,15 +57,22 @@
 //!
 //! # Disclosed simplifications
 //!
-//! - **No WAL checkpoint on suspend.** §5 step 1 also asks for
-//!   "flushes pending writes, checkpoints WAL" -- `LibraryHandle` has
-//!   no connection to the SQLite database at all (that's `Backend`/
-//!   `Cache`, entirely separate types in this crate, per the
-//!   still-open "crate-wide retrofit" item). `Shared::prepare_for_suspend`
-//!   does what it actually owns: fsyncs the journal directory and
-//!   releases the writer lock. Real WAL checkpointing on suspend needs
-//!   `LibraryHandle` and `Backend` to be wired together, which they
-//!   aren't yet.
+//! - **WAL checkpoint on suspend -- real, as of issue #260.** §5 step
+//!   1's "flushes pending writes, checkpoints WAL" is now real:
+//!   `Shared::prepare_for_suspend` calls
+//!   `crate::library_handle::checkpoint_wal_best_effort`, which opens
+//!   its own short-lived connection to `metadata.db` and each sidecar
+//!   database purely to issue `PRAGMA wal_checkpoint(TRUNCATE)` --
+//!   `LibraryHandle` doesn't need a connection to any live `Backend`
+//!   to do this (SQLite lets *any* connection checkpoint a database
+//!   file's WAL, not just the one that wrote to it), which sidesteps
+//!   the "multiple independent `Backend` instances can be open on one
+//!   library at once" complexity a design needing `LibraryHandle` to
+//!   track live `Backend`s would have had. Best-effort: a missing
+//!   sidecar or a checkpoint that can't fully `TRUNCATE` (e.g.
+//!   something else has an open read transaction) isn't an error --
+//!   §5 step 1 is "flush what you can", not a hard precondition for
+//!   suspending.
 //! - **No §5 step 2 blocking-with-timeout semantics.** The design doc
 //!   asks for calls made while `Suspended` to block for up to 30s
 //!   waiting for resume before erroring; this crate's `check_open`
@@ -202,6 +209,34 @@ mod tests {
         let lock_path = dir.path().join(".calibre-oxide").join("writer.lock");
         let f = fs::OpenOptions::new().write(true).open(&lock_path).unwrap();
         assert!(f.try_lock().is_ok());
+    }
+
+    #[test]
+    fn prepare_for_suspend_really_checkpoints_the_wal() {
+        // docs/FAULT_TOLERANCE.md §5 step 1 (issue #260): real, not
+        // just documented -- a real `metadata.db` (WAL mode as of
+        // issue #260's other half) has real pending WAL content from
+        // its own schema creation; `PRAGMA wal_checkpoint(TRUNCATE)`
+        // truncates the `-wal` file to zero bytes on a full,
+        // uncontended checkpoint, which is a strong, direct signal a
+        // real checkpoint happened (not just that the call didn't
+        // error).
+        let _flock_test_guard = crate::library_handle::flock_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let _backend = crate::backend::Backend::new(dir.path()).unwrap();
+
+        let wal_path = dir.path().join("metadata.db-wal");
+        assert!(wal_path.exists(), "expected real pending WAL content");
+        assert!(fs::metadata(&wal_path).unwrap().len() > 0);
+
+        let shared = shared_for_test(dir.path());
+        shared.prepare_for_suspend();
+
+        assert_eq!(
+            fs::metadata(&wal_path).unwrap().len(),
+            0,
+            "a full checkpoint should truncate the WAL file"
+        );
     }
 
     #[test]

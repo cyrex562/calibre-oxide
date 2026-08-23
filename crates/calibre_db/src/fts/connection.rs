@@ -49,6 +49,7 @@
 //!   in this crate outside `sqlite_extension`'s tokenizer, which isn't
 //!   wired into the query path here either.
 
+use crate::constants::FTS_DB_NAME;
 use crate::errors::FtsQueryError;
 use rusqlite::{Connection, OptionalExtension, Result as SqlResult};
 use std::collections::HashSet;
@@ -76,7 +77,7 @@ impl FtsConnection {
         let fts_db_path = main_db_path
             .parent()
             .unwrap_or(main_db_path)
-            .join("full-text-search.db");
+            .join(FTS_DB_NAME);
         FtsConnection { conn, fts_db_path }
     }
 
@@ -100,6 +101,11 @@ impl FtsConnection {
                 "ATTACH DATABASE ? AS fts_db",
                 [self.fts_db_path.to_str().unwrap()],
             )?;
+            // docs/FAULT_TOLERANCE.md §3 (issue #260): each attached
+            // sidecar database needs its own journal_mode/synchronous
+            // pragma -- unqualified PRAGMA journal_mode only applies
+            // to `main`, not to an ATTACHed schema.
+            conn.execute_batch("PRAGMA fts_db.journal_mode=WAL; PRAGMA fts_db.synchronous=FULL;")?;
 
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS fts_db.dirtied_formats (

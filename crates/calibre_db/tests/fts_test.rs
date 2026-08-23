@@ -9,6 +9,26 @@ fn add_text(fts: &FtsConnection, book_id: i32, fmt: &str, text: &str) {
 }
 
 #[test]
+fn fts_db_is_attached_in_wal_mode_with_synchronous_full() {
+    // docs/FAULT_TOLERANCE.md §3 (issue #260): real, not just
+    // documented -- query the pragmas back from the live connection.
+    let dir = tempdir().unwrap();
+    let backend = Backend::new(dir.path()).unwrap();
+    let fts = FtsConnection::new(backend.conn.clone(), &backend.db_path);
+    fts.initialize().expect("Failed to initialize FTS");
+
+    let conn = backend.conn.lock().unwrap();
+    let journal_mode: String = conn
+        .query_row("PRAGMA fts_db.journal_mode", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(journal_mode.to_lowercase(), "wal");
+    let synchronous: i64 = conn
+        .query_row("PRAGMA fts_db.synchronous", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(synchronous, 2);
+}
+
+#[test]
 fn test_fts_basic_flow() {
     let dir = tempdir().unwrap();
     let backend = Backend::new(dir.path()).unwrap();
