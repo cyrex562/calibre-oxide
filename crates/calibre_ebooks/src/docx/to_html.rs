@@ -11,19 +11,23 @@
 //! itself: `images.py`, `fields.py`, `toc.py`, `cleanup.py`) is ready
 //! to replace it wholesale.
 //!
-//! [`convert_run`], [`convert_p`] and [`read_page_properties`] are the
-//! real port so far: `w:r` -> a `<span>`, `w:p` -> a `<p>`/`<h1>`..
-//! `<h6>` (using the real
+//! [`convert_run`], [`convert_p`], [`read_page_properties`] and
+//! [`convert_body`] are the real port so far: `w:r` -> a `<span>`,
+//! `w:p` -> a `<p>`/`<h1>`..`<h6>` (using the real
 //! [`super::styles::Styles::resolve_run`]/`resolve_paragraph`, issue
 //! #130's styles/numbering/tables cluster, landed before this),
 //! carrying the per-document state ([`ConvertState`]) both need across
-//! the whole body walk, and the paragraph/table -> [`PageProperties`]
-//! map (plus `w:tbl` registration) that walk consumes. Not yet wired
-//! into `DOCXToHTML` -- that needs the main body-walking loop
-//! (`Convert.__call__`'s `for wp, page_properties in
-//! self.page_map.items(): ...`) and everything downstream (links,
-//! frames, tables/numbering markup, TOC, OPF writing), none of which
-//! exist here yet.
+//! the whole body walk; the paragraph/table -> [`PageProperties`] map
+//! (plus `w:tbl` registration) that walk consumes; and
+//! [`convert_body`] itself, which actually runs that walk -- builds a
+//! `<body>`, converts and appends every `w:p` in document order, and
+//! applies [`super::styles::Styles::apply_contextual_spacing`]/
+//! [`super::styles::Styles::apply_section_page_breaks`] afterward, all
+//! matching `Convert.__call__`'s paragraph loop. Not yet wired into
+//! `DOCXToHTML` -- that still needs `read_block_anchors`,
+//! `mark_block_runs`, and everything downstream (links, frames,
+//! tables/numbering markup, TOC, OPF writing), none of which exist
+//! here yet.
 //!
 //! # What `convert_run` defers, and why
 //!
@@ -816,6 +820,80 @@ pub fn read_page_properties<'a, 'i>(
     (page_map, section_starts)
 }
 
+/// Builds a `<body>` element under `dom`'s root and walks `doc` via
+/// [`read_page_properties`], converting every `w:p` encountered (in
+/// document order) via [`convert_p`] and appending it as a child --
+/// skipping `w:tbl` entries, which `page_map` also carries but which
+/// are only handled later, via `Tables::apply_markup` (not yet
+/// ported). Finally applies [`Styles::apply_contextual_spacing`] to
+/// every converted paragraph and [`Styles::apply_section_page_breaks`]
+/// to every section but the first (matching Python's
+/// `self.section_starts[1:]` -- the first section is already the
+/// start of the document, so it needs no explicit page break).
+///
+/// Returns the `<body>` [`NodeId`] and the paragraphs converted, in
+/// document order (Python's local `paras` list).
+///
+/// Port of the paragraph-walking half of `Convert.__call__`:
+/// ```text
+/// self.read_page_properties(doc)
+/// self.current_rels = relationships_by_id
+/// for wp, page_properties in self.page_map.items():
+///     self.current_page = page_properties
+///     if wp.tag.endswith('}p'):
+///         p = self.convert_p(wp)
+///         self.body.append(p)
+///         paras.append(wp)
+/// self.read_block_anchors(doc)
+/// self.styles.apply_contextual_spacing(paras)
+/// self.mark_block_runs(paras)
+/// self.styles.apply_section_page_breaks(self.section_starts[1:])
+/// ```
+/// `self.current_page`/`page_properties` is threaded through as an
+/// instance attribute but not read by any code ported so far (see the
+/// module docs), so it isn't returned here. `read_block_anchors`
+/// (resolves `w:bookmarkStart`/`w:bookmarkEnd` pairs that span
+/// multiple paragraphs into cross-reference anchors) and
+/// `mark_block_runs` (numbering-related run bookkeeping) are both
+/// unported -- neither has a designed Rust shape yet, so, per this
+/// module's established scoping principle, they're deferred rather
+/// than guessed at here.
+pub fn convert_body<'a, 'i>(
+    dom: &mut Dom,
+    doc: Node<'a, 'i>,
+    state: &mut ConvertState<'a, 'i>,
+    styles: &mut Styles<'a, 'i>,
+    footnotes: &mut Footnotes<'a, 'i>,
+    settings: &Settings,
+    theme: &Theme,
+    doc_lang: Option<&str>,
+    uuid: &str,
+    ns: &DocxNamespace,
+) -> (NodeId, Vec<Node<'a, 'i>>) {
+    let (page_map, section_starts) = read_page_properties(doc, styles, ns);
+
+    let body = dom.new_element("body");
+    dom.append_child(dom.root, body);
+
+    let mut paras: Vec<Node<'a, 'i>> = Vec::new();
+    for &wp in page_map.keys() {
+        if ns.is_tag(wp, "w:p") {
+            let p = convert_p(
+                dom, state, wp, styles, footnotes, settings, theme, doc_lang, uuid, ns,
+            );
+            dom.append_child(body, p);
+            paras.push(wp);
+        }
+    }
+
+    styles.apply_contextual_spacing(&paras, ns);
+    if section_starts.len() > 1 {
+        styles.apply_section_page_breaks(&section_starts[1..], ns);
+    }
+
+    (body, paras)
+}
+
 #[cfg(test)]
 mod convert_run_tests {
     use super::*;
@@ -1462,5 +1540,171 @@ mod read_page_properties_tests {
         assert!((page_map[&ps[0]].width - 150.0).abs() < 0.01);
         assert!((page_map[&ps[1]].width - 150.0).abs() < 0.01);
         assert_eq!(section_starts, vec![ps[0]]);
+    }
+}
+
+#[cfg(test)]
+mod convert_body_tests {
+    use super::*;
+    use crate::docx::tables::Tables;
+    use roxmltree::Document;
+
+    const DOC_OPEN: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:xml="http://www.w3.org/XML/1998/namespace""#;
+
+    fn parse_root(body: &str) -> (Document<'static>, DocxNamespace) {
+        let xml: &'static str =
+            Box::leak(format!("<w:root {DOC_OPEN}>{body}</w:root>").into_boxed_str());
+        (
+            Document::parse(xml).expect("valid XML"),
+            DocxNamespace::default(),
+        )
+    }
+
+    struct Harness<'a, 'i> {
+        dom: Dom,
+        state: ConvertState<'a, 'i>,
+        styles: Styles<'a, 'i>,
+        footnotes: Footnotes<'a, 'i>,
+        settings: Settings,
+        theme: Theme,
+    }
+
+    impl<'a, 'i> Harness<'a, 'i> {
+        fn new() -> Self {
+            Harness {
+                dom: Dom::empty(),
+                state: ConvertState::new(),
+                styles: Styles::new(Tables::default()),
+                footnotes: Footnotes::new(),
+                settings: Settings::new(),
+                theme: Theme::new(),
+            }
+        }
+
+        fn convert(
+            &mut self,
+            doc: Node<'a, 'i>,
+            ns: &DocxNamespace,
+        ) -> (NodeId, Vec<Node<'a, 'i>>) {
+            convert_body(
+                &mut self.dom,
+                doc,
+                &mut self.state,
+                &mut self.styles,
+                &mut self.footnotes,
+                &self.settings,
+                &self.theme,
+                None,
+                "test-uuid",
+                ns,
+            )
+        }
+    }
+
+    #[test]
+    fn every_paragraph_becomes_a_body_child_in_document_order() {
+        let (doc, ns) = parse_root(
+            "<w:document><w:body>\
+               <w:p><w:r><w:t>one</w:t></w:r></w:p>\
+               <w:p><w:r><w:t>two</w:t></w:r></w:p>\
+             </w:body></w:document>",
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let (body, paras) = h.convert(document, &ns);
+
+        assert_eq!(h.dom.tag(body), Some("body"));
+        let children = h.dom.children(body);
+        assert_eq!(children.len(), 2);
+        assert_eq!(h.dom.serialize(children[0]), "<p><span>one</span></p>");
+        assert_eq!(h.dom.serialize(children[1]), "<p><span>two</span></p>");
+        assert_eq!(paras.len(), 2);
+    }
+
+    #[test]
+    fn a_table_is_present_in_page_map_but_produces_no_body_child() {
+        let (doc, ns) = parse_root(
+            "<w:document><w:body>\
+               <w:tbl><w:tr><w:tc><w:p/></w:tc></w:tr></w:tbl>\
+               <w:p><w:r><w:t>after</w:t></w:r></w:p>\
+             </w:body></w:document>",
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let (body, paras) = h.convert(document, &ns);
+
+        // The table's own (empty) cell paragraph is a real `w:p` and
+        // does get converted -- only the `w:tbl` element itself is
+        // skipped by the body walk (`wp.tag.endswith('}p')` in
+        // Python), matching `read_page_properties`'s own descendants
+        // walk finding both.
+        let children = h.dom.children(body);
+        assert_eq!(children.len(), 2);
+        // Empty paragraphs get a non-breaking space so they don't
+        // visually collapse -- see `convert_p`'s own tests.
+        assert_eq!(h.dom.serialize(children[0]), "<p>\u{a0}</p>");
+        assert_eq!(h.dom.serialize(children[1]), "<p><span>after</span></p>");
+        assert_eq!(paras.len(), 2);
+    }
+
+    #[test]
+    fn contextual_spacing_is_applied_across_the_converted_paragraphs() {
+        let xml: &'static str = Box::leak(
+            format!(
+                r#"<w:root {DOC_OPEN}>
+                     <w:styles>
+                       <w:style w:type="paragraph" w:styleId="Body">
+                         <w:pPr><w:contextualSpacing/></w:pPr>
+                       </w:style>
+                     </w:styles>
+                     <w:document><w:body>
+                       <w:p><w:pPr><w:pStyle w:val="Body"/></w:pPr></w:p>
+                       <w:p><w:pPr><w:pStyle w:val="Body"/></w:pPr></w:p>
+                     </w:body></w:document>
+                   </w:root>"#
+            )
+            .into_boxed_str(),
+        );
+        let doc = Document::parse(xml).expect("valid XML");
+        let ns = DocxNamespace::default();
+        let styles_root = ns.first_child(doc.root_element(), "w:styles").unwrap();
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+
+        let mut h = Harness::new();
+        h.styles.call(Some(styles_root), &ns);
+        let (_body, paras) = h.convert(document, &ns);
+
+        assert_eq!(paras.len(), 2);
+        let first = h.styles.resolve_paragraph(paras[0], &ns);
+        let second = h.styles.resolve_paragraph(paras[1], &ns);
+        assert_eq!(first.margin_bottom.as_deref(), Some("0"));
+        assert_eq!(second.margin_top.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn every_section_but_the_first_gets_a_leading_page_break() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p><w:r><w:t>a</w:t></w:r><w:sectPr><w:pgSz w:w="1000" w:h="16838"/></w:sectPr></w:p>
+                 <w:p><w:r><w:t>b</w:t></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let (_body, paras) = h.convert(document, &ns);
+
+        assert_eq!(paras.len(), 2);
+        let first = h.styles.resolve_paragraph(paras[0], &ns);
+        let second = h.styles.resolve_paragraph(paras[1], &ns);
+        assert_ne!(
+            first.page_break_before,
+            Some(true),
+            "the first section starts the document -- no leading break"
+        );
+        assert_eq!(
+            second.page_break_before,
+            Some(true),
+            "the second section's start paragraph gets a leading break"
+        );
     }
 }
