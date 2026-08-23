@@ -57,6 +57,12 @@
 //!   [`mark_block_runs`]) in a bordered `<div>`, populating
 //!   `ConvertState::framed_map` (issue #287's block-run half; the
 //!   `w:framePr`-based half is separate, still open).
+//! - [`assign_style_classes`]: the final step -- registers a CSS class
+//!   for every cached paragraph/run style and every frame's border
+//!   CSS, then sets `class` on each corresponding HTML element (issue
+//!   #288's class-generation half; `fields.polish_markup`/
+//!   `cleanup_markup`/`write` remain, each blocked on its own unported
+//!   file).
 //!
 //! Not yet wired into `DOCXToHTML` -- that still needs the footnote
 //! body conversion (#284) and everything downstream (the rest of
@@ -2083,6 +2089,78 @@ pub fn apply_block_run_frames<'a, 'i>(
         let css = border_style.css();
         state.framed_map.insert(frame, css.clone());
         styles.register(css, "frame");
+    }
+}
+
+/// Registers a CSS class for every cached paragraph/run style and
+/// every frame's border CSS, then sets `class` on each corresponding
+/// HTML element -- the final step that actually makes all this
+/// crate's CSS generation (`ParagraphStyle::css`/`RunStyle::css`/
+/// [`Table::table_style`]'s CSS/etc.) visible in the output, by
+/// pointing each element at the class it belongs to.
+///
+/// Must run after every pass that still mutates a cached style
+/// (`cascade`, `apply_tables_markup`, `apply_numbering_markup`,
+/// `apply_block_run_frames`) -- [`Styles::generate_classes`] only
+/// registers whatever is in `para_cache`/`run_cache` *at the time it's
+/// called*, and this function's own per-element lookups
+/// (`Styles::class_name`) only succeed for CSS that was actually
+/// registered.
+///
+/// Port of the class-assignment loops at the end of the Python
+/// `Convert.__call__` (after `self.styles.generate_classes()`):
+/// ```text
+/// for html_obj, obj in self.object_map.items():
+///     style = self.styles.resolve(obj)
+///     if style is not None:
+///         css = style.css
+///         if css:
+///             cls = self.styles.class_name(css)
+///             if cls:
+///                 html_obj.set('class', cls)
+/// for html_obj, css in self.framed_map.items():
+///     cls = self.styles.class_name(css)
+///     if cls:
+///         html_obj.set('class', cls)
+/// ```
+/// Python's generic `Styles.resolve(obj)` (dispatching on
+/// `obj.tag.endswith('}p')`/`'}r'`) is inlined here rather than
+/// ported as its own method, since `ParagraphStyle`/`RunStyle` have no
+/// common Rust type to return without introducing an enum wrapper
+/// solely for this one call site.
+pub fn assign_style_classes<'a, 'i>(
+    dom: &mut Dom,
+    state: &ConvertState<'a, 'i>,
+    styles: &mut Styles<'a, 'i>,
+    theme: &Theme,
+    ns: &DocxNamespace,
+) {
+    styles.generate_classes();
+
+    for (&html_obj, &obj) in &state.object_map {
+        let css = if ns.is_tag(obj, "w:p") {
+            styles.resolve_paragraph(obj, ns).css()
+        } else if ns.is_tag(obj, "w:r") {
+            styles.resolve_run(obj, theme, ns).css()
+        } else {
+            continue;
+        };
+        if css.is_empty() {
+            continue;
+        }
+        if let Some(cls) = styles.class_name(&css) {
+            dom.node_mut(html_obj)
+                .attrs
+                .insert("class".to_string(), cls.to_string());
+        }
+    }
+
+    for (&html_obj, css) in &state.framed_map {
+        if let Some(cls) = styles.class_name(css) {
+            dom.node_mut(html_obj)
+                .attrs
+                .insert("class".to_string(), cls.to_string());
+        }
     }
 }
 
@@ -4570,5 +4648,145 @@ mod apply_block_run_frames_tests {
         assert_eq!(h.dom.children(body).len(), 1);
         assert_eq!(h.dom.tag(h.dom.children(body)[0]), Some("p"));
         assert!(h.state.framed_map.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod assign_style_classes_tests {
+    use super::*;
+    use crate::docx::tables::Tables;
+    use roxmltree::Document;
+
+    const DOC_OPEN: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:xml="http://www.w3.org/XML/1998/namespace""#;
+    const BORDER: &str = r#"<w:pBdr><w:top w:val="single" w:sz="8" w:color="FF0000"/><w:bottom w:val="single" w:sz="8" w:color="FF0000"/></w:pBdr>"#;
+
+    fn parse_root(body: &str) -> (Document<'static>, DocxNamespace) {
+        let xml: &'static str =
+            Box::leak(format!("<w:root {DOC_OPEN}>{body}</w:root>").into_boxed_str());
+        (
+            Document::parse(xml).expect("valid XML"),
+            DocxNamespace::default(),
+        )
+    }
+
+    struct Harness<'a, 'i> {
+        dom: Dom,
+        state: ConvertState<'a, 'i>,
+        styles: Styles<'a, 'i>,
+        footnotes: Footnotes<'a, 'i>,
+        settings: Settings,
+        theme: Theme,
+    }
+
+    impl<'a, 'i> Harness<'a, 'i> {
+        fn new() -> Self {
+            Harness {
+                dom: Dom::empty(),
+                state: ConvertState::new(),
+                styles: Styles::new(Tables::default()),
+                footnotes: Footnotes::new(),
+                settings: Settings::new(),
+                theme: Theme::new(),
+            }
+        }
+
+        fn body(&mut self, doc: Node<'a, 'i>, ns: &DocxNamespace) -> NodeId {
+            convert_body(
+                &mut self.dom,
+                doc,
+                &mut self.state,
+                &mut self.styles,
+                &mut self.footnotes,
+                &self.settings,
+                &self.theme,
+                None,
+                "test-uuid",
+                &Relationships::default(),
+                ns,
+            )
+            .0
+        }
+    }
+
+    #[test]
+    fn a_paragraph_with_visible_css_gets_a_block_class() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:t>a</w:t></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let body = h.body(document, &ns);
+
+        assign_style_classes(&mut h.dom, &h.state, &mut h.styles, &h.theme, &ns);
+
+        let p = h.dom.children(body)[0];
+        let cls = h.dom.node(p).attrs.get("class").cloned();
+        assert!(cls.as_deref().is_some_and(|c| c.starts_with("block_")));
+    }
+
+    #[test]
+    fn a_run_with_visible_css_gets_a_text_class() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p><w:r><w:rPr><w:b/></w:rPr><w:t>a</w:t></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let body = h.body(document, &ns);
+
+        assign_style_classes(&mut h.dom, &h.state, &mut h.styles, &h.theme, &ns);
+
+        let p = h.dom.children(body)[0];
+        let span = h.dom.children(p)[0];
+        let cls = h.dom.node(span).attrs.get("class").cloned();
+        assert!(cls.as_deref().is_some_and(|c| c.starts_with("text_")));
+    }
+
+    #[test]
+    fn a_plain_paragraph_and_run_get_no_class() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p><w:r><w:t>a</w:t></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let body = h.body(document, &ns);
+
+        assign_style_classes(&mut h.dom, &h.state, &mut h.styles, &h.theme, &ns);
+
+        let p = h.dom.children(body)[0];
+        assert!(h.dom.node(p).attrs.get("class").is_none());
+        let span = h.dom.children(p)[0];
+        assert!(h.dom.node(span).attrs.get("class").is_none());
+    }
+
+    #[test]
+    fn a_frame_div_gets_a_frame_class_from_framed_map() {
+        let (doc, ns) = parse_root(&format!(
+            r#"<w:document><w:body>
+                 <w:p><w:pPr>{BORDER}</w:pPr><w:r><w:t>a</w:t></w:r></w:p>
+                 <w:p><w:pPr>{BORDER}</w:pPr><w:r><w:t>b</w:t></w:r></w:p>
+               </w:body></w:document>"#
+        ));
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let body = h.body(document, &ns);
+        let body_paras: Vec<Node> = ns.descendants(document, &["w:p"]);
+        mark_block_runs(&mut h.state, &body_paras, &mut h.styles, &ns);
+        assert_eq!(h.state.block_runs.len(), 1);
+
+        let object_map = h.state.object_map.clone();
+        apply_block_run_frames(&mut h.dom, &mut h.state, &mut h.styles, &object_map);
+
+        assign_style_classes(&mut h.dom, &h.state, &mut h.styles, &h.theme, &ns);
+
+        let frame = h.dom.children(body)[0];
+        assert_eq!(h.dom.tag(frame), Some("div"));
+        let cls = h.dom.node(frame).attrs.get("class").cloned();
+        assert!(cls.as_deref().is_some_and(|c| c.starts_with("frame_")));
     }
 }
