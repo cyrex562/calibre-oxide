@@ -5,35 +5,45 @@
 //! heading levels guessed from `w:pStyle` and no style resolution
 //! whatsoever. It stays wired into the DOCX input plugin (see
 //! `input/docx_input.rs`) and keeps producing *something* until real
-//! `Convert::__call__` orchestration (the footnote/numbering/table
-//! passes, links, frames, TOC, OPF writing -- most of which are still
-//! blocked, several on files issue #130 lists alongside `to_html.py`
-//! itself: `images.py`, `fields.py`, `toc.py`, `cleanup.py`) is ready
-//! to replace it wholesale.
+//! `Convert::__call__` orchestration is ready to replace it wholesale
+//! -- see issue #130's tracked follow-ups (#283-293) for exactly
+//! what's still missing.
 //!
-//! [`convert_run`], [`convert_p`], [`read_page_properties`],
-//! [`convert_body`] and [`read_block_anchors`] are the real port so
-//! far: `w:r` -> a `<span>`, `w:p` -> a `<p>`/`<h1>`..`<h6>` (using the
-//! real [`super::styles::Styles::resolve_run`]/`resolve_paragraph`,
-//! issue #130's styles/numbering/tables cluster, landed before this),
-//! carrying the per-document state ([`ConvertState`]) both need across
-//! the whole body walk; the paragraph/table -> [`PageProperties`] map
-//! (plus `w:tbl` registration) that walk consumes; [`convert_body`]
-//! itself, which actually runs that walk -- builds a `<body>`,
-//! converts and appends every `w:p` in document order, and applies
-//! [`super::styles::Styles::apply_contextual_spacing`]/
-//! [`super::styles::Styles::apply_section_page_breaks`] afterward, all
-//! matching `Convert.__call__`'s paragraph loop; and
-//! [`read_block_anchors`], which assigns ids to paragraphs a top-level
-//! bookmark precedes; [`apply_tab_indentation`], which folds leading
-//! `w:tab`-based paragraph indentation into a `text-indent` CSS value;
-//! and [`mark_block_runs`], which collapses a run of consecutive,
-//! same-frame, identically-bordered paragraphs into one visual block
-//! (populating `ConvertState::block_runs`, for the not-yet-ported
-//! `apply_frames` to wrap in a bordered `<div>`). Not yet wired into
-//! `DOCXToHTML` -- that still needs the footnote body conversion and
-//! everything downstream (links, frames, tables/numbering markup,
-//! TOC, OPF writing), none of which exist here yet.
+//! The real port, tracked as issue #130 with per-piece follow-ups
+//! #283-293, so far covers:
+//!
+//! - [`convert_run`]/[`convert_p`]: `w:r` -> `<span>`, `w:p` ->
+//!   `<p>`/`<h1>`..`<h6>`, using the real
+//!   [`super::styles::Styles::resolve_run`]/`resolve_paragraph`
+//!   cascade (issue #130's styles/numbering/tables cluster). Carries
+//!   the per-document state ([`ConvertState`]) both need across the
+//!   whole body walk, and tracks `w:hyperlink` runs into
+//!   `ConvertState::link_map`/`link_source_map`/`is_link` for
+//!   [`resolve_links`].
+//! - [`read_page_properties`]: the paragraph/table -> [`PageProperties`]
+//!   map (plus `w:tbl` registration) [`convert_body`] walks.
+//! - [`convert_body`]: builds a `<body>`, converts and appends every
+//!   `w:p` in document order via `convert_p`, then applies
+//!   [`super::styles::Styles::apply_contextual_spacing`]/
+//!   [`super::styles::Styles::apply_section_page_breaks`] -- the whole
+//!   of `Convert.__call__`'s main paragraph loop.
+//! - [`read_block_anchors`]: ids paragraphs a top-level bookmark
+//!   precedes.
+//! - [`apply_tab_indentation`]: folds leading `w:tab`-based paragraph
+//!   indentation into a `text-indent` CSS value.
+//! - [`mark_block_runs`]: collapses consecutive, same-frame,
+//!   identically-bordered paragraphs into one visual block
+//!   (`ConvertState::block_runs`, for the not-yet-ported `apply_frames`
+//!   -- issue #287).
+//! - [`resolve_links`]: turns tracked `w:hyperlink`s into real `<a>`
+//!   elements (issue #283's `link_map`-driven first block only --
+//!   `fields.py`/`images.py`'s link sources are separate, still-open
+//!   issues #290/#289).
+//!
+//! Not yet wired into `DOCXToHTML` -- that still needs the footnote
+//! body conversion (#284) and everything downstream (frames,
+//! tables/numbering markup, TOC, OPF writing), none of which exist
+//! here yet.
 //!
 //! # What `convert_run` defers, and why
 //!
@@ -67,7 +77,7 @@ use roxmltree::{Document, Node};
 use crate::dom::{Dom, NodeId, NodeKind};
 
 use super::block_styles::{pt, Edge, Frame, ParagraphStyle};
-use super::container::Docx;
+use super::container::{Docx, Relationships};
 use super::error::DocxError;
 use super::fonts::{is_symbol_font, map_symbol_text};
 use super::footnotes::Footnotes;
@@ -510,6 +520,24 @@ pub struct ConvertState<'a, 'i> {
     /// merged run's outer border (for the wrapping `<div>` the
     /// not-yet-ported `apply_frames` builds from it).
     pub block_runs: Vec<(ParagraphStyle, Vec<Node<'a, 'i>>)>,
+    /// `w:hyperlink` source element -> the HTML spans [`convert_p`]
+    /// built for each run inside it, in document order. Populated in
+    /// [`convert_p`]; consumed by [`resolve_links`], which merges
+    /// multi-run hyperlinks into one wrapping `<a>` and sets its
+    /// `href`.
+    pub link_map: HashMap<Node<'a, 'i>, Vec<NodeId>>,
+    /// `w:hyperlink` source element -> the relationships map active
+    /// when [`convert_p`] processed it (the main document's, or a
+    /// footnote/endnote's own -- see #284). Needed because `r:id`
+    /// hyperlink targets are only meaningful relative to whichever
+    /// part's relationships the hyperlink actually belongs to.
+    pub link_source_map: HashMap<Node<'a, 'i>, Relationships>,
+    /// Source `w:r` nodes inside a `w:hyperlink`, i.e. Python's
+    /// `x.set('is-link', '1')` -- a source-tree mutation, here a
+    /// tracked side-table for the same reason `calibre_num_ids`/
+    /// `removed_cells` are (see `docx::styles`/`docx::tables`'s module
+    /// docs). Consumed by the not-yet-ported `Styles::cascade` (#285).
+    pub is_link: HashSet<Node<'a, 'i>>,
 }
 
 impl<'a, 'i> ConvertState<'a, 'i> {
@@ -579,6 +607,7 @@ pub fn convert_p<'a, 'i>(
     theme: &Theme,
     doc_lang: Option<&str>,
     uuid: &str,
+    rels: &Relationships,
     ns: &DocxNamespace,
 ) -> NodeId {
     let dest = dom.new_element("p");
@@ -611,6 +640,23 @@ pub fn convert_p<'a, 'i>(
             dom.append_child(dest, span);
             state.object_map.insert(span, x);
             state.layers.get_mut(&p).unwrap().push(x);
+            // Port of the `current_hyperlink`/`hl_xpath` dance in
+            // Python: it tracks a `current_hyperlink` flag across
+            // iterations purely to skip an XPath call when a run is
+            // obviously not inside any hyperlink, resetting the flag
+            // lazily (only once a subsequent run's `ancestor::
+            // w:hyperlink[1]` lookup comes back empty) rather than at
+            // the hyperlink's actual closing tag. The flag never
+            // substitutes for the lookup's own result -- it's a pure
+            // performance guard with no observable effect on which
+            // hyperlink (if any) a run gets attributed to. Calling
+            // `ns.ancestor` unconditionally here is behaviorally
+            // identical and needs no extra state.
+            if let Some(hyperlink) = ns.ancestor(x, "w:hyperlink") {
+                state.link_map.entry(hyperlink).or_default().push(span);
+                state.link_source_map.insert(hyperlink, rels.clone());
+                state.is_link.insert(x);
+            }
         } else if ns.is_tag(x, "w:bookmarkStart") {
             if let Some(anchor) = ns
                 .get(x, "w:name")
@@ -881,6 +927,7 @@ pub fn read_page_properties<'a, 'i>(
 /// unported -- neither has a designed Rust shape yet, so, per this
 /// module's established scoping principle, they're deferred rather
 /// than guessed at here.
+#[allow(clippy::too_many_arguments)]
 pub fn convert_body<'a, 'i>(
     dom: &mut Dom,
     doc: Node<'a, 'i>,
@@ -891,6 +938,7 @@ pub fn convert_body<'a, 'i>(
     theme: &Theme,
     doc_lang: Option<&str>,
     uuid: &str,
+    rels: &Relationships,
     ns: &DocxNamespace,
 ) -> (NodeId, Vec<Node<'a, 'i>>) {
     let (page_map, section_starts) = read_page_properties(doc, styles, ns);
@@ -902,7 +950,7 @@ pub fn convert_body<'a, 'i>(
     for &wp in page_map.keys() {
         if ns.is_tag(wp, "w:p") {
             let p = convert_p(
-                dom, state, wp, styles, footnotes, settings, theme, doc_lang, uuid, ns,
+                dom, state, wp, styles, footnotes, settings, theme, doc_lang, uuid, rels, ns,
             );
             dom.append_child(body, p);
             paras.push(wp);
@@ -1217,6 +1265,79 @@ fn process_block_run<'a, 'i>(
             block_runs.push((bs, run.to_vec()));
         }
     }
+}
+
+/// Turns every tracked `w:hyperlink` into a real `<a>`: merges its
+/// runs' spans into one element (wrapping them if there's more than
+/// one, matching the run's own span directly if there's only one),
+/// relabels it `<a>`, and sets `href` from either the relationship
+/// its `r:id` points at or an internal `w:anchor` resolved against
+/// `state.anchor_map`.
+///
+/// Returns `hyperlink -> <a>` (Python's `self.resolved_link_map`),
+/// which `toc.py`'s `create_toc` (issue #292) will need.
+///
+/// Port of the `self.link_map`-driven first block of
+/// `Convert.resolve_links`. Two of Python's three link sources are
+/// deliberately not ported here (see issue #283): `self.fields.
+/// hyperlink_fields` (needs `fields.py`, issue #290) and
+/// `self.images.links` (needs `images.py`, issue #289) -- both are
+/// separate loops appended to this same method in Python once those
+/// files exist, not a rewrite of this one. A hyperlink whose `r:id`/
+/// `w:anchor` resolves to nothing is silently left without an `href`
+/// rather than logged, since no logger is threaded through this
+/// module yet.
+pub fn resolve_links<'a, 'i>(
+    dom: &mut Dom,
+    state: &ConvertState<'a, 'i>,
+    ns: &DocxNamespace,
+) -> HashMap<Node<'a, 'i>, NodeId> {
+    let mut resolved_link_map = HashMap::new();
+
+    for (&hyperlink, spans) in &state.link_map {
+        let Some(&first) = spans.first() else {
+            continue;
+        };
+        let span = if spans.len() > 1 {
+            let Some(parent) = dom.parent(first) else {
+                continue;
+            };
+            wrap_elems(dom, parent, spans)
+        } else {
+            first
+        };
+        dom.set_tag(span, "a");
+        resolved_link_map.insert(hyperlink, span);
+
+        if let Some(tgt) = ns.get(hyperlink, "w:tgtFrame") {
+            dom.node_mut(span)
+                .attrs
+                .insert("target".to_string(), tgt.to_string());
+        }
+        if let Some(tt) = ns.get(hyperlink, "w:tooltip") {
+            dom.node_mut(span)
+                .attrs
+                .insert("title".to_string(), tt.to_string());
+        }
+
+        let href = ns.get(hyperlink, "r:id").and_then(|rid| {
+            state
+                .link_source_map
+                .get(&hyperlink)
+                .and_then(|rels| rels.by_id.get(rid))
+                .cloned()
+        });
+        let href = href.or_else(|| {
+            ns.get(hyperlink, "w:anchor")
+                .and_then(|anchor| state.anchor_map.get(anchor))
+                .map(|id| format!("#{id}"))
+        });
+        if let Some(href) = href {
+            dom.node_mut(span).attrs.insert("href".to_string(), href);
+        }
+    }
+
+    resolved_link_map
 }
 
 #[cfg(test)]
@@ -1559,6 +1680,7 @@ mod convert_p_tests {
                 &self.theme,
                 None,
                 "test-uuid",
+                &Relationships::default(),
                 ns,
             )
         }
@@ -1921,6 +2043,7 @@ mod convert_body_tests {
                 &self.theme,
                 None,
                 "test-uuid",
+                &Relationships::default(),
                 ns,
             )
         }
@@ -2083,6 +2206,7 @@ mod read_block_anchors_tests {
                 &self.theme,
                 None,
                 "test-uuid",
+                &Relationships::default(),
                 ns,
             )
             .0
@@ -2273,6 +2397,7 @@ mod apply_tab_indentation_tests {
                 &self.theme,
                 None,
                 "test-uuid",
+                &Relationships::default(),
                 ns,
             )
             .0
@@ -2449,6 +2574,7 @@ mod mark_block_runs_tests {
                 &self.theme,
                 None,
                 "test-uuid",
+                &Relationships::default(),
                 ns,
             )
         }
@@ -2551,5 +2677,190 @@ mod mark_block_runs_tests {
         assert!(h.state.block_runs.is_empty());
         let first = h.styles.resolve_paragraph(paras[0], &ns);
         assert!(first.has_visible_border(), "left untouched, not merged");
+    }
+}
+
+#[cfg(test)]
+mod resolve_links_tests {
+    use super::*;
+    use crate::docx::tables::Tables;
+    use roxmltree::Document;
+
+    const DOC_OPEN: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:xml="http://www.w3.org/XML/1998/namespace" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships""#;
+
+    fn parse_para(body: &str) -> (Document<'static>, DocxNamespace) {
+        let xml: &'static str = Box::leak(format!("<w:p {DOC_OPEN}>{body}</w:p>").into_boxed_str());
+        (
+            Document::parse(xml).expect("valid XML"),
+            DocxNamespace::default(),
+        )
+    }
+
+    struct Harness<'a, 'i> {
+        dom: Dom,
+        state: ConvertState<'a, 'i>,
+        styles: Styles<'a, 'i>,
+        footnotes: Footnotes<'a, 'i>,
+        settings: Settings,
+        theme: Theme,
+    }
+
+    impl<'a, 'i> Harness<'a, 'i> {
+        fn new() -> Self {
+            Harness {
+                dom: Dom::empty(),
+                state: ConvertState::new(),
+                styles: Styles::new(Tables::default()),
+                footnotes: Footnotes::new(),
+                settings: Settings::new(),
+                theme: Theme::new(),
+            }
+        }
+
+        fn convert(&mut self, p: Node<'a, 'i>, ns: &DocxNamespace, rels: &Relationships) -> NodeId {
+            convert_p(
+                &mut self.dom,
+                &mut self.state,
+                p,
+                &mut self.styles,
+                &mut self.footnotes,
+                &self.settings,
+                &self.theme,
+                None,
+                "test-uuid",
+                rels,
+                ns,
+            )
+        }
+    }
+
+    fn relationships(pairs: &[(&str, &str)]) -> Relationships {
+        let mut rels = Relationships::default();
+        for &(k, v) in pairs {
+            rels.by_id.insert(k.to_string(), v.to_string());
+        }
+        rels
+    }
+
+    #[test]
+    fn a_hyperlink_with_an_rid_resolves_to_the_relationship_target() {
+        let (doc, ns) =
+            parse_para(r#"<w:hyperlink r:id="rId1"><w:r><w:t>click</w:t></w:r></w:hyperlink>"#);
+        let rels = relationships(&[("rId1", "https://example.com/")]);
+        let mut h = Harness::new();
+        h.convert(doc.root_element(), &ns, &rels);
+
+        let resolved = resolve_links(&mut h.dom, &h.state, &ns);
+        assert_eq!(resolved.len(), 1);
+        let &span = resolved.values().next().unwrap();
+        assert_eq!(h.dom.tag(span), Some("a"));
+        assert_eq!(
+            h.dom.node(span).attrs.get("href").map(String::as_str),
+            Some("https://example.com/")
+        );
+    }
+
+    #[test]
+    fn a_hyperlink_with_a_w_anchor_resolves_against_the_anchor_map() {
+        let (doc, ns) = parse_para(
+            r#"<w:hyperlink w:anchor="chap1"><w:r><w:t>click</w:t></w:r></w:hyperlink>"#,
+        );
+        let mut h = Harness::new();
+        h.state
+            .anchor_map
+            .insert("chap1".to_string(), "id_chap1".to_string());
+        h.convert(doc.root_element(), &ns, &Relationships::default());
+
+        let resolved = resolve_links(&mut h.dom, &h.state, &ns);
+        let &span = resolved.values().next().unwrap();
+        assert_eq!(
+            h.dom.node(span).attrs.get("href").map(String::as_str),
+            Some("#id_chap1")
+        );
+    }
+
+    #[test]
+    fn multiple_runs_in_one_hyperlink_are_wrapped_into_a_single_a() {
+        let (doc, ns) = parse_para(
+            r#"<w:hyperlink r:id="rId1"><w:r><w:t>a</w:t></w:r><w:r><w:t>b</w:t></w:r></w:hyperlink>"#,
+        );
+        let rels = relationships(&[("rId1", "https://example.com/")]);
+        let mut h = Harness::new();
+        let dest = h.convert(doc.root_element(), &ns, &rels);
+        assert_eq!(h.dom.children(dest).len(), 2, "still two separate spans");
+
+        resolve_links(&mut h.dom, &h.state, &ns);
+
+        let children = h.dom.children(dest);
+        assert_eq!(children.len(), 1, "merged into one wrapper");
+        assert_eq!(h.dom.tag(children[0]), Some("a"));
+        assert_eq!(h.dom.children(children[0]).len(), 2);
+        assert_eq!(
+            h.dom.serialize(dest),
+            r#"<p><a href="https://example.com/"><span>a</span><span>b</span></a></p>"#
+        );
+    }
+
+    #[test]
+    fn the_source_run_is_marked_is_link() {
+        let (doc, ns) =
+            parse_para(r#"<w:hyperlink r:id="rId1"><w:r><w:t>click</w:t></w:r></w:hyperlink>"#);
+        let rels = relationships(&[("rId1", "https://example.com/")]);
+        let mut h = Harness::new();
+        h.convert(doc.root_element(), &ns, &rels);
+
+        let run = ns
+            .descendants(doc.root_element(), &["w:r"])
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(h.state.is_link.contains(&run));
+    }
+
+    #[test]
+    fn an_unresolvable_hyperlink_is_relabeled_but_gets_no_href() {
+        let (doc, ns) = parse_para(r#"<w:hyperlink><w:r><w:t>click</w:t></w:r></w:hyperlink>"#);
+        let mut h = Harness::new();
+        h.convert(doc.root_element(), &ns, &Relationships::default());
+
+        let resolved = resolve_links(&mut h.dom, &h.state, &ns);
+        let &span = resolved.values().next().unwrap();
+        assert_eq!(h.dom.tag(span), Some("a"));
+        assert!(h.dom.node(span).attrs.get("href").is_none());
+    }
+
+    #[test]
+    fn target_and_tooltip_become_target_and_title_attributes() {
+        let (doc, ns) = parse_para(
+            r#"<w:hyperlink r:id="rId1" w:tgtFrame="_blank" w:tooltip="See also"><w:r><w:t>click</w:t></w:r></w:hyperlink>"#,
+        );
+        let rels = relationships(&[("rId1", "https://example.com/")]);
+        let mut h = Harness::new();
+        h.convert(doc.root_element(), &ns, &rels);
+
+        let resolved = resolve_links(&mut h.dom, &h.state, &ns);
+        let &span = resolved.values().next().unwrap();
+        assert_eq!(
+            h.dom.node(span).attrs.get("target").map(String::as_str),
+            Some("_blank")
+        );
+        assert_eq!(
+            h.dom.node(span).attrs.get("title").map(String::as_str),
+            Some("See also")
+        );
+    }
+
+    #[test]
+    fn runs_outside_any_hyperlink_are_not_tracked() {
+        let (doc, ns) = parse_para(
+            r#"<w:hyperlink r:id="rId1"><w:r><w:t>link</w:t></w:r></w:hyperlink><w:r><w:t> plain</w:t></w:r>"#,
+        );
+        let rels = relationships(&[("rId1", "https://example.com/")]);
+        let mut h = Harness::new();
+        h.convert(doc.root_element(), &ns, &rels);
+
+        assert_eq!(h.state.link_map.len(), 1);
+        let spans_tracked: usize = h.state.link_map.values().map(Vec::len).sum();
+        assert_eq!(spans_tracked, 1, "the trailing plain run isn't tracked");
     }
 }
