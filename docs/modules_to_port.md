@@ -367,10 +367,10 @@ either -- this pass wasn't exhaustive.
 - [ ] index.py (needs the mutable HTML tree — see #130)
 - [x] `lcid.py` -> `docx/lcid.rs`
 - [x] `names.py` -> `docx/names.rs`
-- [ ] numbering.py (see #130)
+- [ ] numbering.py (`Level`/`NumberingDefinition`/`Numbering` reading ported to `docx/numbering.rs`; `apply_markup` still needs the mutable HTML tree — see #130)
 - [x] `settings.py` -> `docx/settings.rs`
-- [ ] styles.py (needs numbering + TableStyle — see #130)
-- [ ] tables.py (see #130)
+- [ ] styles.py (`PageProperties`/`Style` ported to `docx/styles.rs`; the `Styles` cascade orchestrator still needs `Tables` — see #130)
+- [ ] tables.py (`RowStyle`/`CellStyle`/`TableStyle` ported to `docx/tables.rs`; `Table`/`Tables` still need a mutable tree, both for HTML output and for `handle_merged_cells`'s *source*-tree cell removal — see #130)
 - [x] `theme.py` -> `docx/theme.rs`
 - [ ] to_html.py (`docx/to_html.rs` is a provisional sketch, not the port — see #130)
 - [ ] toc.py (needs the mutable HTML tree — see #130)

@@ -86,7 +86,7 @@ fn strip_trailing_zeros(s: &str) -> String {
 }
 
 /// A length in points, rendered as CSS.
-fn pt(value: f64) -> String {
+pub(crate) fn pt(value: f64) -> String {
     format!("{}pt", format_g3(value))
 }
 
@@ -176,18 +176,48 @@ pub enum Edge {
     Right,
     Bottom,
     Between,
+    /// Table-only: the border between rows. Part of tables.py's
+    /// `border_edges`, not paragraphs.py's.
+    InsideH,
+    /// Table-only: the border between columns.
+    InsideV,
 }
 
 impl Edge {
     /// The four edges that map directly onto CSS.
     pub const CSS_EDGES: [Edge; 4] = [Edge::Left, Edge::Top, Edge::Right, Edge::Bottom];
-    /// Every edge, in the order the Python `border_edges` lists them.
+    /// Every edge a paragraph border can specify, in the order the
+    /// Python `block_styles.border_edges` lists them.
     pub const ALL: [Edge; 5] = [
         Edge::Left,
         Edge::Top,
         Edge::Right,
         Edge::Bottom,
         Edge::Between,
+    ];
+    /// Every edge a table/row/cell border can specify, in the order
+    /// the Python `tables.border_edges` lists them.
+    pub const ALL_TABLE: [Edge; 6] = [
+        Edge::Left,
+        Edge::Top,
+        Edge::Right,
+        Edge::Bottom,
+        Edge::InsideH,
+        Edge::InsideV,
+    ];
+    /// The union of every edge kind [`Borders`] can hold, used by
+    /// [`Borders::update`]/[`Borders::resolve_based_on`] so a single
+    /// `Borders` value works correctly regardless of whether it was
+    /// built from a paragraph border set (which uses `Between`) or a
+    /// table border set (which uses `InsideH`/`InsideV`).
+    const ALL_FULL: [Edge; 7] = [
+        Edge::Left,
+        Edge::Top,
+        Edge::Right,
+        Edge::Bottom,
+        Edge::Between,
+        Edge::InsideH,
+        Edge::InsideV,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -197,6 +227,8 @@ impl Edge {
             Edge::Right => "right",
             Edge::Bottom => "bottom",
             Edge::Between => "between",
+            Edge::InsideH => "insideH",
+            Edge::InsideV => "insideV",
         }
     }
 }
@@ -250,6 +282,10 @@ pub struct Borders {
     pub right: Border,
     pub bottom: Border,
     pub between: Border,
+    /// Table-only, see [`Edge::InsideH`].
+    pub inside_h: Border,
+    /// Table-only, see [`Edge::InsideV`].
+    pub inside_v: Border,
 }
 
 impl Borders {
@@ -260,6 +296,8 @@ impl Borders {
             Edge::Right => &self.right,
             Edge::Bottom => &self.bottom,
             Edge::Between => &self.between,
+            Edge::InsideH => &self.inside_h,
+            Edge::InsideV => &self.inside_v,
         }
     }
 
@@ -270,18 +308,20 @@ impl Borders {
             Edge::Right => &mut self.right,
             Edge::Bottom => &mut self.bottom,
             Edge::Between => &mut self.between,
+            Edge::InsideH => &mut self.inside_h,
+            Edge::InsideV => &mut self.inside_v,
         }
     }
 
     fn update(&mut self, other: &Borders) {
-        for edge in Edge::ALL {
+        for edge in Edge::ALL_FULL {
             let src = other.edge(edge).clone();
             self.edge_mut(edge).update(&src);
         }
     }
 
     fn resolve_based_on(&mut self, parent: &Borders) {
-        for edge in Edge::ALL {
+        for edge in Edge::ALL_FULL {
             let src = parent.edge(edge).clone();
             self.edge_mut(edge).resolve_based_on(&src);
         }
@@ -873,7 +913,8 @@ impl ParagraphStyle {
             Edge::Top => self.margin_top.as_ref(),
             Edge::Right => self.margin_right.as_ref(),
             Edge::Bottom => self.margin_bottom.as_ref(),
-            Edge::Between => None,
+            // Only ever called with `Edge::CSS_EDGES`.
+            Edge::Between | Edge::InsideH | Edge::InsideV => None,
         }
     }
 
