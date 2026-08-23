@@ -1083,7 +1083,18 @@ impl Shared {
 /// transaction, so SQLite can't `TRUNCATE` the WAL file down to
 /// nothing) is not an error; §5 step 1 is "flush what you can before
 /// suspending", not a hard precondition for suspending at all.
-fn checkpoint_wal_best_effort(library_path: &Path) {
+///
+/// Also reused by `backend.rs`'s §3 per-write checkpoint cadence
+/// (issue #260's other half): `Backend::spawn_checkpoint_thread`'s
+/// background poller calls this same function once its cadence is
+/// due, for the same "any connection can checkpoint" reason -- the
+/// "doesn't reuse a `Backend`'s live connection" property this
+/// function already has is exactly what makes it safe to call from
+/// there too, off `Backend`'s own commit-hook-triggered thread rather
+/// than reaching back into the connection whose commit triggered it
+/// (which deadlocks -- see that module's own doc for the real,
+/// probe-confirmed reason).
+pub(crate) fn checkpoint_wal_best_effort(library_path: &Path) {
     let candidates = [
         library_path.join("metadata.db"),
         library_path
@@ -2077,7 +2088,7 @@ fn fsync_dir(dir: Option<&Path>) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn classify_storage_tier(path: &Path) -> StorageTier {
+pub(crate) fn classify_storage_tier(path: &Path) -> StorageTier {
     let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let mounts = fs::read_to_string("/proc/mounts").unwrap_or_default();
     let Some((device, fstype)) = best_matching_mount(&mounts, &target) else {
@@ -2187,7 +2198,7 @@ fn load_or_create_library_id(handle_dir: &Path) -> io::Result<String> {
 }
 
 #[cfg(windows)]
-fn classify_storage_tier(_path: &Path) -> StorageTier {
+pub(crate) fn classify_storage_tier(_path: &Path) -> StorageTier {
     // Real classification needs `GetDriveTypeW`, which this port
     // can't compile-check or test on this workspace's Linux-only
     // toolchain -- see module doc. `LocalInternal` is the
