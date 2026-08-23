@@ -62,6 +62,26 @@ impl Dom {
         Dom { nodes, root }
     }
 
+    /// A document holding nothing but the `Document` pseudo-root, for
+    /// callers that build markup from scratch (`new_element`/
+    /// `new_text`, mirroring `lxml.html.builder`) rather than parsing
+    /// existing HTML -- e.g. `docx::to_html`, whose Python original
+    /// (`to_html.py`) constructs its output tree element by element.
+    /// `self.root` is otherwise unused by such callers; each
+    /// constructed subtree is returned by [`NodeId`] and attached
+    /// wherever the caller's own document structure calls for it.
+    pub fn empty() -> Dom {
+        Dom {
+            nodes: vec![Node {
+                kind: NodeKind::Document,
+                attrs: IndexMap::new(),
+                children: Vec::new(),
+                parent: None,
+            }],
+            root: 0,
+        }
+    }
+
     pub fn node(&self, id: NodeId) -> &Node {
         &self.nodes[id]
     }
@@ -414,6 +434,19 @@ fn local_name_to_string(name: &LocalName) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_dom_builds_a_detached_tree_from_scratch() {
+        let mut dom = Dom::empty();
+        let p = dom.new_element("p");
+        let text = dom.new_text("hello");
+        dom.append_child(p, text);
+        let b = dom.new_element("b");
+        let bold_text = dom.new_text("world");
+        dom.append_child(b, bold_text);
+        dom.append_child(p, b);
+        assert_eq!(dom.serialize(p), "<p>hello<b>world</b></p>");
+    }
 
     #[test]
     fn parses_and_finds_tags() {
