@@ -43,10 +43,15 @@
 //!   property every run in a paragraph agrees on up onto the
 //!   paragraph, then hoists whichever paragraph-level value is most
 //!   common up onto the document body (issue #285).
+//! - [`apply_tables_markup`]/[`apply_table_markup`]: builds real
+//!   `<table>`/`<tr>`/`<td>` markup and moves each cell's
+//!   already-built paragraphs into place (issue #286's `tables.py`
+//!   half; `numbering.py`'s `<ol>`/`<ul>`/`<li>` half is separate,
+//!   still open).
 //!
 //! Not yet wired into `DOCXToHTML` -- that still needs the footnote
-//! body conversion (#284) and everything downstream (frames,
-//! tables/numbering markup, TOC, OPF writing), none of which exist
+//! body conversion (#284) and everything downstream (numbering
+//! markup, frames, TOC, OPF writing), none of which exist
 //! here yet.
 //!
 //! # What `convert_run` defers, and why
@@ -89,6 +94,7 @@ use super::footnotes::Footnotes;
 use super::names::DocxNamespace;
 use super::settings::Settings;
 use super::styles::{PageProperties, Styles};
+use super::tables::Table;
 use super::theme::Theme;
 
 pub struct DOCXToHTML;
@@ -1553,6 +1559,138 @@ fn promote_most_common<T: Clone + PartialEq>(
     }
 
     Some(winner)
+}
+
+/// Renders every registered top-level [`Table`] into real
+/// `<table>`/`<tr>`/`<td>` markup, moving each cell's already-built
+/// paragraph elements (looked up in the reverse of `object_map`) into
+/// place.
+///
+/// Port of the Python `Tables.apply_markup`.
+pub fn apply_tables_markup<'a, 'i>(
+    dom: &mut Dom,
+    object_map: &IndexMap<NodeId, Node<'a, 'i>>,
+    page_map: &IndexMap<Node<'a, 'i>, PageProperties>,
+    styles: &mut Styles<'a, 'i>,
+    ns: &DocxNamespace,
+) {
+    let rmap: HashMap<Node<'a, 'i>, NodeId> = object_map.iter().map(|(&id, &n)| (n, id)).collect();
+    // Cloned out up front (`Table`/`Tables` are cheap to clone --
+    // `Node` is `Copy`, everything else is owned style data) so the
+    // borrow of `styles.tables()` ends before `apply_table_markup`
+    // needs `&mut styles` for `Styles::register` -- `Tables` lives
+    // inside `Styles` (#278), so holding both borrows at once isn't
+    // possible.
+    let tables: Vec<Table<'a, 'i>> = styles.tables().tables.clone();
+    for table in &tables {
+        let Some(page) = page_map.get(&table.tbl) else {
+            continue;
+        };
+        apply_table_markup(table, dom, &rmap, page, None, styles, ns);
+    }
+}
+
+/// Builds one `<table>` (recursing into sub-tables, which render
+/// inside their own `<td>` rather than getting their own top-level
+/// insertion point) and moves each cell's paragraphs into it.
+/// `removed_cells` (populated by `Table::new`'s `handle_merged_cells`
+/// during construction, #273) is consulted while re-walking `w:tr`/
+/// `w:tc` so an absorbed cell is skipped, the same effect Python gets
+/// for free by having physically deleted those `w:tc` elements from
+/// the (mutable, in Python) source tree.
+///
+/// Port of the Python `Table.apply_markup`. `self.table_style.page =
+/// page` has no Rust equivalent to write back to -- `TableStyle::css`
+/// already takes `page` as a parameter instead of reading it off a
+/// stored field (a simplification already in place since `tables.rs`
+/// was first ported, #271/#273).
+pub fn apply_table_markup<'a, 'i>(
+    table: &Table<'a, 'i>,
+    dom: &mut Dom,
+    rmap: &HashMap<Node<'a, 'i>, NodeId>,
+    page: &PageProperties,
+    parent: Option<NodeId>,
+    styles: &mut Styles<'a, 'i>,
+    ns: &DocxNamespace,
+) {
+    let table_el = dom.new_element("table");
+    if table.table_style.bidi == Some(true) {
+        dom.node_mut(table_el)
+            .attrs
+            .insert("dir".to_string(), "rtl".to_string());
+    }
+
+    match parent {
+        Some(p) => dom.append_child(p, table_el),
+        None => {
+            let Some(first_wp) = table.first_paragraph() else {
+                return;
+            };
+            let Some(&first_html) = rmap.get(&first_wp) else {
+                return;
+            };
+            let Some(container) = dom.parent(first_html) else {
+                return;
+            };
+            let idx = dom.index_in_parent(first_html).unwrap_or(0);
+            dom.insert_child(container, idx, table_el);
+        }
+    }
+
+    let mut style_map: Vec<(NodeId, super::block_styles::Css)> = Vec::new();
+
+    for row in ns.children(table.tbl, &["w:tr"]) {
+        let tr = dom.new_element("tr");
+        dom.append_child(table_el, tr);
+        if let Some(row_style) = table.style_map_row.get(&row) {
+            style_map.push((tr, row_style.css()));
+        }
+        for tc in ns.children(row, &["w:tc"]) {
+            if table.removed_cells.contains(&tc) {
+                continue;
+            }
+            let td = dom.new_element("td");
+            dom.append_child(tr, td);
+            if let Some(cell_style) = table.style_map_cell.get(&tc) {
+                if let Some(col_span) = cell_style.col_span {
+                    dom.node_mut(td)
+                        .attrs
+                        .insert("colspan".to_string(), col_span.to_string());
+                }
+                if let Some(row_span) = cell_style.row_span {
+                    dom.node_mut(td)
+                        .attrs
+                        .insert("rowspan".to_string(), row_span.to_string());
+                }
+                style_map.push((td, cell_style.css()));
+            }
+            for x in ns.children(tc, &["w:p", "w:tbl"]) {
+                if ns.is_tag(x, "w:p") {
+                    if let Some(&html) = rmap.get(&x) {
+                        dom.append_child(td, html);
+                    }
+                } else if let Some(sub) = table.sub_tables.get(&x) {
+                    apply_table_markup(sub, dom, rmap, page, Some(td), styles, ns);
+                }
+            }
+        }
+    }
+
+    let table_css = table.table_style.css(page);
+    if !table_css.is_empty() {
+        let cls = styles.register(table_css, "table");
+        dom.node_mut(table_el)
+            .attrs
+            .insert("class".to_string(), cls);
+    }
+    for (elem, css) in style_map {
+        if css.is_empty() {
+            continue;
+        }
+        let prefix = dom.tag(elem).unwrap_or("td").to_string();
+        let cls = styles.register(css, &prefix);
+        dom.node_mut(elem).attrs.insert("class".to_string(), cls);
+    }
 }
 
 #[cfg(test)]
@@ -3334,6 +3472,254 @@ mod cascade_tests {
                 .font_family
                 .as_deref(),
             Some("serif")
+        );
+    }
+}
+
+#[cfg(test)]
+mod apply_tables_markup_tests {
+    use super::*;
+    use crate::docx::tables::Tables;
+    use roxmltree::Document;
+
+    const DOC_OPEN: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:xml="http://www.w3.org/XML/1998/namespace""#;
+
+    fn parse_root(body: &str) -> (Document<'static>, DocxNamespace) {
+        let xml: &'static str =
+            Box::leak(format!("<w:root {DOC_OPEN}>{body}</w:root>").into_boxed_str());
+        (
+            Document::parse(xml).expect("valid XML"),
+            DocxNamespace::default(),
+        )
+    }
+
+    struct Harness<'a, 'i> {
+        dom: Dom,
+        state: ConvertState<'a, 'i>,
+        styles: Styles<'a, 'i>,
+        footnotes: Footnotes<'a, 'i>,
+        settings: Settings,
+        theme: Theme,
+    }
+
+    impl<'a, 'i> Harness<'a, 'i> {
+        fn new() -> Self {
+            Harness {
+                dom: Dom::empty(),
+                state: ConvertState::new(),
+                styles: Styles::new(Tables::default()),
+                footnotes: Footnotes::new(),
+                settings: Settings::new(),
+                theme: Theme::new(),
+            }
+        }
+
+        fn body(&mut self, doc: Node<'a, 'i>, ns: &DocxNamespace) -> NodeId {
+            convert_body(
+                &mut self.dom,
+                doc,
+                &mut self.state,
+                &mut self.styles,
+                &mut self.footnotes,
+                &self.settings,
+                &self.theme,
+                None,
+                "test-uuid",
+                &Relationships::default(),
+                ns,
+            )
+            .0
+        }
+    }
+
+    #[test]
+    fn a_two_by_two_table_is_rendered_and_paragraphs_move_into_their_cells() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:tbl>
+                   <w:tr>
+                     <w:tc><w:p><w:r><w:t>a</w:t></w:r></w:p></w:tc>
+                     <w:tc><w:p><w:r><w:t>b</w:t></w:r></w:p></w:tc>
+                   </w:tr>
+                   <w:tr>
+                     <w:tc><w:p><w:r><w:t>c</w:t></w:r></w:p></w:tc>
+                     <w:tc><w:p><w:r><w:t>d</w:t></w:r></w:p></w:tc>
+                   </w:tr>
+                 </w:tbl>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let body = h.body(document, &ns);
+
+        // Before apply_markup: the table's cell paragraphs sit flat,
+        // directly under <body> (the documented pre-existing leak --
+        // see tables.rs's module docs).
+        assert_eq!(h.dom.children(body).len(), 4);
+
+        let tbl = ns.descendants(document, &["w:tbl"])[0];
+        let mut page_map = IndexMap::new();
+        page_map.insert(tbl, PageProperties::new());
+
+        apply_tables_markup(
+            &mut h.dom,
+            &h.state.object_map,
+            &page_map,
+            &mut h.styles,
+            &ns,
+        );
+
+        // The 4 stray paragraphs are gone from <body> -- only the
+        // <table> remains, inserted where the first one used to be.
+        let body_children = h.dom.children(body);
+        assert_eq!(body_children.len(), 1);
+        let table = body_children[0];
+        assert_eq!(h.dom.tag(table), Some("table"));
+
+        let rows = h.dom.children(table);
+        assert_eq!(rows.len(), 2);
+        let mut letters = String::new();
+        for row in &rows {
+            assert_eq!(h.dom.tag(*row), Some("tr"));
+            let cells = h.dom.children(*row);
+            assert_eq!(cells.len(), 2);
+            for cell in &cells {
+                assert_eq!(h.dom.tag(*cell), Some("td"));
+                let cell_children = h.dom.children(*cell);
+                assert_eq!(cell_children.len(), 1);
+                assert_eq!(h.dom.tag(cell_children[0]), Some("p"));
+                // `Dom::text_content` isn't used here -- see the
+                // `dom_text_content_bug` memory note (a pre-existing,
+                // unrelated ordering bug found while writing this
+                // test); `serialize` is unaffected and already
+                // covered elsewhere.
+                letters.push_str(&h.dom.serialize(cell_children[0]));
+            }
+        }
+        assert_eq!(
+            letters,
+            "<p><span>a</span></p><p><span>b</span></p><p><span>c</span></p><p><span>d</span></p>"
+        );
+    }
+
+    #[test]
+    fn a_merged_cell_is_skipped_and_the_survivor_gets_colspan() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:tbl>
+                   <w:tr>
+                     <w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr><w:p><w:r><w:t>wide</w:t></w:r></w:p></w:tc>
+                     <w:tc><w:p><w:r><w:t>skipped</w:t></w:r></w:p></w:tc>
+                   </w:tr>
+                 </w:tbl>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let body = h.body(document, &ns);
+
+        let tbl = ns.descendants(document, &["w:tbl"])[0];
+        let mut page_map = IndexMap::new();
+        page_map.insert(tbl, PageProperties::new());
+
+        apply_tables_markup(
+            &mut h.dom,
+            &h.state.object_map,
+            &page_map,
+            &mut h.styles,
+            &ns,
+        );
+
+        let table = h.dom.children(body)[0];
+        let row = h.dom.children(table)[0];
+        let cells = h.dom.children(row);
+        // gridSpan alone (no w:vMerge) doesn't trigger
+        // handle_merged_cells's physical-cell-removal path -- that
+        // only fires for hMerge "continue" runs. This table has two
+        // real <w:tc> elements, so both remain; this test's actual
+        // point is the colspan attribute landing on the wide cell.
+        assert_eq!(cells.len(), 2);
+        assert_eq!(
+            h.dom
+                .node(cells[0])
+                .attrs
+                .get("colspan")
+                .map(String::as_str),
+            Some("2")
+        );
+    }
+
+    #[test]
+    fn a_table_with_no_explicit_style_still_gets_a_border_collapse_class() {
+        // TableStyle::css always emits `border-collapse: collapse`
+        // when nothing else set it (matching Python's own
+        // `if 'border-collapse' not in c: c['border-collapse'] =
+        // 'collapse'`) -- so even a fully unstyled table isn't
+        // class-less, unlike an unstyled row/cell.
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:tbl>
+                   <w:tr><w:tc><w:p><w:r><w:t>a</w:t></w:r></w:p></w:tc></w:tr>
+                 </w:tbl>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let body = h.body(document, &ns);
+
+        let tbl = ns.descendants(document, &["w:tbl"])[0];
+        let mut page_map = IndexMap::new();
+        page_map.insert(tbl, PageProperties::new());
+
+        apply_tables_markup(
+            &mut h.dom,
+            &h.state.object_map,
+            &page_map,
+            &mut h.styles,
+            &ns,
+        );
+
+        let table = h.dom.children(body)[0];
+        let class = h
+            .dom
+            .node(table)
+            .attrs
+            .get("class")
+            .cloned()
+            .expect("border-collapse always registers a class");
+        assert!(class.starts_with("table_"));
+    }
+
+    #[test]
+    fn a_bidi_table_gets_a_dir_attribute() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:tbl>
+                   <w:tblPr><w:bidiVisual/></w:tblPr>
+                   <w:tr><w:tc><w:p><w:r><w:t>a</w:t></w:r></w:p></w:tc></w:tr>
+                 </w:tbl>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let body = h.body(document, &ns);
+
+        let tbl = ns.descendants(document, &["w:tbl"])[0];
+        let mut page_map = IndexMap::new();
+        page_map.insert(tbl, PageProperties::new());
+
+        apply_tables_markup(
+            &mut h.dom,
+            &h.state.object_map,
+            &page_map,
+            &mut h.styles,
+            &ns,
+        );
+
+        let table = h.dom.children(body)[0];
+        assert_eq!(
+            h.dom.node(table).attrs.get("dir").map(String::as_str),
+            Some("rtl")
         );
     }
 }
