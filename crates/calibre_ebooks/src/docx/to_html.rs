@@ -52,10 +52,15 @@
 //!   (via [`commit_list_run`]), and rewrites custom-bullet-text lists
 //!   into a CSS-table layout (issue #286's `numbering.py` half --
 //!   closes #286).
+//! - [`apply_block_run_frames`]: wraps each of
+//!   `ConvertState::block_runs`' merged paragraph runs (from
+//!   [`mark_block_runs`]) in a bordered `<div>`, populating
+//!   `ConvertState::framed_map` (issue #287's block-run half; the
+//!   `w:framePr`-based half is separate, still open).
 //!
 //! Not yet wired into `DOCXToHTML` -- that still needs the footnote
-//! body conversion (#284) and everything downstream (frames, TOC,
-//! OPF writing), none of which exist here yet.
+//! body conversion (#284) and everything downstream (the rest of
+//! `apply_frames`, TOC, OPF writing), none of which exist here yet.
 //!
 //! # What `convert_run` defers, and why
 //!
@@ -88,7 +93,7 @@ use roxmltree::{Document, Node};
 
 use crate::dom::{Dom, NodeId, NodeKind};
 
-use super::block_styles::{pt, Edge, Frame, ParagraphStyle};
+use super::block_styles::{pt, Css, Edge, Frame, ParagraphStyle};
 use super::char_styles::RunStyle;
 use super::container::{Docx, Relationships};
 use super::error::DocxError;
@@ -553,6 +558,13 @@ pub struct ConvertState<'a, 'i> {
     /// `removed_cells` are (see `docx::styles`/`docx::tables`'s module
     /// docs). Consumed by the not-yet-ported `Styles::cascade` (#285).
     pub is_link: HashSet<Node<'a, 'i>>,
+    /// HTML `<div>` frame wrapper -> its CSS, populated by
+    /// [`apply_block_run_frames`] (and, once ported, the other half of
+    /// `apply_frames` that consumes `w:framePr`). Consumed by the
+    /// not-yet-ported final class-assignment pass (issue #288):
+    /// `styles.class_name(css)` looks up the class each frame was
+    /// registered under.
+    pub framed_map: HashMap<NodeId, Css>,
 }
 
 impl<'a, 'i> ConvertState<'a, 'i> {
@@ -1983,6 +1995,94 @@ fn commit_list_run<'a, 'i>(
             dom.node_mut(child).attrs.shift_remove("value");
         }
         last_val = Some(val);
+    }
+}
+
+/// Wraps each of [`ConvertState::block_runs`]'s merged paragraph runs
+/// (from [`mark_block_runs`]) in a `<div>` carrying the run's merged
+/// border as CSS, populating [`ConvertState::framed_map`].
+///
+/// Three cases, depending on where the run's paragraphs sit in the
+/// numbering-markup-produced tree (issue #298 may have retagged them
+/// `<li>` and grouped them into a list, or further rewritten a
+/// custom-bullet-text list into nested `display:table` `<div>`s):
+///
+/// - If the run *is* an entire `<ul>`/`<ol>` (every member is a direct
+///   `<li>` child of one list, and that list has no other content),
+///   the whole list element is wrapped, not the individual `<li>`s.
+/// - Else if any member is (or, after #298's table-layout rewrite,
+///   was) an `<li>`, each member is walked up to whichever ancestor is
+///   a *direct* child of the run's common parent (climbing past any
+///   nested `display:table`/`display:table-row` wrapper `<div>`s) --
+///   deduplicated, since two members can climb to the same ancestor.
+/// - Otherwise the members themselves are wrapped directly.
+///
+/// Port of the `if not self.block_runs: return` block-run half of the
+/// Python `Convert.apply_frames`. The other half (the `for run in
+/// filter(None, self.framed): ...` loop, `w:framePr`-based frames) is
+/// a separate, larger piece needing `add_frame`/`ConvertState::framed`
+/// state this crate hasn't designed yet -- see issue #287.
+pub fn apply_block_run_frames<'a, 'i>(
+    dom: &mut Dom,
+    state: &mut ConvertState<'a, 'i>,
+    styles: &mut Styles<'a, 'i>,
+    object_map: &IndexMap<NodeId, Node<'a, 'i>>,
+) {
+    if state.block_runs.is_empty() {
+        return;
+    }
+    let rmap: HashMap<Node<'a, 'i>, NodeId> = object_map.iter().map(|(&id, &n)| (n, id)).collect();
+    let block_runs = std::mem::take(&mut state.block_runs);
+
+    for (border_style, blocks) in &block_runs {
+        let paras: Vec<NodeId> = blocks.iter().filter_map(|p| rmap.get(p).copied()).collect();
+        let Some(&first) = paras.first() else {
+            continue;
+        };
+        let has_li = paras.iter().any(|&p| dom.tag(p) == Some("li"));
+        let Some(parent) = dom.parent(first) else {
+            continue;
+        };
+
+        let (frame_parent, idx, elems) = if matches!(dom.tag(parent), Some("ul") | Some("ol")) {
+            let Some(outer) = dom.parent(parent) else {
+                continue;
+            };
+            let idx = dom.index_in_parent(parent).unwrap_or(0);
+            (outer, idx, vec![parent])
+        } else if has_li {
+            let mut top: Vec<NodeId> = Vec::new();
+            for &p in &paras {
+                let mut x = p;
+                while let Some(q) = dom.parent(x) {
+                    if q == parent {
+                        break;
+                    }
+                    x = q;
+                }
+                if !top.contains(&x) {
+                    top.push(x);
+                }
+            }
+            let Some(&first_top) = top.first() else {
+                continue;
+            };
+            let idx = dom.index_in_parent(first_top).unwrap_or(0);
+            (parent, idx, top)
+        } else {
+            let idx = dom.index_in_parent(first).unwrap_or(0);
+            (parent, idx, paras.clone())
+        };
+
+        let frame = dom.new_element("div");
+        for &e in &elems {
+            dom.append_child(frame, e);
+        }
+        dom.insert_child(frame_parent, idx, frame);
+
+        let css = border_style.css();
+        state.framed_map.insert(frame, css.clone());
+        styles.register(css, "frame");
     }
 }
 
@@ -4262,5 +4362,213 @@ mod apply_numbering_markup_tests {
             Some("3"),
             "not a +1 continuation of the level-1 item, so value is kept"
         );
+    }
+}
+
+#[cfg(test)]
+mod apply_block_run_frames_tests {
+    use super::*;
+    use crate::docx::tables::Tables;
+    use roxmltree::Document;
+
+    const DOC_OPEN: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:xml="http://www.w3.org/XML/1998/namespace""#;
+    const BORDER: &str = r#"<w:pBdr><w:top w:val="single" w:sz="8" w:color="FF0000"/><w:bottom w:val="single" w:sz="8" w:color="FF0000"/></w:pBdr>"#;
+
+    fn parse_root(body: &str) -> (Document<'static>, DocxNamespace) {
+        let xml: &'static str =
+            Box::leak(format!("<w:root {DOC_OPEN}>{body}</w:root>").into_boxed_str());
+        (
+            Document::parse(xml).expect("valid XML"),
+            DocxNamespace::default(),
+        )
+    }
+
+    fn numbering_with_decimal_list() -> Numbering {
+        let xml: &'static str = Box::leak(
+            r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+                 <w:abstractNum w:abstractNumId="1">
+                   <w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl>
+                 </w:abstractNum>
+                 <w:num w:numId="9"><w:abstractNumId w:val="1"/></w:num>
+               </w:numbering>"#
+                .to_string()
+                .into_boxed_str(),
+        );
+        let doc: &'static Document<'static> =
+            Box::leak(Box::new(Document::parse(xml).expect("valid XML")));
+        let ns = DocxNamespace::default();
+        let mut numbering = Numbering::new();
+        numbering.call(doc.root_element(), &HashMap::new(), &ns);
+        numbering
+    }
+
+    struct Harness<'a, 'i> {
+        dom: Dom,
+        state: ConvertState<'a, 'i>,
+        styles: Styles<'a, 'i>,
+        footnotes: Footnotes<'a, 'i>,
+        settings: Settings,
+        theme: Theme,
+    }
+
+    impl<'a, 'i> Harness<'a, 'i> {
+        fn new() -> Self {
+            Harness {
+                dom: Dom::empty(),
+                state: ConvertState::new(),
+                styles: Styles::new(Tables::default()),
+                footnotes: Footnotes::new(),
+                settings: Settings::new(),
+                theme: Theme::new(),
+            }
+        }
+
+        fn body(&mut self, doc: Node<'a, 'i>, ns: &DocxNamespace) -> (NodeId, Vec<Node<'a, 'i>>) {
+            convert_body(
+                &mut self.dom,
+                doc,
+                &mut self.state,
+                &mut self.styles,
+                &mut self.footnotes,
+                &self.settings,
+                &self.theme,
+                None,
+                "test-uuid",
+                &Relationships::default(),
+                ns,
+            )
+        }
+    }
+
+    #[test]
+    fn two_bordered_plain_paragraphs_are_wrapped_in_one_div() {
+        let (doc, ns) = parse_root(&format!(
+            r#"<w:document><w:body>
+                 <w:p><w:pPr>{BORDER}</w:pPr><w:r><w:t>a</w:t></w:r></w:p>
+                 <w:p><w:pPr>{BORDER}</w:pPr><w:r><w:t>b</w:t></w:r></w:p>
+               </w:body></w:document>"#
+        ));
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let (body, paras) = h.body(document, &ns);
+        mark_block_runs(&mut h.state, &paras, &mut h.styles, &ns);
+        assert_eq!(h.state.block_runs.len(), 1);
+
+        let object_map = h.state.object_map.clone();
+        apply_block_run_frames(&mut h.dom, &mut h.state, &mut h.styles, &object_map);
+
+        let body_children = h.dom.children(body);
+        assert_eq!(body_children.len(), 1);
+        let frame = body_children[0];
+        assert_eq!(h.dom.tag(frame), Some("div"));
+        let inner = h.dom.children(frame);
+        assert_eq!(inner.len(), 2);
+        assert_eq!(h.dom.tag(inner[0]), Some("p"));
+        assert_eq!(h.dom.tag(inner[1]), Some("p"));
+        assert!(h.state.block_runs.is_empty(), "consumed");
+        assert_eq!(h.state.framed_map.len(), 1);
+        assert!(h.state.framed_map.contains_key(&frame));
+    }
+
+    #[test]
+    fn a_whole_bordered_list_is_wrapped_by_wrapping_the_ol_itself() {
+        let (doc, ns) = parse_root(&format!(
+            r#"<w:document><w:body>
+                 <w:p><w:pPr>{BORDER}<w:numPr><w:ilvl w:val="0"/><w:numId w:val="9"/></w:numPr></w:pPr><w:r><w:t>a</w:t></w:r></w:p>
+                 <w:p><w:pPr>{BORDER}<w:numPr><w:ilvl w:val="0"/><w:numId w:val="9"/></w:numPr></w:pPr><w:r><w:t>b</w:t></w:r></w:p>
+               </w:body></w:document>"#
+        ));
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let (body, paras) = h.body(document, &ns);
+        mark_block_runs(&mut h.state, &paras, &mut h.styles, &ns);
+        assert_eq!(h.state.block_runs.len(), 1);
+
+        let mut numbering = numbering_with_decimal_list();
+        apply_numbering_markup(
+            &mut numbering,
+            &mut h.dom,
+            body,
+            &mut h.styles,
+            &h.state.object_map,
+            &ns,
+        );
+        // Sanity check: numbering markup produced exactly one <ol>
+        // wrapping both <li>s before we test the frame wrap.
+        assert_eq!(h.dom.children(body).len(), 1);
+        assert_eq!(h.dom.tag(h.dom.children(body)[0]), Some("ol"));
+
+        let object_map = h.state.object_map.clone();
+        apply_block_run_frames(&mut h.dom, &mut h.state, &mut h.styles, &object_map);
+
+        let body_children = h.dom.children(body);
+        assert_eq!(body_children.len(), 1);
+        let frame = body_children[0];
+        assert_eq!(h.dom.tag(frame), Some("div"));
+        let inner = h.dom.children(frame);
+        assert_eq!(inner.len(), 1);
+        assert_eq!(h.dom.tag(inner[0]), Some("ol"));
+        assert_eq!(h.dom.children(inner[0]).len(), 2, "both <li>s still inside");
+    }
+
+    #[test]
+    fn a_plain_paragraph_and_a_single_item_list_sharing_a_border_climb_to_the_ol() {
+        let (doc, ns) = parse_root(&format!(
+            r#"<w:document><w:body>
+                 <w:p><w:pPr>{BORDER}</w:pPr><w:r><w:t>a</w:t></w:r></w:p>
+                 <w:p><w:pPr>{BORDER}<w:numPr><w:ilvl w:val="0"/><w:numId w:val="9"/></w:numPr></w:pPr><w:r><w:t>b</w:t></w:r></w:p>
+               </w:body></w:document>"#
+        ));
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let (body, paras) = h.body(document, &ns);
+        mark_block_runs(&mut h.state, &paras, &mut h.styles, &ns);
+        assert_eq!(h.state.block_runs.len(), 1);
+
+        let mut numbering = numbering_with_decimal_list();
+        apply_numbering_markup(
+            &mut numbering,
+            &mut h.dom,
+            body,
+            &mut h.styles,
+            &h.state.object_map,
+            &ns,
+        );
+        // Sanity check: <p>a</p> then a single-item <ol> for b.
+        let before = h.dom.children(body);
+        assert_eq!(before.len(), 2);
+        assert_eq!(h.dom.tag(before[0]), Some("p"));
+        assert_eq!(h.dom.tag(before[1]), Some("ol"));
+
+        let object_map = h.state.object_map.clone();
+        apply_block_run_frames(&mut h.dom, &mut h.state, &mut h.styles, &object_map);
+
+        let body_children = h.dom.children(body);
+        assert_eq!(body_children.len(), 1);
+        let frame = body_children[0];
+        assert_eq!(h.dom.tag(frame), Some("div"));
+        let inner = h.dom.children(frame);
+        assert_eq!(inner.len(), 2);
+        assert_eq!(h.dom.tag(inner[0]), Some("p"));
+        assert_eq!(h.dom.tag(inner[1]), Some("ol"));
+    }
+
+    #[test]
+    fn no_block_runs_is_a_no_op() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p><w:r><w:t>a</w:t></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let (body, _paras) = h.body(document, &ns);
+
+        let object_map = h.state.object_map.clone();
+        apply_block_run_frames(&mut h.dom, &mut h.state, &mut h.styles, &object_map);
+
+        assert_eq!(h.dom.children(body).len(), 1);
+        assert_eq!(h.dom.tag(h.dom.children(body)[0]), Some("p"));
+        assert!(h.state.framed_map.is_empty());
     }
 }
