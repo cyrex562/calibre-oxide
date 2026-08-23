@@ -21,8 +21,8 @@ use anyhow::Result;
 use crate::oeb::constants::{DC11_NS, OPF2_NS};
 use crate::oeb::polish::toc::{find_existing_nav_toc, parse_nav};
 use crate::oeb::polish::utils::guess_type;
-use crate::oeb::polish::xmltree::XmlNodeId;
 use crate::xml_util::prepare_string_for_xml as xml;
+use crate::xmltree::XmlNodeId;
 
 use super::super::container::Container;
 use super::base::{CheckError, Level};

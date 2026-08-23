@@ -77,4 +77,3 @@ pub mod subset;
 pub mod toc;
 pub mod upgrade;
 pub mod utils;
-pub mod xmltree;

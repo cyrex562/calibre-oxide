@@ -35,4 +35,5 @@ pub mod textile;
 pub mod txt;
 pub mod unihandecode;
 pub mod xml_util;
+pub mod xmltree;
 pub mod zipfile_safe_replace;

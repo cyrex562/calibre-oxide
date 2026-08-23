@@ -50,7 +50,7 @@ use crate::oeb::constants::{OEB_DOCS, OPF2_NS};
 use super::container::Container;
 use super::replace;
 use super::toc;
-use super::xmltree::XmlNodeId;
+use crate::xmltree::XmlNodeId;
 
 // ===================================================================
 // Shared helpers

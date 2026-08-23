@@ -14,7 +14,7 @@
 //! `lxml.etree` gives every one of those the same `.text`/`.tail`/
 //! `.get`/`.set` API. This crate has two structurally different tree
 //! types for the same reason `container.rs` does (see its module docs):
-//! [`super::xmltree::Xml`] for strict XML (OPF, NCX) and
+//! [`crate::xmltree::Xml`] for strict XML (OPF, NCX) and
 //! [`crate::dom::Dom`] for tag-soup HTML5. [`TreeNode`] is the
 //! discriminated union that replaces "any lxml element": callers that
 //! need to read/write a location's text dispatch on it via
@@ -70,7 +70,7 @@ use crate::dom::{Dom, NodeId, NodeKind};
 
 use super::container::Container;
 use super::toc::{find_existing_nav_toc, find_existing_ncx_toc};
-use super::xmltree::{Xml, XmlNodeId, XmlNodeKind};
+use crate::xmltree::{Xml, XmlNodeId, XmlNodeKind};
 
 // ===================================================================
 // Locale parsing (narrow `calibre.spell.parse_lang_code`)

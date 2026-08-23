@@ -32,7 +32,7 @@ use crate::dom::{Dom, NodeId, NodeKind};
 use crate::oeb::constants::{DC11_NS, NCX_MIME, OEB_DOCS, OEB_STYLES, SVG_MIME, XML_MIME};
 
 use super::container::{opf_namespaces, Container, ContainerBase};
-use super::xmltree::{Xml, XmlNodeId, XmlNodeKind};
+use crate::xmltree::{Xml, XmlNodeId, XmlNodeKind};
 
 /// Port of `isspace`: is `x` made up entirely of tab/newline/formfeed/
 /// carriage-return/space characters (true for the empty string too,
