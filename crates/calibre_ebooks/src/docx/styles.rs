@@ -467,6 +467,18 @@ impl<'a, 'i> Styles<'a, 'i> {
         ans
     }
 
+    /// Write-back setter for a cached paragraph's `text_indent`, the
+    /// same post-`resolve_paragraph` mutation need
+    /// [`Styles::set_run_font_family`]/[`Styles::clear_run_border`]
+    /// cover for runs -- `to_html.py`'s tab-to-text-indent cleanup
+    /// pass calls `resolve(wp)` and then mutates the object it got
+    /// back in place.
+    pub fn set_paragraph_text_indent(&mut self, p: Node<'a, 'i>, text_indent: String) {
+        if let Some(cached) = self.para_cache.get_mut(&p) {
+            cached.text_indent = Some(text_indent);
+        }
+    }
+
     /// The final, fully cascaded style for one `w:r`, cached by node
     /// identity. Font resolution stops short of `fonts.py`'s system
     /// font matching -- see the module docs.

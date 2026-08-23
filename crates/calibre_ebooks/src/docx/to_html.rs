@@ -25,7 +25,9 @@
 //! [`super::styles::Styles::apply_section_page_breaks`] afterward, all
 //! matching `Convert.__call__`'s paragraph loop; and
 //! [`read_block_anchors`], which assigns ids to paragraphs a top-level
-//! bookmark precedes. Not yet wired into `DOCXToHTML` -- that still
+//! bookmark precedes; and [`apply_tab_indentation`], which folds
+//! leading `w:tab`-based paragraph indentation into a `text-indent`
+//! CSS value. Not yet wired into `DOCXToHTML` -- that still
 //! needs `mark_block_runs` and everything downstream (links, frames,
 //! tables/numbering markup, TOC, OPF writing), none of which exist
 //! here yet.
@@ -967,6 +969,132 @@ pub fn read_block_anchors<'a, 'i>(
                     current_bm.push(anchor.to_string());
                 }
             }
+        }
+    }
+}
+
+/// Rewrites a paragraph that starts with one or more `w:tab`-rendered
+/// `<span class="tab">` elements (and nothing else before them) into
+/// an equivalent `text-indent` CSS value, removing the now-redundant
+/// leading tab spans -- Word documents commonly use leading tabs for
+/// paragraph indentation instead of an actual `w:ind` setting.
+///
+/// Walks every converted paragraph in `state.object_map`. For each
+/// one whose first run's first child is a `class="tab"` span, collects
+/// the *leading run* of same-condition tab spans (stopping at the
+/// first non-tab child, or at a tab span immediately followed by real
+/// text -- that text becomes the paragraph's new leading text once the
+/// tabs are gone). If the paragraph's resolved `text_indent` is either
+/// unset or already a `"...pt"` value (added to, not replaced by, the
+/// new indent), the leading tabs are removed and `text_indent` is
+/// updated via [`Styles::set_paragraph_text_indent`]; otherwise (some
+/// other CSS unit) the paragraph is left untouched.
+///
+/// Port of the tab-to-`text-indent` loop inside `Convert.__call__`:
+/// ```text
+/// for p, wp in self.object_map.items():
+///     if len(p) > 0 and not p.text and len(p[0]) > 0 and not p[0].text \
+///             and p[0][0].get('class', None) == 'tab':
+///         parent = p[0]
+///         tabs = []
+///         for child in parent:
+///             if child.get('class', None) == 'tab':
+///                 tabs.append(child)
+///                 if child.tail:
+///                     break
+///             else:
+///                 break
+///         indent = len(tabs) * self.settings.default_tab_stop
+///         style = self.styles.resolve(wp)
+///         if style.text_indent is inherit or (... and style.text_indent.endswith('pt')):
+///             if style.text_indent is not inherit:
+///                 indent = float(style.text_indent[:-2]) + indent
+///             style.text_indent = f'{indent:.3g}pt'
+///             parent.text = tabs[-1].tail or ''
+///             for i in tabs:
+///                 parent.remove(i)
+/// ```
+/// `crate::dom`'s sibling-text-node model has no `.text`/`.tail`
+/// fields (see the module docs' "No `Text` buffering" note): a
+/// lxml-style "does `p` have leading text before its first child
+/// element" check becomes "is `p`'s first child, if any, itself an
+/// element" here, and a tab span's "tail" is simply its next sibling,
+/// when that sibling is a non-empty text node.
+pub fn apply_tab_indentation<'a, 'i>(
+    dom: &mut Dom,
+    state: &ConvertState<'a, 'i>,
+    styles: &mut Styles<'a, 'i>,
+    settings: &Settings,
+    ns: &DocxNamespace,
+) {
+    let entries: Vec<(NodeId, Node<'a, 'i>)> =
+        state.object_map.iter().map(|(&id, &n)| (id, n)).collect();
+
+    for (p, wp) in entries {
+        let Some(&run_span) = dom.children(p).first() else {
+            continue;
+        };
+        if !matches!(dom.node(run_span).kind, NodeKind::Element(_)) {
+            continue;
+        }
+        let run_children = dom.children(run_span);
+        let Some(&first) = run_children.first() else {
+            continue;
+        };
+        if !matches!(dom.node(first).kind, NodeKind::Element(_)) {
+            continue;
+        }
+        if dom.node(first).attrs.get("class").map(String::as_str) != Some("tab") {
+            continue;
+        }
+
+        let mut tabs: Vec<NodeId> = Vec::new();
+        let mut tail_node: Option<NodeId> = None;
+        for (pos, &child) in run_children.iter().enumerate() {
+            if !matches!(dom.node(child).kind, NodeKind::Element(_)) {
+                continue;
+            }
+            if dom.node(child).attrs.get("class").map(String::as_str) != Some("tab") {
+                break;
+            }
+            tabs.push(child);
+            if let Some(&next) = run_children.get(pos + 1) {
+                if let NodeKind::Text(t) = &dom.node(next).kind {
+                    if !t.is_empty() {
+                        tail_node = Some(next);
+                        break;
+                    }
+                }
+            }
+        }
+        if tabs.is_empty() {
+            continue;
+        }
+
+        let mut indent = tabs.len() as f64 * settings.default_tab_stop;
+        let style = styles.resolve_paragraph(wp, ns);
+        let eligible = match &style.text_indent {
+            None => true,
+            Some(v) => v.ends_with("pt"),
+        };
+        if !eligible {
+            continue;
+        }
+        if let Some(existing) = style
+            .text_indent
+            .as_deref()
+            .and_then(|v| v.strip_suffix("pt"))
+            .and_then(|n| n.parse::<f64>().ok())
+        {
+            indent += existing;
+        }
+        styles.set_paragraph_text_indent(wp, super::block_styles::pt(indent));
+
+        for &t in &tabs {
+            dom.detach(t);
+        }
+        if let Some(tail) = tail_node {
+            dom.insert_child(run_span, 0, tail);
         }
     }
 }
@@ -1973,5 +2101,180 @@ mod read_block_anchors_tests {
         let p = h.dom.children(body)[0];
         assert!(h.dom.node(p).attrs.get("id").is_none());
         assert!(h.state.anchor_map.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod apply_tab_indentation_tests {
+    use super::*;
+    use crate::docx::tables::Tables;
+    use roxmltree::Document;
+
+    const DOC_OPEN: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:xml="http://www.w3.org/XML/1998/namespace""#;
+
+    fn parse_root(body: &str) -> (Document<'static>, DocxNamespace) {
+        let xml: &'static str =
+            Box::leak(format!("<w:root {DOC_OPEN}>{body}</w:root>").into_boxed_str());
+        (
+            Document::parse(xml).expect("valid XML"),
+            DocxNamespace::default(),
+        )
+    }
+
+    struct Harness<'a, 'i> {
+        dom: Dom,
+        state: ConvertState<'a, 'i>,
+        styles: Styles<'a, 'i>,
+        footnotes: Footnotes<'a, 'i>,
+        settings: Settings,
+        theme: Theme,
+    }
+
+    impl<'a, 'i> Harness<'a, 'i> {
+        fn new() -> Self {
+            Harness {
+                dom: Dom::empty(),
+                state: ConvertState::new(),
+                styles: Styles::new(Tables::default()),
+                footnotes: Footnotes::new(),
+                settings: Settings::new(),
+                theme: Theme::new(),
+            }
+        }
+
+        fn body(&mut self, doc: Node<'a, 'i>, ns: &DocxNamespace) -> NodeId {
+            convert_body(
+                &mut self.dom,
+                doc,
+                &mut self.state,
+                &mut self.styles,
+                &mut self.footnotes,
+                &self.settings,
+                &self.theme,
+                None,
+                "test-uuid",
+                ns,
+            )
+            .0
+        }
+    }
+
+    #[test]
+    fn two_leading_tabs_become_a_text_indent_and_are_removed() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p><w:r><w:tab/><w:tab/><w:t>hello</w:t></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let body = h.body(document, &ns);
+        apply_tab_indentation(&mut h.dom, &h.state, &mut h.styles, &h.settings, &ns);
+
+        let p = h.dom.children(body)[0];
+        assert_eq!(h.dom.serialize(p), "<p><span>hello</span></p>");
+
+        let wp = *h.state.object_map.get(&p).unwrap();
+        let style = h.styles.resolve_paragraph(wp, &ns);
+        assert_eq!(style.text_indent.as_deref(), Some("72pt"));
+    }
+
+    #[test]
+    fn an_existing_pt_text_indent_gets_the_tab_based_indent_added_to_it() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p><w:pPr><w:ind w:firstLine="240"/></w:pPr>
+                   <w:r><w:tab/><w:t>hello</w:t></w:r>
+                 </w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let body = h.body(document, &ns);
+        apply_tab_indentation(&mut h.dom, &h.state, &mut h.styles, &h.settings, &ns);
+
+        let p = h.dom.children(body)[0];
+        assert_eq!(h.dom.serialize(p), "<p><span>hello</span></p>");
+
+        let wp = *h.state.object_map.get(&p).unwrap();
+        let style = h.styles.resolve_paragraph(wp, &ns);
+        // 12pt (w:firstLine="240" twips) + 36pt (one tab) = 48pt.
+        assert_eq!(style.text_indent.as_deref(), Some("48pt"));
+    }
+
+    #[test]
+    fn a_non_pt_text_indent_is_left_untouched() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p><w:pPr><w:ind w:firstLineChars="100"/></w:pPr>
+                   <w:r><w:tab/><w:t>hello</w:t></w:r>
+                 </w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let body = h.body(document, &ns);
+        apply_tab_indentation(&mut h.dom, &h.state, &mut h.styles, &h.settings, &ns);
+
+        let p = h.dom.children(body)[0];
+        // The tab span survives untouched -- an "em" indent isn't
+        // eligible for the tab-merge, matching Python.
+        let run_span = h.dom.children(p)[0];
+        assert_eq!(h.dom.tag(h.dom.children(run_span)[0]), Some("span"));
+        assert_eq!(
+            h.dom
+                .node(h.dom.children(run_span)[0])
+                .attrs
+                .get("class")
+                .map(String::as_str),
+            Some("tab")
+        );
+
+        let wp = *h.state.object_map.get(&p).unwrap();
+        let style = h.styles.resolve_paragraph(wp, &ns);
+        assert_eq!(style.text_indent.as_deref(), Some("1em"));
+    }
+
+    #[test]
+    fn a_paragraph_not_starting_with_a_tab_is_left_untouched() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p><w:r><w:t>hello</w:t></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let body = h.body(document, &ns);
+        apply_tab_indentation(&mut h.dom, &h.state, &mut h.styles, &h.settings, &ns);
+
+        let p = h.dom.children(body)[0];
+        assert_eq!(h.dom.serialize(p), "<p><span>hello</span></p>");
+    }
+
+    #[test]
+    fn a_tab_followed_by_a_non_tab_element_stops_collection_there() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p><w:r><w:tab/><w:br/><w:t>after</w:t></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let body = h.body(document, &ns);
+        apply_tab_indentation(&mut h.dom, &h.state, &mut h.styles, &h.settings, &ns);
+
+        let p = h.dom.children(body)[0];
+        let run_span = h.dom.children(p)[0];
+        let run_children = h.dom.children(run_span);
+        // The tab is gone, but the <br> (a non-tab element) that
+        // stopped collection -- and anything after it -- is left in
+        // place rather than being folded into a new leading text node
+        // (there was no tail text on the removed tab to fold in).
+        assert_eq!(run_children.len(), 2);
+        assert_eq!(h.dom.tag(run_children[0]), Some("br"));
+
+        let wp = *h.state.object_map.get(&p).unwrap();
+        let style = h.styles.resolve_paragraph(wp, &ns);
+        assert_eq!(style.text_indent.as_deref(), Some("36pt"));
     }
 }
