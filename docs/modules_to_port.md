@@ -364,7 +364,7 @@ either -- this pass wasn't exhaustive.
 - [ ] fonts.py (`is_symbol_font`/`map_symbol_text`/`SYMBOL_MAPS` ported to `docx/fonts.rs`; the `Fonts` class itself still needs a system font scanner — see #130)
 - [x] `footnotes.py` -> `docx/footnotes.rs`
 - [ ] images.py (pure geometry/CSS half ported to `docx/images.rs` — `image_filename`/`emu_to_pt`/`pt_to_emu`/`get_image_properties`/`get_image_margins`/`get_hpos`/`get_float_properties`, two upstream bugs reproduced faithfully — the `Images` struct itself (embedded-image extraction/resize, `w:drawing`/`w:pict` → `<img>` markup) still needs the mutable HTML tree — see #130/#289)
-- [ ] index.py (needs the mutable HTML tree — see #130)
+- [ ] index.py (`polish_index_markup` half — `get_applicable_xe_fields`/`split_up_block`/`find_match`/`add_link`/`merge_blocks`/`polish_index_markup` — ported to `docx/index.rs`, incl. a real reproduced `split_up_block` bug (wrong `ldict` depth from a shadowed loop variable), cross-validated by hand-tracing the real algorithm — `make_block`/`add_xe`/`process_index` still need the mutable *source* tree, same open question as `fields.py`'s `parse_xe` — see #130/#293)
 - [x] `lcid.py` -> `docx/lcid.rs`
 - [x] `names.py` -> `docx/names.rs`
 - [x] numbering.py (`Level`/`NumberingDefinition`/`Numbering` reading, plus `Level::css`/`char_css`, in `docx/numbering.rs`; `apply_markup` ported as `docx/to_html.rs`'s `apply_numbering_markup` — `Level::css` omits `list-style-image` for picture bullets, deferred to `images.py` (#289) — see #130/#286)
