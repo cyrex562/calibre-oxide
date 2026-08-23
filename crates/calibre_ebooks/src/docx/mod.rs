@@ -21,6 +21,7 @@
 //! | `tables.py` (partial) | [`tables`] |
 //! | `styles.py` (partial) | [`styles`] |
 //! | `fonts.py` (partial) | [`fonts`] |
+//! | `toc.py` | [`toc`] |
 //!
 //! The four "partial" rows above port everything except HTML-markup
 //! construction: `numbering.rs` has `Level`/`NumberingDefinition`/
@@ -39,14 +40,15 @@
 //! system dependency) but not the `Fonts` class itself (embedded-font
 //! extraction, `family_for`'s system-installed-font matching), which
 //! needs a font scanner with no Rust counterpart.
-//! `Numbering::apply_markup`, `Table`/`Tables::apply_markup`,
-//! `Styles::cascade`/`generate_css`, and `images.py`, `fields.py`,
-//! `index.py`, `toc.py`, `cleanup.py` and a real `to_html.py` are
-//! tracked separately in issue #130 -- they build and mutate an HTML
-//! element tree ([`crate::dom`] as of that issue), and (for
-//! `fields.py`/`index.py`'s synthetic-element insertion) a mutable
-//! *source*-document tree ([`crate::xmltree`], relocated for this
-//! reason but not yet wired into the docx module).
+//! `to_html.py`'s own orchestration, and the remaining unported files
+//! (`images.py`, `fields.py`, `index.py`, `cleanup.py`) are tracked
+//! separately in issue #130 -- they build and mutate an HTML element
+//! tree ([`crate::dom`] as of that issue), and (for `fields.py`/
+//! `index.py`'s synthetic-element insertion) a mutable *source*-document
+//! tree ([`crate::xmltree`], relocated for this reason but not yet
+//! wired into the docx module). `toc.py` is ported ([`toc`]) but, like
+//! everything above, not yet wired into a `to_html.py` orchestrator --
+//! see issue #288.
 //!
 //! The output half of the module — `writer/` — is issue #23 and lives
 //! in [`writer`].
@@ -80,6 +82,7 @@ pub mod styles;
 pub mod tables;
 pub mod theme;
 pub mod to_html;
+pub mod toc;
 pub mod writer;
 
 pub use block_styles::{Border, Borders, Css, Edge, Frame, ParagraphStyle};
