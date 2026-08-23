@@ -3,11 +3,15 @@
 //!
 //! Partial port of `old_src/src/calibre/ebooks/docx/numbering.py` --
 //! reading definitions (`Level`, `NumberingDefinition`, `Numbering`)
-//! only. `Numbering.apply_markup` (which turns runs of numbered
-//! paragraphs into `<ol>`/`<ul>` HTML) and `Level.css`/`char_css`
-//! (which need an `Images` type from the not-yet-ported `images.py`)
-//! are deferred to the same follow-up as `to_html.rs`'s real port --
-//! see issue #130.
+//! plus [`Level::css`]/[`Level::char_css`]. `Numbering.apply_markup`
+//! itself (which turns runs of numbered paragraphs into `<ol>`/`<ul>`
+//! HTML) lives in `to_html.rs` as `apply_numbering_markup`, alongside
+//! this module's other `Dom`-needing orchestration -- see `tables.rs`'s
+//! module docs for the same pattern, and issue #130/#286.
+//! [`Level::css`] always omits `list-style-image` (a `w:lvlPicBulletId`
+//! picture bullet needs an `Images` type from the not-yet-ported
+//! `images.py`, issue #289) -- see its own docs for why that's a safe
+//! deferral, not a behavior gap.
 //!
 //! # A narrower `Numbering::call` signature than Python's
 //!
@@ -37,7 +41,7 @@ use std::collections::HashMap;
 use regex::Regex;
 use roxmltree::Node;
 
-use super::block_styles::ParagraphStyle;
+use super::block_styles::{Css, ParagraphStyle};
 use super::char_styles::RunStyle;
 use super::names::DocxNamespace;
 
@@ -265,6 +269,40 @@ impl Level {
         });
         format!("{}\u{a0}", substituted.trim_end())
     }
+
+    /// The CSS for this level's `<ol>`/`<ul>` wrapper -- always just
+    /// `list-style-type`. Python's version also resolves a
+    /// `w:lvlPicBulletId` picture bullet into a `list-style-image`
+    /// URL via `images.generate_filename(rid, rid_map, ...)`, but
+    /// swallows any resolution failure with `except Exception: fname
+    /// = None` -- i.e. silently drops the image and falls back to
+    /// exactly what this always does. Deferred until `images.py` is
+    /// ported (issue #289); until then every level, picture-bullet or
+    /// not, behaves like that already-common failure path.
+    ///
+    /// Port of the Python `Level.css`, minus the `images`/`pic_map`/
+    /// `rid_map` picture-bullet branch.
+    pub fn css(&self) -> Css {
+        let mut c = Css::new();
+        c.insert("list-style-type".to_string(), self.fmt.clone());
+        c
+    }
+
+    /// This level's run-level CSS (for the rendered bullet/number
+    /// text), minus `font-family` -- Word's numbering-run font is
+    /// usually a symbol font inappropriate for the *rendered* Unicode
+    /// bullet character.
+    ///
+    /// Port of the Python `Level.char_css`.
+    pub fn char_css(&self) -> Css {
+        let mut c = self
+            .character_style
+            .as_ref()
+            .map(RunStyle::css)
+            .unwrap_or_default();
+        c.shift_remove("font-family");
+        c
+    }
 }
 
 /// One `w:abstractNum`'s per-level definitions.
@@ -358,15 +396,23 @@ fn create_instance(
 /// All numbering definitions and instances in a document's
 /// `numbering.xml`.
 ///
-/// Port of the Python `Numbering` -- reading (`call`) and the two
-/// paragraph-style lookups only; `apply_markup` is deferred (see the
-/// module docs).
+/// Port of the Python `Numbering` -- reading (`call`), the two
+/// paragraph-style lookups, and `apply_markup` (`to_html.rs`'s
+/// `apply_numbering_markup`, since it needs [`crate::dom::Dom`]
+/// alongside this type -- see `tables.rs`'s module docs for the same
+/// pattern).
 #[derive(Debug, Clone, Default)]
 pub struct Numbering {
     pub definitions: HashMap<String, NumberingDefinition>,
     pub instances: HashMap<String, NumberingDefinition>,
     pub starts: HashMap<String, HashMap<i64, i64>>,
     pub pic_map: HashMap<String, String>,
+    /// Per-abstract-numbering-id running counters, shared across
+    /// every `w:num` instance that points at the same
+    /// `w:abstractNum` (Python's `self.counters = defaultdict(Counter)`,
+    /// keyed by `d.abstract_numbering_definition_id`). Populated and
+    /// read by `apply_numbering_markup`'s Phase A.
+    pub counters: HashMap<Option<String>, HashMap<i64, i64>>,
 }
 
 impl Numbering {
