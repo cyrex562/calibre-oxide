@@ -363,7 +363,7 @@ either -- this pass wasn't exhaustive.
 - [ ] fields.py (needs the mutable HTML tree — see #130)
 - [ ] fonts.py (`is_symbol_font`/`map_symbol_text`/`SYMBOL_MAPS` ported to `docx/fonts.rs`; the `Fonts` class itself still needs a system font scanner — see #130)
 - [x] `footnotes.py` -> `docx/footnotes.rs`
-- [ ] images.py (needs the mutable HTML tree — see #130)
+- [ ] images.py (pure geometry/CSS half ported to `docx/images.rs` — `image_filename`/`emu_to_pt`/`pt_to_emu`/`get_image_properties`/`get_image_margins`/`get_hpos`/`get_float_properties`, two upstream bugs reproduced faithfully — the `Images` struct itself (embedded-image extraction/resize, `w:drawing`/`w:pict` → `<img>` markup) still needs the mutable HTML tree — see #130/#289)
 - [ ] index.py (needs the mutable HTML tree — see #130)
 - [x] `lcid.py` -> `docx/lcid.rs`
 - [x] `names.py` -> `docx/names.rs`
