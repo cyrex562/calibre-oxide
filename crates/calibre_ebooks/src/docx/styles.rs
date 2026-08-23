@@ -252,6 +252,17 @@ pub struct Styles<'a, 'i> {
     numbering: Option<Numbering>,
     /// See the module docs' "`calibre_num_id`: a tracked map" section.
     pub calibre_num_ids: HashMap<Node<'a, 'i>, (i32, String)>,
+    /// The document-wide default font family/size/color, promoted
+    /// from the most common paragraph-level value by `to_html.rs`'s
+    /// [`cascade`](super::to_html::cascade). Consumed by the
+    /// not-yet-ported `Styles::generate_css` for the `body { ... }`
+    /// CSS rule. Set to the same values `Styles.cascade` starts from
+    /// in Python (`self.body_font_family = 'serif'`, etc.) so a
+    /// `Styles` that never runs `cascade` still has sensible
+    /// defaults.
+    pub body_font_family: String,
+    pub body_font_size: String,
+    pub body_color: String,
 }
 
 impl<'a, 'i> Styles<'a, 'i> {
@@ -271,6 +282,9 @@ impl<'a, 'i> Styles<'a, 'i> {
             default_character_style: None,
             numbering: None,
             calibre_num_ids: HashMap::new(),
+            body_font_family: "serif".to_string(),
+            body_font_size: "10pt".to_string(),
+            body_color: "currentColor".to_string(),
         }
     }
 
@@ -627,6 +641,16 @@ impl<'a, 'i> Styles<'a, 'i> {
         if let Some(cached) = self.run_cache.get_mut(&r) {
             cached.clear_border_css();
         }
+    }
+
+    /// Overwrites a cached run's entire resolved style -- the
+    /// [`RunStyle`] counterpart to [`Styles::set_paragraph_style`],
+    /// for `to_html.rs`'s [`cascade`](super::to_html::cascade), which
+    /// mutates several `RunStyle` fields per run at once (hoisting
+    /// properties shared by every run in a paragraph up onto the
+    /// paragraph itself).
+    pub fn set_run_style(&mut self, r: Node<'a, 'i>, style: RunStyle) {
+        self.run_cache.insert(r, style);
     }
 
     /// Registers a `w:tbl` with this instance's [`Tables`].
