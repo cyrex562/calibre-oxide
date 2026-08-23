@@ -39,6 +39,10 @@
 //!   elements (issue #283's `link_map`-driven first block only --
 //!   `fields.py`/`images.py`'s link sources are separate, still-open
 //!   issues #290/#289).
+//! - [`cascade`]: a bottom-up property de-duplication pass -- hoists a
+//!   property every run in a paragraph agrees on up onto the
+//!   paragraph, then hoists whichever paragraph-level value is most
+//!   common up onto the document body (issue #285).
 //!
 //! Not yet wired into `DOCXToHTML` -- that still needs the footnote
 //! body conversion (#284) and everything downstream (frames,
@@ -77,6 +81,7 @@ use roxmltree::{Document, Node};
 use crate::dom::{Dom, NodeId, NodeKind};
 
 use super::block_styles::{pt, Edge, Frame, ParagraphStyle};
+use super::char_styles::RunStyle;
 use super::container::{Docx, Relationships};
 use super::error::DocxError;
 use super::fonts::{is_symbol_font, map_symbol_text};
@@ -1338,6 +1343,216 @@ pub fn resolve_links<'a, 'i>(
     }
 
     resolved_link_map
+}
+
+/// A bottom-up property de-duplication pass, run once per document
+/// after the whole body (and footnote) walk is done: first hoists a
+/// property shared by *every* run in a paragraph up onto the
+/// paragraph itself (clearing it from the runs), then hoists whichever
+/// value is most common across *all* paragraphs up onto the document
+/// body (`styles.body_font_family`/`body_font_size`/`body_color`),
+/// clearing it from paragraphs that already matched. Reduces generated
+/// CSS size; never touches HTML elements directly (`generate_classes`,
+/// still unported, reads the result later).
+///
+/// Port of the Python `Styles.cascade`. Python's generic
+/// `getattr`/`setattr` loops over property names become explicit
+/// per-field calls here, since Rust has no runtime attribute
+/// reflection.
+pub fn cascade<'a, 'i>(
+    styles: &mut Styles<'a, 'i>,
+    state: &ConvertState<'a, 'i>,
+    theme: &Theme,
+    ns: &DocxNamespace,
+) {
+    let paragraphs: Vec<Node<'a, 'i>> = state.layers.keys().copied().collect();
+
+    // Phase 1: runs -> their own paragraph.
+    for &p in &paragraphs {
+        let runs = &state.layers[&p];
+        let has_links = runs.iter().any(|r| state.is_link.contains(r));
+        let mut char_styles: Vec<RunStyle> = runs
+            .iter()
+            .map(|&r| styles.resolve_run(r, theme, ns))
+            .collect();
+        let mut block_style = styles.resolve_paragraph(p, ns);
+
+        promote_run_property(
+            &mut char_styles,
+            &mut block_style,
+            |s| s.font_family.clone(),
+            |s, v| s.font_family = v,
+            |b, v| b.font_family = v,
+        );
+        promote_run_property(
+            &mut char_styles,
+            &mut block_style,
+            |s| s.font_size,
+            |s, v| s.font_size = v,
+            |b, v| b.font_size = v,
+        );
+        promote_run_property(
+            &mut char_styles,
+            &mut block_style,
+            |s| s.cs_font_family.clone(),
+            |s, v| s.cs_font_family = v,
+            |b, v| b.cs_font_family = v,
+        );
+        promote_run_property(
+            &mut char_styles,
+            &mut block_style,
+            |s| s.cs_font_size,
+            |s, v| s.cs_font_size = v,
+            |b, v| b.cs_font_size = v,
+        );
+        if !has_links {
+            // Browsers force link text to their own default color
+            // (blue) unless it's set on the link element itself, so
+            // promoting a uniform run color up to the paragraph would
+            // get silently overridden for a paragraph containing a
+            // hyperlink.
+            promote_run_property(
+                &mut char_styles,
+                &mut block_style,
+                |s| s.color.clone(),
+                |s, v| s.color = v,
+                |b, v| b.color = v,
+            );
+        }
+        for s in &mut char_styles {
+            if s.text_decoration.as_deref() == Some("none") {
+                // "none" is the CSS default -- redundant to emit.
+                s.text_decoration = None;
+            }
+        }
+
+        for (&r, s) in runs.iter().zip(char_styles) {
+            styles.set_run_style(r, s);
+        }
+        styles.set_paragraph_style(p, block_style);
+    }
+
+    // Phase 2: paragraphs -> the document body.
+    let mut block_styles: Vec<ParagraphStyle> = paragraphs
+        .iter()
+        .map(|&p| styles.resolve_paragraph(p, ns))
+        .collect();
+
+    if let Some(v) = promote_most_common(
+        &mut block_styles,
+        |s| s.font_family.clone(),
+        |s, v| s.font_family = v,
+        styles.body_font_family.clone(),
+        None,
+    ) {
+        styles.body_font_family = v;
+    }
+    let default_font_size: f64 = styles
+        .body_font_size
+        .trim_end_matches("pt")
+        .parse()
+        .unwrap_or(10.0);
+    if let Some(v) = promote_most_common(
+        &mut block_styles,
+        |s| s.font_size,
+        |s, v| s.font_size = v,
+        default_font_size,
+        None,
+    ) {
+        styles.body_font_size = pt(v);
+    }
+    if let Some(v) = promote_most_common(
+        &mut block_styles,
+        |s| s.color.clone(),
+        |s, v| s.color = v,
+        styles.body_color.clone(),
+        Some("currentColor".to_string()),
+    ) {
+        styles.body_color = v;
+    }
+
+    for (&p, s) in paragraphs.iter().zip(block_styles) {
+        styles.set_paragraph_style(p, s);
+    }
+}
+
+/// Port of the Python `cascade`'s nested `promote_property`: if every
+/// run agrees on a property's value (including if they all agree it's
+/// unset), clears it from every run and sets it once on the
+/// paragraph. A no-op when `char_styles` is empty (an empty
+/// paragraph), matching Python's `len(vals) == 1` never being true for
+/// an empty set.
+fn promote_run_property<T: Clone + PartialEq>(
+    char_styles: &mut [RunStyle],
+    block_style: &mut ParagraphStyle,
+    get: impl Fn(&RunStyle) -> Option<T>,
+    set_run: impl Fn(&mut RunStyle, Option<T>),
+    set_block: impl Fn(&mut ParagraphStyle, Option<T>),
+) {
+    let Some(first) = char_styles.first() else {
+        return;
+    };
+    let value = get(first);
+    if char_styles.iter().all(|s| get(s) == value) {
+        for s in char_styles.iter_mut() {
+            set_run(s, None);
+        }
+        set_block(block_style, value);
+    }
+}
+
+/// Port of the Python `cascade`'s nested `promote_most_common`: finds
+/// the value most paragraphs agree on (an unset value counts as
+/// `inherit_means`, when given -- only `color`/`currentColor` uses
+/// this), clears it from every paragraph that already had it, and
+/// gives every paragraph that had *no* value an explicit `default`
+/// (the old document-wide default) if the new winner differs from it
+/// -- otherwise those paragraphs would silently pick up the *new*
+/// default instead of the one they were actually relying on. Ties
+/// resolve to whichever value was encountered first, matching
+/// Python's `Counter.most_common` (stable on insertion order).
+fn promote_most_common<T: Clone + PartialEq>(
+    block_styles: &mut [ParagraphStyle],
+    get: impl Fn(&ParagraphStyle) -> Option<T>,
+    set: impl Fn(&mut ParagraphStyle, Option<T>),
+    default: T,
+    inherit_means: Option<T>,
+) -> Option<T> {
+    let resolved = |s: &ParagraphStyle| -> Option<T> { get(s).or_else(|| inherit_means.clone()) };
+
+    let mut counts: Vec<(T, usize)> = Vec::new();
+    for s in block_styles.iter() {
+        if let Some(v) = resolved(s) {
+            match counts.iter_mut().find(|(k, _)| *k == v) {
+                Some(entry) => entry.1 += 1,
+                None => counts.push((v, 1)),
+            }
+        }
+    }
+    if counts.is_empty() {
+        return None;
+    }
+    let (mut winner, mut winner_count) = counts[0].clone();
+    for (v, c) in &counts[1..] {
+        if *c > winner_count {
+            winner = v.clone();
+            winner_count = *c;
+        }
+    }
+
+    for s in block_styles.iter_mut() {
+        match resolved(s) {
+            None => {
+                if default != winner {
+                    set(s, Some(default.clone()));
+                }
+            }
+            Some(v) if v == winner => set(s, None),
+            _ => {}
+        }
+    }
+
+    Some(winner)
 }
 
 #[cfg(test)]
@@ -2862,5 +3077,263 @@ mod resolve_links_tests {
         assert_eq!(h.state.link_map.len(), 1);
         let spans_tracked: usize = h.state.link_map.values().map(Vec::len).sum();
         assert_eq!(spans_tracked, 1, "the trailing plain run isn't tracked");
+    }
+}
+
+#[cfg(test)]
+mod cascade_tests {
+    use super::*;
+    use crate::docx::tables::Tables;
+    use roxmltree::Document;
+
+    const DOC_OPEN: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:xml="http://www.w3.org/XML/1998/namespace" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships""#;
+
+    fn parse_root(body: &str) -> (Document<'static>, DocxNamespace) {
+        let xml: &'static str =
+            Box::leak(format!("<w:root {DOC_OPEN}>{body}</w:root>").into_boxed_str());
+        (
+            Document::parse(xml).expect("valid XML"),
+            DocxNamespace::default(),
+        )
+    }
+
+    struct Harness<'a, 'i> {
+        dom: Dom,
+        state: ConvertState<'a, 'i>,
+        styles: Styles<'a, 'i>,
+        footnotes: Footnotes<'a, 'i>,
+        settings: Settings,
+        theme: Theme,
+    }
+
+    impl<'a, 'i> Harness<'a, 'i> {
+        fn new() -> Self {
+            Harness {
+                dom: Dom::empty(),
+                state: ConvertState::new(),
+                styles: Styles::new(Tables::default()),
+                footnotes: Footnotes::new(),
+                settings: Settings::new(),
+                theme: Theme::new(),
+            }
+        }
+
+        fn body(&mut self, doc: Node<'a, 'i>, ns: &DocxNamespace) -> Vec<Node<'a, 'i>> {
+            convert_body(
+                &mut self.dom,
+                doc,
+                &mut self.state,
+                &mut self.styles,
+                &mut self.footnotes,
+                &self.settings,
+                &self.theme,
+                None,
+                "test-uuid",
+                &Relationships::default(),
+                ns,
+            )
+            .1
+        }
+
+        fn cascade(&mut self, ns: &DocxNamespace) {
+            cascade(&mut self.styles, &self.state, &self.theme, ns);
+        }
+    }
+
+    #[test]
+    fn a_font_family_shared_by_every_run_is_promoted_to_the_paragraph() {
+        // Two "Verdana" distractor paragraphs outnumber the "Georgia"
+        // paragraph under test, so phase 2 (paragraph -> body) doesn't
+        // *also* hoist "Georgia" away from the paragraph -- this test
+        // is isolating phase 1 (runs -> paragraph) only.
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p>
+                   <w:r><w:rPr><w:rFonts w:ascii="Georgia"/></w:rPr><w:t>a</w:t></w:r>
+                   <w:r><w:rPr><w:rFonts w:ascii="Georgia"/></w:rPr><w:t>b</w:t></w:r>
+                 </w:p>
+                 <w:p><w:r><w:rPr><w:rFonts w:ascii="Verdana"/></w:rPr><w:t>c</w:t></w:r></w:p>
+                 <w:p><w:r><w:rPr><w:rFonts w:ascii="Verdana"/></w:rPr><w:t>d</w:t></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let paras = h.body(document, &ns);
+        h.cascade(&ns);
+
+        let p_style = h.styles.resolve_paragraph(paras[0], &ns);
+        assert_eq!(p_style.font_family.as_deref(), Some("Georgia"));
+
+        let runs: Vec<Node> = ns.descendants(paras[0], &["w:r"]);
+        for r in runs {
+            assert_eq!(h.styles.resolve_run(r, &h.theme, &ns).font_family, None);
+        }
+    }
+
+    #[test]
+    fn differing_font_families_are_not_promoted() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p>
+                   <w:r><w:rPr><w:rFonts w:ascii="Georgia"/></w:rPr><w:t>a</w:t></w:r>
+                   <w:r><w:rPr><w:rFonts w:ascii="Verdana"/></w:rPr><w:t>b</w:t></w:r>
+                 </w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let paras = h.body(document, &ns);
+        h.cascade(&ns);
+
+        let p_style = h.styles.resolve_paragraph(paras[0], &ns);
+        assert_eq!(p_style.font_family, None);
+
+        let runs: Vec<Node> = ns.descendants(paras[0], &["w:r"]);
+        assert_eq!(
+            h.styles
+                .resolve_run(runs[0], &h.theme, &ns)
+                .font_family
+                .as_deref(),
+            Some("Georgia")
+        );
+        assert_eq!(
+            h.styles
+                .resolve_run(runs[1], &h.theme, &ns)
+                .font_family
+                .as_deref(),
+            Some("Verdana")
+        );
+    }
+
+    #[test]
+    fn a_hyperlink_paragraph_never_promotes_color_but_still_promotes_other_properties() {
+        // Same "outnumber it" trick as the phase-1-isolation test
+        // above, so phase 2 doesn't also hoist "Georgia" to the body.
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p>
+                   <w:hyperlink r:id="rId1"><w:r><w:rPr><w:color w:val="FF0000"/><w:rFonts w:ascii="Georgia"/></w:rPr><w:t>a</w:t></w:r></w:hyperlink>
+                   <w:r><w:rPr><w:color w:val="FF0000"/><w:rFonts w:ascii="Georgia"/></w:rPr><w:t>b</w:t></w:r>
+                 </w:p>
+                 <w:p><w:r><w:rPr><w:rFonts w:ascii="Verdana"/></w:rPr><w:t>c</w:t></w:r></w:p>
+                 <w:p><w:r><w:rPr><w:rFonts w:ascii="Verdana"/></w:rPr><w:t>d</w:t></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let paras = h.body(document, &ns);
+        h.cascade(&ns);
+
+        let p_style = h.styles.resolve_paragraph(paras[0], &ns);
+        assert_eq!(
+            p_style.font_family.as_deref(),
+            Some("Georgia"),
+            "still promoted"
+        );
+        assert_eq!(
+            p_style.color, None,
+            "color is never promoted for a linked paragraph"
+        );
+
+        let runs: Vec<Node> = ns.descendants(paras[0], &["w:r"]);
+        for r in runs {
+            assert_eq!(
+                h.styles.resolve_run(r, &h.theme, &ns).color.as_deref(),
+                Some("#FF0000"),
+                "color stays on each run"
+            );
+        }
+    }
+
+    #[test]
+    fn a_none_underline_is_reset_to_inherit() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p>
+                   <w:r><w:rPr><w:u w:val="none"/></w:rPr><w:t>a</w:t></w:r>
+                 </w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let paras = h.body(document, &ns);
+        let run = ns.descendants(paras[0], &["w:r"])[0];
+        assert_eq!(
+            h.styles
+                .resolve_run(run, &h.theme, &ns)
+                .text_decoration
+                .as_deref(),
+            Some("none"),
+            "sanity check before cascade"
+        );
+
+        h.cascade(&ns);
+
+        assert_eq!(
+            h.styles.resolve_run(run, &h.theme, &ns).text_decoration,
+            None
+        );
+    }
+
+    #[test]
+    fn the_most_common_paragraph_font_family_becomes_the_body_default() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p><w:r><w:rPr><w:rFonts w:ascii="Georgia"/></w:rPr><w:t>a</w:t></w:r></w:p>
+                 <w:p><w:r><w:rPr><w:rFonts w:ascii="Georgia"/></w:rPr><w:t>b</w:t></w:r></w:p>
+                 <w:p><w:r><w:rPr><w:rFonts w:ascii="Verdana"/></w:rPr><w:t>c</w:t></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let paras = h.body(document, &ns);
+        h.cascade(&ns);
+
+        assert_eq!(h.styles.body_font_family, "Georgia");
+        assert_eq!(h.styles.resolve_paragraph(paras[0], &ns).font_family, None);
+        assert_eq!(h.styles.resolve_paragraph(paras[1], &ns).font_family, None);
+        assert_eq!(
+            h.styles
+                .resolve_paragraph(paras[2], &ns)
+                .font_family
+                .as_deref(),
+            Some("Verdana"),
+            "the minority paragraph keeps its own explicit value"
+        );
+    }
+
+    #[test]
+    fn a_paragraph_with_no_explicit_font_family_keeps_the_old_default_when_it_changes() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p><w:r><w:rPr><w:rFonts w:ascii="Georgia"/></w:rPr><w:t>a</w:t></w:r></w:p>
+                 <w:p><w:r><w:rPr><w:rFonts w:ascii="Georgia"/></w:rPr><w:t>b</w:t></w:r></w:p>
+                 <w:p><w:r><w:t>c</w:t></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let paras = h.body(document, &ns);
+        assert_eq!(
+            h.styles.body_font_family, "serif",
+            "the pre-cascade default"
+        );
+
+        h.cascade(&ns);
+
+        assert_eq!(
+            h.styles.body_font_family, "Georgia",
+            "the new majority default"
+        );
+        // The third paragraph never had an explicit font_family -- it
+        // was implicitly relying on the *old* "serif" default, so it
+        // must not silently inherit the new "Georgia" body default.
+        assert_eq!(
+            h.styles
+                .resolve_paragraph(paras[2], &ns)
+                .font_family
+                .as_deref(),
+            Some("serif")
+        );
     }
 }
