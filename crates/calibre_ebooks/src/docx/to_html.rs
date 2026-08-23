@@ -11,14 +11,16 @@
 //! alongside `to_html.py` itself: `images.py`, `fields.py`,
 //! `toc.py`, `cleanup.py`) is ready to replace it wholesale.
 //!
-//! [`convert_run`] is the first piece of the real port: `w:r` -> a
-//! `<span>` in [`crate::dom`], using the now-real [`super::styles::Styles::resolve_run`]
-//! (issue #130's styles/numbering/tables cluster, landed before this)
-//! instead of no style resolution at all. Not yet wired into
-//! `DOCXToHTML` -- that requires `convert_p` (which calls it) and the
-//! surrounding per-document state (`object_map`, `anchor_map`, a
-//! per-document uuid, ...) `Convert.__init__` sets up, none of which
-//! exist here yet.
+//! [`convert_run`] and [`convert_p`] are the real port so far: `w:r` ->
+//! a `<span>`, `w:p` -> a `<p>`/`<h1>`..`<h6>` (using the real
+//! [`super::styles::Styles::resolve_run`]/`resolve_paragraph`, issue
+//! #130's styles/numbering/tables cluster, landed before this),
+//! carrying the per-document state ([`ConvertState`]) both need across
+//! the whole body walk. Not yet wired into `DOCXToHTML` -- that needs
+//! the main body-walking loop (`Convert.__call__`'s `for wp,
+//! page_properties in self.page_map.items(): ...`), page properties,
+//! and everything downstream (links, frames, tables/numbering markup,
+//! TOC, OPF writing), none of which exist here yet.
 //!
 //! # What `convert_run` defers, and why
 //!
@@ -46,6 +48,7 @@ use std::collections::HashMap;
 use std::io::{Read, Seek};
 use std::path::Path;
 
+use indexmap::IndexMap;
 use roxmltree::{Document, Node};
 
 use crate::dom::{Dom, NodeId, NodeKind};
@@ -451,6 +454,309 @@ fn remap_symbol_text(dom: &mut Dom, id: NodeId, font: &str) {
     }
 }
 
+/// Per-document state `Convert.__init__` sets up and `convert_p`
+/// (transitively `convert_run`) reads/writes across the whole body
+/// walk. Deliberately narrower than `Convert`'s full instance state --
+/// see [`convert_p`]'s docs for what's tracked here vs. left for the
+/// (not yet ported) consumer that would need it.
+///
+/// Port of the relevant slice of the Python `Convert.__init__`.
+#[derive(Debug, Default)]
+pub struct ConvertState<'a, 'i> {
+    /// HTML element -> the source node it was built from. Order
+    /// matters to later phases (an `IndexMap`, matching Python's
+    /// `OrderedDict`), even though nothing here yet consumes that
+    /// order.
+    pub object_map: IndexMap<NodeId, Node<'a, 'i>>,
+    /// Bookmark/TOC name -> the generated HTML anchor id. Also used,
+    /// per Python's own idiom, as a *redirect* table: a generated
+    /// anchor id used as a key maps to whatever id ended up actually
+    /// applied to an element, when the anchor itself didn't get its
+    /// own -- see the "trailing pending anchor" step in `convert_p`.
+    pub anchor_map: HashMap<String, String>,
+    /// Paragraph -> its runs, in document order. Needed by the
+    /// (not yet ported) `Styles::cascade`.
+    pub layers: IndexMap<Node<'a, 'i>, Vec<Node<'a, 'i>>>,
+    /// The anchor a `TOC ` field's `w:instrText` generated, if any --
+    /// `write()` (not yet ported) uses this for the OPF guide's `toc`
+    /// reference.
+    pub toc_anchor: Option<String>,
+}
+
+impl<'a, 'i> ConvertState<'a, 'i> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+static HEADING_STYLE_NAME_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)^heading\s+(\d+)$").unwrap());
+
+/// Converts one `w:p` into an HTML block element (`<p>`, or `<h1>`..`<h6>`
+/// once a `"Heading N"` style name is detected), appending its
+/// converted runs via [`convert_run`]. Returns the element's `NodeId`;
+/// the caller is responsible for attaching it wherever the body's own
+/// structure calls for (matching Python's `self.body.append(p)`).
+///
+/// # What's tracked here vs. left for later
+///
+/// Bookmark/anchor generation (`w:bookmarkStart`) and TOC-field
+/// detection (`w:instrText` starting with `"TOC "`) are fully ported:
+/// both are self-contained and produce real, immediately-visible `id`
+/// attributes. Heading-level retagging, `dir="rtl"`, and the
+/// same-bordered-run-merging pass (into a single wrapping `<span>`
+/// with a `text_border` CSS class) are ported too.
+///
+/// `w:hyperlink` handling is **not** ported: Python's `convert_p`
+/// tracks `current_hyperlink`/`link_map`/`link_source_map` and stamps
+/// a synthetic `is-link` marker on the source run purely so a later
+/// `resolve_links` pass (not yet ported) can retag spans into `<a>`
+/// elements. Unlike `calibre_num_id`/`removed_cells` elsewhere in this
+/// crate's docx port, `resolve_links`'s own Rust shape hasn't been
+/// designed yet, so building tracking for it now risks getting that
+/// shape wrong and redoing it -- deferred to `resolve_links`'s own
+/// future PR, along with the tracking it needs. `w:r` elements nested
+/// inside a `w:hyperlink` are still visited and converted normally
+/// (the surrounding `w:hyperlink` element is just never itself
+/// inspected), so plain text content is unaffected; only the
+/// eventual `<a href=...>` wrapping is missing. `add_frame`/`frame_map`
+/// (`apply_frames`'s bookkeeping) are deferred for the same reason.
+///
+/// # Two reproduced Python quirks in the border-run merge
+///
+/// - A span whose border *doesn't* match the run in progress is
+///   silently dropped from every group: Python's `border_runs = []`
+///   reset (on a mismatch) does not also re-seed the list with the
+///   mismatching span, so it starts neither the old group nor the new
+///   one.
+/// - The final group is never flushed to `common_borders`: Python's
+///   loop only ever appends to `common_borders` from inside the
+///   mismatch branch, so a paragraph whose *last* run(s) share a
+///   border with their predecessors never get merged.
+///
+/// Both are reproduced as-is rather than fixed -- see this crate's
+/// established practice for calibre's own bugs (`docx::numbering`'s
+/// module docs have another example).
+///
+/// Port of the Python `Convert.convert_p`.
+#[allow(clippy::too_many_arguments)]
+pub fn convert_p<'a, 'i>(
+    dom: &mut Dom,
+    state: &mut ConvertState<'a, 'i>,
+    p: Node<'a, 'i>,
+    styles: &mut Styles<'a, 'i>,
+    footnotes: &mut Footnotes<'a, 'i>,
+    settings: &Settings,
+    theme: &Theme,
+    doc_lang: Option<&str>,
+    uuid: &str,
+    ns: &DocxNamespace,
+) -> NodeId {
+    let dest = dom.new_element("p");
+    state.object_map.insert(dest, p);
+    let style = styles.resolve_paragraph(p, ns);
+    state.layers.insert(p, Vec::new());
+
+    let mut current_anchor: Option<String> = None;
+
+    for x in ns.descendants(p, &["w:r", "w:bookmarkStart", "w:instrText"]) {
+        if ns.ancestor(x, "w:p") != Some(p) {
+            // Nested `<w:p>` (a text box inside this paragraph, say)
+            // -- its own descendants belong to *its* conversion, not
+            // this one.
+            continue;
+        }
+        if ns.is_tag(x, "w:r") {
+            let span = convert_run(
+                dom, x, styles, footnotes, settings, theme, doc_lang, uuid, ns,
+            );
+            if let Some(anchor) = current_anchor.take() {
+                let target = if dom.children(dest).is_empty() {
+                    dest
+                } else {
+                    span
+                };
+                dom.node_mut(target).attrs.insert("id".to_string(), anchor);
+            }
+            dom.append_child(dest, span);
+            state.object_map.insert(span, x);
+            state.layers.get_mut(&p).unwrap().push(x);
+        } else if ns.is_tag(x, "w:bookmarkStart") {
+            if let Some(anchor) = ns
+                .get(x, "w:name")
+                .filter(|a| !a.is_empty() && *a != "_GoBack")
+            {
+                if !state.anchor_map.contains_key(anchor) {
+                    apply_new_anchor(state, anchor.to_string(), &mut current_anchor);
+                }
+            }
+        } else if ns.is_tag(x, "w:instrText") {
+            if let Some(text) = x.text() {
+                if text.trim_start().starts_with("TOC ") {
+                    // Python keys this entry with a fresh `uuid.uuid4()`
+                    // purely for a guaranteed-unique dict slot -- the
+                    // key itself is never looked up again, only
+                    // `self.toc_anchor` (the *value*) matters. A
+                    // monotonic counter serves the same purpose without
+                    // needing real randomness.
+                    let synthetic_key = format!("\u{0}toc-instr-{}", state.anchor_map.len());
+                    let generated = apply_new_anchor(state, synthetic_key, &mut current_anchor);
+                    state.toc_anchor = Some(generated);
+                }
+            }
+        }
+    }
+
+    if let Some(anchor) = current_anchor.take() {
+        if dom.node(dest).attrs.contains_key("id") {
+            let children = dom.children(dest);
+            if let Some(&last) = children.last() {
+                if let Some(existing_id) = dom.node(last).attrs.get("id").cloned() {
+                    state.anchor_map.insert(anchor, existing_id);
+                } else {
+                    dom.node_mut(last).attrs.insert("id".to_string(), anchor);
+                }
+            } else {
+                let dest_id = dom.node(dest).attrs.get("id").cloned().unwrap();
+                state.anchor_map.insert(anchor, dest_id);
+            }
+        } else {
+            dom.node_mut(dest).attrs.insert("id".to_string(), anchor);
+        }
+    }
+
+    if let Some(name) = &style.style_name {
+        if let Some(caps) = HEADING_STYLE_NAME_RE.captures(name) {
+            if let Ok(n) = caps[1].parse::<i32>() {
+                let n = n.clamp(1, 6);
+                dom.set_tag(dest, &format!("h{n}"));
+                dom.node_mut(dest)
+                    .attrs
+                    .insert("data-heading-level".to_string(), n.to_string());
+            }
+        }
+    }
+
+    if style.bidi == Some(true) {
+        dom.node_mut(dest)
+            .attrs
+            .insert("dir".to_string(), "rtl".to_string());
+    }
+
+    let mut border_runs: Vec<(NodeId, Node<'a, 'i>, super::char_styles::RunStyle)> = Vec::new();
+    let mut common_borders: Vec<Vec<(NodeId, Node<'a, 'i>, super::char_styles::RunStyle)>> =
+        Vec::new();
+    for span in dom.children(dest) {
+        let run = state.object_map[&span];
+        let run_style = styles.resolve_run(run, theme, ns);
+        let matches = border_runs
+            .last()
+            .map(|(_, _, s)| s.same_border(&run_style))
+            .unwrap_or(true);
+        if matches {
+            border_runs.push((span, run, run_style));
+        } else if !border_runs.is_empty() {
+            if border_runs.len() > 1 {
+                common_borders.push(std::mem::take(&mut border_runs));
+            } else {
+                border_runs.clear();
+            }
+            // The mismatching span is dropped here, not re-seeded into
+            // the fresh group -- see the module docs.
+        }
+    }
+
+    for border_run in &common_borders {
+        let mut bs = super::block_styles::Css::new();
+        let mut spans = Vec::new();
+        for (span, run, run_style) in border_run {
+            run_style.border_css(&mut bs);
+            styles.clear_run_border(*run);
+            spans.push(*span);
+        }
+        if !bs.is_empty() {
+            let cls = styles.register(bs, "text_border");
+            let wrapper = wrap_elems(dom, dest, &spans);
+            dom.node_mut(wrapper).attrs.insert("class".to_string(), cls);
+        }
+    }
+
+    if dom.children(dest).is_empty() && !style.has_visible_border() {
+        let t = dom.new_text("\u{a0}");
+        dom.append_child(dest, t);
+    }
+
+    let children = dom.children(dest);
+    if let Some(&last) = children.last() {
+        if dom.tag(last) == Some("br") {
+            // Unreachable in practice -- `dest`'s direct children are
+            // always the `<span>`s `convert_run` returns, never a bare
+            // `<br>` -- but Python's own check is structured this way,
+            // so it's reproduced rather than trimmed.
+            let t = dom.new_text("\u{a0}");
+            dom.append_child(dest, t);
+        } else {
+            let inner_children = dom.children(last);
+            if let Some(&inner_last) = inner_children.last() {
+                if dom.tag(inner_last) == Some("br") {
+                    let t = dom.new_text("\u{a0}");
+                    dom.append_child(last, t);
+                }
+            }
+        }
+    }
+
+    dest
+}
+
+/// Generates a fresh anchor for `key` (a bookmark name or synthetic
+/// TOC-field key), records it in `state.anchor_map`, sets it as the
+/// pending `current_anchor`, and redirects any earlier entry that
+/// pointed at the previous pending anchor (which never got applied to
+/// an element) onto the new one.
+///
+/// Port of the repeated `old_anchor = current_anchor; ...; if
+/// old_anchor is not None: for a, t in ...` block in Python's
+/// `convert_p`.
+fn apply_new_anchor(
+    state: &mut ConvertState,
+    key: String,
+    current_anchor: &mut Option<String>,
+) -> String {
+    let old_anchor = current_anchor.clone();
+    let existing: std::collections::HashSet<String> = state.anchor_map.values().cloned().collect();
+    let new_anchor = super::names::generate_anchor(&key, &existing);
+    state.anchor_map.insert(key, new_anchor.clone());
+    *current_anchor = Some(new_anchor.clone());
+    if let Some(old) = old_anchor {
+        for t in state.anchor_map.values_mut() {
+            if *t == old {
+                *t = new_anchor.clone();
+            }
+        }
+    }
+    new_anchor
+}
+
+/// Moves `elems` (all direct children of `parent`) into a new
+/// `wrapper` element inserted at the position of `elems[0]`.
+///
+/// Port of the Python `Convert.wrap_elems`. `crate::dom::Dom::append_child`
+/// already detaches a node from its previous parent before attaching
+/// it, so this needs no explicit removal step (unlike lxml, where
+/// `parent.remove(elem)` and `.tail` redistribution are the caller's
+/// job) -- and no `.tail`-carrying logic at all, per the module docs'
+/// "No `Text` buffering" note.
+fn wrap_elems(dom: &mut Dom, parent: NodeId, elems: &[NodeId]) -> NodeId {
+    let idx = dom.index_in_parent(elems[0]).unwrap_or(0);
+    let wrapper = dom.new_element("span");
+    dom.insert_child(parent, idx, wrapper);
+    for &e in elems {
+        dom.append_child(wrapper, e);
+    }
+    wrapper
+}
+
 #[cfg(test)]
 mod convert_run_tests {
     use super::*;
@@ -740,5 +1046,262 @@ mod convert_run_tests {
         // literal "Wingdings" -- confirms set_run_font_family wrote back.
         let cached = h.styles.resolve_run(doc.root_element(), &h.theme, &ns);
         assert_eq!(cached.font_family.as_deref(), Some("sans-serif"));
+    }
+}
+
+#[cfg(test)]
+mod convert_p_tests {
+    use super::*;
+    use crate::docx::tables::Tables;
+    use roxmltree::Document;
+
+    const DOC_OPEN: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:xml="http://www.w3.org/XML/1998/namespace""#;
+
+    fn parse_para(body: &str) -> (Document<'static>, DocxNamespace) {
+        let xml: &'static str = Box::leak(format!("<w:p {DOC_OPEN}>{body}</w:p>").into_boxed_str());
+        (
+            Document::parse(xml).expect("valid XML"),
+            DocxNamespace::default(),
+        )
+    }
+
+    struct Harness<'a, 'i> {
+        dom: Dom,
+        state: ConvertState<'a, 'i>,
+        styles: Styles<'a, 'i>,
+        footnotes: Footnotes<'a, 'i>,
+        settings: Settings,
+        theme: Theme,
+    }
+
+    impl<'a, 'i> Harness<'a, 'i> {
+        fn new() -> Self {
+            Harness {
+                dom: Dom::empty(),
+                state: ConvertState::new(),
+                styles: Styles::new(Tables::default()),
+                footnotes: Footnotes::new(),
+                settings: Settings::new(),
+                theme: Theme::new(),
+            }
+        }
+
+        fn convert(&mut self, p: Node<'a, 'i>, ns: &DocxNamespace) -> NodeId {
+            convert_p(
+                &mut self.dom,
+                &mut self.state,
+                p,
+                &mut self.styles,
+                &mut self.footnotes,
+                &self.settings,
+                &self.theme,
+                None,
+                "test-uuid",
+                ns,
+            )
+        }
+    }
+
+    #[test]
+    fn a_paragraph_with_two_runs_becomes_a_p_with_two_spans() {
+        let (doc, ns) = parse_para("<w:r><w:t>hello </w:t></w:r><w:r><w:t>world</w:t></w:r>");
+        let mut h = Harness::new();
+        let dest = h.convert(doc.root_element(), &ns);
+        assert_eq!(h.dom.tag(dest), Some("p"));
+        assert_eq!(h.dom.children(dest).len(), 2);
+        assert_eq!(
+            h.dom.serialize(dest),
+            "<p><span>hello</span><span>world</span></p>"
+        );
+        assert_eq!(h.state.object_map.get(&dest), Some(&doc.root_element()));
+        assert_eq!(h.state.layers[&doc.root_element()].len(), 2);
+    }
+
+    #[test]
+    fn heading_style_name_retags_the_element() {
+        let (doc, ns) =
+            parse_para(r#"<w:pPr><w:pStyle w:val="H1"/></w:pPr><w:r><w:t>Title</w:t></w:r>"#);
+        let mut h = Harness::new();
+        let mut named = std::collections::HashMap::new();
+        let mut style = super::super::styles::Style::default();
+        style.name = Some("Heading 1".to_string());
+        named.insert("H1".to_string(), style);
+        h.styles.call(None, &ns);
+        h.styles
+            .id_map
+            .insert("H1".to_string(), named.remove("H1").unwrap());
+
+        let dest = h.convert(doc.root_element(), &ns);
+        assert_eq!(h.dom.tag(dest), Some("h1"));
+        assert_eq!(
+            h.dom
+                .node(dest)
+                .attrs
+                .get("data-heading-level")
+                .map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn non_heading_style_name_leaves_the_tag_as_p() {
+        let (doc, ns) = parse_para(r#"<w:r><w:t>Body</w:t></w:r>"#);
+        let mut h = Harness::new();
+        let dest = h.convert(doc.root_element(), &ns);
+        assert_eq!(h.dom.tag(dest), Some("p"));
+        assert_eq!(h.dom.node(dest).attrs.get("data-heading-level"), None);
+    }
+
+    #[test]
+    fn bidi_paragraph_gets_rtl_dir() {
+        let (doc, ns) = parse_para(r#"<w:pPr><w:bidi/></w:pPr><w:r><w:t>x</w:t></w:r>"#);
+        let mut h = Harness::new();
+        let dest = h.convert(doc.root_element(), &ns);
+        assert_eq!(
+            h.dom.node(dest).attrs.get("dir").map(String::as_str),
+            Some("rtl")
+        );
+    }
+
+    #[test]
+    fn an_empty_paragraph_with_no_visible_border_gets_a_nbsp() {
+        let (doc, ns) = parse_para("");
+        let mut h = Harness::new();
+        let dest = h.convert(doc.root_element(), &ns);
+        assert_eq!(h.dom.serialize(dest), "<p>\u{a0}</p>");
+    }
+
+    #[test]
+    fn bookmark_start_before_the_first_run_sets_id_on_dest_itself() {
+        // Python checks `len(dest) == 0` *before* appending the span
+        // that triggered the pending anchor -- so a bookmark at the
+        // very start of a paragraph lands on `dest` (the `<p>`
+        // itself), not the first span.
+        let (doc, ns) =
+            parse_para(r#"<w:bookmarkStart w:id="0" w:name="anchor1"/><w:r><w:t>x</w:t></w:r>"#);
+        let mut h = Harness::new();
+        let dest = h.convert(doc.root_element(), &ns);
+        assert!(h.dom.node(dest).attrs.contains_key("id"));
+        assert_eq!(
+            h.state.anchor_map.get("anchor1"),
+            h.dom.node(dest).attrs.get("id")
+        );
+    }
+
+    #[test]
+    fn bookmark_start_between_two_runs_sets_id_on_the_following_span() {
+        let (doc, ns) = parse_para(
+            r#"<w:r><w:t>a</w:t></w:r><w:bookmarkStart w:id="0" w:name="anchor1"/><w:r><w:t>b</w:t></w:r>"#,
+        );
+        let mut h = Harness::new();
+        let dest = h.convert(doc.root_element(), &ns);
+        let second_span = h.dom.children(dest)[1];
+        assert!(h.dom.node(second_span).attrs.contains_key("id"));
+        assert_eq!(
+            h.state.anchor_map.get("anchor1"),
+            h.dom.node(second_span).attrs.get("id")
+        );
+    }
+
+    #[test]
+    fn bookmark_start_with_no_following_run_sets_id_on_dest_itself() {
+        let (doc, ns) = parse_para(r#"<w:bookmarkStart w:id="0" w:name="anchor1"/>"#);
+        let mut h = Harness::new();
+        let dest = h.convert(doc.root_element(), &ns);
+        // Empty-paragraph NBSP still applies; the anchor lands on dest.
+        assert!(h.dom.node(dest).attrs.contains_key("id"));
+    }
+
+    #[test]
+    fn go_back_bookmark_is_ignored() {
+        let (doc, ns) =
+            parse_para(r#"<w:bookmarkStart w:id="0" w:name="_GoBack"/><w:r><w:t>x</w:t></w:r>"#);
+        let mut h = Harness::new();
+        let dest = h.convert(doc.root_element(), &ns);
+        let span = h.dom.children(dest)[0];
+        assert!(!h.dom.node(span).attrs.contains_key("id"));
+        assert!(h.state.anchor_map.is_empty());
+    }
+
+    #[test]
+    fn toc_instr_text_sets_toc_anchor() {
+        let (doc, ns) = parse_para(
+            r#"<w:r><w:instrText>TOC \o "1-3" \h \z \u</w:instrText></w:r><w:r><w:t>x</w:t></w:r>"#,
+        );
+        let mut h = Harness::new();
+        h.convert(doc.root_element(), &ns);
+        assert!(h.state.toc_anchor.is_some());
+    }
+
+    #[test]
+    fn nested_paragraph_content_is_not_absorbed() {
+        // A `w:p` nested inside this one (a textbox) shouldn't have its
+        // own runs pulled into the outer conversion.
+        let (doc, ns) = parse_para(
+            r#"<w:r><w:t>outer</w:t></w:r><w:pict><w:p><w:r><w:t>inner</w:t></w:r></w:p></w:pict>"#,
+        );
+        let mut h = Harness::new();
+        let dest = h.convert(doc.root_element(), &ns);
+        assert_eq!(
+            h.dom.children(dest).len(),
+            1,
+            "only the outer run is converted"
+        );
+        assert_eq!(h.dom.serialize(dest), "<p><span>outer</span></p>");
+    }
+
+    #[test]
+    fn a_trailing_br_inside_the_last_span_gets_a_nbsp_tail() {
+        let (doc, ns) = parse_para(r#"<w:r><w:t>text</w:t><w:br/></w:r>"#);
+        let mut h = Harness::new();
+        let dest = h.convert(doc.root_element(), &ns);
+        let last_span = *h.dom.children(dest).last().unwrap();
+        let span_children = h.dom.children(last_span);
+        // text, br, then a trailing nbsp text node.
+        assert_eq!(span_children.len(), 3);
+        let last = *span_children.last().unwrap();
+        assert!(matches!(&h.dom.node(last).kind, NodeKind::Text(t) if t == "\u{a0}"));
+    }
+
+    #[test]
+    fn two_runs_sharing_a_border_are_wrapped_but_the_trailing_group_is_not() {
+        let border =
+            r#"<w:rPr><w:bdr w:val="single" w:sz="8" w:space="0" w:color="000000"/></w:rPr>"#;
+        let (doc, ns) = parse_para(&format!(
+            "<w:r>{border}<w:t>a</w:t></w:r><w:r>{border}<w:t>b</w:t></w:r>"
+        ));
+        let mut h = Harness::new();
+        let dest = h.convert(doc.root_element(), &ns);
+        // Both runs share a border and are the *only* group -- since it
+        // never hits a mismatch, Python's loop never flushes it either.
+        // No wrapper is produced; this documents the reproduced quirk.
+        let html = h.dom.serialize(dest);
+        assert!(
+            !html.contains("text_border"),
+            "trailing-only group is never flushed: {html}"
+        );
+    }
+
+    #[test]
+    fn a_bordered_group_followed_by_a_mismatch_and_more_bordered_runs_only_wraps_the_first_group() {
+        let border =
+            r#"<w:rPr><w:bdr w:val="single" w:sz="8" w:space="0" w:color="000000"/></w:rPr>"#;
+        let plain = "<w:rPr/>";
+        let (doc, ns) = parse_para(&format!(
+            "<w:r>{border}<w:t>a</w:t></w:r><w:r>{border}<w:t>b</w:t></w:r><w:r>{plain}<w:t>c</w:t></w:r><w:r>{border}<w:t>d</w:t></w:r><w:r>{border}<w:t>e</w:t></w:r>"
+        ));
+        let mut h = Harness::new();
+        let dest = h.convert(doc.root_element(), &ns);
+        let html = h.dom.serialize(dest);
+        // First group (a, b) flushes on hitting the mismatch (c) and
+        // gets wrapped. `c` itself is dropped from every group (the
+        // "mismatching span" quirk). The trailing group (d, e) is
+        // never flushed (the "no final flush" quirk), so only one
+        // text_border class is registered.
+        assert_eq!(html.matches("text_border").count(), 1, "{html}");
+        assert!(
+            html.contains(">c<"),
+            "the mismatching run's own text still renders: {html}"
+        );
     }
 }
