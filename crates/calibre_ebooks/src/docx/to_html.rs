@@ -25,12 +25,15 @@
 //! [`super::styles::Styles::apply_section_page_breaks`] afterward, all
 //! matching `Convert.__call__`'s paragraph loop; and
 //! [`read_block_anchors`], which assigns ids to paragraphs a top-level
-//! bookmark precedes; and [`apply_tab_indentation`], which folds
-//! leading `w:tab`-based paragraph indentation into a `text-indent`
-//! CSS value. Not yet wired into `DOCXToHTML` -- that still
-//! needs `mark_block_runs` and everything downstream (links, frames,
-//! tables/numbering markup, TOC, OPF writing), none of which exist
-//! here yet.
+//! bookmark precedes; [`apply_tab_indentation`], which folds leading
+//! `w:tab`-based paragraph indentation into a `text-indent` CSS value;
+//! and [`mark_block_runs`], which collapses a run of consecutive,
+//! same-frame, identically-bordered paragraphs into one visual block
+//! (populating `ConvertState::block_runs`, for the not-yet-ported
+//! `apply_frames` to wrap in a bordered `<div>`). Not yet wired into
+//! `DOCXToHTML` -- that still needs the footnote body conversion and
+//! everything downstream (links, frames, tables/numbering markup,
+//! TOC, OPF writing), none of which exist here yet.
 //!
 //! # What `convert_run` defers, and why
 //!
@@ -63,6 +66,7 @@ use roxmltree::{Document, Node};
 
 use crate::dom::{Dom, NodeId, NodeKind};
 
+use super::block_styles::{pt, Edge, Frame, ParagraphStyle};
 use super::container::Docx;
 use super::error::DocxError;
 use super::fonts::{is_symbol_font, map_symbol_text};
@@ -491,6 +495,21 @@ pub struct ConvertState<'a, 'i> {
     /// `write()` (not yet ported) uses this for the OPF guide's `toc`
     /// reference.
     pub toc_anchor: Option<String>,
+    /// Paragraph -> its resolved `w:framePr` frame (`None` when it has
+    /// none, Python's `inherit`). Populated once per paragraph in
+    /// [`convert_p`]; read by [`mark_block_runs`] to decide whether
+    /// two adjacent paragraphs belong to the same frame (almost always
+    /// trivially true -- `None == None` -- outside `w:framePr`
+    /// documents). The other consumer of a paragraph's frame,
+    /// `add_frame`/`apply_frames`'s *separate* framing mechanism, is
+    /// not yet ported.
+    pub frame_map: HashMap<Node<'a, 'i>, Option<Frame>>,
+    /// `(border_style, run)` pairs [`mark_block_runs`] appends one of
+    /// for each maximal run of 2+ consecutive, same-frame,
+    /// identically-bordered paragraphs -- `border_style` carries the
+    /// merged run's outer border (for the wrapping `<div>` the
+    /// not-yet-ported `apply_frames` builds from it).
+    pub block_runs: Vec<(ParagraphStyle, Vec<Node<'a, 'i>>)>,
 }
 
 impl<'a, 'i> ConvertState<'a, 'i> {
@@ -566,6 +585,7 @@ pub fn convert_p<'a, 'i>(
     state.object_map.insert(dest, p);
     let style = styles.resolve_paragraph(p, ns);
     state.layers.insert(p, Vec::new());
+    state.frame_map.insert(p, style.frame.clone());
 
     let mut current_anchor: Option<String> = None;
 
@@ -1088,13 +1108,113 @@ pub fn apply_tab_indentation<'a, 'i>(
         {
             indent += existing;
         }
-        styles.set_paragraph_text_indent(wp, super::block_styles::pt(indent));
+        styles.set_paragraph_text_indent(wp, pt(indent));
 
         for &t in &tabs {
             dom.detach(t);
         }
         if let Some(tail) = tail_node {
             dom.insert_child(run_span, 0, tail);
+        }
+    }
+}
+
+/// Groups consecutive, same-frame, identically-bordered paragraphs
+/// into maximal runs of 2+, and for each such run, collapses the
+/// borders shared between adjacent paragraphs down to one visual
+/// block: strips the redundant top/bottom border+margin from every
+/// paragraph but the run's own first/last, replaces each internal
+/// paragraph-to-paragraph boundary with a `between` rule, and records
+/// `(border_style, run)` in `state.block_runs` -- consumed by the
+/// not-yet-ported `apply_frames`, which wraps `run` in a `<div>`
+/// carrying `border_style`'s CSS as its own border.
+///
+/// Port of `Convert.mark_block_runs`. `max_left`/`max_right`
+/// (Python's `isinstance(style.margin_left, numbers.Number)` guard)
+/// are omitted: `ParagraphStyle::margin_left`/`margin_right` are never
+/// numeric in this codebase (`read_indent` always produces `None` or
+/// an already-unit-formatted string), so that branch is provably dead
+/// code here just as it is in Python -- `border_style.margin_left`/
+/// `margin_right` always end up `"0"`, which this port sets directly.
+pub fn mark_block_runs<'a, 'i>(
+    state: &mut ConvertState<'a, 'i>,
+    paras: &[Node<'a, 'i>],
+    styles: &mut Styles<'a, 'i>,
+    ns: &DocxNamespace,
+) {
+    let mut run: Vec<Node<'a, 'i>> = Vec::new();
+    for &p in paras {
+        if let Some(&last) = run.last() {
+            if state.frame_map.get(&p) == state.frame_map.get(&last) {
+                let style = styles.resolve_paragraph(p, ns);
+                let last_style = styles.resolve_paragraph(last, ns);
+                if style.has_identical_borders(&last_style) {
+                    run.push(p);
+                    continue;
+                }
+            }
+        }
+        if run.len() > 1 {
+            process_block_run(&run, styles, ns, &mut state.block_runs);
+        }
+        run = vec![p];
+    }
+    if run.len() > 1 {
+        process_block_run(&run, styles, ns, &mut state.block_runs);
+    }
+}
+
+/// Port of `mark_block_runs`'s nested `process_run` closure. A free
+/// function here since Rust closures can't capture `&mut Styles` and
+/// `&mut Vec<_>` from the same enclosing scope across repeated calls
+/// the way Python's closure captures `self`.
+fn process_block_run<'a, 'i>(
+    run: &[Node<'a, 'i>],
+    styles: &mut Styles<'a, 'i>,
+    ns: &DocxNamespace,
+    block_runs: &mut Vec<(ParagraphStyle, Vec<Node<'a, 'i>>)>,
+) {
+    let mut has_visible_border: Option<bool> = None;
+    let mut border_style: Option<ParagraphStyle> = None;
+    let last = run.len() - 1;
+
+    for (i, &p) in run.iter().enumerate() {
+        let mut style = styles.resolve_paragraph(p, ns);
+        let visible = *has_visible_border.get_or_insert_with(|| style.has_visible_border());
+
+        if visible {
+            style.margin_left = None;
+            style.margin_right = None;
+        }
+        if i != 0 {
+            style.borders.edge_mut(Edge::Top).padding = Some(0.0);
+        } else {
+            let mut bs = style.clone_border_styles();
+            if visible {
+                bs.margin_top = style.margin_top.take();
+            }
+            border_style = Some(bs);
+        }
+        if i != last {
+            style.borders.edge_mut(Edge::Bottom).padding = Some(0.0);
+        } else if visible {
+            if let Some(bs) = border_style.as_mut() {
+                bs.margin_bottom = style.margin_bottom.take();
+            }
+        }
+        style.clear_borders();
+        if i != last {
+            style.apply_between_border();
+        }
+
+        styles.set_paragraph_style(p, style);
+    }
+
+    if has_visible_border == Some(true) {
+        if let Some(mut bs) = border_style {
+            bs.margin_left = Some("0".to_string());
+            bs.margin_right = Some("0".to_string());
+            block_runs.push((bs, run.to_vec()));
         }
     }
 }
@@ -2276,5 +2396,160 @@ mod apply_tab_indentation_tests {
         let wp = *h.state.object_map.get(&p).unwrap();
         let style = h.styles.resolve_paragraph(wp, &ns);
         assert_eq!(style.text_indent.as_deref(), Some("36pt"));
+    }
+}
+
+#[cfg(test)]
+mod mark_block_runs_tests {
+    use super::*;
+    use crate::docx::tables::Tables;
+    use roxmltree::Document;
+
+    const DOC_OPEN: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:xml="http://www.w3.org/XML/1998/namespace""#;
+    const BORDER: &str = r#"<w:pBdr><w:top w:val="single" w:sz="8" w:color="FF0000"/><w:bottom w:val="single" w:sz="8" w:color="FF0000"/></w:pBdr>"#;
+
+    fn parse_root(body: &str) -> (Document<'static>, DocxNamespace) {
+        let xml: &'static str =
+            Box::leak(format!("<w:root {DOC_OPEN}>{body}</w:root>").into_boxed_str());
+        (
+            Document::parse(xml).expect("valid XML"),
+            DocxNamespace::default(),
+        )
+    }
+
+    struct Harness<'a, 'i> {
+        dom: Dom,
+        state: ConvertState<'a, 'i>,
+        styles: Styles<'a, 'i>,
+        footnotes: Footnotes<'a, 'i>,
+        settings: Settings,
+        theme: Theme,
+    }
+
+    impl<'a, 'i> Harness<'a, 'i> {
+        fn new() -> Self {
+            Harness {
+                dom: Dom::empty(),
+                state: ConvertState::new(),
+                styles: Styles::new(Tables::default()),
+                footnotes: Footnotes::new(),
+                settings: Settings::new(),
+                theme: Theme::new(),
+            }
+        }
+
+        fn body(&mut self, doc: Node<'a, 'i>, ns: &DocxNamespace) -> (NodeId, Vec<Node<'a, 'i>>) {
+            convert_body(
+                &mut self.dom,
+                doc,
+                &mut self.state,
+                &mut self.styles,
+                &mut self.footnotes,
+                &self.settings,
+                &self.theme,
+                None,
+                "test-uuid",
+                ns,
+            )
+        }
+    }
+
+    #[test]
+    fn two_identically_bordered_paragraphs_merge_into_one_block_run() {
+        let (doc, ns) = parse_root(&format!(
+            r#"<w:document><w:body>
+                 <w:p><w:pPr>{BORDER}</w:pPr><w:r><w:t>a</w:t></w:r></w:p>
+                 <w:p><w:pPr>{BORDER}</w:pPr><w:r><w:t>b</w:t></w:r></w:p>
+               </w:body></w:document>"#
+        ));
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let (_body, paras) = h.body(document, &ns);
+        mark_block_runs(&mut h.state, &paras, &mut h.styles, &ns);
+
+        assert_eq!(h.state.block_runs.len(), 1);
+        let (border_style, run) = &h.state.block_runs[0];
+        assert_eq!(run, &paras);
+        assert!(border_style.has_visible_border());
+        assert_eq!(border_style.margin_left.as_deref(), Some("0"));
+        assert_eq!(border_style.margin_right.as_deref(), Some("0"));
+
+        // Each paragraph's own border was stripped -- it now lives on
+        // border_style, for the not-yet-ported apply_frames to render
+        // as the wrapping <div>'s border instead.
+        let first = h.styles.resolve_paragraph(paras[0], &ns);
+        let second = h.styles.resolve_paragraph(paras[1], &ns);
+        assert!(!first.has_visible_border());
+        assert!(!second.has_visible_border());
+        // The internal boundary's padding is zeroed on both sides.
+        assert_eq!(first.borders.bottom.padding, Some(0.0));
+        assert_eq!(second.borders.top.padding, Some(0.0));
+    }
+
+    #[test]
+    fn differently_bordered_paragraphs_do_not_merge() {
+        let (doc, ns) = parse_root(&format!(
+            r#"<w:document><w:body>
+                 <w:p><w:pPr>{BORDER}</w:pPr><w:r><w:t>a</w:t></w:r></w:p>
+                 <w:p><w:r><w:t>b</w:t></w:r></w:p>
+               </w:body></w:document>"#
+        ));
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let (_body, paras) = h.body(document, &ns);
+        mark_block_runs(&mut h.state, &paras, &mut h.styles, &ns);
+
+        assert!(h.state.block_runs.is_empty());
+        // Untouched -- a run of length 1 is never handed to
+        // process_block_run at all.
+        let first = h.styles.resolve_paragraph(paras[0], &ns);
+        assert!(first.has_visible_border());
+    }
+
+    #[test]
+    fn identical_but_invisible_borders_still_merge_and_mutate_without_recording_a_block_run() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p><w:r><w:t>a</w:t></w:r></w:p>
+                 <w:p><w:r><w:t>b</w:t></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let (_body, paras) = h.body(document, &ns);
+        mark_block_runs(&mut h.state, &paras, &mut h.styles, &ns);
+
+        // No visible border anywhere -> nothing to record in
+        // block_runs, but the two paragraphs still formed a run (both
+        // have identical -- empty -- borders) and were mutated:
+        // padding between them was still zeroed.
+        assert!(h.state.block_runs.is_empty());
+        let first = h.styles.resolve_paragraph(paras[0], &ns);
+        let second = h.styles.resolve_paragraph(paras[1], &ns);
+        assert_eq!(first.borders.bottom.padding, Some(0.0));
+        assert_eq!(second.borders.top.padding, Some(0.0));
+    }
+
+    #[test]
+    fn a_different_frame_prevents_merging_despite_identical_borders() {
+        let (doc, ns) = parse_root(&format!(
+            r#"<w:document><w:body>
+                 <w:p><w:pPr>{BORDER}</w:pPr><w:r><w:t>a</w:t></w:r></w:p>
+                 <w:p><w:pPr>{BORDER}<w:framePr/></w:pPr><w:r><w:t>b</w:t></w:r></w:p>
+               </w:body></w:document>"#
+        ));
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let (_body, paras) = h.body(document, &ns);
+        assert_ne!(
+            h.state.frame_map.get(&paras[0]),
+            h.state.frame_map.get(&paras[1])
+        );
+
+        mark_block_runs(&mut h.state, &paras, &mut h.styles, &ns);
+
+        assert!(h.state.block_runs.is_empty());
+        let first = h.styles.resolve_paragraph(paras[0], &ns);
+        assert!(first.has_visible_border(), "left untouched, not merged");
     }
 }
