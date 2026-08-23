@@ -372,7 +372,7 @@ either -- this pass wasn't exhaustive.
 - [ ] styles.py (`PageProperties`/`Style` and the full `Styles` paragraph/run cascade orchestrator ported to `docx/styles.rs`; `Styles.cascade` ported as `docx/to_html.rs`'s `cascade` — only `generate_css` (needs `fonts.py`'s system font matching) remains — see #130)
 - [x] tables.py (`RowStyle`/`CellStyle`/`TableStyle` and full `Table`/`Tables` row/cell/paragraph style resolution in `docx/tables.rs`; `apply_markup` (HTML `<table>`/`<tr>`/`<td>` construction) ported as `docx/to_html.rs`'s `apply_table_markup`/`apply_tables_markup` — `handle_merged_cells`'s tracked exclusion set (`removed_cells`) is honoured there — see #130/#286)
 - [x] `theme.py` -> `docx/theme.rs`
-- [ ] to_html.py (`docx/to_html.rs`'s `DOCXToHTML` is still the provisional sketch, wired into `input/docx_input.rs`; `convert_run`/`convert_p`/`read_page_properties`/`convert_body`/`read_block_anchors`/`apply_tab_indentation`/`mark_block_runs`/`resolve_links` (direct `w:hyperlink`s only)/`cascade`/`apply_tables_markup`/`apply_numbering_markup` are ported, not yet wired in — remaining work tracked as issues #284/#287/#288 — see #130)
+- [ ] to_html.py (`docx/to_html.rs`'s `DOCXToHTML` is still the provisional sketch, wired into `input/docx_input.rs`; `convert_run`/`convert_p`/`read_page_properties`/`convert_body`/`read_block_anchors`/`apply_tab_indentation`/`mark_block_runs`/`resolve_links` (direct `w:hyperlink`s only)/`cascade`/`apply_tables_markup`/`apply_numbering_markup`/`apply_block_run_frames` (block-run half of `apply_frames`) are ported, not yet wired in — remaining work tracked as issues #284/#287 (`w:framePr` half)/#288 — see #130)
 - [ ] toc.py (needs the mutable HTML tree — see #130)
 
 ##### writer
