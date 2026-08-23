@@ -73,18 +73,17 @@
 //!   something else has an open read transaction) isn't an error --
 //!   §5 step 1 is "flush what you can", not a hard precondition for
 //!   suspending.
-//! - **No §5 step 2 blocking-with-timeout semantics.** The design doc
-//!   asks for calls made while `Suspended` to block for up to 30s
-//!   waiting for resume before erroring; this crate's `check_open`
-//!   (used by every write path) returns `Err(Suspended)` immediately
-//!   instead, same as it already did for `Detached`. Implementing the
-//!   blocking variant needs a `Condvar` paired with the state lock
-//!   (and touches `device_monitor.rs`'s transition path too, since
-//!   any state-changing caller would need to notify it) -- a real,
-//!   separable follow-up, not bundled into this pass to keep the
-//!   already-large surface of this change (a swappable lock file, a
-//!   persisted `library_id`, a real inhibitor lifecycle) from growing
-//!   further in one pass.
+//! - **§5 step 2 blocking-with-timeout semantics -- real, as of issue
+//!   #259.** `check_open` (used by every write path) now blocks for
+//!   up to 30s waiting for `resume()` while the handle is `Suspended`,
+//!   via a `Condvar` paired with `Shared`'s state lock; `set_state`
+//!   notifies it on every transition (this thread's own `resume()`
+//!   call included, and `device_monitor.rs`'s `Detached` transition
+//!   too, automatically -- no per-caller wiring needed, since
+//!   `set_state` is the one shared chokepoint every transition already
+//!   goes through). `Detached` still fails fast with no blocking when
+//!   the handle is already in that state at the time of the call. See
+//!   `library_handle.rs`'s module doc for the full design.
 //! - **Windows: not implemented**, same disclosed reason as every
 //!   other Windows-specific gap in this crate's fault-tolerance work
 //!   -- `PowerRegisterSuspendResumeNotification`/`WM_POWERBROADCAST`
