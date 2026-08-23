@@ -33,8 +33,7 @@
 //!   indentation into a `text-indent` CSS value.
 //! - [`mark_block_runs`]: collapses consecutive, same-frame,
 //!   identically-bordered paragraphs into one visual block
-//!   (`ConvertState::block_runs`, for the not-yet-ported `apply_frames`
-//!   -- issue #287).
+//!   (`ConvertState::block_runs`, for [`apply_block_run_frames`]).
 //! - [`resolve_links`]: turns tracked `w:hyperlink`s into real `<a>`
 //!   elements (issue #283's `link_map`-driven first block only --
 //!   `fields.py`/`images.py`'s link sources are separate, still-open
@@ -52,11 +51,12 @@
 //!   (via [`commit_list_run`]), and rewrites custom-bullet-text lists
 //!   into a CSS-table layout (issue #286's `numbering.py` half --
 //!   closes #286).
-//! - [`apply_block_run_frames`]: wraps each of
-//!   `ConvertState::block_runs`' merged paragraph runs (from
-//!   [`mark_block_runs`]) in a bordered `<div>`, populating
-//!   `ConvertState::framed_map` (issue #287's block-run half; the
-//!   `w:framePr`-based half is separate, still open).
+//! - [`apply_block_run_frames`]/[`apply_paragraph_frames`]: the two
+//!   halves of `apply_frames`, wrapping bordered [`mark_block_runs`]
+//!   runs and consecutive `w:framePr`-styled paragraph runs (grouped
+//!   by [`ConvertState::add_frame`], called from [`convert_p`])
+//!   respectively in a `<div>` carrying the relevant CSS, populating
+//!   `ConvertState::framed_map` (issue #287, closed).
 //! - [`assign_style_classes`]: the final step -- registers a CSS class
 //!   for every cached paragraph/run style and every frame's border
 //!   CSS, then sets `class` on each corresponding HTML element (issue
@@ -71,9 +71,10 @@
 //!   relationships through `convert_p`/`convert_body` as an explicit
 //!   parameter rather than Python's mutable `self.current_rels`).
 //!
-//! Not yet wired into `DOCXToHTML` -- that still needs everything
-//! downstream (the rest of `apply_frames`, TOC, OPF writing), none of
-//! which exist here yet.
+//! Not yet wired into `DOCXToHTML` -- that still needs
+//! `fields.polish_markup`/`cleanup_markup`/`write` (issue #288) and
+//! everything else downstream (TOC, OPF writing), none of which exist
+//! here yet.
 //!
 //! # What `convert_run` defers, and why
 //!
@@ -572,17 +573,62 @@ pub struct ConvertState<'a, 'i> {
     /// docs). Consumed by the not-yet-ported `Styles::cascade` (#285).
     pub is_link: HashSet<Node<'a, 'i>>,
     /// HTML `<div>` frame wrapper -> its CSS, populated by
-    /// [`apply_block_run_frames`] (and, once ported, the other half of
-    /// `apply_frames` that consumes `w:framePr`). Consumed by the
-    /// not-yet-ported final class-assignment pass (issue #288):
+    /// [`apply_block_run_frames`] and [`apply_paragraph_frames`].
+    /// Consumed by [`assign_style_classes`]:
     /// `styles.class_name(css)` looks up the class each frame was
     /// registered under.
     pub framed_map: HashMap<NodeId, Css>,
+    /// Runs of consecutive `w:framePr`-styled paragraphs, grouped by
+    /// [`ConvertState::add_frame`] as [`convert_p`] builds each one,
+    /// for [`apply_paragraph_frames`] to later wrap each run in a
+    /// `<div>`. Starts with one empty run (Python's `self.framed =
+    /// [[]]`), never truly empty itself -- [`ConvertState::add_frame`]
+    /// relies on that invariant.
+    pub framed: Vec<Vec<(NodeId, Frame)>>,
 }
 
 impl<'a, 'i> ConvertState<'a, 'i> {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            framed: vec![Vec::new()],
+            ..Default::default()
+        }
+    }
+
+    /// Tracks `html_obj` into the current (or a fresh) run of
+    /// consecutively `w:framePr`-styled paragraphs. Called from
+    /// [`convert_p`] once per paragraph, right after
+    /// [`ConvertState::frame_map`] records the same resolved
+    /// `style.frame`.
+    ///
+    /// Port of the Python `Convert.add_frame`. One line of Python is
+    /// dead code, not reproduced: `last_run[-1][1] == style` branches
+    /// into `last_run.append(...)` or `self.framed[-1].append(...)`,
+    /// but `last_run` **is** `self.framed[-1]` (the same list object),
+    /// so both branches do the identical append regardless of the
+    /// comparison's result -- there is no behavior to preserve there,
+    /// only a redundant read. A real, visible consequence of this
+    /// *does* survive though, and is deliberately kept: a run can end
+    /// up containing paragraphs with genuinely different frame styles
+    /// (nothing ever breaks a run on a style mismatch), and
+    /// [`apply_paragraph_frames`] renders the whole run's CSS from
+    /// only its *first* paragraph's style -- reproduced as-is.
+    pub fn add_frame(&mut self, html_obj: NodeId, style_frame: Option<Frame>) {
+        let Some(style_frame) = style_frame else {
+            if !self
+                .framed
+                .last()
+                .expect("framed always has at least one run")
+                .is_empty()
+            {
+                self.framed.push(Vec::new());
+            }
+            return;
+        };
+        self.framed
+            .last_mut()
+            .expect("framed always has at least one run")
+            .push((html_obj, style_frame));
     }
 }
 
@@ -655,6 +701,7 @@ pub fn convert_p<'a, 'i>(
     let style = styles.resolve_paragraph(p, ns);
     state.layers.insert(p, Vec::new());
     state.frame_map.insert(p, style.frame.clone());
+    state.add_frame(dest, style.frame.clone());
 
     let mut current_anchor: Option<String> = None;
 
@@ -2094,6 +2141,58 @@ pub fn apply_block_run_frames<'a, 'i>(
         dom.insert_child(frame_parent, idx, frame);
 
         let css = border_style.css();
+        state.framed_map.insert(frame, css.clone());
+        styles.register(css, "frame");
+    }
+}
+
+/// Wraps each run [`ConvertState::add_frame`] grouped (consecutive
+/// `w:framePr`-styled paragraphs, built up as [`convert_p`] runs) in a
+/// `<div>` carrying the frame's CSS, populating
+/// [`ConvertState::framed_map`]. The other half of `apply_frames`, for
+/// `w:framePr`-based frames rather than [`mark_block_runs`]' bordered
+/// runs (see [`apply_block_run_frames`]).
+///
+/// A run's CSS comes from only its *first* paragraph's frame style,
+/// even when a later member's style genuinely differs -- see
+/// [`ConvertState::add_frame`]'s own docs for why that's a faithfully
+/// reproduced Python behavior, not an oversight here.
+///
+/// Port of the `for run in filter(None, self.framed): ...` half of the
+/// Python `Convert.apply_frames`.
+pub fn apply_paragraph_frames<'a, 'i>(
+    dom: &mut Dom,
+    state: &mut ConvertState<'a, 'i>,
+    styles: &mut Styles<'a, 'i>,
+    object_map: &IndexMap<NodeId, Node<'a, 'i>>,
+    page_map: &IndexMap<Node<'a, 'i>, PageProperties>,
+) {
+    let runs = std::mem::take(&mut state.framed);
+    for run in runs.into_iter().filter(|r| !r.is_empty()) {
+        let style = run[0].1.clone();
+        let paras: Vec<NodeId> = run.iter().map(|&(id, _)| id).collect();
+        let Some(&first) = paras.first() else {
+            continue;
+        };
+        let Some(parent) = dom.parent(first) else {
+            continue;
+        };
+        let idx = dom.index_in_parent(first).unwrap_or(0);
+
+        let frame = dom.new_element("div");
+        for &p in &paras {
+            dom.append_child(frame, p);
+        }
+        dom.insert_child(parent, idx, frame);
+
+        let Some(page_width) = object_map
+            .get(&first)
+            .and_then(|wp| page_map.get(wp))
+            .map(|page| page.width)
+        else {
+            continue;
+        };
+        let css = style.css(page_width);
         state.framed_map.insert(frame, css.clone());
         styles.register(css, "frame");
     }
@@ -5087,5 +5186,197 @@ mod convert_footnotes_tests {
 
         assert!(header.is_none());
         assert_eq!(h.dom.children(body).len(), before);
+    }
+}
+
+#[cfg(test)]
+mod apply_paragraph_frames_tests {
+    use super::*;
+    use crate::docx::tables::Tables;
+    use roxmltree::Document;
+
+    const DOC_OPEN: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:xml="http://www.w3.org/XML/1998/namespace""#;
+    const FRAME: &str = r#"<w:framePr w:w="200" w:h="100" w:wrap="around"/>"#;
+
+    fn parse_root(body: &str) -> (Document<'static>, DocxNamespace) {
+        let xml: &'static str =
+            Box::leak(format!("<w:root {DOC_OPEN}>{body}</w:root>").into_boxed_str());
+        (
+            Document::parse(xml).expect("valid XML"),
+            DocxNamespace::default(),
+        )
+    }
+
+    struct Harness<'a, 'i> {
+        dom: Dom,
+        state: ConvertState<'a, 'i>,
+        styles: Styles<'a, 'i>,
+        footnotes: Footnotes<'a, 'i>,
+        settings: Settings,
+        theme: Theme,
+    }
+
+    impl<'a, 'i> Harness<'a, 'i> {
+        fn new() -> Self {
+            Harness {
+                dom: Dom::empty(),
+                state: ConvertState::new(),
+                styles: Styles::new(Tables::default()),
+                footnotes: Footnotes::new(),
+                settings: Settings::new(),
+                theme: Theme::new(),
+            }
+        }
+
+        fn body(&mut self, doc: Node<'a, 'i>, ns: &DocxNamespace) -> NodeId {
+            convert_body(
+                &mut self.dom,
+                doc,
+                &mut self.state,
+                &mut self.styles,
+                &mut self.footnotes,
+                &self.settings,
+                &self.theme,
+                None,
+                "test-uuid",
+                &Relationships::default(),
+                ns,
+            )
+            .0
+        }
+
+        fn page_map_for(&self, paras: &[Node<'a, 'i>]) -> IndexMap<Node<'a, 'i>, PageProperties> {
+            paras.iter().map(|&p| (p, PageProperties::new())).collect()
+        }
+    }
+
+    #[test]
+    fn two_consecutive_framed_paragraphs_merge_into_one_div() {
+        let (doc, ns) = parse_root(&format!(
+            r#"<w:document><w:body>
+                 <w:p><w:pPr>{FRAME}</w:pPr><w:r><w:t>a</w:t></w:r></w:p>
+                 <w:p><w:pPr>{FRAME}</w:pPr><w:r><w:t>b</w:t></w:r></w:p>
+               </w:body></w:document>"#
+        ));
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let body = h.body(document, &ns);
+        let body_paras: Vec<Node> = ns.descendants(document, &["w:p"]);
+        let page_map = h.page_map_for(&body_paras);
+
+        let object_map = h.state.object_map.clone();
+        apply_paragraph_frames(
+            &mut h.dom,
+            &mut h.state,
+            &mut h.styles,
+            &object_map,
+            &page_map,
+        );
+
+        let body_children = h.dom.children(body);
+        assert_eq!(body_children.len(), 1);
+        let frame = body_children[0];
+        assert_eq!(h.dom.tag(frame), Some("div"));
+        let inner = h.dom.children(frame);
+        assert_eq!(inner.len(), 2);
+        assert_eq!(h.dom.tag(inner[0]), Some("p"));
+        assert_eq!(h.dom.tag(inner[1]), Some("p"));
+        assert_eq!(h.state.framed_map.len(), 1);
+        assert!(h.state.framed_map.contains_key(&frame));
+    }
+
+    #[test]
+    fn a_plain_paragraph_between_two_framed_ones_splits_them_into_two_divs() {
+        let (doc, ns) = parse_root(&format!(
+            r#"<w:document><w:body>
+                 <w:p><w:pPr>{FRAME}</w:pPr><w:r><w:t>a</w:t></w:r></w:p>
+                 <w:p><w:r><w:t>plain</w:t></w:r></w:p>
+                 <w:p><w:pPr>{FRAME}</w:pPr><w:r><w:t>b</w:t></w:r></w:p>
+               </w:body></w:document>"#
+        ));
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let body = h.body(document, &ns);
+        let body_paras: Vec<Node> = ns.descendants(document, &["w:p"]);
+        let page_map = h.page_map_for(&body_paras);
+
+        let object_map = h.state.object_map.clone();
+        apply_paragraph_frames(
+            &mut h.dom,
+            &mut h.state,
+            &mut h.styles,
+            &object_map,
+            &page_map,
+        );
+
+        let body_children = h.dom.children(body);
+        // <div>a</div>, <p>plain</p>, <div>b</div>
+        assert_eq!(body_children.len(), 3);
+        assert_eq!(h.dom.tag(body_children[0]), Some("div"));
+        assert_eq!(h.dom.tag(body_children[1]), Some("p"));
+        assert_eq!(h.dom.tag(body_children[2]), Some("div"));
+        assert_eq!(h.state.framed_map.len(), 2);
+    }
+
+    #[test]
+    fn a_run_with_differing_frame_styles_still_merges_using_the_first_ones_css() {
+        // Different `w:w` values -> genuinely different Frame styles,
+        // but add_frame never breaks a run on a style mismatch (the
+        // comparison in Python is dead code) -- both still merge into
+        // one <div>, styled only from the first paragraph's frame.
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p><w:pPr><w:framePr w:w="200" w:h="100"/></w:pPr><w:r><w:t>a</w:t></w:r></w:p>
+                 <w:p><w:pPr><w:framePr w:w="999" w:h="100"/></w:pPr><w:r><w:t>b</w:t></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let body = h.body(document, &ns);
+        let body_paras: Vec<Node> = ns.descendants(document, &["w:p"]);
+        let page_map = h.page_map_for(&body_paras);
+
+        let object_map = h.state.object_map.clone();
+        apply_paragraph_frames(
+            &mut h.dom,
+            &mut h.state,
+            &mut h.styles,
+            &object_map,
+            &page_map,
+        );
+
+        let body_children = h.dom.children(body);
+        assert_eq!(body_children.len(), 1, "merged despite differing styles");
+        let frame = body_children[0];
+        let css = h.state.framed_map.get(&frame).expect("registered");
+        // 200 twentieths = 10pt, matching the *first* paragraph's w:w,
+        // not the second's 999.
+        assert_eq!(css.get("width").map(String::as_str), Some("10pt"));
+    }
+
+    #[test]
+    fn no_framed_paragraphs_is_a_no_op() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p><w:r><w:t>a</w:t></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let body = h.body(document, &ns);
+        let page_map: IndexMap<Node, PageProperties> = IndexMap::new();
+
+        let object_map = h.state.object_map.clone();
+        apply_paragraph_frames(
+            &mut h.dom,
+            &mut h.state,
+            &mut h.styles,
+            &object_map,
+            &page_map,
+        );
+
+        assert_eq!(h.dom.children(body).len(), 1);
+        assert_eq!(h.dom.tag(h.dom.children(body)[0]), Some("p"));
+        assert!(h.state.framed_map.is_empty());
     }
 }
