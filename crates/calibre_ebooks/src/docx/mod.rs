@@ -25,6 +25,7 @@
 //! | `images.py` (partial) | [`images`] |
 //! | `fields.py` (partial) | [`fields`] |
 //! | `index.py` (partial) | [`index`] |
+//! | `cleanup.py` (partial) | [`cleanup`] |
 //!
 //! The four "partial" rows above port everything except HTML-markup
 //! construction: `numbering.rs` has `Level`/`NumberingDefinition`/
@@ -43,24 +44,26 @@
 //! system dependency) but not the `Fonts` class itself (embedded-font
 //! extraction, `family_for`'s system-installed-font matching), which
 //! needs a font scanner with no Rust counterpart.
-//! `to_html.py`'s own orchestration, and `cleanup.py`, are tracked
-//! separately in issue #130 -- they build and mutate an HTML element
-//! tree ([`crate::dom`] as of that issue). `toc.py` is ported
-//! ([`toc`]) but, like everything above, not yet wired into a
-//! `to_html.py` orchestrator -- see issue #288. `images.py`'s pure
-//! geometry/CSS half is ported ([`images`], issue #289); the `Images`
-//! struct itself (embedded-image extraction, resizing, `w:drawing`/
-//! `w:pict` -> `<img>` markup) is still a separate follow-up.
-//! `fields.py`'s pure field-instruction parsing half is ported
-//! ([`fields`], issue #290); the `Fields` orchestrator itself (the
-//! source-tree field scanner, plus `parse_xe`'s synthetic-bookmark
-//! insertion) is a separate follow-up -- see `fields`'s module docs.
-//! `index.py`'s `polish_index_markup` half (the HTML-DOM-mutating
-//! block-merge algorithm) is ported ([`index`], issue #293); its
-//! `make_block`/`add_xe`/`process_index` (source-tree-mutating) half
-//! is not, needing the same `crate::xmltree`-vs-side-table decision
+//! `to_html.py`'s own orchestration is tracked separately in issue
+//! #130 -- it needs the real HTML element tree ([`crate::dom`] as of
+//! that issue) fully wired into a `Convert`-equivalent orchestrator.
+//! `toc.py` is ported ([`toc`]) but, like everything below, not yet
+//! wired into one -- see issue #288. `images.py`'s pure geometry/CSS
+//! half is ported ([`images`], issue #289); the `Images` struct itself
+//! (embedded-image extraction, resizing, `w:drawing`/`w:pict` ->
+//! `<img>` markup) is still a separate follow-up. `fields.py`'s pure
+//! field-instruction parsing half is ported ([`fields`], issue #290);
+//! the `Fields` orchestrator itself (the source-tree field scanner,
+//! plus `parse_xe`'s synthetic-bookmark insertion) is a separate
+//! follow-up -- see `fields`'s module docs. `index.py`'s
+//! `polish_index_markup` half (the HTML-DOM-mutating block-merge
+//! algorithm) is ported ([`index`], issue #293); its `make_block`/
+//! `add_xe`/`process_index` (source-tree-mutating) half is not,
+//! needing the same `crate::xmltree`-vs-side-table decision
 //! `fields.rs`'s `parse_xe` is blocked on -- see `index`'s module
-//! docs.
+//! docs. `cleanup.py`'s markup-cleanup half is ported ([`cleanup`],
+//! issue #291); its cover-image detection (real file I/O + image
+//! dimension reading) is a separate follow-up.
 //!
 //! The output half of the module — `writer/` — is issue #23 and lives
 //! in [`writer`].
@@ -81,6 +84,7 @@
 
 pub mod block_styles;
 pub mod char_styles;
+pub mod cleanup;
 pub mod container;
 pub mod dump;
 pub mod error;
