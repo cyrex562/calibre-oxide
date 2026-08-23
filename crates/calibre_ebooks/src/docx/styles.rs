@@ -579,6 +579,22 @@ impl<'a, 'i> Styles<'a, 'i> {
         ans
     }
 
+    /// Overwrites a cached run's `font_family`, persisting the change
+    /// the way Python's `resolve_run` callers do when they mutate the
+    /// object `resolve_run` returned in place (e.g. `to_html.py`'s
+    /// `convert_run`, after remapping a symbol font's text, sets
+    /// `style.font_family = 'sans-serif'` on the very `RunStyle`
+    /// `resolve_run` cached -- a real, persisted mutation later CSS
+    /// generation observes, not a throwaway local). `resolve_run`
+    /// returns an owned clone here, so that mutation needs an explicit
+    /// write-back; call this only after `resolve_run(r, ...)` has
+    /// already populated the cache for `r`.
+    pub fn set_run_font_family(&mut self, r: Node<'a, 'i>, font_family: String) {
+        if let Some(cached) = self.run_cache.get_mut(&r) {
+            cached.font_family = Some(font_family);
+        }
+    }
+
     /// Discards a named paragraph style's own `w:numPr` level in
     /// favour of the level `numbering.xml` actually links to that
     /// style (Word ignores a level set directly inside a style
