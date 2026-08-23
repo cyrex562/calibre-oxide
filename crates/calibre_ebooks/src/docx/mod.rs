@@ -29,16 +29,19 @@
 //! bookkeeping (not `apply_markup`) -- merged-cell removal is a
 //! tracked exclusion set rather than source-tree mutation, see
 //! `tables`'s module docs; `styles.rs` has `PageProperties`/`Style`
-//! only, since the `Styles` cascade orchestrator needs `Tables` (now
-//! available) *and* `Numbering` wired together, not yet done.
-//! `Numbering::apply_markup`, `Table`/`Tables::apply_markup`, `Styles`,
-//! and `fonts.py`, `images.py`, `fields.py`, `index.py`, `toc.py`,
-//! `cleanup.py` and a real `to_html.py` are tracked separately in
-//! issue #130 -- they build and mutate an HTML element tree
-//! ([`crate::dom`] as of that issue), and (for `fields.py`/`index.py`'s
-//! synthetic-element insertion) a mutable *source*-document tree
-//! ([`crate::xmltree`], relocated for this reason but not yet wired
-//! into the docx module).
+//! *and* the full `Styles` paragraph/run cascade orchestrator (not
+//! `Styles::cascade` itself, nor `generate_css`) -- see `styles`'s
+//! module docs for why those two, specifically, are still blocked
+//! (an `is-link`/`layers` concept only `to_html.rs` can produce, and
+//! `fonts.py`'s system font matching, respectively).
+//! `Numbering::apply_markup`, `Table`/`Tables::apply_markup`,
+//! `Styles::cascade`/`generate_css`, and `fonts.py`, `images.py`,
+//! `fields.py`, `index.py`, `toc.py`, `cleanup.py` and a real
+//! `to_html.py` are tracked separately in issue #130 -- they build
+//! and mutate an HTML element tree ([`crate::dom`] as of that issue),
+//! and (for `fields.py`/`index.py`'s synthetic-element insertion) a
+//! mutable *source*-document tree ([`crate::xmltree`], relocated for
+//! this reason but not yet wired into the docx module).
 //!
 //! The output half of the module — `writer/` — is issue #23 and lives
 //! in [`writer`].
@@ -81,6 +84,6 @@ pub use footnotes::{Footnotes, Note};
 pub use names::DocxNamespace;
 pub use numbering::{Level, Numbering, NumberingDefinition};
 pub use settings::Settings;
-pub use styles::{PageProperties, Style};
+pub use styles::{PageProperties, Style, Styles};
 pub use tables::{CellStyle, RowStyle, TableStyle};
 pub use theme::Theme;
