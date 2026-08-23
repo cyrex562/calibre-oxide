@@ -26,7 +26,7 @@ use indexmap::IndexMap;
 use lazy_static::lazy_static;
 use regex::Regex;
 
-use crate::mobi::dom::{Dom, NodeId, NodeKind};
+use crate::dom::{Dom, NodeId, NodeKind};
 
 use super::cleaners::clean_html;
 use super::htmls::{build_doc, get_body, get_title, shorten_title};

@@ -82,7 +82,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::Result;
 
-use crate::mobi::dom::{Dom, NodeId, NodeKind};
+use crate::dom::{Dom, NodeId, NodeKind};
 use crate::oeb::book::OEBBook;
 use crate::oeb::constants::{CSS_MIME, OEB_STYLES, XHTML_NS};
 use crate::oeb::polish::cascade::{

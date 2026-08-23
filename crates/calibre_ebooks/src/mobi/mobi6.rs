@@ -25,7 +25,7 @@ use crate::compression::palmdoc::decompress as decompress_doc;
 use crate::html_entities::{decode_entities, xml_replace_entities};
 use crate::metadata::toc::{TOCNode, TOC};
 use crate::metadata::MetaInformation;
-use crate::mobi::dom::{Dom, NodeId};
+use crate::dom::{Dom, NodeId};
 use crate::mobi::headers::BookHeader;
 use crate::mobi::huffcdic::HuffReader;
 use crate::mobi::opf_writer::{self, GuideRef};
@@ -122,7 +122,7 @@ fn tail_is_whitespace(dom: &Dom, tag: NodeId) -> bool {
     match dom.next_sibling(tag) {
         None => true,
         Some(n) => match &dom.node(n).kind {
-            crate::mobi::dom::NodeKind::Text(t) => t.trim().is_empty(),
+            crate::dom::NodeKind::Text(t) => t.trim().is_empty(),
             _ => false,
         },
     }
@@ -879,7 +879,7 @@ impl MobiReader {
                     }
                 }
                 "pre" => {
-                    let has_text = dom.children(tag).iter().any(|&c| matches!(&dom.node(c).kind, crate::mobi::dom::NodeKind::Text(t) if !t.is_empty()));
+                    let has_text = dom.children(tag).iter().any(|&c| matches!(&dom.node(c).kind, crate::dom::NodeKind::Text(t) if !t.is_empty()));
                     if !has_text {
                         dom.set_tag(tag, "div");
                     }

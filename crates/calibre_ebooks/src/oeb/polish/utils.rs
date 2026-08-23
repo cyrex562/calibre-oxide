@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::mobi::dom::{Dom, NodeId};
+use crate::dom::{Dom, NodeId};
 
 /// Port of `BLOCK_TAG_NAMES`.
 pub const BLOCK_TAG_NAMES: &[&str] = &[
@@ -276,7 +276,7 @@ fn comment_re() -> &'static regex::Regex {
 
 /// Port of `lead_text`: the leading text of `top_elem` (including
 /// descendants), up to `num_words` words. Operates on
-/// [`crate::mobi::dom::Dom`] since it walks XHTML content documents.
+/// [`crate::dom::Dom`] since it walks XHTML content documents.
 pub fn lead_text(dom: &Dom, top_elem: NodeId, num_words: usize) -> String {
     let ws_re = whitespace_re();
     let mut words: Vec<String> = Vec::new();
@@ -295,7 +295,7 @@ pub fn lead_text(dom: &Dom, top_elem: NodeId, num_words: usize) -> String {
             return;
         }
         match &dom.node(id).kind {
-            crate::mobi::dom::NodeKind::Text(t) => {
+            crate::dom::NodeKind::Text(t) => {
                 for w in ws_re.split(t) {
                     if !w.is_empty() {
                         words.push(w.to_string());
@@ -305,7 +305,7 @@ pub fn lead_text(dom: &Dom, top_elem: NodeId, num_words: usize) -> String {
                     }
                 }
             }
-            crate::mobi::dom::NodeKind::Element(_) => {
+            crate::dom::NodeKind::Element(_) => {
                 for &c in &dom.node(id).children {
                     walk(dom, c, words, ws_re, limit);
                     if words.len() >= limit {

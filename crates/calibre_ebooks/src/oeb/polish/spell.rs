@@ -15,7 +15,7 @@
 //! `.get`/`.set` API. This crate has two structurally different tree
 //! types for the same reason `container.rs` does (see its module docs):
 //! [`super::xmltree::Xml`] for strict XML (OPF, NCX) and
-//! [`crate::mobi::dom::Dom`] for tag-soup HTML5. [`TreeNode`] is the
+//! [`crate::dom::Dom`] for tag-soup HTML5. [`TreeNode`] is the
 //! discriminated union that replaces "any lxml element": callers that
 //! need to read/write a location's text dispatch on it via
 //! [`node_item_text`]/[`set_node_item_text`] rather than relying on a
@@ -66,7 +66,7 @@ use anyhow::Result;
 use regex::Regex;
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::mobi::dom::{Dom, NodeId, NodeKind};
+use crate::dom::{Dom, NodeId, NodeKind};
 
 use super::container::Container;
 use super::toc::{find_existing_nav_toc, find_existing_ncx_toc};

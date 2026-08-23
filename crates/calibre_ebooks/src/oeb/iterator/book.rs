@@ -82,7 +82,7 @@ use calibre_utils::config::DynamicConfig;
 
 use crate::conversion::plumber::convert_to_oebbook;
 use crate::html_entities::decode_entities;
-use crate::mobi::dom::{Dom, NodeId, NodeKind};
+use crate::dom::{Dom, NodeId, NodeKind};
 use crate::mobi::mobi6::MobiReader;
 use crate::oeb::book::OEBBook;
 use crate::oeb::iterator::bookmarks::{Bookmark, BookmarksMixin};
@@ -438,7 +438,7 @@ impl EbookIterator {
     /// Search the spine for `text` (case-insensitive), scanning forward
     /// from `index` (or backward, if `backwards`), and return the index
     /// of the first spine item whose body text contains it. Port of
-    /// `EbookIterator.search`, using [`crate::mobi::dom`] (the HTML5
+    /// `EbookIterator.search`, using [`crate::dom`] (the HTML5
     /// parser+arena from issue #33) in place of Python's
     /// `calibre.ebooks.oeb.polish.parsing.parse` (a separate, unported
     /// lxml-based parser).

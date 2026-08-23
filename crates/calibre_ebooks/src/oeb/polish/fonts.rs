@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 
 use crate::css::{Rule, Stylesheet};
-use crate::mobi::dom::{Dom, NodeId};
+use crate::dom::{Dom, NodeId};
 use crate::oeb::constants::{OEB_DOCS, OEB_STYLES};
 use crate::oeb::fonts3::{parse_font_family, serialize_font_family};
 

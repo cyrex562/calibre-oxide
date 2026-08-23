@@ -34,7 +34,7 @@
 
 use regex::Regex;
 
-use crate::mobi::dom::{Dom, NodeId, NodeKind};
+use crate::dom::{Dom, NodeId, NodeKind};
 use crate::oeb::book::OEBBook;
 use crate::oeb::toc::TOCNode;
 

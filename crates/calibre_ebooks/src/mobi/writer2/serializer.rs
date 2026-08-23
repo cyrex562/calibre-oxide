@@ -6,7 +6,7 @@
 //! # DOM reuse
 //!
 //! Python walks an lxml-parsed tree per spine item. This port parses
-//! each spine item's raw HTML with [`crate::mobi::dom::Dom`] (the same
+//! each spine item's raw HTML with [`crate::dom::Dom`] (the same
 //! html5ever-backed arena added for issue #33's `upshift_markup`) and
 //! walks that instead of introducing a second tree abstraction.
 //! `dom::Dom`'s `convert()` step discards element/attribute namespaces
@@ -29,7 +29,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::mobi::dom::{Dom, Node, NodeId, NodeKind};
+use crate::dom::{Dom, Node, NodeId, NodeKind};
 use crate::oeb::book::OEBBook;
 use crate::oeb::constants::OEB_DOCS;
 

@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
-use crate::mobi::dom::{Dom, NodeId};
+use crate::dom::{Dom, NodeId};
 use crate::oeb::constants::{OEB_DOCS, OEB_STYLES};
 
 use super::container::{Container, LinkFileType};

@@ -1,7 +1,11 @@
-//! A small, mutable arena-based HTML tree used by the parts of the MOBI
-//! reader that Python implements with `lxml.etree`/`lxml.html`
-//! (`mobi6.py`'s `upshift_markup`/`create_opf`/`read_embedded_metadata`,
-//! `mobi8.py`'s `read_inline_toc`).
+//! A small, mutable arena-based HTML tree used by any format module that
+//! Python implements with a mutated `lxml.etree`/`lxml.html` tree --
+//! originally built for the MOBI reader (`mobi6.py`'s
+//! `upshift_markup`/`create_opf`/`read_embedded_metadata`, `mobi8.py`'s
+//! `read_inline_toc`) and since reused across `oeb::polish` and (as of the
+//! docx HTML-generation port, issue #130) `docx::to_html` and friends. It
+//! lived under `mobi::dom` until that reuse made the name misleading; it
+//! was moved to the crate root without any behavior change.
 //!
 //! Real parsing is delegated to `html5ever` (via `markup5ever_rcdom`),
 //! matching the precedent in `calibre_conversion::transform::html_roundtrip`.

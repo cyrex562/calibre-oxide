@@ -59,7 +59,7 @@ use anyhow::Result;
 use regex::Regex;
 
 use crate::metadata::meta::MetaInformation;
-use crate::mobi::dom::{Dom, NodeId, NodeKind};
+use crate::dom::{Dom, NodeId, NodeKind};
 use crate::oeb::book::OEBBook;
 use crate::oeb::constants::XHTML_MIME;
 

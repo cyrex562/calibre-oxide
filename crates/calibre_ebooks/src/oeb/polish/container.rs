@@ -70,7 +70,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use unicode_normalization::UnicodeNormalization;
 
-use crate::mobi::dom::Dom;
+use crate::dom::Dom;
 use crate::oeb::constants::{DC11_NS, NCX_MIME, OEB_DOCS, OEB_STYLES, OPF2_NS};
 
 use super::errors::PolishError;
@@ -95,7 +95,7 @@ pub fn opf_namespaces() -> HashMap<&'static str, &'static str> {
 /// exercises `parsed()` on a binary file, but the fallback keeps the
 /// cache total).
 pub enum ParsedItem {
-    /// XHTML/HTML content documents, via [`crate::mobi::dom::Dom`].
+    /// XHTML/HTML content documents, via [`crate::dom::Dom`].
     Xhtml(Dom),
     /// OPF/NCX/OCF-family strict XML, via [`Xml`].
     Xml(Xml),

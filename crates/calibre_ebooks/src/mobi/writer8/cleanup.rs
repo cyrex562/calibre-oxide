@@ -29,7 +29,7 @@
 
 use std::collections::HashSet;
 
-use crate::mobi::dom::Dom;
+use crate::dom::Dom;
 
 /// Strip a literal `height` declaration from every `<body>` element's own
 /// inline `style=` attribute. Narrow stand-in for `CSSCleanup` -- see the

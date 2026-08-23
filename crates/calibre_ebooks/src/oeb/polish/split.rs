@@ -15,7 +15,7 @@
 //! (needed because a Python deep-copy produces new `Element` objects
 //! with no relationship to the originals). This crate's [`Dom`] is a
 //! plain arena (`Vec<Node>` + integer `NodeId` indices) that now derives
-//! `Clone` (see `mobi::dom`'s recent addition); cloning it verbatim
+//! `Clone` (see `crate::dom`'s recent addition); cloning it verbatim
 //! preserves every `NodeId`'s meaning unchanged, so the *same*
 //! `split_point`/`NodeId` is valid in both the original and every clone
 //! -- no XPath round trip needed to re-find it.
@@ -23,7 +23,7 @@
 //! **`.text`/`.tail` mutation reuses `oeb::polish::pretty`'s helpers.**
 //! lxml keeps an element's leading text (`.text`) and following text
 //! (`.tail`) as string attributes on the `Element` object itself; `Dom`
-//! represents both as ordinary sibling `Text` nodes (see `mobi::dom`'s
+//! represents both as ordinary sibling `Text` nodes (see `crate::dom`'s
 //! module docs). `pretty.rs` already implements exactly this
 //! text-as-sibling read/write against `Dom` (`leading_text`/
 //! `set_leading_text`/`dom_tail`/`set_dom_tail`), so this module reuses
@@ -50,7 +50,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::mobi::dom::{Dom, Node as DomNode, NodeId, NodeKind};
+use crate::dom::{Dom, Node as DomNode, NodeId, NodeKind};
 use crate::oeb::constants::{OEB_DOCS, OPF2_NS};
 
 use super::container::{href_to_name_at, name_to_href_at, Container, ParsedItem};

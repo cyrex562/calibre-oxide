@@ -28,7 +28,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 
-use crate::mobi::dom::{Dom, NodeId, NodeKind};
+use crate::dom::{Dom, NodeId, NodeKind};
 use crate::oeb::constants::{DC11_NS, NCX_MIME, OEB_DOCS, OEB_STYLES, SVG_MIME, XML_MIME};
 
 use super::container::{opf_namespaces, Container, ContainerBase};
@@ -206,7 +206,7 @@ pub fn pretty_opf(xml: &mut Xml) {
 }
 
 // ===================================================================
-// HTML-tree pretty printing (XHTML content), via `mobi::dom::Dom`
+// HTML-tree pretty printing (XHTML content), via `crate::dom::Dom`
 // ===================================================================
 
 /// Port of `BLOCK_TAGS` (`SVG_TAG` is handled separately -- see

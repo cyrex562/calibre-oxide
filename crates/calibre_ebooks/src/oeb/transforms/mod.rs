@@ -6,7 +6,7 @@
 //! `Container`/`Xml` (used by the separate "Polish Book" tool). There is
 //! no on-disk container here: content is read/written as raw bytes
 //! through `OEBBook::container` (the `oeb::container::Container` trait),
-//! parsed on demand with [`crate::mobi::dom::Dom`] when a transform needs
+//! parsed on demand with [`crate::dom::Dom`] when a transform needs
 //! to walk or mutate markup.
 //!
 //! Issue #41 batch 1 ported the 14 files with no dependency on the

@@ -290,7 +290,7 @@ impl MergeMetadata {
                 continue;
             };
             let html = String::from_utf8_lossy(&raw);
-            let mut dom = crate::mobi::dom::Dom::parse(&html);
+            let mut dom = crate::dom::Dom::parse(&html);
             let mut removed = false;
             for img in dom.find_all_tag_global("img") {
                 let src = dom.node(img).attrs.get("src").cloned();

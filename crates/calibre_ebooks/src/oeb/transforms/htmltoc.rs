@@ -86,7 +86,7 @@ impl HTMLTOCAdder {
                         .ok()
                         .map(|raw| {
                             let html = String::from_utf8_lossy(&raw);
-                            let dom = crate::mobi::dom::Dom::parse(&html);
+                            let dom = crate::dom::Dom::parse(&html);
                             dom.find_all_tag_global("a")
                                 .into_iter()
                                 .any(|a| dom.node(a).attrs.contains_key("href"))

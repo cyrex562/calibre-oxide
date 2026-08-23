@@ -756,7 +756,7 @@ fn is_oeb_image(path: &str) -> bool {
 ///
 /// The markdown branch needs a real markdown-to-HTML pass (reused from
 /// [`markdown_to_html`]) followed by a real HTML parse to find `<img
-/// src>` -- done with `crate::mobi::dom::Dom` (`html5ever`-backed),
+/// src>` -- done with `crate::dom::Dom` (`html5ever`-backed),
 /// matching this crate's established "parse HTML, don't regex-scrape
 /// it" convention for exactly this kind of task.
 pub fn get_images_from_polyglot_text(txt: &str, base_dir: &str, file_ext: &str) -> HashSet<String> {
@@ -794,7 +794,7 @@ pub fn get_images_from_polyglot_text(txt: &str, base_dir: &str, file_ext: &str) 
 
     if matches!(file_ext, "txt" | "text" | "md" | "markdown") {
         let html = html_template("", &markdown_to_html(txt, &[]));
-        let dom = crate::mobi::dom::Dom::parse(&html);
+        let dom = crate::dom::Dom::parse(&html);
         for id in dom.find_all_tag_global("img") {
             if let Some(src) = dom.node(id).attrs.get("src").cloned() {
                 check_path(&src);

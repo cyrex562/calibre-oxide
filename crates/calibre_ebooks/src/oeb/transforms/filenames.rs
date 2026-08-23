@@ -224,7 +224,7 @@ impl<'a> RenameFiles<'a> {
                 || media_type.ends_with("+xml")
             {
                 let html = String::from_utf8_lossy(&raw);
-                let mut dom = crate::mobi::dom::Dom::parse(&html);
+                let mut dom = crate::dom::Dom::parse(&html);
                 let mut changed = false;
                 for el in dom.preorder_elements(dom.root) {
                     for attr in ["href", "src", "xlink:href"] {

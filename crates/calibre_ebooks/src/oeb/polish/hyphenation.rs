@@ -26,15 +26,15 @@
 //! `child.tail` (trailing text after a child) as the two kinds of
 //! "this element's own text" needing hyphenation, while recursing into
 //! child *elements* regardless of whether a dictionary was found for the
-//! current locale. [`crate::mobi::dom::Dom`] represents both of those
-//! as ordinary sibling [`crate::mobi::dom::NodeKind::Text`] children of
+//! current locale. [`crate::dom::Dom`] represents both of those
+//! as ordinary sibling [`crate::dom::NodeKind::Text`] children of
 //! `elem` (see that module's docs) -- so a single pass over `elem`'s
 //! direct children, branching on `Text` vs `Element`, covers exactly the
 //! same two cases Python's two separate code paths (`elem.text` /
 //! `child.tail`) cover.
 
 use crate::hyphenate::hyphenate_text;
-use crate::mobi::dom::{Dom, NodeId, NodeKind};
+use crate::dom::{Dom, NodeId, NodeKind};
 use crate::oeb::constants::OEB_DOCS;
 
 use super::container::Container;

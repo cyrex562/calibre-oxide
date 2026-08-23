@@ -9,7 +9,7 @@
 //! cheap to express in Python.
 //!
 //! In this port, the two paths would return genuinely different Rust
-//! types (a strict-XML tree vs. [`crate::mobi::dom::Dom`]'s HTML5-arena
+//! types (a strict-XML tree vs. [`crate::dom::Dom`]'s HTML5-arena
 //! -- see `oeb::polish::xmltree`'s module docs for why OPF-family XML
 //! needs its own strict tree type and content documents don't), and
 //! unifying them is exactly the kind of "second tree abstraction" this
@@ -17,7 +17,7 @@
 //! is a strict superset of what it can successfully consume (it never
 //! "fails" the way a strict parser does) and calibre's own pipeline only
 //! ever feeds this well-formed-enough XHTML, this port always takes the
-//! tag-soup path via [`crate::mobi::dom::Dom::parse`]. `force_html5_parse`
+//! tag-soup path via [`crate::dom::Dom::parse`]. `force_html5_parse`
 //! is kept as a parameter for signature parity with Python but is a
 //! documented no-op (the behavior is unconditional).
 
@@ -25,7 +25,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::chardet::{detect_bom as chardet_detect_bom, xml_to_unicode};
 use crate::html_entities::xml_replace_entities;
-use crate::mobi::dom::Dom;
+use crate::dom::Dom;
 
 pub const XHTML_NS: &str = "http://www.w3.org/1999/xhtml";
 
@@ -173,7 +173,7 @@ fn entity_decl_re() -> &'static regex::Regex {
 }
 
 /// Port of `parse_html5`: HTML5 tag-soup parse via
-/// [`crate::mobi::dom::Dom::parse`] -- see `mobi::dom`'s module docs for
+/// [`crate::dom::Dom::parse`] -- see `crate::dom`'s module docs for
 /// why that arena (built on a real `html5ever` parse) is the right tool
 /// here, and this module's own docs for why it's used unconditionally
 /// rather than only as a fallback.

@@ -33,7 +33,7 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 
-use crate::mobi::dom::{Dom, NodeId};
+use crate::dom::{Dom, NodeId};
 use crate::oeb::fonts3::parse_font_family;
 use crate::oeb::polish::cascade::{self, PropertyValue, ResolvedStyles};
 
@@ -330,7 +330,7 @@ fn get_element_text(
         ans.push_str(&dom.text_content(elem));
     } else {
         for &child in &dom.node(elem).children {
-            if let crate::mobi::dom::NodeKind::Text(t) = &dom.node(child).kind {
+            if let crate::dom::NodeKind::Text(t) = &dom.node(child).kind {
                 ans.push_str(t);
             }
         }

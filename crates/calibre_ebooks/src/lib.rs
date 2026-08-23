@@ -7,6 +7,7 @@ pub mod constants;
 pub mod conversion;
 pub mod css;
 pub mod djvu;
+pub mod dom;
 pub mod docx;
 pub mod epub;
 pub mod fb2;

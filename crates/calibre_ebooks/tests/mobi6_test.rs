@@ -158,7 +158,7 @@ fn test_upshift_markup_converts_presentational_tags() {
     let data = build_mobi6_pdb("Upshift", b"x", &opts);
     let mut mobi = MobiReader::new(&data).unwrap();
     let mut dom =
-        calibre_ebooks::mobi::dom::Dom::parse("<html><body><b>bold</b><i>italic</i></body></html>");
+        calibre_ebooks::dom::Dom::parse("<html><body><b>bold</b><i>italic</i></body></html>");
     mobi.upshift_markup(&mut dom, &std::collections::HashMap::new());
     let body = dom.find_first_tag_global("body").unwrap();
     let out = dom.serialize(body);

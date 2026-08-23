@@ -22,7 +22,7 @@
 //!   declarations came from).
 //! - [`resolve_property`]/[`resolve_pseudo_property`] (ancestor-chain
 //!   inheritance walk over a `style_map`, against
-//!   [`crate::mobi::dom::Dom`] -- the real content-document tree type
+//!   [`crate::dom::Dom`] -- the real content-document tree type
 //!   this crate uses elsewhere, standing in for Python's `lxml`
 //!   elements).
 //! - [`defvals`] (wraps [`crate::oeb::normalize_css::DEFAULTS`] as
@@ -49,7 +49,7 @@ use std::sync::OnceLock;
 use anyhow::Result;
 
 use crate::css::{Rule, RuleType, Select, SelectorList, Stylesheet};
-use crate::mobi::dom::{Dom, NodeId};
+use crate::dom::{Dom, NodeId};
 use crate::oeb::fonts3::{parse_font_family, serialize_font_family};
 use crate::oeb::normalize_css::DEFAULTS;
 

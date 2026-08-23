@@ -33,7 +33,7 @@ pub mod readability;
 
 pub use readability::{Document, DocumentOptions, ReadabilityLog, Unparsable};
 
-use crate::mobi::dom::{Dom, NodeId, NodeKind};
+use crate::dom::{Dom, NodeId, NodeKind};
 
 /// lxml's `Element.text` property: the text immediately following the
 /// opening tag, up to (but not including) the first child *element* --

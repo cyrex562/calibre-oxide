@@ -44,7 +44,7 @@ use std::fs;
 
 use anyhow::{Context, Result};
 
-use crate::mobi::dom::{Dom, NodeId};
+use crate::dom::{Dom, NodeId};
 use crate::oeb::constants::{OEB_DOCS, OPF2_NS};
 
 use super::container::Container;

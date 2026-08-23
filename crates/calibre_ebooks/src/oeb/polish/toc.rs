@@ -12,7 +12,7 @@
 //! Python object, holding a `parent` back-reference and a `children`
 //! list of more `TOC` objects. Rust has no straightforward equivalent of
 //! that shape without `Rc<RefCell<_>>` boilerplate throughout, so -- like
-//! [`super::xmltree::Xml`] and [`crate::mobi::dom::Dom`] before it -- this
+//! [`super::xmltree::Xml`] and [`crate::dom::Dom`] before it -- this
 //! is ported as an **arena**: [`Toc`] owns a flat `Vec<TocNode>`, and
 //! every node is referred to by a small `Copy` handle, [`TocNodeId`].
 //! [`TocNode`]'s fields mirror `TOC`'s instance attributes 1:1
@@ -50,7 +50,7 @@ use std::sync::OnceLock;
 use anyhow::Result;
 use regex::Regex;
 
-use crate::mobi::dom::{Dom, NodeId, NodeKind};
+use crate::dom::{Dom, NodeId, NodeKind};
 use crate::oeb::constants::OEB_DOCS;
 
 use super::container::{name_to_href_at, Container, ParsedItem};
@@ -1050,7 +1050,7 @@ fn elem_to_toc_text(dom: &Dom, elem: NodeId, prefer_title: bool) -> String {
 }
 
 /// Port of `item_at_top`. Because this arena represents lxml's
-/// `.text`/`.tail` as ordinary sibling `Text` nodes (see `mobi::dom`'s
+/// `.text`/`.tail` as ordinary sibling `Text` nodes (see `crate::dom`'s
 /// module docs), a plain document-order pre-order walk that stops at
 /// `elem` naturally reproduces Python's "ancestor-path"-guarded tail
 /// check: a `Text` node that would be an *ancestor's* tail in lxml is,
@@ -1095,7 +1095,7 @@ fn item_at_top(dom: &Dom, elem: NodeId) -> bool {
 /// (optionally with `[@attr]`/`[@attr1 and @attr2]` existence-only
 /// predicates). A namespace prefix (e.g. calibre's own `//h:h1`) is
 /// accepted and ignored -- `Dom` is HTML5-tag-soup-parsed and does not
-/// track XML namespace prefixes (see `mobi::dom`'s module docs), so a
+/// track XML namespace prefixes (see `crate::dom`'s module docs), so a
 /// prefix on the tag name can only ever mean "the XHTML namespace",
 /// which every element in an XHTML content document already is. This is
 /// not a general XPath engine -- the same documented scope boundary as

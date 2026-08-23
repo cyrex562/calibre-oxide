@@ -31,7 +31,7 @@ use anyhow::{bail, Context, Result};
 use indexmap::IndexMap;
 
 use crate::css::{Rule, StyleDeclarationBlock, Stylesheet};
-use crate::mobi::dom::NodeId;
+use crate::dom::NodeId;
 use crate::oeb::constants::{OEB_DOCS, OEB_STYLES};
 use crate::oeb::polish::css::remove_property_value;
 use crate::oeb::polish::fonts::set_dom_element_text_only;

@@ -54,7 +54,7 @@ impl ManifestTrimmer {
                     || media_type.ends_with("+xml")
                 {
                     let html = String::from_utf8_lossy(&raw);
-                    let dom = crate::mobi::dom::Dom::parse(&html);
+                    let dom = crate::dom::Dom::parse(&html);
                     let mut out = Vec::new();
                     for el in dom.preorder_elements(dom.root) {
                         for attr in ["href", "src", "xlink:href"] {

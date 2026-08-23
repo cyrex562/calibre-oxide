@@ -44,11 +44,11 @@
 //!   implementing its large `selectors::Element` trait -- pseudo-class
 //!   queries, full sibling/ancestor iteration protocols, tree-mutation
 //!   hooks -- across two DOM types, [`crate::xmltree::Xml`] and
-//!   [`crate::mobi::dom::Dom`], that don't have that surface today; see
+//!   [`crate::dom::Dom`], that don't have that surface today; see
 //!   [`selector`]'s module docs for exactly what selector syntax is and
 //!   is not supported).
 //! - [`matcher`]: the [`matcher::Element`] trait (implemented for
-//!   [`crate::mobi::dom::Dom`] node references and
+//!   [`crate::dom::Dom`] node references and
 //!   [`crate::oeb::polish::xmltree::Xml`] node references) plus
 //!   [`matcher::Select`], a small per-document index mirroring Python's
 //!   `css_selectors.Select` (`select.has_matches(selector_text)`).

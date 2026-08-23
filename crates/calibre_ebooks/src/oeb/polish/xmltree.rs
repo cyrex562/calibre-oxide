@@ -8,14 +8,14 @@
 //! - XHTML/HTML content documents, which Python parses leniently
 //!   (`parsing.py`'s `parse`/`parse_html5`, falling back to tag-soup on
 //!   any strict-XML failure). That side of the port reuses
-//!   [`crate::mobi::dom`] directly -- see `oeb::polish::parsing`.
+//!   [`crate::dom`] directly -- see `oeb::polish::parsing`.
 //! - OPF-family documents, which Python parses with a **strict**,
 //!   namespace-aware XML parser (`safe_xml_fromstring`) and then
 //!   mutates in place via `lxml.etree` (`makeelement`, `.set`/`.get`,
 //!   `.xpath('//opf:manifest/opf:item[...]')`, `.remove()`, `.insert()`,
 //!   reading/writing `.text`).
 //!
-//! [`crate::mobi::dom::Dom`] is HTML5-shaped (built on `html5ever`'s HTML
+//! [`crate::dom::Dom`] is HTML5-shaped (built on `html5ever`'s HTML
 //! parser) and is not a fit for the second case: HTML5 parsing rules
 //! only treat a fixed list of *void* elements (`br`, `img`, `meta`, ...)
 //! as self-closing, so an OPF `<item .../>` -- not on that list -- would
@@ -24,7 +24,7 @@
 //! a real XML parser. This module provides that: a mutable arena built
 //! by converting a one-shot [`roxmltree::Document`] parse into an owned
 //! `Vec<XmlNode>` (the same "parse once with a real parser, then mutate
-//! a simpler arena" shape `mobi::dom` uses for HTML, just with
+//! a simpler arena" shape `crate::dom` uses for HTML, just with
 //! `roxmltree` standing in for `html5ever`).
 //!
 //! # Namespace handling (scope note)
