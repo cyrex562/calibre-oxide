@@ -20,8 +20,9 @@
 //! | `numbering.py` (partial) | [`numbering`] |
 //! | `tables.py` (partial) | [`tables`] |
 //! | `styles.py` (partial) | [`styles`] |
+//! | `fonts.py` (partial) | [`fonts`] |
 //!
-//! The three "partial" rows above port everything except HTML-markup
+//! The four "partial" rows above port everything except HTML-markup
 //! construction: `numbering.rs` has `Level`/`NumberingDefinition`/
 //! `Numbering`'s full reading half (not `apply_markup`); `tables.rs`
 //! has `RowStyle`/`CellStyle`/`TableStyle` *and* the full `Table`/
@@ -33,15 +34,19 @@
 //! `Styles::cascade` itself, nor `generate_css`) -- see `styles`'s
 //! module docs for why those two, specifically, are still blocked
 //! (an `is-link`/`layers` concept only `to_html.rs` can produce, and
-//! `fonts.py`'s system font matching, respectively).
+//! `fonts.py`'s system font matching, respectively); `fonts.rs` has
+//! `is_symbol_font`/`map_symbol_text` (pure glyph-table lookups, no
+//! system dependency) but not the `Fonts` class itself (embedded-font
+//! extraction, `family_for`'s system-installed-font matching), which
+//! needs a font scanner with no Rust counterpart.
 //! `Numbering::apply_markup`, `Table`/`Tables::apply_markup`,
-//! `Styles::cascade`/`generate_css`, and `fonts.py`, `images.py`,
-//! `fields.py`, `index.py`, `toc.py`, `cleanup.py` and a real
-//! `to_html.py` are tracked separately in issue #130 -- they build
-//! and mutate an HTML element tree ([`crate::dom`] as of that issue),
-//! and (for `fields.py`/`index.py`'s synthetic-element insertion) a
-//! mutable *source*-document tree ([`crate::xmltree`], relocated for
-//! this reason but not yet wired into the docx module).
+//! `Styles::cascade`/`generate_css`, and `images.py`, `fields.py`,
+//! `index.py`, `toc.py`, `cleanup.py` and a real `to_html.py` are
+//! tracked separately in issue #130 -- they build and mutate an HTML
+//! element tree ([`crate::dom`] as of that issue), and (for
+//! `fields.py`/`index.py`'s synthetic-element insertion) a mutable
+//! *source*-document tree ([`crate::xmltree`], relocated for this
+//! reason but not yet wired into the docx module).
 //!
 //! The output half of the module — `writer/` — is issue #23 and lives
 //! in [`writer`].
@@ -65,6 +70,7 @@ pub mod char_styles;
 pub mod container;
 pub mod dump;
 pub mod error;
+pub mod fonts;
 pub mod footnotes;
 pub mod lcid;
 pub mod names;
@@ -80,6 +86,7 @@ pub use block_styles::{Border, Borders, Css, Edge, Frame, ParagraphStyle};
 pub use char_styles::RunStyle;
 pub use container::{Docx, Relationships};
 pub use error::DocxError;
+pub use fonts::{is_symbol_font, map_symbol_text};
 pub use footnotes::{Footnotes, Note};
 pub use names::DocxNamespace;
 pub use numbering::{Level, Numbering, NumberingDefinition};

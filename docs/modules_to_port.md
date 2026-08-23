@@ -361,7 +361,7 @@ either -- this pass wasn't exhaustive.
 - [x] `container.py` -> `docx/container.rs`
 - [x] `dump.py` -> `docx/dump.rs`
 - [ ] fields.py (needs the mutable HTML tree — see #130)
-- [ ] fonts.py (needs a font scanner — see #130)
+- [ ] fonts.py (`is_symbol_font`/`map_symbol_text`/`SYMBOL_MAPS` ported to `docx/fonts.rs`; the `Fonts` class itself still needs a system font scanner — see #130)
 - [x] `footnotes.py` -> `docx/footnotes.rs`
 - [ ] images.py (needs the mutable HTML tree — see #130)
 - [ ] index.py (needs the mutable HTML tree — see #130)
