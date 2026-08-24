@@ -1,11 +1,14 @@
-//! Port of `old_src/src/calibre/ebooks/docx/cleanup.py` -- **the
-//! markup-cleanup half only** (issue #291): every pass `cleanup_markup`
-//! runs over the converted HTML tree before the `if detect_cover:`
-//! block at the very end. Cover-image detection needs to read a real
-//! image file off disk and inspect its dimensions
-//! (`calibre.utils.imghdr.identify`) -- real filesystem I/O this port
-//! doesn't need for the rest of the file, so it's a separate,
-//! self-contained follow-up.
+//! Port of `old_src/src/calibre/ebooks/docx/cleanup.py`, in full
+//! (issue #291): every pass `cleanup_markup` runs over the converted
+//! HTML tree, plus the `if detect_cover:` block at the very end
+//! ([`detect_cover`]) -- kept as a separate function rather than
+//! folded into [`cleanup_markup`], since it needs real filesystem I/O
+//! (`dest_dir`) the rest of the file doesn't, and (like every other
+//! `docx/to_html.rs`-adjacent piece ported so far) there is no real
+//! orchestrator yet to call it at the right point in the pipeline.
+//! `calibre.utils.imghdr.identify` -- the one piece of real work this
+//! needed -- was already fully ported (`calibre_utils::imghdr`), so
+//! this only had to port the detection logic *around* it.
 //!
 //! # Reused, not reinvented: `Dom::remove_promoting_children`
 //!
@@ -56,6 +59,7 @@
 //! that final run is silently never merged. Ported as-is.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use super::block_styles::Css;
 use crate::dom::{Dom, NodeId, NodeKind};
@@ -584,9 +588,9 @@ fn convert_page_break_paragraphs(dom: &mut Dom) {
 
 /// The markup-cleanup passes `Convert.__call__` runs over the finished
 /// HTML tree, in order -- everything in Python's `cleanup_markup`
-/// except the `if detect_cover:` block at the end (see the module
-/// docs). `class_map` is `styles.class_map()`; `uuid` is the same
-/// per-document id `convert_p`/`convert_footnotes` use to mark
+/// except the `if detect_cover:` block ([`detect_cover`], see the
+/// module docs). `class_map` is `styles.class_map()`; `uuid` is the
+/// same per-document id `convert_p`/`convert_footnotes` use to mark
 /// footnote-reference containers.
 ///
 /// Port of `cleanup_markup`.
@@ -600,6 +604,88 @@ pub fn cleanup_markup(dom: &mut Dom, class_map: &HashMap<String, Css>, uuid: &st
     simplify_bold_italic_spans(dom, class_map);
     remove_unstyled_spans(dom);
     convert_page_break_paragraphs(dom);
+}
+
+/// How many elements before `tag`, in document-order traversal of the
+/// document's first `<body>`, up to `limit` (returned once that many
+/// have been counted without finding `tag`). `limit` is also the
+/// fallback when there's no `<body>` at all.
+///
+/// Python falls off the end of its loop with an implicit `None` if
+/// `tag` isn't actually a descendant of `<body>` -- a real crash risk
+/// in its one caller, `before_count(...) < 5`, comparing `None` against
+/// an `int`. This returns `limit` instead, which fails that same `< 5`
+/// check the same way the crash would have prevented a cover from ever
+/// being "detected" -- there's nothing useful to reproduce about the
+/// crash itself.
+///
+/// Port of `before_count`.
+fn before_count(dom: &Dom, tag: NodeId, limit: i64) -> i64 {
+    let Some(body) = dom.find_first_tag_global("body") else {
+        return limit;
+    };
+    let mut ans: i64 = 0;
+    for elem in dom
+        .preorder_elements(body)
+        .into_iter()
+        .filter(|&n| n != body)
+    {
+        if elem == tag {
+            return ans;
+        }
+        ans += 1;
+        if ans > limit {
+            return limit;
+        }
+    }
+    limit
+}
+
+/// Checks whether the document's first `<img>` (if it appears early
+/// enough -- within the first 5 of the first 10 elements in `<body>`)
+/// looks like a cover: its file exists under `dest_dir`, and its
+/// dimensions (read via [`calibre_utils::imghdr::identify`]) give a
+/// roughly-portrait aspect ratio (0.8-1.8) at a reasonable size (at
+/// least ~400x400). If so, removes that `<img>` from the tree (a
+/// detected cover doesn't also appear inline in the text) and returns
+/// its path.
+///
+/// An unreadable or dimension-less image is treated as definitely not
+/// a cover (`height as f64 / width as f64` naturally becomes `NaN` or
+/// `inf` when a dimension is `0` -- both fail every range check below
+/// -- matching Python's `except ZeroDivisionError: is_cover = False`
+/// without needing a separate check).
+///
+/// Port of `cleanup_markup`'s `if detect_cover:` block.
+pub fn detect_cover(dom: &mut Dom, dest_dir: &Path) -> Option<PathBuf> {
+    let img = dom
+        .find_all_tag_global("img")
+        .into_iter()
+        .find(|&i| dom.node(i).attrs.contains_key("src"))?;
+    let src = dom.node(img).attrs.get("src")?.clone();
+    let path = dest_dir.join(&src);
+    if !path.exists() {
+        return None;
+    }
+    if before_count(dom, img, 10) >= 5 {
+        return None;
+    }
+
+    let (width, height) = match std::fs::read(&path) {
+        Ok(data) => {
+            let (_fmt, w, h) = calibre_utils::imghdr::identify(&data);
+            (w, h)
+        }
+        Err(_) => (0, 0),
+    };
+    let ratio = height as f64 / width as f64;
+    let is_cover = (0.8..=1.8).contains(&ratio) && (height * width) >= 160_000;
+    if !is_cover {
+        return None;
+    }
+
+    dom.detach(img);
+    Some(path)
 }
 
 #[cfg(test)]
@@ -1146,6 +1232,144 @@ mod tests {
             separate_consecutive_noterefs(&mut dom, "u");
 
             assert!(tail_text(&dom, inner1).is_none());
+        }
+    }
+
+    mod detect_cover_tests {
+        use super::*;
+
+        /// A minimal well-formed PNG with the given pixel dimensions,
+        /// matching `calibre_utils::imghdr`'s own test fixture layout.
+        fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+            let mut data = b"\x89PNG\r\n\x1a\n".to_vec();
+            data.extend_from_slice(&[0, 0, 0, 13]);
+            data.extend_from_slice(b"IHDR");
+            data.extend_from_slice(&width.to_be_bytes());
+            data.extend_from_slice(&height.to_be_bytes());
+            data
+        }
+
+        fn img(dom: &mut Dom, parent: NodeId, src: &str) -> NodeId {
+            let img = dom.new_element("img");
+            dom.node_mut(img)
+                .attrs
+                .insert("src".to_string(), src.to_string());
+            dom.append_child(parent, img);
+            img
+        }
+
+        #[test]
+        fn a_portrait_image_early_in_the_body_is_detected_as_the_cover() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("cover.png"), png_bytes(600, 800)).unwrap();
+
+            let mut dom = Dom::empty();
+            let body = dom.new_element("body");
+            dom.append_child(dom.root, body);
+            let the_img = img(&mut dom, body, "cover.png");
+
+            let result = detect_cover(&mut dom, dir.path());
+
+            assert_eq!(result, Some(dir.path().join("cover.png")));
+            assert!(
+                dom.parent(the_img).is_none(),
+                "the cover img is removed from the tree"
+            );
+        }
+
+        #[test]
+        fn a_missing_file_is_not_a_cover() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut dom = Dom::empty();
+            let body = dom.new_element("body");
+            dom.append_child(dom.root, body);
+            img(&mut dom, body, "does-not-exist.png");
+
+            assert_eq!(detect_cover(&mut dom, dir.path()), None);
+        }
+
+        #[test]
+        fn a_small_image_is_not_a_cover() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("tiny.png"), png_bytes(50, 60)).unwrap();
+
+            let mut dom = Dom::empty();
+            let body = dom.new_element("body");
+            dom.append_child(dom.root, body);
+            img(&mut dom, body, "tiny.png");
+
+            assert_eq!(detect_cover(&mut dom, dir.path()), None);
+        }
+
+        #[test]
+        fn a_wide_image_is_not_a_cover() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("wide.png"), png_bytes(1000, 400)).unwrap();
+
+            let mut dom = Dom::empty();
+            let body = dom.new_element("body");
+            dom.append_child(dom.root, body);
+            img(&mut dom, body, "wide.png");
+
+            assert_eq!(detect_cover(&mut dom, dir.path()), None);
+        }
+
+        #[test]
+        fn an_image_buried_deep_in_the_body_is_not_a_cover() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("cover.png"), png_bytes(600, 800)).unwrap();
+
+            let mut dom = Dom::empty();
+            let body = dom.new_element("body");
+            dom.append_child(dom.root, body);
+            for _ in 0..10 {
+                new_span(&mut dom, body);
+            }
+            img(&mut dom, body, "cover.png");
+
+            assert_eq!(detect_cover(&mut dom, dir.path()), None);
+        }
+
+        #[test]
+        fn no_img_at_all_is_not_a_cover() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut dom = Dom::empty();
+            assert_eq!(detect_cover(&mut dom, dir.path()), None);
+        }
+    }
+
+    mod before_count_tests {
+        use super::*;
+
+        #[test]
+        fn no_body_returns_the_limit() {
+            let dom = Dom::empty();
+            assert_eq!(before_count(&dom, dom.root, 10), 10);
+        }
+
+        #[test]
+        fn counts_elements_before_the_target() {
+            let mut dom = Dom::empty();
+            let body = dom.new_element("body");
+            dom.append_child(dom.root, body);
+            new_span(&mut dom, body);
+            new_span(&mut dom, body);
+            let target = new_span(&mut dom, body);
+
+            assert_eq!(before_count(&dom, target, 10), 2);
+        }
+
+        #[test]
+        fn a_target_past_the_limit_returns_the_limit() {
+            let mut dom = Dom::empty();
+            let body = dom.new_element("body");
+            dom.append_child(dom.root, body);
+            for _ in 0..15 {
+                new_span(&mut dom, body);
+            }
+            let target = new_span(&mut dom, body);
+
+            assert_eq!(before_count(&dom, target, 10), 10);
         }
     }
 }
