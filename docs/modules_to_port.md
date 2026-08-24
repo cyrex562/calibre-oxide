@@ -357,7 +357,7 @@ either -- this pass wasn't exhaustive.
 - [x] `__init__.py` (`InvalidDOCX`) -> `docx/error.rs`
 - [x] `block_styles.py` -> `docx/block_styles.rs`
 - [x] `char_styles.py` -> `docx/char_styles.rs`
-- [ ] cleanup.py (markup-cleanup half ported to `docx/cleanup.rs` — vertical-align wrapping, noteref spacing, hr-relocation, span merging/lifting/dir-normalization, bold/italic simplification, page-break conversion — incl. a reproduced bug (the final mergeable-span run is never flushed) and reuse of `Dom::remove_promoting_children` for `lift`/sole-span unwrapping — cover-image detection needs real file I/O and is a separate follow-up — see #130/#291)
+- [x] cleanup.py (fully ported to `docx/cleanup.rs` — vertical-align wrapping, noteref spacing, hr-relocation, span merging/lifting/dir-normalization, bold/italic simplification, page-break conversion, and cover-image detection (`detect_cover`, using the already-ported `calibre_utils::imghdr::identify`) — incl. a reproduced bug (the final mergeable-span run is never flushed) and reuse of `Dom::remove_promoting_children` for `lift`/sole-span unwrapping — not yet wired into an orchestrator, see #130/#291)
 - [x] `container.py` -> `docx/container.rs`
 - [x] `dump.py` -> `docx/dump.rs`
 - [ ] fields.py (pure field-instruction parsing half ported to `docx/fields.rs` — `Field`/scanner/`parse_hyperlink`/`parse_xe`/`parse_index`/`parse_ref`/`parse_noteref`, cross-validated against Python's own `test_parse_fields` cases — the `Fields` orchestrator itself needs `parse_xe`'s source-tree bookmark insertion resolved plus `index.py` for `parse_index`/`polish_markup` — see #130/#290)

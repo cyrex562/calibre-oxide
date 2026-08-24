@@ -25,7 +25,7 @@
 //! | `images.py` (partial) | [`images`] |
 //! | `fields.py` (partial) | [`fields`] |
 //! | `index.py` (partial) | [`index`] |
-//! | `cleanup.py` (partial) | [`cleanup`] |
+//! | `cleanup.py` | [`cleanup`] |
 //!
 //! The four "partial" rows above port everything except HTML-markup
 //! construction: `numbering.rs` has `Level`/`NumberingDefinition`/
@@ -61,9 +61,9 @@
 //! `add_xe`/`process_index` (source-tree-mutating) half is not,
 //! needing the same `crate::xmltree`-vs-side-table decision
 //! `fields.rs`'s `parse_xe` is blocked on -- see `index`'s module
-//! docs. `cleanup.py`'s markup-cleanup half is ported ([`cleanup`],
-//! issue #291); its cover-image detection (real file I/O + image
-//! dimension reading) is a separate follow-up.
+//! docs. `cleanup.py` is fully ported ([`cleanup`], issue #291) --
+//! the last of #130's originally-unported files with no remaining
+//! blocker of its own.
 //!
 //! The output half of the module — `writer/` — is issue #23 and lives
 //! in [`writer`].
