@@ -4,10 +4,10 @@
 //! module's port — paragraphs, runs, hyperlinks and images, with
 //! heading levels guessed from `w:pStyle` and no style resolution
 //! whatsoever. It stays wired into the DOCX input plugin (see
-//! `input/docx_input.rs`) and keeps producing *something* until real
-//! `Convert::__call__` orchestration is ready to replace it wholesale
-//! -- see issue #130's tracked follow-ups (#283-293) for exactly
-//! what's still missing.
+//! `input/docx_input.rs`) and keeps producing *something* until
+//! [`convert_document`] -- the real orchestrator -- is ready to
+//! replace it wholesale -- see issue #130's tracked follow-ups
+//! (#283-293) for exactly what's still missing.
 //!
 //! The real port, tracked as issue #130 with per-piece follow-ups
 //! #283-293, so far covers:
@@ -70,16 +70,31 @@
 //!   dependency after all, since this port already threads
 //!   relationships through `convert_p`/`convert_body` as an explicit
 //!   parameter rather than Python's mutable `self.current_rels`).
+//! - [`convert_document`]: the orchestrator tying every piece above
+//!   together in `Convert.__call__`'s real sequence, plus `write`'s
+//!   own first line (`create_toc`) -- issue #288's remaining scope,
+//!   minus `resolve_alternate_content` (source-tree mutation, the
+//!   same open question as issues #290/#293), `fields.py`'s
+//!   `Fields` orchestrator (issue #290), and `write`'s OPF/NCX
+//!   serialization (needs generalizing `mobi/opf_writer.rs`) -- see
+//!   its own doc comment for exactly what's excluded and why.
 //!
-//! Not yet wired into `DOCXToHTML` -- that still needs
-//! `fields.polish_markup`/`cleanup_markup`/`write` (issue #288) and
-//! everything else downstream (TOC, OPF writing), none of which exist
-//! here yet.
+//! Not yet wired into `DOCXToHTML` -- that still needs a real
+//! `read_styles`-equivalent (parses `numbering.xml`/`styles.xml`/
+//! `settings.xml`/`theme1.xml`/`footnotes.xml`/`endnotes.xml` and
+//! wires them into fresh `Numbering`/`Styles`/`Footnotes`/`Theme`/
+//! `Settings` for [`convert_document`] to consume -- a multi-document
+//! lifetime-ownership design this module doesn't have yet), plus
+//! `write`'s OPF/NCX output.
 //!
 //! # What `convert_run` defers, and why
 //!
 //! - `w:drawing`/`w:pict` (embedded images): skipped entirely --
-//!   `images.py` isn't ported (issue #130).
+//!   `images.py` is fully ported ([`super::images`], issue #289) but
+//!   not yet wired in here; doing so needs threading `&mut
+//!   super::images::Images`, a `&mut Docx<R>`, and an `images_dir`
+//!   through `convert_run`/`convert_p`/`convert_body`, a separate
+//!   follow-up.
 //! - `style.lang`: passed through as-is rather than reduced to an
 //!   ISO 639-1 code via calibre's language-tag database
 //!   (`canonicalize_lang`/`lang_as_iso639_1`, private to `oeb::polish::opf`
@@ -100,7 +115,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 use roxmltree::{Document, Node};
@@ -109,16 +124,19 @@ use crate::dom::{Dom, NodeId, NodeKind};
 
 use super::block_styles::{pt, Css, Edge, Frame, ParagraphStyle};
 use super::char_styles::RunStyle;
+use super::cleanup;
 use super::container::{Docx, Relationships};
 use super::error::DocxError;
 use super::fonts::{is_symbol_font, map_symbol_text};
 use super::footnotes::{Footnotes, Note};
+use super::images::Images;
 use super::names::DocxNamespace;
 use super::numbering::Numbering;
 use super::settings::Settings;
 use super::styles::{PageProperties, Styles};
 use super::tables::Table;
 use super::theme::Theme;
+use super::toc::{self, Toc};
 
 pub struct DOCXToHTML;
 
@@ -987,8 +1005,12 @@ pub fn read_page_properties<'a, 'i>(
 /// `self.section_starts[1:]` -- the first section is already the
 /// start of the document, so it needs no explicit page break).
 ///
-/// Returns the `<body>` [`NodeId`] and the paragraphs converted, in
-/// document order (Python's local `paras` list).
+/// Returns the `<body>` [`NodeId`], the paragraphs converted (in
+/// document order, Python's local `paras` list), and `read_page_properties`'s
+/// own `page_map`/`section_starts` -- needed again later by
+/// `to_html.rs`'s own orchestration (issue #130's remaining wiring
+/// work: `apply_tables_markup`/`apply_paragraph_frames`, and folding a
+/// footnote's own tables into `page_map`, `convert_footnotes`'s job).
 ///
 /// Port of the paragraph-walking half of `Convert.__call__`:
 /// ```text
@@ -1027,7 +1049,12 @@ pub fn convert_body<'a, 'i>(
     uuid: &str,
     rels: &Relationships,
     ns: &DocxNamespace,
-) -> (NodeId, Vec<Node<'a, 'i>>) {
+) -> (
+    NodeId,
+    Vec<Node<'a, 'i>>,
+    IndexMap<Node<'a, 'i>, PageProperties>,
+    Vec<Node<'a, 'i>>,
+) {
     let (page_map, section_starts) = read_page_properties(doc, styles, ns);
 
     let body = dom.new_element("body");
@@ -1049,7 +1076,7 @@ pub fn convert_body<'a, 'i>(
         styles.apply_section_page_breaks(&section_starts[1..], ns);
     }
 
-    (body, paras)
+    (body, paras, page_map, section_starts)
 }
 
 /// Assigns an `id` to every converted paragraph that a top-level (a
@@ -2341,14 +2368,14 @@ pub fn assign_style_classes<'a, 'i>(
 /// (since PR #294), so no such swap-and-restore, and no `Images` type
 /// at all, is needed here.
 ///
-/// One deliberate gap: Python also records `self.page_map[wp] =
-/// self.current_page` for any `w:tbl` found inside a note. There is no
-/// `page_map` in scope here to write into -- that's `read_page_properties`'s
-/// own, locally-built map, not yet threaded through a real orchestrator
-/// (issue #130's remaining wiring work). The table itself is still
-/// registered (`Styles::register_table`), just without a page-properties
-/// entry; whoever wires the real orchestrator needs to fold this note's
-/// tables into that map too.
+/// A `w:tbl` found inside a note is registered (`Styles::register_table`)
+/// and, matching Python's `self.page_map[wp] = self.current_page`,
+/// folded into `page_map` too -- under `current_page`, since that's
+/// what `self.current_page` still holds by this point in Python's
+/// `__call__` (the value it was last set to by the main body walk,
+/// i.e. the page geometry belonging to the *last* main-document
+/// section, not any properties of the note's own -- footnotes/endnotes
+/// have no `w:sectPr` of their own to derive one from).
 ///
 /// Returns `None` (matching Python's `notes_header = None`) when there
 /// are no notes to convert.
@@ -2367,6 +2394,8 @@ pub fn convert_footnotes<'a, 'i>(
     doc_lang: Option<&str>,
     uuid: &str,
     notes_text: &str,
+    page_map: &mut IndexMap<Node<'a, 'i>, PageProperties>,
+    current_page: PageProperties,
     ns: &DocxNamespace,
 ) -> Option<NodeId> {
     if !footnotes.has_notes() {
@@ -2424,6 +2453,7 @@ pub fn convert_footnotes<'a, 'i>(
         for wp in note.blocks(ns) {
             if ns.is_tag(wp, "w:tbl") {
                 styles.register_table(wp, ns);
+                page_map.insert(wp, current_page);
             } else {
                 let p = convert_p(
                     dom, state, wp, styles, footnotes, settings, theme, doc_lang, uuid, &note.rels,
@@ -2438,6 +2468,161 @@ pub fn convert_footnotes<'a, 'i>(
     }
 
     Some(header)
+}
+
+/// Everything [`convert_document`] hands back once conversion has
+/// finished, beyond the mutations it made to `dom`/`styles`/etc.
+/// directly. Port of the handful of `Convert.__call__`/`Convert.write`
+/// local values a real orchestrator (issue #288) still needs after
+/// this function returns -- `self.body`, `notes_header`,
+/// `self.resolved_link_map`, `self.cover_image`, and `write`'s own
+/// local `toc` (Python calls `create_toc` as the *first* line of
+/// `write`, which needs nothing from `write` itself beyond what's
+/// already available here, so it's included rather than making
+/// callers repeat this function's own bookkeeping).
+pub struct ConvertedDocument<'a, 'i> {
+    pub body: NodeId,
+    pub notes_header: Option<NodeId>,
+    pub resolved_link_map: HashMap<Node<'a, 'i>, NodeId>,
+    pub cover_image: Option<PathBuf>,
+    pub toc: Option<Toc>,
+}
+
+/// The paragraph-walking-and-postprocessing heart of `Convert.__call__`:
+/// everything from `read_page_properties` through `cleanup_markup`
+/// (plus `write`'s first line, `create_toc`), in Python's real
+/// sequence, given a `styles`/`numbering`/`footnotes`/`settings`/
+/// `theme` already populated by a caller (Python's own `read_styles`,
+/// not ported here -- see the module docs' "Not (yet) wired up"
+/// section) and an `images` with nothing in it yet (`convert_run`
+/// still explicitly skips `w:drawing`/`w:pict`, so `images.links` is
+/// always empty here regardless of what's passed in -- wiring
+/// #289's `Images` into the body walk itself is a separate follow-up).
+///
+/// Three things `Convert.__call__` itself does that this deliberately
+/// leaves out, each documented elsewhere rather than repeated here:
+/// `resolve_alternate_content`
+/// (inserts a `mc:Fallback`'s real content in place of a proprietary
+/// `mc:AlternateContent` wrapper -- genuine *source*-tree mutation,
+/// the same open architectural question issues #290/#293 are blocked
+/// on), `self.fields(...)`/`self.fields.polish_markup(...)` (needs
+/// `fields.py`'s `Fields` orchestrator, issue #290), and `write`'s own
+/// remaining OPF/NCX serialization (a separate follow-up: this crate's
+/// `mobi/opf_writer.rs` already has the low-level OPF/NCX writers, but
+/// needs generalizing out of the `mobi`-specific module it currently
+/// lives in first).
+///
+/// Port of `Convert.__call__` (`read_page_properties` through
+/// `cleanup_markup`) and the `create_toc` call at the top of
+/// `Convert.write`.
+#[allow(clippy::too_many_arguments)]
+pub fn convert_document<'a, 'i>(
+    dom: &mut Dom,
+    document: Node<'a, 'i>,
+    styles: &mut Styles<'a, 'i>,
+    numbering: &mut Numbering,
+    footnotes: &mut Footnotes<'a, 'i>,
+    settings: &Settings,
+    theme: &Theme,
+    images: &Images,
+    doc_lang: Option<&str>,
+    uuid: &str,
+    notes_text: &str,
+    detect_cover_flag: bool,
+    dest_dir: &Path,
+    rels: &Relationships,
+    ns: &DocxNamespace,
+) -> ConvertedDocument<'a, 'i> {
+    let mut state = ConvertState::new();
+
+    let (body, paras, mut page_map, _section_starts) = convert_body(
+        dom, document, &mut state, styles, footnotes, settings, theme, doc_lang, uuid, rels, ns,
+    );
+
+    read_block_anchors(dom, document, &mut state, ns);
+    mark_block_runs(&mut state, &paras, styles, ns);
+
+    // `self.current_page` at this point in Python's `__call__` is
+    // whatever the main body walk last set it to -- the last
+    // (highest-order) page geometry `page_map` carries, in document
+    // order.
+    let current_page = page_map.values().last().copied().unwrap_or_default();
+    let notes_header = convert_footnotes(
+        dom,
+        body,
+        &mut state,
+        footnotes,
+        styles,
+        settings,
+        theme,
+        doc_lang,
+        uuid,
+        notes_text,
+        &mut page_map,
+        current_page,
+        ns,
+    );
+
+    apply_tab_indentation(dom, &state, styles, settings, ns);
+
+    let resolved_link_map = resolve_links(dom, &state, images, ns);
+
+    cascade(styles, &state, theme, ns);
+
+    apply_tables_markup(dom, &state.object_map, &page_map, styles, ns);
+
+    apply_numbering_markup(numbering, dom, body, styles, &state.object_map, ns);
+
+    // apply_block_run_frames/apply_paragraph_frames need `object_map`
+    // as a separate borrow from the `&mut state` they also take.
+    let object_map = state.object_map.clone();
+    apply_block_run_frames(dom, &mut state, styles, &object_map);
+    apply_paragraph_frames(dom, &mut state, styles, &object_map, &page_map);
+
+    assign_style_classes(dom, &state, styles, theme, ns);
+
+    if let Some(header) = notes_header {
+        if let Some(&h) = dom
+            .children(body)
+            .iter()
+            .find(|&&c| matches!(dom.tag(c), Some("h1" | "h2" | "h3")))
+        {
+            let new_tag = dom.tag(h).expect("just matched").to_string();
+            dom.set_tag(header, &new_tag);
+            if let Some(cls) = dom.node(h).attrs.get("class").cloned() {
+                if cls != "notes-header" {
+                    dom.node_mut(header)
+                        .attrs
+                        .insert("class".to_string(), format!("{cls} notes-header"));
+                }
+            }
+        }
+    }
+
+    let class_map = styles.class_map();
+    cleanup::cleanup_markup(dom, &class_map, uuid);
+    let cover_image = detect_cover_flag
+        .then(|| cleanup::detect_cover(dom, dest_dir))
+        .flatten();
+
+    let toc = toc::create_toc(
+        document,
+        dom,
+        body,
+        &resolved_link_map,
+        styles,
+        theme,
+        &state.object_map,
+        ns,
+    );
+
+    ConvertedDocument {
+        body,
+        notes_header,
+        resolved_link_map,
+        cover_image,
+        toc,
+    }
 }
 
 #[cfg(test)]
@@ -3133,7 +3318,7 @@ mod convert_body_tests {
             doc: Node<'a, 'i>,
             ns: &DocxNamespace,
         ) -> (NodeId, Vec<Node<'a, 'i>>) {
-            convert_body(
+            let (body, paras, ..) = convert_body(
                 &mut self.dom,
                 doc,
                 &mut self.state,
@@ -3145,7 +3330,8 @@ mod convert_body_tests {
                 "test-uuid",
                 &Relationships::default(),
                 ns,
-            )
+            );
+            (body, paras)
         }
     }
 
@@ -3664,7 +3850,7 @@ mod mark_block_runs_tests {
         }
 
         fn body(&mut self, doc: Node<'a, 'i>, ns: &DocxNamespace) -> (NodeId, Vec<Node<'a, 'i>>) {
-            convert_body(
+            let (body, paras, ..) = convert_body(
                 &mut self.dom,
                 doc,
                 &mut self.state,
@@ -3676,7 +3862,8 @@ mod mark_block_runs_tests {
                 "test-uuid",
                 &Relationships::default(),
                 ns,
-            )
+            );
+            (body, paras)
         }
     }
 
@@ -4880,7 +5067,7 @@ mod apply_block_run_frames_tests {
         }
 
         fn body(&mut self, doc: Node<'a, 'i>, ns: &DocxNamespace) -> (NodeId, Vec<Node<'a, 'i>>) {
-            convert_body(
+            let (body, paras, ..) = convert_body(
                 &mut self.dom,
                 doc,
                 &mut self.state,
@@ -4892,7 +5079,8 @@ mod apply_block_run_frames_tests {
                 "test-uuid",
                 &Relationships::default(),
                 ns,
-            )
+            );
+            (body, paras)
         }
     }
 
@@ -5268,6 +5456,8 @@ mod convert_footnotes_tests {
             None,
             "test-uuid",
             "Notes",
+            &mut IndexMap::new(),
+            PageProperties::default(),
             &ns,
         );
 
@@ -5334,11 +5524,71 @@ mod convert_footnotes_tests {
             None,
             "test-uuid",
             "Notes",
+            &mut IndexMap::new(),
+            PageProperties::default(),
             &ns,
         );
 
         assert!(header.is_none());
         assert_eq!(h.dom.children(body).len(), before);
+    }
+
+    #[test]
+    fn a_table_inside_a_note_is_folded_into_page_map_under_the_current_page() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p><w:r><w:t>see</w:t><w:footnoteReference w:id="7"/></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+
+        let notes_xml: &'static str = Box::leak(
+            format!(
+                r#"<w:footnotes {DOC_OPEN}><w:footnote w:id="7"><w:tbl><w:tr><w:tc><w:p/></w:tc></w:tr></w:tbl></w:footnote></w:footnotes>"#
+            )
+            .into_boxed_str(),
+        );
+        let notes_doc = Box::leak(Box::new(Document::parse(notes_xml).unwrap()));
+        h.footnotes.load(
+            Some(notes_doc.root_element()),
+            std::rc::Rc::new(Default::default()),
+            None,
+            std::rc::Rc::new(Default::default()),
+            &ns,
+        );
+
+        let body = h.body(document, &ns);
+        assert!(h.footnotes.has_notes());
+
+        let note_tbl = ns
+            .descendants(notes_doc.root_element(), &["w:tbl"])
+            .into_iter()
+            .next()
+            .unwrap();
+        let mut page_map = IndexMap::new();
+        let current_page = PageProperties {
+            width: 123.0,
+            ..PageProperties::default()
+        };
+
+        convert_footnotes(
+            &mut h.dom,
+            body,
+            &mut h.state,
+            &mut h.footnotes,
+            &mut h.styles,
+            &h.settings,
+            &h.theme,
+            None,
+            "test-uuid",
+            "Notes",
+            &mut page_map,
+            current_page,
+            &ns,
+        );
+
+        assert_eq!(page_map.get(&note_tbl).copied(), Some(current_page));
     }
 }
 
@@ -5531,5 +5781,226 @@ mod apply_paragraph_frames_tests {
         assert_eq!(h.dom.children(body).len(), 1);
         assert_eq!(h.dom.tag(h.dom.children(body)[0]), Some("p"));
         assert!(h.state.framed_map.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod convert_document_tests {
+    use super::*;
+    use crate::docx::tables::Tables;
+    use roxmltree::Document;
+
+    const DOC_OPEN: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:xml="http://www.w3.org/XML/1998/namespace" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships""#;
+
+    fn parse_root(body: &str) -> (Document<'static>, DocxNamespace) {
+        let xml: &'static str =
+            Box::leak(format!("<w:root {DOC_OPEN}>{body}</w:root>").into_boxed_str());
+        (
+            Document::parse(xml).expect("valid XML"),
+            DocxNamespace::default(),
+        )
+    }
+
+    struct Harness<'a, 'i> {
+        dom: Dom,
+        styles: Styles<'a, 'i>,
+        numbering: Numbering,
+        footnotes: Footnotes<'a, 'i>,
+        settings: Settings,
+        theme: Theme,
+        images: Images,
+    }
+
+    impl<'a, 'i> Harness<'a, 'i> {
+        fn new() -> Self {
+            Harness {
+                dom: Dom::empty(),
+                styles: Styles::new(Tables::default()),
+                numbering: Numbering::new(),
+                footnotes: Footnotes::new(),
+                settings: Settings::new(),
+                theme: Theme::new(),
+                images: Images::new(),
+            }
+        }
+
+        fn convert(
+            &mut self,
+            document: Node<'a, 'i>,
+            ns: &DocxNamespace,
+        ) -> ConvertedDocument<'a, 'i> {
+            convert_document(
+                &mut self.dom,
+                document,
+                &mut self.styles,
+                &mut self.numbering,
+                &mut self.footnotes,
+                &self.settings,
+                &self.theme,
+                &self.images,
+                None,
+                "test-uuid",
+                "Notes",
+                false,
+                Path::new("/nonexistent"),
+                &Relationships::default(),
+                ns,
+            )
+        }
+    }
+
+    #[test]
+    fn two_paragraphs_become_a_body_with_two_children() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p><w:r><w:t>one</w:t></w:r></w:p>
+                 <w:p><w:r><w:t>two</w:t></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+
+        let result = h.convert(document, &ns);
+
+        assert_eq!(h.dom.children(result.body).len(), 2);
+        assert!(result.notes_header.is_none());
+        assert!(result.resolved_link_map.is_empty());
+        assert!(result.cover_image.is_none());
+    }
+
+    #[test]
+    fn a_hyperlink_ends_up_in_the_resolved_link_map_with_its_href() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p><w:hyperlink r:id="rId1"><w:r><w:t>click</w:t></w:r></w:hyperlink></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        let mut rels = Relationships::default();
+        rels.by_id
+            .insert("rId1".to_string(), "https://example.com/".to_string());
+
+        let result = convert_document(
+            &mut h.dom,
+            document,
+            &mut h.styles,
+            &mut h.numbering,
+            &mut h.footnotes,
+            &h.settings,
+            &h.theme,
+            &h.images,
+            None,
+            "test-uuid",
+            "Notes",
+            false,
+            Path::new("/nonexistent"),
+            &rels,
+            &ns,
+        );
+
+        assert_eq!(result.resolved_link_map.len(), 1);
+        let &span = result.resolved_link_map.values().next().unwrap();
+        assert_eq!(h.dom.tag(span), Some("a"));
+        assert_eq!(
+            h.dom.node(span).attrs.get("href").map(String::as_str),
+            Some("https://example.com/")
+        );
+    }
+
+    #[test]
+    fn a_footnote_gets_a_notes_header() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p><w:r><w:t>see</w:t><w:footnoteReference w:id="7"/></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+
+        let notes_xml: &'static str = Box::leak(
+            format!(r#"<w:footnotes {DOC_OPEN}><w:footnote w:id="7"><w:p><w:r><w:t>note text</w:t></w:r></w:p></w:footnote></w:footnotes>"#)
+                .into_boxed_str(),
+        );
+        let notes_doc = Box::leak(Box::new(Document::parse(notes_xml).unwrap()));
+        h.footnotes.load(
+            Some(notes_doc.root_element()),
+            std::rc::Rc::new(Default::default()),
+            None,
+            std::rc::Rc::new(Default::default()),
+            &ns,
+        );
+
+        let result = h.convert(document, &ns);
+
+        let header = result.notes_header.expect("a footnote was referenced");
+        assert_eq!(h.dom.tag(header), Some("h1"));
+        assert_eq!(
+            h.dom.node(header).attrs.get("class").map(String::as_str),
+            Some("notes-header")
+        );
+    }
+
+    #[test]
+    fn a_footnote_containing_a_table_folds_it_into_the_current_page() {
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p><w:r><w:t>see</w:t><w:footnoteReference w:id="7"/></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+
+        let notes_xml: &'static str = Box::leak(
+            format!(r#"<w:footnotes {DOC_OPEN}><w:footnote w:id="7"><w:tbl><w:tr><w:tc><w:p/></w:tc></w:tr></w:tbl></w:footnote></w:footnotes>"#)
+                .into_boxed_str(),
+        );
+        let notes_doc = Box::leak(Box::new(Document::parse(notes_xml).unwrap()));
+        h.footnotes.load(
+            Some(notes_doc.root_element()),
+            std::rc::Rc::new(Default::default()),
+            None,
+            std::rc::Rc::new(Default::default()),
+            &ns,
+        );
+
+        // Doesn't panic or lose the table: apply_tables_markup runs
+        // over a page_map that includes the note's own table.
+        let result = h.convert(document, &ns);
+        assert!(result.notes_header.is_some());
+    }
+
+    #[test]
+    fn headings_with_no_word_toc_field_produce_a_toc_from_headings() {
+        let styles_xml: &'static str = Box::leak(
+            format!(
+                r#"<w:styles {DOC_OPEN}>
+                     <w:style w:type="paragraph" w:styleId="Heading1">
+                       <w:name w:val="heading 1"/>
+                     </w:style>
+                   </w:styles>"#
+            )
+            .into_boxed_str(),
+        );
+        let styles_doc = Box::leak(Box::new(Document::parse(styles_xml).unwrap()));
+
+        let (doc, ns) = parse_root(
+            r#"<w:document><w:body>
+                 <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Chapter One</w:t></w:r></w:p>
+                 <w:p><w:r><w:t>some text</w:t></w:r></w:p>
+                 <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Chapter Two</w:t></w:r></w:p>
+               </w:body></w:document>"#,
+        );
+        let document = ns.first_child(doc.root_element(), "w:document").unwrap();
+        let mut h = Harness::new();
+        h.styles.call(Some(styles_doc.root_element()), &ns);
+
+        let result = h.convert(document, &ns);
+
+        let toc = result.toc.expect("two headings should produce a TOC");
+        let top = toc.children(toc.root);
+        assert_eq!(top.len(), 2);
+        assert_eq!(toc.node(top[0]).text.as_deref(), Some("Chapter One"));
+        assert_eq!(toc.node(top[1]).text.as_deref(), Some("Chapter Two"));
     }
 }
