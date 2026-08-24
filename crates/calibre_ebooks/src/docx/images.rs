@@ -1,14 +1,19 @@
-//! Port of `old_src/src/calibre/ebooks/docx/images.py` -- **the pure
-//! geometry/CSS half only** (issue #289). Embedded-image extraction
-//! (reading from the DOCX zip or a linked file, resizing, writing to
-//! `dest_dir/images/`), the `Images` struct itself, and the
-//! `w:drawing`/`w:pict` -> `<img>` markup generators (`pic_to_img`,
-//! `drawing_to_html`, `pict_to_html`, `to_html`) are a separate,
-//! larger follow-up -- this file covers exactly the parts that need no
-//! filesystem/zip access and no `crate::dom` output: filename
-//! sanitizing, EMU-to-point conversion, and the three functions that
-//! compute an image's CSS (`get_image_properties`, `get_image_margins`,
-//! `get_hpos`/`get_float_properties`).
+//! Port of `old_src/src/calibre/ebooks/docx/images.py`.
+//!
+//! Two halves, ported across two issues:
+//!
+//! - **Geometry/CSS** (#289's first PR): filename sanitizing,
+//!   EMU-to-point conversion, and the three functions that compute an
+//!   image's CSS (`get_image_properties`, `get_image_margins`,
+//!   `get_hpos`/`get_float_properties`) -- no filesystem access, no
+//!   `crate::dom` output.
+//! - **The [`Images`] struct** (this PR, #289): real embedded-image
+//!   extraction (from the DOCX zip, or a `file://`-linked path),
+//!   deduplicated unique naming, and optional resizing, writing to
+//!   `dest_dir/images/`. The `w:drawing`/`w:pict` -> `<img>` markup
+//!   generators (`pic_to_img`, `drawing_to_html`, `pict_to_html`,
+//!   `to_html`) are still a separate, smaller follow-up -- everything
+//!   *they* need (`generate_filename` and friends) is done here.
 //!
 //! # Two reproduced upstream bugs
 //!
@@ -26,16 +31,45 @@
 //!   side effects, is behaviorally identical to not existing at all.
 //!   `get_hpos` here goes straight from the `wp:positionH` loop to the
 //!   final `0.0` fallback, exactly matching real behavior.
+//!
+//! # A disclosed gap: EMF images
+//!
+//! Python's `read_image_data` tries to convert an embedded EMF
+//! (Enhanced Metafile, a Windows vector format some older Word
+//! documents embed) to a raster PNG via `calibre.utils.wmf.emf.emf_unwrap`
+//! before writing it out. No Rust EMF parser exists anywhere in this
+//! crate, so [`read_image_data`] returns the raw EMF bytes unconverted
+//! (`ext` stays `"emf"`) -- an e-reader almost certainly can't display
+//! that, but this is at least the same "silently give up" outcome
+//! Python's own `except Exception: self.log.exception(...)` fallback
+//! produces when `emf_unwrap` itself fails.
+//!
+//! # Not (yet) wired up: `numbering.py`'s picture-bullet CSS
+//!
+//! `Level.css(images, pic_map, rid_map)` (Python's `numbering.py`) is
+//! the *other* real caller of `generate_filename` in the whole module
+//! -- with `max_width`/`max_height` set, unlike either in-file call
+//! site here, which is why [`resize_image`] is a real, exercised path
+//! despite looking unused from this file alone. Wiring that up needs
+//! `pic_map` construction (`w:numPicBullet` reading, not yet ported)
+//! and a signature change to the already-shipped `Level::css`
+//! (`numbering.rs`) -- a separate follow-up.
 
+use std::collections::HashMap;
+use std::io::{Read, Seek};
+use std::path::Path;
 use std::sync::OnceLock;
 
 use calibre_utils::filenames::{ascii_filename, sanitize_file_name};
+use image::GenericImageView;
 use regex::Regex;
 use roxmltree::Node;
 
 use super::block_styles::{format_g, pt, Css};
+use super::container::Docx;
 use super::names::DocxNamespace;
 use super::styles::PageProperties;
+use crate::oeb::transforms::rescale::fit_image;
 
 fn non_filename_char_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -287,6 +321,252 @@ pub fn get_float_properties<'a, 'i>(
     }
 }
 
+/// A linked (`file://`) or embedded (zip-relationship) image whose
+/// data couldn't be read. Port of `LinkedImageNotFound`; `fname` is
+/// the path (linked) or relationship id's resolved zip path (embedded)
+/// that failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkedImageNotFound {
+    pub fname: String,
+}
+
+/// Reads `fname`'s raw bytes -- from the local filesystem if it's a
+/// `file://` URI (a linked, not embedded, image), else from `docx` --
+/// and derives a `stem.ext` base filename for it: `base` if given,
+/// else `fname`'s own last path segment sanitized via
+/// [`image_filename`], else `"image"`; extension from
+/// [`calibre_utils::imghdr::what`] if the format is recognized, else
+/// `base`'s own extension, else `"jpeg"`. See the module docs for why
+/// an EMF image's bytes are returned as-is rather than converted to a
+/// raster format.
+///
+/// Port of `Images.read_image_data`.
+fn read_image_data<R: Read + Seek>(
+    docx: &mut Docx<R>,
+    fname: &str,
+    base: Option<&str>,
+) -> Result<(Vec<u8>, String), LinkedImageNotFound> {
+    let raw = if let Some(rest) = fname.strip_prefix("file://") {
+        let mut src = rest.to_string();
+        if cfg!(windows) && src.starts_with('/') {
+            src = src[1..].to_string();
+        }
+        if src.is_empty() || !Path::new(&src).exists() {
+            return Err(LinkedImageNotFound { fname: src });
+        }
+        std::fs::read(&src).map_err(|_| LinkedImageNotFound { fname: src })?
+    } else {
+        docx.read(fname).map_err(|_| LinkedImageNotFound {
+            fname: fname.to_string(),
+        })?
+    };
+
+    let base = base
+        .map(str::to_string)
+        .filter(|b| !b.is_empty())
+        .unwrap_or_else(|| {
+            let last_segment = fname.rsplit('/').next().unwrap_or(fname);
+            let f = image_filename(last_segment);
+            if f.is_empty() {
+                "image".to_string()
+            } else {
+                f
+            }
+        });
+
+    let ext = calibre_utils::imghdr::what(&raw)
+        .map(str::to_string)
+        .or_else(|| {
+            Some(match base.rsplit_once('.') {
+                Some((_, e)) => e.to_string(),
+                None => base.clone(),
+            })
+        })
+        .filter(|e| !e.is_empty())
+        .unwrap_or_else(|| "jpeg".to_string());
+
+    let stem = match base.rsplit_once('.') {
+        Some((s, _)) => s.to_string(),
+        None => String::new(),
+    };
+    let stem = if stem.is_empty() {
+        "image".to_string()
+    } else {
+        stem
+    };
+
+    Ok((raw, format!("{stem}.{ext}")))
+}
+
+fn split_ext(base: &str) -> (String, String) {
+    match base.rsplit_once('.') {
+        Some((n, e)) if !n.is_empty() => (n.to_string(), format!(".{e}")),
+        _ => (base.to_string(), String::new()),
+    }
+}
+
+fn image_format_for_ext(ext: &str) -> image::ImageFormat {
+    match ext.trim_start_matches('.').to_ascii_lowercase().as_str() {
+        "png" => image::ImageFormat::Png,
+        "gif" => image::ImageFormat::Gif,
+        _ => image::ImageFormat::Jpeg,
+    }
+}
+
+/// Shrinks `raw` to fit inside `max_width`x`max_height` (preserving
+/// aspect ratio, via the same [`fit_image`] `oeb::transforms::rescale`
+/// uses) if it doesn't already, re-encoding in the format `base`'s own
+/// extension names. Returns `(possibly-resized bytes, possibly
+/// `-WxH`-suffixed base filename, whether a resize actually happened)`.
+/// An undecodable image is treated as "no resize needed" rather than
+/// propagating a decode error -- this file's own two call sites never
+/// pass a size limit at all, and its one real caller
+/// (`numbering.py`'s `Level.css`, not yet wired up) already wraps the
+/// whole `generate_filename` call in a broad `except Exception:
+/// fname = None`, so nothing downstream distinguishes "not resized
+/// because already small enough" from "not resized because it
+/// couldn't be decoded" -- both mean "use the image as originally
+/// read".
+///
+/// Port of `Images.resize_image`.
+fn resize_image(
+    raw: &[u8],
+    base: &str,
+    max_width: u32,
+    max_height: u32,
+) -> (Vec<u8>, String, bool) {
+    let Ok(img) = image::load_from_memory(raw) else {
+        return (raw.to_vec(), base.to_string(), false);
+    };
+    let (w, h) = img.dimensions();
+    let (resized, nw, nh) = fit_image(w as f64, h as f64, max_width as f64, max_height as f64);
+    if !resized {
+        return (raw.to_vec(), base.to_string(), false);
+    }
+    let nw = (nw.max(1)) as u32;
+    let nh = (nh.max(1)) as u32;
+    let resized_img = img.resize_exact(nw, nh, image::imageops::FilterType::Lanczos3);
+
+    let (stem, ext) = split_ext(base);
+    let new_base = format!("{stem}-{max_width}x{max_height}{ext}");
+    let mut buf = std::io::Cursor::new(Vec::new());
+    if resized_img
+        .write_to(&mut buf, image_format_for_ext(&ext))
+        .is_err()
+    {
+        return (raw.to_vec(), base.to_string(), false);
+    }
+    (buf.into_inner(), new_base, true)
+}
+
+/// Embedded-image extraction, deduplicated naming, optional resizing,
+/// and disk-writing, for one document's worth of `w:drawing`/`w:pict`
+/// image references. Port of the `Images` class -- minus `namespace`/
+/// `log`/`rid_map` (this port threads relationships through as an
+/// explicit parameter everywhere, not mutable instance state, matching
+/// every other function in `to_html.rs`), and minus `names`/`resized`
+/// (write-only fields in Python, never read anywhere in the file).
+#[derive(Debug, Clone, Default)]
+pub struct Images {
+    used: HashMap<(String, Option<(u32, u32)>), String>,
+    all_images: std::collections::HashSet<String>,
+}
+
+impl Images {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Every generated filename, `images/`-prefixed -- for the
+    /// not-yet-wired-up OPF manifest step `Convert.write` (issue #288)
+    /// will eventually need. Port of `self.all_images`.
+    pub fn all_images(&self) -> &std::collections::HashSet<String> {
+        &self.all_images
+    }
+
+    /// Port of `Images.unique_name`.
+    fn unique_name(&self, base: &str) -> String {
+        let exists: std::collections::HashSet<&String> = self.used.values().collect();
+        let mut c = 1;
+        let mut name = base.to_string();
+        while exists.contains(&name) {
+            let (n, e) = match base.rsplit_once('.') {
+                Some((n, e)) => (n.to_string(), e.to_string()),
+                None => (String::new(), base.to_string()),
+            };
+            name = format!("{n}-{c}.{e}");
+            c += 1;
+        }
+        name
+    }
+
+    /// Resolves `rid` against `rid_map` (a resolved zip-path map, e.g.
+    /// `Relationships::by_id` -- pass whichever document's/footnote's
+    /// own relationships apply at the call site, since Python's
+    /// `self.rid_map` swap-and-restore dance for footnotes becomes an
+    /// explicit parameter here instead), reads and (optionally)
+    /// resizes its image data, writes it under a unique name inside
+    /// `images_dir` (already `dest_dir/images` -- see the module docs
+    /// on `to_html`, not yet ported, for why this takes the
+    /// *already-suffixed* directory rather than `dest_dir` itself),
+    /// and returns that filename (not a full path).
+    ///
+    /// Two dedup layers, matching Python exactly: same `(fname,
+    /// max_size)` returns the same name without re-reading anything;
+    /// and if resizing turned out to be a no-op (image already small
+    /// enough), the *unsized* cache entry is checked/populated too, so
+    /// a later unsized request for the same image reuses the file
+    /// already on disk instead of writing a byte-identical duplicate.
+    ///
+    /// Port of `Images.generate_filename`.
+    pub fn generate_filename<R: Read + Seek>(
+        &mut self,
+        docx: &mut Docx<R>,
+        images_dir: &Path,
+        rid: &str,
+        base: Option<&str>,
+        rid_map: &HashMap<String, String>,
+        max_size: Option<(u32, u32)>,
+    ) -> Result<String, LinkedImageNotFound> {
+        let fname = rid_map
+            .get(rid)
+            .cloned()
+            .ok_or_else(|| LinkedImageNotFound {
+                fname: rid.to_string(),
+            })?;
+        let key = (fname.clone(), max_size);
+        if let Some(name) = self.used.get(&key) {
+            return Ok(name.clone());
+        }
+
+        let (mut raw, mut computed_base) = read_image_data(docx, &fname, base)?;
+        let mut resized = false;
+        if let Some((max_width, max_height)) = max_size {
+            let (r, b, did_resize) = resize_image(&raw, &computed_base, max_width, max_height);
+            raw = r;
+            computed_base = b;
+            resized = did_resize;
+        }
+        let name = self.unique_name(&computed_base);
+        self.used.insert(key, name.clone());
+
+        if max_size.is_some() && !resized {
+            let okey = (fname, None);
+            if let Some(existing) = self.used.get(&okey) {
+                return Ok(existing.clone());
+            }
+            self.used.insert(okey, name.clone());
+        }
+
+        let _ = std::fs::create_dir_all(images_dir);
+        std::fs::write(images_dir.join(&name), &raw).map_err(|_| LinkedImageNotFound {
+            fname: name.clone(),
+        })?;
+        self.all_images.insert(format!("images/{name}"));
+        Ok(name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,6 +786,222 @@ mod tests {
             get_float_properties(anchor, &mut style, &page(), &ns);
             assert!(!style.contains_key("float"));
             assert!(!style.contains_key("margin-left"));
+        }
+    }
+
+    mod images_tests {
+        use super::*;
+        use std::io::{Cursor, Write};
+
+        fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+            let img = image::DynamicImage::new_rgb8(width, height);
+            let mut buf = Cursor::new(Vec::new());
+            img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+            buf.into_inner()
+        }
+
+        fn package(parts: &[(&str, &[u8])]) -> Docx<Cursor<Vec<u8>>> {
+            let mut buf = Vec::new();
+            {
+                let mut zip = zip::ZipWriter::new(Cursor::new(&mut buf));
+                let options = zip::write::FileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                for (name, content) in parts {
+                    zip.start_file(*name, options).unwrap();
+                    zip.write_all(content).unwrap();
+                }
+                zip.finish().unwrap();
+            }
+            Docx::new(Cursor::new(buf)).unwrap()
+        }
+
+        const CONTENT_TYPES: &[u8] = br#"<?xml version="1.0"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="png" ContentType="image/png"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"#;
+
+        const RELS: &[u8] = br#"<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#;
+
+        fn docx_with_image(name: &str, data: &[u8]) -> Docx<Cursor<Vec<u8>>> {
+            package(&[
+                ("[Content_Types].xml", CONTENT_TYPES),
+                ("_rels/.rels", RELS),
+                ("word/document.xml", b"<w:document/>"),
+                (name, data),
+            ])
+        }
+
+        #[test]
+        fn generate_filename_reads_writes_and_caches_an_embedded_image() {
+            let dir = tempfile::tempdir().unwrap();
+            let images_dir = dir.path().join("images");
+            let mut docx = docx_with_image("word/media/image1.png", &png_bytes(50, 50));
+            let rid_map =
+                HashMap::from([("rId4".to_string(), "word/media/image1.png".to_string())]);
+            let mut images = Images::new();
+
+            let name1 = images
+                .generate_filename(&mut docx, &images_dir, "rId4", None, &rid_map, None)
+                .unwrap();
+            assert!(images_dir.join(&name1).exists());
+            assert!(images.all_images().contains(&format!("images/{name1}")));
+
+            // Same rid + size key -> cached, no re-read/re-write needed.
+            let name2 = images
+                .generate_filename(&mut docx, &images_dir, "rId4", None, &rid_map, None)
+                .unwrap();
+            assert_eq!(name1, name2);
+        }
+
+        #[test]
+        fn an_unknown_rid_is_reported() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut docx = docx_with_image("word/media/image1.png", &png_bytes(10, 10));
+            let mut images = Images::new();
+            let err = images
+                .generate_filename(
+                    &mut docx,
+                    &dir.path().join("images"),
+                    "rIdMissing",
+                    None,
+                    &HashMap::new(),
+                    None,
+                )
+                .unwrap_err();
+            assert_eq!(err.fname, "rIdMissing");
+        }
+
+        #[test]
+        fn a_linked_file_url_is_read_from_disk_not_the_zip() {
+            let dir = tempfile::tempdir().unwrap();
+            let linked = dir.path().join("external.png");
+            std::fs::write(&linked, png_bytes(20, 20)).unwrap();
+            let mut docx = docx_with_image("word/media/unused.png", &png_bytes(5, 5));
+            let rid_map =
+                HashMap::from([("rId9".to_string(), format!("file://{}", linked.display()))]);
+            let mut images = Images::new();
+
+            let images_dir = dir.path().join("images");
+            let name = images
+                .generate_filename(&mut docx, &images_dir, "rId9", None, &rid_map, None)
+                .unwrap();
+            assert!(images_dir.join(&name).exists());
+        }
+
+        #[test]
+        fn a_missing_linked_file_is_reported() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut docx = docx_with_image("word/media/unused.png", &png_bytes(5, 5));
+            let rid_map =
+                HashMap::from([("rId9".to_string(), "file:///no/such/path.png".to_string())]);
+            let mut images = Images::new();
+
+            let err = images
+                .generate_filename(
+                    &mut docx,
+                    &dir.path().join("images"),
+                    "rId9",
+                    None,
+                    &rid_map,
+                    None,
+                )
+                .unwrap_err();
+            assert_eq!(err.fname, "/no/such/path.png");
+        }
+
+        #[test]
+        fn resize_image_shrinks_an_oversized_image_and_suffixes_the_name() {
+            let raw = png_bytes(1000, 1000);
+            let (resized_raw, new_base, resized) = resize_image(&raw, "image.png", 100, 100);
+            assert!(resized);
+            assert_eq!(new_base, "image-100x100.png");
+            let img = image::load_from_memory(&resized_raw).unwrap();
+            assert_eq!(img.dimensions(), (100, 100));
+        }
+
+        #[test]
+        fn resize_image_leaves_a_small_image_alone() {
+            let raw = png_bytes(50, 50);
+            let (resized_raw, new_base, resized) = resize_image(&raw, "image.png", 100, 100);
+            assert!(!resized);
+            assert_eq!(new_base, "image.png");
+            assert_eq!(resized_raw, raw);
+        }
+
+        #[test]
+        fn generate_filename_with_a_size_limit_resizes_and_writes_a_suffixed_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let images_dir = dir.path().join("images");
+            let mut docx = docx_with_image("word/media/image1.png", &png_bytes(1000, 1000));
+            let rid_map =
+                HashMap::from([("rId4".to_string(), "word/media/image1.png".to_string())]);
+            let mut images = Images::new();
+
+            let name = images
+                .generate_filename(
+                    &mut docx,
+                    &images_dir,
+                    "rId4",
+                    None,
+                    &rid_map,
+                    Some((20, 20)),
+                )
+                .unwrap();
+            assert!(name.contains("20x20"));
+            assert!(images_dir.join(&name).exists());
+        }
+
+        #[test]
+        fn two_different_images_sharing_a_base_name_get_distinct_unique_names() {
+            let dir = tempfile::tempdir().unwrap();
+            let images_dir = dir.path().join("images");
+            let mut docx = package(&[
+                ("[Content_Types].xml", CONTENT_TYPES),
+                ("_rels/.rels", RELS),
+                ("word/document.xml", b"<w:document/>"),
+                ("word/media/image1.png", &png_bytes(10, 10)),
+                ("word/media/image2.png", &png_bytes(20, 20)),
+            ]);
+            let rid_map = HashMap::from([
+                ("rId4".to_string(), "word/media/image1.png".to_string()),
+                ("rId5".to_string(), "word/media/image2.png".to_string()),
+            ]);
+            let mut images = Images::new();
+
+            // An explicit `base` (e.g. from a `pic:cNvPr` name attribute)
+            // forces both distinct images toward the same requested
+            // filename, which `unique_name` must disambiguate.
+            let name1 = images
+                .generate_filename(
+                    &mut docx,
+                    &images_dir,
+                    "rId4",
+                    Some("picture.png"),
+                    &rid_map,
+                    None,
+                )
+                .unwrap();
+            let name2 = images
+                .generate_filename(
+                    &mut docx,
+                    &images_dir,
+                    "rId5",
+                    Some("picture.png"),
+                    &rid_map,
+                    None,
+                )
+                .unwrap();
+            assert_ne!(
+                name1, name2,
+                "both requested picture.png -> the second must be de-duplicated"
+            );
+            assert!(images_dir.join(&name1).exists());
+            assert!(images_dir.join(&name2).exists());
         }
     }
 }

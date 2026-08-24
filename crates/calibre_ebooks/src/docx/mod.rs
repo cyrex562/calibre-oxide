@@ -48,10 +48,12 @@
 //! #130 -- it needs the real HTML element tree ([`crate::dom`] as of
 //! that issue) fully wired into a `Convert`-equivalent orchestrator.
 //! `toc.py` is ported ([`toc`]) but, like everything below, not yet
-//! wired into one -- see issue #288. `images.py`'s pure geometry/CSS
-//! half is ported ([`images`], issue #289); the `Images` struct itself
-//! (embedded-image extraction, resizing, `w:drawing`/`w:pict` ->
-//! `<img>` markup) is still a separate follow-up. `fields.py`'s pure
+//! wired into one -- see issue #288. `images.py`'s geometry/CSS half
+//! and its `Images` struct (embedded-image extraction, resizing) are
+//! both ported ([`images`], issue #289); only the `w:drawing`/
+//! `w:pict` -> `<img>` markup generators (`pic_to_img`,
+//! `drawing_to_html`, `pict_to_html`, `to_html`) remain, a smaller
+//! follow-up now that everything they need is done. `fields.py`'s pure
 //! field-instruction parsing half is ported ([`fields`], issue #290);
 //! the `Fields` orchestrator itself (the source-tree field scanner,
 //! plus `parse_xe`'s synthetic-bookmark insertion) is a separate
