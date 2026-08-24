@@ -697,6 +697,9 @@ mod from_toc_tests {
             .into_iter()
             .nth(1)
             .unwrap();
+        let mut images = crate::docx::images::Images::new();
+        let mut docx = crate::docx::to_html::empty_test_docx();
+        let dest_dir = tempfile::tempdir().unwrap();
         convert_p(
             &mut dom,
             &mut state,
@@ -707,6 +710,10 @@ mod from_toc_tests {
             &theme,
             None,
             "test-uuid",
+            &mut images,
+            &mut docx,
+            dest_dir.path(),
+            &crate::docx::styles::PageProperties::default(),
             &Relationships::default(),
             &ns,
         );

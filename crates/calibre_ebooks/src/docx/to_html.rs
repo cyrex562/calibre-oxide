@@ -17,9 +17,11 @@
 //!   [`super::styles::Styles::resolve_run`]/`resolve_paragraph`
 //!   cascade (issue #130's styles/numbering/tables cluster). Carries
 //!   the per-document state ([`ConvertState`]) both need across the
-//!   whole body walk, and tracks `w:hyperlink` runs into
+//!   whole body walk, tracks `w:hyperlink` runs into
 //!   `ConvertState::link_map`/`link_source_map`/`is_link` for
-//!   [`resolve_links`].
+//!   [`resolve_links`], and turns `w:drawing`/`w:pict` into real
+//!   `<img>`/`<hr>` markup via [`super::images::Images::to_html`]
+//!   (issue #289, closed).
 //! - [`read_page_properties`]: the paragraph/table -> [`PageProperties`]
 //!   map (plus `w:tbl` registration) [`convert_body`] walks.
 //! - [`convert_body`]: builds a `<body>`, converts and appends every
@@ -35,9 +37,10 @@
 //!   identically-bordered paragraphs into one visual block
 //!   (`ConvertState::block_runs`, for [`apply_block_run_frames`]).
 //! - [`resolve_links`]: turns tracked `w:hyperlink`s into real `<a>`
-//!   elements (issue #283's `link_map`-driven first block only --
-//!   `fields.py`/`images.py`'s link sources are separate, still-open
-//!   issues #290/#289).
+//!   elements -- both `link_map` (issue #283, plain-text hyperlinks)
+//!   and `images.links` (issue #289, hyperlink-wrapped pictures) are
+//!   wired in; only `fields.py`'s own hyperlink source remains, still
+//!   blocked on issue #290.
 //! - [`cascade`]: a bottom-up property de-duplication pass -- hoists a
 //!   property every run in a paragraph agrees on up onto the
 //!   paragraph, then hoists whichever paragraph-level value is most
@@ -60,9 +63,8 @@
 //! - [`assign_style_classes`]: the final step -- registers a CSS class
 //!   for every cached paragraph/run style and every frame's border
 //!   CSS, then sets `class` on each corresponding HTML element (issue
-//!   #288's class-generation half; `fields.polish_markup`/
-//!   `cleanup_markup`/`write` remain, each blocked on its own unported
-//!   file).
+//!   #288's class-generation half; only `fields.polish_markup`
+//!   remains, blocked on #290's still-unported `Fields` orchestrator).
 //! - [`convert_footnotes`]: appends the notes section -- an `<h1>`
 //!   heading and one `<dl class="footnote">` per referenced footnote/
 //!   endnote, each converted via [`convert_p`] exactly like the main
@@ -99,12 +101,6 @@
 //!
 //! # What `convert_run` defers, and why
 //!
-//! - `w:drawing`/`w:pict` (embedded images): skipped entirely --
-//!   `images.py` is fully ported ([`super::images`], issue #289) but
-//!   not yet wired in here; doing so needs threading `&mut
-//!   super::images::Images`, a `&mut Docx<R>`, and an `images_dir`
-//!   through `convert_run`/`convert_p`/`convert_body`, a separate
-//!   follow-up.
 //! - `style.lang`: passed through as-is rather than reduced to an
 //!   ISO 639-1 code via calibre's language-tag database
 //!   (`canonicalize_lang`/`lang_as_iso639_1`, private to `oeb::polish::opf`
@@ -335,7 +331,7 @@ pub mod html_escape {
 ///
 /// Port of the Python `Convert.convert_run`.
 #[allow(clippy::too_many_arguments)]
-pub fn convert_run<'a, 'i>(
+pub fn convert_run<'a, 'i, R: Read + Seek>(
     dom: &mut Dom,
     run: Node<'a, 'i>,
     styles: &mut Styles<'a, 'i>,
@@ -344,6 +340,11 @@ pub fn convert_run<'a, 'i>(
     theme: &Theme,
     doc_lang: Option<&str>,
     uuid: &str,
+    images: &mut Images,
+    docx: &mut Docx<R>,
+    dest_dir: &Path,
+    page: &PageProperties,
+    rels: &Relationships,
     ns: &DocxNamespace,
 ) -> NodeId {
     let span = dom.new_element("span");
@@ -389,8 +390,11 @@ pub fn convert_run<'a, 'i>(
         } else if ns.is_tag(child, "w:softHyphen") {
             let t = dom.new_text("\u{ad}");
             dom.append_child(span, t);
+        } else if ns.is_tag(child, "w:drawing") || ns.is_tag(child, "w:pict") {
+            for img in images.to_html(dom, docx, dest_dir, ns, child, page, &rels.by_id) {
+                dom.append_child(span, img);
+            }
         }
-        // w:drawing / w:pict: deferred, see module docs.
     }
 
     let style = styles.resolve_run(run, theme, ns);
@@ -671,29 +675,18 @@ static HEADING_STYLE_NAME_RE: std::sync::LazyLock<regex::Regex> =
 /// the caller is responsible for attaching it wherever the body's own
 /// structure calls for (matching Python's `self.body.append(p)`).
 ///
-/// # What's tracked here vs. left for later
+/// # What's tracked here
 ///
 /// Bookmark/anchor generation (`w:bookmarkStart`) and TOC-field
 /// detection (`w:instrText` starting with `"TOC "`) are fully ported:
 /// both are self-contained and produce real, immediately-visible `id`
 /// attributes. Heading-level retagging, `dir="rtl"`, and the
 /// same-bordered-run-merging pass (into a single wrapping `<span>`
-/// with a `text_border` CSS class) are ported too.
-///
-/// `w:hyperlink` handling is **not** ported: Python's `convert_p`
-/// tracks `current_hyperlink`/`link_map`/`link_source_map` and stamps
-/// a synthetic `is-link` marker on the source run purely so a later
-/// `resolve_links` pass (not yet ported) can retag spans into `<a>`
-/// elements. Unlike `calibre_num_id`/`removed_cells` elsewhere in this
-/// crate's docx port, `resolve_links`'s own Rust shape hasn't been
-/// designed yet, so building tracking for it now risks getting that
-/// shape wrong and redoing it -- deferred to `resolve_links`'s own
-/// future PR, along with the tracking it needs. `w:r` elements nested
-/// inside a `w:hyperlink` are still visited and converted normally
-/// (the surrounding `w:hyperlink` element is just never itself
-/// inspected), so plain text content is unaffected; only the
-/// eventual `<a href=...>` wrapping is missing. `add_frame`/`frame_map`
-/// (`apply_frames`'s bookkeeping) are deferred for the same reason.
+/// with a `text_border` CSS class) are ported too. `w:hyperlink`
+/// tracking (`ConvertState::link_map`/`link_source_map`/`is_link`, for
+/// [`resolve_links`]) and `add_frame`/`frame_map` (`apply_frames`'s
+/// bookkeeping, for [`apply_block_run_frames`]/[`apply_paragraph_frames`])
+/// are both fully wired in too.
 ///
 /// # Two reproduced Python quirks in the border-run merge
 ///
@@ -713,7 +706,7 @@ static HEADING_STYLE_NAME_RE: std::sync::LazyLock<regex::Regex> =
 ///
 /// Port of the Python `Convert.convert_p`.
 #[allow(clippy::too_many_arguments)]
-pub fn convert_p<'a, 'i>(
+pub fn convert_p<'a, 'i, R: Read + Seek>(
     dom: &mut Dom,
     state: &mut ConvertState<'a, 'i>,
     p: Node<'a, 'i>,
@@ -723,6 +716,10 @@ pub fn convert_p<'a, 'i>(
     theme: &Theme,
     doc_lang: Option<&str>,
     uuid: &str,
+    images: &mut Images,
+    docx: &mut Docx<R>,
+    dest_dir: &Path,
+    page: &PageProperties,
     rels: &Relationships,
     ns: &DocxNamespace,
 ) -> NodeId {
@@ -744,7 +741,8 @@ pub fn convert_p<'a, 'i>(
         }
         if ns.is_tag(x, "w:r") {
             let span = convert_run(
-                dom, x, styles, footnotes, settings, theme, doc_lang, uuid, ns,
+                dom, x, styles, footnotes, settings, theme, doc_lang, uuid, images, docx, dest_dir,
+                page, rels, ns,
             );
             if let Some(anchor) = current_anchor.take() {
                 let target = if dom.children(dest).is_empty() {
@@ -1039,17 +1037,19 @@ pub fn read_page_properties<'a, 'i>(
 /// self.mark_block_runs(paras)
 /// self.styles.apply_section_page_breaks(self.section_starts[1:])
 /// ```
-/// `self.current_page`/`page_properties` is threaded through as an
-/// instance attribute but not read by any code ported so far (see the
-/// module docs), so it isn't returned here. `read_block_anchors`
-/// (resolves `w:bookmarkStart`/`w:bookmarkEnd` pairs that span
-/// multiple paragraphs into cross-reference anchors) and
-/// `mark_block_runs` (numbering-related run bookkeeping) are both
+/// `self.current_page`/`page_properties` -- read by [`convert_p`]'s
+/// (transitively [`convert_run`]'s) image-float-positioning code via
+/// [`super::images::Images::to_html`] -- is threaded through per
+/// paragraph as `page_map` is walked, matching Python's own
+/// `self.current_page = page_properties` assignment each iteration.
+/// `read_block_anchors` (resolves `w:bookmarkStart`/`w:bookmarkEnd`
+/// pairs that span multiple paragraphs into cross-reference anchors)
+/// and `mark_block_runs` (numbering-related run bookkeeping) are both
 /// unported -- neither has a designed Rust shape yet, so, per this
 /// module's established scoping principle, they're deferred rather
 /// than guessed at here.
 #[allow(clippy::too_many_arguments)]
-pub fn convert_body<'a, 'i>(
+pub fn convert_body<'a, 'i, R: Read + Seek>(
     dom: &mut Dom,
     doc: Node<'a, 'i>,
     state: &mut ConvertState<'a, 'i>,
@@ -1059,6 +1059,9 @@ pub fn convert_body<'a, 'i>(
     theme: &Theme,
     doc_lang: Option<&str>,
     uuid: &str,
+    images: &mut Images,
+    docx: &mut Docx<R>,
+    dest_dir: &Path,
     rels: &Relationships,
     ns: &DocxNamespace,
 ) -> (
@@ -1073,10 +1076,11 @@ pub fn convert_body<'a, 'i>(
     dom.append_child(dom.root, body);
 
     let mut paras: Vec<Node<'a, 'i>> = Vec::new();
-    for &wp in page_map.keys() {
+    for (&wp, page) in page_map.iter() {
         if ns.is_tag(wp, "w:p") {
             let p = convert_p(
-                dom, state, wp, styles, footnotes, settings, theme, doc_lang, uuid, rels, ns,
+                dom, state, wp, styles, footnotes, settings, theme, doc_lang, uuid, images, docx,
+                dest_dir, page, rels, ns,
             );
             dom.append_child(body, p);
             paras.push(wp);
@@ -2373,12 +2377,17 @@ pub fn assign_style_classes<'a, 'i>(
 /// Every note carries its *own* [`super::container::Relationships`]
 /// (`Note::rels`, since footnotes/endnotes live in their own part,
 /// e.g. `footnotes.xml.rels`) -- passed straight into `convert_p` as
-/// its `rels` argument. Python instead temporarily overwrites
+/// its `rels` argument, and (transitively, for any `w:drawing`/
+/// `w:pict` the note's own body contains) as the `rid_map`
+/// [`super::images::Images::to_html`] resolves a relationship id
+/// against. Python instead temporarily overwrites
 /// `self.images.rid_map`/`self.current_rels` (mutable instance state)
 /// for the duration of each note, restoring it afterward; this port
 /// already threads relationships through as an explicit parameter
-/// (since PR #294), so no such swap-and-restore, and no `Images` type
-/// at all, is needed here.
+/// (since PR #294), so no such swap-and-restore is needed -- the same
+/// `images: &mut Images` the main body walk uses is simply passed
+/// through here too, since it's the *relationships*, not the
+/// `Images` value itself, that differ per note.
 ///
 /// A `w:tbl` found inside a note is registered (`Styles::register_table`)
 /// and, matching Python's `self.page_map[wp] = self.current_page`,
@@ -2395,7 +2404,7 @@ pub fn assign_style_classes<'a, 'i>(
 /// Port of the `if self.footnotes.has_notes: ...` block inside the
 /// Python `Convert.__call__`.
 #[allow(clippy::too_many_arguments)]
-pub fn convert_footnotes<'a, 'i>(
+pub fn convert_footnotes<'a, 'i, R: Read + Seek>(
     dom: &mut Dom,
     body: NodeId,
     state: &mut ConvertState<'a, 'i>,
@@ -2406,6 +2415,9 @@ pub fn convert_footnotes<'a, 'i>(
     doc_lang: Option<&str>,
     uuid: &str,
     notes_text: &str,
+    images: &mut Images,
+    docx: &mut Docx<R>,
+    dest_dir: &Path,
     page_map: &mut IndexMap<Node<'a, 'i>, PageProperties>,
     current_page: PageProperties,
     ns: &DocxNamespace,
@@ -2468,7 +2480,20 @@ pub fn convert_footnotes<'a, 'i>(
                 page_map.insert(wp, current_page);
             } else {
                 let p = convert_p(
-                    dom, state, wp, styles, footnotes, settings, theme, doc_lang, uuid, &note.rels,
+                    dom,
+                    state,
+                    wp,
+                    styles,
+                    footnotes,
+                    settings,
+                    theme,
+                    doc_lang,
+                    uuid,
+                    images,
+                    docx,
+                    dest_dir,
+                    &current_page,
+                    &note.rels,
                     ns,
                 );
                 dom.append_child(dd, p);
@@ -2572,30 +2597,28 @@ pub fn build_html_document(
 /// (plus `write`'s first line, `create_toc`), in Python's real
 /// sequence, given a `styles`/`numbering`/`footnotes`/`settings`/
 /// `theme` already populated by a caller (Python's own `read_styles`,
-/// not ported here -- see the module docs' "Not (yet) wired up"
-/// section) and an `images` with nothing in it yet (`convert_run`
-/// still explicitly skips `w:drawing`/`w:pict`, so `images.links` is
-/// always empty here regardless of what's passed in -- wiring
-/// #289's `Images` into the body walk itself is a separate follow-up).
+/// see [`super::read_styles`]) and a fresh or reused `images`/`docx`
+/// (`w:drawing`/`w:pict` are converted into real `<img>`/`<hr>`
+/// markup during the body walk, via [`super::images::Images::to_html`],
+/// same as Python's own `self.images(relationships_by_id)` call --
+/// this port threads `rid_map` through as `rels.by_id` per call
+/// instead of mutable instance state, so no separate `images(...)`
+/// initialization step exists here).
 ///
-/// Three things `Convert.__call__` itself does that this deliberately
+/// Two things `Convert.__call__` itself does that this deliberately
 /// leaves out, each documented elsewhere rather than repeated here:
 /// `resolve_alternate_content`
 /// (inserts a `mc:Fallback`'s real content in place of a proprietary
 /// `mc:AlternateContent` wrapper -- genuine *source*-tree mutation,
 /// the same open architectural question issues #290/#293 are blocked
-/// on), `self.fields(...)`/`self.fields.polish_markup(...)` (needs
-/// `fields.py`'s `Fields` orchestrator, issue #290), and `write`'s own
-/// remaining OPF/NCX serialization (a separate follow-up: this crate's
-/// `mobi/opf_writer.rs` already has the low-level OPF/NCX writers, but
-/// needs generalizing out of the `mobi`-specific module it currently
-/// lives in first).
+/// on), and `self.fields(...)`/`self.fields.polish_markup(...)` (needs
+/// `fields.py`'s `Fields` orchestrator, issue #290).
 ///
 /// Port of `Convert.__call__` (`read_page_properties` through
 /// `cleanup_markup`) and the `create_toc` call at the top of
 /// `Convert.write`.
 #[allow(clippy::too_many_arguments)]
-pub fn convert_document<'a, 'i>(
+pub fn convert_document<'a, 'i, R: Read + Seek>(
     dom: &mut Dom,
     document: Node<'a, 'i>,
     styles: &mut Styles<'a, 'i>,
@@ -2603,7 +2626,8 @@ pub fn convert_document<'a, 'i>(
     footnotes: &mut Footnotes<'a, 'i>,
     settings: &Settings,
     theme: &Theme,
-    images: &Images,
+    images: &mut Images,
+    docx: &mut Docx<R>,
     doc_lang: Option<&str>,
     uuid: &str,
     notes_text: &str,
@@ -2615,7 +2639,8 @@ pub fn convert_document<'a, 'i>(
     let mut state = ConvertState::new();
 
     let (body, paras, mut page_map, _section_starts) = convert_body(
-        dom, document, &mut state, styles, footnotes, settings, theme, doc_lang, uuid, rels, ns,
+        dom, document, &mut state, styles, footnotes, settings, theme, doc_lang, uuid, images,
+        docx, dest_dir, rels, ns,
     );
 
     read_block_anchors(dom, document, &mut state, ns);
@@ -2637,6 +2662,9 @@ pub fn convert_document<'a, 'i>(
         doc_lang,
         uuid,
         notes_text,
+        images,
+        docx,
+        dest_dir,
         &mut page_map,
         current_page,
         ns,
@@ -2787,6 +2815,38 @@ pub fn write_document(
     Ok(dest_dir.join("metadata.opf"))
 }
 
+/// A minimal, well-formed empty DOCX package -- just enough for
+/// [`Docx::new`] to open successfully (`[Content_Types].xml` and
+/// `_rels/.rels`, both otherwise-empty) -- for every test in this
+/// module that needs *some* `&mut Docx<R>` to thread through
+/// `convert_run`'s image-handling parameters, but never actually
+/// reads an image (`rels.by_id` stays empty, so
+/// `Images::to_html`/`generate_filename` never resolve a real
+/// relationship id). Shared across every `Harness` below via
+/// `use super::*`.
+#[cfg(test)]
+pub(crate) fn empty_test_docx() -> Docx<std::io::Cursor<Vec<u8>>> {
+    use std::io::Write;
+    let mut buf = Vec::new();
+    {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let options =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("[Content_Types].xml", options).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>"#,
+        )
+        .unwrap();
+        zip.start_file("_rels/.rels", options).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#,
+        )
+        .unwrap();
+        zip.finish().unwrap();
+    }
+    Docx::new(std::io::Cursor::new(buf)).expect("minimal docx package opens")
+}
+
 #[cfg(test)]
 mod convert_run_tests {
     use super::*;
@@ -2809,6 +2869,11 @@ mod convert_run_tests {
         footnotes: Footnotes<'a, 'i>,
         settings: Settings,
         theme: Theme,
+        images: Images,
+        docx: Docx<std::io::Cursor<Vec<u8>>>,
+        dest_dir: tempfile::TempDir,
+        page: PageProperties,
+        rels: Relationships,
     }
 
     impl<'a, 'i> Harness<'a, 'i> {
@@ -2819,6 +2884,11 @@ mod convert_run_tests {
                 footnotes: Footnotes::new(),
                 settings: Settings::new(),
                 theme: Theme::new(),
+                images: Images::new(),
+                docx: empty_test_docx(),
+                dest_dir: tempfile::tempdir().unwrap(),
+                page: PageProperties::default(),
+                rels: Relationships::default(),
             }
         }
 
@@ -2832,6 +2902,11 @@ mod convert_run_tests {
                 &self.theme,
                 None,
                 "test-uuid",
+                &mut self.images,
+                &mut self.docx,
+                self.dest_dir.path(),
+                &self.page,
+                &self.rels,
                 ns,
             )
         }
@@ -2843,6 +2918,113 @@ mod convert_run_tests {
         let mut h = Harness::new();
         let span = h.convert(doc.root_element(), &ns);
         assert_eq!(h.dom.serialize(span), "<span>hello world</span>");
+    }
+
+    /// A one-entry package with `name` holding `data`, for the
+    /// `w:drawing`/`w:pict` tests below -- like [`empty_test_docx`],
+    /// but with a real (arbitrary-bytes, since neither
+    /// `Images::read_image_data` nor its `generate_filename` caller
+    /// validate image format for an unsized `pic_to_img`/`pict_to_html`
+    /// request) embedded part `Images::generate_filename` can read.
+    fn test_docx_with_image(name: &str, data: &[u8]) -> Docx<std::io::Cursor<Vec<u8>>> {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let options = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("[Content_Types].xml", options).unwrap();
+            zip.write_all(
+                br#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>"#,
+            )
+            .unwrap();
+            zip.start_file("_rels/.rels", options).unwrap();
+            zip.write_all(
+                br#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#,
+            )
+            .unwrap();
+            zip.start_file(name, options).unwrap();
+            zip.write_all(data).unwrap();
+            zip.finish().unwrap();
+        }
+        Docx::new(std::io::Cursor::new(buf)).expect("minimal docx package with an image opens")
+    }
+
+    #[test]
+    fn a_drawing_with_an_embedded_picture_becomes_a_real_img() {
+        const IMG_DOC_OPEN: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships""#;
+        let xml: &'static str = Box::leak(
+            format!(
+                r#"<w:r {IMG_DOC_OPEN}>
+                     <w:drawing>
+                       <wp:inline>
+                         <wp:extent cx="914400" cy="457200"/>
+                         <pic:pic>
+                           <pic:nvPicPr><pic:cNvPr id="1" name="pic1.png"/></pic:nvPicPr>
+                           <pic:blipFill><a:blip r:embed="rId4"/></pic:blipFill>
+                         </pic:pic>
+                       </wp:inline>
+                     </w:drawing>
+                   </w:r>"#
+            )
+            .into_boxed_str(),
+        );
+        let doc = Document::parse(xml).expect("valid XML");
+        let ns = DocxNamespace::default();
+
+        let mut h = Harness::new();
+        h.docx = test_docx_with_image("word/media/image1.png", b"not-really-a-png");
+        h.rels
+            .by_id
+            .insert("rId4".to_string(), "word/media/image1.png".to_string());
+
+        let span = h.convert(doc.root_element(), &ns);
+        let children = h.dom.children(span);
+        assert_eq!(children.len(), 1, "one img child, no leftover text nodes");
+        assert_eq!(h.dom.tag(children[0]), Some("img"));
+        assert_eq!(
+            h.dom
+                .node(children[0])
+                .attrs
+                .get("style")
+                .map(String::as_str),
+            Some("width: 72pt; height: 36pt")
+        );
+        assert!(h
+            .dom
+            .node(children[0])
+            .attrs
+            .get("src")
+            .unwrap()
+            .starts_with("images/"));
+        assert!(h
+            .dest_dir
+            .path()
+            .join(h.dom.node(children[0]).attrs.get("src").unwrap())
+            .exists());
+    }
+
+    #[test]
+    fn a_pict_horizontal_line_becomes_an_hr() {
+        const VML_DOC_OPEN: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office""#;
+        let xml: &'static str = Box::leak(
+            format!(
+                r#"<w:r {VML_DOC_OPEN}>
+                     <w:pict>
+                       <v:rect o:hr="t" o:hralign="left"/>
+                     </w:pict>
+                   </w:r>"#
+            )
+            .into_boxed_str(),
+        );
+        let doc = Document::parse(xml).expect("valid XML");
+        let ns = DocxNamespace::default();
+
+        let mut h = Harness::new();
+        let span = h.convert(doc.root_element(), &ns);
+        let children = h.dom.children(span);
+        assert_eq!(children.len(), 1);
+        assert_eq!(h.dom.tag(children[0]), Some("hr"));
     }
 
     #[test]
@@ -2942,7 +3124,11 @@ mod convert_run_tests {
     }
 
     #[test]
-    fn drawing_and_pict_children_are_skipped() {
+    fn empty_drawing_and_pict_children_produce_nothing() {
+        // No `wp:inline`/`wp:anchor` and no `v:imagedata`/`o:hr` content
+        // at all -- both `Images::drawing_to_html`/`pict_to_html`
+        // legitimately return an empty `Vec`, same as Python's own
+        // `Images.to_html` would for either element.
         let (doc, ns) = parse_run("<w:drawing/><w:pict/><w:t>after</w:t>");
         let mut h = Harness::new();
         let span = h.convert(doc.root_element(), &ns);
@@ -3055,6 +3241,11 @@ mod convert_run_tests {
             &h.theme,
             Some("en-US"),
             "test-uuid",
+            &mut h.images,
+            &mut h.docx,
+            h.dest_dir.path(),
+            &h.page,
+            &h.rels,
             &ns,
         );
         assert_eq!(h.dom.node(span).attrs.get("lang"), None);
@@ -3102,6 +3293,10 @@ mod convert_p_tests {
         footnotes: Footnotes<'a, 'i>,
         settings: Settings,
         theme: Theme,
+        images: Images,
+        docx: Docx<std::io::Cursor<Vec<u8>>>,
+        dest_dir: tempfile::TempDir,
+        page: PageProperties,
     }
 
     impl<'a, 'i> Harness<'a, 'i> {
@@ -3113,6 +3308,10 @@ mod convert_p_tests {
                 footnotes: Footnotes::new(),
                 settings: Settings::new(),
                 theme: Theme::new(),
+                images: Images::new(),
+                docx: empty_test_docx(),
+                dest_dir: tempfile::tempdir().unwrap(),
+                page: PageProperties::default(),
             }
         }
 
@@ -3127,6 +3326,10 @@ mod convert_p_tests {
                 &self.theme,
                 None,
                 "test-uuid",
+                &mut self.images,
+                &mut self.docx,
+                self.dest_dir.path(),
+                &self.page,
                 &Relationships::default(),
                 ns,
             )
@@ -3461,6 +3664,9 @@ mod convert_body_tests {
         footnotes: Footnotes<'a, 'i>,
         settings: Settings,
         theme: Theme,
+        images: Images,
+        docx: Docx<std::io::Cursor<Vec<u8>>>,
+        dest_dir: tempfile::TempDir,
     }
 
     impl<'a, 'i> Harness<'a, 'i> {
@@ -3472,6 +3678,9 @@ mod convert_body_tests {
                 footnotes: Footnotes::new(),
                 settings: Settings::new(),
                 theme: Theme::new(),
+                images: Images::new(),
+                docx: empty_test_docx(),
+                dest_dir: tempfile::tempdir().unwrap(),
             }
         }
 
@@ -3490,6 +3699,9 @@ mod convert_body_tests {
                 &self.theme,
                 None,
                 "test-uuid",
+                &mut self.images,
+                &mut self.docx,
+                self.dest_dir.path(),
                 &Relationships::default(),
                 ns,
             );
@@ -3629,6 +3841,9 @@ mod read_block_anchors_tests {
         footnotes: Footnotes<'a, 'i>,
         settings: Settings,
         theme: Theme,
+        images: Images,
+        docx: Docx<std::io::Cursor<Vec<u8>>>,
+        dest_dir: tempfile::TempDir,
     }
 
     impl<'a, 'i> Harness<'a, 'i> {
@@ -3640,6 +3855,9 @@ mod read_block_anchors_tests {
                 footnotes: Footnotes::new(),
                 settings: Settings::new(),
                 theme: Theme::new(),
+                images: Images::new(),
+                docx: empty_test_docx(),
+                dest_dir: tempfile::tempdir().unwrap(),
             }
         }
 
@@ -3654,6 +3872,9 @@ mod read_block_anchors_tests {
                 &self.theme,
                 None,
                 "test-uuid",
+                &mut self.images,
+                &mut self.docx,
+                self.dest_dir.path(),
                 &Relationships::default(),
                 ns,
             )
@@ -3820,6 +4041,9 @@ mod apply_tab_indentation_tests {
         footnotes: Footnotes<'a, 'i>,
         settings: Settings,
         theme: Theme,
+        images: Images,
+        docx: Docx<std::io::Cursor<Vec<u8>>>,
+        dest_dir: tempfile::TempDir,
     }
 
     impl<'a, 'i> Harness<'a, 'i> {
@@ -3831,6 +4055,9 @@ mod apply_tab_indentation_tests {
                 footnotes: Footnotes::new(),
                 settings: Settings::new(),
                 theme: Theme::new(),
+                images: Images::new(),
+                docx: empty_test_docx(),
+                dest_dir: tempfile::tempdir().unwrap(),
             }
         }
 
@@ -3845,6 +4072,9 @@ mod apply_tab_indentation_tests {
                 &self.theme,
                 None,
                 "test-uuid",
+                &mut self.images,
+                &mut self.docx,
+                self.dest_dir.path(),
                 &Relationships::default(),
                 ns,
             )
@@ -3997,6 +4227,9 @@ mod mark_block_runs_tests {
         footnotes: Footnotes<'a, 'i>,
         settings: Settings,
         theme: Theme,
+        images: Images,
+        docx: Docx<std::io::Cursor<Vec<u8>>>,
+        dest_dir: tempfile::TempDir,
     }
 
     impl<'a, 'i> Harness<'a, 'i> {
@@ -4008,6 +4241,9 @@ mod mark_block_runs_tests {
                 footnotes: Footnotes::new(),
                 settings: Settings::new(),
                 theme: Theme::new(),
+                images: Images::new(),
+                docx: empty_test_docx(),
+                dest_dir: tempfile::tempdir().unwrap(),
             }
         }
 
@@ -4022,6 +4258,9 @@ mod mark_block_runs_tests {
                 &self.theme,
                 None,
                 "test-uuid",
+                &mut self.images,
+                &mut self.docx,
+                self.dest_dir.path(),
                 &Relationships::default(),
                 ns,
             );
@@ -4153,6 +4392,10 @@ mod resolve_links_tests {
         footnotes: Footnotes<'a, 'i>,
         settings: Settings,
         theme: Theme,
+        images: Images,
+        docx: Docx<std::io::Cursor<Vec<u8>>>,
+        dest_dir: tempfile::TempDir,
+        page: PageProperties,
     }
 
     impl<'a, 'i> Harness<'a, 'i> {
@@ -4164,6 +4407,10 @@ mod resolve_links_tests {
                 footnotes: Footnotes::new(),
                 settings: Settings::new(),
                 theme: Theme::new(),
+                images: Images::new(),
+                docx: empty_test_docx(),
+                dest_dir: tempfile::tempdir().unwrap(),
+                page: PageProperties::default(),
             }
         }
 
@@ -4178,6 +4425,10 @@ mod resolve_links_tests {
                 &self.theme,
                 None,
                 "test-uuid",
+                &mut self.images,
+                &mut self.docx,
+                self.dest_dir.path(),
+                &self.page,
                 rels,
                 ns,
             )
@@ -4440,6 +4691,9 @@ mod cascade_tests {
         footnotes: Footnotes<'a, 'i>,
         settings: Settings,
         theme: Theme,
+        images: Images,
+        docx: Docx<std::io::Cursor<Vec<u8>>>,
+        dest_dir: tempfile::TempDir,
     }
 
     impl<'a, 'i> Harness<'a, 'i> {
@@ -4451,6 +4705,9 @@ mod cascade_tests {
                 footnotes: Footnotes::new(),
                 settings: Settings::new(),
                 theme: Theme::new(),
+                images: Images::new(),
+                docx: empty_test_docx(),
+                dest_dir: tempfile::tempdir().unwrap(),
             }
         }
 
@@ -4465,6 +4722,9 @@ mod cascade_tests {
                 &self.theme,
                 None,
                 "test-uuid",
+                &mut self.images,
+                &mut self.docx,
+                self.dest_dir.path(),
                 &Relationships::default(),
                 ns,
             )
@@ -4698,6 +4958,9 @@ mod apply_tables_markup_tests {
         footnotes: Footnotes<'a, 'i>,
         settings: Settings,
         theme: Theme,
+        images: Images,
+        docx: Docx<std::io::Cursor<Vec<u8>>>,
+        dest_dir: tempfile::TempDir,
     }
 
     impl<'a, 'i> Harness<'a, 'i> {
@@ -4709,6 +4972,9 @@ mod apply_tables_markup_tests {
                 footnotes: Footnotes::new(),
                 settings: Settings::new(),
                 theme: Theme::new(),
+                images: Images::new(),
+                docx: empty_test_docx(),
+                dest_dir: tempfile::tempdir().unwrap(),
             }
         }
 
@@ -4723,6 +4989,9 @@ mod apply_tables_markup_tests {
                 &self.theme,
                 None,
                 "test-uuid",
+                &mut self.images,
+                &mut self.docx,
+                self.dest_dir.path(),
                 &Relationships::default(),
                 ns,
             )
@@ -4971,6 +5240,9 @@ mod apply_numbering_markup_tests {
         footnotes: Footnotes<'a, 'i>,
         settings: Settings,
         theme: Theme,
+        images: Images,
+        docx: Docx<std::io::Cursor<Vec<u8>>>,
+        dest_dir: tempfile::TempDir,
     }
 
     impl<'a, 'i> Harness<'a, 'i> {
@@ -4982,6 +5254,9 @@ mod apply_numbering_markup_tests {
                 footnotes: Footnotes::new(),
                 settings: Settings::new(),
                 theme: Theme::new(),
+                images: Images::new(),
+                docx: empty_test_docx(),
+                dest_dir: tempfile::tempdir().unwrap(),
             }
         }
 
@@ -4996,6 +5271,9 @@ mod apply_numbering_markup_tests {
                 &self.theme,
                 None,
                 "test-uuid",
+                &mut self.images,
+                &mut self.docx,
+                self.dest_dir.path(),
                 &Relationships::default(),
                 ns,
             )
@@ -5214,6 +5492,9 @@ mod apply_block_run_frames_tests {
         footnotes: Footnotes<'a, 'i>,
         settings: Settings,
         theme: Theme,
+        images: Images,
+        docx: Docx<std::io::Cursor<Vec<u8>>>,
+        dest_dir: tempfile::TempDir,
     }
 
     impl<'a, 'i> Harness<'a, 'i> {
@@ -5225,6 +5506,9 @@ mod apply_block_run_frames_tests {
                 footnotes: Footnotes::new(),
                 settings: Settings::new(),
                 theme: Theme::new(),
+                images: Images::new(),
+                docx: empty_test_docx(),
+                dest_dir: tempfile::tempdir().unwrap(),
             }
         }
 
@@ -5239,6 +5523,9 @@ mod apply_block_run_frames_tests {
                 &self.theme,
                 None,
                 "test-uuid",
+                &mut self.images,
+                &mut self.docx,
+                self.dest_dir.path(),
                 &Relationships::default(),
                 ns,
             );
@@ -5404,6 +5691,9 @@ mod assign_style_classes_tests {
         footnotes: Footnotes<'a, 'i>,
         settings: Settings,
         theme: Theme,
+        images: Images,
+        docx: Docx<std::io::Cursor<Vec<u8>>>,
+        dest_dir: tempfile::TempDir,
     }
 
     impl<'a, 'i> Harness<'a, 'i> {
@@ -5415,6 +5705,9 @@ mod assign_style_classes_tests {
                 footnotes: Footnotes::new(),
                 settings: Settings::new(),
                 theme: Theme::new(),
+                images: Images::new(),
+                docx: empty_test_docx(),
+                dest_dir: tempfile::tempdir().unwrap(),
             }
         }
 
@@ -5429,6 +5722,9 @@ mod assign_style_classes_tests {
                 &self.theme,
                 None,
                 "test-uuid",
+                &mut self.images,
+                &mut self.docx,
+                self.dest_dir.path(),
                 &Relationships::default(),
                 ns,
             )
@@ -5543,6 +5839,9 @@ mod convert_footnotes_tests {
         footnotes: Footnotes<'a, 'i>,
         settings: Settings,
         theme: Theme,
+        images: Images,
+        docx: Docx<std::io::Cursor<Vec<u8>>>,
+        dest_dir: tempfile::TempDir,
     }
 
     impl<'a, 'i> Harness<'a, 'i> {
@@ -5554,6 +5853,9 @@ mod convert_footnotes_tests {
                 footnotes: Footnotes::new(),
                 settings: Settings::new(),
                 theme: Theme::new(),
+                images: Images::new(),
+                docx: empty_test_docx(),
+                dest_dir: tempfile::tempdir().unwrap(),
             }
         }
 
@@ -5568,6 +5870,9 @@ mod convert_footnotes_tests {
                 &self.theme,
                 None,
                 "test-uuid",
+                &mut self.images,
+                &mut self.docx,
+                self.dest_dir.path(),
                 &Relationships::default(),
                 ns,
             )
@@ -5618,6 +5923,9 @@ mod convert_footnotes_tests {
             None,
             "test-uuid",
             "Notes",
+            &mut h.images,
+            &mut h.docx,
+            h.dest_dir.path(),
             &mut IndexMap::new(),
             PageProperties::default(),
             &ns,
@@ -5686,6 +5994,9 @@ mod convert_footnotes_tests {
             None,
             "test-uuid",
             "Notes",
+            &mut h.images,
+            &mut h.docx,
+            h.dest_dir.path(),
             &mut IndexMap::new(),
             PageProperties::default(),
             &ns,
@@ -5745,6 +6056,9 @@ mod convert_footnotes_tests {
             None,
             "test-uuid",
             "Notes",
+            &mut h.images,
+            &mut h.docx,
+            h.dest_dir.path(),
             &mut page_map,
             current_page,
             &ns,
@@ -5779,6 +6093,9 @@ mod apply_paragraph_frames_tests {
         footnotes: Footnotes<'a, 'i>,
         settings: Settings,
         theme: Theme,
+        images: Images,
+        docx: Docx<std::io::Cursor<Vec<u8>>>,
+        dest_dir: tempfile::TempDir,
     }
 
     impl<'a, 'i> Harness<'a, 'i> {
@@ -5790,6 +6107,9 @@ mod apply_paragraph_frames_tests {
                 footnotes: Footnotes::new(),
                 settings: Settings::new(),
                 theme: Theme::new(),
+                images: Images::new(),
+                docx: empty_test_docx(),
+                dest_dir: tempfile::tempdir().unwrap(),
             }
         }
 
@@ -5804,6 +6124,9 @@ mod apply_paragraph_frames_tests {
                 &self.theme,
                 None,
                 "test-uuid",
+                &mut self.images,
+                &mut self.docx,
+                self.dest_dir.path(),
                 &Relationships::default(),
                 ns,
             )
@@ -5971,6 +6294,7 @@ mod convert_document_tests {
         settings: Settings,
         theme: Theme,
         images: Images,
+        docx: Docx<std::io::Cursor<Vec<u8>>>,
     }
 
     impl<'a, 'i> Harness<'a, 'i> {
@@ -5983,6 +6307,7 @@ mod convert_document_tests {
                 settings: Settings::new(),
                 theme: Theme::new(),
                 images: Images::new(),
+                docx: empty_test_docx(),
             }
         }
 
@@ -5999,7 +6324,8 @@ mod convert_document_tests {
                 &mut self.footnotes,
                 &self.settings,
                 &self.theme,
-                &self.images,
+                &mut self.images,
+                &mut self.docx,
                 None,
                 "test-uuid",
                 "Notes",
@@ -6051,7 +6377,8 @@ mod convert_document_tests {
             &mut h.footnotes,
             &h.settings,
             &h.theme,
-            &h.images,
+            &mut h.images,
+            &mut h.docx,
             None,
             "test-uuid",
             "Notes",
