@@ -120,6 +120,39 @@ impl Toc {
             .map(|&c| self.flat_count(c))
             .sum::<usize>()
     }
+
+    /// Converts this arena into `crate::metadata::toc::TOC`'s
+    /// tree-of-`TOCNode` shape -- what `crate::opf_writer::write_ncx`
+    /// needs to render a real `toc.ncx` (issue #130/#288's `write`
+    /// step). Not a general-purpose conversion: it's specific to what
+    /// this file's own `Toc` ever actually contains (every node's
+    /// `href` is always `"index.html"`, from `from_headings`/
+    /// `structure_toc`'s own `add_item` calls) -- `href`/`fragment`
+    /// combine into a single `"href#fragment"` `src` (or just `href`
+    /// with no fragment), `text` becomes `title`.
+    pub fn to_ncx_toc(&self) -> crate::metadata::toc::TOC {
+        fn convert(toc: &Toc, id: TocNodeId) -> Vec<crate::metadata::toc::TOCNode> {
+            toc.children(id)
+                .iter()
+                .map(|&child_id| {
+                    let node = toc.node(child_id);
+                    let href = node.href.as_deref().unwrap_or("index.html");
+                    let src = match node.fragment.as_deref() {
+                        Some(frag) if !frag.is_empty() => format!("{href}#{frag}"),
+                        _ => href.to_string(),
+                    };
+                    crate::metadata::toc::TOCNode {
+                        title: node.text.clone().unwrap_or_default(),
+                        src,
+                        children: convert(toc, child_id),
+                    }
+                })
+                .collect()
+        }
+        crate::metadata::toc::TOC {
+            nodes: convert(self, self.root),
+        }
+    }
 }
 
 /// Create a TOC from `data-heading-level`-tagged elements in the
@@ -503,6 +536,54 @@ mod from_headings_tests {
         let toc = from_headings(&mut dom, body, 3).unwrap();
         let first = toc.children(toc.root)[0];
         assert_eq!(toc.node(first).fragment.as_deref(), Some("already-set"));
+    }
+}
+
+#[cfg(test)]
+mod to_ncx_toc_tests {
+    use super::*;
+
+    #[test]
+    fn headings_become_a_metadata_toc_with_fragment_hrefs() {
+        let mut dom = Dom::empty();
+        let body = dom.new_element("body");
+        let h1 = {
+            let h = dom.new_element("h1");
+            let t = dom.new_text("Chapter One");
+            dom.append_child(h, t);
+            dom.append_child(body, h);
+            h
+        };
+        dom.node_mut(h1)
+            .attrs
+            .insert("data-heading-level".to_string(), "1".to_string());
+        let h2 = {
+            let h = dom.new_element("h2");
+            let t = dom.new_text("Section One");
+            dom.append_child(h, t);
+            dom.append_child(body, h);
+            h
+        };
+        dom.node_mut(h2)
+            .attrs
+            .insert("data-heading-level".to_string(), "2".to_string());
+
+        let toc = from_headings(&mut dom, body, 3).unwrap();
+        let ncx = toc.to_ncx_toc();
+
+        assert_eq!(ncx.nodes.len(), 1);
+        assert_eq!(ncx.nodes[0].title, "Chapter One");
+        assert_eq!(ncx.nodes[0].src, "index.html#toc_id_1");
+        assert_eq!(ncx.nodes[0].children.len(), 1);
+        assert_eq!(ncx.nodes[0].children[0].title, "Section One");
+        assert_eq!(ncx.nodes[0].children[0].src, "index.html#toc_id_2");
+    }
+
+    #[test]
+    fn an_empty_toc_converts_to_an_empty_ncx_toc() {
+        let toc = Toc::new();
+        let ncx = toc.to_ncx_toc();
+        assert!(ncx.nodes.is_empty());
     }
 }
 

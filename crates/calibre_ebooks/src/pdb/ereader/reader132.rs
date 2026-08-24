@@ -19,7 +19,7 @@ use crate::compression::palmdoc;
 use crate::metadata::ereader::get_metadata as get_ereader_metadata;
 use crate::metadata::toc::TOC;
 use crate::metadata::MetaInformation;
-use crate::mobi::opf_writer::{auto_manifest, write_ncx, write_opf};
+use crate::opf_writer::{auto_manifest, write_ncx, write_opf};
 use crate::pdb::ereader::EreaderError;
 use crate::pdb::formatreader::FormatReader;
 use crate::pdb::header::PdbHeader;
