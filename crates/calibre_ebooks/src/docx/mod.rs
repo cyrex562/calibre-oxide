@@ -26,6 +26,7 @@
 //! | `fields.py` (partial) | [`fields`] |
 //! | `index.py` (partial) | [`index`] |
 //! | `cleanup.py` | [`cleanup`] |
+//! | `to_html.py`'s `Convert.read_styles` (partial) | [`read_styles`] |
 //!
 //! The four "partial" rows above port everything except HTML-markup
 //! construction: `numbering.rs` has `Level`/`NumberingDefinition`/
@@ -63,7 +64,17 @@
 //! `fields.rs`'s `parse_xe` is blocked on -- see `index`'s module
 //! docs. `cleanup.py` is fully ported ([`cleanup`], issue #291) --
 //! the last of #130's originally-unported files with no remaining
-//! blocker of its own.
+//! blocker of its own. `to_html.rs`'s [`to_html::convert_document`]
+//! (issue #288) wires the whole `to_html.rs` orchestration together
+//! in `Convert.__call__`'s real order, given an already-populated
+//! `Styles`/`Numbering`/`Footnotes`/`Theme`/`Settings` --
+//! [`read_styles`] does exactly that populating (`Convert.read_styles`,
+//! split into a real-I/O half and a wiring half; see its own module
+//! docs for why). What's left for #288: `resolve_alternate_content`
+//! (needs the same source-tree-mutation decision as #290/#293),
+//! `fields.py`'s orchestrator (#290), images wired into `convert_run`,
+//! and `write`'s OPF/NCX output (`mobi/opf_writer.rs` already has the
+//! low-level writers, needs generalizing out of `mobi/`).
 //!
 //! The output half of the module — `writer/` — is issue #23 and lives
 //! in [`writer`].
@@ -96,6 +107,7 @@ pub mod index;
 pub mod lcid;
 pub mod names;
 pub mod numbering;
+pub mod read_styles;
 pub mod settings;
 pub mod styles;
 pub mod tables;
