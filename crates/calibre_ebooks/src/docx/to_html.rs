@@ -86,18 +86,15 @@
 //!   for this) and [`toc::Toc::to_ncx_toc`]. `docx.css` generation is
 //!   skipped -- `styles.rs`'s own `generate_css` gap (needs
 //!   `fonts.py`'s system font matching), not a new one.
-//!
-//! Not yet wired into `DOCXToHTML`, even though every piece it would
-//! need now exists: [`super::read_styles::read_raw_parts`]/
-//! [`super::read_styles::wire_parts`] parse `numbering.xml`/
-//! `styles.xml`/`settings.xml`/`theme1.xml`/`footnotes.xml`/
-//! `endnotes.xml` and wire them into fresh `Numbering`/`Styles`/
-//! `Footnotes`/`Theme`/`Settings` for [`convert_document`] to
-//! consume, and [`write_document`] handles [`convert_document`]'s
-//! output the same way `DOCXToHTML::convert` currently handles its
-//! own. Swapping `DOCXToHTML` out remains its own follow-up (still blocked
-//! on `resolve_alternate_content`/`fields.py`'s orchestrator, per
-//! above).
+//! - [`convert_docx_document`]: the real top-level entry point --
+//!   [`super::read_styles::read_raw_parts`]/
+//!   [`super::read_styles::wire_parts`] parse and wire every part,
+//!   [`convert_document`] runs, [`build_html_document`] wraps the
+//!   result, [`write_document`] writes it out -- the full equivalent
+//!   of `Convert.__call__()` (which itself calls `self.write(doc)` as
+//!   its own last line and returns *that* value). Not yet called from
+//!   anywhere -- see its own doc comment for why swapping it in for
+//!   `DOCXToHTML` needs its own follow-up.
 //!
 //! # What `convert_run` defers, and why
 //!
@@ -2813,6 +2810,142 @@ pub fn write_document(
     std::fs::write(dest_dir.join("toc.ncx"), ncx_xml)?;
 
     Ok(dest_dir.join("metadata.opf"))
+}
+
+/// Real top-level entry point: opens `docx`'s main document and every
+/// styling/numbering/footnote/theme/settings part
+/// [`super::read_styles::read_raw_parts`]/[`super::read_styles::wire_parts`]
+/// can find, runs [`convert_document`], wraps the result via
+/// [`build_html_document`], and writes `index.html`/`metadata.opf`/
+/// `toc.ncx` via [`write_document`] -- the real, full equivalent of
+/// Python's `Convert.__call__()`. Unlike this port's earlier
+/// per-piece functions, `Convert.__call__` itself calls `self.write(doc)`
+/// as its own last line and returns *that* value -- `write()`'s
+/// `metadata.opf` path, not an HTML string -- which is why this
+/// function's return type matches [`write_document`]'s rather than
+/// `DOCXToHTML::convert`'s.
+///
+/// Two pieces of `Convert.__call__` remain deliberately unported
+/// here, both blocked on the same open architectural question
+/// (issues #290/#293 -- see the module docs): `resolve_alternate_content`
+/// (near the very top of `__call__`, before `fields`/`read_styles`
+/// even run) and `self.fields(...)`/`self.fields.polish_markup(...)`.
+/// Skipping them means a document that relies on OOXML's
+/// `mc:AlternateContent` fallback mechanism, or on `HYPERLINK`/`REF`/
+/// `XE`/`NOTEREF` field codes, converts without whatever those would
+/// have contributed -- a disclosed, real gap, not a silent one.
+///
+/// `detect_cover`/`notes_text` mirror `Convert.__init__`'s
+/// same-named parameters; `notes_nopb`/`nosupsub` are **not** accepted
+/// here since their only consumer, `Styles::generate_css`, isn't
+/// ported (needs `fonts.py`'s system font matching -- see the module
+/// docs' `docx.css` note on [`write_document`]).
+///
+/// Not yet called from anywhere. Wiring this in to replace
+/// `DOCXToHTML` in `input/docx_input.rs` needs its own follow-up: this
+/// function returns a `metadata.opf` **path** (matching
+/// `Convert.__call__`'s own real return value), but the current
+/// `DOCXInput::convert` expects an HTML **string** it writes itself
+/// and hands to `HTMLInput` directly. Consuming an OPF-rooted book
+/// instead needs either a general OPF-based book loader this crate
+/// doesn't have yet, or a narrower docx-specific adapter -- not
+/// attempted here.
+pub fn convert_docx_document<R: Read + Seek>(
+    docx: &mut Docx<R>,
+    dest_dir: &Path,
+    detect_cover: bool,
+    notes_text: &str,
+) -> Result<PathBuf, DocxError> {
+    let ns = DocxNamespace::new(docx.is_transitional());
+    let doc_name = docx.document_name()?;
+    let rels = docx.document_relationships()?;
+
+    let raw_document = docx.read_str(&doc_name)?;
+    let document_doc = Document::parse(&raw_document)?;
+    let document = document_doc.root_element();
+    if !ns.is_tag(document, "w:document") {
+        return Err(DocxError::InvalidDocx(
+            "document.xml's root element is not w:document".to_string(),
+        ));
+    }
+
+    let raw_parts = super::read_styles::read_raw_parts(docx, &doc_name, &rels.by_type, &ns);
+    let settings_doc = raw_parts
+        .settings
+        .as_deref()
+        .and_then(|s| Document::parse(s).ok());
+    let footnotes_doc = raw_parts
+        .footnotes
+        .as_deref()
+        .and_then(|s| Document::parse(s).ok());
+    let endnotes_doc = raw_parts
+        .endnotes
+        .as_deref()
+        .and_then(|s| Document::parse(s).ok());
+    let theme_doc = raw_parts
+        .theme
+        .as_deref()
+        .and_then(|s| Document::parse(s).ok());
+    let styles_doc = raw_parts
+        .styles
+        .as_deref()
+        .and_then(|s| Document::parse(s).ok());
+    let numbering_doc = raw_parts
+        .numbering
+        .as_deref()
+        .and_then(|s| Document::parse(s).ok());
+
+    let mut settings = Settings::new();
+    let mut footnotes = Footnotes::new();
+    let mut theme = Theme::new();
+    let mut styles = Styles::new(super::tables::Tables::default());
+    let mut numbering = Numbering::new();
+
+    super::read_styles::wire_parts(
+        &mut settings,
+        &mut footnotes,
+        &mut theme,
+        &mut styles,
+        &mut numbering,
+        settings_doc.as_ref().map(Document::root_element),
+        footnotes_doc.as_ref().map(Document::root_element),
+        raw_parts.footnotes_rels,
+        endnotes_doc.as_ref().map(Document::root_element),
+        raw_parts.endnotes_rels,
+        theme_doc.as_ref().map(Document::root_element),
+        styles_doc.as_ref().map(Document::root_element),
+        numbering_doc.as_ref().map(Document::root_element),
+        &ns,
+    );
+
+    let mut images = Images::new();
+    let mi = docx.metadata();
+    let doc_lang = mi.languages.first().and_then(|l| docx_lang_to_html(l));
+    let uuid = uuid::Uuid::new_v4().simple().to_string();
+
+    let mut dom = Dom::empty();
+    let converted = convert_document(
+        &mut dom,
+        document,
+        &mut styles,
+        &mut numbering,
+        &mut footnotes,
+        &settings,
+        &theme,
+        &mut images,
+        docx,
+        doc_lang.as_deref(),
+        &uuid,
+        notes_text,
+        detect_cover,
+        dest_dir,
+        &rels,
+        &ns,
+    );
+
+    let html = build_html_document(&mut dom, converted.body, &mi.title, doc_lang.as_deref());
+
+    Ok(write_document(&dom, html, &mi, dest_dir, &converted)?)
 }
 
 /// A minimal, well-formed empty DOCX package -- just enough for
@@ -6594,5 +6727,107 @@ mod write_document_tests {
         let opf = std::fs::read_to_string(dir.path().join("metadata.opf")).unwrap();
         assert!(opf.contains(r#"type="toc""#));
         assert!(opf.contains("index.html#toc-anchor"));
+    }
+}
+
+#[cfg(test)]
+mod convert_docx_document_tests {
+    use super::*;
+    use std::io::{Cursor, Write};
+
+    const DOC_XML: &str = r#"<?xml version="1.0"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Chapter One</w:t></w:r></w:p>
+    <w:p><w:r><w:t>Hello, world.</w:t></w:r></w:p>
+  </w:body>
+</w:document>"#;
+
+    const CONTENT_TYPES: &str = r#"<?xml version="1.0"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"#;
+
+    const RELS: &str = r#"<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#;
+
+    const STYLES_XML: &str = r#"<?xml version="1.0"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:style w:type="paragraph" w:styleId="Heading1">
+    <w:name w:val="heading 1"/>
+  </w:style>
+</w:styles>"#;
+
+    fn minimal_docx() -> Docx<Cursor<Vec<u8>>> {
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let options = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (name, content) in [
+                ("[Content_Types].xml", CONTENT_TYPES),
+                ("_rels/.rels", RELS),
+                ("word/document.xml", DOC_XML),
+                ("word/styles.xml", STYLES_XML),
+            ] {
+                zip.start_file(name, options).unwrap();
+                zip.write_all(content.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        Docx::new(Cursor::new(buf)).expect("minimal docx package opens")
+    }
+
+    #[test]
+    fn converts_a_minimal_document_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut docx = minimal_docx();
+
+        let opf_path = convert_docx_document(&mut docx, dir.path(), true, "Notes")
+            .expect("conversion succeeds");
+
+        assert_eq!(opf_path, dir.path().join("metadata.opf"));
+
+        let index = std::fs::read_to_string(dir.path().join("index.html")).unwrap();
+        assert!(index.starts_with("<!DOCTYPE html>\n"));
+        assert!(index.contains("Chapter One"));
+        assert!(index.contains("Hello, world."));
+        assert!(
+            index.contains("<h1"),
+            "the Heading1 style retags to h1: {index}"
+        );
+
+        let opf = std::fs::read_to_string(&opf_path).unwrap();
+        assert!(opf.contains("index.html"));
+
+        let ncx = std::fs::read_to_string(dir.path().join("toc.ncx")).unwrap();
+        assert!(ncx.contains("Chapter One"));
+    }
+
+    #[test]
+    fn a_document_with_no_word_document_xml_is_an_error() {
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let options = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("[Content_Types].xml", options).unwrap();
+            zip.write_all(CONTENT_TYPES.as_bytes()).unwrap();
+            zip.start_file("_rels/.rels", options).unwrap();
+            zip.write_all(RELS.as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+        let mut docx =
+            Docx::new(Cursor::new(buf)).expect("package with no document.xml still opens");
+        let dir = tempfile::tempdir().unwrap();
+
+        let err = convert_docx_document(&mut docx, dir.path(), true, "Notes").unwrap_err();
+        assert!(
+            matches!(err, DocxError::InvalidDocx(_) | DocxError::MissingPart(_)),
+            "unexpected error variant: {err:?}"
+        );
     }
 }
