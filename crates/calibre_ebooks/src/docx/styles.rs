@@ -778,6 +778,19 @@ impl<'a, 'i> Styles<'a, 'i> {
             .collect()
     }
 
+    /// Read access to `numbering_style_links` (populated by
+    /// [`Styles::call`]) -- what `Numbering::call`'s second parameter
+    /// needs. Python's `Numbering.__call__(root, styles, rid_map)`
+    /// takes the whole `Styles` instance and reads
+    /// `styles.numbering_style_links` off it internally; this port's
+    /// `Numbering::call` takes that one map directly instead (see its
+    /// own doc comment), so `docx/read_styles.rs`'s orchestration
+    /// needs a way to read it back out of an already-populated
+    /// `Styles`.
+    pub fn numbering_style_links(&self) -> &HashMap<String, String> {
+        &self.numbering_style_links
+    }
+
     /// Registers a CSS class for every cached paragraph/run style with
     /// non-empty CSS.
     ///
