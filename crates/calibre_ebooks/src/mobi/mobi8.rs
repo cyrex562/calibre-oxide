@@ -15,17 +15,17 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use crate::dom::Dom;
 use crate::metadata::toc::{TOCNode, TOC};
 use crate::mobi::containers::{find_imgtype, Container};
-use crate::dom::Dom;
 use crate::mobi::headers::NULL_INDEX;
 use crate::mobi::index::read_index;
 use crate::mobi::markup::{expand_mobi8_markup, FlowInfo as MarkupFlowInfo, MobiReaderTrait};
 use crate::mobi::mobi6::MobiReader;
 use crate::mobi::ncx::{build_toc, read_ncx};
-use crate::mobi::opf_writer::{self, GuideRef};
 use crate::mobi::utils::{read_font_record, DEFAULT_FONT_XOR_EXTENT};
 use crate::mobi::MobiLog;
+use crate::opf_writer::{self, GuideRef};
 
 lazy_static! {
     static ref ID_RE: BytesRegex =
@@ -904,35 +904,10 @@ impl Mobi8Reader {
 
         // `create_manifest_from_files_in`: walk the output directory and
         // register every written file.
-        let mut manifest_pairs = Vec::new();
-        for entry in walkdir::WalkDir::new(output_dir)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let rel = entry
-                .path()
-                .strip_prefix(output_dir)
-                .unwrap_or(entry.path());
-            let rel_str = rel.to_string_lossy().replace('\\', "/");
-            if rel_str == "metadata.opf" || rel_str == "toc.ncx" || rel_str == "debug-raw.html" {
-                continue;
-            }
-            let mut mt = mime_guess::from_path(&rel_str)
-                .first()
-                .map(|m| m.to_string())
-                .unwrap_or_else(|| "application/octet-stream".to_string());
-            mt = match mt.as_str() {
-                "text/html" => "application/xhtml+xml".to_string(),
-                "font/ttf" => "application/x-font-truetype".to_string(),
-                "font/otf" => "application/vnd.ms-opentype".to_string(),
-                "font/woff" => "application/font-woff".to_string(),
-                other => other.to_string(),
-            };
-            manifest_pairs.push((rel_str, mt));
-        }
+        let manifest_pairs = crate::opf_writer::scan_directory_manifest(
+            output_dir,
+            &["metadata.opf", "toc.ncx", "debug-raw.html"],
+        );
         let manifest = opf_writer::auto_manifest(&manifest_pairs);
         let spine_ids: Vec<String> = spine
             .iter()

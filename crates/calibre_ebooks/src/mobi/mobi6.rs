@@ -22,14 +22,14 @@ use std::path::{Path, PathBuf};
 use crate::beautiful_soup::clean_xml_chars;
 use crate::chardet::strip_encoding_declarations;
 use crate::compression::palmdoc::decompress as decompress_doc;
+use crate::dom::{Dom, NodeId};
 use crate::html_entities::{decode_entities, xml_replace_entities};
 use crate::metadata::toc::{TOCNode, TOC};
 use crate::metadata::MetaInformation;
-use crate::dom::{Dom, NodeId};
 use crate::mobi::headers::BookHeader;
 use crate::mobi::huffcdic::HuffReader;
-use crate::mobi::opf_writer::{self, GuideRef};
 use crate::mobi::{MobiError, MobiLog};
+use crate::opf_writer::{self, GuideRef};
 
 lazy_static! {
     static ref PAGE_BREAK_PAT: Regex = Regex::new(

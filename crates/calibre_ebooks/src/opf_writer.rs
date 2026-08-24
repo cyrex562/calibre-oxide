@@ -1,14 +1,28 @@
-//! Minimal OPF/NCX package writer shared by [`crate::mobi::mobi6`] and
-//! [`crate::mobi::mobi8`].
+//! Minimal OPF/NCX package writer, shared across every output plugin
+//! that needs to hand-write a package rather than build one via
+//! `crate::oeb`'s in-memory `OEBBook` (currently [`crate::mobi::mobi6`]/
+//! [`crate::mobi::mobi8`] and `docx::to_html`'s not-yet-wired-up
+//! `write` step, issue #130/#288).
 //!
 //! Python's readers build these documents via
 //! `calibre.ebooks.metadata.opf2.OPFCreator`/`Guide` and
 //! `calibre.ebooks.metadata.toc.TOC`. This crate has no equivalent OPF
 //! *writer* yet (`crate::opf` only parses), so rather than duplicate a
-//! general-purpose OPF writer inside two unrelated reader modules, this
-//! file provides the narrow slice both MOBI readers need: an OPF 2.0
-//! package document (metadata + manifest + spine + guide) and an NCX
-//! 2005-1 document built from `crate::metadata::toc::TOC`.
+//! general-purpose OPF writer inside each unrelated reader/converter
+//! module, this file provides the narrow slice they actually need: an
+//! OPF 2.0 package document (metadata + manifest + spine + guide), an
+//! NCX 2005-1 document built from `crate::metadata::toc::TOC`, and
+//! ([`scan_directory_manifest`]) a manifest built by walking a
+//! directory of already-written files -- Python's
+//! `OPFCreator.create_manifest_from_files_in`.
+//!
+//! Relocated here (originally `mobi/opf_writer.rs`) once a second,
+//! unrelated module needed it -- same rationale as `crate::dom`'s and
+//! `crate::xmltree`'s own moves out of `mobi::`: don't build a second
+//! copy of a type/module that's already general-purpose, just widen
+//! its home.
+
+use std::path::Path;
 
 use crate::metadata::toc::{TOCNode, TOC};
 use crate::metadata::MetaInformation;
@@ -256,6 +270,53 @@ fn write_nav_point(out: &mut String, node: &TOCNode, play_order: &mut usize, ind
     out.push_str(&format!("{pad}</navPoint>\n"));
 }
 
+/// Walks `dir` for every already-written file, returning `(relative
+/// href, media type)` pairs -- pass to [`auto_manifest`] for a full
+/// [`ManifestItem`] list. `skip` is matched against the file's path
+/// relative to `dir` with `/`-separators (e.g. `"metadata.opf"`),
+/// letting a caller exclude package files it's about to write itself
+/// (this function doesn't know their names) or anything else that
+/// shouldn't be in the manifest.
+///
+/// Media types come from the file extension (falling back to
+/// `application/octet-stream`), with the same handful of remappings
+/// `crate::mobi::mobi8`'s own directory scan already used: `text/html`
+/// -> `application/xhtml+xml` (matches Python's own
+/// `guess_type('a.xhtml')` swap in both `mobi8.py` and `docx/to_html.py`'s
+/// `write`), and the three TrueType/OpenType/WOFF font types
+/// `mime_guess` names differently than EPUB/OPF readers expect.
+///
+/// Port of `OPFCreator.create_manifest_from_files_in`.
+pub fn scan_directory_manifest(dir: &Path, skip: &[&str]) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    for entry in walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let rel = entry.path().strip_prefix(dir).unwrap_or(entry.path());
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if skip.contains(&rel_str.as_str()) {
+            continue;
+        }
+        let mut mt = mime_guess::from_path(&rel_str)
+            .first()
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        mt = match mt.as_str() {
+            "text/html" => "application/xhtml+xml".to_string(),
+            "font/ttf" => "application/x-font-truetype".to_string(),
+            "font/otf" => "application/vnd.ms-opentype".to_string(),
+            "font/woff" => "application/font-woff".to_string(),
+            other => other.to_string(),
+        };
+        pairs.push((rel_str, mt));
+    }
+    pairs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,5 +407,66 @@ mod tests {
         assert_eq!(items[0].id, "id1");
         assert_eq!(items[1].id, "id2");
         assert_ne!(items[0].id, items[1].id);
+    }
+
+    mod scan_directory_manifest_tests {
+        use super::*;
+
+        #[test]
+        fn finds_every_file_and_maps_html_to_xhtml() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("index.html"), "<html/>").unwrap();
+            std::fs::write(dir.path().join("style.css"), "").unwrap();
+
+            let mut pairs = scan_directory_manifest(dir.path(), &[]);
+            pairs.sort();
+
+            assert_eq!(
+                pairs,
+                vec![
+                    (
+                        "index.html".to_string(),
+                        "application/xhtml+xml".to_string()
+                    ),
+                    ("style.css".to_string(), "text/css".to_string()),
+                ]
+            );
+        }
+
+        #[test]
+        fn skipped_names_are_excluded() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("index.html"), "<html/>").unwrap();
+            std::fs::write(dir.path().join("metadata.opf"), "").unwrap();
+            std::fs::write(dir.path().join("toc.ncx"), "").unwrap();
+
+            let pairs = scan_directory_manifest(dir.path(), &["metadata.opf", "toc.ncx"]);
+
+            assert_eq!(pairs.len(), 1);
+            assert_eq!(pairs[0].0, "index.html");
+        }
+
+        #[test]
+        fn nested_files_get_a_relative_forward_slash_path() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("images")).unwrap();
+            std::fs::write(dir.path().join("images/cover.jpg"), b"\xff\xd8").unwrap();
+
+            let pairs = scan_directory_manifest(dir.path(), &[]);
+
+            assert_eq!(pairs.len(), 1);
+            assert_eq!(pairs[0].0, "images/cover.jpg");
+            assert_eq!(pairs[0].1, "image/jpeg");
+        }
+
+        #[test]
+        fn an_unrecognized_extension_falls_back_to_octet_stream() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("data.bin"), b"\x00\x01").unwrap();
+
+            let pairs = scan_directory_manifest(dir.path(), &[]);
+
+            assert_eq!(pairs[0].1, "application/octet-stream");
+        }
     }
 }

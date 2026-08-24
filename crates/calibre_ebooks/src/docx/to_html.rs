@@ -74,18 +74,28 @@
 //!   together in `Convert.__call__`'s real sequence, plus `write`'s
 //!   own first line (`create_toc`) -- issue #288's remaining scope,
 //!   minus `resolve_alternate_content` (source-tree mutation, the
-//!   same open question as issues #290/#293), `fields.py`'s
-//!   `Fields` orchestrator (issue #290), and `write`'s OPF/NCX
-//!   serialization (needs generalizing `mobi/opf_writer.rs`) -- see
-//!   its own doc comment for exactly what's excluded and why.
+//!   same open question as issues #290/#293) and `fields.py`'s
+//!   `Fields` orchestrator (issue #290) -- see its own doc comment
+//!   for exactly what's excluded and why.
+//! - [`build_html_document`]/[`write_document`]: `Convert.__init__`'s
+//!   `<html><head>...` skeleton construction and `Convert.write`'s
+//!   `index.html`/`metadata.opf`/`toc.ncx` output, built on
+//!   [`crate::opf_writer`] (relocated out of `mobi/` and generalized
+//!   for this) and [`toc::Toc::to_ncx_toc`]. `docx.css` generation is
+//!   skipped -- `styles.rs`'s own `generate_css` gap (needs
+//!   `fonts.py`'s system font matching), not a new one.
 //!
-//! Not yet wired into `DOCXToHTML` -- that still needs a real
-//! `read_styles`-equivalent (parses `numbering.xml`/`styles.xml`/
-//! `settings.xml`/`theme1.xml`/`footnotes.xml`/`endnotes.xml` and
-//! wires them into fresh `Numbering`/`Styles`/`Footnotes`/`Theme`/
-//! `Settings` for [`convert_document`] to consume -- a multi-document
-//! lifetime-ownership design this module doesn't have yet), plus
-//! `write`'s OPF/NCX output.
+//! Not yet wired into `DOCXToHTML`, even though every piece it would
+//! need now exists: [`super::read_styles::read_raw_parts`]/
+//! [`super::read_styles::wire_parts`] parse `numbering.xml`/
+//! `styles.xml`/`settings.xml`/`theme1.xml`/`footnotes.xml`/
+//! `endnotes.xml` and wire them into fresh `Numbering`/`Styles`/
+//! `Footnotes`/`Theme`/`Settings` for [`convert_document`] to
+//! consume, and [`write_document`] handles [`convert_document`]'s
+//! output the same way `DOCXToHTML::convert` currently handles its
+//! own. Swapping `DOCXToHTML` out remains its own follow-up (still blocked
+//! on `resolve_alternate_content`/`fields.py`'s orchestrator, per
+//! above).
 //!
 //! # What `convert_run` defers, and why
 //!
@@ -121,6 +131,8 @@ use indexmap::IndexMap;
 use roxmltree::{Document, Node};
 
 use crate::dom::{Dom, NodeId, NodeKind};
+use crate::metadata::MetaInformation;
+use crate::opf_writer;
 
 use super::block_styles::{pt, Css, Edge, Frame, ParagraphStyle};
 use super::char_styles::RunStyle;
@@ -2486,6 +2498,73 @@ pub struct ConvertedDocument<'a, 'i> {
     pub resolved_link_map: HashMap<Node<'a, 'i>, NodeId>,
     pub cover_image: Option<PathBuf>,
     pub toc: Option<Toc>,
+    /// The anchor id a `TOC ` field's `w:instrText` generated, if any
+    /// -- `write`'s own `process_guide` uses this to add an
+    /// `index.html#{toc_anchor}` guide reference pointing readers at
+    /// wherever Word's own table-of-contents field landed. Port of
+    /// `Convert.toc_anchor`.
+    pub toc_anchor: Option<String>,
+}
+
+/// Wraps `body` (from [`convert_document`]) in the `<html><head>
+/// <meta charset><title><link rel=stylesheet></head>{body}</html>`
+/// skeleton `Convert.__init__` builds before conversion starts,
+/// appended under `dom.root`. `doc_lang` (already resolved by the
+/// caller -- the same value passed to [`convert_document`], so a
+/// run's own `lang` never gets marked redundant against the wrong
+/// language) becomes the `<html>`'s own `lang` attribute when present.
+///
+/// Every `.text`/`.tail` assignment in Python's own constructor is
+/// pure pretty-printing whitespace for lxml's serializer with no
+/// equivalent need here -- see the module docs' "No `Text` buffering"
+/// section.
+///
+/// Port of `Convert.__init__`'s `self.html` construction (the
+/// `self.doc_lang` resolution itself is [`docx_lang_to_html`], called
+/// once by the caller and threaded through both this function and
+/// [`convert_document`], not repeated here).
+pub fn build_html_document(
+    dom: &mut Dom,
+    body: NodeId,
+    title: &str,
+    doc_lang: Option<&str>,
+) -> NodeId {
+    let html = dom.new_element("html");
+    if let Some(lang) = doc_lang {
+        dom.node_mut(html)
+            .attrs
+            .insert("lang".to_string(), lang.to_string());
+    }
+
+    let head = dom.new_element("head");
+    let meta = dom.new_element("meta");
+    dom.node_mut(meta)
+        .attrs
+        .insert("charset".to_string(), "utf-8".to_string());
+    dom.append_child(head, meta);
+
+    let title_elem = dom.new_element("title");
+    let title_text = dom.new_text(if title.is_empty() { "Unknown" } else { title });
+    dom.append_child(title_elem, title_text);
+    dom.append_child(head, title_elem);
+
+    let link = dom.new_element("link");
+    dom.node_mut(link)
+        .attrs
+        .insert("rel".to_string(), "stylesheet".to_string());
+    dom.node_mut(link)
+        .attrs
+        .insert("type".to_string(), "text/css".to_string());
+    dom.node_mut(link)
+        .attrs
+        .insert("href".to_string(), "docx.css".to_string());
+    dom.append_child(head, link);
+
+    dom.append_child(html, head);
+    dom.append_child(html, body);
+    dom.append_child(dom.root, html);
+
+    html
 }
 
 /// The paragraph-walking-and-postprocessing heart of `Convert.__call__`:
@@ -2622,7 +2701,90 @@ pub fn convert_document<'a, 'i>(
         resolved_link_map,
         cover_image,
         toc,
+        toc_anchor: state.toc_anchor,
     }
+}
+
+/// Writes `dom`'s fully-converted document to `dest_dir`: `index.html`
+/// (`html` -- [`build_html_document`]'s return value -- prefixed with
+/// a `<!DOCTYPE html>` line, matching Python's `html.tostring(...,
+/// doctype='<!DOCTYPE html>')`), `metadata.opf`, and `toc.ncx`.
+///
+/// `styles.generate_css` (the `docx.css` `build_html_document`'s
+/// `<link>` points at) isn't ported -- needs `fonts.py`'s `Fonts`
+/// class, itself blocked on a system font scanner (`styles.rs`'s own
+/// module docs already note this gap) -- so `docx.css` is simply
+/// never written; the `<link>` stays, pointing at a file that doesn't
+/// exist, exactly as it would for any real document Python's own
+/// `generate_css` happened to return nothing for.
+///
+/// Returns `metadata.opf`'s path, matching Python's own return value.
+///
+/// Port of `Convert.write`, minus its own first line (`create_toc`,
+/// already computed by [`convert_document`] -- see
+/// [`ConvertedDocument::toc`]).
+pub fn write_document(
+    dom: &Dom,
+    html: NodeId,
+    mi: &MetaInformation,
+    dest_dir: &Path,
+    converted: &ConvertedDocument,
+) -> std::io::Result<PathBuf> {
+    let mut raw = String::from("<!DOCTYPE html>\n");
+    raw.push_str(&dom.serialize(html));
+    std::fs::write(dest_dir.join("index.html"), raw)?;
+
+    let manifest_pairs = opf_writer::scan_directory_manifest(dest_dir, &[]);
+    let manifest = opf_writer::auto_manifest(&manifest_pairs);
+    let spine_idrefs: Vec<String> = manifest
+        .iter()
+        .find(|m| m.href == "index.html")
+        .map(|m| vec![m.id.clone()])
+        .unwrap_or_default();
+
+    let cover_href = converted
+        .cover_image
+        .as_ref()
+        .and_then(|p| p.strip_prefix(dest_dir).ok())
+        .map(|p| p.to_string_lossy().replace('\\', "/"));
+
+    let mut guide = Vec::new();
+    if let Some(href) = &cover_href {
+        guide.push(opf_writer::GuideRef {
+            type_: "cover".to_string(),
+            title: "Cover".to_string(),
+            href: href.clone(),
+        });
+    }
+    if let Some(anchor) = &converted.toc_anchor {
+        guide.push(opf_writer::GuideRef {
+            type_: "toc".to_string(),
+            title: "Table of Contents".to_string(),
+            href: format!("index.html#{anchor}"),
+        });
+    }
+
+    let opf_xml = opf_writer::write_opf(
+        mi,
+        &manifest,
+        &spine_idrefs,
+        &guide,
+        Some("ncx"),
+        cover_href.as_deref(),
+        None,
+        None,
+    );
+    std::fs::write(dest_dir.join("metadata.opf"), opf_xml)?;
+
+    let ncx_toc = match &converted.toc {
+        Some(toc) => toc.to_ncx_toc(),
+        None => crate::metadata::toc::TOC { nodes: Vec::new() },
+    };
+    let ncx_xml =
+        opf_writer::write_ncx(&ncx_toc, mi.uuid.as_deref().unwrap_or("unknown"), &mi.title);
+    std::fs::write(dest_dir.join("toc.ncx"), ncx_xml)?;
+
+    Ok(dest_dir.join("metadata.opf"))
 }
 
 #[cfg(test)]
@@ -6002,5 +6164,108 @@ mod convert_document_tests {
         assert_eq!(top.len(), 2);
         assert_eq!(toc.node(top[0]).text.as_deref(), Some("Chapter One"));
         assert_eq!(toc.node(top[1]).text.as_deref(), Some("Chapter Two"));
+    }
+}
+
+#[cfg(test)]
+mod write_document_tests {
+    use super::*;
+    use crate::metadata::MetaInformation;
+
+    fn minimal_converted<'a, 'i>() -> ConvertedDocument<'a, 'i> {
+        ConvertedDocument {
+            body: NodeId::default(),
+            notes_header: None,
+            resolved_link_map: HashMap::new(),
+            cover_image: None,
+            toc: None,
+            toc_anchor: None,
+        }
+    }
+
+    fn html_doc(title: &str) -> (Dom, NodeId) {
+        let mut dom = Dom::empty();
+        let body = dom.new_element("body");
+        let p = dom.new_element("p");
+        let text = dom.new_text("hello world");
+        dom.append_child(p, text);
+        dom.append_child(body, p);
+        let html = build_html_document(&mut dom, body, title, None);
+        (dom, html)
+    }
+
+    #[test]
+    fn writes_index_html_with_doctype_and_body_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dom, html) = html_doc("My Book");
+        let mi = MetaInformation::new("My Book", vec!["An Author".to_string()]);
+        let converted = minimal_converted();
+
+        write_document(&dom, html, &mi, dir.path(), &converted).unwrap();
+
+        let index = std::fs::read_to_string(dir.path().join("index.html")).unwrap();
+        assert!(index.starts_with("<!DOCTYPE html>\n"));
+        assert!(index.contains("<title>My Book</title>"));
+        assert!(index.contains("hello world"));
+    }
+
+    #[test]
+    fn writes_metadata_opf_with_the_spine_pointing_at_index_html() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dom, html) = html_doc("My Book");
+        let mi = MetaInformation::new("My Book", vec!["An Author".to_string()]);
+        let converted = minimal_converted();
+
+        let opf_path = write_document(&dom, html, &mi, dir.path(), &converted).unwrap();
+
+        assert_eq!(opf_path, dir.path().join("metadata.opf"));
+        let opf = std::fs::read_to_string(&opf_path).unwrap();
+        assert!(opf.contains("index.html"));
+        assert!(opf.contains("An Author"));
+    }
+
+    #[test]
+    fn writes_a_non_empty_toc_ncx() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dom, html) = html_doc("My Book");
+        let mi = MetaInformation::new("My Book", vec!["An Author".to_string()]);
+        let converted = minimal_converted();
+
+        write_document(&dom, html, &mi, dir.path(), &converted).unwrap();
+
+        let ncx = std::fs::read_to_string(dir.path().join("toc.ncx")).unwrap();
+        assert!(ncx.contains("<ncx"));
+        assert!(ncx.contains("My Book"));
+    }
+
+    #[test]
+    fn a_cover_image_becomes_a_cover_guide_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cover.png"), b"not-really-a-png").unwrap();
+        let (dom, html) = html_doc("My Book");
+        let mi = MetaInformation::new("My Book", vec!["An Author".to_string()]);
+        let mut converted = minimal_converted();
+        converted.cover_image = Some(dir.path().join("cover.png"));
+
+        write_document(&dom, html, &mi, dir.path(), &converted).unwrap();
+
+        let opf = std::fs::read_to_string(dir.path().join("metadata.opf")).unwrap();
+        assert!(opf.contains(r#"type="cover""#));
+        assert!(opf.contains("cover.png"));
+    }
+
+    #[test]
+    fn a_toc_anchor_becomes_a_toc_guide_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dom, html) = html_doc("My Book");
+        let mi = MetaInformation::new("My Book", vec!["An Author".to_string()]);
+        let mut converted = minimal_converted();
+        converted.toc_anchor = Some("toc-anchor".to_string());
+
+        write_document(&dom, html, &mi, dir.path(), &converted).unwrap();
+
+        let opf = std::fs::read_to_string(dir.path().join("metadata.opf")).unwrap();
+        assert!(opf.contains(r#"type="toc""#));
+        assert!(opf.contains("index.html#toc-anchor"));
     }
 }

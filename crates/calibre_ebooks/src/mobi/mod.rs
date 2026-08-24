@@ -9,7 +9,6 @@ pub mod mobi6;
 pub mod mobi8;
 pub mod mobiml;
 pub mod ncx;
-pub mod opf_writer;
 pub mod reader;
 pub mod tweak;
 pub mod utils;
