@@ -22,7 +22,7 @@
 //! | `styles.py` (partial) | [`styles`] |
 //! | `fonts.py` (partial) | [`fonts`] |
 //! | `toc.py` | [`toc`] |
-//! | `images.py` (partial) | [`images`] |
+//! | `images.py` | [`images`] |
 //! | `fields.py` (partial) | [`fields`] |
 //! | `index.py` (partial) | [`index`] |
 //! | `cleanup.py` | [`cleanup`] |
@@ -47,13 +47,11 @@
 //! `to_html.py`'s own orchestration is tracked separately in issue
 //! #130 -- it needs the real HTML element tree ([`crate::dom`] as of
 //! that issue) fully wired into a `Convert`-equivalent orchestrator.
-//! `toc.py` is ported ([`toc`]) but, like everything below, not yet
-//! wired into one -- see issue #288. `images.py`'s geometry/CSS half
-//! and its `Images` struct (embedded-image extraction, resizing) are
-//! both ported ([`images`], issue #289); only the `w:drawing`/
-//! `w:pict` -> `<img>` markup generators (`pic_to_img`,
-//! `drawing_to_html`, `pict_to_html`, `to_html`) remain, a smaller
-//! follow-up now that everything they need is done. `fields.py`'s pure
+//! `toc.py` and `images.py` are both fully ported ([`toc`]/[`images`],
+//! issue #289 for the latter -- geometry/CSS, real embedded-image
+//! extraction/resizing, and the `w:drawing`/`w:pict` -> `<img>` markup
+//! generators are all done) but, like everything below, not yet wired
+//! into an orchestrator -- see issue #288. `fields.py`'s pure
 //! field-instruction parsing half is ported ([`fields`], issue #290);
 //! the `Fields` orchestrator itself (the source-tree field scanner,
 //! plus `parse_xe`'s synthetic-bookmark insertion) is a separate

@@ -67,9 +67,21 @@ use roxmltree::Node;
 
 use super::block_styles::{format_g, pt, Css};
 use super::container::Docx;
-use super::names::DocxNamespace;
+use super::names::{DocxNamespace, SVG_BLIP_URI};
 use super::styles::PageProperties;
+use crate::dom::{Dom, NodeId};
 use crate::oeb::transforms::rescale::fit_image;
+
+/// `'; '.join(f'{k}: {v}' for k, v in style.items())` -- note the space
+/// after the colon; [`pict_to_html`]'s `<hr>` styling uses the same
+/// join but *without* that space (`f'{k}:{v}'`), so this isn't reused
+/// there.
+fn css_to_style_string(css: &Css) -> String {
+    css.iter()
+        .map(|(k, v)| format!("{k}: {v}"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
 
 fn non_filename_char_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -459,17 +471,39 @@ fn resize_image(
     (buf.into_inner(), new_base, true)
 }
 
+/// One image's hyperlink, recorded by [`Images::pic_to_img`] for
+/// [`super::to_html::resolve_links`] to wrap the `<img>` in a real
+/// `<a>` later. Port of the `{'id':..., 'target':..., 'title':...}`
+/// dict Python builds from a `w:drawing`'s `a:hlinkClick`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageLink {
+    pub id: String,
+    pub target: Option<String>,
+    pub title: Option<String>,
+}
+
 /// Embedded-image extraction, deduplicated naming, optional resizing,
-/// and disk-writing, for one document's worth of `w:drawing`/`w:pict`
-/// image references. Port of the `Images` class -- minus `namespace`/
-/// `log`/`rid_map` (this port threads relationships through as an
-/// explicit parameter everywhere, not mutable instance state, matching
-/// every other function in `to_html.rs`), and minus `names`/`resized`
-/// (write-only fields in Python, never read anywhere in the file).
+/// disk-writing, and `w:drawing`/`w:pict` -> `<img>` markup generation,
+/// for one document's worth of image references. Port of the `Images`
+/// class -- minus `namespace`/`log`/`rid_map` (this port threads
+/// relationships through as an explicit parameter everywhere, not
+/// mutable instance state, matching every other function in
+/// `to_html.rs`), and minus `names`/`resized` (write-only fields in
+/// Python, never read anywhere in the file).
 #[derive(Debug, Clone, Default)]
 pub struct Images {
     used: HashMap<(String, Option<(u32, u32)>), String>,
     all_images: std::collections::HashSet<String>,
+    /// Every image found wrapped in a hyperlink, in the order
+    /// [`Images::pic_to_img`] created them, alongside the
+    /// relationships map that was current when it was recorded (a
+    /// footnote's images are recorded against that note's *own*
+    /// relationships, not the main document's -- matching Python's
+    /// per-tuple `self.rid_map` snapshot, since `self.rid_map` itself
+    /// is swapped out and restored around footnote conversion).
+    /// Consumed by [`super::to_html::resolve_links`]. Port of
+    /// `self.links`.
+    pub links: Vec<(NodeId, ImageLink, HashMap<String, String>)>,
 }
 
 impl Images {
@@ -564,6 +598,323 @@ impl Images {
         })?;
         self.all_images.insert(format!("images/{name}"));
         Ok(name)
+    }
+
+    /// Builds an `<img>` from `pic`'s embedded/linked blip (`a:blip`,
+    /// under a `pic:cNvPr` naming/alt-text carrier -- multiple of
+    /// either yields the *last* one, matching Python's unbroken
+    /// reassigning loops), returning `None` if `pic` has no readable
+    /// image at all. `name`/`alt` come from `pic:cNvPr`'s `name`/
+    /// `descr`; `title` is `get_image_properties`'s `wp:docPr` title,
+    /// *overridden* by a wrapping `a:hlinkClick`'s own `tooltip` if
+    /// present (a real behavior, not a bug: Python's `pic_to_img`
+    /// reuses its own `title` parameter name for this, so the
+    /// hyperlink's tooltip silently wins over the docPr title when
+    /// both exist). A blip's own `a:extLst` SVG alternative is
+    /// preferred over its raster embed/link when its relationship id
+    /// is known.
+    ///
+    /// Port of `Images.pic_to_img`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pic_to_img<'a, 'i, R: Read + Seek>(
+        &mut self,
+        dom: &mut Dom,
+        docx: &mut Docx<R>,
+        images_dir: &Path,
+        ns: &DocxNamespace,
+        pic: Node<'a, 'i>,
+        alt: Option<&str>,
+        parent: Node<'a, 'i>,
+        title: Option<&str>,
+        rid_map: &HashMap<String, String>,
+    ) -> Option<NodeId> {
+        let mut link: Option<ImageLink> = None;
+        let mut title = title.map(str::to_string);
+        for hl in ns.descendants(parent, &["a:hlinkClick"]) {
+            let Some(id) = ns.get(hl, "r:id") else {
+                continue;
+            };
+            let mut l = ImageLink {
+                id: id.to_string(),
+                target: None,
+                title: None,
+            };
+            if let Some(tgt) = ns.get(hl, "tgtFrame") {
+                l.target = Some(tgt.to_string());
+            }
+            if let Some(tt) = ns.get(hl, "tooltip") {
+                title = Some(tt.to_string());
+                l.title = Some(tt.to_string());
+            }
+            link = Some(l);
+        }
+
+        let mut alt = alt.map(str::to_string);
+        for pr in ns.descendants(pic, &["pic:cNvPr"]) {
+            let name = ns
+                .get(pr, "name")
+                .filter(|n| !n.is_empty())
+                .map(image_filename);
+            if let Some(descr) = ns.get(pr, "descr").filter(|s| !s.is_empty()) {
+                alt = Some(descr.to_string());
+            }
+
+            for a in ns.descendants(pic, &["a:blip"]) {
+                let mut rid = ns
+                    .get(a, "r:embed")
+                    .or_else(|| ns.get(a, "r:link"))
+                    .map(str::to_string);
+
+                'ext: for ext_lst in ns.children(a, &["a:extLst"]) {
+                    for ext in ns.children(ext_lst, &["a:ext"]) {
+                        if ns.get(ext, "uri") != Some(SVG_BLIP_URI) {
+                            continue;
+                        }
+                        for asvg in ns.children(ext, &["asvg:svgBlip"]) {
+                            let svg_rid =
+                                ns.get(asvg, "r:embed").or_else(|| ns.get(asvg, "r:link"));
+                            if let Some(svg_rid) = svg_rid {
+                                if rid_map.contains_key(svg_rid) {
+                                    rid = Some(svg_rid.to_string());
+                                    break 'ext;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let Some(rid) = rid else { continue };
+                if !rid_map.contains_key(&rid) {
+                    continue;
+                }
+
+                let src = match self.generate_filename(
+                    docx,
+                    images_dir,
+                    &rid,
+                    name.as_deref(),
+                    rid_map,
+                    None,
+                ) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+
+                let img = dom.new_element("img");
+                let alt_val = alt
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "Image".to_string());
+                dom.node_mut(img)
+                    .attrs
+                    .insert("src".to_string(), format!("images/{src}"));
+                dom.node_mut(img).attrs.insert("alt".to_string(), alt_val);
+                if let Some(t) = title.as_deref().filter(|t| !t.is_empty()) {
+                    dom.node_mut(img)
+                        .attrs
+                        .insert("title".to_string(), t.to_string());
+                }
+                if let Some(l) = link {
+                    self.links.push((img, l, rid_map.clone()));
+                }
+                return Some(img);
+            }
+        }
+        None
+    }
+
+    /// Builds one `<img>` per inline/floated picture in `drawing`
+    /// (`wp:inline`/`wp:anchor`), setting each one's CSS from
+    /// [`get_image_properties`] (and, for floats, [`get_float_properties`]
+    /// too) as an inline `style` attribute.
+    ///
+    /// Port of `Images.drawing_to_html`.
+    pub fn drawing_to_html<'a, 'i, R: Read + Seek>(
+        &mut self,
+        dom: &mut Dom,
+        docx: &mut Docx<R>,
+        images_dir: &Path,
+        ns: &DocxNamespace,
+        drawing: Node<'a, 'i>,
+        page: &PageProperties,
+        rid_map: &HashMap<String, String>,
+    ) -> Vec<NodeId> {
+        let mut out = Vec::new();
+
+        for inline in ns.children(drawing, &["wp:inline"]) {
+            let (style, alt, title) = get_image_properties(inline, ns);
+            for pic in ns.descendants(inline, &["pic:pic"]) {
+                if let Some(img) = self.pic_to_img(
+                    dom,
+                    docx,
+                    images_dir,
+                    ns,
+                    pic,
+                    alt.as_deref(),
+                    inline,
+                    title.as_deref(),
+                    rid_map,
+                ) {
+                    if !style.is_empty() {
+                        dom.node_mut(img)
+                            .attrs
+                            .insert("style".to_string(), css_to_style_string(&style));
+                    }
+                    out.push(img);
+                }
+            }
+        }
+
+        for anchor in ns.children(drawing, &["wp:anchor"]) {
+            let (mut style, alt, title) = get_image_properties(anchor, ns);
+            get_float_properties(anchor, &mut style, page, ns);
+            for pic in ns.descendants(anchor, &["pic:pic"]) {
+                if let Some(img) = self.pic_to_img(
+                    dom,
+                    docx,
+                    images_dir,
+                    ns,
+                    pic,
+                    alt.as_deref(),
+                    anchor,
+                    title.as_deref(),
+                    rid_map,
+                ) {
+                    if !style.is_empty() {
+                        dom.node_mut(img)
+                            .attrs
+                            .insert("style".to_string(), css_to_style_string(&style));
+                    }
+                    out.push(img);
+                }
+            }
+        }
+
+        out
+    }
+
+    /// Handles VML (`w:pict`) markup: a `<hr>` if `pict`'s sole element
+    /// child is a Word "insert horizontal line" shape (`o:hr`), styled
+    /// from `o:hrpct`/`o:hralign`; plus one `<img>` per `v:imagedata`
+    /// with a known relationship id, `display: block`-styled if its
+    /// parent `v:shape`'s own `style` attribute says
+    /// `position:absolute` (VML positions shapes via inline CSS the
+    /// same way `wp:anchor` uses DrawingML attributes).
+    ///
+    /// Port of `Images.pict_to_html`. A parent `v:shape` with no
+    /// `style` attribute at all is treated as simply not
+    /// `position:absolute` rather than reproducing Python's
+    /// `'position:absolute' in style` crash on `style` being `None`
+    /// (`get(elem, 'style')` with no default) -- nothing useful to
+    /// reproduce about a crash on malformed/unusual VML.
+    pub fn pict_to_html<R: Read + Seek>(
+        &mut self,
+        dom: &mut Dom,
+        docx: &mut Docx<R>,
+        images_dir: &Path,
+        ns: &DocxNamespace,
+        pict: Node,
+        rid_map: &HashMap<String, String>,
+    ) -> Vec<NodeId> {
+        let mut out = Vec::new();
+
+        let first_child = pict.children().find(|c| c.is_element());
+        let is_hr = first_child
+            .map(|c| matches!(ns.get(c, "o:hr"), Some("t") | Some("true")))
+            .unwrap_or(false);
+        if let (true, Some(first_child)) = (is_hr, first_child) {
+            let mut style = Css::new();
+            if let Some(pct) = ns
+                .get(first_child, "o:hrpct")
+                .and_then(|s| s.parse::<f64>().ok())
+            {
+                if pct > 0.0 {
+                    style.insert("width".to_string(), format!("{}%", format_g(pct, 3)));
+                }
+            }
+            let align = ns.get_or(first_child, "o:hralign", "center");
+            if align == "left" || align == "right" {
+                let (ml, mr) = if align == "left" {
+                    ("0", "auto")
+                } else {
+                    ("auto", "0")
+                };
+                style.insert("margin-left".to_string(), ml.to_string());
+                style.insert("margin-right".to_string(), mr.to_string());
+            }
+            let hr = dom.new_element("hr");
+            if !style.is_empty() {
+                let style_str = style
+                    .iter()
+                    .map(|(k, v)| format!("{k}:{v}"))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                dom.node_mut(hr)
+                    .attrs
+                    .insert("style".to_string(), style_str);
+            }
+            out.push(hr);
+        }
+
+        for imagedata in ns.descendants(pict, &["v:imagedata"]) {
+            let Some(rid) = ns.get(imagedata, "r:id") else {
+                continue;
+            };
+            if !rid_map.contains_key(rid) {
+                continue;
+            }
+            let src = match self.generate_filename(docx, images_dir, rid, None, rid_map, None) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let img = dom.new_element("img");
+            dom.node_mut(img)
+                .attrs
+                .insert("src".to_string(), format!("images/{src}"));
+            let alt = ns
+                .get(imagedata, "o:title")
+                .filter(|s| !s.is_empty())
+                .unwrap_or("Image");
+            dom.node_mut(img)
+                .attrs
+                .insert("alt".to_string(), alt.to_string());
+            if let Some(parent) = imagedata.parent() {
+                if let Some(pstyle) = ns.get(parent, "style") {
+                    if pstyle.contains("position:absolute") {
+                        dom.node_mut(img)
+                            .attrs
+                            .insert("style".to_string(), "display: block".to_string());
+                    }
+                }
+            }
+            out.push(img);
+        }
+
+        out
+    }
+
+    /// `drawing_to_html` for a `w:drawing` element, `pict_to_html` for
+    /// anything else (`w:pict`) -- creates `dest_dir/images/` if
+    /// needed first.
+    ///
+    /// Port of `Images.to_html`.
+    pub fn to_html<R: Read + Seek>(
+        &mut self,
+        dom: &mut Dom,
+        docx: &mut Docx<R>,
+        dest_dir: &Path,
+        ns: &DocxNamespace,
+        elem: Node,
+        page: &PageProperties,
+        rid_map: &HashMap<String, String>,
+    ) -> Vec<NodeId> {
+        let images_dir = dest_dir.join("images");
+        let _ = std::fs::create_dir_all(&images_dir);
+        if ns.is_tag(elem, "w:drawing") {
+            self.drawing_to_html(dom, docx, &images_dir, ns, elem, page, rid_map)
+        } else {
+            self.pict_to_html(dom, docx, &images_dir, ns, elem, rid_map)
+        }
     }
 }
 
@@ -1002,6 +1353,542 @@ mod tests {
             );
             assert!(images_dir.join(&name1).exists());
             assert!(images_dir.join(&name2).exists());
+        }
+
+        mod markup_tests {
+            use super::*;
+
+            const DOC_OPEN: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office""#;
+
+            fn parse(body: &str) -> (roxmltree::Document<'static>, DocxNamespace) {
+                let xml: &'static str =
+                    Box::leak(format!("<root {DOC_OPEN}>{body}</root>").into_boxed_str());
+                (
+                    roxmltree::Document::parse(xml).expect("valid XML"),
+                    DocxNamespace::default(),
+                )
+            }
+
+            fn pic_fragment(embed_rid: &str, name: &str) -> String {
+                format!(
+                    r#"<pic:pic>
+                     <pic:nvPicPr><pic:cNvPr id="1" name="{name}"/></pic:nvPicPr>
+                     <pic:blipFill><a:blip r:embed="{embed_rid}"/></pic:blipFill>
+                   </pic:pic>"#
+                )
+            }
+
+            mod pic_to_img_tests {
+                use super::*;
+
+                #[test]
+                fn a_pic_with_a_known_embed_becomes_an_img() {
+                    let (doc, ns) = parse(&pic_fragment("rId4", "pic1.png"));
+                    let pic = ns
+                        .descendants(doc.root_element(), &["pic:pic"])
+                        .into_iter()
+                        .next()
+                        .unwrap();
+                    let dir = tempfile::tempdir().unwrap();
+                    let images_dir = dir.path().join("images");
+                    let mut docx = docx_with_image("word/media/image1.png", &png_bytes(10, 10));
+                    let rid_map =
+                        HashMap::from([("rId4".to_string(), "word/media/image1.png".to_string())]);
+                    let mut images = Images::new();
+                    let mut dom = Dom::empty();
+
+                    let img = images
+                        .pic_to_img(
+                            &mut dom,
+                            &mut docx,
+                            &images_dir,
+                            &ns,
+                            pic,
+                            Some("fallback alt"),
+                            pic,
+                            None,
+                            &rid_map,
+                        )
+                        .unwrap();
+
+                    assert_eq!(dom.tag(img), Some("img"));
+                    assert!(dom
+                        .node(img)
+                        .attrs
+                        .get("src")
+                        .unwrap()
+                        .starts_with("images/"));
+                    assert_eq!(
+                        dom.node(img).attrs.get("alt").map(String::as_str),
+                        Some("fallback alt")
+                    );
+                }
+
+                #[test]
+                fn cnvpr_descr_overrides_the_passed_in_alt() {
+                    let (doc, ns) = parse(
+                        r#"<pic:pic>
+                         <pic:nvPicPr><pic:cNvPr id="1" name="pic1.png" descr="A cat"/></pic:nvPicPr>
+                         <pic:blipFill><a:blip r:embed="rId4"/></pic:blipFill>
+                       </pic:pic>"#,
+                    );
+                    let pic = ns
+                        .descendants(doc.root_element(), &["pic:pic"])
+                        .into_iter()
+                        .next()
+                        .unwrap();
+                    let dir = tempfile::tempdir().unwrap();
+                    let images_dir = dir.path().join("images");
+                    let mut docx = docx_with_image("word/media/image1.png", &png_bytes(10, 10));
+                    let rid_map =
+                        HashMap::from([("rId4".to_string(), "word/media/image1.png".to_string())]);
+                    let mut images = Images::new();
+                    let mut dom = Dom::empty();
+
+                    let img = images
+                        .pic_to_img(
+                            &mut dom,
+                            &mut docx,
+                            &images_dir,
+                            &ns,
+                            pic,
+                            Some("fallback alt"),
+                            pic,
+                            None,
+                            &rid_map,
+                        )
+                        .unwrap();
+
+                    assert_eq!(
+                        dom.node(img).attrs.get("alt").map(String::as_str),
+                        Some("A cat")
+                    );
+                }
+
+                #[test]
+                fn no_matching_blip_returns_none() {
+                    let (doc, ns) = parse(
+                        r#"<pic:pic><pic:nvPicPr><pic:cNvPr id="1" name="x"/></pic:nvPicPr></pic:pic>"#,
+                    );
+                    let pic = ns
+                        .descendants(doc.root_element(), &["pic:pic"])
+                        .into_iter()
+                        .next()
+                        .unwrap();
+                    let dir = tempfile::tempdir().unwrap();
+                    let mut docx = docx_with_image("word/media/image1.png", &png_bytes(10, 10));
+                    let mut images = Images::new();
+                    let mut dom = Dom::empty();
+
+                    let img = images.pic_to_img(
+                        &mut dom,
+                        &mut docx,
+                        &dir.path().join("images"),
+                        &ns,
+                        pic,
+                        None,
+                        pic,
+                        None,
+                        &HashMap::new(),
+                    );
+                    assert!(img.is_none());
+                }
+
+                #[test]
+                fn an_unknown_rid_is_skipped_and_returns_none() {
+                    let (doc, ns) = parse(&pic_fragment("rIdMissing", "pic1.png"));
+                    let pic = ns
+                        .descendants(doc.root_element(), &["pic:pic"])
+                        .into_iter()
+                        .next()
+                        .unwrap();
+                    let dir = tempfile::tempdir().unwrap();
+                    let mut docx = docx_with_image("word/media/image1.png", &png_bytes(10, 10));
+                    let rid_map =
+                        HashMap::from([("rId4".to_string(), "word/media/image1.png".to_string())]);
+                    let mut images = Images::new();
+                    let mut dom = Dom::empty();
+
+                    let img = images.pic_to_img(
+                        &mut dom,
+                        &mut docx,
+                        &dir.path().join("images"),
+                        &ns,
+                        pic,
+                        None,
+                        pic,
+                        None,
+                        &rid_map,
+                    );
+                    assert!(img.is_none());
+                }
+
+                #[test]
+                fn a_hyperlinked_picture_records_a_link_and_its_tooltip_overrides_the_title() {
+                    let (doc, ns) = parse(&format!(
+                        r#"<wp:inline>
+                         <a:hlinkClick r:id="rId8" tgtFrame="_blank" tooltip="See more"/>
+                         {}
+                       </wp:inline>"#,
+                        pic_fragment("rId4", "pic1.png")
+                    ));
+                    let parent = ns
+                        .descendants(doc.root_element(), &["wp:inline"])
+                        .into_iter()
+                        .next()
+                        .unwrap();
+                    let pic = ns
+                        .descendants(parent, &["pic:pic"])
+                        .into_iter()
+                        .next()
+                        .unwrap();
+                    let dir = tempfile::tempdir().unwrap();
+                    let images_dir = dir.path().join("images");
+                    let mut docx = docx_with_image("word/media/image1.png", &png_bytes(10, 10));
+                    let rid_map =
+                        HashMap::from([("rId4".to_string(), "word/media/image1.png".to_string())]);
+                    let mut images = Images::new();
+                    let mut dom = Dom::empty();
+
+                    let img = images
+                        .pic_to_img(
+                            &mut dom,
+                            &mut docx,
+                            &images_dir,
+                            &ns,
+                            pic,
+                            None,
+                            parent,
+                            Some("docPr title"),
+                            &rid_map,
+                        )
+                        .unwrap();
+
+                    assert_eq!(images.links.len(), 1);
+                    let (linked_img, link, _) = &images.links[0];
+                    assert_eq!(*linked_img, img);
+                    assert_eq!(link.id, "rId8");
+                    assert_eq!(link.target.as_deref(), Some("_blank"));
+                    assert_eq!(link.title.as_deref(), Some("See more"));
+                    assert_eq!(
+                        dom.node(img).attrs.get("title").map(String::as_str),
+                        Some("See more")
+                    );
+                }
+            }
+
+            mod drawing_to_html_tests {
+                use super::*;
+
+                fn page() -> PageProperties {
+                    PageProperties {
+                        width: 612.0,
+                        height: 792.0,
+                        margin_left: 72.0,
+                        margin_right: 72.0,
+                    }
+                }
+
+                #[test]
+                fn an_inline_picture_gets_its_extent_as_a_style() {
+                    let (doc, ns) = parse(&format!(
+                        r#"<w:drawing>
+                         <wp:inline>
+                           <wp:extent cx="914400" cy="457200"/>
+                           {}
+                         </wp:inline>
+                       </w:drawing>"#,
+                        pic_fragment("rId4", "pic1.png")
+                    ));
+                    let drawing = ns
+                        .descendants(doc.root_element(), &["w:drawing"])
+                        .into_iter()
+                        .next()
+                        .unwrap();
+                    let dir = tempfile::tempdir().unwrap();
+                    let images_dir = dir.path().join("images");
+                    let mut docx = docx_with_image("word/media/image1.png", &png_bytes(10, 10));
+                    let rid_map =
+                        HashMap::from([("rId4".to_string(), "word/media/image1.png".to_string())]);
+                    let mut images = Images::new();
+                    let mut dom = Dom::empty();
+
+                    let imgs = images.drawing_to_html(
+                        &mut dom,
+                        &mut docx,
+                        &images_dir,
+                        &ns,
+                        drawing,
+                        &page(),
+                        &rid_map,
+                    );
+
+                    assert_eq!(imgs.len(), 1);
+                    assert_eq!(
+                        dom.node(imgs[0]).attrs.get("style").map(String::as_str),
+                        Some("width: 72pt; height: 36pt")
+                    );
+                }
+
+                #[test]
+                fn a_floated_anchor_picture_gets_float_properties_applied() {
+                    let (doc, ns) = parse(&format!(
+                        r#"<w:drawing>
+                         <wp:anchor>
+                           <wp:positionH relativeFrom="page"><wp:align>left</wp:align></wp:positionH>
+                           <wp:wrapSquare wrapText="bothSides"/>
+                           {}
+                         </wp:anchor>
+                       </w:drawing>"#,
+                        pic_fragment("rId4", "pic1.png")
+                    ));
+                    let drawing = ns
+                        .descendants(doc.root_element(), &["w:drawing"])
+                        .into_iter()
+                        .next()
+                        .unwrap();
+                    let dir = tempfile::tempdir().unwrap();
+                    let images_dir = dir.path().join("images");
+                    let mut docx = docx_with_image("word/media/image1.png", &png_bytes(10, 10));
+                    let rid_map =
+                        HashMap::from([("rId4".to_string(), "word/media/image1.png".to_string())]);
+                    let mut images = Images::new();
+                    let mut dom = Dom::empty();
+
+                    let imgs = images.drawing_to_html(
+                        &mut dom,
+                        &mut docx,
+                        &images_dir,
+                        &ns,
+                        drawing,
+                        &page(),
+                        &rid_map,
+                    );
+
+                    assert_eq!(imgs.len(), 1);
+                    let style = dom
+                        .node(imgs[0])
+                        .attrs
+                        .get("style")
+                        .cloned()
+                        .unwrap_or_default();
+                    assert!(style.contains("float: left"), "style was: {style}");
+                }
+
+                #[test]
+                fn no_pictures_yields_no_images() {
+                    let (doc, ns) = parse("<w:drawing><wp:inline/></w:drawing>");
+                    let drawing = ns
+                        .descendants(doc.root_element(), &["w:drawing"])
+                        .into_iter()
+                        .next()
+                        .unwrap();
+                    let dir = tempfile::tempdir().unwrap();
+                    let mut docx = docx_with_image("word/media/image1.png", &png_bytes(10, 10));
+                    let mut images = Images::new();
+                    let mut dom = Dom::empty();
+
+                    let imgs = images.drawing_to_html(
+                        &mut dom,
+                        &mut docx,
+                        &dir.path().join("images"),
+                        &ns,
+                        drawing,
+                        &page(),
+                        &HashMap::new(),
+                    );
+                    assert!(imgs.is_empty());
+                }
+            }
+
+            mod pict_to_html_tests {
+                use super::*;
+
+                #[test]
+                fn a_horizontal_rule_shape_becomes_an_hr() {
+                    let (doc, ns) = parse(
+                        r#"<w:pict><v:rect o:hr="t" o:hrpct="50" o:hralign="left"/></w:pict>"#,
+                    );
+                    let pict = ns
+                        .descendants(doc.root_element(), &["w:pict"])
+                        .into_iter()
+                        .next()
+                        .unwrap();
+                    let dir = tempfile::tempdir().unwrap();
+                    let mut docx = docx_with_image("word/media/image1.png", &png_bytes(10, 10));
+                    let mut images = Images::new();
+                    let mut dom = Dom::empty();
+
+                    let out = images.pict_to_html(
+                        &mut dom,
+                        &mut docx,
+                        &dir.path().join("images"),
+                        &ns,
+                        pict,
+                        &HashMap::new(),
+                    );
+
+                    assert_eq!(out.len(), 1);
+                    assert_eq!(dom.tag(out[0]), Some("hr"));
+                    let style = dom
+                        .node(out[0])
+                        .attrs
+                        .get("style")
+                        .cloned()
+                        .unwrap_or_default();
+                    assert!(style.contains("width:50%"), "style was: {style}");
+                    assert!(style.contains("margin-left:0"), "style was: {style}");
+                }
+
+                #[test]
+                fn v_imagedata_becomes_an_img() {
+                    let (doc, ns) = parse(
+                        r#"<w:pict><v:shape><v:imagedata r:id="rId4" o:title="A cat"/></v:shape></w:pict>"#,
+                    );
+                    let pict = ns
+                        .descendants(doc.root_element(), &["w:pict"])
+                        .into_iter()
+                        .next()
+                        .unwrap();
+                    let dir = tempfile::tempdir().unwrap();
+                    let images_dir = dir.path().join("images");
+                    let mut docx = docx_with_image("word/media/image1.png", &png_bytes(10, 10));
+                    let rid_map =
+                        HashMap::from([("rId4".to_string(), "word/media/image1.png".to_string())]);
+                    let mut images = Images::new();
+                    let mut dom = Dom::empty();
+
+                    let out =
+                        images.pict_to_html(&mut dom, &mut docx, &images_dir, &ns, pict, &rid_map);
+
+                    assert_eq!(out.len(), 1);
+                    assert_eq!(dom.tag(out[0]), Some("img"));
+                    assert_eq!(
+                        dom.node(out[0]).attrs.get("alt").map(String::as_str),
+                        Some("A cat")
+                    );
+                }
+
+                #[test]
+                fn an_absolutely_positioned_shapes_image_gets_display_block() {
+                    let (doc, ns) = parse(
+                        r#"<w:pict><v:shape style="position:absolute;left:0"><v:imagedata r:id="rId4"/></v:shape></w:pict>"#,
+                    );
+                    let pict = ns
+                        .descendants(doc.root_element(), &["w:pict"])
+                        .into_iter()
+                        .next()
+                        .unwrap();
+                    let dir = tempfile::tempdir().unwrap();
+                    let images_dir = dir.path().join("images");
+                    let mut docx = docx_with_image("word/media/image1.png", &png_bytes(10, 10));
+                    let rid_map =
+                        HashMap::from([("rId4".to_string(), "word/media/image1.png".to_string())]);
+                    let mut images = Images::new();
+                    let mut dom = Dom::empty();
+
+                    let out =
+                        images.pict_to_html(&mut dom, &mut docx, &images_dir, &ns, pict, &rid_map);
+
+                    assert_eq!(
+                        dom.node(out[0]).attrs.get("style").map(String::as_str),
+                        Some("display: block")
+                    );
+                }
+
+                #[test]
+                fn an_unknown_rid_is_skipped() {
+                    let (doc, ns) = parse(
+                        r#"<w:pict><v:shape><v:imagedata r:id="rIdMissing"/></v:shape></w:pict>"#,
+                    );
+                    let pict = ns
+                        .descendants(doc.root_element(), &["w:pict"])
+                        .into_iter()
+                        .next()
+                        .unwrap();
+                    let dir = tempfile::tempdir().unwrap();
+                    let mut docx = docx_with_image("word/media/image1.png", &png_bytes(10, 10));
+                    let mut images = Images::new();
+                    let mut dom = Dom::empty();
+
+                    let out = images.pict_to_html(
+                        &mut dom,
+                        &mut docx,
+                        &dir.path().join("images"),
+                        &ns,
+                        pict,
+                        &HashMap::new(),
+                    );
+                    assert!(out.is_empty());
+                }
+            }
+
+            mod to_html_tests {
+                use super::*;
+
+                fn page() -> PageProperties {
+                    PageProperties::default()
+                }
+
+                #[test]
+                fn a_w_drawing_element_dispatches_to_drawing_to_html_and_creates_the_images_dir() {
+                    let (doc, ns) = parse(&format!(
+                        r#"<w:drawing><wp:inline>{}</wp:inline></w:drawing>"#,
+                        pic_fragment("rId4", "pic1.png")
+                    ));
+                    let drawing = ns
+                        .descendants(doc.root_element(), &["w:drawing"])
+                        .into_iter()
+                        .next()
+                        .unwrap();
+                    let dir = tempfile::tempdir().unwrap();
+                    let mut docx = docx_with_image("word/media/image1.png", &png_bytes(10, 10));
+                    let rid_map =
+                        HashMap::from([("rId4".to_string(), "word/media/image1.png".to_string())]);
+                    let mut images = Images::new();
+                    let mut dom = Dom::empty();
+
+                    let out = images.to_html(
+                        &mut dom,
+                        &mut docx,
+                        dir.path(),
+                        &ns,
+                        drawing,
+                        &page(),
+                        &rid_map,
+                    );
+
+                    assert_eq!(out.len(), 1);
+                    assert!(dir.path().join("images").is_dir());
+                }
+
+                #[test]
+                fn a_w_pict_element_dispatches_to_pict_to_html() {
+                    let (doc, ns) = parse(r#"<w:pict><v:rect o:hr="t"/></w:pict>"#);
+                    let pict = ns
+                        .descendants(doc.root_element(), &["w:pict"])
+                        .into_iter()
+                        .next()
+                        .unwrap();
+                    let dir = tempfile::tempdir().unwrap();
+                    let mut docx = docx_with_image("word/media/image1.png", &png_bytes(10, 10));
+                    let mut images = Images::new();
+                    let mut dom = Dom::empty();
+
+                    let out = images.to_html(
+                        &mut dom,
+                        &mut docx,
+                        dir.path(),
+                        &ns,
+                        pict,
+                        &page(),
+                        &HashMap::new(),
+                    );
+
+                    assert_eq!(out.len(), 1);
+                    assert_eq!(dom.tag(out[0]), Some("hr"));
+                }
+            }
         }
     }
 }
