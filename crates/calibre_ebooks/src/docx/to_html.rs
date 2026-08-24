@@ -1359,24 +1359,39 @@ fn process_block_run<'a, 'i>(
 /// one, matching the run's own span directly if there's only one),
 /// relabels it `<a>`, and sets `href` from either the relationship
 /// its `r:id` points at or an internal `w:anchor` resolved against
-/// `state.anchor_map`.
+/// `state.anchor_map`. Then wraps every `images.links`-tracked `<img>`
+/// (issue #289's `pic_to_img`) in its own `<a>` the same way, from
+/// `link.id`/`.target`/`.title` and the note-or-document relationships
+/// captured alongside it (since a footnote's images.links entries were
+/// recorded against that note's *own* relationships, not the main
+/// document's).
 ///
 /// Returns `hyperlink -> <a>` (Python's `self.resolved_link_map`),
-/// which `toc.py`'s `create_toc` (issue #292) will need.
+/// which `toc.py`'s `create_toc` (issue #292) needs.
 ///
-/// Port of the `self.link_map`-driven first block of
-/// `Convert.resolve_links`. Two of Python's three link sources are
-/// deliberately not ported here (see issue #283): `self.fields.
-/// hyperlink_fields` (needs `fields.py`, issue #290) and
-/// `self.images.links` (needs `images.py`, issue #289) -- both are
-/// separate loops appended to this same method in Python once those
-/// files exist, not a rewrite of this one. A hyperlink whose `r:id`/
-/// `w:anchor` resolves to nothing is silently left without an `href`
-/// rather than logged, since no logger is threaded through this
-/// module yet.
+/// Port of the `self.link_map`- and `self.images.links`-driven blocks
+/// of `Convert.resolve_links`. The remaining block, `self.fields.
+/// hyperlink_fields`, is deliberately not ported here (see issue
+/// #283): it needs `fields.py`'s `Fields` orchestrator (issue #290),
+/// not yet built. A hyperlink whose `r:id`/`w:anchor` resolves to
+/// nothing is silently left without an `href` rather than logged,
+/// since no logger is threaded through this module yet.
+///
+/// The `images.links` block skips a whole dance Python needs and this
+/// doesn't: `a = A(img); a.tail, img.tail = img.tail, None; parent.insert(idx, a)`
+/// exists only to carry `img`'s lxml `.tail` (the text between it and
+/// its next sibling) over to the new wrapping `<a>`, since in lxml
+/// that trailing text is a property *of the element being replaced*,
+/// not a sibling node. In this crate's sibling-text-node model that
+/// trailing text already **is** a separate sibling -- moving `img`
+/// into `a` and reinserting `a` at `img`'s old position leaves that
+/// sibling exactly where it was, already correctly following `a`
+/// instead of `img`. (Same observation `docx/index.rs`'s and
+/// `docx/cleanup.rs`'s module docs make for `split_up_block`/`lift`.)
 pub fn resolve_links<'a, 'i>(
     dom: &mut Dom,
     state: &ConvertState<'a, 'i>,
+    images: &super::images::Images,
     ns: &DocxNamespace,
 ) -> HashMap<Node<'a, 'i>, NodeId> {
     let mut resolved_link_map = HashMap::new();
@@ -1421,6 +1436,42 @@ pub fn resolve_links<'a, 'i>(
         });
         if let Some(href) = href {
             dom.node_mut(span).attrs.insert("href".to_string(), href);
+        }
+    }
+
+    for (img, link, relationships_by_id) in &images.links {
+        let Some(parent) = dom.parent(*img) else {
+            continue;
+        };
+        let Some(idx) = dom.index_in_parent(*img) else {
+            continue;
+        };
+        let a = dom.new_element("a");
+        dom.append_child(a, *img);
+        dom.insert_child(parent, idx, a);
+
+        if let Some(tgt) = &link.target {
+            dom.node_mut(a)
+                .attrs
+                .insert("target".to_string(), tgt.clone());
+        }
+        if let Some(tt) = &link.title {
+            dom.node_mut(a)
+                .attrs
+                .insert("title".to_string(), tt.clone());
+        }
+        if let Some(dest) = relationships_by_id.get(&link.id) {
+            if let Some(frag) = dest.strip_prefix('#') {
+                if let Some(id) = state.anchor_map.get(frag) {
+                    dom.node_mut(a)
+                        .attrs
+                        .insert("href".to_string(), format!("#{id}"));
+                }
+            } else {
+                dom.node_mut(a)
+                    .attrs
+                    .insert("href".to_string(), dest.clone());
+            }
         }
     }
 
@@ -3732,6 +3783,7 @@ mod mark_block_runs_tests {
 #[cfg(test)]
 mod resolve_links_tests {
     use super::*;
+    use crate::docx::images::{ImageLink, Images};
     use crate::docx::tables::Tables;
     use roxmltree::Document;
 
@@ -3799,7 +3851,7 @@ mod resolve_links_tests {
         let mut h = Harness::new();
         h.convert(doc.root_element(), &ns, &rels);
 
-        let resolved = resolve_links(&mut h.dom, &h.state, &ns);
+        let resolved = resolve_links(&mut h.dom, &h.state, &Images::new(), &ns);
         assert_eq!(resolved.len(), 1);
         let &span = resolved.values().next().unwrap();
         assert_eq!(h.dom.tag(span), Some("a"));
@@ -3820,7 +3872,7 @@ mod resolve_links_tests {
             .insert("chap1".to_string(), "id_chap1".to_string());
         h.convert(doc.root_element(), &ns, &Relationships::default());
 
-        let resolved = resolve_links(&mut h.dom, &h.state, &ns);
+        let resolved = resolve_links(&mut h.dom, &h.state, &Images::new(), &ns);
         let &span = resolved.values().next().unwrap();
         assert_eq!(
             h.dom.node(span).attrs.get("href").map(String::as_str),
@@ -3838,7 +3890,7 @@ mod resolve_links_tests {
         let dest = h.convert(doc.root_element(), &ns, &rels);
         assert_eq!(h.dom.children(dest).len(), 2, "still two separate spans");
 
-        resolve_links(&mut h.dom, &h.state, &ns);
+        resolve_links(&mut h.dom, &h.state, &Images::new(), &ns);
 
         let children = h.dom.children(dest);
         assert_eq!(children.len(), 1, "merged into one wrapper");
@@ -3872,7 +3924,7 @@ mod resolve_links_tests {
         let mut h = Harness::new();
         h.convert(doc.root_element(), &ns, &Relationships::default());
 
-        let resolved = resolve_links(&mut h.dom, &h.state, &ns);
+        let resolved = resolve_links(&mut h.dom, &h.state, &Images::new(), &ns);
         let &span = resolved.values().next().unwrap();
         assert_eq!(h.dom.tag(span), Some("a"));
         assert!(h.dom.node(span).attrs.get("href").is_none());
@@ -3887,7 +3939,7 @@ mod resolve_links_tests {
         let mut h = Harness::new();
         h.convert(doc.root_element(), &ns, &rels);
 
-        let resolved = resolve_links(&mut h.dom, &h.state, &ns);
+        let resolved = resolve_links(&mut h.dom, &h.state, &Images::new(), &ns);
         let &span = resolved.values().next().unwrap();
         assert_eq!(
             h.dom.node(span).attrs.get("target").map(String::as_str),
@@ -3911,6 +3963,107 @@ mod resolve_links_tests {
         assert_eq!(h.state.link_map.len(), 1);
         let spans_tracked: usize = h.state.link_map.values().map(Vec::len).sum();
         assert_eq!(spans_tracked, 1, "the trailing plain run isn't tracked");
+    }
+
+    mod images_links_tests {
+        use super::*;
+
+        #[test]
+        fn a_linked_image_gets_wrapped_in_an_a_with_its_href_resolved() {
+            let mut dom = Dom::empty();
+            let p = dom.new_element("p");
+            let img = dom.new_element("img");
+            dom.node_mut(img)
+                .attrs
+                .insert("src".to_string(), "images/pic.png".to_string());
+            dom.append_child(p, img);
+
+            let mut images = Images::new();
+            let link = ImageLink {
+                id: "rId9".to_string(),
+                target: Some("_blank".to_string()),
+                title: Some("A tooltip".to_string()),
+            };
+            let rels = HashMap::from([("rId9".to_string(), "https://example.com/".to_string())]);
+            images.links.push((img, link, rels));
+
+            let state = ConvertState::new();
+            let ns = DocxNamespace::default();
+            resolve_links(&mut dom, &state, &images, &ns);
+
+            assert_eq!(dom.children(p).len(), 1);
+            let a = dom.children(p)[0];
+            assert_eq!(dom.tag(a), Some("a"));
+            assert_eq!(dom.children(a), vec![img]);
+            assert_eq!(
+                dom.node(a).attrs.get("target").map(String::as_str),
+                Some("_blank")
+            );
+            assert_eq!(
+                dom.node(a).attrs.get("title").map(String::as_str),
+                Some("A tooltip")
+            );
+            assert_eq!(
+                dom.node(a).attrs.get("href").map(String::as_str),
+                Some("https://example.com/")
+            );
+        }
+
+        #[test]
+        fn an_internal_fragment_target_resolves_against_the_anchor_map() {
+            let mut dom = Dom::empty();
+            let p = dom.new_element("p");
+            let img = dom.new_element("img");
+            dom.append_child(p, img);
+
+            let mut images = Images::new();
+            let link = ImageLink {
+                id: "rId9".to_string(),
+                target: None,
+                title: None,
+            };
+            let rels = HashMap::from([("rId9".to_string(), "#chap1".to_string())]);
+            images.links.push((img, link, rels));
+
+            let mut state = ConvertState::new();
+            state
+                .anchor_map
+                .insert("chap1".to_string(), "id_chap1".to_string());
+            let ns = DocxNamespace::default();
+            resolve_links(&mut dom, &state, &images, &ns);
+
+            let a = dom.children(p)[0];
+            assert_eq!(
+                dom.node(a).attrs.get("href").map(String::as_str),
+                Some("#id_chap1")
+            );
+        }
+
+        #[test]
+        fn the_images_own_trailing_text_stays_right_after_the_new_a() {
+            let mut dom = Dom::empty();
+            let p = dom.new_element("p");
+            let before = dom.new_text("before ");
+            dom.append_child(p, before);
+            let img = dom.new_element("img");
+            dom.append_child(p, img);
+            let after = dom.new_text(" after");
+            dom.append_child(p, after);
+
+            let mut images = Images::new();
+            let link = ImageLink {
+                id: "rId9".to_string(),
+                target: None,
+                title: None,
+            };
+            images.links.push((img, link, HashMap::new()));
+
+            let state = ConvertState::new();
+            let ns = DocxNamespace::default();
+            resolve_links(&mut dom, &state, &images, &ns);
+
+            assert_eq!(dom.serialize(p), r#"<p>before <a><img /></a> after</p>"#);
+        }
     }
 }
 

@@ -630,7 +630,12 @@ mod from_toc_tests {
             &ns,
         );
 
-        let resolved = crate::docx::to_html::resolve_links(&mut dom, &state, &ns);
+        let resolved = crate::docx::to_html::resolve_links(
+            &mut dom,
+            &state,
+            &crate::docx::images::Images::new(),
+            &ns,
+        );
 
         let toc = from_toc(
             document,
