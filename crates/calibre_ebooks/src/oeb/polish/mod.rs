@@ -73,6 +73,7 @@ pub mod smartypants;
 pub mod spell;
 pub mod split;
 pub mod stats;
+pub mod style;
 pub mod subset;
 pub mod toc;
 pub mod upgrade;

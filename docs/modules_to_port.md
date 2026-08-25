@@ -380,11 +380,11 @@ either -- this pass wasn't exhaustive.
 - [x] `__init__.py` -> `docx/writer/mod.rs`
 - [x] `container.py` -> `docx/writer/container.rs` (plus `writer/xml.rs`, the element builder replacing `lxml.builder`)
 - [x] `fonts.py` -> `docx/writer/fonts.rs`
-- [ ] from_html.py (needs a real OEB stylizer — see #132)
-- [ ] images.py (see #132)
+- [ ] from_html.py (see #132 — its "needs a real OEB stylizer" premise was stale: `oeb/polish/cascade.rs`'s real CSS cascade already existed, just for a different consumer (issue #164); `oeb/polish/style.rs` now ports the accessor half of `stylizer.py`'s `Style` class against it — `get`/`own`/`item`/`color`/`background_color`/`font_size`/`line_height`/`effective_text_decoration`/`first_vertical_align`/`is_hidden`/`width`/`height`/margins/paddings — the exact surface `styles.py`/`from_html.py` read. `from_html.py`'s own orchestrator (walking the OEB spine, building `w:p`/`w:r`) isn't ported yet)
+- [ ] images.py (see #132; also needs `pt_to_emu` from the reader's `images.py`, already ported — #130)
 - [ ] links.py (see #132)
 - [ ] lists.py (see #132)
-- [ ] styles.py (needs a real OEB stylizer — see #132)
+- [ ] styles.py (see #132 — same stale premise as `from_html.py`, `oeb/polish/style.rs` is the seam it needs. `TextStyle`/`BlockStyle`/`DescendantTextStyle`/`FloatSpec`/`StylesManager` aren't ported yet)
 - [ ] tables.py (see #132)
 - [ ] TODO (upstream notes file, nothing to port)
 - [x] `utils.py` -> `docx/writer/utils.rs` (with the `tinycss.color3` colour grammar it depends on)
