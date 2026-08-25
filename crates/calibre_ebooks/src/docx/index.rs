@@ -1,18 +1,28 @@
-//! Port of `old_src/src/calibre/ebooks/docx/index.py` -- **the
-//! `polish_index_markup` half only** (issue #293): the recursive
-//! block-merge algorithm that turns raw `XE`-field-generated index
-//! entries into a properly nested index, once they've already become
-//! real HTML ([`get_applicable_xe_fields`], [`split_up_block`],
-//! [`find_match`], [`add_link`], [`merge_blocks`],
-//! [`polish_index_markup`]).
+//! Port of `old_src/src/calibre/ebooks/docx/index.py` (issue #293),
+//! now fully ported: [`get_applicable_xe_fields`], [`process_index`]
+//! (with its own private `make_block`/`add_xe` helpers), and the
+//! recursive block-merge algorithm ([`split_up_block`], [`find_match`],
+//! [`add_link`], [`merge_blocks`], [`polish_index_markup`]) that turns
+//! generated index entries into a properly nested index.
 //!
-//! `make_block`, `add_xe`, and `process_index` are a separate,
-//! larger follow-up: they insert synthetic `w:p`/`w:pPr`/`w:pStyle`/
-//! `w:r`/`w:t`/`w:br` elements into the *source* document tree, the
-//! exact same open architectural question `fields.rs`'s module docs
-//! raise for `parse_xe`'s synthetic bookmark (`crate::xmltree` vs. a
-//! tracked side-table `to_html.rs` can consult) -- worth resolving
-//! once, for both files, rather than separately.
+//! `make_block`/`add_xe`/`process_index` were previously thought to
+//! need the same open architectural question as `fields.rs`'s
+//! `parse_xe` (real `crate::xmltree` migration vs. a tracked
+//! side-table) -- Python inserts synthetic `w:p`/`w:pPr`/`w:pStyle`/
+//! `w:r`/`w:t`/`w:br` elements into the *source* tree so its own
+//! already-running main body walk re-encounters and converts them
+//! like any other paragraph. Tracing through exactly how those blocks
+//! get consumed (`Fields.polish_markup`'s `object_map` lookup) found
+//! that reframing wasn't actually necessary: since this port builds
+//! HTML directly rather than round-tripping through a re-walked
+//! source tree, [`process_index`] just builds the equivalent `<p>`/
+//! `<a>` HTML straight into [`crate::dom::Dom`] itself -- no synthetic
+//! source node, and no `crate::xmltree`, needed at all. `parse_xe`'s
+//! own synthetic bookmark (`fields.rs`, issue #290) is expected to
+//! reframe the same way -- see its module docs -- but remains
+//! unported here; [`process_index`] accepts already-resolved
+//! [`XeField`]s (with their `anchor` id already assigned) as an input,
+//! not something it computes itself.
 //!
 //! # A reproduced upstream bug
 //!
@@ -134,6 +144,175 @@ pub fn get_applicable_xe_fields<'a, 'i>(
                 .any(|a| ns.is_tag(a, "w:bookmarkStart") && bookmarks.contains(&a))
         })
         .collect()
+}
+
+/// A new, empty `<p>` (with a `class` matching `style_class`, when
+/// given) inserted into `parent` at `pos`.
+///
+/// Port of `make_block`. Python builds a `w:p > w:r > w:t` *source*
+/// skeleton instead, so the rest of `Convert.__call__`'s already-running
+/// main body walk would style-resolve and convert it exactly like any
+/// other paragraph once it re-encounters the tree. This port has no
+/// such walk to re-trigger -- [`process_index`] builds the equivalent
+/// HTML directly, so there's no source node to synthesize here at
+/// all; see the module docs.
+fn make_block(dom: &mut Dom, style_class: Option<&str>, parent: NodeId, pos: usize) -> NodeId {
+    let p = dom.new_element("p");
+    if let Some(cls) = style_class {
+        dom.node_mut(p)
+            .attrs
+            .insert("class".to_string(), cls.to_string());
+    }
+    dom.insert_child(parent, pos, p);
+    p
+}
+
+/// Fills `p` (from [`make_block`]) with `xe`'s entry: an
+/// `<a href="#{xe.anchor}">` holding `xe.text` (or a single space when
+/// empty, matching Python's `xe.get('text') or ' '`), an optional
+/// trailing `" [{page_number_text}]"` run, and a `<br>` -- exactly the
+/// shape [`polish_index_markup`]/`split_up_block`'s own
+/// `dom.find_all_tag(block, "a")` lookup expects (a link whose text is
+/// the entry's own, possibly colon-separated, hierarchy).
+///
+/// Port of `add_xe`. `xe.anchor` is used as the link's `href` directly
+/// (`#{anchor}`) rather than through Python's `hyperlink_fields`
+/// indirection (a synthetic hyperlink-field entry resolved later by
+/// generic field-hyperlink machinery): `xe.anchor` is a
+/// programmatically-generated, already-unique, already-valid id (not
+/// user input needing `generate_anchor`'s sanitization the way a real
+/// bookmark name would), so nothing later needs to resolve it -- it's
+/// simply where `parse_xe`'s own (not yet ported, issue #290) synthetic
+/// anchor assignment is expected to stamp a matching `id`.
+fn add_xe(dom: &mut Dom, p: NodeId, xe: &XeField) {
+    let a = dom.new_element("a");
+    dom.node_mut(a)
+        .attrs
+        .insert("href".to_string(), format!("#{}", xe.anchor));
+    let text = if xe.text.is_empty() { " " } else { &xe.text };
+    let t = dom.new_text(text);
+    dom.append_child(a, t);
+    dom.append_child(p, a);
+
+    if let Some(pt) = xe.page_number_text.as_deref().filter(|pt| !pt.is_empty()) {
+        let extra = dom.new_text(&format!(" [{pt}]"));
+        dom.append_child(p, extra);
+    }
+
+    let br = dom.new_element("br");
+    dom.append_child(p, br);
+}
+
+/// Replaces an `INDEX` field's own placeholder with generated index
+/// entries: one `<p>` per [`XeField`] [`get_applicable_xe_fields`]
+/// leaves applicable, sorted by text (or, when `index.heading` is
+/// set, grouped under single-letter headings first), each holding an
+/// `add_xe`-built link ready for [`polish_index_markup`] to later
+/// merge into a nested index.
+///
+/// Every block is inserted into `parent` at `pos + i` (`i` in final
+/// document order) -- simpler than, but observably identical to,
+/// Python's own trick of inserting every block at the *same* fixed
+/// `pos` while iterating `items` in reverse (which relies on each
+/// insertion pushing the previous one down one slot).
+///
+/// Unlike Python, which discovers `parent`/`pos` (and `styles[0]`,
+/// this function's `old_heading_style`) itself by walking the
+/// `INDEX` field's own old Word-generated `w:p` content and removing
+/// it from the *source* tree, this takes them as parameters --
+/// locating (and, since there's no such content on the HTML side to
+/// remove, simply not converting) the field's own placeholder is the
+/// not-yet-ported `Fields` orchestrator's job (issue #290), not this
+/// function's.
+///
+/// The letter-heading grouping (`index.heading.is_some()`) approximates
+/// `partition_by_first_letter`'s real ICU-collation-based grouping (which
+/// can group visually-distinct characters -- accented variants, digit
+/// forms -- under one ordinal) as case-insensitive first-character
+/// grouping over a case-insensitive sort -- the same disclosed
+/// simplification `categories.rs`'s own `sort_key_for_name` already
+/// makes elsewhere in this crate. One further quirk reproduced as-is,
+/// not fixed: Python only substitutes a heading's own first character
+/// with the real group letter when `heading_text` itself already
+/// starts with `'a'`/`'A'` (`text.lower().startswith('a')`) -- a
+/// heading template that doesn't start with that specific letter (an
+/// unconventional `\h` switch argument) renders unchanged for every
+/// group, not just the ones that happen to start differently.
+///
+/// Port of `process_index`.
+pub fn process_index<'a, 'i>(
+    dom: &mut Dom,
+    parent: NodeId,
+    pos: usize,
+    index: &IndexField,
+    xe_fields: Vec<XeField<'a, 'i>>,
+    old_heading_style: Option<&str>,
+    ns: &DocxNamespace,
+) -> Vec<NodeId> {
+    let applicable = get_applicable_xe_fields(index, xe_fields, ns);
+    if applicable.is_empty() {
+        return Vec::new();
+    }
+
+    enum Item<'x, 'a, 'i> {
+        Heading(String),
+        Entry(&'x XeField<'a, 'i>),
+    }
+
+    let mut sorted = applicable;
+    sorted.sort_by(|a, b| a.text.to_uppercase().cmp(&b.text.to_uppercase()));
+
+    let heading_style = match old_heading_style {
+        Some(s) => s.to_string(),
+        None => "IndexHeading".to_string(),
+    };
+
+    let items: Vec<Item> = if index.heading.is_some() {
+        let mut items = Vec::new();
+        let mut last_letter: Option<String> = None;
+        for xe in &sorted {
+            let letter = xe
+                .text
+                .chars()
+                .next()
+                .map(|c| c.to_uppercase().collect::<String>())
+                .unwrap_or_else(|| " ".to_string());
+            if last_letter.as_deref() != Some(letter.as_str()) {
+                items.push(Item::Heading(letter.clone()));
+                last_letter = Some(letter);
+            }
+            items.push(Item::Entry(xe));
+        }
+        items
+    } else {
+        sorted.iter().map(Item::Entry).collect()
+    };
+
+    let mut blocks = Vec::with_capacity(items.len());
+    for (i, item) in items.into_iter().enumerate() {
+        match item {
+            Item::Heading(letter) => {
+                let p = make_block(dom, Some(&heading_style), parent, pos + i);
+                let heading_text = index.heading.as_deref().unwrap_or_default();
+                let text = if heading_text.to_lowercase().starts_with('a') {
+                    let rest: String = heading_text.chars().skip(1).collect();
+                    format!("{letter}{rest}")
+                } else {
+                    heading_text.to_string()
+                };
+                let t = dom.new_text(&text);
+                dom.append_child(p, t);
+                blocks.push(p);
+            }
+            Item::Entry(xe) => {
+                let p = make_block(dom, None, parent, pos + i);
+                add_xe(dom, p, xe);
+                blocks.push(p);
+            }
+        }
+    }
+
+    blocks
 }
 
 /// lxml's `elem.text = text`: replaces the leading text (before the
@@ -708,6 +887,236 @@ mod tests {
             let result = get_applicable_xe_fields(&index, fields, &ns);
             assert_eq!(result.len(), 1);
             assert_eq!(result[0].text, "Inside");
+        }
+    }
+
+    mod process_index_tests {
+        use super::*;
+        use roxmltree::Document;
+
+        fn xe<'a, 'i>(
+            text: &str,
+            page_number_text: Option<&str>,
+            start_elem: Node<'a, 'i>,
+            anchor: &str,
+        ) -> XeField<'a, 'i> {
+            XeField {
+                text: text.to_string(),
+                entry_type: None,
+                page_number_text: page_number_text.map(str::to_string),
+                anchor: anchor.to_string(),
+                start_elem,
+            }
+        }
+
+        #[test]
+        fn no_applicable_fields_returns_nothing() {
+            let mut dom = Dom::empty();
+            let root = dom.root;
+            let index = IndexField::default();
+            let ns = DocxNamespace::default();
+
+            let blocks = process_index(&mut dom, root, 0, &index, Vec::new(), None, &ns);
+            assert!(blocks.is_empty());
+        }
+
+        #[test]
+        fn entries_sort_by_text_and_become_linked_paragraphs() {
+            let doc = Document::parse("<w:document xmlns:w=\"x\"/>").unwrap();
+            let start = doc.root_element();
+            let mut dom = Dom::empty();
+            let root = dom.root;
+            let index = IndexField::default();
+            let fields = vec![
+                xe("Bob", None, start, "idx2"),
+                xe("Alice", None, start, "idx1"),
+            ];
+            let ns = DocxNamespace::default();
+
+            let blocks = process_index(&mut dom, root, 0, &index, fields, None, &ns);
+
+            assert_eq!(blocks.len(), 2);
+            assert_eq!(
+                dom.children(root),
+                blocks,
+                "inserted in sorted document order"
+            );
+            let links: Vec<_> = blocks
+                .iter()
+                .map(|&b| dom.find_all_tag(b, "a").into_iter().next().unwrap())
+                .collect();
+            assert_eq!(dom.text_content(links[0]), "Alice");
+            assert_eq!(
+                dom.node(links[0]).attrs.get("href").map(String::as_str),
+                Some("#idx1")
+            );
+            assert_eq!(dom.text_content(links[1]), "Bob");
+        }
+
+        #[test]
+        fn an_entry_with_no_text_gets_a_single_space() {
+            let doc = Document::parse("<w:document xmlns:w=\"x\"/>").unwrap();
+            let start = doc.root_element();
+            let mut dom = Dom::empty();
+            let root = dom.root;
+            let index = IndexField::default();
+            let fields = vec![xe("", None, start, "idx1")];
+            let ns = DocxNamespace::default();
+
+            let blocks = process_index(&mut dom, root, 0, &index, fields, None, &ns);
+
+            let link = dom.find_all_tag(blocks[0], "a").into_iter().next().unwrap();
+            assert_eq!(dom.text_content(link), " ");
+        }
+
+        #[test]
+        fn page_number_text_is_appended_in_brackets_after_the_link() {
+            let doc = Document::parse("<w:document xmlns:w=\"x\"/>").unwrap();
+            let start = doc.root_element();
+            let mut dom = Dom::empty();
+            let root = dom.root;
+            let index = IndexField::default();
+            let fields = vec![xe("Alice", Some("5"), start, "idx1")];
+            let ns = DocxNamespace::default();
+
+            let blocks = process_index(&mut dom, root, 0, &index, fields, None, &ns);
+
+            // Checked node-by-node, not via `Dom::text_content` (its
+            // real, tracked, unfixed multi-node-order bug -- #296 --
+            // would reverse "Alice" and " [5]").
+            let link = dom.find_all_tag(blocks[0], "a").into_iter().next().unwrap();
+            assert_eq!(dom.text_content(link), "Alice");
+            let children = dom.children(blocks[0]);
+            assert_eq!(children[0], link);
+            assert_eq!(dom.text_content(children[1]), " [5]");
+            assert_eq!(dom.find_all_tag(blocks[0], "br").len(), 1);
+        }
+
+        #[test]
+        fn heading_groups_entries_under_a_single_letter_heading() {
+            let doc = Document::parse("<w:document xmlns:w=\"x\"/>").unwrap();
+            let start = doc.root_element();
+            let mut dom = Dom::empty();
+            let root = dom.root;
+            let index = IndexField {
+                heading: Some("A".to_string()),
+                ..Default::default()
+            };
+            let fields = vec![
+                xe("Apple", None, start, "idx1"),
+                xe("Banana", None, start, "idx2"),
+                xe("Avocado", None, start, "idx3"),
+            ];
+            let ns = DocxNamespace::default();
+
+            let blocks = process_index(&mut dom, root, 0, &index, fields, None, &ns);
+
+            // Two headings ("A", "B") plus three entries.
+            assert_eq!(blocks.len(), 5);
+            assert_eq!(dom.text_content(blocks[0]), "A");
+            assert!(dom.find_all_tag(blocks[0], "a").is_empty());
+            assert_eq!(
+                dom.node(blocks[0]).attrs.get("class").map(String::as_str),
+                Some("IndexHeading")
+            );
+            assert_eq!(dom.text_content(blocks[1]), "Apple");
+            assert_eq!(dom.text_content(blocks[2]), "Avocado");
+            assert_eq!(dom.text_content(blocks[3]), "B");
+            assert_eq!(dom.text_content(blocks[4]), "Banana");
+        }
+
+        #[test]
+        fn old_heading_style_overrides_the_default_index_heading_class() {
+            let doc = Document::parse("<w:document xmlns:w=\"x\"/>").unwrap();
+            let start = doc.root_element();
+            let mut dom = Dom::empty();
+            let root = dom.root;
+            let index = IndexField {
+                heading: Some("A".to_string()),
+                ..Default::default()
+            };
+            let fields = vec![xe("Apple", None, start, "idx1")];
+            let ns = DocxNamespace::default();
+
+            let blocks = process_index(&mut dom, root, 0, &index, fields, Some("MyHeading"), &ns);
+
+            assert_eq!(
+                dom.node(blocks[0]).attrs.get("class").map(String::as_str),
+                Some("MyHeading")
+            );
+        }
+
+        #[test]
+        fn heading_text_starting_with_a_gets_its_first_char_replaced_per_group() {
+            // Reproduced quirk: only fires because "A..." starts with
+            // 'a' -- see the module docs on `process_index`.
+            let doc = Document::parse("<w:document xmlns:w=\"x\"/>").unwrap();
+            let start = doc.root_element();
+            let mut dom = Dom::empty();
+            let root = dom.root;
+            let index = IndexField {
+                heading: Some("Az".to_string()),
+                ..Default::default()
+            };
+            let fields = vec![
+                xe("Apple", None, start, "idx1"),
+                xe("Banana", None, start, "idx2"),
+            ];
+            let ns = DocxNamespace::default();
+
+            let blocks = process_index(&mut dom, root, 0, &index, fields, None, &ns);
+
+            assert_eq!(
+                dom.text_content(blocks[0]),
+                "Az",
+                "the 'A' got replaced with 'A'"
+            );
+            assert_eq!(
+                dom.text_content(blocks[2]),
+                "Bz",
+                "the 'A' got replaced with 'B'"
+            );
+        }
+
+        #[test]
+        fn heading_text_not_starting_with_a_is_never_substituted() {
+            let doc = Document::parse("<w:document xmlns:w=\"x\"/>").unwrap();
+            let start = doc.root_element();
+            let mut dom = Dom::empty();
+            let root = dom.root;
+            let index = IndexField {
+                heading: Some("-".to_string()),
+                ..Default::default()
+            };
+            let fields = vec![
+                xe("Apple", None, start, "idx1"),
+                xe("Banana", None, start, "idx2"),
+            ];
+            let ns = DocxNamespace::default();
+
+            let blocks = process_index(&mut dom, root, 0, &index, fields, None, &ns);
+
+            assert_eq!(dom.text_content(blocks[0]), "-");
+            assert_eq!(dom.text_content(blocks[2]), "-");
+        }
+
+        #[test]
+        fn blocks_are_inserted_at_the_given_position_not_only_appended() {
+            let doc = Document::parse("<w:document xmlns:w=\"x\"/>").unwrap();
+            let start = doc.root_element();
+            let mut dom = Dom::empty();
+            let root = dom.root;
+            let before = dom.new_element("p");
+            dom.append_child(root, before);
+            let after = dom.new_element("p");
+            dom.append_child(root, after);
+            let index = IndexField::default();
+            let fields = vec![xe("Alice", None, start, "idx1")];
+            let ns = DocxNamespace::default();
+
+            let blocks = process_index(&mut dom, root, 1, &index, fields, None, &ns);
+
+            assert_eq!(dom.children(root), vec![before, blocks[0], after]);
         }
     }
 }

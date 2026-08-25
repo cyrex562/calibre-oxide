@@ -10,24 +10,33 @@
 //! `parse_hyperlink`/`parse_ref`/`parse_xe`/`parse_index`/
 //! `polish_markup` -- same names as this file's module-level parsers,
 //! but a different, field-*dispatching* role) is a separate, larger
-//! follow-up. Two real reasons, not just size:
+//! follow-up, still unported:
 //!
 //! - `parse_xe` inserts a synthetic `w:bookmarkStart`/`w:bookmarkEnd`
 //!   pair into the *source* document tree so a later pass can link to
-//!   an index entry -- exactly the source-tree-mutation need
-//!   `crate::xmltree` exists for (see `docx/mod.rs`'s module docs),
-//!   but this port's `to_html.rs` pipeline is built entirely on
-//!   `roxmltree`'s read-only tree. Whether that's solved by finally
-//!   using `crate::xmltree` here, or (like `tables.rs`'s
-//!   `removed_cells`) by tracking the synthetic bookmark as side-table
-//!   state `convert_p`'s existing `w:bookmarkStart` handling can
-//!   consult, is an open design question for that follow-up.
+//!   an index entry. This was thought to need real source-tree
+//!   mutation (`crate::xmltree`, see `docx/mod.rs`'s module docs) --
+//!   `docx/index.rs`'s own module docs now disclose why that turned
+//!   out unnecessary once `index.py`'s consumer side was actually
+//!   ported (issue #293, closed): the synthetic bookmark's only real
+//!   purpose is giving a *name* to `field.start`'s (a real, already-
+//!   parsed node's) eventual HTML position. A tracked side-table
+//!   mapping the anchor name to `field.start`, consulted wherever this
+//!   port's own anchor-assignment logic (`ConvertState::anchor_map`,
+//!   `apply_new_anchor`) runs during the main body walk, should work
+//!   the same way `index.rs`'s `process_index` does -- building the
+//!   HTML directly rather than reproducing Python's insert-then-rewalk
+//!   indirection. Still needs doing, but the open design question is
+//!   resolved.
 //! - `parse_index` and `polish_markup` call straight into `index.py`
-//!   (`process_index`/`polish_index_markup`), which is **not yet
-//!   ported** (issue #293) -- a real forward dependency #290's own
-//!   issue body didn't mention. `Fields.__call__` handles every field
-//!   type in one pass, so it can't be split around this the way
-//!   `to_html.rs`'s many independent functions have been.
+//!   (`process_index`/`polish_index_markup`), which **is now fully
+//!   ported** (issue #293, closed) -- `docx/index.rs`'s `process_index`
+//!   takes already-resolved [`super::index::XeField`]s (with `anchor`
+//!   already assigned) and builds the index page's HTML directly, so
+//!   this orchestrator's own job is: walk fields in one pass (as
+//!   Python does), build each `XeField`'s `anchor` via the bookmark
+//!   reframing above, and call `process_index` once ready -- no
+//!   further forward dependency remains.
 //!
 //! `parser(...)`'s returned closure has an unused `log` parameter,
 //! dropped here since the closure body never references it.
