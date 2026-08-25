@@ -10,11 +10,19 @@
 //! | `container.py` | [`container`] |
 //! | `fonts.py` | [`fonts`] |
 //! | — (`lxml.builder`) | [`xml`] |
+//! | `styles.py` (partial) | [`styles`] |
 //!
-//! Still to come, tracked separately: `styles.py`, `from_html.py`,
-//! `tables.py`, `images.py`, `links.py` and `lists.py`. Those walk a
-//! resolved-CSS HTML tree, which needs the OEB stylizer to be more than
-//! the stub it currently is.
+//! Still to come, tracked as issue #132: the rest of `styles.py`
+//! (`BlockStyle`/`FloatSpec`/`DescendantTextStyle`/`StylesManager`),
+//! `from_html.py`, `tables.py`, `images.py`, `links.py`, `lists.py`.
+//! These walk a resolved-CSS HTML tree -- #132's own "needs a real OEB
+//! stylizer" framing was stale by the time it was filed:
+//! [`crate::oeb::polish::cascade`] already had a real CSS cascade (a
+//! different consumer, issue #164), and
+//! [`crate::oeb::polish::style`] is the accessor seam these files
+//! actually need. [`styles`] is the first piece built against it:
+//! `TextStyle`, the CSS -> `w:rPr` run-property data model (not yet
+//! its serialization or `StylesManager`'s deduplication pass).
 //!
 //! ```no_run
 //! use calibre_ebooks::docx::writer::container::{DocxWriter, PageOptions};
@@ -28,6 +36,7 @@
 
 pub mod container;
 pub mod fonts;
+pub mod styles;
 pub mod utils;
 pub mod xml;
 
