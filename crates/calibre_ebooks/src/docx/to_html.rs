@@ -35,10 +35,17 @@
 //!   identically-bordered paragraphs into one visual block
 //!   (`ConvertState::block_runs`, for [`apply_block_run_frames`]).
 //! - [`resolve_links`]: turns tracked `w:hyperlink`s into real `<a>`
-//!   elements -- both `link_map` (issue #283, plain-text hyperlinks)
-//!   and `images.links` (issue #289, hyperlink-wrapped pictures) are
-//!   wired in; only `fields.py`'s own hyperlink source remains, still
-//!   blocked on issue #290.
+//!   elements -- `link_map` (issue #283, plain-text hyperlinks),
+//!   `images.links` (issue #289, hyperlink-wrapped pictures), and
+//!   `fields.rs`'s `FieldsCollector::hyperlink_fields` (issue #290,
+//!   `HYPERLINK`/`REF`/`NOTEREF` fields) are all wired in.
+//! - [`assign_xe_anchors`]/[`apply_index_fields`]: the deferred halves
+//!   of `fields.py`'s `parse_xe`/`parse_index` dispatch (issue #290)
+//!   that need the HTML tree -- stamping each `XE` field's synthetic
+//!   anchor id, then (once every anchor exists) calling
+//!   `docx/index.rs`'s `process_index`/`polish_index_markup` for each
+//!   `INDEX` field, replacing its old Word-generated placeholder
+//!   paragraphs with freshly generated entries.
 //! - [`cascade`]: a bottom-up property de-duplication pass -- hoists a
 //!   property every run in a paragraph agrees on up onto the
 //!   paragraph, then hoists whichever paragraph-level value is most
@@ -58,11 +65,10 @@
 //!   by [`ConvertState::add_frame`], called from [`convert_p`])
 //!   respectively in a `<div>` carrying the relevant CSS, populating
 //!   `ConvertState::framed_map` (issue #287, closed).
-//! - [`assign_style_classes`]: the final step -- registers a CSS class
-//!   for every cached paragraph/run style and every frame's border
-//!   CSS, then sets `class` on each corresponding HTML element (issue
-//!   #288's class-generation half; only `fields.polish_markup`
-//!   remains, blocked on #290's still-unported `Fields` orchestrator).
+//! - [`assign_style_classes`]: registers a CSS class for every cached
+//!   paragraph/run style and every frame's border CSS, then sets
+//!   `class` on each corresponding HTML element (issue #288's
+//!   class-generation half).
 //! - [`convert_footnotes`]: appends the notes section -- an `<h1>`
 //!   heading and one `<dl class="footnote">` per referenced footnote/
 //!   endnote, each converted via [`convert_p`] exactly like the main
@@ -78,11 +84,10 @@
 //!   up front, by [`convert_document`].
 //! - [`convert_document`]: the orchestrator tying every piece above
 //!   together in `Convert.__call__`'s real sequence, plus `write`'s
-//!   own first line (`create_toc`) -- issue #288's remaining scope,
-//!   minus `fields.py`'s `Fields` orchestrator (issue #290, the same
-//!   open source-tree-mutation question issue #293 is also blocked
-//!   on) -- see its own doc comment for exactly what's excluded and
-//!   why.
+//!   own first line (`create_toc`) -- issue #288's full remaining
+//!   scope, including `fields.py`'s `Fields` orchestrator (issue #290,
+//!   closed) via [`super::fields::FieldsCollector::collect`]/
+//!   [`assign_xe_anchors`]/[`apply_index_fields`].
 //! - [`build_html_document`]/[`write_document`]: `Convert.__init__`'s
 //!   `<html><head>...` skeleton construction and `Convert.write`'s
 //!   `index.html`/`metadata.opf`/`toc.ncx` output, built on
@@ -1375,16 +1380,28 @@ fn process_block_run<'a, 'i>(
 /// recorded against that note's *own* relationships, not the main
 /// document's).
 ///
+/// Then resolves `hyperlink_fields` (`fields.rs`'s
+/// `FieldsCollector::hyperlink_fields` -- every `HYPERLINK`/`REF`/
+/// `NOTEREF` field found by [`super::fields::FieldsCollector::collect`])
+/// into real `<a>` elements too: each `(FieldValues, Vec<Node>)` pair
+/// maps its runs to HTML spans via `state.object_map`'s reverse
+/// lookup, merges multi-span entries the same way the `link_map`
+/// block above does, and sets `href` from either `url` (checked
+/// against `anchor_map` first, in case it's actually an internal
+/// bookmark reference) or `anchor` (looked up in `anchor_map`
+/// directly -- a real, user-authored bookmark a `REF`/`NOTEREF`
+/// field references by name; `XE` fields' own synthetic anchors
+/// ([`assign_xe_anchors`]) are a separate, internal-only naming
+/// scheme nothing else ever looks up by name, so they play no part
+/// here).
+///
 /// Returns `hyperlink -> <a>` (Python's `self.resolved_link_map`),
 /// which `toc.py`'s `create_toc` (issue #292) needs.
 ///
-/// Port of the `self.link_map`- and `self.images.links`-driven blocks
-/// of `Convert.resolve_links`. The remaining block, `self.fields.
-/// hyperlink_fields`, is deliberately not ported here (see issue
-/// #283): it needs `fields.py`'s `Fields` orchestrator (issue #290),
-/// not yet built. A hyperlink whose `r:id`/`w:anchor` resolves to
-/// nothing is silently left without an `href` rather than logged,
-/// since no logger is threaded through this module yet.
+/// Port of `Convert.resolve_links` in full. A hyperlink (of either
+/// kind) whose target resolves to nothing is silently left without an
+/// `href` rather than logged, since no logger is threaded through
+/// this module yet.
 ///
 /// The `images.links` block skips a whole dance Python needs and this
 /// doesn't: `a = A(img); a.tail, img.tail = img.tail, None; parent.insert(idx, a)`
@@ -1401,6 +1418,7 @@ pub fn resolve_links<'a, 'i>(
     dom: &mut Dom,
     state: &ConvertState<'a, 'i>,
     images: &super::images::Images,
+    hyperlink_fields: &[(super::fields::FieldValues, Vec<Node<'a, 'i>>)],
     ns: &DocxNamespace,
 ) -> HashMap<Node<'a, 'i>, NodeId> {
     let mut resolved_link_map = HashMap::new();
@@ -1484,7 +1502,243 @@ pub fn resolve_links<'a, 'i>(
         }
     }
 
+    let rmap: HashMap<Node<'a, 'i>, NodeId> =
+        state.object_map.iter().map(|(&id, &n)| (n, id)).collect();
+    for (hyperlink, runs) in hyperlink_fields {
+        let spans: Vec<NodeId> = runs.iter().filter_map(|r| rmap.get(r).copied()).collect();
+        let Some(&first) = spans.first() else {
+            continue;
+        };
+        let span = if spans.len() > 1 {
+            let Some(parent) = dom.parent(first) else {
+                continue;
+            };
+            wrap_elems(dom, parent, &spans)
+        } else {
+            first
+        };
+        dom.set_tag(span, "a");
+
+        let get = |key: &str| hyperlink.get(&Some(key.to_string())).cloned().flatten();
+        if let Some(tgt) = get("target") {
+            dom.node_mut(span).attrs.insert("target".to_string(), tgt);
+        }
+        if let Some(tt) = get("title") {
+            dom.node_mut(span).attrs.insert("title".to_string(), tt);
+        }
+
+        match get("url") {
+            None => {
+                if let Some(anchor) = get("anchor") {
+                    if let Some(id) = state.anchor_map.get(&anchor) {
+                        dom.node_mut(span)
+                            .attrs
+                            .insert("href".to_string(), format!("#{id}"));
+                    }
+                    // else: log.warn("Hyperlink field with unknown
+                    // anchor"), dropped -- no logger threaded through
+                    // this module.
+                }
+            }
+            Some(url) => {
+                if let Some(id) = state.anchor_map.get(&url) {
+                    dom.node_mut(span)
+                        .attrs
+                        .insert("href".to_string(), format!("#{id}"));
+                } else {
+                    dom.node_mut(span).attrs.insert("href".to_string(), url);
+                }
+            }
+        }
+    }
+
     resolved_link_map
+}
+
+/// Assigns each `XeFieldData` (`fields.rs`'s `FieldsCollector::xe_fields`)
+/// a real, unique anchor id and stamps it onto the HTML element
+/// `start`'s enclosing `w:r` became -- the deferred half of `parse_xe`'s
+/// synthetic-bookmark reframing (see `fields.rs`'s module docs for
+/// why no real `w:bookmarkStart`/`w:bookmarkEnd` insertion is needed).
+/// Must run after the main body walk (`state.object_map` needs to be
+/// populated).
+///
+/// This does *not* record anything in `state.anchor_map`: Python's own
+/// synthetic bookmark, once inserted, is discovered by `convert_p`'s
+/// ordinary in-paragraph `w:bookmarkStart` handling (it lands nested
+/// inside a `w:r`, not as a `w:body`-level sibling `read_block_anchors`
+/// would find, but `convert_p`'s own descendant search for
+/// bookmarks -- checking only that the nearest enclosing `w:p` matches
+/// -- still finds it), which runs it through `generate_anchor`'s
+/// sanitizing id assignment and *does* populate `anchor_map` -- but
+/// only because that's the general mechanism *any* bookmark goes
+/// through, not because anything else ever needs to look up an `XE`
+/// field's synthetic name specifically (nothing legitimately
+/// cross-references calibre's own internal `index-N` naming scheme
+/// the way a document author's real bookmark names get referenced by
+/// `REF`/`HYPERLINK` fields). This port skips that indirection
+/// entirely and stamps the final id directly.
+///
+/// Unlike Python's `parse_xe`, which always inserts a brand new
+/// bookmark pair (participating in the real-bookmark id-generation/
+/// reuse machinery above), this checks whether the target HTML
+/// element already carries a real `id` (e.g. from a real user
+/// bookmark landing at the same position) and reuses it directly
+/// rather than stamping a second, redundant one -- a disclosed
+/// simplification of Python's own "insert unconditionally, let normal
+/// processing merge or pick a winner" behavior, with the same
+/// functional outcome (the position is linkable either way). New ids
+/// follow Python's own `index_bookmark_prefix` naming (`"index-1"`,
+/// `"index-2"`, ...) directly, skipping `generate_anchor`'s
+/// character-sanitizing step (unneeded: this scheme is already a
+/// valid, ASCII-alphanumeric-plus-hyphen id token) -- checked for
+/// uniqueness against every id already in `state.anchor_map`'s values
+/// plus every id assigned earlier in this same pass, since a real, if
+/// unlikely, collision (a user-authored bookmark literally named
+/// `index-1`) would otherwise silently merge two unrelated anchors.
+///
+/// A field whose `start` has no `w:r` ancestor, or whose enclosing
+/// run was never converted (e.g. inside content this port doesn't
+/// walk), is silently skipped -- there is nothing to link to.
+///
+/// Port of the synthetic-bookmark half of `Fields.parse_xe`, deferred
+/// from `fields.rs`'s `dispatch_xe` (see [`super::fields::FieldsCollector`]'s
+/// own docs for why).
+pub fn assign_xe_anchors<'a, 'i>(
+    dom: &mut Dom,
+    state: &ConvertState<'a, 'i>,
+    xe_fields: &[super::fields::XeFieldData<'a, 'i>],
+    ns: &DocxNamespace,
+) -> Vec<super::index::XeField<'a, 'i>> {
+    let rmap: HashMap<Node<'a, 'i>, NodeId> =
+        state.object_map.iter().map(|(&id, &n)| (n, id)).collect();
+    let mut used: HashSet<String> = state.anchor_map.values().cloned().collect();
+    let mut counter = 0usize;
+
+    let mut resolved = Vec::with_capacity(xe_fields.len());
+    for xe in xe_fields {
+        let Some(run) = ns.ancestor(xe.start, "w:r") else {
+            continue;
+        };
+        let Some(&html) = rmap.get(&run) else {
+            continue;
+        };
+
+        let anchor = if let Some(existing) = dom.node(html).attrs.get("id") {
+            existing.clone()
+        } else {
+            loop {
+                counter += 1;
+                let candidate = format!("index-{counter}");
+                if used.insert(candidate.clone()) {
+                    dom.node_mut(html)
+                        .attrs
+                        .insert("id".to_string(), candidate.clone());
+                    break candidate;
+                }
+            }
+        };
+
+        resolved.push(super::index::XeField {
+            text: xe.text.clone(),
+            entry_type: xe.entry_type.clone(),
+            page_number_text: xe.page_number_text.clone(),
+            anchor,
+            start_elem: xe.start,
+        });
+    }
+    resolved
+}
+
+/// Removes each `INDEX` field's own old, Word-generated placeholder
+/// paragraphs and replaces them with freshly generated entries via
+/// [`super::index::process_index`]/[`super::index::polish_index_markup`],
+/// once every `XE` field has a real anchor ([`assign_xe_anchors`]).
+///
+/// Must run after class assignment, matching where Python's own
+/// `Fields.polish_markup` runs (near the very end of `Convert.__call__`,
+/// just before `cleanup_markup`) -- unlike Python, this also performs
+/// the `process_index` call itself (Python's own happens much
+/// earlier, *inline* during field dispatch, since its synthetic
+/// source nodes need the main body walk still ahead of them to
+/// convert them; this port's `process_index` builds HTML directly, so
+/// it has to wait until there's HTML to build into -- see
+/// `fields.rs`'s module docs for the full story, including the
+/// resulting divergence in which `XE` fields a given `INDEX` sees).
+///
+/// Finds each `INDEX` field's insertion point (Python's `start_pos`)
+/// from its own `field.contents`' first `w:p`, via `state.object_map`'s
+/// reverse lookup -- an `INDEX` field whose own placeholder paragraphs
+/// were never converted (e.g. inside a table cell this port's markup
+/// doesn't reach) is silently skipped, matching Python's own
+/// `if not blocks: return` (nothing meaningful to insert relative to).
+///
+/// Port of `Fields.parse_index`'s `process_index` call (its
+/// placeholder-removal loop, ported here since it needs the HTML tree)
+/// and `Fields.polish_markup`.
+pub fn apply_index_fields<'a, 'i>(
+    dom: &mut Dom,
+    index_fields: &[(super::index::IndexField, Vec<Node<'a, 'i>>)],
+    xe_fields: &[super::index::XeField<'a, 'i>],
+    state: &ConvertState<'a, 'i>,
+    ns: &DocxNamespace,
+) {
+    if index_fields.is_empty() {
+        return;
+    }
+    let rmap: HashMap<Node<'a, 'i>, NodeId> =
+        state.object_map.iter().map(|(&id, &n)| (n, id)).collect();
+
+    for (index_field, contents) in index_fields {
+        let mut old_heading_style: Option<String> = None;
+        let mut start_pos: Option<(NodeId, usize)> = None;
+        let mut to_remove: Vec<NodeId> = Vec::new();
+
+        for &elem in contents {
+            if !ns.is_tag(elem, "w:p") {
+                continue;
+            }
+            if old_heading_style.is_none() {
+                if let Some(style) = ns
+                    .descendants(elem, &["w:pStyle"])
+                    .into_iter()
+                    .next()
+                    .and_then(|s| ns.get(s, "w:val"))
+                {
+                    old_heading_style = Some(style.to_string());
+                }
+            }
+            let Some(&html) = rmap.get(&elem) else {
+                continue;
+            };
+            if start_pos.is_none() {
+                if let (Some(parent), Some(idx)) = (dom.parent(html), dom.index_in_parent(html)) {
+                    start_pos = Some((parent, idx));
+                }
+            }
+            to_remove.push(html);
+        }
+
+        let Some((parent, pos)) = start_pos else {
+            continue;
+        };
+        for html in to_remove {
+            dom.detach(html);
+        }
+
+        let blocks = super::index::process_index(
+            dom,
+            parent,
+            pos,
+            index_field,
+            xe_fields.to_vec(),
+            old_heading_style.as_deref(),
+            ns,
+        );
+        if !blocks.is_empty() {
+            super::index::polish_index_markup(dom, &blocks);
+        }
+    }
 }
 
 /// A bottom-up property de-duplication pass, run once per document
@@ -2580,15 +2834,20 @@ pub fn build_html_document(
 /// is only ever called on the main document, never on a footnote's or
 /// endnote's own separately-parsed tree.
 ///
-/// One thing `Convert.__call__` itself does that this deliberately
-/// leaves out, documented elsewhere rather than repeated here:
-/// `self.fields(...)`/`self.fields.polish_markup(...)` (needs
-/// `fields.py`'s `Fields` orchestrator, issue #290 -- blocked on the
-/// same open source-tree-mutation question issue #293 is).
+/// Also calls [`super::fields::FieldsCollector::collect`] up front
+/// (matching Python's own `self.fields(doc, self.log)`, right after
+/// `resolve_alternate_content`), then, once the body walk gives it an
+/// HTML tree to work with, [`assign_xe_anchors`] and [`resolve_links`]
+/// (extended with the `hyperlink_fields` block), and finally, near the
+/// very end -- matching where Python's own `Fields.polish_markup`
+/// runs -- [`apply_index_fields`]. See `fields.rs`'s module docs for
+/// why none of this needed the source-tree mutation it was once
+/// thought to.
 ///
-/// Port of `Convert.__call__` (`read_page_properties` through
-/// `cleanup_markup`) and the `create_toc` call at the top of
-/// `Convert.write`.
+/// Port of `Convert.__call__` in full (`read_page_properties` through
+/// `cleanup_markup`, including `self.fields(...)`/
+/// `self.fields.polish_markup(...)`) and the `create_toc` call at the
+/// top of `Convert.write`.
 #[allow(clippy::too_many_arguments)]
 pub fn convert_document<'a, 'i, R: Read + Seek>(
     dom: &mut Dom,
@@ -2610,6 +2869,7 @@ pub fn convert_document<'a, 'i, R: Read + Seek>(
 ) -> ConvertedDocument<'a, 'i> {
     let mut state = ConvertState::new();
     let alt_content = resolve_alternate_content(document, ns);
+    let fields = super::fields::FieldsCollector::collect(document, ns);
 
     let (body, paras, mut page_map, _section_starts) = convert_body(
         dom,
@@ -2658,7 +2918,9 @@ pub fn convert_document<'a, 'i, R: Read + Seek>(
 
     apply_tab_indentation(dom, &state, styles, settings, ns);
 
-    let resolved_link_map = resolve_links(dom, &state, images, ns);
+    let resolved_xe_fields = assign_xe_anchors(dom, &mut state, &fields.xe_fields, ns);
+
+    let resolved_link_map = resolve_links(dom, &state, images, &fields.hyperlink_fields, ns);
 
     cascade(styles, &state, theme, ns);
 
@@ -2691,6 +2953,8 @@ pub fn convert_document<'a, 'i, R: Read + Seek>(
             }
         }
     }
+
+    apply_index_fields(dom, &fields.index_fields, &resolved_xe_fields, &state, ns);
 
     let class_map = styles.class_map();
     cleanup::cleanup_markup(dom, &class_map, uuid);
@@ -2813,19 +3077,16 @@ pub fn write_document(
 /// `metadata.opf` path, not an HTML string -- which is why this
 /// function's return type matches [`write_document`]'s.
 ///
-/// One piece of `Convert.__call__` remains deliberately unported
-/// here, blocked on the shared open architectural question (issues
-/// #290/#293 -- see the module docs): `self.fields(...)`/
-/// `self.fields.polish_markup(...)`. Skipping it means a document
-/// that relies on `HYPERLINK`/`REF`/`XE`/`NOTEREF` field codes
-/// converts without whatever those would have contributed -- a
-/// disclosed, real, narrow-scope gap, not a silent one.
-/// `resolve_alternate_content` itself IS ported (via
-/// [`convert_document`]'s own call to it) for the case Python's own
-/// function special-cases -- a document relying on a
-/// `mc:AlternateContent` wrapper *other* than the common
-/// drawing/pict-in-a-run compatibility pattern converts without full
-/// fidelity there too, see [`AlternateContent`]'s own docs.
+/// `self.fields(...)`/`self.fields.polish_markup(...)` are both
+/// ported too (via [`convert_document`]'s own calls to
+/// [`super::fields::FieldsCollector::collect`]/[`assign_xe_anchors`]/
+/// [`resolve_links`]/[`apply_index_fields`]) -- `HYPERLINK`/`REF`/
+/// `NOTEREF`/`XE`/`INDEX` fields all resolve for real. `resolve_alternate_content`
+/// is ported too, for the case Python's own function special-cases --
+/// a document relying on a `mc:AlternateContent` wrapper *other* than
+/// the common drawing/pict-in-a-run compatibility pattern converts
+/// without full fidelity there, see [`AlternateContent`]'s own docs,
+/// the one remaining disclosed, narrow-scope gap in the whole port.
 ///
 /// `detect_cover`/`notes_text` mirror `Convert.__init__`'s
 /// same-named parameters; `notes_nopb`/`nosupsub` are **not** accepted
@@ -4814,7 +5075,7 @@ mod resolve_links_tests {
         let mut h = Harness::new();
         h.convert(doc.root_element(), &ns, &rels);
 
-        let resolved = resolve_links(&mut h.dom, &h.state, &Images::new(), &ns);
+        let resolved = resolve_links(&mut h.dom, &h.state, &Images::new(), &[], &ns);
         assert_eq!(resolved.len(), 1);
         let &span = resolved.values().next().unwrap();
         assert_eq!(h.dom.tag(span), Some("a"));
@@ -4835,7 +5096,7 @@ mod resolve_links_tests {
             .insert("chap1".to_string(), "id_chap1".to_string());
         h.convert(doc.root_element(), &ns, &Relationships::default());
 
-        let resolved = resolve_links(&mut h.dom, &h.state, &Images::new(), &ns);
+        let resolved = resolve_links(&mut h.dom, &h.state, &Images::new(), &[], &ns);
         let &span = resolved.values().next().unwrap();
         assert_eq!(
             h.dom.node(span).attrs.get("href").map(String::as_str),
@@ -4853,7 +5114,7 @@ mod resolve_links_tests {
         let dest = h.convert(doc.root_element(), &ns, &rels);
         assert_eq!(h.dom.children(dest).len(), 2, "still two separate spans");
 
-        resolve_links(&mut h.dom, &h.state, &Images::new(), &ns);
+        resolve_links(&mut h.dom, &h.state, &Images::new(), &[], &ns);
 
         let children = h.dom.children(dest);
         assert_eq!(children.len(), 1, "merged into one wrapper");
@@ -4887,7 +5148,7 @@ mod resolve_links_tests {
         let mut h = Harness::new();
         h.convert(doc.root_element(), &ns, &Relationships::default());
 
-        let resolved = resolve_links(&mut h.dom, &h.state, &Images::new(), &ns);
+        let resolved = resolve_links(&mut h.dom, &h.state, &Images::new(), &[], &ns);
         let &span = resolved.values().next().unwrap();
         assert_eq!(h.dom.tag(span), Some("a"));
         assert!(h.dom.node(span).attrs.get("href").is_none());
@@ -4902,7 +5163,7 @@ mod resolve_links_tests {
         let mut h = Harness::new();
         h.convert(doc.root_element(), &ns, &rels);
 
-        let resolved = resolve_links(&mut h.dom, &h.state, &Images::new(), &ns);
+        let resolved = resolve_links(&mut h.dom, &h.state, &Images::new(), &[], &ns);
         let &span = resolved.values().next().unwrap();
         assert_eq!(
             h.dom.node(span).attrs.get("target").map(String::as_str),
@@ -4952,7 +5213,7 @@ mod resolve_links_tests {
 
             let state = ConvertState::new();
             let ns = DocxNamespace::default();
-            resolve_links(&mut dom, &state, &images, &ns);
+            resolve_links(&mut dom, &state, &images, &[], &ns);
 
             assert_eq!(dom.children(p).len(), 1);
             let a = dom.children(p)[0];
@@ -4993,7 +5254,7 @@ mod resolve_links_tests {
                 .anchor_map
                 .insert("chap1".to_string(), "id_chap1".to_string());
             let ns = DocxNamespace::default();
-            resolve_links(&mut dom, &state, &images, &ns);
+            resolve_links(&mut dom, &state, &images, &[], &ns);
 
             let a = dom.children(p)[0];
             assert_eq!(
@@ -5023,9 +5284,172 @@ mod resolve_links_tests {
 
             let state = ConvertState::new();
             let ns = DocxNamespace::default();
-            resolve_links(&mut dom, &state, &images, &ns);
+            resolve_links(&mut dom, &state, &images, &[], &ns);
 
             assert_eq!(dom.serialize(p), r#"<p>before <a><img /></a> after</p>"#);
+        }
+    }
+
+    mod hyperlink_fields_tests {
+        use super::*;
+        use crate::docx::fields::FieldValues;
+
+        fn some(s: &str) -> Option<String> {
+            Some(s.to_string())
+        }
+
+        #[test]
+        fn a_hyperlink_field_with_a_url_becomes_a_real_a() {
+            let (doc, ns) = parse_para(r#"<w:r><w:t>click</w:t></w:r>"#);
+            let mut h = Harness::new();
+            let dest = h.convert(doc.root_element(), &ns, &Relationships::default());
+            let run = ns
+                .descendants(doc.root_element(), &["w:r"])
+                .into_iter()
+                .next()
+                .unwrap();
+
+            let mut hl = FieldValues::new();
+            hl.insert(some("url"), some("https://example.com/"));
+            let hyperlink_fields = vec![(hl, vec![run])];
+
+            resolve_links(&mut h.dom, &h.state, &Images::new(), &hyperlink_fields, &ns);
+
+            let span = h.dom.children(dest)[0];
+            assert_eq!(h.dom.tag(span), Some("a"));
+            assert_eq!(
+                h.dom.node(span).attrs.get("href").map(String::as_str),
+                Some("https://example.com/")
+            );
+        }
+
+        #[test]
+        fn target_and_title_are_set_when_present() {
+            let (doc, ns) = parse_para(r#"<w:r><w:t>click</w:t></w:r>"#);
+            let mut h = Harness::new();
+            let dest = h.convert(doc.root_element(), &ns, &Relationships::default());
+            let run = ns
+                .descendants(doc.root_element(), &["w:r"])
+                .into_iter()
+                .next()
+                .unwrap();
+
+            let mut hl = FieldValues::new();
+            hl.insert(some("url"), some("https://example.com/"));
+            hl.insert(some("target"), some("_blank"));
+            hl.insert(some("title"), some("Example"));
+            let hyperlink_fields = vec![(hl, vec![run])];
+
+            resolve_links(&mut h.dom, &h.state, &Images::new(), &hyperlink_fields, &ns);
+
+            let span = h.dom.children(dest)[0];
+            assert_eq!(
+                h.dom.node(span).attrs.get("target").map(String::as_str),
+                Some("_blank")
+            );
+            assert_eq!(
+                h.dom.node(span).attrs.get("title").map(String::as_str),
+                Some("Example")
+            );
+        }
+
+        #[test]
+        fn an_anchor_field_resolves_against_anchor_map() {
+            let (doc, ns) = parse_para(r#"<w:r><w:t>see below</w:t></w:r>"#);
+            let mut h = Harness::new();
+            let dest = h.convert(doc.root_element(), &ns, &Relationships::default());
+            let run = ns
+                .descendants(doc.root_element(), &["w:r"])
+                .into_iter()
+                .next()
+                .unwrap();
+            h.state
+                .anchor_map
+                .insert("bookmark1".to_string(), "id_bookmark1".to_string());
+
+            let mut hl = FieldValues::new();
+            hl.insert(some("anchor"), some("bookmark1"));
+            let hyperlink_fields = vec![(hl, vec![run])];
+
+            resolve_links(&mut h.dom, &h.state, &Images::new(), &hyperlink_fields, &ns);
+
+            let span = h.dom.children(dest)[0];
+            assert_eq!(
+                h.dom.node(span).attrs.get("href").map(String::as_str),
+                Some("#id_bookmark1")
+            );
+        }
+
+        #[test]
+        fn an_anchor_field_with_no_matching_bookmark_gets_no_href() {
+            let (doc, ns) = parse_para(r#"<w:r><w:t>see below</w:t></w:r>"#);
+            let mut h = Harness::new();
+            let dest = h.convert(doc.root_element(), &ns, &Relationships::default());
+            let run = ns
+                .descendants(doc.root_element(), &["w:r"])
+                .into_iter()
+                .next()
+                .unwrap();
+
+            let mut hl = FieldValues::new();
+            hl.insert(some("anchor"), some("nowhere"));
+            let hyperlink_fields = vec![(hl, vec![run])];
+
+            resolve_links(&mut h.dom, &h.state, &Images::new(), &hyperlink_fields, &ns);
+
+            let span = h.dom.children(dest)[0];
+            assert_eq!(h.dom.tag(span), Some("a"));
+            assert!(h.dom.node(span).attrs.get("href").is_none());
+        }
+
+        #[test]
+        fn a_url_that_matches_an_anchor_name_resolves_internally() {
+            // Word sometimes generates a HYPERLINK field whose bare
+            // "url" argument is actually the name of an internal
+            // bookmark, rather than using `\l` explicitly.
+            let (doc, ns) = parse_para(r#"<w:r><w:t>see below</w:t></w:r>"#);
+            let mut h = Harness::new();
+            let dest = h.convert(doc.root_element(), &ns, &Relationships::default());
+            let run = ns
+                .descendants(doc.root_element(), &["w:r"])
+                .into_iter()
+                .next()
+                .unwrap();
+            h.state
+                .anchor_map
+                .insert("bookmark1".to_string(), "id_bookmark1".to_string());
+
+            let mut hl = FieldValues::new();
+            hl.insert(some("url"), some("bookmark1"));
+            let hyperlink_fields = vec![(hl, vec![run])];
+
+            resolve_links(&mut h.dom, &h.state, &Images::new(), &hyperlink_fields, &ns);
+
+            let span = h.dom.children(dest)[0];
+            assert_eq!(
+                h.dom.node(span).attrs.get("href").map(String::as_str),
+                Some("#id_bookmark1")
+            );
+        }
+
+        #[test]
+        fn a_run_with_no_html_counterpart_is_skipped() {
+            let (doc, ns) = parse_para(r#"<w:r><w:t>click</w:t></w:r>"#);
+            let h_state = ConvertState::new(); // empty object_map
+            let mut dom = Dom::empty();
+            let run = ns
+                .descendants(doc.root_element(), &["w:r"])
+                .into_iter()
+                .next()
+                .unwrap();
+
+            let mut hl = FieldValues::new();
+            hl.insert(some("url"), some("https://example.com/"));
+            let hyperlink_fields = vec![(hl, vec![run])];
+
+            let before = dom.children(dom.root).len();
+            resolve_links(&mut dom, &h_state, &Images::new(), &hyperlink_fields, &ns);
+            assert_eq!(dom.children(dom.root).len(), before, "nothing to wrap");
         }
     }
 }
@@ -6640,6 +7064,249 @@ mod apply_paragraph_frames_tests {
 }
 
 #[cfg(test)]
+mod assign_xe_anchors_tests {
+    use super::*;
+    use crate::docx::fields::XeFieldData;
+    use roxmltree::Document;
+
+    const DOC_OPEN: &str =
+        r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main""#;
+
+    fn parse_run(body: &str) -> (Document<'static>, DocxNamespace) {
+        let xml: &'static str = Box::leak(format!("<w:r {DOC_OPEN}>{body}</w:r>").into_boxed_str());
+        (
+            Document::parse(xml).expect("valid XML"),
+            DocxNamespace::default(),
+        )
+    }
+
+    fn xe<'a, 'i>(fld: Node<'a, 'i>, text: &str) -> XeFieldData<'a, 'i> {
+        XeFieldData {
+            text: text.to_string(),
+            entry_type: None,
+            page_number_text: None,
+            start: fld,
+            end: fld,
+        }
+    }
+
+    #[test]
+    fn assigns_a_fresh_id_and_stamps_it_on_the_enclosing_run() {
+        let (doc, ns) = parse_run(r#"<w:fldChar w:fldCharType="begin"/>"#);
+        let run = doc.root_element();
+        let fld = ns
+            .descendants(run, &["w:fldChar"])
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let mut dom = Dom::empty();
+        let span = dom.new_element("span");
+        let mut state = ConvertState::new();
+        state.object_map.insert(span, run);
+
+        let result = assign_xe_anchors(&mut dom, &state, &[xe(fld, "Apple")], &ns);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].text, "Apple");
+        assert_eq!(result[0].anchor, "index-1");
+        assert_eq!(dom.node(span).attrs.get("id"), Some(&"index-1".to_string()));
+    }
+
+    #[test]
+    fn reuses_an_existing_id_instead_of_stamping_a_new_one() {
+        let (doc, ns) = parse_run(r#"<w:fldChar w:fldCharType="begin"/>"#);
+        let run = doc.root_element();
+        let fld = ns
+            .descendants(run, &["w:fldChar"])
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let mut dom = Dom::empty();
+        let span = dom.new_element("span");
+        dom.node_mut(span)
+            .attrs
+            .insert("id".to_string(), "id_realbookmark".to_string());
+        let mut state = ConvertState::new();
+        state.object_map.insert(span, run);
+
+        let result = assign_xe_anchors(&mut dom, &state, &[xe(fld, "Apple")], &ns);
+
+        assert_eq!(result[0].anchor, "id_realbookmark");
+    }
+
+    #[test]
+    fn generated_ids_avoid_colliding_with_existing_anchor_map_values() {
+        let (doc, ns) = parse_run(r#"<w:fldChar w:fldCharType="begin"/>"#);
+        let run = doc.root_element();
+        let fld = ns
+            .descendants(run, &["w:fldChar"])
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let mut dom = Dom::empty();
+        let span = dom.new_element("span");
+        let mut state = ConvertState::new();
+        state.object_map.insert(span, run);
+        state
+            .anchor_map
+            .insert("chap1".to_string(), "index-1".to_string());
+
+        let result = assign_xe_anchors(&mut dom, &state, &[xe(fld, "Apple")], &ns);
+
+        assert_eq!(result[0].anchor, "index-2");
+    }
+
+    #[test]
+    fn a_field_whose_run_was_never_converted_is_skipped() {
+        let (doc, ns) = parse_run(r#"<w:fldChar w:fldCharType="begin"/>"#);
+        let run = doc.root_element();
+        let fld = ns
+            .descendants(run, &["w:fldChar"])
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let mut dom = Dom::empty();
+        let state = ConvertState::new(); // empty object_map
+
+        let result = assign_xe_anchors(&mut dom, &state, &[xe(fld, "Apple")], &ns);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn two_fields_in_the_same_run_get_distinct_ids() {
+        let (doc, ns) =
+            parse_run(r#"<w:fldChar w:fldCharType="begin"/><w:fldChar w:fldCharType="end"/>"#);
+        let run = doc.root_element();
+        let flds = ns.descendants(run, &["w:fldChar"]);
+
+        let mut dom = Dom::empty();
+        let span = dom.new_element("span");
+        let mut state = ConvertState::new();
+        state.object_map.insert(span, run);
+
+        let result = assign_xe_anchors(
+            &mut dom,
+            &state,
+            &[xe(flds[0], "Apple"), xe(flds[1], "Banana")],
+            &ns,
+        );
+
+        // Both fields share the same enclosing run's HTML element,
+        // which already got an id from the first field -- the second
+        // reuses it, matching the "existing id wins" rule.
+        assert_eq!(result[0].anchor, "index-1");
+        assert_eq!(result[1].anchor, "index-1");
+    }
+}
+
+#[cfg(test)]
+mod apply_index_fields_tests {
+    use super::*;
+    use roxmltree::Document;
+
+    const DOC_OPEN: &str =
+        r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main""#;
+
+    fn parse_root(body: &str) -> (Document<'static>, DocxNamespace) {
+        let xml: &'static str =
+            Box::leak(format!("<w:root {DOC_OPEN}>{body}</w:root>").into_boxed_str());
+        (
+            Document::parse(xml).expect("valid XML"),
+            DocxNamespace::default(),
+        )
+    }
+
+    #[test]
+    fn replaces_the_old_placeholder_with_generated_entries() {
+        let (doc, ns) = parse_root(r#"<w:p><w:r><w:t>OLD INDEX</w:t></w:r></w:p>"#);
+        let old_p = ns
+            .descendants(doc.root_element(), &["w:p"])
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let mut dom = Dom::empty();
+        let body = dom.new_element("body");
+        dom.append_child(dom.root, body);
+        let before = dom.new_element("p");
+        dom.append_child(body, before);
+        let old_p_html = dom.new_element("p");
+        dom.append_child(body, old_p_html);
+        let after = dom.new_element("p");
+        dom.append_child(body, after);
+
+        let mut state = ConvertState::new();
+        state.object_map.insert(old_p_html, old_p);
+
+        let index_field = super::super::index::IndexField::default();
+        let index_fields = vec![(index_field, vec![old_p])];
+        let xe_field = super::super::index::XeField {
+            text: "Apple".to_string(),
+            entry_type: None,
+            page_number_text: None,
+            anchor: "index-1".to_string(),
+            start_elem: doc.root_element(),
+        };
+
+        apply_index_fields(&mut dom, &index_fields, &[xe_field], &state, &ns);
+
+        assert!(
+            dom.parent(old_p_html).is_none(),
+            "the old placeholder is detached"
+        );
+        let children = dom.children(body);
+        assert_eq!(children.len(), 3, "before, the generated entry, after");
+        assert_eq!(children[0], before);
+        assert_eq!(children[2], after);
+        let link = dom
+            .find_all_tag(children[1], "a")
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(dom.text_content(link), "Apple");
+        assert_eq!(
+            dom.node(link).attrs.get("href").map(String::as_str),
+            Some("#index-1")
+        );
+    }
+
+    #[test]
+    fn an_index_field_whose_placeholder_was_never_converted_is_skipped() {
+        let (doc, ns) = parse_root(r#"<w:p><w:r><w:t>OLD INDEX</w:t></w:r></w:p>"#);
+        let old_p = ns
+            .descendants(doc.root_element(), &["w:p"])
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let mut dom = Dom::empty();
+        let body = dom.new_element("body");
+        dom.append_child(dom.root, body);
+        let state = ConvertState::new(); // old_p never converted -- empty object_map
+
+        let index_field = super::super::index::IndexField::default();
+        let index_fields = vec![(index_field, vec![old_p])];
+
+        apply_index_fields(&mut dom, &index_fields, &[], &state, &ns);
+
+        assert_eq!(dom.children(body).len(), 0, "nothing to insert relative to");
+    }
+
+    #[test]
+    fn no_index_fields_at_all_is_a_no_op() {
+        let mut dom = Dom::empty();
+        let state = ConvertState::new();
+        let ns = DocxNamespace::default();
+        apply_index_fields(&mut dom, &[], &[], &state, &ns);
+        assert!(dom.children(dom.root).is_empty());
+    }
+}
+
+#[cfg(test)]
 mod convert_document_tests {
     use super::*;
     use crate::docx::tables::Tables;
@@ -7042,6 +7709,47 @@ mod convert_docx_document_tests {
 
         let ncx = std::fs::read_to_string(dir.path().join("toc.ncx")).unwrap();
         assert!(ncx.contains("Chapter One"));
+    }
+
+    #[test]
+    fn a_hyperlink_field_resolves_end_to_end() {
+        const DOC_XML_WITH_FIELD: &str = r#"<?xml version="1.0"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p>
+      <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+      <w:r><w:instrText> HYPERLINK "http://example.com" </w:instrText></w:r>
+      <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+      <w:r><w:t>click here</w:t></w:r>
+      <w:r><w:fldChar w:fldCharType="end"/></w:r>
+    </w:p>
+  </w:body>
+</w:document>"#;
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let options = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (name, content) in [
+                ("[Content_Types].xml", CONTENT_TYPES),
+                ("_rels/.rels", RELS),
+                ("word/document.xml", DOC_XML_WITH_FIELD),
+            ] {
+                zip.start_file(name, options).unwrap();
+                zip.write_all(content.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let mut docx = Docx::new(Cursor::new(buf)).expect("package opens");
+        let dir = tempfile::tempdir().unwrap();
+
+        convert_docx_document(&mut docx, dir.path(), true, "Notes").expect("conversion succeeds");
+
+        let index = std::fs::read_to_string(dir.path().join("index.html")).unwrap();
+        assert!(
+            index.contains(r#"<a href="http://example.com">click here</a>"#),
+            "the HYPERLINK field resolved to a real link: {index}"
+        );
     }
 
     #[test]

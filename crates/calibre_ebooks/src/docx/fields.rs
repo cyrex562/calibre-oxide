@@ -1,12 +1,12 @@
-//! Port of `old_src/src/calibre/ebooks/docx/fields.py` (issue #290):
-//! the pure field-instruction parsing half ([`Field`], the
-//! `\flag "quoted word" bareword`-syntax [`scan`]ner, and its five
-//! named parsers -- [`parse_hyperlink`]/[`parse_xe`]/[`parse_index`]/
-//! [`parse_ref`]/[`parse_noteref`]), plus [`FieldsCollector`]: the
-//! source-tree-only half of the `Fields` orchestrator (`__call__`'s
-//! stack-based walk collecting `w:fldChar`/`w:fldSimple` field
-//! boundaries into [`Field`]s, dispatching each by name to the
-//! parsers above).
+//! Port of `old_src/src/calibre/ebooks/docx/fields.py` (issue #290),
+//! now fully ported: the pure field-instruction parsing half
+//! ([`Field`], the `\flag "quoted word" bareword`-syntax [`scan`]ner,
+//! and its five named parsers -- [`parse_hyperlink`]/[`parse_xe`]/
+//! [`parse_index`]/[`parse_ref`]/[`parse_noteref`]), plus
+//! [`FieldsCollector`]: the source-tree-only half of the `Fields`
+//! orchestrator (`__call__`'s stack-based walk collecting
+//! `w:fldChar`/`w:fldSimple` field boundaries into [`Field`]s,
+//! dispatching each by name to the parsers above).
 //!
 //! [`FieldsCollector::collect`] runs before the main body walk (same
 //! as Python's own `self.fields(doc, self.log)`, called right after
@@ -14,35 +14,40 @@
 //! What it *doesn't* do, unlike Python's single-pass `Fields.__call__`,
 //! is call `docx/index.rs`'s `process_index` inline or assign an `XE`
 //! field's anchor id -- both need the HTML tree/`ConvertState::object_map`
-//! that only exists *after* the main body walk. This was the open
-//! architectural question issue #290 was tracked as blocked on
-//! (real `crate::xmltree` source-tree mutation vs. a side-table) --
-//! resolved the same way `docx/index.rs`'s own `process_index` (issue
-//! #293, closed) resolved it: the synthetic bookmark's only real
-//! purpose is giving a *name* to `field.start`'s (a real,
-//! already-parsed node's) eventual HTML position, so a later pass,
-//! not yet written, can just look up whichever HTML element
-//! `field.start`'s enclosing `w:r` became (via `object_map`'s reverse
-//! lookup -- the same technique `to_html.rs`'s own `resolve_links`
-//! already uses for its own deferred `Fields.hyperlink_fields` block)
-//! and stamp an `id` there directly -- no real tree mutation needed.
+//! that only exists *after* the main body walk, so `to_html.rs`'s
+//! `convert_document` calls three more functions once it does:
+//! `assign_xe_anchors` (the deferred half of `parse_xe`'s synthetic
+//! bookmark -- a real, if perhaps surprising, resolution: unlike a
+//! real bookmark, an `XE` field's synthetic anchor name is never
+//! referenced by name anywhere else, so this skips `state.anchor_map`
+//! entirely and just stamps a final id straight onto the HTML), then
+//! `resolve_links` (extended with the `hyperlink_fields` block it was
+//! always missing), then, near the very end (matching where Python's
+//! own `Fields.polish_markup` runs), `apply_index_fields` (calls
+//! `process_index`/`polish_index_markup` for each collected `INDEX`
+//! field, once every `XE` field has a real anchor).
 //!
-//! Still needed, none of it blocked on any open design question
-//! anymore: a post-body-walk pass assigning each `XeFieldData`'s
-//! anchor id (with the same document-wide uniqueness check Python's
-//! own `index_bookmark_prefix` loop makes, checked against the HTML
-//! ids already in use rather than a source-tree `@w:id` scan) and
-//! stamping it; calling `process_index` for each collected `INDEX`
-//! field once every `XE` field's anchor is assigned (a genuine,
-//! disclosed divergence from Python here: since this happens *after*
-//! the whole document is walked rather than inline during a single
-//! pass, an `INDEX` field here sees every `XE` field in the document,
-//! not just the ones Python's own single pass had already dispatched
-//! by the time it reached that `INDEX` field -- see
-//! [`FieldsCollector`]'s own docs); and resolving
-//! `FieldsCollector::hyperlink_fields` into real `<a>` elements,
-//! extending `to_html.rs`'s `resolve_links` with the block it was
-//! always missing for this input source specifically.
+//! This was the open architectural question issue #290 was tracked as
+//! blocked on (real `crate::xmltree` source-tree mutation vs. a
+//! side-table) -- resolved the same way `docx/index.rs`'s own
+//! `process_index` (issue #293, closed) resolved it: the synthetic
+//! bookmark's only real purpose is giving a *name* to `field.start`'s
+//! (a real, already-parsed node's) eventual HTML position, so a later
+//! pass can just look up whichever HTML element `field.start`'s
+//! enclosing `w:r` became (via `object_map`'s reverse lookup -- the
+//! same technique `to_html.rs`'s own `resolve_links` already used for
+//! its `link_map`/`images.links` blocks) and stamp an `id` there
+//! directly -- no real tree mutation needed anywhere in the entire
+//! docx port, in the end.
+//!
+//! One genuine, disclosed behavioral divergence from Python survives:
+//! since `process_index` only runs *after* the whole document is
+//! walked, rather than inline during Python's own single pass, an
+//! `INDEX` field here sees every `XE` field in the document, not just
+//! the ones Python's own single pass had already dispatched by the
+//! time it reached that `INDEX` field (an accident of Python's own
+//! architecture, not a deliberate design choice -- see
+//! `to_html.rs`'s `apply_index_fields` for the full reasoning).
 //!
 //! `parser(...)`'s returned closure has an unused `log` parameter,
 //! dropped here since the closure body never references it.
