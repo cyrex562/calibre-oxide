@@ -1,42 +1,48 @@
-//! Port of `old_src/src/calibre/ebooks/docx/fields.py` -- **the pure
-//! field-instruction parsing half only** (issue #290): the [`Field`]
-//! accumulator and the `\flag "quoted word" bareword`-syntax
-//! [`scan`]ner plus its five named parsers ([`parse_hyperlink`]/
-//! [`parse_xe`]/[`parse_index`]/[`parse_ref`]/[`parse_noteref`]).
+//! Port of `old_src/src/calibre/ebooks/docx/fields.py` (issue #290):
+//! the pure field-instruction parsing half ([`Field`], the
+//! `\flag "quoted word" bareword`-syntax [`scan`]ner, and its five
+//! named parsers -- [`parse_hyperlink`]/[`parse_xe`]/[`parse_index`]/
+//! [`parse_ref`]/[`parse_noteref`]), plus [`FieldsCollector`]: the
+//! source-tree-only half of the `Fields` orchestrator (`__call__`'s
+//! stack-based walk collecting `w:fldChar`/`w:fldSimple` field
+//! boundaries into [`Field`]s, dispatching each by name to the
+//! parsers above).
 //!
-//! The `Fields` orchestrator itself (`__call__`'s stack-based walk
-//! over the source document collecting `w:fldChar`/`w:fldSimple`
-//! field boundaries into [`Field`]s, `get_runs`, and the *method*-level
-//! `parse_hyperlink`/`parse_ref`/`parse_xe`/`parse_index`/
-//! `polish_markup` -- same names as this file's module-level parsers,
-//! but a different, field-*dispatching* role) is a separate, larger
-//! follow-up, still unported:
+//! [`FieldsCollector::collect`] runs before the main body walk (same
+//! as Python's own `self.fields(doc, self.log)`, called right after
+//! `resolve_alternate_content`), since it only reads the source tree.
+//! What it *doesn't* do, unlike Python's single-pass `Fields.__call__`,
+//! is call `docx/index.rs`'s `process_index` inline or assign an `XE`
+//! field's anchor id -- both need the HTML tree/`ConvertState::object_map`
+//! that only exists *after* the main body walk. This was the open
+//! architectural question issue #290 was tracked as blocked on
+//! (real `crate::xmltree` source-tree mutation vs. a side-table) --
+//! resolved the same way `docx/index.rs`'s own `process_index` (issue
+//! #293, closed) resolved it: the synthetic bookmark's only real
+//! purpose is giving a *name* to `field.start`'s (a real,
+//! already-parsed node's) eventual HTML position, so a later pass,
+//! not yet written, can just look up whichever HTML element
+//! `field.start`'s enclosing `w:r` became (via `object_map`'s reverse
+//! lookup -- the same technique `to_html.rs`'s own `resolve_links`
+//! already uses for its own deferred `Fields.hyperlink_fields` block)
+//! and stamp an `id` there directly -- no real tree mutation needed.
 //!
-//! - `parse_xe` inserts a synthetic `w:bookmarkStart`/`w:bookmarkEnd`
-//!   pair into the *source* document tree so a later pass can link to
-//!   an index entry. This was thought to need real source-tree
-//!   mutation (`crate::xmltree`, see `docx/mod.rs`'s module docs) --
-//!   `docx/index.rs`'s own module docs now disclose why that turned
-//!   out unnecessary once `index.py`'s consumer side was actually
-//!   ported (issue #293, closed): the synthetic bookmark's only real
-//!   purpose is giving a *name* to `field.start`'s (a real, already-
-//!   parsed node's) eventual HTML position. A tracked side-table
-//!   mapping the anchor name to `field.start`, consulted wherever this
-//!   port's own anchor-assignment logic (`ConvertState::anchor_map`,
-//!   `apply_new_anchor`) runs during the main body walk, should work
-//!   the same way `index.rs`'s `process_index` does -- building the
-//!   HTML directly rather than reproducing Python's insert-then-rewalk
-//!   indirection. Still needs doing, but the open design question is
-//!   resolved.
-//! - `parse_index` and `polish_markup` call straight into `index.py`
-//!   (`process_index`/`polish_index_markup`), which **is now fully
-//!   ported** (issue #293, closed) -- `docx/index.rs`'s `process_index`
-//!   takes already-resolved [`super::index::XeField`]s (with `anchor`
-//!   already assigned) and builds the index page's HTML directly, so
-//!   this orchestrator's own job is: walk fields in one pass (as
-//!   Python does), build each `XeField`'s `anchor` via the bookmark
-//!   reframing above, and call `process_index` once ready -- no
-//!   further forward dependency remains.
+//! Still needed, none of it blocked on any open design question
+//! anymore: a post-body-walk pass assigning each `XeFieldData`'s
+//! anchor id (with the same document-wide uniqueness check Python's
+//! own `index_bookmark_prefix` loop makes, checked against the HTML
+//! ids already in use rather than a source-tree `@w:id` scan) and
+//! stamping it; calling `process_index` for each collected `INDEX`
+//! field once every `XE` field's anchor is assigned (a genuine,
+//! disclosed divergence from Python here: since this happens *after*
+//! the whole document is walked rather than inline during a single
+//! pass, an `INDEX` field here sees every `XE` field in the document,
+//! not just the ones Python's own single pass had already dispatched
+//! by the time it reached that `INDEX` field -- see
+//! [`FieldsCollector`]'s own docs); and resolving
+//! `FieldsCollector::hyperlink_fields` into real `<a>` elements,
+//! extending `to_html.rs`'s `resolve_links` with the block it was
+//! always missing for this input source specifically.
 //!
 //! `parser(...)`'s returned closure has an unused `log` parameter,
 //! dropped here since the closure body never references it.
@@ -44,6 +50,8 @@
 use std::collections::HashMap;
 
 use roxmltree::Node;
+
+use super::names::DocxNamespace;
 
 /// One in-progress or finished field, spanning from a `w:fldChar`
 /// begin (or a `w:fldSimple`) to its matching end. Port of `Field`.
@@ -295,6 +303,274 @@ pub fn parse_noteref(raw: &str) -> FieldValues {
     parse_instructions(raw, NOTEREF_FIELDS, None)
 }
 
+/// One `XE` field's data, collected by [`FieldsCollector::collect`]
+/// but not yet given an anchor id -- that assignment needs the HTML
+/// tree, deferred to a later pass (see [`FieldsCollector`]'s own
+/// docs for why).
+///
+/// Port of the `xe` dict `Fields.parse_xe` builds, minus `anchor`
+/// (assigned later) and `start_elem` (this struct's own `start`
+/// already is that node).
+#[derive(Debug, Clone)]
+pub struct XeFieldData<'a, 'i> {
+    pub text: String,
+    pub entry_type: Option<String>,
+    pub page_number_text: Option<String>,
+    pub start: Node<'a, 'i>,
+    pub end: Node<'a, 'i>,
+}
+
+/// Everything one pass over the source document gathers, before the
+/// main body walk runs.
+///
+/// Port of `Fields.__call__`'s field-collection-and-dispatch loop --
+/// with two real, disclosed differences from it, both forced by the
+/// same fact: `process_index` (`docx/index.rs`, issue #293) and
+/// stamping an `XE` field's anchor `id` both need the HTML tree
+/// (`crate::dom::Dom`/`ConvertState::object_map`) that only exists
+/// *after* the main body walk -- but Python's own `self.fields(doc,
+/// self.log)` runs *before* it (`Convert.__call__` calls it right
+/// after `resolve_alternate_content`, well before
+/// `read_page_properties`), and calls `process_index` for each
+/// `INDEX` field *inline*, during this same single pass:
+///
+/// - `xe_fields` here carries no `anchor` yet -- a later pass (not
+///   yet ported) assigns one per field, once the HTML tree exists, by
+///   finding whichever HTML element `start`'s enclosing `w:r` became
+///   (via `ConvertState::object_map`'s reverse lookup, the same
+///   technique `to_html.rs`'s own `resolve_links` already uses for
+///   its `hyperlink_fields` block) and stamping an `id` there.
+/// - `index_fields` holds each `INDEX` field's own parsed switches
+///   plus its `field.contents` -- not yet resolved into generated
+///   HTML blocks. Calling `process_index` for real needs to happen
+///   after that later pass, so every `XE` field in the *whole*
+///   document is available by then, not just the ones this walk had
+///   already dispatched by the time it reached a given `INDEX` field.
+///   This is a genuine, disclosed behavior change from Python's own
+///   single-pass architecture, where an `INDEX` field only ever sees
+///   `XE` fields that appear *before* it in document order (an
+///   accident of *when* `self.xe_fields` happens to have been
+///   populated, not a deliberate design choice) -- not reproduced,
+///   since there is nothing to reproduce a document-order accident
+///   *for*.
+///
+/// Port of `Fields.get_runs` sits alongside this as a free function
+/// ([`get_runs`]), since every dispatcher needs it and none of them
+/// are methods on anything stateful enough to own it.
+#[derive(Debug, Default)]
+pub struct FieldsCollector<'a, 'i> {
+    pub hyperlink_fields: Vec<(FieldValues, Vec<Node<'a, 'i>>)>,
+    pub xe_fields: Vec<XeFieldData<'a, 'i>>,
+    pub index_fields: Vec<(super::index::IndexField, Vec<Node<'a, 'i>>)>,
+    /// Field names encountered that aren't `HYPERLINK`/`hyperlink`,
+    /// `XE`/`xe`, `INDEX`/`index`, `REF`/`ref`, `NOTEREF`/`noteref`,
+    /// `TOC`/`toc`, or `PAGEREF`/`pageref` (`TOC`/`PAGEREF` are
+    /// handled elsewhere already -- `toc.py`'s own port for the
+    /// former, nothing at all for the latter, matching Python).
+    ///
+    /// Port of `log.warn(f'Encountered unknown field: {field.name},
+    /// ignoring it.')`, tracked as data instead of a log call -- no
+    /// logger threads through this module, same as every other
+    /// function in this crate that silently drops what Python would
+    /// have logged. Unlike Python's own `unknown_fields` set (which
+    /// exists purely to avoid warning about the *same* unknown field
+    /// name twice), this keeps every occurrence -- deduplication was
+    /// a log-spam concern, not something a data-collecting caller
+    /// needs.
+    pub unknown_fields: Vec<String>,
+}
+
+impl<'a, 'i> FieldsCollector<'a, 'i> {
+    /// Port of `Fields.__call__`. See [`FieldsCollector`]'s own docs
+    /// for what's deferred and why.
+    pub fn collect(document: Node<'a, 'i>, ns: &DocxNamespace) -> Self {
+        let mut fields: Vec<Field<'a, 'i>> = Vec::new();
+        let mut stack: Vec<usize> = Vec::new();
+
+        for elem in ns.descendants(
+            document,
+            &["w:p", "w:r", "w:instrText", "w:fldChar", "w:fldSimple"],
+        ) {
+            if ns.is_tag(elem, "w:fldChar") {
+                match ns.get(elem, "w:fldCharType") {
+                    Some("begin") => {
+                        fields.push(Field::new(elem));
+                        stack.push(fields.len() - 1);
+                    }
+                    Some("end") => {
+                        if let Some(idx) = stack.pop() {
+                            fields[idx].end = Some(elem);
+                        }
+                    }
+                    _ => {}
+                }
+            } else if ns.is_tag(elem, "w:instrText") {
+                if let Some(&idx) = stack.last() {
+                    fields[idx].add_instr(elem);
+                }
+            } else if ns.is_tag(elem, "w:fldSimple") {
+                if let Some(instr) = ns.get(elem, "w:instr").filter(|s| !s.is_empty()) {
+                    let mut field = Field::new(elem);
+                    field.add_raw(instr);
+                    for r in ns.descendants(elem, &["w:r"]) {
+                        field.contents.push(r);
+                    }
+                    fields.push(field);
+                }
+            } else if let Some(&idx) = stack.last() {
+                // A `w:p`/`w:r` encountered while a field is open.
+                fields[idx].contents.push(elem);
+            }
+        }
+
+        let mut result = FieldsCollector::default();
+        for mut field in fields {
+            field.finalize();
+            let Some(instructions) = field.instructions.as_deref().filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            let instructions = instructions.to_string();
+            let name = field.name.clone().unwrap_or_default();
+            match name.as_str() {
+                "HYPERLINK" | "hyperlink" => {
+                    dispatch_hyperlink(&mut result, &field, &instructions, ns)
+                }
+                "REF" | "ref" => dispatch_ref(&mut result, &field, &instructions, parse_ref, ns),
+                "NOTEREF" | "noteref" => {
+                    dispatch_ref(&mut result, &field, &instructions, parse_noteref, ns)
+                }
+                "XE" | "xe" => dispatch_xe(&mut result, &field, &instructions),
+                "INDEX" | "index" => dispatch_index(&mut result, &field, &instructions),
+                "TOC" | "toc" | "PAGEREF" | "pageref" => {}
+                other => result.unknown_fields.push(other.to_string()),
+            }
+        }
+        result
+    }
+}
+
+/// Splits `contents` (a field's `Field::contents`) into groups of
+/// consecutive `w:r` elements, one group per `w:p` boundary crossed
+/// -- "we only handle spans in a single paragraph being wrapped in
+/// `<a>`" (Python's own comment).
+///
+/// Port of `Fields.get_runs`.
+fn get_runs<'a, 'i>(contents: &[Node<'a, 'i>], ns: &DocxNamespace) -> Vec<Vec<Node<'a, 'i>>> {
+    let mut all_runs = Vec::new();
+    let mut current_runs: Vec<Node<'a, 'i>> = Vec::new();
+    for &x in contents {
+        if ns.is_tag(x, "w:p") {
+            if !current_runs.is_empty() {
+                all_runs.push(std::mem::take(&mut current_runs));
+            }
+        } else if ns.is_tag(x, "w:r") {
+            current_runs.push(x);
+        }
+    }
+    if !current_runs.is_empty() {
+        all_runs.push(current_runs);
+    }
+    all_runs
+}
+
+/// Port of `Fields.parse_hyperlink`.
+fn dispatch_hyperlink<'a, 'i>(
+    result: &mut FieldsCollector<'a, 'i>,
+    field: &Field<'a, 'i>,
+    instructions: &str,
+    ns: &DocxNamespace,
+) {
+    let mut hl = parse_hyperlink(instructions);
+    if hl.is_empty() {
+        return;
+    }
+    let target_key = Some("target".to_string());
+    if hl.get(&target_key) == Some(&None) {
+        hl.insert(target_key, Some("_blank".to_string()));
+    }
+    for runs in get_runs(&field.contents, ns) {
+        result.hyperlink_fields.push((hl.clone(), runs));
+    }
+}
+
+/// Port of `Fields.parse_ref` (also `Fields.parse_noteref`, an alias
+/// for the same method in Python -- `parse` is `parse_ref`/
+/// `parse_noteref` respectively at the two call sites).
+fn dispatch_ref<'a, 'i>(
+    result: &mut FieldsCollector<'a, 'i>,
+    field: &Field<'a, 'i>,
+    instructions: &str,
+    parse: fn(&str) -> FieldValues,
+    ns: &DocxNamespace,
+) {
+    let r = parse(instructions);
+    let dest = r.get(&None).cloned().flatten();
+    let has_hyperlink_flag = r.contains_key(&Some("hyperlink".to_string()));
+    let Some(dest) = dest.filter(|_| has_hyperlink_flag) else {
+        return; // log.warn(...), dropped -- see FieldsCollector's own docs.
+    };
+    let mut hl = FieldValues::new();
+    hl.insert(Some("anchor".to_string()), Some(dest));
+    for runs in get_runs(&field.contents, ns) {
+        result.hyperlink_fields.push((hl.clone(), runs));
+    }
+}
+
+/// Port of `Fields.parse_xe`, minus the synthetic bookmark insertion
+/// -- see [`FieldsCollector`]'s own docs for why that's deferred to a
+/// later pass instead.
+fn dispatch_xe<'a, 'i>(
+    result: &mut FieldsCollector<'a, 'i>,
+    field: &Field<'a, 'i>,
+    instructions: &str,
+) {
+    let Some(end) = field.end else { return };
+    let xe = parse_xe(instructions);
+    if xe.is_empty() {
+        return;
+    }
+    result.xe_fields.push(XeFieldData {
+        text: xe
+            .get(&Some("text".to_string()))
+            .cloned()
+            .flatten()
+            .unwrap_or_default(),
+        entry_type: xe.get(&Some("entry-type".to_string())).cloned().flatten(),
+        page_number_text: xe
+            .get(&Some("page-number-text".to_string()))
+            .cloned()
+            .flatten(),
+        start: field.start,
+        end,
+    });
+}
+
+/// Port of `Fields.parse_index`, minus the `process_index` call
+/// itself -- see [`FieldsCollector`]'s own docs for why that's
+/// deferred to a later pass instead.
+fn dispatch_index<'a, 'i>(
+    result: &mut FieldsCollector<'a, 'i>,
+    field: &Field<'a, 'i>,
+    instructions: &str,
+) {
+    if field.contents.is_empty() {
+        return;
+    }
+    let idx = parse_index(instructions);
+    let index_field = super::index::IndexField {
+        heading: idx.get(&Some("heading".to_string())).cloned().flatten(),
+        entry_type: idx.get(&Some("entry-type".to_string())).cloned().flatten(),
+        letter_range: idx
+            .get(&Some("letter-range".to_string()))
+            .cloned()
+            .flatten(),
+        bookmark: idx.get(&Some("bookmark".to_string())).cloned().flatten(),
+    };
+    result
+        .index_fields
+        .push((index_field, field.contents.clone()));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,5 +697,193 @@ mod tests {
         let mut field = Field::new(doc.root_element());
         field.add_raw("");
         assert!(field.name.is_none());
+    }
+
+    mod fields_collector_tests {
+        use super::*;
+        use roxmltree::Document;
+
+        const DOC_OPEN: &str =
+            r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main""#;
+
+        fn parse_root(body: &str) -> (Document<'static>, DocxNamespace) {
+            let xml: &'static str =
+                Box::leak(format!("<w:document {DOC_OPEN}>{body}</w:document>").into_boxed_str());
+            (
+                Document::parse(xml).expect("valid XML"),
+                DocxNamespace::default(),
+            )
+        }
+
+        /// A `w:fldChar`-based field spanning one paragraph: begin,
+        /// `instrText`, separate, a result run, end.
+        fn field_xml(instr: &str, result_text: &str) -> String {
+            format!(
+                r#"<w:p>
+                     <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+                     <w:r><w:instrText>{instr}</w:instrText></w:r>
+                     <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+                     <w:r><w:t>{result_text}</w:t></w:r>
+                     <w:r><w:fldChar w:fldCharType="end"/></w:r>
+                   </w:p>"#
+            )
+        }
+
+        #[test]
+        fn a_hyperlink_field_produces_one_hyperlink_entry_wrapping_every_run() {
+            let (doc, ns) = parse_root(&field_xml(r#" HYPERLINK "http://example.com" "#, "click"));
+            let result = FieldsCollector::collect(doc.root_element(), &ns);
+
+            assert_eq!(result.hyperlink_fields.len(), 1);
+            let (hl, runs) = &result.hyperlink_fields[0];
+            assert_eq!(hl.get(&some("url")), Some(&some("http://example.com")));
+            assert_eq!(runs.len(), 4, "every run seen while the field was open");
+        }
+
+        #[test]
+        fn a_hyperlink_field_with_a_bare_target_flag_defaults_to_blank() {
+            let (doc, ns) = parse_root(&field_xml(
+                r#" HYPERLINK "http://example.com" \t "#,
+                "click",
+            ));
+            let result = FieldsCollector::collect(doc.root_element(), &ns);
+
+            let (hl, _) = &result.hyperlink_fields[0];
+            assert_eq!(hl.get(&some("target")), Some(&some("_blank")));
+        }
+
+        #[test]
+        fn a_ref_field_with_the_hyperlink_switch_produces_an_anchor_entry() {
+            let (doc, ns) = parse_root(&field_xml(r" REF bookmark1 \h ", "text"));
+            let result = FieldsCollector::collect(doc.root_element(), &ns);
+
+            assert_eq!(result.hyperlink_fields.len(), 1);
+            let (hl, _) = &result.hyperlink_fields[0];
+            assert_eq!(hl.get(&some("anchor")), Some(&some("bookmark1")));
+        }
+
+        #[test]
+        fn a_ref_field_without_the_hyperlink_switch_is_dropped() {
+            let (doc, ns) = parse_root(&field_xml(r" REF bookmark1 ", "text"));
+            let result = FieldsCollector::collect(doc.root_element(), &ns);
+            assert!(result.hyperlink_fields.is_empty());
+        }
+
+        #[test]
+        fn a_noteref_field_behaves_like_ref() {
+            let (doc, ns) = parse_root(&field_xml(r" NOTEREF note1 \h ", "1"));
+            let result = FieldsCollector::collect(doc.root_element(), &ns);
+
+            assert_eq!(result.hyperlink_fields.len(), 1);
+            let (hl, _) = &result.hyperlink_fields[0];
+            assert_eq!(hl.get(&some("anchor")), Some(&some("note1")));
+        }
+
+        #[test]
+        fn an_xe_field_is_collected_with_its_start_and_end_nodes() {
+            let (doc, ns) = parse_root(&field_xml(r#" XE "Apple" \t "5" "#, ""));
+            let result = FieldsCollector::collect(doc.root_element(), &ns);
+
+            assert_eq!(result.xe_fields.len(), 1);
+            let xe = &result.xe_fields[0];
+            assert_eq!(xe.text, "Apple");
+            assert_eq!(xe.page_number_text.as_deref(), Some("5"));
+            assert!(ns.is_tag(xe.start, "w:fldChar"));
+            assert!(ns.is_tag(xe.end, "w:fldChar"));
+        }
+
+        #[test]
+        fn an_xe_field_with_no_matching_end_is_dropped() {
+            // No closing fldChar[end] at all -- field.end stays None.
+            let (doc, ns) = parse_root(
+                r#"<w:p>
+                     <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+                     <w:r><w:instrText> XE "Apple" </w:instrText></w:r>
+                   </w:p>"#,
+            );
+            let result = FieldsCollector::collect(doc.root_element(), &ns);
+            assert!(result.xe_fields.is_empty());
+        }
+
+        #[test]
+        fn an_index_field_with_content_is_collected() {
+            let (doc, ns) = parse_root(&field_xml(r#" INDEX \h "A" "#, "placeholder"));
+            let result = FieldsCollector::collect(doc.root_element(), &ns);
+
+            assert_eq!(result.index_fields.len(), 1);
+            let (idx, contents) = &result.index_fields[0];
+            assert_eq!(idx.heading.as_deref(), Some("A"));
+            assert!(!contents.is_empty());
+        }
+
+        #[test]
+        fn an_index_field_with_no_contents_is_dropped() {
+            let (doc, ns) = parse_root(
+                r#"<w:p>
+                     <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+                     <w:r><w:instrText> INDEX </w:instrText></w:r>
+                     <w:r><w:fldChar w:fldCharType="end"/></w:r>
+                   </w:p>"#,
+            );
+            let result = FieldsCollector::collect(doc.root_element(), &ns);
+            assert!(result.index_fields.is_empty());
+        }
+
+        #[test]
+        fn an_unknown_field_is_tracked_but_toc_and_pageref_are_not() {
+            let (doc, ns) = parse_root(&format!(
+                "{}{}{}",
+                field_xml(" FOOBAR arg1 ", "x"),
+                field_xml(" TOC \\o \"1-3\" ", "x"),
+                field_xml(" PAGEREF x ", "1")
+            ));
+            let result = FieldsCollector::collect(doc.root_element(), &ns);
+            assert_eq!(result.unknown_fields, vec!["FOOBAR".to_string()]);
+        }
+
+        #[test]
+        fn a_fldsimple_hyperlink_is_collected_too() {
+            let (doc, ns) = parse_root(
+                r#"<w:p>
+                     <w:fldSimple w:instr=" HYPERLINK &quot;http://example.com&quot; ">
+                       <w:r><w:t>click</w:t></w:r>
+                     </w:fldSimple>
+                   </w:p>"#,
+            );
+            let result = FieldsCollector::collect(doc.root_element(), &ns);
+
+            assert_eq!(result.hyperlink_fields.len(), 1);
+            let (hl, runs) = &result.hyperlink_fields[0];
+            assert_eq!(hl.get(&some("url")), Some(&some("http://example.com")));
+            assert_eq!(runs.len(), 1);
+        }
+
+        #[test]
+        fn nested_fields_each_produce_their_own_hyperlink_entry() {
+            // A REF field nested inside a HYPERLINK field's own
+            // display text. Each run seen while multiple fields are
+            // open goes to whichever field is *innermost* at that
+            // moment (Python's own `stack[-1]`, not every open
+            // field) -- both still end up with a well-formed
+            // (non-empty) `contents` here since the inner field's
+            // begin/end markers each get attributed to whichever
+            // field was on top of the stack when that specific run
+            // was visited.
+            let (doc, ns) = parse_root(
+                r#"<w:p>
+                     <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+                     <w:r><w:instrText> HYPERLINK "http://example.com" </w:instrText></w:r>
+                     <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+                     <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+                     <w:r><w:instrText> REF bookmark1 \h </w:instrText></w:r>
+                     <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+                     <w:r><w:t>inner</w:t></w:r>
+                     <w:r><w:fldChar w:fldCharType="end"/></w:r>
+                     <w:r><w:fldChar w:fldCharType="end"/></w:r>
+                   </w:p>"#,
+            );
+            let result = FieldsCollector::collect(doc.root_element(), &ns);
+            assert_eq!(result.hyperlink_fields.len(), 2);
+        }
     }
 }
