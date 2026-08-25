@@ -70,13 +70,19 @@
 //!   dependency after all, since this port already threads
 //!   relationships through `convert_p`/`convert_body` as an explicit
 //!   parameter rather than Python's mutable `self.current_rels`).
+//! - [`resolve_alternate_content`]/[`AlternateContent`]: normalizes
+//!   `mc:AlternateContent`/`mc:Choice`/`mc:Fallback` compatibility
+//!   markup -- as a tracked side-table, not real tree mutation, since
+//!   this crate's `roxmltree` pipeline is read-only (same established
+//!   precedent as `tables.rs`'s `Table::removed_cells`). Called once,
+//!   up front, by [`convert_document`].
 //! - [`convert_document`]: the orchestrator tying every piece above
 //!   together in `Convert.__call__`'s real sequence, plus `write`'s
 //!   own first line (`create_toc`) -- issue #288's remaining scope,
-//!   minus `resolve_alternate_content` (source-tree mutation, the
-//!   same open question as issues #290/#293) and `fields.py`'s
-//!   `Fields` orchestrator (issue #290) -- see its own doc comment
-//!   for exactly what's excluded and why.
+//!   minus `fields.py`'s `Fields` orchestrator (issue #290, the same
+//!   open source-tree-mutation question issue #293 is also blocked
+//!   on) -- see its own doc comment for exactly what's excluded and
+//!   why.
 //! - [`build_html_document`]/[`write_document`]: `Convert.__init__`'s
 //!   `<html><head>...` skeleton construction and `Convert.write`'s
 //!   `index.html`/`metadata.opf`/`toc.ncx` output, built on
@@ -142,6 +148,104 @@ use super::tables::Table;
 use super::theme::Theme;
 use super::toc::{self, Toc};
 
+/// The result of [`resolve_alternate_content`]: what every
+/// `mc:AlternateContent` element in a document resolved to, for
+/// [`convert_p`]'s outer descendant walk and [`convert_run`]'s
+/// per-child loop to consult.
+///
+/// Port of `Convert.resolve_alternate_content`'s effect on the
+/// document tree -- as a tracked side-table rather than genuine tree
+/// mutation, since this crate's read-only `roxmltree` pipeline can't
+/// remove or insert nodes. Same established precedent as
+/// `tables.rs`'s `Table::removed_cells` (`roxmltree::Node` is
+/// `Hash`/`Eq`, id-based, so a `HashSet`/`HashMap` of real nodes
+/// tracks exactly what real tree mutation would have expressed).
+#[derive(Debug, Default)]
+pub struct AlternateContent<'a, 'i> {
+    /// Every `mc:Choice` element that would have been removed
+    /// (`ac.remove(choice)`, Python's own unconditional first step
+    /// once `ac` has at least one `mc:Fallback`) -- so that walking a
+    /// document for real content skips whatever proprietary/
+    /// newer-OOXML markup a `mc:Choice` carries, the same way
+    /// deleting it from the tree would. Only [`convert_p`]'s own
+    /// outer descendant walk (the main body/note walk, by far the
+    /// most consequential one for avoiding duplicate content) checks
+    /// this -- narrower call sites (`read_block_anchors`, `toc.rs`,
+    /// etc.) walking into a surviving `mc:Choice`'s content is a
+    /// disclosed, real, exceedingly narrow-scope gap: a `w:r`, a
+    /// bookmark, or a heading buried inside compatibility markup
+    /// wouldn't be excluded there. `mc:Fallback` itself is never
+    /// excluded -- Python doesn't remove it either.
+    pub excluded_choices: HashSet<Node<'a, 'i>>,
+    /// `mc:AlternateContent` -> the real node it should be treated as
+    /// being, for the one case Python's own function special-cases:
+    /// exactly one `mc:Fallback`, `ac`'s parent is a `w:r`, and that
+    /// fallback's sole child is `w:drawing` or `w:pict`. Consulted by
+    /// [`convert_run`]'s per-child loop.
+    pub substitutions: HashMap<Node<'a, 'i>, Node<'a, 'i>>,
+}
+
+impl<'a, 'i> AlternateContent<'a, 'i> {
+    /// Whether `node` sits inside an excluded `mc:Choice`, directly or
+    /// via any ancestor.
+    pub fn is_excluded(&self, node: Node<'a, 'i>) -> bool {
+        if self.excluded_choices.is_empty() {
+            return false;
+        }
+        std::iter::once(node)
+            .chain(node.ancestors())
+            .any(|n| self.excluded_choices.contains(&n))
+    }
+}
+
+/// Port of `Convert.resolve_alternate_content`. See [`AlternateContent`]
+/// for why this returns a side-table rather than mutating `document`.
+///
+/// For every `mc:AlternateContent` with at least one `mc:Fallback`
+/// child: records every `mc:Choice` child in
+/// [`AlternateContent::excluded_choices`] (Python's unconditional
+/// `for choice in choices: ac.remove(choice)`). Additionally, when
+/// there's exactly one `mc:Fallback`, `ac`'s parent is a `w:r`, and
+/// that fallback has exactly one child element which is `w:drawing`
+/// or `w:pict`, records `ac -> that child` in
+/// [`AlternateContent::substitutions`] -- Python's own
+/// `p.insert(idx, q); p.remove(ac)`, i.e. "replace `ac` with its
+/// fallback's real drawing/pict content" -- expressed here as "when
+/// you would process `ac`, process this real node instead" rather
+/// than an actual tree splice.
+pub fn resolve_alternate_content<'a, 'i>(
+    document: Node<'a, 'i>,
+    ns: &DocxNamespace,
+) -> AlternateContent<'a, 'i> {
+    let mut result = AlternateContent::default();
+    for ac in ns.descendants(document, &["mc:AlternateContent"]) {
+        let choices = ns.children(ac, &["mc:Choice"]);
+        let fallbacks = ns.children(ac, &["mc:Fallback"]);
+        if fallbacks.is_empty() {
+            continue;
+        }
+        result.excluded_choices.extend(choices);
+
+        if fallbacks.len() != 1 {
+            continue;
+        }
+        let Some(parent) = ac.parent() else { continue };
+        if !ns.is_tag(parent, "w:r") {
+            continue;
+        }
+        let fallback_children: Vec<Node> =
+            fallbacks[0].children().filter(|c| c.is_element()).collect();
+        if fallback_children.len() != 1 {
+            continue;
+        }
+        let q = fallback_children[0];
+        if ns.is_tag(q, "w:drawing") || ns.is_tag(q, "w:pict") {
+            result.substitutions.insert(ac, q);
+        }
+    }
+    result
+}
+
 /// Converts one `w:r` into a `<span>` in `dom`, returning its `NodeId`.
 /// See the module docs for what's deferred.
 ///
@@ -167,11 +271,17 @@ pub fn convert_run<'a, 'i, R: Read + Seek>(
     dest_dir: &Path,
     page: &PageProperties,
     rels: &Relationships,
+    alt_content: &AlternateContent<'a, 'i>,
     ns: &DocxNamespace,
 ) -> NodeId {
     let span = dom.new_element("span");
 
     for child in run.children().filter(|c| c.is_element()) {
+        let child = alt_content
+            .substitutions
+            .get(&child)
+            .copied()
+            .unwrap_or(child);
         if ns.is_tag(child, "w:t") {
             append_run_text(dom, span, child, ns);
         } else if ns.is_tag(child, "w:cr") {
@@ -543,6 +653,7 @@ pub fn convert_p<'a, 'i, R: Read + Seek>(
     dest_dir: &Path,
     page: &PageProperties,
     rels: &Relationships,
+    alt_content: &AlternateContent<'a, 'i>,
     ns: &DocxNamespace,
 ) -> NodeId {
     let dest = dom.new_element("p");
@@ -561,10 +672,28 @@ pub fn convert_p<'a, 'i, R: Read + Seek>(
             // this one.
             continue;
         }
+        if alt_content.is_excluded(x) {
+            // Inside a `mc:Choice` `resolve_alternate_content` would
+            // have deleted -- see `AlternateContent`'s own docs.
+            continue;
+        }
         if ns.is_tag(x, "w:r") {
             let span = convert_run(
-                dom, x, styles, footnotes, settings, theme, doc_lang, uuid, images, docx, dest_dir,
-                page, rels, ns,
+                dom,
+                x,
+                styles,
+                footnotes,
+                settings,
+                theme,
+                doc_lang,
+                uuid,
+                images,
+                docx,
+                dest_dir,
+                page,
+                rels,
+                alt_content,
+                ns,
             );
             if let Some(anchor) = current_anchor.take() {
                 let target = if dom.children(dest).is_empty() {
@@ -885,6 +1014,7 @@ pub fn convert_body<'a, 'i, R: Read + Seek>(
     docx: &mut Docx<R>,
     dest_dir: &Path,
     rels: &Relationships,
+    alt_content: &AlternateContent<'a, 'i>,
     ns: &DocxNamespace,
 ) -> (
     NodeId,
@@ -901,8 +1031,22 @@ pub fn convert_body<'a, 'i, R: Read + Seek>(
     for (&wp, page) in page_map.iter() {
         if ns.is_tag(wp, "w:p") {
             let p = convert_p(
-                dom, state, wp, styles, footnotes, settings, theme, doc_lang, uuid, images, docx,
-                dest_dir, page, rels, ns,
+                dom,
+                state,
+                wp,
+                styles,
+                footnotes,
+                settings,
+                theme,
+                doc_lang,
+                uuid,
+                images,
+                docx,
+                dest_dir,
+                page,
+                rels,
+                alt_content,
+                ns,
             );
             dom.append_child(body, p);
             paras.push(wp);
@@ -2316,6 +2460,7 @@ pub fn convert_footnotes<'a, 'i, R: Read + Seek>(
                     dest_dir,
                     &current_page,
                     &note.rels,
+                    &AlternateContent::default(),
                     ns,
                 );
                 dom.append_child(dd, p);
@@ -2427,14 +2572,19 @@ pub fn build_html_document(
 /// instead of mutable instance state, so no separate `images(...)`
 /// initialization step exists here).
 ///
-/// Two things `Convert.__call__` itself does that this deliberately
-/// leaves out, each documented elsewhere rather than repeated here:
-/// `resolve_alternate_content`
-/// (inserts a `mc:Fallback`'s real content in place of a proprietary
-/// `mc:AlternateContent` wrapper -- genuine *source*-tree mutation,
-/// the same open architectural question issues #290/#293 are blocked
-/// on), and `self.fields(...)`/`self.fields.polish_markup(...)` (needs
-/// `fields.py`'s `Fields` orchestrator, issue #290).
+/// Calls [`resolve_alternate_content`] up front (matching Python's
+/// own `self.resolve_alternate_content(doc)`, the first line of
+/// `Convert.__call__`) and threads the result through the whole body
+/// walk -- but NOT through [`convert_footnotes`]'s own note-body
+/// conversions, matching Python precisely: `resolve_alternate_content`
+/// is only ever called on the main document, never on a footnote's or
+/// endnote's own separately-parsed tree.
+///
+/// One thing `Convert.__call__` itself does that this deliberately
+/// leaves out, documented elsewhere rather than repeated here:
+/// `self.fields(...)`/`self.fields.polish_markup(...)` (needs
+/// `fields.py`'s `Fields` orchestrator, issue #290 -- blocked on the
+/// same open source-tree-mutation question issue #293 is).
 ///
 /// Port of `Convert.__call__` (`read_page_properties` through
 /// `cleanup_markup`) and the `create_toc` call at the top of
@@ -2459,10 +2609,24 @@ pub fn convert_document<'a, 'i, R: Read + Seek>(
     ns: &DocxNamespace,
 ) -> ConvertedDocument<'a, 'i> {
     let mut state = ConvertState::new();
+    let alt_content = resolve_alternate_content(document, ns);
 
     let (body, paras, mut page_map, _section_starts) = convert_body(
-        dom, document, &mut state, styles, footnotes, settings, theme, doc_lang, uuid, images,
-        docx, dest_dir, rels, ns,
+        dom,
+        document,
+        &mut state,
+        styles,
+        footnotes,
+        settings,
+        theme,
+        doc_lang,
+        uuid,
+        images,
+        docx,
+        dest_dir,
+        rels,
+        &alt_content,
+        ns,
     );
 
     read_block_anchors(dom, document, &mut state, ns);
@@ -2649,15 +2813,19 @@ pub fn write_document(
 /// `metadata.opf` path, not an HTML string -- which is why this
 /// function's return type matches [`write_document`]'s.
 ///
-/// Two pieces of `Convert.__call__` remain deliberately unported
-/// here, both blocked on the same open architectural question
-/// (issues #290/#293 -- see the module docs): `resolve_alternate_content`
-/// (near the very top of `__call__`, before `fields`/`read_styles`
-/// even run) and `self.fields(...)`/`self.fields.polish_markup(...)`.
-/// Skipping them means a document that relies on OOXML's
-/// `mc:AlternateContent` fallback mechanism, or on `HYPERLINK`/`REF`/
-/// `XE`/`NOTEREF` field codes, converts without whatever those would
-/// have contributed -- a disclosed, real gap, not a silent one.
+/// One piece of `Convert.__call__` remains deliberately unported
+/// here, blocked on the shared open architectural question (issues
+/// #290/#293 -- see the module docs): `self.fields(...)`/
+/// `self.fields.polish_markup(...)`. Skipping it means a document
+/// that relies on `HYPERLINK`/`REF`/`XE`/`NOTEREF` field codes
+/// converts without whatever those would have contributed -- a
+/// disclosed, real, narrow-scope gap, not a silent one.
+/// `resolve_alternate_content` itself IS ported (via
+/// [`convert_document`]'s own call to it) for the case Python's own
+/// function special-cases -- a document relying on a
+/// `mc:AlternateContent` wrapper *other* than the common
+/// drawing/pict-in-a-run compatibility pattern converts without full
+/// fidelity there too, see [`AlternateContent`]'s own docs.
 ///
 /// `detect_cover`/`notes_text` mirror `Convert.__init__`'s
 /// same-named parameters; `notes_nopb`/`nosupsub` are **not** accepted
@@ -2801,6 +2969,134 @@ pub(crate) fn empty_test_docx() -> Docx<std::io::Cursor<Vec<u8>>> {
 }
 
 #[cfg(test)]
+mod resolve_alternate_content_tests {
+    use super::*;
+    use roxmltree::Document;
+
+    const DOC_OPEN: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006""#;
+
+    fn parse_root(body: &str) -> (Document<'static>, DocxNamespace) {
+        let xml: &'static str =
+            Box::leak(format!("<w:root {DOC_OPEN}>{body}</w:root>").into_boxed_str());
+        (
+            Document::parse(xml).expect("valid XML"),
+            DocxNamespace::default(),
+        )
+    }
+
+    #[test]
+    fn a_choice_with_a_single_drawing_fallback_inside_a_run_substitutes_the_drawing() {
+        let (doc, ns) = parse_root(
+            r#"<w:r>
+                 <mc:AlternateContent>
+                   <mc:Choice Requires="wps"><w:drawing><w:proprietary/></w:drawing></mc:Choice>
+                   <mc:Fallback><w:drawing><w:docPr id="1"/></w:drawing></mc:Fallback>
+                 </mc:AlternateContent>
+               </w:r>"#,
+        );
+        let ac = ns
+            .descendants(doc.root_element(), &["mc:AlternateContent"])
+            .into_iter()
+            .next()
+            .unwrap();
+        let result = resolve_alternate_content(doc.root_element(), &ns);
+
+        let choice = ns.children(ac, &["mc:Choice"])[0];
+        assert!(result.excluded_choices.contains(&choice));
+
+        let fallback = ns.children(ac, &["mc:Fallback"])[0];
+        let fallback_drawing = ns.children(fallback, &["w:drawing"])[0];
+        assert_eq!(result.substitutions.get(&ac), Some(&fallback_drawing));
+    }
+
+    #[test]
+    fn no_fallback_means_nothing_is_excluded_or_substituted() {
+        let (doc, ns) = parse_root(
+            r#"<w:r>
+                 <mc:AlternateContent>
+                   <mc:Choice Requires="wps"><w:drawing/></mc:Choice>
+                 </mc:AlternateContent>
+               </w:r>"#,
+        );
+        let result = resolve_alternate_content(doc.root_element(), &ns);
+        assert!(result.excluded_choices.is_empty());
+        assert!(result.substitutions.is_empty());
+    }
+
+    #[test]
+    fn a_fallback_outside_a_run_is_excluded_but_not_substituted() {
+        // Choice is removed regardless of where `ac` lives; the
+        // narrow drawing-in-a-run unwrap only applies when `ac`'s
+        // parent is itself a `w:r` (Python's own
+        // `ac.getparent().tag.endswith('}r')` check).
+        let (doc, ns) = parse_root(
+            r#"<w:p>
+                 <mc:AlternateContent>
+                   <mc:Choice Requires="wps"><w:pPr/></mc:Choice>
+                   <mc:Fallback><w:pPr/></mc:Fallback>
+                 </mc:AlternateContent>
+               </w:p>"#,
+        );
+        let result = resolve_alternate_content(doc.root_element(), &ns);
+        assert_eq!(result.excluded_choices.len(), 1);
+        assert!(result.substitutions.is_empty());
+    }
+
+    #[test]
+    fn a_fallback_with_multiple_children_is_excluded_but_not_substituted() {
+        let (doc, ns) = parse_root(
+            r#"<w:r>
+                 <mc:AlternateContent>
+                   <mc:Choice Requires="wps"><w:drawing/></mc:Choice>
+                   <mc:Fallback><w:drawing/><w:t>x</w:t></mc:Fallback>
+                 </mc:AlternateContent>
+               </w:r>"#,
+        );
+        let result = resolve_alternate_content(doc.root_element(), &ns);
+        assert_eq!(result.excluded_choices.len(), 1);
+        assert!(result.substitutions.is_empty());
+    }
+
+    #[test]
+    fn a_fallback_whose_sole_child_is_not_drawing_or_pict_is_not_substituted() {
+        let (doc, ns) = parse_root(
+            r#"<w:r>
+                 <mc:AlternateContent>
+                   <mc:Choice Requires="wps"><w:drawing/></mc:Choice>
+                   <mc:Fallback><w:t>x</w:t></mc:Fallback>
+                 </mc:AlternateContent>
+               </w:r>"#,
+        );
+        let result = resolve_alternate_content(doc.root_element(), &ns);
+        assert!(result.substitutions.is_empty());
+    }
+
+    #[test]
+    fn is_excluded_is_true_for_a_descendant_of_an_excluded_choice() {
+        let (doc, ns) = parse_root(
+            r#"<w:p>
+                 <mc:AlternateContent>
+                   <mc:Choice Requires="wps"><w:r><w:t>hidden</w:t></w:r></mc:Choice>
+                   <mc:Fallback><w:r><w:t>shown</w:t></w:r></mc:Fallback>
+                 </mc:AlternateContent>
+               </w:p>"#,
+        );
+        let result = resolve_alternate_content(doc.root_element(), &ns);
+        let runs = ns.descendants(doc.root_element(), &["w:r"]);
+        assert_eq!(runs.len(), 2);
+        for &r in &runs {
+            let text = r.descendants().find_map(|d| d.text()).unwrap_or("");
+            let excluded = result.is_excluded(r);
+            match text {
+                "hidden" => assert!(excluded, "the Choice run should be excluded"),
+                "shown" => assert!(!excluded, "the Fallback run should not be excluded"),
+                other => panic!("unexpected run text {other:?}"),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod convert_run_tests {
     use super::*;
     use crate::docx::tables::Tables;
@@ -2860,6 +3156,7 @@ mod convert_run_tests {
                 self.dest_dir.path(),
                 &self.page,
                 &self.rels,
+                &AlternateContent::default(),
                 ns,
             )
         }
@@ -2955,6 +3252,67 @@ mod convert_run_tests {
             .path()
             .join(h.dom.node(children[0]).attrs.get("src").unwrap())
             .exists());
+    }
+
+    #[test]
+    fn a_drawing_wrapped_in_alternate_content_fallback_still_becomes_a_real_img() {
+        const IMG_DOC_OPEN: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006""#;
+        let xml: &'static str = Box::leak(
+            format!(
+                r#"<w:r {IMG_DOC_OPEN}>
+                     <mc:AlternateContent>
+                       <mc:Choice Requires="wps"><w:drawing><w:proprietary/></w:drawing></mc:Choice>
+                       <mc:Fallback>
+                         <w:drawing>
+                           <wp:inline>
+                             <wp:extent cx="914400" cy="457200"/>
+                             <pic:pic>
+                               <pic:nvPicPr><pic:cNvPr id="1" name="pic1.png"/></pic:nvPicPr>
+                               <pic:blipFill><a:blip r:embed="rId4"/></pic:blipFill>
+                             </pic:pic>
+                           </wp:inline>
+                         </w:drawing>
+                       </mc:Fallback>
+                     </mc:AlternateContent>
+                   </w:r>"#
+            )
+            .into_boxed_str(),
+        );
+        let doc = Document::parse(xml).expect("valid XML");
+        let ns = DocxNamespace::default();
+
+        let mut h = Harness::new();
+        h.docx = test_docx_with_image("word/media/image1.png", b"not-really-a-png");
+        h.rels
+            .by_id
+            .insert("rId4".to_string(), "word/media/image1.png".to_string());
+        let alt_content = resolve_alternate_content(doc.root_element(), &ns);
+
+        let span = convert_run(
+            &mut h.dom,
+            doc.root_element(),
+            &mut h.styles,
+            &mut h.footnotes,
+            &h.settings,
+            &h.theme,
+            None,
+            "test-uuid",
+            &mut h.images,
+            &mut h.docx,
+            h.dest_dir.path(),
+            &h.page,
+            &h.rels,
+            &alt_content,
+            &ns,
+        );
+
+        let children = h.dom.children(span);
+        assert_eq!(
+            children.len(),
+            1,
+            "the AlternateContent wrapper contributes exactly the fallback's real img, not the Choice's proprietary content"
+        );
+        assert_eq!(h.dom.tag(children[0]), Some("img"));
     }
 
     #[test]
@@ -3199,6 +3557,7 @@ mod convert_run_tests {
             h.dest_dir.path(),
             &h.page,
             &h.rels,
+            &AlternateContent::default(),
             &ns,
         );
         assert_eq!(h.dom.node(span).attrs.get("lang"), None);
@@ -3284,6 +3643,7 @@ mod convert_p_tests {
                 self.dest_dir.path(),
                 &self.page,
                 &Relationships::default(),
+                &AlternateContent::default(),
                 ns,
             )
         }
@@ -3302,6 +3662,51 @@ mod convert_p_tests {
         );
         assert_eq!(h.state.object_map.get(&dest), Some(&doc.root_element()));
         assert_eq!(h.state.layers[&doc.root_element()].len(), 2);
+    }
+
+    #[test]
+    fn a_choice_run_excluded_by_alternate_content_is_not_converted() {
+        const AC_DOC_OPEN: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006""#;
+        let xml: &'static str = Box::leak(
+            format!(
+                r#"<w:p {AC_DOC_OPEN}>
+                     <mc:AlternateContent>
+                       <mc:Choice Requires="wps"><w:r><w:t>hidden</w:t></w:r></mc:Choice>
+                       <mc:Fallback><w:r><w:t>shown</w:t></w:r></mc:Fallback>
+                     </mc:AlternateContent>
+                   </w:p>"#
+            )
+            .into_boxed_str(),
+        );
+        let doc = Document::parse(xml).expect("valid XML");
+        let ns = DocxNamespace::default();
+        let alt_content = resolve_alternate_content(doc.root_element(), &ns);
+
+        let mut h = Harness::new();
+        let dest = convert_p(
+            &mut h.dom,
+            &mut h.state,
+            doc.root_element(),
+            &mut h.styles,
+            &mut h.footnotes,
+            &h.settings,
+            &h.theme,
+            None,
+            "test-uuid",
+            &mut h.images,
+            &mut h.docx,
+            h.dest_dir.path(),
+            &h.page,
+            &Relationships::default(),
+            &alt_content,
+            &ns,
+        );
+
+        assert_eq!(
+            h.dom.serialize(dest),
+            "<p><span>shown</span></p>",
+            "the Choice run is excluded; only the Fallback run converts"
+        );
     }
 
     #[test]
@@ -3656,6 +4061,7 @@ mod convert_body_tests {
                 &mut self.docx,
                 self.dest_dir.path(),
                 &Relationships::default(),
+                &AlternateContent::default(),
                 ns,
             );
             (body, paras)
@@ -3829,6 +4235,7 @@ mod read_block_anchors_tests {
                 &mut self.docx,
                 self.dest_dir.path(),
                 &Relationships::default(),
+                &AlternateContent::default(),
                 ns,
             )
             .0
@@ -4029,6 +4436,7 @@ mod apply_tab_indentation_tests {
                 &mut self.docx,
                 self.dest_dir.path(),
                 &Relationships::default(),
+                &AlternateContent::default(),
                 ns,
             )
             .0
@@ -4215,6 +4623,7 @@ mod mark_block_runs_tests {
                 &mut self.docx,
                 self.dest_dir.path(),
                 &Relationships::default(),
+                &AlternateContent::default(),
                 ns,
             );
             (body, paras)
@@ -4383,6 +4792,7 @@ mod resolve_links_tests {
                 self.dest_dir.path(),
                 &self.page,
                 rels,
+                &AlternateContent::default(),
                 ns,
             )
         }
@@ -4679,6 +5089,7 @@ mod cascade_tests {
                 &mut self.docx,
                 self.dest_dir.path(),
                 &Relationships::default(),
+                &AlternateContent::default(),
                 ns,
             )
             .1
@@ -4946,6 +5357,7 @@ mod apply_tables_markup_tests {
                 &mut self.docx,
                 self.dest_dir.path(),
                 &Relationships::default(),
+                &AlternateContent::default(),
                 ns,
             )
             .0
@@ -5228,6 +5640,7 @@ mod apply_numbering_markup_tests {
                 &mut self.docx,
                 self.dest_dir.path(),
                 &Relationships::default(),
+                &AlternateContent::default(),
                 ns,
             )
             .0
@@ -5480,6 +5893,7 @@ mod apply_block_run_frames_tests {
                 &mut self.docx,
                 self.dest_dir.path(),
                 &Relationships::default(),
+                &AlternateContent::default(),
                 ns,
             );
             (body, paras)
@@ -5679,6 +6093,7 @@ mod assign_style_classes_tests {
                 &mut self.docx,
                 self.dest_dir.path(),
                 &Relationships::default(),
+                &AlternateContent::default(),
                 ns,
             )
             .0
@@ -5827,6 +6242,7 @@ mod convert_footnotes_tests {
                 &mut self.docx,
                 self.dest_dir.path(),
                 &Relationships::default(),
+                &AlternateContent::default(),
                 ns,
             )
             .0
@@ -6081,6 +6497,7 @@ mod apply_paragraph_frames_tests {
                 &mut self.docx,
                 self.dest_dir.path(),
                 &Relationships::default(),
+                &AlternateContent::default(),
                 ns,
             )
             .0
