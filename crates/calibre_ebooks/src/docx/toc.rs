@@ -715,6 +715,7 @@ mod from_toc_tests {
             dest_dir.path(),
             &crate::docx::styles::PageProperties::default(),
             &Relationships::default(),
+            &crate::docx::to_html::AlternateContent::default(),
             &ns,
         );
 
