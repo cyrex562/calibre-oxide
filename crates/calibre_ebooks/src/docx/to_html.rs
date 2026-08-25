@@ -1,16 +1,14 @@
 //! DOCX → HTML conversion.
 //!
-//! [`DOCXToHTML`] is the **provisional sketch** that predates this
-//! module's port — paragraphs, runs, hyperlinks and images, with
-//! heading levels guessed from `w:pStyle` and no style resolution
-//! whatsoever. It stays wired into the DOCX input plugin (see
-//! `input/docx_input.rs`) and keeps producing *something* until
-//! [`convert_document`] -- the real orchestrator -- is ready to
-//! replace it wholesale -- see issue #130's tracked follow-ups
-//! (#283-293) for exactly what's still missing.
+//! [`convert_docx_document`] is the real top-level entry point, wired
+//! into the DOCX input plugin (`input/docx_input.rs`'s `DOCXInput::convert`),
+//! replacing an earlier provisional sketch (`DOCXToHTML`, deleted)
+//! that predated this module's real port -- guessed heading levels
+//! from a paragraph's raw `w:pStyle` value, no real style resolution,
+//! no tables/lists/footnotes/cover-detection at all.
 //!
 //! The real port, tracked as issue #130 with per-piece follow-ups
-//! #283-293, so far covers:
+//! #283-293, covers:
 //!
 //! - [`convert_run`]/[`convert_p`]: `w:r` -> `<span>`, `w:p` ->
 //!   `<p>`/`<h1>`..`<h6>`, using the real
@@ -92,9 +90,10 @@
 //!   [`convert_document`] runs, [`build_html_document`] wraps the
 //!   result, [`write_document`] writes it out -- the full equivalent
 //!   of `Convert.__call__()` (which itself calls `self.write(doc)` as
-//!   its own last line and returns *that* value). Not yet called from
-//!   anywhere -- see its own doc comment for why swapping it in for
-//!   `DOCXToHTML` needs its own follow-up.
+//!   its own last line and returns *that* value). Wired into
+//!   `input/docx_input.rs`'s `DOCXInput::convert`, which reads the
+//!   OPF this writes back via `oeb::reader::OEBReader::read_opf` --
+//!   the same general OPF-based book loader `EPUBInput` already uses.
 //!
 //! # What `convert_run` defers, and why
 //!
@@ -142,180 +141,6 @@ use super::styles::{PageProperties, Styles};
 use super::tables::Table;
 use super::theme::Theme;
 use super::toc::{self, Toc};
-
-pub struct DOCXToHTML;
-
-impl DOCXToHTML {
-    pub fn convert<R: Read + Seek>(
-        docx: &mut Docx<R>,
-        dest_dir: &Path,
-    ) -> Result<String, DocxError> {
-        let ns = DocxNamespace::new(docx.is_transitional());
-        let doc_name = docx.document_name()?;
-
-        // 1. Read Document Relationships
-        // Construct path: word/_rels/document.xml.rels
-        // Simple logic: assume doc_name has a parent dir
-        let path_obj = Path::new(&doc_name);
-        let file_name = path_obj.file_name().unwrap_or_default().to_string_lossy();
-        let parent = path_obj.parent().unwrap_or(Path::new(""));
-        let rels_path = parent.join("_rels").join(format!("{}.rels", file_name));
-        let rels_path_str = rels_path.to_string_lossy().replace("\\", "/");
-
-        let mut doc_rels = HashMap::new();
-        if let Ok(content) = docx.read(&rels_path_str) {
-            let text = String::from_utf8(content).unwrap_or_default();
-            if let Ok(doc) = Document::parse(&text) {
-                for node in doc.descendants() {
-                    if node.has_tag_name("Relationship") {
-                        let id = node.attribute("Id").unwrap_or_default().to_string();
-                        let target = node.attribute("Target").unwrap_or_default().to_string();
-                        doc_rels.insert(id, target);
-                    }
-                }
-            }
-        }
-
-        // 2. Read Document Content
-        let content = docx.read(&doc_name)?;
-        let text = String::from_utf8(content).map_err(|e| DocxError::InvalidDocx(e.to_string()))?;
-        let doc = Document::parse(&text)?;
-
-        // 3. Generate HTML
-        let mut html = String::from("<html><head><meta charset=\"utf-8\"/></head><body>");
-
-        for node in doc.descendants() {
-            if node.tag_name().name() == "p" {
-                Self::process_paragraph(node, &mut html, &doc_rels, docx, dest_dir, &ns);
-            }
-        }
-
-        html.push_str("</body></html>");
-        Ok(html)
-    }
-
-    fn process_paragraph<R: Read + Seek>(
-        node: Node,
-        html: &mut String,
-        rels: &HashMap<String, String>,
-        docx: &mut Docx<R>,
-        dest_dir: &Path,
-        ns: &DocxNamespace,
-    ) {
-        // Determine Tag (p, h1-h6) based on pPr/pStyle
-        let mut tag = "p";
-
-        for child in node.children() {
-            if child.tag_name().name() == "pPr" {
-                for p_prop in child.children() {
-                    if p_prop.tag_name().name() == "pStyle" {
-                        if let Some(val) = p_prop.attribute("val") {
-                            match val {
-                                "Heading1" => tag = "h1",
-                                "Heading2" => tag = "h2",
-                                "Heading3" => tag = "h3",
-                                "Heading4" => tag = "h4",
-                                "Heading5" => tag = "h5",
-                                "Heading6" => tag = "h6",
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        html.push('<');
-        html.push_str(tag);
-        html.push('>');
-
-        for child in node.children() {
-            if child.tag_name().name() == "r" {
-                Self::process_run(child, html, rels, docx, dest_dir, ns);
-            } else if child.tag_name().name() == "hyperlink" {
-                // Handle hyperlink
-                let rid = ns.get(child, "r:id");
-                if let Some(rid) = rid {
-                    if let Some(target) = rels.get(rid) {
-                        html.push_str(&format!("<a href=\"{}\">", target));
-                        for sub in child.children() {
-                            if sub.tag_name().name() == "r" {
-                                Self::process_run(sub, html, rels, docx, dest_dir, ns);
-                            }
-                        }
-                        html.push_str("</a>");
-                    }
-                }
-            }
-        }
-
-        html.push_str(&format!("</{}>", tag));
-    }
-
-    fn process_run<R: Read + Seek>(
-        node: Node,
-        html: &mut String,
-        rels: &HashMap<String, String>,
-        docx: &mut Docx<R>,
-        dest_dir: &Path,
-        ns: &DocxNamespace,
-    ) {
-        for child in node.children() {
-            match child.tag_name().name() {
-                "t" => {
-                    if let Some(text) = child.text() {
-                        html.push_str(&html_escape::encode_text(text));
-                    }
-                }
-                "br" => html.push_str("<br/>"),
-                "drawing" => {
-                    // Extract image
-                    // This is complex in OOXML. drawing -> inline -> graphic -> graphicData -> pic -> blipFill -> blip -> embed
-                    // Or similar structure
-                    for desc in child.descendants() {
-                        if desc.tag_name().name() == "blip" {
-                            if let Some(rid) = ns.get(desc, "r:embed") {
-                                if let Some(target) = rels.get(rid) {
-                                    // target is relative to document.xml usually, e.g. "media/image1.jpeg"
-                                    // We need to resolve it relative to DOCX root (word/media/image1.jpeg)
-                                    // Assuming document is at word/document.xml
-                                    let image_path = Path::new("word")
-                                        .join(target)
-                                        .to_string_lossy()
-                                        .replace("\\", "/");
-
-                                    if let Ok(data) = docx.read(&image_path) {
-                                        // Write to dest_dir
-                                        let file_name =
-                                            Path::new(target).file_name().unwrap_or_default();
-                                        let dest_path = dest_dir.join(file_name);
-                                        if std::fs::write(&dest_path, data).is_ok() {
-                                            html.push_str(&format!(
-                                                "<img src=\"{}\" />",
-                                                file_name.to_string_lossy()
-                                            ));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-}
-
-pub mod html_escape {
-    pub fn encode_text(s: &str) -> String {
-        s.replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace("\"", "&quot;")
-            .replace("'", "&#39;")
-    }
-}
 
 /// Converts one `w:r` into a `<span>` in `dom`, returning its `NodeId`.
 /// See the module docs for what's deferred.
@@ -2822,8 +2647,7 @@ pub fn write_document(
 /// per-piece functions, `Convert.__call__` itself calls `self.write(doc)`
 /// as its own last line and returns *that* value -- `write()`'s
 /// `metadata.opf` path, not an HTML string -- which is why this
-/// function's return type matches [`write_document`]'s rather than
-/// `DOCXToHTML::convert`'s.
+/// function's return type matches [`write_document`]'s.
 ///
 /// Two pieces of `Convert.__call__` remain deliberately unported
 /// here, both blocked on the same open architectural question
@@ -2841,15 +2665,11 @@ pub fn write_document(
 /// ported (needs `fonts.py`'s system font matching -- see the module
 /// docs' `docx.css` note on [`write_document`]).
 ///
-/// Not yet called from anywhere. Wiring this in to replace
-/// `DOCXToHTML` in `input/docx_input.rs` needs its own follow-up: this
-/// function returns a `metadata.opf` **path** (matching
-/// `Convert.__call__`'s own real return value), but the current
-/// `DOCXInput::convert` expects an HTML **string** it writes itself
-/// and hands to `HTMLInput` directly. Consuming an OPF-rooted book
-/// instead needs either a general OPF-based book loader this crate
-/// doesn't have yet, or a narrower docx-specific adapter -- not
-/// attempted here.
+/// Wired into `input/docx_input.rs`'s `DOCXInput::convert`, which
+/// reads the `metadata.opf` this returns back into a real
+/// `OEBBook` via `oeb::reader::OEBReader::read_opf` +
+/// `oeb::container::DirContainer` -- the same general OPF-based book
+/// loader `EPUBInput` already uses, not a docx-specific one.
 pub fn convert_docx_document<R: Read + Seek>(
     docx: &mut Docx<R>,
     dest_dir: &Path,

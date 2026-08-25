@@ -1,5 +1,4 @@
 use calibre_ebooks::input::docx_input::DOCXInput;
-use calibre_ebooks::oeb::book::OEBBook;
 use std::fs::File;
 use std::io::Write;
 use tempfile::tempdir;
@@ -50,6 +49,21 @@ fn test_docx_input_conversion() {
     )
     .unwrap();
 
+    // 4. word/styles.xml -- a real document always has one; a
+    // paragraph only retags to <h1> once its style ID resolves to a
+    // *named* style whose own name matches "heading N" (the raw
+    // style ID "Heading1" is not itself special-cased).
+    zip.start_file("word/styles.xml", options).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:style w:type="paragraph" w:styleId="Heading1">
+    <w:name w:val="heading 1"/>
+  </w:style>
+</w:styles>"#,
+    )
+    .unwrap();
+
     zip.finish().unwrap(); // Drop file
 
     // Test Conversion
@@ -70,6 +84,16 @@ fn test_docx_input_conversion() {
     let content = std::fs::read_to_string(output_dir.join(&html_item.href))
         .expect("Failed to read output html");
 
-    assert!(content.contains("<h1>Chapter 1</h1>"));
-    assert!(content.contains("<p>Hello World</p>"));
+    assert!(
+        content.contains("<h1"),
+        "heading 1 style retags to h1: {content}"
+    );
+    assert!(content.contains(">Chapter 1<"));
+    assert!(content.contains(">Hello World<"));
+
+    // The real pipeline produces a real OPF, unlike the old
+    // HTMLInput-delegated path (which hardcoded the book title to
+    // "Converted Log" and never saw the document's own manifest).
+    assert!(output_dir.join("metadata.opf").exists());
+    assert!(book.manifest.iter().any(|i| i.href == "toc.ncx"));
 }
