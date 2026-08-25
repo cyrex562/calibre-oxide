@@ -90,11 +90,11 @@
 //!   [`assign_xe_anchors`]/[`apply_index_fields`].
 //! - [`build_html_document`]/[`write_document`]: `Convert.__init__`'s
 //!   `<html><head>...` skeleton construction and `Convert.write`'s
-//!   `index.html`/`metadata.opf`/`toc.ncx` output, built on
+//!   `index.html`/`docx.css`/`metadata.opf`/`toc.ncx` output, built on
 //!   [`crate::opf_writer`] (relocated out of `mobi/` and generalized
-//!   for this) and [`toc::Toc::to_ncx_toc`]. `docx.css` generation is
-//!   skipped -- `styles.rs`'s own `generate_css` gap (needs
-//!   `fonts.py`'s system font matching), not a new one.
+//!   for this), [`toc::Toc::to_ncx_toc`], and [`super::styles::Styles::generate_css`]
+//!   (`docx.css`, written before the manifest scan so it's picked up
+//!   by it, matching Python's real write order).
 //! - [`convert_docx_document`]: the real top-level entry point --
 //!   [`super::read_styles::read_raw_parts`]/
 //!   [`super::read_styles::wire_parts`] parse and wire every part,
@@ -142,7 +142,7 @@ use super::char_styles::RunStyle;
 use super::cleanup;
 use super::container::{Docx, Relationships};
 use super::error::DocxError;
-use super::fonts::{is_symbol_font, map_symbol_text};
+use super::fonts::{is_symbol_font, map_symbol_text, Fonts};
 use super::footnotes::{Footnotes, Note};
 use super::images::Images;
 use super::names::DocxNamespace;
@@ -269,6 +269,7 @@ pub fn convert_run<'a, 'i, R: Read + Seek>(
     footnotes: &mut Footnotes<'a, 'i>,
     settings: &Settings,
     theme: &Theme,
+    fonts: &mut Fonts,
     doc_lang: Option<&str>,
     uuid: &str,
     images: &mut Images,
@@ -334,7 +335,7 @@ pub fn convert_run<'a, 'i, R: Read + Seek>(
         }
     }
 
-    let style = styles.resolve_run(run, theme, ns);
+    let style = styles.resolve_run(run, theme, fonts, ns);
     if matches!(
         style.vert_align.as_deref(),
         Some("superscript") | Some("subscript")
@@ -651,6 +652,7 @@ pub fn convert_p<'a, 'i, R: Read + Seek>(
     footnotes: &mut Footnotes<'a, 'i>,
     settings: &Settings,
     theme: &Theme,
+    fonts: &mut Fonts,
     doc_lang: Option<&str>,
     uuid: &str,
     images: &mut Images,
@@ -690,6 +692,7 @@ pub fn convert_p<'a, 'i, R: Read + Seek>(
                 footnotes,
                 settings,
                 theme,
+                fonts,
                 doc_lang,
                 uuid,
                 images,
@@ -795,7 +798,7 @@ pub fn convert_p<'a, 'i, R: Read + Seek>(
         Vec::new();
     for span in dom.children(dest) {
         let run = state.object_map[&span];
-        let run_style = styles.resolve_run(run, theme, ns);
+        let run_style = styles.resolve_run(run, theme, fonts, ns);
         let matches = border_runs
             .last()
             .map(|(_, _, s)| s.same_border(&run_style))
@@ -1013,6 +1016,7 @@ pub fn convert_body<'a, 'i, R: Read + Seek>(
     footnotes: &mut Footnotes<'a, 'i>,
     settings: &Settings,
     theme: &Theme,
+    fonts: &mut Fonts,
     doc_lang: Option<&str>,
     uuid: &str,
     images: &mut Images,
@@ -1043,6 +1047,7 @@ pub fn convert_body<'a, 'i, R: Read + Seek>(
                 footnotes,
                 settings,
                 theme,
+                fonts,
                 doc_lang,
                 uuid,
                 images,
@@ -1759,6 +1764,7 @@ pub fn cascade<'a, 'i>(
     styles: &mut Styles<'a, 'i>,
     state: &ConvertState<'a, 'i>,
     theme: &Theme,
+    fonts: &mut Fonts,
     ns: &DocxNamespace,
 ) {
     let paragraphs: Vec<Node<'a, 'i>> = state.layers.keys().copied().collect();
@@ -1769,7 +1775,7 @@ pub fn cascade<'a, 'i>(
         let has_links = runs.iter().any(|r| state.is_link.contains(r));
         let mut char_styles: Vec<RunStyle> = runs
             .iter()
-            .map(|&r| styles.resolve_run(r, theme, ns))
+            .map(|&r| styles.resolve_run(r, theme, fonts, ns))
             .collect();
         let mut block_style = styles.resolve_paragraph(p, ns);
 
@@ -2553,6 +2559,7 @@ pub fn assign_style_classes<'a, 'i>(
     state: &ConvertState<'a, 'i>,
     styles: &mut Styles<'a, 'i>,
     theme: &Theme,
+    fonts: &mut Fonts,
     ns: &DocxNamespace,
 ) {
     styles.generate_classes();
@@ -2561,7 +2568,7 @@ pub fn assign_style_classes<'a, 'i>(
         let css = if ns.is_tag(obj, "w:p") {
             styles.resolve_paragraph(obj, ns).css()
         } else if ns.is_tag(obj, "w:r") {
-            styles.resolve_run(obj, theme, ns).css()
+            styles.resolve_run(obj, theme, fonts, ns).css()
         } else {
             continue;
         };
@@ -2632,6 +2639,7 @@ pub fn convert_footnotes<'a, 'i, R: Read + Seek>(
     styles: &mut Styles<'a, 'i>,
     settings: &Settings,
     theme: &Theme,
+    fonts: &mut Fonts,
     doc_lang: Option<&str>,
     uuid: &str,
     notes_text: &str,
@@ -2707,6 +2715,7 @@ pub fn convert_footnotes<'a, 'i, R: Read + Seek>(
                     footnotes,
                     settings,
                     theme,
+                    fonts,
                     doc_lang,
                     uuid,
                     images,
@@ -2857,6 +2866,7 @@ pub fn convert_document<'a, 'i, R: Read + Seek>(
     footnotes: &mut Footnotes<'a, 'i>,
     settings: &Settings,
     theme: &Theme,
+    fonts: &mut Fonts,
     images: &mut Images,
     docx: &mut Docx<R>,
     doc_lang: Option<&str>,
@@ -2879,6 +2889,7 @@ pub fn convert_document<'a, 'i, R: Read + Seek>(
         footnotes,
         settings,
         theme,
+        fonts,
         doc_lang,
         uuid,
         images,
@@ -2905,6 +2916,7 @@ pub fn convert_document<'a, 'i, R: Read + Seek>(
         styles,
         settings,
         theme,
+        fonts,
         doc_lang,
         uuid,
         notes_text,
@@ -2922,7 +2934,7 @@ pub fn convert_document<'a, 'i, R: Read + Seek>(
 
     let resolved_link_map = resolve_links(dom, &state, images, &fields.hyperlink_fields, ns);
 
-    cascade(styles, &state, theme, ns);
+    cascade(styles, &state, theme, fonts, ns);
 
     apply_tables_markup(dom, &state.object_map, &page_map, styles, ns);
 
@@ -2934,7 +2946,7 @@ pub fn convert_document<'a, 'i, R: Read + Seek>(
     apply_block_run_frames(dom, &mut state, styles, &object_map);
     apply_paragraph_frames(dom, &mut state, styles, &object_map, &page_map);
 
-    assign_style_classes(dom, &state, styles, theme, ns);
+    assign_style_classes(dom, &state, styles, theme, fonts, ns);
 
     if let Some(header) = notes_header {
         if let Some(&h) = dom
@@ -2969,6 +2981,7 @@ pub fn convert_document<'a, 'i, R: Read + Seek>(
         &resolved_link_map,
         styles,
         theme,
+        fonts,
         &state.object_map,
         ns,
     );
@@ -2986,31 +2999,37 @@ pub fn convert_document<'a, 'i, R: Read + Seek>(
 /// Writes `dom`'s fully-converted document to `dest_dir`: `index.html`
 /// (`html` -- [`build_html_document`]'s return value -- prefixed with
 /// a `<!DOCTYPE html>` line, matching Python's `html.tostring(...,
-/// doctype='<!DOCTYPE html>')`), `metadata.opf`, and `toc.ncx`.
-///
-/// `styles.generate_css` (the `docx.css` `build_html_document`'s
-/// `<link>` points at) isn't ported -- needs `fonts.py`'s `Fonts`
-/// class, itself blocked on a system font scanner (`styles.rs`'s own
-/// module docs already note this gap) -- so `docx.css` is simply
-/// never written; the `<link>` stays, pointing at a file that doesn't
-/// exist, exactly as it would for any real document Python's own
-/// `generate_css` happened to return nothing for.
+/// doctype='<!DOCTYPE html>')`), `docx.css` (via
+/// [`Styles::generate_css`], written before the manifest scan below so
+/// it's picked up by it, matching Python's own write order), then
+/// `metadata.opf` and `toc.ncx`.
 ///
 /// Returns `metadata.opf`'s path, matching Python's own return value.
 ///
 /// Port of `Convert.write`, minus its own first line (`create_toc`,
 /// already computed by [`convert_document`] -- see
 /// [`ConvertedDocument::toc`]).
-pub fn write_document(
+#[allow(clippy::too_many_arguments)]
+pub fn write_document<R: Read + Seek>(
     dom: &Dom,
     html: NodeId,
     mi: &MetaInformation,
     dest_dir: &Path,
     converted: &ConvertedDocument,
+    styles: &Styles,
+    fonts: &Fonts,
+    docx: &mut Docx<R>,
+    notes_nopb: bool,
+    nosupsub: bool,
 ) -> std::io::Result<PathBuf> {
     let mut raw = String::from("<!DOCTYPE html>\n");
     raw.push_str(&dom.serialize(html));
     std::fs::write(dest_dir.join("index.html"), raw)?;
+
+    let css = styles.generate_css(fonts, dest_dir, docx, notes_nopb, nosupsub);
+    if !css.is_empty() {
+        std::fs::write(dest_dir.join("docx.css"), css)?;
+    }
 
     let manifest_pairs = opf_writer::scan_directory_manifest(dest_dir, &[]);
     let manifest = opf_writer::auto_manifest(&manifest_pairs);
@@ -3088,22 +3107,23 @@ pub fn write_document(
 /// without full fidelity there, see [`AlternateContent`]'s own docs,
 /// the one remaining disclosed, narrow-scope gap in the whole port.
 ///
-/// `detect_cover`/`notes_text` mirror `Convert.__init__`'s
-/// same-named parameters; `notes_nopb`/`nosupsub` are **not** accepted
-/// here since their only consumer, `Styles::generate_css`, isn't
-/// ported (needs `fonts.py`'s system font matching -- see the module
-/// docs' `docx.css` note on [`write_document`]).
+/// `detect_cover`/`notes_text`/`notes_nopb`/`nosupsub` all mirror
+/// `Convert.__init__`'s same-named parameters -- `notes_nopb`/
+/// `nosupsub` reach [`Styles::generate_css`] via [`write_document`].
 ///
 /// Wired into `input/docx_input.rs`'s `DOCXInput::convert`, which
 /// reads the `metadata.opf` this returns back into a real
 /// `OEBBook` via `oeb::reader::OEBReader::read_opf` +
 /// `oeb::container::DirContainer` -- the same general OPF-based book
 /// loader `EPUBInput` already uses, not a docx-specific one.
+#[allow(clippy::too_many_arguments)]
 pub fn convert_docx_document<R: Read + Seek>(
     docx: &mut Docx<R>,
     dest_dir: &Path,
     detect_cover: bool,
     notes_text: &str,
+    notes_nopb: bool,
+    nosupsub: bool,
 ) -> Result<PathBuf, DocxError> {
     let ns = DocxNamespace::new(docx.is_transitional());
     let doc_name = docx.document_name()?;
@@ -3143,12 +3163,17 @@ pub fn convert_docx_document<R: Read + Seek>(
         .numbering
         .as_deref()
         .and_then(|s| Document::parse(s).ok());
+    let fonts_table_doc = raw_parts
+        .fonts_table
+        .as_deref()
+        .and_then(|s| Document::parse(s).ok());
 
     let mut settings = Settings::new();
     let mut footnotes = Footnotes::new();
     let mut theme = Theme::new();
-    let mut styles = Styles::new(super::tables::Tables::default());
+    let mut styles = Styles::new(crate::docx::tables::Tables::default());
     let mut numbering = Numbering::new();
+    let mut fonts = Fonts::new();
 
     super::read_styles::wire_parts(
         &mut settings,
@@ -3156,6 +3181,7 @@ pub fn convert_docx_document<R: Read + Seek>(
         &mut theme,
         &mut styles,
         &mut numbering,
+        &mut fonts,
         settings_doc.as_ref().map(Document::root_element),
         footnotes_doc.as_ref().map(Document::root_element),
         raw_parts.footnotes_rels,
@@ -3164,6 +3190,8 @@ pub fn convert_docx_document<R: Read + Seek>(
         theme_doc.as_ref().map(Document::root_element),
         styles_doc.as_ref().map(Document::root_element),
         numbering_doc.as_ref().map(Document::root_element),
+        fonts_table_doc.as_ref().map(Document::root_element),
+        raw_parts.fonts_table_rels,
         &ns,
     );
 
@@ -3181,6 +3209,7 @@ pub fn convert_docx_document<R: Read + Seek>(
         &mut footnotes,
         &settings,
         &theme,
+        &mut fonts,
         &mut images,
         docx,
         doc_lang.as_deref(),
@@ -3194,7 +3223,9 @@ pub fn convert_docx_document<R: Read + Seek>(
 
     let html = build_html_document(&mut dom, converted.body, &mi.title, doc_lang.as_deref());
 
-    Ok(write_document(&dom, html, &mi, dest_dir, &converted)?)
+    Ok(write_document(
+        &dom, html, &mi, dest_dir, &converted, &styles, &fonts, docx, notes_nopb, nosupsub,
+    )?)
 }
 
 /// A minimal, well-formed empty DOCX package -- just enough for
@@ -3379,6 +3410,7 @@ mod convert_run_tests {
         footnotes: Footnotes<'a, 'i>,
         settings: Settings,
         theme: Theme,
+        fonts: Fonts,
         images: Images,
         docx: Docx<std::io::Cursor<Vec<u8>>>,
         dest_dir: tempfile::TempDir,
@@ -3390,10 +3422,11 @@ mod convert_run_tests {
         fn new() -> Self {
             Harness {
                 dom: Dom::empty(),
-                styles: Styles::new(Tables::default()),
+                styles: Styles::new(crate::docx::tables::Tables::default()),
                 footnotes: Footnotes::new(),
                 settings: Settings::new(),
                 theme: Theme::new(),
+                fonts: Fonts::new(),
                 images: Images::new(),
                 docx: empty_test_docx(),
                 dest_dir: tempfile::tempdir().unwrap(),
@@ -3410,6 +3443,7 @@ mod convert_run_tests {
                 &mut self.footnotes,
                 &self.settings,
                 &self.theme,
+                &mut self.fonts,
                 None,
                 "test-uuid",
                 &mut self.images,
@@ -3556,6 +3590,7 @@ mod convert_run_tests {
             &mut h.footnotes,
             &h.settings,
             &h.theme,
+            &mut h.fonts,
             None,
             "test-uuid",
             &mut h.images,
@@ -3811,6 +3846,7 @@ mod convert_run_tests {
             &mut h.footnotes,
             &h.settings,
             &h.theme,
+            &mut h.fonts,
             Some("en-US"),
             "test-uuid",
             &mut h.images,
@@ -3829,6 +3865,16 @@ mod convert_run_tests {
         let (doc, ns) =
             parse_run(r#"<w:rPr><w:rFonts w:ascii="Wingdings"/></w:rPr><w:t>&#xf0fc;</w:t>"#);
         let mut h = Harness::new();
+        // A real document always declares every font it uses in
+        // `fontTable.xml` -- without a matching `Family`,
+        // `Fonts::family_for` falls back to "serif" (not a symbol
+        // font), so the remap below wouldn't fire.
+        let fonts_xml: &'static str = Box::leak(Box::new(
+            r#"<w:fonts xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:font w:name="Wingdings"/></w:fonts>"#.to_string(),
+        ));
+        let fonts_doc: &'static Document<'static> =
+            Box::leak(Box::new(Document::parse(fonts_xml).unwrap()));
+        h.fonts.call(fonts_doc.root_element(), &HashMap::new(), &ns);
         let span = h.convert(doc.root_element(), &ns);
         assert_eq!(
             h.dom.serialize(span),
@@ -3838,7 +3884,9 @@ mod convert_run_tests {
 
         // The persisted cache reflects the sans-serif override, not the
         // literal "Wingdings" -- confirms set_run_font_family wrote back.
-        let cached = h.styles.resolve_run(doc.root_element(), &h.theme, &ns);
+        let cached = h
+            .styles
+            .resolve_run(doc.root_element(), &h.theme, &mut h.fonts, &ns);
         assert_eq!(cached.font_family.as_deref(), Some("sans-serif"));
     }
 }
@@ -3866,6 +3914,7 @@ mod convert_p_tests {
         footnotes: Footnotes<'a, 'i>,
         settings: Settings,
         theme: Theme,
+        fonts: Fonts,
         images: Images,
         docx: Docx<std::io::Cursor<Vec<u8>>>,
         dest_dir: tempfile::TempDir,
@@ -3877,10 +3926,11 @@ mod convert_p_tests {
             Harness {
                 dom: Dom::empty(),
                 state: ConvertState::new(),
-                styles: Styles::new(Tables::default()),
+                styles: Styles::new(crate::docx::tables::Tables::default()),
                 footnotes: Footnotes::new(),
                 settings: Settings::new(),
                 theme: Theme::new(),
+                fonts: Fonts::new(),
                 images: Images::new(),
                 docx: empty_test_docx(),
                 dest_dir: tempfile::tempdir().unwrap(),
@@ -3897,6 +3947,7 @@ mod convert_p_tests {
                 &mut self.footnotes,
                 &self.settings,
                 &self.theme,
+                &mut self.fonts,
                 None,
                 "test-uuid",
                 &mut self.images,
@@ -3952,6 +4003,7 @@ mod convert_p_tests {
             &mut h.footnotes,
             &h.settings,
             &h.theme,
+            &mut h.fonts,
             None,
             "test-uuid",
             &mut h.images,
@@ -4188,7 +4240,7 @@ mod read_page_properties_tests {
             "<w:p><w:r><w:t>a</w:t></w:r></w:p><w:p><w:r><w:t>b</w:t></w:r>{}</w:p>",
             sect_pr(1000)
         ));
-        let mut styles = Styles::new(Tables::default());
+        let mut styles = Styles::new(crate::docx::tables::Tables::default());
         let root = doc.root_element();
         let (page_map, section_starts) = read_page_properties(root, &mut styles, &ns);
 
@@ -4206,7 +4258,7 @@ mod read_page_properties_tests {
             sect_pr(1000),
             sect_pr(2000)
         ));
-        let mut styles = Styles::new(Tables::default());
+        let mut styles = Styles::new(crate::docx::tables::Tables::default());
         let root = doc.root_element();
         let (page_map, section_starts) = read_page_properties(root, &mut styles, &ns);
 
@@ -4222,7 +4274,7 @@ mod read_page_properties_tests {
             "<w:tbl><w:tr><w:tc><w:p/></w:tc></w:tr></w:tbl><w:p><w:r><w:t>a</w:t></w:r>{}</w:p>",
             sect_pr(1000)
         ));
-        let mut styles = Styles::new(Tables::default());
+        let mut styles = Styles::new(crate::docx::tables::Tables::default());
         let root = doc.root_element();
         let (page_map, section_starts) = read_page_properties(root, &mut styles, &ns);
 
@@ -4247,7 +4299,7 @@ mod read_page_properties_tests {
             "<w:p><w:r><w:t>a</w:t></w:r></w:p><w:p><w:r><w:t>b</w:t></w:r></w:p>{}",
             sect_pr(3000)
         ));
-        let mut styles = Styles::new(Tables::default());
+        let mut styles = Styles::new(crate::docx::tables::Tables::default());
         let root = doc.root_element();
         let (page_map, section_starts) = read_page_properties(root, &mut styles, &ns);
 
@@ -4283,6 +4335,7 @@ mod convert_body_tests {
         footnotes: Footnotes<'a, 'i>,
         settings: Settings,
         theme: Theme,
+        fonts: Fonts,
         images: Images,
         docx: Docx<std::io::Cursor<Vec<u8>>>,
         dest_dir: tempfile::TempDir,
@@ -4293,10 +4346,11 @@ mod convert_body_tests {
             Harness {
                 dom: Dom::empty(),
                 state: ConvertState::new(),
-                styles: Styles::new(Tables::default()),
+                styles: Styles::new(crate::docx::tables::Tables::default()),
                 footnotes: Footnotes::new(),
                 settings: Settings::new(),
                 theme: Theme::new(),
+                fonts: Fonts::new(),
                 images: Images::new(),
                 docx: empty_test_docx(),
                 dest_dir: tempfile::tempdir().unwrap(),
@@ -4316,6 +4370,7 @@ mod convert_body_tests {
                 &mut self.footnotes,
                 &self.settings,
                 &self.theme,
+                &mut self.fonts,
                 None,
                 "test-uuid",
                 &mut self.images,
@@ -4461,6 +4516,7 @@ mod read_block_anchors_tests {
         footnotes: Footnotes<'a, 'i>,
         settings: Settings,
         theme: Theme,
+        fonts: Fonts,
         images: Images,
         docx: Docx<std::io::Cursor<Vec<u8>>>,
         dest_dir: tempfile::TempDir,
@@ -4471,10 +4527,11 @@ mod read_block_anchors_tests {
             Harness {
                 dom: Dom::empty(),
                 state: ConvertState::new(),
-                styles: Styles::new(Tables::default()),
+                styles: Styles::new(crate::docx::tables::Tables::default()),
                 footnotes: Footnotes::new(),
                 settings: Settings::new(),
                 theme: Theme::new(),
+                fonts: Fonts::new(),
                 images: Images::new(),
                 docx: empty_test_docx(),
                 dest_dir: tempfile::tempdir().unwrap(),
@@ -4490,6 +4547,7 @@ mod read_block_anchors_tests {
                 &mut self.footnotes,
                 &self.settings,
                 &self.theme,
+                &mut self.fonts,
                 None,
                 "test-uuid",
                 &mut self.images,
@@ -4662,6 +4720,7 @@ mod apply_tab_indentation_tests {
         footnotes: Footnotes<'a, 'i>,
         settings: Settings,
         theme: Theme,
+        fonts: Fonts,
         images: Images,
         docx: Docx<std::io::Cursor<Vec<u8>>>,
         dest_dir: tempfile::TempDir,
@@ -4672,10 +4731,11 @@ mod apply_tab_indentation_tests {
             Harness {
                 dom: Dom::empty(),
                 state: ConvertState::new(),
-                styles: Styles::new(Tables::default()),
+                styles: Styles::new(crate::docx::tables::Tables::default()),
                 footnotes: Footnotes::new(),
                 settings: Settings::new(),
                 theme: Theme::new(),
+                fonts: Fonts::new(),
                 images: Images::new(),
                 docx: empty_test_docx(),
                 dest_dir: tempfile::tempdir().unwrap(),
@@ -4691,6 +4751,7 @@ mod apply_tab_indentation_tests {
                 &mut self.footnotes,
                 &self.settings,
                 &self.theme,
+                &mut self.fonts,
                 None,
                 "test-uuid",
                 &mut self.images,
@@ -4849,6 +4910,7 @@ mod mark_block_runs_tests {
         footnotes: Footnotes<'a, 'i>,
         settings: Settings,
         theme: Theme,
+        fonts: Fonts,
         images: Images,
         docx: Docx<std::io::Cursor<Vec<u8>>>,
         dest_dir: tempfile::TempDir,
@@ -4859,10 +4921,11 @@ mod mark_block_runs_tests {
             Harness {
                 dom: Dom::empty(),
                 state: ConvertState::new(),
-                styles: Styles::new(Tables::default()),
+                styles: Styles::new(crate::docx::tables::Tables::default()),
                 footnotes: Footnotes::new(),
                 settings: Settings::new(),
                 theme: Theme::new(),
+                fonts: Fonts::new(),
                 images: Images::new(),
                 docx: empty_test_docx(),
                 dest_dir: tempfile::tempdir().unwrap(),
@@ -4878,6 +4941,7 @@ mod mark_block_runs_tests {
                 &mut self.footnotes,
                 &self.settings,
                 &self.theme,
+                &mut self.fonts,
                 None,
                 "test-uuid",
                 &mut self.images,
@@ -5015,6 +5079,7 @@ mod resolve_links_tests {
         footnotes: Footnotes<'a, 'i>,
         settings: Settings,
         theme: Theme,
+        fonts: Fonts,
         images: Images,
         docx: Docx<std::io::Cursor<Vec<u8>>>,
         dest_dir: tempfile::TempDir,
@@ -5026,10 +5091,11 @@ mod resolve_links_tests {
             Harness {
                 dom: Dom::empty(),
                 state: ConvertState::new(),
-                styles: Styles::new(Tables::default()),
+                styles: Styles::new(crate::docx::tables::Tables::default()),
                 footnotes: Footnotes::new(),
                 settings: Settings::new(),
                 theme: Theme::new(),
+                fonts: Fonts::new(),
                 images: Images::new(),
                 docx: empty_test_docx(),
                 dest_dir: tempfile::tempdir().unwrap(),
@@ -5046,6 +5112,7 @@ mod resolve_links_tests {
                 &mut self.footnotes,
                 &self.settings,
                 &self.theme,
+                &mut self.fonts,
                 None,
                 "test-uuid",
                 &mut self.images,
@@ -5478,6 +5545,7 @@ mod cascade_tests {
         footnotes: Footnotes<'a, 'i>,
         settings: Settings,
         theme: Theme,
+        fonts: Fonts,
         images: Images,
         docx: Docx<std::io::Cursor<Vec<u8>>>,
         dest_dir: tempfile::TempDir,
@@ -5485,13 +5553,30 @@ mod cascade_tests {
 
     impl<'a, 'i> Harness<'a, 'i> {
         fn new() -> Self {
+            let ns = DocxNamespace::default();
+            // "Georgia"/"Verdana" only stand in for two distinguishable
+            // font names in these tests -- declaring both in a
+            // synthetic `fontTable.xml` root so `Fonts::family_for`
+            // resolves each to its own distinct CSS string, matching
+            // how a real document (which always declares every font it
+            // uses) would behave, rather than both undeclared names
+            // collapsing to the same "serif" fallback.
+            let fonts_xml: &'static str = Box::leak(Box::new(
+                r#"<w:fonts xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:font w:name="Georgia"/><w:font w:name="Verdana"/></w:fonts>"#.to_string(),
+            ));
+            let fonts_doc: &'static Document<'static> =
+                Box::leak(Box::new(Document::parse(fonts_xml).unwrap()));
+            let mut fonts = Fonts::new();
+            fonts.call(fonts_doc.root_element(), &HashMap::new(), &ns);
+
             Harness {
                 dom: Dom::empty(),
                 state: ConvertState::new(),
-                styles: Styles::new(Tables::default()),
+                styles: Styles::new(crate::docx::tables::Tables::default()),
                 footnotes: Footnotes::new(),
                 settings: Settings::new(),
                 theme: Theme::new(),
+                fonts,
                 images: Images::new(),
                 docx: empty_test_docx(),
                 dest_dir: tempfile::tempdir().unwrap(),
@@ -5507,6 +5592,7 @@ mod cascade_tests {
                 &mut self.footnotes,
                 &self.settings,
                 &self.theme,
+                &mut self.fonts,
                 None,
                 "test-uuid",
                 &mut self.images,
@@ -5520,7 +5606,13 @@ mod cascade_tests {
         }
 
         fn cascade(&mut self, ns: &DocxNamespace) {
-            cascade(&mut self.styles, &self.state, &self.theme, ns);
+            cascade(
+                &mut self.styles,
+                &self.state,
+                &self.theme,
+                &mut self.fonts,
+                ns,
+            );
         }
     }
 
@@ -5546,11 +5638,16 @@ mod cascade_tests {
         h.cascade(&ns);
 
         let p_style = h.styles.resolve_paragraph(paras[0], &ns);
-        assert_eq!(p_style.font_family.as_deref(), Some("Georgia"));
+        assert_eq!(p_style.font_family.as_deref(), Some("\"Georgia\", serif"));
 
         let runs: Vec<Node> = ns.descendants(paras[0], &["w:r"]);
         for r in runs {
-            assert_eq!(h.styles.resolve_run(r, &h.theme, &ns).font_family, None);
+            assert_eq!(
+                h.styles
+                    .resolve_run(r, &h.theme, &mut h.fonts, &ns)
+                    .font_family,
+                None
+            );
         }
     }
 
@@ -5575,17 +5672,17 @@ mod cascade_tests {
         let runs: Vec<Node> = ns.descendants(paras[0], &["w:r"]);
         assert_eq!(
             h.styles
-                .resolve_run(runs[0], &h.theme, &ns)
+                .resolve_run(runs[0], &h.theme, &mut h.fonts, &ns)
                 .font_family
                 .as_deref(),
-            Some("Georgia")
+            Some("\"Georgia\", serif")
         );
         assert_eq!(
             h.styles
-                .resolve_run(runs[1], &h.theme, &ns)
+                .resolve_run(runs[1], &h.theme, &mut h.fonts, &ns)
                 .font_family
                 .as_deref(),
-            Some("Verdana")
+            Some("\"Verdana\", serif")
         );
     }
 
@@ -5611,7 +5708,7 @@ mod cascade_tests {
         let p_style = h.styles.resolve_paragraph(paras[0], &ns);
         assert_eq!(
             p_style.font_family.as_deref(),
-            Some("Georgia"),
+            Some("\"Georgia\", serif"),
             "still promoted"
         );
         assert_eq!(
@@ -5622,7 +5719,10 @@ mod cascade_tests {
         let runs: Vec<Node> = ns.descendants(paras[0], &["w:r"]);
         for r in runs {
             assert_eq!(
-                h.styles.resolve_run(r, &h.theme, &ns).color.as_deref(),
+                h.styles
+                    .resolve_run(r, &h.theme, &mut h.fonts, &ns)
+                    .color
+                    .as_deref(),
                 Some("#FF0000"),
                 "color stays on each run"
             );
@@ -5644,7 +5744,7 @@ mod cascade_tests {
         let run = ns.descendants(paras[0], &["w:r"])[0];
         assert_eq!(
             h.styles
-                .resolve_run(run, &h.theme, &ns)
+                .resolve_run(run, &h.theme, &mut h.fonts, &ns)
                 .text_decoration
                 .as_deref(),
             Some("none"),
@@ -5654,7 +5754,9 @@ mod cascade_tests {
         h.cascade(&ns);
 
         assert_eq!(
-            h.styles.resolve_run(run, &h.theme, &ns).text_decoration,
+            h.styles
+                .resolve_run(run, &h.theme, &mut h.fonts, &ns)
+                .text_decoration,
             None
         );
     }
@@ -5673,7 +5775,7 @@ mod cascade_tests {
         let paras = h.body(document, &ns);
         h.cascade(&ns);
 
-        assert_eq!(h.styles.body_font_family, "Georgia");
+        assert_eq!(h.styles.body_font_family, "\"Georgia\", serif");
         assert_eq!(h.styles.resolve_paragraph(paras[0], &ns).font_family, None);
         assert_eq!(h.styles.resolve_paragraph(paras[1], &ns).font_family, None);
         assert_eq!(
@@ -5681,7 +5783,7 @@ mod cascade_tests {
                 .resolve_paragraph(paras[2], &ns)
                 .font_family
                 .as_deref(),
-            Some("Verdana"),
+            Some("\"Verdana\", serif"),
             "the minority paragraph keeps its own explicit value"
         );
     }
@@ -5706,7 +5808,7 @@ mod cascade_tests {
         h.cascade(&ns);
 
         assert_eq!(
-            h.styles.body_font_family, "Georgia",
+            h.styles.body_font_family, "\"Georgia\", serif",
             "the new majority default"
         );
         // The third paragraph never had an explicit font_family -- it
@@ -5746,6 +5848,7 @@ mod apply_tables_markup_tests {
         footnotes: Footnotes<'a, 'i>,
         settings: Settings,
         theme: Theme,
+        fonts: Fonts,
         images: Images,
         docx: Docx<std::io::Cursor<Vec<u8>>>,
         dest_dir: tempfile::TempDir,
@@ -5756,10 +5859,11 @@ mod apply_tables_markup_tests {
             Harness {
                 dom: Dom::empty(),
                 state: ConvertState::new(),
-                styles: Styles::new(Tables::default()),
+                styles: Styles::new(crate::docx::tables::Tables::default()),
                 footnotes: Footnotes::new(),
                 settings: Settings::new(),
                 theme: Theme::new(),
+                fonts: Fonts::new(),
                 images: Images::new(),
                 docx: empty_test_docx(),
                 dest_dir: tempfile::tempdir().unwrap(),
@@ -5775,6 +5879,7 @@ mod apply_tables_markup_tests {
                 &mut self.footnotes,
                 &self.settings,
                 &self.theme,
+                &mut self.fonts,
                 None,
                 "test-uuid",
                 &mut self.images,
@@ -6029,6 +6134,7 @@ mod apply_numbering_markup_tests {
         footnotes: Footnotes<'a, 'i>,
         settings: Settings,
         theme: Theme,
+        fonts: Fonts,
         images: Images,
         docx: Docx<std::io::Cursor<Vec<u8>>>,
         dest_dir: tempfile::TempDir,
@@ -6039,10 +6145,11 @@ mod apply_numbering_markup_tests {
             Harness {
                 dom: Dom::empty(),
                 state: ConvertState::new(),
-                styles: Styles::new(Tables::default()),
+                styles: Styles::new(crate::docx::tables::Tables::default()),
                 footnotes: Footnotes::new(),
                 settings: Settings::new(),
                 theme: Theme::new(),
+                fonts: Fonts::new(),
                 images: Images::new(),
                 docx: empty_test_docx(),
                 dest_dir: tempfile::tempdir().unwrap(),
@@ -6058,6 +6165,7 @@ mod apply_numbering_markup_tests {
                 &mut self.footnotes,
                 &self.settings,
                 &self.theme,
+                &mut self.fonts,
                 None,
                 "test-uuid",
                 &mut self.images,
@@ -6282,6 +6390,7 @@ mod apply_block_run_frames_tests {
         footnotes: Footnotes<'a, 'i>,
         settings: Settings,
         theme: Theme,
+        fonts: Fonts,
         images: Images,
         docx: Docx<std::io::Cursor<Vec<u8>>>,
         dest_dir: tempfile::TempDir,
@@ -6292,10 +6401,11 @@ mod apply_block_run_frames_tests {
             Harness {
                 dom: Dom::empty(),
                 state: ConvertState::new(),
-                styles: Styles::new(Tables::default()),
+                styles: Styles::new(crate::docx::tables::Tables::default()),
                 footnotes: Footnotes::new(),
                 settings: Settings::new(),
                 theme: Theme::new(),
+                fonts: Fonts::new(),
                 images: Images::new(),
                 docx: empty_test_docx(),
                 dest_dir: tempfile::tempdir().unwrap(),
@@ -6311,6 +6421,7 @@ mod apply_block_run_frames_tests {
                 &mut self.footnotes,
                 &self.settings,
                 &self.theme,
+                &mut self.fonts,
                 None,
                 "test-uuid",
                 &mut self.images,
@@ -6482,6 +6593,7 @@ mod assign_style_classes_tests {
         footnotes: Footnotes<'a, 'i>,
         settings: Settings,
         theme: Theme,
+        fonts: Fonts,
         images: Images,
         docx: Docx<std::io::Cursor<Vec<u8>>>,
         dest_dir: tempfile::TempDir,
@@ -6492,10 +6604,11 @@ mod assign_style_classes_tests {
             Harness {
                 dom: Dom::empty(),
                 state: ConvertState::new(),
-                styles: Styles::new(Tables::default()),
+                styles: Styles::new(crate::docx::tables::Tables::default()),
                 footnotes: Footnotes::new(),
                 settings: Settings::new(),
                 theme: Theme::new(),
+                fonts: Fonts::new(),
                 images: Images::new(),
                 docx: empty_test_docx(),
                 dest_dir: tempfile::tempdir().unwrap(),
@@ -6511,6 +6624,7 @@ mod assign_style_classes_tests {
                 &mut self.footnotes,
                 &self.settings,
                 &self.theme,
+                &mut self.fonts,
                 None,
                 "test-uuid",
                 &mut self.images,
@@ -6535,7 +6649,14 @@ mod assign_style_classes_tests {
         let mut h = Harness::new();
         let body = h.body(document, &ns);
 
-        assign_style_classes(&mut h.dom, &h.state, &mut h.styles, &h.theme, &ns);
+        assign_style_classes(
+            &mut h.dom,
+            &h.state,
+            &mut h.styles,
+            &h.theme,
+            &mut h.fonts,
+            &ns,
+        );
 
         let p = h.dom.children(body)[0];
         let cls = h.dom.node(p).attrs.get("class").cloned();
@@ -6553,7 +6674,14 @@ mod assign_style_classes_tests {
         let mut h = Harness::new();
         let body = h.body(document, &ns);
 
-        assign_style_classes(&mut h.dom, &h.state, &mut h.styles, &h.theme, &ns);
+        assign_style_classes(
+            &mut h.dom,
+            &h.state,
+            &mut h.styles,
+            &h.theme,
+            &mut h.fonts,
+            &ns,
+        );
 
         let p = h.dom.children(body)[0];
         let span = h.dom.children(p)[0];
@@ -6572,7 +6700,14 @@ mod assign_style_classes_tests {
         let mut h = Harness::new();
         let body = h.body(document, &ns);
 
-        assign_style_classes(&mut h.dom, &h.state, &mut h.styles, &h.theme, &ns);
+        assign_style_classes(
+            &mut h.dom,
+            &h.state,
+            &mut h.styles,
+            &h.theme,
+            &mut h.fonts,
+            &ns,
+        );
 
         let p = h.dom.children(body)[0];
         assert!(h.dom.node(p).attrs.get("class").is_none());
@@ -6598,7 +6733,14 @@ mod assign_style_classes_tests {
         let object_map = h.state.object_map.clone();
         apply_block_run_frames(&mut h.dom, &mut h.state, &mut h.styles, &object_map);
 
-        assign_style_classes(&mut h.dom, &h.state, &mut h.styles, &h.theme, &ns);
+        assign_style_classes(
+            &mut h.dom,
+            &h.state,
+            &mut h.styles,
+            &h.theme,
+            &mut h.fonts,
+            &ns,
+        );
 
         let frame = h.dom.children(body)[0];
         assert_eq!(h.dom.tag(frame), Some("div"));
@@ -6631,6 +6773,7 @@ mod convert_footnotes_tests {
         footnotes: Footnotes<'a, 'i>,
         settings: Settings,
         theme: Theme,
+        fonts: Fonts,
         images: Images,
         docx: Docx<std::io::Cursor<Vec<u8>>>,
         dest_dir: tempfile::TempDir,
@@ -6641,10 +6784,11 @@ mod convert_footnotes_tests {
             Harness {
                 dom: Dom::empty(),
                 state: ConvertState::new(),
-                styles: Styles::new(Tables::default()),
+                styles: Styles::new(crate::docx::tables::Tables::default()),
                 footnotes: Footnotes::new(),
                 settings: Settings::new(),
                 theme: Theme::new(),
+                fonts: Fonts::new(),
                 images: Images::new(),
                 docx: empty_test_docx(),
                 dest_dir: tempfile::tempdir().unwrap(),
@@ -6660,6 +6804,7 @@ mod convert_footnotes_tests {
                 &mut self.footnotes,
                 &self.settings,
                 &self.theme,
+                &mut self.fonts,
                 None,
                 "test-uuid",
                 &mut self.images,
@@ -6713,6 +6858,7 @@ mod convert_footnotes_tests {
             &mut h.styles,
             &h.settings,
             &h.theme,
+            &mut h.fonts,
             None,
             "test-uuid",
             "Notes",
@@ -6784,6 +6930,7 @@ mod convert_footnotes_tests {
             &mut h.styles,
             &h.settings,
             &h.theme,
+            &mut h.fonts,
             None,
             "test-uuid",
             "Notes",
@@ -6846,6 +6993,7 @@ mod convert_footnotes_tests {
             &mut h.styles,
             &h.settings,
             &h.theme,
+            &mut h.fonts,
             None,
             "test-uuid",
             "Notes",
@@ -6886,6 +7034,7 @@ mod apply_paragraph_frames_tests {
         footnotes: Footnotes<'a, 'i>,
         settings: Settings,
         theme: Theme,
+        fonts: Fonts,
         images: Images,
         docx: Docx<std::io::Cursor<Vec<u8>>>,
         dest_dir: tempfile::TempDir,
@@ -6896,10 +7045,11 @@ mod apply_paragraph_frames_tests {
             Harness {
                 dom: Dom::empty(),
                 state: ConvertState::new(),
-                styles: Styles::new(Tables::default()),
+                styles: Styles::new(crate::docx::tables::Tables::default()),
                 footnotes: Footnotes::new(),
                 settings: Settings::new(),
                 theme: Theme::new(),
+                fonts: Fonts::new(),
                 images: Images::new(),
                 docx: empty_test_docx(),
                 dest_dir: tempfile::tempdir().unwrap(),
@@ -6915,6 +7065,7 @@ mod apply_paragraph_frames_tests {
                 &mut self.footnotes,
                 &self.settings,
                 &self.theme,
+                &mut self.fonts,
                 None,
                 "test-uuid",
                 &mut self.images,
@@ -7330,6 +7481,7 @@ mod convert_document_tests {
         footnotes: Footnotes<'a, 'i>,
         settings: Settings,
         theme: Theme,
+        fonts: Fonts,
         images: Images,
         docx: Docx<std::io::Cursor<Vec<u8>>>,
     }
@@ -7338,11 +7490,12 @@ mod convert_document_tests {
         fn new() -> Self {
             Harness {
                 dom: Dom::empty(),
-                styles: Styles::new(Tables::default()),
+                styles: Styles::new(crate::docx::tables::Tables::default()),
                 numbering: Numbering::new(),
                 footnotes: Footnotes::new(),
                 settings: Settings::new(),
                 theme: Theme::new(),
+                fonts: Fonts::new(),
                 images: Images::new(),
                 docx: empty_test_docx(),
             }
@@ -7361,6 +7514,7 @@ mod convert_document_tests {
                 &mut self.footnotes,
                 &self.settings,
                 &self.theme,
+                &mut self.fonts,
                 &mut self.images,
                 &mut self.docx,
                 None,
@@ -7414,6 +7568,7 @@ mod convert_document_tests {
             &mut h.footnotes,
             &h.settings,
             &h.theme,
+            &mut h.fonts,
             &mut h.images,
             &mut h.docx,
             None,
@@ -7565,7 +7720,22 @@ mod write_document_tests {
         let mi = MetaInformation::new("My Book", vec!["An Author".to_string()]);
         let converted = minimal_converted();
 
-        write_document(&dom, html, &mi, dir.path(), &converted).unwrap();
+        let styles = Styles::new(crate::docx::tables::Tables::default());
+        let fonts = Fonts::new();
+        let mut test_docx = empty_test_docx();
+        write_document(
+            &dom,
+            html,
+            &mi,
+            dir.path(),
+            &converted,
+            &styles,
+            &fonts,
+            &mut test_docx,
+            false,
+            false,
+        )
+        .unwrap();
 
         let index = std::fs::read_to_string(dir.path().join("index.html")).unwrap();
         assert!(index.starts_with("<!DOCTYPE html>\n"));
@@ -7580,7 +7750,22 @@ mod write_document_tests {
         let mi = MetaInformation::new("My Book", vec!["An Author".to_string()]);
         let converted = minimal_converted();
 
-        let opf_path = write_document(&dom, html, &mi, dir.path(), &converted).unwrap();
+        let styles = Styles::new(crate::docx::tables::Tables::default());
+        let fonts = Fonts::new();
+        let mut test_docx = empty_test_docx();
+        let opf_path = write_document(
+            &dom,
+            html,
+            &mi,
+            dir.path(),
+            &converted,
+            &styles,
+            &fonts,
+            &mut test_docx,
+            false,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(opf_path, dir.path().join("metadata.opf"));
         let opf = std::fs::read_to_string(&opf_path).unwrap();
@@ -7595,7 +7780,22 @@ mod write_document_tests {
         let mi = MetaInformation::new("My Book", vec!["An Author".to_string()]);
         let converted = minimal_converted();
 
-        write_document(&dom, html, &mi, dir.path(), &converted).unwrap();
+        let styles = Styles::new(crate::docx::tables::Tables::default());
+        let fonts = Fonts::new();
+        let mut test_docx = empty_test_docx();
+        write_document(
+            &dom,
+            html,
+            &mi,
+            dir.path(),
+            &converted,
+            &styles,
+            &fonts,
+            &mut test_docx,
+            false,
+            false,
+        )
+        .unwrap();
 
         let ncx = std::fs::read_to_string(dir.path().join("toc.ncx")).unwrap();
         assert!(ncx.contains("<ncx"));
@@ -7611,7 +7811,22 @@ mod write_document_tests {
         let mut converted = minimal_converted();
         converted.cover_image = Some(dir.path().join("cover.png"));
 
-        write_document(&dom, html, &mi, dir.path(), &converted).unwrap();
+        let styles = Styles::new(crate::docx::tables::Tables::default());
+        let fonts = Fonts::new();
+        let mut test_docx = empty_test_docx();
+        write_document(
+            &dom,
+            html,
+            &mi,
+            dir.path(),
+            &converted,
+            &styles,
+            &fonts,
+            &mut test_docx,
+            false,
+            false,
+        )
+        .unwrap();
 
         let opf = std::fs::read_to_string(dir.path().join("metadata.opf")).unwrap();
         assert!(opf.contains(r#"type="cover""#));
@@ -7626,7 +7841,22 @@ mod write_document_tests {
         let mut converted = minimal_converted();
         converted.toc_anchor = Some("toc-anchor".to_string());
 
-        write_document(&dom, html, &mi, dir.path(), &converted).unwrap();
+        let styles = Styles::new(crate::docx::tables::Tables::default());
+        let fonts = Fonts::new();
+        let mut test_docx = empty_test_docx();
+        write_document(
+            &dom,
+            html,
+            &mi,
+            dir.path(),
+            &converted,
+            &styles,
+            &fonts,
+            &mut test_docx,
+            false,
+            false,
+        )
+        .unwrap();
 
         let opf = std::fs::read_to_string(dir.path().join("metadata.opf")).unwrap();
         assert!(opf.contains(r#"type="toc""#));
@@ -7690,7 +7920,7 @@ mod convert_docx_document_tests {
         let dir = tempfile::tempdir().unwrap();
         let mut docx = minimal_docx();
 
-        let opf_path = convert_docx_document(&mut docx, dir.path(), true, "Notes")
+        let opf_path = convert_docx_document(&mut docx, dir.path(), true, "Notes", false, false)
             .expect("conversion succeeds");
 
         assert_eq!(opf_path, dir.path().join("metadata.opf"));
@@ -7709,6 +7939,70 @@ mod convert_docx_document_tests {
 
         let ncx = std::fs::read_to_string(dir.path().join("toc.ncx")).unwrap();
         assert!(ncx.contains("Chapter One"));
+
+        let css = std::fs::read_to_string(dir.path().join("docx.css")).unwrap();
+        assert!(css.contains("body { font-family:"));
+        assert!(
+            opf.contains("docx.css"),
+            "docx.css is picked up by the manifest scan: {opf}"
+        );
+    }
+
+    #[test]
+    fn an_embedded_font_declared_in_font_table_is_extracted_and_referenced_in_docx_css() {
+        const DOC_XML_WITH_FONT: &str = r#"<?xml version="1.0"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:r><w:rPr><w:rFonts w:ascii="MyFont"/></w:rPr><w:t>styled text</w:t></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        const FONT_TABLE_XML: &str = r#"<?xml version="1.0"?>
+<w:fonts xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <w:font w:name="MyFont">
+    <w:embedRegular r:id="rId9"/>
+  </w:font>
+</w:fonts>"#;
+        const FONT_TABLE_RELS: &str = r#"<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/font" Target="fonts/font1.fntdata"/>
+</Relationships>"#;
+        let mut font_bytes = b"OTTO".to_vec();
+        font_bytes.extend_from_slice(&[0u8; 60]);
+
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let options = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (name, content) in [
+                ("[Content_Types].xml", CONTENT_TYPES),
+                ("_rels/.rels", RELS),
+                ("word/document.xml", DOC_XML_WITH_FONT),
+                ("word/fontTable.xml", FONT_TABLE_XML),
+                ("word/_rels/fontTable.xml.rels", FONT_TABLE_RELS),
+            ] {
+                zip.start_file(name, options).unwrap();
+                zip.write_all(content.as_bytes()).unwrap();
+            }
+            zip.start_file("word/fonts/font1.fntdata", options).unwrap();
+            zip.write_all(&font_bytes).unwrap();
+            zip.finish().unwrap();
+        }
+        let mut docx = Docx::new(Cursor::new(buf)).expect("package opens");
+        let dir = tempfile::tempdir().unwrap();
+
+        convert_docx_document(&mut docx, dir.path(), true, "Notes", false, false)
+            .expect("conversion succeeds");
+
+        let css = std::fs::read_to_string(dir.path().join("docx.css")).unwrap();
+        assert!(
+            css.contains("@font-face"),
+            "the embedded font is referenced: {css}"
+        );
+        assert!(css.contains(r#"font-family: "MyFont""#));
+
+        let written = std::fs::read(dir.path().join("fonts").join("MyFont_-_Regular.otf")).unwrap();
+        assert_eq!(written, font_bytes);
     }
 
     #[test]
@@ -7743,7 +8037,8 @@ mod convert_docx_document_tests {
         let mut docx = Docx::new(Cursor::new(buf)).expect("package opens");
         let dir = tempfile::tempdir().unwrap();
 
-        convert_docx_document(&mut docx, dir.path(), true, "Notes").expect("conversion succeeds");
+        convert_docx_document(&mut docx, dir.path(), true, "Notes", false, false)
+            .expect("conversion succeeds");
 
         let index = std::fs::read_to_string(dir.path().join("index.html")).unwrap();
         assert!(
@@ -7769,7 +8064,8 @@ mod convert_docx_document_tests {
             Docx::new(Cursor::new(buf)).expect("package with no document.xml still opens");
         let dir = tempfile::tempdir().unwrap();
 
-        let err = convert_docx_document(&mut docx, dir.path(), true, "Notes").unwrap_err();
+        let err =
+            convert_docx_document(&mut docx, dir.path(), true, "Notes", false, false).unwrap_err();
         assert!(
             matches!(err, DocxError::InvalidDocx(_) | DocxError::MissingPart(_)),
             "unexpected error variant: {err:?}"

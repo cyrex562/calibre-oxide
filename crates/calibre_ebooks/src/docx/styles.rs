@@ -3,16 +3,17 @@
 //! resolves them into per-paragraph/per-run [`ParagraphStyle`]s and
 //! [`RunStyle`]s ([`Styles`]).
 //!
-//! Port of `old_src/src/calibre/ebooks/docx/styles.py`, minus two
-//! pieces still blocked (see issue #130): [`Styles::cascade`] needs
-//! an `is-link` marker and a paragraph -> runs `layers` map that only
-//! exist once `to_html.rs`'s real port builds the HTML body, and
-//! [`Styles::resolve_run`]'s font resolution stops at
-//! [`super::theme::Theme::resolve_font_family`] rather than also
-//! matching against the system's installed fonts
-//! (`fonts.py`'s `Fonts::family_for`, which needs a font scanner with
-//! no Rust counterpart yet) -- `generate_css` (which needs
-//! `Fonts::embed_fonts`) is deferred for the same reason.
+//! Port of `old_src/src/calibre/ebooks/docx/styles.py`, in full.
+//! [`Styles::resolve_run`] resolves a run's font family all the way
+//! through [`super::theme::Theme::resolve_font_family`] and then
+//! [`super::fonts::Fonts::family_for`] (matching Python's own
+//! `self.fonts.family_for(ff, ans.b, ans.i)`, the very last step of
+//! `resolve_run`), and [`Styles::generate_css`] assembles the whole
+//! `docx.css` document -- both take a `fonts: &Fonts`/`&mut Fonts`
+//! parameter rather than storing one, the same way `theme: &Theme` is
+//! already threaded through rather than stored (Python's `self.fonts`
+//! is set once by `__call__` and never reassigned; this port's
+//! `Styles` has no equivalent call that would need to own it).
 //!
 //! # `calibre_num_id`: a tracked map, not a synthetic attribute
 //!
@@ -29,12 +30,16 @@
 //! `roxmltree`.
 
 use std::collections::{BTreeMap, HashMap};
+use std::io::{Read, Seek};
+use std::path::Path;
 
 use indexmap::IndexMap;
 use roxmltree::Node;
 
 use super::block_styles::{twips, Css, ParagraphStyle};
 use super::char_styles::RunStyle;
+use super::container::Docx;
+use super::fonts::Fonts;
 use super::names::DocxNamespace;
 use super::numbering::Numbering;
 use super::tables::{TableStyle, Tables};
@@ -504,11 +509,16 @@ impl<'a, 'i> Styles<'a, 'i> {
     }
 
     /// The final, fully cascaded style for one `w:r`, cached by node
-    /// identity. Font resolution stops short of `fonts.py`'s system
-    /// font matching -- see the module docs.
+    /// identity.
     ///
     /// Port of the Python `Styles.resolve_run`.
-    pub fn resolve_run(&mut self, r: Node<'a, 'i>, theme: &Theme, ns: &DocxNamespace) -> RunStyle {
+    pub fn resolve_run(
+        &mut self,
+        r: Node<'a, 'i>,
+        theme: &Theme,
+        fonts: &mut Fonts,
+        ns: &DocxNamespace,
+    ) -> RunStyle {
         if let Some(cached) = self.run_cache.get(&r) {
             return cached.clone();
         }
@@ -604,11 +614,8 @@ impl<'a, 'i> Styles<'a, 'i> {
         toggle!(vanish);
 
         if let Some(ff) = &ans.font_family {
-            // Python continues: `self.fonts.family_for(ff, ans.b,
-            // ans.i)`, matching against the system's installed fonts.
-            // Not ported (see the module docs) -- `font_family` stops
-            // at the theme-resolved literal name.
-            ans.font_family = Some(theme.resolve_font_family(ff));
+            let ff = theme.resolve_font_family(ff);
+            ans.font_family = Some(fonts.family_for(&ff, ans.b == Some(true), ans.i == Some(true)));
         }
 
         self.run_cache.insert(r, ans.clone());
@@ -810,6 +817,99 @@ impl<'a, 'i> Styles<'a, 'i> {
                 self.register(css, "text");
             }
         }
+    }
+
+    /// Assembles the full `docx.css` document: a fixed prelude of
+    /// Word-authoring-model resets, `@font-face` rules for whichever
+    /// embedded fonts [`Styles::resolve_run`] actually used
+    /// ([`Fonts::embed_fonts`]), the body's own cascaded
+    /// font-family/size/color (set by [`Styles::cascade`]), and every
+    /// class [`Styles::generate_classes`] registered.
+    ///
+    /// Port of the Python `Styles.generate_css`. CSS whitespace isn't
+    /// reproduced byte-for-byte (it has no effect on how a browser
+    /// parses the stylesheet) -- only the rules themselves.
+    pub fn generate_css<R: Read + Seek>(
+        &self,
+        fonts: &Fonts,
+        dest_dir: &Path,
+        docx: &mut Docx<R>,
+        notes_nopb: bool,
+        nosupsub: bool,
+    ) -> String {
+        let ef = fonts.embed_fonts(dest_dir, docx);
+
+        let body_color = if matches!(
+            self.body_color.to_lowercase().as_str(),
+            "currentcolor" | "inherit"
+        ) {
+            String::new()
+        } else {
+            format!("color: {};", self.body_color)
+        };
+
+        let mut s = format!(
+            "body {{ font-family: {}; font-size: {}; {body_color} }}\n\n\
+             /* In word all paragraphs have zero margins unless explicitly specified in a style */\n\
+             p, h1, h2, h3, h4, h5, h6, div {{ margin: 0; padding: 0 }}\n\
+             /* In word headings only have bold font if explicitly specified,\n\
+             \tsimilarly the font size is the body font size, unless explicitly set. */\n\
+             h1, h2, h3, h4, h5, h6 {{ font-weight: normal; font-size: 1rem }}\n\
+             ul, ol {{ margin: 0; padding: 0; padding-inline-start: 0; padding-inline-end: 0; margin-block-start: 0; margin-block-end: 0 }}\n\n\
+             /* The word hyperlink styling will set text-decoration to underline if needed */\n\
+             a {{ text-decoration: none }}\n\n\
+             sup.noteref a {{ text-decoration: none }}\n\n\
+             h1.notes-header {{ page-break-before: always }}\n\n\
+             dl.footnote dt {{ font-size: large }}\n\n\
+             dl.footnote dt a {{ text-decoration: none }}\n\n",
+            self.body_font_family, self.body_font_size,
+        );
+
+        if !notes_nopb {
+            s.push_str(
+                "dl.footnote { page-break-after: always }\n\
+                 dl.footnote:last-of-type { page-break-after: avoid }\n",
+            );
+        }
+
+        s.push_str(
+            "span.tab { white-space: pre }\n\n\
+             p.index-entry { text-indent: 0pt; }\n\
+             p.index-entry a:visited { color: blue }\n\
+             p.index-entry a:hover { color: red }\n",
+        );
+
+        if nosupsub {
+            s.push_str(
+                "sup { vertical-align: top }\n\
+                 sub { vertical-align: bottom }\n",
+            );
+        }
+
+        let mut prefix = s;
+        if !ef.is_empty() {
+            prefix = format!("{ef}\n{prefix}");
+        }
+
+        let mut classes: Vec<(&String, &Css)> = self
+            .classes
+            .values()
+            .map(|(name, css)| (name, css))
+            .collect();
+        classes.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut ans = Vec::new();
+        for (cls, css) in classes {
+            let body: String = css
+                .iter()
+                .map(|(k, v)| format!("\t{k}: {v};"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let body = body.trim_end_matches(';');
+            ans.push(format!(".{cls} {{\n{body}\n}}\n"));
+        }
+
+        format!("{prefix}\n{}", ans.join("\n"))
     }
 }
 
@@ -1090,7 +1190,8 @@ mod tests {
         default_char.b = Some(true);
         styles.default_character_style = Some(default_char);
         let theme = Theme::default();
-        let resolved = styles.resolve_run(r, &theme, &ns);
+        let mut fonts = Fonts::new();
+        let resolved = styles.resolve_run(r, &theme, &mut fonts, &ns);
         assert_eq!(
             resolved.b,
             Some(false),
@@ -1120,6 +1221,7 @@ mod tests {
         let mut styles = Styles::new(Tables::default());
         styles.call(Some(styles_root), &ns);
         let theme = Theme::default();
+        let mut fonts = Fonts::new();
 
         let body = ns.first_child(doc.root_element(), "w:body").unwrap();
         let p = ns.first_child(body, "w:p").unwrap();
@@ -1127,7 +1229,7 @@ mod tests {
 
         // Populates para_char_cache from P1's own character_style.
         styles.resolve_paragraph(p, &ns);
-        let resolved = styles.resolve_run(r, &theme, &ns);
+        let resolved = styles.resolve_run(r, &theme, &mut fonts, &ns);
         assert_eq!(
             resolved.b,
             Some(false),
@@ -1136,7 +1238,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_run_theme_resolves_font_family_but_does_not_match_system_fonts() {
+    fn resolve_run_theme_resolves_font_family_then_falls_back_to_serif_when_undeclared() {
+        // No `fontTable.xml` was ever read into `fonts`, so "Arial"
+        // (a theme-resolved literal name) isn't a known `Family` --
+        // `Fonts::family_for` falls back to "serif", matching a real
+        // document where a run names a font `fontTable.xml` never
+        // declared.
         let (doc, ns) = parse_doc(
             "w:body",
             r#"<w:p><w:r><w:rPr><w:rFonts w:ascii="Arial"/></w:rPr></w:r></w:p>"#,
@@ -1145,8 +1252,31 @@ mod tests {
         let r = ns.first_child(p, "w:r").unwrap();
         let mut styles = Styles::new(Tables::default());
         let theme = Theme::default();
-        let resolved = styles.resolve_run(r, &theme, &ns);
-        assert_eq!(resolved.font_family.as_deref(), Some("Arial"));
+        let mut fonts = Fonts::new();
+        let resolved = styles.resolve_run(r, &theme, &mut fonts, &ns);
+        assert_eq!(resolved.font_family.as_deref(), Some("serif"));
+    }
+
+    #[test]
+    fn resolve_run_font_family_resolves_through_a_declared_family() {
+        let (doc, ns) = parse_doc(
+            "w:body",
+            r#"<w:p><w:r><w:rPr><w:rFonts w:ascii="Arial"/></w:rPr></w:r></w:p>"#,
+        );
+        let p = ns.first_child(doc.root_element(), "w:p").unwrap();
+        let r = ns.first_child(p, "w:r").unwrap();
+        let mut styles = Styles::new(Tables::default());
+        let theme = Theme::default();
+
+        let fonts_xml = Document::parse(
+            r#"<w:fonts xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:font w:name="Arial"/></w:fonts>"#,
+        )
+        .unwrap();
+        let mut fonts = Fonts::new();
+        fonts.call(fonts_xml.root_element(), &HashMap::new(), &ns);
+
+        let resolved = styles.resolve_run(r, &theme, &mut fonts, &ns);
+        assert_eq!(resolved.font_family.as_deref(), Some("\"Arial\", serif"));
     }
 
     #[test]
@@ -1269,5 +1399,68 @@ mod tests {
         styles.resolve_paragraph(p, &ns);
         styles.generate_classes();
         assert_eq!(styles.classes.len(), 1);
+    }
+
+    #[test]
+    fn generate_css_includes_the_fixed_prelude_and_body_defaults() {
+        let styles = Styles::new(Tables::default());
+        let fonts = Fonts::new();
+        let mut docx = crate::docx::to_html::empty_test_docx();
+        let dest_dir = tempfile::tempdir().unwrap();
+        let css = styles.generate_css(&fonts, dest_dir.path(), &mut docx, false, false);
+        assert!(css.contains("body { font-family: serif; font-size: 10pt;  }"));
+        assert!(css.contains("p, h1, h2, h3, h4, h5, h6, div { margin: 0; padding: 0 }"));
+        assert!(css.contains("dl.footnote { page-break-after: always }"));
+        assert!(!css.contains("sup { vertical-align: top }"));
+    }
+
+    #[test]
+    fn generate_css_omits_the_footnote_page_break_when_notes_nopb_is_set() {
+        let styles = Styles::new(Tables::default());
+        let fonts = Fonts::new();
+        let mut docx = crate::docx::to_html::empty_test_docx();
+        let dest_dir = tempfile::tempdir().unwrap();
+        let css = styles.generate_css(&fonts, dest_dir.path(), &mut docx, true, false);
+        assert!(!css.contains("dl.footnote { page-break-after: always }"));
+    }
+
+    #[test]
+    fn generate_css_adds_sup_sub_rules_when_nosupsub_is_set() {
+        let styles = Styles::new(Tables::default());
+        let fonts = Fonts::new();
+        let mut docx = crate::docx::to_html::empty_test_docx();
+        let dest_dir = tempfile::tempdir().unwrap();
+        let css = styles.generate_css(&fonts, dest_dir.path(), &mut docx, false, true);
+        assert!(css.contains("sup { vertical-align: top }"));
+        assert!(css.contains("sub { vertical-align: bottom }"));
+    }
+
+    #[test]
+    fn generate_css_includes_a_color_declaration_when_body_color_is_set() {
+        let mut styles = Styles::new(Tables::default());
+        styles.body_color = "#123456".to_string();
+        let fonts = Fonts::new();
+        let mut docx = crate::docx::to_html::empty_test_docx();
+        let dest_dir = tempfile::tempdir().unwrap();
+        let css = styles.generate_css(&fonts, dest_dir.path(), &mut docx, false, false);
+        assert!(css.contains("color: #123456;"));
+    }
+
+    #[test]
+    fn generate_css_renders_every_registered_class_sorted_by_name() {
+        let (doc, ns) = parse_doc(
+            "w:body",
+            r#"<w:p><w:pPr><w:jc w:val="center"/></w:pPr></w:p>"#,
+        );
+        let p = ns.first_child(doc.root_element(), "w:p").unwrap();
+        let mut styles = Styles::new(Tables::default());
+        styles.resolve_paragraph(p, &ns);
+        styles.generate_classes();
+
+        let fonts = Fonts::new();
+        let mut docx = crate::docx::to_html::empty_test_docx();
+        let dest_dir = tempfile::tempdir().unwrap();
+        let css = styles.generate_css(&fonts, dest_dir.path(), &mut docx, false, false);
+        assert!(css.contains(".block_1 {\n\ttext-align: center\n}"));
     }
 }

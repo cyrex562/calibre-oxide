@@ -1,11 +1,7 @@
 //! Port of `Convert.read_styles` (`old_src/.../docx/to_html.py:294-385`)
 //! -- the package-loading step that resolves and reads
 //! `numbering.xml`/`styles.xml`/`settings.xml`/`theme1.xml`/
-//! `footnotes.xml`/`endnotes.xml`. `fontTable.xml` is not read at all:
-//! it needs `fonts.py`'s `Fonts` class (embedded-font extraction),
-//! itself blocked on a system font scanner -- see `fonts.rs`'s module
-//! docs. `Styles`/`Numbering`'s own font resolution already stops
-//! short of that dependency for the same reason.
+//! `footnotes.xml`/`endnotes.xml`/`fontTable.xml`.
 //!
 //! # Split into two phases, unlike Python's one method
 //!
@@ -35,6 +31,7 @@
 //! # use calibre_ebooks::docx::names::DocxNamespace;
 //! # use calibre_ebooks::docx::numbering::Numbering;
 //! # use calibre_ebooks::docx::footnotes::Footnotes;
+//! # use calibre_ebooks::docx::fonts::Fonts;
 //! # use calibre_ebooks::docx::settings::Settings;
 //! # use calibre_ebooks::docx::styles::Styles;
 //! # use calibre_ebooks::docx::tables::Tables;
@@ -53,14 +50,16 @@
 //! let theme_doc = parts.theme.as_deref().and_then(|s| Document::parse(s).ok());
 //! let styles_doc = parts.styles.as_deref().and_then(|s| Document::parse(s).ok());
 //! let numbering_doc = parts.numbering.as_deref().and_then(|s| Document::parse(s).ok());
+//! let fonts_table_doc = parts.fonts_table.as_deref().and_then(|s| Document::parse(s).ok());
 //!
 //! let mut settings = Settings::new();
 //! let mut footnotes = Footnotes::new();
 //! let mut theme = Theme::new();
 //! let mut styles = Styles::new(Tables::default());
 //! let mut numbering = Numbering::new();
+//! let mut fonts = Fonts::new();
 //! wire_parts(
-//!     &mut settings, &mut footnotes, &mut theme, &mut styles, &mut numbering,
+//!     &mut settings, &mut footnotes, &mut theme, &mut styles, &mut numbering, &mut fonts,
 //!     settings_doc.as_ref().map(Document::root_element),
 //!     footnotes_doc.as_ref().map(Document::root_element),
 //!     parts.footnotes_rels,
@@ -69,6 +68,8 @@
 //!     theme_doc.as_ref().map(Document::root_element),
 //!     styles_doc.as_ref().map(Document::root_element),
 //!     numbering_doc.as_ref().map(Document::root_element),
+//!     fonts_table_doc.as_ref().map(Document::root_element),
+//!     parts.fonts_table_rels,
 //!     &ns,
 //! );
 //! # Ok(())
@@ -82,6 +83,7 @@ use std::rc::Rc;
 use roxmltree::Node;
 
 use super::container::{Docx, Relationships};
+use super::fonts::Fonts;
 use super::footnotes::Footnotes;
 use super::names::DocxNamespace;
 use super::numbering::Numbering;
@@ -157,6 +159,12 @@ pub struct RawParts {
     /// that follow-up doesn't also need to re-derive this name
     /// resolution.
     pub numbering_rels: Relationships,
+    /// `fontTable.xml`'s own relationships (each `w:embed*`'s `r:id`
+    /// resolved to the embedded font file's real zip name) -- what
+    /// [`super::fonts::Fonts::call`]'s `embed_relationships` parameter
+    /// needs.
+    pub fonts_table: Option<String>,
+    pub fonts_table_rels: Relationships,
 }
 
 /// Port of the real-I/O half of `Convert.read_styles`: resolves and
@@ -241,19 +249,34 @@ pub fn read_raw_parts<R: Read + Seek>(
         }
     }
 
+    if let Some(name) = resolve_part_name(
+        docx,
+        document_name,
+        relationships_by_type,
+        ns.name("FONTS").unwrap_or(""),
+        "fontTable.xml",
+    ) {
+        if let Ok(raw) = docx.read_str(&name) {
+            parts.fonts_table_rels = docx.get_relationships(&name);
+            parts.fonts_table = Some(raw);
+        }
+    }
+
     parts
 }
 
 /// Wires already-parsed part roots into `settings`/`footnotes`/
-/// `theme`/`styles`/`numbering`, in Python's real order: settings,
-/// footnotes+endnotes together, theme, styles (loaded even when
-/// `styles_root` is `None`, matching Python's `self.styles(None,
-/// fonts, self.theme)` fallback -- `Styles::call` already treats
-/// `None` as "no explicit styles, resolve pure defaults" the same
-/// way), numbering (only when `numbering_root` is `Some`, matching
-/// Python's own `if nname is not None:` guard -- unlike styles,
-/// nothing calls `Numbering::call` with an absent root), then
-/// [`Styles::resolve_numbering`].
+/// `theme`/`styles`/`numbering`/`fonts`, in Python's real order:
+/// settings, footnotes+endnotes together, fonts (before theme,
+/// matching Python's own `fonts = self.fonts = Fonts(...)` /
+/// `fonts(...)` call landing before `self.theme(...)`), theme, styles
+/// (loaded even when `styles_root` is `None`, matching Python's
+/// `self.styles(None, fonts, self.theme)` fallback -- `Styles::call`
+/// already treats `None` as "no explicit styles, resolve pure
+/// defaults" the same way), numbering (only when `numbering_root` is
+/// `Some`, matching Python's own `if nname is not None:` guard --
+/// unlike styles, nothing calls `Numbering::call` with an absent
+/// root), then [`Styles::resolve_numbering`].
 ///
 /// `resolve_numbering` takes `Numbering` *by value* in this port
 /// (Python passes the same shared, implicitly-reference-counted
@@ -271,6 +294,7 @@ pub fn wire_parts<'a, 'i>(
     theme: &mut Theme,
     styles: &mut Styles<'a, 'i>,
     numbering: &mut Numbering,
+    fonts: &mut Fonts,
     settings_root: Option<Node<'a, 'i>>,
     footnotes_root: Option<Node<'a, 'i>>,
     footnotes_rels: Relationships,
@@ -279,6 +303,8 @@ pub fn wire_parts<'a, 'i>(
     theme_root: Option<Node<'a, 'i>>,
     styles_root: Option<Node<'a, 'i>>,
     numbering_root: Option<Node<'a, 'i>>,
+    fonts_table_root: Option<Node<'a, 'i>>,
+    fonts_table_rels: Relationships,
     ns: &DocxNamespace,
 ) {
     if let Some(root) = settings_root {
@@ -292,6 +318,10 @@ pub fn wire_parts<'a, 'i>(
         Rc::new(endnotes_rels),
         ns,
     );
+
+    if let Some(root) = fonts_table_root {
+        fonts.call(root, &fonts_table_rels.by_id, ns);
+    }
 
     if let Some(root) = theme_root {
         theme.read(root, ns);
@@ -488,6 +518,33 @@ mod tests {
             assert!(parts.styles.is_none());
             assert!(parts.numbering.is_none());
             assert!(parts.theme.is_none());
+            assert!(parts.fonts_table.is_none());
+        }
+
+        #[test]
+        fn the_font_table_and_its_own_relationships_are_read_together() {
+            let mut docx = package(&[
+                ("[Content_Types].xml", CONTENT_TYPES),
+                ("_rels/.rels", RELS),
+                ("word/document.xml", "<w:document/>"),
+                (
+                    "word/fontTable.xml",
+                    r#"<w:fonts xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:font w:name="Arial"/></w:fonts>"#,
+                ),
+                (
+                    "word/_rels/fontTable.xml.rels",
+                    r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId9" Type="t" Target="fonts/font1.fntdata"/></Relationships>"#,
+                ),
+            ]);
+            let ns = DocxNamespace::default();
+
+            let parts = read_raw_parts(&mut docx, "word/document.xml", &HashMap::new(), &ns);
+
+            assert!(parts.fonts_table.as_deref().unwrap().contains("Arial"));
+            assert_eq!(
+                parts.fonts_table_rels.by_id.get("rId9").map(String::as_str),
+                Some("word/fonts/font1.fntdata")
+            );
         }
     }
 
@@ -513,6 +570,7 @@ mod tests {
             let mut theme = Theme::new();
             let mut styles = Styles::new(Tables::default());
             let mut numbering = Numbering::new();
+            let mut fonts = Fonts::new();
 
             wire_parts(
                 &mut settings,
@@ -520,6 +578,7 @@ mod tests {
                 &mut theme,
                 &mut styles,
                 &mut numbering,
+                &mut fonts,
                 None,
                 None,
                 Relationships::default(),
@@ -528,10 +587,51 @@ mod tests {
                 None,
                 Some(styles_doc.root_element()),
                 None,
+                None,
+                Relationships::default(),
                 &ns,
             );
 
             assert!(styles.id_map.contains_key("Heading1"));
+        }
+
+        #[test]
+        fn a_declared_font_table_ends_up_queryable_on_fonts() {
+            let fonts_xml: &'static str = Box::leak(Box::new(
+                r#"<w:fonts xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:font w:name="Arial"><w:family w:val="swiss"/></w:font></w:fonts>"#.to_string(),
+            ));
+            let fonts_doc = Document::parse(fonts_xml).unwrap();
+            let ns = DocxNamespace::default();
+
+            let mut settings = Settings::new();
+            let mut footnotes = Footnotes::new();
+            let mut theme = Theme::new();
+            let mut styles = Styles::new(Tables::default());
+            let mut numbering = Numbering::new();
+            let mut fonts = Fonts::new();
+
+            wire_parts(
+                &mut settings,
+                &mut footnotes,
+                &mut theme,
+                &mut styles,
+                &mut numbering,
+                &mut fonts,
+                None,
+                None,
+                Relationships::default(),
+                None,
+                Relationships::default(),
+                None,
+                None,
+                None,
+                Some(fonts_doc.root_element()),
+                Relationships::default(),
+                &ns,
+            );
+
+            let family = fonts.get("Arial").expect("Arial was declared");
+            assert_eq!(family.css_generic_family, "sans-serif");
         }
 
         #[test]
@@ -542,6 +642,7 @@ mod tests {
             let mut theme = Theme::new();
             let mut styles = Styles::new(Tables::default());
             let mut numbering = Numbering::new();
+            let mut fonts = Fonts::new();
 
             wire_parts(
                 &mut settings,
@@ -549,6 +650,7 @@ mod tests {
                 &mut theme,
                 &mut styles,
                 &mut numbering,
+                &mut fonts,
                 None,
                 None,
                 Relationships::default(),
@@ -557,6 +659,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                Relationships::default(),
                 &ns,
             );
 

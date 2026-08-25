@@ -37,7 +37,7 @@ impl DOCXInput {
         let mut docx = Docx::new(file).map_err(|e| anyhow::anyhow!("DOCX Error: {}", e))?;
 
         std::fs::create_dir_all(output_dir)?;
-        convert_docx_document(&mut docx, output_dir, true, "Notes")
+        convert_docx_document(&mut docx, output_dir, true, "Notes", false, false)
             .map_err(|e| anyhow::anyhow!("Conversion Error: {}", e))?;
 
         let container = Box::new(DirContainer::new(output_dir));
