@@ -33,6 +33,7 @@ use roxmltree::Node;
 use crate::dom::{Dom, NodeId};
 use crate::oeb::polish::toc::elem_to_toc_text;
 
+use super::fonts::Fonts;
 use super::names::DocxNamespace;
 use super::styles::Styles;
 use super::theme::Theme;
@@ -239,6 +240,7 @@ fn link_to_txt<'a, 'i>(
     a: NodeId,
     styles: &mut Styles<'a, 'i>,
     theme: &Theme,
+    fonts: &mut Fonts,
     object_map: &IndexMap<NodeId, Node<'a, 'i>>,
     ns: &DocxNamespace,
 ) -> String {
@@ -251,7 +253,7 @@ fn link_to_txt<'a, 'i>(
             let css = if ns.is_tag(run, "w:p") {
                 styles.resolve_paragraph(run, ns).css()
             } else if ns.is_tag(run, "w:r") {
-                styles.resolve_run(run, theme, ns).css()
+                styles.resolve_run(run, theme, fonts, ns).css()
             } else {
                 continue;
             };
@@ -291,6 +293,7 @@ pub fn from_toc<'a, 'i>(
     dom: &mut Dom,
     styles: &mut Styles<'a, 'i>,
     theme: &Theme,
+    fonts: &mut Fonts,
     object_map: &IndexMap<NodeId, Node<'a, 'i>>,
     ns: &DocxNamespace,
 ) -> Option<Toc> {
@@ -327,7 +330,7 @@ pub fn from_toc<'a, 'i>(
                 continue;
             };
             let href = dom.node(a).attrs.get("href").cloned();
-            let txt = link_to_txt(dom, a, styles, theme, object_map, ns);
+            let txt = link_to_txt(dom, a, styles, theme, fonts, object_map, ns);
             let p = ns.ancestor(tag, "w:p");
             let (Some(href), Some(p)) = (href, p) else {
                 continue;
@@ -409,6 +412,7 @@ pub fn create_toc<'a, 'i>(
     resolved_link_map: &HashMap<Node<'a, 'i>, NodeId>,
     styles: &mut Styles<'a, 'i>,
     theme: &Theme,
+    fonts: &mut Fonts,
     object_map: &IndexMap<NodeId, Node<'a, 'i>>,
     ns: &DocxNamespace,
 ) -> Option<Toc> {
@@ -418,6 +422,7 @@ pub fn create_toc<'a, 'i>(
         dom,
         styles,
         theme,
+        fonts,
         object_map,
         ns,
     )
@@ -621,6 +626,7 @@ mod create_toc_tests {
         let empty_doc = roxmltree::Document::parse("<w:document xmlns:w=\"x\"/>").unwrap();
         let mut styles = Styles::new(super::super::tables::Tables::default());
         let theme = Theme::new();
+        let mut fonts = Fonts::new();
         let object_map = IndexMap::new();
         let ns = DocxNamespace::default();
 
@@ -631,6 +637,7 @@ mod create_toc_tests {
             &HashMap::new(),
             &mut styles,
             &theme,
+            &mut fonts,
             &object_map,
             &ns,
         );
@@ -687,6 +694,7 @@ mod from_toc_tests {
         let mut footnotes = Footnotes::new();
         let settings = Settings::new();
         let theme = Theme::new();
+        let mut fonts = Fonts::new();
 
         state
             .anchor_map
@@ -708,6 +716,7 @@ mod from_toc_tests {
             &mut footnotes,
             &settings,
             &theme,
+            &mut fonts,
             None,
             "test-uuid",
             &mut images,
@@ -733,6 +742,7 @@ mod from_toc_tests {
             &mut dom,
             &mut styles,
             &theme,
+            &mut fonts,
             &state.object_map,
             &ns,
         )
@@ -753,6 +763,7 @@ mod from_toc_tests {
         let mut dom = Dom::empty();
         let mut styles = Styles::new(Tables::default());
         let theme = Theme::new();
+        let mut fonts = Fonts::new();
         let object_map = IndexMap::new();
 
         let toc = from_toc(
@@ -761,6 +772,7 @@ mod from_toc_tests {
             &mut dom,
             &mut styles,
             &theme,
+            &mut fonts,
             &object_map,
             &ns,
         );
