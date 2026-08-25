@@ -723,6 +723,7 @@ mod from_toc_tests {
             &mut dom,
             &state,
             &crate::docx::images::Images::new(),
+            &[],
             &ns,
         );
 
