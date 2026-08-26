@@ -15,8 +15,11 @@
 //! | `from_html.py` (partial) | [`from_html`] |
 //! | `lists.py` | [`lists`] |
 //! | `images.py` (partial) | [`images`] |
+//! | `tables.py` (partial) | [`tables`] |
 //!
-//! Still to come, tracked as issue #132: `tables.py`, `images.py`'s
+//! Still to come, tracked as issue #132: `tables.py`'s `Cell`/`Row`/
+//! `Table` themselves (see [`tables`]'s module docs -- only the
+//! border/width foundation is ported so far), `images.py`'s
 //! `ImagesManager` itself (see [`images`]'s module docs -- only its
 //! self-contained utility layer is ported so far), `from_html.py`'s
 //! `Convert.__call__`/`.write` and `Blocks`'
@@ -58,6 +61,7 @@ pub mod images;
 pub mod links;
 pub mod lists;
 pub mod styles;
+pub mod tables;
 pub mod utils;
 pub mod xml;
 
@@ -73,5 +77,9 @@ pub use images::{create_docx_image_markup, create_filename, get_image_margins, I
 pub use links::{LinksManager, TocItem};
 pub use lists::ListsManager;
 pub use styles::{BlockStyleId, StylesManager, TextStyleId};
+pub use tables::{
+    as_percent, border_style_weight, convert_width, read_css_block_borders, table_background_color,
+    Border, EdgeBorders,
+};
 pub use utils::{convert_color, int_or_zero};
 pub use xml::Element;
