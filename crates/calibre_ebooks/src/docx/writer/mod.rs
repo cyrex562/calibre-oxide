@@ -12,13 +12,16 @@
 //! | — (`lxml.builder`) | [`xml`] |
 //! | `styles.py` (partial) | [`styles`] |
 //! | `links.py` (partial) | [`links`] |
+//! | `from_html.py` (partial) | [`from_html`] |
 //!
-//! Still to come, tracked as issue #132: `from_html.py`, `tables.py`,
-//! `images.py`, `lists.py`, plus `styles.py`'s `CombinedStyle`/
+//! Still to come, tracked as issue #132: `tables.py`, `images.py`,
+//! `lists.py`, `from_html.py`'s `Block`/`Blocks`/`Convert` (see
+//! [`from_html`]'s module docs), plus `styles.py`'s `CombinedStyle`/
 //! `StylesManager.finalize`/`.serialize` and `links.py`'s
 //! TOC-serialization half (`LinksManager.process_toc_node`/
 //! `.process_toc_links`/`.serialize_toc` -- see [`links`]'s module
-//! docs). These walk a resolved-CSS HTML tree -- #132's own "needs a
+//! docs) -- all of which need those still-unported `from_html.py`
+//! types. These walk a resolved-CSS HTML tree -- #132's own "needs a
 //! real OEB stylizer" framing was stale by the time it was filed:
 //! [`crate::oeb::polish::cascade`] already had a real CSS cascade (a
 //! different consumer, issue #164), and
@@ -44,6 +47,7 @@
 
 pub mod container;
 pub mod fonts;
+pub mod from_html;
 pub mod links;
 pub mod styles;
 pub mod utils;
@@ -53,6 +57,7 @@ pub use container::{
     create_skeleton, DocumentRelationships, DocxWriter, Margins, PageOptions, Skeleton,
 };
 pub use fonts::{obfuscate_font_data, FontFace, FontsManager, Slot};
+pub use from_html::{LinkTarget, TextRun};
 pub use links::{LinksManager, TocItem};
 pub use styles::{BlockStyleId, StylesManager, TextStyleId};
 pub use utils::{convert_color, int_or_zero};
