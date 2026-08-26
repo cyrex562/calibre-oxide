@@ -540,6 +540,21 @@ impl Block {
         self.runs.iter().all(TextRun::is_empty)
     }
 
+    /// This block's runs, in document order. Exposed for
+    /// `StylesManager::finalize` (`styles.rs`), which needs to read
+    /// and reassign `TextRun::style`/`.parent_style`/
+    /// `.descendant_style_id` across every block -- a cross-module
+    /// caller, unlike `Block`'s other methods, which is why this
+    /// needed a real accessor instead of just the private field.
+    pub fn runs(&self) -> &[TextRun] {
+        &self.runs
+    }
+
+    /// Mutable counterpart of [`Self::runs`].
+    pub fn runs_mut(&mut self) -> &mut [TextRun] {
+        &mut self.runs
+    }
+
     /// Port of `Block.serialize`: appends one `<w:p>` into `body`.
     /// `own_style_id`/`is_first_float_block`/`is_last_float_block` are
     /// the module-doc-explained stand-ins for reading `self.style.id`

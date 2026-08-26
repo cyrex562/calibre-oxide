@@ -21,29 +21,27 @@
 //! `Table` themselves (see [`tables`]'s module docs -- only the
 //! border/width foundation is ported so far), `images.py`'s
 //! `ImagesManager` itself (see [`images`]'s module docs -- only its
-//! self-contained utility layer is ported so far), `from_html.py`'s
-//! `Convert.__call__`/`.write` and `Blocks`'
+//! self-contained utility layer is ported so far), and
+//! `from_html.py`'s `Convert.__call__`/`.write` and `Blocks`'
 //! `Table`-related methods/`.serialize` (see [`from_html`]'s module
-//! docs -- `Convert`'s core element walker itself is ported), and
-//! `styles.py`'s `CombinedStyle`/
-//! `StylesManager.finalize`/`.serialize` -- all of which need those
-//! still-unported `from_html.py` types. `links.py`'s `LinksManager`
-//! is now fully ported, including its TOC-serialization half, which
-//! is what gave [`xml::Element`] its `insert`/`find_descendant_mut`
-//! methods. These walk a resolved-CSS HTML tree
-//! -- #132's own "needs a real OEB stylizer" framing was stale by the
-//! time it was filed:
+//! docs -- `Convert`'s core element walker itself is ported) --
+//! `links.py`'s `LinksManager` is now fully ported, including its
+//! TOC-serialization half, which is what gave [`xml::Element`] its
+//! `insert`/`find_descendant_mut` methods. These walk a resolved-CSS
+//! HTML tree -- #132's own "needs a real OEB stylizer" framing was
+//! stale by the time it was filed:
 //! [`crate::oeb::polish::cascade`] already had a real CSS cascade (a
 //! different consumer, issue #164), and
 //! [`crate::oeb::polish::style`] is the accessor seam these files
 //! actually need. [`styles`] is built against it: `TextStyle`/
 //! `BlockStyle`/`FloatSpec`/`DescendantTextStyle` (CSS -> `w:rPr`/
-//! `w:pPr`/`w:framePr`, data model and serialization) plus
+//! `w:pPr`/`w:framePr`, data model and serialization),
 //! `StylesManager`'s `create_text_style`/`create_block_style` dedup
-//! cache are all ported; `StylesManager.finalize` (block/run-style
-//! pairing, heading promotion, descendant-style dedup) and
-//! `.serialize` (writing the final `w:styles` part) still need real
-//! `Block`/`Run` objects from `from_html.py`.
+//! cache, and now `StylesManager::finalize` (block/run-style pairing,
+//! heading promotion, descendant-style dedup, writing back onto
+//! `from_html`'s `Block`/`TextRun`) are all ported. Only
+//! `StylesManager::serialize` (writing the final `w:styles` part from
+//! `finalize`'s output) remains of `styles.py`.
 //!
 //! ```no_run
 //! use calibre_ebooks::docx::writer::container::{DocxWriter, PageOptions};
@@ -77,7 +75,7 @@ pub use from_html::{
 pub use images::{create_docx_image_markup, create_filename, get_image_margins, ImageMargins};
 pub use links::{LinksManager, TocItem};
 pub use lists::ListsManager;
-pub use styles::{BlockStyleId, StylesManager, TextStyleId};
+pub use styles::{BlockStyleId, CombinedStyle, StylesManager, TextStyleId};
 pub use tables::{
     as_percent, border_style_weight, convert_width, read_css_block_borders, table_background_color,
     Border, EdgeBorders,
