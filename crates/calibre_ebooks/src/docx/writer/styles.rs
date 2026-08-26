@@ -17,26 +17,39 @@
 //! `is_first_block`/`is_last_block` instead, standing in for Python's
 //! `block is self.blocks[0]`/`self.blocks[-1]` identity checks
 //! (`self.blocks` itself isn't tracked here -- needs `from_html.py`'s
-//! `Block` type, not ported yet). `DOCXStyle`'s hash/dedup base class
-//! (`id`/`name`/`next_style` bookkeeping), `CombinedStyle`, and
-//! `StylesManager` (deduplication + `w:styles` assembly) are not
-//! ported yet -- see issue #23's own tracking notes. `serialize`'s
-//! `id`/`name`/`is_normal_style`/`next_style` are plain parameters
-//! here rather than fields Python stores on `self` (`DOCXStyle.id`/
-//! `.name`/`.next_style`), since nothing yet needs to persist them on
-//! a `TextStyle`/`BlockStyle`/`DescendantTextStyle` instance itself --
-//! that's exactly the bookkeeping `StylesManager`'s still-unported
-//! `finalize` assigns.
+//! `Block` type, not ported yet). `serialize`'s `id`/`name`/
+//! `is_normal_style`/`next_style` are plain parameters here rather
+//! than fields Python stores on `self` (`DOCXStyle.id`/`.name`/
+//! `.next_style`) -- [`StylesManager`] is what assigns them, once a
+//! style has been deduplicated and its final position is known.
+//!
+//! [`StylesManager`] itself ports only `create_text_style`/
+//! `create_block_style` -- the `dict`-based intern cache each
+//! `StylesManager.create_*` method in Python uses to hand back a
+//! *shared* style object for two structurally-identical styles. Rust
+//! has no cheap equivalent of that shared-mutable-object pattern, so
+//! this uses an arena (`Vec<TextStyle>`/`Vec<BlockStyle>`) plus a
+//! `TextStyleId`/`BlockStyleId` handle instead of a shared reference --
+//! the same `NodeId`-into-arena shape [`crate::dom::Dom`] already
+//! uses elsewhere in this crate. `StylesManager.finalize` (the
+//! block/run-style pairing, heading-style promotion, and
+//! descendant-style deduplication passes) and `.serialize` (writing
+//! the final `w:styles` part) are NOT ported -- both need real
+//! `Block`/`Run` objects (`.style`, `.runs`, `.style_weight`,
+//! `.html_tag`, `.is_empty()`) that only `from_html.py` can supply,
+//! and `CombinedStyle` (the block+run style pairing `finalize` builds)
+//! isn't ported for the same reason.
 //!
 //! Reads against [`crate::oeb::polish::style::Style`] -- the seam
 //! issue #132 needed, not the stub `oeb::stylizer::Stylizer` its own
 //! docs once assumed was still the state of things (see
 //! `oeb/polish/style.rs`'s module docs for that correction).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::dom::{Dom, NodeId};
 use crate::oeb::polish::style::{ItemValue, Style, VerticalAlign};
+use crate::oeb::polish::toc::lang_as_iso639_1;
 
 use super::utils::{convert_color, int_or_zero};
 use super::xml::Element;
@@ -1474,6 +1487,102 @@ impl DescendantTextStyle {
     }
 }
 
+/// Handle into a [`StylesManager`]'s `TextStyle` arena. Stands in for
+/// Python holding a shared reference to a deduplicated `TextStyle`
+/// object directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TextStyleId(pub usize);
+
+/// Handle into a [`StylesManager`]'s `BlockStyle` arena, same role as
+/// [`TextStyleId`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BlockStyleId(pub usize);
+
+/// Port of `StylesManager.create_text_style`/`.create_block_style` and
+/// the `text_styles`/`block_styles`/`styles_for_html_blocks` caches
+/// backing them. `finalize`/`serialize`/`CombinedStyle` are not ported
+/// -- see the module docs above.
+#[derive(Debug, Default)]
+pub struct StylesManager {
+    document_lang: String,
+    text_styles: Vec<TextStyle>,
+    text_style_index: HashMap<TextStyle, TextStyleId>,
+    block_styles: Vec<BlockStyle>,
+    block_style_index: HashMap<BlockStyle, BlockStyleId>,
+    styles_for_html_blocks: HashMap<NodeId, BlockStyleId>,
+}
+
+impl StylesManager {
+    /// Port of `StylesManager.__init__`. `document_lang` is
+    /// normalized the same way every other call site in this crate
+    /// normalizes it (`lang_as_iso639_1(x) or 'en'`); the Python
+    /// `namespace`/`log` constructor args aren't ported -- `namespace`
+    /// was only ever used for `DOCXStyle.w()`/`makeelement`, which
+    /// [`super::xml::Element`] doesn't need, and nothing here logs
+    /// yet.
+    pub fn new(document_lang: &str) -> Self {
+        StylesManager {
+            document_lang: lang_as_iso639_1(document_lang).unwrap_or_else(|| "en".to_string()),
+            ..Default::default()
+        }
+    }
+
+    pub fn document_lang(&self) -> &str {
+        &self.document_lang
+    }
+
+    /// Port of `StylesManager.create_text_style`: builds a `TextStyle`
+    /// from `css` and returns the id of the existing structurally-equal
+    /// style if one was already created, else interns this one.
+    pub fn create_text_style(&mut self, css: &Style, is_parent_style: bool) -> TextStyleId {
+        let style = TextStyle::from_css(css, is_parent_style);
+        if let Some(&id) = self.text_style_index.get(&style) {
+            return id;
+        }
+        let id = TextStyleId(self.text_styles.len());
+        self.text_style_index.insert(style.clone(), id);
+        self.text_styles.push(style);
+        id
+    }
+
+    pub fn text_style(&self, id: TextStyleId) -> &TextStyle {
+        &self.text_styles[id.0]
+    }
+
+    /// Port of `StylesManager.create_block_style`: same dedup as
+    /// [`Self::create_text_style`], plus recording `html_block ->
+    /// style id` in `styles_for_html_blocks` (Python does this even
+    /// when the style was already interned -- a later block reusing
+    /// an earlier block's exact style still needs its own entry).
+    pub fn create_block_style(
+        &mut self,
+        css: Option<&Style>,
+        html_block: NodeId,
+        is_table_cell: bool,
+        parent_bg: Option<&str>,
+    ) -> BlockStyleId {
+        let style = BlockStyle::from_css(css, is_table_cell, parent_bg);
+        let id = if let Some(&id) = self.block_style_index.get(&style) {
+            id
+        } else {
+            let id = BlockStyleId(self.block_styles.len());
+            self.block_style_index.insert(style.clone(), id);
+            self.block_styles.push(style);
+            id
+        };
+        self.styles_for_html_blocks.insert(html_block, id);
+        id
+    }
+
+    pub fn block_style(&self, id: BlockStyleId) -> &BlockStyle {
+        &self.block_styles[id.0]
+    }
+
+    pub fn style_for_html_block(&self, html_block: NodeId) -> Option<BlockStyleId> {
+        self.styles_for_html_blocks.get(&html_block).copied()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2268,5 +2377,129 @@ mod tests {
         assert_eq!(name_el.get("w:val"), Some("0 Text"));
         let rpr = el.children_named("w:rPr").next().unwrap();
         assert!(rpr.children_named("w:b").next().is_some());
+    }
+
+    #[test]
+    fn styles_manager_normalizes_document_lang() {
+        assert_eq!(StylesManager::new("en-GB").document_lang(), "en");
+        assert_eq!(
+            StylesManager::new("this-is-not-a-lang-code-1234").document_lang(),
+            "en",
+            "an unrecognized code falls back to 'en', matching lang_as_iso639_1(x) or 'en'"
+        );
+    }
+
+    #[test]
+    fn styles_manager_dedups_structurally_equal_text_styles() {
+        let dom = make("<html><body><p>x</p><p>y</p></body></html>");
+        let ps: Vec<NodeId> = dom
+            .preorder_elements(dom.root)
+            .into_iter()
+            .filter(|&id| dom.tag(id) == Some("p"))
+            .collect();
+        let resolved = resolved_with(&[
+            (ps[0], &[("font-weight", "bold")]),
+            (ps[1], &[("font-weight", "bold")]),
+        ]);
+        let profile = Profile::default();
+        let mut mgr = StylesManager::new("en");
+        let a = mgr.create_text_style(&Style::new(&dom, &resolved, &profile, ps[0]), false);
+        let b = mgr.create_text_style(&Style::new(&dom, &resolved, &profile, ps[1]), false);
+        assert_eq!(
+            a, b,
+            "two structurally-identical styles intern to the same id"
+        );
+        assert!(mgr.text_style(a).bold);
+    }
+
+    #[test]
+    fn styles_manager_keeps_structurally_different_text_styles_distinct() {
+        let dom = make("<html><body><p>x</p><p>y</p></body></html>");
+        let ps: Vec<NodeId> = dom
+            .preorder_elements(dom.root)
+            .into_iter()
+            .filter(|&id| dom.tag(id) == Some("p"))
+            .collect();
+        let resolved = resolved_with(&[(ps[0], &[("font-weight", "bold")]), (ps[1], &[])]);
+        let profile = Profile::default();
+        let mut mgr = StylesManager::new("en");
+        let a = mgr.create_text_style(&Style::new(&dom, &resolved, &profile, ps[0]), false);
+        let b = mgr.create_text_style(&Style::new(&dom, &resolved, &profile, ps[1]), false);
+        assert_ne!(a, b);
+        assert!(mgr.text_style(a).bold);
+        assert!(!mgr.text_style(b).bold);
+    }
+
+    #[test]
+    fn styles_manager_dedups_block_styles_and_tracks_html_block_membership() {
+        let dom = make("<html><body><p>x</p><p>y</p></body></html>");
+        let ps: Vec<NodeId> = dom
+            .preorder_elements(dom.root)
+            .into_iter()
+            .filter(|&id| dom.tag(id) == Some("p"))
+            .collect();
+        let resolved = resolved_with(&[
+            (ps[0], &[("text-align", "center")]),
+            (ps[1], &[("text-align", "center")]),
+        ]);
+        let profile = Profile::default();
+        let mut mgr = StylesManager::new("en");
+        let a = mgr.create_block_style(
+            Some(&Style::new(&dom, &resolved, &profile, ps[0])),
+            ps[0],
+            false,
+            None,
+        );
+        let b = mgr.create_block_style(
+            Some(&Style::new(&dom, &resolved, &profile, ps[1])),
+            ps[1],
+            false,
+            None,
+        );
+        assert_eq!(
+            a, b,
+            "distinct html blocks with structurally-identical styles still intern to the same style id"
+        );
+        // Even though the style is shared, each html block still gets
+        // its own entry in styles_for_html_blocks -- Python's
+        // create_block_style unconditionally sets
+        // self.styles_for_html_blocks[html_block] = ans regardless of
+        // whether ans was freshly interned or reused.
+        assert_eq!(mgr.style_for_html_block(ps[0]), Some(a));
+        assert_eq!(mgr.style_for_html_block(ps[1]), Some(b));
+    }
+
+    #[test]
+    fn styles_manager_create_block_style_with_no_css_uses_defaults() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let mut mgr = StylesManager::new("en");
+        let id = mgr.create_block_style(None, p, true, Some("FF0000"));
+        let style = mgr.block_style(id);
+        assert_eq!(
+            style.background_color, None,
+            "a block style built with no css always returns BlockStyle::from_css's \
+             early-out defaults, which never consult parent_bg"
+        );
+        assert_eq!(style.text_align, "left");
+    }
+
+    #[test]
+    fn styles_manager_create_block_style_falls_back_to_parent_bg() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let mut mgr = StylesManager::new("en");
+        let id = mgr.create_block_style(
+            Some(&Style::new(&dom, &resolved, &profile, p)),
+            p,
+            false,
+            Some("FF0000"),
+        );
+        assert_eq!(
+            mgr.block_style(id).background_color.as_deref(),
+            Some("FF0000")
+        );
     }
 }
