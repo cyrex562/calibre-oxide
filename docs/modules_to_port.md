@@ -384,7 +384,7 @@ either -- this pass wasn't exhaustive.
 - [ ] images.py (see #132; also needs `pt_to_emu` from the reader's `images.py`, already ported — #130)
 - [ ] links.py (see #132)
 - [ ] lists.py (see #132)
-- [ ] styles.py (see #132 — `TextStyle` and `BlockStyle` (CSS -> `w:rPr`/`w:pPr`, incl. their own `serialize`/`serialize_properties`), `read_css_block_borders`/`parse_css_length`, and `FloatSpec` (floated-block frame geometry, data model only) all ported to `docx/writer/styles.rs`, against the `oeb/polish/style.rs` seam, plus `css_font_family_to_docx`/`convert_underline`/`LINE_STYLES`/`bmap`/`is_dropcaps`. Not yet ported: `FloatSpec.serialize`, `DOCXStyle`'s hash/dedup base class, `DescendantTextStyle`, `StylesManager`)
+- [ ] styles.py (see #132 — `TextStyle`, `BlockStyle`, and `FloatSpec` (CSS -> `w:rPr`/`w:pPr`/`w:framePr`, incl. their own `serialize`/`serialize_properties`) all ported to `docx/writer/styles.rs`, against the `oeb/polish/style.rs` seam, plus `read_css_block_borders`/`parse_css_length`/`css_font_family_to_docx`/`convert_underline`/`LINE_STYLES`/`bmap`/`is_dropcaps`. Not yet ported: `DOCXStyle`'s hash/dedup base class, `CombinedStyle`, `DescendantTextStyle`, `StylesManager`)
 - [ ] tables.py (see #132)
 - [ ] TODO (upstream notes file, nothing to port)
 - [x] `utils.py` -> `docx/writer/utils.rs` (with the `tinycss.color3` colour grammar it depends on)
