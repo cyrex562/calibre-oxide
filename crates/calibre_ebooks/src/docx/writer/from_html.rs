@@ -1,15 +1,13 @@
 //! The HTML/OEB -> DOCX spine walker: port of `docx/writer/from_html.py`.
 //!
-//! **Only [`TextRun`] is ported so far** -- the leaf type with the
-//! fewest cross-dependencies (needs [`super::styles::TextStyleId`]
-//! and [`super::links::LinksManager`], both already ported; needs
-//! nothing from `Block`/`Blocks`/`Convert`, none of which exist yet).
-//! `lang_for_tag`, the `Style`/`Stylizer` subclasses (add a
-//! `letterSpacing` property/a `KeyError`-tolerant `style()` lookup --
-//! already subsumed by [`crate::oeb::polish::style::Style`] and
+//! **[`TextRun`] and [`Block`] are ported so far.** `lang_for_tag`,
+//! the `Style`/`Stylizer` subclasses (add a `letterSpacing` property/
+//! a `KeyError`-tolerant `style()` lookup -- already subsumed by
+//! [`crate::oeb::polish::style::Style`] and
 //! [`crate::oeb::polish::cascade`], see `oeb/polish/style.rs`'s
-//! module docs), `Block`, `Blocks`, and `Convert` (the actual
-//! spine-walking orchestrator) are NOT ported -- see issue #132.
+//! module docs), `Blocks` (the per-item block/table bookkeeping
+//! container), and `Convert` (the real spine-walking orchestrator)
+//! are NOT ported -- see issue #132.
 //!
 //! `TextRun.first_html_parent` (an lxml element in Python) is a
 //! [`NodeId`] here; `TextRun.style`/`.parent_style` (a shared
@@ -26,12 +24,42 @@
 //! rather than a whole manifest `Item` object, matching
 //! `LinksManager::serialize_hyperlink`'s own already-established
 //! `current_item_href: &str` parameter (issue #132, PR #331).
+//!
+//! [`Block`]'s constructor and methods take `&mut StylesManager`/
+//! `&mut LinksManager` as explicit parameters rather than storing
+//! them as fields (Python's `self.styles_manager`/`self.links_manager`)
+//! -- storing `&mut` references as struct fields would tie `Block` to
+//! a lifetime and make holding many of them at once (`Blocks`, not
+//! ported) an aliasing problem for no benefit, since every call site
+//! already has both managers in scope. `Block.style`/`.linked_style`
+//! (real `BlockStyle`/`CombinedStyle` objects in Python, read via
+//! `.id`) are an id handle (`style: BlockStyleId`) and an
+//! `Option<String>` respectively -- both only ever get a real id from
+//! `StylesManager.finalize`, not ported, so `Block::serialize` takes
+//! the resolved id for `self.style` as an explicit `own_style_id`
+//! parameter instead of reading it off a stored object.
+//! `Block.float_spec.blocks` (the float's member-block list, used in
+//! Python only for `block is self.blocks[0]`/`[-1]` identity checks)
+//! isn't needed at all -- `FloatSpec::serialize` (PR #328) already
+//! takes `is_first_block`/`is_last_block` as explicit bools, so
+//! `Block::serialize` just forwards its own such parameters through.
+//! `Block.parent_items` (a back-reference into `Blocks`' own bookkeeping,
+//! never read by `Block` itself) isn't ported -- it belongs to
+//! `Blocks`, not `Block`, once that container exists.
+//! `Block.list_tag`'s second tuple element (the raw CSS `Style` used
+//! later by `lists.py`, unported) is dropped -- `list_tag` here is
+//! just the html block's [`NodeId`]; `Style` is cheap to reconstruct
+//! from a `NodeId` (it's `Copy`), so there's nothing to lose by not
+//! storing it early.
 
-use crate::docx::names::DocxNamespace;
-use crate::dom::NodeId;
+use crate::docx::names::{barename, DocxNamespace};
+use crate::dom::{Dom, NodeId};
+use crate::oeb::polish::style::Style;
+
+use indexmap::IndexSet;
 
 use super::links::LinksManager;
-use super::styles::TextStyleId;
+use super::styles::{BlockStyleId, FloatSpec, StylesManager, TextStyleId};
 use super::xml::{Child, Element};
 
 /// Port of the `(item, url, tooltip)` tuple Python's
@@ -335,6 +363,249 @@ impl TextRun {
             if let Some(bid) = bookmark_id {
                 r.append(Element::new("w:bookmarkEnd").attr("w:id", bid.to_string()));
             }
+        }
+    }
+}
+
+/// Port of `Block`: one `<w:p>` worth of content -- a run of
+/// [`TextRun`]s sharing one paragraph style, plus the paragraph-level
+/// bookkeeping (bookmarks, page breaks, float/list/numbering
+/// properties) `Blocks`/`Convert` (not ported) assign onto it.
+#[derive(Debug)]
+pub struct Block {
+    pub force_not_empty: bool,
+    pub bookmarks: IndexSet<String>,
+    pub list_tag: Option<NodeId>,
+    pub is_first_block: bool,
+    pub numbering_id: Option<(u32, u32)>,
+    pub html_block: NodeId,
+    pub html_tag: String,
+    pub float_spec: Option<FloatSpec>,
+    pub style: BlockStyleId,
+    default_text_style: TextStyleId,
+    runs: Vec<TextRun>,
+    pub skipped: bool,
+    pub linked_style: Option<String>,
+    pub page_break_before: bool,
+    pub keep_lines: bool,
+    pub page_break_after: bool,
+    pub keep_next: bool,
+    pub block_lang: Option<String>,
+}
+
+impl Block {
+    /// Port of `Block.__init__`. `namespace` isn't stored (see the
+    /// module docs); `styles_manager` is only borrowed for the
+    /// duration of this call, not stored either.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        styles_manager: &mut StylesManager,
+        dom: &Dom,
+        html_block: NodeId,
+        style: &Style,
+        is_table_cell: bool,
+        float_spec: Option<FloatSpec>,
+        is_list_item: bool,
+        parent_bg: Option<&str>,
+    ) -> Self {
+        let html_tag = barename(dom.tag(html_block).unwrap_or("")).to_string();
+        let block_style =
+            styles_manager.create_block_style(Some(style), html_block, is_table_cell, parent_bg);
+        let default_text_style = styles_manager.create_text_style(style, false);
+        Block {
+            force_not_empty: false,
+            bookmarks: IndexSet::new(),
+            list_tag: if is_list_item { Some(html_block) } else { None },
+            is_first_block: false,
+            numbering_id: None,
+            html_block,
+            html_tag,
+            float_spec,
+            style: block_style,
+            default_text_style,
+            runs: Vec::new(),
+            skipped: false,
+            linked_style: None,
+            page_break_before: style.get("page-break-before") == "always",
+            keep_lines: style.get("page-break-inside") == "avoid",
+            page_break_after: false,
+            keep_next: false,
+            block_lang: None,
+        }
+    }
+
+    /// Port of `Block.resolve_skipped`: if this block turned out
+    /// empty and its html tag's first child element is `next_block`'s
+    /// html tag (i.e. this block only ever represented a container
+    /// element's own inline content, and that content never
+    /// appeared), mark it skipped and hand its `list_tag` down to
+    /// `next_block`.
+    pub fn resolve_skipped(&mut self, dom: &Dom, next_block: &mut Block) {
+        if !self.is_empty() {
+            return;
+        }
+        let first_child_element = dom
+            .children(self.html_block)
+            .into_iter()
+            .find(|&c| dom.tag(c).is_some());
+        if first_child_element == Some(next_block.html_block) {
+            self.skipped = true;
+            if let Some(list_tag) = self.list_tag {
+                next_block.list_tag = Some(list_tag);
+            }
+        }
+    }
+
+    /// Port of `Block.add_text`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_text(
+        &mut self,
+        styles_manager: &mut StylesManager,
+        text: &str,
+        style: &Style,
+        ignore_leading_whitespace: bool,
+        html_parent: Option<NodeId>,
+        is_parent_style: bool,
+        mut bookmark: Option<String>,
+        link: Option<LinkTarget>,
+        lang: Option<String>,
+    ) {
+        let ws = style.get("white-space");
+        let preserve_whitespace = matches!(ws.as_str(), "pre" | "pre-wrap" | "-o-pre-wrap");
+        let ts = styles_manager.create_text_style(style, is_parent_style);
+        let reuse = self
+            .runs
+            .last()
+            .is_some_and(|r| r.style == ts && r.link == link && r.lang == lang);
+        if !reuse {
+            let parent = html_parent.unwrap_or(self.html_block);
+            self.runs.push(TextRun::new(ts, parent, lang.clone()));
+        }
+        let run = self.runs.last_mut().expect("just ensured a run exists");
+
+        let mut text = text.to_string();
+        if ignore_leading_whitespace && !preserve_whitespace {
+            text = text.trim_start().to_string();
+        }
+        if preserve_whitespace || ws == "pre-line" {
+            for line in text.lines() {
+                run.add_text(line, preserve_whitespace, bookmark.take(), link.clone());
+                run.add_break("none", None);
+            }
+        } else {
+            run.add_text(&text, preserve_whitespace, bookmark, link);
+        }
+    }
+
+    /// Port of `Block.add_break`. Reuses [`Self::default_text_style`],
+    /// computed once in [`Self::new`], rather than recomputing
+    /// `styles_manager.create_text_style(self.html_style)` on every
+    /// call as Python does -- `create_text_style` is a pure function
+    /// of an unchanging input here, so the two are equivalent, and
+    /// this avoids `Block` having to hold a `Style` reference (and
+    /// thus a lifetime) just for this.
+    pub fn add_break(&mut self, clear: impl Into<String>, bookmark: Option<String>) {
+        if self.runs.is_empty() {
+            self.runs
+                .push(TextRun::new(self.default_text_style, self.html_block, None));
+        }
+        self.runs
+            .last_mut()
+            .expect("just ensured a run exists")
+            .add_break(clear, bookmark);
+    }
+
+    /// Port of `Block.add_image`.
+    pub fn add_image(&mut self, drawing: Element, bookmark: Option<String>) {
+        if self.runs.is_empty() {
+            self.runs
+                .push(TextRun::new(self.default_text_style, self.html_block, None));
+        }
+        self.runs
+            .last_mut()
+            .expect("just ensured a run exists")
+            .add_image(drawing, bookmark);
+    }
+
+    /// Port of `Block.is_empty`.
+    pub fn is_empty(&self) -> bool {
+        if self.force_not_empty {
+            return false;
+        }
+        self.runs.iter().all(TextRun::is_empty)
+    }
+
+    /// Port of `Block.serialize`: appends one `<w:p>` into `body`.
+    /// `own_style_id`/`is_first_float_block`/`is_last_float_block` are
+    /// the module-doc-explained stand-ins for reading `self.style.id`
+    /// and `self.float_spec.blocks[0]`/`[-1]` identity directly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn serialize(
+        &self,
+        body: &mut Element,
+        links_manager: &mut LinksManager,
+        names: &DocxNamespace,
+        own_style_id: Option<&str>,
+        is_first_float_block: bool,
+        is_last_float_block: bool,
+    ) {
+        let p = body.append(Element::new("w:p"));
+
+        let mut end_bookmarks = Vec::new();
+        for bmark in &self.bookmarks {
+            let bid = links_manager.bookmark_id();
+            end_bookmarks.push(bid);
+            p.append(
+                Element::new("w:bookmarkStart")
+                    .attr("w:id", bid.to_string())
+                    .attr("w:name", bmark.as_str()),
+            );
+        }
+        if let Some(lang) = &self.block_lang {
+            if !lang.is_empty() {
+                let rpr = p.append(Element::new("w:rPr"));
+                rpr.append(
+                    Element::new("w:lang")
+                        .attr("w:val", lang.as_str())
+                        .attr("w:bidi", lang.as_str())
+                        .attr("w:eastAsia", lang.as_str()),
+                );
+            }
+        }
+
+        let ppr = p.append(Element::new("w:pPr"));
+        if self.keep_next {
+            ppr.append(Element::new("w:keepNext"));
+        }
+        if let Some(float_spec) = &self.float_spec {
+            float_spec.serialize(ppr, is_first_float_block, is_last_float_block);
+        }
+        if let Some((num_id, ilvl)) = self.numbering_id {
+            let numpr = ppr.append(Element::new("w:numPr"));
+            numpr.append(Element::new("w:ilvl").attr("w:val", ilvl.to_string()));
+            numpr.append(Element::new("w:numId").attr("w:val", num_id.to_string()));
+        }
+        if let Some(id) = &self.linked_style {
+            ppr.append(Element::new("w:pStyle").attr("w:val", id.as_str()));
+        } else if let Some(id) = own_style_id {
+            if !id.is_empty() {
+                ppr.append(Element::new("w:pStyle").attr("w:val", id));
+            }
+        }
+        if self.is_first_block {
+            ppr.append(Element::new("w:pageBreakBefore").attr("w:val", "off"));
+        } else if self.page_break_before {
+            ppr.append(Element::new("w:pageBreakBefore").attr("w:val", "on"));
+        }
+        if self.keep_lines {
+            ppr.append(Element::new("w:keepLines").attr("w:val", "on"));
+        }
+
+        for run in &self.runs {
+            run.serialize(p, links_manager, names);
+        }
+        for bid in end_bookmarks {
+            p.append(Element::new("w:bookmarkEnd").attr("w:id", bid.to_string()));
         }
     }
 }
@@ -661,5 +932,409 @@ mod tests {
         assert_eq!(wt[1].children, vec![Child::Text(" ".to_string())]);
         assert_eq!(wt[1].get("xml:space"), Some("preserve"));
         assert_eq!(wt[2].children, vec![Child::Text("bar".to_string())]);
+    }
+
+    use crate::oeb::polish::cascade::{PropertyValue, ResolvedStyles};
+    use crate::oeb::polish::style::Profile;
+    use std::collections::HashMap;
+
+    fn make(html: &str) -> Dom {
+        Dom::parse(html)
+    }
+
+    fn resolved_with(entries: &[(NodeId, &[(&str, &str)])]) -> ResolvedStyles {
+        let mut style_map = HashMap::new();
+        for &(id, props) in entries {
+            let mut m = HashMap::new();
+            for &(k, v) in props {
+                m.insert(k.to_string(), PropertyValue::new(v, None, false));
+            }
+            style_map.insert(id, m);
+        }
+        ResolvedStyles {
+            style_map,
+            pseudo_style_map: HashMap::new(),
+        }
+    }
+
+    fn find(dom: &Dom, tag: &str) -> NodeId {
+        dom.preorder_elements(dom.root)
+            .into_iter()
+            .find(|&id| dom.tag(id) == Some(tag))
+            .unwrap()
+    }
+
+    fn styles_manager() -> StylesManager {
+        StylesManager::new("en")
+    }
+
+    #[test]
+    fn block_new_reads_page_break_flags_and_html_tag() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[(
+            p,
+            &[
+                ("page-break-before", "always"),
+                ("page-break-inside", "avoid"),
+            ],
+        )]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, p);
+        let mut mgr = styles_manager();
+        let block = Block::new(&mut mgr, &dom, p, &style, false, None, false, None);
+        assert_eq!(block.html_tag, "p");
+        assert!(block.page_break_before);
+        assert!(block.keep_lines);
+        assert!(block.is_empty());
+    }
+
+    #[test]
+    fn block_new_defaults_page_break_flags_to_false_with_no_css() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, p);
+        let mut mgr = styles_manager();
+        let block = Block::new(&mut mgr, &dom, p, &style, false, None, false, None);
+        assert!(!block.page_break_before);
+        assert!(!block.keep_lines);
+    }
+
+    #[test]
+    fn block_add_text_makes_it_non_empty() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, p);
+        let mut mgr = styles_manager();
+        let mut block = Block::new(&mut mgr, &dom, p, &style, false, None, false, None);
+        block.add_text(
+            &mut mgr, "hello", &style, false, None, false, None, None, None,
+        );
+        assert!(!block.is_empty());
+        assert_eq!(block.runs.len(), 1);
+    }
+
+    #[test]
+    fn block_add_text_reuses_the_last_run_when_style_link_and_lang_match() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, p);
+        let mut mgr = styles_manager();
+        let mut block = Block::new(&mut mgr, &dom, p, &style, false, None, false, None);
+        block.add_text(&mut mgr, "a", &style, false, None, false, None, None, None);
+        block.add_text(&mut mgr, "b", &style, false, None, false, None, None, None);
+        assert_eq!(
+            block.runs.len(),
+            1,
+            "same style/link/lang should append to the existing run"
+        );
+    }
+
+    #[test]
+    fn block_add_text_starts_a_new_run_when_style_differs() {
+        let dom = make("<html><body><p>x</p><span>y</span></body></html>");
+        let p = find(&dom, "p");
+        let span = find(&dom, "span");
+        let resolved = resolved_with(&[(span, &[("font-weight", "bold")])]);
+        let profile = Profile::default();
+        let plain = Style::new(&dom, &resolved, &profile, p);
+        let bold = Style::new(&dom, &resolved, &profile, span);
+        let mut mgr = styles_manager();
+        let mut block = Block::new(&mut mgr, &dom, p, &plain, false, None, false, None);
+        block.add_text(&mut mgr, "a", &plain, false, None, false, None, None, None);
+        block.add_text(&mut mgr, "b", &bold, false, None, false, None, None, None);
+        assert_eq!(block.runs.len(), 2);
+    }
+
+    #[test]
+    fn block_add_text_preserve_whitespace_splits_multiline_text_into_breaks() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[(p, &[("white-space", "pre")])]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, p);
+        let mut mgr = styles_manager();
+        let mut block = Block::new(&mut mgr, &dom, p, &style, false, None, false, None);
+        block.add_text(
+            &mut mgr, "a\nb", &style, false, None, false, None, None, None,
+        );
+        let run = &block.runs[0];
+        // "a" text, break, "b" text, break -- one TextEntry per add_text/add_break call.
+        assert_eq!(run.texts.len(), 4);
+        assert!(matches!(run.texts[1].item, TextItem::Break { .. }));
+        assert!(matches!(run.texts[3].item, TextItem::Break { .. }));
+    }
+
+    #[test]
+    fn block_add_break_creates_a_run_when_none_exists() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, p);
+        let mut mgr = styles_manager();
+        let mut block = Block::new(&mut mgr, &dom, p, &style, false, None, false, None);
+        block.add_break("none", None);
+        assert_eq!(block.runs.len(), 1);
+        assert!(!block.is_empty());
+    }
+
+    #[test]
+    fn block_add_image_creates_a_run_when_none_exists() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, p);
+        let mut mgr = styles_manager();
+        let mut block = Block::new(&mut mgr, &dom, p, &style, false, None, false, None);
+        block.add_image(Element::new("w:drawing"), None);
+        assert_eq!(block.runs.len(), 1);
+    }
+
+    #[test]
+    fn block_resolve_skipped_marks_skipped_when_empty_and_first_child_is_next_block() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let body = find(&dom, "body");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let body_style = Style::new(&dom, &resolved, &profile, body);
+        let p_style = Style::new(&dom, &resolved, &profile, p);
+        let mut mgr = styles_manager();
+        let mut body_block = Block::new(&mut mgr, &dom, body, &body_style, false, None, true, None);
+        let mut p_block = Block::new(&mut mgr, &dom, p, &p_style, false, None, false, None);
+        body_block.resolve_skipped(&dom, &mut p_block);
+        assert!(body_block.skipped);
+        assert_eq!(
+            p_block.list_tag,
+            Some(body),
+            "the skipped block's list_tag is handed down to next_block"
+        );
+    }
+
+    #[test]
+    fn block_resolve_skipped_does_nothing_when_not_empty() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let body = find(&dom, "body");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let body_style = Style::new(&dom, &resolved, &profile, body);
+        let p_style = Style::new(&dom, &resolved, &profile, p);
+        let mut mgr = styles_manager();
+        let mut body_block =
+            Block::new(&mut mgr, &dom, body, &body_style, false, None, false, None);
+        body_block.add_text(
+            &mut mgr,
+            "hi",
+            &body_style,
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+        );
+        let mut p_block = Block::new(&mut mgr, &dom, p, &p_style, false, None, false, None);
+        body_block.resolve_skipped(&dom, &mut p_block);
+        assert!(!body_block.skipped);
+    }
+
+    #[test]
+    fn block_resolve_skipped_does_nothing_when_first_child_is_a_different_element() {
+        let dom = make("<html><body><p>x</p><p>y</p></body></html>");
+        let body = find(&dom, "body");
+        let ps: Vec<NodeId> = dom
+            .preorder_elements(dom.root)
+            .into_iter()
+            .filter(|&id| dom.tag(id) == Some("p"))
+            .collect();
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let body_style = Style::new(&dom, &resolved, &profile, body);
+        let p_style = Style::new(&dom, &resolved, &profile, ps[1]);
+        let mut mgr = styles_manager();
+        let mut body_block =
+            Block::new(&mut mgr, &dom, body, &body_style, false, None, false, None);
+        // next_block is the *second* <p>, not body's first child.
+        let mut p_block = Block::new(&mut mgr, &dom, ps[1], &p_style, false, None, false, None);
+        body_block.resolve_skipped(&dom, &mut p_block);
+        assert!(!body_block.skipped);
+    }
+
+    fn dummy_block(mgr: &mut StylesManager, dom: &Dom, node: NodeId, style: &Style) -> Block {
+        Block::new(mgr, dom, node, style, false, None, false, None)
+    }
+
+    #[test]
+    fn block_serialize_produces_a_paragraph_with_pstyle_and_a_run() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, p);
+        let mut mgr = styles_manager();
+        let mut block = dummy_block(&mut mgr, &dom, p, &style);
+        block.add_text(&mut mgr, "hi", &style, false, None, false, None, None, None);
+        let mut body = Element::new("w:body");
+        let mut lm = links_manager();
+        block.serialize(&mut body, &mut lm, &ns(), Some("MyStyle"), false, false);
+        let p_el = body.children_named("w:p").next().unwrap();
+        let ppr = p_el.children_named("w:pPr").next().unwrap();
+        let pstyle = ppr.children_named("w:pStyle").next().unwrap();
+        assert_eq!(pstyle.get("w:val"), Some("MyStyle"));
+        assert!(p_el.children_named("w:r").next().is_some());
+    }
+
+    #[test]
+    fn block_serialize_linked_style_wins_over_own_style_id() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, p);
+        let mut mgr = styles_manager();
+        let mut block = dummy_block(&mut mgr, &dom, p, &style);
+        block.linked_style = Some("Combined1".to_string());
+        let mut body = Element::new("w:body");
+        let mut lm = links_manager();
+        block.serialize(&mut body, &mut lm, &ns(), Some("OwnStyle"), false, false);
+        let p_el = body.children_named("w:p").next().unwrap();
+        let ppr = p_el.children_named("w:pPr").next().unwrap();
+        let pstyle = ppr.children_named("w:pStyle").next().unwrap();
+        assert_eq!(pstyle.get("w:val"), Some("Combined1"));
+    }
+
+    #[test]
+    fn block_serialize_is_first_block_forces_page_break_off() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[(p, &[("page-break-before", "always")])]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, p);
+        let mut mgr = styles_manager();
+        let mut block = dummy_block(&mut mgr, &dom, p, &style);
+        block.is_first_block = true;
+        assert!(block.page_break_before);
+        let mut body = Element::new("w:body");
+        let mut lm = links_manager();
+        block.serialize(&mut body, &mut lm, &ns(), None, false, false);
+        let p_el = body.children_named("w:p").next().unwrap();
+        let ppr = p_el.children_named("w:pPr").next().unwrap();
+        let pbb = ppr.children_named("w:pageBreakBefore").next().unwrap();
+        assert_eq!(pbb.get("w:val"), Some("off"));
+    }
+
+    #[test]
+    fn block_serialize_page_break_before_emits_on_when_not_first_block() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[(p, &[("page-break-before", "always")])]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, p);
+        let mut mgr = styles_manager();
+        let block = dummy_block(&mut mgr, &dom, p, &style);
+        let mut body = Element::new("w:body");
+        let mut lm = links_manager();
+        block.serialize(&mut body, &mut lm, &ns(), None, false, false);
+        let p_el = body.children_named("w:p").next().unwrap();
+        let ppr = p_el.children_named("w:pPr").next().unwrap();
+        let pbb = ppr.children_named("w:pageBreakBefore").next().unwrap();
+        assert_eq!(pbb.get("w:val"), Some("on"));
+    }
+
+    #[test]
+    fn block_serialize_bookmarks_wrap_the_whole_paragraph() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, p);
+        let mut mgr = styles_manager();
+        let mut block = dummy_block(&mut mgr, &dom, p, &style);
+        block.bookmarks.insert("mark1".to_string());
+        let mut body = Element::new("w:body");
+        let mut lm = links_manager();
+        block.serialize(&mut body, &mut lm, &ns(), None, false, false);
+        let p_el = body.children_named("w:p").next().unwrap();
+        let names: Vec<&str> = p_el
+            .children
+            .iter()
+            .filter_map(|c| match c {
+                Child::Element(e) => Some(e.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names[0], "w:bookmarkStart");
+        assert_eq!(*names.last().unwrap(), "w:bookmarkEnd");
+    }
+
+    #[test]
+    fn block_serialize_numbering_id_emits_num_pr() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, p);
+        let mut mgr = styles_manager();
+        let mut block = dummy_block(&mut mgr, &dom, p, &style);
+        block.numbering_id = Some((3, 1));
+        let mut body = Element::new("w:body");
+        let mut lm = links_manager();
+        block.serialize(&mut body, &mut lm, &ns(), None, false, false);
+        let p_el = body.children_named("w:p").next().unwrap();
+        let ppr = p_el.children_named("w:pPr").next().unwrap();
+        let numpr = ppr.children_named("w:numPr").next().unwrap();
+        assert_eq!(
+            numpr.children_named("w:numId").next().unwrap().get("w:val"),
+            Some("3")
+        );
+        assert_eq!(
+            numpr.children_named("w:ilvl").next().unwrap().get("w:val"),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn block_serialize_forwards_first_and_last_to_float_spec() {
+        let dom = make("<html><body><img/></body></html>");
+        let img = dom
+            .preorder_elements(dom.root)
+            .into_iter()
+            .find(|&id| dom.tag(id) == Some("img"))
+            .unwrap();
+        let html_tag = dom
+            .preorder_elements(dom.root)
+            .into_iter()
+            .find(|&id| dom.tag(id) == Some("html"))
+            .unwrap();
+        let resolved = resolved_with(&[(img, &[("float", "left")])]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, img);
+        let float_spec = FloatSpec::from_css(&dom, html_tag, &style);
+        let mut mgr = styles_manager();
+        let block = Block::new(
+            &mut mgr,
+            &dom,
+            img,
+            &style,
+            false,
+            Some(float_spec),
+            false,
+            None,
+        );
+        let mut body = Element::new("w:body");
+        let mut lm = links_manager();
+        block.serialize(&mut body, &mut lm, &ns(), None, true, true);
+        let p_el = body.children_named("w:p").next().unwrap();
+        let ppr = p_el.children_named("w:pPr").next().unwrap();
+        assert!(ppr.children_named("w:framePr").next().is_some());
     }
 }
