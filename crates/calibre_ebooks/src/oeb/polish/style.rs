@@ -374,6 +374,77 @@ impl<'a> Style<'a> {
         result
     }
 
+    /// Port of `Style.img_dimension` -- `<img>`-specific size
+    /// resolution for `attr` (`"width"` or `"height"`), distinct from
+    /// [`Self::width`]/[`Self::height`]'s own general-purpose
+    /// resolution: CSS `width`/`height: auto` here means "use the
+    /// image's natural `img_size`" rather than falling back to `base`
+    /// directly, the raw HTML `width`/`height` attribute is checked
+    /// before falling back to `img_size`, and `max-width`/`max-height`
+    /// clamp the result. `base` (the percentage-resolution base) is
+    /// computed exactly as [`Self::width`]/[`Self::height`] compute
+    /// their own -- recurse to the parent's resolved size, or the
+    /// profile default at the root.
+    fn img_dimension(&self, attr: &str, img_size: f64) -> f64 {
+        let base = match self.parent() {
+            Some(p) => {
+                if attr == "width" {
+                    p.width()
+                } else {
+                    p.height()
+                }
+            }
+            None => {
+                if attr == "width" {
+                    self.profile.width_pts
+                } else {
+                    self.profile.height_pts
+                }
+            }
+        };
+        let mut ans: Option<f64> = None;
+        if let Some(x) = self.own(attr) {
+            if x == "auto" {
+                ans = self.unit_convert(&format!("{img_size}px"), Some(base), None);
+            } else if let Some(v) = self.unit_convert(&x, Some(base), None) {
+                ans = Some(v);
+            }
+        }
+        if ans.is_none() {
+            if let Some(x) = self.dom.node(self.node).attrs.get(attr) {
+                if let Some(v) = self.unit_convert(&format!("{x}px"), Some(base), None) {
+                    ans = Some(v);
+                }
+            }
+        }
+        if ans.is_none() {
+            ans = self.unit_convert(&format!("{img_size}px"), Some(base), None);
+        }
+        if let Some(maa) = self.own(&format!("max-{attr}")) {
+            if let Some(x) = self.unit_convert(&maa, Some(base), None) {
+                if ans.is_none_or(|a| x < a) {
+                    ans = Some(x);
+                }
+            }
+        }
+        ans.unwrap_or(base)
+    }
+
+    /// Port of `Style.img_size`: the final size of an `<img>` given
+    /// that it points to an image of size `width` x `height`.
+    pub fn img_size(&self, width: f64, height: f64) -> (f64, f64) {
+        let w = self.get("width");
+        let h = self.get("height");
+        let mut ans_w = self.img_dimension("width", width);
+        let mut ans_h = self.img_dimension("height", height);
+        if w == "auto" && h != "auto" {
+            ans_w = (width / height) * ans_h;
+        } else if h == "auto" && w != "auto" {
+            ans_h = (height / width) * ans_w;
+        }
+        (ans_w, ans_h)
+    }
+
     /// Port of `Style.lineHeight`.
     pub fn line_height(&self) -> f64 {
         if let Some(lineh) = self.own("line-height") {
@@ -866,5 +937,65 @@ mod tests {
         let profile = Profile::default();
         let style = Style::new(&dom, &resolved, &profile, p);
         assert_eq!(style.width(), profile.width_pts);
+    }
+
+    #[test]
+    fn img_size_uses_explicit_css_width_and_height_in_points() {
+        let dom = make("<html><body><img/></body></html>");
+        let img = find(&dom, "img");
+        let resolved = resolved_with(&[(img, &[("width", "50pt"), ("height", "30pt")])]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, img);
+        assert_eq!(style.img_size(400.0, 300.0), (50.0, 30.0));
+    }
+
+    #[test]
+    fn img_size_both_auto_preserves_the_natural_aspect_ratio() {
+        let dom = make("<html><body><img/></body></html>");
+        let img = find(&dom, "img");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, img);
+        let (w, h) = style.img_size(400.0, 300.0);
+        assert!((w / h - 400.0 / 300.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn img_size_width_auto_with_a_fixed_height_scales_to_match_aspect_ratio() {
+        let dom = make("<html><body><img/></body></html>");
+        let img = find(&dom, "img");
+        let resolved = resolved_with(&[(img, &[("height", "30pt")])]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, img);
+        let (w, h) = style.img_size(400.0, 300.0);
+        assert_eq!(h, 30.0);
+        assert_eq!(w, (400.0 / 300.0) * 30.0);
+    }
+
+    #[test]
+    fn img_size_falls_back_to_the_raw_html_width_attribute() {
+        let dom = make("<html><body><img width=\"50\"/></body></html>");
+        let img = find(&dom, "img");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, img);
+        let (w, _h) = style.img_size(400.0, 300.0);
+        // "50" is read as 50px (Style.img_dimension appends 'px'), not
+        // the same value as an explicit CSS "50pt" would give.
+        let expected = style
+            .unit_convert("50px", Some(profile.width_pts), None)
+            .unwrap();
+        assert_eq!(w, expected);
+    }
+
+    #[test]
+    fn img_size_max_width_clamps_an_explicit_css_width() {
+        let dom = make("<html><body><img/></body></html>");
+        let img = find(&dom, "img");
+        let resolved = resolved_with(&[(img, &[("width", "100pt"), ("max-width", "40pt")])]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, img);
+        let (w, _h) = style.img_size(400.0, 300.0);
+        assert_eq!(w, 40.0);
     }
 }

@@ -14,9 +14,12 @@
 //! | `links.py` (partial) | [`links`] |
 //! | `from_html.py` (partial) | [`from_html`] |
 //! | `lists.py` | [`lists`] |
+//! | `images.py` (partial) | [`images`] |
 //!
-//! Still to come, tracked as issue #132: `tables.py`, `images.py`,
-//! `from_html.py`'s `Convert.__call__`/`.write` and `Blocks`'
+//! Still to come, tracked as issue #132: `tables.py`, `images.py`'s
+//! `ImagesManager` itself (see [`images`]'s module docs -- only its
+//! self-contained utility layer is ported so far), `from_html.py`'s
+//! `Convert.__call__`/`.write` and `Blocks`'
 //! `Table`-related methods/`.serialize` (see [`from_html`]'s module
 //! docs -- `Convert`'s core element walker itself is ported), plus
 //! `styles.py`'s `CombinedStyle`/
@@ -51,6 +54,7 @@
 pub mod container;
 pub mod fonts;
 pub mod from_html;
+pub mod images;
 pub mod links;
 pub mod lists;
 pub mod styles;
@@ -65,6 +69,7 @@ pub use from_html::{
     lang_for_tag, process_item, process_tag, Block, BlockId, Blocks, LinkTarget, ProcessCtx,
     ProcessState, TextRun,
 };
+pub use images::{create_docx_image_markup, create_filename, get_image_margins, ImageMargins};
 pub use links::{LinksManager, TocItem};
 pub use lists::ListsManager;
 pub use styles::{BlockStyleId, StylesManager, TextStyleId};
