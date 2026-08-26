@@ -1,24 +1,29 @@
 //! CSS -> OOXML property conversion: `docx/writer/styles.py`'s
-//! `TextStyle`/`BlockStyle` (data model + serialization) and
-//! `FloatSpec` (data model only, so far).
+//! `TextStyle`/`BlockStyle`/`FloatSpec`, data model and serialization,
+//! all fully ported.
 //!
 //! Port of `TextStyle`/`BlockStyle`/`FloatSpec`'s CSS-reading
-//! constructors, plus `TextStyle`/`BlockStyle`'s `serialize`/
-//! `serialize_properties` methods (writing to real `w:rPr`/`w:pPr` XML
-//! via [`super::xml::Element`]), plus the module-level helpers
+//! constructors and `serialize`/`serialize_properties` methods
+//! (writing to real `w:rPr`/`w:pPr`/`w:framePr` XML via
+//! [`super::xml::Element`]), plus the module-level helpers
 //! (`css_font_family_to_docx`/`parse_css_font_family`,
 //! `convert_underline`, `bmap`, `LINE_STYLES`, `is_dropcaps`,
-//! `read_css_block_borders`, `parse_css_length`). `FloatSpec.serialize`
-//! (real `w:framePr` XML), `DOCXStyle`'s hash/dedup base class (`id`/
-//! `name`/`next_style` bookkeeping), `CombinedStyle`,
-//! `DescendantTextStyle`, and `StylesManager` (deduplication +
-//! `w:styles` assembly) are not ported yet -- see issue #23's own
-//! tracking notes. `serialize`'s `id`/`name`/`is_normal_style`/
-//! `next_style` are plain parameters here rather than fields Python
-//! stores on `self` (`DOCXStyle.id`/`.name`/`.next_style`), since
-//! nothing yet needs to persist them on a `TextStyle`/`BlockStyle`
-//! instance itself -- that's exactly the bookkeeping `StylesManager`'s
-//! still-unported `finalize` assigns.
+//! `read_css_block_borders`, `parse_css_length`). `FloatSpec::serialize`
+//! doesn't diff against a `normal_style` at all (a float always emits
+//! every attribute/edge unconditionally, unlike `TextStyle`/
+//! `BlockStyle`) -- it takes `is_first_block`/`is_last_block` instead,
+//! standing in for Python's `block is self.blocks[0]`/`self.blocks[-1]`
+//! identity checks (`self.blocks` itself isn't tracked here -- needs
+//! `from_html.py`'s `Block` type, not ported yet). `DOCXStyle`'s
+//! hash/dedup base class (`id`/`name`/`next_style` bookkeeping),
+//! `CombinedStyle`, `DescendantTextStyle`, and `StylesManager`
+//! (deduplication + `w:styles` assembly) are not ported yet -- see
+//! issue #23's own tracking notes. `serialize`'s `id`/`name`/
+//! `is_normal_style`/`next_style` are plain parameters here rather
+//! than fields Python stores on `self` (`DOCXStyle.id`/`.name`/
+//! `.next_style`), since nothing yet needs to persist them on a
+//! `TextStyle`/`BlockStyle` instance itself -- that's exactly the
+//! bookkeeping `StylesManager`'s still-unported `finalize` assigns.
 //!
 //! Reads against [`crate::oeb::polish::style::Style`] -- the seam
 //! issue #132 needed, not the stub `oeb::stylizer::Stylizer` its own
@@ -1198,6 +1203,89 @@ impl FloatSpec {
             borders,
         }
     }
+
+    /// Port of `FloatSpec.serialize`: appends `w:framePr`, a
+    /// zeroed-margin `w:ind` (the frame style itself already applies
+    /// the real margins -- individual blocks must not double them),
+    /// an optional `w:spacing` clearing before/after spacing on the
+    /// float's first/last member, and an unconditional `w:pBdr` with
+    /// all four edges -- directly into `parent`, matching Python's own
+    /// `self.makeelement(parent, ..., append=True)` (the default)
+    /// calls.
+    ///
+    /// `is_first_block`/`is_last_block` replace Python's `block is
+    /// self.blocks[0]`/`block is self.blocks[-1]` identity checks
+    /// against `self.blocks` (not ported -- needs `from_html.py`'s
+    /// `Block` type). The caller, once it exists, will know
+    /// positionally whether it's building the float's first/last
+    /// member -- the same explicit-parameter-over-stored-state
+    /// pattern this whole port uses (see `TextStyle`/
+    /// `BlockStyle::serialize`'s `is_normal_style`). Unlike
+    /// `TextStyle`/`BlockStyle`, nothing here is diffed against a
+    /// `normal_style` -- a float always emits every attribute/edge
+    /// unconditionally, matching Python's own unconditional calls.
+    pub fn serialize(&self, parent: &mut Element, is_first_block: bool, is_last_block: bool) {
+        let frame_pr = if self.is_dropcaps {
+            Element::new("w:framePr")
+                .attr("w:dropCap", "drop")
+                .attr("w:lines", self.dropcaps_lines.unwrap_or(0).to_string())
+                .attr("w:wrap", "around")
+                .attr("w:vAnchor", "text")
+                .attr("w:hAnchor", "text")
+        } else {
+            let mut fp = Element::new("w:framePr")
+                .attr("w:wrap", "around")
+                .attr("w:vAnchor", "text")
+                .attr("w:hAnchor", "text")
+                .attr("w:xAlign", self.x_align.clone().unwrap_or_default())
+                .attr("w:y", "1")
+                .attr("w:hSpace", self.h_space.unwrap_or(0).to_string())
+                .attr("w:vSpace", self.v_space.unwrap_or(0).to_string())
+                .attr("w:hRule", self.h_rule.clone().unwrap_or_default());
+            if let Some(w) = self.w {
+                fp = fp.attr("w:w", w.to_string());
+            }
+            if let Some(h) = self.h {
+                fp = fp.attr("w:h", h.to_string());
+            }
+            fp
+        };
+        parent.append(frame_pr);
+
+        parent.append(
+            Element::new("w:ind")
+                .attr("w:left", "0")
+                .attr("w:leftChars", "0")
+                .attr("w:right", "0")
+                .attr("w:rightChars", "0"),
+        );
+
+        let mut spacing = Element::new("w:spacing");
+        if is_first_block {
+            spacing.set("w:before", "0");
+            spacing.set("w:beforeLines", "0");
+        }
+        if is_last_block {
+            spacing.set("w:after", "0");
+            spacing.set("w:afterLines", "0");
+        }
+        if !spacing.attrs.is_empty() {
+            parent.append(spacing);
+        }
+
+        let mut bdr = Element::new("w:pBdr");
+        for edge in BORDER_EDGES {
+            let mut e = Element::new(format!("w:{edge}"))
+                .attr("w:space", self.borders.padding(edge).to_string())
+                .attr("w:val", self.borders.border_style(edge))
+                .attr("w:sz", self.borders.border_width(edge).to_string());
+            if let Some(color) = self.borders.border_color(edge) {
+                e = e.attr("w:color", color);
+            }
+            bdr.append(e);
+        }
+        parent.append(bdr);
+    }
 }
 
 #[cfg(test)]
@@ -1788,5 +1876,104 @@ mod tests {
         let fs = FloatSpec::from_css(&dom, div, &style);
         assert_eq!(fs.h_rule.as_deref(), Some("auto"));
         assert_eq!(fs.h, None);
+    }
+
+    #[test]
+    fn float_spec_serialize_dropcaps_emits_the_drop_cap_frame_pr() {
+        let dom = make(r#"<html><body><span style="float:left">A</span></body></html>"#);
+        let span = find(&dom, "span");
+        let resolved = resolved_with(&[(span, &[("float", "left")])]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, span);
+        let fs = FloatSpec::from_css(&dom, span, &style);
+        let mut parent = Element::new("w:pPr");
+        fs.serialize(&mut parent, true, true);
+        let frame_pr = parent.children_named("w:framePr").next().unwrap();
+        assert_eq!(frame_pr.get("w:dropCap"), Some("drop"));
+        assert_eq!(frame_pr.get("w:lines"), Some("3"));
+        assert_eq!(frame_pr.get("w:xAlign"), None, "dropcaps has no xAlign");
+    }
+
+    #[test]
+    fn float_spec_serialize_real_float_emits_geometry_and_zeroed_ind() {
+        let dom =
+            make(r#"<html><body><div style="float:left">Hello there, world!</div></body></html>"#);
+        let div = find(&dom, "div");
+        let resolved = resolved_with(&[(
+            div,
+            &[("float", "left"), ("width", "100pt"), ("height", "50pt")],
+        )]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, div);
+        let fs = FloatSpec::from_css(&dom, div, &style);
+        let mut parent = Element::new("w:pPr");
+        fs.serialize(&mut parent, false, false);
+
+        let frame_pr = parent.children_named("w:framePr").next().unwrap();
+        assert_eq!(frame_pr.get("w:xAlign"), Some("left"));
+        assert_eq!(frame_pr.get("w:w"), Some("2000"));
+        assert_eq!(frame_pr.get("w:h"), Some("1000"));
+        assert_eq!(frame_pr.get("w:hRule"), Some("exact"));
+
+        let ind = parent.children_named("w:ind").next().unwrap();
+        assert_eq!(ind.get("w:left"), Some("0"));
+        assert_eq!(ind.get("w:leftChars"), Some("0"));
+
+        assert!(
+            parent.children_named("w:spacing").next().is_none(),
+            "neither first nor last block -- no spacing override needed"
+        );
+
+        let pbdr = parent.children_named("w:pBdr").next().unwrap();
+        assert_eq!(pbdr.child_count(), 4, "every edge is always emitted");
+    }
+
+    #[test]
+    fn float_spec_serialize_first_and_last_block_zero_their_own_spacing() {
+        let dom =
+            make(r#"<html><body><div style="float:left">Hello there, world!</div></body></html>"#);
+        let div = find(&dom, "div");
+        let resolved = resolved_with(&[(div, &[("float", "left")])]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, div);
+        let fs = FloatSpec::from_css(&dom, div, &style);
+
+        let mut first = Element::new("w:pPr");
+        fs.serialize(&mut first, true, false);
+        let spacing = first.children_named("w:spacing").next().unwrap();
+        assert_eq!(spacing.get("w:before"), Some("0"));
+        assert_eq!(spacing.get("w:after"), None);
+
+        let mut last = Element::new("w:pPr");
+        fs.serialize(&mut last, false, true);
+        let spacing = last.children_named("w:spacing").next().unwrap();
+        assert_eq!(spacing.get("w:after"), Some("0"));
+        assert_eq!(spacing.get("w:before"), None);
+    }
+
+    #[test]
+    fn float_spec_serialize_borders_reflect_the_declared_edges() {
+        let dom =
+            make(r#"<html><body><div style="float:left">Hello there, world!</div></body></html>"#);
+        let div = find(&dom, "div");
+        let resolved = resolved_with(&[(
+            div,
+            &[
+                ("float", "left"),
+                ("border-top-style", "solid"),
+                ("border-top-color", "#0000ff"),
+            ],
+        )]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, div);
+        let fs = FloatSpec::from_css(&dom, div, &style);
+        let mut parent = Element::new("w:pPr");
+        fs.serialize(&mut parent, false, false);
+        let pbdr = parent.children_named("w:pBdr").next().unwrap();
+        let top = pbdr.children_named("w:top").next().unwrap();
+        assert_eq!(top.get("w:val"), Some("single"));
+        assert_eq!(top.get("w:color"), Some("0000FF"));
+        let left = pbdr.children_named("w:left").next().unwrap();
+        assert_eq!(left.get("w:val"), Some("none"));
     }
 }
