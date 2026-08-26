@@ -23,34 +23,39 @@
 //! `.next_style`) -- [`StylesManager`] is what assigns them, once a
 //! style has been deduplicated and its final position is known.
 //!
-//! [`StylesManager`] itself ports only `create_text_style`/
-//! `create_block_style` -- the `dict`-based intern cache each
-//! `StylesManager.create_*` method in Python uses to hand back a
-//! *shared* style object for two structurally-identical styles. Rust
-//! has no cheap equivalent of that shared-mutable-object pattern, so
-//! this uses an arena (`Vec<TextStyle>`/`Vec<BlockStyle>`) plus a
-//! `TextStyleId`/`BlockStyleId` handle instead of a shared reference --
-//! the same `NodeId`-into-arena shape [`crate::dom::Dom`] already
-//! uses elsewhere in this crate. `StylesManager.finalize` (the
-//! block/run-style pairing, heading-style promotion, and
-//! descendant-style deduplication passes) and `.serialize` (writing
-//! the final `w:styles` part) are NOT ported -- both need real
-//! `Block`/`Run` objects (`.style`, `.runs`, `.style_weight`,
-//! `.html_tag`, `.is_empty()`) that only `from_html.py` can supply,
-//! and `CombinedStyle` (the block+run style pairing `finalize` builds)
-//! isn't ported for the same reason.
+//! [`StylesManager`] ports `create_text_style`/`create_block_style`
+//! -- the `dict`-based intern cache each `StylesManager.create_*`
+//! method in Python uses to hand back a *shared* style object for two
+//! structurally-identical styles. Rust has no cheap equivalent of
+//! that shared-mutable-object pattern, so this uses an arena
+//! (`Vec<TextStyle>`/`Vec<BlockStyle>`) plus a `TextStyleId`/
+//! `BlockStyleId` handle instead of a shared reference -- the same
+//! `NodeId`-into-arena shape [`crate::dom::Dom`] already uses
+//! elsewhere in this crate. `StylesManager.finalize` is now also
+//! ported (block/run-style pairing, heading-style promotion,
+//! descendant-style deduplication, all writing back onto
+//! `from_html::Blocks`/`Block`/`TextRun`) -- [`CombinedStyle`] is its
+//! own new, minimal type (just the block+run style pairing and
+//! outline level; Python's version also carries `id`/`name`/`.blocks`,
+//! neither needed here, see its own docs). **`.serialize`** (writing
+//! the final `w:styles` part from `finalize`'s output) is still NOT
+//! ported.
 //!
 //! Reads against [`crate::oeb::polish::style::Style`] -- the seam
 //! issue #132 needed, not the stub `oeb::stylizer::Stylizer` its own
 //! docs once assumed was still the state of things (see
 //! `oeb/polish/style.rs`'s module docs for that correction).
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
+
+use indexmap::{IndexMap, IndexSet};
 
 use crate::dom::{Dom, NodeId};
 use crate::oeb::polish::style::{ItemValue, Style, VerticalAlign};
 use crate::oeb::polish::toc::lang_as_iso639_1;
 
+use super::from_html::{BlockId, Blocks};
 use super::utils::{convert_color, int_or_zero};
 use super::xml::Element;
 
@@ -1498,10 +1503,30 @@ pub struct TextStyleId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlockStyleId(pub usize);
 
-/// Port of `StylesManager.create_text_style`/`.create_block_style` and
-/// the `text_styles`/`block_styles`/`styles_for_html_blocks` caches
-/// backing them. `finalize`/`serialize`/`CombinedStyle` are not ported
-/// -- see the module docs above.
+/// Port of `CombinedStyle`: a `(block style, run style)` pairing that
+/// won as a block's dominant style combination during
+/// [`StylesManager::finalize`], plus the outline level it was
+/// promoted to if it's serving as a heading style. Just the pairing
+/// -- Python's `CombinedStyle` also stores `id`/`name`/`seq` and
+/// `.blocks` (the member blocks the pairing applies to); none of
+/// those are needed after `finalize` runs (`.blocks` was only ever
+/// used to `apply()` the pairing back onto its member blocks/runs,
+/// which `finalize` already does; `id`/`name` are recomputed from a
+/// `CombinedStyle`'s position in [`StylesManager::combined_styles`]
+/// -- see that field's docs for why).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CombinedStyle {
+    pub block_style: BlockStyleId,
+    pub text_style: TextStyleId,
+    pub outline_level: Option<u32>,
+}
+
+/// Port of `StylesManager.create_text_style`/`.create_block_style`
+/// (the `text_styles`/`block_styles`/`styles_for_html_blocks` caches
+/// backing them) and `.finalize` (block/run-style pairing, heading
+/// promotion, descendant-style dedup). `.serialize` (writing the
+/// final `w:styles` part from `finalize`'s output) is NOT ported --
+/// see the module docs above.
 #[derive(Debug, Default)]
 pub struct StylesManager {
     document_lang: String,
@@ -1510,6 +1535,29 @@ pub struct StylesManager {
     block_styles: Vec<BlockStyle>,
     block_style_index: HashMap<BlockStyle, BlockStyleId>,
     styles_for_html_blocks: HashMap<NodeId, BlockStyleId>,
+    /// Port of `self.pure_block_styles`: block styles with no runs at
+    /// all (an empty paragraph, e.g.), sorted ascending by how many
+    /// blocks use them -- **not** descending; matching Python
+    /// exactly, `self.pure_block_styles[0]` (the LEAST common one)
+    /// becomes the "Normal" pure-block style everything else diffs
+    /// against. Final `id`/`name` (`"%0nd Block" % i`) are a pure
+    /// function of position in this `Vec` -- not stored as fields,
+    /// same reasoning as [`CombinedStyle`]'s docs.
+    pure_block_styles: Vec<BlockStyleId>,
+    /// Port of `self.combined_styles`: every `(block style, run
+    /// style)` pairing that won as some block's dominant combination,
+    /// sorted descending by weighted use count -- index 0 is always
+    /// Python's `self.normal_style`. Final `id`/`name`
+    /// ("Normal"/`"Heading N"`/`"Para %0nd" % i`) are a pure function
+    /// of `(position, outline_level)` -- see [`CombinedStyle`]'s docs.
+    combined_styles: Vec<CombinedStyle>,
+    /// Port of `self.descendant_text_styles`: every distinct
+    /// run-vs-containing-block style diff actually used, sorted
+    /// descending by weighted use count. Final `id`/`name`
+    /// (`"TextN"`/`"%0nd Text" % i`) are a pure function of position.
+    descendant_text_styles: Vec<DescendantTextStyle>,
+    /// Port of `self.primary_heading_style`.
+    primary_heading_style: Option<CombinedStyle>,
 }
 
 impl StylesManager {
@@ -1581,6 +1629,238 @@ impl StylesManager {
     pub fn style_for_html_block(&self, html_block: NodeId) -> Option<BlockStyleId> {
         self.styles_for_html_blocks.get(&html_block).copied()
     }
+
+    pub fn pure_block_styles(&self) -> &[BlockStyleId] {
+        &self.pure_block_styles
+    }
+
+    /// The least-used pure block style -- see
+    /// [`Self::pure_block_styles`]'s field docs for why it's the
+    /// *least*, not most, common one.
+    pub fn normal_pure_block_style(&self) -> Option<BlockStyleId> {
+        self.pure_block_styles.first().copied()
+    }
+
+    pub fn combined_styles(&self) -> &[CombinedStyle] {
+        &self.combined_styles
+    }
+
+    pub fn normal_style(&self) -> Option<CombinedStyle> {
+        self.combined_styles.first().copied()
+    }
+
+    pub fn descendant_text_styles(&self) -> &[DescendantTextStyle] {
+        &self.descendant_text_styles
+    }
+
+    pub fn primary_heading_style(&self) -> Option<CombinedStyle> {
+        self.primary_heading_style
+    }
+
+    /// Port of `StylesManager.finalize`: pairs each block with its
+    /// dominant run style by weighted use, promotes per-heading-tag
+    /// styles via outline level, and deduplicates descendant
+    /// (run-vs-containing-block) style diffs -- writing the results
+    /// both onto `blocks` (`Block::linked_style`,
+    /// `TextRun::parent_style`/`.descendant_style_id`) and onto
+    /// `self` (see the new field docs above) for `.serialize` (not
+    /// yet ported) to walk.
+    ///
+    /// Python assigns final `id`/`name`/`seq` by mutating the shared,
+    /// already-hashed `BlockStyle`/`CombinedStyle`/`DescendantTextStyle`
+    /// objects in place -- safe there since none of those fields
+    /// participate in `__hash__`/`__eq__`. This port's style types
+    /// derive `Hash`/`Eq` from every field (needed for the `create_*`
+    /// intern caches), so id/name/seq are never stored on them at all
+    /// here: each is a pure function of final position in
+    /// `pure_block_styles`/`combined_styles`/`descendant_text_styles`
+    /// (plus `outline_level` for combined styles) -- computed at
+    /// `.serialize` time, once that exists.
+    ///
+    /// Ties in Python's `Counter.most_common()` break by
+    /// first-insertion order (documented `Counter` behavior) --
+    /// reproduced with `IndexMap`/`IndexSet` (insertion order
+    /// preserved) and a manual strict-greater-than scan for the
+    /// single-winner cases (`Iterator::max_by_key` returns the LAST
+    /// maximum on a tie, the opposite of what's needed here).
+    pub fn finalize(&mut self, blocks: &mut Blocks) {
+        const HEADING_TAGS: [&str; 6] = ["h1", "h2", "h3", "h4", "h5", "h6"];
+
+        let all_block_ids: Vec<BlockId> = blocks.all_blocks().to_vec();
+
+        let mut block_counts: IndexMap<BlockStyleId, usize> = IndexMap::new();
+        let mut used_pairs: IndexMap<(BlockStyleId, TextStyleId), Vec<BlockId>> = IndexMap::new();
+        let mut heading_pairs: IndexMap<&'static str, Vec<(BlockStyleId, TextStyleId)>> =
+            IndexMap::new();
+        let mut pure_block_styles_set: IndexSet<BlockStyleId> = IndexSet::new();
+
+        for &block_id in &all_block_ids {
+            let bs = blocks.block(block_id).style;
+            *block_counts.entry(bs).or_insert(0) += 1;
+
+            let mut local_run_counts: IndexMap<TextStyleId, usize> = IndexMap::new();
+            for run in blocks.block(block_id).runs() {
+                *local_run_counts.entry(run.style).or_insert(0) += run.style_weight();
+            }
+
+            if let Some(rs) = first_max_by_count(&local_run_counts) {
+                used_pairs.entry((bs, rs)).or_default().push(block_id);
+                let html_tag = blocks.block(block_id).html_tag.clone();
+                if let Some(&tag) = HEADING_TAGS.iter().find(|&&t| t == html_tag) {
+                    heading_pairs.entry(tag).or_default().push((bs, rs));
+                }
+                for run in blocks.block_mut(block_id).runs_mut() {
+                    run.parent_style = Some(rs);
+                }
+            } else {
+                pure_block_styles_set.insert(bs);
+            }
+        }
+
+        let mut pure_block_styles: Vec<BlockStyleId> = pure_block_styles_set.into_iter().collect();
+        pure_block_styles.sort_by_key(|id| block_counts.get(id).copied().unwrap_or(0));
+
+        let mut pair_counts: IndexMap<(BlockStyleId, TextStyleId), usize> = IndexMap::new();
+        for (&pair, member_blocks) in &used_pairs {
+            let count = member_blocks
+                .iter()
+                .filter(|&&id| !blocks.block(id).is_empty())
+                .count();
+            pair_counts.insert(pair, count);
+        }
+
+        let mut outline_levels: HashMap<(BlockStyleId, TextStyleId), u32> = HashMap::new();
+        let mut heading_tags: Vec<&'static str> = heading_pairs.keys().copied().collect();
+        heading_tags.sort_unstable();
+        for (i, tag) in heading_tags.iter().enumerate() {
+            let mut candidates: Vec<(BlockStyleId, TextStyleId)> = heading_pairs[tag].clone();
+            candidates.sort_by_key(|pair| pair_counts.get(pair).copied().unwrap_or(0));
+            if let Some(&chosen) = candidates
+                .iter()
+                .rev()
+                .find(|pair| !outline_levels.contains_key(pair))
+            {
+                outline_levels.insert(chosen, i as u32);
+            }
+        }
+
+        let mut combined_candidates: Vec<((BlockStyleId, TextStyleId), usize)> = pair_counts
+            .iter()
+            .map(|(&pair, &count)| (pair, count))
+            .collect();
+        combined_candidates.sort_by_key(|&(_, count)| Reverse(count));
+
+        let combined_styles: Vec<CombinedStyle> = combined_candidates
+            .iter()
+            .map(|&(pair, _)| CombinedStyle {
+                block_style: pair.0,
+                text_style: pair.1,
+                outline_level: outline_levels.get(&pair).copied(),
+            })
+            .collect();
+
+        let seq_width = format!("{}", combined_candidates.len().saturating_sub(1).max(1)).len();
+        for (i, &(pair, _)) in combined_candidates.iter().enumerate() {
+            let label = if i == 0 {
+                "Normal".to_string()
+            } else if let Some(level) = outline_levels.get(&pair) {
+                format!("Heading {}", level + 1)
+            } else {
+                format!("Para {i:0seq_width$}")
+            };
+            if let Some(member_blocks) = used_pairs.get(&pair) {
+                for &block_id in member_blocks {
+                    blocks.block_mut(block_id).linked_style = Some(label.clone());
+                }
+            }
+        }
+
+        let mut assigned_headings: Vec<CombinedStyle> = combined_styles
+            .iter()
+            .enumerate()
+            .filter(|&(i, cs)| i != 0 && cs.outline_level.is_some())
+            .map(|(_, &cs)| cs)
+            .collect();
+        assigned_headings.sort_by_key(|cs| cs.outline_level.unwrap());
+        let primary_heading_style = if let Some(&first) = assigned_headings.first() {
+            Some(first)
+        } else {
+            let mut best: Option<CombinedStyle> = None;
+            let mut ms = 0i64;
+            for &cs in &combined_styles {
+                let fs = self.text_style(cs.text_style).font_size.unwrap_or(0);
+                if fs > ms {
+                    best = Some(cs);
+                    ms = fs;
+                }
+            }
+            best
+        };
+
+        let mut descendant_groups: IndexMap<DescendantTextStyle, (usize, Vec<(BlockId, usize)>)> =
+            IndexMap::new();
+        for &block_id in &all_block_ids {
+            let runs_len = blocks.block(block_id).runs().len();
+            for run_idx in 0..runs_len {
+                let (parent_id, style_id, weight) = {
+                    let run = &blocks.block(block_id).runs()[run_idx];
+                    (run.parent_style, run.style, run.style_weight())
+                };
+                let Some(parent_id) = parent_id else { continue };
+                if parent_id == style_id {
+                    continue;
+                }
+                let ds =
+                    DescendantTextStyle::new(self.text_style(parent_id), self.text_style(style_id));
+                if ds.properties.is_empty() {
+                    continue;
+                }
+                let entry = descendant_groups
+                    .entry(ds)
+                    .or_insert_with(|| (0, Vec::new()));
+                entry.0 += weight;
+                entry.1.push((block_id, run_idx));
+            }
+        }
+
+        let mut group_list: Vec<(DescendantTextStyle, usize, Vec<(BlockId, usize)>)> =
+            descendant_groups
+                .into_iter()
+                .map(|(ds, (weight, locs))| (ds, weight, locs))
+                .collect();
+        group_list.sort_by_key(|&(_, weight, _)| Reverse(weight));
+
+        for (i, (_, _, locs)) in group_list.iter().enumerate() {
+            let id = format!("Text{i}");
+            for &(block_id, run_idx) in locs {
+                blocks.block_mut(block_id).runs_mut()[run_idx].descendant_style_id =
+                    Some(id.clone());
+            }
+        }
+        let descendant_text_styles: Vec<DescendantTextStyle> =
+            group_list.into_iter().map(|(ds, _, _)| ds).collect();
+
+        self.pure_block_styles = pure_block_styles;
+        self.combined_styles = combined_styles;
+        self.descendant_text_styles = descendant_text_styles;
+        self.primary_heading_style = primary_heading_style;
+    }
+}
+
+/// First-inserted winner of the highest-count entry in `map` -- port
+/// of Python's `Counter.most_common(1)[0][0]`, whose ties break by
+/// first-insertion order (documented `Counter` behavior).
+/// `Iterator::max_by_key` returns the LAST maximum on a tie, so a
+/// manual strict-greater-than scan is used instead.
+fn first_max_by_count<K: Copy>(map: &IndexMap<K, usize>) -> Option<K> {
+    let mut best: Option<(K, usize)> = None;
+    for (&k, &v) in map {
+        match best {
+            Some((_, bv)) if v <= bv => {}
+            _ => best = Some((k, v)),
+        }
+    }
+    best.map(|(k, _)| k)
 }
 
 #[cfg(test)]
@@ -2501,5 +2781,227 @@ mod tests {
             mgr.block_style(id).background_color.as_deref(),
             Some("FF0000")
         );
+    }
+
+    #[test]
+    fn finalize_labels_the_only_combined_style_normal_and_sets_run_parent_style() {
+        let dom = make("<html><body><p>hello</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let mut mgr = StylesManager::new("en");
+        let style = Style::new(&dom, &resolved, &profile, p);
+        let mut blocks = Blocks::new();
+        let id = blocks.start_new_block(&mut mgr, &dom, p, &style, false, None, false);
+        blocks.block_mut(id).add_text(
+            &mut mgr, "hello", &style, false, None, false, None, None, None,
+        );
+        blocks.end_current_block();
+
+        mgr.finalize(&mut blocks);
+
+        assert_eq!(mgr.combined_styles().len(), 1);
+        assert_eq!(blocks.block(id).linked_style.as_deref(), Some("Normal"));
+        let run_style = blocks.block(id).runs()[0].style;
+        assert_eq!(blocks.block(id).runs()[0].parent_style, Some(run_style));
+        assert_eq!(mgr.normal_style().map(|cs| cs.text_style), Some(run_style));
+    }
+
+    #[test]
+    fn finalize_treats_a_block_with_no_runs_as_a_pure_block_style() {
+        let dom = make("<html><body><p></p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let mut mgr = StylesManager::new("en");
+        let style = Style::new(&dom, &resolved, &profile, p);
+        let mut blocks = Blocks::new();
+        let id = blocks.start_new_block(&mut mgr, &dom, p, &style, false, None, false);
+        blocks.end_current_block();
+
+        mgr.finalize(&mut blocks);
+
+        assert!(mgr.combined_styles().is_empty());
+        assert_eq!(mgr.pure_block_styles().len(), 1);
+        assert_eq!(blocks.block(id).linked_style, None);
+    }
+
+    #[test]
+    fn finalize_labels_the_second_most_common_pairing_para_one() {
+        let dom = make("<html><body><div>a</div><div>a</div><div>b</div></body></html>");
+        let divs: Vec<NodeId> = dom
+            .preorder_elements(dom.root)
+            .into_iter()
+            .filter(|&id| dom.tag(id) == Some("div"))
+            .collect();
+        let resolved = resolved_with(&[(divs[0], &[]), (divs[2], &[("font-weight", "bold")])]);
+        let profile = Profile::default();
+        let mut mgr = StylesManager::new("en");
+        let a_style = Style::new(&dom, &resolved, &profile, divs[0]);
+        let b_style = Style::new(&dom, &resolved, &profile, divs[2]);
+        let mut blocks = Blocks::new();
+        let id1 = blocks.start_new_block(&mut mgr, &dom, divs[0], &a_style, false, None, false);
+        blocks.block_mut(id1).add_text(
+            &mut mgr, "a", &a_style, false, None, false, None, None, None,
+        );
+        let id2 = blocks.start_new_block(&mut mgr, &dom, divs[1], &a_style, false, None, false);
+        blocks.block_mut(id2).add_text(
+            &mut mgr, "a", &a_style, false, None, false, None, None, None,
+        );
+        let id3 = blocks.start_new_block(&mut mgr, &dom, divs[2], &b_style, false, None, false);
+        blocks.block_mut(id3).add_text(
+            &mut mgr, "b", &b_style, false, None, false, None, None, None,
+        );
+        blocks.end_current_block();
+
+        mgr.finalize(&mut blocks);
+
+        assert_eq!(blocks.block(id1).linked_style.as_deref(), Some("Normal"));
+        assert_eq!(blocks.block(id2).linked_style.as_deref(), Some("Normal"));
+        assert_eq!(blocks.block(id3).linked_style.as_deref(), Some("Para 1"));
+    }
+
+    #[test]
+    fn finalize_promotes_a_heading_tag_pairing_to_outline_level_and_primary_heading() {
+        let dom = make("<html><body><p>a</p><p>a</p><h1>heading</h1></body></html>");
+        let ps: Vec<NodeId> = dom
+            .preorder_elements(dom.root)
+            .into_iter()
+            .filter(|&id| dom.tag(id) == Some("p"))
+            .collect();
+        let h1 = find(&dom, "h1");
+        let resolved = resolved_with(&[(ps[0], &[]), (h1, &[("font-weight", "bold")])]);
+        let profile = Profile::default();
+        let mut mgr = StylesManager::new("en");
+        let p_style = Style::new(&dom, &resolved, &profile, ps[0]);
+        let h1_style = Style::new(&dom, &resolved, &profile, h1);
+        let mut blocks = Blocks::new();
+        let id_p1 = blocks.start_new_block(&mut mgr, &dom, ps[0], &p_style, false, None, false);
+        blocks.block_mut(id_p1).add_text(
+            &mut mgr, "a", &p_style, false, None, false, None, None, None,
+        );
+        let id_p2 = blocks.start_new_block(&mut mgr, &dom, ps[1], &p_style, false, None, false);
+        blocks.block_mut(id_p2).add_text(
+            &mut mgr, "a", &p_style, false, None, false, None, None, None,
+        );
+        let id_h1 = blocks.start_new_block(&mut mgr, &dom, h1, &h1_style, false, None, false);
+        blocks.block_mut(id_h1).add_text(
+            &mut mgr, "heading", &h1_style, false, None, false, None, None, None,
+        );
+        blocks.end_current_block();
+
+        mgr.finalize(&mut blocks);
+
+        assert_eq!(mgr.combined_styles().len(), 2);
+        assert_eq!(blocks.block(id_p1).linked_style.as_deref(), Some("Normal"));
+        assert_eq!(blocks.block(id_p2).linked_style.as_deref(), Some("Normal"));
+        assert_eq!(
+            blocks.block(id_h1).linked_style.as_deref(),
+            Some("Heading 1")
+        );
+        let heading_cs = mgr.combined_styles()[1];
+        assert_eq!(heading_cs.outline_level, Some(0));
+        assert_eq!(mgr.primary_heading_style(), Some(heading_cs));
+    }
+
+    #[test]
+    fn finalize_primary_heading_style_falls_back_to_the_largest_font_size_when_no_heading_tags() {
+        let dom = make("<html><body><p>a</p><p>a</p><p>big</p></body></html>");
+        let ps: Vec<NodeId> = dom
+            .preorder_elements(dom.root)
+            .into_iter()
+            .filter(|&id| dom.tag(id) == Some("p"))
+            .collect();
+        let resolved = resolved_with(&[(ps[0], &[]), (ps[2], &[("font-size", "24pt")])]);
+        let profile = Profile::default();
+        let mut mgr = StylesManager::new("en");
+        let small_style = Style::new(&dom, &resolved, &profile, ps[0]);
+        let big_style = Style::new(&dom, &resolved, &profile, ps[2]);
+        let mut blocks = Blocks::new();
+        let id1 = blocks.start_new_block(&mut mgr, &dom, ps[0], &small_style, false, None, false);
+        blocks.block_mut(id1).add_text(
+            &mut mgr,
+            "a",
+            &small_style,
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+        );
+        let id2 = blocks.start_new_block(&mut mgr, &dom, ps[1], &small_style, false, None, false);
+        blocks.block_mut(id2).add_text(
+            &mut mgr,
+            "a",
+            &small_style,
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+        );
+        let id3 = blocks.start_new_block(&mut mgr, &dom, ps[2], &big_style, false, None, false);
+        blocks.block_mut(id3).add_text(
+            &mut mgr, "big", &big_style, false, None, false, None, None, None,
+        );
+        blocks.end_current_block();
+
+        mgr.finalize(&mut blocks);
+
+        assert!(mgr
+            .combined_styles()
+            .iter()
+            .all(|cs| cs.outline_level.is_none()));
+        let primary = mgr
+            .primary_heading_style()
+            .expect("a font-size fallback should be chosen");
+        assert_eq!(
+            primary.text_style,
+            mgr.combined_styles()[1].text_style,
+            "the less-common, larger-font pairing wins the fallback, not the most-common one"
+        );
+        assert_eq!(mgr.text_style(primary.text_style).font_size, Some(48));
+    }
+
+    #[test]
+    fn finalize_dedups_descendant_styles_and_writes_ids_onto_runs() {
+        let dom = make("<html><body><p>plain <b>bold</b></p></body></html>");
+        let p = find(&dom, "p");
+        let b = find(&dom, "b");
+        let resolved = resolved_with(&[(p, &[]), (b, &[("font-weight", "bold")])]);
+        let profile = Profile::default();
+        let mut mgr = StylesManager::new("en");
+        let p_style = Style::new(&dom, &resolved, &profile, p);
+        let b_style = Style::new(&dom, &resolved, &profile, b);
+        let mut blocks = Blocks::new();
+        let id = blocks.start_new_block(&mut mgr, &dom, p, &p_style, false, None, false);
+        blocks.block_mut(id).add_text(
+            &mut mgr,
+            "plain text long enough to dominate",
+            &p_style,
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+        );
+        blocks.block_mut(id).add_text(
+            &mut mgr, "b", &b_style, false, None, false, None, None, None,
+        );
+        blocks.end_current_block();
+
+        mgr.finalize(&mut blocks);
+
+        let runs = blocks.block(id).runs();
+        assert_eq!(runs.len(), 2);
+        assert!(
+            runs[0].descendant_style_id.is_none(),
+            "the dominant-style run needs no descendant override"
+        );
+        assert_eq!(runs[1].descendant_style_id.as_deref(), Some("Text0"));
+        assert_eq!(mgr.descendant_text_styles().len(), 1);
     }
 }
