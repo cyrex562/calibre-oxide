@@ -1,14 +1,21 @@
-//! CSS -> OOXML run-property conversion: the data-model half of
-//! `docx/writer/styles.py`'s `TextStyle`.
+//! CSS -> OOXML property conversion: `docx/writer/styles.py`'s
+//! `TextStyle`/`BlockStyle`/`FloatSpec`, data model and serialization.
 //!
-//! Port of the pure CSS-reading half of `TextStyle.__init__` plus its
-//! module-level helpers (`css_font_family_to_docx`/
-//! `parse_css_font_family`, `convert_underline`, `bmap`, `LINE_STYLES`).
-//! `TextStyle.serialize`/`serialize_properties` (writing the resolved
-//! properties out as real `w:rPr` XML), `DOCXStyle`'s hash/dedup
-//! machinery, `BlockStyle`/`FloatSpec`/`DescendantTextStyle`, and
-//! `StylesManager` (deduplication + `w:styles` assembly) are not
-//! ported yet -- see issue #23's own tracking notes.
+//! Port of `TextStyle`/`BlockStyle`/`FloatSpec`'s CSS-reading
+//! constructors and their `serialize`/`serialize_properties` methods
+//! (writing to real `w:rPr`/`w:pPr`/`w:framePr` XML via
+//! [`super::xml::Element`]), plus the module-level helpers
+//! (`css_font_family_to_docx`/`parse_css_font_family`,
+//! `convert_underline`, `bmap`, `LINE_STYLES`, `is_dropcaps`,
+//! `read_css_block_borders`). `DOCXStyle`'s hash/dedup base class
+//! (`id`/`name`/`next_style` bookkeeping), `CombinedStyle`,
+//! `DescendantTextStyle`, and `StylesManager` (deduplication +
+//! `w:styles` assembly) are not ported yet -- see issue #23's own
+//! tracking notes. `serialize`'s `id`/`name`/`is_normal_style` are
+//! plain parameters here rather than fields Python stores on `self`
+//! (`DOCXStyle.id`/`.name`), since nothing yet needs to persist them
+//! on a `TextStyle`/`BlockStyle` instance itself -- that's exactly the
+//! bookkeeping `StylesManager`'s still-unported `finalize` assigns.
 //!
 //! Reads against [`crate::oeb::polish::style::Style`] -- the seam
 //! issue #132 needed, not the stub `oeb::stylizer::Stylizer` its own
@@ -21,6 +28,7 @@ use crate::dom::{Dom, NodeId};
 use crate::oeb::polish::style::{ItemValue, Style, VerticalAlign};
 
 use super::utils::{convert_color, int_or_zero};
+use super::xml::Element;
 
 /// The four box edges DOCX borders/padding/margins are read per, in
 /// the order Python iterates them.
@@ -149,8 +157,9 @@ fn border_width_value(style: &Style, edge: &str) -> f64 {
 /// The run-level CSS -> `w:rPr` property set -- port of `TextStyle`'s
 /// `ALL_PROPS` fields (everything `__init__` computes from `css`).
 /// Deliberately excludes `DOCXStyle`'s bookkeeping fields (`id`/
-/// `name`/`next_style`) and the hash/serialize machinery, which need
-/// `StylesManager`'s deduplication pass -- not ported yet.
+/// `name`/`next_style`), which belong to `StylesManager`'s still-
+/// unported deduplication pass -- see [`TextStyle::serialize`] for why
+/// they're plain parameters there instead.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TextStyle {
     pub font_family: Option<String>,
@@ -350,6 +359,175 @@ impl TextStyle {
             border_width,
             border_style,
             border_color,
+        }
+    }
+
+    /// Port of `DOCXStyle.serialize` + `TextStyle.serialize` combined:
+    /// the standalone `<w:style w:type="character">` element (not yet
+    /// appended into a `w:styles` document -- that's `StylesManager`'s
+    /// job, not ported yet). `is_normal_style`/`normal_style_id`
+    /// stand in for Python's `self is normal_style`
+    /// identity-comparison/`normal_style.id`.
+    pub fn serialize(
+        &self,
+        id: &str,
+        name: &str,
+        is_normal_style: bool,
+        normal_style: &TextStyle,
+        normal_style_id: &str,
+    ) -> Element {
+        let mut style = Element::new("w:style")
+            .attr("w:styleId", id)
+            .attr("w:type", "character")
+            .with(Element::new("w:name").attr("w:val", name));
+        if !is_normal_style {
+            style = style.with(Element::new("w:basedOn").attr("w:val", normal_style_id));
+        }
+        let mut rpr = Element::new("w:rPr");
+        self.serialize_properties(&mut rpr, is_normal_style, normal_style);
+        if !rpr.is_empty() {
+            style = style.with(rpr);
+        }
+        style
+    }
+
+    /// Port of `TextStyle.serialize_properties`: appends every
+    /// property that differs from `normal_style` (or, for the Normal
+    /// style itself, every property unconditionally -- `is_normal_style`
+    /// mirrors Python's `self is normal_style`).
+    pub fn serialize_properties(
+        &self,
+        rpr: &mut Element,
+        is_normal_style: bool,
+        normal_style: &TextStyle,
+    ) {
+        if (is_normal_style || self.font_family != normal_style.font_family)
+            && self.font_family.is_some()
+        {
+            // Python sets ascii/cs/eastAsia/hAnsi to `self.font_family`
+            // unconditionally, which would pass `None` to lxml (a
+            // TypeError there) if it were ever actually `None` on this
+            // branch -- disclosed deviation: omit `w:rFonts` entirely
+            // rather than reproduce a crash no real font stack should
+            // trigger (`css_font_family_to_docx` only returns `None`
+            // for a genuinely empty `font-family` declaration).
+            let family = self.font_family.as_deref().unwrap();
+            rpr.append(
+                Element::new("w:rFonts")
+                    .attr("w:ascii", family)
+                    .attr("w:cs", family)
+                    .attr("w:eastAsia", family)
+                    .attr("w:hAnsi", family),
+            );
+        }
+
+        if is_normal_style || normal_style.font_size != self.font_size {
+            let val = self.font_size.unwrap_or(0).to_string();
+            rpr.append(Element::new("w:sz").attr("w:val", val.clone()));
+            rpr.append(Element::new("w:szCs").attr("w:val", val));
+        }
+        if is_normal_style || normal_style.bold != self.bold {
+            rpr.append(Element::new("w:b").attr("w:val", bmap(self.bold)));
+            rpr.append(Element::new("w:bCs").attr("w:val", bmap(self.bold)));
+        }
+        if is_normal_style || normal_style.italic != self.italic {
+            rpr.append(Element::new("w:i").attr("w:val", bmap(self.italic)));
+            rpr.append(Element::new("w:iCs").attr("w:val", bmap(self.italic)));
+        }
+
+        let changed = |same: bool| is_normal_style || !same;
+
+        if changed(self.color == normal_style.color) {
+            rpr.append(Element::new("w:color").attr(
+                "w:val",
+                self.color.clone().unwrap_or_else(|| "auto".to_string()),
+            ));
+        }
+        if changed(self.background_color == normal_style.background_color) {
+            rpr.append(
+                Element::new("w:shd").attr(
+                    "w:fill",
+                    self.background_color
+                        .clone()
+                        .unwrap_or_else(|| "auto".to_string()),
+                ),
+            );
+        }
+        if changed(self.underline == normal_style.underline) {
+            let (u_style, u_color) = match self.underline.split_once(' ') {
+                Some((s, c)) => (s.to_string(), c.to_string()),
+                None => (self.underline.clone(), String::new()),
+            };
+            let mut u = Element::new("w:u").attr("w:val", u_style);
+            if u_color != "auto" {
+                u = u.attr("w:color", u_color);
+            }
+            rpr.append(u);
+        }
+        if changed(self.dstrike == normal_style.dstrike) {
+            rpr.append(Element::new("w:dstrike").attr("w:val", bmap(self.dstrike)));
+        }
+        if changed(self.strike == normal_style.strike) {
+            rpr.append(Element::new("w:strike").attr("w:val", bmap(self.strike)));
+        }
+        if changed(self.caps == normal_style.caps) {
+            rpr.append(Element::new("w:caps").attr("w:val", bmap(self.caps)));
+        }
+        if changed(self.small_caps == normal_style.small_caps) {
+            rpr.append(Element::new("w:smallCaps").attr("w:val", bmap(self.small_caps)));
+        }
+        if changed(self.shadow == normal_style.shadow) {
+            rpr.append(Element::new("w:shadow").attr("w:val", bmap(self.shadow)));
+        }
+        if changed(self.spacing == normal_style.spacing) {
+            rpr.append(
+                Element::new("w:spacing").attr("w:val", self.spacing.unwrap_or(0).to_string()),
+            );
+        }
+
+        if is_normal_style {
+            let val = if matches!(self.vertical_align.as_str(), "superscript" | "subscript") {
+                self.vertical_align.as_str()
+            } else {
+                "baseline"
+            };
+            rpr.append(Element::new("w:vertAlign").attr("w:val", val));
+        } else if self.vertical_align != normal_style.vertical_align {
+            if matches!(
+                self.vertical_align.as_str(),
+                "superscript" | "subscript" | "baseline"
+            ) {
+                rpr.append(Element::new("w:vertAlign").attr("w:val", self.vertical_align.clone()));
+            } else {
+                rpr.append(Element::new("w:position").attr("w:val", self.vertical_align.clone()));
+            }
+        }
+
+        let mut bdr = Element::new("w:bdr");
+        self.serialize_borders(&mut bdr, is_normal_style, normal_style);
+        if !bdr.attrs.is_empty() {
+            rpr.append(bdr);
+        }
+    }
+
+    /// Port of `TextStyle.serialize_borders`.
+    fn serialize_borders(
+        &self,
+        bdr: &mut Element,
+        is_normal_style: bool,
+        normal_style: &TextStyle,
+    ) {
+        if is_normal_style || self.padding != normal_style.padding {
+            bdr.set("w:space", self.padding.to_string());
+        }
+        if is_normal_style || self.border_width != normal_style.border_width {
+            bdr.set("w:sz", self.border_width.to_string());
+        }
+        if is_normal_style || self.border_style != normal_style.border_style {
+            bdr.set("w:val", self.border_style.clone());
+        }
+        if is_normal_style || self.border_color != normal_style.border_color {
+            bdr.set("w:color", self.border_color.clone());
         }
     }
 }
@@ -953,6 +1131,106 @@ mod tests {
         let mut set = HashSet::new();
         set.insert(a);
         assert!(set.contains(&b));
+    }
+
+    fn plain_text_style() -> TextStyle {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        TextStyle::from_css(&Style::new(&dom, &resolved, &profile, p), false)
+    }
+
+    #[test]
+    fn text_style_serialize_properties_for_the_normal_style_emits_everything() {
+        let normal = plain_text_style();
+        let mut rpr = Element::new("w:rPr");
+        normal.serialize_properties(&mut rpr, true, &normal);
+        assert!(rpr.children_named("w:sz").next().is_some());
+        assert!(rpr.children_named("w:b").next().is_some());
+        assert!(rpr.children_named("w:vertAlign").next().is_some());
+    }
+
+    #[test]
+    fn text_style_serialize_properties_for_a_non_normal_style_only_emits_differences() {
+        let normal = plain_text_style();
+        let mut bold = normal.clone();
+        bold.bold = true;
+        let mut rpr = Element::new("w:rPr");
+        bold.serialize_properties(&mut rpr, false, &normal);
+        assert!(rpr.children_named("w:b").next().is_some());
+        assert!(
+            rpr.children_named("w:i").next().is_none(),
+            "italic didn't change, so it's not re-emitted"
+        );
+    }
+
+    #[test]
+    fn text_style_underline_with_a_real_color_emits_both_attributes() {
+        let mut style = plain_text_style();
+        style.underline = "single FF0000".to_string();
+        let normal = plain_text_style();
+        let mut rpr = Element::new("w:rPr");
+        style.serialize_properties(&mut rpr, false, &normal);
+        let u = rpr.children_named("w:u").next().unwrap();
+        assert_eq!(u.get("w:val"), Some("single"));
+        assert_eq!(u.get("w:color"), Some("FF0000"));
+    }
+
+    #[test]
+    fn text_style_underline_auto_color_omits_the_color_attribute() {
+        let mut style = plain_text_style();
+        style.underline = "single auto".to_string();
+        let normal = plain_text_style();
+        let mut rpr = Element::new("w:rPr");
+        style.serialize_properties(&mut rpr, false, &normal);
+        let u = rpr.children_named("w:u").next().unwrap();
+        assert_eq!(u.get("w:color"), None);
+    }
+
+    #[test]
+    fn text_style_vertical_align_keyword_uses_vert_align_element() {
+        let mut style = plain_text_style();
+        style.vertical_align = "superscript".to_string();
+        let normal = plain_text_style();
+        let mut rpr = Element::new("w:rPr");
+        style.serialize_properties(&mut rpr, false, &normal);
+        let va = rpr.children_named("w:vertAlign").next().unwrap();
+        assert_eq!(va.get("w:val"), Some("superscript"));
+    }
+
+    #[test]
+    fn text_style_vertical_align_raw_offset_uses_position_element() {
+        let mut style = plain_text_style();
+        style.vertical_align = "6".to_string();
+        let normal = plain_text_style();
+        let mut rpr = Element::new("w:rPr");
+        style.serialize_properties(&mut rpr, false, &normal);
+        assert!(rpr.children_named("w:vertAlign").next().is_none());
+        let pos = rpr.children_named("w:position").next().unwrap();
+        assert_eq!(pos.get("w:val"), Some("6"));
+    }
+
+    #[test]
+    fn text_style_serialize_wraps_style_id_name_and_based_on() {
+        let normal = plain_text_style();
+        let mut other = normal.clone();
+        other.bold = true;
+        let el = other.serialize("Text1", "1 Text", false, &normal, "Normal");
+        assert_eq!(el.name, "w:style");
+        assert_eq!(el.get("w:styleId"), Some("Text1"));
+        assert_eq!(el.get("w:type"), Some("character"));
+        let name_el = el.children_named("w:name").next().unwrap();
+        assert_eq!(name_el.get("w:val"), Some("1 Text"));
+        let based_on = el.children_named("w:basedOn").next().unwrap();
+        assert_eq!(based_on.get("w:val"), Some("Normal"));
+    }
+
+    #[test]
+    fn text_style_serialize_normal_style_has_no_based_on() {
+        let normal = plain_text_style();
+        let el = normal.serialize("Normal", "Normal", true, &normal, "Normal");
+        assert!(el.children_named("w:basedOn").next().is_none());
     }
 
     #[test]
