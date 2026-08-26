@@ -382,6 +382,376 @@ pub fn is_dropcaps(dom: &Dom, html_tag: NodeId, tag_style: &Style) -> bool {
     child_count < 2 && text_len < 5 && tag_style.get("float") == "left"
 }
 
+/// One box edge's padding/margin/border, in the DOCX-ready units each
+/// field is actually serialized in -- padding in points, margin in
+/// twips (twentieths of a point), border width in eighths of a point,
+/// `LINE_STYLES`' `w:val` keyword, and a `RRGGBB`/`auto` colour.
+/// Shared shape [`BlockStyle`]/`FloatSpec`/(not yet ported)
+/// `tables.py`'s cell/row/table styles all read from
+/// [`read_css_block_borders`], mirroring how Python's version writes
+/// onto whatever `self` its caller passes via `setattr`.
+///
+/// `border_*_color` is `None` only in the `css: None` branch of
+/// [`read_css_block_borders`] (Python literally stores `None` there,
+/// distinct from the real `'auto'` string every other branch produces
+/// via `convert_color(...) or 'auto'`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct BlockBorders {
+    pub padding_left: i64,
+    pub padding_top: i64,
+    pub padding_right: i64,
+    pub padding_bottom: i64,
+    pub margin_left: i64,
+    pub margin_top: i64,
+    pub margin_right: i64,
+    pub margin_bottom: i64,
+    /// The raw, undeclared-inheritance `margin-{edge}` CSS text (`""`
+    /// when unset) -- port of `css._style.get('margin-' + edge, '')`,
+    /// needed later (not yet ported) to detect an `em`/`ex` margin and
+    /// serialize `w:beforeLines`/`w:leftChars` instead of an absolute
+    /// twips value.
+    pub css_margin_left: String,
+    pub css_margin_top: String,
+    pub css_margin_right: String,
+    pub css_margin_bottom: String,
+    pub border_left_width: i64,
+    pub border_top_width: i64,
+    pub border_right_width: i64,
+    pub border_bottom_width: i64,
+    pub border_left_style: String,
+    pub border_top_style: String,
+    pub border_right_style: String,
+    pub border_bottom_style: String,
+    pub border_left_color: Option<String>,
+    pub border_top_color: Option<String>,
+    pub border_right_color: Option<String>,
+    pub border_bottom_color: Option<String>,
+}
+
+/// The lowercased raw `border-{edge}-style` CSS keyword, per edge --
+/// `read_css_block_borders`'s `store_css_style=True` output, needed
+/// only by `tables.py` (not yet ported) to tell "explicitly `none`"
+/// apart from "never declared" when deciding whether a table's own
+/// border settings should show through a cell.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct BlockBorderCssStyles {
+    pub border_left_css_style: String,
+    pub border_top_css_style: String,
+    pub border_right_css_style: String,
+    pub border_bottom_css_style: String,
+}
+
+fn margin_for(css: &Style, edge: &str) -> f64 {
+    match edge {
+        "left" => css.margin_left(),
+        "top" => css.margin_top(),
+        "right" => css.margin_right(),
+        "bottom" => css.margin_bottom(),
+        _ => 0.0,
+    }
+}
+
+/// Reads one edge's padding/margin/border into `borders`/`css_styles`
+/// -- port of `read_css_block_borders`. `css: None` matches Python's
+/// own `css is None` branch (a block with no resolved style at all);
+/// `store_css_style` matches Python's own parameter (only `tables.py`,
+/// not yet ported, passes `true`).
+pub fn read_css_block_borders(
+    css: Option<&Style>,
+    store_css_style: bool,
+) -> (BlockBorders, Option<BlockBorderCssStyles>) {
+    let Some(css) = css else {
+        let borders = BlockBorders {
+            border_left_width: 2,
+            border_top_width: 2,
+            border_right_width: 2,
+            border_bottom_width: 2,
+            border_left_style: "none".to_string(),
+            border_top_style: "none".to_string(),
+            border_right_style: "none".to_string(),
+            border_bottom_style: "none".to_string(),
+            ..Default::default()
+        };
+        let css_styles = store_css_style.then(|| BlockBorderCssStyles {
+            border_left_css_style: "none".to_string(),
+            border_top_css_style: "none".to_string(),
+            border_right_css_style: "none".to_string(),
+            border_bottom_css_style: "none".to_string(),
+        });
+        return (borders, css_styles);
+    };
+
+    let mut borders = BlockBorders::default();
+    let mut css_styles = store_css_style.then(BlockBorderCssStyles::default);
+
+    for edge in BORDER_EDGES {
+        let padding = padding_for(css, edge).max(0.0) as i64;
+        let margin = (margin_for(css, edge) * 20.0).max(0.0) as i64;
+        let css_margin = css.own(&format!("margin-{edge}")).unwrap_or_default();
+        let raw_w = border_width_value(css, edge);
+        let width = ((raw_w * 8.0) as i64).clamp(2, 96);
+        let color = convert_color(Some(&css.get(&format!("border-{edge}-color"))))
+            .unwrap_or_else(|| "auto".to_string());
+        let style_kw = css
+            .get(&format!("border-{edge}-style"))
+            .to_ascii_lowercase();
+        let style = line_style(&style_kw).to_string();
+
+        match edge {
+            "left" => {
+                borders.padding_left = padding;
+                borders.margin_left = margin;
+                borders.css_margin_left = css_margin;
+                borders.border_left_width = width;
+                borders.border_left_color = Some(color);
+                borders.border_left_style = style;
+                if let Some(s) = &mut css_styles {
+                    s.border_left_css_style = style_kw;
+                }
+            }
+            "top" => {
+                borders.padding_top = padding;
+                borders.margin_top = margin;
+                borders.css_margin_top = css_margin;
+                borders.border_top_width = width;
+                borders.border_top_color = Some(color);
+                borders.border_top_style = style;
+                if let Some(s) = &mut css_styles {
+                    s.border_top_css_style = style_kw;
+                }
+            }
+            "right" => {
+                borders.padding_right = padding;
+                borders.margin_right = margin;
+                borders.css_margin_right = css_margin;
+                borders.border_right_width = width;
+                borders.border_right_color = Some(color);
+                borders.border_right_style = style;
+                if let Some(s) = &mut css_styles {
+                    s.border_right_css_style = style_kw;
+                }
+            }
+            "bottom" => {
+                borders.padding_bottom = padding;
+                borders.margin_bottom = margin;
+                borders.css_margin_bottom = css_margin;
+                borders.border_bottom_width = width;
+                borders.border_bottom_color = Some(color);
+                borders.border_bottom_style = style;
+                if let Some(s) = &mut css_styles {
+                    s.border_bottom_css_style = style_kw;
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    (borders, css_styles)
+}
+
+/// The paragraph-level CSS -> `w:pPr` property set -- port of
+/// `BlockStyle`'s `ALL_PROPS` fields (everything `__init__` computes
+/// from `css`, plus [`BlockBorders`] via [`read_css_block_borders`]).
+/// Not yet ported: `BlockStyle.serialize`/`serialize_properties`
+/// (real `w:pPr` XML) and `DOCXStyle`'s hash/dedup bookkeeping fields
+/// (`id`/`name`/`next_style`) -- same scope split as [`TextStyle`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BlockStyle {
+    pub borders: BlockBorders,
+    /// Twentieths of a point.
+    pub text_indent: i64,
+    /// The raw `text-indent` CSS text, needed later (not yet ported)
+    /// for the same `em`/`ex` special-casing `css_margin_*` is for.
+    pub css_text_indent: Option<String>,
+    /// Twentieths of a point.
+    pub line_height: i64,
+    pub background_color: Option<String>,
+    pub text_align: String,
+}
+
+impl BlockStyle {
+    /// Port of `BlockStyle.__init__`. `is_table_cell` zeroes every
+    /// border/padding/margin (DOCX cell borders/spacing come from the
+    /// table's own row/cell styles, not #ported yet, never the
+    /// paragraph inside a cell) and skips `background_color`
+    /// (inherited from the cell instead, via `parent_bg`).
+    ///
+    /// A few of Python's `try/except (TypeError, ValueError)` guards
+    /// around `css.lineHeight`/`css['white-space']`/`css['text-align']`
+    /// are not reproduced: they exist because Python's `Style`
+    /// properties can raise for values `_unit_convert`/`_get` can't
+    /// coerce, but every equivalent [`Style`] accessor here already
+    /// returns a plain `f64`/`String` with its own internal fallback
+    /// (`unwrap_or(0.0)`/an empty string), so the exception path is
+    /// unreachable in this port -- there's no distinguishable failure
+    /// state left to catch.
+    pub fn from_css(css: Option<&Style>, is_table_cell: bool, parent_bg: Option<&str>) -> Self {
+        let (mut borders, _) = read_css_block_borders(css, false);
+        if is_table_cell {
+            for edge in BORDER_EDGES {
+                match edge {
+                    "left" => {
+                        borders.border_left_style = "none".to_string();
+                        borders.border_left_width = 0;
+                        borders.padding_left = 0;
+                        borders.margin_left = 0;
+                    }
+                    "top" => {
+                        borders.border_top_style = "none".to_string();
+                        borders.border_top_width = 0;
+                        borders.padding_top = 0;
+                        borders.margin_top = 0;
+                    }
+                    "right" => {
+                        borders.border_right_style = "none".to_string();
+                        borders.border_right_width = 0;
+                        borders.padding_right = 0;
+                        borders.margin_right = 0;
+                    }
+                    "bottom" => {
+                        borders.border_bottom_style = "none".to_string();
+                        borders.border_bottom_width = 0;
+                        borders.padding_bottom = 0;
+                        borders.margin_bottom = 0;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+
+        let Some(css) = css else {
+            return BlockStyle {
+                borders,
+                text_indent: 0,
+                css_text_indent: None,
+                line_height: 280,
+                background_color: None,
+                text_align: "left".to_string(),
+            };
+        };
+
+        let (text_indent, css_text_indent) = match css.item("text-indent") {
+            ItemValue::Number(n) => ((n * 20.0) as i64, Some(css.get("text-indent"))),
+            ItemValue::Text(_) => (0, None),
+        };
+
+        let line_height = ((css.line_height() * 20.0).max(0.0)) as i64;
+
+        let background_color = if is_table_cell {
+            None
+        } else {
+            convert_color(css.background_color().as_deref())
+                .or_else(|| parent_bg.map(str::to_string))
+        };
+
+        let white_space = css.get("white-space").to_ascii_lowercase();
+        let preserve_whitespace = matches!(white_space.as_str(), "pre" | "pre-wrap");
+
+        let mut text_align = css.get("text-align").to_ascii_lowercase();
+        if preserve_whitespace {
+            text_align = "start".to_string();
+        }
+        let text_align = match text_align.as_str() {
+            "start" | "left" => "left",
+            "end" | "right" => "right",
+            "center" | "centre" => "center",
+            "justify" => "both",
+            _ => "left",
+        }
+        .to_string();
+
+        BlockStyle {
+            borders,
+            text_indent,
+            css_text_indent,
+            line_height,
+            background_color,
+            text_align,
+        }
+    }
+}
+
+/// A floated (`float: left`/`right`) block's frame geometry -- port
+/// of `FloatSpec`. `blocks` (the paragraphs the frame wraps, appended
+/// externally as `Block`s are built) and `serialize` (real
+/// `w:framePr` XML) aren't ported yet -- both need `from_html.py`'s
+/// not-yet-ported `Block` type/`docx/writer/xml.rs`'s element builder.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FloatSpec {
+    pub is_dropcaps: bool,
+    pub dropcaps_lines: Option<i64>,
+    pub x_align: Option<String>,
+    /// Twentieths of a point.
+    pub w: Option<i64>,
+    /// Twentieths of a point.
+    pub h: Option<i64>,
+    pub h_rule: Option<String>,
+    /// Twentieths of a point.
+    pub h_space: Option<i64>,
+    /// Twentieths of a point.
+    pub v_space: Option<i64>,
+    pub borders: BlockBorders,
+}
+
+impl FloatSpec {
+    /// Port of `FloatSpec.__init__`.
+    pub fn from_css(dom: &Dom, html_tag: NodeId, tag_style: &Style) -> Self {
+        let is_dropcaps = is_dropcaps(dom, html_tag, tag_style);
+
+        let (dropcaps_lines, x_align, w, h, h_rule, h_space, v_space) = if is_dropcaps {
+            (Some(3), None, None, None, None, None, None)
+        } else {
+            let x_align = Some(tag_style.get("float"));
+
+            let w = if tag_style.get("width") != "auto" {
+                let min_width = match tag_style.item("min-width") {
+                    ItemValue::Number(n) => n,
+                    ItemValue::Text(_) => 0.0,
+                };
+                Some((20.0 * min_width.max(tag_style.width())) as i64)
+            } else {
+                None
+            };
+
+            let (h_rule, h) = if tag_style.get("height") == "auto" {
+                ("auto".to_string(), None)
+            } else {
+                let min_height = match tag_style.item("min-height") {
+                    ItemValue::Number(n) => n,
+                    ItemValue::Text(_) => 0.0,
+                };
+                let (rule, raw_h) = if min_height > 0.0 {
+                    ("atLeast", min_height)
+                } else {
+                    ("exact", tag_style.height())
+                };
+                (rule.to_string(), Some((20.0 * raw_h) as i64))
+            };
+
+            let h_space =
+                Some((20.0 * tag_style.margin_right().max(tag_style.margin_left())) as i64);
+            let v_space =
+                Some((20.0 * tag_style.margin_top().max(tag_style.margin_bottom())) as i64);
+
+            (None, x_align, w, h, Some(h_rule), h_space, v_space)
+        };
+
+        let (borders, _) = read_css_block_borders(Some(tag_style), false);
+
+        FloatSpec {
+            is_dropcaps,
+            dropcaps_lines,
+            x_align,
+            w,
+            h,
+            h_rule,
+            h_space,
+            v_space,
+            borders,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -603,5 +973,157 @@ mod tests {
         let profile = Profile::default();
         let style = Style::new(&dom, &resolved, &profile, span);
         assert!(!is_dropcaps(&dom, span, &style));
+    }
+
+    #[test]
+    fn read_css_block_borders_with_no_css_uses_the_two_point_none_defaults() {
+        let (borders, css_styles) = read_css_block_borders(None, false);
+        assert_eq!(borders.border_left_width, 2);
+        assert_eq!(borders.border_left_style, "none");
+        assert_eq!(borders.border_left_color, None);
+        assert_eq!(borders.padding_left, 0);
+        assert!(css_styles.is_none());
+    }
+
+    #[test]
+    fn read_css_block_borders_reads_every_edge_from_real_css() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[(
+            p,
+            &[
+                ("border-left-style", "solid"),
+                ("border-left-color", "#00ff00"),
+                ("padding-left", "5pt"),
+                ("margin-left", "10pt"),
+            ],
+        )]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, p);
+        let (borders, _) = read_css_block_borders(Some(&style), false);
+        assert_eq!(borders.border_left_style, "single");
+        assert_eq!(borders.border_left_color.as_deref(), Some("00FF00"));
+        assert_eq!(borders.padding_left, 5);
+        assert_eq!(borders.margin_left, 200, "10pt in twentieths of a point");
+    }
+
+    #[test]
+    fn read_css_block_borders_store_css_style_captures_the_lowercased_keyword() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[(p, &[("border-top-style", "DASHED")])]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, p);
+        let (_, css_styles) = read_css_block_borders(Some(&style), true);
+        assert_eq!(css_styles.unwrap().border_top_css_style, "dashed");
+    }
+
+    #[test]
+    fn block_style_with_no_css_uses_the_hardcoded_defaults() {
+        let bs = BlockStyle::from_css(None, false, None);
+        assert_eq!(bs.text_indent, 0);
+        assert_eq!(bs.line_height, 280);
+        assert_eq!(bs.background_color, None);
+        assert_eq!(bs.text_align, "left");
+    }
+
+    #[test]
+    fn block_style_table_cell_zeroes_borders_and_background() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[(
+            p,
+            &[
+                ("border-left-style", "solid"),
+                ("background-color", "#ff0000"),
+            ],
+        )]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, p);
+        let bs = BlockStyle::from_css(Some(&style), true, None);
+        assert_eq!(bs.borders.border_left_style, "none");
+        assert_eq!(bs.background_color, None);
+    }
+
+    #[test]
+    fn block_style_background_falls_back_to_the_parent_when_unset() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, p);
+        let bs = BlockStyle::from_css(Some(&style), false, Some("112233"));
+        assert_eq!(bs.background_color.as_deref(), Some("112233"));
+    }
+
+    #[test]
+    fn block_style_text_align_maps_start_and_end_to_left_and_right() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[(p, &[("text-align", "end")])]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, p);
+        assert_eq!(
+            BlockStyle::from_css(Some(&style), false, None).text_align,
+            "right"
+        );
+    }
+
+    #[test]
+    fn block_style_preserved_whitespace_forces_start_alignment() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[(p, &[("white-space", "pre"), ("text-align", "center")])]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, p);
+        // preserve_whitespace forces `aval = 'start'`, which maps to left.
+        assert_eq!(
+            BlockStyle::from_css(Some(&style), false, None).text_align,
+            "left"
+        );
+    }
+
+    #[test]
+    fn float_spec_reads_dropcaps() {
+        let dom = make(r#"<html><body><span style="float:left">A</span></body></html>"#);
+        let span = find(&dom, "span");
+        let resolved = resolved_with(&[(span, &[("float", "left")])]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, span);
+        let fs = FloatSpec::from_css(&dom, span, &style);
+        assert!(fs.is_dropcaps);
+        assert_eq!(fs.dropcaps_lines, Some(3));
+    }
+
+    #[test]
+    fn float_spec_reads_a_real_float_geometry() {
+        let dom =
+            make(r#"<html><body><div style="float:left">Hello there, world!</div></body></html>"#);
+        let div = find(&dom, "div");
+        let resolved = resolved_with(&[(
+            div,
+            &[("float", "left"), ("width", "100pt"), ("height", "50pt")],
+        )]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, div);
+        let fs = FloatSpec::from_css(&dom, div, &style);
+        assert!(!fs.is_dropcaps);
+        assert_eq!(fs.x_align.as_deref(), Some("left"));
+        assert_eq!(fs.w, Some(2000), "100pt * 20");
+        assert_eq!(fs.h, Some(1000), "50pt * 20");
+        assert_eq!(fs.h_rule.as_deref(), Some("exact"));
+    }
+
+    #[test]
+    fn float_spec_auto_height_sets_h_rule_auto_with_no_height() {
+        let dom =
+            make(r#"<html><body><div style="float:left">Hello there, world!</div></body></html>"#);
+        let div = find(&dom, "div");
+        let resolved = resolved_with(&[(div, &[("float", "left"), ("height", "auto")])]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, div);
+        let fs = FloatSpec::from_css(&dom, div, &style);
+        assert_eq!(fs.h_rule.as_deref(), Some("auto"));
+        assert_eq!(fs.h, None);
     }
 }
