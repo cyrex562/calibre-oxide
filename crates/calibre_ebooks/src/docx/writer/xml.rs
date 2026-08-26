@@ -97,6 +97,36 @@ impl Element {
         }
     }
 
+    /// Insert a child element at `index`, shifting later children
+    /// back. Port of lxml's `element.insert(index, child)`, used by
+    /// `docx/writer/links.py` and `images.py` to prepend paragraphs
+    /// (`body.insert(0, p)`) into an already-built `<w:body>`.
+    pub fn insert(&mut self, index: usize, child: Element) {
+        self.children.insert(index, Child::Element(child));
+    }
+
+    /// The first descendant element (not including `self`) named
+    /// `name`, in document order, or `None` if there isn't one. Port
+    /// of the narrow use lxml's `element.xpath('//*[local-name()="..."]')`
+    /// gets put to in `docx/writer/links.py`/`images.py`: since `//`
+    /// searches from the document root regardless of context node,
+    /// but this writer never has more than one such element outside
+    /// of `<w:body>`'s own subtree, searching just `self`'s
+    /// descendants gives the same match.
+    pub fn find_descendant_mut(&mut self, name: &str) -> Option<&mut Element> {
+        for child in &mut self.children {
+            if let Child::Element(e) = child {
+                if e.name == name {
+                    return Some(e);
+                }
+                if let Some(found) = e.find_descendant_mut(name) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
     /// Whether the element has any children at all.
     pub fn is_empty(&self) -> bool {
         self.children.is_empty()
@@ -249,6 +279,46 @@ mod tests {
         assert_eq!(body.child_count(), 2);
         assert_eq!(body.children_named("w:p").count(), 1);
         assert!(!body.is_empty());
+    }
+
+    #[test]
+    fn insert_prepends_and_shifts_later_children_back() {
+        let mut body = Element::new("w:body");
+        body.append(Element::new("w:sectPr"));
+        body.insert(0, Element::new("w:p").attr("w:id", "2"));
+        body.insert(0, Element::new("w:p").attr("w:id", "1"));
+        assert_eq!(
+            body.to_xml_fragment(),
+            r#"<w:body><w:p w:id="1"/><w:p w:id="2"/><w:sectPr/></w:body>"#
+        );
+    }
+
+    #[test]
+    fn find_descendant_mut_finds_the_first_match_in_document_order() {
+        let mut body = Element::new("w:body");
+        let p = body.append(Element::new("w:p"));
+        p.append(Element::new("w:pPr"))
+            .append(Element::new("w:pageBreakBefore").attr("w:val", "off"));
+        body.append(
+            Element::new("w:p").with(Element::new("w:pageBreakBefore").attr("w:val", "off")),
+        );
+        let found = body
+            .find_descendant_mut("w:pageBreakBefore")
+            .expect("first pageBreakBefore");
+        found.set("w:val", "on");
+        assert_eq!(body.children_named("w:p").count(), 2);
+        let xml = body.to_xml_fragment();
+        assert_eq!(
+            xml.matches(r#"w:val="on""#).count(),
+            1,
+            "only the first match should have been mutated: {xml}"
+        );
+    }
+
+    #[test]
+    fn find_descendant_mut_returns_none_when_absent() {
+        let mut body = Element::new("w:body").with(Element::new("w:p"));
+        assert!(body.find_descendant_mut("w:sectPr").is_none());
     }
 
     #[test]

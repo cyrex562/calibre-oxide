@@ -11,7 +11,7 @@
 //! | `fonts.py` | [`fonts`] |
 //! | — (`lxml.builder`) | [`xml`] |
 //! | `styles.py` (partial) | [`styles`] |
-//! | `links.py` (partial) | [`links`] |
+//! | `links.py` | [`links`] |
 //! | `from_html.py` (partial) | [`from_html`] |
 //! | `lists.py` | [`lists`] |
 //! | `images.py` (partial) | [`images`] |
@@ -24,14 +24,15 @@
 //! self-contained utility layer is ported so far), `from_html.py`'s
 //! `Convert.__call__`/`.write` and `Blocks`'
 //! `Table`-related methods/`.serialize` (see [`from_html`]'s module
-//! docs -- `Convert`'s core element walker itself is ported), plus
+//! docs -- `Convert`'s core element walker itself is ported), and
 //! `styles.py`'s `CombinedStyle`/
-//! `StylesManager.finalize`/`.serialize` and `links.py`'s
-//! TOC-serialization half (`LinksManager.process_toc_node`/
-//! `.process_toc_links`/`.serialize_toc` -- see [`links`]'s module
-//! docs) -- all of which need those still-unported `from_html.py`
-//! types. These walk a resolved-CSS HTML tree -- #132's own "needs a
-//! real OEB stylizer" framing was stale by the time it was filed:
+//! `StylesManager.finalize`/`.serialize` -- all of which need those
+//! still-unported `from_html.py` types. `links.py`'s `LinksManager`
+//! is now fully ported, including its TOC-serialization half, which
+//! is what gave [`xml::Element`] its `insert`/`find_descendant_mut`
+//! methods. These walk a resolved-CSS HTML tree
+//! -- #132's own "needs a real OEB stylizer" framing was stale by the
+//! time it was filed:
 //! [`crate::oeb::polish::cascade`] already had a real CSS cascade (a
 //! different consumer, issue #164), and
 //! [`crate::oeb::polish::style`] is the accessor seam these files

@@ -1,18 +1,18 @@
 //! Bookmarks and hyperlinks: port of `docx/writer/links.py`'s
 //! `start_text`, `sanitize_bookmark_name`, [`TocItem`] (Python
-//! `TOCItem`), and the bookmark/hyperlink half of [`LinksManager`]
-//! (`__init__`, `bookmark_for_anchor`, `bookmark_id`,
-//! `serialize_hyperlink`).
+//! `TOCItem`), and all of [`LinksManager`] (`__init__`,
+//! `bookmark_for_anchor`, `bookmark_id`, `serialize_hyperlink`,
+//! `process_toc_node`, `process_toc_links`, `serialize_toc`) --
+//! `LinksManager` is now fully ported.
 //!
-//! **Not yet ported**: `LinksManager.process_toc_node`/
-//! `.process_toc_links`/`.serialize_toc`. All three walk
-//! [`crate::oeb::toc::TOC`]/`TOCNode` and, for `serialize_toc`,
-//! prepend paragraphs into an already-serialized `<w:body>` (Python's
-//! `body.insert(0, p)`, a capability [`super::xml::Element`] doesn't
-//! have yet -- it only ever appends). Their only caller,
-//! `Convert.write`, isn't ported either (`from_html.py`'s `Convert`
-//! orchestrator, issue #132) -- there is no real caller to build
-//! against yet, so this was left for whichever PR ports `Convert`.
+//! `serialize_toc` needed `<w:body>` to support prepending a child
+//! (Python's `body.insert(0, p)`); [`super::xml::Element`] gained
+//! `insert`/`find_descendant_mut` for this.
+//!
+//! **Not yet wired up**: `LinksManager`'s only caller,
+//! `Convert.write` (`from_html.py`'s `Convert` orchestrator, issue
+//! #132), isn't ported yet -- there is no real call site to exercise
+//! this against beyond the tests here.
 //!
 //! Python's `urlparse` is not ported in general; [`parse_link_url`]
 //! is a narrow stand-in covering exactly what `serialize_hyperlink`
@@ -26,6 +26,7 @@ use crate::docx::names::DocxNamespace;
 use crate::docx::writer::container::DocumentRelationships;
 use crate::dom::{Dom, NodeId, NodeKind};
 use crate::oeb::polish::check::parsing::urlquote;
+use crate::oeb::toc::{TOCNode, TOC};
 use crate::oeb::transforms::filenames::abshref;
 
 use super::xml::Element;
@@ -165,8 +166,7 @@ impl TocItem {
     /// Port of `TOCItem.serialize`. Python appends the returned `<w:p>`
     /// at position 0 of `<w:body>`; that insertion (and the resulting
     /// document-order-via-repeated-prepend it relies on) is
-    /// `LinksManager.serialize_toc`'s job, not ported yet -- see the
-    /// module docs.
+    /// [`LinksManager::serialize_toc`]'s job, not this method's.
     pub fn serialize(&self) -> Element {
         let mut ppr = Element::new("w:pPr")
             .with(Element::new("w:pStyle").attr("w:val", "Normal"))
@@ -254,6 +254,7 @@ pub struct LinksManager {
     bmark_id: u64,
     document_hrefs: HashSet<String>,
     external_links: HashMap<String, String>,
+    toc: Vec<TocItem>,
 }
 
 impl LinksManager {
@@ -270,6 +271,7 @@ impl LinksManager {
             bmark_id: 0,
             document_hrefs: HashSet::new(),
             external_links: HashMap::new(),
+            toc: Vec::new(),
         }
     }
 
@@ -387,6 +389,91 @@ impl LinksManager {
             return make_hyperlink(parent, HyperlinkTarget::RelId(&rel_id), tooltip);
         }
         parent
+    }
+
+    /// Port of `LinksManager.process_toc_node`. `toc`'s href is
+    /// looked up verbatim (no `abshref`) -- matching Python, since OEB
+    /// TOC entries already carry canonical, item-absolute hrefs, unlike
+    /// the raw in-document hrefs [`Self::serialize_hyperlink`] has to
+    /// resolve.
+    pub fn process_toc_node(&mut self, toc: &TOCNode, level: u32) {
+        if let Some(href) = &toc.href {
+            let (_, path, fragment) = parse_link_url(href);
+            if self.document_hrefs.contains(&path) {
+                let frag_key = if fragment.is_empty() {
+                    self.top_anchor.clone()
+                } else {
+                    fragment
+                };
+                let key = (path.clone(), frag_key);
+                let bmark = self.anchor_map.get(&key).cloned().unwrap_or_else(|| {
+                    self.anchor_map
+                        .get(&(path.clone(), self.top_anchor.clone()))
+                        .cloned()
+                        .expect(
+                            "a document href only ever enters document_hrefs after \
+                             bookmark_for_anchor(top_anchor, ...) already recorded its \
+                             (href, top_anchor) anchor_map entry",
+                        )
+                });
+                self.toc.push(TocItem::new(
+                    toc.title.clone().unwrap_or_default(),
+                    bmark,
+                    level,
+                ));
+            }
+        }
+        for child in &toc.children {
+            self.process_toc_node(child, level + 1);
+        }
+    }
+
+    /// Port of `LinksManager.process_toc_links`. Python's `oeb.toc and
+    /// oeb.toc.count() > 1` guard collapses to just the count check --
+    /// [`TOC`] always exists here, there's no `None` case to short
+    /// on.
+    pub fn process_toc_links(&mut self, toc: &TOC) {
+        self.toc.clear();
+        if toc.count() <= 1 {
+            return;
+        }
+        for child in &toc.root.children {
+            self.process_toc_node(child, 0);
+        }
+        if let Some(first) = self.toc.first_mut() {
+            first.is_first = true;
+        }
+        if let Some(last) = self.toc.last_mut() {
+            last.is_last = true;
+        }
+    }
+
+    /// Port of `LinksManager.serialize_toc`. Python finds the
+    /// `pageBreakBefore` element to flip on via
+    /// `body[0].xpath('//*[local-name()="pageBreakBefore"]')[0]` --
+    /// an *absolute* xpath (`//` searches from the document root, not
+    /// from `body[0]`), but since nothing outside `body`'s own subtree
+    /// carries that tag in this writer, searching `body`'s descendants
+    /// finds the same element. `__('Table of Contents')` is ported as
+    /// the literal English string, matching this crate's established
+    /// stand-in for calibre's gettext calls (see
+    /// `crate::pdf::render::links`).
+    pub fn serialize_toc(&mut self, body: &mut Element, primary_heading_style: Option<&str>) {
+        if let Some(pbb) = body.find_descendant_mut("w:pageBreakBefore") {
+            pbb.set("w:val", "on");
+        }
+        for item in self.toc.iter().rev() {
+            body.insert(0, item.serialize());
+        }
+        let mut ppr = Element::new("w:pPr");
+        if let Some(style_id) = primary_heading_style {
+            ppr.append(Element::new("w:pStyle").attr("w:val", style_id));
+        }
+        ppr.append(Element::new("w:pageBreakBefore").attr("w:val", "off"));
+        let mut p = Element::new("w:p");
+        p.append(ppr);
+        p.append(Element::new("w:r").with(Element::new("w:t").with_text("Table of Contents")));
+        body.insert(0, p);
     }
 }
 
@@ -701,5 +788,153 @@ mod tests {
         let mut p = Element::new("w:p");
         let out = mgr.serialize_hyperlink(&mut p, &names, "chap1.html", "mailto:a@b.com", None);
         assert_eq!(out.child_count(), 0);
+    }
+
+    #[test]
+    fn process_toc_node_registers_a_toc_item_for_a_known_document_href() {
+        let dom = make("<html><body><h1>x</h1></body></html>");
+        let h1 = find(&dom, "h1");
+        let mut mgr = LinksManager::new(relationships());
+        let top = mgr.top_anchor().to_string();
+        mgr.bookmark_for_anchor(&top, "chap1.html", &dom, h1);
+        let node = TOCNode::new(
+            Some("Chapter 1".to_string()),
+            Some("chap1.html".to_string()),
+        );
+        mgr.process_toc_node(&node, 0);
+        assert_eq!(mgr.toc.len(), 1);
+        assert_eq!(mgr.toc[0].title, "Chapter 1");
+        assert_eq!(mgr.toc[0].level, 0);
+        assert_eq!(mgr.toc[0].bmark, "Top_of_chap1_html");
+    }
+
+    #[test]
+    fn process_toc_node_skips_hrefs_outside_the_document() {
+        let mut mgr = LinksManager::new(relationships());
+        let node = TOCNode::new(Some("Nope".to_string()), Some("unknown.html".to_string()));
+        mgr.process_toc_node(&node, 0);
+        assert!(mgr.toc.is_empty());
+    }
+
+    #[test]
+    fn process_toc_node_recurses_into_children_with_increasing_level() {
+        let dom = make("<html><body><h1>x</h1></body></html>");
+        let h1 = find(&dom, "h1");
+        let mut mgr = LinksManager::new(relationships());
+        let top = mgr.top_anchor().to_string();
+        mgr.bookmark_for_anchor(&top, "chap1.html", &dom, h1);
+        let mut root = TOCNode::new(Some("Root".to_string()), Some("chap1.html".to_string()));
+        root.add(TOCNode::new(
+            Some("Child".to_string()),
+            Some("chap1.html".to_string()),
+        ));
+        mgr.process_toc_node(&root, 0);
+        assert_eq!(mgr.toc.len(), 2);
+        assert_eq!(mgr.toc[0].level, 0);
+        assert_eq!(mgr.toc[1].level, 1);
+    }
+
+    #[test]
+    fn process_toc_links_returns_early_when_the_toc_has_one_or_fewer_entries() {
+        let mut mgr = LinksManager::new(relationships());
+        let mut toc = TOC::new();
+        toc.root.add(TOCNode::new(
+            Some("Only".to_string()),
+            Some("chap1.html".to_string()),
+        ));
+        mgr.process_toc_links(&toc);
+        assert!(mgr.toc.is_empty());
+    }
+
+    #[test]
+    fn process_toc_links_marks_first_and_last_entries() {
+        let dom = make("<html><body><h1>x</h1></body></html>");
+        let h1 = find(&dom, "h1");
+        let mut mgr = LinksManager::new(relationships());
+        let top = mgr.top_anchor().to_string();
+        mgr.bookmark_for_anchor(&top, "chap1.html", &dom, h1);
+        mgr.bookmark_for_anchor(&top, "chap2.html", &dom, h1);
+        mgr.bookmark_for_anchor(&top, "chap3.html", &dom, h1);
+        let mut toc = TOC::new();
+        toc.root.add(TOCNode::new(
+            Some("One".to_string()),
+            Some("chap1.html".to_string()),
+        ));
+        toc.root.add(TOCNode::new(
+            Some("Two".to_string()),
+            Some("chap2.html".to_string()),
+        ));
+        toc.root.add(TOCNode::new(
+            Some("Three".to_string()),
+            Some("chap3.html".to_string()),
+        ));
+        mgr.process_toc_links(&toc);
+        assert_eq!(mgr.toc.len(), 3);
+        assert!(mgr.toc[0].is_first);
+        assert!(!mgr.toc[1].is_first && !mgr.toc[1].is_last);
+        assert!(mgr.toc[2].is_last);
+    }
+
+    #[test]
+    fn serialize_toc_prepends_title_then_items_and_flips_the_first_pagebreak() {
+        let mut mgr = LinksManager::new(relationships());
+        mgr.toc = vec![TocItem::new("One", "b1", 0), TocItem::new("Two", "b2", 0)];
+        mgr.toc[0].is_first = true;
+        mgr.toc[1].is_last = true;
+        let mut body = Element::new("w:body").with(Element::new("w:p").with(
+            Element::new("w:pPr").with(Element::new("w:pageBreakBefore").attr("w:val", "off")),
+        ));
+        mgr.serialize_toc(&mut body, Some("Heading1"));
+
+        let ps: Vec<&Element> = body.children_named("w:p").collect();
+        assert_eq!(ps.len(), 4, "title + 2 toc items + the original paragraph");
+
+        let title_ppr = ps[0].children_named("w:pPr").next().unwrap();
+        assert_eq!(
+            title_ppr
+                .children_named("w:pStyle")
+                .next()
+                .unwrap()
+                .get("w:val"),
+            Some("Heading1")
+        );
+        let title_t = ps[0]
+            .children_named("w:r")
+            .next()
+            .unwrap()
+            .children_named("w:t")
+            .next()
+            .unwrap();
+        assert_eq!(
+            title_t.children.first(),
+            Some(&Child::Text("Table of Contents".to_string()))
+        );
+
+        let one_hyperlink = ps[1].children_named("w:hyperlink").next().unwrap();
+        assert_eq!(one_hyperlink.get("w:anchor"), Some("b1"));
+        let two_hyperlink = ps[2].children_named("w:hyperlink").next().unwrap();
+        assert_eq!(two_hyperlink.get("w:anchor"), Some("b2"));
+
+        let orig_pbb = ps[3]
+            .children_named("w:pPr")
+            .next()
+            .unwrap()
+            .children_named("w:pageBreakBefore")
+            .next()
+            .unwrap();
+        assert_eq!(orig_pbb.get("w:val"), Some("on"));
+    }
+
+    #[test]
+    fn serialize_toc_with_no_toc_items_still_prepends_the_title() {
+        let mut mgr = LinksManager::new(relationships());
+        let mut body = Element::new("w:body").with(Element::new("w:p").with(
+            Element::new("w:pPr").with(Element::new("w:pageBreakBefore").attr("w:val", "off")),
+        ));
+        mgr.serialize_toc(&mut body, None);
+        let ps: Vec<&Element> = body.children_named("w:p").collect();
+        assert_eq!(ps.len(), 2);
+        let title_ppr = ps[0].children_named("w:pPr").next().unwrap();
+        assert!(title_ppr.children_named("w:pStyle").next().is_none());
     }
 }
