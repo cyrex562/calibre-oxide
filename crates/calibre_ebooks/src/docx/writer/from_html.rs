@@ -55,8 +55,11 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::docx::names::{barename, DocxNamespace};
-use crate::dom::{Dom, NodeId};
-use crate::oeb::polish::style::Style;
+use crate::dom::{Dom, NodeId, NodeKind};
+use crate::oeb::polish::cascade::ResolvedStyles;
+use crate::oeb::polish::pretty::{dom_tail, leading_text};
+use crate::oeb::polish::style::{Profile, Style};
+use crate::oeb::polish::toc::lang_as_iso639_1;
 
 use indexmap::{IndexMap, IndexSet};
 
@@ -710,6 +713,12 @@ impl Blocks {
         &self.items
     }
 
+    /// Port of `html_tag in self.blocks.open_html_blocks` (used by
+    /// `Convert.process_tag`).
+    pub fn is_open(&self, html_tag: NodeId) -> bool {
+        self.open_html_blocks.contains(&html_tag)
+    }
+
     /// Port of `Blocks.current_or_new_block`.
     pub fn current_or_new_block(
         &mut self,
@@ -905,6 +914,427 @@ impl Blocks {
                 block.block_lang = None;
             }
         }
+    }
+}
+
+/// Port of `lang_for_tag`. `'{http://www.w3.org/XML/1998/namespace}lang'`
+/// (lxml's Clark-notation name for an XML-namespaced attribute) becomes
+/// the literal `"xml:lang"` -- `Dom` is an HTML5 (html5ever) tree, which
+/// has no XML-namespace resolution for attributes, so an `xml:lang`
+/// attribute is stored under its literal source name.
+pub fn lang_for_tag(dom: &Dom, node: NodeId) -> Option<String> {
+    for attr in ["lang", "xml:lang"] {
+        if let Some(raw) = dom.node(node).attrs.get(attr) {
+            if let Some(val) = lang_as_iso639_1(raw) {
+                return Some(val);
+            }
+        }
+    }
+    None
+}
+
+fn first_non_text_child(dom: &Dom, id: NodeId) -> Option<NodeId> {
+    dom.children(id)
+        .into_iter()
+        .find(|&c| !matches!(dom.node(c).kind, NodeKind::Text(_)))
+}
+
+fn element_or_comment_child_count(dom: &Dom, id: NodeId) -> usize {
+    dom.children(id)
+        .into_iter()
+        .filter(|&c| !matches!(dom.node(c).kind, NodeKind::Text(_)))
+        .count()
+}
+
+fn element_children(dom: &Dom, id: NodeId) -> Vec<NodeId> {
+    dom.children(id)
+        .into_iter()
+        .filter(|&c| dom.tag(c).is_some())
+        .collect()
+}
+
+/// Save/restore state Python threads through `Convert.process_tag`'s
+/// recursion as `self.current_link`/`self.current_lang`, saved to a
+/// local and restored after each recursive call returns.
+#[derive(Debug, Clone, Default)]
+pub struct ProcessState {
+    pub current_link: Option<LinkTarget>,
+    pub current_lang: Option<String>,
+}
+
+/// The managers/inputs `process_tag` and its helpers need on every
+/// call. Bundled into one struct (rather than a long parameter list)
+/// since every function here needs the same set; `&mut ProcessCtx` is
+/// reborrowed at each recursive/helper call site, same as passing
+/// `&mut self` would be if `Convert` (not ported) owned all of this
+/// directly.
+pub struct ProcessCtx<'a> {
+    pub dom: &'a Dom,
+    pub resolved: &'a ResolvedStyles,
+    pub profile: &'a Profile,
+    pub blocks: &'a mut Blocks,
+    pub styles_manager: &'a mut StylesManager,
+    pub links_manager: &'a mut LinksManager,
+    pub current_item_href: &'a str,
+}
+
+impl<'a> ProcessCtx<'a> {
+    fn style(&self, node: NodeId) -> Style<'a> {
+        Style::new(self.dom, self.resolved, self.profile, node)
+    }
+}
+
+/// Port of `Convert.create_block_from_parent`.
+fn create_block_from_parent(ctx: &mut ProcessCtx, html_tag: NodeId) -> BlockId {
+    let parent = ctx
+        .dom
+        .parent(html_tag)
+        .expect("create_block_from_parent is only ever called on a tag with a real parent");
+    let parent_style = ctx.style(parent);
+    let id = ctx
+        .blocks
+        .current_or_new_block(ctx.styles_manager, ctx.dom, parent, &parent_style);
+    ctx.blocks.block_mut(id).page_break_before = false;
+    id
+}
+
+/// Port of `Convert.add_block_tag`. The `tagname == 'img'` branch
+/// (needs `ImagesManager`, `images.py`, unported) is a documented
+/// `todo!()` -- see the module docs.
+#[allow(clippy::too_many_arguments)]
+fn add_block_tag(
+    ctx: &mut ProcessCtx,
+    state: &ProcessState,
+    tagname: &str,
+    html_tag: NodeId,
+    tag_style: &Style,
+    is_table_cell: bool,
+    float_spec: Option<FloatSpec>,
+    is_list_item: bool,
+) -> BlockId {
+    let id = ctx.blocks.start_new_block(
+        ctx.styles_manager,
+        ctx.dom,
+        html_tag,
+        tag_style,
+        is_table_cell,
+        float_spec,
+        is_list_item,
+    );
+    let attrs = &ctx.dom.node(html_tag).attrs;
+    let anchor = attrs.get("id").or_else(|| attrs.get("name")).cloned();
+    if let Some(anchor) = anchor {
+        let bmark = ctx.links_manager.bookmark_for_anchor(
+            &anchor,
+            ctx.current_item_href,
+            ctx.dom,
+            html_tag,
+        );
+        ctx.blocks.block_mut(id).bookmarks.insert(bmark);
+    }
+    if tagname == "img" {
+        todo!("add_block_tag: <img> needs ImagesManager (images.py), issue #132");
+    }
+
+    let mut text = leading_text(ctx.dom, html_tag);
+    let is_li_tag = tagname == "li";
+    let has_sublist = is_li_tag
+        && first_non_text_child(ctx.dom, html_tag)
+            .map(|c| {
+                matches!(ctx.dom.tag(c), Some("ul") | Some("ol"))
+                    && element_or_comment_child_count(ctx.dom, c) > 0
+            })
+            .unwrap_or(false);
+    if has_sublist {
+        if let Some(t) = &text {
+            if t.trim().is_empty() {
+                text = Some(String::new());
+            }
+        }
+    }
+    match text {
+        Some(t) if !t.is_empty() => {
+            ctx.blocks.block_mut(id).add_text(
+                ctx.styles_manager,
+                &t,
+                tag_style,
+                true,
+                None,
+                true,
+                None,
+                state.current_link.clone(),
+                state.current_lang.clone(),
+            );
+        }
+        _ => {
+            if has_sublist {
+                ctx.blocks.block_mut(id).force_not_empty = true;
+            }
+        }
+    }
+    id
+}
+
+/// Port of `Convert.add_inline_tag`. The `tagname == 'img'` branch
+/// (needs `ImagesManager`) is a documented `todo!()` -- see the
+/// module docs.
+fn add_inline_tag(
+    ctx: &mut ProcessCtx,
+    state: &ProcessState,
+    tagname: &str,
+    html_tag: NodeId,
+    tag_style: &Style,
+) {
+    let attrs = &ctx.dom.node(html_tag).attrs;
+    let anchor = attrs.get("id").or_else(|| attrs.get("name")).cloned();
+    let bmark = anchor.map(|a| {
+        ctx.links_manager
+            .bookmark_for_anchor(&a, ctx.current_item_href, ctx.dom, html_tag)
+    });
+
+    if tagname == "br" {
+        let is_last_element_child = ctx
+            .dom
+            .parent(html_tag)
+            .map(|p| element_children(ctx.dom, p).last() == Some(&html_tag))
+            .unwrap_or(true);
+        if dom_tail(ctx.dom, html_tag).is_some() || !is_last_element_child {
+            let id = create_block_from_parent(ctx, html_tag);
+            let clear = match tag_style.get("clear").as_str() {
+                "both" => "all",
+                "left" => "left",
+                "right" => "right",
+                _ => "none",
+            };
+            ctx.blocks.block_mut(id).add_break(clear, bmark);
+        }
+    } else if tagname == "img" {
+        todo!("add_inline_tag: <img> needs ImagesManager (images.py), issue #132");
+    } else if let Some(text) = leading_text(ctx.dom, html_tag).filter(|t| !t.is_empty()) {
+        let id = create_block_from_parent(ctx, html_tag);
+        ctx.blocks.block_mut(id).add_text(
+            ctx.styles_manager,
+            &text,
+            tag_style,
+            false,
+            None,
+            false,
+            bmark,
+            state.current_link.clone(),
+            state.current_lang.clone(),
+        );
+    } else if let Some(bmark) = bmark {
+        let id = create_block_from_parent(ctx, html_tag);
+        ctx.blocks.block_mut(id).add_text(
+            ctx.styles_manager,
+            "",
+            tag_style,
+            false,
+            None,
+            false,
+            Some(bmark),
+            state.current_link.clone(),
+            state.current_lang.clone(),
+        );
+    }
+}
+
+/// Port of `Convert.process_tag` -- the core recursive element
+/// walker. Table content (`display` starting with `table`, or
+/// `inline-table`) is a documented `todo!()`: `Blocks`' table methods
+/// aren't ported (see [`Blocks`]'s own module docs). `<hr>`'s
+/// `tag_style.set('border-*-style', 'none')` override (suppressing
+/// the default block border on horizontal rules) is a disclosed,
+/// narrower gap that's simply not applied here -- `Style` has no
+/// mutation capability (it's a read-only, `Copy` view over a resolved
+/// cascade, by design), and adding one for this single call site
+/// wasn't judged worth it yet.
+pub fn process_tag(
+    ctx: &mut ProcessCtx,
+    state: &mut ProcessState,
+    html_tag: NodeId,
+    is_first_tag: bool,
+    mut float_spec: Option<FloatSpec>,
+) {
+    let tagname = barename(ctx.dom.tag(html_tag).unwrap_or("")).to_string();
+    let tag_style = ctx.style(html_tag);
+    let ignore_tag_contents =
+        matches!(tagname.as_str(), "script" | "style" | "title" | "meta") || tag_style.is_hidden();
+    let display = tag_style.get("display");
+    let mut is_block = false;
+
+    if !ignore_tag_contents {
+        let previous_link = state.current_link.clone();
+        if tagname == "a" {
+            if let Some(href) = ctx.dom.node(html_tag).attrs.get("href") {
+                state.current_link = Some(LinkTarget {
+                    item_href: ctx.current_item_href.to_string(),
+                    url: href.clone(),
+                    tooltip: ctx.dom.node(html_tag).attrs.get("title").cloned(),
+                });
+            }
+        }
+        let previous_lang = state.current_lang.clone();
+        if let Some(tag_lang) = lang_for_tag(ctx.dom, html_tag) {
+            state.current_lang = Some(tag_lang);
+        }
+
+        let is_float = matches!(tag_style.get("float").as_str(), "left" | "right") && !is_first_tag;
+        if float_spec.is_none() && is_float {
+            float_spec = Some(FloatSpec::from_css(ctx.dom, html_tag, &tag_style));
+        }
+
+        if matches!(display.as_str(), "inline" | "inline-block") || tagname == "br" {
+            if is_float && float_spec.as_ref().map(|f| f.is_dropcaps).unwrap_or(false) {
+                add_block_tag(
+                    ctx,
+                    state,
+                    &tagname,
+                    html_tag,
+                    &tag_style,
+                    false,
+                    float_spec.take(),
+                    false,
+                );
+            } else {
+                add_inline_tag(ctx, state, &tagname, html_tag, &tag_style);
+            }
+        } else if display == "list-item" {
+            add_block_tag(
+                ctx, state, &tagname, html_tag, &tag_style, false, None, true,
+            );
+        } else if display.starts_with("table") || display == "inline-table" {
+            todo!("process_tag: table display ({display:?}) needs tables.py, issue #132");
+        } else if tagname == "img" && is_float {
+            add_inline_tag(ctx, state, &tagname, html_tag, &tag_style);
+        } else {
+            // A real, narrower gap than the two todo!()s above: Python
+            // forces `border-{right,bottom,left}-style: none` on <hr>
+            // here before building its block style. Not applied (see
+            // this function's own doc comment).
+            add_block_tag(
+                ctx,
+                state,
+                &tagname,
+                html_tag,
+                &tag_style,
+                false,
+                float_spec.clone(),
+                false,
+            );
+        }
+
+        for child in ctx.dom.children(html_tag) {
+            match &ctx.dom.node(child).kind {
+                NodeKind::Element(_) => {
+                    process_tag(ctx, state, child, false, float_spec.clone());
+                }
+                NodeKind::Comment(_) => {
+                    if let Some(tail) = dom_tail(ctx.dom, child) {
+                        if !tail.is_empty() {
+                            let id = create_block_from_parent(ctx, html_tag);
+                            ctx.blocks.block_mut(id).add_text(
+                                ctx.styles_manager,
+                                &tail,
+                                &tag_style,
+                                false,
+                                None,
+                                false,
+                                None,
+                                state.current_link.clone(),
+                                state.current_lang.clone(),
+                            );
+                        }
+                    }
+                }
+                _ => {} // Text nodes: already accounted for via leading_text/dom_tail.
+            }
+        }
+
+        is_block = ctx.blocks.is_open(html_tag);
+        ctx.blocks.finish_tag(html_tag, &tag_style);
+        if is_block && tag_style.get("page-break-after") == "avoid" {
+            if let Some(&last) = ctx.blocks.all_blocks().last() {
+                ctx.blocks.block_mut(last).keep_next = true;
+            }
+        }
+
+        state.current_link = previous_link;
+        state.current_lang = previous_lang;
+    }
+
+    if display == "table-row" {
+        return;
+    }
+    let ignore_whitespace_tail = is_block || display.starts_with("table");
+    if !is_first_tag {
+        if let Some(tail) = dom_tail(ctx.dom, html_tag) {
+            if !ignore_whitespace_tail || !tail.trim().is_empty() {
+                let parent = ctx
+                    .dom
+                    .parent(html_tag)
+                    .expect("a tag with a tail always has a real parent");
+                let parent_style = ctx.style(parent);
+                let id = create_block_from_parent(ctx, html_tag);
+                ctx.blocks.block_mut(id).add_text(
+                    ctx.styles_manager,
+                    &tail,
+                    &parent_style,
+                    false,
+                    None,
+                    true,
+                    None,
+                    state.current_link.clone(),
+                    state.current_lang.clone(),
+                );
+            }
+        }
+    }
+}
+
+/// Port of `Convert.process_item`. `resolved`/`profile` stand in for
+/// `stylizer` -- the caller resolves the item's cascade once (via
+/// [`crate::oeb::polish::cascade::resolve_styles`], already real and
+/// used elsewhere, e.g. `oeb/polish/stats.rs`) and passes the result
+/// in, rather than this function reaching into a `Container` itself.
+/// `html_root` is Python's `item.data` (the parsed document's root
+/// `<html>` element) -- `lang_for_tag` reads attributes off it, same
+/// as Python.
+pub fn process_item(
+    dom: &Dom,
+    resolved: &ResolvedStyles,
+    profile: &Profile,
+    blocks: &mut Blocks,
+    styles_manager: &mut StylesManager,
+    links_manager: &mut LinksManager,
+    current_item_href: &str,
+    html_root: NodeId,
+    document_lang: &str,
+) {
+    let current_lang =
+        Some(lang_for_tag(dom, html_root).unwrap_or_else(|| document_lang.to_string()));
+    let bodies = dom.find_all_tag_global("body");
+    for (i, &body) in bodies.iter().enumerate() {
+        blocks.begin_item();
+        let top_anchor = links_manager.top_anchor().to_string();
+        let top_bookmark =
+            links_manager.bookmark_for_anchor(&top_anchor, current_item_href, dom, body);
+        blocks.top_bookmark = Some(top_bookmark);
+        let mut ctx = ProcessCtx {
+            dom,
+            resolved,
+            profile,
+            blocks,
+            styles_manager,
+            links_manager,
+            current_item_href,
+        };
+        let mut state = ProcessState {
+            current_link: None,
+            current_lang: current_lang.clone(),
+        };
+        process_tag(&mut ctx, &mut state, body, i == 0, None);
+        blocks.end_item(true);
     }
 }
 
@@ -2007,5 +2437,413 @@ mod tests {
         blocks.end_current_block();
         blocks.resolve_language("en");
         assert_eq!(blocks.block(id).block_lang, None);
+    }
+
+    struct Fixture {
+        dom: Dom,
+        resolved: ResolvedStyles,
+        profile: Profile,
+        blocks: Blocks,
+        mgr: StylesManager,
+        lm: LinksManager,
+    }
+
+    fn fixture(html: &str, resolved: &[(NodeId, &[(&str, &str)])]) -> Fixture {
+        let dom = make(html);
+        Fixture {
+            resolved: resolved_with(resolved),
+            profile: Profile::default(),
+            blocks: Blocks::new(),
+            mgr: styles_manager(),
+            lm: links_manager(),
+            dom,
+        }
+    }
+
+    impl Fixture {
+        fn ctx(&mut self) -> ProcessCtx<'_> {
+            ProcessCtx {
+                dom: &self.dom,
+                resolved: &self.resolved,
+                profile: &self.profile,
+                blocks: &mut self.blocks,
+                styles_manager: &mut self.mgr,
+                links_manager: &mut self.lm,
+                current_item_href: "chap1.html",
+            }
+        }
+    }
+
+    #[test]
+    fn process_tag_simple_paragraph_creates_a_block_with_text() {
+        // resolved_with(&[]) has no user-agent stylesheet baked in (unlike
+        // real cascade::resolve_styles output), so `display` must be set
+        // explicitly here -- otherwise Style::get("display") falls back to
+        // CSS's raw initial value ("inline"), not a real browser default.
+        let mut f = fixture("<html><body><p>hello</p></body></html>", &[]);
+        let p = find(&f.dom, "p");
+        f.resolved = resolved_with(&[(p, &[("display", "block")])]);
+        let mut ctx = f.ctx();
+        let mut state = ProcessState::default();
+        process_tag(&mut ctx, &mut state, p, true, None);
+        assert_eq!(f.blocks.items().len(), 1);
+        let id = f.blocks.items()[0];
+        assert_eq!(f.blocks.block(id).runs.len(), 1);
+    }
+
+    #[test]
+    fn process_tag_script_contents_are_ignored() {
+        let mut f = fixture("<html><body><script>var x = 1;</script></body></html>", &[]);
+        let script = find(&f.dom, "script");
+        let mut ctx = f.ctx();
+        let mut state = ProcessState::default();
+        process_tag(&mut ctx, &mut state, script, true, None);
+        assert!(f.blocks.items().is_empty());
+    }
+
+    #[test]
+    fn process_tag_hidden_element_is_skipped_entirely() {
+        let mut f = fixture(
+            "<html><body><p style=\"display:none\">hidden</p></body></html>",
+            &[],
+        );
+        let p = find(&f.dom, "p");
+        // is_hidden() reads `display: none` itself (see oeb/polish/style.rs).
+        let resolved = resolved_with(&[(p, &[("display", "none")])]);
+        f.resolved = resolved;
+        let mut ctx = f.ctx();
+        let mut state = ProcessState::default();
+        process_tag(&mut ctx, &mut state, p, true, None);
+        assert!(f.blocks.items().is_empty());
+    }
+
+    #[test]
+    fn process_tag_inline_span_adds_a_run_to_the_parent_paragraph() {
+        let mut f = fixture("<html><body><p>a<span>b</span></p></body></html>", &[]);
+        let p = find(&f.dom, "p");
+        let span = f
+            .dom
+            .preorder_elements(f.dom.root)
+            .into_iter()
+            .find(|&id| f.dom.tag(id) == Some("span"))
+            .unwrap();
+        // font-weight is a real TextStyle-affecting property (unlike
+        // `display`, which TextStyle doesn't read at all) -- needed so
+        // "a" and "b" actually get distinct TextStyleIds and split into
+        // separate runs, matching Python's own create_text_style dedup
+        // (identical CSS -> identical TextStyle -> the SAME run).
+        f.resolved = resolved_with(&[
+            (p, &[("display", "block")]),
+            (span, &[("display", "inline"), ("font-weight", "bold")]),
+        ]);
+        let mut ctx = f.ctx();
+        let mut state = ProcessState::default();
+        process_tag(&mut ctx, &mut state, p, true, None);
+        assert_eq!(f.blocks.items().len(), 1);
+        let id = f.blocks.items()[0];
+        // "a" and "b" -- both text-bearing runs land in the same block
+        // since the <p> itself is the current_or_new_block target, but
+        // as two distinct runs since their TextStyles differ.
+        assert_eq!(f.blocks.block(id).runs.len(), 2);
+    }
+
+    #[test]
+    fn process_tag_anchor_link_applies_to_descendant_text_and_is_restored_after() {
+        let mut f = fixture(
+            "<html><body><p><a href=\"chap2.html\">link text</a> after</p></body></html>",
+            &[],
+        );
+        let p = find(&f.dom, "p");
+        f.resolved = resolved_with(&[(p, &[("display", "block")])]);
+        let mut ctx = f.ctx();
+        let mut state = ProcessState::default();
+        process_tag(&mut ctx, &mut state, p, true, None);
+        let id = f.blocks.items()[0];
+        let runs = &f.blocks.block(id).runs;
+        assert_eq!(runs.len(), 2, "the linked run, then the unlinked tail run");
+        assert!(runs[0].link.is_some());
+        assert_eq!(runs[0].link.as_ref().unwrap().url, "chap2.html");
+        assert!(
+            runs[1].link.is_none(),
+            "current_link must be restored after the <a> closes"
+        );
+    }
+
+    #[test]
+    fn process_tag_lang_attribute_applies_to_descendants_and_is_restored_after() {
+        let mut f = fixture(
+            "<html><body><p><span lang=\"de\">hallo</span> bye</p></body></html>",
+            &[],
+        );
+        let p = find(&f.dom, "p");
+        let span = f
+            .dom
+            .preorder_elements(f.dom.root)
+            .into_iter()
+            .find(|&id| f.dom.tag(id) == Some("span"))
+            .unwrap();
+        f.resolved = resolved_with(&[
+            (p, &[("display", "block")]),
+            (span, &[("display", "inline")]),
+        ]);
+        let mut ctx = f.ctx();
+        let mut state = ProcessState::default();
+        process_tag(&mut ctx, &mut state, p, true, None);
+        let id = f.blocks.items()[0];
+        let runs = &f.blocks.block(id).runs;
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].lang.as_deref(), Some("de"));
+        assert_eq!(
+            runs[1].lang, None,
+            "current_lang must be restored after the <span> closes"
+        );
+    }
+
+    #[test]
+    fn process_tag_br_with_a_tail_adds_a_break() {
+        let mut f = fixture("<html><body><p>a<br/>b</p></body></html>", &[]);
+        let p = find(&f.dom, "p");
+        f.resolved = resolved_with(&[(p, &[("display", "block")])]);
+        let mut ctx = f.ctx();
+        let mut state = ProcessState::default();
+        process_tag(&mut ctx, &mut state, p, true, None);
+        let id = f.blocks.items()[0];
+        // One run: "a" text entry, then a break entry (add_break
+        // appends to the SAME run when one already exists), then "b".
+        assert_eq!(f.blocks.block(id).runs.len(), 1);
+        assert_eq!(f.blocks.block(id).runs[0].texts.len(), 3);
+        assert!(matches!(
+            f.blocks.block(id).runs[0].texts[1].item,
+            TextItem::Break { .. }
+        ));
+    }
+
+    #[test]
+    fn process_tag_trailing_br_with_no_tail_is_skipped() {
+        let mut f = fixture("<html><body><p>a<br/></p></body></html>", &[]);
+        let p = find(&f.dom, "p");
+        f.resolved = resolved_with(&[(p, &[("display", "block")])]);
+        let mut ctx = f.ctx();
+        let mut state = ProcessState::default();
+        process_tag(&mut ctx, &mut state, p, true, None);
+        let id = f.blocks.items()[0];
+        assert_eq!(f.blocks.block(id).runs.len(), 1);
+        assert_eq!(
+            f.blocks.block(id).runs[0].texts.len(),
+            1,
+            "no break was added for a trailing <br> with nothing after it"
+        );
+    }
+
+    #[test]
+    fn process_tag_list_item_creates_a_block_marked_as_a_list_item() {
+        let mut f = fixture("<html><body><li>item text</li></body></html>", &[]);
+        let li = find(&f.dom, "li");
+        f.resolved = resolved_with(&[(li, &[("display", "list-item")])]);
+        let mut ctx = f.ctx();
+        let mut state = ProcessState::default();
+        process_tag(&mut ctx, &mut state, li, true, None);
+        assert_eq!(f.blocks.items().len(), 1);
+        let id = f.blocks.items()[0];
+        assert!(f.blocks.block(id).list_tag.is_some());
+    }
+
+    #[test]
+    fn process_tag_page_break_after_avoid_sets_keep_next_on_the_finished_block() {
+        let mut f = fixture("<html><body><div>text</div></body></html>", &[]);
+        let div = find(&f.dom, "div");
+        f.resolved =
+            resolved_with(&[(div, &[("display", "block"), ("page-break-after", "avoid")])]);
+        let mut ctx = f.ctx();
+        let mut state = ProcessState::default();
+        process_tag(&mut ctx, &mut state, div, true, None);
+        let id = f.blocks.items()[0];
+        assert!(f.blocks.block(id).keep_next);
+    }
+
+    #[test]
+    fn process_tag_comment_tail_becomes_a_text_run() {
+        let mut f = fixture("<html><body><p>a<!-- c -->tail text</p></body></html>", &[]);
+        let p = find(&f.dom, "p");
+        f.resolved = resolved_with(&[(p, &[("display", "block")])]);
+        let mut ctx = f.ctx();
+        let mut state = ProcessState::default();
+        process_tag(&mut ctx, &mut state, p, true, None);
+        let id = f.blocks.items()[0];
+        // "a" run, then the comment's tail ("tail text") gets its own
+        // add_text call via create_block_from_parent -- which reuses
+        // the same current block (the <p>'s), appending a new run
+        // since is_parent_style differs from the first run's.
+        let all_text: String = f
+            .blocks
+            .block(id)
+            .runs
+            .iter()
+            .flat_map(|r| r.texts.iter())
+            .filter_map(|e| match &e.item {
+                TextItem::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(all_text.contains("tail text"));
+    }
+
+    #[test]
+    fn process_tag_element_tail_after_a_block_child_becomes_its_own_block() {
+        let mut f = fixture(
+            "<html><body><div><p>inside</p>after</div></body></html>",
+            &[],
+        );
+        let div = find(&f.dom, "div");
+        let p = find(&f.dom, "p");
+        f.resolved = resolved_with(&[(div, &[("display", "block")]), (p, &[("display", "block")])]);
+        let mut ctx = f.ctx();
+        let mut state = ProcessState::default();
+        process_tag(&mut ctx, &mut state, div, true, None);
+        // div's own (initially-current, later possibly-skipped) block,
+        // the <p>'s block, and a block for "after".
+        assert!(f.blocks.items().len() >= 2);
+        let has_after_text = f.blocks.items().iter().any(|&id| {
+            f.blocks.block(id).runs.iter().any(|r| {
+                r.texts.iter().any(|e| match &e.item {
+                    TextItem::Text { text, .. } => text.contains("after"),
+                    _ => false,
+                })
+            })
+        });
+        assert!(has_after_text);
+    }
+
+    #[test]
+    #[should_panic(expected = "tables.py")]
+    fn process_tag_table_display_is_a_documented_gap() {
+        let mut f = fixture("<html><body><div>x</div></body></html>", &[]);
+        let div = find(&f.dom, "div");
+        f.resolved = resolved_with(&[(div, &[("display", "table")])]);
+        let mut ctx = f.ctx();
+        let mut state = ProcessState::default();
+        process_tag(&mut ctx, &mut state, div, true, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "ImagesManager")]
+    fn process_tag_img_tag_is_a_documented_gap() {
+        let mut f = fixture("<html><body><img/></body></html>", &[]);
+        let img = find(&f.dom, "img");
+        let mut ctx = f.ctx();
+        let mut state = ProcessState::default();
+        process_tag(&mut ctx, &mut state, img, true, None);
+    }
+
+    #[test]
+    fn create_block_from_parent_resets_page_break_before() {
+        let mut f = fixture("<html><body><p>x</p></body></html>", &[]);
+        let p = find(&f.dom, "p");
+        {
+            let mut ctx = f.ctx();
+            let id = create_block_from_parent(&mut ctx, p);
+            ctx.blocks.block_mut(id).page_break_before = true;
+        }
+        {
+            let mut ctx = f.ctx();
+            let id = create_block_from_parent(&mut ctx, p);
+            assert!(!ctx.blocks.block(id).page_break_before);
+        }
+    }
+
+    #[test]
+    fn process_item_creates_one_block_per_body() {
+        let mut f = fixture("<html><body><p>hello</p></body></html>", &[]);
+        let p = find(&f.dom, "p");
+        f.resolved = resolved_with(&[(p, &[("display", "block")])]);
+        let html_root = find(&f.dom, "html");
+        process_item(
+            &f.dom,
+            &f.resolved,
+            &f.profile,
+            &mut f.blocks,
+            &mut f.mgr,
+            &mut f.lm,
+            "chap1.html",
+            html_root,
+            "en",
+        );
+        assert_eq!(f.blocks.items().len(), 1);
+    }
+
+    #[test]
+    fn process_item_the_first_item_in_the_book_gets_no_top_bookmark_or_page_break() {
+        // Matches Python's own `if self.pos > 0 and self.pos < len(self.all_blocks)`
+        // guard in Blocks.__exit__ -- the very first item processed in
+        // the whole document has nothing before it to page-break from,
+        // so end_item never applies top_bookmark/page_break_before.
+        let mut f = fixture("<html><body><p>hello</p></body></html>", &[]);
+        let p = find(&f.dom, "p");
+        f.resolved = resolved_with(&[(p, &[("display", "block")])]);
+        let html_root = find(&f.dom, "html");
+        process_item(
+            &f.dom,
+            &f.resolved,
+            &f.profile,
+            &mut f.blocks,
+            &mut f.mgr,
+            &mut f.lm,
+            "chap1.html",
+            html_root,
+            "en",
+        );
+        let id = f.blocks.items()[0];
+        assert!(f.blocks.block(id).bookmarks.is_empty());
+        assert!(!f.blocks.block(id).page_break_before);
+    }
+
+    #[test]
+    fn process_item_a_later_item_gets_a_top_bookmark_and_a_page_break() {
+        let mut f = fixture("<html><body><p>hello</p></body></html>", &[]);
+        let p = find(&f.dom, "p");
+        f.resolved = resolved_with(&[(p, &[("display", "block")])]);
+        let html_root = find(&f.dom, "html");
+        // First item -- establishes that all_blocks is non-empty by
+        // the time the second item's begin_item runs, so its `pos > 0`.
+        process_item(
+            &f.dom,
+            &f.resolved,
+            &f.profile,
+            &mut f.blocks,
+            &mut f.mgr,
+            &mut f.lm,
+            "chap1.html",
+            html_root,
+            "en",
+        );
+        process_item(
+            &f.dom,
+            &f.resolved,
+            &f.profile,
+            &mut f.blocks,
+            &mut f.mgr,
+            &mut f.lm,
+            "chap2.html",
+            html_root,
+            "en",
+        );
+        assert_eq!(f.blocks.items().len(), 2);
+        let second = f.blocks.items()[1];
+        assert!(!f.blocks.block(second).bookmarks.is_empty());
+        assert!(f.blocks.block(second).page_break_before);
+    }
+
+    #[test]
+    fn lang_for_tag_reads_the_lang_attribute() {
+        let dom = make("<html lang=\"fr\"><body><p>x</p></body></html>");
+        let html = find(&dom, "html");
+        assert_eq!(lang_for_tag(&dom, html).as_deref(), Some("fr"));
+    }
+
+    #[test]
+    fn lang_for_tag_returns_none_with_no_lang_attribute() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let html = find(&dom, "html");
+        assert_eq!(lang_for_tag(&dom, html), None);
     }
 }
