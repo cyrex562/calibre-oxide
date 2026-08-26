@@ -13,12 +13,13 @@
 //! | `styles.py` (partial) | [`styles`] |
 //! | `links.py` (partial) | [`links`] |
 //! | `from_html.py` (partial) | [`from_html`] |
+//! | `lists.py` | [`lists`] |
 //!
 //! Still to come, tracked as issue #132: `tables.py`, `images.py`,
-//! `lists.py`, `from_html.py`'s `Convert.__call__`/`.write` and
-//! `Blocks`' `Table`-related methods/`.serialize` (see [`from_html`]'s
-//! module docs -- `Convert`'s core element walker itself is ported),
-//! plus `styles.py`'s `CombinedStyle`/
+//! `from_html.py`'s `Convert.__call__`/`.write` and `Blocks`'
+//! `Table`-related methods/`.serialize` (see [`from_html`]'s module
+//! docs -- `Convert`'s core element walker itself is ported), plus
+//! `styles.py`'s `CombinedStyle`/
 //! `StylesManager.finalize`/`.serialize` and `links.py`'s
 //! TOC-serialization half (`LinksManager.process_toc_node`/
 //! `.process_toc_links`/`.serialize_toc` -- see [`links`]'s module
@@ -51,6 +52,7 @@ pub mod container;
 pub mod fonts;
 pub mod from_html;
 pub mod links;
+pub mod lists;
 pub mod styles;
 pub mod utils;
 pub mod xml;
@@ -64,6 +66,7 @@ pub use from_html::{
     ProcessState, TextRun,
 };
 pub use links::{LinksManager, TocItem};
+pub use lists::ListsManager;
 pub use styles::{BlockStyleId, StylesManager, TextStyleId};
 pub use utils::{convert_color, int_or_zero};
 pub use xml::Element;
