@@ -12,17 +12,22 @@
 //! | — (`lxml.builder`) | [`xml`] |
 //! | `styles.py` (partial) | [`styles`] |
 //!
-//! Still to come, tracked as issue #132: the rest of `styles.py`
-//! (`BlockStyle`/`FloatSpec`/`DescendantTextStyle`/`StylesManager`),
-//! `from_html.py`, `tables.py`, `images.py`, `links.py`, `lists.py`.
-//! These walk a resolved-CSS HTML tree -- #132's own "needs a real OEB
+//! Still to come, tracked as issue #132: `from_html.py`, `tables.py`,
+//! `images.py`, `links.py`, `lists.py`, plus `styles.py`'s
+//! `CombinedStyle` and `StylesManager.finalize`/`.serialize`. These
+//! walk a resolved-CSS HTML tree -- #132's own "needs a real OEB
 //! stylizer" framing was stale by the time it was filed:
 //! [`crate::oeb::polish::cascade`] already had a real CSS cascade (a
 //! different consumer, issue #164), and
 //! [`crate::oeb::polish::style`] is the accessor seam these files
-//! actually need. [`styles`] is the first piece built against it:
-//! `TextStyle`, the CSS -> `w:rPr` run-property data model (not yet
-//! its serialization or `StylesManager`'s deduplication pass).
+//! actually need. [`styles`] is built against it: `TextStyle`/
+//! `BlockStyle`/`FloatSpec`/`DescendantTextStyle` (CSS -> `w:rPr`/
+//! `w:pPr`/`w:framePr`, data model and serialization) plus
+//! `StylesManager`'s `create_text_style`/`create_block_style` dedup
+//! cache are all ported; `StylesManager.finalize` (block/run-style
+//! pairing, heading promotion, descendant-style dedup) and
+//! `.serialize` (writing the final `w:styles` part) still need real
+//! `Block`/`Run` objects from `from_html.py`.
 //!
 //! ```no_run
 //! use calibre_ebooks::docx::writer::container::{DocxWriter, PageOptions};
@@ -44,5 +49,6 @@ pub use container::{
     create_skeleton, DocumentRelationships, DocxWriter, Margins, PageOptions, Skeleton,
 };
 pub use fonts::{obfuscate_font_data, FontFace, FontsManager, Slot};
+pub use styles::{BlockStyleId, StylesManager, TextStyleId};
 pub use utils::{convert_color, int_or_zero};
 pub use xml::Element;

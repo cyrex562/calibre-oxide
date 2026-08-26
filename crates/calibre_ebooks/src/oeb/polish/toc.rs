@@ -346,7 +346,7 @@ fn canonicalize_lang(raw: &str) -> Option<String> {
 /// 3-letter ISO-639-2/3 code needing table lookup, e.g. `"eng"`) returns
 /// `None`, matching Python's `lang_as_iso639_1(x) or x`
 /// fallback-to-original pattern used at every call site in this file.
-fn lang_as_iso639_1(lang: &str) -> Option<String> {
+pub(crate) fn lang_as_iso639_1(lang: &str) -> Option<String> {
     let first = lang.split(['-', '_']).next().unwrap_or(lang);
     if first.len() == 2 && first.chars().all(|c| c.is_ascii_alphabetic()) {
         Some(first.to_lowercase())
