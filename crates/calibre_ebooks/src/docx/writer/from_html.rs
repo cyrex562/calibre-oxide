@@ -1,12 +1,12 @@
 //! The HTML/OEB -> DOCX spine walker: port of `docx/writer/from_html.py`.
 //!
-//! **[`TextRun`] and [`Block`] are ported so far.** `lang_for_tag`,
-//! the `Style`/`Stylizer` subclasses (add a `letterSpacing` property/
-//! a `KeyError`-tolerant `style()` lookup -- already subsumed by
-//! [`crate::oeb::polish::style::Style`] and
+//! **[`TextRun`], [`Block`], and [`Blocks`] are ported so far** (the
+//! last of these only partially -- see its own doc comment).
+//! `lang_for_tag`, the `Style`/`Stylizer` subclasses (add a
+//! `letterSpacing` property/a `KeyError`-tolerant `style()` lookup --
+//! already subsumed by [`crate::oeb::polish::style::Style`] and
 //! [`crate::oeb::polish::cascade`], see `oeb/polish/style.rs`'s
-//! module docs), `Blocks` (the per-item block/table bookkeeping
-//! container), and `Convert` (the real spine-walking orchestrator)
+//! module docs), and `Convert` (the real spine-walking orchestrator)
 //! are NOT ported -- see issue #132.
 //!
 //! `TextRun.first_html_parent` (an lxml element in Python) is a
@@ -52,11 +52,13 @@
 //! from a `NodeId` (it's `Copy`), so there's nothing to lose by not
 //! storing it early.
 
+use std::collections::{HashMap, HashSet};
+
 use crate::docx::names::{barename, DocxNamespace};
 use crate::dom::{Dom, NodeId};
 use crate::oeb::polish::style::Style;
 
-use indexmap::IndexSet;
+use indexmap::{IndexMap, IndexSet};
 
 use super::links::LinksManager;
 use super::styles::{BlockStyleId, FloatSpec, StylesManager, TextStyleId};
@@ -606,6 +608,302 @@ impl Block {
         }
         for bid in end_bookmarks {
             p.append(Element::new("w:bookmarkEnd").attr("w:id", bid.to_string()));
+        }
+    }
+}
+
+/// Handle into a [`Blocks`]' `Block` arena. Stands in for Python
+/// holding a direct `Block` object reference (`Blocks.block_map`,
+/// `Blocks.current_block`, `Blocks.all_blocks`/`.items` all key or
+/// store on Python object identity, which Rust has no equivalent of
+/// -- same reasoning as `TextStyleId`/`BlockStyleId`, PR #330).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BlockId(pub usize);
+
+/// Port of `Blocks` -- **partial**. Ported: `new` (`__init__`),
+/// `current_or_new_block`, `end_current_block`, `start_new_block`,
+/// the block-only half of `finish_tag` (see below),
+/// `delete_block_at`, `begin_item`/`end_item` (`__enter__`/
+/// `__exit__` -- Rust has no context-manager equivalent that also
+/// allows the caller to keep mutating `Blocks` and other managers
+/// mid-scope, so these are just two plain methods `Convert`, not
+/// ported, will call explicitly around each spine item), and
+/// `apply_page_break_after`/`resolve_language`.
+///
+/// **Not ported, deliberately**:
+/// - Everything involving `Table` (`self.tables`/`self.current_table`,
+///   `start_new_table`/`start_new_row`/`start_new_cell`, and
+///   `finish_tag`'s `if self.current_table is not None:` half) --
+///   `tables.py` isn't ported, so there is no `Table` type to hold.
+///   `self.items` here is therefore always `Vec<BlockId>`, never the
+///   `Block | Table` union Python's version holds.
+/// - `serialize` (`Blocks.serialize`, walking `self.items` and
+///   calling each item's own `serialize`) -- `Block::serialize` needs
+///   a resolved `own_style_id: Option<&str>` per block (only
+///   `StylesManager.finalize`, unported, can supply one) and
+///   `is_first_float_block`/`is_last_float_block` per block sharing a
+///   `FloatSpec` (Python computes these by walking `float_spec.blocks`,
+///   itself populated because `Block`/`FloatSpec` are shared mutable
+///   Python objects -- this port's `FloatSpec` is a plain owned,
+///   `Clone`, value, not `Rc<RefCell<...>>`, precisely to avoid that
+///   pattern, following the same reasoning `StylesManager`'s arena
+///   design already established). Building `serialize` before
+///   deciding how float-group membership gets tracked (a real design
+///   question, not a routine port -- see issue #132's own tracking
+///   notes) would mean guessing at an interface with no real caller
+///   to validate it against yet.
+/// - `block_map` (`dict[Block, int]`, Python's object-identity-keyed
+///   cache of a block's position within `self.items`, used only to
+///   speed up `delete_block_at`'s lookup) isn't ported at all --
+///   [`Self::delete_block_at`] does a plain linear
+///   [`Vec::iter`]`.`[`position`](Iterator::position) scan of `items`
+///   instead. `items` sizes are a book chapter's worth of paragraphs
+///   at most, so this is nowhere near a hot path, and dropping the
+///   cache sidesteps both the object-identity-as-dict-key translation
+///   problem and a latent staleness risk in Python's own cache (a
+///   block's cached position never gets updated when an *earlier*
+///   block is deleted and everything after it shifts down).
+/// - `Block.parent_items` (see [`Block`]'s own module-level design
+///   note) means [`Self::apply_page_break_after`]'s Python condition
+///   `next_block.parent_items is block.parent_items is self.items`
+///   is unconditionally true here (there is only ever one items list,
+///   `self.items`, since table-cell item lists don't exist yet) --
+///   simplified accordingly; **revisit this the moment table support
+///   lands**, since a real per-cell items list would make the
+///   condition meaningfully false again.
+#[derive(Debug, Default)]
+pub struct Blocks {
+    pub top_bookmark: Option<String>,
+    blocks: Vec<Block>,
+    all_blocks: Vec<BlockId>,
+    pos: usize,
+    current_block: Option<BlockId>,
+    items: Vec<BlockId>,
+    open_html_blocks: HashSet<NodeId>,
+    html_tag_start_blocks: HashMap<NodeId, BlockId>,
+}
+
+impl Blocks {
+    /// Port of `Blocks.__init__`. `namespace`/`styles_manager`/
+    /// `links_manager` aren't stored -- see the module docs.
+    pub fn new() -> Self {
+        Blocks::default()
+    }
+
+    pub fn block(&self, id: BlockId) -> &Block {
+        &self.blocks[id.0]
+    }
+
+    pub fn block_mut(&mut self, id: BlockId) -> &mut Block {
+        &mut self.blocks[id.0]
+    }
+
+    pub fn current_block(&self) -> Option<BlockId> {
+        self.current_block
+    }
+
+    pub fn all_blocks(&self) -> &[BlockId] {
+        &self.all_blocks
+    }
+
+    pub fn items(&self) -> &[BlockId] {
+        &self.items
+    }
+
+    /// Port of `Blocks.current_or_new_block`.
+    pub fn current_or_new_block(
+        &mut self,
+        styles_manager: &mut StylesManager,
+        dom: &Dom,
+        html_tag: NodeId,
+        tag_style: &Style,
+    ) -> BlockId {
+        match self.current_block {
+            Some(id) => id,
+            None => {
+                self.start_new_block(styles_manager, dom, html_tag, tag_style, false, None, false)
+            }
+        }
+    }
+
+    /// Port of `Blocks.end_current_block`. The `self.current_table is
+    /// not None and self.current_table.current_row is not None`
+    /// branch (adding the block to the current table row instead of
+    /// `self.items`) is never taken here -- table support isn't
+    /// ported, so there is no `current_table` to check.
+    pub fn end_current_block(&mut self) {
+        if let Some(id) = self.current_block.take() {
+            self.all_blocks.push(id);
+            self.items.push(id);
+        }
+    }
+
+    /// Port of `Blocks.start_new_block`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_new_block(
+        &mut self,
+        styles_manager: &mut StylesManager,
+        dom: &Dom,
+        html_block: NodeId,
+        style: &Style,
+        is_table_cell: bool,
+        float_spec: Option<FloatSpec>,
+        is_list_item: bool,
+    ) -> BlockId {
+        let mut parent_bg: Option<String> = None;
+        if let Some(parent) = dom.parent(html_block) {
+            if self.html_tag_start_blocks.contains_key(&parent) {
+                if let Some(ps_id) = styles_manager.style_for_html_block(parent) {
+                    if let Some(bg) = &styles_manager.block_style(ps_id).background_color {
+                        parent_bg = Some(bg.clone());
+                    }
+                }
+            }
+        }
+        self.end_current_block();
+        let block = Block::new(
+            styles_manager,
+            dom,
+            html_block,
+            style,
+            is_table_cell,
+            float_spec,
+            is_list_item,
+            parent_bg.as_deref(),
+        );
+        let id = BlockId(self.blocks.len());
+        self.blocks.push(block);
+        self.html_tag_start_blocks.insert(html_block, id);
+        self.open_html_blocks.insert(html_block);
+        self.current_block = Some(id);
+        id
+    }
+
+    /// Port of the block-only half of `Blocks.finish_tag` -- the
+    /// `if self.current_table is not None:` half isn't ported (see
+    /// the module docs). `tag_style` stands in for Python reading
+    /// `start_block.html_style['page-break-after']` off the cached
+    /// block that opened `html_tag` -- that block's own `html_style`
+    /// *is* `html_tag`'s style (it was created for this exact tag),
+    /// so the caller's fresh `tag_style` for `html_tag` at the point
+    /// it closes is the same value.
+    pub fn finish_tag(&mut self, html_tag: NodeId, tag_style: &Style) {
+        if self.current_block.is_some() && self.open_html_blocks.contains(&html_tag) {
+            // Every element added to `open_html_blocks` is added to
+            // `html_tag_start_blocks` in the same call (start_new_block),
+            // so this lookup always succeeds here -- kept as a real
+            // check rather than an unchecked index, matching Python's
+            // own `if start_block is not None` guard.
+            if self.html_tag_start_blocks.contains_key(&html_tag)
+                && tag_style.get("page-break-after") == "always"
+            {
+                if let Some(id) = self.current_block {
+                    self.blocks[id.0].page_break_after = true;
+                }
+            }
+            self.end_current_block();
+            self.open_html_blocks.remove(&html_tag);
+        }
+    }
+
+    /// Port of `Blocks.delete_block_at`. See the module docs for why
+    /// there's no `block_map`/`parent_items` here.
+    pub fn delete_block_at(&mut self, pos: Option<usize>) {
+        let pos = pos.unwrap_or(self.pos);
+        let block_id = self.all_blocks.remove(pos);
+        if let Some(item_pos) = self.items.iter().position(|&id| id == block_id) {
+            self.items.remove(item_pos);
+        }
+        let (bookmarks, page_break_after, page_break_before) = {
+            let block = &self.blocks[block_id.0];
+            (
+                block.bookmarks.clone(),
+                block.page_break_after,
+                block.page_break_before,
+            )
+        };
+        if let Some(&next_id) = self.all_blocks.get(pos) {
+            let next = &mut self.blocks[next_id.0];
+            next.bookmarks.extend(bookmarks);
+            next.page_break_after = page_break_after;
+            next.page_break_before = page_break_before;
+        }
+    }
+
+    /// Port of `Blocks.__enter__`.
+    pub fn begin_item(&mut self) {
+        self.pos = self.all_blocks.len();
+    }
+
+    /// Port of `Blocks.__exit__`. `ok` stands in for Python's
+    /// `value is None` (no exception raised in the `with` block) --
+    /// pass `false` to skip cleanup the way an exception would.
+    pub fn end_item(&mut self, ok: bool) {
+        if !ok {
+            return;
+        }
+        if let Some(id) = self.current_block.take() {
+            self.all_blocks.push(id);
+        }
+        if self.all_blocks.len() > self.pos && self.blocks[self.all_blocks[self.pos].0].is_empty() {
+            self.delete_block_at(Some(self.pos));
+        }
+        if self.pos > 0 && self.pos < self.all_blocks.len() {
+            let id = self.all_blocks[self.pos];
+            self.blocks[id.0].page_break_before = true;
+            if let Some(bmark) = &self.top_bookmark {
+                self.blocks[id.0].bookmarks.insert(bmark.clone());
+            }
+        }
+        self.top_bookmark = None;
+    }
+
+    /// Port of `Blocks.apply_page_break_after`. Python's
+    /// `next_block.parent_items is block.parent_items is self.items`
+    /// guard is unconditionally true here -- see the module docs.
+    pub fn apply_page_break_after(&mut self) {
+        for i in 0..self.all_blocks.len().saturating_sub(1) {
+            if self.blocks[self.all_blocks[i].0].page_break_after {
+                let next_id = self.all_blocks[i + 1];
+                self.blocks[next_id.0].page_break_before = true;
+            }
+        }
+    }
+
+    /// Port of `Blocks.resolve_language`. Ties in "most common lang
+    /// among this block's runs" resolve to whichever lang was first
+    /// seen, matching Python's `Counter.most_common(1)` (CPython's
+    /// `heapq.nlargest(1, ...)` degenerates to a linear max-scan that
+    /// only replaces the current best on a strictly greater count).
+    pub fn resolve_language(&mut self, default_lang: &str) {
+        for &id in &self.all_blocks {
+            let block = &mut self.blocks[id.0];
+            let mut counts: IndexMap<Option<String>, usize> = IndexMap::new();
+            for run in &block.runs {
+                *counts.entry(run.lang.clone()).or_insert(0) += 1;
+            }
+            if counts.is_empty() {
+                continue;
+            }
+            let mut best_lang: Option<String> = None;
+            let mut best_count = 0usize;
+            let mut have_best = false;
+            for (lang, &count) in &counts {
+                if !have_best || count > best_count {
+                    best_lang = lang.clone();
+                    best_count = count;
+                    have_best = true;
+                }
+            }
+            block.block_lang = best_lang.clone();
+            for run in &mut block.runs {
+                if run.lang == best_lang {
+                    run.lang = None;
+                }
+            }
+            if best_lang.as_deref() == Some(default_lang) {
+                block.block_lang = None;
+            }
         }
     }
 }
@@ -1336,5 +1634,378 @@ mod tests {
         let p_el = body.children_named("w:p").next().unwrap();
         let ppr = p_el.children_named("w:pPr").next().unwrap();
         assert!(ppr.children_named("w:framePr").next().is_some());
+    }
+
+    fn plain_style<'a>(
+        dom: &'a Dom,
+        resolved: &'a ResolvedStyles,
+        profile: &'a Profile,
+        node: NodeId,
+    ) -> Style<'a> {
+        Style::new(dom, resolved, profile, node)
+    }
+
+    #[test]
+    fn blocks_start_new_block_becomes_the_current_block() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style = plain_style(&dom, &resolved, &profile, p);
+        let mut mgr = styles_manager();
+        let mut blocks = Blocks::new();
+        let id = blocks.start_new_block(&mut mgr, &dom, p, &style, false, None, false);
+        assert_eq!(blocks.current_block(), Some(id));
+        assert!(
+            blocks.items().is_empty(),
+            "not added to items until end_current_block"
+        );
+    }
+
+    #[test]
+    fn current_or_new_block_reuses_the_existing_current_block() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style = plain_style(&dom, &resolved, &profile, p);
+        let mut mgr = styles_manager();
+        let mut blocks = Blocks::new();
+        let a = blocks.current_or_new_block(&mut mgr, &dom, p, &style);
+        let b = blocks.current_or_new_block(&mut mgr, &dom, p, &style);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn start_new_block_ends_the_previous_current_block_first() {
+        let dom = make("<html><body><p>x</p><p>y</p></body></html>");
+        let ps: Vec<NodeId> = dom
+            .preorder_elements(dom.root)
+            .into_iter()
+            .filter(|&id| dom.tag(id) == Some("p"))
+            .collect();
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style1 = plain_style(&dom, &resolved, &profile, ps[0]);
+        let style2 = plain_style(&dom, &resolved, &profile, ps[1]);
+        let mut mgr = styles_manager();
+        let mut blocks = Blocks::new();
+        let first = blocks.start_new_block(&mut mgr, &dom, ps[0], &style1, false, None, false);
+        let second = blocks.start_new_block(&mut mgr, &dom, ps[1], &style2, false, None, false);
+        assert_eq!(blocks.current_block(), Some(second));
+        assert_eq!(blocks.items(), &[first]);
+        assert_eq!(blocks.all_blocks(), &[first]);
+    }
+
+    #[test]
+    fn start_new_block_inherits_background_from_a_tracked_parent_block() {
+        let dom = make("<html><body><div><p>x</p></div></body></html>");
+        let div = find(&dom, "div");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[(div, &[("background-color", "#ff0000")])]);
+        let profile = Profile::default();
+        let div_style = plain_style(&dom, &resolved, &profile, div);
+        let p_style = plain_style(&dom, &resolved, &profile, p);
+        let mut mgr = styles_manager();
+        let mut blocks = Blocks::new();
+        blocks.start_new_block(&mut mgr, &dom, div, &div_style, false, None, false);
+        let p_id = blocks.start_new_block(&mut mgr, &dom, p, &p_style, false, None, false);
+        let p_block_style = mgr.block_style(blocks.block(p_id).style);
+        assert_eq!(p_block_style.background_color.as_deref(), Some("FF0000"));
+    }
+
+    #[test]
+    fn start_new_block_does_not_inherit_background_when_parent_was_never_a_block_start() {
+        // The parent <div> never went through start_new_block (no
+        // html_tag_start_blocks entry), so parent_bg stays None even
+        // though it has a real background-color.
+        let dom = make("<html><body><div><p>x</p></div></body></html>");
+        let div = find(&dom, "div");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[(div, &[("background-color", "#ff0000")])]);
+        let profile = Profile::default();
+        let p_style = plain_style(&dom, &resolved, &profile, p);
+        let mut mgr = styles_manager();
+        let mut blocks = Blocks::new();
+        let p_id = blocks.start_new_block(&mut mgr, &dom, p, &p_style, false, None, false);
+        let p_block_style = mgr.block_style(blocks.block(p_id).style);
+        assert_eq!(p_block_style.background_color, None);
+    }
+
+    #[test]
+    fn end_current_block_moves_current_into_all_blocks_and_items() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style = plain_style(&dom, &resolved, &profile, p);
+        let mut mgr = styles_manager();
+        let mut blocks = Blocks::new();
+        let id = blocks.start_new_block(&mut mgr, &dom, p, &style, false, None, false);
+        blocks.end_current_block();
+        assert_eq!(blocks.current_block(), None);
+        assert_eq!(blocks.items(), &[id]);
+        assert_eq!(blocks.all_blocks(), &[id]);
+    }
+
+    #[test]
+    fn finish_tag_sets_page_break_after_when_style_says_always() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[(p, &[("page-break-after", "always")])]);
+        let profile = Profile::default();
+        let style = plain_style(&dom, &resolved, &profile, p);
+        let mut mgr = styles_manager();
+        let mut blocks = Blocks::new();
+        let id = blocks.start_new_block(&mut mgr, &dom, p, &style, false, None, false);
+        blocks.finish_tag(p, &style);
+        assert!(blocks.block(id).page_break_after);
+        assert_eq!(
+            blocks.current_block(),
+            None,
+            "finish_tag ends the current block"
+        );
+    }
+
+    #[test]
+    fn finish_tag_leaves_page_break_after_false_without_always() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style = plain_style(&dom, &resolved, &profile, p);
+        let mut mgr = styles_manager();
+        let mut blocks = Blocks::new();
+        let id = blocks.start_new_block(&mut mgr, &dom, p, &style, false, None, false);
+        blocks.finish_tag(p, &style);
+        assert!(!blocks.block(id).page_break_after);
+    }
+
+    #[test]
+    fn finish_tag_is_a_no_op_for_a_tag_that_was_never_opened() {
+        let dom = make("<html><body><p>x</p><p>y</p></body></html>");
+        let ps: Vec<NodeId> = dom
+            .preorder_elements(dom.root)
+            .into_iter()
+            .filter(|&id| dom.tag(id) == Some("p"))
+            .collect();
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style = plain_style(&dom, &resolved, &profile, ps[0]);
+        let mut mgr = styles_manager();
+        let mut blocks = Blocks::new();
+        blocks.start_new_block(&mut mgr, &dom, ps[0], &style, false, None, false);
+        // ps[1] was never opened as a block start.
+        blocks.finish_tag(ps[1], &style);
+        assert!(
+            blocks.current_block().is_some(),
+            "unrelated tag must not end the real current block"
+        );
+    }
+
+    #[test]
+    fn delete_block_at_removes_and_transfers_bookmarks_and_page_breaks_to_the_next_block() {
+        let dom = make("<html><body><p>x</p><p>y</p></body></html>");
+        let ps: Vec<NodeId> = dom
+            .preorder_elements(dom.root)
+            .into_iter()
+            .filter(|&id| dom.tag(id) == Some("p"))
+            .collect();
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style1 = plain_style(&dom, &resolved, &profile, ps[0]);
+        let style2 = plain_style(&dom, &resolved, &profile, ps[1]);
+        let mut mgr = styles_manager();
+        let mut blocks = Blocks::new();
+        let first = blocks.start_new_block(&mut mgr, &dom, ps[0], &style1, false, None, false);
+        blocks
+            .block_mut(first)
+            .bookmarks
+            .insert("mark1".to_string());
+        blocks.block_mut(first).page_break_after = true;
+        blocks.end_current_block();
+        let second = blocks.start_new_block(&mut mgr, &dom, ps[1], &style2, false, None, false);
+        blocks.end_current_block();
+        blocks.delete_block_at(Some(0));
+        assert_eq!(blocks.all_blocks(), &[second]);
+        assert_eq!(blocks.items(), &[second]);
+        assert!(blocks.block(second).bookmarks.contains("mark1"));
+        assert!(blocks.block(second).page_break_after);
+    }
+
+    #[test]
+    fn begin_end_item_deletes_an_empty_leading_block_and_marks_the_next_page_break() {
+        let dom = make("<html><body><p></p><p>y</p></body></html>");
+        let ps: Vec<NodeId> = dom
+            .preorder_elements(dom.root)
+            .into_iter()
+            .filter(|&id| dom.tag(id) == Some("p"))
+            .collect();
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style1 = plain_style(&dom, &resolved, &profile, ps[0]);
+        let style2 = plain_style(&dom, &resolved, &profile, ps[1]);
+        let mut mgr = styles_manager();
+        let mut blocks = Blocks::new();
+        // A prior real item already put one block in all_blocks, so
+        // begin_item's `pos` is non-zero -- matching Python's own
+        // "insert a page break at the start of this html file" case.
+        let prior = blocks.start_new_block(&mut mgr, &dom, ps[0], &style1, false, None, false);
+        blocks.end_current_block();
+        blocks.begin_item();
+        blocks.top_bookmark = Some("top1".to_string());
+        // Empty block (never got any text) for this "item".
+        blocks.start_new_block(&mut mgr, &dom, ps[0], &style1, false, None, false);
+        blocks.end_current_block();
+        let real = blocks.start_new_block(&mut mgr, &dom, ps[1], &style2, false, None, false);
+        blocks
+            .block_mut(real)
+            .add_text(&mut mgr, "y", &style2, false, None, false, None, None, None);
+        blocks.end_current_block();
+        blocks.end_item(true);
+        assert_eq!(blocks.all_blocks(), &[prior, real]);
+        assert!(blocks.block(real).page_break_before);
+        assert!(blocks.block(real).bookmarks.contains("top1"));
+        assert_eq!(blocks.top_bookmark, None);
+    }
+
+    #[test]
+    fn end_item_with_ok_false_does_nothing() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style = plain_style(&dom, &resolved, &profile, p);
+        let mut mgr = styles_manager();
+        let mut blocks = Blocks::new();
+        blocks.start_new_block(&mut mgr, &dom, p, &style, false, None, false);
+        blocks.begin_item();
+        blocks.top_bookmark = Some("keep-me".to_string());
+        blocks.end_item(false);
+        assert!(
+            blocks.current_block().is_some(),
+            "current_block untouched when ok is false"
+        );
+        assert_eq!(blocks.top_bookmark, Some("keep-me".to_string()));
+    }
+
+    #[test]
+    fn apply_page_break_after_propagates_to_the_next_block_only() {
+        let dom = make("<html><body><p>a</p><p>b</p><p>c</p></body></html>");
+        let ps: Vec<NodeId> = dom
+            .preorder_elements(dom.root)
+            .into_iter()
+            .filter(|&id| dom.tag(id) == Some("p"))
+            .collect();
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let mut mgr = styles_manager();
+        let mut blocks = Blocks::new();
+        let mut ids = Vec::new();
+        for &p in &ps {
+            let style = plain_style(&dom, &resolved, &profile, p);
+            ids.push(blocks.start_new_block(&mut mgr, &dom, p, &style, false, None, false));
+            blocks.end_current_block();
+        }
+        blocks.block_mut(ids[1]).page_break_after = true;
+        blocks.apply_page_break_after();
+        assert!(!blocks.block(ids[0]).page_break_before);
+        assert!(!blocks.block(ids[1]).page_break_before);
+        assert!(blocks.block(ids[2]).page_break_before);
+    }
+
+    #[test]
+    fn apply_page_break_after_on_the_last_block_does_nothing() {
+        let dom = make("<html><body><p>a</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style = plain_style(&dom, &resolved, &profile, p);
+        let mut mgr = styles_manager();
+        let mut blocks = Blocks::new();
+        let id = blocks.start_new_block(&mut mgr, &dom, p, &style, false, None, false);
+        blocks.end_current_block();
+        blocks.block_mut(id).page_break_after = true;
+        blocks.apply_page_break_after();
+        // No panic and nothing to assert beyond "didn't crash" -- the
+        // real assertion is that this doesn't index out of bounds.
+    }
+
+    fn add_lang_run(
+        blocks: &mut Blocks,
+        mgr: &mut StylesManager,
+        id: BlockId,
+        style: &Style,
+        lang: Option<&str>,
+    ) {
+        blocks.block_mut(id).add_text(
+            mgr,
+            "x",
+            style,
+            false,
+            None,
+            false,
+            None,
+            None,
+            lang.map(str::to_string),
+        );
+    }
+
+    #[test]
+    fn resolve_language_sets_block_lang_to_the_most_common_and_clears_matching_runs() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style = plain_style(&dom, &resolved, &profile, p);
+        let mut mgr = styles_manager();
+        let mut blocks = Blocks::new();
+        let id = blocks.start_new_block(&mut mgr, &dom, p, &style, false, None, false);
+        // Two runs tagged "de", one "fr" -- "de" wins.
+        add_lang_run(&mut blocks, &mut mgr, id, &style, Some("de"));
+        blocks.block_mut(id).add_break("none", None);
+        add_lang_run(&mut blocks, &mut mgr, id, &style, Some("fr"));
+        blocks.block_mut(id).add_break("none", None);
+        add_lang_run(&mut blocks, &mut mgr, id, &style, Some("de"));
+        blocks.end_current_block();
+        blocks.resolve_language("en");
+        assert_eq!(blocks.block(id).block_lang.as_deref(), Some("de"));
+        for run in &blocks.block(id).runs {
+            if run.lang.as_deref() == Some("fr") {
+                continue;
+            }
+            assert_eq!(run.lang, None, "runs matching the winning lang get cleared");
+        }
+    }
+
+    #[test]
+    fn resolve_language_clears_block_lang_when_it_matches_the_document_default() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style = plain_style(&dom, &resolved, &profile, p);
+        let mut mgr = styles_manager();
+        let mut blocks = Blocks::new();
+        let id = blocks.start_new_block(&mut mgr, &dom, p, &style, false, None, false);
+        add_lang_run(&mut blocks, &mut mgr, id, &style, Some("en"));
+        blocks.end_current_block();
+        blocks.resolve_language("en");
+        assert_eq!(blocks.block(id).block_lang, None);
+    }
+
+    #[test]
+    fn resolve_language_skips_a_block_with_no_runs() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style = plain_style(&dom, &resolved, &profile, p);
+        let mut mgr = styles_manager();
+        let mut blocks = Blocks::new();
+        let id = blocks.start_new_block(&mut mgr, &dom, p, &style, false, None, false);
+        blocks.end_current_block();
+        blocks.resolve_language("en");
+        assert_eq!(blocks.block(id).block_lang, None);
     }
 }

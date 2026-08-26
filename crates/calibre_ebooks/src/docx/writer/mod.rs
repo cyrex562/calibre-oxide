@@ -15,8 +15,9 @@
 //! | `from_html.py` (partial) | [`from_html`] |
 //!
 //! Still to come, tracked as issue #132: `tables.py`, `images.py`,
-//! `lists.py`, `from_html.py`'s `Blocks`/`Convert` (see
-//! [`from_html`]'s module docs), plus `styles.py`'s `CombinedStyle`/
+//! `lists.py`, `from_html.py`'s `Convert` and `Blocks`' `Table`-related
+//! methods/`.serialize` (see [`from_html`]'s module docs), plus
+//! `styles.py`'s `CombinedStyle`/
 //! `StylesManager.finalize`/`.serialize` and `links.py`'s
 //! TOC-serialization half (`LinksManager.process_toc_node`/
 //! `.process_toc_links`/`.serialize_toc` -- see [`links`]'s module
@@ -57,7 +58,7 @@ pub use container::{
     create_skeleton, DocumentRelationships, DocxWriter, Margins, PageOptions, Skeleton,
 };
 pub use fonts::{obfuscate_font_data, FontFace, FontsManager, Slot};
-pub use from_html::{Block, LinkTarget, TextRun};
+pub use from_html::{Block, BlockId, Blocks, LinkTarget, TextRun};
 pub use links::{LinksManager, TocItem};
 pub use styles::{BlockStyleId, StylesManager, TextStyleId};
 pub use utils::{convert_color, int_or_zero};
