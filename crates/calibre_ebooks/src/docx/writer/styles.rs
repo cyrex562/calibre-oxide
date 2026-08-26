@@ -1,21 +1,24 @@
 //! CSS -> OOXML property conversion: `docx/writer/styles.py`'s
-//! `TextStyle`/`BlockStyle`/`FloatSpec`, data model and serialization.
+//! `TextStyle`/`BlockStyle` (data model + serialization) and
+//! `FloatSpec` (data model only, so far).
 //!
 //! Port of `TextStyle`/`BlockStyle`/`FloatSpec`'s CSS-reading
-//! constructors and their `serialize`/`serialize_properties` methods
-//! (writing to real `w:rPr`/`w:pPr`/`w:framePr` XML via
-//! [`super::xml::Element`]), plus the module-level helpers
+//! constructors, plus `TextStyle`/`BlockStyle`'s `serialize`/
+//! `serialize_properties` methods (writing to real `w:rPr`/`w:pPr` XML
+//! via [`super::xml::Element`]), plus the module-level helpers
 //! (`css_font_family_to_docx`/`parse_css_font_family`,
 //! `convert_underline`, `bmap`, `LINE_STYLES`, `is_dropcaps`,
-//! `read_css_block_borders`). `DOCXStyle`'s hash/dedup base class
-//! (`id`/`name`/`next_style` bookkeeping), `CombinedStyle`,
+//! `read_css_block_borders`, `parse_css_length`). `FloatSpec.serialize`
+//! (real `w:framePr` XML), `DOCXStyle`'s hash/dedup base class (`id`/
+//! `name`/`next_style` bookkeeping), `CombinedStyle`,
 //! `DescendantTextStyle`, and `StylesManager` (deduplication +
 //! `w:styles` assembly) are not ported yet -- see issue #23's own
-//! tracking notes. `serialize`'s `id`/`name`/`is_normal_style` are
-//! plain parameters here rather than fields Python stores on `self`
-//! (`DOCXStyle.id`/`.name`), since nothing yet needs to persist them
-//! on a `TextStyle`/`BlockStyle` instance itself -- that's exactly the
-//! bookkeeping `StylesManager`'s still-unported `finalize` assigns.
+//! tracking notes. `serialize`'s `id`/`name`/`is_normal_style`/
+//! `next_style` are plain parameters here rather than fields Python
+//! stores on `self` (`DOCXStyle.id`/`.name`/`.next_style`), since
+//! nothing yet needs to persist them on a `TextStyle`/`BlockStyle`
+//! instance itself -- that's exactly the bookkeeping `StylesManager`'s
+//! still-unported `finalize` assigns.
 //!
 //! Reads against [`crate::oeb::polish::style::Style`] -- the seam
 //! issue #132 needed, not the stub `oeb::stylizer::Stylizer` its own
@@ -152,6 +155,26 @@ fn border_width_value(style: &Style, edge: &str) -> f64 {
             _ => 0.0,
         },
     }
+}
+
+/// Splits a CSS length into `(number, lowercased unit)` -- port of
+/// `calibre.ebooks.parse_css_length`. `None` for `value: None`
+/// (Python's `UNIT_RE.match(None)` raises `TypeError`, caught and
+/// turned into `(None, None)`), an unparseable value, or one with no
+/// number at all (Python's own falsy-empty-string check on
+/// `m.group(1)`).
+fn parse_css_length(value: Option<&str>) -> Option<(f64, String)> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"^(-*[0-9]*[.]?[0-9]*)\s*(%|em|ex|en|px|mm|cm|in|pt|pc|rem|q)$").unwrap()
+    });
+    let caps = re.captures(value?)?;
+    let num_str = caps.get(1)?.as_str();
+    if num_str.is_empty() {
+        return None;
+    }
+    let num: f64 = num_str.parse().ok()?;
+    Some((num, caps.get(2)?.as_str().to_ascii_lowercase()))
 }
 
 /// The run-level CSS -> `w:rPr` property set -- port of `TextStyle`'s
@@ -606,6 +629,71 @@ pub struct BlockBorders {
     pub border_bottom_color: Option<String>,
 }
 
+impl BlockBorders {
+    /// Port of Python's `getattr(self, 'margin_' + edge)` -- a
+    /// by-edge-name accessor `BlockBorders`' flat fields don't offer
+    /// natively (Rust has no runtime attribute reflection).
+    fn margin(&self, edge: &str) -> i64 {
+        match edge {
+            "left" => self.margin_left,
+            "top" => self.margin_top,
+            "right" => self.margin_right,
+            "bottom" => self.margin_bottom,
+            _ => 0,
+        }
+    }
+
+    fn css_margin(&self, edge: &str) -> &str {
+        match edge {
+            "left" => &self.css_margin_left,
+            "top" => &self.css_margin_top,
+            "right" => &self.css_margin_right,
+            "bottom" => &self.css_margin_bottom,
+            _ => "",
+        }
+    }
+
+    fn padding(&self, edge: &str) -> i64 {
+        match edge {
+            "left" => self.padding_left,
+            "top" => self.padding_top,
+            "right" => self.padding_right,
+            "bottom" => self.padding_bottom,
+            _ => 0,
+        }
+    }
+
+    fn border_width(&self, edge: &str) -> i64 {
+        match edge {
+            "left" => self.border_left_width,
+            "top" => self.border_top_width,
+            "right" => self.border_right_width,
+            "bottom" => self.border_bottom_width,
+            _ => 0,
+        }
+    }
+
+    fn border_style(&self, edge: &str) -> &str {
+        match edge {
+            "left" => &self.border_left_style,
+            "top" => &self.border_top_style,
+            "right" => &self.border_right_style,
+            "bottom" => &self.border_bottom_style,
+            _ => "none",
+        }
+    }
+
+    fn border_color(&self, edge: &str) -> Option<&str> {
+        match edge {
+            "left" => self.border_left_color.as_deref(),
+            "top" => self.border_top_color.as_deref(),
+            "right" => self.border_right_color.as_deref(),
+            "bottom" => self.border_bottom_color.as_deref(),
+            _ => None,
+        }
+    }
+}
+
 /// The lowercased raw `border-{edge}-style` CSS keyword, per edge --
 /// `read_css_block_borders`'s `store_css_style=True` output, needed
 /// only by `tables.py` (not yet ported) to tell "explicitly `none`"
@@ -846,6 +934,188 @@ impl BlockStyle {
             background_color,
             text_align,
         }
+    }
+
+    /// Port of `DOCXStyle.serialize` + `BlockStyle.serialize`
+    /// combined -- see [`TextStyle::serialize`] for why `id`/`name`/
+    /// `is_normal_style`/`next_style` are parameters, not fields.
+    #[allow(clippy::too_many_arguments)]
+    pub fn serialize(
+        &self,
+        id: &str,
+        name: &str,
+        is_normal_style: bool,
+        normal_style: &BlockStyle,
+        normal_style_id: &str,
+        next_style: Option<&str>,
+    ) -> Element {
+        let mut style = Element::new("w:style")
+            .attr("w:styleId", id)
+            .attr("w:type", "paragraph")
+            .with(Element::new("w:name").attr("w:val", name));
+        if !is_normal_style {
+            style = style.with(Element::new("w:basedOn").attr("w:val", normal_style_id));
+        }
+        let mut ppr = Element::new("w:pPr");
+        self.serialize_properties(&mut ppr, is_normal_style, normal_style, next_style);
+        if !ppr.is_empty() {
+            style = style.with(ppr);
+        }
+        style
+    }
+
+    /// Port of `BlockStyle.serialize_properties`.
+    pub fn serialize_properties(
+        &self,
+        ppr: &mut Element,
+        is_normal_style: bool,
+        normal_style: &BlockStyle,
+        next_style: Option<&str>,
+    ) {
+        let mut spacing = Element::new("w:spacing");
+        for (edge, attr) in [("top", "before"), ("bottom", "after")] {
+            let css_margin = self.borders.css_margin(edge);
+            match parse_css_length(Some(css_margin)) {
+                Some((val, unit)) if unit == "em" || unit == "ex" => {
+                    let lines = ((val * if unit == "ex" { 50.0 } else { 100.0 }) as i64).max(0);
+                    if (is_normal_style && lines > 0)
+                        || css_margin != normal_style.borders.css_margin(edge)
+                    {
+                        spacing.set(format!("w:{attr}Lines"), lines.to_string());
+                    }
+                }
+                _ => {
+                    let val = self.borders.margin(edge);
+                    if (is_normal_style && val > 0) || val != normal_style.borders.margin(edge) {
+                        spacing.set(format!("w:{attr}"), val.to_string());
+                    }
+                }
+            }
+        }
+
+        if is_normal_style || self.line_height != normal_style.line_height {
+            spacing.set("w:line", self.line_height.to_string());
+            spacing.set("w:lineRule", "atLeast");
+        }
+
+        if !spacing.attrs.is_empty() {
+            ppr.append(spacing);
+        }
+
+        let mut ind = Element::new("w:ind");
+        for edge in ["left", "right"] {
+            let css_margin = self.borders.css_margin(edge);
+            match parse_css_length(Some(css_margin)) {
+                Some((val, unit)) if unit == "em" || unit == "ex" => {
+                    let chars = ((val * if unit == "ex" { 50.0 } else { 100.0 }) as i64).max(0);
+                    if (is_normal_style && chars > 0)
+                        || css_margin != normal_style.borders.css_margin(edge)
+                    {
+                        ind.set(format!("w:{edge}Chars"), chars.to_string());
+                    }
+                }
+                _ => {
+                    let val = self.borders.margin(edge);
+                    if (is_normal_style && val > 0) || val != normal_style.borders.margin(edge) {
+                        ind.set(format!("w:{edge}"), val.to_string());
+                        ind.set(format!("w:{edge}Chars"), "0");
+                    }
+                }
+            }
+        }
+        match parse_css_length(self.css_text_indent.as_deref()) {
+            Some((css_val, unit)) if unit == "em" || unit == "ex" => {
+                let chars = (css_val * if unit == "ex" { 50.0 } else { 100.0 }) as i64;
+                if css_val >= 0.0 {
+                    if (is_normal_style && chars > 0)
+                        || self.css_text_indent != normal_style.css_text_indent
+                    {
+                        ind.set("w:firstLineChars", chars.to_string());
+                    }
+                } else if (is_normal_style && chars < 0)
+                    || self.css_text_indent != normal_style.css_text_indent
+                {
+                    ind.set("w:hangingChars", chars.unsigned_abs().to_string());
+                }
+            }
+            _ => {
+                let val = self.text_indent;
+                if val >= 0 {
+                    if (is_normal_style && val > 0) || val != normal_style.text_indent {
+                        ind.set("w:firstLine", val.to_string());
+                        ind.set("w:firstLineChars", "0");
+                    }
+                } else if (is_normal_style && val < 0) || val != normal_style.text_indent {
+                    ind.set("w:hanging", val.unsigned_abs().to_string());
+                    ind.set("w:hangingChars", "0");
+                }
+            }
+        }
+        if !ind.attrs.is_empty() {
+            ppr.append(ind);
+        }
+
+        if (is_normal_style && self.background_color.is_some())
+            || self.background_color != normal_style.background_color
+        {
+            ppr.append(
+                Element::new("w:shd")
+                    .attr("w:val", "clear")
+                    .attr("w:color", "auto")
+                    .attr(
+                        "w:fill",
+                        self.background_color
+                            .clone()
+                            .unwrap_or_else(|| "auto".to_string()),
+                    ),
+            );
+        }
+
+        let pbdr = self.serialize_borders(is_normal_style, normal_style);
+        if pbdr.child_count() > 0 {
+            ppr.append(pbdr);
+        }
+
+        if is_normal_style || self.text_align != normal_style.text_align {
+            ppr.append(Element::new("w:jc").attr("w:val", self.text_align.clone()));
+        }
+
+        if !is_normal_style {
+            if let Some(next) = next_style {
+                ppr.append(Element::new("w:next").attr("w:val", next));
+            }
+        }
+    }
+
+    /// Port of `BlockStyle.serialize_borders`: one `<w:{edge}>` child
+    /// per edge, inside a `<w:pBdr>` wrapper, each only carrying the
+    /// attributes that differ from `normal_style` (or, for the Normal
+    /// style itself, whichever attributes are actually non-default).
+    fn serialize_borders(&self, is_normal_style: bool, normal_style: &BlockStyle) -> Element {
+        let mut pbdr = Element::new("w:pBdr");
+        for edge in BORDER_EDGES {
+            let mut e = Element::new(format!("w:{edge}"));
+            let padding = self.borders.padding(edge);
+            if (is_normal_style && padding > 0) || padding != normal_style.borders.padding(edge) {
+                e.set("w:space", padding.to_string());
+            }
+            let width = self.borders.border_width(edge);
+            let bstyle = self.borders.border_style(edge);
+            if (is_normal_style && width > 0 && bstyle != "none")
+                || width != normal_style.borders.border_width(edge)
+                || bstyle != normal_style.borders.border_style(edge)
+            {
+                e.set("w:val", bstyle);
+                e.set("w:sz", width.to_string());
+                if let Some(color) = self.borders.border_color(edge) {
+                    e.set("w:color", color);
+                }
+            }
+            if !e.attrs.is_empty() {
+                pbdr.append(e);
+            }
+        }
+        pbdr
     }
 }
 
@@ -1359,6 +1629,121 @@ mod tests {
             BlockStyle::from_css(Some(&style), false, None).text_align,
             "left"
         );
+    }
+
+    fn block_style_of(props: &[(&str, &str)]) -> BlockStyle {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[(p, props)]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, p);
+        BlockStyle::from_css(Some(&style), false, None)
+    }
+
+    #[test]
+    fn block_style_serialize_properties_for_the_normal_style_emits_line_spacing_and_alignment() {
+        let normal = block_style_of(&[]);
+        let mut ppr = Element::new("w:pPr");
+        normal.serialize_properties(&mut ppr, true, &normal, None);
+        let spacing = ppr.children_named("w:spacing").next().unwrap();
+        assert_eq!(
+            spacing.get("w:line"),
+            Some(normal.line_height.to_string()).as_deref()
+        );
+        let jc = ppr.children_named("w:jc").next().unwrap();
+        assert_eq!(jc.get("w:val"), Some("left"));
+    }
+
+    #[test]
+    fn block_style_serialize_properties_only_emits_alignment_when_it_differs() {
+        let normal = block_style_of(&[]);
+        let centered = block_style_of(&[("text-align", "center")]);
+        let mut ppr = Element::new("w:pPr");
+        centered.serialize_properties(&mut ppr, false, &normal, None);
+        let jc = ppr.children_named("w:jc").next().unwrap();
+        assert_eq!(jc.get("w:val"), Some("center"));
+
+        let mut ppr2 = Element::new("w:pPr");
+        normal.serialize_properties(&mut ppr2, false, &normal, None);
+        assert!(
+            ppr2.children_named("w:jc").next().is_none(),
+            "identical alignment to normal_style is not re-emitted"
+        );
+    }
+
+    #[test]
+    fn block_style_serialize_properties_em_margin_uses_lines_not_absolute_twips() {
+        let normal = block_style_of(&[]);
+        let spaced = block_style_of(&[("margin-top", "2em")]);
+        let mut ppr = Element::new("w:pPr");
+        spaced.serialize_properties(&mut ppr, false, &normal, None);
+        let spacing = ppr.children_named("w:spacing").next().unwrap();
+        assert_eq!(spacing.get("w:beforeLines"), Some("200"), "2em * 100");
+        assert_eq!(spacing.get("w:before"), None);
+    }
+
+    #[test]
+    fn block_style_serialize_properties_positive_text_indent_sets_first_line() {
+        let normal = block_style_of(&[]);
+        let indented = block_style_of(&[("text-indent", "10pt")]);
+        let mut ppr = Element::new("w:pPr");
+        indented.serialize_properties(&mut ppr, false, &normal, None);
+        let ind = ppr.children_named("w:ind").next().unwrap();
+        assert_eq!(ind.get("w:firstLine"), Some("200"), "10pt * 20 twentieths");
+        assert_eq!(ind.get("w:firstLineChars"), Some("0"));
+    }
+
+    #[test]
+    fn block_style_serialize_properties_negative_text_indent_sets_hanging() {
+        let normal = block_style_of(&[]);
+        let hanging = block_style_of(&[("text-indent", "-10pt")]);
+        let mut ppr = Element::new("w:pPr");
+        hanging.serialize_properties(&mut ppr, false, &normal, None);
+        let ind = ppr.children_named("w:ind").next().unwrap();
+        assert_eq!(ind.get("w:hanging"), Some("200"));
+        assert_eq!(ind.get("w:hangingChars"), Some("0"));
+    }
+
+    #[test]
+    fn block_style_serialize_properties_next_style_only_appears_on_non_normal_styles() {
+        let normal = block_style_of(&[]);
+        let other = block_style_of(&[("text-align", "right")]);
+        let mut ppr = Element::new("w:pPr");
+        other.serialize_properties(&mut ppr, false, &normal, Some("Body Text"));
+        let next = ppr.children_named("w:next").next().unwrap();
+        assert_eq!(next.get("w:val"), Some("Body Text"));
+
+        let mut ppr2 = Element::new("w:pPr");
+        normal.serialize_properties(&mut ppr2, true, &normal, Some("Body Text"));
+        assert!(ppr2.children_named("w:next").next().is_none());
+    }
+
+    #[test]
+    fn block_style_serialize_borders_emits_one_child_per_declared_edge() {
+        let normal = block_style_of(&[]);
+        let bordered = block_style_of(&[
+            ("border-left-style", "solid"),
+            ("border-left-color", "#ff0000"),
+        ]);
+        let mut ppr = Element::new("w:pPr");
+        bordered.serialize_properties(&mut ppr, false, &normal, None);
+        let pbdr = ppr.children_named("w:pBdr").next().unwrap();
+        let left = pbdr.children_named("w:left").next().unwrap();
+        assert_eq!(left.get("w:val"), Some("single"));
+        assert_eq!(left.get("w:color"), Some("FF0000"));
+        assert!(pbdr.children_named("w:top").next().is_none());
+    }
+
+    #[test]
+    fn block_style_serialize_wraps_style_id_name_and_based_on() {
+        let normal = block_style_of(&[]);
+        let other = block_style_of(&[("text-align", "right")]);
+        let el = other.serialize("Para1", "1 Para", false, &normal, "Normal", None);
+        assert_eq!(el.name, "w:style");
+        assert_eq!(el.get("w:styleId"), Some("Para1"));
+        assert_eq!(el.get("w:type"), Some("paragraph"));
+        let based_on = el.children_named("w:basedOn").next().unwrap();
+        assert_eq!(based_on.get("w:val"), Some("Normal"));
     }
 
     #[test]
