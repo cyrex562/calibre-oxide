@@ -5,25 +5,28 @@
 //! Port of `TextStyle`/`BlockStyle`/`FloatSpec`'s CSS-reading
 //! constructors and `serialize`/`serialize_properties` methods
 //! (writing to real `w:rPr`/`w:pPr`/`w:framePr` XML via
-//! [`super::xml::Element`]), plus the module-level helpers
-//! (`css_font_family_to_docx`/`parse_css_font_family`,
-//! `convert_underline`, `bmap`, `LINE_STYLES`, `is_dropcaps`,
-//! `read_css_block_borders`, `parse_css_length`). `FloatSpec::serialize`
-//! doesn't diff against a `normal_style` at all (a float always emits
-//! every attribute/edge unconditionally, unlike `TextStyle`/
-//! `BlockStyle`) -- it takes `is_first_block`/`is_last_block` instead,
-//! standing in for Python's `block is self.blocks[0]`/`self.blocks[-1]`
-//! identity checks (`self.blocks` itself isn't tracked here -- needs
-//! `from_html.py`'s `Block` type, not ported yet). `DOCXStyle`'s
-//! hash/dedup base class (`id`/`name`/`next_style` bookkeeping),
-//! `CombinedStyle`, `DescendantTextStyle`, and `StylesManager`
-//! (deduplication + `w:styles` assembly) are not ported yet -- see
-//! issue #23's own tracking notes. `serialize`'s `id`/`name`/
-//! `is_normal_style`/`next_style` are plain parameters here rather
-//! than fields Python stores on `self` (`DOCXStyle.id`/`.name`/
-//! `.next_style`), since nothing yet needs to persist them on a
-//! `TextStyle`/`BlockStyle` instance itself -- that's exactly the
-//! bookkeeping `StylesManager`'s still-unported `finalize` assigns.
+//! [`super::xml::Element`]), plus [`DescendantTextStyle`] (a run's
+//! `w:rPr` overrides relative to its containing block, DOCX's
+//! approximation of HTML/CSS's nested inline formatting), plus the
+//! module-level helpers (`css_font_family_to_docx`/
+//! `parse_css_font_family`, `convert_underline`, `bmap`,
+//! `LINE_STYLES`, `is_dropcaps`, `read_css_block_borders`,
+//! `parse_css_length`). `FloatSpec::serialize` doesn't diff against a
+//! `normal_style` at all (a float always emits every attribute/edge
+//! unconditionally, unlike `TextStyle`/`BlockStyle`) -- it takes
+//! `is_first_block`/`is_last_block` instead, standing in for Python's
+//! `block is self.blocks[0]`/`self.blocks[-1]` identity checks
+//! (`self.blocks` itself isn't tracked here -- needs `from_html.py`'s
+//! `Block` type, not ported yet). `DOCXStyle`'s hash/dedup base class
+//! (`id`/`name`/`next_style` bookkeeping), `CombinedStyle`, and
+//! `StylesManager` (deduplication + `w:styles` assembly) are not
+//! ported yet -- see issue #23's own tracking notes. `serialize`'s
+//! `id`/`name`/`is_normal_style`/`next_style` are plain parameters
+//! here rather than fields Python stores on `self` (`DOCXStyle.id`/
+//! `.name`/`.next_style`), since nothing yet needs to persist them on
+//! a `TextStyle`/`BlockStyle`/`DescendantTextStyle` instance itself --
+//! that's exactly the bookkeeping `StylesManager`'s still-unported
+//! `finalize` assigns.
 //!
 //! Reads against [`crate::oeb::polish::style::Style`] -- the seam
 //! issue #132 needed, not the stub `oeb::stylizer::Stylizer` its own
@@ -1288,6 +1291,189 @@ impl FloatSpec {
     }
 }
 
+/// A run's `w:rPr` overrides relative to its *containing block*'s own
+/// resolved style -- port of `DescendantTextStyle`. DOCX has no
+/// concept of nested inline formatting the way HTML/CSS does (a `<b>`
+/// inside a `<span style="color:red">` is two nested elements in
+/// HTML, but DOCX runs are flat) -- Word approximates the effect with
+/// a *second*, descendant-only character style Word applies on top of
+/// the run's own paragraph-linked style, and this is exactly that
+/// diff, holding only the properties that actually changed between
+/// `parent_style` (the containing block's own [`TextStyle`],
+/// `is_parent_style: true`) and `child_style` (the run's real own
+/// [`TextStyle`]).
+///
+/// `id`/`name` are plain [`DescendantTextStyle::serialize`] parameters
+/// rather than fields, same as [`TextStyle`]/[`BlockStyle`]'s -- see
+/// their own `serialize` docs for why.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DescendantTextStyle {
+    /// `(element name, attributes)` pairs, in the order Python's own
+    /// `add(...)` calls append them -- port of the `properties` tuple
+    /// `__hash__`/`__eq__` compare directly (a `frozenset` per entry
+    /// in Python; a plain `Vec` here since every `add()` call builds
+    /// its own attrs in the same fixed order every time, so two equal
+    /// instances always agree on order too).
+    pub properties: Vec<(String, Vec<(String, String)>)>,
+}
+
+impl DescendantTextStyle {
+    /// Port of `DescendantTextStyle.__init__`.
+    pub fn new(parent_style: &TextStyle, child_style: &TextStyle) -> Self {
+        let mut p: Vec<(String, Vec<(String, String)>)> = Vec::new();
+        let mut add = |name: &str, attrs: Vec<(String, String)>| {
+            p.push((name.to_string(), attrs));
+        };
+
+        if parent_style.font_family != child_style.font_family {
+            let family = child_style.font_family.clone().unwrap_or_default();
+            add(
+                "rFonts",
+                vec![
+                    ("w:ascii".to_string(), family.clone()),
+                    ("w:cs".to_string(), family.clone()),
+                    ("w:eastAsia".to_string(), family.clone()),
+                    ("w:hAnsi".to_string(), family),
+                ],
+            );
+        }
+
+        if parent_style.font_size != child_style.font_size {
+            let val = child_style.font_size.unwrap_or(0).to_string();
+            add("sz", vec![("w:val".to_string(), val.clone())]);
+            add("szCs", vec![("w:val".to_string(), val)]);
+        }
+        if parent_style.bold != child_style.bold {
+            add("b", vec![("w:val".to_string(), "on".to_string())]);
+            add("bCs", vec![("w:val".to_string(), "on".to_string())]);
+        }
+        if parent_style.italic != child_style.italic {
+            add("i", vec![("w:val".to_string(), "on".to_string())]);
+            add("iCs", vec![("w:val".to_string(), "on".to_string())]);
+        }
+
+        if parent_style.color != child_style.color {
+            add(
+                "color",
+                vec![(
+                    "w:val".to_string(),
+                    child_style
+                        .color
+                        .clone()
+                        .unwrap_or_else(|| "auto".to_string()),
+                )],
+            );
+        }
+        if parent_style.background_color != child_style.background_color {
+            add(
+                "shd",
+                vec![(
+                    "w:fill".to_string(),
+                    child_style
+                        .background_color
+                        .clone()
+                        .unwrap_or_else(|| "auto".to_string()),
+                )],
+            );
+        }
+        if parent_style.underline != child_style.underline {
+            if child_style.underline.is_empty() {
+                add("u", vec![("w:val".to_string(), "none".to_string())]);
+            } else {
+                let (style, color) = match child_style.underline.split_once(' ') {
+                    Some((s, c)) => (s.to_string(), c.to_string()),
+                    None => (child_style.underline.clone(), String::new()),
+                };
+                add(
+                    "u",
+                    vec![("w:val".to_string(), style), ("w:color".to_string(), color)],
+                );
+            }
+        }
+        if parent_style.dstrike != child_style.dstrike {
+            add(
+                "dstrike",
+                vec![("w:val".to_string(), bmap(child_style.dstrike).to_string())],
+            );
+        }
+        if parent_style.strike != child_style.strike {
+            add("strike", vec![("w:val".to_string(), "on".to_string())]);
+        }
+        if parent_style.caps != child_style.caps {
+            add("caps", vec![("w:val".to_string(), "on".to_string())]);
+        }
+        if parent_style.small_caps != child_style.small_caps {
+            add("smallCaps", vec![("w:val".to_string(), "on".to_string())]);
+        }
+        if parent_style.shadow != child_style.shadow {
+            add("shadow", vec![("w:val".to_string(), "on".to_string())]);
+        }
+        if parent_style.spacing != child_style.spacing {
+            add(
+                "spacing",
+                vec![(
+                    "w:val".to_string(),
+                    child_style.spacing.unwrap_or(0).to_string(),
+                )],
+            );
+        }
+        if parent_style.vertical_align != child_style.vertical_align {
+            if matches!(
+                child_style.vertical_align.as_str(),
+                "superscript" | "subscript" | "baseline"
+            ) {
+                add(
+                    "vertAlign",
+                    vec![("w:val".to_string(), child_style.vertical_align.clone())],
+                );
+            } else {
+                add(
+                    "position",
+                    vec![("w:val".to_string(), child_style.vertical_align.clone())],
+                );
+            }
+        }
+
+        let mut bdr = Vec::new();
+        if parent_style.padding != child_style.padding {
+            bdr.push(("w:space".to_string(), child_style.padding.to_string()));
+        }
+        if parent_style.border_width != child_style.border_width {
+            bdr.push(("w:sz".to_string(), child_style.border_width.to_string()));
+        }
+        if parent_style.border_style != child_style.border_style {
+            bdr.push(("w:val".to_string(), child_style.border_style.clone()));
+        }
+        if parent_style.border_color != child_style.border_color {
+            bdr.push(("w:color".to_string(), child_style.border_color.clone()));
+        }
+        if !bdr.is_empty() {
+            add("bdr", bdr);
+        }
+
+        DescendantTextStyle { properties: p }
+    }
+
+    /// Port of `DescendantTextStyle.serialize`: the standalone
+    /// `<w:style w:type="character">` element (not yet appended into
+    /// a `w:styles` document -- `StylesManager`'s job, not ported).
+    pub fn serialize(&self, id: &str, name: &str) -> Element {
+        let mut rpr = Element::new("w:rPr");
+        for (elem_name, attrs) in &self.properties {
+            let mut el = Element::new(format!("w:{elem_name}"));
+            for (k, v) in attrs {
+                el = el.attr(k.clone(), v.clone());
+            }
+            rpr.append(el);
+        }
+        Element::new("w:style")
+            .attr("w:styleId", id)
+            .attr("w:type", "character")
+            .with(Element::new("w:name").attr("w:val", name))
+            .with(rpr)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1975,5 +2161,112 @@ mod tests {
         assert_eq!(top.get("w:color"), Some("0000FF"));
         let left = pbdr.children_named("w:left").next().unwrap();
         assert_eq!(left.get("w:val"), Some("none"));
+    }
+
+    #[test]
+    fn descendant_text_style_is_empty_when_parent_and_child_match() {
+        let a = plain_text_style();
+        let b = plain_text_style();
+        let ds = DescendantTextStyle::new(&a, &b);
+        assert!(ds.properties.is_empty());
+    }
+
+    #[test]
+    fn descendant_text_style_bold_becomes_a_toggle_on_regardless_of_direction() {
+        let normal = plain_text_style();
+        let mut bold = normal.clone();
+        bold.bold = true;
+        let ds = DescendantTextStyle::new(&normal, &bold);
+        let (name, attrs) = ds
+            .properties
+            .iter()
+            .find(|(n, _)| n == "b")
+            .expect("b property present");
+        assert_eq!(name, "b");
+        assert_eq!(attrs, &vec![("w:val".to_string(), "on".to_string())]);
+    }
+
+    #[test]
+    fn descendant_text_style_font_size_carries_the_real_value_not_a_toggle() {
+        let normal = plain_text_style();
+        let mut bigger = normal.clone();
+        bigger.font_size = Some(48);
+        let ds = DescendantTextStyle::new(&normal, &bigger);
+        let (_, attrs) = ds.properties.iter().find(|(n, _)| n == "sz").unwrap();
+        assert_eq!(attrs, &vec![("w:val".to_string(), "48".to_string())]);
+    }
+
+    #[test]
+    fn descendant_text_style_underline_removed_emits_none() {
+        let mut normal = plain_text_style();
+        normal.underline = "single auto".to_string();
+        let mut child = normal.clone();
+        child.underline = String::new();
+        let ds = DescendantTextStyle::new(&normal, &child);
+        let (_, attrs) = ds.properties.iter().find(|(n, _)| n == "u").unwrap();
+        assert_eq!(attrs, &vec![("w:val".to_string(), "none".to_string())]);
+    }
+
+    #[test]
+    fn descendant_text_style_vertical_align_dispatches_like_text_style() {
+        let normal = plain_text_style();
+        let mut sup = normal.clone();
+        sup.vertical_align = "superscript".to_string();
+        let ds = DescendantTextStyle::new(&normal, &sup);
+        assert!(ds.properties.iter().any(|(n, _)| n == "vertAlign"));
+
+        let mut offset = normal.clone();
+        offset.vertical_align = "6".to_string();
+        let ds2 = DescendantTextStyle::new(&normal, &offset);
+        assert!(ds2.properties.iter().any(|(n, _)| n == "position"));
+    }
+
+    #[test]
+    fn descendant_text_style_border_changes_are_folded_into_one_bdr_element() {
+        let normal = plain_text_style();
+        let mut bordered = normal.clone();
+        bordered.border_width = 8;
+        bordered.border_style = "single".to_string();
+        let ds = DescendantTextStyle::new(&normal, &bordered);
+        let bdr_entries: Vec<_> = ds.properties.iter().filter(|(n, _)| n == "bdr").collect();
+        assert_eq!(
+            bdr_entries.len(),
+            1,
+            "one bdr element for all border changes"
+        );
+        let (_, attrs) = bdr_entries[0];
+        assert!(attrs.contains(&("w:sz".to_string(), "8".to_string())));
+        assert!(attrs.contains(&("w:val".to_string(), "single".to_string())));
+    }
+
+    #[test]
+    fn descendant_text_style_equal_diffs_hash_and_compare_equal() {
+        let normal = plain_text_style();
+        let mut bold_a = normal.clone();
+        bold_a.bold = true;
+        let mut bold_b = normal.clone();
+        bold_b.bold = true;
+        let a = DescendantTextStyle::new(&normal, &bold_a);
+        let b = DescendantTextStyle::new(&normal, &bold_b);
+        assert_eq!(a, b);
+        let mut set = HashSet::new();
+        set.insert(a);
+        assert!(set.contains(&b));
+    }
+
+    #[test]
+    fn descendant_text_style_serialize_wraps_style_id_and_name() {
+        let normal = plain_text_style();
+        let mut bold = normal.clone();
+        bold.bold = true;
+        let ds = DescendantTextStyle::new(&normal, &bold);
+        let el = ds.serialize("Text0", "0 Text");
+        assert_eq!(el.name, "w:style");
+        assert_eq!(el.get("w:styleId"), Some("Text0"));
+        assert_eq!(el.get("w:type"), Some("character"));
+        let name_el = el.children_named("w:name").next().unwrap();
+        assert_eq!(name_el.get("w:val"), Some("0 Text"));
+        let rpr = el.children_named("w:rPr").next().unwrap();
+        assert!(rpr.children_named("w:b").next().is_some());
     }
 }
