@@ -17,9 +17,13 @@
 //! | `images.py` (partial) | [`images`] |
 //! | `tables.py` (partial) | [`tables`] |
 //!
-//! Still to come, tracked as issue #132: `tables.py`'s `Cell`/`Row`/
-//! `Table` themselves (see [`tables`]'s module docs -- only the
-//! border/width foundation is ported so far), `images.py`'s
+//! Still to come, tracked as issue #132: the HTML-walk integration
+//! `tables.py`'s [`tables::Cell`]/[`tables::Row`]/[`tables::Table`]
+//! need to get built during a real conversion, plus every
+//! `.serialize` (see [`tables`]'s module docs -- the border/width
+//! foundation AND the types themselves, with their border-conflict-
+//! resolution algorithms, are now ported; only the stateful
+//! HTML-walk wiring and serialization are left), `images.py`'s
 //! `ImagesManager` itself (see [`images`]'s module docs -- only its
 //! self-contained utility layer is ported so far), and
 //! `from_html.py`'s `Convert.__call__`/`.write` and `Blocks`'
@@ -80,7 +84,8 @@ pub use lists::ListsManager;
 pub use styles::{BlockStyleId, CombinedStyle, StylesManager, TextStyleId};
 pub use tables::{
     as_percent, border_style_weight, convert_width, read_css_block_borders, table_background_color,
-    Border, EdgeBorders,
+    Border, Cell, CellId, CellSlot, EdgeBorders, ResolvedBorders, Row, RowId, SpannedCell, Table,
+    TableId, Tables,
 };
 pub use utils::{convert_color, int_or_zero};
 pub use xml::Element;
