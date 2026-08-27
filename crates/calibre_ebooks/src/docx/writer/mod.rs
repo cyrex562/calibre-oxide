@@ -17,37 +17,38 @@
 //! | `images.py` (partial) | [`images`] |
 //! | `tables.py` | [`tables`] |
 //!
-//! Still to come, tracked as issue #132: `from_html.py`'s own
-//! `Blocks::serialize` (see [`tables`]'s module docs -- `tables.py`
-//! itself is now FULLY ported, including every `.serialize` method;
-//! `Tables::serialize_cell`/`::serialize_row`/`::serialize_table` take
-//! a `serialize_block` callback for the one piece they can't resolve
-//! on their own, a real `Block`'s content, and `Blocks::serialize` is
-//! what will build that closure and call in). `from_html.py`'s
-//! `Blocks` has real table support too: its own `tables` stack of
-//! currently-open tables, `finish_tag`'s table-closing branch (moving
-//! a finished table into its parent -- nesting it into a still-open
-//! outer table, or appending it to `Blocks`' own top-level `items`),
-//! a real `items: Vec<ItemId>` holding both `Block`s and finished
-//! `Table`s, and [`from_html::Block`] gained a real
-//! [`from_html::ItemContainer`] field (Python's `parent_items`,
-//! finally meaningful now that a block can live in either `Blocks`'
-//! own items or a table cell's). [`from_html::process_tag`]'s own
-//! table-`display` dispatch (`table`/`table-row`/`table-cell`, into
+//! Still to come, tracked as issue #132: `from_html.py`'s
+//! `Convert.__call__`/`.write` (see [`from_html`]'s module docs --
+//! `Convert`'s core element walker, `Blocks`' `Table`-related methods,
+//! AND `Blocks::serialize` itself are all ported now; only the
+//! top-level orchestration remains). `from_html.py`'s `Blocks` has
+//! real table support: its own `tables` stack of currently-open
+//! tables, `finish_tag`'s table-closing branch (moving a finished
+//! table into its parent -- nesting it into a still-open outer table,
+//! or appending it to `Blocks`' own top-level `items`), a real
+//! `items: Vec<ItemId>` holding both `Block`s and finished `Table`s,
+//! and [`from_html::Block`] gained a real [`from_html::ItemContainer`]
+//! field (Python's `parent_items`, finally meaningful now that a
+//! block can live in either `Blocks`' own items or a table cell's).
+//! [`from_html::process_tag`]'s own table-`display` dispatch
+//! (`table`/`table-row`/`table-cell`, into
 //! `Blocks::start_new_table`/`::start_new_row`/`::start_new_cell`) is
-//! wired up too -- real table content now flows all the way through
-//! the walker AND can be written out at the `tables.py` level; only
-//! `Blocks::serialize` itself is missing. `images.py`'s
+//! wired up too, and `Blocks::serialize` (see [`tables`]'s module
+//! docs -- `tables.py` itself is now FULLY ported, including every
+//! `.serialize` method; `Tables::serialize_cell`/`::serialize_row`/
+//! `::serialize_table` take a `serialize_block` callback for the one
+//! piece they can't resolve on their own, a real `Block`'s content,
+//! and `Blocks::serialize` is what builds that closure) walks
+//! `self.items` and writes real content out -- real table content now
+//! flows all the way through the walker, gets styled, and gets
+//! written out, end to end. `images.py`'s
 //! `create_image_markup`/`add_image`/`serialize`/cover-image methods
 //! (see [`images`]'s module docs -- its self-contained utility layer
 //! AND [`images::ImagesManager`]'s data-source half, `read_image`/
 //! `read_svg`, are now ported: the real image-content-source design
 //! question resolved to an existing crate-wide idiom,
-//! `OEBBook.container.read(href)`, no new abstraction needed), and
-//! `from_html.py`'s `Convert.__call__`/`.write` (see [`from_html`]'s
-//! module docs -- `Convert`'s core element walker AND `Blocks`'
-//! `Table`-related methods are both ported now; only the top-level
-//! orchestration itself remains) --
+//! `OEBBook.container.read(href)`, no new abstraction needed) are the
+//! main remaining gap besides `Convert` itself --
 //! `links.py`'s `LinksManager` is now fully ported, including its
 //! TOC-serialization half, which is what gave [`xml::Element`] its
 //! `insert`/`find_descendant_mut` methods. These walk a resolved-CSS
