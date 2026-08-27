@@ -638,6 +638,19 @@ impl Block {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlockId(pub usize);
 
+/// One entry in an items list that mixes ordinary content with
+/// tables -- [`Blocks`]'s own top-level `items`, and
+/// [`super::tables::Cell::items`]. Python's `self.items`/`Cell.items`
+/// hold either a `Block` or a `Table` object directly, told apart at
+/// use sites by duck typing (e.g. `isinstance(item, Table)`); this is
+/// the real enum standing in for that, the same reasoning as
+/// [`super::tables::CellSlot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ItemId {
+    Block(BlockId),
+    Table(super::tables::TableId),
+}
+
 /// Port of `Blocks` -- **partial**. Ported: `new` (`__init__`),
 /// `current_or_new_block`, `end_current_block`, `start_new_block`,
 /// the block-only half of `finish_tag` (see below),

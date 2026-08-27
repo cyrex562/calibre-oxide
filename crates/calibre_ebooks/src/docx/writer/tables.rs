@@ -1,8 +1,12 @@
 //! Tables (`docx/writer/tables.py`) -- **partial**: the border/width
-//! foundation, plus [`SpannedCell`]/[`Cell`]/[`Row`]/[`Table`]
-//! themselves and their border-conflict-resolution algorithms, are
-//! ported. What's left is the HTML-walk integration that builds these
-//! during a real conversion, and `.serialize`.
+//! foundation, [`SpannedCell`]/[`Cell`]/[`Row`]/[`Table`] themselves,
+//! their border-conflict-resolution algorithms, AND the stateful
+//! `Table`/`Row`/`Cell` mutation methods (`start_new_row`/
+//! `start_new_cell`/`finish_tag`/`add_block`/`add_table`) are all
+//! ported. What's left is `Blocks`' OWN half of the HTML-walk
+//! integration (the `tables` stack of currently-open tables and
+//! `finish_tag`'s table-closing branch, which call into this file's
+//! `Tables::table_finish_tag`), and every `.serialize` method.
 //!
 //! Ported: [`Border`], [`border_style_weight`], [`as_percent`],
 //! [`convert_width`], and [`read_css_block_borders`] (a thin
@@ -16,29 +20,51 @@
 //! structs instead of mutating anything, so no `Dummy` stand-in is
 //! needed at all.
 //!
-//! [`SpannedCell`], [`Cell`], [`Row`], and [`Table`] are now ported
-//! too, held in a new [`Tables`] arena (see its own docs for the
-//! arena-shape decision this needed -- the real, previously undecided
-//! design question this module was blocked on). Ported with them:
+//! [`SpannedCell`], [`Cell`], [`Row`], and [`Table`] are ported, held
+//! in a [`Tables`] arena (see its own docs for the arena-shape
+//! decision this needed -- the real, previously undecided design
+//! question this module was blocked on). Ported with them:
 //! [`Tables::neighbor`]/`::applicable_borders`/`::resolve_border`/
 //! `::resolve_cell_borders` (CSS table border-conflict resolution)
 //! and [`Tables::expand_spanned_cells`] (inserting merge-continuation
-//! placeholders for `rowspan`/`colspan`'d cells).
+//! placeholders for `rowspan`/`colspan`'d cells). On top of those,
+//! `Tables` now also ports the stateful mutation half every real
+//! HTML-walking caller needs: [`Tables::table_start_new_row`]/
+//! `::table_start_new_cell`/`::row_start_new_cell` (port of `Table`/
+//! `Row.start_new_row`/`.start_new_cell`), [`Tables::table_finish_tag`]
+//! (port of `Table.finish_tag`, including the row-level
+//! `Row.finish_tag` layer, private), and [`Tables::table_add_block`]/
+//! `::table_add_table`/`::row_add_block`/`::row_add_table`/
+//! `::cell_add_block`/`::cell_add_table` (port of `Table`/`Row`/
+//! `Cell.add_block`/`.add_table`, including their auto-create-a-cell/
+//! row fallbacks). [`Cell::items`] (mixing `Block`s and nested
+//! `Table`s, port of `Cell.items`) uses the new
+//! [`super::from_html::ItemId`] enum, shared with `Blocks`' own
+//! still-unported top-level `items` list.
 //!
-//! **Not ported yet, deliberately** -- see [`Tables`]' and [`Cell`]'s
-//! own docs for the details: the stateful HTML-walk integration
-//! (`Blocks`' `tables` stack of currently-open tables,
-//! `start_new_row`/`start_new_cell`/`finish_tag`'s table branch, and
-//! the `Block`-or-`Table` item enum `Blocks.items`/`Cell.items` both
-//! need -- `Block.parent_items`, dropped when `Block` was ported, PR
-//! #333, is the concrete thing that becomes real again once this
-//! lands), and every `.serialize` method (`Cell`/`Row`/`Table` all
-//! need real `Block`/nested-`Table` content to serialize against,
-//! which the still-deferred integration above is what would produce).
+//! **Not ported yet, deliberately**: `Blocks`' own `tables` stack of
+//! currently-open tables and `finish_tag`'s table-closing branch
+//! (`Blocks.start_new_table`/`.start_new_row`/`.start_new_cell` just
+//! delegate into this file's now-real `Tables` methods, and
+//! `Blocks.finish_tag`'s table half calls `Tables::table_finish_tag`
+//! and, on a `true` return, moves the finished table into its parent
+//! -- either nesting it via `Tables::table_add_table` into a still-
+//! open OUTER table, or appending it to `Blocks`' own top-level
+//! `items: Vec<ItemId>`, not yet widened from `Vec<BlockId>`). This
+//! also needs `Block` to gain a real "which container do I live in"
+//! field (`Block.parent_items`, dropped when `Block` was ported, PR
+//! #333, becomes real again here -- likely
+//! `enum ItemContainer { Top, Cell(CellId) }`, needed so
+//! `Blocks::delete_block_at`/`::apply_page_break_after` can tell which
+//! items-list a block belongs to). Every `.serialize` method
+//! (`Cell`/`Row`/`Table`/`Blocks`) still needs real content from that
+//! same deferred integration.
 
 use crate::dom::{Dom, NodeId};
-use crate::oeb::polish::style::Style;
+use crate::oeb::polish::cascade::ResolvedStyles;
+use crate::oeb::polish::style::{Profile, Style};
 
+use super::from_html::{BlockId, ItemId};
 use super::styles::{read_css_block_borders as read_block_borders, BORDER_EDGES};
 use super::utils::convert_color;
 
@@ -242,15 +268,10 @@ pub enum CellSlot {
 /// Port of `Cell`. `BLEVEL = 2` (passed to
 /// [`read_css_block_borders`] as the most-specific border source).
 ///
-/// **Not ported yet, deliberately**: `self.items`/`add_block`/
-/// `add_table` (a cell's own content list, mixing `Block`s and
-/// nested `Table`s the same way [`super::from_html::Blocks::items`]
-/// does at the top level) and `serialize`. Both need the
-/// HTML-walk integration half of this design (`Blocks`' `tables`
-/// stack, `start_new_row`/`start_new_cell`/`finish_tag`'s table
-/// branch, and a shared `Block`-or-`Table` item enum) -- a separate,
-/// still-undecided follow-up, not part of this PR's scope (border
-/// resolution and the arena shape itself).
+/// **Not ported yet, deliberately**: `serialize` -- needs a real
+/// `w:tc` builder against this cell's now-real `items` content, left
+/// for the `Blocks` HTML-walk-integration PR that will actually
+/// populate `items` during a real conversion.
 #[derive(Debug)]
 pub struct Cell {
     pub row: RowId,
@@ -273,11 +294,15 @@ pub struct Cell {
     /// pass runs (referencing it earlier would be an `AttributeError`
     /// in Python; here it's a `None` a caller has to handle instead).
     pub resolved_borders: Option<ResolvedBorders>,
+    /// Port of `Cell.items`: this cell's own content, mixing `Block`s
+    /// and nested `Table`s the same way
+    /// [`super::from_html::Blocks`]'s own top-level items list does --
+    /// see [`super::from_html::ItemId`].
+    pub items: Vec<ItemId>,
 }
 
 impl Cell {
-    /// Port of `Cell.__init__`, minus `self.items` -- see the type's
-    /// own docs.
+    /// Port of `Cell.__init__`.
     pub fn new(
         row: RowId,
         table: TableId,
@@ -308,6 +333,7 @@ impl Cell {
             background_color: table_background_color(tag_style),
             borders: read_css_block_borders(tag_style, 2),
             resolved_borders: None,
+            items: Vec::new(),
         }
     }
 }
@@ -326,8 +352,8 @@ fn span_attr(attrs: &indexmap::IndexMap<String, String>, name: &str) -> u32 {
 
 /// Port of `Row`. `BLEVEL = 1`.
 ///
-/// **Not ported yet, deliberately**: `start_new_cell`/`finish_tag`/
-/// `add_block`/`add_table`/`serialize` -- see [`Cell`]'s docs.
+/// **Not ported yet, deliberately**: `serialize` -- see [`Cell`]'s
+/// docs.
 #[derive(Debug)]
 pub struct Row {
     pub table: TableId,
@@ -335,6 +361,19 @@ pub struct Row {
     pub cells: Vec<CellId>,
     pub background_color: Option<String>,
     pub borders: EdgeBorders,
+    /// Port of `Row.current_cell`: the cell currently being built,
+    /// not yet moved into [`Self::cells`] (that happens on
+    /// [`Tables::table_finish_tag`]'s matching closing tag).
+    pub current_cell: Option<CellId>,
+    /// Port of `Row.orig_tag_style`. Python holds a live `Style`
+    /// object (cheap there); this stores just the `Style::node` it
+    /// was built from and reconstructs a real `Style` on demand
+    /// (`Tables::row_add_block`/`row_add_table`'s auto-create-a-cell
+    /// fallback) -- the same "stored `NodeId`, rebuilt `Style`"
+    /// pattern this effort uses throughout (e.g. `Block::html_block`).
+    /// `None` when the row was itself auto-created with no real style
+    /// (Python's `Row(self, html_tag, None)`).
+    pub orig_tag_style_node: Option<NodeId>,
 }
 
 impl Row {
@@ -345,6 +384,8 @@ impl Row {
             cells: Vec::new(),
             background_color: table_background_color(tag_style),
             borders: read_css_block_borders(tag_style, 1),
+            current_cell: None,
+            orig_tag_style_node: tag_style.map(|s| s.node),
         }
     }
 
@@ -359,12 +400,8 @@ impl Row {
 
 /// Port of `Table`. `BLEVEL = 0`.
 ///
-/// **Not ported yet, deliberately**: `start_new_row`/`start_new_cell`/
-/// `finish_tag`/`add_block`/`add_table`/`expand_spanned_cells`'s
-/// caller (`finish_tag`)/`serialize` -- see [`Cell`]'s docs. Note
-/// [`expand_spanned_cells`] itself (the algorithm `finish_tag` would
-/// call) IS ported, as [`Tables::expand_spanned_cells`] -- it's the
-/// HTML-walk plumbing around it, not the algorithm, that's deferred.
+/// **Not ported yet, deliberately**: `serialize` -- see [`Cell`]'s
+/// docs.
 #[derive(Debug)]
 pub struct Table {
     pub html_tag: NodeId,
@@ -378,6 +415,12 @@ pub struct Table {
     pub margin_top: Option<f64>,
     pub margin_bottom: Option<f64>,
     pub borders: EdgeBorders,
+    /// Port of `Table.current_row`: the row currently being built,
+    /// not yet moved into [`Self::rows`].
+    pub current_row: Option<RowId>,
+    /// Port of `Table.orig_tag_style` -- see [`Row::orig_tag_style_node`]'s
+    /// docs for why this stores a `NodeId`, not a live `Style`.
+    pub orig_tag_style_node: Option<NodeId>,
 }
 
 impl Table {
@@ -419,6 +462,8 @@ impl Table {
             margin_top,
             margin_bottom,
             borders: read_css_block_borders(tag_style, 0),
+            current_row: None,
+            orig_tag_style_node: tag_style.map(|s| s.node),
         }
     }
 
@@ -555,6 +600,14 @@ impl Tables {
     /// [`Row::cells`]/internal bookkeeping).
     pub fn cell(&self, id: CellId) -> &Cell {
         match &self.cells[id.0] {
+            CellSlot::Cell(c) => c,
+            CellSlot::Spanned(_) => panic!("CellId {} names a SpannedCell, not a Cell", id.0),
+        }
+    }
+
+    /// Mutable counterpart of [`Self::cell`].
+    pub fn cell_mut(&mut self, id: CellId) -> &mut Cell {
+        match &mut self.cells[id.0] {
             CellSlot::Cell(c) => c,
             CellSlot::Spanned(_) => panic!("CellId {} names a SpannedCell, not a Cell", id.0),
         }
@@ -774,6 +827,224 @@ impl Tables {
                 }
             }
         }
+    }
+
+    /// Port of `Row.start_new_cell`.
+    pub fn row_start_new_cell(
+        &mut self,
+        row: RowId,
+        html_tag: NodeId,
+        dom: &Dom,
+        tag_style: Option<&Style>,
+    ) -> CellId {
+        let table = self.rows[row.0].table;
+        let id = CellId(self.cells.len());
+        self.cells.push(CellSlot::Cell(Cell::new(
+            row, table, html_tag, dom, tag_style,
+        )));
+        self.rows[row.0].current_cell = Some(id);
+        id
+    }
+
+    /// Port of `Row.finish_tag`.
+    fn row_finish_tag(&mut self, row: RowId, html_tag: NodeId) {
+        if let Some(cell_id) = self.rows[row.0].current_cell {
+            if self.cell(cell_id).html_tag == html_tag {
+                self.rows[row.0].cells.push(cell_id);
+                self.rows[row.0].current_cell = None;
+            }
+        }
+    }
+
+    /// Port of `Cell.add_block`.
+    pub fn cell_add_block(&mut self, cell: CellId, block: BlockId) {
+        self.cell_mut(cell).items.push(ItemId::Block(block));
+    }
+
+    /// Port of `Cell.add_table`.
+    pub fn cell_add_table(&mut self, cell: CellId, table: TableId) {
+        self.cell_mut(cell).items.push(ItemId::Table(table));
+    }
+
+    /// Rebuilds a `Style` from a stored `orig_tag_style_node`, the
+    /// "stored `NodeId`, rebuilt `Style`" pattern -- see
+    /// [`Row::orig_tag_style_node`]'s docs.
+    fn rebuild_style<'a>(
+        node: Option<NodeId>,
+        dom: &'a Dom,
+        resolved: &'a ResolvedStyles,
+        profile: &'a Profile,
+    ) -> Option<Style<'a>> {
+        node.map(|n| Style::new(dom, resolved, profile, n))
+    }
+
+    /// Port of `Row.add_block`: appends `block` to this row's current
+    /// cell, auto-creating one from the row's own stored style
+    /// (`orig_tag_style_node`) if none is open yet.
+    pub fn row_add_block(
+        &mut self,
+        row: RowId,
+        block: BlockId,
+        dom: &Dom,
+        resolved: &ResolvedStyles,
+        profile: &Profile,
+    ) {
+        let cell = match self.rows[row.0].current_cell {
+            Some(c) => c,
+            None => {
+                let html_tag = self.rows[row.0].html_tag;
+                let style = Self::rebuild_style(
+                    self.rows[row.0].orig_tag_style_node,
+                    dom,
+                    resolved,
+                    profile,
+                );
+                self.row_start_new_cell(row, html_tag, dom, style.as_ref())
+            }
+        };
+        self.cell_add_block(cell, block);
+    }
+
+    /// Port of `Row.add_table`: same auto-create-a-cell fallback as
+    /// [`Self::row_add_block`].
+    pub fn row_add_table(
+        &mut self,
+        row: RowId,
+        table: TableId,
+        dom: &Dom,
+        resolved: &ResolvedStyles,
+        profile: &Profile,
+    ) {
+        let cell = match self.rows[row.0].current_cell {
+            Some(c) => c,
+            None => {
+                let html_tag = self.rows[row.0].html_tag;
+                let style = Self::rebuild_style(
+                    self.rows[row.0].orig_tag_style_node,
+                    dom,
+                    resolved,
+                    profile,
+                );
+                self.row_start_new_cell(row, html_tag, dom, style.as_ref())
+            }
+        };
+        self.cell_add_table(cell, table);
+    }
+
+    /// Port of `Table.start_new_row`: any unfinished current row is
+    /// pushed into `rows` as-is (matching Python -- a row still
+    /// missing its own closing tag when a *new* row starts just gets
+    /// whatever `cells` it had accumulated so far; nothing here
+    /// forces it closed).
+    pub fn table_start_new_row(
+        &mut self,
+        table: TableId,
+        html_tag: NodeId,
+        tag_style: Option<&Style>,
+    ) -> RowId {
+        if let Some(prev) = self.tables[table.0].current_row.take() {
+            self.tables[table.0].rows.push(prev);
+        }
+        let id = RowId(self.rows.len());
+        self.rows.push(Row::new(table, html_tag, tag_style));
+        self.tables[table.0].current_row = Some(id);
+        id
+    }
+
+    /// Port of `Table.start_new_cell`.
+    pub fn table_start_new_cell(
+        &mut self,
+        table: TableId,
+        html_tag: NodeId,
+        dom: &Dom,
+        tag_style: Option<&Style>,
+    ) {
+        let row = match self.tables[table.0].current_row {
+            Some(r) => r,
+            None => self.table_start_new_row(table, html_tag, None),
+        };
+        self.row_start_new_cell(row, html_tag, dom, tag_style);
+    }
+
+    /// Port of `Table.finish_tag`. Returns whether `html_tag` was the
+    /// TABLE's own opening tag closing -- [`Self::table_finish_tag`]'s
+    /// caller (the still-unwired `Blocks.finish_tag` table branch)
+    /// uses this to decide whether the table itself is done and ready
+    /// to move into its parent container. When the table itself
+    /// closes, this also runs [`Self::expand_spanned_cells`] and
+    /// [`Self::resolve_cell_borders`] for every real cell -- Python
+    /// calls `cell.resolve_borders()` unconditionally (a no-op for
+    /// `SpannedCell`); this skips `Spanned` slots instead, since this
+    /// port's [`Self::resolve_cell_borders`] panics on one rather than
+    /// silently doing nothing.
+    pub fn table_finish_tag(&mut self, table: TableId, html_tag: NodeId) -> bool {
+        if let Some(row) = self.tables[table.0].current_row {
+            self.row_finish_tag(row, html_tag);
+            if self.rows[row.0].html_tag == html_tag {
+                self.tables[table.0].rows.push(row);
+                self.tables[table.0].current_row = None;
+            }
+        }
+        let table_ended = self.tables[table.0].html_tag == html_tag;
+        if table_ended {
+            self.expand_spanned_cells(table);
+            let row_ids = self.tables[table.0].rows.clone();
+            for row_id in row_ids {
+                let cell_ids = self.rows[row_id.0].cells.clone();
+                for cell_id in cell_ids {
+                    if matches!(self.cell_slot(cell_id), CellSlot::Cell(_)) {
+                        self.resolve_cell_borders(cell_id);
+                    }
+                }
+            }
+        }
+        table_ended
+    }
+
+    /// Port of `Table.add_block`. Panics if no row is open -- matches
+    /// Python's own unguarded `self.current_row.add_block(block)`
+    /// (`Blocks.end_current_block`, the only real caller, never
+    /// routes a block into a table without one, since it only does so
+    /// when `current_table.current_row is not None`).
+    pub fn table_add_block(
+        &mut self,
+        table: TableId,
+        block: BlockId,
+        dom: &Dom,
+        resolved: &ResolvedStyles,
+        profile: &Profile,
+    ) {
+        let row = self.tables[table.0]
+            .current_row
+            .expect("Table.add_block assumes a current row, matching Python");
+        self.row_add_block(row, block, dom, resolved, profile);
+    }
+
+    /// Port of `Table.add_table`: auto-creates a row from the table's
+    /// own stored style if none is open, the same fallback shape as
+    /// [`Self::row_add_block`]'s cell fallback.
+    pub fn table_add_table(
+        &mut self,
+        table: TableId,
+        nested: TableId,
+        dom: &Dom,
+        resolved: &ResolvedStyles,
+        profile: &Profile,
+    ) {
+        let row = match self.tables[table.0].current_row {
+            Some(r) => r,
+            None => {
+                let html_tag = self.tables[table.0].html_tag;
+                let style = Self::rebuild_style(
+                    self.tables[table.0].orig_tag_style_node,
+                    dom,
+                    resolved,
+                    profile,
+                );
+                self.table_start_new_row(table, html_tag, style.as_ref())
+            }
+        };
+        self.row_add_table(row, nested, dom, resolved, profile);
     }
 }
 
@@ -1226,5 +1497,258 @@ mod tests {
         assert!(
             matches!(tables.cell_slot(tables.row(r2).cells[0]), CellSlot::Spanned(s) if s.spanning_cell == grid[0][0])
         );
+    }
+
+    // The stateful start_new_row/start_new_cell/finish_tag/add_block/
+    // add_table methods below are tested against synthetic,
+    // disconnected nodes (`Dom::empty` + `Dom::new_element`) rather
+    // than parsed HTML fragments -- `<table><td>` without a `<tr>` is
+    // exactly the malformed-markup case these fallbacks exist for,
+    // and html5ever's real tree-construction rules would silently
+    // reparent it (a known gotcha from this effort's `from_html.rs`
+    // tests). `Cell`/`Row`/`Table::new` only ever read the given
+    // node's own attrs, never its ancestry, so a disconnected node is
+    // just as real an input as a parsed one here.
+
+    fn fresh_dom() -> Dom {
+        Dom::empty()
+    }
+
+    fn new_tag(dom: &mut Dom, name: &str) -> NodeId {
+        dom.new_element(name)
+    }
+
+    fn new_tag_with_attr(dom: &mut Dom, name: &str, attr: &str, value: &str) -> NodeId {
+        let id = dom.new_element(name);
+        dom.node_mut(id)
+            .attrs
+            .insert(attr.to_string(), value.to_string());
+        id
+    }
+
+    #[test]
+    fn table_start_new_row_pushes_an_unfinished_row_into_rows_first() {
+        let mut dom = fresh_dom();
+        let table_tag = new_tag(&mut dom, "table");
+        let tr1 = new_tag(&mut dom, "tr");
+        let tr2 = new_tag(&mut dom, "tr");
+        let mut tables = Tables::new();
+        let t = tables.add_table(table_tag, None);
+        let r1 = tables.table_start_new_row(t, tr1, None);
+        let r2 = tables.table_start_new_row(t, tr2, None);
+        assert_eq!(tables.table(t).current_row, Some(r2));
+        assert_eq!(
+            tables.table(t).rows,
+            vec![r1],
+            "the unfinished first row is pushed in as-is, not dropped"
+        );
+    }
+
+    #[test]
+    fn table_start_new_cell_auto_starts_a_row_when_none_is_open() {
+        let mut dom = fresh_dom();
+        let table_tag = new_tag(&mut dom, "table");
+        let td_tag = new_tag(&mut dom, "td");
+        let mut tables = Tables::new();
+        let t = tables.add_table(table_tag, None);
+        tables.table_start_new_cell(t, td_tag, &dom, None);
+        let row = tables.table(t).current_row.expect("a row was auto-created");
+        assert_eq!(
+            tables.row(row).html_tag,
+            td_tag,
+            "the fallback row reuses the cell's own html_tag, matching \
+             Python's start_new_row(html_tag, None)"
+        );
+        assert!(tables.row(row).current_cell.is_some());
+    }
+
+    #[test]
+    fn table_finish_tag_closes_the_open_cell_and_row_on_matching_tags() {
+        let mut dom = fresh_dom();
+        let table_tag = new_tag(&mut dom, "table");
+        let tr_tag = new_tag(&mut dom, "tr");
+        let td_tag = new_tag(&mut dom, "td");
+        let mut tables = Tables::new();
+        let t = tables.add_table(table_tag, None);
+        let r = tables.table_start_new_row(t, tr_tag, None);
+        tables.row_start_new_cell(r, td_tag, &dom, None);
+
+        assert!(!tables.table_finish_tag(t, td_tag));
+        assert_eq!(tables.row(r).current_cell, None);
+        assert_eq!(tables.row(r).cells.len(), 1);
+
+        assert!(!tables.table_finish_tag(t, tr_tag));
+        assert_eq!(tables.table(t).current_row, None);
+        assert_eq!(tables.table(t).rows, vec![r]);
+
+        assert!(
+            tables.table_finish_tag(t, table_tag),
+            "only the table's own opening tag closing returns true"
+        );
+    }
+
+    #[test]
+    fn table_finish_tag_on_table_close_runs_expand_and_resolve_borders() {
+        let mut dom = fresh_dom();
+        let table_tag = new_tag(&mut dom, "table");
+        let tr_tag = new_tag(&mut dom, "tr");
+        let td1 = new_tag_with_attr(&mut dom, "td", "colspan", "2");
+        let td2 = new_tag(&mut dom, "td");
+        let mut tables = Tables::new();
+        let t = tables.add_table(table_tag, None);
+        let r = tables.table_start_new_row(t, tr_tag, None);
+        tables.row_start_new_cell(r, td1, &dom, None);
+        tables.table_finish_tag(t, td1);
+        tables.row_start_new_cell(r, td2, &dom, None);
+        tables.table_finish_tag(t, td2);
+        tables.table_finish_tag(t, tr_tag);
+
+        assert!(tables.table_finish_tag(t, table_tag));
+
+        let row = tables.table(t).rows[0];
+        assert_eq!(
+            tables.row(row).cells.len(),
+            3,
+            "the colspan=2 cell should have expanded to include one placeholder"
+        );
+        assert!(tables
+            .cell(tables.row(row).cells[0])
+            .resolved_borders
+            .is_some());
+        assert!(tables
+            .cell(tables.row(row).cells[2])
+            .resolved_borders
+            .is_some());
+    }
+
+    #[test]
+    fn cell_add_block_and_add_table_append_to_items_in_order() {
+        let mut dom = fresh_dom();
+        let table_tag = new_tag(&mut dom, "table");
+        let tr_tag = new_tag(&mut dom, "tr");
+        let td_tag = new_tag(&mut dom, "td");
+        let mut tables = Tables::new();
+        let t = tables.add_table(table_tag, None);
+        let r = tables.add_row(t, tr_tag, None);
+        let c = tables.add_cell(r, td_tag, &dom, None);
+        let block = BlockId(7);
+        let nested = tables.add_table(table_tag, None);
+        tables.cell_add_block(c, block);
+        tables.cell_add_table(c, nested);
+        assert_eq!(
+            tables.cell(c).items,
+            vec![ItemId::Block(block), ItemId::Table(nested)]
+        );
+    }
+
+    #[test]
+    fn row_add_block_auto_creates_a_cell_from_the_rows_own_style_when_none_is_open() {
+        let mut dom = fresh_dom();
+        let table_tag = new_tag(&mut dom, "table");
+        let tr_tag = new_tag(&mut dom, "tr");
+        let resolved = resolved_with(&[(tr_tag, &[("background-color", "red")])]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, tr_tag);
+        let mut tables = Tables::new();
+        let t = tables.add_table(table_tag, None);
+        let r = tables.add_row(t, tr_tag, Some(&style));
+        assert_eq!(tables.row(r).current_cell, None);
+
+        let block = BlockId(3);
+        tables.row_add_block(r, block, &dom, &resolved, &profile);
+
+        let cell = tables.row(r).current_cell.expect("a cell was auto-created");
+        assert_eq!(
+            tables.cell(cell).html_tag,
+            tr_tag,
+            "the fallback cell reuses the row's own html_tag"
+        );
+        assert_eq!(
+            tables.cell(cell).background_color.as_deref(),
+            Some("FF0000"),
+            "the auto-created cell picks up the row's own stored style"
+        );
+        assert_eq!(tables.cell(cell).items, vec![ItemId::Block(block)]);
+    }
+
+    #[test]
+    fn row_add_table_auto_creates_a_cell_when_none_is_open() {
+        let mut dom = fresh_dom();
+        let table_tag = new_tag(&mut dom, "table");
+        let tr_tag = new_tag(&mut dom, "tr");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let mut tables = Tables::new();
+        let t = tables.add_table(table_tag, None);
+        let r = tables.add_row(t, tr_tag, None);
+        let nested = tables.add_table(table_tag, None);
+
+        tables.row_add_table(r, nested, &dom, &resolved, &profile);
+
+        let cell = tables.row(r).current_cell.expect("a cell was auto-created");
+        assert_eq!(tables.cell(cell).items, vec![ItemId::Table(nested)]);
+    }
+
+    #[test]
+    fn table_add_block_routes_through_the_current_row() {
+        let mut dom = fresh_dom();
+        let table_tag = new_tag(&mut dom, "table");
+        let tr_tag = new_tag(&mut dom, "tr");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let mut tables = Tables::new();
+        let t = tables.add_table(table_tag, None);
+        tables.table_start_new_row(t, tr_tag, None);
+
+        let block = BlockId(9);
+        tables.table_add_block(t, block, &dom, &resolved, &profile);
+
+        let row = tables.table(t).current_row.unwrap();
+        let cell = tables.row(row).current_cell.unwrap();
+        assert_eq!(tables.cell(cell).items, vec![ItemId::Block(block)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Table.add_block assumes a current row")]
+    fn table_add_block_panics_when_no_row_is_open() {
+        let mut dom = fresh_dom();
+        let table_tag = new_tag(&mut dom, "table");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let mut tables = Tables::new();
+        let t = tables.add_table(table_tag, None);
+        tables.table_add_block(t, BlockId(1), &dom, &resolved, &profile);
+    }
+
+    #[test]
+    fn table_add_table_auto_creates_a_row_from_the_tables_own_style_when_none_is_open() {
+        let mut dom = fresh_dom();
+        let table_tag = new_tag(&mut dom, "table");
+        let resolved = resolved_with(&[(table_tag, &[("background-color", "blue")])]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, table_tag);
+        let mut tables = Tables::new();
+        let t = tables.add_table(table_tag, Some(&style));
+        assert_eq!(tables.table(t).current_row, None);
+        let nested = tables.add_table(table_tag, None);
+
+        tables.table_add_table(t, nested, &dom, &resolved, &profile);
+
+        let row = tables.table(t).current_row.expect("a row was auto-created");
+        assert_eq!(
+            tables.row(row).html_tag,
+            table_tag,
+            "the fallback row reuses the table's own html_tag"
+        );
+        assert_eq!(
+            tables.row(row).background_color.as_deref(),
+            Some("0000FF"),
+            "the auto-created row picks up the table's own stored style"
+        );
+        let cell = tables
+            .row(row)
+            .current_cell
+            .expect("a cell was auto-created");
+        assert_eq!(tables.cell(cell).items, vec![ItemId::Table(nested)]);
     }
 }

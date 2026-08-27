@@ -17,13 +17,15 @@
 //! | `images.py` (partial) | [`images`] |
 //! | `tables.py` (partial) | [`tables`] |
 //!
-//! Still to come, tracked as issue #132: the HTML-walk integration
-//! `tables.py`'s [`tables::Cell`]/[`tables::Row`]/[`tables::Table`]
-//! need to get built during a real conversion, plus every
-//! `.serialize` (see [`tables`]'s module docs -- the border/width
-//! foundation AND the types themselves, with their border-conflict-
-//! resolution algorithms, are now ported; only the stateful
-//! HTML-walk wiring and serialization are left), `images.py`'s
+//! Still to come, tracked as issue #132: `Blocks`' OWN half of the
+//! `tables.py` HTML-walk integration (see [`tables`]'s module docs --
+//! the border/width foundation, the types themselves with their
+//! border-conflict-resolution algorithms, AND their stateful
+//! `start_new_row`/`start_new_cell`/`finish_tag`/`add_block`/
+//! `add_table` mutation methods are all now ported; what's left is
+//! `Blocks`' own `tables` stack of currently-open tables and
+//! `finish_tag`'s table-closing branch, which call into those --
+//! plus every `.serialize`), `images.py`'s
 //! `create_image_markup`/`add_image`/`serialize`/cover-image methods
 //! (see [`images`]'s module docs -- its self-contained utility layer
 //! AND [`images::ImagesManager`]'s data-source half, `read_image`/
@@ -79,8 +81,8 @@ pub use container::{
 };
 pub use fonts::{obfuscate_font_data, FontFace, FontsManager, Slot};
 pub use from_html::{
-    lang_for_tag, process_item, process_tag, Block, BlockId, Blocks, LinkTarget, ProcessCtx,
-    ProcessState, TextRun,
+    lang_for_tag, process_item, process_tag, Block, BlockId, Blocks, ItemId, LinkTarget,
+    ProcessCtx, ProcessState, TextRun,
 };
 pub use images::{
     create_docx_image_markup, create_filename, get_image_margins, Image, ImageMargins,
