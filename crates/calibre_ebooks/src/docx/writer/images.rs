@@ -1,36 +1,39 @@
 //! Image embedding (`docx/writer/images.py`) -- **partial**: the
-//! self-contained utility layer AND [`ImagesManager`]'s data-source
-//! half (`read_image`/`read_svg`) are ported; `create_image_markup`/
-//! `add_image`/`serialize`/the cover-image methods are not.
+//! self-contained utility layer, [`ImagesManager`]'s data-source half
+//! (`read_image`/`read_svg`), and now `create_image_markup`/
+//! `add_image` are all ported; only `serialize`/the cover-image
+//! methods remain, and wiring `add_image` into `from_html.rs`'s own
+//! `<img>`-tag handling is a separate, deliberately deferred
+//! integration step (see [`ImagesManager`]'s own docs).
 //!
 //! Ported: [`get_image_margins`], [`create_filename`], and
 //! [`create_docx_image_markup`] (the actual `w:drawing`/`pic:pic`
-//! OOXML builder, factored out of `create_image_markup`, which itself
-//! is NOT ported). [`crate::oeb::polish::style::Style::img_size`] (a
-//! prerequisite `create_image_markup` needs) is ported too, alongside
-//! this file since it lives in `oeb/polish/style.rs`. [`Image`] and
-//! [`ImagesManager`]'s `read_image`/`read_svg` are now ported too --
-//! see [`ImagesManager`]'s own docs for the real image-content-source
-//! design question this resolves (an existing crate-wide idiom,
-//! `OEBBook.container.read(href)` -- no new abstraction was needed).
+//! OOXML builder, factored out of `create_image_markup`).
+//! [`crate::oeb::polish::style::Style::img_size`] (a prerequisite
+//! `create_image_markup` needs) is ported too, alongside this file
+//! since it lives in `oeb/polish/style.rs`. [`Image`] and
+//! [`ImagesManager`]'s `read_image`/`read_svg` resolve the real
+//! image-content-source design question (an existing crate-wide
+//! idiom, `OEBBook.container.read(href)` -- no new abstraction was
+//! needed). [`ImagesManager::create_image_markup`]/`::add_image` are
+//! now real too -- the floating/margin decision logic, `wp:inline`/
+//! `wp:anchor` assembly, and the `<img>` element's own `src`/`abshref`
+//! resolution, using [`Floating`] (a real 3-value enum standing in for
+//! Python's `'left' | 'right' | 'center' | None` string-or-None
+//! value) in place of the raw string Python threads through.
 //!
 //! **Not ported, each for a real reason, not oversight**:
-//! - `create_image_markup` (the floating/margin decision logic and
-//!   final assembly) -- needs a `Style`/stylizer context on top of
-//!   the already-ported [`get_image_margins`]/[`Style::img_size`]/
-//!   [`create_docx_image_markup`], plus `self.count` (a manager-owned
-//!   running counter, not yet added since nothing calls it) and
-//!   `self.svg_rasterizer.svg_originals` (see below).
-//! - `add_image` -- needs a real DOM `<img>`/[`super::from_html::Block`]
-//!   to attach to, part of the still-unported `from_html.py`
-//!   `<img>`-tag `todo!()` gaps.
 //! - SVG-original tracking (Python's `SVGRasterizer.svg_originals`,
-//!   populated when `save_svg_originals=True`) -- this crate's
+//!   populated when `save_svg_originals=True`) -- the FIELD is now
+//!   real (`ImagesManager::svg_originals`), but nothing populates it
+//!   yet, since that happens during `Convert.__call__`'s SVG
+//!   rasterization pass, itself unported. This crate's
 //!   [`crate::oeb::transforms::rasterize::SvgRasterizer`] is a real,
 //!   already-ported port of the SAME Python class, but only of its
 //!   rasterization-cache half (issue #162, for a different consumer);
-//!   the `svg_originals` bookkeeping `docx::writer` needs isn't part
-//!   of that port and would need adding.
+//!   the `svg_originals` bookkeeping this pass needs isn't part of
+//!   that port and would need adding when the rasterization pass
+//!   itself is ported.
 //! - `serialize` -- needs write-time access to the real docx package
 //!   being assembled, part of `DocxWriter::write`'s own still-unwired
 //!   content-input path (`Convert.__call__`, not ported).
@@ -39,6 +42,15 @@
 //!   `Element::insert`-at-front capability they also need is no
 //!   longer a gap ([`super::xml::Element`] gained it for `links.py`'s
 //!   `LinksManager::serialize_toc`, issue #132).
+//! - Wiring `add_image` into `from_html.rs`'s `<img>`-tag `todo!()`s
+//!   -- a real, separate integration step (threading a new
+//!   `images_manager: &mut ImagesManager` through `ProcessCtx`,
+//!   touching every `process_tag`/`process_item` call site including
+//!   every test's), deliberately left for a follow-up PR, matching
+//!   this effort's own "arena+algorithms PR, then integration PR"
+//!   split precedent (`tables.rs`'s `Cell`/`Row`/`Table` vs. `Blocks`'
+//!   own wiring; `tables.rs`'s serialize methods vs.
+//!   `Blocks::serialize`).
 
 use std::collections::HashSet;
 
@@ -52,10 +64,41 @@ use crate::docx::names::{DocxNamespace, SVG_BLIP_URI, USE_LOCAL_DPI_URI};
 use crate::lit::urlunquote;
 use crate::oeb::book::OEBBook;
 use crate::oeb::polish::check::parsing::urlquote;
+use crate::oeb::polish::pretty::{dom_tail, leading_text};
 use crate::oeb::polish::style::Style;
+use crate::oeb::transforms::filenames::abshref;
+use crate::oeb::transforms::rescale::fit_image;
 
 use super::container::DocumentRelationships;
+use super::from_html::Block;
 use super::xml::Element;
+
+/// Port of the `floating` local variable's value set inside
+/// `create_image_markup` -- Python leaves it as a plain `str | None`,
+/// but every real value it's ever assigned is one of exactly these
+/// three CSS keywords (`'left'`/`'right''` from the `float`/
+/// `text-align` properties, or `'center'` from either an
+/// auto-margins-on-both-sides block image or a centered ancestor's
+/// `text-align`) -- a real enum matches this effort's established
+/// practice of replacing a well-understood string value set with a
+/// type, rather than carrying `Option<String>` through the whole
+/// function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Floating {
+    Left,
+    Right,
+    Center,
+}
+
+impl Floating {
+    fn as_wp_align(self) -> &'static str {
+        match self {
+            Floating::Left => "left",
+            Floating::Right => "right",
+            Floating::Center => "center",
+        }
+    }
+}
 
 /// Port of `get_image_margins`'s return value. Python returns a
 /// `dict` of pre-stringified EMU values keyed `distL`/`distR`/`distT`/
@@ -250,41 +293,66 @@ fn read_blank_png() -> Option<Vec<u8>> {
 /// question, not this type's, and is left for whichever PR wires
 /// `Convert.__call__` together.
 ///
-/// **Not ported here, deliberately**: `add_image` (needs a real DOM
-/// `<img>`/[`super::from_html::Block`] to attach to), `create_image_markup`
-/// (needs a `Style`/floating-position decision on top of the
-/// already-ported [`get_image_margins`]/[`create_docx_image_markup`]/
-/// [`crate::oeb::polish::style::Style::img_size`], plus
-/// `SvgRasterizer.svg_originals` tracking -- still not part of this
-/// crate's `SvgRasterizer` port, issue #162), `serialize` (needs
+/// `create_image_markup`/`add_image` are now ported -- see their own
+/// docs. **Still not ported here, deliberately**: `serialize` (needs
 /// write-time access to the real docx package being assembled,
 /// `DocxWriter::write`'s own still-unwired content-input path),
 /// `create_cover_markup`/`write_cover_block` (need the cover-image
-/// resolution flow from `Convert.__call__`, not ported).
+/// resolution flow from `Convert.__call__`, not ported). Wiring
+/// `add_image` into `from_html.rs`'s own `<img>`-tag `todo!()`s is
+/// ALSO deliberately left for a follow-up PR -- it needs threading a
+/// new `images_manager: &mut ImagesManager` through `ProcessCtx`
+/// (touching every `process_tag`/`process_item` call site, including
+/// every test's), a real, separate integration step, matching this
+/// effort's own established "arena+algorithms PR, then integration
+/// PR" split (`tables.rs`'s `Cell`/`Row`/`Table` vs. `Blocks`' own
+/// wiring, PR #342 then #344/#345; `tables.rs`'s serialize methods vs.
+/// `Blocks::serialize`, PR #347 then #348).
 pub struct ImagesManager<'a> {
     oeb: &'a OEBBook,
     document_relationships: DocumentRelationships,
     images: IndexMap<String, Image>,
     svg_images: IndexMap<String, Image>,
     seen_filenames: HashSet<String>,
+    count: u32,
+    page_width: f64,
+    page_height: f64,
+    /// Port of `SVGRasterizer.svg_originals` (`href of the rasterized
+    /// PNG -> href of the original SVG`), populated when
+    /// `save_svg_originals=True`. Nothing populates this yet -- that
+    /// happens during `Convert.__call__`'s SVG-rasterization pass,
+    /// itself unported -- so `create_image_markup` always finds it
+    /// empty today; the field exists so the type is real and correct
+    /// once that pass lands, matching how `count`/`page_width`/
+    /// `page_height` were added specifically because THIS PR is their
+    /// first real caller.
+    svg_originals: IndexMap<String, String>,
 }
 
 impl<'a> ImagesManager<'a> {
-    /// Port of `ImagesManager.__init__`, minus `page_width`/
-    /// `page_height`/`svg_rasterizer` -- neither has a real caller yet
-    /// (both belong to `create_image_markup`, not ported); `log` isn't
-    /// stored, matching this effort's established absence of a log
-    /// sink for these writer managers so far; `count` isn't stored
-    /// either, for the same "no real caller yet" reason (only
-    /// `create_image_markup`/`create_docx_image_markup` read it, and
-    /// the latter already takes it as a plain parameter, PR #337).
-    pub fn new(oeb: &'a OEBBook, document_relationships: DocumentRelationships) -> Self {
+    /// Port of `ImagesManager.__init__`. `page_width`/`page_height`
+    /// stand in for `opts.output_profile.width_pts`/`.height_pts` --
+    /// plain scalars rather than a whole `&Profile`, since nothing
+    /// else here needs one. `log` isn't stored, matching this effort's
+    /// established absence of a log sink for these writer managers.
+    /// `svg_rasterizer` itself isn't stored -- only its
+    /// `svg_originals` map is ever read (see that field's own docs).
+    pub fn new(
+        oeb: &'a OEBBook,
+        document_relationships: DocumentRelationships,
+        page_width: f64,
+        page_height: f64,
+    ) -> Self {
         ImagesManager {
             oeb,
             document_relationships,
             images: IndexMap::new(),
             svg_images: IndexMap::new(),
             seen_filenames: HashSet::new(),
+            count: 0,
+            page_width,
+            page_height,
+            svg_originals: IndexMap::new(),
         }
     }
 
@@ -376,6 +444,229 @@ impl<'a> ImagesManager<'a> {
             );
         }
         self.images.get(href)
+    }
+
+    /// Port of `ImagesManager.create_image_markup`. `stylizer` is
+    /// dropped -- Python re-derives `stylizer.style(html_img)`
+    /// internally, but every real caller (`add_image`, below) already
+    /// holds a `Style` for the exact same node, so `style` is taken
+    /// directly instead. The ancestor's style (`pstyle`, for the
+    /// "inline image alone inside a block" detection) is rebuilt via
+    /// `Style::new(style.dom(), style.resolved(), style.profile(),
+    /// parent)`, the same "reconstruct via `Style`'s own dom/resolved/
+    /// profile accessors" technique `Blocks::end_current_block`
+    /// established (PR #345).
+    ///
+    /// `float`/`display`/`text-align` have no dedicated `@property` on
+    /// either `stylizer.py`'s base `Style` or `from_html.py`'s own
+    /// subclass (confirmed by reading both), so `style['float']` etc.
+    /// fall through to the raw specified-value getter --
+    /// [`Style::get`] (port of `Style._get`), matching this effort's
+    /// established domName-dispatch discipline. `style._get('margin-
+    /// left')`/`.get('margin-right')` are the SAME raw getter, already
+    /// what `_get` (not `[]`) calls for directly.
+    ///
+    /// "`len(parent) == 1`" is lxml's `Element.__len__`, which counts
+    /// only child ELEMENTS (not text/comment nodes) -- ported as a
+    /// direct filter over [`crate::dom::Dom::children`] rather than a
+    /// new `Dom` method, since this is the one place that needs it.
+    /// `parent.text`/`html_img.tail` are [`leading_text`]/[`dom_tail`],
+    /// the same lxml text/tail bridge `process_tag` already uses.
+    pub fn create_image_markup(
+        &mut self,
+        names: &DocxNamespace,
+        style: &Style,
+        href: &str,
+        as_block: bool,
+    ) -> Option<Element> {
+        let dom = style.dom();
+        let html_img = style.node;
+
+        let mut svg_rid: Option<String> = None;
+        if let Some(svghref) = self.svg_originals.get(href).cloned() {
+            if let Some(si) = self.read_svg(&svghref) {
+                svg_rid = Some(si.rid.clone());
+            }
+        }
+
+        let mut floating = match style.get("float").as_str() {
+            "left" => Some(Floating::Left),
+            "right" => Some(Floating::Right),
+            _ => None,
+        };
+        let mut as_block = as_block;
+        if as_block {
+            let ml = style.get("margin-left");
+            let mr = style.get("margin-right");
+            if ml == "auto" {
+                floating = Some(if mr == "auto" {
+                    Floating::Center
+                } else {
+                    Floating::Right
+                });
+            }
+            if mr == "auto" {
+                floating = Some(if ml == "auto" {
+                    Floating::Center
+                } else {
+                    Floating::Right
+                });
+            }
+        } else if let Some(parent) = dom.parent(html_img) {
+            let element_child_count = dom
+                .children(parent)
+                .iter()
+                .filter(|&&c| dom.tag(c).is_some())
+                .count();
+            let parent_text_empty = leading_text(dom, parent)
+                .map(|t| t.trim().is_empty())
+                .unwrap_or(true);
+            let img_tail_empty = dom_tail(dom, html_img)
+                .map(|t| t.trim().is_empty())
+                .unwrap_or(true);
+            if element_child_count == 1 && parent_text_empty && img_tail_empty {
+                let pstyle = Style::new(dom, style.resolved(), style.profile(), parent);
+                if pstyle.get("display").contains("block") {
+                    as_block = true;
+                    floating = match pstyle.get("float").as_str() {
+                        "left" => Some(Floating::Left),
+                        "right" => Some(Floating::Right),
+                        _ => None,
+                    };
+                    if floating.is_none() {
+                        floating = match pstyle.get("text-align").as_str() {
+                            "center" => Some(Floating::Center),
+                            "right" => Some(Floating::Right),
+                            _ => None,
+                        };
+                    }
+                    floating = Some(floating.unwrap_or(Floating::Left));
+                }
+            }
+        }
+
+        let fake_margins = floating.is_none();
+        self.count += 1;
+        let img = self.images.get(href)?;
+        let name = urlunquote(href.rsplit('/').next().unwrap_or(href));
+        let (w, h) = style.img_size(img.width as f64, img.height as f64);
+        let (_scaled, fitted_w, fitted_h) = fit_image(w, h, self.page_width, self.page_height);
+        let width = pt_to_emu(fitted_w as f64);
+        let height = pt_to_emu(fitted_h as f64);
+
+        let mut drawing = Element::new("w:drawing");
+        let content = if let Some(f) = floating {
+            let margins = get_image_margins(style);
+            let mut anchor = Element::new("wp:anchor")
+                .attr("distL", margins.left.to_string())
+                .attr("distR", margins.right.to_string())
+                .attr("distT", margins.top.to_string())
+                .attr("distB", margins.bottom.to_string())
+                .attr("simplePos", "0")
+                .attr("relativeHeight", "1")
+                .attr("behindDoc", "0")
+                .attr("locked", "0")
+                .attr("layoutInCell", "1")
+                .attr("allowOverlap", "1");
+            anchor.append(Element::new("wp:simplePos").attr("x", "0").attr("y", "0"));
+            anchor.append(
+                Element::new("wp:positionH")
+                    .attr("relativeFrom", "margin")
+                    .with(Element::new("wp:align").with_text(f.as_wp_align())),
+            );
+            anchor.append(
+                Element::new("wp:positionV")
+                    .attr("relativeFrom", "line")
+                    .with(Element::new("wp:align").with_text("top")),
+            );
+            drawing.append(anchor)
+        } else {
+            drawing.append(Element::new("wp:inline"))
+        };
+        content.append(
+            Element::new("wp:extent")
+                .attr("cx", width.to_string())
+                .attr("cy", height.to_string()),
+        );
+        if fake_margins {
+            let margins = get_image_margins(style);
+            content.append(
+                Element::new("wp:effectExtent")
+                    .attr("l", margins.left.to_string())
+                    .attr("r", margins.right.to_string())
+                    .attr("t", margins.top.to_string())
+                    .attr("b", margins.bottom.to_string()),
+            );
+        } else {
+            content.append(
+                Element::new("wp:effectExtent")
+                    .attr("l", "0")
+                    .attr("r", "0")
+                    .attr("t", "0")
+                    .attr("b", "0"),
+            );
+        }
+        if floating.is_some() {
+            if as_block {
+                content.append(Element::new("wp:wrapTopAndBottom"));
+            } else {
+                content.append(Element::new("wp:wrapSquare").attr("wrapText", "bothSides"));
+            }
+        }
+        let alt = dom
+            .node(html_img)
+            .attrs
+            .get("alt")
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .unwrap_or_else(|| name.clone());
+        create_docx_image_markup(
+            names,
+            content,
+            self.count,
+            &name,
+            &alt,
+            &img.rid,
+            width,
+            height,
+            svg_rid.as_deref(),
+        );
+        Some(drawing)
+    }
+
+    /// Port of `ImagesManager.add_image`. `stylizer` is dropped for
+    /// the same reason [`Self::create_image_markup`] drops it --
+    /// `style` (already built by the caller for `html_img`) replaces
+    /// it directly. `current_item_href` stands in for the bound
+    /// `self.abshref` method (`item.abshref`, bound to the CURRENT
+    /// spine item being processed, `from_html.py:493`) -- the same
+    /// `current_item_href: &str` parameter `LinksManager`'s own
+    /// href-resolving methods already take.
+    ///
+    /// Python's `try: rid = self.read_image(href).rid; except
+    /// AttributeError: return` (a `None.rid` access) is just
+    /// `self.read_image(&href)?` here -- `read_image` already returns
+    /// `None` on the same failure.
+    pub fn add_image(
+        &mut self,
+        names: &DocxNamespace,
+        style: &Style,
+        block: &mut Block,
+        current_item_href: &str,
+        bookmark: Option<String>,
+        as_block: bool,
+    ) -> Option<String> {
+        let dom = style.dom();
+        let html_img = style.node;
+        let src = dom.node(html_img).attrs.get("src")?;
+        if src.is_empty() {
+            return None;
+        }
+        let href = abshref(current_item_href, src);
+        let rid = self.read_image(&href)?.rid.clone();
+        let drawing = self.create_image_markup(names, style, &href, as_block)?;
+        block.add_image(drawing, bookmark);
+        Some(rid)
     }
 }
 
@@ -572,6 +863,10 @@ mod tests {
         DocumentRelationships::new(&ns())
     }
 
+    fn images_manager(oeb: &OEBBook) -> ImagesManager<'_> {
+        ImagesManager::new(oeb, relationships(), 600.0, 800.0)
+    }
+
     fn png_bytes(width: u32, height: u32) -> Vec<u8> {
         let mut data = b"\x89PNG\r\n\x1a\n".to_vec();
         data.extend_from_slice(&[0, 0, 0, 13]);
@@ -586,7 +881,7 @@ mod tests {
         let oeb = Builder::new()
             .part("images/pic.png", "image/png", &png_bytes(100, 200), false)
             .build();
-        let mut mgr = ImagesManager::new(&oeb, relationships());
+        let mut mgr = images_manager(&oeb);
         let img = mgr.read_image("images/pic.png").unwrap();
         assert_eq!(img.fmt, "png");
         assert_eq!((img.width, img.height), (100, 200));
@@ -599,7 +894,7 @@ mod tests {
         let oeb = Builder::new()
             .part("images/pic.png", "image/png", &png_bytes(1, 1), false)
             .build();
-        let mut mgr = ImagesManager::new(&oeb, relationships());
+        let mut mgr = images_manager(&oeb);
         let rid1 = mgr.read_image("images/pic.png").unwrap().rid.clone();
         let rid2 = mgr.read_image("images/pic.png").unwrap().rid.clone();
         assert_eq!(rid1, rid2);
@@ -613,7 +908,7 @@ mod tests {
         let oeb = Builder::new()
             .part("images/my%20pic.png", "image/png", &png_bytes(1, 1), false)
             .build();
-        let mut mgr = ImagesManager::new(&oeb, relationships());
+        let mut mgr = images_manager(&oeb);
         let img = mgr.read_image("images/my pic.png").unwrap();
         assert_eq!(img.href, "images/my%20pic.png");
     }
@@ -621,7 +916,7 @@ mod tests {
     #[test]
     fn read_image_returns_none_for_an_unknown_href() {
         let oeb = Builder::new().build();
-        let mut mgr = ImagesManager::new(&oeb, relationships());
+        let mut mgr = images_manager(&oeb);
         assert!(mgr.read_image("nope.png").is_none());
     }
 
@@ -636,7 +931,7 @@ mod tests {
         let oeb = Builder::new()
             .part("images/bad.png", "image/png", b"not an image", false)
             .build();
-        let mut mgr = ImagesManager::new(&oeb, relationships());
+        let mut mgr = images_manager(&oeb);
         assert!(mgr.read_image("images/bad.png").is_none());
     }
 
@@ -645,7 +940,7 @@ mod tests {
         let oeb = Builder::new()
             .part("images/pic.svg", "image/svg+xml", b"<svg/>", false)
             .build();
-        let mut mgr = ImagesManager::new(&oeb, relationships());
+        let mut mgr = images_manager(&oeb);
         let img = mgr.read_svg("images/pic.svg").unwrap();
         assert_eq!(img.fmt, "svg");
         assert_eq!((img.width, img.height), (-1, -1));
@@ -655,7 +950,7 @@ mod tests {
     #[test]
     fn read_svg_returns_none_for_an_unknown_href() {
         let oeb = Builder::new().build();
-        let mut mgr = ImagesManager::new(&oeb, relationships());
+        let mut mgr = images_manager(&oeb);
         assert!(mgr.read_svg("nope.svg").is_none());
     }
 
@@ -665,7 +960,7 @@ mod tests {
             .part("a/pic.png", "image/png", &png_bytes(1, 1), false)
             .part("b/pic.svg", "image/svg+xml", b"<svg/>", false)
             .build();
-        let mut mgr = ImagesManager::new(&oeb, relationships());
+        let mut mgr = images_manager(&oeb);
         let raster = mgr.read_image("a/pic.png").unwrap().fname.clone();
         let svg = mgr.read_svg("b/pic.svg").unwrap().fname.clone();
         assert_eq!(raster, "media/pic.png");
@@ -674,5 +969,174 @@ mod tests {
             "create_filename's dedup is stem-only, extension-agnostic -- \
              a same-stem svg after a png collides and gets a counter"
         );
+    }
+
+    use super::super::links::LinksManager;
+    use super::super::styles::StylesManager;
+    use super::super::xml::Child;
+    use crate::docx::writer::container::DocumentRelationships as DocRels;
+
+    fn text_of<'a>(el: &'a Element, name: &'a str) -> Option<&'a str> {
+        el.children_named(name)
+            .next()?
+            .children
+            .iter()
+            .find_map(|c| match c {
+                Child::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+    }
+
+    #[test]
+    fn create_image_markup_builds_a_plain_inline_drawing_when_not_floated() {
+        // Leading text on the <p> ("text") means the img is NOT alone
+        // in its parent, so the inline-image-alone-in-a-block
+        // promotion never fires, and no float is declared either.
+        let dom = make("<html><body><p>text<img src=\"pic.png\"/></p></body></html>");
+        let img = find(&dom, "img");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, img);
+        let oeb = Builder::new()
+            .part("pic.png", "image/png", &png_bytes(100, 200), false)
+            .build();
+        let mut mgr = images_manager(&oeb);
+        mgr.read_image("pic.png").unwrap();
+        let drawing = mgr
+            .create_image_markup(&ns(), &style, "pic.png", false)
+            .unwrap();
+        assert!(drawing.children_named("wp:inline").next().is_some());
+        assert!(drawing.children_named("wp:anchor").next().is_none());
+    }
+
+    #[test]
+    fn create_image_markup_anchors_a_floated_image() {
+        // "x" leading text on the div blocks the alone-in-a-block
+        // promotion, so `floating` comes straight from the img's own
+        // `float: left`.
+        let dom = make("<html><body><div>x<img src=\"pic.png\"/></div></body></html>");
+        let img = find(&dom, "img");
+        let resolved = resolved_with(&[(img, &[("float", "left")])]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, img);
+        let oeb = Builder::new()
+            .part("pic.png", "image/png", &png_bytes(100, 200), false)
+            .build();
+        let mut mgr = images_manager(&oeb);
+        mgr.read_image("pic.png").unwrap();
+        let drawing = mgr
+            .create_image_markup(&ns(), &style, "pic.png", false)
+            .unwrap();
+        let anchor = drawing.children_named("wp:anchor").next().unwrap();
+        let position_h = anchor.children_named("wp:positionH").next().unwrap();
+        assert_eq!(text_of(position_h, "wp:align"), Some("left"));
+        assert!(anchor.children_named("wp:wrapSquare").next().is_some());
+    }
+
+    #[test]
+    fn create_image_markup_as_block_with_auto_margins_on_both_sides_centers() {
+        let dom = make("<html><body><img src=\"pic.png\"/></body></html>");
+        let img = find(&dom, "img");
+        let resolved =
+            resolved_with(&[(img, &[("margin-left", "auto"), ("margin-right", "auto")])]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, img);
+        let oeb = Builder::new()
+            .part("pic.png", "image/png", &png_bytes(100, 200), false)
+            .build();
+        let mut mgr = images_manager(&oeb);
+        mgr.read_image("pic.png").unwrap();
+        let drawing = mgr
+            .create_image_markup(&ns(), &style, "pic.png", true)
+            .unwrap();
+        let anchor = drawing.children_named("wp:anchor").next().unwrap();
+        let position_h = anchor.children_named("wp:positionH").next().unwrap();
+        assert_eq!(text_of(position_h, "wp:align"), Some("center"));
+        // as_block stays true here (it was already true on entry), so
+        // the wrap element is wrapTopAndBottom, not wrapSquare.
+        assert!(anchor
+            .children_named("wp:wrapTopAndBottom")
+            .next()
+            .is_some());
+    }
+
+    #[test]
+    fn create_image_markup_promotes_a_lone_inline_image_via_the_parents_text_align() {
+        // The img is the ONLY child of the div, with no leading/tail
+        // text anywhere -- exactly the shape that triggers the
+        // "inline image alone inside a block" promotion. The div
+        // itself has no float, so the promoted `floating` falls
+        // through to its `text-align: center`.
+        let dom = make("<html><body><div><img src=\"pic.png\"/></div></body></html>");
+        let div = find(&dom, "div");
+        let img = find(&dom, "img");
+        let resolved = resolved_with(&[(div, &[("display", "block"), ("text-align", "center")])]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, img);
+        let oeb = Builder::new()
+            .part("pic.png", "image/png", &png_bytes(100, 200), false)
+            .build();
+        let mut mgr = images_manager(&oeb);
+        mgr.read_image("pic.png").unwrap();
+        let drawing = mgr
+            .create_image_markup(&ns(), &style, "pic.png", false)
+            .unwrap();
+        let anchor = drawing.children_named("wp:anchor").next().unwrap();
+        let position_h = anchor.children_named("wp:positionH").next().unwrap();
+        assert_eq!(text_of(position_h, "wp:align"), Some("center"));
+        // Promotion sets the internal as_block to true, so this is a
+        // wrapTopAndBottom, not a wrapSquare.
+        assert!(anchor
+            .children_named("wp:wrapTopAndBottom")
+            .next()
+            .is_some());
+        // floating became Some, so effectExtent uses real zeros, not
+        // faked margins.
+        let extent = anchor.children_named("wp:effectExtent").next().unwrap();
+        assert_eq!(extent.get("l"), Some("0"));
+        assert_eq!(extent.get("t"), Some("0"));
+    }
+
+    #[test]
+    fn add_image_resolves_src_via_abshref_and_attaches_an_image_run_to_the_block() {
+        let dom = make("<html><body><img src=\"pic.png\"/></body></html>");
+        let img = find(&dom, "img");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, img);
+        let oeb = Builder::new()
+            .part("pic.png", "image/png", &png_bytes(100, 200), false)
+            .build();
+        let mut mgr = images_manager(&oeb);
+        let mut styles_mgr = StylesManager::new("en");
+        let mut block = Block::new(&mut styles_mgr, &dom, img, &style, false, None, false, None);
+        assert!(block.is_empty());
+
+        let rid = mgr.add_image(&ns(), &style, &mut block, "chap1.html", None, false);
+        assert!(rid.is_some());
+        assert!(!block.is_empty());
+
+        let mut body = Element::new("w:body");
+        let mut lm = LinksManager::new(DocRels::new(&ns()));
+        block.serialize(&mut body, &mut lm, &ns(), None, false, false);
+        let p_el = body.children_named("w:p").next().unwrap();
+        let r = p_el.children_named("w:r").next().unwrap();
+        assert!(r.children_named("w:drawing").next().is_some());
+    }
+
+    #[test]
+    fn add_image_returns_none_when_the_img_has_no_src() {
+        let dom = make("<html><body><img/></body></html>");
+        let img = find(&dom, "img");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style = Style::new(&dom, &resolved, &profile, img);
+        let oeb = Builder::new().build();
+        let mut mgr = images_manager(&oeb);
+        let mut styles_mgr = StylesManager::new("en");
+        let mut block = Block::new(&mut styles_mgr, &dom, img, &style, false, None, false, None);
+        let rid = mgr.add_image(&ns(), &style, &mut block, "chap1.html", None, false);
+        assert!(rid.is_none());
+        assert!(block.is_empty());
     }
 }
