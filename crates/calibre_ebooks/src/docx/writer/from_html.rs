@@ -674,7 +674,7 @@ pub enum ItemContainer {
     Cell(CellId),
 }
 
-/// Port of `Blocks` -- **partial**. Ported: `new` (`__init__`),
+/// Port of `Blocks` -- **fully ported**. Ported: `new` (`__init__`),
 /// `current_or_new_block`, `end_current_block`, `start_new_block`,
 /// `finish_tag` (now including its table-closing branch),
 /// `start_new_table`/`start_new_row`/`start_new_cell`,
@@ -682,32 +682,19 @@ pub enum ItemContainer {
 /// `__exit__` -- Rust has no context-manager equivalent that also
 /// allows the caller to keep mutating `Blocks` and other managers
 /// mid-scope, so these are just two plain methods `Convert`, not
-/// ported, will call explicitly around each spine item), and
-/// `apply_page_break_after`/`resolve_language`. `self.items` is now
-/// the real `Vec<ItemId>` union Python's version holds (both `Block`s
-/// and finished `Table`s), and [`Block::container`] is real too (see
-/// its own docs) -- both were the concrete things flagged as
-/// "becomes real once table support lands" back when `Block`/`Blocks`
-/// were first ported (PRs #333/#334).
+/// ported, will call explicitly around each spine item),
+/// `apply_page_break_after`/`resolve_language`, and `serialize`
+/// (see [`Self::serialize`]'s own docs for how it threads a
+/// `serialize_block` closure through `super::tables::Tables`'
+/// `serialize_cell`/`serialize_row`/`serialize_table`, and for the
+/// disclosed float-group-membership simplification it makes).
+/// `self.items` is the real `Vec<ItemId>` union Python's version
+/// holds (both `Block`s and finished `Table`s), and [`Block::container`]
+/// is real too (see its own docs) -- both were the concrete things
+/// flagged as "becomes real once table support lands" back when
+/// `Block`/`Blocks` were first ported (PRs #333/#334).
 ///
 /// **Not ported, deliberately**:
-/// - `serialize` (`Blocks.serialize`, walking `self.items` and
-///   calling each item's own `serialize`) -- `Block::serialize` needs
-///   a resolved `own_style_id: Option<&str>` per block (only
-///   `StylesManager.finalize`, unported, can supply one) and
-///   `is_first_float_block`/`is_last_float_block` per block sharing a
-///   `FloatSpec` (Python computes these by walking `float_spec.blocks`,
-///   itself populated because `Block`/`FloatSpec` are shared mutable
-///   Python objects -- this port's `FloatSpec` is a plain owned,
-///   `Clone`, value, not `Rc<RefCell<...>>`, precisely to avoid that
-///   pattern, following the same reasoning `StylesManager`'s arena
-///   design already established). Building `serialize` before
-///   deciding how float-group membership gets tracked (a real design
-///   question, not a routine port -- see issue #132's own tracking
-///   notes) would mean guessing at an interface with no real caller
-///   to validate it against yet. `super::tables::Cell`/`Row`/
-///   `Table::serialize` are equally unported, for the same "no real
-///   content to serialize against yet" reason.
 /// - `block_map` (`dict[Block, int]`, Python's object-identity-keyed
 ///   cache of a block's position within `self.items`, used only to
 ///   speed up `delete_block_at`'s lookup) isn't ported at all --
@@ -1073,6 +1060,60 @@ impl Blocks {
             }
             if best_lang.as_deref() == Some(default_lang) {
                 block.block_lang = None;
+            }
+        }
+    }
+
+    /// Port of `Blocks.serialize`. Builds the one real closure
+    /// [`super::tables::Tables::serialize_cell`]/`::serialize_row`/
+    /// `::serialize_table` need (see their own docs for why they take
+    /// a callback instead of importing `StylesManager`/`LinksManager`
+    /// directly) and threads it through every top-level item -- a
+    /// nested [`ItemId::Table`] recurses straight into
+    /// `self.tables_arena.serialize_table` without going through this
+    /// closure a second time, since a `Tables` arena already has
+    /// everything it needs for that.
+    ///
+    /// `own_style_id` is computed for every block unconditionally
+    /// (via [`StylesManager::pure_block_style_label`]) even though
+    /// `Block::serialize` only ever reads it when `Block::linked_style`
+    /// is `None` -- simpler than branching here to avoid a lookup that
+    /// costs nothing when it's not needed.
+    ///
+    /// `is_first_float_block`/`is_last_float_block` are always
+    /// `false` -- a disclosed, narrow simplification: real
+    /// float-group-membership tracking (which blocks share one
+    /// `FloatSpec`) is still a genuinely open item, per issue #132's
+    /// own tracking notes, but these two bools are only read inside
+    /// `Block::serialize` when `self.float_spec.is_some()`, so a
+    /// non-floated block (the overwhelming common case) is completely
+    /// unaffected. Revisit once float-group tracking is real.
+    pub fn serialize(
+        &self,
+        body: &mut Element,
+        styles_manager: &StylesManager,
+        links_manager: &mut LinksManager,
+        names: &DocxNamespace,
+    ) {
+        let mut serialize_block = |parent: &mut Element, id: BlockId| {
+            let block = self.block(id);
+            let own_style_id = styles_manager.pure_block_style_label(block.style);
+            block.serialize(
+                parent,
+                links_manager,
+                names,
+                own_style_id.as_deref(),
+                false,
+                false,
+            );
+        };
+        for &item in &self.items {
+            match item {
+                ItemId::Block(id) => serialize_block(body, id),
+                ItemId::Table(id) => {
+                    self.tables_arena
+                        .serialize_table(id, body, &mut serialize_block)
+                }
             }
         }
     }
@@ -2909,6 +2950,65 @@ mod tests {
         assert_eq!(blocks.block(id).block_lang, None);
     }
 
+    #[test]
+    fn blocks_serialize_writes_a_top_level_block_with_its_linked_style() {
+        let dom = make("<html><body><p>hi</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style = plain_style(&dom, &resolved, &profile, p);
+        let mut mgr = styles_manager();
+        let mut blocks = Blocks::new();
+        let id = blocks.start_new_block(&mut mgr, &dom, p, &style, false, None, false);
+        blocks
+            .block_mut(id)
+            .add_text(&mut mgr, "hi", &style, false, None, false, None, None, None);
+        blocks.end_current_block(&dom, &resolved, &profile);
+        mgr.finalize(&mut blocks);
+        assert_eq!(
+            blocks.block(id).linked_style.as_deref(),
+            Some("Normal"),
+            "the only block with runs gets paired with the default combined style"
+        );
+
+        let mut body = Element::new("w:body");
+        let mut lm = links_manager();
+        blocks.serialize(&mut body, &mgr, &mut lm, &ns());
+
+        let p_el = body.children_named("w:p").next().unwrap();
+        let ppr = p_el.children_named("w:pPr").next().unwrap();
+        let pstyle = ppr.children_named("w:pStyle").next().unwrap();
+        assert_eq!(pstyle.get("w:val"), Some("Normal"));
+    }
+
+    #[test]
+    fn blocks_serialize_writes_a_pure_block_styles_own_style_id() {
+        let dom = make("<html><body><p></p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style = plain_style(&dom, &resolved, &profile, p);
+        let mut mgr = styles_manager();
+        let mut blocks = Blocks::new();
+        let id = blocks.start_new_block(&mut mgr, &dom, p, &style, false, None, false);
+        blocks.end_current_block(&dom, &resolved, &profile);
+        mgr.finalize(&mut blocks);
+        assert_eq!(
+            blocks.block(id).linked_style,
+            None,
+            "a block with no runs has nothing to pair with, so it stays a pure block style"
+        );
+
+        let mut body = Element::new("w:body");
+        let mut lm = links_manager();
+        blocks.serialize(&mut body, &mgr, &mut lm, &ns());
+
+        let p_el = body.children_named("w:p").next().unwrap();
+        let ppr = p_el.children_named("w:pPr").next().unwrap();
+        let pstyle = ppr.children_named("w:pStyle").next().unwrap();
+        assert_eq!(pstyle.get("w:val"), Some("0 Block"));
+    }
+
     struct Fixture {
         dom: Dom,
         resolved: ResolvedStyles,
@@ -3242,6 +3342,46 @@ mod tests {
     }
 
     #[test]
+    fn blocks_serialize_writes_a_real_table_with_its_cell_block() {
+        let mut f = fixture(
+            "<html><body><table><tr><td>hi</td></tr></table></body></html>",
+            &[],
+        );
+        let table_tag = find(&f.dom, "table");
+        let tr_tag = find(&f.dom, "tr");
+        let td_tag = find(&f.dom, "td");
+        f.resolved = resolved_with(&[
+            (table_tag, &[("display", "table")]),
+            (tr_tag, &[("display", "table-row")]),
+            (td_tag, &[("display", "table-cell")]),
+        ]);
+        {
+            let mut ctx = f.ctx();
+            let mut state = ProcessState::default();
+            process_tag(&mut ctx, &mut state, table_tag, true, None);
+        }
+        f.mgr.finalize(&mut f.blocks);
+
+        let mut body = Element::new("w:body");
+        f.blocks.serialize(&mut body, &f.mgr, &mut f.lm, &ns());
+
+        let tbl = body.children_named("w:tbl").next().unwrap();
+        let tr = tbl.children_named("w:tr").next().unwrap();
+        let tc = tr.children_named("w:tc").next().unwrap();
+        let p_el = tc.children_named("w:p").next().unwrap();
+        let text: String = p_el
+            .children_named("w:r")
+            .flat_map(|r| r.children_named("w:t"))
+            .flat_map(|t| t.children.iter())
+            .filter_map(|c| match c {
+                Child::Text(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "hi");
+    }
+
+    #[test]
     #[should_panic(expected = "ImagesManager")]
     fn process_tag_img_tag_is_a_documented_gap() {
         let mut f = fixture("<html><body><img/></body></html>", &[]);
@@ -3285,6 +3425,56 @@ mod tests {
             "en",
         );
         assert_eq!(f.blocks.items().len(), 1);
+    }
+
+    #[test]
+    fn blocks_serialize_preserves_the_order_of_mixed_block_and_table_items() {
+        let mut f = fixture(
+            "<html><body><p>a</p><table><tr><td>b</td></tr></table><p>c</p></body></html>",
+            &[],
+        );
+        let ps: Vec<NodeId> = f
+            .dom
+            .preorder_elements(f.dom.root)
+            .into_iter()
+            .filter(|&id| f.dom.tag(id) == Some("p"))
+            .collect();
+        let table_tag = find(&f.dom, "table");
+        let tr_tag = find(&f.dom, "tr");
+        let td_tag = find(&f.dom, "td");
+        f.resolved = resolved_with(&[
+            (ps[0], &[("display", "block")]),
+            (table_tag, &[("display", "table")]),
+            (tr_tag, &[("display", "table-row")]),
+            (td_tag, &[("display", "table-cell")]),
+            (ps[1], &[("display", "block")]),
+        ]);
+        let html_root = find(&f.dom, "html");
+        process_item(
+            &f.dom,
+            &f.resolved,
+            &f.profile,
+            &mut f.blocks,
+            &mut f.mgr,
+            &mut f.lm,
+            "chap1.html",
+            html_root,
+            "en",
+        );
+        f.mgr.finalize(&mut f.blocks);
+
+        let mut body = Element::new("w:body");
+        f.blocks.serialize(&mut body, &f.mgr, &mut f.lm, &ns());
+
+        let child_names: Vec<&str> = body
+            .children
+            .iter()
+            .filter_map(|c| match c {
+                Child::Element(e) => Some(e.name.as_str()),
+                Child::Text(_) => None,
+            })
+            .collect();
+        assert_eq!(child_names, vec!["w:p", "w:tbl", "w:p"]);
     }
 
     #[test]

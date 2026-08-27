@@ -1641,6 +1641,24 @@ impl StylesManager {
         self.pure_block_styles.first().copied()
     }
 
+    /// A pure block style's final `id`/`name` (Python sets both to
+    /// the same value, `"%0nd Block" % i`) -- a pure function of
+    /// `style`'s position in [`Self::pure_block_styles`], mirroring
+    /// [`combined_style_label`]'s exact reasoning for why this isn't
+    /// stored as a field. Used by [`super::from_html::Block::serialize`]'s
+    /// caller (`Blocks::serialize`, not yet ported) to resolve
+    /// `own_style_id` for a block whose `Block::linked_style` is
+    /// `None` -- i.e. one with no runs of its own, so it was never
+    /// part of a [`CombinedStyle`] pairing. `None` if `style` isn't a
+    /// pure block style at all (shouldn't happen for a real caller,
+    /// matching Python's `self.style.id` being `None` in the same
+    /// situation).
+    pub fn pure_block_style_label(&self, style: BlockStyleId) -> Option<String> {
+        let i = self.pure_block_styles.iter().position(|&id| id == style)?;
+        let width = format!("{}", self.pure_block_styles.len().saturating_sub(1).max(1)).len();
+        Some(format!("{i:0width$} Block"))
+    }
+
     pub fn combined_styles(&self) -> &[CombinedStyle] {
         &self.combined_styles
     }
@@ -1918,12 +1936,14 @@ impl StylesManager {
         }
 
         if let Some(&normal_id) = self.pure_block_styles.first() {
-            let pure_width =
-                format!("{}", self.pure_block_styles.len().saturating_sub(1).max(1)).len();
-            let normal_label = format!("{:0pure_width$} Block", 0);
+            let normal_label = self
+                .pure_block_style_label(normal_id)
+                .expect("normal_id came from pure_block_styles itself");
             let normal_bs = self.block_style(normal_id);
             for (i, &bsid) in self.pure_block_styles.iter().enumerate() {
-                let label = format!("{i:0pure_width$} Block");
+                let label = self
+                    .pure_block_style_label(bsid)
+                    .expect("bsid came from pure_block_styles itself");
                 let bs = self.block_style(bsid);
                 styles.append(bs.serialize(&label, &label, i == 0, normal_bs, &normal_label, None));
             }
@@ -2926,6 +2946,20 @@ mod tests {
         assert!(mgr.combined_styles().is_empty());
         assert_eq!(mgr.pure_block_styles().len(), 1);
         assert_eq!(blocks.block(id).linked_style, None);
+        assert_eq!(
+            mgr.pure_block_style_label(mgr.pure_block_styles()[0]),
+            Some("0 Block".to_string())
+        );
+    }
+
+    #[test]
+    fn pure_block_style_label_returns_none_for_a_style_that_never_finalized() {
+        let dom = make("<html><body><p></p></body></html>");
+        let p = find(&dom, "p");
+        let mut mgr = StylesManager::new("en");
+        let id = mgr.create_block_style(None, p, false, None);
+        // finalize() was never called, so pure_block_styles is empty.
+        assert_eq!(mgr.pure_block_style_label(id), None);
     }
 
     #[test]
