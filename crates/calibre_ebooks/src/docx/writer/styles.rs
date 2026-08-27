@@ -1761,13 +1761,7 @@ impl StylesManager {
 
         let seq_width = format!("{}", combined_candidates.len().saturating_sub(1).max(1)).len();
         for (i, &(pair, _)) in combined_candidates.iter().enumerate() {
-            let label = if i == 0 {
-                "Normal".to_string()
-            } else if let Some(level) = outline_levels.get(&pair) {
-                format!("Heading {}", level + 1)
-            } else {
-                format!("Para {i:0seq_width$}")
-            };
+            let label = combined_style_label(i, outline_levels.get(&pair).copied(), seq_width);
             if let Some(member_blocks) = used_pairs.get(&pair) {
                 for &block_id in member_blocks {
                     blocks.block_mut(block_id).linked_style = Some(label.clone());
@@ -1845,6 +1839,96 @@ impl StylesManager {
         self.descendant_text_styles = descendant_text_styles;
         self.primary_heading_style = primary_heading_style;
     }
+
+    /// Port of `StylesManager.serialize`: writes every combined
+    /// (paragraph+run) style, deduplicated descendant-text-style
+    /// override, and pure block style [`Self::finalize`] computed
+    /// into `styles` (a `<w:styles>` element -- e.g.
+    /// [`super::container::Skeleton::styles`]), and overwrites every
+    /// attribute value on the document-default `<w:lang>` element
+    /// Word's own skeleton already ships with [`Self::document_lang`].
+    ///
+    /// Python's `styles.xpath('descendant::*[local-name()="lang"]')[0]`
+    /// is a genuinely relative search here (no leading `//`, unlike
+    /// `links.py`'s `serialize_toc`) -- [`Element::find_descendant_mut`]
+    /// is a faithful port, not an approximation.
+    ///
+    /// Combined styles are hand-built here rather than reusing
+    /// [`BlockStyle::serialize`]/[`TextStyle::serialize`] -- Python's
+    /// `CombinedStyle.serialize` is its own standalone method (not a
+    /// `DOCXStyle` subclass), folding both a block style's `w:pPr`
+    /// AND a run style's `w:rPr` into ONE `<w:style w:type="paragraph">`,
+    /// plus `w:qFormat`/`w:default`, neither of which
+    /// `DOCXStyle.serialize` (the base `BlockStyle`/`TextStyle` share)
+    /// emits. Pure block styles, by contrast, really do call
+    /// `BlockStyle.serialize` in Python, so this reuses the
+    /// already-ported method directly.
+    pub fn serialize(&self, styles: &mut Element) {
+        if let Some(lang) = styles.find_descendant_mut("w:lang") {
+            for (_, value) in lang.attrs.iter_mut() {
+                *value = self.document_lang.clone();
+            }
+        }
+
+        if let Some(normal) = self.combined_styles.first().copied() {
+            let seq_width =
+                format!("{}", self.combined_styles.len().saturating_sub(1).max(1)).len();
+            let normal_id = combined_style_label(0, normal.outline_level, seq_width);
+            let normal_bs = self.block_style(normal.block_style);
+            let normal_rs = self.text_style(normal.text_style);
+            for (i, &cs) in self.combined_styles.iter().enumerate() {
+                let is_normal = i == 0;
+                let id = combined_style_label(i, cs.outline_level, seq_width);
+                let bs = self.block_style(cs.block_style);
+                let rs = self.text_style(cs.text_style);
+
+                let mut style = Element::new("w:style")
+                    .attr("w:styleId", id.as_str())
+                    .attr("w:type", "paragraph")
+                    .with(Element::new("w:name").attr("w:val", id.as_str()))
+                    .with(Element::new("w:qFormat"));
+                if !is_normal {
+                    style = style.with(Element::new("w:basedOn").attr("w:val", normal_id.as_str()));
+                }
+                if is_normal {
+                    style.set("w:default", "1");
+                }
+                let mut ppr = Element::new("w:pPr");
+                bs.serialize_properties(&mut ppr, is_normal, normal_bs, None);
+                if let Some(level) = cs.outline_level {
+                    ppr.append(Element::new("w:outlineLvl").attr("w:val", (level + 1).to_string()));
+                }
+                style.append(ppr);
+                let mut rpr = Element::new("w:rPr");
+                rs.serialize_properties(&mut rpr, is_normal, normal_rs);
+                style.append(rpr);
+                styles.append(style);
+            }
+        }
+
+        let ds_width = format!(
+            "{}",
+            self.descendant_text_styles.len().saturating_sub(1).max(1)
+        )
+        .len();
+        for (i, ds) in self.descendant_text_styles.iter().enumerate() {
+            let id = format!("Text{i}");
+            let name = format!("{i:0ds_width$} Text");
+            styles.append(ds.serialize(&id, &name));
+        }
+
+        if let Some(&normal_id) = self.pure_block_styles.first() {
+            let pure_width =
+                format!("{}", self.pure_block_styles.len().saturating_sub(1).max(1)).len();
+            let normal_label = format!("{:0pure_width$} Block", 0);
+            let normal_bs = self.block_style(normal_id);
+            for (i, &bsid) in self.pure_block_styles.iter().enumerate() {
+                let label = format!("{i:0pure_width$} Block");
+                let bs = self.block_style(bsid);
+                styles.append(bs.serialize(&label, &label, i == 0, normal_bs, &normal_label, None));
+            }
+        }
+    }
 }
 
 /// First-inserted winner of the highest-count entry in `map` -- port
@@ -1861,6 +1945,24 @@ fn first_max_by_count<K: Copy>(map: &IndexMap<K, usize>) -> Option<K> {
         }
     }
     best.map(|(k, _)| k)
+}
+
+/// A [`CombinedStyle`]'s final `w:styleId`/`w:name` (Python sets both
+/// to the same value) -- a pure function of its position `i` in
+/// [`StylesManager::combined_styles`] and its `outline_level`,
+/// confirmed exactly matching `StylesManager.finalize`'s
+/// `style.id = style.name = ...` assignment. Shared by
+/// [`StylesManager::finalize`] (writing it onto member blocks'
+/// `linked_style`) and [`StylesManager::serialize`] (writing it as
+/// the real `w:styleId`/`w:name`), so the two can never drift apart.
+fn combined_style_label(i: usize, outline_level: Option<u32>, seq_width: usize) -> String {
+    if i == 0 {
+        "Normal".to_string()
+    } else if let Some(level) = outline_level {
+        format!("Heading {}", level + 1)
+    } else {
+        format!("Para {i:0seq_width$}")
+    }
 }
 
 #[cfg(test)]
@@ -3003,5 +3105,187 @@ mod tests {
         );
         assert_eq!(runs[1].descendant_style_id.as_deref(), Some("Text0"));
         assert_eq!(mgr.descendant_text_styles().len(), 1);
+    }
+
+    fn find_style<'a>(styles: &'a Element, style_id: &str) -> &'a Element {
+        styles
+            .children_named("w:style")
+            .find(|e| e.get("w:styleId") == Some(style_id))
+            .unwrap_or_else(|| panic!("no w:style with styleId {style_id}"))
+    }
+
+    #[test]
+    fn serialize_overwrites_every_lang_attribute_value() {
+        let mut styles = Element::new("w:styles").with(
+            Element::new("w:docDefaults").with(
+                Element::new("w:rPrDefault").with(
+                    Element::new("w:rPr").with(
+                        Element::new("w:lang")
+                            .attr("w:val", "en-US")
+                            .attr("w:eastAsia", "en-US")
+                            .attr("w:bidi", "ar-SA"),
+                    ),
+                ),
+            ),
+        );
+        let mgr = StylesManager::new("fr");
+        mgr.serialize(&mut styles);
+        let lang = styles.find_descendant_mut("w:lang").unwrap();
+        assert_eq!(lang.get("w:val"), Some("fr"));
+        assert_eq!(lang.get("w:eastAsia"), Some("fr"));
+        assert_eq!(lang.get("w:bidi"), Some("fr"));
+    }
+
+    #[test]
+    fn serialize_writes_the_normal_combined_style_with_default_and_qformat() {
+        let dom = make("<html><body><p>hello</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let mut mgr = StylesManager::new("en");
+        let style = Style::new(&dom, &resolved, &profile, p);
+        let mut blocks = Blocks::new();
+        let id = blocks.start_new_block(&mut mgr, &dom, p, &style, false, None, false);
+        blocks.block_mut(id).add_text(
+            &mut mgr, "hello", &style, false, None, false, None, None, None,
+        );
+        blocks.end_current_block();
+        mgr.finalize(&mut blocks);
+
+        let mut styles = Element::new("w:styles");
+        mgr.serialize(&mut styles);
+
+        let normal = find_style(&styles, "Normal");
+        assert_eq!(normal.get("w:type"), Some("paragraph"));
+        assert_eq!(normal.get("w:default"), Some("1"));
+        assert!(normal.children_named("w:qFormat").next().is_some());
+        assert!(normal.children_named("w:basedOn").next().is_none());
+        assert!(normal.children_named("w:pPr").next().is_some());
+        assert!(normal.children_named("w:rPr").next().is_some());
+    }
+
+    #[test]
+    fn serialize_writes_a_heading_style_with_based_on_and_outline_level() {
+        let dom = make("<html><body><p>a</p><p>a</p><h1>heading</h1></body></html>");
+        let ps: Vec<NodeId> = dom
+            .preorder_elements(dom.root)
+            .into_iter()
+            .filter(|&id| dom.tag(id) == Some("p"))
+            .collect();
+        let h1 = find(&dom, "h1");
+        let resolved = resolved_with(&[(ps[0], &[]), (h1, &[("font-weight", "bold")])]);
+        let profile = Profile::default();
+        let mut mgr = StylesManager::new("en");
+        let p_style = Style::new(&dom, &resolved, &profile, ps[0]);
+        let h1_style = Style::new(&dom, &resolved, &profile, h1);
+        let mut blocks = Blocks::new();
+        let id_p1 = blocks.start_new_block(&mut mgr, &dom, ps[0], &p_style, false, None, false);
+        blocks.block_mut(id_p1).add_text(
+            &mut mgr, "a", &p_style, false, None, false, None, None, None,
+        );
+        let id_p2 = blocks.start_new_block(&mut mgr, &dom, ps[1], &p_style, false, None, false);
+        blocks.block_mut(id_p2).add_text(
+            &mut mgr, "a", &p_style, false, None, false, None, None, None,
+        );
+        let id_h1 = blocks.start_new_block(&mut mgr, &dom, h1, &h1_style, false, None, false);
+        blocks.block_mut(id_h1).add_text(
+            &mut mgr, "heading", &h1_style, false, None, false, None, None, None,
+        );
+        blocks.end_current_block();
+        mgr.finalize(&mut blocks);
+
+        let mut styles = Element::new("w:styles");
+        mgr.serialize(&mut styles);
+
+        let heading = find_style(&styles, "Heading 1");
+        assert_eq!(heading.get("w:type"), Some("paragraph"));
+        assert_eq!(heading.get("w:default"), None);
+        assert_eq!(
+            heading
+                .children_named("w:basedOn")
+                .next()
+                .unwrap()
+                .get("w:val"),
+            Some("Normal")
+        );
+        let ppr = heading.children_named("w:pPr").next().unwrap();
+        assert_eq!(
+            ppr.children_named("w:outlineLvl")
+                .next()
+                .unwrap()
+                .get("w:val"),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn serialize_writes_deduped_descendant_text_styles() {
+        let dom = make("<html><body><p>plain <b>bold</b></p></body></html>");
+        let p = find(&dom, "p");
+        let b = find(&dom, "b");
+        let resolved = resolved_with(&[(p, &[]), (b, &[("font-weight", "bold")])]);
+        let profile = Profile::default();
+        let mut mgr = StylesManager::new("en");
+        let p_style = Style::new(&dom, &resolved, &profile, p);
+        let b_style = Style::new(&dom, &resolved, &profile, b);
+        let mut blocks = Blocks::new();
+        let id = blocks.start_new_block(&mut mgr, &dom, p, &p_style, false, None, false);
+        blocks.block_mut(id).add_text(
+            &mut mgr,
+            "plain text long enough to dominate",
+            &p_style,
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+        );
+        blocks.block_mut(id).add_text(
+            &mut mgr, "b", &b_style, false, None, false, None, None, None,
+        );
+        blocks.end_current_block();
+        mgr.finalize(&mut blocks);
+
+        let mut styles = Element::new("w:styles");
+        mgr.serialize(&mut styles);
+
+        let ds = find_style(&styles, "Text0");
+        assert_eq!(ds.get("w:type"), Some("character"));
+        assert_eq!(
+            ds.children_named("w:name").next().unwrap().get("w:val"),
+            Some("0 Text")
+        );
+        assert!(ds
+            .children_named("w:rPr")
+            .next()
+            .unwrap()
+            .children_named("w:b")
+            .next()
+            .is_some());
+    }
+
+    #[test]
+    fn serialize_writes_pure_block_styles_without_qformat() {
+        let dom = make("<html><body><p></p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let mut mgr = StylesManager::new("en");
+        let style = Style::new(&dom, &resolved, &profile, p);
+        let mut blocks = Blocks::new();
+        let id = blocks.start_new_block(&mut mgr, &dom, p, &style, false, None, false);
+        blocks.end_current_block();
+        mgr.finalize(&mut blocks);
+
+        let mut styles = Element::new("w:styles");
+        mgr.serialize(&mut styles);
+
+        let pure = find_style(&styles, "0 Block");
+        assert_eq!(pure.get("w:type"), Some("paragraph"));
+        assert!(
+            pure.children_named("w:qFormat").next().is_none(),
+            "pure block styles go through DOCXStyle.serialize, not CombinedStyle's own -- no qFormat"
+        );
     }
 }

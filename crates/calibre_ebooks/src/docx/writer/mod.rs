@@ -10,7 +10,7 @@
 //! | `container.py` | [`container`] |
 //! | `fonts.py` | [`fonts`] |
 //! | — (`lxml.builder`) | [`xml`] |
-//! | `styles.py` (partial) | [`styles`] |
+//! | `styles.py` | [`styles`] |
 //! | `links.py` | [`links`] |
 //! | `from_html.py` (partial) | [`from_html`] |
 //! | `lists.py` | [`lists`] |
@@ -33,15 +33,17 @@
 //! [`crate::oeb::polish::cascade`] already had a real CSS cascade (a
 //! different consumer, issue #164), and
 //! [`crate::oeb::polish::style`] is the accessor seam these files
-//! actually need. [`styles`] is built against it: `TextStyle`/
+//! actually need. [`styles`] is now FULLY ported: `TextStyle`/
 //! `BlockStyle`/`FloatSpec`/`DescendantTextStyle` (CSS -> `w:rPr`/
 //! `w:pPr`/`w:framePr`, data model and serialization),
 //! `StylesManager`'s `create_text_style`/`create_block_style` dedup
-//! cache, and now `StylesManager::finalize` (block/run-style pairing,
-//! heading promotion, descendant-style dedup, writing back onto
-//! `from_html`'s `Block`/`TextRun`) are all ported. Only
-//! `StylesManager::serialize` (writing the final `w:styles` part from
-//! `finalize`'s output) remains of `styles.py`.
+//! cache, `StylesManager::finalize` (block/run-style pairing, heading
+//! promotion, descendant-style dedup, writing back onto `from_html`'s
+//! `Block`/`TextRun`), and `StylesManager::serialize` (writing every
+//! combined/descendant/pure-block style into a real `<w:styles>`
+//! element). `links.py`/`lists.py`/`styles.py` are the three files of
+//! the original six this issue tracks that are now closed out
+//! completely.
 //!
 //! ```no_run
 //! use calibre_ebooks::docx::writer::container::{DocxWriter, PageOptions};
