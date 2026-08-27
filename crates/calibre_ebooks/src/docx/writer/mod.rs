@@ -48,14 +48,14 @@
 //! `ImagesManager<'b>`'s own `&'b OEBBook` borrow is unrelated to
 //! `ProcessCtx`'s other `'a` borrows), so `<img>` markup is built
 //! for real during the walk, not deferred to serialize time. `images.py`'s
-//! `serialize`/cover-image methods (see [`images`]'s module docs --
-//! its self-contained utility layer, [`images::ImagesManager`]'s
-//! data-source half (`read_image`/`read_svg`), AND
-//! `create_image_markup`/`add_image` themselves are ported: the real
-//! image-content-source design question resolved to an existing
-//! crate-wide idiom, `OEBBook.container.read(href)`, no new
-//! abstraction needed) are the main remaining gap besides `Convert`
-//! itself --
+//! cover-image methods (see [`images`]'s module docs -- its
+//! self-contained utility layer, [`images::ImagesManager`]'s
+//! data-source half (`read_image`/`read_svg`), `create_image_markup`/
+//! `add_image`, AND now `serialize` (writing every embedded image's
+//! bytes into a `part name -> bytes` map -- exactly the shape
+//! [`container::DocxWriter::parts`] already has, so this needed no
+//! new capability despite earlier docs flagging one as missing) are
+//! all ported) are the main remaining gap besides `Convert` itself --
 //! `links.py`'s `LinksManager` is now fully ported, including its
 //! TOC-serialization half, which is what gave [`xml::Element`] its
 //! `insert`/`find_descendant_mut` methods. These walk a resolved-CSS
