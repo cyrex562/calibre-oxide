@@ -16,9 +16,8 @@
 //! that module's own already-established design (issue #132, PR
 //! #330). `TextRun.descendant_style` (a shared `DescendantTextStyle`
 //! object in Python, only ever read via `.id`) is stored here as
-//! just that `id: Option<String>` directly -- `StylesManager.finalize`,
-//! which assigns real ids to deduplicated descendant styles, isn't
-//! ported, so there is no id-carrying object to reference yet.
+//! just that `id: Option<String>` directly -- `StylesManager.finalize`
+//! (now ported, PR #340) is the only real writer of that id.
 //! `TextRun.link` (a raw `(item, url, tooltip)` tuple in Python) is
 //! [`LinkTarget`], storing the link's `current_item`'s href directly
 //! rather than a whole manifest `Item` object, matching
@@ -29,23 +28,26 @@
 //! `&mut LinksManager` as explicit parameters rather than storing
 //! them as fields (Python's `self.styles_manager`/`self.links_manager`)
 //! -- storing `&mut` references as struct fields would tie `Block` to
-//! a lifetime and make holding many of them at once (`Blocks`, not
-//! ported) an aliasing problem for no benefit, since every call site
-//! already has both managers in scope. `Block.style`/`.linked_style`
-//! (real `BlockStyle`/`CombinedStyle` objects in Python, read via
-//! `.id`) are an id handle (`style: BlockStyleId`) and an
-//! `Option<String>` respectively -- both only ever get a real id from
-//! `StylesManager.finalize`, not ported, so `Block::serialize` takes
-//! the resolved id for `self.style` as an explicit `own_style_id`
-//! parameter instead of reading it off a stored object.
+//! a lifetime and make holding many of them at once (`Blocks`) an
+//! aliasing problem for no benefit, since every call site already has
+//! both managers in scope. `Block.style`/`.linked_style` (real
+//! `BlockStyle`/`CombinedStyle` objects in Python, read via `.id`) are
+//! an id handle (`style: BlockStyleId`) and an `Option<String>`
+//! respectively -- `StylesManager.finalize` (ported, PR #340) is the
+//! only real writer of either, so `Block::serialize` still takes the
+//! resolved id for `self.style` as an explicit `own_style_id`
+//! parameter instead of reading it off a stored object (nothing wires
+//! `finalize`'s output back onto `Block.style` itself yet -- that's
+//! `Convert`'s job, still unported).
 //! `Block.float_spec.blocks` (the float's member-block list, used in
 //! Python only for `block is self.blocks[0]`/`[-1]` identity checks)
 //! isn't needed at all -- `FloatSpec::serialize` (PR #328) already
 //! takes `is_first_block`/`is_last_block` as explicit bools, so
 //! `Block::serialize` just forwards its own such parameters through.
-//! `Block.parent_items` (a back-reference into `Blocks`' own bookkeeping,
-//! never read by `Block` itself) isn't ported -- it belongs to
-//! `Blocks`, not `Block`, once that container exists.
+//! `Block.parent_items` (a back-reference into `Blocks`' own
+//! bookkeeping) IS ported now, as [`Block::container`] -- see
+//! [`ItemContainer`]'s own docs; this became real once `Blocks` grew
+//! real table support to make it meaningful (issue #132).
 //! `Block.list_tag`'s second tuple element (the raw CSS `Style` used
 //! later by `lists.py`, unported) is dropped -- `list_tag` here is
 //! just the html block's [`NodeId`]; `Style` is cheap to reconstruct
@@ -65,6 +67,7 @@ use indexmap::{IndexMap, IndexSet};
 
 use super::links::LinksManager;
 use super::styles::{BlockStyleId, FloatSpec, StylesManager, TextStyleId};
+use super::tables::{CellId, TableId};
 use super::xml::{Child, Element};
 
 /// Port of the `(item, url, tooltip)` tuple Python's
@@ -396,6 +399,10 @@ pub struct Block {
     pub page_break_after: bool,
     pub keep_next: bool,
     pub block_lang: Option<String>,
+    /// Port of `Block.parent_items` -- see [`ItemContainer`]'s docs.
+    /// `None` until [`Blocks::end_current_block`] (or a table's own
+    /// `add_block`) files this block into a real items list.
+    pub container: Option<ItemContainer>,
 }
 
 impl Block {
@@ -436,6 +443,7 @@ impl Block {
             page_break_after: false,
             keep_next: false,
             block_lang: None,
+            container: None,
         }
     }
 
@@ -648,26 +656,41 @@ pub struct BlockId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ItemId {
     Block(BlockId),
-    Table(super::tables::TableId),
+    Table(TableId),
+}
+
+/// Which items list a [`Block`] currently lives in -- port of
+/// `Block.parent_items`, dropped when `Block` was first ported (PR
+/// #333, before `Cell`/table support existed to make it real) and
+/// reintroduced now that it is: Python holds a direct reference to
+/// the live Python list object (either `Blocks.items` or some
+/// `Cell.items`); this names WHICH one instead, since Rust has
+/// nothing to hold a reference to a specific `Vec` living inside an
+/// arena entry. [`Blocks::delete_block_at`]/`::apply_page_break_after`
+/// are the two real readers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemContainer {
+    Top,
+    Cell(CellId),
 }
 
 /// Port of `Blocks` -- **partial**. Ported: `new` (`__init__`),
 /// `current_or_new_block`, `end_current_block`, `start_new_block`,
-/// the block-only half of `finish_tag` (see below),
+/// `finish_tag` (now including its table-closing branch),
+/// `start_new_table`/`start_new_row`/`start_new_cell`,
 /// `delete_block_at`, `begin_item`/`end_item` (`__enter__`/
 /// `__exit__` -- Rust has no context-manager equivalent that also
 /// allows the caller to keep mutating `Blocks` and other managers
 /// mid-scope, so these are just two plain methods `Convert`, not
 /// ported, will call explicitly around each spine item), and
-/// `apply_page_break_after`/`resolve_language`.
+/// `apply_page_break_after`/`resolve_language`. `self.items` is now
+/// the real `Vec<ItemId>` union Python's version holds (both `Block`s
+/// and finished `Table`s), and [`Block::container`] is real too (see
+/// its own docs) -- both were the concrete things flagged as
+/// "becomes real once table support lands" back when `Block`/`Blocks`
+/// were first ported (PRs #333/#334).
 ///
 /// **Not ported, deliberately**:
-/// - Everything involving `Table` (`self.tables`/`self.current_table`,
-///   `start_new_table`/`start_new_row`/`start_new_cell`, and
-///   `finish_tag`'s `if self.current_table is not None:` half) --
-///   `tables.py` isn't ported, so there is no `Table` type to hold.
-///   `self.items` here is therefore always `Vec<BlockId>`, never the
-///   `Block | Table` union Python's version holds.
 /// - `serialize` (`Blocks.serialize`, walking `self.items` and
 ///   calling each item's own `serialize`) -- `Block::serialize` needs
 ///   a resolved `own_style_id: Option<&str>` per block (only
@@ -682,7 +705,9 @@ pub enum ItemId {
 ///   deciding how float-group membership gets tracked (a real design
 ///   question, not a routine port -- see issue #132's own tracking
 ///   notes) would mean guessing at an interface with no real caller
-///   to validate it against yet.
+///   to validate it against yet. `super::tables::Cell`/`Row`/
+///   `Table::serialize` are equally unported, for the same "no real
+///   content to serialize against yet" reason.
 /// - `block_map` (`dict[Block, int]`, Python's object-identity-keyed
 ///   cache of a block's position within `self.items`, used only to
 ///   speed up `delete_block_at`'s lookup) isn't ported at all --
@@ -694,14 +719,6 @@ pub enum ItemId {
 ///   problem and a latent staleness risk in Python's own cache (a
 ///   block's cached position never gets updated when an *earlier*
 ///   block is deleted and everything after it shifts down).
-/// - `Block.parent_items` (see [`Block`]'s own module-level design
-///   note) means [`Self::apply_page_break_after`]'s Python condition
-///   `next_block.parent_items is block.parent_items is self.items`
-///   is unconditionally true here (there is only ever one items list,
-///   `self.items`, since table-cell item lists don't exist yet) --
-///   simplified accordingly; **revisit this the moment table support
-///   lands**, since a real per-cell items list would make the
-///   condition meaningfully false again.
 #[derive(Debug, Default)]
 pub struct Blocks {
     pub top_bookmark: Option<String>,
@@ -709,9 +726,19 @@ pub struct Blocks {
     all_blocks: Vec<BlockId>,
     pos: usize,
     current_block: Option<BlockId>,
-    items: Vec<BlockId>,
+    items: Vec<ItemId>,
     open_html_blocks: HashSet<NodeId>,
     html_tag_start_blocks: HashMap<NodeId, BlockId>,
+    /// The `Cell`/`Row`/`Table` arena -- port of `super::tables::Tables`,
+    /// owned here the same way `self.blocks: Vec<Block>` is (plain
+    /// data, no aliasing concern the way a shared manager would have).
+    tables_arena: super::tables::Tables,
+    /// Port of `self.tables`: the STACK of currently-open tables
+    /// (nested tables push, `finish_tag`'s table-closing branch pops).
+    /// Distinct from `tables_arena`, which never shrinks -- a
+    /// finished table stays in the arena forever, just no longer on
+    /// this stack.
+    open_tables: Vec<TableId>,
 }
 
 impl Blocks {
@@ -737,14 +764,24 @@ impl Blocks {
         &self.all_blocks
     }
 
-    pub fn items(&self) -> &[BlockId] {
+    pub fn items(&self) -> &[ItemId] {
         &self.items
+    }
+
+    pub fn tables(&self) -> &super::tables::Tables {
+        &self.tables_arena
     }
 
     /// Port of `html_tag in self.blocks.open_html_blocks` (used by
     /// `Convert.process_tag`).
     pub fn is_open(&self, html_tag: NodeId) -> bool {
         self.open_html_blocks.contains(&html_tag)
+    }
+
+    /// Port of `self.current_table` (a plain attribute in Python,
+    /// last of `self.tables`; here, the top of [`Self::open_tables`]).
+    pub fn current_table(&self) -> Option<TableId> {
+        self.open_tables.last().copied()
     }
 
     /// Port of `Blocks.current_or_new_block`.
@@ -763,15 +800,34 @@ impl Blocks {
         }
     }
 
-    /// Port of `Blocks.end_current_block`. The `self.current_table is
-    /// not None and self.current_table.current_row is not None`
-    /// branch (adding the block to the current table row instead of
-    /// `self.items`) is never taken here -- table support isn't
-    /// ported, so there is no `current_table` to check.
-    pub fn end_current_block(&mut self) {
+    /// Port of `Blocks.end_current_block`. `dom`/`resolved`/`profile`
+    /// are only ever used by the table-routing branch's own fallback
+    /// (`Tables::table_add_block`'s auto-create-a-cell path, when a
+    /// row is open but has no current cell yet -- malformed markup,
+    /// e.g. text directly inside a `<tr>` with no `<td>`); the common
+    /// top-level-block and real-cell cases never touch them.
+    pub fn end_current_block(&mut self, dom: &Dom, resolved: &ResolvedStyles, profile: &Profile) {
         if let Some(id) = self.current_block.take() {
             self.all_blocks.push(id);
-            self.items.push(id);
+            let current_row = self
+                .current_table()
+                .and_then(|t| self.tables_arena.table(t).current_row);
+            match current_row {
+                Some(row) => {
+                    self.tables_arena
+                        .row_add_block(row, id, dom, resolved, profile);
+                    let cell = self
+                        .tables_arena
+                        .row(row)
+                        .current_cell
+                        .expect("row_add_block always leaves a current cell behind");
+                    self.blocks[id.0].container = Some(ItemContainer::Cell(cell));
+                }
+                None => {
+                    self.items.push(ItemId::Block(id));
+                    self.blocks[id.0].container = Some(ItemContainer::Top);
+                }
+            }
         }
     }
 
@@ -797,7 +853,7 @@ impl Blocks {
                 }
             }
         }
-        self.end_current_block();
+        self.end_current_block(dom, style.resolved(), style.profile());
         let block = Block::new(
             styles_manager,
             dom,
@@ -816,14 +872,16 @@ impl Blocks {
         id
     }
 
-    /// Port of the block-only half of `Blocks.finish_tag` -- the
-    /// `if self.current_table is not None:` half isn't ported (see
-    /// the module docs). `tag_style` stands in for Python reading
+    /// Port of `Blocks.finish_tag`, now including its table-closing
+    /// branch. `tag_style` stands in for Python reading
     /// `start_block.html_style['page-break-after']` off the cached
     /// block that opened `html_tag` -- that block's own `html_style`
     /// *is* `html_tag`'s style (it was created for this exact tag),
     /// so the caller's fresh `tag_style` for `html_tag` at the point
-    /// it closes is the same value.
+    /// it closes is the same value. The two branches are independent
+    /// `if`s in Python, not an `else if` -- both run unconditionally
+    /// on every call, matched here the same way, even though a single
+    /// closing tag realistically only ever matches one of them.
     pub fn finish_tag(&mut self, html_tag: NodeId, tag_style: &Style) {
         if self.current_block.is_some() && self.open_html_blocks.contains(&html_tag) {
             // Every element added to `open_html_blocks` is added to
@@ -838,19 +896,84 @@ impl Blocks {
                     self.blocks[id.0].page_break_after = true;
                 }
             }
-            self.end_current_block();
+            self.end_current_block(tag_style.dom(), tag_style.resolved(), tag_style.profile());
             self.open_html_blocks.remove(&html_tag);
+        }
+
+        if let Some(table) = self.current_table() {
+            let table_finished = self.tables_arena.table_finish_tag(table, html_tag);
+            if table_finished {
+                self.open_tables.pop();
+                match self.open_tables.last().copied() {
+                    Some(outer) => {
+                        self.tables_arena.table_add_table(
+                            outer,
+                            table,
+                            tag_style.dom(),
+                            tag_style.resolved(),
+                            tag_style.profile(),
+                        );
+                    }
+                    None => {
+                        self.items.push(ItemId::Table(table));
+                    }
+                }
+            }
         }
     }
 
+    /// Port of `Blocks.start_new_table`.
+    pub fn start_new_table(&mut self, html_tag: NodeId, tag_style: Option<&Style>) {
+        let id = self.tables_arena.add_table(html_tag, tag_style);
+        self.open_tables.push(id);
+    }
+
+    /// Port of `Blocks.start_new_row`.
+    pub fn start_new_row(&mut self, html_tag: NodeId, tag_style: Option<&Style>) {
+        if self.current_table().is_none() {
+            self.start_new_table(html_tag, None);
+        }
+        let table = self.current_table().expect("just ensured a current table");
+        self.tables_arena
+            .table_start_new_row(table, html_tag, tag_style);
+    }
+
+    /// Port of `Blocks.start_new_cell`.
+    pub fn start_new_cell(&mut self, html_tag: NodeId, dom: &Dom, tag_style: Option<&Style>) {
+        if self.current_table().is_none() {
+            self.start_new_table(html_tag, None);
+        }
+        let table = self.current_table().expect("just ensured a current table");
+        self.tables_arena
+            .table_start_new_cell(table, html_tag, dom, tag_style);
+    }
+
     /// Port of `Blocks.delete_block_at`. See the module docs for why
-    /// there's no `block_map`/`parent_items` here.
+    /// there's no `block_map`; `block.container` (Python's
+    /// `parent_items`) is real now, so this removes from the SAME
+    /// items list the block actually lives in -- `self.items` for a
+    /// top-level block, or the owning cell's own `items` otherwise.
     pub fn delete_block_at(&mut self, pos: Option<usize>) {
         let pos = pos.unwrap_or(self.pos);
         let block_id = self.all_blocks.remove(pos);
-        if let Some(item_pos) = self.items.iter().position(|&id| id == block_id) {
-            self.items.remove(item_pos);
+        match self.blocks[block_id.0].container {
+            Some(ItemContainer::Cell(cell)) => {
+                let items = &mut self.tables_arena.cell_mut(cell).items;
+                if let Some(item_pos) = items.iter().position(|&id| id == ItemId::Block(block_id)) {
+                    items.remove(item_pos);
+                }
+            }
+            _ => {
+                if let Some(item_pos) = self
+                    .items
+                    .iter()
+                    .position(|&id| id == ItemId::Block(block_id))
+                {
+                    self.items.remove(item_pos);
+                }
+            }
         }
+        self.blocks[block_id.0].container = None;
         let (bookmarks, page_break_after, page_break_before) = {
             let block = &self.blocks[block_id.0];
             (
@@ -897,12 +1020,22 @@ impl Blocks {
 
     /// Port of `Blocks.apply_page_break_after`. Python's
     /// `next_block.parent_items is block.parent_items is self.items`
-    /// guard is unconditionally true here -- see the module docs.
+    /// guard requires BOTH blocks to live in the literal top-level
+    /// `self.items` -- two blocks sharing the same CELL's items list
+    /// don't count, matching Python exactly (page-break-after
+    /// propagation is a top-level-only concept; `container` is now
+    /// real, PR after #344, so this is no longer the "always true"
+    /// simplification the port carried until table support landed).
     pub fn apply_page_break_after(&mut self) {
         for i in 0..self.all_blocks.len().saturating_sub(1) {
-            if self.blocks[self.all_blocks[i].0].page_break_after {
+            let id = self.all_blocks[i];
+            if self.blocks[id.0].page_break_after {
                 let next_id = self.all_blocks[i + 1];
-                self.blocks[next_id.0].page_break_before = true;
+                let both_top = self.blocks[id.0].container == Some(ItemContainer::Top)
+                    && self.blocks[next_id.0].container == Some(ItemContainer::Top);
+                if both_top {
+                    self.blocks[next_id.0].page_break_before = true;
+                }
             }
         }
     }
@@ -1724,6 +1857,16 @@ mod tests {
         StylesManager::new("en")
     }
 
+    /// Unwraps an [`ItemId`] that a test knows must be a [`Block`] --
+    /// none of these fixtures wire up table content, so every real
+    /// `items()` entry they produce is a `Block`.
+    fn expect_block(item: ItemId) -> BlockId {
+        match item {
+            ItemId::Block(id) => id,
+            ItemId::Table(_) => panic!("expected a Block item, got a Table"),
+        }
+    }
+
     #[test]
     fn block_new_reads_page_break_flags_and_html_tag() {
         let dom = make("<html><body><p>x</p></body></html>");
@@ -2151,7 +2294,7 @@ mod tests {
         let first = blocks.start_new_block(&mut mgr, &dom, ps[0], &style1, false, None, false);
         let second = blocks.start_new_block(&mut mgr, &dom, ps[1], &style2, false, None, false);
         assert_eq!(blocks.current_block(), Some(second));
-        assert_eq!(blocks.items(), &[first]);
+        assert_eq!(blocks.items(), &[ItemId::Block(first)]);
         assert_eq!(blocks.all_blocks(), &[first]);
     }
 
@@ -2200,9 +2343,9 @@ mod tests {
         let mut mgr = styles_manager();
         let mut blocks = Blocks::new();
         let id = blocks.start_new_block(&mut mgr, &dom, p, &style, false, None, false);
-        blocks.end_current_block();
+        blocks.end_current_block(&dom, &resolved, &profile);
         assert_eq!(blocks.current_block(), None);
-        assert_eq!(blocks.items(), &[id]);
+        assert_eq!(blocks.items(), &[ItemId::Block(id)]);
         assert_eq!(blocks.all_blocks(), &[id]);
     }
 
@@ -2281,12 +2424,12 @@ mod tests {
             .bookmarks
             .insert("mark1".to_string());
         blocks.block_mut(first).page_break_after = true;
-        blocks.end_current_block();
+        blocks.end_current_block(&dom, &resolved, &profile);
         let second = blocks.start_new_block(&mut mgr, &dom, ps[1], &style2, false, None, false);
-        blocks.end_current_block();
+        blocks.end_current_block(&dom, &resolved, &profile);
         blocks.delete_block_at(Some(0));
         assert_eq!(blocks.all_blocks(), &[second]);
-        assert_eq!(blocks.items(), &[second]);
+        assert_eq!(blocks.items(), &[ItemId::Block(second)]);
         assert!(blocks.block(second).bookmarks.contains("mark1"));
         assert!(blocks.block(second).page_break_after);
     }
@@ -2309,17 +2452,17 @@ mod tests {
         // begin_item's `pos` is non-zero -- matching Python's own
         // "insert a page break at the start of this html file" case.
         let prior = blocks.start_new_block(&mut mgr, &dom, ps[0], &style1, false, None, false);
-        blocks.end_current_block();
+        blocks.end_current_block(&dom, &resolved, &profile);
         blocks.begin_item();
         blocks.top_bookmark = Some("top1".to_string());
         // Empty block (never got any text) for this "item".
         blocks.start_new_block(&mut mgr, &dom, ps[0], &style1, false, None, false);
-        blocks.end_current_block();
+        blocks.end_current_block(&dom, &resolved, &profile);
         let real = blocks.start_new_block(&mut mgr, &dom, ps[1], &style2, false, None, false);
         blocks
             .block_mut(real)
             .add_text(&mut mgr, "y", &style2, false, None, false, None, None, None);
-        blocks.end_current_block();
+        blocks.end_current_block(&dom, &resolved, &profile);
         blocks.end_item(true);
         assert_eq!(blocks.all_blocks(), &[prior, real]);
         assert!(blocks.block(real).page_break_before);
@@ -2363,7 +2506,7 @@ mod tests {
         for &p in &ps {
             let style = plain_style(&dom, &resolved, &profile, p);
             ids.push(blocks.start_new_block(&mut mgr, &dom, p, &style, false, None, false));
-            blocks.end_current_block();
+            blocks.end_current_block(&dom, &resolved, &profile);
         }
         blocks.block_mut(ids[1]).page_break_after = true;
         blocks.apply_page_break_after();
@@ -2382,11 +2525,290 @@ mod tests {
         let mut mgr = styles_manager();
         let mut blocks = Blocks::new();
         let id = blocks.start_new_block(&mut mgr, &dom, p, &style, false, None, false);
-        blocks.end_current_block();
+        blocks.end_current_block(&dom, &resolved, &profile);
         blocks.block_mut(id).page_break_after = true;
         blocks.apply_page_break_after();
         // No panic and nothing to assert beyond "didn't crash" -- the
         // real assertion is that this doesn't index out of bounds.
+    }
+
+    #[test]
+    fn blocks_start_new_table_pushes_onto_the_open_stack() {
+        let dom = make("<html><body><table></table></body></html>");
+        let table_tag = find(&dom, "table");
+        let mut blocks = Blocks::new();
+        assert_eq!(blocks.current_table(), None);
+        blocks.start_new_table(table_tag, None);
+        assert_eq!(blocks.current_table(), Some(TableId(0)));
+    }
+
+    #[test]
+    fn blocks_start_new_row_auto_starts_a_table_when_none_is_open() {
+        // A bare <tr> with no <table> ancestor is exactly the
+        // malformed-markup case this fallback exists for, but
+        // html5ever's real tree-construction rules would foster-parent
+        // or drop it before this test ever saw it -- a synthetic,
+        // disconnected node (matching tables.rs's own PR #344 tests)
+        // sidesteps that; `start_new_row` only reads the node itself.
+        let mut dom = Dom::empty();
+        let tr_tag = dom.new_element("tr");
+        let mut blocks = Blocks::new();
+        blocks.start_new_row(tr_tag, None);
+        let table = blocks.current_table().expect("a table was auto-started");
+        assert!(blocks.tables().table(table).current_row.is_some());
+    }
+
+    #[test]
+    fn blocks_start_new_cell_auto_starts_a_table_when_none_is_open() {
+        let mut dom = Dom::empty();
+        let td_tag = dom.new_element("td");
+        let mut blocks = Blocks::new();
+        blocks.start_new_cell(td_tag, &dom, None);
+        let table = blocks.current_table().expect("a table was auto-started");
+        let row = blocks
+            .tables()
+            .table(table)
+            .current_row
+            .expect("a row was auto-started too");
+        assert!(blocks.tables().row(row).current_cell.is_some());
+    }
+
+    #[test]
+    fn end_current_block_routes_into_the_open_cell_when_a_table_row_is_open() {
+        let dom = make("<html><body><table><tr><td><p>x</p></td></tr></table></body></html>");
+        let table_tag = find(&dom, "table");
+        let tr_tag = find(&dom, "tr");
+        let td_tag = find(&dom, "td");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let mut mgr = styles_manager();
+        let mut blocks = Blocks::new();
+        blocks.start_new_table(table_tag, None);
+        blocks.start_new_row(tr_tag, None);
+        blocks.start_new_cell(td_tag, &dom, None);
+        let style = plain_style(&dom, &resolved, &profile, p);
+        let id = blocks.start_new_block(&mut mgr, &dom, p, &style, true, None, false);
+        blocks.end_current_block(&dom, &resolved, &profile);
+
+        assert!(
+            blocks.items().is_empty(),
+            "a block inside an open table cell must not land in the top-level items"
+        );
+        let container = blocks.block(id).container.expect("container was set");
+        let ItemContainer::Cell(cell) = container else {
+            panic!("expected the block to be filed under a Cell, got {container:?}");
+        };
+        assert_eq!(blocks.tables().cell(cell).items, vec![ItemId::Block(id)]);
+    }
+
+    #[test]
+    fn end_current_block_falls_back_to_top_level_items_with_no_open_table() {
+        let dom = make("<html><body><p>x</p></body></html>");
+        let p = find(&dom, "p");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style = plain_style(&dom, &resolved, &profile, p);
+        let mut mgr = styles_manager();
+        let mut blocks = Blocks::new();
+        let id = blocks.start_new_block(&mut mgr, &dom, p, &style, false, None, false);
+        blocks.end_current_block(&dom, &resolved, &profile);
+        assert_eq!(blocks.items(), &[ItemId::Block(id)]);
+        assert_eq!(blocks.block(id).container, Some(ItemContainer::Top));
+    }
+
+    #[test]
+    fn finish_tag_table_closing_moves_the_finished_table_into_top_level_items() {
+        let dom = make("<html><body><table><tr><td>x</td></tr></table></body></html>");
+        let table_tag = find(&dom, "table");
+        let tr_tag = find(&dom, "tr");
+        let td_tag = find(&dom, "td");
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style = plain_style(&dom, &resolved, &profile, table_tag);
+        let mut blocks = Blocks::new();
+        blocks.start_new_table(table_tag, None);
+        blocks.start_new_row(tr_tag, None);
+        blocks.start_new_cell(td_tag, &dom, None);
+
+        blocks.finish_tag(td_tag, &style);
+        blocks.finish_tag(tr_tag, &style);
+        blocks.finish_tag(table_tag, &style);
+
+        assert_eq!(blocks.current_table(), None);
+        assert_eq!(blocks.items().len(), 1);
+        assert!(matches!(blocks.items()[0], ItemId::Table(_)));
+    }
+
+    #[test]
+    fn finish_tag_table_closing_nests_into_the_outer_table_when_one_is_still_open() {
+        let dom = make(
+            "<html><body><table><tr><td><table><tr><td>inner</td></tr></table></td></tr></table></body></html>",
+        );
+        let tables_nodes: Vec<NodeId> = dom
+            .preorder_elements(dom.root)
+            .into_iter()
+            .filter(|&id| dom.tag(id) == Some("table"))
+            .collect();
+        let (outer_table, inner_table) = (tables_nodes[0], tables_nodes[1]);
+        let trs: Vec<NodeId> = dom
+            .preorder_elements(dom.root)
+            .into_iter()
+            .filter(|&id| dom.tag(id) == Some("tr"))
+            .collect();
+        let tds: Vec<NodeId> = dom
+            .preorder_elements(dom.root)
+            .into_iter()
+            .filter(|&id| dom.tag(id) == Some("td"))
+            .collect();
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let style = plain_style(&dom, &resolved, &profile, outer_table);
+        let mut blocks = Blocks::new();
+        blocks.start_new_table(outer_table, None);
+        blocks.start_new_row(trs[0], None);
+        blocks.start_new_cell(tds[0], &dom, None);
+        blocks.start_new_table(inner_table, None);
+        blocks.start_new_row(trs[1], None);
+        blocks.start_new_cell(tds[1], &dom, None);
+
+        blocks.finish_tag(tds[1], &style);
+        blocks.finish_tag(trs[1], &style);
+        assert_eq!(
+            blocks.current_table(),
+            Some(TableId(1)),
+            "closing the inner row's own tag isn't the inner TABLE's own tag -- \
+             the stack only pops once the table's own opening tag closes"
+        );
+        blocks.finish_tag(inner_table, &style);
+
+        assert_eq!(
+            blocks.current_table(),
+            Some(TableId(0)),
+            "closing the inner table's own tag pops back to the outer table"
+        );
+        assert!(
+            blocks.items().is_empty(),
+            "the finished inner table must nest into the outer table's open cell, \
+             not land in Blocks' own top-level items"
+        );
+        let outer_cell = blocks
+            .tables()
+            .row(
+                blocks
+                    .tables()
+                    .table(TableId(0))
+                    .current_row
+                    .expect("outer row still open"),
+            )
+            .current_cell
+            .expect("outer cell still open");
+        assert_eq!(
+            blocks.tables().cell(outer_cell).items,
+            vec![ItemId::Table(TableId(1))]
+        );
+    }
+
+    #[test]
+    fn delete_block_at_removes_from_the_owning_cells_items_not_top_level() {
+        let dom =
+            make("<html><body><table><tr><td><p>x</p></td></tr></table><p>top</p></body></html>");
+        let table_tag = find(&dom, "table");
+        let tr_tag = find(&dom, "tr");
+        let td_tag = find(&dom, "td");
+        let ps: Vec<NodeId> = dom
+            .preorder_elements(dom.root)
+            .into_iter()
+            .filter(|&id| dom.tag(id) == Some("p"))
+            .collect();
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let mut mgr = styles_manager();
+        let mut blocks = Blocks::new();
+        blocks.start_new_table(table_tag, None);
+        blocks.start_new_row(tr_tag, None);
+        blocks.start_new_cell(td_tag, &dom, None);
+        let cell_style = plain_style(&dom, &resolved, &profile, ps[0]);
+        let cell_block =
+            blocks.start_new_block(&mut mgr, &dom, ps[0], &cell_style, true, None, false);
+        blocks.end_current_block(&dom, &resolved, &profile);
+        let table_style = plain_style(&dom, &resolved, &profile, table_tag);
+        blocks.finish_tag(td_tag, &table_style);
+        blocks.finish_tag(tr_tag, &table_style);
+        blocks.finish_tag(table_tag, &table_style);
+        let top_style = plain_style(&dom, &resolved, &profile, ps[1]);
+        let top_block =
+            blocks.start_new_block(&mut mgr, &dom, ps[1], &top_style, false, None, false);
+        blocks.end_current_block(&dom, &resolved, &profile);
+
+        let cell = match blocks.block(cell_block).container {
+            Some(ItemContainer::Cell(c)) => c,
+            other => panic!("expected the first block to be cell-contained, got {other:?}"),
+        };
+        assert_eq!(
+            blocks.tables().cell(cell).items,
+            vec![ItemId::Block(cell_block)]
+        );
+        assert_eq!(
+            blocks.items(),
+            &[ItemId::Table(TableId(0)), ItemId::Block(top_block)],
+            "the finished table itself also lands in items, ahead of the later top-level block"
+        );
+
+        let pos = blocks
+            .all_blocks()
+            .iter()
+            .position(|&id| id == cell_block)
+            .unwrap();
+        blocks.delete_block_at(Some(pos));
+
+        assert!(
+            blocks.tables().cell(cell).items.is_empty(),
+            "the cell-contained block should be removed from the cell's own items"
+        );
+        assert_eq!(
+            blocks.items(),
+            &[ItemId::Table(TableId(0)), ItemId::Block(top_block)],
+            "top-level items must be untouched by deleting a cell-contained block"
+        );
+    }
+
+    #[test]
+    fn apply_page_break_after_does_not_propagate_across_a_cell_boundary() {
+        let dom =
+            make("<html><body><p>a</p><table><tr><td><p>b</p></td></tr></table></body></html>");
+        let table_tag = find(&dom, "table");
+        let tr_tag = find(&dom, "tr");
+        let td_tag = find(&dom, "td");
+        let ps: Vec<NodeId> = dom
+            .preorder_elements(dom.root)
+            .into_iter()
+            .filter(|&id| dom.tag(id) == Some("p"))
+            .collect();
+        let resolved = resolved_with(&[]);
+        let profile = Profile::default();
+        let mut mgr = styles_manager();
+        let mut blocks = Blocks::new();
+        let top_style = plain_style(&dom, &resolved, &profile, ps[0]);
+        let top_block =
+            blocks.start_new_block(&mut mgr, &dom, ps[0], &top_style, false, None, false);
+        blocks.end_current_block(&dom, &resolved, &profile);
+        blocks.start_new_table(table_tag, None);
+        blocks.start_new_row(tr_tag, None);
+        blocks.start_new_cell(td_tag, &dom, None);
+        let cell_style = plain_style(&dom, &resolved, &profile, ps[1]);
+        let cell_block =
+            blocks.start_new_block(&mut mgr, &dom, ps[1], &cell_style, true, None, false);
+        blocks.end_current_block(&dom, &resolved, &profile);
+
+        blocks.block_mut(top_block).page_break_after = true;
+        blocks.apply_page_break_after();
+
+        assert!(
+            !blocks.block(cell_block).page_break_before,
+            "page-break-after propagation is a top-level-only concept in Python -- \
+             a following cell-contained block must not inherit it"
+        );
     }
 
     fn add_lang_run(
@@ -2425,7 +2847,7 @@ mod tests {
         add_lang_run(&mut blocks, &mut mgr, id, &style, Some("fr"));
         blocks.block_mut(id).add_break("none", None);
         add_lang_run(&mut blocks, &mut mgr, id, &style, Some("de"));
-        blocks.end_current_block();
+        blocks.end_current_block(&dom, &resolved, &profile);
         blocks.resolve_language("en");
         assert_eq!(blocks.block(id).block_lang.as_deref(), Some("de"));
         for run in &blocks.block(id).runs {
@@ -2447,7 +2869,7 @@ mod tests {
         let mut blocks = Blocks::new();
         let id = blocks.start_new_block(&mut mgr, &dom, p, &style, false, None, false);
         add_lang_run(&mut blocks, &mut mgr, id, &style, Some("en"));
-        blocks.end_current_block();
+        blocks.end_current_block(&dom, &resolved, &profile);
         blocks.resolve_language("en");
         assert_eq!(blocks.block(id).block_lang, None);
     }
@@ -2462,7 +2884,7 @@ mod tests {
         let mut mgr = styles_manager();
         let mut blocks = Blocks::new();
         let id = blocks.start_new_block(&mut mgr, &dom, p, &style, false, None, false);
-        blocks.end_current_block();
+        blocks.end_current_block(&dom, &resolved, &profile);
         blocks.resolve_language("en");
         assert_eq!(blocks.block(id).block_lang, None);
     }
@@ -2515,7 +2937,7 @@ mod tests {
         let mut state = ProcessState::default();
         process_tag(&mut ctx, &mut state, p, true, None);
         assert_eq!(f.blocks.items().len(), 1);
-        let id = f.blocks.items()[0];
+        let id = expect_block(f.blocks.items()[0]);
         assert_eq!(f.blocks.block(id).runs.len(), 1);
     }
 
@@ -2568,7 +2990,7 @@ mod tests {
         let mut state = ProcessState::default();
         process_tag(&mut ctx, &mut state, p, true, None);
         assert_eq!(f.blocks.items().len(), 1);
-        let id = f.blocks.items()[0];
+        let id = expect_block(f.blocks.items()[0]);
         // "a" and "b" -- both text-bearing runs land in the same block
         // since the <p> itself is the current_or_new_block target, but
         // as two distinct runs since their TextStyles differ.
@@ -2586,7 +3008,7 @@ mod tests {
         let mut ctx = f.ctx();
         let mut state = ProcessState::default();
         process_tag(&mut ctx, &mut state, p, true, None);
-        let id = f.blocks.items()[0];
+        let id = expect_block(f.blocks.items()[0]);
         let runs = &f.blocks.block(id).runs;
         assert_eq!(runs.len(), 2, "the linked run, then the unlinked tail run");
         assert!(runs[0].link.is_some());
@@ -2617,7 +3039,7 @@ mod tests {
         let mut ctx = f.ctx();
         let mut state = ProcessState::default();
         process_tag(&mut ctx, &mut state, p, true, None);
-        let id = f.blocks.items()[0];
+        let id = expect_block(f.blocks.items()[0]);
         let runs = &f.blocks.block(id).runs;
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].lang.as_deref(), Some("de"));
@@ -2635,7 +3057,7 @@ mod tests {
         let mut ctx = f.ctx();
         let mut state = ProcessState::default();
         process_tag(&mut ctx, &mut state, p, true, None);
-        let id = f.blocks.items()[0];
+        let id = expect_block(f.blocks.items()[0]);
         // One run: "a" text entry, then a break entry (add_break
         // appends to the SAME run when one already exists), then "b".
         assert_eq!(f.blocks.block(id).runs.len(), 1);
@@ -2654,7 +3076,7 @@ mod tests {
         let mut ctx = f.ctx();
         let mut state = ProcessState::default();
         process_tag(&mut ctx, &mut state, p, true, None);
-        let id = f.blocks.items()[0];
+        let id = expect_block(f.blocks.items()[0]);
         assert_eq!(f.blocks.block(id).runs.len(), 1);
         assert_eq!(
             f.blocks.block(id).runs[0].texts.len(),
@@ -2672,7 +3094,7 @@ mod tests {
         let mut state = ProcessState::default();
         process_tag(&mut ctx, &mut state, li, true, None);
         assert_eq!(f.blocks.items().len(), 1);
-        let id = f.blocks.items()[0];
+        let id = expect_block(f.blocks.items()[0]);
         assert!(f.blocks.block(id).list_tag.is_some());
     }
 
@@ -2685,7 +3107,7 @@ mod tests {
         let mut ctx = f.ctx();
         let mut state = ProcessState::default();
         process_tag(&mut ctx, &mut state, div, true, None);
-        let id = f.blocks.items()[0];
+        let id = expect_block(f.blocks.items()[0]);
         assert!(f.blocks.block(id).keep_next);
     }
 
@@ -2697,7 +3119,7 @@ mod tests {
         let mut ctx = f.ctx();
         let mut state = ProcessState::default();
         process_tag(&mut ctx, &mut state, p, true, None);
-        let id = f.blocks.items()[0];
+        let id = expect_block(f.blocks.items()[0]);
         // "a" run, then the comment's tail ("tail text") gets its own
         // add_text call via create_block_from_parent -- which reuses
         // the same current block (the <p>'s), appending a new run
@@ -2731,7 +3153,10 @@ mod tests {
         // div's own (initially-current, later possibly-skipped) block,
         // the <p>'s block, and a block for "after".
         assert!(f.blocks.items().len() >= 2);
-        let has_after_text = f.blocks.items().iter().any(|&id| {
+        let has_after_text = f.blocks.items().iter().any(|&item| {
+            let ItemId::Block(id) = item else {
+                return false;
+            };
             f.blocks.block(id).runs.iter().any(|r| {
                 r.texts.iter().any(|e| match &e.item {
                     TextItem::Text { text, .. } => text.contains("after"),
@@ -2820,7 +3245,7 @@ mod tests {
             html_root,
             "en",
         );
-        let id = f.blocks.items()[0];
+        let id = expect_block(f.blocks.items()[0]);
         assert!(f.blocks.block(id).bookmarks.is_empty());
         assert!(!f.blocks.block(id).page_break_before);
     }
@@ -2856,7 +3281,7 @@ mod tests {
             "en",
         );
         assert_eq!(f.blocks.items().len(), 2);
-        let second = f.blocks.items()[1];
+        let second = expect_block(f.blocks.items()[1]);
         assert!(!f.blocks.block(second).bookmarks.is_empty());
         assert!(f.blocks.block(second).page_break_before);
     }

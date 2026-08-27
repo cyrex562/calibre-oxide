@@ -2898,7 +2898,7 @@ mod tests {
         blocks.block_mut(id).add_text(
             &mut mgr, "hello", &style, false, None, false, None, None, None,
         );
-        blocks.end_current_block();
+        blocks.end_current_block(&dom, &resolved, &profile);
 
         mgr.finalize(&mut blocks);
 
@@ -2919,7 +2919,7 @@ mod tests {
         let style = Style::new(&dom, &resolved, &profile, p);
         let mut blocks = Blocks::new();
         let id = blocks.start_new_block(&mut mgr, &dom, p, &style, false, None, false);
-        blocks.end_current_block();
+        blocks.end_current_block(&dom, &resolved, &profile);
 
         mgr.finalize(&mut blocks);
 
@@ -2954,7 +2954,7 @@ mod tests {
         blocks.block_mut(id3).add_text(
             &mut mgr, "b", &b_style, false, None, false, None, None, None,
         );
-        blocks.end_current_block();
+        blocks.end_current_block(&dom, &resolved, &profile);
 
         mgr.finalize(&mut blocks);
 
@@ -2990,7 +2990,7 @@ mod tests {
         blocks.block_mut(id_h1).add_text(
             &mut mgr, "heading", &h1_style, false, None, false, None, None, None,
         );
-        blocks.end_current_block();
+        blocks.end_current_block(&dom, &resolved, &profile);
 
         mgr.finalize(&mut blocks);
 
@@ -3048,7 +3048,7 @@ mod tests {
         blocks.block_mut(id3).add_text(
             &mut mgr, "big", &big_style, false, None, false, None, None, None,
         );
-        blocks.end_current_block();
+        blocks.end_current_block(&dom, &resolved, &profile);
 
         mgr.finalize(&mut blocks);
 
@@ -3093,7 +3093,7 @@ mod tests {
         blocks.block_mut(id).add_text(
             &mut mgr, "b", &b_style, false, None, false, None, None, None,
         );
-        blocks.end_current_block();
+        blocks.end_current_block(&dom, &resolved, &profile);
 
         mgr.finalize(&mut blocks);
 
@@ -3149,7 +3149,7 @@ mod tests {
         blocks.block_mut(id).add_text(
             &mut mgr, "hello", &style, false, None, false, None, None, None,
         );
-        blocks.end_current_block();
+        blocks.end_current_block(&dom, &resolved, &profile);
         mgr.finalize(&mut blocks);
 
         let mut styles = Element::new("w:styles");
@@ -3191,7 +3191,7 @@ mod tests {
         blocks.block_mut(id_h1).add_text(
             &mut mgr, "heading", &h1_style, false, None, false, None, None, None,
         );
-        blocks.end_current_block();
+        blocks.end_current_block(&dom, &resolved, &profile);
         mgr.finalize(&mut blocks);
 
         let mut styles = Element::new("w:styles");
@@ -3244,7 +3244,7 @@ mod tests {
         blocks.block_mut(id).add_text(
             &mut mgr, "b", &b_style, false, None, false, None, None, None,
         );
-        blocks.end_current_block();
+        blocks.end_current_block(&dom, &resolved, &profile);
         mgr.finalize(&mut blocks);
 
         let mut styles = Element::new("w:styles");
@@ -3275,7 +3275,7 @@ mod tests {
         let style = Style::new(&dom, &resolved, &profile, p);
         let mut blocks = Blocks::new();
         let id = blocks.start_new_block(&mut mgr, &dom, p, &style, false, None, false);
-        blocks.end_current_block();
+        blocks.end_current_block(&dom, &resolved, &profile);
         mgr.finalize(&mut blocks);
 
         let mut styles = Element::new("w:styles");

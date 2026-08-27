@@ -421,7 +421,7 @@ mod tests {
     ) -> BlockId {
         let style = Style::new(dom, resolved, profile, node);
         let id = blocks.start_new_block(mgr, dom, node, &style, false, None, true);
-        blocks.end_current_block();
+        blocks.end_current_block(dom, resolved, profile);
         id
     }
 
@@ -660,7 +660,7 @@ mod tests {
         let mut blocks = Blocks::new();
         let style = Style::new(&dom, &resolved, &profile, p);
         let id = blocks.start_new_block(&mut mgr, &dom, p, &style, false, None, false);
-        blocks.end_current_block();
+        blocks.end_current_block(&dom, &resolved, &profile);
         let mut lm = ListsManager::new();
         lm.finalize(&dom, &resolved, &profile, &mut blocks);
         assert_eq!(blocks.block(id).numbering_id, None);
