@@ -173,6 +173,26 @@ impl<'a> Style<'a> {
         Style { node, ..*self }
     }
 
+    /// The DOM this style resolves against. Exposed alongside
+    /// [`Self::resolved`]/[`Self::profile`] so a caller holding only a
+    /// `Style` (not the `dom`/`resolved`/`profile` triple it was built
+    /// from) can still reconstruct a fresh `Style` for a DIFFERENT
+    /// node, or thread the underlying context onward -- e.g.
+    /// `docx::writer::from_html::Blocks::end_current_block`'s callers,
+    /// which already have a `Style` in hand and shouldn't need three
+    /// more parameters just to pass through what it already borrows.
+    pub fn dom(&self) -> &'a Dom {
+        self.dom
+    }
+
+    pub fn resolved(&self) -> &'a ResolvedStyles {
+        self.resolved
+    }
+
+    pub fn profile(&self) -> &'a Profile {
+        self.profile
+    }
+
     /// Port of `Style._get_parent`/`_has_parent`. lxml's root element
     /// has no parent at all (`getparent()` returns `None`); `Dom`
     /// instead nests every element under a non-element document node,
