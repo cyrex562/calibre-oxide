@@ -1,12 +1,11 @@
-//! Tables (`docx/writer/tables.py`) -- **partial**: the border/width
-//! foundation, [`SpannedCell`]/[`Cell`]/[`Row`]/[`Table`] themselves,
-//! their border-conflict-resolution algorithms, AND the stateful
-//! `Table`/`Row`/`Cell` mutation methods (`start_new_row`/
-//! `start_new_cell`/`finish_tag`/`add_block`/`add_table`) are all
-//! ported. What's left is `Blocks`' OWN half of the HTML-walk
-//! integration (the `tables` stack of currently-open tables and
-//! `finish_tag`'s table-closing branch, which call into this file's
-//! `Tables::table_finish_tag`), and every `.serialize` method.
+//! Tables (`docx/writer/tables.py`) -- **fully ported**. The
+//! border/width foundation, [`SpannedCell`]/[`Cell`]/[`Row`]/[`Table`]
+//! themselves, their border-conflict-resolution algorithms, the
+//! stateful HTML-walk mutation methods, AND every `.serialize` method
+//! are all ported (`Blocks`' OWN half of the HTML-walk integration --
+//! its `tables` stack of currently-open tables, `finish_tag`'s
+//! table-closing branch, and `Block`'s `container` field -- lives in
+//! `from_html.rs`, also ported).
 //!
 //! Ported: [`Border`], [`border_style_weight`], [`as_percent`],
 //! [`convert_width`], and [`read_css_block_borders`] (a thin
@@ -20,45 +19,39 @@
 //! structs instead of mutating anything, so no `Dummy` stand-in is
 //! needed at all.
 //!
-//! [`SpannedCell`], [`Cell`], [`Row`], and [`Table`] are ported, held
-//! in a [`Tables`] arena (see its own docs for the arena-shape
-//! decision this needed -- the real, previously undecided design
-//! question this module was blocked on). Ported with them:
+//! [`SpannedCell`], [`Cell`], [`Row`], and [`Table`] are held in a
+//! [`Tables`] arena (see its own docs for the arena-shape decision
+//! this needed -- the real, previously undecided design question this
+//! module was once blocked on). Ported with them:
 //! [`Tables::neighbor`]/`::applicable_borders`/`::resolve_border`/
-//! `::resolve_cell_borders` (CSS table border-conflict resolution)
-//! and [`Tables::expand_spanned_cells`] (inserting merge-continuation
-//! placeholders for `rowspan`/`colspan`'d cells). On top of those,
-//! `Tables` now also ports the stateful mutation half every real
-//! HTML-walking caller needs: [`Tables::table_start_new_row`]/
-//! `::table_start_new_cell`/`::row_start_new_cell` (port of `Table`/
-//! `Row.start_new_row`/`.start_new_cell`), [`Tables::table_finish_tag`]
-//! (port of `Table.finish_tag`, including the row-level
-//! `Row.finish_tag` layer, private), and [`Tables::table_add_block`]/
-//! `::table_add_table`/`::row_add_block`/`::row_add_table`/
-//! `::cell_add_block`/`::cell_add_table` (port of `Table`/`Row`/
-//! `Cell.add_block`/`.add_table`, including their auto-create-a-cell/
-//! row fallbacks). [`Cell::items`] (mixing `Block`s and nested
-//! `Table`s, port of `Cell.items`) uses the new
+//! `::resolve_cell_borders` (CSS table border-conflict resolution),
+//! [`Tables::expand_spanned_cells`] (inserting merge-continuation
+//! placeholders for `rowspan`/`colspan`'d cells), the stateful
+//! mutation half ([`Tables::table_start_new_row`]/`::table_start_new_cell`/
+//! `::table_finish_tag`/`::table_add_block`/`::table_add_table`/
+//! `::row_add_block`/`::row_add_table`/`::cell_add_block`/
+//! `::cell_add_table`, plus their `row_*`/`Row`-level counterparts),
+//! and now [`SpannedCell::serialize`]/[`Tables::serialize_cell`]/
+//! `::serialize_row`/`::serialize_table` (the actual `<w:tc>`/`<w:tr>`/
+//! `<w:tbl>` OOXML). [`Cell::items`] (mixing `Block`s and nested
+//! `Table`s, port of `Cell.items`) uses the
 //! [`super::from_html::ItemId`] enum, shared with `Blocks`' own
-//! still-unported top-level `items` list.
+//! top-level `items` list (also real, `from_html.rs`).
 //!
-//! **Not ported yet, deliberately**: `Blocks`' own `tables` stack of
-//! currently-open tables and `finish_tag`'s table-closing branch
-//! (`Blocks.start_new_table`/`.start_new_row`/`.start_new_cell` just
-//! delegate into this file's now-real `Tables` methods, and
-//! `Blocks.finish_tag`'s table half calls `Tables::table_finish_tag`
-//! and, on a `true` return, moves the finished table into its parent
-//! -- either nesting it via `Tables::table_add_table` into a still-
-//! open OUTER table, or appending it to `Blocks`' own top-level
-//! `items: Vec<ItemId>`, not yet widened from `Vec<BlockId>`). This
-//! also needs `Block` to gain a real "which container do I live in"
-//! field (`Block.parent_items`, dropped when `Block` was ported, PR
-//! #333, becomes real again here -- likely
-//! `enum ItemContainer { Top, Cell(CellId) }`, needed so
-//! `Blocks::delete_block_at`/`::apply_page_break_after` can tell which
-//! items-list a block belongs to). Every `.serialize` method
-//! (`Cell`/`Row`/`Table`/`Blocks`) still needs real content from that
-//! same deferred integration.
+//! **The one real design point in the serialize methods**: rendering a
+//! `Block`'s own content needs `StylesManager`/`LinksManager` (both
+//! owned by `Blocks`, in `from_html.rs`, per that module's own
+//! "explicit parameter, not stored field" pattern) -- this arena
+//! can't resolve that on its own, and importing those types here would
+//! invert this effort's established module-dependency direction
+//! (`from_html.rs` already depends on `tables.rs`, not the reverse).
+//! [`Tables::serialize_cell`]/`::serialize_row`/`::serialize_table`
+//! instead take a `serialize_block: &mut dyn FnMut(&mut Element,
+//! BlockId)` callback for exactly that one case -- a nested
+//! [`ItemId::Table`] needs no such callback, since it recurses
+//! straight back into this arena's own `serialize_table`. `Blocks`'
+//! own `.serialize` (not yet ported) is what will build the real
+//! closure and pass it in.
 
 use crate::dom::{Dom, NodeId};
 use crate::oeb::polish::cascade::ResolvedStyles;
@@ -67,6 +60,7 @@ use crate::oeb::polish::style::{Profile, Style};
 use super::from_html::{BlockId, ItemId};
 use super::styles::{read_css_block_borders as read_block_borders, BORDER_EDGES};
 use super::utils::convert_color;
+use super::xml::Element;
 
 /// Port of `Border`. `level` is `Cell`/`Row`/`Table`'s `BLEVEL` class
 /// attribute (2/1/0 respectively) -- how specific the border's source
@@ -252,6 +246,24 @@ pub struct SpannedCell {
     /// The real [`Cell`] this placeholder continues the merge of.
     pub spanning_cell: CellId,
     pub horizontal: bool,
+}
+
+impl SpannedCell {
+    /// Port of `SpannedCell.serialize`: a bare `<w:tc>` with a
+    /// `w:hMerge`/`w:vMerge` `val="continue"` marker and an empty
+    /// paragraph -- Word requires every grid position to have a real
+    /// `<w:tc>`, even the ones a merge covers.
+    pub fn serialize(&self, parent: &mut Element) {
+        let tc = parent.append(Element::new("w:tc"));
+        let tc_pr = tc.append(Element::new("w:tcPr"));
+        let merge_tag = if self.horizontal {
+            "w:hMerge"
+        } else {
+            "w:vMerge"
+        };
+        tc_pr.append(Element::new(merge_tag).attr("w:val", "continue"));
+        tc.append(Element::new("w:p"));
+    }
 }
 
 /// One slot in a [`Row`]'s cell list: either a real [`Cell`] or a
@@ -1046,6 +1058,212 @@ impl Tables {
         };
         self.row_add_table(row, nested, dom, resolved, profile);
     }
+
+    /// Port of `Cell.serialize`. `serialize_block` is the one piece of
+    /// context this arena genuinely can't provide on its own -- a real
+    /// `Block`'s content needs `StylesManager`/`LinksManager` (both
+    /// owned by `Blocks`, in `from_html.rs`), so rendering one is a
+    /// caller-supplied callback rather than a parameter this method
+    /// resolves itself. A nested [`ItemId::Table`] needs no such
+    /// callback -- it recurses straight back into
+    /// [`Self::serialize_table`], since everything a nested table
+    /// needs already lives in this same arena.
+    pub fn serialize_cell(
+        &self,
+        cell_id: CellId,
+        parent: &mut Element,
+        serialize_block: &mut dyn FnMut(&mut Element, BlockId),
+    ) {
+        let cell = self.cell(cell_id);
+        let row = self.row(cell.row);
+        let table = self.table(cell.table);
+
+        let tc = parent.append(Element::new("w:tc"));
+        let tc_pr = tc.append(Element::new("w:tcPr"));
+        tc_pr.append(
+            Element::new("w:tcW")
+                .attr("w:type", cell.width.0)
+                .attr("w:w", cell.width.1.to_string()),
+        );
+
+        // Word 2007 refuses to honor <w:shd> at the table or row
+        // level, so it's inherited and applied at the cell level
+        // instead -- matches Python's own comment on this exactly.
+        let bc = cell
+            .background_color
+            .clone()
+            .or_else(|| row.background_color.clone())
+            .or_else(|| table.background_color.clone());
+        if let Some(bc) = bc {
+            tc_pr.append(
+                Element::new("w:shd")
+                    .attr("w:val", "clear")
+                    .attr("w:color", "auto")
+                    .attr("w:fill", bc),
+            );
+        }
+
+        let mut borders = Element::new("w:tcBorders");
+        if let Some(resolved) = &cell.resolved_borders {
+            for (edge, border) in [
+                ("left", &resolved.left),
+                ("top", &resolved.top),
+                ("right", &resolved.right),
+                ("bottom", &resolved.bottom),
+            ] {
+                if let Some(border) = border {
+                    if border.width > 0 && border.style != "none" {
+                        let mut el = Element::new(format!("w:{edge}"))
+                            .attr("w:val", border.style.clone())
+                            .attr("w:sz", border.width.to_string());
+                        if let Some(color) = &border.color {
+                            el = el.attr("w:color", color.clone());
+                        }
+                        borders.append(el);
+                    }
+                }
+            }
+        }
+        if !borders.is_empty() {
+            tc_pr.append(borders);
+        }
+
+        let mut margins = Element::new("w:tcMar");
+        let first_cell = row.first_cell();
+        let last_cell = row.last_cell();
+        for edge in BORDER_EDGES {
+            let mut padding = cell.borders.padding(edge);
+            let inherits_from_row = match edge {
+                "top" | "bottom" => true,
+                "left" => first_cell == Some(cell_id),
+                "right" => last_cell == Some(cell_id),
+                _ => false,
+            };
+            if inherits_from_row {
+                padding += row.borders.padding(edge);
+            }
+            if padding > 0 {
+                margins.append(
+                    Element::new(format!("w:{edge}"))
+                        .attr("w:type", "dxa")
+                        .attr("w:w", (padding * 20).to_string()),
+                );
+            }
+        }
+        if !margins.is_empty() {
+            tc_pr.append(margins);
+        }
+
+        if let Some(valign) = cell.valign {
+            tc_pr.append(Element::new("w:vAlign").attr("w:val", valign));
+        }
+        if cell.row_span > 1 {
+            tc_pr.append(Element::new("w:vMerge").attr("w:val", "restart"));
+        }
+        if cell.col_span > 1 {
+            tc_pr.append(Element::new("w:hMerge").attr("w:val", "restart"));
+        }
+
+        let mut last_was_table = false;
+        let mut had_item = false;
+        for &item in &cell.items {
+            had_item = true;
+            match item {
+                ItemId::Block(id) => {
+                    last_was_table = false;
+                    serialize_block(tc, id);
+                }
+                ItemId::Table(id) => {
+                    last_was_table = true;
+                    self.serialize_table(id, tc, serialize_block);
+                }
+            }
+        }
+        if !had_item || last_was_table {
+            // Word 2007 requires the last element in a table cell to
+            // be a paragraph.
+            tc.append(Element::new("w:p"));
+        }
+    }
+
+    /// Port of `Row.serialize`.
+    pub fn serialize_row(
+        &self,
+        row: RowId,
+        parent: &mut Element,
+        serialize_block: &mut dyn FnMut(&mut Element, BlockId),
+    ) {
+        let tr = parent.append(Element::new("w:tr"));
+        for &cell_id in &self.row(row).cells {
+            match self.cell_slot(cell_id) {
+                CellSlot::Spanned(s) => s.serialize(tr),
+                CellSlot::Cell(_) => self.serialize_cell(cell_id, tr, serialize_block),
+            }
+        }
+    }
+
+    /// Port of `Table.serialize`. Rows with no cells at all (matching
+    /// Python's `[r for r in self.rows if r.cells]`) are skipped
+    /// entirely, and the table itself emits nothing if that leaves no
+    /// rows.
+    pub fn serialize_table(
+        &self,
+        table_id: TableId,
+        parent: &mut Element,
+        serialize_block: &mut dyn FnMut(&mut Element, BlockId),
+    ) {
+        let table = self.table(table_id);
+        let row_ids: Vec<RowId> = table
+            .rows
+            .iter()
+            .copied()
+            .filter(|&r| !self.row(r).cells.is_empty())
+            .collect();
+        if row_ids.is_empty() {
+            return;
+        }
+
+        let tbl = parent.append(Element::new("w:tbl"));
+        let tbl_pr = tbl.append(Element::new("w:tblPr"));
+        tbl_pr.append(
+            Element::new("w:tblW")
+                .attr("w:type", table.width.0)
+                .attr("w:w", table.width.1.to_string()),
+        );
+        if let Some(float_dir) = table.float.as_deref() {
+            if float_dir == "left" || float_dir == "right" {
+                let mut tblp_pr = Element::new("w:tblpPr")
+                    .attr("w:vertAnchor", "text")
+                    .attr("w:horzAnchor", "text")
+                    .attr("w:tblpXSpec", float_dir);
+                for edge in BORDER_EDGES {
+                    let mut val = match edge {
+                        "left" => table.margin_left,
+                        "top" => table.margin_top,
+                        "right" => table.margin_right,
+                        "bottom" => table.margin_bottom,
+                        _ => None,
+                    }
+                    .unwrap_or(0.0);
+                    let is_opposite_edge = (float_dir == "left" && edge == "right")
+                        || (float_dir == "right" && edge == "left");
+                    if is_opposite_edge {
+                        val = val.max(2.0);
+                    }
+                    let twips = ((val * 20.0) as i64).max(0);
+                    tblp_pr.set(format!("w:{edge}FromText"), twips.to_string());
+                }
+                tbl_pr.append(tblp_pr);
+            }
+        }
+        if let Some(jc) = table.jc {
+            tbl_pr.append(Element::new("w:jc").attr("w:val", jc));
+        }
+
+        for row_id in row_ids {
+            self.serialize_row(row_id, tbl, serialize_block);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1750,5 +1968,325 @@ mod tests {
             .current_cell
             .expect("a cell was auto-created");
         assert_eq!(tables.cell(cell).items, vec![ItemId::Table(nested)]);
+    }
+
+    #[test]
+    fn spanned_cell_serialize_emits_a_horizontal_merge_marker() {
+        let sc = SpannedCell {
+            spanning_cell: CellId(0),
+            horizontal: true,
+        };
+        let mut parent = Element::new("w:tr");
+        sc.serialize(&mut parent);
+        let tc = parent.children_named("w:tc").next().unwrap();
+        let tc_pr = tc.children_named("w:tcPr").next().unwrap();
+        assert_eq!(
+            tc_pr
+                .children_named("w:hMerge")
+                .next()
+                .unwrap()
+                .get("w:val"),
+            Some("continue")
+        );
+        assert!(tc.children_named("w:p").next().is_some());
+    }
+
+    #[test]
+    fn spanned_cell_serialize_vertical_uses_v_merge() {
+        let sc = SpannedCell {
+            spanning_cell: CellId(0),
+            horizontal: false,
+        };
+        let mut parent = Element::new("w:tr");
+        sc.serialize(&mut parent);
+        let tc_pr = parent
+            .children_named("w:tc")
+            .next()
+            .unwrap()
+            .children_named("w:tcPr")
+            .next()
+            .unwrap();
+        assert!(tc_pr.children_named("w:vMerge").next().is_some());
+    }
+
+    fn no_block(_: &mut Element, _: BlockId) {}
+
+    #[test]
+    fn serialize_cell_emits_width_and_a_paragraph_when_empty() {
+        let dom = make("<html><body><table/></body></html>");
+        let (mut tables, _t, grid) = build_grid(&dom, 1, 1);
+        let cell = grid[0][0];
+        tables.resolve_cell_borders(cell);
+        let mut parent = Element::new("w:tr");
+        tables.serialize_cell(cell, &mut parent, &mut no_block);
+        let tc = parent.children_named("w:tc").next().unwrap();
+        let tc_pr = tc.children_named("w:tcPr").next().unwrap();
+        let tc_w = tc_pr.children_named("w:tcW").next().unwrap();
+        assert_eq!(tc_w.get("w:type"), Some("auto"));
+        assert!(
+            tc.children_named("w:p").next().is_some(),
+            "an empty cell still needs a trailing paragraph"
+        );
+    }
+
+    #[test]
+    fn serialize_cell_writes_resolved_border_edges() {
+        let dom = make("<html><body><table/></body></html>");
+        let (mut tables, _t, grid) = build_grid(&dom, 1, 1);
+        let cell = grid[0][0];
+        if let CellSlot::Cell(c) = &mut tables.cells[cell.0] {
+            c.borders.left = styled_border("solid", 20, 2);
+        }
+        tables.resolve_cell_borders(cell);
+        let mut parent = Element::new("w:tr");
+        tables.serialize_cell(cell, &mut parent, &mut no_block);
+        let tc_pr = parent
+            .children_named("w:tc")
+            .next()
+            .unwrap()
+            .children_named("w:tcPr")
+            .next()
+            .unwrap();
+        let borders = tc_pr.children_named("w:tcBorders").next().unwrap();
+        let left = borders.children_named("w:left").next().unwrap();
+        assert_eq!(left.get("w:val"), Some("solid"));
+        assert_eq!(left.get("w:sz"), Some("20"));
+    }
+
+    #[test]
+    fn serialize_cell_inherits_background_from_row_then_table() {
+        let dom = make("<html><body><table/></body></html>");
+        let (mut tables, t, grid) = build_grid(&dom, 1, 1);
+        let cell = grid[0][0];
+        tables.tables[t.0].background_color = Some("0000FF".to_string());
+        tables.resolve_cell_borders(cell);
+        let mut parent = Element::new("w:tr");
+        tables.serialize_cell(cell, &mut parent, &mut no_block);
+        let tc_pr = parent
+            .children_named("w:tc")
+            .next()
+            .unwrap()
+            .children_named("w:tcPr")
+            .next()
+            .unwrap();
+        let shd = tc_pr.children_named("w:shd").next().unwrap();
+        assert_eq!(shd.get("w:fill"), Some("0000FF"));
+    }
+
+    #[test]
+    fn serialize_cell_adds_row_padding_on_the_left_for_the_rows_first_cell() {
+        let dom = make("<html><body><table/></body></html>");
+        let (mut tables, _t, grid) = build_grid(&dom, 1, 2);
+        let cell = grid[0][0];
+        let row = tables.cell(cell).row;
+        tables.rows[row.0].borders.padding_left = 100;
+        if let CellSlot::Cell(c) = &mut tables.cells[cell.0] {
+            c.borders.padding_left = 50;
+        }
+        tables.resolve_cell_borders(cell);
+        let mut parent = Element::new("w:tr");
+        tables.serialize_cell(cell, &mut parent, &mut no_block);
+        let margins = parent
+            .children_named("w:tc")
+            .next()
+            .unwrap()
+            .children_named("w:tcPr")
+            .next()
+            .unwrap()
+            .children_named("w:tcMar")
+            .next()
+            .unwrap();
+        let left = margins.children_named("w:left").next().unwrap();
+        assert_eq!(
+            left.get("w:w"),
+            Some("3000"),
+            "the row's own left padding is added since this is the row's first cell: (50+100)*20"
+        );
+    }
+
+    #[test]
+    fn serialize_cell_does_not_add_row_padding_on_the_left_for_a_non_edge_cell() {
+        let dom = make("<html><body><table/></body></html>");
+        let (mut tables, _t, grid) = build_grid(&dom, 1, 2);
+        let cell = grid[0][1];
+        let row = tables.cell(cell).row;
+        tables.rows[row.0].borders.padding_left = 100;
+        if let CellSlot::Cell(c) = &mut tables.cells[cell.0] {
+            c.borders.padding_left = 50;
+        }
+        tables.resolve_cell_borders(cell);
+        let mut parent = Element::new("w:tr");
+        tables.serialize_cell(cell, &mut parent, &mut no_block);
+        let margins = parent
+            .children_named("w:tc")
+            .next()
+            .unwrap()
+            .children_named("w:tcPr")
+            .next()
+            .unwrap()
+            .children_named("w:tcMar")
+            .next()
+            .unwrap();
+        let left = margins.children_named("w:left").next().unwrap();
+        assert_eq!(
+            left.get("w:w"),
+            Some("1000"),
+            "not the row's first cell, so only its own padding counts: 50*20"
+        );
+    }
+
+    #[test]
+    fn serialize_cell_calls_serialize_block_for_each_block_item_in_order() {
+        let dom = make("<html><body><table/></body></html>");
+        let (mut tables, _t, grid) = build_grid(&dom, 1, 1);
+        let cell = grid[0][0];
+        tables.cell_add_block(cell, BlockId(1));
+        tables.cell_add_block(cell, BlockId(2));
+        tables.resolve_cell_borders(cell);
+        let mut seen = Vec::new();
+        let mut parent = Element::new("w:tr");
+        {
+            let mut cb = |el: &mut Element, id: BlockId| {
+                seen.push(id);
+                el.append(Element::new("w:p"));
+            };
+            tables.serialize_cell(cell, &mut parent, &mut cb);
+        }
+        assert_eq!(seen, vec![BlockId(1), BlockId(2)]);
+        let tc = parent.children_named("w:tc").next().unwrap();
+        assert_eq!(
+            tc.children_named("w:p").count(),
+            2,
+            "no extra trailing paragraph after a Block item"
+        );
+    }
+
+    #[test]
+    fn serialize_cell_nested_table_recurses_and_still_appends_a_trailing_paragraph() {
+        let dom = make("<html><body><table/></body></html>");
+        let table_tag = find(&dom, "table");
+        let (mut tables, _outer, grid) = build_grid(&dom, 1, 1);
+        let cell = grid[0][0];
+        let inner = tables.add_table(table_tag, None);
+        let inner_row = tables.add_row(inner, table_tag, None);
+        tables.add_cell(inner_row, table_tag, &dom, None);
+        tables.cell_add_table(cell, inner);
+        tables.resolve_cell_borders(cell);
+
+        let mut parent = Element::new("w:tr");
+        tables.serialize_cell(cell, &mut parent, &mut no_block);
+
+        let tc = parent.children_named("w:tc").next().unwrap();
+        assert!(
+            tc.children_named("w:tbl").next().is_some(),
+            "the nested table should have been serialized"
+        );
+        assert!(
+            tc.children_named("w:p").next().is_some(),
+            "the last item was a Table, so a trailing paragraph is still required"
+        );
+    }
+
+    #[test]
+    fn serialize_row_dispatches_cells_and_spanned_placeholders() {
+        let dom = make("<html><body><table/></body></html>");
+        let (mut tables, t, grid) = build_grid(&dom, 1, 2);
+        if let CellSlot::Cell(cell) = &mut tables.cells[grid[0][0].0] {
+            cell.col_span = 2;
+        }
+        tables.expand_spanned_cells(t);
+        let row = tables.cell(grid[0][0]).row;
+        let cell_ids: Vec<CellId> = tables.row(row).cells.clone();
+        for cell_id in cell_ids {
+            if matches!(tables.cell_slot(cell_id), CellSlot::Cell(_)) {
+                tables.resolve_cell_borders(cell_id);
+            }
+        }
+        let mut parent = Element::new("w:tbl");
+        tables.serialize_row(row, &mut parent, &mut no_block);
+        let tr = parent.children_named("w:tr").next().unwrap();
+        assert_eq!(
+            tr.children_named("w:tc").count(),
+            3,
+            "1 real cell + 1 horizontal-span placeholder + 1 real cell"
+        );
+    }
+
+    #[test]
+    fn serialize_table_skips_rows_with_no_cells() {
+        let dom = make("<html><body><table/></body></html>");
+        let (mut tables, t, grid) = build_grid(&dom, 1, 1);
+        tables.add_row(t, find(&dom, "table"), None); // an empty row, no cells
+        tables.resolve_cell_borders(grid[0][0]);
+        let mut parent = Element::new("w:body");
+        tables.serialize_table(t, &mut parent, &mut no_block);
+        let tbl = parent.children_named("w:tbl").next().unwrap();
+        assert_eq!(
+            tbl.children_named("w:tr").count(),
+            1,
+            "the empty row must be skipped entirely"
+        );
+    }
+
+    #[test]
+    fn serialize_table_emits_nothing_when_every_row_is_empty() {
+        let dom = make("<html><body><table/></body></html>");
+        let table_tag = find(&dom, "table");
+        let mut tables = Tables::new();
+        let t = tables.add_table(table_tag, None);
+        tables.add_row(t, table_tag, None);
+        let mut parent = Element::new("w:body");
+        tables.serialize_table(t, &mut parent, &mut no_block);
+        assert!(parent.children_named("w:tbl").next().is_none());
+    }
+
+    #[test]
+    fn serialize_table_with_a_float_direction_bumps_the_opposite_edge() {
+        let dom = make("<html><body><table/></body></html>");
+        let (mut tables, t, grid) = build_grid(&dom, 1, 1);
+        tables.tables[t.0].float = Some("left".to_string());
+        tables.tables[t.0].margin_left = Some(1.0);
+        tables.tables[t.0].margin_right = Some(0.5);
+        tables.resolve_cell_borders(grid[0][0]);
+        let mut parent = Element::new("w:body");
+        tables.serialize_table(t, &mut parent, &mut no_block);
+        let tblp_pr = parent
+            .children_named("w:tbl")
+            .next()
+            .unwrap()
+            .children_named("w:tblPr")
+            .next()
+            .unwrap()
+            .children_named("w:tblpPr")
+            .next()
+            .unwrap();
+        assert_eq!(tblp_pr.get("w:tblpXSpec"), Some("left"));
+        assert_eq!(tblp_pr.get("w:leftFromText"), Some("20"));
+        assert_eq!(
+            tblp_pr.get("w:rightFromText"),
+            Some("40"),
+            "the edge opposite the float direction is bumped to a 2pt minimum: max(0.5,2)*20"
+        );
+    }
+
+    #[test]
+    fn serialize_table_with_jc_emits_the_alignment() {
+        let dom = make("<html><body><table/></body></html>");
+        let (mut tables, t, grid) = build_grid(&dom, 1, 1);
+        tables.tables[t.0].jc = Some("center");
+        tables.resolve_cell_borders(grid[0][0]);
+        let mut parent = Element::new("w:body");
+        tables.serialize_table(t, &mut parent, &mut no_block);
+        let jc = parent
+            .children_named("w:tbl")
+            .next()
+            .unwrap()
+            .children_named("w:tblPr")
+            .next()
+            .unwrap()
+            .children_named("w:jc")
+            .next()
+            .unwrap();
+        assert_eq!(jc.get("w:val"), Some("center"));
     }
 }
