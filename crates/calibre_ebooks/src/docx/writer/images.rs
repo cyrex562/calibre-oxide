@@ -1,10 +1,8 @@
 //! Image embedding (`docx/writer/images.py`) -- **partial**: the
 //! self-contained utility layer, [`ImagesManager`]'s data-source half
-//! (`read_image`/`read_svg`), and now `create_image_markup`/
-//! `add_image` are all ported; only `serialize`/the cover-image
-//! methods remain, and wiring `add_image` into `from_html.rs`'s own
-//! `<img>`-tag handling is a separate, deliberately deferred
-//! integration step (see [`ImagesManager`]'s own docs).
+//! (`read_image`/`read_svg`), `create_image_markup`/`add_image` (and
+//! their `from_html.rs` `<img>`-tag wiring), and now `serialize` are
+//! all ported; only the cover-image methods remain.
 //!
 //! Ported: [`get_image_margins`], [`create_filename`], and
 //! [`create_docx_image_markup`] (the actual `w:drawing`/`pic:pic`
@@ -16,11 +14,25 @@
 //! image-content-source design question (an existing crate-wide
 //! idiom, `OEBBook.container.read(href)` -- no new abstraction was
 //! needed). [`ImagesManager::create_image_markup`]/`::add_image` are
-//! now real too -- the floating/margin decision logic, `wp:inline`/
+//! real too -- the floating/margin decision logic, `wp:inline`/
 //! `wp:anchor` assembly, and the `<img>` element's own `src`/`abshref`
 //! resolution, using [`Floating`] (a real 3-value enum standing in for
 //! Python's `'left' | 'right' | 'center' | None` string-or-None
-//! value) in place of the raw string Python threads through.
+//! value) in place of the raw string Python threads through --
+//! `from_html.rs`'s `add_block_tag`/`add_inline_tag` call `add_image`
+//! for real now too, via a new `images_manager`/`names` pair of fields
+//! on `ProcessCtx`.
+//!
+//! [`ImagesManager::serialize`] is now real too -- writing every
+//! embedded image's bytes into a `part name -> bytes` map, exactly the
+//! shape [`super::container::DocxWriter::parts`] (this crate's `DOCX`
+//! equivalent) already has, contrary to this method's own earlier doc
+//! history flagging "needs write-time package access" as a blocker;
+//! no new capability was actually needed. Bytes are re-read straight
+//! from `self.oeb.container` at serialize time rather than cached, the
+//! same "don't hold every embedded image in memory for the whole
+//! conversion" property Python's lazy `partial(self.get_data, ...)`
+//! callback achieves differently.
 //!
 //! **Not ported, each for a real reason, not oversight**:
 //! - SVG-original tracking (Python's `SVGRasterizer.svg_originals`,
@@ -34,23 +46,18 @@
 //!   the `svg_originals` bookkeeping this pass needs isn't part of
 //!   that port and would need adding when the rasterization pass
 //!   itself is ported.
-//! - `serialize` -- needs write-time access to the real docx package
-//!   being assembled, part of `DocxWriter::write`'s own still-unwired
-//!   content-input path (`Convert.__call__`, not ported).
 //! - `create_cover_markup`/`write_cover_block` -- need the cover-image
-//!   resolution flow from `Convert.__call__` (not ported); the
+//!   resolution flow from `Convert.__call__` (not ported, and not
+//!   separable from it the way `serialize` was -- there is no
+//!   `self.cover_img`-equivalent lookup anywhere yet); the
 //!   `Element::insert`-at-front capability they also need is no
 //!   longer a gap ([`super::xml::Element`] gained it for `links.py`'s
 //!   `LinksManager::serialize_toc`, issue #132).
-//! - Wiring `add_image` into `from_html.rs`'s `<img>`-tag `todo!()`s
-//!   -- a real, separate integration step (threading a new
-//!   `images_manager: &mut ImagesManager` through `ProcessCtx`,
-//!   touching every `process_tag`/`process_item` call site including
-//!   every test's), deliberately left for a follow-up PR, matching
-//!   this effort's own "arena+algorithms PR, then integration PR"
-//!   split precedent (`tables.rs`'s `Cell`/`Row`/`Table` vs. `Blocks`'
-//!   own wiring; `tables.rs`'s serialize methods vs.
-//!   `Blocks::serialize`).
+//! - `ImagesManager::serialize`'s own real caller -- merging its
+//!   output map into [`super::container::DocxWriter::parts`] -- is
+//!   `Convert.write`'s job (not ported); `DocxWriter.parts` today is
+//!   only ever populated directly by tests, confirmed by grepping
+//!   every call site before scoping this file's own `serialize`.
 
 use std::collections::HashSet;
 
@@ -668,6 +675,44 @@ impl<'a> ImagesManager<'a> {
         block.add_image(drawing, bookmark);
         Some(rid)
     }
+
+    /// Port of `ImagesManager.serialize`. `images_map` stands in for
+    /// Python's `self.docx.images` -- both this and
+    /// [`super::container::DocxWriter::parts`] (this crate's `DOCX`
+    /// equivalent) already have exactly this shape (`part name ->
+    /// bytes`, written verbatim into the zip), so despite this
+    /// method's own doc history flagging "needs write-time package
+    /// access" as a blocker, no new capability was actually needed --
+    /// `DocxWriter.parts` already existed for embedded fonts.
+    ///
+    /// Python's `partial(self.get_data, img.item)` defers the actual
+    /// read until zip-write time specifically so `item.data`'s
+    /// in-memory cache (already dropped once by
+    /// `item.unload_data_from_memory()` inside `read_image`/`read_svg`)
+    /// can be re-populated lazily and dropped again afterward. This
+    /// port never cached bytes in memory in the first place --
+    /// [`Self::read_image`]/[`Self::read_svg`] only ever kept metadata
+    /// (`Image { href, fname, .. }`) -- so re-reading straight from
+    /// `self.oeb.container` here, eagerly, reproduces the same
+    /// "don't hold every embedded image in memory for the whole
+    /// conversion" property without needing a lazy-callback map at
+    /// all. A read that fails (the source item genuinely vanished
+    /// between `read_image` succeeding earlier and `serialize` running
+    /// now) is skipped rather than aborting the whole document --
+    /// consistent with this file's existing `read_image` treatment of
+    /// a missing item as a graceful `None`, not a hard error.
+    pub fn serialize(&self, images_map: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+        for img in self.images.values() {
+            if let Ok(data) = self.oeb.container.read(&img.href) {
+                images_map.insert(format!("word/{}", img.fname), data);
+            }
+        }
+        for img in self.svg_images.values() {
+            if let Ok(data) = self.oeb.container.read(&img.href) {
+                images_map.insert(format!("word/{}", img.fname), data);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1138,5 +1183,37 @@ mod tests {
         let rid = mgr.add_image(&ns(), &style, &mut block, "chap1.html", None, false);
         assert!(rid.is_none());
         assert!(block.is_empty());
+    }
+
+    #[test]
+    fn serialize_writes_raster_and_svg_bytes_under_word_media() {
+        let oeb = Builder::new()
+            .part("a/pic.png", "image/png", &png_bytes(1, 1), false)
+            .part("b/pic.svg", "image/svg+xml", b"<svg/>", false)
+            .build();
+        let mut mgr = images_manager(&oeb);
+        let raster_fname = mgr.read_image("a/pic.png").unwrap().fname.clone();
+        let svg_fname = mgr.read_svg("b/pic.svg").unwrap().fname.clone();
+
+        let mut images_map = std::collections::BTreeMap::new();
+        mgr.serialize(&mut images_map);
+
+        assert_eq!(
+            images_map.get(&format!("word/{raster_fname}")),
+            Some(&png_bytes(1, 1))
+        );
+        assert_eq!(
+            images_map.get(&format!("word/{svg_fname}")),
+            Some(&b"<svg/>".to_vec())
+        );
+    }
+
+    #[test]
+    fn serialize_with_no_images_read_writes_nothing() {
+        let oeb = Builder::new().build();
+        let mgr = images_manager(&oeb);
+        let mut images_map = std::collections::BTreeMap::new();
+        mgr.serialize(&mut images_map);
+        assert!(images_map.is_empty());
     }
 }
