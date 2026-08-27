@@ -15,13 +15,16 @@
 //! | `from_html.py` (partial) | [`from_html`] |
 //! | `lists.py` | [`lists`] |
 //! | `images.py` (partial) | [`images`] |
-//! | `tables.py` (partial) | [`tables`] |
+//! | `tables.py` | [`tables`] |
 //!
-//! Still to come, tracked as issue #132: every `.serialize` method
-//! across `tables.py`/`from_html.py` (`Cell`/`Row`/`Table`/`Blocks`)
-//! -- `tables.py`'s own side of its HTML-walk integration is now
-//! FULLY ported (see [`tables`]'s module docs), and `from_html.py`'s
-//! `Blocks` now has real table support too: its own `tables` stack of
+//! Still to come, tracked as issue #132: `from_html.py`'s own
+//! `Blocks::serialize` (see [`tables`]'s module docs -- `tables.py`
+//! itself is now FULLY ported, including every `.serialize` method;
+//! `Tables::serialize_cell`/`::serialize_row`/`::serialize_table` take
+//! a `serialize_block` callback for the one piece they can't resolve
+//! on their own, a real `Block`'s content, and `Blocks::serialize` is
+//! what will build that closure and call in). `from_html.py`'s
+//! `Blocks` has real table support too: its own `tables` stack of
 //! currently-open tables, `finish_tag`'s table-closing branch (moving
 //! a finished table into its parent -- nesting it into a still-open
 //! outer table, or appending it to `Blocks`' own top-level `items`),
@@ -33,8 +36,8 @@
 //! table-`display` dispatch (`table`/`table-row`/`table-cell`, into
 //! `Blocks::start_new_table`/`::start_new_row`/`::start_new_cell`) is
 //! wired up too -- real table content now flows all the way through
-//! the walker, it just can't be written out yet (no `.serialize`).
-//! `images.py`'s
+//! the walker AND can be written out at the `tables.py` level; only
+//! `Blocks::serialize` itself is missing. `images.py`'s
 //! `create_image_markup`/`add_image`/`serialize`/cover-image methods
 //! (see [`images`]'s module docs -- its self-contained utility layer
 //! AND [`images::ImagesManager`]'s data-source half, `read_image`/
