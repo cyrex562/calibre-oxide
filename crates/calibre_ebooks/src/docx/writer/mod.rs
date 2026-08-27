@@ -29,7 +29,12 @@
 //! `Table`s, and [`from_html::Block`] gained a real
 //! [`from_html::ItemContainer`] field (Python's `parent_items`,
 //! finally meaningful now that a block can live in either `Blocks`'
-//! own items or a table cell's). `images.py`'s
+//! own items or a table cell's). [`from_html::process_tag`]'s own
+//! table-`display` dispatch (`table`/`table-row`/`table-cell`, into
+//! `Blocks::start_new_table`/`::start_new_row`/`::start_new_cell`) is
+//! wired up too -- real table content now flows all the way through
+//! the walker, it just can't be written out yet (no `.serialize`).
+//! `images.py`'s
 //! `create_image_markup`/`add_image`/`serialize`/cover-image methods
 //! (see [`images`]'s module docs -- its self-contained utility layer
 //! AND [`images::ImagesManager`]'s data-source half, `read_image`/

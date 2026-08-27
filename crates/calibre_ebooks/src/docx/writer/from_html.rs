@@ -1302,14 +1302,18 @@ fn add_inline_tag(
 
 /// Port of `Convert.process_tag` -- the core recursive element
 /// walker. Table content (`display` starting with `table`, or
-/// `inline-table`) is a documented `todo!()`: `Blocks`' table methods
-/// aren't ported (see [`Blocks`]'s own module docs). `<hr>`'s
+/// `inline-table`) is now wired up, dispatching to
+/// [`Blocks::start_new_cell`]/`::start_new_row`/`::start_new_table`
+/// now that `Blocks`' own table support is real (issue #132). Any
+/// OTHER `display.starts_with("table")` value (`table-header-group`,
+/// `table-caption`, ...) matches this branch but none of its three
+/// inner arms -- a genuine no-op in Python too, not a gap. `<hr>`'s
 /// `tag_style.set('border-*-style', 'none')` override (suppressing
-/// the default block border on horizontal rules) is a disclosed,
-/// narrower gap that's simply not applied here -- `Style` has no
-/// mutation capability (it's a read-only, `Copy` view over a resolved
-/// cascade, by design), and adding one for this single call site
-/// wasn't judged worth it yet.
+/// the default block border on horizontal rules) is still a
+/// disclosed, narrower gap that's simply not applied here -- `Style`
+/// has no mutation capability (it's a read-only, `Copy` view over a
+/// resolved cascade, by design), and adding one for this single call
+/// site wasn't judged worth it yet.
 pub fn process_tag(
     ctx: &mut ProcessCtx,
     state: &mut ProcessState,
@@ -1365,7 +1369,23 @@ pub fn process_tag(
                 ctx, state, &tagname, html_tag, &tag_style, false, None, true,
             );
         } else if display.starts_with("table") || display == "inline-table" {
-            todo!("process_tag: table display ({display:?}) needs tables.py, issue #132");
+            // Any OTHER `display.starts_with("table")` value (e.g.
+            // `table-header-group`/`table-caption`/...) matches this
+            // branch but none of the three below -- a genuine no-op
+            // in Python too, not a gap.
+            if display == "table-cell" {
+                ctx.blocks
+                    .start_new_cell(html_tag, ctx.dom, Some(&tag_style));
+                add_block_tag(
+                    ctx, state, &tagname, html_tag, &tag_style, true, None, false,
+                );
+            } else if display == "table-row" {
+                ctx.blocks.start_new_row(html_tag, Some(&tag_style));
+            } else if display == "table" || display == "inline-table" {
+                ctx.blocks
+                    .end_current_block(ctx.dom, ctx.resolved, ctx.profile);
+                ctx.blocks.start_new_table(html_tag, Some(&tag_style));
+            }
         } else if tagname == "img" && is_float {
             add_inline_tag(ctx, state, &tagname, html_tag, &tag_style);
         } else {
@@ -3168,14 +3188,57 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "tables.py")]
-    fn process_tag_table_display_is_a_documented_gap() {
-        let mut f = fixture("<html><body><div>x</div></body></html>", &[]);
+    fn process_tag_table_display_starts_and_closes_a_table() {
+        let mut f = fixture("<html><body><div></div></body></html>", &[]);
         let div = find(&f.dom, "div");
         f.resolved = resolved_with(&[(div, &[("display", "table")])]);
         let mut ctx = f.ctx();
         let mut state = ProcessState::default();
         process_tag(&mut ctx, &mut state, div, true, None);
+        assert_eq!(
+            f.blocks.current_table(),
+            None,
+            "the table's own tag closes by the time process_tag returns"
+        );
+        assert_eq!(f.blocks.items().len(), 1);
+        assert!(matches!(f.blocks.items()[0], ItemId::Table(_)));
+    }
+
+    #[test]
+    fn process_tag_walks_a_real_table_and_files_its_cell_block_correctly() {
+        let mut f = fixture(
+            "<html><body><table><tr><td>hi</td></tr></table></body></html>",
+            &[],
+        );
+        let table_tag = find(&f.dom, "table");
+        let tr_tag = find(&f.dom, "tr");
+        let td_tag = find(&f.dom, "td");
+        f.resolved = resolved_with(&[
+            (table_tag, &[("display", "table")]),
+            (tr_tag, &[("display", "table-row")]),
+            (td_tag, &[("display", "table-cell")]),
+        ]);
+        let mut ctx = f.ctx();
+        let mut state = ProcessState::default();
+        process_tag(&mut ctx, &mut state, table_tag, true, None);
+
+        assert_eq!(f.blocks.current_table(), None);
+        assert_eq!(f.blocks.items().len(), 1);
+        let ItemId::Table(table) = f.blocks.items()[0] else {
+            panic!("expected the finished table to land in items");
+        };
+        let row = f.blocks.tables().table(table).rows[0];
+        let cell = f.blocks.tables().row(row).cells[0];
+        let cell_items = f.blocks.tables().cell(cell).items.clone();
+        assert_eq!(cell_items.len(), 1);
+        let ItemId::Block(block_id) = cell_items[0] else {
+            panic!("expected a Block inside the cell");
+        };
+        assert!(f.blocks.block(block_id).runs.iter().any(|r| {
+            r.texts
+                .iter()
+                .any(|e| matches!(&e.item, TextItem::Text { text, .. } if text.contains("hi")))
+        }));
     }
 
     #[test]
