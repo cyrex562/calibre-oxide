@@ -41,17 +41,21 @@
 //! and `Blocks::serialize` is what builds that closure) walks
 //! `self.items` and writes real content out -- real table content now
 //! flows all the way through the walker, gets styled, and gets
-//! written out, end to end. `images.py`'s `serialize`/cover-image
-//! methods (see [`images`]'s module docs -- its self-contained
-//! utility layer, [`images::ImagesManager`]'s data-source half
-//! (`read_image`/`read_svg`), AND now `create_image_markup`/
-//! `add_image` themselves are ported: the real image-content-source
-//! design question resolved to an existing crate-wide idiom,
-//! `OEBBook.container.read(href)`, no new abstraction needed) are the
-//! main remaining gap besides `Convert` itself. Wiring `add_image`
-//! into `from_html.rs`'s own `<img>`-tag `todo!()`s is a separate,
-//! deliberately deferred integration step (needs threading a new
-//! `images_manager` through `ProcessCtx`) --
+//! written out, end to end. `add_block_tag`/`add_inline_tag`'s
+//! `<img>`-tag handling is wired up too now -- [`ProcessCtx`] gained
+//! `images_manager: &mut ImagesManager`/`names: &DocxNamespace` fields
+//! (a second lifetime parameter, `ProcessCtx<'a, 'b>`, since
+//! `ImagesManager<'b>`'s own `&'b OEBBook` borrow is unrelated to
+//! `ProcessCtx`'s other `'a` borrows), so `<img>` markup is built
+//! for real during the walk, not deferred to serialize time. `images.py`'s
+//! `serialize`/cover-image methods (see [`images`]'s module docs --
+//! its self-contained utility layer, [`images::ImagesManager`]'s
+//! data-source half (`read_image`/`read_svg`), AND
+//! `create_image_markup`/`add_image` themselves are ported: the real
+//! image-content-source design question resolved to an existing
+//! crate-wide idiom, `OEBBook.container.read(href)`, no new
+//! abstraction needed) are the main remaining gap besides `Convert`
+//! itself --
 //! `links.py`'s `LinksManager` is now fully ported, including its
 //! TOC-serialization half, which is what gave [`xml::Element`] its
 //! `insert`/`find_descendant_mut` methods. These walk a resolved-CSS

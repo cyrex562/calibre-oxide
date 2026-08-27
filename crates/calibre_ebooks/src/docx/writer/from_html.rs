@@ -65,6 +65,7 @@ use crate::oeb::polish::toc::lang_as_iso639_1;
 
 use indexmap::{IndexMap, IndexSet};
 
+use super::images::ImagesManager;
 use super::links::LinksManager;
 use super::styles::{BlockStyleId, FloatSpec, StylesManager, TextStyleId};
 use super::tables::{CellId, TableId};
@@ -1169,18 +1170,28 @@ pub struct ProcessState {
 /// since every function here needs the same set; `&mut ProcessCtx` is
 /// reborrowed at each recursive/helper call site, same as passing
 /// `&mut self` would be if `Convert` (not ported) owned all of this
-/// directly.
-pub struct ProcessCtx<'a> {
+/// directly. Two lifetime parameters: `'a` covers `dom`/`resolved`/
+/// `profile`/every `&'a mut` manager here, `'b` is
+/// [`super::images::ImagesManager`]'s OWN borrow of a `&'b OEBBook` --
+/// unrelated to `'a`, so it needs its own parameter rather than
+/// (incorrectly) unifying the two.
+pub struct ProcessCtx<'a, 'b> {
     pub dom: &'a Dom,
     pub resolved: &'a ResolvedStyles,
     pub profile: &'a Profile,
     pub blocks: &'a mut Blocks,
     pub styles_manager: &'a mut StylesManager,
     pub links_manager: &'a mut LinksManager,
+    pub images_manager: &'a mut ImagesManager<'b>,
+    /// Needed to build a real `<img>`'s `w:drawing` markup immediately
+    /// during the walk (`ImagesManager::add_image`), unlike every
+    /// other `DocxNamespace` use in this file, which happens later at
+    /// `serialize` time.
+    pub names: &'a DocxNamespace,
     pub current_item_href: &'a str,
 }
 
-impl<'a> ProcessCtx<'a> {
+impl<'a, 'b> ProcessCtx<'a, 'b> {
     fn style(&self, node: NodeId) -> Style<'a> {
         Style::new(self.dom, self.resolved, self.profile, node)
     }
@@ -1200,9 +1211,7 @@ fn create_block_from_parent(ctx: &mut ProcessCtx, html_tag: NodeId) -> BlockId {
     id
 }
 
-/// Port of `Convert.add_block_tag`. The `tagname == 'img'` branch
-/// (needs `ImagesManager`, `images.py`, unported) is a documented
-/// `todo!()` -- see the module docs.
+/// Port of `Convert.add_block_tag`.
 #[allow(clippy::too_many_arguments)]
 fn add_block_tag(
     ctx: &mut ProcessCtx,
@@ -1235,7 +1244,16 @@ fn add_block_tag(
         ctx.blocks.block_mut(id).bookmarks.insert(bmark);
     }
     if tagname == "img" {
-        todo!("add_block_tag: <img> needs ImagesManager (images.py), issue #132");
+        let block = ctx.blocks.block_mut(id);
+        ctx.images_manager.add_image(
+            ctx.names,
+            tag_style,
+            block,
+            ctx.current_item_href,
+            None,
+            true,
+        );
+        return id;
     }
 
     let mut text = leading_text(ctx.dom, html_tag);
@@ -1277,9 +1295,7 @@ fn add_block_tag(
     id
 }
 
-/// Port of `Convert.add_inline_tag`. The `tagname == 'img'` branch
-/// (needs `ImagesManager`) is a documented `todo!()` -- see the
-/// module docs.
+/// Port of `Convert.add_inline_tag`.
 fn add_inline_tag(
     ctx: &mut ProcessCtx,
     state: &ProcessState,
@@ -1311,7 +1327,16 @@ fn add_inline_tag(
             ctx.blocks.block_mut(id).add_break(clear, bmark);
         }
     } else if tagname == "img" {
-        todo!("add_inline_tag: <img> needs ImagesManager (images.py), issue #132");
+        let id = create_block_from_parent(ctx, html_tag);
+        let block = ctx.blocks.block_mut(id);
+        ctx.images_manager.add_image(
+            ctx.names,
+            tag_style,
+            block,
+            ctx.current_item_href,
+            bmark,
+            false,
+        );
     } else if let Some(text) = leading_text(ctx.dom, html_tag).filter(|t| !t.is_empty()) {
         let id = create_block_from_parent(ctx, html_tag);
         ctx.blocks.block_mut(id).add_text(
@@ -1522,6 +1547,7 @@ pub fn process_tag(
 /// `html_root` is Python's `item.data` (the parsed document's root
 /// `<html>` element) -- `lang_for_tag` reads attributes off it, same
 /// as Python.
+#[allow(clippy::too_many_arguments)]
 pub fn process_item(
     dom: &Dom,
     resolved: &ResolvedStyles,
@@ -1529,6 +1555,8 @@ pub fn process_item(
     blocks: &mut Blocks,
     styles_manager: &mut StylesManager,
     links_manager: &mut LinksManager,
+    images_manager: &mut ImagesManager,
+    names: &DocxNamespace,
     current_item_href: &str,
     html_root: NodeId,
     document_lang: &str,
@@ -1549,6 +1577,8 @@ pub fn process_item(
             blocks,
             styles_manager,
             links_manager,
+            images_manager,
+            names,
             current_item_href,
         };
         let mut state = ProcessState {
@@ -3031,7 +3061,19 @@ mod tests {
     }
 
     impl Fixture {
-        fn ctx(&mut self) -> ProcessCtx<'_> {
+        /// `images_manager`/`names` are passed in rather than owned by
+        /// `Fixture` itself -- `ImagesManager<'a>` borrows `&'a OEBBook`,
+        /// and `Fixture` owning both an `OEBBook` and an `ImagesManager`
+        /// borrowing it would be a self-referential struct, not
+        /// expressible in safe Rust. Callers that need one build a
+        /// throwaway `OEBBook`/`ImagesManager`/`DocxNamespace` locally
+        /// via [`test_oeb`]/[`images_manager_for_test`]/[`ns`] -- see
+        /// any of the many test bodies below for the pattern.
+        fn ctx<'s, 'i>(
+            &'s mut self,
+            images_manager: &'s mut ImagesManager<'i>,
+            names: &'s DocxNamespace,
+        ) -> ProcessCtx<'s, 'i> {
             ProcessCtx {
                 dom: &self.dom,
                 resolved: &self.resolved,
@@ -3039,9 +3081,19 @@ mod tests {
                 blocks: &mut self.blocks,
                 styles_manager: &mut self.mgr,
                 links_manager: &mut self.lm,
+                images_manager,
+                names,
                 current_item_href: "chap1.html",
             }
         }
+    }
+
+    fn test_oeb() -> crate::oeb::book::OEBBook {
+        crate::oeb::transforms::test_support::Builder::new().build()
+    }
+
+    fn images_manager_for_test(oeb: &crate::oeb::book::OEBBook) -> ImagesManager<'_> {
+        ImagesManager::new(oeb, DocumentRelationships::new(&ns()), 600.0, 800.0)
     }
 
     #[test]
@@ -3053,7 +3105,10 @@ mod tests {
         let mut f = fixture("<html><body><p>hello</p></body></html>", &[]);
         let p = find(&f.dom, "p");
         f.resolved = resolved_with(&[(p, &[("display", "block")])]);
-        let mut ctx = f.ctx();
+        let test_oeb = test_oeb();
+        let mut test_images = images_manager_for_test(&test_oeb);
+        let test_names = ns();
+        let mut ctx = f.ctx(&mut test_images, &test_names);
         let mut state = ProcessState::default();
         process_tag(&mut ctx, &mut state, p, true, None);
         assert_eq!(f.blocks.items().len(), 1);
@@ -3065,7 +3120,10 @@ mod tests {
     fn process_tag_script_contents_are_ignored() {
         let mut f = fixture("<html><body><script>var x = 1;</script></body></html>", &[]);
         let script = find(&f.dom, "script");
-        let mut ctx = f.ctx();
+        let test_oeb = test_oeb();
+        let mut test_images = images_manager_for_test(&test_oeb);
+        let test_names = ns();
+        let mut ctx = f.ctx(&mut test_images, &test_names);
         let mut state = ProcessState::default();
         process_tag(&mut ctx, &mut state, script, true, None);
         assert!(f.blocks.items().is_empty());
@@ -3081,7 +3139,10 @@ mod tests {
         // is_hidden() reads `display: none` itself (see oeb/polish/style.rs).
         let resolved = resolved_with(&[(p, &[("display", "none")])]);
         f.resolved = resolved;
-        let mut ctx = f.ctx();
+        let test_oeb = test_oeb();
+        let mut test_images = images_manager_for_test(&test_oeb);
+        let test_names = ns();
+        let mut ctx = f.ctx(&mut test_images, &test_names);
         let mut state = ProcessState::default();
         process_tag(&mut ctx, &mut state, p, true, None);
         assert!(f.blocks.items().is_empty());
@@ -3106,7 +3167,10 @@ mod tests {
             (p, &[("display", "block")]),
             (span, &[("display", "inline"), ("font-weight", "bold")]),
         ]);
-        let mut ctx = f.ctx();
+        let test_oeb = test_oeb();
+        let mut test_images = images_manager_for_test(&test_oeb);
+        let test_names = ns();
+        let mut ctx = f.ctx(&mut test_images, &test_names);
         let mut state = ProcessState::default();
         process_tag(&mut ctx, &mut state, p, true, None);
         assert_eq!(f.blocks.items().len(), 1);
@@ -3125,7 +3189,10 @@ mod tests {
         );
         let p = find(&f.dom, "p");
         f.resolved = resolved_with(&[(p, &[("display", "block")])]);
-        let mut ctx = f.ctx();
+        let test_oeb = test_oeb();
+        let mut test_images = images_manager_for_test(&test_oeb);
+        let test_names = ns();
+        let mut ctx = f.ctx(&mut test_images, &test_names);
         let mut state = ProcessState::default();
         process_tag(&mut ctx, &mut state, p, true, None);
         let id = expect_block(f.blocks.items()[0]);
@@ -3156,7 +3223,10 @@ mod tests {
             (p, &[("display", "block")]),
             (span, &[("display", "inline")]),
         ]);
-        let mut ctx = f.ctx();
+        let test_oeb = test_oeb();
+        let mut test_images = images_manager_for_test(&test_oeb);
+        let test_names = ns();
+        let mut ctx = f.ctx(&mut test_images, &test_names);
         let mut state = ProcessState::default();
         process_tag(&mut ctx, &mut state, p, true, None);
         let id = expect_block(f.blocks.items()[0]);
@@ -3174,7 +3244,10 @@ mod tests {
         let mut f = fixture("<html><body><p>a<br/>b</p></body></html>", &[]);
         let p = find(&f.dom, "p");
         f.resolved = resolved_with(&[(p, &[("display", "block")])]);
-        let mut ctx = f.ctx();
+        let test_oeb = test_oeb();
+        let mut test_images = images_manager_for_test(&test_oeb);
+        let test_names = ns();
+        let mut ctx = f.ctx(&mut test_images, &test_names);
         let mut state = ProcessState::default();
         process_tag(&mut ctx, &mut state, p, true, None);
         let id = expect_block(f.blocks.items()[0]);
@@ -3193,7 +3266,10 @@ mod tests {
         let mut f = fixture("<html><body><p>a<br/></p></body></html>", &[]);
         let p = find(&f.dom, "p");
         f.resolved = resolved_with(&[(p, &[("display", "block")])]);
-        let mut ctx = f.ctx();
+        let test_oeb = test_oeb();
+        let mut test_images = images_manager_for_test(&test_oeb);
+        let test_names = ns();
+        let mut ctx = f.ctx(&mut test_images, &test_names);
         let mut state = ProcessState::default();
         process_tag(&mut ctx, &mut state, p, true, None);
         let id = expect_block(f.blocks.items()[0]);
@@ -3210,7 +3286,10 @@ mod tests {
         let mut f = fixture("<html><body><li>item text</li></body></html>", &[]);
         let li = find(&f.dom, "li");
         f.resolved = resolved_with(&[(li, &[("display", "list-item")])]);
-        let mut ctx = f.ctx();
+        let test_oeb = test_oeb();
+        let mut test_images = images_manager_for_test(&test_oeb);
+        let test_names = ns();
+        let mut ctx = f.ctx(&mut test_images, &test_names);
         let mut state = ProcessState::default();
         process_tag(&mut ctx, &mut state, li, true, None);
         assert_eq!(f.blocks.items().len(), 1);
@@ -3224,7 +3303,10 @@ mod tests {
         let div = find(&f.dom, "div");
         f.resolved =
             resolved_with(&[(div, &[("display", "block"), ("page-break-after", "avoid")])]);
-        let mut ctx = f.ctx();
+        let test_oeb = test_oeb();
+        let mut test_images = images_manager_for_test(&test_oeb);
+        let test_names = ns();
+        let mut ctx = f.ctx(&mut test_images, &test_names);
         let mut state = ProcessState::default();
         process_tag(&mut ctx, &mut state, div, true, None);
         let id = expect_block(f.blocks.items()[0]);
@@ -3236,7 +3318,10 @@ mod tests {
         let mut f = fixture("<html><body><p>a<!-- c -->tail text</p></body></html>", &[]);
         let p = find(&f.dom, "p");
         f.resolved = resolved_with(&[(p, &[("display", "block")])]);
-        let mut ctx = f.ctx();
+        let test_oeb = test_oeb();
+        let mut test_images = images_manager_for_test(&test_oeb);
+        let test_names = ns();
+        let mut ctx = f.ctx(&mut test_images, &test_names);
         let mut state = ProcessState::default();
         process_tag(&mut ctx, &mut state, p, true, None);
         let id = expect_block(f.blocks.items()[0]);
@@ -3267,7 +3352,10 @@ mod tests {
         let div = find(&f.dom, "div");
         let p = find(&f.dom, "p");
         f.resolved = resolved_with(&[(div, &[("display", "block")]), (p, &[("display", "block")])]);
-        let mut ctx = f.ctx();
+        let test_oeb = test_oeb();
+        let mut test_images = images_manager_for_test(&test_oeb);
+        let test_names = ns();
+        let mut ctx = f.ctx(&mut test_images, &test_names);
         let mut state = ProcessState::default();
         process_tag(&mut ctx, &mut state, div, true, None);
         // div's own (initially-current, later possibly-skipped) block,
@@ -3292,7 +3380,10 @@ mod tests {
         let mut f = fixture("<html><body><div></div></body></html>", &[]);
         let div = find(&f.dom, "div");
         f.resolved = resolved_with(&[(div, &[("display", "table")])]);
-        let mut ctx = f.ctx();
+        let test_oeb = test_oeb();
+        let mut test_images = images_manager_for_test(&test_oeb);
+        let test_names = ns();
+        let mut ctx = f.ctx(&mut test_images, &test_names);
         let mut state = ProcessState::default();
         process_tag(&mut ctx, &mut state, div, true, None);
         assert_eq!(
@@ -3318,7 +3409,10 @@ mod tests {
             (tr_tag, &[("display", "table-row")]),
             (td_tag, &[("display", "table-cell")]),
         ]);
-        let mut ctx = f.ctx();
+        let test_oeb = test_oeb();
+        let mut test_images = images_manager_for_test(&test_oeb);
+        let test_names = ns();
+        let mut ctx = f.ctx(&mut test_images, &test_names);
         let mut state = ProcessState::default();
         process_tag(&mut ctx, &mut state, table_tag, true, None);
 
@@ -3356,7 +3450,10 @@ mod tests {
             (td_tag, &[("display", "table-cell")]),
         ]);
         {
-            let mut ctx = f.ctx();
+            let test_oeb = test_oeb();
+            let mut test_images = images_manager_for_test(&test_oeb);
+            let test_names = ns();
+            let mut ctx = f.ctx(&mut test_images, &test_names);
             let mut state = ProcessState::default();
             process_tag(&mut ctx, &mut state, table_tag, true, None);
         }
@@ -3381,14 +3478,52 @@ mod tests {
         assert_eq!(text, "hi");
     }
 
+    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let mut data = b"\x89PNG\r\n\x1a\n".to_vec();
+        data.extend_from_slice(&[0, 0, 0, 13]);
+        data.extend_from_slice(b"IHDR");
+        data.extend_from_slice(&width.to_be_bytes());
+        data.extend_from_slice(&height.to_be_bytes());
+        data
+    }
+
     #[test]
-    #[should_panic(expected = "ImagesManager")]
-    fn process_tag_img_tag_is_a_documented_gap() {
-        let mut f = fixture("<html><body><img/></body></html>", &[]);
+    fn process_tag_img_tag_embeds_a_real_image() {
+        let mut f = fixture("<html><body><img src=\"pic.png\"/></body></html>", &[]);
         let img = find(&f.dom, "img");
-        let mut ctx = f.ctx();
+        let test_oeb = crate::oeb::transforms::test_support::Builder::new()
+            .part("pic.png", "image/png", &png_bytes(100, 200), false)
+            .build();
+        let mut test_images = images_manager_for_test(&test_oeb);
+        let test_names = ns();
+        let mut ctx = f.ctx(&mut test_images, &test_names);
         let mut state = ProcessState::default();
         process_tag(&mut ctx, &mut state, img, true, None);
+        let id = f
+            .blocks
+            .current_block()
+            .expect("create_block_from_parent should have opened the body's block");
+        assert!(
+            !f.blocks.block(id).is_empty(),
+            "add_image should have attached a real image run to the block"
+        );
+    }
+
+    #[test]
+    fn process_tag_img_tag_with_no_src_stays_empty() {
+        let mut f = fixture("<html><body><img/></body></html>", &[]);
+        let img = find(&f.dom, "img");
+        let test_oeb = test_oeb();
+        let mut test_images = images_manager_for_test(&test_oeb);
+        let test_names = ns();
+        let mut ctx = f.ctx(&mut test_images, &test_names);
+        let mut state = ProcessState::default();
+        process_tag(&mut ctx, &mut state, img, true, None);
+        let id = f
+            .blocks
+            .current_block()
+            .expect("create_block_from_parent should have opened the body's block");
+        assert!(f.blocks.block(id).is_empty());
     }
 
     #[test]
@@ -3396,12 +3531,18 @@ mod tests {
         let mut f = fixture("<html><body><p>x</p></body></html>", &[]);
         let p = find(&f.dom, "p");
         {
-            let mut ctx = f.ctx();
+            let test_oeb = test_oeb();
+            let mut test_images = images_manager_for_test(&test_oeb);
+            let test_names = ns();
+            let mut ctx = f.ctx(&mut test_images, &test_names);
             let id = create_block_from_parent(&mut ctx, p);
             ctx.blocks.block_mut(id).page_break_before = true;
         }
         {
-            let mut ctx = f.ctx();
+            let test_oeb = test_oeb();
+            let mut test_images = images_manager_for_test(&test_oeb);
+            let test_names = ns();
+            let mut ctx = f.ctx(&mut test_images, &test_names);
             let id = create_block_from_parent(&mut ctx, p);
             assert!(!ctx.blocks.block(id).page_break_before);
         }
@@ -3413,6 +3554,9 @@ mod tests {
         let p = find(&f.dom, "p");
         f.resolved = resolved_with(&[(p, &[("display", "block")])]);
         let html_root = find(&f.dom, "html");
+        let test_oeb = test_oeb();
+        let mut test_images = images_manager_for_test(&test_oeb);
+        let test_names = ns();
         process_item(
             &f.dom,
             &f.resolved,
@@ -3420,6 +3564,8 @@ mod tests {
             &mut f.blocks,
             &mut f.mgr,
             &mut f.lm,
+            &mut test_images,
+            &test_names,
             "chap1.html",
             html_root,
             "en",
@@ -3450,6 +3596,9 @@ mod tests {
             (ps[1], &[("display", "block")]),
         ]);
         let html_root = find(&f.dom, "html");
+        let test_oeb = test_oeb();
+        let mut test_images = images_manager_for_test(&test_oeb);
+        let test_names = ns();
         process_item(
             &f.dom,
             &f.resolved,
@@ -3457,6 +3606,8 @@ mod tests {
             &mut f.blocks,
             &mut f.mgr,
             &mut f.lm,
+            &mut test_images,
+            &test_names,
             "chap1.html",
             html_root,
             "en",
@@ -3487,6 +3638,9 @@ mod tests {
         let p = find(&f.dom, "p");
         f.resolved = resolved_with(&[(p, &[("display", "block")])]);
         let html_root = find(&f.dom, "html");
+        let test_oeb = test_oeb();
+        let mut test_images = images_manager_for_test(&test_oeb);
+        let test_names = ns();
         process_item(
             &f.dom,
             &f.resolved,
@@ -3494,6 +3648,8 @@ mod tests {
             &mut f.blocks,
             &mut f.mgr,
             &mut f.lm,
+            &mut test_images,
+            &test_names,
             "chap1.html",
             html_root,
             "en",
@@ -3509,6 +3665,9 @@ mod tests {
         let p = find(&f.dom, "p");
         f.resolved = resolved_with(&[(p, &[("display", "block")])]);
         let html_root = find(&f.dom, "html");
+        let test_oeb = test_oeb();
+        let mut test_images = images_manager_for_test(&test_oeb);
+        let test_names = ns();
         // First item -- establishes that all_blocks is non-empty by
         // the time the second item's begin_item runs, so its `pos > 0`.
         process_item(
@@ -3518,6 +3677,8 @@ mod tests {
             &mut f.blocks,
             &mut f.mgr,
             &mut f.lm,
+            &mut test_images,
+            &test_names,
             "chap1.html",
             html_root,
             "en",
@@ -3529,6 +3690,8 @@ mod tests {
             &mut f.blocks,
             &mut f.mgr,
             &mut f.lm,
+            &mut test_images,
+            &test_names,
             "chap2.html",
             html_root,
             "en",
