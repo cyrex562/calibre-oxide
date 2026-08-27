@@ -24,8 +24,12 @@
 //! foundation AND the types themselves, with their border-conflict-
 //! resolution algorithms, are now ported; only the stateful
 //! HTML-walk wiring and serialization are left), `images.py`'s
-//! `ImagesManager` itself (see [`images`]'s module docs -- only its
-//! self-contained utility layer is ported so far), and
+//! `create_image_markup`/`add_image`/`serialize`/cover-image methods
+//! (see [`images`]'s module docs -- its self-contained utility layer
+//! AND [`images::ImagesManager`]'s data-source half, `read_image`/
+//! `read_svg`, are now ported: the real image-content-source design
+//! question resolved to an existing crate-wide idiom,
+//! `OEBBook.container.read(href)`, no new abstraction needed), and
 //! `from_html.py`'s `Convert.__call__`/`.write` and `Blocks`'
 //! `Table`-related methods/`.serialize` (see [`from_html`]'s module
 //! docs -- `Convert`'s core element walker itself is ported) --
@@ -78,7 +82,10 @@ pub use from_html::{
     lang_for_tag, process_item, process_tag, Block, BlockId, Blocks, LinkTarget, ProcessCtx,
     ProcessState, TextRun,
 };
-pub use images::{create_docx_image_markup, create_filename, get_image_margins, ImageMargins};
+pub use images::{
+    create_docx_image_markup, create_filename, get_image_margins, Image, ImageMargins,
+    ImagesManager,
+};
 pub use links::{LinksManager, TocItem};
 pub use lists::ListsManager;
 pub use styles::{BlockStyleId, CombinedStyle, StylesManager, TextStyleId};
