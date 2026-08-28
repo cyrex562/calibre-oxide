@@ -118,6 +118,11 @@
 //!   `<level-in-table>` tags -- unlike this issue's other passes, it's
 //!   handed just the block's own text (one call per block), not the
 //!   whole document.
+//! - [`override_table`]: parse a `\listoverridetable` block into
+//!   `<override-list>` tags, and cross-reference each override's
+//!   `list-table-id` against [`list_table`]'s own output, filling in
+//!   [`list_table::ListInfo::list_id`] -- this issue's one genuine
+//!   cross-pass dependency among its own files.
 //!
 //! Three more follow-up issues cover the rest of the ~35 passes
 //! (fields/tables, lists/grouping/tag-conversion, and the
@@ -160,6 +165,7 @@ pub mod line_endings;
 pub mod list_numbers;
 pub mod list_table;
 pub mod old_rtf;
+pub mod override_table;
 pub mod paragraph_def;
 pub mod paragraphs;
 pub mod pict;

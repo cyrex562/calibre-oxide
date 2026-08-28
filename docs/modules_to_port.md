@@ -793,7 +793,7 @@ either -- this pass wasn't exhaustive.
 - [x] old_rtf.py
 - [ ] options_trem.py
 - [ ] output.py
-- [ ] override_table.py
+- [x] override_table.py
 - [x] paragraph_def.py
 - [x] paragraphs.py
 - [ ] ParseRtf.py
