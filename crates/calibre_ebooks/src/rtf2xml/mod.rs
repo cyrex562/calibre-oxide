@@ -114,6 +114,10 @@
 //!   its own doc for why [`paragraph_def`], [`styles`], and [`table`]
 //!   each keep an independent private copy instead of calling this
 //!   one).
+//! - [`list_table`]: parse a `\listtable` block into `<list-in-table>`/
+//!   `<level-in-table>` tags -- unlike this issue's other passes, it's
+//!   handed just the block's own text (one call per block), not the
+//!   whole document.
 //!
 //! Three more follow-up issues cover the rest of the ~35 passes
 //! (fields/tables, lists/grouping/tag-conversion, and the
@@ -126,7 +130,8 @@
 //! `ParseRtf.py` and the remaining later-stage transformation passes
 //! (`convert_to_tags`, `group_borders`,
 //! `headings_to_sections`, `inline`, `list_*` (besides
-//! [`list_numbers`]), `make_lists`, `output`, and the rest).
+//! [`list_numbers`] and [`list_table`]), `make_lists`, `output`, and
+//! the rest).
 //! Those are tracked by this crate's follow-up rtf2xml issues, built on
 //! top of the shapes established here -- most importantly
 //! [`process_tokens`]'s intermediate format.
@@ -153,6 +158,7 @@ pub mod hex_2_utf8;
 pub mod info;
 pub mod line_endings;
 pub mod list_numbers;
+pub mod list_table;
 pub mod old_rtf;
 pub mod paragraph_def;
 pub mod paragraphs;

@@ -788,7 +788,7 @@ either -- this pass wasn't exhaustive.
 - [ ] inline.py
 - [x] line_endings.py
 - [x] list_numbers.py
-- [ ] list_table.py
+- [x] list_table.py
 - [ ] make_lists.py
 - [x] old_rtf.py
 - [ ] options_trem.py
