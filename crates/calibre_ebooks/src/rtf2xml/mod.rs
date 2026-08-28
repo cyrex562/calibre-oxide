@@ -129,6 +129,9 @@
 //!   each list's `ordered`/`unordered` type.
 //! - [`headings_to_sections`]: wrap `heading 1`..`heading 9`-styled
 //!   paragraphs in nested, numbered `<section>` tags.
+//! - [`group_styles`]: close every `paragraph-definition` block, and
+//!   either merge consecutive same-`style-name` blocks into one or
+//!   wrap each same-styled run in a `<style-group>` tag.
 //!
 //! Two more follow-up issues cover the rest of the ~35 passes
 //! (the remaining lists/grouping/tag-conversion passes, and the
@@ -139,7 +142,7 @@
 //!
 //! Everything else in `old_src/src/calibre/ebooks/rtf2xml/`:
 //! `ParseRtf.py` and the remaining later-stage transformation passes
-//! (`convert_to_tags`, `group_borders`, `group_styles`,
+//! (`convert_to_tags`, `group_borders`,
 //! `inline`, `output`, and the rest).
 //! Those are tracked by this crate's follow-up rtf2xml issues, built on
 //! top of the shapes established here -- most importantly
@@ -162,6 +165,7 @@ pub mod fields_small;
 pub mod fonts;
 pub mod footnote;
 pub mod get_char_map;
+pub mod group_styles;
 pub mod header;
 pub mod headings_to_sections;
 pub mod hex_2_utf8;
