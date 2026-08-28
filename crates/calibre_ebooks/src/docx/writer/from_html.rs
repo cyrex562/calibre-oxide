@@ -1,30 +1,62 @@
 //! The HTML/OEB -> DOCX spine walker: port of `docx/writer/from_html.py`.
 //!
 //! **[`TextRun`], [`Block`], and [`Blocks`] are fully ported**, and so
-//! is `Convert`'s core element walker (`process_tag`/`process_item`/
-//! `add_block_tag`/`add_inline_tag`/`create_block_from_parent`/
-//! `lang_for_tag`) plus its final assembly step, [`write`] (port of
-//! `Convert.write`). `lang_for_tag`, the `Style`/`Stylizer` subclasses
+//! is `Convert` itself, end to end: its core element walker
+//! (`process_tag`/`process_item`/`add_block_tag`/`add_inline_tag`/
+//! `create_block_from_parent`/`lang_for_tag`), its final assembly step
+//! ([`write`], port of `Convert.write`), and now [`convert`] (port of
+//! `Convert.__init__` + `Convert.__call__`, the real multi-item spine
+//! walk and its pre-`write()` cleanup pass) -- a real `OEBBook` goes
+//! in, a fully-populated [`super::container::DocxWriter`] comes out,
+//! ready for [`super::container::DocxWriter::write`] to serialize into
+//! an actual `.docx` zip. [`convert`]'s own doc comment lists the
+//! three things `Convert.__call__` also does that are deliberately
+//! NOT ported (SVG rasterization, cover-image embedding, font
+//! embedding) -- none of them block a real, valid document; a
+//! finished conversion just won't rasterize SVGs, embed a cover, or
+//! embed fonts yet. `lang_for_tag`, the `Style`/`Stylizer` subclasses
 //! (add a `letterSpacing` property/a `KeyError`-tolerant `style()`
 //! lookup -- already subsumed by [`crate::oeb::polish::style::Style`]
 //! and [`crate::oeb::polish::cascade`], see `oeb/polish/style.rs`'s
 //! module docs) are ported too.
 //!
-//! **`Convert.__call__` itself -- the real multi-item spine walk plus
-//! the pre-`write()` cleanup pass -- is NOT ported**, see issue #132.
-//! [`write`] takes already-populated, already-finalized `Blocks`/
-//! managers as input rather than building them; the orchestration
-//! that WOULD build them (looping `process_item` over a real
-//! `OEBBook`'s spine, then `resolve_skipped`/`delete_block_at`/
-//! `apply_page_break_after`/`resolve_language`/`styles_manager.finalize`/
-//! `lists_manager.finalize`) is real, substantial work left for a
-//! follow-up PR -- notably, `ListsManager::finalize`'s current
-//! signature only accepts ONE `(dom, resolved, profile)` triple, which
-//! is correct for a single spine item but not yet extended to handle
-//! blocks from MULTIPLE items (each parsed against its own `Dom`) in
-//! one `all_blocks` pass -- a genuinely open question for whoever
-//! builds that orchestration, not solved here since [`write`] never
-//! needed to touch `finalize` at all.
+//! [`convert`]'s own per-item CSS cascade resolution reuses
+//! [`crate::oeb::transforms::flatcss::resolve_document_styles`] rather
+//! than [`crate::oeb::polish::cascade::resolve_styles`] -- the latter
+//! needs a `polish::Container` (issue #163's filesystem-backed "Polish
+//! Book" editor), a completely different object model from the
+//! `OEBBook` this whole module is built against, and NOT something an
+//! in-memory `OEBBook` can cheaply become (`polish::Container::open`
+//! is disk-backed). `flatcss.rs` already solved exactly this problem
+//! for the SAME reason (see ITS OWN module docs) -- reusing it here is
+//! the third consumer of that local, container-agnostic cascade
+//! reimplementation, not a new one.
+//!
+//! `ListsManager::finalize`'s multi-item signature (issue #132's
+//! design question, resolved in the PR before this one) and
+//! [`Blocks::resolve_skipped_range`] (added alongside [`convert`]
+//! itself, for the identical underlying reason -- a `NodeId` is only
+//! meaningful within the specific `Dom` it came from) are BOTH called
+//! once per spine item here, each with that item's own `(dom,
+//! resolved, profile)`.
+//!
+//! **A real correctness question [`convert`] had to resolve, not just
+//! wire together**: Python shares ONE `DOCX.document_relationships`
+//! object BY REFERENCE across `LinksManager`/`ImagesManager`/the
+//! package writer; this port's managers each own a `Clone` (no
+//! `Rc<RefCell<...>>`, matching this whole effort's established
+//! avoidance of shared-mutable-object patterns). Since relationship
+//! ids are assigned sequentially by insertion order, two independent
+//! clones would silently collide on the SAME id for genuinely
+//! different targets (an image and an external hyperlink both getting
+//! `rId5`, corrupting whichever one Word resolves second) -- avoided
+//! because `ImagesManager`'s registrations all happen eagerly DURING
+//! the spine walk while `LinksManager`'s only happen LATER at
+//! `write()` time, so [`convert`] re-seeds `links_manager` from
+//! `images_manager`'s final state right before calling [`write`] (see
+//! [`super::links::LinksManager::set_document_relationships`]'s own
+//! docs), then feeds the combined result into
+//! `DocxWriter.document_relationships` for the real zip write.
 //!
 //! `TextRun.first_html_parent` (an lxml element in Python) is a
 //! [`NodeId`] here; `TextRun.style`/`.parent_style` (a shared
@@ -75,14 +107,17 @@ use std::collections::{HashMap, HashSet};
 
 use crate::docx::names::{barename, DocxNamespace};
 use crate::dom::{Dom, NodeId, NodeKind};
+use crate::metadata::meta::MetaInformation;
+use crate::oeb::book::OEBBook;
 use crate::oeb::polish::cascade::ResolvedStyles;
 use crate::oeb::polish::pretty::{dom_tail, leading_text};
 use crate::oeb::polish::style::{Profile, Style};
 use crate::oeb::polish::toc::lang_as_iso639_1;
+use crate::oeb::transforms::flatcss::resolve_document_styles;
 
 use indexmap::{IndexMap, IndexSet};
 
-use super::container::DocxWriter;
+use super::container::{DocxWriter, PageOptions};
 use super::images::ImagesManager;
 use super::links::LinksManager;
 use super::lists::ListsManager;
@@ -955,6 +990,57 @@ impl Blocks {
             .table_start_new_cell(table, html_tag, dom, tag_style);
     }
 
+    /// Port of the pairwise `block.resolve_skipped(nb)` walk inside
+    /// `Convert.__call__` (`for i, block in enumerate(all_blocks): ...
+    /// block.resolve_skipped(all_blocks[i+1])`). Python runs this walk
+    /// globally across every block in the whole book, safe there only
+    /// because comparing lxml elements from DIFFERENT spine-item
+    /// documents can never spuriously match (`first_child_element ==
+    /// next_block.html_block`, an identity comparison, is always
+    /// `False` across documents). This port's `NodeId`s are plain
+    /// `usize`s, only meaningful within the specific `Dom` they came
+    /// from, so `dom`/`range` must both belong to the SAME spine item
+    /// -- exactly the same "must be called per item" constraint
+    /// [`super::lists::ListsManager::finalize`] already documents, and
+    /// for the identical underlying reason. Restricting the walk to
+    /// `range` (one item's own slice of `self.all_blocks`) rather than
+    /// the whole book loses nothing versus Python's real behavior --
+    /// cross-item pairs never actually mark `skipped` there either.
+    ///
+    /// Returns the ABSOLUTE positions within `self.all_blocks` that
+    /// turned out `skipped`, in ascending order, for the caller to
+    /// pass to [`Self::delete_block_at`] -- in REVERSE order, so an
+    /// earlier deletion never shifts a later position out from under
+    /// a not-yet-processed one (matching `Convert.__call__`'s own
+    /// `for pos, block in reversed(remove_blocks)`).
+    pub fn resolve_skipped_range(
+        &mut self,
+        dom: &Dom,
+        range: std::ops::Range<usize>,
+    ) -> Vec<usize> {
+        let mut removed = Vec::new();
+        // Only pairs (i, i+1) with BOTH indices inside `range` -- the
+        // one past the last index in `range` belongs to a DIFFERENT
+        // spine item (or doesn't exist), never checked here. See this
+        // method's own docs for why that's correct, not a gap.
+        for i in range.start..range.end.saturating_sub(1) {
+            let next_id = self.all_blocks[i + 1];
+            let id = self.all_blocks[i];
+            let (a, b) = if id.0 < next_id.0 {
+                let (left, right) = self.blocks.split_at_mut(next_id.0);
+                (&mut left[id.0], &mut right[0])
+            } else {
+                let (left, right) = self.blocks.split_at_mut(id.0);
+                (&mut right[0], &mut left[next_id.0])
+            };
+            a.resolve_skipped(dom, b);
+            if a.skipped {
+                removed.push(i);
+            }
+        }
+        removed
+    }
+
     /// Port of `Blocks.delete_block_at`. See the module docs for why
     /// there's no `block_map`; `block.container` (Python's
     /// `parent_items`) is real now, so this removes from the SAME
@@ -1668,6 +1754,208 @@ pub fn write(
     styles_manager.serialize(&mut writer.styles);
     images_manager.serialize(&mut writer.parts);
     lists_manager.serialize(&mut writer.numbering);
+}
+
+/// Python's `a[href] { text-decoration: underline; color: blue }` --
+/// Word doesn't apply default hyperlink styling, and the conversion
+/// pipeline doesn't apply any either, so `Convert` injects this one
+/// rule into every item's cascade. Port of `Convert.base_css`.
+const BASE_CSS: &str = "a[href] { text-decoration: underline; color: blue }";
+
+/// The `<html>` root of a parsed document -- the first real element in
+/// document order, matching what `Dom::parse` always produces for a
+/// well-formed document. Port of Python's `item.data` (an lxml
+/// document's root element, implicitly what every `html_root`
+/// parameter in this file already means).
+fn html_root_of(dom: &Dom) -> Option<NodeId> {
+    dom.preorder_elements(dom.root)
+        .into_iter()
+        .find(|&id| dom.tag(id).is_some())
+}
+
+/// One already-processed spine item's own state, kept alive for the
+/// rest of [`convert`] -- `Block`/`Blocks` hold [`NodeId`]s into
+/// `dom`, only meaningful against the SAME `Dom` (and, for
+/// [`Blocks::resolve_skipped_range`]/[`super::lists::ListsManager::finalize`],
+/// the matching `resolved`) they were created from.
+struct ItemContext {
+    dom: Dom,
+    resolved: ResolvedStyles,
+    /// This item's own slice of `Blocks::all_blocks()`'s POSITIONS,
+    /// recorded right after its own `process_item` call returned --
+    /// used ONLY for [`Blocks::resolve_skipped_range`], which is
+    /// itself run before any deletion, while positions are still
+    /// accurate.
+    block_range: std::ops::Range<usize>,
+    /// The actual [`BlockId`]s created while processing this item,
+    /// captured at the SAME time as `block_range` but immune to later
+    /// position-shifting `delete_block_at` calls (a `BlockId` stays
+    /// valid forever, unlike a position in `all_blocks`) -- used for
+    /// [`super::lists::ListsManager::finalize`], which runs AFTER the
+    /// skip/delete cleanup pass, by which point `block_range`'s own
+    /// positions would already be stale.
+    block_ids: Vec<BlockId>,
+}
+
+/// Port of `Convert.__init__` + `Convert.__call__`, producing a
+/// [`DocxWriter`] with its `document.xml`/`styles.xml`/
+/// `numbering.xml`/parts fully populated -- ready for
+/// [`DocxWriter::write`] to serialize into a real `.docx` zip.
+///
+/// **Three things `Convert.__call__` also does are deliberately NOT
+/// ported here**, each disclosed precisely rather than silently
+/// dropped:
+/// - SVG rasterization (`SVGRasterizer(base_css=...)`, run over the
+///   whole book before the spine walk) -- this crate's own
+///   [`crate::oeb::transforms::rasterize::SvgRasterizer`] only has the
+///   rasterization-CACHE half (issue #162, ported for a different
+///   consumer), not the actual "rasterize every SVG in the book, in
+///   place" pass Python's version performs. Without it, an `<img>`
+///   pointing at a `.svg` file embeds via `ImagesManager::read_svg`'s
+///   already-real path (dimensions `(-1, -1)`, no `svg_rid` fallback,
+///   see that method's own docs) rather than a rasterized PNG.
+/// - Cover-image embedding (`self.cover_img`'s resolution +
+///   `ImagesManager::create_cover_markup`/`write_cover_block`) --
+///   neither `create_cover_markup` nor `write_cover_block` is ported
+///   yet (issue #132), so a document produced here never gets a cover
+///   image, regardless of what `oeb.metadata.cover` says.
+/// - Font embedding (`FontsManager::serialize`, itself fully ported
+///   but needing used-family extraction from `styles_manager`'s
+///   interned styles plus manifest font-face discovery, neither of
+///   which exists yet) -- Word falls back to substitute fonts by the
+///   `font-family` name already written into each style's `w:rFonts`,
+///   so this is a real, disclosed simplification, not a correctness
+///   gap; a document with no embedded fonts is still valid OOXML.
+///
+/// `document_lang` is `mi.languages.first()`, falling back to `"en"`
+/// -- Python's `self.mi.language` is a single canonicalized language
+/// code; this crate's own `MetaInformation` only has a `languages`
+/// list (see [`crate::docx::writer::container::DocxWriter::core_properties`]
+/// for the same fallback already established there).
+pub fn convert(
+    oeb: &OEBBook,
+    opts: &PageOptions,
+    mi: &MetaInformation,
+    add_toc: bool,
+) -> DocxWriter {
+    let (effective_width, effective_height) = opts.effective_area();
+    let mut profile = Profile::default();
+    profile.width_pts = effective_width;
+    profile.height_pts = effective_height;
+    let document_lang = mi.languages.first().map(String::as_str).unwrap_or("en");
+
+    let mut writer = DocxWriter::new(opts.clone());
+    let names = writer.namespace.clone();
+    let mut styles_manager = StylesManager::new(document_lang);
+    // See LinksManager::set_document_relationships's own docs for why
+    // this starts as an independent clone rather than the SAME
+    // instance images_manager below gets, and why that's safe here.
+    let mut links_manager = LinksManager::new(writer.document_relationships.clone());
+    let mut images_manager = ImagesManager::new(
+        oeb,
+        writer.document_relationships.clone(),
+        effective_width,
+        effective_height,
+    );
+    let mut lists_manager = ListsManager::new();
+    let mut blocks = Blocks::new();
+    let mut item_contexts: Vec<ItemContext> = Vec::new();
+
+    for spine_item in &oeb.spine.items {
+        let Some(manifest_item) = oeb.manifest.items.get(&spine_item.idref) else {
+            continue;
+        };
+        let href = manifest_item.href.clone();
+        let Ok(bytes) = oeb.container.read(&href) else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let dom = Dom::parse(&text);
+        let Some(html_root) = html_root_of(&dom) else {
+            continue;
+        };
+        let style_map = resolve_document_styles(oeb, &href, &dom, BASE_CSS);
+        let resolved = ResolvedStyles {
+            style_map,
+            pseudo_style_map: HashMap::new(),
+        };
+
+        let start = blocks.all_blocks().len();
+        process_item(
+            &dom,
+            &resolved,
+            &profile,
+            &mut blocks,
+            &mut styles_manager,
+            &mut links_manager,
+            &mut images_manager,
+            &names,
+            &href,
+            html_root,
+            document_lang,
+        );
+        let end = blocks.all_blocks().len();
+        let block_ids = blocks.all_blocks()[start..end].to_vec();
+
+        item_contexts.push(ItemContext {
+            dom,
+            resolved,
+            block_range: start..end,
+            block_ids,
+        });
+    }
+
+    if add_toc {
+        links_manager.process_toc_links(&oeb.toc);
+    }
+
+    // Cover-image embedding is deliberately out of scope -- see this
+    // function's own doc comment.
+
+    // The skip-detection + deletion pass. resolve_skipped_range is
+    // scoped per item (see its own docs for why); positions from
+    // every item are collected first, THEN deleted in one global,
+    // descending pass so an earlier deletion never invalidates a
+    // later, not-yet-processed position.
+    let mut remove_positions: Vec<usize> = Vec::new();
+    for ctx in &item_contexts {
+        remove_positions.extend(blocks.resolve_skipped_range(&ctx.dom, ctx.block_range.clone()));
+    }
+    remove_positions.sort_unstable();
+    for &pos in remove_positions.iter().rev() {
+        blocks.delete_block_at(Some(pos));
+    }
+    if let Some(&first) = blocks.all_blocks().first() {
+        blocks.block_mut(first).is_first_block = true;
+    }
+    blocks.apply_page_break_after();
+    blocks.resolve_language(document_lang);
+
+    for ctx in &item_contexts {
+        lists_manager.finalize(
+            &ctx.dom,
+            &ctx.resolved,
+            &profile,
+            &ctx.block_ids,
+            &mut blocks,
+        );
+    }
+    styles_manager.finalize(&mut blocks);
+
+    // Re-seed links_manager right before write() may grow it further
+    // (external-hyperlink registration, TextRun::serialize) -- see
+    // LinksManager::set_document_relationships's own docs.
+    links_manager.set_document_relationships(images_manager.document_relationships().clone());
+    write(
+        &mut writer,
+        &blocks,
+        &styles_manager,
+        &mut links_manager,
+        &lists_manager,
+        &images_manager,
+    );
+    writer.document_relationships = links_manager.document_relationships().clone();
+    writer
 }
 
 #[cfg(test)]
@@ -4010,5 +4298,131 @@ mod tests {
             Some(&png_bytes(1, 1)),
             "the embedded image's real bytes should have landed in writer.parts"
         );
+    }
+
+    use crate::metadata::meta::MetaInformation;
+
+    #[test]
+    fn convert_produces_a_real_document_from_a_single_spine_item() {
+        let oeb = crate::oeb::transforms::test_support::Builder::new()
+            .page("chap1.html", "<h1>Chapter One</h1><p>hello</p>")
+            .build();
+        let opts = PageOptions::default();
+        let mi = MetaInformation::default();
+        let mut writer = convert(&oeb, &opts, &mi, false);
+
+        let body = writer.body_mut();
+        assert!(
+            matches!(body.children.last(), Some(Child::Element(e)) if e.name == "w:sectPr"),
+            "the section properties must end up as body's last child"
+        );
+        let text: String = body
+            .children_named("w:p")
+            .flat_map(|p| p.children_named("w:r"))
+            .flat_map(|r| r.children_named("w:t"))
+            .flat_map(|t| t.children.iter())
+            .filter_map(|c| match c {
+                Child::Text(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(text.contains("Chapter One"));
+        assert!(text.contains("hello"));
+        assert!(
+            !writer
+                .styles
+                .children_named("w:style")
+                .collect::<Vec<_>>()
+                .is_empty(),
+            "styles_manager.finalize + .serialize should have run for real"
+        );
+    }
+
+    #[test]
+    fn convert_keeps_lists_in_different_spine_items_from_colliding() {
+        // Each item's own <ul> gets a real UA-stylesheet list-style-type
+        // (real cascade this time, not a resolved_with([]) fixture) --
+        // this is the end-to-end proof that ListsManager::finalize's
+        // per-item contract (PR #353) actually holds up through a real
+        // multi-item spine walk, not just in its own unit tests.
+        let oeb = crate::oeb::transforms::test_support::Builder::new()
+            .page("chap1.html", "<ul><li>a</li></ul>")
+            .page("chap2.html", "<ul><li>b</li></ul>")
+            .build();
+        let opts = PageOptions::default();
+        let mi = MetaInformation::default();
+        let mut writer = convert(&oeb, &opts, &mi, false);
+
+        assert_eq!(
+            writer.numbering.children_named("w:abstractNum").count(),
+            2,
+            "both items' own lists should have survived, with no num_id collision"
+        );
+    }
+
+    #[test]
+    fn convert_never_lets_an_image_and_an_external_link_share_a_relationship_id() {
+        let oeb = crate::oeb::transforms::test_support::Builder::new()
+            .part("pic.png", "image/png", &png_bytes(1, 1), false)
+            .page(
+                "chap1.html",
+                "<p><img src=\"pic.png\"/><a href=\"https://example.com/\">x</a></p>",
+            )
+            .build();
+        let opts = PageOptions::default();
+        let mi = MetaInformation::default();
+        let writer = convert(&oeb, &opts, &mi, false);
+
+        let rels_xml = writer.document_relationships.serialize(&writer.namespace);
+        let doc = roxmltree::Document::parse(&rels_xml).expect("valid relationships XML");
+        let mut seen = std::collections::HashSet::new();
+        for rel in doc.root_element().children() {
+            if let Some(id) = rel.attribute("Id") {
+                assert!(
+                    seen.insert(id.to_string()),
+                    "duplicate relationship id {id} in {rels_xml}"
+                );
+            }
+        }
+        assert!(
+            seen.len() >= 6,
+            "expected at least the 4 boilerplate parts plus the image and the external link, got {seen:?}"
+        );
+    }
+
+    #[test]
+    fn convert_end_to_end_produces_a_package_the_docx_reader_can_open() {
+        // The real closing of the loop: a book with headings, a list,
+        // an image, and a multi-item spine, run through convert(),
+        // written to a real zip, and read back by this crate's OWN
+        // docx reader (issue #22/#130) -- independent verification
+        // that the whole pipeline produces a genuinely valid package,
+        // not just plausible-looking XML fragments in isolation.
+        let oeb = crate::oeb::transforms::test_support::Builder::new()
+            .part("pic.png", "image/png", &png_bytes(2, 2), false)
+            .page(
+                "chap1.html",
+                "<h1>Chapter One</h1><p>hello <img src=\"pic.png\"/></p><ul><li>a</li><li>b</li></ul>",
+            )
+            .page("chap2.html", "<h1>Chapter Two</h1><p>world</p>")
+            .build();
+        let opts = PageOptions::default();
+        let mut mi = MetaInformation::default();
+        mi.title = "Test Book".to_string();
+        let writer = convert(&oeb, &opts, &mi, false);
+
+        let mut buf = std::io::Cursor::new(Vec::new());
+        writer.write(&mut buf, &mi).expect("writes a real zip");
+        buf.set_position(0);
+
+        let mut docx =
+            crate::docx::container::Docx::new(buf).expect("the reader accepts the package");
+        assert_eq!(docx.document_name().unwrap(), "word/document.xml");
+        assert_eq!(
+            docx.content_type("word/media/pic.png").as_deref(),
+            Some("image/png")
+        );
+        let read_mi = docx.metadata();
+        assert_eq!(read_mi.title, "Test Book");
     }
 }

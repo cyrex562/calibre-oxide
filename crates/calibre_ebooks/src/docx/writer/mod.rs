@@ -17,83 +17,82 @@
 //! | `images.py` (partial) | [`images`] |
 //! | `tables.py` | [`tables`] |
 //!
-//! Still to come, tracked as issue #132: `from_html.py`'s
-//! `Convert.__call__` -- the real multi-item spine walk and its
-//! pre-`write()` cleanup pass (see [`from_html`]'s module docs --
-//! `Convert`'s core element walker, `Blocks`' `Table`-related methods,
-//! `Blocks::serialize`, AND now [`from_html::write`] (`Convert.write`,
-//! the final assembly step, taking already-populated/finalized
-//! `Blocks`/managers and filling in a real
-//! [`container::DocxWriter`]'s `document.xml`/`styles.xml`/
-//! `numbering.xml`/parts) are all ported now; only the top-level
-//! orchestration that WOULD populate/finalize them from a real
-//! `OEBBook` remains). One real design question for that orchestration
-//! has already been resolved: [`lists::ListsManager::finalize`] now
-//! takes an explicit `block_ids: &[BlockId]` slice instead of scanning
-//! `Blocks::all_blocks()` itself, and APPENDS each call's
-//! `NumberingDefinition`s (continuing `num_id` from wherever the
-//! previous call left off) rather than overwriting them -- since this
-//! port's `NodeId`s are only meaningful within the specific `Dom` they
-//! came from (unlike Python's globally-comparable lxml elements), a
-//! multi-item document MUST call `finalize` once per spine item, each
-//! with that item's own `(dom, resolved, profile)` and just the block
-//! ids created while processing it. `from_html.py`'s `Blocks` has
-//! real table support: its own `tables` stack of currently-open
-//! tables, `finish_tag`'s table-closing branch (moving a finished
-//! table into its parent -- nesting it into a still-open outer table,
-//! or appending it to `Blocks`' own top-level `items`), a real
-//! `items: Vec<ItemId>` holding both `Block`s and finished `Table`s,
-//! and [`from_html::Block`] gained a real [`from_html::ItemContainer`]
-//! field (Python's `parent_items`, finally meaningful now that a
-//! block can live in either `Blocks`' own items or a table cell's).
-//! [`from_html::process_tag`]'s own table-`display` dispatch
-//! (`table`/`table-row`/`table-cell`, into
-//! `Blocks::start_new_table`/`::start_new_row`/`::start_new_cell`) is
-//! wired up too, and `Blocks::serialize` (see [`tables`]'s module
-//! docs -- `tables.py` itself is now FULLY ported, including every
+//! **`Convert` (`from_html.py`) is now FULLY ported, end to end** --
+//! see [`from_html`]'s own module docs. [`from_html::convert`] (port
+//! of `Convert.__init__` + `Convert.__call__`) is the real,
+//! recommended entry point: give it a real `OEBBook`, and it runs the
+//! full multi-item spine walk (per-item CSS cascade resolution reused
+//! from [`crate::oeb::transforms::flatcss::resolve_document_styles`],
+//! since [`crate::oeb::polish::cascade::resolve_styles`] needs a
+//! DIFFERENT, filesystem-backed object model this crate's plain
+//! `OEBBook` isn't), the pre-`write()` cleanup pass
+//! (`resolve_skipped`/`delete_block_at`/`apply_page_break_after`/
+//! `resolve_language`/`styles_manager.finalize`/`lists_manager.finalize`,
+//! each of the latter two now correctly scoped PER SPINE ITEM -- see
+//! [`lists::ListsManager::finalize`]'s own docs for why a single
+//! shared call across the whole book would misresolve), and
+//! [`from_html::write`] (`Convert.write`, the final assembly into a
+//! real [`container::DocxWriter`]). A real correctness question surfaced and
+//! resolved along the way: Python shares ONE `document_relationships`
+//! object by reference across every manager, but this port's managers
+//! each own a `Clone` -- [`from_html::convert`]'s own doc comment
+//! explains exactly how relationship-id collisions between
+//! `LinksManager` and `ImagesManager` are avoided without
+//! `Rc<RefCell<...>>`.
+//!
+//! **Deliberately NOT ported, tracked as the remainder of issue
+//! #132**: SVG rasterization (this crate's
+//! [`crate::oeb::transforms::rasterize::SvgRasterizer`] only has the
+//! rasterization-cache half, issue #162, ported for a different
+//! consumer), cover-image embedding
+//! (`images::ImagesManager::create_cover_markup`/`write_cover_block`,
+//! needing a real cover-image resolution flow `Convert.__call__`
+//! doesn't have), and font embedding (`fonts::FontsManager::serialize`
+//! is itself fully ported, but needs used-family extraction from
+//! `styles::StylesManager`'s interned styles plus manifest
+//! font-face discovery, neither of which is wired up). None of these
+//! block producing a real, valid `.docx` -- a document converted
+//! today just won't rasterize SVGs, have a cover, or embed fonts yet.
+//!
+//! `from_html.py`'s `Blocks` has real table support: its own `tables`
+//! stack of currently-open tables, `finish_tag`'s table-closing branch
+//! (moving a finished table into its parent -- nesting it into a
+//! still-open outer table, or appending it to `Blocks`' own top-level
+//! `items`), a real `items: Vec<ItemId>` holding both `Block`s and
+//! finished `Table`s, and [`from_html::Block`] gained a real
+//! [`from_html::ItemContainer`] field (Python's `parent_items`,
+//! finally meaningful now that a block can live in either `Blocks`'
+//! own items or a table cell's). `Blocks::serialize` (see [`tables`]'s
+//! module docs -- `tables.py` itself is FULLY ported, including every
 //! `.serialize` method; `Tables::serialize_cell`/`::serialize_row`/
 //! `::serialize_table` take a `serialize_block` callback for the one
 //! piece they can't resolve on their own, a real `Block`'s content,
 //! and `Blocks::serialize` is what builds that closure) walks
-//! `self.items` and writes real content out -- real table content now
-//! flows all the way through the walker, gets styled, and gets
-//! written out, end to end. `add_block_tag`/`add_inline_tag`'s
-//! `<img>`-tag handling is wired up too now -- [`ProcessCtx`] gained
-//! `images_manager: &mut ImagesManager`/`names: &DocxNamespace` fields
-//! (a second lifetime parameter, `ProcessCtx<'a, 'b>`, since
-//! `ImagesManager<'b>`'s own `&'b OEBBook` borrow is unrelated to
-//! `ProcessCtx`'s other `'a` borrows), so `<img>` markup is built
-//! for real during the walk, not deferred to serialize time. `images.py`'s
-//! cover-image methods (see [`images`]'s module docs -- its
-//! self-contained utility layer, [`images::ImagesManager`]'s
-//! data-source half (`read_image`/`read_svg`), `create_image_markup`/
-//! `add_image`, AND now `serialize` (writing every embedded image's
-//! bytes into a `part name -> bytes` map -- exactly the shape
-//! [`container::DocxWriter::parts`] already has, so this needed no
-//! new capability despite earlier docs flagging one as missing) are
-//! all ported -- only its cover-image methods (`create_cover_markup`/
-//! `write_cover_block`) remain, needing a real cover-image resolution
-//! flow `Convert.__call__` doesn't have yet) are the main remaining
-//! gap besides `Convert.__call__` itself --
-//! `links.py`'s `LinksManager` is now fully ported, including its
-//! TOC-serialization half, which is what gave [`xml::Element`] its
-//! `insert`/`find_descendant_mut` methods. These walk a resolved-CSS
-//! HTML tree -- #132's own "needs a real OEB stylizer" framing was
-//! stale by the time it was filed:
-//! [`crate::oeb::polish::cascade`] already had a real CSS cascade (a
-//! different consumer, issue #164), and
+//! `self.items` and writes real content out. `add_block_tag`/
+//! `add_inline_tag`'s `<img>`-tag handling is wired up too -- via
+//! [`ProcessCtx`]'s `images_manager`/`names` fields (a second lifetime
+//! parameter, `ProcessCtx<'a, 'b>`, since `ImagesManager<'b>`'s own
+//! `&'b OEBBook` borrow is unrelated to `ProcessCtx`'s other `'a`
+//! borrows). `images.py`'s self-contained utility layer,
+//! [`images::ImagesManager`]'s data-source half (`read_image`/
+//! `read_svg`), `create_image_markup`/`add_image`, AND `serialize`
+//! (writing every embedded image's bytes into a `part name -> bytes`
+//! map -- exactly the shape [`container::DocxWriter::parts`] already
+//! has) are all ported. `links.py`'s `LinksManager` is fully ported,
+//! including its TOC-serialization half, which is what gave
+//! [`xml::Element`] its `insert`/`find_descendant_mut` methods -- #132's
+//! own "needs a real OEB stylizer" framing was stale by the time it
+//! was filed: [`crate::oeb::polish::cascade`] already had a real CSS
+//! cascade (a different consumer, issue #164), and
 //! [`crate::oeb::polish::style`] is the accessor seam these files
-//! actually need. [`styles`] is now FULLY ported: `TextStyle`/
+//! actually need. [`styles`] is FULLY ported: `TextStyle`/
 //! `BlockStyle`/`FloatSpec`/`DescendantTextStyle` (CSS -> `w:rPr`/
 //! `w:pPr`/`w:framePr`, data model and serialization),
 //! `StylesManager`'s `create_text_style`/`create_block_style` dedup
-//! cache, `StylesManager::finalize` (block/run-style pairing, heading
-//! promotion, descendant-style dedup, writing back onto `from_html`'s
-//! `Block`/`TextRun`), and `StylesManager::serialize` (writing every
-//! combined/descendant/pure-block style into a real `<w:styles>`
-//! element). `links.py`/`lists.py`/`styles.py` are the three files of
-//! the original six this issue tracks that are now closed out
-//! completely.
+//! cache, `StylesManager::finalize`, and `StylesManager::serialize`.
+//! `links.py`/`lists.py`/`styles.py`/`tables.py`/`from_html.py` are
+//! FIVE of the original six files this issue tracks, now closed out
+//! completely; only `images.py`'s cover-image methods remain.
 //!
 //! ```no_run
 //! use calibre_ebooks::docx::writer::container::{DocxWriter, PageOptions};
@@ -121,8 +120,8 @@ pub use container::{
 };
 pub use fonts::{obfuscate_font_data, FontFace, FontsManager, Slot};
 pub use from_html::{
-    lang_for_tag, process_item, process_tag, Block, BlockId, Blocks, ItemContainer, ItemId,
-    LinkTarget, ProcessCtx, ProcessState, TextRun,
+    convert, lang_for_tag, process_item, process_tag, write, Block, BlockId, Blocks,
+    ItemContainer, ItemId, LinkTarget, ProcessCtx, ProcessState, TextRun,
 };
 pub use images::{
     create_docx_image_markup, create_filename, get_image_margins, Image, ImageMargins,
