@@ -782,7 +782,7 @@ either -- this pass wasn't exhaustive.
 - [ ] group_borders.py
 - [ ] group_styles.py
 - [x] header.py
-- [ ] headings_to_sections.py
+- [x] headings_to_sections.py
 - [x] hex_2_utf8.py
 - [x] info.py
 - [ ] inline.py
