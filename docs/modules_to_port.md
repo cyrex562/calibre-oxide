@@ -759,7 +759,7 @@ either -- this pass wasn't exhaustive.
 #### rtf2xml
 
 - [ ] __init__.py
-- [ ] add_brackets.py
+- [x] add_brackets.py
 - [x] body_styles.py
 - [ ] border_parse.py
 - [x] char_set.py
