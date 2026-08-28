@@ -123,9 +123,13 @@
 //!   `list-table-id` against [`list_table`]'s own output, filling in
 //!   [`list_table::ListInfo::list_id`] -- this issue's one genuine
 //!   cross-pass dependency among its own files.
+//! - [`make_lists`]: wrap `paragraph-definition` tags that carry a
+//!   `<list-id>` attribute in `<list>`/`<item>` tags, consulting
+//!   [`list_table`]/[`override_table`]'s combined output to resolve
+//!   each list's `ordered`/`unordered` type.
 //!
-//! Three more follow-up issues cover the rest of the ~35 passes
-//! (fields/tables, lists/grouping/tag-conversion, and the
+//! Two more follow-up issues cover the rest of the ~35 passes
+//! (the remaining lists/grouping/tag-conversion passes, and the
 //! `ParseRtf.py` orchestrator itself), built on top of the shapes
 //! established here and in the foundation below.
 //!
@@ -133,10 +137,8 @@
 //!
 //! Everything else in `old_src/src/calibre/ebooks/rtf2xml/`:
 //! `ParseRtf.py` and the remaining later-stage transformation passes
-//! (`convert_to_tags`, `group_borders`,
-//! `headings_to_sections`, `inline`, `list_*` (besides
-//! [`list_numbers`] and [`list_table`]), `make_lists`, `output`, and
-//! the rest).
+//! (`convert_to_tags`, `group_borders`, `group_styles`,
+//! `headings_to_sections`, `inline`, `output`, and the rest).
 //! Those are tracked by this crate's follow-up rtf2xml issues, built on
 //! top of the shapes established here -- most importantly
 //! [`process_tokens`]'s intermediate format.
@@ -164,6 +166,7 @@ pub mod info;
 pub mod line_endings;
 pub mod list_numbers;
 pub mod list_table;
+pub mod make_lists;
 pub mod old_rtf;
 pub mod override_table;
 pub mod paragraph_def;

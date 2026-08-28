@@ -789,7 +789,7 @@ either -- this pass wasn't exhaustive.
 - [x] line_endings.py
 - [x] list_numbers.py
 - [x] list_table.py
-- [ ] make_lists.py
+- [x] make_lists.py
 - [x] old_rtf.py
 - [ ] options_trem.py
 - [ ] output.py
