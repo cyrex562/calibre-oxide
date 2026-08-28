@@ -18,10 +18,16 @@
 //! | `tables.py` | [`tables`] |
 //!
 //! Still to come, tracked as issue #132: `from_html.py`'s
-//! `Convert.__call__`/`.write` (see [`from_html`]'s module docs --
+//! `Convert.__call__` -- the real multi-item spine walk and its
+//! pre-`write()` cleanup pass (see [`from_html`]'s module docs --
 //! `Convert`'s core element walker, `Blocks`' `Table`-related methods,
-//! AND `Blocks::serialize` itself are all ported now; only the
-//! top-level orchestration remains). `from_html.py`'s `Blocks` has
+//! `Blocks::serialize`, AND now [`from_html::write`] (`Convert.write`,
+//! the final assembly step, taking already-populated/finalized
+//! `Blocks`/managers and filling in a real
+//! [`container::DocxWriter`]'s `document.xml`/`styles.xml`/
+//! `numbering.xml`/parts) are all ported now; only the top-level
+//! orchestration that WOULD populate/finalize them from a real
+//! `OEBBook` remains). `from_html.py`'s `Blocks` has
 //! real table support: its own `tables` stack of currently-open
 //! tables, `finish_tag`'s table-closing branch (moving a finished
 //! table into its parent -- nesting it into a still-open outer table,
@@ -55,7 +61,10 @@
 //! bytes into a `part name -> bytes` map -- exactly the shape
 //! [`container::DocxWriter::parts`] already has, so this needed no
 //! new capability despite earlier docs flagging one as missing) are
-//! all ported) are the main remaining gap besides `Convert` itself --
+//! all ported -- only its cover-image methods (`create_cover_markup`/
+//! `write_cover_block`) remain, needing a real cover-image resolution
+//! flow `Convert.__call__` doesn't have yet) are the main remaining
+//! gap besides `Convert.__call__` itself --
 //! `links.py`'s `LinksManager` is now fully ported, including its
 //! TOC-serialization half, which is what gave [`xml::Element`] its
 //! `insert`/`find_descendant_mut` methods. These walk a resolved-CSS

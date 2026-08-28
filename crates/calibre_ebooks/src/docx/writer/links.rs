@@ -279,6 +279,16 @@ impl LinksManager {
         &self.top_anchor
     }
 
+    /// Whether [`Self::process_toc_links`] found a real TOC to
+    /// serialize -- port of `Convert.write`'s own `if
+    /// self.links_manager.toc:` guard, needed because
+    /// [`Self::serialize_toc`] unconditionally adds a "Table of
+    /// Contents" heading even with zero entries, so a caller must
+    /// check first rather than always calling it.
+    pub fn has_toc(&self) -> bool {
+        !self.toc.is_empty()
+    }
+
     pub fn document_relationships(&self) -> &DocumentRelationships {
         &self.document_relationships
     }
@@ -844,6 +854,29 @@ mod tests {
         ));
         mgr.process_toc_links(&toc);
         assert!(mgr.toc.is_empty());
+        assert!(!mgr.has_toc());
+    }
+
+    #[test]
+    fn has_toc_is_true_once_process_toc_links_finds_real_entries() {
+        let dom = make("<html><body><h1>x</h1></body></html>");
+        let h1 = find(&dom, "h1");
+        let mut mgr = LinksManager::new(relationships());
+        let top = mgr.top_anchor().to_string();
+        mgr.bookmark_for_anchor(&top, "chap1.html", &dom, h1);
+        mgr.bookmark_for_anchor(&top, "chap2.html", &dom, h1);
+        let mut toc = TOC::new();
+        toc.root.add(TOCNode::new(
+            Some("One".to_string()),
+            Some("chap1.html".to_string()),
+        ));
+        toc.root.add(TOCNode::new(
+            Some("Two".to_string()),
+            Some("chap2.html".to_string()),
+        ));
+        assert!(!mgr.has_toc(), "nothing processed yet");
+        mgr.process_toc_links(&toc);
+        assert!(mgr.has_toc());
     }
 
     #[test]
