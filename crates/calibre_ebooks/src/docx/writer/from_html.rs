@@ -118,7 +118,7 @@ use crate::oeb::transforms::flatcss::resolve_document_styles;
 use indexmap::{IndexMap, IndexSet};
 
 use super::container::{DocxWriter, PageOptions};
-use super::images::ImagesManager;
+use super::images::{Image, ImagesManager};
 use super::links::LinksManager;
 use super::lists::ListsManager;
 use super::styles::{BlockStyleId, FloatSpec, StylesManager, TextStyleId};
@@ -1713,11 +1713,14 @@ pub fn process_item(
 /// the first place, are `Convert.__call__`'s job -- not ported yet,
 /// and deliberately not attempted here (see this module's own docs).
 ///
-/// Two things `Convert.write` also does are deliberately NOT here,
-/// each disclosed at its own call site rather than silently dropped:
-/// `self.images_manager.write_cover_block` (needs a real resolved
-/// cover image -- `ImagesManager::create_cover_markup`/
-/// `write_cover_block` themselves are still unported, issue #132) and
+/// `cover_image` is the ALREADY-BUILT `w:drawing` element for the
+/// cover, if any (port of `self.cover_img`, resolved and turned into
+/// markup by `Convert.__call__` before calling `write()` -- see
+/// [`convert`]'s own doc comment for that resolution) -- `None` skips
+/// [`super::images::write_cover_block`] entirely, matching Python's
+/// own `if self.cover_img is not None:` guard.
+///
+/// One thing `Convert.write` also does is deliberately NOT here:
 /// `self.fonts_manager.serialize` (needs the set of font families
 /// actually used, extracted from `styles_manager`'s interned text
 /// styles, plus embedded-font-face discovery from the manifest --
@@ -1726,6 +1729,7 @@ pub fn process_item(
 /// whatever `font-family` name is written into each style's
 /// `w:rFonts`, so this is a real, narrow simplification, not a
 /// correctness gap).
+#[allow(clippy::too_many_arguments)]
 pub fn write(
     writer: &mut DocxWriter,
     blocks: &Blocks,
@@ -1733,6 +1737,7 @@ pub fn write(
     links_manager: &mut LinksManager,
     lists_manager: &ListsManager,
     images_manager: &ImagesManager,
+    cover_image: Option<Element>,
 ) {
     let names = writer.namespace.clone();
     {
@@ -1749,6 +1754,12 @@ pub fn write(
         if links_manager.has_toc() {
             let primary_heading_style = styles_manager.primary_heading_style_label();
             links_manager.serialize_toc(body, primary_heading_style.as_deref());
+        }
+        // Cover markup is prepended LAST (matching Python's own
+        // order), so it lands before even the TOC heading -- the
+        // cover is always the very first thing in the document.
+        if let Some(cover_image) = cover_image {
+            super::images::write_cover_block(body, cover_image);
         }
     }
     styles_manager.serialize(&mut writer.styles);
@@ -1802,7 +1813,7 @@ struct ItemContext {
 /// `numbering.xml`/parts fully populated -- ready for
 /// [`DocxWriter::write`] to serialize into a real `.docx` zip.
 ///
-/// **Three things `Convert.__call__` also does are deliberately NOT
+/// **Two things `Convert.__call__` also does are deliberately NOT
 /// ported here**, each disclosed precisely rather than silently
 /// dropped:
 /// - SVG rasterization (`SVGRasterizer(base_css=...)`, run over the
@@ -1814,11 +1825,6 @@ struct ItemContext {
 ///   pointing at a `.svg` file embeds via `ImagesManager::read_svg`'s
 ///   already-real path (dimensions `(-1, -1)`, no `svg_rid` fallback,
 ///   see that method's own docs) rather than a rasterized PNG.
-/// - Cover-image embedding (`self.cover_img`'s resolution +
-///   `ImagesManager::create_cover_markup`/`write_cover_block`) --
-///   neither `create_cover_markup` nor `write_cover_block` is ported
-///   yet (issue #132), so a document produced here never gets a cover
-///   image, regardless of what `oeb.metadata.cover` says.
 /// - Font embedding (`FontsManager::serialize`, itself fully ported
 ///   but needing used-family extraction from `styles_manager`'s
 ///   interned styles plus manifest font-face discovery, neither of
@@ -1826,6 +1832,18 @@ struct ItemContext {
 ///   `font-family` name already written into each style's `w:rFonts`,
 ///   so this is a real, disclosed simplification, not a correctness
 ///   gap; a document with no embedded fonts is still valid OOXML.
+///
+/// Cover-image embedding IS ported: `add_cover` gates the SAME lookup
+/// Python does (`oeb.metadata.cover[0]`, the manifest id of the cover
+/// image, per the `"cover"` OPF metadata term -- confirmed by reading
+/// `oeb::transforms::metadata.rs`'s own real writer of that term
+/// before assuming the read side existed anywhere), read via
+/// [`super::images::ImagesManager::read_image`] like any other image.
+/// [`super::images::ImagesManager::create_cover_markup`] runs AFTER
+/// the cleanup pass (matching Python's own ordering exactly -- the
+/// lookup happens early, the markup-building happens late), using
+/// `opts.size()` (the FULL page size, not `opts.effective_area()`'s
+/// margin-adjusted content area -- a cover fills the whole page).
 ///
 /// `document_lang` is `mi.languages.first()`, falling back to `"en"`
 /// -- Python's `self.mi.language` is a single canonicalized language
@@ -1837,6 +1855,7 @@ pub fn convert(
     opts: &PageOptions,
     mi: &MetaInformation,
     add_toc: bool,
+    add_cover: bool,
 ) -> DocxWriter {
     let (effective_width, effective_height) = opts.effective_area();
     let mut profile = Profile::default();
@@ -1909,8 +1928,18 @@ pub fn convert(
         links_manager.process_toc_links(&oeb.toc);
     }
 
-    // Cover-image embedding is deliberately out of scope -- see this
-    // function's own doc comment.
+    // Port of `if self.add_cover and self.oeb.metadata.cover and
+    // str(self.oeb.metadata.cover[0]) in self.oeb.manifest.ids: ...` --
+    // the lookup happens here, early; the markup only gets built
+    // later, after the cleanup pass, matching Python's own ordering.
+    let cover_img: Option<Image> = if add_cover {
+        oeb.metadata.first("cover").and_then(|item| {
+            let href = oeb.manifest.items.get(&item.value)?.href.clone();
+            images_manager.read_image(&href).cloned()
+        })
+    } else {
+        None
+    };
 
     // The skip-detection + deletion pass. resolve_skipped_range is
     // scoped per item (see its own docs for why); positions from
@@ -1930,6 +1959,17 @@ pub fn convert(
     }
     blocks.apply_page_break_after();
     blocks.resolve_language(document_lang);
+
+    let cover_markup = cover_img.map(|img| {
+        let (page_width, page_height) = opts.size();
+        images_manager.create_cover_markup(
+            &names,
+            &img,
+            opts.preserve_cover_aspect_ratio,
+            page_width,
+            page_height,
+        )
+    });
 
     for ctx in &item_contexts {
         lists_manager.finalize(
@@ -1953,6 +1993,7 @@ pub fn convert(
         &mut links_manager,
         &lists_manager,
         &images_manager,
+        cover_markup,
     );
     writer.document_relationships = links_manager.document_relationships().clone();
     writer
@@ -4165,6 +4206,7 @@ mod tests {
             &mut f.lm,
             &lists_mgr,
             &test_images,
+            None,
         );
 
         let body = writer.body_mut();
@@ -4246,6 +4288,7 @@ mod tests {
             &mut f.lm,
             &lists_mgr,
             &test_images,
+            None,
         );
 
         let body = writer.body_mut();
@@ -4290,6 +4333,7 @@ mod tests {
             &mut f.lm,
             &lists_mgr,
             &test_images,
+            None,
         );
 
         assert_eq!(writer.parts.len(), 1);
@@ -4309,7 +4353,7 @@ mod tests {
             .build();
         let opts = PageOptions::default();
         let mi = MetaInformation::default();
-        let mut writer = convert(&oeb, &opts, &mi, false);
+        let mut writer = convert(&oeb, &opts, &mi, false, false);
 
         let body = writer.body_mut();
         assert!(
@@ -4351,7 +4395,7 @@ mod tests {
             .build();
         let opts = PageOptions::default();
         let mi = MetaInformation::default();
-        let mut writer = convert(&oeb, &opts, &mi, false);
+        let mut writer = convert(&oeb, &opts, &mi, false, false);
 
         assert_eq!(
             writer.numbering.children_named("w:abstractNum").count(),
@@ -4371,7 +4415,7 @@ mod tests {
             .build();
         let opts = PageOptions::default();
         let mi = MetaInformation::default();
-        let writer = convert(&oeb, &opts, &mi, false);
+        let writer = convert(&oeb, &opts, &mi, false, false);
 
         let rels_xml = writer.document_relationships.serialize(&writer.namespace);
         let doc = roxmltree::Document::parse(&rels_xml).expect("valid relationships XML");
@@ -4409,7 +4453,7 @@ mod tests {
         let opts = PageOptions::default();
         let mut mi = MetaInformation::default();
         mi.title = "Test Book".to_string();
-        let writer = convert(&oeb, &opts, &mi, false);
+        let writer = convert(&oeb, &opts, &mi, false, false);
 
         let mut buf = std::io::Cursor::new(Vec::new());
         writer.write(&mut buf, &mi).expect("writes a real zip");
@@ -4424,5 +4468,69 @@ mod tests {
         );
         let read_mi = docx.metadata();
         assert_eq!(read_mi.title, "Test Book");
+    }
+
+    #[test]
+    fn convert_embeds_a_cover_image_as_the_documents_first_content() {
+        // Builder assigns sequential "idN" manifest ids in call order,
+        // so the FIRST .part() call (before .page()) is "id0" --
+        // exactly the manifest id the "cover" metadata term needs to
+        // reference, matching Python's `oeb.metadata.cover[0]` ->
+        // `oeb.manifest.ids[cover_id]` lookup.
+        let mut oeb = crate::oeb::transforms::test_support::Builder::new()
+            .part("cover.png", "image/png", &png_bytes(400, 300), false)
+            .page("chap1.html", "<p>hello</p>")
+            .build();
+        oeb.metadata.add("cover", "id0");
+
+        let opts = PageOptions::default();
+        let mi = MetaInformation::default();
+        let mut writer = convert(&oeb, &opts, &mi, false, true);
+
+        let body = writer.body_mut();
+        let first_p = body
+            .children_named("w:p")
+            .next()
+            .expect("the cover paragraph should be body's first child");
+        let doc_pr = first_p
+            .children_named("w:r")
+            .next()
+            .unwrap()
+            .children_named("w:drawing")
+            .next()
+            .expect("the cover image's own w:drawing")
+            .children_named("wp:anchor")
+            .next()
+            .unwrap()
+            .children_named("wp:docPr")
+            .next()
+            .unwrap();
+        // "cover.jpg" is a real, disclosed Python quirk (a hardcoded
+        // literal in create_docx_image_markup's caller, unrelated to
+        // the real embedded file's own format) -- not a bug here.
+        assert_eq!(doc_pr.get("name"), Some("cover.jpg"));
+        assert!(
+            writer.parts.contains_key("word/media/cover.png"),
+            "the real cover image bytes should have landed in writer.parts: {:?}",
+            writer.parts.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn convert_with_add_cover_false_never_looks_up_a_cover_image() {
+        let mut oeb = crate::oeb::transforms::test_support::Builder::new()
+            .part("cover.png", "image/png", &png_bytes(400, 300), false)
+            .page("chap1.html", "<p>hello</p>")
+            .build();
+        oeb.metadata.add("cover", "id0");
+
+        let opts = PageOptions::default();
+        let mi = MetaInformation::default();
+        let mut writer = convert(&oeb, &opts, &mi, false, false);
+
+        assert!(
+            !writer.parts.contains_key("word/media/cover.png"),
+            "add_cover=false should skip the cover lookup entirely"
+        );
     }
 }
