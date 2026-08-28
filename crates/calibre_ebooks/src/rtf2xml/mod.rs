@@ -109,6 +109,11 @@
 //! - [`table_info`]: insert a `<table>` tag (with the column/row/
 //!   average-width summary [`table::make_table`] collected) around
 //!   each table [`table`] found.
+//! - [`border_parse`]: parse a single border-definition line into an
+//!   attribute dictionary -- the standalone, `pub` entry point (see
+//!   its own doc for why [`paragraph_def`], [`styles`], and [`table`]
+//!   each keep an independent private copy instead of calling this
+//!   one).
 //!
 //! Three more follow-up issues cover the rest of the ~35 passes
 //! (fields/tables, lists/grouping/tag-conversion, and the
@@ -119,9 +124,7 @@
 //!
 //! Everything else in `old_src/src/calibre/ebooks/rtf2xml/`:
 //! `ParseRtf.py` and the remaining later-stage transformation passes
-//! (`border_parse` (except as a private, non-`pub` dependency
-//! independently inlined into both [`paragraph_def`] and [`styles`] --
-//! see those modules' own docs), `convert_to_tags`, `group_borders`,
+//! (`convert_to_tags`, `group_borders`,
 //! `headings_to_sections`, `inline`, `list_*` (besides
 //! [`list_numbers`]), `make_lists`, `output`, and the rest).
 //! Those are tracked by this crate's follow-up rtf2xml issues, built on
@@ -130,6 +133,7 @@
 
 pub mod add_brackets;
 pub mod body_styles;
+pub mod border_parse;
 pub mod char_set;
 pub mod check_brackets;
 pub mod check_encoding;
