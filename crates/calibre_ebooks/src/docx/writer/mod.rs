@@ -27,7 +27,17 @@
 //! [`container::DocxWriter`]'s `document.xml`/`styles.xml`/
 //! `numbering.xml`/parts) are all ported now; only the top-level
 //! orchestration that WOULD populate/finalize them from a real
-//! `OEBBook` remains). `from_html.py`'s `Blocks` has
+//! `OEBBook` remains). One real design question for that orchestration
+//! has already been resolved: [`lists::ListsManager::finalize`] now
+//! takes an explicit `block_ids: &[BlockId]` slice instead of scanning
+//! `Blocks::all_blocks()` itself, and APPENDS each call's
+//! `NumberingDefinition`s (continuing `num_id` from wherever the
+//! previous call left off) rather than overwriting them -- since this
+//! port's `NodeId`s are only meaningful within the specific `Dom` they
+//! came from (unlike Python's globally-comparable lxml elements), a
+//! multi-item document MUST call `finalize` once per spine item, each
+//! with that item's own `(dom, resolved, profile)` and just the block
+//! ids created while processing it. `from_html.py`'s `Blocks` has
 //! real table support: its own `tables` stack of currently-open
 //! tables, `finish_tag`'s table-closing branch (moving a finished
 //! table into its parent -- nesting it into a still-open outer table,

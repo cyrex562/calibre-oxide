@@ -294,21 +294,37 @@ impl ListsManager {
         ListsManager::default()
     }
 
-    /// Port of `ListsManager.finalize`. `all_blocks` is
-    /// `Blocks::all_blocks()`'s current contents (Python's
-    /// `Convert.__call__` passes `self.blocks.all_blocks` after its
-    /// own skip/dedup pass -- not ported here, so the caller is
-    /// responsible for having done any such cleanup on `blocks` first).
+    /// Port of `ListsManager.finalize`. Python calls this ONCE across
+    /// every block in the whole document (`self.blocks.all_blocks`,
+    /// after `Convert.__call__`'s own skip/dedup pass -- not ported
+    /// here, so the caller is responsible for having done any such
+    /// cleanup on `blocks` first) -- safe there because lxml elements
+    /// from different spine-item documents are still globally
+    /// comparable/hashable objects. This port's `NodeId` is only
+    /// unique WITHIN the specific `Dom` it came from, so `dom`/
+    /// `resolved`/`profile` must all belong to the SAME document as
+    /// every block named in `block_ids`.
+    ///
+    /// **A document with more than one spine item must call this
+    /// ONCE PER ITEM**, passing that item's own `(dom, resolved,
+    /// profile)` alongside just the `BlockId`s created while
+    /// processing THAT item (not `Blocks::all_blocks()` as a whole,
+    /// which would mix in other items' blocks and misresolve their
+    /// `NodeId`s against the wrong document). Each call's own new
+    /// `NumberingDefinition`s are appended to [`Self::definitions`]
+    /// (never overwritten) with `num_id`s continuing from wherever
+    /// the previous call left off, so numbering ids stay globally
+    /// unique across every item's lists.
     pub fn finalize(
         &mut self,
         dom: &Dom,
         resolved: &ResolvedStyles,
         profile: &Profile,
+        block_ids: &[BlockId],
         blocks: &mut Blocks,
     ) {
-        let all_blocks: Vec<BlockId> = blocks.all_blocks().to_vec();
         let mut lists: IndexMap<NodeId, NumberingDefinition> = IndexMap::new();
-        for block_id in all_blocks {
+        for &block_id in block_ids {
             let Some(list_tag) = blocks.block(block_id).list_tag else {
                 continue;
             };
@@ -340,13 +356,17 @@ impl ListsManager {
         // first-encountered order -- see the module docs for why this
         // doesn't attempt Python's (non-functional) dedup pass.
         let mut definitions: Vec<NumberingDefinition> = lists.into_values().collect();
+        // num_ids continue from wherever a PREVIOUS finalize call (a
+        // prior spine item's own lists) left off, so two items' lists
+        // never collide on the same id -- see this method's own docs.
+        let offset = self.definitions.len() as u32;
         for (i, nd) in definitions.iter_mut().enumerate() {
-            nd.num_id = Some(i as u32);
+            nd.num_id = Some(offset + i as u32);
         }
         for nd in &definitions {
             nd.link_blocks(blocks);
         }
-        self.definitions = definitions;
+        self.definitions.extend(definitions);
     }
 
     /// Port of `ListsManager.serialize`.
@@ -567,7 +587,8 @@ mod tests {
         let a = add_list_item_block(&mut blocks, &mut mgr, &dom, &resolved, &profile, lis[0]);
         let b = add_list_item_block(&mut blocks, &mut mgr, &dom, &resolved, &profile, lis[1]);
         let mut lm = ListsManager::new();
-        lm.finalize(&dom, &resolved, &profile, &mut blocks);
+        let all_block_ids = blocks.all_blocks().to_vec();
+        lm.finalize(&dom, &resolved, &profile, &all_block_ids, &mut blocks);
         assert_eq!(blocks.block(a).numbering_id, Some((1, 0)));
         assert_eq!(blocks.block(b).numbering_id, Some((1, 0)));
     }
@@ -588,7 +609,8 @@ mod tests {
         let outer = add_list_item_block(&mut blocks, &mut mgr, &dom, &resolved, &profile, lis[0]);
         let inner = add_list_item_block(&mut blocks, &mut mgr, &dom, &resolved, &profile, lis[1]);
         let mut lm = ListsManager::new();
-        lm.finalize(&dom, &resolved, &profile, &mut blocks);
+        let all_block_ids = blocks.all_blocks().to_vec();
+        lm.finalize(&dom, &resolved, &profile, &all_block_ids, &mut blocks);
         // Both list items are inside the SAME outermost <ul>, so they
         // share one NumberingDefinition/num_id but different ilvl.
         assert_eq!(blocks.block(outer).numbering_id, Some((1, 0)));
@@ -610,12 +632,86 @@ mod tests {
         let a = add_list_item_block(&mut blocks, &mut mgr, &dom, &resolved, &profile, lis[0]);
         let b = add_list_item_block(&mut blocks, &mut mgr, &dom, &resolved, &profile, lis[1]);
         let mut lm = ListsManager::new();
-        lm.finalize(&dom, &resolved, &profile, &mut blocks);
+        let all_block_ids = blocks.all_blocks().to_vec();
+        lm.finalize(&dom, &resolved, &profile, &all_block_ids, &mut blocks);
         // Structurally identical (same bullet style) but two distinct
         // <ul> roots -- Python's own dedup never fires (see the module
         // docs), so each gets its own num_id.
         assert_eq!(blocks.block(a).numbering_id, Some((1, 0)));
         assert_eq!(blocks.block(b).numbering_id, Some((2, 0)));
+    }
+
+    #[test]
+    fn finalize_called_once_per_spine_item_accumulates_across_documents() {
+        // Two SEPARATE Dom instances, sharing one Blocks -- exactly
+        // the multi-item shape Convert.__call__ produces (each spine
+        // item parsed on its own, all sharing one Blocks arena).
+        // NodeIds are only meaningful within their OWN Dom, so this is
+        // the scenario finalize's own docs warn a single shared
+        // (dom, resolved, profile) triple would misresolve.
+        let item1_dom = make("<html><body><ul><li>a</li></ul></body></html>");
+        let item1_ul = find(&item1_dom, "ul");
+        let item1_li = find(&item1_dom, "li");
+        let item1_resolved = resolved_with(&[(item1_ul, &[("list-style-type", "disc")])]);
+
+        let item2_dom = make("<html><body><ul><li>b</li></ul></body></html>");
+        let item2_ul = find(&item2_dom, "ul");
+        let item2_li = find(&item2_dom, "li");
+        let item2_resolved = resolved_with(&[(item2_ul, &[("list-style-type", "decimal")])]);
+
+        let profile = Profile::default();
+        let mut mgr = StylesManager::new("en");
+        let mut blocks = Blocks::new();
+        let mut lm = ListsManager::new();
+
+        let item1_a = add_list_item_block(
+            &mut blocks,
+            &mut mgr,
+            &item1_dom,
+            &item1_resolved,
+            &profile,
+            item1_li,
+        );
+        let item1_ids = blocks.all_blocks().to_vec();
+        lm.finalize(
+            &item1_dom,
+            &item1_resolved,
+            &profile,
+            &item1_ids,
+            &mut blocks,
+        );
+
+        let before_item2 = blocks.all_blocks().len();
+        let item2_b = add_list_item_block(
+            &mut blocks,
+            &mut mgr,
+            &item2_dom,
+            &item2_resolved,
+            &profile,
+            item2_li,
+        );
+        let item2_ids = blocks.all_blocks()[before_item2..].to_vec();
+        lm.finalize(
+            &item2_dom,
+            &item2_resolved,
+            &profile,
+            &item2_ids,
+            &mut blocks,
+        );
+
+        // Each item's own list got its own, globally-distinct num_id
+        // -- the second finalize call's ids continue from the first's,
+        // never colliding or overwriting it.
+        assert_eq!(blocks.block(item1_a).numbering_id, Some((1, 0)));
+        assert_eq!(blocks.block(item2_b).numbering_id, Some((2, 0)));
+
+        let mut serialized = Element::new("w:numbering");
+        lm.serialize(&mut serialized);
+        assert_eq!(
+            serialized.children_named("w:abstractNum").count(),
+            2,
+            "both items' lists should have survived into one shared numbering.xml"
+        );
     }
 
     #[test]
@@ -629,7 +725,8 @@ mod tests {
         let mut blocks = Blocks::new();
         let a = add_list_item_block(&mut blocks, &mut mgr, &dom, &resolved, &profile, li);
         let mut lm = ListsManager::new();
-        lm.finalize(&dom, &resolved, &profile, &mut blocks);
+        let all_block_ids = blocks.all_blocks().to_vec();
+        lm.finalize(&dom, &resolved, &profile, &all_block_ids, &mut blocks);
         assert_eq!(blocks.block(a).numbering_id, None);
     }
 
@@ -646,7 +743,8 @@ mod tests {
         let mut blocks = Blocks::new();
         let a = add_list_item_block(&mut blocks, &mut mgr, &dom, &resolved, &profile, li);
         let mut lm = ListsManager::new();
-        lm.finalize(&dom, &resolved, &profile, &mut blocks);
+        let all_block_ids = blocks.all_blocks().to_vec();
+        lm.finalize(&dom, &resolved, &profile, &all_block_ids, &mut blocks);
         assert_eq!(blocks.block(a).numbering_id, None);
     }
 
@@ -662,7 +760,8 @@ mod tests {
         let id = blocks.start_new_block(&mut mgr, &dom, p, &style, false, None, false);
         blocks.end_current_block(&dom, &resolved, &profile);
         let mut lm = ListsManager::new();
-        lm.finalize(&dom, &resolved, &profile, &mut blocks);
+        let all_block_ids = blocks.all_blocks().to_vec();
+        lm.finalize(&dom, &resolved, &profile, &all_block_ids, &mut blocks);
         assert_eq!(blocks.block(id).numbering_id, None);
     }
 
@@ -677,7 +776,8 @@ mod tests {
         let mut blocks = Blocks::new();
         add_list_item_block(&mut blocks, &mut mgr, &dom, &resolved, &profile, li);
         let mut lm = ListsManager::new();
-        lm.finalize(&dom, &resolved, &profile, &mut blocks);
+        let all_block_ids = blocks.all_blocks().to_vec();
+        lm.finalize(&dom, &resolved, &profile, &all_block_ids, &mut blocks);
         let mut numbering = Element::new("w:numbering");
         lm.serialize(&mut numbering);
         let an = numbering.children_named("w:abstractNum").next().unwrap();

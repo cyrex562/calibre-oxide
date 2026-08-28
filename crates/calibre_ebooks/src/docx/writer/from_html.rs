@@ -3844,7 +3844,14 @@ mod tests {
         );
 
         let mut lists_mgr = ListsManager::new();
-        lists_mgr.finalize(&f.dom, &f.resolved, &f.profile, &mut f.blocks);
+        let all_block_ids = f.blocks.all_blocks().to_vec();
+        lists_mgr.finalize(
+            &f.dom,
+            &f.resolved,
+            &f.profile,
+            &all_block_ids,
+            &mut f.blocks,
+        );
         f.mgr.finalize(&mut f.blocks);
 
         let mut toc = TOC::new();
