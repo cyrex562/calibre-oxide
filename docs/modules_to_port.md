@@ -761,7 +761,7 @@ either -- this pass wasn't exhaustive.
 - [ ] __init__.py
 - [x] add_brackets.py
 - [x] body_styles.py
-- [ ] border_parse.py
+- [x] border_parse.py
 - [x] char_set.py
 - [x] check_brackets.py
 - [x] check_encoding.py
