@@ -127,6 +127,8 @@
 //!   `<list-id>` attribute in `<list>`/`<item>` tags, consulting
 //!   [`list_table`]/[`override_table`]'s combined output to resolve
 //!   each list's `ordered`/`unordered` type.
+//! - [`headings_to_sections`]: wrap `heading 1`..`heading 9`-styled
+//!   paragraphs in nested, numbered `<section>` tags.
 //!
 //! Two more follow-up issues cover the rest of the ~35 passes
 //! (the remaining lists/grouping/tag-conversion passes, and the
@@ -138,7 +140,7 @@
 //! Everything else in `old_src/src/calibre/ebooks/rtf2xml/`:
 //! `ParseRtf.py` and the remaining later-stage transformation passes
 //! (`convert_to_tags`, `group_borders`, `group_styles`,
-//! `headings_to_sections`, `inline`, `output`, and the rest).
+//! `inline`, `output`, and the rest).
 //! Those are tracked by this crate's follow-up rtf2xml issues, built on
 //! top of the shapes established here -- most importantly
 //! [`process_tokens`]'s intermediate format.
@@ -161,6 +163,7 @@ pub mod fonts;
 pub mod footnote;
 pub mod get_char_map;
 pub mod header;
+pub mod headings_to_sections;
 pub mod hex_2_utf8;
 pub mod info;
 pub mod line_endings;
