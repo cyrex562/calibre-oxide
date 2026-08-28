@@ -772,8 +772,8 @@ either -- this pass wasn't exhaustive.
 - [x] copy.py
 - [x] default_encoding.py
 - [x] delete_info.py
-- [ ] field_strings.py
-- [ ] fields_large.py
+- [x] field_strings.py
+- [x] fields_large.py
 - [x] fields_small.py
 - [x] fonts.py
 - [x] footnote.py

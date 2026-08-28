@@ -97,6 +97,13 @@
 //! - [`fields_small`]: wrap bookmark, index-entry, and toc-entry field
 //!   markers with `mi<mk<inline-fld` field-instruction tags (doesn't
 //!   handle index/toc tables).
+//! - [`field_strings`]: parse a field-instruction string (`PAGE`,
+//!   `HYPERLINK`, `TOC`, `SYMBOL`, ...) into a field-attribute string;
+//!   consumed by [`fields_large`].
+//! - [`fields_large`]: wrap Word's `\field{\*\fldinst ...}{\fldrslt
+//!   ...}` fields (everything except [`fields_small`]'s toc/index/
+//!   bookmark fields) in `<field>`/`<field-block>` tags. Fields can
+//!   nest.
 //!
 //! Three more follow-up issues cover the rest of the ~35 passes
 //! (fields/tables, lists/grouping/tag-conversion, and the
@@ -109,9 +116,8 @@
 //! `ParseRtf.py` and the remaining later-stage transformation passes
 //! (`border_parse` (except as a private, non-`pub` dependency
 //! independently inlined into both [`paragraph_def`] and [`styles`] --
-//! see those modules' own docs), `convert_to_tags`, `field_strings`,
-//! `fields_large`, `group_borders`, `headings_to_sections`, `inline`,
-//! `list_*` (besides
+//! see those modules' own docs), `convert_to_tags`, `group_borders`,
+//! `headings_to_sections`, `inline`, `list_*` (besides
 //! [`list_numbers`]), `make_lists`, `output`, `table*`, and the rest).
 //! Those are tracked by this crate's follow-up rtf2xml issues, built on
 //! top of the shapes established here -- most importantly
@@ -127,6 +133,8 @@ pub mod combine_borders;
 pub mod copy;
 pub mod default_encoding;
 pub mod delete_info;
+pub mod field_strings;
+pub mod fields_large;
 pub mod fields_small;
 pub mod fonts;
 pub mod footnote;
