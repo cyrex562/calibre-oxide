@@ -104,6 +104,8 @@
 //!   ...}` fields (everything except [`fields_small`]'s toc/index/
 //!   bookmark fields) in `<field>`/`<field-block>` tags. Fields can
 //!   nest.
+//! - [`table`]: wrap table row/cell groups in `<row>`/`<cell>` tags,
+//!   collecting border/width/position attributes along the way.
 //!
 //! Three more follow-up issues cover the rest of the ~35 passes
 //! (fields/tables, lists/grouping/tag-conversion, and the
@@ -118,7 +120,7 @@
 //! independently inlined into both [`paragraph_def`] and [`styles`] --
 //! see those modules' own docs), `convert_to_tags`, `group_borders`,
 //! `headings_to_sections`, `inline`, `list_*` (besides
-//! [`list_numbers`]), `make_lists`, `output`, `table*`, and the rest).
+//! [`list_numbers`]), `make_lists`, `output`, `table_info`, and the rest).
 //! Those are tracked by this crate's follow-up rtf2xml issues, built on
 //! top of the shapes established here -- most importantly
 //! [`process_tokens`]'s intermediate format.
@@ -154,4 +156,5 @@ pub mod process_tokens;
 pub mod replace_illegals;
 pub mod sections;
 pub mod styles;
+pub mod table;
 pub mod tokenize;
