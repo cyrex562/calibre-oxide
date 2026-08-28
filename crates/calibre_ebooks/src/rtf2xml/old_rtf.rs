@@ -22,8 +22,12 @@
 
 /// Control-word labels (the fixed 10-char part of `cw<ci<{label}` and a
 /// few other categories) that must always be inside their own group --
-/// port of `__allowable`.
-const ALLOWABLE: &[&str] = &[
+/// port of `__allowable`. `pub(crate)`: `add_brackets.py`'s own
+/// `__accept` list (see [`super::add_brackets`]) is this SAME 25-entry
+/// list verbatim (confirmed by reading both `old_src` files side by
+/// side, not assumed from the name) -- kept as one shared constant
+/// here rather than a second, driftable copy.
+pub(crate) const ALLOWABLE: &[&str] = &[
     "annotation",
     "blue______",
     "bold______",

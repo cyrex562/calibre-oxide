@@ -88,8 +88,14 @@
 //!   [`body_styles`] threads back in.
 //! - [`body_styles`]: insert [`paragraph_def`]'s collected body-style
 //!   strings after the style table.
+//! - [`add_brackets`]: wrap "bare" character-formatting control words
+//!   (the same list [`old_rtf::ALLOWABLE`] flags) that appear directly
+//!   in running text -- with no bracket group of their own, as older
+//!   RTF producers sometimes emit them -- in a synthetic bracket group,
+//!   so every later pass can rely on the group-scoping invariant
+//!   holding everywhere.
 //!
-//! Four more follow-up issues cover the rest of the ~35 passes
+//! Three more follow-up issues cover the rest of the ~35 passes
 //! (fields/tables, lists/grouping/tag-conversion, and the
 //! `ParseRtf.py` orchestrator itself), built on top of the shapes
 //! established here and in the foundation below.
@@ -98,16 +104,16 @@
 //!
 //! Everything else in `old_src/src/calibre/ebooks/rtf2xml/`:
 //! `ParseRtf.py` and the remaining later-stage transformation passes
-//! (`add_brackets`, `border_parse` (except as a private, non-`pub`
-//! dependency independently inlined into both [`paragraph_def`] and
-//! [`styles`] -- see those modules' own docs), `convert_to_tags`,
-//! `fields_*`, `group_borders`,
-//! `headings_to_sections`, `inline`, `list_*` (besides
+//! (`border_parse` (except as a private, non-`pub` dependency
+//! independently inlined into both [`paragraph_def`] and [`styles`] --
+//! see those modules' own docs), `convert_to_tags`, `fields_*`,
+//! `group_borders`, `headings_to_sections`, `inline`, `list_*` (besides
 //! [`list_numbers`]), `make_lists`, `output`, `table*`, and the rest).
 //! Those are tracked by this crate's follow-up rtf2xml issues, built on
 //! top of the shapes established here -- most importantly
 //! [`process_tokens`]'s intermediate format.
 
+pub mod add_brackets;
 pub mod body_styles;
 pub mod char_set;
 pub mod check_brackets;
