@@ -114,13 +114,24 @@ enum State {
 
 /// One `\list` entry: its own attributes (`list-template-id`,
 /// `list-hybrid`, `list-table-id`) plus one attribute dict per
-/// `\listlevel` found inside it, in document order. Python's
-/// `'list-id': []` placeholder entry (never populated, always
-/// excluded from output) has no counterpart here at all.
+/// `\listlevel` found inside it, in document order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ListInfo {
     pub attributes: IndexMap<String, String>,
     pub levels: Vec<IndexMap<String, String>>,
+    /// Port of the `'list-id': []` placeholder Python seeds into the
+    /// list's own attribute dict. Looks dead within `list_table.py`
+    /// alone -- confirmed never populated or read anywhere in *this*
+    /// file -- but `override_table.py`'s `__parse_override_dict`
+    /// mutates this SAME structure afterward (see
+    /// [`super::override_table`]), appending each `\listoverride`'s
+    /// own `list-id` once its `list-table-id` matches this list's.
+    /// Kept as its own typed field rather than folded into
+    /// `attributes` (which never mentions `list-id`) -- `list_table.py`'s
+    /// own `not_allow = ['list-id']` output filter has no Rust
+    /// counterpart needed, since this field was never part of the
+    /// attribute map to begin with.
+    pub list_id: Vec<String>,
 }
 
 #[derive(Default)]
