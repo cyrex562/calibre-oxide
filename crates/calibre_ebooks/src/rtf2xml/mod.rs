@@ -94,6 +94,9 @@
 //!   RTF producers sometimes emit them -- in a synthetic bracket group,
 //!   so every later pass can rely on the group-scoping invariant
 //!   holding everywhere.
+//! - [`fields_small`]: wrap bookmark, index-entry, and toc-entry field
+//!   markers with `mi<mk<inline-fld` field-instruction tags (doesn't
+//!   handle index/toc tables).
 //!
 //! Three more follow-up issues cover the rest of the ~35 passes
 //! (fields/tables, lists/grouping/tag-conversion, and the
@@ -106,8 +109,9 @@
 //! `ParseRtf.py` and the remaining later-stage transformation passes
 //! (`border_parse` (except as a private, non-`pub` dependency
 //! independently inlined into both [`paragraph_def`] and [`styles`] --
-//! see those modules' own docs), `convert_to_tags`, `fields_*`,
-//! `group_borders`, `headings_to_sections`, `inline`, `list_*` (besides
+//! see those modules' own docs), `convert_to_tags`, `field_strings`,
+//! `fields_large`, `group_borders`, `headings_to_sections`, `inline`,
+//! `list_*` (besides
 //! [`list_numbers`]), `make_lists`, `output`, `table*`, and the rest).
 //! Those are tracked by this crate's follow-up rtf2xml issues, built on
 //! top of the shapes established here -- most importantly
@@ -123,6 +127,7 @@ pub mod combine_borders;
 pub mod copy;
 pub mod default_encoding;
 pub mod delete_info;
+pub mod fields_small;
 pub mod fonts;
 pub mod footnote;
 pub mod get_char_map;

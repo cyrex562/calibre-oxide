@@ -774,7 +774,7 @@ either -- this pass wasn't exhaustive.
 - [x] delete_info.py
 - [ ] field_strings.py
 - [ ] fields_large.py
-- [ ] fields_small.py
+- [x] fields_small.py
 - [x] fonts.py
 - [x] footnote.py
 - [x] get_char_map.py
