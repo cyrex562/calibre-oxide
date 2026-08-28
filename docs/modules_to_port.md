@@ -805,7 +805,7 @@ either -- this pass wasn't exhaustive.
 - [x] sections.py
 - [x] styles.py
 - [ ] table_info.py
-- [ ] table.py
+- [x] table.py
 - [x] tokenize.py
 
 #### snb
