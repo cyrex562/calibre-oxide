@@ -1,13 +1,30 @@
 //! The HTML/OEB -> DOCX spine walker: port of `docx/writer/from_html.py`.
 //!
-//! **[`TextRun`], [`Block`], and [`Blocks`] are ported so far** (the
-//! last of these only partially -- see its own doc comment).
-//! `lang_for_tag`, the `Style`/`Stylizer` subclasses (add a
-//! `letterSpacing` property/a `KeyError`-tolerant `style()` lookup --
-//! already subsumed by [`crate::oeb::polish::style::Style`] and
-//! [`crate::oeb::polish::cascade`], see `oeb/polish/style.rs`'s
-//! module docs), and `Convert` (the real spine-walking orchestrator)
-//! are NOT ported -- see issue #132.
+//! **[`TextRun`], [`Block`], and [`Blocks`] are fully ported**, and so
+//! is `Convert`'s core element walker (`process_tag`/`process_item`/
+//! `add_block_tag`/`add_inline_tag`/`create_block_from_parent`/
+//! `lang_for_tag`) plus its final assembly step, [`write`] (port of
+//! `Convert.write`). `lang_for_tag`, the `Style`/`Stylizer` subclasses
+//! (add a `letterSpacing` property/a `KeyError`-tolerant `style()`
+//! lookup -- already subsumed by [`crate::oeb::polish::style::Style`]
+//! and [`crate::oeb::polish::cascade`], see `oeb/polish/style.rs`'s
+//! module docs) are ported too.
+//!
+//! **`Convert.__call__` itself -- the real multi-item spine walk plus
+//! the pre-`write()` cleanup pass -- is NOT ported**, see issue #132.
+//! [`write`] takes already-populated, already-finalized `Blocks`/
+//! managers as input rather than building them; the orchestration
+//! that WOULD build them (looping `process_item` over a real
+//! `OEBBook`'s spine, then `resolve_skipped`/`delete_block_at`/
+//! `apply_page_break_after`/`resolve_language`/`styles_manager.finalize`/
+//! `lists_manager.finalize`) is real, substantial work left for a
+//! follow-up PR -- notably, `ListsManager::finalize`'s current
+//! signature only accepts ONE `(dom, resolved, profile)` triple, which
+//! is correct for a single spine item but not yet extended to handle
+//! blocks from MULTIPLE items (each parsed against its own `Dom`) in
+//! one `all_blocks` pass -- a genuinely open question for whoever
+//! builds that orchestration, not solved here since [`write`] never
+//! needed to touch `finalize` at all.
 //!
 //! `TextRun.first_html_parent` (an lxml element in Python) is a
 //! [`NodeId`] here; `TextRun.style`/`.parent_style` (a shared
@@ -65,8 +82,10 @@ use crate::oeb::polish::toc::lang_as_iso639_1;
 
 use indexmap::{IndexMap, IndexSet};
 
+use super::container::DocxWriter;
 use super::images::ImagesManager;
 use super::links::LinksManager;
+use super::lists::ListsManager;
 use super::styles::{BlockStyleId, FloatSpec, StylesManager, TextStyleId};
 use super::tables::{CellId, TableId};
 use super::xml::{Child, Element};
@@ -1588,6 +1607,67 @@ pub fn process_item(
         process_tag(&mut ctx, &mut state, body, i == 0, None);
         blocks.end_item(true);
     }
+}
+
+/// Port of `Convert.write` -- the final assembly step, turning
+/// already-populated/finalized `Blocks`/managers into a real
+/// [`DocxWriter`]'s `document.xml`/`styles.xml`/`numbering.xml`/parts.
+/// `writer`'s `document`/`styles` skeleton (Python's own
+/// `create_skeleton(self.opts)` call, first thing in `write`) is
+/// already built by [`DocxWriter::new`], so this only fills it in.
+///
+/// **Callers must have already run every `finalize` pass** --
+/// `styles_manager.finalize`/`lists_manager.finalize`, plus `Blocks`'
+/// own cleanup (`resolve_skipped`/`delete_block_at`/
+/// `apply_page_break_after`/`resolve_language`, matching
+/// `Convert.__call__`'s own pre-`write()` sequence) -- this function
+/// only serializes, it never mutates a `Block`'s own style/language/
+/// skip state. That whole cleanup sequence, and the real multi-item
+/// spine walk that builds `blocks`/the managers from an `OEBBook` in
+/// the first place, are `Convert.__call__`'s job -- not ported yet,
+/// and deliberately not attempted here (see this module's own docs).
+///
+/// Two things `Convert.write` also does are deliberately NOT here,
+/// each disclosed at its own call site rather than silently dropped:
+/// `self.images_manager.write_cover_block` (needs a real resolved
+/// cover image -- `ImagesManager::create_cover_markup`/
+/// `write_cover_block` themselves are still unported, issue #132) and
+/// `self.fonts_manager.serialize` (needs the set of font families
+/// actually used, extracted from `styles_manager`'s interned text
+/// styles, plus embedded-font-face discovery from the manifest --
+/// neither piece of glue exists yet; a document with no embedded
+/// fonts is still perfectly valid OOXML, Word just falls back to
+/// whatever `font-family` name is written into each style's
+/// `w:rFonts`, so this is a real, narrow simplification, not a
+/// correctness gap).
+pub fn write(
+    writer: &mut DocxWriter,
+    blocks: &Blocks,
+    styles_manager: &StylesManager,
+    links_manager: &mut LinksManager,
+    lists_manager: &ListsManager,
+    images_manager: &ImagesManager,
+) {
+    let names = writer.namespace.clone();
+    {
+        let body = writer.body_mut();
+        blocks.serialize(body, styles_manager, links_manager, &names);
+        // Port of `body.append(body[0])`: the skeleton's placeholder
+        // `w:sectPr` (DocxWriter::new's own create_skeleton call) is
+        // body's ONLY child before blocks.serialize runs, so index 0
+        // is still it -- move it after the real paragraph content
+        // blocks.serialize just appended, matching OOXML's
+        // last-child-of-body requirement for the document's final
+        // section properties.
+        body.move_child_to_end(0);
+        if links_manager.has_toc() {
+            let primary_heading_style = styles_manager.primary_heading_style_label();
+            links_manager.serialize_toc(body, primary_heading_style.as_deref());
+        }
+    }
+    styles_manager.serialize(&mut writer.styles);
+    images_manager.serialize(&mut writer.parts);
+    lists_manager.serialize(&mut writer.numbering);
 }
 
 #[cfg(test)]
@@ -3714,5 +3794,214 @@ mod tests {
         let dom = make("<html><body><p>x</p></body></html>");
         let html = find(&dom, "html");
         assert_eq!(lang_for_tag(&dom, html), None);
+    }
+
+    use super::super::container::{DocxWriter, PageOptions};
+    use crate::oeb::toc::{TOCNode, TOC};
+
+    #[test]
+    fn write_assembles_real_content_styles_lists_and_toc() {
+        let mut f = fixture(
+            "<html><body><h1>Chapter One</h1><ul><li>a</li><li>b</li></ul></body></html>",
+            &[],
+        );
+        let h1 = find(&f.dom, "h1");
+        let ul = find(&f.dom, "ul");
+        let lis: Vec<NodeId> = f
+            .dom
+            .preorder_elements(f.dom.root)
+            .into_iter()
+            .filter(|&id| f.dom.tag(id) == Some("li"))
+            .collect();
+        f.resolved = resolved_with(&[
+            (h1, &[("display", "block")]),
+            (ul, &[("display", "block"), ("list-style-type", "disc")]),
+            (
+                lis[0],
+                &[("display", "list-item"), ("list-style-type", "disc")],
+            ),
+            (
+                lis[1],
+                &[("display", "list-item"), ("list-style-type", "disc")],
+            ),
+        ]);
+        let html_root = find(&f.dom, "html");
+        let test_oeb = test_oeb();
+        let mut test_images = images_manager_for_test(&test_oeb);
+        let test_names = ns();
+        process_item(
+            &f.dom,
+            &f.resolved,
+            &f.profile,
+            &mut f.blocks,
+            &mut f.mgr,
+            &mut f.lm,
+            &mut test_images,
+            &test_names,
+            "chap1.html",
+            html_root,
+            "en",
+        );
+
+        let mut lists_mgr = ListsManager::new();
+        lists_mgr.finalize(&f.dom, &f.resolved, &f.profile, &mut f.blocks);
+        f.mgr.finalize(&mut f.blocks);
+
+        let mut toc = TOC::new();
+        toc.root.add(TOCNode::new(
+            Some("Chapter One".to_string()),
+            Some("chap1.html".to_string()),
+        ));
+        // process_toc_links needs count() > 1 to actually populate
+        // anything -- a lone entry is treated the same as "no real
+        // navigation value", matching Python's own `count() > 1` guard.
+        toc.root.add(TOCNode::new(
+            Some("Also Chapter One".to_string()),
+            Some("chap1.html".to_string()),
+        ));
+        f.lm.process_toc_links(&toc);
+        assert!(f.lm.has_toc());
+
+        let mut writer = DocxWriter::new(PageOptions::default());
+        write(
+            &mut writer,
+            &f.blocks,
+            &f.mgr,
+            &mut f.lm,
+            &lists_mgr,
+            &test_images,
+        );
+
+        let body = writer.body_mut();
+        assert!(
+            matches!(body.children.last(), Some(Child::Element(e)) if e.name == "w:sectPr"),
+            "the section properties must end up as body's last child"
+        );
+        let toc_heading = body.children_named("w:p").find(|p| {
+            p.children_named("w:r")
+                .flat_map(|r| r.children_named("w:t"))
+                .any(|t| t.children == vec![Child::Text("Table of Contents".to_string())])
+        });
+        assert!(
+            toc_heading.is_some(),
+            "the TOC heading paragraph should be present"
+        );
+
+        let heading_text: String = body
+            .children_named("w:p")
+            .flat_map(|p| p.children_named("w:r"))
+            .flat_map(|r| r.children_named("w:t"))
+            .flat_map(|t| t.children.iter())
+            .filter_map(|c| match c {
+                Child::Text(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(heading_text.contains("Chapter One"));
+
+        assert!(
+            !writer
+                .styles
+                .children_named("w:style")
+                .collect::<Vec<_>>()
+                .is_empty(),
+            "styles_manager.serialize should have written real w:style elements"
+        );
+        assert!(
+            !writer
+                .numbering
+                .children_named("w:abstractNum")
+                .collect::<Vec<_>>()
+                .is_empty(),
+            "lists_manager.serialize should have written a real numbering definition"
+        );
+    }
+
+    #[test]
+    fn write_omits_the_toc_heading_when_there_is_no_real_toc() {
+        let mut f = fixture("<html><body><p>hello</p></body></html>", &[]);
+        let p = find(&f.dom, "p");
+        f.resolved = resolved_with(&[(p, &[("display", "block")])]);
+        let html_root = find(&f.dom, "html");
+        let test_oeb = test_oeb();
+        let mut test_images = images_manager_for_test(&test_oeb);
+        let test_names = ns();
+        process_item(
+            &f.dom,
+            &f.resolved,
+            &f.profile,
+            &mut f.blocks,
+            &mut f.mgr,
+            &mut f.lm,
+            &mut test_images,
+            &test_names,
+            "chap1.html",
+            html_root,
+            "en",
+        );
+        f.mgr.finalize(&mut f.blocks);
+        assert!(!f.lm.has_toc());
+
+        let lists_mgr = ListsManager::new();
+        let mut writer = DocxWriter::new(PageOptions::default());
+        write(
+            &mut writer,
+            &f.blocks,
+            &f.mgr,
+            &mut f.lm,
+            &lists_mgr,
+            &test_images,
+        );
+
+        let body = writer.body_mut();
+        let has_toc_heading = body.children_named("w:p").any(|p| {
+            p.children_named("w:r")
+                .flat_map(|r| r.children_named("w:t"))
+                .any(|t| t.children == vec![Child::Text("Table of Contents".to_string())])
+        });
+        assert!(!has_toc_heading);
+    }
+
+    #[test]
+    fn write_serializes_embedded_images_into_the_writers_parts() {
+        let mut f = fixture("<html><body><img src=\"pic.png\"/></body></html>", &[]);
+        let html_root = find(&f.dom, "html");
+        let test_oeb = crate::oeb::transforms::test_support::Builder::new()
+            .part("pic.png", "image/png", &png_bytes(1, 1), false)
+            .build();
+        let mut test_images = images_manager_for_test(&test_oeb);
+        let test_names = ns();
+        process_item(
+            &f.dom,
+            &f.resolved,
+            &f.profile,
+            &mut f.blocks,
+            &mut f.mgr,
+            &mut f.lm,
+            &mut test_images,
+            &test_names,
+            "chap1.html",
+            html_root,
+            "en",
+        );
+        f.mgr.finalize(&mut f.blocks);
+
+        let lists_mgr = ListsManager::new();
+        let mut writer = DocxWriter::new(PageOptions::default());
+        write(
+            &mut writer,
+            &f.blocks,
+            &f.mgr,
+            &mut f.lm,
+            &lists_mgr,
+            &test_images,
+        );
+
+        assert_eq!(writer.parts.len(), 1);
+        assert_eq!(
+            writer.parts.values().next(),
+            Some(&png_bytes(1, 1)),
+            "the embedded image's real bytes should have landed in writer.parts"
+        );
     }
 }

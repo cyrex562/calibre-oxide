@@ -1675,6 +1675,23 @@ impl StylesManager {
         self.primary_heading_style
     }
 
+    /// The primary heading combined style's final `w:styleId`, the
+    /// same label [`Self::serialize`] itself writes for that style --
+    /// mirrors [`Self::pure_block_style_label`]'s exact reasoning
+    /// (position-based, not stored on the value). Used by
+    /// `LinksManager::serialize_toc`'s `primary_heading_style`
+    /// parameter (`Convert.write`'s
+    /// `self.styles_manager.primary_heading_style`, which Python reads
+    /// as `.id` off the stored object -- here computed fresh from
+    /// position instead, same as every other final id/name in this
+    /// file).
+    pub fn primary_heading_style_label(&self) -> Option<String> {
+        let cs = self.primary_heading_style?;
+        let i = self.combined_styles.iter().position(|&s| s == cs)?;
+        let seq_width = format!("{}", self.combined_styles.len().saturating_sub(1).max(1)).len();
+        Some(combined_style_label(i, cs.outline_level, seq_width))
+    }
+
     /// Port of `StylesManager.finalize`: pairs each block with its
     /// dominant run style by weighted use, promotes per-heading-tag
     /// styles via outline level, and deduplicates descendant
@@ -3038,6 +3055,17 @@ mod tests {
         let heading_cs = mgr.combined_styles()[1];
         assert_eq!(heading_cs.outline_level, Some(0));
         assert_eq!(mgr.primary_heading_style(), Some(heading_cs));
+        assert_eq!(
+            mgr.primary_heading_style_label().as_deref(),
+            Some("Heading 1"),
+            "matches the same label already written onto id_h1's own linked_style"
+        );
+    }
+
+    #[test]
+    fn primary_heading_style_label_is_none_before_finalize_runs() {
+        let mgr = StylesManager::new("en");
+        assert_eq!(mgr.primary_heading_style_label(), None);
     }
 
     #[test]

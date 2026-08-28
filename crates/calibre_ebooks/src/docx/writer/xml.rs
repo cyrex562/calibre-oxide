@@ -105,6 +105,25 @@ impl Element {
         self.children.insert(index, Child::Element(child));
     }
 
+    /// Move the child at `index` to the end, shifting later children
+    /// forward to fill the gap. Port of lxml's `element.append(child)`
+    /// where `child` is ALREADY one of `element`'s own children --
+    /// unlike this port's own [`Self::append`] (always adds a NEW
+    /// child), lxml's `append` re-parents an existing node, which for
+    /// an element already a child of `self` is just a move. Used by
+    /// `docx/writer/from_html.py`'s `Convert.write` (`body.append(
+    /// body[0])`, moving the skeleton's placeholder `w:sectPr` from
+    /// the front of `<w:body>` to the end, after real paragraph
+    /// content has been serialized in ahead of it -- OOXML requires
+    /// the document's final `w:sectPr` be `<w:body>`'s last child).
+    /// A no-op if `index` is already the last child.
+    pub fn move_child_to_end(&mut self, index: usize) {
+        if index + 1 < self.children.len() {
+            let child = self.children.remove(index);
+            self.children.push(child);
+        }
+    }
+
     /// The first descendant element (not including `self`) named
     /// `name`, in document order, or `None` if there isn't one. Port
     /// of the narrow use lxml's `element.xpath('//*[local-name()="..."]')`
@@ -291,6 +310,29 @@ mod tests {
             body.to_xml_fragment(),
             r#"<w:body><w:p w:id="1"/><w:p w:id="2"/><w:sectPr/></w:body>"#
         );
+    }
+
+    #[test]
+    fn move_child_to_end_moves_the_first_child_after_later_ones() {
+        let mut body = Element::new("w:body");
+        body.append(Element::new("w:sectPr"));
+        body.insert(0, Element::new("w:p").attr("w:id", "1"));
+        body.insert(1, Element::new("w:p").attr("w:id", "2"));
+        // At this point: [p1, p2, sectPr]. Moving index 0 (which is
+        // now p1, not sectPr) checks the move is by CURRENT position,
+        // not by content -- exactly matching lxml's index semantics.
+        body.move_child_to_end(0);
+        assert_eq!(
+            body.to_xml_fragment(),
+            r#"<w:body><w:p w:id="2"/><w:sectPr/><w:p w:id="1"/></w:body>"#
+        );
+    }
+
+    #[test]
+    fn move_child_to_end_on_the_last_child_is_a_no_op() {
+        let mut body = Element::new("w:body").with(Element::new("w:p"));
+        body.move_child_to_end(0);
+        assert_eq!(body.to_xml_fragment(), "<w:body><w:p/></w:body>");
     }
 
     #[test]
