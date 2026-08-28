@@ -804,7 +804,7 @@ either -- this pass wasn't exhaustive.
 - [x] replace_illegals.py
 - [x] sections.py
 - [x] styles.py
-- [ ] table_info.py
+- [x] table_info.py
 - [x] table.py
 - [x] tokenize.py
 
