@@ -293,6 +293,32 @@ impl LinksManager {
         &self.document_relationships
     }
 
+    /// Re-seeds `self.document_relationships`. Python shares ONE
+    /// `DOCX.document_relationships` object BY REFERENCE across
+    /// `LinksManager`/`ImagesManager`/the package writer itself; this
+    /// port's managers each OWN a `Clone`, since nothing here uses
+    /// `Rc<RefCell<...>>` for shared mutable state (a deliberate
+    /// choice, see `StylesManager`'s own arena-vs-shared-object design
+    /// note). The only real place that divergence could matter is
+    /// relationship id numbering (`DocumentRelationships::add`
+    /// assigns sequential `rIdN`s based on `self.entries.len()`,
+    /// purely by insertion order): `ImagesManager`'s image
+    /// registrations all happen DURING the spine walk (eagerly, in
+    /// `add_image`), while `LinksManager`'s only own use of
+    /// `document_relationships` (external-hyperlink registration,
+    /// `serialize_hyperlink`) happens LATER, only at `write()` time
+    /// (`Blocks::serialize` -> `Block::serialize` ->
+    /// `TextRun::serialize`). Since these two phases never overlap,
+    /// the caller orchestrating a real multi-manager conversion should
+    /// call this with `images_manager.document_relationships().clone()`
+    /// right before `write()` runs, so `LinksManager`'s own later
+    /// `rId` assignments continue the SAME sequence `ImagesManager`
+    /// already used -- rather than each starting fresh and colliding
+    /// on the same ids for genuinely different targets.
+    pub fn set_document_relationships(&mut self, document_relationships: DocumentRelationships) {
+        self.document_relationships = document_relationships;
+    }
+
     /// Port of the `bookmark_id` property: a mutating counter, not a
     /// plain getter (each call hands out the next id).
     pub fn bookmark_id(&mut self) -> u64 {
