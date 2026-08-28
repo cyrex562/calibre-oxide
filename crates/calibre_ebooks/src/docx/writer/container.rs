@@ -63,6 +63,11 @@ pub struct PageOptions {
     pub docx_margins: Margins,
     /// The conversion-wide margins used for that fallback.
     pub margins: Margins,
+    /// Port of the `preserve_cover_aspect_ratio` conversion option
+    /// (`docx_output.py`, `recommended_value=False`). Read by
+    /// `from_html::convert`'s cover-image resolution, threaded into
+    /// `ImagesManager::create_cover_markup`.
+    pub preserve_cover_aspect_ratio: bool,
 }
 
 /// Page margins in points.
@@ -93,6 +98,7 @@ impl Default for PageOptions {
             custom_page_size: None,
             docx_margins: Margins::uniform(72.0),
             margins: Margins::uniform(72.0),
+            preserve_cover_aspect_ratio: false,
         }
     }
 }

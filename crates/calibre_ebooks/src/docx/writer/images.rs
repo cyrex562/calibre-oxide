@@ -1,12 +1,10 @@
-//! Image embedding (`docx/writer/images.py`) -- **partial**: the
-//! self-contained utility layer, [`ImagesManager`]'s data-source half
-//! (`read_image`/`read_svg`), `create_image_markup`/`add_image` (and
-//! their `from_html.rs` `<img>`-tag wiring), and now `serialize` are
-//! all ported; only the cover-image methods remain.
+//! Image embedding (`docx/writer/images.py`) -- **FULLY PORTED**,
+//! closing out the last file of issue #132's original six-file scope.
 //!
 //! Ported: [`get_image_margins`], [`create_filename`], and
 //! [`create_docx_image_markup`] (the actual `w:drawing`/`pic:pic`
-//! OOXML builder, factored out of `create_image_markup`).
+//! OOXML builder, shared by [`ImagesManager::create_image_markup`]
+//! and [`ImagesManager::create_cover_markup`]).
 //! [`crate::oeb::polish::style::Style::img_size`] (a prerequisite
 //! `create_image_markup` needs) is ported too, alongside this file
 //! since it lives in `oeb/polish/style.rs`. [`Image`] and
@@ -14,50 +12,49 @@
 //! image-content-source design question (an existing crate-wide
 //! idiom, `OEBBook.container.read(href)` -- no new abstraction was
 //! needed). [`ImagesManager::create_image_markup`]/`::add_image` are
-//! real too -- the floating/margin decision logic, `wp:inline`/
+//! real -- the floating/margin decision logic, `wp:inline`/
 //! `wp:anchor` assembly, and the `<img>` element's own `src`/`abshref`
 //! resolution, using [`Floating`] (a real 3-value enum standing in for
 //! Python's `'left' | 'right' | 'center' | None` string-or-None
 //! value) in place of the raw string Python threads through --
 //! `from_html.rs`'s `add_block_tag`/`add_inline_tag` call `add_image`
-//! for real now too, via a new `images_manager`/`names` pair of fields
-//! on `ProcessCtx`.
-//!
-//! [`ImagesManager::serialize`] is now real too -- writing every
-//! embedded image's bytes into a `part name -> bytes` map, exactly the
-//! shape [`super::container::DocxWriter::parts`] (this crate's `DOCX`
-//! equivalent) already has, contrary to this method's own earlier doc
-//! history flagging "needs write-time package access" as a blocker;
-//! no new capability was actually needed. Bytes are re-read straight
-//! from `self.oeb.container` at serialize time rather than cached, the
+//! for real too, via an `images_manager`/`names` pair of fields on
+//! `ProcessCtx`. [`ImagesManager::serialize`] writes every embedded
+//! image's bytes into a `part name -> bytes` map, exactly the shape
+//! [`super::container::DocxWriter::parts`] (this crate's `DOCX`
+//! equivalent) already has -- bytes are re-read straight from
+//! `self.oeb.container` at serialize time rather than cached, the
 //! same "don't hold every embedded image in memory for the whole
 //! conversion" property Python's lazy `partial(self.get_data, ...)`
 //! callback achieves differently.
 //!
+//! [`ImagesManager::create_cover_markup`]/[`write_cover_block`] are
+//! now ported too -- the LAST piece of this file. Unlike
+//! `create_image_markup`, a cover has no floating/margin decision at
+//! all (always centered, always anchored, always full-page-relative);
+//! its only real logic is the aspect-ratio-preserving width/height
+//! rescale. `write_cover_block` is a free function, not a method --
+//! Python's own version reads nothing from `self` except the
+//! namespace, which every caller here already has as `&DocxNamespace`
+//! -- and needed no new `Element` primitive (`insert`-at-front and
+//! `find_descendant_mut`, both already real since `links.py`'s
+//! `LinksManager::serialize_toc`, issue #132). The actual cover-image
+//! RESOLUTION (`oeb.metadata.cover` lookup, `Convert.__call__`'s job
+//! in Python) lives in `from_html::convert`, not here -- see that
+//! function's own doc comment.
+//!
 //! **Not ported, each for a real reason, not oversight**:
 //! - SVG-original tracking (Python's `SVGRasterizer.svg_originals`,
-//!   populated when `save_svg_originals=True`) -- the FIELD is now
-//!   real (`ImagesManager::svg_originals`), but nothing populates it
-//!   yet, since that happens during `Convert.__call__`'s SVG
-//!   rasterization pass, itself unported. This crate's
+//!   populated when `save_svg_originals=True`) -- the FIELD is real
+//!   (`ImagesManager::svg_originals`), but nothing populates it yet,
+//!   since that happens during `Convert.__call__`'s SVG rasterization
+//!   pass, itself unported. This crate's
 //!   [`crate::oeb::transforms::rasterize::SvgRasterizer`] is a real,
 //!   already-ported port of the SAME Python class, but only of its
 //!   rasterization-cache half (issue #162, for a different consumer);
 //!   the `svg_originals` bookkeeping this pass needs isn't part of
 //!   that port and would need adding when the rasterization pass
 //!   itself is ported.
-//! - `create_cover_markup`/`write_cover_block` -- need the cover-image
-//!   resolution flow from `Convert.__call__` (not ported, and not
-//!   separable from it the way `serialize` was -- there is no
-//!   `self.cover_img`-equivalent lookup anywhere yet); the
-//!   `Element::insert`-at-front capability they also need is no
-//!   longer a gap ([`super::xml::Element`] gained it for `links.py`'s
-//!   `LinksManager::serialize_toc`, issue #132).
-//! - `ImagesManager::serialize`'s own real caller -- merging its
-//!   output map into [`super::container::DocxWriter::parts`] -- is
-//!   `Convert.write`'s job (not ported); `DocxWriter.parts` today is
-//!   only ever populated directly by tests, confirmed by grepping
-//!   every call site before scoping this file's own `serialize`.
 
 use std::collections::HashSet;
 
@@ -713,6 +710,107 @@ impl<'a> ImagesManager<'a> {
             }
         }
     }
+
+    /// Port of `ImagesManager.create_cover_markup`. Unlike
+    /// [`Self::create_image_markup`], the caller already has a
+    /// resolved `img` in hand (`Convert.__call__`'s own cover-image
+    /// lookup, not this file's job) and passes the target size
+    /// directly -- no `Style`/floating-position decision needed, a
+    /// cover is always centered and always anchored. `width`/`height`
+    /// are in points, matching `page_size(opts)`'s own unit.
+    pub fn create_cover_markup(
+        &mut self,
+        names: &DocxNamespace,
+        img: &Image,
+        preserve_aspect_ratio: bool,
+        mut width: f64,
+        mut height: f64,
+    ) -> Element {
+        self.count += 1;
+        if preserve_aspect_ratio {
+            if img.width >= img.height {
+                let ar = img.height as f64 / img.width as f64;
+                height = ar * width;
+            } else {
+                let ar = img.width as f64 / img.height as f64;
+                width = ar * height;
+            }
+        }
+        let width = pt_to_emu(width);
+        let height = pt_to_emu(height);
+
+        let mut drawing = Element::new("w:drawing");
+        let anchor = drawing.append(
+            Element::new("wp:anchor")
+                .attr("distL", "0")
+                .attr("distR", "0")
+                .attr("distT", "0")
+                .attr("distB", "0")
+                .attr("simplePos", "0")
+                .attr("relativeHeight", "1")
+                .attr("behindDoc", "0")
+                .attr("locked", "0")
+                .attr("layoutInCell", "1")
+                .attr("allowOverlap", "1"),
+        );
+        anchor.append(Element::new("wp:simplePos").attr("x", "0").attr("y", "0"));
+        anchor.append(
+            Element::new("wp:positionH")
+                .attr("relativeFrom", "page")
+                .with(Element::new("wp:align").with_text("center")),
+        );
+        anchor.append(
+            Element::new("wp:positionV")
+                .attr("relativeFrom", "page")
+                .with(Element::new("wp:align").with_text("center")),
+        );
+        anchor.append(
+            Element::new("wp:extent")
+                .attr("cx", width.to_string())
+                .attr("cy", height.to_string()),
+        );
+        anchor.append(
+            Element::new("wp:effectExtent")
+                .attr("l", "0")
+                .attr("r", "0")
+                .attr("t", "0")
+                .attr("b", "0"),
+        );
+        anchor.append(Element::new("wp:wrapTopAndBottom"));
+        create_docx_image_markup(
+            names,
+            anchor,
+            self.count,
+            "cover.jpg",
+            "Cover",
+            &img.rid,
+            width,
+            height,
+            None,
+        );
+        drawing
+    }
+}
+
+/// Port of `ImagesManager.write_cover_block`. A free function, not a
+/// method -- Python's own version doesn't read `self` for anything
+/// besides `self.document_relationships.namespace`, which this port's
+/// callers already have as `names: &DocxNamespace` directly. `body`'s
+/// first `w:pageBreakBefore` (Python's `body[0].xpath(...)`, an
+/// absolute xpath that only happens to match the same element as a
+/// plain descendant search here because nothing else in the body
+/// carries that tag -- the same reasoning
+/// [`super::links::LinksManager::serialize_toc`] already established
+/// for the identical xpath idiom) gets flipped on, forcing a page
+/// break before whatever was previously first so the newly-inserted
+/// cover paragraph doesn't share a page with it.
+pub fn write_cover_block(body: &mut Element, cover_image: Element) {
+    if let Some(pbb) = body.find_descendant_mut("w:pageBreakBefore") {
+        pbb.set("w:val", "on");
+    }
+    let mut p = Element::new("w:p");
+    p.append(Element::new("w:r")).append(cover_image);
+    body.insert(0, p);
 }
 
 #[cfg(test)]
@@ -1215,5 +1313,111 @@ mod tests {
         let mut images_map = std::collections::BTreeMap::new();
         mgr.serialize(&mut images_map);
         assert!(images_map.is_empty());
+    }
+
+    fn cover_image(rid: &str, width: i64, height: i64) -> Image {
+        Image {
+            rid: rid.to_string(),
+            fname: "cover.jpg".to_string(),
+            width,
+            height,
+            fmt: "jpg".to_string(),
+            href: "cover.jpg".to_string(),
+        }
+    }
+
+    #[test]
+    fn create_cover_markup_without_aspect_ratio_uses_the_given_size_verbatim() {
+        let oeb = Builder::new().build();
+        let mut mgr = images_manager(&oeb);
+        let img = cover_image("rId9", 400, 300);
+        let drawing = mgr.create_cover_markup(&ns(), &img, false, 100.0, 200.0);
+        let anchor = drawing.children_named("wp:anchor").next().unwrap();
+        let extent = anchor.children_named("wp:extent").next().unwrap();
+        assert_eq!(extent.get("cx"), Some(&pt_to_emu(100.0).to_string()[..]));
+        assert_eq!(extent.get("cy"), Some(&pt_to_emu(200.0).to_string()[..]));
+        let doc_pr = anchor
+            .children_named("wp:docPr")
+            .next()
+            .expect("wp:docPr lives directly under wp:anchor, via create_docx_image_markup");
+        assert_eq!(doc_pr.get("name"), Some("cover.jpg"));
+        assert_eq!(doc_pr.get("descr"), Some("Cover"));
+    }
+
+    #[test]
+    fn create_cover_markup_preserves_aspect_ratio_for_a_wide_image() {
+        let oeb = Builder::new().build();
+        let mut mgr = images_manager(&oeb);
+        // width >= height -> height is rescaled to match the image's
+        // own aspect ratio at the requested width.
+        let img = cover_image("rId9", 200, 100);
+        let drawing = mgr.create_cover_markup(&ns(), &img, true, 100.0, 999.0);
+        let extent = drawing
+            .children_named("wp:anchor")
+            .next()
+            .unwrap()
+            .children_named("wp:extent")
+            .next()
+            .unwrap();
+        assert_eq!(extent.get("cx"), Some(&pt_to_emu(100.0).to_string()[..]));
+        assert_eq!(extent.get("cy"), Some(&pt_to_emu(50.0).to_string()[..]));
+    }
+
+    #[test]
+    fn create_cover_markup_preserves_aspect_ratio_for_a_tall_image() {
+        let oeb = Builder::new().build();
+        let mut mgr = images_manager(&oeb);
+        // height > width -> width is rescaled to match the image's
+        // own aspect ratio at the requested height.
+        let img = cover_image("rId9", 100, 200);
+        let drawing = mgr.create_cover_markup(&ns(), &img, true, 999.0, 100.0);
+        let extent = drawing
+            .children_named("wp:anchor")
+            .next()
+            .unwrap()
+            .children_named("wp:extent")
+            .next()
+            .unwrap();
+        assert_eq!(extent.get("cx"), Some(&pt_to_emu(50.0).to_string()[..]));
+        assert_eq!(extent.get("cy"), Some(&pt_to_emu(100.0).to_string()[..]));
+    }
+
+    #[test]
+    fn write_cover_block_prepends_a_paragraph_and_flips_the_page_break() {
+        let mut body = Element::new("w:body");
+        body.append(Element::new("w:p").with(
+            Element::new("w:pPr").with(Element::new("w:pageBreakBefore").attr("w:val", "off")),
+        ));
+        let cover_drawing = Element::new("w:drawing").attr("marker", "cover");
+        write_cover_block(&mut body, cover_drawing);
+
+        let ps: Vec<_> = body.children_named("w:p").collect();
+        assert_eq!(
+            ps.len(),
+            2,
+            "the cover paragraph was prepended, not replacing anything"
+        );
+        let cover_p = &ps[0];
+        let drawing = cover_p
+            .children_named("w:r")
+            .next()
+            .unwrap()
+            .children_named("w:drawing")
+            .next()
+            .unwrap();
+        assert_eq!(drawing.get("marker"), Some("cover"));
+
+        let pbb = ps[1]
+            .children_named("w:pPr")
+            .next()
+            .unwrap()
+            .children_named("w:pageBreakBefore")
+            .next()
+            .unwrap();
+        assert_eq!(
+            pbb.get("w:val"),
+            Some("on"),
+            "the formerly-first paragraph's page break should now be forced on"
+        );
     }
 }
