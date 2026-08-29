@@ -767,7 +767,7 @@ either -- this pass wasn't exhaustive.
 - [x] check_encoding.py
 - [x] colors.py
 - [x] combine_borders.py
-- [ ] configure_txt.py
+- [x] configure_txt.py
 - [x] convert_to_tags.py
 - [x] copy.py
 - [x] default_encoding.py
