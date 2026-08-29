@@ -56,6 +56,7 @@ use thiserror::Error;
 
 use crate::cache::Cache;
 
+pub mod bibtex;
 pub mod csv_xml;
 pub mod utils;
 
