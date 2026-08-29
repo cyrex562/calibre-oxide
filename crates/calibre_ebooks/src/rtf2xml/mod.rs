@@ -139,23 +139,25 @@
 //! - [`inline`]: wrap runs of character-formatted text (bold,
 //!   italics, font-color, ...) in `<inline>` tags, tracking separate
 //!   waiting-group state for list text vs. body text.
-//! - [`convert_to_tags`]: the pipeline's final pass -- converts the
-//!   intermediate format's own `mi<tg<...` structural lines into real
-//!   XML, dropping every other line shape.
+//! - [`convert_to_tags`]: the pipeline's final content-transform pass
+//!   -- converts the intermediate format's own `mi<tg<...` structural
+//!   lines into real XML, dropping every other line shape.
+//! - [`output`]: decides where the finished XML goes (a derived or
+//!   explicit file path, or stdout) -- genuinely about file I/O
+//!   rather than a content transform, unlike every other module here.
 //!
-//! Two more follow-up issues cover the rest of the ~35 passes
-//! (the remaining lists/grouping/tag-conversion passes, and the
-//! `ParseRtf.py` orchestrator itself), built on top of the shapes
-//! established here and in the foundation below.
+//! One more follow-up issue covers the rest of the ~35 passes (the
+//! `ParseRtf.py` orchestrator itself, and CLI options), built on top
+//! of the shapes established here and in the foundation below.
 //!
 //! # Not here
 //!
 //! Everything else in `old_src/src/calibre/ebooks/rtf2xml/`:
-//! `ParseRtf.py` and the remaining later-stage transformation passes
-//! (`output`, and the rest).
-//! Those are tracked by this crate's follow-up rtf2xml issues, built on
-//! top of the shapes established here -- most importantly
-//! [`process_tokens`]'s intermediate format.
+//! `ParseRtf.py` (the orchestrator tying every pass above into one
+//! pipeline) and the CLI-options file(s) around it. Tracked by this
+//! crate's last rtf2xml follow-up issue, built on top of the shapes
+//! established here -- most importantly [`process_tokens`]'s
+//! intermediate format.
 
 pub mod add_brackets;
 pub mod body_styles;
@@ -187,6 +189,7 @@ pub mod list_numbers;
 pub mod list_table;
 pub mod make_lists;
 pub mod old_rtf;
+pub mod output;
 pub mod override_table;
 pub mod paragraph_def;
 pub mod paragraphs;
