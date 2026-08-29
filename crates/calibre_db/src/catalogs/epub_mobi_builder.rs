@@ -67,6 +67,16 @@
 //!   function would always immediately return nothing; porting it would
 //!   mean porting genuinely dead code, so it's skipped the same way
 //!   `fetch_bookmarks` itself was, not stubbed.
+//! - Cluster D (NCX navigation, `catalogs/ncx.rs`) and most of cluster E
+//!   (OPF + thumbnails, `catalogs/opf.rs`/`catalogs/output_profiles.rs`/
+//!   `catalogs/thumbnails.rs`) are also complete -- see those files' own
+//!   module docs. [`create_catalog_directory_structure`]/
+//!   [`copy_catalog_resources`] here close out the rest of cluster E.
+//!   Only `generate_masthead_image` (needs font-rasterization
+//!   infrastructure this crate doesn't have -- see `thumbnails.rs`'s
+//!   doc) is deliberately unported. Only cluster F (top-level
+//!   orchestration: the `CatalogBuilder` struct itself, `build_sources`,
+//!   plus `epub_mobi.py`) remains.
 //!
 //! # Disclosed simplifications
 //!
@@ -2581,6 +2591,41 @@ pub fn format_ncx_text(
     generate_short_description(Some(trimmed), dest, author_clip, description_clip)
 }
 
+/// Port of `create_catalog_directory_structure`: create
+/// `catalog_path`/`content`/`images`. `std::fs::create_dir_all` is
+/// idempotent and creates parents as needed, so this doesn't need
+/// upstream's explicit `if not os.path.isdir(...)` guards -- the
+/// observable end state (the three directories exist) is identical.
+pub fn create_catalog_directory_structure(catalog_path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(catalog_path)?;
+    std::fs::create_dir_all(catalog_path.join("content"))?;
+    std::fs::create_dir_all(catalog_path.join("images"))?;
+    Ok(())
+}
+
+/// Port of `copy_catalog_resources`: copy the static `DefaultCover.jpg`/
+/// `stylesheet.css` (and, for Kindle/MOBI, `mastheadImage.gif`) resource
+/// files into a freshly-created catalog directory structure.
+///
+/// `resources_dir` replaces upstream's `P('catalog')` (a calibre
+/// resource-directory lookup) -- this workspace has no established
+/// resource-bundling convention yet (see `thumbnails.rs`'s own doc for
+/// the same gap), so the caller supplies wherever these three files
+/// actually live (e.g. `old_src/resources/catalog` in this repo).
+/// Doesn't attempt `generate_masthead_image` (not ported -- see
+/// `thumbnails.rs`'s doc) -- the copied `mastheadImage.gif` is used
+/// as-is rather than being regenerated with the catalog's own title
+/// text baked in.
+pub fn copy_catalog_resources(resources_dir: &std::path::Path, catalog_path: &std::path::Path, generate_for_kindle_mobi: bool) -> std::io::Result<()> {
+    create_catalog_directory_structure(catalog_path)?;
+    std::fs::copy(resources_dir.join("DefaultCover.jpg"), catalog_path.join("DefaultCover.jpg"))?;
+    std::fs::copy(resources_dir.join("stylesheet.css"), catalog_path.join("content").join("stylesheet.css"))?;
+    if generate_for_kindle_mobi {
+        std::fs::copy(resources_dir.join("mastheadImage.gif"), catalog_path.join("images").join("mastheadImage.gif"))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3891,5 +3936,54 @@ mod tests {
             format_ncx_text(Some("  hello world  "), Some(ShortDescriptionDest::Title), 100, 100),
             Some("hello world".to_string())
         );
+    }
+
+    // --- create_catalog_directory_structure / copy_catalog_resources ---
+
+    #[test]
+    fn create_catalog_directory_structure_creates_content_and_images() {
+        let dir = tempdir().unwrap();
+        let catalog_path = dir.path().join("catalog");
+        create_catalog_directory_structure(&catalog_path).unwrap();
+        assert!(catalog_path.join("content").is_dir());
+        assert!(catalog_path.join("images").is_dir());
+    }
+
+    #[test]
+    fn create_catalog_directory_structure_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let catalog_path = dir.path().join("catalog");
+        create_catalog_directory_structure(&catalog_path).unwrap();
+        // Should not error when the directories already exist.
+        create_catalog_directory_structure(&catalog_path).unwrap();
+        assert!(catalog_path.join("content").is_dir());
+    }
+
+    #[test]
+    fn copy_catalog_resources_copies_the_default_cover_and_stylesheet() {
+        let resources_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../old_src/resources/catalog");
+        if !resources_dir.join("DefaultCover.jpg").exists() {
+            // Skip if the reference resource tree isn't checked out in
+            // this environment.
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let catalog_path = dir.path().join("catalog");
+        copy_catalog_resources(&resources_dir, &catalog_path, false).unwrap();
+        assert!(catalog_path.join("DefaultCover.jpg").exists());
+        assert!(catalog_path.join("content/stylesheet.css").exists());
+        assert!(!catalog_path.join("images/mastheadImage.gif").exists());
+    }
+
+    #[test]
+    fn copy_catalog_resources_copies_the_masthead_for_kindle_mobi() {
+        let resources_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../old_src/resources/catalog");
+        if !resources_dir.join("mastheadImage.gif").exists() {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let catalog_path = dir.path().join("catalog");
+        copy_catalog_resources(&resources_dir, &catalog_path, true).unwrap();
+        assert!(catalog_path.join("images/mastheadImage.gif").exists());
     }
 }
