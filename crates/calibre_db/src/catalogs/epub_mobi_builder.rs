@@ -1131,6 +1131,302 @@ pub fn establish_equivalencies(items: &[String]) -> Vec<String> {
         .collect()
 }
 
+// ===================================================================
+// Cluster C: HTML section generators
+// ===================================================================
+//
+// Shared plumbing for every `generate_html_by_*` function: an
+// `empty_html_document` skeleton (`generate_html_empty_header`), a
+// prefix-glyph snippet builder (`insert_prefix`), and a narrow
+// `{name}`-token template substitution (`safe_format`) -- the same
+// grammar `calibre_ebooks::oeb::transforms::jacket`'s own private
+// `safe_format` already implements for a different issue, reimplemented
+// here (rather than made `pub` and shared) since it's a handful of lines
+// and this crate's established convention favors small per-file
+// duplicates over forcing a shared abstraction across crates for
+// something this size. Every default section template string below is
+// copied verbatim from `old_src/resources/catalog/section_list_templates
+// .conf` (`load_section_templates`'s real source) -- upstream lets users
+// override these with local file copies; this crate always uses the
+// shipped defaults (same "CLI/GUI dual-typing plumbing dropped"
+// precedent as everywhere else in this file).
+
+const NBSP: &str = "\u{a0}";
+
+pub const BY_AUTHORS_NORMAL_TITLE_TEMPLATE: &str = "{title} {pubyear_parens}";
+pub const BY_AUTHORS_SERIES_TITLE_TEMPLATE: &str = "[{series_index}] {title} {pubyear_parens}";
+
+fn set_attr(dom: &mut calibre_ebooks::dom::Dom, id: calibre_ebooks::dom::NodeId, name: &str, value: impl Into<String>) {
+    dom.node_mut(id).attrs.insert(name.to_string(), value.into());
+}
+
+fn append_text(dom: &mut calibre_ebooks::dom::Dom, parent: calibre_ebooks::dom::NodeId, text: &str) {
+    let t = dom.new_text(text);
+    dom.append_child(parent, t);
+}
+
+/// Port of `generate_html_empty_header`: a boilerplate XHTML skeleton
+/// with `title` as the document title. The DOCTYPE line is prepended as
+/// a literal string rather than round-tripped through
+/// [`calibre_ebooks::dom::Dom`]'s parser/serializer -- `Dom`'s `NodeKind`
+/// has no `Doctype` variant (it's built for HTML5-tag-soup element
+/// trees, not preserving arbitrary XML prolog declarations), so a
+/// parse-then-serialize round trip would silently drop it.
+fn empty_html_document(title: &str) -> (calibre_ebooks::dom::Dom, calibre_ebooks::dom::NodeId, calibre_ebooks::dom::NodeId) {
+    let mut dom = calibre_ebooks::dom::Dom::empty();
+    let root = dom.root;
+    let html = dom.new_element("html");
+    set_attr(&mut dom, html, "xmlns", "http://www.w3.org/1999/xhtml");
+    set_attr(&mut dom, html, "xmlns:calibre", "http://calibre.kovidgoyal.net/2009/metadata");
+    dom.append_child(root, html);
+
+    let head = dom.new_element("head");
+    dom.append_child(html, head);
+    let meta = dom.new_element("meta");
+    set_attr(&mut dom, meta, "http-equiv", "Content-Type");
+    set_attr(&mut dom, meta, "content", "text/html; charset=UTF-8");
+    dom.append_child(head, meta);
+    let link = dom.new_element("link");
+    set_attr(&mut dom, link, "rel", "stylesheet");
+    set_attr(&mut dom, link, "type", "text/css");
+    set_attr(&mut dom, link, "href", "stylesheet.css");
+    set_attr(&mut dom, link, "media", "screen");
+    dom.append_child(head, link);
+    let title_tag = dom.new_element("title");
+    append_text(&mut dom, title_tag, title);
+    dom.append_child(head, title_tag);
+
+    let body = dom.new_element("body");
+    dom.append_child(html, body);
+
+    (dom, root, body)
+}
+
+/// Serializes an [`empty_html_document`]-built tree with the DOCTYPE
+/// line upstream's literal header string carries, prepended back on.
+fn serialize_html_document(dom: &calibre_ebooks::dom::Dom, root: calibre_ebooks::dom::NodeId) -> String {
+    format!(
+        "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.1//EN\" \"http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd\">\n{}",
+        dom.serialize(root)
+    )
+}
+
+/// Port of `insert_prefix`.
+fn insert_prefix(dom: &mut calibre_ebooks::dom::Dom, parent: calibre_ebooks::dom::NodeId, fmt: &str, prefix_char: Option<&str>) {
+    let tag = dom.new_element(if fmt == "mobi" { "code" } else { "span" });
+    if fmt != "mobi" {
+        set_attr(dom, tag, "class", "prefix");
+    }
+    let content = prefix_char.filter(|s| !s.is_empty()).unwrap_or(NBSP);
+    append_text(dom, tag, content);
+    dom.append_child(parent, tag);
+}
+
+fn template_token_re() -> &'static Regex {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\{([A-Za-z_][A-Za-z0-9_]*)\}").unwrap())
+}
+
+/// Port of `Formatter.safe_format`, narrowed to the bare-`{name}` grammar
+/// every section template in `section_list_templates.conf` actually
+/// uses (no `{name.attr}`/function-call/conditional syntax the real
+/// `TemplateFormatter` supports for computed-column templates elsewhere
+/// in calibre) -- same narrowing `jacket.rs`'s own `safe_format` already
+/// applies for a different template set, for the same reason (see this
+/// section's own doc).
+fn safe_format(template: &str, args: &FormatArgs) -> String {
+    template_token_re()
+        .replace_all(template, |caps: &regex::Captures| match &caps[1] {
+            "title" => args.title.clone(),
+            "series" => args.series.clone().unwrap_or_default(),
+            "series_index" => args.series_index.clone(),
+            "rating" => args.rating.clone(),
+            "rating_parens" => args.rating_parens.clone(),
+            "pubyear" => args.pubyear.clone(),
+            "pubyear_parens" => args.pubyear_parens.clone(),
+            _ => String::new(),
+        })
+        .into_owned()
+}
+
+/// Port of `letter_or_symbol`'s actual return value (as opposed to
+/// [`letter_or_symbol`]'s boolean-only test, used by the two callers
+/// that only need the test): the input string if it's alphabetic
+/// (ASCII-ized), or [`SYMBOLS`] if not.
+pub fn letter_or_symbol_str(text: &str) -> String {
+    if letter_or_symbol(text) {
+        text.to_string()
+    } else {
+        SYMBOLS.to_string()
+    }
+}
+
+/// Port of `generate_html_by_author`: renders `content/ByAlphaAuthor.html`'s
+/// body. Returns the finished HTML document string -- writing it to
+/// `content_dir` and tracking it in `html_filelist_1` is the caller's job
+/// (cluster F, not yet ported), matching this crate's "pure function,
+/// caller does I/O" convention used throughout this module.
+///
+/// `rating_full_char`/`rating_empty_char` thread through to
+/// [`generate_format_args`] (itself threading to
+/// [`generate_rating_string`]) -- deferred device-profile parameters
+/// that don't actually affect this particular template's output (neither
+/// `BY_AUTHORS_NORMAL_TITLE_TEMPLATE` nor `BY_AUTHORS_SERIES_TITLE_TEMPLATE`
+/// reference `{rating}`/`{rating_parens}`), but are still required
+/// arguments since `generate_format_args` computes them unconditionally.
+pub fn generate_html_by_author(
+    books_by_author: &[Value],
+    fmt: &str,
+    generate_for_kindle_mobi: bool,
+    generate_series: bool,
+    generate_descriptions: bool,
+    rating_full_char: &str,
+    rating_empty_char: &str,
+) -> String {
+    let friendly_name = "Authors";
+    let (mut dom, root, body) = empty_html_document(friendly_name);
+
+    let div_tag = dom.new_element("div");
+    let mut div_opening_tag: Option<calibre_ebooks::dom::NodeId> = None;
+    let mut div_running_tag: Option<calibre_ebooks::dom::NodeId> = None;
+
+    let mut author_count = 0usize;
+    let mut current_author = String::new();
+    let mut current_letter = String::new();
+    let mut current_series: Option<String> = None;
+
+    let author_sorts: Vec<String> = books_by_author.iter().map(|b| book_str(b, "author_sort").to_string()).collect();
+    let sort_equivalents = establish_equivalencies(&author_sorts);
+
+    for (idx, book) in books_by_author.iter().enumerate() {
+        let letter_candidate = letter_or_symbol_str(&sort_equivalents[idx]);
+        if letter_candidate != current_letter {
+            if let Some(opening) = div_opening_tag.take() {
+                dom.append_child(div_tag, opening);
+            }
+            if let Some(running) = div_running_tag.take() {
+                dom.append_child(div_tag, running);
+            }
+            author_count = 0;
+
+            let opening = dom.new_element("div");
+            if !dom.children(div_tag).is_empty() {
+                set_attr(&mut dom, opening, "class", "initial_letter");
+            }
+
+            let p_index = dom.new_element("p");
+            set_attr(&mut dom, p_index, "class", "author_title_letter_index");
+            let a_tag = dom.new_element("a");
+            current_letter = letter_candidate;
+            if current_letter == SYMBOLS {
+                set_attr(&mut dom, a_tag, "id", format!("{SYMBOLS}_authors"));
+                dom.append_child(p_index, a_tag);
+                append_text(&mut dom, p_index, SYMBOLS);
+            } else {
+                set_attr(&mut dom, a_tag, "id", format!("{}_authors", generate_unicode_name(&current_letter)));
+                dom.append_child(p_index, a_tag);
+                append_text(&mut dom, p_index, &sort_equivalents[idx]);
+            }
+            dom.append_child(opening, p_index);
+            div_opening_tag = Some(opening);
+        }
+
+        let author = book_str(book, "author").to_string();
+        if author != current_author {
+            current_author = author.clone();
+            author_count += 1;
+            if author_count >= 2 {
+                if let Some(opening) = div_opening_tag.take() {
+                    dom.append_child(div_tag, opening);
+                }
+                if author_count > 2 {
+                    if let Some(running) = div_running_tag.take() {
+                        dom.append_child(div_tag, running);
+                    }
+                }
+                let running = dom.new_element("div");
+                set_attr(&mut dom, running, "class", "author_logical_group");
+                div_running_tag = Some(running);
+            }
+
+            current_series = None;
+            let p_author = dom.new_element("p");
+            set_attr(&mut dom, p_author, "class", "author_index");
+            let a_tag = dom.new_element("a");
+            set_attr(&mut dom, a_tag, "id", generate_author_anchor(&current_author));
+            append_text(&mut dom, a_tag, &current_author);
+            dom.append_child(p_author, a_tag);
+            let target = if author_count == 1 { div_opening_tag.unwrap() } else { div_running_tag.unwrap() };
+            dom.append_child(target, p_author);
+        }
+
+        match book.get("series").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            Some(series) if Some(series.to_string()) != current_series => {
+                current_series = Some(series.to_string());
+                let p_series = dom.new_element("p");
+                set_attr(&mut dom, p_series, "class", if fmt == "mobi" { "series_mobi" } else { "series" });
+                if generate_series {
+                    let a_tag = dom.new_element("a");
+                    set_attr(&mut dom, a_tag, "href", format!("BySeries.html#{}", generate_series_anchor(series)));
+                    append_text(&mut dom, a_tag, series);
+                    dom.append_child(p_series, a_tag);
+                } else {
+                    append_text(&mut dom, p_series, series);
+                }
+                if author_count == 1 {
+                    dom.append_child(div_opening_tag.unwrap(), p_series);
+                } else if let Some(running) = div_running_tag {
+                    dom.append_child(running, p_series);
+                }
+            }
+            None => current_series = None,
+            _ => {}
+        }
+
+        let p_book = dom.new_element("p");
+        set_attr(&mut dom, p_book, "class", "line_item");
+        insert_prefix(&mut dom, p_book, fmt, book.get("prefix").and_then(|v| v.as_str()));
+
+        let span_tag = dom.new_element("span");
+        set_attr(&mut dom, span_tag, "class", "entry");
+        let a_tag = dom.new_element("a");
+        if generate_descriptions {
+            let book_id = book.get("id").and_then(|v| v.as_i64()).unwrap_or_default();
+            set_attr(&mut dom, a_tag, "href", format!("book_{book_id}.html"));
+        }
+        let args = generate_format_args(book, rating_full_char, rating_empty_char);
+        let template = if current_series.is_some() { BY_AUTHORS_SERIES_TITLE_TEMPLATE } else { BY_AUTHORS_NORMAL_TITLE_TEMPLATE };
+        append_text(&mut dom, a_tag, &safe_format(template, &args));
+        dom.append_child(span_tag, a_tag);
+        dom.append_child(p_book, span_tag);
+
+        let target = if author_count == 1 { div_opening_tag.unwrap() } else { div_running_tag.unwrap() };
+        dom.append_child(target, p_book);
+    }
+
+    let p_title = dom.new_element("p");
+    set_attr(&mut dom, p_title, "class", "title");
+    let a_section_start = dom.new_element("a");
+    set_attr(&mut dom, a_section_start, "id", "section_start");
+    dom.append_child(p_title, a_section_start);
+    if !generate_for_kindle_mobi {
+        let a_tag = dom.new_element("a");
+        set_attr(&mut dom, a_tag, "id", friendly_name.to_lowercase().replace(' ', ""));
+        dom.append_child(p_title, a_tag);
+        append_text(&mut dom, p_title, friendly_name);
+    }
+    dom.insert_child(body, 0, p_title);
+
+    if let Some(opening) = div_opening_tag.take() {
+        dom.append_child(div_tag, opening);
+    } else if let Some(running) = div_running_tag.take() {
+        dom.append_child(div_tag, running);
+    }
+    dom.append_child(body, div_tag);
+
+    serialize_html_document(&dom, root)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1805,5 +2101,121 @@ mod tests {
     fn establish_equivalencies_applies_the_a_o_u_umlaut_exceptions() {
         let items = vec!["Äpple".to_string(), "Öl".to_string(), "Über".to_string()];
         assert_eq!(establish_equivalencies(&items), vec!["A".to_string(), "O".to_string(), "U".to_string()]);
+    }
+
+    // --- generate_html_by_author ---
+
+    fn author_html_book(
+        author: &str,
+        author_sort: &str,
+        title: &str,
+        title_sort: &str,
+        series: Option<&str>,
+        prefix: Option<&str>,
+    ) -> Value {
+        book(&[
+            ("id", Value::from(1)),
+            ("author", Value::String(author.to_string())),
+            ("author_sort", Value::String(author_sort.to_string())),
+            ("title", Value::String(title.to_string())),
+            ("title_sort", Value::String(title_sort.to_string())),
+            ("series", series.map(Value::from).unwrap_or(Value::Null)),
+            ("series_index", Value::from(1.0)),
+            ("prefix", prefix.map(Value::from).unwrap_or(Value::Null)),
+        ])
+    }
+
+    #[test]
+    fn generate_html_by_author_produces_a_well_formed_document() {
+        let books = vec![author_html_book("Alice", "Alice", "Book One", "Book One", None, None)];
+        let html = generate_html_by_author(&books, "epub", false, true, false, "*", "-");
+        assert!(html.starts_with("<!DOCTYPE html"), "{html}");
+        assert!(html.contains("<title>Authors</title>"), "{html}");
+        assert!(html.contains("class=\"author_index\""), "{html}");
+        assert!(html.contains(">Alice<"), "{html}");
+        assert!(html.contains("class=\"line_item\""), "{html}");
+        assert!(html.contains("Book One"), "{html}");
+    }
+
+    #[test]
+    fn generate_html_by_author_second_author_gets_a_logical_group_div() {
+        let books = vec![
+            author_html_book("Alice", "Alice", "A Book", "A Book", None, None),
+            author_html_book("Adam", "Adam", "B Book", "B Book", None, None),
+        ];
+        let html = generate_html_by_author(&books, "epub", false, true, false, "*", "-");
+        assert!(html.contains("class=\"author_logical_group\""), "{html}");
+        // First letter section (the very first in the whole document)
+        // never gets the initial_letter class.
+        assert!(!html.contains("class=\"initial_letter\""), "{html}");
+    }
+
+    #[test]
+    fn generate_html_by_author_new_letter_gets_initial_letter_class() {
+        let books = vec![
+            author_html_book("Alice", "Alice", "A Book", "A Book", None, None),
+            author_html_book("Zeb", "Zeb", "Z Book", "Z Book", None, None),
+        ];
+        let html = generate_html_by_author(&books, "epub", false, true, false, "*", "-");
+        assert!(html.contains("class=\"initial_letter\""), "{html}");
+        // Different letters means no shared logical-group wrapper.
+        assert!(!html.contains("class=\"author_logical_group\""), "{html}");
+    }
+
+    #[test]
+    fn generate_html_by_author_series_link_uses_the_series_anchor() {
+        let books = vec![author_html_book("Alice", "Alice", "Book One", "Book One", Some("Foundation"), None)];
+        let html = generate_html_by_author(&books, "epub", false, true, false, "*", "-");
+        assert!(html.contains("href=\"BySeries.html#foundation_series\""), "{html}");
+        assert!(html.contains("class=\"series\""), "{html}");
+    }
+
+    #[test]
+    fn generate_html_by_author_series_class_is_series_mobi_for_mobi_format() {
+        let books = vec![author_html_book("Alice", "Alice", "Book One", "Book One", Some("Foundation"), None)];
+        let html = generate_html_by_author(&books, "mobi", false, true, false, "*", "-");
+        assert!(html.contains("class=\"series_mobi\""), "{html}");
+    }
+
+    #[test]
+    fn generate_html_by_author_uses_the_series_title_template_when_in_a_series() {
+        let books = vec![author_html_book("Alice", "Alice", "Book One", "Book One", Some("Foundation"), None)];
+        let html = generate_html_by_author(&books, "epub", false, true, false, "*", "-");
+        // BY_AUTHORS_SERIES_TITLE_TEMPLATE is "[{series_index}] {title} ...".
+        assert!(html.contains("[1] Book One"), "{html}");
+    }
+
+    #[test]
+    fn generate_html_by_author_inserts_the_prefix_glyph() {
+        let books = vec![author_html_book("Alice", "Alice", "Book One", "Book One", None, Some("\u{2713}"))];
+        let html = generate_html_by_author(&books, "epub", false, true, false, "*", "-");
+        assert!(html.contains("class=\"prefix\""), "{html}");
+        assert!(html.contains('\u{2713}'), "{html}");
+    }
+
+    #[test]
+    fn generate_html_by_author_prefix_uses_code_tag_for_mobi() {
+        let books = vec![author_html_book("Alice", "Alice", "Book One", "Book One", None, Some("\u{2713}"))];
+        let html = generate_html_by_author(&books, "mobi", false, true, false, "*", "-");
+        assert!(html.contains("<code>"), "{html}");
+    }
+
+    #[test]
+    fn generate_html_by_author_adds_a_book_link_when_generating_descriptions() {
+        let books = vec![author_html_book("Alice", "Alice", "Book One", "Book One", None, None)];
+        let html = generate_html_by_author(&books, "epub", false, true, true, "*", "-");
+        assert!(html.contains("href=\"book_1.html\""), "{html}");
+    }
+
+    #[test]
+    fn generate_html_by_author_omits_the_section_title_text_for_kindle_mobi() {
+        // `contains(">Authors<")` alone would also match the ever-present
+        // `<title>Authors</title>` document head, so check the
+        // section-heading anchor's id specifically.
+        let books = vec![author_html_book("Alice", "Alice", "Book One", "Book One", None, None)];
+        let with_title = generate_html_by_author(&books, "mobi", false, true, false, "*", "-");
+        let without_title = generate_html_by_author(&books, "mobi", true, true, false, "*", "-");
+        assert!(with_title.contains("id=\"authors\""), "{with_title}");
+        assert!(!without_title.contains("id=\"authors\""), "{without_title}");
     }
 }
