@@ -796,7 +796,7 @@ either -- this pass wasn't exhaustive.
 - [x] override_table.py
 - [x] paragraph_def.py
 - [x] paragraphs.py
-- [ ] ParseRtf.py
+- [x] ParseRtf.py
 - [x] pict.py
 - [x] preamble_div.py
 - [x] preamble_rest.py
