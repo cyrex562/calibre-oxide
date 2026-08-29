@@ -59,6 +59,7 @@ use crate::cache::Cache;
 pub mod bibtex;
 pub mod csv_xml;
 pub mod epub_mobi_builder;
+pub mod ncx;
 pub mod utils;
 
 /// Port of `catalogs/__init__.py`'s `FIELDS` list -- the full set of
