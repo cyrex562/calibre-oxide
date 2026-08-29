@@ -60,6 +60,7 @@ pub mod bibtex;
 pub mod csv_xml;
 pub mod epub_mobi_builder;
 pub mod ncx;
+pub mod opf;
 pub mod output_profiles;
 pub mod utils;
 
