@@ -365,6 +365,22 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+fn sanitize_pat() -> &'static Regex {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)<script|<table|<tr|<td|<th|<style|<iframe").unwrap())
+}
+
+/// Port of `calibre.library.comments.sanitize_comments_html`: round-trip
+/// through `html2text` then back to HTML via Markdown, used for comments
+/// containing tags this module's own DOM-regrouping pass in
+/// [`comments_to_html`] isn't meant to handle (`<script>`, `<table>` and
+/// friends -- block-structured or unsafe markup, not the small inline-tag
+/// vocabulary [`comments_to_html`] regroups around).
+pub fn sanitize_comments_html(html: &str) -> String {
+    let text = calibre_utils::html2text::html2text(html);
+    render_markdown(&text)
+}
+
 /// Port of `calibre.library.comments.comments_to_html`.
 pub fn comments_to_html(comments: &str) -> String {
     if comments.is_empty() {
@@ -381,6 +397,9 @@ pub fn comments_to_html(comments: &str) -> String {
             .map(|x| format!("<p class=\"description\">{}</p>", x.replace('\n', "<br />")))
             .collect::<Vec<_>>()
             .join("\n");
+    }
+    if sanitize_pat().is_match(comments) {
+        return sanitize_comments_html(comments);
     }
 
     // A mix of loose text and inline markup: fold "lost" paragraph
@@ -1106,6 +1125,24 @@ mod tests {
         let html = comments_to_html("a <b>bold</b> word");
         assert!(html.starts_with("<p class=\"description\">"), "{html}");
         assert!(html.contains("<b>bold</b>"), "{html}");
+    }
+
+    #[test]
+    fn comments_to_html_routes_table_markup_through_the_sanitize_path() {
+        // Doesn't start with '<' (so it's not the "already HTML,
+        // untouched" case) but contains a <table> -- Python's
+        // sanitize_pat routes this through html2text -> Markdown
+        // instead of the inline-tag DOM-regrouping pass, which isn't
+        // meant to handle block-structured markup like tables.
+        let html = comments_to_html("intro <table><tr><td>cell</td></tr></table>");
+        assert!(!html.contains("<table"), "{html}");
+    }
+
+    #[test]
+    fn sanitize_comments_html_round_trips_through_markdown() {
+        let html = sanitize_comments_html("<p>Hello <b>world</b></p>");
+        assert!(html.contains("Hello"), "{html}");
+        assert!(html.contains("world"), "{html}");
     }
 
     #[test]
