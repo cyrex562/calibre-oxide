@@ -785,7 +785,7 @@ either -- this pass wasn't exhaustive.
 - [x] headings_to_sections.py
 - [x] hex_2_utf8.py
 - [x] info.py
-- [ ] inline.py
+- [x] inline.py
 - [x] line_endings.py
 - [x] list_numbers.py
 - [x] list_table.py
