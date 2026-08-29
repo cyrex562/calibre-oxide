@@ -768,7 +768,7 @@ either -- this pass wasn't exhaustive.
 - [x] colors.py
 - [x] combine_borders.py
 - [ ] configure_txt.py
-- [ ] convert_to_tags.py
+- [x] convert_to_tags.py
 - [x] copy.py
 - [x] default_encoding.py
 - [x] delete_info.py

@@ -139,6 +139,9 @@
 //! - [`inline`]: wrap runs of character-formatted text (bold,
 //!   italics, font-color, ...) in `<inline>` tags, tracking separate
 //!   waiting-group state for list text vs. body text.
+//! - [`convert_to_tags`]: the pipeline's final pass -- converts the
+//!   intermediate format's own `mi<tg<...` structural lines into real
+//!   XML, dropping every other line shape.
 //!
 //! Two more follow-up issues cover the rest of the ~35 passes
 //! (the remaining lists/grouping/tag-conversion passes, and the
@@ -149,7 +152,7 @@
 //!
 //! Everything else in `old_src/src/calibre/ebooks/rtf2xml/`:
 //! `ParseRtf.py` and the remaining later-stage transformation passes
-//! (`convert_to_tags`, `output`, and the rest).
+//! (`output`, and the rest).
 //! Those are tracked by this crate's follow-up rtf2xml issues, built on
 //! top of the shapes established here -- most importantly
 //! [`process_tokens`]'s intermediate format.
@@ -162,6 +165,7 @@ pub mod check_brackets;
 pub mod check_encoding;
 pub mod colors;
 pub mod combine_borders;
+pub mod convert_to_tags;
 pub mod copy;
 pub mod default_encoding;
 pub mod delete_info;
