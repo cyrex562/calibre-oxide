@@ -1060,6 +1060,24 @@ impl Cache {
         Ok(out)
     }
 
+    /// Port of `LibraryDatabase2.all_tags`: every row in the `tags`
+    /// table (not narrowed to tags actually attached to a book, unlike
+    /// most of this crate's tag-reading paths), trimmed, with blanks
+    /// dropped.
+    pub fn all_tags(&self) -> Result<Vec<String>> {
+        let conn = self.backend.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT name FROM tags")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let name = row?.trim().to_string();
+            if !name.is_empty() {
+                out.push(name);
+            }
+        }
+        Ok(out)
+    }
+
     /// `datatype` is one of `bool`/`int`/`float`/`rating` (one-to-one
     /// numeric value table) or `text`/`comments`/`series` (one-to-one
     /// text value table, non-`is_multiple` only -- see the error
@@ -1816,6 +1834,20 @@ mod tests {
         assert_eq!(entry["name"], "My Column");
         assert_eq!(entry["datatype"], "int");
         assert_eq!(entry["is_multiple"], true);
+    }
+
+    #[test]
+    fn all_tags_returns_every_row_trimmed_with_blanks_dropped() {
+        let (_dir, cache) = open_test_cache();
+        let conn = cache.backend.conn.lock().unwrap();
+        for name in ["Fiction", " Non-Fiction ", "  "] {
+            conn.execute("INSERT INTO tags (name) VALUES (?1)", [name]).unwrap();
+        }
+        drop(conn);
+
+        let mut tags = cache.all_tags().unwrap();
+        tags.sort();
+        assert_eq!(tags, vec!["Fiction".to_string(), "Non-Fiction".to_string()]);
     }
 
     // --- filesystem book/format/cover management ---

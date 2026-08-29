@@ -38,13 +38,17 @@
 //!   device-profile registry this crate has no port of), and
 //!   `fetch_bookmarks` is intentionally skipped -- upstream's own
 //!   docstring says it's been turned off since calibre 0.8.70.
-//!   `filter_genre_tags` and `establish_equivalencies` are deferred to
-//!   cluster C (their only real consumers are the genre/alphabetical-
-//!   section HTML generators, not this cluster's per-book data prep) --
-//!   `filter_genre_tags` additionally needs a `Cache::all_tags()`-style
-//!   library-wide distinct-tags query this crate doesn't have yet, and
-//!   `establish_equivalencies` needs ICU `collation_order`, in the same
-//!   "no real ICU collation" gap as the sort-key simplification above.
+//! - `filter_genre_tags` and `establish_equivalencies` -- prerequisites
+//!   for cluster C's genre/alphabetical-section HTML generators, ported
+//!   ahead of that cluster since they're small and self-contained.
+//!   `filter_genre_tags` needed a new [`crate::cache::Cache::all_tags`]
+//!   (a small, genuinely reusable primitive, added alongside this) and is
+//!   narrowed to upstream's `"Tags"` `genre_source_field` case only (a
+//!   custom `#field` genre source needs `Cache::all_custom`-style
+//!   distinct-value querying this crate doesn't have). `establish_
+//!   equivalencies` approximates real ICU `collation_order` with plain
+//!   per-character Unicode uppercasing, the same "no real ICU collation"
+//!   gap as the sort-key simplification below.
 //!   `dump_custom_fields` is a `self.opts.verbose`-gated debug-log dumper
 //!   with no return value and no effect on any generated output --
 //!   omitted entirely (not even a no-op stub), matching this crate's
@@ -1053,6 +1057,80 @@ pub fn generate_format_args(book: &Value, full_char: &str, empty_char: &str) -> 
     }
 }
 
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+fn normalize_tag(tag: &str, max_len: usize) -> String {
+    let massaged: String =
+        calibre_utils::filenames::ascii_text(tag).to_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
+    let normalized = if massaged.chars().any(|c| !is_word_char(c)) {
+        massaged.chars().map(|c| if is_word_char(c) { c.to_string() } else { generate_unicode_name(&c.to_string()) }).collect()
+    } else {
+        massaged
+    };
+    calibre_utils::filenames::limit_component(&normalized, max_len)
+}
+
+/// Port of `filter_genre_tags`, narrowed to upstream's `"Tags"`
+/// `genre_source_field` case (see this module's doc for why a custom
+/// `#field` genre source isn't supported here). Drops upstream's
+/// verbose-only "multiple tags resolving to the same normalized genre"
+/// warning log -- a diagnostic side effect, not part of the returned
+/// dict.
+pub fn filter_genre_tags(
+    db: &Cache,
+    max_len: usize,
+    excluded_tags: &[String],
+    exclude_genre: &str,
+) -> crate::catalogs::Result<indexmap::IndexMap<String, String>> {
+    let mut all_genre_tags = db.all_tags().map_err(CatalogError::Sqlite)?;
+    all_genre_tags.sort();
+
+    let excluded_set: std::collections::HashSet<&str> = excluded_tags.iter().map(|s| s.as_str()).collect();
+    let re = Regex::new(exclude_genre).ok();
+
+    let mut genre_tags_dict = indexmap::IndexMap::new();
+    for tag in &all_genre_tags {
+        if excluded_set.contains(tag.as_str()) {
+            continue;
+        }
+        if re.as_ref().is_some_and(|re| re.is_match(tag)) {
+            continue;
+        }
+        if tag == " " {
+            continue;
+        }
+        genre_tags_dict.insert(tag.clone(), normalize_tag(tag, max_len));
+    }
+    Ok(genre_tags_dict)
+}
+
+/// Port of `establish_equivalencies`'s `key=None` (plain string list)
+/// case -- the only shape `fetch_books_by_author`/`fetch_books_by_title`
+/// actually call it with (`key=sort_field` is unused in the real
+/// pipeline). Approximated via per-item Unicode uppercasing of just the
+/// leading character (with the same `Ä`/`Ö`/`Ü` -> `A`/`O`/`U`
+/// exceptions upstream hardcodes) rather than real ICU
+/// `collation_order`, which this crate has no port of (same "no real
+/// ICU collation" gap as the sort-key simplification in this module's
+/// doc). Real ICU `collation_order` can group multi-character collation
+/// units (e.g. Spanish "ch") under one heading and generally strips
+/// accents more broadly than upstream's narrow three-letter exception
+/// list would suggest; this simplified version does neither -- it's a
+/// per-character approximation, not a locale-correct one.
+pub fn establish_equivalencies(items: &[String]) -> Vec<String> {
+    let exceptions: std::collections::HashMap<char, char> = [('Ä', 'A'), ('Ö', 'O'), ('Ü', 'U')].into_iter().collect();
+    items
+        .iter()
+        .map(|item| {
+            let first = item.chars().next().unwrap_or(' ');
+            let upper_char = first.to_uppercase().next().unwrap_or(first);
+            exceptions.get(&upper_char).copied().unwrap_or(upper_char).to_string()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1682,5 +1760,50 @@ mod tests {
         let b = format_args_book(&[("title", Value::from("T")), ("series", Value::Null), ("series_index", Value::from(0.0))]);
         let args = generate_format_args(&b, "*", "-");
         assert_eq!(args.rating_parens, "");
+    }
+
+    // --- filter_genre_tags / establish_equivalencies ---
+
+    #[test]
+    fn normalize_tag_lowercases_and_strips_whitespace() {
+        assert_eq!(normalize_tag("Science Fiction", 245), "sciencefiction");
+    }
+
+    #[test]
+    fn normalize_tag_substitutes_a_unicode_name_for_symbols() {
+        // Cross-checked against a live Python `unicodedata.name('-')`
+        // call: "HYPHEN-MINUS" (which itself contains a hyphen -- not
+        // further sanitized, matching upstream exactly).
+        assert_eq!(normalize_tag("Sci-Fi", 245), "sciHYPHEN-MINUSfi");
+    }
+
+    #[test]
+    fn filter_genre_tags_excludes_configured_and_pattern_matched_tags() {
+        let (dir, cache) = open_test_cache();
+        add_test_book(dir.path(), &cache, "T");
+        {
+            let conn = cache.backend.conn.lock().unwrap();
+            for tag in ["Fiction", "[Project Gutenberg]", "Archived"] {
+                conn.execute("INSERT INTO tags (name) VALUES (?1)", [tag]).unwrap();
+            }
+        }
+
+        let excluded_tags = vec!["Archived".to_string()];
+        let dict = filter_genre_tags(&cache, 245, &excluded_tags, r"\[.+\]|^\+$").unwrap();
+        assert!(dict.contains_key("Fiction"));
+        assert!(!dict.contains_key("Archived"));
+        assert!(!dict.contains_key("[Project Gutenberg]"));
+    }
+
+    #[test]
+    fn establish_equivalencies_uppercases_leading_characters() {
+        let items = vec!["apple".to_string(), "Banana".to_string()];
+        assert_eq!(establish_equivalencies(&items), vec!["A".to_string(), "B".to_string()]);
+    }
+
+    #[test]
+    fn establish_equivalencies_applies_the_a_o_u_umlaut_exceptions() {
+        let items = vec!["Äpple".to_string(), "Öl".to_string(), "Über".to_string()];
+        assert_eq!(establish_equivalencies(&items), vec!["A".to_string(), "O".to_string(), "U".to_string()]);
     }
 }
