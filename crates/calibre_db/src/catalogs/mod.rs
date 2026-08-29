@@ -62,6 +62,7 @@ pub mod epub_mobi_builder;
 pub mod ncx;
 pub mod opf;
 pub mod output_profiles;
+pub mod thumbnails;
 pub mod utils;
 
 /// Port of `catalogs/__init__.py`'s `FIELDS` list -- the full set of
