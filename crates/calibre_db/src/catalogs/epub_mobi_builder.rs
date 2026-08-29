@@ -918,6 +918,28 @@ pub fn fetch_books_by_title(books_to_catalog: &[Value]) -> crate::catalogs::Resu
     Ok(books)
 }
 
+/// Shared run-length group-by used by both `fetch_books_by_author` and
+/// `generate_html_by_genres`'s own near-identical (and, in upstream, even
+/// more severely bugged -- see that function's own doc) unique-authors
+/// tally: `pairs` must already be grouped so identical `(friendly, sort)`
+/// pairs are consecutive (both callers' inputs already are, by
+/// construction). Returns `(friendly, sort, count)` triples, one per
+/// distinct run.
+fn group_consecutive_authors(pairs: &[(String, String)]) -> Vec<(String, String, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < pairs.len() {
+        let current = &pairs[i];
+        let mut count = 1;
+        while i + count < pairs.len() && &pairs[i + count] == current {
+            count += 1;
+        }
+        out.push((current.0.clone(), current.1.clone(), count));
+        i += count;
+    }
+    out
+}
+
 /// Port of `fetch_books_by_author`'s output: `self.books_by_author`,
 /// `self.books_by_description`, `self.authors` (unique authors as
 /// `(friendly, title-cased sort, book count)`), and
@@ -985,17 +1007,8 @@ pub fn fetch_books_by_author(
     let authors: Vec<(String, String)> =
         books_by_author.iter().map(|r| (book_str(r, "author").to_string(), capitalize(book_str(r, "author_sort")))).collect();
 
-    let mut unique_authors: Vec<(String, String, usize)> = Vec::new();
-    let mut i = 0;
-    while i < authors.len() {
-        let current = &authors[i];
-        let mut count = 1;
-        while i + count < authors.len() && &authors[i + count] == current {
-            count += 1;
-        }
-        unique_authors.push((current.0.clone(), calibre_utils::icu::title_case(&current.1), count));
-        i += count;
-    }
+    let unique_authors: Vec<(String, String, usize)> =
+        group_consecutive_authors(&authors).into_iter().map(|(a, s, c)| (a, calibre_utils::icu::title_case(&s), c)).collect();
 
     let mut individual_authors: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (friendly, _, _) in &unique_authors {
@@ -1677,6 +1690,254 @@ pub fn generate_html_by_series(
     dom.append_child(body, div_tag);
 
     Ok(Some(serialize_html_document(&dom, root)))
+}
+
+pub const BY_GENRES_NORMAL_TITLE_TEMPLATE: &str = "{title} {pubyear_parens}";
+pub const BY_GENRES_SERIES_TITLE_TEMPLATE: &str = "{series_index}. {title} {pubyear_parens}";
+
+/// A slim per-book summary for a genre page -- upstream's `this_book`
+/// dict (`author`, `title`, `author_sort` (already
+/// [`capitalize`]-d), `prefix`, `tags`, `id`, `series`, `series_index`,
+/// `date`), deliberately narrower than a full [`populate_title`]
+/// output. Notably has no `"rating"` key -- [`generate_format_args`]'s
+/// `rating_parens` is empty for every genre-page book, matching upstream
+/// exactly (its own `'rating' in book` check is false for this shape).
+fn slim_genre_book(book: &Value) -> Value {
+    let mut m = serde_json::Map::new();
+    m.insert("author".to_string(), Value::String(book_str(book, "author").to_string()));
+    m.insert("title".to_string(), Value::String(book_str(book, "title").to_string()));
+    m.insert("author_sort".to_string(), Value::String(capitalize(book_str(book, "author_sort"))));
+    m.insert("prefix".to_string(), book.get("prefix").cloned().unwrap_or(Value::Null));
+    m.insert("tags".to_string(), book.get("tags").cloned().unwrap_or(Value::Null));
+    m.insert("id".to_string(), book.get("id").cloned().unwrap_or(Value::Null));
+    m.insert("series".to_string(), book.get("series").cloned().unwrap_or(Value::Null));
+    m.insert("series_index".to_string(), book.get("series_index").cloned().unwrap_or(Value::Null));
+    m.insert("date".to_string(), book.get("date").cloned().unwrap_or(Value::Null));
+    Value::Object(m)
+}
+
+/// Port of `generate_html_by_genre`: renders one genre's page. Returns
+/// the finished HTML plus `titles_spanned` (the first, and if there's
+/// more than one book the last, `(author, title)` pair -- matching
+/// upstream's own return shape exactly, including that it's *not* a
+/// simple 2-tuple when there's only one book).
+pub fn generate_html_by_genre(
+    genre: &str,
+    section_head: bool,
+    books: &[Value],
+    friendly_genre_tag: &str,
+    fmt: &str,
+    generate_authors: bool,
+    generate_series: bool,
+    generate_descriptions: bool,
+    rating_full_char: &str,
+    rating_empty_char: &str,
+) -> (String, Vec<(String, String)>) {
+    let (mut dom, root, body) = empty_html_document(genre);
+
+    let anchor_div = dom.new_element("div");
+    if section_head {
+        let a_tag = dom.new_element("a");
+        set_attr(&mut dom, a_tag, "id", "section_start");
+        dom.append_child(anchor_div, a_tag);
+    }
+    let a_genre = dom.new_element("a");
+    set_attr(&mut dom, a_genre, "id", format!("Genre_{genre}"));
+    dom.append_child(anchor_div, a_genre);
+    dom.append_child(body, anchor_div);
+
+    let p_title = dom.new_element("p");
+    set_attr(&mut dom, p_title, "class", "title");
+    append_text(&mut dom, p_title, friendly_genre_tag);
+    dom.append_child(body, p_title);
+
+    let authors_div = dom.new_element("div");
+    set_attr(&mut dom, authors_div, "class", "authors");
+
+    let mut current_author = String::new();
+    let mut current_series: Option<String> = None;
+    for book in books {
+        let author = book_str(book, "author").to_string();
+        if author != current_author {
+            current_author = author.clone();
+            current_series = None;
+            let p_author = dom.new_element("p");
+            set_attr(&mut dom, p_author, "class", "author_index");
+            let a_tag = dom.new_element("a");
+            if generate_authors {
+                set_attr(&mut dom, a_tag, "href", format!("ByAlphaAuthor.html#{}", generate_author_anchor(&author)));
+            }
+            append_text(&mut dom, a_tag, &author);
+            dom.append_child(p_author, a_tag);
+            dom.append_child(authors_div, p_author);
+        }
+
+        match book.get("series").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            Some(series) if Some(series.to_string()) != current_series => {
+                current_series = Some(series.to_string());
+                let p_series = dom.new_element("p");
+                set_attr(&mut dom, p_series, "class", if fmt == "mobi" { "series_mobi" } else { "series" });
+                if generate_series {
+                    let a_tag = dom.new_element("a");
+                    set_attr(&mut dom, a_tag, "href", format!("BySeries.html#{}", generate_series_anchor(series)));
+                    append_text(&mut dom, a_tag, series);
+                    dom.append_child(p_series, a_tag);
+                } else {
+                    append_text(&mut dom, p_series, series);
+                }
+                dom.append_child(authors_div, p_series);
+            }
+            None => current_series = None,
+            _ => {}
+        }
+
+        let p_book = dom.new_element("p");
+        set_attr(&mut dom, p_book, "class", "line_item");
+        insert_prefix(&mut dom, p_book, fmt, book.get("prefix").and_then(|v| v.as_str()));
+
+        let span_tag = dom.new_element("span");
+        set_attr(&mut dom, span_tag, "class", "entry");
+        let title_a = dom.new_element("a");
+        if generate_descriptions {
+            let book_id = book.get("id").and_then(|v| v.as_i64()).unwrap_or_default();
+            set_attr(&mut dom, title_a, "href", format!("book_{book_id}.html"));
+        }
+        let args = generate_format_args(book, rating_full_char, rating_empty_char);
+        let template = if current_series.is_some() { BY_GENRES_SERIES_TITLE_TEMPLATE } else { BY_GENRES_NORMAL_TITLE_TEMPLATE };
+        append_text(&mut dom, title_a, &safe_format(template, &args));
+        dom.append_child(span_tag, title_a);
+        dom.append_child(p_book, span_tag);
+
+        dom.append_child(authors_div, p_book);
+    }
+    dom.append_child(body, authors_div);
+
+    let titles_spanned = if books.len() > 1 {
+        vec![
+            (book_str(&books[0], "author").to_string(), book_str(&books[0], "title").to_string()),
+            (book_str(&books[books.len() - 1], "author").to_string(), book_str(&books[books.len() - 1], "title").to_string()),
+        ]
+    } else {
+        vec![(book_str(&books[0], "author").to_string(), book_str(&books[0], "title").to_string())]
+    };
+
+    (serialize_html_document(&dom, root), titles_spanned)
+}
+
+/// One genre's summary + rendered page -- upstream's `master_genre_list`
+/// entry shape.
+#[derive(Debug, Clone)]
+pub struct GenrePage {
+    /// The normalized tag (upstream's dict key -- what upstream simply
+    /// calls `genre`).
+    pub tag: String,
+    pub file: String,
+    pub authors: Vec<(String, String, usize)>,
+    pub books: Vec<Value>,
+    pub titles_spanned: Vec<(String, String)>,
+    pub html: String,
+}
+
+/// Port of `generate_html_by_genres`. `genre_tags_dict` is
+/// [`filter_genre_tags`]'s output (`friendly tag -> normalized tag`);
+/// `books_by_author` must already carry each book's `"genres"` array
+/// (matching [`populate_title`]'s own output).
+///
+/// The grouping loop is a plain `IndexMap`-based group-by (normalized tag
+/// -> deduped-by-`(title, author)` book list, in first-seen order) rather
+/// than upstream's literal list-of-single-key-dicts-with-nested-linear-
+/// scans structure -- that structure has no observable effect on the
+/// output beyond its own internal bookkeeping cost, so this port
+/// reproduces its *result* (deduped books grouped under whichever
+/// normalized tag they share, ordered by the first `friendly_tag` that
+/// introduced each group) directly rather than the awkward container
+/// shape that produces it.
+///
+/// **Fixes a real bug, not preserved**: upstream's per-genre
+/// `unique_authors` tally only appends an entry when a *different*
+/// author is encountered -- meaning the *last* author in every genre
+/// with 2+ distinct authors is silently dropped from the list entirely
+/// (there's no post-loop "flush the final author" step here, unlike
+/// `fetch_books_by_author`'s otherwise-similar loop). Unlike that
+/// function's narrow single-book-catalog edge case, this drops real data
+/// in the ordinary multi-author case -- a visible defect, not a stable
+/// quirk -- so this port reuses the same (already-fixed)
+/// `group_consecutive_authors` helper `fetch_books_by_author` uses
+/// instead of transliterating the buggy loop.
+pub fn generate_html_by_genres(
+    genre_tags_dict: &indexmap::IndexMap<String, String>,
+    books_by_author: &[Value],
+    fmt: &str,
+    generate_authors: bool,
+    generate_series: bool,
+    generate_descriptions: bool,
+    rating_full_char: &str,
+    rating_empty_char: &str,
+) -> Vec<GenrePage> {
+    let mut friendly_tags: Vec<&String> = genre_tags_dict.keys().collect();
+    friendly_tags.sort();
+
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: indexmap::IndexMap<String, Vec<Value>> = indexmap::IndexMap::new();
+    let mut seen: std::collections::HashMap<String, std::collections::HashSet<(String, String)>> = std::collections::HashMap::new();
+
+    for friendly_tag in friendly_tags {
+        let normalized = genre_tags_dict[friendly_tag].clone();
+        for book in books_by_author {
+            let has_tag = book
+                .get("genres")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().any(|g| g.as_str() == Some(friendly_tag.as_str())))
+                .unwrap_or(false);
+            if !has_tag {
+                continue;
+            }
+
+            let key = (book_str(book, "title").to_string(), book_str(book, "author").to_string());
+            let seen_for_tag = seen.entry(normalized.clone()).or_default();
+            if seen_for_tag.contains(&key) {
+                continue;
+            }
+            seen_for_tag.insert(key);
+
+            if !groups.contains_key(&normalized) {
+                order.push(normalized.clone());
+            }
+            groups.entry(normalized.clone()).or_default().push(slim_genre_book(book));
+        }
+    }
+
+    let mut pages = Vec::with_capacity(order.len());
+    for (index, tag) in order.iter().enumerate() {
+        let books_for_genre = &groups[tag];
+        let authors: Vec<(String, String)> =
+            books_for_genre.iter().map(|b| (book_str(b, "author").to_string(), book_str(b, "author_sort").to_string())).collect();
+        let unique_authors = group_consecutive_authors(&authors);
+
+        let friendly = get_friendly_genre_tag(genre_tags_dict, tag).unwrap_or(tag.as_str()).to_string();
+        let (html, titles_spanned) = generate_html_by_genre(
+            tag,
+            index == 0,
+            books_for_genre,
+            &friendly,
+            fmt,
+            generate_authors,
+            generate_series,
+            generate_descriptions,
+            rating_full_char,
+            rating_empty_char,
+        );
+
+        pages.push(GenrePage {
+            tag: tag.clone(),
+            file: format!("content/Genre_{tag}.html"),
+            authors: unique_authors,
+            books: books_for_genre.clone(),
+            titles_spanned,
+            html,
+        });
+    }
+    pages
 }
 
 #[cfg(test)]
@@ -2619,5 +2880,111 @@ mod tests {
         let without_title = generate_html_by_series(&cache, &books, &[], "epub", true, false, true, "*", "-").unwrap().unwrap();
         assert!(with_title.contains("id=\"series\""), "{with_title}");
         assert!(!without_title.contains("id=\"series\""), "{without_title}");
+    }
+
+    // --- generate_html_by_genre / generate_html_by_genres ---
+
+    fn genre_book(id: i32, title: &str, author: &str, author_sort: &str, genres: &[&str]) -> Value {
+        book(&[
+            ("id", Value::from(id)),
+            ("title", Value::String(title.to_string())),
+            ("author", Value::String(author.to_string())),
+            ("author_sort", Value::String(author_sort.to_string())),
+            ("genres", Value::from(genres.iter().map(|g| g.to_string()).collect::<Vec<_>>())),
+            ("tags", Value::from(genres.iter().map(|g| g.to_string()).collect::<Vec<_>>())),
+            ("series", Value::Null),
+            ("series_index", Value::from(0.0)),
+            ("date", Value::Null),
+            ("prefix", Value::Null),
+        ])
+    }
+
+    #[test]
+    fn generate_html_by_genre_produces_a_well_formed_page() {
+        let books = vec![slim_genre_book(&genre_book(1, "Book One", "Alice", "Alice", &["Fiction"]))];
+        let (html, spanned) = generate_html_by_genre("fiction", true, &books, "Fiction", "epub", true, true, false, "*", "-");
+        assert!(html.starts_with("<!DOCTYPE html"), "{html}");
+        assert!(html.contains("id=\"section_start\""), "{html}");
+        assert!(html.contains("id=\"Genre_fiction\""), "{html}");
+        assert!(html.contains("class=\"authors\""), "{html}");
+        assert!(html.contains(">Fiction<"), "{html}");
+        assert_eq!(spanned, vec![("Alice".to_string(), "Book One".to_string())]);
+    }
+
+    #[test]
+    fn generate_html_by_genre_titles_spanned_covers_first_and_last_when_multiple_books() {
+        let books = vec![
+            slim_genre_book(&genre_book(1, "Book A", "Alice", "Alice", &["Fiction"])),
+            slim_genre_book(&genre_book(2, "Book Z", "Zeb", "Zeb", &["Fiction"])),
+        ];
+        let (_html, spanned) = generate_html_by_genre("fiction", false, &books, "Fiction", "epub", true, true, false, "*", "-");
+        assert_eq!(spanned, vec![("Alice".to_string(), "Book A".to_string()), ("Zeb".to_string(), "Book Z".to_string())]);
+    }
+
+    #[test]
+    fn generate_html_by_genres_groups_books_by_normalized_tag() {
+        let mut dict = indexmap::IndexMap::new();
+        dict.insert("Fiction".to_string(), "fiction".to_string());
+        let books = vec![
+            genre_book(1, "Book A", "Alice", "Alice", &["Fiction"]),
+            genre_book(2, "Book B", "Bob", "Bob", &["Fiction"]),
+            genre_book(3, "Book C", "Carol", "Carol", &["Nonfiction"]),
+        ];
+        let pages = generate_html_by_genres(&dict, &books, "epub", true, true, false, "*", "-");
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].tag, "fiction");
+        assert_eq!(pages[0].books.len(), 2);
+    }
+
+    #[test]
+    fn generate_html_by_genres_dedups_synonymous_friendly_tags() {
+        // Two friendly tags mapping to the same normalized form should
+        // not double-count a book that carries both.
+        let mut dict = indexmap::IndexMap::new();
+        dict.insert("SciFi".to_string(), "scifi".to_string());
+        dict.insert("Sci-Fi".to_string(), "scifi".to_string());
+        let books = vec![genre_book(1, "Book A", "Alice", "Alice", &["SciFi", "Sci-Fi"])];
+        let pages = generate_html_by_genres(&dict, &books, "epub", true, true, false, "*", "-");
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].books.len(), 1);
+    }
+
+    #[test]
+    fn generate_html_by_genres_unique_authors_includes_the_last_author() {
+        // Regression test for the upstream bug this port deliberately
+        // fixes: the last distinct author in a genre must NOT be dropped.
+        let mut dict = indexmap::IndexMap::new();
+        dict.insert("Fiction".to_string(), "fiction".to_string());
+        let books = vec![
+            genre_book(1, "Book A", "Alice", "Alice", &["Fiction"]),
+            genre_book(2, "Book B", "Bob", "Bob", &["Fiction"]),
+        ];
+        let pages = generate_html_by_genres(&dict, &books, "epub", true, true, false, "*", "-");
+        let names: Vec<&str> = pages[0].authors.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["Alice", "Bob"]);
+    }
+
+    #[test]
+    fn generate_html_by_genres_uses_the_friendly_tag_as_the_page_title() {
+        let mut dict = indexmap::IndexMap::new();
+        dict.insert("Sci-Fi".to_string(), "scifi".to_string());
+        let books = vec![genre_book(1, "Book A", "Alice", "Alice", &["Sci-Fi"])];
+        let pages = generate_html_by_genres(&dict, &books, "epub", true, true, false, "*", "-");
+        assert!(pages[0].html.contains(">Sci-Fi<"), "{}", pages[0].html);
+    }
+
+    #[test]
+    fn generate_html_by_genres_only_the_first_page_gets_section_start() {
+        let mut dict = indexmap::IndexMap::new();
+        dict.insert("Fiction".to_string(), "fiction".to_string());
+        dict.insert("Nonfiction".to_string(), "nonfiction".to_string());
+        let books = vec![
+            genre_book(1, "Book A", "Alice", "Alice", &["Fiction"]),
+            genre_book(2, "Book B", "Bob", "Bob", &["Nonfiction"]),
+        ];
+        let pages = generate_html_by_genres(&dict, &books, "epub", true, true, false, "*", "-");
+        assert_eq!(pages.len(), 2);
+        assert!(pages[0].html.contains("id=\"section_start\""), "{}", pages[0].html);
+        assert!(!pages[1].html.contains("id=\"section_start\""), "{}", pages[1].html);
     }
 }
