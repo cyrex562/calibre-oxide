@@ -778,7 +778,7 @@ either -- this pass wasn't exhaustive.
 - [x] fonts.py
 - [x] footnote.py
 - [x] get_char_map.py
-- [ ] get_options.py
+- [x] get_options.py
 - [x] group_borders.py
 - [x] group_styles.py
 - [x] header.py
