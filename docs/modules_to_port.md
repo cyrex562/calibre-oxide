@@ -779,7 +779,7 @@ either -- this pass wasn't exhaustive.
 - [x] footnote.py
 - [x] get_char_map.py
 - [ ] get_options.py
-- [ ] group_borders.py
+- [x] group_borders.py
 - [x] group_styles.py
 - [x] header.py
 - [x] headings_to_sections.py

@@ -132,6 +132,10 @@
 //! - [`group_styles`]: close every `paragraph-definition` block, and
 //!   either merge consecutive same-`style-name` blocks into one or
 //!   wrap each same-styled run in a `<style-group>` tag.
+//! - [`group_borders`]: close every `paragraph-definition` block and
+//!   merge consecutive paragraphs sharing the same embedded
+//!   `<border-paragraph...>` attribute into one `<border-group>`-wrapped
+//!   run.
 //!
 //! Two more follow-up issues cover the rest of the ~35 passes
 //! (the remaining lists/grouping/tag-conversion passes, and the
@@ -142,8 +146,7 @@
 //!
 //! Everything else in `old_src/src/calibre/ebooks/rtf2xml/`:
 //! `ParseRtf.py` and the remaining later-stage transformation passes
-//! (`convert_to_tags`, `group_borders`,
-//! `inline`, `output`, and the rest).
+//! (`convert_to_tags`, `inline`, `output`, and the rest).
 //! Those are tracked by this crate's follow-up rtf2xml issues, built on
 //! top of the shapes established here -- most importantly
 //! [`process_tokens`]'s intermediate format.
@@ -165,6 +168,7 @@ pub mod fields_small;
 pub mod fonts;
 pub mod footnote;
 pub mod get_char_map;
+pub mod group_borders;
 pub mod group_styles;
 pub mod header;
 pub mod headings_to_sections;
