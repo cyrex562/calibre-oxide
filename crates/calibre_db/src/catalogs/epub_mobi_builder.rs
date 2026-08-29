@@ -19,11 +19,18 @@
 //!   (`get_prefix_rules`, `discover_prefix`, `get_excluded_tags`,
 //!   `filter_excluded_genres`, `process_exclusions`,
 //!   `relist_multiple_authors`) -- filters and per-book prefix annotations
-//!   `fetch_books_to_catalog` (not yet ported -- see below) applies while
-//!   building its output. Ported ahead of `fetch_books_to_catalog` itself
-//!   since it needs substantially more new infrastructure
-//!   (`comments_to_html`, an HTML-paragraph-extraction step) this narrower
-//!   slice doesn't.
+//!   [`fetch_books_to_catalog`] applies while building its output.
+//! - `fetch_books_to_catalog` itself (`generate_short_description`,
+//!   `merge_comments`, and its own inner `_populate_title` closure, ported
+//!   as [`populate_title`]) -- the entry point that turns a raw
+//!   [`crate::cache::Cache::get_data_as_dict`] row into the enriched
+//!   `this_title` shape every later HTML/NCX cluster consumes. Needed
+//!   `comments_to_html` (a whole separate module upstream,
+//!   `calibre.library.comments`) as a prerequisite -- already ported at
+//!   [`calibre_ebooks::oeb::transforms::jacket::comments_to_html`] for a
+//!   different issue (jacket-page generation); this port found and fixed a
+//!   real gap in it (a missing `<script>`/`<table>`/etc. sanitize branch)
+//!   before relying on it here.
 //!
 //! # Disclosed simplifications
 //!
@@ -71,8 +78,50 @@
 //!   intentional behavior, so this port excludes a record if *any*
 //!   exclusion pair matches it, with no duplicates, matching the code's
 //!   evident intent.
+//! - **`genre_source_field`/`header_note_source_field` support only
+//!   `"Tags"` or a `#`-prefixed custom column**, not upstream's fully
+//!   general `db.get_field`/`db.metadata_for_field` (which can target any
+//!   standard or custom field by name). Every real-world use of these two
+//!   options is a custom column in practice (the whole point of
+//!   `genre_source_field` is picking an *alternate* genre source, and
+//!   `Tags` is the field it's an alternative to); a field name that's
+//!   neither is treated as producing no genres/no note, not an error.
+//! - **A custom `header_note_source_field` doesn't get upstream's
+//!   datatype-aware reformatting** (`datetime`-typed columns re-rendered
+//!   via `format_date`, `text`-typed list values joined with `" · "`) --
+//!   this crate's custom columns are always scalar strings already (see
+//!   the exclusion/prefix-rules simplification above), so the raw stored
+//!   string is used directly.
+//! - **`discover_prefix` reads the *original*, un-filtered `record`'s
+//!   tags**, not the [`filter_excluded_genres`]-filtered tag list
+//!   [`populate_title`] stores on its own output -- matching upstream
+//!   exactly (`self.discover_prefix(record)`, not
+//!   `self.discover_prefix(this_title)`).
+//! - **No local-timezone conversion for the `date` display field.**
+//!   Upstream renders `pubdate` via `as_local_time(...)` before
+//!   formatting; this crate has no established "local timezone" concept
+//!   (`calibre_utils::date` is UTC-only throughout), so the month/year
+//!   string is formatted directly from the UTC value.
+//! - **Short-description text extraction is simplified.** Upstream walks
+//!   `comments_to_html`'s output with BeautifulSoup, joining only the
+//!   *direct* string-valued children of each top-level `<p>` (a shallow,
+//!   one-level walk -- `token.string` is `None`, and thus skipped, for any
+//!   child tag with more than one grandchild). This port instead takes
+//!   each `<p>`'s full recursive text content
+//!   ([`calibre_ebooks::dom::Dom::text_content`]) -- close enough for text
+//!   that's immediately truncated to a short preview via
+//!   [`generate_short_description`] regardless.
+//! - **`fetch_books_to_catalog`'s tag-exclusion narrows the fetched rows
+//!   by post-filtering, not a search-query string.** Upstream builds a
+//!   `not (tags:"=x" or tags:"=y" ...)` search phrase and folds it into
+//!   `opts.search_text` before calling `search_sort_db` -- this crate's
+//!   generators expect the caller to have already resolved any search to
+//!   an explicit id list (see `catalogs/mod.rs`'s own doc), so tag
+//!   exclusion happens as a post-fetch filter here instead. Both produce
+//!   the same final row set.
 
 use calibre_utils::icu::capitalize;
+use chrono::Datelike;
 use regex::Regex;
 use serde_json::Value;
 
@@ -476,6 +525,321 @@ pub fn relist_multiple_authors(books_by_author: &[Value]) -> Vec<Value> {
     result
 }
 
+/// Port of `generate_short_description`'s `dest` parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortDescriptionDest {
+    Title,
+    Author,
+    Description,
+}
+
+fn short_description(description: &str, limit: usize) -> Option<String> {
+    let mut short = String::new();
+    for word in description.split_whitespace() {
+        short.push_str(word);
+        short.push(' ');
+        if short.chars().count() > limit {
+            short.push_str("...");
+            return Some(short);
+        }
+    }
+    // Matches upstream: if the whole description is consumed without ever
+    // exceeding `limit`, `_short_description` falls off the end of its
+    // `for` loop with no explicit `return`, which in Python means it
+    // returns `None`. Callers only reach this function when the input is
+    // already at least `limit` characters long, so this is effectively
+    // unreachable in practice, not a deliberately useful `None` path.
+    None
+}
+
+/// Port of `generate_short_description`.
+pub fn generate_short_description(
+    description: Option<&str>,
+    dest: ShortDescriptionDest,
+    author_clip: usize,
+    description_clip: usize,
+) -> Option<String> {
+    let description = description.filter(|d| !d.is_empty())?;
+    match dest {
+        ShortDescriptionDest::Title => Some(description.to_string()),
+        ShortDescriptionDest::Author => {
+            if author_clip > 0 && description.chars().count() < author_clip {
+                Some(description.to_string())
+            } else {
+                short_description(description, author_clip)
+            }
+        }
+        ShortDescriptionDest::Description => {
+            if description_clip > 0 && description.chars().count() < description_clip {
+                Some(description.to_string())
+            } else {
+                short_description(description, description_clip)
+            }
+        }
+    }
+}
+
+/// Port of `merge_comments_rule['position']`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergePosition {
+    Before,
+    After,
+}
+
+/// Port of `merge_comments`. Only ever called when a merge field is
+/// actually configured -- matches upstream's own
+/// `if self.merge_comments_rule['field']: ...` guard at the one call
+/// site, so `field` here is required rather than `Option`.
+pub fn merge_comments(
+    db: &Cache,
+    book_id: i32,
+    description: Option<&str>,
+    field: &str,
+    position: MergePosition,
+    hr: bool,
+) -> crate::catalogs::Result<Option<String>> {
+    match description {
+        Some(desc) if !desc.is_empty() => {
+            let addendum = db.get_custom_column_value(book_id, field).map_err(CatalogError::Sqlite)?.unwrap_or_default();
+            let sep = if hr { "<hr class=\"merged_comments_divider\"/>" } else { "\n" };
+            let merged = match position {
+                MergePosition::Before => format!("{addendum}{sep}{desc}"),
+                MergePosition::After => format!("{desc}{sep}{addendum}"),
+            };
+            Ok(Some(merged))
+        }
+        _ => Ok(db.get_custom_column_value(book_id, field).map_err(CatalogError::Sqlite)?),
+    }
+}
+
+/// Port of `calibre.utils.date.is_date_undefined`: true for `None`, or a
+/// date at or before calibre's `UNDEFINED_DATE` sentinel (`0101-01-01`).
+pub fn is_date_undefined(dt: Option<&chrono::DateTime<chrono::Utc>>) -> bool {
+    match dt {
+        None => true,
+        Some(d) => d.year() < 101 || (d.year() == 101 && d.month() == 1 && d.day() == 1),
+    }
+}
+
+fn plain_text_paragraphs(html: &str) -> String {
+    let dom = calibre_ebooks::dom::Dom::parse(html);
+    dom.find_all_tag_global("p")
+        .iter()
+        .map(|&id| dom.text_content(id))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The subset of `opts`/`self.merge_comments_rule` [`populate_title`]
+/// reads -- see this module's doc for what's narrowed relative to
+/// upstream's fully general field lookups.
+#[derive(Debug, Clone, Default)]
+pub struct PopulateTitleOptions {
+    pub exclude_genre: String,
+    /// `"Tags"` or a `#`-prefixed custom column label.
+    pub genre_source_field: String,
+    /// A `#`-prefixed custom column label, or `None` to disable header
+    /// notes entirely.
+    pub header_note_source_field: Option<String>,
+    /// A `#`-prefixed custom column label, or `None` to disable comment
+    /// merging entirely (matches upstream's `if
+    /// self.merge_comments_rule['field']:` guard).
+    pub merge_comments_field: Option<String>,
+    pub merge_comments_position: MergePosition,
+    pub merge_comments_hr: bool,
+    pub description_clip: usize,
+    pub author_clip: usize,
+}
+
+impl Default for MergePosition {
+    fn default() -> Self {
+        MergePosition::After
+    }
+}
+
+/// Port of `fetch_books_to_catalog`'s inner `_populate_title` closure:
+/// turn one raw [`crate::cache::Cache::get_data_as_dict`] row into the
+/// enriched `this_title` shape.
+pub fn populate_title(
+    db: &Cache,
+    record: &Value,
+    opts: &PopulateTitleOptions,
+    prefix_rules: &[PrefixRule],
+) -> crate::catalogs::Result<Value> {
+    let mut this_title = serde_json::Map::new();
+    let book_id = record.get("id").and_then(|v| v.as_i64()).unwrap_or_default();
+    let book_id_i32 = book_id as i32;
+    this_title.insert("id".to_string(), Value::from(book_id));
+    this_title.insert("uuid".to_string(), record.get("uuid").cloned().unwrap_or(Value::Null));
+
+    let title = convert_html_entities(record.get("title").and_then(|v| v.as_str()).unwrap_or_default());
+    this_title.insert("title".to_string(), Value::String(title.clone()));
+
+    match record.get("series").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        Some(series) => {
+            this_title.insert("series".to_string(), Value::String(series.to_string()));
+            let series_index = record.get("series_index").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            this_title.insert("series_index".to_string(), Value::from(series_index));
+        }
+        None => {
+            this_title.insert("series".to_string(), Value::Null);
+            this_title.insert("series_index".to_string(), Value::from(0.0));
+        }
+    }
+
+    this_title.insert("title_sort".to_string(), Value::String(generate_sort_title(&title)));
+
+    let record_authors: Vec<String> = record
+        .get("authors")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    let author = if !record_authors.is_empty() { record_authors.join(" & ") } else { "Unknown".to_string() };
+    let authors = if record_authors.is_empty() { vec![author.clone()] } else { record_authors };
+    this_title.insert("authors".to_string(), Value::from(authors));
+    this_title.insert("author".to_string(), Value::String(author.clone()));
+
+    let author_sort = match record.get("author_sort").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()) {
+        Some(s) => s.to_string(),
+        None => kf_author_to_author_sort(&author),
+    };
+    this_title.insert("author_sort".to_string(), Value::String(author_sort));
+
+    if let Some(publisher) = record.get("publisher").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        this_title.insert("publisher".to_string(), Value::String(publisher.to_string()));
+    }
+
+    let rating = record.get("rating").and_then(|v| v.as_f64()).filter(|r| *r != 0.0).unwrap_or(0.0);
+    this_title.insert("rating".to_string(), Value::from(rating));
+
+    let pubdate = record.get("pubdate").and_then(|v| v.as_str()).and_then(|s| calibre_utils::date::parse_date(s, true));
+    if is_date_undefined(pubdate.as_ref()) {
+        this_title.insert("date".to_string(), Value::Null);
+    } else {
+        let dt = pubdate.unwrap();
+        this_title.insert("date".to_string(), Value::String(dt.format("%B %Y").to_string()));
+    }
+
+    this_title.insert("timestamp".to_string(), record.get("timestamp").cloned().unwrap_or(Value::Null));
+
+    let raw_comments = record.get("comments").and_then(|v| v.as_str()).filter(|c| !c.is_empty());
+    let (description, short_description_val) = match raw_comments {
+        Some(comments) => {
+            let mut comments = comments.to_string();
+            if let Some(pos) = comments.find("<div class=\"user_annotations\">") {
+                comments.truncate(pos);
+            }
+            if let Some(pos) = comments.find("<hr class=\"annotations_divider\" />") {
+                comments.truncate(pos);
+            }
+            let html = calibre_ebooks::oeb::transforms::jacket::comments_to_html(&comments);
+            let plain = plain_text_paragraphs(&html);
+            let short = generate_short_description(
+                Some(&plain),
+                ShortDescriptionDest::Description,
+                opts.author_clip,
+                opts.description_clip,
+            );
+            (Some(html), short)
+        }
+        None => (None, None),
+    };
+    let description = match &opts.merge_comments_field {
+        Some(field) => merge_comments(
+            db,
+            book_id_i32,
+            description.as_deref(),
+            field,
+            opts.merge_comments_position,
+            opts.merge_comments_hr,
+        )?,
+        None => description,
+    };
+    this_title.insert("description".to_string(), description.map(Value::String).unwrap_or(Value::Null));
+    this_title.insert(
+        "short_description".to_string(),
+        short_description_val.map(Value::String).unwrap_or(Value::Null),
+    );
+
+    if let Some(cover) = record.get("cover").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        this_title.insert("cover".to_string(), Value::String(cover.to_string()));
+    }
+
+    let raw_tags: Vec<String> = record
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    let tags = if raw_tags.is_empty() { Vec::new() } else { filter_excluded_genres(&raw_tags, &opts.exclude_genre) };
+    this_title.insert("tags".to_string(), Value::from(tags.clone()));
+
+    let genres: Vec<String> = if opts.genre_source_field == "Tags" {
+        tags
+    } else if let Some(label) = opts.genre_source_field.strip_prefix('#') {
+        match db.get_custom_column_value(book_id_i32, label).map_err(CatalogError::Sqlite)? {
+            Some(v) if !v.is_empty() => filter_excluded_genres(&[v], &opts.exclude_genre),
+            _ => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    this_title.insert("genres".to_string(), Value::from(genres));
+
+    if let Some(formats) = record.get("formats").and_then(|v| v.as_array()).filter(|a| !a.is_empty()) {
+        let converted: Vec<String> = formats.iter().filter_map(|v| v.as_str()).map(convert_html_entities).collect();
+        this_title.insert("formats".to_string(), Value::from(converted));
+    }
+
+    if let Some(label) = &opts.header_note_source_field {
+        if let Some(content) = db.get_custom_column_value(book_id_i32, label).map_err(CatalogError::Sqlite)?.filter(|c| !c.is_empty()) {
+            let mut note = serde_json::Map::new();
+            note.insert("source".to_string(), Value::String(label.clone()));
+            note.insert("content".to_string(), Value::String(content));
+            this_title.insert("notes".to_string(), Value::Object(note));
+        }
+    }
+
+    // Reads the ORIGINAL record's tags, not this_title's
+    // filter_excluded_genres-filtered copy -- see this module's doc.
+    let prefix = discover_prefix(db, record, prefix_rules)?;
+    this_title.insert("prefix".to_string(), prefix.map(Value::String).unwrap_or(Value::Null));
+
+    Ok(Value::Object(this_title))
+}
+
+/// Port of `fetch_books_to_catalog`'s entry point (its inner
+/// `_populate_title` closure is [`populate_title`], ported separately).
+/// `ids` is `None` for every book, matching upstream's `opts.ids` being
+/// unset.
+pub fn fetch_books_to_catalog(
+    db: &Cache,
+    ids: Option<&[i32]>,
+    exclusion_rules: &[(String, String, String)],
+    prefix_rules: &[PrefixRule],
+    opts: &PopulateTitleOptions,
+) -> crate::catalogs::Result<Vec<Value>> {
+    let ids_set: Option<std::collections::HashSet<i32>> = ids.map(|v| v.iter().copied().collect());
+    let rows = db.get_data_as_dict(None, false, ids_set.as_ref(), true).map_err(CatalogError::Db)?;
+
+    let excluded_tags: std::collections::HashSet<String> = get_excluded_tags(exclusion_rules).into_iter().collect();
+    let rows: Vec<Value> = if excluded_tags.is_empty() {
+        rows
+    } else {
+        rows.into_iter()
+            .filter(|r| {
+                !r.get("tags")
+                    .and_then(|v| v.as_array())
+                    .map(|tags| tags.iter().any(|t| t.as_str().map(|s| excluded_tags.contains(s)).unwrap_or(false)))
+                    .unwrap_or(false)
+            })
+            .collect()
+    };
+
+    let rows = process_exclusions(db, &rows, exclusion_rules)?;
+
+    rows.iter().map(|record| populate_title(db, record, opts, prefix_rules)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -756,5 +1120,201 @@ mod tests {
         ])];
         let out = relist_multiple_authors(&books);
         assert_eq!(out.len(), 1);
+    }
+
+    // --- generate_short_description ---
+
+    #[test]
+    fn short_description_none_for_empty_input() {
+        assert_eq!(generate_short_description(None, ShortDescriptionDest::Description, 100, 100), None);
+        assert_eq!(generate_short_description(Some(""), ShortDescriptionDest::Description, 100, 100), None);
+    }
+
+    #[test]
+    fn short_description_title_is_never_truncated() {
+        let long = "a".repeat(500);
+        assert_eq!(generate_short_description(Some(&long), ShortDescriptionDest::Title, 10, 10), Some(long));
+    }
+
+    #[test]
+    fn short_description_under_the_clip_length_passes_through() {
+        assert_eq!(
+            generate_short_description(Some("short"), ShortDescriptionDest::Description, 100, 100),
+            Some("short".to_string())
+        );
+    }
+
+    #[test]
+    fn short_description_over_the_clip_length_is_truncated_with_an_ellipsis() {
+        let long = "one two three four five six seven eight nine ten";
+        let short = generate_short_description(Some(long), ShortDescriptionDest::Description, 100, 10).unwrap();
+        assert!(short.ends_with("..."), "{short:?}");
+        assert!(short.len() < long.len(), "{short:?}");
+    }
+
+    // --- merge_comments ---
+
+    #[test]
+    fn merge_comments_places_the_custom_field_before_the_description() {
+        let (dir, cache) = open_test_cache();
+        let id = add_test_book(dir.path(), &cache, "T");
+        cache.add_custom_column("notes", "Notes", "text", false).unwrap();
+        cache.set_custom_column_value(id, "notes", "NOTE").unwrap();
+
+        let merged = merge_comments(&cache, id, Some("DESC"), "notes", MergePosition::Before, false).unwrap();
+        assert_eq!(merged, Some("NOTE\nDESC".to_string()));
+    }
+
+    #[test]
+    fn merge_comments_places_the_custom_field_after_with_an_hr() {
+        let (dir, cache) = open_test_cache();
+        let id = add_test_book(dir.path(), &cache, "T");
+        cache.add_custom_column("notes", "Notes", "text", false).unwrap();
+        cache.set_custom_column_value(id, "notes", "NOTE").unwrap();
+
+        let merged = merge_comments(&cache, id, Some("DESC"), "notes", MergePosition::After, true).unwrap();
+        assert_eq!(merged, Some("DESC<hr class=\"merged_comments_divider\"/>NOTE".to_string()));
+    }
+
+    #[test]
+    fn merge_comments_with_no_description_returns_just_the_custom_field() {
+        let (dir, cache) = open_test_cache();
+        let id = add_test_book(dir.path(), &cache, "T");
+        cache.add_custom_column("notes", "Notes", "text", false).unwrap();
+        cache.set_custom_column_value(id, "notes", "NOTE").unwrap();
+
+        let merged = merge_comments(&cache, id, None, "notes", MergePosition::Before, false).unwrap();
+        assert_eq!(merged, Some("NOTE".to_string()));
+    }
+
+    // --- is_date_undefined ---
+
+    #[test]
+    fn is_date_undefined_true_for_none_and_the_sentinel_date() {
+        assert!(is_date_undefined(None));
+        let sentinel = calibre_utils::date::parse_date("0101-01-01T00:00:00Z", true).unwrap();
+        assert!(is_date_undefined(Some(&sentinel)));
+    }
+
+    #[test]
+    fn is_date_undefined_false_for_a_real_date() {
+        let real = calibre_utils::date::parse_date("2020-06-15T00:00:00Z", true).unwrap();
+        assert!(!is_date_undefined(Some(&real)));
+    }
+
+    // --- populate_title / fetch_books_to_catalog ---
+
+    fn default_populate_opts() -> PopulateTitleOptions {
+        PopulateTitleOptions {
+            exclude_genre: r"\[.+\]|^\+$".to_string(),
+            genre_source_field: "Tags".to_string(),
+            description_clip: 380,
+            author_clip: 100,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn populate_title_fills_defaults_for_a_minimal_book() {
+        let (dir, cache) = open_test_cache();
+        let id = add_test_book(dir.path(), &cache, "My Book");
+        let rows = cache.get_data_as_dict(None, false, None, true).unwrap();
+        let record = rows.iter().find(|r| r["id"] == Value::from(id)).unwrap();
+
+        let title = populate_title(&cache, record, &default_populate_opts(), &[]).unwrap();
+        assert_eq!(title["title"], "My Book");
+        assert_eq!(title["author"], "A");
+        assert_eq!(title["author_sort"], "A");
+        assert_eq!(title["series"], Value::Null);
+        assert_eq!(title["series_index"], Value::from(0.0));
+        assert_eq!(title["prefix"], Value::Null);
+        assert_eq!(title["description"], Value::Null);
+    }
+
+    #[test]
+    fn populate_title_computes_author_sort_when_missing() {
+        let (dir, cache) = open_test_cache();
+        let source = write_temp_file(dir.path(), "book.epub", b"x");
+        let mut meta = calibre_ebooks::metadata::MetaInformation::default();
+        meta.title = "T".to_string();
+        meta.authors = vec!["John Smith".to_string()];
+        let id = cache.add_book(&source, &meta).unwrap();
+        // Cache::add_book defaults author_sort to the plain author name;
+        // force it blank to actually exercise the "compute it" branch,
+        // matching Python's `record['author_sort'].strip()` falsy check.
+        cache.set_field(id, "author_sort", "").unwrap();
+
+        let rows = cache.get_data_as_dict(None, false, None, true).unwrap();
+        let record = rows.iter().find(|r| r["id"] == Value::from(id)).unwrap();
+        let title = populate_title(&cache, record, &default_populate_opts(), &[]).unwrap();
+        assert_eq!(title["author_sort"], "Smith, john");
+    }
+
+    #[test]
+    fn populate_title_converts_comments_to_html_and_a_short_description() {
+        let (dir, cache) = open_test_cache();
+        let id = add_test_book(dir.path(), &cache, "T");
+        cache.set_field(id, "comments", "Hello world").unwrap();
+
+        let rows = cache.get_data_as_dict(None, false, None, true).unwrap();
+        let record = rows.iter().find(|r| r["id"] == Value::from(id)).unwrap();
+        let title = populate_title(&cache, record, &default_populate_opts(), &[]).unwrap();
+        assert_eq!(title["description"], "<p class=\"description\">Hello world</p>");
+        assert_eq!(title["short_description"], "Hello world");
+    }
+
+    #[test]
+    fn populate_title_filters_excluded_genre_tags() {
+        let (dir, cache) = open_test_cache();
+        let id = add_test_book(dir.path(), &cache, "T");
+        cache.set_field(id, "tags", "Fiction, [Project Gutenberg]").unwrap();
+
+        let rows = cache.get_data_as_dict(None, false, None, true).unwrap();
+        let record = rows.iter().find(|r| r["id"] == Value::from(id)).unwrap();
+        let title = populate_title(&cache, record, &default_populate_opts(), &[]).unwrap();
+        assert_eq!(title["tags"], Value::from(vec!["Fiction".to_string()]));
+        assert_eq!(title["genres"], Value::from(vec!["Fiction".to_string()]));
+    }
+
+    #[test]
+    fn populate_title_applies_a_matching_prefix_rule() {
+        let (dir, cache) = open_test_cache();
+        let id = add_test_book(dir.path(), &cache, "T");
+        cache.set_field(id, "tags", "Wishlist").unwrap();
+
+        let rows = cache.get_data_as_dict(None, false, None, true).unwrap();
+        let record = rows.iter().find(|r| r["id"] == Value::from(id)).unwrap();
+        let rules = get_prefix_rules(&[("W".to_string(), "tags".to_string(), "wishlist".to_string(), "\u{d7}".to_string())]);
+        let title = populate_title(&cache, record, &default_populate_opts(), &rules).unwrap();
+        assert_eq!(title["prefix"], "\u{d7}");
+    }
+
+    #[test]
+    fn fetch_books_to_catalog_excludes_books_by_tag() {
+        let (dir, cache) = open_test_cache();
+        let keep = add_test_book(dir.path(), &cache, "Keep");
+        let drop = add_test_book(dir.path(), &cache, "Drop");
+        cache.set_field(drop, "tags", "Catalog").unwrap();
+
+        let exclusion_rules = vec![("Skip".to_string(), "Tags".to_string(), "Catalog".to_string())];
+        let titles = fetch_books_to_catalog(&cache, None, &exclusion_rules, &[], &default_populate_opts()).unwrap();
+        let ids: Vec<i64> = titles.iter().map(|t| t["id"].as_i64().unwrap()).collect();
+        assert!(ids.contains(&(keep as i64)));
+        assert!(!ids.contains(&(drop as i64)));
+    }
+
+    #[test]
+    fn fetch_books_to_catalog_excludes_books_by_custom_field() {
+        let (dir, cache) = open_test_cache();
+        let keep = add_test_book(dir.path(), &cache, "Keep");
+        let drop = add_test_book(dir.path(), &cache, "Drop");
+        cache.add_custom_column("status", "Status", "text", false).unwrap();
+        cache.set_custom_column_value(drop, "status", "Archived").unwrap();
+
+        let exclusion_rules = vec![("Arch".to_string(), "#status".to_string(), "archiv".to_string())];
+        let titles = fetch_books_to_catalog(&cache, None, &exclusion_rules, &[], &default_populate_opts()).unwrap();
+        let ids: Vec<i64> = titles.iter().map(|t| t["id"].as_i64().unwrap()).collect();
+        assert!(ids.contains(&(keep as i64)));
+        assert!(!ids.contains(&(drop as i64)));
     }
 }
