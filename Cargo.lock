@@ -629,6 +629,7 @@ dependencies = [
  "chrono",
  "clap",
  "csv",
+ "image",
  "indexmap 2.12.1",
  "lazy_static",
  "libc",
@@ -649,6 +650,7 @@ dependencies = [
  "uuid",
  "walkdir",
  "zbus",
+ "zip",
 ]
 
 [[package]]
