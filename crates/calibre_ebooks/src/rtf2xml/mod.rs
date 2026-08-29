@@ -146,18 +146,27 @@
 //!   explicit file path, or stdout) -- genuinely about file I/O
 //!   rather than a content transform, unlike every other module here.
 //!
-//! One more follow-up issue covers the rest of the ~35 passes (the
-//! `ParseRtf.py` orchestrator itself, and CLI options), built on top
-//! of the shapes established here and in the foundation below.
+//! # Orchestrator & CLI options
+//!
+//! Issue #190's follow-up: `ParseRtf.py` itself (the orchestrator
+//! tying every pass above into one pipeline; done last, since it's
+//! the only file that calls all the others) plus the standalone-CLI
+//! options-handling side of the module.
+//!
+//! - [`configure_txt`]: locate and parse the user's `.rtf2xml`
+//!   configuration file, genuinely about environment/filesystem
+//!   interaction (like [`output`]) rather than a content transform.
+//!
+//! Built on top of the shapes established here and in the foundation
+//! below.
 //!
 //! # Not here
 //!
 //! Everything else in `old_src/src/calibre/ebooks/rtf2xml/`:
-//! `ParseRtf.py` (the orchestrator tying every pass above into one
-//! pipeline) and the CLI-options file(s) around it. Tracked by this
-//! crate's last rtf2xml follow-up issue, built on top of the shapes
-//! established here -- most importantly [`process_tokens`]'s
-//! intermediate format.
+//! `ParseRtf.py` and the rest of its CLI-options siblings
+//! (`get_options`, `options_trem`). Tracked by this crate's last
+//! rtf2xml follow-up issue, built on top of the shapes established
+//! here -- most importantly [`process_tokens`]'s intermediate format.
 
 pub mod add_brackets;
 pub mod body_styles;
@@ -167,6 +176,7 @@ pub mod check_brackets;
 pub mod check_encoding;
 pub mod colors;
 pub mod combine_borders;
+pub mod configure_txt;
 pub mod convert_to_tags;
 pub mod copy;
 pub mod default_encoding;
