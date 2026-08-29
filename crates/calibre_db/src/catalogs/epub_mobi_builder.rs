@@ -53,6 +53,20 @@
 //!   with no return value and no effect on any generated output --
 //!   omitted entirely (not even a no-op stub), matching this crate's
 //!   standing convention of dropping debug-print-only code paths.
+//! - **Cluster C (the HTML section generators) is now complete**:
+//!   [`generate_html_by_author`], [`generate_html_by_title`],
+//!   [`generate_html_by_series`], [`generate_html_by_genre`]/
+//!   [`generate_html_by_genres`], [`generate_html_by_date_added`],
+//!   [`generate_html_description_header`]/[`generate_html_descriptions`],
+//!   and [`format_ncx_text`]. **`generate_html_by_date_read` is
+//!   intentionally NOT ported**: it starts with `if not self.
+//!   bookmarked_books: return`, and `bookmarked_books` is only ever
+//!   populated by `fetch_bookmarks` -- already skipped in cluster A as
+//!   device-specific (upstream's own docstring: turned off since calibre
+//!   0.8.70). With that source permanently empty in this port, the
+//!   function would always immediately return nothing; porting it would
+//!   mean porting genuinely dead code, so it's skipped the same way
+//!   `fetch_bookmarks` itself was, not stubbed.
 //!
 //! # Disclosed simplifications
 //!
@@ -2546,6 +2560,27 @@ pub fn generate_html_descriptions(
         .collect()
 }
 
+/// Port of `format_ncx_text`: massage NCX text for Kindle display, then
+/// truncate via [`generate_short_description`]. Drops upstream's
+/// `xml_replace_entities` whole-document entity-normalization pass --
+/// same disclosed simplification as
+/// `generate_html_description_header`'s own doc (this crate has no
+/// equivalent of that Python extension's entity re-encoding, and the
+/// inputs here are already-decoded plain text).
+pub fn format_ncx_text(
+    description: Option<&str>,
+    dest: Option<ShortDescriptionDest>,
+    author_clip: usize,
+    description_clip: usize,
+) -> Option<String> {
+    let trimmed = description.unwrap_or("").trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let dest = dest?;
+    generate_short_description(Some(trimmed), dest, author_clip, description_clip)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3835,5 +3870,26 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].0, 1);
         assert_eq!(out[1].0, 2);
+    }
+
+    // --- format_ncx_text ---
+
+    #[test]
+    fn format_ncx_text_none_for_empty_or_whitespace_only_input() {
+        assert_eq!(format_ncx_text(None, Some(ShortDescriptionDest::Title), 100, 100), None);
+        assert_eq!(format_ncx_text(Some("   "), Some(ShortDescriptionDest::Title), 100, 100), None);
+    }
+
+    #[test]
+    fn format_ncx_text_none_when_no_destination_given() {
+        assert_eq!(format_ncx_text(Some("hello"), None, 100, 100), None);
+    }
+
+    #[test]
+    fn format_ncx_text_trims_and_truncates_like_generate_short_description() {
+        assert_eq!(
+            format_ncx_text(Some("  hello world  "), Some(ShortDescriptionDest::Title), 100, 100),
+            Some("hello world".to_string())
+        );
     }
 }
