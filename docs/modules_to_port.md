@@ -1531,12 +1531,12 @@ either -- this pass wasn't exhaustive.
 
 ### scraper
 
-- [ ] qt.py
-- [ ] qt_backend.py
-- [ ] simple.py
-- [ ] test_fetch_backend.py
-- [ ] webengine_backend.py
-- [ ] __init__.py
+- [x] qt.py
+- [x] qt_backend.py
+- [x] simple.py
+- [x] test_fetch_backend.py
+- [ ] webengine_backend.py (JS-rendering core is genuinely unportable without embedding a JS-capable browser engine, a new class of dependency; disclosed in `calibre_ebooks::scraper`'s module doc — its plain-HTTP test contract is satisfied via a `WebEngineBrowser` wrapper, but it never executes JavaScript)
+- [x] __init__.py
 
 ### spell
 
