@@ -6,12 +6,14 @@
 //!
 //! The full upstream module is 48 files (~30,900 lines) architected as
 //! a strict sequential pipeline of ~35 file-to-file transformation
-//! passes orchestrated by `ParseRtf.parse_rtf()`. That orchestration
-//! (`ParseRtf.py` itself, and the ~35 later-stage passes it calls) is
-//! deliberately **out of scope** here -- this module ports only the
-//! foundation: the raw-input normalization passes and the two core
-//! parsing stages every later pass builds on. Four follow-up issues
-//! cover the rest of the pipeline in dependency order.
+//! passes orchestrated by `ParseRtf.parse_rtf()`. **All 48 files are
+//! ported** (across this module plus four follow-up issues, #188-#190,
+//! completed in dependency order): [`parse_rtf`] is the orchestrator,
+//! calling every pass below (plus [`add_brackets`] through [`output`])
+//! in Python's own sequential order, threading a `String` through the
+//! whole pipeline rather than Python's real temp-file-per-pass
+//! architecture (see [`parse_rtf`]'s own doc for exactly what pipeline
+//! plumbing that skips).
 //!
 //! # What's here
 //!
@@ -211,6 +213,7 @@ pub mod output;
 pub mod override_table;
 pub mod paragraph_def;
 pub mod paragraphs;
+pub mod parse_rtf;
 pub mod pict;
 pub mod preamble_div;
 pub mod preamble_rest;
