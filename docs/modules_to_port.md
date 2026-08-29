@@ -1526,7 +1526,7 @@ either -- this pass wasn't exhaustive.
 - [ ] csv_xml.py
 - [ ] epub_mobi.py
 - [ ] epub_mobi_builder.py
-- [ ] utils.py
+- [x] utils.py
 - [ ] __init__.py
 
 ### scraper

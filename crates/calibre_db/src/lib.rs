@@ -4,6 +4,7 @@ pub mod backend;
 pub mod backup;
 pub mod book;
 pub mod cache;
+pub mod catalogs;
 pub mod categories;
 pub mod check_library;
 pub mod checksums;
