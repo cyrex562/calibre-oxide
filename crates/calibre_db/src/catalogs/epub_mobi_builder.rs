@@ -2243,6 +2243,309 @@ pub fn generate_html_by_date_added(
     serialize_html_document(&dom, root)
 }
 
+// ===================================================================
+// generate_html_description_header / generate_html_descriptions
+// ===================================================================
+
+/// Port of `old_src/resources/catalog/template.xhtml` -- the one
+/// resource `load_section_templates`-style file this port hardcodes
+/// verbatim rather than reading at runtime (same "CLI/GUI dual-typing
+/// plumbing / local file overrides dropped" precedent as every other
+/// section template in this module).
+const DESCRIPTION_TEMPLATE: &str = r#"<html xmlns="{xmlns}">
+    <head>
+        <title>{title_str}</title>
+        <meta name="catalog description header" http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+        <link rel="stylesheet" type="text/css" href="stylesheet.css" media="screen" />
+    </head>
+    <body>
+        <p class="title">{title}</p>
+        <p class="series_id"><a class="series_id">{series} [{series_index}]</a></p>
+        <hr class="header_divider" />
+        <p class="author">{author_prefix}<a class="author">{author}</a></p>
+        <p class="genres">{genres}</p>
+        <p class="formats">{formats}</p>
+        <table width="100%" border="0">
+          <tr>
+            <td class="thumbnail" rowspan="7">{thumb}</td>
+            <td class="empty"></td>
+          </tr>
+          <tr>
+            <td class="empty"></td>
+          </tr>
+          <tr>
+            <td class="publisher">{publisher}</td>
+          </tr>
+          <tr>
+            <td class="date">{pubyear}</td>
+          </tr>
+          <tr>
+            <td class="rating">{rating}</td>
+          </tr>
+          <tr>
+            <td class="notes">{note_source}: {note_content}</td>
+          </tr>
+          <tr>
+            <td></td>
+          </tr>
+        </table>
+        <hr class="description_divider" />
+        <div class="description">{comments}</div>
+    </body>
+</html>"#;
+
+fn format_named(template: &str, args: &[(&str, &str)]) -> String {
+    template_token_re()
+        .replace_all(template, |caps: &regex::Captures| {
+            args.iter().find(|(k, _)| *k == &caps[1]).map(|(_, v)| v.to_string()).unwrap_or_default()
+        })
+        .into_owned()
+}
+
+fn find_by_tag_class(dom: &calibre_ebooks::dom::Dom, tag: &str, class: &str) -> Option<calibre_ebooks::dom::NodeId> {
+    dom.find_all_tag_global(tag).into_iter().find(|&id| dom.node(id).attrs.get("class").map(|s| s.as_str()) == Some(class))
+}
+
+fn replace_children_with_text(dom: &mut calibre_ebooks::dom::Dom, id: calibre_ebooks::dom::NodeId, text: &str) {
+    let children: Vec<_> = dom.children(id);
+    for child in children {
+        dom.detach(child);
+    }
+    let t = dom.new_text(text);
+    dom.append_child(id, t);
+}
+
+/// Port of `generate_html_description_header`: renders one book's
+/// per-title description page from `DESCRIPTION_TEMPLATE`, then applies
+/// the same conditional post-processing upstream does (blank/remove
+/// elements whose content ended up empty).
+///
+/// **Disclosed simplifications**:
+/// - Drops upstream's final `xml_replace_entities(generated_html)` pass
+///   (a whole-document HTML-entity normalization step run on the raw
+///   templated string before parsing) -- the substituted values here are
+///   already either XML-escaped ([`comments_to_html`]'s own output,
+///   title/author/series via [`escape_xml`]) or plain text, so this
+///   extra normalization pass has no realistic effect worth the
+///   complexity of porting a second, whole-document entity pass distinct
+///   from [`calibre_ebooks::html_entities::decode_entities`] (which
+///   decodes, the opposite direction).
+/// - Drops the `self.opts.connected_kindle and book['id'] in self.
+///   bookmarked_books` branch of `author_prefix` (the "currently
+///   reading" glyph) -- `bookmarked_books` is never populated in this
+///   port (see `fetch_bookmarks`'s own skip note), so that branch is
+///   unreachable here; only the `prefix`-present and plain-"by " cases
+///   remain.
+/// - The `<td class="empty">`/blanked `<td class="publisher">`/`<td
+///   class="notes">` post-processing clears the cell's children and
+///   inserts a single NBSP text node, rather than upstream's swap to a
+///   brand-new `<td>` element (which also happens to drop the `class`
+///   attribute) -- visually and functionally identical once serialized,
+///   since nothing inspects these cells' `class` afterward.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_html_description_header(
+    book: &Value,
+    genre_tags_dict: &indexmap::IndexMap<String, String>,
+    generate_genres: bool,
+    generate_series: bool,
+    generate_authors: bool,
+    rating_full_char: &str,
+    rating_empty_char: &str,
+) -> String {
+    let title = xml_escape_simple(book_str(book, "title"));
+    let (series, series_index) = match book.get("series").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        Some(s) => {
+            let idx = book.get("series_index").map(|v| v.to_string()).unwrap_or_default();
+            (xml_escape_simple(s), idx.strip_suffix(".0").unwrap_or(&idx).to_string())
+        }
+        None => (String::new(), String::new()),
+    };
+
+    let author = xml_escape_simple(book_str(book, "author"));
+    let author_prefix = match book.get("prefix").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        Some(prefix) => format!("{prefix} by "),
+        None => "by ".to_string(),
+    };
+
+    let genre_tags: Vec<String> = book
+        .get("genres")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    let mut sorted_genres = genre_tags.clone();
+    sorted_genres.sort();
+    let genres = sorted_genres
+        .iter()
+        .map(|tag| match (generate_genres, genre_tags_dict.get(tag)) {
+            (true, Some(normalized)) => format!("<a href=\"Genre_{normalized}.html\">{tag}</a>"),
+            _ => format!("<a>{tag}</a>"),
+        })
+        .collect::<Vec<_>>()
+        .join(" \u{b7} ");
+
+    let mut formats: Vec<String> = book
+        .get("formats")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.rsplit('.').next().unwrap_or(s).to_ascii_uppercase())
+                .collect()
+        })
+        .unwrap_or_default();
+    formats.sort();
+    let formats = formats.join(" \u{b7} ");
+
+    let date = book.get("date").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+    let pubyear = match date.and_then(|d| d.split_whitespace().nth(1)) {
+        Some(y) => y.to_string(),
+        None => String::new(),
+    };
+
+    let book_id = book.get("id").and_then(|v| v.as_i64()).unwrap_or_default();
+    let has_cover = book.get("cover").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).is_some();
+    let thumb = if has_cover {
+        format!("<img src=\"../images/thumbnail_{book_id}.jpg\" alt=\"cover thumbnail\"/>")
+    } else {
+        "<img src=\"../images/thumbnail_default.jpg\" alt=\"cover thumbnail\"/>".to_string()
+    };
+
+    let publisher = book.get("publisher").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+
+    let rating = match book.get("rating").and_then(|v| v.as_f64()) {
+        Some(r) if (r as i64) / 2 > 0 => {
+            format!("{} <br/>", generate_rating_string(Some(r), rating_full_char, rating_empty_char))
+        }
+        _ => String::new(),
+    };
+
+    let (note_source, note_content) = match book.get("notes") {
+        Some(Value::Object(notes)) => (
+            notes.get("source").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            notes.get("content").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+        ),
+        _ => (String::new(), String::new()),
+    };
+
+    let comments = book.get("description").and_then(|v| v.as_str()).unwrap_or_default();
+
+    let publisher_display = publisher.unwrap_or(" ");
+    let args: Vec<(&str, &str)> = vec![
+        ("xmlns", "http://www.w3.org/1999/xhtml"),
+        ("title_str", &title),
+        ("title", &title),
+        ("series", &series),
+        ("series_index", &series_index),
+        ("author_prefix", &author_prefix),
+        ("author", &author),
+        ("genres", &genres),
+        ("formats", &formats),
+        ("thumb", &thumb),
+        ("publisher", publisher_display),
+        ("pubyear", &pubyear),
+        ("rating", &rating),
+        ("note_source", &note_source),
+        ("note_content", &note_content),
+        ("comments", comments),
+    ];
+    let generated = format_named(DESCRIPTION_TEMPLATE, &args);
+
+    let mut dom = calibre_ebooks::dom::Dom::parse(&generated);
+    let root = dom.root;
+    let Some(body) = dom.find_first_tag_global("body") else {
+        return generated;
+    };
+
+    let anchor_div = dom.new_element("div");
+    let a_book = dom.new_element("a");
+    set_attr(&mut dom, a_book, "id", format!("book{book_id}"));
+    dom.append_child(anchor_div, a_book);
+    dom.insert_child(body, 0, anchor_div);
+
+    if let Some(series_a) = find_by_tag_class(&dom, "a", "series_id") {
+        if let Some(series_name) = book.get("series").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            if generate_series {
+                set_attr(&mut dom, series_a, "href", format!("BySeries.html#{}", generate_series_anchor(series_name)));
+            }
+        } else {
+            dom.detach(series_a);
+        }
+    }
+
+    if generate_authors {
+        if let Some(author_a) = find_by_tag_class(&dom, "a", "author") {
+            set_attr(&mut dom, author_a, "href", format!("ByAlphaAuthor.html#{}", generate_author_anchor(book_str(book, "author"))));
+        }
+    }
+
+    if publisher.is_none() {
+        if let Some(td) = find_by_tag_class(&dom, "td", "publisher") {
+            replace_children_with_text(&mut dom, td, NBSP);
+        }
+    }
+
+    if genres.is_empty() {
+        if let Some(p) = find_by_tag_class(&dom, "p", "genres") {
+            dom.detach(p);
+        }
+    }
+
+    if formats.is_empty() {
+        if let Some(p) = find_by_tag_class(&dom, "p", "formats") {
+            dom.detach(p);
+        }
+    }
+
+    if note_content.is_empty() {
+        if let Some(td) = find_by_tag_class(&dom, "td", "notes") {
+            replace_children_with_text(&mut dom, td, NBSP);
+        }
+    }
+
+    for td in dom.find_all_tag_global("td") {
+        if dom.node(td).attrs.get("class").map(|s| s.as_str()) == Some("empty") {
+            replace_children_with_text(&mut dom, td, NBSP);
+        }
+    }
+
+    serialize_html_document(&dom, root)
+}
+
+fn xml_escape_simple(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// Port of `generate_html_descriptions`: one `book_{id}.html` file per
+/// book in `books_by_title`. Returns `(book_id, html)` pairs -- writing
+/// each to `content_dir` is the caller's job (cluster F), matching this
+/// module's "pure function, caller does I/O" convention.
+pub fn generate_html_descriptions(
+    books_by_title: &[Value],
+    genre_tags_dict: &indexmap::IndexMap<String, String>,
+    generate_genres: bool,
+    generate_series: bool,
+    generate_authors: bool,
+    rating_full_char: &str,
+    rating_empty_char: &str,
+) -> Vec<(i64, String)> {
+    books_by_title
+        .iter()
+        .map(|book| {
+            let book_id = book.get("id").and_then(|v| v.as_i64()).unwrap_or_default();
+            let html = generate_html_description_header(
+                book,
+                genre_tags_dict,
+                generate_genres,
+                generate_series,
+                generate_authors,
+                rating_full_char,
+                rating_empty_char,
+            );
+            (book_id, html)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3375,5 +3678,162 @@ mod tests {
             generate_html_by_date_added(&books, &[30], a_now(), "epub", true, true, true, false, "*", "-");
         assert!(with_title.contains("id=\"recentlyadded\""), "{with_title}");
         assert!(!without_title.contains("id=\"recentlyadded\""), "{without_title}");
+    }
+
+    // --- generate_html_description_header ---
+
+    fn description_book(fields: &[(&str, Value)]) -> Value {
+        let mut defaults: Vec<(&str, Value)> = vec![
+            ("id", Value::from(1)),
+            ("title", Value::from("Book One")),
+            ("author", Value::from("Alice")),
+            ("series", Value::Null),
+            ("prefix", Value::Null),
+            ("genres", Value::from(Vec::<String>::new())),
+            ("formats", Value::from(Vec::<String>::new())),
+            ("date", Value::Null),
+            ("cover", Value::Null),
+            ("publisher", Value::Null),
+            ("rating", Value::from(0.0)),
+            ("notes", Value::Null),
+            ("description", Value::Null),
+        ];
+        for (k, v) in fields {
+            if let Some(entry) = defaults.iter_mut().find(|(dk, _)| dk == k) {
+                entry.1 = v.clone();
+            } else {
+                defaults.push((k, v.clone()));
+            }
+        }
+        book(&defaults)
+    }
+
+    fn empty_genre_dict() -> indexmap::IndexMap<String, String> {
+        indexmap::IndexMap::new()
+    }
+
+    #[test]
+    fn description_header_produces_a_well_formed_document() {
+        let b = description_book(&[]);
+        let html = generate_html_description_header(&b, &empty_genre_dict(), true, true, true, "*", "-");
+        assert!(html.starts_with("<!DOCTYPE html"), "{html}");
+        assert!(html.contains("<title>Book One</title>"), "{html}");
+        assert!(html.contains("id=\"book1\""), "{html}");
+        assert!(html.contains("thumbnail_default.jpg"), "{html}");
+    }
+
+    #[test]
+    fn description_header_uses_the_real_cover_thumbnail_when_present() {
+        let b = description_book(&[("cover", Value::from("/path/to/cover.jpg"))]);
+        let html = generate_html_description_header(&b, &empty_genre_dict(), true, true, true, "*", "-");
+        assert!(html.contains("thumbnail_1.jpg"), "{html}");
+        assert!(!html.contains("thumbnail_default.jpg"), "{html}");
+    }
+
+    #[test]
+    fn description_header_removes_the_series_link_when_there_is_no_series() {
+        let b = description_book(&[]);
+        let html = generate_html_description_header(&b, &empty_genre_dict(), true, true, true, "*", "-");
+        assert!(!html.contains("class=\"series_id\">Alice"), "{html}");
+        assert!(html.contains("<p class=\"series_id\"></p>"), "{html}");
+    }
+
+    #[test]
+    fn description_header_links_the_series_when_present() {
+        let b = description_book(&[("series", Value::from("Foundation")), ("series_index", Value::from(2.0))]);
+        let html = generate_html_description_header(&b, &empty_genre_dict(), true, true, true, "*", "-");
+        assert!(html.contains("href=\"BySeries.html#foundation_series\""), "{html}");
+        assert!(html.contains("Foundation [2]"), "{html}");
+    }
+
+    #[test]
+    fn description_header_removes_the_genres_paragraph_when_empty() {
+        let b = description_book(&[]);
+        let html = generate_html_description_header(&b, &empty_genre_dict(), true, true, true, "*", "-");
+        assert!(!html.contains("class=\"genres\""), "{html}");
+    }
+
+    #[test]
+    fn description_header_links_genres_to_their_normalized_page() {
+        let mut dict = empty_genre_dict();
+        dict.insert("Sci-Fi".to_string(), "scifi".to_string());
+        let b = description_book(&[("genres", Value::from(vec!["Sci-Fi".to_string()]))]);
+        let html = generate_html_description_header(&b, &dict, true, true, true, "*", "-");
+        assert!(html.contains("href=\"Genre_scifi.html\">Sci-Fi</a>"), "{html}");
+    }
+
+    #[test]
+    fn description_header_removes_the_formats_paragraph_when_empty() {
+        let b = description_book(&[]);
+        let html = generate_html_description_header(&b, &empty_genre_dict(), true, true, true, "*", "-");
+        assert!(!html.contains("class=\"formats\""), "{html}");
+    }
+
+    #[test]
+    fn description_header_lists_uppercased_formats() {
+        let b = description_book(&[("formats", Value::from(vec!["/a/book.epub".to_string()]))]);
+        let html = generate_html_description_header(&b, &empty_genre_dict(), true, true, true, "*", "-");
+        assert!(html.contains(">EPUB<"), "{html}");
+    }
+
+    #[test]
+    fn description_header_blanks_the_publisher_cell_when_absent() {
+        let b = description_book(&[]);
+        let html = generate_html_description_header(&b, &empty_genre_dict(), true, true, true, "*", "-");
+        assert!(html.contains("class=\"publisher\">\u{a0}<"), "{html}");
+    }
+
+    #[test]
+    fn description_header_shows_the_real_publisher_when_present() {
+        let b = description_book(&[("publisher", Value::from("Acme"))]);
+        let html = generate_html_description_header(&b, &empty_genre_dict(), true, true, true, "*", "-");
+        assert!(html.contains("class=\"publisher\">Acme<"), "{html}");
+    }
+
+    #[test]
+    fn description_header_blanks_the_notes_cell_when_no_notes() {
+        let b = description_book(&[]);
+        let html = generate_html_description_header(&b, &empty_genre_dict(), true, true, true, "*", "-");
+        assert!(html.contains("class=\"notes\">\u{a0}<"), "{html}");
+    }
+
+    #[test]
+    fn description_header_shows_notes_when_present() {
+        let mut notes = serde_json::Map::new();
+        notes.insert("source".to_string(), Value::from("Status"));
+        notes.insert("content".to_string(), Value::from("Archived"));
+        let b = description_book(&[("notes", Value::Object(notes))]);
+        let html = generate_html_description_header(&b, &empty_genre_dict(), true, true, true, "*", "-");
+        assert!(html.contains("class=\"notes\">Status: Archived<"), "{html}");
+    }
+
+    #[test]
+    fn description_header_shows_stars_for_a_positive_rating() {
+        let b = description_book(&[("rating", Value::from(8.0))]);
+        let html = generate_html_description_header(&b, &empty_genre_dict(), true, true, true, "*", "-");
+        assert!(html.contains("****-"), "{html}");
+    }
+
+    #[test]
+    fn description_header_empty_cells_get_a_non_breaking_space() {
+        let b = description_book(&[]);
+        let html = generate_html_description_header(&b, &empty_genre_dict(), true, true, true, "*", "-");
+        assert!(html.matches('\u{a0}').count() >= 3, "{html}");
+    }
+
+    #[test]
+    fn description_header_uses_the_prefix_before_by() {
+        let b = description_book(&[("prefix", Value::from("\u{2713}"))]);
+        let html = generate_html_description_header(&b, &empty_genre_dict(), true, true, true, "*", "-");
+        assert!(html.contains("\u{2713} by"), "{html}");
+    }
+
+    #[test]
+    fn generate_html_descriptions_returns_one_entry_per_book() {
+        let books = vec![description_book(&[("id", Value::from(1))]), description_book(&[("id", Value::from(2))])];
+        let out = generate_html_descriptions(&books, &empty_genre_dict(), true, true, true, "*", "-");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].0, 1);
+        assert_eq!(out[1].0, 2);
     }
 }
