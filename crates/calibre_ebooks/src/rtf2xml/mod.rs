@@ -157,8 +157,11 @@
 //!   configuration file, genuinely about environment/filesystem
 //!   interaction (like [`output`]) rather than a content transform.
 //! - [`options_trem`]: a small, RTF-independent `getopt`-like
-//!   command-line option parser -- `get_options.py`'s other
-//!   dependency besides [`configure_txt`].
+//!   command-line option parser -- [`get_options`]'s other dependency
+//!   besides [`configure_txt`].
+//! - [`get_options`]: merges the resolved config file with parsed CLI
+//!   arguments into one final run-options struct, applying CLI
+//!   overrides on top of config-file defaults.
 //!
 //! Built on top of the shapes established here and in the foundation
 //! below.
@@ -166,9 +169,10 @@
 //! # Not here
 //!
 //! Everything else in `old_src/src/calibre/ebooks/rtf2xml/`:
-//! `ParseRtf.py` and `get_options.py`. Tracked by this crate's last
-//! rtf2xml follow-up issue, built on top of the shapes established
-//! here -- most importantly [`process_tokens`]'s intermediate format.
+//! `ParseRtf.py` -- the orchestrator tying every pass above (plus
+//! [`get_options`]) into one pipeline; the very last file in this
+//! crate's rtf2xml port, built on top of the shapes established here
+//! -- most importantly [`process_tokens`]'s intermediate format.
 
 pub mod add_brackets;
 pub mod body_styles;
@@ -189,6 +193,7 @@ pub mod fields_small;
 pub mod fonts;
 pub mod footnote;
 pub mod get_char_map;
+pub mod get_options;
 pub mod group_borders;
 pub mod group_styles;
 pub mod header;
