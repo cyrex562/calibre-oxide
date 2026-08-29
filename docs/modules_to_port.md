@@ -1524,10 +1524,10 @@ either -- this pass wasn't exhaustive.
 
 - [x] bibtex.py
 - [x] csv_xml.py
-- [ ] epub_mobi.py
-- [ ] epub_mobi_builder.py
+- [x] epub_mobi.py
+- [x] epub_mobi_builder.py
 - [x] utils.py
-- [ ] __init__.py
+- [x] __init__.py
 
 ### scraper
 
