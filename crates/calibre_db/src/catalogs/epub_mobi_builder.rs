@@ -1548,6 +1548,137 @@ pub fn generate_html_by_title(
     serialize_html_document(&dom, root)
 }
 
+pub const BY_SERIES_TITLE_TEMPLATE: &str = "[{series_index}] {title} {pubyear_parens}";
+
+/// Port of `generate_html_by_series`: renders `content/BySeries.html`'s
+/// body, or `None` if no book in `books_to_catalog` has a series (matching
+/// upstream's own early return -- upstream additionally sets
+/// `self.opts.generate_series = False` as a side effect so later
+/// generators skip series links entirely; since every generator in this
+/// module already takes `generate_series` as an explicit caller-supplied
+/// parameter rather than reading shared mutable state, propagating that
+/// `None` into `false` for subsequent calls is the caller's job, not
+/// this function's).
+///
+/// Recomputes each book's `prefix` via [`discover_prefix`] against the
+/// book record *as already enriched by [`populate_title`]* (i.e. against
+/// its `filter_excluded_genres`-filtered `tags`, not the original raw
+/// tags [`populate_title`]'s own internal `discover_prefix` call used) --
+/// matching upstream's real `book['prefix'] = self.discover_prefix(book)`
+/// line here precisely, a real (if easy to miss) discrepancy from every
+/// other generator, which just uses [`populate_title`]'s already-computed
+/// `prefix` field unchanged.
+pub fn generate_html_by_series(
+    db: &Cache,
+    books_to_catalog: &[Value],
+    prefix_rules: &[PrefixRule],
+    fmt: &str,
+    generate_for_kindle_mobi: bool,
+    generate_descriptions: bool,
+    generate_authors: bool,
+    rating_full_char: &str,
+    rating_empty_char: &str,
+) -> crate::catalogs::Result<Option<String>> {
+    let friendly_name = "Series";
+
+    let mut books_by_series: Vec<Value> =
+        books_to_catalog.iter().filter(|b| !book_str(b, "series").is_empty()).cloned().collect();
+    if books_by_series.is_empty() {
+        return Ok(None);
+    }
+    books_by_series.sort_by(|a, b| kf_books_by_series_sorter(a).cmp(&kf_books_by_series_sorter(b)));
+
+    let series_sorts: Vec<String> = books_by_series.iter().map(|b| generate_sort_title(book_str(b, "series"))).collect();
+    let sort_equivalents = establish_equivalencies(&series_sorts);
+
+    let (mut dom, root, body) = empty_html_document(friendly_name);
+    let div_tag = dom.new_element("div");
+    let mut current_letter = String::new();
+    let mut current_series: Option<String> = None;
+
+    for (idx, book) in books_by_series.iter_mut().enumerate() {
+        let letter_candidate = letter_or_symbol_str(&sort_equivalents[idx]);
+        if letter_candidate != current_letter {
+            current_letter = letter_candidate;
+            let p_index = dom.new_element("p");
+            set_attr(&mut dom, p_index, "class", "series_letter_index");
+            let a_tag = dom.new_element("a");
+            if current_letter == SYMBOLS {
+                set_attr(&mut dom, a_tag, "id", format!("{SYMBOLS}_series"));
+                dom.append_child(p_index, a_tag);
+                append_text(&mut dom, p_index, SYMBOLS);
+            } else {
+                set_attr(&mut dom, a_tag, "id", format!("{}_series", generate_unicode_name(&current_letter)));
+                dom.append_child(p_index, a_tag);
+                append_text(&mut dom, p_index, &sort_equivalents[idx]);
+            }
+            dom.append_child(div_tag, p_index);
+        }
+
+        let series = book_str(book, "series").to_string();
+        if Some(&series) != current_series.as_ref() {
+            current_series = Some(series.clone());
+            let p_series = dom.new_element("p");
+            set_attr(&mut dom, p_series, "class", if fmt == "mobi" { "series_mobi" } else { "series" });
+            let a_tag = dom.new_element("a");
+            set_attr(&mut dom, a_tag, "id", generate_series_anchor(&series));
+            dom.append_child(p_series, a_tag);
+            append_text(&mut dom, p_series, &series);
+            dom.append_child(div_tag, p_series);
+        }
+
+        let recomputed_prefix = discover_prefix(db, book, prefix_rules)?;
+        if let Value::Object(map) = book {
+            map.insert("prefix".to_string(), recomputed_prefix.map(Value::String).unwrap_or(Value::Null));
+        }
+
+        let p_book = dom.new_element("p");
+        set_attr(&mut dom, p_book, "class", "line_item");
+        insert_prefix(&mut dom, p_book, fmt, book.get("prefix").and_then(|v| v.as_str()));
+
+        let span_tag = dom.new_element("span");
+        set_attr(&mut dom, span_tag, "class", "entry");
+
+        let title_a = dom.new_element("a");
+        if generate_descriptions {
+            let book_id = book.get("id").and_then(|v| v.as_i64()).unwrap_or_default();
+            set_attr(&mut dom, title_a, "href", format!("book_{book_id}.html"));
+        }
+        let args = generate_format_args(book, rating_full_char, rating_empty_char);
+        append_text(&mut dom, title_a, &safe_format(BY_SERIES_TITLE_TEMPLATE, &args));
+        dom.append_child(span_tag, title_a);
+
+        append_text(&mut dom, span_tag, " \u{b7} ");
+
+        let author = book_str(book, "author").to_string();
+        let author_a = dom.new_element("a");
+        if generate_authors {
+            set_attr(&mut dom, author_a, "href", format!("ByAlphaAuthor.html#{}", generate_author_anchor(&author)));
+        }
+        append_text(&mut dom, author_a, &author);
+        dom.append_child(span_tag, author_a);
+
+        dom.append_child(p_book, span_tag);
+        dom.append_child(div_tag, p_book);
+    }
+
+    let p_title = dom.new_element("p");
+    set_attr(&mut dom, p_title, "class", "title");
+    let a_section_start = dom.new_element("a");
+    set_attr(&mut dom, a_section_start, "id", "section_start");
+    dom.append_child(p_title, a_section_start);
+    if !generate_for_kindle_mobi {
+        let a_tag = dom.new_element("a");
+        set_attr(&mut dom, a_tag, "id", friendly_name.to_lowercase().replace(' ', ""));
+        dom.append_child(p_title, a_tag);
+        append_text(&mut dom, p_title, friendly_name);
+    }
+    dom.append_child(body, p_title);
+    dom.append_child(body, div_tag);
+
+    Ok(Some(serialize_html_document(&dom, root)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2413,5 +2544,80 @@ mod tests {
         let books = vec![title_html_book("Book One", "Book One", "Alice", None, None)];
         let html = generate_html_by_title(&books, "epub", false, true, true, "*", "-");
         assert!(html.contains("href=\"book_1.html\""), "{html}");
+    }
+
+    // --- generate_html_by_series ---
+
+    fn series_html_book(id: i32, title: &str, author: &str, series: &str, series_index: f64, tags: &[&str]) -> Value {
+        book(&[
+            ("id", Value::from(id)),
+            ("title", Value::String(title.to_string())),
+            ("title_sort", Value::String(title.to_string())),
+            ("author", Value::String(author.to_string())),
+            ("authors", Value::from(vec![author.to_string()])),
+            ("series", Value::String(series.to_string())),
+            ("series_index", Value::from(series_index)),
+            ("tags", Value::from(tags.iter().map(|t| t.to_string()).collect::<Vec<_>>())),
+        ])
+    }
+
+    #[test]
+    fn generate_html_by_series_none_when_no_book_has_a_series() {
+        let (_dir, cache) = open_test_cache();
+        let books = vec![title_html_book("T", "T", "A", None, None)];
+        let result = generate_html_by_series(&cache, &books, &[], "epub", false, false, true, "*", "-").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn generate_html_by_series_produces_a_well_formed_document() {
+        let (_dir, cache) = open_test_cache();
+        let books = vec![series_html_book(1, "Book One", "Alice", "Foundation", 1.0, &[])];
+        let html = generate_html_by_series(&cache, &books, &[], "epub", false, false, true, "*", "-").unwrap().unwrap();
+        assert!(html.starts_with("<!DOCTYPE html"), "{html}");
+        assert!(html.contains("<title>Series</title>"), "{html}");
+        assert!(html.contains("class=\"series\""), "{html}");
+        assert!(html.contains("id=\"foundation_series\""), "{html}");
+        assert!(html.contains("[1] Book One"), "{html}");
+    }
+
+    #[test]
+    fn generate_html_by_series_groups_multiple_books_under_one_series_header() {
+        let (_dir, cache) = open_test_cache();
+        let books = vec![
+            series_html_book(1, "Book One", "Alice", "Foundation", 1.0, &[]),
+            series_html_book(2, "Book Two", "Alice", "Foundation", 2.0, &[]),
+        ];
+        let html = generate_html_by_series(&cache, &books, &[], "epub", false, false, true, "*", "-").unwrap().unwrap();
+        assert_eq!(html.matches("id=\"foundation_series\"").count(), 1, "{html}");
+        assert!(html.contains("[1] Book One"), "{html}");
+        assert!(html.contains("[2] Book Two"), "{html}");
+    }
+
+    #[test]
+    fn generate_html_by_series_class_is_series_mobi_for_mobi_format() {
+        let (_dir, cache) = open_test_cache();
+        let books = vec![series_html_book(1, "Book One", "Alice", "Foundation", 1.0, &[])];
+        let html = generate_html_by_series(&cache, &books, &[], "mobi", false, false, true, "*", "-").unwrap().unwrap();
+        assert!(html.contains("class=\"series_mobi\""), "{html}");
+    }
+
+    #[test]
+    fn generate_html_by_series_recomputes_the_prefix_from_the_populated_tags() {
+        let (_dir, cache) = open_test_cache();
+        let books = vec![series_html_book(1, "Book One", "Alice", "Foundation", 1.0, &["wishlist"])];
+        let rules = get_prefix_rules(&[("W".to_string(), "tags".to_string(), "wishlist".to_string(), "\u{d7}".to_string())]);
+        let html = generate_html_by_series(&cache, &books, &rules, "epub", false, false, true, "*", "-").unwrap().unwrap();
+        assert!(html.contains('\u{d7}'), "{html}");
+    }
+
+    #[test]
+    fn generate_html_by_series_omits_the_section_title_text_for_kindle_mobi() {
+        let (_dir, cache) = open_test_cache();
+        let books = vec![series_html_book(1, "Book One", "Alice", "Foundation", 1.0, &[])];
+        let with_title = generate_html_by_series(&cache, &books, &[], "epub", false, false, true, "*", "-").unwrap().unwrap();
+        let without_title = generate_html_by_series(&cache, &books, &[], "epub", true, false, true, "*", "-").unwrap().unwrap();
+        assert!(with_title.contains("id=\"series\""), "{with_title}");
+        assert!(!without_title.contains("id=\"series\""), "{without_title}");
     }
 }
