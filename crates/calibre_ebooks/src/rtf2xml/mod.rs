@@ -136,6 +136,9 @@
 //!   merge consecutive paragraphs sharing the same embedded
 //!   `<border-paragraph...>` attribute into one `<border-group>`-wrapped
 //!   run.
+//! - [`inline`]: wrap runs of character-formatted text (bold,
+//!   italics, font-color, ...) in `<inline>` tags, tracking separate
+//!   waiting-group state for list text vs. body text.
 //!
 //! Two more follow-up issues cover the rest of the ~35 passes
 //! (the remaining lists/grouping/tag-conversion passes, and the
@@ -146,7 +149,7 @@
 //!
 //! Everything else in `old_src/src/calibre/ebooks/rtf2xml/`:
 //! `ParseRtf.py` and the remaining later-stage transformation passes
-//! (`convert_to_tags`, `inline`, `output`, and the rest).
+//! (`convert_to_tags`, `output`, and the rest).
 //! Those are tracked by this crate's follow-up rtf2xml issues, built on
 //! top of the shapes established here -- most importantly
 //! [`process_tokens`]'s intermediate format.
@@ -174,6 +177,7 @@ pub mod header;
 pub mod headings_to_sections;
 pub mod hex_2_utf8;
 pub mod info;
+pub mod inline;
 pub mod line_endings;
 pub mod list_numbers;
 pub mod list_table;
