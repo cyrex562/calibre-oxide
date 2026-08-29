@@ -31,6 +31,14 @@
 //!   different issue (jacket-page generation); this port found and fixed a
 //!   real gap in it (a missing `<script>`/`<table>`/etc. sanitize branch)
 //!   before relying on it here.
+//! - `detect_author_sort_mismatches`, `fetch_books_by_title`, and
+//!   `fetch_books_by_author` -- re-sort/re-group `fetch_books_to_catalog`'s
+//!   output by author/title, closing out cluster A (the data-preparation
+//!   layer). `get_output_profile` remains deferred (needs
+//!   `calibre.customize.ui.output_profiles()`, a whole device-profile
+//!   registry this crate has no port of), and `fetch_bookmarks` is
+//!   intentionally skipped -- upstream's own docstring says it's been
+//!   turned off since calibre 0.8.70.
 //!
 //! # Disclosed simplifications
 //!
@@ -119,6 +127,14 @@
 //!   an explicit id list (see `catalogs/mod.rs`'s own doc), so tag
 //!   exclusion happens as a post-fetch filter here instead. Both produce
 //!   the same final row set.
+//! - **No real ICU collation.** Upstream sorts by `sort_key(...)`
+//!   (`calibre.utils.icu`'s locale-aware collation key) in
+//!   `fetch_books_by_author`/`fetch_books_by_title`; this crate has no
+//!   `sort_key`/`collation_order` port (`icu.rs`'s own doc already frames
+//!   it as "for now we use Rust Standard Library unicode methods" for
+//!   every function it *does* have), so these sort by the computed key
+//!   string's plain `Ord` instead -- correct for ASCII-range titles/author
+//!   names, an approximation for accented/non-Latin ones.
 
 use calibre_utils::icu::capitalize;
 use chrono::Datelike;
@@ -840,6 +856,149 @@ pub fn fetch_books_to_catalog(
     rows.iter().map(|record| populate_title(db, record, opts, prefix_rules)).collect()
 }
 
+/// Port of `detect_author_sort_mismatches`. Returns one warning string per
+/// non-fatal mismatch (upstream's `self.error.append(...)` accumulation)
+/// for MOBI-format is instead a hard error on the *first* mismatch
+/// ([`CatalogError::AuthorSortMismatch`]), matching upstream's own
+/// `raise AuthorSortMismatchException` for that format.
+pub fn detect_author_sort_mismatches(books_to_test: &[Value], fmt: &str) -> crate::catalogs::Result<Vec<String>> {
+    if books_to_test.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut books_by_author = books_to_test.to_vec();
+    books_by_author.sort_by(|a, b| kf_books_by_author_sorter_author(a).cmp(&kf_books_by_author_sorter_author(b)));
+
+    let authors: Vec<(String, String)> =
+        books_by_author.iter().map(|r| (book_str(r, "author").to_string(), book_str(r, "author_sort").to_string())).collect();
+
+    let mut warnings = Vec::new();
+    let mut current_author = authors[0].clone();
+    for (i, author) in authors.iter().enumerate() {
+        if *author != current_author && i > 0 {
+            if author.0 == current_author.0 {
+                if fmt == "mobi" {
+                    return Err(CatalogError::AuthorSortMismatch(format!(
+                        "Inconsistent author sort values for author '{}': {} != {}",
+                        author.0, author.1, current_author.1
+                    )));
+                }
+                warnings.push(format!(
+                    "Warning: Inconsistent author sort values for author '{}':\n {} != {}\n",
+                    author.0, author.1, current_author.1
+                ));
+                continue;
+            }
+            current_author = author.clone();
+        }
+    }
+    Ok(warnings)
+}
+
+/// Port of `fetch_books_by_title`.
+pub fn fetch_books_by_title(books_to_catalog: &[Value]) -> crate::catalogs::Result<Vec<Value>> {
+    if books_to_catalog.is_empty() {
+        return Err(CatalogError::EmptyCatalog);
+    }
+    let mut books = books_to_catalog.to_vec();
+    books.sort_by(|a, b| book_str(a, "title_sort").to_uppercase().cmp(&book_str(b, "title_sort").to_uppercase()));
+    Ok(books)
+}
+
+/// Port of `fetch_books_by_author`'s output: `self.books_by_author`,
+/// `self.books_by_description`, `self.authors` (unique authors as
+/// `(friendly, title-cased sort, book count)`), and
+/// `self.individual_authors`.
+#[derive(Debug, Clone, Default)]
+pub struct FetchBooksByAuthorResult {
+    pub books_by_author: Vec<Value>,
+    pub books_by_description: Option<Vec<Value>>,
+    pub authors: Vec<(String, String, usize)>,
+    pub individual_authors: Vec<String>,
+    /// Non-fatal author_sort-mismatch warnings from
+    /// [`detect_author_sort_mismatches`] (dropped for MOBI, which errors
+    /// out of this function entirely on the first mismatch instead).
+    pub warnings: Vec<String>,
+}
+
+/// Port of `fetch_books_by_author`.
+///
+/// The unique-authors grouping loop is a straightforward run-length
+/// group-by over the (already author-sorted) book list rather than a
+/// literal translation of upstream's branch structure -- upstream's
+/// version has a genuine bug for a catalog containing *exactly one book
+/// total*: the single-book path takes a loop branch that never
+/// increments the book-count accumulator, then the post-loop "final
+/// author" check fires *again* despite the single-book branch already
+/// having appended an entry, leaving `unique_authors` with two duplicate
+/// `(author, title, 0)` entries instead of one `(author, title, 1)`. Not
+/// a stable, intentional-looking result (a visible double-counted-zero
+/// glitch, only for the rarest possible catalog size) -- fixed here
+/// rather than preserved, same bar as `process_exclusions`'s
+/// duplicate-survivor fix.
+pub fn fetch_books_by_author(
+    books_to_catalog: &[Value],
+    books_by_title: Option<&[Value]>,
+    cross_reference_authors: bool,
+    generate_descriptions: bool,
+    sort_descriptions_by_author: bool,
+    fmt: &str,
+) -> crate::catalogs::Result<FetchBooksByAuthorResult> {
+    let mut books_by_author = books_to_catalog.to_vec();
+    let warnings = detect_author_sort_mismatches(&books_by_author, fmt)?;
+
+    let mut books_by_description = if generate_descriptions {
+        Some(if sort_descriptions_by_author {
+            books_by_author.clone()
+        } else {
+            books_by_title.map(|t| t.to_vec()).unwrap_or_default()
+        })
+    } else {
+        None
+    };
+
+    if cross_reference_authors {
+        books_by_author = relist_multiple_authors(&books_by_author);
+    }
+
+    let longest_author_sort = books_by_author.iter().map(|b| book_str(b, "author_sort").chars().count()).max().unwrap_or(0);
+    let sort_key_of = |b: &Value| kf_books_by_author_sorter_author_sort(b, longest_author_sort);
+
+    if let Some(v) = &mut books_by_description {
+        v.sort_by(|a, b| sort_key_of(a).cmp(&sort_key_of(b)));
+    }
+    books_by_author.sort_by(|a, b| sort_key_of(a).cmp(&sort_key_of(b)));
+
+    let authors: Vec<(String, String)> =
+        books_by_author.iter().map(|r| (book_str(r, "author").to_string(), capitalize(book_str(r, "author_sort")))).collect();
+
+    let mut unique_authors: Vec<(String, String, usize)> = Vec::new();
+    let mut i = 0;
+    while i < authors.len() {
+        let current = &authors[i];
+        let mut count = 1;
+        while i + count < authors.len() && &authors[i + count] == current {
+            count += 1;
+        }
+        unique_authors.push((current.0.clone(), calibre_utils::icu::title_case(&current.1), count));
+        i += count;
+    }
+
+    let mut individual_authors: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (friendly, _, _) in &unique_authors {
+        for a in friendly.replace(" &amp; ", " & ").split(" & ") {
+            individual_authors.insert(a.to_string());
+        }
+    }
+
+    Ok(FetchBooksByAuthorResult {
+        books_by_author,
+        books_by_description,
+        authors: unique_authors,
+        individual_authors: individual_authors.into_iter().collect(),
+        warnings,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1316,5 +1475,93 @@ mod tests {
         let ids: Vec<i64> = titles.iter().map(|t| t["id"].as_i64().unwrap()).collect();
         assert!(ids.contains(&(keep as i64)));
         assert!(!ids.contains(&(drop as i64)));
+    }
+
+    // --- detect_author_sort_mismatches / fetch_books_by_title / fetch_books_by_author ---
+
+    fn author_book(author: &str, author_sort: &str, title: &str, title_sort: &str) -> Value {
+        book(&[
+            ("author", Value::String(author.to_string())),
+            ("author_sort", Value::String(author_sort.to_string())),
+            ("authors", Value::from(vec![author.to_string()])),
+            ("title", Value::String(title.to_string())),
+            ("title_sort", Value::String(title_sort.to_string())),
+            ("series", Value::Null),
+        ])
+    }
+
+    #[test]
+    fn detect_author_sort_mismatches_warns_for_epub_but_errors_for_mobi() {
+        let books = vec![
+            author_book("Smith, John", "Smith, John", "A", "A"),
+            author_book("Smith, John", "Smyth, John", "B", "B"),
+        ];
+        let warnings = detect_author_sort_mismatches(&books, "epub").unwrap();
+        assert_eq!(warnings.len(), 1);
+
+        let err = detect_author_sort_mismatches(&books, "mobi").unwrap_err();
+        assert!(matches!(err, CatalogError::AuthorSortMismatch(_)));
+    }
+
+    #[test]
+    fn detect_author_sort_mismatches_is_fine_with_consistent_sorts() {
+        let books = vec![author_book("Alice", "Alice", "A", "A"), author_book("Bob", "Bob", "B", "B")];
+        assert_eq!(detect_author_sort_mismatches(&books, "epub").unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn fetch_books_by_title_sorts_case_insensitively_by_title_sort() {
+        let books = vec![author_book("A", "A", "zebra", "zebra"), author_book("B", "B", "Apple", "apple")];
+        let sorted = fetch_books_by_title(&books).unwrap();
+        assert_eq!(sorted[0]["title"], "Apple");
+        assert_eq!(sorted[1]["title"], "zebra");
+    }
+
+    #[test]
+    fn fetch_books_by_title_errors_on_an_empty_catalog() {
+        let err = fetch_books_by_title(&[]).unwrap_err();
+        assert!(matches!(err, CatalogError::EmptyCatalog));
+    }
+
+    #[test]
+    fn fetch_books_by_author_groups_and_counts_unique_authors() {
+        let books = vec![
+            author_book("Alice", "Alice", "Book1", "Book1"),
+            author_book("Alice", "Alice", "Book2", "Book2"),
+            author_book("Bob", "Bob", "Book3", "Book3"),
+        ];
+        let result = fetch_books_by_author(&books, None, false, false, false, "epub").unwrap();
+        let names: Vec<&str> = result.authors.iter().map(|(name, _, _)| name.as_str()).collect();
+        assert_eq!(names, vec!["Alice", "Bob"]);
+        let alice_count = result.authors.iter().find(|(n, _, _)| n == "Alice").unwrap().2;
+        assert_eq!(alice_count, 2);
+        let bob_count = result.authors.iter().find(|(n, _, _)| n == "Bob").unwrap().2;
+        assert_eq!(bob_count, 1);
+    }
+
+    #[test]
+    fn fetch_books_by_author_single_book_catalog_reports_count_one() {
+        // Regression test for the upstream duplicate-zero-count bug this
+        // port deliberately fixes (see fetch_books_by_author's own doc).
+        let books = vec![author_book("Alice", "Alice", "Only Book", "Only Book")];
+        let result = fetch_books_by_author(&books, None, false, false, false, "epub").unwrap();
+        assert_eq!(result.authors, vec![("Alice".to_string(), "Alice".to_string(), 1)]);
+    }
+
+    #[test]
+    fn fetch_books_by_author_splits_multi_author_strings_into_individual_authors() {
+        let books = vec![author_book("Alice & Bob", "Alice & Bob", "Collab", "Collab")];
+        let result = fetch_books_by_author(&books, None, false, false, false, "epub").unwrap();
+        let mut individuals = result.individual_authors.clone();
+        individuals.sort();
+        assert_eq!(individuals, vec!["Alice".to_string(), "Bob".to_string()]);
+    }
+
+    #[test]
+    fn fetch_books_by_author_populates_books_by_description_when_requested() {
+        let books = vec![author_book("Alice", "Alice", "Book1", "Book1")];
+        let result = fetch_books_by_author(&books, None, false, true, true, "epub").unwrap();
+        assert!(result.books_by_description.is_some());
+        assert_eq!(result.books_by_description.unwrap().len(), 1);
     }
 }

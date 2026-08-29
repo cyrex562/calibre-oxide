@@ -113,8 +113,8 @@ pub const TEMPLATE_ALLOWED_FIELDS: &[&str] = &[
 /// exception the DB layer itself raises).
 #[derive(Debug, Error)]
 pub enum CatalogError {
-    #[error("author_sort mismatch")]
-    AuthorSortMismatch,
+    #[error("author_sort mismatch: {0}")]
+    AuthorSortMismatch(String),
     #[error("empty catalog")]
     EmptyCatalog,
     #[error("invalid --fields specified: {0}")]
