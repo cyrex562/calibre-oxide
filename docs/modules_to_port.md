@@ -791,7 +791,7 @@ either -- this pass wasn't exhaustive.
 - [x] list_table.py
 - [x] make_lists.py
 - [x] old_rtf.py
-- [ ] options_trem.py
+- [x] options_trem.py
 - [x] output.py
 - [x] override_table.py
 - [x] paragraph_def.py
