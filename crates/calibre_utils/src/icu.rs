@@ -10,11 +10,29 @@ pub fn upper(text: &str) -> String {
     text.to_uppercase()
 }
 
+/// Port of `calibre.utils.icu.capitalize`: uppercase the first character,
+/// lowercase the rest (`upper(x[0]) + lower(x[1:])`) -- not merely
+/// uppercase-the-first-character-and-leave-the-rest-alone.
 pub fn capitalize(text: &str) -> String {
     let mut c = text.chars();
     match c.next() {
         None => String::new(),
-        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        Some(f) => f.to_uppercase().collect::<String>() + &c.as_str().to_lowercase(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capitalize_uppercases_first_and_lowercases_the_rest() {
+        assert_eq!(capitalize("hello WORLD"), "Hello world");
+    }
+
+    #[test]
+    fn capitalize_of_empty_string_is_empty() {
+        assert_eq!(capitalize(""), "");
     }
 }
 
