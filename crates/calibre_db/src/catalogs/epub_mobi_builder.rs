@@ -6,13 +6,24 @@
 //! `CatalogBuilder` is ~65 methods on one class (4337 lines) -- far larger
 //! than the rest of issue #57 combined -- so this module is being ported
 //! incrementally, cluster by cluster (see the persisted project memory for
-//! the full plan). **What's here so far: the sort/key helper cluster**
-//! (`_kf_author_to_author_sort`, `_kf_books_by_author_sorter_author`,
-//! `_kf_books_by_author_sorter_author_sort`, `_kf_books_by_series_sorter`,
-//! `generate_sort_title`, `letter_or_symbol`, `generate_unicode_name`,
-//! `convert_html_entities`, `generate_author_anchor`, `generate_series_anchor`,
-//! `get_friendly_genre_tag`, `generate_rating_string`) -- the pure string
-//! transforms every later HTML/NCX-generating cluster will call into.
+//! the full plan). **What's here so far**:
+//! - The sort/key helper cluster (`_kf_author_to_author_sort`,
+//!   `_kf_books_by_author_sorter_author`,
+//!   `_kf_books_by_author_sorter_author_sort`, `_kf_books_by_series_sorter`,
+//!   `generate_sort_title`, `letter_or_symbol`, `generate_unicode_name`,
+//!   `convert_html_entities`, `generate_author_anchor`,
+//!   `generate_series_anchor`, `get_friendly_genre_tag`,
+//!   `generate_rating_string`) -- the pure string transforms every later
+//!   HTML/NCX-generating cluster calls into.
+//! - The exclusion/prefix-rules sub-cluster of the data-preparation layer
+//!   (`get_prefix_rules`, `discover_prefix`, `get_excluded_tags`,
+//!   `filter_excluded_genres`, `process_exclusions`,
+//!   `relist_multiple_authors`) -- filters and per-book prefix annotations
+//!   `fetch_books_to_catalog` (not yet ported -- see below) applies while
+//!   building its output. Ported ahead of `fetch_books_to_catalog` itself
+//!   since it needs substantially more new infrastructure
+//!   (`comments_to_html`, an HTML-paragraph-extraction step) this narrower
+//!   slice doesn't.
 //!
 //! # Disclosed simplifications
 //!
@@ -34,9 +45,39 @@
 //!   `output_profile` object (`calibre.customize.ui.output_profiles`) this
 //!   crate has no port of yet -- deferred to whichever cluster ports
 //!   `get_output_profile`.
+//! - **Prefix/exclusion rules arrive already-typed**, not as raw
+//!   `opts.prefix_rules`/`opts.exclusion_rules` strings `eval()`'d into
+//!   tuples -- matches this module's own established "CLI/GUI dual-typing
+//!   plumbing is dropped" precedent (see `bibtex.rs`'s module doc).
+//!   [`PrefixRule`] is `get_prefix_rules`'s one real reshape (a 4-tuple ->
+//!   named-field struct); `get_excluded_tags`/`process_exclusions` take
+//!   `&[(String, String, String)]` triples directly.
+//! - **No `bools_are_tristate` preference.** `discover_prefix`/
+//!   `process_exclusions`'s custom-bool-field handling (substituting a
+//!   locale "False" string for a `None` bool value only when that
+//!   preference is off) has no preference to check here -- this crate
+//!   always takes the "preference is on" branch (no substitution), the
+//!   simpler of upstream's two paths.
+//! - **`process_exclusions`'s duplicate-survivor bug is fixed, not
+//!   preserved.** Upstream accumulates a record into `filtered_data_set`
+//!   on every exclusion-pair miss and removes it (via `list.remove`,
+//!   which only strips the *first* occurrence) on a later hit -- with 2+
+//!   exclusion pairs, a record that missed earlier pairs before finally
+//!   matching one can survive as a literal duplicate in the output. That's
+//!   not a stable, easily-replicated wrong result the way this crate's
+//!   other preserved bugs are (see `rtf2xml`'s fix-vs-preserve bar) -- it's
+//!   an accidental consequence of Python list-mutation order that would
+//!   read as a visible defect (duplicate catalog rows) rather than
+//!   intentional behavior, so this port excludes a record if *any*
+//!   exclusion pair matches it, with no duplicates, matching the code's
+//!   evident intent.
 
 use calibre_utils::icu::capitalize;
+use regex::Regex;
 use serde_json::Value;
+
+use crate::cache::Cache;
+use crate::catalogs::CatalogError;
 
 /// Port of `CatalogBuilder.SYMBOLS` -- upstream is `_('Symbols')` (a
 /// gettext-localized string); this crate has no i18n subsystem to port
@@ -254,6 +295,187 @@ pub fn generate_sort_title(title: &str) -> String {
     translated.join(" ")
 }
 
+/// Port of the model described in `get_prefix_rules`'s docstring:
+/// `('<rule name>', '<#source_field_lookup>', '<pattern>', '<prefix>')`.
+#[derive(Debug, Clone)]
+pub struct PrefixRule {
+    pub name: String,
+    pub field: String,
+    pub pattern: String,
+    pub prefix: String,
+}
+
+/// Port of `get_prefix_rules` -- a pure reshape now that `opts.prefix_rules`
+/// arrives already-typed (see this module's doc).
+pub fn get_prefix_rules(rules: &[(String, String, String, String)]) -> Vec<PrefixRule> {
+    rules
+        .iter()
+        .map(|(name, field, pattern, prefix)| PrefixRule {
+            name: name.clone(),
+            field: field.clone(),
+            pattern: pattern.clone(),
+            prefix: prefix.clone(),
+        })
+        .collect()
+}
+
+fn book_id_of(book: &Value) -> i32 {
+    book.get("id").and_then(|v| v.as_i64()).unwrap_or_default() as i32
+}
+
+/// Port of `discover_prefix`: the first [`PrefixRule`] whose pattern
+/// matches `book`, or `None`.
+pub fn discover_prefix(db: &Cache, book: &Value, prefix_rules: &[PrefixRule]) -> crate::catalogs::Result<Option<String>> {
+    let tags: Vec<String> = book
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_ascii_lowercase())).collect())
+        .unwrap_or_default();
+    let book_id = book_id_of(book);
+
+    for rule in prefix_rules {
+        if rule.field.eq_ignore_ascii_case("tags") {
+            if tags.iter().any(|t| t == &rule.pattern.to_ascii_lowercase()) {
+                return Ok(Some(rule.prefix.clone()));
+            }
+        } else if let Some(label) = rule.field.strip_prefix('#') {
+            let field_contents = db.get_custom_column_value(book_id, label).map_err(CatalogError::Sqlite)?;
+            let field_contents = match field_contents.as_deref() {
+                Some("") | None => None,
+                Some(s) => Some(s.to_string()),
+            };
+            match field_contents {
+                Some(contents) => {
+                    if let Ok(re) = Regex::new(&format!("(?i){}", rule.pattern)) {
+                        if re.is_match(&contents) {
+                            return Ok(Some(rule.prefix.clone()));
+                        }
+                    }
+                }
+                None if rule.pattern == "None" => return Ok(Some(rule.prefix.clone())),
+                None => {}
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Port of `get_excluded_tags`: every tag named by a `"Tags"`-field
+/// exclusion rule, deduplicated. Drops upstream's console logging of
+/// which books get excluded by tag -- a side effect, not part of the
+/// return value.
+pub fn get_excluded_tags(exclusion_rules: &[(String, String, String)]) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for (_, field, pattern) in exclusion_rules {
+        if field == "Tags" {
+            for tag in pattern.split(',') {
+                seen.insert(tag.to_string());
+            }
+        }
+    }
+    seen.into_iter().collect()
+}
+
+/// Port of `filter_excluded_genres`: drop any tag matching `exclude_genre`
+/// (after HTML-entity decoding). On a malformed regex, returns `tags`
+/// unchanged, matching upstream's `except Exception: return tags`.
+pub fn filter_excluded_genres(tags: &[String], exclude_genre: &str) -> Vec<String> {
+    let Ok(re) = Regex::new(exclude_genre) else {
+        return tags.to_vec();
+    };
+    tags.iter()
+        .map(|t| convert_html_entities(t))
+        .filter(|t| !re.is_match(t))
+        .collect()
+}
+
+/// Port of `process_exclusions`: drop every book matched by a
+/// custom-field (`#`-prefixed) exclusion rule. Tag-based exclusion rules
+/// are handled earlier, via [`get_excluded_tags`] narrowing the search
+/// query before books are ever fetched -- this only re-examines
+/// already-fetched books against the *custom-field* rules. See this
+/// module's doc for why the upstream duplicate-survivor behavior is fixed
+/// here rather than preserved.
+pub fn process_exclusions(
+    db: &Cache,
+    data_set: &[Value],
+    exclusion_rules: &[(String, String, String)],
+) -> crate::catalogs::Result<Vec<Value>> {
+    let pairs: Vec<(&str, &str)> = exclusion_rules
+        .iter()
+        .filter(|(_, field, pat)| field.starts_with('#') && !pat.is_empty())
+        .map(|(_, field, pat)| (field.as_str(), pat.as_str()))
+        .collect();
+
+    if pairs.is_empty() {
+        return Ok(data_set.to_vec());
+    }
+
+    let mut filtered = Vec::with_capacity(data_set.len());
+    for record in data_set {
+        let book_id = book_id_of(record);
+        let mut excluded = false;
+        for (field, pattern) in &pairs {
+            let label = field.strip_prefix('#').unwrap_or(field);
+            let field_contents = db.get_custom_column_value(book_id, label).map_err(CatalogError::Sqlite)?;
+            let field_contents = match field_contents.as_deref() {
+                Some("") | None => None,
+                Some(s) => Some(s.to_string()),
+            };
+            match field_contents {
+                Some(contents) => {
+                    if let Ok(re) = Regex::new(&format!("(?i){pattern}")) {
+                        if re.is_match(&contents) {
+                            excluded = true;
+                            break;
+                        }
+                    }
+                }
+                None if *pattern == "None" => {
+                    excluded = true;
+                    break;
+                }
+                None => {}
+            }
+        }
+        if !excluded {
+            filtered.push(record.clone());
+        }
+    }
+    Ok(filtered)
+}
+
+/// Port of `relist_multiple_authors`: for every book with 2+ authors, add
+/// one cloned entry per additional author (each clone's `author`/
+/// `author_sort`/`authors` rotated so that author leads).
+pub fn relist_multiple_authors(books_by_author: &[Value]) -> Vec<Value> {
+    let mut result = books_by_author.to_vec();
+    for book in books_by_author {
+        let Some(authors) = book.get("authors").and_then(|v| v.as_array()) else { continue };
+        let authors: Vec<String> = authors.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect();
+        if authors.len() <= 1 {
+            continue;
+        }
+        let mut rotated = authors.clone();
+        for _ in 1..authors.len() {
+            let first = rotated.remove(0);
+            rotated.push(first);
+            let mut new_book = book.clone();
+            if let Value::Object(map) = &mut new_book {
+                map.insert("author".to_string(), Value::String(rotated.join(" & ")));
+                map.insert("authors".to_string(), Value::from(rotated.clone()));
+                let asl: Vec<String> = rotated
+                    .iter()
+                    .map(|a| calibre_ebooks::metadata::author_to_author_sort(a, None, None, None, None, None, None))
+                    .collect();
+                map.insert("author_sort".to_string(), Value::String(asl.join(" & ")));
+            }
+            result.push(new_book);
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,5 +620,141 @@ mod tests {
     fn generate_sort_title_zero_pads_a_leading_number_for_numeric_sorting() {
         let sorted = generate_sort_title("2001 A Space Odyssey");
         assert!(sorted.starts_with("      2001"), "{sorted:?}");
+    }
+
+    // --- exclusion/prefix rules ---
+
+    use tempfile::tempdir;
+
+    fn open_test_cache() -> (tempfile::TempDir, Cache) {
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).expect("Cache::new should succeed");
+        (dir, cache)
+    }
+
+    fn write_temp_file(dir: &std::path::Path, name: &str, content: &[u8]) -> std::path::PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, content).unwrap();
+        p
+    }
+
+    fn add_test_book(dir: &std::path::Path, cache: &Cache, title: &str) -> i32 {
+        let source = write_temp_file(dir, &format!("{title}.epub"), b"x");
+        let mut meta = calibre_ebooks::metadata::MetaInformation::default();
+        meta.title = title.to_string();
+        meta.authors = vec!["A".to_string()];
+        cache.add_book(&source, &meta).unwrap()
+    }
+
+    #[test]
+    fn get_prefix_rules_reshapes_tuples_into_named_fields() {
+        let rules = vec![("Read".to_string(), "tags".to_string(), "+".to_string(), "\u{2713}".to_string())];
+        let out = get_prefix_rules(&rules);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "Read");
+        assert_eq!(out[0].field, "tags");
+        assert_eq!(out[0].pattern, "+");
+        assert_eq!(out[0].prefix, "\u{2713}");
+    }
+
+    #[test]
+    fn discover_prefix_matches_a_tags_rule_case_insensitively() {
+        let (_dir, cache) = open_test_cache();
+        let rules = get_prefix_rules(&[("Read".to_string(), "tags".to_string(), "wishlist".to_string(), "W".to_string())]);
+        let b = book(&[("id", Value::from(1)), ("tags", Value::from(vec!["Wishlist".to_string()]))]);
+        assert_eq!(discover_prefix(&cache, &b, &rules).unwrap(), Some("W".to_string()));
+    }
+
+    #[test]
+    fn discover_prefix_returns_none_when_nothing_matches() {
+        let (_dir, cache) = open_test_cache();
+        let rules = get_prefix_rules(&[("Read".to_string(), "tags".to_string(), "wishlist".to_string(), "W".to_string())]);
+        let b = book(&[("id", Value::from(1)), ("tags", Value::from(vec!["Fiction".to_string()]))]);
+        assert_eq!(discover_prefix(&cache, &b, &rules).unwrap(), None);
+    }
+
+    #[test]
+    fn discover_prefix_matches_a_custom_field_regex() {
+        let (dir, cache) = open_test_cache();
+        let id = add_test_book(dir.path(), &cache, "T");
+        cache.add_custom_column("status", "Status", "text", false).unwrap();
+        cache.set_custom_column_value(id, "status", "Archived").unwrap();
+
+        let rules = get_prefix_rules(&[("Arch".to_string(), "#status".to_string(), "archiv".to_string(), "A".to_string())]);
+        let b = book(&[("id", Value::from(id))]);
+        assert_eq!(discover_prefix(&cache, &b, &rules).unwrap(), Some("A".to_string()));
+    }
+
+    #[test]
+    fn get_excluded_tags_collects_and_dedupes_tags_rule_values() {
+        let rules = vec![
+            ("Skip".to_string(), "Tags".to_string(), "Catalog,Archived".to_string()),
+            ("Skip2".to_string(), "Tags".to_string(), "Archived".to_string()),
+            ("Other".to_string(), "#status".to_string(), "x".to_string()),
+        ];
+        let mut tags = get_excluded_tags(&rules);
+        tags.sort();
+        assert_eq!(tags, vec!["Archived".to_string(), "Catalog".to_string()]);
+    }
+
+    #[test]
+    fn filter_excluded_genres_drops_matching_tags_and_decodes_entities() {
+        let tags = vec!["[Project Gutenberg]".to_string(), "AT&amp;T".to_string(), "Fiction".to_string()];
+        let filtered = filter_excluded_genres(&tags, r"\[.+\]|^\+$");
+        assert_eq!(filtered, vec!["AT&T".to_string(), "Fiction".to_string()]);
+    }
+
+    #[test]
+    fn filter_excluded_genres_returns_input_unchanged_on_malformed_regex() {
+        let tags = vec!["Fiction".to_string()];
+        assert_eq!(filter_excluded_genres(&tags, "[unclosed"), tags);
+    }
+
+    #[test]
+    fn process_exclusions_drops_books_matching_a_custom_field_rule() {
+        let (dir, cache) = open_test_cache();
+        let keep_id = add_test_book(dir.path(), &cache, "Keep Me");
+        let drop_id = add_test_book(dir.path(), &cache, "Drop Me");
+        cache.add_custom_column("status", "Status", "text", false).unwrap();
+        cache.set_custom_column_value(drop_id, "status", "Archived").unwrap();
+
+        let data = vec![book(&[("id", Value::from(keep_id))]), book(&[("id", Value::from(drop_id))])];
+        let rules = vec![("Arch".to_string(), "#status".to_string(), "archiv".to_string())];
+        let out = process_exclusions(&cache, &data, &rules).unwrap();
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["id"], Value::from(keep_id));
+    }
+
+    #[test]
+    fn process_exclusions_is_a_no_op_with_no_custom_field_rules() {
+        let (_dir, cache) = open_test_cache();
+        let data = vec![book(&[("id", Value::from(1))])];
+        let rules = vec![("Skip".to_string(), "Tags".to_string(), "Archived".to_string())];
+        let out = process_exclusions(&cache, &data, &rules).unwrap();
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn relist_multiple_authors_adds_one_rotated_clone_per_extra_author() {
+        let books = vec![book(&[
+            ("author", Value::String("Alice & Bob & Carol".to_string())),
+            ("authors", Value::from(vec!["Alice".to_string(), "Bob".to_string(), "Carol".to_string()])),
+        ])];
+        let out = relist_multiple_authors(&books);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["author"], "Alice & Bob & Carol");
+        assert_eq!(out[1]["author"], "Bob & Carol & Alice");
+        assert_eq!(out[2]["author"], "Carol & Alice & Bob");
+    }
+
+    #[test]
+    fn relist_multiple_authors_leaves_single_author_books_alone() {
+        let books = vec![book(&[
+            ("author", Value::String("Alice".to_string())),
+            ("authors", Value::from(vec!["Alice".to_string()])),
+        ])];
+        let out = relist_multiple_authors(&books);
+        assert_eq!(out.len(), 1);
     }
 }
