@@ -31,14 +31,24 @@
 //!   different issue (jacket-page generation); this port found and fixed a
 //!   real gap in it (a missing `<script>`/`<table>`/etc. sanitize branch)
 //!   before relying on it here.
-//! - `detect_author_sort_mismatches`, `fetch_books_by_title`, and
-//!   `fetch_books_by_author` -- re-sort/re-group `fetch_books_to_catalog`'s
-//!   output by author/title, closing out cluster A (the data-preparation
-//!   layer). `get_output_profile` remains deferred (needs
-//!   `calibre.customize.ui.output_profiles()`, a whole device-profile
-//!   registry this crate has no port of), and `fetch_bookmarks` is
-//!   intentionally skipped -- upstream's own docstring says it's been
-//!   turned off since calibre 0.8.70.
+//! - `detect_author_sort_mismatches`, `fetch_books_by_title`,
+//!   `fetch_books_by_author`, and `generate_format_args` -- close out
+//!   cluster A (the data-preparation layer). `get_output_profile` remains
+//!   deferred (needs `calibre.customize.ui.output_profiles()`, a whole
+//!   device-profile registry this crate has no port of), and
+//!   `fetch_bookmarks` is intentionally skipped -- upstream's own
+//!   docstring says it's been turned off since calibre 0.8.70.
+//!   `filter_genre_tags` and `establish_equivalencies` are deferred to
+//!   cluster C (their only real consumers are the genre/alphabetical-
+//!   section HTML generators, not this cluster's per-book data prep) --
+//!   `filter_genre_tags` additionally needs a `Cache::all_tags()`-style
+//!   library-wide distinct-tags query this crate doesn't have yet, and
+//!   `establish_equivalencies` needs ICU `collation_order`, in the same
+//!   "no real ICU collation" gap as the sort-key simplification above.
+//!   `dump_custom_fields` is a `self.opts.verbose`-gated debug-log dumper
+//!   with no return value and no effect on any generated output --
+//!   omitted entirely (not even a no-op stub), matching this crate's
+//!   standing convention of dropping debug-print-only code paths.
 //!
 //! # Disclosed simplifications
 //!
@@ -999,6 +1009,50 @@ pub fn fetch_books_by_author(
     })
 }
 
+/// Port of `generate_format_args`'s output shape (`format`-template
+/// substitution args for the `by_*_template.py` section templates --
+/// those templates are cluster C's concern, not yet ported).
+#[derive(Debug, Clone, Default)]
+pub struct FormatArgs {
+    pub title: String,
+    pub series: Option<String>,
+    pub series_index: String,
+    pub rating: String,
+    pub rating_parens: String,
+    pub pubyear: String,
+    pub pubyear_parens: String,
+}
+
+/// Port of `generate_format_args`. `full_char`/`empty_char` are
+/// [`generate_rating_string`]'s own deferred device-profile parameters
+/// (see this module's doc). `rating_parens` is non-empty whenever `book`
+/// has a `"rating"` key at all (even a zero rating) -- since
+/// [`populate_title`]'s output always sets one, every book this is
+/// realistically called on gets a `rating_parens` value, even if
+/// `rating` itself is `""` for an unrated book (matching upstream's own
+/// `'rating' in book` key-existence check, not a truthiness check).
+pub fn generate_format_args(book: &Value, full_char: &str, empty_char: &str) -> FormatArgs {
+    let series_index_raw = book.get("series_index").map(|v| v.to_string()).unwrap_or_default();
+    let series_index = series_index_raw.strip_suffix(".0").unwrap_or(&series_index_raw).to_string();
+
+    let rating = generate_rating_string(book.get("rating").and_then(|v| v.as_f64()), full_char, empty_char);
+    let rating_parens = if book.get("rating").is_some() { format!("({rating})") } else { String::new() };
+
+    let pubyear =
+        book.get("date").and_then(|v| v.as_str()).and_then(|d| d.split_whitespace().nth(1)).unwrap_or("").to_string();
+    let pubyear_parens = if !pubyear.is_empty() { format!("({pubyear})") } else { String::new() };
+
+    FormatArgs {
+        title: book.get("title").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+        series: book.get("series").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        series_index,
+        rating,
+        rating_parens,
+        pubyear,
+        pubyear_parens,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1563,5 +1617,70 @@ mod tests {
         let result = fetch_books_by_author(&books, None, false, true, true, "epub").unwrap();
         assert!(result.books_by_description.is_some());
         assert_eq!(result.books_by_description.unwrap().len(), 1);
+    }
+
+    // --- generate_format_args ---
+
+    fn format_args_book(fields: &[(&str, Value)]) -> Value {
+        book(fields)
+    }
+
+    #[test]
+    fn generate_format_args_strips_a_whole_number_series_index_suffix() {
+        let b = format_args_book(&[("title", Value::from("T")), ("series", Value::Null), ("series_index", Value::from(3.0))]);
+        let args = generate_format_args(&b, "*", "-");
+        assert_eq!(args.series_index, "3");
+    }
+
+    #[test]
+    fn generate_format_args_keeps_a_fractional_series_index() {
+        let b = format_args_book(&[("title", Value::from("T")), ("series", Value::Null), ("series_index", Value::from(3.5))]);
+        let args = generate_format_args(&b, "*", "-");
+        assert_eq!(args.series_index, "3.5");
+    }
+
+    #[test]
+    fn generate_format_args_extracts_the_pubyear_from_the_date_field() {
+        let b = format_args_book(&[
+            ("title", Value::from("T")),
+            ("series", Value::Null),
+            ("series_index", Value::from(0.0)),
+            ("date", Value::from("June 2020")),
+        ]);
+        let args = generate_format_args(&b, "*", "-");
+        assert_eq!(args.pubyear, "2020");
+        assert_eq!(args.pubyear_parens, "(2020)");
+    }
+
+    #[test]
+    fn generate_format_args_empty_pubyear_when_date_is_absent() {
+        let b = format_args_book(&[("title", Value::from("T")), ("series", Value::Null), ("series_index", Value::from(0.0))]);
+        let args = generate_format_args(&b, "*", "-");
+        assert_eq!(args.pubyear, "");
+        assert_eq!(args.pubyear_parens, "");
+    }
+
+    #[test]
+    fn generate_format_args_rating_parens_present_even_for_a_zero_rating() {
+        // Matches upstream's `'rating' in book` key-existence check --
+        // populate_title always sets a rating key (even 0), so
+        // rating_parens is always non-empty for a real populated book,
+        // even though the rating glyph string itself is empty.
+        let b = format_args_book(&[
+            ("title", Value::from("T")),
+            ("series", Value::Null),
+            ("series_index", Value::from(0.0)),
+            ("rating", Value::from(0.0)),
+        ]);
+        let args = generate_format_args(&b, "*", "-");
+        assert_eq!(args.rating, "");
+        assert_eq!(args.rating_parens, "()");
+    }
+
+    #[test]
+    fn generate_format_args_rating_parens_empty_when_no_rating_key_at_all() {
+        let b = format_args_book(&[("title", Value::from("T")), ("series", Value::Null), ("series_index", Value::from(0.0))]);
+        let args = generate_format_args(&b, "*", "-");
+        assert_eq!(args.rating_parens, "");
     }
 }
