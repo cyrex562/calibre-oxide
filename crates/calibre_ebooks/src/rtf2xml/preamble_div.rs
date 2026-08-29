@@ -36,30 +36,30 @@
 //! preamble group and are back at depth 1" signal, regardless of which
 //! group it was.
 //!
-//! # Scope boundary: `list_table.py` / `override_table.py` are not ported here
+//! # `list_table.py` / `override_table.py` integration
 //!
-//! The Python constructs a `list_table.ListTable` and (once a list
-//! table is found) an `override_table.OverrideTable`, and calls their
-//! `parse_list_table`/`parse_override_table` methods to transform the
-//! raw accumulated `\listtable`/`\listoverridetable` group content into
-//! tagged output and to populate `self.__all_lists` (returned by
-//! `make_preamble_divisions` and threaded, much later in the real
-//! pipeline, into the out-of-scope `make_lists.py`, issue #189). Both
-//! `list_table.py` and `override_table.py` are explicitly out of scope
-//! for this issue (see `crate::rtf2xml`'s module docs, "Not here"
-//! section: `list_*` besides [`super::list_numbers`] is a follow-up
-//! issue) and are not ported anywhere else in this crate yet. So
-//! [`list_table_func`] and [`override_table_func`] below faithfully
-//! reproduce only the *division* logic Python performs before handing
-//! off to those parsers -- finding the group's boundaries and
-//! accumulating its raw lines -- and, instead of calling the unported
-//! parsers, pass that raw content straight through unchanged (rather
-//! than the real transformed `mi<tg<...<list-table` tag shape) and
-//! leave [`PreambleDivOutput::list_of_lists`] empty. This is a
-//! deliberate, documented simplification, not a bug being preserved.
+//! When this module was first ported (the foundation/early-structure
+//! issue), `list_table.py`/`override_table.py` didn't exist in this
+//! crate yet, so [`list_table_func`]/[`override_table_func`] only
+//! reproduced the *division* logic (finding the group's boundaries,
+//! accumulating its raw lines) and passed the raw content straight
+//! through, leaving `list_of_lists` always empty. Now that
+//! [`super::list_table`]/[`super::override_table`] exist (issue
+//! #188), this module calls them for real at each group's close --
+//! [`super::list_table::parse_list_table`] to both replace the raw
+//! accumulated content with its real transformed tag output and
+//! populate [`PreambleDivOutput::list_of_lists`], then
+//! [`super::override_table::parse_override_table`] to replace the
+//! override-table's own raw content and mutate that same
+//! `list_of_lists` in place -- matching Python's
+//! `override_table.OverrideTable(list_of_lists=...)` construction
+//! exactly.
 
 use indexmap::IndexMap;
 use thiserror::Error;
+
+use super::list_table::{self, ListInfo};
+use super::override_table;
 
 /// Errors [`make_preamble_divisions`] can return.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -96,23 +96,29 @@ pub enum PreambleDivError {
     /// input.
     #[error("invalid bracket sequence number: {0:?}")]
     InvalidBracketCount(String),
+    /// Port of the `run_level > 3`-gated raise inside
+    /// `list_table.ListTable.parse_list_table`, reached from
+    /// [`list_table_func`]'s new real integration.
+    #[error(transparent)]
+    ListTable(#[from] list_table::ListTableError),
+    /// Port of the raises inside
+    /// `override_table.OverrideTable.parse_override_table`, reached
+    /// from [`override_table_func`]'s new real integration.
+    #[error(transparent)]
+    OverrideTable(#[from] override_table::OverrideTableError),
 }
 
 pub type Result<T> = std::result::Result<T, PreambleDivError>;
 
 /// Result of [`make_preamble_divisions`]: the transformed content plus
-/// the Python's `self.__all_lists` return value.
-///
-/// `list_of_lists` is always empty in this port -- see the module
-/// docs' "Scope boundary" section for why: populating it for real
-/// requires the unported `list_table.py`/`override_table.py`. The
-/// field is kept (rather than dropped) because it's a genuine part of
-/// this function's public API, even though nothing in this crate
-/// consumes it yet.
+/// the Python's `self.__all_lists` return value -- one [`ListInfo`]
+/// per `\list` found in the document's `\listtable`, each with its
+/// `list_id` field populated by any matching `\listoverridetable`
+/// entry (see this module's own doc).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreambleDivOutput {
     pub content: String,
-    pub list_of_lists: Vec<IndexMap<String, String>>,
+    pub list_of_lists: Vec<ListInfo>,
 }
 
 /// Port of `self.__state`'s possible values (`self.__state_dict`'s
@@ -197,13 +203,14 @@ struct State {
     /// the end while updating an existing key's value in place, so
     /// this ordering is semantically observable in the output.
     page: IndexMap<String, String>,
-    all_lists: Vec<IndexMap<String, String>>,
+    all_lists: Vec<ListInfo>,
     out: String,
     no_namespace: bool,
+    run_level: u32,
 }
 
 impl State {
-    fn new(no_namespace: bool) -> Self {
+    fn new(no_namespace: bool, run_level: u32) -> Self {
         State {
             state: Stage::Preamble,
             previous_state: Stage::Preamble,
@@ -226,6 +233,7 @@ impl State {
             all_lists: Vec::new(),
             out: String::new(),
             no_namespace,
+            run_level,
         }
     }
 
@@ -536,13 +544,16 @@ fn found_list_table_func(st: &mut State) {
     st.cb_count = "0".to_string();
 }
 
-/// Port of `__list_table_func`, minus the call into the unported
-/// `list_table.ListTable.parse_list_table` -- see the module docs'
-/// "Scope boundary" section. The raw accumulated group content is
-/// passed through unchanged instead of the real transformed tags.
-fn list_table_func(st: &mut State, line: &str, token: &str) {
+/// Port of `__list_table_func`, including the real call into
+/// [`list_table::parse_list_table`] once the group closes (see this
+/// module's own doc).
+fn list_table_func(st: &mut State, line: &str, token: &str) -> Result<()> {
     if st.cb_count == st.close_group_count {
         st.state = Stage::Preamble;
+        let raw = std::mem::take(&mut st.list_table_final);
+        let (transformed, lists) = list_table::parse_list_table(&raw, st.run_level)?;
+        st.list_table_final = transformed;
+        st.all_lists = lists;
     } else if token.is_empty() {
         // Port of `elif self.__token_info == '': pass` -- guards the
         // synthetic empty-line dispatch `make_preamble_divisions`
@@ -550,6 +561,7 @@ fn list_table_func(st: &mut State, line: &str, token: &str) {
     } else {
         st.list_table_final.push_str(line);
     }
+    Ok(())
 }
 
 /// Port of `__found_override_table_func`, minus constructing the
@@ -561,16 +573,20 @@ fn found_override_table_func(st: &mut State) {
     st.cb_count = "0".to_string();
 }
 
-/// Port of `__override_table_func` -- see [`list_table_func`]'s doc for
-/// why this passes raw content through instead of transforming it.
-fn override_table_func(st: &mut State, line: &str, token: &str) {
+/// Port of `__override_table_func`, including the real call into
+/// [`override_table::parse_override_table`] once the group closes --
+/// see [`list_table_func`]'s doc.
+fn override_table_func(st: &mut State, line: &str, token: &str) -> Result<()> {
     if st.cb_count == st.close_group_count {
         st.state = Stage::Preamble;
+        let raw = std::mem::take(&mut st.override_table_final);
+        st.override_table_final = override_table::parse_override_table(&raw, &mut st.all_lists, st.run_level)?;
     } else if token.is_empty() {
         // See the matching comment in `list_table_func`.
     } else {
         st.override_table_final.push_str(line);
     }
+    Ok(())
 }
 
 /// Port of `__found_revision_table_func`.
@@ -733,8 +749,8 @@ fn dispatch(st: &mut State, line: &str, token: &str) -> Result<()> {
         Stage::FontTable => font_table_func(st, line, token)?,
         Stage::ColorTable => color_table_func(st, line)?,
         Stage::StyleSheet => style_sheet_func(st, line, token)?,
-        Stage::ListTable => list_table_func(st, line, token),
-        Stage::OverrideTable => override_table_func(st, line, token),
+        Stage::ListTable => list_table_func(st, line, token)?,
+        Stage::OverrideTable => override_table_func(st, line, token)?,
         Stage::RevisionTable => revision_table_func(st, line)?,
         Stage::DocInfo => doc_info_func(st, line, token)?,
         Stage::Body => body_func(st, line),
@@ -755,8 +771,8 @@ fn dispatch(st: &mut State, line: &str, token: &str) -> Result<()> {
 /// (out-of-scope, unported) `list_table.ListTable`/
 /// `override_table.OverrideTable` constructors, so there is nothing
 /// for this port to gate on yet.
-pub fn make_preamble_divisions(content: &str, no_namespace: bool) -> Result<PreambleDivOutput> {
-    let mut st = State::new(no_namespace);
+pub fn make_preamble_divisions(content: &str, no_namespace: bool, run_level: u32) -> Result<PreambleDivOutput> {
+    let mut st = State::new(no_namespace, run_level);
 
     // Every real line keeps its trailing `\n` re-attached (mirroring
     // Python's `readline()`, which never strips it) so that every
@@ -831,7 +847,7 @@ mod tests {
             "cw<pf<par-def___<nu<1",
             &cb(1),
         ]);
-        let out = make_preamble_divisions(&content, false).unwrap();
+        let out = make_preamble_divisions(&content, false, 1).unwrap();
         assert!(out.content.contains("mi<mk<rtfhed-beg\nmi<mk<rtfhed-end\n"));
         // rtf1 marker itself is consumed by `found_rtf_head_func`, not
         // accumulated into `rtf_final`, so the wrapped header is empty.
@@ -844,7 +860,7 @@ mod tests {
         // still nominally in `rtf_header` state falls through directly
         // to body, synthesizing a default font table along the way.
         let content = lines(&["cw<ri<rtf_______<nu<1", "cw<pf<par-def___<nu<1"]);
-        let out = make_preamble_divisions(&content, false).unwrap();
+        let out = make_preamble_divisions(&content, false, 1).unwrap();
         assert!(out.content.contains("tx<nu<__________<Times;")); // default font table
         assert!(out.content.contains("mi<tg<open______<body\n"));
         // The triggering par-def line itself is written after the
@@ -865,7 +881,7 @@ mod tests {
             "cw<pf<par-def___<nu<1",
             &cb(1),
         ]);
-        let out = make_preamble_divisions(&content, false).unwrap();
+        let out = make_preamble_divisions(&content, false, 1).unwrap();
         assert!(out.content.contains(
             "mi<tg<open______<font-table\n\
              mi<mk<fonttb-beg\n\
@@ -901,7 +917,7 @@ mod tests {
             "cw<pf<par-def___<nu<1",
             &cb(1),
         ]);
-        let out = make_preamble_divisions(&content, false).unwrap();
+        let out = make_preamble_divisions(&content, false, 1).unwrap();
         // The too-deep group's content never reaches font_table_final.
         assert!(!out.content.contains("dropped"));
         // Everything else in the individual font's own group (both
@@ -927,14 +943,14 @@ mod tests {
             "cw<it<font-table<nu<1",
             &cb(2),
         ]);
-        let err = make_preamble_divisions(&content, false).unwrap_err();
+        let err = make_preamble_divisions(&content, false, 1).unwrap_err();
         assert_eq!(err, PreambleDivError::IgnoreNumUnset);
     }
 
     #[test]
     fn color_table_default_when_absent() {
         let content = lines(&["cw<ri<rtf_______<nu<1", "tx<nu<__________<hello"]);
-        let out = make_preamble_divisions(&content, false).unwrap();
+        let out = make_preamble_divisions(&content, false, 1).unwrap();
         assert!(out.content.contains(
             "mi<tg<open______<color-table\n\
              mi<mk<clrtbl-beg\n\
@@ -949,7 +965,7 @@ mod tests {
     #[test]
     fn style_sheet_default_when_absent() {
         let content = lines(&["cw<ri<rtf_______<nu<1", "tx<nu<__________<hello"]);
-        let out = make_preamble_divisions(&content, false).unwrap();
+        let out = make_preamble_divisions(&content, false, 1).unwrap();
         assert!(out.content.contains("tx<nu<__________<Normal;"));
         assert!(out
             .content
@@ -957,8 +973,8 @@ mod tests {
     }
 
     #[test]
-    fn list_table_and_override_table_pass_through_raw_content() {
-        // {\rtf1 {\fonttbl...} {\*\listtable ...}}
+    fn list_table_group_is_really_parsed_and_populates_list_of_lists() {
+        // {\rtf1 {\fonttbl...} {\*\listtable {\list ...}}}
         let content = lines(&[
             &ob(1),
             "cw<ri<rtf_______<nu<1",
@@ -969,16 +985,59 @@ mod tests {
             &cb(2),
             &ob(2),
             "cw<it<listtable_<nu<1",
-            "cw<ls<list-hybri<nu<1",
+            &ob(3),
+            "cw<ls<list-in-tb<nu<1",
+            "cw<ls<ls-tem-id_<nu<12345",
+            &cb(3),
             &cb(2),
             "cw<pf<par-def___<nu<1",
             &cb(1),
         ]);
-        let out = make_preamble_divisions(&content, false).unwrap();
-        // Raw accumulated content, unwrapped (see module docs' "Scope
-        // boundary" section), still appears in the output.
-        assert!(out.content.contains("cw<ls<list-hybri<nu<1"));
-        assert!(out.list_of_lists.is_empty());
+        let out = make_preamble_divisions(&content, false, 1).unwrap();
+        // The real list_table::parse_list_table ran (not a raw
+        // passthrough) -- its own tag shape is in the output, and
+        // list_of_lists is genuinely populated.
+        assert!(out.content.contains("mi<tg<open-att__<list-in-table<list-template-id>12345\n"), "{}", out.content);
+        assert_eq!(out.list_of_lists.len(), 1);
+        assert_eq!(
+            out.list_of_lists[0].attributes.get("list-template-id").map(String::as_str),
+            Some("12345")
+        );
+    }
+
+    #[test]
+    fn an_override_table_group_matches_a_list_by_table_id_and_populates_list_id() {
+        // {\rtf1 {\fonttbl...} {\*\listtable {\list ...}} {\*\listoverridetable {\listoverride ...}}}
+        let content = lines(&[
+            &ob(1),
+            "cw<ri<rtf_______<nu<1",
+            &ob(2),
+            "cw<it<font-table<nu<1",
+            "cw<ci<font-style<nu<0",
+            "tx<nu<__________<Times;",
+            &cb(2),
+            &ob(2),
+            "cw<it<listtable_<nu<1",
+            &ob(3),
+            "cw<ls<list-in-tb<nu<1",
+            "cw<ls<lis-tbl-id<nu<12345",
+            &cb(3),
+            &cb(2),
+            &ob(2),
+            "cw<it<lovr-table<nu<1",
+            &ob(3),
+            "cw<ls<lis-overid<nu<1",
+            "cw<ls<lis-tbl-id<nu<12345",
+            "cw<ls<list-id___<nu<7",
+            &cb(3),
+            &cb(2),
+            "cw<pf<par-def___<nu<1",
+            &cb(1),
+        ]);
+        let out = make_preamble_divisions(&content, false, 1).unwrap();
+        assert_eq!(out.list_of_lists.len(), 1);
+        assert_eq!(out.list_of_lists[0].list_id, vec!["7".to_string()]);
+        assert!(out.content.contains("mi<tg<empty-att_<override-list"), "{}", out.content);
     }
 
     #[test]
@@ -996,7 +1055,7 @@ mod tests {
             "cw<pf<par-def___<nu<1",
             &cb(1),
         ]);
-        let out = make_preamble_divisions(&content, false).unwrap();
+        let out = make_preamble_divisions(&content, false, 1).unwrap();
         // Existing key (margin-left) updated in place, mid-sequence;
         // brand-new key (paper-width) appended at the end.
         let expected_page_info = "mi<tg<empty-att_<page-definition\
@@ -1012,7 +1071,7 @@ mod tests {
         // so the `None` "woops!" branch is unreachable through the
         // public state machine. Exercised directly here to document
         // the fallback exists and is harmless.
-        let mut st = State::new(false);
+        let mut st = State::new(false, 1);
         let before = st.page.clone();
         margin_func(&mut st, "cw<pa<xxxxxxxxxx<nu<1\n");
         assert_eq!(st.page, before);
@@ -1029,7 +1088,7 @@ mod tests {
             "cw<tb<row-def___<nu<1",
             &cb(1),
         ]);
-        let out = make_preamble_divisions(&content, false).unwrap();
+        let out = make_preamble_divisions(&content, false, 1).unwrap();
         assert!(out.content.contains("mi<tg<open______<body\n"));
         assert!(out.content.contains("cw<tb<row-def___<nu<1\n"));
     }
@@ -1040,7 +1099,7 @@ mod tests {
         // `__text_func`'s `if self.__cb_count == '': cb_count = '0002'`
         // fallback treats this as if we were already back at depth 1.
         let content = "tx<nu<__________<hello\n";
-        let out = make_preamble_divisions(content, false).unwrap();
+        let out = make_preamble_divisions(content, false, 1).unwrap();
         assert!(out.content.contains("mi<tg<open______<body\n"));
         assert!(out.content.ends_with("tx<nu<__________<hello\n"));
     }
@@ -1055,7 +1114,7 @@ mod tests {
         // the triggering line -- a genuine malformed-output bug,
         // preserved as-is.
         let content = "cw<sc<section___<nu<1\n";
-        let out = make_preamble_divisions(content, false).unwrap();
+        let out = make_preamble_divisions(content, false, 1).unwrap();
         assert!(!out.content.contains("mi<tg<open______<preamble\n"));
         assert_eq!(out.content, "cw<sc<section___<nu<1\n");
     }
@@ -1063,8 +1122,8 @@ mod tests {
     #[test]
     fn no_namespace_flag_changes_doc_open_tag() {
         let content = "tx<nu<__________<hello\n";
-        let with_ns = make_preamble_divisions(content, false).unwrap();
-        let without_ns = make_preamble_divisions(content, true).unwrap();
+        let with_ns = make_preamble_divisions(content, false, 1).unwrap();
+        let without_ns = make_preamble_divisions(content, true, 1).unwrap();
         assert!(with_ns
             .content
             .starts_with("mi<tg<open-att__<doc<xmlns>http://rtf2xml.sourceforge.net/\n"));
@@ -1086,7 +1145,7 @@ mod tests {
             "tx<nu<__________<hi",
             &cb(1),
         ]);
-        let out = make_preamble_divisions(&content, false).unwrap();
+        let out = make_preamble_divisions(&content, false, 1).unwrap();
         let expected_tail = format!("{}\n", cb(1));
         assert!(out.content.ends_with(&expected_tail));
         // The synthetic final empty-line dispatch must not add a stray
@@ -1096,7 +1155,7 @@ mod tests {
 
     #[test]
     fn empty_input_produces_default_preamble_and_no_crash() {
-        let out = make_preamble_divisions("", false).unwrap();
+        let out = make_preamble_divisions("", false, 1).unwrap();
         assert_eq!(out.content, "");
         assert!(out.list_of_lists.is_empty());
     }
