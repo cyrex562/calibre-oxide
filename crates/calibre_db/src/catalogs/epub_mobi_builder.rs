@@ -272,6 +272,18 @@ pub fn kf_books_by_series_sorter(book: &Value) -> String {
     )
 }
 
+/// Filter `books_to_catalog` down to books with a non-empty `series`,
+/// sorted by [`kf_books_by_series_sorter`] -- the `self.books_by_series`
+/// list `generate_html_by_series` computes and stashes on `self` for
+/// `generate_ncx_by_series` to reuse. Exposed so the top-level orchestrator
+/// (cluster F) can compute the same list once and pass it to both.
+pub fn compute_books_by_series(books_to_catalog: &[Value]) -> Vec<Value> {
+    let mut books_by_series: Vec<Value> =
+        books_to_catalog.iter().filter(|b| !book_str(b, "series").is_empty()).cloned().collect();
+    books_by_series.sort_by(|a, b| kf_books_by_series_sorter(a).cmp(&kf_books_by_series_sorter(b)));
+    books_by_series
+}
+
 /// Port of `letter_or_symbol`: is `text` alphabetic (once transliterated
 /// to ASCII)? If not, the caller should bucket it under [`SYMBOLS`]
 /// instead of its own leading letter.
@@ -1618,12 +1630,10 @@ pub fn generate_html_by_series(
 ) -> crate::catalogs::Result<Option<String>> {
     let friendly_name = "Series";
 
-    let mut books_by_series: Vec<Value> =
-        books_to_catalog.iter().filter(|b| !book_str(b, "series").is_empty()).cloned().collect();
+    let mut books_by_series = compute_books_by_series(books_to_catalog);
     if books_by_series.is_empty() {
         return Ok(None);
     }
-    books_by_series.sort_by(|a, b| kf_books_by_series_sorter(a).cmp(&kf_books_by_series_sorter(b)));
 
     let series_sorts: Vec<String> = books_by_series.iter().map(|b| generate_sort_title(book_str(b, "series"))).collect();
     let sort_equivalents = establish_equivalencies(&series_sorts);

@@ -57,7 +57,9 @@ use thiserror::Error;
 use crate::cache::Cache;
 
 pub mod bibtex;
+pub mod build;
 pub mod csv_xml;
+pub mod epub_mobi;
 pub mod epub_mobi_builder;
 pub mod ncx;
 pub mod opf;
