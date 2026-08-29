@@ -1940,6 +1940,309 @@ pub fn generate_html_by_genres(
     pages
 }
 
+pub const BY_RECENTLY_ADDED_NORMAL_TITLE_TEMPLATE: &str = "{title}";
+pub const BY_RECENTLY_ADDED_SERIES_TITLE_TEMPLATE: &str = "{title} ({series} [{series_index}])";
+pub const BY_MONTH_ADDED_NORMAL_TITLE_TEMPLATE: &str = "{title} {pubyear_parens}";
+pub const BY_MONTH_ADDED_SERIES_TITLE_TEMPLATE: &str = "[{series_index}] {title} {pubyear_parens}";
+
+fn book_timestamp(book: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    book.get("timestamp").and_then(|v| v.as_str()).and_then(|s| calibre_utils::date::parse_date(s, true))
+}
+
+/// Renders one "recently added" date-range bucket's books into `div_tag`
+/// (title + " · " + author, same line shape as `generate_html_by_title`).
+#[allow(clippy::too_many_arguments)]
+fn append_date_range_section(
+    dom: &mut calibre_ebooks::dom::Dom,
+    div_tag: calibre_ebooks::dom::NodeId,
+    label: &str,
+    books: &[&Value],
+    fmt: &str,
+    generate_descriptions: bool,
+    generate_authors: bool,
+    rating_full_char: &str,
+    rating_empty_char: &str,
+) {
+    if books.is_empty() {
+        return;
+    }
+    let p_index = dom.new_element("p");
+    set_attr(dom, p_index, "class", "date_index");
+    let a_tag = dom.new_element("a");
+    set_attr(dom, a_tag, "id", format!("bda_{}", label.replace(' ', "")));
+    dom.append_child(p_index, a_tag);
+    append_text(dom, p_index, label);
+    dom.append_child(div_tag, p_index);
+
+    for book in books {
+        let p_book = dom.new_element("p");
+        set_attr(dom, p_book, "class", "line_item");
+        insert_prefix(dom, p_book, fmt, book.get("prefix").and_then(|v| v.as_str()));
+
+        let span_tag = dom.new_element("span");
+        set_attr(dom, span_tag, "class", "entry");
+        let title_a = dom.new_element("a");
+        if generate_descriptions {
+            let book_id = book.get("id").and_then(|v| v.as_i64()).unwrap_or_default();
+            set_attr(dom, title_a, "href", format!("book_{book_id}.html"));
+        }
+        let args = generate_format_args(book, rating_full_char, rating_empty_char);
+        let has_series = book.get("series").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).is_some();
+        let template = if has_series { BY_RECENTLY_ADDED_SERIES_TITLE_TEMPLATE } else { BY_RECENTLY_ADDED_NORMAL_TITLE_TEMPLATE };
+        append_text(dom, title_a, &safe_format(template, &args));
+        dom.append_child(span_tag, title_a);
+
+        append_text(dom, span_tag, " \u{b7} ");
+
+        let em_tag = dom.new_element("em");
+        let author = book_str(book, "author");
+        let author_a = dom.new_element("a");
+        if generate_authors {
+            set_attr(dom, author_a, "href", format!("ByAlphaAuthor.html#{}", generate_author_anchor(author)));
+        }
+        append_text(dom, author_a, author);
+        dom.append_child(em_tag, author_a);
+        dom.append_child(span_tag, em_tag);
+
+        dom.append_child(p_book, span_tag);
+        dom.append_child(div_tag, p_book);
+    }
+}
+
+/// Renders one calendar month's books into `div_tag` (author/series
+/// grouping, same shape as `generate_html_by_genre`'s book list), sorted
+/// by `_kf_books_by_author_sorter_author_sort` within the month.
+#[allow(clippy::too_many_arguments)]
+fn append_month_section(
+    dom: &mut calibre_ebooks::dom::Dom,
+    div_tag: calibre_ebooks::dom::NodeId,
+    year: i32,
+    month: u32,
+    month_label: &str,
+    books: &[Value],
+    fmt: &str,
+    generate_series: bool,
+    generate_authors: bool,
+    generate_descriptions: bool,
+    rating_full_char: &str,
+    rating_empty_char: &str,
+) {
+    if books.is_empty() {
+        return;
+    }
+    let longest_author_sort = books.iter().map(|b| book_str(b, "author_sort").chars().count()).max().unwrap_or(0);
+    let mut sorted_books: Vec<&Value> = books.iter().collect();
+    sorted_books.sort_by(|a, b| {
+        kf_books_by_author_sorter_author_sort(a, longest_author_sort)
+            .cmp(&kf_books_by_author_sorter_author_sort(b, longest_author_sort))
+    });
+
+    let p_index = dom.new_element("p");
+    set_attr(dom, p_index, "class", "date_index");
+    let a_tag = dom.new_element("a");
+    set_attr(dom, a_tag, "id", format!("bda_{year}-{month}"));
+    dom.append_child(p_index, a_tag);
+    append_text(dom, p_index, month_label);
+    dom.append_child(div_tag, p_index);
+
+    let mut current_author = String::new();
+    let mut current_series: Option<String> = None;
+    for book in sorted_books {
+        let author = book_str(book, "author").to_string();
+        if author != current_author {
+            current_author = author.clone();
+            current_series = None;
+            let p_author = dom.new_element("p");
+            set_attr(dom, p_author, "class", "author_index");
+            let a_tag = dom.new_element("a");
+            if generate_authors {
+                set_attr(dom, a_tag, "href", format!("ByAlphaAuthor.html#{}", generate_author_anchor(&author)));
+            }
+            append_text(dom, a_tag, &author);
+            dom.append_child(p_author, a_tag);
+            dom.append_child(div_tag, p_author);
+        }
+
+        match book.get("series").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            Some(series) if Some(series.to_string()) != current_series => {
+                current_series = Some(series.to_string());
+                let p_series = dom.new_element("p");
+                set_attr(dom, p_series, "class", if fmt == "mobi" { "series_mobi" } else { "series" });
+                if generate_series {
+                    let a_tag = dom.new_element("a");
+                    set_attr(dom, a_tag, "href", format!("BySeries.html#{}", generate_series_anchor(series)));
+                    append_text(dom, a_tag, series);
+                    dom.append_child(p_series, a_tag);
+                } else {
+                    append_text(dom, p_series, series);
+                }
+                dom.append_child(div_tag, p_series);
+            }
+            None => current_series = None,
+            _ => {}
+        }
+
+        let p_book = dom.new_element("p");
+        set_attr(dom, p_book, "class", "line_item");
+        insert_prefix(dom, p_book, fmt, book.get("prefix").and_then(|v| v.as_str()));
+
+        let span_tag = dom.new_element("span");
+        set_attr(dom, span_tag, "class", "entry");
+        let title_a = dom.new_element("a");
+        if generate_descriptions {
+            let book_id = book.get("id").and_then(|v| v.as_i64()).unwrap_or_default();
+            set_attr(dom, title_a, "href", format!("book_{book_id}.html"));
+        }
+        let args = generate_format_args(book, rating_full_char, rating_empty_char);
+        let template = if current_series.is_some() { BY_MONTH_ADDED_SERIES_TITLE_TEMPLATE } else { BY_MONTH_ADDED_NORMAL_TITLE_TEMPLATE };
+        append_text(dom, title_a, &safe_format(template, &args));
+        dom.append_child(span_tag, title_a);
+        dom.append_child(p_book, span_tag);
+
+        dom.append_child(div_tag, p_book);
+    }
+}
+
+/// Port of `generate_html_by_date_added`: renders `content/ByDateAdded.html`'s
+/// body -- a "recently added" section (day-count buckets from
+/// `date_ranges_days`, e.g. `&[30]` for upstream's default single-bucket
+/// `DATE_RANGE`) followed by a by-calendar-month section, both in one
+/// `<div>`.
+///
+/// **Upstream's multi-bucket day-range logic is genuinely broken, and not
+/// reproduced.** With `DATE_RANGE`'s upstream default (`[30]`, one
+/// element), the accumulation loop only ever runs once, so the bug never
+/// manifests in the actual product -- but tracing what happens with 2+
+/// elements: each outer iteration re-scans the *entire* book list from
+/// the start (not continuing where the previous bucket left off), and a
+/// `date_range_list = [book]` reset between iterations seeds the next
+/// bucket with an unrelated leftover entry that gets duplicated once the
+/// re-scan re-adds it. The result for a hypothetical multi-element
+/// `DATE_RANGE` would be overlapping buckets with duplicate entries, not
+/// upstream's own documented intent ("Multiple numbers create 'Last x
+/// days', 'x to y days ago' ..."). Since this path is unreachable with
+/// the shipped default and the documented intent is clear and simple to
+/// implement correctly, this port partitions books into genuinely
+/// non-overlapping day-count buckets instead of reproducing the broken
+/// (and never-exercised) logic.
+///
+/// `now` replaces upstream's internal `nowf()` wall-clock read -- this
+/// module's "pure function, caller supplies impure inputs" convention
+/// (see `bibtex.rs`'s `generated_at` parameter for the same pattern).
+#[allow(clippy::too_many_arguments)]
+pub fn generate_html_by_date_added(
+    books_to_catalog: &[Value],
+    date_ranges_days: &[i64],
+    now: chrono::DateTime<chrono::Utc>,
+    fmt: &str,
+    generate_for_kindle_mobi: bool,
+    generate_series: bool,
+    generate_authors: bool,
+    generate_descriptions: bool,
+    rating_full_char: &str,
+    rating_empty_char: &str,
+) -> String {
+    let friendly_name = "Recently Added";
+    let (mut dom, root, body) = empty_html_document(friendly_name);
+
+    let p_title = dom.new_element("p");
+    set_attr(&mut dom, p_title, "class", "title");
+    let a_section_start = dom.new_element("a");
+    set_attr(&mut dom, a_section_start, "id", "section_start");
+    dom.append_child(p_title, a_section_start);
+    if !generate_for_kindle_mobi {
+        let a_tag = dom.new_element("a");
+        set_attr(&mut dom, a_tag, "id", friendly_name.to_lowercase().replace(' ', ""));
+        dom.append_child(p_title, a_tag);
+        append_text(&mut dom, p_title, friendly_name);
+    }
+    dom.append_child(body, p_title);
+
+    let div_tag = dom.new_element("div");
+
+    // Recently-added day-count buckets.
+    let mut by_date: Vec<(&Value, chrono::DateTime<chrono::Utc>)> =
+        books_to_catalog.iter().filter_map(|b| book_timestamp(b).map(|ts| (b, ts))).collect();
+    by_date.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let mut lower_bound = 0i64;
+    for (i, &limit) in date_ranges_days.iter().enumerate() {
+        let label =
+            if i == 0 { format!("Last {limit} days") } else { format!("{} to {limit} days ago", date_ranges_days[i - 1]) };
+        let bucket: Vec<&Value> = by_date
+            .iter()
+            .filter(|(_, ts)| {
+                let days = (now - *ts).num_days();
+                days > lower_bound && days <= limit
+            })
+            .map(|(b, _)| *b)
+            .collect();
+        append_date_range_section(
+            &mut dom,
+            div_tag,
+            &label,
+            &bucket,
+            fmt,
+            generate_descriptions,
+            generate_authors,
+            rating_full_char,
+            rating_empty_char,
+        );
+        lower_bound = limit;
+    }
+
+    // By-calendar-month sections.
+    let mut by_month = by_date.clone();
+    by_month.sort_by(|a, b| b.1.cmp(&a.1));
+    let mut current_ym: Option<(i32, u32)> = None;
+    let mut this_months_books: Vec<Value> = Vec::new();
+    for (book, ts) in &by_month {
+        let ym = (ts.year(), ts.month());
+        if Some(ym) != current_ym {
+            if let Some((year, month)) = current_ym {
+                let label = by_month.iter().find(|(_, t)| (t.year(), t.month()) == (year, month)).unwrap().1.format("%B %Y").to_string();
+                append_month_section(
+                    &mut dom,
+                    div_tag,
+                    year,
+                    month,
+                    &label,
+                    &this_months_books,
+                    fmt,
+                    generate_series,
+                    generate_authors,
+                    generate_descriptions,
+                    rating_full_char,
+                    rating_empty_char,
+                );
+            }
+            this_months_books = Vec::new();
+            current_ym = Some(ym);
+        }
+        this_months_books.push((*book).clone());
+    }
+    if let Some((year, month)) = current_ym {
+        let label = by_month.iter().find(|(_, t)| (t.year(), t.month()) == (year, month)).unwrap().1.format("%B %Y").to_string();
+        append_month_section(
+            &mut dom,
+            div_tag,
+            year,
+            month,
+            &label,
+            &this_months_books,
+            fmt,
+            generate_series,
+            generate_authors,
+            generate_descriptions,
+            rating_full_char,
+            rating_empty_char,
+        );
+    }
+
+    dom.append_child(body, div_tag);
+    serialize_html_document(&dom, root)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2986,5 +3289,91 @@ mod tests {
         assert_eq!(pages.len(), 2);
         assert!(pages[0].html.contains("id=\"section_start\""), "{}", pages[0].html);
         assert!(!pages[1].html.contains("id=\"section_start\""), "{}", pages[1].html);
+    }
+
+    // --- generate_html_by_date_added ---
+
+    fn date_added_book(id: i32, title: &str, author: &str, author_sort: &str, timestamp: &str) -> Value {
+        book(&[
+            ("id", Value::from(id)),
+            ("title", Value::String(title.to_string())),
+            ("author", Value::String(author.to_string())),
+            ("author_sort", Value::String(author_sort.to_string())),
+            ("series", Value::Null),
+            ("series_index", Value::from(0.0)),
+            ("timestamp", Value::String(timestamp.to_string())),
+            ("prefix", Value::Null),
+        ])
+    }
+
+    fn a_now() -> chrono::DateTime<chrono::Utc> {
+        calibre_utils::date::parse_date("2024-03-15T12:00:00Z", true).unwrap()
+    }
+
+    #[test]
+    fn generate_html_by_date_added_produces_a_well_formed_document() {
+        let books = vec![date_added_book(1, "Book One", "Alice", "Alice", "2024-03-14T00:00:00Z")];
+        let html =
+            generate_html_by_date_added(&books, &[30], a_now(), "epub", false, true, true, false, "*", "-");
+        assert!(html.starts_with("<!DOCTYPE html"), "{html}");
+        assert!(html.contains("<title>Recently Added</title>"), "{html}");
+    }
+
+    #[test]
+    fn generate_html_by_date_added_recent_book_appears_in_the_day_range_bucket() {
+        let books = vec![date_added_book(1, "Book One", "Alice", "Alice", "2024-03-14T00:00:00Z")];
+        let html =
+            generate_html_by_date_added(&books, &[30], a_now(), "epub", false, true, true, false, "*", "-");
+        assert!(html.contains("Last 30 days"), "{html}");
+        assert!(html.contains("class=\"date_index\""), "{html}");
+        assert!(html.contains("Book One"), "{html}");
+    }
+
+    #[test]
+    fn generate_html_by_date_added_old_book_is_excluded_from_the_day_range_bucket() {
+        // 2024-01-01 is well over 30 days before the fixed `now`
+        // (2024-03-15), so it must not appear in the "Last 30 days"
+        // bucket -- but it still shows up in its own by-month section.
+        let books = vec![date_added_book(1, "Old Book", "Alice", "Alice", "2024-01-01T00:00:00Z")];
+        let html =
+            generate_html_by_date_added(&books, &[30], a_now(), "epub", false, true, true, false, "*", "-");
+        assert!(!html.contains("Last 30 days"), "{html}");
+        assert!(html.contains("January 2024"), "{html}");
+    }
+
+    #[test]
+    fn generate_html_by_date_added_groups_books_by_calendar_month() {
+        let books = vec![
+            date_added_book(1, "Jan Book", "Alice", "Alice", "2024-01-15T00:00:00Z"),
+            date_added_book(2, "Feb Book", "Bob", "Bob", "2024-02-15T00:00:00Z"),
+        ];
+        let html =
+            generate_html_by_date_added(&books, &[30], a_now(), "epub", false, true, true, false, "*", "-");
+        assert!(html.contains("January 2024"), "{html}");
+        assert!(html.contains("February 2024"), "{html}");
+        assert!(html.contains("id=\"bda_2024-1\""), "{html}");
+        assert!(html.contains("id=\"bda_2024-2\""), "{html}");
+    }
+
+    #[test]
+    fn generate_html_by_date_added_same_month_books_share_one_date_index() {
+        let books = vec![
+            date_added_book(1, "Book A", "Alice", "Alice", "2024-01-05T00:00:00Z"),
+            date_added_book(2, "Book B", "Bob", "Bob", "2024-01-20T00:00:00Z"),
+        ];
+        let html =
+            generate_html_by_date_added(&books, &[30], a_now(), "epub", false, true, true, false, "*", "-");
+        assert_eq!(html.matches("id=\"bda_2024-1\"").count(), 1, "{html}");
+    }
+
+    #[test]
+    fn generate_html_by_date_added_omits_the_section_title_text_for_kindle_mobi() {
+        let books = vec![date_added_book(1, "Book One", "Alice", "Alice", "2024-03-14T00:00:00Z")];
+        let with_title =
+            generate_html_by_date_added(&books, &[30], a_now(), "epub", false, true, true, false, "*", "-");
+        let without_title =
+            generate_html_by_date_added(&books, &[30], a_now(), "epub", true, true, true, false, "*", "-");
+        assert!(with_title.contains("id=\"recentlyadded\""), "{with_title}");
+        assert!(!without_title.contains("id=\"recentlyadded\""), "{without_title}");
     }
 }
