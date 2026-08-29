@@ -1523,7 +1523,7 @@ either -- this pass wasn't exhaustive.
 #### catalogs
 
 - [ ] bibtex.py
-- [ ] csv_xml.py
+- [x] csv_xml.py
 - [ ] epub_mobi.py
 - [ ] epub_mobi_builder.py
 - [x] utils.py
