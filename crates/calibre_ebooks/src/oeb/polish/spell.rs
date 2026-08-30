@@ -3,9 +3,11 @@
 //! OPF/NCX/HTML content of a book, for calibre's spell-check UI's
 //! "list every word" and "replace this word everywhere" features. This
 //! is **not** the dictionary-lookup/spell-checking itself
-//! (`calibre.spell.dictionary`, a separate, much larger subsystem this
-//! file only imports `parse_lang_code` from) -- purely extraction and
-//! location bookkeeping, which is fully portable.
+//! (`crate::spell::dictionary`, a separate, much larger subsystem this
+//! file only imports [`DictionaryLocale`]/[`parse_lang_code`]/
+//! [`split_into_words`]/[`index_of`] from -- their canonical home is
+//! `crate::spell`, issue #59's port, not this file) -- purely
+//! extraction and location bookkeeping, which is fully portable.
 //!
 //! # Design note: `TreeNode` instead of a shared tree-node type
 //!
@@ -26,180 +28,21 @@
 //! small tail-lookup helpers here, matching the per-file-private-copy
 //! convention `pretty.rs`/`toc.rs` already established for the `Dom`
 //! half of this).
-//!
-//! # Word segmentation: `unicode-segmentation`, not ICU
-//!
-//! `split_into_words`/`index_of` are backed in Python by
-//! `calibre.spell.break_iterator`, which wraps ICU's `BreakIterator`
-//! (`UBRK_WORD`), a locale-aware, dictionary-based segmenter (important
-//! for languages without whitespace between words, e.g. Thai/Japanese).
-//! This workspace has no ICU binding. [`split_into_words`] instead uses
-//! the `unicode-segmentation` crate's [`UnicodeSegmentation::unicode_words`],
-//! a pure-Rust implementation of Unicode UAX #29 word-boundary rules --
-//! locale-independent (the `lang` parameter is accepted for API
-//! parity but unused), and correct for the overwhelming majority of
-//! real-world text (anything using whitespace/punctuation to separate
-//! words, i.e. every European-family language). It will not segment
-//! dictionary-requiring scripts (Thai, Lao, Khmer, CJK without explicit
-//! separators) as accurately as ICU. This is the documented fidelity
-//! tradeoff called out in this port's tracking issue, not a blocked gap.
-//!
-//! # Locale parsing: narrow `parse_lang_code`, not the full ISO tables
-//!
-//! `calibre.spell.parse_lang_code` depends on
-//! `calibre.utils.localization.canonicalize_lang`/`load_iso3166`, both
-//! large generated tables. Neither `crate::mobi::langcodes` (MOBI's
-//! own numeric-code tables, not BCP-47 string parsing) nor anything
-//! else in this crate covers this. [`parse_lang_code`] ports the
-//! function's actual algorithm (split on `-`/`_`, drop `Cyrl`/`Latn`
-//! script subtags, canonicalize the primary subtag, treat a two-letter
-//! second subtag as a country code) against a narrow, hand-picked
-//! ISO 639-1 -> ISO 639-2/T table covering the common languages real
-//! books are written in, rather than the full multi-hundred-entry
-//! table -- the same "narrow slice, not a full port" boundary this
-//! project draws elsewhere (see `opf.rs`'s own `canonicalize_lang`).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use anyhow::Result;
 use regex::Regex;
-use unicode_segmentation::UnicodeSegmentation;
+
+pub use crate::spell::break_iterator::{index_of, split_into_words};
+pub use crate::spell::{parse_lang_code, DictionaryLocale};
 
 use crate::dom::{Dom, NodeId, NodeKind};
 
 use super::container::Container;
 use super::toc::{find_existing_nav_toc, find_existing_ncx_toc};
 use crate::xmltree::{Xml, XmlNodeId, XmlNodeKind};
-
-// ===================================================================
-// Locale parsing (narrow `calibre.spell.parse_lang_code`)
-// ===================================================================
-
-/// Port of `calibre.spell.DictionaryLocale`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct DictionaryLocale {
-    pub langcode: String,
-    pub countrycode: Option<String>,
-}
-
-impl DictionaryLocale {
-    pub fn new(langcode: impl Into<String>, countrycode: Option<String>) -> Self {
-        DictionaryLocale {
-            langcode: langcode.into(),
-            countrycode,
-        }
-    }
-}
-
-/// Narrow ISO 639-1 -> ISO 639-2/T table. See the module docs.
-const LANG_MAP: &[(&str, &str)] = &[
-    ("en", "eng"),
-    ("fr", "fra"),
-    ("de", "deu"),
-    ("es", "spa"),
-    ("it", "ita"),
-    ("pt", "por"),
-    ("nl", "nld"),
-    ("sv", "swe"),
-    ("da", "dan"),
-    ("no", "nor"),
-    ("fi", "fin"),
-    ("pl", "pol"),
-    ("ru", "rus"),
-    ("ja", "jpn"),
-    ("zh", "zho"),
-    ("ko", "kor"),
-    ("ar", "ara"),
-    ("he", "heb"),
-    ("tr", "tur"),
-    ("el", "ell"),
-    ("cs", "ces"),
-    ("hu", "hun"),
-    ("ro", "ron"),
-    ("uk", "ukr"),
-    ("bg", "bul"),
-    ("hr", "hrv"),
-    ("sr", "srp"),
-    ("sk", "slk"),
-    ("sl", "slv"),
-    ("lt", "lit"),
-    ("lv", "lav"),
-    ("et", "est"),
-    ("is", "isl"),
-    ("ga", "gle"),
-    ("cy", "cym"),
-    ("ca", "cat"),
-    ("eu", "eus"),
-    ("gl", "glg"),
-    ("hi", "hin"),
-    ("bn", "ben"),
-    ("ta", "tam"),
-    ("te", "tel"),
-    ("vi", "vie"),
-    ("th", "tha"),
-    ("id", "ind"),
-    ("ms", "msa"),
-    ("fa", "fas"),
-    ("ur", "urd"),
-];
-
-fn narrow_canonicalize_lang(code: &str) -> Option<String> {
-    let c = code.trim().to_lowercase();
-    if c.is_empty() {
-        return None;
-    }
-    if c.len() == 3 && c.chars().all(|ch| ch.is_ascii_alphabetic()) {
-        return Some(c);
-    }
-    LANG_MAP
-        .iter()
-        .find(|(k, _)| *k == c)
-        .map(|(_, v)| v.to_string())
-}
-
-/// Port of `calibre.spell.parse_lang_code`. See the module docs for the
-/// table-size tradeoff.
-pub fn parse_lang_code(raw: &str) -> std::result::Result<DictionaryLocale, String> {
-    let normalized = raw.replace('_', "-");
-    let mut parts: Vec<&str> = normalized.split('-').collect();
-    if parts.is_empty() {
-        parts.push("");
-    }
-    let lc = narrow_canonicalize_lang(parts[0])
-        .ok_or_else(|| format!("Invalid language code: {raw:?}"))?;
-    parts.retain(|p| *p != "Cyrl" && *p != "Latn");
-    let cc = if parts.len() > 1 {
-        let q = parts[1].to_uppercase();
-        if q.len() == 2 && q.chars().all(|c| c.is_ascii_alphabetic()) {
-            Some(q)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    Ok(DictionaryLocale::new(lc, cc))
-}
-
-// ===================================================================
-// Word segmentation (`calibre.spell.break_iterator`)
-// ===================================================================
-
-/// Port of `split_into_words`. See the module docs: `lang` is accepted
-/// for API parity but unused (`unicode-segmentation` is locale-independent).
-pub fn split_into_words(text: &str, _lang: &str) -> Vec<String> {
-    text.unicode_words().map(|w| w.to_string()).collect()
-}
-
-/// Port of `index_of`: the byte offset of the first word-boundary-aligned
-/// occurrence of `needle` in `haystack`, or `None` if absent.
-pub fn index_of(needle: &str, haystack: &str, _lang: &str) -> Option<usize> {
-    haystack
-        .unicode_word_indices()
-        .find(|(_, w)| *w == needle)
-        .map(|(i, _)| i)
-}
 
 /// Port of `replace`: replaces every whole-word occurrence of
 /// `original_word` in `text` with `new_word`. Returns the new text and
@@ -1238,29 +1081,8 @@ mod tests {
         DictionaryLocale::new("eng", None)
     }
 
-    #[test]
-    fn parse_lang_code_handles_common_forms() {
-        assert_eq!(
-            parse_lang_code("en").unwrap(),
-            DictionaryLocale::new("eng", None)
-        );
-        assert_eq!(
-            parse_lang_code("en-US").unwrap(),
-            DictionaryLocale::new("eng", Some("US".to_string()))
-        );
-        assert_eq!(
-            parse_lang_code("fra").unwrap(),
-            DictionaryLocale::new("fra", None)
-        );
-        assert!(parse_lang_code("").is_err());
-        assert!(parse_lang_code("xx-zz-not-a-lang").is_err());
-    }
-
-    #[test]
-    fn split_into_words_extracts_plain_words() {
-        let words = split_into_words("Hello, world! It's fine.", "eng");
-        assert_eq!(words, vec!["Hello", "world", "It's", "fine"]);
-    }
+    // parse_lang_code/split_into_words are now imported from
+    // crate::spell -- see that module's own tests for their coverage.
 
     #[test]
     fn replace_replaces_whole_word_occurrences_only() {

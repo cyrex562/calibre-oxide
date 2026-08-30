@@ -33,6 +33,7 @@ pub mod rtf;
 pub mod rtf2xml;
 pub mod scraper;
 pub mod snb;
+pub mod spell;
 pub mod textile;
 pub mod txt;
 pub mod unihandecode;

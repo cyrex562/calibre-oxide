@@ -1540,10 +1540,10 @@ either -- this pass wasn't exhaustive.
 
 ### spell
 
-- [ ] break_iterator.py
-- [ ] dictionary.py
-- [ ] import_from.py
-- [ ] __init__.py
+- [x] break_iterator.py (`unicode-segmentation`, not ICU — locale-independent; upstream's hyphen-recombination not replicated, disclosed in `spell/break_iterator.rs`'s module doc)
+- [x] dictionary.py (real spell-checking via `spellbook`, a pure-Rust Hunspell-compatible engine — reads the same vendored `.dic`/`.aff` files; no persisted-prefs store, caller supplies lookup closures instead)
+- [x] import_from.py (`import_from_libreoffice_source_tree`, a maintainer-only build tool, intentionally not ported — disclosed in `spell/import_from.rs`'s module doc; the runtime `.oxt`-import and online-fetch paths are)
+- [x] __init__.py
 
 ### srv
 
