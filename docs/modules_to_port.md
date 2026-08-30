@@ -1567,7 +1567,7 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 - [ ] embedded.py
 - [x] errors.py
 - [ ] fast_css_transform.cpp
-- [ ] fts.py
+- [x] fts.py (search/disable/reindex/indexing/snippets, backed by calibre_db's already-ported FTS5 engine; restriction reinterpreted as a search query, no virtual-library concept; see `calibre_srv::fts`'s module doc)
 - [ ] handler.py
 - [ ] html_as_json.cpp
 - [x] http_request.py (subsumed by `axum`/`hyper`'s own HTTP parsing -- see `calibre_srv`'s crate root doc)

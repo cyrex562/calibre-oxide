@@ -79,11 +79,14 @@
 //!   native WebSocket support) -- see that module's own doc for why
 //!   this is wired up differently than upstream's own incomplete
 //!   implementation.
+//! - [`fts`]: full-text search over indexed book content (`fts.py`),
+//!   backed by `calibre_db`'s already-ported FTS5 engine -- see that
+//!   module's own doc.
 //!
 //! **Deferred to future increments** (not started): `manage_users_cli.py` (a CLI wrapper around
 //! `users.py` this crate's own binary doesn't expose yet),
 //! `render_book.py` (the in-browser EPUB reader), `convert.py`
-//! (server-side conversion), `fts.py` (full-text search), `jobs.py`
+//! (server-side conversion), `jobs.py`
 //! (background job management), `auto_reload.py` (dev-mode
 //! auto-restart), `bonjour.py` (mDNS advertisement), `legacy.py` (the
 //! old pre-content-server API), `library_broker.py` (multi-library
@@ -96,6 +99,7 @@ pub mod books;
 pub mod cdb;
 pub mod content;
 pub mod errors;
+pub mod fts;
 pub mod opds;
 pub mod opts;
 pub mod users;
@@ -152,7 +156,12 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/cdb/set-fields/{book_id}", post(cdb::set_fields))
         .route("/book-get-last-read-position/{library_id}/{which}", get(books::get_last_read_position))
         .route("/book-set-last-read-position/{library_id}/{book_id}/{fmt}", post(books::set_last_read_position))
-        .route("/web-socket", get(web_socket::upgrade));
+        .route("/web-socket", get(web_socket::upgrade))
+        .route("/fts/search", get(fts::search))
+        .route("/fts/disable", post(fts::disable))
+        .route("/fts/reindex", post(fts::reindex))
+        .route("/fts/indexing", post(fts::indexing))
+        .route("/fts/snippets/{book_ids}", get(fts::snippets));
 
     api.route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth)).with_state(state)
 }
