@@ -66,7 +66,7 @@ fn get_pagination(num: Option<i64>, offset: Option<i64>) -> Result<(i64, i64), S
 /// URLs (matching `opds::acquisition_entry`'s own URL scheme), and
 /// halves `rating` (0..10 storage -> 0..5 display), matching
 /// upstream's non-`device_compatible` path.
-fn book_json(row: &Value) -> Value {
+pub(crate) fn book_json(row: &Value) -> Value {
     let book_id = row["id"].as_i64().unwrap_or(0);
     let mut out = row.as_object().cloned().unwrap_or_default();
     out.remove("size");
@@ -98,7 +98,7 @@ fn book_json(row: &Value) -> Value {
     Value::Object(out)
 }
 
-async fn fetch_rows(state: &AppState, ids: HashSet<i32>) -> Result<Vec<Value>, ServerError> {
+pub(crate) async fn fetch_rows(state: &AppState, ids: HashSet<i32>) -> Result<Vec<Value>, ServerError> {
     tokio::task::spawn_blocking({
         let cache = state.cache.clone();
         move || cache.get_data_as_dict(None, false, Some(&ids), false)

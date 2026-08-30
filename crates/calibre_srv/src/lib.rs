@@ -64,9 +64,13 @@
 //!   metadata, category browsing, and search as JSON instead of Atom
 //!   -- see that module's doc for what's narrowed relative to
 //!   upstream's full `field_metadata`-driven version.
+//! - [`cdb`]: a subset of the write/mutation JSON API (`cdb.py`) --
+//!   delete-books, set-cover, set-fields (metadata/cover/format
+//!   edits). Not ported: the generic `calibredb`-CLI-over-HTTP
+//!   dispatcher, add-book, copy-to-library -- see that module's own
+//!   doc for why.
 //!
-//! **Deferred to future increments** (not started): `cdb.py` (the
-//! write/mutation JSON API), `manage_users_cli.py` (a CLI wrapper around
+//! **Deferred to future increments** (not started): `manage_users_cli.py` (a CLI wrapper around
 //! `users.py` this crate's own binary doesn't expose yet),
 //! `render_book.py` (the in-browser EPUB reader), `convert.py`
 //! (server-side conversion), `fts.py` (full-text search), `jobs.py`
@@ -79,6 +83,7 @@
 
 pub mod ajax;
 pub mod auth;
+pub mod cdb;
 pub mod content;
 pub mod errors;
 pub mod opds;
@@ -127,7 +132,10 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/ajax/category/{name}", get(ajax::category))
         .route("/ajax/books_in/{category}/{item_id}", get(ajax::books_in))
         .route("/ajax/search", get(ajax::search))
-        .route("/ajax/library-info", get(ajax::library_info));
+        .route("/ajax/library-info", get(ajax::library_info))
+        .route("/cdb/delete-books/{book_ids}", post(cdb::delete_books))
+        .route("/cdb/set-cover/{book_id}", post(cdb::set_cover))
+        .route("/cdb/set-fields/{book_id}", post(cdb::set_fields));
 
     api.route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth)).with_state(state)
 }
