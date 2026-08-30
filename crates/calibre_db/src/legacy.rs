@@ -418,7 +418,7 @@ impl LegacyDb {
         sort: &str,
         ids: Option<&HashSet<i32>>,
     ) -> Result<IndexMap<String, Vec<Tag>>> {
-        categories::get_categories(&self.new_api, sort, ids)
+        categories::get_categories(&self.new_api.lock().unwrap(), sort, ids)
     }
 
     /// `mi_title`/`mi_authors` stand in for upstream's `Metadata`

@@ -43,7 +43,6 @@ use crate::cache::Cache;
 use anyhow::{bail, Result};
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
 
 /// A narrower version of upstream's `Tag` class: just the fields this
 /// pass actually computes (name/id/count/average rating), not the
@@ -167,17 +166,12 @@ fn sort_tags(tags: &mut [Tag], sort: &str) {
 /// upstream's own `raise ValueError`. `book_ids` restricts the count
 /// to a subset of books (e.g. a search result), matching upstream's
 /// own optional filter.
-pub fn get_categories(
-    cache: &Arc<Mutex<Cache>>,
-    sort: &str,
-    book_ids: Option<&HashSet<i32>>,
-) -> Result<IndexMap<String, Vec<Tag>>> {
+pub fn get_categories(cache: &Cache, sort: &str, book_ids: Option<&HashSet<i32>>) -> Result<IndexMap<String, Vec<Tag>>> {
     if !matches!(sort, "name" | "popularity" | "rating") {
         bail!("sort {sort} not a valid value");
     }
 
-    let guard = cache.lock().unwrap();
-    let conn = guard.backend.conn.lock().unwrap();
+    let conn = cache.backend.conn.lock().unwrap();
 
     let mut ratings: HashMap<i32, i32> = HashMap::new();
     {
@@ -210,27 +204,42 @@ pub fn get_categories(
     Ok(categories)
 }
 
+/// Port of `LibraryDatabase2.get_books_for_category` restricted to
+/// this module's five standard categories (see the module doc): every
+/// book id linked to item `item_id` in `category`. `category` must be
+/// one of `STANDARD_CATEGORIES`' keys; anything else (composite
+/// columns, `"search"`, `"news"`) is out of scope, matching this
+/// module's own narrowed category list, and returns an error rather
+/// than silently an empty set.
+pub fn book_ids_for_category_item(cache: &Cache, category: &str, item_id: i32) -> Result<HashSet<i32>> {
+    let Some(&(_, link_table, link_column, _, _)) = STANDARD_CATEGORIES.iter().find(|(key, ..)| *key == category) else {
+        bail!("category {category} not found");
+    };
+    let conn = cache.backend.conn.lock().unwrap();
+    let sql = format!("SELECT book FROM {link_table} WHERE {link_column} = ?1");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([item_id], |row| row.get::<_, i32>(0))?;
+    let mut out = HashSet::new();
+    for row in rows {
+        out.insert(row?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::backend::Backend;
     use tempfile::tempdir;
 
-    fn open_test_cache() -> (tempfile::TempDir, Arc<Mutex<Cache>>) {
+    fn open_test_cache() -> (tempfile::TempDir, Cache) {
         let dir = tempdir().unwrap();
         let backend = Backend::new(dir.path()).unwrap();
-        (dir, Arc::new(Mutex::new(Cache::from_backend(backend))))
+        (dir, Cache::from_backend(backend))
     }
 
-    fn insert_book_with_author_tag_rating(
-        cache: &Arc<Mutex<Cache>>,
-        title: &str,
-        author: &str,
-        tag: &str,
-        rating: Option<i32>,
-    ) -> i32 {
-        let guard = cache.lock().unwrap();
-        let conn = guard.backend.conn.lock().unwrap();
+    fn insert_book_with_author_tag_rating(cache: &Cache, title: &str, author: &str, tag: &str, rating: Option<i32>) -> i32 {
+        let conn = cache.backend.conn.lock().unwrap();
         conn.execute("INSERT INTO books (title) VALUES (?1)", [title])
             .unwrap();
         let book_id = conn.last_insert_rowid() as i32;
@@ -344,5 +353,25 @@ mod tests {
     fn get_categories_rejects_an_invalid_sort_value() {
         let (_dir, cache) = open_test_cache();
         assert!(get_categories(&cache, "bogus", None).is_err());
+    }
+
+    #[test]
+    fn book_ids_for_category_item_finds_every_book_with_that_author() {
+        let (_dir, cache) = open_test_cache();
+        let id1 = insert_book_with_author_tag_rating(&cache, "A", "Jane Doe", "fiction", None);
+        let id2 = insert_book_with_author_tag_rating(&cache, "B", "Jane Doe", "fiction", None);
+        insert_book_with_author_tag_rating(&cache, "C", "John Smith", "fiction", None);
+
+        let cats = get_categories(&cache, "name", None).unwrap();
+        let jane_id = cats["authors"].iter().find(|t| t.name == "Jane Doe").unwrap().id;
+
+        let ids = book_ids_for_category_item(&cache, "authors", jane_id).unwrap();
+        assert_eq!(ids, [id1, id2].into_iter().collect());
+    }
+
+    #[test]
+    fn book_ids_for_category_item_rejects_an_unknown_category() {
+        let (_dir, cache) = open_test_cache();
+        assert!(book_ids_for_category_item(&cache, "bogus", 1).is_err());
     }
 }

@@ -393,8 +393,7 @@ impl Library {
     pub fn get_categories(
         &self,
     ) -> Result<std::collections::HashMap<String, Vec<crate::categories::Tag>>, LibraryError> {
-        let cache = Arc::new(Mutex::new(self.as_cache()));
-        let cats = crate::categories::get_categories(&cache, "name", None)
+        let cats = crate::categories::get_categories(&self.as_cache(), "name", None)
             .map_err(|e| LibraryError::Transaction(e.to_string()))?;
         Ok(cats.into_iter().collect())
     }
