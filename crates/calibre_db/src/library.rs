@@ -286,8 +286,7 @@ impl Library {
         new_cover_path: &Path,
     ) -> Result<(), LibraryError> {
         let data = fs::read(new_cover_path)?;
-        let cache = Arc::new(Mutex::new(self.as_cache()));
-        crate::covers::set_cover(&cache, book_id, &data)
+        crate::covers::set_cover(&self.as_cache(), book_id, &data)
             .map_err(|e| LibraryError::Transaction(e.to_string()))
     }
 
