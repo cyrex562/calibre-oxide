@@ -102,7 +102,6 @@ use calibre_utils::search_query_parser::{Parser as QueryParser, SearchNode};
 use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Utc};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use unicode_normalization::UnicodeNormalization;
 
@@ -1029,10 +1028,9 @@ fn evaluate(
 /// Port of the top-level search entry point (a narrowed
 /// `Search.__call__`/`_do_search`, without the `LRUCache` query cache
 /// or virtual-library restriction handling -- see module docs).
-pub fn search(cache: &Arc<Mutex<Cache>>, query: &str) -> anyhow::Result<Vec<i32>> {
+pub fn search(cache: &Cache, query: &str) -> anyhow::Result<Vec<i32>> {
     let query = query.trim();
-    let guard = cache.lock().unwrap();
-    let all_ids: HashSet<i32> = guard.all_book_ids()?.into_iter().collect();
+    let all_ids: HashSet<i32> = cache.all_book_ids()?.into_iter().collect();
     if query.is_empty() {
         let mut v: Vec<i32> = all_ids.into_iter().collect();
         v.sort_unstable();
@@ -1042,7 +1040,7 @@ pub fn search(cache: &Arc<Mutex<Cache>>, query: &str) -> anyhow::Result<Vec<i32>
     let tree = parser
         .parse(query)
         .map_err(|e| SearchError::Parse(e.to_string()))?;
-    let matches = evaluate(&guard, &tree, &all_ids)?;
+    let matches = evaluate(cache, &tree, &all_ids)?;
     let mut v: Vec<i32> = matches.into_iter().collect();
     v.sort_unstable();
     Ok(v)
@@ -1422,7 +1420,6 @@ mod tests {
         let (_dir, cache) = make_cache();
         insert_book(&cache, "Foundation", &["Isaac Asimov"], &["scifi"]);
         insert_book(&cache, "Dune", &["Frank Herbert"], &["scifi", "classic"]);
-        let cache = Arc::new(Mutex::new(cache));
         let ids = search(&cache, "foundation").unwrap();
         assert_eq!(ids, vec![1]);
     }
@@ -1432,7 +1429,6 @@ mod tests {
         let (_dir, cache) = make_cache();
         insert_book(&cache, "Foundation", &["Isaac Asimov"], &["scifi"]);
         insert_book(&cache, "Dune", &["Frank Herbert"], &["scifi", "classic"]);
-        let cache = Arc::new(Mutex::new(cache));
         let ids = search(&cache, "author:herbert").unwrap();
         assert_eq!(ids, vec![2]);
     }
@@ -1443,7 +1439,6 @@ mod tests {
         insert_book(&cache, "Foundation", &["Isaac Asimov"], &["scifi"]);
         insert_book(&cache, "Dune", &["Frank Herbert"], &["scifi", "classic"]);
         insert_book(&cache, "Emma", &["Jane Austen"], &["classic"]);
-        let cache = Arc::new(Mutex::new(cache));
 
         assert_eq!(
             search(&cache, "tag:scifi and tag:classic").unwrap(),
@@ -1471,7 +1466,6 @@ mod tests {
             &["Isaac Asimov", "Robert Silverberg"],
             &[],
         );
-        let cache = Arc::new(Mutex::new(cache));
         assert!(search(&cache, "author:\"Asimov & Robert\"")
             .unwrap()
             .is_empty());
@@ -1482,7 +1476,6 @@ mod tests {
     fn search_unknown_location_matches_nothing_without_erroring() {
         let (_dir, cache) = make_cache();
         insert_book(&cache, "Foundation", &["Isaac Asimov"], &[]);
-        let cache = Arc::new(Mutex::new(cache));
         assert!(search(&cache, "nosuchfield:foo").unwrap().is_empty());
     }
 
@@ -1491,7 +1484,6 @@ mod tests {
         let (_dir, cache) = make_cache();
         insert_book(&cache, "Foundation", &["Isaac Asimov"], &[]);
         insert_book(&cache, "Dune", &["Frank Herbert"], &[]);
-        let cache = Arc::new(Mutex::new(cache));
         assert_eq!(search(&cache, "").unwrap(), vec![1, 2]);
     }
 }

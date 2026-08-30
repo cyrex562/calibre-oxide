@@ -318,8 +318,7 @@ impl Library {
     /// See this module's docs for why that engine was previously
     /// unreachable from the CLI.
     pub fn search(&self, query: &str) -> Result<Vec<i32>, LibraryError> {
-        let cache = Arc::new(Mutex::new(self.as_cache()));
-        crate::search::search(&cache, query).map_err(|e| LibraryError::Transaction(e.to_string()))
+        crate::search::search(&self.as_cache(), query).map_err(|e| LibraryError::Transaction(e.to_string()))
     }
 
     pub fn get_book(&self, id: i32) -> Result<Option<Book>, LibraryError> {

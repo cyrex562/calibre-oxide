@@ -1579,7 +1579,7 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 - [x] loop.py (subsumed by `tokio`'s async runtime)
 - [ ] manage_users_cli.py (`calibre_srv`'s own `--add-user` flag covers the one thing needed to exercise `--auth`; the full CLI isn't ported)
 - [ ] metadata.py
-- [ ] opds.py (partial -- root nav feed, title/newest acquisition feeds, and category/categorygroup browsing; no search/multi-library yet; see `calibre_srv::opds`'s module doc)
+- [ ] opds.py (partial -- root nav feed, title/newest acquisition feeds, category/categorygroup browsing, and query-language search; no multi-library yet; see `calibre_srv::opds`'s module doc)
 - [x] opts.py
 - [x] pool.py (subsumed by `tokio`'s task scheduler)
 - [ ] pre_activated.py
