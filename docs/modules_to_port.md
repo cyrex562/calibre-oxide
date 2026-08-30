@@ -1559,7 +1559,7 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 - [ ] auto_reload.py
 - [ ] bonjour.py
 - [ ] books.py
-- [ ] cdb.py
+- [ ] cdb.py (partial -- delete-books, set-cover, set-fields; no generic cmd dispatcher, add-book, or copy-to-library; see `calibre_srv::cdb`'s module doc)
 - [ ] changes.py
 - [ ] code.py
 - [ ] content.py (partial -- `cover`/`thumb`/format downloads only, no etag caching, no thumbnail resizing, no `opf`/`json`; see `calibre_srv::content`'s module doc)
