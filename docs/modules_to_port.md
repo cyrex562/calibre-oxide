@@ -1560,7 +1560,7 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 - [ ] bonjour.py
 - [ ] books.py (partial -- book-get/set-last-read-position only; no render_book.py in-browser reader pipeline; see `calibre_srv::books`'s module doc)
 - [ ] cdb.py (partial -- delete-books, set-cover, set-fields; no generic cmd dispatcher, add-book, or copy-to-library; see `calibre_srv::cdb`'s module doc)
-- [ ] changes.py
+- [ ] changes.py (partial -- event shapes ported as `calibre_srv::web_socket::ChangeEvent` (BooksAdded/BooksDeleted/FormatsAdded/FormatsRemoved/MetadataChanged); no SavedSearchesChanged)
 - [ ] code.py
 - [ ] content.py (partial -- `cover`/`thumb`/format downloads only, no etag caching, no thumbnail resizing, no `opf`/`json`; see `calibre_srv::content`'s module doc)
 - [ ] convert.py
@@ -1590,7 +1590,7 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 - [x] users.py (`UserManager`: CRUD + password check ported; `restriction`/`session_data`/`misc_data` kept as schema columns but not yet exposed through any accessor -- see `calibre_srv::users`'s module doc)
 - [x] users_api.py (`POST /users/change-pw`; `is_allowed_to_change_password_via_http` check skipped, see `calibre_srv::users_api`'s module doc)
 - [x] utils.py (the still-relevant pure-logic slice -- `Offsets`/`http_date` -- is ported as `calibre_srv::utils`; the rest is socket/logging plumbing subsumed by `axum`/`tokio`)
-- [ ] web_socket.py
+- [x] web_socket.py (transport subsumed by `axum`'s native WebSocket support; `GET /web-socket` broadcasts real `ChangeEvent`s on library mutation -- see `calibre_srv::web_socket`'s module doc for why this is wired differently than upstream's own incomplete implementation)
 - [ ] __init__.py
 
 ### translations

@@ -204,7 +204,7 @@ mod tests {
         } else {
             None
         };
-        (dir, AppState { cache: Arc::new(cache), opts: Arc::new(ServerOptions::default()), auth })
+        (dir, AppState { cache: Arc::new(cache), opts: Arc::new(ServerOptions::default()), auth, changes: crate::web_socket::new_change_broadcaster() })
     }
 
     #[tokio::test]
