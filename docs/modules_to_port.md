@@ -1558,7 +1558,7 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 - [x] auth.py (Basic auth only, no Digest; see `calibre_srv::auth`'s module doc)
 - [ ] auto_reload.py
 - [ ] bonjour.py
-- [ ] books.py
+- [ ] books.py (partial -- book-get/set-last-read-position only; no render_book.py in-browser reader pipeline; see `calibre_srv::books`'s module doc)
 - [ ] cdb.py (partial -- delete-books, set-cover, set-fields; no generic cmd dispatcher, add-book, or copy-to-library; see `calibre_srv::cdb`'s module doc)
 - [ ] changes.py
 - [ ] code.py

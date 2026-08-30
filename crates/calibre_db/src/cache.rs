@@ -1511,6 +1511,56 @@ impl Cache {
         tx.commit()?;
         Ok(())
     }
+
+    /// Port of `db.get_last_read_positions` -- every recorded reading
+    /// position for one book/format/user triple, one per device (the
+    /// in-browser EPUB reader syncs a CFI position per device so a
+    /// reader who last read on their phone can resume in the desktop
+    /// browser).
+    pub fn get_last_read_positions(&self, book_id: i32, fmt: &str, user: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        let fmt = fmt.to_uppercase();
+        let conn = self.backend.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT device, cfi, epoch, pos_frac FROM last_read_positions WHERE book = ?1 AND format = ?2 AND user = ?3")?;
+        let rows = stmt.query_map((book_id, &fmt, user), |row| {
+            Ok(serde_json::json!({
+                "device": row.get::<_, String>(0)?,
+                "cfi": row.get::<_, String>(1)?,
+                "epoch": row.get::<_, f64>(2)?,
+                "pos_frac": row.get::<_, f64>(3)?,
+            }))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Port of `db.set_last_read_position`. An empty/absent `cfi`
+    /// deletes the stored position for this book/format/user/device
+    /// instead of recording one, matching upstream (the reader clears
+    /// its own position once a book is finished). `user`/`device`
+    /// default to `"_"` when empty, matching upstream's own fallback
+    /// for anonymous/unspecified callers.
+    pub fn set_last_read_position(&self, book_id: i32, fmt: &str, user: &str, device: &str, cfi: Option<&str>, epoch: Option<f64>, pos_frac: f64) -> anyhow::Result<()> {
+        let fmt = fmt.to_uppercase();
+        let user = if user.is_empty() { "_" } else { user };
+        let device = if device.is_empty() { "_" } else { device };
+        let conn = self.backend.conn.lock().unwrap();
+        match cfi.filter(|c| !c.is_empty()) {
+            None => {
+                conn.execute("DELETE FROM last_read_positions WHERE book = ?1 AND format = ?2 AND user = ?3 AND device = ?4", (book_id, &fmt, user, device))?;
+            }
+            Some(cfi) => {
+                let epoch = epoch.unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0));
+                conn.execute(
+                    "INSERT OR REPLACE INTO last_read_positions (book, format, user, device, cfi, epoch, pos_frac) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    (book_id, &fmt, user, device, cfi, epoch, pos_frac),
+                )?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -2027,6 +2077,51 @@ mod tests {
         // entries via `copy_atomic`, so this specifically looks for
         // the delete rather than asserting a total count).
         assert_eq!(journaled_delete_count(dir.path()), 1);
+    }
+
+    #[test]
+    fn set_last_read_position_records_and_deletes_a_position() {
+        let (dir, cache) = open_test_cache();
+        let source = write_temp_file(dir.path(), "src.epub", b"epub bytes");
+        let mut meta = MetaInformation::default();
+        meta.title = "T".to_string();
+        meta.authors = vec!["A".to_string()];
+        let book_id = cache.add_book(&source, &meta).unwrap();
+
+        cache.set_last_read_position(book_id, "epub", "alice", "phone", Some("/6/4[chap01]"), Some(1000.0), 0.5).unwrap();
+        let positions = cache.get_last_read_positions(book_id, "epub", "alice").unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0]["device"], "phone");
+        assert_eq!(positions[0]["cfi"], "/6/4[chap01]");
+        assert_eq!(positions[0]["pos_frac"], 0.5);
+
+        // A second device gets its own row, not an overwrite.
+        cache.set_last_read_position(book_id, "epub", "alice", "desktop", Some("/6/8[chap02]"), Some(2000.0), 0.75).unwrap();
+        assert_eq!(cache.get_last_read_positions(book_id, "epub", "alice").unwrap().len(), 2);
+
+        // A different user's positions are isolated.
+        assert!(cache.get_last_read_positions(book_id, "epub", "bob").unwrap().is_empty());
+
+        // An empty cfi clears that device's position, matching upstream.
+        cache.set_last_read_position(book_id, "epub", "alice", "phone", None, None, 0.0).unwrap();
+        let positions = cache.get_last_read_positions(book_id, "epub", "alice").unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0]["device"], "desktop");
+    }
+
+    #[test]
+    fn set_last_read_position_defaults_empty_user_and_device_to_underscore() {
+        let (dir, cache) = open_test_cache();
+        let source = write_temp_file(dir.path(), "src.epub", b"epub bytes");
+        let mut meta = MetaInformation::default();
+        meta.title = "T".to_string();
+        meta.authors = vec!["A".to_string()];
+        let book_id = cache.add_book(&source, &meta).unwrap();
+
+        cache.set_last_read_position(book_id, "epub", "", "", Some("/2"), Some(1.0), 0.1).unwrap();
+        let positions = cache.get_last_read_positions(book_id, "epub", "_").unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0]["device"], "_");
     }
 
     #[test]
