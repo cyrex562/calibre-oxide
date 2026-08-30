@@ -69,6 +69,10 @@
 //!   edits). Not ported: the generic `calibredb`-CLI-over-HTTP
 //!   dispatcher, add-book, copy-to-library -- see that module's own
 //!   doc for why.
+//! - [`books`]: cross-device reading-position sync (a narrow slice of
+//!   `books.py`) -- `book-get/set-last-read-position` only; the rest
+//!   of that file is `render_book.py`'s in-browser EPUB rendering
+//!   pipeline, not ported.
 //!
 //! **Deferred to future increments** (not started): `manage_users_cli.py` (a CLI wrapper around
 //! `users.py` this crate's own binary doesn't expose yet),
@@ -83,6 +87,7 @@
 
 pub mod ajax;
 pub mod auth;
+pub mod books;
 pub mod cdb;
 pub mod content;
 pub mod errors;
@@ -135,7 +140,9 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/ajax/library-info", get(ajax::library_info))
         .route("/cdb/delete-books/{book_ids}", post(cdb::delete_books))
         .route("/cdb/set-cover/{book_id}", post(cdb::set_cover))
-        .route("/cdb/set-fields/{book_id}", post(cdb::set_fields));
+        .route("/cdb/set-fields/{book_id}", post(cdb::set_fields))
+        .route("/book-get-last-read-position/{library_id}/{which}", get(books::get_last_read_position))
+        .route("/book-set-last-read-position/{library_id}/{book_id}/{fmt}", post(books::set_last_read_position));
 
     api.route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth)).with_state(state)
 }
