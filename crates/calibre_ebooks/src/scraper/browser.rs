@@ -1,7 +1,13 @@
-//! Port of `qt.py`'s `Browser`/`WebEngineBrowser`/`FakeResponse` -- see
-//! this module's parent doc for why the subprocess/IPC machinery those
-//! classes coordinate with (`qt_backend.py`, `webengine_backend.py`)
-//! has no separate Rust port.
+//! Port of `qt.py`'s `Browser`/`FakeResponse` -- the plain,
+//! `reqwest`-based fetcher. `qt_backend.py`'s `FetchBackend` (the
+//! subprocess `Browser` talks to over its own JSON-lines IPC protocol,
+//! built on `QNetworkAccessManager`) has no separate Rust port -- there
+//! is nothing left to port once the transport moves in-process, see
+//! this module's parent doc for the full explanation.
+//!
+//! [`super::webengine_browser::WebEngineBrowser`] is the JS-rendering
+//! counterpart (`webengine_backend.py`'s port) -- a genuinely different
+//! implementation with its own subprocess IPC, in its own file.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -28,6 +34,13 @@ pub struct BrowserResponse {
 }
 
 impl BrowserResponse {
+    /// Used by [`super::webengine_browser`]: a webview-rendered response
+    /// has a final URL and a body (the rendered HTML), but no real
+    /// status/headers -- see that module's doc for why.
+    pub(crate) fn from_webview(final_url: String, body: Vec<u8>) -> BrowserResponse {
+        BrowserResponse { final_url, status: None, reason: String::new(), headers: Vec::new(), body }
+    }
+
     /// Port of `FakeResponse.read()` (whole-body form only -- see this
     /// struct's doc).
     pub fn read(&self) -> &[u8] {
@@ -107,6 +120,13 @@ pub struct BrowserError {
 }
 
 impl BrowserError {
+    /// Used by [`super::webengine_browser`], which raises its own
+    /// worker-process/protocol errors rather than ones `reqwest`
+    /// classified (see [`classify_error`]).
+    pub(crate) fn new(message: String, worth_retry: bool) -> BrowserError {
+        BrowserError { message, worth_retry }
+    }
+
     /// Whether upstream's backend would have flagged this failure as
     /// `worth_retry` -- timeouts and connection failures were (matching
     /// `qt_backend.py`'s `TimeoutError`/`TemporaryNetworkFailureError`/
@@ -129,7 +149,7 @@ fn classify_error(e: reqwest::Error) -> BrowserError {
 /// `qt_backend.py::FetchBackend.download`'s `QNetworkRequest::
 /// setRawHeader` merge-on-repeat loop (`ex = rq.rawHeader(name); if
 /// len(ex): val = ex.decode() + ', ' + val`).
-fn merge_headers(parts: Vec<(String, String)>) -> Vec<(String, String)> {
+pub(crate) fn merge_headers(parts: Vec<(String, String)>) -> Vec<(String, String)> {
     let mut order: Vec<String> = Vec::new();
     let mut values: HashMap<String, String> = HashMap::new();
     let mut display_name: HashMap<String, String> = HashMap::new();
@@ -292,24 +312,6 @@ impl Browser {
     pub fn shutdown(&self) {}
 }
 
-/// Port of `WebEngineBrowser` -- see this module's parent doc for why
-/// it wraps [`Browser`] (plain HTTP, no JS execution) instead of
-/// driving a real JS-rendering engine.
-pub struct WebEngineBrowser(Browser);
-
-impl WebEngineBrowser {
-    pub fn new(user_agent: &str, headers: &[(String, String)], verify_ssl_certificates: bool) -> WebEngineBrowser {
-        WebEngineBrowser(Browser::new(user_agent, headers, verify_ssl_certificates))
-    }
-}
-
-impl std::ops::Deref for WebEngineBrowser {
-    type Target = Browser;
-    fn deref(&self) -> &Browser {
-        &self.0
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,10 +443,10 @@ mod tests {
             .collect()
     }
 
-    /// Port of `TestFetchBackend.do_recipe_browser_test`, run against
-    /// both [`Browser`] and [`WebEngineBrowser`] (the same two upstream
-    /// parametrizes over) -- see this module's doc for why
-    /// `WebEngineBrowser` exercises identical plain-HTTP behavior here.
+    /// Port of `TestFetchBackend.do_recipe_browser_test`'s `Browser`
+    /// half (`webengine_browser::tests` has its own, smaller contract
+    /// test for `WebEngineBrowser` -- it can't satisfy this one
+    /// byte-for-byte, see that module's doc for why).
     fn recipe_browser_contract(open: impl Fn(&str, &OpenOptions) -> Result<BrowserResponse, BrowserError>, set_cookie: impl Fn(&str, &str), set_ua: impl Fn(&str)) {
         let dont_send_response = Arc::new(AtomicUsize::new(0));
         let dont_send_body = Arc::new(AtomicUsize::new(0));
@@ -517,12 +519,6 @@ mod tests {
     #[test]
     fn browser_satisfies_the_recipe_contract() {
         let br = Browser::new("test-ua", &[("th".to_string(), "1".to_string())], true);
-        recipe_browser_contract(|url, opts| br.open(url, opts), |n, v| br.set_simple_cookie(n, v, None, None), |ua| br.set_user_agent(ua));
-    }
-
-    #[test]
-    fn webengine_browser_satisfies_the_recipe_contract() {
-        let br = WebEngineBrowser::new("test-ua", &[("th".to_string(), "1".to_string())], true);
         recipe_browser_contract(|url, opts| br.open(url, opts), |n, v| br.set_simple_cookie(n, v, None, None), |ua| br.set_user_agent(ua));
     }
 
