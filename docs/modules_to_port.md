@@ -1554,7 +1554,7 @@ wholesale rather than a file-by-file port -- see `calibre_srv`'s crate
 root doc for the full explanation. Phase 1 (this pass) ships a
 single-library, unauthenticated OPDS catalog + book/cover downloads.**
 
-- [ ] ajax.py
+- [ ] ajax.py (partial -- read-only JSON REST API: book/books, categories/category (flat, no hierarchy), books_in, search, library-info; see `calibre_srv::ajax`'s module doc for what's narrowed)
 - [x] auth.py (Basic auth only, no Digest; see `calibre_srv::auth`'s module doc)
 - [ ] auto_reload.py
 - [ ] bonjour.py

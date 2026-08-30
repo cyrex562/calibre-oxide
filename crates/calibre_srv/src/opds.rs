@@ -57,7 +57,7 @@ use crate::AppState;
 /// supports, with their OPDS-facing friendly names -- matches upstream's
 /// own `field_metadata[category]['name']` lookup, narrowed to the same
 /// fixed list `calibre_db::categories`'s own doc discloses.
-const CATEGORY_NAMES: &[(&str, &str)] =
+pub(crate) const CATEGORY_NAMES: &[(&str, &str)] =
     &[("tags", "Tags"), ("authors", "Authors"), ("series", "Series"), ("publisher", "Publisher"), ("languages", "Languages")];
 
 fn friendly_category_name(category: &str) -> &'static str {
@@ -390,7 +390,7 @@ async fn acquisition_feed_for_ids(
     Ok(finish(dom, last_modified))
 }
 
-fn sort_key_for(book: &Value, field: &str) -> String {
+pub(crate) fn sort_key_for(book: &Value, field: &str) -> String {
     book[field].as_str().map(str::to_lowercase).unwrap_or_default()
 }
 
