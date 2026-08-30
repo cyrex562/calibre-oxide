@@ -42,9 +42,10 @@
 //!   pure-logic slice of `utils.py` -- see that module's own doc for
 //!   what's socket/logging plumbing this doesn't need).
 //! - [`opds`]: the OPDS catalog (`opds.py`), scoped to the root feed,
-//!   built-in title/newest acquisition feeds, and category/categorygroup
-//!   browsing (tags/authors/series/publisher/languages) -- see that
-//!   module's doc for what's deferred (search, multi-library).
+//!   built-in title/newest acquisition feeds, category/categorygroup
+//!   browsing (tags/authors/series/publisher/languages), and full
+//!   query-language search -- see that module's doc for what's
+//!   deferred (multi-library).
 //! - [`content`]: book/cover/format downloads (the `/get` endpoint from
 //!   `content.py`), scoped to what OPDS acquisition links need -- see
 //!   that module's doc for what's deferred (etag/conditional-GET
@@ -111,6 +112,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/opds/navcatalog/{which}", get(opds::navcatalog))
         .route("/opds/category/{category}/{which}", get(opds::category))
         .route("/opds/categorygroup/{category}/{which}", get(opds::categorygroup))
+        .route("/opds/search/{query}", get(opds::search))
         .route("/get/{what}/{book_id}/{library_id}", get(content::get))
         .route("/get/{what}/{book_id}", get(content::get_no_library))
         .route("/users/change-pw", post(users_api::change_pw));

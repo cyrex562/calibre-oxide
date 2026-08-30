@@ -25,11 +25,15 @@
 //! `max_opds_ungrouped_items` items) are bucketed by first letter,
 //! matching upstream's own fallback.
 //!
-//! **Not yet ported**: search (`opds_search` -- needs a
-//! `db.search()`-equivalent this crate doesn't have yet); multi-library
-//! support (`library_map`/`library_broker.py`) -- this server is
-//! single-library for now, so `TopLevel`'s per-library nav entries are
-//! omitted.
+//! `GET /opds/search/{query}` (`opds_search`) is also ported, backed by
+//! `calibre_db::search::search` -- calibre's real search-query
+//! language (`tag:foo AND author:bar`-style expressions), the same
+//! engine behind the desktop UI's search bar. An unparseable query 404s,
+//! matching upstream's own behavior.
+//!
+//! **Not yet ported**: multi-library support (`library_map`/
+//! `library_broker.py`) -- this server is single-library for now, so
+//! `TopLevel`'s per-library nav entries are omitted.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -624,6 +628,29 @@ pub async fn categorygroup(State(state): State<AppState>, Path((category, which)
     Ok(finish(dom, last_modified))
 }
 
+/// `GET /opds/search/{query}`. Port of `opds_search`: runs `query`
+/// through `calibre_db::search`'s real search-query-language engine
+/// and renders the matches as an acquisition feed, sorted by title
+/// (matching upstream's `get_acquisition_feed`'s own default
+/// `sort_by='title'` -- `opds_search` doesn't override it).
+pub async fn search(State(state): State<AppState>, Path(query): Path<String>, Query(q): Query<NavCatalogQuery>) -> Result<Response, ServerError> {
+    let ids: HashSet<i32> = tokio::task::spawn_blocking({
+        let cache = state.cache.clone();
+        let query = query.clone();
+        move || calibre_db::search::search(&cache, &query)
+    })
+    .await
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))?
+    .map_err(|_| ServerError::NotFound(format!("Search: {query:?} not understood")))?
+    .into_iter()
+    .collect();
+
+    let feed_title = default_feed_title();
+    let feed_id = format!("calibre-search:{query}");
+    let page_url = format!("/opds/search/{}", urlencoding::encode(&query));
+    acquisition_feed_for_ids(&state, ids, "title", true, &feed_id, &feed_title, &page_url, "/opds", q.offset).await
+}
+
 #[cfg(test)]
 mod tests {
     use axum::body::{to_bytes, Body};
@@ -823,5 +850,50 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("/opds/categorygroup/authors/"), "expected letter-group links, got: {body}");
         assert!(!body.contains("/opds/category/authors/I"), "expected no direct item links when bucketed, got: {body}");
+    }
+
+    #[tokio::test]
+    async fn search_plain_word_matches_title_via_all_location() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        add_test_book(dir.path(), &cache, "Foundation", "Isaac Asimov");
+        add_test_book(dir.path(), &cache, "Dune", "Frank Herbert");
+        let state = crate::AppState { cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None };
+        let router = crate::test_router(state);
+
+        let (status, body) = get_body(&router, "/opds/search/Foundation").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("Foundation"));
+        assert!(!body.contains("Dune"), "search for Foundation should not match Dune, got: {body}");
+        assert!(body.contains("http://opds-spec.org/acquisition"));
+    }
+
+    #[tokio::test]
+    async fn search_location_prefix_matches_specific_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        add_test_book(dir.path(), &cache, "Foundation", "Isaac Asimov");
+        add_test_book(dir.path(), &cache, "Dune", "Frank Herbert");
+        let state = crate::AppState { cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None };
+        let router = crate::test_router(state);
+
+        let (status, body) = get_body(&router, "/opds/search/author%3Aherbert").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("Dune"));
+        assert!(!body.contains("Foundation"), "author:herbert should not match Asimov's book, got: {body}");
+    }
+
+    #[tokio::test]
+    async fn search_with_no_matches_404s() {
+        let (_dir, router) = test_app(1);
+        let (status, _) = get_body(&router, "/opds/search/nosuchbookexists").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn search_unparseable_query_404s() {
+        let (_dir, router) = test_app(1);
+        let (status, _) = get_body(&router, "/opds/search/%28author%3Aasimov").await; // "(author:asimov" -- unmatched paren
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }

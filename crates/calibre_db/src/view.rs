@@ -17,7 +17,8 @@ impl View {
 
     pub fn search(&mut self, query: &str) {
         // Use our search module
-        if let Ok(results) = search::search(&self.cache, query) {
+        let guard = self.cache.lock().unwrap();
+        if let Ok(results) = search::search(&guard, query) {
             // In a real view, we might intersect with existing restriction.
             // For this basic port, simply replace ids with search results.
             self.ids = results;
