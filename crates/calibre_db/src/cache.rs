@@ -1078,6 +1078,18 @@ impl Cache {
         Ok(out)
     }
 
+    /// Port of `LibraryDatabase2.last_modified`: the most recent
+    /// `last_modified` timestamp across every book, or the Unix epoch
+    /// for an empty library (matching upstream's own `UNDEFINED_DATE`-style
+    /// "nothing to report" fallback rather than `None`/an error).
+    pub fn last_modified(&self) -> Result<chrono::DateTime<chrono::Utc>> {
+        let raw: Option<String> = {
+            let conn = self.backend.conn.lock().unwrap();
+            conn.query_row("SELECT MAX(last_modified) FROM books", [], |row| row.get(0)).optional()?.flatten()
+        };
+        Ok(raw.as_deref().and_then(|s| calibre_utils::date::parse_date(s, true)).unwrap_or_else(|| chrono::DateTime::UNIX_EPOCH))
+    }
+
     /// `datatype` is one of `bool`/`int`/`float`/`rating` (one-to-one
     /// numeric value table) or `text`/`comments`/`series` (one-to-one
     /// text value table, non-`is_multiple` only -- see the error
