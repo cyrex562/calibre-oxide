@@ -50,5 +50,6 @@ sha2 = "0.10"
 resvg = "0.48"
 usvg = "0.48"
 tiny-skia = "0.12"
+spellbook = "0.4"
 
 [dev-dependencies]
