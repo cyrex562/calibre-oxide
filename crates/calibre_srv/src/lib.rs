@@ -60,9 +60,13 @@
 //!   when [`opts::ServerOptions::auth`] is set.
 //! - [`users_api`]: `POST /users/change-pw` (`users_api.py`), letting an
 //!   authenticated user change their own password.
+//! - [`ajax`]: the read-only JSON REST API (`ajax.py`) -- book
+//!   metadata, category browsing, and search as JSON instead of Atom
+//!   -- see that module's doc for what's narrowed relative to
+//!   upstream's full `field_metadata`-driven version.
 //!
-//! **Deferred to future increments** (not started): `ajax.py`/`cdb.py`
-//! (the JSON REST API), `manage_users_cli.py` (a CLI wrapper around
+//! **Deferred to future increments** (not started): `cdb.py` (the
+//! write/mutation JSON API), `manage_users_cli.py` (a CLI wrapper around
 //! `users.py` this crate's own binary doesn't expose yet),
 //! `render_book.py` (the in-browser EPUB reader), `convert.py`
 //! (server-side conversion), `fts.py` (full-text search), `jobs.py`
@@ -73,6 +77,7 @@
 //! `embedded.py` (process-management entry points -- this increment has
 //! its own minimal `main.rs` instead).
 
+pub mod ajax;
 pub mod auth;
 pub mod content;
 pub mod errors;
@@ -115,7 +120,14 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/opds/search/{query}", get(opds::search))
         .route("/get/{what}/{book_id}/{library_id}", get(content::get))
         .route("/get/{what}/{book_id}", get(content::get_no_library))
-        .route("/users/change-pw", post(users_api::change_pw));
+        .route("/users/change-pw", post(users_api::change_pw))
+        .route("/ajax/book/{book_id}", get(ajax::book))
+        .route("/ajax/books", get(ajax::books))
+        .route("/ajax/categories", get(ajax::categories_list))
+        .route("/ajax/category/{name}", get(ajax::category))
+        .route("/ajax/books_in/{category}/{item_id}", get(ajax::books_in))
+        .route("/ajax/search", get(ajax::search))
+        .route("/ajax/library-info", get(ajax::library_info));
 
     api.route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth)).with_state(state)
 }
