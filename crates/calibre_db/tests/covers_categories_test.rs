@@ -2,7 +2,6 @@ use calibre_db::backend::Backend;
 use calibre_db::cache::Cache;
 use calibre_db::{categories, covers};
 use std::fs;
-use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
 
 #[test]
@@ -48,7 +47,7 @@ fn test_covers_and_categories() {
         .unwrap();
     }
 
-    let cache = Arc::new(Mutex::new(Cache::new(dir.path()).unwrap()));
+    let cache = Cache::new(dir.path()).unwrap();
 
     // 1. Test Categories
     let cats = categories::get_categories(&cache, "name", None).expect("get_categories failed");
@@ -84,24 +83,16 @@ fn test_covers_and_categories() {
     // set_cover also records a real BLAKE3 checksum (issue #93 §8) --
     // verifying against the file as it stands now must match, and a
     // direct on-disk tamper must be caught.
-    {
-        let guard = cache.lock().unwrap();
-        assert_eq!(
-            guard
-                .checksums()
-                .verify_file(book_id, "cover", "", &cover_path)
-                .unwrap(),
-            calibre_db::checksums::VerifyOutcome::Match
-        );
-    }
+    assert_eq!(
+        cache
+            .checksums()
+            .verify_file(book_id, "cover", "", &cover_path)
+            .unwrap(),
+        calibre_db::checksums::VerifyOutcome::Match
+    );
     fs::write(&cover_path, b"tampered").unwrap();
-    {
-        let guard = cache.lock().unwrap();
-        assert!(matches!(
-            guard
-                .checksums()
-                .verify_file(book_id, "cover", "", &cover_path),
-            Err(calibre_db::checksums::ChecksumError::Mismatch { .. })
-        ));
-    }
+    assert!(matches!(
+        cache.checksums().verify_file(book_id, "cover", "", &cover_path),
+        Err(calibre_db::checksums::ChecksumError::Mismatch { .. })
+    ));
 }
