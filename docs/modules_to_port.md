@@ -1555,7 +1555,7 @@ root doc for the full explanation. Phase 1 (this pass) ships a
 single-library, unauthenticated OPDS catalog + book/cover downloads.**
 
 - [ ] ajax.py
-- [ ] auth.py
+- [x] auth.py (Basic auth only, no Digest; see `calibre_srv::auth`'s module doc)
 - [ ] auto_reload.py
 - [ ] bonjour.py
 - [ ] books.py
@@ -1577,7 +1577,7 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 - [ ] legacy.py
 - [ ] library_broker.py
 - [x] loop.py (subsumed by `tokio`'s async runtime)
-- [ ] manage_users_cli.py
+- [ ] manage_users_cli.py (`calibre_srv`'s own `--add-user` flag covers the one thing needed to exercise `--auth`; the full CLI isn't ported)
 - [ ] metadata.py
 - [ ] opds.py (partial -- root nav feed + title/newest acquisition feeds only, no categories/search/multi-library; see `calibre_srv::opds`'s module doc)
 - [x] opts.py
@@ -1587,8 +1587,8 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 - [x] routes.py (subsumed by `axum::Router`)
 - [ ] standalone.py (`calibre_srv`'s own minimal `main.rs` covers the same "run the server over TCP" role, not a port of this file's process-management machinery)
 - [ ] TODO.rst
-- [ ] users.py
-- [ ] users_api.py
+- [x] users.py (`UserManager`: CRUD + password check ported; `restriction`/`session_data`/`misc_data` kept as schema columns but not yet exposed through any accessor -- see `calibre_srv::users`'s module doc)
+- [x] users_api.py (`POST /users/change-pw`; `is_allowed_to_change_password_via_http` check skipped, see `calibre_srv::users_api`'s module doc)
 - [x] utils.py (the still-relevant pure-logic slice -- `Offsets`/`http_date` -- is ported as `calibre_srv::utils`; the rest is socket/logging plumbing subsumed by `axum`/`tokio`)
 - [ ] web_socket.py
 - [ ] __init__.py
