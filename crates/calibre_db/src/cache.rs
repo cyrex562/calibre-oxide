@@ -1561,6 +1561,59 @@ impl Cache {
         }
         Ok(())
     }
+
+    /// A real [`crate::fts::connection::FtsConnection`] over this
+    /// library's `full-text-search.db`, same pattern as
+    /// [`crate::library::Library::fts`] -- this crate's `Cache` and
+    /// `Library` both wrap the same underlying [`Backend`], so this is
+    /// the same connection either type would build (needed here so
+    /// `calibre_srv`, which only holds an `Arc<Cache>`, can reach it
+    /// too).
+    pub fn fts(&self) -> crate::fts::connection::FtsConnection {
+        crate::fts::connection::FtsConnection::new(self.backend.conn.clone(), &self.backend.db_path)
+    }
+
+    /// Port of `Library::get_preference`/`set_preference`'s read half
+    /// -- the plain string-flag `preferences` table (distinct from
+    /// `Cache`'s own separate JSON-preference storage, if any).
+    pub fn get_preference(&self, key: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.backend.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT val FROM preferences WHERE key = ?1")?;
+        let val: Option<String> = stmt.query_row([key], |row| row.get(0)).optional()?;
+        Ok(val)
+    }
+
+    /// Port of `Library::set_preference`.
+    pub fn set_preference(&self, key: &str, val: &str) -> anyhow::Result<()> {
+        let conn = self.backend.conn.lock().unwrap();
+        conn.execute("INSERT OR REPLACE INTO preferences (key, val) VALUES (?1, ?2)", (key, val))?;
+        Ok(())
+    }
+
+    /// Port of `is_fts_enabled` -- same as [`crate::library::Library::is_fts_enabled`].
+    pub fn is_fts_enabled(&self) -> anyhow::Result<bool> {
+        Ok(self.get_preference("fts.enabled")?.as_deref() == Some("true"))
+    }
+
+    /// Port of `enable_fts` -- same as [`crate::library::Library::set_fts_enabled`].
+    pub fn set_fts_enabled(&self, enabled: bool) -> anyhow::Result<()> {
+        self.set_preference("fts.enabled", if enabled { "true" } else { "false" })?;
+        if enabled {
+            self.fts().initialize()?;
+            self.fts().dirty_existing()?;
+        }
+        Ok(())
+    }
+
+    /// Port of `fts_indexing_progress`'s `(left, total)` -- same as
+    /// [`crate::library::Library::fts_indexing_progress`].
+    pub fn fts_indexing_progress(&self) -> anyhow::Result<(i64, i64)> {
+        let fts = self.fts();
+        fts.initialize()?;
+        let left = fts.number_dirtied()?;
+        let indexed = fts.number_indexed()?;
+        Ok((left, left + indexed))
+    }
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -2122,6 +2175,46 @@ mod tests {
         let positions = cache.get_last_read_positions(book_id, "epub", "_").unwrap();
         assert_eq!(positions.len(), 1);
         assert_eq!(positions[0]["device"], "_");
+    }
+
+    #[test]
+    fn fts_enable_disable_and_search_round_trip_through_cache() {
+        let (_dir, cache) = open_test_cache();
+        assert!(!cache.is_fts_enabled().unwrap());
+
+        cache.set_fts_enabled(true).unwrap();
+        assert!(cache.is_fts_enabled().unwrap());
+
+        cache.fts().add_text(1, "EPUB", 0.0, Some("This is a book about Rust programming."), "", 0, "", None).unwrap();
+        cache.fts().add_text(2, "MOBI", 0.0, Some("Python is a fine language too."), "", 0, "", None).unwrap();
+
+        let results = cache.fts().search("Rust", false, None, None, None, false).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].book_id, 1);
+
+        cache.set_fts_enabled(false).unwrap();
+        assert!(!cache.is_fts_enabled().unwrap());
+    }
+
+    #[test]
+    fn fts_indexing_progress_reports_dirty_and_indexed_counts() {
+        let (_dir, cache) = open_test_cache();
+        cache.set_fts_enabled(true).unwrap();
+        // `set_fts_enabled(true)` dirties every existing format (none
+        // yet in a fresh library), so start from a known state.
+        let (left_before, total_before) = cache.fts_indexing_progress().unwrap();
+        assert_eq!(left_before, 0);
+        assert_eq!(total_before, 0);
+
+        cache.fts().dirty_book(1, &["EPUB"]).unwrap();
+        let (left, total) = cache.fts_indexing_progress().unwrap();
+        assert_eq!(left, 1);
+        assert_eq!(total, 1);
+
+        cache.fts().add_text(1, "EPUB", 0.0, Some("indexed now"), "", 0, "", None).unwrap();
+        let (left, total) = cache.fts_indexing_progress().unwrap();
+        assert_eq!(left, 0);
+        assert_eq!(total, 1);
     }
 
     #[test]
