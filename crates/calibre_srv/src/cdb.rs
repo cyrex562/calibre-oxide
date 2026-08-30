@@ -180,6 +180,14 @@ pub async fn set_fields(State(state): State<AppState>, Path(book_id): Path<i32>,
         for fmt in added {
             let data = decode_data_url(&fmt.data_url)?;
             let ext = fmt.ext.to_lowercase();
+            if ext.is_empty() || ext.len() > 10 || !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+                // `ext` is embedded directly into a filesystem path below
+                // (both the temp file here and, inside `add_format`, the
+                // book's own destination filename) -- an allowlisted,
+                // alphanumeric-only extension rules out path traversal
+                // (`../`) and absolute-path (`/etc/...`) payloads.
+                return Err(ServerError::BadRequest("Format has an invalid extension".to_string()));
+            }
             let tmp_name = format!("cdb-upload-{book_id}-{}.{}", rand::rng().random::<u64>(), ext);
             let tmp_path = std::env::temp_dir().join(tmp_name);
             std::fs::write(&tmp_path, &data).map_err(|e| ServerError::InternalServerError(e.to_string()))?;
@@ -428,5 +436,26 @@ mod tests {
         let (_dir, router) = test_app(1);
         let (status, _) = post_json(&router, "/cdb/set-fields/1", serde_json::json!({"changes": {"db_id": 5}})).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn set_fields_rejects_a_path_traversal_extension_in_added_formats() {
+        // `ext` is embedded directly into a filesystem path (the temp
+        // upload file here, and the book's own destination filename
+        // inside `Cache::add_format`) -- a `../`-laden extension must
+        // be rejected outright, not just neutralized downstream.
+        use base64::Engine;
+        let (dir, router) = test_app(1);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"pwned");
+        let evil_ext = "../../../../../../../../tmp/cdb-traversal-poc";
+        let (status, body) = post_json(
+            &router,
+            "/cdb/set-fields/1",
+            serde_json::json!({"changes": {"added_formats": [{"ext": evil_ext, "data_url": format!("data:application/octet-stream;base64,{encoded}")}]}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "got: {body}");
+        assert!(!std::path::Path::new("/tmp/cdb-traversal-poc").exists(), "path traversal payload escaped the intended directory");
+        let _ = dir; // keep the temp library alive for the duration of the request above
     }
 }

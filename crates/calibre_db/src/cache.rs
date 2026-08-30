@@ -455,7 +455,11 @@ impl Cache {
 
         let book_dir = self.backend.library_path.join(&path_rel);
 
-        let file_name = format!("{}.{}", sanitize_file_name(&title), format.to_lowercase());
+        // `format` is sanitized the same as `title` -- a caller that
+        // derives it from untrusted input (e.g. an HTTP request body,
+        // see `calibre_srv::cdb::set_fields`) must not be able to
+        // embed a path separator here and write outside `book_dir`.
+        let file_name = format!("{}.{}", sanitize_file_name(&title), sanitize_file_name(&format.to_lowercase()));
         let dest_path = book_dir.join(&file_name);
         if dest_path.exists() && !replace {
             return Ok(false);
@@ -1979,6 +1983,25 @@ mod tests {
 
         assert!(cache.add_format(book_id, &source2, "epub", true).unwrap());
         assert_eq!(fs::read(&dest).unwrap(), b"second");
+    }
+
+    #[test]
+    fn add_format_sanitizes_a_path_traversal_extension() {
+        // `format` can come from untrusted input (e.g. an HTTP request
+        // body -- see `calibre_srv::cdb::set_fields`'s `added_formats`);
+        // it must not be able to embed a path separator and write
+        // outside the book's own directory.
+        let (dir, cache) = open_test_cache();
+        let source = write_temp_file(dir.path(), "src.bin", b"payload");
+        let mut meta = MetaInformation::default();
+        meta.title = "T".to_string();
+        meta.authors = vec!["A".to_string()];
+        let book_id = cache.add_book(&source, &meta).unwrap();
+
+        let evil_ext = "../../../../../../../../tmp/cache-add-format-traversal-poc";
+        cache.add_format(book_id, &source, evil_ext, true).unwrap();
+
+        assert!(!std::path::Path::new("/tmp/cache-add-format-traversal-poc").exists(), "path traversal payload escaped the book's own directory");
     }
 
     #[test]
