@@ -8,6 +8,7 @@ members = [
     "crates/calibre_devices",
     "crates/calibre_ebooks",
     "crates/calibre_scraper_worker",
+    "crates/calibre_srv",
     "crates/calibre_utils",
     "tools/harness",
 ]

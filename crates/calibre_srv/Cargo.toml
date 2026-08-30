@@ -1,0 +1,30 @@
+[package]
+name = "calibre_srv"
+version = "0.1.0"
+edition = "2021"
+description = "calibre-oxide content server (issue #60) -- an axum/tokio HTTP server replacing calibre's own hand-rolled event loop."
+
+[[bin]]
+name = "calibre_srv"
+path = "src/main.rs"
+
+[dependencies]
+calibre_db = { path = "../calibre_db" }
+calibre_ebooks = { path = "../calibre_ebooks" }
+calibre_utils = { path = "../calibre_utils" }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["trace"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1.0"
+anyhow = "1.0"
+mime_guess = "2.0"
+urlencoding = "2.1"
+
+[dev-dependencies]
+tempfile = "3.10"
+reqwest = { version = "0.11", features = ["blocking"] }
+tower = "0.5"

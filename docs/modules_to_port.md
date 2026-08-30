@@ -1547,6 +1547,13 @@ either -- this pass wasn't exhaustive.
 
 ### srv
 
+**Large, multi-increment port (issue #60, 36 files, ~12,300 lines) --
+calibre's entire hand-rolled async HTTP/WebSocket content server.
+Architecture decision: `axum`/`tokio` replace the custom event loop
+wholesale rather than a file-by-file port -- see `calibre_srv`'s crate
+root doc for the full explanation. Phase 1 (this pass) ships a
+single-library, unauthenticated OPDS catalog + book/cover downloads.**
+
 - [ ] ajax.py
 - [ ] auth.py
 - [ ] auto_reload.py
@@ -1555,34 +1562,34 @@ either -- this pass wasn't exhaustive.
 - [ ] cdb.py
 - [ ] changes.py
 - [ ] code.py
-- [ ] content.py
+- [ ] content.py (partial -- `cover`/`thumb`/format downloads only, no etag caching, no thumbnail resizing, no `opf`/`json`; see `calibre_srv::content`'s module doc)
 - [ ] convert.py
 - [ ] embedded.py
-- [ ] errors.py
+- [x] errors.py
 - [ ] fast_css_transform.cpp
 - [ ] fts.py
 - [ ] handler.py
 - [ ] html_as_json.cpp
-- [ ] http_request.py
-- [ ] http_response.py
+- [x] http_request.py (subsumed by `axum`/`hyper`'s own HTTP parsing -- see `calibre_srv`'s crate root doc)
+- [x] http_response.py (subsumed by `axum`/`hyper`)
 - [ ] jobs.py
 - [ ] last_read.py
 - [ ] legacy.py
 - [ ] library_broker.py
-- [ ] loop.py
+- [x] loop.py (subsumed by `tokio`'s async runtime)
 - [ ] manage_users_cli.py
 - [ ] metadata.py
-- [ ] opds.py
-- [ ] opts.py
-- [ ] pool.py
+- [ ] opds.py (partial -- root nav feed + title/newest acquisition feeds only, no categories/search/multi-library; see `calibre_srv::opds`'s module doc)
+- [x] opts.py
+- [x] pool.py (subsumed by `tokio`'s task scheduler)
 - [ ] pre_activated.py
 - [ ] render_book.py
-- [ ] routes.py
-- [ ] standalone.py
+- [x] routes.py (subsumed by `axum::Router`)
+- [ ] standalone.py (`calibre_srv`'s own minimal `main.rs` covers the same "run the server over TCP" role, not a port of this file's process-management machinery)
 - [ ] TODO.rst
 - [ ] users.py
 - [ ] users_api.py
-- [ ] utils.py
+- [x] utils.py (the still-relevant pure-logic slice -- `Offsets`/`http_date` -- is ported as `calibre_srv::utils`; the rest is socket/logging plumbing subsumed by `axum`/`tokio`)
 - [ ] web_socket.py
 - [ ] __init__.py
 
