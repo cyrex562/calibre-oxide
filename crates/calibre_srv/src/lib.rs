@@ -74,16 +74,21 @@
 //!   of that file is `render_book.py`'s in-browser EPUB rendering
 //!   pipeline, not ported.
 //!
+//! - [`web_socket`]: real-time push notifications over `GET
+//!   /web-socket` (`web_socket.py`, transport subsumed by `axum`'s
+//!   native WebSocket support) -- see that module's own doc for why
+//!   this is wired up differently than upstream's own incomplete
+//!   implementation.
+//!
 //! **Deferred to future increments** (not started): `manage_users_cli.py` (a CLI wrapper around
 //! `users.py` this crate's own binary doesn't expose yet),
 //! `render_book.py` (the in-browser EPUB reader), `convert.py`
 //! (server-side conversion), `fts.py` (full-text search), `jobs.py`
-//! (background job management), `web_socket.py` (real-time UI updates),
-//! `auto_reload.py` (dev-mode auto-restart), `bonjour.py` (mDNS
-//! advertisement), `legacy.py` (the old pre-content-server API),
-//! `library_broker.py` (multi-library support), `standalone.py`/
-//! `embedded.py` (process-management entry points -- this increment has
-//! its own minimal `main.rs` instead).
+//! (background job management), `auto_reload.py` (dev-mode
+//! auto-restart), `bonjour.py` (mDNS advertisement), `legacy.py` (the
+//! old pre-content-server API), `library_broker.py` (multi-library
+//! support), `standalone.py`/`embedded.py` (process-management entry
+//! points -- this increment has its own minimal `main.rs` instead).
 
 pub mod ajax;
 pub mod auth;
@@ -96,6 +101,7 @@ pub mod opts;
 pub mod users;
 pub mod users_api;
 pub mod utils;
+pub mod web_socket;
 
 use std::sync::Arc;
 
@@ -110,6 +116,9 @@ pub struct AppState {
     /// allowed through, matching upstream's own unauthenticated default
     /// (`opts.auth == False`).
     pub auth: Option<Arc<auth::AuthGate>>,
+    /// Broadcasts [`web_socket::ChangeEvent`]s to every connected
+    /// `/web-socket` client -- see that module's doc.
+    pub changes: web_socket::ChangeBroadcaster,
 }
 
 /// Builds the `axum::Router` for this increment's endpoints. When
@@ -142,7 +151,8 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/cdb/set-cover/{book_id}", post(cdb::set_cover))
         .route("/cdb/set-fields/{book_id}", post(cdb::set_fields))
         .route("/book-get-last-read-position/{library_id}/{which}", get(books::get_last_read_position))
-        .route("/book-set-last-read-position/{library_id}/{book_id}/{fmt}", post(books::set_last_read_position));
+        .route("/book-set-last-read-position/{library_id}/{book_id}/{fmt}", post(books::set_last_read_position))
+        .route("/web-socket", get(web_socket::upgrade));
 
     api.route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth)).with_state(state)
 }

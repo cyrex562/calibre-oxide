@@ -12,7 +12,7 @@ path = "src/main.rs"
 calibre_db = { path = "../calibre_db" }
 calibre_ebooks = { path = "../calibre_ebooks" }
 calibre_utils = { path = "../calibre_utils" }
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -32,3 +32,5 @@ rand = "0.9"
 tempfile = "3.10"
 reqwest = { version = "0.11", features = ["blocking"] }
 tower = "0.5"
+tokio-tungstenite = "0.30.0"
+futures-util = "0.3.34"

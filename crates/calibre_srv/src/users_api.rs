@@ -73,7 +73,7 @@ mod tests {
         let users = UserManager::new(&dir.path().join("users.sqlite")).unwrap();
         users.add_user("alice", "hunter2", false).unwrap();
         let auth = Some(Arc::new(AuthGate::new(users, "calibre".to_string(), 0, 5)));
-        (dir, AppState { cache: Arc::new(cache), opts: Arc::new(ServerOptions::default()), auth })
+        (dir, AppState { cache: Arc::new(cache), opts: Arc::new(ServerOptions::default()), auth, changes: crate::web_socket::new_change_broadcaster() })
     }
 
     #[tokio::test]

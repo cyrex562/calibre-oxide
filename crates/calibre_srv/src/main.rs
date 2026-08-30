@@ -58,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let port = cli.opts.port;
     let listen_on = cli.opts.listen_on.clone().unwrap_or_else(|| "0.0.0.0".to_string());
-    let state = AppState { cache: Arc::new(cache), opts: Arc::new(cli.opts), auth };
+    let state = AppState { cache: Arc::new(cache), opts: Arc::new(cli.opts), auth, changes: calibre_srv::web_socket::new_change_broadcaster() };
 
     let app = router(state);
     let addr: SocketAddr = format!("{listen_on}:{port}").parse()?;

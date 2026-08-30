@@ -53,6 +53,7 @@ use serde_json::Value;
 
 use crate::ajax::{book_json, fetch_rows};
 use crate::errors::ServerError;
+use crate::web_socket::{self, ChangeEvent};
 use crate::AppState;
 
 /// `POST /cdb/delete-books/{book_ids}`. Port of `cdb_delete_book`.
@@ -67,6 +68,7 @@ pub async fn delete_books(State(state): State<AppState>, Path(book_ids): Path<St
 
     tokio::task::spawn_blocking({
         let cache = state.cache.clone();
+        let ids = ids.clone();
         move || -> anyhow::Result<()> {
             for id in ids {
                 cache.delete_book(id)?;
@@ -78,6 +80,7 @@ pub async fn delete_books(State(state): State<AppState>, Path(book_ids): Path<St
     .map_err(|e| ServerError::InternalServerError(e.to_string()))?
     .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
 
+    web_socket::publish(&state, ChangeEvent::BooksDeleted { book_ids: ids });
     Ok(Json(serde_json::json!({})))
 }
 
@@ -105,6 +108,7 @@ pub async fn set_cover(State(state): State<AppState>, Path(book_id): Path<i32>, 
     .map_err(|e| ServerError::InternalServerError(e.to_string()))?
     .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
 
+    web_socket::publish(&state, ChangeEvent::MetadataChanged { book_ids: vec![book_id] });
     Ok(Json(serde_json::json!([book_id])))
 }
 
@@ -261,6 +265,7 @@ pub async fn set_fields(State(state): State<AppState>, Path(book_id): Path<i32>,
         let id = row["id"].as_i64().unwrap_or(0);
         ans.insert(id.to_string(), book_json(&row));
     }
+    web_socket::publish(&state, ChangeEvent::MetadataChanged { book_ids: vec![book_id] });
     Ok(Json(Value::Object(ans)))
 }
 
@@ -289,7 +294,7 @@ mod tests {
         for i in 0..book_count {
             add_test_book(dir.path(), &cache, &format!("Book {i}"), "Author");
         }
-        let state = crate::AppState { cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None };
+        let state = crate::AppState { cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster() };
         let router = crate::test_router(state);
         (dir, router)
     }

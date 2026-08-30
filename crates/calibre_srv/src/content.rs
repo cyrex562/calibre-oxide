@@ -119,7 +119,7 @@ mod tests {
         let cache = calibre_db::cache::Cache::new(dir.path()).unwrap();
         let id = add_test_book(dir.path(), &cache, "Test Book");
         let _ = id;
-        let state = crate::AppState { cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None };
+        let state = crate::AppState { cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster() };
         let router = crate::test_router(state.clone());
         (dir, state, router)
     }
