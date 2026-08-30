@@ -27,6 +27,7 @@ When porting `old_src` (Python) to `calibre-oxide` (Rust), follow these guidelin
 - **GUI**: Use `iced` for the frontend.
 - **Async**: Use `tokio` for I/O bound tasks (device communication, network).
 - **Error Handling**: `thiserror` for library crates, `anyhow` for applications.
+- **JS-rendering (real headless browser needs)**: `app/src-tauri` (the actual desktop app) is built on Tauri, so `wry`/`tao` -- the same OS-native webview stack Tauri uses -- are available for ports that genuinely need to execute JavaScript to produce usable content (e.g. `calibre.scraper.webengine_backend`, ported as `crates/calibre_scraper_worker`, a small standalone binary crate spawned over a JSON-lines protocol by `calibre_ebooks::scraper::WebEngineBrowser`). Keep the `wry`/`tao` dependency isolated in its own worker-process crate rather than pulling it into a library crate directly -- it needs a real (or virtual, e.g. `xvfb-run`) display to run at all, which most library crates and headless/CLI contexts shouldn't be forced to require.
 
 ## 5. Porting Workflow
 1. **Isolate**: Pick a single Python module (e.g., `calibre.utils.config`).
