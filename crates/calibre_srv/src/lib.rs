@@ -87,8 +87,14 @@
 //!   `content.py`), backed by `calibre_db`'s already-ported notes
 //!   engine -- see that module's own doc.
 //!
-//! **Deferred to future increments** (not started): `manage_users_cli.py` (a CLI wrapper around
-//! `users.py` this crate's own binary doesn't expose yet),
+//! `manage_users_cli.py` is partially covered by this crate's own
+//! `main.rs` binary directly (`--add-user`/`--remove-user`/
+//! `--list-users`/`--set-readonly`/`--change-password` convenience
+//! flags around `users::UserManager`), not this library crate itself
+//! -- see `main.rs`'s own doc for exactly what's covered and what
+//! isn't (`change_set_password`, `libraries`).
+//!
+//! **Deferred to future increments** (not started):
 //! `render_book.py` (the in-browser EPUB reader), `convert.py`
 //! (server-side conversion), `jobs.py`
 //! (background job management), `auto_reload.py` (dev-mode

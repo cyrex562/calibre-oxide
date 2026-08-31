@@ -4,10 +4,15 @@
 //! pools, GUI-embedded server lifecycle) is out of scope for now; this
 //! is just enough to run [`calibre_srv::router`] over TCP.
 //!
-//! `--add-user NAME:PASSWORD` is a convenience flag for this binary,
-//! not a port of `manage_users_cli.py` (a much larger CLI this
-//! increment doesn't cover -- see `lib.rs`'s doc) -- just enough to
-//! actually exercise `--auth` without a separate tool.
+//! `--add-user`/`--remove-user`/`--list-users`/`--set-readonly`/
+//! `--change-password` are convenience flags for this binary, a
+//! narrow subset of `manage_users_cli.py`'s real subcommands
+//! (`add`/`remove`/`list`/`readonly`/`chpass`) -- backed by the same
+//! real `UserManager` methods those subcommands use. Not ported:
+//! `change_set_password` (`is_allowed_to_change_password_via_http`/
+//! `set_allowed_to_change_password_via_http` need the `misc_data`
+//! column `users.rs` doesn't expose yet) and `libraries` (per-library
+//! restriction, no multi-library support anywhere in this crate).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -26,6 +31,21 @@ struct Cli {
     /// Add a user (NAME:PASSWORD) to the user database and exit, rather than starting the server
     #[arg(long)]
     add_user: Option<String>,
+    /// Modifier for --add-user: give the new user only read access
+    #[arg(long)]
+    readonly: bool,
+    /// Remove a user from the user database and exit
+    #[arg(long)]
+    remove_user: Option<String>,
+    /// List all usernames in the user database and exit
+    #[arg(long)]
+    list_users: bool,
+    /// Set/reset/toggle/show whether a user is readonly (NAME:set|reset|toggle|show) and exit
+    #[arg(long)]
+    set_readonly: Option<String>,
+    /// Change a user's password (NAME:PASSWORD) and exit
+    #[arg(long)]
+    change_password: Option<String>,
     #[command(flatten)]
     opts: ServerOptions,
 }
@@ -41,10 +61,56 @@ fn userdb_path(cli: &Cli) -> PathBuf {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    if cli.list_users {
+        let users = UserManager::new(&userdb_path(&cli))?;
+        for name in users.all_user_names() {
+            println!("{name}");
+        }
+        return Ok(());
+    }
+
+    if let Some(name) = &cli.remove_user {
+        let users = UserManager::new(&userdb_path(&cli))?;
+        if !users.remove_user(name) {
+            anyhow::bail!("No such user: {name:?}");
+        }
+        println!("Removed user {name:?}");
+        return Ok(());
+    }
+
+    if let Some(spec) = &cli.set_readonly {
+        let (name, op) = spec.split_once(':').ok_or_else(|| anyhow::anyhow!("--set-readonly expects NAME:set|reset|toggle|show"))?;
+        let users = UserManager::new(&userdb_path(&cli))?;
+        if !users.has_user(name) {
+            anyhow::bail!("No such user: {name:?}");
+        }
+        let val = match op {
+            "toggle" => !users.is_readonly(name),
+            "set" => true,
+            "reset" => false,
+            "show" => {
+                println!("{}", if users.is_readonly(name) { "set" } else { "reset" });
+                return Ok(());
+            }
+            other => anyhow::bail!("{other} is an unknown operation (expected set, reset, toggle, or show)"),
+        };
+        users.set_readonly(name, val);
+        println!("Readonly for {name:?} is now {}", if val { "set" } else { "reset" });
+        return Ok(());
+    }
+
+    if let Some(spec) = &cli.change_password {
+        let (name, pw) = spec.split_once(':').ok_or_else(|| anyhow::anyhow!("--change-password expects NAME:PASSWORD"))?;
+        let users = UserManager::new(&userdb_path(&cli))?;
+        users.change_password(name, pw).map_err(|e| anyhow::anyhow!(e))?;
+        println!("Changed password for {name:?}");
+        return Ok(());
+    }
+
     if let Some(spec) = &cli.add_user {
         let (name, pw) = spec.split_once(':').ok_or_else(|| anyhow::anyhow!("--add-user expects NAME:PASSWORD"))?;
         let users = UserManager::new(&userdb_path(&cli))?;
-        users.add_user(name, pw, false).map_err(|e| anyhow::anyhow!(e))?;
+        users.add_user(name, pw, cli.readonly).map_err(|e| anyhow::anyhow!(e))?;
         println!("Added user {name:?}");
         return Ok(());
     }

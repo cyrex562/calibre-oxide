@@ -1577,7 +1577,7 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 - [ ] legacy.py
 - [ ] library_broker.py
 - [x] loop.py (subsumed by `tokio`'s async runtime)
-- [ ] manage_users_cli.py (`calibre_srv`'s own `--add-user` flag covers the one thing needed to exercise `--auth`; the full CLI isn't ported)
+- [ ] manage_users_cli.py (partial -- `calibre_srv`'s own `--add-user`/`--remove-user`/`--list-users`/`--set-readonly`/`--change-password` flags cover add/remove/list/readonly/chpass; no change_set_password (misc_data column) or libraries (multi-library) subcommands)
 - [ ] metadata.py
 - [ ] opds.py (partial -- root nav feed, title/newest acquisition feeds, category/categorygroup browsing, and query-language search; no multi-library yet; see `calibre_srv::opds`'s module doc)
 - [x] opts.py
