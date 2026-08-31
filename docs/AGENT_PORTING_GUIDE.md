@@ -35,6 +35,38 @@ When porting `old_src` (Python) to `calibre-oxide` (Rust), follow these guidelin
 3. **Implement**: Port the logic.
 4. **Test**: Write a Rust unit test. If possible, compare output with the Python version.
 
+### 5a. Split issues that outgrow one iteration
+
+An "iteration" is one plan→implement→test→PR→merge cycle for a single
+coherent chunk of work. If an issue is going to take more than one
+iteration to reach a mergeable state, **stop and split it** into
+smaller issues rather than letting it grow into a multi-PR mega-issue
+tracked by ad hoc checkboxes:
+
+- Split along real seams: one file, one endpoint family, one
+  self-contained feature, or one piece of missing infrastructure
+  (e.g. "add a `field_metadata` subsystem" is its own issue, separate
+  from every feature that will eventually consume it).
+- Each new issue should be independently mergeable — completing it
+  should not require any of the others to also be done in the same
+  PR. It's fine for one issue to be *blocked on* another (say so in
+  the issue body); it's not fine for two issues to need the same PR.
+- Give each new issue the same definition-of-done as any other port
+  issue (real signatures, tests, cross-validation where applicable) —
+  splitting is about scope, not about lowering the bar.
+- When a large module clearly needs infrastructure this codebase
+  doesn't have yet (a job queue, multi-library support, a rendering
+  pipeline), don't silently defer it inside a bigger issue's checklist
+  — file it as its own issue stating what's missing and what it would
+  unblock, even if nobody works it immediately. A visible, honestly-
+  scoped backlog issue is more useful than an optimistic checkbox that
+  never gets checked.
+- If an existing issue has already grown past this (e.g. it's
+  accumulated several "Phase N" PRs against one issue number), split
+  its *remaining* scope into fresh issues and leave the original as a
+  tracking/epic issue linking to them — don't retroactively rewrite
+  history for the phases already merged.
+
 ## 6. Important Crates for Calibre
 - `zip` / `tar`: For archive handling (epub/cbz).
 - `xml-rs` / `roxmltree`: For parsing OPF/XML metadata.
