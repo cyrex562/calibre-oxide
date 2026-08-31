@@ -285,6 +285,18 @@ impl NotesConnection {
         let (alg, digest) = resource_hash
             .split_once(':')
             .unwrap_or(("raw", resource_hash));
+        // `resource_hash` can originate from an untrusted caller (e.g.
+        // an HTTP request's `{scheme}/{digest}` path segments -- see
+        // `calibre_srv::notes::get_note_resource`); sanitize both
+        // halves the same way `covers::set_cover`/`Cache::add_format`
+        // already do for other content-hash-derived filenames, so a
+        // `../`-laden hash can't escape `resources_dir`. Every
+        // legitimate hash (`hash_data`'s own `"siphash64:<hex>"`
+        // output) is untouched by this -- `sanitize_file_name` only
+        // strips path separators and a handful of other reserved
+        // characters, none of which appear in a real hash.
+        let alg = sanitize_file_name(alg);
+        let digest = sanitize_file_name(digest);
         let prefix: String = digest.chars().take(2).collect();
         self.resources_dir
             .join(prefix)

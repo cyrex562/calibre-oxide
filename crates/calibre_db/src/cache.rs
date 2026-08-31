@@ -1573,6 +1573,15 @@ impl Cache {
         crate::fts::connection::FtsConnection::new(self.backend.conn.clone(), &self.backend.db_path)
     }
 
+    /// A real [`crate::notes::connection::NotesConnection`] over this
+    /// library's `.calnotes/notes.db`, same pattern as
+    /// [`crate::library::Library::notes`] -- see [`Cache::fts`]'s doc
+    /// for why this is duplicated onto `Cache` rather than routed
+    /// through `Library`.
+    pub fn notes(&self) -> crate::notes::connection::NotesConnection {
+        crate::notes::connection::NotesConnection::new(self.backend.clone(), &self.backend.library_path)
+    }
+
     /// Port of `Library::get_preference`/`set_preference`'s read half
     /// -- the plain string-flag `preferences` table (distinct from
     /// `Cache`'s own separate JSON-preference storage, if any).
@@ -2215,6 +2224,15 @@ mod tests {
         let (left, total) = cache.fts_indexing_progress().unwrap();
         assert_eq!(left, 0);
         assert_eq!(total, 1);
+    }
+
+    #[test]
+    fn notes_shares_the_same_connection_cache_would_get_via_library() {
+        let (_dir, cache) = open_test_cache();
+        cache.notes().initialize().unwrap();
+        let hash = std::collections::HashSet::new();
+        cache.notes().set_note("authors", 1, "Jane Doe", "<p>A note</p>", &hash).unwrap();
+        assert_eq!(cache.notes().get_note("authors", 1).unwrap(), Some("<p>A note</p>".to_string()));
     }
 
     #[test]

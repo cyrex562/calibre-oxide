@@ -82,6 +82,10 @@
 //! - [`fts`]: full-text search over indexed book content (`fts.py`),
 //!   backed by `calibre_db`'s already-ported FTS5 engine -- see that
 //!   module's own doc.
+//! - [`notes`]: the "Notes" feature -- free-form HTML notes on a
+//!   category item, with embedded image resources (a subset of
+//!   `content.py`), backed by `calibre_db`'s already-ported notes
+//!   engine -- see that module's own doc.
 //!
 //! **Deferred to future increments** (not started): `manage_users_cli.py` (a CLI wrapper around
 //! `users.py` this crate's own binary doesn't expose yet),
@@ -100,6 +104,7 @@ pub mod cdb;
 pub mod content;
 pub mod errors;
 pub mod fts;
+pub mod notes;
 pub mod opds;
 pub mod opts;
 pub mod users;
@@ -161,7 +166,11 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/fts/disable", post(fts::disable))
         .route("/fts/reindex", post(fts::reindex))
         .route("/fts/indexing", post(fts::indexing))
-        .route("/fts/snippets/{book_ids}", get(fts::snippets));
+        .route("/fts/snippets/{book_ids}", get(fts::snippets))
+        .route("/get-note/{field}/{item_id}/{library_id}", get(notes::get_note))
+        .route("/get-note-from-item-val/{field}/{item}/{library_id}", get(notes::get_note_from_val))
+        .route("/get-note-resource/{scheme}/{digest}/{library_id}", get(notes::get_note_resource))
+        .route("/set-note/{field}/{item_id}/{library_id}", post(notes::set_note));
 
     api.route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth)).with_state(state)
 }
