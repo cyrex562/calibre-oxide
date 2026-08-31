@@ -162,10 +162,26 @@ pub async fn get_note_resource(State(state): State<AppState>, Path((scheme, dige
         return Err(ServerError::NotFound(format!("Notes resource {scheme}:{digest} not found")));
     };
 
-    let content_type = mime_guess::from_path(&resource.name).first_raw().unwrap_or("application/octet-stream");
+    // These resources are always client-uploaded (`set_note`'s
+    // `images`) and served back with no auth distinction from the
+    // uploader -- serving an attacker-chosen filename `inline` with a
+    // guessed Content-Type (upstream's own behavior too, `guess_type
+    // (name)[0]`) is a real stored-XSS vector: an uploaded
+    // `evil.svg`/`evil.html` resource would render as same-origin
+    // markup/script if navigated to directly, able to replay a
+    // browser's cached HTTP Basic credentials against every other
+    // endpoint. Narrowed here, beyond upstream's own fidelity, to a
+    // real image-only allowlist -- anything else downloads as an
+    // attachment with a generic type instead of rendering inline.
+    let content_type = match mime_guess::from_path(&resource.name).first_raw() {
+        Some(m @ ("image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/bmp" | "image/avif")) => m,
+        _ => "application/octet-stream",
+    };
+    let disposition = if content_type == "application/octet-stream" { "attachment" } else { "inline" };
+
     let mut resp = resource.data.into_response();
-    resp.headers_mut().insert(header::CONTENT_TYPE, header::HeaderValue::from_str(content_type).unwrap_or(header::HeaderValue::from_static("application/octet-stream")));
-    if let Ok(v) = header::HeaderValue::from_str(&format!("inline; filename=\"{}\"", resource.name)) {
+    resp.headers_mut().insert(header::CONTENT_TYPE, header::HeaderValue::from_static(content_type));
+    if let Ok(v) = header::HeaderValue::from_str(&format!("{disposition}; filename=\"{}\"", resource.name)) {
         resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
     }
     Ok(resp)
@@ -385,6 +401,24 @@ mod tests {
         assert!(resp.headers().get("content-disposition").unwrap().to_str().unwrap().contains("photo.jpg"));
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"jpeg bytes here");
+    }
+
+    #[tokio::test]
+    async fn get_note_resource_serves_a_non_image_as_an_octet_stream_attachment_not_inline() {
+        // Regression test for a stored-XSS finding: an uploaded
+        // "evil.html"/"evil.svg" resource must not be served inline
+        // with a browser-executable Content-Type, even though the
+        // filename (and thus the guessed MIME type) is fully
+        // attacker-controlled at upload time.
+        let (_dir, router, cache) = test_app();
+        let rhash = cache.notes().add_resource(b"<script>alert(1)</script>", "evil.html").unwrap();
+        let (scheme, digest) = rhash.split_once(':').unwrap();
+
+        let req = Request::builder().uri(format!("/get-note-resource/{scheme}/{digest}/default")).body(Body::empty()).unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("content-type").unwrap(), "application/octet-stream");
+        assert!(resp.headers().get("content-disposition").unwrap().to_str().unwrap().starts_with("attachment"));
     }
 
     #[tokio::test]
