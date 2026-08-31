@@ -139,6 +139,20 @@ fn add_resource_disambiguates_a_name_collision_between_different_resources() {
 }
 
 #[test]
+fn path_for_resource_sanitizes_a_path_traversal_hash() {
+    // `resource_hash` can come straight from an untrusted HTTP
+    // request's path segments (see `calibre_srv::notes::get_note_resource`,
+    // issue #60) -- a malicious `scheme`/`digest` must not be able to
+    // escape `resources_dir`.
+    let dir = tempdir().unwrap();
+    let notes = open(dir.path());
+
+    let evil = "../../../../../../../../tmp/notes-traversal-poc:../../../../../../../../tmp/notes-traversal-poc2";
+    let path = notes.path_for_resource(evil);
+    assert!(path.starts_with(dir.path()), "expected the sanitized path to stay under {:?}, got: {path:?}", dir.path());
+}
+
+#[test]
 fn add_resource_is_idempotent_for_the_same_content_and_name() {
     let dir = tempdir().unwrap();
     let notes = open(dir.path());

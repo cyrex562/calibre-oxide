@@ -1562,7 +1562,7 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 - [ ] cdb.py (partial -- delete-books, set-cover, set-fields; no generic cmd dispatcher, add-book, or copy-to-library; see `calibre_srv::cdb`'s module doc)
 - [ ] changes.py (partial -- event shapes ported as `calibre_srv::web_socket::ChangeEvent` (BooksAdded/BooksDeleted/FormatsAdded/FormatsRemoved/MetadataChanged); no SavedSearchesChanged)
 - [ ] code.py
-- [ ] content.py (partial -- `cover`/`thumb`/format downloads only, no etag caching, no thumbnail resizing, no `opf`/`json`; see `calibre_srv::content`'s module doc)
+- [ ] content.py (partial -- `cover`/`thumb`/format downloads (`calibre_srv::content`, no etag caching, no thumbnail resizing, no `opf`/`json`) and the Notes feature (`calibre_srv::notes` -- get/set-note, get-note-from-item-val, get-note-resource); no static/icon/favicon serving, reader-profiles, or data-files endpoints)
 - [ ] convert.py
 - [ ] embedded.py
 - [x] errors.py

@@ -42,6 +42,7 @@
 use crate::cache::Cache;
 use anyhow::{bail, Result};
 use indexmap::IndexMap;
+use rusqlite::OptionalExtension;
 use std::collections::{HashMap, HashSet};
 
 /// A narrower version of upstream's `Tag` class: just the fields this
@@ -226,6 +227,30 @@ pub fn book_ids_for_category_item(cache: &Cache, category: &str, item_id: i32) -
     Ok(out)
 }
 
+/// Port of `Cache.get_item_id`, restricted to this module's five
+/// standard categories (see the module doc) -- looks up an item's id
+/// by its exact display name. `field` must be one of
+/// `STANDARD_CATEGORIES`' keys, same restriction as
+/// [`book_ids_for_category_item`].
+pub fn get_item_id(cache: &Cache, field: &str, item_name: &str) -> Result<Option<i32>> {
+    let Some(&(_, _, _, item_table, name_column)) = STANDARD_CATEGORIES.iter().find(|(key, ..)| *key == field) else {
+        bail!("field {field} not found");
+    };
+    let conn = cache.backend.conn.lock().unwrap();
+    let sql = format!("SELECT id FROM {item_table} WHERE {name_column} = ?1");
+    Ok(conn.query_row(&sql, [item_name], |row| row.get(0)).optional()?)
+}
+
+/// Port of `Cache.get_item_name` -- the reverse of [`get_item_id`].
+pub fn get_item_name(cache: &Cache, field: &str, item_id: i32) -> Result<Option<String>> {
+    let Some(&(_, _, _, item_table, name_column)) = STANDARD_CATEGORIES.iter().find(|(key, ..)| *key == field) else {
+        bail!("field {field} not found");
+    };
+    let conn = cache.backend.conn.lock().unwrap();
+    let sql = format!("SELECT {name_column} FROM {item_table} WHERE id = ?1");
+    Ok(conn.query_row(&sql, [item_id], |row| row.get(0)).optional()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,5 +398,23 @@ mod tests {
     fn book_ids_for_category_item_rejects_an_unknown_category() {
         let (_dir, cache) = open_test_cache();
         assert!(book_ids_for_category_item(&cache, "bogus", 1).is_err());
+    }
+
+    #[test]
+    fn get_item_id_and_get_item_name_round_trip() {
+        let (_dir, cache) = open_test_cache();
+        insert_book_with_author_tag_rating(&cache, "A", "Jane Doe", "fiction", None);
+
+        let id = get_item_id(&cache, "authors", "Jane Doe").unwrap().unwrap();
+        assert_eq!(get_item_name(&cache, "authors", id).unwrap().unwrap(), "Jane Doe");
+
+        assert_eq!(get_item_id(&cache, "authors", "Nobody").unwrap(), None);
+        assert_eq!(get_item_name(&cache, "authors", 999999).unwrap(), None);
+    }
+
+    #[test]
+    fn get_item_id_rejects_an_unknown_field() {
+        let (_dir, cache) = open_test_cache();
+        assert!(get_item_id(&cache, "bogus", "x").is_err());
     }
 }
