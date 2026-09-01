@@ -43,12 +43,11 @@ fn test_pml_input_conversion() {
     assert!(content_path.exists());
 
     let html = fs::read_to_string(content_path).unwrap();
-    // \p -> <p>, \b -> <strong>, \i -> <em>
+    // Matches upstream calibre.ebooks.pml.pmlconverter.PML_HTMLizer's
+    // own STATES table exactly: `\b`/`\i` become inline-styled spans,
+    // not <strong>/<em> -- verified against
+    // old_src/src/calibre/ebooks/pml/pmlconverter.py.
     assert!(html.contains("<p>"));
-    assert!(html.contains("<strong>test</strong>"));
-    assert!(html.contains("<em>PML</em>")); // Note: My simple parser toggled off?
-                                            // "of \\iPML\\i."
-                                            // 1st \i: in_italic=true, push <em>
-                                            // 2nd \i: in_italic=false, push </em>
-                                            // So <em>PML</em>. Correct.
+    assert!(html.contains(r#"<span style="font-weight: bold;">test</span>"#), "{html}");
+    assert!(html.contains(r#"<span style="font-style: italic;">PML</span>"#), "{html}");
 }
