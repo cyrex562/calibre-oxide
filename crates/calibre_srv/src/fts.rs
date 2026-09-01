@@ -259,7 +259,7 @@ mod tests {
     fn test_app() -> (tempfile::TempDir, axum::Router, std::sync::Arc<Cache>) {
         let dir = tempfile::tempdir().unwrap();
         let cache = std::sync::Arc::new(Cache::new(dir.path()).unwrap());
-        let state = crate::AppState { cache: cache.clone(), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster() };
+        let state = crate::AppState { cache: cache.clone(), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()) };
         let router = crate::test_router(state);
         (dir, router, cache)
     }

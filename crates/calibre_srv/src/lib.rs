@@ -89,6 +89,9 @@
 //! - [`data_files`]: arbitrary files attached to a book outside its
 //!   standard formats (another subset of `content.py`, issue #418),
 //!   backed by `calibre_db::extra_files` -- see that module's own doc.
+//! - [`reader_profiles`]: named per-user in-browser-reader settings
+//!   (another subset of `content.py`, issue #419) -- see that
+//!   module's own doc.
 //!
 //! `manage_users_cli.py` is partially covered by this crate's own
 //! `main.rs` binary directly (`--add-user`/`--remove-user`/
@@ -117,6 +120,7 @@ pub mod fts;
 pub mod notes;
 pub mod opds;
 pub mod opts;
+pub mod reader_profiles;
 pub mod users;
 pub mod users_api;
 pub mod utils;
@@ -138,6 +142,9 @@ pub struct AppState {
     /// Broadcasts [`web_socket::ChangeEvent`]s to every connected
     /// `/web-socket` client -- see that module's doc.
     pub changes: web_socket::ChangeBroadcaster,
+    /// Per-user in-browser-reader settings -- see
+    /// [`reader_profiles::ProfileStore`]'s own doc.
+    pub reader_profiles: Arc<reader_profiles::ProfileStore>,
 }
 
 /// Builds the `axum::Router` for this increment's endpoints. When
@@ -183,7 +190,9 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/set-note/{field}/{item_id}/{library_id}", post(notes::set_note))
         .route("/data-files/get/{book_id}/{*relpath}", get(data_files::get))
         .route("/data-files/upload/{book_id}/{library_id}", post(data_files::upload))
-        .route("/data-files/remove/{book_id}/{library_id}", post(data_files::remove));
+        .route("/data-files/remove/{book_id}/{library_id}", post(data_files::remove))
+        .route("/reader-profiles/get-all", get(reader_profiles::get_all))
+        .route("/reader-profiles/save", post(reader_profiles::save));
 
     api.route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth)).with_state(state)
 }
