@@ -269,21 +269,17 @@ impl Dom {
     /// `xml2text`/`x.xpath('descendant::text()')` usage.
     pub fn text_content(&self, id: NodeId) -> String {
         let mut out = String::new();
-        let mut stack = vec![id];
-        let mut order = Vec::new();
-        while let Some(n) = stack.pop() {
-            order.push(n);
-            for &c in self.nodes[n].children.iter().rev() {
-                stack.push(c);
-            }
-        }
-        order.reverse();
-        for n in order {
-            if let NodeKind::Text(t) = &self.nodes[n].kind {
-                out.push_str(t);
-            }
-        }
+        self.collect_text_content(id, &mut out);
         out
+    }
+
+    fn collect_text_content(&self, id: NodeId, out: &mut String) {
+        if let NodeKind::Text(t) = &self.nodes[id].kind {
+            out.push_str(t);
+        }
+        for &c in &self.nodes[id].children {
+            self.collect_text_content(c, out);
+        }
     }
 
     /// Renders just `id`'s opening tag (`<tag attr="val" ...>`), with no
@@ -446,6 +442,26 @@ mod tests {
         dom.append_child(b, bold_text);
         dom.append_child(p, b);
         assert_eq!(dom.serialize(p), "<p>hello<b>world</b></p>");
+    }
+
+    #[test]
+    fn text_content_preserves_document_order_across_sibling_text_nodes() {
+        let mut dom = Dom::empty();
+        let p = dom.new_element("p");
+        let a = dom.new_text("a");
+        dom.append_child(p, a);
+        let b = dom.new_text("b");
+        dom.append_child(p, b);
+        let c = dom.new_text("c");
+        dom.append_child(p, c);
+        assert_eq!(dom.text_content(p), "abc");
+    }
+
+    #[test]
+    fn text_content_preserves_document_order_across_nested_elements() {
+        let dom = Dom::parse("<table><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table>");
+        let table = dom.find_all_tag_global("table")[0];
+        assert_eq!(dom.text_content(table), "abcd");
     }
 
     #[test]
