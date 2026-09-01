@@ -84,7 +84,9 @@ fn a_written_package_round_trips_through_the_reader() {
     assert_eq!(read.authors, vec!["Emily Brontë"]);
     assert_eq!(read.publisher.as_deref(), Some("Thomas Cautley Newby"));
     assert_eq!(read.tags, vec!["gothic"]);
-    assert_eq!(read.languages, vec!["en"]);
+    // "en" canonicalizes to "eng" -- see calibre_utils::localization
+    // (issue #140).
+    assert_eq!(read.languages, vec!["eng"]);
 
     // Every part the writer promised in [Content_Types].xml is present.
     for part in [

@@ -86,7 +86,9 @@ fn reads_parts_content_types_and_metadata() {
     let mi = docx.metadata();
     assert_eq!(mi.title, "Test Document");
     assert_eq!(mi.authors, vec!["Test Author"]);
-    assert_eq!(mi.languages, vec!["en"]);
+    // "en" canonicalizes to "eng" -- see calibre_utils::localization
+    // (issue #140).
+    assert_eq!(mi.languages, vec!["eng"]);
 }
 
 #[test]
