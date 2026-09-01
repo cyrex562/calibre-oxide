@@ -1865,9 +1865,9 @@ compiled in) -- so there is no Qt resource format to compile for.
 
 #### fetch
 
-- [ ] simple.py
-- [ ] utils.py
-- [ ] __init__.py
+- [ ] simple.py (`RecursiveFetcher` -- large, needs its own scoping pass, tracked as issue #455)
+- [x] utils.py (`calibre_ebooks::web::fetch::utils`; real `rescale_image`/`prepare_masthead_image`, backed by the `image` crate + this crate's own already-ported `fit_image`)
+- [x] __init__.py (empty package marker, N/A)
 
 #### site_parsers
 
