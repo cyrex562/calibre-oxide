@@ -32,9 +32,19 @@ impl FB2Input {
         let mut html = String::from("<html><head><meta charset=\"utf-8\"/></head><body>");
 
         // 1. Binaries (Images)
+        //
+        // Port of upstream's own `except TypeError:
+        // self.log.exception('Binary data with id=... is corrupted,
+        // ignoring')` -- one malformed <binary> block is skipped, not
+        // a reason to fail the whole conversion.
         for node in root.children() {
             if node.tag_name().name() == "binary" {
-                self.process_binary(node, output_dir, &mut book)?;
+                if let Err(e) = self.process_binary(node, output_dir, &mut book) {
+                    eprintln!(
+                        "Binary data with id={:?} is corrupted, ignoring: {e}",
+                        node.attribute("id").unwrap_or("")
+                    );
+                }
             }
         }
 
