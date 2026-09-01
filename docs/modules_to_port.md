@@ -1557,7 +1557,7 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 - [ ] ajax.py (partial -- read-only JSON REST API: book/books, categories/category (flat, no hierarchy), books_in, search, library-info; see `calibre_srv::ajax`'s module doc for what's narrowed; remaining gaps tracked by issue #421 field_metadata)
 - [x] auth.py (Basic auth only, no Digest; see `calibre_srv::auth`'s module doc)
 - [ ] auto_reload.py (issue #431, low priority)
-- [ ] bonjour.py (issue #420)
+- [x] bonjour.py (mDNS advertisement via the `mdns-sd` crate, real pure-Rust multicast responder — no system Avahi/Bonjour daemon needed; see `calibre_srv::bonjour`'s module doc for what's narrowed; issue #420 closed)
 - [ ] books.py (partial -- book-get/set-last-read-position only; no render_book.py in-browser reader pipeline; see `calibre_srv::books`'s module doc; remainder tracked by issue #427)
 - [ ] cdb.py (partial -- delete-books, set-cover, set-fields; no generic cmd dispatcher, add-book, or copy-to-library; see `calibre_srv::cdb`'s module doc; remainder tracked by issues #424/#425/#426)
 - [ ] changes.py (partial -- event shapes ported as `calibre_srv::web_socket::ChangeEvent` (BooksAdded/BooksDeleted/FormatsAdded/FormatsRemoved/MetadataChanged); no SavedSearchesChanged, tracked by issue #422)

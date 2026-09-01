@@ -127,9 +127,26 @@ async fn main() -> anyhow::Result<()> {
     let reader_profiles = calibre_srv::reader_profiles::ProfileStore::new(&cli.library_path.join("reader-profiles.sqlite"))?;
     let state = AppState { cache: Arc::new(cache), opts: Arc::new(cli.opts), auth, changes: calibre_srv::web_socket::new_change_broadcaster(), reader_profiles: Arc::new(reader_profiles) };
 
+    let use_bonjour = state.opts.use_bonjour;
+    let library_name = cli.library_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "calibre-oxide Library".to_string());
     let app = router(state);
     let addr: SocketAddr = format!("{listen_on}:{port}").parse()?;
     println!("calibre-oxide content server listening on http://{addr}");
+
+    // Kept alive for the life of the process (see calibre_srv::bonjour's
+    // own doc) -- unregisters on Drop, i.e. when main() returns.
+    let _bonjour = if use_bonjour {
+        match calibre_srv::bonjour::Bonjour::start(&library_name, port, "/opds") {
+            Ok(b) => Some(b),
+            Err(e) => {
+                eprintln!("Warning: could not advertise via mDNS/Bonjour: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
