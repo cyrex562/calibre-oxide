@@ -73,6 +73,8 @@ pub struct Fb2Options {
     pub genre: String,
     /// Program name and version for `<program-used>`.
     pub program: String,
+    /// Re-parse and re-indent the final output, one element per line.
+    pub pretty_print: bool,
 }
 
 impl Default for Fb2Options {
@@ -83,6 +85,7 @@ impl Default for Fb2Options {
             // calibre's default for --fb2-genre.
             genre: "antique".to_string(),
             program: format!("calibre-oxide {}", env!("CARGO_PKG_VERSION")),
+            pretty_print: false,
         }
     }
 }
@@ -108,14 +111,38 @@ pub trait ImageConverter {
 
 /// Drops images FB2 cannot carry natively rather than converting them.
 ///
-/// The default, because this crate has no image codec yet. A caller
-/// with one implements [`ImageConverter`] instead.
+/// Kept only as a way to opt out of conversion; [`DefaultImageConverter`]
+/// is the real default (see issue #145).
 #[derive(Debug, Default, Clone)]
 pub struct NoImageConversion;
 
 impl ImageConverter for NoImageConversion {
     fn to_jpeg(&self, _data: &[u8]) -> Option<Vec<u8>> {
         None
+    }
+}
+
+/// Real default: passes JPEG/PNG data through unchanged (FB2 `<binary>`
+/// elements carry both natively), otherwise decodes and re-encodes via
+/// the `image` crate.
+///
+/// Port of `calibre.utils.img.save_cover_data_to(data,
+/// compression_quality=70)`, the quality upstream's own FB2 output
+/// plugin calls it with.
+#[derive(Debug, Default, Clone)]
+pub struct DefaultImageConverter;
+
+impl ImageConverter for DefaultImageConverter {
+    fn to_jpeg(&self, data: &[u8]) -> Option<Vec<u8>> {
+        match calibre_utils::imghdr::what(data) {
+            Some("jpeg") | Some("png") => return Some(data.to_vec()),
+            _ => {}
+        }
+        let img = image::load_from_memory(data).ok()?;
+        let mut jpeg_bytes = Vec::new();
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_bytes, 70);
+        encoder.encode_image(&img).ok()?;
+        Some(jpeg_bytes)
     }
 }
 
@@ -194,7 +221,19 @@ impl Fb2Mlizer {
 
         let joined = format!("{header}\n{body}\n{binaries}\n{}", fb2_footer());
         let cleaned = clean_text(&joined, opts.insert_blank_line);
-        format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{cleaned}")
+        let output = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{cleaned}");
+
+        if opts.pretty_print {
+            // Port of `if self.opts.pretty_print: output =
+            // etree.tostring(safe_xml_fromstring(output), ...,
+            // pretty_print=True)`. If the assembled document somehow
+            // doesn't reparse, fall back to the unformatted output
+            // rather than losing the conversion over a cosmetic option.
+            if let Ok(doc) = Document::parse(&output) {
+                return crate::xml_util::pretty_print(&doc);
+            }
+        }
+        output
     }
 
     /// Port of the Python `create_flat_toc`.
@@ -1345,6 +1384,71 @@ mod tests {
         assert!(out.contains("<image l:href=\"#img_0\"/>"), "{out}");
         assert!(!out.contains("<binary"), "{out}");
         assert!(mlizer.warnings().iter().any(|w| w.contains("JPEG")));
+    }
+
+    #[test]
+    fn default_image_converter_passes_jpeg_and_png_through_unchanged() {
+        let jpeg = {
+            let mut buf = Vec::new();
+            image::DynamicImage::new_rgb8(2, 2)
+                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageOutputFormat::Jpeg(80))
+                .unwrap();
+            buf
+        };
+        assert_eq!(DefaultImageConverter.to_jpeg(&jpeg), Some(jpeg));
+    }
+
+    #[test]
+    fn default_image_converter_really_converts_a_non_native_format() {
+        let gif = {
+            let mut buf = Vec::new();
+            image::DynamicImage::new_rgb8(3, 3)
+                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageOutputFormat::Gif)
+                .unwrap();
+            buf
+        };
+        let jpeg = DefaultImageConverter.to_jpeg(&gif).expect("a real GIF should convert");
+        assert_eq!(calibre_utils::imghdr::what(&jpeg), Some("jpeg"));
+        let decoded = image::load_from_memory(&jpeg).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (3, 3));
+    }
+
+    #[test]
+    fn a_gif_is_really_converted_and_embedded_end_to_end() {
+        let page = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body><p><img src="a.gif"/></p></body></html>"#;
+        let mut oeb = book(&[("index.html", page)]);
+        oeb.manifest.items.insert("img1".to_string(), ManifestItem::new("img1", "a.gif", "image/gif"));
+        oeb.manifest.hrefs.insert("a.gif".to_string(), "img1".to_string());
+        let gif = {
+            let mut buf = Vec::new();
+            image::DynamicImage::new_rgb8(2, 2)
+                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageOutputFormat::Gif)
+                .unwrap();
+            buf
+        };
+        oeb.container.write("a.gif", &gif).unwrap();
+
+        let mut mlizer = Fb2Mlizer::new();
+        let out = mlizer.extract_content(&oeb, &Fb2Options::default(), &TagStylizer, &DefaultImageConverter, "1.1.2010", "u");
+        assert!(out.contains("<binary id=\"img_0\" content-type=\"image/jpeg\">"), "{out}");
+        assert!(mlizer.warnings().is_empty(), "{:?}", mlizer.warnings());
+    }
+
+    #[test]
+    fn pretty_print_reindents_the_output_one_element_per_line() {
+        let oeb = book(&[("index.html", PAGE)]);
+        let compact = convert(&oeb, &Fb2Options::default());
+        let pretty = convert(&oeb, &Fb2Options { pretty_print: true, ..Fb2Options::default() });
+
+        assert_ne!(compact, pretty);
+        assert!(pretty.lines().count() > compact.lines().count(), "pretty-printed output should have more lines");
+        // Still the same document underneath.
+        let compact_doc = Document::parse(&compact).unwrap();
+        let pretty_doc = Document::parse(&pretty).unwrap();
+        assert_eq!(
+            compact_doc.root_element().tag_name().name(),
+            pretty_doc.root_element().tag_name().name()
+        );
     }
 
     #[test]

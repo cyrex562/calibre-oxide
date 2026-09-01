@@ -405,7 +405,7 @@ either -- this pass wasn't exhaustive.
 #### fb2
 
 - [x] `__init__.py` (`base64_decode`) -> `fb2/mod.rs`
-- [x] `fb2ml.py` -> `fb2/fb2ml.rs` (the `Stylizer` becomes a trait — see #132/#130 for the missing CSS cascade; `--pretty-print` re-serialization and image transcoding are noted in #145)
+- [x] `fb2ml.py` -> `fb2/fb2ml.rs` (the `Stylizer` becomes a trait — see #132/#130 for the missing CSS cascade; `--pretty-print` re-serialization and real image transcoding, issue #145, both closed — `DefaultImageConverter`, `Fb2Options::pretty_print`)
 
 #### html
 
