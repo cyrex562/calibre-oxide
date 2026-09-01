@@ -1719,11 +1719,11 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 
 #### hyphenation
 
-- [ ] dictionaries.py
-- [ ] hyphen.c
-- [ ] hyphenate.py
-- [ ] test_hyphenation.py
-- [ ] __init__.py
+- [x] dictionaries.py (`calibre_utils::hyphenation::language_for_locale`/`dictionary_for_language`; locale-alias table narrowed since upstream's `locales.json` isn't vendored -- see the module's own doc)
+- [x] hyphen.c (subsumed by the `hyphenation` crate's real Knuth-Liang engine, built from the same TeX/LibreOffice pattern data upstream's own `dictionaries.tar.xz` uses -- embedded via the `embed_all` feature, not a missing-asset gap)
+- [x] hyphenate.py (`calibre_utils::hyphenation::add_soft_hyphens`/`add_soft_hyphens_to_words`; the HTML-tree-walking half is not ported here -- this crate has no DOM type, see the module's own doc)
+- [x] test_hyphenation.py (covered by this module's own unit tests, incl. the classic Knuth-Liang "hy-phen-a-tion" example)
+- [x] __init__.py (empty package marker, N/A)
 
 #### imageops
 

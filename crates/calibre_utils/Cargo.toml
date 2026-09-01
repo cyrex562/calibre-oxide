@@ -33,6 +33,7 @@ sevenz-rust = "0.6.1"
 unrar = "0.5.8"
 unicode_names2 = "2.0.0"
 socket2 = "0.6.1"
+hyphenation = { version = "0.8.4", features = ["embed_all"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
