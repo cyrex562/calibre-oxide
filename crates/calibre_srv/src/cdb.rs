@@ -294,7 +294,7 @@ mod tests {
         for i in 0..book_count {
             add_test_book(dir.path(), &cache, &format!("Book {i}"), "Author");
         }
-        let state = crate::AppState { cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster() };
+        let state = crate::AppState { cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()) };
         let router = crate::test_router(state);
         (dir, router)
     }

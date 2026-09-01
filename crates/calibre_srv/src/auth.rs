@@ -204,7 +204,7 @@ mod tests {
         } else {
             None
         };
-        (dir, AppState { cache: Arc::new(cache), opts: Arc::new(ServerOptions::default()), auth, changes: crate::web_socket::new_change_broadcaster() })
+        (dir, AppState { cache: Arc::new(cache), opts: Arc::new(ServerOptions::default()), auth, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()) })
     }
 
     #[tokio::test]
