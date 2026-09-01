@@ -1,7 +1,6 @@
 use calibre_db::cli::cmd_backup_metadata::CmdBackupMetadata;
-use calibre_db::cli::cmd_catalog::CmdCatalog;
+use calibre_db::cli::cmd_catalog::{CmdCatalog, RunArgs as CatalogRunArgs};
 use calibre_db::cli::cmd_check_library::CmdCheckLibrary;
-use std::path::Path;
 
 #[test]
 fn test_cli_maintenance_stubs() {
@@ -13,10 +12,18 @@ fn test_cli_maintenance_stubs() {
     // Should now succeed
     assert!(backup.run(&db, &args).is_ok());
 
+    let temp_dir = tempfile::tempdir().unwrap();
     let catalog = CmdCatalog::new();
-    let p = Path::new("catalog.csv");
-    // Catalog is likely still a stub, assuming signature hasn't changed
-    assert!(catalog.run(p, "csv").is_err());
+    let catalog_args = CatalogRunArgs {
+        output_file: temp_dir.path().join("catalog.csv"),
+        ids: None,
+        search: None,
+        verbose: false,
+    };
+    // A real, supported (CSV) catalog export against an empty library
+    // succeeds -- it just writes the header row.
+    assert!(catalog.run(&db, &catalog_args).is_ok());
+    assert!(catalog_args.output_file.exists());
 
     let check = CmdCheckLibrary::new();
     let args = vec![];
