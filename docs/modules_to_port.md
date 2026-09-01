@@ -1801,10 +1801,17 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 
 #### rcc
 
-- [ ] rcc.cpp
-- [ ] rcc.h
-- [ ] rcc.sip
-- [ ] __init__.py
+N/A, entire cluster (issue #75). This is a SIP/C++ binding for Qt's
+`.qrc` resource-compiler format (embedding files into a Qt binary as
+a `QResource`). This project's UI is Tauri, not Qt -- Tauri has its
+own asset-bundling mechanism (`tauri.conf.json`'s `bundle`/`resources`
+config, or `include_bytes!`/`include_dir!` for anything needing to be
+compiled in) -- so there is no Qt resource format to compile for.
+
+- [x] rcc.cpp (N/A -- Qt-specific, no Qt in this project)
+- [x] rcc.h (N/A -- Qt-specific, no Qt in this project)
+- [x] rcc.sip (N/A -- Qt-specific, no Qt in this project)
+- [x] __init__.py (N/A -- empty package marker)
 
 #### spell
 
@@ -1940,21 +1947,29 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 
 ## src/polyglot
 
-- [ ] binary.py
-- [ ] builtins.py
-- [ ] functools.py
-- [ ] html_entities.py
-- [ ] http_client.py
-- [ ] http_cookie.py
-- [ ] http_server.py
-- [ ] io.py
-- [ ] plistlib.py
-- [ ] queue.py
-- [ ] reprlib.py
-- [ ] smtplib.py
-- [ ] socketserver.py
-- [ ] urllib.py
-- [ ] __init__.py
+N/A, entire cluster (issue #87). Every file here is a Python-2/3
+compatibility shim (a thin re-export of a stdlib module, or a trivial
+wrapper like `as_base64_bytes`) with zero calibre-specific logic --
+verified by reading every file. Rust has no Python-2/3 split to paper
+over, and callers use Rust std/crates (`base64`, `std::sync::mpsc`,
+`std::io::Cursor`, etc.) directly at the call site instead of through
+an indirection layer. Nothing here needs a Rust equivalent.
+
+- [x] binary.py (N/A -- `as_base64_*`/`as_hex_*` trivially map to the `base64`/`hex` crates at each call site)
+- [x] builtins.py (N/A -- Python-2/3 compat shim, e.g. `unicode_type = str`)
+- [x] functools.py (N/A -- re-exports `functools.lru_cache`)
+- [x] html_entities.py (N/A -- re-exports `html.entities.name2codepoint`)
+- [x] http_client.py (N/A -- re-exports `http.client`)
+- [x] http_cookie.py (N/A -- re-exports `http.cookiejar`)
+- [x] http_server.py (N/A -- re-exports `http.server`)
+- [x] io.py (N/A -- a `StringIO` subclass that also accepts bytes)
+- [x] plistlib.py (N/A -- re-exports `plistlib`)
+- [x] queue.py (N/A -- re-exports `queue.Queue`/`Empty`/`Full`/etc.)
+- [x] reprlib.py (N/A -- re-exports `reprlib.repr`)
+- [x] smtplib.py (N/A -- re-exports `smtplib`)
+- [x] socketserver.py (N/A -- re-exports `socketserver`)
+- [x] urllib.py (N/A -- re-exports `urllib.parse`/`urllib.request`)
+- [x] __init__.py (N/A -- empty package marker)
 
 ## src/pyj
 
@@ -2122,7 +2137,14 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 
 ## src/unicode_names
 
-- [ ] data-types.h
-- [ ] names.h
-- [ ] unicode_names.c
+N/A, entire cluster (issue #89). Subsumed by the `unicode_names2` crate
+(pure-Rust Unicode character name database), already wired up as
+`calibre_utils::unicode_names` for `src/calibre/utils/unicode_names.py`
+-- this top-level `src/unicode_names/` C library is the exact same
+generated character-name database, just as a C extension instead of
+the Python module that wraps it.
+
+- [x] data-types.h (N/A -- subsumed by the `unicode_names2` crate)
+- [x] names.h (N/A -- subsumed by the `unicode_names2` crate)
+- [x] unicode_names.c (N/A -- subsumed by the `unicode_names2` crate)
 
