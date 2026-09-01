@@ -1772,10 +1772,10 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 
 #### open_with
 
-- [ ] linux.py
-- [ ] osx.py
-- [ ] windows.py
-- [ ] __init__.py
+- [x] linux.py (`calibre_utils::open_with::linux`; real `.desktop` file discovery/parsing, XDG icon-theme lookup, `%f`/`%u`/`%i`/etc field-code substitution -- see that module's own doc for narrowed pieces: no persistent icon cache, plain string sort instead of ICU numeric sort, env-var-based UI language)
+- [ ] osx.py (not ported -- native macOS Launch Services/`.app` bundle integration, unverifiable without a macOS host; see `calibre_utils::open_with`'s module doc)
+- [ ] windows.py (not ported -- native Win32 registry + Qt integration, unverifiable without a Windows host; same doc)
+- [x] __init__.py (empty package marker, N/A)
 
 #### opensearch
 
