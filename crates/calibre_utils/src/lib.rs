@@ -27,6 +27,7 @@ pub mod speedups;
 pub mod terminal;
 pub mod text2int;
 pub mod titlecase;
+pub mod translations;
 pub mod unicode_names;
 pub mod unrar;
 pub mod unsmarten;

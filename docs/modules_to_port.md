@@ -1595,9 +1595,9 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 
 ### translations
 
-- [ ] dynamic.py
-- [ ] msgfmt.py
-- [ ] __init__.py
+- [x] dynamic.py (`calibre_utils::translations::dynamic`; caching behavior ported, `.mo`-loading strategy narrowed to an injected closure since this project doesn't vendor upstream's bundled `locales.zip` -- see that module's own doc)
+- [x] msgfmt.py (`calibre_utils::translations::msgfmt`; `.po`-to-`.mo` compiler, cross-validated byte-for-byte against a real run of the upstream script itself via system `python3`, since it has no calibre-specific imports)
+- [x] __init__.py (empty package marker, N/A)
 
 ### utils
 
