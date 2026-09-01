@@ -92,6 +92,9 @@
 //! - [`reader_profiles`]: named per-user in-browser-reader settings
 //!   (another subset of `content.py`, issue #419) -- see that
 //!   module's own doc.
+//! - [`bonjour`]: mDNS/Bonjour advertisement of the running OPDS
+//!   catalog (`bonjour.py`, issue #420), started from `main.rs` when
+//!   `ServerOptions::use_bonjour` is set -- see that module's own doc.
 //!
 //! `manage_users_cli.py` is partially covered by this crate's own
 //! `main.rs` binary directly (`--add-user`/`--remove-user`/
@@ -111,6 +114,7 @@
 
 pub mod ajax;
 pub mod auth;
+pub mod bonjour;
 pub mod books;
 pub mod cdb;
 pub mod content;
