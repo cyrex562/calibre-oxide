@@ -177,6 +177,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/ajax/books_in/{category}/{item_id}", get(ajax::books_in))
         .route("/ajax/search", get(ajax::search))
         .route("/ajax/library-info", get(ajax::library_info))
+        .route("/cdb/add-book/{job_id}/{add_duplicates}/{filename}/{library_id}", post(cdb::add_book))
         .route("/cdb/delete-books/{book_ids}", post(cdb::delete_books))
         .route("/cdb/set-cover/{book_id}", post(cdb::set_cover))
         .route("/cdb/set-fields/{book_id}", post(cdb::set_fields))
