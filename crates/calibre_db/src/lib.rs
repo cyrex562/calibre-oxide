@@ -15,6 +15,7 @@ pub mod covers;
 #[cfg(unix)]
 mod device_monitor;
 pub mod errors;
+pub mod extra_files;
 pub mod fields;
 pub mod fts;
 pub mod lazy;

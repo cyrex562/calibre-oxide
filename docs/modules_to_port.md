@@ -1562,7 +1562,7 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 - [ ] cdb.py (partial -- delete-books, set-cover, set-fields; no generic cmd dispatcher, add-book, or copy-to-library; see `calibre_srv::cdb`'s module doc; remainder tracked by issues #424/#425/#426)
 - [ ] changes.py (partial -- event shapes ported as `calibre_srv::web_socket::ChangeEvent` (BooksAdded/BooksDeleted/FormatsAdded/FormatsRemoved/MetadataChanged); no SavedSearchesChanged, tracked by issue #422)
 - [ ] code.py (issue #432, low priority -- needs vendoring calibre's bundled UI assets)
-- [ ] content.py (partial -- `cover`/`thumb`/format downloads (`calibre_srv::content`, no etag caching, no thumbnail resizing, no `opf`/`json`) and the Notes feature (`calibre_srv::notes` -- get/set-note, get-note-from-item-val, get-note-resource); no static/icon/favicon serving (issue #432), reader-profiles (issue #419), or data-files endpoints (issue #418))
+- [ ] content.py (partial -- `cover`/`thumb`/format downloads (`calibre_srv::content`, no etag caching, no thumbnail resizing, no `opf`/`json`), the Notes feature (`calibre_srv::notes`), and data-files endpoints (`calibre_srv::data_files`, issue #418 closed); no static/icon/favicon serving (issue #432) or reader-profiles (issue #419))
 - [ ] convert.py (issue #429, blocked on #428)
 - [ ] embedded.py
 - [x] errors.py
