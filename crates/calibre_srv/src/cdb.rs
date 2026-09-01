@@ -11,13 +11,6 @@
 //!   ported. It would mean building a whole dynamic command registry
 //!   equivalent to `calibre_db::cli`'s own module system, reachable
 //!   over HTTP -- a large, separate undertaking, not attempted here.
-//! - `POST /cdb/add-book/...` (`cdb_add_book`) is **not** ported --
-//!   upstream sniffs real book metadata (title/authors/languages) out
-//!   of arbitrary uploaded format bytes via `get_metadata`, which
-//!   needs real per-format metadata *readers* wired into an HTTP
-//!   upload path; this crate's own `Cache::add_book` instead takes a
-//!   caller-supplied `MetaInformation` rather than deriving it, so
-//!   there's no equivalent entry point to call from here yet.
 //! - `POST /cdb/copy-to-library/...` (`cdb_copy_to_library`) is **not**
 //!   ported -- needs real multi-library support (`library_map`), which
 //!   nothing in this crate has yet (see `opds.rs`'s own doc for the
@@ -29,6 +22,20 @@
 //! distinct from ordinary auth -- a narrower model than upstream's,
 //! disclosed rather than half-built):
 //!
+//! - `POST /cdb/add-book/{job_id}/{add_duplicates}/{filename}/{library_id}`
+//!   -- the uploaded file's raw bytes are the request body. Real
+//!   metadata sniffing (title/authors/languages) via
+//!   `calibre_ebooks::metadata::get_metadata`, dispatched by
+//!   `filename`'s extension across the dozens of already-ported
+//!   per-format readers (issue #424 -- the "needs new metadata-
+//!   sniffing infra" assumption used to defer this in an earlier
+//!   phase turned out to be wrong once actually checked: that
+//!   dispatcher already existed). Real duplicate detection via
+//!   `calibre_db::copy_to_library::find_duplicate_books`, the same
+//!   author-intersection algorithm `copy-to-library`'s own duplicate
+//!   check already uses. Not ported: `run_import_plugins` (upstream's
+//!   plugin-driven pre-import format conversion -- no plugin system
+//!   in this crate; the uploaded bytes are used as-is).
 //! - `POST /cdb/delete-books/{book_ids}` -- `Cache::delete_book` per id.
 //! - `POST /cdb/set-cover/{book_id}` -- raw image bytes in the request
 //!   body, sniffed for a real JPEG/PNG magic number (matching
@@ -47,6 +54,7 @@
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::Json;
+use calibre_utils::filenames::sanitize_file_name;
 use rand::Rng;
 use serde::Deserialize;
 use serde_json::Value;
@@ -55,6 +63,68 @@ use crate::ajax::{book_json, fetch_rows};
 use crate::errors::ServerError;
 use crate::web_socket::{self, ChangeEvent};
 use crate::AppState;
+
+fn valid_extension(ext: &str) -> bool {
+    !ext.is_empty() && ext.len() <= 10 && ext.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// `POST /cdb/add-book/{job_id}/{add_duplicates}/{filename}/{library_id}`.
+/// Port of `cdb_add_book`.
+pub async fn add_book(State(state): State<AppState>, Path((job_id, add_duplicates, filename, _library_id)): Path<(String, String, String, String)>, body: Bytes) -> Result<Json<Value>, ServerError> {
+    if filename.is_empty() {
+        return Err(ServerError::BadRequest("An empty filename is not allowed".to_string()));
+    }
+    let sanitized = sanitize_file_name(&filename);
+    let ext = sanitized.rsplit_once('.').map(|(_, e)| e.to_lowercase()).unwrap_or_default();
+    if !valid_extension(&ext) {
+        return Err(ServerError::BadRequest("A filename with no extension is not allowed".to_string()));
+    }
+    let add_duplicates = add_duplicates == "y" || add_duplicates == "1";
+
+    let tmp_path = std::env::temp_dir().join(format!("cdb-add-book-{}.{}", rand::rng().random::<u64>(), ext));
+    tokio::fs::write(&tmp_path, &body).await.map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+
+    let result = tokio::task::spawn_blocking({
+        let cache = state.cache.clone();
+        let tmp_path = tmp_path.clone();
+        let job_id = job_id.clone();
+        let filename = filename.clone();
+        move || -> Result<Value, ServerError> {
+            let meta = calibre_ebooks::metadata::get_metadata(&tmp_path).map_err(|e| ServerError::BadRequest(format!("Could not read metadata from {filename:?}: {e}")))?;
+
+            if !add_duplicates {
+                let dups = calibre_db::copy_to_library::find_duplicate_books(&cache, &meta.title, &meta.authors).map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+                if !dups.is_empty() {
+                    let duplicates: Vec<Value> = dups
+                        .iter()
+                        .filter_map(|id| calibre_db::copy_to_library::book_title_and_authors(&cache, *id).ok())
+                        .map(|(title, authors)| serde_json::json!({ "title": title, "authors": authors }))
+                        .collect();
+                    return Ok(serde_json::json!({
+                        "title": meta.title, "authors": meta.authors, "languages": meta.languages,
+                        "filename": filename, "id": job_id, "duplicates": duplicates,
+                    }));
+                }
+            }
+
+            let book_id = cache.add_book(&tmp_path, &meta).map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+            Ok(serde_json::json!({
+                "title": meta.title, "authors": meta.authors, "languages": meta.languages,
+                "filename": filename, "id": job_id, "book_id": book_id,
+            }))
+        }
+    })
+    .await
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))??;
+
+    let _ = tokio::fs::remove_file(&tmp_path).await;
+
+    if let Some(book_id) = result.get("book_id").and_then(|v| v.as_i64()) {
+        web_socket::publish(&state, ChangeEvent::BooksAdded { book_ids: vec![book_id as i32] });
+    }
+
+    Ok(Json(result))
+}
 
 /// `POST /cdb/delete-books/{book_ids}`. Port of `cdb_delete_book`.
 pub async fn delete_books(State(state): State<AppState>, Path(book_ids): Path<String>) -> Result<Json<Value>, ServerError> {
@@ -463,4 +533,84 @@ mod tests {
         assert!(!std::path::Path::new("/tmp/cdb-traversal-poc").exists(), "path traversal payload escaped the intended directory");
         let _ = dir; // keep the temp library alive for the duration of the request above
     }
+
+    // `Title\n\n\nAuthor\n` is the real txt::get_metadata pattern
+    // (TXT_PAT: title, three blank lines, author) -- a genuine format
+    // this endpoint's metadata sniffing understands, not a stub.
+    fn txt_fixture(title: &str, author: &str) -> Vec<u8> {
+        format!("{title}\n\n\n{author}\n").into_bytes()
+    }
+
+    async fn post_bytes_to(router: &axum::Router, uri: &str, body: Vec<u8>) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder().method("POST").uri(uri).body(Body::from(body)).unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let value = if body.is_empty() { serde_json::Value::Null } else { serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null) };
+        (status, value)
+    }
+
+    #[tokio::test]
+    async fn add_book_extracts_real_metadata_and_adds_the_book() {
+        let (_dir, router) = test_app(0);
+        let (status, body) = post_bytes_to(&router, "/cdb/add-book/job1/n/new-book.txt/default", txt_fixture("Test Book", "Jane Doe")).await;
+        assert_eq!(status, StatusCode::OK, "got: {body}");
+        assert_eq!(body["title"], "Test Book");
+        assert_eq!(body["authors"], serde_json::json!(["Jane Doe"]));
+        assert_eq!(body["id"], "job1");
+        let book_id = body["book_id"].as_i64().expect("expected a real book_id");
+
+        let (_, fetched) = get_json(&router, &format!("/ajax/book/{book_id}")).await;
+        assert_eq!(fetched["title"], "Test Book");
+    }
+
+    #[tokio::test]
+    async fn add_book_rejects_a_filename_with_no_extension() {
+        let (_dir, router) = test_app(0);
+        let (status, _) = post_bytes_to(&router, "/cdb/add-book/job1/n/noext/default", txt_fixture("T", "A")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// Same as [`test_app`], but seeds one specific book (title/author)
+    /// via the *same* `Cache` instance the router itself holds --
+    /// unlike opening a second, separate `Cache::new` against the same
+    /// directory (which briefly holds two independent
+    /// `LibraryHandle`s against one library and can race: the first's
+    /// OS-level write lock isn't always visibly released before the
+    /// second tries to acquire it, intermittently failing with
+    /// `AlreadyLocked`/"another process already holds the writer
+    /// lock"). One shared `Cache` avoids the race entirely.
+    fn test_app_with_book(title: &str, author: &str) -> (tempfile::TempDir, axum::Router) {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        add_test_book(dir.path(), &cache, title, author);
+        let state = crate::AppState { cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()) };
+        let router = crate::test_router(state);
+        (dir, router)
+    }
+
+    #[tokio::test]
+    async fn add_book_reports_a_duplicate_without_adding_it() {
+        let (_dir, router) = test_app_with_book("Test Book", "Jane Doe");
+
+        let (status, body) = post_bytes_to(&router, "/cdb/add-book/job1/n/new-book.txt/default", txt_fixture("Test Book", "Jane Doe")).await;
+        assert_eq!(status, StatusCode::OK, "got: {body}");
+        assert!(body.get("book_id").is_none(), "should not have added a duplicate, got: {body}");
+        let duplicates = body["duplicates"].as_array().expect("expected a duplicates list");
+        assert_eq!(duplicates.len(), 1);
+        assert_eq!(duplicates[0]["title"], "Test Book");
+    }
+
+    #[tokio::test]
+    async fn add_book_with_add_duplicates_flag_adds_anyway() {
+        let (_dir, router) = test_app_with_book("Test Book", "Jane Doe");
+
+        let (status, body) = post_bytes_to(&router, "/cdb/add-book/job1/y/new-book.txt/default", txt_fixture("Test Book", "Jane Doe")).await;
+        assert_eq!(status, StatusCode::OK, "got: {body}");
+        assert!(body.get("book_id").is_some(), "add_duplicates=y should add anyway, got: {body}");
+
+        let (_, all_books) = get_json(&router, "/ajax/books").await;
+        assert_eq!(all_books.as_object().unwrap().len(), 2);
+    }
 }
+

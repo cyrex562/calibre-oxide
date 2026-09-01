@@ -134,3 +134,41 @@ fn copy_one_book_ignores_duplicates_when_not_asked_to_check() {
     );
     assert_eq!(dest_cache.lock().unwrap().all_book_ids().unwrap().len(), 2);
 }
+
+#[test]
+fn find_duplicate_books_matches_same_author_same_title() {
+    use calibre_db::copy_to_library::find_duplicate_books;
+
+    let dir = tempdir().unwrap();
+    let cache = Cache::new(dir.path()).unwrap();
+    let existing_id = seed_book_with_author(&cache, "The Great Book", "Jane Doe");
+    seed_book_with_author(&cache, "A Different Book", "John Smith");
+
+    let dups = find_duplicate_books(&cache, "The Great Book", &["Jane Doe".to_string()]).unwrap();
+    assert_eq!(dups, [existing_id].into_iter().collect());
+}
+
+#[test]
+fn find_duplicate_books_is_empty_for_a_genuinely_new_book() {
+    use calibre_db::copy_to_library::find_duplicate_books;
+
+    let dir = tempdir().unwrap();
+    let cache = Cache::new(dir.path()).unwrap();
+    seed_book_with_author(&cache, "The Great Book", "Jane Doe");
+
+    let dups = find_duplicate_books(&cache, "A Brand New Book", &["Someone Else".to_string()]).unwrap();
+    assert!(dups.is_empty());
+}
+
+#[test]
+fn book_title_and_authors_reports_the_real_per_author_list() {
+    use calibre_db::copy_to_library::book_title_and_authors;
+
+    let dir = tempdir().unwrap();
+    let cache = Cache::new(dir.path()).unwrap();
+    let book_id = seed_book_with_author(&cache, "The Great Book", "Jane Doe");
+
+    let (title, authors) = book_title_and_authors(&cache, book_id).unwrap();
+    assert_eq!(title, "The Great Book");
+    assert_eq!(authors, vec!["Jane Doe".to_string()]);
+}

@@ -39,6 +39,7 @@ use crate::cache::Cache;
 use crate::utils::find_identical_books;
 use anyhow::{Context, Result};
 use indexmap::IndexMap;
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 /// Builds the three lookup maps [`find_identical_books`] needs
@@ -87,6 +88,26 @@ pub(crate) fn duplicate_detection_maps(
     }
 
     Ok((author_map, aid_to_bids, title_map))
+}
+
+/// Real duplicate detection (issue #424's `cdb_add_book`), reusing
+/// the exact same author-intersection algorithm [`copy_one_book`]'s
+/// own `check_duplicates` path already uses -- see this module's own
+/// doc for what's narrower here than upstream's real
+/// `find_identical_books` (a same-author/near-same-title match, not
+/// upstream's full fuzzy-title heuristics).
+pub fn find_duplicate_books(cache: &Cache, title: &str, authors: &[String]) -> Result<HashSet<i32>> {
+    let (author_map, aid_to_bids, title_map) = duplicate_detection_maps(cache)?;
+    Ok(find_identical_books(title, authors, &author_map, &aid_to_bids, &title_map))
+}
+
+/// `(title, authors)` for one book id -- port of upstream's
+/// `{'title': m.title, 'authors': m.authors}` per-duplicate report
+/// shape.
+pub fn book_title_and_authors(cache: &Cache, book_id: i32) -> Result<(String, Vec<String>)> {
+    let title = cache.field_for(book_id, "title")?.unwrap_or_default();
+    let authors = real_authors(cache, book_id)?;
+    Ok((title, authors))
 }
 
 /// The real per-author names for `book_id` (`authors` joined through
