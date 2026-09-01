@@ -1554,36 +1554,36 @@ wholesale rather than a file-by-file port -- see `calibre_srv`'s crate
 root doc for the full explanation. Phase 1 (this pass) ships a
 single-library, unauthenticated OPDS catalog + book/cover downloads.**
 
-- [ ] ajax.py (partial -- read-only JSON REST API: book/books, categories/category (flat, no hierarchy), books_in, search, library-info; see `calibre_srv::ajax`'s module doc for what's narrowed)
+- [ ] ajax.py (partial -- read-only JSON REST API: book/books, categories/category (flat, no hierarchy), books_in, search, library-info; see `calibre_srv::ajax`'s module doc for what's narrowed; remaining gaps tracked by issue #421 field_metadata)
 - [x] auth.py (Basic auth only, no Digest; see `calibre_srv::auth`'s module doc)
-- [ ] auto_reload.py
-- [ ] bonjour.py
-- [ ] books.py (partial -- book-get/set-last-read-position only; no render_book.py in-browser reader pipeline; see `calibre_srv::books`'s module doc)
-- [ ] cdb.py (partial -- delete-books, set-cover, set-fields; no generic cmd dispatcher, add-book, or copy-to-library; see `calibre_srv::cdb`'s module doc)
-- [ ] changes.py (partial -- event shapes ported as `calibre_srv::web_socket::ChangeEvent` (BooksAdded/BooksDeleted/FormatsAdded/FormatsRemoved/MetadataChanged); no SavedSearchesChanged)
-- [ ] code.py
-- [ ] content.py (partial -- `cover`/`thumb`/format downloads (`calibre_srv::content`, no etag caching, no thumbnail resizing, no `opf`/`json`) and the Notes feature (`calibre_srv::notes` -- get/set-note, get-note-from-item-val, get-note-resource); no static/icon/favicon serving, reader-profiles, or data-files endpoints)
-- [ ] convert.py
+- [ ] auto_reload.py (issue #431, low priority)
+- [ ] bonjour.py (issue #420)
+- [ ] books.py (partial -- book-get/set-last-read-position only; no render_book.py in-browser reader pipeline; see `calibre_srv::books`'s module doc; remainder tracked by issue #427)
+- [ ] cdb.py (partial -- delete-books, set-cover, set-fields; no generic cmd dispatcher, add-book, or copy-to-library; see `calibre_srv::cdb`'s module doc; remainder tracked by issues #424/#425/#426)
+- [ ] changes.py (partial -- event shapes ported as `calibre_srv::web_socket::ChangeEvent` (BooksAdded/BooksDeleted/FormatsAdded/FormatsRemoved/MetadataChanged); no SavedSearchesChanged, tracked by issue #422)
+- [ ] code.py (issue #432, low priority -- needs vendoring calibre's bundled UI assets)
+- [ ] content.py (partial -- `cover`/`thumb`/format downloads (`calibre_srv::content`, no etag caching, no thumbnail resizing, no `opf`/`json`) and the Notes feature (`calibre_srv::notes` -- get/set-note, get-note-from-item-val, get-note-resource); no static/icon/favicon serving (issue #432), reader-profiles (issue #419), or data-files endpoints (issue #418))
+- [ ] convert.py (issue #429, blocked on #428)
 - [ ] embedded.py
 - [x] errors.py
-- [ ] fast_css_transform.cpp
+- [ ] fast_css_transform.cpp (folded into issue #427)
 - [x] fts.py (search/disable/reindex/indexing/snippets, backed by calibre_db's already-ported FTS5 engine; restriction reinterpreted as a search query, no virtual-library concept; see `calibre_srv::fts`'s module doc)
-- [ ] handler.py
-- [ ] html_as_json.cpp
+- [ ] handler.py (not planned -- subsumed by axum::Router + AppState, same as routes.py)
+- [ ] html_as_json.cpp (folded into issue #427)
 - [x] http_request.py (subsumed by `axum`/`hyper`'s own HTTP parsing -- see `calibre_srv`'s crate root doc)
 - [x] http_response.py (subsumed by `axum`/`hyper`)
-- [ ] jobs.py
-- [ ] last_read.py
-- [ ] legacy.py
-- [ ] library_broker.py
+- [ ] jobs.py (issue #428, foundational)
+- [ ] last_read.py (superseded -- see issue #60's body)
+- [ ] legacy.py (issue #430, low priority -- wait for a concrete need)
+- [ ] library_broker.py (issue #423, foundational)
 - [x] loop.py (subsumed by `tokio`'s async runtime)
 - [ ] manage_users_cli.py (partial -- `calibre_srv`'s own `--add-user`/`--remove-user`/`--list-users`/`--set-readonly`/`--change-password` flags cover add/remove/list/readonly/chpass; no change_set_password (misc_data column) or libraries (multi-library) subcommands)
-- [ ] metadata.py
-- [ ] opds.py (partial -- root nav feed, title/newest acquisition feeds, category/categorygroup browsing, and query-language search; no multi-library yet; see `calibre_srv::opds`'s module doc)
+- [ ] metadata.py (blocked on issue #421 field_metadata)
+- [ ] opds.py (partial -- root nav feed, title/newest acquisition feeds, category/categorygroup browsing, and query-language search; no multi-library yet (issue #423); see `calibre_srv::opds`'s module doc)
 - [x] opts.py
 - [x] pool.py (subsumed by `tokio`'s task scheduler)
-- [ ] pre_activated.py
-- [ ] render_book.py
+- [ ] pre_activated.py (not planned -- N/A, tokio's own `TcpListener::bind` covers "run over TCP")
+- [ ] render_book.py (issue #427)
 - [x] routes.py (subsumed by `axum::Router`)
 - [ ] standalone.py (`calibre_srv`'s own minimal `main.rs` covers the same "run the server over TCP" role, not a port of this file's process-management machinery)
 - [ ] TODO.rst
