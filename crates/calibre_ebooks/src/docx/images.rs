@@ -32,17 +32,16 @@
 //!   `get_hpos` here goes straight from the `wp:positionH` loop to the
 //!   final `0.0` fallback, exactly matching real behavior.
 //!
-//! # A disclosed gap: EMF images
+//! # EMF images
 //!
-//! Python's `read_image_data` tries to convert an embedded EMF
-//! (Enhanced Metafile, a Windows vector format some older Word
-//! documents embed) to a raster PNG via `calibre.utils.wmf.emf.emf_unwrap`
-//! before writing it out. No Rust EMF parser exists anywhere in this
-//! crate, so [`read_image_data`] returns the raw EMF bytes unconverted
-//! (`ext` stays `"emf"`) -- an e-reader almost certainly can't display
-//! that, but this is at least the same "silently give up" outcome
-//! Python's own `except Exception: self.log.exception(...)` fallback
-//! produces when `emf_unwrap` itself fails.
+//! [`read_image_data`] converts an embedded EMF (Enhanced Metafile, a
+//! Windows vector format some older Word documents embed) to a raster
+//! PNG via `calibre_utils::wmf::emf_unwrap` (issue #80), matching
+//! Python's own `calibre.utils.wmf.emf.emf_unwrap` call. On failure
+//! (no embedded raster image found, or malformed EMF data), the raw
+//! EMF bytes are returned unconverted -- the same "silently give up"
+//! outcome Python's own `except Exception: self.log.exception(...)`
+//! fallback produces.
 //!
 //! # Not (yet) wired up: `numbering.py`'s picture-bullet CSS
 //!
@@ -386,7 +385,7 @@ fn read_image_data<R: Read + Seek>(
             }
         });
 
-    let ext = calibre_utils::imghdr::what(&raw)
+    let mut ext = calibre_utils::imghdr::what(&raw)
         .map(str::to_string)
         .or_else(|| {
             Some(match base.rsplit_once('.') {
@@ -396,6 +395,20 @@ fn read_image_data<R: Read + Seek>(
         })
         .filter(|e| !e.is_empty())
         .unwrap_or_else(|| "jpeg".to_string());
+
+    let mut raw = raw;
+    if ext == "emf" {
+        // See: https://bugs.launchpad.net/bugs/1224849 -- an EMF
+        // (Enhanced Metafile) image some older Word documents embed;
+        // extract its largest embedded raster image as PNG. On
+        // failure, fall through with the original EMF bytes/ext
+        // unconverted, matching upstream's own
+        // `except Exception: self.log.exception(...)` fallback.
+        if let Ok(png) = calibre_utils::wmf::emf_unwrap(&raw) {
+            raw = png;
+            ext = "png".to_string();
+        }
+    }
 
     let stem = match base.rsplit_once('.') {
         Some((s, _)) => s.to_string(),
@@ -1178,6 +1191,48 @@ mod tests {
   <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
 </Relationships>"#;
 
+        /// A minimal EMF file: one `EMR_STRETCHDIBITS` record embedding
+        /// a tiny uncompressed 24bpp DIB, then `EMR_EOF`. See
+        /// `calibre_utils::wmf::emf`'s own tests for the record layout
+        /// this mirrors.
+        fn emf_bytes(width: u32, height: u32) -> Vec<u8> {
+            let row_bytes = (width * 3).div_ceil(4) * 4;
+            let pixel_data_size = row_bytes * height;
+
+            let mut dib_header = Vec::new();
+            dib_header.extend_from_slice(&40u32.to_le_bytes());
+            dib_header.extend_from_slice(&(width as i32).to_le_bytes());
+            dib_header.extend_from_slice(&(height as i32).to_le_bytes());
+            dib_header.extend_from_slice(&1u16.to_le_bytes());
+            dib_header.extend_from_slice(&24u16.to_le_bytes());
+            dib_header.extend_from_slice(&[0u8; 20]); // compression, image_size, hres, vres, ncols, nimpcols
+
+            let dib_bits = vec![0x80u8; pixel_data_size as usize];
+
+            let fixed_len = 8 + 18 * 4;
+            let hdr_offset = fixed_len as u32;
+            let bits_offset = hdr_offset + dib_header.len() as u32;
+            let total_len = bits_offset as usize + dib_bits.len();
+
+            let mut record = Vec::with_capacity(total_len);
+            record.extend_from_slice(&0x51u32.to_le_bytes()); // EMR_STRETCHDIBITS
+            record.extend_from_slice(&(total_len as u32).to_le_bytes());
+            let mut fields = [0u32; 18];
+            fields[10] = hdr_offset;
+            fields[11] = dib_header.len() as u32;
+            fields[12] = bits_offset;
+            fields[13] = dib_bits.len() as u32;
+            for f in fields {
+                record.extend_from_slice(&f.to_le_bytes());
+            }
+            record.extend_from_slice(&dib_header);
+            record.extend_from_slice(&dib_bits);
+
+            record.extend_from_slice(&0xeu32.to_le_bytes()); // EMR_EOF
+            record.extend_from_slice(&8u32.to_le_bytes());
+            record
+        }
+
         fn docx_with_image(name: &str, data: &[u8]) -> Docx<Cursor<Vec<u8>>> {
             package(&[
                 ("[Content_Types].xml", CONTENT_TYPES),
@@ -1207,6 +1262,26 @@ mod tests {
                 .generate_filename(&mut docx, &images_dir, "rId4", None, &rid_map, None)
                 .unwrap();
             assert_eq!(name1, name2);
+        }
+
+        #[test]
+        fn an_embedded_emf_image_is_converted_to_a_real_png() {
+            let dir = tempfile::tempdir().unwrap();
+            let images_dir = dir.path().join("images");
+            let mut docx = docx_with_image("word/media/image1.emf", &emf_bytes(4, 4));
+            let rid_map =
+                HashMap::from([("rId4".to_string(), "word/media/image1.emf".to_string())]);
+            let mut images = Images::new();
+
+            let name = images
+                .generate_filename(&mut docx, &images_dir, "rId4", None, &rid_map, None)
+                .unwrap();
+            assert!(name.ends_with(".png"), "EMF should be converted to PNG, got {name}");
+
+            let written = std::fs::read(images_dir.join(&name)).unwrap();
+            let decoded = image::load_from_memory_with_format(&written, image::ImageFormat::Png)
+                .expect("the written file should be a real, decodable PNG");
+            assert_eq!((decoded.width(), decoded.height()), (4, 4));
         }
 
         #[test]

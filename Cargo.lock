@@ -869,6 +869,7 @@ dependencies = [
  "fancy-regex",
  "html2text",
  "hyphenation",
+ "image",
  "indexmap 2.12.1",
  "lazy_static",
  "libc",

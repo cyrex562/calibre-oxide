@@ -23,7 +23,8 @@ pub fn what(data: &[u8]) -> Option<&'static str> {
     if is_webp(data) { return Some("webp"); }
     if is_bmp(data) { return Some("bmp"); }
     if is_jpeg2000(data) { return Some("jpeg2000"); }
-    // ... add others as needed (pbm, pgm, ppm, ras, xbm, emf, svg)
+    if is_emf(data) { return Some("emf"); }
+    // ... add others as needed (pbm, pgm, ppm, ras, xbm, svg)
     // SVG is text-based but has known headers.
     
     // Fallback JPEG check
@@ -73,6 +74,10 @@ fn is_bmp(h: &[u8]) -> bool {
 
 fn is_jpeg2000(h: &[u8]) -> bool {
     h.len() >= 12 && &h[0..12] == b"\x00\x00\x00\x0cjP  \r\n\x87\n"
+}
+
+fn is_emf(h: &[u8]) -> bool {
+    h.len() >= 44 && &h[0..4] == b"\x01\0\0\0" && &h[40..44] == b" EMF"
 }
 
 /// Number of header bytes `identify` inspects, matching Python's `HSIZE`.
@@ -229,6 +234,14 @@ mod tests {
         let (fmt, w, h) = identify(&data);
         assert_eq!(fmt, Some("jpeg"));
         assert_eq!((w, h), (640, 480));
+    }
+
+    #[test]
+    fn recognizes_an_emf_header() {
+        let mut data = vec![1u8, 0, 0, 0];
+        data.extend_from_slice(&[0u8; 36]);
+        data.extend_from_slice(b" EMF");
+        assert_eq!(what(&data), Some("emf"));
     }
 
     #[test]

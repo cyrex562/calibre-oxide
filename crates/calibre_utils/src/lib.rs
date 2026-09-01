@@ -33,5 +33,6 @@ pub mod translations;
 pub mod unicode_names;
 pub mod unrar;
 pub mod unsmarten;
+pub mod wmf;
 pub mod wordcount;
 pub mod xml_parse;

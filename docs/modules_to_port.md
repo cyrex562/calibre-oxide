@@ -1843,9 +1843,9 @@ compiled in) -- so there is no Qt resource format to compile for.
 
 #### wmf
 
-- [ ] emf.py
-- [ ] parse.py
-- [ ] __init__.py
+- [x] emf.py (`calibre_utils::wmf::emf`; real EMR record-stream parser, now wired up in `calibre_ebooks::docx::images::read_image_data` to actually convert embedded EMF images to PNG -- closes a gap that module's own doc previously disclosed)
+- [x] parse.py (`calibre_utils::wmf::parse`; real WMF record-stream parser)
+- [x] __init__.py (`calibre_utils::wmf::dib`; DIB header parsing + BMP wrapping, `to_png` via the `image` crate instead of Qt)
 
 ### web
 
