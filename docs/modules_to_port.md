@@ -1636,7 +1636,7 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 - [ ] ip_routing.py
 - [x] iso8601.py
 - [ ] linux_trash.py
-- [ ] localization.py
+- [x] localization.py (language-code half only, issue #140: `calibre_utils::localization::canonicalize_lang`/`lang_as_iso639_1`, backed by the `isolang` crate's real ISO 639 tables instead of upstream's bundled `iso639.calibre_msgpack` resource. The translation-catalog machinery -- `get_lang`, `set_translators`, UI language listing -- is out of scope, matching the issue)
 - [ ] localunzip.py
 - [ ] lock.py
 - [x] logging.py

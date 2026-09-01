@@ -464,6 +464,7 @@ pub fn read_doc_props(raw: &str, mi: &mut MetaInformation, ns: &DocxNamespace) {
         .descendants(root, &["dc:language"])
         .into_iter()
         .filter_map(text_of)
+        .filter_map(|t| calibre_utils::localization::canonicalize_lang(&t))
         .collect();
     if !langs.is_empty() {
         mi.languages = langs;
@@ -504,12 +505,13 @@ pub fn read_default_style_language(raw: &str, mi: &mut MetaInformation, ns: &Doc
         for rpr_default in ns.children(defaults, &["w:rPrDefault"]) {
             for rpr in ns.children(rpr_default, &["w:rPr"]) {
                 for lang in ns.children(rpr, &["w:lang"]) {
-                    if let Some(val) = ns
+                    if let Some(canonical) = ns
                         .get(lang, "w:val")
                         .map(str::trim)
                         .filter(|v| !v.is_empty())
+                        .and_then(calibre_utils::localization::canonicalize_lang)
                     {
-                        mi.languages = vec![val.to_string()];
+                        mi.languages = vec![canonical];
                         return;
                     }
                 }
@@ -720,7 +722,7 @@ mod tests {
         assert_eq!(mi.authors, vec!["Arthur Conan Doyle", "Someone Else"]);
         assert!(mi.author_sort.is_some());
         assert_eq!(mi.publisher.as_deref(), Some("Ward, Lock & Co."));
-        assert_eq!(mi.languages, vec!["en-GB"]);
+        assert_eq!(mi.languages, vec!["eng"]);
         // The Word 2007 newline mangling is undone.
         assert_eq!(mi.comments.as_deref(), Some("First outing.Second line."));
         // A comma inside a subject would split one tag into two, so it
@@ -747,7 +749,7 @@ mod tests {
         ]))
         .unwrap();
         let mi = docx.metadata();
-        assert_eq!(mi.languages, vec!["fr-FR"]);
+        assert_eq!(mi.languages, vec!["fra"]);
     }
 
     #[test]

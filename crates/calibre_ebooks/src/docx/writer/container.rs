@@ -638,7 +638,18 @@ impl DocxWriter {
             root.append(Element::new("dc:description").with_text(comments));
         }
         if let Some(lang) = mi.languages.first() {
-            root.append(Element::new("dc:language").with_text(lang));
+            // Port of `l = canonicalize_lang(mi.languages[0]);
+            // setm('language', lang_as_iso639_1(l) or l)`. If `lang`
+            // doesn't canonicalize at all (rare -- it's normally
+            // already a canonical code by the time it lands in
+            // `MetaInformation`), fall back to the raw value rather
+            // than writing an empty element.
+            let canonical = calibre_utils::localization::canonicalize_lang(lang);
+            let text = match &canonical {
+                Some(c) => calibre_utils::localization::lang_as_iso639_1(c).unwrap_or_else(|| c.clone()),
+                None => lang.clone(),
+            };
+            root.append(Element::new("dc:language").with_text(&text));
         }
         root.to_xml()
     }
@@ -960,7 +971,11 @@ mod tests {
         assert_eq!(read_mi.title, "The Moonstone");
         assert_eq!(read_mi.authors, vec!["Wilkie Collins"]);
         assert_eq!(read_mi.publisher.as_deref(), Some("Tinsley Brothers"));
-        assert_eq!(read_mi.languages, vec!["en"]);
+        // "en" canonicalizes to "eng" on the way in (core_properties
+        // narrows to ISO 639-1 for the written dc:language text, and
+        // the reader canonicalizes back to calibre's own 3-letter
+        // convention on the way out) -- see calibre_utils::localization.
+        assert_eq!(read_mi.languages, vec!["eng"]);
         assert_eq!(read_mi.tags, vec!["mystery", "victorian"]);
 
         // And the body survived, escaping included.
