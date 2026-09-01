@@ -68,9 +68,8 @@ pub fn get_comic_book_info(data: &Value, mi: &mut MetaInformation, series_index:
 
     // Extract language
     if let Some(lang) = data.get("language").and_then(|v| v.as_str()) {
-        // TODO: Use canonicalize_lang from calibre_utils when available
-        if !lang.is_empty() {
-            mi.languages = vec![lang.to_string()];
+        if let Some(canonical) = calibre_utils::localization::canonicalize_lang(lang) {
+            mi.languages = vec![canonical];
         }
     }
 

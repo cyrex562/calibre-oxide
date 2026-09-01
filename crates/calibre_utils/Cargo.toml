@@ -37,6 +37,7 @@ hyphenation = { version = "0.8.4", features = ["embed_all"] }
 url = "2.5.8"
 reqwest = { version = "0.11", features = ["blocking"] }
 image = { version = "0.24", default-features = false, features = ["bmp", "png"] }
+isolang = { version = "2.4.0", features = ["english_names", "lowercase_names"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

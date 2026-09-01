@@ -106,16 +106,6 @@
 //!   OPF this writes back via `oeb::reader::OEBReader::read_opf` --
 //!   the same general OPF-based book loader `EPUBInput` already uses.
 //!
-//! # What `convert_run` defers, and why
-//!
-//! - `style.lang`: passed through as-is rather than reduced to an
-//!   ISO 639-1 code via calibre's language-tag database
-//!   (`canonicalize_lang`/`lang_as_iso639_1`, private to `oeb::polish::opf`
-//!   and not a general-purpose utility here). A raw BCP-47 tag
-//!   (`"en-US"`) is still valid in an HTML `lang` attribute -- this
-//!   loses calibre's own normalization preference, not HTML
-//!   correctness. See [`docx_lang_to_html`].
-//!
 //! # No `Text` buffering
 //!
 //! Python's `Text` helper buffers text fragments before flushing them
@@ -452,17 +442,16 @@ fn append_note_ref<'a, 'i>(
         .insert("data-noteref-container".to_string(), uuid.to_string());
 }
 
-/// A deliberately simplified stand-in for the Python `html_lang`: does
-/// not reduce a full BCP-47 tag to its ISO 639-1 form via calibre's
-/// language-tag database, just filters out empty/`"und"` (undetermined)
-/// tags. See the module docs.
+/// Port of the Python `html_lang`, now that `calibre_utils::localization`
+/// (issue #140) exists as a general-purpose `canonicalize_lang`/
+/// `lang_as_iso639_1` -- reduces a full BCP-47 tag to its ISO 639-1
+/// form, filtering out empty/unrecognized/`"und"` (undetermined) tags.
 fn docx_lang_to_html(lang: &str) -> Option<String> {
-    let lang = lang.trim();
-    if lang.is_empty() || lang.eq_ignore_ascii_case("und") {
-        None
-    } else {
-        Some(lang.to_string())
+    let lang = calibre_utils::localization::canonicalize_lang(lang)?;
+    if lang == "und" {
+        return None;
     }
+    calibre_utils::localization::lang_as_iso639_1(&lang)
 }
 
 /// Remaps every text descendant of `id` through `font`'s symbol-glyph
@@ -3831,7 +3820,7 @@ mod convert_run_tests {
         let span = h.convert(doc.root_element(), &ns);
         assert_eq!(
             h.dom.node(span).attrs.get("lang").map(String::as_str),
-            Some("fr-FR")
+            Some("fr")
         );
     }
 
@@ -3839,6 +3828,10 @@ mod convert_run_tests {
     fn lang_matching_the_document_language_is_not_repeated() {
         let (doc, ns) = parse_run(r#"<w:rPr><w:lang w:val="en-US"/></w:rPr><w:t>x</w:t>"#);
         let mut h = Harness::new();
+        // `doc_lang` is always already resolved via `docx_lang_to_html`
+        // by the time it reaches `convert_run` in real usage (see that
+        // function's own call site) -- so the test passes the same
+        // already-canonicalized form, not the raw docx tag.
         let span = convert_run(
             &mut h.dom,
             doc.root_element(),
@@ -3847,7 +3840,7 @@ mod convert_run_tests {
             &h.settings,
             &h.theme,
             &mut h.fonts,
-            Some("en-US"),
+            Some("en"),
             "test-uuid",
             &mut h.images,
             &mut h.docx,
