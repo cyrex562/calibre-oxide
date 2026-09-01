@@ -4,6 +4,7 @@ pub mod constants;
 pub mod date;
 pub mod filenames;
 pub mod html2text;
+pub mod hyphenation;
 pub mod icu;
 pub mod imghdr;
 pub mod logging;

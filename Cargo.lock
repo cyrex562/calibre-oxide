@@ -868,6 +868,7 @@ dependencies = [
  "env_logger",
  "fancy-regex",
  "html2text",
+ "hyphenation",
  "indexmap 2.12.1",
  "lazy_static",
  "libc",
