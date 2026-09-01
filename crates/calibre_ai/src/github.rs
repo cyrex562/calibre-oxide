@@ -11,7 +11,7 @@ use std::path::PathBuf;
 const MODELS_URL: &str = "https://models.github.ai/catalog/models";
 const CHAT_URL: &str = "https://models.github.ai/inference/chat/completions";
 const API_VERSION: &str = "2022-11-28";
-pub(crate) const PLUGIN_NAME: &str = "GitHubABI";
+pub(crate) const PLUGIN_NAME: &str = "GitHubAI";
 
 pub mod config;
 
