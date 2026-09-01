@@ -1871,8 +1871,8 @@ compiled in) -- so there is no Qt resource format to compile for.
 
 #### site_parsers
 
-- [ ] natgeo.py
-- [ ] nytimes.py
+- [x] natgeo.py (`calibre_ebooks::web::site_parsers::natgeo`; real JSON->HTML extraction)
+- [x] nytimes.py (`calibre_ebooks::web::site_parsers::nytimes`; real JSON->HTML extraction, incl. the "live" liveblog JSON shape; `download_url_from_wayback`/`download_url` not ported -- a specific calibre-ebook.com proxy fetch, orthogonal to the parsing logic, see the module's own doc)
 - [ ] __init__.py
 
 ## src/css_selectors
