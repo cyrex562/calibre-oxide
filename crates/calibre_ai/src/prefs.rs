@@ -47,7 +47,19 @@ lazy_static! {
     static ref PREFS: RwLock<ArtificialIntelligenceConfig> = RwLock::new(ArtificialIntelligenceConfig::default());
 }
 
+/// Provider names that shipped under a typo before being corrected
+/// (issue #107: `"GitHubABI"` -> `"GitHubAI"`), mapped old -> canonical.
+/// Prefs on disk from before the fix are keyed under the old name;
+/// [`canonical_provider_name`] lets every lookup/write site treat both
+/// spellings as the same provider without a one-shot migration pass.
+const LEGACY_PROVIDER_NAME_ALIASES: &[(&str, &str)] = &[("GitHubABI", "GitHubAI")];
+
+fn canonical_provider_name(name: &str) -> &str {
+    LEGACY_PROVIDER_NAME_ALIASES.iter().find(|(old, _)| *old == name).map(|(_, new)| *new).unwrap_or(name)
+}
+
 pub fn pref_for_provider(name: &str, key: &str, defval: Option<Value>) -> Option<Value> {
+    let name = canonical_provider_name(name);
     let prefs = PREFS.read().unwrap();
     prefs.providers.get(name)
         .and_then(|p| p.get(key).cloned())
@@ -55,6 +67,7 @@ pub fn pref_for_provider(name: &str, key: &str, defval: Option<Value>) -> Option
 }
 
 pub fn set_prefs_for_provider(name: &str, pref_map: HashMap<String, Value>) {
+    let name = canonical_provider_name(name);
     let mut prefs = PREFS.write().unwrap();
     prefs.providers.insert(name.to_string(), pref_map);
     // In real impl, save to disk here
@@ -63,6 +76,7 @@ pub fn set_prefs_for_provider(name: &str, pref_map: HashMap<String, Value>) {
 /// Write the currently-selected provider for a given purpose into the
 /// `purpose_map`. Called from `ConfigureAI::commit`.
 pub fn set_purpose_selection(purpose: &AICapabilities, provider_name: &str) {
+    let provider_name = canonical_provider_name(provider_name);
     let mut prefs = PREFS.write().unwrap();
     prefs
         .purpose_map
@@ -83,7 +97,7 @@ pub fn plugin_for_purpose(purpose: AICapabilities) -> Option<Arc<dyn AIProviderP
         plugins_for_purpose(purpose).map(|p| (p.name().to_string(), p)).collect();
     
     let prefs = PREFS.read().unwrap();
-    let q = prefs.purpose_map.get(&purpose.purpose()).map(|s| s.as_str()).unwrap_or("");
+    let q = prefs.purpose_map.get(&purpose.purpose()).map(|s| canonical_provider_name(s)).unwrap_or("");
     
     if let Some(p) = compatible_plugins.get(q) {
         return Some(p.clone());
@@ -113,6 +127,43 @@ pub fn decode_secret(text: &str) -> Result<String, hex::FromHexError> {
     Ok(String::from_utf8_lossy(&bytes).to_string())
 }
 
-// Need hex crate or implement it. 
+// Need hex crate or implement it.
 // "polyglot.binary.as_hex_unicode" does hex encoding of utf-8 bytes.
 // I'll add `hex` dependency to Cargo.toml.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::Mutex;
+
+    // PREFS is process-global; serialize tests that touch it.
+    static PREFS_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn canonical_provider_name_maps_the_known_typo() {
+        assert_eq!(canonical_provider_name("GitHubABI"), "GitHubAI");
+        assert_eq!(canonical_provider_name("GitHubAI"), "GitHubAI");
+        assert_eq!(canonical_provider_name("Google"), "Google");
+    }
+
+    #[test]
+    fn a_pref_written_under_the_typo_is_readable_under_the_canonical_name() {
+        let _guard = PREFS_LOCK.lock().unwrap();
+        set_prefs_for_provider("GitHubABI", HashMap::from([("api_key".to_string(), json!("secret"))]));
+        assert_eq!(pref_for_provider("GitHubAI", "api_key", None), Some(json!("secret")));
+        assert_eq!(pref_for_provider("GitHubABI", "api_key", None), Some(json!("secret")));
+    }
+
+    #[test]
+    fn a_purpose_selection_written_under_the_typo_still_resolves() {
+        let _guard = PREFS_LOCK.lock().unwrap();
+        set_purpose_selection(&AICapabilities::TEXT_TO_TEXT, "GitHubABI");
+        let prefs = PREFS.read().unwrap();
+        assert_eq!(
+            prefs.purpose_map.get(&AICapabilities::TEXT_TO_TEXT.purpose()).map(String::as_str),
+            Some("GitHubAI"),
+            "writes should always store the canonical name, even when given the old one"
+        );
+    }
+}
