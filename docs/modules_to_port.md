@@ -1605,7 +1605,7 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 - [ ] browser.py
 - [ ] certgen.c
 - [ ] certgen.py
-- [ ] cleantext.py
+- [x] cleantext.py (`calibre_utils::cleantext`; real `clean_ascii_chars`/`clean_xml_chars`/`unescape`, entity decoding via the `htmlentity` crate)
 - [ ] cocoa.m
 - [ ] complete.py
 - [x] config.py
@@ -1618,7 +1618,7 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 - [ ] ffml_processor.py
 - [ ] ffmpeg.c
 - [x] filenames.py
-- [ ] file_type_icons.py
+- [x] file_type_icons.py (`calibre_utils::file_type_icons::icon_for_ext`)
 - [ ] forked_map.py
 - [ ] formatter.py
 - [ ] formatter_functions.py
@@ -1638,7 +1638,7 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 - [ ] linux_trash.py
 - [x] localization.py (language-code half only, issue #140: `calibre_utils::localization::canonicalize_lang`/`lang_as_iso639_1`, backed by the `isolang` crate's real ISO 639 tables instead of upstream's bundled `iso639.calibre_msgpack` resource. The translation-catalog machinery -- `get_lang`, `set_translators`, UI language listing -- is out of scope, matching the issue)
 - [ ] localunzip.py
-- [ ] lock.py
+- [x] lock.py (`calibre_utils::lock`; Linux subset only -- `flock`-based `lock_file` + abstract-Unix-socket `create_single_instance_mutex`. Windows/macOS branches N/A, see the module's own doc)
 - [x] logging.py
 - [ ] matcher.c
 - [ ] matcher.py
@@ -1664,7 +1664,7 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 - [x] socket_inheritance.py
 - [ ] speedup.c
 - [x] speedups.py
-- [ ] tdir_in_cache.py
+- [x] tdir_in_cache.py (`calibre_utils::tdir_in_cache`; `fcntl`-record-lock-based crash-robust temp dirs, narrowed to skip the `atexit` eager-cleanup registration -- see the module's own doc)
 - [x] terminal.py
 - [ ] test_lock.py
 - [x] text2int.py
