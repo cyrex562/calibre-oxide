@@ -14,6 +14,7 @@ pub mod monotonic;
 pub mod mreplace;
 pub mod msdes;
 pub mod network;
+pub mod opensearch;
 pub mod ordered_dict;
 pub mod random_ua;
 pub mod recycle_bin;

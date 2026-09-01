@@ -1779,10 +1779,10 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 
 #### opensearch
 
-- [ ] description.py
-- [ ] query.py
-- [ ] url.py
-- [ ] __init__.py
+- [x] description.py (`calibre_utils::opensearch::Description`; real HTTP fetch via `reqwest::blocking` + roxmltree parsing, verified against a local in-process HTTP server)
+- [x] query.py (`calibre_utils::opensearch::Query`; macro substitution via `url::form_urlencoded`)
+- [x] url.py (`calibre_utils::opensearch::Url`)
+- [x] __init__.py (empty package marker, N/A)
 
 #### podofo
 
