@@ -86,6 +86,9 @@
 //!   category item, with embedded image resources (a subset of
 //!   `content.py`), backed by `calibre_db`'s already-ported notes
 //!   engine -- see that module's own doc.
+//! - [`data_files`]: arbitrary files attached to a book outside its
+//!   standard formats (another subset of `content.py`, issue #418),
+//!   backed by `calibre_db::extra_files` -- see that module's own doc.
 //!
 //! `manage_users_cli.py` is partially covered by this crate's own
 //! `main.rs` binary directly (`--add-user`/`--remove-user`/
@@ -108,6 +111,7 @@ pub mod auth;
 pub mod books;
 pub mod cdb;
 pub mod content;
+pub mod data_files;
 pub mod errors;
 pub mod fts;
 pub mod notes;
@@ -176,7 +180,10 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/get-note/{field}/{item_id}/{library_id}", get(notes::get_note))
         .route("/get-note-from-item-val/{field}/{item}/{library_id}", get(notes::get_note_from_val))
         .route("/get-note-resource/{scheme}/{digest}/{library_id}", get(notes::get_note_resource))
-        .route("/set-note/{field}/{item_id}/{library_id}", post(notes::set_note));
+        .route("/set-note/{field}/{item_id}/{library_id}", post(notes::set_note))
+        .route("/data-files/get/{book_id}/{*relpath}", get(data_files::get))
+        .route("/data-files/upload/{book_id}/{library_id}", post(data_files::upload))
+        .route("/data-files/remove/{book_id}/{library_id}", post(data_files::remove));
 
     api.route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth)).with_state(state)
 }
