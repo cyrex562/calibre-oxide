@@ -123,6 +123,12 @@ pub enum SearchError {
     NumberConversion(String),
     #[error(transparent)]
     Db(#[from] rusqlite::Error),
+    #[error("unknown saved search: {0:?}")]
+    UnknownSavedSearch(String),
+    #[error("recursive saved search: {0:?}")]
+    RecursiveSavedSearch(String),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
 }
 
 // --- _matchkind / _match {{{
@@ -799,6 +805,11 @@ fn resolve_location(loc: &str) -> Option<LocationKind> {
 fn search_locations() -> Vec<String> {
     [
         "all",
+        // Not resolved by `resolve_location`/`get_matches` -- handled
+        // specially in `evaluate` as a saved-search expansion. Still
+        // needs to be in this list so the tokenizer recognizes
+        // `search:name` as a location-prefixed token at all.
+        "search",
         "title",
         "sort",
         "title_sort",
@@ -999,29 +1010,69 @@ fn get_matches(
 /// Port of `SearchQueryParser.evaluate_and/or/not/token` -- see module
 /// docs for why the candidate-narrowing here is real behavior, not
 /// just a tree walk.
+///
+/// `seen` is upstream's own `self.searches_seen`: the set of saved-
+/// search names currently being expanded on this call stack, so a
+/// `search:` token can detect (and reject) a cycle instead of
+/// recursing forever -- see [`evaluate_saved_search`].
 fn evaluate(
     cache: &Cache,
     node: &SearchNode,
     candidates: &HashSet<i32>,
+    seen: &mut HashSet<String>,
 ) -> Result<HashSet<i32>, SearchError> {
     match node {
         SearchNode::And(l, r) => {
-            let lm = evaluate(cache, l, candidates)?;
-            let rm = evaluate(cache, r, &lm)?;
+            let lm = evaluate(cache, l, candidates, seen)?;
+            let rm = evaluate(cache, r, &lm, seen)?;
             Ok(lm.intersection(&rm).copied().collect())
         }
         SearchNode::Or(l, r) => {
-            let lm = evaluate(cache, l, candidates)?;
+            let lm = evaluate(cache, l, candidates, seen)?;
             let remaining: HashSet<i32> = candidates.difference(&lm).copied().collect();
-            let rm = evaluate(cache, r, &remaining)?;
+            let rm = evaluate(cache, r, &remaining, seen)?;
             Ok(lm.union(&rm).copied().collect())
         }
         SearchNode::Not(inner) => {
-            let m = evaluate(cache, inner, candidates)?;
+            let m = evaluate(cache, inner, candidates, seen)?;
             Ok(candidates.difference(&m).copied().collect())
         }
-        SearchNode::Token { location, query } => get_matches(cache, location, query, candidates),
+        SearchNode::Token { location, query } => {
+            if location.eq_ignore_ascii_case("search") {
+                evaluate_saved_search(cache, query, candidates, seen)
+            } else {
+                get_matches(cache, location, query, candidates)
+            }
+        }
     }
+}
+
+/// Port of `evaluate_token`'s `location.lower() == 'search'` branch
+/// (`_check_saved_search_recursion` + `_get_saved_search_text`):
+/// looks `query` (the saved search's name) up, recursively parses and
+/// evaluates its stored query text against `candidates`, and rejects
+/// a search that (directly or indirectly) references itself.
+fn evaluate_saved_search(
+    cache: &Cache,
+    query: &str,
+    candidates: &HashSet<i32>,
+    seen: &mut HashSet<String>,
+) -> Result<HashSet<i32>, SearchError> {
+    let name = query.strip_prefix('=').unwrap_or(query);
+    let name_lower = name.to_lowercase();
+    if seen.contains(&name_lower) {
+        return Err(SearchError::RecursiveSavedSearch(name.to_string()));
+    }
+    let saved_query = cache.saved_search_lookup(name)?.ok_or_else(|| SearchError::UnknownSavedSearch(name.to_string()))?;
+
+    seen.insert(name_lower.clone());
+    let result = (|| -> Result<HashSet<i32>, SearchError> {
+        let mut parser = QueryParser::new(search_locations());
+        let tree = parser.parse(&saved_query).map_err(|e| SearchError::Parse(e.to_string()))?;
+        evaluate(cache, &tree, candidates, seen)
+    })();
+    seen.remove(&name_lower);
+    result
 }
 // }}}
 
@@ -1040,7 +1091,8 @@ pub fn search(cache: &Cache, query: &str) -> anyhow::Result<Vec<i32>> {
     let tree = parser
         .parse(query)
         .map_err(|e| SearchError::Parse(e.to_string()))?;
-    let matches = evaluate(cache, &tree, &all_ids)?;
+    let mut seen = HashSet::new();
+    let matches = evaluate(cache, &tree, &all_ids, &mut seen)?;
     let mut v: Vec<i32> = matches.into_iter().collect();
     v.sort_unstable();
     Ok(v)
@@ -1452,6 +1504,68 @@ mod tests {
             search(&cache, "tag:classic and not tag:scifi").unwrap(),
             vec![3]
         );
+    }
+
+    #[test]
+    fn search_expands_a_saved_search_by_name() {
+        let (_dir, cache) = make_cache();
+        insert_book(&cache, "Foundation", &["Isaac Asimov"], &["scifi"]);
+        insert_book(&cache, "Emma", &["Jane Austen"], &["classic"]);
+        cache.saved_search_add("scifi books", "tag:scifi").unwrap();
+
+        assert_eq!(search(&cache, "search:\"scifi books\"").unwrap(), vec![1]);
+        // Case-insensitive name match, matching saved_search_lookup.
+        assert_eq!(search(&cache, "search:\"SCIFI BOOKS\"").unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn search_combines_a_saved_search_with_other_terms() {
+        let (_dir, cache) = make_cache();
+        insert_book(&cache, "Foundation", &["Isaac Asimov"], &["scifi"]);
+        insert_book(&cache, "Dune", &["Frank Herbert"], &["scifi", "classic"]);
+        cache.saved_search_add("scifi", "tag:scifi").unwrap();
+
+        assert_eq!(search(&cache, "search:scifi and tag:classic").unwrap(), vec![2]);
+    }
+
+    #[test]
+    fn search_of_an_unknown_saved_search_is_a_real_error() {
+        let (_dir, cache) = make_cache();
+        insert_book(&cache, "Foundation", &["Isaac Asimov"], &["scifi"]);
+        let err = search(&cache, "search:nonexistent").unwrap_err();
+        assert!(err.to_string().contains("nonexistent"), "{err}");
+    }
+
+    #[test]
+    fn search_rejects_a_directly_recursive_saved_search() {
+        let (_dir, cache) = make_cache();
+        insert_book(&cache, "Foundation", &["Isaac Asimov"], &["scifi"]);
+        cache.saved_search_add("loopy", "search:loopy").unwrap();
+        let err = search(&cache, "search:loopy").unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("recursive"), "{err}");
+    }
+
+    #[test]
+    fn search_rejects_an_indirectly_recursive_saved_search() {
+        let (_dir, cache) = make_cache();
+        insert_book(&cache, "Foundation", &["Isaac Asimov"], &["scifi"]);
+        cache.saved_search_add("a", "search:b").unwrap();
+        cache.saved_search_add("b", "search:a").unwrap();
+        let err = search(&cache, "search:a").unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("recursive"), "{err}");
+    }
+
+    #[test]
+    fn search_allows_the_same_saved_search_twice_when_not_actually_cyclic() {
+        let (_dir, cache) = make_cache();
+        insert_book(&cache, "Foundation", &["Isaac Asimov"], &["scifi"]);
+        insert_book(&cache, "Dune", &["Frank Herbert"], &["scifi", "classic"]);
+        cache.saved_search_add("scifi", "tag:scifi").unwrap();
+        // Two independent references to the same saved search in one
+        // query (not nested inside each other) must not trip the
+        // recursion guard -- `seen` is cleared after each expansion
+        // completes.
+        assert_eq!(search(&cache, "search:scifi or search:scifi").unwrap(), vec![1, 2]);
     }
 
     #[test]
