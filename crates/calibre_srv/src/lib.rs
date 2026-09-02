@@ -103,14 +103,25 @@
 //! -- see `main.rs`'s own doc for exactly what's covered and what
 //! isn't (`change_set_password`, `libraries`).
 //!
+//! - [`jobs`]: background job management (`jobs.py`, issue #428) --
+//!   real bounded-concurrency task tracking with status polling and
+//!   best-effort abort, built on real `tokio` tasks rather than
+//!   upstream's forked-subprocess model -- see that module's own doc
+//!   for the disclosed consequence of that substitution. Not yet
+//!   wired into [`AppState`]/any route: neither of its two real
+//!   upstream consumers (`books.py`'s render-book job, `convert.py`'s
+//!   server-side conversion) is ported yet, and upstream itself never
+//!   exposed `jobs.py`'s own test helpers (`sleep_test`/`error_test`)
+//!   over HTTP either -- inventing a synthetic endpoint here would be
+//!   API surface upstream never had, not a real port.
+//!
 //! **Deferred to future increments** (not started):
 //! `render_book.py` (the in-browser EPUB reader), `convert.py`
-//! (server-side conversion), `jobs.py`
-//! (background job management), `auto_reload.py` (dev-mode
-//! auto-restart), `bonjour.py` (mDNS advertisement), `legacy.py` (the
-//! old pre-content-server API), `library_broker.py` (multi-library
-//! support), `standalone.py`/`embedded.py` (process-management entry
-//! points -- this increment has its own minimal `main.rs` instead).
+//! (server-side conversion), `auto_reload.py` (dev-mode auto-restart),
+//! `legacy.py` (the old pre-content-server API), `library_broker.py`
+//! (multi-library support), `standalone.py`/`embedded.py` (process-
+//! management entry points -- this increment has its own minimal
+//! `main.rs` instead).
 
 pub mod ajax;
 pub mod auth;
@@ -121,6 +132,7 @@ pub mod content;
 pub mod data_files;
 pub mod errors;
 pub mod fts;
+pub mod jobs;
 pub mod notes;
 pub mod opds;
 pub mod opts;
