@@ -1511,7 +1511,7 @@ either -- this pass wasn't exhaustive.
 - [ ] custom_columns.py
 - [ ] database.py
 - [ ] database2.py
-- [ ] field_metadata.py
+- [x] field_metadata.py (issue #421, first slice -- `calibre_db::field_metadata::FieldMetadata`, a real per-field descriptor registry: every standard column ported verbatim from `_builtin_field_metadata()`, plus one entry per custom column via `Cache::custom_column_label_map`, with accurate `is_category`/`datatype`/`display`/`is_multiple` separator dicts. Read-only -- mutation methods (`add_user_category`/`add_search_category`/`add_grouped_search_terms`) and widening existing narrowed consumers (`ajax`/`categories`/`notes`/`cdb::set_fields`) are separate follow-ups -- see the module's own doc)
 - [ ] prefs.py
 - [ ] restore.py
 - [ ] save_to_disk.py

@@ -16,6 +16,7 @@ pub mod covers;
 mod device_monitor;
 pub mod errors;
 pub mod extra_files;
+pub mod field_metadata;
 pub mod fields;
 pub mod fts;
 pub mod lazy;
