@@ -18,6 +18,14 @@
 //!   crate's formats are always a single path segment, so a plain
 //!   `{fmt}` is used instead -- no real format string needs the extra
 //!   generality).
+//! - `GET /book-get-annotations/{library_id}/{which}` /
+//!   `POST /book-update-annotations/{library_id}/{book_id}/{fmt}`
+//!   (issue #485, part of #427's tracking epic) -- annotation sync,
+//!   backed by `calibre_db::annotations`'s real storage/merge
+//!   algorithm (see that module's own doc for what's narrowed:
+//!   `last-read`-type annotations participate in a merge but are
+//!   never actually persisted, matching upstream exactly). Doesn't
+//!   depend on the render pipeline at all, unlike the rest of #427.
 //!
 //! `last_read.py`'s separate srv-wide "recently read across every
 //! library" cache (a second, `srv-last-read.sqlite`-backed store,
@@ -120,6 +128,74 @@ pub async fn set_last_read_position(
     Ok(())
 }
 
+/// Port of `get_annotations`. `which` is
+/// `book_id1-fmt1_book_id2-fmt2_...` (same shape as
+/// [`get_last_read_position`]'s own `which`). Upstream's `user_type`
+/// for this endpoint is always `"web"` (as opposed to
+/// `"local"`, the desktop app's own annotation namespace) -- this
+/// crate has no desktop app, so there's no `"local"` data to conflict
+/// with, but the real `user_type` value is still used for storage
+/// fidelity should a library ever be shared with a real calibre
+/// desktop install.
+pub async fn get_annotations(State(state): State<AppState>, Path((_library_id, which)): Path<(String, String)>, user: Option<Extension<AuthenticatedUser>>) -> Result<Json<Value>, ServerError> {
+    let user = effective_user(user);
+    let mut ans = serde_json::Map::new();
+    for item in which.split('_') {
+        let (book_id_str, fmt) = item.split_once('-').unwrap_or((item, ""));
+        let Ok(book_id) = book_id_str.parse::<i32>() else {
+            continue;
+        };
+        let key = format!("{book_id}:{fmt}");
+        let (positions, annotations_map) = tokio::task::spawn_blocking({
+            let cache = state.cache.clone();
+            let fmt = fmt.to_string();
+            let user = user.clone();
+            move || -> anyhow::Result<(Vec<Value>, std::collections::HashMap<String, Vec<Value>>)> {
+                let positions = cache.get_last_read_positions(book_id, &fmt, &user)?;
+                let annotations_map = calibre_db::annotations::annotations_map_for_book(&cache, book_id, &fmt, "web", &user)?;
+                Ok((positions, annotations_map))
+            }
+        })
+        .await
+        .map_err(|e| ServerError::InternalServerError(e.to_string()))?
+        .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+        ans.insert(key, serde_json::json!({"last_read_positions": positions, "annotations_map": annotations_map}));
+    }
+    Ok(Json(Value::Object(ans)))
+}
+
+/// `POST /book-update-annotations/{library_id}/{book_id}/{fmt}`. Port
+/// of `update_annotations`. The request body is a JSON object mapping
+/// annotation type -> list of annotations (matching upstream's own
+/// `amap.values()` flattening); every list is concatenated into one
+/// flat list before merging.
+pub async fn update_annotations(State(state): State<AppState>, Path((_library_id, book_id, fmt)): Path<(String, i32, String)>, user: Option<Extension<AuthenticatedUser>>, Json(amap): Json<serde_json::Map<String, Value>>) -> Result<(), ServerError> {
+    let user = effective_user(user);
+    let title_exists = tokio::task::spawn_blocking({
+        let cache = state.cache.clone();
+        move || cache.field_for(book_id, "title")
+    })
+    .await
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))?
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))?
+    .is_some();
+    if !title_exists {
+        return Err(ServerError::book_not_found(book_id, "default"));
+    }
+
+    let alist: Vec<Value> = amap.into_values().filter_map(|v| v.as_array().cloned()).flatten().collect();
+
+    tokio::task::spawn_blocking({
+        let cache = state.cache.clone();
+        move || calibre_db::annotations::merge_annotations_for_book(&cache, book_id, &fmt, &alist, "web", &user)
+    })
+    .await
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))?
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use axum::body::{to_bytes, Body};
@@ -208,5 +284,63 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body[format!("{book_id}:epub")].as_array().unwrap().len(), 1);
         assert_eq!(body[format!("{book_id}:pdf")].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn update_then_get_annotations_round_trips_a_bookmark() {
+        let (_dir, router, book_id) = test_app();
+        let (status, _) = post_json(
+            &router,
+            &format!("/book-update-annotations/default/{book_id}/epub"),
+            serde_json::json!({"bookmark": [{"type": "bookmark", "title": "Chapter 1", "timestamp": "2026-01-01T00:00:00+00:00", "pos": "epubcfi(/6/2)", "pos_type": "epubcfi"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = get_json(&router, &format!("/book-get-annotations/default/{book_id}-epub")).await;
+        assert_eq!(status, StatusCode::OK);
+        let key = format!("{book_id}:epub");
+        let bookmarks = body[&key]["annotations_map"]["bookmark"].as_array().unwrap();
+        assert_eq!(bookmarks.len(), 1);
+        assert_eq!(bookmarks[0]["title"], "Chapter 1");
+        assert_eq!(body[&key]["last_read_positions"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn update_annotations_merges_with_existing_ones() {
+        let (_dir, router, book_id) = test_app();
+        post_json(
+            &router,
+            &format!("/book-update-annotations/default/{book_id}/epub"),
+            serde_json::json!({"bookmark": [{"type": "bookmark", "title": "Chapter 1", "timestamp": "2026-01-01T00:00:00+00:00", "pos": "epubcfi(/6/2)", "pos_type": "epubcfi"}]}),
+        )
+        .await;
+        post_json(
+            &router,
+            &format!("/book-update-annotations/default/{book_id}/epub"),
+            serde_json::json!({"bookmark": [{"type": "bookmark", "title": "Chapter 2", "timestamp": "2026-01-02T00:00:00+00:00", "pos": "epubcfi(/6/4)", "pos_type": "epubcfi"}]}),
+        )
+        .await;
+
+        let (_, body) = get_json(&router, &format!("/book-get-annotations/default/{book_id}-epub")).await;
+        let bookmarks = body[format!("{book_id}:epub")]["annotations_map"]["bookmark"].as_array().unwrap();
+        assert_eq!(bookmarks.len(), 2, "distinct titles should both survive the merge");
+    }
+
+    #[tokio::test]
+    async fn update_annotations_404s_for_an_unknown_book() {
+        let (_dir, router, _book_id) = test_app();
+        let (status, _) = post_json(&router, "/book-update-annotations/default/999/epub", serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn get_annotations_is_empty_for_a_book_with_none() {
+        let (_dir, router, book_id) = test_app();
+        let (status, body) = get_json(&router, &format!("/book-get-annotations/default/{book_id}-epub")).await;
+        assert_eq!(status, StatusCode::OK);
+        let key = format!("{book_id}:epub");
+        assert!(body[&key]["annotations_map"].as_object().unwrap().is_empty());
+        assert!(body[&key]["last_read_positions"].as_array().unwrap().is_empty());
     }
 }
