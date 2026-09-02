@@ -9,9 +9,12 @@
 //! typed access API (`for_book`, `iter_searchable_values`, ...) that
 //! `cache.py`'s `field_for`/`set_field`/searching/sorting/categories
 //! all go through instead of hitting SQL per call. This crate has no
-//! per-field-datatype class hierarchy (no `field_metadata` to drive
-//! one from -- the recurring #201 gap), so [`FieldStore`] plays that
-//! role directly: one struct wrapping [`StandardTables`], with a
+//! per-field-datatype class hierarchy driven by
+//! [`crate::field_metadata::FieldMetadata`] (issue #421 landed the
+//! registry itself, but [`FieldStore`] hasn't been rewired to build
+//! its match arms from it -- that rewiring is its own separate
+//! follow-up, not attempted as part of #421), so [`FieldStore`] plays
+//! that role directly: one struct wrapping [`StandardTables`], with a
 //! [`FieldStore::field_for`] method that reproduces every arm of
 //! [`crate::cache::Cache::field_for`]'s original per-call-SQL match,
 //! reading from the in-memory tables instead. This is the piece
