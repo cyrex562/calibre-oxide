@@ -3,15 +3,6 @@
 //! (deleting books, changing metadata, replacing covers/formats), as
 //! opposed to [`crate::ajax`]'s read-only endpoints.
 //!
-//! # Disclosed scope
-//!
-//! - `GET/POST /cdb/cmd/{which}/{version}` (`cdb_run`) -- the generic
-//!   `calibredb`-CLI-over-HTTP dispatcher (`module_for_cmd`, running
-//!   arbitrary `calibre.db.cli` command modules by name) is **not**
-//!   ported. It would mean building a whole dynamic command registry
-//!   equivalent to `calibre_db::cli`'s own module system, reachable
-//!   over HTTP -- a large, separate undertaking, not attempted here.
-//!
 //! **Ported here**, all requiring [`crate::auth::require_auth`] the
 //! same way every other route in this crate does (this crate has no
 //! separate `needs_db_write`/`restriction_for` write-access gate
@@ -56,9 +47,17 @@
 //!   -- `copy_one_book` itself doesn't support it, see that module's
 //!   doc), and `preserve_date`/`automerge_action` aren't accepted at
 //!   all rather than accepted-but-inert.
+//! - `GET/POST /cdb/cmd/{which}/{version}` (issue #426, `cdb_run`) --
+//!   the generic `calibredb`-CLI-over-HTTP dispatcher, narrowed to a
+//!   representative subset of `calibre_db::cli` commands (`search`,
+//!   `show_metadata`, `remove` -- both read-only and write shapes
+//!   covered). Every other command is a separate follow-up -- see
+//!   [`remote_command`]'s own doc for why most of them need a real
+//!   `implementation`-equivalent written per command, not just a
+//!   registry entry pointing at their existing CLI-facing `run`.
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::Json;
 use calibre_utils::filenames::sanitize_file_name;
 use rand::Rng;
@@ -437,6 +436,149 @@ pub async fn copy_to_library_no_source(State(state): State<AppState>, Path(targe
     copy_to_library_handle(state, target_library_id, None, body).await
 }
 
+/// One `calibre_db::cli` command reachable via [`cmd`] -- port of a
+/// `calibre.db.cli.cmd_*` module's `version` module attribute, plus a
+/// Rust closure standing in for its `implementation` function.
+/// Upstream's `readonly` module attribute isn't tracked here: this
+/// crate's disclosed auth model (see this module's own doc) has no
+/// separate write-access gate distinct from ordinary authentication
+/// for `readonly` to drive, so there'd be nothing for the field to
+/// mean.
+struct RemoteCommand {
+    version: u32,
+    run: fn(&calibre_db::cache::Cache, &[Value]) -> anyhow::Result<Value>,
+}
+
+/// Port of `module_for_cmd` + each supported module's own `version`
+/// attribute -- a representative subset (issue #426's own DoD
+/// explicitly allows this: "not necessarily every `calibre_db::cli`
+/// command on day one"), covering both the read-only and write
+/// shapes: `search`/`show_metadata` (read-only), `remove` (write).
+/// Every other `calibre_db::cli` command is a separate follow-up once
+/// picked -- most of them (`list`/`add_custom_column`/
+/// `set_metadata`/etc.) currently `println!` their own output and
+/// take raw CLI-flag `&[String]` args rather than returning
+/// structured data from a request-shaped argument list, so wiring
+/// them here means writing a real `implementation`-equivalent per
+/// command (as this module does for its three), not just calling
+/// their existing CLI-facing `run`. Upstream's own
+/// `cmd_add_custom_column.py` module has the identical gap -- its own
+/// `implementation()` is `raise NotImplementedError()` -- confirming
+/// this isn't a Rust-specific shortcut.
+fn remote_command(which: &str) -> Option<RemoteCommand> {
+    match which {
+        "search" => Some(RemoteCommand { version: 0, run: run_search }),
+        "show_metadata" => Some(RemoteCommand { version: 0, run: run_show_metadata }),
+        "remove" => Some(RemoteCommand { version: 0, run: run_remove }),
+        _ => None,
+    }
+}
+
+/// Port of `cmd_search.implementation`: `args[0]` is the search query
+/// string; returns every matching book id.
+fn run_search(cache: &calibre_db::cache::Cache, args: &[Value]) -> anyhow::Result<Value> {
+    let query = args.first().and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("expected a search query string as the first argument"))?;
+    let ids = calibre_db::search::search(cache, query)?;
+    Ok(serde_json::json!(ids))
+}
+
+/// Port of `cmd_show_metadata.implementation`: `args[0]` is a book
+/// id; returns that book's metadata (this crate's `ajax::book_json`
+/// shape, not upstream's own `Metadata` object -- a disclosed,
+/// Rust-shaped equivalent, same as every other endpoint in this
+/// crate that reports book metadata), or `null` for an unknown id
+/// (matching upstream's own `return` with no value).
+fn run_show_metadata(cache: &calibre_db::cache::Cache, args: &[Value]) -> anyhow::Result<Value> {
+    let book_id = args.first().and_then(|v| v.as_i64()).ok_or_else(|| anyhow::anyhow!("expected a book id as the first argument"))? as i32;
+    let ids: std::collections::HashSet<i32> = std::iter::once(book_id).collect();
+    let rows = cache.get_data_as_dict(None, false, Some(&ids), false)?;
+    Ok(rows.into_iter().next().map(|row| book_json(&row)).unwrap_or(Value::Null))
+}
+
+/// Port of `cmd_remove.implementation`: `args[0]` is a list of book
+/// ids, `args[1]` is `permanent` -- accepted for request-shape
+/// compatibility but has no effect, matching this crate's existing
+/// [`delete_books`] handler: `Cache::delete_book` has no recycle-bin
+/// concept to preserve or bypass, it's unconditionally permanent.
+fn run_remove(cache: &calibre_db::cache::Cache, args: &[Value]) -> anyhow::Result<Value> {
+    let ids: Vec<i32> = args
+        .first()
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("expected a list of book ids as the first argument"))?
+        .iter()
+        .filter_map(|v| v.as_i64())
+        .map(|n| n as i32)
+        .collect();
+    if ids.is_empty() {
+        anyhow::bail!("You must specify at least one book to remove");
+    }
+    for id in &ids {
+        cache.delete_book(*id)?;
+    }
+    Ok(Value::Null)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CmdQuery {
+    library_id: Option<String>,
+}
+
+/// `GET/POST /cdb/cmd/{which}/{version}`. Port of `cdb_run` --
+/// `which` names a [`remote_command`] (a representative subset of
+/// `calibre_db::cli` commands, see that function's own doc for
+/// scope), `version` must match its declared version (a real
+/// compatibility check, matching upstream's own contract for the
+/// real `calibredb` CLI talking to a remote server). The request
+/// body is a JSON array of positional arguments (matching upstream's
+/// own `args` tuple shape) -- always parsed as JSON regardless of
+/// `Content-Type`; upstream also accepts msgpack-encoded bodies
+/// (negotiated via `Content-Type`), which isn't ported (a real,
+/// disclosed narrowing -- a msgpack body simply fails JSON parsing
+/// and gets a 400, same as any other malformed body). On success,
+/// returns `{"result": ...}`; on a command error, returns `{"err":
+/// "...", "tb": ""}` **with a 200 status**, matching upstream's own
+/// behavior of reporting command failures inside the response body
+/// rather than as an HTTP error status (`tb` is always empty -- this
+/// crate has no Python-style traceback capture).
+///
+/// This crate's disclosed auth model (see this module's own doc) has
+/// no separate write-access gate distinct from ordinary
+/// authentication, so upstream's own `readonly`-gated
+/// `ctx.check_for_write_access` call has nothing to port here -- see
+/// [`RemoteCommand`]'s own doc.
+pub async fn cmd(State(state): State<AppState>, Path((which, version)): Path<(String, String)>, Query(q): Query<CmdQuery>, body: Bytes) -> Result<Json<Value>, ServerError> {
+    let Some(command) = remote_command(&which) else {
+        return Err(ServerError::NotFound(format!("No module named: {which}")));
+    };
+    let Ok(requested_version) = version.parse::<u32>() else {
+        return Err(ServerError::NotFound(format!("The module {which} is not available in version: {version}. Make sure the version of calibre used for the server and calibredb match")));
+    };
+    if requested_version != command.version {
+        return Err(ServerError::NotFound(format!(
+            "The module {which} is not available in version: {version}. Make sure the version of calibre used for the server and calibredb match"
+        )));
+    }
+
+    let args: Vec<Value> = if body.is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_slice(&body).map_err(|_| ServerError::BadRequest("args are not valid encoded data".to_string()))?
+    };
+
+    let cache = state
+        .cache_for(q.library_id.as_deref())
+        .ok_or_else(|| ServerError::NotFound(format!("no library named {:?}", q.library_id.unwrap_or_default())))?;
+
+    let result = tokio::task::spawn_blocking(move || (command.run)(&cache, &args))
+        .await
+        .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+
+    Ok(Json(match result {
+        Ok(value) => serde_json::json!({"result": value}),
+        Err(err) => serde_json::json!({"err": err.to_string(), "tb": ""}),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use axum::body::{to_bytes, Body};
@@ -810,6 +952,76 @@ mod tests {
 
         let (status, _) = post_json(&router, &format!("/cdb/copy-to-library/{dest_name}/{src_name}"), serde_json::json!({"book_ids": [1], "duplicate_action": "add_formats_to_existing"})).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn cmd_search_returns_matching_book_ids() {
+        let (_dir, router) = test_app_with_book("The Great Book", "Jane Doe");
+        let (_, books) = get_json(&router, "/ajax/books").await;
+        let book_id = books.as_object().unwrap().keys().next().unwrap().parse::<i64>().unwrap();
+
+        let (status, body) = post_json(&router, "/cdb/cmd/search/0", serde_json::json!(["great"])).await;
+        assert_eq!(status, StatusCode::OK, "got: {body}");
+        assert_eq!(body["result"], serde_json::json!([book_id]));
+    }
+
+    #[tokio::test]
+    async fn cmd_show_metadata_returns_the_books_json() {
+        let (_dir, router) = test_app_with_book("The Great Book", "Jane Doe");
+        let (_, books) = get_json(&router, "/ajax/books").await;
+        let book_id = books.as_object().unwrap().keys().next().unwrap().parse::<i64>().unwrap();
+
+        let (status, body) = post_json(&router, "/cdb/cmd/show_metadata/0", serde_json::json!([book_id])).await;
+        assert_eq!(status, StatusCode::OK, "got: {body}");
+        assert_eq!(body["result"]["title"], "The Great Book");
+    }
+
+    #[tokio::test]
+    async fn cmd_show_metadata_returns_null_for_an_unknown_book() {
+        let (_dir, router) = test_app_with_book("The Great Book", "Jane Doe");
+
+        let (status, body) = post_json(&router, "/cdb/cmd/show_metadata/0", serde_json::json!([999999])).await;
+        assert_eq!(status, StatusCode::OK, "got: {body}");
+        assert!(body["result"].is_null());
+    }
+
+    #[tokio::test]
+    async fn cmd_remove_deletes_the_book() {
+        let (_dir, router) = test_app_with_book("The Great Book", "Jane Doe");
+        let (_, books) = get_json(&router, "/ajax/books").await;
+        let book_id = books.as_object().unwrap().keys().next().unwrap().parse::<i64>().unwrap();
+
+        let (status, body) = post_json(&router, "/cdb/cmd/remove/0", serde_json::json!([[book_id], false])).await;
+        assert_eq!(status, StatusCode::OK, "got: {body}");
+        assert!(body.get("err").is_none(), "got: {body}");
+
+        let (_, books_after) = get_json(&router, "/ajax/books").await;
+        assert!(books_after.as_object().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cmd_remove_with_no_ids_reports_an_error_not_an_http_failure() {
+        let (_dir, router) = test_app_with_book("The Great Book", "Jane Doe");
+
+        let (status, body) = post_json(&router, "/cdb/cmd/remove/0", serde_json::json!([[], false])).await;
+        assert_eq!(status, StatusCode::OK, "errors are reported in the body, not the HTTP status -- got: {body}");
+        assert!(body["err"].as_str().is_some(), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn cmd_404s_for_an_unknown_command() {
+        let (_dir, router) = test_app_with_book("The Great Book", "Jane Doe");
+
+        let (status, _) = post_json(&router, "/cdb/cmd/no_such_command/0", serde_json::json!([])).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cmd_404s_for_a_version_mismatch() {
+        let (_dir, router) = test_app_with_book("The Great Book", "Jane Doe");
+
+        let (status, _) = post_json(&router, "/cdb/cmd/search/99", serde_json::json!(["query"])).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }
 

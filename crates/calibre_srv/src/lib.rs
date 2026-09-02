@@ -67,9 +67,10 @@
 //! - [`cdb`]: a subset of the write/mutation JSON API (`cdb.py`) --
 //!   add-book, delete-books, set-cover, set-fields (metadata/cover/
 //!   format edits), copy-to-library (issue #425, real two-library
-//!   copy/move built on #423's multi-library support). Not ported:
-//!   the generic `calibredb`-CLI-over-HTTP dispatcher -- see that
-//!   module's own doc for why.
+//!   copy/move built on #423's multi-library support), the generic
+//!   `calibredb`-CLI-over-HTTP dispatcher (issue #426, narrowed to a
+//!   representative subset of commands) -- see that module's own doc
+//!   for what's narrowed in each.
 //! - [`books`]: cross-device reading-position sync (a narrow slice of
 //!   `books.py`) -- `book-get/set-last-read-position` only; the rest
 //!   of that file is `render_book.py`'s in-browser EPUB rendering
@@ -233,6 +234,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/cdb/set-fields/{book_id}", post(cdb::set_fields))
         .route("/cdb/copy-to-library/{target_library_id}/{library_id}", post(cdb::copy_to_library))
         .route("/cdb/copy-to-library/{target_library_id}", post(cdb::copy_to_library_no_source))
+        .route("/cdb/cmd/{which}/{version}", get(cdb::cmd).post(cdb::cmd))
         .route("/book-get-last-read-position/{library_id}/{which}", get(books::get_last_read_position))
         .route("/book-set-last-read-position/{library_id}/{book_id}/{fmt}", post(books::set_last_read_position))
         .route("/web-socket", get(web_socket::upgrade))
