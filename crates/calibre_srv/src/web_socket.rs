@@ -177,6 +177,7 @@ mod tests {
     fn test_state(dir: &std::path::Path) -> crate::AppState {
         let cache = Cache::new(dir).unwrap();
         crate::AppState {
+            libraries: None,
             cache: std::sync::Arc::new(cache),
             opts: std::sync::Arc::new(crate::opts::ServerOptions::default()),
             auth: None,

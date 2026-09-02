@@ -1575,7 +1575,7 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 - [x] jobs.py (issue #428; `calibre_srv::jobs::JobsManager` -- real bounded-concurrency task tracking on `tokio` tasks instead of upstream's forked-subprocess model; not yet wired into `AppState`/a route since neither real consumer, `books.py`'s render-book job or `convert.py`, is ported yet -- see the module's own doc)
 - [ ] last_read.py (superseded -- see issue #60's body)
 - [ ] legacy.py (issue #430, low priority -- wait for a concrete need)
-- [ ] library_broker.py (issue #423, foundational)
+- [x] library_broker.py (issue #423, first slice -- `calibre_srv::library_broker::LibraryBroker`, the base non-GUI class: opens N libraries, dedups by canonical path/samefile, default-library-is-first-inserted, `get`/`library_map`; `GuiLibraryBroker` out of scope, no GUI. Wired into `AppState::libraries`/`cache_for`, threaded through `content::get` as a real end-to-end `library_id`-switches-libraries demonstration; every other handler and `opds.py`/`ajax.py`'s multi-library gaps are separate follow-ups -- see the module's own doc)
 - [x] loop.py (subsumed by `tokio`'s async runtime)
 - [ ] manage_users_cli.py (partial -- `calibre_srv`'s own `--add-user`/`--remove-user`/`--list-users`/`--set-readonly`/`--change-password` flags cover add/remove/list/readonly/chpass; no change_set_password (misc_data column) or libraries (multi-library) subcommands)
 - [ ] metadata.py (blocked on issue #421 field_metadata)

@@ -424,7 +424,7 @@ mod tests {
         for i in 0..book_count {
             add_test_book(dir.path(), &cache, &format!("Book {i}"), "Author");
         }
-        let state = crate::AppState { cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()) };
+        let state = crate::AppState { libraries: None, cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()) };
         let router = crate::test_router(state);
         (dir, router)
     }
@@ -491,7 +491,7 @@ mod tests {
         let cache = Cache::new(dir.path()).unwrap();
         add_test_book(dir.path(), &cache, "Book A", "Jane Doe");
         add_test_book(dir.path(), &cache, "Book B", "John Smith");
-        let state = crate::AppState { cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()) };
+        let state = crate::AppState { libraries: None, cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()) };
         let router = crate::test_router(state);
 
         let (status, body) = get_json(&router, "/ajax/category/authors?num=1").await;
@@ -515,7 +515,7 @@ mod tests {
         let cache = Cache::new(dir.path()).unwrap();
         add_test_book(dir.path(), &cache, "Book A", "Jane Doe");
         add_test_book(dir.path(), &cache, "Book B", "John Smith");
-        let state = crate::AppState { cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()) };
+        let state = crate::AppState { libraries: None, cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()) };
         let router = crate::test_router(state);
 
         let (_, cat) = get_json(&router, "/ajax/category/authors").await;
@@ -551,7 +551,7 @@ mod tests {
         let cache = Cache::new(dir.path()).unwrap();
         add_test_book(dir.path(), &cache, "Foundation", "Isaac Asimov");
         add_test_book(dir.path(), &cache, "Dune", "Frank Herbert");
-        let state = crate::AppState { cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()) };
+        let state = crate::AppState { libraries: None, cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()) };
         let router = crate::test_router(state);
 
         let (status, body) = get_json(&router, "/ajax/search?query=Foundation").await;
@@ -579,7 +579,7 @@ mod tests {
         add_test_book(dir.path(), &cache, "Foundation", "Isaac Asimov");
         add_test_book(dir.path(), &cache, "Dune", "Frank Herbert");
         cache.saved_search_add("asimov books", "title:Foundation").unwrap();
-        let state = crate::AppState { cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()) };
+        let state = crate::AppState { libraries: None, cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()) };
         let router = crate::test_router(state);
 
         let (status, body) = get_json(&router, "/ajax/search?query=search%3A%22asimov+books%22").await;

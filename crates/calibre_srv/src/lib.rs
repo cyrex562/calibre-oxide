@@ -115,13 +115,26 @@
 //!   over HTTP either -- inventing a synthetic endpoint here would be
 //!   API surface upstream never had, not a real port.
 //!
+//! - [`library_broker`]: a pool of opened libraries keyed by
+//!   `library_id` (`library_broker.py`'s base `LibraryBroker` class,
+//!   issue #423, first slice), wired into [`AppState::libraries`] +
+//!   [`AppState::cache_for`] and threaded through [`content::get`] as
+//!   this slice's one real end-to-end demonstration -- every other
+//!   handler still reads [`AppState::cache`] directly and ignores its
+//!   own `library_id` path segment (`AppState::libraries` defaults to
+//!   `None`, so every pre-#423 single-library test and call site is
+//!   unaffected). Migrating the rest of the handlers to real
+//!   `library_id` routing, and exposing `library_map` for real
+//!   (`ajax::library_info`'s hardcoded single entry, OPDS per-library
+//!   nav entries, `cdb`'s copy-to-library) are separate follow-ups --
+//!   see that module's own doc.
+//!
 //! **Deferred to future increments** (not started):
 //! `render_book.py` (the in-browser EPUB reader), `convert.py`
 //! (server-side conversion), `auto_reload.py` (dev-mode auto-restart),
-//! `legacy.py` (the old pre-content-server API), `library_broker.py`
-//! (multi-library support), `standalone.py`/`embedded.py` (process-
-//! management entry points -- this increment has its own minimal
-//! `main.rs` instead).
+//! `legacy.py` (the old pre-content-server API),
+//! `standalone.py`/`embedded.py` (process-management entry points --
+//! this increment has its own minimal `main.rs` instead).
 
 pub mod ajax;
 pub mod auth;
@@ -133,6 +146,7 @@ pub mod data_files;
 pub mod errors;
 pub mod fts;
 pub mod jobs;
+pub mod library_broker;
 pub mod notes;
 pub mod opds;
 pub mod opts;
@@ -161,6 +175,29 @@ pub struct AppState {
     /// Per-user in-browser-reader settings -- see
     /// [`reader_profiles::ProfileStore`]'s own doc.
     pub reader_profiles: Arc<reader_profiles::ProfileStore>,
+    /// The full pool of opened libraries (issue #423, first slice) --
+    /// `None` means single-library mode: every handler falls back to
+    /// [`AppState::cache`] regardless of any `library_id` it was
+    /// given, exactly matching this crate's pre-#423 behavior. `Some`
+    /// libraries are addressed by id via [`AppState::cache_for`];
+    /// `cache` itself still names the default library either way, so
+    /// existing single-library call sites that never call
+    /// `cache_for` keep working unchanged.
+    pub libraries: Option<Arc<library_broker::LibraryBroker>>,
+}
+
+impl AppState {
+    /// The library for `library_id`, or the default library
+    /// ([`AppState::cache`]) when `library_id` is `None`/empty, or
+    /// [`AppState::libraries`] is `None` (single-library mode).
+    /// `None` only when `library_id` names a library that isn't in
+    /// [`AppState::libraries`].
+    pub fn cache_for(&self, library_id: Option<&str>) -> Option<Arc<Cache>> {
+        match &self.libraries {
+            None => Some(self.cache.clone()),
+            Some(broker) => broker.get(library_id),
+        }
+    }
 }
 
 /// Builds the `axum::Router` for this increment's endpoints. When

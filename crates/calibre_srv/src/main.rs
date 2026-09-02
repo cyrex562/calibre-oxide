@@ -125,7 +125,7 @@ async fn main() -> anyhow::Result<()> {
     let port = cli.opts.port;
     let listen_on = cli.opts.listen_on.clone().unwrap_or_else(|| "0.0.0.0".to_string());
     let reader_profiles = calibre_srv::reader_profiles::ProfileStore::new(&cli.library_path.join("reader-profiles.sqlite"))?;
-    let state = AppState { cache: Arc::new(cache), opts: Arc::new(cli.opts), auth, changes: calibre_srv::web_socket::new_change_broadcaster(), reader_profiles: Arc::new(reader_profiles) };
+    let state = AppState { libraries: None, cache: Arc::new(cache), opts: Arc::new(cli.opts), auth, changes: calibre_srv::web_socket::new_change_broadcaster(), reader_profiles: Arc::new(reader_profiles) };
 
     let use_bonjour = state.opts.use_bonjour;
     let library_name = cli.library_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "calibre-oxide Library".to_string());
