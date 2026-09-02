@@ -65,10 +65,11 @@
 //!   -- see that module's doc for what's narrowed relative to
 //!   upstream's full `field_metadata`-driven version.
 //! - [`cdb`]: a subset of the write/mutation JSON API (`cdb.py`) --
-//!   delete-books, set-cover, set-fields (metadata/cover/format
-//!   edits). Not ported: the generic `calibredb`-CLI-over-HTTP
-//!   dispatcher, add-book, copy-to-library -- see that module's own
-//!   doc for why.
+//!   add-book, delete-books, set-cover, set-fields (metadata/cover/
+//!   format edits), copy-to-library (issue #425, real two-library
+//!   copy/move built on #423's multi-library support). Not ported:
+//!   the generic `calibredb`-CLI-over-HTTP dispatcher -- see that
+//!   module's own doc for why.
 //! - [`books`]: cross-device reading-position sync (a narrow slice of
 //!   `books.py`) -- `book-get/set-last-read-position` only; the rest
 //!   of that file is `render_book.py`'s in-browser EPUB rendering
@@ -118,16 +119,16 @@
 //! - [`library_broker`]: a pool of opened libraries keyed by
 //!   `library_id` (`library_broker.py`'s base `LibraryBroker` class,
 //!   issue #423, first slice), wired into [`AppState::libraries`] +
-//!   [`AppState::cache_for`] and threaded through [`content::get`] as
-//!   this slice's one real end-to-end demonstration -- every other
-//!   handler still reads [`AppState::cache`] directly and ignores its
-//!   own `library_id` path segment (`AppState::libraries` defaults to
-//!   `None`, so every pre-#423 single-library test and call site is
-//!   unaffected). Migrating the rest of the handlers to real
-//!   `library_id` routing, and exposing `library_map` for real
-//!   (`ajax::library_info`'s hardcoded single entry, OPDS per-library
-//!   nav entries, `cdb`'s copy-to-library) are separate follow-ups --
-//!   see that module's own doc.
+//!   [`AppState::cache_for`] and threaded through [`content::get`] and
+//!   [`cdb::copy_to_library`] (issue #425) as real end-to-end
+//!   demonstrations -- every other handler still reads
+//!   [`AppState::cache`] directly and ignores its own `library_id`
+//!   path segment (`AppState::libraries` defaults to `None`, so every
+//!   pre-#423 single-library test and call site is unaffected).
+//!   Migrating the rest of the handlers to real `library_id` routing,
+//!   and exposing `library_map` for real (`ajax::library_info`'s
+//!   hardcoded single entry, OPDS per-library nav entries) are
+//!   separate follow-ups -- see that module's own doc.
 //!
 //! **Deferred to future increments** (not started):
 //! `render_book.py` (the in-browser EPUB reader), `convert.py`
@@ -230,6 +231,8 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/cdb/delete-books/{book_ids}", post(cdb::delete_books))
         .route("/cdb/set-cover/{book_id}", post(cdb::set_cover))
         .route("/cdb/set-fields/{book_id}", post(cdb::set_fields))
+        .route("/cdb/copy-to-library/{target_library_id}/{library_id}", post(cdb::copy_to_library))
+        .route("/cdb/copy-to-library/{target_library_id}", post(cdb::copy_to_library_no_source))
         .route("/book-get-last-read-position/{library_id}/{which}", get(books::get_last_read_position))
         .route("/book-set-last-read-position/{library_id}/{book_id}/{fmt}", post(books::set_last_read_position))
         .route("/web-socket", get(web_socket::upgrade))

@@ -400,7 +400,7 @@ pub fn recursive_import(
 ///
 /// # Returns
 /// * `Result<i32>` - The ID of the newly created book.
-pub fn add_book(cache: &Arc<Mutex<Cache>>, title: &str, authors: &[String]) -> Result<i32> {
+pub fn add_book(cache: &Cache, title: &str, authors: &[String]) -> Result<i32> {
     let uuid = Uuid::new_v4().to_string();
 
     // Basic title sort: simplified for now (Copy of title).
@@ -415,10 +415,7 @@ pub fn add_book(cache: &Arc<Mutex<Cache>>, title: &str, authors: &[String]) -> R
         authors.join(" & ")
     };
 
-    let lock = cache.lock().unwrap();
-    let book_id = lock
-        .backend
-        .insert_book(title, &sort, &author_sort, &uuid)?;
+    let book_id = cache.backend.insert_book(title, &sort, &author_sort, &uuid)?;
 
     // Note: This does NOT yet insert into the `authors` table or `books_authors_link` table.
     // That involves "many-many" field logic which is complex and partially handled in `write.py`.

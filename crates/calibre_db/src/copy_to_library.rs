@@ -40,7 +40,6 @@ use crate::utils::find_identical_books;
 use anyhow::{Context, Result};
 use indexmap::IndexMap;
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
 
 /// Builds the three lookup maps [`find_identical_books`] needs
 /// (lowercase author name -> author ids, author id -> book ids, book
@@ -126,15 +125,14 @@ fn real_authors(cache: &Cache, book_id: i32) -> Result<Vec<String>> {
 }
 
 pub fn copy_one_book(
-    src_cache: &Arc<Mutex<Cache>>,
-    dest_cache: &Arc<Mutex<Cache>>,
+    src_cache: &Cache,
+    dest_cache: &Cache,
     book_id: i32,
     check_duplicates: bool,
 ) -> Result<Option<i32>> {
     // 1. Fetch Source Data
     let (title, authors, sort, author_sort, uuid, _path_rel) = {
-        let guard = src_cache.lock().unwrap();
-        let backend = &guard.backend;
+        let backend = &src_cache.backend;
         let title = backend.field_for(book_id, "title")?.unwrap_or_default();
         let sort = backend.field_for(book_id, "sort")?.unwrap_or_default();
         let author_sort = backend
@@ -144,15 +142,14 @@ pub fn copy_one_book(
         let path = backend
             .field_for(book_id, "path")?
             .context("No path info")?;
-        let authors = real_authors(&guard, book_id)?;
+        let authors = real_authors(src_cache, book_id)?;
 
         (title, authors, sort, author_sort, uuid, path)
     };
 
     // 2. Check Duplicates in Dest
     if check_duplicates {
-        let guard = dest_cache.lock().unwrap();
-        let (author_map, aid_to_bids, title_map) = duplicate_detection_maps(&guard)?;
+        let (author_map, aid_to_bids, title_map) = duplicate_detection_maps(dest_cache)?;
         let matches = find_identical_books(&title, &authors, &author_map, &aid_to_bids, &title_map);
         if !matches.is_empty() {
             // A same-author/near-same-title book already exists in the
@@ -168,15 +165,12 @@ pub fn copy_one_book(
     let new_book_id = add_book(dest_cache, &title, &authors)?;
 
     // 4. Update core metadata
-    {
-        let guard = dest_cache.lock().unwrap();
-        guard.backend.update(new_book_id, "sort", &sort)?;
-        guard
-            .backend
-            .update(new_book_id, "author_sort", &author_sort)?;
-        // We usually want to preserve UUID or generate new one? copy logic usually preserves.
-        guard.backend.update(new_book_id, "uuid", &uuid)?;
-    }
+    dest_cache.backend.update(new_book_id, "sort", &sort)?;
+    dest_cache
+        .backend
+        .update(new_book_id, "author_sort", &author_sort)?;
+    // We usually want to preserve UUID or generate new one? copy logic usually preserves.
+    dest_cache.backend.update(new_book_id, "uuid", &uuid)?;
 
     // 5. Copy Files: not yet real -- `add_book` (the free function
     // above) doesn't set the new book's `path` at all, so there's
