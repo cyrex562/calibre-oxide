@@ -141,7 +141,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::new(dir.path()).unwrap();
         let book_id = add_test_book(dir.path(), &cache, "Book 0");
-        let state = crate::AppState { cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()) };
+        let state = crate::AppState { libraries: None, cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()) };
         let router = crate::test_router(state);
         (dir, router, book_id)
     }
