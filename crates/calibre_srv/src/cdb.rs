@@ -11,10 +11,6 @@
 //!   ported. It would mean building a whole dynamic command registry
 //!   equivalent to `calibre_db::cli`'s own module system, reachable
 //!   over HTTP -- a large, separate undertaking, not attempted here.
-//! - `POST /cdb/copy-to-library/...` (`cdb_copy_to_library`) is **not**
-//!   ported -- needs real multi-library support (`library_map`), which
-//!   nothing in this crate has yet (see `opds.rs`'s own doc for the
-//!   same disclosed gap).
 //!
 //! **Ported here**, all requiring [`crate::auth::require_auth`] the
 //! same way every other route in this crate does (this crate has no
@@ -50,6 +46,16 @@
 //!   upstream supports for these fields is real. Returns the same
 //!   shape upstream does: `{book_id: full-book-json}` for every
 //!   dirtied id (via [`crate::ajax::book_json`]).
+//! - `POST /cdb/copy-to-library/{target_library_id}/{library_id}`
+//!   (issue #425, built on #423's `AppState::libraries`/`cache_for`)
+//!   -- real copy/move between two open libraries with same-author/
+//!   near-same-title duplicate detection via
+//!   `calibre_db::copy_to_library::copy_one_book`. Narrower than
+//!   upstream: no `add_formats_to_existing` automerge (rejected with
+//!   a real error rather than silently downgraded to something else
+//!   -- `copy_one_book` itself doesn't support it, see that module's
+//!   doc), and `preserve_date`/`automerge_action` aren't accepted at
+//!   all rather than accepted-but-inert.
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
@@ -339,6 +345,98 @@ pub async fn set_fields(State(state): State<AppState>, Path(book_id): Path<i32>,
     Ok(Json(Value::Object(ans)))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CopyToLibraryBody {
+    book_ids: Vec<i32>,
+    #[serde(default, rename = "move")]
+    move_books: bool,
+    #[serde(default = "default_duplicate_action")]
+    duplicate_action: String,
+}
+
+fn default_duplicate_action() -> String {
+    "add".to_string()
+}
+
+async fn copy_to_library_handle(state: AppState, target_library_id: String, source_library_id: Option<String>, body: CopyToLibraryBody) -> Result<Json<Value>, ServerError> {
+    let CopyToLibraryBody { book_ids, move_books, duplicate_action } = body;
+    if book_ids.is_empty() {
+        return Err(ServerError::BadRequest("book_ids must not be empty".to_string()));
+    }
+    if duplicate_action == "add_formats_to_existing" {
+        // Upstream's automerge path (adding incoming formats to an
+        // existing identical book) -- `calibre_db::copy_to_library`'s
+        // own `copy_one_book` doesn't support it either, see that
+        // module's doc.
+        return Err(ServerError::BadRequest("duplicate_action=add_formats_to_existing (automerge) is not supported".to_string()));
+    }
+    if duplicate_action != "add" && duplicate_action != "ignore" {
+        return Err(ServerError::BadRequest("duplicate_action must be one of: add, ignore".to_string()));
+    }
+    let check_duplicates = duplicate_action == "ignore";
+
+    let src_cache = state
+        .cache_for(source_library_id.as_deref())
+        .ok_or_else(|| ServerError::NotFound(format!("no library named {:?}", source_library_id.clone().unwrap_or_default())))?;
+    let dest_cache = state.cache_for(Some(&target_library_id)).ok_or_else(|| ServerError::NotFound(format!("no library named {target_library_id:?}")))?;
+
+    let (response, copied_ids) = tokio::task::spawn_blocking(move || {
+        let mut response = serde_json::Map::new();
+        let mut copied_ids = Vec::new();
+        for book_id in book_ids {
+            match calibre_db::copy_to_library::copy_one_book(&src_cache, &dest_cache, book_id, check_duplicates) {
+                Ok(Some(new_id)) => {
+                    response.insert(book_id.to_string(), serde_json::json!({"ok": true, "payload": new_id}));
+                    copied_ids.push(book_id);
+                }
+                Ok(None) => {
+                    response.insert(book_id.to_string(), serde_json::json!({"ok": true, "payload": null}));
+                }
+                Err(e) => {
+                    response.insert(book_id.to_string(), serde_json::json!({"ok": false, "payload": e.to_string()}));
+                }
+            }
+        }
+        if move_books {
+            for id in &copied_ids {
+                let _ = src_cache.delete_book(*id);
+            }
+        }
+        (Value::Object(response), copied_ids)
+    })
+    .await
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+
+    if !copied_ids.is_empty() {
+        web_socket::publish(&state, ChangeEvent::BooksAdded { book_ids: copied_ids.clone() });
+        if move_books {
+            web_socket::publish(&state, ChangeEvent::BooksDeleted { book_ids: copied_ids });
+        }
+    }
+
+    Ok(Json(response))
+}
+
+/// `POST /cdb/copy-to-library/{target_library_id}/{library_id}`. Port
+/// of `cdb_copy_to_library`, narrowed to what
+/// `calibre_db::copy_to_library::copy_one_book` supports: real
+/// copy/move with same-author/near-same-title duplicate detection
+/// (`duplicate_action` of `add` or `ignore`); `add_formats_to_existing`
+/// (automerge) isn't ported (see that module's own doc), and neither
+/// is `preserve_date`/`automerge_action` -- both accepted upstream but
+/// meaningless without automerge support, so this port doesn't parse
+/// them at all rather than silently ignoring accepted-but-inert
+/// fields.
+pub async fn copy_to_library(State(state): State<AppState>, Path((target_library_id, library_id)): Path<(String, String)>, Json(body): Json<CopyToLibraryBody>) -> Result<Json<Value>, ServerError> {
+    copy_to_library_handle(state, target_library_id, Some(library_id), body).await
+}
+
+/// Same as [`copy_to_library`], for a URL with no source
+/// `{library_id}` segment -- always copies from the default library.
+pub async fn copy_to_library_no_source(State(state): State<AppState>, Path(target_library_id): Path<String>, Json(body): Json<CopyToLibraryBody>) -> Result<Json<Value>, ServerError> {
+    copy_to_library_handle(state, target_library_id, None, body).await
+}
+
 #[cfg(test)]
 mod tests {
     use axum::body::{to_bytes, Body};
@@ -611,6 +709,107 @@ mod tests {
 
         let (_, all_books) = get_json(&router, "/ajax/books").await;
         assert_eq!(all_books.as_object().unwrap().len(), 2);
+    }
+
+    /// Two real, separately opened libraries wired into `AppState`
+    /// via a real `LibraryBroker` (issue #423), the source seeded
+    /// with one book -- for exercising `copy-to-library` end to end.
+    /// Returns the broker itself (not just the router) so tests can
+    /// inspect/seed either library through the same already-open
+    /// `Cache` the router holds, rather than opening a second,
+    /// independent `Cache::new` against a directory the broker (and
+    /// so the still-alive router) already has open -- see
+    /// `test_app_with_book`'s own doc comment above for why that
+    /// race matters.
+    fn test_app_with_two_libraries() -> (tempfile::TempDir, tempfile::TempDir, std::sync::Arc<crate::library_broker::LibraryBroker>, axum::Router) {
+        let src_dir = tempfile::tempdir().unwrap();
+        let dest_dir = tempfile::tempdir().unwrap();
+        {
+            let cache = Cache::new(src_dir.path()).unwrap();
+            add_test_book(src_dir.path(), &cache, "Source Book", "Jane Doe");
+        }
+        {
+            // Seeds the dest library so it has a real metadata.db of
+            // its own -- `LibraryBroker::new` only opens libraries
+            // that already exist. Closed again before the broker
+            // opens its own handle on the same path.
+            Cache::new(dest_dir.path()).unwrap();
+        }
+        let broker = std::sync::Arc::new(crate::library_broker::LibraryBroker::new(&[src_dir.path().to_path_buf(), dest_dir.path().to_path_buf()]).unwrap());
+        let default_cache = broker.get(None).expect("the broker's default library");
+        let state = crate::AppState {
+            libraries: Some(broker.clone()),
+            cache: default_cache,
+            opts: std::sync::Arc::new(crate::opts::ServerOptions::default()),
+            auth: None,
+            changes: crate::web_socket::new_change_broadcaster(),
+            reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()),
+        };
+        let router = crate::test_router(state);
+        (src_dir, dest_dir, broker, router)
+    }
+
+    #[tokio::test]
+    async fn copy_to_library_copies_a_book_into_the_target_library() {
+        let (src_dir, dest_dir, broker, router) = test_app_with_two_libraries();
+        let src_name = src_dir.path().file_name().unwrap().to_str().unwrap();
+        let dest_name = dest_dir.path().file_name().unwrap().to_str().unwrap();
+
+        let (status, body) = post_json(&router, &format!("/cdb/copy-to-library/{dest_name}/{src_name}"), serde_json::json!({"book_ids": [1]})).await;
+        assert_eq!(status, StatusCode::OK, "got: {body}");
+        assert_eq!(body["1"]["ok"], true);
+        assert!(body["1"]["payload"].as_i64().is_some(), "expected the new book's id, got: {body}");
+
+        assert_eq!(broker.get(Some(dest_name)).unwrap().all_book_ids().unwrap().len(), 1, "the book should now exist in the destination library");
+        assert_eq!(broker.get(Some(src_name)).unwrap().all_book_ids().unwrap().len(), 1, "a plain copy should leave the source library untouched");
+    }
+
+    #[tokio::test]
+    async fn copy_to_library_with_move_removes_the_book_from_the_source() {
+        let (src_dir, dest_dir, broker, router) = test_app_with_two_libraries();
+        let src_name = src_dir.path().file_name().unwrap().to_str().unwrap();
+        let dest_name = dest_dir.path().file_name().unwrap().to_str().unwrap();
+
+        let (status, body) = post_json(&router, &format!("/cdb/copy-to-library/{dest_name}/{src_name}"), serde_json::json!({"book_ids": [1], "move": true})).await;
+        assert_eq!(status, StatusCode::OK, "got: {body}");
+        assert_eq!(body["1"]["ok"], true);
+
+        assert!(broker.get(Some(src_name)).unwrap().all_book_ids().unwrap().is_empty(), "move should remove the book from the source library");
+        assert_eq!(broker.get(Some(dest_name)).unwrap().all_book_ids().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn copy_to_library_with_ignore_skips_an_existing_duplicate() {
+        let (src_dir, dest_dir, broker, router) = test_app_with_two_libraries();
+        let src_name = src_dir.path().file_name().unwrap().to_str().unwrap();
+        let dest_name = dest_dir.path().file_name().unwrap().to_str().unwrap();
+        add_test_book(dest_dir.path(), &broker.get(Some(dest_name)).unwrap(), "Source Book", "Jane Doe");
+
+        let (status, body) = post_json(&router, &format!("/cdb/copy-to-library/{dest_name}/{src_name}"), serde_json::json!({"book_ids": [1], "duplicate_action": "ignore"})).await;
+        assert_eq!(status, StatusCode::OK, "got: {body}");
+        assert_eq!(body["1"]["ok"], true);
+        assert!(body["1"]["payload"].is_null(), "a detected duplicate should report a null payload, got: {body}");
+
+        assert_eq!(broker.get(Some(dest_name)).unwrap().all_book_ids().unwrap().len(), 1, "the duplicate should not have been added");
+    }
+
+    #[tokio::test]
+    async fn copy_to_library_404s_for_an_unknown_target_library() {
+        let (src_dir, _dest_dir, _broker, router) = test_app_with_two_libraries();
+        let src_name = src_dir.path().file_name().unwrap().to_str().unwrap();
+
+        let (status, _) = post_json(&router, &format!("/cdb/copy-to-library/NoSuchLibrary/{src_name}"), serde_json::json!({"book_ids": [1]})).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn copy_to_library_rejects_automerge_duplicate_action() {
+        let (src_dir, dest_dir, _broker, router) = test_app_with_two_libraries();
+        let src_name = src_dir.path().file_name().unwrap().to_str().unwrap();
+        let dest_name = dest_dir.path().file_name().unwrap().to_str().unwrap();
+
+        let (status, _) = post_json(&router, &format!("/cdb/copy-to-library/{dest_name}/{src_name}"), serde_json::json!({"book_ids": [1], "duplicate_action": "add_formats_to_existing"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }
 

@@ -11,7 +11,7 @@ fn test_add_book() {
 
     // `Cache::new` opens (and, for a fresh dir, creates) the real
     // calibre schema via `Backend::new` -- no need to hand-roll one.
-    let cache = Arc::new(Mutex::new(Cache::new(dir.path()).unwrap()));
+    let cache = Cache::new(dir.path()).unwrap();
 
     let authors = vec!["Author One".to_string(), "Author Two".to_string()];
     let book_id = adding::add_book(&cache, "New Book Title", &authors).expect("add_book failed");
@@ -19,10 +19,9 @@ fn test_add_book() {
     assert!(book_id > 0);
 
     // Verify Data
-    let guard = cache.lock().unwrap();
-    let title = guard.field_for(book_id, "title").unwrap().unwrap();
-    let author_sort = guard.field_for(book_id, "author_sort").unwrap().unwrap();
-    let uuid = guard.field_for(book_id, "uuid").unwrap();
+    let title = cache.field_for(book_id, "title").unwrap().unwrap();
+    let author_sort = cache.field_for(book_id, "author_sort").unwrap().unwrap();
+    let uuid = cache.field_for(book_id, "uuid").unwrap();
 
     assert_eq!(title, "New Book Title");
     assert_eq!(author_sort, "Author One & Author Two");

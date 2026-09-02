@@ -1,7 +1,6 @@
 use calibre_db::backend::Backend;
 use calibre_db::cache::Cache;
 use calibre_db::copy_to_library::copy_one_book;
-use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
 
 #[test]
@@ -15,11 +14,12 @@ fn test_copy_book_basic() {
         let backend = Backend::new(src_dir.path()).unwrap();
         let conn = backend.conn.lock().unwrap();
         conn.execute("INSERT INTO books (title, sort, author_sort, uuid, path) VALUES ('Source Book', 'Source Book', 'Author A', 'uuid-src', 'book_path')", []).unwrap();
-        Arc::new(Mutex::new(Cache::new(src_dir.path()).unwrap()))
+        drop(conn);
+        Cache::new(src_dir.path()).unwrap()
     };
 
     // Setup Dest DB (empty).
-    let dest_cache = Arc::new(Mutex::new(Cache::new(dest_dir.path()).unwrap()));
+    let dest_cache = Cache::new(dest_dir.path()).unwrap();
 
     // Perform Copy
     let new_id = copy_one_book(&src_cache, &dest_cache, 1, false)
@@ -27,14 +27,11 @@ fn test_copy_book_basic() {
         .unwrap();
 
     // Verify
-    {
-        let guard = dest_cache.lock().unwrap();
-        let title = guard.field_for(new_id, "title").unwrap().unwrap();
-        let author = guard.field_for(new_id, "author_sort").unwrap().unwrap();
+    let title = dest_cache.field_for(new_id, "title").unwrap().unwrap();
+    let author = dest_cache.field_for(new_id, "author_sort").unwrap().unwrap();
 
-        assert_eq!(title, "Source Book");
-        assert_eq!(author, "Author A");
-    }
+    assert_eq!(title, "Source Book");
+    assert_eq!(author, "Author A");
 }
 
 fn seed_book_with_author(cache: &Cache, title: &str, author: &str) -> i32 {
@@ -65,25 +62,19 @@ fn copy_one_book_skips_a_same_author_near_same_title_duplicate_when_checking() {
     let src_dir = tempdir().unwrap();
     let dest_dir = tempdir().unwrap();
 
-    let src_cache = Arc::new(Mutex::new(Cache::new(src_dir.path()).unwrap()));
-    let src_book_id = {
-        let guard = src_cache.lock().unwrap();
-        seed_book_with_author(&guard, "The Great Book", "Jane Doe")
-    };
+    let src_cache = Cache::new(src_dir.path()).unwrap();
+    let src_book_id = seed_book_with_author(&src_cache, "The Great Book", "Jane Doe");
 
-    let dest_cache = Arc::new(Mutex::new(Cache::new(dest_dir.path()).unwrap()));
-    {
-        let guard = dest_cache.lock().unwrap();
-        // `fuzzy_title` (which `find_identical_books` uses) lowercases
-        // and collapses whitespace, so this counts as a near-match,
-        // not just a byte-identical title.
-        seed_book_with_author(&guard, "the   GREAT book", "Jane Doe");
-    }
+    let dest_cache = Cache::new(dest_dir.path()).unwrap();
+    // `fuzzy_title` (which `find_identical_books` uses) lowercases
+    // and collapses whitespace, so this counts as a near-match,
+    // not just a byte-identical title.
+    seed_book_with_author(&dest_cache, "the   GREAT book", "Jane Doe");
 
     let result = copy_one_book(&src_cache, &dest_cache, src_book_id, true).unwrap();
 
     assert!(result.is_none(), "duplicate should be skipped, not copied");
-    assert_eq!(dest_cache.lock().unwrap().all_book_ids().unwrap().len(), 1);
+    assert_eq!(dest_cache.all_book_ids().unwrap().len(), 1);
 }
 
 #[test]
@@ -91,22 +82,16 @@ fn copy_one_book_adds_when_no_duplicate_exists() {
     let src_dir = tempdir().unwrap();
     let dest_dir = tempdir().unwrap();
 
-    let src_cache = Arc::new(Mutex::new(Cache::new(src_dir.path()).unwrap()));
-    let src_book_id = {
-        let guard = src_cache.lock().unwrap();
-        seed_book_with_author(&guard, "Unique Book", "Jane Doe")
-    };
+    let src_cache = Cache::new(src_dir.path()).unwrap();
+    let src_book_id = seed_book_with_author(&src_cache, "Unique Book", "Jane Doe");
 
-    let dest_cache = Arc::new(Mutex::new(Cache::new(dest_dir.path()).unwrap()));
-    {
-        let guard = dest_cache.lock().unwrap();
-        seed_book_with_author(&guard, "A Completely Different Book", "John Smith");
-    }
+    let dest_cache = Cache::new(dest_dir.path()).unwrap();
+    seed_book_with_author(&dest_cache, "A Completely Different Book", "John Smith");
 
     let result = copy_one_book(&src_cache, &dest_cache, src_book_id, true).unwrap();
 
     assert!(result.is_some());
-    assert_eq!(dest_cache.lock().unwrap().all_book_ids().unwrap().len(), 2);
+    assert_eq!(dest_cache.all_book_ids().unwrap().len(), 2);
 }
 
 #[test]
@@ -114,17 +99,11 @@ fn copy_one_book_ignores_duplicates_when_not_asked_to_check() {
     let src_dir = tempdir().unwrap();
     let dest_dir = tempdir().unwrap();
 
-    let src_cache = Arc::new(Mutex::new(Cache::new(src_dir.path()).unwrap()));
-    let src_book_id = {
-        let guard = src_cache.lock().unwrap();
-        seed_book_with_author(&guard, "The Great Book", "Jane Doe")
-    };
+    let src_cache = Cache::new(src_dir.path()).unwrap();
+    let src_book_id = seed_book_with_author(&src_cache, "The Great Book", "Jane Doe");
 
-    let dest_cache = Arc::new(Mutex::new(Cache::new(dest_dir.path()).unwrap()));
-    {
-        let guard = dest_cache.lock().unwrap();
-        seed_book_with_author(&guard, "The Great Book", "Jane Doe");
-    }
+    let dest_cache = Cache::new(dest_dir.path()).unwrap();
+    seed_book_with_author(&dest_cache, "The Great Book", "Jane Doe");
 
     let result = copy_one_book(&src_cache, &dest_cache, src_book_id, false).unwrap();
 
@@ -132,7 +111,7 @@ fn copy_one_book_ignores_duplicates_when_not_asked_to_check() {
         result.is_some(),
         "check_duplicates=false should always copy"
     );
-    assert_eq!(dest_cache.lock().unwrap().all_book_ids().unwrap().len(), 2);
+    assert_eq!(dest_cache.all_book_ids().unwrap().len(), 2);
 }
 
 #[test]
