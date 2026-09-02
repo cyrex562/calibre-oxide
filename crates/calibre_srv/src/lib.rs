@@ -237,6 +237,8 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/cdb/cmd/{which}/{version}", get(cdb::cmd).post(cdb::cmd))
         .route("/book-get-last-read-position/{library_id}/{which}", get(books::get_last_read_position))
         .route("/book-set-last-read-position/{library_id}/{book_id}/{fmt}", post(books::set_last_read_position))
+        .route("/book-get-annotations/{library_id}/{which}", get(books::get_annotations))
+        .route("/book-update-annotations/{library_id}/{book_id}/{fmt}", post(books::update_annotations))
         .route("/web-socket", get(web_socket::upgrade))
         .route("/fts/search", get(fts::search))
         .route("/fts/disable", post(fts::disable))
