@@ -1604,6 +1604,73 @@ impl Cache {
         Ok(self.get_preference("fts.enabled")?.as_deref() == Some("true"))
     }
 
+    // --- Saved searches (issue #422) -- port of db.cache.Cache's
+    // saved_search_* methods, a thin layer over a {name: query} map
+    // stored under the "saved_searches" preference key (matching
+    // upstream's own `Search(self, 'saved_searches', ...)`). {{{
+
+    const SAVED_SEARCHES_PREF: &'static str = "saved_searches";
+
+    fn saved_search_map(&self) -> anyhow::Result<std::collections::HashMap<String, String>> {
+        let json = self.get_preference(Self::SAVED_SEARCHES_PREF)?.unwrap_or_else(|| "{}".to_string());
+        Ok(serde_json::from_str(&json).unwrap_or_default())
+    }
+
+    fn set_saved_search_map(&self, map: &std::collections::HashMap<String, String>) -> anyhow::Result<()> {
+        self.set_preference(Self::SAVED_SEARCHES_PREF, &serde_json::to_string(map)?)
+    }
+
+    /// Port of `saved_search_names`: every saved search's name,
+    /// sorted. Narrowed to a plain case-insensitive sort rather than
+    /// upstream's ICU `sort_key` -- see `calibre_utils::icu`'s own
+    /// doc for why real ICU collation isn't available yet (issue #459).
+    pub fn saved_search_names(&self) -> anyhow::Result<Vec<String>> {
+        let mut names: Vec<String> = self.saved_search_map()?.into_keys().collect();
+        names.sort_by_key(|n| n.to_lowercase());
+        Ok(names)
+    }
+
+    /// Port of `saved_search_lookup`: case-insensitive name match.
+    pub fn saved_search_lookup(&self, name: &str) -> anyhow::Result<Option<String>> {
+        let name_lower = name.to_lowercase();
+        Ok(self.saved_search_map()?.into_iter().find(|(n, _)| n.to_lowercase() == name_lower).map(|(_, v)| v))
+    }
+
+    /// Port of `saved_search_add`.
+    pub fn saved_search_add(&self, name: &str, value: &str) -> anyhow::Result<()> {
+        let mut map = self.saved_search_map()?;
+        map.insert(name.to_string(), value.trim().to_string());
+        self.set_saved_search_map(&map)
+    }
+
+    /// Port of `saved_search_delete`.
+    pub fn saved_search_delete(&self, name: &str) -> anyhow::Result<()> {
+        let mut map = self.saved_search_map()?;
+        map.remove(name);
+        self.set_saved_search_map(&map)
+    }
+
+    /// Port of `saved_search_rename`. Narrowed to a no-op when
+    /// `old_name` doesn't exist -- upstream's own
+    /// `queries[new] = queries.get(old, None)` would store a JSON
+    /// `null` under `new_name` in that case, which no real caller
+    /// relies on and this map's `HashMap<String, String>` can't
+    /// represent anyway.
+    pub fn saved_search_rename(&self, old_name: &str, new_name: &str) -> anyhow::Result<()> {
+        let mut map = self.saved_search_map()?;
+        if let Some(v) = map.remove(old_name) {
+            map.insert(new_name.to_string(), v);
+            self.set_saved_search_map(&map)?;
+        }
+        Ok(())
+    }
+
+    /// Port of `saved_search_set_all`: replaces the entire map.
+    pub fn saved_search_set_all(&self, map: std::collections::HashMap<String, String>) -> anyhow::Result<()> {
+        self.set_saved_search_map(&map)
+    }
+    // }}}
+
     /// Port of `enable_fts` -- same as [`crate::library::Library::set_fts_enabled`].
     pub fn set_fts_enabled(&self, enabled: bool) -> anyhow::Result<()> {
         self.set_preference("fts.enabled", if enabled { "true" } else { "false" })?;
@@ -1658,6 +1725,56 @@ mod tests {
         conn.execute("INSERT INTO books (title) VALUES (?1)", [title])
             .unwrap();
         conn.last_insert_rowid() as i32
+    }
+
+    #[test]
+    fn saved_search_add_lookup_and_names_round_trip() {
+        let (_dir, cache) = open_test_cache();
+        assert_eq!(cache.saved_search_names().unwrap(), Vec::<String>::new());
+
+        cache.saved_search_add("Recent SF", "tags:scifi and date:>30daysago").unwrap();
+        cache.saved_search_add("Anthologies", "tags:anthology").unwrap();
+
+        assert_eq!(cache.saved_search_names().unwrap(), vec!["Anthologies".to_string(), "Recent SF".to_string()]);
+        assert_eq!(cache.saved_search_lookup("Recent SF").unwrap().as_deref(), Some("tags:scifi and date:>30daysago"));
+        // Case-insensitive, matching upstream's own lookup().
+        assert_eq!(cache.saved_search_lookup("recent sf").unwrap().as_deref(), Some("tags:scifi and date:>30daysago"));
+        assert_eq!(cache.saved_search_lookup("nonexistent").unwrap(), None);
+    }
+
+    #[test]
+    fn saved_search_delete_removes_it() {
+        let (_dir, cache) = open_test_cache();
+        cache.saved_search_add("temp", "tags:x").unwrap();
+        assert!(cache.saved_search_lookup("temp").unwrap().is_some());
+        cache.saved_search_delete("temp").unwrap();
+        assert_eq!(cache.saved_search_lookup("temp").unwrap(), None);
+    }
+
+    #[test]
+    fn saved_search_rename_moves_the_query_to_the_new_name() {
+        let (_dir, cache) = open_test_cache();
+        cache.saved_search_add("old", "tags:x").unwrap();
+        cache.saved_search_rename("old", "new").unwrap();
+        assert_eq!(cache.saved_search_lookup("old").unwrap(), None);
+        assert_eq!(cache.saved_search_lookup("new").unwrap().as_deref(), Some("tags:x"));
+    }
+
+    #[test]
+    fn saved_search_rename_of_a_nonexistent_name_is_a_no_op() {
+        let (_dir, cache) = open_test_cache();
+        cache.saved_search_rename("nonexistent", "new").unwrap();
+        assert_eq!(cache.saved_search_names().unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn saved_search_set_all_replaces_the_whole_map() {
+        let (_dir, cache) = open_test_cache();
+        cache.saved_search_add("keep-me-out", "tags:x").unwrap();
+        let mut replacement = std::collections::HashMap::new();
+        replacement.insert("only".to_string(), "tags:y".to_string());
+        cache.saved_search_set_all(replacement).unwrap();
+        assert_eq!(cache.saved_search_names().unwrap(), vec!["only".to_string()]);
     }
 
     #[test]

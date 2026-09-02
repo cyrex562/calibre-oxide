@@ -47,9 +47,15 @@
 //!   `searchable_fields`/`sortable_field_keys`/`all_field_keys` return
 //!   a hardcoded list matching [`crate::cache::Cache::field_for`]'s
 //!   supported fields, not real per-library metadata.
-//! - **Saved searches**: no such subsystem exists in this crate at
-//!   all (tracked separately, e.g. issue #226 for FTS); the
-//!   `saved_search_*` family is not implemented.
+//! - **Saved searches**: real now (issue #422) --
+//!   [`crate::cache::Cache::saved_search_names`]/`saved_search_lookup`/
+//!   `saved_search_add`/`saved_search_delete`/`saved_search_rename`/
+//!   `saved_search_set_all`, with matching [`crate::library::Library`]
+//!   wrappers, and `search:name` query expansion (with cycle
+//!   detection) in [`crate::search::search`]. This `legacy.rs` file
+//!   itself doesn't forward the `saved_search_*` family under its own
+//!   old-API method names yet -- a narrow, separate widening if
+//!   something needs the legacy shape specifically.
 //! - **`allow_case_change`/dirtying/notification/conversion options/
 //!   custom book data/on-device state**: none of these subsystems
 //!   exist in this crate; the corresponding legacy methods are not

@@ -470,6 +470,31 @@ impl Library {
             .map_err(|e| LibraryError::Transaction(e.to_string()))
     }
 
+    // --- Saved searches (issue #422) -- thin wrappers over
+    // `Cache`'s real implementation, matching `add_custom_column`'s
+    // own delegation pattern above. {{{
+
+    pub fn saved_search_names(&self) -> Result<Vec<String>, LibraryError> {
+        self.as_cache().saved_search_names().map_err(|e| LibraryError::Transaction(e.to_string()))
+    }
+
+    pub fn saved_search_lookup(&self, name: &str) -> Result<Option<String>, LibraryError> {
+        self.as_cache().saved_search_lookup(name).map_err(|e| LibraryError::Transaction(e.to_string()))
+    }
+
+    pub fn saved_search_add(&mut self, name: &str, value: &str) -> Result<(), LibraryError> {
+        self.as_cache().saved_search_add(name, value).map_err(|e| LibraryError::Transaction(e.to_string()))
+    }
+
+    pub fn saved_search_delete(&mut self, name: &str) -> Result<(), LibraryError> {
+        self.as_cache().saved_search_delete(name).map_err(|e| LibraryError::Transaction(e.to_string()))
+    }
+
+    pub fn saved_search_rename(&mut self, old_name: &str, new_name: &str) -> Result<(), LibraryError> {
+        self.as_cache().saved_search_rename(old_name, new_name).map_err(|e| LibraryError::Transaction(e.to_string()))
+    }
+    // }}}
+
     pub fn set_custom_column_value(
         &mut self,
         book_id: i32,

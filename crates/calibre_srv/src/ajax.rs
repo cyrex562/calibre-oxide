@@ -286,7 +286,11 @@ pub struct BooksInQuery {
 /// item id `calibre_db::categories::Tag::id` (no `allbooks`/`newest`/
 /// `search` pseudo-categories -- those are already covered by
 /// `opds::navcatalog`'s `title`/`newest` and `ajax::search`), single
-/// sort field, no `get_additional_fields`.
+/// sort field, no `get_additional_fields`. In particular, a named
+/// saved search (upstream's `dname == 'search'` case here) is just a
+/// `search:name` query to [`search`] now that saved searches are real
+/// (issue #422) -- nothing to add to *this* endpoint for that.
+/// `GET /ajax/search?query=search%3Aname`.
 pub async fn books_in(State(state): State<AppState>, Path((category, item_id)): Path<(String, String)>, Query(q): Query<BooksInQuery>) -> Result<Json<Value>, ServerError> {
     let (num, offset) = get_pagination(Some(q.num), Some(q.offset))?;
     let sort_field = q.sort.as_deref().unwrap_or("title");
@@ -562,6 +566,25 @@ mod tests {
         let (status, body) = get_json(&router, "/ajax/search?query=nosuchbook").await;
         assert_eq!(status, StatusCode::OK, "ajax search should return an empty list, not 404, unlike opds::search");
         assert_eq!(body["book_ids"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn search_expands_a_saved_search_name_end_to_end() {
+        // Real cross-crate wiring check for issue #422: a saved search
+        // added via calibre_db::cache::Cache is resolvable through the
+        // real HTTP endpoint via a `search:name` query, with no
+        // srv-side code needed for it (see this endpoint's own doc).
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        add_test_book(dir.path(), &cache, "Foundation", "Isaac Asimov");
+        add_test_book(dir.path(), &cache, "Dune", "Frank Herbert");
+        cache.saved_search_add("asimov books", "title:Foundation").unwrap();
+        let state = crate::AppState { cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()) };
+        let router = crate::test_router(state);
+
+        let (status, body) = get_json(&router, "/ajax/search?query=search%3A%22asimov+books%22").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["book_ids"], serde_json::json!([1]));
     }
 
     #[tokio::test]
