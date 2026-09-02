@@ -1572,7 +1572,7 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 - [ ] html_as_json.cpp (folded into issue #427)
 - [x] http_request.py (subsumed by `axum`/`hyper`'s own HTTP parsing -- see `calibre_srv`'s crate root doc)
 - [x] http_response.py (subsumed by `axum`/`hyper`)
-- [ ] jobs.py (issue #428, foundational)
+- [x] jobs.py (issue #428; `calibre_srv::jobs::JobsManager` -- real bounded-concurrency task tracking on `tokio` tasks instead of upstream's forked-subprocess model; not yet wired into `AppState`/a route since neither real consumer, `books.py`'s render-book job or `convert.py`, is ported yet -- see the module's own doc)
 - [ ] last_read.py (superseded -- see issue #60's body)
 - [ ] legacy.py (issue #430, low priority -- wait for a concrete need)
 - [ ] library_broker.py (issue #423, foundational)
