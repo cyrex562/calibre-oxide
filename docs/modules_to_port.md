@@ -1583,7 +1583,7 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 - [x] opts.py
 - [x] pool.py (subsumed by `tokio`'s task scheduler)
 - [ ] pre_activated.py (not planned -- N/A, tokio's own `TcpListener::bind` covers "run over TCP")
-- [ ] render_book.py (issue #427)
+- [ ] render_book.py (partial -- issue #480 closed: `calibre_ebooks::link_virtualize` (`rewrite_link_attributes`, `encode_url`/`decode_url`/`encode_component`/`decode_component`, `process_anchor_links`, `disable_non_stylesheet_links`, `anchor_map`), the generic link-uid virtualization mechanism and its self-contained post-processing passes. Not ported: real book-resource-name resolution (`create_link_replacer`'s `container.href_to_name`/`present_names` logic -- needs #481's container), the actual `extract_book`/`process_exploded_book` orchestration (#481), `<object>` codebase-relative link attributes (real but rare in EPUB content); see the module's own doc)
 - [x] routes.py (subsumed by `axum::Router`)
 - [ ] standalone.py (`calibre_srv`'s own minimal `main.rs` covers the same "run the server over TCP" role, not a port of this file's process-management machinery)
 - [ ] TODO.rst

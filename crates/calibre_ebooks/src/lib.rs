@@ -16,6 +16,7 @@ pub mod html_entities;
 pub mod htmlz;
 pub mod hyphenate;
 pub mod input;
+pub mod link_virtualize;
 pub mod lit;
 pub mod metadata;
 pub mod mobi;
