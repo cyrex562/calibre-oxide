@@ -71,10 +71,18 @@
 //!   `calibredb`-CLI-over-HTTP dispatcher (issue #426, narrowed to a
 //!   representative subset of commands) -- see that module's own doc
 //!   for what's narrowed in each.
-//! - [`books`]: cross-device reading-position sync (a narrow slice of
-//!   `books.py`) -- `book-get/set-last-read-position` only; the rest
-//!   of that file is `render_book.py`'s in-browser EPUB rendering
-//!   pipeline, not ported.
+//! - [`books`]: cross-device reading-position sync
+//!   (`book-get/set-last-read-position`) and annotation sync
+//!   (`book-get/update-annotations`, issue #485, backed by
+//!   `calibre_db::annotations`'s real storage/merge algorithm) -- the
+//!   rest of `books.py` is `render_book.py`'s in-browser EPUB
+//!   rendering pipeline (issue #427), not ported here.
+//! - [`books_cache`]: the disk-cache layer for that rendering
+//!   pipeline's output (issue #482, part of #427) -- content-hash
+//!   keying, staging/final directory lifecycle, a reaping sweep. Real
+//!   and tested ahead of the pipeline itself (#481) and the HTTP
+//!   endpoints that will serve from it (#483), same pattern as
+//!   [`library_broker`]/[`jobs`] -- not yet wired into either.
 //!
 //! - [`web_socket`]: real-time push notifications over `GET
 //!   /web-socket` (`web_socket.py`, transport subsumed by `axum`'s
@@ -142,6 +150,7 @@ pub mod ajax;
 pub mod auth;
 pub mod bonjour;
 pub mod books;
+pub mod books_cache;
 pub mod cdb;
 pub mod content;
 pub mod data_files;
