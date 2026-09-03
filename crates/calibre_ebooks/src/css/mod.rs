@@ -70,6 +70,7 @@ pub mod matcher;
 pub mod model;
 pub mod parser;
 pub mod selector;
+pub mod url_rewrite;
 
 pub use matcher::{DomElement, Element, Select, XmlElement};
 pub use model::{

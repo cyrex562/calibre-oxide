@@ -1566,7 +1566,7 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 - [ ] convert.py (issue #429, blocked on #428)
 - [ ] embedded.py
 - [x] errors.py
-- [ ] fast_css_transform.cpp (folded into issue #427)
+- [ ] fast_css_transform.cpp (partial -- issue #479 closed: `calibre_ebooks::css::url_rewrite::transform_urls`, real `url()`/`@import`-string rewriting via a token-level `cssparser`-based splicer, disclosed narrower than upstream's own lenient hand-rolled tokenizer for two malformed-CSS edge cases (internal whitespace/mid-token comments in an unquoted url, see the module's own doc). The much larger property-value semantic rewrite piece (font-size→rem, page-break fallback injection, writing-mode rename, string quote normalization) is real, separate, unstarted work tracked by issue #488)
 - [x] fts.py (search/disable/reindex/indexing/snippets, backed by calibre_db's already-ported FTS5 engine; restriction reinterpreted as a search query, no virtual-library concept; see `calibre_srv::fts`'s module doc)
 - [ ] handler.py (not planned -- subsumed by axum::Router + AppState, same as routes.py)
 - [x] html_as_json.cpp (issue #478, part of #427 -- `calibre_ebooks::reader_json::{serialize_node,serialize_document}`, real serialization of `calibre_ebooks::dom::Dom` into the in-browser reader's own JSON document format. NOT ported: XML namespace tracking (`Dom` is HTML5-only, no namespace URIs to track -- `ns_map` is always empty), and the comment-vs-other-node-type distinction (`Dom` already collapses doctypes/processing instructions into empty-string `Comment` nodes before this module ever sees them); see the module's own doc for both)
