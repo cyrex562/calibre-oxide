@@ -139,10 +139,15 @@
 //!   hardcoded single entry, OPDS per-library nav entries) are
 //!   separate follow-ups -- see that module's own doc.
 //!
+//! - [`render_endpoints`]: `book_manifest`/`book_file` (`books.py`'s
+//!   in-browser-reader HTTP surface, issue #483) -- ties
+//!   [`calibre_ebooks::render_book`] (#481) and [`books_cache`] (#482)
+//!   together via [`jobs::JobsManager`] (#428). See that module's own
+//!   doc for the disclosed simplifications.
+//!
 //! **Deferred to future increments** (not started):
-//! `render_book.py` (the in-browser EPUB reader), `convert.py`
-//! (server-side conversion), `auto_reload.py` (dev-mode auto-restart),
-//! `legacy.py` (the old pre-content-server API),
+//! `convert.py` (server-side conversion), `auto_reload.py` (dev-mode
+//! auto-restart), `legacy.py` (the old pre-content-server API),
 //! `standalone.py`/`embedded.py` (process-management entry points --
 //! this increment has its own minimal `main.rs` instead).
 
@@ -162,6 +167,7 @@ pub mod notes;
 pub mod opds;
 pub mod opts;
 pub mod reader_profiles;
+pub mod render_endpoints;
 pub mod users;
 pub mod users_api;
 pub mod utils;
@@ -195,6 +201,13 @@ pub struct AppState {
     /// existing single-library call sites that never call
     /// `cache_for` keep working unchanged.
     pub libraries: Option<Arc<library_broker::LibraryBroker>>,
+    /// Disk cache for rendered in-browser-reader output (issue #482).
+    pub book_cache: Arc<books_cache::BookCache>,
+    /// Background render/conversion job queue (issue #428).
+    pub jobs: Arc<jobs::JobsManager>,
+    /// `queued_jobs`/`failed_jobs` for the render pipeline -- see
+    /// [`render_endpoints`]'s own doc.
+    pub render_jobs: Arc<render_endpoints::RenderJobRegistry>,
 }
 
 impl AppState {
@@ -248,6 +261,8 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/book-set-last-read-position/{library_id}/{book_id}/{fmt}", post(books::set_last_read_position))
         .route("/book-get-annotations/{library_id}/{which}", get(books::get_annotations))
         .route("/book-update-annotations/{library_id}/{book_id}/{fmt}", post(books::update_annotations))
+        .route("/book-manifest/{book_id}/{fmt}", get(render_endpoints::book_manifest))
+        .route("/book-file/{book_id}/{fmt}/{size}/{mtime}/{*name}", get(render_endpoints::book_file))
         .route("/web-socket", get(web_socket::upgrade))
         .route("/fts/search", get(fts::search))
         .route("/fts/disable", post(fts::disable))

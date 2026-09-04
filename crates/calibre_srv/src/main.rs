@@ -125,7 +125,22 @@ async fn main() -> anyhow::Result<()> {
     let port = cli.opts.port;
     let listen_on = cli.opts.listen_on.clone().unwrap_or_else(|| "0.0.0.0".to_string());
     let reader_profiles = calibre_srv::reader_profiles::ProfileStore::new(&cli.library_path.join("reader-profiles.sqlite"))?;
-    let state = AppState { libraries: None, cache: Arc::new(cache), opts: Arc::new(cli.opts), auth, changes: calibre_srv::web_socket::new_change_broadcaster(), reader_profiles: Arc::new(reader_profiles) };
+    let book_cache = Arc::new(calibre_srv::books_cache::BookCache::open_default()?);
+    let max_jobs = if cli.opts.max_jobs < 1 { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) } else { cli.opts.max_jobs as usize };
+    let max_job_time = if cli.opts.max_job_time <= 0 { std::time::Duration::ZERO } else { std::time::Duration::from_secs(cli.opts.max_job_time as u64 * 60) };
+    let jobs = Arc::new(calibre_srv::jobs::JobsManager::new(max_jobs, max_job_time));
+    let render_jobs = Arc::new(calibre_srv::render_endpoints::RenderJobRegistry::new());
+    let state = AppState {
+        libraries: None,
+        cache: Arc::new(cache),
+        opts: Arc::new(cli.opts),
+        auth,
+        changes: calibre_srv::web_socket::new_change_broadcaster(),
+        reader_profiles: Arc::new(reader_profiles),
+        book_cache,
+        jobs,
+        render_jobs,
+    };
 
     let use_bonjour = state.opts.use_bonjour;
     let library_name = cli.library_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "calibre-oxide Library".to_string());

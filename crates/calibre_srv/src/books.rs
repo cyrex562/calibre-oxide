@@ -56,7 +56,7 @@ use crate::auth::AuthenticatedUser;
 use crate::errors::ServerError;
 use crate::AppState;
 
-fn effective_user(user: Option<Extension<AuthenticatedUser>>) -> String {
+pub(crate) fn effective_user(user: Option<Extension<AuthenticatedUser>>) -> String {
     user.map(|Extension(AuthenticatedUser(name))| name).unwrap_or_else(|| "_".to_string())
 }
 
@@ -217,7 +217,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::new(dir.path()).unwrap();
         let book_id = add_test_book(dir.path(), &cache, "Book 0");
-        let state = crate::AppState { libraries: None, cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()) };
+        let state = crate::AppState { libraries: None, cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()), book_cache: std::sync::Arc::new(crate::books_cache::BookCache::open_temp()), jobs: std::sync::Arc::new(crate::jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))), render_jobs: std::sync::Arc::new(crate::render_endpoints::RenderJobRegistry::new()) };
         let router = crate::test_router(state);
         (dir, router, book_id)
     }
