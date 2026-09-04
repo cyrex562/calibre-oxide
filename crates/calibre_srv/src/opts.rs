@@ -119,6 +119,15 @@ pub struct ServerOptions {
     /// Default book list mode for new users: "cover_grid", "details_list", or "custom_list"
     #[arg(long, default_value = "cover_grid")]
     pub book_list_mode: String,
+    /// Path to the built browser UI's static files (issue #432/#498)
+    /// -- not a port of any upstream option (upstream bundles its own
+    /// compiled JS into the binary's own resources at build time; this
+    /// port instead serves a separately-built `web/dist` at runtime,
+    /// see `router`'s own doc for how). `None` (the default) serves
+    /// no UI at all -- every existing JSON/OPDS/download route still
+    /// works unaffected, matching this crate's behavior before #498.
+    #[arg(long)]
+    pub static_dir: Option<String>,
 }
 
 impl Default for ServerOptions {
