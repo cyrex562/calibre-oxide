@@ -1620,7 +1620,7 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 - [x] filenames.py
 - [x] file_type_icons.py (`calibre_utils::file_type_icons::icon_for_ext`)
 - [ ] forked_map.py
-- [ ] formatter.py (issue #460 epic -- parser/AST/evaluator core split into #513, foundational for every function-batch sub-issue)
+- [x] formatter.py (issue #513, part of the #460 formatter epic -- `calibre_utils::formatter`: tokenizer/parser/AST/tree-walking evaluator for the calibre template language. Field access (`ValueSource`) and function calls (`FunctionRegistry`) are trait-based, decoupling the core from `calibre_db` -- real `calibre_db`-backed implementations + the ~125 built-in functions are #514-520's own scope. Includes a real, usable `DictValueSource` (upstream's own `EvalFormatter`/`eval_formatter` equivalent). 54 tests across lexer/parser/interpreter. Disclosed narrowings: stored GPM/Python templates not ported (no storage/registry system exists yet); `break_reporter` GUI debug hook not ported (no GUI exists); Python-`exec()`-based `python:`-prefixed templates are fundamentally not portable to Rust as-is, out of scope entirely. See the module's own doc comments for several more specific, real upstream quirks preserved rather than "fixed" -- a `with`-statement error message typo, a local function's inability to call itself recursively, `raw_field`'s 2-arg form requiring the not-yet-ported real function registry)
 - [ ] formatter_functions.py (issue #460 epic -- ~125 built-ins split by upstream's own `category` constant into #514-520, see #460's own tracking body for the exact batching)
 - [x] html2text.py
 - [ ] https.py
