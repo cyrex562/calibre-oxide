@@ -881,6 +881,7 @@ dependencies = [
  "dirs 6.0.0",
  "env_logger",
  "fancy-regex",
+ "flate2",
  "html2text",
  "htmlentity",
  "hyphenation",
