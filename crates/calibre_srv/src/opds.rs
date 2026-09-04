@@ -351,9 +351,9 @@ async fn acquisition_feed_for_ids(
                 let ka = sort_key_for(a, &sort_field_owned);
                 let kb = sort_key_for(b, &sort_field_owned);
                 if ascending {
-                    ka.cmp(&kb)
+                    calibre_utils::icu::strcmp(&ka, &kb)
                 } else {
-                    kb.cmp(&ka)
+                    calibre_utils::icu::strcmp(&kb, &ka)
                 }
             });
             let lm = cache.last_modified()?;
@@ -390,8 +390,14 @@ async fn acquisition_feed_for_ids(
     Ok(finish(dom, last_modified))
 }
 
+/// Extracts `field`'s raw string value for a comparison via
+/// `calibre_utils::icu::strcmp` (issue #459) -- no longer lowercases
+/// here (real collation orders case itself; pre-lowercasing would make
+/// same-spelling-different-case values compare equal instead of
+/// case-ordering them, and would defeat locale-aware ordering for
+/// non-ASCII text).
 pub(crate) fn sort_key_for(book: &Value, field: &str) -> String {
-    book[field].as_str().map(str::to_lowercase).unwrap_or_default()
+    book[field].as_str().unwrap_or_default().to_string()
 }
 
 /// `GET /opds/navcatalog/{which}`. Port of `opds_navcatalog`: `title`/
@@ -710,6 +716,42 @@ mod tests {
         assert!(body.contains("<name>Author</name>"), "author name missing from entry -- got: {body}");
         assert!(body.contains("http://opds-spec.org/acquisition"));
         assert!(body.contains("/get/epub/"));
+    }
+
+    #[tokio::test]
+    async fn navcatalog_title_uses_real_locale_aware_collation_not_plain_codepoint_order() {
+        // Real UCA order: "apple" < "Émile" < "Zebra" (an accented
+        // letter collates near its base letter, not after every ASCII
+        // letter). A plain codepoint/lowercase-then-cmp sort would
+        // instead give "apple" < "Zebra" < "Émile" (U+00C9 sorts after
+        // "z"), an ordering issue #459 fixed end to end from
+        // calibre_db::categories through this crate's own
+        // opds::sort_key_for/ajax::sort_key_for call sites.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        add_test_book(dir.path(), &cache, "Zebra", "Author");
+        add_test_book(dir.path(), &cache, "apple", "Author");
+        add_test_book(dir.path(), &cache, "Émile", "Author");
+        let state = crate::AppState {
+            libraries: None,
+            cache: std::sync::Arc::new(cache),
+            opts: std::sync::Arc::new(crate::opts::ServerOptions::default()),
+            auth: None,
+            changes: crate::web_socket::new_change_broadcaster(),
+            reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()),
+            book_cache: std::sync::Arc::new(crate::books_cache::BookCache::open_temp()),
+            jobs: std::sync::Arc::new(crate::jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
+            render_jobs: std::sync::Arc::new(crate::render_endpoints::RenderJobRegistry::new()),
+            conversion_jobs: std::sync::Arc::new(crate::convert::ConversionJobRegistry::new()),
+        };
+        let router = crate::test_router(state);
+
+        let (_, feed) = get_body(&router, "/opds/navcatalog/title").await;
+        let pos_apple = feed.find("apple").expect("apple present");
+        let pos_emile = feed.find("Émile").expect("Émile present");
+        let pos_zebra = feed.find("Zebra").expect("Zebra present");
+        assert!(pos_apple < pos_emile, "expected apple before Émile, got: {feed}");
+        assert!(pos_emile < pos_zebra, "expected Émile before Zebra, got: {feed}");
     }
 
     #[tokio::test]

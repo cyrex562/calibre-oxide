@@ -351,9 +351,9 @@ pub async fn books_in(State(state): State<AppState>, Path((category, item_id)): 
         let ka = sort_key_for(a, sort_field);
         let kb = sort_key_for(b, sort_field);
         if sort_order == "asc" {
-            ka.cmp(&kb)
+            calibre_utils::icu::strcmp(&ka, &kb)
         } else {
-            kb.cmp(&ka)
+            calibre_utils::icu::strcmp(&kb, &ka)
         }
     });
 
@@ -418,9 +418,9 @@ pub async fn search(State(state): State<AppState>, Query(q): Query<SearchQuery>)
         let ka = sort_key_for(a, sort_field);
         let kb = sort_key_for(b, sort_field);
         if sort_order == "asc" {
-            ka.cmp(&kb)
+            calibre_utils::icu::strcmp(&ka, &kb)
         } else {
-            kb.cmp(&ka)
+            calibre_utils::icu::strcmp(&kb, &ka)
         }
     });
 
