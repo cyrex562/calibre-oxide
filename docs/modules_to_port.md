@@ -1659,8 +1659,8 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 - [ ] shm.py
 - [x] short_uuid.py
 - [x] smartypants.py
-- [ ] smtp.py
-- [ ] smtplib.py
+- [x] smtp.py (issue #468 -- `calibre_utils::smtp`: real SMTP relay sending via the `lettre` crate, redesigned around it rather than porting `smtp.py`'s own MIME/smtplib wrapping line for line. `create_mail` (plain text or `multipart/mixed` with one attachment) + `send_via_relay` (TLS/SSL/none, matching upstream's `encryption` choices onto `lettre`'s `starttls_relay`/`relay`/`builder_dangerous`). Verified with a real TCP round trip against a hand-written fake SMTP server in-test, not a mocked transport. Disclosed narrowings: direct-to-MX delivery (`sendmail_direct`, needs a DNS resolver dependency, no caller uses it), the maildir-backed retry queue and `--fork` background-delivery CLI orchestration (no send-to-device/email feature exists yet to drive that design) not ported)
+- [x] smtplib.py (N/A -- upstream's own lightly-patched copy of Python stdlib `smtplib`, not calibre-specific logic; see #468's own filed scope. Not to be confused with the *different* `polyglot/smtplib.py`, also N/A, below)
 - [x] socket_inheritance.py
 - [ ] speedup.c
 - [x] speedups.py

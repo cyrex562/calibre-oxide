@@ -30,6 +30,7 @@ pub mod series;
 pub mod seven_zip;
 pub mod short_uuid;
 pub mod smartypants;
+pub mod smtp;
 pub mod socket_inheritance;
 pub mod speedups;
 pub mod tdir_in_cache;

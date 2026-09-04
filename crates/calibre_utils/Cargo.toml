@@ -59,6 +59,10 @@ icu = { version = "1.5", features = ["compiled_data"] }
 # Used by localunzip.rs for raw-deflate (no zlib header) decompression,
 # matching upstream's `zlib.decompressobj(-15)`.
 flate2 = "1.0"
+# Used by smtp.rs -- real SMTP client (STARTTLS/implicit-TLS/AUTH),
+# replacing smtp.py's own polyglot.smtplib wrapping (see that
+# module's own doc for why).
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "rustls-tls", "hostname"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
