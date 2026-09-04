@@ -130,6 +130,7 @@ async fn main() -> anyhow::Result<()> {
     let max_job_time = if cli.opts.max_job_time <= 0 { std::time::Duration::ZERO } else { std::time::Duration::from_secs(cli.opts.max_job_time as u64 * 60) };
     let jobs = Arc::new(calibre_srv::jobs::JobsManager::new(max_jobs, max_job_time));
     let render_jobs = Arc::new(calibre_srv::render_endpoints::RenderJobRegistry::new());
+    let conversion_jobs = Arc::new(calibre_srv::convert::ConversionJobRegistry::new());
     let state = AppState {
         libraries: None,
         cache: Arc::new(cache),
@@ -140,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
         book_cache,
         jobs,
         render_jobs,
+        conversion_jobs,
     };
 
     let use_bonjour = state.opts.use_bonjour;

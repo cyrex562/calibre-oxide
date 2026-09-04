@@ -145,11 +145,21 @@
 //!   together via [`jobs::JobsManager`] (#428). See that module's own
 //!   doc for the disclosed simplifications.
 //!
+//! - [`convert`]: `convert.py` (server-side ebook format conversion,
+//!   issue #429) -- `POST /conversion/start`/`GET /conversion/status`/
+//!   `GET /conversion/book-data`, backed by
+//!   [`calibre_ebooks::conversion::plumber::Plumber`] (the real
+//!   format-dispatch table issue #476 found and reconciled
+//!   `calibre_conversion`'s own binary onto) via [`jobs::JobsManager`]
+//!   (#428). See that module's own doc for the disclosed
+//!   simplifications (no live conversion options or progress
+//!   percentage yet).
+//!
 //! **Deferred to future increments** (not started):
-//! `convert.py` (server-side conversion), `auto_reload.py` (dev-mode
-//! auto-restart), `legacy.py` (the old pre-content-server API),
-//! `standalone.py`/`embedded.py` (process-management entry points --
-//! this increment has its own minimal `main.rs` instead).
+//! `auto_reload.py` (dev-mode auto-restart), `legacy.py` (the old
+//! pre-content-server API), `standalone.py`/`embedded.py`
+//! (process-management entry points -- this increment has its own
+//! minimal `main.rs` instead).
 
 pub mod ajax;
 pub mod auth;
@@ -158,6 +168,7 @@ pub mod books;
 pub mod books_cache;
 pub mod cdb;
 pub mod content;
+pub mod convert;
 pub mod data_files;
 pub mod errors;
 pub mod fts;
@@ -208,6 +219,9 @@ pub struct AppState {
     /// `queued_jobs`/`failed_jobs` for the render pipeline -- see
     /// [`render_endpoints`]'s own doc.
     pub render_jobs: Arc<render_endpoints::RenderJobRegistry>,
+    /// `conversion_jobs` for server-side format conversion -- see
+    /// [`convert`]'s own doc.
+    pub conversion_jobs: Arc<convert::ConversionJobRegistry>,
 }
 
 impl AppState {
@@ -263,6 +277,9 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/book-update-annotations/{library_id}/{book_id}/{fmt}", post(books::update_annotations))
         .route("/book-manifest/{book_id}/{fmt}", get(render_endpoints::book_manifest))
         .route("/book-file/{book_id}/{fmt}/{size}/{mtime}/{*name}", get(render_endpoints::book_file))
+        .route("/conversion/start/{book_id}", get(convert::start_conversion).post(convert::start_conversion))
+        .route("/conversion/status/{job_id}", get(convert::conversion_status).post(convert::conversion_status))
+        .route("/conversion/book-data/{book_id}", get(convert::conversion_book_data))
         .route("/web-socket", get(web_socket::upgrade))
         .route("/fts/search", get(fts::search))
         .route("/fts/disable", post(fts::disable))

@@ -408,6 +408,7 @@ mod tests {
             book_cache: std::sync::Arc::new(crate::books_cache::BookCache::open_temp()),
             jobs: std::sync::Arc::new(crate::jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
             render_jobs: std::sync::Arc::new(crate::render_endpoints::RenderJobRegistry::new()),
+            conversion_jobs: std::sync::Arc::new(crate::convert::ConversionJobRegistry::new()),
         };
         let router = crate::test_router(state);
         (dir, router, book_id)
