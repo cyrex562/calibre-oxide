@@ -26,6 +26,8 @@ export default defineConfig({
       "/book-set-last-read-position": "http://127.0.0.1:8080",
       "/book-get-annotations": "http://127.0.0.1:8080",
       "/book-update-annotations": "http://127.0.0.1:8080",
+      "/ajax": "http://127.0.0.1:8080",
+      "/get": "http://127.0.0.1:8080",
     },
   },
 });

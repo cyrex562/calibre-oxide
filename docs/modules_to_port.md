@@ -2006,32 +2006,52 @@ an indirection layer. Nothing here needs a Rust equivalent.
 
 ### book_list
 
-- [ ] add.pyj
-- [ ] book_details.pyj
-- [ ] comments_editor.pyj
+**Issue #501 (library browser MVP, part of the #432 browser-UI epic)
+ported a minimum-viable slice of this SPA to TypeScript from scratch --
+`web/src/library/{types,api,query}.ts` +
+`web/src/components/{LibraryView,CategoryBrowser,BookDetailsPanel}.vue`
+-- not a file-by-file transpile of the `.pyj` sources below, so no
+individual file here is a full [x]. Covers: cover-grid view (only one
+of upstream's three render modes -- `details_list`/`custom_list`
+deferred), pagination/sort/virtual-library switching, a search bar,
+a category browser (clicking an item builds an exact-match search
+query via `query.ts::categoryItemToQuery`, reusing the same
+`/ajax/search` pipeline rather than wiring `/ajax/books_in` as a
+second parallel data path -- a disclosed simplification), and a
+trimmed book-details panel (metadata, format downloads, a "Read"
+button into #499's reader for epub/kepub). Verified end to end against
+a live `calibre_srv` + a real multi-book library (see #501's closing
+comment for the exact HTTP round trip). Explicitly deferred to their
+own issues per #501's own body: edit-metadata UI, add-books
+(drag-and-drop upload), conversion UI, FTS UI, notes UI, alternate
+view modes, offline/local-books panel.
+
+- [ ] add.pyj (deferred -- add-books UI, own future issue)
+- [ ] book_details.pyj (trimmed equivalent: `BookDetailsPanel.vue`)
+- [ ] comments_editor.pyj (deferred -- part of edit-metadata UI)
 - [ ] constants.pyj
-- [ ] conversion_widgets.pyj
-- [ ] convert_book.pyj
-- [ ] cover_grid.pyj
-- [ ] custom_list.pyj
-- [ ] delete_book.pyj
-- [ ] details_list.pyj
-- [ ] edit_metadata.pyj
-- [ ] fts.pyj
+- [ ] conversion_widgets.pyj (deferred -- conversion UI, own future issue)
+- [ ] convert_book.pyj (deferred -- conversion UI, own future issue)
+- [x] cover_grid.pyj -- `LibraryView.vue`'s grid (cover-grid mode only)
+- [ ] custom_list.pyj (deferred alternate view mode)
+- [ ] delete_book.pyj (deferred -- not in the MVP's read-only scope)
+- [ ] details_list.pyj (deferred alternate view mode)
+- [ ] edit_metadata.pyj (deferred, own future issue)
+- [ ] fts.pyj (deferred -- FTS UI, own future issue)
 - [ ] globals.pyj
 - [ ] home.pyj
 - [ ] item_list.pyj
-- [ ] library_data.pyj
-- [ ] local_books.pyj
-- [ ] main.pyj
-- [ ] prefs.pyj
-- [ ] router.pyj
-- [ ] search.pyj
-- [ ] show_note.pyj
+- [x] library_data.pyj -- `library/api.ts` (against `/ajax/*`, not upstream's `interface-data/*`)
+- [ ] local_books.pyj (deferred -- offline/local-books panel, own future issue)
+- [x] main.pyj -- `web/src/main.ts`'s router (#498) + `LibraryView.vue` as its bootstrap-equivalent
+- [ ] prefs.pyj (deferred -- session-data endpoint exists (#500) but no settings UI yet)
+- [x] router.pyj -- Vue Router (`main.ts`), not a mode/panel-router reimplementation
+- [x] search.pyj -- `LibraryView.vue`'s search bar + `/ajax/search`
+- [ ] show_note.pyj (deferred -- notes UI, own future issue)
 - [ ] theme.pyj
-- [ ] top_bar.pyj
+- [x] top_bar.pyj -- `LibraryView.vue`'s toolbar (search/sort/vl)
 - [ ] ui.pyj
-- [ ] views.pyj
+- [x] views.pyj -- `CategoryBrowser.vue` (category browsing only; no tag-browser tree UI beyond a flat item list)
 - [ ] __init__.pyj
 
 ### read_book

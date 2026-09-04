@@ -156,6 +156,7 @@ function goToTocEntry(dest: string | null, frag: string | null) {
 <template>
   <div class="reader">
     <header class="toolbar">
+      <router-link to="/" class="back">Library</router-link>
       <button @click="showToc = !showToc" :disabled="!manifest">Contents</button>
       <button @click="prev" :disabled="spineIndex <= 0">◀ Prev</button>
       <span class="title">{{ manifest?.metadata?.title ?? "" }}</span>
