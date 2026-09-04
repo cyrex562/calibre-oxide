@@ -5,9 +5,11 @@
 //! landmarks/cover/spine, run the per-file transforms (#478 `html_as_json`
 //! via [`crate::reader_json`], #479 `url()` rewriting via
 //! [`crate::css::url_rewrite`], #480 link virtualization via
-//! [`crate::link_virtualize`]) across every HTML/CSS file, and write
-//! one `book_render_data` structure as `calibre-book-manifest.json`
-//! alongside the transformed files on disk.
+//! [`crate::link_virtualize`], #488 CSS property-value semantic
+//! rewrites -- font-size->rem, page-break fallback, writing-mode rename
+//! -- via [`crate::css::property_transform`]) across every HTML/CSS
+//! file, and write one `book_render_data` structure as
+//! `calibre-book-manifest.json` alongside the transformed files on disk.
 //!
 //! # Scope: EPUB only, HTML/CSS only, sequential
 //!
@@ -74,6 +76,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
+use crate::css::property_transform::transform_properties;
 use crate::css::url_rewrite::transform_urls;
 use crate::dom::{Dom, NodeKind};
 use crate::link_virtualize::{anchor_map, disable_non_stylesheet_links, encode_url, process_anchor_links, rewrite_link_attributes};
@@ -392,9 +395,14 @@ fn process_book_file(container: &mut Container, name: &str, root: &Path, link_ui
             anchors
         };
 
-        // 3. Inline <style>/style="" -- url() rewriting only (#479's own scope; upstream's own
-        //    comment claims these get resolved in virtualize_html, but doesn't actually pass a
-        //    real url_callback into transform_properties for them either -- matched here).
+        // 3. Inline <style>/style="" -- url() rewriting (#479) with no
+        //    real callback (upstream's own comment claims these get
+        //    resolved in virtualize_html, but doesn't actually pass a
+        //    real url_callback into transform_properties for them
+        //    either -- matched here), plus the #488 property-value
+        //    semantic rewrites, which upstream's own single combined
+        //    transform_properties call always applies regardless of
+        //    whether a real url_callback was given.
         transform_inline_styles(container.get_xhtml_mut(name)?);
 
         // 4. Link virtualization: rewrite href/src/etc, then the <a>/<area> post-processing pass.
@@ -423,10 +431,11 @@ fn process_book_file(container: &mut Container, name: &str, root: &Path, link_ui
     } else if OEB_STYLES.contains(&mime.as_str()) {
         let raw = container.get_css_text(name)?.to_string();
         let mut changed_names = HashSet::new();
-        let new_raw = {
+        let after_urls = {
             let mut replacer = create_link_replacer(root, link_uid, present_names, &mut changed_names);
             transform_urls(&raw, |url| replacer(name, url))
         };
+        let new_raw = transform_properties(&after_urls);
         let mut changed = new_raw != raw;
         let trimmed = new_raw.trim_start();
         let final_raw = if trimmed.starts_with("@charset") {
@@ -449,13 +458,13 @@ fn transform_inline_styles(dom: &mut Dom) {
         if dom.tag(id) == Some("style") {
             if let Some(first_child) = dom.node(id).children.first().copied() {
                 if let NodeKind::Text(text) = dom.node(first_child).kind.clone() {
-                    let new_text = transform_urls(&text, |_| None);
+                    let new_text = transform_properties(&transform_urls(&text, |_| None));
                     dom.node_mut(first_child).kind = NodeKind::Text(new_text);
                 }
             }
         }
         if let Some(style) = dom.node(id).attrs.get("style").cloned() {
-            let new_style = transform_urls(&style, |_| None);
+            let new_style = transform_properties(&transform_urls(&style, |_| None));
             dom.node_mut(id).attrs.insert("style".to_string(), new_style);
         }
     }

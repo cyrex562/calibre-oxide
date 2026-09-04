@@ -69,6 +69,7 @@
 pub mod matcher;
 pub mod model;
 pub mod parser;
+pub mod property_transform;
 pub mod selector;
 pub mod url_rewrite;
 
