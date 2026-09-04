@@ -480,7 +480,18 @@ pub struct BookRenderData {
 
 /// Port of `process_exploded_book`. See this module's own doc for
 /// what's not ported (SVG/SMIL per-file transforms, parallelism).
-pub fn process_exploded_book(container: &mut Container, book_fmt: &str, book_hash: Option<&str>, virtualize_resources: bool) -> Result<BookRenderData> {
+///
+/// `book_hash` is `Some((hash, size, mtime))` -- upstream's own
+/// manifest field of the same name is an object `{hash, size, mtime}`
+/// (`books.py::queue_job` passes `{'size':size, 'mtime':mtime,
+/// 'hash':bhash}` as `render_book.py`'s `book_hash` argument, reused
+/// verbatim into the manifest), not a bare hash string -- the real
+/// `read_book` client reads `manifest.book_hash.size`/`.mtime` to
+/// build `book-file` URLs. An earlier version of this port emitted
+/// just the bare hash string here, which is a real bug: a client
+/// built against the actual manifest shape would read `undefined` for
+/// `size`/`mtime` and request a 404.
+pub fn process_exploded_book(container: &mut Container, book_fmt: &str, book_hash: Option<(&str, i64, i64)>, virtualize_resources: bool) -> Result<BookRenderData> {
     let mut excluded_names = HashSet::new();
     let mut present_names = HashSet::new();
     let opf_name = container.opf_name.clone();
@@ -602,7 +613,7 @@ pub fn process_exploded_book(container: &mut Container, book_fmt: &str, book_has
         "book_format": book_fmt,
         "spine": spine,
         "link_uid": link_uid,
-        "book_hash": book_hash,
+        "book_hash": book_hash.map(|(hash, size, mtime)| json!({"hash": hash, "size": size, "mtime": mtime})),
         "is_comic": false,
         "raster_cover_name": raster_cover_name,
         "title_page_name": title_page_name,
@@ -633,7 +644,7 @@ pub fn process_exploded_book(container: &mut Container, book_fmt: &str, book_has
 
 /// Port of `render`, narrowed: no `serialize_metadata`/
 /// `extract_annotations` (see this module's own doc).
-pub fn render(path_to_ebook: &Path, output_dir: &Path, book_hash: Option<&str>, virtualize_resources: bool) -> Result<BookRenderData> {
+pub fn render(path_to_ebook: &Path, output_dir: &Path, book_hash: Option<(&str, i64, i64)>, virtualize_resources: bool) -> Result<BookRenderData> {
     let (mut any, book_fmt, _input_fmt) = extract_book(path_to_ebook, output_dir)?;
     process_exploded_book(any.as_container_mut(), &book_fmt, book_hash, virtualize_resources)
 }
@@ -729,11 +740,11 @@ mod tests {
     #[test]
     fn process_exploded_book_produces_a_real_manifest_with_spine_and_files() {
         let (_src, _tdir, mut epub) = open_test_book();
-        let data = process_exploded_book(&mut epub.container, "EPUB", Some("deadbeef"), true).unwrap();
+        let data = process_exploded_book(&mut epub.container, "EPUB", Some(("deadbeef", 12345, 67890)), true).unwrap();
 
         assert_eq!(data.json["version"], RENDER_VERSION);
         assert_eq!(data.json["book_format"], "EPUB");
-        assert_eq!(data.json["book_hash"], "deadbeef");
+        assert_eq!(data.json["book_hash"], json!({"hash": "deadbeef", "size": 12345, "mtime": 67890}));
         assert_eq!(data.json["spine"], json!(["chap1.xhtml", "chap2.xhtml"]));
         assert_eq!(data.json["files"]["chap1.xhtml"]["is_html"], true);
         assert_eq!(data.json["files"]["style.css"]["is_html"], false);
@@ -750,7 +761,7 @@ mod tests {
         // The manifest file itself was really written to disk.
         let manifest = fs::read_to_string(epub.container.root.join("calibre-book-manifest.json")).unwrap();
         let reparsed: Value = serde_json::from_str(&manifest).unwrap();
-        assert_eq!(reparsed["book_hash"], "deadbeef");
+        assert_eq!(reparsed["book_hash"], json!({"hash": "deadbeef", "size": 12345, "mtime": 67890}));
     }
 
     #[test]
@@ -862,8 +873,8 @@ mod tests {
         let src = tempfile::tempdir().unwrap();
         write_test_book(src.path());
         let out = tempfile::tempdir().unwrap();
-        let data = render(src.path(), out.path(), Some("hash123"), true).unwrap();
-        assert_eq!(data.json["book_hash"], "hash123");
+        let data = render(src.path(), out.path(), Some(("hash123", 111, 222)), true).unwrap();
+        assert_eq!(data.json["book_hash"], json!({"hash": "hash123", "size": 111, "mtime": 222}));
         assert!(out.path().join("calibre-book-manifest.json").exists());
     }
 }

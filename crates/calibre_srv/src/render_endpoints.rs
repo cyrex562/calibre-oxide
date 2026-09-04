@@ -127,7 +127,7 @@ async fn fetch_book_row(state: &AppState, book_id: i32) -> Result<Value, ServerE
     rows.into_iter().next().ok_or_else(|| ServerError::book_not_found(book_id, "default"))
 }
 
-async fn queue_render_job(state: &AppState, ebook_path: PathBuf, bhash: String) -> JobId {
+async fn queue_render_job(state: &AppState, ebook_path: PathBuf, bhash: String, size: i64, mtime: i64) -> JobId {
     let staging_out = state.book_cache.staging_dir().join(&bhash);
     let final_dir = state.book_cache.hash_dir(&bhash);
     let registry = state.render_jobs.clone();
@@ -141,7 +141,7 @@ async fn queue_render_job(state: &AppState, ebook_path: PathBuf, bhash: String) 
             let render_result = tokio::task::spawn_blocking(move || -> Result<calibre_ebooks::render_book::BookRenderData, String> {
                 crate::books_cache::safe_remove(&sb_out);
                 std::fs::create_dir_all(&sb_out).map_err(|e| e.to_string())?;
-                calibre_ebooks::render_book::render(&ebook_path, &sb_out, Some(&sb_hash), true).map_err(|e| format!("{e:#}"))
+                calibre_ebooks::render_book::render(&ebook_path, &sb_out, Some((&sb_hash, size, mtime)), true).map_err(|e| format!("{e:#}"))
             })
             .await;
 
@@ -258,7 +258,7 @@ pub async fn book_manifest(
             let job_id = match state.render_jobs.queued_get(&bhash) {
                 Some(id) => id,
                 None => {
-                    let id = queue_render_job(&state, path, bhash.clone()).await;
+                    let id = queue_render_job(&state, path, bhash.clone(), size, mtime).await;
                     state.render_jobs.queued_insert(bhash.clone(), id);
                     id
                 }
@@ -468,6 +468,13 @@ mod tests {
         let manifest = poll_manifest_until_done(&router, &uri).await;
         assert_eq!(manifest["spine"], json!(["chap1.xhtml"]));
         assert_eq!(manifest["metadata"]["title"], "Book 0");
+        // book_hash must be the real {hash,size,mtime} object shape the
+        // actual read_book client expects (`manifest.book_hash.size`/
+        // `.mtime` are used to build book-file URLs) -- a bare string
+        // here is a real bug, not a narrower-but-valid simplification.
+        assert!(manifest["book_hash"]["hash"].is_string(), "{manifest}");
+        assert!(manifest["book_hash"]["size"].is_i64(), "{manifest}");
+        assert!(manifest["book_hash"]["mtime"].is_i64(), "{manifest}");
     }
 
     #[tokio::test]
