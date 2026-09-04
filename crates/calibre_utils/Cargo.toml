@@ -67,6 +67,17 @@ lettre = { version = "0.11", default-features = false, features = ["smtp-transpo
 # own hashlib.sha1().hexdigest().
 sha1 = "0.10"
 hex = "0.4"
+# Used by certgen.rs -- real self-signed X.509 CA + server cert
+# generation for calibre_srv's future HTTPS support, replacing
+# certgen.py's certgen.c OpenSSL binding (see that module's own doc).
+rcgen = "0.13"
+time = "0.3"
+
+[dev-dependencies]
+# certgen.rs tests only -- real X.509 parsing + signature
+# verification of generated certs, not string-prefix checks.
+x509-parser = { version = "0.16", features = ["verify"] }
+base64 = "0.22"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

@@ -1,3 +1,4 @@
+pub mod certgen;
 pub mod cleantext;
 pub mod config;
 mod config_tests;
