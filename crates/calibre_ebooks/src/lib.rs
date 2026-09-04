@@ -31,6 +31,7 @@ pub mod pml;
 pub mod rb;
 pub mod readability;
 pub mod reader_json;
+pub mod render_book;
 pub mod rtf;
 pub mod rtf2xml;
 pub mod scraper;
