@@ -27,18 +27,51 @@
 //!   item, single-field sort only (upstream supports a comma-separated
 //!   multi-field sort), no `get_additional_fields`.
 //! - `GET /ajax/search`: same query language as `opds::search`, JSON
-//!   shape instead of an Atom feed.
+//!   shape instead of an Atom feed. Now supports `vl=` (issue #500),
+//!   via [`calibre_db::search::books_in_virtual_library`].
 //! - `GET /ajax/library-info`: single-library only.
+//!
+//! # New in issue #500 (part of the #432 browser-UI epic)
+//!
+//! `old_src/src/pyj/book_list/` (the library-browser client this
+//! `/ajax/*` API is being extended for) calls upstream's own
+//! `interface-data/*` endpoint family, which doesn't exist in this
+//! crate -- see #500's own issue body for why extending `/ajax/*`
+//! (rather than porting `interface-data/*` verbatim) was chosen. The
+//! pieces it actually needs, added here:
+//!
+//! - `GET /ajax/field-metadata`: [`calibre_db::field_metadata::FieldMetadata::all_metadata`]
+//!   + `ui_sortable_field_keys` in one response, replacing upstream's
+//!   `db.field_metadata.all_metadata()`/`sortable_fields` (computed
+//!   inline as part of `get_library_init_data` upstream, a standalone
+//!   endpoint here instead since this crate has no combined
+//!   library-init endpoint to fold it into).
+//! - `GET /ajax/virtual-libraries`: the whole `{name: query}` map
+//!   (`calibre_db::cache::Cache::virtual_library_map`), matching
+//!   upstream's own `db._pref('virtual_libraries', {})`.
+//! - `GET`/`POST /ajax/session-data`: per-user client-prefs storage,
+//!   port of `interface-data/set-session-data` (a GET half added too
+//!   -- upstream only exposes reading session data bundled inside
+//!   `interface-data/init`, which this crate doesn't have). Backed by
+//!   `calibre_srv::users::UserManager`'s `session_data` column,
+//!   reachable only via [`AppState::auth`] -- when the server is run
+//!   without `--auth` (`AppState::auth` is `None`), there is no user
+//!   store at all to persist into, so `GET` returns `{}` and `POST` is
+//!   a silent no-op, same effective behavior as upstream's own
+//!   anonymous-user no-op (`if rd.username: ...`) even though the
+//!   *reason* differs (no auth mode vs. no logged-in user).
 
 use std::collections::HashSet;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::Value;
 
 use calibre_db::categories;
 
+use crate::auth::AuthenticatedUser;
+use crate::books::effective_user;
 use crate::errors::ServerError;
 use crate::opds::sort_key_for;
 use crate::AppState;
@@ -99,13 +132,18 @@ pub(crate) fn book_json(row: &Value) -> Value {
 }
 
 pub(crate) async fn fetch_rows(state: &AppState, ids: HashSet<i32>) -> Result<Vec<Value>, ServerError> {
-    tokio::task::spawn_blocking({
-        let cache = state.cache.clone();
-        move || cache.get_data_as_dict(None, false, Some(&ids), false)
-    })
-    .await
-    .map_err(|e| ServerError::InternalServerError(e.to_string()))?
-    .map_err(|e| ServerError::InternalServerError(e.to_string()))
+    fetch_rows_from_cache(state.cache.clone(), ids).await
+}
+
+/// Same as [`fetch_rows`], against an already-resolved cache -- for a
+/// caller (e.g. `cdb::set_fields`, issue #500) that resolved its own
+/// `Cache` via [`AppState::cache_for`] rather than always using the
+/// default [`AppState::cache`].
+pub(crate) async fn fetch_rows_from_cache(cache: std::sync::Arc<calibre_db::cache::Cache>, ids: HashSet<i32>) -> Result<Vec<Value>, ServerError> {
+    tokio::task::spawn_blocking(move || cache.get_data_as_dict(None, false, Some(&ids), false))
+        .await
+        .map_err(|e| ServerError::InternalServerError(e.to_string()))?
+        .map_err(|e| ServerError::InternalServerError(e.to_string()))
 }
 
 /// `GET /ajax/book/{book_id}`. Port of `book`, `id_is_uuid` not
@@ -342,22 +380,32 @@ pub struct SearchQuery {
     offset: i64,
     sort: Option<String>,
     sort_order: Option<String>,
+    /// Virtual library name (issue #500) -- restricts results to the
+    /// intersection of `query` and the named virtual library's own
+    /// stored query, matching upstream's own `vl` handling in
+    /// `get_basic_query_data`.
+    vl: Option<String>,
 }
 
 /// `GET /ajax/search?query=...`. Port of `search`/`search_result`,
 /// single sort field (upstream supports a comma-separated multi-field
-/// sort; not needed yet), no virtual-library restriction (`vl`, not
-/// supported anywhere in this crate yet).
+/// sort; not needed yet). `vl=` (issue #500) restricts to a named
+/// virtual library.
 pub async fn search(State(state): State<AppState>, Query(q): Query<SearchQuery>) -> Result<Json<Value>, ServerError> {
     let (num, offset) = get_pagination(Some(q.num), Some(q.offset))?;
     let sort_field = q.sort.as_deref().unwrap_or("title");
     let sort_order = ensure_val(q.sort_order.as_deref(), &["asc", "desc"]);
     let query = q.query.unwrap_or_default();
+    let vl = q.vl.unwrap_or_default();
 
     let ids: HashSet<i32> = tokio::task::spawn_blocking({
         let cache = state.cache.clone();
         let query = query.clone();
-        move || calibre_db::search::search(&cache, &query)
+        let vl = vl.clone();
+        move || {
+            let restriction = if query.is_empty() { None } else { Some(query.as_str()) };
+            calibre_db::search::books_in_virtual_library(&cache, &vl, restriction)
+        }
     })
     .await
     .map_err(|e| ServerError::InternalServerError(e.to_string()))?
@@ -387,6 +435,7 @@ pub async fn search(State(state): State<AppState>, Query(q): Query<SearchQuery>)
         "sort": sort_field,
         "base_url": "/ajax/search",
         "query": query,
+        "vl": vl,
         "library_id": LIBRARY_ID,
         "book_ids": page,
     })))
@@ -401,10 +450,75 @@ pub async fn library_info() -> Json<Value> {
     }))
 }
 
+/// `GET /ajax/field-metadata` (issue #500). Port of the
+/// `field_metadata`/`sortable_fields` pieces of upstream's
+/// `get_library_init_data` -- see this module's own doc.
+pub async fn field_metadata(State(state): State<AppState>) -> Result<Json<Value>, ServerError> {
+    let (all_metadata, sortable_fields) = tokio::task::spawn_blocking({
+        let cache = state.cache.clone();
+        move || -> anyhow::Result<(Value, Vec<(String, String)>)> {
+            let fm = calibre_db::field_metadata::FieldMetadata::from_cache(&cache)?;
+            let sortable = fm.ui_sortable_field_keys().into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            Ok((fm.all_metadata(), sortable))
+        }
+    })
+    .await
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))?
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "field_metadata": all_metadata,
+        "sortable_fields": sortable_fields,
+    })))
+}
+
+/// `GET /ajax/virtual-libraries` (issue #500). Port of upstream's own
+/// `db._pref('virtual_libraries', {})` -- the whole `{name: query}`
+/// map, unsorted (a client that wants a sorted name list can sort the
+/// object's own keys; upstream's `ui` layer does the same).
+pub async fn virtual_libraries(State(state): State<AppState>) -> Result<Json<Value>, ServerError> {
+    let map = tokio::task::spawn_blocking({
+        let cache = state.cache.clone();
+        move || cache.virtual_library_map()
+    })
+    .await
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))?
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+    Ok(Json(serde_json::json!(map)))
+}
+
+/// `GET /ajax/session-data` (issue #500). See this module's own doc
+/// for the "no `--auth`, no user store" narrowing.
+pub async fn get_session_data(State(state): State<AppState>, user: Option<Extension<AuthenticatedUser>>) -> Json<Value> {
+    let username = effective_user(user);
+    let data = state.auth.as_ref().map(|gate| gate.users.get_session_data(&username)).unwrap_or_else(|| serde_json::json!({}));
+    Json(data)
+}
+
+/// `POST /ajax/session-data`. Port of `set_session_data`: merges the
+/// posted object into whatever's already stored (not a full
+/// overwrite), matching upstream's own `ud.update(new_data)`.
+pub async fn set_session_data(State(state): State<AppState>, user: Option<Extension<AuthenticatedUser>>, Json(new_data): Json<Value>) -> Result<Json<Value>, ServerError> {
+    let Some(new_obj) = new_data.as_object() else {
+        return Err(ServerError::BadRequest("session data must be a JSON object".to_string()));
+    };
+    let username = effective_user(user);
+    let Some(gate) = &state.auth else {
+        return Ok(Json(serde_json::json!({})));
+    };
+    let mut merged = gate.users.get_session_data(&username);
+    let merged_obj = merged.as_object_mut().expect("get_session_data always returns an object");
+    for (k, v) in new_obj {
+        merged_obj.insert(k.clone(), v.clone());
+    }
+    gate.users.set_session_data(&username, &merged).map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+    Ok(Json(merged))
+}
+
 #[cfg(test)]
 mod tests {
     use axum::body::{to_bytes, Body};
-    use axum::http::{Request, StatusCode};
+    use axum::http::{header, Request, StatusCode};
     use tower::ServiceExt;
 
     use calibre_db::cache::Cache;
@@ -601,5 +715,156 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["default_library"], "default");
         assert!(body["library_map"]["default"].is_string());
+    }
+
+    #[tokio::test]
+    async fn field_metadata_lists_real_fields_and_sortable_fields() {
+        let (_dir, router) = test_app(1);
+        let (status, body) = get_json(&router, "/ajax/field-metadata").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["field_metadata"]["title"]["datatype"], "text");
+        assert_eq!(body["field_metadata"]["authors"]["is_category"], true);
+        let sortable: Vec<String> = body["sortable_fields"].as_array().unwrap().iter().map(|pair| pair[0].as_str().unwrap().to_string()).collect();
+        assert!(sortable.contains(&"title".to_string()));
+        assert!(!sortable.contains(&"uuid".to_string()), "uuid is in the real exclusion set");
+    }
+
+    #[tokio::test]
+    async fn virtual_libraries_lists_a_real_saved_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        cache.virtual_library_add("Unread", "not read:true").unwrap();
+        let state = crate::AppState {
+            libraries: None,
+            cache: std::sync::Arc::new(cache),
+            opts: std::sync::Arc::new(crate::opts::ServerOptions::default()),
+            auth: None,
+            changes: crate::web_socket::new_change_broadcaster(),
+            reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()),
+            book_cache: std::sync::Arc::new(crate::books_cache::BookCache::open_temp()),
+            jobs: std::sync::Arc::new(crate::jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
+            render_jobs: std::sync::Arc::new(crate::render_endpoints::RenderJobRegistry::new()),
+            conversion_jobs: std::sync::Arc::new(crate::convert::ConversionJobRegistry::new()),
+        };
+        let router = crate::test_router(state);
+        let (status, body) = get_json(&router, "/ajax/virtual-libraries").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["Unread"], "not read:true");
+    }
+
+    #[tokio::test]
+    async fn search_vl_restricts_to_the_intersection_of_query_and_virtual_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        add_test_book(dir.path(), &cache, "Foundation", "Isaac Asimov");
+        add_test_book(dir.path(), &cache, "Dune", "Frank Herbert");
+        cache.virtual_library_add("Asimov Only", "author:asimov").unwrap();
+        let state = crate::AppState {
+            libraries: None,
+            cache: std::sync::Arc::new(cache),
+            opts: std::sync::Arc::new(crate::opts::ServerOptions::default()),
+            auth: None,
+            changes: crate::web_socket::new_change_broadcaster(),
+            reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()),
+            book_cache: std::sync::Arc::new(crate::books_cache::BookCache::open_temp()),
+            jobs: std::sync::Arc::new(crate::jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
+            render_jobs: std::sync::Arc::new(crate::render_endpoints::RenderJobRegistry::new()),
+            conversion_jobs: std::sync::Arc::new(crate::convert::ConversionJobRegistry::new()),
+        };
+        let router = crate::test_router(state);
+
+        // Every book matches "*", but vl=Asimov Only narrows to book 1.
+        let (status, body) = get_json(&router, "/ajax/search?vl=Asimov+Only").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["book_ids"], serde_json::json!([1]));
+
+        // vl + a query that also matches book 1 -> still book 1.
+        let (_, body) = get_json(&router, "/ajax/search?query=title%3AFoundation&vl=Asimov+Only").await;
+        assert_eq!(body["book_ids"], serde_json::json!([1]));
+
+        // vl + a query that matches only the OTHER book -> empty.
+        let (_, body) = get_json(&router, "/ajax/search?query=title%3ADune&vl=Asimov+Only").await;
+        assert_eq!(body["book_ids"], serde_json::json!([]));
+    }
+
+    fn basic_auth_header(username: &str, password: &str) -> String {
+        use base64::Engine;
+        format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}")))
+    }
+
+    fn test_app_with_auth(username: &str, password: &str) -> (tempfile::TempDir, axum::Router) {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        let users = crate::users::UserManager::new(&dir.path().join("users.sqlite")).unwrap();
+        users.add_user(username, password, false).unwrap();
+        let auth = Some(std::sync::Arc::new(crate::auth::AuthGate::new(users, "calibre".to_string(), 0, 5)));
+        let state = crate::AppState {
+            libraries: None,
+            cache: std::sync::Arc::new(cache),
+            opts: std::sync::Arc::new(crate::opts::ServerOptions::default()),
+            auth,
+            changes: crate::web_socket::new_change_broadcaster(),
+            reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()),
+            book_cache: std::sync::Arc::new(crate::books_cache::BookCache::open_temp()),
+            jobs: std::sync::Arc::new(crate::jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
+            render_jobs: std::sync::Arc::new(crate::render_endpoints::RenderJobRegistry::new()),
+            conversion_jobs: std::sync::Arc::new(crate::convert::ConversionJobRegistry::new()),
+        };
+        (dir, crate::test_router(state))
+    }
+
+    #[tokio::test]
+    async fn session_data_round_trips_for_a_real_authenticated_user() {
+        let (_dir, router) = test_app_with_auth("alice", "hunter2");
+
+        let req = Request::builder().uri("/ajax/session-data").header(header::AUTHORIZATION, basic_auth_header("alice", "hunter2")).body(Body::empty()).unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap(), serde_json::json!({}));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/ajax/session-data")
+            .header(header::AUTHORIZATION, basic_auth_header("alice", "hunter2"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"font_size": 16}"#))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let req = Request::builder().uri("/ajax/session-data").header(header::AUTHORIZATION, basic_auth_header("alice", "hunter2")).body(Body::empty()).unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap(), serde_json::json!({"font_size": 16}));
+    }
+
+    #[tokio::test]
+    async fn session_data_post_merges_rather_than_overwrites() {
+        let (_dir, router) = test_app_with_auth("alice", "hunter2");
+        let post = |body: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri("/ajax/session-data")
+                .header(header::AUTHORIZATION, basic_auth_header("alice", "hunter2"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+        router.clone().oneshot(post(r#"{"font_size": 16}"#)).await.unwrap();
+        router.clone().oneshot(post(r#"{"theme": "dark"}"#)).await.unwrap();
+
+        let req = Request::builder().uri("/ajax/session-data").header(header::AUTHORIZATION, basic_auth_header("alice", "hunter2")).body(Body::empty()).unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap(), serde_json::json!({"font_size": 16, "theme": "dark"}));
+    }
+
+    #[tokio::test]
+    async fn session_data_without_auth_configured_is_a_harmless_empty_no_op() {
+        let (_dir, router) = test_app(0);
+        let (status, body) = get_json(&router, "/ajax/session-data").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({}));
     }
 }

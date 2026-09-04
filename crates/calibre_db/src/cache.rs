@@ -1671,6 +1671,70 @@ impl Cache {
     }
     // }}}
 
+    // --- Virtual libraries (issue #500, part of the #432 browser-UI
+    // epic) -- upstream's own `books_in_virtual_library` resolves a
+    // named virtual library through `db._pref('virtual_libraries', {})`,
+    // the *exact* same `{name: query}`-map-under-a-preference-key
+    // shape as saved searches (`db.cache.py:1605-1622`) -- just a
+    // second, separate preference key, not a distinct subsystem. This
+    // mirrors `saved_search_*` above 1:1, plus a public
+    // [`Cache::virtual_library_map`] (saved searches never needed a
+    // public "give me the whole map" accessor; the library browser
+    // does, to list every virtual library by name). {{{
+
+    const VIRTUAL_LIBRARIES_PREF: &'static str = "virtual_libraries";
+
+    fn virtual_library_map_raw(&self) -> anyhow::Result<std::collections::HashMap<String, String>> {
+        let json = self.get_preference(Self::VIRTUAL_LIBRARIES_PREF)?.unwrap_or_else(|| "{}".to_string());
+        Ok(serde_json::from_str(&json).unwrap_or_default())
+    }
+
+    fn set_virtual_library_map(&self, map: &std::collections::HashMap<String, String>) -> anyhow::Result<()> {
+        self.set_preference(Self::VIRTUAL_LIBRARIES_PREF, &serde_json::to_string(map)?)
+    }
+
+    /// The whole `{name: query}` map, unsorted -- for a caller (the
+    /// library browser) that wants to list every virtual library by
+    /// name, not just check for/resolve one.
+    pub fn virtual_library_map(&self) -> anyhow::Result<std::collections::HashMap<String, String>> {
+        self.virtual_library_map_raw()
+    }
+
+    /// Port of `virtual_libraries` (the read-only name-listing half --
+    /// upstream's own property of the same name): every virtual
+    /// library's name, sorted. Same case-insensitive-sort narrowing as
+    /// [`Cache::saved_search_names`] (no real ICU collation yet).
+    pub fn virtual_library_names(&self) -> anyhow::Result<Vec<String>> {
+        let mut names: Vec<String> = self.virtual_library_map_raw()?.into_keys().collect();
+        names.sort_by_key(|n| n.to_lowercase());
+        Ok(names)
+    }
+
+    /// Port of the lookup half of `books_in_virtual_library`'s own
+    /// `db._pref('virtual_libraries', {}).get(vl)` -- case-insensitive
+    /// name match, matching [`Cache::saved_search_lookup`].
+    pub fn virtual_library_lookup(&self, name: &str) -> anyhow::Result<Option<String>> {
+        let name_lower = name.to_lowercase();
+        Ok(self.virtual_library_map_raw()?.into_iter().find(|(n, _)| n.to_lowercase() == name_lower).map(|(_, v)| v))
+    }
+
+    pub fn virtual_library_add(&self, name: &str, value: &str) -> anyhow::Result<()> {
+        let mut map = self.virtual_library_map_raw()?;
+        map.insert(name.to_string(), value.trim().to_string());
+        self.set_virtual_library_map(&map)
+    }
+
+    pub fn virtual_library_delete(&self, name: &str) -> anyhow::Result<()> {
+        let mut map = self.virtual_library_map_raw()?;
+        map.remove(name);
+        self.set_virtual_library_map(&map)
+    }
+
+    pub fn virtual_library_set_all(&self, map: std::collections::HashMap<String, String>) -> anyhow::Result<()> {
+        self.set_virtual_library_map(&map)
+    }
+    // }}}
+
     /// Port of `enable_fts` -- same as [`crate::library::Library::set_fts_enabled`].
     pub fn set_fts_enabled(&self, enabled: bool) -> anyhow::Result<()> {
         self.set_preference("fts.enabled", if enabled { "true" } else { "false" })?;
@@ -1775,6 +1839,58 @@ mod tests {
         replacement.insert("only".to_string(), "tags:y".to_string());
         cache.saved_search_set_all(replacement).unwrap();
         assert_eq!(cache.saved_search_names().unwrap(), vec!["only".to_string()]);
+    }
+
+    #[test]
+    fn virtual_library_add_lookup_and_names_round_trip() {
+        let (_dir, cache) = open_test_cache();
+        assert_eq!(cache.virtual_library_names().unwrap(), Vec::<String>::new());
+
+        cache.virtual_library_add("Unread", "not read:true").unwrap();
+        cache.virtual_library_add("Fiction", "tags:fiction").unwrap();
+
+        assert_eq!(cache.virtual_library_names().unwrap(), vec!["Fiction".to_string(), "Unread".to_string()]);
+        assert_eq!(cache.virtual_library_lookup("Unread").unwrap().as_deref(), Some("not read:true"));
+        assert_eq!(cache.virtual_library_lookup("unread").unwrap().as_deref(), Some("not read:true"), "lookup should be case-insensitive, matching saved searches");
+        assert_eq!(cache.virtual_library_lookup("nonexistent").unwrap(), None);
+    }
+
+    #[test]
+    fn virtual_library_map_lists_every_entry() {
+        let (_dir, cache) = open_test_cache();
+        cache.virtual_library_add("Unread", "not read:true").unwrap();
+        cache.virtual_library_add("Fiction", "tags:fiction").unwrap();
+        let map = cache.virtual_library_map().unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("Unread").map(String::as_str), Some("not read:true"));
+    }
+
+    #[test]
+    fn virtual_library_delete_removes_it() {
+        let (_dir, cache) = open_test_cache();
+        cache.virtual_library_add("temp", "tags:x").unwrap();
+        assert!(cache.virtual_library_lookup("temp").unwrap().is_some());
+        cache.virtual_library_delete("temp").unwrap();
+        assert_eq!(cache.virtual_library_lookup("temp").unwrap(), None);
+    }
+
+    #[test]
+    fn virtual_library_set_all_replaces_the_whole_map() {
+        let (_dir, cache) = open_test_cache();
+        cache.virtual_library_add("keep-me-out", "tags:x").unwrap();
+        let mut replacement = std::collections::HashMap::new();
+        replacement.insert("only".to_string(), "tags:y".to_string());
+        cache.virtual_library_set_all(replacement).unwrap();
+        assert_eq!(cache.virtual_library_names().unwrap(), vec!["only".to_string()]);
+    }
+
+    #[test]
+    fn virtual_libraries_and_saved_searches_are_stored_under_separate_preference_keys() {
+        let (_dir, cache) = open_test_cache();
+        cache.saved_search_add("same-name", "tags:from-saved-search").unwrap();
+        cache.virtual_library_add("same-name", "tags:from-virtual-library").unwrap();
+        assert_eq!(cache.saved_search_lookup("same-name").unwrap().as_deref(), Some("tags:from-saved-search"));
+        assert_eq!(cache.virtual_library_lookup("same-name").unwrap().as_deref(), Some("tags:from-virtual-library"));
     }
 
     #[test]

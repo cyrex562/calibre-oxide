@@ -64,7 +64,7 @@ use rand::Rng;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::ajax::{book_json, fetch_rows};
+use crate::ajax::book_json;
 use crate::errors::ServerError;
 use crate::web_socket::{self, ChangeEvent};
 use crate::AppState;
@@ -131,8 +131,24 @@ pub async fn add_book(State(state): State<AppState>, Path((job_id, add_duplicate
     Ok(Json(result))
 }
 
-/// `POST /cdb/delete-books/{book_ids}`. Port of `cdb_delete_book`.
-pub async fn delete_books(State(state): State<AppState>, Path(book_ids): Path<String>) -> Result<Json<Value>, ServerError> {
+/// `POST /cdb/delete-books/{book_ids}/{library_id}`. Port of
+/// `cdb_delete_book`.
+pub async fn delete_books(State(state): State<AppState>, Path((book_ids, library_id)): Path<(String, String)>) -> Result<Json<Value>, ServerError> {
+    delete_books_handle(state, book_ids, Some(library_id)).await
+}
+
+/// Same as [`delete_books`], for a URL with no `{library_id}` segment
+/// -- always deletes from the default library. Issue #500 found the
+/// real RapydScript client always sends the trailing segment, but the
+/// no-segment form is kept too, matching every other library_id-aware
+/// route pair in this file (`copy_to_library`/`copy_to_library_no_source`).
+pub async fn delete_books_no_library(State(state): State<AppState>, Path(book_ids): Path<String>) -> Result<Json<Value>, ServerError> {
+    delete_books_handle(state, book_ids, None).await
+}
+
+async fn delete_books_handle(state: AppState, book_ids: String, library_id: Option<String>) -> Result<Json<Value>, ServerError> {
+    let cache = state.cache_for(library_id.as_deref()).ok_or_else(|| ServerError::NotFound(format!("no library named {:?}", library_id.clone().unwrap_or_default())))?;
+
     let mut ids = Vec::new();
     for part in book_ids.split(',') {
         let Ok(id) = part.trim().parse::<i32>() else {
@@ -142,7 +158,7 @@ pub async fn delete_books(State(state): State<AppState>, Path(book_ids): Path<St
     }
 
     tokio::task::spawn_blocking({
-        let cache = state.cache.clone();
+        let cache = cache.clone();
         let ids = ids.clone();
         move || -> anyhow::Result<()> {
             for id in ids {
@@ -228,8 +244,20 @@ fn value_to_field_string(field: &str, value: &Value) -> Option<String> {
     }
 }
 
-/// `POST /cdb/set-fields/{book_id}`. Port of `cdb_set_fields`.
-pub async fn set_fields(State(state): State<AppState>, Path(book_id): Path<i32>, Json(body): Json<SetFieldsBody>) -> Result<Json<Value>, ServerError> {
+/// `POST /cdb/set-fields/{book_id}/{library_id}`. Port of
+/// `cdb_set_fields`.
+pub async fn set_fields(State(state): State<AppState>, Path((book_id, library_id)): Path<(i32, String)>, Json(body): Json<SetFieldsBody>) -> Result<Json<Value>, ServerError> {
+    set_fields_handle(state, book_id, Some(library_id), body).await
+}
+
+/// Same as [`set_fields`], for a URL with no `{library_id}` segment --
+/// always updates the default library.
+pub async fn set_fields_no_library(State(state): State<AppState>, Path(book_id): Path<i32>, Json(body): Json<SetFieldsBody>) -> Result<Json<Value>, ServerError> {
+    set_fields_handle(state, book_id, None, body).await
+}
+
+async fn set_fields_handle(state: AppState, book_id: i32, library_id: Option<String>, body: SetFieldsBody) -> Result<Json<Value>, ServerError> {
+    let cache = state.cache_for(library_id.as_deref()).ok_or_else(|| ServerError::NotFound(format!("no library named {:?}", library_id.clone().unwrap_or_default())))?;
     let SetFieldsBody { mut changes, loaded_book_ids, all_dirtied } = body;
 
     if let Some(cover) = changes.remove("cover") {
@@ -243,7 +271,7 @@ pub async fn set_fields(State(state): State<AppState>, Path(book_id): Path<i32>,
                     return Err(ServerError::BadRequest("Cover data must be either JPEG or PNG".to_string()));
                 }
                 tokio::task::spawn_blocking({
-                    let cache = state.cache.clone();
+                    let cache = cache.clone();
                     move || calibre_db::covers::set_cover(&cache, book_id, &data)
                 })
                 .await
@@ -271,7 +299,7 @@ pub async fn set_fields(State(state): State<AppState>, Path(book_id): Path<i32>,
             let tmp_path = std::env::temp_dir().join(tmp_name);
             std::fs::write(&tmp_path, &data).map_err(|e| ServerError::InternalServerError(e.to_string()))?;
             let result = tokio::task::spawn_blocking({
-                let cache = state.cache.clone();
+                let cache = cache.clone();
                 let tmp_path = tmp_path.clone();
                 move || cache.add_format(book_id, &tmp_path, &ext, true)
             })
@@ -285,7 +313,7 @@ pub async fn set_fields(State(state): State<AppState>, Path(book_id): Path<i32>,
     if let Some(removed) = changes.remove("removed_formats") {
         let removed: Vec<String> = serde_json::from_value(removed).map_err(|_| ServerError::BadRequest("removed_formats must be a list of format extensions".to_string()))?;
         tokio::task::spawn_blocking({
-            let cache = state.cache.clone();
+            let cache = cache.clone();
             move || -> anyhow::Result<()> {
                 for fmt in removed {
                     cache.remove_format(book_id, &fmt)?;
@@ -307,7 +335,7 @@ pub async fn set_fields(State(state): State<AppState>, Path(book_id): Path<i32>,
     }
     if !field_updates.is_empty() {
         tokio::task::spawn_blocking({
-            let cache = state.cache.clone();
+            let cache = cache.clone();
             move || -> anyhow::Result<()> {
                 for (field, value) in field_updates {
                     cache.set_field(book_id, &field, &value)?;
@@ -334,7 +362,7 @@ pub async fn set_fields(State(state): State<AppState>, Path(book_id): Path<i32>,
     // both are still accepted (and validated) for request-shape
     // compatibility, they just can't change the answer in this port.
     let _ = (loaded_book_ids, all_dirtied);
-    let rows = fetch_rows(&state, std::iter::once(book_id).collect()).await?;
+    let rows = crate::ajax::fetch_rows_from_cache(cache, std::iter::once(book_id).collect()).await?;
     let mut ans = serde_json::Map::new();
     for row in rows {
         let id = row["id"].as_i64().unwrap_or(0);
@@ -650,6 +678,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_books_with_a_real_library_id_segment_targets_that_library() {
+        // Issue #500: the real RapydScript client always sends a
+        // trailing /{library_id} segment -- confirm it's honored, not
+        // silently ignored, and that the book is really gone from the
+        // NAMED library (checked directly through the broker's own
+        // still-open Cache, since /ajax/book has no library_id-aware
+        // route to check through over HTTP).
+        let (src_dir, _dest_dir, broker, router) = test_app_with_two_libraries();
+        let src_name = src_dir.path().file_name().unwrap().to_str().unwrap();
+        let src_cache = broker.get(Some(src_name)).unwrap();
+        assert!(src_cache.field_for(1, "title").unwrap().is_some(), "book 1 should exist in the source library before deleting");
+
+        let (status, _) = post_json(&router, &format!("/cdb/delete-books/1/{src_name}"), serde_json::json!(null)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(src_cache.field_for(1, "title").unwrap().is_none(), "the book should really be gone from the named library");
+    }
+
+    #[tokio::test]
+    async fn delete_books_404s_for_an_unknown_library_id() {
+        // Must use multi-library mode: in single-library mode
+        // (`AppState::libraries == None`), `cache_for` always falls
+        // back to the default library regardless of the requested
+        // name (that's deliberate pre-#423 compatibility behavior,
+        // not a bug) -- an unknown name can only actually 404 once a
+        // real `LibraryBroker` is involved.
+        let (_src_dir, _dest_dir, _broker, router) = test_app_with_two_libraries();
+        let (status, _) = post_json(&router, "/cdb/delete-books/1/no-such-library", serde_json::json!(null)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn delete_books_rejects_a_non_integer_id() {
         let (_dir, router) = test_app(1);
         let (status, _) = post_json(&router, "/cdb/delete-books/bogus", serde_json::json!(null)).await;
@@ -751,6 +810,27 @@ mod tests {
         let (_dir, router) = test_app(1);
         let (status, _) = post_json(&router, "/cdb/set-fields/1", serde_json::json!({"changes": {"db_id": 5}})).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn set_fields_with_a_real_library_id_segment_targets_that_library() {
+        let (src_dir, _dest_dir, broker, router) = test_app_with_two_libraries();
+        let src_name = src_dir.path().file_name().unwrap().to_str().unwrap();
+        let src_cache = broker.get(Some(src_name)).unwrap();
+
+        let (status, body) = post_json(&router, &format!("/cdb/set-fields/1/{src_name}"), serde_json::json!({"changes": {"title": "Retitled"}})).await;
+        assert_eq!(status, StatusCode::OK, "got: {body}");
+        assert_eq!(body["1"]["title"], "Retitled");
+        assert_eq!(src_cache.field_for(1, "title").unwrap().as_deref(), Some("Retitled"), "the write should have really landed in the named library");
+    }
+
+    #[tokio::test]
+    async fn set_fields_404s_for_an_unknown_library_id() {
+        // See `delete_books_404s_for_an_unknown_library_id`'s own
+        // comment for why this needs multi-library mode.
+        let (_src_dir, _dest_dir, _broker, router) = test_app_with_two_libraries();
+        let (status, _) = post_json(&router, "/cdb/set-fields/1/no-such-library", serde_json::json!({"changes": {"title": "x"}})).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
