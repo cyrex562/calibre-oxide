@@ -294,8 +294,9 @@ either -- this pass wasn't exhaustive.
 
 - [x] __init__.py
 - [x] archives.py
-- [x] cli.py (ported into `calibre_conversion::cli_helpers` — input/output validation, USAGE banner, HEURISTIC_OPTIONS. Plugin-driven option assembly deferred to #126)
-- [x] config.py (ported into `calibre_conversion::config` — GuiRecommendations JSON roundtrip, OPTIONS registry, format-preference helpers, atomic save/load. DB-integrated `*_specifics` deferred to #93 LibraryHandle)
+- [x] cli.py (ported into `calibre_conversion::cli_helpers` — input/output validation, USAGE banner, HEURISTIC_OPTIONS. Plugin-driven option assembly deferred to #126; issue #476 wired `check_command_line_options` into `calibre_conversion`'s `ebook_convert` binary for real, replacing its previous ad hoc clap-only arg handling)
+- [x] config.py (ported into `calibre_conversion::config` — GuiRecommendations JSON roundtrip, OPTIONS registry, format-preference helpers, atomic save/load. DB-integrated `*_specifics` deferred to #93 LibraryHandle. Registry not yet wired into `Plumber` — issue #476's own disclosed follow-up)
+- [x] issue #476 (foundational, blocked #429): found and removed `calibre_conversion`'s own second, thinner, untested conversion architecture (`OebBook`/`InputPlugin`/`OutputPlugin`/`ConversionPipeline`/`plugins::{epub_input,epub_output}`) — it duplicated, with a strictly worse content model (a leaked temp dir, no NCX/TOC generation), what `calibre_ebooks::conversion::plumber::Plumber` already did, tested, and reused elsewhere (`oeb::iterator::book::extract_book`, issue #38). `calibre_conversion::bin::ebook_convert` now calls `Plumber` directly (real dynamic format dispatch across all ~19/~15 already-ported input/output formats, verified end to end with a real EPUB→EPUB and EPUB→TXT conversion via the built binary — previously hardcoded to EPUB→EPUB only). AZW3 *output* remains genuinely unimplemented anywhere in the crate (a real, pre-existing gap, not introduced or masked by this issue)
 - [x] plumber.py
 - [x] preprocess.py
 - [x] search_replace.py
