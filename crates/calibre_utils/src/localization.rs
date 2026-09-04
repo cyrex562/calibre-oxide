@@ -68,6 +68,19 @@ pub fn lang_as_iso639_1(name_or_code: &str) -> Option<String> {
     Language::from_639_3(&code).and_then(|l| l.to_639_1()).map(str::to_string)
 }
 
+/// Port of `calibre_langcode_to_name`'s English-name half (issue
+/// #514's `language_strings()` builtin): the display name for a
+/// language code. Narrowed vs. upstream: only the English name is
+/// available (`isolang`'s `english_names` feature) -- there's no
+/// translation-catalog machinery in this crate to localize into the
+/// current locale, so a `localize != 0` request still gets the
+/// English name rather than erroring or silently returning the raw
+/// code.
+pub fn lang_display_name(code: &str) -> Option<String> {
+    let canonical = canonicalize_lang(code)?;
+    Language::from_639_3(&canonical).map(|l| l.to_name().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,6 +95,15 @@ mod tests {
     fn canonicalizes_locale_style_codes() {
         assert_eq!(canonicalize_lang("en-GB"), Some("eng".to_string()));
         assert_eq!(canonicalize_lang("en_US"), Some("eng".to_string()));
+    }
+
+    #[test]
+    fn lang_display_name_maps_a_code_to_its_english_name() {
+        assert_eq!(lang_display_name("en"), Some("English".to_string()));
+        assert_eq!(lang_display_name("fra"), Some("French".to_string()));
+        // "not" alone is coincidentally a real ISO 639-3 code
+        // (Nomatsiguenga) -- use a string with no valid subtag at all.
+        assert_eq!(lang_display_name("zzzzzzzz"), None);
     }
 
     #[test]

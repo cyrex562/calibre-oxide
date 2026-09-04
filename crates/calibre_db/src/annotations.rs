@@ -154,6 +154,15 @@ fn merge_annotations(annots: &[Value], annots_map: &mut HashMap<String, Vec<Valu
     }
 }
 
+/// Port of `db.annotation_count_for_book` (issue #514's
+/// `annotation_count()` template function): the total number of
+/// stored annotations for `book_id`, across every format/user.
+pub fn annotation_count_for_book(cache: &Cache, book_id: i32) -> Result<i64> {
+    let conn = cache.backend.conn.lock().unwrap();
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM annotations WHERE book = ?1", [book_id], |row| row.get(0))?;
+    Ok(count)
+}
+
 /// Port of `db.annotations_map_for_book`: every stored annotation for
 /// `book_id`/`fmt`/`user_type`/`user`, grouped by its own `"type"`.
 pub fn annotations_map_for_book(cache: &Cache, book_id: i32, fmt: &str, user_type: &str, user: &str) -> Result<HashMap<String, Vec<Value>>> {
