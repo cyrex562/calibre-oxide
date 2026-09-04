@@ -63,6 +63,10 @@ flate2 = "1.0"
 # replacing smtp.py's own polyglot.smtplib wrapping (see that
 # module's own doc for why).
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "rustls-tls", "hostname"] }
+# Used by exim.rs for per-exported-file digests, matching upstream's
+# own hashlib.sha1().hexdigest().
+sha1 = "0.10"
+hex = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
