@@ -1562,8 +1562,8 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 - [x] books.py (issue #483 closes out #427's core scope -- book-get/set-last-read-position, book-get/update-annotations (issue #485, real annotation storage + merge algorithm via `calibre_db::annotations`), the disk-cache layer (issue #482, `calibre_srv::books_cache::BookCache`), and now the real HTTP surface tying it together with the render pipeline (#481) via `calibre_srv::jobs::JobsManager` (#428): `GET /book-manifest/{book_id}/{fmt}` (cache-hit returns the rendered manifest merged with live metadata/read-positions/annotations, cache-miss queues/dedupes a render job and returns a poll-able job-status object) and `GET /book-file/{book_id}/{fmt}/{size}/{mtime}/{*name}` (serves one cached rendered asset, ETag'd with the content hash, real path-traversal guard). Not ported: mathjax static-asset serving (a separate, unrelated endpoint upstream, no real consumer in this crate yet). See `calibre_srv::render_endpoints`'s module doc for the disclosed `queue_job`/`job_done` simplifications)
 - [x] cdb.py (delete-books, set-cover, set-fields, add-book (issue #424, real metadata sniffing + duplicate detection), copy-to-library (issue #425, real two-library copy/move + duplicate detection, no automerge), generic cmd dispatcher (issue #426, narrowed to a representative subset -- `search`/`show_metadata`/`remove` -- of `calibre_db::cli` commands; most others need a real `implementation`-equivalent written per command before they can be added, see `calibre_srv::cdb`'s module doc); see that module's doc for what's narrowed in each)
 - [ ] changes.py (partial -- event shapes ported as `calibre_srv::web_socket::ChangeEvent` (BooksAdded/BooksDeleted/FormatsAdded/FormatsRemoved/MetadataChanged); no SavedSearchesChanged, tracked by issue #422)
-- [ ] code.py (issue #432, low priority -- needs vendoring calibre's bundled UI assets)
-- [ ] content.py (partial -- `cover`/`thumb`/format downloads (`calibre_srv::content`, no etag caching, no thumbnail resizing, no `opf`/`json`), the Notes feature (`calibre_srv::notes`), data-files endpoints (`calibre_srv::data_files`, issue #418 closed), and reader-profiles (`calibre_srv::reader_profiles`, issue #419 closed); no static/icon/favicon serving (issue #432))
+- [ ] code.py (issue #432, epic -- real scope found: two substantial RapydScript SPAs (`book_list`/`read_book`, see `src/pyj` below), not vendorable upstream assets. Reimplemented from scratch in TypeScript+Vue, not a literal port. #498 (static serving) and #499 (reader MVP, `read_book`) closed; #500 (`/ajax/*` extension) and #501 (`book_list` library-browser MVP) not started -- see #432's own issue body)
+- [ ] content.py (partial -- `cover`/`thumb`/format downloads (`calibre_srv::content`, no etag caching, no thumbnail resizing, no `opf`/`json`), the Notes feature (`calibre_srv::notes`), data-files endpoints (`calibre_srv::data_files`, issue #418 closed), and reader-profiles (`calibre_srv::reader_profiles`, issue #419 closed); issue #498 added real static-file serving for the new browser UI (`--static-dir`, `calibre_srv::router`'s own `fallback_service`, a real SPA-serving pattern -- not literally content.py's own `/static/{+what}` resource-directory serving, which upstream bundles at build time), but no icon/favicon endpoints specifically yet (issue #432))
 - [x] convert.py (issue #429 -- `calibre_srv::convert`: real `POST /conversion/start/{book_id}`, `GET`/`POST /conversion/status/{job_id}`, `GET /conversion/book-data/{book_id}`, backed by `calibre_ebooks::conversion::plumber::Plumber` (#476) via `calibre_srv::jobs::JobsManager` (#428); `conversion_status` is the first real trigger for `web_socket::ChangeEvent::FormatsAdded`. Narrowed: no live conversion options (`Plumber::run` takes none yet), no progress percentage/message (no report-progress hook in `Plumber`), `book-data` omits `profiles`/`conversion_options` (needs the same live per-format option support); see the module's own doc)
 - [ ] embedded.py
 - [x] errors.py
@@ -2036,45 +2036,66 @@ an indirection layer. Nothing here needs a Rust equivalent.
 
 ### read_book
 
+**Issue #499 (reader MVP, part of the #432 browser-UI epic) ported a
+minimum-viable slice of this SPA to TypeScript from scratch --
+`web/src/reader/{api,unserialize,virtualLinks,position,toc}.ts` +
+`web/src/components/ReaderView.vue` -- not a file-by-file transpile of
+the `.pyj` sources below, so no individual file here is a full [x].
+Real, verified end to end against a live `calibre_srv` + a real EPUB:
+manifest/book-file fetch (`ui.pyj`'s role), JSON-tree-to-DOM +
+virtualized-resource resolution (`resources.pyj`'s role, confirmed
+byte-for-byte against a live server response), `data-{link_uid}`
+anchor click handling, TOC navigation (`toc.pyj`'s role, narrowed --
+no bordering-node/anchor-visibility tracking), last-read-position
+persistence via a real (non-CFI) position scheme (see `position.ts`'s
+own doc for why real EPUB CFI computation, `cfi.pyj`, ~1000 lines, is
+deferred). Continuous-scroll only, whole-spine-file navigation
+granularity (no real pagination math, `flow_mode.pyj`/`paged_mode.pyj`
+not ported). Explicitly NOT ported by this slice: in-book search,
+highlights/annotations/bookmarks UI, MathJax, TTS/audiobooks, touch
+gestures, settings panel, footnotes, offline/IndexedDB caching
+(`db.pyj`'s whole-book-predownload model deliberately not replicated
+-- files are fetched on demand instead).**
+
 - [ ] anchor_visibility.pyj
 - [ ] annotations.pyj
 - [ ] bookmarks.pyj
 - [ ] cfi.pyj
 - [ ] content_popup.pyj
-- [ ] db.pyj
+- [ ] db.pyj (not ported -- on-demand fetch used instead, see banner above)
 - [ ] extract.pyj
 - [ ] find.pyj
-- [ ] flow_mode.pyj
+- [ ] flow_mode.pyj (not ported -- native iframe scroll used instead)
 - [ ] footnotes.pyj
 - [ ] gestures.pyj
-- [ ] globals.pyj
-- [ ] goto.pyj
+- [ ] globals.pyj (partial -- narrow equivalents inline in `ReaderView.vue`, #499)
+- [ ] goto.pyj (partial -- narrow equivalent inline in `ReaderView.vue`, #499)
 - [ ] highlights.pyj
 - [ ] hints.pyj
-- [ ] iframe.pyj
+- [ ] iframe.pyj (partial -- parent-frame-side DOM injection only, no postMessage boundary, see `unserialize.ts`, #499)
 - [ ] mathjax.pyj
-- [ ] open_book.pyj
+- [ ] open_book.pyj (not applicable -- standalone-viewer-only)
 - [ ] overlay.pyj
 - [ ] paged_mode.pyj
 - [ ] profiles.pyj
 - [ ] read_aloud.pyj
 - [ ] read_audio_ebook.pyj
 - [ ] referencing.pyj
-- [ ] resources.pyj
+- [ ] resources.pyj (partial -- `unserialize.ts`/`virtualLinks.ts`, #499)
 - [ ] scrollbar.pyj
 - [ ] search.pyj
 - [ ] search_worker.pyj
 - [ ] selection_bar.pyj
 - [ ] settings.pyj
-- [ ] shortcuts.pyj
+- [ ] shortcuts.pyj (partial -- page-turn keys only, `ReaderView.vue`, #499)
 - [ ] smil.pyj
 - [ ] test_cfi.pyj
 - [ ] timers.pyj
-- [ ] toc.pyj
+- [ ] toc.pyj (partial -- `toc.ts`, #499)
 - [ ] touch.pyj
 - [ ] tts.pyj
-- [ ] ui.pyj
-- [ ] view.pyj
+- [ ] ui.pyj (partial -- `api.ts`/`ReaderView.vue`, #499)
+- [ ] view.pyj (partial -- `ReaderView.vue`, #499)
 - [ ] viewport.pyj
 - [ ] word_actions.pyj
 - [ ] __init__.pyj

@@ -296,6 +296,28 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/reader-profiles/get-all", get(reader_profiles::get_all))
         .route("/reader-profiles/save", post(reader_profiles::save));
 
+    // Serve the browser UI's built static files (issue #432/#498), if
+    // `--static-dir` names a real directory -- as a `fallback_service`
+    // so it never shadows any real route above, and so any client-side
+    // route (e.g. `/read/123/epub`, which has no server-side handler)
+    // still resolves to `index.html` for `vue-router` to pick up,
+    // matching the standard SPA-serving pattern. Behind the same auth
+    // layer as everything else, matching upstream's own `index()`
+    // endpoint (`auth_required=True`).
+    let api = match state.opts.static_dir.as_deref().map(std::path::Path::new).filter(|d| d.is_dir()) {
+        Some(dir) => {
+            // `ServeDir::not_found_service` (tower_http's other
+            // fallback constructor) always forces a `404` status even
+            // while serving the fallback body -- exactly wrong for a
+            // real SPA route, whose whole point is a normal, cacheable
+            // `200` response. `fallback` (not `not_found_service`)
+            // leaves `ServeFile`'s own natural `200` status alone.
+            let serve_dir = tower_http::services::ServeDir::new(dir).fallback(tower_http::services::ServeFile::new(dir.join("index.html")));
+            api.fallback_service(serve_dir)
+        }
+        None => api,
+    };
+
     api.route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth)).with_state(state)
 }
 
@@ -310,4 +332,94 @@ pub fn test_router(state: AppState) -> axum::Router {
     use axum::extract::connect_info::MockConnectInfo;
     use std::net::SocketAddr;
     router(state).layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    fn test_state_with_static_dir(dir: &std::path::Path) -> AppState {
+        let lib_dir = tempfile::tempdir().unwrap();
+        AppState {
+            libraries: None,
+            cache: std::sync::Arc::new(calibre_db::cache::Cache::new(lib_dir.path()).unwrap()),
+            opts: std::sync::Arc::new(opts::ServerOptions { static_dir: Some(dir.to_string_lossy().into_owned()), ..opts::ServerOptions::default() }),
+            auth: None,
+            changes: web_socket::new_change_broadcaster(),
+            reader_profiles: std::sync::Arc::new(reader_profiles::ProfileStore::new_in_memory().unwrap()),
+            book_cache: std::sync::Arc::new(books_cache::BookCache::open_temp()),
+            jobs: std::sync::Arc::new(jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
+            render_jobs: std::sync::Arc::new(render_endpoints::RenderJobRegistry::new()),
+            conversion_jobs: std::sync::Arc::new(convert::ConversionJobRegistry::new()),
+        }
+    }
+
+    async fn get(router: &axum::Router, uri: &str) -> (StatusCode, String) {
+        let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[tokio::test]
+    async fn no_static_dir_leaves_every_existing_route_working_and_serves_nothing_new() {
+        let lib_dir = tempfile::tempdir().unwrap();
+        let state = AppState {
+            libraries: None,
+            cache: std::sync::Arc::new(calibre_db::cache::Cache::new(lib_dir.path()).unwrap()),
+            opts: std::sync::Arc::new(opts::ServerOptions::default()),
+            auth: None,
+            changes: web_socket::new_change_broadcaster(),
+            reader_profiles: std::sync::Arc::new(reader_profiles::ProfileStore::new_in_memory().unwrap()),
+            book_cache: std::sync::Arc::new(books_cache::BookCache::open_temp()),
+            jobs: std::sync::Arc::new(jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
+            render_jobs: std::sync::Arc::new(render_endpoints::RenderJobRegistry::new()),
+            conversion_jobs: std::sync::Arc::new(convert::ConversionJobRegistry::new()),
+        };
+        let router = test_router(state);
+        let (status, _) = get(&router, "/opds").await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = get(&router, "/no-such-route-at-all").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "with no static_dir there's no SPA fallback to catch this");
+    }
+
+    #[tokio::test]
+    async fn a_real_static_dir_serves_its_own_files_and_falls_back_to_index_html_for_unmatched_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<html>the reader app</html>").unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(dir.path().join("assets/app.js"), "console.log('hi')").unwrap();
+
+        let router = test_router(test_state_with_static_dir(dir.path()));
+
+        let (status, body) = get(&router, "/assets/app.js").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "console.log('hi')");
+
+        let (status, body) = get(&router, "/").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("the reader app"));
+
+        // A client-side route with no server-side handler (e.g.
+        // vue-router's /read/:bookId/:fmt) falls back to index.html
+        // for the SPA's own router to pick up.
+        let (status, body) = get(&router, "/read/123/epub").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("the reader app"));
+    }
+
+    #[tokio::test]
+    async fn a_static_dir_never_shadows_a_real_api_route() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<html>the reader app</html>").unwrap();
+
+        let router = test_router(test_state_with_static_dir(dir.path()));
+        let (status, body) = get(&router, "/opds").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body.contains("the reader app"), "the real /opds route must win over the static fallback");
+    }
 }
