@@ -108,6 +108,38 @@ impl FieldStore {
             _ => None,
         }
     }
+
+    /// Port of `author_sorts`/`get_link('authors', ...)`/
+    /// `author_links`'s own per-author lookups (issue #514) --
+    /// keyed by author *name* since that's what a template caller
+    /// has (a book's author-name list), not the internal id.
+    pub fn author_sort_for_name(&self, name: &str) -> Option<String> {
+        let t = &self.tables;
+        let id = t.authors.id_map.iter().find(|(_, n)| n.as_str() == name)?.0;
+        t.authors.asort_map.get(id).cloned()
+    }
+
+    pub fn author_link_for_name(&self, name: &str) -> Option<String> {
+        let t = &self.tables;
+        let id = t.authors.id_map.iter().find(|(_, n)| n.as_str() == name)?.0;
+        t.authors.link_map.get(id).cloned()
+    }
+
+    /// A book's author *names* in real link order (unlike
+    /// `field_for("authors")`, which returns them pre-joined into one
+    /// `" & "`-separated string) -- needed to look each one up in
+    /// `asort_map` while preserving the book's own author ordering.
+    pub fn author_names_for_book(&self, book_id: i32) -> Vec<String> {
+        let t = &self.tables;
+        t.authors.book_col_map.get(&book_id).map(|ids| ids.iter().filter_map(|id| t.authors.id_map.get(id).cloned()).collect()).unwrap_or_default()
+    }
+
+    /// `(author_name, link_url)` for every author with a real
+    /// (non-empty) stored link -- backs `author_links()`.
+    pub fn all_author_links(&self) -> Vec<(String, String)> {
+        let t = &self.tables;
+        t.authors.link_map.iter().filter(|(_, link)| !link.is_empty()).filter_map(|(id, link)| t.authors.id_map.get(id).map(|name| (name.clone(), link.clone()))).collect()
+    }
 }
 
 fn many_to_one(table: &crate::tables::ManyToOneTable, book_id: i32) -> Option<String> {

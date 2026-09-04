@@ -262,6 +262,24 @@ impl Cache {
         self.with_field_store(|store| store.field_for(book_id, field_name))
     }
 
+    /// Port of `author_sorts`'s/`get_link('authors', ...)`'s/
+    /// `author_links`'s own per-author data (issue #514).
+    pub fn author_sort_for_name(&self, name: &str) -> Result<Option<String>> {
+        self.with_field_store(|store| store.author_sort_for_name(name))
+    }
+
+    pub fn author_link_for_name(&self, name: &str) -> Result<Option<String>> {
+        self.with_field_store(|store| store.author_link_for_name(name))
+    }
+
+    pub fn author_names_for_book(&self, book_id: i32) -> Result<Vec<String>> {
+        self.with_field_store(|store| store.author_names_for_book(book_id))
+    }
+
+    pub fn all_author_links(&self) -> Result<Vec<(String, String)>> {
+        self.with_field_store(|store| store.all_author_links())
+    }
+
     pub fn update_memory(&mut self, _book_id: i32, _field: &str, _value: &str) {
         // Placeholder for future in-memory cache invalidation.
         // Currently, field_for hits the DB directly so no cache to clear.

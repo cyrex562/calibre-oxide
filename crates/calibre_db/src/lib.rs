@@ -18,6 +18,7 @@ pub mod errors;
 pub mod extra_files;
 pub mod field_metadata;
 pub mod fields;
+pub mod formatter_functions;
 pub mod fts;
 pub mod lazy;
 pub mod legacy;
