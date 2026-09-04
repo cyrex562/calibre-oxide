@@ -1611,8 +1611,8 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 - [ ] complete.py
 - [x] config.py
 - [x] config_base.py
-- [ ] copy_files.py
-- [ ] copy_files_test.py
+- [x] copy_files.py (issue #464 -- `calibre_utils::copy_files`: hardlink-aware recursive tree copy (`copy_tree`/`copy_files`/`rename_files`), ported as `UnixFileCopier`'s semantics used verbatim on every platform (see module doc for why). Scope decision (the issue's own open question): kept standalone, NOT wired into `calibre_db::copy_to_library.rs`'s existing ad hoc logic -- a separate refactor decision with its own migration-verification risk, out of scope for a port issue. Disclosed narrowing: `WindowsFileCopier` (pre-locks every file via `winutil` handles) not ported, no Windows-specific FFI exists in this crate. A real recursive-path bug (nested files landing directly under the dest root instead of their real subdirectory, from computing `rel` against the wrong recursion-local `src`) was caught by this port's own nested-directory test and fixed before shipping)
+- [x] copy_files_test.py (native Rust tests written instead -- see `calibre_utils::copy_files`'s own test module)
 - [ ] cpp_binding.h
 - [x] date.py
 - [x] exim.py (issue #461 -- `calibre_utils::exim`: the container-format core only (`Exporter`/`FileDest`, `Importer`/`Pos`/`FileSource`) -- a multi-part, SHA1-hash-verified, append-only archive format, including random-access reads that span a part boundary. Verified with a tiny 32-byte `part_size` forcing files to span 3+ parts, a seek-mid-file test, and a deliberate single-byte corruption test confirming digest-mismatch detection. Disclosed narrowing: upstream's `export()`/`import_data()` orchestration (calling `calibre_db::Cache::export_library`/`import_library`, GUI prefs, global config export) not ported -- neither exists yet, and no `calibre-debug --export-library` equivalent CLI exists in this crate to wire it into; same "port the real primitive, defer the caller-less glue" pattern as `calibre_utils::smtp`/`icu` this session)

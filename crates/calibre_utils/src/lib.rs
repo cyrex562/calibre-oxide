@@ -2,6 +2,7 @@ pub mod cleantext;
 pub mod config;
 mod config_tests;
 pub mod constants;
+pub mod copy_files;
 pub mod date;
 pub mod exim;
 pub mod file_type_icons;
