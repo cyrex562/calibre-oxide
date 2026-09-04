@@ -1604,8 +1604,7 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 
 - [ ] bibtex.py
 - [ ] browser.py
-- [ ] certgen.c
-- [ ] certgen.py
+- [x] certgen.c / certgen.py (issue #463 -- `calibre_utils::certgen`: real self-signed CA + server certificate generation via the pure-Rust `rcgen` crate, replacing the 460-line OpenSSL `certgen.c` binding upstream's own `certgen.py` wraps. `create_server_cert` is the one entry point (upstream's own only real end-to-end caller). Verified with real X.509 parsing + signature-chain verification via `x509-parser` (an independent implementation from `rcgen`), not just PEM-prefix string checks. Disclosed narrowing/improvement: ECDSA P-256 keys instead of RSA (a strictly better modern default, nothing in this crate needs RSA-specific compatibility); password-encrypted key export not ported (no caller needs it). **Not wired into `calibre_srv`'s HTTP listener** -- real HTTPS support is its own architecture decision (TLS integration, auto-generate-vs-operator-supplied-cert, renewal), out of scope for this port; this module is the building block a future `--https` feature would use)
 - [x] cleantext.py (`calibre_utils::cleantext`; real `clean_ascii_chars`/`clean_xml_chars`/`unescape`, entity decoding via the `htmlentity` crate)
 - [ ] cocoa.m
 - [ ] complete.py
