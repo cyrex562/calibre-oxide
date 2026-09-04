@@ -1637,7 +1637,7 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 - [x] iso8601.py
 - [ ] linux_trash.py
 - [x] localization.py (language-code half only, issue #140: `calibre_utils::localization::canonicalize_lang`/`lang_as_iso639_1`, backed by the `isolang` crate's real ISO 639 tables instead of upstream's bundled `iso639.calibre_msgpack` resource. The translation-catalog machinery -- `get_lang`, `set_translators`, UI language listing -- is out of scope, matching the issue)
-- [ ] localunzip.py
+- [x] localunzip.py (issue #469 -- `calibre_utils::localunzip`: real fallback ZIP reader for missing/damaged central directories, local-header-only scanning with resync-past-corruption, stored+raw-deflate entries, streaming/data-descriptor entries, `LocalZipFile` (read/getinfo/extract_all). Disclosed narrowings: `decode_arcname`'s chardet fallback narrowed to UTF-8-or-lossy; `safe_replace` (in-place damaged-ZIP repair) not ported, no caller needs it yet; Windows-reserved-filename check not ported. Zip-bomb guard reshaped from upstream's per-chunk decompress-call-count heuristic to a total-output-size cap, verified by a real test compressing 200MB of zeros into <1MB and confirming the cap rejects it)
 - [x] lock.py (`calibre_utils::lock`; Linux subset only -- `flock`-based `lock_file` + abstract-Unix-socket `create_single_instance_mutex`. Windows/macOS branches N/A, see the module's own doc)
 - [x] logging.py
 - [ ] matcher.c

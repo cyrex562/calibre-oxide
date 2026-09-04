@@ -56,6 +56,9 @@ tempfile = "3.24.0"
 # bindings when a real one exists (see calibre_ebooks::spell's
 # `spellbook` choice, issue #59).
 icu = { version = "1.5", features = ["compiled_data"] }
+# Used by localunzip.rs for raw-deflate (no zlib header) decompression,
+# matching upstream's `zlib.decompressobj(-15)`.
+flate2 = "1.0"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

@@ -10,6 +10,7 @@ pub mod hyphenation;
 pub mod icu;
 pub mod imghdr;
 pub mod localization;
+pub mod localunzip;
 pub mod lock;
 pub mod logging;
 pub mod lzx;
