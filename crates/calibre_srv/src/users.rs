@@ -26,14 +26,15 @@
 //!
 //! # Not yet ported
 //!
-//! `restriction`/`session_data`/`misc_data` (per-user library-access
-//! restrictions, session key-value storage, and the
-//! `allow_change_password_via_http` flag) are kept as schema columns
-//! (for forward/backward compatibility with upstream's own `userdb`
-//! files) but not exposed through any accessor yet -- nothing in this
-//! server enforces per-library restrictions or reads session data yet
-//! either, so there's nothing to wire them into. `user_data` (the
-//! bulk get/set-all-users property) also isn't ported; `add_user`/
+//! `restriction`/`misc_data` (per-user library-access restrictions and
+//! the `allow_change_password_via_http` flag) are kept as schema
+//! columns (for forward/backward compatibility with upstream's own
+//! `userdb` files) but not exposed through any accessor yet -- nothing
+//! in this server enforces per-library restrictions yet. `session_data`
+//! (issue #500, part of the #432 browser-UI epic) IS now real --
+//! [`UserManager::get_session_data`]/[`UserManager::set_session_data`],
+//! backing `calibre_srv::ajax`'s `GET`/`POST /ajax/session-data`. `user_data`
+//! (the bulk get/set-all-users property) also isn't ported; `add_user`/
 //! `remove_user`/single-user accessors cover everything
 //! `manage_users_cli.py`-equivalent tooling would need for now.
 
@@ -121,6 +122,33 @@ impl UserManager {
     /// Port of `has_user`.
     pub fn has_user(&self, username: &str) -> bool {
         self.get(username).is_some()
+    }
+
+    /// Port of `get_session_data`: the user's stored client-prefs
+    /// blob, or an empty object if the user doesn't exist or has never
+    /// saved anything (matches upstream's own "no rows -> `{}`, not an
+    /// error" behavior -- `session_data`'s own column default is
+    /// already `"{}"`, so an existing user with no real data also
+    /// falls out of this the same way).
+    pub fn get_session_data(&self, username: &str) -> serde_json::Value {
+        let conn = self.conn.lock().unwrap();
+        let raw: Option<String> = conn.query_row("SELECT session_data FROM users WHERE name=?1", [username], |row| row.get(0)).ok();
+        raw.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_else(|| serde_json::json!({}))
+    }
+
+    /// Port of `set_session_data`: overwrites the whole stored blob.
+    /// Upstream's own endpoint (`interface-data/set-session-data`)
+    /// merges `new_data` into the existing dict before calling this --
+    /// that merge is the caller's job here too (matching upstream's own
+    /// split between the endpoint doing the merge and this method just
+    /// doing the write), see `calibre_srv::ajax`'s own session-data
+    /// handler. A `username` that doesn't exist is silently a no-op
+    /// (`UPDATE` affecting zero rows is not an error), matching
+    /// upstream's own anonymous-user no-op (`if rd.username: ...`).
+    pub fn set_session_data(&self, username: &str, data: &serde_json::Value) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE users SET session_data=?1 WHERE name=?2", (data.to_string(), username))?;
+        Ok(())
     }
 
     fn validate_username_for_add(&self, username: &str) -> Option<String> {
@@ -214,6 +242,36 @@ mod tests {
         assert!(mgr.remove_user("alice"));
         assert!(!mgr.has_user("alice"));
         assert!(!mgr.remove_user("alice"));
+    }
+
+    #[test]
+    fn session_data_defaults_to_an_empty_object() {
+        let (_dir, mgr) = test_manager();
+        mgr.add_user("alice", "hunter2", false).unwrap();
+        assert_eq!(mgr.get_session_data("alice"), serde_json::json!({}));
+    }
+
+    #[test]
+    fn session_data_round_trips_through_set_and_get() {
+        let (_dir, mgr) = test_manager();
+        mgr.add_user("alice", "hunter2", false).unwrap();
+        mgr.set_session_data("alice", &serde_json::json!({"font_size": 16, "theme": "dark"})).unwrap();
+        assert_eq!(mgr.get_session_data("alice"), serde_json::json!({"font_size": 16, "theme": "dark"}));
+    }
+
+    #[test]
+    fn set_session_data_for_an_unknown_user_is_a_silent_no_op() {
+        let (_dir, mgr) = test_manager();
+        // Matches upstream's own anonymous-user no-op -- an UPDATE
+        // affecting zero rows is not an error here either.
+        mgr.set_session_data("nobody", &serde_json::json!({"x": 1})).unwrap();
+        assert_eq!(mgr.get_session_data("nobody"), serde_json::json!({}));
+    }
+
+    #[test]
+    fn get_session_data_for_an_unknown_user_is_an_empty_object() {
+        let (_dir, mgr) = test_manager();
+        assert_eq!(mgr.get_session_data("nobody"), serde_json::json!({}));
     }
 
     #[test]

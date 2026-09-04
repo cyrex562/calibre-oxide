@@ -40,6 +40,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use indexmap::IndexMap;
+use serde::Serialize;
 
 use crate::cache::Cache;
 
@@ -48,7 +49,7 @@ use crate::cache::Cache;
 /// delimiter-joined list, with separate separators for the three
 /// contexts upstream distinguishes (the in-DB cached representation,
 /// what a user types, and what's shown back to them).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 pub struct IsMultiple {
     pub cache_to_list: Option<String>,
     pub ui_to_list: Option<String>,
@@ -66,7 +67,8 @@ impl IsMultiple {
 /// `User`/`Search` exist for `add_user_category`/`add_search_category`,
 /// not ported here, but are kept as real variants so a later slice
 /// doesn't need to change this enum's shape).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum FieldKind {
     Field,
     Category,
@@ -76,7 +78,7 @@ pub enum FieldKind {
 
 /// One field's full descriptor -- port of upstream's per-key `dict`
 /// value in `FieldMetadata._tb_cats`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FieldInfo {
     /// The registry key: the bare field name for standard fields, or
     /// `#label` for custom fields (upstream's two-namespace scheme so
@@ -308,6 +310,42 @@ impl FieldMetadata {
     pub fn searchable_fields(&self) -> Vec<&str> {
         self.fields.values().filter(|f| f.kind == FieldKind::Field && !f.search_terms.is_empty()).map(|f| f.key.as_str()).collect()
     }
+
+    /// Port of `sortable_field_keys`: every field-kind entry with a
+    /// known datatype (in practice, everything except `news`, the one
+    /// `Category`-kind builtin field).
+    pub fn sortable_field_keys(&self) -> Vec<&str> {
+        self.fields.values().filter(|f| f.kind == FieldKind::Field && f.datatype.is_some()).map(|f| f.key.as_str()).collect()
+    }
+
+    /// Port of `ui_sortable_field_keys`: [`FieldMetadata::sortable_field_keys`]
+    /// minus a fixed exclusion set of fields no UI should offer as a
+    /// sort choice, each paired with its display label, plus a
+    /// synthetic `cover` entry upstream always appends by hand.
+    pub fn ui_sortable_field_keys(&self) -> Vec<(&str, &str)> {
+        const EXCLUDED: &[&str] = &["sort", "author_sort", "au_map", "series_sort", "marked", "series_index", "path", "formats", "identifiers", "uuid", "comments"];
+        // `cover` is a real, already-sortable builtin field (label
+        // "Cover") -- upstream's own `ans['cover'] = _('Has cover')`
+        // overwrites it in a plain dict (same key, last write wins).
+        // Filtered out here and re-appended below to get the same
+        // one-entry-not-two result from a `Vec`.
+        let mut out: Vec<(&str, &str)> = self
+            .sortable_field_keys()
+            .into_iter()
+            .filter(|k| !EXCLUDED.contains(k) && *k != "cover")
+            .filter_map(|k| self.get(k).and_then(|f| f.name.as_deref()).map(|name| (k, name)))
+            .collect();
+        out.push(("cover", "Has cover"));
+        out
+    }
+
+    /// Port of `all_metadata`: the entire registry, keyed by field
+    /// key, as one JSON object -- upstream's own `all_metadata` is
+    /// literally `{k: self._tb_cats[k] for k in self._tb_cats}`.
+    pub fn all_metadata(&self) -> serde_json::Value {
+        let map: serde_json::Map<String, serde_json::Value> = self.fields.iter().map(|(k, v)| (k.clone(), serde_json::to_value(v).unwrap_or(serde_json::Value::Null))).collect();
+        serde_json::Value::Object(map)
+    }
 }
 
 #[cfg(test)]
@@ -404,5 +442,52 @@ mod tests {
         assert_eq!(fm.search_term_to_field_key("author"), "authors");
         assert_eq!(fm.search_term_to_field_key("isbn"), "identifiers");
         assert_eq!(fm.search_term_to_field_key("nonexistent_term"), "nonexistent_term");
+    }
+
+    #[test]
+    fn sortable_field_keys_excludes_only_the_datatype_less_news_field() {
+        let fm = FieldMetadata::builtin();
+        let sortable = fm.sortable_field_keys();
+        assert!(sortable.contains(&"title"));
+        assert!(sortable.contains(&"authors"));
+        assert!(!sortable.contains(&"news"), "news has no datatype and shouldn't be sortable");
+    }
+
+    #[test]
+    fn ui_sortable_field_keys_drops_the_excluded_set_and_adds_a_synthetic_cover_entry() {
+        let fm = FieldMetadata::builtin();
+        let ui = fm.ui_sortable_field_keys();
+        let keys: Vec<&str> = ui.iter().map(|(k, _)| *k).collect();
+        assert!(keys.contains(&"title"));
+        assert!(!keys.contains(&"author_sort"), "author_sort is in the exclusion set");
+        assert!(!keys.contains(&"uuid"), "uuid is in the exclusion set");
+        assert_eq!(keys.iter().filter(|k| **k == "cover").count(), 1, "cover should appear exactly once, not once from the real field plus once synthetic");
+        let cover = ui.iter().find(|(k, _)| *k == "cover").expect("a synthetic cover entry should be appended");
+        assert_eq!(cover.1, "Has cover");
+    }
+
+    #[test]
+    fn all_metadata_is_a_real_json_object_keyed_by_field_key() {
+        let fm = FieldMetadata::builtin();
+        let json = fm.all_metadata();
+        let obj = json.as_object().unwrap();
+        // `keys()` (unlike `all_field_keys()`) iterates the WHOLE
+        // registry regardless of kind, matching `all_metadata`'s own
+        // upstream semantics (dumps every `_tb_cats` entry, including
+        // `news`, the one Category-kind builtin field).
+        assert_eq!(obj.len(), fm.keys().count());
+        assert!(obj.contains_key("news"));
+        assert_eq!(obj["title"]["datatype"], "text");
+        assert_eq!(obj["authors"]["is_category"], true);
+        assert_eq!(obj["news"]["kind"], "category");
+    }
+
+    #[test]
+    fn field_info_serializes_a_real_is_multiple_separator_dict() {
+        let fm = FieldMetadata::builtin();
+        let json = fm.all_metadata();
+        let seps = &json["authors"]["is_multiple"];
+        assert_eq!(seps["list_to_ui"], " & ");
+        assert!(json["title"]["is_multiple"].is_null(), "title has no is_multiple separators");
     }
 }

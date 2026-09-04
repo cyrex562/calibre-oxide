@@ -1098,6 +1098,28 @@ pub fn search(cache: &Cache, query: &str) -> anyhow::Result<Vec<i32>> {
     Ok(v)
 }
 
+/// Port of `books_in_virtual_library` (issue #500): resolves `vl`
+/// (empty = no restriction) through [`Cache::virtual_library_lookup`]
+/// and intersects it with `search_restriction` (also optional) --
+/// either, both, or neither may be given, matching upstream's own
+/// `if vl: ... if search_restriction: ...` branching. With neither,
+/// every book id is returned (same as [`search`] on an empty query).
+pub fn books_in_virtual_library(cache: &Cache, vl: &str, search_restriction: Option<&str>) -> anyhow::Result<Vec<i32>> {
+    let vl_query = if vl.is_empty() { None } else { cache.virtual_library_lookup(vl)? };
+    match (vl_query.as_deref(), search_restriction) {
+        (None, None) => search(cache, ""),
+        (Some(vq), None) => search(cache, vq),
+        (None, Some(sr)) => search(cache, sr),
+        (Some(vq), Some(sr)) => {
+            let a: HashSet<i32> = search(cache, vq)?.into_iter().collect();
+            let b: HashSet<i32> = search(cache, sr)?.into_iter().collect();
+            let mut v: Vec<i32> = a.intersection(&b).copied().collect();
+            v.sort_unstable();
+            Ok(v)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1516,6 +1538,50 @@ mod tests {
         assert_eq!(search(&cache, "search:\"scifi books\"").unwrap(), vec![1]);
         // Case-insensitive name match, matching saved_search_lookup.
         assert_eq!(search(&cache, "search:\"SCIFI BOOKS\"").unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn books_in_virtual_library_with_neither_vl_nor_restriction_returns_every_book() {
+        let (_dir, cache) = make_cache();
+        insert_book(&cache, "Foundation", &["Isaac Asimov"], &["scifi"]);
+        insert_book(&cache, "Emma", &["Jane Austen"], &["classic"]);
+        assert_eq!(books_in_virtual_library(&cache, "", None).unwrap(), vec![1, 2]);
+    }
+
+    #[test]
+    fn books_in_virtual_library_resolves_the_named_vl_alone() {
+        let (_dir, cache) = make_cache();
+        insert_book(&cache, "Foundation", &["Isaac Asimov"], &["scifi"]);
+        insert_book(&cache, "Emma", &["Jane Austen"], &["classic"]);
+        cache.virtual_library_add("Scifi Only", "tag:scifi").unwrap();
+        assert_eq!(books_in_virtual_library(&cache, "Scifi Only", None).unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn books_in_virtual_library_intersects_with_a_search_restriction() {
+        let (_dir, cache) = make_cache();
+        insert_book(&cache, "Foundation", &["Isaac Asimov"], &["scifi"]);
+        insert_book(&cache, "Dune", &["Frank Herbert"], &["scifi", "classic"]);
+        insert_book(&cache, "Emma", &["Jane Austen"], &["classic"]);
+        cache.virtual_library_add("Scifi Only", "tag:scifi").unwrap();
+        // vl narrows to {1,2}, the restriction narrows to authors
+        // whose name contains "herbert" -> {2}; intersection = {2}.
+        assert_eq!(books_in_virtual_library(&cache, "Scifi Only", Some("author:herbert")).unwrap(), vec![2]);
+    }
+
+    #[test]
+    fn books_in_virtual_library_with_no_vl_but_a_restriction_is_a_plain_search() {
+        let (_dir, cache) = make_cache();
+        insert_book(&cache, "Foundation", &["Isaac Asimov"], &["scifi"]);
+        insert_book(&cache, "Emma", &["Jane Austen"], &["classic"]);
+        assert_eq!(books_in_virtual_library(&cache, "", Some("tag:classic")).unwrap(), vec![2]);
+    }
+
+    #[test]
+    fn books_in_virtual_library_unknown_name_behaves_like_no_vl() {
+        let (_dir, cache) = make_cache();
+        insert_book(&cache, "Foundation", &["Isaac Asimov"], &["scifi"]);
+        assert_eq!(books_in_virtual_library(&cache, "nonexistent", None).unwrap(), vec![1]);
     }
 
     #[test]
