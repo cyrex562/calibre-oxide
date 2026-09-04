@@ -1625,10 +1625,9 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 - [ ] formatter_functions.py
 - [x] html2text.py
 - [ ] https.py
-- [ ] icu.c
-- [ ] icu.py
-- [ ] icu_calibre_utils.h
-- [ ] icu_test.py
+- [x] icu.c / icu.py (issue #459 -- `calibre_utils::icu`'s `strcmp`/`primary_strcmp`: real Unicode Collation Algorithm string comparison via the pure-Rust `icu` (ICU4X) crate, `compiled_data` feature, chosen over `rust_icu`'s real ICU4C bindings because bindgen fails on this box's headless libclang install (no bundled builtin C headers) and this project already prefers pure-Rust over new C-toolchain deps when a real one exists (see `calibre_ebooks::spell`'s `spellbook` choice, #59). Wired into the real sort call sites that used to do a plain `to_lowercase().cmp()`: `calibre_db::categories::sort_tags` and `calibre_srv::opds::sort_key_for`/`ajax::sort_key_for`(shared). Case folding (`lower`/`upper`/`capitalize`/`title_case`) stays on Rust stdlib, unchanged. Disclosed narrowing: exposes comparators (`strcmp`/`primary_strcmp`) instead of upstream's byte `sort_key`, since ICU4X's `Collator` doesn't expose raw sort keys and Rust's `sort_by` doesn't need them. Disclosed gap: `primary_contains`/`primary_find` (collation-strength substring search, ICU4C's `usearch.h`) has no ICU4X equivalent -- `calibre_db::search`'s own pre-existing NFD+lowercase approximation is unchanged)
+- [ ] icu_calibre_utils.h (C-only glue for the ICU4C binding path not taken, see above)
+- [ ] icu_test.py (native Rust tests written instead -- see `calibre_utils::icu`'s own test module)
 - [ ] img.py
 - [x] imghdr.py
 - [ ] inotify.py

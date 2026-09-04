@@ -45,6 +45,17 @@ htmlentity = "1.3.2"
 # Used unconditionally by tdir_in_cache.rs's real tdir_in_cache(), not
 # just tests -- see that module's own doc.
 tempfile = "3.24.0"
+# Real Unicode Collation Algorithm implementation for icu.rs's
+# sort_key/strcmp/primary_* -- chosen over `rust_icu` (real ICU4C
+# bindings, matching upstream's own choice) because it's pure Rust:
+# no system libicu-dev + a working libclang bindgen toolchain needed
+# (this box's libclang is headless, missing its bundled builtin
+# headers -- `stddef.h` isn't found -- so `rust_icu`'s bindgen build
+# fails here; see issue #459's own PR discussion). Also consistent
+# with this project's established preference for pure-Rust over C
+# bindings when a real one exists (see calibre_ebooks::spell's
+# `spellbook` choice, issue #59).
+icu = { version = "1.5", features = ["compiled_data"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

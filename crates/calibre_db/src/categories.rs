@@ -41,6 +41,7 @@
 
 use crate::cache::Cache;
 use anyhow::{bail, Result};
+use calibre_utils::icu::strcmp;
 use indexmap::IndexMap;
 use rusqlite::OptionalExtension;
 use std::collections::{HashMap, HashSet};
@@ -144,20 +145,16 @@ fn category_from_link_table(
     Ok(tags)
 }
 
+/// Name tiebreak/primary sort uses real locale-aware collation
+/// (issue #459) rather than a plain `to_lowercase().cmp()`, which
+/// would (among other real-world mis-orderings) sort every accented
+/// letter after "z" and make same-spelling-different-case names
+/// compare equal instead of case-ordering them.
 fn sort_tags(tags: &mut [Tag], sort: &str) {
     match sort {
-        "popularity" => tags.sort_by(|a, b| {
-            b.count
-                .cmp(&a.count)
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        }),
-        "rating" => tags.sort_by(|a, b| {
-            b.avg_rating
-                .partial_cmp(&a.avg_rating)
-                .unwrap()
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        }),
-        _ => tags.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+        "popularity" => tags.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| strcmp(&a.name, &b.name))),
+        "rating" => tags.sort_by(|a, b| b.avg_rating.partial_cmp(&a.avg_rating).unwrap().then_with(|| strcmp(&a.name, &b.name))),
+        _ => tags.sort_by(|a, b| strcmp(&a.name, &b.name)),
     }
 }
 
