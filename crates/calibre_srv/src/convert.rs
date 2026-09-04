@@ -153,6 +153,28 @@ pub struct StartConversionBody {
 /// `POST /conversion/start/{book_id}`. Port of `start_conversion`/
 /// `queue_job`.
 pub async fn start_conversion(State(state): State<AppState>, AxumPath(book_id): AxumPath<i32>, Json(body): Json<StartConversionBody>) -> Result<Json<Value>, ServerError> {
+    // `input_fmt`/`output_fmt` end up in `tdir.join(format!("input.{..}"))`/
+    // `tdir.join(format!("output.{..}"))` below -- both must be validated
+    // against the real, closed set of formats this crate can actually
+    // convert *before* either touches a path. Without this, an
+    // `output_fmt` containing `../` (or an absolute path) would let a
+    // request write the converted file anywhere the server process can
+    // write, since `Plumber`'s own output dispatch does no path
+    // validation of its own. The `input_fmt` side happens to already be
+    // gated by the `row.get(format!("fmt_{input_fmt_lower}"))` lookup
+    // below (a malicious value can't match a real `fmt_<ext>` key), but
+    // this check covers it too, defense in depth, and matches real
+    // conversion semantics (an unconvertible format is a real 400, not
+    // just an unsafe one).
+    let input_fmt_upper = body.input_fmt.to_uppercase();
+    let output_fmt_upper = body.output_fmt.to_uppercase();
+    if !READABLE_FORMATS.contains(&input_fmt_upper.as_str()) {
+        return Err(ServerError::BadRequest(format!("Unsupported input format: {}", body.input_fmt)));
+    }
+    if !WRITABLE_FORMATS.contains(&output_fmt_upper.as_str()) {
+        return Err(ServerError::BadRequest(format!("Unsupported output format: {}", body.output_fmt)));
+    }
+
     let row = fetch_book_row(&state, book_id).await?;
     let input_fmt_lower = body.input_fmt.to_lowercase();
     let path_str = row.get(format!("fmt_{input_fmt_lower}")).and_then(|v| v.as_str()).ok_or_else(|| ServerError::NotFound(format!("No {input_fmt_lower} format for the book {book_id}")))?;
@@ -388,6 +410,27 @@ mod tests {
         let (_dir, router, book_id) = test_app();
         let (status, _) = post_json(&router, &format!("/conversion/start/{book_id}"), serde_json::json!({"input_fmt": "pdf", "output_fmt": "txt"})).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_path_traversal_output_fmt_is_rejected_before_touching_any_path() {
+        let (_dir, router, book_id) = test_app();
+        let (status, _) = post_json(&router, &format!("/conversion/start/{book_id}"), serde_json::json!({"input_fmt": "epub", "output_fmt": "../../../../tmp/evil"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_path_traversal_input_fmt_is_rejected_before_touching_any_path() {
+        let (_dir, router, book_id) = test_app();
+        let (status, _) = post_json(&router, &format!("/conversion/start/{book_id}"), serde_json::json!({"input_fmt": "../../../../etc/passwd", "output_fmt": "txt"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn an_unconvertible_format_name_is_a_real_400_not_a_500() {
+        let (_dir, router, book_id) = test_app();
+        let (status, _) = post_json(&router, &format!("/conversion/start/{book_id}"), serde_json::json!({"input_fmt": "epub", "output_fmt": "exe"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
