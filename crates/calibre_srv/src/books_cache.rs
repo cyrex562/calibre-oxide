@@ -135,6 +135,15 @@ impl BookCache {
         Self::new(calibre_utils::constants::cache_dir().join("srvb"))
     }
 
+    /// A throwaway cache backed by a real, process-lifetime temp
+    /// directory -- for tests (mirrors `ProfileStore::new_in_memory`'s
+    /// role; there's no true in-memory option here since this cache is
+    /// inherently filesystem-based).
+    pub fn open_temp() -> Self {
+        let base = tempfile::tempdir().expect("failed to create a temp dir for BookCache::open_temp").keep();
+        Self::new(base).expect("failed to initialize a temp BookCache")
+    }
+
     pub fn staging_dir(&self) -> PathBuf {
         self.base.join("s")
     }
