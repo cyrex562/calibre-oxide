@@ -9,6 +9,7 @@ name = "calibre_srv"
 path = "src/main.rs"
 
 [dependencies]
+calibre_conversion = { path = "../calibre_conversion" }
 calibre_db = { path = "../calibre_db" }
 calibre_ebooks = { path = "../calibre_ebooks" }
 calibre_utils = { path = "../calibre_utils" }

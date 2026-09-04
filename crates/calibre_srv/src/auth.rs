@@ -204,7 +204,7 @@ mod tests {
         } else {
             None
         };
-        (dir, AppState { libraries: None, cache: Arc::new(cache), opts: Arc::new(ServerOptions::default()), auth, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()), book_cache: Arc::new(crate::books_cache::BookCache::open_temp()), jobs: Arc::new(crate::jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))), render_jobs: Arc::new(crate::render_endpoints::RenderJobRegistry::new()) })
+        (dir, AppState { libraries: None, cache: Arc::new(cache), opts: Arc::new(ServerOptions::default()), auth, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()), book_cache: Arc::new(crate::books_cache::BookCache::open_temp()), jobs: Arc::new(crate::jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))), render_jobs: Arc::new(crate::render_endpoints::RenderJobRegistry::new()), conversion_jobs: Arc::new(crate::convert::ConversionJobRegistry::new()) })
     }
 
     #[tokio::test]

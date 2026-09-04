@@ -831,6 +831,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.21.7",
+ "calibre_conversion",
  "calibre_db",
  "calibre_ebooks",
  "calibre_utils",

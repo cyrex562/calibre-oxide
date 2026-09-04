@@ -63,12 +63,14 @@
 //! - Per-connection close-code/ping-interval/max-message-size
 //!   fine-tuning upstream's `WebSocketConnection` does -- `axum`'s own
 //!   defaults are used as-is.
-//! - `FormatsAdded`/`FormatsRemoved`/`SavedSearchesChanged` events
-//!   have no real trigger yet (`cdb::set_fields`'s `added_formats`/
-//!   `removed_formats` handling could emit `FormatsAdded`/
-//!   `FormatsRemoved`, but doesn't yet -- only `BooksAdded`/
-//!   `BooksDeleted`/`MetadataChanged` are wired, matching what
-//!   `cdb.rs` currently has real endpoints for).
+//! - `FormatsRemoved`/`SavedSearchesChanged` events have no real
+//!   trigger yet (`cdb::set_fields`'s `removed_formats` handling could
+//!   emit `FormatsRemoved`, but doesn't yet). `FormatsAdded` DOES now
+//!   have a real trigger -- `convert::conversion_status` (issue #429)
+//!   publishes it when a server-side conversion job finishes and adds
+//!   the new format to the book; `cdb::set_fields`'s own
+//!   `added_formats` handling still doesn't (a real, separate,
+//!   remaining gap).
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -186,6 +188,7 @@ mod tests {
             book_cache: std::sync::Arc::new(crate::books_cache::BookCache::open_temp()),
             jobs: std::sync::Arc::new(crate::jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
             render_jobs: std::sync::Arc::new(crate::render_endpoints::RenderJobRegistry::new()),
+            conversion_jobs: std::sync::Arc::new(crate::convert::ConversionJobRegistry::new()),
         }
     }
 
