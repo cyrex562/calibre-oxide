@@ -3,6 +3,7 @@ pub mod config;
 mod config_tests;
 pub mod constants;
 pub mod date;
+pub mod exim;
 pub mod file_type_icons;
 pub mod filenames;
 pub mod html2text;

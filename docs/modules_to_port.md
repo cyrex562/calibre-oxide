@@ -1615,7 +1615,7 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 - [ ] copy_files_test.py
 - [ ] cpp_binding.h
 - [x] date.py
-- [ ] exim.py
+- [x] exim.py (issue #461 -- `calibre_utils::exim`: the container-format core only (`Exporter`/`FileDest`, `Importer`/`Pos`/`FileSource`) -- a multi-part, SHA1-hash-verified, append-only archive format, including random-access reads that span a part boundary. Verified with a tiny 32-byte `part_size` forcing files to span 3+ parts, a seek-mid-file test, and a deliberate single-byte corruption test confirming digest-mismatch detection. Disclosed narrowing: upstream's `export()`/`import_data()` orchestration (calling `calibre_db::Cache::export_library`/`import_library`, GUI prefs, global config export) not ported -- neither exists yet, and no `calibre-debug --export-library` equivalent CLI exists in this crate to wire it into; same "port the real primitive, defer the caller-less glue" pattern as `calibre_utils::smtp`/`icu` this session)
 - [ ] ffml_processor.py
 - [ ] ffmpeg.c
 - [x] filenames.py
