@@ -308,7 +308,7 @@ either -- this pass wasn't exhaustive.
 - [x] azw4_input.py (Wrapper)
 - [x] chm_input.py (Regex/Placeholder)
 - [x] comic_input.py
-- [x] djvu_input.py (Placeholder)
+- [x] djvu_input.py (issue #129: wired for real -- extracts the DjVu file's OCR text via `djvu::file::DjvuFile::text()`, HTML-izes it via `txt::processor::convert_basic` (same as the plain-text pipeline), then feeds the result through the real `HTMLInput` to build the OEB, matching upstream's own 4-step `convert`. Errors for a text-less/pure-page-scan file, matching upstream's own `ValueError`. Disclosed narrowing: real upstream's own "set metadata from file" step is a practical no-op for DjVu even in real calibre (no registered `metadata/djvu.py` reader plugin) -- this port still sets a real filename-derived title after the `HTMLInput` call purely to replace `HTMLInput::convert`'s own unrelated hardcoded placeholder title, a separate pre-existing gap in that file, not fixed here. No longer the "DJVU Content Not Supported Yet" placeholder page)
 - [x] docx_input.py
 - [x] docx_output.py (Stub)
 - [x] epub_input.py
