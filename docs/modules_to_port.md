@@ -315,7 +315,7 @@ either -- this pass wasn't exhaustive.
 - [x] epub_output.py
 - [x] fb2_input.py
 - [x] fb2_output.py (issue #457: `output::fb2_output::FB2Output::convert` was previously an unwired, ad-hoc regex-based converter separate from the real `fb2::fb2ml::Fb2Mlizer` port -- a "marked done but silently wrong" gap of the same class #201 flagged for `calibre_db`. Now rewired to call `Fb2Mlizer::extract_content` for real, matching `rtf_output.rs`'s own #50 rewiring pattern (real `TagStylizer`, real `DefaultImageConverter`). Also found and fixed that `conversion::plumber.rs` never actually dispatched `.fb2` output at all -- added the missing `output_ext == "fb2"` branch alongside `"rtf"`'s own. Disclosed narrowing shared with every other output plugin in this crate: `SVGRasterizer`/`linearize_jacket` transforms aren't wired at the output-plugin level anywhere yet, not new to this fix)
-- [x] html_input.py
+- [x] html_input.py (issue #536 fixed a real bug: `HTMLInput::convert` hardcoded the book title to the unrelated literal `"Converted Log"` regardless of the real HTML's own `<title>` -- now uses the root file's own title, which `html::input::get_filelist`'s `HtmlFile::title` already extracts (falling back to the file's stem, matching real upstream's own fallback chain narrowed to just this piece, not a separate filename-metadata-pattern parser). Real, still-open gap, NOT fixed here (separate, larger piece of work): the file's own inline `TODO` for real link rewriting between crawled pages -- files are copied as-is, so relative links between pages can still break)
 - [x] html_output.py
 - [x] htmlz_input.py
 - [x] htmlz_output.py

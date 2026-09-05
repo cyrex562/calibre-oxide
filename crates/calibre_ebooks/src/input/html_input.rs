@@ -75,13 +75,17 @@ impl HTMLInput {
         // A robust implementation would parse HTML, find links, resolve to `path`, lookup `href` in map, and rewrite.
         // Leaving this as TODO for iterative refinement.
 
-        // 3. Metadata (Minimal)
-        use crate::oeb::metadata::Item as MetaItem;
-        book.metadata.items.push(MetaItem {
-            term: "dc:title".to_string(),
-            value: "Converted Log".to_string(),
-            attrib: Default::default(),
-        });
+        // 3. Metadata (issue #536): the real book title, from the root
+        // file's own `<title>` (`get_filelist`'s `HtmlFile::title`
+        // already extracts it, falling back to the file's stem when
+        // there's no `<title>` tag -- see that struct's own doc).
+        // Real upstream's own title chain is `metadata_from_filename`
+        // updated by `get_metadata`'s real HTML-derived value,
+        // falling back to "Unknown" -- narrowed here to just the
+        // per-file `<title>`/stem `get_filelist` already computes,
+        // not a separate filename-pattern parser.
+        let title = file_list.first().map(|f| f.title.clone()).filter(|t| !t.is_empty()).unwrap_or_else(|| "Unknown".to_string());
+        book.metadata.add("title", &title);
 
         println!(
             "Created OEBBook with {} manifest items.",
