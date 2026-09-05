@@ -314,7 +314,7 @@ either -- this pass wasn't exhaustive.
 - [x] epub_input.py
 - [x] epub_output.py
 - [x] fb2_input.py
-- [x] fb2_output.py
+- [x] fb2_output.py (issue #457: `output::fb2_output::FB2Output::convert` was previously an unwired, ad-hoc regex-based converter separate from the real `fb2::fb2ml::Fb2Mlizer` port -- a "marked done but silently wrong" gap of the same class #201 flagged for `calibre_db`. Now rewired to call `Fb2Mlizer::extract_content` for real, matching `rtf_output.rs`'s own #50 rewiring pattern (real `TagStylizer`, real `DefaultImageConverter`). Also found and fixed that `conversion::plumber.rs` never actually dispatched `.fb2` output at all -- added the missing `output_ext == "fb2"` branch alongside `"rtf"`'s own. Disclosed narrowing shared with every other output plugin in this crate: `SVGRasterizer`/`linearize_jacket` transforms aren't wired at the output-plugin level anywhere yet, not new to this fix)
 - [x] html_input.py
 - [x] html_output.py
 - [x] htmlz_input.py

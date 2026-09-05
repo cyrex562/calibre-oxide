@@ -243,6 +243,15 @@ impl Plumber {
             }
             let output_plugin = RTFOutput::new();
             output_plugin.convert(&book, &self.output_path)?;
+        } else if output_ext == "fb2" {
+            use crate::output::fb2_output::FB2Output;
+            if let Some(parent) = self.output_path.parent() {
+                if !parent.exists() {
+                    fs::create_dir_all(parent)?;
+                }
+            }
+            let output_plugin = FB2Output::new();
+            output_plugin.convert(&book, &self.output_path)?;
         } else if output_ext == "pdf" {
             use crate::output::pdf_output::PDFOutput;
             if let Some(parent) = self.output_path.parent() {
