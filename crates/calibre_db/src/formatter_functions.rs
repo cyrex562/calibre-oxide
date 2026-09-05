@@ -997,7 +997,7 @@ mod tests {
         let f = CacheFunctions::new(&cache, id);
         assert_eq!(f.call("human_readable", &["1536".to_string()]).unwrap(), "1.5 KB");
         assert_eq!(f.call("today", &[]).unwrap().len() > 0, true);
-        assert_eq!(f.call("is_dark_mode", &[]).unwrap(), "", "no GUI exists in this port");
+        assert!(f.call("is_dark_mode", &[]).is_err(), "no GUI exists in this port -- real upstream raises only_in_gui_error here, not a silent empty string");
     }
 
     #[test]
