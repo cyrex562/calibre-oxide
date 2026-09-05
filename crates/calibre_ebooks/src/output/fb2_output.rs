@@ -1,7 +1,33 @@
+//! Port of `calibre.ebooks.conversion.plugins.fb2_output.FB2Output`'s
+//! call site (issue #457).
+//!
+//! Rewired to drive the real [`Fb2Mlizer`] port instead of its own
+//! crude regex-based HTML-to-FB2 substitution (`<img>`->`<image>`,
+//! `<br>`->`<empty-line/>`, `<div>`->`<p>` over raw strings) -- the
+//! same rewiring pattern already established for `output::rtf_output`
+//! (issue #50): real markup comes from walking the XHTML tree with a
+//! [`TagStylizer`], images are converted/embedded for real via
+//! [`DefaultImageConverter`], and metadata is read directly from
+//! `book.metadata` inside `Fb2Mlizer::extract_content` itself.
+//!
+//! `date`/`uuid_fallback` are synthesized here (real upstream reads
+//! the system clock and generates a UUID at the same call site) --
+//! `Fb2Mlizer::extract_content` takes them as parameters instead of
+//! reading the clock itself specifically so its own tests can pass
+//! fixed values for reproducibility; this is the one real call site
+//! that needs a genuine, non-deterministic value.
+//!
+//! Disclosed narrowing, matching every other output plugin in this
+//! crate (e.g. `rtf_output`): upstream's own `FB2Output.convert` also
+//! runs `SVGRasterizer`/`linearize_jacket` transforms on the OEB book
+//! before calling `FB2MLizer.extract_content` -- neither is wired at
+//! the output-plugin level anywhere in this crate yet, a pre-existing
+//! gap shared by every other output plugin, not new to this fix.
+
+use crate::fb2::fb2ml::{DefaultImageConverter, Fb2Mlizer, Fb2Options};
 use crate::oeb::book::OEBBook;
+use crate::oeb::stylizer::TagStylizer;
 use anyhow::{Context, Result};
-use base64::Engine;
-use html_escape::encode_text;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -13,166 +39,94 @@ impl FB2Output {
         FB2Output
     }
 
-    pub fn convert(&self, book: &mut OEBBook, output_path: &Path) -> Result<()> {
+    pub fn convert(&self, book: &OEBBook, output_path: &Path) -> Result<()> {
+        let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let uuid_fallback = uuid::Uuid::new_v4().to_string();
+
+        let mut mlizer = Fb2Mlizer::new();
+        let fb2 = mlizer.extract_content(book, &Fb2Options::default(), &TagStylizer, &DefaultImageConverter, &date, &uuid_fallback);
+
         let mut file = File::create(output_path).context("Failed to create output FB2 file")?;
-
-        writeln!(file, "<?xml version=\"1.0\" encoding=\"utf-8\"?>")?;
-        writeln!(file, "<FictionBook xmlns=\"http://www.gribuser.ru/xml/fictionbook/2.0\" xmlns:l=\"http://www.w3.org/1999/xlink\">")?;
-
-        // 1. Description (Metadata)
-        writeln!(file, "  <description>")?;
-        writeln!(file, "    <title-info>")?;
-
-        // Title
-        let title = book
-            .metadata
-            .items
-            .iter()
-            .find(|i| i.term == "title")
-            .map(|i| i.value.clone())
-            .unwrap_or_else(|| "Unknown".to_string());
-        writeln!(
-            file,
-            "      <book-title>{}</book-title>",
-            encode_text(&title)
-        )?;
-
-        // Language
-        let lang = book
-            .metadata
-            .items
-            .iter()
-            .find(|i| i.term == "language")
-            .map(|i| i.value.clone())
-            .unwrap_or_else(|| "en".to_string());
-        writeln!(file, "      <lang>{}</lang>", encode_text(&lang))?;
-
-        // Author (first one found)
-        if let Some(creator) = book.metadata.items.iter().find(|i| i.term == "creator") {
-            writeln!(
-                file,
-                "      <author><first-name>{}</first-name></author>",
-                encode_text(&creator.value)
-            )?;
-        }
-
-        writeln!(file, "    </title-info>")?;
-        writeln!(file, "  </description>")?;
-
-        // 2. Body
-        writeln!(file, "  <body>")?;
-
-        // Iterate spine
-        for itemref in &book.spine.items {
-            if let Some(item) = book.manifest.items.get(&itemref.idref) {
-                if let Ok(data) = book.container.read(&item.href) {
-                    let html_content = String::from_utf8_lossy(&data);
-
-                    // Simple HTML to FB2 conversion
-                    // Ideally we parse the HTML structure.
-                    // For this iteration, we'll wrap paragraphs in <p> assuming simple text,
-                    // or strip tags for safety if complex.
-                    // A robust solution needs an HTML parser.
-                    // Here we will use a quick hack: Remove XML header if present, and try to extract body content.
-
-                    let content = self.extract_body_content(&html_content);
-                    // Just wrap raw content in a section for safety?
-                    // FB2 requires Valid XML inside. Inserting HTML tags might break it if they aren't FB2 tags.
-                    // FB2 tags: section, title, p, image, empty-line.
-                    // If we dump HTML <p> it works. <div> might not.
-                    // Let's assume the helper cleans it or we sanitize.
-                    // For now: Wrap in section. Replace <img> with <image>.
-
-                    writeln!(file, "    <section>")?;
-                    let fb2_markup = self.convert_html_to_fb2(&content);
-                    writeln!(file, "{}", fb2_markup)?;
-                    writeln!(file, "    </section>")?;
-                }
-            }
-        }
-
-        writeln!(file, "  </body>")?;
-
-        // 3. Binaries
-        for item in book.manifest.items.values() {
-            // Check if image
-            if item.media_type.starts_with("image/") {
-                if let Ok(data) = book.container.read(&item.href) {
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-                    // ID should match what's used in <image l:href="#...">
-                    // In convert_html_to_fb2, we need to ensure we use the same ID.
-                    // Usually item.id or item.href (cleaned).
-                    // Let's use item.href as ID (basename).
-                    let id = Path::new(&item.href).file_name().unwrap().to_string_lossy();
-
-                    writeln!(
-                        file,
-                        "  <binary id=\"{}\" content-type=\"{}\">{}</binary>",
-                        encode_text(&id),
-                        item.media_type,
-                        b64
-                    )?;
-                }
-            }
-        }
-
-        writeln!(file, "</FictionBook>")?;
+        file.write_all(fb2.as_bytes()).context("Failed to write FB2 file")?;
         Ok(())
     }
+}
 
-    fn extract_body_content(&self, html: &str) -> String {
-        // Very naive extraction: find <body>...</body>
-        if let Some(start) = html.find("<body") {
-            if let Some(open_end) = html[start..].find('>') {
-                let body_start = start + open_end + 1;
-                if let Some(end) = html[body_start..].find("</body>") {
-                    return html[body_start..body_start + end].to_string();
-                }
-            }
-        }
-        html.to_string() // Fallback: return all
+impl Default for FB2Output {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::oeb::container::DirContainer;
+
+    fn png_bytes(w: u32, h: u32) -> Vec<u8> {
+        let mut buf = Vec::new();
+        image::DynamicImage::new_rgb8(w, h).write_to(&mut std::io::Cursor::new(&mut buf), image::ImageOutputFormat::Png).unwrap();
+        buf
     }
 
-    fn convert_html_to_fb2(&self, html: &str) -> String {
-        // Basic replacements
-        // 1. <img> to <image>
-        // <img src="foo.jpg" /> -> <image l:href="#foo.jpg"/>
-        // Valid for simple cases.
-        // Also remove unsupported tags?
-        // FB2 parser is strict.
-        // For this batch, implementing basic <img> support.
+    #[test]
+    fn convert_drives_the_real_fb2mlizer_with_real_metadata_and_markup() {
+        let tmp_source = tempfile::tempdir().unwrap();
+        let source_path = tmp_source.path();
+        std::fs::write(source_path.join("ch1.html"), r#"<html xmlns="http://www.w3.org/1999/xhtml"><body><h1>Title</h1><p>Text</p></body></html>"#).unwrap();
 
-        // Regex for img
-        // regex crate is available
-        use regex::Regex;
-        // lazy_static?
-        // Just compile for now.
+        let container = Box::new(DirContainer::new(source_path));
+        let mut book = OEBBook::new(container);
+        book.manifest.add("ch1", "ch1.html", "application/xhtml+xml");
+        book.spine.add("ch1", true);
+        book.metadata.add("title", "FB2 Test");
+        book.metadata.add("creator", "Author Name");
 
-        let img_re = Regex::new(r#"<img\s+[^>]*src="([^"]+)"[^>]*>"#).unwrap();
-        // Replace with <image l:href="#$1"/>
-        // Note: $1 must be just filename if we used filenames in binaries.
-        // If src="images/foo.jpg", binary id should handle that.
-        // In process_binary loop above, I used file_name().
+        let tmp_out = tempfile::tempdir().unwrap();
+        let output_path = tmp_out.path().join("book.fb2");
 
-        let result = img_re.replace_all(html, |caps: &regex::Captures| {
-            let src = &caps[1];
-            let name = Path::new(src)
-                .file_name()
-                .unwrap_or(std::ffi::OsStr::new("unknown"))
-                .to_string_lossy();
-            format!("<image l:href=\"#{}\"/>", name)
-        });
+        FB2Output::new().convert(&book, &output_path).expect("conversion failed");
 
-        // Replace <br> with <empty-line/>
-        let br_re = Regex::new(r"<br\s*/?>").unwrap();
-        let result = br_re.replace_all(&result, "<empty-line/>");
+        let content = std::fs::read_to_string(&output_path).unwrap();
+        assert!(content.contains("<book-title>FB2 Test</book-title>"), "{content}");
+        // Real Fb2Mlizer splits a "First Last" creator into separate
+        // first-name/last-name elements, unlike the old ad-hoc
+        // converter's single <first-name>Author Name</first-name>.
+        assert!(content.contains("<first-name>Author</first-name><last-name>Name</last-name>"), "{content}");
+        assert!(content.contains("<section"), "{content}");
+        assert!(content.contains("<p>Text</p>"), "{content}");
+        // Real Fb2Mlizer structure the old ad-hoc converter never
+        // produced: a real FictionBook wrapper and document info.
+        assert!(content.starts_with("<?xml"), "{content}");
+        assert!(content.contains("<FictionBook"), "{content}");
+        assert!(content.contains("<document-info>"), "{content}");
+    }
 
-        // Strip <div>, <span>? FB2 doesn't like them.
-        // Ideally we strip tags but keep content.
-        // Or blindly map div -> p?
-        // Let's replace div with p.
-        let result = result.replace("<div>", "<p>").replace("</div>", "</p>");
+    /// A real (not fake-bytes) image round-trips through the actual
+    /// `DefaultImageConverter` -- the old ad-hoc converter never
+    /// validated or transcoded image data at all.
+    #[test]
+    fn convert_embeds_a_real_image_via_the_real_image_converter() {
+        let tmp_source = tempfile::tempdir().unwrap();
+        let source_path = tmp_source.path();
+        std::fs::write(source_path.join("ch1.html"), r#"<html xmlns="http://www.w3.org/1999/xhtml"><body><p><img src="image.png"/></p></body></html>"#).unwrap();
+        std::fs::write(source_path.join("image.png"), png_bytes(2, 2)).unwrap();
 
-        result.to_string()
+        let container = Box::new(DirContainer::new(source_path));
+        let mut book = OEBBook::new(container);
+        book.manifest.add("ch1", "ch1.html", "application/xhtml+xml");
+        book.manifest.add("img1", "image.png", "image/png");
+        book.spine.add("ch1", true);
+        book.metadata.add("title", "FB2 Image Test");
+
+        let tmp_out = tempfile::tempdir().unwrap();
+        let output_path = tmp_out.path().join("book.fb2");
+        FB2Output::new().convert(&book, &output_path).expect("conversion failed");
+
+        let content = std::fs::read_to_string(&output_path).unwrap();
+        assert!(content.contains("<image l:href=\"#img_0\"/>"), "{content}");
+        // A native PNG passes through `DefaultImageConverter` unchanged
+        // (only non-native formats are actually transcoded to JPEG).
+        assert!(content.contains("<binary id=\"img_0\" content-type=\"image/png\">"), "{content}");
     }
 }
