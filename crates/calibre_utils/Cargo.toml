@@ -72,6 +72,10 @@ hex = "0.4"
 # certgen.py's certgen.c OpenSSL binding (see that module's own doc).
 rcgen = "0.13"
 time = "0.3"
+# Used by formatter/format_functions.rs's make_url/make_url_extended/
+# query_string/encode_for_url (issue #518) -- the same crate already
+# used by calibre_ebooks/calibre_db elsewhere in this workspace.
+urlencoding = "2.1.3"
 
 [dev-dependencies]
 # certgen.rs tests only -- real X.509 parsing + signature

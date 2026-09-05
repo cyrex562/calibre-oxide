@@ -17,13 +17,18 @@
 //! `has_extra_files`, `extra_file_names`, `extra_file_size`,
 //! `extra_file_modtime`, `virtual_libraries`, `book_count`,
 //! `book_values`, `get_note`, `has_note`, `approximate_formats`,
-//! `ondevice`, `annotation_count`, and (issue #515, the only two
+//! `ondevice`, `annotation_count`; (issue #515, the only two
 //! `STRING_MANIPULATION` functions that need real book-field access)
-//! `check_yes_no`/`field_exists` -- every other `STRING_MANIPULATION`/
-//! `CASE_CHANGES` (issue #515), `LIST_MANIPULATION`/`LIST_LOOKUP`
-//! (issue #516), and `ARITHMETIC`/`RELATIONAL`/`BOOLEAN` (issue #517)
+//! `check_yes_no`/`field_exists`; and (issue #518, the only 3
+//! `FORMATTING_VALUES`/`URL_FUNCTIONS` functions that need real
+//! `Cache`/`calibre_ebooks` access) `format_date_field`/
+//! `rating_to_stars`/`urls_from_identifiers` -- every other
+//! `STRING_MANIPULATION`/`CASE_CHANGES` (issue #515),
+//! `LIST_MANIPULATION`/`LIST_LOOKUP` (issue #516),
+//! `ARITHMETIC`/`RELATIONAL`/`BOOLEAN` (issue #517), and
+//! `FORMATTING_VALUES`/`DATE_FUNCTIONS`/`URL_FUNCTIONS` (issue #518)
 //! built-in needs no `Cache` at all and lives in
-//! `calibre_utils::formatter::{string_functions,list_functions,numeric_functions}`
+//! `calibre_utils::formatter::{string_functions,list_functions,numeric_functions,format_functions}`
 //! instead, reached here via [`fallback_call`]/[`fallback_arg_count`].
 //!
 //! **Deferred to a follow-up** (needs new per-format
@@ -81,6 +86,9 @@ use crate::constants::DATA_FILE_PATTERN;
 use crate::extra_files;
 use crate::field_metadata::FieldMetadata;
 use crate::search;
+use calibre_ebooks::oeb::transforms::jacket::rating_to_stars as ebooks_rating_to_stars;
+use calibre_ebooks::xml_util::prepare_string_for_xml;
+use calibre_utils::formatter::format_functions::format_parsed_date;
 use calibre_utils::formatter::interp::{FunctionRegistry, RawValue, ValueSource};
 use calibre_utils::formatter::parser::FunctionCatalog;
 use calibre_utils::icu::strcmp;
@@ -460,6 +468,169 @@ impl<'a> CacheFunctions<'a> {
         let fm = FieldMetadata::from_cache(self.cache).map_err(|e| e.to_string())?;
         Ok(if fm.all_field_keys().contains(&field.as_str()) { "1".to_string() } else { String::new() })
     }
+
+    /// Port of `format_date_field` (issue #518) -- needs the real
+    /// field registry + this book's actual field value, so it lives
+    /// here rather than in `calibre_utils::formatter::format_functions`
+    /// with `format_date` (which works on an already-evaluated date
+    /// *string*, not a field lookup).
+    ///
+    /// Disclosed real upstream bug, not replicated: upstream's own
+    /// `from_number` branch calls `float(val)` where `val` is already
+    /// `mi.get(field)`'s real `datetime` object (not a number string)
+    /// -- that would raise a `TypeError` in real calibre too. This
+    /// port reports the same real error instead of silently doing
+    /// something more helpful than upstream.
+    fn format_date_field(&self, args: &[String]) -> Result<String, String> {
+        let field_arg = &args[0];
+        let format_string = &args[1];
+        let fm = FieldMetadata::from_cache(self.cache).map_err(|e| e.to_string())?;
+        let field = fm.search_term_to_field_key(field_arg).to_string();
+        if !fm.all_field_keys().contains(&field.as_str()) {
+            return Err(format!("Function format_date_field: Unknown field '{field}'"));
+        }
+        let info = fm.get(&field).ok_or_else(|| format!("Function format_date_field: Unknown field '{field}'"))?;
+        if info.datatype.as_deref() != Some("datetime") {
+            return Err(format!("Function format_date_field: field '{field}' is not a date"));
+        }
+        if format_string.starts_with("from_number") {
+            return Err("format_date_field: 'from_number' cannot be used on a real date field (matches a real upstream bug -- calling float() on an already-parsed datetime raises there too)".to_string());
+        }
+        let vs = CacheValueSource::new(self.cache, self.book_id).map_err(|e| e.to_string())?;
+        let val_str = match vs.row.get(field.trim_start_matches('#')) {
+            None | Some(serde_json::Value::Null) => return Ok(String::new()),
+            Some(serde_json::Value::String(s)) => s.clone(),
+            _ => return Ok(String::new()),
+        };
+        let Some(d) = calibre_utils::date::parse_date(&val_str, true) else { return Ok(String::new()) };
+        Ok(format_parsed_date(d, format_string).unwrap_or_default())
+    }
+
+    /// Port of `rating_to_stars` (issue #518) -- needs
+    /// `calibre_ebooks::oeb::transforms::jacket::rating_to_stars`,
+    /// which `calibre_utils` can't depend on (that crate depends on
+    /// `calibre_utils`, not the reverse), so it lives here even though
+    /// it doesn't touch `self.cache`/`self.book_id` at all.
+    fn rating_to_stars(&self, args: &[String]) -> Result<String, String> {
+        let value = &args[0];
+        let use_half_stars = &args[1];
+        if value.is_empty() {
+            return Ok(String::new());
+        }
+        const ERR: &str = "The rating must be a number between 0 and 5";
+        let v: f64 = value.parse().map_err(|_| ERR.to_string())?;
+        let v2 = v * 2.0;
+        if !(0.0..=10.0).contains(&v2) {
+            return Err(ERR.to_string());
+        }
+        Ok(ebooks_rating_to_stars(Some(v2), use_half_stars == "1"))
+    }
+
+    /// Port of `urls_from_identifiers` (issue #518) -- needs
+    /// `calibre_ebooks::xml_util::prepare_string_for_xml` (same
+    /// cross-crate-dependency reason as `rating_to_stars`).
+    ///
+    /// Disclosed narrowing: real upstream also consults
+    /// `msprefs['id_link_rules']` (user-configured URL templates,
+    /// no preferences-UI equivalent exists in this crate) and
+    /// `all_metadata_plugins()` (calibre's metadata-download source
+    /// plugins, a subsystem not ported at all here) -- only the
+    /// hardcoded fallback identifiers upstream itself falls back to
+    /// (`isbn`/`doi`/`arxiv`/`oclc`/`issn`) plus explicit `uri`/`url`-
+    /// named identifiers are implemented. Real calibre without any
+    /// matching plugin/rule installed would ALSO produce nothing for
+    /// every identifier type this port doesn't cover, so this is
+    /// narrower in *source* but not wildly narrower in typical
+    /// *practice*.
+    fn urls_from_identifiers(&self, args: &[String]) -> Result<String, String> {
+        let identifiers_str = &args[0];
+        let sort_results = &args[1];
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for id_ in identifiers_str.split(',') {
+            if id_.is_empty() {
+                continue;
+            }
+            if let Some((l, r)) = id_.split_once(':') {
+                let (l, r) = (l.trim(), r.trim());
+                if !l.is_empty() && !r.is_empty() {
+                    pairs.push((l.to_lowercase(), r.to_string()));
+                }
+            }
+        }
+        let mut links: Vec<(String, String, String, String)> = Vec::new();
+        for (k, v) in &pairs {
+            match k.as_str() {
+                "isbn" => links.push((v.clone(), "isbn".to_string(), v.clone(), format!("https://www.worldcat.org/isbn/{v}"))),
+                "doi" => links.push(("DOI".to_string(), "doi".to_string(), v.clone(), format!("https://dx.doi.org/{v}"))),
+                "arxiv" => links.push(("arXiv".to_string(), "arxiv".to_string(), v.clone(), format!("https://arxiv.org/abs/{v}"))),
+                "oclc" => links.push(("OCLC".to_string(), "oclc".to_string(), v.clone(), format!("https://www.worldcat.org/oclc/{v}"))),
+                "issn" => {
+                    if let Some(issn) = check_issn(v) {
+                        links.push((issn.clone(), "issn".to_string(), issn.clone(), format!("https://www.worldcat.org/issn/{issn}")));
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (k, v) in &pairs {
+            if is_uri_identifier_key(k) {
+                let scheme = v.split_once(':').map(|(s, _)| s.to_lowercase()).unwrap_or_default();
+                if matches!(scheme.as_str(), "http" | "https" | "file") {
+                    links.push((url_display_name(v), k.clone(), v.clone(), v.clone()));
+                }
+            }
+        }
+        if sort_results != "0" {
+            links.sort_by(|a, b| strcmp(&a.0, &b.0));
+        }
+        let html: Vec<String> = links
+            .iter()
+            .map(|(name, id_typ, id_val, url)| {
+                format!(
+                    "<a href=\"{}\" title=\"{}:{}\">{}</a>",
+                    prepare_string_for_xml(url, true),
+                    prepare_string_for_xml(id_typ, true),
+                    prepare_string_for_xml(id_val, true),
+                    prepare_string_for_xml(name, false)
+                )
+            })
+            .collect();
+        Ok(html.join(", "))
+    }
+}
+
+/// Port of `calibre.ebooks.metadata.check_issn`.
+fn check_issn(issn: &str) -> Option<String> {
+    if issn.is_empty() {
+        return None;
+    }
+    let cleaned: String = issn.to_uppercase().chars().filter(|c| c.is_ascii_digit() || *c == 'X').collect();
+    if cleaned.len() < 8 {
+        return None;
+    }
+    let digits: Vec<i32> = cleaned[..7].chars().map(|c| c.to_digit(10).unwrap_or(0) as i32).collect();
+    let sum: i32 = digits.iter().enumerate().map(|(i, d)| (8 - i as i32) * d).sum();
+    let check = 11 - sum.rem_euclid(11);
+    let last = cleaned.chars().nth(7)?;
+    let matches_check = (check == 10 && last == 'X') || last.to_digit(10).map(|d| d as i32) == Some(check);
+    matches_check.then_some(cleaned)
+}
+
+/// Matches upstream's `re.match(r'ur[il]\d*$', k)` on an already-
+/// lowercased key.
+fn is_uri_identifier_key(k: &str) -> bool {
+    k.strip_prefix("uri").or_else(|| k.strip_prefix("url")).is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// A simplified `urlparse(url).netloc or .path` -- real upstream uses
+/// Python's own `urlparse` for this; this is a direct, bounded
+/// re-derivation (scheme `://` then up to the first `/`, `?`, or `#`)
+/// rather than a full RFC 3986 URL parser.
+fn url_display_name(url: &str) -> String {
+    let Some(rest) = url.split_once("://").map(|(_, r)| r) else { return url.to_string() };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let netloc = &rest[..end];
+    if netloc.is_empty() { rest.to_string() } else { netloc.to_string() }
 }
 
 impl FunctionRegistry for CacheFunctions<'_> {
@@ -491,11 +662,16 @@ impl FunctionRegistry for CacheFunctions<'_> {
             "annotation_count" => self.annotation_count(),
             "check_yes_no" => self.check_yes_no(args),
             "field_exists" => self.field_exists(args),
-            // Every `STRING_MANIPULATION`/`CASE_CHANGES` (#515) and
-            // `LIST_MANIPULATION`/`LIST_LOOKUP` (#516), and
-            // `ARITHMETIC`/`RELATIONAL`/`BOOLEAN` (#517) built-ins
-            // need no `Cache` access at all, so all three live in
-            // `calibre_utils` and are reached here as a fallback.
+            "format_date_field" => self.format_date_field(args),
+            "rating_to_stars" => self.rating_to_stars(args),
+            "urls_from_identifiers" => self.urls_from_identifiers(args),
+            // Every `STRING_MANIPULATION`/`CASE_CHANGES` (#515),
+            // `LIST_MANIPULATION`/`LIST_LOOKUP` (#516),
+            // `ARITHMETIC`/`RELATIONAL`/`BOOLEAN` (#517), and
+            // `FORMATTING_VALUES`/`DATE_FUNCTIONS`/`URL_FUNCTIONS`
+            // (#518) built-in needs no `Cache` access at all, so all
+            // four live in `calibre_utils` and are reached here as a
+            // fallback.
             _ => fallback_call(name, args),
         }
     }
@@ -508,20 +684,25 @@ impl FunctionRegistry for CacheFunctions<'_> {
 /// absent from one module's dispatch table is also absent from that
 /// same module's arity table.
 fn fallback_call(name: &str, args: &[String]) -> Result<String, String> {
-    use calibre_utils::formatter::{list_functions, numeric_functions, string_functions};
+    use calibre_utils::formatter::{format_functions, list_functions, numeric_functions, string_functions};
     if string_functions::arg_count(name).is_some() {
         string_functions::call(name, args)
     } else if list_functions::arg_count(name).is_some() {
         list_functions::call(name, args)
-    } else {
+    } else if numeric_functions::arg_count(name).is_some() {
         numeric_functions::call(name, args)
+    } else {
+        format_functions::call(name, args)
     }
 }
 
 /// The [`FunctionCatalog`] counterpart of [`fallback_call`].
 fn fallback_arg_count(name: &str) -> Option<Option<usize>> {
-    use calibre_utils::formatter::{list_functions, numeric_functions, string_functions};
-    string_functions::arg_count(name).or_else(|| list_functions::arg_count(name)).or_else(|| numeric_functions::arg_count(name))
+    use calibre_utils::formatter::{format_functions, list_functions, numeric_functions, string_functions};
+    string_functions::arg_count(name)
+        .or_else(|| list_functions::arg_count(name))
+        .or_else(|| numeric_functions::arg_count(name))
+        .or_else(|| format_functions::arg_count(name))
 }
 
 /// Parse-time arity/existence catalog matching [`CacheFunctions`]'s
@@ -544,6 +725,7 @@ impl FunctionCatalog for CacheCatalog {
             "has_extra_files" | "extra_file_names" => Some(None),
             "field_exists" => Some(Some(1)),
             "check_yes_no" => Some(Some(4)),
+            "format_date_field" | "rating_to_stars" | "urls_from_identifiers" => Some(Some(2)),
             _ => fallback_arg_count(name),
         }
     }
@@ -803,6 +985,54 @@ mod tests {
         let catalog = CacheCatalog;
         assert_eq!(catalog.arg_count("strcmp"), Some(Some(5)));
         assert_eq!(catalog.arg_count("add"), Some(None));
+    }
+
+    #[test]
+    fn format_functions_fall_through_to_calibre_utils() {
+        let (_dir, cache) = make_cache();
+        let id = add_book(&cache, "Book", &["Author"]);
+        let f = CacheFunctions::new(&cache, id);
+        assert_eq!(f.call("human_readable", &["1536".to_string()]).unwrap(), "1.5 KB");
+        assert_eq!(f.call("today", &[]).unwrap().len() > 0, true);
+    }
+
+    #[test]
+    fn catalog_falls_through_for_format_arities() {
+        let catalog = CacheCatalog;
+        assert_eq!(catalog.arg_count("human_readable"), Some(Some(1)));
+        assert_eq!(catalog.arg_count("make_url"), Some(None));
+    }
+
+    #[test]
+    fn format_date_field_formats_a_real_datetime_field() {
+        let (_dir, cache) = make_cache();
+        let id = add_book(&cache, "Book", &["Author"]);
+        let f = CacheFunctions::new(&cache, id);
+        let out = f.call("format_date_field", &["timestamp".to_string(), "yyyy".to_string()]).unwrap();
+        assert_eq!(out.len(), 4, "got: {out}");
+        assert!(f.call("format_date_field", &["title".to_string(), "yyyy".to_string()]).is_err(), "title is not a date field");
+        assert!(f.call("format_date_field", &["no_such_field".to_string(), "yyyy".to_string()]).is_err());
+    }
+
+    #[test]
+    fn rating_to_stars_delegates_to_the_real_jacket_helper() {
+        let (_dir, cache) = make_cache();
+        let id = add_book(&cache, "Book", &["Author"]);
+        let f = CacheFunctions::new(&cache, id);
+        assert_eq!(f.call("rating_to_stars", &["5".to_string(), "0".to_string()]).unwrap(), "★★★★★");
+        assert_eq!(f.call("rating_to_stars", &["".to_string(), "0".to_string()]).unwrap(), "");
+        assert!(f.call("rating_to_stars", &["6".to_string(), "0".to_string()]).is_err());
+    }
+
+    #[test]
+    fn urls_from_identifiers_covers_the_hardcoded_fallback_identifiers() {
+        let (_dir, cache) = make_cache();
+        let id = add_book(&cache, "Book", &["Author"]);
+        let f = CacheFunctions::new(&cache, id);
+        let html = f.call("urls_from_identifiers", &["isbn:0123456789, doi:10.1/xyz".to_string(), "0".to_string()]).unwrap();
+        assert!(html.contains("https://www.worldcat.org/isbn/0123456789"), "got: {html}");
+        assert!(html.contains("https://dx.doi.org/10.1/xyz"), "got: {html}");
+        assert_eq!(f.call("urls_from_identifiers", &["unknown_source:xyz".to_string(), "0".to_string()]).unwrap(), "", "no rule/plugin matches this identifier type in this port");
     }
 
     #[test]

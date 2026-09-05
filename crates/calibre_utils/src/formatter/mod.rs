@@ -18,8 +18,12 @@
 //!   built-ins (issue #516) that need no book/`Cache` access
 //! - [`numeric_functions`]: the `ARITHMETIC`/`RELATIONAL`/`BOOLEAN`
 //!   built-ins (issue #517) that need no book/`Cache` access
+//! - [`format_functions`]: the `FORMATTING_VALUES`/`DATE_FUNCTIONS`/
+//!   `URL_FUNCTIONS` built-ins (issue #518) that need no book/`Cache`
+//!   access
 
 pub mod ast;
+pub mod format_functions;
 pub mod interp;
 pub mod lexer;
 pub mod list_functions;
