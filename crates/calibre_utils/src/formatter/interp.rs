@@ -181,7 +181,7 @@ pub fn evaluate(program: &Expr, val: &str, values: Box<dyn ValueSource + '_>, fu
     }
 }
 
-fn float_deal_with_none(v: &str) -> Option<f64> {
+pub(crate) fn float_deal_with_none(v: &str) -> Option<f64> {
     if v.is_empty() || v == "None" {
         Some(0.0)
     } else {

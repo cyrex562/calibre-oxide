@@ -402,14 +402,11 @@ fn list_contains(args: &[String]) -> Result<String, String> {
     unreachable!("rest.len() is odd, so the loop always returns via the trailing not_found_val")
 }
 
-/// Port of `str_in_list`. Disclosed docstring/code discrepancy: the
-/// real docstring claims the comparison is case-insensitive, but the
-/// real code compares with `strcmp` (full Unicode collation, which
-/// distinguishes case as a real, if low-priority, ordering/equality
-/// factor -- confirmed by `icu::strcmp`'s own test suite, e.g.
-/// `strcmp("a", "A") != Equal`), not `icu_lower`/`primary_strcmp`
-/// (which would actually fold case). This port matches the real code,
-/// not the docstring's claim.
+/// Port of `str_in_list`: case-insensitive comparison via `icu::strcmp`
+/// (matching upstream's own docstring -- `icu::strcmp` is `Secondary`
+/// UCA strength, which really does ignore case; see that function's
+/// own doc for a real, now-fixed bug in this crate's earlier `strcmp`
+/// port that this issue's testing surfaced).
 fn str_in_list(args: &[String]) -> Result<String, String> {
     if args.len() < 3 {
         return Err("str_in_list requires at least 3 arguments".to_string());
@@ -614,11 +611,10 @@ mod tests {
     }
 
     #[test]
-    fn str_in_list_compares_exact_case_despite_its_own_docstrings_ignoring_case_claim() {
-        // See this module's own `str_in_list` doc for the real
-        // docstring/code discrepancy this preserves.
+    fn str_in_list_compares_case_insensitively() {
         assert_eq!(call("str_in_list", &["Fiction, Drama".to_string(), ",".to_string(), "Fiction".to_string(), "yes".to_string(), "no".to_string()]).unwrap(), "yes");
-        assert_eq!(call("str_in_list", &["Fiction, Drama".to_string(), ",".to_string(), "fiction".to_string(), "yes".to_string(), "no".to_string()]).unwrap(), "no");
+        assert_eq!(call("str_in_list", &["Fiction, Drama".to_string(), ",".to_string(), "fiction".to_string(), "yes".to_string(), "no".to_string()]).unwrap(), "yes");
+        assert_eq!(call("str_in_list", &["Fiction, Drama".to_string(), ",".to_string(), "Comedy".to_string(), "yes".to_string(), "no".to_string()]).unwrap(), "no");
     }
 
     #[test]
