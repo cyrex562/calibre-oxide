@@ -118,8 +118,16 @@ use calibre_utils::filenames::sanitize_file_name;
 use rusqlite::{OptionalExtension, Result};
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+
+/// One of a book's real stored formats -- backs
+/// [`Cache::format_file_info`] (issue #524).
+pub struct FormatFileInfo {
+    pub fmt: String,
+    pub size: i64,
+    pub path: PathBuf,
+}
 
 pub struct Cache {
     pub backend: Backend,
@@ -278,6 +286,26 @@ impl Cache {
 
     pub fn all_author_links(&self) -> Result<Vec<(String, String)>> {
         self.with_field_store(|store| store.all_author_links())
+    }
+
+    /// One of a book's formats: its uppercase extension, real stored
+    /// size, and derived absolute on-disk path (issue #524's
+    /// `formats_sizes`/`formats_paths`/`formats_modtimes`/
+    /// `formats_path_segments`).
+    pub fn format_file_info(&self, book_id: i32) -> Result<Vec<FormatFileInfo>> {
+        let path_rel = self.field_for(book_id, "path")?.unwrap_or_default();
+        let library_path = self.backend.library_path.clone();
+        self.with_field_store(|store| {
+            store
+                .formats_for_book(book_id)
+                .into_iter()
+                .map(|(fmt, fname, size)| {
+                    let file_name = format!("{fname}.{}", fmt.to_lowercase());
+                    let path = library_path.join(&path_rel).join(file_name);
+                    FormatFileInfo { fmt, size, path }
+                })
+                .collect()
+        })
     }
 
     pub fn update_memory(&mut self, _book_id: i32, _field: &str, _value: &str) {
