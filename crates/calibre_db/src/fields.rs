@@ -140,6 +140,26 @@ impl FieldStore {
         let t = &self.tables;
         t.authors.link_map.iter().filter(|(_, link)| !link.is_empty()).filter_map(|(id, link)| t.authors.id_map.get(id).map(|name| (name.clone(), link.clone()))).collect()
     }
+
+    /// `(format, stored_filename, size)` for every one of a book's
+    /// formats, in `book_col_map`'s own sorted-by-format order --
+    /// backs `formats_sizes`/`formats_paths`/`formats_modtimes`/
+    /// `formats_path_segments` (issue #524). `stored_filename` is the
+    /// real `data.name` column value (no extension), matching
+    /// upstream's own `format_abspath` -- NOT a re-derivation from the
+    /// book's current title, which could drift from the real on-disk
+    /// name if the title changed after the format was added.
+    pub fn formats_for_book(&self, book_id: i32) -> Vec<(String, String, i64)> {
+        let t = &self.tables;
+        let Some(fmts) = t.formats.book_col_map.get(&book_id) else { return Vec::new() };
+        fmts.iter()
+            .filter_map(|fmt| {
+                let fname = t.formats.fname_map.get(&book_id)?.get(fmt)?.clone();
+                let size = *t.formats.size_map.get(&book_id)?.get(fmt)?;
+                Some((fmt.clone(), fname, size))
+            })
+            .collect()
+    }
 }
 
 fn many_to_one(table: &crate::tables::ManyToOneTable, book_id: i32) -> Option<String> {

@@ -19,22 +19,21 @@
 //! `book_values`, `get_note`, `has_note`, `approximate_formats`,
 //! `ondevice`, `annotation_count`; (issue #515, the only two
 //! `STRING_MANIPULATION` functions that need real book-field access)
-//! `check_yes_no`/`field_exists`; and (issue #518, the only 3
+//! `check_yes_no`/`field_exists`; (issue #518, the only 3
 //! `FORMATTING_VALUES`/`URL_FUNCTIONS` functions that need real
 //! `Cache`/`calibre_ebooks` access) `format_date_field`/
-//! `rating_to_stars`/`urls_from_identifiers` -- every other
-//! `STRING_MANIPULATION`/`CASE_CHANGES` (issue #515),
+//! `rating_to_stars`/`urls_from_identifiers`; and (issue #524, the
+//! last 4 `DB_FUNCS` functions, split out of #514 since they needed
+//! new per-format size/path/mtime plumbing #514 itself didn't add)
+//! `formats_sizes`/`formats_paths`/`formats_modtimes`/
+//! `formats_path_segments`, backed by the new [`crate::cache::Cache::format_file_info`]
+//! -- every other `STRING_MANIPULATION`/`CASE_CHANGES` (issue #515),
 //! `LIST_MANIPULATION`/`LIST_LOOKUP` (issue #516),
 //! `ARITHMETIC`/`RELATIONAL`/`BOOLEAN` (issue #517), and
 //! `FORMATTING_VALUES`/`DATE_FUNCTIONS`/`URL_FUNCTIONS` (issue #518)
 //! built-in needs no `Cache` at all and lives in
 //! `calibre_utils::formatter::{string_functions,list_functions,numeric_functions,format_functions}`
 //! instead, reached here via [`fallback_call`]/[`fallback_arg_count`].
-//!
-//! **Deferred to a follow-up** (needs new per-format
-//! size/path/mtime plumbing this pass didn't add):
-//! `formats_modtimes`, `formats_sizes`, `formats_paths`,
-//! `formats_path_segments`.
 //!
 //! **Not registered at all** (the underlying feature/subsystem is
 //! genuinely absent from this port, confirmed by reading the real
@@ -93,6 +92,7 @@ use calibre_utils::formatter::interp::{FunctionRegistry, RawValue, ValueSource};
 use calibre_utils::formatter::parser::FunctionCatalog;
 use calibre_utils::icu::strcmp;
 use regex::RegexBuilder;
+use std::path::Path;
 use std::collections::{BTreeSet, HashSet};
 
 /// Real field access, backed by one book's row from
@@ -428,6 +428,92 @@ impl<'a> CacheFunctions<'a> {
         Ok(if c == 0 { String::new() } else { c.to_string() })
     }
 
+    /// Port of `formats_sizes` (issue #524).
+    fn formats_sizes(&self) -> Result<String, String> {
+        let infos = self.cache.format_file_info(self.book_id).map_err(|e| e.to_string())?;
+        Ok(infos.iter().map(|i| format!("{}:{}", i.fmt, i.size)).collect::<Vec<_>>().join(","))
+    }
+
+    /// Port of `formats_paths` (issue #524). Real upstream's own
+    /// `evaluate` signature is `(self, formatter, kwargs, mi, locals,
+    /// sep=',')` -- a single optional positional argument, NOT `*args`,
+    /// despite `arg_count = -1` -- so 2+ arguments is a real error.
+    fn formats_paths(&self, args: &[String]) -> Result<String, String> {
+        if args.len() > 1 {
+            return Err("formats_paths() takes from 0 to 1 positional arguments but more were given".to_string());
+        }
+        let sep = args.first().map(String::as_str).unwrap_or(",");
+        let infos = self.cache.format_file_info(self.book_id).map_err(|e| e.to_string())?;
+        Ok(infos.iter().map(|i| format!("{}:{}", i.fmt, i.path.display())).collect::<Vec<_>>().join(sep))
+    }
+
+    /// Port of `formats_modtimes` (issue #524). No mtime data exists
+    /// anywhere in `calibre_db`'s own `data` table read (confirmed by
+    /// reading `tables.rs`'s `FormatsTable`) -- matches
+    /// `extra_files.rs`'s own pattern of a real filesystem `stat()`
+    /// call on the derived path at read time rather than a stored DB
+    /// column. A format whose file is missing/unreadable is silently
+    /// excluded (matches upstream's own `mi.get('format_metadata', {})`,
+    /// which is only ever populated for formats that actually resolved
+    /// to a real file).
+    fn formats_modtimes(&self, args: &[String]) -> Result<String, String> {
+        let date_format = &args[0];
+        let infos = self.cache.format_file_info(self.book_id).map_err(|e| e.to_string())?;
+        let mut with_mtime: Vec<(String, std::time::SystemTime)> = Vec::new();
+        for info in &infos {
+            if let Ok(mtime) = std::fs::metadata(&info.path).and_then(|m| m.modified()) {
+                with_mtime.push((info.fmt.clone(), mtime));
+            }
+        }
+        with_mtime.sort_by(|a, b| b.1.cmp(&a.1));
+        let parts: Vec<String> = with_mtime
+            .into_iter()
+            .map(|(fmt, mtime)| {
+                let dt: chrono::DateTime<chrono::Utc> = mtime.into();
+                format!("{fmt}:{}", calibre_utils::date::format_date(&dt, date_format))
+            })
+            .collect();
+        Ok(parts.join(","))
+    }
+
+    /// Port of `formats_path_segments` (issue #524) -- decomposes the
+    /// FIRST format's path (`book_col_map`'s own sorted-by-format
+    /// order, matching this crate's other formats_* functions; real
+    /// upstream picks whatever its own dict iteration order gives,
+    /// documented as "one of the extensions will be picked at random")
+    /// into author/title/format path segments.
+    fn formats_path_segments(&self, args: &[String]) -> Result<String, String> {
+        let with_author = &args[0];
+        let with_title = &args[1];
+        let with_format = &args[2];
+        let with_ext = &args[3];
+        let sep = &args[4];
+        let infos = self.cache.format_file_info(self.book_id).map_err(|e| e.to_string())?;
+        let Some(info) = infos.first() else {
+            return Ok("No book formats found so the path can't be generated".to_string());
+        };
+        let file_name = info.path.file_name().and_then(|s| s.to_str()).unwrap_or_default();
+        let fmt_component = if with_ext == "0" || with_ext.is_empty() {
+            Path::new(file_name).file_stem().and_then(|s| s.to_str()).unwrap_or(file_name).to_string()
+        } else {
+            file_name.to_string()
+        };
+        let parent = info.path.parent();
+        let title_component = parent.and_then(|p| p.file_name()).and_then(|s| s.to_str()).unwrap_or_default().to_string();
+        let author_component = parent.and_then(|p| p.parent()).and_then(|p| p.file_name()).and_then(|s| s.to_str()).unwrap_or_default().to_string();
+        let mut parts = Vec::new();
+        if with_author == "1" {
+            parts.push(author_component);
+        }
+        if with_title == "1" {
+            parts.push(title_component);
+        }
+        if with_format == "1" {
+            parts.push(fmt_component);
+        }
+        Ok(parts.join(sep))
+    }
+
     /// Port of `check_yes_no` (issue #515) -- needs real book-field
     /// access (`getattr(mi, field, None)`) so it lives here rather
     /// than in `calibre_utils::formatter::string_functions` with the
@@ -660,6 +746,10 @@ impl FunctionRegistry for CacheFunctions<'_> {
             "approximate_formats" => self.approximate_formats(),
             "ondevice" => Ok(String::new()),
             "annotation_count" => self.annotation_count(),
+            "formats_sizes" => self.formats_sizes(),
+            "formats_paths" => self.formats_paths(args),
+            "formats_modtimes" => self.formats_modtimes(args),
+            "formats_path_segments" => self.formats_path_segments(args),
             "check_yes_no" => self.check_yes_no(args),
             "field_exists" => self.field_exists(args),
             "format_date_field" => self.format_date_field(args),
@@ -729,6 +819,10 @@ impl FunctionCatalog for CacheCatalog {
             "field_exists" => Some(Some(1)),
             "check_yes_no" => Some(Some(4)),
             "format_date_field" | "rating_to_stars" | "urls_from_identifiers" => Some(Some(2)),
+            "formats_sizes" => Some(Some(0)),
+            "formats_paths" => Some(None),
+            "formats_modtimes" => Some(Some(1)),
+            "formats_path_segments" => Some(Some(5)),
             _ => fallback_arg_count(name),
         }
     }
@@ -914,6 +1008,46 @@ mod tests {
         assert_eq!(f.call("approximate_formats", &[]).unwrap(), "EPUB", "add_book's own test fixture writes a .epub");
         assert_eq!(f.call("ondevice", &[]).unwrap(), "");
         assert_eq!(f.call("annotation_count", &[]).unwrap(), "");
+    }
+
+    #[test]
+    fn formats_sizes_and_paths_reflect_real_files_on_disk() {
+        let (_dir, cache) = make_cache();
+        let id = add_book(&cache, "Book", &["Author"]);
+        let f = CacheFunctions::new(&cache, id);
+        // add_book's own fixture writes a real 4-byte "fake" .epub.
+        assert_eq!(f.call("formats_sizes", &[]).unwrap(), "EPUB:4");
+        let paths = f.call("formats_paths", &[]).unwrap();
+        assert!(paths.starts_with("EPUB:"), "got: {paths}");
+        let path_str = paths.strip_prefix("EPUB:").unwrap();
+        assert!(std::path::Path::new(path_str).is_file(), "the reported path should really exist on disk: {path_str}");
+        let paths_custom_sep = f.call("formats_paths", &["|".to_string()]).unwrap();
+        assert_eq!(paths_custom_sep, paths, "single-format list looks the same regardless of separator");
+        assert!(f.call("formats_paths", &["a".to_string(), "b".to_string()]).is_err(), "real upstream signature takes at most one positional argument");
+    }
+
+    #[test]
+    fn formats_modtimes_reports_a_real_recent_mtime() {
+        let (_dir, cache) = make_cache();
+        let id = add_book(&cache, "Book", &["Author"]);
+        let f = CacheFunctions::new(&cache, id);
+        let out = f.call("formats_modtimes", &["yyyy".to_string()]).unwrap();
+        assert!(out.starts_with("EPUB:"), "got: {out}");
+        let year = out.strip_prefix("EPUB:").unwrap();
+        assert_eq!(year.len(), 4, "got: {year}");
+    }
+
+    #[test]
+    fn formats_path_segments_decomposes_the_real_path() {
+        let (_dir, cache) = make_cache();
+        let id = add_book(&cache, "Book", &["Author"]);
+        let f = CacheFunctions::new(&cache, id);
+        let fmt_only = f.call("formats_path_segments", &["0".to_string(), "0".to_string(), "1".to_string(), "0".to_string(), "/".to_string()]).unwrap();
+        assert!(!fmt_only.is_empty() && !fmt_only.contains('/'), "got: {fmt_only}");
+        let fmt_with_ext = f.call("formats_path_segments", &["0".to_string(), "0".to_string(), "1".to_string(), "1".to_string(), "/".to_string()]).unwrap();
+        assert_eq!(fmt_with_ext, format!("{fmt_only}.epub"));
+        let full = f.call("formats_path_segments", &["1".to_string(), "1".to_string(), "1".to_string(), "1".to_string(), "/".to_string()]).unwrap();
+        assert_eq!(full.matches('/').count(), 2, "author/title/format -- got: {full}");
     }
 
     #[test]
