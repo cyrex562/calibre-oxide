@@ -69,6 +69,12 @@ pub enum ExprKind {
     Character(Box<Expr>),
     Strcat(Vec<Expr>),
     ListCountField(Box<Expr>),
+    /// `list_split(list_val, sep, id_prefix)` (issue #516) -- splits
+    /// `list_val` and assigns each piece to a local variable named
+    /// `id_prefix_N`, so (like `assign`) it needs direct mutable
+    /// access to the interpreter's own locals map and can't be a
+    /// plain `FunctionRegistry` call.
+    ListSplit { list_val: Box<Expr>, sep: Box<Expr>, id_prefix: Box<Expr> },
     /// `f_string(...)`: an embedded-`{...}`-template string, each
     /// `{...}` re-parsed and evaluated as its own sub-program.
     FString(Box<Expr>),

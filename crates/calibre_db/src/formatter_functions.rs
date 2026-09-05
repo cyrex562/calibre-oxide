@@ -20,9 +20,11 @@
 //! `ondevice`, `annotation_count`, and (issue #515, the only two
 //! `STRING_MANIPULATION` functions that need real book-field access)
 //! `check_yes_no`/`field_exists` -- every other `STRING_MANIPULATION`/
-//! `CASE_CHANGES` built-in needs no `Cache` at all and lives in
-//! `calibre_utils::formatter::string_functions` instead, reached here
-//! via a fallback in [`CacheFunctions::call`]/[`CacheCatalog::arg_count`].
+//! `CASE_CHANGES` (issue #515) and every `LIST_MANIPULATION`/
+//! `LIST_LOOKUP` (issue #516) built-in needs no `Cache` at all and
+//! lives in `calibre_utils::formatter::{string_functions,list_functions}`
+//! instead, reached here via a fallback in
+//! [`CacheFunctions::call`]/[`CacheCatalog::arg_count`].
 //!
 //! **Deferred to a follow-up** (needs new per-format
 //! size/path/mtime plumbing this pass didn't add):
@@ -489,10 +491,21 @@ impl FunctionRegistry for CacheFunctions<'_> {
             "annotation_count" => self.annotation_count(),
             "check_yes_no" => self.check_yes_no(args),
             "field_exists" => self.field_exists(args),
-            // Every `STRING_MANIPULATION`/`CASE_CHANGES` built-in
-            // (issue #515) needs no `Cache` access at all, so it lives
-            // in `calibre_utils` and is reached here as a fallback.
-            _ => calibre_utils::formatter::string_functions::call(name, args),
+            // Every `STRING_MANIPULATION`/`CASE_CHANGES` (#515) and
+            // `LIST_MANIPULATION`/`LIST_LOOKUP` (#516) built-in needs
+            // no `Cache` access at all, so both live in `calibre_utils`
+            // and are reached here as a fallback -- routed by arity
+            // lookup (not by matching on the string_functions error
+            // text, which would be fragile) since a name that isn't
+            // in one module's dispatch table isn't in its arity table
+            // either.
+            _ => {
+                if calibre_utils::formatter::string_functions::arg_count(name).is_some() {
+                    calibre_utils::formatter::string_functions::call(name, args)
+                } else {
+                    calibre_utils::formatter::list_functions::call(name, args)
+                }
+            }
         }
     }
 }
@@ -517,7 +530,7 @@ impl FunctionCatalog for CacheCatalog {
             "has_extra_files" | "extra_file_names" => Some(None),
             "field_exists" => Some(Some(1)),
             "check_yes_no" => Some(Some(4)),
-            _ => calibre_utils::formatter::string_functions::arg_count(name),
+            _ => calibre_utils::formatter::string_functions::arg_count(name).or_else(|| calibre_utils::formatter::list_functions::arg_count(name)),
         }
     }
 }
@@ -744,6 +757,22 @@ mod tests {
         let f = CacheFunctions::new(&cache, id);
         assert_eq!(f.call("uppercase", &["abc".to_string()]).unwrap(), "ABC");
         assert_eq!(f.call("substr", &["12345".to_string(), "1".to_string(), "0".to_string()]).unwrap(), "2345");
+    }
+
+    #[test]
+    fn list_manipulation_functions_fall_through_to_calibre_utils() {
+        let (_dir, cache) = make_cache();
+        let id = add_book(&cache, "Book", &["Author"]);
+        let f = CacheFunctions::new(&cache, id);
+        assert_eq!(f.call("list_count", &["a,b,c".to_string(), ",".to_string()]).unwrap(), "3");
+        assert_eq!(f.call("list_item", &["a & b".to_string(), "-1".to_string(), "&".to_string()]).unwrap(), "b");
+    }
+
+    #[test]
+    fn catalog_falls_through_for_list_manipulation_arities() {
+        let catalog = CacheCatalog;
+        assert_eq!(catalog.arg_count("list_item"), Some(Some(3)));
+        assert_eq!(catalog.arg_count("range"), Some(None));
     }
 
     #[test]
