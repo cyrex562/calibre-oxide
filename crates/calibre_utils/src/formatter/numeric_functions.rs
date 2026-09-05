@@ -141,7 +141,7 @@ fn first_matching_cmp(args: &[String]) -> Result<String, String> {
 /// Port of Python's `str(float)`: unlike this crate's own
 /// `format_number` (used by the numeric operators), a whole-number
 /// result always keeps a trailing `.0` -- see this module's own doc.
-fn python_float_str(v: f64) -> String {
+pub(crate) fn python_float_str(v: f64) -> String {
     if v.is_nan() {
         "nan".to_string()
     } else if v.is_infinite() {
