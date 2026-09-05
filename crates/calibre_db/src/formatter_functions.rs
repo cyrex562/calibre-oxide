@@ -20,11 +20,11 @@
 //! `ondevice`, `annotation_count`, and (issue #515, the only two
 //! `STRING_MANIPULATION` functions that need real book-field access)
 //! `check_yes_no`/`field_exists` -- every other `STRING_MANIPULATION`/
-//! `CASE_CHANGES` (issue #515) and every `LIST_MANIPULATION`/
-//! `LIST_LOOKUP` (issue #516) built-in needs no `Cache` at all and
-//! lives in `calibre_utils::formatter::{string_functions,list_functions}`
-//! instead, reached here via a fallback in
-//! [`CacheFunctions::call`]/[`CacheCatalog::arg_count`].
+//! `CASE_CHANGES` (issue #515), `LIST_MANIPULATION`/`LIST_LOOKUP`
+//! (issue #516), and `ARITHMETIC`/`RELATIONAL`/`BOOLEAN` (issue #517)
+//! built-in needs no `Cache` at all and lives in
+//! `calibre_utils::formatter::{string_functions,list_functions,numeric_functions}`
+//! instead, reached here via [`fallback_call`]/[`fallback_arg_count`].
 //!
 //! **Deferred to a follow-up** (needs new per-format
 //! size/path/mtime plumbing this pass didn't add):
@@ -492,22 +492,36 @@ impl FunctionRegistry for CacheFunctions<'_> {
             "check_yes_no" => self.check_yes_no(args),
             "field_exists" => self.field_exists(args),
             // Every `STRING_MANIPULATION`/`CASE_CHANGES` (#515) and
-            // `LIST_MANIPULATION`/`LIST_LOOKUP` (#516) built-in needs
-            // no `Cache` access at all, so both live in `calibre_utils`
-            // and are reached here as a fallback -- routed by arity
-            // lookup (not by matching on the string_functions error
-            // text, which would be fragile) since a name that isn't
-            // in one module's dispatch table isn't in its arity table
-            // either.
-            _ => {
-                if calibre_utils::formatter::string_functions::arg_count(name).is_some() {
-                    calibre_utils::formatter::string_functions::call(name, args)
-                } else {
-                    calibre_utils::formatter::list_functions::call(name, args)
-                }
-            }
+            // `LIST_MANIPULATION`/`LIST_LOOKUP` (#516), and
+            // `ARITHMETIC`/`RELATIONAL`/`BOOLEAN` (#517) built-ins
+            // need no `Cache` access at all, so all three live in
+            // `calibre_utils` and are reached here as a fallback.
+            _ => fallback_call(name, args),
         }
     }
+}
+
+/// Routes a name unknown to [`CacheFunctions::call`] to whichever of
+/// `calibre_utils`'s no-`Cache`-needed function modules actually
+/// implements it -- by arity lookup, not by matching on a module's
+/// "No function named ... exists" error text (fragile), since a name
+/// absent from one module's dispatch table is also absent from that
+/// same module's arity table.
+fn fallback_call(name: &str, args: &[String]) -> Result<String, String> {
+    use calibre_utils::formatter::{list_functions, numeric_functions, string_functions};
+    if string_functions::arg_count(name).is_some() {
+        string_functions::call(name, args)
+    } else if list_functions::arg_count(name).is_some() {
+        list_functions::call(name, args)
+    } else {
+        numeric_functions::call(name, args)
+    }
+}
+
+/// The [`FunctionCatalog`] counterpart of [`fallback_call`].
+fn fallback_arg_count(name: &str) -> Option<Option<usize>> {
+    use calibre_utils::formatter::{list_functions, numeric_functions, string_functions};
+    string_functions::arg_count(name).or_else(|| list_functions::arg_count(name)).or_else(|| numeric_functions::arg_count(name))
 }
 
 /// Parse-time arity/existence catalog matching [`CacheFunctions`]'s
@@ -530,7 +544,7 @@ impl FunctionCatalog for CacheCatalog {
             "has_extra_files" | "extra_file_names" => Some(None),
             "field_exists" => Some(Some(1)),
             "check_yes_no" => Some(Some(4)),
-            _ => calibre_utils::formatter::string_functions::arg_count(name).or_else(|| calibre_utils::formatter::list_functions::arg_count(name)),
+            _ => fallback_arg_count(name),
         }
     }
 }
@@ -773,6 +787,22 @@ mod tests {
         let catalog = CacheCatalog;
         assert_eq!(catalog.arg_count("list_item"), Some(Some(3)));
         assert_eq!(catalog.arg_count("range"), Some(None));
+    }
+
+    #[test]
+    fn numeric_functions_fall_through_to_calibre_utils() {
+        let (_dir, cache) = make_cache();
+        let id = add_book(&cache, "Book", &["Author"]);
+        let f = CacheFunctions::new(&cache, id);
+        assert_eq!(f.call("add", &["2".to_string(), "3".to_string()]).unwrap(), "5.0");
+        assert_eq!(f.call("strcmp", &["apple".to_string(), "Apple".to_string(), "lt".to_string(), "eq".to_string(), "gt".to_string()]).unwrap(), "eq");
+    }
+
+    #[test]
+    fn catalog_falls_through_for_numeric_arities() {
+        let catalog = CacheCatalog;
+        assert_eq!(catalog.arg_count("strcmp"), Some(Some(5)));
+        assert_eq!(catalog.arg_count("add"), Some(None));
     }
 
     #[test]

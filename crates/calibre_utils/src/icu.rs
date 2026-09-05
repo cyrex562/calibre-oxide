@@ -53,26 +53,56 @@
 //! `unsafe impl Send`/`Sync` workaround for a type whose internal
 //! thread-safety this crate has no way to independently verify.
 
-use icu::collator::{Collator, CollatorOptions, Strength};
+use icu::collator::{CaseFirst, Collator, CollatorOptions, Strength};
 use std::cmp::Ordering;
 
-fn new_collator(strength: Option<Strength>) -> Collator {
+fn new_collator(strength: Option<Strength>, case_first: Option<CaseFirst>) -> Collator {
     let mut options = CollatorOptions::new();
     options.strength = strength;
+    options.case_first = case_first;
     Collator::try_new(&Default::default(), options).expect("icu collator data is compiled in via the `compiled_data` feature")
 }
 
-/// Port of `calibre.utils.icu.strcmp`: locale-aware string comparison
-/// via the real Unicode Collation Algorithm, not a plain codepoint
-/// comparison.
+/// Port of `calibre.utils.icu.strcmp` (real name: `sort_collator()`'s
+/// comparator, aliased to bare `strcmp` at module level and used
+/// pervasively for author/tag/category sorting) -- **`Strength::Secondary`**,
+/// matching upstream's own `collator(strength=UCOL_SECONDARY, ...)`
+/// (upstream's own docstring: "Ignores case differences ..."), fixing
+/// a real bug from this port's first pass (issue #459): it originally
+/// used ICU4X's own default strength (`Tertiary`, which DOES
+/// distinguish case for equality, confirmed by direct probing --
+/// `Collator::compare("apple", "Apple")` is `Equal` at `Secondary`
+/// but not at the unset/`Tertiary` default), silently making every
+/// caller of this function -- author/tag/category sorting, and this
+/// crate's template-language `strcmp`/`str_in_list`/`==` comparisons
+/// -- case-sensitive when real calibre is not. Found and fixed while
+/// porting issue #517's own `strcmp`/`strcmpcase` built-ins, which
+/// made the discrepancy between "the docstring says case-insensitive"
+/// and "our own implementation disagreed" impossible to ignore.
+///
+/// Disclosed narrowing: upstream's `numeric=prefs['numeric_collation']`
+/// (natural-sort digit sequences, e.g. `"item2" < "item10"`) is a user
+/// preference this crate has no settings UI for -- not enabled here.
 pub fn strcmp(a: &str, b: &str) -> Ordering {
-    new_collator(None).compare(a, b)
+    new_collator(Some(Strength::Secondary), None).compare(a, b)
+}
+
+/// Port of `calibre.utils.icu.case_sensitive_strcmp`
+/// (`case_sensitive_collator()`: the locale's own default strength --
+/// typically `Tertiary`, which *does* distinguish case -- plus
+/// `upper_first=True`, "Always sorts upper case letter before lower
+/// case"). This is what [`strcmp`] itself used to do before the fix
+/// documented on that function -- upstream deliberately keeps this as
+/// a separate, explicitly-opted-into function precisely because it's
+/// NOT the default sort behavior.
+pub fn case_sensitive_strcmp(a: &str, b: &str) -> Ordering {
+    new_collator(None, Some(CaseFirst::UpperFirst)).compare(a, b)
 }
 
 /// Port of `calibre.utils.icu.primary_strcmp`: case- and
 /// accent-insensitive locale-aware comparison.
 pub fn primary_strcmp(a: &str, b: &str) -> Ordering {
-    new_collator(Some(Strength::Primary)).compare(a, b)
+    new_collator(Some(Strength::Primary), None).compare(a, b)
 }
 
 pub fn lower(text: &str) -> String {
@@ -99,15 +129,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strcmp_orders_lowercase_immediately_after_its_uppercase_letter_locale_aware() {
-        // Real UCA tertiary-strength behavior: "a" < "A" < "b" (case is
-        // a tiebreaker within the same base letter), unlike a plain
-        // codepoint comparison where every uppercase letter (0x41-0x5A)
-        // sorts before every lowercase letter (0x61-0x7A), which would
-        // give "A" < "B" < "a".
-        assert_eq!(strcmp("a", "A"), Ordering::Less);
-        assert_eq!(strcmp("A", "b"), Ordering::Less);
-        assert!(matches!(strcmp("apple", "Banana"), Ordering::Less));
+    fn strcmp_ignores_case_real_secondary_strength_behavior() {
+        // Matches upstream's own `sort_collator()` docstring: "Ignores
+        // case differences". Verified by direct probing, not assumed
+        // from the `icu` crate's own docs -- see `strcmp`'s own doc
+        // for the real bug this fixed.
+        assert_eq!(strcmp("apple", "Apple"), Ordering::Equal);
+        assert_eq!(strcmp("a", "A"), Ordering::Equal);
     }
 
     #[test]
@@ -120,16 +148,26 @@ mod tests {
     }
 
     #[test]
+    fn strcmp_still_distinguishes_accents_that_primary_strcmp_folds() {
+        assert_ne!(strcmp("cafe", "café"), Ordering::Equal);
+    }
+
+    #[test]
+    fn case_sensitive_strcmp_sorts_uppercase_before_lowercase() {
+        // Real upstream docstring: "Always sorts upper case letter
+        // before lower case" -- the opposite of plain UCA tertiary
+        // ordering, which puts lowercase first (see `strcmp`'s own
+        // prior, now-fixed behavior).
+        assert_eq!(case_sensitive_strcmp("A", "a"), Ordering::Less);
+        assert_eq!(case_sensitive_strcmp("a", "A"), Ordering::Greater);
+        assert_ne!(case_sensitive_strcmp("apple", "Apple"), Ordering::Equal, "case-sensitive comparison must still distinguish case");
+    }
+
+    #[test]
     fn primary_strcmp_ignores_case_and_accents() {
         assert_eq!(primary_strcmp("cafe", "café"), Ordering::Equal);
         assert_eq!(primary_strcmp("APPLE", "apple"), Ordering::Equal);
         assert_eq!(primary_strcmp("cote", "côte"), Ordering::Equal);
-    }
-
-    #[test]
-    fn strcmp_still_distinguishes_case_and_accents_that_primary_strcmp_folds() {
-        assert_ne!(strcmp("cafe", "café"), Ordering::Equal);
-        assert_ne!(strcmp("APPLE", "apple"), Ordering::Equal);
     }
 
     #[test]
