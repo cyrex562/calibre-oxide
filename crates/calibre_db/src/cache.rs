@@ -1153,9 +1153,17 @@ impl Cache {
                 } else {
                     "INTEGER"
                 };
+                // `UNIQUE(book)` (matching real calibre's own schema
+                // for these tables) is what makes `set_custom_column_value`'s
+                // `INSERT OR REPLACE` actually replace an existing
+                // row instead of silently accumulating a new one on
+                // every write -- a real bug found while testing
+                // `formatter_functions.rs`'s `check_yes_no` (issue
+                // #515), which calls `set_custom_column_value` more
+                // than once for the same book (no prior test did).
                 tx.execute(
                     &format!(
-                        "CREATE TABLE {table_name} (id INTEGER PRIMARY KEY, book INTEGER, value {value_type})"
+                        "CREATE TABLE {table_name} (id INTEGER PRIMARY KEY, book INTEGER, value {value_type}, UNIQUE(book))"
                     ),
                     [],
                 )?;
@@ -1170,7 +1178,7 @@ impl Cache {
                 }
                 tx.execute(
                     &format!(
-                        "CREATE TABLE {table_name} (id INTEGER PRIMARY KEY, book INTEGER, value TEXT)"
+                        "CREATE TABLE {table_name} (id INTEGER PRIMARY KEY, book INTEGER, value TEXT, UNIQUE(book))"
                     ),
                     [],
                 )?;
@@ -1234,9 +1242,17 @@ impl Cache {
         let conn = self.backend.conn.lock().unwrap();
         let sql = format!("INSERT OR REPLACE INTO {table_name} (book, value) VALUES (?1, ?2)");
         match datatype.as_str() {
+            // Accepts both `"0"`/`"1"` (this crate's own round-trip
+            // convention -- `get_custom_column_value` always reads a
+            // bool column back as that exact string, never
+            // `"true"`/`"false"`) and `"true"`/`"false"` -- a real,
+            // previously-latent bug where only the latter parsed
+            // (`"1".parse::<bool>()` fails and silently fell back to
+            // `false`), found while wiring `formatter_functions.rs`'s
+            // `check_yes_no` (issue #515).
             "bool" => conn.execute(
                 &sql,
-                (book_id, value.parse::<bool>().unwrap_or(false) as i32),
+                (book_id, value.parse::<i32>().map(|n| n != 0).or_else(|_| value.parse::<bool>()).unwrap_or(false) as i32),
             ),
             "int" => conn.execute(&sql, (book_id, value.parse::<i32>().unwrap_or(0))),
             "float" | "rating" => {
