@@ -17,7 +17,12 @@
 //! `has_extra_files`, `extra_file_names`, `extra_file_size`,
 //! `extra_file_modtime`, `virtual_libraries`, `book_count`,
 //! `book_values`, `get_note`, `has_note`, `approximate_formats`,
-//! `ondevice`, `annotation_count`.
+//! `ondevice`, `annotation_count`, and (issue #515, the only two
+//! `STRING_MANIPULATION` functions that need real book-field access)
+//! `check_yes_no`/`field_exists` -- every other `STRING_MANIPULATION`/
+//! `CASE_CHANGES` built-in needs no `Cache` at all and lives in
+//! `calibre_utils::formatter::string_functions` instead, reached here
+//! via a fallback in [`CacheFunctions::call`]/[`CacheCatalog::arg_count`].
 //!
 //! **Deferred to a follow-up** (needs new per-format
 //! size/path/mtime plumbing this pass didn't add):
@@ -111,12 +116,22 @@ fn json_scalar_or_join(v: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// `get_data_as_dict` keys custom-column entries by their bare label
+/// (e.g. `"myflag"`), but every real template/caller refers to a
+/// custom column with a leading `#` (`"#myflag"`, matching upstream's
+/// own convention and this crate's own `field_metadata.rs` key format
+/// elsewhere) -- both `get_value`/`get_raw_value` below strip it
+/// before the row lookup so `field("#myflag")`/`raw_field("#myflag")`
+/// (and this module's own `check_yes_no`) actually find the value,
+/// a real, previously-latent gap #514's own tests never exercised
+/// (they only ever used standard, non-`#` field names).
 impl ValueSource for CacheValueSource<'_> {
     fn get_value(&self, name: &str) -> Option<String> {
-        self.row.get(name).and_then(json_scalar_or_join)
+        self.row.get(name.trim_start_matches('#')).and_then(json_scalar_or_join)
     }
 
     fn get_raw_value(&self, name: &str) -> Option<RawValue> {
+        let name = name.trim_start_matches('#');
         match self.row.get(name)? {
             serde_json::Value::Array(items) => Some(RawValue::List(items.iter().filter_map(|i| i.as_str().map(str::to_string)).collect())),
             serde_json::Value::String(s) => Some(RawValue::Scalar(s.clone())),
@@ -402,6 +417,47 @@ impl<'a> CacheFunctions<'a> {
         let c = annotations::annotation_count_for_book(self.cache, self.book_id).map_err(|e| e.to_string())?;
         Ok(if c == 0 { String::new() } else { c.to_string() })
     }
+
+    /// Port of `check_yes_no` (issue #515) -- needs real book-field
+    /// access (`getattr(mi, field, None)`) so it lives here rather
+    /// than in `calibre_utils::formatter::string_functions` with the
+    /// rest of `STRING_MANIPULATION`.
+    ///
+    /// `Cache::get_custom_column_value` stores a bool custom column's
+    /// value as the string `"0"`/`"1"` (see that function's own doc),
+    /// not a JSON boolean -- `get_data_as_dict`/`CacheValueSource`
+    /// inherit that representation unchanged, so both the string and
+    /// (for forward-compatibility) bool JSON shapes are handled here.
+    fn check_yes_no(&self, args: &[String]) -> Result<String, String> {
+        let field_key = &args[0];
+        let row_key = field_key.trim_start_matches('#');
+        let fm = FieldMetadata::from_cache(self.cache).map_err(|e| e.to_string())?;
+        let is_bool_field = fm.get(field_key).map(|i| i.datatype.as_deref() == Some("bool")).unwrap_or(false);
+        let vs = CacheValueSource::new(self.cache, self.book_id).map_err(|e| e.to_string())?;
+        match vs.row.get(row_key) {
+            None | Some(serde_json::Value::Null) => Ok(if args[1] == "1" { "Yes".to_string() } else { String::new() }),
+            Some(_) if !is_bool_field => Err("check_yes_no requires the field be a Yes/No custom column".to_string()),
+            Some(serde_json::Value::String(s)) => {
+                let b = s == "1";
+                Ok(if (args[2] == "1" && !b) || (args[3] == "1" && b) { "Yes".to_string() } else { String::new() })
+            }
+            Some(serde_json::Value::Bool(b)) => {
+                let b = *b;
+                Ok(if (args[2] == "1" && !b) || (args[3] == "1" && b) { "Yes".to_string() } else { String::new() })
+            }
+            _ => Err("check_yes_no requires the field be a Yes/No custom column".to_string()),
+        }
+    }
+
+    /// Port of `field_exists` (issue #515) -- needs the real field
+    /// registry (`mi.all_field_keys()`, standard fields + this
+    /// library's actual custom columns), so it lives here rather than
+    /// in `calibre_utils::formatter::string_functions`.
+    fn field_exists(&self, args: &[String]) -> Result<String, String> {
+        let field = args[0].to_lowercase();
+        let fm = FieldMetadata::from_cache(self.cache).map_err(|e| e.to_string())?;
+        Ok(if fm.all_field_keys().contains(&field.as_str()) { "1".to_string() } else { String::new() })
+    }
 }
 
 impl FunctionRegistry for CacheFunctions<'_> {
@@ -431,7 +487,12 @@ impl FunctionRegistry for CacheFunctions<'_> {
             "approximate_formats" => self.approximate_formats(),
             "ondevice" => Ok(String::new()),
             "annotation_count" => self.annotation_count(),
-            _ => Err(format!("No function named {name:?} exists")),
+            "check_yes_no" => self.check_yes_no(args),
+            "field_exists" => self.field_exists(args),
+            // Every `STRING_MANIPULATION`/`CASE_CHANGES` built-in
+            // (issue #515) needs no `Cache` access at all, so it lives
+            // in `calibre_utils` and is reached here as a fallback.
+            _ => calibre_utils::formatter::string_functions::call(name, args),
         }
     }
 }
@@ -454,7 +515,9 @@ impl FunctionCatalog for CacheCatalog {
             "get_note" => Some(Some(3)),
             "book_values" => Some(Some(4)),
             "has_extra_files" | "extra_file_names" => Some(None),
-            _ => None,
+            "field_exists" => Some(Some(1)),
+            "check_yes_no" => Some(Some(4)),
+            _ => calibre_utils::formatter::string_functions::arg_count(name),
         }
     }
 }
@@ -639,6 +702,56 @@ mod tests {
         assert_eq!(f.call("approximate_formats", &[]).unwrap(), "EPUB", "add_book's own test fixture writes a .epub");
         assert_eq!(f.call("ondevice", &[]).unwrap(), "");
         assert_eq!(f.call("annotation_count", &[]).unwrap(), "");
+    }
+
+    #[test]
+    fn check_yes_no_covers_undefined_false_true_and_rejects_non_bool_fields() {
+        let (_dir, cache) = make_cache();
+        let id = add_book(&cache, "Book", &["Author"]);
+        cache.add_custom_column("myflag", "My Flag", "bool", false).unwrap();
+        let f = CacheFunctions::new(&cache, id);
+
+        // No value has been set yet -- undefined.
+        assert_eq!(f.call("check_yes_no", &["#myflag".to_string(), "1".to_string(), "0".to_string(), "0".to_string()]).unwrap(), "Yes");
+        assert_eq!(f.call("check_yes_no", &["#myflag".to_string(), "0".to_string(), "0".to_string(), "0".to_string()]).unwrap(), "");
+
+        cache.set_custom_column_value(id, "myflag", "0").unwrap();
+        assert_eq!(f.call("check_yes_no", &["#myflag".to_string(), "0".to_string(), "1".to_string(), "0".to_string()]).unwrap(), "Yes");
+        assert_eq!(f.call("check_yes_no", &["#myflag".to_string(), "0".to_string(), "0".to_string(), "1".to_string()]).unwrap(), "");
+
+        cache.set_custom_column_value(id, "myflag", "1").unwrap();
+        assert_eq!(f.call("check_yes_no", &["#myflag".to_string(), "0".to_string(), "0".to_string(), "1".to_string()]).unwrap(), "Yes");
+
+        assert!(f.call("check_yes_no", &["title".to_string(), "0".to_string(), "0".to_string(), "1".to_string()]).is_err(), "title is a real, non-bool field");
+    }
+
+    #[test]
+    fn field_exists_checks_the_real_field_registry() {
+        let (_dir, cache) = make_cache();
+        let id = add_book(&cache, "Book", &["Author"]);
+        cache.add_custom_column("myflag", "My Flag", "bool", false).unwrap();
+        let f = CacheFunctions::new(&cache, id);
+        assert_eq!(f.call("field_exists", &["title".to_string()]).unwrap(), "1");
+        assert_eq!(f.call("field_exists", &["TITLE".to_string()]).unwrap(), "1", "lookup is case-insensitive");
+        assert_eq!(f.call("field_exists", &["#myflag".to_string()]).unwrap(), "1");
+        assert_eq!(f.call("field_exists", &["no_such_field".to_string()]).unwrap(), "");
+    }
+
+    #[test]
+    fn string_manipulation_functions_fall_through_to_calibre_utils() {
+        let (_dir, cache) = make_cache();
+        let id = add_book(&cache, "Book", &["Author"]);
+        let f = CacheFunctions::new(&cache, id);
+        assert_eq!(f.call("uppercase", &["abc".to_string()]).unwrap(), "ABC");
+        assert_eq!(f.call("substr", &["12345".to_string(), "1".to_string(), "0".to_string()]).unwrap(), "2345");
+    }
+
+    #[test]
+    fn catalog_falls_through_for_string_manipulation_arities() {
+        let catalog = CacheCatalog;
+        assert_eq!(catalog.arg_count("shorten"), Some(Some(4)));
+        assert_eq!(catalog.arg_count("field_exists"), Some(Some(1)));
+        assert_eq!(catalog.arg_count("check_yes_no"), Some(Some(4)));
     }
 
     #[test]
