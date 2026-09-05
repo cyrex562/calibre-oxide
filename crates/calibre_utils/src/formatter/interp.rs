@@ -109,6 +109,24 @@ impl ValueSource for DictValueSource {
     }
 }
 
+/// A [`ValueSource`] that borrows another one -- used by `template`
+/// (issue #519) to give a nested sub-evaluation the SAME real value
+/// source (e.g. the same book) as its caller without needing to move
+/// or clone the caller's own `Box<dyn ValueSource>`.
+struct BorrowedValueSource<'a>(&'a dyn ValueSource);
+
+impl ValueSource for BorrowedValueSource<'_> {
+    fn get_value(&self, name: &str) -> Option<String> {
+        self.0.get_value(name)
+    }
+    fn get_raw_value(&self, name: &str) -> Option<RawValue> {
+        self.0.get_raw_value(name)
+    }
+    fn with_book(&self, book_id: i64) -> Option<Box<dyn ValueSource>> {
+        self.0.with_book(book_id)
+    }
+}
+
 /// Registered (built-in or user-defined) template function calls --
 /// the `Func` AST node's only evaluation path. See this module's own
 /// doc for why real functions (issue #460's other sub-issues) aren't
@@ -204,6 +222,39 @@ fn format_number(v: f64) -> String {
 fn regex_search_ci(pattern: &str, text: &str) -> Result<bool, String> {
     let re = Regex::new(&format!("(?i){pattern}")).map_err(|e| e.to_string())?;
     re.is_match(text).map_err(|e| e.to_string())
+}
+
+/// Shared by `eval`/`template` (issue #519). Real upstream's own
+/// `TemplateFormatter.evaluate` dispatches on the (post `[[`/`]]`->
+/// `{`/`}` conversion) string's OWN prefix: `"program:"` for a full
+/// Template Program Mode expression (evaluated by this same
+/// lexer/parser/interpreter this port already has), `"python:"` for
+/// `exec()`-based templates (permanently out of scope everywhere in
+/// this port, see `parser.rs`'s own doc), and otherwise the *separate*
+/// old-style `{field}`/`{field:func}` shorthand-template compiler
+/// (`vformat`) -- which isn't ported anywhere in this crate (the same
+/// gap `string_functions::re_group`'s own narrowed grammar and
+/// `lookup`'s bare-field-only key both already work around). Only the
+/// `"program:"` case is supported here; anything else is a real,
+/// reported error rather than a silent misinterpretation.
+///
+/// A plain free function, not an `Interpreter` method, so its
+/// `values` argument can borrow the caller's own `self.values` field
+/// without conflicting with the `&mut self.globals` reborrow this
+/// needs -- `self.method(values_borrowed_from_self, ...)` would
+/// require a whole-`self` mutable borrow that overlaps that immutable
+/// one.
+fn eval_sub_program(template: &str, line: u32, values: Box<dyn ValueSource + '_>, local_functions: &HashMap<String, (Vec<Param>, Expr)>, functions: &dyn FunctionRegistry, globals: &mut HashMap<String, String>) -> EvalResult {
+    let template = template.replace("[[", "{").replace("]]", "}");
+    let Some(program_text) = template.strip_prefix("program:") else {
+        return Err(EvalError::Msg {
+            message: "eval/template: only a 'program:'-prefixed argument (full Template Program Mode) is supported in this port -- the old-style '{field}' shorthand-template compiler isn't ported anywhere in this crate".to_string(),
+            line,
+        });
+    };
+    let tokens = super::lexer::scan(program_text).map_err(|pos| EvalError::Msg { message: format!("eval/template: lex error at byte {pos}"), line })?;
+    let sub_program = super::parser::parse(&tokens, &super::parser::EmptyCatalog, local_functions.keys().cloned().collect()).map_err(|e| EvalError::Msg { message: e.to_string(), line })?;
+    evaluate(&sub_program, "", values, functions, globals)
 }
 
 impl<'a> Interpreter<'a> {
@@ -350,6 +401,51 @@ impl<'a> Interpreter<'a> {
             ExprKind::FString(string) => {
                 let template = self.eval(string)?;
                 self.eval_f_string(&template, line)
+            }
+            ExprKind::Eval(string) => {
+                let template = self.eval(string)?;
+                let values = Box::new(DictValueSource::new(self.locals.clone()));
+                eval_sub_program(&template, line, values, &self.local_functions, self.functions, self.globals)
+            }
+            ExprKind::Template(string) => {
+                let template = self.eval(string)?;
+                let values = Box::new(BorrowedValueSource(self.values.as_ref()));
+                eval_sub_program(&template, line, values, &self.local_functions, self.functions, self.globals)
+            }
+            ExprKind::Lookup { value, args } => {
+                let val = self.eval(value)?;
+                let mut arg_strs = Vec::with_capacity(args.len());
+                for a in args {
+                    arg_strs.push(self.eval(a)?);
+                }
+                let key = if arg_strs.len() == 2 {
+                    // Backwards-compatibility 2-arg form, matching
+                    // upstream's own special case.
+                    if !val.is_empty() { &arg_strs[0] } else { &arg_strs[1] }
+                } else {
+                    if arg_strs.len() % 2 != 1 {
+                        return self.err(line, "lookup requires either 2 or an odd number of arguments".to_string());
+                    }
+                    let mut chosen = None;
+                    let mut i = 0;
+                    while i < arg_strs.len() {
+                        if i + 1 >= arg_strs.len() {
+                            chosen = Some(&arg_strs[i]);
+                            break;
+                        }
+                        if regex_search_ci(&arg_strs[i], &val).map_err(|m| EvalError::Msg { message: m, line })? {
+                            chosen = Some(&arg_strs[i + 1]);
+                            break;
+                        }
+                        i += 2;
+                    }
+                    chosen.expect("the odd-length check above guarantees a trailing else_key is always reached")
+                };
+                let key = key.trim();
+                if key.contains(':') {
+                    return self.err(line, format!("lookup: the field key '{key}' uses the old-style '{{field:func}}' shorthand chain, which isn't supported in this port -- only a bare field name is"));
+                }
+                self.values.get_value(key).ok_or_else(|| EvalError::Msg { message: format!("Unknown field '{key}'"), line })
             }
 
             ExprKind::If { condition, then_part, else_part } => {
@@ -870,6 +966,59 @@ mod tests {
     #[test]
     fn list_split_assigns_indexed_locals_and_returns_the_last_value() {
         assert_eq!(run("list_split('one:two:foo', ':', 'var'); var_0 & ' ' & var_1 & ' ' & var_2").unwrap(), "one two foo");
+    }
+
+    #[test]
+    fn eval_uses_current_locals_as_its_field_source_not_the_real_book() {
+        let mut values = HashMap::new();
+        values.insert("title".to_string(), "Real Book Title".to_string());
+        // `$x` inside eval() should resolve `x` against eval's own
+        // field source (the caller's locals), not against the real
+        // book's fields at all.
+        assert_eq!(run_with("x = 'hello'; eval('program: $x')", values).unwrap(), "hello");
+    }
+
+    #[test]
+    fn eval_cannot_see_the_real_books_fields() {
+        let mut values = HashMap::new();
+        values.insert("title".to_string(), "Real Book Title".to_string());
+        assert!(run_with("eval('program: $title')", values).is_err(), "title isn't one of eval's own locals, so its field lookup should fail");
+    }
+
+    #[test]
+    fn eval_without_a_program_prefix_is_a_real_reported_error() {
+        assert!(run("eval('{x}')").is_err(), "the old-style shorthand-template compiler isn't ported, so this must error rather than silently misinterpret");
+    }
+
+    #[test]
+    fn template_shares_the_real_value_source_but_not_locals() {
+        let mut values = HashMap::new();
+        values.insert("title".to_string(), "Real Book Title".to_string());
+        assert_eq!(run_with("template('program: $title')", values).unwrap(), "Real Book Title");
+    }
+
+    #[test]
+    fn template_gets_a_fresh_locals_scope() {
+        let mut values = HashMap::new();
+        values.insert("title".to_string(), "T".to_string());
+        assert!(run_with("x = 'outer'; template('program: x')", values).is_err(), "template()'s sub-program has its own fresh locals, unrelated to the caller's");
+    }
+
+    #[test]
+    fn lookup_picks_a_field_by_regex_match_against_the_value() {
+        let mut values = HashMap::new();
+        values.insert("title".to_string(), "The Title".to_string());
+        values.insert("author_sort".to_string(), "Author, A".to_string());
+        assert_eq!(run_with("lookup('Fiction', '^Fic', 'title', 'author_sort')", values).unwrap(), "The Title");
+    }
+
+    #[test]
+    fn lookup_falls_back_to_the_else_key_and_supports_the_2_arg_form() {
+        let mut values = HashMap::new();
+        values.insert("title".to_string(), "T".to_string());
+        values.insert("author_sort".to_string(), "A".to_string());
+        assert_eq!(run_with("lookup('nomatch', '^Fic', 'title', 'author_sort')", values.clone()).unwrap(), "A");
+        assert_eq!(run_with("lookup('', 'title', 'author_sort')", values).unwrap(), "A", "2-arg backwards-compat form: empty value picks the second key");
     }
 
     #[test]

@@ -78,6 +78,34 @@ pub enum ExprKind {
     /// `f_string(...)`: an embedded-`{...}`-template string, each
     /// `{...}` re-parsed and evaluated as its own sub-program.
     FString(Box<Expr>),
+    /// `eval(string)` (issue #519) -- a faithful port of real
+    /// upstream calibre's own template-language `eval` built-in
+    /// (documented, user-facing calibre feature, not arbitrary
+    /// host/OS code execution): if `string` (after `[[`/`]]` ->
+    /// `{`/`}` conversion) starts with `"program:"`, re-parses the
+    /// rest as a fresh program in this same sandboxed template
+    /// language and evaluates it with the CALLER's own local
+    /// variables exposed as its field-lookup source (not the real
+    /// book) and a fresh locals scope -- needs direct interpreter
+    /// access (the current `locals` map), not a plain
+    /// `FunctionRegistry` call. See `interp.rs`'s own
+    /// `eval_sub_program` doc for the disclosed narrowing on every
+    /// other case (upstream's separate old-style shorthand-template
+    /// compiler, not ported here).
+    Eval(Box<Expr>),
+    /// `template(string)` (issue #519) -- like [`ExprKind::Eval`]'s
+    /// `"program:"` dispatch, but evaluates against the SAME real
+    /// value source as the caller (same book) instead of the
+    /// caller's locals, still with a fresh, unshared locals scope --
+    /// needs direct interpreter access (the current
+    /// `values`/`functions`), not a plain `FunctionRegistry` call.
+    Template(Box<Expr>),
+    /// `lookup(value, [pattern, key]*, else_key)` (issue #519) --
+    /// picks a FIELD NAME by regex-matching `value` against each
+    /// `pattern` in order, then resolves and returns that field's
+    /// value -- needs direct `ValueSource` access, not a plain
+    /// `FunctionRegistry` call.
+    Lookup { value: Box<Expr>, args: Vec<Expr> },
 
     If { condition: Box<Expr>, then_part: Box<Expr>, else_part: Option<Box<Expr>> },
     For { variable: String, list_expr: Box<Expr>, separator: Option<Box<Expr>>, block: Box<Expr> },

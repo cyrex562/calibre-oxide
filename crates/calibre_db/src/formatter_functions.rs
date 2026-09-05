@@ -684,25 +684,28 @@ impl FunctionRegistry for CacheFunctions<'_> {
 /// absent from one module's dispatch table is also absent from that
 /// same module's arity table.
 fn fallback_call(name: &str, args: &[String]) -> Result<String, String> {
-    use calibre_utils::formatter::{format_functions, list_functions, numeric_functions, string_functions};
+    use calibre_utils::formatter::{format_functions, list_functions, misc_functions, numeric_functions, string_functions};
     if string_functions::arg_count(name).is_some() {
         string_functions::call(name, args)
     } else if list_functions::arg_count(name).is_some() {
         list_functions::call(name, args)
     } else if numeric_functions::arg_count(name).is_some() {
         numeric_functions::call(name, args)
-    } else {
+    } else if format_functions::arg_count(name).is_some() {
         format_functions::call(name, args)
+    } else {
+        misc_functions::call(name, args)
     }
 }
 
 /// The [`FunctionCatalog`] counterpart of [`fallback_call`].
 fn fallback_arg_count(name: &str) -> Option<Option<usize>> {
-    use calibre_utils::formatter::{format_functions, list_functions, numeric_functions, string_functions};
+    use calibre_utils::formatter::{format_functions, list_functions, misc_functions, numeric_functions, string_functions};
     string_functions::arg_count(name)
         .or_else(|| list_functions::arg_count(name))
         .or_else(|| numeric_functions::arg_count(name))
         .or_else(|| format_functions::arg_count(name))
+        .or_else(|| misc_functions::arg_count(name))
 }
 
 /// Parse-time arity/existence catalog matching [`CacheFunctions`]'s
@@ -994,6 +997,7 @@ mod tests {
         let f = CacheFunctions::new(&cache, id);
         assert_eq!(f.call("human_readable", &["1536".to_string()]).unwrap(), "1.5 KB");
         assert_eq!(f.call("today", &[]).unwrap().len() > 0, true);
+        assert_eq!(f.call("is_dark_mode", &[]).unwrap(), "", "no GUI exists in this port");
     }
 
     #[test]

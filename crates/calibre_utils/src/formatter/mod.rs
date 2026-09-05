@@ -21,12 +21,16 @@
 //! - [`format_functions`]: the `FORMATTING_VALUES`/`DATE_FUNCTIONS`/
 //!   `URL_FUNCTIONS` built-ins (issue #518) that need no book/`Cache`
 //!   access
+//! - [`misc_functions`]: the one real registry function left in
+//!   `ITERATING_VALUES`/`RECURSION`/`OTHER` (issue #519) -- everything
+//!   else in that batch is a new inlined `ExprKind` shortcut instead
 
 pub mod ast;
 pub mod format_functions;
 pub mod interp;
 pub mod lexer;
 pub mod list_functions;
+pub mod misc_functions;
 pub mod numeric_functions;
 pub mod parser;
 pub mod string_functions;

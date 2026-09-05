@@ -13,10 +13,10 @@
 //!   known [`FunctionCatalog`] entry or a local function is still a
 //!   real "unknown function" parse error, same observable behavior
 //!   for everything this port *does* support.
-//! - The 14 inlined-shortcut names (`field`/`raw_field`/`test`/
+//! - The 17 inlined-shortcut names (`field`/`raw_field`/`test`/
 //!   `first_non_empty`/`switch`/`switch_if`/`assign`/`contains`/
 //!   `character`/`print`/`strcat`/`list_count_field`/`f_string`/
-//!   `list_split`) are
+//!   `list_split`/`eval`/`template`/`lookup`) are
 //!   always recognized by this parser as their special forms,
 //!   regardless of what a [`FunctionCatalog`] says -- upstream
 //!   actually requires these to *also* be present in the real
@@ -598,7 +598,7 @@ impl<'a> Parser<'a> {
 /// [`build_inlined`], which returns a real parse error for a bad
 /// count rather than silently falling through to "unknown function").
 fn inlined_function_arity(name: &str) -> Option<()> {
-    matches!(name, "field" | "raw_field" | "test" | "first_non_empty" | "switch" | "switch_if" | "assign" | "contains" | "character" | "print" | "strcat" | "list_count_field" | "f_string" | "list_split").then_some(())
+    matches!(name, "field" | "raw_field" | "test" | "first_non_empty" | "switch" | "switch_if" | "assign" | "contains" | "character" | "print" | "strcat" | "list_count_field" | "f_string" | "list_split" | "eval" | "template" | "lookup").then_some(())
 }
 
 fn build_inlined(line: u32, name: &str, args: &[Expr]) -> Option<Result<Expr>> {
@@ -695,6 +695,27 @@ fn build_inlined(line: u32, name: &str, args: &[Expr]) -> Option<Result<Expr>> {
                 return bad_arity();
             }
             Some(Ok(Expr::new(line, ExprKind::FString(Box::new(args[0].clone())))))
+        }
+        "eval" => {
+            if args.len() != 1 {
+                return bad_arity();
+            }
+            Some(Ok(Expr::new(line, ExprKind::Eval(Box::new(args[0].clone())))))
+        }
+        "template" => {
+            if args.len() != 1 {
+                return bad_arity();
+            }
+            Some(Ok(Expr::new(line, ExprKind::Template(Box::new(args[0].clone())))))
+        }
+        "lookup" => {
+            // Real arity ("2, or an odd count >= 3") is checked at
+            // eval time in upstream (`arg_count = -1`, fully
+            // variadic) -- matched here, not at parse time.
+            if args.is_empty() {
+                return bad_arity();
+            }
+            Some(Ok(Expr::new(line, ExprKind::Lookup { value: Box::new(args[0].clone()), args: args[1..].to_vec() })))
         }
         _ => None,
     }
