@@ -263,15 +263,25 @@ impl<R: Read + Seek> Docx<R> {
                 continue;
             };
             // External targets and in-document fragments are used
-            // verbatim; internal ones are resolved against the part's
-            // own directory.
+            // verbatim; a target starting with `/` is absolute from
+            // the package root (OPC §, resolved without the part's own
+            // directory); everything else is relative to that
+            // directory. Issue #139 (#3): a prior version stripped the
+            // leading `/` but still joined onto `base` regardless, so
+            // an absolute target like `/word/styles.xml` inside `word/`
+            // resolved to `word/word/styles.xml` -- a real bug, not a
+            // reproduced calibre quirk (Word itself never writes
+            // absolute targets, so this was latent, but any producer
+            // that does would have its parts silently not found).
             let resolved =
                 if item.attribute("TargetMode") == Some("External") || target.starts_with('#') {
                     target.to_string()
+                } else if let Some(absolute) = target.strip_prefix('/') {
+                    absolute.to_string()
                 } else if base.is_empty() {
-                    target.trim_start_matches('/').to_string()
+                    target.to_string()
                 } else {
-                    format!("{base}/{}", target.trim_start_matches('/'))
+                    format!("{base}/{target}")
                 };
             if let Some(id) = item.attribute("Id") {
                 rels.by_id.insert(id.to_string(), resolved.clone());
@@ -695,13 +705,12 @@ mod tests {
         assert_eq!(rels.target("rId4"), Some("word/media/image1.png"));
         // External target, left alone.
         assert_eq!(rels.target("rId5"), Some("https://example.com/"));
-        // An absolute internal target keeps calibre's quirk: the
-        // leading slash is stripped and the result is still joined onto
-        // the part's own directory, so `/word/styles.xml` inside
-        // `word/` resolves to `word/word/styles.xml`. Reproduced rather
-        // than corrected — Word does not write absolute targets, and
-        // changing it would be a behaviour change, not a port.
-        assert_eq!(rels.target("rId6"), Some("word/word/styles.xml"));
+        // An absolute internal target (`/word/styles.xml`) resolves
+        // from the package root, not against the part's own directory
+        // -- issue #139 (#3) fixed a real bug where the leading slash
+        // was stripped but the result was still joined onto `base`
+        // anyway, giving `word/word/styles.xml`.
+        assert_eq!(rels.target("rId6"), Some("word/styles.xml"));
         assert_eq!(rels.target("nosuch"), None);
     }
 

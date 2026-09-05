@@ -10,15 +10,20 @@
 //! metadata and table of contents. The EPUB output plugin writes them
 //! into the package when converting a periodical for a Sony device.
 //!
-//! # Escaping
+//! # Disclosed divergences from upstream (issues #24/#139/#142)
 //!
-//! One deliberate divergence, in the interest of producing a file that
-//! parses: calibre escapes the section summary but not the article
-//! summary, and escapes neither `href`. A description containing `&` or
-//! `<` — ordinary in a news feed — therefore yields non-well-formed
-//! XML. This port escapes every interpolated value. Nothing else in the
-//! output differs, and the escaping only ever fires where calibre's
-//! output would have been malformed anyway.
+//! - **Escaping.** In the interest of producing a file that parses:
+//!   calibre escapes the section summary but not the article summary,
+//!   and escapes neither `href`. A description containing `&` or `<`
+//!   — ordinary in a news feed — therefore yields non-well-formed XML.
+//!   This port escapes every interpolated value. See issue #142 for
+//!   the one open question about this (whether real Sony hardware
+//!   actually requires calibre's unescaped form).
+//! - **Article summaries.** Real calibre reads the *section's*
+//!   description for every article's `<summary>` instead of the
+//!   article's own, so every article in a section shows the same
+//!   blurb and the article's real description is dropped entirely —
+//!   a plain bug (issue #139, #5), fixed here to use `article.description`.
 
 use chrono::{DateTime, Datelike, Utc};
 
@@ -251,10 +256,12 @@ pub fn sony_metadata(oeb: &OEBBook, clock: &Clock) -> SonyMetadata {
                 false,
             );
             let author = article.author.clone().unwrap_or_default();
-            // calibre reads the *section's* description here, not the
-            // article's. Reproduced: the article summaries in a Sony
-            // feed really are the section blurb.
-            let desc = section.description.clone().unwrap_or_default();
+            // Issue #139 (#5): real calibre reads the *section's*
+            // description here instead of the article's own, so every
+            // article in a section carries the same blurb and the
+            // article's real description is dropped entirely -- a
+            // plain bug, not a rendering choice worth reproducing.
+            let desc = article.description.clone().unwrap_or_default();
             let aid = format!("article{j}");
 
             entries.push(fill(
@@ -336,8 +343,13 @@ mod tests {
     }
 
     fn article(title: &str, href: &str, author: Option<&str>) -> TOCNode {
+        article_with_desc(title, href, author, None)
+    }
+
+    fn article_with_desc(title: &str, href: &str, author: Option<&str>, desc: Option<&str>) -> TOCNode {
         let mut node = TOCNode::new(Some(title.to_string()), Some(href.to_string()));
         node.author = author.map(str::to_string);
+        node.description = desc.map(str::to_string);
         node
     }
 
@@ -354,10 +366,11 @@ mod tests {
             .add_with_attrib("identifier", "book-uuid-1234", attrib);
 
         let mut news = section("News", "news.html", Some("What happened"));
-        news.add(article(
+        news.add(article_with_desc(
             "Council votes",
             "news.html#a1",
             Some("A. Reporter"),
+            Some("The council voted 5-2"),
         ));
         news.add(article("Rain expected", "news.html#a2", None));
         let mut sport = section("Sport", "sport.html", None);
@@ -480,9 +493,9 @@ mod tests {
     }
 
     #[test]
-    fn an_article_carries_its_author_and_its_sections_summary() {
-        // calibre reads the section's description for each article,
-        // not the article's own; this pins that.
+    fn an_article_carries_its_author_and_its_own_summary() {
+        // Issue #139 (#5) fixed a real bug where every article in a
+        // section carried the *section's* blurb instead of its own.
         let out = sony_metadata(&book(), &clock());
         let doc = Document::parse(&out.atom).unwrap();
         let first_article = doc
@@ -499,7 +512,23 @@ mod tests {
         };
         assert_eq!(child_text("title").as_deref(), Some("Council votes"));
         assert_eq!(child_text("name").as_deref(), Some("A. Reporter"));
-        assert_eq!(child_text("summary").as_deref(), Some("What happened"));
+        assert_eq!(child_text("summary").as_deref(), Some("The council voted 5-2"));
+    }
+
+    #[test]
+    fn an_article_with_no_description_of_its_own_gets_an_empty_summary() {
+        // The second article in the fixture has no description set --
+        // it must NOT fall back to the section's, matching the fix for
+        // issue #139 (#5).
+        let out = sony_metadata(&book(), &clock());
+        let doc = Document::parse(&out.atom).unwrap();
+        let second_article = doc
+            .descendants()
+            .filter(|n| n.tag_name().name() == "entry")
+            .nth(2)
+            .expect("a second article entry");
+        let summary = second_article.descendants().find(|c| c.tag_name().name() == "summary").and_then(|c| c.text()).unwrap_or("");
+        assert_eq!(summary, "");
     }
 
     #[test]
