@@ -268,6 +268,18 @@ impl<'a> Interpreter<'a> {
                     _ => self.err(line, format!("Field '{name}' is either not a field or not a list")),
                 }
             }
+            ExprKind::ListSplit { list_val, sep, id_prefix } => {
+                let list_val = self.eval(list_val)?;
+                let sep = self.eval(sep)?;
+                let id_prefix = self.eval(id_prefix)?;
+                let mut res = String::new();
+                for (i, v) in list_val.split(sep.as_str()).enumerate() {
+                    let v = v.trim().to_string();
+                    self.locals.insert(format!("{id_prefix}_{i}"), v.clone());
+                    res = v;
+                }
+                Ok(res)
+            }
 
             ExprKind::FirstNonEmpty(exprs) => {
                 for expr in exprs {
@@ -853,6 +865,11 @@ mod tests {
         let mut globals = HashMap::new();
         let result = evaluate(&program, "", Box::new(ListSource), &EmptyFunctionRegistry, &mut globals).unwrap();
         assert_eq!(result, "3");
+    }
+
+    #[test]
+    fn list_split_assigns_indexed_locals_and_returns_the_last_value() {
+        assert_eq!(run("list_split('one:two:foo', ':', 'var'); var_0 & ' ' & var_1 & ' ' & var_2").unwrap(), "one two foo");
     }
 
     #[test]

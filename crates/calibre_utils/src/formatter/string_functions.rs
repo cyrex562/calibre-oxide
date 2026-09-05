@@ -144,7 +144,7 @@ fn strcat_max(args: &[String]) -> Result<String, String> {
 /// group backreferences, literal `$` otherwise) into the `regex`
 /// crate's own replacement syntax (`${1}`, `${2}`, ... with a literal
 /// `$` doubled to `$$`).
-fn translate_python_replacement(replacement: &str) -> String {
+pub(crate) fn translate_python_replacement(replacement: &str) -> String {
     let mut out = String::new();
     let mut chars = replacement.chars().peekable();
     while let Some(c) = chars.next() {
@@ -244,7 +244,7 @@ fn swap_around_articles(val: &str, separator: &str) -> Result<String, String> {
 /// with the concatenation of its capture groups, each optionally
 /// rendered through the corresponding entry of `templates` -- see this
 /// module's own doc for the real, narrowed per-group template grammar.
-fn re_group(value: &str, pattern: &str, templates: &[String]) -> Result<String, String> {
+pub(crate) fn re_group(value: &str, pattern: &str, templates: &[String]) -> Result<String, String> {
     let re = RegexBuilder::new(pattern).case_insensitive(true).build().map_err(|e| e.to_string())?;
     let mut result = String::new();
     let mut last_end = 0;

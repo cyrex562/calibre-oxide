@@ -14,9 +14,12 @@
 //! - [`interp`]: the tree-walking evaluator (`_Interpreter`)
 //! - [`string_functions`]: the `STRING_MANIPULATION`/`CASE_CHANGES`
 //!   built-ins (issue #515) that need no book/`Cache` access
+//! - [`list_functions`]: the `LIST_MANIPULATION`/`LIST_LOOKUP`
+//!   built-ins (issue #516) that need no book/`Cache` access
 
 pub mod ast;
 pub mod interp;
 pub mod lexer;
+pub mod list_functions;
 pub mod parser;
 pub mod string_functions;

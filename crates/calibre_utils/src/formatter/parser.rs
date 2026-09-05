@@ -13,9 +13,10 @@
 //!   known [`FunctionCatalog`] entry or a local function is still a
 //!   real "unknown function" parse error, same observable behavior
 //!   for everything this port *does* support.
-//! - The 13 inlined-shortcut names (`field`/`raw_field`/`test`/
+//! - The 14 inlined-shortcut names (`field`/`raw_field`/`test`/
 //!   `first_non_empty`/`switch`/`switch_if`/`assign`/`contains`/
-//!   `character`/`print`/`strcat`/`list_count_field`/`f_string`) are
+//!   `character`/`print`/`strcat`/`list_count_field`/`f_string`/
+//!   `list_split`) are
 //!   always recognized by this parser as their special forms,
 //!   regardless of what a [`FunctionCatalog`] says -- upstream
 //!   actually requires these to *also* be present in the real
@@ -597,7 +598,7 @@ impl<'a> Parser<'a> {
 /// [`build_inlined`], which returns a real parse error for a bad
 /// count rather than silently falling through to "unknown function").
 fn inlined_function_arity(name: &str) -> Option<()> {
-    matches!(name, "field" | "raw_field" | "test" | "first_non_empty" | "switch" | "switch_if" | "assign" | "contains" | "character" | "print" | "strcat" | "list_count_field" | "f_string").then_some(())
+    matches!(name, "field" | "raw_field" | "test" | "first_non_empty" | "switch" | "switch_if" | "assign" | "contains" | "character" | "print" | "strcat" | "list_count_field" | "f_string" | "list_split").then_some(())
 }
 
 fn build_inlined(line: u32, name: &str, args: &[Expr]) -> Option<Result<Expr>> {
@@ -682,6 +683,12 @@ fn build_inlined(line: u32, name: &str, args: &[Expr]) -> Option<Result<Expr>> {
                 return bad_arity();
             }
             Some(Ok(Expr::new(line, ExprKind::ListCountField(Box::new(args[0].clone())))))
+        }
+        "list_split" => {
+            if args.len() != 3 {
+                return bad_arity();
+            }
+            Some(Ok(Expr::new(line, ExprKind::ListSplit { list_val: Box::new(args[0].clone()), sep: Box::new(args[1].clone()), id_prefix: Box::new(args[2].clone()) })))
         }
         "f_string" => {
             if args.len() != 1 {
