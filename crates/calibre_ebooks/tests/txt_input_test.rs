@@ -49,7 +49,10 @@ fn test_plain_text_conversion() {
     let input_path = tmp_dir.path().join("test.txt");
     let output_dir = tmp_dir.path().join("output_txt");
 
-    let txt_content = "Just some plain text.\nNew line here.";
+    // Two blank lines apart so paragraph-type auto-detection (issue
+    // #537) doesn't collapse them into a single block/single-line
+    // paragraph the way "single spaced" prose would.
+    let txt_content = "Just some plain text.\n\n\nNew line here.";
     fs::write(&input_path, txt_content).unwrap();
 
     let plugin = TXTInput::new();
@@ -61,14 +64,9 @@ fn test_plain_text_conversion() {
     let html_path = output_dir.join(href);
     let html = fs::read_to_string(html_path).unwrap();
 
-    // Expect pre tag for plain text fallback (if logic works)
-    // Actually my logic defaults to markdown if ext is txt AND content has # or **.
-    // Here logic might default to markdown parser ANYWAY if I implemented it that way?
-    // "else { Plain text }" logic depends on `is_markdown`.
-    // is_markdown = extension check AND content check.
-    // "md" -> true. "txt" -> true IF content check.
-    // Here content is simple. So is_markdown should be false.
-
-    assert!(html.contains("<pre>"));
-    assert!(html.contains("New line here."));
+    // Real upstream's own `convert_basic` (used here for plain,
+    // non-Markdown/Textile text, issue #537) wraps each real
+    // paragraph in `<p>`, not `<pre>`.
+    assert!(html.contains("<p>Just some plain text.</p>"));
+    assert!(html.contains("<p>New line here.</p>"));
 }
