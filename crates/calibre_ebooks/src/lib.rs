@@ -6,6 +6,7 @@ pub mod compression;
 pub mod constants;
 pub mod conversion;
 pub mod css;
+pub mod css_transform_rules;
 pub mod djvu;
 pub mod docx;
 pub mod dom;
