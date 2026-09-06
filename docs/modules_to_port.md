@@ -1693,20 +1693,20 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 
 ##### sfnt
 
-- [ ] cmap.py
-- [ ] common.py
-- [ ] container.py
-- [ ] errors.py
-- [ ] glyf.py
-- [ ] gsub.py
-- [ ] head.py
-- [ ] kern.py
-- [ ] loca.py
-- [ ] maxp.py
-- [ ] merge.py
-- [ ] metrics.py
-- [ ] subset.py
-- [ ] __init__.py
+- [ ] cmap.py (issue #551)
+- [ ] common.py (issue #555 -- its only real importer is gsub.py, not container.py)
+- [x] container.py (issue #549 CLOSED -- `calibre_utils::fonts::sfnt::container::Sfnt`: real table-tag -> bytes map, sorted-tag iteration, real re-serialization with correct per-table/whole-file checksums and the `head` table's checksum-adjustment field. Every table (known or not) round-trips as opaque bytes for now -- the specialized `HeadTable`/`GlyfTable`/`CmapTable`/etc dispatch is separate, dependency-ordered follow-up scope (#550-555); this container doesn't need it to parse/rebuild a real font. Disclosed narrowings in the module's own doc comment: the `ttLib`-object constructor path is unreachable; `Sfnt.get_all_font_names` (a real upstream method importing a function, `metadata.get_font_names2`, that doesn't exist anywhere in `metadata.py`) is real, unreachable dead code in upstream itself -- confirmed by grep that every real caller of "get all font names" calls `utils.py`'s own version directly -- so it's not ported; the real sfnt-version signature set's dead 5-byte `type1` entry (compared against an always-4-byte slice, so it can never match) is reproduced by omission rather than "fixed")
+- [x] errors.py (issue #549 CLOSED -- `calibre_utils::fonts::sfnt::errors::{UnsupportedFont,NoGlyphs}`)
+- [ ] glyf.py (issue #550)
+- [ ] gsub.py (issue #555, low priority)
+- [ ] head.py (issue #550)
+- [ ] kern.py (issue #552)
+- [ ] loca.py (issue #550)
+- [ ] maxp.py (issue #550)
+- [ ] merge.py (issue #555, low priority)
+- [ ] metrics.py (issue #552)
+- [ ] subset.py (issue #553 -- the real payoff, closes oeb::polish::subset.rs's subset_all_fonts todo!())
+- [x] __init__.py (issue #549 CLOSED -- `calibre_utils::fonts::sfnt::{align_block,max_power_of_two,load_font}`)
 
 ###### cff
 
