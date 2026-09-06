@@ -9,6 +9,7 @@ pub mod exim;
 pub mod ffml_processor;
 pub mod file_type_icons;
 pub mod filenames;
+pub mod fonts;
 pub mod formatter;
 pub mod html2text;
 pub mod hyphenation;

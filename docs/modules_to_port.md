@@ -1681,14 +1681,14 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 
 #### fonts
 
-- [ ] freetype.cpp
-- [ ] free_type.py
-- [ ] metadata.py
-- [ ] scanner.py
-- [ ] subset.py
-- [ ] utils.py
-- [ ] winfonts.cpp
-- [ ] win_fonts.py
+- [ ] freetype.cpp (part of #556, low priority)
+- [ ] free_type.py (part of #556, low priority)
+- [ ] metadata.py (part of #556, low priority)
+- [ ] scanner.py (part of #556, low priority)
+- [ ] subset.py (issue #553, depends on the sfnt sub-cluster below)
+- [x] utils.py (issue #548 CLOSED -- `calibre_utils::fonts::utils`: standalone sfnt table-directory reader (`get_tables`/`get_table`), OS/2 characteristics (`get_font_characteristics`), name-table parsing (`get_font_names`/`get_font_names2`/`get_all_font_names`, with the real Windows/Mac/Unicode-platform fallback chain), checksum verification/fixup (`verify_checksums`/`remove_embed_restriction`/`is_font_embeddable`), and format-4 cmap glyph lookup (`get_glyph_ids`/`supports_text`) -- no dependency on the fuller `sfnt/` object model needed. `panose_to_css_generic_family` is now canonically here; `docx::fonts::panose_to_css_generic_family` (ported earlier, before this module existed) delegates to it instead of duplicating. Real payoff: this is exactly what issue #169's `embed_all_fonts` cites as a missing dependency (font names/characteristics/embeddability for whole-font embedding, no subsetting needed). Disclosed narrowings: the `ttLib`-object calling convention (unreachable, nothing in this port constructs such an object) and `get_printable_characters`'s stdlib-only (no Unicode general-category) filtering, both documented in the module's own doc comment)
+- [ ] winfonts.cpp (part of #556, low priority)
+- [ ] win_fonts.py (part of #556, low priority)
 - [ ] __init__.py
 
 ##### sfnt
