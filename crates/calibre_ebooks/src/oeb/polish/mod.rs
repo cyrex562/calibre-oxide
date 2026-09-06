@@ -66,6 +66,7 @@ pub mod hyphenation;
 pub mod images;
 pub mod import_book;
 pub mod jacket;
+pub mod main;
 pub mod opf;
 pub mod parsing;
 pub mod pretty;
