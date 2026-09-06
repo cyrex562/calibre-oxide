@@ -4,6 +4,7 @@
 //! `glyf`/`cmap`/`kern`/`metrics`/`gsub`/`merge`/`cff`) is separate,
 //! dependency-ordered follow-up scope -- issues #550-555.
 
+pub mod cmap;
 pub mod container;
 pub mod errors;
 pub mod glyf;

@@ -625,17 +625,20 @@ fn read_u16_array(table: &[u8], offset: usize, n: usize) -> Result<Vec<u16>, Str
 }
 
 /// Port of `read_bmp_prefix`: the parsed pieces of a format-4 cmap
-/// subtable.
-struct BmpPrefix {
-    start_count: Vec<u16>,
-    end_count: Vec<u16>,
-    range_offset: Vec<u16>,
-    id_delta: Vec<i16>,
-    glyph_id_map: Vec<u16>,
-    array_len: usize,
+/// subtable. `pub(crate)` (rather than fully private) so
+/// [`crate::fonts::sfnt::cmap::BmpTable`] (issue #551) can parse once
+/// and reuse the same fields, instead of re-parsing raw bytes on every
+/// lookup the way [`get_bmp_glyph_ids`] does.
+pub(crate) struct BmpPrefix {
+    pub(crate) start_count: Vec<u16>,
+    pub(crate) end_count: Vec<u16>,
+    pub(crate) range_offset: Vec<u16>,
+    pub(crate) id_delta: Vec<i16>,
+    pub(crate) glyph_id_map: Vec<u16>,
+    pub(crate) array_len: usize,
 }
 
-fn read_bmp_prefix(table: &[u8], bmp: usize) -> Result<BmpPrefix, String> {
+pub(crate) fn read_bmp_prefix(table: &[u8], bmp: usize) -> Result<BmpPrefix, String> {
     let base = bmp + 2;
     let length = u16::from_be_bytes(table.get(base..base + 2).ok_or("truncated cmap subtable")?.try_into().unwrap()) as usize;
     let segcount = u16::from_be_bytes(table.get(base + 4..base + 6).ok_or("truncated cmap subtable")?.try_into().unwrap()) as usize;
@@ -666,9 +669,11 @@ fn read_bmp_prefix(table: &[u8], bmp: usize) -> Result<BmpPrefix, String> {
     })
 }
 
-/// Port of `get_bmp_glyph_ids`.
-pub fn get_bmp_glyph_ids(table: &[u8], bmp: usize, codes: impl Iterator<Item = u32>) -> Result<Vec<u32>, String> {
-    let p = read_bmp_prefix(table, bmp)?;
+/// Port of `BMPTable.get_glyph_ids`'s real per-code segment lookup.
+/// `pub(crate)` so [`crate::fonts::sfnt::cmap::BmpTable`] (issue #551)
+/// can reuse it against an already-parsed [`BmpPrefix`] rather than
+/// re-deriving the same segment-walk logic a second time.
+pub(crate) fn bmp_prefix_glyph_ids(p: &BmpPrefix, codes: impl Iterator<Item = u32>) -> Vec<u32> {
     let mut out = Vec::new();
     for code in codes {
         let mut found = false;
@@ -698,7 +703,13 @@ pub fn get_bmp_glyph_ids(table: &[u8], bmp: usize, codes: impl Iterator<Item = u
             out.push(0);
         }
     }
-    Ok(out)
+    out
+}
+
+/// Port of `get_bmp_glyph_ids`.
+pub fn get_bmp_glyph_ids(table: &[u8], bmp: usize, codes: impl Iterator<Item = u32>) -> Result<Vec<u32>, String> {
+    let p = read_bmp_prefix(table, bmp)?;
+    Ok(bmp_prefix_glyph_ids(&p, codes))
 }
 
 /// Port of `get_glyph_ids`.
