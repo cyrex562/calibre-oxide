@@ -9,8 +9,10 @@ pub mod container;
 pub mod errors;
 pub mod glyf;
 pub mod head;
+pub mod kern;
 pub mod loca;
 pub mod maxp;
+pub mod metrics;
 
 /// Port of `align_block`: pads `raw` with zero bytes until its length
 /// is a multiple of 4.

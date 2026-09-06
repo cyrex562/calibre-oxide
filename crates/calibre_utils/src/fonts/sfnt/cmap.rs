@@ -133,6 +133,7 @@ fn resolve_glyph_id(p: &BmpPrefix, i: usize, code: u32) -> u32 {
 }
 
 /// Port of `BMPTable` (a parsed cmap format-4 subtable).
+#[derive(Debug)]
 pub struct BmpTable {
     prefix: BmpPrefix,
 }
@@ -169,6 +170,7 @@ impl BmpTable {
 /// [`super::glyf::GlyfTable`]'s own doc for why the base class isn't
 /// ported separately; its `raw`/`__call__`/`__len__` are folded
 /// directly into this struct's own `raw` field).
+#[derive(Debug)]
 pub struct CmapTable {
     pub version: u16,
     pub num_tables: u16,

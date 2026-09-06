@@ -455,8 +455,16 @@ pub fn get_font_names2(raw: &[u8]) -> Result<ExtendedFontNames, String> {
 
 /// Port of `get_all_font_names`.
 pub fn get_all_font_names(raw: &[u8]) -> Result<HashMap<String, String>, String> {
-    let table = get_name_table(raw)?;
-    let records = parse_name_records(&table);
+    get_all_font_names_from_table(&get_name_table(raw)?)
+}
+
+/// Port of `get_all_font_names(raw_is_table=True)`: `raw` is already an
+/// extracted `name` table's own bytes (as
+/// [`crate::fonts::sfnt::container::Sfnt::get`] returns), not a whole
+/// font -- so the "find the name table within a full font" step
+/// [`get_all_font_names`] does is skipped.
+pub fn get_all_font_names_from_table(table: &[u8]) -> Result<HashMap<String, String>, String> {
+    let records = parse_name_records(table);
     let mut ans = HashMap::new();
 
     for (name, id) in [
@@ -629,6 +637,7 @@ fn read_u16_array(table: &[u8], offset: usize, n: usize) -> Result<Vec<u16>, Str
 /// [`crate::fonts::sfnt::cmap::BmpTable`] (issue #551) can parse once
 /// and reuse the same fields, instead of re-parsing raw bytes on every
 /// lookup the way [`get_bmp_glyph_ids`] does.
+#[derive(Debug)]
 pub(crate) struct BmpPrefix {
     pub(crate) start_count: Vec<u16>,
     pub(crate) end_count: Vec<u16>,
