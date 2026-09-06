@@ -48,7 +48,14 @@ fn fcis(text_length: u32) -> Vec<u8> {
 /// `RECORD_SIZE` used as the fixed `record_size` header field value.
 const RECORD_SIZE: u64 = crate::mobi::utils::RECORD_SIZE as u64;
 
-fn mobi_header_fields() -> Vec<FieldDef> {
+/// Port of `MOBIHeader.__init__(file_version=...)`: Python re-templates
+/// its `DEFINITION` string per instance with `file_version` substituted
+/// into both the `file_version` and `min_version` fields (`header_length`
+/// stays the fixed 264-byte KF8-style layout regardless -- real joint
+/// output's MOBI6-view header uses this same shape stamped `file_version
+/// = 6`, not the smaller 232-byte legacy header `writer2::main`'s own
+/// standalone-MOBI6 path builds by hand).
+fn mobi_header_fields(file_version: u64) -> Vec<FieldDef> {
     vec![
         FieldDef::short("compression", FieldValue::Dyn),
         FieldDef::new("unused1", zeroes(2)),
@@ -62,7 +69,7 @@ fn mobi_header_fields() -> Vec<FieldDef> {
         FieldDef::new("book_type", FieldValue::Dyn),
         FieldDef::new("encoding", FieldValue::Int(65001)),
         FieldDef::new("uid", FieldValue::Dyn),
-        FieldDef::new("file_version", FieldValue::Int(8)),
+        FieldDef::new("file_version", FieldValue::Int(file_version)),
         FieldDef::new("meta_orth_record", FieldValue::Int(NULL)),
         FieldDef::new("meta_infl_index", FieldValue::Int(NULL)),
         FieldDef::new("extra_index0", FieldValue::Int(NULL)),
@@ -79,7 +86,7 @@ fn mobi_header_fields() -> Vec<FieldDef> {
         FieldDef::new("language_code", FieldValue::Dyn),
         FieldDef::new("in_lang", FieldValue::Int(0)),
         FieldDef::new("out_lang", FieldValue::Int(0)),
-        FieldDef::new("min_version", FieldValue::Int(8)),
+        FieldDef::new("min_version", FieldValue::Int(file_version)),
         FieldDef::new("first_resource_record", FieldValue::Dyn),
         FieldDef::new("huff_first_record", FieldValue::Int(0)),
         FieldDef::new("huff_count", FieldValue::Int(0)),
@@ -130,11 +137,11 @@ fn mobi_header_fields() -> Vec<FieldDef> {
 /// behavior (`align = false` below), not the apparently-intended one,
 /// since matching what kindlegen/the Kindle firmware actually receives
 /// is what matters for compatibility.
-fn mobi_header() -> Header {
+fn mobi_header(file_version: u64) -> Header {
     Header::new(
         b"",
         false,
-        &mobi_header_fields(),
+        &mobi_header_fields(file_version),
         &[("title_offset", "full_title")],
     )
 }
@@ -181,6 +188,11 @@ pub struct KF8BuildInputs<'a> {
 /// Port of `KF8Book`.
 pub struct KF8Book {
     records: Vec<Vec<u8>>,
+    /// `KF8Book.used_images` (`writer.used_images`, kept verbatim from
+    /// the underlying `KF8Writer` pass) -- a real joint-output caller
+    /// unions this with its own MOBI6 `Serializer::used_images` before
+    /// serializing the shared resource block once.
+    pub used_images: HashSet<String>,
     chunk_index: u32,
     skel_index: u32,
     guide_index: u32,
@@ -319,6 +331,7 @@ impl KF8Book {
 
         Ok(KF8Book {
             records,
+            used_images: inputs.used_images,
             chunk_index,
             skel_index,
             guide_index,
@@ -355,6 +368,24 @@ impl KF8Book {
     /// tweak fields -- e.g. a joint writer overwriting `first_resource_record`
     /// -- between `new()` and serialization, matching Python's intent).
     pub fn record0(&self, metadata: &Metadata) -> Result<Vec<u8>> {
+        self.record0_with_start_offset(metadata, self.start_offset, None)
+    }
+
+    /// Port of `KF8Book.record0` as accessed by `generate_joint_record0`,
+    /// which first does `self.kf8.start_offset = (mobi6_start, kf8's own
+    /// prior start_offset)` -- `build_exth` then writes one `startreading`
+    /// EXTH record per non-`None` element of that pair. `mobi6_start` is
+    /// the MOBI6 sibling writer's own `Serializer::start_offset`.
+    pub fn record0_for_joint(&self, metadata: &Metadata, mobi6_start_offset: Option<u32>) -> Result<Vec<u8>> {
+        self.record0_with_start_offset(metadata, mobi6_start_offset, self.start_offset)
+    }
+
+    fn record0_with_start_offset(
+        &self,
+        metadata: &Metadata,
+        start_offset: Option<u32>,
+        start_offset_secondary: Option<u32>,
+    ) -> Result<Vec<u8>> {
         let exth_params = ExthParams {
             prefer_author_sort: self.opts.prefer_author_sort,
             is_periodical: self.opts.mobi_periodical,
@@ -365,14 +396,15 @@ impl KF8Book {
             kf8_unknown_count: self.kf8_unknown_count,
             kf8_header_index: None,
             be_kindlegen2: true,
-            start_offset: self.start_offset,
+            start_offset,
+            start_offset_secondary,
             mobi_doctype: self.book_type,
             page_progression_direction: self.page_progression_direction.clone(),
             primary_writing_mode: self.primary_writing_mode.clone(),
         };
         let exth = build_exth(metadata, &exth_params).context("building KF8 EXTH header")?;
 
-        let mut header = mobi_header();
+        let mut header = mobi_header(8);
         header.set("compression", FieldValue::Int(self.compression as u64))?;
         header.set("text_length", FieldValue::Int(self.text_length as u64))?;
         header.set(
@@ -410,6 +442,44 @@ impl KF8Book {
         header.set("exth", FieldValue::Bytes(exth))?;
         header.set("full_title", FieldValue::Bytes(self.full_title.clone()))?;
         header.build()
+    }
+
+    /// This `KF8Book`'s own record list, minus the `record0` placeholder
+    /// at index 0 -- what a joint writer appends after its own embedded
+    /// `record0_for_joint()` (`self.kf8.records[1:]` in
+    /// `generate_joint_record0`).
+    pub fn tail_records(&self) -> &[Vec<u8>] {
+        &self.records[1..]
+    }
+
+    /// `KF8Book.compression`, reused as-is for a joint file's MOBI6-view
+    /// header (`generate_joint_record0` never overwrites `compression`).
+    pub fn compression(&self) -> u16 {
+        self.compression
+    }
+
+    /// `KF8Book.book_type`, reused as-is for a joint file's MOBI6-view
+    /// header.
+    pub fn book_type(&self) -> u32 {
+        self.book_type
+    }
+
+    /// `KF8Book.full_title`, reused as-is (bytes and length both) for a
+    /// joint file's MOBI6-view header.
+    pub fn full_title(&self) -> &[u8] {
+        &self.full_title
+    }
+
+    /// `KF8Book.language_code`, reused as-is for a joint file's MOBI6-view
+    /// header.
+    pub fn language_code(&self) -> u32 {
+        self.language_code
+    }
+
+    /// `KF8Book.uid`, reused as-is (both headers of a joint file share one
+    /// UID).
+    pub fn uid(&self) -> u32 {
+        self.uid
     }
 
     /// Port of `KF8Book.write`: assemble the PDB header + all records
@@ -461,6 +531,91 @@ impl KF8Book {
         }
         Ok(out)
     }
+}
+
+/// The 20 `HEADER_FIELDS` values `generate_joint_record0` computes for a
+/// joint file's MOBI6-view `record0` -- some copied verbatim from the
+/// `KF8Book` that was built alongside (`compression`, `book_type`,
+/// `full_title`, `language_code`, `uid`), the rest computed fresh by the
+/// MOBI6 sibling writer once the shared resource block, `BOUNDARY`
+/// marker, and embedded KF8 record set have all been appended to one
+/// combined record list. `chunk_index`/`skel_index`/`guide_index` are
+/// always [`NULL_INDEX`] here -- a MOBI6 reader has no use for KF8's own
+/// structural indices, and Python's `generate_joint_record0` sets them
+/// to `NULL_INDEX` unconditionally rather than remapping them into the
+/// combined list.
+pub struct JointMobi6Fields {
+    pub compression: u16,
+    pub text_length: u32,
+    pub last_text_record: u32,
+    pub book_type: u32,
+    pub first_non_text_record: u32,
+    pub language_code: u32,
+    pub first_resource_record: u32,
+    pub exth_flags: u32,
+    /// MOBI6 has no real FDST record -- this field instead packs the
+    /// first/last content record numbers as two big-endian `u16`s
+    /// (`pack('>HH', 1, last_content_record)` in Python), matching the
+    /// `MOBIHeader.DEFINITION` comment: "In MOBI 6 the fdst record is
+    /// instead two two byte fields storing the index of the first and
+    /// last content records."
+    pub fdst_record_packed: u32,
+    pub ncx_index: u32,
+    pub extra_data_flags: u32,
+    pub flis_record: u32,
+    pub fcis_record: u32,
+    pub uid: u32,
+    pub full_title: Vec<u8>,
+    pub exth: Vec<u8>,
+}
+
+/// Port of `MOBIHeader(file_version=6)(**header_fields)`, the last line
+/// of `generate_joint_record0` -- builds the MOBI6-view `record0` of a
+/// joint MOBI6+KF8 file using the same 264-byte KF8-style header layout
+/// as [`KF8Book::record0`], just stamped `file_version = 6` and filled
+/// from [`JointMobi6Fields`] instead of `KF8Book`'s own state.
+pub fn build_joint_mobi6_record0(fields: JointMobi6Fields) -> Result<Vec<u8>> {
+    let mut header = mobi_header(6);
+    header.set("compression", FieldValue::Int(fields.compression as u64))?;
+    header.set("text_length", FieldValue::Int(fields.text_length as u64))?;
+    header.set(
+        "last_text_record",
+        FieldValue::Int(fields.last_text_record as u64),
+    )?;
+    header.set("book_type", FieldValue::Int(fields.book_type as u64))?;
+    header.set("uid", FieldValue::Int(fields.uid as u64))?;
+    header.set(
+        "first_non_text_record",
+        FieldValue::Int(fields.first_non_text_record as u64),
+    )?;
+    header.set(
+        "title_length",
+        FieldValue::Int(fields.full_title.len() as u64),
+    )?;
+    header.set("language_code", FieldValue::Int(fields.language_code as u64))?;
+    header.set(
+        "first_resource_record",
+        FieldValue::Int(fields.first_resource_record as u64),
+    )?;
+    header.set("exth_flags", FieldValue::Int(fields.exth_flags as u64))?;
+    header.set(
+        "fdst_record",
+        FieldValue::Int(fields.fdst_record_packed as u64),
+    )?;
+    header.set("fdst_count", FieldValue::Int(1))?;
+    header.set("fcis_record", FieldValue::Int(fields.fcis_record as u64))?;
+    header.set("flis_record", FieldValue::Int(fields.flis_record as u64))?;
+    header.set(
+        "extra_data_flags",
+        FieldValue::Int(fields.extra_data_flags as u64),
+    )?;
+    header.set("ncx_index", FieldValue::Int(fields.ncx_index as u64))?;
+    header.set("chunk_index", FieldValue::Int(NULL_INDEX as u64))?;
+    header.set("skel_index", FieldValue::Int(NULL_INDEX as u64))?;
+    header.set("guide_index", FieldValue::Int(NULL_INDEX as u64))?;
+    header.set("exth", FieldValue::Bytes(fields.exth))?;
+    header.set("full_title", FieldValue::Bytes(fields.full_title))?;
+    header.build()
 }
 
 #[cfg(test)]

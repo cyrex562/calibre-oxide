@@ -11,13 +11,15 @@
 //! `indexer.rs` here is deliberately read as index.rs's inverse rather
 //! than re-derived independently.
 //!
-//! Scope note: the joint MOBI6+KF8 (`.azw3`) output path (`main.py`'s
-//! `kf8`-present branches) needs `mobi/writer8` (`crate::mobi::writer8`,
-//! ported in issue #35) *plus* interleaving logic between the two
-//! writers that hasn't been written yet (shared `Resources`, offset
-//! patching between the two `record0`s, a combined record list). Those
-//! branches are represented here with a real signature and a documented
-//! `todo!()` -- see `main::MobiWriter::write_joint`.
+//! The joint MOBI6+KF8 (`.azw3`) output path (`main.py`'s `kf8`-present
+//! branches) is real (issue #157): `main::MobiWriter::write_joint`
+//! interleaves this writer's own text/index records with a sibling
+//! `crate::mobi::writer8::mobi::KF8Book`'s, sharing one `Resources`
+//! block. No output plugin drives it yet (`output::mobi_output::MOBIOutput`
+//! only ever calls the standalone [`main::MobiWriter::write`]; there is
+//! no `AZW3Output` plugin in this crate at all) -- that dispatch (real
+//! upstream's own old/new/both `mobi_output_format` option) is separate,
+//! unstarted scope.
 
 pub mod indexer;
 pub mod main;

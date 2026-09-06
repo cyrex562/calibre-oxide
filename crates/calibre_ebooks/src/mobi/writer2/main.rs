@@ -5,33 +5,35 @@
 //!
 //! Port of `calibre.ebooks.mobi.writer2.main.MobiWriter`.
 //!
-//! # Scope: joint MOBI6+KF8 (`.azw3`) output
+//! # Joint MOBI6+KF8 (`.azw3`) output
 //!
-//! Python's `MobiWriter.__init__` takes an optional `kf8` (a
-//! `Mobi8Writer` from `mobi/writer8`), and when present, `dump_stream`
-//! calls `generate_joint_record0` instead of `generate_record0` to
-//! interleave a second, KF8-format `record0` and record set into the
-//! same file. `mobi/writer8` is now ported (issue #35 --
-//! `crate::mobi::writer8`, notably `writer8::main::KF8Writer` and
-//! `writer8::mobi::KF8Book`, whose `for_joint` flag already skips
-//! serializing its own resource records so a joint caller can share one
-//! resource block), but *wiring the two writers together* into one PDB
-//! (interleaving both `record0`s, adjusting each side's resource/EXTH
-//! offsets to account for the shared block, and writing a single combined
-//! record list with a KF8-boundary EXTH marker for the reader's
-//! `kf8_type == "joint"` detection) is still real, unwritten integration
-//! work -- left as a documented gap rather than attempted under issue
-//! #35's time budget (that issue's actual deliverable is the standalone
-//! `writer8` module set, which is complete and round-trip tested; wiring
-//! joint output was called out there as a bonus, not a blocker).
-//! [`MobiWriter::write_joint`] takes the real Python call shape
-//! (`kf8: Option<&()>` standing in for a `KF8Writer`/`KF8Book` pair,
-//! since the exact shared-`Resources`-and-offset-patching integration
-//! hasn't been designed yet) and is a documented `todo!()`. The
-//! standalone path ([`MobiWriter::write`], `kf8 = None` in Python) is
-//! fully implemented.
+//! Port of `MobiWriter.generate_joint_record0` (issue #157). A joint file
+//! shares one `Resources` block between the MOBI6 writer (this module)
+//! and a [`KF8Book`] (`mobi::writer8`, built with `for_joint = true` so
+//! it skips serializing its own resource records) built by the caller.
+//! [`MobiWriter::write_joint`] runs the same `generate_content` this
+//! module's standalone [`MobiWriter::write`] uses (own text/index
+//! records), then instead of [`MobiWriter::generate_record0`], appends:
+//! the shared resource records (keyed off the *union* of both writers'
+//! `used_images`), FLIS/FCIS, a literal `BOUNDARY` marker record, the
+//! `KF8Book`'s own embedded `record0` (via
+//! [`KF8Book::record0_for_joint`], which additionally EXTH-encodes this
+//! writer's own `start_offset` alongside the KF8 book's), and the rest of
+//! the `KF8Book`'s own record list. The MOBI6-view `record0` is then
+//! built via [`build_joint_mobi6_record0`] (the same 264-byte KF8-style
+//! header shape `KF8Book::record0` itself uses, just stamped
+//! `file_version = 6`) with an EXTH `kf8_header_index` marker pointing at
+//! the embedded KF8 header -- what the reader's `kf8_type == "joint"`
+//! detection (`crate::mobi::mobi6`, issue #33) looks for.
+//!
+//! One real upstream quirk, disclosed rather than silently "fixed": the
+//! MOBI6-view header's `chunk_index`/`skel_index`/`guide_index` are set
+//! to `NULL_INDEX` unconditionally, not remapped into the combined
+//! record list -- a MOBI6 reader has no use for KF8's own structural
+//! indices, and Python's `generate_joint_record0` does the same (see
+//! [`JointMobi6Fields`]'s own doc for detail).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -46,6 +48,7 @@ use crate::mobi::writer2::resources::{ResourceOpts, Resources};
 use crate::mobi::writer2::serializer::{urlnormalize, Serializer};
 use crate::mobi::writer2::{PALMDOC, UNCOMPRESSED};
 use crate::mobi::writer8::exth::{build_exth, ExthParams};
+use crate::mobi::writer8::mobi::{build_joint_mobi6_record0, JointMobi6Fields, KF8Book, NULL_INDEX};
 use crate::mobi::MobiLog;
 use crate::oeb::book::OEBBook;
 
@@ -104,6 +107,31 @@ struct Record0Inputs<'a> {
     first_non_text_record_idx: usize,
 }
 
+/// Output of [`MobiWriter::generate_content`]: everything both
+/// [`MobiWriter::write`] and [`MobiWriter::write_joint`] need to build
+/// `records[0]`, owned (not borrowed) so both callers can build their
+/// own [`Record0Inputs`]-shaped view (or, for the joint path, mutate the
+/// record list directly) without fighting the borrow checker over an
+/// `Indexer` reference.
+struct ContentParts {
+    records: Vec<Vec<u8>>,
+    /// `Serializer::used_images`/`Serializer::start_offset` -- the only
+    /// two `Serializer` fields either `generate_record0` or
+    /// `generate_joint_record0` reads, pulled out here rather than
+    /// storing the `Serializer` itself (which borrows a `HashMap` local
+    /// to [`MobiWriter::generate_content`] and so can't outlive it).
+    used_images: HashSet<String>,
+    start_offset: Option<usize>,
+    is_periodical: bool,
+    cover_offset: Option<usize>,
+    thumbnail_offset: Option<usize>,
+    text_length: usize,
+    last_text_record_idx: usize,
+    first_non_text_record_idx: usize,
+    primary_index_record_idx: Option<usize>,
+    indexer: Option<Indexer>,
+}
+
 /// Assembles a standalone MOBI 6 file from an `OEBBook`.
 pub struct MobiWriter {
     opts: MobiWriterOpts,
@@ -132,14 +160,79 @@ impl MobiWriter {
     /// + `generate_record0` + `write_header` + `write_content`).
     pub fn write(&mut self, oeb: &OEBBook) -> Result<Vec<u8>> {
         let is_periodical = detect_periodical(&oeb.toc, Some(&mut self.log));
-
         let resource_opts = ResourceOpts {
             mobi_keep_original_images: self.opts.mobi_keep_original_images,
         };
+        // Fonts are KF8-only content, so a standalone MOBI6 file never
+        // needs them (`add_fonts = false`, matching Python's
+        // `Resources(oeb, opts, is_periodical, add_fonts=create_kf8)`
+        // with `create_kf8 = False` here).
         let mut resources = Resources::new(oeb, resource_opts, is_periodical, false);
+
+        let mut parts = self.generate_content(oeb, &mut resources)?;
+
+        let inputs = Record0Inputs {
+            is_periodical: parts.is_periodical,
+            primary_index_record_idx: parts.primary_index_record_idx,
+            indexer: parts.indexer.as_ref(),
+            cover_offset: parts.cover_offset,
+            thumbnail_offset: parts.thumbnail_offset,
+            text_length: parts.text_length,
+            last_text_record_idx: parts.last_text_record_idx,
+            first_non_text_record_idx: parts.first_non_text_record_idx,
+        };
+        self.generate_record0(
+            oeb,
+            &mut parts.records,
+            &mut resources,
+            &parts.used_images,
+            parts.start_offset,
+            &inputs,
+        )?;
+
+        let mut out = Vec::new();
+        self.write_header(oeb, &parts.records, &mut out)?;
+        for record in &parts.records {
+            out.extend_from_slice(record);
+        }
+        Ok(out)
+    }
+
+    /// Encode `oeb` as a joint MOBI6+KF8 (`.azw3`) file, sharing one
+    /// resource block with `kf8`. Port of `MobiWriter.dump_stream`'s
+    /// `kf8 is not None` path (`generate_content` + `generate_joint_record0`
+    /// + `write_header` + `write_content`). See the module doc for the
+    /// real interleaving this performs.
+    ///
+    /// `resources` must be the *same* `Resources` instance `kf8` itself
+    /// was built from (via `KF8Writer::write_for_joint`) -- real
+    /// upstream constructs one `Resources` object in the output plugin
+    /// and threads it into both sub-writers by reference, rather than
+    /// each independently deriving its own copy.
+    pub fn write_joint(&mut self, oeb: &OEBBook, kf8: &KF8Book, resources: &mut Resources) -> Result<Vec<u8>> {
+        let mut parts = self.generate_content(oeb, resources)?;
+        self.generate_joint_record0(oeb, &mut parts, resources, kf8)?;
+
+        let mut out = Vec::new();
+        self.write_header(oeb, &parts.records, &mut out)?;
+        for record in &parts.records {
+            out.extend_from_slice(record);
+        }
+        Ok(out)
+    }
+
+    /// Port of `MobiWriter.generate_content`: resource bookkeeping, text
+    /// serialization/compression/splitting into records, and (if the
+    /// `OEBBook` has a TOC) the MOBI index. Shared by both [`Self::write`]
+    /// and [`Self::write_joint`], which only differ in how `records[0]`
+    /// gets built afterwards (and, for the joint path, in whether
+    /// `resources` is this writer's own or shared with a sibling
+    /// [`KF8Book`]).
+    fn generate_content(&mut self, oeb: &OEBBook, resources: &mut Resources) -> Result<ContentParts> {
         if !resources.records.is_empty() && resources.records[0].is_none() {
             anyhow::bail!("Failed to find masthead image in manifest");
         }
+        let is_periodical = detect_periodical(&oeb.toc, Some(&mut self.log));
         let masthead_offset = resources.masthead_offset;
         let cover_offset = resources.cover_offset;
         let thumbnail_offset = resources.thumbnail_offset;
@@ -223,39 +316,130 @@ impl MobiWriter {
             }
         }
 
-        let inputs = Record0Inputs {
+        Ok(ContentParts {
+            records,
+            used_images: serializer.used_images,
+            start_offset: serializer.start_offset,
             is_periodical,
-            primary_index_record_idx,
-            indexer: indexer.as_ref(),
             cover_offset,
             thumbnail_offset,
             text_length,
             last_text_record_idx,
             first_non_text_record_idx,
-        };
-        self.generate_record0(oeb, &mut records, &mut resources, &serializer, &inputs)?;
-
-        let mut out = Vec::new();
-        self.write_header(oeb, &records, &mut out)?;
-        for record in &records {
-            out.extend_from_slice(record);
-        }
-        Ok(out)
+            primary_index_record_idx,
+            indexer,
+        })
     }
 
-    /// Placeholder for the joint MOBI6+KF8 (`.azw3`) output path.
-    ///
-    /// `kf8` stands in for a `writer8::main::KF8Writer` +
-    /// `writer8::mobi::KF8Book` pair (`mobi/writer8/main.py`'s
-    /// `Mobi8Writer` in Python) -- `mobi/writer8` itself is ported (issue
-    /// #35), but the interleaving logic this function needs (shared
-    /// `Resources`, offset patching between the two `record0`s, a single
-    /// combined record list, the KF8-boundary EXTH marker) is not yet
-    /// written. See the module scope note.
-    pub fn write_joint(&mut self, _oeb: &OEBBook, _kf8: Option<&()>) -> Result<Vec<u8>> {
-        todo!(
-            "placeholder: joint KF8 output needs writer2+writer8 interleaving logic, not yet written — see issue #35 scope note"
-        )
+    /// Port of `MobiWriter.generate_joint_record0`. See the module doc
+    /// for the full real interleaving this performs.
+    fn generate_joint_record0(
+        &mut self,
+        oeb: &OEBBook,
+        parts: &mut ContentParts,
+        resources: &mut Resources,
+        kf8: &KF8Book,
+    ) -> Result<()> {
+        // Shared resource block: the union of both sides' used images,
+        // serialized once into the combined record list.
+        let mut first_image_record: Option<usize> = None;
+        let before_resources = parts.records.len();
+        if !resources.is_empty() {
+            let mut used_images = parts.used_images.clone();
+            used_images.extend(kf8.used_images.iter().cloned());
+            first_image_record = Some(parts.records.len());
+            resources.serialize(&mut parts.records, &used_images);
+        }
+        let resource_record_count = parts.records.len() - before_resources;
+        let last_content_record = parts.records.len() - 1;
+
+        let flis_number = parts.records.len();
+        parts.records.push(FLIS.to_vec());
+        let fcis_number = parts.records.len();
+        parts.records.push(fcis(parts.text_length as u32));
+
+        // Insert the KF8 half: a literal `BOUNDARY` marker, the KF8
+        // book's own embedded record0 (EXTH-encoding both writers'
+        // start_offset), then the rest of its own record list.
+        parts.records.push(b"BOUNDARY".to_vec());
+        let kf8_header_index = parts.records.len();
+        let kf8_record0 = kf8
+            .record0_for_joint(&oeb.metadata, parts.start_offset.map(|v| v as u32))
+            .context("building joint KF8 record0")?;
+        parts.records.push(kf8_record0);
+        parts.records.extend(kf8.tail_records().iter().cloned());
+
+        let first_image_record = first_image_record.unwrap_or(parts.records.len());
+
+        let mut exth_flags: u32 = 0b100001010000; // Kindlegen uses this
+        if resources.has_fonts {
+            exth_flags |= 0b1000000000000;
+        }
+
+        // MOBI6 has no real FDST record: this field packs the first/last
+        // content record numbers as two big-endian u16s instead
+        // (`pack('>HH', 1, last_content_record)` in Python).
+        let fdst_record_packed = (1u32 << 16) | (last_content_record as u32 & 0xffff);
+
+        let mut extra_data_flags: u32 = 0b1;
+        if parts.primary_index_record_idx.is_some() {
+            extra_data_flags |= 0b10;
+        }
+        let kuc = if resource_record_count > 0 {
+            Some(0u32)
+        } else {
+            None
+        };
+
+        // Real upstream reads `opts.mobi_periodical` here rather than
+        // this writer's own detected `is_periodical` -- moot in
+        // practice, since `mobi_output.py` forces `mobi_type = 'old'`
+        // (no KF8 at all) whenever a book is a periodical, so
+        // `generate_joint_record0` never actually runs for one; using
+        // the detected value is equivalent for every real caller.
+        let exth_params = ExthParams {
+            prefer_author_sort: self.opts.prefer_author_sort,
+            is_periodical: parts.is_periodical,
+            share_not_sync: self.opts.share_not_sync,
+            cover_offset: parts.cover_offset.map(|v| v as u32),
+            thumbnail_offset: parts.thumbnail_offset.map(|v| v as u32),
+            num_of_resources: Some(resource_record_count as u32),
+            kf8_unknown_count: kuc,
+            kf8_header_index: Some(kf8_header_index as u32),
+            be_kindlegen2: true,
+            start_offset: parts.start_offset.map(|v| v as u32),
+            start_offset_secondary: None,
+            mobi_doctype: 2,
+            page_progression_direction: None,
+            primary_writing_mode: None,
+        };
+        let exth = build_exth(&oeb.metadata, &exth_params).context("building joint MOBI6 EXTH header")?;
+
+        let ncx_index = parts
+            .primary_index_record_idx
+            .map(|v| v as u32)
+            .unwrap_or(NULL_INDEX);
+
+        let fields = JointMobi6Fields {
+            compression: kf8.compression(),
+            text_length: parts.text_length as u32,
+            last_text_record: parts.last_text_record_idx as u32,
+            book_type: kf8.book_type(),
+            first_non_text_record: parts.first_non_text_record_idx as u32,
+            language_code: kf8.language_code(),
+            first_resource_record: first_image_record as u32,
+            exth_flags,
+            fdst_record_packed,
+            ncx_index,
+            extra_data_flags,
+            flis_record: flis_number as u32,
+            fcis_record: fcis_number as u32,
+            uid: kf8.uid(),
+            full_title: kf8.full_title().to_vec(),
+            exth,
+        };
+        parts.records[0] = build_joint_mobi6_record0(fields)?;
+        Ok(())
     }
 
     /// Build `records[0]` (the PalmDOC + MOBI + EXTH + title header) and
@@ -266,7 +450,8 @@ impl MobiWriter {
         oeb: &OEBBook,
         records: &mut Vec<Vec<u8>>,
         resources: &mut Resources,
-        serializer: &Serializer,
+        used_images: &HashSet<String>,
+        start_offset: Option<usize>,
         inputs: &Record0Inputs,
     ) -> Result<()> {
         let mut bt: u32 = 0x002;
@@ -282,7 +467,7 @@ impl MobiWriter {
             share_not_sync: self.opts.share_not_sync,
             cover_offset: inputs.cover_offset.map(|v| v as u32),
             thumbnail_offset: inputs.thumbnail_offset.map(|v| v as u32),
-            start_offset: serializer.start_offset.map(|v| v as u32),
+            start_offset: start_offset.map(|v| v as u32),
             mobi_doctype: bt,
             ..Default::default()
         };
@@ -290,9 +475,8 @@ impl MobiWriter {
 
         let mut first_image_record: Option<usize> = None;
         if !resources.is_empty() {
-            let used_images = serializer.used_images.clone();
             first_image_record = Some(records.len());
-            resources.serialize(records, &used_images);
+            resources.serialize(records, used_images);
         }
         let last_content_record = records.len() - 1;
 
