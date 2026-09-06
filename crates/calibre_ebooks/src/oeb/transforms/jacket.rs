@@ -838,7 +838,12 @@ pub fn linearize_jacket(oeb: &mut OEBBook) {
     }
 }
 
-fn is_jacket_document(dom: &Dom) -> bool {
+/// Port of `is_current_jacket` (`oeb/polish/jacket.py`, issue #168) --
+/// this is the SAME real check real upstream's own `is_current_jacket`
+/// performs, just already implemented here under a different name for
+/// this file's own `Jacket` transform's use. `pub(crate)` so
+/// `oeb::polish::jacket` can reuse it directly instead of duplicating.
+pub(crate) fn is_jacket_document(dom: &Dom) -> bool {
     dom.find_all_tag_global("meta").iter().any(|&m| {
         dom.node(m).attrs.get("name").map(|s| s.as_str()) == Some(JACKET_META_NAME)
             && dom.node(m).attrs.get("content").map(|s| s.as_str()) == Some(JACKET_META_VALUE)

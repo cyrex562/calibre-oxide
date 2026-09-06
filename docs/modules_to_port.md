@@ -623,8 +623,8 @@ either -- this pass wasn't exhaustive.
 - [x] hyphenation.py
 - [x] images.py
 - [x] import_book.py
-- [ ] jacket.py
-- [ ] kepubify.py
+- [x] jacket.py (issue #168's jacket.py half CLOSED -- `oeb::polish::jacket`: find/replace/remove an existing jacket page in an already-built book via `Container`, real end-to-end tests exercising metadata rendering, spine insertion at the right index, idempotent replace, and removal. Real `container.mi`-equivalent metadata via `crate::opf::parse_opf` on the container's own serialized OPF; the GUI `page_setup` output-profile preference lookup is collapsed into `transforms::jacket::JacketOptions::default()`, matching that already-ported file's own documented narrowing. `kepubify.py` split out to its own issue since it also depends on the unported `tts.py`)
+- [ ] kepubify.py (split into its own issue, blocked on tts.py)
 - [ ] main.py
 - [x] opf.py
 - [x] parsing.py
