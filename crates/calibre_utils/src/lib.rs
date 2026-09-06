@@ -6,6 +6,7 @@ pub mod constants;
 pub mod copy_files;
 pub mod date;
 pub mod exim;
+pub mod ffml_processor;
 pub mod file_type_icons;
 pub mod filenames;
 pub mod formatter;
