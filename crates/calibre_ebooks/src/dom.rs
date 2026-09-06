@@ -176,6 +176,29 @@ impl Dom {
         self.nodes.len() - 1
     }
 
+    /// Recursively copies `other`'s subtree rooted at `other_id` into
+    /// `self`'s own arena, returning the new (unattached) root. Used by
+    /// any caller that parses a small HTML snippet into its own
+    /// throwaway [`Dom`] and needs to splice its content into a
+    /// different document (e.g. `html_transform_rules`'s `insert`/
+    /// `append` actions) -- callers attach the returned id with
+    /// [`Self::append_child`]/[`Self::insert_child`].
+    pub fn clone_from(&mut self, other: &Dom, other_id: NodeId) -> NodeId {
+        let src = other.node(other_id);
+        let new_id = self.nodes.len();
+        self.nodes.push(Node {
+            kind: src.kind.clone(),
+            attrs: src.attrs.clone(),
+            children: Vec::new(),
+            parent: None,
+        });
+        for &child in &src.children {
+            let new_child = self.clone_from(other, child);
+            self.append_child(new_id, new_child);
+        }
+        new_id
+    }
+
     /// Detaches `id` from its parent's child list (the node itself stays
     /// alive in the arena, orphaned, so other `NodeId`s referencing it or
     /// its descendants remain valid).
