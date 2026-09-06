@@ -219,24 +219,12 @@ pub fn get_variant(bold: bool, italic: bool) -> &'static str {
 /// generic class of its own.
 ///
 /// Port of the Python `panose_to_css_generic_family`
-/// (`calibre.utils.fonts.utils`).
+/// (`calibre.utils.fonts.utils`) -- the canonical copy now lives at
+/// `calibre_utils::fonts::utils::panose_to_css_generic_family` (issue
+/// #548, ported after this file), which didn't exist yet when this
+/// file was first ported.
 pub fn panose_to_css_generic_family(panose: &[u8]) -> String {
-    let proportion = panose.get(3).copied().unwrap_or(0);
-    if proportion == 9 {
-        return "monospace".to_string();
-    }
-    let family_type = panose.first().copied().unwrap_or(0);
-    if family_type == 3 {
-        return "cursive".to_string();
-    }
-    if family_type == 4 {
-        return "fantasy".to_string();
-    }
-    let serif_style = panose.get(1).copied().unwrap_or(0);
-    if matches!(serif_style, 11 | 12 | 13) {
-        return "sans-serif".to_string();
-    }
-    "serif".to_string()
+    calibre_utils::fonts::utils::panose_to_css_generic_family(panose)
 }
 
 /// Parses a run of hex-digit pairs (`w:panose1`'s/an embedded font
