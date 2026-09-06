@@ -2,7 +2,7 @@ use calibre_devices::interface::Device;
 use calibre_devices::nook::NookDevice;
 use calibre_devices::scanner::USBDevice;
 use calibre_devices::smart_device_app::SmartDevice;
-use calibre_devices::userdefined::UserDefinedDevice;
+use calibre_devices::userdefined::{UserDefinedConfig, UserDefinedDevice};
 
 #[test]
 fn test_device_stubs() {
@@ -23,7 +23,16 @@ fn test_device_stubs() {
         "Smart Device App"
     );
 
-    let mut user = UserDefinedDevice::new();
+    // Non-zero ids so this config genuinely doesn't match `dummy_usb`
+    // (0/0) -- a config left at 0/0 would spuriously match it, since
+    // `can_handle` is a plain vendor/product id equality check.
+    let mut user = UserDefinedDevice::new(UserDefinedConfig {
+        vendor_id: 1,
+        product_id: 1,
+        vendor_name: None,
+        main_memory_path: None,
+        card_a_path: None,
+    });
     assert!(!user.can_handle(&dummy_usb, false));
     assert!(user.open(&dummy_usb, None).is_err());
     assert_eq!(
