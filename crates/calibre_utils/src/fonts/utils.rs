@@ -107,32 +107,40 @@ pub fn get_table(raw: &[u8], name: &str) -> Option<TableRecord> {
 
 /// A minimal big-endian binary cursor, port of `Unpackable`'s role in
 /// `struct.unpack_from` call sites throughout this file.
-struct Cursor<'a> {
+pub(crate) struct Cursor<'a> {
     data: &'a [u8],
     pos: usize,
 }
 
 impl<'a> Cursor<'a> {
-    fn new(data: &'a [u8]) -> Self {
+    pub(crate) fn new(data: &'a [u8]) -> Self {
         Cursor { data, pos: 0 }
     }
 
-    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
         let v = self.data.get(self.pos..self.pos + n).ok_or("truncated font table")?;
         self.pos += n;
         Ok(v)
     }
 
-    fn u16(&mut self) -> Result<u16, String> {
+    pub(crate) fn u16(&mut self) -> Result<u16, String> {
         Ok(u16::from_be_bytes(self.take(2)?.try_into().unwrap()))
     }
 
-    fn i16(&mut self) -> Result<i16, String> {
+    pub(crate) fn i16(&mut self) -> Result<i16, String> {
         Ok(self.u16()? as i16)
     }
 
-    fn u32(&mut self) -> Result<u32, String> {
+    pub(crate) fn u32(&mut self) -> Result<u32, String> {
         Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    pub(crate) fn i32(&mut self) -> Result<i32, String> {
+        Ok(self.u32()? as i32)
+    }
+
+    pub(crate) fn i64(&mut self) -> Result<i64, String> {
+        Ok(i64::from_be_bytes(self.take(8)?.try_into().unwrap()))
     }
 }
 
