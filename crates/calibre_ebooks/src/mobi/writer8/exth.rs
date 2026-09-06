@@ -15,13 +15,16 @@
 //! path, `mobi::writer2::exth` re-exports from here instead of the
 //! reverse, and there is exactly one copy of `build_exth`.
 //!
-//! `start_offset` is `Option<u32>` (a single value) rather than Python's
-//! `start_offset: int | Sequence[int] | None` -- every call site in both
-//! `writer2/main.py` and `writer8/mobi.py` (`self.start_offset`, set by
-//! `Serializer`/`KF8Writer.create_guide` from a single `<guide
-//! type="start">` reference) only ever passes a single optional value or
-//! `None`, never a real sequence, so the simpler shape is a faithful
-//! match for every real caller.
+//! `start_offset` is `Option<u32>` plus a second `start_offset_secondary`
+//! field, rather than Python's `start_offset: int | Sequence[int] | None`
+//! -- every call site sets at most a 1- or 2-element sequence: a single
+//! optional value (`Serializer`/`KF8Writer.create_guide`, from a single
+//! `<guide type="start">` reference), or, for a joint MOBI6+KF8 file's
+//! embedded KF8 header, the 2-tuple `(mobi6_start, kf8's_own_start)` that
+//! `MobiWriter.generate_joint_record0` assigns to `self.kf8.start_offset`
+//! right before reading `self.kf8.record0`. `build_exth` writes one
+//! `startreading` EXTH record per non-`None` element, in order, so the
+//! two-field shape is a faithful match without a real `Vec`.
 //!
 //! Two small pieces of the Python original are simplified rather than
 //! fully reproduced, both because their backing tables
@@ -92,6 +95,9 @@ pub struct ExthParams {
     pub cover_offset: Option<u32>,
     pub thumbnail_offset: Option<u32>,
     pub start_offset: Option<u32>,
+    /// Second element of a joint file's `(mobi6_start, kf8_start)` pair.
+    /// `None` for every non-joint caller.
+    pub start_offset_secondary: Option<u32>,
     pub mobi_doctype: u32,
     pub num_of_resources: Option<u32>,
     pub kf8_unknown_count: Option<u32>,
@@ -282,7 +288,7 @@ pub fn build_exth(metadata: &Metadata, params: &ExthParams) -> Result<Vec<u8>> {
         nrecs += 2;
     }
 
-    if let Some(so) = params.start_offset {
+    for so in [params.start_offset, params.start_offset_secondary].into_iter().flatten() {
         write_u32_record(&mut body, code_for("startreading"), so);
         nrecs += 1;
     }

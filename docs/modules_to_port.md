@@ -564,7 +564,7 @@ either -- this pass wasn't exhaustive.
 
 - [x] __init__.py
 - [x] indexer.py
-- [x] main.py
+- [x] main.py (issue #157 closed the last real gap: `MobiWriter::write_joint`/`generate_joint_record0` now really interleave a joint MOBI6+KF8 `.azw3` file -- shared `Resources` block keyed off the union of both writers' `used_images`, a literal `BOUNDARY` marker, the embedded `KF8Book::record0_for_joint` plus its own record list, and a MOBI6-view `record0` built via `writer8::mobi::build_joint_mobi6_record0` (the same 264-byte KF8-style header shape, stamped `file_version = 6`) with an EXTH `kf8_header_index` marker for the reader's `kf8_type == "joint"` detection. Round-trip tested: both the MOBI6 and the embedded KF8 payload recover their real text through this crate's own readers. No output plugin drives this path yet -- `output::mobi_output::MOBIOutput` only calls the standalone `write()`, and there is no `AZW3Output` plugin in this crate at all; that dispatch is separate, unstarted scope)
 - [x] resources.py
 - [x] serializer.py
 

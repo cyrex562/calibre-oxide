@@ -597,10 +597,29 @@ impl KF8Writer {
     /// Port of `KF8Writer.__init__` followed by `KF8Book(writer,
     /// for_joint=False)` (`create_kf8_book(oeb, opts, resources,
     /// for_joint=False)` with a `KF8Writer`-owned `Resources` rather
-    /// than a caller-supplied shared one -- see the `for_joint` note on
-    /// [`KF8Book::new`] for what a real joint-output caller would need
-    /// to do differently).
+    /// than a caller-supplied shared one -- see [`Self::write_for_joint`]
+    /// for the real joint-output path, which threads an externally
+    /// shared `Resources` through instead).
     pub fn write(&mut self, oeb: &mut OEBBook) -> Result<KF8Book> {
+        let resource_opts = ResourceOpts {
+            mobi_keep_original_images: self.opts.mobi_keep_original_images,
+        };
+        let mut resources = Resources::new(oeb, resource_opts, self.opts.mobi_periodical, true);
+        self.write_impl(oeb, &mut resources, false)
+    }
+
+    /// Port of `KF8Writer(oeb, opts, resources, for_joint=True)` followed
+    /// by `KF8Book(writer, for_joint=True)`, i.e. `create_kf8_book(oeb,
+    /// opts, resources, for_joint=True)` -- the real joint MOBI6+KF8
+    /// output path (issue #157): `resources` is the *same* instance a
+    /// sibling `MobiWriter::write_joint` call will also serialize the
+    /// shared resource block into, rather than each writer independently
+    /// deriving its own copy.
+    pub fn write_for_joint(&mut self, oeb: &mut OEBBook, resources: &mut Resources) -> Result<KF8Book> {
+        self.write_impl(oeb, resources, true)
+    }
+
+    fn write_impl(&mut self, oeb: &mut OEBBook, resources: &mut Resources, for_joint: bool) -> Result<KF8Book> {
         let compress_flag = !self.opts.dont_compress;
 
         let toc_opts = TocOpts {
@@ -611,11 +630,6 @@ impl KF8Writer {
             extra_css: self.opts.extra_css.clone(),
         };
         let mut toc_adder = TocAdder::new(oeb, &toc_opts, true, false)?;
-
-        let resource_opts = ResourceOpts {
-            mobi_keep_original_images: self.opts.mobi_keep_original_images,
-        };
-        let mut resources = Resources::new(oeb, resource_opts, self.opts.mobi_periodical, true);
 
         let mut docs: Vec<(String, Dom)> = Vec::new();
         for item in oeb.spine.iter() {
@@ -631,7 +645,7 @@ impl KF8Writer {
 
         cleanup_markup(&mut docs);
         let mut used_images: HashSet<String> = HashSet::new();
-        replace_resource_links(&mut docs, &resources, &mut used_images);
+        replace_resource_links(&mut docs, resources, &mut used_images);
 
         let mut flows: Vec<Vec<u8>> = vec![Vec::new()];
         extract_css_into_flows(oeb, &mut docs, &mut flows);
@@ -721,7 +735,7 @@ impl KF8Writer {
             skel_records,
             guide_records,
             ncx_records,
-            resources: &mut resources,
+            resources,
             used_images,
             fdst_count,
             fdst_records,
@@ -734,7 +748,7 @@ impl KF8Writer {
             primary_writing_mode,
         };
 
-        KF8Book::new(inputs, false)
+        KF8Book::new(inputs, for_joint)
     }
 }
 
