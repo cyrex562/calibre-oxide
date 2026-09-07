@@ -57,7 +57,6 @@
 //! covered by this issue.
 
 use std::any::Any;
-use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
