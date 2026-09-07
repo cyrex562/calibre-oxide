@@ -29,14 +29,14 @@
 //!   `PropertyValue`s).
 //! - [`html_css_stylesheet`]: parses the bundled user-agent stylesheet
 //!   (`templates/html.css`, embedded via `include_str!`) once, cached.
-//! - [`media_ok`]/[`media_allowed`]: a scoped media-query-list parser
-//!   (comma-separated `[not|only] <type> [and (<feature>[: <value>])]*`)
-//!   -- real, but narrower than `tinycss.mediaquery3.CSSMedia3Parser`:
-//!   feature *values* are never evaluated (matching Python's own
-//!   `IGNORED_MEDIA_FEATURES` table, which always fails a query on any
-//!   device-specific feature regardless of its value), and an
-//!   unparseable query string is treated as "allowed" (matching
-//!   Python's `except Exception: return True`).
+//! - [`media_ok`]/[`media_allowed`]: real `tinycss.mediaquery3.CSSMedia3Parser`
+//!   grammar as of issue #581 ([`crate::oeb::media3::parse_media`]),
+//!   previously a scoped hand-rolled parser. Feature *values* are still
+//!   never evaluated (matching Python's own `IGNORED_MEDIA_FEATURES`
+//!   table, which always fails a query on any device-specific feature
+//!   regardless of its value) -- that's a real upstream design choice,
+//!   not a gap in this port. An unparseable query string is treated as
+//!   "allowed" (matching Python's `except Exception: return True`).
 //! - [`iterrules`]: walks `@import`/`@media` for real against
 //!   [`crate::css::Stylesheet`].
 //! - [`normalize_style_declaration`]/[`iterdeclaration`]: real, with one
@@ -374,81 +374,15 @@ const IGNORED_MEDIA_FEATURES: &[&str] = &[
     "grid",
 ];
 
-struct MediaQuery {
-    media_type: String,
-    negated: bool,
-    features: Vec<String>,
-}
-
-/// A scoped media-query-list parser: `query (, query)*` where `query` is
-/// `[not|only]? <ident> (and \( <feature-ident> (: ...)? \))*`. This is
-/// not a general CSS3 Media Queries grammar (feature *values* -- the
-/// `100px` in `(max-width: 100px)` -- are never parsed or evaluated,
-/// only feature *names*, since [`IGNORED_MEDIA_FEATURES`] only ever
-/// tests presence); real-world `@media`/`media=""` text in e-books is
-/// overwhelmingly this shape. Returns `None` on anything it can't make
-/// sense of, matching [`media_ok`]'s permissive fallback.
-fn parse_media_query_list(raw: &str) -> Option<Vec<MediaQuery>> {
-    let mut out = Vec::new();
-    for part in raw.split(',') {
-        out.push(parse_one_media_query(part.trim())?);
-    }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
-}
-
-fn parse_one_media_query(text: &str) -> Option<MediaQuery> {
-    let lower = text.to_ascii_lowercase();
-    let (negated, rest) = if let Some(r) = lower.strip_prefix("not ") {
-        (true, &text[text.len() - r.len()..])
-    } else if let Some(r) = lower.strip_prefix("only ") {
-        (false, &text[text.len() - r.len()..])
-    } else {
-        (false, text)
-    };
-    let rest = rest.trim_start();
-    let type_end = rest
-        .find(|c: char| c.is_whitespace() || c == '(')
-        .unwrap_or(rest.len());
-    let media_type = rest[..type_end].trim().to_ascii_lowercase();
-    if media_type.is_empty() {
-        return None;
-    }
-    let mut features = Vec::new();
-    let mut cursor = rest[type_end..].trim_start();
-    loop {
-        if let Some(r) = cursor.strip_prefix("and") {
-            cursor = r.trim_start();
-        }
-        let Some(inner) = cursor.strip_prefix('(') else {
-            break;
-        };
-        let close = inner.find(')')?;
-        let feature_name = inner[..close]
-            .split(':')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase();
-        if !feature_name.is_empty() {
-            features.push(feature_name);
-        }
-        cursor = inner[close + 1..].trim_start();
-    }
-    Some(MediaQuery {
-        media_type,
-        negated,
-        features,
-    })
-}
-
-fn query_ok(mq: &MediaQuery) -> bool {
+/// Port of `stylizer.media_ok`'s `query_ok` closure. Case-sensitive
+/// throughout (`mq.media_type`/each feature name are compared exactly
+/// as the real grammar returns them), matching real
+/// `tinycss.media3`/`stylizer.py` exactly -- neither lowercases before
+/// comparing against [`ALLOWED_MEDIA_TYPES`]/[`IGNORED_MEDIA_FEATURES`].
+fn query_ok(mq: &crate::oeb::media3::MediaQuery) -> bool {
     let mut matched = ALLOWED_MEDIA_TYPES.contains(&mq.media_type.as_str());
-    for f in &mq.features {
-        if IGNORED_MEDIA_FEATURES.contains(&f.as_str()) {
+    for (feature, _) in &mq.expressions {
+        if IGNORED_MEDIA_FEATURES.contains(&feature.as_str()) {
             matched = false;
         }
     }
@@ -456,9 +390,16 @@ fn query_ok(mq: &MediaQuery) -> bool {
 }
 
 /// Port of `media_ok`. `""` (Python's falsy `raw`) is always allowed.
-/// See [`parse_media_query_list`]'s docs for the scoped grammar this
-/// evaluates against, and its "unparseable -> allowed" fallback (Python:
-/// `except Exception: pass; return True`).
+/// Uses the real CSS3 Media Queries grammar
+/// ([`crate::oeb::media3::parse_media`], issue #581) -- unlike the
+/// scoped hand-rolled parser this replaced, feature *values* (e.g. the
+/// `16/9` in `(device-aspect-ratio: 16/9)`) are now really parsed, even
+/// though [`query_ok`] still only ever tests feature *names* (matching
+/// upstream's own `IGNORED_MEDIA_FEATURES`, which never inspects a
+/// value either). `parse_media` never itself fails to parse (a
+/// malformed expression resets just that one query, not the whole
+/// list), so there is no "unparseable -> allowed" fallback path left to
+/// model here.
 pub fn media_ok(media_text: &str) -> bool {
     let raw = media_text.trim();
     if raw.is_empty() {
@@ -467,10 +408,9 @@ pub fn media_ok(media_text: &str) -> bool {
     if raw == "amzn-mobi" {
         return false;
     }
-    match parse_media_query_list(raw) {
-        None => true,
-        Some(queries) => queries.iter().any(query_ok),
-    }
+    let mut errors = Vec::new();
+    let queries = crate::oeb::media3::parse_media(raw, &mut errors);
+    queries.iter().any(query_ok)
 }
 
 /// Port of `media_allowed`: `None`/empty is always allowed.
@@ -909,6 +849,25 @@ mod tests {
         assert!(media_allowed(None));
     }
 
+    /// Cross-validated directly against `stylizer.py`'s own real
+    /// `test_media_ok` assertions (run against real
+    /// `tinycss.media3.CSSMedia3Parser` + `stylizer.ALLOWED_MEDIA_TYPES`/
+    /// `IGNORED_MEDIA_FEATURES`, since the full `calibre` package can't
+    /// be imported standalone on this box).
+    #[test]
+    fn media_ok_matches_upstreams_own_test_media_ok_cases() {
+        assert!(media_allowed(None));
+        assert!(media_ok(""));
+        assert!(!media_ok("amzn-mobi"));
+        assert!(media_ok("amzn-kf8"));
+        assert!(media_ok("screen"));
+        assert!(media_ok("only screen"));
+        assert!(!media_ok("not screen"));
+        assert!(!media_ok("(device-width:10px)"));
+        assert!(media_ok("screen, (device-width:10px)"));
+        assert!(!media_ok("screen and (device-width:10px)"));
+    }
+
     #[test]
     fn media_ok_rejects_a_pure_device_feature_query() {
         // `print` is not in ALLOWED_MEDIA_TYPES, so this query never
@@ -917,6 +876,17 @@ mod tests {
         assert!(!media_ok("print and (min-width: 400px)"));
         // `screen` alone (no feature) is allowed.
         assert!(media_ok("screen and (min-width: 400px), screen"));
+    }
+
+    #[test]
+    fn media_ok_rejects_a_ratio_valued_device_feature() {
+        // Only parseable as a real feature expression since issue #581
+        // wired in the real CSS3 Media Queries grammar (RATIO values) --
+        // the previous hand-rolled parser only ever extracted feature
+        // *names*, not values, but a device-aspect-ratio feature is
+        // rejected by name alone regardless.
+        assert!(!media_ok("screen and (device-aspect-ratio: 16/9)"));
+        assert!(media_ok("screen and (orientation: portrait)"));
     }
 
     #[test]

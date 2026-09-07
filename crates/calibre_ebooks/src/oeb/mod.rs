@@ -6,6 +6,7 @@ pub mod fonts3;
 pub mod guide;
 pub mod iterator;
 pub mod manifest;
+pub mod media3;
 pub mod metadata;
 pub mod normalize_css;
 pub mod parse_utils;

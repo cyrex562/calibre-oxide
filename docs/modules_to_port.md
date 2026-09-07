@@ -2238,9 +2238,19 @@ source file, not itself a tinycss file — filed separately as #584.
       `oeb/polish/fonts.rs`'s `font_family_data_from_declaration`/
       `change_font_in_declaration`. Cross-validated byte-for-byte
       against real `tinycss.fonts3.parse_font`/`normalize_font`)
-- [ ] media3.py (split to #581 — only a narrow private reimplementation
-      exists today, `cascade.rs`'s `media_ok`, feature-names-only, no
-      values/RATIO/reusable type)
+- [x] media3.py (`MediaQuery`/`parse_media` real in
+      `crate::oeb::media3` — issue #581. Cross-validated byte-for-byte
+      against real `tinycss.media3.CSSMedia3Parser.parse_media`,
+      including RATIO values and its per-query malformed-expression
+      error-recovery behavior. Wired into `oeb/polish/cascade.rs`'s
+      real, live `media_ok` (upgraded from that file's own prior
+      narrower hand-rolled parser), cross-validated against
+      `stylizer.py`'s own real `test_media_ok` doctest cases.
+      `stylizer.rs` itself has no `<style>`/`<link>`/`@media`
+      document-cascade pipeline at all yet (a separate, pre-existing
+      narrowing, not part of this issue) so this grammar isn't also
+      called from there -- `cascade.rs` is this crate's one real,
+      live media-query call site today)
 - [ ] page3.py (split to #582)
 - [x] parsing.py (N/A beyond disclosure — this file's token-list
       utilities (`split_on_comma`/`strip_whitespace`/`validate_*`) have
