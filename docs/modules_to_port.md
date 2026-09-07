@@ -2204,18 +2204,56 @@ gestures, settings panel, footnotes, offline/IndexedDB caching
 
 ## src/tinycss
 
-- [ ] color3.py
-- [ ] css21.py
-- [ ] decoding.py
-- [ ] fonts3.py
-- [ ] media3.py
-- [ ] page3.py
-- [ ] parsing.py
-- [ ] tokenizer.c
-- [ ] tokenizer.py
-- [ ] token_data.py
-- [ ] version.py
-- [ ] __init__.py
+Issue #88 (11 files). Real research (an Explore-agent pass reading all
+11 files plus this crate's existing `crate::css`/`crate::oeb::fonts3`)
+found this is not "write a CSS parser from scratch" — the tokenizer,
+core stylesheet/ruleset/declaration grammar, `@font-face`, and
+font-family list parsing were already shipped under issue #164 and
+prior font/cascade work. What's genuinely missing is narrower and
+split into 4 real sub-issues: #580 (fonts3 `parse_font`/`serialize_font`
+full shorthand), #581 (media3 real grammar), #582 (page3 `@page`/
+margin-boxes in `crate::css`), #583 (color3 consolidation). A 5th
+finding, `oeb/polish/report.py`'s `css_data` (needs line/column
+tracking added to `crate::css`), is a different, currently-untouched
+source file, not itself a tinycss file — filed separately as #584.
+
+- [ ] color3.py (split to #583 — the algorithm is already ported, in
+      `docx/writer/utils.rs`, just not exposed as a shared API; the
+      real gap is `mobi/utils.py`'s equivalent call site being unwired)
+- [x] css21.py (partial — the core grammar this file defines is already
+      real in `crate::css::model`/`parser` (issue #164): Stylesheet/
+      RuleSet/Declaration, `@import`/`@media`/`@charset`, `!important`
+      splitting. Missing: `@page` support (split to #582) and source
+      line/column + an accumulated error list (needed only by #584's
+      `report.py`, not by any other real consumer))
+- [x] decoding.py (N/A — zero real callers found anywhere in
+      `old_src/src/calibre/`; charset/BOM-sniffing for standalone
+      `.css` files/bytes that nothing in this codebase actually uses)
+- [ ] fonts3.py (partial — `@font-face` and `parse_font_family`/
+      `serialize_font_family` already real in `crate::css::model` and
+      `crate::oeb::fonts3` respectively; `parse_font`/`serialize_font`
+      full shorthand grammar split to #580)
+- [ ] media3.py (split to #581 — only a narrow private reimplementation
+      exists today, `cascade.rs`'s `media_ok`, feature-names-only, no
+      values/RATIO/reusable type)
+- [ ] page3.py (split to #582)
+- [x] parsing.py (N/A beyond disclosure — this file's token-list
+      utilities (`split_on_comma`/`strip_whitespace`/`validate_*`) have
+      equivalent inline logic already in `crate::css::parser`/`model`,
+      not literal transliterations but the same jobs already done)
+- [x] tokenizer.c (N/A — confirmed a compiled speedup twin of
+      tokenizer.py's `tokenize_flat`, built from the same regex tables
+      in token_data.py; not independent scope)
+- [x] tokenizer.py (N/A — superseded by `cssparser::Parser` [Mozilla/
+      Servo's real CSS Syntax Level 3 tokenizer], already wired into
+      `crate::css::parser` under issue #164; no hand-rolled regex
+      tokenizer needed)
+- [x] token_data.py (N/A — the regex grammar backing tokenizer.py,
+      moot for the same reason)
+- [x] version.py (N/A — a version string constant)
+- [x] __init__.py (N/A — pure Python glue composing `CSS21Parser` with
+      the three CSS3 mixins via dynamic multiple inheritance;
+      `crate::css` is already monolithic, nothing to compose)
 
 ## src/unicode_names
 
