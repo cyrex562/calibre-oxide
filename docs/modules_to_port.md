@@ -1734,13 +1734,13 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 
 #### ipc
 
-- [ ] job.py
-- [ ] launch.py
-- [ ] pool.py
-- [ ] server.py
-- [ ] simple_worker.py
-- [ ] worker.py
-- [ ] __init__.py
+- [ ] job.py (issue #573, split from #68 -- GUI job-list/progress tracking, no GUI job-list widget exists yet to drive it)
+- [x] launch.py (issue #68 CLOSED -- N/A under the real thread-pool redesign `calibre_utils::pool` uses instead; no subprocess to launch)
+- [x] pool.py (issue #68 CLOSED -- `calibre_utils::pool::Pool<T>`, a real port of the actual scheduling semantics (job submission/results/wait-for-completion/shutdown) redesigned onto real OS threads instead of worker subprocesses, after asking the user directly which architecture to target. See the module's own doc comment for the full real-vs-redesigned reasoning, incl. one intentional behavioral improvement the thread model enables: a panicking job fails only itself, not the whole pool)
+- [ ] server.py (issue #573, split from #68 -- see job.py)
+- [x] simple_worker.py (issue #68 CLOSED -- N/A under the thread-pool redesign; the same real mechanism as pool.py, just for one-off calls)
+- [x] worker.py (issue #68 CLOSED -- N/A under the thread-pool redesign; the dynamic-dispatch subprocess entry point, moot with no subprocess)
+- [x] __init__.py (issue #68 CLOSED -- `eintr_retry_call`/socket-address helpers not needed by the real thread-pool redesign; the GUI/viewer socket-address functions are a separate, GUI-facing concern with no current consumer in this port)
 
 #### lzx
 

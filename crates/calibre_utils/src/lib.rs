@@ -30,6 +30,7 @@ pub mod network;
 pub mod open_with;
 pub mod opensearch;
 pub mod ordered_dict;
+pub mod pool;
 pub mod random_ua;
 pub mod recycle_bin;
 pub mod resources;
