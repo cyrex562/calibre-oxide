@@ -951,6 +951,7 @@ dependencies = [
  "thiserror 1.0.69",
  "time",
  "trash",
+ "unicode-normalization",
  "unicode_names2",
  "unidecode",
  "unrar",
