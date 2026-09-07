@@ -2229,10 +2229,15 @@ source file, not itself a tinycss file — filed separately as #584.
 - [x] decoding.py (N/A — zero real callers found anywhere in
       `old_src/src/calibre/`; charset/BOM-sniffing for standalone
       `.css` files/bytes that nothing in this codebase actually uses)
-- [ ] fonts3.py (partial — `@font-face` and `parse_font_family`/
-      `serialize_font_family` already real in `crate::css::model` and
-      `crate::oeb::fonts3` respectively; `parse_font`/`serialize_font`
-      full shorthand grammar split to #580)
+- [x] fonts3.py (`@font-face` real in `crate::css::model`;
+      `parse_font_family`/`serialize_font_family`/`parse_font`/
+      `serialize_font` all real in `crate::oeb::fonts3` — issue #580
+      closed the last gap, the full `font` shorthand grammar
+      (style/variant/weight/stretch/size/line-height/family), wired
+      into `normalize_css.rs`'s `normalize_font` and
+      `oeb/polish/fonts.rs`'s `font_family_data_from_declaration`/
+      `change_font_in_declaration`. Cross-validated byte-for-byte
+      against real `tinycss.fonts3.parse_font`/`normalize_font`)
 - [ ] media3.py (split to #581 — only a narrow private reimplementation
       exists today, `cascade.rs`'s `media_ok`, feature-names-only, no
       values/RATIO/reusable type)

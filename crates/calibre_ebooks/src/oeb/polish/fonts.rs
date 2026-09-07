@@ -3,24 +3,11 @@
 //! Every function in this file except [`unquote`] needed real CSS
 //! parsing: reading/mutating `font-family` declarations inside parsed
 //! stylesheets, `<style>` tags, and `style=""` attributes. Issue #164
-//! added that ([`crate::css`]), so this file is now real end to end,
-//! with one deliberate, documented narrowing shared by
-//! [`font_family_data_from_declaration`]/[`change_font_in_declaration`]:
-//! neither handles the `font` shorthand property (`font: bold 12px
-//! Georgia, serif`) -- only `font-family` declared directly. Python
-//! extracts a family list from `font` too, via
-//! `tinycss.fonts3.parse_font`/`normalize_font` (the full CSS Fonts
-//! Level 3 `font` shorthand grammar: style/variant/weight/stretch/
-//! size/line-height/family in a fixed token order -- see
-//! `old_src/src/tinycss/fonts3.py`'s `parse_font`). This crate ports
-//! only `parse_font_family`/`serialize_font_family` (issue #164's own
-//! scoping note: "simple string parsing, not full CSS" -- see
-//! [`crate::oeb::fonts3`]), not that larger shorthand grammar, so a
-//! `font-family` set *only* via the `font` shorthand is invisible to
-//! these two functions. This is a real, working simplification (not a
-//! `todo!()`): declaring `font-family` directly is by far the more
-//! common real-world pattern, and every other function in this file
-//! (which does not need `font` shorthand parsing) is unaffected.
+//! added that ([`crate::css`]); issue #580 added the `font` shorthand
+//! grammar ([`crate::oeb::fonts3::parse_font`]/`serialize_font`), so
+//! [`font_family_data_from_declaration`]/[`change_font_in_declaration`]
+//! now handle `font: bold 12px Georgia, serif`-style declarations too,
+//! not just `font-family` declared directly.
 
 use std::collections::HashMap;
 
@@ -29,7 +16,8 @@ use anyhow::Result;
 use crate::css::{Rule, Stylesheet};
 use crate::dom::{Dom, NodeId};
 use crate::oeb::constants::{OEB_DOCS, OEB_STYLES};
-use crate::oeb::fonts3::{parse_font_family, serialize_font_family};
+use crate::oeb::fonts3::{parse_font, parse_font_family, serialize_font, serialize_font_family};
+use crate::oeb::normalize_css::{normalize_font, FontPropertyValue};
 
 use super::container::Container;
 
@@ -44,16 +32,26 @@ pub fn unquote(x: &str) -> &str {
     }
 }
 
-/// Port of `font_family_data_from_declaration`. See the module docs for
-/// why the `font` shorthand branch is not handled.
+/// Port of `font_family_data_from_declaration`. A `font` shorthand's
+/// family list is checked first; a `font-family` declared directly on
+/// the same rule then overwrites it (not merges), matching upstream's
+/// own sequential reassignment.
 pub fn font_family_data_from_declaration(
     style: &crate::css::StyleDeclarationBlock,
     families: &mut HashMap<String, bool>,
 ) {
-    if let Some(ff) = style.get_property("font-family") {
-        for f in parse_font_family(&ff.value) {
-            families.entry(f).or_insert(false);
+    let mut font_families: Vec<String> = Vec::new();
+    if let Some(f) = style.get_property("font") {
+        let ans = normalize_font(&f.value, true);
+        if let Some(FontPropertyValue::List(list)) = ans.get("font-family") {
+            font_families = list.iter().map(|x| unquote(x).to_string()).collect();
         }
+    }
+    if let Some(ff) = style.get_property("font-family") {
+        font_families = parse_font_family(&ff.value);
+    }
+    for f in font_families {
+        families.entry(f).or_insert(false);
     }
 }
 
@@ -122,18 +120,17 @@ pub(crate) fn style_tag_is_css(dom: &Dom, id: NodeId) -> bool {
         .unwrap_or(true)
 }
 
-/// Port of `change_font_in_declaration`. See the module docs for why the
-/// `font` shorthand branch is not handled.
+/// Port of `change_font_in_declaration`: renames (or, with `new_name:
+/// None`, removes) a font family wherever it's referenced, in both a
+/// direct `font-family` declaration and a `font` shorthand's family
+/// list (issue #580).
 pub fn change_font_in_declaration(
     style: &mut crate::css::StyleDeclarationBlock,
     old_name: &str,
     new_name: Option<&str>,
 ) -> bool {
-    let mut changed = false;
-    if let Some(ff) = style.get_property("font-family").cloned() {
-        let fams = parse_font_family(&ff.value);
-        let nfams: Vec<String> = fams
-            .iter()
+    fn renamed(fams: &[String], old_name: &str, new_name: Option<&str>) -> Vec<String> {
+        fams.iter()
             .filter_map(|x| {
                 if x == old_name {
                     new_name.map(|s| s.to_string())
@@ -141,12 +138,31 @@ pub fn change_font_in_declaration(
                     Some(x.clone())
                 }
             })
-            .collect();
+            .collect()
+    }
+
+    let mut changed = false;
+    if let Some(ff) = style.get_property("font-family").cloned() {
+        let fams = parse_font_family(&ff.value);
+        let nfams = renamed(&fams, old_name, new_name);
         if fams != nfams {
             if nfams.is_empty() {
                 style.remove_property("font-family");
             } else {
                 style.set_property("font-family", serialize_font_family(&nfams), ff.important);
+            }
+            changed = true;
+        }
+    }
+    if let Some(ff) = style.get_property("font").cloned() {
+        let mut props = parse_font(&ff.value);
+        let nfams = renamed(&props.family, old_name, new_name);
+        if props.family != nfams {
+            props.family = nfams;
+            if props.family.is_empty() {
+                style.remove_property("font");
+            } else {
+                style.set_property("font", serialize_font(&props), ff.important);
             }
             changed = true;
         }
@@ -365,6 +381,43 @@ mod tests {
 
         let mut style3 = crate::css::parser::parse_declaration_list("font-family: Other");
         assert!(!change_font_in_declaration(&mut style3, "Old", Some("New")));
+    }
+
+    #[test]
+    fn font_family_data_from_declaration_reads_the_font_shorthand() {
+        let style = crate::css::parser::parse_declaration_list("font: bold 12px Old, serif");
+        let mut families = HashMap::new();
+        font_family_data_from_declaration(&style, &mut families);
+        assert_eq!(families.get("Old"), Some(&false));
+        assert_eq!(families.get("serif"), Some(&false));
+    }
+
+    #[test]
+    fn font_family_data_from_declaration_direct_font_family_overrides_the_shorthand() {
+        let style = crate::css::parser::parse_declaration_list(
+            "font: bold 12px Shorthand; font-family: Direct",
+        );
+        let mut families = HashMap::new();
+        font_family_data_from_declaration(&style, &mut families);
+        assert_eq!(families.get("Direct"), Some(&false));
+        assert!(!families.contains_key("Shorthand"));
+    }
+
+    #[test]
+    fn change_font_in_declaration_renames_within_the_font_shorthand() {
+        let mut style = crate::css::parser::parse_declaration_list("font: bold 12px Old, serif");
+        assert!(change_font_in_declaration(&mut style, "Old", Some("New")));
+        assert_eq!(
+            style.get_property_value("font"),
+            "bold 12px New, serif"
+        );
+    }
+
+    #[test]
+    fn change_font_in_declaration_removes_the_whole_font_property_when_its_only_family_is_removed() {
+        let mut style = crate::css::parser::parse_declaration_list("font: 12px Old");
+        assert!(change_font_in_declaration(&mut style, "Old", None));
+        assert!(style.get_property("font").is_none());
     }
 
     fn make_container(files: &[(&str, &str, &[u8])]) -> (tempfile::TempDir, Container) {
