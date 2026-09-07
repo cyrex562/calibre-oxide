@@ -897,6 +897,7 @@ fn rule_atkeyword(rule: &Rule) -> &str {
         Rule::Media(_) => "media",
         Rule::FontFace(_) => "font-face",
         Rule::Import(_) => "import",
+        Rule::Page(_) => "page",
         Rule::Charset(_) => "charset",
         Rule::Namespace(_) => "namespace",
         Rule::Unknown(UnknownAtRule { at_keyword, .. }) => at_keyword,
