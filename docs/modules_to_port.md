@@ -2251,7 +2251,15 @@ source file, not itself a tinycss file — filed separately as #584.
       narrowing, not part of this issue) so this grammar isn't also
       called from there -- `cascade.rs` is this crate's one real,
       live media-query call site today)
-- [ ] page3.py (split to #582)
+- [x] page3.py (`PageSelector`/`MarginRule`/`PageRule`/`Rule::Page` real
+      in `crate::css::model`/`parser` — issue #582. Implements CSS3
+      Paged Media's extended `@page` selector grammar directly (a real
+      superset of plain CSS 2.1's own simpler selector, which page3.py
+      itself extends), including all 16 margin-box at-keywords.
+      Cross-validated byte-for-byte against real
+      `tinycss.page3.CSSPage3Parser` for 5 cases: empty selector,
+      pseudo-class-only, named, named+pseudo-class, and a mixed
+      declarations/margin-box body)
 - [x] parsing.py (N/A beyond disclosure — this file's token-list
       utilities (`split_on_comma`/`strip_whitespace`/`validate_*`) have
       equivalent inline logic already in `crate::css::parser`/`model`,

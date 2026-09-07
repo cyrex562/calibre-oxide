@@ -249,8 +249,8 @@ impl StyleRule {
 }
 
 /// An at-rule this object model does not give first-class structure to
-/// (`@supports`, `@page`, `@keyframes`, ...). `block` is the raw text
-/// inside `{ }`, if the rule had a block.
+/// (`@supports`, `@keyframes`, ...). `block` is the raw text inside
+/// `{ }`, if the rule had a block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnknownAtRule {
     pub at_keyword: String,
@@ -258,19 +258,59 @@ pub struct UnknownAtRule {
     pub block: Option<String>,
 }
 
+/// Port of `tinycss.page3`'s extended `@page` selector: a page name
+/// (`@page chapter { ... }`) and/or a pseudo-class (`@page :first`),
+/// either of which may be absent. This is a real superset of plain CSS
+/// 2.1's `@page` selector (which has no name, only the pseudo-class) --
+/// `PageSelector { name: None, .. }` covers that case exactly, so this
+/// object model implements CSS 3 Paged Media's grammar directly rather
+/// than the two as separate parsers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PageSelector {
+    pub name: Option<String>,
+    pub pseudo_class: Option<String>,
+}
+
+/// Port of `tinycss.page3.MarginRule`: one of the 16 CSS3 Paged Media
+/// margin-box at-rules (`@top-left`, `@bottom-right-corner`, ...) nested
+/// inside a `@page` rule's body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarginRule {
+    /// Always one of the 16 real margin-box at-keywords, including the
+    /// leading `@` (e.g. `"@top-left"`), matching upstream's own
+    /// `at_keyword` attribute.
+    pub at_keyword: String,
+    pub declarations: StyleDeclarationBlock,
+}
+
+/// Port of a `@page` rule (`tinycss.css21.PageRule` extended by
+/// `tinycss.page3.CSSPage3Parser`): a page selector, its specificity
+/// (upstream's own 3-integer tuple: name-presence, then the
+/// pseudo-class's own 2-integer weight), the page's own declarations,
+/// and any nested margin-box rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageRule {
+    pub selector: PageSelector,
+    pub specificity: (u8, u8, u8),
+    pub declarations: StyleDeclarationBlock,
+    pub margin_rules: Vec<MarginRule>,
+}
+
 /// Port of the subset of `CSSRule` subtypes `css.py`/`cascade.py`/
 /// `stats.py`/`fonts.py`/`subset.py` actually touch
 /// (`STYLE_RULE`/`FONT_FACE_RULE`/`IMPORT_RULE`/`MEDIA_RULE`/
-/// `CHARSET_RULE`/`NAMESPACE_RULE`), plus [`Rule::Unknown`] as a lossless
-/// fallback for anything else (`@page`, `@supports`, `@keyframes`, ...)
-/// so a stylesheet round-trips even when it contains rule types this
-/// object model doesn't model structurally.
+/// `CHARSET_RULE`/`NAMESPACE_RULE`), plus `Rule::Page` (issue #582) and
+/// [`Rule::Unknown`] as a lossless fallback for anything else
+/// (`@supports`, `@keyframes`, ...) so a stylesheet round-trips even
+/// when it contains rule types this object model doesn't model
+/// structurally.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Rule {
     Style(StyleRule),
     FontFace(StyleDeclarationBlock),
     Import(ImportRule),
     Media(MediaRule),
+    Page(PageRule),
     Charset(String),
     Namespace(NamespaceRule),
     Unknown(UnknownAtRule),
@@ -286,6 +326,7 @@ pub enum RuleType {
     Style,
     Media,
     FontFace,
+    Page,
     Unknown,
 }
 
@@ -296,9 +337,17 @@ impl Rule {
             Rule::FontFace(_) => RuleType::FontFace,
             Rule::Import(_) => RuleType::Import,
             Rule::Media(_) => RuleType::Media,
+            Rule::Page(_) => RuleType::Page,
             Rule::Charset(_) => RuleType::Charset,
             Rule::Namespace(_) => RuleType::Namespace,
             Rule::Unknown(_) => RuleType::Unknown,
+        }
+    }
+
+    pub fn as_page(&self) -> Option<&PageRule> {
+        match self {
+            Rule::Page(p) => Some(p),
+            _ => None,
         }
     }
 
@@ -344,6 +393,25 @@ impl Rule {
                     .collect::<Vec<_>>()
                     .join("\n\n");
                 format!("@media {} {{\n{}\n}}", m.media_text, inner)
+            }
+            Rule::Page(p) => {
+                let mut selector = String::new();
+                if let Some(name) = &p.selector.name {
+                    selector.push(' ');
+                    selector.push_str(name);
+                }
+                if let Some(pc) = &p.selector.pseudo_class {
+                    selector.push(':');
+                    selector.push_str(pc);
+                }
+                let mut body = indent_decls(&p.declarations);
+                for m in &p.margin_rules {
+                    if !body.is_empty() {
+                        body.push('\n');
+                    }
+                    body.push_str(&format!("  {} {{\n{}\n  }}", m.at_keyword, indent_decls(&m.declarations)));
+                }
+                format!("@page{selector} {{\n{body}\n}}")
             }
             Rule::Charset(v) => format!("@charset \"{v}\";"),
             Rule::Namespace(n) => match &n.prefix {
@@ -431,6 +499,12 @@ fn collect_declarations<'a>(rules: &'a [Rule], out: &mut Vec<&'a StyleDeclaratio
             Rule::Style(s) => out.push(&s.style),
             Rule::FontFace(d) => out.push(d),
             Rule::Media(m) => collect_declarations(&m.rules, out),
+            Rule::Page(p) => {
+                out.push(&p.declarations);
+                for m in &p.margin_rules {
+                    out.push(&m.declarations);
+                }
+            }
             _ => {}
         }
     }

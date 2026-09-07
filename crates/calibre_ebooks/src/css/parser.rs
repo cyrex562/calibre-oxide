@@ -7,8 +7,8 @@
 use cssparser::{Delimiter, Delimiters, ParseError, Parser, ParserInput, Token};
 
 use super::model::{
-    Declaration, ImportRule, MediaRule, NamespaceRule, Rule, StyleDeclarationBlock, StyleRule,
-    UnknownAtRule,
+    Declaration, ImportRule, MarginRule, MediaRule, NamespaceRule, PageRule, PageSelector, Rule,
+    StyleDeclarationBlock, StyleRule, UnknownAtRule,
 };
 use super::selector::parse_selector_list;
 
@@ -142,12 +142,161 @@ fn at_rule_with_block(name: &str, prelude: &str, block: &str) -> Rule {
             rules: parse_stylesheet(block).rules,
         }),
         "font-face" => Rule::FontFace(parse_declaration_list(block)),
+        "page" => {
+            let (selector, specificity) = parse_page_selector(prelude);
+            let (declarations, margin_rules) = parse_page_body(block);
+            Rule::Page(PageRule {
+                selector,
+                specificity,
+                declarations,
+                margin_rules,
+            })
+        }
         _ => Rule::Unknown(UnknownAtRule {
             at_keyword: name.to_string(),
             prelude: prelude.to_string(),
             block: Some(block.to_string()),
         }),
     }
+}
+
+/// The 16 real CSS3 Paged Media margin-box at-keywords (without the
+/// leading `@`), port of `tinycss.page3.CSSPage3Parser.PAGE_MARGIN_AT_KEYWORDS`.
+const MARGIN_AT_KEYWORDS: &[&str] = &[
+    "top-left-corner",
+    "top-left",
+    "top-center",
+    "top-right",
+    "top-right-corner",
+    "bottom-left-corner",
+    "bottom-left",
+    "bottom-center",
+    "bottom-right",
+    "bottom-right-corner",
+    "left-top",
+    "left-middle",
+    "left-bottom",
+    "right-top",
+    "right-middle",
+    "right-bottom",
+];
+
+/// Port of `tinycss.page3.CSSPage3Parser.parse_page_selector` (a real
+/// superset of CSS 2.1's own simpler `parse_page_selector`; see
+/// [`PageSelector`]'s docs). Upstream raises `ParseError` on a malformed
+/// selector; this falls back to an empty selector instead of dropping
+/// the whole `@page` rule, matching this crate's established
+/// tolerant-parsing convention (e.g. [`parse_rules`]' unparseable-
+/// selector handling for style rules).
+fn parse_page_selector(prelude: &str) -> (PageSelector, (u8, u8, u8)) {
+    let mut input = ParserInput::new(prelude.trim());
+    let mut parser = Parser::new(&mut input);
+    let mut tokens = Vec::new();
+    loop {
+        match parser.next() {
+            Ok(t) => tokens.push(t.clone()),
+            Err(_) => break,
+        }
+    }
+    if tokens.is_empty() {
+        return (PageSelector::default(), (0, 0, 0));
+    }
+
+    let (name, name_specificity, rest_start) = match &tokens[0] {
+        Token::Ident(s) => (Some(s.to_string()), 1u8, 1),
+        _ => (None, 0u8, 0),
+    };
+    let rest = &tokens[rest_start..];
+
+    if rest.is_empty() {
+        return match name {
+            Some(name) => (
+                PageSelector {
+                    name: Some(name),
+                    pseudo_class: None,
+                },
+                (1, 0, 0),
+            ),
+            None => (PageSelector::default(), (0, 0, 0)),
+        };
+    }
+
+    if rest.len() == 2 {
+        if let (Token::Colon, Token::Ident(pc)) = (&rest[0], &rest[1]) {
+            let pc = pc.to_string();
+            let specificity = match pc.as_str() {
+                "first" | "blank" => Some((1u8, 0u8)),
+                "left" | "right" => Some((0u8, 1u8)),
+                _ => None,
+            };
+            if let Some((a, b)) = specificity {
+                return (
+                    PageSelector {
+                        name,
+                        pseudo_class: Some(pc),
+                    },
+                    (name_specificity, a, b),
+                );
+            }
+        }
+    }
+
+    (PageSelector::default(), (0, 0, 0))
+}
+
+/// Port of `parse_declarations_and_at_rules` for the `@page` body case:
+/// a mix of plain declarations and nested margin-box at-rules. Any
+/// at-keyword that isn't one of [`MARGIN_AT_KEYWORDS`] is invalid inside
+/// `@page` (upstream raises `ParseError`) and is dropped rather than
+/// aborting the whole rule's parse.
+fn parse_page_body(text: &str) -> (StyleDeclarationBlock, Vec<MarginRule>) {
+    let mut input = ParserInput::new(text);
+    let mut parser = Parser::new(&mut input);
+    let mut block = StyleDeclarationBlock::default();
+    let mut margin_rules = Vec::new();
+    loop {
+        parser.skip_whitespace();
+        if parser.is_exhausted() {
+            break;
+        }
+        let tok = match parser.next() {
+            Ok(t) => t.clone(),
+            Err(_) => break,
+        };
+        match tok {
+            Token::Semicolon => continue,
+            Token::Ident(name) => {
+                let name = name.to_string();
+                if parser.expect_colon().is_err() {
+                    skip_to_semicolon(&mut parser);
+                    continue;
+                }
+                let raw_value = consume_raw_until(&mut parser, Delimiter::Semicolon)
+                    .trim()
+                    .to_string();
+                let _ = parser.next();
+                if raw_value.is_empty() {
+                    continue;
+                }
+                let (value, important) = split_important(&raw_value);
+                block.properties.push(Declaration { name, value, important });
+            }
+            Token::AtKeyword(kw) => {
+                let kw_lower = kw.to_ascii_lowercase();
+                if let Ok(Token::CurlyBracketBlock) = parser.next() {
+                    let body_text = capture_block_text(&mut parser);
+                    if MARGIN_AT_KEYWORDS.contains(&kw_lower.as_str()) {
+                        margin_rules.push(MarginRule {
+                            at_keyword: format!("@{kw_lower}"),
+                            declarations: parse_declaration_list(&body_text),
+                        });
+                    }
+                }
+            }
+            _ => skip_to_semicolon(&mut parser),
+        }
+    }
+    (block, margin_rules)
 }
 
 /// `@import url(foo.css) screen;` / `@import "foo.css";`. A narrow,
@@ -382,5 +531,67 @@ mod tests {
         assert_eq!(r.selectors.0.len(), 2);
         assert_eq!(r.selectors.0[0].text, "img");
         assert_eq!(r.selectors.0[1].text, "object");
+    }
+
+    // Cross-validated directly against real `tinycss.page3.CSSPage3Parser`.
+
+    #[test]
+    fn page_with_no_selector_and_empty_body() {
+        let sheet = parse_stylesheet("@page {}");
+        let p = sheet.rules[0].as_page().unwrap();
+        assert_eq!(p.selector, PageSelector::default());
+        assert_eq!(p.specificity, (0, 0, 0));
+        assert!(p.declarations.properties.is_empty());
+        assert!(p.margin_rules.is_empty());
+    }
+
+    #[test]
+    fn page_with_a_pseudo_class_selector() {
+        let sheet = parse_stylesheet("@page :first { margin: 1in; }");
+        let p = sheet.rules[0].as_page().unwrap();
+        assert_eq!(p.selector.name, None);
+        assert_eq!(p.selector.pseudo_class.as_deref(), Some("first"));
+        assert_eq!(p.specificity, (0, 1, 0));
+        assert_eq!(p.declarations.get_property_value("margin"), "1in");
+    }
+
+    #[test]
+    fn page_with_a_named_selector() {
+        let sheet = parse_stylesheet("@page chapter { size: A4; }");
+        let p = sheet.rules[0].as_page().unwrap();
+        assert_eq!(p.selector.name.as_deref(), Some("chapter"));
+        assert_eq!(p.selector.pseudo_class, None);
+        assert_eq!(p.specificity, (1, 0, 0));
+    }
+
+    #[test]
+    fn page_with_a_named_and_pseudo_class_selector() {
+        let sheet = parse_stylesheet("@page table:right { color: red; }");
+        let p = sheet.rules[0].as_page().unwrap();
+        assert_eq!(p.selector.name.as_deref(), Some("table"));
+        assert_eq!(p.selector.pseudo_class.as_deref(), Some("right"));
+        assert_eq!(p.specificity, (1, 0, 1));
+    }
+
+    #[test]
+    fn page_body_mixes_declarations_and_margin_box_rules() {
+        let sheet = parse_stylesheet(
+            "@page { margin: 1in; @top-left { content: \"Left\"; } @bottom-right-corner { content: \"X\"; } }",
+        );
+        let p = sheet.rules[0].as_page().unwrap();
+        assert_eq!(p.declarations.get_property_value("margin"), "1in");
+        assert_eq!(p.margin_rules.len(), 2);
+        assert_eq!(p.margin_rules[0].at_keyword, "@top-left");
+        assert_eq!(p.margin_rules[0].declarations.get_property_value("content"), "\"Left\"");
+        assert_eq!(p.margin_rules[1].at_keyword, "@bottom-right-corner");
+        assert_eq!(p.margin_rules[1].declarations.get_property_value("content"), "\"X\"");
+    }
+
+    #[test]
+    fn an_invalid_page_selector_falls_back_to_empty_rather_than_dropping_the_rule() {
+        let sheet = parse_stylesheet("@page :bogus { margin: 1in; }");
+        let p = sheet.rules[0].as_page().unwrap();
+        assert_eq!(p.selector, PageSelector::default());
+        assert_eq!(p.specificity, (0, 0, 0));
     }
 }
