@@ -352,6 +352,25 @@ fn search_finds_notes_by_searchable_text() {
 }
 
 #[test]
+fn stemmed_and_non_stemmed_search_now_genuinely_differ() {
+    // Issue #566: notes_fts/notes_fts_stemmed previously had no
+    // `tokenize=` clause, so `use_stemming` selected between two
+    // byte-for-byte identical tables. Confirm the real fix here too.
+    let dir = tempdir().unwrap();
+    let notes = open(dir.path());
+    notes
+        .set_note("tags", 1, "fiction", "<p>the athlete went running yesterday</p>", &HashSet::new())
+        .unwrap();
+
+    let non_stemmed = notes.search("run", false, None, None, &[], true, None).unwrap();
+    assert!(non_stemmed.is_empty(), "the plain 'calibre' tokenizer should not stem, so 'run' should not match 'running'");
+
+    let stemmed = notes.search("run", true, None, None, &[], true, None).unwrap();
+    assert_eq!(stemmed.len(), 1, "the 'porter calibre' tokenizer should stem 'running' down to 'run'");
+    assert_eq!(stemmed[0].item_id, 1);
+}
+
+#[test]
 fn search_with_an_empty_query_falls_back_to_all_notes() {
     let dir = tempdir().unwrap();
     let notes = open(dir.path());

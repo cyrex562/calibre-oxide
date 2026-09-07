@@ -19,13 +19,23 @@
 //!   covers the same languages as libstemmer.
 //! - **(3) diacritic removal**: `unicode-normalization` NFD + strip
 //!   combining marks.
-//! - **FTS5 tokenizer registration**: NOT included here — it's a
-//!   rusqlite-integration concern that belongs alongside connection
-//!   opening in the fault-tolerance-aware `LibraryHandle` port
-//!   (issue #93). Registered as a placeholder below.
+//! - **FTS5 tokenizer registration** (issue #566): real, via raw
+//!   `libsqlite3-sys` FFI against `fts5_api`/`fts5_tokenizer` — see
+//!   [`register_fts5_tokenizers`]'s own doc for the full design. This
+//!   crate's `fts::connection`/`notes::connection` virtual tables now
+//!   use the real `tokenize = 'calibre remove_diacritics 2'`/
+//!   `tokenize = 'porter calibre remove_diacritics 2'` clauses from
+//!   real upstream's bundled `fts_sqlite.sql`/`notes_sqlite.sql`
+//!   (previously missing a `tokenize=` clause at all, so `_stemmed`
+//!   tables were byte-for-byte identical to their non-stemmed
+//!   siblings -- a real, disclosed, silently-wrong gap found while
+//!   researching this issue, the same class #201's original audit
+//!   flagged elsewhere in this crate).
 
+use std::ffi::{c_char, c_int, c_void, CStr};
 use std::fmt;
 
+use rusqlite::ffi;
 use rust_stemmers::{Algorithm, Stemmer as SbStemmer};
 use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 use unicode_segmentation::UnicodeSegmentation;
@@ -210,29 +220,224 @@ fn strip_diacritics(s: &str) -> String {
     s.nfd().filter(|c| !is_combining_mark(*c)).collect()
 }
 
-/// Sentinel error type for the FTS5 registration placeholder.
+/// Error registering the FTS5 tokenizers: either a raw SQLite error
+/// code (from the `fts5_api` retrieval or `xCreateTokenizer` calls),
+/// or FTS5 not being compiled in / too old.
 #[derive(Debug)]
-pub struct Fts5NotWired;
-impl fmt::Display for Fts5NotWired {
+pub enum Fts5RegistrationError {
+    Sqlite(c_int),
+    Fts5Unavailable,
+}
+impl fmt::Display for Fts5RegistrationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("FTS5 custom tokenizer registration not yet wired — tracked as issue #93 (LibraryHandle)")
+        match self {
+            Fts5RegistrationError::Sqlite(rc) => write!(f, "SQLite error {rc} while registering FTS5 tokenizers"),
+            Fts5RegistrationError::Fts5Unavailable => f.write_str("FTS5 extension not available or too old (iVersion < 2)"),
+        }
     }
 }
-impl std::error::Error for Fts5NotWired {}
+impl std::error::Error for Fts5RegistrationError {}
 
-/// Register the `calibre` and `porter` FTS5 tokenizers on a rusqlite
-/// connection. Deliberately unimplemented in this port — the C++
-/// version registers via `fts5_api->xCreateTokenizer`, which rusqlite
-/// doesn't expose directly. Wiring it correctly requires either:
-/// (a) the `rusqlite_ext_fts5` crate, or (b) hand-rolled FFI against
-/// the SQLite extension API.
+/// Opaque handle for a tokenizer instance, matching real `fts5.h`'s
+/// forward-declared `struct Fts5Tokenizer` (application-defined
+/// content). We store a boxed [`Tokenizer`] behind it -- see
+/// [`xcreate_impl`]/[`xdelete`].
+#[repr(C)]
+struct RawFts5Tokenizer {
+    _private: [u8; 0],
+}
+
+/// A C function pointer matching `fts5_tokenizer.xTokenize`'s own
+/// `xToken` callback parameter -- supplied BY FTS5 (not by us) on
+/// every real `xTokenize` call, invoked once per emitted token.
+type XTokenFn = unsafe extern "C" fn(*mut c_void, c_int, *const c_char, c_int, c_int, c_int) -> c_int;
+
+const FTS5_TOKENIZE_QUERY: c_int = 0x0001;
+const FTS5_TOKEN_COLOCATED: c_int = 0x0001;
+
+/// Port of real `fts5.h`'s `struct fts5_tokenizer` (byte-for-byte
+/// field order/types, verified directly against the real vendored
+/// SQLite amalgamation this crate already compiles against --
+/// `libsqlite3-sys-0.27.0/sqlite3/sqlite3.c`, not guessed from memory).
+#[repr(C)]
+struct RawFts5TokenizerVtable {
+    x_create: unsafe extern "C" fn(*mut c_void, *mut *const c_char, c_int, *mut *mut RawFts5Tokenizer) -> c_int,
+    x_delete: unsafe extern "C" fn(*mut RawFts5Tokenizer),
+    x_tokenize: unsafe extern "C" fn(*mut RawFts5Tokenizer, *mut c_void, c_int, *const c_char, c_int, XTokenFn) -> c_int,
+}
+
+/// A real, but deliberately TRUNCATED, port of `fts5_api` -- only its
+/// leading `iVersion`/`xCreateTokenizer` fields are declared (the real
+/// struct also has `xFindTokenizer`/`xCreateFunction` after them,
+/// which this port never calls). This is safe: we only ever receive
+/// `*mut RawFts5Api` as a raw pointer from SQLite and read these two
+/// leading fields off it -- never treat it as complete-sized (never
+/// `size_of`/copy-by-value it).
+#[repr(C)]
+struct RawFts5Api {
+    i_version: c_int,
+    x_create_tokenizer: unsafe extern "C" fn(*mut RawFts5Api, *const c_char, *mut c_void, *const RawFts5TokenizerVtable, Option<unsafe extern "C" fn(*mut c_void)>) -> c_int,
+}
+
+/// Port of the real C++ `Tokenizer` constructor's `azArg` handling:
+/// only a literal `"0"` following `remove_diacritics`/`stem_words`
+/// changes the corresponding default; any other value (including real
+/// upstream's own `remove_diacritics 2`, meaningful only to SQLite's
+/// *built-in* `unicode61` tokenizer's distinct 3-way option, not to
+/// this custom one) leaves the default untouched. A bare tokenizer
+/// name embedded in the chain (e.g. the `calibre` in real upstream's
+/// `tokenize = 'porter calibre remove_diacritics 2'`) is likewise
+/// inert here -- this port's `porter` tokenizer always runs its own
+/// full pipeline regardless of what base-tokenizer name FTS5's chain
+/// syntax names, matching the real C++ exactly (it never looks at that
+/// argument either).
+fn parse_tokenizer_args(args: &[&str], mut remove_diacritics: bool, mut stem_words: bool) -> (bool, bool) {
+    let mut i = 0usize;
+    while i < args.len() {
+        if args[i] == "remove_diacritics" {
+            i += 1;
+            if i < args.len() && args[i] == "0" {
+                remove_diacritics = false;
+            }
+        } else if args[i] == "stem_words" {
+            i += 1;
+            if i < args.len() && args[i] == "0" {
+                stem_words = false;
+            } else {
+                stem_words = true;
+            }
+        }
+        i += 1;
+    }
+    (remove_diacritics, stem_words)
+}
+
+unsafe fn xcreate_impl(az_arg: *mut *const c_char, n_arg: c_int, pp_out: *mut *mut RawFts5Tokenizer, stem_words_default: bool) -> c_int {
+    let mut args: Vec<&str> = Vec::with_capacity(n_arg.max(0) as usize);
+    for i in 0..n_arg as isize {
+        let p = *az_arg.offset(i);
+        if p.is_null() {
+            continue;
+        }
+        match CStr::from_ptr(p).to_str() {
+            Ok(s) => args.push(s),
+            Err(_) => return ffi::SQLITE_ERROR,
+        }
+    }
+    let (remove_diacritics, stem_words) = parse_tokenizer_args(&args, true, stem_words_default);
+    let tokenizer = Tokenizer {
+        remove_diacritics,
+        stemmer: if stem_words { Some(Algorithm::English) } else { None },
+    };
+    *pp_out = Box::into_raw(Box::new(tokenizer)) as *mut RawFts5Tokenizer;
+    ffi::SQLITE_OK
+}
+
+unsafe extern "C" fn xcreate(_ctx: *mut c_void, az_arg: *mut *const c_char, n_arg: c_int, pp_out: *mut *mut RawFts5Tokenizer) -> c_int {
+    xcreate_impl(az_arg, n_arg, pp_out, false)
+}
+
+unsafe extern "C" fn xcreate_stemming(_ctx: *mut c_void, az_arg: *mut *const c_char, n_arg: c_int, pp_out: *mut *mut RawFts5Tokenizer) -> c_int {
+    xcreate_impl(az_arg, n_arg, pp_out, true)
+}
+
+unsafe extern "C" fn xdelete(p: *mut RawFts5Tokenizer) {
+    if !p.is_null() {
+        drop(Box::from_raw(p as *mut Tokenizer));
+    }
+}
+
+unsafe extern "C" fn xtokenize(tokenizer_ptr: *mut RawFts5Tokenizer, p_ctx: *mut c_void, flags: c_int, p_text: *const c_char, n_text: c_int, x_token: XTokenFn) -> c_int {
+    if p_text.is_null() || n_text < 0 {
+        return ffi::SQLITE_ERROR;
+    }
+    let tokenizer = &*(tokenizer_ptr as *const Tokenizer);
+    let bytes = std::slice::from_raw_parts(p_text as *const u8, n_text as usize);
+    let text = match std::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => return ffi::SQLITE_ERROR,
+    };
+    let mode = if flags & FTS5_TOKENIZE_QUERY != 0 { TokenizeMode::Query } else { TokenizeMode::Document };
+    let tokens = tokenizer.tokenize(text, mode);
+
+    let mut prev: Option<(usize, usize)> = None;
+    for tok in &tokens {
+        let tflags = if prev == Some((tok.start, tok.end)) { FTS5_TOKEN_COLOCATED } else { 0 };
+        let rc = x_token(p_ctx, tflags, tok.text.as_ptr() as *const c_char, tok.text.len() as c_int, tok.start as c_int, tok.end as c_int);
+        if rc != ffi::SQLITE_OK {
+            return rc;
+        }
+        prev = Some((tok.start, tok.end));
+    }
+    ffi::SQLITE_OK
+}
+
+/// Port of `fts5_api_from_db`: the documented SQLite/FTS5 idiom for
+/// retrieving the `fts5_api*` pointer from a connection that has FTS5
+/// compiled in -- prepare `SELECT fts5(?1)`, bind a type-tagged
+/// pointer (to our own output slot) as its parameter, and step once;
+/// FTS5's internal `fts5()` SQL function writes the real API pointer
+/// into that slot as a side effect.
+unsafe fn fts5_api_from_db(db: *mut ffi::sqlite3) -> Result<*mut RawFts5Api, Fts5RegistrationError> {
+    let sql = c"SELECT fts5(?1)";
+    let mut stmt: *mut ffi::sqlite3_stmt = std::ptr::null_mut();
+    let rc = ffi::sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, std::ptr::null_mut());
+    if rc != ffi::SQLITE_OK {
+        return Err(Fts5RegistrationError::Sqlite(rc));
+    }
+    let mut api_ptr: *mut RawFts5Api = std::ptr::null_mut();
+    let tag = c"fts5_api_ptr";
+    let rc = ffi::sqlite3_bind_pointer(stmt, 1, (&mut api_ptr as *mut *mut RawFts5Api) as *mut c_void, tag.as_ptr(), None);
+    if rc != ffi::SQLITE_OK {
+        ffi::sqlite3_finalize(stmt);
+        return Err(Fts5RegistrationError::Sqlite(rc));
+    }
+    ffi::sqlite3_step(stmt);
+    ffi::sqlite3_finalize(stmt);
+    if api_ptr.is_null() {
+        return Err(Fts5RegistrationError::Fts5Unavailable);
+    }
+    Ok(api_ptr)
+}
+
+/// Port of `calibre_sqlite_extension_init`: registers the real
+/// `calibre`/`porter` FTS5 tokenizers on `conn`, and -- matching real
+/// upstream's own extension init exactly -- also OVERRIDES the
+/// built-in `unicode61` tokenizer name with the plain (non-stemming)
+/// `calibre` implementation. Real upstream's own bundled DDL
+/// (`fts_sqlite.sql`/`notes_sqlite.sql`) uses `tokenize = 'calibre
+/// remove_diacritics 2'`/`tokenize = 'porter calibre remove_diacritics
+/// 2'` directly (not the overridden `unicode61` name) for its own
+/// `books_fts`/`notes_fts` tables, but some other real schema
+/// (`schema_upgrades.py`'s `annotations_fts`) does use `tokenize =
+/// 'unicode61 remove_diacritics 2'` -- registering all three names is
+/// what makes both real call sites correct.
 ///
-/// This lands as part of the `LibraryHandle` port (issue #93) so the
-/// registration happens exactly once per Connection at open time,
-/// alongside the WAL/synchronous=FULL pragmas.
-pub fn register_fts5_tokenizers(_conn: &rusqlite::Connection) -> Result<(), Fts5NotWired> {
-    // todo!("placeholder: wire rusqlite fts5 tokenizer registration in #93")
-    Err(Fts5NotWired)
+/// Call once per real `Connection`, alongside the other custom
+/// function/collation registration in [`crate::backend::register_functions`].
+pub fn register_fts5_tokenizers(conn: &rusqlite::Connection) -> Result<(), Fts5RegistrationError> {
+    unsafe {
+        let db = conn.handle();
+        let api = fts5_api_from_db(db)?;
+        if (*api).i_version < 2 {
+            return Err(Fts5RegistrationError::Fts5Unavailable);
+        }
+
+        let plain = RawFts5TokenizerVtable { x_create: xcreate, x_delete: xdelete, x_tokenize: xtokenize };
+        let stemming = RawFts5TokenizerVtable { x_create: xcreate_stemming, x_delete: xdelete, x_tokenize: xtokenize };
+
+        for name in [c"unicode61", c"calibre"] {
+            let rc = ((*api).x_create_tokenizer)(api, name.as_ptr(), std::ptr::null_mut(), &plain, None);
+            if rc != ffi::SQLITE_OK {
+                return Err(Fts5RegistrationError::Sqlite(rc));
+            }
+        }
+        let rc = ((*api).x_create_tokenizer)(api, c"porter".as_ptr(), std::ptr::null_mut(), &stemming, None);
+        if rc != ffi::SQLITE_OK {
+            return Err(Fts5RegistrationError::Sqlite(rc));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -367,12 +572,69 @@ mod tests {
     }
 
     #[test]
-    fn register_fts5_returns_placeholder_error() {
-        // Documents the placeholder — when #93 lands, this test
-        // becomes the real registration test.
+    fn parse_tokenizer_args_only_a_literal_zero_disables_remove_diacritics() {
+        assert_eq!(parse_tokenizer_args(&[], true, false), (true, false));
+        assert_eq!(parse_tokenizer_args(&["remove_diacritics", "0"], true, false), (false, false));
+        // Real upstream's own bundled DDL value -- meaningful only to
+        // SQLite's built-in unicode61, inert here.
+        assert_eq!(parse_tokenizer_args(&["remove_diacritics", "2"], true, false), (true, false));
+        assert_eq!(parse_tokenizer_args(&["stem_words", "1"], true, false), (true, true));
+        assert_eq!(parse_tokenizer_args(&["stem_words", "0"], true, true), (true, false));
+        // A bare chained-tokenizer name (e.g. "calibre" in real
+        // upstream's "porter calibre remove_diacritics 2") is simply
+        // skipped, matching the real C++ loop exactly.
+        assert_eq!(parse_tokenizer_args(&["calibre", "remove_diacritics", "0"], true, false), (false, false));
+    }
+
+    #[test]
+    fn register_fts5_tokenizers_makes_calibre_and_porter_real() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        let err = register_fts5_tokenizers(&conn).unwrap_err();
-        // Just verify the message references the tracking issue.
-        assert!(format!("{}", err).contains("#93"));
+        register_fts5_tokenizers(&conn).unwrap();
+
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE t USING fts5(content, tokenize='calibre');
+             CREATE VIRTUAL TABLE t_stemmed USING fts5(content, tokenize='porter');",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t(rowid, content) VALUES (1, 'café')", []).unwrap();
+        conn.execute("INSERT INTO t_stemmed(rowid, content) VALUES (1, 'running')", []).unwrap();
+
+        // Diacritic-folding: a plain "cafe" query should match "café"
+        // via the calibre tokenizer's colocated diacritic-stripped
+        // token.
+        let hits: i64 = conn.query_row("SELECT count(*) FROM t WHERE t MATCH 'cafe'", [], |r| r.get(0)).unwrap();
+        assert_eq!(hits, 1, "the calibre tokenizer should fold diacritics so 'cafe' matches 'café'");
+
+        // English stemming: a "run" query should match "running" via
+        // the porter tokenizer's Snowball stemming.
+        let hits: i64 = conn.query_row("SELECT count(*) FROM t_stemmed WHERE t_stemmed MATCH 'run'", [], |r| r.get(0)).unwrap();
+        assert_eq!(hits, 1, "the porter tokenizer should stem 'running' to 'run'");
+    }
+
+    #[test]
+    fn register_fts5_tokenizers_overrides_the_builtin_unicode61_name_too() {
+        // Real upstream's own extension init overrides SQLite's
+        // built-in "unicode61" tokenizer name with the plain calibre
+        // implementation -- confirm the override actually took (a
+        // real "unicode61" would NOT diacritic-fold by default).
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        register_fts5_tokenizers(&conn).unwrap();
+        conn.execute_batch("CREATE VIRTUAL TABLE u USING fts5(content, tokenize='unicode61 remove_diacritics 2')").unwrap();
+        conn.execute("INSERT INTO u(rowid, content) VALUES (1, 'café')", []).unwrap();
+        let hits: i64 = conn.query_row("SELECT count(*) FROM u WHERE u MATCH 'cafe'", [], |r| r.get(0)).unwrap();
+        assert_eq!(hits, 1, "the overridden 'unicode61' name should behave like the calibre tokenizer, not SQLite's real built-in one");
+    }
+
+    #[test]
+    fn register_fts5_tokenizers_rejects_a_malformed_query() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        register_fts5_tokenizers(&conn).unwrap();
+        conn.execute_batch("CREATE VIRTUAL TABLE t USING fts5(content, tokenize='calibre')").unwrap();
+        // An unclosed double-quoted phrase is FTS5's own query-syntax
+        // error (not the outer SQL string, which is validly closed).
+        let err = conn.query_row("SELECT count(*) FROM t WHERE t MATCH 'unterminated \"quote'", [], |r| r.get::<_, i64>(0)).unwrap_err();
+        // Just confirm it's a real, well-formed SQLite-level error
+        // surfaced through the connection -- not a panic or UB.
+        assert!(format!("{err}").to_lowercase().contains("unterminated"), "{err}");
     }
 }

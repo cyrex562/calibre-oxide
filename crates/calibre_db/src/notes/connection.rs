@@ -23,9 +23,11 @@
 //!
 //! # Disclosed simplifications
 //!
-//! - **No custom `calibre`/`porter` FTS5 tokenizers** -- same #93
-//!   dependency and same `unicode61` fallback as `fts/connection.rs`
-//!   (#226); see that file's module doc for the full explanation.
+//! - **Real `calibre`/`porter` FTS5 tokenizers, as of issue #566** --
+//!   same fix and the same real `tokenize=` clauses (verified against
+//!   real upstream's bundled `notes_sqlite.sql`) as `fts/connection.rs`
+//!   (#226); see that file's module doc for the full explanation,
+//!   including the stale-prior-claim correction.
 //! - **No retire/backup/undo-trail.** Upstream keeps a `backup_dir`/
 //!   `retired_dir` on disk: every `set_note` call also writes a
 //!   plain-text backup copy (`set_backup_for`), and deleting a note
@@ -201,10 +203,12 @@ impl NotesConnection {
                     UNIQUE(note, resource)
                 );
                 CREATE VIRTUAL TABLE IF NOT EXISTS notes_db.notes_fts USING fts5(
-                    searchable_text, content = 'notes', content_rowid = 'id'
+                    searchable_text, content = 'notes', content_rowid = 'id',
+                    tokenize = 'calibre remove_diacritics 2'
                 );
                 CREATE VIRTUAL TABLE IF NOT EXISTS notes_db.notes_fts_stemmed USING fts5(
-                    searchable_text, content = 'notes', content_rowid = 'id'
+                    searchable_text, content = 'notes', content_rowid = 'id',
+                    tokenize = 'porter calibre remove_diacritics 2'
                 );
                 CREATE TRIGGER IF NOT EXISTS notes_db.notes_fts_insert_trg AFTER INSERT ON notes BEGIN
                     INSERT INTO notes_fts(rowid, searchable_text) VALUES (NEW.id, NEW.searchable_text);

@@ -21,20 +21,22 @@
 //!
 //! # Disclosed simplifications
 //!
-//! - **No custom `calibre`/`porter` FTS5 tokenizers.** Upstream's
-//!   schema creates `books_fts`/`books_fts_stemmed` with
+//! - **Real `calibre`/`porter` FTS5 tokenizers, as of issue #566.**
+//!   `books_fts`/`books_fts_stemmed` now use the real
 //!   `tokenize = 'calibre remove_diacritics 2'` /
-//!   `'porter calibre remove_diacritics 2'` -- SQLite extension
-//!   tokenizers registered via `fts5_api->xCreateTokenizer`, which
-//!   `crate::sqlite_extension` implements the tokenize/stem logic for
-//!   but deliberately does not wire into a live connection (that's
-//!   issue #93's job -- rusqlite has no direct API for it). Both
-//!   virtual tables here use FTS5's built-in `unicode61` tokenizer
-//!   instead, so `use_stemming` in [`FtsConnection::search`] currently
-//!   selects between two functionally-identical tables. Real
-//!   stemming/diacritic-aware search starts working automatically
-//!   once #93 wires tokenizer registration -- nothing here needs to
-//!   change, since the table names/roles already match upstream.
+//!   `'porter calibre remove_diacritics 2'` clauses from real
+//!   upstream's bundled `fts_sqlite.sql`, registered via
+//!   `crate::sqlite_extension::register_fts5_tokenizers`. **Correction
+//!   to a stale claim this doc previously made**: it used to say
+//!   "nothing here needs to change" once tokenizer registration
+//!   landed, on the theory that the DDL already matched upstream --
+//!   that was wrong. Neither virtual table had a `tokenize=` clause AT
+//!   ALL before #566 (both silently used FTS5's default `unicode61`),
+//!   so `use_stemming` in [`FtsConnection::search`] previously
+//!   selected between two byte-for-byte IDENTICAL tables, not just two
+//!   tables sharing the same (wrong) tokenizer. Confirmed by reading
+//!   real upstream's actual bundled `resources/fts_sqlite.sql`
+//!   directly, not by re-trusting this comment's own prior claim.
 //! - **No background worker pool.** `fts/pool.py`'s `Pool`/`Worker`
 //!   spawn a subprocess per book/format to extract text
 //!   out-of-process (via `calibre.db.fts.text.main`) and feed results
@@ -129,10 +131,12 @@ impl FtsConnection {
                     UNIQUE(book, format)
                 );
                 CREATE VIRTUAL TABLE IF NOT EXISTS fts_db.books_fts USING fts5(
-                    searchable_text, content = 'books_text', content_rowid = 'id'
+                    searchable_text, content = 'books_text', content_rowid = 'id',
+                    tokenize = 'calibre remove_diacritics 2'
                 );
                 CREATE VIRTUAL TABLE IF NOT EXISTS fts_db.books_fts_stemmed USING fts5(
-                    searchable_text, content = 'books_text', content_rowid = 'id'
+                    searchable_text, content = 'books_text', content_rowid = 'id',
+                    tokenize = 'porter calibre remove_diacritics 2'
                 );
                 CREATE TRIGGER IF NOT EXISTS fts_db.books_fts_insert_trg AFTER INSERT ON books_text BEGIN
                     INSERT INTO books_fts(rowid, searchable_text) VALUES (NEW.id, NEW.searchable_text);
