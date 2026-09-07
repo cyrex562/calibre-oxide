@@ -1758,9 +1758,9 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 
 #### magick
 
-- [ ] draw.py
-- [ ] legacy.py
-- [ ] __init__.py
+- [x] draw.py (issue #70 CLOSED as not-applicable -- zero real consumers anywhere in upstream outside the package's own files; despite the "magick" name, doesn't use ImageMagick at all, just a thin wrapper over `calibre.utils.img`)
+- [x] legacy.py (issue #70, same -- a PythonMagick-API-shaped compat shim over `calibre.utils.img`, no real consumer)
+- [x] __init__.py (issue #70, same)
 
 #### msdes
 
