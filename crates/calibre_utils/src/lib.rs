@@ -20,6 +20,7 @@ pub mod localunzip;
 pub mod lock;
 pub mod logging;
 pub mod lzx;
+pub mod matcher;
 pub mod mem;
 pub mod monotonic;
 pub mod mreplace;
