@@ -330,11 +330,26 @@ pub fn align_block(raw: &[u8], multiple: usize, pad: u8) -> Vec<u8> {
     res
 }
 
+/// Port of the Python `convert_color_for_font_tag`. Previously a naive
+/// passthrough that never actually parsed anything -- fixed (issue
+/// #583) to use the real `tinycss.color3.parse_color_string` port
+/// ([`crate::oeb::color3`]) any real caller needs: named keywords,
+/// `#rgb`/`#rrggbb`, and `rgb()`/`rgba()`/`hsl()`/`hsla()` all now
+/// resolve to a real `#rrggbb` hex value, not just values that already
+/// happened to start with `#`.
 pub fn convert_color_for_font_tag(val: &str) -> String {
-    if val.starts_with('#') {
-        return val.to_string();
+    match crate::oeb::color3::parse_color_string(val) {
+        None | Some(crate::oeb::color3::CssColor::Current) => val.to_string(),
+        Some(crate::oeb::color3::CssColor::Rgba(c)) => {
+            let clamp = |x: f64| x.clamp(0.0, 1.0);
+            format!(
+                "#{:02x}{:02x}{:02x}",
+                (clamp(c.red) * 255.0) as i64 as u8,
+                (clamp(c.green) * 255.0) as i64 as u8,
+                (clamp(c.blue) * 255.0) as i64 as u8
+            )
+        }
     }
-    val.to_string()
 }
 
 pub fn is_guide_ref_start(title: Option<&str>, type_: Option<&str>) -> bool {
@@ -660,6 +675,18 @@ pub fn detect_periodical(toc: &TOC, mut log: Option<&mut crate::mobi::MobiLog>) 
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// Cross-validated directly against real Python's
+    /// `convert_color_for_font_tag` (`old_src/.../mobi/utils.py`).
+    #[test]
+    fn convert_color_for_font_tag_resolves_real_colors() {
+        assert_eq!(convert_color_for_font_tag("red"), "#ff0000");
+        assert_eq!(convert_color_for_font_tag("currentColor"), "currentColor");
+        assert_eq!(convert_color_for_font_tag("#00ff00"), "#00ff00");
+        assert_eq!(convert_color_for_font_tag("rgb(0, 0, 255)"), "#0000ff");
+        assert_eq!(convert_color_for_font_tag("notacolor"), "notacolor");
+        assert_eq!(convert_color_for_font_tag(""), "");
+    }
 
     #[test]
     fn test_encint_decint() {
