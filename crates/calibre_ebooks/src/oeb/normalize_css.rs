@@ -196,10 +196,214 @@ pub fn normalize_edge(name: &str, value: &str) -> HashMap<String, String> {
     style
 }
 
+/// A `font-family`-composition value: either a serialized string (the
+/// common case, and every non-`font-family` composition key) or a list
+/// of individual family names -- Python's dict is untyped and stores
+/// either shape in the same `font-family` slot depending on
+/// `font_family_as_list`/whether `parse_font` ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FontPropertyValue {
+    Text(String),
+    List(Vec<String>),
+}
+
+const FONT_COMPOSITION: [&str; 6] = [
+    "font-style",
+    "font-variant",
+    "font-weight",
+    "font-size",
+    "line-height",
+    "font-family",
+];
+
+const LEGACY_SYSTEM_FONTS: [&str; 6] = [
+    "caption",
+    "icon",
+    "menu",
+    "message-box",
+    "small-caption",
+    "status-bar",
+];
+
+/// Port of `normalize_font` (issue #580). `font-stretch` is deliberately
+/// absent from [`FONT_COMPOSITION`], matching upstream's own
+/// `font_composition` tuple -- it's only ever present in the result if
+/// [`super::fonts3::parse_font`] itself sets it, never defaulted.
+///
+/// Faithfully replicates a real upstream quirk: the legacy-system-font
+/// branch (`caption`/`icon`/...) does NOT call `parse_font` at all, so
+/// `font-family` ends up as `DEFAULTS["font-family"]` (`"serif"`) here,
+/// NOT `parse_font`'s own `"sans-serif"` legacy handling -- these two
+/// legacy-keyword code paths genuinely disagree in real upstream, and
+/// this port keeps both exactly as they are rather than reconciling
+/// them.
+pub fn normalize_font(cssvalue: &str, font_family_as_list: bool) -> HashMap<String, FontPropertyValue> {
+    let val = cssvalue.trim();
+    let mut ans: HashMap<String, FontPropertyValue> = HashMap::new();
+
+    if val == "inherit" {
+        for k in FONT_COMPOSITION {
+            ans.insert(k.to_string(), FontPropertyValue::Text("inherit".to_string()));
+        }
+    } else if LEGACY_SYSTEM_FONTS.contains(&val) {
+        for k in FONT_COMPOSITION {
+            let default = DEFAULTS.get(k).copied().unwrap_or_default();
+            ans.insert(k.to_string(), FontPropertyValue::Text(default.to_string()));
+        }
+    } else {
+        for k in FONT_COMPOSITION {
+            let default = DEFAULTS.get(k).copied().unwrap_or_default();
+            ans.insert(k.to_string(), FontPropertyValue::Text(default.to_string()));
+        }
+        let parsed = super::fonts3::parse_font(val);
+        if let Some(v) = parsed.style {
+            ans.insert("font-style".to_string(), FontPropertyValue::Text(v));
+        }
+        if let Some(v) = parsed.variant {
+            ans.insert("font-variant".to_string(), FontPropertyValue::Text(v));
+        }
+        if let Some(v) = parsed.weight {
+            ans.insert("font-weight".to_string(), FontPropertyValue::Text(v));
+        }
+        if let Some(v) = parsed.stretch {
+            ans.insert("font-stretch".to_string(), FontPropertyValue::Text(v));
+        }
+        if let Some(v) = parsed.size {
+            ans.insert("font-size".to_string(), FontPropertyValue::Text(v));
+        }
+        if let Some(v) = parsed.line_height {
+            ans.insert("line-height".to_string(), FontPropertyValue::Text(v));
+        }
+        if !parsed.family.is_empty() {
+            ans.insert("font-family".to_string(), FontPropertyValue::List(parsed.family));
+        }
+    }
+
+    let family_is_list = matches!(ans.get("font-family"), Some(FontPropertyValue::List(_)));
+    if font_family_as_list {
+        if let Some(FontPropertyValue::Text(s)) = ans.get("font-family").cloned() {
+            let list = s.split(',').map(|x| x.trim().to_string()).collect();
+            ans.insert("font-family".to_string(), FontPropertyValue::List(list));
+        }
+    } else if family_is_list {
+        if let Some(FontPropertyValue::List(list)) = ans.get("font-family").cloned() {
+            ans.insert(
+                "font-family".to_string(),
+                FontPropertyValue::Text(super::fonts3::serialize_font_family(&list)),
+            );
+        }
+    }
+    ans
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    /// Cross-validated against `old_src/src/calibre/ebooks/oeb/normalize_css.py`'s
+    /// own `test_font_normalization` doctest cases (real Python, run
+    /// directly against `tinycss.fonts3.parse_font`/`normalize_font`).
+    fn text(s: &str) -> FontPropertyValue {
+        FontPropertyValue::Text(s.to_string())
+    }
+
+    #[test]
+    fn normalize_font_a_bare_family_name() {
+        let ans = normalize_font("some_font", false);
+        assert_eq!(ans.get("font-family"), Some(&text("some_font")));
+    }
+
+    #[test]
+    fn normalize_font_inherit_sets_every_composition_key_to_inherit() {
+        let ans = normalize_font("inherit", false);
+        for k in FONT_COMPOSITION {
+            assert_eq!(ans.get(k), Some(&text("inherit")), "key {k}");
+        }
+    }
+
+    #[test]
+    fn normalize_font_size_and_line_height_shorthand() {
+        let ans = normalize_font("1.2pt/1.4 A_Font", false);
+        assert_eq!(ans.get("font-family"), Some(&text("A_Font")));
+        assert_eq!(ans.get("font-size"), Some(&text("1.2pt")));
+        assert_eq!(ans.get("line-height"), Some(&text("1.4")));
+    }
+
+    #[test]
+    fn normalize_font_an_unquoted_multi_word_name_gets_quoted_on_serialize() {
+        let ans = normalize_font("bad font", false);
+        assert_eq!(ans.get("font-family"), Some(&text("\"bad font\"")));
+    }
+
+    #[test]
+    fn normalize_font_percentage_size_with_a_generic_family() {
+        let ans = normalize_font("10% serif", false);
+        assert_eq!(ans.get("font-family"), Some(&text("serif")));
+        assert_eq!(ans.get("font-size"), Some(&text("10%")));
+    }
+
+    #[test]
+    fn normalize_font_quoted_family_plus_generic_fallback() {
+        let ans = normalize_font("12px \"My Font\", serif", false);
+        assert_eq!(ans.get("font-family"), Some(&text("\"My Font\", serif")));
+        assert_eq!(ans.get("font-size"), Some(&text("12px")));
+    }
+
+    #[test]
+    fn normalize_font_style_size_line_height_and_family_list() {
+        let ans = normalize_font("normal 0.6em/135% arial,sans-serif", false);
+        assert_eq!(ans.get("font-family"), Some(&text("arial, sans-serif")));
+        assert_eq!(ans.get("font-size"), Some(&text("0.6em")));
+        assert_eq!(ans.get("line-height"), Some(&text("135%")));
+        assert_eq!(ans.get("font-style"), Some(&text("normal")));
+    }
+
+    #[test]
+    fn normalize_font_weight_style_and_size_keywords() {
+        let ans = normalize_font("bold italic large serif", false);
+        assert_eq!(ans.get("font-family"), Some(&text("serif")));
+        assert_eq!(ans.get("font-weight"), Some(&text("bold")));
+        assert_eq!(ans.get("font-style"), Some(&text("italic")));
+        assert_eq!(ans.get("font-size"), Some(&text("large")));
+    }
+
+    #[test]
+    fn normalize_font_all_slots_plus_normal_line_height() {
+        let ans = normalize_font("bold italic small-caps larger/normal serif", false);
+        assert_eq!(ans.get("font-family"), Some(&text("serif")));
+        assert_eq!(ans.get("font-weight"), Some(&text("bold")));
+        assert_eq!(ans.get("font-style"), Some(&text("italic")));
+        assert_eq!(ans.get("font-size"), Some(&text("larger")));
+        assert_eq!(ans.get("line-height"), Some(&text("normal")));
+        assert_eq!(ans.get("font-variant"), Some(&text("small-caps")));
+    }
+
+    #[test]
+    fn normalize_font_two_bare_idents_join_into_one_quoted_family() {
+        let ans = normalize_font("2em A B", false);
+        assert_eq!(ans.get("font-family"), Some(&text("\"A B\"")));
+        assert_eq!(ans.get("font-size"), Some(&text("2em")));
+    }
+
+    #[test]
+    fn normalize_font_legacy_keyword_uses_the_default_not_parse_fonts_own_legacy_handling() {
+        // See this function's own doc comment: normalize_font's legacy
+        // branch never calls parse_font, so font-family stays the plain
+        // DEFAULTS value ("serif"), not parse_font's "sans-serif".
+        let ans = normalize_font("caption", false);
+        assert_eq!(ans.get("font-family"), Some(&text("serif")));
+        assert_eq!(ans.get("font-style"), Some(&text("normal")));
+    }
+
+    #[test]
+    fn normalize_font_family_as_list_splits_a_defaulted_string() {
+        let ans = normalize_font("bold", true);
+        assert_eq!(
+            ans.get("font-family"),
+            Some(&FontPropertyValue::List(vec!["serif".to_string()]))
+        );
+    }
 
     #[test]
     fn normalize_filter_css_expands_margin_into_all_four_edges() {
