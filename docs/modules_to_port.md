@@ -1785,18 +1785,60 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 
 #### podofo
 
-- [ ] doc.cpp
-- [ ] fonts.cpp
-- [ ] global.h
-- [ ] images.cpp
-- [ ] impose.cpp
-- [ ] outline.cpp
-- [ ] outlines.cpp
-- [ ] output.cpp
-- [ ] podofo.cpp
-- [ ] test.cpp
-- [ ] utils.cpp
-- [ ] __init__.py
+Issue #74 (11 files). Per explicit project direction this is built on
+[`lopdf`](https://docs.rs/lopdf) (pure Rust) rather than an FFI wrap of
+the real C++ PoDoFo library `calibre_extensions/podofo` binds. Split
+into a doc-core piece (this issue, done) plus three dependent
+sub-issues covering the larger remaining algorithms: #576 (outline/
+bookmark tree), #577 (font management), #578 (images/pages/document
+merging — dedup_images, impose, append/copy_page/insert_existing_page).
+
+- [x] doc.cpp (partial — doc-core only: load/open/save/write, page_count,
+      version, the 6 Info-dict string properties, get/set_xmp_metadata,
+      image_count. `calibre_utils::podofo::PdfDoc`. Remaining doc.cpp
+      scope — delete_pages, get/set_page_box, copy_page, append,
+      insert_existing_page, set_box, extract_first_page,
+      extract_anchors, alter_links — split to #578.
+      Disclosed deviation: image_count() uses the correct `Type==XObject
+      AND Subtype==Image` check, not upstream's likely-unintentional
+      `OR`, which over-counts Form XObjects and is inconsistent with the
+      AND-gated image detection used elsewhere in the same C++ codebase.)
+- [ ] fonts.cpp (split to #577)
+- [x] global.h (N/A beyond disclosure: `PdfSaveOptions::NoMetadataUpdate`,
+      used on every real PoDoFo save call to stop PoDoFo silently
+      rewriting `/Info`/XMP on save, has no Rust equivalent concern —
+      `lopdf::Document::save`/`save_to` only serialize the existing
+      object table and never touch `/Info` themselves.)
+- [ ] images.cpp (mislabeled filename — its real content is
+      `dedup_images()`; split to #578)
+- [ ] impose.cpp (split to #578)
+- [ ] outline.cpp (split to #576)
+- [ ] outlines.cpp (split to #576)
+- [x] output.cpp (N/A — a CPython `OutputStreamDevice` shim letting
+      PoDoFo write into an arbitrary Python file object. `lopdf`'s
+      `save_to<W: Write>` already accepts any `impl std::io::Write`, so
+      no equivalent bridging shim is needed.)
+- [x] podofo.cpp (N/A — CPython extension-module init/registration
+      boilerplate; no such step exists for a native Rust crate.)
+- [x] test.cpp (N/A — a standalone interactive C++ `main()` dev harness
+      exercising PoDoFo directly, not part of the Python-facing API and
+      not a test suite; this port's own `#[cfg(test)]` unit tests in
+      `podofo.rs`, including a byte-for-byte reuse of upstream's own
+      `test_podofo()` fixture PDF, serve the equivalent purpose.)
+- [x] utils.cpp (N/A — `podofo_convert_pdfstring`/`podofo_convert_pystring`,
+      PoDoFo↔Python string/exception conversion helpers, are subsumed by
+      `lopdf::text_string`/`decode_text_string` and this crate's own
+      `PodofoError`.)
+- [x] __init__.py (Python orchestration layer: `set_metadata`'s real
+      `fork_job`-based subprocess-isolated call into
+      `calibre.utils.ipc.simple_worker` is now moot per issue #68's
+      thread-pool redesign of `utils/ipc` — no subprocess worker exists
+      to fork into. Wiring `PdfDoc` into a real metadata-writing
+      pipeline, if one is added later, would call it in-process
+      directly instead. Not ported as a standalone module; its real
+      algorithmic content (`set_metadata_implementation`'s dirty-check-
+      then-set logic) is straightforward to inline at that future call
+      site.)
 
 #### rcc
 
