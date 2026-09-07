@@ -2217,9 +2217,14 @@ finding, `oeb/polish/report.py`'s `css_data` (needs line/column
 tracking added to `crate::css`), is a different, currently-untouched
 source file, not itself a tinycss file — filed separately as #584.
 
-- [ ] color3.py (split to #583 — the algorithm is already ported, in
-      `docx/writer/utils.rs`, just not exposed as a shared API; the
-      real gap is `mobi/utils.py`'s equivalent call site being unwired)
+- [x] color3.py (`crate::oeb::color3` — issue #583. Promoted out of
+      `docx/writer/utils.rs` [its original, private home] into a shared
+      module, and used to fix `mobi::utils::convert_color_for_font_tag`,
+      which had been a naive passthrough that never actually parsed
+      anything despite existing already. Cross-validated byte-for-byte
+      against real `tinycss.color3.parse_color_string` for named
+      keywords/hex/rgb()/rgba()/hsl()/hsla()/currentColor, and against
+      the real `convert_color_for_font_tag` for its own 6 cases)
 - [x] css21.py (partial — the core grammar this file defines is already
       real in `crate::css::model`/`parser` (issue #164): Stylesheet/
       RuleSet/Declaration, `@import`/`@media`/`@charset`, `!important`
