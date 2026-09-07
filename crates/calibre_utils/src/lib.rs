@@ -14,6 +14,7 @@ pub mod formatter;
 pub mod html2text;
 pub mod hyphenation;
 pub mod icu;
+pub mod imageops;
 pub mod imghdr;
 pub mod localization;
 pub mod localunzip;

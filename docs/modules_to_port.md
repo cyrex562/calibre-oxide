@@ -1726,11 +1726,11 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 
 #### imageops
 
-- [ ] imageops.cpp
-- [ ] imageops.h
-- [ ] imageops.sip
-- [ ] ordered_dither.cpp
-- [ ] quantize.cpp
+- [ ] imageops.cpp (issue #67 split into #569/#570/#571 -- #569 CLOSED: `calibre_utils::imageops::{remove_borders,grayscale,overlay,has_transparent_pixels,set_opacity,texture_image,dominant_color,normalize}`, the real pixel/histogram-level operations, ported against `image::RgbaImage`. Found and fixed a real bug in `overlay`/`texture_image`'s alpha-blend math while writing tests: the premultiplied source's ALPHA channel was being re-multiplied by itself instead of used as-is (a premultiplied pixel's alpha channel IS the alpha value, only R/G/B get premultiplied) -- caught by a real test expecting the opaque canvas to stay opaque after blending, not by review. Remaining functions (`gaussian_sharpen`/`gaussian_blur`/`despeckle`/`oil_paint`) are #570, not yet done)
+- [ ] imageops.h (see imageops.cpp above -- the shared declarations, split the same way)
+- [x] imageops.sip (SIP/PyQt binding glue, N/A -- this port has no Python/Qt binding layer)
+- [ ] ordered_dither.cpp (issue #571, not yet done)
+- [ ] quantize.cpp (issue #571, not yet done)
 
 #### ipc
 
