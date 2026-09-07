@@ -208,6 +208,42 @@ fn search_restricted_to_multiple_book_ids_uses_the_temp_table_path() {
 }
 
 #[test]
+fn stemmed_and_non_stemmed_search_now_genuinely_differ() {
+    // Issue #566: books_fts/books_fts_stemmed previously had no
+    // `tokenize=` clause at all, so `use_stemming` selected between
+    // two byte-for-byte identical tables. With the real `calibre`/
+    // `porter calibre` tokenizers now registered and wired into the
+    // DDL, a search for the stem "run" should only match "running"
+    // through the stemmed table.
+    let dir = tempdir().unwrap();
+    let backend = Backend::new(dir.path()).unwrap();
+    let fts = FtsConnection::new(backend.conn.clone(), &backend.db_path);
+    fts.initialize().unwrap();
+
+    add_text(&fts, 1, "EPUB", "the athlete went running yesterday");
+
+    let non_stemmed = fts.search("run", false, None, None, None, true).unwrap();
+    assert!(non_stemmed.is_empty(), "the plain 'calibre' tokenizer should not stem, so 'run' should not match 'running'");
+
+    let stemmed = fts.search("run", true, None, None, None, true).unwrap();
+    assert_eq!(stemmed.len(), 1, "the 'porter calibre' tokenizer should stem 'running' down to 'run'");
+    assert_eq!(stemmed[0].book_id, 1);
+}
+
+#[test]
+fn search_diacritic_folds_through_the_real_calibre_tokenizer() {
+    let dir = tempdir().unwrap();
+    let backend = Backend::new(dir.path()).unwrap();
+    let fts = FtsConnection::new(backend.conn.clone(), &backend.db_path);
+    fts.initialize().unwrap();
+
+    add_text(&fts, 1, "EPUB", "a story about a café");
+
+    let results = fts.search("cafe", false, None, None, None, true).unwrap();
+    assert_eq!(results.len(), 1, "the real calibre tokenizer should fold diacritics so 'cafe' matches 'café'");
+}
+
+#[test]
 fn search_with_an_empty_restrict_set_returns_no_results() {
     let dir = tempdir().unwrap();
     let backend = Backend::new(dir.path()).unwrap();

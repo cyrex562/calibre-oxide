@@ -613,6 +613,12 @@ impl Backend {
 /// Port of `Connection.__init__`'s custom function/collation/aggregate
 /// registration.
 pub(crate) fn register_functions(conn: &Connection) -> SqlResult<()> {
+    // Port of `calibre_sqlite_extension_init` (issue #566): registers
+    // the real `calibre`/`porter` FTS5 tokenizers (and overrides the
+    // built-in `unicode61` name), matching real upstream's own
+    // extension-init call alongside connection setup.
+    crate::sqlite_extension::register_fts5_tokenizers(conn).map_err(|e| SqlError::UserFunctionError(Box::new(e)))?;
+
     conn.create_collation("PYNOCASE", |a: &str, b: &str| -> Ordering {
         a.to_lowercase().cmp(&b.to_lowercase())
     })?;
