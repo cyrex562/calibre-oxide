@@ -630,17 +630,23 @@ either -- this pass wasn't exhaustive.
 - [x] parsing.py
 - [x] pretty.py
 - [x] replace.py
-- [ ] report.py (partial -- issue #584. `get_category`/`files_data`/
-      `images_data`/`words_data`/`chars_data` real in
-      `oeb::polish::report`, wired against already-real `Container`/
-      `spell::{get_all_words,count_all_chars}`/`imghdr::identify`; two
-      small new primitives needed and added to `calibre_utils::icu`
-      (`numeric_strcmp`, `safe_chr`). `links_data`/`create_anchor_map`/
-      `css_data`/`gather_data`'s orchestration split to #590 -- both
-      need real source line/column tracking this crate's `Dom`
-      (confirmed via its `Node` struct directly) and
-      `crate::css::model` don't have at all, a genuine infrastructure
-      change, not a small wiring gap)
+- [ ] report.py (partial -- issue #584/#590. `get_category`/
+      `files_data`/`images_data`/`words_data`/`chars_data`/
+      `links_data`/`create_anchor_map`/`description_for_anchor` real
+      in `oeb::polish::report`, wired against already-real
+      `Container`/`spell::{get_all_words,count_all_chars}`/
+      `imghdr::identify`; two small new primitives added to
+      `calibre_utils::icu` (`numeric_strcmp`, `safe_chr`).
+      `links_data` needed real source line tracking on `crate::dom::Dom`
+      (confirmed absent via its `Node` struct directly) -- added via a
+      custom `TreeSink` wrapping `RcDom` (`dom.rs`'s
+      `LineTrackingSink`), a real, tested, crate-wide infrastructure
+      addition, not a per-function workaround. Only `css_data`/
+      `gather_data`'s orchestration remain: `css_data` needs the same
+      kind of position tracking on `crate::css::model`, a separate
+      change since `crate::css`'s parser is unrelated to `Dom`'s;
+      CSS-selector-to-DOM matching itself is NOT a blocker
+      (`crate::css::selector`/`matcher` already provides it))
 - [x] spell.py
 - [x] split.py
 - [x] stats.py
