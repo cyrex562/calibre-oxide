@@ -773,29 +773,20 @@ impl FunctionRegistry for CacheFunctions<'_> {
 /// "No function named ... exists" error text (fragile), since a name
 /// absent from one module's dispatch table is also absent from that
 /// same module's arity table.
+/// Delegates to [`calibre_utils::formatter::PureFunctions`] (issue
+/// #596 promoted this crate's own original private implementation of
+/// this exact "chain the 5 pure function modules" logic into a
+/// shared, reusable place once a second real caller,
+/// `calibre_ebooks::covers`, needed the identical thing).
 fn fallback_call(name: &str, args: &[String]) -> Result<String, String> {
-    use calibre_utils::formatter::{format_functions, list_functions, misc_functions, numeric_functions, string_functions};
-    if string_functions::arg_count(name).is_some() {
-        string_functions::call(name, args)
-    } else if list_functions::arg_count(name).is_some() {
-        list_functions::call(name, args)
-    } else if numeric_functions::arg_count(name).is_some() {
-        numeric_functions::call(name, args)
-    } else if format_functions::arg_count(name).is_some() {
-        format_functions::call(name, args)
-    } else {
-        misc_functions::call(name, args)
-    }
+    use calibre_utils::formatter::interp::FunctionRegistry;
+    calibre_utils::formatter::PureFunctions.call(name, args)
 }
 
 /// The [`FunctionCatalog`] counterpart of [`fallback_call`].
 fn fallback_arg_count(name: &str) -> Option<Option<usize>> {
-    use calibre_utils::formatter::{format_functions, list_functions, misc_functions, numeric_functions, string_functions};
-    string_functions::arg_count(name)
-        .or_else(|| list_functions::arg_count(name))
-        .or_else(|| numeric_functions::arg_count(name))
-        .or_else(|| format_functions::arg_count(name))
-        .or_else(|| misc_functions::arg_count(name))
+    use calibre_utils::formatter::parser::FunctionCatalog;
+    calibre_utils::formatter::PureCatalog.arg_count(name)
 }
 
 /// Parse-time arity/existence catalog matching [`CacheFunctions`]'s
