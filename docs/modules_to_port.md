@@ -630,7 +630,17 @@ either -- this pass wasn't exhaustive.
 - [x] parsing.py
 - [x] pretty.py
 - [x] replace.py
-- [ ] report.py
+- [ ] report.py (partial -- issue #584. `get_category`/`files_data`/
+      `images_data`/`words_data`/`chars_data` real in
+      `oeb::polish::report`, wired against already-real `Container`/
+      `spell::{get_all_words,count_all_chars}`/`imghdr::identify`; two
+      small new primitives needed and added to `calibre_utils::icu`
+      (`numeric_strcmp`, `safe_chr`). `links_data`/`create_anchor_map`/
+      `css_data`/`gather_data`'s orchestration split to #590 -- both
+      need real source line/column tracking this crate's `Dom`
+      (confirmed via its `Node` struct directly) and
+      `crate::css::model` don't have at all, a genuine infrastructure
+      change, not a small wiring gap)
 - [x] spell.py
 - [x] split.py
 - [x] stats.py
