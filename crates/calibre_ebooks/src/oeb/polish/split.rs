@@ -751,6 +751,7 @@ fn clone_into(dst: &mut Dom, src: &Dom, src_id: NodeId) -> NodeId {
                 attrs: indexmap::IndexMap::new(),
                 children: Vec::new(),
                 parent: None,
+                sourceline: None,
             });
             id
         }

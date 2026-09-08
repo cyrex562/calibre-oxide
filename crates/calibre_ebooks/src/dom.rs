@@ -19,10 +19,135 @@
 //! walking + mutation -- html5ever does the actual HTML5 parsing -- just
 //! with a representation that is far less friction for a lxml-shaped port.
 
-use html5ever::tendril::TendrilSink;
-use html5ever::{parse_document, LocalName};
+use html5ever::interface::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
+use html5ever::tendril::{StrTendril, TendrilSink};
+use html5ever::{parse_document, Attribute, ExpandedName, LocalName, QualName};
 use indexmap::IndexMap;
 use markup5ever_rcdom::{Handle as RcHandle, NodeData as RcNodeData, RcDom};
+use std::borrow::Cow;
+use std::collections::HashMap;
+
+/// A `TreeSink` wrapping [`RcDom`] that additionally records, for every
+/// element node, the 1-based source line it was opened on -- port of
+/// lxml's `elem.sourceline` (issue #590).
+///
+/// html5ever's `TreeSink` trait already has the hook this needs:
+/// `set_current_line` is called by the tree builder every time the
+/// tokenizer's line counter advances (confirmed by reading
+/// `html5ever::tree_builder::TreeBuilder::process_token`, not assumed
+/// from the trait's doc comment alone), but `RcDom` itself only
+/// implements it as a no-op default. This wrapper tracks the current
+/// line and, in [`TreeSink::create_element`], records it against the
+/// new handle's identity (`Rc::as_ptr` as a `usize` -- stable for the
+/// handle's lifetime, and `RcDom`'s own `same_node` uses the identical
+/// `Rc::ptr_eq` notion of identity) in a side table, everything else
+/// delegated straight through to the wrapped `RcDom`. [`Dom::parse`]
+/// consults that side table once, while walking the finished tree in
+/// [`convert`], rather than storing it on `markup5ever_rcdom::Node`
+/// itself (which this crate does not own and cannot extend).
+struct LineTrackingSink {
+    inner: RcDom,
+    current_line: u64,
+    lines: HashMap<usize, u32>,
+}
+
+impl Default for LineTrackingSink {
+    fn default() -> Self {
+        LineTrackingSink {
+            inner: RcDom::default(),
+            current_line: 1,
+            lines: HashMap::new(),
+        }
+    }
+}
+
+fn handle_key(handle: &RcHandle) -> usize {
+    std::rc::Rc::as_ptr(handle) as usize
+}
+
+impl TreeSink for LineTrackingSink {
+    type Handle = RcHandle;
+    type Output = (RcDom, HashMap<usize, u32>);
+
+    fn finish(self) -> Self::Output {
+        (self.inner.finish(), self.lines)
+    }
+
+    fn parse_error(&mut self, msg: Cow<'static, str>) {
+        self.inner.parse_error(msg);
+    }
+
+    fn get_document(&mut self) -> Self::Handle {
+        self.inner.get_document()
+    }
+
+    fn elem_name<'a>(&'a self, target: &'a Self::Handle) -> ExpandedName<'a> {
+        self.inner.elem_name(target)
+    }
+
+    fn create_element(&mut self, name: QualName, attrs: Vec<Attribute>, flags: ElementFlags) -> Self::Handle {
+        let handle = self.inner.create_element(name, attrs, flags);
+        self.lines.insert(handle_key(&handle), self.current_line as u32);
+        handle
+    }
+
+    fn create_comment(&mut self, text: StrTendril) -> Self::Handle {
+        self.inner.create_comment(text)
+    }
+
+    fn create_pi(&mut self, target: StrTendril, data: StrTendril) -> Self::Handle {
+        self.inner.create_pi(target, data)
+    }
+
+    fn append(&mut self, parent: &Self::Handle, child: NodeOrText<Self::Handle>) {
+        self.inner.append(parent, child);
+    }
+
+    fn append_based_on_parent_node(
+        &mut self,
+        element: &Self::Handle,
+        prev_element: &Self::Handle,
+        child: NodeOrText<Self::Handle>,
+    ) {
+        self.inner.append_based_on_parent_node(element, prev_element, child);
+    }
+
+    fn append_doctype_to_document(&mut self, name: StrTendril, public_id: StrTendril, system_id: StrTendril) {
+        self.inner.append_doctype_to_document(name, public_id, system_id);
+    }
+
+    fn get_template_contents(&mut self, target: &Self::Handle) -> Self::Handle {
+        self.inner.get_template_contents(target)
+    }
+
+    fn same_node(&self, x: &Self::Handle, y: &Self::Handle) -> bool {
+        self.inner.same_node(x, y)
+    }
+
+    fn set_quirks_mode(&mut self, mode: QuirksMode) {
+        self.inner.set_quirks_mode(mode);
+    }
+
+    fn append_before_sibling(&mut self, sibling: &Self::Handle, new_node: NodeOrText<Self::Handle>) {
+        self.inner.append_before_sibling(sibling, new_node);
+    }
+
+    fn add_attrs_if_missing(&mut self, target: &Self::Handle, attrs: Vec<Attribute>) {
+        self.inner.add_attrs_if_missing(target, attrs);
+    }
+
+    fn remove_from_parent(&mut self, target: &Self::Handle) {
+        self.inner.remove_from_parent(target);
+    }
+
+    fn reparent_children(&mut self, node: &Self::Handle, new_parent: &Self::Handle) {
+        self.inner.reparent_children(node, new_parent);
+    }
+
+    fn set_current_line(&mut self, line_number: u64) {
+        self.current_line = line_number;
+    }
+}
 
 pub type NodeId = usize;
 
@@ -40,6 +165,14 @@ pub struct Node {
     pub attrs: IndexMap<String, String>,
     pub children: Vec<NodeId>,
     pub parent: Option<NodeId>,
+    /// 1-based source line this element started on, for nodes parsed
+    /// via [`Dom::parse`] (port of lxml's `elem.sourceline`, issue
+    /// #590). `None` for the document root, for text/comment/PI nodes
+    /// (line tracking only every observes the moment an *element*
+    /// opens -- see [`LineTrackingSink`]'s docs), and for any node
+    /// built via [`Dom::new_element`]/[`Dom::new_text`] rather than
+    /// parsed from real markup.
+    pub sourceline: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -52,13 +185,13 @@ impl Dom {
     /// Parses `html` as an HTML5 document (tag-soup tolerant, like
     /// `lxml.html`/`html5-parser`).
     pub fn parse(html: &str) -> Dom {
-        let rc_dom = parse_document(RcDom::default(), Default::default())
+        let (rc_dom, lines) = parse_document(LineTrackingSink::default(), Default::default())
             .from_utf8()
             .read_from(&mut html.as_bytes())
             .unwrap_or_default();
 
         let mut nodes = Vec::new();
-        let root = convert(&rc_dom.document, &mut nodes, None);
+        let root = convert(&rc_dom.document, &mut nodes, None, &lines);
         Dom { nodes, root }
     }
 
@@ -77,6 +210,7 @@ impl Dom {
                 attrs: IndexMap::new(),
                 children: Vec::new(),
                 parent: None,
+                sourceline: None,
             }],
             root: 0,
         }
@@ -162,6 +296,7 @@ impl Dom {
             attrs: IndexMap::new(),
             children: Vec::new(),
             parent: None,
+            sourceline: None,
         });
         self.nodes.len() - 1
     }
@@ -172,6 +307,7 @@ impl Dom {
             attrs: IndexMap::new(),
             children: Vec::new(),
             parent: None,
+            sourceline: None,
         });
         self.nodes.len() - 1
     }
@@ -191,6 +327,7 @@ impl Dom {
             attrs: src.attrs.clone(),
             children: Vec::new(),
             parent: None,
+            sourceline: src.sourceline,
         });
         for &child in &src.children {
             let new_child = self.clone_from(other, child);
@@ -401,7 +538,7 @@ fn is_void_element(tag: &str) -> bool {
     )
 }
 
-fn convert(handle: &RcHandle, nodes: &mut Vec<Node>, parent: Option<NodeId>) -> NodeId {
+fn convert(handle: &RcHandle, nodes: &mut Vec<Node>, parent: Option<NodeId>, lines: &HashMap<usize, u32>) -> NodeId {
     let kind = match &handle.data {
         RcNodeData::Document => NodeKind::Document,
         RcNodeData::Doctype { .. } => NodeKind::Comment(String::new()),
@@ -422,9 +559,10 @@ fn convert(handle: &RcHandle, nodes: &mut Vec<Node>, parent: Option<NodeId>) -> 
                 attrs: attr_map,
                 children: Vec::new(),
                 parent,
+                sourceline: lines.get(&handle_key(handle)).copied(),
             });
             for child in handle.children.borrow().iter() {
-                let cid = convert(child, nodes, Some(id));
+                let cid = convert(child, nodes, Some(id), lines);
                 nodes[id].children.push(cid);
             }
             return id;
@@ -438,9 +576,10 @@ fn convert(handle: &RcHandle, nodes: &mut Vec<Node>, parent: Option<NodeId>) -> 
         attrs: IndexMap::new(),
         children: Vec::new(),
         parent,
+        sourceline: None,
     });
     for child in handle.children.borrow().iter() {
-        let cid = convert(child, nodes, Some(id));
+        let cid = convert(child, nodes, Some(id), lines);
         nodes[id].children.push(cid);
     }
     id
@@ -453,6 +592,25 @@ fn local_name_to_string(name: &LocalName) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_records_a_real_source_line_per_element() {
+        let html = "<html>\n<body>\n<p>line 3</p>\n<p>line 4</p>\n</body>\n</html>";
+        let dom = Dom::parse(html);
+        let body = dom.find_first_tag_global("body").unwrap();
+        let ps = dom.find_all_tag(body, "p");
+        assert_eq!(ps.len(), 2);
+        assert_eq!(dom.node(ps[0]).sourceline, Some(3));
+        assert_eq!(dom.node(ps[1]).sourceline, Some(4));
+        assert_eq!(dom.node(body).sourceline, Some(2));
+    }
+
+    #[test]
+    fn synthetic_nodes_have_no_sourceline() {
+        let mut dom = Dom::empty();
+        let p = dom.new_element("p");
+        assert_eq!(dom.node(p).sourceline, None);
+    }
 
     #[test]
     fn empty_dom_builds_a_detached_tree_from_scratch() {
