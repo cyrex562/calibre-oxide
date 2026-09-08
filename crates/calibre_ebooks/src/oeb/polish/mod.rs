@@ -71,6 +71,7 @@ pub mod opf;
 pub mod parsing;
 pub mod pretty;
 pub mod replace;
+pub mod report;
 pub mod smartypants;
 pub mod spell;
 pub mod split;

@@ -53,13 +53,20 @@
 //! `unsafe impl Send`/`Sync` workaround for a type whose internal
 //! thread-safety this crate has no way to independently verify.
 
-use icu::collator::{CaseFirst, Collator, CollatorOptions, Strength};
+use icu::collator::{CaseFirst, Collator, CollatorOptions, Numeric, Strength};
 use std::cmp::Ordering;
 
 fn new_collator(strength: Option<Strength>, case_first: Option<CaseFirst>) -> Collator {
     let mut options = CollatorOptions::new();
     options.strength = strength;
     options.case_first = case_first;
+    Collator::try_new(&Default::default(), options).expect("icu collator data is compiled in via the `compiled_data` feature")
+}
+
+fn new_numeric_collator() -> Collator {
+    let mut options = CollatorOptions::new();
+    options.strength = Some(Strength::Secondary);
+    options.numeric = Some(Numeric::On);
     Collator::try_new(&Default::default(), options).expect("icu collator data is compiled in via the `compiled_data` feature")
 }
 
@@ -124,6 +131,34 @@ pub fn capitalize(text: &str) -> String {
     }
 }
 
+/// Port of `calibre.utils.icu.numeric_sort_key` (issue #584): the same
+/// case-insensitive locale-aware comparison as [`strcmp`], but with
+/// digit sequences compared by their numeric value ("item2" sorts
+/// before "item10") rather than character-by-character. Real upstream
+/// returns an opaque sortable key (`sort_key`-shaped); like
+/// [`strcmp`]'s own module doc explains, `icu` 1.5's `Collator`
+/// doesn't expose raw sort keys, only pairwise comparison -- so this
+/// is exposed as a comparator (`numeric_strcmp`), the same adaptation
+/// already established for every other `icu.*strcmp` port here. Use it
+/// with `Vec::sort_by`/`.then_with(...)` wherever upstream would embed
+/// `numeric_sort_key(x)` in a tuple sort key.
+pub fn numeric_strcmp(a: &str, b: &str) -> Ordering {
+    new_numeric_collator().compare(a, b)
+}
+
+/// Port of `calibre.utils.icu.safe_chr` (issue #584): converts a
+/// Unicode codepoint to a `char`, without panicking on a codepoint
+/// `char::from_u32` rejects (surrogate range `0xD800..=0xDFFF`, or
+/// anything above `0x10FFFF`) -- returns U+FFFD (the standard Unicode
+/// replacement character) in that case. No visible Python reference
+/// implementation exists (`icu.safe_chr` lives only in the compiled C
+/// extension, not in this repo's vendored Python sources), so this is
+/// a reasonable interpretation of "safe" absent one, not a literal
+/// transcription.
+pub fn safe_chr(codepoint: u32) -> char {
+    char::from_u32(codepoint).unwrap_or('\u{FFFD}')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +213,29 @@ mod tests {
     #[test]
     fn capitalize_of_empty_string_is_empty() {
         assert_eq!(capitalize(""), "");
+    }
+
+    #[test]
+    fn numeric_strcmp_orders_digit_sequences_by_value_not_by_character() {
+        assert_eq!(numeric_strcmp("item2", "item10"), Ordering::Less);
+        assert_eq!(numeric_strcmp("item10", "item2"), Ordering::Greater);
+        // A plain character-by-character comparison would put "item10"
+        // before "item2" (since '1' < '2').
+        assert!("item10" < "item2");
+        // Still case-insensitive, matching strcmp's own Secondary strength.
+        assert_eq!(numeric_strcmp("Item2", "item2"), Ordering::Equal);
+    }
+
+    #[test]
+    fn safe_chr_converts_a_valid_codepoint() {
+        assert_eq!(safe_chr(0x41), 'A');
+        assert_eq!(safe_chr(0x1F600), '\u{1F600}');
+    }
+
+    #[test]
+    fn safe_chr_falls_back_to_replacement_character_for_a_surrogate() {
+        assert_eq!(safe_chr(0xD800), '\u{FFFD}');
+        assert_eq!(safe_chr(0x110000), '\u{FFFD}');
     }
 }
 
