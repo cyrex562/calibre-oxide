@@ -272,11 +272,24 @@ either -- this pass wasn't exhaustive.
       substitute for everything except text shaping -- and even that
       has a viable path via `usvg`'s own internal `harfrust`/`skrifa`
       text engine (already a transitive dependency), not a new crate.
-      #595 (color themes + text-formatting tokenizer, zero graphics
-      dependency) shipped as `calibre_ebooks::covers`. #596 (field-
-      template formatting)/#597 (`tiny-skia` canvas + simple
-      Styles)/#598 (text layout + rendering, the real hard part)/#599
-      (`Banner`, curve math)/#600 (`Ornamental`, transform
+      #595 (color themes + text-formatting tokenizer) and #596
+      (field-template formatting) both shipped as
+      `calibre_ebooks::covers`. #596 needed real `string.Formatter`-
+      style `{field}`/`{field:'expr'}` substitution on top of the
+      already-real GPM evaluator (`calibre_utils::formatter`), plus a
+      new shared `PureFunctions`/`PureCatalog` (the 5 pure built-in
+      modules combined into one registry, promoted out of
+      `calibre_db::formatter_functions`'s own private
+      `fallback_call`/`fallback_arg_count`, which now delegates to it
+      -- no duplicated logic). Cross-validated: real Python's
+      `BuiltinField.evaluate` confirmed `field()` inside a `program:`
+      template returns an ESCAPED value (the same
+      `Formatter(SafeFormat).get_value` override every `{field}`
+      substitution uses), explaining why the real default
+      `footer_template` splits/joins on literal `&amp;`, not `&` --
+      replicated exactly, not by accident. #597 (`tiny-skia` canvas +
+      simple Styles)/#598 (text layout + rendering, the real hard
+      part)/#599 (`Banner`, curve math)/#600 (`Ornamental`, transform
       stamping)/#601 (entry points + wiring) remain, in dependency
       order)
 - [x] css_transform_rules.py (issue #117 CLOSED -- `css_transform_rules.rs`: a real match-a-CSS-property's-value (exact/negated/regex/numeric-with-unit-conversion), then remove/change/append/arithmetic-transform rules engine over `crate::css::model::StyleDeclarationBlock`. `transform_container` wired directly against the already-real `crate::oeb::polish::css::transform_css`, needing no new container-walking logic at all. Shorthand-property expansion (matching e.g. `margin-top` against a compact `margin: 0`) reuses `crate::oeb::normalize_css::normalize_edge`, covering the same five shorthands `normalize_filter_css` already does; other shorthands (`font`/`background`/`list-style`/non-edge `border`) pass through unexpanded, the same disclosed narrowing `oeb::polish::css::filter_css` already has. Real, non-obvious upstream behavior confirmed by reading the source and locked in with a test: a normalizable shorthand's own compact name (e.g. `property: "margin"`) is NEVER directly matchable by a rule -- real upstream's own declaration iterator yields ONLY the expanded longhand names for a normalizable property, never the raw shorthand. `\N`-style regex backreferences in a `change` action's replacement text are translated from Python `regex.sub` syntax to Rust `regex` syntax. `export_rules`/`import_rules`' real plain-text rule-file format ported and round-trip tested, matching `html_transform_rules.rs`'s (#118) own precedent)
