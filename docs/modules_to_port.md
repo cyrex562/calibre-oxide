@@ -630,23 +630,28 @@ either -- this pass wasn't exhaustive.
 - [x] parsing.py
 - [x] pretty.py
 - [x] replace.py
-- [ ] report.py (partial -- issue #584/#590. `get_category`/
+- [x] report.py (issue #584/#590, fully real: `get_category`/
       `files_data`/`images_data`/`words_data`/`chars_data`/
-      `links_data`/`create_anchor_map`/`description_for_anchor` real
-      in `oeb::polish::report`, wired against already-real
-      `Container`/`spell::{get_all_words,count_all_chars}`/
-      `imghdr::identify`; two small new primitives added to
-      `calibre_utils::icu` (`numeric_strcmp`, `safe_chr`).
-      `links_data` needed real source line tracking on `crate::dom::Dom`
-      (confirmed absent via its `Node` struct directly) -- added via a
-      custom `TreeSink` wrapping `RcDom` (`dom.rs`'s
-      `LineTrackingSink`), a real, tested, crate-wide infrastructure
-      addition, not a per-function workaround. Only `css_data`/
-      `gather_data`'s orchestration remain: `css_data` needs the same
-      kind of position tracking on `crate::css::model`, a separate
-      change since `crate::css`'s parser is unrelated to `Dom`'s;
-      CSS-selector-to-DOM matching itself is NOT a blocker
-      (`crate::css::selector`/`matcher` already provides it))
+      `links_data`/`create_anchor_map`/`description_for_anchor`/
+      `css_data`/`gather_data`, all in `oeb::polish::report`. Two real
+      crate-wide infrastructure gaps closed along the way rather than
+      worked around: (1) `links_data` needed source line tracking on
+      `crate::dom::Dom` (confirmed absent via its `Node` struct
+      directly) -- added via a custom `TreeSink` wrapping `RcDom`
+      (`dom.rs`'s `LineTrackingSink`); (2) `css_data` needed the same
+      kind of tracking on `crate::css::model::StyleRule`
+      (`line`/`column` via `cssparser`'s own real
+      `current_source_location`), and along the way exposed a
+      pre-existing, unrelated `todo!()` in `Container::iterlinks`'s CSS
+      branch (needed by `images_data` for any book with a stylesheet)
+      citing a stale "no CSS parser exists" claim -- fixed as a direct
+      port of upstream's own real regex-based `itercsslinks`/
+      `PositionFinder`/`CommentFinder` (`container.rs`'s
+      `css_links_with_positions`), not routed through `crate::css` at
+      all (upstream's own real implementation isn't a CSS-parser job
+      either). `tag_text` fixes a confirmed real upstream bug (a
+      missing final `return ans`). Three small new primitives added to
+      `calibre_utils::icu` (`numeric_strcmp`, `safe_chr`))
 - [x] spell.py
 - [x] split.py
 - [x] stats.py

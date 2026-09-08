@@ -67,6 +67,7 @@ fn parse_rules(parser: &mut Parser) -> Vec<Rule> {
             break;
         }
         let state = parser.state();
+        let start_location = parser.current_source_location();
         let tok = match parser.next() {
             Ok(t) => t.clone(),
             Err(_) => break,
@@ -101,6 +102,8 @@ fn parse_rules(parser: &mut Parser) -> Vec<Rule> {
                                     selector_text,
                                     selectors,
                                     style: parse_declaration_list(&block_text),
+                                    line: start_location.line + 1,
+                                    column: start_location.column,
                                 }));
                             }
                             // An unparseable selector list is dropped
@@ -430,6 +433,20 @@ mod tests {
         assert_eq!(r.selector_text, "div.a");
         assert_eq!(r.style.get_property_value("color"), "red");
         assert_eq!(r.style.get_property_value("font-size"), "12px");
+    }
+
+    #[test]
+    fn style_rules_record_a_real_source_line_and_column() {
+        // Cross-validated against real `tinycss.make_full_parser()`
+        // output for the identical text: rule 1 at (1,1), rule 2 at
+        // (2,1) -- tinycss's own line/column convention is 1-based for
+        // both, confirmed by running it directly.
+        let sheet = parse_stylesheet("a { color: red }\nb { color: blue }\n");
+        assert_eq!(sheet.rules.len(), 2);
+        let a = sheet.rules[0].as_style().unwrap();
+        let b = sheet.rules[1].as_style().unwrap();
+        assert_eq!((a.line, a.column), (1, 1));
+        assert_eq!((b.line, b.column), (2, 1));
     }
 
     #[test]

@@ -3,29 +3,45 @@
 //! a tinycss file). Real Python data-gathering functions for the GUI's
 //! "Check Book" report, orchestrated by `gather_data`.
 //!
-//! `files_data`/`images_data`/`words_data`/`chars_data`/`links_data`/
-//! `create_anchor_map`/`description_for_anchor` are all real. Issue
-//! #590 added the one real prerequisite `links_data` needed: source
-//! line tracking on [`crate::dom::Dom`] (confirmed absent by reading
-//! `dom.rs`'s `Node` struct directly before starting, not assumed),
-//! via a custom `TreeSink` wrapping `RcDom` -- see `dom.rs`'s
-//! `LineTrackingSink` docs. `description_for_anchor` is adapted to
-//! this crate's child-node text model (text is its own [`NodeKind::Text`]
-//! child, unlike lxml's `.text`/`.tail`) rather than transliterated
-//! against an API `Dom` doesn't have, matching the same adaptation
-//! `html_transform_rules` (#118) already established.
+//! Every real function in `report.py` is ported: `files_data`/
+//! `images_data`/`words_data`/`chars_data`/`links_data`/
+//! `create_anchor_map`/`description_for_anchor`/`css_data`/
+//! `gather_data`.
 //!
-//! **Still not ported**: `css_data` and `gather_data`'s own
-//! orchestration. `css_data` needs the *same kind* of position
-//! tracking on `crate::css::model` (`Stylesheet`/`Rule`/`Declaration`
-//! currently have none at all) -- a separate change, since
-//! `crate::css`'s parser is unrelated to `Dom`'s HTML parser. Real
-//! CSS-selector-to-DOM-element matching (`css_selectors.Select` in
-//! Python) is NOT a blocker -- `crate::css::selector`/`matcher`
-//! already provides that against a `Dom`, confirmed by reading
-//! `matcher.rs`'s `Matcher::matching` directly.
+//! Two real, crate-wide infrastructure gaps this module's real
+//! algorithm exposed were closed directly rather than worked around:
+//! - `links_data` needed source line tracking on [`crate::dom::Dom`]
+//!   (confirmed absent by reading `dom.rs`'s `Node` struct directly
+//!   before starting, not assumed) -- added via a custom `TreeSink`
+//!   wrapping `RcDom`, see `dom.rs`'s `LineTrackingSink` docs.
+//! - `css_data` needed the same kind of tracking on
+//!   `crate::css::model::StyleRule` (`line`/`column`, via
+//!   `cssparser::Parser::current_source_location`) and exposed a
+//!   pre-existing, unrelated `todo!()`: `Container::iterlinks`'s CSS
+//!   branch (needed by `images_data`, run earlier in `gather_data`,
+//!   for ANY book with a stylesheet -- virtually all of them) had
+//!   never been implemented, citing a stale "no CSS parser exists"
+//!   claim issue #164 already resolved. Fixed as a direct, faithful
+//!   port of upstream's own real `itercsslinks`/`PositionFinder`/
+//!   `CommentFinder` (a regex-based link scanner, not a
+//!   `crate::css`-routed one -- upstream's own implementation isn't a
+//!   CSS-parser job either), in `container.rs`'s `css_links_with_positions`.
 //!
-//! Two small real primitives this file needed didn't exist yet and
+//! `description_for_anchor` is adapted to this crate's child-node text
+//! model (text is its own [`NodeKind::Text`] child, unlike lxml's
+//! `.text`/`.tail`) rather than transliterated against an API `Dom`
+//! doesn't have, matching the same adaptation `html_transform_rules`
+//! (#118) already established. Real CSS-selector-to-DOM-element
+//! matching (`css_selectors.Select` in Python) was never a blocker for
+//! `css_data` -- `crate::css::selector`/`matcher` already provides
+//! that against a `Dom`.
+//!
+//! `tag_text` fixes a confirmed real upstream bug (a missing final
+//! `return ans`, so real Python only ever returns a tag string the
+//! very first time it's called for an attribute-bearing element) --
+//! see [`tag_text`]'s own doc.
+//!
+//! Three small real primitives this file needed didn't exist yet and
 //! were added directly to `calibre_utils::icu` rather than
 //! reimplemented locally: `numeric_strcmp` (port of
 //! `icu.numeric_sort_key`, exposed as a comparator like every other
@@ -35,7 +51,9 @@
 //! module-level global dict between `words_data` and `files_data`;
 //! this port passes it explicitly as a parameter instead (a plain,
 //! Rust-idiomatic replacement for the same data flow, not a
-//! behavioral change).
+//! behavioral change). `css_data`'s own `result_data['classes']`
+//! side-effect-into-a-shared-dict likewise becomes a plain second
+//! return value.
 
 use std::collections::HashMap;
 
@@ -606,6 +624,427 @@ pub fn links_data(container: &mut Container) -> Result<Vec<Link>> {
     Ok(links)
 }
 
+// ===================================================================
+// css_data (issue #590's last real piece -- needed real line/column
+// tracking on crate::css::model, added directly to StyleRule rather
+// than worked around here)
+// ===================================================================
+
+use crate::css::matcher::{DomElement, Select};
+use crate::dom::{Dom, NodeId};
+
+/// Port of `RuleLocation`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RuleLocation {
+    pub file_name: String,
+    pub line: u32,
+    pub column: u32,
+}
+
+/// Port of `CSSRule` (the namedtuple `(selector, location)` -- named
+/// `CssRuleEntry` here since `Rule` already names something else in
+/// `crate::css::model`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CssRuleEntry {
+    pub selector: String,
+    pub location: RuleLocation,
+}
+
+/// One entry of a flattened stylesheet: either a real style rule, or
+/// (Python: a plain string appended in place of an `@import`) a
+/// resolved, existing import target name to recurse into.
+enum CssRuleOrImport {
+    Rule(CssRuleEntry),
+    Import(String),
+}
+
+/// Port of the `css_rules` closure.
+fn css_rules(
+    container: &Container,
+    file_name: &str,
+    rules: &[crate::css::Rule],
+    sourceline_offset: u32,
+) -> Vec<CssRuleOrImport> {
+    let mut ans = Vec::new();
+    for rule in rules {
+        match rule {
+            crate::css::Rule::Style(sr) => {
+                ans.push(CssRuleOrImport::Rule(CssRuleEntry {
+                    selector: sr.selector_text.clone(),
+                    location: RuleLocation {
+                        file_name: file_name.to_string(),
+                        line: sourceline_offset + sr.line,
+                        column: sr.column,
+                    },
+                }));
+            }
+            crate::css::Rule::Import(imp) => {
+                if let Some(import_name) = safe_href_to_name(container, &imp.href, file_name) {
+                    if container.exists(&import_name) {
+                        ans.push(CssRuleOrImport::Import(import_name));
+                    }
+                }
+            }
+            crate::css::Rule::Media(m) => {
+                ans.extend(css_rules(container, file_name, &m.rules, sourceline_offset));
+            }
+            _ => {}
+        }
+    }
+    ans
+}
+
+fn rules_in_sheet<'a>(
+    sheet: &'a [CssRuleOrImport],
+    importable_sheets: &'a HashMap<String, Vec<CssRuleOrImport>>,
+    out: &mut Vec<&'a CssRuleEntry>,
+) {
+    for entry in sheet {
+        match entry {
+            CssRuleOrImport::Rule(r) => out.push(r),
+            CssRuleOrImport::Import(name) => {
+                if let Some(isheet) = importable_sheets.get(name) {
+                    rules_in_sheet(isheet, importable_sheets, out);
+                }
+            }
+        }
+    }
+}
+
+/// Port of `sheets_for_html`.
+fn sheets_for_html<'a>(
+    dom: &Dom,
+    container: &Container,
+    name: &str,
+    importable_sheets: &'a HashMap<String, Vec<CssRuleOrImport>>,
+) -> Vec<&'a Vec<CssRuleOrImport>> {
+    let mut out = Vec::new();
+    for id in dom.preorder_elements(dom.root) {
+        if dom.tag(id) != Some("link") {
+            continue;
+        }
+        let Some(href) = dom.node(id).attrs.get("href") else {
+            continue;
+        };
+        let Some(tname) = safe_href_to_name(container, href, name) else {
+            continue;
+        };
+        if let Some(sheet) = importable_sheets.get(&tname) {
+            out.push(sheet);
+        }
+    }
+    out
+}
+
+/// Port of `tag_text`. Real upstream has a confirmed bug here (its own
+/// `tag_text` is missing a final `return ans`, so it only ever returns
+/// a non-`None` value the very first time it's called for an
+/// attribute-bearing element -- every cache hit, and every first call
+/// for an attribute-less element, silently returns `None` instead).
+/// This port implements the function correctly (always returns the
+/// real tag string, real caching) rather than reproducing that latent
+/// bug, matching this project's convention of fixing (and disclosing)
+/// confirmed-unintentional upstream defects rather than silently
+/// replicating them.
+fn tag_text(dom: &Dom, id: NodeId, cache: &mut HashMap<NodeId, String>) -> String {
+    if let Some(s) = cache.get(&id) {
+        return s.clone();
+    }
+    let tag = dom.tag(id).unwrap_or("").to_string();
+    let attrs = &dom.node(id).attrs;
+    let text = if attrs.is_empty() {
+        format!("<{tag}>")
+    } else {
+        let attribs: Vec<String> = attrs
+            .iter()
+            .map(|(k, v)| format!("{k}=\"{}\"", crate::xml_util::prepare_string_for_xml(v, true)))
+            .collect();
+        format!("<{tag} {}>", attribs.join(" "))
+    };
+    cache.insert(id, text.clone());
+    text
+}
+
+/// Port of `matches_for_selector`.
+fn matches_for_selector(
+    dom: &Dom,
+    select: &Select<DomElement>,
+    cmap: &mut HashMap<String, HashMap<NodeId, Vec<CssRuleEntry>>>,
+    rule: &CssRuleEntry,
+    tt_cache: &mut HashMap<NodeId, String>,
+) -> Vec<MatchLocation> {
+    let lsel = rule.selector.to_lowercase();
+    let selectors = match crate::css::selector::parse_selector_list(&rule.selector) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let matches = select.matching(&selectors);
+    let mut seen: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+    for e in &matches {
+        let mut p = Some(e.id);
+        while let Some(id) = p {
+            if seen.insert(id) {
+                if let Some(class_attr) = dom.node(id).attrs.get("class") {
+                    for cls in class_attr.split_whitespace() {
+                        if lsel.contains(&format!(".{}", cls.to_lowercase())) {
+                            cmap.entry(cls.to_string()).or_default().entry(id).or_default().push(rule.clone());
+                        }
+                    }
+                }
+            }
+            p = dom.parent(id);
+        }
+    }
+    matches
+        .iter()
+        .map(|e| MatchLocation {
+            tag: tag_text(dom, e.id, tt_cache),
+            sourceline: dom.node(e.id).sourceline,
+        })
+        .collect()
+}
+
+/// Port of `MatchLocation`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchLocation {
+    pub tag: String,
+    pub sourceline: Option<u32>,
+}
+
+/// Port of `CSSFileMatch`. `sort_key` is not stored as a field (see
+/// [`ClassEntry`]'s doc for why) -- `matched_files` is pre-sorted by
+/// file name before being returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CssFileMatch {
+    pub file_name: String,
+    pub locations: Vec<MatchLocation>,
+}
+
+/// Port of `CSSEntry`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CssEntry {
+    pub rule: CssRuleEntry,
+    pub count: usize,
+    pub matched_files: Vec<CssFileMatch>,
+}
+
+/// Port of `ClassElement`. `text_on_line` is the element's raw `class`
+/// attribute text (matching `elem.get('class')`), not the `href`-style
+/// value [`LinkLocation`]'s own field usually carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassElement {
+    pub name: String,
+    pub line_number: Option<u32>,
+    pub text_on_line: String,
+    pub tag: String,
+    pub matched_rules: Vec<CssRuleEntry>,
+}
+
+/// Port of `ClassFileMatch`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassFileMatch {
+    pub file_name: String,
+    pub class_elements: Vec<ClassElement>,
+}
+
+/// Port of `ClassEntry`. Upstream stores a precomputed
+/// `numeric_sort_key(...)` result as a `sort_key` field on this and
+/// three sibling namedtuples, so a GUI table sorter doesn't need to
+/// recompute it. This port doesn't have a sort-key *value* to store at
+/// all -- [`calibre_utils::icu::numeric_strcmp`] is a comparator, not a
+/// key producer (the same real ICU4X limitation already disclosed on
+/// that function) -- so instead, every `Vec` this module returns is
+/// already sorted into the equivalent real order before being handed
+/// back, achieving the same observable ordering without an exposed key
+/// field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassEntry {
+    pub cls: String,
+    pub num_of_matches: usize,
+    pub matched_files: Vec<ClassFileMatch>,
+}
+
+/// Port of `css_data`.
+pub fn css_data(container: &mut Container) -> Result<(Vec<ClassEntry>, Vec<CssEntry>)> {
+    let spine_names: std::collections::HashSet<String> =
+        container.spine_names()?.into_iter().map(|(n, _)| n).collect();
+
+    let mut names: Vec<(String, String)> = container
+        .base
+        .mime_map
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    names.sort();
+
+    let mut importable_sheets: HashMap<String, Vec<CssRuleOrImport>> = HashMap::new();
+    let mut html_sheets: HashMap<String, Vec<Vec<CssRuleOrImport>>> = HashMap::new();
+
+    for (name, mt) in &names {
+        if OEB_STYLES.contains(&mt.as_str()) {
+            let raw = container.raw_data(name, true)?;
+            let text = String::from_utf8_lossy(&raw).into_owned();
+            let sheet = crate::css::Stylesheet::parse(&text);
+            importable_sheets.insert(name.clone(), css_rules(container, name, &sheet.rules, 0));
+        } else if OEB_DOCS.contains(&mt.as_str()) && spine_names.contains(name) {
+            container.ensure_parsed(name)?;
+            let dom = container.get_xhtml(name)?;
+            let mut sheets_here = Vec::new();
+            for id in dom.preorder_elements(dom.root) {
+                if dom.tag(id) != Some("style") || !super::fonts::style_tag_is_css(dom, id) {
+                    continue;
+                }
+                let text = dom.text_content(id);
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let offset = dom.node(id).sourceline.unwrap_or(1).saturating_sub(1);
+                let sheet = crate::css::Stylesheet::parse(&text);
+                sheets_here.push(css_rules(container, name, &sheet.rules, offset));
+            }
+            html_sheets.insert(name.clone(), sheets_here);
+        }
+    }
+
+    let mut tt_cache: HashMap<NodeId, String> = HashMap::new();
+    let mut rule_map: HashMap<CssRuleEntry, HashMap<String, Vec<MatchLocation>>> = HashMap::new();
+    let mut class_map: HashMap<String, HashMap<String, Vec<ClassElement>>> = HashMap::new();
+
+    let mut html_names: Vec<&String> = html_sheets.keys().collect();
+    html_names.sort();
+    for name in html_names {
+        let inline_sheets = &html_sheets[name];
+        let dom = container.get_xhtml(name)?;
+
+        let mut cmap: HashMap<String, HashMap<NodeId, Vec<CssRuleEntry>>> = HashMap::new();
+        for id in dom.preorder_elements(dom.root) {
+            if let Some(class_attr) = dom.node(id).attrs.get("class") {
+                for cls in class_attr.split_whitespace() {
+                    cmap.entry(cls.to_string()).or_default().entry(id).or_default();
+                }
+            }
+        }
+
+        let select = Select::for_dom(dom);
+        let linked = sheets_for_html(dom, container, name, &importable_sheets);
+        for sheet in linked.into_iter().chain(inline_sheets.iter()) {
+            let mut flat = Vec::new();
+            rules_in_sheet(sheet, &importable_sheets, &mut flat);
+            for rule in flat {
+                let locs = matches_for_selector(dom, &select, &mut cmap, rule, &mut tt_cache);
+                rule_map.entry(rule.clone()).or_default().entry(name.clone()).or_default().extend(locs);
+            }
+        }
+
+        for (cls, elem_map) in cmap {
+            let class_elements = class_map.entry(cls).or_default().entry(name.clone()).or_default();
+            for (elem_id, usage) in elem_map {
+                let node = dom.node(elem_id);
+                class_elements.push(ClassElement {
+                    name: name.clone(),
+                    line_number: node.sourceline,
+                    text_on_line: node.attrs.get("class").cloned().unwrap_or_default(),
+                    tag: tag_text(dom, elem_id, &mut tt_cache),
+                    matched_rules: usage,
+                });
+            }
+        }
+    }
+
+    let mut classes: Vec<ClassEntry> = Vec::new();
+    for (cls, name_map) in class_map {
+        let mut matched_files: Vec<ClassFileMatch> = name_map
+            .into_iter()
+            .filter(|(_, elems)| !elems.is_empty())
+            .map(|(file_name, class_elements)| ClassFileMatch { file_name, class_elements })
+            .collect();
+        matched_files.sort_by(|a, b| numeric_strcmp(&a.file_name, &b.file_name));
+        let num_of_matches: usize = matched_files
+            .iter()
+            .map(|cfm| cfm.class_elements.iter().map(|ce| ce.matched_rules.len()).sum::<usize>())
+            .sum();
+        classes.push(ClassEntry { cls, num_of_matches, matched_files });
+    }
+    classes.sort_by(|a, b| numeric_strcmp(&a.cls, &b.cls));
+
+    let mut rules: Vec<CssEntry> = Vec::new();
+    for (rule, loc_map) in rule_map {
+        let mut matched_files: Vec<CssFileMatch> = loc_map
+            .into_iter()
+            .filter(|(_, locs)| !locs.is_empty())
+            .map(|(file_name, locations)| CssFileMatch { file_name, locations })
+            .collect();
+        matched_files.sort_by(|a, b| numeric_strcmp(&a.file_name, &b.file_name));
+        let count: usize = matched_files.iter().map(|fm| fm.locations.len()).sum();
+        rules.push(CssEntry { rule, count, matched_files });
+    }
+    rules.sort_by(|a, b| numeric_strcmp(&a.rule.selector, &b.rule.selector));
+
+    Ok((classes, rules))
+}
+
+// ===================================================================
+// gather_data
+// ===================================================================
+
+/// Port of `gather_data`'s `data` dict. Python's `css_data` sets
+/// `result_data['classes']` as a side effect on the same dict it also
+/// returns rules into; this port's `css_data` just returns both
+/// directly (see its own doc), so `classes`/`css` land here without
+/// needing a shared mutable map threaded through every call.
+#[derive(Debug, Clone)]
+pub struct ReportData {
+    pub chars: Vec<CharEntry>,
+    pub images: Vec<ImageEntry>,
+    pub links: Vec<Link>,
+    pub word_count: usize,
+    pub words: Vec<WordEntry>,
+    pub classes: Vec<ClassEntry>,
+    pub css: Vec<CssEntry>,
+    pub files: Vec<FileEntry>,
+}
+
+/// Port of `gather_data`. Real per-section wall-clock timing (Python's
+/// own `timing` dict, a GUI progress-display diagnostic), in the same
+/// real order upstream calls the six `*_data` functions in --
+/// `files_data` runs last so it can see the just-computed
+/// per-file word counts.
+pub fn gather_data(
+    container: &mut Container,
+    book_locale: &DictionaryLocale,
+) -> Result<(ReportData, HashMap<String, std::time::Duration>)> {
+    let mut timing = HashMap::new();
+
+    let t = std::time::Instant::now();
+    let chars = chars_data(container, book_locale)?;
+    timing.insert("chars".to_string(), t.elapsed());
+
+    let t = std::time::Instant::now();
+    let images = images_data(container)?;
+    timing.insert("images".to_string(), t.elapsed());
+
+    let t = std::time::Instant::now();
+    let links = links_data(container)?;
+    timing.insert("links".to_string(), t.elapsed());
+
+    let t = std::time::Instant::now();
+    let (word_count, words, file_word_counts) = words_data(container, book_locale)?;
+    timing.insert("words".to_string(), t.elapsed());
+
+    let t = std::time::Instant::now();
+    let (classes, css) = css_data(container)?;
+    timing.insert("css".to_string(), t.elapsed());
+
+    let t = std::time::Instant::now();
+    let files = files_data(container, Some(&file_word_counts));
+    timing.insert("files".to_string(), t.elapsed());
+
+    Ok((
+        ReportData { chars, images, links, word_count, words, classes, css, files },
+        timing,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,5 +1252,96 @@ mod tests {
         let dom = crate::dom::Dom::parse("<html><body><a id=\"a\">Some real link text</a></body></html>");
         let id = dom.find_by_id("a").unwrap();
         assert_eq!(description_for_anchor(&dom, id).as_deref(), Some("Some real link text"));
+    }
+
+    #[test]
+    fn css_data_matches_a_linked_stylesheet_rule_against_its_real_selector() {
+        let (_dir, mut container) = make_container(&[
+            (
+                "chapter1.xhtml",
+                "application/xhtml+xml",
+                b"<html><head><link rel=\"stylesheet\" href=\"style.css\"/></head><body><p class=\"intro highlight\">Hello</p></body></html>",
+            ),
+            ("style.css", "text/css", b".intro { color: red }\n.unused { color: blue }\n"),
+        ]);
+        let (classes, rules) = css_data(&mut container).unwrap();
+
+        let intro_rule = rules.iter().find(|r| r.rule.selector == ".intro").unwrap();
+        assert_eq!(intro_rule.count, 1);
+        assert_eq!(intro_rule.rule.location.file_name, "style.css");
+        assert_eq!(intro_rule.rule.location.line, 1);
+        let file_match = &intro_rule.matched_files[0];
+        assert_eq!(file_match.file_name, "chapter1.xhtml");
+        assert_eq!(file_match.locations[0].tag, "<p class=\"intro highlight\">");
+
+        // A rule that matches nothing still shows up, with zero real matches.
+        let unused_rule = rules.iter().find(|r| r.rule.selector == ".unused").unwrap();
+        assert_eq!(unused_rule.count, 0);
+        assert!(unused_rule.matched_files.is_empty());
+
+        // "intro" is used by a real rule; "highlight" is a real class on
+        // the element with no rule targeting it at all.
+        let intro_class = classes.iter().find(|c| c.cls == "intro").unwrap();
+        assert_eq!(intro_class.num_of_matches, 1);
+        let highlight_class = classes.iter().find(|c| c.cls == "highlight").unwrap();
+        assert_eq!(highlight_class.num_of_matches, 0);
+    }
+
+    #[test]
+    fn css_data_matches_an_inline_style_tag_rule() {
+        let (_dir, mut container) = make_container(&[(
+            "chapter1.xhtml",
+            "application/xhtml+xml",
+            b"<html><head><style>.foo { color: green }</style></head><body><p class=\"foo\">Hi</p></body></html>",
+        )]);
+        let (_classes, rules) = css_data(&mut container).unwrap();
+        let foo_rule = rules.iter().find(|r| r.rule.selector == ".foo").unwrap();
+        assert_eq!(foo_rule.count, 1);
+        assert_eq!(foo_rule.rule.location.file_name, "chapter1.xhtml");
+    }
+
+    #[test]
+    fn css_data_follows_an_import_chain_to_a_matching_rule() {
+        let (_dir, mut container) = make_container(&[
+            (
+                "chapter1.xhtml",
+                "application/xhtml+xml",
+                b"<html><head><link rel=\"stylesheet\" href=\"main.css\"/></head><body><p class=\"bar\">Hi</p></body></html>",
+            ),
+            ("main.css", "text/css", b"@import url(base.css);\n"),
+            ("base.css", "text/css", b".bar { color: purple }\n"),
+        ]);
+        let (_classes, rules) = css_data(&mut container).unwrap();
+        let bar_rule = rules.iter().find(|r| r.rule.selector == ".bar").unwrap();
+        assert_eq!(bar_rule.count, 1);
+        assert_eq!(bar_rule.rule.location.file_name, "base.css");
+    }
+
+    #[test]
+    fn gather_data_orchestrates_all_six_real_sections() {
+        let (_dir, mut container) = make_container(&[
+            (
+                "chapter1.xhtml",
+                "application/xhtml+xml",
+                b"<html><head><link rel=\"stylesheet\" href=\"style.css\"/></head><body><p class=\"intro\">hello world</p></body></html>",
+            ),
+            ("style.css", "text/css", b".intro { color: red }\n"),
+        ]);
+        let locale = SpellLocale::new("en", Some("US".to_string()));
+        let (data, timing) = gather_data(&mut container, &locale).unwrap();
+
+        assert!(!data.chars.is_empty());
+        assert!(data.images.is_empty());
+        assert!(data.links.is_empty());
+        assert!(data.words.iter().any(|w| w.word == "hello"));
+        assert!(data.classes.iter().any(|c| c.cls == "intro" && c.num_of_matches == 1));
+        assert!(data.css.iter().any(|r| r.rule.selector == ".intro" && r.count == 1));
+        // files_data ran last and can see the just-computed word counts.
+        let chapter_file = data.files.iter().find(|f| f.name == "chapter1.xhtml").unwrap();
+        assert_eq!(chapter_file.word_count, 2);
+
+        for key in ["chars", "images", "links", "words", "css", "files"] {
+            assert!(timing.contains_key(key), "missing timing for {key}");
+        }
     }
 }
