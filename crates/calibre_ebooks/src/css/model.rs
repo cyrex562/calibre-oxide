@@ -230,6 +230,15 @@ pub struct StyleRule {
     pub selector_text: String,
     pub selectors: SelectorList,
     pub style: StyleDeclarationBlock,
+    /// 1-based source line/column this rule's selector started on
+    /// (port of tinycss's `RuleSet.line`/`.column`, issue #590 --
+    /// needed by `oeb/polish/report.py`'s `css_data`). `cssparser`'s
+    /// own `SourceLocation.line` is 0-based; this crate normalizes to
+    /// 1-based everywhere (matching `crate::dom::Dom`'s `sourceline`
+    /// and tinycss's own convention, confirmed directly against real
+    /// `tinycss.make_full_parser()` output) by adding 1.
+    pub line: u32,
+    pub column: u32,
 }
 
 impl StyleRule {
