@@ -1948,40 +1948,53 @@ compiled in) -- so there is no Qt resource format to compile for.
 
 ## src/odf
 
-- [ ] anim.py
-- [ ] attrconverters.py
-- [ ] chart.py
-- [ ] config.py
-- [ ] dc.py
-- [ ] dr3d.py
-- [ ] draw.py
-- [ ] easyliststyle.py
-- [ ] element.py
-- [ ] elementtypes.py
-- [ ] form.py
-- [ ] grammar.py
-- [ ] load.py
-- [ ] manifest.py
-- [ ] math.py
-- [ ] meta.py
-- [ ] namespaces.py
-- [ ] number.py
-- [ ] odf2moinmoin.py
-- [ ] odf2xhtml.py
-- [ ] odfmanifest.py
-- [ ] office.py
-- [ ] opendocument.py
-- [ ] presentation.py
-- [ ] script.py
-- [ ] style.py
-- [ ] svg.py
-- [ ] table.py
-- [ ] teletype.py
-- [ ] text.py
-- [ ] thumbnail.py
-- [ ] userfield.py
-- [ ] xforms.py
-- [ ] __init__.py
+N/A, entire cluster (issue #86, closed not-applicable). `odf.*` is the
+vendored `odfpy` library. Grepped every real importer anywhere in
+`old_src/src/calibre/`: exactly 2 files use it at all
+(`ebooks/metadata/odt.py`, `ebooks/odt/input.py`), and both are
+already real, ported files in this crate
+(`crates/calibre_ebooks/src/metadata/odt.rs`,
+`crates/calibre_ebooks/src/odt/`, plus `input/odt_input.rs`/
+`output/odt_output.rs`) built via direct XML parsing that bypasses the
+odfpy object-model abstraction entirely. The other 31 files below are
+odfpy's own internal machinery for OpenDocument features (charts,
+forms, presentations, animations, 3D drawing, ...) with zero real
+consumers anywhere in this port's call graph.
+
+- [x] anim.py (N/A)
+- [x] attrconverters.py (N/A)
+- [x] chart.py (N/A)
+- [x] config.py (N/A)
+- [x] dc.py (N/A)
+- [x] dr3d.py (N/A)
+- [x] draw.py (N/A)
+- [x] easyliststyle.py (N/A)
+- [x] element.py (N/A)
+- [x] elementtypes.py (N/A)
+- [x] form.py (N/A)
+- [x] grammar.py (N/A)
+- [x] load.py (N/A)
+- [x] manifest.py (N/A)
+- [x] math.py (N/A)
+- [x] meta.py (N/A)
+- [x] namespaces.py (N/A)
+- [x] number.py (N/A)
+- [x] odf2moinmoin.py (N/A)
+- [x] odf2xhtml.py (N/A)
+- [x] odfmanifest.py (N/A)
+- [x] office.py (N/A)
+- [x] opendocument.py (N/A)
+- [x] presentation.py (N/A)
+- [x] script.py (N/A)
+- [x] style.py (N/A)
+- [x] svg.py (N/A)
+- [x] table.py (N/A)
+- [x] teletype.py (N/A)
+- [x] text.py (N/A)
+- [x] thumbnail.py (N/A)
+- [x] userfield.py (N/A)
+- [x] xforms.py (N/A)
+- [x] __init__.py (N/A)
 
 ## src/perfect-hashing
 
