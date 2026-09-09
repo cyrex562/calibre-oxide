@@ -82,8 +82,18 @@ impl FontFace {
     /// has no fonts loaded whatsoever (see this module's font-source
     /// doc).
     pub fn query(db: &fontdb::Database, family: &str, generic: fontdb::Family) -> Option<Self> {
+        Self::query_weighted(db, family, generic, fontdb::Weight::NORMAL, fontdb::Style::Normal)
+    }
+
+    /// Like [`FontFace::query`], but also matches on `weight`/`style`
+    /// (e.g. `Weight::BOLD` for `generate_masthead`'s `QFont::setBold`,
+    /// which real Python applies to the whole `QFont` directly rather
+    /// than via an inline `<b>` markup span).
+    pub fn query_weighted(db: &fontdb::Database, family: &str, generic: fontdb::Family, weight: fontdb::Weight, style: fontdb::Style) -> Option<Self> {
         let query = fontdb::Query {
             families: &[fontdb::Family::Name(family), generic],
+            weight,
+            style,
             ..Default::default()
         };
         let id = db.query(&query).or_else(|| db.faces().next().map(|f| f.id))?;
@@ -587,6 +597,36 @@ pub fn draw_block(pixmap: &mut Pixmap, db: &Arc<fontdb::Database>, block: &Block
         return;
     }
     let svg = build_block_svg(&lines, font_family, generic_family, pixel_size, color, pixmap.width(), pixmap.height());
+    let opt = usvg::Options { fontdb: db.clone(), ..Default::default() };
+    let tree = match usvg::Tree::from_str(&svg, &opt) {
+        Ok(tree) => tree,
+        Err(_) => return,
+    };
+    resvg::render(&tree, Transform::identity(), &mut pixmap.as_mut());
+}
+
+/// Like [`draw_block`], but without the etch effect -- a plain single
+/// paint pass. `message_image`/`generate_masthead` (issue #601) call
+/// `QPainter::drawText` directly rather than going through `Block.draw`,
+/// so they never get the etch shadow real `covers.py`'s own cover-
+/// generation blocks do; this is the real, distinct code path they
+/// need, not `draw_block` with the shadow simply omitted as an
+/// approximation.
+pub fn draw_block_plain(pixmap: &mut Pixmap, db: &Arc<fontdb::Database>, block: &Block, font_family: &str, generic_family: &str, pixel_size: f32, color: Color) {
+    let lines = block.positioned_lines();
+    if lines.is_empty() {
+        return;
+    }
+    let c = color.to_color_u8();
+    let hex = format!("#{:02x}{:02x}{:02x}", c.red(), c.green(), c.blue());
+    let mut svg = format!("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{}\" height=\"{}\">", pixmap.width(), pixmap.height());
+    for line in &lines {
+        if line.text.is_empty() {
+            continue;
+        }
+        svg.push_str(&text_element(line, font_family, generic_family, pixel_size, &hex, None, 0.0, 0.0));
+    }
+    svg.push_str("</svg>");
     let opt = usvg::Options { fontdb: db.clone(), ..Default::default() };
     let tree = match usvg::Tree::from_str(&svg, &opt) {
         Ok(tree) => tree,

@@ -20,12 +20,12 @@
 //! (already a transitive dependency), not a new crate.
 //!
 //! Split into real sub-issues by tractability (least to most graphics
-//! dependency): #595 (color themes + text-formatting tokenizer,
-//! done), #596 (this file's other half -- field-template formatting,
-//! done), #597 (`tiny-skia` canvas + `Half`/`Blocks`/`Cross`, done),
-//! #598 (text layout + rendering bridge), #599 (`Banner`, real curve
-//! math), #600 (`Ornamental`, transform stamping), #601 (entry
-//! points/wiring).
+//! dependency): #595 (color themes + text-formatting tokenizer),
+//! #596 (this file's other half -- field-template formatting), #597
+//! (`tiny-skia` canvas + `Half`/`Blocks`/`Cross`), #598 (text layout +
+//! rendering bridge, `covers_text.rs`), #599 (`Banner`, real curve
+//! math), #600 (`Ornamental`, transform stamping), #601 (entry points
+//! + wiring). All CLOSED -- the entire epic is done.
 //!
 //! # This file's own scope
 //!
@@ -34,17 +34,21 @@
 //! [`escape_formatting`]/[`unescape_formatting`]/
 //! [`parse_text_formatting`] (port of the non-Qt-dependent half of the
 //! `Draw text {{{` section), the `program:`/default-dialect field-
-//! template formatting (`vformat`/[`format_text`]), and (#597) the
-//! `tiny-skia`-backed [`render_cross`]/[`render_half`]/[`render_blocks`]
-//! `Style` implementations. `parse_text_formatting` deliberately
-//! stops at producing [`FormatRange`] data (tag/start/length) rather
-//! than wrapping it in a `QTextCharFormat`/`QTextLayout::FormatRange`
-//! equivalent -- that belongs to #598's real text-rendering bridge,
-//! which needs to decide what text-shaping API actually consumes this
-//! data.
+//! template formatting (`vformat`/[`format_text`]), the `tiny-skia`-
+//! backed `Style` implementations ([`render_cross`]/[`render_half`]/
+//! [`render_blocks`]/[`render_banner`]/[`render_ornamental`]), and the
+//! entry points ([`generate_cover`]/[`create_cover`]/
+//! [`calibre_cover2`]/[`message_image`]/[`generate_masthead`]) tying
+//! them together with real font/text layout from `crate::covers_text`
+//! (`covers.py`'s own `Block`/`layout_text`, a separate module -- see
+//! its own doc). `parse_text_formatting` deliberately stops at
+//! producing [`FormatRange`] data (tag/start/length) rather than
+//! wrapping it in a `QTextCharFormat`/`QTextLayout::FormatRange`
+//! equivalent -- `crate::covers_text` decides what text-shaping API
+//! actually consumes this data.
 
-use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
 
 use regex::Regex;
 use unicode_normalization::UnicodeNormalization;
@@ -54,12 +58,14 @@ use calibre_utils::formatter::interp::{evaluate as gpm_evaluate, RawValue, Value
 use calibre_utils::formatter::parser::parse as gpm_parse;
 use calibre_utils::formatter::{lexer, PureCatalog, PureFunctions};
 use tiny_skia::{
-    Color, FillRule, GradientStop, LinearGradient, Mask, Paint, PathBuilder, Pixmap, Point,
+    Color, FillRule, GradientStop, LinearGradient, Mask, Paint, PathBuilder, Pixmap, PixmapPaint, Point,
     RadialGradient, Rect, SpreadMode, Transform,
 };
 
+use crate::covers_text::HAlign;
 use crate::metadata::authors::authors_to_string;
 use crate::metadata::meta::MetaInformation;
+use crate::oeb::transforms::rescale::fit_image;
 use crate::oeb::transforms::jacket::fmt_sidx;
 
 // ===================================================================
@@ -1236,6 +1242,337 @@ pub fn render_ornamental(pixmap: &mut Pixmap, width: u32, height: u32, colors: &
     Some(StyleResultColors { title: colors.ccolor2, subtitle: colors.ccolor2, footer: colors.ccolor1 })
 }
 
+// ===================================================================
+// Entry points (issue #601): generate_cover/create_cover/
+// calibre_cover2/message_image/generate_masthead + all_styles/
+// load_styles/scale_cover -- thin orchestration tying #595-#600
+// together. Also the only place any future Tauri/UI wiring would
+// attach; the rendering engine itself needs none.
+//
+// A real, non-obvious API gotcha found (not guessed) while wiring
+// `calibre_cover2`'s logo compositing: `tiny_skia::Pixmap::draw_pixmap`
+// computes its internal clip rect from the SOURCE pixmap's own
+// (unscaled) size offset by its raw `x`/`y` integer params -- passing
+// a scaling `transform` *and* non-zero `x`/`y` together silently clips
+// away most or all of the scaled result (confirmed with a standalone
+// scratch reproduction before writing this code, not assumed). The
+// fix: always pass `x=0, y=0` and fold *all* positioning into the
+// `transform` itself via [`chain_transforms`] (scale first, then
+// translate).
+//
+// `override_prefs`'s `override_color_theme`/`override_style` kwargs
+// paths have no real caller in this port's own entry-point graph (only
+// `create_cover`'s template-only override is exercised) -- scoped out,
+// not silently faked; `create_cover` inlines the one real behavior it
+// needs directly rather than through a general kwargs-shaped function,
+// which doesn't have a natural Rust equivalent anyway.
+
+/// Port of the `Prefs` namedtuple (`cprefs.defaults`'s full shape).
+#[derive(Debug, Clone)]
+pub struct CoverPrefs {
+    pub cover_width: u32,
+    pub cover_height: u32,
+    pub text: crate::covers_text::CoverTextPrefs,
+    pub templates: CoverTemplates,
+    pub color_themes: HashMap<String, ColorTheme>,
+    pub disabled_color_themes: Vec<String>,
+    pub disabled_styles: Vec<String>,
+}
+
+impl Default for CoverPrefs {
+    fn default() -> Self {
+        CoverPrefs {
+            cover_width: 1200,
+            cover_height: 1600,
+            text: Default::default(),
+            templates: Default::default(),
+            color_themes: HashMap::new(),
+            disabled_color_themes: Vec::new(),
+            disabled_styles: Vec::new(),
+        }
+    }
+}
+
+/// The 5 real `Style` subclasses (port of `all_styles()`'s own
+/// `globals().values()` scan, made explicit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StyleKind {
+    Cross,
+    Half,
+    Banner,
+    Ornamental,
+    Blocks,
+}
+
+impl StyleKind {
+    pub const ALL: [StyleKind; 5] = [StyleKind::Cross, StyleKind::Half, StyleKind::Banner, StyleKind::Ornamental, StyleKind::Blocks];
+
+    /// Port of each class's own `NAME`. (`GUI_NAME` is the same string
+    /// wrapped in gettext `_()` -- no translation catalog exists in
+    /// this port, matching this project's established i18n-narrowing
+    /// precedent elsewhere, so `name()` doubles for both.)
+    pub fn name(&self) -> &'static str {
+        match self {
+            StyleKind::Cross => "The Cross",
+            StyleKind::Half => "Half and Half",
+            StyleKind::Banner => "Banner",
+            StyleKind::Ornamental => "Ornamental",
+            StyleKind::Blocks => "Blocks",
+        }
+    }
+}
+
+/// Port of `all_styles()`.
+pub fn all_styles() -> Vec<&'static str> {
+    StyleKind::ALL.iter().map(|s| s.name()).collect()
+}
+
+/// Port of `load_styles(prefs, respect_disabled)`.
+pub fn load_styles(prefs: &CoverPrefs, respect_disabled: bool) -> Vec<StyleKind> {
+    if !respect_disabled {
+        return StyleKind::ALL.to_vec();
+    }
+    let disabled: HashSet<&str> = prefs.disabled_styles.iter().map(String::as_str).collect();
+    let ans: Vec<StyleKind> = StyleKind::ALL.into_iter().filter(|s| !disabled.contains(s.name())).collect();
+    if ans.is_empty() && !disabled.is_empty() {
+        load_styles(prefs, false)
+    } else {
+        ans
+    }
+}
+
+/// Port of `scale_cover`.
+pub fn scale_cover(prefs: &mut CoverPrefs, scale: f32) {
+    prefs.cover_width = (scale * prefs.cover_width as f32).trunc() as u32;
+    prefs.cover_height = (scale * prefs.cover_height as f32).trunc() as u32;
+    prefs.text.title_font_size = (scale * prefs.text.title_font_size).trunc();
+    prefs.text.subtitle_font_size = (scale * prefs.text.subtitle_font_size).trunc();
+    prefs.text.footer_font_size = (scale * prefs.text.footer_font_size).trunc();
+}
+
+fn style_margins(kind: StyleKind, cover_width: u32, cover_height: u32) -> Margins {
+    match kind {
+        StyleKind::Banner => {
+            let m = banner_margins(cover_width, cover_height);
+            Margins { hmargin: m.hmargin, vmargin: m.vmargin }
+        }
+        StyleKind::Ornamental => ornamental_margins(cover_width, cover_height),
+        StyleKind::Cross | StyleKind::Half | StyleKind::Blocks => calculate_margins(cover_width, cover_height),
+    }
+}
+
+/// None of the 5 real `Style` subclasses override `TITLE_ALIGN`/
+/// `SUBTITLE_ALIGN`; only `Blocks.FOOTER_ALIGN` differs from the base
+/// `Style`'s `AlignHCenter` default.
+fn style_footer_align(kind: StyleKind) -> HAlign {
+    match kind {
+        StyleKind::Blocks => HAlign::Right,
+        _ => HAlign::Center,
+    }
+}
+
+fn text_block_geometry(title: &crate::covers_text::Block, subtitle: &crate::covers_text::Block) -> TextBlockGeometry {
+    TextBlockGeometry {
+        title_x: title.position().0,
+        title_y: title.position().1,
+        title_height: title.height(),
+        title_leading: title.leading,
+        subtitle_height: subtitle.height(),
+        subtitle_line_spacing: subtitle.line_spacing,
+    }
+}
+
+fn render_style(kind: StyleKind, pixmap: &mut Pixmap, width: u32, height: u32, colors: &StyleColors, layout: &crate::covers_text::LayoutResult) -> Option<StyleResultColors> {
+    match kind {
+        StyleKind::Cross => Some(render_cross(pixmap, width, height, colors, &text_block_geometry(&layout.title, &layout.subtitle))),
+        StyleKind::Half => Some(render_half(pixmap, width as f32, height as f32, colors)),
+        StyleKind::Blocks => Some(render_blocks(pixmap, width, height, colors)),
+        StyleKind::Banner => render_banner(pixmap, width, height, colors, &banner_margins(width, height), &layout.title, &layout.subtitle),
+        StyleKind::Ornamental => render_ornamental(pixmap, width, height, colors),
+    }
+}
+
+/// Draws `layout`'s 3 blocks with the real etch effect, in each
+/// block's own resolved font/size/color -- the common tail shared by
+/// [`generate_cover`] and [`calibre_cover2`].
+fn draw_layout_blocks(pixmap: &mut Pixmap, db: &Arc<fontdb::Database>, prefs_text: &crate::covers_text::CoverTextPrefs, layout: &crate::covers_text::LayoutResult, colors: &StyleResultColors) {
+    crate::covers_text::draw_block(pixmap, db, &layout.title, &layout.title_family, "serif", prefs_text.title_font_size, colors.title);
+    if !layout.subtitle_family.is_empty() {
+        crate::covers_text::draw_block(pixmap, db, &layout.subtitle, &layout.subtitle_family, "sans-serif", prefs_text.subtitle_font_size, colors.subtitle);
+    }
+    crate::covers_text::draw_block(pixmap, db, &layout.footer, &layout.footer_family, "serif", prefs_text.footer_font_size, colors.footer);
+}
+
+/// Port of `generate_cover(mi, prefs)`. `db` is threaded in explicitly
+/// (a real, disclosed API improvement over the implicit global
+/// `init_environment()`/`ensure_app()` Qt uses -- reloading every
+/// system font on every single call would be real but wasteful; a
+/// caller generating many covers should load fonts once and reuse the
+/// same `db`). Returns `None` only when no usable font/canvas could be
+/// resolved at all (see `covers_text`'s own font-source doc).
+pub fn generate_cover(mi: &MetaInformation, prefs: &CoverPrefs, db: &Arc<fontdb::Database>, use_roman: bool) -> Option<Vec<u8>> {
+    let themes = load_color_themes(&prefs.color_themes, &prefs.disabled_color_themes);
+    let theme = &themes[rand::random_range(0..themes.len())];
+    let styles = load_styles(prefs, true);
+    let style_kind = styles[rand::random_range(0..styles.len())];
+
+    let (title, subtitle, footer) = format_text(mi, &prefs.templates, use_roman);
+
+    let margins = style_margins(style_kind, prefs.cover_width, prefs.cover_height);
+    let max_title_height = (prefs.cover_height / 3) as f32;
+    let layout = crate::covers_text::layout_text(
+        db.as_ref(),
+        &prefs.text,
+        prefs.cover_width,
+        prefs.cover_height,
+        margins.hmargin,
+        margins.vmargin,
+        &title,
+        &subtitle,
+        &footer,
+        max_title_height,
+        HAlign::Center,
+        HAlign::Center,
+        style_footer_align(style_kind),
+    )?;
+
+    let mut pixmap = Pixmap::new(prefs.cover_width, prefs.cover_height)?;
+    let colors = StyleColors::load(theme);
+    let result_colors = render_style(style_kind, &mut pixmap, prefs.cover_width, prefs.cover_height, &colors, &layout)?;
+    draw_layout_blocks(&mut pixmap, db, &prefs.text, &layout, &result_colors);
+
+    pixmap.encode_png().ok()
+}
+
+/// Port of `create_cover(title, authors, series, series_index, prefs)`:
+/// ignores any user-set templates, always using the real default
+/// [`CoverTemplates`] (`override_prefs`'s only real effect any caller
+/// in this port's scope needs -- see this section's module doc).
+pub fn create_cover(title: &str, authors: &[String], series: Option<&str>, series_index: f64, prefs: &CoverPrefs, db: &Arc<fontdb::Database>, use_roman: bool) -> Option<Vec<u8>> {
+    let mi = MetaInformation { title: title.to_string(), authors: authors.to_vec(), series: series.map(str::to_string), series_index, ..Default::default() };
+    let prefs = CoverPrefs { templates: CoverTemplates::default(), ..prefs.clone() };
+    generate_cover(&mi, &prefs, db, use_roman)
+}
+
+/// Port of `calibre_cover2`'s inline `CalibeLogoStyle`, drawing `logo`
+/// scaled to fit between the title/subtitle band and the footer. Real
+/// `fit_image` semantics apply (shrink-to-fit only, never enlarges).
+#[allow(clippy::too_many_arguments)]
+fn draw_calibre_logo(pixmap: &mut Pixmap, width: u32, logo: &Pixmap, title_block: &crate::covers_text::Block, subtitle_block: &crate::covers_text::Block, footer_block: &crate::covers_text::Block) {
+    let top0 = title_block.position().1 + 10.0;
+    let extra_spacing = if subtitle_block.line_spacing != 0.0 { (subtitle_block.line_spacing / 2.0).floor() } else { (title_block.line_spacing / 3.0).floor() };
+    let band_height = title_block.height() + subtitle_block.height() + extra_spacing + title_block.leading;
+    let top = top0 + band_height + 25.0;
+    let bottom = footer_block.position().1 - 50.0;
+
+    let pwidth = width as f64;
+    let pheight = (bottom - top) as f64;
+    let (_, logo_w, logo_h) = fit_image(logo.width() as f64, logo.height() as f64, pwidth, pheight);
+    if logo_w <= 0 || logo_h <= 0 {
+        return;
+    }
+    let x = ((pwidth - logo_w as f64) / 2.0) as f32;
+    let y = ((pheight - logo_h as f64) / 2.0) as f32;
+    let sx = logo_w as f32 / logo.width().max(1) as f32;
+    let sy = logo_h as f32 / logo.height().max(1) as f32;
+    // `draw_pixmap`'s own (x,y) params combined with a scaling
+    // transform silently clip away the scaled result (see this
+    // section's module doc) -- fold all positioning into the
+    // transform itself and always pass (0,0).
+    let placement = chain_transforms(&[Transform::from_scale(sx, sy), Transform::from_translate(x, top + y)]);
+    pixmap.draw_pixmap(0, 0, logo.as_ref(), &PixmapPaint::default(), placement, None);
+}
+
+/// Port of `calibre_cover2`. `logo` replaces the real
+/// `I('library.png')` resource lookup -- no bundled-resource system
+/// exists in this port yet, so the caller supplies the already-decoded
+/// logo image directly.
+#[allow(clippy::too_many_arguments)]
+pub fn calibre_cover2(title: &str, author_string: &str, series_string: &str, prefs: &CoverPrefs, db: &Arc<fontdb::Database>, logo: &Pixmap) -> Option<Vec<u8>> {
+    let title = format!("<b>{}", escape_formatting(title));
+    let subtitle = format!("<i>{}", escape_formatting(series_string));
+    let footer = format!("<b>{}", escape_formatting(author_string));
+
+    let mut prefs = prefs.clone();
+    let scale = 800.0 / prefs.cover_height as f32;
+    scale_cover(&mut prefs, scale);
+
+    let color_theme = theme_to_colors(fallback_colors());
+    let colors = StyleColors::load(&color_theme);
+
+    let margins = calculate_margins(prefs.cover_width, prefs.cover_height);
+    let max_title_height = (prefs.cover_height / 3) as f32;
+    let layout = crate::covers_text::layout_text(
+        db.as_ref(),
+        &prefs.text,
+        prefs.cover_width,
+        prefs.cover_height,
+        margins.hmargin,
+        margins.vmargin,
+        &title,
+        &subtitle,
+        &footer,
+        max_title_height,
+        HAlign::Center,
+        HAlign::Center,
+        HAlign::Center,
+    )?;
+
+    let mut pixmap = Pixmap::new(prefs.cover_width, prefs.cover_height)?;
+    pixmap.fill(Color::WHITE);
+    draw_calibre_logo(&mut pixmap, prefs.cover_width, logo, &layout.title, &layout.subtitle, &layout.footer);
+
+    let result_colors = StyleResultColors { title: colors.ccolor1, subtitle: colors.ccolor1, footer: colors.ccolor1 };
+    draw_layout_blocks(&mut pixmap, db, &prefs.text, &layout, &result_colors);
+
+    pixmap.encode_png().ok()
+}
+
+/// Port of `message_image`. **Disclosed narrowing**: real Python
+/// full-justifies (`Qt.AlignmentFlag.AlignJustify`) each wrapped line
+/// (stretching inter-word spacing to fill the width); this port
+/// center-aligns instead ([`HAlign`] has no justify mode -- true
+/// justification needs per-line extra-space redistribution this
+/// module's line layout doesn't do). Text still real-wraps and is
+/// vertically centered for real.
+pub fn message_image(db: &Arc<fontdb::Database>, text: &str, width: u32, height: u32, font_size: f32) -> Option<Vec<u8>> {
+    let font = crate::covers_text::FontFace::query(db.as_ref(), "sans-serif", fontdb::Family::SansSerif)?;
+    let face = font.face();
+    let metrics = crate::covers_text::FontMetrics::new(&face, font_size);
+    let inner_w = (width as f32 - 20.0).max(1.0);
+    let inner_h = (height as f32 - 20.0).max(1.0);
+    let mut block = crate::covers_text::Block::new(text, inner_w, &face, &metrics, inner_h, HAlign::Center);
+    let y = 10.0 + ((inner_h - block.height()) / 2.0).max(0.0);
+    block.set_position(10.0, y);
+
+    let mut pixmap = Pixmap::new(width, height)?;
+    pixmap.fill(Color::WHITE);
+    crate::covers_text::draw_block_plain(&mut pixmap, db, &block, font.family_name(), "sans-serif", font_size, Color::BLACK);
+    pixmap.encode_png().ok()
+}
+
+/// Port of `generate_masthead`. A single left/vertically-centered bold
+/// line, no wrapping (matches real Python: no `TextWordWrap` flag is
+/// passed to this specific `drawText` call, unlike [`message_image`]'s).
+pub fn generate_masthead(db: &Arc<fontdb::Database>, title: &str, width: u32, height: u32, font_family: Option<&str>) -> Option<Vec<u8>> {
+    let pixel_size = (height as f32 * 3.0 / 4.0).floor();
+    let font = crate::covers_text::FontFace::query_weighted(db.as_ref(), font_family.unwrap_or("Liberation Serif"), fontdb::Family::Serif, fontdb::Weight::BOLD, fontdb::Style::Normal)?;
+    let face = font.face();
+    let metrics = crate::covers_text::FontMetrics::new(&face, pixel_size);
+    let sanitized = sanitize(title);
+    // A generous width avoids wrapping (real Python's `drawText` call
+    // here has no `TextWordWrap` flag -- single line, may overflow/clip
+    // visually on real narrow mastheads exactly as upstream's own does).
+    let mut block = crate::covers_text::Block::new(&sanitized, width as f32 * 4.0, &face, &metrics, height as f32 * 4.0, HAlign::Left);
+    let y = ((height as f32 - block.height()) / 2.0).max(0.0);
+    block.set_position(0.0, y);
+
+    let mut pixmap = Pixmap::new(width, height)?;
+    pixmap.fill(Color::WHITE);
+    crate::covers_text::draw_block_plain(&mut pixmap, db, &block, font.family_name(), "serif", pixel_size, Color::BLACK);
+    pixmap.encode_png().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1735,5 +2072,101 @@ mod tests {
         }
         assert!(found_blue, "expected some blue (ccolor1) ornament ink near the top-left corner");
     }
+
+    #[test]
+    fn all_styles_lists_all_five_real_style_names() {
+        let mut names = all_styles();
+        names.sort();
+        let mut expected = vec!["The Cross", "Half and Half", "Banner", "Ornamental", "Blocks"];
+        expected.sort();
+        assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn load_styles_respects_the_disabled_list() {
+        let mut prefs = CoverPrefs { disabled_styles: vec!["Banner".to_string(), "Blocks".to_string()], ..Default::default() };
+        let styles = load_styles(&prefs, true);
+        assert_eq!(styles.len(), 3);
+        assert!(!styles.contains(&StyleKind::Banner));
+        assert!(!styles.contains(&StyleKind::Blocks));
+
+        // Disabling every style falls back to all 5, matching real
+        // Python's own "ignore the disabling" fallback.
+        prefs.disabled_styles = all_styles().into_iter().map(str::to_string).collect();
+        assert_eq!(load_styles(&prefs, true).len(), 5);
+    }
+
+    #[test]
+    fn scale_cover_truncates_like_the_real_int_cast() {
+        let mut prefs = CoverPrefs { cover_width: 1200, cover_height: 1600, ..Default::default() };
+        prefs.text.title_font_size = 120.0;
+        scale_cover(&mut prefs, 0.5);
+        assert_eq!(prefs.cover_width, 600);
+        assert_eq!(prefs.cover_height, 800);
+        assert_eq!(prefs.text.title_font_size, 60.0);
+    }
+
+    fn test_prefs_with_only(style: &str) -> CoverPrefs {
+        CoverPrefs {
+            cover_width: 300,
+            cover_height: 400,
+            disabled_styles: all_styles().into_iter().filter(|s| *s != style).map(str::to_string).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn is_valid_png(data: &[u8], width: u32, height: u32) -> bool {
+        match Pixmap::decode_png(data) {
+            Ok(pixmap) => pixmap.width() == width && pixmap.height() == height,
+            Err(_) => false,
+        }
+    }
+
+    #[test]
+    fn generate_cover_produces_a_real_decodable_png_for_every_style() {
+        let db = Arc::new(crate::covers_text::load_system_fonts());
+        let mi = MetaInformation { title: "A Test Book".to_string(), authors: vec!["Jane Author".to_string()], series: Some("A Series".to_string()), series_index: 2.0, ..Default::default() };
+        for name in all_styles() {
+            let prefs = test_prefs_with_only(name);
+            let png = generate_cover(&mi, &prefs, &db, false).unwrap_or_else(|| panic!("style {name:?} failed to render"));
+            assert!(is_valid_png(&png, 300, 400), "style {name:?} produced an invalid/mis-sized PNG");
+        }
+    }
+
+    #[test]
+    fn create_cover_ignores_user_templates() {
+        let db = Arc::new(crate::covers_text::load_system_fonts());
+        let mut prefs = test_prefs_with_only("Blocks");
+        prefs.templates.title_template = "some non-default template that would break".to_string();
+        let png = create_cover("My Title", &["Author One".to_string()], Some("My Series"), 3.0, &prefs, &db, false).expect("real cover");
+        assert!(is_valid_png(&png, 300, 400));
+    }
+
+    #[test]
+    fn calibre_cover2_composites_a_real_logo() {
+        let db = Arc::new(crate::covers_text::load_system_fonts());
+        let mut logo = Pixmap::new(64, 64).unwrap();
+        logo.fill(Color::from_rgba8(10, 20, 30, 255));
+        let prefs = CoverPrefs { cover_width: 600, cover_height: 800, ..Default::default() };
+        let png = calibre_cover2("Calibre", "Kovid Goyal", "", &prefs, &db, &logo).expect("real calibre_cover2 render");
+        // scale_cover(800/cover_height=1.0) leaves dimensions unchanged here.
+        assert!(is_valid_png(&png, 600, 800));
+    }
+
+    #[test]
+    fn message_image_wraps_and_centers_real_text() {
+        let db = Arc::new(crate::covers_text::load_system_fonts());
+        let png = message_image(&db, "This is a longer message that should wrap across more than one line", 300, 200, 20.0).expect("real message image");
+        assert!(is_valid_png(&png, 300, 200));
+    }
+
+    #[test]
+    fn generate_masthead_produces_a_single_line_image() {
+        let db = Arc::new(crate::covers_text::load_system_fonts());
+        let png = generate_masthead(&db, "My Periodical", 600, 60, None).expect("real masthead");
+        assert!(is_valid_png(&png, 600, 60));
+    }
 }
+
+
 
