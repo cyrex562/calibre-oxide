@@ -301,9 +301,31 @@ either -- this pass wasn't exhaustive.
       produce) are represented by a `TextBlockGeometry` carrying just
       the scalar fields `Cross` reads off them, so #598 landing won't
       change this port's function signatures. #598 (text layout +
-      rendering, the real hard part)/#599 (`Banner`, curve math)/#600
-      (`Ornamental`, transform stamping)/#601 (entry points + wiring)
-      remain, in dependency order)
+      rendering) shipped as a new `covers_text.rs`: `Block`/
+      `layout_text` (real greedy word-wrap via glyph advance widths
+      read from each font's `hmtx` table through `ttf_parser`, exact
+      per-paragraph spacer-leading height bookkeeping matching
+      `Block.height`/`Block.position`'s real formulas) plus a
+      `usvg`/`resvg`-based rendering bridge (`draw_block`) producing
+      the real etch double-draw effect. No fonts are bundled in this
+      repo (matching upstream's own `setup/liberation.py`, which
+      *downloads* Liberation fonts at build time rather than
+      committing them); `fontdb::Database::load_system_fonts()` is
+      used with a real 3-tier fallback (exact family -> fontconfig's
+      generic serif/sans-serif alias -> whatever's installed at all),
+      needed because the fontconfig alias on the dev box points at a
+      family (`FreeSans`/`FreeSerif`) that isn't actually installed
+      (only DejaVu is) -- a real gap in naive 2-tier fallback caught by
+      the test suite actually failing on this box, not assumed away.
+      `usvg`'s own independent font matching (used only for final
+      rendering) has no equivalent fallback, so `draw_block` must be
+      given the *real* resolved family name, not the logical one.
+      Disclosed narrowing: wrap-width measurement sums raw advances
+      with no shaping (no kerning/ligatures) and uses the regular
+      face's metrics even for bold/italic runs (which still render
+      with real `font-weight`/`font-style` at draw time). #599
+      (`Banner`, curve math)/#600 (`Ornamental`, transform stamping)/
+      #601 (entry points + wiring) remain, in dependency order)
 - [x] css_transform_rules.py (issue #117 CLOSED -- `css_transform_rules.rs`: a real match-a-CSS-property's-value (exact/negated/regex/numeric-with-unit-conversion), then remove/change/append/arithmetic-transform rules engine over `crate::css::model::StyleDeclarationBlock`. `transform_container` wired directly against the already-real `crate::oeb::polish::css::transform_css`, needing no new container-walking logic at all. Shorthand-property expansion (matching e.g. `margin-top` against a compact `margin: 0`) reuses `crate::oeb::normalize_css::normalize_edge`, covering the same five shorthands `normalize_filter_css` already does; other shorthands (`font`/`background`/`list-style`/non-edge `border`) pass through unexpanded, the same disclosed narrowing `oeb::polish::css::filter_css` already has. Real, non-obvious upstream behavior confirmed by reading the source and locked in with a test: a normalizable shorthand's own compact name (e.g. `property: "margin"`) is NEVER directly matchable by a rule -- real upstream's own declaration iterator yields ONLY the expanded longhand names for a normalizable property, never the raw shorthand. `\N`-style regex backreferences in a `change` action's replacement text are translated from Python `regex.sub` syntax to Rust `regex` syntax. `export_rules`/`import_rules`' real plain-text rule-file format ported and round-trip tested, matching `html_transform_rules.rs`'s (#118) own precedent)
 - [x] html_entities.c (ported to `html_entities.rs` — `html-escape` crate supersedes the C lookup table)
 - [x] html_entities.h (ported — the 5000-line table is now `html-escape`'s embedded WHATWG data)
