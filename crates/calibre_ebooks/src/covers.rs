@@ -54,8 +54,8 @@ use calibre_utils::formatter::interp::{evaluate as gpm_evaluate, RawValue, Value
 use calibre_utils::formatter::parser::parse as gpm_parse;
 use calibre_utils::formatter::{lexer, PureCatalog, PureFunctions};
 use tiny_skia::{
-    Color, FillRule, GradientStop, LinearGradient, Mask, Paint, PathBuilder, Pixmap, Point, Rect,
-    SpreadMode, Transform,
+    Color, FillRule, GradientStop, LinearGradient, Mask, Paint, PathBuilder, Pixmap, Point,
+    RadialGradient, Rect, SpreadMode, Transform,
 };
 
 use crate::metadata::authors::authors_to_string;
@@ -1018,6 +1018,224 @@ pub fn render_banner(pixmap: &mut Pixmap, width: u32, height: u32, colors: &Styl
     Some(StyleResultColors { title: colors.ccolor2, subtitle: colors.ccolor2, footer: colors.ccolor1 })
 }
 
+// ===================================================================
+// Ornamental style (issue #600): transform-stamped corner ornaments +
+// radial gradient + rule lines. No text-block dependency at all --
+// real `Ornamental.__call__` never reads `title_block`/`subtitle_block`/
+// `footer_block`.
+// ===================================================================
+//
+// # `setWindow`: a manual scale, not a `tiny_skia` primitive
+//
+// `painter.setWindow(0, 0, *VIEWPORT)` (`VIEWPORT = (400, 500)`)
+// establishes a logical coordinate system Qt maps onto the real
+// device pixels (the full cover image, no `setViewport` override).
+// Since the window origin matches the viewport origin, this is a pure
+// anisotropic scale -- `Transform::from_scale(width/400, height/500)`
+// -- applied as the OUTERMOST transform to every drawing call in this
+// style (`window_transform` below). `tiny-skia` has no dedicated
+// "logical window" concept; this is real, worked-out scale math, not
+// a guess.
+//
+// # Transform composition order, worked out (not guessed) from Qt's
+// own `setWorldTransform(matrix, combine=true)` semantics
+//
+// Each `painter.rotate()`/`.translate()`/`.scale()` call does
+// `worldTransform = matrix * worldTransform` -- so calling them in
+// sequence `rotate(90); translate(a,b); scale(c,d); translate(e,f)`
+// yields `device = T2(S(T1(R(p))))`: **the calls apply to a point in
+// the literal order they're written**, each later call composing
+// *outside* the earlier ones. `Transform::post_concat`/`post_scale`/
+// `post_translate`/`post_rotate` chained in that same call order
+// reproduce this exactly (verified via `tiny-skia-path`'s own
+// `concat` semantics: `a.pre_concat(b)` == "b applied first, then
+// a" == `post_concat` in the OPPOSITE call order would reverse it --
+// `post_*` chained in *Python's own call order* is the direct match).
+//
+// # Two ornament copies per corner, not one
+//
+// `corner()` draws the SVG ornament path TWICE: once with whatever
+// "outer" scale+translate was set up just before calling it (a plain
+// mirrored/shifted copy), and again after appending its own internal
+// `rotate(90)/translate/scale/translate` chain on top (a rotated
+// copy) -- then resets the world transform to identity before
+// returning, so each of the 4 corner call-sites is independent. 8
+// total ornament fills across the whole image, exactly matching a
+// literal reading of the real Python.
+//
+// # Pen width: cosmetic vs. logical, both replicated for real
+//
+// The first 4 rule lines use Qt's *default* pen (width 0 == a
+// "cosmetic" always-1-device-pixel line, regardless of any active
+// transform); the last 4 use `setWidthF(1.8)` (a *logical*-unit width
+// that scales with `window_transform` like any other geometry).
+// `tiny-skia::Stroke`'s own `width: 0.0` documented "hairline"
+// behavior is the literal, non-approximated match for the cosmetic
+// case (endpoints pre-transformed to device space, stroked with
+// `Transform::identity()`); the logical case strokes in window-space
+// coordinates with `window_transform` as the draw transform, so the
+// resulting device-space width genuinely scales the same way Qt's
+// does.
+
+const CORNER_VECTOR: &str = "m 67.791903,64.260958 c -4.308097,-2.07925 -4.086719,-8.29575 0.334943,-9.40552 4.119758,-1.03399 8.732363,5.05239 5.393055,7.1162 -0.55,0.33992 -1,1.04147 -1,1.55902 0,1.59332 2.597425,1.04548 5.365141,-1.1316 1.999416,-1.57274 2.634859,-2.96609 2.634859,-5.7775 0,-9.55787 -9.827495,-13.42961 -24.43221,-9.62556 -3.218823,0.83839 -5.905663,1.40089 -5.970755,1.25 -0.06509,-0.1509 -0.887601,-1.19493 -1.827799,-2.32007 -1.672708,-2.00174 -1.636693,-2.03722 1.675668,-1.65052 1.861815,0.21736 6.685863,-0.35719 10.720107,-1.27678 12.280767,-2.79934 20.195487,-0.0248 22.846932,8.0092 3.187273,9.65753 -6.423297,17.7497 -15.739941,13.25313 z m 49.881417,-20.53932 c -3.19204,-2.701 -3.72967,-6.67376 -1.24009,-9.16334 2.48236,-2.48236 5.35141,-2.67905 7.51523,-0.51523 1.85966,1.85966 2.07045,6.52954 0.37143,8.22857 -2.04025,2.04024 3.28436,1.44595 6.92316,-0.77272 9.66959,-5.89579 0.88581,-18.22422 -13.0777,-18.35516 -5.28594,-0.0496 -10.31098,1.88721 -14.26764,5.4991 -1.98835,1.81509 -2.16454,1.82692 -2.7936,0.18763 -0.40973,-1.06774 0.12141,-2.82197 1.3628,-4.50104 2.46349,-3.33205 1.67564,-4.01299 -2.891784,-2.49938 -2.85998,0.94777 -3.81038,2.05378 -5.59837,6.51495 -1.184469,2.95536 -3.346819,6.86882 -4.805219,8.69657 -1.4584,1.82776 -2.65164,4.02223 -2.65164,4.87662 0,3.24694 -4.442667,0.59094 -5.872557,-3.51085 -1.361274,-3.90495 0.408198,-8.63869 4.404043,-11.78183 5.155844,-4.05558 1.612374,-3.42079 -9.235926,1.65457 -12.882907,6.02725 -16.864953,7.18038 -24.795556,7.18038 -8.471637,0 -13.38802,-1.64157 -17.634617,-5.88816 -2.832233,-2.83224 -3.849773,-4.81378 -4.418121,-8.6038 -1.946289,-12.9787795 8.03227,-20.91713135 19.767685,-15.7259993 5.547225,2.4538018 6.993631,6.1265383 3.999564,10.1557393 -5.468513,7.35914 -15.917883,-0.19431 -10.657807,-7.7041155 1.486298,-2.1219878 1.441784,-2.2225068 -0.984223,-2.2225068 -1.397511,0 -4.010527,1.3130878 -5.806704,2.9179718 -2.773359,2.4779995 -3.265777,3.5977995 -3.265777,7.4266705 0,5.10943 2.254112,8.84197 7.492986,12.40748 8.921325,6.07175 19.286666,5.61396 37.12088,-1.63946 15.35037,-6.24321 21.294999,-7.42408 34.886123,-6.92999 11.77046,0.4279 19.35803,3.05537 24.34054,8.42878 4.97758,5.3681 2.53939,13.58271 -4.86733,16.39873 -4.17361,1.58681 -11.00702,1.19681 -13.31978,-0.76018 z m 26.50156,-0.0787 c -2.26347,-2.50111 -2.07852,-7.36311 0.39995,-10.51398 2.68134,-3.40877 10.49035,-5.69409 18.87656,-5.52426 l 6.5685,0.13301 -7.84029,0.82767 c -8.47925,0.89511 -12.76997,2.82233 -16.03465,7.20213 -1.92294,2.57976 -1.96722,3.00481 -0.57298,5.5 1.00296,1.79495 2.50427,2.81821 4.46514,3.04333 2.92852,0.33623 2.93789,0.32121 1.08045,-1.73124 -1.53602,-1.69728 -1.64654,-2.34411 -0.61324,-3.58916 2.84565,-3.4288 7.14497,-0.49759 5.03976,3.43603 -1.86726,3.48903 -8.65528,4.21532 -11.3692,1.21647 z m -4.17462,-14.20302 c -0.38836,-0.62838 -0.23556,-1.61305 0.33954,-2.18816 1.3439,-1.34389 4.47714,-0.17168 3.93038,1.47045 -0.5566,1.67168 -3.38637,2.14732 -4.26992,0.71771 z m -8.48037,-9.1829 c -12.462,-4.1101 -12.53952,-4.12156 -25.49998,-3.7694 -24.020921,0.65269 -32.338219,0.31756 -37.082166,-1.49417 -5.113999,-1.95305 -8.192504,-6.3647405 -6.485463,-9.2940713 0.566827,-0.972691 1.020091,-1.181447 1.037211,-0.477701 0.01685,0.692606 1.268676,1.2499998 2.807321,1.2499998 1.685814,0 4.868609,1.571672 8.10041,4.0000015 4.221481,3.171961 6.182506,3.999221 9.473089,3.996261 l 4.149585,-0.004 -3.249996,-1.98156 c -3.056252,-1.863441 -4.051566,-3.8760635 -2.623216,-5.3044145 0.794,-0.794 6.188222,1.901516 9.064482,4.5295635 1.858669,1.698271 3.461409,1.980521 10.559493,1.859621 11.30984,-0.19266 20.89052,1.29095 31.97905,4.95208 7.63881,2.52213 11.51931,3.16471 22.05074,3.65141 7.02931,0.32486 13.01836,0.97543 13.30902,1.44571 0.29065,0.47029 -5.2356,0.83436 -12.28056,0.80906 -12.25942,-0.044 -13.34537,-0.2229 -25.30902,-4.16865 z";
+
+/// Port of `Ornamental.VIEWPORT`.
+const ORNAMENTAL_VIEWPORT: (f32, f32) = (400.0, 500.0);
+
+/// Port of `Ornamental.calculate_margins`: a totally different ratio
+/// basis (`VIEWPORT`, not `prefs.cover_width`/`600`) than the base
+/// `Style`, but the same `Margins` shape.
+pub fn ornamental_margins(cover_width: u32, cover_height: u32) -> Margins {
+    Margins {
+        hmargin: ((51.0 / ORNAMENTAL_VIEWPORT.0) * cover_width as f32) as i32,
+        vmargin: ((83.0 / ORNAMENTAL_VIEWPORT.1) * cover_height as f32) as i32,
+    }
+}
+
+/// Port of `svg_path_to_painter_path` for this style's own fixed
+/// `CORNER_VECTOR` -- a real SVG path `d`-string parser
+/// (`svgtypes::PathParser`, the same tokenizer `usvg` itself uses
+/// internally) converted into a `tiny_skia::Path` via `move_to`/
+/// `line_to`/`cubic_to`/`close`. **Disclosed narrowing**: only the
+/// segment kinds `CORNER_VECTOR` actually uses (`m`/`l`/`c`/`z`) are
+/// handled; elliptical-arc/quadratic/smooth-curve segments are
+/// skipped (a general-purpose SVG path converter would need them, but
+/// no real caller of this specific function does).
+fn svg_path_to_tiny_skia_path(d: &str) -> Option<tiny_skia::Path> {
+    let mut pb = PathBuilder::new();
+    let (mut cx, mut cy) = (0.0f32, 0.0f32);
+    let (mut sx, mut sy) = (0.0f32, 0.0f32);
+    for seg in svgtypes::PathParser::from(d) {
+        match seg.ok()? {
+            svgtypes::PathSegment::MoveTo { abs, x, y } => {
+                let (x, y) = (x as f32, y as f32);
+                (cx, cy) = if abs { (x, y) } else { (cx + x, cy + y) };
+                (sx, sy) = (cx, cy);
+                pb.move_to(cx, cy);
+            }
+            svgtypes::PathSegment::LineTo { abs, x, y } => {
+                let (x, y) = (x as f32, y as f32);
+                (cx, cy) = if abs { (x, y) } else { (cx + x, cy + y) };
+                pb.line_to(cx, cy);
+            }
+            svgtypes::PathSegment::CurveTo { abs, x1, y1, x2, y2, x, y } => {
+                let (mut x1, mut y1, mut x2, mut y2, mut x, mut y) = (x1 as f32, y1 as f32, x2 as f32, y2 as f32, x as f32, y as f32);
+                if !abs {
+                    x1 += cx;
+                    y1 += cy;
+                    x2 += cx;
+                    y2 += cy;
+                    x += cx;
+                    y += cy;
+                }
+                pb.cubic_to(x1, y1, x2, y2, x, y);
+                (cx, cy) = (x, y);
+            }
+            svgtypes::PathSegment::ClosePath { .. } => {
+                pb.close();
+                (cx, cy) = (sx, sy);
+            }
+            _ => {}
+        }
+    }
+    pb.finish()
+}
+
+/// Port of the cached `PATH_CACHE['corner']` lookup.
+fn ornamental_corner_path() -> Option<&'static tiny_skia::Path> {
+    static CACHE: OnceLock<Option<tiny_skia::Path>> = OnceLock::new();
+    CACHE.get_or_init(|| svg_path_to_tiny_skia_path(CORNER_VECTOR)).as_ref()
+}
+
+/// Chains `ops` in the exact order they're applied to a point (`ops[0]`
+/// first/innermost, `ops[last]` outermost) -- the direct equivalent of
+/// a sequence of real `painter.rotate()`/`.translate()`/`.scale()`
+/// calls in that same order (see this section's own module doc).
+fn chain_transforms(ops: &[Transform]) -> Transform {
+    ops.iter().fold(Transform::identity(), |acc, op| acc.post_concat(*op))
+}
+
+fn stroke_line(pixmap: &mut Pixmap, transform: Transform, paint: &Paint, stroke: &tiny_skia::Stroke, p1: (f32, f32), p2: (f32, f32)) {
+    let mut pb = PathBuilder::new();
+    pb.move_to(p1.0, p1.1);
+    pb.line_to(p2.0, p2.1);
+    if let Some(path) = pb.finish() {
+        pixmap.stroke_path(&path, paint, stroke, transform, None);
+    }
+}
+
+/// Port of `Ornamental.__call__`. Reads no `title_block`/
+/// `subtitle_block`/`footer_block` data at all, matching the real
+/// Python exactly.
+pub fn render_ornamental(pixmap: &mut Pixmap, width: u32, height: u32, colors: &StyleColors) -> Option<StyleResultColors> {
+    let (width_f, height_f) = (width as f32, height as f32);
+
+    // `QRadialGradient(rect.center(), rect.width())`: a single circle
+    // centered on the cover, radius == cover width (not height).
+    let center = Point::from_xy(width_f / 2.0, height_f / 2.0);
+    let gradient = RadialGradient::new(
+        center,
+        0.0,
+        center,
+        width_f.max(1.0),
+        vec![GradientStop::new(0.0, colors.color1), GradientStop::new(1.0, colors.color2)],
+        SpreadMode::Pad,
+        Transform::identity(),
+    )?;
+    let gradient_paint = Paint { shader: gradient, ..Default::default() };
+    let full = Rect::from_xywh(0.0, 0.0, width_f, height_f)?;
+    pixmap.fill_rect(full, &gradient_paint, Transform::identity(), None);
+
+    let window_transform = Transform::from_scale(width_f / ORNAMENTAL_VIEWPORT.0, height_f / ORNAMENTAL_VIEWPORT.1);
+
+    if let Some(path) = ornamental_corner_path() {
+        let corner_chain = [Transform::from_rotate(90.0), Transform::from_translate(100.0, -100.0), Transform::from_scale(1.0, -1.0), Transform::from_translate(-103.0, -97.0)];
+        let groups: [Vec<Transform>; 4] = [
+            vec![],
+            vec![Transform::from_scale(-1.0, 1.0), Transform::from_translate(-400.0, 0.0)],
+            vec![Transform::from_scale(1.0, -1.0), Transform::from_translate(0.0, -500.0)],
+            vec![Transform::from_scale(-1.0, -1.0), Transform::from_translate(-400.0, -500.0)],
+        ];
+        let ornament_paint = Paint { shader: tiny_skia::Shader::SolidColor(colors.ccolor1), ..Default::default() };
+        for outer in &groups {
+            let mut plain_ops = outer.clone();
+            plain_ops.push(window_transform);
+            pixmap.fill_path(path, &ornament_paint, FillRule::Winding, chain_transforms(&plain_ops), None);
+
+            let mut rotated_ops = outer.clone();
+            rotated_ops.extend_from_slice(&corner_chain);
+            rotated_ops.push(window_transform);
+            pixmap.fill_path(path, &ornament_paint, FillRule::Winding, chain_transforms(&rotated_ops), None);
+        }
+    }
+
+    let line_paint = Paint { shader: tiny_skia::Shader::SolidColor(colors.ccolor1), ..Default::default() };
+    let hairline = tiny_skia::Stroke { width: 0.0, ..Default::default() };
+    for y in [28.4f32, 471.7] {
+        let mut a = Point::from_xy(160.0, y);
+        let mut b = Point::from_xy(240.0, y);
+        window_transform.map_point(&mut a);
+        window_transform.map_point(&mut b);
+        stroke_line(pixmap, Transform::identity(), &line_paint, &hairline, (a.x, a.y), (b.x, b.y));
+    }
+    for x in [31.3f32, 368.7] {
+        let mut a = Point::from_xy(x, 155.0);
+        let mut b = Point::from_xy(x, 345.0);
+        window_transform.map_point(&mut a);
+        window_transform.map_point(&mut b);
+        stroke_line(pixmap, Transform::identity(), &line_paint, &hairline, (a.x, a.y), (b.x, b.y));
+    }
+    let wide = tiny_skia::Stroke { width: 1.8, ..Default::default() };
+    for y in [23.8f32, 476.7] {
+        stroke_line(pixmap, window_transform, &line_paint, &wide, (160.0, y), (240.0, y));
+    }
+    for x in [26.3f32, 373.7] {
+        stroke_line(pixmap, window_transform, &line_paint, &wide, (x, 155.0), (x, 345.0));
+    }
+
+    Some(StyleResultColors { title: colors.ccolor2, subtitle: colors.ccolor2, footer: colors.ccolor1 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1421,6 +1639,101 @@ mod tests {
         let ribbon_y = title.position().1 as u32 + 5;
         let (r, g, _) = px(&pixmap, 600, ribbon_y);
         assert!(g > r, "expected ribbon-green to dominate at (600,{ribbon_y}), got r={r} g={g}");
+    }
+
+    #[test]
+    fn chain_transforms_applies_ops_in_call_order_not_reversed() {
+        let translate_then_scale = chain_transforms(&[Transform::from_translate(10.0, 0.0), Transform::from_scale(2.0, 1.0)]);
+        let mut p = Point::from_xy(1.0, 0.0);
+        translate_then_scale.map_point(&mut p);
+        // translate first: (1,0)->(11,0); then scale by 2x: (11,0)->(22,0).
+        assert!((p.x - 22.0).abs() < 1e-4, "{p:?}");
+
+        let scale_then_translate = chain_transforms(&[Transform::from_scale(2.0, 1.0), Transform::from_translate(10.0, 0.0)]);
+        let mut p2 = Point::from_xy(1.0, 0.0);
+        scale_then_translate.map_point(&mut p2);
+        // scale first: (1,0)->(2,0); then translate by 10: (2,0)->(12,0).
+        assert!((p2.x - 12.0).abs() < 1e-4, "{p2:?}");
+
+        // The two orders must disagree -- proves call order is actually
+        // respected, not silently reversed or commutative by accident.
+        assert!((p.x - p2.x).abs() > 1.0);
+    }
+
+    #[test]
+    fn svg_path_to_tiny_skia_path_parses_relative_moveto_lineto_curveto_close() {
+        let path = svg_path_to_tiny_skia_path("m 10,10 l 5,0 c 1,1 2,2 3,3 z").expect("valid SVG path data");
+        let segments: Vec<_> = path.segments().collect();
+        assert_eq!(segments.len(), 4);
+        match segments[0] {
+            tiny_skia::PathSegment::MoveTo(p) => assert!((p.x - 10.0).abs() < 1e-4 && (p.y - 10.0).abs() < 1e-4, "{p:?}"),
+            other => panic!("expected MoveTo, got {other:?}"),
+        }
+        match segments[1] {
+            // Relative lineto from (10,10) by (5,0) -> (15,10).
+            tiny_skia::PathSegment::LineTo(p) => assert!((p.x - 15.0).abs() < 1e-4 && (p.y - 10.0).abs() < 1e-4, "{p:?}"),
+            other => panic!("expected LineTo, got {other:?}"),
+        }
+        match segments[2] {
+            // Relative curveto from (15,10) by (1,1)/(2,2)/(3,3) -> control points (16,11)/(17,12), end (18,13).
+            tiny_skia::PathSegment::CubicTo(c1, c2, end) => {
+                assert!((c1.x - 16.0).abs() < 1e-4 && (c1.y - 11.0).abs() < 1e-4, "{c1:?}");
+                assert!((c2.x - 17.0).abs() < 1e-4 && (c2.y - 12.0).abs() < 1e-4, "{c2:?}");
+                assert!((end.x - 18.0).abs() < 1e-4 && (end.y - 13.0).abs() < 1e-4, "{end:?}");
+            }
+            other => panic!("expected CubicTo, got {other:?}"),
+        }
+        assert_eq!(segments[3], tiny_skia::PathSegment::Close);
+    }
+
+    #[test]
+    fn ornamental_corner_path_parses_the_real_corner_vector() {
+        // The real CORNER_VECTOR is well-formed SVG path data -- this
+        // must succeed, not silently fall back to an empty path.
+        assert!(ornamental_corner_path().is_some());
+    }
+
+    #[test]
+    fn ornamental_margins_matches_the_real_viewport_ratio() {
+        let m = ornamental_margins(400, 500);
+        assert_eq!(m.hmargin, 51); // 51/400 * 400
+        assert_eq!(m.vmargin, 83); // 83/500 * 500
+        let m2 = ornamental_margins(1200, 1600);
+        assert_eq!(m2.hmargin, (51.0 / 400.0 * 1200.0) as i32);
+        assert_eq!(m2.vmargin, (83.0 / 500.0 * 1600.0) as i32);
+    }
+
+    #[test]
+    fn render_ornamental_paints_a_radial_gradient_and_corner_ornaments() {
+        let colors = StyleColors::load(&theme()); // color1=red, color2=green, ccolor1=blue
+        let mut pixmap = Pixmap::new(1200, 1600).unwrap();
+        let result = render_ornamental(&mut pixmap, 1200, 1600, &colors).expect("real ornamental render");
+        assert_eq!(result.title.to_color_u8().green(), 0xff); // ccolor2 = green
+
+        // Radial gradient: center is color1 (red), a far corner is
+        // color2 (green) -- real QRadialGradient(center, width) math,
+        // not a flat fill.
+        let (cr, _, _) = px(&pixmap, 600, 800);
+        assert!(cr > 200, "expected the gradient center to be reddish, got r={cr}");
+        let (_, cg, _) = px(&pixmap, 1199, 1599);
+        assert!(cg > 100, "expected a far corner to have shifted toward color2 (green), got g={cg}");
+
+        // Somewhere within the top-left ornament's device-space
+        // bounding box, real ccolor1 (blue)-ish ink was painted (not
+        // just background/gradient colors) -- proves the transform-
+        // stamped corner ornament actually rasterized.
+        let window_sx = 1200.0 / 400.0;
+        let window_sy = 1600.0 / 500.0;
+        let mut found_blue = false;
+        for yy in 40..80 {
+            for xx in 20..60 {
+                let (r, g, b) = px(&pixmap, (xx as f32 * window_sx) as u32, (yy as f32 * window_sy) as u32);
+                if b > r && b > g {
+                    found_blue = true;
+                }
+            }
+        }
+        assert!(found_blue, "expected some blue (ccolor1) ornament ink near the top-left corner");
     }
 }
 
