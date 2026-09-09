@@ -335,8 +335,19 @@ either -- this pass wasn't exhaustive.
       directly off `covers_text::Block`. `QColor::darker()`'s real
       default (factor 200) was ported as genuine HSV-space value
       halving, not a flat RGB scale. #600 (`Ornamental`, transform
-      stamping)/#601 (entry points + wiring) remain, in dependency
-      order)
+      stamping) shipped: `svg_path_to_tiny_skia_path` (a real SVG path
+      `d`-string converter via `svgtypes::PathParser`, the same
+      tokenizer `usvg` uses internally); `chain_transforms` (real
+      `tiny_skia::Transform::post_concat` chaining, worked out --not
+      guessed-- from Qt's own `setWorldTransform(matrix, combine=true)`
+      semantics to reproduce "each `rotate`/`translate`/`scale` call
+      composes *outside* the previous ones, in literal call order");
+      the `setWindow(0,0,400,500)` logical-viewport remap as a plain
+      `Transform::from_scale`; and the real 8-ornament-fill + 8-rule-
+      line render (`render_ornamental`), including a literal, non-
+      approximated port of Qt's cosmetic-vs-logical pen width
+      distinction via `tiny_skia::Stroke`'s own documented `width:
+      0.0` hairline feature. #601 (entry points + wiring) remains)
 - [x] css_transform_rules.py (issue #117 CLOSED -- `css_transform_rules.rs`: a real match-a-CSS-property's-value (exact/negated/regex/numeric-with-unit-conversion), then remove/change/append/arithmetic-transform rules engine over `crate::css::model::StyleDeclarationBlock`. `transform_container` wired directly against the already-real `crate::oeb::polish::css::transform_css`, needing no new container-walking logic at all. Shorthand-property expansion (matching e.g. `margin-top` against a compact `margin: 0`) reuses `crate::oeb::normalize_css::normalize_edge`, covering the same five shorthands `normalize_filter_css` already does; other shorthands (`font`/`background`/`list-style`/non-edge `border`) pass through unexpanded, the same disclosed narrowing `oeb::polish::css::filter_css` already has. Real, non-obvious upstream behavior confirmed by reading the source and locked in with a test: a normalizable shorthand's own compact name (e.g. `property: "margin"`) is NEVER directly matchable by a rule -- real upstream's own declaration iterator yields ONLY the expanded longhand names for a normalizable property, never the raw shorthand. `\N`-style regex backreferences in a `change` action's replacement text are translated from Python `regex.sub` syntax to Rust `regex` syntax. `export_rules`/`import_rules`' real plain-text rule-file format ported and round-trip tested, matching `html_transform_rules.rs`'s (#118) own precedent)
 - [x] html_entities.c (ported to `html_entities.rs` — `html-escape` crate supersedes the C lookup table)
 - [x] html_entities.h (ported — the 5000-line table is now `html-escape`'s embedded WHATWG data)
