@@ -821,6 +821,203 @@ pub fn render_cross(
     StyleResultColors { title: colors.ccolor2, subtitle: colors.ccolor2, footer: colors.ccolor1 }
 }
 
+// ===================================================================
+// Banner style (issue #599): real curve math (`rotate_vector`/
+// `draw_curved_line`) + fold-rectangle geometry.
+// ===================================================================
+//
+// Unlike `Cross` (#597, ported before #598's real `Block` existed and
+// so takes a placeholder [`TextBlockGeometry`]), `Banner` is ported
+// after #598 landed and reads real title/subtitle geometry directly
+// off [`crate::covers_text::Block`] -- `position()`/`height()`/
+// `leading`/`line_spacing` all already exist for exactly this.
+
+/// Port of `Banner.calculate_margins`: overrides the base `Style`
+/// margins entirely (does not call `Style.calculate_margins` for
+/// `hmargin`, only inherits `vmargin`), plus a `fold_width` the base
+/// `Style` has no equivalent of.
+#[derive(Debug, Clone, Copy)]
+pub struct BannerMargins {
+    pub hmargin: i32,
+    pub vmargin: i32,
+    pub fold_width: i32,
+}
+
+pub fn banner_margins(cover_width: u32, cover_height: u32) -> BannerMargins {
+    BannerMargins {
+        hmargin: (0.15 * cover_width as f64) as i32,
+        vmargin: calculate_margins(cover_width, cover_height).vmargin,
+        fold_width: (0.1 * cover_width as f64) as i32,
+    }
+}
+
+/// Port of `rotate_vector`.
+fn rotate_vector(angle: f32, x: f32, y: f32) -> (f32, f32) {
+    (x * angle.cos() - y * angle.sin(), x * angle.sin() + y * angle.cos())
+}
+
+/// Port of `draw_curved_line`: appends a cubic Bezier segment from the
+/// path's current point to `(dx, dy)` further along, whose two control
+/// points are `(c1_frac, c1_amp)`/`(c2_frac, c2_amp)` -- expressed as
+/// fractions of the segment's own length/amplitude in a frame rotated
+/// to the segment's own direction (`atan2(dy, dx)`) -- rotated back
+/// into absolute coordinates via [`rotate_vector`]. This is the exact
+/// real curve-construction primitive every `Banner` ribbon/fold edge
+/// uses; `tiny-skia-path`'s `cubic_to` is a direct match for Qt's
+/// `QPainterPath.cubicTo`, so only the control-point math is new
+/// porting work.
+fn draw_curved_line(pb: &mut PathBuilder, dx: f32, dy: f32, c1_frac: f32, c1_amp: f32, c2_frac: f32, c2_amp: f32) {
+    let length = (dx * dx + dy * dy).sqrt();
+    let angle = dy.atan2(dx);
+    let (c1x, c1y) = rotate_vector(angle, c1_frac * length, c1_amp * length);
+    let (c2x, c2y) = rotate_vector(angle, c2_frac * length, c2_amp * length);
+    let pos = pb.last_point().unwrap_or(Point::from_xy(0.0, 0.0));
+    pb.cubic_to(pos.x + c1x, pos.y + c1y, pos.x + c2x, pos.y + c2y, pos.x + dx, pos.y + dy);
+}
+
+/// Port of `QColor::darker()`'s real default (`factor=200`): scales
+/// the HSV "value" channel by `100/factor` (i.e. halves it), keeping
+/// hue/saturation unchanged -- real HSV-space darkening, not a flat
+/// RGB scale (which would visibly differ for saturated colors).
+fn darker(color: Color) -> Color {
+    let (r, g, b) = (color.red(), color.green(), color.blue());
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let delta = max - min;
+    let v = max;
+    let s = if max > 0.0 { delta / max } else { 0.0 };
+    let h = if delta <= 0.0 {
+        0.0
+    } else if max == r {
+        60.0 * (((g - b) / delta).rem_euclid(6.0))
+    } else if max == g {
+        60.0 * ((b - r) / delta + 2.0)
+    } else {
+        60.0 * ((r - g) / delta + 4.0)
+    };
+    let new_v = (v * 0.5).clamp(0.0, 1.0);
+    let c = new_v * s;
+    let hp = h / 60.0;
+    let x = c * (1.0 - (hp.rem_euclid(2.0) - 1.0).abs());
+    let (r1, g1, b1) = match hp as i32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = new_v - c;
+    Color::from_rgba((r1 + m).clamp(0.0, 1.0), (g1 + m).clamp(0.0, 1.0), (b1 + m).clamp(0.0, 1.0), color.alpha()).unwrap_or(Color::BLACK)
+}
+
+/// The 5 closed paths a real `Banner.__call__` builds: the main
+/// ribbon plus a fold and inner-fold-shading path on each side.
+#[derive(Debug, Clone)]
+pub struct BannerPaths {
+    pub main: tiny_skia::Path,
+    pub left_fold: tiny_skia::Path,
+    pub left_inner: tiny_skia::Path,
+    pub right_fold: tiny_skia::Path,
+    pub right_inner: tiny_skia::Path,
+}
+
+/// Port of `draw_fold` (a real closure in the Python, capturing
+/// `deltax`/`height`/`rwidth` from `Banner.__call__`'s own scope).
+#[allow(clippy::too_many_arguments)]
+fn draw_fold(x: f32, m: f32, corner: Point, rtop: f32, rwidth: f32, deltax: f32, height: f32) -> Option<(tiny_skia::Path, tiny_skia::Path)> {
+    let mut pb = PathBuilder::new();
+    pb.move_to(x, rtop);
+    draw_curved_line(&mut pb, rwidth * m, 0.0, 0.1, 0.1 * m, 0.5, -0.2 * m);
+    let fold_upper = pb.last_point()?;
+    let cur = pb.last_point()?;
+    pb.line_to(cur.x - deltax * m, cur.y + height);
+    let fold_corner = pb.last_point()?;
+    draw_curved_line(&mut pb, -rwidth * m, 0.0, 0.2, -0.1 * m, 0.8, -0.1 * m);
+    draw_curved_line(&mut pb, deltax * m, -height, 0.2, 0.1 * m, 0.8, 0.1 * m);
+    let fold = pb.finish()?;
+
+    let mut inner_pb = PathBuilder::new();
+    inner_pb.move_to(corner.x, corner.y);
+    let dp = (fold_corner.x - corner.x, fold_corner.y - corner.y);
+    draw_curved_line(&mut inner_pb, dp.0, dp.1, 0.5, 0.3 * m, 1.0, 0.0 * m);
+    inner_pb.line_to(fold_upper.x, fold_upper.y);
+    inner_pb.close();
+    let inner_fold = inner_pb.finish()?;
+
+    Some((fold, inner_fold))
+}
+
+/// Port of `Banner.__call__`'s path-construction half (the
+/// `title_block`/`subtitle_block`-derived geometry through to the 5
+/// closed paths, before any painting).
+pub fn build_banner_paths(width: u32, height: u32, margins: &BannerMargins, title_block: &crate::covers_text::Block, subtitle_block: &crate::covers_text::Block) -> Option<BannerPaths> {
+    const GRADE: f32 = 0.07;
+    let (width_f, height_f) = (width as f32, height as f32);
+    let hmargin = margins.hmargin as f32;
+
+    let top = title_block.position().1 + 2.0;
+    // Real Python floor-divides (`//`) an already-integer `line_spacing`
+    // (`QFontMetrics::lineSpacing()` returns `int`); this port's own
+    // `line_spacing` is a real `f32` (see `covers_text`'s own disclosed
+    // no-Qt-"+1"-rounding narrowing), so only the final `//`'s flooring
+    // is replicated here, not a pre-rounded integer input.
+    let extra_spacing = if subtitle_block.line_spacing != 0.0 { (subtitle_block.line_spacing / 2.0).floor() } else { (title_block.line_spacing / 3.0).floor() };
+    let band_height = title_block.height() + subtitle_block.height() + extra_spacing + title_block.leading;
+    let right = (width_f - 1.0) - hmargin; // QRect::right() == x + width - 1
+    let band_width = right - hmargin;
+
+    let mut main_pb = PathBuilder::new();
+    main_pb.move_to(hmargin, top);
+    draw_curved_line(&mut main_pb, width_f - 2.0 * hmargin, 0.0, 0.1, -0.1, 0.9, -0.1);
+    let deltax = GRADE * band_height;
+    main_pb.line_to(right + deltax, top + band_height);
+    let right_corner = main_pb.last_point()?;
+    draw_curved_line(&mut main_pb, -band_width - 2.0 * deltax, 0.0, 0.1, 0.05, 0.9, 0.05);
+    let left_corner = main_pb.last_point()?;
+    main_pb.close();
+    let main = main_pb.finish()?;
+
+    let rwidth = margins.fold_width as f32;
+    let yfrac = 0.1;
+    let width23 = (0.67 * rwidth) as i32 as f32;
+    let rtop = top + band_height * yfrac;
+
+    let (left_fold, left_inner) = draw_fold(hmargin - width23, 1.0, left_corner, rtop, rwidth, deltax, band_height)?;
+    let (right_fold, right_inner) = draw_fold(right + width23, -1.0, right_corner, rtop, rwidth, deltax, band_height)?;
+
+    Some(BannerPaths { main, left_fold, left_inner, right_fold, right_inner })
+}
+
+/// Port of `Banner.__call__`'s painting half: fills + 3px round-join
+/// strokes for the fold/inner-fold/main paths, in upstream's own real
+/// draw order (folds, then inner-fold shading, then the main ribbon on
+/// top).
+pub fn render_banner(pixmap: &mut Pixmap, width: u32, height: u32, colors: &StyleColors, margins: &BannerMargins, title_block: &crate::covers_text::Block, subtitle_block: &crate::covers_text::Block) -> Option<StyleResultColors> {
+    let full = Rect::from_xywh(0.0, 0.0, width as f32, height as f32)?;
+    let paint1 = Paint { shader: tiny_skia::Shader::SolidColor(colors.color1), ..Default::default() };
+    pixmap.fill_rect(full, &paint1, Transform::identity(), None);
+
+    let paths = build_banner_paths(width, height, margins, title_block, subtitle_block)?;
+    let stroke = tiny_skia::Stroke { width: 3.0, line_join: tiny_skia::LineJoin::Round, ..Default::default() };
+    let stroke_paint = Paint { shader: tiny_skia::Shader::SolidColor(colors.ccolor2), ..Default::default() };
+    let fill_paint = Paint { shader: tiny_skia::Shader::SolidColor(colors.color2), ..Default::default() };
+    let inner_fill_paint = Paint { shader: tiny_skia::Shader::SolidColor(darker(colors.color2)), ..Default::default() };
+
+    for fold in [&paths.left_fold, &paths.right_fold] {
+        pixmap.fill_path(fold, &fill_paint, FillRule::Winding, Transform::identity(), None);
+        pixmap.stroke_path(fold, &stroke_paint, &stroke, Transform::identity(), None);
+    }
+    for inner in [&paths.left_inner, &paths.right_inner] {
+        pixmap.fill_path(inner, &inner_fill_paint, FillRule::Winding, Transform::identity(), None);
+        pixmap.stroke_path(inner, &stroke_paint, &stroke, Transform::identity(), None);
+    }
+    pixmap.fill_path(&paths.main, &fill_paint, FillRule::Winding, Transform::identity(), None);
+    pixmap.stroke_path(&paths.main, &stroke_paint, &stroke, Transform::identity(), None);
+
+    Some(StyleResultColors { title: colors.ccolor2, subtitle: colors.ccolor2, footer: colors.ccolor1 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1117,6 +1314,113 @@ mod tests {
         // rounded corner, is still color2 -- the clip only removes the
         // corners, not the whole right edge.
         assert_eq!(px(&pixmap, 199, 80), (0, 0xff, 0));
+    }
+
+    fn real_block(db: &fontdb::Database, text: &str, width: f32, pixel_size: f32) -> crate::covers_text::Block {
+        let font = crate::covers_text::FontFace::query(db, "Liberation Serif", fontdb::Family::Serif).expect("a font must be installed on the test host");
+        let face = font.face();
+        let metrics = crate::covers_text::FontMetrics::new(&face, pixel_size);
+        crate::covers_text::Block::new(text, width, &face, &metrics, 1000.0, crate::covers_text::HAlign::Center)
+    }
+
+    #[test]
+    fn rotate_vector_matches_hand_computed_values() {
+        // 0 radians: identity.
+        let (x, y) = rotate_vector(0.0, 3.0, -5.0);
+        assert!((x - 3.0).abs() < 1e-5 && (y - (-5.0)).abs() < 1e-5);
+        // PI/2: (x,y) -> (-y, x).
+        let (x, y) = rotate_vector(std::f32::consts::FRAC_PI_2, 3.0, -5.0);
+        assert!((x - 5.0).abs() < 1e-4, "x={x}");
+        assert!((y - 3.0).abs() < 1e-4, "y={y}");
+    }
+
+    #[test]
+    fn draw_curved_line_produces_the_exact_hand_computed_control_points() {
+        let mut pb = PathBuilder::new();
+        pb.move_to(0.0, 0.0);
+        // A horizontal (angle=0) segment -- rotate_vector is the
+        // identity at angle 0, so control points are exactly
+        // (c1_frac*length, c1_amp*length) and (c2_frac*length, c2_amp*length).
+        draw_curved_line(&mut pb, 100.0, 0.0, 0.1, -0.1, 0.9, -0.1);
+        let path = pb.finish().unwrap();
+        let segments: Vec<_> = path.segments().collect();
+        assert_eq!(segments.len(), 2); // MoveTo + CubicTo
+        match segments[1] {
+            tiny_skia::PathSegment::CubicTo(c1, c2, end) => {
+                assert!((c1.x - 10.0).abs() < 1e-3 && (c1.y - (-10.0)).abs() < 1e-3, "{c1:?}");
+                assert!((c2.x - 90.0).abs() < 1e-3 && (c2.y - (-10.0)).abs() < 1e-3, "{c2:?}");
+                assert!((end.x - 100.0).abs() < 1e-3 && end.y.abs() < 1e-3, "{end:?}");
+            }
+            other => panic!("expected a CubicTo segment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn darker_halves_the_hsv_value_of_a_pure_color() {
+        let red = Color::from_rgba8(200, 0, 0, 255);
+        let d = darker(red).to_color_u8();
+        // Pure red's HSV value == its red channel; darker(200) halves it.
+        assert_eq!(d.red(), 100);
+        assert_eq!(d.green(), 0);
+        assert_eq!(d.blue(), 0);
+    }
+
+    #[test]
+    fn banner_margins_matches_the_real_ratios() {
+        let m = banner_margins(1200, 1600);
+        assert_eq!(m.hmargin, 180); // 0.15 * 1200
+        assert_eq!(m.fold_width, 120); // 0.1 * 1200
+        assert_eq!(m.vmargin, 100); // base Style ratio: (50/800)*1600
+    }
+
+    #[test]
+    fn build_banner_paths_produces_a_ribbon_spanning_the_full_width() {
+        let db = crate::covers_text::load_system_fonts();
+        let title = real_block(&db, "Title", 800.0, 60.0);
+        let subtitle = crate::covers_text::Block::empty();
+        let margins = banner_margins(1200, 1600);
+        let paths = build_banner_paths(1200, 1600, &margins, &title, &subtitle).expect("real banner geometry");
+
+        // The ribbon's top edge runs straight across at `hmargin..width-hmargin`,
+        // but its bottom edge is horizontally slanted by `deltax = GRADE *
+        // band_height` (the real "folded banner" look: `right_corner` is
+        // shifted right by `deltax`, `left_corner` left by `deltax`), so
+        // the real bounding box is wider than the plain margins by
+        // exactly that amount -- not a fixed small tolerance.
+        let band_height = title.height() + subtitle.height() + (title.line_spacing / 3.0).floor() + title.leading;
+        let deltax = 0.07 * band_height;
+        let bounds = paths.main.bounds();
+        assert!((bounds.left() - (margins.hmargin as f32 - deltax)).abs() < 2.0, "{bounds:?} deltax={deltax}");
+        assert!((bounds.right() - ((1200.0 - margins.hmargin as f32) + deltax)).abs() < 2.0, "{bounds:?} deltax={deltax}");
+
+        // The fold paths sit near the left/right margins, straddling them.
+        let left_bounds = paths.left_fold.bounds();
+        assert!(left_bounds.left() < margins.hmargin as f32);
+        assert!(left_bounds.right() > 0.0);
+        let right_bounds = paths.right_fold.bounds();
+        assert!(right_bounds.right() > (1200.0 - margins.hmargin as f32));
+    }
+
+    #[test]
+    fn render_banner_paints_the_ribbon_over_the_background() {
+        let db = crate::covers_text::load_system_fonts();
+        let title = real_block(&db, "A Banner Title", 800.0, 60.0);
+        let subtitle = crate::covers_text::Block::empty();
+        let margins = banner_margins(1200, 1600);
+        let colors = StyleColors::load(&theme()); // color1=red, color2=green
+        let mut pixmap = Pixmap::new(1200, 1600).unwrap();
+
+        let result = render_banner(&mut pixmap, 1200, 1600, &colors, &margins, &title, &subtitle).expect("real banner render");
+        assert_eq!(result.title.to_color_u8().blue(), 0xff); // ccolor2 = blue
+
+        // Far outside the ribbon (top-left corner): still pure background.
+        assert_eq!(px(&pixmap, 2, 2), (0xff, 0, 0));
+        // Somewhere well inside the ribbon's vertical band and clear of
+        // the fold overlays: real green ribbon fill was painted, not
+        // just the red background.
+        let ribbon_y = title.position().1 as u32 + 5;
+        let (r, g, _) = px(&pixmap, 600, ribbon_y);
+        assert!(g > r, "expected ribbon-green to dominate at (600,{ribbon_y}), got r={r} g={g}");
     }
 }
 
