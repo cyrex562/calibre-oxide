@@ -1982,8 +1982,8 @@ compiled in) -- so there is no Qt resource format to compile for.
 
 #### spell
 
-- [ ] hunspell_wrapper.cpp
-- [ ] __init__.py
+- [x] hunspell_wrapper.cpp (N/A -- a CPython C-extension wrapping the real C++ Hunspell library (`<hunspell.hxx>`). Issue #59 already replaced this whole native dependency with `spellbook` (a pure-Rust, Hunspell-`.dic`/`.aff`-compatible engine, see `crates/calibre_ebooks/src/spell/dictionary.rs`'s own module doc) -- no FFI wrapper is needed or wanted, matching this project's established podofo/lopdf precedent of preferring a pure-Rust equivalent over binding the original C/C++ library. Issue #76 (this file's own tracking issue) closed not-applicable)
+- [x] __init__.py (N/A -- empty package marker, just a license header)
 
 #### tts
 
