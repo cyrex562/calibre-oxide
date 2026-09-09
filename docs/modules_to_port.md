@@ -262,7 +262,7 @@ either -- this pass wasn't exhaustive.
 - [x] BeautifulSoup.py (ported to `beautiful_soup.rs` — preprocess pipeline; html5ever parser wiring is a follow-up)
 - [x] chardet.py (ported to `chardet.rs` — chardetng + encoding_rs)
 - [x] constants.py (already ported to `constants.rs`)
-- [ ] covers.py (partial -- issue #116, split into #595-601 after
+- [x] covers.py (issue #116 CLOSED -- split into #595-601, all CLOSED, after
       research found the "needs Tauri wiring" framing this issue was
       filed under was stale: cover generation is a pure `Metadata +
       theme + style -> PNG bytes` function needing zero GUI/webview
@@ -347,7 +347,27 @@ either -- this pass wasn't exhaustive.
       line render (`render_ornamental`), including a literal, non-
       approximated port of Qt's cosmetic-vs-logical pen width
       distinction via `tiny_skia::Stroke`'s own documented `width:
-      0.0` hairline feature. #601 (entry points + wiring) remains)
+      0.0` hairline feature. #601 (entry points + wiring) shipped, closing
+      out the whole epic: `generate_cover`/`create_cover`/`calibre_cover2`/
+      `message_image`/`generate_masthead` (a new `CoverPrefs` combining
+      every `cprefs.defaults` field, `StyleKind`/`all_styles`/
+      `load_styles`, `scale_cover`). A real, non-obvious `tiny_skia` API
+      gotcha found (not guessed) while wiring `calibre_cover2`'s logo
+      compositing, confirmed via a standalone scratch reproduction before
+      writing any real code: `Pixmap::draw_pixmap`'s own `x`/`y` integer
+      params, combined with a scaling `transform`, silently clip away
+      most/all of the scaled result (the internal clip rect is computed
+      from the source pixmap's *unscaled* size offset by the raw `x`/`y`)
+      -- fixed by always passing `x=0,y=0` and folding all positioning
+      into the transform itself via `chain_transforms`. Every render call
+      produces a real, `Pixmap::decode_png`-verified image end to end for
+      all 5 real `Style`s from real book metadata. Disclosed narrowings:
+      `message_image` center-aligns instead of full-justifying (no
+      justify mode exists in this port's text layout); `override_prefs`'s
+      `override_color_theme`/`override_style` kwargs paths have no real
+      caller in this port's own entry-point graph and were scoped out
+      rather than blindly ported; no PNG `tEXt` metadata chunk (`tiny_skia`'s
+      encoder doesn't expose one))
 - [x] css_transform_rules.py (issue #117 CLOSED -- `css_transform_rules.rs`: a real match-a-CSS-property's-value (exact/negated/regex/numeric-with-unit-conversion), then remove/change/append/arithmetic-transform rules engine over `crate::css::model::StyleDeclarationBlock`. `transform_container` wired directly against the already-real `crate::oeb::polish::css::transform_css`, needing no new container-walking logic at all. Shorthand-property expansion (matching e.g. `margin-top` against a compact `margin: 0`) reuses `crate::oeb::normalize_css::normalize_edge`, covering the same five shorthands `normalize_filter_css` already does; other shorthands (`font`/`background`/`list-style`/non-edge `border`) pass through unexpanded, the same disclosed narrowing `oeb::polish::css::filter_css` already has. Real, non-obvious upstream behavior confirmed by reading the source and locked in with a test: a normalizable shorthand's own compact name (e.g. `property: "margin"`) is NEVER directly matchable by a rule -- real upstream's own declaration iterator yields ONLY the expanded longhand names for a normalizable property, never the raw shorthand. `\N`-style regex backreferences in a `change` action's replacement text are translated from Python `regex.sub` syntax to Rust `regex` syntax. `export_rules`/`import_rules`' real plain-text rule-file format ported and round-trip tested, matching `html_transform_rules.rs`'s (#118) own precedent)
 - [x] html_entities.c (ported to `html_entities.rs` — `html-escape` crate supersedes the C lookup table)
 - [x] html_entities.h (ported — the 5000-line table is now `html-escape`'s embedded WHATWG data)
