@@ -22,18 +22,21 @@
 //! Split into real sub-issues by tractability (least to most graphics
 //! dependency): #595 (color themes + text-formatting tokenizer,
 //! done), #596 (this file's other half -- field-template formatting,
-//! done), #597 (`tiny-skia` canvas + `Half`/`Blocks`/`Cross`), #598
-//! (text layout + rendering bridge), #599 (`Banner`, real curve
+//! done), #597 (`tiny-skia` canvas + `Half`/`Blocks`/`Cross`, done),
+//! #598 (text layout + rendering bridge), #599 (`Banner`, real curve
 //! math), #600 (`Ornamental`, transform stamping), #601 (entry
 //! points/wiring).
 //!
 //! # This file's own scope
 //!
 //! [`ColorTheme`]/[`load_color_themes`]/[`theme_to_colors`]/[`color`]
-//! (port of the `Colors {{{` section) and [`sanitize`]/
+//! (port of the `Colors {{{` section), [`sanitize`]/
 //! [`escape_formatting`]/[`unescape_formatting`]/
 //! [`parse_text_formatting`] (port of the non-Qt-dependent half of the
-//! `Draw text {{{` section). `parse_text_formatting` deliberately
+//! `Draw text {{{` section), the `program:`/default-dialect field-
+//! template formatting (`vformat`/[`format_text`]), and (#597) the
+//! `tiny-skia`-backed [`render_cross`]/[`render_half`]/[`render_blocks`]
+//! `Style` implementations. `parse_text_formatting` deliberately
 //! stops at producing [`FormatRange`] data (tag/start/length) rather
 //! than wrapping it in a `QTextCharFormat`/`QTextLayout::FormatRange`
 //! equivalent -- that belongs to #598's real text-rendering bridge,
@@ -50,6 +53,10 @@ use calibre_utils::cleantext::{clean_ascii_chars, clean_xml_chars};
 use calibre_utils::formatter::interp::{evaluate as gpm_evaluate, RawValue, ValueSource};
 use calibre_utils::formatter::parser::parse as gpm_parse;
 use calibre_utils::formatter::{lexer, PureCatalog, PureFunctions};
+use tiny_skia::{
+    Color, FillRule, GradientStop, LinearGradient, Mask, Paint, PathBuilder, Pixmap, Point, Rect,
+    SpreadMode, Transform,
+};
 
 use crate::metadata::authors::authors_to_string;
 use crate::metadata::meta::MetaInformation;
@@ -609,6 +616,211 @@ pub fn format_text(mi: &MetaInformation, templates: &CoverTemplates, use_roman: 
     )
 }
 
+// ===================================================================
+// Styles (issue #597): `tiny-skia` canvas + the `Half`/`Blocks`/
+// `Cross` `Style` classes.
+// ===================================================================
+//
+// Establishes the real `QImage`->`tiny_skia::Pixmap` canvas/PNG-encode
+// pattern for `covers.py`'s 5 `Style` classes, using the 3 cheapest
+// (no curve math, no transform-stamping, no text) as the proving
+// ground. `Banner` (#599) and `Ornamental` (#600) are separate issues.
+//
+// Every real `Style.__call__(painter, rect, color_theme, title_block,
+// subtitle_block, footer_block)` reads only a handful of scalar fields
+// off `title_block`/`subtitle_block` (`Block` objects `layout_text`,
+// #598, produces) -- never the `Block`s themselves. [`TextBlockGeometry`]
+// carries exactly those fields (only [`render_cross`] needs it; `Half`/
+// `Blocks` ignore their `title_block`/`subtitle_block` params in the
+// real Python too), so this port's function signatures don't need to
+// change once #598 lands -- #598 just computes and passes real values
+// into the same fields.
+
+/// Port of the base `Style.load_colors`: the 4 theme colors, parsed
+/// from [`color`]'s hex strings into real paintable colors.
+#[derive(Debug, Clone, Copy)]
+pub struct StyleColors {
+    pub color1: Color,
+    pub color2: Color,
+    pub ccolor1: Color,
+    pub ccolor2: Color,
+}
+
+impl StyleColors {
+    pub fn load(theme: &ColorTheme) -> Self {
+        StyleColors {
+            color1: hex_to_color(&color(theme, "color1")),
+            color2: hex_to_color(&color(theme, "color2")),
+            ccolor1: hex_to_color(&color(theme, "contrast_color1")),
+            ccolor2: hex_to_color(&color(theme, "contrast_color2")),
+        }
+    }
+}
+
+/// Parses a bare `"rrggbb"` hex string (as produced by [`to_theme`]/
+/// [`color`]) into a `tiny_skia::Color`. Falls back to opaque black on
+/// a malformed string -- every real caller's input ultimately comes
+/// from [`default_color_themes`]/user-supplied hex-quad strings the
+/// same way upstream's own `QColor('#' + val)` would, so a malformed
+/// value here is already a real, pre-existing data problem, not
+/// something this port's color math should mask with `Result`
+/// plumbing no upstream call site has either.
+fn hex_to_color(hex: &str) -> Color {
+    let byte = |i: usize| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok();
+    let (Some(r), Some(g), Some(b)) = (byte(0), byte(2), byte(4)) else {
+        return Color::BLACK;
+    };
+    Color::from_rgba8(r, g, b, 255)
+}
+
+/// Port of the base `Style.calculate_margins`. `Banner` overrides this
+/// (#599); `Cross`/`Half`/`Blocks` all use the shared base behavior.
+#[derive(Debug, Clone, Copy)]
+pub struct Margins {
+    pub hmargin: i32,
+    pub vmargin: i32,
+}
+
+pub fn calculate_margins(cover_width: u32, cover_height: u32) -> Margins {
+    Margins {
+        hmargin: ((50.0 / 600.0) * cover_width as f64) as i32,
+        vmargin: ((50.0 / 800.0) * cover_height as f64) as i32,
+    }
+}
+
+/// The scalar fields real `Cross.__call__` reads off `title_block`/
+/// `subtitle_block` (see this section's module doc).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TextBlockGeometry {
+    pub title_x: f32,
+    pub title_y: f32,
+    pub title_height: f32,
+    pub title_leading: f32,
+    pub subtitle_height: f32,
+    pub subtitle_line_spacing: f32,
+}
+
+/// Port of a real `Style.__call__`'s return tuple: `(title_color,
+/// subtitle_color, footer_color)`.
+#[derive(Debug, Clone, Copy)]
+pub struct StyleResultColors {
+    pub title: Color,
+    pub subtitle: Color,
+    pub footer: Color,
+}
+
+/// Builds a rounded-rectangle path with equal x/y corner radius,
+/// clamped to at most half the smaller side (matching Qt's own
+/// `addRoundedRect` clamping). `tiny-skia-path` has no built-in
+/// rounded-rect helper, so this hand-builds the standard 4-corner
+/// cubic-Bezier circular-arc approximation (the `k = 0.5522847498 * r`
+/// constant used by every vector-graphics rounded-rect implementation,
+/// including Qt's own).
+fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<tiny_skia::Path> {
+    let r = radius.max(0.0).min(w / 2.0).min(h / 2.0);
+    let k = 0.5522847498 * r;
+    let mut pb = PathBuilder::new();
+    pb.move_to(x + r, y);
+    pb.line_to(x + w - r, y);
+    pb.cubic_to(x + w - r + k, y, x + w, y + r - k, x + w, y + r);
+    pb.line_to(x + w, y + h - r);
+    pb.cubic_to(x + w, y + h - r + k, x + w - r + k, y + h, x + w - r, y + h);
+    pb.line_to(x + r, y + h);
+    pb.cubic_to(x + r - k, y + h, x, y + h - r + k, x, y + h - r);
+    pb.line_to(x, y + r);
+    pb.cubic_to(x, y + r - k, x + r - k, y, x + r, y);
+    pb.close();
+    pb.finish()
+}
+
+/// Port of `Half.__call__`: a 3-stop vertical `QLinearGradient` fill.
+pub fn render_half(pixmap: &mut Pixmap, width: f32, height: f32, colors: &StyleColors) -> StyleResultColors {
+    let rect = Rect::from_xywh(0.0, 0.0, width, height).expect("non-degenerate cover rect");
+    let shader = LinearGradient::new(
+        Point::from_xy(0.0, 0.0),
+        Point::from_xy(0.0, height),
+        vec![
+            GradientStop::new(0.0, colors.color1),
+            GradientStop::new(0.7, colors.color2),
+            GradientStop::new(1.0, colors.color1),
+        ],
+        SpreadMode::Pad,
+        Transform::identity(),
+    )
+    .expect("linear gradient with 3 distinct, non-degenerate stops");
+    let paint = Paint { shader, ..Default::default() };
+    pixmap.fill_rect(rect, &paint, Transform::identity(), None);
+    StyleResultColors { title: colors.ccolor1, subtitle: colors.ccolor1, footer: colors.ccolor1 }
+}
+
+/// Port of `Blocks.__call__`: the whole cover in `color1`, with the
+/// bottom third overpainted in `color2`. (Upstream's own body computes
+/// an unused intermediate `QRect` before the first `fillRect` -- dead
+/// code with no observable effect, not reproduced here.)
+pub fn render_blocks(pixmap: &mut Pixmap, width: u32, height: u32, colors: &StyleColors) -> StyleResultColors {
+    let full = Rect::from_xywh(0.0, 0.0, width as f32, height as f32).expect("non-degenerate cover rect");
+    let paint1 = Paint { shader: tiny_skia::Shader::SolidColor(colors.color1), ..Default::default() };
+    pixmap.fill_rect(full, &paint1, Transform::identity(), None);
+
+    let y = height - height / 3;
+    let band = Rect::from_xywh(0.0, y as f32, width as f32, (height - y) as f32).expect("non-degenerate band rect");
+    let paint2 = Paint { shader: tiny_skia::Shader::SolidColor(colors.color2), ..Default::default() };
+    pixmap.fill_rect(band, &paint2, Transform::identity(), None);
+
+    StyleResultColors { title: colors.ccolor1, subtitle: colors.ccolor1, footer: colors.ccolor2 }
+}
+
+/// Port of `Cross.__call__`: the whole cover in `color1`, a rounded-
+/// corner band behind the title/subtitle text in `color2` (`setClipPath`
+/// -> a [`Mask`] filled with the rounded-rect path, matching Qt's own
+/// general clip-to-arbitrary-path mechanism rather than special-casing
+/// "the fill happens to match the clip shape exactly"), and a solid
+/// left-margin bar in `color2`.
+///
+/// Real `QPainterPath.addRoundedRect(rect, 10, 10 * rect.width() /
+/// rect.height(), Qt.SizeMode.RelativeSize)` resolves (worked out from
+/// Qt's own `RelativeSize` semantics: `rx = xRadius/100 * width/2`,
+/// `ry = yRadius/100 * height/2`) to an absolute circular corner radius
+/// of exactly `0.05 * rect.width()` regardless of the band's aspect
+/// ratio -- substituted directly rather than reproducing the
+/// percentage/`RelativeSize` indirection, which has no other real
+/// caller in this port.
+pub fn render_cross(
+    pixmap: &mut Pixmap,
+    width: u32,
+    height: u32,
+    colors: &StyleColors,
+    blocks: &TextBlockGeometry,
+) -> StyleResultColors {
+    let (width_f, height_f) = (width as f32, height as f32);
+    let full = Rect::from_xywh(0.0, 0.0, width_f, height_f).expect("non-degenerate cover rect");
+    let paint1 = Paint { shader: tiny_skia::Shader::SolidColor(colors.color1), ..Default::default() };
+    pixmap.fill_rect(full, &paint1, Transform::identity(), None);
+
+    let band_y = blocks.title_y as i32;
+    let band_h = blocks.title_height + blocks.subtitle_height + blocks.subtitle_line_spacing / 2.0 + blocks.title_leading;
+    let band = Rect::from_xywh(0.0, band_y as f32, width_f, band_h).expect("non-degenerate title band rect");
+
+    let radius = 0.05 * width_f;
+    if let Some(path) = rounded_rect_path(0.0, band_y as f32, width_f, band_h, radius) {
+        if let Some(mut mask) = Mask::new(width, height) {
+            mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
+            let paint2 = Paint { shader: tiny_skia::Shader::SolidColor(colors.color2), ..Default::default() };
+            pixmap.fill_rect(band, &paint2, Transform::identity(), Some(&mask));
+        }
+    }
+
+    let left_w = blocks.title_x as i32;
+    if left_w > 0 {
+        if let Some(left) = Rect::from_xywh(0.0, 0.0, left_w as f32, height_f) {
+            let paint2 = Paint { shader: tiny_skia::Shader::SolidColor(colors.color2), ..Default::default() };
+            pixmap.fill_rect(left, &paint2, Transform::identity(), None);
+        }
+    }
+
+    StyleResultColors { title: colors.ccolor2, subtitle: colors.ccolor2, footer: colors.ccolor1 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -808,4 +1020,103 @@ mod tests {
             _ => panic!("expected a scalar"),
         }
     }
+
+    fn px(pixmap: &Pixmap, x: u32, y: u32) -> (u8, u8, u8) {
+        let c = pixmap.pixel(x, y).unwrap().demultiply();
+        (c.red(), c.green(), c.blue())
+    }
+
+    fn theme() -> ColorTheme {
+        // color1=red, color2=green, ccolor1=blue, ccolor2=white.
+        ColorTheme {
+            color1: "ff0000".to_string(),
+            color2: "00ff00".to_string(),
+            contrast_color1: "0000ff".to_string(),
+            contrast_color2: "ffffff".to_string(),
+        }
+    }
+
+    #[test]
+    fn hex_to_color_parses_a_theme_hex_string() {
+        let c = hex_to_color("e8d9ac");
+        assert_eq!((c.to_color_u8().red(), c.to_color_u8().green(), c.to_color_u8().blue()), (0xe8, 0xd9, 0xac));
+    }
+
+    #[test]
+    fn calculate_margins_matches_the_real_ratio() {
+        let m = calculate_margins(600, 800);
+        assert_eq!((m.hmargin, m.vmargin), (50, 50));
+        let m2 = calculate_margins(1200, 1600);
+        assert_eq!((m2.hmargin, m2.vmargin), (100, 100));
+    }
+
+    #[test]
+    fn render_half_produces_a_top_to_bottom_to_top_gradient() {
+        let colors = StyleColors::load(&theme());
+        let mut pixmap = Pixmap::new(100, 100).unwrap();
+        let result = render_half(&mut pixmap, 100.0, 100.0, &colors);
+        // Real returned colors are all ccolor1 (blue).
+        assert_eq!(result.title.to_color_u8().blue(), 0xff);
+        // Gradient endpoints (0.0 and 1.0 stops) are both color1 (red);
+        // the 0.7 stop is color2 (green). Pixel centers never land
+        // exactly on a stop's fractional position, so these check
+        // "clearly dominated by" rather than an exact color.
+        let (r, g, _) = px(&pixmap, 50, 0);
+        assert!(r > 240 && g < 20, "near top should be mostly color1 (red): got ({r},{g})");
+        let (r, g, _) = px(&pixmap, 50, 99);
+        assert!(r > 240 && g < 20, "near bottom should be mostly color1 (red): got ({r},{g})");
+        let (r, g, _) = px(&pixmap, 50, 70);
+        assert!(g > 240 && r < 20, "near the 0.7 stop should be mostly color2 (green): got ({r},{g})");
+    }
+
+    #[test]
+    fn render_blocks_splits_top_two_thirds_from_bottom_third() {
+        let colors = StyleColors::load(&theme());
+        let mut pixmap = Pixmap::new(90, 90).unwrap();
+        let result = render_blocks(&mut pixmap, 90, 90, &colors);
+        assert_eq!(result.footer.to_color_u8().green(), 0xff); // ccolor2 = white -> green channel opaque too, checked below
+        // y = 90 - 90/3 = 60: rows above are color1 (red), at/after are color2 (green).
+        assert_eq!(px(&pixmap, 45, 59), (0xff, 0, 0));
+        assert_eq!(px(&pixmap, 45, 60), (0, 0xff, 0));
+        assert_eq!(px(&pixmap, 45, 89), (0, 0xff, 0));
+    }
+
+    #[test]
+    fn render_cross_fills_background_left_bar_and_clipped_title_band() {
+        let colors = StyleColors::load(&theme());
+        let mut pixmap = Pixmap::new(200, 200).unwrap();
+        let blocks = TextBlockGeometry {
+            title_x: 40.0,
+            title_y: 50.0,
+            title_height: 60.0,
+            title_leading: 0.0,
+            subtitle_height: 0.0,
+            subtitle_line_spacing: 0.0,
+        };
+        render_cross(&mut pixmap, 200, 200, &colors, &blocks);
+
+        // Outside the title band and left bar: pure background (color1 = red).
+        assert_eq!(px(&pixmap, 150, 10), (0xff, 0, 0));
+        // Left margin bar (x < title_x): color2 (green), full height --
+        // including rows that fall inside the title band's y-range,
+        // since the real Python draws this bar *after* the clipped
+        // band, unconditionally overwriting it there too.
+        assert_eq!(px(&pixmap, 10, 190), (0, 0xff, 0));
+        assert_eq!(px(&pixmap, 10, 55), (0, 0xff, 0));
+        // Center of the title band (right of the left bar), well inside
+        // the rounded rect: color2 (green).
+        assert_eq!(px(&pixmap, 100, 80), (0, 0xff, 0));
+        // The rounded corners of the title band on its *right* side
+        // (unobscured by the left bar) are clipped away by the mask,
+        // leaving background color1 (red) showing through at the
+        // extreme corner pixels -- proving the clip mask actually
+        // clips rather than filling a plain rect.
+        assert_eq!(px(&pixmap, 199, 50), (0xff, 0, 0));
+        assert_eq!(px(&pixmap, 199, 109), (0xff, 0, 0));
+        // A pixel just inside that same right edge, away from the
+        // rounded corner, is still color2 -- the clip only removes the
+        // corners, not the whole right edge.
+        assert_eq!(px(&pixmap, 199, 80), (0, 0xff, 0));
+    }
 }
+
