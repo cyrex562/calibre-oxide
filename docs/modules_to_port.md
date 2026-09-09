@@ -288,10 +288,22 @@ either -- this pass wasn't exhaustive.
       substitution uses), explaining why the real default
       `footer_template` splits/joins on literal `&amp;`, not `&` --
       replicated exactly, not by accident. #597 (`tiny-skia` canvas +
-      simple Styles)/#598 (text layout + rendering, the real hard
-      part)/#599 (`Banner`, curve math)/#600 (`Ornamental`, transform
-      stamping)/#601 (entry points + wiring) remain, in dependency
-      order)
+      `Half`/`Blocks`/`Cross` Styles) shipped: real `Style.__call__`
+      ports using `tiny_skia::{Pixmap,Paint,LinearGradient,Mask}` --
+      `Half`'s 3-stop gradient, `Blocks`'s two-band fill, and `Cross`'s
+      rounded-rect clip mask (hand-built cubic-Bezier rounded-rect
+      path, `tiny-skia-path` has no built-in helper; the real
+      `RelativeSize`-percentage radius math was worked out to an
+      equivalent absolute `0.05 * width` circular radius). Tests assert
+      real pixel colors, including that the clip mask actually removes
+      the rounded corners rather than filling a plain rect. `title_block`/
+      `subtitle_block` (real `Block` objects `layout_text`, #598, will
+      produce) are represented by a `TextBlockGeometry` carrying just
+      the scalar fields `Cross` reads off them, so #598 landing won't
+      change this port's function signatures. #598 (text layout +
+      rendering, the real hard part)/#599 (`Banner`, curve math)/#600
+      (`Ornamental`, transform stamping)/#601 (entry points + wiring)
+      remain, in dependency order)
 - [x] css_transform_rules.py (issue #117 CLOSED -- `css_transform_rules.rs`: a real match-a-CSS-property's-value (exact/negated/regex/numeric-with-unit-conversion), then remove/change/append/arithmetic-transform rules engine over `crate::css::model::StyleDeclarationBlock`. `transform_container` wired directly against the already-real `crate::oeb::polish::css::transform_css`, needing no new container-walking logic at all. Shorthand-property expansion (matching e.g. `margin-top` against a compact `margin: 0`) reuses `crate::oeb::normalize_css::normalize_edge`, covering the same five shorthands `normalize_filter_css` already does; other shorthands (`font`/`background`/`list-style`/non-edge `border`) pass through unexpanded, the same disclosed narrowing `oeb::polish::css::filter_css` already has. Real, non-obvious upstream behavior confirmed by reading the source and locked in with a test: a normalizable shorthand's own compact name (e.g. `property: "margin"`) is NEVER directly matchable by a rule -- real upstream's own declaration iterator yields ONLY the expanded longhand names for a normalizable property, never the raw shorthand. `\N`-style regex backreferences in a `change` action's replacement text are translated from Python `regex.sub` syntax to Rust `regex` syntax. `export_rules`/`import_rules`' real plain-text rule-file format ported and round-trip tested, matching `html_transform_rules.rs`'s (#118) own precedent)
 - [x] html_entities.c (ported to `html_entities.rs` — `html-escape` crate supersedes the C lookup table)
 - [x] html_entities.h (ported — the 5000-line table is now `html-escape`'s embedded WHATWG data)
