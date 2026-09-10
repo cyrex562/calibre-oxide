@@ -285,6 +285,11 @@ pub trait NewsRecipeHooks {
         self.config().masthead_url.clone()
     }
 
+    /// Port of `get_masthead_title`.
+    fn get_masthead_title(&self) -> String {
+        self.config().title.clone()
+    }
+
     /// Port of `get_feeds`. Real Python raises `NotImplementedError`
     /// if `self.feeds` is falsy; `None` is that signal.
     fn get_feeds(&self) -> Option<Vec<(Option<String>, String)>> {
