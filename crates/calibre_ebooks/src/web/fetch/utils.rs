@@ -23,7 +23,7 @@ use std::path::Path;
 
 use crate::oeb::transforms::rescale::fit_image;
 
-fn encode_jpeg(img: &DynamicImage, quality: u8) -> Vec<u8> {
+pub(crate) fn encode_jpeg(img: &DynamicImage, quality: u8) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut cursor = std::io::Cursor::new(&mut buf);
     let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, quality);

@@ -29,6 +29,7 @@
 //!   a single [`feed_rs::model::Content`]. [`Feed::parse_article`]
 //!   uses that single body directly.
 
+pub mod cover;
 pub mod postprocess;
 pub mod recipe;
 pub mod templates;
