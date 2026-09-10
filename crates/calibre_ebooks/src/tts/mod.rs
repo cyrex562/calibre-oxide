@@ -7,25 +7,27 @@
 //! `piper.py`/`piper.cpp` together wrap a full neural TTS pipeline:
 //! eSpeak-ng phonemization, a Piper ONNX neural vocoder, and (in the
 //! GUI) Qt audio playback. None of that infrastructure previously
-//! existed in this workspace. A feasibility spike (3 standalone
+//! existed in this workspace. A feasibility spike (multiple standalone
 //! scratch-project builds, run *before* committing to any approach)
-//! found: `tract-onnx` (pure-Rust ONNX inference) builds cleanly with
-//! no native toolchain; a real FFI eSpeak-ng binding
-//! (`espeak-rs`/`espeak-rs-sys`) has real, non-environmental build bugs
-//! in its own vendored eSpeak-ng snapshot; and
-//! [`espeak-ng`](https://crates.io/crates/espeak-ng) -- a genuine
-//! **pure-Rust port** of eSpeak NG, not an FFI wrapper -- builds
-//! cleanly and produces correct real IPA phonemization out of the box.
-//! Split into #610 (this module: voice config + real phonemization),
-//! #611 (ONNX neural vocoder inference, needs a real `.onnx` voice
-//! model to test against), #612 (streaming synthesis orchestration,
-//! the real `Piper` class). Qt audio playback
-//! (`play_wav_data`/`play_pcm_data`) is out of scope, matching this
-//! project's established GUI-plumbing narrowing -- this port's job
-//! ends at producing real phoneme-ID sequences (and, once #611/#612
-//! land, real PCM audio bytes).
+//! found: a real FFI eSpeak-ng binding (`espeak-rs`/`espeak-rs-sys`)
+//! has real, non-environmental build bugs in its own vendored
+//! eSpeak-ng snapshot; [`espeak-ng`](https://crates.io/crates/espeak-ng)
+//! -- a genuine **pure-Rust port** of eSpeak NG, not an FFI wrapper --
+//! builds cleanly and produces correct real IPA phonemization out of
+//! the box; and `tract-onnx` (pure-Rust ONNX inference, the original
+//! plan for the vocoder) fails real symbolic shape inference on
+//! Piper's actual VITS-style attention graph, so [`vocoder`] uses
+//! [`ort`](https://crates.io/crates/ort) (real ONNX Runtime bindings,
+//! the same choice the existing `piper-rs` crate makes) instead --
+//! see [`vocoder`]'s own module doc for the full story. Split into
+//! #610 (this module's `piper` submodule: voice config + real
+//! phonemization), #611 ([`vocoder`]: ONNX neural vocoder inference),
+//! #612 (streaming synthesis orchestration, the real `Piper` class).
+//! Qt audio playback (`play_wav_data`/`play_pcm_data`) is out of
+//! scope, matching this project's established GUI-plumbing narrowing
+//! -- this port's job ends at producing real PCM audio samples.
 //!
-//! # This module's scope (#610)
+//! # `piper` submodule scope (#610)
 //!
 //! [`VoiceConfig`]/[`translate_voice_config`]/[`load_voice_config`]/
 //! [`create_voice_config`] (port of `piper.py`'s voice-config JSON
@@ -33,7 +35,7 @@
 //! ([`text_to_sentence_ids`]), replicating `piper.cpp`'s own
 //! `start()`'s real algorithm exactly: per-sentence phoneme-ID
 //! sequences, each wrapped `BOS, PAD, <id, PAD>*, EOS`, ready to feed
-//! into the neural vocoder #611 will add.
+//! into [`vocoder::Vocoder`].
 //!
 //! **Disclosed narrowing**: real `piper.cpp` iterates eSpeak-ng's
 //! low-level per-*clause* API (`espeak_TextToPhonemesWithTerminator`),
@@ -58,9 +60,11 @@
 //! upstream.
 
 pub mod piper;
+pub mod vocoder;
 
 pub use piper::{
     create_voice_config, load_voice_config, sentence_phonemes_to_ids, split_clauses,
     text_to_sentence_ids, text_to_sentence_phonemes, translate_voice_config, Clause,
     ClauseTerminator, VoiceConfig,
 };
+pub use vocoder::{to_i16_samples, Vocoder};
