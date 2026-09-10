@@ -114,6 +114,10 @@ pub struct MetaInformation {
     pub cover_id: Option<String>,              // ID in OPF manifest
     pub cover_data: (Option<String>, Vec<u8>), // (Extension, Data)
     pub uuid: Option<String>,
+    /// Port of the `publication_type` attribute `BasicNewsRecipe.create_opf`
+    /// sets (`'periodical:'+type+':'+title`), rendered by
+    /// [`crate::opf_writer::write_opf`] as `<meta name="calibre:publication_type">`.
+    pub publication_type: Option<String>,
 }
 
 impl Default for MetaInformation {
@@ -138,6 +142,7 @@ impl Default for MetaInformation {
             cover_id: None,
             cover_data: (None, Vec::new()),
             uuid: None,
+            publication_type: None,
         }
     }
 }

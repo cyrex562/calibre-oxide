@@ -208,6 +208,7 @@ impl Reader202 {
             None,
             None,
             None,
+            None,
         );
         std::fs::write(output_dir.join("metadata.opf"), opf_xml)?;
 

@@ -322,6 +322,54 @@ pub trait NewsRecipeHooks {
 }
 
 // ===================================================================
+// description_limiter
+// ===================================================================
+
+/// Port of `BasicNewsRecipe.description_limiter`: truncates `src` to
+/// roughly `summary_length` characters, preferring to cut at a nearby
+/// `;` or `>` (within 50 characters past the cutoff) to avoid slicing
+/// through an HTML entity or tag. Used by `templates.rs`'s
+/// `generate_feed`/`generate_touchscreen_feed` (as their injected
+/// `cutoff` closure -- see those functions' own doc for why they take
+/// a closure rather than depending on this trait) and by
+/// `crate::web::feeds::opf`'s `create_opf` port for article summaries.
+pub fn description_limiter(src: &str, summary_length: usize) -> String {
+    if src.is_empty() {
+        return String::new();
+    }
+    let chars: Vec<char> = src.chars().collect();
+    let pos = summary_length as i64;
+    let fuzz = 50i64;
+
+    let find_from = |needle: char, from: i64| -> i64 {
+        if from < 0 || from as usize >= chars.len() {
+            return -1;
+        }
+        chars[from as usize..].iter().position(|&c| c == needle).map(|i| i as i64 + from).unwrap_or(-1)
+    };
+
+    let mut si = find_from(';', pos);
+    if si > 0 && si - pos > fuzz {
+        si = -1;
+    }
+    let mut gi = find_from('>', pos);
+    if gi > 0 && gi - pos > fuzz {
+        gi = -1;
+    }
+    let mut npos = si.max(gi);
+    if npos < 0 {
+        npos = pos;
+    }
+    let end = (npos + 1).clamp(0, chars.len() as i64) as usize;
+    let ans: String = chars[..end].iter().collect();
+    if end < chars.len() {
+        format!("{}\u{2026}", calibre_utils::cleantext::clean_xml_chars(&ans))
+    } else {
+        ans
+    }
+}
+
+// ===================================================================
 // extract_readable_article
 // ===================================================================
 
@@ -398,6 +446,29 @@ mod tests {
     fn short_title_defaults_to_the_config_title() {
         let r = TestRecipe(RecipeConfig { title: "My Paper".to_string(), ..Default::default() });
         assert_eq!(r.short_title(), "My Paper");
+    }
+
+    #[test]
+    fn description_limiter_returns_short_strings_unchanged() {
+        assert_eq!(description_limiter("Hello, world!", 500), "Hello, world!");
+        assert_eq!(description_limiter("", 500), "");
+    }
+
+    #[test]
+    fn description_limiter_truncates_long_strings_with_an_ellipsis() {
+        let src = "a".repeat(600);
+        let out = description_limiter(&src, 500);
+        assert!(out.ends_with('\u{2026}'), "{out}");
+        assert!(out.len() < src.len());
+    }
+
+    #[test]
+    fn description_limiter_prefers_cutting_at_a_nearby_entity_or_tag_boundary() {
+        // A `;` just a few characters past the cutoff should be
+        // preferred over an exact mid-entity cut.
+        let src = format!("{}&amp;{}", "a".repeat(10), "b".repeat(20));
+        let out = description_limiter(&src, 10);
+        assert!(out.starts_with("aaaaaaaaaa&amp;"), "{out}");
     }
 
     #[test]

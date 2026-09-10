@@ -83,6 +83,7 @@ fn empty_accumulator() -> MetaInformation {
         cover_id: None,
         cover_data: (None, Vec::new()),
         uuid: None,
+        publication_type: None,
     }
 }
 

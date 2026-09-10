@@ -1,14 +1,48 @@
 use anyhow::{Context, Result};
 use roxmltree::Document;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TOCNode {
     pub title: String,
     pub src: String,
     pub children: Vec<TOCNode>,
+    /// Port of `TOC.play_order`. `None` means "not explicitly set" --
+    /// [`crate::opf_writer::write_ncx`] falls back to auto-numbering
+    /// in traversal order for these, matching every pre-existing
+    /// caller of this struct that never set it.
+    pub play_order: Option<u32>,
+    /// Port of `TOC.author`/`.description`/`.toc_thumbnail`: rendered
+    /// as `<calibre:meta name="...">` children of the `<navPoint>`
+    /// (real `calibre.ebooks.metadata.toc.TOC.render`'s own
+    /// `CALIBRE_NS` extension elements). Used by periodical TOCs
+    /// (issue #622); no other current caller sets these.
+    pub author: Option<String>,
+    pub description: Option<String>,
+    pub toc_thumbnail: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+impl TOCNode {
+    /// Port of `TOC.add_item`, restricted to the explicit-`play_order`
+    /// form -- every real call site that needs `add_item` on a
+    /// specific node (as opposed to a "top of tree" root) already
+    /// tracks its own play-order counter and passes a real value, the
+    /// same way `BasicNewsRecipe.create_opf`'s own `feed_index`
+    /// closure does.
+    pub fn add_item(&mut self, href: impl Into<String>, title: impl Into<String>, play_order: u32, author: Option<String>, description: Option<String>, toc_thumbnail: Option<String>) -> &mut TOCNode {
+        self.children.push(TOCNode {
+            title: title.into(),
+            src: href.into(),
+            children: Vec::new(),
+            play_order: Some(play_order),
+            author,
+            description,
+            toc_thumbnail,
+        });
+        self.children.last_mut().expect("just pushed")
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct TOC {
     pub nodes: Vec<TOCNode>,
 }
@@ -16,6 +50,21 @@ pub struct TOC {
 impl TOC {
     pub fn new() -> Self {
         Self { nodes: Vec::new() }
+    }
+
+    /// Port of `TOC.add_item` at the tree root. See
+    /// [`TOCNode::add_item`] for the per-node form.
+    pub fn add_item(&mut self, href: impl Into<String>, title: impl Into<String>, play_order: u32, author: Option<String>, description: Option<String>, toc_thumbnail: Option<String>) -> &mut TOCNode {
+        self.nodes.push(TOCNode {
+            title: title.into(),
+            src: href.into(),
+            children: Vec::new(),
+            play_order: Some(play_order),
+            author,
+            description,
+            toc_thumbnail,
+        });
+        self.nodes.last_mut().expect("just pushed")
     }
 
     pub fn parse_ncx(raw: &str) -> Result<Self> {
@@ -81,6 +130,7 @@ fn parse_nav_point(node: roxmltree::Node) -> Option<TOCNode> {
         title,
         src,
         children,
+        ..Default::default()
     })
 }
 
@@ -117,5 +167,21 @@ mod tests {
         assert_eq!(toc.nodes[1].title, "Chapter 2");
 
         Ok(())
+    }
+
+    #[test]
+    fn add_item_builds_a_nested_tree_with_explicit_play_order() {
+        let mut toc = TOC::new();
+        let article = toc.add_item("a.html", "Article", 1, Some("Jane".to_string()), Some("A summary".to_string()), Some("thumb.jpg".to_string()));
+        article.add_item("a.html#s1", "Section One", 2, None, None, None);
+
+        assert_eq!(toc.nodes.len(), 1);
+        assert_eq!(toc.nodes[0].play_order, Some(1));
+        assert_eq!(toc.nodes[0].author.as_deref(), Some("Jane"));
+        assert_eq!(toc.nodes[0].description.as_deref(), Some("A summary"));
+        assert_eq!(toc.nodes[0].toc_thumbnail.as_deref(), Some("thumb.jpg"));
+        assert_eq!(toc.nodes[0].children.len(), 1);
+        assert_eq!(toc.nodes[0].children[0].src, "a.html#s1");
+        assert_eq!(toc.nodes[0].children[0].play_order, Some(2));
     }
 }
