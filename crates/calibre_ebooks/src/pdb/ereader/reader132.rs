@@ -291,6 +291,7 @@ impl Reader132 {
             &["id1".to_string()],
             &[],
             Some("ncx"),
+            None,
             cover_href.as_deref(),
             None,
             None,

@@ -201,6 +201,7 @@ pub fn build_toc(index_entries: Vec<NCXEntry>) -> TOC {
                 title: b.title.clone(),
                 src: b.src.clone(),
                 children: convert(b.children.clone()),
+                ..Default::default()
             });
         }
         nodes

@@ -3056,6 +3056,7 @@ pub fn write_document<R: Read + Seek>(
         &spine_idrefs,
         &guide,
         Some("ncx"),
+        None,
         cover_href.as_deref(),
         None,
         None,

@@ -1130,6 +1130,7 @@ impl MobiReader {
                     title: text.clone(),
                     src: join_href(href, frag),
                     children: Vec::new(),
+                    ..Default::default()
                 })
                 .collect();
             return toc;
@@ -1160,6 +1161,7 @@ impl MobiReader {
                 title: text.clone(),
                 src: join_href(href, frag),
                 children: Vec::new(),
+                ..Default::default()
             });
             let mut new_path = parent_path;
             new_path.push(siblings.len() - 1);
@@ -1285,6 +1287,7 @@ impl MobiReader {
             &spine,
             &guide_refs,
             ncx_manifest_id,
+            None,
             cover_href.as_deref(),
             None,
             None,

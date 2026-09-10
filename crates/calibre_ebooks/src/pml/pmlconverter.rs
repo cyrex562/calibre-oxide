@@ -977,6 +977,7 @@ impl PmlHtmlizer {
                 title: text.to_string(),
                 src: join_href(href, id),
                 children: Vec::new(),
+                ..Default::default()
             });
             let mut new_path = path.to_vec();
             new_path.push(siblings.len() - 1);

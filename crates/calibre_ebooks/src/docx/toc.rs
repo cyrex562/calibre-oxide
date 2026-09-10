@@ -146,6 +146,7 @@ impl Toc {
                         title: node.text.clone().unwrap_or_default(),
                         src,
                         children: convert(toc, child_id),
+                        ..Default::default()
                     }
                 })
                 .collect()

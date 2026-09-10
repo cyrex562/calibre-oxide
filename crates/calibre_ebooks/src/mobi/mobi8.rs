@@ -945,6 +945,7 @@ impl Mobi8Reader {
             &guide,
             ncx_manifest_id,
             None,
+            None,
             ppd.as_deref(),
             pwm.as_deref(),
         );
@@ -1029,6 +1030,7 @@ impl Mobi8Reader {
                 title: text,
                 src: join_href(&href, &frag),
                 children: Vec::new(),
+                ..Default::default()
             };
             match current_depth {
                 None => {

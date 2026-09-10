@@ -82,6 +82,12 @@ pub fn write_opf(
     spine_idrefs: &[String],
     guide: &[GuideRef],
     ncx_manifest_id: Option<&str>,
+    // Href of the NCX manifest entry `write_opf` adds itself when
+    // `ncx_manifest_id` is set. `None` keeps every pre-existing
+    // caller's own convention (`toc.ncx`); periodicals (issue #622)
+    // need `index.ncx` instead, matching real `create_opf`'s own
+    // hardcoded filename.
+    ncx_href: Option<&str>,
     cover_href: Option<&str>,
     page_progression_direction: Option<&str>,
     primary_writing_mode: Option<&str>,
@@ -170,6 +176,18 @@ pub fn write_opf(
             xml_escape(href)
         ));
     }
+    if let Some(author_sort) = &mi.author_sort {
+        out.push_str(&format!(
+            "    <meta name=\"calibre:author_sort\" content=\"{}\"/>\n",
+            xml_escape(author_sort)
+        ));
+    }
+    if let Some(publication_type) = &mi.publication_type {
+        out.push_str(&format!(
+            "    <meta name=\"calibre:publication_type\" content=\"{}\"/>\n",
+            xml_escape(publication_type)
+        ));
+    }
     out.push_str("  </metadata>\n");
 
     out.push_str("  <manifest>\n");
@@ -183,8 +201,9 @@ pub fn write_opf(
     }
     if let Some(id) = ncx_manifest_id {
         out.push_str(&format!(
-            "    <item id=\"{}\" href=\"toc.ncx\" media-type=\"application/x-dtbncx+xml\"/>\n",
-            xml_escape(id)
+            "    <item id=\"{}\" href=\"{}\" media-type=\"application/x-dtbncx+xml\"/>\n",
+            xml_escape(id),
+            xml_escape(ncx_href.unwrap_or("toc.ncx"))
         ));
     }
     out.push_str("  </manifest>\n");
@@ -218,12 +237,17 @@ pub fn write_opf(
     out
 }
 
-/// Renders `toc` as an NCX 2005-1 document (`toc.ncx`).
+/// Renders `toc` as an NCX 2005-1 document (`toc.ncx`). Port of
+/// `calibre.ebooks.metadata.toc.TOC.render`. Each node's own
+/// `play_order` is used verbatim when set (real Python always sets it
+/// via `add_item`); nodes that leave it unset (`None`) fall back to
+/// auto-numbering in traversal order, matching every pre-existing
+/// caller of this function that never set it.
 pub fn write_ncx(toc: &TOC, uid: &str, doc_title: &str) -> String {
     let mut out = String::new();
     out.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
     out.push_str("<!DOCTYPE ncx PUBLIC \"-//NISO//DTD ncx 2005-1//EN\" \"http://www.daisy.org/z3986/2005/ncx-2005-1.dtd\">\n");
-    out.push_str("<ncx xmlns=\"http://www.daisy.org/z3986/2005/ncx/\" version=\"2005-1\">\n");
+    out.push_str("<ncx xmlns=\"http://www.daisy.org/z3986/2005/ncx/\" xmlns:calibre=\"http://calibre.kovidgoyal.net/2009/metadata\" version=\"2005-1\">\n");
     out.push_str("  <head>\n");
     out.push_str(&format!(
         "    <meta name=\"dtb:uid\" content=\"{}\"/>\n",
@@ -238,24 +262,29 @@ pub fn write_ncx(toc: &TOC, uid: &str, doc_title: &str) -> String {
         xml_escape(doc_title)
     ));
     out.push_str("  <navMap>\n");
-    let mut play_order = 1;
+    let mut id_counter = 0u32;
+    let mut auto_play_order = 0u32;
     for node in &toc.nodes {
-        write_nav_point(&mut out, node, &mut play_order, 2);
+        write_nav_point(&mut out, node, &mut id_counter, &mut auto_play_order, 2);
     }
     out.push_str("  </navMap>\n");
     out.push_str("</ncx>\n");
     out
 }
 
-fn write_nav_point(out: &mut String, node: &TOCNode, play_order: &mut usize, indent: usize) {
+fn write_nav_point(out: &mut String, node: &TOCNode, id_counter: &mut u32, auto_play_order: &mut u32, indent: usize) {
     let pad = "  ".repeat(indent);
-    let id = format!("np{}", *play_order);
+    *id_counter += 1;
+    let id = format!("num_{id_counter}");
+    let play_order = node.play_order.unwrap_or_else(|| {
+        *auto_play_order += 1;
+        *auto_play_order
+    });
     out.push_str(&format!(
         "{pad}<navPoint id=\"{}\" playOrder=\"{}\">\n",
         xml_escape(&id),
         play_order
     ));
-    *play_order += 1;
     out.push_str(&format!(
         "{pad}  <navLabel><text>{}</text></navLabel>\n",
         xml_escape(&node.title)
@@ -264,8 +293,17 @@ fn write_nav_point(out: &mut String, node: &TOCNode, play_order: &mut usize, ind
         "{pad}  <content src=\"{}\"/>\n",
         xml_escape(&node.src)
     ));
+    if let Some(author) = &node.author {
+        out.push_str(&format!("{pad}  <calibre:meta name=\"author\">{}</calibre:meta>\n", xml_escape(author)));
+    }
+    if let Some(description) = &node.description {
+        out.push_str(&format!("{pad}  <calibre:meta name=\"description\">{}</calibre:meta>\n", xml_escape(description)));
+    }
+    if let Some(toc_thumbnail) = &node.toc_thumbnail {
+        out.push_str(&format!("{pad}  <calibre:meta name=\"toc_thumbnail\">{}</calibre:meta>\n", xml_escape(toc_thumbnail)));
+    }
     for child in &node.children {
-        write_nav_point(out, child, play_order, indent + 1);
+        write_nav_point(out, child, id_counter, auto_play_order, indent + 1);
     }
     out.push_str(&format!("{pad}</navPoint>\n"));
 }
@@ -343,6 +381,7 @@ mod tests {
             &["id1".to_string()],
             &guide,
             Some("ncx"),
+            None,
             Some("images/00001.jpg"),
             Some("ltr"),
             None,
@@ -362,7 +401,7 @@ mod tests {
     #[test]
     fn test_write_opf_escapes_special_characters() {
         let mi = MetaInformation::new("A & B <Title>", vec!["Author \"Q\"".to_string()]);
-        let xml = write_opf(&mi, &[], &[], &[], None, None, None, None);
+        let xml = write_opf(&mi, &[], &[], &[], None, None, None, None, None);
         assert!(xml.contains("A &amp; B &lt;Title&gt;"), "{xml}");
         assert!(!xml.contains("<Title>"), "{xml}");
     }
@@ -376,8 +415,9 @@ mod tests {
                 children: vec![TOCNode {
                     title: "Section 1.1".to_string(),
                     src: "text/part0001.html#s1".to_string(),
-                    children: Vec::new(),
+                    ..Default::default()
                 }],
+                ..Default::default()
             }],
         };
         let ncx = write_ncx(&toc, "urn:uuid:1234", "My Book");
@@ -396,6 +436,39 @@ mod tests {
             child_pos < parent_close,
             "child navPoint should nest inside parent"
         );
+    }
+
+    #[test]
+    fn test_write_ncx_uses_explicit_play_order_and_calibre_meta_extensions() {
+        let mut toc = TOC::new();
+        toc.add_item("feed_0/article_0/index.html", "An Article", 5, Some("Jane Doe".to_string()), Some("A summary".to_string()), Some("thumb.jpg".to_string()));
+        let ncx = write_ncx(&toc, "urn:uuid:periodical", "My Weekly");
+
+        assert!(ncx.contains("playOrder=\"5\""), "{ncx}");
+        assert!(ncx.contains("xmlns:calibre=\"http://calibre.kovidgoyal.net/2009/metadata\""), "{ncx}");
+        assert!(ncx.contains("<calibre:meta name=\"author\">Jane Doe</calibre:meta>"), "{ncx}");
+        assert!(ncx.contains("<calibre:meta name=\"description\">A summary</calibre:meta>"), "{ncx}");
+        assert!(ncx.contains("<calibre:meta name=\"toc_thumbnail\">thumb.jpg</calibre:meta>"), "{ncx}");
+    }
+
+    #[test]
+    fn test_write_ncx_auto_numbers_play_order_when_unset() {
+        // Every pre-existing caller never sets `play_order` -- confirm
+        // the fallback still auto-numbers sequentially in traversal
+        // order, matching this function's behavior before #622.
+        let toc = TOC { nodes: vec![TOCNode { title: "One".to_string(), src: "a.html".to_string(), ..Default::default() }, TOCNode { title: "Two".to_string(), src: "b.html".to_string(), ..Default::default() }] };
+        let ncx = write_ncx(&toc, "urn:uuid:1234", "Book");
+        assert!(ncx.contains("playOrder=\"1\""), "{ncx}");
+        assert!(ncx.contains("playOrder=\"2\""), "{ncx}");
+        assert!(!ncx.contains("calibre:meta"), "no author/description/toc_thumbnail set, so no extension elements should appear");
+    }
+
+    #[test]
+    fn test_write_opf_uses_a_custom_ncx_href_when_given() {
+        let mi = MetaInformation::new("Title", vec!["Author".to_string()]);
+        let xml = write_opf(&mi, &[], &[], &[], Some("ncx"), Some("index.ncx"), None, None, None);
+        assert!(xml.contains("href=\"index.ncx\""), "{xml}");
+        assert!(!xml.contains("toc.ncx"), "{xml}");
     }
 
     #[test]

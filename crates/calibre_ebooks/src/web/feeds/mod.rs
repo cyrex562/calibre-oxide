@@ -30,6 +30,7 @@
 //!   uses that single body directly.
 
 pub mod cover;
+pub mod opf;
 pub mod postprocess;
 pub mod recipe;
 pub mod templates;
@@ -63,8 +64,26 @@ pub struct Article {
     /// every real comparison in this module already worked in UTC).
     pub date: DateTime<Utc>,
     pub toc_thumbnail: Option<String>,
-    pub internal_toc_entries: Vec<String>,
+    pub internal_toc_entries: Vec<InternalTocEntry>,
     pub downloaded: bool,
+    /// Port of `article.orig_url`, set by real `article_downloaded`
+    /// (`self.url` before it's overwritten with the local
+    /// `article_N/index.html` path) -- populated once real fetch
+    /// orchestration (#623) lands. `None` before then.
+    pub orig_url: Option<String>,
+    /// Port of `article.sub_pages` (`result[1][1:]`), the extra pages
+    /// beyond the first that a multi-page article was split across --
+    /// same real-orchestration-only caveat as [`Article::orig_url`].
+    pub sub_pages: Vec<String>,
+}
+
+/// Port of one entry in `article.internal_toc_entries` (a real Python
+/// dict with `anchor`/`title` keys, used by `create_opf` -- issue
+/// #622 -- to add sub-article TOC entries for in-page headings).
+#[derive(Debug, Clone, Default)]
+pub struct InternalTocEntry {
+    pub anchor: Option<String>,
+    pub title: Option<String>,
 }
 
 impl Article {
@@ -100,6 +119,8 @@ impl Article {
             toc_thumbnail: None,
             internal_toc_entries: Vec::new(),
             downloaded: false,
+            orig_url: None,
+            sub_pages: Vec::new(),
         }
     }
 
