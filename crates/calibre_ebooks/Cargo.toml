@@ -53,6 +53,7 @@ tiny-skia = "0.12"
 fontdb = "0.24"
 ttf-parser = "0.25"
 svgtypes = "0.16"
+espeak-ng = { version = "0.2", default-features = false, features = ["bundled-data-en"] }
 spellbook = "0.4"
 
 [dev-dependencies]

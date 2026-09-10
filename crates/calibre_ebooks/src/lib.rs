@@ -42,6 +42,7 @@ pub mod scraper;
 pub mod snb;
 pub mod spell;
 pub mod textile;
+pub mod tts;
 pub mod txt;
 pub mod unihandecode;
 pub mod web;

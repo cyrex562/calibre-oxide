@@ -1987,9 +1987,9 @@ compiled in) -- so there is no Qt resource format to compile for.
 
 #### tts
 
-- [ ] piper.cpp
-- [ ] piper.py
-- [ ] __init__.py
+- [x] piper.cpp (no separate port -- it's the native binding glue for `piper.py`'s own logic; its real phonemization/ID-building algorithm is ported directly into `crate::tts::piper` as part of #610, see `piper.py`'s own entry below)
+- [ ] piper.py (partial -- issue #77, split into #610 (voice config + real phonemization, CLOSED) / #611 (ONNX neural vocoder inference) / #612 (streaming synthesis orchestration) after a feasibility spike found the "2 files" framing understated the real scope: a full neural TTS pipeline (eSpeak phonemization + Piper ONNX vocoder + Qt audio playback), none of which previously existed in this workspace. `tract-onnx` (pure-Rust ONNX inference) and `espeak-ng` (a genuine pure-Rust port of eSpeak NG, not an FFI wrapper -- found after a real FFI alternative, `espeak-rs`, hit build bugs in its own vendored eSpeak-ng snapshot) are the real, verified dependencies. #610 shipped as `crates/calibre_ebooks/src/tts/`: `VoiceConfig`/`translate_voice_config`/`load_voice_config`/`create_voice_config` (real Piper voice-config JSON parsing -- more robust than real Python, which would raise `AttributeError` on a missing `"inference"` object) plus real phonemization + phoneme-to-ID-sequence building (`text_to_sentence_ids`) replicating `piper.cpp`'s exact `BOS,PAD,<id,PAD>*,EOS` algorithm. Disclosed narrowing: this port splits clauses itself (a direct, real punctuation-based split) and phonemizes each separately, re-inserting the same literal terminator characters `piper.cpp` does, rather than relying on eSpeak-ng's own low-level per-clause API (unavailable in the pure-Rust crate) or its simplified `read_clauses` approximation (confirmed via the crate's own doc comments not to match the real upstream `ReadClause()` algorithm). Qt audio playback is out of scope, matching this project's established GUI-plumbing narrowing. #611/#612 remain, in dependency order)
+- [x] __init__.py (N/A -- empty package marker)
 
 #### windows
 
