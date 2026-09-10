@@ -1993,20 +1993,20 @@ compiled in) -- so there is no Qt resource format to compile for.
 
 #### windows
 
-- [ ] common.h
-- [ ] wintest.py
-- [ ] wintoast.cpp
-- [ ] wintoastlib.cpp
-- [ ] wintoastlib.h
-- [ ] winutil.cpp
-- [ ] __init__.py
+- [x] common.h (deferred, issue #78 CLOSED not-yet-portable -- real native Win32 API surface (WinToast notifications + `winutil.cpp`'s registry/shell/junction/elevated-process bindings) this Linux-only dev environment can neither compile-check nor test; matches the already-established, already-referenced precedent at `crate::open_with`/`crate::copy_files`/`crate::lock`'s own module docs, which cite #78 by name as one of the deferred native-platform-integration issues "left for whoever can actually run and verify it on the target OS")
+- [x] wintest.py (deferred, same as #78 above -- a Windows-only manual test script for the native module)
+- [x] wintoast.cpp (deferred, same as #78 above -- also a vendored, non-calibre-authored 3rd-party toast-notification library with no calibre-specific logic)
+- [x] wintoastlib.cpp (deferred, same as #78 above)
+- [x] wintoastlib.h (deferred, same as #78 above)
+- [x] winutil.cpp (deferred, same as #78 above -- the real Win32 API-wrapping module `crate::open_with`/`crate::copy_files`/`crate::lock` already each disclose a `winutil`-shaped gap for)
+- [x] __init__.py (N/A -- empty package marker)
 
 #### winreg
 
-- [ ] dde.py
-- [ ] default_programs.py
-- [ ] lib.py
-- [ ] __init__.py
+- [x] dde.py (deferred, issue #79 CLOSED not-yet-portable -- Windows Registry (`HKEY_CLASSES_ROOT`/DDE) integration for shell "Open With" association, same class of native-platform-only code as #78, already referenced by name at `crate::open_with::mod`'s own module doc)
+- [x] default_programs.py (deferred, same as #79 above)
+- [x] lib.py (deferred, same as #79 above -- a thin `winreg` stdlib wrapper)
+- [x] __init__.py (N/A -- empty package marker)
 
 #### wmf
 
