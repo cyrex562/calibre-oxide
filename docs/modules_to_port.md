@@ -2020,9 +2020,9 @@ compiled in) -- so there is no Qt resource format to compile for.
 
 #### feeds
 
-- [ ] news.py
-- [ ] templates.py
-- [ ] __init__.py
+- [ ] news.py (partial -- issue #81 CLOSED, split into #617 (this file's `Feed`/`Article` prerequisite, CLOSED) / #618 (templates.py) / #619 (config+hooks+readability) / #620 (HTML cleanup) / #621 (cover/masthead glue) / #622 (create_opf) / #623 (fetch+concurrency orchestration, blocked by #455). See `__init__.py`'s own entry for #617's real findings)
+- [ ] templates.py (see #618, split from #81 -- not started)
+- [x] __init__.py (issue #617 CLOSED -- `crates/calibre_ebooks/src/web/feeds/mod.rs`: real `Article`/`Feed`/`FeedCollection` + `feed_from_xml`/`feeds_from_index`, using [`feed-rs`](https://crates.io/crates/feed-rs) in place of upstream's vendored `feedparser` (an external runtime dependency never tracked in this porting corpus to begin with). `feed-rs` already resolves entry ids and parses every date field for real, eliminating real Python's own `dateutil`-reparse fallback chain entirely (not a narrowing -- `feed-rs` already does that work). Disclosed narrowing: `Article`'s `formatted_date`/display timestamp is UTC-only (no `local_tz` equivalent exists yet anywhere in `calibre_utils::date`); every real comparison/dedup already worked in UTC regardless. `FeedCollection::restore_duplicates` re-derives a duplicate's original position via `is_same_as` equality rather than real Python's object-identity `find_article` (Rust's `Vec::remove` invalidates raw pointers the way Python's GC-managed references don't need to worry about) -- same real observable result)
 
 ##### recipes
 
