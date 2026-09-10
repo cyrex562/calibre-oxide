@@ -22,10 +22,11 @@
 //! see [`vocoder`]'s own module doc for the full story. Split into
 //! #610 (this module's `piper` submodule: voice config + real
 //! phonemization), #611 ([`vocoder`]: ONNX neural vocoder inference),
-//! #612 (streaming synthesis orchestration, the real `Piper` class).
-//! Qt audio playback (`play_wav_data`/`play_pcm_data`) is out of
-//! scope, matching this project's established GUI-plumbing narrowing
-//! -- this port's job ends at producing real PCM audio samples.
+//! #612 ([`stream`]: streaming synthesis orchestration, the real
+//! `Piper` class). All three are done -- #77 is fully ported. Qt audio
+//! playback (`play_wav_data`/`play_pcm_data`) is out of scope, matching
+//! this project's established GUI-plumbing narrowing -- this port's
+//! job ends at producing real PCM audio samples.
 //!
 //! # `piper` submodule scope (#610)
 //!
@@ -60,6 +61,7 @@
 //! upstream.
 
 pub mod piper;
+pub mod stream;
 pub mod vocoder;
 
 pub use piper::{
@@ -67,4 +69,5 @@ pub use piper::{
     text_to_sentence_ids, text_to_sentence_phonemes, translate_voice_config, Clause,
     ClauseTerminator, VoiceConfig,
 };
+pub use stream::{PcmSamples, Piper, PiperEvent, SynthesisResult};
 pub use vocoder::{to_i16_samples, Vocoder};
