@@ -259,7 +259,7 @@ either -- this pass wasn't exhaustive.
 ### ebooks
 
 - [x] __init__.py
-- [x] BeautifulSoup.py (ported to `beautiful_soup.rs` — preprocess pipeline; html5ever parser wiring is a follow-up)
+- [x] BeautifulSoup.py (issue #121 CLOSED, resolved by existing infrastructure -- `beautiful_soup.rs` stays narrow (its own module doc: preprocessing only, deliberately not a tree). The "html5ever + tree navigation" gap #121 described is already filled crate-wide by `crate::dom::Dom` (`dom.rs`'s own doc: "Real parsing is delegated to `html5ever`"), adopted as the general replacement for BeautifulSoup tree operations across this whole crate (used directly by #619-#622, #630-#633, and dozens of other already-shipped ports -- none of them route through `beautiful_soup.rs` for tree work). Confirmed via grep: `beautiful_soup.rs`'s only two real callers (`mobi/headers.rs`, `mobi/mobi6.rs`) use only `clean_xml_chars` (plain string cleaning), never tree navigation -- no real caller anywhere in the crate has ever needed `beautiful_soup.rs` itself to return a tree)
 - [x] chardet.py (ported to `chardet.rs` — chardetng + encoding_rs)
 - [x] constants.py (already ported to `constants.rs`)
 - [x] covers.py (issue #116 CLOSED -- split into #595-601, all CLOSED, after
