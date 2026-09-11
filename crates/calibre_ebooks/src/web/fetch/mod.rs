@@ -6,8 +6,11 @@
 //! crawler: link rewriting, image downloading, HTML rewriting, depth
 //! limits) was large enough to need its own scoping/splitting pass
 //! (docs/AGENT_PORTING_GUIDE.md §5a, issue #455 epic -> #630-#633).
-//! [`simple`] covers #630 (the fetch primitive + link filtering); the
-//! rest of the crawler isn't here yet -- see [`simple`]'s own doc.
+//! [`simple`] covers #630 (the fetch primitive + link filtering);
+//! [`get_soup`] covers #631 (HTML preprocessing + tag-selector
+//! matching); the rest of the crawler isn't here yet -- see each
+//! module's own doc.
 
+pub mod get_soup;
 pub mod simple;
 pub mod utils;
