@@ -11,12 +11,19 @@
 //! recipe authors override, as a trait with real default
 //! implementations). Tag-selector fields (`remove_tags`/
 //! `keep_only_tags`/`remove_tags_after`/`remove_tags_before`) use a
-//! minimal, real [`TagSpec`] shape matching the literal
-//! `dict(name=..., attrs={...})`/`dict(id=[...])` syntax every real
-//! recipe in this codebase's own corpus uses -- full BeautifulSoup-
-//! style predicate matching (regex classes, callables) is issue
-//! #620's job (the HTML cleanup pipeline that actually consumes these
-//! fields), not this one's.
+//! real [`TagSpec`] shape -- widened by issue #631 (after grepping
+//! every real `.recipe` file's actual `dict(...)` shapes, not just
+//! guessing) to cover `name` as one-or-many tag names, `attrs` as
+//! either an explicit `attrs={...}` dict or any other top-level
+//! keyword BeautifulSoup folds into an implicit attribute filter
+//! (`id=`, `class_=`, `src=`, etc.), and `text=`. Full BeautifulSoup-
+//! style predicate matching (`re.compile(...)`-valued or
+//! lambda-valued attrs) is **not** supported -- a deliberate, disclosed
+//! scope boundary (see #631's own doc in `web/fetch/get_soup.rs`,
+//! which actually consumes this shape): those are real but rare (a
+//! few dozen of ~1400 real `attrs=` uses), and representing arbitrary
+//! Python predicates in a static Rust data shape isn't worth the
+//! complexity for this port's own recipe-authoring needs.
 //!
 //! [`extract_readable_article`] wires the real, already-ported
 //! `readability::Document` (see that module's own doc: "The only
@@ -70,6 +77,13 @@ pub enum BrowserType {
 
 /// A single attribute-value matcher in a [`TagSpec`] (real Python:
 /// `dict(attrs={'class': 'advert'})` / `dict(id=['content', 'heading'])`).
+/// Matching semantics (real BeautifulSoup's own `_matches`, ported in
+/// `web/fetch/get_soup.rs`): `Str` matches an attribute whose value
+/// equals it exactly (or, for the `class` attribute specifically,
+/// whose whitespace-split class-token list contains it); `List`
+/// matches if *any* entry in the list would itself match per those
+/// same rules -- one real recipe corpus grep found real uses of both
+/// forms for `class`/`id`/`itemprop`/etc.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TagAttrValue {
     Str(String),
@@ -78,12 +92,27 @@ pub enum TagAttrValue {
 
 /// Port of a `remove_tags`/`keep_only_tags`/`remove_tags_after`/
 /// `remove_tags_before` entry's real `dict(name=..., attrs={...})`
-/// shape (see this module's own doc for the disclosed scope: matching
-/// logic itself belongs to #620).
+/// shape. Matching logic lives in `web/fetch/get_soup.rs` (issue
+/// #631), the actual consumer of this data.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TagSpec {
-    pub name: Option<String>,
+    /// `None` matches any tag name (BeautifulSoup's own `find(name=None)`
+    /// default). `Some(names)` requires the tag's name to equal one of
+    /// them -- real recipes commonly pass `name=['h1', 'h2']`, not
+    /// just a single string.
+    pub name: Option<Vec<String>>,
+    /// Both an explicit `attrs={...}` dict's entries AND any other
+    /// top-level keyword real `dict(...)` calls accept get folded in
+    /// here -- BeautifulSoup treats every keyword besides `name`/
+    /// `attrs`/`recursive`/`text`/`limit` as an implicit attribute
+    /// filter, with `class_` (working around `class` being a Python
+    /// keyword) already renamed to the real attribute name `class` by
+    /// whoever builds this `TagSpec`.
     pub attrs: HashMap<String, TagAttrValue>,
+    /// Port of BeautifulSoup's `text=` keyword: match by the tag's
+    /// own direct text content. Rare in the real corpus (a couple of
+    /// uses) but real.
+    pub text: Option<String>,
 }
 
 /// Port of `BasicNewsRecipe.cover_margins`.
@@ -136,8 +165,11 @@ pub struct RecipeConfig {
     pub match_regexps: Vec<String>,
     pub filter_regexps: Vec<String>,
     pub remove_tags: Vec<TagSpec>,
-    pub remove_tags_after: Option<TagSpec>,
-    pub remove_tags_before: Option<TagSpec>,
+    /// Real Python: `self.remove_tags_after`/`_before` can be a single
+    /// `dict` *or* a list of them (`[self.X] if isinstance(self.X,
+    /// dict) else self.X`) -- an empty `Vec` here is Python's `None`.
+    pub remove_tags_after: Vec<TagSpec>,
+    pub remove_tags_before: Vec<TagSpec>,
     pub remove_attributes: Vec<String>,
     pub keep_only_tags: Vec<TagSpec>,
     /// `(pattern, replacement)` pairs -- real Python's second element
@@ -195,8 +227,8 @@ impl Default for RecipeConfig {
             match_regexps: Vec::new(),
             filter_regexps: Vec::new(),
             remove_tags: Vec::new(),
-            remove_tags_after: None,
-            remove_tags_before: None,
+            remove_tags_after: Vec::new(),
+            remove_tags_before: Vec::new(),
             remove_attributes: Vec::new(),
             keep_only_tags: Vec::new(),
             preprocess_regexps: Vec::new(),
