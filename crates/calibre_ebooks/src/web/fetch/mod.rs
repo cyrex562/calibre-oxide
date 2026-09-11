@@ -9,10 +9,12 @@
 //! [`simple`] covers #630 (the fetch primitive + link filtering);
 //! [`get_soup`] covers #631 (HTML preprocessing + tag-selector
 //! matching); [`media`] covers #632 (image/stylesheet download +
-//! rewrite); the recursive crawl engine itself (#633) isn't here yet
-//! -- see each module's own doc.
+//! rewrite); [`recursive`] covers #633 (the recursive crawl engine
+//! itself, the final piece of the #455 epic) -- see each module's own
+//! doc.
 
 pub mod get_soup;
 pub mod media;
+pub mod recursive;
 pub mod simple;
 pub mod utils;
