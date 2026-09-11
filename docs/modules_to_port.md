@@ -2026,9 +2026,31 @@ compiled in) -- so there is no Qt resource format to compile for.
 
 ##### recipes
 
-- [ ] collection.py
-- [ ] model.py
-- [ ] __init__.py
+N/A, entire subfolder (issue #82, closed not-applicable). All three files
+exist solely to let calibre's desktop GUI dynamically compile, schedule,
+and manage arbitrary user-supplied `.recipe` Python scripts:
+
+- `__init__.py`'s `compile_recipe` literally `exec()`s recipe source text
+  into a live Python class at runtime -- a Python-execution-environment
+  feature with no meaningful Rust equivalent short of embedding a Python
+  interpreter (out of scope for a source port, not attempted anywhere
+  else in this project).
+- `collection.py`'s `SchedulerConfig`/custom-recipe file management
+  (add/update/remove/get) and `get_builtin_recipe_by_id`/`_by_title`
+  (recipe *retrieval*) only have real callers in `gui2/dialogs/scheduler.py`/
+  `gui2/dialogs/custom_recipes.py` (pure Qt GUI, no equivalent here) and
+  `ebooks/conversion/plugins/recipe_input.py` -- itself already tracked
+  as `[x] recipe_input.py (Placeholder)` in this doc's `conversion/plugins`
+  section, i.e. not a real implementation in this port either. Even a
+  faithful port of the retrieval functions would have nowhere to send
+  the resulting `.recipe` text without `compile_recipe`'s exec step.
+- `model.py` is 100% Qt (`QAbstractItemModel` tree model for the GUI's
+  recipe browser) -- zero portable logic.
+
+This crate's own `web/feeds` recipes are native Rust structs implementing
+[`NewsRecipeHooks`](crates/calibre_ebooks/src/web/feeds/recipe.rs) (#619),
+not dynamically-loaded `.recipe` scripts -- a deliberate, different
+architecture, not a partial port of this subfolder.
 
 #### fetch
 
