@@ -30,6 +30,7 @@
 //!   uses that single body directly.
 
 pub mod cover;
+pub mod download;
 pub mod opf;
 pub mod postprocess;
 pub mod recipe;
