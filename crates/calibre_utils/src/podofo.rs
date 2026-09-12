@@ -58,6 +58,8 @@ pub enum PodofoError {
     InvalidPage(u32),
     #[error("Outline item has no parent")]
     OutlineItemHasNoParent,
+    #[error("Font does not have a descriptor, or its descriptor has no embedded font file")]
+    FontHasNoDescriptor,
 }
 
 pub type Result<T> = std::result::Result<T, PodofoError>;
@@ -263,7 +265,7 @@ impl PdfDoc {
     }
 }
 
-fn is_name(dict: &Dictionary, key: &[u8], expected: &[u8]) -> bool {
+pub(crate) fn is_name(dict: &Dictionary, key: &[u8], expected: &[u8]) -> bool {
     dict.get(key)
         .and_then(Object::as_name)
         .map(|name| name == expected)

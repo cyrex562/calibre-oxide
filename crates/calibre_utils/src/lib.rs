@@ -31,6 +31,7 @@ pub mod open_with;
 pub mod opensearch;
 pub mod ordered_dict;
 pub mod podofo;
+pub mod podofo_fonts;
 pub mod podofo_outline;
 pub mod pool;
 pub mod quantize;

@@ -1929,7 +1929,19 @@ merging — dedup_images, impose, append/copy_page/insert_existing_page).
       AND Subtype==Image` check, not upstream's likely-unintentional
       `OR`, which over-counts Form XObjects and is inconsistent with the
       AND-gated image detection used elsewhere in the same C++ codebase.)
-- [ ] fonts.cpp (split to #577)
+- [x] fonts.cpp (issue #577 CLOSED — `calibre_utils::podofo_fonts`.
+      Real `list_fonts`/`remove_unused_fonts`/`replace_font_data`/
+      `merge_fonts`/`dedup_type3_fonts` against `lopdf`. Real upstream's
+      own hand-rolled PostScript-tokenizer + manual operand-stack for
+      finding `Tf` operators inside `BT`/`ET` isn't needed:
+      `lopdf::Content`/`Operation` already group each operator with its
+      own operand list, so a `Tf` operation's font name is simply
+      `operands[0]`. `remove_unused_fonts`' real `/CharProcs` usage-
+      count bookkeeping (only decrementing shared glyph streams' usage
+      when their owning font is actually removed, so a stream shared
+      with a still-used font survives) faithfully replicated. Disclosed
+      upstream-preserved scope-narrowing: only Type0/Type3 fonts are
+      ever removal candidates, simple fonts never are, even if unused.)
 - [x] global.h (N/A beyond disclosure: `PdfSaveOptions::NoMetadataUpdate`,
       used on every real PoDoFo save call to stop PoDoFo silently
       rewriting `/Info`/XMP on save, has no Rust equivalent concern —
