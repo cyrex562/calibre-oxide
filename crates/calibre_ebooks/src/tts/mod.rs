@@ -60,6 +60,7 @@
 //! ellipsis) fall back to no terminator character here too, same as
 //! upstream.
 
+pub mod batch;
 pub mod piper;
 pub mod stream;
 pub mod vocoder;
@@ -69,5 +70,6 @@ pub use piper::{
     text_to_sentence_ids, text_to_sentence_phonemes, translate_voice_config, Clause,
     ClauseTerminator, VoiceConfig,
 };
+pub use batch::{text_to_raw_audio_data, BatchSynthesis, Utterance};
 pub use stream::{PcmSamples, Piper, PiperEvent, SynthesisResult};
 pub use vocoder::{to_i16_samples, Vocoder};
