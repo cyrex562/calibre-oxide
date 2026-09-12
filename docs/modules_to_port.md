@@ -762,7 +762,7 @@ either -- this pass wasn't exhaustive.
 - [x] stats.py
 - [x] subset.py
 - [x] toc.py
-- [ ] tts.py
+- [ ] tts.py (issue #167 (epic), split after a full read of the real 576-line file found a genuine multi-part epic: #645 (sentence marking + HTML span wrapping, `mark_sentences_in_html`/`wrap_sentence` -- ~15 branches of exact tree surgery, the real intricate core) / #646 (SMIL media-overlay generation, `make_par`) / #647 (batch TTS synthesis, a `PiperEmbedded`-equivalent -- a real, different-shaped entry point than the already-real streaming `crate::tts::stream::Piper` from the #77 epic, not redundant with it) / #648 (WAV->M4A/AAC transcoding -- a genuinely absent subsystem, no FFmpeg wrapper exists anywhere in this workspace, needs a real design decision before implementation) / #649 (`embed_tts`/`remove_embedded_tts` orchestrator tying the above together with the already-real container/manifest wiring). None started yet.)
 - [x] upgrade.py
 - [x] utils.py
 
