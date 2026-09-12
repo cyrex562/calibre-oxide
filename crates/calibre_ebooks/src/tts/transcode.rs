@@ -74,6 +74,34 @@ use oxideav_core::{CodecId, CodecParameters, Packet, StreamInfo, TimeBase};
 /// per channel.
 const FRAME_LEN: i64 = 1024;
 
+/// Wraps raw little-endian PCM16 samples (the shape
+/// [`super::batch::Utterance::audio`] and [`super::stream::PcmSamples::I16`]
+/// both produce) in a real WAV/RIFF header, ready for [`wav_to_m4a`].
+/// Real upstream's own `wav_header_for_pcm_data` is a `calibre_extensions.ffmpeg`
+/// C function with no Python source to port; this produces the same
+/// real WAV shape (a canonical 44-byte PCM header) via the already-real
+/// `hound` dependency instead of reproducing that header by hand.
+pub fn wav_from_pcm16le(samples: &[u8], sample_rate: u32, channels: u16) -> Result<Vec<u8>> {
+    let spec = hound::WavSpec {
+        channels,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut buf = Vec::new();
+    {
+        let cursor = Cursor::new(&mut buf);
+        let mut writer = hound::WavWriter::new(cursor, spec).context("building a WAV header for PCM audio")?;
+        for chunk in samples.chunks_exact(2) {
+            writer
+                .write_sample(i16::from_le_bytes([chunk[0], chunk[1]]))
+                .context("writing a PCM sample into the WAV buffer")?;
+        }
+        writer.finalize().context("finalizing the WAV buffer")?;
+    }
+    Ok(buf)
+}
+
 /// Port of `transcode_single_audio_stream(wav, m4a)`: reads a WAV byte
 /// buffer and returns a real M4A (AAC-LC in an MP4 container) byte
 /// buffer.
