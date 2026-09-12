@@ -113,6 +113,36 @@ pub fn convert_to_oebbook(input_path: &Path, extract_dir: &Path) -> Result<OEBBo
     Ok(book)
 }
 
+/// Runs only the input stage of a conversion and writes the resulting
+/// book out as a real OPF-plus-content-files directory at `dump_dir`.
+///
+/// Port of `Plumber.run(..., abort_after_input_dump=True)`: real
+/// upstream runs the input plugin, then stops before any output stage,
+/// leaving `tdir/input/` holding the parsed book as a plain directory
+/// (an OPF, its manifest files, and -- when the input format produces
+/// one -- an NCX). `ebooks/html/to_zip.py`'s own `run()` is this
+/// function's real, single caller-of-note (issue #147): it re-packages
+/// that directory into a zip. This port collapses upstream's two-level
+/// `tdir` / `tdir/input` scratch layout into one caller-supplied
+/// `dump_dir`, since the outer/inner split has no effect the caller can
+/// observe -- only `dump_dir`'s own contents (what `package_dump`
+/// reads) are.
+///
+/// **Not yet threaded through**: real upstream's own `run()` passes
+/// `input_encoding`/`breadth_first`/`allow_local_files_outside_root`
+/// `OptionRecommendation`s down into this stage; this port calls
+/// [`convert_to_oebbook`] with each input plugin's own defaults, since
+/// generic `OptionRecommendation` plumbing is issue #126's own separate
+/// scope (this issue's own body draws the same line). A future #126
+/// lands with a way to pass per-plugin options through this call.
+pub fn dump_input(input_path: &Path, dump_dir: &Path) -> Result<()> {
+    let extract_dir = tempdir()?;
+    let mut book = convert_to_oebbook(input_path, extract_dir.path())?;
+    fs::create_dir_all(dump_dir)?;
+    crate::oeb::writer::OEBWriter::new().write_book(&mut book, dump_dir)?;
+    Ok(())
+}
+
 pub struct Plumber {
     input_path: PathBuf,
     output_path: PathBuf,
@@ -314,5 +344,35 @@ impl Plumber {
 
         println!("Done.");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod dump_input_tests {
+    use super::*;
+
+    #[test]
+    fn dump_input_writes_a_real_opf_and_content_directory() {
+        let src = tempdir().unwrap();
+        let html_path = src.path().join("index.html");
+        fs::write(
+            &html_path,
+            "<html><head><title>A Loose Page</title></head><body><h1>Hello</h1></body></html>",
+        )
+        .unwrap();
+
+        let dump = tempdir().unwrap();
+        let dump_dir = dump.path().join("input");
+        dump_input(&html_path, &dump_dir).unwrap();
+
+        let entries: Vec<String> = fs::read_dir(&dump_dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect();
+        assert!(entries.iter().any(|e| e.ends_with(".opf")), "{entries:?}");
+
+        let opf_text = fs::read_to_string(dump_dir.join("content.opf")).unwrap();
+        assert!(opf_text.contains("<manifest>"));
+        assert!(opf_text.contains("<spine>"));
     }
 }
