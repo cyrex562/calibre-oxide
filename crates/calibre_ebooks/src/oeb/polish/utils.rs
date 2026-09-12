@@ -357,6 +357,20 @@ pub fn extract(dom: &mut Dom, id: NodeId) {
     dom.detach(id);
 }
 
+/// Port of `insert_self_closing`. Real upstream's body exists entirely
+/// to relocate lxml's inline `.text`/`.tail` strings so pretty-printed
+/// indentation survives turning a previously-childless element into one
+/// with children -- moot for this crate's [`Dom`], which represents
+/// text as ordinary sibling nodes rather than an inlined per-element
+/// property, so there is no indentation bookkeeping to preserve. This
+/// port is a direct index-or-append insert.
+pub fn insert_self_closing(dom: &mut Dom, parent: NodeId, item: NodeId, index: Option<usize>) {
+    match index {
+        Some(i) => dom.insert_child(parent, i, item),
+        None => dom.append_child(parent, item),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
