@@ -8,11 +8,13 @@
 //! 3. Qt-based image rendering pipeline (`PageProcessor`,
 //!    `render_pages`, `process_pages`).
 //!
-//! Rust ports (1) and (2) here — they're the semantic core the input
-//! plugin (`crate::input::comic_input`) needs. (3) is a substantial
-//! rewrite off Qt onto the `image` / `imageproc` crates and lands as
-//! a dedicated follow-up issue.
+//! All three are real here: (1)/(2) in [`input`], (3) in
+//! [`page_processor`] (issue #124) -- a rewrite off Qt onto this
+//! workspace's own `image` crate plus the already-real
+//! `calibre_utils::imageops`/`quantize` (issues #569-#571).
 
 pub mod input;
+pub mod page_processor;
 
 pub use input::{comic_exts, extract_comic, find_pages, is_comic_page, numeric_sort_key};
+pub use page_processor::{process_pages, render_page, render_pages, ComicPageOptions, PageTask, RenderOutcome};
