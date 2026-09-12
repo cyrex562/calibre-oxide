@@ -836,6 +836,7 @@ dependencies = [
  "feed-rs",
  "flate2",
  "fontdb",
+ "hound",
  "html-escape",
  "html5ever 0.26.0",
  "hyphenation",
@@ -849,6 +850,9 @@ dependencies = [
  "markup5ever_rcdom",
  "mime_guess",
  "ort",
+ "oxideav-aac",
+ "oxideav-core",
+ "oxideav-mp4",
  "pathdiff",
  "pulldown-cmark",
  "rand 0.9.2",
@@ -1550,6 +1554,15 @@ name = "ctor-proc-macro"
 version = "0.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52560adf09603e58c9a7ee1fe1dcb95a16927b17c127f0ac02d6e768a0e25bc1"
+
+[[package]]
+name = "ctr"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0369ee1ad671834580515889b80f2ea915f23b8be8d0daa4bbaf2ac5c7590835"
+dependencies = [
+ "cipher 0.4.4",
+]
 
 [[package]]
 name = "darling"
@@ -2830,6 +2843,12 @@ dependencies = [
  "libc",
  "windows-link 0.2.1",
 ]
+
+[[package]]
+name = "hound"
+version = "3.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62adaabb884c94955b19907d60019f4e145d091c75345379e70d1ee696f7854f"
 
 [[package]]
 name = "html-escape"
@@ -4876,6 +4895,38 @@ dependencies = [
  "hmac-sha256",
  "lzma-rust2",
  "ureq",
+]
+
+[[package]]
+name = "oxideav-aac"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "35453ffa827080f322dba5d2233879f008627d4ffb07c496c0c6fe3190b35048"
+dependencies = [
+ "oxideav-core",
+]
+
+[[package]]
+name = "oxideav-core"
+version = "0.1.36"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a78b502f679c580ceb7cc834d23f80821673b0a393a3083d54ef82668bb9c028"
+dependencies = [
+ "bytemuck",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "oxideav-mp4"
+version = "0.0.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3fb26f41df4d00b495208a5943ae59cb33e6aff5c40a505a944b3e9361ffddc"
+dependencies = [
+ "aes 0.8.4",
+ "cbc 0.1.2",
+ "ctr",
+ "oxideav-core",
 ]
 
 [[package]]
