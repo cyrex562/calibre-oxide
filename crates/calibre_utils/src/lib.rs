@@ -32,6 +32,7 @@ pub mod opensearch;
 pub mod ordered_dict;
 pub mod podofo;
 pub mod pool;
+pub mod quantize;
 pub mod random_ua;
 pub mod recycle_bin;
 pub mod resources;

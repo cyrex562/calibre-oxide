@@ -35,7 +35,7 @@ use std::collections::{HashMap, HashSet};
 use image::{Rgba, RgbaImage};
 
 /// Port of Qt's `qGray(r, g, b)`.
-fn q_gray(r: u8, g: u8, b: u8) -> u8 {
+pub(crate) fn q_gray(r: u8, g: u8, b: u8) -> u8 {
     ((r as u32 * 11 + g as u32 * 16 + b as u32 * 5) / 32) as u8
 }
 
