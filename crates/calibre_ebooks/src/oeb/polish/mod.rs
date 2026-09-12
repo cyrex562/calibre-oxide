@@ -80,5 +80,6 @@ pub mod stats;
 pub mod style;
 pub mod subset;
 pub mod toc;
+pub mod tts;
 pub mod upgrade;
 pub mod utils;
