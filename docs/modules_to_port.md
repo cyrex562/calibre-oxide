@@ -1938,8 +1938,21 @@ merging — dedup_images, impose, append/copy_page/insert_existing_page).
 - [ ] images.cpp (mislabeled filename — its real content is
       `dedup_images()`; split to #578)
 - [ ] impose.cpp (split to #578)
-- [ ] outline.cpp (split to #576)
-- [ ] outlines.cpp (split to #576)
+- [x] outline.cpp (issue #576 CLOSED — `calibre_utils::podofo_outline`.
+      Real upstream's own C++ is a thin `PyObject` wrapper around
+      PoDoFo's own `PdfOutlineItem::CreateChild`/`CreateNext`/`Erase`,
+      whose actual tree-manipulation algorithm lives inside the
+      third-party PoDoFo library (not in this repo), so this port
+      implements the PDF outline object model directly (ISO 32000-1
+      §12.3.3: `/First`/`/Next`/`/Parent`/`/Count` linked tree)
+      against `lopdf`, verified against upstream's own *observable*
+      `get_outline()`/`PDFOutlineItem.create`/`.erase` behavior. Real
+      `/Count` bookkeeping on insert/erase, including erasing a whole
+      subtree's descendant count. Disclosed simplification: the real
+      spec's "closed item" negative-`/Count` case is unreachable since
+      nothing in the ported API ever exposes an open/close toggle.)
+- [x] outlines.cpp (issue #576 CLOSED, see outline.cpp above — same
+      module, `create_outline`/`get_outline`'s top-level entry points.)
 - [x] output.cpp (N/A — a CPython `OutputStreamDevice` shim letting
       PoDoFo write into an arbitrary Python file object. `lopdf`'s
       `save_to<W: Write>` already accepts any `impl std::io::Write`, so

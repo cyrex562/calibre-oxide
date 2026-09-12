@@ -54,6 +54,10 @@ pub enum PodofoError {
     Pdf(#[from] lopdf::Error),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("Invalid page number: {0}")]
+    InvalidPage(u32),
+    #[error("Outline item has no parent")]
+    OutlineItemHasNoParent,
 }
 
 pub type Result<T> = std::result::Result<T, PodofoError>;
@@ -61,7 +65,7 @@ pub type Result<T> = std::result::Result<T, PodofoError>;
 /// A loaded PDF document, mirroring the real `podofo.PDFDoc` Python type's
 /// doc-core surface.
 pub struct PdfDoc {
-    doc: Document,
+    pub(crate) doc: Document,
 }
 
 impl PdfDoc {
