@@ -1806,6 +1806,27 @@ fn clone_dir(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Recursively copies `src` into `dest` with real, independent bytes --
+/// port of `shutil.copy`'s use in `EpubContainer.__init__`'s
+/// already-unzipped-directory path. Unlike [`clone_dir`] (which
+/// hard-links where possible, correct only where the caller also marks
+/// itself `cloned` so later writes detach a shared inode first), this
+/// never shares an inode with `src`, so no such bookkeeping is needed.
+fn copy_dir(src: &Path, dest: &Path) -> Result<()> {
+    fs::create_dir_all(dest)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let spath = entry.path();
+        let dpath = dest.join(entry.file_name());
+        if spath.is_dir() {
+            copy_dir(&spath, &dpath)?;
+        } else {
+            fs::copy(&spath, &dpath)?;
+        }
+    }
+    Ok(())
+}
+
 // -- free functions mirroring container.py's module-level helpers -----
 
 pub fn abspath_to_name_at(path: &Path, root: &Path) -> String {
@@ -2038,8 +2059,24 @@ impl EpubContainer {
 
     /// Port of `EpubContainer.__init__`'s already-unzipped-directory
     /// path.
+    ///
+    /// Real upstream's own `__init__` copies this tree with
+    /// `shutil.copy` -- real, independent bytes, not hard links (unlike
+    /// [`Container::clone_to`]/`clone_data`, whose own real Python
+    /// counterpart *does* hard-link and correspondingly sets
+    /// `self.cloned = True` so later writes know to detach a shared
+    /// inode first). This port previously called the hard-link-based
+    /// [`clone_dir`] here without ever setting that flag -- a real,
+    /// disclosed bug found while testing issue #649's `embed_tts`: any
+    /// file this container never individually rewrites (so it stays
+    /// hard-linked to the original directory the whole time) gets its
+    /// *shared* inode truncated to zero bytes the moment
+    /// [`EpubContainer::commit`]'s own `sync_dir_tree` copies it back
+    /// out with a plain `fs::copy`, corrupting the original source
+    /// directory too. [`copy_dir`] matches upstream's real behavior
+    /// exactly and has no such hazard.
     pub fn open_dir(path_to_epub_dir: &Path, tdir: &Path) -> Result<EpubContainer> {
-        clone_dir(path_to_epub_dir, tdir)?;
+        copy_dir(path_to_epub_dir, tdir)?;
         Self::finish_open(path_to_epub_dir, tdir, true)
     }
 

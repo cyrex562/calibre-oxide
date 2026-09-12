@@ -73,5 +73,5 @@ pub use piper::{
 };
 pub use batch::{text_to_raw_audio_data, BatchSynthesis, Utterance};
 pub use stream::{PcmSamples, Piper, PiperEvent, SynthesisResult};
-pub use transcode::wav_to_m4a;
+pub use transcode::{wav_from_pcm16le, wav_to_m4a};
 pub use vocoder::{to_i16_samples, Vocoder};
