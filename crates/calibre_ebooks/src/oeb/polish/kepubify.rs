@@ -39,6 +39,7 @@ use crate::metadata::authors::authors_to_string;
 use crate::metadata::meta::MetaInformation;
 use crate::oeb::polish::container::{Container, ParsedItem};
 use crate::oeb::polish::utils::insert_self_closing;
+use crate::spell::break_iterator::sentence_positions;
 
 /// Port of `kepubify.py`'s `CSS_COMMENT_COOKIE`.
 pub const CSS_COMMENT_COOKIE: &str = "calibre-removed-css-for-kobo";
@@ -50,7 +51,7 @@ pub const KOBO_JS_NAME: &str = "kobo.js";
 pub const KOBO_CSS_NAME: &str = "kobo.css";
 pub const OUTER_DIV_ID: &str = "book-columns";
 pub const INNER_DIV_ID: &str = "book-inner";
-/// Used by `add_kobo_spans` (issue #651, not yet ported).
+/// Used by [`add_kobo_spans`].
 pub const KOBO_SPAN_CLASS: &str = "koboSpan";
 pub const DUMMY_TITLE_PAGE_NAME: &str = "kobo-title-page-generated-by-calibre";
 pub const DUMMY_COVER_IMAGE_NAME: &str = "kobo-cover-image-generated-by-calibre";
@@ -682,6 +683,452 @@ pub fn add_dummy_title_page_for(
     add_dummy_title_page(container, cover_image_name, &mi.title, &mi.authors, kobo_js_name)
 }
 
+// ---------------------------------------------------------------------
+// Kobo sentence/paragraph span wrapping (issue #651)
+// ---------------------------------------------------------------------
+//
+// This is the real core of kepubification: Kobo's renderer can't do
+// highlighting or bookmarking without every text run being wrapped in
+// its own identified `<span>`, so `add_kobo_spans` walks the body and
+// wraps each sentence in `<span class="koboSpan" id="kobo.PARA.SEG">`.
+//
+// # How upstream's lxml-shaped algorithm maps onto [`Dom`]
+//
+// Real upstream is written against lxml, where text is *not* a node:
+// each element carries a `.text` (the run before its first child) and a
+// `.tail` (the run after its own closing tag). Nearly all of
+// `wrap_text_in_spans`' apparent complexity is bookkeeping for that
+// split representation:
+//
+// * It must compute an insertion index `at` (`0` for `.text`, else
+//   `parent.index(after_child) + 1`), then write the surviving leading
+//   whitespace to *either* `parent.text` *or* `parent[at-1].tail`
+//   depending on which case it's in, then `insert()` each new span at
+//   `at`, `at+1`, ...
+// * It needs a `try/except ValueError` fallback, because by the time a
+//   run's `.tail` is processed its `after_child` may have been moved
+//   inside a wrapper span by `wrap_child`, so `parent.index()` on it
+//   raises.
+//
+// In this crate's [`Dom`] a text run *is* an ordinary child node, and
+// every one of those branches collapses to the same statement: **replace
+// the text node, in place, with `[surviving-whitespace?, span, span,
+// ...]`**. The `ValueError` fallback disappears entirely (a wrapped
+// child's following text node keeps its own position, so nothing needs
+// re-deriving), and `at == 0` is just "this text node is `children[0]`".
+// The three-way `parent.text` / `parent[at-1].tail` / `insert(at, ...)`
+// split is one splice. This is a representation difference, not a
+// behavioral narrowing -- the resulting trees are identical.
+//
+// The same applies to the stack walk. Upstream pushes each child's
+// `.tail` and the child itself, then handles `node.text` *inline*
+// (before any pop) because `.text` isn't a child it can push. Here,
+// pushing every child -- text and element alike -- in reverse order
+// gives the identical pop order, because a leading text run is simply
+// `children[0]` and so is pushed last and popped first.
+
+/// Port of `SKIPPED_TAGS`. Upstream's set also contains `''`, which is
+/// what its `barename(child.tag) if isinstance(child.tag, str) else ''`
+/// yields for a comment or processing instruction -- i.e. `''` exists
+/// purely to stop the walk descending into those. Here they simply
+/// aren't [`NodeKind::Element`]s and are skipped structurally, so the
+/// sentinel has nothing to do and is dropped.
+pub const SKIPPED_TAGS: &[&str] = &["script", "style", "atom", "pre", "audio", "video", "svg", "math"];
+
+/// Port of `BLOCK_TAGS`: the tags that start a new Kobo "paragraph"
+/// (the first number in a `kobo.PARA.SEG` id).
+pub const BLOCK_TAGS: &[&str] = &["p", "ol", "ul", "table", "h1", "h2", "h3", "h4", "h5", "h6"];
+
+/// Port of `tts.py`'s `lang_for_elem` -- the one helper `kepubify.py`
+/// borrows from that module (see this crate's issue #543 notes: the
+/// "kepubify is blocked on tts.py" framing turned out to rest entirely
+/// on this two-line function).
+///
+/// Upstream tries `lang`, then `xml_lang`, then the Clark-notation
+/// `{http://www.w3.org/XML/1998/namespace}lang`; the middle spelling is
+/// what calibre's own OEB parser rewrites `xml:lang` to. [`Dom::parse`]
+/// keys attributes by local name, so the two XML spellings collapse to
+/// the one `"xml:lang"` key -- the same pair `oeb::polish::hyphenation`
+/// and `oeb::polish::spell` already check, followed here for
+/// consistency. An empty value falls through to the next spelling,
+/// matching Python's `or` chain over attribute *values*.
+pub fn lang_for_elem(dom: &Dom, elem: NodeId, parent_lang: &str) -> String {
+    let attrs = &dom.node(elem).attrs;
+    let raw = ["lang", "xml:lang"]
+        .iter()
+        .find_map(|k| attrs.get(*k).map(String::as_str).filter(|v| !v.is_empty()));
+    raw.and_then(calibre_utils::localization::canonicalize_lang)
+        .unwrap_or_else(|| parent_lang.to_string())
+}
+
+/// One entry of `add_kobo_spans`' explicit walk stack.
+enum SpanTask {
+    /// An element to descend into. Upstream's `(elem, None, tagname, lang)`.
+    Element { node: NodeId, tag: String, lang: String },
+    /// A text run to wrap. Upstream's `(text, parent, after_child, lang)`
+    /// -- here the run's own node id stands in for both the text and the
+    /// `after_child` position marker (see this section's module notes).
+    Text { node: NodeId, parent: NodeId, lang: String },
+}
+
+/// The `nonlocal` state of upstream's nested closures.
+struct KoboSpanWrapper<'a> {
+    dom: &'a mut Dom,
+    paranum: u32,
+    segnum: u32,
+    increment_next_para: bool,
+    prefer_justification: bool,
+}
+
+/// Port of lxml's `len(element)`: the number of children that are not
+/// text. Comments count, exactly as they do in lxml.
+fn non_text_child_count(dom: &Dom, parent: NodeId) -> usize {
+    dom.node(parent)
+        .children
+        .iter()
+        .filter(|&&c| !matches!(dom.node(c).kind, NodeKind::Text(_)))
+        .count()
+}
+
+fn set_text(dom: &mut Dom, node: NodeId, value: &str) {
+    if let NodeKind::Text(t) = &mut dom.node_mut(node).kind {
+        value.clone_into(t);
+    }
+}
+
+impl KoboSpanWrapper<'_> {
+    /// Port of the `kobo_span` closure. Note the increment happens
+    /// *before* the id is formatted, so the first span of a paragraph is
+    /// `kobo.N.1`, not `kobo.N.0`.
+    fn kobo_span(&mut self) -> NodeId {
+        self.segnum += 1;
+        let s = self.dom.new_element("span");
+        let attrs = &mut self.dom.node_mut(s).attrs;
+        attrs.insert("class".to_string(), KOBO_SPAN_CLASS.to_string());
+        attrs.insert("id".to_string(), format!("kobo.{}.{}", self.paranum, self.segnum));
+        s
+    }
+
+    /// Port of the `wrap_child` closure: replaces `child` (only ever an
+    /// `<img>`) with a span wrapping it.
+    ///
+    /// Upstream additionally does `w.tail = child.tail` and
+    /// `child.tail = child.text = None`, all three of which are
+    /// structurally automatic here: the run following `child` is its own
+    /// sibling node and simply ends up following the wrapper instead,
+    /// and an `<img>` is a void element, so it has no children to clear.
+    fn wrap_child(&mut self, child: NodeId) {
+        self.increment_next_para = false;
+        self.paranum += 1;
+        self.segnum = 0;
+        let (Some(parent), Some(idx)) = (self.dom.parent(child), self.dom.index_in_parent(child)) else {
+            return;
+        };
+        let w = self.kobo_span();
+        self.dom.insert_child(parent, idx, w);
+        self.dom.append_child(w, child);
+    }
+
+    /// Port of the `wrap_text_in_spans` closure.
+    fn wrap_text_in_spans(&mut self, text_node: NodeId, parent: NodeId, lang: &str) {
+        let NodeKind::Text(text) = self.dom.node(text_node).kind.clone() else {
+            return;
+        };
+        let stripped = text.trim_start_matches(char::is_whitespace).to_string();
+        // Upstream's `at`: `0` exactly when this run is `parent.text`,
+        // which here means it is `parent`'s first child.
+        let is_leading = self.dom.index_in_parent(text_node) == Some(0);
+
+        if self.increment_next_para {
+            self.paranum += 1;
+            self.segnum = 0;
+            self.increment_next_para = false;
+        }
+
+        // "block tag with only whitespace": the whole run, whitespace
+        // and all, goes inside one span. Reached before the pure-
+        // whitespace early return below, so such a block still gets a
+        // span (and consumed a paragraph number just above).
+        if is_leading && stripped.is_empty() && non_text_child_count(self.dom, parent) == 0 {
+            let s = self.kobo_span();
+            let t = self.dom.new_text(&text);
+            self.dom.append_child(s, t);
+            self.dom.detach(text_node);
+            self.dom.append_child(parent, s);
+            return;
+        }
+
+        let leading_ws_len = text.len() - stripped.len();
+        let leading_whitespace = (leading_ws_len > 0).then(|| text[..leading_ws_len].to_string());
+        // When there is real text and we aren't justifying, the leading
+        // whitespace is pulled *into* the first span rather than left
+        // outside it -- that is what keeps Kobo's own highlighting from
+        // leaving an unhighlighted gap at the start of a sentence.
+        let before = if !stripped.is_empty() && !self.prefer_justification {
+            None
+        } else {
+            leading_whitespace.clone()
+        };
+
+        let idx = self.dom.index_in_parent(text_node).expect("text run is attached to its parent");
+        let mut at = match &before {
+            Some(b) => {
+                set_text(self.dom, text_node, b);
+                idx + 1
+            }
+            None => {
+                self.dom.detach(text_node);
+                idx
+            }
+        };
+
+        // Pure whitespace between elements: left exactly as it was.
+        if stripped.is_empty() {
+            return;
+        }
+
+        let body = if leading_whitespace.is_none() || self.prefer_justification {
+            stripped.as_str()
+        } else {
+            text.as_str()
+        };
+
+        for (pos, sz) in sentence_positions(body, lang) {
+            let inside = &body[pos..pos + sz];
+            // With `prefer_justification`, a sentence's trailing
+            // whitespace is moved out of the span, so Kobo's justifier
+            // sees a normal inter-span gap instead of trailing space
+            // locked inside an inline box.
+            let (span_text, tail) = if self.prefer_justification {
+                let trimmed = inside.trim_end_matches(char::is_whitespace);
+                if trimmed.len() == inside.len() {
+                    (inside, None)
+                } else {
+                    (trimmed, Some(&inside[trimmed.len()..]))
+                }
+            } else {
+                (inside, None)
+            };
+
+            let s = self.kobo_span();
+            let t = self.dom.new_text(span_text);
+            self.dom.append_child(s, t);
+            self.dom.insert_child(parent, at, s);
+            at += 1;
+            if let Some(tail) = tail {
+                let tn = self.dom.new_text(tail);
+                self.dom.insert_child(parent, at, tn);
+                at += 1;
+            }
+        }
+    }
+}
+
+/// Port of `add_kobo_spans(inner, root_lang, prefer_justification)`.
+///
+/// `inner` is the `div#book-inner` [`wrap_body_contents`] just created.
+/// Every text run beneath it is split at sentence boundaries (via the
+/// already-real [`sentence_positions`]) and each sentence wrapped in
+/// `<span class="koboSpan" id="kobo.PARA.SEG">`; every `<img>` is
+/// wrapped in a span of its own.
+///
+/// `lang` reaches [`sentence_positions`], whose own port segments text
+/// with `unicode-segmentation` rather than ICU and so ignores it (see
+/// `crate::spell::break_iterator`); the full language-inheritance walk
+/// is still ported faithfully here so that behavior arrives for free if
+/// that module ever grows real per-language iterators.
+pub fn add_kobo_spans(dom: &mut Dom, inner: NodeId, root_lang: &str, prefer_justification: bool) {
+    let root_tag = dom.tag(inner).unwrap_or("").to_ascii_lowercase();
+    let root_lang = lang_for_elem(dom, inner, root_lang);
+    let mut w = KoboSpanWrapper {
+        dom,
+        paranum: 0,
+        segnum: 0,
+        increment_next_para: true,
+        prefer_justification,
+    };
+    let mut stack = vec![SpanTask::Element {
+        node: inner,
+        tag: root_tag,
+        lang: root_lang,
+    }];
+
+    while let Some(task) = stack.pop() {
+        let (node, tag, lang) = match task {
+            SpanTask::Text { node, parent, lang } => {
+                w.wrap_text_in_spans(node, parent, &lang);
+                continue;
+            }
+            SpanTask::Element { node, tag, lang } => (node, tag, lang),
+        };
+
+        if tag == "img" {
+            w.wrap_child(node);
+            continue;
+        }
+        if !w.increment_next_para && BLOCK_TAGS.contains(&tag.as_str()) {
+            w.increment_next_para = true;
+        }
+
+        // Reverse order so the pops come back out in document order.
+        // Unlike upstream this also covers the leading run, which here
+        // is just `children[0]` and so is pushed last and popped first
+        // -- exactly where upstream's inline `if node.text:` handled it.
+        for child in w.dom.node(node).children.clone().into_iter().rev() {
+            let is_text = matches!(&w.dom.node(child).kind, NodeKind::Text(t) if !t.is_empty());
+            if is_text {
+                stack.push(SpanTask::Text {
+                    node: child,
+                    parent: node,
+                    lang: lang.clone(),
+                });
+                continue;
+            }
+            let Some(child_tag) = w.dom.tag(child).map(|t| t.to_ascii_lowercase()) else {
+                continue;
+            };
+            if SKIPPED_TAGS.contains(&child_tag.as_str()) {
+                continue;
+            }
+            let child_lang = lang_for_elem(w.dom, child, &lang);
+            stack.push(SpanTask::Element {
+                node: child,
+                tag: child_tag,
+                lang: child_lang,
+            });
+        }
+    }
+}
+
+/// Port of `unwrap(span)`: removes one Kobo span, splicing whatever it
+/// held back into its parent.
+///
+/// Two real upstream quirks are reproduced rather than quietly repaired,
+/// because both are unreachable for any book this crate itself produces
+/// and "fix" would mean guessing at an intent upstream never stated:
+///
+/// * When the span has element children (only ever the `<img>` case),
+///   upstream's `del p[idx]` drops the span *and its tail* -- in lxml a
+///   tail belongs to its element -- and then reinserts only `span[0]`.
+///   So both the text after the span and any second element child are
+///   discarded. After a real `add_kobo_spans` run an image wrapper never
+///   has either (the following run was consumed into its own spans, and
+///   `wrap_child` only ever puts one child inside), so this is
+///   unreachable in practice.
+/// * When the span is empty, upstream's `span.text + (span.tail or '')`
+///   raises `TypeError`, since `span.text` is then `None`. Every span
+///   `kobo_span` builds has text, so this too is unreachable; an empty
+///   span is treated as empty text here rather than panicking.
+pub fn unwrap(dom: &mut Dom, span: NodeId) {
+    let (Some(parent), Some(idx)) = (dom.parent(span), dom.index_in_parent(span)) else {
+        return;
+    };
+    let first_element_child = dom
+        .node(span)
+        .children
+        .iter()
+        .copied()
+        .find(|&c| !matches!(dom.node(c).kind, NodeKind::Text(_)));
+    // lxml's `span.tail`: the run immediately following the span.
+    let tail_node = dom
+        .node(parent)
+        .children
+        .get(idx + 1)
+        .copied()
+        .filter(|&n| matches!(dom.node(n).kind, NodeKind::Text(_)));
+
+    if let Some(child) = first_element_child {
+        if let Some(tail) = tail_node {
+            dom.detach(tail);
+        }
+        dom.detach(span);
+        dom.insert_child(parent, idx, child);
+        return;
+    }
+
+    let mut text = dom.text_content(span);
+    if let Some(tail) = tail_node {
+        text.push_str(&dom.text_content(tail));
+        dom.detach(tail);
+    }
+    dom.detach(span);
+
+    // Merge into the preceding run if there is one, keeping lxml's
+    // invariant that two text runs are never adjacent. Upstream phrases
+    // this as "append to `p[idx-1]`'s tail, else to `p.text`"; both mean
+    // the same node here, and when the preceding sibling is an element
+    // with no tail at all, giving it one *is* inserting a run at `idx`.
+    if idx > 0 {
+        let prev = dom.node(parent).children[idx - 1];
+        if let NodeKind::Text(t) = &mut dom.node_mut(prev).kind {
+            t.push_str(&text);
+            return;
+        }
+    }
+    let t = dom.new_text(&text);
+    dom.insert_child(parent, idx, t);
+}
+
+/// Port of `remove_kobo_spans(body)`. Returns whether any span was found.
+pub fn remove_kobo_spans(dom: &mut Dom, body: NodeId) -> bool {
+    let spans: Vec<NodeId> = dom
+        .find_all_tag(body, "span")
+        .into_iter()
+        .filter(|&s| {
+            let attrs = &dom.node(s).attrs;
+            attrs.get("class").map(String::as_str) == Some(KOBO_SPAN_CLASS)
+                && attrs.get("id").is_some_and(|i| i.starts_with("kobo."))
+        })
+        .collect();
+    let found = !spans.is_empty();
+    for span in spans {
+        unwrap(dom, span);
+    }
+    found
+}
+
+/// Narrow stand-in for `calibre.utils.localization.get_lang`, matching
+/// the identical one `oeb::polish::toc` already documents: no locale
+/// subsystem exists in this port, so this is always the fallback
+/// `get_lang` itself lands on when nothing is configured.
+fn get_lang() -> &'static str {
+    "eng"
+}
+
+/// Port of `add_kobo_markup_to_html`.
+pub fn add_kobo_markup_to_html(
+    dom: &mut Dom,
+    root: NodeId,
+    kobo_js_href: &str,
+    opts: &Options,
+    metadata_lang: &str,
+) {
+    let base = if metadata_lang.is_empty() { get_lang() } else { metadata_lang };
+    let base = calibre_utils::localization::canonicalize_lang(base).unwrap_or_default();
+    let root_lang = lang_for_elem(dom, root, &base);
+    let root_lang = calibre_utils::localization::canonicalize_lang(if root_lang.is_empty() { "en" } else { &root_lang })
+        .unwrap_or_default();
+
+    add_style_and_script(dom, root, kobo_js_href, opts);
+
+    let bodies: Vec<NodeId> = dom.children(root).into_iter().filter(|&c| dom.tag(c) == Some("body")).collect();
+    for body in bodies {
+        let body_lang = lang_for_elem(dom, body, &root_lang);
+        let inner = wrap_body_contents(dom, body);
+        add_kobo_spans(dom, inner, &body_lang, opts.prefer_justification);
+    }
+}
+
+/// Port of `remove_kobo_markup_from_html`.
+pub fn remove_kobo_markup_from_html(dom: &mut Dom, root: NodeId) {
+    remove_kobo_styles_and_scripts(dom, root);
+    let bodies: Vec<NodeId> = dom.children(root).into_iter().filter(|&c| dom.tag(c) == Some("body")).collect();
+    for body in bodies {
+        unwrap_body_contents(dom, body);
+        remove_kobo_spans(dom, body);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1128,6 +1575,249 @@ in it to fail every title-page text-length heuristic that exists in this codebas
         let mut c = crate::oeb::polish::container::Container::open(dir.path(), &dir.path().join("content.opf")).unwrap();
         // chap1.html has substantial text -> not a title page by content.
         assert!(!first_spine_item_is_probably_title_page(&mut c).unwrap());
+    }
+
+    // ---- Kobo span wrapping (issue #651) ------------------------------
+    //
+    // Every assertion below was cross-validated against upstream's own
+    // verbatim `add_kobo_spans`/`unwrap`/`remove_kobo_spans` running on a
+    // minimal lxml-shaped tree (40 fixtures, byte-identical structural
+    // dumps, `add_kobo_spans` and the `remove_kobo_spans` round trip
+    // both) -- see this port's notes on the issue for the harness.
+
+    fn spanned(html: &str, prefer_justification: bool) -> (Dom, NodeId) {
+        let mut dom = Dom::parse(html);
+        let inner = dom.find_by_id("i").expect("fixture needs id=i on the wrapper");
+        add_kobo_spans(&mut dom, inner, "en", prefer_justification);
+        (dom, inner)
+    }
+
+    /// Every `kobo.PARA.SEG` id in `html`, in document order.
+    fn kobo_ids(html: &str) -> Vec<String> {
+        html.match_indices("id=\"kobo.")
+            .map(|(n, m)| {
+                let rest = &html[n + m.len()..];
+                rest[..rest.find('"').expect("id attribute is quoted")].to_string()
+            })
+            .collect()
+    }
+
+    fn spanned_html(html: &str, prefer_justification: bool) -> String {
+        let (dom, inner) = spanned(html, prefer_justification);
+        dom.serialize(inner)
+    }
+
+    #[test]
+    fn splits_a_run_at_sentence_boundaries_numbering_each_segment() {
+        assert_eq!(
+            spanned_html("<div id=i><p>One. Two.</p></div>", false),
+            "<div id=\"i\"><p>\
+               <span class=\"koboSpan\" id=\"kobo.1.1\">One. </span>\
+               <span class=\"koboSpan\" id=\"kobo.1.2\">Two.</span>\
+             </p></div>"
+                .replace(['\n'], "")
+                .replace("               ", "")
+                .replace("             ", "")
+        );
+    }
+
+    #[test]
+    fn leading_whitespace_is_pulled_inside_the_first_span() {
+        // Not justifying: the run's leading whitespace goes *into* the
+        // span, so Kobo's highlight has no unhighlighted gap in front.
+        let html = spanned_html("<div id=i><p>  Hello there.</p></div>", false);
+        assert!(html.contains(">  Hello there.</span>"), "{html}");
+        assert!(!html.contains("<p>  <span"), "{html}");
+    }
+
+    #[test]
+    fn prefer_justification_leaves_leading_whitespace_outside_the_span() {
+        let html = spanned_html("<div id=i><p>  Hello there.</p></div>", true);
+        assert!(html.contains("<p>  <span"), "{html}");
+        assert!(html.contains(">Hello there.</span>"), "{html}");
+    }
+
+    #[test]
+    fn prefer_justification_moves_trailing_whitespace_out_of_each_span() {
+        let html = spanned_html("<div id=i><p>One.   Two.</p></div>", true);
+        assert!(html.contains("<span class=\"koboSpan\" id=\"kobo.1.1\">One.</span>   "), "{html}");
+        assert!(html.contains("<span class=\"koboSpan\" id=\"kobo.1.2\">Two.</span>"), "{html}");
+    }
+
+    #[test]
+    fn a_block_holding_only_whitespace_still_gets_one_span() {
+        // Upstream's own "block tag with only whitespace" branch: the
+        // whole run, whitespace included, goes inside a span. Checked
+        // before the pure-whitespace early return, so it still consumes
+        // a paragraph number.
+        assert_eq!(
+            spanned_html("<div id=i><p>   </p></div>", false),
+            "<div id=\"i\"><p><span class=\"koboSpan\" id=\"kobo.1.1\">   </span></p></div>"
+        );
+    }
+
+    #[test]
+    fn whitespace_between_blocks_is_left_exactly_as_it_was() {
+        // Same pure-whitespace run, but with element siblings present,
+        // so the branch above does not apply and no span is made.
+        assert_eq!(
+            spanned_html("<div id=i><p>a</p>   <p>b</p></div>", false),
+            "<div id=\"i\">\
+             <p><span class=\"koboSpan\" id=\"kobo.1.1\">a</span></p>   \
+             <p><span class=\"koboSpan\" id=\"kobo.2.1\">b</span></p>\
+             </div>"
+                .replace("             ", "")
+        );
+    }
+
+    #[test]
+    fn nested_inline_elements_and_their_tails_are_wrapped_in_document_order() {
+        let html = spanned_html("<div id=i><p>Start. <b>Bold text.</b> Tail here.</p></div>", false);
+        assert_eq!(kobo_ids(&html), ["1.1", "1.2", "1.3"], "{html}");
+        // The <b>'s own text is wrapped inside the <b>, not hoisted out.
+        assert!(html.contains("<b><span class=\"koboSpan\" id=\"kobo.1.2\">Bold text.</span></b>"), "{html}");
+    }
+
+    #[test]
+    fn an_image_is_wrapped_in_its_own_span_and_starts_a_new_paragraph() {
+        // `wrap_child` bumps paranum unconditionally, so the run after
+        // the image lands in that same new paragraph as segment 2.
+        assert_eq!(
+            spanned_html("<div id=i><p>Before. <img src=\"x.png\"> After.</p></div>", false),
+            "<div id=\"i\"><p>\
+               <span class=\"koboSpan\" id=\"kobo.1.1\">Before. </span>\
+               <span class=\"koboSpan\" id=\"kobo.2.1\"><img src=\"x.png\" /></span>\
+               <span class=\"koboSpan\" id=\"kobo.2.2\"> After.</span>\
+             </p></div>"
+                .replace("               ", "")
+                .replace("             ", "")
+        );
+    }
+
+    #[test]
+    fn skipped_tags_are_not_descended_into_but_their_tails_still_are() {
+        let html = spanned_html("<div id=i><pre>code here.</pre>after pre.</div>", false);
+        assert!(html.contains("<pre>code here.</pre>"), "{html}");
+        assert!(html.contains("<span class=\"koboSpan\" id=\"kobo.1.1\">after pre.</span>"), "{html}");
+    }
+
+    #[test]
+    fn comments_survive_and_the_run_after_one_is_still_wrapped() {
+        let html = spanned_html("<div id=i><p>a<!-- c -->tail</p></div>", false);
+        assert!(html.contains("<!-- c -->"), "{html}");
+        assert!(html.contains("id=\"kobo.1.1\">a</span>"), "{html}");
+        assert!(html.contains("id=\"kobo.1.2\">tail</span>"), "{html}");
+    }
+
+    #[test]
+    fn each_block_tag_starts_a_new_paragraph_number() {
+        let html = spanned_html(
+            "<div id=i><h1>Title.</h1><p>Body one. Body two.</p><ul><li>Item.</li></ul></div>",
+            false,
+        );
+        assert_eq!(kobo_ids(&html), ["1.1", "2.1", "2.2", "3.1"], "{html}");
+    }
+
+    #[test]
+    fn a_run_between_two_blocks_stays_in_the_preceding_paragraph() {
+        // The bump only happens when the *next* block element is
+        // reached, so loose text after a block joins the block's number.
+        let html = spanned_html("<div id=i><h2>Head.</h2>loose. <h3>Sub.</h3></div>", false);
+        assert_eq!(kobo_ids(&html), ["1.1", "1.2", "2.1"], "{html}");
+    }
+
+    #[test]
+    fn lang_is_inherited_down_the_tree_and_overridden_per_element() {
+        let dom = Dom::parse("<div id=i lang=\"fr\"><p><span lang=\"de\">x</span></p></div>");
+        let outer = dom.find_by_id("i").unwrap();
+        let p = dom.find_all_tag(outer, "p")[0];
+        let inner_span = dom.find_all_tag(outer, "span")[0];
+        assert_eq!(lang_for_elem(&dom, outer, "eng"), "fra");
+        // No lang of its own -> inherits whatever was passed down.
+        assert_eq!(lang_for_elem(&dom, p, "fra"), "fra");
+        assert_eq!(lang_for_elem(&dom, inner_span, "fra"), "deu");
+        // Unrecognized values fall back to the parent's, as upstream.
+        let dom2 = Dom::parse("<p id=i lang=\"zzzz\">x</p>");
+        let e = dom2.find_by_id("i").unwrap();
+        assert_eq!(lang_for_elem(&dom2, e, "eng"), "eng");
+    }
+
+    #[test]
+    fn remove_kobo_spans_round_trips_every_shape_back_to_the_original() {
+        for fixture in [
+            "<div id=i><p>One. Two.</p></div>",
+            "<div id=i><p>  Hello there.</p></div>",
+            "<div id=i><p>Start. <b>Bold text.</b> Tail here.</p></div>",
+            "<div id=i><p>a</p>   <p>b</p></div>",
+            "<div id=i><h1>Title.</h1><p>Body one. Body two.</p></div>",
+            "<div id=i><p>A <b>b <i>c.</i> d</b> e.</p></div>",
+            "<div id=i>Loose text. More.</div>",
+        ] {
+            let original = {
+                let dom = Dom::parse(fixture);
+                let inner = dom.find_by_id("i").unwrap();
+                dom.serialize(inner)
+            };
+            let (mut dom, inner) = spanned(fixture, false);
+            assert!(remove_kobo_spans(&mut dom, inner), "no spans found in {fixture}");
+            assert_eq!(dom.serialize(inner), original, "round trip failed for {fixture}");
+        }
+    }
+
+    #[test]
+    fn remove_kobo_spans_reports_when_there_was_nothing_to_remove() {
+        let mut dom = Dom::parse("<div id=i><p>plain <span class=\"other\">x</span></p></div>");
+        let inner = dom.find_by_id("i").unwrap();
+        assert!(!remove_kobo_spans(&mut dom, inner));
+        // A span that isn't a Kobo span is left completely alone.
+        assert!(dom.serialize(inner).contains("<span class=\"other\">x</span>"));
+    }
+
+    #[test]
+    fn remove_kobo_spans_leaves_an_image_in_place() {
+        let fixture = "<div id=i><p><img src=\"a.png\"></p></div>";
+        let (mut dom, inner) = spanned(fixture, false);
+        assert!(remove_kobo_spans(&mut dom, inner));
+        assert_eq!(dom.serialize(inner), "<div id=\"i\"><p><img src=\"a.png\" /></p></div>");
+    }
+
+    #[test]
+    fn unwrap_merges_its_text_into_the_preceding_run() {
+        let mut dom = Dom::parse(
+            "<p id=i>before<span class=\"koboSpan\" id=\"kobo.1.1\">mid</span>after</p>",
+        );
+        let p = dom.find_by_id("i").unwrap();
+        let span = dom.find_all_tag(p, "span")[0];
+        unwrap(&mut dom, span);
+        // lxml keeps two text runs from ever being adjacent; so does this.
+        assert_eq!(dom.serialize(p), "<p id=\"i\">beforemidafter</p>");
+        assert_eq!(dom.node(p).children.len(), 1);
+    }
+
+    #[test]
+    fn add_and_remove_kobo_markup_to_html_round_trips() {
+        let source = "<html><head></head><body><p>One. Two.</p></body></html>";
+        let mut dom = Dom::parse(source);
+        let root = html_root(&dom);
+        let opts = Options {
+            extra_css: "p { color: red; }".to_string(),
+            ..Default::default()
+        };
+        add_kobo_markup_to_html(&mut dom, root, "../kobo.js", &opts, "en");
+
+        let marked = dom.serialize(root);
+        assert!(marked.contains(&format!("id=\"{OUTER_DIV_ID}\"")), "{marked}");
+        assert!(marked.contains(&format!("id=\"{INNER_DIV_ID}\"")), "{marked}");
+        assert!(marked.contains("class=\"koboSpan\""), "{marked}");
+        assert!(marked.contains(KOBO_CSS_ID), "{marked}");
+        assert!(marked.contains("../kobo.js"), "{marked}");
+
+        remove_kobo_markup_from_html(&mut dom, root);
+        let cleaned = dom.serialize(root);
+        assert!(!cleaned.contains("koboSpan"), "{cleaned}");
+        assert!(!cleaned.contains(OUTER_DIV_ID), "{cleaned}");
+        assert!(!cleaned.contains(KOBO_CSS_ID), "{cleaned}");
+        assert!(cleaned.contains("<p>One. Two.</p>"), "{cleaned}");
     }
 
     #[test]
