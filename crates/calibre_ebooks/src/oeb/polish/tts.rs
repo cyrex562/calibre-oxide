@@ -38,7 +38,9 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::dom::{Dom, NodeId, NodeKind};
+use crate::oeb::polish::container::seconds_to_timestamp;
 use crate::spell::break_iterator::split_into_sentences_for_tts_embed;
+use crate::xmltree::{Xml, XmlNodeId};
 
 /// Port of the `Sentence` NamedTuple.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -886,6 +888,64 @@ fn merge_adjacent_text(dom: &mut Dom, parent: NodeId) {
 }
 
 
+// ---------------------------------------------------------------------
+// SMIL media-overlay generation (issue #646)
+// ---------------------------------------------------------------------
+
+/// Port of `make_par`: appends one `<par>` (a `<text>`/`<audio>` pair)
+/// to an existing SMIL `<seq>`, recording that `elem_id` in `html_href`
+/// is read aloud by the `[pos, pos + duration)` clip of `audio_href`.
+///
+/// Two disclosed departures from a literal transcription:
+///
+/// * Upstream's `container` parameter is never read by the function
+///   body (it uses only the module-level `EPUB`/`seconds_to_timestamp`
+///   imports) -- dropped rather than carried forward unused.
+/// * Every `.tail`/`.text` assignment in the real function exists
+///   purely to keep lxml's pretty-printed indentation consistent after
+///   inserting new elements; [`Xml`] represents whitespace as ordinary
+///   sibling text nodes rather than out-of-band `.text`/`.tail`
+///   properties precisely so that removal and insertion don't need this
+///   bookkeeping (see the module's own scope note on `insert_element`).
+///   None of it is reproduced here.
+///
+/// `par`/`text`/`audio` are created with no namespace, matching real
+/// upstream: `seq.makeelement('par')` with a bare tag name creates a
+/// namespace-*less* element regardless of `seq`'s own namespace --
+/// lxml does not propagate an ancestor's default `xmlns` onto new
+/// children created this way. Upstream's own `remove_embedded_tts`
+/// corroborates this isn't accidental-looking to its author either: it
+/// reads these elements back with `local-name() = "audio"` rather than
+/// a namespace-qualified test.
+///
+/// The one attribute that must keep its namespace prefix to stay
+/// EPUB3-conformant, `epub:textref`, is stored under that literal
+/// qualified string. [`Xml`]'s own documented convention is that
+/// attributes are stored unprefixed because every document it has
+/// handled until now (OPF/NCX/OCF, DOCX) only ever has unprefixed
+/// attributes; SMIL's one real namespaced attribute is a genuine, narrow
+/// exception, not a violation of that convention for those other
+/// documents.
+pub fn make_par(xml: &mut Xml, seq: XmlNodeId, html_href: &str, audio_href: &str, elem_id: &str, pos: f64, duration: f64) {
+    xml.set_attr(seq, "epub:textref", html_href);
+
+    let par_number = xml.element_children(seq).len() + 1;
+    let par = xml.new_element("par", None);
+    xml.set_attr(par, "id", format!("par-{par_number}"));
+    xml.insert_element(seq, par, None);
+
+    let text = xml.new_element("text", None);
+    xml.set_attr(text, "src", format!("{html_href}#{elem_id}"));
+    xml.insert_element(par, text, None);
+
+    let audio = xml.new_element("audio", None);
+    xml.set_attr(audio, "src", audio_href);
+    xml.set_attr(audio, "clipBegin", seconds_to_timestamp(pos));
+    xml.set_attr(audio, "clipEnd", seconds_to_timestamp(pos + duration));
+    xml.insert_element(par, audio, None);
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1122,4 +1182,97 @@ mod tests {
         set_text(&mut dom, p, None);
         assert_eq!(dom.serialize(p), "<p><b>x</b></p>");
     }
-}
+
+    // ---- SMIL media-overlay generation (issue #646) --------------------
+
+    /// The exact template `embed_tts` writes before calling `make_par`
+    /// (see `old_src/.../tts.py`'s `embed_tts`), minus the `X` marker
+    /// text upstream immediately truncates away.
+    fn smil_fixture() -> (Xml, XmlNodeId) {
+        let xml = Xml::parse(
+            r#"<smil xmlns="http://www.w3.org/ns/SMIL" xmlns:epub="http://www.idpf.org/2007/ops" version="3.0">
+  <body>
+    <seq id="generated-by-calibre">
+    </seq>
+  </body>
+</smil>"#,
+        )
+        .unwrap();
+        let smil = xml.root_element().unwrap();
+        let body = xml.element_children(smil)[0];
+        let seq = xml.element_children(body)[0];
+        (xml, seq)
+    }
+
+    #[test]
+    fn make_par_appends_a_text_audio_pair() {
+        let (mut xml, seq) = smil_fixture();
+        make_par(&mut xml, seq, "chapter1.xhtml", "audio.m4a", "cttsw-1", 1.5, 2.25);
+
+        let pars = xml.element_children(seq);
+        assert_eq!(pars.len(), 1);
+        let par = pars[0];
+        assert_eq!(xml.local_name(par), Some("par"));
+        assert_eq!(xml.namespace(par), None, "par must have no namespace, matching real upstream");
+        assert_eq!(xml.get_attr(par, "id"), Some("par-1"));
+
+        let children = xml.element_children(par);
+        assert_eq!(children.len(), 2);
+        let (text, audio) = (children[0], children[1]);
+        assert_eq!(xml.local_name(text), Some("text"));
+        assert_eq!(xml.get_attr(text, "src"), Some("chapter1.xhtml#cttsw-1"));
+        assert_eq!(xml.local_name(audio), Some("audio"));
+        assert_eq!(xml.get_attr(audio, "src"), Some("audio.m4a"));
+        assert_eq!(xml.get_attr(audio, "clipBegin"), Some("00:00:01.5"));
+        assert_eq!(xml.get_attr(audio, "clipEnd"), Some("00:00:03.75"));
+    }
+
+    #[test]
+    fn make_par_sets_the_seqs_textref_to_the_html_href() {
+        let (mut xml, seq) = smil_fixture();
+        make_par(&mut xml, seq, "chapter1.xhtml", "audio.m4a", "cttsw-1", 0.0, 1.0);
+        assert_eq!(xml.get_attr(seq, "epub:textref"), Some("chapter1.xhtml"));
+    }
+
+    #[test]
+    fn successive_calls_number_pars_sequentially_and_keep_them_in_order() {
+        let (mut xml, seq) = smil_fixture();
+        make_par(&mut xml, seq, "c1.xhtml", "a.m4a", "cttsw-1", 0.0, 1.0);
+        make_par(&mut xml, seq, "c1.xhtml", "a.m4a", "cttsw-2", 1.0, 1.0);
+        make_par(&mut xml, seq, "c1.xhtml", "a.m4a", "cttsw-3", 2.0, 1.0);
+
+        let pars = xml.element_children(seq);
+        assert_eq!(pars.len(), 3);
+        let ids: Vec<&str> = pars.iter().map(|&p| xml.get_attr(p, "id").unwrap()).collect();
+        assert_eq!(ids, ["par-1", "par-2", "par-3"]);
+        let elem_ids: Vec<&str> = pars
+            .iter()
+            .map(|&p| {
+                let text = xml.element_children(p)[0];
+                let src = xml.get_attr(text, "src").unwrap();
+                src.rsplit('#').next().unwrap()
+            })
+            .collect();
+        assert_eq!(elem_ids, ["cttsw-1", "cttsw-2", "cttsw-3"]);
+    }
+
+    #[test]
+    fn the_epub_textref_prefix_survives_serialization() {
+        let (mut xml, seq) = smil_fixture();
+        make_par(&mut xml, seq, "chapter1.xhtml", "audio.m4a", "cttsw-1", 0.0, 1.0);
+        let out = String::from_utf8(xml.serialize()).unwrap();
+        assert!(out.contains("epub:textref=\"chapter1.xhtml\""), "{out}");
+        assert!(out.contains("<par id=\"par-1\">"), "{out}");
+        assert!(out.contains("<text src=\"chapter1.xhtml#cttsw-1\" />"), "{out}");
+        assert!(out.contains("<audio src=\"audio.m4a\" clipBegin=\"00:00:00\" clipEnd=\"00:00:01\" />"), "{out}");
+    }
+
+    #[test]
+    fn clip_timestamps_use_the_real_hms_format() {
+        let (mut xml, seq) = smil_fixture();
+        make_par(&mut xml, seq, "c.xhtml", "a.m4a", "s1", 3661.0, 5.0);
+        let par = xml.element_children(seq)[0];
+        let audio = xml.element_children(par)[1];
+        assert_eq!(xml.get_attr(audio, "clipBegin"), Some("01:01:01"));
+        assert_eq!(xml.get_attr(audio, "clipEnd"), Some("01:01:06"));
+    }}

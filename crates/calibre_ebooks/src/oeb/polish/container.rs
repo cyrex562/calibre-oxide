@@ -1757,7 +1757,7 @@ fn collect_ids(xml: &Xml, id: XmlNodeId, out: &mut HashSet<String>) {
 }
 
 /// Port of `seconds_to_timestamp`.
-fn seconds_to_timestamp(duration: f64) -> String {
+pub(crate) fn seconds_to_timestamp(duration: f64) -> String {
     let seconds_total = duration.floor();
     let float_part = duration - seconds_total;
     let seconds_total = seconds_total as u64;
