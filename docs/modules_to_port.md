@@ -518,7 +518,15 @@ either -- this pass wasn't exhaustive.
 - [x] `__init__.py` (docstring only) -> `html/mod.rs`
 - [x] `input.py` -> `html/input.rs`
 - [x] `meta.py` -> `html/meta.rs`
-- [x] `to_zip.py` -> `html/to_zip.rs` (settings + packaging; the `gui_convert` input dump `run()` needs is #147, and `do_user_config` is Qt)
+- [x] `to_zip.py` -> `html/to_zip.rs` (settings + packaging + `run()`,
+      issue #147 CLOSED: `conversion::plumber::dump_input` runs the
+      input stage via the already-real `convert_to_oebbook` and writes
+      the result out via the already-real `oeb::writer::OEBWriter` --
+      both pieces existed, #147's real work was the ~4-line glue, not a
+      new plumber architecture. `do_user_config` is Qt, out of scope.
+      Not yet threaded through: the plugin's `encoding`/`breadth_first`/
+      `allow_local_files_outside_root` settings don't reach the input
+      plugin yet, pending #126's generic `OptionRecommendation` plumbing.)
 
 #### htmlz
 

@@ -11,11 +11,13 @@
 //!
 //! The plugin's `run()` drives the whole conversion pipeline through
 //! `gui_convert(..., abort_after_input_dump=True)` and then packages
-//! what the pipeline dumped. The pipeline half is not portable yet —
-//! `calibre_conversion`'s plumber does not have the input-dump entry
-//! point — so this module ports the two halves that are: the settings
-//! parsing, and [`package_dump`], which turns a dumped input directory
-//! into the zip. Wiring the middle together is #147.
+//! what the pipeline dumped. [`run`] wires this together (issue #147)
+//! using [`crate::conversion::plumber::dump_input`] for the pipeline
+//! half and [`package_dump`] for the packaging half; see `dump_input`'s
+//! own docs for the one real gap that remains (the plugin's
+//! encoding/breadth-first/allow-local-files-outside-root settings
+//! aren't threaded down into the input plugin yet -- that needs #126's
+//! generic `OptionRecommendation` plumbing).
 //!
 //! `do_user_config` is a Qt dialog and is out of scope, like the other
 //! Qt surfaces in this repo.
@@ -187,6 +189,21 @@ pub fn package_dump(dump_dir: &Path, output: &Path) -> anyhow::Result<Packaged> 
     })
 }
 
+/// Port of the plugin's `run(htmlfile)`: converts `htmlfile` and packages
+/// the result into a zip at `output`.
+///
+/// Real upstream returns a path to a `NamedTemporaryFile` it creates
+/// itself; this port takes an explicit `output` path instead, matching
+/// every other conversion plugin in this crate (`convert(&book,
+/// &self.output_path)`) rather than managing a hidden temp file whose
+/// lifetime the caller would otherwise need to track separately.
+pub fn run(htmlfile: &Path, output: &Path) -> anyhow::Result<Packaged> {
+    let tdir = tempfile::tempdir()?;
+    let dump_dir = tdir.path().join("input");
+    crate::conversion::plumber::dump_input(htmlfile, &dump_dir)?;
+    package_dump(&dump_dir, output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,6 +328,36 @@ mod tests {
         let out = TempDir::new().unwrap();
         let err = package_dump(src.path(), &out.path().join("o.zip")).unwrap_err();
         assert!(err.to_string().contains("no OPF"), "{err}");
+    }
+
+    #[test]
+    fn run_converts_a_real_html_file_into_a_real_zip() {
+        let src = TempDir::new().unwrap();
+        std::fs::write(
+            src.path().join("index.html"),
+            "<html><head><title>A Loose Page</title></head><body><h1>Hello</h1></body></html>",
+        )
+        .unwrap();
+
+        let out_dir = TempDir::new().unwrap();
+        let output = out_dir.path().join("packaged.zip");
+        let packaged = run(&src.path().join("index.html"), &output).unwrap();
+
+        assert!(packaged.opf_name.ends_with(".opf"));
+        assert!(output.exists());
+
+        let file = std::fs::File::open(&output).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        let mut container_xml = String::new();
+        zip.by_name("META-INF/container.xml")
+            .unwrap()
+            .read_to_string(&mut container_xml)
+            .unwrap();
+        assert!(container_xml.contains(&packaged.opf_name));
+
+        let mut opf_text = String::new();
+        zip.by_name(&packaged.opf_name).unwrap().read_to_string(&mut opf_text).unwrap();
+        assert!(opf_text.contains("<manifest>"));
     }
 
     #[test]
