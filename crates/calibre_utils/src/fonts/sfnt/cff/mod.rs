@@ -12,3 +12,4 @@
 
 pub mod constants;
 pub mod dict_data;
+pub mod table;
