@@ -153,16 +153,33 @@ Cross-validation pattern per format:
 
 ## Playtest flow
 
-When the user runs `harness playtest-ready`, the harness:
+`harness playtest-ready [--since <ref>] [--no-tag]` is a standalone
+reporting command over already-merged history — it does not depend on
+the autonomous `run`/`sweep` pipeline above (which, in practice, has
+never been the way real work lands here; every real port merges via
+`gh pr merge --squash` directly, not through the judge loop). When run,
+it:
 
-1. Rebases and re-verifies each green-judged branch against latest master.
-2. Merges them.
-3. Emits a per-cluster checklist to `.harness/playtest/<timestamp>.md`
-   with: what was added, what to click, what to look for. This is the
-   "list of things to check" the user asked for.
-4. On feedback prompt from user, the harness ingests the feedback, opens
-   one issue per distinct concern, and prioritizes them ahead of new port
-   work.
+1. Resolves `--since` (explicit ref, else the most recent
+   `playtest-<timestamp>` tag, else `origin/master`).
+2. Walks `git log --no-merges <since>..HEAD` — every real merge in this
+   repo is a squash commit, never a two-parent merge commit, so this is
+   the real analogue of "walk merges since `since`".
+3. Groups each commit by cluster, inferred from its changed files'
+   crate directory (`crates/calibre_db` -> `db`, etc. — the same
+   mapping `seed-issues` uses for placeholders).
+4. Emits `.harness/playtest/<timestamp>.md`: each commit's subject, its
+   `## Summary` bullets if its body has one (real content when the
+   commit itself carries a PR description), and the files it touched.
+   This deliberately doesn't fabricate "what to click" — the tool has
+   no way to know what a change looks like in a running app; a human
+   reads the summary and files to judge that.
+5. Tags `HEAD` as `playtest-<timestamp>` (unless `--no-tag`), so the
+   next invocation's default `--since` picks up from here.
+
+Ingesting playtest feedback into new issues is not implemented — no
+real workflow in this repo currently produces that feedback in a form
+the harness could parse.
 
 ## State
 
