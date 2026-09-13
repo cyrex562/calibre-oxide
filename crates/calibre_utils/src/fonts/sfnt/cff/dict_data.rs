@@ -299,6 +299,7 @@ pub struct DictEntry {
 
 /// The real per-flavor schema: its field table plus the `FILTERED`/
 /// `OFFSETS` name sets.
+#[derive(Debug)]
 pub struct DictSchema {
     pub table: &'static [DictEntry],
     /// Real upstream's `FILTERED`: fields that are decoded (so
@@ -388,6 +389,7 @@ pub static PRIVATE_DICT_SCHEMA: DictSchema = DictSchema {
 // ---------------------------------------------------------------------
 
 /// Port of `Dict`/`TopDict`/`PrivateDict` (the schema selects which).
+#[derive(Debug)]
 pub struct Dict {
     schema: &'static DictSchema,
     values: std::collections::HashMap<&'static str, Value>,
