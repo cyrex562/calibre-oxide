@@ -31,13 +31,25 @@
 //! never sees the hidden `@page` rule) is identical; only the concrete
 //! on-disk encoding differs from real calibre's own kepub output.
 
-use anyhow::Result;
+use std::fs;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 
+use anyhow::{Context, Result};
+
+use crate::covers::{generate_cover, CoverPrefs};
 use crate::css::model::{Rule, Stylesheet, UnknownAtRule};
 use crate::dom::{Dom, NodeId, NodeKind};
 use crate::metadata::authors::authors_to_string;
 use crate::metadata::meta::MetaInformation;
-use crate::oeb::polish::container::{Container, ParsedItem};
+use crate::oeb::constants::{OEB_DOCS, OEB_STYLES};
+use crate::oeb::parse_utils::merge_multiple_html_heads_and_bodies;
+use crate::oeb::polish::container::{
+    get_container, AnyContainer, Container, EpubContainer, ParsedItem,
+};
+use crate::oeb::polish::cover::{find_cover_image, find_cover_image3, find_cover_page};
+use crate::oeb::polish::errors::PolishError;
+use crate::oeb::polish::parsing;
 use crate::oeb::polish::utils::insert_self_closing;
 use crate::spell::break_iterator::sentence_positions;
 
@@ -1129,6 +1141,356 @@ pub fn remove_kobo_markup_from_html(dom: &mut Dom, root: NodeId) {
     }
 }
 
+// ---------------------------------------------------------------------
+// Container-wide orchestrators (issue #654)
+// ---------------------------------------------------------------------
+//
+// Everything above operates on one parsed document at a time; this
+// section ties it together the way real upstream's `kepubify_container`/
+// `unkepubify_container` do: find/generate a cover, add a dummy title
+// page if needed, then dispatch every manifest document/stylesheet
+// through [`kepubify_parsed_html`]/[`process_stylesheet`].
+//
+// Real upstream dispatches per-file work across a `ThreadPoolExecutor`
+// sized by `calculate_number_of_workers` (`calibre.srv.render_book`,
+// itself a heuristic over free memory/file sizes). This port reuses this
+// crate's own established `std::thread::scope` + shared-queue pattern
+// instead (see `comic::page_processor::process_pages`,
+// `web::feeds::download::build_index`) with a plain
+// `available_parallelism()` worker count -- a disclosed narrowing of the
+// exact sizing heuristic, not of the parallelism itself: every file
+// still gets processed, just with a simpler worker-count formula.
+
+/// Embedded copy of `resources/templates/kobo.js` (Kobo's own
+/// pagination/highlighting shim), port of `kobo_js()`.
+const KOBO_JS_TEMPLATE: &[u8] = include_bytes!("../../../resources/templates/kobo.js");
+
+pub fn kobo_js() -> &'static [u8] {
+    KOBO_JS_TEMPLATE
+}
+
+/// Port of `serialize_html`. [`Dom::serialize`]'s own escaping (shared
+/// with every other writer in this crate) only covers `<`/`>`/`&`/
+/// quotes, not non-ASCII text, so -- exactly like real upstream's own
+/// post-`tostring` fixup -- a non-breaking space is turned into a
+/// numeric entity afterwards as a plain string replace.
+pub fn serialize_html(dom: &Dom) -> Vec<u8> {
+    let ans = dom.serialize(dom.root).replace('\u{a0}', "&#160;");
+    let mut out = b"<?xml version='1.0' encoding='utf-8'?>\n".to_vec();
+    out.extend_from_slice(ans.as_bytes());
+    out
+}
+
+fn style_text(dom: &Dom, style: NodeId) -> Option<String> {
+    let &first = dom.node(style).children.first()?;
+    match &dom.node(first).kind {
+        NodeKind::Text(t) => Some(t.clone()),
+        _ => None,
+    }
+}
+
+fn set_style_text(dom: &mut Dom, style: NodeId, value: &str) {
+    if let Some(&first) = dom.node(style).children.first() {
+        set_text(dom, first, value);
+    }
+}
+
+/// Port of `kepubify_parsed_html`. `root` is the document's `<html>`
+/// element (from [`Dom::find_first_tag_global`]), not [`Dom::root`]
+/// (the document pseudo-node) -- matching every other function in this
+/// module that takes a `root: NodeId`.
+pub fn kepubify_parsed_html(dom: &mut Dom, root: NodeId, kobo_js_href: &str, opts: &Options, metadata_lang: &str) {
+    remove_kobo_markup_from_html(dom, root);
+    if !opts.for_removal {
+        merge_multiple_html_heads_and_bodies(dom, root);
+    }
+    if opts.needs_stylesheet_processing() {
+        for style in dom.find_all_tag(root, "style") {
+            let typ = dom.node(style).attrs.get("type").cloned().unwrap_or_else(|| "text/css".to_string());
+            if typ != "text/css" {
+                continue;
+            }
+            if let Some(text) = style_text(dom, style) {
+                if !text.is_empty() {
+                    let processed = process_stylesheet(&text, opts);
+                    if processed != text {
+                        set_style_text(dom, style, &processed);
+                    }
+                }
+            }
+        }
+    }
+    if !opts.for_removal {
+        add_kobo_markup_to_html(dom, root, kobo_js_href, opts, metadata_lang);
+    }
+}
+
+/// Port of `kepubify_html_data`.
+pub fn kepubify_html_data(raw: &[u8], kobo_js_href: &str, opts: &Options, metadata_lang: &str) -> Dom {
+    let (text, _encoding) = crate::chardet::xml_to_unicode(raw, false, true);
+    let mut dom = parsing::parse(&text, true, false);
+    if let Some(root) = dom.find_first_tag_global("html") {
+        kepubify_parsed_html(&mut dom, root, kobo_js_href, opts, metadata_lang);
+    }
+    dom
+}
+
+/// Port of `kepubify_html_path`.
+pub fn kepubify_html_path(path: &Path, kobo_js_href: &str, metadata_lang: &str, opts: &Options) -> Result<()> {
+    let raw = fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let dom = kepubify_html_data(&raw, kobo_js_href, opts, metadata_lang);
+    let out = serialize_html(&dom);
+    fs::write(path, out).with_context(|| format!("Failed to write {}", path.display()))?;
+    Ok(())
+}
+
+/// Port of `process_stylesheet_path`.
+pub fn process_stylesheet_path(path: &Path, opts: &Options) -> Result<()> {
+    if !opts.needs_stylesheet_processing() {
+        return Ok(());
+    }
+    let css = fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let ncss = process_stylesheet(&css, opts);
+    if ncss != css {
+        fs::write(path, ncss).with_context(|| format!("Failed to write {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Port of `process_path`.
+pub fn process_path(path: &Path, kobo_js_href: &str, metadata_lang: &str, opts: &Options, media_type: &str) -> Result<()> {
+    if OEB_DOCS.contains(&media_type) {
+        kepubify_html_path(path, kobo_js_href, metadata_lang, opts)?;
+    } else if OEB_STYLES.contains(&media_type) {
+        process_stylesheet_path(path, opts)?;
+    }
+    Ok(())
+}
+
+/// Port of `do_work_in_parallel`. See this section's module docs for
+/// why worker sizing doesn't reproduce `calculate_number_of_workers`.
+pub fn do_work_in_parallel(container: &mut Container, kobo_js_name: &str, opts: &Options, metadata_lang: &str, max_workers: usize) -> Result<()> {
+    let names_that_need_work: Vec<String> = container
+        .base
+        .mime_map
+        .iter()
+        .filter(|(_, mt)| OEB_DOCS.contains(&mt.as_str()) || OEB_STYLES.contains(&mt.as_str()))
+        .map(|(n, _)| n.clone())
+        .collect();
+
+    let mut tasks: Vec<(std::path::PathBuf, String, String)> = Vec::with_capacity(names_that_need_work.len());
+    for name in &names_that_need_work {
+        let href = container.name_to_href(kobo_js_name, Some(name));
+        let media_type = container.base.mime_map.get(name).cloned().unwrap_or_default();
+        let path = container.get_file_path_for_processing(name, true)?;
+        tasks.push((path, href, media_type));
+    }
+
+    let num_workers = if max_workers > 0 {
+        max_workers
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(tasks.len().max(1))
+    };
+
+    if num_workers < 2 {
+        for (path, href, media_type) in &tasks {
+            process_path(path, href, metadata_lang, opts, media_type)?;
+        }
+        return Ok(());
+    }
+
+    let queue = Mutex::new(tasks.into_iter());
+    let errors: Mutex<Vec<anyhow::Error>> = Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..num_workers {
+            let queue = &queue;
+            let errors = &errors;
+            scope.spawn(move || loop {
+                let task = { queue.lock().unwrap().next() };
+                let Some((path, href, media_type)) = task else { break };
+                if let Err(e) = process_path(&path, &href, metadata_lang, opts, &media_type) {
+                    errors.lock().unwrap().push(e);
+                }
+            });
+        }
+    });
+    if let Some(e) = errors.into_inner().unwrap().into_iter().next() {
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Port of `remove_kobo_files`.
+pub fn remove_kobo_files(container: &mut Container) -> Result<()> {
+    let entries: Vec<(String, String)> = container.base.mime_map.iter().map(|(n, mt)| (n.clone(), mt.clone())).collect();
+    for (name, mt) in entries {
+        let fname = name.rsplit('/').next().unwrap_or(&name);
+        if (mt == "application/javascript" && fname == KOBO_JS_NAME) || (mt == "text/css" && fname == KOBO_CSS_NAME) {
+            container.remove_item(&name, true)?;
+        }
+    }
+    Ok(())
+}
+
+fn bytes_contains(hay: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Port of `check_for_kobo_drm`.
+pub fn check_for_kobo_drm(container: &mut Container) -> Result<()> {
+    if !container.has_name_and_is_not_empty("rights.xml") {
+        return Ok(());
+    }
+    for (name, _is_linear) in container.spine_names()? {
+        let mt = container.base.mime_map.get(&name).cloned().unwrap_or_default();
+        if !OEB_DOCS.contains(&mt.as_str()) {
+            continue;
+        }
+        let raw = container.read_file(&name)?;
+        let head = &raw[..raw.len().min(8192)];
+        if !bytes_contains(head, b"<?xml") && !bytes_contains(head, b"<html") && !bytes_contains(head, KOBO_SPAN_CLASS.as_bytes()) {
+            return Err(PolishError::drm().into());
+        }
+        break;
+    }
+    Ok(())
+}
+
+/// Port of `uniqify_name`. Real upstream has a genuine bug in its retry
+/// branch: `f'{uuid4()}/fname'` is a literal string `"fname"` with no
+/// interpolation (missing braces around the parameter), not
+/// `f'{uuid4()}/{fname}'` -- so a collision retry produces a path like
+/// `<uuid>/fname` regardless of the actual requested name. Replicated
+/// bug-for-bug, matching this project's own established precedent
+/// (issue #653's disclosed bugs) of porting real observed behavior
+/// rather than the obviously-intended one.
+pub fn uniqify_name(container: &mut Container, fname: &str) -> Result<String> {
+    let mut q = fname.to_string();
+    while container.has_name_case_insensitive(&q) || container.manifest_has_name(&q)? {
+        q = format!("{}/fname", calibre_utils::short_uuid::uuid4());
+    }
+    Ok(q)
+}
+
+fn container_mi(container: &mut Container) -> Result<MetaInformation> {
+    let opf_bytes = container.opf()?.serialize();
+    crate::opf::parse_opf(&String::from_utf8_lossy(&opf_bytes)).map_err(|e| anyhow::anyhow!("parsing OPF metadata: {e}"))
+}
+
+/// Port of `unkepubify_container`.
+pub fn unkepubify_container(container: &mut Container, max_workers: usize) -> Result<()> {
+    check_for_kobo_drm(container)?;
+    remove_dummy_cover_image(container)?;
+    remove_dummy_title_page(container)?;
+    remove_kobo_files(container)?;
+    let opts = Options { for_removal: true, ..Default::default() };
+    let mi = container_mi(container)?;
+    let metadata_lang = mi.languages.first().cloned().unwrap_or_default();
+    do_work_in_parallel(container, KOBO_JS_NAME, &opts, &metadata_lang, max_workers)
+}
+
+/// Port of `kepubify_container`. `fontdb` backs the last-resort
+/// synthesized cover path (`covers::generate_cover`, issue #116) for
+/// books with no cover image at all -- callers typically build it once
+/// via `covers_text::load_system_fonts()` and share it across calls.
+pub fn kepubify_container(container: &mut Container, opts: &Options, max_workers: usize, fontdb: &Arc<fontdb::Database>) -> Result<()> {
+    remove_dummy_title_page(container)?;
+    remove_dummy_cover_image(container)?;
+    remove_kobo_files(container)?;
+    let mi = container_mi(container)?;
+
+    let mut cover_image_name = find_cover_image(container, false)?;
+    if cover_image_name.is_none() {
+        cover_image_name = find_cover_image3(container)?;
+    }
+    let cover_image_name = match cover_image_name {
+        Some(n) => n,
+        None => {
+            let cdata = generate_cover(&mi, &CoverPrefs::default(), fontdb, false)
+                .ok_or_else(|| anyhow::anyhow!("Failed to generate a dummy cover image"))?;
+            container.add_file(&format!("{DUMMY_COVER_IMAGE_NAME}.jpeg"), &cdata, None, None, true)?
+        }
+    };
+    container.apply_unique_properties(Some(&cover_image_name), &["cover-image"])?;
+
+    // Real upstream passes `suggested_id='js-kobo.js'` to `add_file`
+    // here; this port's `add_file` (ported before #654, see its own
+    // docs) has no `suggested_id` parameter, so the manifest item gets
+    // an auto-assigned id (`id`/`id-1`/...) instead of `js-kobo.js`.
+    // Purely cosmetic -- nothing dereferences a manifest item by id for
+    // the kobo.js entry -- so not worth widening `add_file` for.
+    let kobo_js_name = uniqify_name(container, KOBO_JS_NAME)?;
+    let kobo_js_name = container.add_file(&kobo_js_name, kobo_js(), Some("application/javascript"), None, true)?;
+
+    if find_cover_page(container)?.is_none() && !first_spine_item_is_probably_title_page(container)? {
+        add_dummy_title_page_for(container, Some(&cover_image_name), &mi, &kobo_js_name)?;
+    }
+    let metadata_lang = mi.languages.first().cloned().unwrap_or_default();
+    do_work_in_parallel(container, &kobo_js_name, opts, &metadata_lang, max_workers)
+}
+
+fn splitext_replace(path: &Path, new_ext: &str) -> std::path::PathBuf {
+    path.with_extension(new_ext)
+}
+
+fn unique_outpath(path: &Path, base_outpath: std::path::PathBuf, allow_overwrite: bool, ext: &str) -> std::path::PathBuf {
+    let mut outpath = base_outpath;
+    if !allow_overwrite {
+        let stem = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        let mut c = 0u32;
+        while outpath == path {
+            c += 1;
+            outpath = path.with_file_name(format!("{stem}-{c}.{ext}"));
+        }
+    }
+    outpath
+}
+
+/// Port of `kepubify_path`.
+pub fn kepubify_path(
+    path: &Path,
+    outpath: Option<&Path>,
+    max_workers: usize,
+    allow_overwrite: bool,
+    opts: &Options,
+    fontdb: &Arc<fontdb::Database>,
+) -> Result<std::path::PathBuf> {
+    let tdir = tempfile::tempdir()?;
+    let mut any = get_container(path, tdir.path(), true)?;
+    kepubify_container(any.as_container_mut(), opts, max_workers, fontdb)?;
+    let outpath = unique_outpath(path, outpath.map(|p| p.to_path_buf()).unwrap_or_else(|| splitext_replace(path, "kepub")), allow_overwrite, "kepub");
+    match &mut any {
+        AnyContainer::Epub(c) => c.commit(Some(&outpath))?,
+        AnyContainer::Kepub(c) => c.epub.commit(Some(&outpath))?,
+        AnyContainer::Azw3(c) => c.commit(Some(&outpath))?,
+    }
+    Ok(outpath)
+}
+
+/// Port of `unkepubify_path`. Real upstream forces `ebook_cls=
+/// EpubContainer` here so a `.kepub` input is opened as a plain
+/// `EpubContainer` rather than through `KEPUBContainer`'s own
+/// auto-unkepubify-on-open (which would double-unkepubify it). This
+/// port has no `ebook_cls` override on [`get_container`] -- its one
+/// real caller needing that behavior calls
+/// [`EpubContainer::open_zip`]/[`EpubContainer::open_dir`] directly
+/// instead of widening the generic dispatcher for a single use site.
+pub fn unkepubify_path(path: &Path, outpath: Option<&Path>, max_workers: usize, allow_overwrite: bool) -> Result<std::path::PathBuf> {
+    let tdir = tempfile::tempdir()?;
+    let mut epub = if path.is_dir() {
+        EpubContainer::open_dir(path, tdir.path())?
+    } else {
+        EpubContainer::open_zip(path, tdir.path())?
+    };
+    unkepubify_container(&mut epub.container, max_workers)?;
+    let outpath = unique_outpath(path, outpath.map(|p| p.to_path_buf()).unwrap_or_else(|| splitext_replace(path, "epub")), allow_overwrite, "epub");
+    epub.commit(Some(&outpath))?;
+    Ok(outpath)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1847,5 +2209,302 @@ in it to fail every title-page text-length heuristic that exists in this codebas
         .unwrap();
         let mut c = crate::oeb::polish::container::Container::open(dir.path(), &dir.path().join("content.opf")).unwrap();
         assert!(first_spine_item_is_probably_title_page(&mut c).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod orchestrator_tests {
+    use super::*;
+    use crate::oeb::polish::container::Container;
+    use std::io::{self, Write as _};
+
+    const COVER_JPEG: &[u8] = &[
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x00, 0x00,
+        0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
+    ];
+
+    fn write_book(dir: &Path, with_cover: bool) {
+        fs::create_dir_all(dir.join("META-INF")).unwrap();
+        fs::write(
+            dir.join("META-INF/container.xml"),
+            br#"<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"#,
+        )
+        .unwrap();
+        let cover_manifest = if with_cover {
+            r#"<item id="cover" href="cover.jpeg" media-type="image/jpeg" properties="cover-image"/>"#
+        } else {
+            ""
+        };
+        fs::write(
+            dir.join("content.opf"),
+            format!(
+                r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" xmlns:dc="http://purl.org/dc/elements/1.1/" version="3.0" unique-identifier="bookid">
+  <metadata>
+    <dc:title>Test Book</dc:title>
+    <dc:creator>Jane Author</dc:creator>
+    <dc:language>en</dc:language>
+    <dc:identifier id="bookid">urn:uuid:12345678-1234-1234-1234-123456789012</dc:identifier>
+  </metadata>
+  <manifest>
+    <item id="c1" href="chap1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="c2" href="chap2.xhtml" media-type="application/xhtml+xml"/>
+    <item id="css" href="style.css" media-type="text/css"/>
+    {cover_manifest}
+  </manifest>
+  <spine>
+    <itemref idref="c1"/>
+    <itemref idref="c2"/>
+  </spine>
+</package>"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("chap1.xhtml"),
+            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><head></head><body>\
+              <p>The quick brown fox jumps over the lazy dog. It was a good jump.</p>\
+              </body></html>",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("chap2.xhtml"),
+            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><head></head><body>\
+              <p>Second chapter text, also long enough not to look like a title page.</p>\
+              </body></html>",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("style.css"),
+            b"p { widows: 2; orphans: 3; } @page { margin: 1in; }",
+        )
+        .unwrap();
+        if with_cover {
+            fs::write(dir.join("cover.jpeg"), COVER_JPEG).unwrap();
+        }
+    }
+
+    fn test_fontdb() -> Arc<fontdb::Database> {
+        Arc::new(crate::covers_text::load_system_fonts())
+    }
+
+    fn spine_html(container: &mut Container, name: &str) -> String {
+        String::from_utf8(container.raw_data(name, false).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn kepubify_container_adds_markup_and_unkepubify_reverses_it() {
+        let dir = tempfile::tempdir().unwrap();
+        write_book(dir.path(), true);
+        let mut container = Container::open(dir.path(), &dir.path().join("content.opf")).unwrap();
+
+        // Real upstream's own default `Options()` leaves CSS untouched
+        // (`needs_stylesheet_processing` is false unless a flag is set
+        // explicitly, typically via `make_options`) -- set these
+        // explicitly to also exercise the stylesheet-hiding path.
+        let opts = Options { remove_at_page_rules: true, remove_widows_and_orphans: true, ..Default::default() };
+        kepubify_container(&mut container, &opts, 1, &test_fontdb()).unwrap();
+
+        // Kobo span/style/script markup landed in both content docs.
+        let chap1 = spine_html(&mut container, "chap1.xhtml");
+        assert!(chap1.contains(KOBO_SPAN_CLASS), "expected koboSpan markup, got: {chap1}");
+        assert!(chap1.contains(KOBO_CSS_ID));
+        assert!(chap1.contains(OUTER_DIV_ID) && chap1.contains(INNER_DIV_ID));
+
+        // The existing cover image was reused (no dummy cover generated).
+        assert!(!container.base.mime_map.keys().any(|n| n.contains(DUMMY_COVER_IMAGE_NAME)));
+        // A cover *image* isn't a cover *page*: neither spine chapter is
+        // one either (both are plain, longish paragraphs), so a dummy
+        // title page pointing at the real cover image gets generated.
+        assert!(container.base.mime_map.keys().any(|n| n.contains(DUMMY_TITLE_PAGE_NAME)));
+        // A kobo.js file was added to the manifest.
+        assert!(container.base.mime_map.values().any(|mt| mt == "application/javascript"));
+        // @page/widows/orphans got hidden in the stylesheet. The raw
+        // text can still contain the substrings "@page"/"widows" (the
+        // hidden payload/property name embed them, see this module's
+        // own docs on the disclosed comment-vs-marker-at-rule
+        // narrowing) -- assert structurally instead, via a real parse.
+        let css = spine_html(&mut container, "style.css");
+        let parsed_css = Stylesheet::parse(&css);
+        assert!(!parsed_css.rules.iter().any(|r| matches!(r, Rule::Page(_))), "still a live @page rule: {css}");
+        let style_rule = parsed_css.style_rules().next().expect("one style rule");
+        assert!(style_rule.style.get_property("widows").is_none());
+        assert!(style_rule.style.get_property("orphans").is_none());
+
+        unkepubify_container(&mut container, 1).unwrap();
+        let chap1_after = spine_html(&mut container, "chap1.xhtml");
+        assert!(!chap1_after.contains(KOBO_SPAN_CLASS));
+        assert!(!chap1_after.contains(KOBO_CSS_ID));
+        assert!(!chap1_after.contains(OUTER_DIV_ID));
+        assert!(!container.base.mime_map.values().any(|mt| mt == "application/javascript"));
+        assert!(!container.base.mime_map.keys().any(|n| n.contains(DUMMY_TITLE_PAGE_NAME)));
+        let css_after = spine_html(&mut container, "style.css");
+        assert!(css_after.contains("@page"));
+        assert!(css_after.contains("widows"));
+    }
+
+    #[test]
+    fn kepubify_container_generates_a_dummy_cover_when_none_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        write_book(dir.path(), false);
+        let mut container = Container::open(dir.path(), &dir.path().join("content.opf")).unwrap();
+
+        kepubify_container(&mut container, &Options::default(), 1, &test_fontdb()).unwrap();
+
+        let dummy_cover = container
+            .base
+            .mime_map
+            .keys()
+            .find(|n| n.contains(DUMMY_COVER_IMAGE_NAME))
+            .cloned()
+            .expect("a dummy cover should have been generated");
+        assert!(!container.raw_data(&dummy_cover, false).unwrap().is_empty());
+
+        unkepubify_container(&mut container, 1).unwrap();
+        assert!(!container.base.mime_map.keys().any(|n| n.contains(DUMMY_COVER_IMAGE_NAME)));
+    }
+
+    #[test]
+    fn check_for_kobo_drm_passes_when_no_rights_xml() {
+        let dir = tempfile::tempdir().unwrap();
+        write_book(dir.path(), true);
+        let mut container = Container::open(dir.path(), &dir.path().join("content.opf")).unwrap();
+        assert!(check_for_kobo_drm(&mut container).is_ok());
+    }
+
+    #[test]
+    fn check_for_kobo_drm_rejects_locked_content() {
+        let dir = tempfile::tempdir().unwrap();
+        write_book(dir.path(), true);
+        // rights.xml present + the spine's first doc has none of the
+        // "not actually locked" markers real upstream checks for.
+        fs::write(dir.path().join("rights.xml"), b"<rights/>").unwrap();
+        fs::write(dir.path().join("chap1.xhtml"), vec![0u8; 64]).unwrap();
+        let mut container = Container::open(dir.path(), &dir.path().join("content.opf")).unwrap();
+        let err = check_for_kobo_drm(&mut container).unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("drm"));
+    }
+
+    #[test]
+    fn uniqify_name_replicates_the_missing_interpolation_bug() {
+        let dir = tempfile::tempdir().unwrap();
+        write_book(dir.path(), true);
+        // Force a collision on the very first name checked.
+        fs::write(dir.path().join(KOBO_JS_NAME), b"//existing").unwrap();
+        let mut opf = fs::read_to_string(dir.path().join("content.opf")).unwrap();
+        opf = opf.replace(
+            "</manifest>",
+            &format!(r#"<item id="kobojs" href="{KOBO_JS_NAME}" media-type="application/javascript"/></manifest>"#),
+        );
+        fs::write(dir.path().join("content.opf"), opf).unwrap();
+        let mut container = Container::open(dir.path(), &dir.path().join("content.opf")).unwrap();
+
+        let q = uniqify_name(&mut container, KOBO_JS_NAME).unwrap();
+        assert!(q.ends_with("/fname"), "expected the literal, un-interpolated suffix, got: {q}");
+    }
+
+    #[test]
+    fn kepubify_path_and_unkepubify_path_round_trip_a_real_epub_zip() {
+        let src_dir = tempfile::tempdir().unwrap();
+        write_book(src_dir.path(), true);
+        // Pack the fixture directory into a real zip so `get_container`
+        // dispatches through `EpubContainer::open_zip`, matching how a
+        // real `.epub` file arrives on disk.
+        let epub_path = src_dir.path().join("book.epub");
+        {
+            let file = fs::File::create(&epub_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opts = zip::write::FileOptions::default();
+            for entry in walkdir::WalkDir::new(src_dir.path()).into_iter().filter_map(|e| e.ok()) {
+                if !entry.file_type().is_file() || entry.path() == epub_path {
+                    continue;
+                }
+                let rel = entry.path().strip_prefix(src_dir.path()).unwrap().to_string_lossy().replace('\\', "/");
+                zip.start_file(&rel, opts).unwrap();
+                zip.write_all(&fs::read(entry.path()).unwrap()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+
+        let fontdb = test_fontdb();
+        let kepub_path = kepubify_path(&epub_path, None, 1, false, &Options::default(), &fontdb).unwrap();
+        assert!(kepub_path.exists());
+        assert_ne!(kepub_path, epub_path);
+
+        {
+            let file = fs::File::open(&kepub_path).unwrap();
+            let mut zip = zip::ZipArchive::new(file).unwrap();
+            let mut chap1 = String::new();
+            io::Read::read_to_string(&mut zip.by_name("chap1.xhtml").unwrap(), &mut chap1).unwrap();
+            assert!(chap1.contains(KOBO_SPAN_CLASS));
+        }
+
+        let roundtrip_epub = unkepubify_path(&kepub_path, None, 1, false).unwrap();
+        assert!(roundtrip_epub.exists());
+        let file = fs::File::open(&roundtrip_epub).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        let mut chap1 = String::new();
+        io::Read::read_to_string(&mut zip.by_name("chap1.xhtml").unwrap(), &mut chap1).unwrap();
+        assert!(!chap1.contains(KOBO_SPAN_CLASS));
+    }
+
+    #[test]
+    fn open_zip_as_kepub_unkepubifies_on_open_and_kepubifies_on_commit() {
+        use crate::oeb::polish::container::{get_container, AnyContainer};
+
+        let src_dir = tempfile::tempdir().unwrap();
+        write_book(src_dir.path(), true);
+        let epub_path = src_dir.path().join("book.epub");
+        {
+            let file = fs::File::create(&epub_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opts = zip::write::FileOptions::default();
+            for entry in walkdir::WalkDir::new(src_dir.path()).into_iter().filter_map(|e| e.ok()) {
+                if !entry.file_type().is_file() || entry.path() == epub_path {
+                    continue;
+                }
+                let rel = entry.path().strip_prefix(src_dir.path()).unwrap().to_string_lossy().replace('\\', "/");
+                zip.start_file(&rel, opts).unwrap();
+                zip.write_all(&fs::read(entry.path()).unwrap()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let fontdb = test_fontdb();
+        // `get_container`'s dispatch (matching real upstream's own
+        // `path.rpartition('.')[-1]`) keys off the literal final
+        // extension, so the fixture needs to be named `*.kepub`
+        // (`kepubify_path`'s own default outpath), not `*.kepub.epub`.
+        let kepub_path = kepubify_path(&epub_path, None, 1, false, &Options::default(), &fontdb).unwrap();
+        assert_eq!(kepub_path.extension().unwrap(), "kepub");
+
+        // Opening it as a KEPUBContainer must present a *plain* EPUB
+        // (spans already stripped) to the rest of `polish`.
+        let open_tdir = tempfile::tempdir().unwrap();
+        let mut any = get_container(&kepub_path, open_tdir.path(), true).unwrap();
+        let AnyContainer::Kepub(kc) = &mut any else {
+            panic!("expected .kepub.epub to dispatch to KepubContainer");
+        };
+        let chap1 = spine_html(&mut kc.epub.container, "chap1.xhtml");
+        assert!(!chap1.contains(KOBO_SPAN_CLASS), "KEPUBContainer should unkepubify on open, got: {chap1}");
+
+        // Committing a packed (non-dir) KepubContainer re-kepubifies a
+        // *clone*, leaving `self` a plain, still-editable EPUB.
+        let commit_tdir = tempfile::tempdir().unwrap();
+        let final_path = commit_tdir.path().join("out.kepub.epub");
+        kc.commit_epub(&final_path).unwrap();
+        assert!(final_path.exists());
+        let chap1_after_commit = spine_html(&mut kc.epub.container, "chap1.xhtml");
+        assert!(!chap1_after_commit.contains(KOBO_SPAN_CLASS), "self must remain the plain, unkepubified copy");
+
+        let file = fs::File::open(&final_path).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        let mut chap1_committed = String::new();
+        io::Read::read_to_string(&mut zip.by_name("chap1.xhtml").unwrap(), &mut chap1_committed).unwrap();
+        assert!(chap1_committed.contains(KOBO_SPAN_CLASS), "the committed output must be re-kepubified");
     }
 }
