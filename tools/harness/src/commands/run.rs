@@ -1,15 +1,25 @@
 //! `harness run` — the porting iteration loop.
 //!
-//! This command is intentionally not implemented in the bootstrap PR.
-//! Implementing it requires: worktree management, subprocess control for
-//! `claude` calls, judge-rubric machinery, and PR/merge orchestration.
-//! Each of those is a substantial follow-up issue, and doing them all in
-//! one PR would make review impossible.
+//! **Deliberately not implemented, by user decision (issue #91) — not a
+//! bootstrap-scope deferral anymore.** `docs/HARNESS.md`'s own
+//! §Iteration loop design has this command spawn `claude` subprocesses
+//! to plan/implement/judge each port, then `gh pr merge --squash --auto`
+//! on a passing AI-judge verdict with **no human review** — a
+//! materially different, higher-risk shape than how every real port in
+//! this repo has actually landed: an interactive Claude Code session
+//! (via `/loop` and friends) doing the work directly, with a human
+//! present at every merge decision. That's not an accident of bootstrap
+//! sequencing; it's the tool that's actually been used, and it already
+//! covers everything this command would have done (claim/plan/implement
+//! /judge/merge), just with a human in the loop instead of an
+//! unsupervised second AI judge. Building this for real would mean
+//! adding unsupervised autonomous merging to a repo that has
+//! specifically not wanted that. Superseded, not pending -- see
+//! `docs/HARNESS.md`'s own updated note.
 //!
-//! The bootstrap PR ships `scan-placeholders`, `seed-issues`, and
-//! `status` fully working, plus the CLI surface for `run` / `sweep` /
-//! `playtest-ready` so downstream work can flesh them in without
-//! restructuring the crate.
+//! The CLI surface stays (so `harness run ...` fails with a clear
+//! message instead of "unknown subcommand"), but there is no follow-up
+//! issue tracking a real implementation.
 
 use anyhow::Result;
 use std::path::Path;
@@ -38,13 +48,13 @@ pub struct Args {
 }
 
 pub fn run(_repo: &Path, args: Args) -> Result<()> {
-    eprintln!("harness run: NOT YET IMPLEMENTED");
+    eprintln!("harness run: not implemented (deliberately -- see this file's own module doc)");
     eprintln!("  planned inputs: issues={:?}, cluster={:?}, auto={}, max_concurrent={}, max_issues={}",
         args.issues, args.cluster, args.auto, args.max_concurrent, args.max_issues);
     eprintln!();
-    eprintln!("This is intentional. The bootstrap PR ships the CLI surface and");
-    eprintln!("the placeholder/seed/status commands. The orchestration loop is");
-    eprintln!("tracked as a follow-up harness issue and will land in a separate PR.");
-    // PLACEHOLDER: implement iteration loop — see docs/HARNESS.md §Iteration loop.
-    Err(anyhow::anyhow!("harness run not implemented in bootstrap"))
+    eprintln!("The autonomous plan/implement/judge/auto-merge pipeline this command");
+    eprintln!("would run is superseded by interactive Claude Code sessions (/loop and");
+    eprintln!("friends), which is how every real port in this repo has actually landed.");
+    eprintln!("There is no follow-up issue tracking a real implementation of this command.");
+    Err(anyhow::anyhow!("harness run is deliberately unimplemented — use an interactive Claude Code session instead"))
 }
