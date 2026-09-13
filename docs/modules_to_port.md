@@ -1924,15 +1924,25 @@ Issue #74 (11 files). Per explicit project direction this is built on
 the real C++ PoDoFo library `calibre_extensions/podofo` binds. Split
 into a doc-core piece (this issue, done) plus three dependent
 sub-issues covering the larger remaining algorithms: #576 (outline/
-bookmark tree), #577 (font management), #578 (images/pages/document
-merging — dedup_images, impose, append/copy_page/insert_existing_page).
+bookmark tree, CLOSED), #577 (font management, CLOSED), #578 (images/
+pages/document merging), itself further split into #668 (simple page
+ops, CLOSED), #669 (object-graph-copy primitive + append/copy_page/
+insert_existing_page), #670 (impose), #671 (dedup_images).
 
-- [x] doc.cpp (partial — doc-core only: load/open/save/write, page_count,
-      version, the 6 Info-dict string properties, get/set_xmp_metadata,
-      image_count. `calibre_utils::podofo::PdfDoc`. Remaining doc.cpp
-      scope — delete_pages, get/set_page_box, copy_page, append,
-      insert_existing_page, set_box, extract_first_page,
-      extract_anchors, alter_links — split to #578.
+- [x] doc.cpp (doc-core: load/open/save/write, page_count, version, the
+      6 Info-dict string properties, get/set_xmp_metadata, image_count
+      — `calibre_utils::podofo::PdfDoc`. Simple page ops — issue #668
+      CLOSED, `calibre_utils::podofo_pages`: `delete_pages`/
+      `get_page_box`/`set_page_box` (real PDF page-attribute
+      inheritance walk up `/Parent`, hand-implemented since `lopdf` has
+      no such helper — CropBox defaults to MediaBox, Trim/Bleed/ArtBox
+      default to CropBox)/`set_box`/`extract_first_page`/
+      `extract_anchors`/`alter_links`. Real upstream's own indexing is
+      inconsistent across these functions (1-based-from-caller vs.
+      plain 0-based) and was preserved per-function rather than
+      silently unified. Remaining doc.cpp scope — copy_page, append,
+      insert_existing_page — split to #669 (needs the shared
+      object-graph-copy primitive).
       Disclosed deviation: image_count() uses the correct `Type==XObject
       AND Subtype==Image` check, not upstream's likely-unintentional
       `OR`, which over-counts Form XObjects and is inconsistent with the
@@ -1956,8 +1966,8 @@ merging — dedup_images, impose, append/copy_page/insert_existing_page).
       `lopdf::Document::save`/`save_to` only serialize the existing
       object table and never touch `/Info` themselves.)
 - [ ] images.cpp (mislabeled filename — its real content is
-      `dedup_images()`; split to #578)
-- [ ] impose.cpp (split to #578)
+      `dedup_images()`; split to #671)
+- [ ] impose.cpp (split to #670)
 - [x] outline.cpp (issue #576 CLOSED — `calibre_utils::podofo_outline`.
       Real upstream's own C++ is a thin `PyObject` wrapper around
       PoDoFo's own `PdfOutlineItem::CreateChild`/`CreateNext`/`Erase`,
