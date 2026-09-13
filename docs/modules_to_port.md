@@ -1844,11 +1844,11 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 
 ###### cff
 
-- [ ] constants.py
-- [ ] dict_data.py
-- [ ] table.py
-- [ ] writer.py
-- [ ] __init__.py
+- [x] constants.py (issue #563 CLOSED -- `calibre_utils::fonts::sfnt::cff::constants::{CFF_STANDARD_STRINGS,STANDARD_CHARSETS}`. Pure data (391 CFF Standard Strings + the 3 predefined charsets), generated directly from the real Python source via this project's own established codegen-from-live-Python-data technique rather than hand-transcribed.)
+- [x] dict_data.py (issue #563 CLOSED -- `calibre_utils::fonts::sfnt::cff::dict_data::{Operand,Value,Opcode,ScalarArg,ArgType,DictEntry,DictSchema,Dict,TOP_DICT_SCHEMA,PRIVATE_DICT_SCHEMA}`. The CFF DICT byte-code codec (`ByteCode`'s int/real-number encoding) plus the generic, TABLE-driven `Dict`/`TopDict`/`PrivateDict` machinery, real upstream's own reflection-based (`getattr(self, 'arg_'+type)`) dispatch replaced by a static field-spec table + ordinary `match`-based decode/encode (no Rust equivalent to Python's runtime method-name lookup). Real, preserved: `Operand::Int`/`Operand::Float` as distinct variants (a CFF number's *encoding* depends on whether the source value was a Python `int` or `float`, not its numeric value -- `7` and `7.0` encode differently); `arg_delta`'s real int/float promotion (an accumulator that switches to float permanently once any float operand appears), mirrored on both decode and the reverse re-diffing `compile` needs; `FILTERED` fields (e.g. `ROS`) are fully decoded (so the stack-based operand parser stays correct) but never re-emitted by `compile`; `OFFSETS` fields (e.g. `Private`, `charset`) always use the 4-byte offset form even inside a tuple arg. A real, disclosed upstream crash-vs-error fix: a reserved/undefined real-number nibble (`0xD`) would raise an uncontrolled Python `TypeError` (string + `None`) in real upstream -- this port raises a real, controlled error instead. Not ported (disclosed, #564's scope): the `strings`/SID-index integration (`Dict::decompile`/`compile` take an indexable slice / resolver closure instead of owning the real `Strings`/`Index` machinery) and the unused-in-this-file `global_subrs` parameter.)
+- [ ] table.py (split to #564, depends on #563)
+- [ ] writer.py (split to #565, depends on #564 and the already-closed #553)
+- [x] __init__.py (N/A -- empty real upstream file, nothing to port)
 
 #### hyphenation
 
