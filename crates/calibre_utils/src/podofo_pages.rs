@@ -91,7 +91,7 @@ fn parse_box_array(arr: &[Object]) -> Option<(f64, f64, f64, f64)> {
 }
 
 impl PdfDoc {
-    fn page_id(&self, pagenum: u32) -> Result<ObjectId> {
+    pub(crate) fn page_id(&self, pagenum: u32) -> Result<ObjectId> {
         self.doc
             .get_pages()
             .get(&pagenum)
