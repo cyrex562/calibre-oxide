@@ -33,6 +33,7 @@ pub mod ordered_dict;
 pub mod podofo;
 pub mod podofo_dedup_images;
 pub mod podofo_fonts;
+pub mod podofo_impose;
 pub mod podofo_merge;
 pub mod podofo_outline;
 pub mod podofo_pages;

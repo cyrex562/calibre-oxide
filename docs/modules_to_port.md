@@ -1925,9 +1925,11 @@ the real C++ PoDoFo library `calibre_extensions/podofo` binds. Split
 into a doc-core piece (this issue, done) plus three dependent
 sub-issues covering the larger remaining algorithms: #576 (outline/
 bookmark tree, CLOSED), #577 (font management, CLOSED), #578 (images/
-pages/document merging), itself further split into #668 (simple page
-ops, CLOSED), #669 (object-graph-copy primitive + append/copy_page/
-insert_existing_page, CLOSED), #670 (impose), #671 (dedup_images).
+pages/document merging, CLOSED), itself further split into #668
+(simple page ops, CLOSED), #669 (object-graph-copy primitive +
+append/copy_page/insert_existing_page, CLOSED), #670 (impose, CLOSED),
+#671 (dedup_images, CLOSED). The entire utils/podofo cluster (11 real
+files across #74/#576/#577/#578) is now fully ported.
 
 - [x] doc.cpp (doc-core: load/open/save/write, page_count, version, the
       6 Info-dict string properties, get/set_xmp_metadata, image_count
@@ -1999,7 +2001,21 @@ insert_existing_page, CLOSED), #670 (impose), #671 (dedup_images).
       an image's own `/SMask` key lives on its *stream* dict, which
       `get_dictionary_mut` can't reach (only matches `Object::Dictionary`,
       not `Object::Stream`).)
-- [ ] impose.cpp (split to #670, not yet closed)
+- [x] impose.cpp (issue #670 CLOSED, `calibre_utils::podofo_impose`.
+      Real: stamps a header/footer page onto a body page as a Form
+      XObject registered under the literal resource name
+      `HeaderFooter`, prepends (not appends) the `q/cm/Do/Q` invocation
+      snippet before the destination page's own content, then removes
+      the source pages. Since dest/src pages live in the *same*
+      document by the time `impose` runs (unlike #669's cross-document
+      `append`/`copy_page`), building the Form XObject didn't need
+      #669's object-graph-copy primitive at all — just a fresh clone of
+      the source page's already-resolved `/Resources`. Real upstream's
+      own comment preserved: prepending (header/footer drawn first,
+      then original content) is a deliberate compatibility workaround
+      for older Qt WebEngine, not derivable from the PDF spec. This
+      closes the #578 epic (images/pages/document merging) in full —
+      #668/#669/#670/#671 all shipped.)
 - [x] outline.cpp (issue #576 CLOSED — `calibre_utils::podofo_outline`.
       Real upstream's own C++ is a thin `PyObject` wrapper around
       PoDoFo's own `PdfOutlineItem::CreateChild`/`CreateNext`/`Erase`,
