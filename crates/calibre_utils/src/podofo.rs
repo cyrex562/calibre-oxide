@@ -60,6 +60,8 @@ pub enum PodofoError {
     OutlineItemHasNoParent,
     #[error("Font does not have a descriptor, or its descriptor has no embedded font file")]
     FontHasNoDescriptor,
+    #[error("Unknown page box name: {0}")]
+    UnknownBoxName(String),
 }
 
 pub type Result<T> = std::result::Result<T, PodofoError>;
