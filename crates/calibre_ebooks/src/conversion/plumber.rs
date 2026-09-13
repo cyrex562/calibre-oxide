@@ -170,17 +170,55 @@ impl Plumber {
         // Here, EPUBInput needs a place to extract to.
         let temp_dir = tempdir()?;
         let extract_path = temp_dir.path().join("source");
-        let book = convert_to_oebbook(&self.input_path, &extract_path)?;
+        let mut book = convert_to_oebbook(&self.input_path, &extract_path)?;
 
-        // 3. Transforms (Placeholder)
-        // Processing steps would go here (metadata merge, style flattening, etc.)
-        println!("Processed {} manifest items.", book.manifest.items.len());
+        // 3. Transforms
+        Self::run_transforms(&mut book);
 
         // 4. Output Plugin
         self.write_output(book)?;
 
         println!("Done.");
         Ok(())
+    }
+
+    /// Port of the option-independent prefix of real `Plumber.run`'s
+    /// transform stage (`plumber.py`'s own real sequence: `DataURL` ->
+    /// `Clean` (guide) -> ... -> `DetectStructure` -> ... ->
+    /// `ManifestTrimmer` -> `toc.rationalize_play_orders()`), using
+    /// each transform's own real default options.
+    ///
+    /// **Real, tracked gap, not silently dropped**: this is a genuine
+    /// prefix/suffix slice of the real pipeline, not the whole thing.
+    /// Deferred (tracking issue: the "wire real oeb::transforms into
+    /// Plumber" epic filed alongside this change, see its own body for
+    /// the full real stage-by-stage breakdown): `RemoveFirstImage`/
+    /// `Jacket`, `MergeMetadata` (needs a real per-conversion
+    /// `MetaInformation` source -- reading the input file's own
+    /// metadata, not yet threaded through this call), `AddAltText`/
+    /// `LinearizeTables`/`UnsmartenPunctuation` (each gated on a CLI
+    /// option that doesn't exist yet -- issue #126's own scope),
+    /// `CSSFlattener` (needs a real `OutputProfile` abstraction --
+    /// upstream's own font-size/margin defaults per target device,
+    /// substantial scope on its own), `RemoveFakeMargins`/
+    /// `RemoveAdobeMargins`, `EmbedFonts`/`SubsetFonts` (subsetting
+    /// itself is real, #553/#565 -- only the Plumber-level wiring and
+    /// the `embed_all_fonts`/`subset_embedded_fonts` option gating are
+    /// missing), and `toc.rationalize_play_orders()` (no such method
+    /// exists on `crate::oeb::toc::TOC` yet). Output plugins also don't
+    /// yet accept the `(opts, log, input_plugin)` parameters real
+    /// `output_plugin.convert` takes -- a separate, output-plugin-side
+    /// gap the tracking issue also documents.
+    fn run_transforms(book: &mut crate::oeb::book::OEBBook) {
+        use crate::oeb::transforms::data_url::DataURL;
+        use crate::oeb::transforms::guide::Clean;
+        use crate::oeb::transforms::structure::{DetectStructure, StructureOptions};
+        use crate::oeb::transforms::trimmanifest::ManifestTrimmer;
+
+        DataURL.call(book);
+        Clean.call(book);
+        DetectStructure.call(book, &StructureOptions::default());
+        ManifestTrimmer.call(book);
     }
 
     fn write_output(&self, mut book: crate::oeb::book::OEBBook) -> Result<()> {
@@ -374,5 +412,48 @@ mod dump_input_tests {
         let opf_text = fs::read_to_string(dump_dir.join("content.opf")).unwrap();
         assert!(opf_text.contains("<manifest>"));
         assert!(opf_text.contains("<spine>"));
+    }
+}
+
+#[cfg(test)]
+mod run_transforms_tests {
+    use super::*;
+    use base64::Engine;
+    use crate::oeb::transforms::test_support::Builder;
+
+    /// Exercises `Plumber::run_transforms`'s real wired-in prefix
+    /// end-to-end against one `OEBBook`: a `data:` URI image (DataURL),
+    /// an unrecognized guide reference type (Clean), and an orphaned
+    /// manifest item unreachable from metadata/guide/spine/links
+    /// (ManifestTrimmer) should all be handled for real, not left
+    /// untouched by a no-op placeholder.
+    #[test]
+    fn run_transforms_actually_runs_the_wired_in_pipeline_prefix() {
+        let png_1x1_transparent = base64::engine::general_purpose::STANDARD.decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+        ).unwrap();
+        let data_uri = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&png_1x1_transparent)
+        );
+        let mut oeb = Builder::new()
+            .page("a.html", &format!(r#"<img src="{data_uri}"/>"#))
+            .part("orphan.txt", "text/plain", b"unreachable", false)
+            .build();
+        oeb.guide.add("some-unrecognized-type", None, "a.html");
+
+        Plumber::run_transforms(&mut oeb);
+
+        // DataURL: the inline data: URI became a real manifest item.
+        let raw = oeb.container.read("a.html").unwrap();
+        let html = String::from_utf8_lossy(&raw);
+        assert!(!html.contains("data:image"), "{html}");
+        assert!(oeb.manifest.iter().any(|i| i.media_type == "image/png"));
+
+        // Clean: the unrecognized guide type is gone.
+        assert!(!oeb.guide.references.contains_key("some-unrecognized-type"));
+
+        // ManifestTrimmer: the orphaned item was dropped.
+        assert!(!oeb.manifest.iter().any(|i| i.href == "orphan.txt"));
     }
 }
