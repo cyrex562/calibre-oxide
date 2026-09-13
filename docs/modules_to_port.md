@@ -2157,12 +2157,12 @@ architecture, not a partial port of this subfolder.
 
 ## src/css_selectors
 
-- [ ] errors.py
-- [ ] ordered_set.py
-- [ ] parser.py
-- [ ] select.py
-- [ ] tests.py
-- [ ] __init__.py
+- [x] errors.py (issue #451 CLOSED -- `calibre_ebooks::css_selectors::errors::SelectorError`. Real `SelectorError`/`SelectorSyntaxError`/`ExpressionError` class hierarchy collapsed into one 2-variant enum (`Syntax`/`Expression`) since nothing in this port ever needs to catch "any `SelectorError`" separately from its two concrete cases.)
+- [x] ordered_set.py (issue #451 CLOSED -- `calibre_ebooks::css_selectors::ordered_set::OrderedSet`. Wraps `indexmap::IndexSet` rather than re-implementing a parallel `Vec`+`HashMap` pair by hand -- `IndexSet::shift_remove` already re-indexes exactly like real `OrderedSet.discard`'s `list.pop`-based removal. Narrowed to the real call sites' actual usage (`add`/`index`/`len`/`get`/`discard`/`contains`/`iter`): Python's slice/fancy-indexing `__getitem__` forms aren't ported since no real caller in `parser.py`/`select.py` uses them.)
+- [ ] parser.py (issue #452, depends on #451 -- CLOSED above)
+- [ ] select.py (issue #453, depends on #452)
+- [ ] tests.py (upstream's own test suite, not ported line-by-line -- #452/#453 write real Rust tests covering the same grammar/matching surface instead)
+- [x] __init__.py (just re-exports; folded into `calibre_ebooks::css_selectors`'s own module structure, no separate file needed)
 
 ## src/odf
 
