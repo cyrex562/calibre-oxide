@@ -1979,9 +1979,27 @@ insert_existing_page, CLOSED), #670 (impose), #671 (dedup_images).
       rewriting `/Info`/XMP on save, has no Rust equivalent concern —
       `lopdf::Document::save`/`save_to` only serialize the existing
       object table and never touch `/Info` themselves.)
-- [ ] images.cpp (mislabeled filename — its real content is
-      `dedup_images()`; split to #671)
-- [ ] impose.cpp (split to #670)
+- [x] images.cpp (mislabeled filename — its real content is
+      `dedup_images()`. Issue #671 CLOSED, `calibre_utils::podofo_dedup_images`.
+      Structurally identical to #577's `dedup_type3_fonts`: value
+      equality (same width/height/`/SMask` *reference* + byte-identical
+      stream content) + hash + first-seen-canonical + reference-remap,
+      run exactly 2 fixed passes (not to convergence) so pass 2 can
+      catch images that only became identical once pass 1 already
+      merged their SMask references. Disclosed simplification: compares
+      raw as-stored stream bytes rather than fully decoding every image
+      filter (`DCTDecode`/etc.), which would need a general image-codec
+      dependency just to compute a hash key — reduces the dedup rate in
+      theory, never merges two genuinely distinct images. Two real
+      `lopdf` gotchas found (documented in the module doc, not upstream
+      quirks): `Document::delete_object` already strips any dangling
+      reference to the deleted id throughout the whole document, so the
+      reference-remap sweep has to run *before* deleting the duplicates
+      or it silently deletes the very entries it should redirect; and
+      an image's own `/SMask` key lives on its *stream* dict, which
+      `get_dictionary_mut` can't reach (only matches `Object::Dictionary`,
+      not `Object::Stream`).)
+- [ ] impose.cpp (split to #670, not yet closed)
 - [x] outline.cpp (issue #576 CLOSED — `calibre_utils::podofo_outline`.
       Real upstream's own C++ is a thin `PyObject` wrapper around
       PoDoFo's own `PdfOutlineItem::CreateChild`/`CreateNext`/`Erase`,
