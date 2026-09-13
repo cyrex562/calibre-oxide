@@ -234,7 +234,7 @@ fn write_int(value: i64, encoding: IntEncoding) -> Vec<u8> {
 }
 
 /// Port of `ByteCode.write_offset`.
-fn write_offset(value: i64) -> Vec<u8> {
+pub(crate) fn write_offset(value: i64) -> Vec<u8> {
     let mut d = vec![29u8];
     d.extend_from_slice(&(value as i32).to_be_bytes());
     d
@@ -389,7 +389,7 @@ pub static PRIVATE_DICT_SCHEMA: DictSchema = DictSchema {
 // ---------------------------------------------------------------------
 
 /// Port of `Dict`/`TopDict`/`PrivateDict` (the schema selects which).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Dict {
     schema: &'static DictSchema,
     values: std::collections::HashMap<&'static str, Value>,
@@ -420,6 +420,14 @@ impl Dict {
             return Some(v.clone());
         }
         self.entry(name).and_then(|e| e.default).map(|nums| nums.iter().map(|&n| Operand::Float(n)).collect())
+    }
+
+    /// Port of plain `dict.__setitem__` on a real `Dict`/`TopDict`/
+    /// `PrivateDict` instance (e.g. `t['charset'] = pos`) -- used by
+    /// [`crate::fonts::sfnt::cff::writer::Subset`] to patch in real
+    /// offsets after cloning a source font's dict.
+    pub fn set(&mut self, name: &'static str, value: Value) {
+        self.values.insert(name, value);
     }
 
     fn entry(&self, name: &str) -> Option<&'static DictEntry> {
