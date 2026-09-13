@@ -1,3 +1,4 @@
+use crate::conversion::options::ConversionOptions;
 use crate::oeb::book::OEBBook;
 use anyhow::{bail, Result};
 use std::fs;
@@ -146,13 +147,26 @@ pub fn dump_input(input_path: &Path, dump_dir: &Path) -> Result<()> {
 pub struct Plumber {
     input_path: PathBuf,
     output_path: PathBuf,
+    opts: ConversionOptions,
 }
 
 impl Plumber {
     pub fn new<P: AsRef<Path>>(input: P, output: P) -> Self {
+        Self::with_options(input, output, ConversionOptions::default())
+    }
+
+    /// Real upstream's `Plumber` always carries a live `self.opts`,
+    /// populated from every plugin's `OptionRecommendation` defaults
+    /// (`setup_options`) and then overridden by whatever the CLI/GUI
+    /// parsed. This port has no CLI option parser yet (issue #126's own
+    /// scope) -- `Plumber::new` uses [`ConversionOptions::default`]
+    /// (the real upstream default values), and this constructor is for
+    /// callers that already have a customized [`ConversionOptions`].
+    pub fn with_options<P: AsRef<Path>>(input: P, output: P, opts: ConversionOptions) -> Self {
         Self {
             input_path: input.as_ref().to_path_buf(),
             output_path: output.as_ref().to_path_buf(),
+            opts,
         }
     }
 
@@ -173,7 +187,8 @@ impl Plumber {
         let mut book = convert_to_oebbook(&self.input_path, &extract_path)?;
 
         // 3. Transforms
-        Self::run_transforms(&mut book);
+        let output_ext = self.output_path.extension().and_then(|s| s.to_str()).map(|s| s.to_lowercase()).unwrap_or_default();
+        self.run_transforms(&mut book, &output_ext)?;
 
         // 4. Output Plugin
         self.write_output(book)?;
@@ -182,43 +197,89 @@ impl Plumber {
         Ok(())
     }
 
-    /// Port of the option-independent prefix of real `Plumber.run`'s
-    /// transform stage (`plumber.py`'s own real sequence: `DataURL` ->
-    /// `Clean` (guide) -> ... -> `DetectStructure` -> ... ->
-    /// `ManifestTrimmer` -> `toc.rationalize_play_orders()`), using
-    /// each transform's own real default options.
+    /// Port of real `Plumber.run`'s transform stage (`plumber.py`'s own
+    /// real sequence, `old_src/src/calibre/ebooks/conversion/plumber.py:1115-1247`):
+    /// `DataURL` -> `Clean` (guide) -> `RemoveFirstImage`/`MergeMetadata`
+    /// (jacket.py/metadata.py) -> `DetectStructure` -> `Jacket` ->
+    /// `AddAltText` -> `LinearizeTables` -> `UnsmartenPunctuation` ->
+    /// `CSSFlattener` -> `RemoveFakeMargins`/`RemoveAdobeMargins` ->
+    /// `EmbedFonts` -> `SubsetFonts` -> `ManifestTrimmer` ->
+    /// `toc.rationalize_play_orders()`, using `self.opts` (real upstream
+    /// default values absent any CLI override -- see
+    /// [`ConversionOptions`]'s own module doc).
     ///
-    /// **Real, tracked gap, not silently dropped**: this is a genuine
-    /// prefix/suffix slice of the real pipeline, not the whole thing.
-    /// Deferred (tracking issue: the "wire real oeb::transforms into
-    /// Plumber" epic filed alongside this change, see its own body for
-    /// the full real stage-by-stage breakdown): `RemoveFirstImage`/
-    /// `Jacket`, `MergeMetadata` (needs a real per-conversion
-    /// `MetaInformation` source -- reading the input file's own
-    /// metadata, not yet threaded through this call), `AddAltText`/
-    /// `LinearizeTables`/`UnsmartenPunctuation` (each gated on a CLI
-    /// option that doesn't exist yet -- issue #126's own scope),
-    /// `CSSFlattener` (needs a real `OutputProfile` abstraction --
-    /// upstream's own font-size/margin defaults per target device,
-    /// substantial scope on its own), `RemoveFakeMargins`/
-    /// `RemoveAdobeMargins`, `EmbedFonts`/`SubsetFonts` (subsetting
-    /// itself is real, #553/#565 -- only the Plumber-level wiring and
-    /// the `embed_all_fonts`/`subset_embedded_fonts` option gating are
-    /// missing), and `toc.rationalize_play_orders()` (no such method
-    /// exists on `crate::oeb::toc::TOC` yet). Output plugins also don't
-    /// yet accept the `(opts, log, input_plugin)` parameters real
-    /// `output_plugin.convert` takes -- a separate, output-plugin-side
-    /// gap the tracking issue also documents.
-    fn run_transforms(book: &mut crate::oeb::book::OEBBook) {
+    /// **Real, disclosed narrowings, not silently dropped**:
+    /// `user_metadata` (real upstream's `read_user_metadata`) is always
+    /// [`crate::metadata::meta::MetaInformation::default`] here -- real
+    /// upstream's own default (absent `--read-metadata-from-opf` or any
+    /// `--title`/`--authors`/etc. CLI override) is exactly the same
+    /// blank `MetaInformation(None, [])`, so this is faithful for the
+    /// no-CLI-yet case, not a shortcut. The non-EPUB/KePub "remove the
+    /// TOC's own reference to the HTML cover" step
+    /// (`item_that_refers_to_cover`) has no Rust equivalent on
+    /// `crate::oeb::toc::TOC` yet -- a real, narrow, cosmetic gap (a
+    /// stray NCX entry pointing at the cover page for non-EPUB
+    /// outputs), not attempted here. No named output/input profile
+    /// catalog exists (see [`ConversionOptions`]'s own module doc) --
+    /// every profile-derived value uses the real *default* profile's
+    /// own constants. `mi.cover`-is-a-URL/on-disk-path handling
+    /// (`download_cover`, explicit `--cover` CLI flag) doesn't apply
+    /// since `user_metadata` is always blank here.
+    fn run_transforms(&self, book: &mut OEBBook, output_ext: &str) -> Result<()> {
+        use crate::metadata::meta::MetaInformation;
+        use crate::oeb::transforms::alt_text::AddAltText;
         use crate::oeb::transforms::data_url::DataURL;
+        use crate::oeb::transforms::embed_fonts::EmbedFonts;
+        use crate::oeb::transforms::flatcss::CSSFlattener;
         use crate::oeb::transforms::guide::Clean;
-        use crate::oeb::transforms::structure::{DetectStructure, StructureOptions};
+        use crate::oeb::transforms::jacket::{JacketTransform, RemoveFirstImage};
+        use crate::oeb::transforms::linearize_tables::LinearizeTables;
+        use crate::oeb::transforms::metadata::MergeMetadata;
+        use crate::oeb::transforms::page_margin::{RemoveAdobeMargins, RemoveFakeMargins};
+        use crate::oeb::transforms::structure::DetectStructure;
+        use crate::oeb::transforms::subset::SubsetFonts;
         use crate::oeb::transforms::trimmanifest::ManifestTrimmer;
+        use crate::oeb::transforms::unsmarten::UnsmartenPunctuation;
+
+        let opts = &self.opts;
+        let mut report = |msg: &str| println!("{msg}");
+        let user_metadata = MetaInformation::default();
+        let jacket_opts = opts.jacket_options();
 
         DataURL.call(book);
         Clean.call(book);
-        DetectStructure.call(book, &StructureOptions::default());
+        RemoveFirstImage.call(book, &jacket_opts, &mut report);
+        MergeMetadata.call(book, &user_metadata, opts.prefer_metadata_cover, output_ext, false);
+        DetectStructure.call(book, &opts.structure);
+        JacketTransform.call(book, &jacket_opts, &user_metadata, &mut report)?;
+
+        if opts.add_alt_text_to_img {
+            AddAltText.call(book);
+        }
+        if opts.linearize_tables && !matches!(output_ext, "mobi" | "lrf") {
+            LinearizeTables.call(book);
+        }
+        if opts.unsmarten_punctuation {
+            UnsmartenPunctuation.call(book);
+        }
+
+        let flattener = CSSFlattener::new(opts.flattener_options(output_ext));
+        let ctx = opts.flatten_context(output_ext);
+        flattener.call(book, &ctx, &mut report)?;
+
+        RemoveFakeMargins.call(book, opts.remove_fake_margins);
+        RemoveAdobeMargins.call(book);
+
+        if opts.embed_all_fonts {
+            EmbedFonts::new().call(book, &mut report)?;
+        }
+        if opts.subset_embedded_fonts && output_ext != "pdf" {
+            SubsetFonts::new().call(book, &mut report)?;
+        }
+
         ManifestTrimmer.call(book);
+        book.toc.rationalize_play_orders();
+        Ok(())
     }
 
     fn write_output(&self, mut book: crate::oeb::book::OEBBook) -> Result<()> {
@@ -442,7 +503,8 @@ mod run_transforms_tests {
             .build();
         oeb.guide.add("some-unrecognized-type", None, "a.html");
 
-        Plumber::run_transforms(&mut oeb);
+        let plumber = Plumber::new("in.html", "out.epub");
+        plumber.run_transforms(&mut oeb, "epub").unwrap();
 
         // DataURL: the inline data: URI became a real manifest item.
         let raw = oeb.container.read("a.html").unwrap();
@@ -455,5 +517,34 @@ mod run_transforms_tests {
 
         // ManifestTrimmer: the orphaned item was dropped.
         assert!(!oeb.manifest.iter().any(|i| i.href == "orphan.txt"));
+    }
+
+    /// A genuine end-to-end conversion through the public `Plumber::run`
+    /// entry point (HTML -> EPUB, on real files on disk), proving the
+    /// full wired-in pipeline -- not just `run_transforms` in isolation
+    /// -- actually flattens CSS for real. Before this issue, this
+    /// conversion produced an EPUB with the *unmodified* input markup
+    /// (no `stylesheet.css`, no `calibre*` classes); this test would
+    /// have failed against that pre-existing behavior.
+    #[test]
+    fn a_real_html_to_epub_conversion_flattens_css_end_to_end() {
+        let src = tempdir().unwrap();
+        let html_path = src.path().join("book.html");
+        fs::write(&html_path, "<html><head><title>A Book</title></head><body><h1>Ch 1</h1><p>Hello.</p></body></html>").unwrap();
+
+        let out_dir = tempdir().unwrap();
+        let epub_path = out_dir.path().join("book.epub");
+        Plumber::new(&html_path, &epub_path).run().unwrap();
+
+        let file = fs::File::open(&epub_path).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        let names: Vec<String> = (0..zip.len()).map(|i| zip.by_index(i).unwrap().name().to_string()).collect();
+        assert!(names.iter().any(|n| n.ends_with(".css")), "{names:?}");
+
+        let html_entry = names.iter().find(|n| n.ends_with(".html")).cloned().unwrap();
+        let mut html_bytes = Vec::new();
+        std::io::Read::read_to_end(&mut zip.by_name(&html_entry).unwrap(), &mut html_bytes).unwrap();
+        let html = String::from_utf8_lossy(&html_bytes);
+        assert!(html.contains("class=\"calibre"), "CSSFlattener should have added real classes: {html}");
     }
 }
