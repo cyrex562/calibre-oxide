@@ -1927,7 +1927,7 @@ sub-issues covering the larger remaining algorithms: #576 (outline/
 bookmark tree, CLOSED), #577 (font management, CLOSED), #578 (images/
 pages/document merging), itself further split into #668 (simple page
 ops, CLOSED), #669 (object-graph-copy primitive + append/copy_page/
-insert_existing_page), #670 (impose), #671 (dedup_images).
+insert_existing_page, CLOSED), #670 (impose), #671 (dedup_images).
 
 - [x] doc.cpp (doc-core: load/open/save/write, page_count, version, the
       6 Info-dict string properties, get/set_xmp_metadata, image_count
@@ -1940,9 +1940,23 @@ insert_existing_page), #670 (impose), #671 (dedup_images).
       `extract_anchors`/`alter_links`. Real upstream's own indexing is
       inconsistent across these functions (1-based-from-caller vs.
       plain 0-based) and was preserved per-function rather than
-      silently unified. Remaining doc.cpp scope — copy_page, append,
-      insert_existing_page — split to #669 (needs the shared
-      object-graph-copy primitive).
+      silently unified. `copy_page`/`append`/`insert_existing_page` —
+      issue #669 CLOSED, `calibre_utils::podofo_merge`: one shared
+      object-graph-copy-and-remap primitive (`copy_objects_into`/
+      `remap_references`), used with two different real object-
+      selection strategies — `copy_page`/`insert_existing_page` copy
+      only the objects reachable from the one page being copied
+      (excluding its own `/Parent`), while `append` copies literally
+      every indirect object in each source document (no reachability
+      pruning at all, matching upstream's own real behavior). Every
+      copied/appended page gets the 4 inheritable attributes
+      (`Resources`/`MediaBox`/`CropBox`/`Rotate`) flattened directly
+      onto it and a guaranteed `/Contents`, matching upstream. Disclosed:
+      the real C++'s dead `RemoveKey("Resource")` (singular, wrong key
+      name) line is omitted rather than reproduced; `PdfReference`
+      bucketing that ignores generation number is replicated with a
+      stricter plain `ObjectId` key instead (observably identical for
+      any real PDF).
       Disclosed deviation: image_count() uses the correct `Type==XObject
       AND Subtype==Image` check, not upstream's likely-unintentional
       `OR`, which over-counts Form XObjects and is inconsistent with the
