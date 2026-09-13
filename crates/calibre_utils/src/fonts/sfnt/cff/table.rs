@@ -78,7 +78,7 @@ fn parse_index_with_prepend(raw: &[u8], offset: usize, prepend: Vec<Vec<u8>>) ->
     Ok((items, pos))
 }
 
-fn parse_index(raw: &[u8], offset: usize) -> Result<(Vec<Vec<u8>>, usize), UnsupportedFont> {
+pub(crate) fn parse_index(raw: &[u8], offset: usize) -> Result<(Vec<Vec<u8>>, usize), UnsupportedFont> {
     parse_index_with_prepend(raw, offset, Vec::new())
 }
 
