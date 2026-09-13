@@ -8,6 +8,7 @@ pub mod conversion;
 pub mod covers;
 pub mod covers_text;
 pub mod css;
+pub mod css_selectors;
 pub mod css_transform_rules;
 pub mod djvu;
 pub mod docx;
