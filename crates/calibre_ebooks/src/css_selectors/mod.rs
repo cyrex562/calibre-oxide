@@ -32,3 +32,4 @@
 pub mod errors;
 pub mod ordered_set;
 pub mod parser;
+pub mod select;
