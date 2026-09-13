@@ -28,9 +28,14 @@
 //! [`config`] (the input/output format option-recommendation
 //! registry) -- both already written with "dispatch to the plumber"
 //! as their explicit target (see `cli_helpers`'s own module doc),
-//! neither depends on anything just removed. [`config`]'s registry
-//! isn't wired into `Plumber` yet (`Plumber::run` takes no options at
-//! all) -- a real, separate follow-up, not part of #476's own finding.
+//! neither depends on anything just removed.
+//!
+//! [`cli_options`] (issue #126) is the real option-*parsing* layer:
+//! `Plumber` now carries a real `ConversionOptions` (issue #686 wired
+//! the actual transform pipeline that reads it), and `cli_options`'s
+//! `ConvertArgs` is a real `clap`-based CLI populating one from the
+//! command line, wired into `bin/ebook_convert.rs`.
 
 pub mod cli_helpers;
+pub mod cli_options;
 pub mod config;
