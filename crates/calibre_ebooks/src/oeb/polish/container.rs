@@ -2640,10 +2640,9 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 /// Port of `KEPUBContainer`. Kobo's `.kepub` format is an EPUB with
 /// Kobo-specific markup injected on read and stripped on write
-/// (`unkepubify_container`/`kepubify_container` in `kepubify.py`, one of
-/// the ~23 not-yet-ported `polish` feature files -- out of scope for
-/// this slice). The struct shape and delegation to `EpubContainer` are
-/// real; the kepubify-dependent steps are `todo!()`.
+/// (`unkepubify_container`/`kepubify_container` in `kepubify.py`, issue
+/// #654). The struct shape, delegation to `EpubContainer`, and the
+/// open/commit wiring below are all real.
 pub struct KepubContainer {
     pub epub: EpubContainer,
 }
@@ -2662,31 +2661,55 @@ impl std::ops::DerefMut for KepubContainer {
 }
 
 impl KepubContainer {
+    /// Port of `KEPUBContainer.__init__`: opens the underlying EPUB,
+    /// then immediately strips the Kobo markup so the rest of this
+    /// port's `polish` machinery sees a plain, editable EPUB. Real
+    /// upstream's `Container.commit(self, keep_parsed=True)` before
+    /// `unkepubify_container` flushes any pending per-file dirt from
+    /// `EpubContainer::open_zip`'s own setup (there is none in this
+    /// port's `open_zip`, but the call is kept for parity and in case a
+    /// future change to `open_zip` introduces some).
     pub fn open_zip(path_to_kepub: &Path, tdir: &Path) -> Result<KepubContainer> {
-        let _epub = EpubContainer::open_zip(path_to_kepub, tdir)?;
-        todo!(
-            "placeholder: KEPUBContainer::open_zip needs \
-             oeb::polish::kepubify::unkepubify_container (kepubify.py is one \
-             of the ~23 not-yet-ported polish feature files); EpubContainer \
-             opening above this call is real"
-        )
+        let mut epub = EpubContainer::open_zip(path_to_kepub, tdir)?;
+        epub.container.commit(true)?;
+        super::kepubify::unkepubify_container(&mut epub.container, 0)?;
+        Ok(KepubContainer { epub })
     }
 
     pub fn book_type(&self) -> &'static str {
         "kepub"
     }
 
-    /// Port of `KEPUBContainer.commit_epub`.
+    /// Port of `KEPUBContainer.commit_epub`. For a directory-backed
+    /// kepub this is just a normal `EpubContainer` commit (the on-disk
+    /// tree is expected to already be Kobo-formatted, matching real
+    /// upstream). For a packed `.kepub.epub`, real upstream re-applies
+    /// Kobo markup onto a *clone* rather than mutating `self` in place
+    /// -- `self` stays the plain, editable EPUB every other `polish`
+    /// operation sees. [`Container::clone_to`] is this port's one other
+    /// real hardlink-clone call site (it pairs the clone with
+    /// `self.cloned = true`, the same pairing its own docs describe),
+    /// reused here rather than duplicating that logic.
     pub fn commit_epub(&mut self, outpath: &Path) -> Result<()> {
         if self.epub.is_dir {
             return self.epub.commit_epub(outpath);
         }
-        todo!(
-            "placeholder: non-directory KEPUBContainer::commit_epub needs \
-             oeb::polish::kepubify::kepubify_container (not yet ported, see \
-             open_zip's docs); the is_dir branch above delegates to the real \
-             EpubContainer::commit_epub"
-        )
+        let tdir = tempfile::tempdir()?;
+        let cloned_container = self.epub.container.clone_to(tdir.path())?;
+        let mut cloned = EpubContainer {
+            container: cloned_container,
+            path_to_epub: outpath.to_path_buf(),
+            is_dir: false,
+            obfuscated_fonts: HashMap::new(),
+        };
+        let fontdb = std::sync::Arc::new(crate::covers_text::load_system_fonts());
+        super::kepubify::kepubify_container(
+            &mut cloned.container,
+            &super::kepubify::Options::default(),
+            0,
+            &fontdb,
+        )?;
+        cloned.commit(Some(outpath))
     }
 }
 
