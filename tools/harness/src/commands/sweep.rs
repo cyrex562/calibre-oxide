@@ -1,6 +1,12 @@
 //! `harness sweep` — merge PRs the harness has marked green-and-judged.
 //!
-//! Not implemented in bootstrap PR. Tracked as a follow-up issue.
+//! **Deliberately not implemented, by user decision (issue #92).**
+//! `state.green_judged_prs` is only ever populated by the also-not-
+//! implemented `run` pipeline (see that command's own module doc for
+//! the full rationale) -- there's nothing for this command to iterate
+//! even if it were built. Every real PR in this repo merges via an
+//! interactive Claude Code session (`gh pr merge` under direct
+//! instruction), not an unsupervised sweep. Superseded, not pending.
 
 use anyhow::Result;
 use std::path::Path;
@@ -12,7 +18,9 @@ pub struct Args {
 }
 
 pub fn run(_repo: &Path, _args: Args) -> Result<()> {
-    eprintln!("harness sweep: NOT YET IMPLEMENTED (bootstrap PR ships CLI surface only)");
-    // PLACEHOLDER: iterate state.green_judged_prs, re-verify each, gh pr merge --squash --auto.
-    Err(anyhow::anyhow!("harness sweep not implemented in bootstrap"))
+    eprintln!("harness sweep: not implemented (deliberately -- see this file's own module doc)");
+    eprintln!("state.green_judged_prs is only ever populated by `run`, which is also");
+    eprintln!("deliberately unimplemented. Merges happen via an interactive Claude Code");
+    eprintln!("session instead. There is no follow-up issue tracking a real implementation.");
+    Err(anyhow::anyhow!("harness sweep is deliberately unimplemented — use an interactive Claude Code session instead"))
 }

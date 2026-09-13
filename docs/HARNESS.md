@@ -4,21 +4,34 @@ The harness is a Rust binary at `tools/harness/`. It orchestrates iterative
 porting of the legacy Python calibre codebase (`old_src/`) into the Rust
 crates under `crates/`, plus new fault-tolerance and organizational features.
 
+**`run` and `sweep` are deliberately unimplemented (issues #91/#92,
+closed as won't-implement, not deferred).** The sections below describe
+the bootstrap PR's original autonomous design for them — spawn `claude`
+subprocesses to plan/implement/judge each port, then unsupervised
+`gh pr merge --squash --auto` on a passing AI-judge verdict — kept here
+as a historical record of the design, not a spec to build. In practice
+every real port in this repo has landed through an interactive Claude
+Code session (`/loop` and similar) doing the same claim/plan/implement/
+judge/merge work directly, with a human present at the merge decision
+instead of a second, unsupervised AI judge. `scan-placeholders`,
+`seed-issues`, `status`, and `playtest-ready` are real and current; the
+`run`/`sweep` CLI surface stays wired up (so invoking them fails with a
+clear message) but neither has, or will get, a real implementation.
+
 ## Invocation
 
 ```
 harness seed-issues              # populate GitHub issues from modules_to_port.md + placeholders.jsonl
 harness scan-placeholders        # rebuild placeholders.jsonl from the code
-harness run --issues 12,15,18    # tackle a specific set of issues
-harness run --cluster db-cli     # tackle everything labeled `cluster:db-cli`
-harness run --auto --max-issues 5  # pick the top-N unblocked issues
-harness sweep                    # merge any PRs the harness already marked green-and-judged
 harness status                   # print in-flight issues, PRs, and last run summary
+harness playtest-ready           # emit a per-cluster checklist of what changed since the last playtest tag
+harness run ...                  # NOT IMPLEMENTED (deliberately -- see above)
+harness sweep                    # NOT IMPLEMENTED (deliberately -- see above)
 ```
 
-## Iteration loop
+## Iteration loop (historical design, not implemented — see above)
 
-For each issue the harness works:
+For each issue the harness *would have* worked:
 
 1. **Claim** — assign the issue to the harness bot, label `in-progress`.
 2. **Branch** — `git checkout -b port/<issue-number>-<slug>` off `master`.
@@ -51,7 +64,7 @@ For each issue the harness works:
 8. **Update state** — `docs/modules_to_port.md`, `docs/placeholders.jsonl`,
    `.harness/state.json`.
 
-## Concurrency
+## Concurrency (historical design, not implemented)
 
 `--max-concurrent N` (default 3) governs how many issues run in parallel.
 Each in-flight issue owns its own git worktree under `.harness/worktrees/`,
@@ -89,7 +102,7 @@ The user-agreed anti-stub rule:
   3. Fault-tolerance issues (labeled `fault-tolerance`).
   4. Port issues in dependency-topological order.
 
-## Judge rubric
+## Judge rubric (historical design, not implemented)
 
 The judge answers each of these with yes/no and one line of reasoning.
 Verdict is `pass` only if all mandatory items are yes.
@@ -110,7 +123,7 @@ Verdict is `pass` only if all mandatory items are yes.
 - Are public APIs documented with `///`?
 - Is the code idiomatic Rust vs a mechanical Python transliteration?
 
-## Model routing
+## Model routing (historical design, not implemented)
 
 | Role                | Default model    | Escalate to Opus when                       |
 | ------------------- | ---------------- | ------------------------------------------- |
@@ -124,7 +137,13 @@ The harness enforces model routing by passing `--model` to `claude` calls.
 Every call is logged to `.harness/logs/calls.jsonl` with token counts so we
 can true-up cost weekly.
 
-## Cross-validation via Python calibre
+## Cross-validation via Python calibre (historical design, not implemented)
+
+The automated `calibre-debug`-discovery flow described below was never
+built. Real cross-validation in this repo happens manually, per-issue,
+using whatever technique fits (see e.g. the lxml-shaped fake-tree
+harness used for several `css_selectors`/`tts` ports) -- not through
+this automated pipeline.
 
 Calibre proper doesn't install cleanly from source on Windows (per
 `old_src/INSTALL.rst`) — it requires a huge native-dep dev environment.
@@ -182,6 +201,11 @@ real workflow in this repo currently produces that feedback in a form
 the harness could parse.
 
 ## State
+
+`in_flight`/`green_judged_prs`/`last_sweep` below are only ever written
+by the never-implemented `run`/`sweep` pipeline and stay empty in
+practice; `last_seed` (written by the real `seed-issues`) is the only
+field any current command actually populates.
 
 `.harness/state.json` — small, human-readable, atomically written:
 

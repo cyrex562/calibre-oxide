@@ -6,5 +6,3 @@
 {"crate_name":"calibre_ebooks","path":"crates/calibre_ebooks/src/pdf/render/graphics.rs","line":432,"kind":"todo_macro","reason":"QPaintEngine-interception logic - requires driving from a live Qt paint engine, out of scope for this port"}
 {"crate_name":"calibre_ebooks","path":"crates/calibre_ebooks/src/pdf/render/graphics.rs","line":437,"kind":"todo_macro","reason":"QPaintEngine-interception logic - requires driving from a live Qt paint engine, out of scope for this port"}
 {"crate_name":"calibre_ebooks","path":"crates/calibre_ebooks/src/pdf/render/graphics.rs","line":444,"kind":"todo_macro","reason":"QPaintEngine-interception logic - requires driving from a live Qt paint engine, out of scope for this port"}
-{"crate_name":"harness","path":"tools/harness/src/commands/run.rs","line":48,"kind":"comment","reason":"implement iteration loop — see docs/HARNESS.md §Iteration loop."}
-{"crate_name":"harness","path":"tools/harness/src/commands/sweep.rs","line":16,"kind":"comment","reason":"iterate state.green_judged_prs, re-verify each, gh pr merge --squash --auto."}
