@@ -46,13 +46,14 @@
 //!   `extra_glyphs` is always empty here, matching what real upstream
 //!   itself falls back to when a font has no `GSUB` table (which is
 //!   the common case for most fonts).
-//! - **CFF-flavored (`subset_postscript`) fonts** are out of scope for
-//!   this issue (#554); [`subset`] returns
-//!   [`SubsetError::UnsupportedFont`] for a font with a `CFF ` table
-//!   and no `glyf`/`loca` pair, matching real upstream's own
-//!   `UnsupportedFont` for a font with neither TrueType nor PostScript
-//!   outlines (just for a different reason: not-yet-implemented rather
-//!   than genuinely absent).
+//! - **CFF-flavored (`subset_postscript`) fonts**: real subsetting via
+//!   [`subset_cff`] (port of `CFFTable.subset`, issue #565, itself
+//!   built on #563/#564's DICT codec and table reader and #565's own
+//!   [`super::cff::writer::Subset`] orchestrator). [`subset`] still
+//!   returns [`SubsetError::UnsupportedFont`] only for a font with
+//!   neither a `glyf`/`loca` pair nor a `CFF ` table, matching real
+//!   upstream's own `UnsupportedFont` for a font with no outlines at
+//!   all.
 //! - **`subset()`'s CLI-facing `individual_chars`/`ranges` parameters**
 //!   (a comma-separated-string convenience layer for the `subset-font`
 //!   command-line tool) aren't ported -- this port's [`subset`] takes
@@ -65,6 +66,8 @@ use std::fmt;
 
 use indexmap::IndexMap;
 
+use super::cff::table::Cff;
+use super::cff::writer::Subset as CffSubset;
 use super::cmap::CmapTable;
 use super::container::Sfnt;
 use super::errors::{NoGlyphs, UnsupportedFont};
@@ -176,6 +179,51 @@ pub fn subset_truetype(sfnt: &mut Sfnt, character_map: &mut BTreeMap<u32, u32>, 
     Ok(())
 }
 
+/// Port of `CFFTable.subset`: maps `character_map`'s cmap-derived glyph
+/// ids to glyph *names* via the font's own [`super::cff::table::Charset`]
+/// (CFF's `CharStrings` index is keyed by name/SID, not directly by the
+/// TrueType-style glyph id `character_map` carries), runs the real
+/// [`CffSubset`] orchestrator keeping only those names (plus any
+/// `extra_glyphs`), then remaps `character_map` back to the *subset*
+/// font's own (unchanged, since glyph ids are preserved -- see
+/// [`CffSubset`]'s own doc) glyph ids.
+pub fn subset_cff(cff_raw: &[u8], character_map: &mut BTreeMap<u32, u32>, extra_glyphs: &HashSet<usize>) -> Result<Vec<u8>, SubsetError> {
+    let cff = Cff::parse(cff_raw)?;
+
+    let charset_map: BTreeMap<u32, Option<String>> = character_map.iter().map(|(&code, &gid)| (code, cff.charset.safe_lookup(gid as usize))).collect();
+
+    let mut charnames: HashSet<String> = charset_map.values().flatten().cloned().collect();
+    if charnames.is_empty() && !character_map.is_empty() {
+        return Err(NoGlyphs("This font has no glyphs for the specified characters".to_string()).into());
+    }
+    for &gid in extra_glyphs {
+        if let Some(name) = cff.charset.safe_lookup(gid) {
+            charnames.insert(name);
+        }
+    }
+
+    let subset = CffSubset::new(&cff, charnames);
+
+    // Rebuild character_map with the glyph ids from the subset font.
+    // Real upstream's own `if glyph_id:` is a Python truthiness check,
+    // so a resolved id of 0 (`.notdef`) is deliberately never inserted
+    // -- replicated faithfully rather than "fixed" to `is_some()`.
+    character_map.clear();
+    for (code, charname) in charset_map {
+        let Some(charname) = charname else { continue };
+        if let Some(&glyph_id) = subset.charname_map.get(&charname) {
+            if glyph_id != 0 {
+                character_map.insert(code, glyph_id as u32);
+            }
+        }
+    }
+
+    // Check that raw is parseable.
+    Cff::parse(&subset.raw)?;
+
+    Ok(subset.raw)
+}
+
 /// Real sfnt tables `subset` keeps -- everything else is stripped
 /// before subsetting, matching real Python's `core_tables` set.
 const CORE_TABLES: &[[u8; 4]] = &[
@@ -218,7 +266,9 @@ pub fn subset(raw: &[u8], chars: &HashSet<char>) -> Result<(Vec<u8>, IndexMap<[u
     if sfnt.contains(b"loca") && sfnt.contains(b"glyf") {
         subset_truetype(&mut sfnt, &mut character_map, &extra_glyphs)?;
     } else if sfnt.contains(b"CFF ") {
-        return Err(UnsupportedFont("CFF-flavored (PostScript outline) font subsetting is not yet implemented".to_string()).into());
+        let cff_raw = sfnt.get(b"CFF ").cloned().unwrap();
+        let new_cff_raw = subset_cff(&cff_raw, &mut character_map, &extra_glyphs)?;
+        sfnt.insert(*b"CFF ", new_cff_raw);
     } else {
         return Err(UnsupportedFont("This font does not contain TrueType or PostScript outlines".to_string()).into());
     }
@@ -249,6 +299,118 @@ mod tests {
     use super::*;
     use crate::fonts::sfnt::max_power_of_two;
     use crate::fonts::utils::checksum_of_block;
+
+    /// A real, fixed-width-offset (see `cff::table::tests::minimal_cff`'s
+    /// own doc for why) 4-glyph CFF table: `.notdef` + 3 glyphs, a
+    /// custom format-0 charset resolving to real CFF Standard Strings
+    /// ("space"/"exclam"/"quotedbl", SIDs 1-3).
+    fn four_glyph_cff() -> Vec<u8> {
+        fn write_offset_op(v: u32) -> Vec<u8> {
+            let mut out = vec![29u8];
+            out.extend(v.to_be_bytes());
+            out
+        }
+        fn index(entries: &[&[u8]]) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend((entries.len() as u16).to_be_bytes());
+            if entries.is_empty() {
+                return out;
+            }
+            out.push(1u8); // offset_size = 1
+            let mut off = 1u32;
+            out.push(off as u8);
+            for e in entries {
+                off += e.len() as u32;
+                out.push(off as u8);
+            }
+            for e in entries {
+                out.extend_from_slice(e);
+            }
+            out
+        }
+
+        let header = vec![1u8, 0, 4, 4]; // major, minor, header_size=4, offset_size=4
+        let names = index(&[b"Font"]);
+
+        let build = |charstrings_off: u32, charset_off: u32| -> Vec<u8> {
+            let mut dict = Vec::new();
+            dict.extend(write_offset_op(charset_off));
+            dict.push(15); // charset
+            dict.extend(write_offset_op(charstrings_off));
+            dict.push(17); // CharStrings
+            index(&[&dict])
+        };
+
+        let strings = index(&[]);
+        let global_subrs = index(&[]);
+        let char_strings = index(&[b"\x0e", b"\xAA", b"\xBB", b"\xCC"]);
+
+        let top_dict_index_len = build(0, 0).len();
+        let after_top_dict = header.len() + names.len() + top_dict_index_len + strings.len() + global_subrs.len();
+        let charstrings_offset = after_top_dict as u32;
+        let charset_offset = charstrings_offset + char_strings.len() as u32;
+
+        let charset_table = {
+            let mut c = vec![0u8]; // format 0
+            c.extend(1u16.to_be_bytes()); // glyph 1 -> SID 1 "space"
+            c.extend(2u16.to_be_bytes()); // glyph 2 -> SID 2 "exclam"
+            c.extend(3u16.to_be_bytes()); // glyph 3 -> SID 3 "quotedbl"
+            c
+        };
+
+        let top_dict_index = build(charstrings_offset, charset_offset);
+        assert_eq!(top_dict_index.len(), top_dict_index_len, "fixed-width offset encoding must not change size between passes");
+
+        let mut out = header;
+        out.extend(names);
+        out.extend(top_dict_index);
+        out.extend(strings);
+        out.extend(global_subrs);
+        out.extend(char_strings);
+        out.extend(charset_table);
+        out
+    }
+
+    #[test]
+    fn subset_cff_remaps_character_map_to_the_subset_fonts_glyph_ids() {
+        let raw = four_glyph_cff();
+        // cmap-style: char code 65 ('A') -> glyph 2 ("exclam"), code 66
+        // ('B') -> glyph 3 ("quotedbl", not kept).
+        let mut character_map: BTreeMap<u32, u32> = [(65u32, 2u32), (66u32, 3u32)].into_iter().collect();
+        // Only glyph 2 ("exclam") is actually requested via character_map,
+        // so glyph 3 gets dropped by subset_cff itself (not by an
+        // explicit keep-set) -- character_map drives what's kept.
+        character_map.remove(&66);
+
+        let new_raw = subset_cff(&raw, &mut character_map, &HashSet::new()).unwrap();
+        assert_eq!(character_map.get(&65), Some(&2), "glyph ids are preserved by CFF subsetting, not renumbered");
+
+        let reparsed = Cff::parse(&new_raw).unwrap();
+        assert_eq!(reparsed.char_strings[2], vec![0xBB]);
+        assert_eq!(reparsed.char_strings[1], vec![0x0e], "unrequested glyph 1 is stubbed to endchar");
+        assert_eq!(reparsed.char_strings[3], vec![0x0e], "unrequested glyph 3 is stubbed to endchar");
+    }
+
+    #[test]
+    fn subset_cff_keeps_extra_glyphs_beyond_the_character_map() {
+        let raw = four_glyph_cff();
+        let mut character_map: BTreeMap<u32, u32> = [(65u32, 2u32)].into_iter().collect();
+        let extra_glyphs: HashSet<usize> = [3usize].into_iter().collect();
+
+        let new_raw = subset_cff(&raw, &mut character_map, &extra_glyphs).unwrap();
+        let reparsed = Cff::parse(&new_raw).unwrap();
+        assert_eq!(reparsed.char_strings[3], vec![0xCC], "extra_glyphs keeps glyph 3 even though no code maps to it");
+    }
+
+    #[test]
+    fn subset_cff_errors_with_no_glyphs_when_the_character_map_matches_nothing() {
+        let raw = four_glyph_cff();
+        // Glyph id 99 has no charset entry -> safe_lookup returns None
+        // for every character_map entry -> no real glyphs requested.
+        let mut character_map: BTreeMap<u32, u32> = [(65u32, 99u32)].into_iter().collect();
+        let err = subset_cff(&raw, &mut character_map, &HashSet::new()).unwrap_err();
+        assert!(matches!(err, SubsetError::NoGlyphs(_)));
+    }
 
     fn head_bytes(index_to_loc_format: i16) -> Vec<u8> {
         let mut out = Vec::new();

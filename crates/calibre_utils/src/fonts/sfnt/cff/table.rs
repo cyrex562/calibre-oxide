@@ -179,6 +179,8 @@ fn value_int(value: &Value, index: usize) -> Result<i64, UnsupportedFont> {
 pub struct Cff {
     pub major_version: u8,
     pub minor_version: u8,
+    pub offset_size: u8,
+    pub font_names: Vec<Vec<u8>>,
     pub top_dict: Dict,
     pub is_cid: bool,
     pub char_strings: Vec<Vec<u8>>,
@@ -196,6 +198,7 @@ impl Cff {
         let major_version = *raw.first().ok_or_else(trunc)?;
         let minor_version = *raw.get(1).ok_or_else(trunc)?;
         let header_size = *raw.get(2).ok_or_else(trunc)?;
+        let offset_size = *raw.get(3).ok_or_else(trunc)?;
         if (major_version, minor_version) != (1, 0) {
             return Err(UnsupportedFont(format!("The CFF table has unknown version: ({major_version}, {minor_version})")));
         }
@@ -254,6 +257,8 @@ impl Cff {
         Ok(Cff {
             major_version,
             minor_version,
+            offset_size,
+            font_names,
             top_dict,
             is_cid,
             char_strings,

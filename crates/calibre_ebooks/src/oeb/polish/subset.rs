@@ -28,10 +28,12 @@
 //!   fully-hand-rolled `sfnt/subset.py` algorithm instead -- same
 //!   observable goal (shrink an embedded font to only the glyphs a
 //!   book's text needs), different implementation, not byte-identical
-//!   output to current upstream. CFF-flavored (PostScript-outline)
-//!   fonts aren't subsettable yet (issue #554); such a font is
-//!   reported as unsupported and left untouched, matching how any
-//!   other unsupported font is handled.
+//!   output to current upstream. CFF-flavored (PostScript-outline,
+//!   `.otf`) fonts are also real subsetting candidates as of issue
+//!   #565 (`calibre_utils::fonts::sfnt::subset::subset_cff`); only a
+//!   font with neither `glyf`/`loca` nor a `CFF ` table (i.e. no
+//!   outlines this port can subset) is reported as unsupported and
+//!   left untouched.
 //!
 //! [`iter_subsettable_fonts`] needs neither: it is pure manifest
 //! filtering and is ported for real.
