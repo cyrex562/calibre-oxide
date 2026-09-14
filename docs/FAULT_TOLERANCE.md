@@ -117,6 +117,68 @@ Everything in §2-§5 still applies, plus:
 - Retry policy: exponential backoff up to 60 s, then bubble up. Never
   retry silently for more than 5 minutes — surface the failure.
 
+### Validated against real mounts (issues #262/#263, PR #696)
+
+§6 was originally shipped (#257/PR #261) verified logic-only, against a
+plain local filesystem standing in for "network" — no real network
+filesystem was available at the time. Since validated against a real
+loopback NFSv4 mount (`itsthenetwork/nfs-server-alpine` in a container)
+and a real loopback SMB3 mount (Samba in a container, mounted via the
+Linux `cifs.ko` client):
+
+- Tier classification, and the real write/copy/rename/remove path, both
+  confirmed correct against real NFSv4 and SMB3.
+- **Rename onto an already-existing target** — SMB's most-cited real
+  divergence from POSIX — confirmed atomic and correct on both real
+  mounts: the source's content lands at the target, the source is
+  gone, nothing partial. (Scope limit: this is a modern Samba server
+  and a modern Linux `cifs.ko` client; the historically-flaky
+  combinations are older SMB1/non-Samba servers, which weren't
+  available to test against here.)
+- A real, general bug was found and fixed while setting this up
+  (issue #694): journal recovery falsely reported corruption after the
+  same path was written more than once. Unrelated to network storage —
+  reproduces locally too — but only surfaced because a real validation
+  script happened to reopen a handle after several writes to the same
+  target, which the original logic-only tests never did.
+- **`LibraryHandle`'s own writer lock (§7) needed a real fix for SMB**
+  (this PR): the Linux `cifs.ko` client reports a losing `flock`
+  conflict as `EACCES`, not `EWOULDBLOCK` — confirmed live with two
+  real processes racing for the same lock file over the SMB3 mount.
+  Before this fix, a second `LibraryHandle::open` on an SMB-hosted
+  library that lost the lock race got a generic I/O error instead of
+  `AlreadyLocked`, defeating any caller logic that specifically checks
+  for that variant. Fixed by also treating `PermissionDenied`
+  immediately after a successful lock-file `open()` as contention.
+  Raw `flock` (independent of `LibraryHandle`) also confirmed correctly
+  rejecting the second locker on both mounts, just with this
+  differing error kind on SMB.
+- **A real NFS "hard" mount (the default) blocks the underlying
+  syscall itself during a server outage**, rather than returning an
+  error for `retry_with_backoff` to retry. A real NFS server restart
+  mid-`write_atomic` left the operation blocked (not failed) for the
+  outage's full duration; it resumed and completed correctly, with no
+  corruption, once the server came back. This means the 5-minute
+  `total_budget` is not a hard ceiling on how long an operation can
+  actually take under a real outage on a hard mount — the clock inside
+  `retry_with_backoff` only starts once a syscall *returns* an error,
+  and a hard mount may not return one at all until the outage ends.
+  Not fixed: this is standard, intentional NFS hard-mount behavior
+  (favoring "block until it's safe" over "fail fast, maybe corrupt"),
+  and changing it is a mount-option decision for whoever administers
+  the mount, not something `LibraryHandle` controls. A real SMB server
+  restart under the same test, by contrast, surfaced as one slow
+  (~2.5 s) but successful operation — the default "soft" CIFS mount
+  recovered on its own well inside a single retry attempt.
+- NFSv3's specifically-weaker `flock` support (the thing this section
+  most wanted checked) was **not** tested — the readily available
+  loopback server image only serves NFSv4.x. NFSv4's locking, which is
+  what a new real-world deployment would actually use, tested clean.
+
+Not yet validated against a real mount: S3-backed/FUSE storage (#264,
+open — object stores are architecturally different enough that NFS/SMB
+results don't transfer) and Google Drive desktop sync (#265, deferred).
+
 ## 7. Concurrency
 
 - One writer per library. Enforced by `flock`-style exclusive lock on

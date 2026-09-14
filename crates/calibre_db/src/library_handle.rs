@@ -403,6 +403,27 @@ pub(crate) fn flock_test_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Classifies a failed `try_lock()` on the writer-lock file (§7) as
+/// [`LibraryHandleError::AlreadyLocked`] or a plain I/O error.
+///
+/// Real CIFS/SMB finding (issue #263): the Linux `cifs.ko` client
+/// reports a losing `flock` conflict as `EACCES` (`PermissionDenied`),
+/// not `EWOULDBLOCK` -- confirmed live against a real SMB3 mount, two
+/// processes racing for the same lock file. By the time this runs, the
+/// caller has already successfully *opened* the same lock file for
+/// writing (real access to this exact file is confirmed), so an
+/// `EACCES` specifically from the *lock* request right after is a
+/// contention signal, not a genuine permission problem.
+fn classify_writer_lock_error(e: fs::TryLockError) -> LibraryHandleError {
+    match e {
+        fs::TryLockError::WouldBlock => LibraryHandleError::AlreadyLocked,
+        fs::TryLockError::Error(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            LibraryHandleError::AlreadyLocked
+        }
+        fs::TryLockError::Error(e) => LibraryHandleError::Io(e),
+    }
+}
+
 /// Test-only: like `LibraryHandle::open_impl(dir, retention, false,
 /// false)`, but retries briefly on `AlreadyLocked` -- extra defense in
 /// depth on top of [`FLOCK_TEST_SERIALIZE`] for tests that deliberately
@@ -1574,10 +1595,8 @@ impl LibraryHandle {
             .create(true)
             .write(true)
             .open(&lock_path)?;
-        match lock_file.try_lock() {
-            Ok(()) => {}
-            Err(fs::TryLockError::WouldBlock) => return Err(LibraryHandleError::AlreadyLocked),
-            Err(fs::TryLockError::Error(e)) => return Err(LibraryHandleError::Io(e)),
+        if let Err(e) = lock_file.try_lock() {
+            return Err(classify_writer_lock_error(e));
         }
 
         let (tier, network_retry_policy) = match force_tier_and_policy {
@@ -2388,6 +2407,29 @@ mod tests {
         // Releases automatically once the first handle (and its lock
         // file descriptor) drops.
         assert!(LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false).is_ok());
+    }
+
+    #[test]
+    fn classify_writer_lock_error_treats_a_real_cifs_eacces_as_already_locked() {
+        // Issue #263: confirmed live against a real SMB3 mount that
+        // `cifs.ko` reports a losing flock conflict as EACCES, not
+        // EWOULDBLOCK. Exercised here directly (no real SMB mount
+        // needed) since forcing a genuine EACCES from `try_lock()`
+        // isn't reproducible on a local/tmpfs test filesystem.
+        let eacces = io::Error::from(io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            classify_writer_lock_error(fs::TryLockError::Error(eacces)),
+            LibraryHandleError::AlreadyLocked
+        ));
+        assert!(matches!(
+            classify_writer_lock_error(fs::TryLockError::WouldBlock),
+            LibraryHandleError::AlreadyLocked
+        ));
+        let other = io::Error::from(io::ErrorKind::NotFound);
+        assert!(matches!(
+            classify_writer_lock_error(fs::TryLockError::Error(other)),
+            LibraryHandleError::Io(e) if e.kind() == io::ErrorKind::NotFound
+        ));
     }
 
     #[test]
