@@ -59,7 +59,11 @@ async fn fetch_book_row(cache: std::sync::Arc<calibre_db::cache::Cache>, book_id
     rows.into_iter().next().ok_or_else(|| ServerError::book_not_found(book_id, "default"))
 }
 
-async fn handle(state: AppState, what: String, book_id_raw: String, library_id: Option<&str>) -> Result<Response, ServerError> {
+/// `pub(crate)`: reused by `legacy.rs`'s `/legacy/get` (issue #430),
+/// which needs to post-process the response (strip
+/// `Content-Disposition` for old Kindle browsers) rather than just
+/// dispatching to the public [`get`]/[`get_no_library`] handlers.
+pub(crate) async fn handle(state: AppState, what: String, book_id_raw: String, library_id: Option<&str>) -> Result<Response, ServerError> {
     let book_id = book_id_from_path_segment(&book_id_raw)?;
     let cache = state.cache_for(library_id).ok_or_else(|| ServerError::NotFound(format!("no library named {:?}", library_id.unwrap_or(""))))?;
     let book = fetch_book_row(cache, book_id).await?;
