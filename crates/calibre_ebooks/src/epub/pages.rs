@@ -24,18 +24,25 @@
 //! (choosing names, assigning ids, building the page list) and returns
 //! the assignments instead of crashing.
 //!
-//! **Element selection is the caller's.** The Python takes two XPath
-//! expressions from the command line, one selecting the break elements
-//! and one pulling name text out of each. Evaluating arbitrary XPath
-//! needs an engine this crate does not have, so the caller does the
-//! selecting and hands over [`PageMarker`]s. Everything downstream of
-//! that — the id generation, the `href#id` joining, the name filtering
-//! — is ported.
+//! **Element selection is CSS, not XPath (issue #141).** The Python
+//! takes two XPath expressions from the command line, one selecting
+//! the break elements and one pulling name text out of each. This
+//! crate has no XPath engine, and `add_page_map` has no real caller in
+//! calibre to match a CLI contract against (see above) -- so rather
+//! than build an XPath subset for a feature nobody calls, element
+//! selection here is CSS ([`select_page_markers`], built on
+//! [`crate::css::matcher`]'s real selector engine). This is a
+//! deliberate, disclosed divergence in *how* breaks are found, not in
+//! what happens once they are: [`add_page_map`] itself, downstream of
+//! selection, is unchanged.
 
 use std::sync::OnceLock;
 
 use regex::Regex;
 
+use crate::css::matcher::{DomElement, Element, Select};
+use crate::css::selector::{parse_selector_list, SelectorError};
+use crate::dom::Dom;
 use crate::oeb::book::OEBBook;
 
 fn page_re() -> &'static Regex {
@@ -113,6 +120,59 @@ pub struct PageMarker {
     pub values: Vec<String>,
 }
 
+/// Where a page break's name text comes from, once the break element
+/// itself has been found by [`select_page_markers`]'s CSS selector.
+///
+/// Stands in for the second half of the Python's XPath contract
+/// (`--page-names ./@title` or similar): an XPath can select an
+/// attribute or arbitrary text nodes, but real page-break markup only
+/// ever needs one of two things, so that is all this offers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NameSource {
+    /// An attribute on the break element itself, e.g. `title` for
+    /// `./@title`.
+    Attr(String),
+    /// The break element's own text content, e.g. `<a id="page_42">42</a>`.
+    Text,
+}
+
+/// Find page-break elements in `dom` by CSS selector and build a
+/// [`PageMarker`] for each, in document order.
+///
+/// Port of the *selecting* half of the Python's command-line contract
+/// (`--page`/`--page-names`), using a CSS selector instead of XPath --
+/// see the module docs for why. `page_selector` finds the break
+/// elements (e.g. `div.pagebreak`); `name_source`, when given,
+/// extracts each one's name text (`None` leaves `values` empty, for
+/// [`PageNamer::Sequential`], which ignores them anyway).
+pub fn select_page_markers(
+    dom: &Dom,
+    page_selector: &str,
+    name_source: Option<&NameSource>,
+) -> Result<Vec<PageMarker>, SelectorError> {
+    let selectors = parse_selector_list(page_selector)?;
+    let elements: Vec<DomElement> = Select::for_dom(dom).matching(&selectors);
+    Ok(elements
+        .into_iter()
+        .map(|el| {
+            let id = el.get_attr("id");
+            let values = match name_source {
+                Some(NameSource::Attr(attr)) => el.get_attr(attr).into_iter().collect(),
+                Some(NameSource::Text) => {
+                    let text = dom.text_content(el.id);
+                    if text.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![text]
+                    }
+                }
+                None => Vec::new(),
+            };
+            PageMarker { id, values }
+        })
+        .collect())
+}
+
 /// A page break after processing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssignedPage {
@@ -183,6 +243,70 @@ mod tests {
             id: id.map(str::to_string),
             values: values.iter().map(|v| v.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn select_page_markers_finds_breaks_by_css_selector() {
+        let dom = Dom::parse(
+            r#"<html><body>
+                <div class="pagebreak" id="p1" title="iv"></div>
+                <p>text</p>
+                <div class="pagebreak" title="1"></div>
+            </body></html>"#,
+        );
+        let markers =
+            select_page_markers(&dom, "div.pagebreak", Some(&NameSource::Attr("title".to_string())))
+                .expect("valid selector");
+        assert_eq!(markers.len(), 2);
+        assert_eq!(markers[0].id.as_deref(), Some("p1"));
+        assert_eq!(markers[0].values, vec!["iv".to_string()]);
+        // No id on the second element -- add_page_map generates one.
+        assert_eq!(markers[1].id, None);
+        assert_eq!(markers[1].values, vec!["1".to_string()]);
+    }
+
+    #[test]
+    fn select_page_markers_can_read_the_elements_own_text() {
+        let dom = Dom::parse(r#"<html><body><a id="page_42">42</a></body></html>"#);
+        let markers = select_page_markers(&dom, "a", Some(&NameSource::Text)).expect("valid selector");
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].values, vec!["42".to_string()]);
+    }
+
+    #[test]
+    fn select_page_markers_defaults_to_no_name_values() {
+        let dom = Dom::parse(r#"<html><body><div class="pagebreak"></div></body></html>"#);
+        let markers = select_page_markers(&dom, "div.pagebreak", None).expect("valid selector");
+        assert_eq!(markers[0].values, Vec::<String>::new());
+    }
+
+    #[test]
+    fn select_page_markers_reports_a_bad_selector() {
+        let dom = Dom::parse("<html><body></body></html>");
+        assert!(select_page_markers(&dom, "", None).is_err());
+    }
+
+    #[test]
+    fn selecting_then_assigning_produces_a_real_end_to_end_page_map() {
+        let dom = Dom::parse(
+            r#"<html><body>
+                <div class="pagebreak" title="Page 1"></div>
+                <div class="pagebreak" title="Page 2"></div>
+            </body></html>"#,
+        );
+        let markers = select_page_markers(
+            &dom,
+            "div.pagebreak",
+            Some(&NameSource::Attr("title".to_string())),
+        )
+        .expect("valid selector");
+        let mut oeb = book();
+        let mut namer = PageNamer::FromText;
+        let items = vec![("chapter1.html".to_string(), markers)];
+        let assigned = add_page_map(&mut oeb, &items, &mut namer);
+        let names: Vec<&str> = assigned.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["1", "2"]);
+        assert!(assigned.iter().all(|a| a.id_generated));
     }
 
     #[test]

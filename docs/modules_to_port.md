@@ -497,8 +497,8 @@ either -- this pass wasn't exhaustive.
 
 #### epub
 
-- [x] `__init__.py` -> `epub.rs` (`simple_container_xml`, `initialize_container`; `rules()` needs a CSS object model, not ported)
-- [x] `pages.py` -> `epub/pages.rs` (element selection is the caller's — no XPath engine; `add_page_map`'s unreachable writer call is not reproduced)
+- [x] `__init__.py` -> `epub.rs` (`simple_container_xml`, `initialize_container`, `rules()` — issue #141 closed 2026-09-14: `crate::css`'s object model (from #88) made `rules()` a straightforward flat filter over `Stylesheet`/`Rule`)
+- [x] `pages.py` -> `epub/pages.rs` (issue #141 closed 2026-09-14: element selection is CSS, not XPath — `select_page_markers` built on `crate::css::matcher`'s real selector engine, per explicit user direction since `add_page_map` has no real caller/CLI contract to match; `add_page_map`'s unreachable writer call is not reproduced)
 - [x] `periodical.py` -> `epub/periodical.rs` (issue #139/#5 fixed: article `<summary>` now reads the article's own `description`, not its section's, which real calibre does and which silently discarded every article's real description. See the module's own doc for the still-open #142 question on the escaping divergence)
 
 ##### cfi
