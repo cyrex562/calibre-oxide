@@ -16,9 +16,13 @@
 //!   calibre escapes the section summary but not the article summary,
 //!   and escapes neither `href`. A description containing `&` or `<`
 //!   — ordinary in a news feed — therefore yields non-well-formed XML.
-//!   This port escapes every interpolated value. See issue #142 for
-//!   the one open question about this (whether real Sony hardware
-//!   actually requires calibre's unescaped form).
+//!   This port escapes every interpolated value. Issue #142 asked
+//!   whether real Sony PRS-505/600/T1 hardware actually requires
+//!   calibre's unescaped form instead — closed won't-verify: that
+//!   hardware has been discontinued for over a decade and nobody
+//!   working on this port has access to it. Kept the well-formed
+//!   choice, since a writer producing invalid XML is a defect
+//!   regardless of what any one reader's parser tolerates.
 //! - **Article summaries.** Real calibre reads the *section's*
 //!   description for every article's `<summary>` instead of the
 //!   article's own, so every article in a section shows the same
