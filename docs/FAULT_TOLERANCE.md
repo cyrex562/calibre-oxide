@@ -175,9 +175,55 @@ Linux `cifs.ko` client):
   loopback server image only serves NFSv4.x. NFSv4's locking, which is
   what a new real-world deployment would actually use, tested clean.
 
-Not yet validated against a real mount: S3-backed/FUSE storage (#264,
-open — object stores are architecturally different enough that NFS/SMB
-results don't transfer) and Google Drive desktop sync (#265, deferred).
+### Validated against a real S3-backed FUSE mount (issue #264, PR #697)
+
+Object stores are architecturally different enough from NFS/SMB that
+the results above don't transfer — validated separately, against a
+real MinIO bucket (loopback container) mounted two ways: `rclone
+mount` and `s3fs-fuse`.
+
+- **Real bug fixed**: `s3fs-fuse` reports its fstype as exactly
+  `fuse.s3fs`, which wasn't in `NETWORK_FSTYPES` — a library on an
+  s3fs mount silently got `LocalInternal` treatment, the opposite of
+  the caution an object-store mount needs (no local-staging, no
+  read-back-verify, no retry/backoff). `fuse.rclone` was already
+  correctly recognized. Added `fuse.s3fs`.
+- Tier classification (once fixed), the write/copy/rename/remove path,
+  and rename onto an already-existing target all confirmed correct
+  against both real mounts.
+- **`fsync`-durability genuinely depends on the mount's own
+  configuration, confirmed by direct measurement — this is real, not
+  theoretical, and `LibraryHandle` cannot fix it from its own code.**
+  With `rclone mount`'s default `--vfs-cache-mode writes`,
+  `write_atomic`'s own explicit `fsync()` on the scratch/temp file
+  returns success while the object is still, measurably, not yet
+  present in MinIO — confirmed by querying MinIO directly (bypassing
+  the FUSE mount entirely) immediately after `write_atomic` returned
+  `Ok`. `LibraryHandle`'s own read-back-verify step doesn't catch this
+  either, since it reads back through the *same* FUSE cache that's
+  lying about durability. Remounting with `--vfs-cache-mode off` closed
+  the gap completely — the same immediate query confirmed every file
+  durably present in MinIO the instant `write_atomic` returned.
+  **Recommendation for anyone hosting a library on an S3-backed FUSE
+  mount: use a cache mode with genuinely synchronous writes (e.g.
+  `rclone mount --vfs-cache-mode off`), not a default tuned for read
+  performance** — this is a real, disclosed limitation of what any
+  application-level `fsync()` call can guarantee against a FUSE daemon
+  that chooses not to honor it synchronously, not something a future
+  `LibraryHandle` change could close on its own.
+- Not tested: the "rename is actually copy-then-delete" failure mode
+  the issue specifically flagged (a crash mid-rename leaving a
+  copied-and-partially-deleted source) — both FUSE tools' own VFS
+  layers handled every rename tested here as a single opaque
+  operation, and reliably interrupting one specifically *inside* the
+  backend copy+delete (as opposed to interrupting the calling process,
+  which doesn't touch an already-dispatched backend call) needs a
+  fault-injection point inside the FUSE daemon itself that neither
+  tool exposes from the outside. Flagged as a real, still-open
+  question rather than assumed covered.
+
+Not yet validated against a real mount: Google Drive desktop sync
+(#265, deferred).
 
 ## 7. Concurrency
 
