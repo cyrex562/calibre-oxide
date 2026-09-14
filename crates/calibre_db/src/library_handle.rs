@@ -2304,6 +2304,13 @@ const NETWORK_FSTYPES: &[&str] = &[
     "fuse.sshfs",
     "davfs",
     "fuse.rclone",
+    // Issue #264: confirmed live -- mounting a real MinIO bucket with
+    // `s3fs-fuse` reports fstype exactly `fuse.s3fs`, and without this
+    // entry `classify_storage_tier` silently called it `LocalInternal`
+    // -- meaning a library on an s3fs mount got none of §6's network
+    // safety (no local-staging, no read-back-verify, no retry/backoff),
+    // the opposite of the caution an object-store-backed mount needs.
+    "fuse.s3fs",
     "9p",
     "afs",
     "ceph",
@@ -3992,6 +3999,16 @@ mod tests {
         );
         assert_eq!(
             classify_from_device_and_fstype("//server/share", "cifs"),
+            StorageTier::Network
+        );
+    }
+
+    #[test]
+    fn classify_from_device_and_fstype_detects_s3fs_mounts() {
+        // Issue #264: confirmed live against a real MinIO bucket
+        // mounted with s3fs-fuse -- its real fstype is exactly this.
+        assert_eq!(
+            classify_from_device_and_fstype("ft-bucket", "fuse.s3fs"),
             StorageTier::Network
         );
     }
