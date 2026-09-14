@@ -24,6 +24,11 @@
 //!   article's own, so every article in a section shows the same
 //!   blurb and the article's real description is dropped entirely —
 //!   a plain bug (issue #139, #5), fixed here to use `article.description`.
+//! - **Duplicate article titles.** Real calibre disambiguates an
+//!   article title against the shared seen-title set but never adds
+//!   the result to it, so the second and third articles sharing a
+//!   title both become "Title 1" instead of "Title 1"/"Title 2" —
+//!   a plain bug (issue #139, #4), fixed here.
 
 use chrono::{DateTime, Datelike, Utc};
 
@@ -225,7 +230,6 @@ pub fn sony_metadata(oeb: &OEBBook, clock: &Clock) -> SonyMetadata {
             section.title.clone().unwrap_or_default(),
             "Unknown",
             &mut seen_titles,
-            true,
         );
         let sectitle = prepare_string_for_xml(&sectitle, true);
         let secdesc = prepare_string_for_xml(section.description.as_deref().unwrap_or(""), false);
@@ -246,14 +250,17 @@ pub fn sony_metadata(oeb: &OEBBook, clock: &Clock) -> SonyMetadata {
             let Some(ahref) = non_empty(&article.href) else {
                 continue;
             };
-            // The article title is disambiguated against the same set
-            // but — as in calibre — is not added to it, so several
-            // articles sharing a title all become "<title> 1".
+            // Issue #139 (#4): real calibre disambiguates the article
+            // title against the shared set but never adds the result
+            // to it, so several articles sharing a title all become
+            // "<title> 1" instead of "<title> 1"/"<title> 2"/etc.
+            // Fixed here to record the article title too --
+            // diverging from upstream's own bug is a deliberate
+            // product decision, not a rendering-fidelity concern.
             let atitle = disambiguate(
                 article.title.clone().unwrap_or_default(),
                 "",
                 &mut seen_titles,
-                false,
             );
             let author = article.author.clone().unwrap_or_default();
             // Issue #139 (#5): real calibre reads the *section's*
@@ -298,11 +305,9 @@ fn non_empty(value: &Option<String>) -> Option<&str> {
     value.as_deref().filter(|v| !v.is_empty())
 }
 
-/// Append ` 1`, ` 2`, ... until the title is not already taken.
-///
-/// `record` mirrors calibre: section titles join the seen set, article
-/// titles do not.
-fn disambiguate(title: String, default: &str, seen: &mut Vec<String>, record: bool) -> String {
+/// Append ` 1`, ` 2`, ... until the title is not already taken, then
+/// join the seen set so later titles disambiguate against it too.
+fn disambiguate(title: String, default: &str, seen: &mut Vec<String>) -> String {
     let base = if title.is_empty() {
         default.to_string()
     } else {
@@ -314,9 +319,7 @@ fn disambiguate(title: String, default: &str, seen: &mut Vec<String>, record: bo
         candidate = format!("{base} {n}");
         n += 1;
     }
-    if record {
-        seen.push(candidate.clone());
-    }
+    seen.push(candidate.clone());
     candidate
 }
 
@@ -586,9 +589,10 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_article_titles_all_get_the_same_suffix() {
-        // calibre never adds an article title to the seen set, so the
-        // second and third copies both become "Repeat 1". Reproduced.
+    fn duplicate_article_titles_are_each_disambiguated() {
+        // Issue #139 (#4): fixed so each article title joins the seen
+        // set, giving successive duplicates distinct suffixes instead
+        // of every copy after the first becoming "Repeat 1".
         let mut oeb = book();
         oeb.toc = crate::oeb::toc::TOC::new();
         let mut s = section("Repeat", "s.html", None);
@@ -597,7 +601,10 @@ mod tests {
         }
         oeb.toc.root.add(s);
         let out = sony_metadata(&oeb, &clock());
-        assert_eq!(out.atom.matches("<title>Repeat 1</title>").count(), 3);
+        // The section title itself claims "Repeat" first.
+        assert_eq!(out.atom.matches("<title>Repeat 1</title>").count(), 1);
+        assert_eq!(out.atom.matches("<title>Repeat 2</title>").count(), 1);
+        assert_eq!(out.atom.matches("<title>Repeat 3</title>").count(), 1);
     }
 
     #[test]
