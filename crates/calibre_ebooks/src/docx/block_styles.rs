@@ -443,11 +443,20 @@ fn read_justification(parent: Node, ns: &DocxNamespace, dest: &mut ParagraphStyl
         let Some(val) = ns.get(jc, "w:val").filter(|v| !v.is_empty()) else {
             continue;
         };
-        // The `kashida` test is lowercase in calibre while Word writes
-        // `lowKashida`/`mediumKashida`/`highKashida`, so it never
-        // matches. Kept as-is: "fixing" it would change the rendering
-        // of Arabic documents, which is not this port's call to make.
-        if matches!(val, "both" | "distribute") || val.contains("thai") || val.contains("kashida") {
+        // Issue #139 (#1): real calibre's `'kashida' in val` test is
+        // lowercase, so it never matches Word's actual spellings
+        // (`lowKashida`/`mediumKashida`/`highKashida`), and the same
+        // is true of its `'thai' in val` test against `thaiDistribute`
+        // (which DOES match, since "thai" is already lowercase there).
+        // Fixed here to recognize the real ST_Jc enum members
+        // case-insensitively -- diverging from upstream's own bug is
+        // a deliberate product decision, not a rendering-fidelity
+        // concern.
+        let val_lower = val.to_ascii_lowercase();
+        if matches!(val, "both" | "distribute")
+            || val_lower.contains("thai")
+            || val_lower.contains("kashida")
+        {
             dest.text_align = Some("justify".to_string());
         } else if matches!(val, "left" | "center" | "right" | "start" | "end") {
             dest.text_align = Some(val.to_string());
@@ -1085,17 +1094,18 @@ mod tests {
                 .as_deref(),
             Some("justify")
         );
-        // Word spells the kashida values `lowKashida`/`mediumKashida`/
-        // `highKashida`, so calibre's lowercase `'kashida' in val` test
-        // never fires. Reproduced rather than fixed: changing it would
-        // silently alter output for Arabic documents, which belongs in
-        // its own change.
-        assert_eq!(
-            style_of(r#"<w:jc w:val="mediumKashida"/>"#)
-                .text_align
-                .as_deref(),
-            None
-        );
+        // Issue #139 (#1): fixed to recognize Word's actual spellings
+        // of the kashida values, which real calibre's lowercase test
+        // misses entirely.
+        for val in ["lowKashida", "mediumKashida", "highKashida"] {
+            assert_eq!(
+                style_of(&format!(r#"<w:jc w:val="{val}"/>"#))
+                    .text_align
+                    .as_deref(),
+                Some("justify"),
+                "{val} should justify"
+            );
+        }
         assert_eq!(
             style_of(r#"<w:jc w:val="center"/>"#).text_align.as_deref(),
             Some("center")

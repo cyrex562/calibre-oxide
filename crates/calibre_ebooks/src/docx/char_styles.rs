@@ -517,11 +517,13 @@ fn read_font_cs(parent: Node, ns: &DocxNamespace, dest: &mut RunStyle) {
     }
     for col in ns.children(parent, &["w:szCS"]) {
         if let Some(v) = simple_float(ns.get(col, "w:val"), 0.5) {
-            // Calibre assigns `w:szCS` to `font_size`, not
-            // `cs_font_size` — and since this runs after read_font, a
-            // complex-script size wins over the ASCII one. Reproduced
-            // as-is so output matches; see the module docs.
-            dest.font_size = Some(v);
+            // Issue #139 (#2): real calibre assigns `w:szCS` to
+            // `font_size` instead of `cs_font_size`, so a
+            // complex-script size silently overrides the ASCII one.
+            // Fixed here rather than reproduced -- diverging from
+            // upstream's own bug is a deliberate product decision,
+            // not a rendering-fidelity concern.
+            dest.cs_font_size = Some(v);
             return;
         }
     }
@@ -574,12 +576,13 @@ mod tests {
     }
 
     #[test]
-    fn complex_script_size_overrides_the_ascii_size() {
-        // Calibre's read_font_cs writes to font_size; this pins that
-        // behaviour so a future fix is a deliberate, visible change.
+    fn complex_script_size_lands_on_its_own_field() {
+        // Issue #139 (#2): real calibre writes w:szCS onto font_size,
+        // clobbering the ASCII size. Fixed here to keep the two sizes
+        // independent.
         let s = style_of(r#"<w:sz w:val="24"/><w:szCS w:val="40"/>"#);
-        assert_eq!(s.font_size, Some(20.0));
-        assert_eq!(s.cs_font_size, None);
+        assert_eq!(s.font_size, Some(12.0));
+        assert_eq!(s.cs_font_size, Some(20.0));
     }
 
     #[test]
