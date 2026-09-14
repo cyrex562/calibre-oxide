@@ -173,6 +173,7 @@ pub mod data_files;
 pub mod errors;
 pub mod fts;
 pub mod jobs;
+pub mod legacy;
 pub mod library_broker;
 pub mod notes;
 pub mod opds;
@@ -299,7 +300,14 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/data-files/upload/{book_id}/{library_id}", post(data_files::upload))
         .route("/data-files/remove/{book_id}/{library_id}", post(data_files::remove))
         .route("/reader-profiles/get-all", get(reader_profiles::get_all))
-        .route("/reader-profiles/save", post(reader_profiles::save));
+        .route("/reader-profiles/save", post(reader_profiles::save))
+        .route("/mobile", get(legacy::mobile))
+        .route("/browse", get(legacy::browse_root))
+        .route("/browse/{*rest}", get(legacy::browse))
+        .route("/stanza", get(legacy::stanza))
+        .route("/stanza/{*rest}", get(legacy::stanza))
+        .route("/legacy/get/{what}/{book_id}/{library_id}", get(legacy::legacy_get))
+        .route("/legacy/get/{what}/{book_id}/{library_id}/{*filename}", get(legacy::legacy_get_with_filename));
 
     // Serve the browser UI's built static files (issue #432/#498), if
     // `--static-dir` names a real directory -- as a `fallback_service`
