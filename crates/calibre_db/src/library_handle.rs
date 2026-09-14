@@ -338,6 +338,7 @@
 //!   disclosed, conservative default.
 
 use rusqlite::Connection as SqliteConnection;
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -1858,6 +1859,19 @@ fn recover_journal(
     }
     entries.sort_by_key(|(_, e)| e.seq);
 
+    // A `WriteFile` entry's content-hash check (in `recover_one`,
+    // below) only makes sense against the *newest* entry that
+    // targeted a given path -- an older entry for the same path is
+    // legitimately superseded, not corrupt, once a later write has
+    // overwritten it. `entries` is sorted by seq, so the last write
+    // recorded here for each path is the one recovery should verify.
+    let mut latest_write_seq: HashMap<&Path, u64> = HashMap::new();
+    for (_, entry) in &entries {
+        if let OperationDescriptor::WriteFile { target, .. } = &entry.op {
+            latest_write_seq.insert(target.as_path(), entry.seq);
+        }
+    }
+
     let mut prev_hash = boundary_hash;
     let mut next_seq = boundary_seq;
     // (seq, uuid, descriptor_hash) for every live entry, in order --
@@ -1891,7 +1905,19 @@ fn recover_journal(
         next_seq = entry.seq + 1;
         live.push((entry.seq, *uuid, entry.descriptor_hash.clone()));
 
-        recover_one(journal_dir, *uuid, entry, network_retry_policy)?;
+        let is_latest_write_for_target = match &entry.op {
+            OperationDescriptor::WriteFile { target, .. } => {
+                latest_write_seq.get(target.as_path()) == Some(&entry.seq)
+            }
+            _ => false,
+        };
+        recover_one(
+            journal_dir,
+            *uuid,
+            entry,
+            network_retry_policy,
+            is_latest_write_for_target,
+        )?;
     }
 
     prune_if_needed(journal_dir, checkpoint_path, boundary_seq, retention, &live)?;
@@ -1979,6 +2005,7 @@ fn recover_one(
     uuid: Uuid,
     entry: &JournalEntry,
     network_retry_policy: &RetryPolicy,
+    is_latest_write_for_target: bool,
 ) -> Result<(), LibraryHandleError> {
     let committed_path = journal_dir.join(format!("{uuid}.committed"));
     if committed_path.exists() {
@@ -1988,17 +2015,30 @@ fn recover_one(
         // file changed out from under the journal after it was
         // marked committed -- genuine corruption, not a recovery
         // scenario the design doc's replay logic covers.
+        //
+        // Only checked for the *newest* entry that targeted this
+        // path (`is_latest_write_for_target`): an older `WriteFile`
+        // entry for the same path is expected to mismatch once a
+        // later write has legitimately overwritten it -- e.g. the
+        // same book format or metadata.db saved twice in one
+        // session. Verifying every historical entry regardless would
+        // report every such library as corrupt on its very next
+        // reopen, which real usage hits constantly (found live while
+        // validating §6 network-storage safety, issues #262-#265,
+        // though the bug itself has nothing to do with storage tier).
         if let OperationDescriptor::WriteFile {
             target,
             content_hash,
         } = &entry.op
         {
-            if let Ok(hash) = blake3_hash_file(target) {
-                if hash != *content_hash {
-                    return Err(LibraryHandleError::Corruption(format!(
-                        "{} does not match its recorded checksum",
-                        target.display()
-                    )));
+            if is_latest_write_for_target {
+                if let Ok(hash) = blake3_hash_file(target) {
+                    if hash != *content_hash {
+                        return Err(LibraryHandleError::Corruption(format!(
+                            "{} does not match its recorded checksum",
+                            target.display()
+                        )));
+                    }
                 }
             }
         }
@@ -2730,6 +2770,34 @@ mod tests {
 
         let result = LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false);
         assert!(matches!(result, Err(LibraryHandleError::Corruption(_))));
+    }
+
+    #[test]
+    fn reopening_after_the_same_path_was_written_more_than_once_is_not_corruption() {
+        // Regression test: found live while validating #262-#265
+        // (real network-storage testing surfaced it, but it has
+        // nothing to do with storage tier -- it reproduces on a plain
+        // local filesystem). Every committed `WriteFile` entry that
+        // ever targeted a path used to be re-verified against the
+        // path's *current* content on reopen, not just the newest
+        // one -- so as soon as the same path was written twice within
+        // the retention window (metadata.db saved twice in a session,
+        // a book format re-converted, ...), the older entry's stale
+        // hash could never match, and every reopen after that failed
+        // with a spurious `Corruption` error.
+        let _flock_test_guard = flock_test_guard();
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("metadata.opf");
+
+        let handle = reopen_for_test(dir.path(), JOURNAL_PRUNE_RETENTION);
+        handle.write_atomic(&target, b"version 1").unwrap();
+        handle.write_atomic(&target, b"version 2").unwrap();
+        handle.write_atomic(&target, b"version 3").unwrap();
+        drop(handle);
+
+        let handle2 = reopen_for_test(dir.path(), JOURNAL_PRUNE_RETENTION);
+        assert_eq!(fs::read(&target).unwrap(), b"version 3");
+        drop(handle2);
     }
 
     // }}}
