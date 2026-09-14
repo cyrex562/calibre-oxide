@@ -10,9 +10,6 @@
 //! | `pages.py` | [`pages`] |
 //! | `periodical.py` | [`periodical`] |
 //!
-//! `__init__.py`'s `rules()` is not ported: it walks cssutils
-//! stylesheet objects, and this crate has no CSS object model to walk.
-
 pub mod cfi;
 pub mod pages;
 pub mod periodical;
@@ -22,6 +19,7 @@ use std::io::{Seek, Write};
 use zip::write::FileOptions;
 use zip::ZipWriter;
 
+use crate::css::{Rule, StyleRule, Stylesheet};
 use crate::metadata::MetaInformation;
 use crate::opf::parse_opf;
 use anyhow::{Context, Result};
@@ -89,6 +87,24 @@ pub struct RootFile {
 
 /// Build `META-INF/container.xml` pointing at `opf_path`.
 ///
+/// Yield every style rule (`selector { declarations }`) across a set of
+/// stylesheets, skipping at-rules.
+///
+/// Port of the Python `rules`: `for s in stylesheets: for r in s: if
+/// r.type == r.STYLE_RULE: yield r`. cssutils' `for r in s` only walks
+/// a stylesheet's own top-level rules (not, say, the rules nested
+/// inside a `@media` block), which [`Stylesheet::rules`] already
+/// mirrors -- so this is a flat filter, not a recursive walk.
+pub fn rules(stylesheets: &[Stylesheet]) -> impl Iterator<Item = &StyleRule> {
+    stylesheets
+        .iter()
+        .flat_map(|s| s.rules.iter())
+        .filter_map(|r| match r {
+            Rule::Style(s) => Some(s),
+            _ => None,
+        })
+}
+
 /// Port of the Python `simple_container_xml`. `extra_entries` is
 /// pre-rendered `<rootfile>` markup, as in the original.
 pub fn simple_container_xml(opf_path: &str, extra_entries: &str) -> String {
@@ -147,6 +163,26 @@ pub fn initialize_container<W: Write + Seek>(
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn rules_yields_only_style_rules_across_every_sheet() {
+        let a = Stylesheet::parse("p { color: red; } @media print { p { color: blue; } }");
+        let b = Stylesheet::parse("h1 { font-weight: bold; }");
+        let sheets = [a, b];
+        let selectors: Vec<&str> = rules(&sheets).map(|r| r.selector_text.as_str()).collect();
+        // The @media rule itself isn't a style rule, and cssutils'
+        // `for r in s` never descends into it either -- only the two
+        // top-level rules come out.
+        assert_eq!(selectors, vec!["p", "h1"]);
+    }
+
+    #[test]
+    fn rules_skips_at_rules_with_no_selector() {
+        let sheet = Stylesheet::parse("@import url(x.css); @charset \"utf-8\"; p { color: red; }");
+        let sheets = [sheet];
+        let selectors: Vec<&str> = rules(&sheets).map(|r| r.selector_text.as_str()).collect();
+        assert_eq!(selectors, vec!["p"]);
+    }
 
     #[test]
     fn the_container_points_at_the_opf() {
