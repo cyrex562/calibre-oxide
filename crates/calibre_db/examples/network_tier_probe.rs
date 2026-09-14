@@ -39,6 +39,7 @@ fn main() -> ExitCode {
         }
         "tier" => tier(&args[2]),
         "basic" => basic(&args[2]),
+        "rename-onto-existing" => rename_onto_existing(&args[2]),
         "lock-hold" => lock_hold(&args[2], args[3].parse().unwrap()),
         "lock-try" => lock_try(&args[2]),
         "write-loop" => write_loop(&args[2], args[3].parse().unwrap(), args[4].parse().unwrap()),
@@ -119,6 +120,49 @@ fn basic(path: &str) -> Result<(), String> {
     let _ = std::fs::remove_file(&target);
     let _ = std::fs::remove_file(&source);
     println!("basic: ALL OK");
+    Ok(())
+}
+
+/// Renames a file directly onto an *existing* target -- SMB's
+/// most-cited real divergence from POSIX rename (some server/client
+/// combinations reject it, or don't guarantee it's atomic). Confirms
+/// `rename_atomic` either succeeds with the source's content landing
+/// at the target, or fails cleanly (no partial/lost state), rather
+/// than assuming POSIX semantics apply.
+fn rename_onto_existing(path: &str) -> Result<(), String> {
+    let lib = Path::new(path);
+    let handle = LibraryHandle::open(lib).map_err(|e| e.to_string())?;
+    let from = lib.join("rename_source.txt");
+    let to = lib.join("rename_target.txt");
+    std::fs::write(&from, b"source content").map_err(|e| e.to_string())?;
+    std::fs::write(&to, b"pre-existing target content").map_err(|e| e.to_string())?;
+
+    match handle.rename_atomic(&from, &to) {
+        Ok(()) => {
+            let content = std::fs::read(&to).map_err(|e| e.to_string())?;
+            if content != b"source content" {
+                return Err(format!(
+                    "rename_atomic reported success but target has unexpected content: {:?}",
+                    String::from_utf8_lossy(&content)
+                ));
+            }
+            if from.exists() {
+                return Err("rename_atomic reported success but source still exists".to_string());
+            }
+            println!("rename-onto-existing: OK (rename onto an existing target succeeded, content correct)");
+        }
+        Err(e) => {
+            println!("rename-onto-existing: rename_atomic failed cleanly: {e}");
+            let to_content = std::fs::read(&to).ok();
+            let from_exists = from.exists();
+            println!(
+                "  post-failure state: from.exists()={from_exists} to content={:?}",
+                to_content.map(|c| String::from_utf8_lossy(&c).to_string())
+            );
+        }
+    }
+    let _ = std::fs::remove_file(&from);
+    let _ = std::fs::remove_file(&to);
     Ok(())
 }
 
