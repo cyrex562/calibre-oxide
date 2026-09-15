@@ -1789,7 +1789,7 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 - [ ] serialize.py
 - [x] seven_zip.py
 - [ ] shared_file.py
-- [ ] shm.py
+- [x] shm.py (issue #466, closed 2026-09-15 not-applicable -- exists to support IPC with worker subprocesses, but #68's redesign deliberately replaced that whole architecture with an in-process thread pool (`calibre_utils::pool::Pool<T>`); no worker subprocess exists anywhere in this port to share memory with, same reasoning already used for `launch.py`/`worker.py`/`simple_worker.py` under #68)
 - [x] short_uuid.py
 - [x] smartypants.py
 - [x] smtp.py (issue #468 -- `calibre_utils::smtp`: real SMTP relay sending via the `lettre` crate, redesigned around it rather than porting `smtp.py`'s own MIME/smtplib wrapping line for line. `create_mail` (plain text or `multipart/mixed` with one attachment) + `send_via_relay` (TLS/SSL/none, matching upstream's `encryption` choices onto `lettre`'s `starttls_relay`/`relay`/`builder_dangerous`). Verified with a real TCP round trip against a hand-written fake SMTP server in-test, not a mocked transport. Disclosed narrowings: direct-to-MX delivery (`sendmail_direct`, needs a DNS resolver dependency, no caller uses it), the maildir-backed retry queue and `--fork` background-delivery CLI orchestration (no send-to-device/email feature exists yet to drive that design) not ported)
