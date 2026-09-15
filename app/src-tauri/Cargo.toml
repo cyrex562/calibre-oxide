@@ -23,6 +23,7 @@ tauri = { version = "2.11", features = [] }
 calibre_db = { path = "../../crates/calibre_db" }
 calibre_ebooks = { path = "../../crates/calibre_ebooks" }
 calibre_utils = { path = "../../crates/calibre_utils" }
+tauri-plugin-dialog = "2.7.3"
 
 [features]
 # Feature used for production builds or when a dev server is not specified,
