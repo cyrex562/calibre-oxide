@@ -175,6 +175,7 @@ pub mod fts;
 pub mod jobs;
 pub mod legacy;
 pub mod library_broker;
+pub mod mathjax;
 pub mod notes;
 pub mod opds;
 pub mod opts;
@@ -331,7 +332,20 @@ pub fn router(state: AppState) -> axum::Router {
         None => api,
     };
 
-    api.route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth)).with_state(state)
+    let api = api.route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth));
+
+    // `/mathjax`/`/mathjax/{*which}` (issue #484) are the one real
+    // exemption from the auth layer above -- upstream's own
+    // `auth_required=False`, since a reader page can reference these
+    // assets from contexts where re-authenticating isn't practical,
+    // and the bundle has no per-library/per-user content to protect.
+    // Merged in *after* `route_layer` runs (not registered on `api`
+    // before it), since `route_layer` only wraps whatever routes exist
+    // on the router at the moment it's called -- see `mathjax`'s own
+    // module doc.
+    let mathjax_routes = axum::Router::new().route("/mathjax", get(mathjax::mathjax_root)).route("/mathjax/{*which}", get(mathjax::mathjax_file));
+
+    api.merge(mathjax_routes).with_state(state)
 }
 
 /// [`router`], plus a mocked [`axum::extract::ConnectInfo`] so
@@ -434,5 +448,36 @@ mod tests {
         let (status, body) = get(&router, "/opds").await;
         assert_eq!(status, StatusCode::OK);
         assert!(!body.contains("the reader app"), "the real /opds route must win over the static fallback");
+    }
+
+    #[tokio::test]
+    async fn mathjax_bypasses_auth_but_every_other_route_still_requires_it() {
+        let lib_dir = tempfile::tempdir().unwrap();
+        let users_dir = tempfile::tempdir().unwrap();
+        let users = users::UserManager::new(&users_dir.path().join("users.sqlite")).unwrap();
+        users.add_user("alice", "hunter2", false).unwrap();
+        let state = AppState {
+            libraries: None,
+            cache: std::sync::Arc::new(calibre_db::cache::Cache::new(lib_dir.path()).unwrap()),
+            opts: std::sync::Arc::new(opts::ServerOptions::default()),
+            auth: Some(std::sync::Arc::new(auth::AuthGate::new(users, "calibre".to_string(), 0, 5))),
+            changes: web_socket::new_change_broadcaster(),
+            reader_profiles: std::sync::Arc::new(reader_profiles::ProfileStore::new_in_memory().unwrap()),
+            book_cache: std::sync::Arc::new(books_cache::BookCache::open_temp()),
+            jobs: std::sync::Arc::new(jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
+            render_jobs: std::sync::Arc::new(render_endpoints::RenderJobRegistry::new()),
+            conversion_jobs: std::sync::Arc::new(convert::ConversionJobRegistry::new()),
+        };
+        let router = test_router(state);
+
+        // No credentials supplied at all -- /mathjax must still work
+        // (issue #484's auth_required=False); every other route must
+        // still be rejected.
+        let (status, _) = get(&router, "/mathjax").await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = get(&router, "/mathjax/core.js").await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = get(&router, "/opds").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 }
