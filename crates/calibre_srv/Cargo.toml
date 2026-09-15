@@ -33,6 +33,10 @@ hostname = "0.4.2"
 sha2 = "0.10"
 tempfile = "3.10"
 filetime = "0.2.26"
+# Embeds the vendored MathJax bundle (resources/mathjax/, issue #484)
+# into the compiled binary at build time, so serving it doesn't depend
+# on the process's working directory at runtime.
+include_dir = "0.7"
 
 [dev-dependencies]
 zip = "0.6"
