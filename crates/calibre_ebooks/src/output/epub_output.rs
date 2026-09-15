@@ -1,3 +1,4 @@
+use crate::conversion::options::ConversionOptions;
 use crate::oeb::book::OEBBook;
 use crate::oeb::writer::OEBWriter;
 use anyhow::{Context, Result};
@@ -15,7 +16,7 @@ impl EPUBOutput {
         EPUBOutput
     }
 
-    pub fn convert(&self, book: &mut OEBBook, output_path: &Path) -> Result<()> {
+    pub fn convert(&self, book: &mut OEBBook, output_path: &Path, _opts: &ConversionOptions) -> Result<()> {
         let temp_dir = tempdir().context("Failed to create temporary directory")?;
         let temp_path = temp_dir.path();
 

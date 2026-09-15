@@ -1,3 +1,4 @@
+use calibre_ebooks::conversion::options::ConversionOptions;
 use calibre_ebooks::input::snb_input::SnbInput;
 use calibre_ebooks::oeb::book::OEBBook;
 use calibre_ebooks::oeb::container::DirContainer;
@@ -15,7 +16,7 @@ fn test_snb_output_empty_book_produces_a_valid_container() {
     book.metadata.add("title", "Empty Book");
 
     let output = SnbOutput::new();
-    let result = output.convert(&book, &output_path);
+    let result = output.convert(&book, &output_path, &ConversionOptions::default());
 
     assert!(result.is_ok(), "{result:?}");
     assert!(output_path.exists());
@@ -41,7 +42,7 @@ fn test_snb_output_then_input_round_trips_text_and_metadata() {
     book.metadata.add("creator", "Round Trip Author");
 
     let out_path = src_tmp.path().join("book.snb");
-    SnbOutput::new().convert(&book, &out_path).unwrap();
+    SnbOutput::new().convert(&book, &out_path, &ConversionOptions::default()).unwrap();
 
     let extract_dir = tempdir().unwrap();
     let read_back = SnbInput::new()

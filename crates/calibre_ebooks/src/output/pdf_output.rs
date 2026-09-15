@@ -1,3 +1,4 @@
+use crate::conversion::options::ConversionOptions;
 use crate::oeb::book::OEBBook;
 use anyhow::{Context, Result};
 use calibre_utils::html2text::html2text;
@@ -12,7 +13,7 @@ impl PDFOutput {
         PDFOutput
     }
 
-    pub fn convert(&self, book: &OEBBook, output_path: &Path) -> Result<()> {
+    pub fn convert(&self, book: &OEBBook, output_path: &Path, _opts: &ConversionOptions) -> Result<()> {
         let mut doc = Document::with_version("1.4");
 
         let pages_id = doc.new_object_id();

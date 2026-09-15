@@ -38,9 +38,29 @@
 //! profile selection is a real, separate gap (needs porting the whole
 //! `customize/profiles.py` catalog), not attempted here.
 
+use crate::mobi::writer2::main::MobiWriterOpts;
 use crate::oeb::transforms::flatcss::{FlattenContext, FlattenerOptions};
 use crate::oeb::transforms::jacket::JacketOptions;
 use crate::oeb::transforms::structure::StructureOptions;
+
+/// Port of `MOBIOutput`'s own `mobi_file_type` `OptionRecommendation`
+/// (`choices=['old', 'both', 'new']`, `recommended_value='old'`,
+/// `old_src/.../conversion/plugins/mobi_output.py`). Only `Old` has a
+/// real effect in this port so far ([`ConversionOptions::flattener_options`]'s
+/// `needs_old_markup`) -- `Both`/`New` still produce this port's
+/// single MOBI6 writer's own output rather than selecting a joint
+/// MOBI6+KF8 (`.azw3`) writer, since no `MOBIOutput`/`AZW3Output` glue
+/// wires that up yet (issue #157's own doc: "No AZW3Output plugin
+/// wires this path yet"). Accepted and threaded through regardless,
+/// so the option already exists and does its one real thing today
+/// rather than waiting for the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MobiFileType {
+    #[default]
+    Old,
+    Both,
+    New,
+}
 
 /// The default output profile's own real constants
 /// (`customize/profiles.py`'s base `Plugin`/`OutputProfile` classes).
@@ -90,6 +110,14 @@ pub struct ConversionOptions {
     pub pretty_print: bool,
 
     pub structure: StructureOptions,
+
+    // MOBI-output-specific (mobi_output.py's own OptionRecommendations).
+    // A direct reuse of `MobiWriterOpts` rather than a duplicate field
+    // set -- `MOBIOutput::convert` builds the writer's own opts
+    // straight from this, so there's exactly one place these four
+    // knobs are defined.
+    pub mobi: MobiWriterOpts,
+    pub mobi_file_type: MobiFileType,
 }
 
 impl Default for ConversionOptions {
@@ -126,6 +154,9 @@ impl Default for ConversionOptions {
             pretty_print: false,
 
             structure: StructureOptions::default(),
+
+            mobi: MobiWriterOpts::default(),
+            mobi_file_type: MobiFileType::default(),
         }
     }
 }
@@ -133,15 +164,11 @@ impl Default for ConversionOptions {
 impl ConversionOptions {
     /// Port of the fbase/fkey/lineh/`needs_old_markup` resolution
     /// inlined in `Plumber.run` just before constructing
-    /// `CSSFlattener`. `needs_old_markup` faithfully covers the `lit`
-    /// case (`self.output_plugin.file_type == 'lit'`); the MOBI-format
-    /// `mobi_file_type == 'old'` half of the real condition depends on
-    /// an output-plugin-specific option this port doesn't have yet, so
-    /// `output_ext == "mobi"` never triggers it here (a real, narrow
-    /// gap -- MOBI output already defaults to the newer KF8 markup in
-    /// this port regardless).
+    /// `CSSFlattener`: `self.output_plugin.file_type == 'lit' or
+    /// (file_type == 'mobi' and mobi_file_type == 'old')`.
     pub fn flattener_options(&self, output_ext: &str) -> FlattenerOptions {
-        let needs_old_markup = output_ext == "lit";
+        let is_old_mobi = matches!(output_ext, "mobi" | "azw" | "prc") && self.mobi_file_type == MobiFileType::Old;
+        let needs_old_markup = output_ext == "lit" || is_old_mobi;
         let fbase = if self.base_font_size > 1e-4 { self.base_font_size } else { DEFAULT_FBASE };
         let fkey = self.font_size_mapping.clone().unwrap_or_else(|| DEFAULT_FKEY.to_vec());
         let lineh = if self.line_height > 1e-4 { Some(self.line_height) } else { None };
@@ -228,5 +255,35 @@ mod tests {
         assert!(o.flatten_context("mobi").page_break_on_body);
         assert!(o.flatten_context("lit").page_break_on_body);
         assert!(!o.flatten_context("epub").page_break_on_body);
+    }
+
+    #[test]
+    fn mobi_output_needs_old_markup_by_default_matching_real_upstreams_own_old_default() {
+        // real upstream: `self.output_plugin.file_type == 'lit' or
+        // (file_type == 'mobi' and mobi_file_type == 'old')` --
+        // `mobi_file_type`'s own real recommended_value is 'old', so a
+        // default `ebook-convert --output mobi` needs old markup too,
+        // not just `lit`.
+        let o = ConversionOptions::default();
+        assert_eq!(o.mobi_file_type, MobiFileType::Old);
+        assert!(o.flattener_options("mobi").unfloat, "default MOBI output should need old markup, matching upstream's own default mobi_file_type");
+        assert!(o.flattener_options("azw").unfloat);
+        assert!(o.flattener_options("prc").unfloat);
+    }
+
+    #[test]
+    fn mobi_output_does_not_need_old_markup_for_both_or_new_file_types() {
+        let mut o = ConversionOptions::default();
+        o.mobi_file_type = MobiFileType::Both;
+        assert!(!o.flattener_options("mobi").unfloat);
+        o.mobi_file_type = MobiFileType::New;
+        assert!(!o.flattener_options("mobi").unfloat);
+    }
+
+    #[test]
+    fn non_mobi_formats_are_unaffected_by_mobi_file_type() {
+        let o = ConversionOptions::default();
+        assert!(!o.flattener_options("epub").unfloat);
+        assert!(!o.flattener_options("docx").unfloat);
     }
 }

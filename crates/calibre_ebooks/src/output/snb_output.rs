@@ -18,6 +18,7 @@
 //! to JPEG -- a real thing `HandleImage` does in the unported plugin --
 //! is out of scope here), and a real `snbf/book.snbf` metadata file.
 
+use crate::conversion::options::ConversionOptions;
 use crate::oeb::book::OEBBook;
 use crate::oeb::stylizer::TagStylizer;
 use crate::snb::snbml::{process_file_name, SnbMlizer, SnbOptions};
@@ -36,7 +37,7 @@ impl SnbOutput {
         SnbOutput
     }
 
-    pub fn convert(&self, book: &OEBBook, output_path: &Path) -> Result<()> {
+    pub fn convert(&self, book: &OEBBook, output_path: &Path, _opts: &ConversionOptions) -> Result<()> {
         let opts = SnbOptions::default();
         let mut files: Vec<SnbOutputFile> = Vec::new();
 
@@ -185,7 +186,7 @@ mod tests {
         book.metadata.add("title", "My Book");
         book.metadata.add("creator", "Author One");
 
-        let result = SnbOutput::new().convert(&book, &output_path);
+        let result = SnbOutput::new().convert(&book, &output_path, &ConversionOptions::default());
         assert!(result.is_ok(), "{result:?}");
         assert!(output_path.exists());
         assert!(std::fs::metadata(&output_path).unwrap().len() > 44);

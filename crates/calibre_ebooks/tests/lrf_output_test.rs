@@ -1,3 +1,4 @@
+use calibre_ebooks::conversion::options::ConversionOptions;
 
 use calibre_ebooks::oeb::book::OEBBook;
 use calibre_ebooks::oeb::container::DirContainer;
@@ -16,7 +17,7 @@ fn test_lrf_output_conversion_stub() {
     let book = OEBBook::new(container);
 
     let output = LRFOutput::new();
-    output.convert(&book, &output_path).expect("LRF output conversion failed");
+    output.convert(&book, &output_path, &ConversionOptions::default()).expect("LRF output conversion failed");
 
     assert!(output_path.exists());
     let content = fs::read_to_string(output_path).unwrap();

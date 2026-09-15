@@ -1,3 +1,4 @@
+use crate::conversion::options::ConversionOptions;
 use crate::oeb::book::OEBBook;
 use anyhow::{Context, Result};
 use calibre_utils::html2text::html2text;
@@ -12,7 +13,7 @@ impl TXTOutput {
         TXTOutput
     }
 
-    pub fn convert(&self, book: &mut OEBBook, output_path: &Path) -> Result<()> {
+    pub fn convert(&self, book: &mut OEBBook, output_path: &Path, _opts: &ConversionOptions) -> Result<()> {
         let mut file = File::create(output_path).context("Failed to create output TXT file")?;
 
         // Iterate over spine

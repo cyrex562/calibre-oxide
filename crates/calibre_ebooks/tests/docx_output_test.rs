@@ -1,3 +1,4 @@
+use calibre_ebooks::conversion::options::ConversionOptions;
 use calibre_ebooks::oeb::book::OEBBook;
 use calibre_ebooks::oeb::container::DirContainer;
 use calibre_ebooks::output::docx_output::DOCXOutput;
@@ -17,7 +18,7 @@ fn test_docx_output_basics() {
     book.metadata.add("title", "My DOCX Book");
 
     let output_plugin = DOCXOutput::new();
-    output_plugin.convert(&book, &output_path).unwrap();
+    output_plugin.convert(&book, &output_path, &ConversionOptions::default()).unwrap();
 
     assert!(output_path.exists());
 

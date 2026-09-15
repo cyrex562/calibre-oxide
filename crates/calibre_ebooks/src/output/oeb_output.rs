@@ -1,3 +1,4 @@
+use crate::conversion::options::ConversionOptions;
 use crate::oeb::book::OEBBook;
 use crate::oeb::writer::OEBWriter;
 use anyhow::{Context, Result};
@@ -11,7 +12,7 @@ impl OEBOutput {
         OEBOutput
     }
 
-    pub fn convert(&self, book: &mut OEBBook, output_path: &Path) -> Result<()> {
+    pub fn convert(&self, book: &mut OEBBook, output_path: &Path, _opts: &ConversionOptions) -> Result<()> {
         // If output_path is intended as a directory, ensure it exists.
         // If it exists and is a file, error? Or overwrite/delete?
         // Plumber usually handles output path existence logic or passes a target.

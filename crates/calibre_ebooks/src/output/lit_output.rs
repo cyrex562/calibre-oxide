@@ -4,6 +4,7 @@
 //! stamp on the Microsoft cover guide references, then hand the book to
 //! [`LitWriter`].
 
+use crate::conversion::options::ConversionOptions;
 use crate::lit::writer::{litize_oeb, LitWriter, ProviderStyles};
 use crate::oeb::book::OEBBook;
 use crate::oeb::stylizer::{StyleProvider, TagStylizer};
@@ -43,7 +44,7 @@ impl LitOutput {
     ///
     /// Returns any non-fatal problems noticed on the way, which the
     /// Python logs.
-    pub fn convert(&self, book: &mut OEBBook, output_path: &Path) -> Result<Vec<String>> {
+    pub fn convert(&self, book: &mut OEBBook, output_path: &Path, _opts: &ConversionOptions) -> Result<Vec<String>> {
         let mut warnings = litize_oeb(book);
 
         let file = File::create(output_path).context("Failed to create output LIT file")?;

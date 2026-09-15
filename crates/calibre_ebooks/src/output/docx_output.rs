@@ -1,3 +1,4 @@
+use crate::conversion::options::ConversionOptions;
 use crate::oeb::book::OEBBook;
 use anyhow::{Context, Result};
 use std::fs::File;
@@ -13,7 +14,7 @@ impl DOCXOutput {
         DOCXOutput
     }
 
-    pub fn convert(&self, book: &OEBBook, output_path: &Path) -> Result<()> {
+    pub fn convert(&self, book: &OEBBook, output_path: &Path, _opts: &ConversionOptions) -> Result<()> {
         let file = File::create(output_path).context("Failed to create DOCX file")?;
         let mut zip = ZipWriter::new(file);
         let options = FileOptions::default().compression_method(zip::CompressionMethod::Stored);

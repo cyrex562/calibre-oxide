@@ -1,3 +1,4 @@
+use calibre_ebooks::conversion::options::ConversionOptions;
 use calibre_ebooks::input::html_input::HTMLInput;
 use calibre_ebooks::output::txt_output::TXTOutput;
 use std::fs;
@@ -24,7 +25,7 @@ fn test_txt_output_generation() {
     // Export
     let output = TXTOutput::new();
     output
-        .convert(&mut book, &output_file)
+        .convert(&mut book, &output_file, &ConversionOptions::default())
         .expect("Export failed");
 
     // Verify

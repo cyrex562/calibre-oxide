@@ -6,6 +6,7 @@
 //! the LZX codec — lives in `mssha1_cross_test.rs` and, in
 //! `calibre_utils`, `msdes_cross_test.rs` and `lzx_cross_test.rs`.
 
+use calibre_ebooks::conversion::options::ConversionOptions;
 use calibre_ebooks::input::html_input::HTMLInput;
 use calibre_ebooks::input::lit_input::LitInput;
 use calibre_ebooks::lit::reader::{LitContainer, LitFile};
@@ -26,7 +27,7 @@ fn build_lit(tmp: &std::path::Path, pages: &[(&str, &str)]) -> Vec<u8> {
         .expect("ingest HTML");
     let out = tmp.join("book.lit");
     LitOutput::new()
-        .convert(&mut book, &out)
+        .convert(&mut book, &out, &ConversionOptions::default())
         .expect("write LIT");
     fs::read(&out).expect("read LIT")
 }
@@ -115,7 +116,7 @@ fn conversion_extracts_every_manifest_item() {
 
     let lit_path = tmp.path().join("book.lit");
     LitOutput::new()
-        .convert(&mut book, &lit_path)
+        .convert(&mut book, &lit_path, &ConversionOptions::default())
         .expect("write LIT");
 
     let extracted = tmp.path().join("extracted");

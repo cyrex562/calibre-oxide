@@ -1,3 +1,4 @@
+use crate::conversion::options::ConversionOptions;
 use crate::oeb::book::OEBBook;
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -9,7 +10,7 @@ impl LRFOutput {
         LRFOutput
     }
 
-    pub fn convert(&self, _book: &OEBBook, output_path: &Path) -> Result<()> {
+    pub fn convert(&self, _book: &OEBBook, output_path: &Path, _opts: &ConversionOptions) -> Result<()> {
         // Outputting LRF is not supported (proprietary format, mostly obsolete).
         // We will just create a dummy file to satisfy the plugin architecture/testing.
         // In a real scenario this might error or warn.

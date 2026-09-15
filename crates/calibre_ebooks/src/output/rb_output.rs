@@ -1,6 +1,7 @@
 //! Port of `calibre.ebooks.rb.writer.RBWriter`'s call site (the RB
 //! output plugin's `convert`).
 
+use crate::conversion::options::ConversionOptions;
 use crate::metadata::MetaInformation;
 use crate::oeb::book::OEBBook;
 use crate::rb::rbml::RbOptions;
@@ -17,7 +18,7 @@ impl RBOutput {
         RBOutput
     }
 
-    pub fn convert(&self, book: &OEBBook, output_path: &Path) -> Result<()> {
+    pub fn convert(&self, book: &OEBBook, output_path: &Path, _opts: &ConversionOptions) -> Result<()> {
         let title = book
             .metadata
             .first("title")
@@ -76,7 +77,7 @@ mod tests {
         book.metadata.add("creator", "Round Trip Author");
 
         let out_path = src_tmp.path().join("book.rb");
-        RBOutput::new().convert(&book, &out_path).unwrap();
+        RBOutput::new().convert(&book, &out_path, &ConversionOptions::default()).unwrap();
 
         let extract_dir = tempfile::tempdir().unwrap();
         let read_back = RBInput::new()

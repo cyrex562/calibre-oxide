@@ -1,3 +1,4 @@
+use crate::conversion::options::ConversionOptions;
 use crate::oeb::book::OEBBook;
 use anyhow::{Context, Result};
 use calibre_utils::html2text::html2text;
@@ -14,7 +15,7 @@ impl ODTOutput {
         ODTOutput
     }
 
-    pub fn convert(&self, book: &OEBBook, output_path: &Path) -> Result<()> {
+    pub fn convert(&self, book: &OEBBook, output_path: &Path, _opts: &ConversionOptions) -> Result<()> {
         let file = fs::File::create(output_path)?;
         let mut zip = ZipWriter::new(file);
 
