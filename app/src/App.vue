@@ -1,60 +1,88 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import LibraryView from "./components/LibraryView.vue";
 
-const libraryPath = ref("");
-const backendGreeting = ref("");
+// The real library UI is the browser app served from web/dist, spawned
+// and navigated to by the Rust side (app/src-tauri/src/lib.rs) once a
+// library is chosen or a previously-persisted one reopens. This view
+// only ever shows during that brief window, or if no library has been
+// chosen yet.
 
-async function pingBackend() {
-  backendGreeting.value = await invoke<string>("ping");
+const status = ref<"checking" | "no-library" | "opening" | "error">(
+  "checking",
+);
+const errorMessage = ref("");
+
+async function checkPersistedLibrary() {
+  const path = await invoke<string | null>("get_persisted_library");
+  status.value = path ? "opening" : "no-library";
 }
+
+async function pickLibrary() {
+  status.value = "opening";
+  errorMessage.value = "";
+  try {
+    const opened = await invoke<boolean>("choose_library");
+    if (!opened) {
+      status.value = "no-library";
+    }
+    // On success the Rust side navigates the window itself; nothing
+    // left to do here.
+  } catch (e) {
+    status.value = "error";
+    errorMessage.value = String(e);
+  }
+}
+
+onMounted(checkPersistedLibrary);
 </script>
 
 <template>
-  <main class="app-shell">
-    <header>
-      <h1>calibre-oxide</h1>
-      <p class="tagline">A fault-tolerant organizer for your media.</p>
-    </header>
+  <main class="splash">
+    <h1>calibre-oxide</h1>
 
-    <section class="library-picker">
-      <input
-        v-model="libraryPath"
-        placeholder="Path to a Calibre library (metadata.db)"
-      />
-      <button @click="pingBackend">Ping backend</button>
-      <p v-if="backendGreeting" class="ok">{{ backendGreeting }}</p>
-    </section>
+    <p v-if="status === 'checking'" class="hint">Checking for a library…</p>
 
-    <LibraryView :library-path="libraryPath" />
+    <p v-else-if="status === 'opening'" class="hint">
+      Starting your library…
+    </p>
+
+    <div v-else-if="status === 'no-library'" class="picker">
+      <p class="hint">Choose a Calibre library folder to get started.</p>
+      <button @click="pickLibrary">Choose Library…</button>
+    </div>
+
+    <div v-else class="picker">
+      <p class="error">Could not open that library: {{ errorMessage }}</p>
+      <button @click="pickLibrary">Try Again…</button>
+    </div>
   </main>
 </template>
 
 <style scoped>
-.app-shell {
-  padding: 1rem 2rem;
+.splash {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
   font-family: system-ui, -apple-system, sans-serif;
 }
-header h1 {
-  margin-bottom: 0.25rem;
-}
-.tagline {
+.hint {
   color: #888;
-  margin-top: 0;
 }
-.library-picker {
-  margin: 1rem 0;
+.error {
+  color: #b3261e;
+}
+.picker {
   display: flex;
-  gap: 0.5rem;
+  flex-direction: column;
   align-items: center;
+  gap: 0.75rem;
 }
-.library-picker input {
-  flex: 1;
-  padding: 0.5rem;
-}
-.ok {
-  color: #2a7f2a;
-  margin: 0;
+button {
+  padding: 0.5rem 1.25rem;
+  font-size: 1rem;
 }
 </style>
