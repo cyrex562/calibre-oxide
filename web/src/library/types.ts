@@ -82,3 +82,30 @@ export interface FieldMetadataResponse {
 
 // { name: query } -- calibre_db::cache::Cache::virtual_library_map.
 export type VirtualLibraries = Record<string, string>;
+
+// Response shape of `POST /cdb/add-book/...` -- see crates/calibre_srv/src/cdb.rs::add_book.
+// `book_id` is present on a real add; `duplicates` is present instead
+// when a same-title/author match already exists and `add_duplicates`
+// wasn't set.
+export interface AddBookResult {
+  title: string;
+  authors: string[];
+  languages: string[];
+  filename: string;
+  id: string;
+  book_id?: number;
+  duplicates?: { title: string; authors: string[] }[];
+}
+
+// Fields `POST /cdb/set-fields/{book_id}`'s `changes` object accepts
+// for this MVP's edit form -- see cdb.rs::value_to_field_string for
+// the full set the server understands (this is a subset).
+export interface BookFieldChanges {
+  title?: string;
+  authors?: string[];
+  series?: string;
+  series_index?: number;
+  tags?: string[];
+  rating?: number; // 0..5 display scale, halved server-side to 0..10 storage
+  comments?: string;
+}

@@ -2,7 +2,7 @@
 import { computed, ref, watch } from "vue";
 import CategoryBrowser from "./CategoryBrowser.vue";
 import BookDetailsPanel from "./BookDetailsPanel.vue";
-import { fetchBooks, fetchFieldMetadata, fetchVirtualLibraries, search } from "../library/api";
+import { addBook, fetchBooks, fetchFieldMetadata, fetchVirtualLibraries, search } from "../library/api";
 import type { BookSummary } from "../library/types";
 
 const PAGE_SIZE = 24;
@@ -22,6 +22,11 @@ const totalNum = ref(0);
 const loading = ref(false);
 const error = ref<string | null>(null);
 const selectedBookId = ref<number | null>(null);
+const cacheBust = ref(0);
+
+const addInput = ref<HTMLInputElement | null>(null);
+const adding = ref(false);
+const addError = ref<string | null>(null);
 
 const pageCount = computed(() => Math.max(1, Math.ceil(totalNum.value / PAGE_SIZE)));
 const currentPage = computed(() => Math.floor(offset.value / PAGE_SIZE) + 1);
@@ -80,6 +85,39 @@ function nextPage() {
 function prevPage() {
   if (offset.value > 0) offset.value = Math.max(0, offset.value - PAGE_SIZE);
 }
+
+function onDetailsUpdated() {
+  cacheBust.value++;
+  void runSearch();
+}
+
+async function addBookFile(file: File, addDuplicates: boolean): Promise<void> {
+  const result = await addBook(file, addDuplicates);
+  if (result.duplicates && result.duplicates.length > 0 && result.book_id === undefined) {
+    const names = result.duplicates.map((d) => `${d.title} (${d.authors.join(" & ")})`).join(", ");
+    if (confirm(`A book with the same title/author already exists: ${names}. Add anyway?`)) {
+      await addBookFile(file, true);
+    }
+    return;
+  }
+  cacheBust.value++;
+  await runSearch();
+}
+
+async function onAddFileSelected(e: Event) {
+  const file = (e.target as HTMLInputElement).files?.[0];
+  if (!file) return;
+  adding.value = true;
+  addError.value = null;
+  try {
+    await addBookFile(file, false);
+  } catch (err) {
+    addError.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    adding.value = false;
+    if (addInput.value) addInput.value.value = "";
+  }
+}
 </script>
 
 <template>
@@ -101,7 +139,12 @@ function prevPage() {
         <option value="">All books</option>
         <option v-for="name in Object.keys(virtualLibraries)" :key="name" :value="name">{{ name }}</option>
       </select>
+
+      <button type="button" :disabled="adding" @click="addInput?.click()">{{ adding ? "Adding…" : "Add Book…" }}</button>
+      <input ref="addInput" type="file" class="hidden-file-input" @change="onAddFileSelected" />
     </header>
+
+    <p v-if="addError" class="error add-error">{{ addError }}</p>
 
     <div class="body">
       <CategoryBrowser class="sidebar" @select="onCategorySelect" />
@@ -113,7 +156,7 @@ function prevPage() {
 
         <div class="grid">
           <button v-for="book in books" :key="book.id" class="card" @click="selectedBookId = book.id">
-            <img :src="book.thumbnail" :alt="book.title" loading="lazy" />
+            <img :src="`${book.thumbnail}?v=${cacheBust}`" :alt="book.title" loading="lazy" />
             <div class="card-title">{{ book.title }}</div>
             <div class="card-authors">{{ (book.authors ?? []).join(" & ") }}</div>
           </button>
@@ -127,7 +170,7 @@ function prevPage() {
       </main>
     </div>
 
-    <BookDetailsPanel v-if="selectedBookId !== null" :book-id="selectedBookId" @close="selectedBookId = null" />
+    <BookDetailsPanel v-if="selectedBookId !== null" :book-id="selectedBookId" @close="selectedBookId = null" @updated="onDetailsUpdated" />
   </div>
 </template>
 
@@ -218,5 +261,11 @@ function prevPage() {
 }
 .error {
   color: #b00020;
+}
+.add-error {
+  padding: 0 0.5em;
+}
+.hidden-file-input {
+  display: none;
 }
 </style>
