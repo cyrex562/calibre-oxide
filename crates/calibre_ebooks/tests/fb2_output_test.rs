@@ -1,3 +1,4 @@
+use calibre_ebooks::conversion::options::ConversionOptions;
 use calibre_ebooks::oeb::book::OEBBook;
 use calibre_ebooks::oeb::container::DirContainer;
 use calibre_ebooks::output::fb2_output::FB2Output;
@@ -43,7 +44,7 @@ fn test_fb2_output_conversion() {
     // Convert
     let output = FB2Output::new();
     output
-        .convert(&book, &output_path)
+        .convert(&book, &output_path, &ConversionOptions::default())
         .expect("Conversion failed");
 
     // Verify -- real Fb2Mlizer structure (FictionBook wrapper,

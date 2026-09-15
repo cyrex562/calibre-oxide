@@ -24,6 +24,7 @@
 //! the output-plugin level anywhere in this crate yet, a pre-existing
 //! gap shared by every other output plugin, not new to this fix.
 
+use crate::conversion::options::ConversionOptions;
 use crate::fb2::fb2ml::{DefaultImageConverter, Fb2Mlizer, Fb2Options};
 use crate::oeb::book::OEBBook;
 use crate::oeb::stylizer::TagStylizer;
@@ -39,7 +40,7 @@ impl FB2Output {
         FB2Output
     }
 
-    pub fn convert(&self, book: &OEBBook, output_path: &Path) -> Result<()> {
+    pub fn convert(&self, book: &OEBBook, output_path: &Path, _opts: &ConversionOptions) -> Result<()> {
         let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let uuid_fallback = uuid::Uuid::new_v4().to_string();
 
@@ -85,7 +86,7 @@ mod tests {
         let tmp_out = tempfile::tempdir().unwrap();
         let output_path = tmp_out.path().join("book.fb2");
 
-        FB2Output::new().convert(&book, &output_path).expect("conversion failed");
+        FB2Output::new().convert(&book, &output_path, &ConversionOptions::default()).expect("conversion failed");
 
         let content = std::fs::read_to_string(&output_path).unwrap();
         assert!(content.contains("<book-title>FB2 Test</book-title>"), "{content}");
@@ -121,7 +122,7 @@ mod tests {
 
         let tmp_out = tempfile::tempdir().unwrap();
         let output_path = tmp_out.path().join("book.fb2");
-        FB2Output::new().convert(&book, &output_path).expect("conversion failed");
+        FB2Output::new().convert(&book, &output_path, &ConversionOptions::default()).expect("conversion failed");
 
         let content = std::fs::read_to_string(&output_path).unwrap();
         assert!(content.contains("<image l:href=\"#img_0\"/>"), "{content}");

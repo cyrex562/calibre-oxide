@@ -1,4 +1,5 @@
-use crate::mobi::writer2::main::{MobiWriter, MobiWriterOpts};
+use crate::conversion::options::ConversionOptions;
+use crate::mobi::writer2::main::MobiWriter;
 use crate::oeb::book::OEBBook;
 use anyhow::{Context, Result};
 use std::fs::File;
@@ -18,8 +19,8 @@ impl MOBIOutput {
         MOBIOutput
     }
 
-    pub fn convert(&self, book: &OEBBook, output_path: &Path) -> Result<()> {
-        let mut writer = MobiWriter::new(MobiWriterOpts::default());
+    pub fn convert(&self, book: &OEBBook, output_path: &Path, opts: &ConversionOptions) -> Result<()> {
+        let mut writer = MobiWriter::new(opts.mobi);
         let bytes = writer
             .write(book)
             .context("Failed to encode MOBI content")?;

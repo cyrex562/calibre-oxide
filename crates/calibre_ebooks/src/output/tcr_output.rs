@@ -1,3 +1,4 @@
+use crate::conversion::options::ConversionOptions;
 use crate::oeb::book::OEBBook;
 use anyhow::{Context, Result};
 use calibre_utils::html2text::html2text;
@@ -11,7 +12,7 @@ impl TCROutput {
         TCROutput
     }
 
-    pub fn convert(&self, book: &OEBBook, output_path: &Path) -> Result<()> {
+    pub fn convert(&self, book: &OEBBook, output_path: &Path, _opts: &ConversionOptions) -> Result<()> {
         let mut combined_text = String::new();
         for itemref in &book.spine.items {
             if let Some(item) = book.manifest.items.get(&itemref.idref) {

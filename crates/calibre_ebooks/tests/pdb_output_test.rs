@@ -1,3 +1,4 @@
+use calibre_ebooks::conversion::options::ConversionOptions;
 use calibre_ebooks::oeb::book::OEBBook;
 use calibre_ebooks::oeb::container::DirContainer;
 use calibre_ebooks::oeb::manifest::ManifestItem;
@@ -39,7 +40,7 @@ fn test_pdb_output_conversion() {
 
     let output = PDBOutput::new();
     output
-        .convert(&book, &output_path)
+        .convert(&book, &output_path, &ConversionOptions::default())
         .expect("PDB output conversion failed");
 
     assert!(output_path.exists());

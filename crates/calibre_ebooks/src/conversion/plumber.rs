@@ -301,7 +301,7 @@ impl Plumber {
                 }
             }
             let output_plugin = EPUBOutput::new();
-            output_plugin.convert(&mut book, &self.output_path)?;
+            output_plugin.convert(&mut book, &self.output_path, &self.opts)?;
         } else if output_ext == "docx" {
             use crate::output::docx_output::DOCXOutput;
             if let Some(parent) = self.output_path.parent() {
@@ -310,7 +310,7 @@ impl Plumber {
                 }
             }
             let output_plugin = DOCXOutput::new();
-            output_plugin.convert(&book, &self.output_path)?;
+            output_plugin.convert(&book, &self.output_path, &self.opts)?;
         } else if ["mobi", "azw", "prc"].contains(&output_ext.as_str()) {
             use crate::output::mobi_output::MOBIOutput;
             // Ensure dir exists
@@ -320,7 +320,7 @@ impl Plumber {
                 }
             }
             let output_plugin = MOBIOutput::new();
-            output_plugin.convert(&book, &self.output_path)?;
+            output_plugin.convert(&book, &self.output_path, &self.opts)?;
         } else if output_ext == "rb" {
             use crate::output::rb_output::RBOutput;
             // Ensure dir exists
@@ -330,7 +330,7 @@ impl Plumber {
                 }
             }
             let output_plugin = RBOutput::new();
-            output_plugin.convert(&book, &self.output_path)?;
+            output_plugin.convert(&book, &self.output_path, &self.opts)?;
         } else if output_ext == "lit" {
             use crate::output::lit_output::LitOutput;
             // Ensure dir exists
@@ -340,7 +340,7 @@ impl Plumber {
                 }
             }
             let output_plugin = LitOutput::new();
-            for warning in output_plugin.convert(&mut book, &self.output_path)? {
+            for warning in output_plugin.convert(&mut book, &self.output_path, &self.opts)? {
                 eprintln!("Warning: {warning}");
             }
         } else if ["txt", "md", "markdown", "text"].contains(&output_ext.as_str()) {
@@ -352,7 +352,7 @@ impl Plumber {
                 }
             }
             let output_plugin = TXTOutput::new();
-            output_plugin.convert(&mut book, &self.output_path)?;
+            output_plugin.convert(&mut book, &self.output_path, &self.opts)?;
         } else if output_ext == "snb" {
             use crate::output::snb_output::SnbOutput;
             // Ensure dir exists
@@ -362,7 +362,7 @@ impl Plumber {
                 }
             }
             let output_plugin = SnbOutput::new();
-            output_plugin.convert(&book, &self.output_path)?;
+            output_plugin.convert(&book, &self.output_path, &self.opts)?;
         } else if output_ext == "rtf" {
             use crate::output::rtf_output::RTFOutput;
             if let Some(parent) = self.output_path.parent() {
@@ -371,7 +371,7 @@ impl Plumber {
                 }
             }
             let output_plugin = RTFOutput::new();
-            output_plugin.convert(&book, &self.output_path)?;
+            output_plugin.convert(&book, &self.output_path, &self.opts)?;
         } else if output_ext == "fb2" {
             use crate::output::fb2_output::FB2Output;
             if let Some(parent) = self.output_path.parent() {
@@ -380,7 +380,7 @@ impl Plumber {
                 }
             }
             let output_plugin = FB2Output::new();
-            output_plugin.convert(&book, &self.output_path)?;
+            output_plugin.convert(&book, &self.output_path, &self.opts)?;
         } else if output_ext == "pdf" {
             use crate::output::pdf_output::PDFOutput;
             if let Some(parent) = self.output_path.parent() {
@@ -389,7 +389,7 @@ impl Plumber {
                 }
             }
             let output_plugin = PDFOutput::new();
-            output_plugin.convert(&book, &self.output_path)?;
+            output_plugin.convert(&book, &self.output_path, &self.opts)?;
         } else if output_ext == "lrf" {
             use crate::output::lrf_output::LRFOutput;
             if let Some(parent) = self.output_path.parent() {
@@ -398,11 +398,11 @@ impl Plumber {
                 }
             }
             let output_plugin = LRFOutput::new();
-            output_plugin.convert(&book, &self.output_path)?;
+            output_plugin.convert(&book, &self.output_path, &self.opts)?;
         } else if output_ext == "oeb" {
             use crate::output::oeb_output::OEBOutput;
             let output_plugin = OEBOutput::new();
-            output_plugin.convert(&mut book, &self.output_path)?;
+            output_plugin.convert(&mut book, &self.output_path, &self.opts)?;
         } else if output_ext == "pdb" {
             use crate::output::pdb_output::PDBOutput;
             // Ensure parent exists
@@ -412,7 +412,7 @@ impl Plumber {
                 }
             }
             let output_plugin = PDBOutput::new();
-            output_plugin.convert(&book, &self.output_path)?;
+            output_plugin.convert(&book, &self.output_path, &self.opts)?;
         } else if output_ext == "odt" {
             use crate::output::odt_output::ODTOutput;
             if let Some(parent) = self.output_path.parent() {
@@ -421,7 +421,7 @@ impl Plumber {
                 }
             }
             let output_plugin = ODTOutput::new();
-            output_plugin.convert(&book, &self.output_path)?;
+            output_plugin.convert(&book, &self.output_path, &self.opts)?;
         } else if output_ext == "tcr" {
             use crate::output::tcr_output::TCROutput;
             // Ensure parent exists
@@ -431,7 +431,7 @@ impl Plumber {
                 }
             }
             let output_plugin = TCROutput::new();
-            output_plugin.convert(&book, &self.output_path)?;
+            output_plugin.convert(&book, &self.output_path, &self.opts)?;
         } else {
             // Default to OEB Directory Output
             if !self.output_path.exists() {
@@ -546,5 +546,38 @@ mod run_transforms_tests {
         std::io::Read::read_to_end(&mut zip.by_name(&html_entry).unwrap(), &mut html_bytes).unwrap();
         let html = String::from_utf8_lossy(&html_bytes);
         assert!(html.contains("class=\"calibre"), "CSSFlattener should have added real classes: {html}");
+    }
+}
+
+#[cfg(test)]
+mod write_output_threads_opts_tests {
+    use super::*;
+
+    /// Issue #690's own definition of done: `Plumber::write_output`
+    /// really threads `&self.opts` through to the output plugin it
+    /// dispatches to, exercised here through the public `Plumber` API
+    /// end-to-end (not by calling `MOBIOutput::convert` directly, the
+    /// way `mobi_output_test.rs`'s own option test does) -- a real
+    /// `.mobi` conversion with `opts.mobi.dont_compress = true` set on
+    /// the `Plumber` itself produces real uncompressed output.
+    #[test]
+    fn plumber_threads_a_real_mobi_option_from_conversion_options_through_to_the_output_file() {
+        let src = tempdir().unwrap();
+        let html_path = src.path().join("book.html");
+        let paragraph = "The quick brown fox jumps over the lazy dog. ".repeat(200);
+        fs::write(&html_path, format!("<html><body><p>{paragraph}</p></body></html>")).unwrap();
+
+        let out_dir = tempdir().unwrap();
+        let mobi_path = out_dir.path().join("book.mobi");
+
+        let mut opts = ConversionOptions::default();
+        opts.mobi.dont_compress = true;
+        Plumber::with_options(&html_path, &mobi_path, opts).run().unwrap();
+
+        let bytes = fs::read(&mobi_path).unwrap();
+        let record0_offset = u32::from_be_bytes(bytes[78..82].try_into().unwrap()) as usize;
+        let compression = u16::from_be_bytes(bytes[record0_offset..record0_offset + 2].try_into().unwrap());
+        const UNCOMPRESSED: u16 = 1;
+        assert_eq!(compression, UNCOMPRESSED, "Plumber's own opts.mobi.dont_compress should have really reached MOBIOutput::convert, not a default MobiWriterOpts");
     }
 }

@@ -1,3 +1,4 @@
+use calibre_ebooks::conversion::options::ConversionOptions;
 use calibre_ebooks::oeb::book::OEBBook;
 use calibre_ebooks::oeb::container::DirContainer;
 use calibre_ebooks::output::oeb_output::OEBOutput;
@@ -27,7 +28,7 @@ fn test_oeb_output_conversion() {
     // Convert
     let output = OEBOutput::new();
     output
-        .convert(&mut book, &output_path)
+        .convert(&mut book, &output_path, &ConversionOptions::default())
         .expect("Conversion failed");
 
     // Verify

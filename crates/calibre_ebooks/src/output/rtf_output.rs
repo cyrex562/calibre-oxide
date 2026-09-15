@@ -11,6 +11,7 @@
 //! embedded for real via [`DefaultImageConverter`] rather than being
 //! dropped on the floor.
 
+use crate::conversion::options::ConversionOptions;
 use crate::oeb::book::OEBBook;
 use crate::oeb::stylizer::TagStylizer;
 use crate::rtf::rtfml::{DefaultImageConverter, RtfMlizer};
@@ -26,7 +27,7 @@ impl RTFOutput {
         RTFOutput
     }
 
-    pub fn convert(&self, book: &OEBBook, output_path: &Path) -> Result<()> {
+    pub fn convert(&self, book: &OEBBook, output_path: &Path, _opts: &ConversionOptions) -> Result<()> {
         let mut mlizer = RtfMlizer::new();
         let rtf = mlizer.extract_content(book, &TagStylizer, &DefaultImageConverter);
 
@@ -78,7 +79,7 @@ mod tests {
 
         let output = RTFOutput::new();
         output
-            .convert(&book, &output_path)
+            .convert(&book, &output_path, &ConversionOptions::default())
             .expect("RTF output conversion failed");
 
         assert!(output_path.exists());
@@ -119,7 +120,7 @@ mod tests {
         book.metadata.add("title", "Round Trip Book");
 
         let out_path = src_tmp.path().join("book.rtf");
-        RTFOutput::new().convert(&book, &out_path).unwrap();
+        RTFOutput::new().convert(&book, &out_path, &ConversionOptions::default()).unwrap();
 
         let extract_dir = tempfile::tempdir().unwrap();
         let read_back = RTFInput::new()

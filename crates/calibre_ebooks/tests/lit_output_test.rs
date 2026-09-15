@@ -6,6 +6,7 @@
 //! directory chunks, LZX compression, DES sealing and the binary
 //! tokenisation in both directions.
 
+use calibre_ebooks::conversion::options::ConversionOptions;
 use calibre_ebooks::input::html_input::HTMLInput;
 use calibre_ebooks::input::lit_input::LitInput;
 use calibre_ebooks::lit::reader::LitFile;
@@ -27,7 +28,7 @@ fn write_sample_lit(dir: &std::path::Path) -> std::path::PathBuf {
 
     let output_file = dir.join("book.lit");
     LitOutput::new()
-        .convert(&mut book, &output_file)
+        .convert(&mut book, &output_file, &ConversionOptions::default())
         .expect("write LIT");
     output_file
 }
@@ -95,7 +96,7 @@ fn images_survive_the_round_trip_byte_for_byte() {
 
     let output_file = tmp.path().join("book.lit");
     LitOutput::new()
-        .convert(&mut book, &output_file)
+        .convert(&mut book, &output_file, &ConversionOptions::default())
         .expect("write LIT");
 
     let extracted = tmp.path().join("extracted");
@@ -124,7 +125,7 @@ fn a_book_without_a_cover_is_reported_but_still_written() {
 
     let output_file = tmp.path().join("book.lit");
     let warnings = LitOutput::new()
-        .convert(&mut book, &output_file)
+        .convert(&mut book, &output_file, &ConversionOptions::default())
         .expect("write LIT");
     assert!(warnings.iter().any(|w| w.contains("cover")), "{warnings:?}");
     assert!(output_file.exists());

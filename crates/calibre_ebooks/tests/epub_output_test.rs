@@ -1,3 +1,4 @@
+use calibre_ebooks::conversion::options::ConversionOptions;
 use calibre_ebooks::oeb::book::OEBBook;
 use calibre_ebooks::oeb::container::DirContainer;
 use calibre_ebooks::oeb::metadata::{Item, Metadata};
@@ -55,7 +56,7 @@ fn test_epub_output_generation() {
     // Run EPUBOutput
     let output = EPUBOutput::new();
     output
-        .convert(&mut book, &output_epub)
+        .convert(&mut book, &output_epub, &ConversionOptions::default())
         .expect("Failed to create EPUB");
 
     assert!(output_epub.exists());

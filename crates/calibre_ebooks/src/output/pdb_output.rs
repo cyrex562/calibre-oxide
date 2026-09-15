@@ -1,3 +1,4 @@
+use crate::conversion::options::ConversionOptions;
 use crate::oeb::book::OEBBook;
 use crate::pdb::writer::PdbWriter;
 use anyhow::{Context, Result};
@@ -12,7 +13,7 @@ impl PDBOutput {
         PDBOutput
     }
 
-    pub fn convert(&self, book: &OEBBook, output_path: &Path) -> Result<()> {
+    pub fn convert(&self, book: &OEBBook, output_path: &Path, _opts: &ConversionOptions) -> Result<()> {
         let writer = PdbWriter::new();
 
         // Accumulate all content

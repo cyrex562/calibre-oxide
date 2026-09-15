@@ -1,3 +1,4 @@
+use calibre_ebooks::conversion::options::ConversionOptions;
 use calibre_ebooks::input::html_input::HTMLInput;
 use calibre_ebooks::output::rb_output::RBOutput;
 use calibre_ebooks::rb::header::RbHeader;
@@ -24,7 +25,7 @@ fn test_rb_output_generation() {
 
     // Export
     let output = RBOutput::new();
-    output.convert(&book, &output_file).expect("Export failed");
+    output.convert(&book, &output_file, &ConversionOptions::default()).expect("Export failed");
 
     // Verify
     assert!(output_file.exists());

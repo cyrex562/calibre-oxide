@@ -1,3 +1,4 @@
+use calibre_ebooks::conversion::options::ConversionOptions;
 use calibre_ebooks::oeb::book::OEBBook;
 use calibre_ebooks::oeb::container::DirContainer;
 use calibre_ebooks::oeb::manifest::ManifestItem;
@@ -29,7 +30,7 @@ fn test_tcr_output_conversion() {
 
     // Run conversion
     let output = TCROutput::new();
-    output.convert(&book, &output_path).unwrap();
+    output.convert(&book, &output_path, &ConversionOptions::default()).unwrap();
 
     // Verify Output
     assert!(output_path.exists());
