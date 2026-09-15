@@ -22,14 +22,11 @@
 //!   categories C (control/format/private-use/surrogate), Z
 //!   (separator), and M (mark/combining) after NFC normalization; this
 //!   port only filters `char::is_control()`/`char::is_whitespace()`
-//!   (stdlib-only, no combining-mark filtering) since this function is
-//!   only reachable from `supports_text`'s default path and
-//!   `get_font_for_text` -- both part of the font-scanning/picking
-//!   workflow deferred to issue #556, not exercised by anything ported
-//!   in this issue.
-//! - **`get_font_for_text`/`test_find_font`** need
-//!   `calibre.utils.fonts.scanner.font_scanner` (a system-installed-
-//!   font resolver), deferred to issue #556. Not ported here.
+//!   (stdlib-only, no combining-mark filtering).
+//! - **`get_font_for_text` is real** (issue #556 closed the
+//!   `font_scanner` dependency it needed). `test_find_font` (the
+//!   `__main__`-only CLI smoke test) isn't ported -- no equivalent CLI
+//!   entry point exists in this crate to hang it off.
 //! - **`checksum_of_block`**'s real Python always pads with at least
 //!   one full zero word, even when `len(raw)` is already a multiple of
 //!   4 (`extra = 4 - len(raw) % 4` is `4`, not `0`, when the remainder
@@ -751,6 +748,23 @@ pub fn supports_text(raw: &[u8], text: &str, has_only_printable_chars: bool) -> 
         Ok(ids) => ids.iter().all(|&id| id != 0),
         Err(_) => false,
     }
+}
+
+/// Port of `get_font_for_text` (issue #556, real as of that issue --
+/// previously deferred, see this module's own doc history). If
+/// `candidate_font_data` already covers `text`, returns it unchanged;
+/// otherwise asks [`super::scanner::font_scanner`] for a system font
+/// that does, returning that font's raw bytes instead. `None` if
+/// neither the candidate nor any system font covers it.
+pub fn get_font_for_text(text: &str, candidate_font_data: Option<Vec<u8>>) -> Option<Vec<u8>> {
+    if let Some(data) = &candidate_font_data {
+        if supports_text(data, text, false) {
+            return candidate_font_data;
+        }
+    }
+    let (_family, faces) = super::scanner::font_scanner().find_font_for_text(text, &["serif", "sans-serif"], &["serif", "sans-serif", "monospace", "cursive", "fantasy"]);
+    let face = faces?.into_iter().next()?;
+    std::fs::read(&face.path).ok()
 }
 
 #[cfg(test)]

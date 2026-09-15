@@ -16,14 +16,12 @@
 //! branch in Python) -- copying an existing manifest item's bytes needs
 //! no external capability and is ported for real.
 //!
-//! # The one gap: pulling a new font in from the system
+//! # Pulling a new font in from the system
 //!
-//! When no matching font is already in the book, Python asks
-//! `calibre.utils.fonts.scanner.font_scanner` (OS font enumeration plus
-//! calibre's bundled font collection) for one and embeds it fresh. No
-//! equivalent exists in this crate -- the same, already-documented gap
-//! [`crate::oeb::polish::embed::do_embed`] left open (issue #162). See
-//! [`scan_system_font`] for the narrow `todo!()` site.
+//! When no matching font is already in the book, [`scan_system_font`]
+//! asks `calibre_utils::fonts::scanner::font_scanner` (real as of
+//! issue #556) for one to embed fresh -- the same dependency
+//! [`crate::oeb::polish::embed::do_embed`] needed (issue #162).
 
 use std::collections::HashSet;
 
@@ -408,10 +406,16 @@ impl EmbedFonts {
         } else if let Some(k) = style_key(&style) {
             match scan_system_font(&style) {
                 Ok(Some(_desc)) => {
-                    // Real embedding of a freshly-scanned system font is
-                    // gated behind `scan_system_font`'s gap -- unreachable
-                    // while it always returns `Ok(None)`; kept for shape
-                    // parity with Python's structure once that gap closes.
+                    // `scan_system_font` (issue #556) now really finds a
+                    // matching system font -- reachable as of this fix.
+                    // Actually copying its data into the book's manifest
+                    // and writing a real `@font-face` rule for it (the
+                    // Python `do_embed`'s closure body, distinct from
+                    // finding the font in the first place) is real,
+                    // separate, not-yet-ported work -- not attempted here
+                    // to keep this fix scoped to #556 itself. Bookkeeping
+                    // the key so a later pass has the same shape Python's
+                    // `embedded_fonts.append(added)` would.
                     self.newly_embedded_fonts.insert(k);
                 }
                 Ok(None) => {
@@ -492,22 +496,46 @@ impl EmbedFonts {
     }
 }
 
-/// The one real gap: pulling a font in from the operating system's font
-/// database. Needs `calibre.utils.fonts.scanner.font_scanner` (OS font
-/// enumeration plus calibre's bundled font collection), which this crate
-/// has no equivalent for -- the same gap already left open by
-/// [`crate::oeb::polish::embed::do_embed`] (issue #162). Kept as a
-/// function returning `Result<Option<FontDescriptor>>` rather than a
-/// hard `todo!()` panic so [`EmbedFonts::find_usage_in`] can be exercised
-/// end to end on documents that don't need a *new* system font (the
-/// overwhelmingly common case once a book has any embedded/reusable
-/// font at all): this always resolves to "no system font available"
-/// rather than panicking, since panicking here would make every
-/// conversion of a book with un-embeddable fonts crash instead of simply
-/// not embedding them (Python's own behavior on `NoFonts`).
+/// Port of `EmbedFonts.embed_font`'s scanner half: pulls a font in
+/// from the operating system's font database via
+/// `calibre_utils::fonts::scanner::font_scanner` (real as of issue
+/// #556 -- previously a documented gap here and in
+/// [`crate::oeb::polish::embed::do_embed`], issue #162). Returns
+/// `Ok(None)` (not an error) when the requested family isn't
+/// installed, matching Python's own `except NoFonts: ... return`
+/// behavior -- a book with an un-embeddable font style should still
+/// convert, just without embedding that one font.
 fn scan_system_font(style: &ElemStyle) -> Result<Option<FontDescriptor>> {
-    let _ = style;
-    Ok(None)
+    let Some(family) = style.font_family.as_ref().and_then(|f| f.first()) else {
+        return Ok(None);
+    };
+    if family == "inherit" {
+        return Ok(None);
+    }
+    let scanner = calibre_utils::fonts::scanner::font_scanner();
+    let Ok(faces) = scanner.fonts_for_family(family) else {
+        return Ok(None);
+    };
+    if faces.is_empty() {
+        return Ok(None);
+    }
+    let descriptors: Vec<FontDescriptor> = faces
+        .iter()
+        .map(|f| FontDescriptor {
+            font_family: f.font_family.clone(),
+            font_weight: f.font_weight.clone(),
+            font_style: f.font_style.clone(),
+            font_stretch: f.font_stretch.to_string(),
+            path: Some(f.path.to_string_lossy().into_owned()),
+            full_name: Some(f.full_name.clone()),
+            is_otf: f.is_otf,
+        })
+        .collect();
+    let refs: Vec<&FontDescriptor> = descriptors.iter().collect();
+    let weight = style.font_weight.as_deref().unwrap_or("400");
+    let font_style = style.font_style.as_deref().unwrap_or("normal");
+    let stretch = style.font_stretch.as_deref().unwrap_or("normal");
+    Ok(Some(crate::oeb::polish::embed::find_matching_font(&refs, weight, font_style, stretch).clone()))
 }
 
 #[cfg(test)]

@@ -67,13 +67,13 @@
 //!   state and these rules are a small minority of real-world jacket/
 //!   book CSS; [`crate::css::selector`]'s own scope note already covers
 //!   what pseudo-class syntax parses at all.
-//! - **`embed_font_family`** (`get_embed_font_info`): needs
-//!   `calibre.utils.fonts.scanner.font_scanner`, the same
-//!   already-documented OS-font-scanning gap `embed_fonts.rs`/
-//!   `subset.rs`/`oeb::polish::embed::do_embed` all share. The `None`
-//!   (no family requested) path -- overwhelmingly the common case -- is
-//!   real; [`get_embed_font_info`] only `todo!()`s when a family is
-//!   actually requested.
+//! - **`embed_font_family`**: [`get_embed_font_info`] itself is real
+//!   as of issue #556 (`calibre_utils::fonts::scanner`), including a
+//!   requested family (not just the `None`/no-family path). What's
+//!   still not wired: `FlattenContext` has no `embed_font_family`
+//!   option to actually request one, so [`CSSFlattener::call`] always
+//!   passes `None` -- a real, separate, narrower gap than the
+//!   font-scanning one #556 closed.
 //! - **A `specializer` hook** (an output-format-specific callback some
 //!   converters pass to further adjust a `Stylizer` before flattening):
 //!   not modeled; no caller in this batch's scope needs it.
@@ -89,6 +89,10 @@ use crate::oeb::polish::cascade::{
     html_css_stylesheet, normalize_style_declaration, resolve_declarations, resolve_property,
     specificity, PropertyValue, Specificity, StyleDeclaration, INHERITED,
 };
+use crate::oeb::polish::embed::FontFaceRule;
+use crate::oeb::polish::utils::OEB_FONTS;
+use calibre_utils::filenames::ascii_filename;
+use calibre_utils::fonts::utils::panose_to_css_generic_family;
 
 // ===================================================================
 // unit_convert / length parsing
@@ -544,19 +548,81 @@ pub struct FlattenerOptions {
     pub untable: bool,
 }
 
-/// Needs `calibre.utils.fonts.scanner.font_scanner` -- the same
-/// already-documented OS-font-scanning gap `embed_fonts.rs`/`subset.rs`
-/// share (see the module docs). The no-family-requested path (by far the
-/// common case) is real.
-fn get_embed_font_info(family: Option<&str>) -> Result<Option<String>> {
-    match family {
-        None => Ok(None),
-        Some(_) => todo!(
-            "placeholder: needs calibre.utils.fonts.scanner.font_scanner (OS font \
-             enumeration + calibre's bundled font collection), which this crate has \
-             no equivalent for -- see this module's docs"
-        ),
+/// Port of `get_embed_font_info`. Real as of issue #556
+/// (`calibre_utils::fonts::scanner`). Embeds every face of `family`
+/// into `oeb`'s manifest (deduping against an already-embedded font
+/// with identical bytes, matching upstream's own `x.data == font_data`
+/// check), returning the CSS `font-family` value the flattened body
+/// should use plus one [`FontFaceRule`] per face.
+///
+/// `failure_critical` matches upstream: when the family can't be
+/// found at all, this raises rather than returning `Ok((None, ..))`
+/// (the caller asked for a *specific* family and got nothing -- a
+/// real, reportable failure, not a silent no-op); `flatcss.py`'s own
+/// caller only sets `failure_critical=False` for a narrower fallback
+/// path this port hasn't needed yet.
+fn get_embed_font_info(oeb: &mut OEBBook, family: Option<&str>, failure_critical: bool, report: &mut dyn FnMut(&str)) -> Result<(Option<String>, Vec<FontFaceRule>)> {
+    let mut efi = Vec::new();
+    let Some(family) = family else {
+        return Ok((None, efi));
+    };
+
+    let scanner = calibre_utils::fonts::scanner::font_scanner();
+    let faces = match scanner.fonts_for_family(family) {
+        Ok(faces) if !faces.is_empty() => faces.to_vec(),
+        _ => {
+            let msg = format!("No embeddable fonts found for family: {family:?}");
+            if failure_critical {
+                anyhow::bail!(msg);
+            }
+            report(&msg);
+            return Ok((None, efi));
+        }
+    };
+
+    let mut body_font_family = None;
+    for (i, font) in faces.iter().enumerate() {
+        let ext = if font.is_otf { "otf" } else { "ttf" };
+        let font_data = scanner.get_font_data(font)?;
+
+        let mut existing_href: Option<String> = None;
+        for item in oeb.manifest.iter() {
+            if OEB_FONTS.iter().any(|f| f.eq_ignore_ascii_case(&item.media_type)) {
+                if oeb.container.read(&item.href).map(|d| d == font_data).unwrap_or(false) {
+                    existing_href = Some(item.href.clone());
+                    break;
+                }
+            }
+        }
+        let href = match existing_href {
+            Some(h) => h,
+            None => {
+                let fname = ascii_filename(&font.full_name).replace(' ', "-");
+                let (id, href) = oeb.manifest.generate("font", &format!("fonts/{fname}.{ext}"));
+                let mime = mime_guess::from_ext(ext).first_raw().unwrap_or("application/octet-stream");
+                oeb.manifest.add(&id, &href, mime);
+                oeb.container.write(&href, &font_data)?;
+                href
+            }
+        };
+
+        if i == 0 {
+            let generic_family = panose_to_css_generic_family(&font.panose);
+            body_font_family = Some(format!("'{}',{generic_family}", font.font_family));
+            report(&format!("Embedding font: {}", font.font_family));
+        }
+
+        efi.push(FontFaceRule {
+            font_family: font.font_family.clone(),
+            font_weight: font.font_weight.clone(),
+            font_style: font.font_style.clone(),
+            font_stretch: font.font_stretch.to_string(),
+            src: format!("url({href})"),
+            name: href,
+        });
     }
+
+    Ok((body_font_family, efi))
 }
 
 struct ItemStyle {
@@ -586,7 +652,10 @@ impl CSSFlattener {
     ) -> Result<()> {
         report("Flattening CSS and remapping font sizes...");
 
-        let _body_font_family = get_embed_font_info(None)?;
+        // `FlattenContext` has no `embed_font_family` option to pass
+        // through yet (see the module doc's disclosed narrowing) --
+        // always `None` here, the overwhelmingly common real case.
+        let (_body_font_family, _font_face_rules) = get_embed_font_info(oeb, None, true, report)?;
 
         let spine_hrefs: Vec<String> = oeb
             .spine
@@ -1089,6 +1158,58 @@ fn strip_trailing_digits(s: &str) -> &str {
 mod tests {
     use super::*;
     use crate::oeb::transforms::test_support::Builder;
+
+    #[test]
+    fn get_embed_font_info_errors_for_a_family_nobody_has() {
+        let mut oeb = Builder::new().build();
+        let mut messages = Vec::new();
+        let mut report = |m: &str| messages.push(m.to_string());
+        let err = get_embed_font_info(&mut oeb, Some("Some Font Nobody Has, Surely, Right"), true, &mut report).unwrap_err();
+        assert!(err.to_string().contains("No embeddable fonts"), "{err}");
+    }
+
+    #[test]
+    fn get_embed_font_info_returns_none_and_warns_when_not_failure_critical() {
+        let mut oeb = Builder::new().build();
+        let mut messages = Vec::new();
+        let mut report = |m: &str| messages.push(m.to_string());
+        let (body_font_family, efi) = get_embed_font_info(&mut oeb, Some("Some Font Nobody Has, Surely, Right"), false, &mut report).unwrap();
+        assert_eq!(body_font_family, None);
+        assert!(efi.is_empty());
+        assert!(!messages.is_empty());
+    }
+
+    #[test]
+    fn get_embed_font_info_embeds_a_real_installed_family_end_to_end() {
+        // Exercises the real family-found path against whichever
+        // fonts actually exist on this machine (DejaVu Sans is a
+        // near-universal Linux default) rather than a fixture the
+        // global `font_scanner()` singleton has no way to substitute
+        // in for a test. Skips gracefully elsewhere, same shape as
+        // this session's other "real binary/asset not present, skip"
+        // tests (`safe_atexit`).
+        let family = "DejaVu Sans";
+        if calibre_utils::fonts::scanner::font_scanner().fonts_for_family(family).is_err() {
+            eprintln!("skipping: {family} not installed on this machine");
+            return;
+        }
+        let mut oeb = Builder::new().build();
+        let mut report = |_: &str| {};
+        let (body_font_family, efi) = get_embed_font_info(&mut oeb, Some(family), true, &mut report).unwrap();
+        assert!(body_font_family.unwrap().contains(family));
+        assert!(!efi.is_empty());
+        // The embedded font's bytes are really in the container, not
+        // just referenced.
+        let font_item = oeb.manifest.iter().find(|i| OEB_FONTS.iter().any(|f| f.eq_ignore_ascii_case(&i.media_type))).expect("a font manifest item");
+        assert!(!oeb.container.read(&font_item.href).unwrap().is_empty());
+
+        // A second call for the same family dedupes against the
+        // already-embedded bytes instead of adding duplicates.
+        let font_items_before = oeb.manifest.iter().filter(|i| OEB_FONTS.iter().any(|f| f.eq_ignore_ascii_case(&i.media_type))).count();
+        get_embed_font_info(&mut oeb, Some(family), true, &mut report).unwrap();
+        let font_items_after = oeb.manifest.iter().filter(|i| OEB_FONTS.iter().any(|f| f.eq_ignore_ascii_case(&i.media_type))).count();
+        assert_eq!(font_items_before, font_items_after, "re-embedding the same family should dedupe, not duplicate");
+    }
 
     #[test]
     fn unit_convert_handles_common_units() {

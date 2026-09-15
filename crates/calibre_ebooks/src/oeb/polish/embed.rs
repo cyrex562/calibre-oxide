@@ -7,17 +7,14 @@
 //! structs -- no CSS parser needed -- and is ported for real, matching
 //! Python's CSS Fonts Level 3 matching algorithm
 //! (<https://www.w3.org/TR/css-fonts-3/#font-style-matching>).
+//! [`do_embed`] (system font scanning) and `embed_font`'s fallback
+//! path that calls it are real as of issue #556
+//! (`calibre_utils::fonts::scanner`); `embed_font`'s *other* branch
+//! (reusing a font already embedded elsewhere in the book, matched via
+//! [`matching_rule_face`]) needed none of that and was already real.
 //!
-//! Two things are genuinely out of scope:
+//! One thing is genuinely out of scope:
 //!
-//! - **System font scanning** (`do_embed`, and `embed_font`'s fallback
-//!   path): Python's `calibre.utils.fonts.scanner.font_scanner` enumerates
-//!   fonts installed on the OS and calibre's own bundled font collection.
-//!   No equivalent capability -- OS font enumeration, TrueType/OpenType
-//!   name-table reading to build a searchable font database -- exists in
-//!   this crate. `embed_font`'s *other* branch (reusing a font already
-//!   embedded elsewhere in the book, matched via [`matching_rule_face`])
-//!   needs none of that and is ported for real.
 //! - **`embed_all_fonts`'s orchestration**: it walks `stats.font_usage_map`/
 //!   `font_spec_map`/`font_rule_map`, which come from
 //!   `oeb.polish.stats.StatsCollector` -- a different, not-yet-ported
@@ -30,7 +27,8 @@
 
 use std::collections::HashSet;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use calibre_utils::filenames::ascii_filename;
 
 use crate::dom::{Dom, NodeId};
 
@@ -345,19 +343,33 @@ pub fn font_key(font: &FontDescriptor) -> (String, String, String, String) {
 }
 
 /// Port of `do_embed`: copies a system font's file into the book and
-/// returns its `@font-face` rule. Needs
-/// `calibre.utils.fonts.scanner.font_scanner` -- see the module docs.
-pub fn do_embed(
-    _container: &mut Container,
-    _font: &FontDescriptor,
-    _report: &mut dyn FnMut(&str),
-) -> Result<FontFaceRule> {
-    todo!(
-        "placeholder: needs calibre.utils.fonts.scanner.font_scanner (OS font \
-         enumeration + calibre's bundled font collection, with \
-         TrueType/OpenType name-table reading), which this crate has no \
-         equivalent for -- see this module's docs"
-    )
+/// returns its `@font-face` rule. Real as of issue #556
+/// (`calibre_utils::fonts::scanner`) -- `font.path` is one of that
+/// scanner's own [`FontDescriptor`]s, so this reads the font file
+/// directly rather than going back through the scanner.
+pub fn do_embed(container: &mut Container, font: &FontDescriptor, report: &mut dyn FnMut(&str)) -> Result<FontFaceRule> {
+    let path = font.path.as_deref().ok_or_else(|| anyhow::anyhow!("no path to embed {} from", font.font_family))?;
+    let full_name = font.full_name.as_deref().unwrap_or(&font.font_family);
+    report(&format!("Embedding font {full_name} from {path}"));
+    let data = std::fs::read(path).with_context(|| format!("failed to read font file {path}"))?;
+
+    let ext = if font.is_otf { "otf" } else { "ttf" };
+    let fname = ascii_filename(full_name).replace(' ', "-").replace(['(', ')'], "");
+    let opf_name = container.opf_name.clone();
+    let item_node = container.generate_item(&format!("fonts/{fname}.{ext}"), "font", None, true)?;
+    let href_attr = container.opf()?.get_attr(item_node, "href").unwrap_or("").to_string();
+    let name = container.href_to_name(&href_attr, Some(&opf_name)).ok_or_else(|| anyhow::anyhow!("failed to resolve the generated font item's name"))?;
+    container.write_file(&name, &data)?;
+    let href = container.name_to_href(&name, None);
+
+    Ok(FontFaceRule {
+        font_family: font.font_family.clone(),
+        font_weight: font.font_weight.clone(),
+        font_style: font.font_style.clone(),
+        font_stretch: font.font_stretch.clone(),
+        src: format!("url({href})"),
+        name,
+    })
 }
 
 /// Port of `embed_font`. The already-embedded-elsewhere branch (a
