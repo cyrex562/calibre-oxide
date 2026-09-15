@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 // Existing commands modules
 use super::{
+    cmd_add,
     cmd_add_custom_column,
     cmd_add_format,
     // Add others if needed after implementation
@@ -66,11 +67,10 @@ pub fn run_command(cmd: &str, args: &[String], ctx: &DBCtx) -> Result<()> {
             let db = ctx.db()?;
             cmd_show_metadata::CmdShowMetadata::new().run(&db, args)
         }
-        // Stub all others to avoid import/signature issues during porting
-        "add" => Err(anyhow!(
-            "Command '{}' not yet implemented in main_dispatch",
-            cmd
-        )),
+        "add" => {
+            let mut db = ctx.db()?;
+            cmd_add::CmdAdd::new().run(&mut db, args)
+        }
         "add_custom_column" => {
             let mut db = ctx.db()?;
             cmd_add_custom_column::CmdAddCustomColumn::new().run(&mut db, args)
@@ -164,5 +164,45 @@ pub fn run_command(cmd: &str, args: &[String], ctx: &DBCtx) -> Result<()> {
         "restore_database" => cmd_restore_database::CmdRestoreDatabase::new().run(args),
 
         _ => Err(anyhow!("Unknown command: {}", cmd)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::io::Write;
+
+    /// `run_command("add", ...)` is the real dispatch path the
+    /// `calibredb` binary uses -- unlike `cmd_add`'s own unit test,
+    /// which calls `CmdAdd::run` directly and would have kept passing
+    /// even while this dispatcher's `"add"` arm was a hardcoded
+    /// `Err(...)` stub. Exercises the dispatcher itself, on a real
+    /// on-disk library (`DBCtx::db()` requires one via
+    /// `Library::open`, unlike `Library::open_test()`).
+    #[test]
+    fn run_command_add_really_adds_a_book_through_the_dispatcher() {
+        let lib_dir = tempfile::tempdir().unwrap();
+        Library::create(lib_dir.path().to_path_buf()).unwrap();
+        let ctx = DBCtx::new(lib_dir.path().to_path_buf());
+
+        let book_dir = tempfile::tempdir().unwrap();
+        let book_path = book_dir.path().join("Dispatch Test.epub");
+        let mut f = fs::File::create(&book_path).unwrap();
+        f.write_all(b"dummy content").unwrap();
+
+        run_command("add", &[book_path.to_string_lossy().to_string()], &ctx).unwrap();
+
+        let db = ctx.db().unwrap();
+        let books = db.list_books().unwrap();
+        assert_eq!(books.len(), 1, "the dispatcher should have really added the book, not stubbed out");
+    }
+
+    #[test]
+    fn run_command_reports_an_unknown_command_as_an_error() {
+        let lib_dir = tempfile::tempdir().unwrap();
+        Library::create(lib_dir.path().to_path_buf()).unwrap();
+        let ctx = DBCtx::new(lib_dir.path().to_path_buf());
+        assert!(run_command("not_a_real_command", &[], &ctx).is_err());
     }
 }
