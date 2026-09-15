@@ -1783,7 +1783,7 @@ single-library, unauthenticated OPDS catalog + book/cover downloads.**
 - [x] recycle_bin.py
 - [x] resources.py
 - [ ] run_tests.py
-- [ ] safe_atexit.py
+- [x] safe_atexit.py (issue #467, closed 2026-09-15 -- `calibre_utils::safe_atexit` + `src/bin/safe_atexit_worker.rs`: a real, genuinely portable crash-safe-cleanup worker subprocess -- `rmtree`/`unlink` are queued and only run when the worker's own stdin hits EOF, which the OS guarantees regardless of how the caller process ends (clean exit, panic, or kill), giving the same crash-safety property as upstream without needing any Python-specific mechanism. `run_program_now` launches immediately. No current caller in this port (temp files here use the `tempfile` crate's `Drop`-based cleanup directly) -- a real, ready primitive, not wired into anything yet. NOT ported: `atexit`-based auto-shutdown (no Rust equivalent that captures owned state the way `atexit.register` does -- same gap `tdir_in_cache.rs` already discloses; callers wanting the synchronous graceful-wait call `shutdown_worker` themselves), Windows' retry-with-sleep `remove_dir` and `reset_dll_dir` (unverifiable on this Linux-only toolchain), `sanitize_env_vars` (exists only to stop a frozen Python binary's bundled shared libs from leaking into a launched subprocess's env -- doesn't apply to a native Rust binary at all))
 - [x] search_query_parser.py
 - [x] search_query_parser_test.py
 - [ ] serialize.py
