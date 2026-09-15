@@ -8,16 +8,15 @@
 //! Full port of `old_src/src/calibre/ebooks/docx/fonts.py`. An earlier
 //! version of this module ported only the symbol-map half, believing
 //! the rest was blocked on `calibre.utils.fonts.scanner.font_scanner`
-//! (a *system*-installed-font resolver with no Rust counterpart) --
-//! tracing the Python source precisely found that's wrong: the scanner
-//! is used in exactly one place, [`has_system_fonts`] (deciding
-//! whether `Family` should prefer a declared `w:altName` over the
-//! font's own primary name, when the primary isn't installed on the
-//! system) -- everything else (`family_for`, `embed_fonts`, `write`,
-//! `is_truetype_font`, `panose_to_css_generic_family`) has zero system
-//! dependency. [`has_system_fonts`] is stubbed to always return
-//! `false` -- see its own doc comment for why that's a real, already-
-//! existing Python code path, not a hypothetical.
+//! (a *system*-installed-font resolver) -- tracing the Python source
+//! precisely found that's wrong: the scanner is used in exactly one
+//! place, [`has_system_fonts`] (deciding whether `Family` should
+//! prefer a declared `w:altName` over the font's own primary name,
+//! when the primary isn't installed on the system) -- everything else
+//! (`family_for`, `embed_fonts`, `write`, `is_truetype_font`,
+//! `panose_to_css_generic_family`) has zero system dependency.
+//! [`has_system_fonts`] is real as of issue #556
+//! (`calibre_utils::fonts::scanner`).
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek};
@@ -197,9 +196,10 @@ pub fn map_symbol_text(text: &str, font: &str) -> String {
 /// ([`Family::css_generic_family`]) to handle a font that turns out
 /// not to be installed there.
 ///
-/// Port of the Python `has_system_fonts`.
-pub fn has_system_fonts(_name: &str) -> bool {
-    false
+/// Port of the Python `has_system_fonts`. Real as of issue #556
+/// (`calibre_utils::fonts::scanner::font_scanner`).
+pub fn has_system_fonts(name: &str) -> bool {
+    calibre_utils::fonts::scanner::font_scanner().fonts_for_family(name).map(|faces| !faces.is_empty()).unwrap_or(false)
 }
 
 /// `(bold, italic)` -> the `w:embed*`/variant-map key Word itself uses.
@@ -648,9 +648,8 @@ mod fonts_tests {
     }
 
     #[test]
-    fn has_system_fonts_always_reports_false_no_scanner_available() {
-        assert!(!has_system_fonts("Arial"));
-        assert!(!has_system_fonts("Some Font Nobody Has"));
+    fn has_system_fonts_reports_false_for_a_family_nobody_has() {
+        assert!(!has_system_fonts("Some Font Nobody Has, Surely, Right"));
     }
 
     #[test]
