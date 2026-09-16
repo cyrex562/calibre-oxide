@@ -194,6 +194,7 @@ pub mod render_endpoints;
 pub mod save_to_disk;
 pub mod share;
 pub mod template_tester;
+pub mod tts;
 pub mod tweak;
 pub mod users;
 pub mod users_api;
@@ -247,6 +248,9 @@ pub struct AppState {
     /// Persisted recurring news-feed schedules -- see
     /// [`news_scheduler`]'s own doc.
     pub news_schedules: Arc<news_scheduler::NewsScheduleStore>,
+    /// The single server-wide TTS voice, if `--tts-voice` was passed
+    /// at startup -- see [`tts`]'s own doc.
+    pub tts_voice: Option<Arc<tts::TtsVoiceConfig>>,
 }
 
 impl AppState {
@@ -307,6 +311,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/news/schedules/list", get(news_scheduler::list_schedules))
         .route("/news/schedules/remove/{id}", post(news_scheduler::remove_schedule))
         .route("/news/schedules/run-now/{id}", post(news_scheduler::run_schedule_now))
+        .route("/tts/synthesize", post(tts::synthesize))
         .route("/share/email", post(share::share_email))
         .route("/check-library/{library_id}", post(check_library::check))
         .route("/custom-columns", get(custom_columns::list))
@@ -432,7 +437,7 @@ mod tests {
             jobs: std::sync::Arc::new(jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
             render_jobs: std::sync::Arc::new(render_endpoints::RenderJobRegistry::new()),
             conversion_jobs: std::sync::Arc::new(convert::ConversionJobRegistry::new()),
-            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()),
+            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()), tts_voice: None,
         }
     }
 
@@ -458,7 +463,7 @@ mod tests {
             jobs: std::sync::Arc::new(jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
             render_jobs: std::sync::Arc::new(render_endpoints::RenderJobRegistry::new()),
             conversion_jobs: std::sync::Arc::new(convert::ConversionJobRegistry::new()),
-            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()),
+            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()), tts_voice: None,
         };
         let router = test_router(state);
         let (status, _) = get(&router, "/opds").await;
@@ -520,7 +525,7 @@ mod tests {
             jobs: std::sync::Arc::new(jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
             render_jobs: std::sync::Arc::new(render_endpoints::RenderJobRegistry::new()),
             conversion_jobs: std::sync::Arc::new(convert::ConversionJobRegistry::new()),
-            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()),
+            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()), tts_voice: None,
         };
         let router = test_router(state);
 
