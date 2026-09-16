@@ -388,3 +388,36 @@ export async function renameCategoryItem(category: string, itemName: string, new
   });
   if (!resp.ok) throw new Error((await resp.text()) || `${resp.status} ${resp.statusText}`);
 }
+
+// Real, new route -- see crates/calibre_srv/src/check_library.rs's
+// own doc for why (real upstream's "Check Library" dialog is Qt
+// GUI-only, never exposed over HTTP there).
+export interface CheckLibraryFinding {
+  a: string;
+  b: string;
+  book_id: number;
+}
+
+export type CheckLibraryResult = Record<string, CheckLibraryFinding[]>;
+
+// Human-readable labels for each real result key, matching
+// calibre_db::cli::cmd_check_library's own upstream-derived labels.
+export const CHECK_LIBRARY_LABELS: Record<string, string> = {
+  invalid_titles: "Invalid titles",
+  extra_titles: "Extra titles",
+  invalid_authors: "Invalid authors",
+  extra_authors: "Extra authors",
+  missing_formats: "Missing book formats",
+  extra_formats: "Extra book formats",
+  extra_files: "Unknown files in books",
+  missing_covers: "Missing cover files",
+  extra_covers: "Cover files not in database",
+  malformed_formats: "Malformed formats",
+  malformed_paths: "Malformed book paths",
+  corrupted_formats: "Corrupted book formats",
+  corrupted_covers: "Corrupted cover files",
+};
+
+export function checkLibrary(): Promise<CheckLibraryResult> {
+  return jsonFetch<CheckLibraryResult>("/check-library/default", { method: "POST" });
+}

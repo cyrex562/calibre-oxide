@@ -3,7 +3,7 @@ use crate::constants::{
     LIBRARY_HANDLE_DIR_NAME, NOTES_DIR_NAME as REAL_NOTES_DIR_NAME,
     TRASH_DIR_NAME as REAL_TRASH_DIR_NAME,
 };
-use crate::Library;
+use crate::cache::Cache;
 
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -36,9 +36,40 @@ lazy_static::lazy_static! {
     static ref IGNORE_AT_TOP_LEVEL: HashSet<&'static str> = {
         let mut s = HashSet::new();
         s.insert("metadata.db");
+        // Real SQLite WAL-mode sidecar files (`Backend::new` enables
+        // WAL mode for every real `Cache`/`Library` connection this
+        // port opens) -- a real, pre-existing false positive found
+        // while porting this module to `Cache` for issue #748: every
+        // real library scanned with WAL mode active (i.e. every real
+        // library this port ever opens) reported these two normal,
+        // expected files as "invalid authors" at the library's top
+        // level. Confirmed pre-existing on `master` before that port
+        // (stashed the port, reran the same test, identical false
+        // positive), not introduced by it.
+        s.insert("metadata.db-shm");
+        s.insert("metadata.db-wal");
         s.insert("metadata_db_prefs_backup.json");
         s.insert("metadata_pre_restore.db");
         s.insert("full-text-search.db");
+        s.insert("full-text-search.db-shm");
+        s.insert("full-text-search.db-wal");
+        // Real oxide-only server-local state sidecars (`calibre_srv`'s
+        // own `reader_profiles::ProfileStore`/`users::UserManager`,
+        // both real `rusqlite` databases stored directly at the
+        // library root, per `main.rs`'s own real `--library-path`-
+        // relative construction) -- a second real instance of the
+        // exact same false-positive class as the WAL-mode sidecars
+        // above, found via a real live-server check right after fixing
+        // those (issue #748): every real desktop-app-spawned
+        // `calibre_srv` creates these two files (plus their own WAL
+        // sidecars) the first time it runs, and the scan reported them
+        // as "invalid authors" too.
+        s.insert("reader-profiles.sqlite");
+        s.insert("reader-profiles.sqlite-shm");
+        s.insert("reader-profiles.sqlite-wal");
+        s.insert("server-users.sqlite");
+        s.insert("server-users.sqlite-shm");
+        s.insert("server-users.sqlite-wal");
         // Real oxide-only sidecar directory names (`.caltrash`/
         // `.calnotes`, not the `".trash"`/`".notes"` placeholders this
         // set previously held -- those never matched
@@ -57,7 +88,7 @@ lazy_static::lazy_static! {
 
 pub struct CheckLibrary<'a> {
     library_path: PathBuf,
-    db: &'a Library,
+    db: &'a Cache,
     is_case_sensitive: bool,
 
     // Results
@@ -99,7 +130,7 @@ pub struct CheckLibrary<'a> {
 }
 
 impl<'a> CheckLibrary<'a> {
-    pub fn new(library_path: PathBuf, db: &'a Library) -> Self {
+    pub fn new(library_path: PathBuf, db: &'a Cache) -> Self {
         let is_case_sensitive = db.is_case_sensitive();
 
         let all_authors = db
@@ -581,7 +612,7 @@ mod tests {
         let file_path = seed_book_with_format(dir.path(), 1, b"original bytes");
         fs::write(&file_path, b"corrupted on disk").unwrap();
 
-        let lib = Library::open(dir.path().to_path_buf()).unwrap();
+        let lib = Cache::new(dir.path()).unwrap();
         let mut checker = CheckLibrary::new(dir.path().to_path_buf(), &lib);
         checker.scan_library(vec![], vec![]);
 
@@ -593,6 +624,48 @@ mod tests {
         assert_eq!(checker.corrupted_formats.len(), 1);
         assert_eq!(checker.corrupted_formats[0].2, 1);
         assert!(checker.corrupted_covers.is_empty());
+    }
+
+    #[test]
+    fn scan_library_does_not_flag_real_wal_mode_sqlite_sidecar_files_as_invalid_authors() {
+        // Regression test for a real, pre-existing false positive
+        // found while porting this module to `Cache` for issue #748:
+        // `Backend::new` enables WAL mode for every real connection
+        // this port opens, so `metadata.db-shm`/`metadata.db-wal` are
+        // real, expected files at the top level of every real library
+        // -- not user-created "author directories" the scan should
+        // flag as invalid.
+        let dir = tempdir().unwrap();
+        seed_book_with_format(dir.path(), 1, b"content");
+        std::fs::write(dir.path().join("metadata.db-shm"), b"").unwrap();
+        std::fs::write(dir.path().join("metadata.db-wal"), b"").unwrap();
+
+        let lib = Cache::new(dir.path()).unwrap();
+        let mut checker = CheckLibrary::new(dir.path().to_path_buf(), &lib);
+        checker.scan_library(vec![], vec![]);
+
+        assert!(checker.invalid_authors.is_empty(), "{:?}", checker.invalid_authors);
+    }
+
+    #[test]
+    fn scan_library_does_not_flag_calibre_srv_server_local_state_files_as_invalid_authors() {
+        // Regression test: found via a real live `calibre_srv` check
+        // right after fixing the WAL-sidecar false positive above --
+        // `reader-profiles.sqlite`/`server-users.sqlite` (real
+        // calibre_srv-only server-local state, always created at the
+        // library root the first time a real server runs against a
+        // library) were flagged the same way.
+        let dir = tempdir().unwrap();
+        seed_book_with_format(dir.path(), 1, b"content");
+        for name in ["reader-profiles.sqlite", "reader-profiles.sqlite-shm", "reader-profiles.sqlite-wal", "server-users.sqlite", "server-users.sqlite-shm", "server-users.sqlite-wal"] {
+            std::fs::write(dir.path().join(name), b"").unwrap();
+        }
+
+        let lib = Cache::new(dir.path()).unwrap();
+        let mut checker = CheckLibrary::new(dir.path().to_path_buf(), &lib);
+        checker.scan_library(vec![], vec![]);
+
+        assert!(checker.invalid_authors.is_empty(), "{:?}", checker.invalid_authors);
     }
 
     #[test]
@@ -610,7 +683,7 @@ mod tests {
                 .unwrap();
         }
 
-        let lib = Library::open(dir.path().to_path_buf()).unwrap();
+        let lib = Cache::new(dir.path()).unwrap();
         let mut checker = CheckLibrary::new(dir.path().to_path_buf(), &lib);
         checker.scan_library(vec![], vec![]);
 
@@ -639,7 +712,7 @@ mod tests {
         }
         fs::write(&cover_path, b"tampered cover").unwrap();
 
-        let lib = Library::open(dir.path().to_path_buf()).unwrap();
+        let lib = Cache::new(dir.path()).unwrap();
         let mut checker = CheckLibrary::new(dir.path().to_path_buf(), &lib);
         checker.scan_library(vec![], vec![]);
 

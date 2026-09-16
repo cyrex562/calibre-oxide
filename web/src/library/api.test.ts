@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { addBook, addFormat, catalogDownloadUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, removeDataFile, removeFormat, renameCategoryItem, renameSavedSearch, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
+import { addBook, addFormat, catalogDownloadUrl, checkLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, removeDataFile, removeFormat, renameCategoryItem, renameSavedSearch, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
 import type { BookSummary } from "./types";
 
 function bookStub(id: number): BookSummary {
@@ -465,6 +465,19 @@ describe("renameCategoryItem", () => {
   it("throws the server's own error text on failure", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 400, statusText: "Bad Request", text: async () => "renaming \"series\" is not supported" }));
     await expect(renameCategoryItem("series", "X", "Y")).rejects.toThrow("not supported");
+  });
+});
+
+describe("checkLibrary", () => {
+  it("posts to the real single-library route and returns the parsed result", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ invalid_authors: [{ a: "junk.bin", b: "junk.bin", book_id: 0 }], extra_formats: [] }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await checkLibrary();
+
+    expect(fetchMock).toHaveBeenCalledWith("/check-library/default", { method: "POST" });
+    expect(result.invalid_authors).toHaveLength(1);
+    expect(result.extra_formats).toEqual([]);
   });
 });
 
