@@ -178,6 +178,7 @@ pub mod legacy;
 pub mod library_broker;
 pub mod lists;
 pub mod mathjax;
+pub mod net_guard;
 pub mod news;
 pub mod notes;
 pub mod opds;

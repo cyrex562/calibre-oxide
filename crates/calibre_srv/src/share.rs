@@ -26,19 +26,31 @@
 //! *persistence* a genuine, separate follow-up once #721 lands (the
 //! client can store its own relay config locally in the meantime).
 //!
-//! # Real, disclosed narrowing: the relay itself is not SSRF-checked
+//! # SSRF: the relay host is validated the same way `news.rs` validates feed URLs
 //!
-//! Unlike `news::validate_feed_url`, the SMTP relay host isn't
-//! DNS-validated against internal address ranges here. Real SMTP
-//! delivery inherently needs to connect to *some* mail server, and
-//! restricting that to a public-only allowlist would break the
-//! legitimate "a local mail relay on the same trusted host/network"
-//! use case `calibre_utils::smtp`'s own doc explicitly calls out --
-//! unlike `/news/fetch`, where the fetched *content* is exposed back
-//! to the caller (making an internal-service response readable via
-//! the resulting book), a bare send-only SMTP connection doesn't leak
-//! a response body back to the caller the same way. A real, load-
-//! bearing distinction, not an oversight.
+//! An earlier version of this doc comment argued no SSRF check was
+//! needed here because a send-only SMTP connection doesn't leak a
+//! response body back to the caller the way a fetched page would.
+//! That reasoning was incomplete: letting a caller point this server
+//! at an arbitrary internal host:port and have it speak
+//! attacker-influenced bytes (a crafted `from`/`to`/subject/body) is a
+//! real "blind" SSRF / protocol-smuggling vector even with no response
+//! leakage -- e.g. probing which internal ports are open (a
+//! differential-error-message oracle), or smuggling a line-based
+//! command to a non-SMTP internal service (Redis, Memcached) that
+//! happens to tolerate malformed input enough to act on an early line.
+//! The impact doesn't require the caller to read a response, only that
+//! the server dials and writes to a host of the caller's choosing.
+//!
+//! So the relay host is DNS-resolved and checked against the same
+//! disallowed-address list `news::validate_feed_url` uses (see
+//! [`crate::net_guard`]) before `RelayConfig` is ever constructed.
+//! `send_via_relay`'s own error detail is also not surfaced to the
+//! client (logged server-side instead, generic message returned) --
+//! even for a *permitted* destination, echoing back "connection
+//! refused" vs. "timed out" vs. "TLS handshake failed" would let a
+//! caller fingerprint what's listening on a given public host:port,
+//! which this route has no business revealing.
 
 use axum::extract::{Query, State};
 use axum::Json;
@@ -93,6 +105,18 @@ pub async fn share_email(State(state): State<AppState>, Query(q): Query<ShareQue
     let cache = state.cache_for(q.library_id.as_deref()).ok_or_else(|| ServerError::NotFound(format!("no library named {:?}", q.library_id.unwrap_or_default())))?;
     let encryption = parse_encryption(body.relay.encryption.as_deref())?;
 
+    // Default ports mirror lettre's own per-encryption defaults
+    // (`SmtpTransport::relay`/`starttls_relay`/`builder_dangerous`) --
+    // only used here to pick a port for the DNS-resolution check, the
+    // real connection still goes through `send_via_relay`/`RelayConfig`
+    // unchanged.
+    let guard_port = body.relay.port.unwrap_or(match encryption {
+        Encryption::Ssl => 465,
+        Encryption::Tls => 587,
+        Encryption::None => 25,
+    });
+    crate::net_guard::resolve_and_check(&body.relay.relay, guard_port).await.map_err(|e| ServerError::BadRequest(format!("relay {}: {e}", body.relay.relay)))?;
+
     tokio::task::spawn_blocking(move || -> Result<(), ServerError> {
         let fmt_lower = body.format.to_lowercase();
         let ids: std::collections::HashSet<i32> = std::iter::once(body.book_id).collect();
@@ -110,7 +134,14 @@ pub async fn share_email(State(state): State<AppState>, Query(q): Query<ShareQue
         let msg = create_mail(&body.from, &body.to, &subject, body.text.as_deref(), Some(MailAttachment { data, content_type, filename })).map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
         let cfg = RelayConfig { relay: body.relay.relay, port: body.relay.port, username: body.relay.username, password: body.relay.password, encryption, timeout: Some(std::time::Duration::from_secs(30)) };
-        send_via_relay(&msg, &cfg).map_err(|e| ServerError::InternalServerError(format!("failed to send mail: {e:#}")))?;
+        send_via_relay(&msg, &cfg).map_err(|e| {
+            // Detail logged server-side only -- see this module's doc
+            // comment on why leaking the raw error (connection
+            // refused vs. timed out vs. TLS failure, etc.) back to the
+            // client would make this route usable as a scan oracle.
+            eprintln!("share_email: send_via_relay failed: {e:#}");
+            ServerError::InternalServerError("failed to send mail".to_string())
+        })?;
         Ok(())
     })
     .await
@@ -203,6 +234,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn share_email_rejects_a_relay_that_resolves_to_a_private_address() {
+        let (_dir, router, book_id) = test_app();
+        let (status, body) = post_json(
+            &router,
+            "/share/email",
+            serde_json::json!({"book_id": book_id, "format": "txt", "from": "me@example.com", "to": "you@example.com", "relay": {"relay": "10.0.0.5"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    #[tokio::test]
+    async fn share_email_rejects_a_relay_that_resolves_to_a_link_local_address() {
+        let (_dir, router, book_id) = test_app();
+        let (status, body) = post_json(
+            &router,
+            "/share/email",
+            serde_json::json!({"book_id": book_id, "format": "txt", "from": "me@example.com", "to": "you@example.com", "relay": {"relay": "169.254.169.254"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    #[tokio::test]
     async fn share_email_rejects_an_invalid_from_address() {
         let (_dir, router, book_id) = test_app();
         let (status, _) = post_json(
@@ -212,6 +267,37 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn share_email_reports_a_send_failure_generically_without_leaking_the_relay_error() {
+        use std::net::TcpListener;
+
+        // Bind then immediately drop the listener -- the port is real
+        // and resolvable (loopback) but nothing is listening, so
+        // `send_via_relay` fails with a real "connection refused".
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let (_dir, router, book_id) = test_app();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/share/email")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "book_id": book_id, "format": "txt", "from": "me@example.com", "to": "you@example.com",
+                    "relay": {"relay": addr.ip().to_string(), "port": addr.port(), "encryption": "none"},
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert_eq!(text, "failed to send mail", "raw relay error detail must not reach the client: {text}");
     }
 
     #[tokio::test]
