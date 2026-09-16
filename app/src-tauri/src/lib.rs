@@ -115,6 +115,19 @@ async fn open_recent_library(app: AppHandle, path: String) -> Result<(), String>
     open_library(&app, std::path::PathBuf::from(path))
 }
 
+/// Issue #721's one real app-level preference: whether to reopen the
+/// last library automatically on launch (see `settings.rs`'s own doc
+/// on why this defaults to `true`).
+#[tauri::command]
+fn get_auto_reopen(app: AppHandle) -> bool {
+    settings::get_auto_reopen(&app)
+}
+
+#[tauri::command]
+fn set_auto_reopen(app: AppHandle, enabled: bool) -> Result<(), String> {
+    settings::set_auto_reopen(&app, enabled).map_err(|e| e.to_string())
+}
+
 /// Real extensions `calibre_ebooks::metadata::get_metadata`'s own
 /// dispatch table understands (`crates/calibre_ebooks/src/metadata/mod.rs`)
 /// -- sourced from that match arm list directly, not invented, so a
@@ -200,18 +213,23 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(ServerState::default())
-        .invoke_handler(tauri::generate_handler![ping, get_persisted_library, choose_library, choose_folder_and_add_books, list_recent_libraries, open_recent_library])
+        .invoke_handler(tauri::generate_handler![ping, get_persisted_library, choose_library, choose_folder_and_add_books, list_recent_libraries, open_recent_library, get_auto_reopen, set_auto_reopen])
         .setup(|app| {
             // Auto-open the last library, if any, without waiting for
             // the frontend to ask -- real startup UX, not just a
-            // technically-correct command surface.
-            if let Some(path) = settings::load_library_path(app.handle()) {
-                let handle = app.handle().clone();
-                std::thread::spawn(move || {
-                    if let Err(e) = open_library(&handle, path) {
-                        eprintln!("failed to reopen the last library on startup: {e}");
-                    }
-                });
+            // technically-correct command surface. Gated on the
+            // auto_reopen preference (issue #721): a user who's
+            // disabled it wants to land on the loading screen's
+            // "choose a library" prompt instead every time.
+            if settings::get_auto_reopen(app.handle()) {
+                if let Some(path) = settings::load_library_path(app.handle()) {
+                    let handle = app.handle().clone();
+                    std::thread::spawn(move || {
+                        if let Err(e) = open_library(&handle, path) {
+                            eprintln!("failed to reopen the last library on startup: {e}");
+                        }
+                    });
+                }
             }
             Ok(())
         })

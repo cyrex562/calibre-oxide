@@ -5,14 +5,20 @@ import BookDetailsPanel from "./BookDetailsPanel.vue";
 import { addBook, catalogDownloadUrl, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, renameSavedSearch, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
 import { isTauri, tauriInvoke } from "../tauri";
+import { DEFAULT_LIBRARY_PREFS, fetchProfile, LIBRARY_PREFS_PROFILE, type LibraryPrefs } from "../settings/api";
 import type { BookFieldChanges, BookSummary, FtsSnippet } from "../library/types";
 
-const PAGE_SIZE = 24;
+// Real, persisted default (issue #721) -- overwritten by
+// loadLibraryPrefs() below once its fetch resolves; starts at the
+// same value DEFAULT_LIBRARY_PREFS uses so there's no visible flash
+// for a user with no saved preferences yet.
+const pageSize = ref(DEFAULT_LIBRARY_PREFS.pageSize);
+const duplicateDefault = ref<LibraryPrefs["duplicateDefault"]>(DEFAULT_LIBRARY_PREFS.duplicateDefault);
 
 const queryText = ref("");
 const activeQuery = ref(""); // committed query -- what's actually sent, vs. the input box's live text
-const sort = ref("timestamp");
-const sortOrder = ref<"asc" | "desc">("desc");
+const sort = ref(DEFAULT_LIBRARY_PREFS.sort);
+const sortOrder = ref<"asc" | "desc">(DEFAULT_LIBRARY_PREFS.sortOrder);
 const vl = ref("");
 const offset = ref(0);
 
@@ -31,8 +37,8 @@ const addInput = ref<HTMLInputElement | null>(null);
 const adding = ref(false);
 const addError = ref<string | null>(null);
 
-const pageCount = computed(() => Math.max(1, Math.ceil(totalNum.value / PAGE_SIZE)));
-const currentPage = computed(() => Math.floor(offset.value / PAGE_SIZE) + 1);
+const pageCount = computed(() => Math.max(1, Math.ceil(totalNum.value / pageSize.value)));
+const currentPage = computed(() => Math.floor(offset.value / pageSize.value) + 1);
 
 async function loadMetadata() {
   try {
@@ -46,6 +52,21 @@ async function loadMetadata() {
   }
 }
 void loadMetadata();
+
+async function loadLibraryPrefs() {
+  try {
+    const prefs = await fetchProfile<LibraryPrefs>(LIBRARY_PREFS_PROFILE);
+    if (!prefs) return;
+    sort.value = prefs.sort;
+    sortOrder.value = prefs.sortOrder;
+    pageSize.value = prefs.pageSize;
+    duplicateDefault.value = prefs.duplicateDefault;
+  } catch (e) {
+    // Non-fatal -- the grid still works with the built-in defaults.
+    console.error("failed to load library preferences", e);
+  }
+}
+void loadLibraryPrefs();
 
 // Virtual library / saved search management -- real, new routes (see
 // crates/calibre_srv/src/lists.rs's own doc for why no upstream route
@@ -189,7 +210,7 @@ async function runSearch() {
   try {
     const result = await search({
       query: activeQuery.value,
-      num: PAGE_SIZE,
+      num: pageSize.value,
       offset: offset.value,
       sort: sort.value,
       sortOrder: sortOrder.value,
@@ -307,10 +328,10 @@ function onCategorySelect(categoryQuery: string) {
 }
 
 function nextPage() {
-  if (offset.value + PAGE_SIZE < totalNum.value) offset.value += PAGE_SIZE;
+  if (offset.value + pageSize.value < totalNum.value) offset.value += pageSize.value;
 }
 function prevPage() {
-  if (offset.value > 0) offset.value = Math.max(0, offset.value - PAGE_SIZE);
+  if (offset.value > 0) offset.value = Math.max(0, offset.value - pageSize.value);
 }
 
 function onDetailsUpdated() {
@@ -407,6 +428,11 @@ const addSummary = ref<string | null>(null);
 async function addOneBookFile(file: File, addDuplicates: boolean): Promise<"added" | "skipped"> {
   const result = await addBook(file, addDuplicates);
   if (result.duplicates && result.duplicates.length > 0 && result.book_id === undefined) {
+    // Issue #721's real behavior change: "add"/"skip" act immediately
+    // with no prompt; "ask" (the default) keeps the pre-#721 confirm()
+    // dialog.
+    if (duplicateDefault.value === "add") return addOneBookFile(file, true);
+    if (duplicateDefault.value === "skip") return "skipped";
     const names = result.duplicates.map((d) => `${d.title} (${d.authors.join(" & ")})`).join(", ");
     if (confirm(`"${file.name}": a book with the same title/author already exists: ${names}. Add anyway?`)) {
       return addOneBookFile(file, true);
@@ -556,6 +582,7 @@ async function switchToOther() {
       <input ref="addInput" type="file" multiple class="hidden-file-input" @change="onAddFileSelected" />
       <button v-if="isTauri()" type="button" :disabled="addingFolder" @click="addFolder">{{ addingFolder ? "Adding…" : "Add Folder…" }}</button>
       <button v-if="isTauri()" type="button" @click="openSwitchLibrary">Switch library…</button>
+      <router-link to="/settings" class="settings-link">Settings…</router-link>
 
       <template v-if="!ftsMode">
         <button type="button" :class="{ active: selectMode }" @click="toggleSelectMode">
@@ -644,7 +671,7 @@ async function switchToOther() {
         <footer class="pagination">
           <button :disabled="offset === 0" @click="prevPage">◀ Prev</button>
           <span>Page {{ currentPage }} / {{ pageCount }} ({{ totalNum }} books)</span>
-          <button :disabled="offset + PAGE_SIZE >= totalNum" @click="nextPage">Next ▶</button>
+          <button :disabled="offset + pageSize >= totalNum" @click="nextPage">Next ▶</button>
         </footer>
       </main>
     </div>
@@ -847,6 +874,13 @@ async function switchToOther() {
   background: #2a6df4;
   color: #fff;
   border-color: #2a6df4;
+}
+.settings-link {
+  padding: 0.35em 0.7em;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  color: inherit;
+  text-decoration: none;
 }
 .fts-enable {
   padding: 1em;
