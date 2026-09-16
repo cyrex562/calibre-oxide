@@ -173,6 +173,7 @@ pub mod content;
 pub mod convert;
 pub mod custom_columns;
 pub mod data_files;
+pub mod duplicates;
 pub mod errors;
 pub mod fts;
 pub mod jobs;
@@ -305,6 +306,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/custom-columns/remove/{label}", post(custom_columns::remove))
         .route("/template-tester/evaluate/{book_id}/{library_id}", post(template_tester::evaluate))
         .route("/save-to-disk/{library_id}", post(save_to_disk::save_to_disk))
+        .route("/duplicates/scan/{library_id}", post(duplicates::scan))
         .route("/tweak/open/{book_id}/{fmt}/{library_id}", post(tweak::open_session))
         .route("/tweak/file/{session_id}/{*name}", get(tweak::get_file).post(tweak::set_file))
         .route("/tweak/commit/{session_id}", post(tweak::commit))

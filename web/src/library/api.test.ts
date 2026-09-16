@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { addBook, addFormat, catalogDownloadUrl, checkLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, removeDataFile, removeFormat, renameCategoryItem, renameSavedSearch, saveToDisk, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
+import { addBook, addFormat, catalogDownloadUrl, checkLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, removeDataFile, removeFormat, renameCategoryItem, renameSavedSearch, saveToDisk, scanForDuplicates, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
 import type { BookSummary } from "./types";
 
 function bookStub(id: number): BookSummary {
@@ -524,5 +524,18 @@ describe("saveToDisk", () => {
 
     const [, init] = fetchMock.mock.calls[0];
     expect(JSON.parse(init.body)).toEqual({ book_ids: [1], template: "{title}", dest: "/dest", formats: ["EPUB"] });
+  });
+});
+
+describe("scanForDuplicates", () => {
+  it("posts to the real single-library route and returns the parsed groups", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ groups: [[{ book_id: 1, title: "A", authors: ["X"] }, { book_id: 2, title: "A", authors: ["X"] }]] }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { groups } = await scanForDuplicates();
+
+    expect(fetchMock).toHaveBeenCalledWith("/duplicates/scan/default", { method: "POST" });
+    expect(groups).toHaveLength(1);
+    expect(groups[0]).toHaveLength(2);
   });
 });

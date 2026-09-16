@@ -454,3 +454,16 @@ export function saveToDisk(bookIds: number[], template: string, dest: string, fo
     body: JSON.stringify({ book_ids: bookIds, template, dest, ...(formats ? { formats } : {}) }),
   });
 }
+
+// Real, new route -- see crates/calibre_srv/src/duplicates.rs's own
+// doc (real upstream's "Find duplicates" is a Qt GUI action, never
+// exposed over HTTP there).
+export interface DuplicateBook {
+  book_id: number;
+  title: string;
+  authors: string[];
+}
+
+export function scanForDuplicates(): Promise<{ groups: DuplicateBook[][] }> {
+  return jsonFetch<{ groups: DuplicateBook[][] }>("/duplicates/scan/default", { method: "POST" });
+}
