@@ -457,6 +457,10 @@ function onDetailsUpdated() {
   void (ftsMode.value ? runFtsSearch() : runSearch());
 }
 
+function onCategoryRenamed() {
+  void (ftsMode.value ? runFtsSearch() : runSearch());
+}
+
 function onDetailsDeleted() {
   selectedBookId.value = null;
   void (ftsMode.value ? runFtsSearch() : runSearch());
@@ -747,7 +751,7 @@ async function switchToOther() {
     <p v-if="addSummary" class="status add-summary">{{ addSummary }}</p>
 
     <div class="body">
-      <CategoryBrowser class="sidebar" @select="onCategorySelect" @view-note="openNote" />
+      <CategoryBrowser class="sidebar" @select="onCategorySelect" @view-note="openNote" @renamed="onCategoryRenamed" />
 
       <main v-if="ftsMode" class="grid-area">
         <p v-if="ftsError" class="error">{{ ftsError }}</p>

@@ -186,6 +186,7 @@ pub mod opds;
 pub mod opml;
 pub mod opts;
 pub mod reader_profiles;
+pub mod rename;
 pub mod render_endpoints;
 pub mod share;
 pub mod template_tester;
@@ -293,6 +294,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/catalog/generate", get(catalog::generate))
         .route("/news/fetch", post(news::fetch_news))
         .route("/opml/import", post(opml::import))
+        .route("/rename-category-item/{category}/{item_name}/{library_id}", post(rename::rename))
         .route("/news/status/{job_id}", get(news::news_status).post(news::news_status))
         .route("/share/email", post(share::share_email))
         .route("/custom-columns", get(custom_columns::list))

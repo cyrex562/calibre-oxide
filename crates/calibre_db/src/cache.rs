@@ -1314,6 +1314,50 @@ impl Cache {
         Ok(())
     }
 
+    /// Renames a category item (author/tag/publisher) and, if that
+    /// collides with an existing name (the `name` column's `UNIQUE`
+    /// constraint), merges by re-pointing the old item's links at the
+    /// existing one and deleting the now-orphaned old row -- ported
+    /// from `legacy::LegacyDb::rename_item`'s identical logic
+    /// (issues #223/#749), moved here (and `legacy.rs`'s own
+    /// `rename_author`/`rename_tag`/`rename_publisher` now delegate to
+    /// this) so a real caller with only a `Cache` in scope (like
+    /// `calibre_srv`, which never opens a second `LegacyDb`/`Cache`
+    /// connection onto the same library file) can reach it directly.
+    /// A real, simplified stand-in for upstream's fuller
+    /// `rename_items` (which also updates every affected book's
+    /// composite/sort fields), matching `legacy.rs`'s own already-
+    /// disclosed narrowing.
+    fn rename_item(&self, table: &str, link_table: &str, link_col: &str, old_id: i32, new_name: &str) -> anyhow::Result<()> {
+        let mut conn = self.backend.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let existing: Option<i32> = tx.query_row(&format!("SELECT id FROM {table} WHERE name = ?1 AND id != ?2"), (new_name, old_id), |row| row.get(0)).optional()?;
+        match existing {
+            Some(target_id) => {
+                tx.execute(&format!("UPDATE OR IGNORE {link_table} SET {link_col} = ?1 WHERE {link_col} = ?2"), (target_id, old_id))?;
+                tx.execute(&format!("DELETE FROM {link_table} WHERE {link_col} = ?1"), [old_id])?;
+                tx.execute(&format!("DELETE FROM {table} WHERE id = ?1"), [old_id])?;
+            }
+            None => {
+                tx.execute(&format!("UPDATE {table} SET name = ?1 WHERE id = ?2"), (new_name, old_id))?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn rename_author(&self, old_id: i32, new_name: &str) -> anyhow::Result<()> {
+        self.rename_item("authors", "books_authors_link", "author", old_id, new_name)
+    }
+
+    pub fn rename_tag(&self, old_id: i32, new_name: &str) -> anyhow::Result<()> {
+        self.rename_item("tags", "books_tags_link", "tag", old_id, new_name)
+    }
+
+    pub fn rename_publisher(&self, old_id: i32, new_name: &str) -> anyhow::Result<()> {
+        self.rename_item("publishers", "books_publishers_link", "publisher", old_id, new_name)
+    }
+
     pub fn has_cover(&self, book_id: i32) -> anyhow::Result<bool> {
         let conn = self.backend.conn.lock().unwrap();
         let has_cover: Option<i64> = conn
@@ -1860,6 +1904,70 @@ mod tests {
         conn.execute("INSERT INTO books (title) VALUES (?1)", [title])
             .unwrap();
         conn.last_insert_rowid() as i32
+    }
+
+    fn author_id(cache: &Cache, name: &str) -> i32 {
+        let conn = cache.backend.conn.lock().unwrap();
+        conn.query_row("SELECT id FROM authors WHERE name = ?1", [name], |row| row.get(0)).unwrap()
+    }
+
+    #[test]
+    fn rename_author_renames_when_the_new_name_is_not_taken() {
+        let (_dir, cache) = open_test_cache();
+        let id = insert_book(&cache, "T");
+        cache.set_field(id, "authors", "Old Name").unwrap();
+        let old_id = author_id(&cache, "Old Name");
+
+        cache.rename_author(old_id, "New Name").unwrap();
+
+        assert_eq!(cache.field_for(id, "authors").unwrap(), Some("New Name".to_string()));
+        assert_eq!(author_id(&cache, "New Name"), old_id, "same row, just renamed -- not a new author");
+    }
+
+    #[test]
+    fn rename_author_merges_into_an_existing_author_on_collision() {
+        // Real merge behavior: renaming "Old Name" to an author that
+        // already exists re-points every book linked to "Old Name"
+        // onto the existing author and drops the now-orphaned row,
+        // rather than violating the `name` column's UNIQUE constraint.
+        let (_dir, cache) = open_test_cache();
+        let book_a = insert_book(&cache, "A");
+        let book_b = insert_book(&cache, "B");
+        cache.set_field(book_a, "authors", "Alice").unwrap();
+        cache.set_field(book_b, "authors", "Bob").unwrap();
+        let alice_id = author_id(&cache, "Alice");
+        let bob_id = author_id(&cache, "Bob");
+
+        cache.rename_author(alice_id, "Bob").unwrap();
+
+        assert_eq!(cache.field_for(book_a, "authors").unwrap(), Some("Bob".to_string()), "book_a's author link should now point at the surviving Bob row");
+        assert_eq!(cache.field_for(book_b, "authors").unwrap(), Some("Bob".to_string()));
+        assert_eq!(author_id(&cache, "Bob"), bob_id, "Bob's own id should be unchanged (Alice's row was the one dropped)");
+        let conn = cache.backend.conn.lock().unwrap();
+        let remaining: i64 = conn.query_row("SELECT COUNT(*) FROM authors WHERE id = ?1", [alice_id], |row| row.get(0)).unwrap();
+        assert_eq!(remaining, 0, "the orphaned Alice row should really be gone");
+    }
+
+    #[test]
+    fn rename_tag_and_rename_publisher_work_the_same_way() {
+        let (_dir, cache) = open_test_cache();
+        let id = insert_book(&cache, "T");
+        cache.set_field(id, "tags", "scifi").unwrap();
+        cache.set_field(id, "publisher", "Old Press").unwrap();
+        let tag_id = {
+            let conn = cache.backend.conn.lock().unwrap();
+            conn.query_row("SELECT id FROM tags WHERE name = ?1", ["scifi"], |row| row.get::<_, i32>(0)).unwrap()
+        };
+        let publisher_id = {
+            let conn = cache.backend.conn.lock().unwrap();
+            conn.query_row("SELECT id FROM publishers WHERE name = ?1", ["Old Press"], |row| row.get::<_, i32>(0)).unwrap()
+        };
+
+        cache.rename_tag(tag_id, "classic-scifi").unwrap();
+        cache.rename_publisher(publisher_id, "New Press").unwrap();
+
+        assert_eq!(cache.field_for(id, "tags").unwrap(), Some("classic-scifi".to_string()));
+        assert_eq!(cache.field_for(id, "publisher").unwrap(), Some("New Press".to_string()));
     }
 
     #[test]

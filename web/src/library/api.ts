@@ -372,3 +372,19 @@ export async function importOpml(opml: string): Promise<OpmlFeed[]> {
   });
   return r.feeds;
 }
+
+// Real, new route -- see crates/calibre_srv/src/rename.rs's own doc
+// for why (real rename/merge logic already existed but only on a
+// LibraryDatabase-compatibility type calibre_srv could never reach
+// without opening a second connection to the same library). Renaming
+// to an existing item of the same category is a real merge, not an
+// error -- the server handles that, this is a plain rename call
+// either way.
+export async function renameCategoryItem(category: string, itemName: string, newName: string): Promise<void> {
+  const resp = await fetch(`/rename-category-item/${encodeURIComponent(category)}/${encodeURIComponent(itemName)}/default`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ new_name: newName }),
+  });
+  if (!resp.ok) throw new Error((await resp.text()) || `${resp.status} ${resp.statusText}`);
+}
