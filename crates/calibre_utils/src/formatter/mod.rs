@@ -33,6 +33,7 @@ pub mod list_functions;
 pub mod misc_functions;
 pub mod numeric_functions;
 pub mod parser;
+pub mod string_format;
 pub mod string_functions;
 
 use interp::FunctionRegistry;

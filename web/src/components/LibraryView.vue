@@ -3,8 +3,8 @@ import { computed, ref, watch } from "vue";
 import CategoryBrowser from "./CategoryBrowser.vue";
 import NoteEditor from "./NoteEditor.vue";
 import BookDetailsPanel from "./BookDetailsPanel.vue";
-import { addBook, addCustomColumn, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, removeCustomColumn, renameSavedSearch, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
-import type { CheckLibraryResult } from "../library/api";
+import { addBook, addCustomColumn, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, removeCustomColumn, renameSavedSearch, saveToDisk, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
+import type { CheckLibraryResult, SaveToDiskResult } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
 import { isTauri, tauriInvoke } from "../tauri";
 import { DEFAULT_LIBRARY_PREFS, fetchProfile, LIBRARY_PREFS_PROFILE, type LibraryPrefs } from "../settings/api";
@@ -572,6 +572,40 @@ async function runBulkEdit() {
   await runSearch();
 }
 
+// Save to disk (#751) -- real POST /save-to-disk against whatever
+// books are currently selected (falls back to the single currently
+// open book if selection mode isn't active), evaluating a real
+// calibre-template-language `{field}`-shorthand path template per
+// book server-side.
+const saveToDiskOpen = ref(false);
+const saveToDiskTemplate = ref("{author_sort}/{title}/{title} - {authors}");
+const saveToDiskDest = ref("");
+const saveToDiskBusy = ref(false);
+const saveToDiskResults = ref<SaveToDiskResult[]>([]);
+const saveToDiskError = ref<string | null>(null);
+
+function openSaveToDisk() {
+  saveToDiskOpen.value = true;
+  saveToDiskResults.value = [];
+  saveToDiskError.value = null;
+}
+
+async function runSaveToDisk() {
+  const ids = selectMode.value && selectedIds.value.size > 0 ? [...selectedIds.value] : selectedBookId.value !== null ? [selectedBookId.value] : [];
+  if (ids.length === 0 || !saveToDiskDest.value.trim()) return;
+  saveToDiskBusy.value = true;
+  saveToDiskError.value = null;
+  saveToDiskResults.value = [];
+  try {
+    const { results } = await saveToDisk(ids, saveToDiskTemplate.value, saveToDiskDest.value.trim());
+    saveToDiskResults.value = results;
+  } catch (e) {
+    saveToDiskError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    saveToDiskBusy.value = false;
+  }
+}
+
 const addSummary = ref<string | null>(null);
 
 async function addOneBookFile(file: File, addDuplicates: boolean): Promise<"added" | "skipped"> {
@@ -750,6 +784,7 @@ async function switchToOther() {
           {{ selectMode ? "Cancel selection" : "Select…" }}
         </button>
         <button v-if="selectedIds.size > 0" type="button" @click="bulkOpen = true">Bulk edit ({{ selectedIds.size }})</button>
+        <button v-if="selectedIds.size > 0" type="button" @click="openSaveToDisk">Save to disk ({{ selectedIds.size }})</button>
       </template>
     </header>
 
@@ -931,6 +966,35 @@ async function switchToOther() {
             </div>
           </template>
         </section>
+      </div>
+    </div>
+
+    <div v-if="saveToDiskOpen" class="manage-backdrop" @click.self="saveToDiskOpen = false">
+      <div class="manage-panel">
+        <button class="manage-close" @click="saveToDiskOpen = false">✕</button>
+        <h3>Save to disk</h3>
+        <p class="news-hint">Exports the selected book(s) into a folder tree named from a real calibre template. Available fields include {title}, {authors}, {author_sort}, {series}, and any custom column (e.g. {#shelf}).</p>
+        <form @submit.prevent="runSaveToDisk">
+          <label class="news-field">
+            Path template
+            <input v-model="saveToDiskTemplate" placeholder="{author_sort}/{title}/{title} - {authors}" :disabled="saveToDiskBusy" />
+          </label>
+          <label class="news-field">
+            Destination folder (absolute path)
+            <input v-model="saveToDiskDest" placeholder="/home/me/Books" :disabled="saveToDiskBusy" />
+          </label>
+          <div class="bulk-actions">
+            <button type="submit" class="read" :disabled="saveToDiskBusy || !saveToDiskDest.trim()">{{ saveToDiskBusy ? "Saving…" : "Save" }}</button>
+            <button type="button" :disabled="saveToDiskBusy" @click="saveToDiskOpen = false">Close</button>
+          </div>
+        </form>
+        <p v-if="saveToDiskError" class="error">{{ saveToDiskError }}</p>
+        <ul v-if="saveToDiskResults.length" class="manage-list">
+          <li v-for="r in saveToDiskResults" :key="r.book_id">
+            <span v-if="r.ok" class="manage-name">Book {{ r.book_id }}: saved {{ r.paths?.length }} file(s)</span>
+            <span v-else class="error">Book {{ r.book_id }}: {{ r.error }}</span>
+          </li>
+        </ul>
       </div>
     </div>
 

@@ -54,9 +54,8 @@ use regex::Regex;
 use unicode_normalization::UnicodeNormalization;
 
 use calibre_utils::cleantext::{clean_ascii_chars, clean_xml_chars};
-use calibre_utils::formatter::interp::{evaluate as gpm_evaluate, RawValue, ValueSource};
-use calibre_utils::formatter::parser::parse as gpm_parse;
-use calibre_utils::formatter::{lexer, PureCatalog, PureFunctions};
+use calibre_utils::formatter::interp::{RawValue, ValueSource};
+use calibre_utils::formatter::{PureCatalog, PureFunctions};
 use tiny_skia::{
     Color, FillRule, GradientStop, LinearGradient, Mask, Paint, PathBuilder, Pixmap, PixmapPaint, Point,
     RadialGradient, Rect, SpreadMode, Transform,
@@ -406,162 +405,16 @@ impl ValueSource for CoverValueSource {
     }
 }
 
-/// Port of `_eval_program`/`Formatter.evaluate`'s `program:` branch:
-/// runs `program_text` through the real GPM lexer/parser/interpreter,
-/// with `dollar_val` bound to the special `$` local (matching
-/// `format_field`'s own `_eval_program(val, expr, ...)` call, where
-/// `val` is the field's current value).
-fn run_gpm(program_text: &str, dollar_val: &str, values: &CoverValueSource) -> Result<String, String> {
-    let tokens = lexer::scan(program_text).map_err(|p| format!("lex error at byte {p}"))?;
-    let expr = gpm_parse(&tokens, &PureCatalog, Default::default()).map_err(|e| e.to_string())?;
-    let mut globals = HashMap::new();
-    gpm_evaluate(&expr, dollar_val, Box::new(values.clone()), &PureFunctions, &mut globals).map_err(|e| e.to_string())
-}
-
-/// Port of `_explode_format_string`: unwraps a `prefix|fmt|suffix`
-/// format spec into its 3 parts (matching upstream's own regex
-/// `^(.*)\|([^\|]*)\|(.*)$`); a spec with no `|`-delimited middle
-/// section returns unchanged with empty prefix/suffix.
-fn explode_format_string(fmt: &str) -> (&str, &str, &str) {
-    if let Some(first) = fmt.find('|') {
-        if let Some(rel_last) = fmt[first + 1..].rfind('|') {
-            let last = first + 1 + rel_last;
-            if last > first {
-                return (&fmt[first + 1..last], &fmt[..first], &fmt[last + 1..]);
-            }
-        }
-    }
-    (fmt, "", "")
-}
-
-/// Port of `_do_format`: applies a Python `str.format()`-style
-/// single-char type spec to `val`. Real upstream supports the full
-/// numeric/width/precision/alignment grammar via `('{0:'+fmt+'}').format(val)`;
-/// this only implements the empty-spec passthrough (`if not fmt or
-/// not val: return val`) that `covers.py`'s own real templates
-/// exercise -- their only non-empty format specs are the bare-quoted
-/// GPM-expression kind [`format_field`] intercepts before this is
-/// ever reached, so `dispfmt` is always empty in practice for this
-/// consumer. A non-empty spec is returned unchanged rather than
-/// attempting a real Python format-mini-language reimplementation,
-/// disclosed here rather than silently pretending full fidelity.
-fn apply_display_format(val: &str, fmt: &str) -> String {
-    if fmt.is_empty() || val.is_empty() {
-        return val.to_string();
-    }
-    val.to_string()
-}
-
-/// Port of `TemplateFormatter.format_field`.
-fn format_field(val: &str, fmt: &str, values: &CoverValueSource) -> Result<String, String> {
-    let (fmt, prefix, suffix) = explode_format_string(fmt);
-
-    let mut val = val.to_string();
-    let mut dispfmt = fmt.to_string();
-
-    let p = if fmt.starts_with('\'') {
-        Some(0usize)
-    } else {
-        fmt.find(":'").map(|i| i + 1)
-    };
-    if let Some(p) = p {
-        if fmt.ends_with('\'') && fmt.len() > p + 1 {
-            let inner = &fmt[p + 1..fmt.len() - 1];
-            val = run_gpm(inner, &val, values)?;
-            dispfmt = match fmt[..p].find(':') {
-                None => String::new(),
-                Some(colon) => fmt[..colon].to_string(),
-            };
-        }
-        // else: malformed (starts with a quote-triggering pattern but
-        // doesn't end in a quote) -- falls through with dispfmt
-        // unchanged, matching upstream's own fallthrough to the
-        // old-style-call check (which this port doesn't implement
-        // either, see this section's own doc).
-    }
-    if !val.is_empty() {
-        val = apply_display_format(&val, &dispfmt);
-    }
-    if val.is_empty() {
-        return Ok(String::new());
-    }
-    Ok(format!("{prefix}{val}{suffix}"))
-}
-
-/// Port of `TemplateFormatter.evaluate`'s default (`vformat`) branch:
-/// `string.Formatter`-style `{field}`/`{field:format_spec}`
-/// substitution. `{{`/`}}` escape to literal braces. Every substituted
-/// field value comes back already escaped from [`CoverValueSource::get_value`]
-/// (matching `Formatter(SafeFormat).get_value`'s real override, and
-/// GPM's own `field()` builtin, which delegates to the identical
-/// method -- confirmed by reading `formatter_functions.py`'s real
-/// `BuiltinField.evaluate`, not assumed).
-///
-/// **Real, disclosed narrowing**: finds the format spec via the first
-/// top-level `}` after the field name rather than reproducing Python's
-/// full brace-nesting-aware `string.Formatter.parse` grammar (which
-/// also allows a nested replacement field *inside* a format spec, e.g.
-/// `{val:{width}}`). `covers.py`'s own real templates never nest
-/// braces this way.
-fn vformat(fmt: &str, values: &CoverValueSource) -> Result<String, String> {
-    let mut out = String::new();
-    let chars: Vec<char> = fmt.chars().collect();
-    let mut i = 0usize;
-    while i < chars.len() {
-        match chars[i] {
-            '{' if chars.get(i + 1) == Some(&'{') => {
-                out.push('{');
-                i += 2;
-            }
-            '}' if chars.get(i + 1) == Some(&'}') => {
-                out.push('}');
-                i += 2;
-            }
-            '{' => {
-                let start = i + 1;
-                let end = chars[start..].iter().position(|&c| c == '}').map(|p| start + p).unwrap_or(chars.len());
-                let field_spec: String = chars[start..end].iter().collect();
-                let (field_name, format_spec) = match field_spec.find(':') {
-                    Some(p) => (&field_spec[..p], &field_spec[p + 1..]),
-                    None => (field_spec.as_str(), ""),
-                };
-                // `get_value` already escapes (matching real
-                // `Formatter(SafeFormat).get_value`'s override, which
-                // both `vformat`'s own field substitution AND GPM's
-                // `field()` builtin delegate to identically) -- no
-                // separate escape step here.
-                let val = values.get_value(field_name).unwrap_or_default();
-                out.push_str(&format_field(&val, format_spec, values)?);
-                i = end + 1;
-            }
-            c => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// Port of `TemplateFormatter.evaluate`'s real dispatch (`program:` /
-/// default). `python:` templates are N/A -- no Python interpreter in
-/// this port.
-fn evaluate_template(fmt: &str, values: &CoverValueSource) -> Result<String, String> {
-    match fmt.strip_prefix("program:") {
-        Some(rest) => run_gpm(rest, "", values),
-        None => vformat(fmt, values),
-    }
-}
-
-/// Port of `Formatter.safe_format`: never fails, substituting
-/// `"Template error <message>"` on any real evaluation error (matching
-/// upstream's `error_value + ' ' + error_message(e)`, with
-/// `error_value` being the untranslated literal `"Template error"`).
+/// Thin wrappers around `calibre_utils::formatter::string_format`'s
+/// now-generic port of this same logic (issue #751 generalized it out
+/// of this module so `calibre_srv`'s save-to-disk route could reuse
+/// the `{field}` shorthand dialect against a `Cache`-backed
+/// `ValueSource` too) -- kept here under their original names/2-arg
+/// signatures so every existing call site and test in this module
+/// (which all pass `&CoverValueSource` and never need a non-`Pure`
+/// catalog/registry) needs no changes.
 fn safe_format(fmt: &str, values: &CoverValueSource) -> String {
-    match evaluate_template(fmt, values) {
-        Ok(s) => s,
-        Err(e) => format!("Template error {e}"),
-    }
+    calibre_utils::formatter::string_format::safe_format(fmt, values, &PureCatalog, &PureFunctions)
 }
 
 /// The 3 templates [`format_text`] evaluates, port of the relevant
@@ -1755,7 +1608,7 @@ mod tests {
             series: String::new(),
             formatted_series_index: String::new(),
         };
-        assert_eq!(vformat("{{{title}}}", &source).unwrap(), "{T}");
+        assert_eq!(calibre_utils::formatter::string_format::vformat("{{{title}}}", &source, &PureCatalog, &PureFunctions).unwrap(), "{T}");
     }
 
     #[test]

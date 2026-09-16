@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { addBook, addFormat, catalogDownloadUrl, checkLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, removeDataFile, removeFormat, renameCategoryItem, renameSavedSearch, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
+import { addBook, addFormat, catalogDownloadUrl, checkLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, removeDataFile, removeFormat, renameCategoryItem, renameSavedSearch, saveToDisk, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
 import type { BookSummary } from "./types";
 
 function bookStub(id: number): BookSummary {
@@ -499,5 +499,30 @@ describe("importOpml", () => {
 
     expect(fetchMock).toHaveBeenCalledWith("/opml/import", expect.objectContaining({ method: "POST", body: JSON.stringify({ opml: "<opml></opml>" }) }));
     expect(feeds).toEqual([{ title: "Feed One", feed_url: "https://example.com/feed1.xml" }]);
+  });
+});
+
+describe("saveToDisk", () => {
+  it("posts book ids, template, and destination and returns the per-book results", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ results: [{ book_id: 1, ok: true, paths: ["/dest/A/B.epub"] }] }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { results } = await saveToDisk([1], "{author_sort}/{title}", "/dest");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/save-to-disk/default",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ book_ids: [1], template: "{author_sort}/{title}", dest: "/dest" }) }),
+    );
+    expect(results).toEqual([{ book_id: 1, ok: true, paths: ["/dest/A/B.epub"] }]);
+  });
+
+  it("includes formats when provided", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ results: [] }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await saveToDisk([1], "{title}", "/dest", ["EPUB"]);
+
+    const [, init] = fetchMock.mock.calls[0];
+    expect(JSON.parse(init.body)).toEqual({ book_ids: [1], template: "{title}", dest: "/dest", formats: ["EPUB"] });
   });
 });
