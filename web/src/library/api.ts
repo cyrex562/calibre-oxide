@@ -214,6 +214,30 @@ export function catalogDownloadUrl(search: string): string {
   return `/catalog/generate${qs}`;
 }
 
+// Real, new route -- see crates/calibre_srv/src/news.rs's own doc for
+// why (fetching news/recipes is CLI/GUI-only in real upstream calibre,
+// never exposed over HTTP there). A real, generic RSS/Atom feed
+// reader, not a catalog of upstream's ~1077 hand-written per-site
+// recipes -- see that module's doc for the real scope.
+export interface NewsFetchStatus {
+  running: boolean;
+  ok?: boolean;
+  error?: string;
+  book_id?: number;
+}
+
+export function startNewsFetch(title: string, feeds: string[]): Promise<number> {
+  return jsonFetch<number>("/news/fetch", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title, feeds }),
+  });
+}
+
+export function getNewsFetchStatus(jobId: number): Promise<NewsFetchStatus> {
+  return jsonFetch<NewsFetchStatus>(`/news/status/${jobId}`);
+}
+
 // Unlike this file's other write endpoints, /fts/indexing's real
 // handler returns an empty 200 body (`Result<(), ServerError>` in
 // Rust), not `{}` -- jsonFetch's own unconditional `.json()` would

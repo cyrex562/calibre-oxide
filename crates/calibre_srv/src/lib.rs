@@ -178,6 +178,7 @@ pub mod legacy;
 pub mod library_broker;
 pub mod lists;
 pub mod mathjax;
+pub mod news;
 pub mod notes;
 pub mod opds;
 pub mod opts;
@@ -226,6 +227,9 @@ pub struct AppState {
     /// `conversion_jobs` for server-side format conversion -- see
     /// [`convert`]'s own doc.
     pub conversion_jobs: Arc<convert::ConversionJobRegistry>,
+    /// `news_jobs` for real news/recipe fetch-and-add-to-library jobs
+    /// -- see [`news`]'s own doc.
+    pub news_jobs: Arc<news::NewsJobRegistry>,
 }
 
 impl AppState {
@@ -278,6 +282,8 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/saved-search/delete/{name}", post(lists::delete_saved_search))
         .route("/saved-search/rename/{old_name}/{new_name}", post(lists::rename_saved_search))
         .route("/catalog/generate", get(catalog::generate))
+        .route("/news/fetch", post(news::fetch_news))
+        .route("/news/status/{job_id}", get(news::news_status).post(news::news_status))
         .route("/cdb/add-book/{job_id}/{add_duplicates}/{filename}/{library_id}", post(cdb::add_book))
         .route("/cdb/delete-books/{book_ids}/{library_id}", post(cdb::delete_books))
         .route("/cdb/delete-books/{book_ids}", post(cdb::delete_books_no_library))
@@ -390,6 +396,7 @@ mod tests {
             jobs: std::sync::Arc::new(jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
             render_jobs: std::sync::Arc::new(render_endpoints::RenderJobRegistry::new()),
             conversion_jobs: std::sync::Arc::new(convert::ConversionJobRegistry::new()),
+            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()),
         }
     }
 
@@ -415,6 +422,7 @@ mod tests {
             jobs: std::sync::Arc::new(jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
             render_jobs: std::sync::Arc::new(render_endpoints::RenderJobRegistry::new()),
             conversion_jobs: std::sync::Arc::new(convert::ConversionJobRegistry::new()),
+            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()),
         };
         let router = test_router(state);
         let (status, _) = get(&router, "/opds").await;
@@ -476,6 +484,7 @@ mod tests {
             jobs: std::sync::Arc::new(jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
             render_jobs: std::sync::Arc::new(render_endpoints::RenderJobRegistry::new()),
             conversion_jobs: std::sync::Arc::new(convert::ConversionJobRegistry::new()),
+            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()),
         };
         let router = test_router(state);
 

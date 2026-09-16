@@ -37,6 +37,7 @@ filetime = "0.2.26"
 # into the compiled binary at build time, so serving it doesn't depend
 # on the process's working directory at runtime.
 include_dir = "0.7"
+fontdb = "0.24"
 
 [dev-dependencies]
 zip = "0.6"

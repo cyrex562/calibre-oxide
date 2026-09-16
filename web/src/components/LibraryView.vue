@@ -2,7 +2,7 @@
 import { computed, ref, watch } from "vue";
 import CategoryBrowser from "./CategoryBrowser.vue";
 import BookDetailsPanel from "./BookDetailsPanel.vue";
-import { addBook, catalogDownloadUrl, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, renameSavedSearch, search, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary } from "../library/api";
+import { addBook, catalogDownloadUrl, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, renameSavedSearch, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
 import { isTauri, tauriInvoke } from "../tauri";
 import type { BookFieldChanges, BookSummary, FtsSnippet } from "../library/types";
@@ -135,6 +135,52 @@ function exportCatalog() {
   // Content-Disposition: attachment header (catalog.rs) makes the
   // browser download it natively.
   window.open(catalogDownloadUrl(activeQuery.value), "_blank");
+}
+
+// Fetch news/recipes -- a real, generic RSS/Atom feed reader (see
+// crates/calibre_srv/src/news.rs's own doc for why this isn't a
+// catalog of upstream's ~1077 hand-written per-site recipes).
+const newsOpen = ref(false);
+const newsTitle = ref("");
+const newsFeedUrls = ref("");
+const newsFetching = ref(false);
+const newsError = ref<string | null>(null);
+const newsDone = ref(false);
+
+function openNews() {
+  newsOpen.value = true;
+  newsError.value = null;
+  newsDone.value = false;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchNews() {
+  const feeds = newsFeedUrls.value.split("\n").map((u) => u.trim()).filter(Boolean);
+  if (feeds.length === 0) return;
+  newsFetching.value = true;
+  newsError.value = null;
+  newsDone.value = false;
+  try {
+    const jobId = await startNewsFetch(newsTitle.value.trim(), feeds);
+    for (;;) {
+      const status = await getNewsFetchStatus(jobId);
+      if (!status.running) {
+        if (!status.ok) throw new Error(status.error || "fetch failed");
+        break;
+      }
+      await sleep(1000);
+    }
+    newsDone.value = true;
+    cacheBust.value++;
+    await runSearch();
+  } catch (e) {
+    newsError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    newsFetching.value = false;
+  }
 }
 
 async function runSearch() {
@@ -456,6 +502,7 @@ async function addFolder() {
         </select>
         <button type="button" @click="openManage">Manage lists…</button>
         <button type="button" :title="activeQuery ? 'Export the current search results as a CSV catalog' : 'Export the whole library as a CSV catalog'" @click="exportCatalog">Export catalog…</button>
+        <button type="button" @click="openNews">Fetch news…</button>
       </template>
 
       <button type="button" :disabled="adding" @click="addInput?.click()">{{ adding ? "Adding…" : "Add Books…" }}</button>
@@ -593,6 +640,30 @@ async function addFolder() {
             <button type="submit">Add</button>
           </form>
         </section>
+      </div>
+    </div>
+
+    <div v-if="newsOpen" class="manage-backdrop" @click.self="newsOpen = false">
+      <div class="manage-panel news-panel">
+        <button class="manage-close" @click="newsOpen = false">✕</button>
+        <h3>Fetch news</h3>
+        <p class="news-hint">Enter one or more RSS/Atom feed URLs, one per line. This downloads the latest articles and adds the result as a new book.</p>
+        <form @submit.prevent="fetchNews">
+          <label class="news-field">
+            Title
+            <input v-model="newsTitle" placeholder="My Weekly" :disabled="newsFetching" />
+          </label>
+          <label class="news-field">
+            Feed URLs
+            <textarea v-model="newsFeedUrls" rows="4" placeholder="https://example.com/feed.xml" :disabled="newsFetching"></textarea>
+          </label>
+          <div class="bulk-actions">
+            <button type="submit" class="read" :disabled="newsFetching || !newsFeedUrls.trim()">{{ newsFetching ? "Fetching…" : "Fetch" }}</button>
+            <button type="button" :disabled="newsFetching" @click="newsOpen = false">Close</button>
+          </div>
+        </form>
+        <p v-if="newsDone" class="news-done">Added the fetched news as a new book.</p>
+        <p v-if="newsError" class="error">{{ newsError }}</p>
       </div>
     </div>
   </div>
@@ -877,5 +948,33 @@ async function addFolder() {
   padding: 0.35em 0.5em;
   border: 1px solid #ccc;
   border-radius: 4px;
+}
+.news-panel {
+  max-width: 480px;
+}
+.news-hint {
+  color: #666;
+  font-size: 0.9em;
+  margin: 0;
+}
+.news-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3em;
+  font-size: 0.85em;
+  color: #555;
+  margin-bottom: 0.75em;
+}
+.news-field input,
+.news-field textarea {
+  font: inherit;
+  padding: 0.35em 0.5em;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  resize: vertical;
+}
+.news-done {
+  color: #2a7f2a;
+  margin: 0.6em 0 0;
 }
 </style>

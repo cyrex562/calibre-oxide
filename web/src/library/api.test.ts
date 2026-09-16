@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { addBook, addFormat, catalogDownloadUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchConversionBookData, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, removeFormat, renameSavedSearch, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, startConversion } from "./api";
+import { addBook, addFormat, catalogDownloadUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchConversionBookData, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, removeFormat, renameSavedSearch, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, startConversion, startNewsFetch } from "./api";
 import type { BookSummary } from "./types";
 
 function bookStub(id: number): BookSummary {
@@ -339,5 +339,30 @@ describe("catalogDownloadUrl", () => {
 
   it("scopes to a search query when given one", () => {
     expect(catalogDownloadUrl("tags:scifi")).toBe("/catalog/generate?search=tags%3Ascifi");
+  });
+});
+
+describe("startNewsFetch", () => {
+  it("posts the title and feed list, returning the bare job id", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => 7 });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const jobId = await startNewsFetch("My Weekly", ["http://example.com/feed.xml"]);
+    expect(jobId).toBe(7);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/news/fetch");
+    expect(JSON.parse(init.body)).toEqual({ title: "My Weekly", feeds: ["http://example.com/feed.xml"] });
+  });
+});
+
+describe("getNewsFetchStatus", () => {
+  it("fetches the real status endpoint", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ running: false, ok: true, book_id: 5 }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const status = await getNewsFetchStatus(7);
+    expect(status.ok).toBe(true);
+    expect(status.book_id).toBe(5);
+    expect(fetchMock.mock.calls[0][0]).toBe("/news/status/7");
   });
 });

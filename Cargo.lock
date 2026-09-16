@@ -930,6 +930,7 @@ dependencies = [
  "chrono",
  "clap",
  "filetime",
+ "fontdb",
  "futures-util",
  "hostname",
  "include_dir",
