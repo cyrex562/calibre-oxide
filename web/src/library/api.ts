@@ -97,7 +97,7 @@ export async function deleteBooks(ids: number[]): Promise<void> {
   await jsonFetch(`/cdb/delete-books/${ids.join(",")}`, { method: "POST" });
 }
 
-function fileToDataUrl(file: File): Promise<string> {
+export function fileToDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(reader.result as string);
