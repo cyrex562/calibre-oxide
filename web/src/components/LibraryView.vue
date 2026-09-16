@@ -4,6 +4,7 @@ import CategoryBrowser from "./CategoryBrowser.vue";
 import BookDetailsPanel from "./BookDetailsPanel.vue";
 import { addBook, fetchBooks, fetchFieldMetadata, fetchVirtualLibraries, ftsSearch, ftsSnippets, search, setFields, setFtsEnabled } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
+import { isTauri, tauriInvoke } from "../tauri";
 import type { BookFieldChanges, BookSummary, FtsSnippet } from "../library/types";
 
 const PAGE_SIZE = 24;
@@ -263,31 +264,72 @@ async function runBulkEdit() {
   await runSearch();
 }
 
-async function addBookFile(file: File, addDuplicates: boolean): Promise<void> {
+const addSummary = ref<string | null>(null);
+
+async function addOneBookFile(file: File, addDuplicates: boolean): Promise<"added" | "skipped"> {
   const result = await addBook(file, addDuplicates);
   if (result.duplicates && result.duplicates.length > 0 && result.book_id === undefined) {
     const names = result.duplicates.map((d) => `${d.title} (${d.authors.join(" & ")})`).join(", ");
-    if (confirm(`A book with the same title/author already exists: ${names}. Add anyway?`)) {
-      await addBookFile(file, true);
+    if (confirm(`"${file.name}": a book with the same title/author already exists: ${names}. Add anyway?`)) {
+      return addOneBookFile(file, true);
     }
-    return;
+    return "skipped";
+  }
+  return "added";
+}
+
+async function onAddFileSelected(e: Event) {
+  const input = e.target as HTMLInputElement;
+  const files = Array.from(input.files ?? []);
+  if (files.length === 0) return;
+  adding.value = true;
+  addError.value = null;
+  addSummary.value = null;
+  const errors: string[] = [];
+  let added = 0;
+  let skipped = 0;
+  for (const file of files) {
+    try {
+      const outcome = await addOneBookFile(file, false);
+      if (outcome === "added") added++;
+      else skipped++;
+    } catch (err) {
+      errors.push(`${file.name}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  adding.value = false;
+  if (addInput.value) addInput.value.value = "";
+  if (errors.length > 0) addError.value = errors.join("; ");
+  if (files.length > 1) {
+    addSummary.value = `Added ${added} of ${files.length} book(s)${skipped ? `, ${skipped} skipped` : ""}${errors.length ? `, ${errors.length} failed` : ""}.`;
   }
   cacheBust.value++;
   await runSearch();
 }
 
-async function onAddFileSelected(e: Event) {
-  const file = (e.target as HTMLInputElement).files?.[0];
-  if (!file) return;
-  adding.value = true;
+interface AddFolderResult {
+  added: number;
+  duplicates: string[];
+  errors: string[];
+}
+
+const addingFolder = ref(false);
+
+async function addFolder() {
+  addingFolder.value = true;
   addError.value = null;
+  addSummary.value = null;
   try {
-    await addBookFile(file, false);
-  } catch (err) {
-    addError.value = err instanceof Error ? err.message : String(err);
+    const result = await tauriInvoke<AddFolderResult | null>("choose_folder_and_add_books");
+    if (!result) return; // dialog cancelled
+    addSummary.value = `Added ${result.added} book(s) from the folder${result.duplicates.length ? `, skipped ${result.duplicates.length} duplicate(s)` : ""}${result.errors.length ? `, ${result.errors.length} failed` : ""}.`;
+    if (result.errors.length > 0) addError.value = result.errors.join("; ");
+    cacheBust.value++;
+    await runSearch();
+  } catch (e) {
+    addError.value = e instanceof Error ? e.message : String(e);
   } finally {
-    adding.value = false;
-    if (addInput.value) addInput.value.value = "";
+    addingFolder.value = false;
   }
 }
 </script>
@@ -318,8 +360,9 @@ async function onAddFileSelected(e: Event) {
         </select>
       </template>
 
-      <button type="button" :disabled="adding" @click="addInput?.click()">{{ adding ? "Adding…" : "Add Book…" }}</button>
-      <input ref="addInput" type="file" class="hidden-file-input" @change="onAddFileSelected" />
+      <button type="button" :disabled="adding" @click="addInput?.click()">{{ adding ? "Adding…" : "Add Books…" }}</button>
+      <input ref="addInput" type="file" multiple class="hidden-file-input" @change="onAddFileSelected" />
+      <button v-if="isTauri()" type="button" :disabled="addingFolder" @click="addFolder">{{ addingFolder ? "Adding…" : "Add Folder…" }}</button>
 
       <template v-if="!ftsMode">
         <button type="button" :class="{ active: selectMode }" @click="toggleSelectMode">
@@ -352,6 +395,7 @@ async function onAddFileSelected(e: Event) {
     </div>
 
     <p v-if="addError" class="error add-error">{{ addError }}</p>
+    <p v-if="addSummary" class="status add-summary">{{ addSummary }}</p>
 
     <div class="body">
       <CategoryBrowser class="sidebar" @select="onCategorySelect" />
@@ -517,7 +561,8 @@ async function onAddFileSelected(e: Event) {
 .error {
   color: #b00020;
 }
-.add-error {
+.add-error,
+.add-summary {
   padding: 0 0.5em;
 }
 .hidden-file-input {

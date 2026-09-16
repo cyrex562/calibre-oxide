@@ -22,7 +22,7 @@ mod settings;
 
 use std::sync::Mutex;
 
-use tauri::{AppHandle, Manager, Url};
+use tauri::{AppHandle, Manager, State, Url};
 use tauri_plugin_dialog::DialogExt;
 
 #[tauri::command]
@@ -98,12 +98,92 @@ async fn choose_library(app: AppHandle) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Real extensions `calibre_ebooks::metadata::get_metadata`'s own
+/// dispatch table understands (`crates/calibre_ebooks/src/metadata/mod.rs`)
+/// -- sourced from that match arm list directly, not invented, so a
+/// folder-import scan only picks up files the add-book pipeline can
+/// actually read metadata from.
+const KNOWN_EBOOK_EXTENSIONS: &[&str] = &[
+    "epub", "mobi", "prc", "azw", "azw3", "fb2", "lit", "pdf", "rb", "imp", "lrf", "lrx", "azw4", "chm", "docx", "odt", "snb", "pdb", "updb", "txt", "rtf", "html", "htm", "xhtml", "zip", "cbz", "rar", "cbr",
+];
+
+fn simple_job_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    format!("app-add-folder-{now}-{n}")
+}
+
+#[derive(serde::Serialize, Default)]
+struct AddFolderResult {
+    added: u32,
+    duplicates: Vec<String>,
+    errors: Vec<String>,
+}
+
+/// Real folder-import counterpart to `web/`'s own per-file `addBook()`
+/// (`web/src/library/api.ts`) -- a plain browser file input can't read
+/// an arbitrary folder's worth of files by path, so this drives the
+/// same `/cdb/add-book` endpoint directly from the Tauri backend
+/// instead, which *can* pick a real folder (`tauri-plugin-dialog`) and
+/// read real files from it. Flat (non-recursive) scan for this first
+/// slice -- matches upstream `calibredb add`'s own default without
+/// `-r`, a real, disclosed narrowing rather than silently always
+/// recursing.
+#[tauri::command]
+async fn choose_folder_and_add_books(app: AppHandle, state: State<'_, ServerState>) -> Result<Option<AddFolderResult>, String> {
+    let (tx, mut rx) = tauri::async_runtime::channel(1);
+    app.dialog().file().pick_folder(move |result| {
+        let _ = tx.try_send(result);
+    });
+    let Some(Some(picked)) = rx.recv().await else {
+        return Ok(None);
+    };
+    let dir = picked.into_path().map_err(|e| e.to_string())?;
+
+    let port = state.0.lock().unwrap().as_ref().map(|(_, p)| *p).ok_or("no library is currently open")?;
+
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .map_err(|e| e.to_string())?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().and_then(|e| e.to_str()).map(|e| KNOWN_EBOOK_EXTENSIONS.contains(&e.to_lowercase().as_str())).unwrap_or(false))
+        .collect();
+    files.sort();
+
+    let client = reqwest::Client::new();
+    let mut result = AddFolderResult::default();
+    for path in files {
+        let filename = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                result.errors.push(format!("{filename}: {e}"));
+                continue;
+            }
+        };
+        let url = format!("http://127.0.0.1:{port}/cdb/add-book/{}/n/{}/-", simple_job_id(), urlencoding::encode(&filename));
+        match client.post(&url).body(bytes).send().await {
+            Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+                Ok(body) if body.get("book_id").is_some() => result.added += 1,
+                Ok(_) => result.duplicates.push(filename),
+                Err(e) => result.errors.push(format!("{filename}: {e}")),
+            },
+            Ok(resp) => result.errors.push(format!("{filename}: HTTP {}", resp.status())),
+            Err(e) => result.errors.push(format!("{filename}: {e}")),
+        }
+    }
+
+    Ok(Some(result))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(ServerState::default())
-        .invoke_handler(tauri::generate_handler![ping, get_persisted_library, choose_library])
+        .invoke_handler(tauri::generate_handler![ping, get_persisted_library, choose_library, choose_folder_and_add_books])
         .setup(|app| {
             // Auto-open the last library, if any, without waiting for
             // the frontend to ask -- real startup UX, not just a
