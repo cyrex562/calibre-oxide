@@ -4,7 +4,7 @@ import CategoryBrowser from "./CategoryBrowser.vue";
 import NoteEditor from "./NoteEditor.vue";
 import BookDetailsPanel from "./BookDetailsPanel.vue";
 import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
-import type { CheckLibraryResult, DuplicateBook, NewsSchedule, SaveToDiskResult } from "../library/api";
+import type { CheckLibraryResult, CustomRecipeOptions, DuplicateBook, NewsFeedInput, NewsSchedule, SaveToDiskResult } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
 import { isTauri, tauriInvoke } from "../tauri";
 import { DEFAULT_LIBRARY_PREFS, fetchProfile, LIBRARY_PREFS_PROFILE, type LibraryPrefs } from "../settings/api";
@@ -280,6 +280,8 @@ function exportCatalog() {
 const newsOpen = ref(false);
 const newsTitle = ref("");
 const newsFeedUrls = ref("");
+const newsOldestArticleDays = ref("");
+const newsMaxArticlesPerFeed = ref("");
 const newsFetching = ref(false);
 const newsError = ref<string | null>(null);
 const newsDone = ref(false);
@@ -309,7 +311,10 @@ function openNews() {
 }
 
 async function saveNewsSchedule() {
-  const feeds = newsFeedUrls.value.split("\n").map((u) => u.trim()).filter(Boolean);
+  // Real, disclosed narrowing: scheduled feeds (#764) only store plain
+  // URLs, not #765's {title, url} sections -- strip any "Title|" prefix
+  // rather than saving a broken literal URL.
+  const feeds = parseFeedLines(newsFeedUrls.value).map((f) => (typeof f === "string" ? f : f.url));
   const minutes = Number(scheduleIntervalMinutes.value);
   if (feeds.length === 0 || !Number.isFinite(minutes) || minutes < 1) return;
   schedulingBusy.value = true;
@@ -378,14 +383,34 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// A line may be a bare URL, or "Section Title|https://..." naming its
+// own real recipe section (#765) -- reuses the existing one-line-per-
+// feed textarea rather than a new per-row form for this first slice.
+function parseFeedLines(raw: string): NewsFeedInput[] {
+  return raw
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const pipe = line.indexOf("|");
+      if (pipe === -1) return line;
+      const title = line.slice(0, pipe).trim();
+      const url = line.slice(pipe + 1).trim();
+      return title && url ? { title, url } : line;
+    });
+}
+
 async function fetchNews() {
-  const feeds = newsFeedUrls.value.split("\n").map((u) => u.trim()).filter(Boolean);
+  const feeds = parseFeedLines(newsFeedUrls.value);
   if (feeds.length === 0) return;
   newsFetching.value = true;
   newsError.value = null;
   newsDone.value = false;
   try {
-    const jobId = await startNewsFetch(newsTitle.value.trim(), feeds);
+    const options: CustomRecipeOptions = {};
+    if (newsOldestArticleDays.value.trim()) options.oldestArticleDays = Number(newsOldestArticleDays.value);
+    if (newsMaxArticlesPerFeed.value.trim()) options.maxArticlesPerFeed = Number(newsMaxArticlesPerFeed.value);
+    const jobId = await startNewsFetch(newsTitle.value.trim(), feeds, options);
     for (;;) {
       const status = await getNewsFetchStatus(jobId);
       if (!status.running) {
@@ -1111,7 +1136,7 @@ async function switchToOther() {
       <div class="manage-panel news-panel">
         <button class="manage-close" @click="newsOpen = false">✕</button>
         <h3>Fetch news</h3>
-        <p class="news-hint">Enter one or more RSS/Atom feed URLs, one per line. This downloads the latest articles and adds the result as a new book.</p>
+        <p class="news-hint">Enter one or more RSS/Atom feed URLs, one per line. Prefix a line with "Section Title|" to name that feed's own section in a multi-section recipe. This downloads the latest articles and adds the result as a new book.</p>
         <form @submit.prevent="fetchNews">
           <label class="news-field">
             Title
@@ -1119,12 +1144,20 @@ async function switchToOther() {
           </label>
           <label class="news-field">
             Feed URLs
-            <textarea v-model="newsFeedUrls" rows="4" placeholder="https://example.com/feed.xml" :disabled="newsFetching"></textarea>
+            <textarea v-model="newsFeedUrls" rows="4" placeholder="https://example.com/feed.xml&#10;Tech News|https://example.com/tech.xml" :disabled="newsFetching"></textarea>
           </label>
           <div class="bulk-actions">
             <button type="button" :disabled="newsFetching || opmlImporting" @click="opmlInput?.click()">{{ opmlImporting ? "Importing…" : "Import OPML…" }}</button>
             <input ref="opmlInput" type="file" accept=".opml,.xml,text/x-opml,text/xml" class="hidden-file-input" @change="importOpmlFile" />
           </div>
+          <label class="news-field">
+            Oldest article (days)
+            <input v-model="newsOldestArticleDays" type="number" min="0" step="1" placeholder="7" :disabled="newsFetching" />
+          </label>
+          <label class="news-field">
+            Max articles per feed
+            <input v-model="newsMaxArticlesPerFeed" type="number" min="1" step="1" placeholder="100" :disabled="newsFetching" />
+          </label>
           <label class="news-field">
             Repeat every (minutes)
             <input v-model="scheduleIntervalMinutes" type="number" min="1" step="1" :disabled="schedulingBusy" />

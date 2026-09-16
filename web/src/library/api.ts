@@ -241,11 +241,28 @@ export interface NewsFetchStatus {
   book_id?: number;
 }
 
-export function startNewsFetch(title: string, feeds: string[]): Promise<number> {
+// A feed entry can be a bare URL string, or a real {title, url} object
+// naming its own section within the recipe -- see
+// crates/calibre_srv/src/news.rs's own FeedInput (issue #765).
+export type NewsFeedInput = string | { title: string; url: string };
+
+export interface CustomRecipeOptions {
+  /// RecipeConfig::oldest_article override, in days.
+  oldestArticleDays?: number;
+  /// RecipeConfig::max_articles_per_feed override.
+  maxArticlesPerFeed?: number;
+}
+
+export function startNewsFetch(title: string, feeds: NewsFeedInput[], options: CustomRecipeOptions = {}): Promise<number> {
   return jsonFetch<number>("/news/fetch", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ title, feeds }),
+    body: JSON.stringify({
+      title,
+      feeds,
+      ...(options.oldestArticleDays !== undefined ? { oldest_article_days: options.oldestArticleDays } : {}),
+      ...(options.maxArticlesPerFeed !== undefined ? { max_articles_per_feed: options.maxArticlesPerFeed } : {}),
+    }),
   });
 }
 

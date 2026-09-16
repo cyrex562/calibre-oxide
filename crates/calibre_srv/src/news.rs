@@ -110,12 +110,50 @@ impl NewsJobRegistry {
     }
 }
 
+/// One requested feed -- either a bare URL string (title defaults to
+/// the feed's own, matching `RecipeConfig::feeds`'s own `None`-title
+/// convention) or a real `{title, url}` object, for the real
+/// multi-section-feeds-with-per-section-titles config `RecipeConfig`
+/// already supports but the original `Vec<String>` shape this route
+/// started with had no way to ask for (issue #765).
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum FeedInput {
+    Url(String),
+    WithTitle { title: Option<String>, url: String },
+}
+
+impl FeedInput {
+    fn url(&self) -> &str {
+        match self {
+            FeedInput::Url(u) => u,
+            FeedInput::WithTitle { url, .. } => url,
+        }
+    }
+
+    fn into_pair(self) -> (Option<String>, String) {
+        match self {
+            FeedInput::Url(u) => (None, u),
+            FeedInput::WithTitle { title, url } => (title, url),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct FetchNewsBody {
     title: String,
-    /// Plain feed URLs -- titles default to each feed's own (matching
-    /// `RecipeConfig::feeds`'s own `None`-title convention).
-    feeds: Vec<String>,
+    feeds: Vec<FeedInput>,
+    /// Real `RecipeConfig::oldest_article` override, in days -- `None`
+    /// keeps the real upstream default (7.0). See issue #765: this
+    /// route's own prerequisite check found `RecipeConfig` already had
+    /// more real, wired fields than the original title+feeds-only body
+    /// exposed.
+    #[serde(default)]
+    oldest_article_days: Option<f64>,
+    /// Real `RecipeConfig::max_articles_per_feed` override -- `None`
+    /// keeps the real upstream default (100).
+    #[serde(default)]
+    max_articles_per_feed: Option<usize>,
 }
 
 /// Real-DNS-resolves `url`'s host and rejects it if the scheme isn't
@@ -145,8 +183,8 @@ pub async fn fetch_news(State(state): State<AppState>, Json(body): Json<FetchNew
     if body.feeds.is_empty() {
         return Err(ServerError::BadRequest("at least one feed URL is required".to_string()));
     }
-    for feed_url in &body.feeds {
-        if let Err(e) = validate_feed_url(feed_url).await {
+    for feed in &body.feeds {
+        if let Err(e) = validate_feed_url(feed.url()).await {
             return Err(ServerError::BadRequest(e));
         }
     }
@@ -159,13 +197,21 @@ pub async fn fetch_news(State(state): State<AppState>, Json(body): Json<FetchNew
     let job_id = {
         let output_dir = output_dir.clone();
         let output_epub = output_epub.clone();
-        let feeds = body.feeds.clone();
+        let feeds = body.feeds;
+        let oldest_article_days = body.oldest_article_days;
+        let max_articles_per_feed = body.max_articles_per_feed;
         let title_for_job = title.clone();
         state
             .jobs
             .start_job(move || async move {
                 let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                    let mut cfg = RecipeConfig { title: title_for_job, feeds: Some(feeds.into_iter().map(|u| (None, u)).collect()), ..Default::default() };
+                    let mut cfg = RecipeConfig { title: title_for_job, feeds: Some(feeds.into_iter().map(FeedInput::into_pair).collect()), ..Default::default() };
+                    if let Some(oldest) = oldest_article_days {
+                        cfg.oldest_article = oldest;
+                    }
+                    if let Some(max) = max_articles_per_feed {
+                        cfg.max_articles_per_feed = max;
+                    }
                     cfg.simultaneous_downloads = cfg.simultaneous_downloads.max(1);
                     let simultaneous_downloads = cfg.simultaneous_downloads;
                     let recipe = GenericRecipe(cfg);
@@ -375,6 +421,60 @@ mod tests {
 
         let (_, book) = get_json(&router, &format!("/ajax/book/{book_id}")).await;
         assert_eq!(book["title"], "My Weekly");
+    }
+
+    #[tokio::test]
+    async fn fetch_news_accepts_a_real_multi_section_feed_list_with_per_section_titles() {
+        // Real, new (#765): a feed entry can be a bare URL string
+        // (title defaults) OR a {title, url} object naming its own
+        // section -- both shapes in the same request, matching what a
+        // real multi-section custom recipe needs.
+        let mut routes = HashMap::new();
+        routes.insert("/feed1.xml", ("application/rss+xml", rss_feed()));
+        routes.insert("/feed2.xml", ("application/rss+xml", rss_feed()));
+        routes.insert("/article1", ("text/html", b"<html><body><p>Full text of article one.</p></body></html>".as_slice()));
+        let site = TestSite::start(routes);
+
+        let (_dir, router) = test_app();
+        let (status, job_id) = post_json(
+            &router,
+            "/news/fetch",
+            serde_json::json!({
+                "title": "My Digest",
+                "feeds": [
+                    site.url("/feed1.xml"),
+                    {"title": "Tech News", "url": site.url("/feed2.xml")},
+                ],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{job_id}");
+        let job_id = job_id.as_i64().unwrap();
+
+        let result = poll_until_done(&router, job_id).await;
+        assert_eq!(result["ok"], true, "{result}");
+        assert!(result["book_id"].as_i64().is_some());
+    }
+
+    #[tokio::test]
+    async fn fetch_news_accepts_real_oldest_article_and_max_articles_overrides() {
+        let mut routes = HashMap::new();
+        routes.insert("/feed.xml", ("application/rss+xml", rss_feed()));
+        routes.insert("/article1", ("text/html", b"<html><body><p>Full text of article one.</p></body></html>".as_slice()));
+        let site = TestSite::start(routes);
+
+        let (_dir, router) = test_app();
+        let (status, job_id) = post_json(
+            &router,
+            "/news/fetch",
+            serde_json::json!({"title": "My Weekly", "feeds": [site.url("/feed.xml")], "oldest_article_days": 30, "max_articles_per_feed": 1}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{job_id}");
+        let job_id = job_id.as_i64().unwrap();
+
+        let result = poll_until_done(&router, job_id).await;
+        assert_eq!(result["ok"], true, "{result}");
     }
 
     #[tokio::test]
