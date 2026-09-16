@@ -187,6 +187,7 @@ pub mod opts;
 pub mod reader_profiles;
 pub mod render_endpoints;
 pub mod share;
+pub mod template_tester;
 pub mod tweak;
 pub mod users;
 pub mod users_api;
@@ -295,6 +296,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/custom-columns", get(custom_columns::list))
         .route("/custom-columns/add", post(custom_columns::add))
         .route("/custom-columns/remove/{label}", post(custom_columns::remove))
+        .route("/template-tester/evaluate/{book_id}/{library_id}", post(template_tester::evaluate))
         .route("/tweak/open/{book_id}/{fmt}/{library_id}", post(tweak::open_session))
         .route("/tweak/file/{session_id}/{*name}", get(tweak::get_file).post(tweak::set_file))
         .route("/tweak/commit/{session_id}", post(tweak::commit))

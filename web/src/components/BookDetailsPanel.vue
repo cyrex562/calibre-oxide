@@ -2,7 +2,7 @@
 import { computed, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import TweakEditor from "./TweakEditor.vue";
-import { addFormat, deleteBooks, fetchBook, fetchBooks, fetchConversionBookData, fetchDataFiles, fetchFieldMetadata, getConversionStatus, removeDataFile, removeFormat, search, setCover, setFields, shareEmail, startConversion, uploadDataFile } from "../library/api";
+import { addFormat, deleteBooks, evaluateTemplate, fetchBook, fetchBooks, fetchConversionBookData, fetchDataFiles, fetchFieldMetadata, getConversionStatus, removeDataFile, removeFormat, search, setCover, setFields, shareEmail, startConversion, uploadDataFile } from "../library/api";
 import type { DataFileStat, SmtpRelayConfig } from "../library/api";
 import { categoryItemToQuery } from "../library/query";
 import type { BookFieldChanges, BookSummary, FieldMetaEntry } from "../library/types";
@@ -394,6 +394,30 @@ function openBookFromQuickView(id: number) {
   emit("open-book", id);
 }
 
+// Template tester (issue #763) -- evaluated against the currently-open
+// book, matching this component's own established modal-panel pattern
+// (Quick View, Send…, etc.) rather than a separate book-picker UI.
+const templateTesterOpen = ref(false);
+const templateInput = ref("field('title')");
+const templateRunning = ref(false);
+const templateResult = ref<string | null>(null);
+const templateError = ref<string | null>(null);
+
+async function runTemplateTest() {
+  templateRunning.value = true;
+  templateResult.value = null;
+  templateError.value = null;
+  try {
+    const r = await evaluateTemplate(props.bookId, templateInput.value);
+    if (r.ok) templateResult.value = r.result ?? "";
+    else templateError.value = r.error ?? "Unknown template error";
+  } catch (e) {
+    templateError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    templateRunning.value = false;
+  }
+}
+
 // Only formats the reader MVP (#499) actually round-trips through
 // render_book are offered a "Read" link -- other formats still get a
 // plain download link.
@@ -430,6 +454,9 @@ async function load(id: number) {
   shareOpen.value = false;
   quickViewOpen.value = false;
   quickViewGroups.value = [];
+  templateTesterOpen.value = false;
+  templateResult.value = null;
+  templateError.value = null;
   try {
     book.value = await fetchBook(id);
   } catch (e) {
@@ -494,7 +521,18 @@ const visibleCustomColumnValues = computed(() => {
           <button class="edit" @click="openShare">Send…</button>
           <button v-if="canTweak" class="edit" @click="tweakOpen = true">Tweak Book…</button>
           <button class="edit" @click="openQuickView">Quick View…</button>
+          <button class="edit" @click="templateTesterOpen = !templateTesterOpen">Test template…</button>
           <button class="delete" :disabled="deleting" @click="deleteBook">{{ deleting ? "Deleting…" : "Delete" }}</button>
+        </div>
+
+        <div v-if="templateTesterOpen" class="template-tester">
+          <p class="hint">Template Program Mode only (e.g. <code>field('title')</code>) -- the <code>{field}</code> shorthand isn't supported yet.</p>
+          <textarea v-model="templateInput" rows="2" spellcheck="false"></textarea>
+          <div class="template-tester-actions">
+            <button type="button" :disabled="templateRunning" @click="runTemplateTest">{{ templateRunning ? "Running…" : "Run" }}</button>
+          </div>
+          <p v-if="templateResult !== null" class="template-result">{{ templateResult || "(empty result)" }}</p>
+          <p v-if="templateError" class="error">{{ templateError }}</p>
         </div>
 
         <div v-if="quickViewOpen" class="quick-view">
@@ -810,6 +848,33 @@ const visibleCustomColumnValues = computed(() => {
 .hint {
   font-size: 0.85em;
   color: #888;
+}
+.template-tester {
+  border-top: 1px solid #eee;
+  padding-top: 0.75em;
+  margin-top: 0.5em;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5em;
+}
+.template-tester textarea {
+  font-family: ui-monospace, monospace;
+  font-size: 0.85em;
+  padding: 0.4em;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  resize: vertical;
+}
+.template-tester-actions {
+  display: flex;
+}
+.template-result {
+  font-family: ui-monospace, monospace;
+  font-size: 0.85em;
+  background: #f5f5f5;
+  padding: 0.4em 0.6em;
+  border-radius: 4px;
+  word-break: break-word;
 }
 .quick-view {
   border-top: 1px solid #eee;

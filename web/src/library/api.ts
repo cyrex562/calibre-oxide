@@ -334,3 +334,23 @@ export async function removeDataFile(bookId: number, relpath: string): Promise<R
   if (r.errors && r.errors[relpath]) throw new Error(r.errors[relpath]);
   return r.data_files;
 }
+
+// Real, new route -- see crates/calibre_srv/src/template_tester.rs's
+// own doc for why (real upstream's Template Tester dialog is Qt
+// GUI-only, never exposed over HTTP there) and for the real,
+// disclosed narrowing: only Template Program Mode syntax
+// (`field('title')`, an optional leading `program:` is stripped) is
+// accepted, not the `{field}` shorthand dialect.
+export interface TemplateEvalResult {
+  ok: boolean;
+  result?: string;
+  error?: string;
+}
+
+export function evaluateTemplate(bookId: number, template: string): Promise<TemplateEvalResult> {
+  return jsonFetch<TemplateEvalResult>(`/template-tester/evaluate/${bookId}/default`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ template }),
+  });
+}

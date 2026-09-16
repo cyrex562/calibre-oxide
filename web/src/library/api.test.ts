@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { addBook, addFormat, catalogDownloadUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchConversionBookData, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, removeDataFile, removeFormat, renameSavedSearch, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
+import { addBook, addFormat, catalogDownloadUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, removeDataFile, removeFormat, renameSavedSearch, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
 import type { BookSummary } from "./types";
 
 function bookStub(id: number): BookSummary {
@@ -427,5 +427,24 @@ describe("fetchDataFiles / uploadDataFile / removeDataFile", () => {
 
     expect(fetchMock).toHaveBeenCalledWith("/data-files/remove/7/default", expect.objectContaining({ method: "POST", body: JSON.stringify(["data/a.txt"]) }));
     expect(files).toEqual({});
+  });
+});
+
+describe("evaluateTemplate", () => {
+  it("posts the template and returns the server's real ok/result shape", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ ok: true, result: "My Title" }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await evaluateTemplate(7, "field('title')");
+
+    expect(fetchMock).toHaveBeenCalledWith("/template-tester/evaluate/7/default", expect.objectContaining({ method: "POST", body: JSON.stringify({ template: "field('title')" }) }));
+    expect(result).toEqual({ ok: true, result: "My Title" });
+  });
+
+  it("passes through a real ok:false/error result without throwing", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => ({ ok: false, error: "Interpreter: Unknown identifier 'nope' - line number 1" }) }));
+    const result = await evaluateTemplate(7, "nope");
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("Unknown identifier");
   });
 });
