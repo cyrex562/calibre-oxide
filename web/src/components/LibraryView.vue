@@ -2,8 +2,9 @@
 import { computed, ref, watch } from "vue";
 import CategoryBrowser from "./CategoryBrowser.vue";
 import BookDetailsPanel from "./BookDetailsPanel.vue";
-import { addBook, fetchBooks, fetchFieldMetadata, fetchVirtualLibraries, search } from "../library/api";
-import type { BookSummary } from "../library/types";
+import { addBook, fetchBooks, fetchFieldMetadata, fetchVirtualLibraries, ftsSearch, ftsSnippets, search, setFtsEnabled } from "../library/api";
+import { parseSnippetSegments } from "../library/snippets";
+import type { BookSummary, FtsSnippet } from "../library/types";
 
 const PAGE_SIZE = 24;
 
@@ -66,7 +67,94 @@ async function runSearch() {
   }
 }
 
-watch([activeQuery, sort, sortOrder, vl, offset], runSearch, { immediate: true });
+watch([activeQuery, sort, sortOrder, vl, offset], () => {
+  if (!ftsMode.value) void runSearch();
+}, { immediate: true });
+
+// Full-text search -- a separate result shape/backend (crates/calibre_srv/src/fts.rs)
+// from the metadata search above: no pagination/sort/vl, real
+// snippet/highlight text per match, and a real "not enabled yet" state
+// to surface instead of an empty result list.
+interface FtsDisplayResult {
+  bookId: number;
+  title: string;
+  authors: string;
+  formats: string[];
+  snippets: FtsSnippet[];
+}
+
+const ftsMode = ref(false);
+const ftsLoading = ref(false);
+const ftsError = ref<string | null>(null);
+const ftsNotEnabled = ref(false);
+const ftsEnabling = ref(false);
+const ftsIndexing = ref<{ left: number; total: number } | null>(null);
+const ftsResults = ref<FtsDisplayResult[]>([]);
+
+async function runFtsSearch() {
+  const query = activeQuery.value;
+  ftsError.value = null;
+  ftsNotEnabled.value = false;
+  ftsIndexing.value = null;
+  if (!query) {
+    ftsResults.value = [];
+    return;
+  }
+  ftsLoading.value = true;
+  try {
+    const outcome = await ftsSearch(query);
+    if (!outcome.enabled) {
+      ftsNotEnabled.value = true;
+      ftsResults.value = [];
+      return;
+    }
+    const { metadata, indexing_status, results } = outcome.result;
+    ftsIndexing.value = indexing_status;
+
+    const formatsByBook = new Map<number, string[]>();
+    for (const r of results) {
+      const list = formatsByBook.get(r.book_id) ?? [];
+      if (!list.includes(r.format)) list.push(r.format);
+      formatsByBook.set(r.book_id, list);
+    }
+    const bookIds = [...formatsByBook.keys()];
+    const snippetsByBook = await ftsSnippets(bookIds, query);
+
+    ftsResults.value = bookIds.map((bookId) => ({
+      bookId,
+      title: metadata[String(bookId)]?.title ?? `Book ${bookId}`,
+      authors: metadata[String(bookId)]?.authors ?? "",
+      formats: formatsByBook.get(bookId) ?? [],
+      snippets: snippetsByBook[String(bookId)] ?? [],
+    }));
+  } catch (e) {
+    ftsError.value = e instanceof Error ? e.message : String(e);
+    ftsResults.value = [];
+  } finally {
+    ftsLoading.value = false;
+  }
+}
+
+watch([activeQuery, ftsMode], () => {
+  if (ftsMode.value) void runFtsSearch();
+});
+
+async function enableFts() {
+  ftsEnabling.value = true;
+  ftsError.value = null;
+  try {
+    await setFtsEnabled(true);
+    await runFtsSearch();
+  } catch (e) {
+    ftsError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    ftsEnabling.value = false;
+  }
+}
+
+function snippetSegments(text: string) {
+  return parseSnippetSegments(text);
+}
 
 function submitSearch() {
   activeQuery.value = queryText.value;
@@ -88,12 +176,12 @@ function prevPage() {
 
 function onDetailsUpdated() {
   cacheBust.value++;
-  void runSearch();
+  void (ftsMode.value ? runFtsSearch() : runSearch());
 }
 
 function onDetailsDeleted() {
   selectedBookId.value = null;
-  void runSearch();
+  void (ftsMode.value ? runFtsSearch() : runSearch());
 }
 
 async function addBookFile(file: File, addDuplicates: boolean): Promise<void> {
@@ -129,21 +217,27 @@ async function onAddFileSelected(e: Event) {
   <div class="library">
     <header class="toolbar">
       <form class="search" @submit.prevent="submitSearch">
-        <input v-model="queryText" type="search" placeholder="Search…" />
+        <input v-model="queryText" type="search" :placeholder="ftsMode ? 'Search book contents…' : 'Search…'" />
         <button type="submit">Search</button>
       </form>
 
-      <select v-model="sort">
-        <option v-for="[key, label] in sortableFields" :key="key" :value="key">{{ label }}</option>
-      </select>
-      <select v-model="sortOrder">
-        <option value="asc">Ascending</option>
-        <option value="desc">Descending</option>
-      </select>
-      <select v-model="vl">
-        <option value="">All books</option>
-        <option v-for="name in Object.keys(virtualLibraries)" :key="name" :value="name">{{ name }}</option>
-      </select>
+      <button type="button" :class="{ active: ftsMode }" @click="ftsMode = !ftsMode">
+        {{ ftsMode ? "Full-text search" : "Metadata search" }}
+      </button>
+
+      <template v-if="!ftsMode">
+        <select v-model="sort">
+          <option v-for="[key, label] in sortableFields" :key="key" :value="key">{{ label }}</option>
+        </select>
+        <select v-model="sortOrder">
+          <option value="asc">Ascending</option>
+          <option value="desc">Descending</option>
+        </select>
+        <select v-model="vl">
+          <option value="">All books</option>
+          <option v-for="name in Object.keys(virtualLibraries)" :key="name" :value="name">{{ name }}</option>
+        </select>
+      </template>
 
       <button type="button" :disabled="adding" @click="addInput?.click()">{{ adding ? "Adding…" : "Add Book…" }}</button>
       <input ref="addInput" type="file" class="hidden-file-input" @change="onAddFileSelected" />
@@ -154,7 +248,41 @@ async function onAddFileSelected(e: Event) {
     <div class="body">
       <CategoryBrowser class="sidebar" @select="onCategorySelect" />
 
-      <main class="grid-area">
+      <main v-if="ftsMode" class="grid-area">
+        <p v-if="ftsError" class="error">{{ ftsError }}</p>
+        <div v-else-if="ftsNotEnabled" class="fts-enable">
+          <p>Full-text search is not enabled on this library yet.</p>
+          <button type="button" :disabled="ftsEnabling" @click="enableFts">
+            {{ ftsEnabling ? "Enabling…" : "Enable full-text search" }}
+          </button>
+        </div>
+        <template v-else>
+          <p v-if="ftsIndexing && ftsIndexing.left > 0" class="status fts-indexing">
+            Indexing… {{ ftsIndexing.left }} of {{ ftsIndexing.total }} remaining. Results may be incomplete until indexing finishes.
+          </p>
+          <p v-if="ftsLoading" class="status">Searching…</p>
+          <p v-else-if="activeQuery && ftsResults.length === 0" class="status">No matches found.</p>
+          <p v-else-if="!activeQuery" class="status">Enter a search to look through book contents.</p>
+
+          <ul class="fts-results">
+            <li v-for="r in ftsResults" :key="r.bookId" class="fts-result" @click="selectedBookId = r.bookId">
+              <div class="fts-result-header">
+                <span class="fts-result-title">{{ r.title }}</span>
+                <span class="fts-result-authors">{{ r.authors }}</span>
+                <span class="fts-result-formats">{{ r.formats.join(", ") }}</span>
+              </div>
+              <p v-for="(snippet, i) in r.snippets" :key="i" class="fts-snippet">
+                <template v-for="(seg, j) in snippetSegments(snippet.text)" :key="j">
+                  <mark v-if="seg.highlighted">{{ seg.text }}</mark>
+                  <template v-else>{{ seg.text }}</template>
+                </template>
+              </p>
+            </li>
+          </ul>
+        </template>
+      </main>
+
+      <main v-else class="grid-area">
         <p v-if="error" class="error">{{ error }}</p>
         <p v-else-if="loading" class="status">Loading…</p>
         <p v-else-if="books.length === 0" class="status">No books found.</p>
@@ -272,5 +400,64 @@ async function onAddFileSelected(e: Event) {
 }
 .hidden-file-input {
   display: none;
+}
+.toolbar button.active {
+  background: #2a6df4;
+  color: #fff;
+  border-color: #2a6df4;
+}
+.fts-enable {
+  padding: 1em;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6em;
+  align-items: flex-start;
+}
+.fts-indexing {
+  color: #a06a00;
+}
+.fts-results {
+  list-style: none;
+  margin: 0;
+  padding: 0.5em;
+  overflow: auto;
+  flex: 1;
+}
+.fts-result {
+  padding: 0.75em;
+  border-bottom: 1px solid #eee;
+  cursor: pointer;
+}
+.fts-result:hover {
+  background: #f7f7f7;
+}
+.fts-result-header {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6em;
+  flex-wrap: wrap;
+}
+.fts-result-title {
+  font-weight: 600;
+}
+.fts-result-authors {
+  color: #666;
+  font-size: 0.9em;
+}
+.fts-result-formats {
+  color: #999;
+  font-size: 0.8em;
+  text-transform: uppercase;
+  margin-left: auto;
+}
+.fts-snippet {
+  margin: 0.4em 0 0;
+  font-size: 0.9em;
+  color: #444;
+}
+.fts-snippet mark {
+  background: #fff3a0;
+  color: inherit;
+  padding: 0 0.1em;
 }
 </style>
