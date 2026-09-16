@@ -330,6 +330,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/data-files/get/{book_id}/{*relpath}", get(data_files::get))
         .route("/data-files/upload/{book_id}/{library_id}", post(data_files::upload))
         .route("/data-files/remove/{book_id}/{library_id}", post(data_files::remove))
+        .route("/data-files/list/{book_id}/{library_id}", get(data_files::list))
         .route("/reader-profiles/get-all", get(reader_profiles::get_all))
         .route("/reader-profiles/save", post(reader_profiles::save))
         .route("/mobile", get(legacy::mobile))

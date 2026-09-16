@@ -294,3 +294,43 @@ export async function setFtsEnabled(enabled: boolean): Promise<void> {
   });
   if (!resp.ok) throw new Error(`POST /fts/indexing failed: ${resp.status} ${resp.statusText}`);
 }
+
+// Real, new routes -- see crates/calibre_srv/src/data_files.rs's own
+// doc for why (extra files attached to a book outside its standard
+// formats, issue #418, with a real "list what's already attached"
+// route added for issue #757 -- upload/remove already returned this
+// as a side effect, but nothing could fetch it up front). No
+// no-library_id-segment variant exists for these routes (unlike
+// set-fields), so this app's own single-library convention ("default")
+// is used directly, matching reader/api.ts and library/notes.ts.
+const DATA_FILES_LIBRARY_ID = "default";
+
+export interface DataFileStat {
+  size: number;
+  mtime_ns: number;
+}
+
+export function fetchDataFiles(bookId: number): Promise<Record<string, DataFileStat>> {
+  return jsonFetch<{ data_files: Record<string, DataFileStat> }>(`/data-files/list/${bookId}/${DATA_FILES_LIBRARY_ID}`).then((r) => r.data_files);
+}
+
+export async function uploadDataFile(bookId: number, file: File): Promise<Record<string, DataFileStat>> {
+  const dataUrl = await fileToDataUrl(file);
+  const r = await jsonFetch<{ error: string; data_files: Record<string, DataFileStat> }>(`/data-files/upload/${bookId}/${DATA_FILES_LIBRARY_ID}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify([{ name: file.name, data_url: dataUrl }]),
+  });
+  if (r.error) throw new Error(r.error);
+  return r.data_files;
+}
+
+export async function removeDataFile(bookId: number, relpath: string): Promise<Record<string, DataFileStat>> {
+  const r = await jsonFetch<{ data_files: Record<string, DataFileStat>; errors?: Record<string, string> }>(`/data-files/remove/${bookId}/${DATA_FILES_LIBRARY_ID}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify([relpath]),
+  });
+  if (r.errors && r.errors[relpath]) throw new Error(r.errors[relpath]);
+  return r.data_files;
+}
