@@ -738,7 +738,7 @@ async function switchToOther() {
       </main>
     </div>
 
-    <BookDetailsPanel v-if="selectedBookId !== null" :book-id="selectedBookId" @close="selectedBookId = null" @updated="onDetailsUpdated" @deleted="onDetailsDeleted" />
+    <BookDetailsPanel v-if="selectedBookId !== null" :book-id="selectedBookId" @close="selectedBookId = null" @updated="onDetailsUpdated" @deleted="onDetailsDeleted" @open-book="selectedBookId = $event" />
     <NoteEditor v-if="noteTarget" :field="noteTarget.field" :item-name="noteTarget.itemName" @close="noteTarget = null" />
 
     <div v-if="manageOpen" class="manage-backdrop" @click.self="manageOpen = false">
