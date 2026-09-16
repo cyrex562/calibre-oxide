@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { useRouter } from "vue-router";
-import { addFormat, deleteBooks, fetchBook, removeFormat, setCover, setFields } from "../library/api";
+import { addFormat, deleteBooks, fetchBook, fetchConversionBookData, getConversionStatus, removeFormat, setCover, setFields, startConversion } from "../library/api";
 import type { BookFieldChanges, BookSummary } from "../library/types";
 
 const props = defineProps<{ bookId: number }>();
@@ -28,6 +28,68 @@ async function deleteBook() {
     deleteError.value = e instanceof Error ? e.message : String(e);
   } finally {
     deleting.value = false;
+  }
+}
+
+const convertOpen = ref(false);
+const convertLoadingFormats = ref(false);
+const convertInputFormats = ref<string[]>([]);
+const convertOutputFormats = ref<string[]>([]);
+const convertInputFmt = ref("");
+const convertOutputFmt = ref("");
+const converting = ref(false);
+const convertError = ref<string | null>(null);
+const convertDone = ref(false);
+
+async function openConvert() {
+  convertOpen.value = true;
+  convertDone.value = false;
+  convertError.value = null;
+  convertLoadingFormats.value = true;
+  try {
+    const data = await fetchConversionBookData(props.bookId);
+    convertInputFormats.value = data.input_formats;
+    convertOutputFormats.value = data.output_formats;
+    convertInputFmt.value = data.input_formats[0] ?? "";
+    // Default to a real format the book doesn't already have, so
+    // starting a conversion produces a genuinely new format rather
+    // than one already sitting in the format list.
+    convertOutputFmt.value = data.output_formats.find((f) => !data.input_formats.includes(f)) ?? data.output_formats[0] ?? "";
+  } catch (e) {
+    convertError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    convertLoadingFormats.value = false;
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function runConversion() {
+  if (!convertInputFmt.value || !convertOutputFmt.value) return;
+  converting.value = true;
+  convertError.value = null;
+  convertDone.value = false;
+  try {
+    const jobId = await startConversion(props.bookId, convertInputFmt.value, convertOutputFmt.value);
+    for (;;) {
+      const status = await getConversionStatus(jobId);
+      if (!status.running) {
+        if (!status.ok) {
+          throw new Error(status.traceback || "conversion failed");
+        }
+        break;
+      }
+      await sleep(700);
+    }
+    convertDone.value = true;
+    book.value = await fetchBook(props.bookId);
+    emit("updated");
+  } catch (e) {
+    convertError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    converting.value = false;
   }
 }
 
@@ -151,6 +213,7 @@ async function load(id: number) {
   error.value = null;
   book.value = null;
   editing.value = false;
+  convertOpen.value = false;
   try {
     book.value = await fetchBook(id);
   } catch (e) {
@@ -199,7 +262,34 @@ function read() {
           <button v-if="readableFormat" class="read" @click="read">Read ({{ readableFormat.toUpperCase() }})</button>
           <a v-for="[fmt, url] in formatLinks" :key="fmt" :href="url" class="download"> Download {{ fmt.toUpperCase() }} </a>
           <button class="edit" @click="startEditing">Edit metadata</button>
+          <button class="edit" @click="openConvert">Convert…</button>
           <button class="delete" :disabled="deleting" @click="deleteBook">{{ deleting ? "Deleting…" : "Delete" }}</button>
+        </div>
+
+        <div v-if="convertOpen" class="convert-panel">
+          <p v-if="convertLoadingFormats">Loading formats…</p>
+          <template v-else>
+            <div class="convert-row">
+              <label>
+                From
+                <select v-model="convertInputFmt" :disabled="converting">
+                  <option v-for="fmt in convertInputFormats" :key="fmt" :value="fmt">{{ fmt }}</option>
+                </select>
+              </label>
+              <label>
+                To
+                <select v-model="convertOutputFmt" :disabled="converting">
+                  <option v-for="fmt in convertOutputFormats" :key="fmt" :value="fmt">{{ fmt }}</option>
+                </select>
+              </label>
+              <button type="button" class="read" :disabled="converting || !convertInputFmt || !convertOutputFmt" @click="runConversion">
+                {{ converting ? "Converting…" : "Start" }}
+              </button>
+              <button type="button" :disabled="converting" @click="convertOpen = false">Close</button>
+            </div>
+            <p v-if="convertDone" class="convert-done">Converted to {{ convertOutputFmt }} -- format added to this book.</p>
+          </template>
+          <p v-if="convertError" class="error">{{ convertError }}</p>
         </div>
       </template>
 
@@ -397,5 +487,34 @@ function read() {
 .format-chip-remove:disabled {
   opacity: 0.5;
   cursor: default;
+}
+.convert-panel {
+  margin-top: 1em;
+  padding: 0.9em;
+  background: #f7f7f7;
+  border-radius: 6px;
+}
+.convert-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.75em;
+  flex-wrap: wrap;
+}
+.convert-row label {
+  display: flex;
+  flex-direction: column;
+  font-size: 0.85em;
+  color: #555;
+  gap: 0.2em;
+}
+.convert-row select {
+  font: inherit;
+  padding: 0.35em 0.5em;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+}
+.convert-done {
+  color: #2a7f2a;
+  margin: 0.6em 0 0;
 }
 </style>

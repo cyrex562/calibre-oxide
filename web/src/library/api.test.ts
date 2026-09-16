@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { addBook, addFormat, deleteBooks, fetchBooks, removeFormat, setCover, setFields } from "./api";
+import { addBook, addFormat, deleteBooks, fetchBooks, fetchConversionBookData, getConversionStatus, removeFormat, setCover, setFields, startConversion } from "./api";
 import type { BookSummary } from "./types";
 
 function bookStub(id: number): BookSummary {
@@ -169,5 +169,42 @@ describe("removeFormat", () => {
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe("/cdb/set-fields/1");
     expect(JSON.parse(init.body)).toEqual({ changes: { removed_formats: ["pdf"] } });
+  });
+});
+
+describe("fetchConversionBookData", () => {
+  it("fetches the real book-data endpoint", async () => {
+    const responseBody = { book_id: 1, title: "T", authors: ["A"], input_formats: ["EPUB"], output_formats: ["EPUB", "MOBI"] };
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => responseBody });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const data = await fetchConversionBookData(1);
+    expect(data).toEqual(responseBody);
+    expect(fetchMock.mock.calls[0][0]).toBe("/conversion/book-data/1");
+  });
+});
+
+describe("startConversion", () => {
+  it("posts input/output formats and returns the bare job id", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => 42 });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const jobId = await startConversion(1, "EPUB", "MOBI");
+    expect(jobId).toBe(42);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/conversion/start/1");
+    expect(JSON.parse(init.body)).toEqual({ input_fmt: "EPUB", output_fmt: "MOBI" });
+  });
+});
+
+describe("getConversionStatus", () => {
+  it("fetches the real status endpoint", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ running: false, ok: true, size: 123, fmt: "mobi" }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const status = await getConversionStatus(42);
+    expect(status.running).toBe(false);
+    expect(status.ok).toBe(true);
+    expect(fetchMock.mock.calls[0][0]).toBe("/conversion/status/42");
   });
 });

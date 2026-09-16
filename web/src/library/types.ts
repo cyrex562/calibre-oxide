@@ -97,6 +97,34 @@ export interface AddBookResult {
   duplicates?: { title: string; authors: string[] }[];
 }
 
+// Real shapes from crates/calibre_srv/src/convert.rs. `book-data`'s
+// `input_formats`/`output_formats` entries are always upper-case
+// extensions (e.g. "EPUB"), matching what `/ajax/book`'s own `formats`
+// field would need `.toUpperCase()`-ing to compare against.
+export interface ConversionBookData {
+  book_id: number;
+  title: string;
+  authors: string[];
+  input_formats: string[];
+  output_formats: string[];
+}
+
+// `{running: true, percent, msg}` while in flight; once finished,
+// `running: false` plus `ok`/`was_aborted`/`traceback`/`log` and (only
+// when `ok`) `size`/`fmt`. Real upstream has no live percent/msg yet
+// (see convert.rs's own doc) -- always 0.0/"" while running.
+export interface ConversionStatus {
+  running: boolean;
+  percent?: number;
+  msg?: string;
+  ok?: boolean;
+  was_aborted?: boolean;
+  traceback?: string;
+  log?: string;
+  size?: number;
+  fmt?: string;
+}
+
 // Fields `POST /cdb/set-fields/{book_id}`'s `changes` object accepts
 // for this MVP's edit form -- see cdb.rs::value_to_field_string for
 // the full set the server understands (this is a subset).
