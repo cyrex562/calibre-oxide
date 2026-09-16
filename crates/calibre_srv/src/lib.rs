@@ -168,6 +168,7 @@ pub mod books;
 pub mod books_cache;
 pub mod catalog;
 pub mod cdb;
+pub mod check_library;
 pub mod content;
 pub mod convert;
 pub mod custom_columns;
@@ -297,6 +298,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/rename-category-item/{category}/{item_name}/{library_id}", post(rename::rename))
         .route("/news/status/{job_id}", get(news::news_status).post(news::news_status))
         .route("/share/email", post(share::share_email))
+        .route("/check-library/{library_id}", post(check_library::check))
         .route("/custom-columns", get(custom_columns::list))
         .route("/custom-columns/add", post(custom_columns::add))
         .route("/custom-columns/remove/{label}", post(custom_columns::remove))

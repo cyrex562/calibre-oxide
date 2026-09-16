@@ -3,7 +3,8 @@ import { computed, ref, watch } from "vue";
 import CategoryBrowser from "./CategoryBrowser.vue";
 import NoteEditor from "./NoteEditor.vue";
 import BookDetailsPanel from "./BookDetailsPanel.vue";
-import { addBook, addCustomColumn, catalogDownloadUrl, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, removeCustomColumn, renameSavedSearch, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
+import { addBook, addCustomColumn, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, removeCustomColumn, renameSavedSearch, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
+import type { CheckLibraryResult } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
 import { isTauri, tauriInvoke } from "../tauri";
 import { DEFAULT_LIBRARY_PREFS, fetchProfile, LIBRARY_PREFS_PROFILE, type LibraryPrefs } from "../settings/api";
@@ -200,6 +201,32 @@ function openColumns() {
   columnsError.value = null;
   columnsOpen.value = true;
   void loadCustomColumns();
+}
+
+// Check Library (issue #748) -- real integrity scan, see
+// crates/calibre_srv/src/check_library.rs's own doc.
+const checkLibraryOpen = ref(false);
+const checkLibraryLoading = ref(false);
+const checkLibraryError = ref<string | null>(null);
+const checkLibraryResult = ref<CheckLibraryResult | null>(null);
+
+const checkLibraryNonEmpty = computed(() => {
+  if (!checkLibraryResult.value) return [];
+  return Object.entries(checkLibraryResult.value).filter(([, findings]) => findings.length > 0);
+});
+
+async function openCheckLibrary() {
+  checkLibraryOpen.value = true;
+  checkLibraryError.value = null;
+  checkLibraryLoading.value = true;
+  checkLibraryResult.value = null;
+  try {
+    checkLibraryResult.value = await checkLibrary();
+  } catch (e) {
+    checkLibraryError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    checkLibraryLoading.value = false;
+  }
 }
 
 // Item notes (issue #732) -- see NoteEditor.vue's own doc.
@@ -707,6 +734,7 @@ async function switchToOther() {
         </select>
         <button type="button" @click="openManage">Manage lists…</button>
         <button type="button" @click="openColumns">Custom columns…</button>
+        <button type="button" @click="openCheckLibrary">Check library…</button>
         <button type="button" :title="activeQuery ? 'Export the current search results as a CSV catalog' : 'Export the whole library as a CSV catalog'" @click="exportCatalog">Export catalog…</button>
         <button type="button" @click="openNews">Fetch news…</button>
       </template>
@@ -879,6 +907,29 @@ async function switchToOther() {
             </select>
             <button type="submit">Add</button>
           </form>
+        </section>
+      </div>
+    </div>
+
+    <div v-if="checkLibraryOpen" class="manage-backdrop" @click.self="checkLibraryOpen = false">
+      <div class="manage-panel">
+        <button class="manage-close" @click="checkLibraryOpen = false">✕</button>
+        <section>
+          <h3>Check library</h3>
+          <p v-if="checkLibraryLoading">Scanning…</p>
+          <p v-else-if="checkLibraryError" class="error">{{ checkLibraryError }}</p>
+          <template v-else-if="checkLibraryResult">
+            <p v-if="checkLibraryNonEmpty.length === 0" class="news-hint">No problems found.</p>
+            <div v-for="[key, findings] in checkLibraryNonEmpty" :key="key">
+              <h4>{{ CHECK_LIBRARY_LABELS[key] ?? key }} ({{ findings.length }})</h4>
+              <ul class="manage-list">
+                <li v-for="(f, i) in findings" :key="i">
+                  <span class="manage-name">{{ f.a }}</span>
+                  <code class="manage-query">{{ f.b }}</code>
+                </li>
+              </ul>
+            </div>
+          </template>
         </section>
       </div>
     </div>

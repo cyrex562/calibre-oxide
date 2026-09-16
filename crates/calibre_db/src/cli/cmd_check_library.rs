@@ -29,7 +29,8 @@ impl CmdCheckLibrary {
         }
 
         let path = db.path();
-        let mut checker = crate::check_library::CheckLibrary::new(path.to_path_buf(), db);
+        let cache = db.as_cache();
+        let mut checker = crate::check_library::CheckLibrary::new(path.to_path_buf(), &cache);
         checker.scan_library(vec![], vec![]);
 
         let stdout = io::stdout();

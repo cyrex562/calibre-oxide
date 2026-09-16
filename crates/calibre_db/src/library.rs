@@ -300,8 +300,13 @@ impl Library {
     /// [`crate::cache::Cache`] (via `Backend`'s cheap `Clone` -- no
     /// second connection opened), for delegating to `Cache`-side
     /// functionality (real search, real custom columns) instead of
-    /// `Library` hand-rolling its own duplicate SQL.
-    fn as_cache(&self) -> crate::cache::Cache {
+    /// `Library` hand-rolling its own duplicate SQL. `pub` (issue
+    /// #748) so a real external caller that only has a `&Library` in
+    /// hand (e.g. `calibre_db::cli::cmd_check_library`, which keeps
+    /// its own `&Library` signature to match every other CLI command
+    /// in this crate) can still reach `Cache`-hosted functionality
+    /// like `check_library::CheckLibrary`.
+    pub fn as_cache(&self) -> crate::cache::Cache {
         crate::cache::Cache::from_backend(self.backend.clone())
     }
 

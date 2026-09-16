@@ -112,6 +112,7 @@
 //! ported vs. disclosed simplification in each.
 
 use crate::backend::Backend;
+use crate::book::Book;
 use crate::fields::FieldStore;
 use calibre_ebooks::metadata::MetaInformation;
 use calibre_utils::filenames::sanitize_file_name;
@@ -1368,6 +1369,73 @@ impl Cache {
             )
             .optional()?;
         Ok(has_cover.unwrap_or(0) != 0)
+    }
+
+    /// Ported from `Library::get_book`'s identical SQL (issue #748:
+    /// `check_library::CheckLibrary` was written against `Library`,
+    /// the pre-`Cache` API -- `Library` and `Cache` are sibling
+    /// structs, each independently owning their own `Backend`/
+    /// connection, not wrapper/wrapped like `legacy::LegacyDb` turned
+    /// out to be for #749, so this couldn't be a one-line delegation;
+    /// the real SQL had to move here too).
+    pub fn get_book(&self, id: i32) -> anyhow::Result<Option<Book>> {
+        let conn = self.backend.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, title, sort, timestamp, pubdate, series_index, author_sort, isbn, lccn, path, has_cover, uuid FROM books WHERE id = ?1")?;
+        let mut rows = stmt.query([id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(Book {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                sort: row.get(2)?,
+                timestamp: row.get(3)?,
+                pubdate: row.get(4)?,
+                series_index: row.get(5)?,
+                author_sort: row.get(6)?,
+                isbn: row.get(7)?,
+                lccn: row.get(8)?,
+                path: row.get(9)?,
+                has_cover: row.get::<_, i32>(10)? != 0,
+                uuid: row.get(11)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Ported from `Library::all_authors`'s identical SQL (issue #748,
+    /// see [`Cache::get_book`]'s own doc for why this moved here).
+    pub fn all_authors(&self) -> anyhow::Result<Vec<(i32, String)>> {
+        let conn = self.backend.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, name FROM authors")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut authors = Vec::new();
+        for row in rows {
+            authors.push(row?);
+        }
+        Ok(authors)
+    }
+
+    /// Ported from `Library::format_files`'s identical SQL (issue
+    /// #748, see [`Cache::get_book`]'s own doc for why this moved
+    /// here).
+    pub fn format_files(&self, book_id: i32) -> anyhow::Result<Vec<(String, String)>> {
+        let conn = self.backend.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT name, format FROM data WHERE book = ?1")?;
+        let rows = stmt.query_map([book_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut formats = Vec::new();
+        for row in rows {
+            formats.push(row?);
+        }
+        Ok(formats)
+    }
+
+    /// Ported from `Library::is_case_sensitive`'s identical stub
+    /// (issue #748, see [`Cache::get_book`]'s own doc for why this
+    /// moved here) -- real upstream detects the *filesystem's* real
+    /// case-sensitivity; neither this port's `Library` nor `Cache` has
+    /// ever done that real detection, both always report `false`.
+    pub fn is_case_sensitive(&self) -> bool {
+        false
     }
 
     /// Real generic field writer backing `legacy.rs`'s (#223) setter
