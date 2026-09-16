@@ -7,7 +7,7 @@ import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LI
 import type { CheckLibraryResult, CustomRecipeOptions, DuplicateBook, NewsFeedInput, NewsSchedule, SaveToDiskResult } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
 import { isTauri, tauriInvoke } from "../tauri";
-import { DEFAULT_LIBRARY_PREFS, fetchProfile, LIBRARY_PREFS_PROFILE, type LibraryPrefs } from "../settings/api";
+import { DEFAULT_LIBRARY_PREFS, DEFAULT_TOOLBAR_PREFS, fetchProfile, LIBRARY_PREFS_PROFILE, TOOLBAR_PREFS_PROFILE, type LibraryPrefs, type ToolbarActionId, type ToolbarPrefs } from "../settings/api";
 import type { BookFieldChanges, BookSummary, CustomColumnInfo, FtsSnippet } from "../library/types";
 
 // Real, persisted default (issue #721) -- overwritten by
@@ -97,6 +97,33 @@ async function loadLibraryPrefs() {
   }
 }
 void loadLibraryPrefs();
+
+// Real toolbar customization (#753) -- see settings/api.ts's own doc
+// for the action-registry design. Loaded once on mount, same pattern
+// as library prefs above; a settings-panel edit re-loads it here too
+// so a change is visible without a full page reload (the issue's own
+// definition of done only requires surviving a real reload, but this
+// is free given the existing fetchProfile-on-mount shape).
+const toolbarPrefs = ref<ToolbarPrefs>({ ...DEFAULT_TOOLBAR_PREFS });
+
+async function loadToolbarPrefs() {
+  try {
+    const prefs = await fetchProfile<ToolbarPrefs>(TOOLBAR_PREFS_PROFILE);
+    if (prefs) toolbarPrefs.value = { ...DEFAULT_TOOLBAR_PREFS, ...prefs };
+  } catch (e) {
+    console.error("failed to load toolbar preferences", e);
+  }
+}
+void loadToolbarPrefs();
+
+function toolbarActionVisible(id: ToolbarActionId): boolean {
+  return !toolbarPrefs.value.hidden.includes(id);
+}
+
+function toolbarActionOrder(id: ToolbarActionId): number | undefined {
+  const i = toolbarPrefs.value.order.indexOf(id);
+  return i === -1 ? undefined : i;
+}
 
 // Virtual library / saved search management -- real, new routes (see
 // crates/calibre_srv/src/lists.rs's own doc for why no upstream route
@@ -882,19 +909,19 @@ async function switchToOther() {
           <option value="" disabled selected>Saved searches…</option>
           <option v-for="[name, q] in Object.entries(savedSearches)" :key="name" :value="q">{{ name }}</option>
         </select>
-        <button type="button" @click="openManage">Manage lists…</button>
-        <button type="button" @click="openColumns">Custom columns…</button>
-        <button type="button" @click="openCheckLibrary">Check library…</button>
-        <button type="button" @click="openDuplicates">Find duplicates…</button>
-        <button type="button" :title="activeQuery ? 'Export the current search results as a CSV catalog' : 'Export the whole library as a CSV catalog'" @click="exportCatalog">Export catalog…</button>
-        <button type="button" title="Download the whole library (every book and its metadata) as a real .zip archive for backup or transfer" @click="exportLibraryArchive">Export library archive…</button>
-        <button type="button" @click="openNews">Fetch news…</button>
+        <button v-if="toolbarActionVisible('manage-lists')" type="button" :style="{ order: toolbarActionOrder('manage-lists') }" @click="openManage">Manage lists…</button>
+        <button v-if="toolbarActionVisible('custom-columns')" type="button" :style="{ order: toolbarActionOrder('custom-columns') }" @click="openColumns">Custom columns…</button>
+        <button v-if="toolbarActionVisible('check-library')" type="button" :style="{ order: toolbarActionOrder('check-library') }" @click="openCheckLibrary">Check library…</button>
+        <button v-if="toolbarActionVisible('find-duplicates')" type="button" :style="{ order: toolbarActionOrder('find-duplicates') }" @click="openDuplicates">Find duplicates…</button>
+        <button v-if="toolbarActionVisible('export-catalog')" type="button" :style="{ order: toolbarActionOrder('export-catalog') }" :title="activeQuery ? 'Export the current search results as a CSV catalog' : 'Export the whole library as a CSV catalog'" @click="exportCatalog">Export catalog…</button>
+        <button v-if="toolbarActionVisible('export-library-archive')" type="button" :style="{ order: toolbarActionOrder('export-library-archive') }" title="Download the whole library (every book and its metadata) as a real .zip archive for backup or transfer" @click="exportLibraryArchive">Export library archive…</button>
+        <button v-if="toolbarActionVisible('fetch-news')" type="button" :style="{ order: toolbarActionOrder('fetch-news') }" @click="openNews">Fetch news…</button>
       </template>
 
-      <button type="button" :disabled="adding" @click="addInput?.click()">{{ adding ? "Adding…" : "Add Books…" }}</button>
+      <button v-if="toolbarActionVisible('add-books')" type="button" :style="{ order: toolbarActionOrder('add-books') }" :disabled="adding" @click="addInput?.click()">{{ adding ? "Adding…" : "Add Books…" }}</button>
       <input ref="addInput" type="file" multiple class="hidden-file-input" @change="onAddFileSelected" />
-      <button v-if="isTauri()" type="button" :disabled="addingFolder" @click="addFolder">{{ addingFolder ? "Adding…" : "Add Folder…" }}</button>
-      <button v-if="isTauri()" type="button" @click="openSwitchLibrary">Switch library…</button>
+      <button v-if="isTauri() && toolbarActionVisible('add-folder')" type="button" :style="{ order: toolbarActionOrder('add-folder') }" :disabled="addingFolder" @click="addFolder">{{ addingFolder ? "Adding…" : "Add Folder…" }}</button>
+      <button v-if="isTauri() && toolbarActionVisible('switch-library')" type="button" :style="{ order: toolbarActionOrder('switch-library') }" @click="openSwitchLibrary">Switch library…</button>
       <router-link to="/settings" class="settings-link">Settings…</router-link>
 
       <template v-if="!ftsMode">

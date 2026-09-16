@@ -69,3 +69,42 @@ export const DEFAULT_KEYMAP: KeymapPrefs = { readerNext: "ArrowRight", readerPre
 export const KEYMAP_ACTION_LABELS: Record<KeymapAction, string> = { readerNext: "Reader: next page", readerPrev: "Reader: previous page" };
 
 export const KEYMAP_PROFILE = "keymap";
+
+// Toolbar customization (#753). Real prerequisite this issue's own
+// body called out: this port had no action-registry concept at all
+// before this -- "what actions exist" was implicit in each
+// component's own template. This registry is a real, deliberate first
+// slice: the LibraryView.vue header's self-contained, always-simple
+// action buttons (open a panel, trigger a one-shot fetch/export) --
+// not the context-dependent controls (sort fields, bulk-edit, select
+// mode) that only make sense with live state alongside them, and not
+// ReaderView.vue's own toolbar (a real, separable follow-up if this
+// slice proves out).
+export type ToolbarActionId = "manage-lists" | "custom-columns" | "check-library" | "find-duplicates" | "export-catalog" | "export-library-archive" | "fetch-news" | "add-books" | "add-folder" | "switch-library";
+
+export const TOOLBAR_ACTIONS: { id: ToolbarActionId; label: string }[] = [
+  { id: "manage-lists", label: "Manage lists…" },
+  { id: "custom-columns", label: "Custom columns…" },
+  { id: "check-library", label: "Check library…" },
+  { id: "find-duplicates", label: "Find duplicates…" },
+  { id: "export-catalog", label: "Export catalog…" },
+  { id: "export-library-archive", label: "Export library archive…" },
+  { id: "fetch-news", label: "Fetch news…" },
+  { id: "add-books", label: "Add Books…" },
+  { id: "add-folder", label: "Add Folder… (desktop app only)" },
+  { id: "switch-library", label: "Switch library… (desktop app only)" },
+];
+
+export interface ToolbarPrefs {
+  /// Action ids hidden from the toolbar.
+  hidden: ToolbarActionId[];
+  /// The full left-to-right display order (every `TOOLBAR_ACTIONS` id,
+  /// reordered), applied via each button's own CSS flex `order`
+  /// (index in this array). Empty means "keep each action's own
+  /// default template position."
+  order: ToolbarActionId[];
+}
+
+export const DEFAULT_TOOLBAR_PREFS: ToolbarPrefs = { hidden: [], order: [] };
+
+export const TOOLBAR_PREFS_PROFILE = "toolbar-prefs";
