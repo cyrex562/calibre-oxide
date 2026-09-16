@@ -354,3 +354,21 @@ export function evaluateTemplate(bookId: number, template: string): Promise<Temp
     body: JSON.stringify({ template }),
   });
 }
+
+// Real, new route -- see crates/calibre_srv/src/opml.rs's own doc for
+// why (no OPML support exists anywhere in this port otherwise). Pairs
+// with startNewsFetch above: parses a real OPML export into a flat
+// feed list the news-fetch panel can offer to add.
+export interface OpmlFeed {
+  title: string;
+  feed_url: string;
+}
+
+export async function importOpml(opml: string): Promise<OpmlFeed[]> {
+  const r = await jsonFetch<{ feeds: OpmlFeed[] }>("/opml/import", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ opml }),
+  });
+  return r.feeds;
+}
