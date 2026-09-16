@@ -170,6 +170,7 @@ pub mod catalog;
 pub mod cdb;
 pub mod content;
 pub mod convert;
+pub mod custom_columns;
 pub mod data_files;
 pub mod errors;
 pub mod fts;
@@ -287,6 +288,9 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/news/fetch", post(news::fetch_news))
         .route("/news/status/{job_id}", get(news::news_status).post(news::news_status))
         .route("/share/email", post(share::share_email))
+        .route("/custom-columns", get(custom_columns::list))
+        .route("/custom-columns/add", post(custom_columns::add))
+        .route("/custom-columns/remove/{label}", post(custom_columns::remove))
         .route("/cdb/add-book/{job_id}/{add_duplicates}/{filename}/{library_id}", post(cdb::add_book))
         .route("/cdb/delete-books/{book_ids}/{library_id}", post(cdb::delete_books))
         .route("/cdb/delete-books/{book_ids}", post(cdb::delete_books_no_library))

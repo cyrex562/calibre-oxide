@@ -2,11 +2,11 @@
 import { computed, ref, watch } from "vue";
 import CategoryBrowser from "./CategoryBrowser.vue";
 import BookDetailsPanel from "./BookDetailsPanel.vue";
-import { addBook, catalogDownloadUrl, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, renameSavedSearch, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
+import { addBook, addCustomColumn, catalogDownloadUrl, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, removeCustomColumn, renameSavedSearch, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
 import { isTauri, tauriInvoke } from "../tauri";
 import { DEFAULT_LIBRARY_PREFS, fetchProfile, LIBRARY_PREFS_PROFILE, type LibraryPrefs } from "../settings/api";
-import type { BookFieldChanges, BookSummary, FtsSnippet } from "../library/types";
+import type { BookFieldChanges, BookSummary, CustomColumnInfo, FtsSnippet } from "../library/types";
 
 // Real, persisted default (issue #721) -- overwritten by
 // loadLibraryPrefs() below once its fetch resolves; starts at the
@@ -141,6 +141,59 @@ async function renameSavedSearchPrompt(name: string) {
     await loadMetadata();
   } catch (e) {
     manageError.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
+// Custom column management -- real, new routes (see
+// crates/calibre_srv/src/custom_columns.rs's own doc for why no
+// upstream route exists to port here). `is_multiple` is left out of
+// the create form entirely: it's not a real working combination for
+// any datatype this backend supports yet (text/comments/series reject
+// it outright, and bool/int/float/rating silently ignore it -- see
+// that module's own doc) -- a real, disclosed narrowing rather than a
+// checkbox that would look like it works but doesn't.
+const columnsOpen = ref(false);
+const columnsError = ref<string | null>(null);
+const customColumns = ref<Record<string, CustomColumnInfo>>({});
+const newColumnLabel = ref("");
+const newColumnName = ref("");
+const newColumnDatatype = ref("text");
+
+async function loadCustomColumns() {
+  try {
+    customColumns.value = await fetchCustomColumns();
+  } catch (e) {
+    columnsError.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
+function openColumns() {
+  columnsError.value = null;
+  columnsOpen.value = true;
+  void loadCustomColumns();
+}
+
+async function createCustomColumn() {
+  if (!newColumnLabel.value.trim() || !newColumnName.value.trim()) return;
+  columnsError.value = null;
+  try {
+    await addCustomColumn(newColumnLabel.value.trim(), newColumnName.value.trim(), newColumnDatatype.value);
+    newColumnLabel.value = "";
+    newColumnName.value = "";
+    await loadCustomColumns();
+  } catch (e) {
+    columnsError.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
+async function removeCustomColumnClick(label: string) {
+  if (!confirm(`Delete the custom column "${label}"? Its stored values will be lost.`)) return;
+  columnsError.value = null;
+  try {
+    await removeCustomColumn(label);
+    await loadCustomColumns();
+  } catch (e) {
+    columnsError.value = e instanceof Error ? e.message : String(e);
   }
 }
 
@@ -574,6 +627,7 @@ async function switchToOther() {
           <option v-for="[name, q] in Object.entries(savedSearches)" :key="name" :value="q">{{ name }}</option>
         </select>
         <button type="button" @click="openManage">Manage lists…</button>
+        <button type="button" @click="openColumns">Custom columns…</button>
         <button type="button" :title="activeQuery ? 'Export the current search results as a CSV catalog' : 'Export the whole library as a CSV catalog'" @click="exportCatalog">Export catalog…</button>
         <button type="button" @click="openNews">Fetch news…</button>
       </template>
@@ -712,6 +766,37 @@ async function switchToOther() {
           <form class="manage-form" @submit.prevent="createSavedSearch">
             <input v-model="newSearchName" placeholder="Name" required />
             <input v-model="newSearchQuery" placeholder="Search query" required />
+            <button type="submit">Add</button>
+          </form>
+        </section>
+      </div>
+    </div>
+
+    <div v-if="columnsOpen" class="manage-backdrop" @click.self="columnsOpen = false">
+      <div class="manage-panel">
+        <button class="manage-close" @click="columnsOpen = false">✕</button>
+        <section>
+          <h3>Custom columns</h3>
+          <p v-if="columnsError" class="error">{{ columnsError }}</p>
+          <ul class="manage-list">
+            <li v-for="[label, col] in Object.entries(customColumns)" :key="label">
+              <span class="manage-name">{{ col.name }}</span>
+              <code class="manage-query">#{{ label }} ({{ col.datatype }})</code>
+              <button type="button" class="manage-remove" @click="removeCustomColumnClick(label)">Delete</button>
+            </li>
+            <li v-if="Object.keys(customColumns).length === 0">No custom columns yet.</li>
+          </ul>
+          <form class="manage-form" @submit.prevent="createCustomColumn">
+            <input v-model="newColumnLabel" placeholder="Label (e.g. shelf)" pattern="[a-zA-Z0-9_]+" title="Letters, numbers, and underscores only" required />
+            <input v-model="newColumnName" placeholder="Display name (e.g. Shelf)" required />
+            <select v-model="newColumnDatatype">
+              <option value="text">Text</option>
+              <option value="comments">Long text</option>
+              <option value="int">Integer</option>
+              <option value="float">Decimal number</option>
+              <option value="bool">Yes/No</option>
+              <option value="rating">Rating</option>
+            </select>
             <button type="submit">Add</button>
           </form>
         </section>

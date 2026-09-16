@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { useRouter } from "vue-router";
-import { addFormat, deleteBooks, fetchBook, fetchConversionBookData, getConversionStatus, removeFormat, setCover, setFields, shareEmail, startConversion } from "../library/api";
+import { addFormat, deleteBooks, fetchBook, fetchConversionBookData, fetchFieldMetadata, getConversionStatus, removeFormat, setCover, setFields, shareEmail, startConversion } from "../library/api";
 import type { SmtpRelayConfig } from "../library/api";
-import type { BookFieldChanges, BookSummary } from "../library/types";
+import type { BookFieldChanges, BookSummary, FieldMetaEntry } from "../library/types";
 
 const props = defineProps<{ bookId: number }>();
 const emit = defineEmits<{ close: []; updated: []; deleted: [bookId: number] }>();
@@ -158,6 +158,26 @@ const editTags = ref("");
 const editRating = ref(0);
 const coverInput = ref<HTMLInputElement | null>(null);
 
+// Custom columns (issue #720) -- discovered from /ajax/field-metadata
+// (real, already includes custom columns, see that route's own doc),
+// rendered/edited generically alongside the fixed fields above. `key`
+// is "#label" (field-metadata's own namespacing so a custom column
+// can't collide with a standard one); `label` is the bare name that
+// both the book row (Cache::get_data_as_dict) and set-fields'
+// `changes` object actually use.
+const customColumnFields = ref<FieldMetaEntry[]>([]);
+const editCustomValues = ref<Record<string, string>>({});
+
+async function loadCustomColumnFields() {
+  try {
+    const fm = await fetchFieldMetadata();
+    customColumnFields.value = Object.values(fm.field_metadata).filter((f) => f.is_custom);
+  } catch (e) {
+    console.error("failed to load custom column metadata", e);
+  }
+}
+void loadCustomColumnFields();
+
 function startEditing() {
   const b = book.value;
   if (!b) return;
@@ -167,6 +187,21 @@ function startEditing() {
   editSeriesIndex.value = b.series_index != null ? String(b.series_index) : "";
   editTags.value = (b.tags ?? []).join(", ");
   editRating.value = b.rating ?? 0;
+  editCustomValues.value = {};
+  for (const field of customColumnFields.value) {
+    const raw = b[field.label];
+    // `Cache::get_custom_column_value` reads a real bool column back
+    // as "0"/"1" (an integer column under the hood), never
+    // "true"/"false" -- normalize here so the checkbox's `checked`
+    // binding below (which only recognizes the literal "true") works
+    // for a value that actually came from the server, not just one
+    // this form itself just wrote.
+    if (field.datatype === "bool") {
+      editCustomValues.value[field.label] = raw === "1" || raw === "true" || raw === true ? "true" : "false";
+    } else {
+      editCustomValues.value[field.label] = raw == null ? "" : String(raw);
+    }
+  }
   saveError.value = null;
   editing.value = true;
 }
@@ -185,6 +220,10 @@ async function saveEdits() {
     if (editSeriesIndex.value.trim() !== "") {
       const idx = Number(editSeriesIndex.value);
       if (!Number.isNaN(idx)) changes.series_index = idx;
+    }
+    for (const field of customColumnFields.value) {
+      if (!field.is_editable) continue;
+      changes[field.label] = editCustomValues.value[field.label] ?? "";
     }
     book.value = await setFields(props.bookId, changes);
     editing.value = false;
@@ -291,6 +330,12 @@ function read() {
   if (!readableFormat.value) return;
   void router.push({ name: "read", params: { bookId: String(props.bookId), fmt: readableFormat.value } });
 }
+
+const visibleCustomColumnValues = computed(() => {
+  const b = book.value;
+  if (!b) return [];
+  return customColumnFields.value.map((f) => ({ field: f, value: b[f.label] })).filter((v) => v.value !== null && v.value !== undefined && v.value !== "");
+});
 </script>
 
 <template>
@@ -311,6 +356,12 @@ function read() {
         </div>
 
         <p v-if="(book.tags ?? []).length" class="tags">{{ (book.tags ?? []).join(", ") }}</p>
+        <dl v-if="visibleCustomColumnValues.length" class="custom-columns">
+          <template v-for="{ field, value } in visibleCustomColumnValues" :key="field.key">
+            <dt>{{ field.name ?? field.label }}</dt>
+            <dd>{{ field.datatype === "bool" ? (value === "1" || value === "true" ? "Yes" : "No") : value }}</dd>
+          </template>
+        </dl>
         <p v-if="deleteError" class="error">{{ deleteError }}</p>
 
         <div class="formats">
@@ -416,6 +467,20 @@ function read() {
             <label>Series index <input v-model="editSeriesIndex" type="number" step="0.1" /></label>
             <label>Tags <input v-model="editTags" placeholder="scifi, classic" /></label>
             <label>Rating <input v-model.number="editRating" type="number" min="0" max="5" step="1" /></label>
+            <template v-for="field in customColumnFields" :key="field.key">
+              <label v-if="field.is_editable && field.datatype === 'bool'" class="checkbox-field">
+                <input type="checkbox" :checked="editCustomValues[field.label] === 'true'" @change="editCustomValues[field.label] = ($event.target as HTMLInputElement).checked ? 'true' : 'false'" />
+                {{ field.name ?? field.label }}
+              </label>
+              <label v-else-if="field.is_editable && (field.datatype === 'int' || field.datatype === 'float' || field.datatype === 'rating')">
+                {{ field.name ?? field.label }}
+                <input v-model="editCustomValues[field.label]" type="number" :step="field.datatype === 'int' ? 1 : 0.1" />
+              </label>
+              <label v-else-if="field.is_editable">
+                {{ field.name ?? field.label }}
+                <input v-model="editCustomValues[field.label]" />
+              </label>
+            </template>
           </div>
         </div>
 
@@ -484,6 +549,19 @@ function read() {
 .tags {
   color: #888;
   font-size: 0.9em;
+}
+.custom-columns {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.2em 0.75em;
+  margin: 0.5em 0 0;
+  font-size: 0.9em;
+}
+.custom-columns dt {
+  color: #888;
+}
+.custom-columns dd {
+  margin: 0;
 }
 .formats {
   margin-top: 1em;
@@ -560,6 +638,11 @@ function read() {
   padding: 0.35em 0.5em;
   border: 1px solid #ccc;
   border-radius: 4px;
+}
+.checkbox-field {
+  flex-direction: row !important;
+  align-items: center;
+  gap: 0.4em !important;
 }
 .format-manager {
   margin-top: 1em;

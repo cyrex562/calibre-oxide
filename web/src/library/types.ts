@@ -74,10 +74,36 @@ export interface BooksInPage {
   book_ids: number[];
 }
 
+// One entry of `/ajax/field-metadata`'s `field_metadata` map -- real
+// shape from calibre_db::field_metadata::FieldInfo. Only the keys
+// this port's UI actually reads are named; the rest passes through.
+export interface FieldMetaEntry {
+  key: string; // bare name for standard fields, "#label" for custom ones
+  label: string; // unprefixed -- matches the book row's own key for that field
+  name: string | null;
+  datatype: string | null;
+  is_custom: boolean;
+  is_editable: boolean;
+  [key: string]: unknown;
+}
+
 export interface FieldMetadataResponse {
-  field_metadata: Record<string, unknown>;
+  field_metadata: Record<string, FieldMetaEntry>;
   // [key, display_label] pairs -- calibre_db::field_metadata::FieldMetadata::ui_sortable_field_keys.
   sortable_fields: [string, string][];
+}
+
+// One entry of `GET /custom-columns` -- real shape from
+// calibre_db::cache::Cache::custom_column_label_map.
+export interface CustomColumnInfo {
+  num: number;
+  label: string;
+  name: string;
+  datatype: string;
+  mark_for_delete: boolean;
+  editable: boolean;
+  is_multiple: boolean;
+  normalized: boolean;
 }
 
 // { name: query } -- calibre_db::cache::Cache::virtual_library_map.
@@ -162,4 +188,7 @@ export interface BookFieldChanges {
   // not plain metadata fields, but accepted in the same `changes` object.
   added_formats?: { ext: string; data_url: string }[];
   removed_formats?: string[];
+  // Custom column values, keyed by their bare label (calibre_db::cache::Cache::set_field's
+  // fallback dispatches any name matching a real custom_columns row -- see issue #720).
+  [key: string]: unknown;
 }
