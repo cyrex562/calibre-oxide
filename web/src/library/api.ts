@@ -122,11 +122,26 @@ export function fetchConversionBookData(bookId: number): Promise<ConversionBookD
   return jsonFetch<ConversionBookData>(`/conversion/book-data/${bookId}`);
 }
 
-export function startConversion(bookId: number, inputFmt: string, outputFmt: string): Promise<number> {
+// Real, fixed subset of the ~40 real upstream ConversionOptions fields
+// -- see crates/calibre_srv/src/convert.rs's own doc for why this is a
+// deliberate slice, not the full set. Omitted fields keep the real
+// upstream default server-side.
+export type ConversionOptionsOverride = {
+  unsmarten_punctuation?: boolean;
+  linearize_tables?: boolean;
+  insert_metadata?: boolean;
+  remove_first_image?: boolean;
+  use_auto_toc?: boolean;
+  chapter?: string;
+  max_toc_links?: number;
+  base_font_size?: number;
+};
+
+export function startConversion(bookId: number, inputFmt: string, outputFmt: string, options: ConversionOptionsOverride = {}): Promise<number> {
   return jsonFetch<number>(`/conversion/start/${bookId}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ input_fmt: inputFmt, output_fmt: outputFmt }),
+    body: JSON.stringify({ input_fmt: inputFmt, output_fmt: outputFmt, options }),
   });
 }
 

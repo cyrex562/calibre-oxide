@@ -29,15 +29,24 @@
 //!
 //! # Real, disclosed narrowing versus upstream
 //!
-//! - **No conversion options.** `Plumber::run` (issue #476) takes no
-//!   options at all -- upstream's `queue_job` merges per-book saved
-//!   option specifics, GUI recommendations, and profile settings into
-//!   a real `OptionRecommendation` list passed to its own `Plumber`.
-//!   This port accepts (and ignores) an `options` field in the start
-//!   request body for forward compatibility, but nothing is actually
-//!   applied. Wiring `calibre_conversion::config`'s already-real
-//!   option-recommendation registry into `Plumber` is real, separate,
-//!   disclosed follow-up work (#476's own disclosed gap).
+//! - **Partial conversion options (issue #755).** `Plumber::with_options`
+//!   already takes a real [`calibre_ebooks::conversion::options::ConversionOptions`]
+//!   and every transform stage genuinely reads it (confirmed by reading
+//!   `Plumber::run_transforms` directly -- this module's own earlier
+//!   doc comment claiming "`Plumber::run` takes no options at all" was
+//!   stale/wrong). What upstream's `queue_job` does that this port
+//!   doesn't is merge per-book saved option specifics, GUI
+//!   recommendations, and device-profile settings from a dynamic
+//!   `OptionRecommendation` registry (#126's own scope) -- this route
+//!   instead accepts a small, fixed, real subset of
+//!   [`ConversionOptions`]'s ~40 fields directly in the start request's
+//!   `options` object (see [`ConversionOptionsBody`]), covering the
+//!   most commonly-changed knobs (chapter detection, TOC generation,
+//!   punctuation/table normalization, jacket insertion, base font
+//!   size). Any field omitted from the request keeps
+//!   [`ConversionOptions::default`]'s real upstream default. Exposing
+//!   the rest of the ~40 fields is real, separable follow-up work, not
+//!   attempted here.
 //! - **No live progress percentage/message.** Upstream's `Plumber`
 //!   takes a `report_progress` callback writing `percent:msg|||` lines
 //!   to a status file this module's `conversion_status` tails.
@@ -140,14 +149,67 @@ async fn fetch_book_row(state: &AppState, book_id: i32) -> Result<Value, ServerE
     rows.into_iter().next().ok_or_else(|| ServerError::book_not_found(book_id, "default"))
 }
 
+/// A real, fixed subset of [`calibre_ebooks::conversion::options::ConversionOptions`]
+/// exposed to `POST /conversion/start` -- see this module's own doc for
+/// why this is a deliberate subset, not the full ~40-field set.
+/// `None` fields keep [`ConversionOptions::default`]'s real upstream
+/// value untouched.
+#[derive(Debug, Deserialize, Default)]
+pub struct ConversionOptionsBody {
+    #[serde(default)]
+    unsmarten_punctuation: Option<bool>,
+    #[serde(default)]
+    linearize_tables: Option<bool>,
+    #[serde(default)]
+    insert_metadata: Option<bool>,
+    #[serde(default)]
+    remove_first_image: Option<bool>,
+    #[serde(default)]
+    use_auto_toc: Option<bool>,
+    #[serde(default)]
+    chapter: Option<String>,
+    #[serde(default)]
+    max_toc_links: Option<usize>,
+    #[serde(default)]
+    base_font_size: Option<f64>,
+}
+
+impl ConversionOptionsBody {
+    fn apply(self, mut opts: calibre_ebooks::conversion::options::ConversionOptions) -> calibre_ebooks::conversion::options::ConversionOptions {
+        if let Some(v) = self.unsmarten_punctuation {
+            opts.unsmarten_punctuation = v;
+        }
+        if let Some(v) = self.linearize_tables {
+            opts.linearize_tables = v;
+        }
+        if let Some(v) = self.insert_metadata {
+            opts.insert_metadata = v;
+        }
+        if let Some(v) = self.remove_first_image {
+            opts.remove_first_image = v;
+        }
+        if let Some(v) = self.use_auto_toc {
+            opts.structure.use_auto_toc = v;
+        }
+        if let Some(v) = self.chapter {
+            opts.structure.chapter = Some(v);
+        }
+        if let Some(v) = self.max_toc_links {
+            opts.structure.max_toc_links = v;
+        }
+        if let Some(v) = self.base_font_size {
+            opts.base_font_size = v;
+        }
+        opts
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct StartConversionBody {
     input_fmt: String,
     output_fmt: String,
-    /// Accepted, not applied -- see this module's own doc.
     #[serde(default)]
-    #[allow(dead_code)]
-    options: Value,
+    options: ConversionOptionsBody,
 }
 
 /// `POST /conversion/start/{book_id}`. Port of `start_conversion`/
@@ -186,13 +248,15 @@ pub async fn start_conversion(State(state): State<AppState>, AxumPath(book_id): 
     tokio::fs::copy(&src_on_disk, &src_path).await.map_err(|e| ServerError::InternalServerError(e.to_string()))?;
     let output_path = tdir.join(format!("output.{output_fmt_lower}"));
 
+    let opts = body.options.apply(calibre_ebooks::conversion::options::ConversionOptions::default());
+
     let job_id = {
         let job_src = src_path.clone();
         let job_out = output_path.clone();
         state
             .jobs
             .start_job(move || async move {
-                let result = tokio::task::spawn_blocking(move || calibre_ebooks::conversion::plumber::Plumber::new(&job_src, &job_out).run()).await;
+                let result = tokio::task::spawn_blocking(move || calibre_ebooks::conversion::plumber::Plumber::with_options(&job_src, &job_out, opts).run()).await;
                 match result {
                     Ok(Ok(())) => Ok("ok".to_string()),
                     Ok(Err(e)) => Err(format!("{e:#}")),
@@ -403,6 +467,52 @@ mod tests {
         let (_status, data) = get_json(&router, &format!("/conversion/book-data/{book_id}")).await;
         let formats: Vec<String> = data["input_formats"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
         assert!(formats.contains(&"TXT".to_string()), "converted TXT format should now be listed: {formats:?}");
+    }
+
+    #[tokio::test]
+    async fn a_real_option_override_is_actually_applied_not_just_accepted() {
+        // Real regression test for #755: `unsmarten_punctuation` should
+        // replace the smart/curly right-single-quote (U+2019) in the
+        // source HTML with a plain ASCII apostrophe in the converted
+        // TXT output -- proving the option is genuinely threaded into
+        // `Plumber`, not silently ignored like the old `options: Value`
+        // field was.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        let book_id = add_test_epub(dir.path(), &cache, "Smart Quote Book", "It\u{2019}s a real test.");
+        let cache = std::sync::Arc::new(cache);
+        let state = crate::AppState {
+            libraries: None,
+            cache: cache.clone(),
+            opts: std::sync::Arc::new(crate::opts::ServerOptions::default()),
+            auth: None,
+            changes: crate::web_socket::new_change_broadcaster(),
+            reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()),
+            book_cache: std::sync::Arc::new(crate::books_cache::BookCache::open_temp()),
+            jobs: std::sync::Arc::new(crate::jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
+            render_jobs: std::sync::Arc::new(crate::render_endpoints::RenderJobRegistry::new()),
+            conversion_jobs: std::sync::Arc::new(crate::convert::ConversionJobRegistry::new()), news_jobs: std::sync::Arc::new(crate::news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()),
+        };
+        let router = crate::test_router(state);
+
+        let (status, job_id) = post_json(&router, &format!("/conversion/start/{book_id}"), serde_json::json!({"input_fmt": "epub", "output_fmt": "txt", "options": {"unsmarten_punctuation": true}})).await;
+        assert_eq!(status, StatusCode::OK);
+        let job_id = job_id.as_i64().unwrap();
+        let result = poll_until_done(&router, job_id).await;
+        assert_eq!(result["ok"], true, "{result}");
+
+        // Re-fetch the converted TXT file straight off disk via the
+        // book's own real format path (the route already added it via
+        // Cache::add_format), so the assertion checks the actual bytes
+        // written by Plumber, not just that the job reported success.
+        let txt_path: std::path::PathBuf = {
+            let rows = cache.get_data_as_dict(None, true, Some(&std::iter::once(book_id).collect()), false).unwrap();
+            let row = rows.into_iter().next().unwrap();
+            std::path::PathBuf::from(row["fmt_txt"].as_str().unwrap())
+        };
+        let content = std::fs::read_to_string(&txt_path).unwrap();
+        assert!(content.contains("It's a real test"), "expected unsmartened straight apostrophe, got: {content:?}");
+        assert!(!content.contains('\u{2019}'), "smart quote should have been replaced: {content:?}");
     }
 
     #[tokio::test]

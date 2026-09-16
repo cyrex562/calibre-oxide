@@ -3,7 +3,7 @@ import { computed, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import TweakEditor from "./TweakEditor.vue";
 import { addFormat, deleteBooks, evaluateTemplate, fetchBook, fetchBooks, fetchConversionBookData, fetchDataFiles, fetchFieldMetadata, getConversionStatus, removeDataFile, removeFormat, search, setCover, setFields, shareEmail, startConversion, uploadDataFile } from "../library/api";
-import type { DataFileStat, SmtpRelayConfig } from "../library/api";
+import type { ConversionOptionsOverride, DataFileStat, SmtpRelayConfig } from "../library/api";
 import { categoryItemToQuery } from "../library/query";
 import type { BookFieldChanges, BookSummary, FieldMetaEntry } from "../library/types";
 
@@ -44,11 +44,30 @@ const converting = ref(false);
 const convertError = ref<string | null>(null);
 const convertDone = ref(false);
 
+// A real, deliberate first-slice subset of upstream's ~40 conversion
+// options -- see crates/calibre_srv/src/convert.rs's own doc for why.
+const convertUnsmartenPunctuation = ref(false);
+const convertLinearizeTables = ref(false);
+const convertInsertMetadata = ref(false);
+const convertRemoveFirstImage = ref(false);
+const convertUseAutoToc = ref(false);
+const convertChapter = ref("");
+const convertMaxTocLinks = ref("");
+const convertBaseFontSize = ref("");
+
 async function openConvert() {
   convertOpen.value = true;
   convertDone.value = false;
   convertError.value = null;
   convertLoadingFormats.value = true;
+  convertUnsmartenPunctuation.value = false;
+  convertLinearizeTables.value = false;
+  convertInsertMetadata.value = false;
+  convertRemoveFirstImage.value = false;
+  convertUseAutoToc.value = false;
+  convertChapter.value = "";
+  convertMaxTocLinks.value = "";
+  convertBaseFontSize.value = "";
   try {
     const data = await fetchConversionBookData(props.bookId);
     convertInputFormats.value = data.input_formats;
@@ -75,7 +94,16 @@ async function runConversion() {
   convertError.value = null;
   convertDone.value = false;
   try {
-    const jobId = await startConversion(props.bookId, convertInputFmt.value, convertOutputFmt.value);
+    const options: ConversionOptionsOverride = {};
+    if (convertUnsmartenPunctuation.value) options.unsmarten_punctuation = true;
+    if (convertLinearizeTables.value) options.linearize_tables = true;
+    if (convertInsertMetadata.value) options.insert_metadata = true;
+    if (convertRemoveFirstImage.value) options.remove_first_image = true;
+    if (convertUseAutoToc.value) options.use_auto_toc = true;
+    if (convertChapter.value.trim()) options.chapter = convertChapter.value.trim();
+    if (convertMaxTocLinks.value.trim()) options.max_toc_links = Number(convertMaxTocLinks.value);
+    if (convertBaseFontSize.value.trim()) options.base_font_size = Number(convertBaseFontSize.value);
+    const jobId = await startConversion(props.bookId, convertInputFmt.value, convertOutputFmt.value, options);
     for (;;) {
       const status = await getConversionStatus(jobId);
       if (!status.running) {
@@ -569,6 +597,28 @@ const visibleCustomColumnValues = computed(() => {
               </button>
               <button type="button" :disabled="converting" @click="convertOpen = false">Close</button>
             </div>
+            <details class="convert-options">
+              <summary>Options</summary>
+              <div class="convert-options-grid">
+                <label><input type="checkbox" v-model="convertUnsmartenPunctuation" :disabled="converting" /> Convert smart quotes/dashes to plain ASCII</label>
+                <label><input type="checkbox" v-model="convertLinearizeTables" :disabled="converting" /> Linearize tables</label>
+                <label><input type="checkbox" v-model="convertInsertMetadata" :disabled="converting" /> Insert a metadata jacket page</label>
+                <label><input type="checkbox" v-model="convertRemoveFirstImage" :disabled="converting" /> Remove the first image (if it's a cover)</label>
+                <label><input type="checkbox" v-model="convertUseAutoToc" :disabled="converting" /> Force auto-generated table of contents</label>
+                <label class="convert-options-text">
+                  Chapter detection XPath
+                  <input type="text" v-model="convertChapter" :disabled="converting" placeholder="//h:h1 | //h:h2" />
+                </label>
+                <label class="convert-options-text">
+                  Max TOC links
+                  <input type="number" min="0" v-model="convertMaxTocLinks" :disabled="converting" />
+                </label>
+                <label class="convert-options-text">
+                  Base font size (pt)
+                  <input type="number" min="0" step="0.5" v-model="convertBaseFontSize" :disabled="converting" />
+                </label>
+              </div>
+            </details>
             <p v-if="convertDone" class="convert-done">Converted to {{ convertOutputFmt }} -- format added to this book.</p>
           </template>
           <p v-if="convertError" class="error">{{ convertError }}</p>
@@ -956,5 +1006,38 @@ const visibleCustomColumnValues = computed(() => {
 .convert-done {
   color: #2a7f2a;
   margin: 0.6em 0 0;
+}
+.convert-options {
+  margin-top: 0.6em;
+  font-size: 0.85em;
+}
+.convert-options summary {
+  cursor: pointer;
+  color: #555;
+}
+.convert-options-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4em;
+  margin-top: 0.5em;
+}
+.convert-options-grid label {
+  display: flex;
+  align-items: center;
+  gap: 0.4em;
+  color: #333;
+}
+.convert-options-text {
+  flex-direction: column !important;
+  align-items: flex-start !important;
+}
+.convert-options-text input[type="text"],
+.convert-options-text input[type="number"] {
+  font: inherit;
+  padding: 0.3em 0.45em;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  width: 100%;
+  max-width: 20em;
 }
 </style>
