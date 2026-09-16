@@ -2,12 +2,13 @@
 import { computed, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import TweakEditor from "./TweakEditor.vue";
-import { addFormat, deleteBooks, fetchBook, fetchConversionBookData, fetchDataFiles, fetchFieldMetadata, getConversionStatus, removeDataFile, removeFormat, setCover, setFields, shareEmail, startConversion, uploadDataFile } from "../library/api";
+import { addFormat, deleteBooks, fetchBook, fetchBooks, fetchConversionBookData, fetchDataFiles, fetchFieldMetadata, getConversionStatus, removeDataFile, removeFormat, search, setCover, setFields, shareEmail, startConversion, uploadDataFile } from "../library/api";
 import type { DataFileStat, SmtpRelayConfig } from "../library/api";
+import { categoryItemToQuery } from "../library/query";
 import type { BookFieldChanges, BookSummary, FieldMetaEntry } from "../library/types";
 
 const props = defineProps<{ bookId: number }>();
-const emit = defineEmits<{ close: []; updated: []; deleted: [bookId: number] }>();
+const emit = defineEmits<{ close: []; updated: []; deleted: [bookId: number]; "open-book": [bookId: number] }>();
 const router = useRouter();
 
 const book = ref<BookSummary | null>(null);
@@ -343,6 +344,56 @@ async function removeDataFileClick(relpath: string) {
   }
 }
 
+// Quick View (issue #758) -- confirmed while scoping the issue that
+// this needs no new backend at all: categoryItemToQuery + the
+// already-real /ajax/search route already produce exactly "every
+// other book sharing this author/tag/series" -- this is purely a
+// frontend composition over existing pieces.
+interface QuickViewGroup {
+  label: string;
+  books: BookSummary[];
+}
+
+const quickViewOpen = ref(false);
+const quickViewLoading = ref(false);
+const quickViewGroups = ref<QuickViewGroup[]>([]);
+
+async function loadQuickView() {
+  const b = book.value;
+  if (!b) return;
+  quickViewLoading.value = true;
+  saveError.value = null;
+  try {
+    const candidates: { category: string; label: string }[] = [
+      ...(b.authors ?? []).map((label) => ({ category: "authors", label })),
+      ...(b.tags ?? []).map((label) => ({ category: "tags", label })),
+      ...(b.series ? [{ category: "series", label: b.series }] : []),
+    ];
+    const groups: QuickViewGroup[] = [];
+    for (const { category, label } of candidates) {
+      const result = await search({ query: categoryItemToQuery(category, label), num: 6, offset: 0, sort: "title", sortOrder: "asc", vl: "" });
+      const otherIds = result.book_ids.filter((id) => id !== props.bookId);
+      if (otherIds.length === 0) continue;
+      groups.push({ label, books: await fetchBooks(otherIds) });
+    }
+    quickViewGroups.value = groups;
+  } catch (e) {
+    saveError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    quickViewLoading.value = false;
+  }
+}
+
+function openQuickView() {
+  quickViewOpen.value = true;
+  if (quickViewGroups.value.length === 0) void loadQuickView();
+}
+
+function openBookFromQuickView(id: number) {
+  quickViewOpen.value = false;
+  emit("open-book", id);
+}
+
 // Only formats the reader MVP (#499) actually round-trips through
 // render_book are offered a "Read" link -- other formats still get a
 // plain download link.
@@ -377,6 +428,8 @@ async function load(id: number) {
   editing.value = false;
   convertOpen.value = false;
   shareOpen.value = false;
+  quickViewOpen.value = false;
+  quickViewGroups.value = [];
   try {
     book.value = await fetchBook(id);
   } catch (e) {
@@ -440,7 +493,21 @@ const visibleCustomColumnValues = computed(() => {
           <button class="edit" @click="openConvert">Convert…</button>
           <button class="edit" @click="openShare">Send…</button>
           <button v-if="canTweak" class="edit" @click="tweakOpen = true">Tweak Book…</button>
+          <button class="edit" @click="openQuickView">Quick View…</button>
           <button class="delete" :disabled="deleting" @click="deleteBook">{{ deleting ? "Deleting…" : "Delete" }}</button>
+        </div>
+
+        <div v-if="quickViewOpen" class="quick-view">
+          <p v-if="quickViewLoading">Loading…</p>
+          <p v-else-if="quickViewGroups.length === 0" class="hint">No other books share this book's authors, tags, or series.</p>
+          <div v-for="group in quickViewGroups" :key="group.label" class="quick-view-group">
+            <h4>{{ group.label }}</h4>
+            <ul>
+              <li v-for="b in group.books" :key="b.id">
+                <button type="button" @click="openBookFromQuickView(b.id)">{{ b.title }}</button>
+              </li>
+            </ul>
+          </div>
         </div>
 
         <div v-if="convertOpen" class="convert-panel">
@@ -743,6 +810,36 @@ const visibleCustomColumnValues = computed(() => {
 .hint {
   font-size: 0.85em;
   color: #888;
+}
+.quick-view {
+  border-top: 1px solid #eee;
+  padding-top: 0.75em;
+  margin-top: 0.5em;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75em;
+}
+.quick-view-group h4 {
+  margin: 0 0 0.3em;
+  font-size: 0.85em;
+  color: #555;
+}
+.quick-view-group ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4em;
+}
+.quick-view-group button {
+  background: none;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  padding: 0.3em 0.6em;
+  font: inherit;
+  font-size: 0.85em;
+  cursor: pointer;
 }
 .format-chip {
   display: inline-flex;
