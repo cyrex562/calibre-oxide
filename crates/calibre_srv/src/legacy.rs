@@ -429,7 +429,7 @@ mod tests {
             book_cache: Arc::new(crate::books_cache::BookCache::open_temp()),
             jobs: Arc::new(crate::jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
             render_jobs: Arc::new(crate::render_endpoints::RenderJobRegistry::new()),
-            conversion_jobs: Arc::new(crate::convert::ConversionJobRegistry::new()),
+            conversion_jobs: Arc::new(crate::convert::ConversionJobRegistry::new()), news_jobs: Arc::new(crate::news::NewsJobRegistry::new()),
         };
         let router = crate::test_router(state.clone());
         (dir, state, router)
