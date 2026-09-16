@@ -436,3 +436,21 @@ export const CHECK_LIBRARY_LABELS: Record<string, string> = {
 export function checkLibrary(): Promise<CheckLibraryResult> {
   return jsonFetch<CheckLibraryResult>("/check-library/default", { method: "POST" });
 }
+
+// Real, new route -- see crates/calibre_srv/src/save_to_disk.rs's own
+// doc (real upstream's "Save to disk" is a Qt GUI action, never
+// exposed over HTTP there).
+export interface SaveToDiskResult {
+  book_id: number;
+  ok: boolean;
+  paths?: string[];
+  error?: string;
+}
+
+export function saveToDisk(bookIds: number[], template: string, dest: string, formats?: string[]): Promise<{ results: SaveToDiskResult[] }> {
+  return jsonFetch<{ results: SaveToDiskResult[] }>("/save-to-disk/default", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ book_ids: bookIds, template, dest, ...(formats ? { formats } : {}) }),
+  });
+}
