@@ -362,6 +362,21 @@ describe("startNewsFetch", () => {
     expect(url).toBe("/news/fetch");
     expect(JSON.parse(init.body)).toEqual({ title: "My Weekly", feeds: ["http://example.com/feed.xml"] });
   });
+
+  it("includes per-section feed titles and real recipe overrides when given", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => 8 });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await startNewsFetch("My Digest", [{ title: "Tech", url: "http://example.com/tech.xml" }, "http://example.com/plain.xml"], { oldestArticleDays: 30, maxArticlesPerFeed: 5 });
+
+    const [, init] = fetchMock.mock.calls[0];
+    expect(JSON.parse(init.body)).toEqual({
+      title: "My Digest",
+      feeds: [{ title: "Tech", url: "http://example.com/tech.xml" }, "http://example.com/plain.xml"],
+      oldest_article_days: 30,
+      max_articles_per_feed: 5,
+    });
+  });
 });
 
 describe("getNewsFetchStatus", () => {
