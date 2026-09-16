@@ -91,3 +91,8 @@ export async function setFields(bookId: number, changes: BookFieldChanges): Prom
 export async function setCover(bookId: number, file: File): Promise<void> {
   await jsonFetch(`/cdb/set-cover/${bookId}`, { method: "POST", body: file });
 }
+
+export async function deleteBooks(ids: number[]): Promise<void> {
+  if (ids.length === 0) return;
+  await jsonFetch(`/cdb/delete-books/${ids.join(",")}`, { method: "POST" });
+}

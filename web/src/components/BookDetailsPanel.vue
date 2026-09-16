@@ -1,16 +1,35 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { useRouter } from "vue-router";
-import { fetchBook, setCover, setFields } from "../library/api";
+import { deleteBooks, fetchBook, setCover, setFields } from "../library/api";
 import type { BookFieldChanges, BookSummary } from "../library/types";
 
 const props = defineProps<{ bookId: number }>();
-const emit = defineEmits<{ close: []; updated: [] }>();
+const emit = defineEmits<{ close: []; updated: []; deleted: [bookId: number] }>();
 const router = useRouter();
 
 const book = ref<BookSummary | null>(null);
 const loading = ref(true);
 const error = ref<string | null>(null);
+
+const deleting = ref(false);
+const deleteError = ref<string | null>(null);
+
+async function deleteBook() {
+  const b = book.value;
+  if (!b) return;
+  if (!confirm(`Delete "${b.title}"? This cannot be undone.`)) return;
+  deleting.value = true;
+  deleteError.value = null;
+  try {
+    await deleteBooks([props.bookId]);
+    emit("deleted", props.bookId);
+  } catch (e) {
+    deleteError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    deleting.value = false;
+  }
+}
 
 const editing = ref(false);
 const saving = ref(false);
@@ -141,11 +160,13 @@ function read() {
         </div>
 
         <p v-if="(book.tags ?? []).length" class="tags">{{ (book.tags ?? []).join(", ") }}</p>
+        <p v-if="deleteError" class="error">{{ deleteError }}</p>
 
         <div class="formats">
           <button v-if="readableFormat" class="read" @click="read">Read ({{ readableFormat.toUpperCase() }})</button>
           <a v-for="[fmt, url] in formatLinks" :key="fmt" :href="url" class="download"> Download {{ fmt.toUpperCase() }} </a>
           <button class="edit" @click="startEditing">Edit metadata</button>
+          <button class="delete" :disabled="deleting" @click="deleteBook">{{ deleting ? "Deleting…" : "Delete" }}</button>
         </div>
       </template>
 
@@ -252,6 +273,19 @@ function read() {
   padding: 0.5em 1em;
   border-radius: 4px;
   cursor: pointer;
+}
+.delete {
+  background: none;
+  border: 1px solid #d99;
+  color: #b00020;
+  padding: 0.5em 1em;
+  border-radius: 4px;
+  cursor: pointer;
+  margin-left: auto;
+}
+.delete:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 .edit-form .header {
   align-items: flex-start;
