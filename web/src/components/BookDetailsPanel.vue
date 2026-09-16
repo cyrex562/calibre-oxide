@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { useRouter } from "vue-router";
+import TweakEditor from "./TweakEditor.vue";
 import { addFormat, deleteBooks, fetchBook, fetchConversionBookData, fetchFieldMetadata, getConversionStatus, removeFormat, setCover, setFields, shareEmail, startConversion } from "../library/api";
 import type { SmtpRelayConfig } from "../library/api";
 import type { BookFieldChanges, BookSummary, FieldMetaEntry } from "../library/types";
@@ -292,6 +293,17 @@ const READABLE_FORMATS = ["epub", "kepub"];
 
 const readableFormat = computed(() => book.value?.formats.find((f) => READABLE_FORMATS.includes(f)) ?? null);
 
+// Tweak Book (issue #719) -- crates/calibre_srv/src/tweak.rs's own
+// scope is real-EPUB-container-only for this first slice, so the
+// action is only offered when the book actually has that format.
+const canTweak = computed(() => book.value?.formats.includes("epub") ?? false);
+const tweakOpen = ref(false);
+
+async function onTweakUpdated() {
+  book.value = await fetchBook(props.bookId);
+  emit("updated");
+}
+
 const formatLinks = computed<[string, string][]>(() => {
   const b = book.value;
   if (!b) return [];
@@ -370,6 +382,7 @@ const visibleCustomColumnValues = computed(() => {
           <button class="edit" @click="startEditing">Edit metadata</button>
           <button class="edit" @click="openConvert">Convert…</button>
           <button class="edit" @click="openShare">Send…</button>
+          <button v-if="canTweak" class="edit" @click="tweakOpen = true">Tweak Book…</button>
           <button class="delete" :disabled="deleting" @click="deleteBook">{{ deleting ? "Deleting…" : "Delete" }}</button>
         </div>
 
@@ -503,6 +516,7 @@ const visibleCustomColumnValues = computed(() => {
       </form>
     </div>
   </div>
+  <TweakEditor v-if="tweakOpen" :book-id="bookId" @close="tweakOpen = false" @updated="onTweakUpdated" />
 </template>
 
 <style scoped>

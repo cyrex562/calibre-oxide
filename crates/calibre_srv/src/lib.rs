@@ -187,6 +187,7 @@ pub mod opts;
 pub mod reader_profiles;
 pub mod render_endpoints;
 pub mod share;
+pub mod tweak;
 pub mod users;
 pub mod users_api;
 pub mod utils;
@@ -233,6 +234,9 @@ pub struct AppState {
     /// `news_jobs` for real news/recipe fetch-and-add-to-library jobs
     /// -- see [`news`]'s own doc.
     pub news_jobs: Arc<news::NewsJobRegistry>,
+    /// Open book-editing sessions for the `/tweak/*` routes -- see
+    /// [`tweak`]'s own doc.
+    pub tweak_sessions: Arc<tweak::TweakSessionRegistry>,
 }
 
 impl AppState {
@@ -291,6 +295,10 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/custom-columns", get(custom_columns::list))
         .route("/custom-columns/add", post(custom_columns::add))
         .route("/custom-columns/remove/{label}", post(custom_columns::remove))
+        .route("/tweak/open/{book_id}/{fmt}/{library_id}", post(tweak::open_session))
+        .route("/tweak/file/{session_id}/{*name}", get(tweak::get_file).post(tweak::set_file))
+        .route("/tweak/commit/{session_id}", post(tweak::commit))
+        .route("/tweak/discard/{session_id}", post(tweak::discard))
         .route("/cdb/add-book/{job_id}/{add_duplicates}/{filename}/{library_id}", post(cdb::add_book))
         .route("/cdb/delete-books/{book_ids}/{library_id}", post(cdb::delete_books))
         .route("/cdb/delete-books/{book_ids}", post(cdb::delete_books_no_library))
@@ -403,7 +411,7 @@ mod tests {
             jobs: std::sync::Arc::new(jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
             render_jobs: std::sync::Arc::new(render_endpoints::RenderJobRegistry::new()),
             conversion_jobs: std::sync::Arc::new(convert::ConversionJobRegistry::new()),
-            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()),
+            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()),
         }
     }
 
@@ -429,7 +437,7 @@ mod tests {
             jobs: std::sync::Arc::new(jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
             render_jobs: std::sync::Arc::new(render_endpoints::RenderJobRegistry::new()),
             conversion_jobs: std::sync::Arc::new(convert::ConversionJobRegistry::new()),
-            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()),
+            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()),
         };
         let router = test_router(state);
         let (status, _) = get(&router, "/opds").await;
@@ -491,7 +499,7 @@ mod tests {
             jobs: std::sync::Arc::new(jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
             render_jobs: std::sync::Arc::new(render_endpoints::RenderJobRegistry::new()),
             conversion_jobs: std::sync::Arc::new(convert::ConversionJobRegistry::new()),
-            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()),
+            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()),
         };
         let router = test_router(state);
 
