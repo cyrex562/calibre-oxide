@@ -65,7 +65,8 @@ pub(crate) fn effective_user(user: Option<Extension<AuthenticatedUser>>) -> Stri
 /// (matching upstream's own `which.split('_')` -- the docstring's
 /// comma-separated description in the original doesn't match its own
 /// code, so this follows the code).
-pub async fn get_last_read_position(State(state): State<AppState>, Path((_library_id, which)): Path<(String, String)>, user: Option<Extension<AuthenticatedUser>>) -> Result<Json<Value>, ServerError> {
+pub async fn get_last_read_position(State(state): State<AppState>, Path((library_id, which)): Path<(String, String)>, user: Option<Extension<AuthenticatedUser>>) -> Result<Json<Value>, ServerError> {
+    let cache = state.cache_for(Some(&library_id)).ok_or_else(|| ServerError::NotFound(format!("no library named {library_id:?}")))?;
     let user = effective_user(user);
     let mut ans = serde_json::Map::new();
     for item in which.split('_') {
@@ -75,7 +76,7 @@ pub async fn get_last_read_position(State(state): State<AppState>, Path((_librar
         };
         let key = format!("{book_id}:{fmt}");
         let positions = tokio::task::spawn_blocking({
-            let cache = state.cache.clone();
+            let cache = cache.clone();
             let fmt = fmt.to_string();
             let user = user.clone();
             move || cache.get_last_read_positions(book_id, &fmt, &user)
@@ -99,13 +100,14 @@ pub struct SetLastReadPositionBody {
 /// Port of `set_last_read_position`.
 pub async fn set_last_read_position(
     State(state): State<AppState>,
-    Path((_library_id, book_id, fmt)): Path<(String, i32, String)>,
+    Path((library_id, book_id, fmt)): Path<(String, i32, String)>,
     user: Option<Extension<AuthenticatedUser>>,
     Json(body): Json<SetLastReadPositionBody>,
 ) -> Result<(), ServerError> {
+    let cache = state.cache_for(Some(&library_id)).ok_or_else(|| ServerError::NotFound(format!("no library named {library_id:?}")))?;
     let user = effective_user(user);
     let title_exists = tokio::task::spawn_blocking({
-        let cache = state.cache.clone();
+        let cache = cache.clone();
         move || cache.field_for(book_id, "title")
     })
     .await
@@ -117,7 +119,7 @@ pub async fn set_last_read_position(
     }
 
     tokio::task::spawn_blocking({
-        let cache = state.cache.clone();
+        let cache = cache.clone();
         let cfi = body.cfi.clone();
         move || cache.set_last_read_position(book_id, &fmt, &user, &body.device, cfi.as_deref(), None, body.pos_frac)
     })
@@ -137,7 +139,8 @@ pub async fn set_last_read_position(
 /// with, but the real `user_type` value is still used for storage
 /// fidelity should a library ever be shared with a real calibre
 /// desktop install.
-pub async fn get_annotations(State(state): State<AppState>, Path((_library_id, which)): Path<(String, String)>, user: Option<Extension<AuthenticatedUser>>) -> Result<Json<Value>, ServerError> {
+pub async fn get_annotations(State(state): State<AppState>, Path((library_id, which)): Path<(String, String)>, user: Option<Extension<AuthenticatedUser>>) -> Result<Json<Value>, ServerError> {
+    let cache = state.cache_for(Some(&library_id)).ok_or_else(|| ServerError::NotFound(format!("no library named {library_id:?}")))?;
     let user = effective_user(user);
     let mut ans = serde_json::Map::new();
     for item in which.split('_') {
@@ -147,7 +150,7 @@ pub async fn get_annotations(State(state): State<AppState>, Path((_library_id, w
         };
         let key = format!("{book_id}:{fmt}");
         let (positions, annotations_map) = tokio::task::spawn_blocking({
-            let cache = state.cache.clone();
+            let cache = cache.clone();
             let fmt = fmt.to_string();
             let user = user.clone();
             move || -> anyhow::Result<(Vec<Value>, std::collections::HashMap<String, Vec<Value>>)> {
@@ -169,10 +172,11 @@ pub async fn get_annotations(State(state): State<AppState>, Path((_library_id, w
 /// annotation type -> list of annotations (matching upstream's own
 /// `amap.values()` flattening); every list is concatenated into one
 /// flat list before merging.
-pub async fn update_annotations(State(state): State<AppState>, Path((_library_id, book_id, fmt)): Path<(String, i32, String)>, user: Option<Extension<AuthenticatedUser>>, Json(amap): Json<serde_json::Map<String, Value>>) -> Result<(), ServerError> {
+pub async fn update_annotations(State(state): State<AppState>, Path((library_id, book_id, fmt)): Path<(String, i32, String)>, user: Option<Extension<AuthenticatedUser>>, Json(amap): Json<serde_json::Map<String, Value>>) -> Result<(), ServerError> {
+    let cache = state.cache_for(Some(&library_id)).ok_or_else(|| ServerError::NotFound(format!("no library named {library_id:?}")))?;
     let user = effective_user(user);
     let title_exists = tokio::task::spawn_blocking({
-        let cache = state.cache.clone();
+        let cache = cache.clone();
         move || cache.field_for(book_id, "title")
     })
     .await
@@ -186,7 +190,7 @@ pub async fn update_annotations(State(state): State<AppState>, Path((_library_id
     let alist: Vec<Value> = amap.into_values().filter_map(|v| v.as_array().cloned()).flatten().collect();
 
     tokio::task::spawn_blocking({
-        let cache = state.cache.clone();
+        let cache = cache.clone();
         move || calibre_db::annotations::merge_annotations_for_book(&cache, book_id, &fmt, &alist, "web", &user)
     })
     .await
@@ -259,6 +263,51 @@ mod tests {
     async fn set_last_read_position_404s_for_an_unknown_book() {
         let (_dir, router, _book_id) = test_app();
         let (status, _) = post_json(&router, "/book-set-last-read-position/default/999/epub", serde_json::json!({"device": "phone", "cfi": "/6/4", "pos_frac": 0.3})).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    fn test_app_with_two_libraries() -> (tempfile::TempDir, tempfile::TempDir, std::sync::Arc<crate::library_broker::LibraryBroker>, axum::Router, i32) {
+        let src_dir = tempfile::tempdir().unwrap();
+        let dest_dir = tempfile::tempdir().unwrap();
+        let book_id = {
+            let cache = Cache::new(src_dir.path()).unwrap();
+            add_test_book(src_dir.path(), &cache, "Source Book")
+        };
+        Cache::new(dest_dir.path()).unwrap();
+        let broker = std::sync::Arc::new(crate::library_broker::LibraryBroker::new(&[src_dir.path().to_path_buf(), dest_dir.path().to_path_buf()]).unwrap());
+        let default_cache = broker.get(None).expect("the broker's default library");
+        let state = crate::AppState { libraries: Some(broker.clone()), cache: default_cache, opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()), book_cache: std::sync::Arc::new(crate::books_cache::BookCache::open_temp()), jobs: std::sync::Arc::new(crate::jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))), render_jobs: std::sync::Arc::new(crate::render_endpoints::RenderJobRegistry::new()), conversion_jobs: std::sync::Arc::new(crate::convert::ConversionJobRegistry::new()), news_jobs: std::sync::Arc::new(crate::news::NewsJobRegistry::new()) };
+        let router = crate::test_router(state);
+        (src_dir, dest_dir, broker, router, book_id)
+    }
+
+    #[tokio::test]
+    async fn set_last_read_position_with_a_real_library_id_segment_targets_that_library() {
+        // #725: these handlers used to ignore their own {library_id}
+        // path segment entirely and always hit `state.cache` (the
+        // broker's default library) -- confirm the position is really
+        // stored in the NAMED library, not silently redirected to the
+        // default one.
+        let (src_dir, _dest_dir, broker, router, book_id) = test_app_with_two_libraries();
+        let src_name = src_dir.path().file_name().unwrap().to_str().unwrap();
+        let src_cache = broker.get(Some(src_name)).unwrap();
+
+        let (status, _) = post_json(&router, &format!("/book-set-last-read-position/{src_name}/{book_id}/epub"), serde_json::json!({"device": "phone", "cfi": "/6/4", "pos_frac": 0.3})).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let positions = src_cache.get_last_read_positions(book_id, "epub", "_").unwrap();
+        assert_eq!(positions.len(), 1, "the position should be stored in the named library's own cache");
+    }
+
+    #[tokio::test]
+    async fn get_last_read_position_404s_for_an_unknown_library_id() {
+        // Must use multi-library mode: in single-library mode
+        // (`AppState::libraries == None`), `cache_for` always falls
+        // back to the default library regardless of the requested
+        // name -- an unknown name can only actually 404 once a real
+        // `LibraryBroker` is involved.
+        let (_src_dir, _dest_dir, _broker, router, book_id) = test_app_with_two_libraries();
+        let (status, _) = get_json(&router, &format!("/book-get-last-read-position/no-such-library/{book_id}-epub")).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 

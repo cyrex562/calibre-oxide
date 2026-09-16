@@ -12,10 +12,9 @@
 //! with `supports_notes` metadata (including custom columns), which
 //! needs the full `field_metadata` system this crate doesn't have
 //! (same disclosed narrowing as every other category-touching module
-//! in this crate). `library_id` is a required path segment here
-//! (accepted but unused, single-library-only, same as everywhere else
-//! in this crate), not upstream's optional trailing segment -- no
-//! `{path}`-without-`library_id` route variant is registered.
+//! in this crate). `library_id` is a required path segment here (see
+//! `AppState::cache_for`), not upstream's optional trailing segment --
+//! no `{path}`-without-`library_id` route variant is registered.
 //!
 //! - `GET /get-note/{field}/{item_id}/{library_id}` -- the note's
 //!   HTML, with `calres://scheme/digest` resource placeholders
@@ -96,9 +95,10 @@ fn is_alphanumeric(s: &str) -> bool {
 }
 
 /// `GET /get-note/{field}/{item_id}/{library_id}`. Port of `get_note`.
-pub async fn get_note(State(state): State<AppState>, Path((field, item_id, _library_id)): Path<(String, i32, String)>) -> Result<Response, ServerError> {
+pub async fn get_note(State(state): State<AppState>, Path((field, item_id, library_id)): Path<(String, i32, String)>) -> Result<Response, ServerError> {
+    let cache = state.cache_for(Some(&library_id)).ok_or_else(|| ServerError::NotFound(format!("no library named {library_id:?}")))?;
     let html = tokio::task::spawn_blocking({
-        let cache = state.cache.clone();
+        let cache = cache.clone();
         let field = field.clone();
         move || get_note_html(&cache, &field, item_id)
     })
@@ -117,9 +117,10 @@ pub async fn get_note(State(state): State<AppState>, Path((field, item_id, _libr
 
 /// `GET /get-note-from-item-val/{field}/{item}/{library_id}`. Port of
 /// `get_note_from_val`.
-pub async fn get_note_from_val(State(state): State<AppState>, Path((field, item, _library_id)): Path<(String, String, String)>) -> Result<Json<serde_json::Value>, ServerError> {
+pub async fn get_note_from_val(State(state): State<AppState>, Path((field, item, library_id)): Path<(String, String, String)>) -> Result<Json<serde_json::Value>, ServerError> {
+    let cache = state.cache_for(Some(&library_id)).ok_or_else(|| ServerError::NotFound(format!("no library named {library_id:?}")))?;
     let result = tokio::task::spawn_blocking({
-        let cache = state.cache.clone();
+        let cache = cache.clone();
         let field = field.clone();
         move || -> anyhow::Result<Option<(i32, Option<String>)>> {
             let Some(item_id) = categories::get_item_id(&cache, &field, &item)? else {
@@ -141,14 +142,15 @@ pub async fn get_note_from_val(State(state): State<AppState>, Path((field, item,
 
 /// `GET /get-note-resource/{scheme}/{digest}/{library_id}`. Port of
 /// `get_note_resource`.
-pub async fn get_note_resource(State(state): State<AppState>, Path((scheme, digest, _library_id)): Path<(String, String, String)>) -> Result<Response, ServerError> {
+pub async fn get_note_resource(State(state): State<AppState>, Path((scheme, digest, library_id)): Path<(String, String, String)>) -> Result<Response, ServerError> {
     if !is_alphanumeric(&scheme) || !is_alphanumeric(&digest) {
         return Err(ServerError::NotFound(format!("Notes resource {scheme}:{digest} not found")));
     }
+    let cache = state.cache_for(Some(&library_id)).ok_or_else(|| ServerError::NotFound(format!("no library named {library_id:?}")))?;
     let hash = format!("{scheme}:{digest}");
 
     let resource = tokio::task::spawn_blocking({
-        let cache = state.cache.clone();
+        let cache = cache.clone();
         move || -> anyhow::Result<Option<calibre_db::notes::connection::ResourceData>> {
             cache.notes().initialize()?;
             Ok(cache.notes().get_resource_data(&hash)?)
@@ -227,7 +229,8 @@ fn decode_data_url(data: &str) -> Result<Vec<u8>, ServerError> {
 }
 
 /// `POST /set-note/{field}/{item_id}/{library_id}`. Port of `set_note`.
-pub async fn set_note(State(state): State<AppState>, Path((field, item_id, _library_id)): Path<(String, i32, String)>, Json(body): Json<SetNoteBody>) -> Result<Response, ServerError> {
+pub async fn set_note(State(state): State<AppState>, Path((field, item_id, library_id)): Path<(String, i32, String)>, Json(body): Json<SetNoteBody>) -> Result<Response, ServerError> {
+    let cache = state.cache_for(Some(&library_id)).ok_or_else(|| ServerError::NotFound(format!("no library named {library_id:?}")))?;
     let mut db_replacements: HashMap<String, String> = HashMap::new();
     let mut srv_replacements: HashMap<String, String> = HashMap::new();
     let mut resources: HashSet<String> = HashSet::new();
@@ -236,7 +239,7 @@ pub async fn set_note(State(state): State<AppState>, Path((field, item_id, _libr
         let (scheme, digest) = if img.data.starts_with("data:") {
             let bytes = decode_data_url(&img.data)?;
             let filename = img.filename.clone().ok_or_else(|| ServerError::BadRequest("Invalid query: image has no filename".to_string()))?;
-            let cache = state.cache.clone();
+            let cache = cache.clone();
             let bytes_clone = bytes.clone();
             let filename_clone = filename.clone();
             let rhash = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
@@ -266,7 +269,7 @@ pub async fn set_note(State(state): State<AppState>, Path((field, item_id, _libr
     }
 
     tokio::task::spawn_blocking({
-        let cache = state.cache.clone();
+        let cache = cache.clone();
         let field = field.clone();
         move || -> Result<(), ServerError> {
             let item_value = categories::get_item_name(&cache, &field, item_id).map_err(|e| ServerError::InternalServerError(e.to_string()))?.ok_or_else(|| ServerError::NotFound(format!("Item {field:?}:{item_id} not found")))?;
@@ -337,6 +340,55 @@ mod tests {
     async fn get_note_404s_for_an_unknown_item() {
         let (_dir, router, _cache) = test_app();
         let (status, _) = get_body(&router, "/get-note/authors/999/default").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    fn test_app_with_two_libraries() -> (tempfile::TempDir, tempfile::TempDir, std::sync::Arc<crate::library_broker::LibraryBroker>, axum::Router, i32) {
+        let src_dir = tempfile::tempdir().unwrap();
+        let dest_dir = tempfile::tempdir().unwrap();
+        let book_id = {
+            let cache = Cache::new(src_dir.path()).unwrap();
+            cache.notes().initialize().unwrap();
+            add_test_book(src_dir.path(), &cache, "Source Book", "Jane Doe")
+        };
+        {
+            let cache = Cache::new(dest_dir.path()).unwrap();
+            cache.notes().initialize().unwrap();
+        }
+        let broker = std::sync::Arc::new(crate::library_broker::LibraryBroker::new(&[src_dir.path().to_path_buf(), dest_dir.path().to_path_buf()]).unwrap());
+        let default_cache = broker.get(None).expect("the broker's default library");
+        let state = crate::AppState { libraries: Some(broker.clone()), cache: default_cache, opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()), book_cache: std::sync::Arc::new(crate::books_cache::BookCache::open_temp()), jobs: std::sync::Arc::new(crate::jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))), render_jobs: std::sync::Arc::new(crate::render_endpoints::RenderJobRegistry::new()), conversion_jobs: std::sync::Arc::new(crate::convert::ConversionJobRegistry::new()), news_jobs: std::sync::Arc::new(crate::news::NewsJobRegistry::new()) };
+        let router = crate::test_router(state);
+        (src_dir, dest_dir, broker, router, book_id)
+    }
+
+    #[tokio::test]
+    async fn set_note_with_a_real_library_id_segment_targets_that_library() {
+        // #725: `set_note`/`get_note` used to ignore their own
+        // {library_id} path segment entirely and always hit
+        // `state.cache` (the broker's default library) -- confirm the
+        // note is really stored in the NAMED library.
+        let (src_dir, _dest_dir, broker, router, _book_id) = test_app_with_two_libraries();
+        let src_name = src_dir.path().file_name().unwrap().to_str().unwrap();
+        let src_cache = broker.get(Some(src_name)).unwrap();
+        let author_id = calibre_db::categories::get_item_id(&src_cache, "authors", "Jane Doe").unwrap().unwrap();
+
+        let (status, _) = post_json(&router, &format!("/set-note/authors/{author_id}/{src_name}"), serde_json::json!({"html": "<p>hi</p>"})).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let stored = super::get_note_html(&src_cache, "authors", author_id).ok().flatten();
+        assert!(stored.is_some_and(|h| h.contains("hi")), "the note should really be stored in the named library's own cache");
+    }
+
+    #[tokio::test]
+    async fn get_note_404s_for_an_unknown_library_id() {
+        // Must use multi-library mode: in single-library mode
+        // (`AppState::libraries == None`), `cache_for` always falls
+        // back to the default library regardless of the requested
+        // name -- an unknown name can only actually 404 once a real
+        // `LibraryBroker` is involved.
+        let (_src_dir, _dest_dir, _broker, router, _book_id) = test_app_with_two_libraries();
+        let (status, _) = get_body(&router, "/get-note/authors/1/no-such-library").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
