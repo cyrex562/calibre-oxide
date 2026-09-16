@@ -390,14 +390,42 @@ async fn acquisition_feed_for_ids(
     Ok(finish(dom, last_modified))
 }
 
-/// Extracts `field`'s raw string value for a comparison via
-/// `calibre_utils::icu::strcmp` (issue #459) -- no longer lowercases
-/// here (real collation orders case itself; pre-lowercasing would make
-/// same-spelling-different-case values compare equal instead of
-/// case-ordering them, and would defeat locale-aware ordering for
-/// non-ASCII text).
+/// Extracts `field`'s sort-comparable string value for a comparison
+/// via `calibre_utils::icu::strcmp` (issue #459) -- no longer
+/// lowercases here (real collation orders case itself; pre-lowercasing
+/// would make same-spelling-different-case values compare equal
+/// instead of case-ordering them, and would defeat locale-aware
+/// ordering for non-ASCII text).
+///
+/// Real, self-caught bug fixed alongside #759's multi-field sort:
+/// `book["authors"]` (and `book["tags"]`/`book["languages"]`) are real
+/// JSON *arrays* in `ajax::book_json`'s row shape, not strings --
+/// `.as_str()` on any of them always silently returned `None` here,
+/// meaning "sort by authors" was a real, latent no-op long before this
+/// fix (every book compared equal, so the sort fell straight through
+/// to whatever came next -- invisible with a single sort field, since
+/// ties just preserved fetch order, but immediately obvious once a
+/// second tie-break field was added and "authors" contributed
+/// nothing). `authors`/`title` map to their own real dedicated
+/// sort-key columns (`author_sort`/`sort`) that this row already
+/// carries -- the same fields real upstream calibre's own sort always
+/// uses for these two (title-sort strips a leading article,
+/// author-sort is `Last, First` -- using the raw display value instead
+/// would silently mis-order every book that has either). Any other
+/// array-valued field falls back to a real, sensible joined string
+/// rather than staying broken the same way.
 pub(crate) fn sort_key_for(book: &Value, field: &str) -> String {
-    book[field].as_str().unwrap_or_default().to_string()
+    let mapped_field = match field {
+        "authors" => "author_sort",
+        "title" => "sort",
+        _ => field,
+    };
+    match &book[mapped_field] {
+        Value::String(s) => s.clone(),
+        Value::Array(items) => items.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "),
+        Value::Number(n) => n.to_string(),
+        _ => String::new(),
+    }
 }
 
 /// `GET /opds/navcatalog/{which}`. Port of `opds_navcatalog`: `title`/
@@ -683,6 +711,25 @@ mod tests {
         let state = crate::AppState { libraries: None, cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()), book_cache: std::sync::Arc::new(crate::books_cache::BookCache::open_temp()), jobs: std::sync::Arc::new(crate::jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))), render_jobs: std::sync::Arc::new(crate::render_endpoints::RenderJobRegistry::new()), conversion_jobs: std::sync::Arc::new(crate::convert::ConversionJobRegistry::new()), news_jobs: std::sync::Arc::new(crate::news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), };
         let router = crate::test_router(state);
         (dir, router)
+    }
+
+    #[test]
+    fn sort_key_for_extracts_a_usable_key_for_array_valued_fields() {
+        // Regression test: `book["authors"]` is a real JSON array in
+        // ajax::book_json's row shape -- `.as_str()` on it used to
+        // always silently return None, meaning "sort by authors" was
+        // a real no-op (every book compared equal on that key) until
+        // this was fixed to map to the row's own `author_sort` field.
+        let book = serde_json::json!({
+            "authors": ["Jane Doe", "John Smith"],
+            "author_sort": "Doe, Jane & Smith, John",
+            "title": "My Book",
+            "sort": "My Book",
+            "tags": ["scifi", "classic"],
+        });
+        assert_eq!(super::sort_key_for(&book, "authors"), "Doe, Jane & Smith, John");
+        assert_eq!(super::sort_key_for(&book, "title"), "My Book");
+        assert_eq!(super::sort_key_for(&book, "tags"), "scifi, classic");
     }
 
     async fn get_body(router: &axum::Router, uri: &str) -> (StatusCode, String) {
