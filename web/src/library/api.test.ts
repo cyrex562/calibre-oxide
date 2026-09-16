@@ -193,7 +193,16 @@ describe("startConversion", () => {
     expect(jobId).toBe(42);
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe("/conversion/start/1");
-    expect(JSON.parse(init.body)).toEqual({ input_fmt: "EPUB", output_fmt: "MOBI" });
+    expect(JSON.parse(init.body)).toEqual({ input_fmt: "EPUB", output_fmt: "MOBI", options: {} });
+  });
+
+  it("includes any real option overrides passed by the caller", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => 43 });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await startConversion(1, "EPUB", "TXT", { unsmarten_punctuation: true, chapter: "//h:h1" });
+    const [, init] = fetchMock.mock.calls[0];
+    expect(JSON.parse(init.body)).toEqual({ input_fmt: "EPUB", output_fmt: "TXT", options: { unsmarten_punctuation: true, chapter: "//h:h1" } });
   });
 });
 
