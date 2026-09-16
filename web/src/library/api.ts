@@ -96,3 +96,22 @@ export async function deleteBooks(ids: number[]): Promise<void> {
   if (ids.length === 0) return;
   await jsonFetch(`/cdb/delete-books/${ids.join(",")}`, { method: "POST" });
 }
+
+function fileToDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = () => reject(reader.error ?? new Error(`failed to read ${file.name}`));
+    reader.readAsDataURL(file);
+  });
+}
+
+export async function addFormat(bookId: number, file: File): Promise<BookSummary> {
+  const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
+  const dataUrl = await fileToDataUrl(file);
+  return setFields(bookId, { added_formats: [{ ext, data_url: dataUrl }] });
+}
+
+export function removeFormat(bookId: number, ext: string): Promise<BookSummary> {
+  return setFields(bookId, { removed_formats: [ext] });
+}

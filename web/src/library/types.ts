@@ -108,4 +108,8 @@ export interface BookFieldChanges {
   tags?: string[];
   rating?: number; // 0..5 display scale, halved server-side to 0..10 storage
   comments?: string;
+  // `set-fields`'s own special-cased keys (cdb.rs::set_fields_handle) --
+  // not plain metadata fields, but accepted in the same `changes` object.
+  added_formats?: { ext: string; data_url: string }[];
+  removed_formats?: string[];
 }
