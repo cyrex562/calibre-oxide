@@ -4,7 +4,7 @@ import { fetchCategories, fetchCategory } from "../library/api";
 import { categoryItemToQuery } from "../library/query";
 import type { CategoryEntry, CategoryItem } from "../library/types";
 
-const emit = defineEmits<{ select: [query: string, label: string] }>();
+const emit = defineEmits<{ select: [query: string, label: string]; "view-note": [field: string, itemName: string] }>();
 
 const categories = ref<CategoryEntry[]>([]);
 const openCategory = ref<string | null>(null);
@@ -45,6 +45,16 @@ function pick(item: CategoryItem) {
   if (!openCategory.value) return;
   emit("select", categoryItemToQuery(openCategory.value, item.name), item.name);
 }
+
+// Notes (issue #732) -- every category this browser lists is one of
+// the five standard fields notes.rs itself supports
+// (authors/tags/series/publisher/languages, see ajax::categories's
+// own doc), so no extra allowlist check is needed here: whatever's
+// shown in this list is always a valid `field` for the notes routes.
+function viewNote(item: CategoryItem) {
+  if (!openCategory.value) return;
+  emit("view-note", openCategory.value, item.name);
+}
 </script>
 
 <template>
@@ -55,8 +65,9 @@ function pick(item: CategoryItem) {
         <button class="cat-toggle" @click="toggle(cat)">{{ cat.name }}</button>
         <ul v-if="openCategory === cat.url.split('/').pop()" class="items">
           <li v-if="loading">Loading…</li>
-          <li v-for="item in items" :key="item.name">
+          <li v-for="item in items" :key="item.name" class="item-row">
             <button class="item" @click="pick(item)">{{ item.name }} <span class="count">({{ item.count }})</span></button>
+            <button class="note-btn" title="View/edit note" @click="viewNote(item)">Note</button>
           </li>
         </ul>
       </li>
@@ -83,6 +94,23 @@ ul {
   padding: 0.3em 0.5em;
   cursor: pointer;
   font: inherit;
+}
+.item-row {
+  display: flex;
+  align-items: center;
+}
+.item-row .item {
+  flex: 1;
+}
+.note-btn {
+  flex-shrink: 0;
+  background: none;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  padding: 0.15em 0.5em;
+  margin-right: 0.4em;
+  font-size: 0.8em;
+  cursor: pointer;
 }
 .cat-toggle {
   font-weight: 600;

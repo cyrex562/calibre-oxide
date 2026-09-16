@@ -10,10 +10,12 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "dompurify": "^3.4.15",
     "vue": "^3.5.13",
     "vue-router": "^4.4.5"
   },
   "devDependencies": {
+    "@types/dompurify": "^3.0.5",
     "@vitejs/plugin-vue": "^5.2.1",
     "jsdom": "^25.0.1",
     "typescript": "^5.6.3",

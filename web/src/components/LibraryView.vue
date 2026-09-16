@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import CategoryBrowser from "./CategoryBrowser.vue";
+import NoteEditor from "./NoteEditor.vue";
 import BookDetailsPanel from "./BookDetailsPanel.vue";
 import { addBook, addCustomColumn, catalogDownloadUrl, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, removeCustomColumn, renameSavedSearch, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
@@ -171,6 +172,13 @@ function openColumns() {
   columnsError.value = null;
   columnsOpen.value = true;
   void loadCustomColumns();
+}
+
+// Item notes (issue #732) -- see NoteEditor.vue's own doc.
+const noteTarget = ref<{ field: string; itemName: string } | null>(null);
+
+function openNote(field: string, itemName: string) {
+  noteTarget.value = { field, itemName };
 }
 
 async function createCustomColumn() {
@@ -672,7 +680,7 @@ async function switchToOther() {
     <p v-if="addSummary" class="status add-summary">{{ addSummary }}</p>
 
     <div class="body">
-      <CategoryBrowser class="sidebar" @select="onCategorySelect" />
+      <CategoryBrowser class="sidebar" @select="onCategorySelect" @view-note="openNote" />
 
       <main v-if="ftsMode" class="grid-area">
         <p v-if="ftsError" class="error">{{ ftsError }}</p>
@@ -731,6 +739,7 @@ async function switchToOther() {
     </div>
 
     <BookDetailsPanel v-if="selectedBookId !== null" :book-id="selectedBookId" @close="selectedBookId = null" @updated="onDetailsUpdated" @deleted="onDetailsDeleted" />
+    <NoteEditor v-if="noteTarget" :field="noteTarget.field" :item-name="noteTarget.itemName" @close="noteTarget = null" />
 
     <div v-if="manageOpen" class="manage-backdrop" @click.self="manageOpen = false">
       <div class="manage-panel">
