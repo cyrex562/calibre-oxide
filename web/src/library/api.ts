@@ -3,7 +3,7 @@
 // role for this slice, narrowed to only what the library-browser MVP
 // needs.
 
-import type { AddBookResult, BookFieldChanges, BookSummary, BooksInPage, CategoryEntry, CategoryPage, FieldMetadataResponse, SearchResult, VirtualLibraries } from "./types";
+import type { AddBookResult, BookFieldChanges, BookSummary, BooksInPage, CategoryEntry, CategoryPage, ConversionBookData, ConversionStatus, FieldMetadataResponse, SearchResult, VirtualLibraries } from "./types";
 
 async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(url, init);
@@ -114,4 +114,22 @@ export async function addFormat(bookId: number, file: File): Promise<BookSummary
 
 export function removeFormat(bookId: number, ext: string): Promise<BookSummary> {
   return setFields(bookId, { removed_formats: [ext] });
+}
+
+// Real conversion endpoints -- see crates/calibre_srv/src/convert.rs.
+
+export function fetchConversionBookData(bookId: number): Promise<ConversionBookData> {
+  return jsonFetch<ConversionBookData>(`/conversion/book-data/${bookId}`);
+}
+
+export function startConversion(bookId: number, inputFmt: string, outputFmt: string): Promise<number> {
+  return jsonFetch<number>(`/conversion/start/${bookId}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ input_fmt: inputFmt, output_fmt: outputFmt }),
+  });
+}
+
+export function getConversionStatus(jobId: number): Promise<ConversionStatus> {
+  return jsonFetch<ConversionStatus>(`/conversion/status/${jobId}`);
 }
