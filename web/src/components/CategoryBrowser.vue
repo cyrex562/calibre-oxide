@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { ref } from "vue";
-import { fetchCategories, fetchCategory } from "../library/api";
+import { fetchCategories, fetchCategory, renameCategoryItem } from "../library/api";
 import { categoryItemToQuery } from "../library/query";
 import type { CategoryEntry, CategoryItem } from "../library/types";
 
-const emit = defineEmits<{ select: [query: string, label: string]; "view-note": [field: string, itemName: string] }>();
+const emit = defineEmits<{ select: [query: string, label: string]; "view-note": [field: string, itemName: string]; renamed: [] }>();
 
 const categories = ref<CategoryEntry[]>([]);
 const openCategory = ref<string | null>(null);
@@ -55,11 +55,35 @@ function viewNote(item: CategoryItem) {
   if (!openCategory.value) return;
   emit("view-note", openCategory.value, item.name);
 }
+
+// Rename & merge (issue #749) -- backend supports these three real
+// categories only (Cache::rename_author/rename_tag/rename_publisher);
+// series/languages are real standard categories elsewhere in this
+// crate but have no rename method to call, see rename.rs's own doc.
+const RENAMEABLE_CATEGORIES = ["authors", "tags", "publisher"];
+const renameError = ref<string | null>(null);
+
+async function renameItem(item: CategoryItem) {
+  const category = openCategory.value;
+  if (!category) return;
+  const newName = prompt(`Rename "${item.name}" to:`, item.name);
+  if (!newName || newName === item.name) return;
+  renameError.value = null;
+  try {
+    await renameCategoryItem(category, item.name, newName);
+    const page = await fetchCategory(category);
+    items.value = page.items;
+    emit("renamed");
+  } catch (e) {
+    renameError.value = e instanceof Error ? e.message : String(e);
+  }
+}
 </script>
 
 <template>
   <nav class="category-browser">
     <p v-if="error" class="error">{{ error }}</p>
+    <p v-if="renameError" class="error">{{ renameError }}</p>
     <ul>
       <li v-for="cat in categories" :key="cat.url">
         <button class="cat-toggle" @click="toggle(cat)">{{ cat.name }}</button>
@@ -67,6 +91,7 @@ function viewNote(item: CategoryItem) {
           <li v-if="loading">Loading…</li>
           <li v-for="item in items" :key="item.name" class="item-row">
             <button class="item" @click="pick(item)">{{ item.name }} <span class="count">({{ item.count }})</span></button>
+            <button v-if="openCategory && RENAMEABLE_CATEGORIES.includes(openCategory)" class="note-btn" title="Rename or merge" @click="renameItem(item)">Rename</button>
             <button class="note-btn" title="View/edit note" @click="viewNote(item)">Note</button>
           </li>
         </ul>

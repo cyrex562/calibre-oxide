@@ -618,71 +618,24 @@ impl LegacyDb {
         self.delete_item_using_id("publishers", "books_publishers_link", "publisher", item_id)
     }
 
-    /// Renames the item and, if that collides with an existing name
-    /// (the `name` column's `UNIQUE` constraint), merges by
-    /// re-pointing the old item's links at the existing one and
-    /// deleting the now-orphaned old row -- a real but simplified
-    /// stand-in for upstream's full `rename_items` (which also
-    /// updates every affected book's composite/sort fields).
-    fn rename_item(
-        &self,
-        table: &str,
-        link_table: &str,
-        link_col: &str,
-        old_id: i32,
-        new_name: &str,
-    ) {
-        let cache = self.new_api.lock().unwrap();
-        let mut conn = cache.backend.conn.lock().unwrap();
-        let tx = match conn.transaction() {
-            Ok(tx) => tx,
-            Err(_) => return,
-        };
-        let existing: Option<i32> = tx
-            .query_row(
-                &format!("SELECT id FROM {table} WHERE name = ?1 AND id != ?2"),
-                (new_name, old_id),
-                |row| row.get(0),
-            )
-            .ok();
-        match existing {
-            Some(target_id) => {
-                let _ = tx.execute(
-                    &format!(
-                        "UPDATE OR IGNORE {link_table} SET {link_col} = ?1 WHERE {link_col} = ?2"
-                    ),
-                    (target_id, old_id),
-                );
-                let _ = tx.execute(
-                    &format!("DELETE FROM {link_table} WHERE {link_col} = ?1"),
-                    [old_id],
-                );
-                let _ = tx.execute(&format!("DELETE FROM {table} WHERE id = ?1"), [old_id]);
-            }
-            None => {
-                let _ = tx.execute(
-                    &format!("UPDATE {table} SET name = ?1 WHERE id = ?2"),
-                    (new_name, old_id),
-                );
-            }
-        }
-        let _ = tx.commit();
-    }
-
+    /// Renames the item and, if that collides with an existing name,
+    /// merges the two -- real logic now lives on
+    /// [`crate::cache::Cache::rename_author`]/`rename_tag`/
+    /// `rename_publisher` (issue #749: a real `calibre_srv` caller
+    /// only ever has a `Cache` in scope, never a second `LegacyDb`
+    /// opened onto the same library file, so the implementation moved
+    /// there and these three keep their own real, `()`-returning
+    /// legacy signature -- matching every other method in this file --
+    /// by discarding the `Result`, same as this method's own
+    /// pre-existing `let _ = ...` error-swallowing behavior did.
     pub fn rename_author(&self, old_id: i32, new_name: &str) {
-        self.rename_item("authors", "books_authors_link", "author", old_id, new_name)
+        let _ = self.new_api.lock().unwrap().rename_author(old_id, new_name);
     }
     pub fn rename_tag(&self, old_id: i32, new_name: &str) {
-        self.rename_item("tags", "books_tags_link", "tag", old_id, new_name)
+        let _ = self.new_api.lock().unwrap().rename_tag(old_id, new_name);
     }
     pub fn rename_publisher(&self, old_id: i32, new_name: &str) {
-        self.rename_item(
-            "publishers",
-            "books_publishers_link",
-            "publisher",
-            old_id,
-            new_name,
-        )
+        let _ = self.new_api.lock().unwrap().rename_publisher(old_id, new_name);
     }
 
     // }}}

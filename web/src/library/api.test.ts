@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { addBook, addFormat, catalogDownloadUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, removeDataFile, removeFormat, renameSavedSearch, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
+import { addBook, addFormat, catalogDownloadUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, removeDataFile, removeFormat, renameCategoryItem, renameSavedSearch, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
 import type { BookSummary } from "./types";
 
 function bookStub(id: number): BookSummary {
@@ -446,6 +446,25 @@ describe("evaluateTemplate", () => {
     const result = await evaluateTemplate(7, "nope");
     expect(result.ok).toBe(false);
     expect(result.error).toContain("Unknown identifier");
+  });
+});
+
+describe("renameCategoryItem", () => {
+  it("posts the new name to the real category/item route", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await renameCategoryItem("authors", "Old Name", "New Name");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/rename-category-item/authors/Old%20Name/default",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ new_name: "New Name" }) }),
+    );
+  });
+
+  it("throws the server's own error text on failure", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 400, statusText: "Bad Request", text: async () => "renaming \"series\" is not supported" }));
+    await expect(renameCategoryItem("series", "X", "Y")).rejects.toThrow("not supported");
   });
 });
 
