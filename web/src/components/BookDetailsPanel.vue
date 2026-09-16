@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { useRouter } from "vue-router";
-import { deleteBooks, fetchBook, setCover, setFields } from "../library/api";
+import { addFormat, deleteBooks, fetchBook, removeFormat, setCover, setFields } from "../library/api";
 import type { BookFieldChanges, BookSummary } from "../library/types";
 
 const props = defineProps<{ bookId: number }>();
@@ -97,6 +97,39 @@ async function replaceCover(e: Event) {
   }
 }
 
+const formatInput = ref<HTMLInputElement | null>(null);
+const formatBusy = ref(false);
+
+async function addFormatFile(e: Event) {
+  const file = (e.target as HTMLInputElement).files?.[0];
+  if (!file) return;
+  formatBusy.value = true;
+  saveError.value = null;
+  try {
+    book.value = await addFormat(props.bookId, file);
+    emit("updated");
+  } catch (e) {
+    saveError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    formatBusy.value = false;
+    if (formatInput.value) formatInput.value.value = "";
+  }
+}
+
+async function removeFormatClick(ext: string) {
+  if (!confirm(`Remove the ${ext.toUpperCase()} format from this book?`)) return;
+  formatBusy.value = true;
+  saveError.value = null;
+  try {
+    book.value = await removeFormat(props.bookId, ext);
+    emit("updated");
+  } catch (e) {
+    saveError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    formatBusy.value = false;
+  }
+}
+
 // Only formats the reader MVP (#499) actually round-trips through
 // render_book are offered a "Read" link -- other formats still get a
 // plain download link.
@@ -185,6 +218,16 @@ function read() {
             <label>Tags <input v-model="editTags" placeholder="scifi, classic" /></label>
             <label>Rating <input v-model.number="editRating" type="number" min="0" max="5" step="1" /></label>
           </div>
+        </div>
+
+        <div class="format-manager">
+          <span class="format-manager-label">Formats</span>
+          <span v-for="[fmt] in formatLinks" :key="fmt" class="format-chip">
+            {{ fmt.toUpperCase() }}
+            <button type="button" class="format-chip-remove" :disabled="formatBusy" @click="removeFormatClick(fmt)" :aria-label="`Remove ${fmt.toUpperCase()}`">✕</button>
+          </span>
+          <button type="button" :disabled="formatBusy" @click="formatInput?.click()">{{ formatBusy ? "Working…" : "Add format…" }}</button>
+          <input ref="formatInput" type="file" class="hidden-file-input" @change="addFormatFile" />
         </div>
 
         <p v-if="saveError" class="error">{{ saveError }}</p>
@@ -318,5 +361,41 @@ function read() {
   padding: 0.35em 0.5em;
   border: 1px solid #ccc;
   border-radius: 4px;
+}
+.format-manager {
+  margin-top: 1em;
+  padding-top: 1em;
+  border-top: 1px solid #eee;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5em;
+}
+.format-manager-label {
+  font-size: 0.85em;
+  color: #555;
+  font-weight: 600;
+}
+.format-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3em;
+  background: #f0f0f0;
+  border-radius: 4px;
+  padding: 0.3em 0.5em;
+  font-size: 0.85em;
+}
+.format-chip-remove {
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: #888;
+  font-size: 0.9em;
+  padding: 0;
+  line-height: 1;
+}
+.format-chip-remove:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 </style>

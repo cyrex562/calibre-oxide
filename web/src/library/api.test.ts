@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { addBook, deleteBooks, fetchBooks, setCover, setFields } from "./api";
+import { addBook, addFormat, deleteBooks, fetchBooks, removeFormat, setCover, setFields } from "./api";
 import type { BookSummary } from "./types";
 
 function bookStub(id: number): BookSummary {
@@ -139,5 +139,35 @@ describe("deleteBooks", () => {
 
     await deleteBooks([]);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("addFormat", () => {
+  it("base64-encodes the file as a data URL and sends it as added_formats", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ "1": bookStub(1) }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const file = new File(["pdf bytes"], "extra.PDF");
+    const book = await addFormat(1, file);
+    expect(book.id).toBe(1);
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/cdb/set-fields/1");
+    const body = JSON.parse(init.body);
+    expect(body.changes.added_formats).toHaveLength(1);
+    expect(body.changes.added_formats[0].ext).toBe("pdf");
+    expect(body.changes.added_formats[0].data_url).toMatch(/^data:/);
+  });
+});
+
+describe("removeFormat", () => {
+  it("sends the extension as removed_formats", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ "1": bookStub(1) }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await removeFormat(1, "pdf");
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/cdb/set-fields/1");
+    expect(JSON.parse(init.body)).toEqual({ changes: { removed_formats: ["pdf"] } });
   });
 });
