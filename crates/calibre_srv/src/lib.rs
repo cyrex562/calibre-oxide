@@ -326,6 +326,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/tweak/file/{session_id}/{*name}", get(tweak::get_file).post(tweak::set_file))
         .route("/tweak/commit/{session_id}", post(tweak::commit))
         .route("/tweak/discard/{session_id}", post(tweak::discard))
+        .route("/tweak/toc/{session_id}", get(tweak::get_toc_route).post(tweak::set_toc_route))
         .route("/cdb/add-book/{job_id}/{add_duplicates}/{filename}/{library_id}", post(cdb::add_book))
         .route("/cdb/delete-books/{book_ids}/{library_id}", post(cdb::delete_books))
         .route("/cdb/delete-books/{book_ids}", post(cdb::delete_books_no_library))
