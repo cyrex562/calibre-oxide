@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { addBook, fetchBooks, setCover, setFields } from "./api";
+import { addBook, deleteBooks, fetchBooks, setCover, setFields } from "./api";
 import type { BookSummary } from "./types";
 
 function bookStub(id: number): BookSummary {
@@ -119,5 +119,25 @@ describe("setCover", () => {
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe("/cdb/set-cover/1");
     expect(init.body).toBe(file);
+  });
+});
+
+describe("deleteBooks", () => {
+  it("posts a comma-joined id list to the delete-books URL", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await deleteBooks([1, 2, 3]);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/cdb/delete-books/1,2,3");
+    expect(init.method).toBe("POST");
+  });
+
+  it("short-circuits without a network call for an empty id list", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await deleteBooks([]);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

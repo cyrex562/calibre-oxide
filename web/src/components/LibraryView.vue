@@ -91,6 +91,11 @@ function onDetailsUpdated() {
   void runSearch();
 }
 
+function onDetailsDeleted() {
+  selectedBookId.value = null;
+  void runSearch();
+}
+
 async function addBookFile(file: File, addDuplicates: boolean): Promise<void> {
   const result = await addBook(file, addDuplicates);
   if (result.duplicates && result.duplicates.length > 0 && result.book_id === undefined) {
@@ -170,7 +175,7 @@ async function onAddFileSelected(e: Event) {
       </main>
     </div>
 
-    <BookDetailsPanel v-if="selectedBookId !== null" :book-id="selectedBookId" @close="selectedBookId = null" @updated="onDetailsUpdated" />
+    <BookDetailsPanel v-if="selectedBookId !== null" :book-id="selectedBookId" @close="selectedBookId = null" @updated="onDetailsUpdated" @deleted="onDetailsDeleted" />
   </div>
 </template>
 
