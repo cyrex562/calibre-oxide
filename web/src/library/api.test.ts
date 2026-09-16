@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { addBook, addFormat, catalogDownloadUrl, checkLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, removeDataFile, removeFormat, renameCategoryItem, renameSavedSearch, saveToDisk, scanForDuplicates, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
+import { addBook, addFormat, addNewsSchedule, catalogDownloadUrl, checkLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, listNewsSchedules, removeDataFile, removeFormat, removeNewsSchedule, renameCategoryItem, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
 import type { BookSummary } from "./types";
 
 function bookStub(id: number): BookSummary {
@@ -537,5 +537,49 @@ describe("scanForDuplicates", () => {
     expect(fetchMock).toHaveBeenCalledWith("/duplicates/scan/default", { method: "POST" });
     expect(groups).toHaveLength(1);
     expect(groups[0]).toHaveLength(2);
+  });
+});
+
+describe("news schedules", () => {
+  it("addNewsSchedule posts title/feeds/interval and returns the new id", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ id: 7 }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { id } = await addNewsSchedule("My Feed", ["https://example.com/feed.xml"], 3600);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/news/schedules/add",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ title: "My Feed", feeds: ["https://example.com/feed.xml"], interval_secs: 3600 }) }),
+    );
+    expect(id).toBe(7);
+  });
+
+  it("listNewsSchedules returns the parsed schedule list", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ schedules: [{ id: 1, title: "A", feeds: ["u"], interval_secs: 3600, next_run_at: "2026-01-01T00:00:00Z", last_run_at: null, last_result: null }] }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { schedules } = await listNewsSchedules();
+
+    expect(fetchMock).toHaveBeenCalledWith("/news/schedules/list", undefined);
+    expect(schedules).toHaveLength(1);
+  });
+
+  it("removeNewsSchedule posts to the real route", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await removeNewsSchedule(7);
+
+    expect(fetchMock).toHaveBeenCalledWith("/news/schedules/remove/7", { method: "POST" });
+  });
+
+  it("runNewsScheduleNow posts to the real route and returns the outcome", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ ok: true, book_id: 42 }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await runNewsScheduleNow(7);
+
+    expect(fetchMock).toHaveBeenCalledWith("/news/schedules/run-now/7", { method: "POST" });
+    expect(result).toEqual({ ok: true, book_id: 42 });
   });
 });

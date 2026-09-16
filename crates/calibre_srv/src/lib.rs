@@ -183,6 +183,7 @@ pub mod lists;
 pub mod mathjax;
 pub mod net_guard;
 pub mod news;
+pub mod news_scheduler;
 pub mod notes;
 pub mod opds;
 pub mod opml;
@@ -243,6 +244,9 @@ pub struct AppState {
     /// Open book-editing sessions for the `/tweak/*` routes -- see
     /// [`tweak`]'s own doc.
     pub tweak_sessions: Arc<tweak::TweakSessionRegistry>,
+    /// Persisted recurring news-feed schedules -- see
+    /// [`news_scheduler`]'s own doc.
+    pub news_schedules: Arc<news_scheduler::NewsScheduleStore>,
 }
 
 impl AppState {
@@ -299,6 +303,10 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/opml/import", post(opml::import))
         .route("/rename-category-item/{category}/{item_name}/{library_id}", post(rename::rename))
         .route("/news/status/{job_id}", get(news::news_status).post(news::news_status))
+        .route("/news/schedules/add", post(news_scheduler::add_schedule))
+        .route("/news/schedules/list", get(news_scheduler::list_schedules))
+        .route("/news/schedules/remove/{id}", post(news_scheduler::remove_schedule))
+        .route("/news/schedules/run-now/{id}", post(news_scheduler::run_schedule_now))
         .route("/share/email", post(share::share_email))
         .route("/check-library/{library_id}", post(check_library::check))
         .route("/custom-columns", get(custom_columns::list))
@@ -424,7 +432,7 @@ mod tests {
             jobs: std::sync::Arc::new(jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
             render_jobs: std::sync::Arc::new(render_endpoints::RenderJobRegistry::new()),
             conversion_jobs: std::sync::Arc::new(convert::ConversionJobRegistry::new()),
-            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()),
+            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()),
         }
     }
 
@@ -450,7 +458,7 @@ mod tests {
             jobs: std::sync::Arc::new(jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
             render_jobs: std::sync::Arc::new(render_endpoints::RenderJobRegistry::new()),
             conversion_jobs: std::sync::Arc::new(convert::ConversionJobRegistry::new()),
-            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()),
+            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()),
         };
         let router = test_router(state);
         let (status, _) = get(&router, "/opds").await;
@@ -512,7 +520,7 @@ mod tests {
             jobs: std::sync::Arc::new(jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
             render_jobs: std::sync::Arc::new(render_endpoints::RenderJobRegistry::new()),
             conversion_jobs: std::sync::Arc::new(convert::ConversionJobRegistry::new()),
-            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()),
+            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()),
         };
         let router = test_router(state);
 

@@ -3,8 +3,8 @@ import { computed, ref, watch } from "vue";
 import CategoryBrowser from "./CategoryBrowser.vue";
 import NoteEditor from "./NoteEditor.vue";
 import BookDetailsPanel from "./BookDetailsPanel.vue";
-import { addBook, addCustomColumn, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, removeCustomColumn, renameSavedSearch, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
-import type { CheckLibraryResult, DuplicateBook, SaveToDiskResult } from "../library/api";
+import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
+import type { CheckLibraryResult, DuplicateBook, NewsSchedule, SaveToDiskResult } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
 import { isTauri, tauriInvoke } from "../tauri";
 import { DEFAULT_LIBRARY_PREFS, fetchProfile, LIBRARY_PREFS_PROFILE, type LibraryPrefs } from "../settings/api";
@@ -284,10 +284,65 @@ const newsFetching = ref(false);
 const newsError = ref<string | null>(null);
 const newsDone = ref(false);
 
+// Scheduled feeds (#764) -- a saved feed configuration that runs
+// automatically on a real recurring interval via a server-side
+// background task, instead of only this panel's own one-shot fetch.
+const newsSchedules = ref<NewsSchedule[]>([]);
+const scheduleIntervalMinutes = ref("1440");
+const schedulingBusy = ref(false);
+const scheduleError = ref<string | null>(null);
+
+async function loadNewsSchedules() {
+  try {
+    const { schedules } = await listNewsSchedules();
+    newsSchedules.value = schedules;
+  } catch (e) {
+    scheduleError.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
 function openNews() {
   newsOpen.value = true;
   newsError.value = null;
   newsDone.value = false;
+  void loadNewsSchedules();
+}
+
+async function saveNewsSchedule() {
+  const feeds = newsFeedUrls.value.split("\n").map((u) => u.trim()).filter(Boolean);
+  const minutes = Number(scheduleIntervalMinutes.value);
+  if (feeds.length === 0 || !Number.isFinite(minutes) || minutes < 1) return;
+  schedulingBusy.value = true;
+  scheduleError.value = null;
+  try {
+    await addNewsSchedule(newsTitle.value.trim(), feeds, Math.round(minutes * 60));
+    await loadNewsSchedules();
+  } catch (e) {
+    scheduleError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    schedulingBusy.value = false;
+  }
+}
+
+async function deleteNewsSchedule(id: number) {
+  await removeNewsSchedule(id);
+  await loadNewsSchedules();
+}
+
+async function runNewsScheduleNowClick(id: number) {
+  schedulingBusy.value = true;
+  scheduleError.value = null;
+  try {
+    const result = await runNewsScheduleNow(id);
+    if (!result.ok) throw new Error(result.error || "run failed");
+    cacheBust.value++;
+    await runSearch();
+    await loadNewsSchedules();
+  } catch (e) {
+    scheduleError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    schedulingBusy.value = false;
+  }
 }
 
 const opmlInput = ref<HTMLInputElement | null>(null);
@@ -1070,14 +1125,32 @@ async function switchToOther() {
             <button type="button" :disabled="newsFetching || opmlImporting" @click="opmlInput?.click()">{{ opmlImporting ? "Importing…" : "Import OPML…" }}</button>
             <input ref="opmlInput" type="file" accept=".opml,.xml,text/x-opml,text/xml" class="hidden-file-input" @change="importOpmlFile" />
           </div>
+          <label class="news-field">
+            Repeat every (minutes)
+            <input v-model="scheduleIntervalMinutes" type="number" min="1" step="1" :disabled="schedulingBusy" />
+          </label>
           <div class="bulk-actions">
-            <button type="submit" class="read" :disabled="newsFetching || !newsFeedUrls.trim()">{{ newsFetching ? "Fetching…" : "Fetch" }}</button>
+            <button type="submit" class="read" :disabled="newsFetching || !newsFeedUrls.trim()">{{ newsFetching ? "Fetching…" : "Fetch once" }}</button>
+            <button type="button" :disabled="schedulingBusy || !newsFeedUrls.trim()" @click="saveNewsSchedule">{{ schedulingBusy ? "Saving…" : "Save schedule…" }}</button>
             <button type="button" :disabled="newsFetching" @click="newsOpen = false">Close</button>
           </div>
         </form>
         <p v-if="opmlSummary" class="news-hint">{{ opmlSummary }}</p>
         <p v-if="newsDone" class="news-done">Added the fetched news as a new book.</p>
         <p v-if="newsError" class="error">{{ newsError }}</p>
+        <p v-if="scheduleError" class="error">{{ scheduleError }}</p>
+
+        <template v-if="newsSchedules.length">
+          <h4>Scheduled feeds</h4>
+          <ul class="manage-list">
+            <li v-for="s in newsSchedules" :key="s.id">
+              <span class="manage-name">{{ s.title }} — every {{ Math.round(s.interval_secs / 60) }} min</span>
+              <code class="manage-query">next: {{ new Date(s.next_run_at).toLocaleString() }}<template v-if="s.last_result"> · last: {{ s.last_result }}</template></code>
+              <button type="button" :disabled="schedulingBusy" @click="runNewsScheduleNowClick(s.id)">Run now</button>
+              <button type="button" :disabled="schedulingBusy" @click="deleteNewsSchedule(s.id)">Delete</button>
+            </li>
+          </ul>
+        </template>
       </div>
     </div>
 
