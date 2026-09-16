@@ -1,12 +1,47 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from "vue";
 import { isTauri, tauriInvoke } from "../tauri";
-import { DEFAULT_KEYMAP, DEFAULT_LIBRARY_PREFS, DEFAULT_READER_PREFS, fetchProfile, KEYMAP_ACTION_LABELS, KEYMAP_PROFILE, LIBRARY_PREFS_PROFILE, READER_PREFS_PROFILE, saveProfile, type KeymapAction, type KeymapPrefs, type LibraryPrefs, type ReaderPrefs } from "./api";
+import { DEFAULT_KEYMAP, DEFAULT_LIBRARY_PREFS, DEFAULT_READER_PREFS, DEFAULT_TOOLBAR_PREFS, fetchProfile, KEYMAP_ACTION_LABELS, KEYMAP_PROFILE, LIBRARY_PREFS_PROFILE, READER_PREFS_PROFILE, saveProfile, TOOLBAR_ACTIONS, TOOLBAR_PREFS_PROFILE, type KeymapAction, type KeymapPrefs, type LibraryPrefs, type ReaderPrefs, type ToolbarActionId, type ToolbarPrefs } from "./api";
 
 const libraryPrefs = ref<LibraryPrefs>({ ...DEFAULT_LIBRARY_PREFS });
 const readerPrefs = ref<ReaderPrefs>({ ...DEFAULT_READER_PREFS });
 const keymap = ref<KeymapPrefs>({ ...DEFAULT_KEYMAP });
 const rebindingAction = ref<KeymapAction | null>(null);
+
+// Real toolbar customization (#753) -- `toolbarOrder` always holds
+// every real TOOLBAR_ACTIONS id (defaulting to the registry's own
+// declared order the first time this loads), so the reorder UI below
+// is just "swap two adjacent list entries," not a partial-list merge.
+const toolbarHidden = ref<Set<ToolbarActionId>>(new Set());
+const toolbarOrder = ref<ToolbarActionId[]>(TOOLBAR_ACTIONS.map((a) => a.id));
+
+function toolbarLabel(id: ToolbarActionId): string {
+  return TOOLBAR_ACTIONS.find((a) => a.id === id)?.label ?? id;
+}
+function toggleToolbarHidden(id: ToolbarActionId) {
+  const next = new Set(toolbarHidden.value);
+  if (next.has(id)) next.delete(id);
+  else next.add(id);
+  toolbarHidden.value = next;
+}
+function moveToolbarAction(index: number, delta: number) {
+  const to = index + delta;
+  if (to < 0 || to >= toolbarOrder.value.length) return;
+  const arr = [...toolbarOrder.value];
+  [arr[index], arr[to]] = [arr[to], arr[index]];
+  toolbarOrder.value = arr;
+}
+async function saveToolbarPrefs() {
+  savedMessage.value = null;
+  error.value = null;
+  try {
+    const prefs: ToolbarPrefs = { hidden: [...toolbarHidden.value], order: toolbarOrder.value };
+    await saveProfile(TOOLBAR_PREFS_PROFILE, prefs as unknown as Record<string, unknown>);
+    savedMessage.value = "Toolbar layout saved.";
+  } catch (e) {
+    error.value = e instanceof Error ? e.message : String(e);
+  }
+}
 const loading = ref(true);
 const savedMessage = ref<string | null>(null);
 const error = ref<string | null>(null);
@@ -18,10 +53,19 @@ async function load() {
   loading.value = true;
   error.value = null;
   try {
-    const [lib, reader, keys] = await Promise.all([fetchProfile<LibraryPrefs>(LIBRARY_PREFS_PROFILE), fetchProfile<ReaderPrefs>(READER_PREFS_PROFILE), fetchProfile<KeymapPrefs>(KEYMAP_PROFILE)]);
+    const [lib, reader, keys, toolbar] = await Promise.all([fetchProfile<LibraryPrefs>(LIBRARY_PREFS_PROFILE), fetchProfile<ReaderPrefs>(READER_PREFS_PROFILE), fetchProfile<KeymapPrefs>(KEYMAP_PROFILE), fetchProfile<ToolbarPrefs>(TOOLBAR_PREFS_PROFILE)]);
     if (lib) libraryPrefs.value = { ...DEFAULT_LIBRARY_PREFS, ...lib };
     if (reader) readerPrefs.value = { ...DEFAULT_READER_PREFS, ...reader };
     if (keys) keymap.value = { ...DEFAULT_KEYMAP, ...keys };
+    if (toolbar) {
+      toolbarHidden.value = new Set(toolbar.hidden ?? DEFAULT_TOOLBAR_PREFS.hidden);
+      // A saved order might predate a newly-added registry action (or
+      // simply be empty, the real default) -- append anything missing
+      // at the end rather than dropping it from the reorder UI.
+      const saved = toolbar.order?.length ? toolbar.order : TOOLBAR_ACTIONS.map((a) => a.id);
+      const missing = TOOLBAR_ACTIONS.map((a) => a.id).filter((id) => !saved.includes(id));
+      toolbarOrder.value = [...saved, ...missing];
+    }
     if (isTauri()) {
       showAppSettings.value = true;
       autoReopen.value = await tauriInvoke<boolean>("get_auto_reopen");
@@ -172,6 +216,22 @@ async function toggleAutoReopen() {
         <button type="button" @click="saveKeymap">Save keyboard shortcuts</button>
       </section>
 
+      <section class="pane">
+        <h3>Toolbar</h3>
+        <p class="hint">Show/hide and reorder the library toolbar's own action buttons.</p>
+        <ul class="toolbar-list">
+          <li v-for="(id, i) in toolbarOrder" :key="id" class="toolbar-row">
+            <label class="field checkbox">
+              <input type="checkbox" :checked="!toolbarHidden.has(id)" @change="toggleToolbarHidden(id)" />
+              {{ toolbarLabel(id) }}
+            </label>
+            <button type="button" :disabled="i === 0" @click="moveToolbarAction(i, -1)" title="Move up">↑</button>
+            <button type="button" :disabled="i === toolbarOrder.length - 1" @click="moveToolbarAction(i, 1)" title="Move down">↓</button>
+          </li>
+        </ul>
+        <button type="button" @click="saveToolbarPrefs">Save toolbar layout</button>
+      </section>
+
       <section v-if="showAppSettings" class="pane">
         <h3>App</h3>
         <label class="field checkbox">
@@ -224,6 +284,22 @@ async function toggleAutoReopen() {
   flex-direction: row;
   align-items: center;
   justify-content: space-between;
+}
+.toolbar-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3em;
+}
+.toolbar-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+}
+.toolbar-row .field.checkbox {
+  flex: 1;
 }
 .error {
   color: #b00020;

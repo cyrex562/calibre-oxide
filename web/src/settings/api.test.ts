@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { DEFAULT_KEYMAP, fetchProfile, KEYMAP_PROFILE, saveProfile } from "./api";
+import { DEFAULT_KEYMAP, DEFAULT_TOOLBAR_PREFS, fetchProfile, KEYMAP_PROFILE, saveProfile, TOOLBAR_ACTIONS, TOOLBAR_PREFS_PROFILE } from "./api";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -55,5 +55,25 @@ describe("saveProfile", () => {
         body: JSON.stringify({ name: "keymap", profile: rebound }),
       }),
     );
+  });
+
+  it("round-trips a hidden/reordered toolbar layout through the same profile storage", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => true });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const reordered = { hidden: ["fetch-news"], order: [...TOOLBAR_ACTIONS.map((a) => a.id)].reverse() };
+    await saveProfile(TOOLBAR_PREFS_PROFILE, reordered);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/reader-profiles/save",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ name: "toolbar-prefs", profile: reordered }),
+      }),
+    );
+  });
+
+  it("DEFAULT_TOOLBAR_PREFS hides nothing and imposes no explicit order", () => {
+    expect(DEFAULT_TOOLBAR_PREFS).toEqual({ hidden: [], order: [] });
   });
 });
