@@ -38,6 +38,7 @@ filetime = "0.2.26"
 # on the process's working directory at runtime.
 include_dir = "0.7"
 fontdb = "0.24"
+url = "2.5.8"
 
 [dev-dependencies]
 zip = "0.6"
