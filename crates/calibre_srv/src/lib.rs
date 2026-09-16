@@ -184,6 +184,7 @@ pub mod opds;
 pub mod opts;
 pub mod reader_profiles;
 pub mod render_endpoints;
+pub mod share;
 pub mod users;
 pub mod users_api;
 pub mod utils;
@@ -284,6 +285,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/catalog/generate", get(catalog::generate))
         .route("/news/fetch", post(news::fetch_news))
         .route("/news/status/{job_id}", get(news::news_status).post(news::news_status))
+        .route("/share/email", post(share::share_email))
         .route("/cdb/add-book/{job_id}/{add_duplicates}/{filename}/{library_id}", post(cdb::add_book))
         .route("/cdb/delete-books/{book_ids}/{library_id}", post(cdb::delete_books))
         .route("/cdb/delete-books/{book_ids}", post(cdb::delete_books_no_library))

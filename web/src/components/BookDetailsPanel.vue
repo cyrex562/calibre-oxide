@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { useRouter } from "vue-router";
-import { addFormat, deleteBooks, fetchBook, fetchConversionBookData, getConversionStatus, removeFormat, setCover, setFields, startConversion } from "../library/api";
+import { addFormat, deleteBooks, fetchBook, fetchConversionBookData, getConversionStatus, removeFormat, setCover, setFields, shareEmail, startConversion } from "../library/api";
+import type { SmtpRelayConfig } from "../library/api";
 import type { BookFieldChanges, BookSummary } from "../library/types";
 
 const props = defineProps<{ bookId: number }>();
@@ -90,6 +91,59 @@ async function runConversion() {
     convertError.value = e instanceof Error ? e.message : String(e);
   } finally {
     converting.value = false;
+  }
+}
+
+// Send via email -- real POST /share/email. No persisted SMTP account
+// server-side yet (crates/calibre_srv/src/share.rs's own doc: ties
+// into the not-yet-built preferences epic), so the relay config is
+// remembered client-side in localStorage instead, purely for this
+// browser's own convenience across sends.
+const RELAY_STORAGE_KEY = "calibre-oxide-smtp-relay";
+
+function loadSavedRelay(): SmtpRelayConfig {
+  try {
+    const raw = localStorage.getItem(RELAY_STORAGE_KEY);
+    if (raw) return JSON.parse(raw) as SmtpRelayConfig;
+  } catch {
+    // Ignore a corrupt/unavailable localStorage entry -- fall through
+    // to real, empty defaults below rather than failing to open the
+    // share panel at all.
+  }
+  return { relay: "", encryption: "tls" };
+}
+
+const shareOpen = ref(false);
+const shareFormat = ref("");
+const shareFrom = ref("");
+const shareTo = ref("");
+const shareSubject = ref("");
+const shareRelay = ref<SmtpRelayConfig>(loadSavedRelay());
+const sharing = ref(false);
+const shareError = ref<string | null>(null);
+const shareDone = ref(false);
+
+function openShare() {
+  shareOpen.value = true;
+  shareDone.value = false;
+  shareError.value = null;
+  shareFormat.value = book.value?.formats[0] ?? "";
+  shareSubject.value = book.value?.title ?? "";
+}
+
+async function sendShareEmail() {
+  if (!shareFormat.value || !shareFrom.value || !shareTo.value || !shareRelay.value.relay) return;
+  sharing.value = true;
+  shareError.value = null;
+  shareDone.value = false;
+  try {
+    await shareEmail(props.bookId, shareFormat.value, shareFrom.value, shareTo.value, shareRelay.value, shareSubject.value || undefined);
+    localStorage.setItem(RELAY_STORAGE_KEY, JSON.stringify(shareRelay.value));
+    shareDone.value = true;
+  } catch (e) {
+    shareError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    sharing.value = false;
   }
 }
 
@@ -214,6 +268,7 @@ async function load(id: number) {
   book.value = null;
   editing.value = false;
   convertOpen.value = false;
+  shareOpen.value = false;
   try {
     book.value = await fetchBook(id);
   } catch (e) {
@@ -263,6 +318,7 @@ function read() {
           <a v-for="[fmt, url] in formatLinks" :key="fmt" :href="url" class="download"> Download {{ fmt.toUpperCase() }} </a>
           <button class="edit" @click="startEditing">Edit metadata</button>
           <button class="edit" @click="openConvert">Convert…</button>
+          <button class="edit" @click="openShare">Send…</button>
           <button class="delete" :disabled="deleting" @click="deleteBook">{{ deleting ? "Deleting…" : "Delete" }}</button>
         </div>
 
@@ -291,6 +347,59 @@ function read() {
           </template>
           <p v-if="convertError" class="error">{{ convertError }}</p>
         </div>
+
+        <form v-if="shareOpen" class="convert-panel" @submit.prevent="sendShareEmail">
+          <div class="convert-row">
+            <label>
+              Format
+              <select v-model="shareFormat" :disabled="sharing">
+                <option v-for="fmt in book.formats" :key="fmt" :value="fmt">{{ fmt.toUpperCase() }}</option>
+              </select>
+            </label>
+            <label>
+              From
+              <input v-model="shareFrom" type="email" placeholder="me@example.com" required :disabled="sharing" />
+            </label>
+            <label>
+              To
+              <input v-model="shareTo" type="email" placeholder="you@example.com" required :disabled="sharing" />
+            </label>
+          </div>
+          <div class="convert-row">
+            <label>
+              SMTP relay
+              <input v-model="shareRelay.relay" placeholder="smtp.example.com" required :disabled="sharing" />
+            </label>
+            <label>
+              Port
+              <input v-model.number="shareRelay.port" type="number" placeholder="587" :disabled="sharing" />
+            </label>
+            <label>
+              Encryption
+              <select v-model="shareRelay.encryption" :disabled="sharing">
+                <option value="tls">STARTTLS</option>
+                <option value="ssl">SSL</option>
+                <option value="none">None</option>
+              </select>
+            </label>
+          </div>
+          <div class="convert-row">
+            <label>
+              Username
+              <input v-model="shareRelay.username" :disabled="sharing" />
+            </label>
+            <label>
+              Password
+              <input v-model="shareRelay.password" type="password" :disabled="sharing" />
+            </label>
+          </div>
+          <div class="convert-row">
+            <button type="submit" class="read" :disabled="sharing">{{ sharing ? "Sending…" : "Send" }}</button>
+            <button type="button" :disabled="sharing" @click="shareOpen = false">Close</button>
+          </div>
+          <p v-if="shareDone" class="convert-done">Sent.</p>
+          <p v-if="shareError" class="error">{{ shareError }}</p>
+        </form>
       </template>
 
       <form v-else-if="book && editing" class="edit-form" @submit.prevent="saveEdits">
