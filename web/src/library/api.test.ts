@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { addBook, addFormat, deleteBooks, fetchBooks, fetchConversionBookData, ftsSearch, ftsSnippets, getConversionStatus, removeFormat, setCover, setFields, setFtsEnabled, startConversion } from "./api";
+import { addBook, addFormat, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchConversionBookData, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, removeFormat, renameSavedSearch, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, startConversion } from "./api";
 import type { BookSummary } from "./types";
 
 function bookStub(id: number): BookSummary {
@@ -266,5 +266,68 @@ describe("setFtsEnabled", () => {
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe("/fts/indexing");
     expect(init.body).toBe("true");
+  });
+});
+
+describe("virtual library management", () => {
+  it("setVirtualLibrary posts the query body to the name-scoped URL", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await setVirtualLibrary("My VL", "tags:scifi");
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/vl/set/My%20VL");
+    expect(JSON.parse(init.body)).toEqual({ query: "tags:scifi" });
+  });
+
+  it("deleteVirtualLibrary posts with no body", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await deleteVirtualLibrary("My VL");
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/vl/delete/My%20VL");
+    expect(init.method).toBe("POST");
+  });
+
+  it("setVirtualLibrary throws on a real failure", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: false, status: 500, statusText: "Internal Server Error" });
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(setVirtualLibrary("x", "y")).rejects.toThrow(/500/);
+  });
+});
+
+describe("saved search management", () => {
+  it("fetchSavedSearches fetches the real map", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ "My Search": "authors:asimov" }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const map = await fetchSavedSearches();
+    expect(map["My Search"]).toBe("authors:asimov");
+    expect(fetchMock.mock.calls[0][0]).toBe("/ajax/saved-searches");
+  });
+
+  it("setSavedSearch posts the query body to the name-scoped URL", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await setSavedSearch("My Search", "authors:asimov");
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/saved-search/set/My%20Search");
+    expect(JSON.parse(init.body)).toEqual({ query: "authors:asimov" });
+  });
+
+  it("deleteSavedSearch posts with no body", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+    vi.stubGlobal("fetch", fetchMock);
+    await deleteSavedSearch("My Search");
+    expect(fetchMock.mock.calls[0][0]).toBe("/saved-search/delete/My%20Search");
+  });
+
+  it("renameSavedSearch posts to the old/new-name-scoped URL", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+    vi.stubGlobal("fetch", fetchMock);
+    await renameSavedSearch("Old", "New");
+    expect(fetchMock.mock.calls[0][0]).toBe("/saved-search/rename/Old/New");
   });
 });

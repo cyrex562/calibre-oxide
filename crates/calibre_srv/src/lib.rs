@@ -175,6 +175,7 @@ pub mod fts;
 pub mod jobs;
 pub mod legacy;
 pub mod library_broker;
+pub mod lists;
 pub mod mathjax;
 pub mod notes;
 pub mod opds;
@@ -268,7 +269,13 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/ajax/library-info", get(ajax::library_info))
         .route("/ajax/field-metadata", get(ajax::field_metadata))
         .route("/ajax/virtual-libraries", get(ajax::virtual_libraries))
+        .route("/ajax/saved-searches", get(lists::saved_searches))
         .route("/ajax/session-data", get(ajax::get_session_data).post(ajax::set_session_data))
+        .route("/vl/set/{name}", post(lists::set_virtual_library))
+        .route("/vl/delete/{name}", post(lists::delete_virtual_library))
+        .route("/saved-search/set/{name}", post(lists::set_saved_search))
+        .route("/saved-search/delete/{name}", post(lists::delete_saved_search))
+        .route("/saved-search/rename/{old_name}/{new_name}", post(lists::rename_saved_search))
         .route("/cdb/add-book/{job_id}/{add_duplicates}/{filename}/{library_id}", post(cdb::add_book))
         .route("/cdb/delete-books/{book_ids}/{library_id}", post(cdb::delete_books))
         .route("/cdb/delete-books/{book_ids}", post(cdb::delete_books_no_library))
