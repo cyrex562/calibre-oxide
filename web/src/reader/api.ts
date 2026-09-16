@@ -3,7 +3,7 @@
 // old_src/src/pyj/ajax.pyj's role for this slice, narrowed to only
 // what the reader MVP needs (no generic XHR-progress/upload support).
 
-import type { Bookmark, BookManifest, LastReadPosition } from "./types";
+import type { Bookmark, BookManifest, Highlight, LastReadPosition } from "./types";
 
 async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(url, init);
@@ -66,9 +66,9 @@ export async function setLastReadPosition(bookId: string, fmt: string, device: s
   });
 }
 
-export async function getAnnotations(bookId: string, fmt: string): Promise<{ bookmark?: Bookmark[] }> {
+export async function getAnnotations(bookId: string, fmt: string): Promise<{ bookmark?: Bookmark[]; highlight?: Highlight[] }> {
   const which = `${bookId}-${fmt}`;
-  const data = await jsonFetch<Record<string, { annotations_map?: { bookmark?: Bookmark[] } }>>(`/book-get-annotations/${LIBRARY_ID}/${which}`);
+  const data = await jsonFetch<Record<string, { annotations_map?: { bookmark?: Bookmark[]; highlight?: Highlight[] } }>>(`/book-get-annotations/${LIBRARY_ID}/${which}`);
   return data[`${bookId}:${fmt}`]?.annotations_map ?? {};
 }
 
@@ -81,4 +81,15 @@ export async function addBookmark(bookId: string, fmt: string, title: string, po
   });
   if (!resp.ok) throw new Error(`POST /book-update-annotations failed: ${resp.status} ${resp.statusText}`);
   return bookmark;
+}
+
+export async function addHighlight(bookId: string, fmt: string, startCfi: string, endCfi: string, highlightedText: string): Promise<Highlight> {
+  const highlight: Highlight = { type: "highlight", uuid: crypto.randomUUID(), timestamp: new Date().toISOString(), start_cfi: startCfi, end_cfi: endCfi, highlighted_text: highlightedText };
+  const resp = await fetch(`/book-update-annotations/${LIBRARY_ID}/${bookId}/${fmt}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ highlight: [highlight] }),
+  });
+  if (!resp.ok) throw new Error(`POST /book-update-annotations failed: ${resp.status} ${resp.statusText}`);
+  return highlight;
 }
