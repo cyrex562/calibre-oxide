@@ -3,7 +3,7 @@
 // old_src/src/pyj/ajax.pyj's role for this slice, narrowed to only
 // what the reader MVP needs (no generic XHR-progress/upload support).
 
-import type { BookManifest, LastReadPosition } from "./types";
+import type { Bookmark, BookManifest, LastReadPosition } from "./types";
 
 async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(url, init);
@@ -64,4 +64,21 @@ export async function setLastReadPosition(bookId: string, fmt: string, device: s
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ device, cfi, pos_frac: posFrac }),
   });
+}
+
+export async function getAnnotations(bookId: string, fmt: string): Promise<{ bookmark?: Bookmark[] }> {
+  const which = `${bookId}-${fmt}`;
+  const data = await jsonFetch<Record<string, { annotations_map?: { bookmark?: Bookmark[] } }>>(`/book-get-annotations/${LIBRARY_ID}/${which}`);
+  return data[`${bookId}:${fmt}`]?.annotations_map ?? {};
+}
+
+export async function addBookmark(bookId: string, fmt: string, title: string, pos: string): Promise<Bookmark> {
+  const bookmark: Bookmark = { type: "bookmark", title, timestamp: new Date().toISOString(), pos, pos_type: "calibre-oxide-simple-pos" };
+  const resp = await fetch(`/book-update-annotations/${LIBRARY_ID}/${bookId}/${fmt}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ bookmark: [bookmark] }),
+  });
+  if (!resp.ok) throw new Error(`POST /book-update-annotations failed: ${resp.status} ${resp.statusText}`);
+  return bookmark;
 }

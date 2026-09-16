@@ -52,12 +52,29 @@ export interface BookManifest {
   files: Record<string, FileInfo>;
   metadata?: Record<string, unknown>;
   last_read_positions?: LastReadPosition[];
-  annotations_map?: Record<string, unknown[]>;
+  annotations_map?: { bookmark?: Bookmark[]; [key: string]: unknown[] | undefined };
   // Cache-miss / job-status shaped response instead of a real manifest.
   job_status?: "waiting" | "running" | "finished" | "failed" | "unknown";
   aborted?: boolean;
   traceback?: string;
   job_id?: number;
+}
+
+// Real shape `calibre_db::annotations`'s own `annot_db_data`/merge
+// logic expects for a bookmark (see that module's own `MERGE_FIELDS`:
+// `title` is the merge key, so re-bookmarking under the same title
+// replaces rather than duplicates). `pos_type` here is
+// "calibre-oxide-simple-pos" rather than real upstream's "epubcfi" --
+// this reader has no real CFI implementation yet (see position.ts's
+// own doc), and the server never parses this field itself, only
+// stores/returns it verbatim, so an honestly-different pos_type is
+// the disclosed-narrowing choice, not a silent mismatch.
+export interface Bookmark {
+  type: "bookmark";
+  title: string;
+  timestamp: string;
+  pos: string;
+  pos_type: string;
 }
 
 export interface LastReadPosition {
