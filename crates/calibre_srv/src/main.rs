@@ -132,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
     let render_jobs = Arc::new(calibre_srv::render_endpoints::RenderJobRegistry::new());
     let conversion_jobs = Arc::new(calibre_srv::convert::ConversionJobRegistry::new());
     let news_jobs = Arc::new(calibre_srv::news::NewsJobRegistry::new());
+    let tweak_sessions = Arc::new(calibre_srv::tweak::TweakSessionRegistry::new());
     let state = AppState {
         libraries: None,
         cache: Arc::new(cache),
@@ -144,6 +145,7 @@ async fn main() -> anyhow::Result<()> {
         render_jobs,
         conversion_jobs,
         news_jobs,
+        tweak_sessions,
     };
 
     let use_bonjour = state.opts.use_bonjour;
