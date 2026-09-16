@@ -204,6 +204,16 @@ export function renameSavedSearch(oldName: string, newName: string): Promise<voi
   return postNoBody(`/saved-search/rename/${encodeURIComponent(oldName)}/${encodeURIComponent(newName)}`);
 }
 
+// Real, new route -- see crates/calibre_srv/src/catalog.rs's own doc
+// for why (catalog generation is CLI/GUI-only in real upstream
+// calibre, never exposed over HTTP there). A plain GET URL rather
+// than a fetch+blob dance: the response's own real Content-Disposition:
+// attachment header lets the browser handle the download natively.
+export function catalogDownloadUrl(search: string): string {
+  const qs = search ? `?${new URLSearchParams({ search })}` : "";
+  return `/catalog/generate${qs}`;
+}
+
 // Unlike this file's other write endpoints, /fts/indexing's real
 // handler returns an empty 200 body (`Result<(), ServerError>` in
 // Rust), not `{}` -- jsonFetch's own unconditional `.json()` would

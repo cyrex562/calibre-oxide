@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { addBook, addFormat, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchConversionBookData, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, removeFormat, renameSavedSearch, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, startConversion } from "./api";
+import { addBook, addFormat, catalogDownloadUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchConversionBookData, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, removeFormat, renameSavedSearch, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, startConversion } from "./api";
 import type { BookSummary } from "./types";
 
 function bookStub(id: number): BookSummary {
@@ -329,5 +329,15 @@ describe("saved search management", () => {
     vi.stubGlobal("fetch", fetchMock);
     await renameSavedSearch("Old", "New");
     expect(fetchMock.mock.calls[0][0]).toBe("/saved-search/rename/Old/New");
+  });
+});
+
+describe("catalogDownloadUrl", () => {
+  it("has no query string for the whole library", () => {
+    expect(catalogDownloadUrl("")).toBe("/catalog/generate");
+  });
+
+  it("scopes to a search query when given one", () => {
+    expect(catalogDownloadUrl("tags:scifi")).toBe("/catalog/generate?search=tags%3Ascifi");
   });
 });
