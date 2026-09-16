@@ -6,6 +6,7 @@ import { loadSpineFileInto, type ResolveContext } from "../reader/unserialize";
 import { anchorLinkData } from "../reader/virtualLinks";
 import { decodePosition, encodePosition } from "../reader/position";
 import { flattenToc } from "../reader/toc";
+import { DEFAULT_READER_PREFS, fetchProfile, READER_PREFS_PROFILE, type ReaderPrefs } from "../settings/api";
 import type { Bookmark, BookManifest } from "../reader/types";
 
 const route = useRoute();
@@ -24,6 +25,42 @@ const bookmarks = ref<Bookmark[]>([]);
 const bookmarkError = ref<string | null>(null);
 
 const tocEntries = computed(() => (manifest.value ? flattenToc(manifest.value.toc) : []));
+
+// Real reading preferences (issue #721) -- fetched once on mount,
+// re-applied to the sandboxed content iframe after every spine load
+// (a fresh document each time, so the injected <style> doesn't
+// survive navigation on its own).
+const readerPrefs = ref<ReaderPrefs>({ ...DEFAULT_READER_PREFS });
+
+async function loadReaderPrefs() {
+  try {
+    const prefs = await fetchProfile<ReaderPrefs>(READER_PREFS_PROFILE);
+    if (prefs) readerPrefs.value = prefs;
+  } catch (e) {
+    console.error("failed to load reading preferences", e);
+  }
+}
+
+const THEME_COLORS: Record<ReaderPrefs["theme"], { bg: string; fg: string }> = {
+  light: { bg: "#ffffff", fg: "#111111" },
+  dark: { bg: "#181818", fg: "#e8e8e8" },
+  sepia: { bg: "#f4ecd8", fg: "#3b3226" },
+};
+
+const READER_PREFS_STYLE_ID = "calibre-oxide-reading-prefs";
+
+function applyReaderPrefs() {
+  const doc = iframeEl.value?.contentDocument;
+  if (!doc) return;
+  const { bg, fg } = THEME_COLORS[readerPrefs.value.theme];
+  let style = doc.getElementById(READER_PREFS_STYLE_ID) as HTMLStyleElement | null;
+  if (!style) {
+    style = doc.createElement("style");
+    style.id = READER_PREFS_STYLE_ID;
+    doc.head?.appendChild(style);
+  }
+  style.textContent = `html { font-size: ${readerPrefs.value.fontSizePercent}% !important; } body { background: ${bg} !important; color: ${fg} !important; }`;
+}
 
 function deviceId(): string {
   const key = "calibre-oxide-device-id";
@@ -66,6 +103,7 @@ async function loadSpine(index: number, frag = "") {
   if (!name) return;
   spineIndex.value = index;
   await loadSpineFileInto(iframeEl.value.contentDocument, resolveContextFor(m), name);
+  applyReaderPrefs();
   if (frag) {
     iframeEl.value.contentDocument.getElementById(frag)?.scrollIntoView();
   }
@@ -109,6 +147,7 @@ async function init() {
   loadError.value = null;
   try {
     statusMessage.value = "Loading…";
+    await loadReaderPrefs();
     const m = await pollManifest();
     manifest.value = m;
     statusMessage.value = "";

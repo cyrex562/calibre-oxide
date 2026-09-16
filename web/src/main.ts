@@ -3,6 +3,7 @@ import { createRouter, createWebHistory } from "vue-router";
 import App from "./App.vue";
 import ReaderView from "./components/ReaderView.vue";
 import LibraryView from "./components/LibraryView.vue";
+import SettingsView from "./settings/SettingsView.vue";
 import "./style.css";
 
 const router = createRouter({
@@ -10,6 +11,7 @@ const router = createRouter({
   routes: [
     { path: "/", name: "library", component: LibraryView },
     { path: "/read/:bookId?/:fmt?", name: "read", component: ReaderView, props: true },
+    { path: "/settings", name: "settings", component: SettingsView },
   ],
 });
 

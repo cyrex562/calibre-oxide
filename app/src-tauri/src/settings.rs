@@ -32,11 +32,28 @@ use tauri::{AppHandle, Manager};
 /// months would turn the picker into a stale-path graveyard instead.
 const MAX_RECENT: usize = 8;
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+fn default_auto_reopen() -> bool {
+    true
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct Settings {
     library_path: Option<PathBuf>,
     #[serde(default)]
     recent_libraries: Vec<PathBuf>,
+    /// Whether to auto-reopen `library_path` on launch (issue #721).
+    /// Defaults to `true` -- this is the behavior every version of
+    /// this app has always had before this setting existed, so an
+    /// old `settings.json` with no such key must keep behaving the
+    /// same way rather than silently stop reopening.
+    #[serde(default = "default_auto_reopen")]
+    auto_reopen: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Settings {
+        Settings { library_path: None, recent_libraries: Vec::new(), auto_reopen: true }
+    }
 }
 
 fn settings_path(app: &AppHandle) -> std::io::Result<PathBuf> {
@@ -82,6 +99,17 @@ pub fn save_library_path(app: &AppHandle, library_path: &Path) -> std::io::Resul
     std::fs::write(path, serde_json::to_vec_pretty(&settings)?)
 }
 
+pub fn get_auto_reopen(app: &AppHandle) -> bool {
+    read(app).auto_reopen
+}
+
+pub fn set_auto_reopen(app: &AppHandle, enabled: bool) -> std::io::Result<()> {
+    let mut settings = read(app);
+    settings.auto_reopen = enabled;
+    let path = settings_path(app)?;
+    std::fs::write(path, serde_json::to_vec_pretty(&settings)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,6 +119,18 @@ mod tests {
         let mut list = vec![PathBuf::from("/a"), PathBuf::from("/b"), PathBuf::from("/c")];
         push_recent(&mut list, PathBuf::from("/b"), 8);
         assert_eq!(list, vec![PathBuf::from("/b"), PathBuf::from("/a"), PathBuf::from("/c")]);
+    }
+
+    #[test]
+    fn an_old_settings_json_with_no_auto_reopen_key_defaults_to_true() {
+        // Real regression guard: `auto_reopen` was added after
+        // `library_path`/`recent_libraries` already shipped -- an
+        // existing user's settings.json on disk has no such key at
+        // all, and must keep reopening automatically (its only
+        // behavior before this setting existed) rather than silently
+        // stop.
+        let settings: Settings = serde_json::from_str(r#"{"library_path": "/some/lib", "recent_libraries": []}"#).unwrap();
+        assert!(settings.auto_reopen);
     }
 
     #[test]
