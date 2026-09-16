@@ -467,3 +467,36 @@ export interface DuplicateBook {
 export function scanForDuplicates(): Promise<{ groups: DuplicateBook[][] }> {
   return jsonFetch<{ groups: DuplicateBook[][] }>("/duplicates/scan/default", { method: "POST" });
 }
+
+// Real, new routes -- see crates/calibre_srv/src/news_scheduler.rs's
+// own doc (real upstream schedules recurring recipe fetches inside
+// its own GUI job scheduler, never exposed over HTTP there).
+export interface NewsSchedule {
+  id: number;
+  title: string;
+  feeds: string[];
+  interval_secs: number;
+  next_run_at: string;
+  last_run_at: string | null;
+  last_result: string | null;
+}
+
+export function addNewsSchedule(title: string, feeds: string[], intervalSecs: number): Promise<{ id: number }> {
+  return jsonFetch<{ id: number }>("/news/schedules/add", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title, feeds, interval_secs: intervalSecs }),
+  });
+}
+
+export function listNewsSchedules(): Promise<{ schedules: NewsSchedule[] }> {
+  return jsonFetch<{ schedules: NewsSchedule[] }>("/news/schedules/list");
+}
+
+export function removeNewsSchedule(id: number): Promise<void> {
+  return postNoBody(`/news/schedules/remove/${id}`);
+}
+
+export function runNewsScheduleNow(id: number): Promise<{ ok: boolean; book_id?: number; error?: string }> {
+  return jsonFetch<{ ok: boolean; book_id?: number; error?: string }>(`/news/schedules/run-now/${id}`, { method: "POST" });
+}

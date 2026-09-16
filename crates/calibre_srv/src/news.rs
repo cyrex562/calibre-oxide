@@ -58,7 +58,7 @@ use crate::jobs::{JobId, JobStatus};
 use crate::web_socket::{self, ChangeEvent};
 use crate::AppState;
 
-struct GenericRecipe(RecipeConfig);
+pub(crate) struct GenericRecipe(pub RecipeConfig);
 
 impl NewsRecipeHooks for GenericRecipe {
     fn config(&self) -> &RecipeConfig {
@@ -72,7 +72,7 @@ impl NewsRecipePostprocessHooks for GenericRecipe {}
 /// `calibre_ebooks::web::feeds::download`'s own test helper exactly
 /// (`test_db`), needed by `build_index` for real default-cover/
 /// masthead-image generation.
-fn fontdb() -> &'static std::sync::Arc<fontdb::Database> {
+pub(crate) fn fontdb() -> &'static std::sync::Arc<fontdb::Database> {
     static DB: OnceLock<std::sync::Arc<fontdb::Database>> = OnceLock::new();
     DB.get_or_init(|| {
         let mut db = fontdb::Database::new();
@@ -314,7 +314,7 @@ mod tests {
             jobs: std::sync::Arc::new(crate::jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
             render_jobs: std::sync::Arc::new(crate::render_endpoints::RenderJobRegistry::new()),
             conversion_jobs: std::sync::Arc::new(crate::convert::ConversionJobRegistry::new()),
-            news_jobs: std::sync::Arc::new(crate::news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()),
+            news_jobs: std::sync::Arc::new(crate::news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()),
         };
         let router = crate::test_router(state);
         (dir, router)

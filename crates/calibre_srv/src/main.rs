@@ -133,6 +133,7 @@ async fn main() -> anyhow::Result<()> {
     let conversion_jobs = Arc::new(calibre_srv::convert::ConversionJobRegistry::new());
     let news_jobs = Arc::new(calibre_srv::news::NewsJobRegistry::new());
     let tweak_sessions = Arc::new(calibre_srv::tweak::TweakSessionRegistry::new());
+    let news_schedules = Arc::new(calibre_srv::news_scheduler::NewsScheduleStore::new(&cli.library_path.join("news-schedules.sqlite"))?);
     let state = AppState {
         libraries: None,
         cache: Arc::new(cache),
@@ -146,7 +147,15 @@ async fn main() -> anyhow::Result<()> {
         conversion_jobs,
         news_jobs,
         tweak_sessions,
+        news_schedules,
     };
+
+    // Real background scheduler for #764's own recurring news
+    // fetches -- see calibre_srv::news_scheduler's own doc. A 30s tick
+    // is frequent enough for a real short interval_secs to actually
+    // demonstrate scheduling during manual verification, without
+    // polling the schedule store aggressively in normal operation.
+    tokio::spawn(calibre_srv::news_scheduler::run_scheduler_loop(state.clone(), std::time::Duration::from_secs(30)));
 
     let use_bonjour = state.opts.use_bonjour;
     let library_name = cli.library_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "calibre-oxide Library".to_string());
