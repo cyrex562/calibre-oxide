@@ -1,12 +1,12 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute } from "vue-router";
-import { fetchManifest, getLastReadPositions, setLastReadPosition } from "../reader/api";
+import { addBookmark, fetchManifest, getAnnotations, getLastReadPositions, setLastReadPosition } from "../reader/api";
 import { loadSpineFileInto, type ResolveContext } from "../reader/unserialize";
 import { anchorLinkData } from "../reader/virtualLinks";
 import { decodePosition, encodePosition } from "../reader/position";
 import { flattenToc } from "../reader/toc";
-import type { BookManifest } from "../reader/types";
+import type { Bookmark, BookManifest } from "../reader/types";
 
 const route = useRoute();
 
@@ -18,7 +18,10 @@ const loadError = ref<string | null>(null);
 const statusMessage = ref("");
 const spineIndex = ref(0);
 const showToc = ref(false);
+const showBookmarks = ref(false);
 const iframeEl = ref<HTMLIFrameElement | null>(null);
+const bookmarks = ref<Bookmark[]>([]);
+const bookmarkError = ref<string | null>(null);
 
 const tocEntries = computed(() => (manifest.value ? flattenToc(manifest.value.toc) : []));
 
@@ -110,6 +113,21 @@ async function init() {
     manifest.value = m;
     statusMessage.value = "";
 
+    // Not `m.annotations_map`: `render_endpoints.rs` only populates
+    // that field when the request is authenticated
+    // (`is_authenticated` gate), and this app's own spawned
+    // `calibre_srv` runs with auth disabled by default -- the
+    // manifest's copy would silently always be empty in real use.
+    // `/book-get-annotations` has no such gate (its `effective_user`
+    // falls back to the anonymous user id), so it's the real source
+    // of truth here regardless of auth state.
+    try {
+      const map = await getAnnotations(bookId.value, fmt.value);
+      bookmarks.value = map.bookmark ?? [];
+    } catch (e) {
+      console.error("failed to load bookmarks", e);
+    }
+
     const positions = await getLastReadPositions(bookId.value, fmt.value);
     const device = deviceId();
     const mine = positions.find((p) => p.device === device) ?? positions[0];
@@ -151,13 +169,40 @@ function goToTocEntry(dest: string | null, frag: string | null) {
   showToc.value = false;
   void loadSpine(idx, frag ?? "");
 }
+
+async function bookmarkCurrentPage() {
+  const m = manifest.value;
+  if (!m) return;
+  const suggested = tocEntries.value.find((e) => m.spine.indexOf(e.dest ?? "") === spineIndex.value)?.title ?? `Page ${spineIndex.value + 1}`;
+  const title = prompt("Bookmark title:", suggested);
+  if (!title) return;
+  bookmarkError.value = null;
+  try {
+    const bookmark = await addBookmark(bookId.value, fmt.value, title, encodePosition({ spineIndex: spineIndex.value, frag: "" }));
+    // Re-bookmarking under the same title replaces it server-side
+    // (annotations.rs's own title-keyed merge) -- mirror that locally
+    // rather than appending a duplicate entry.
+    bookmarks.value = [...bookmarks.value.filter((b) => b.title !== title), bookmark];
+  } catch (e) {
+    bookmarkError.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
+function goToBookmark(bookmark: Bookmark) {
+  const pos = decodePosition(bookmark.pos);
+  if (!pos) return;
+  showBookmarks.value = false;
+  void loadSpine(pos.spineIndex, pos.frag);
+}
 </script>
 
 <template>
   <div class="reader">
     <header class="toolbar">
       <router-link to="/" class="back">Library</router-link>
-      <button @click="showToc = !showToc" :disabled="!manifest">Contents</button>
+      <button @click="showBookmarks = false; showToc = !showToc" :disabled="!manifest">Contents</button>
+      <button @click="showToc = false; showBookmarks = !showBookmarks" :disabled="!manifest">Bookmarks ({{ bookmarks.length }})</button>
+      <button @click="bookmarkCurrentPage" :disabled="!manifest">Bookmark this page</button>
       <button @click="prev" :disabled="spineIndex <= 0">◀ Prev</button>
       <span class="title">{{ manifest?.metadata?.title ?? "" }}</span>
       <button @click="next" :disabled="!manifest || spineIndex >= manifest.spine.length - 1">Next ▶</button>
@@ -166,11 +211,21 @@ function goToTocEntry(dest: string | null, frag: string | null) {
     <p v-if="!bookId" class="empty">Open a book via <code>/read/&lt;book_id&gt;/&lt;fmt&gt;</code>.</p>
     <p v-else-if="loadError" class="error">{{ loadError }}</p>
     <p v-else-if="statusMessage" class="status">{{ statusMessage }}</p>
+    <p v-if="bookmarkError" class="error">{{ bookmarkError }}</p>
 
     <nav v-if="showToc" class="toc">
       <ul>
         <li v-for="(entry, i) in tocEntries" :key="i" :style="{ paddingLeft: `${entry.depth}em` }">
           <a href="#" @click.prevent="goToTocEntry(entry.dest, entry.frag)">{{ entry.title }}</a>
+        </li>
+      </ul>
+    </nav>
+
+    <nav v-if="showBookmarks" class="toc">
+      <p v-if="bookmarks.length === 0" class="empty">No bookmarks yet.</p>
+      <ul v-else>
+        <li v-for="b in bookmarks" :key="b.title">
+          <a href="#" @click.prevent="goToBookmark(b)">{{ b.title }}</a>
         </li>
       </ul>
     </nav>
