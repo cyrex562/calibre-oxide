@@ -8,7 +8,7 @@ import { decodePosition, encodePosition } from "../reader/position";
 import { flattenToc } from "../reader/toc";
 import { encodeBoundary, rangeFromEncoded } from "../reader/highlightRange";
 import { wrapHighlightRange } from "../reader/highlightDom";
-import { DEFAULT_READER_PREFS, fetchProfile, READER_PREFS_PROFILE, type ReaderPrefs } from "../settings/api";
+import { DEFAULT_KEYMAP, DEFAULT_READER_PREFS, fetchProfile, KEYMAP_PROFILE, READER_PREFS_PROFILE, type KeymapPrefs, type ReaderPrefs } from "../settings/api";
 import type { Bookmark, BookManifest, Highlight } from "../reader/types";
 
 const route = useRoute();
@@ -42,6 +42,19 @@ async function loadReaderPrefs() {
     if (prefs) readerPrefs.value = prefs;
   } catch (e) {
     console.error("failed to load reading preferences", e);
+  }
+}
+
+// Real keyboard shortcut customization (#752) -- loaded once on
+// mount, same pattern as readerPrefs above.
+const keymap = ref<KeymapPrefs>({ ...DEFAULT_KEYMAP });
+
+async function loadKeymap() {
+  try {
+    const prefs = await fetchProfile<KeymapPrefs>(KEYMAP_PROFILE);
+    if (prefs) keymap.value = { ...DEFAULT_KEYMAP, ...prefs };
+  } catch (e) {
+    console.error("failed to load keyboard shortcuts", e);
   }
 }
 
@@ -243,6 +256,7 @@ async function init() {
   try {
     statusMessage.value = "Loading…";
     await loadReaderPrefs();
+    await loadKeymap();
     const m = await pollManifest();
     manifest.value = m;
     statusMessage.value = "";
@@ -285,8 +299,8 @@ function prev() {
 }
 
 function onKeydown(e: KeyboardEvent) {
-  if (e.key === "PageDown" || e.key === "ArrowRight") next();
-  else if (e.key === "PageUp" || e.key === "ArrowLeft") prev();
+  if (e.key === keymap.value.readerNext) next();
+  else if (e.key === keymap.value.readerPrev) prev();
 }
 
 onMounted(() => {

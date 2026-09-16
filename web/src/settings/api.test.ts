@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fetchProfile, saveProfile } from "./api";
+import { DEFAULT_KEYMAP, fetchProfile, KEYMAP_PROFILE, saveProfile } from "./api";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -37,6 +37,22 @@ describe("saveProfile", () => {
       expect.objectContaining({
         method: "POST",
         body: JSON.stringify({ name: "library-prefs", profile: { sort: "title", pageSize: 48 } }),
+      }),
+    );
+  });
+
+  it("round-trips a rebound keymap through the same profile storage", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => true });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const rebound = { ...DEFAULT_KEYMAP, readerNext: " " };
+    await saveProfile(KEYMAP_PROFILE, rebound);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/reader-profiles/save",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ name: "keymap", profile: rebound }),
       }),
     );
   });

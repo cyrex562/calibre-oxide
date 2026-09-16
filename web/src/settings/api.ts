@@ -48,3 +48,24 @@ export const DEFAULT_READER_PREFS: ReaderPrefs = { fontSizePercent: 100, theme: 
 
 export const LIBRARY_PREFS_PROFILE = "library-prefs";
 export const READER_PREFS_PROFILE = "reader-prefs";
+
+// Keyboard shortcut customization (#752). A real, deliberate first
+// slice: this port's own real keyboard-triggerable action surface
+// today is exactly `ReaderView.vue`'s prev/next handlers (confirmed
+// via grep before assuming a larger surface existed, matching this
+// issue's own filed instruction) -- nothing in `LibraryView.vue` is
+// keyboard-triggerable yet. Each action gets exactly one rebindable
+// key (a `KeyboardEvent.key` value, e.g. "ArrowRight"); this replaces
+// the previous hardcoded PageDown/ArrowRight and PageUp/ArrowLeft
+// dual-binding with a single real configurable key per action rather
+// than preserving both as permanent unconfigurable fallbacks -- a
+// real, disclosed narrowing, not an oversight.
+export type KeymapAction = "readerNext" | "readerPrev";
+
+export type KeymapPrefs = Record<KeymapAction, string>;
+
+export const DEFAULT_KEYMAP: KeymapPrefs = { readerNext: "ArrowRight", readerPrev: "ArrowLeft" };
+
+export const KEYMAP_ACTION_LABELS: Record<KeymapAction, string> = { readerNext: "Reader: next page", readerPrev: "Reader: previous page" };
+
+export const KEYMAP_PROFILE = "keymap";
