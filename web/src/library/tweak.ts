@@ -47,3 +47,34 @@ export async function commitTweakSession(sessionId: string): Promise<void> {
 export async function discardTweakSession(sessionId: string): Promise<void> {
   await fetch(`/tweak/discard/${sessionId}`, { method: "POST" });
 }
+
+// Real visual TOC tree editor (issue #760) -- see
+// crates/calibre_srv/src/tweak.rs's own doc for the "whole-tree
+// replace" design (the tree UI edits its own local copy, then this
+// posts the whole thing once, same "edit locally, then commit" shape
+// the plain-text editor above already uses).
+export interface TocNode {
+  title: string | null;
+  dest: string | null;
+  frag: string | null;
+  dest_exists?: boolean | null;
+  children: TocNode[];
+}
+
+export async function fetchToc(sessionId: string): Promise<TocNode[]> {
+  const url = `/tweak/toc/${sessionId}`;
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error((await resp.text()) || `${resp.status} ${resp.statusText}`);
+  const body = (await resp.json()) as { children: TocNode[] };
+  return body.children;
+}
+
+export async function saveToc(sessionId: string, children: TocNode[]): Promise<void> {
+  const url = `/tweak/toc/${sessionId}`;
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ children }),
+  });
+  if (!resp.ok) throw new Error((await resp.text()) || `${resp.status} ${resp.statusText}`);
+}

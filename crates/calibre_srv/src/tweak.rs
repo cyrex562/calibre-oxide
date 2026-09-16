@@ -206,6 +206,112 @@ pub async fn discard(State(state): State<AppState>, AxumPath(session_id): AxumPa
     Ok(())
 }
 
+// ===================================================================
+// Visual TOC tree editor (issue #760)
+// ===================================================================
+//
+// Reuses the exact same `TweakSession`/`EpubContainer` this module's
+// plain-text file editing already opens/commits -- these routes are
+// just a second, structured view onto the same open session, not a
+// separate primitive. Built on `oeb::polish::toc`'s real, complete
+// `Toc`/`get_toc`/`commit_toc` engine (#77's sibling epic, 2697 lines,
+// confirmed via grep to have had zero `calibre_srv` callers before
+// this route -- the same "real backend, zero route" gap this whole
+// issue cluster keeps finding).
+//
+// **Real design choice: whole-tree replace, not incremental
+// add/remove/reorder ops over HTTP.** The tree UI edits its own local
+// copy (add/remove/rename/drag-reorder all happen client-side, same
+// as how the plain-text editor already lets a user freely edit before
+// ever calling `/tweak/file`), then `POST /tweak/toc/{session_id}`
+// sends the complete resulting tree once and this route rebuilds a
+// fresh `Toc` from it and calls `commit_toc` -- matching this port's
+// established "edit locally, then commit the whole thing" precedent
+// rather than inventing granular mutation endpoints. The book's real
+// `lang`/`uid` (read via a real `get_toc` call first) are preserved
+// across the rebuild rather than discarded.
+
+use calibre_ebooks::oeb::polish::toc::{commit_toc, get_toc, Toc, TocNodeId};
+
+#[derive(serde::Serialize)]
+struct TocNodeOut {
+    title: Option<String>,
+    dest: Option<String>,
+    frag: Option<String>,
+    dest_exists: Option<bool>,
+    children: Vec<TocNodeOut>,
+}
+
+fn toc_node_out(toc: &Toc, id: TocNodeId) -> TocNodeOut {
+    let node = toc.node(id);
+    TocNodeOut {
+        title: node.title.clone(),
+        dest: node.dest.clone(),
+        frag: node.frag.clone(),
+        dest_exists: node.dest_exists,
+        children: toc.children(id).iter().map(|&c| toc_node_out(toc, c)).collect(),
+    }
+}
+
+/// `GET /tweak/toc/{session_id}` -- the book's current TOC as a real
+/// structured tree. `verify_destinations: true` so `dest_exists` is
+/// real, not always `None` -- a tree UI showing a broken-link warning
+/// on a stale entry is exactly the kind of thing this editor is for.
+pub async fn get_toc_route(State(state): State<AppState>, AxumPath(session_id): AxumPath<String>) -> Result<Json<Value>, ServerError> {
+    tokio::task::spawn_blocking(move || -> Result<Json<Value>, ServerError> {
+        let mut sessions = state.tweak_sessions.sessions.lock().unwrap();
+        let session = sessions.get_mut(&session_id).ok_or_else(|| ServerError::NotFound(format!("No tweak session: {session_id}")))?;
+        let toc = get_toc(&mut session.container, true).map_err(|e| ServerError::InternalServerError(format!("{e:#}")))?;
+        let root = toc_node_out(&toc, toc.root);
+        Ok(Json(json!({"children": root.children})))
+    })
+    .await
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))?
+}
+
+#[derive(serde::Deserialize)]
+pub struct TocNodeIn {
+    title: Option<String>,
+    dest: Option<String>,
+    frag: Option<String>,
+    #[serde(default)]
+    children: Vec<TocNodeIn>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetTocBody {
+    children: Vec<TocNodeIn>,
+}
+
+fn build_toc(toc: &mut Toc, parent: TocNodeId, nodes: Vec<TocNodeIn>) {
+    for n in nodes {
+        let id = toc.add(parent, n.title, n.dest, n.frag);
+        build_toc(toc, id, n.children);
+    }
+}
+
+/// `POST /tweak/toc/{session_id}` -- replaces the TOC with the given
+/// tree and commits it into the session's own working tree (still
+/// requires a separate `/tweak/commit/{session_id}` to save the whole
+/// session back to the library, same two-step shape as editing a file
+/// via `/tweak/file` then committing).
+pub async fn set_toc_route(State(state): State<AppState>, AxumPath(session_id): AxumPath<String>, Json(body): Json<SetTocBody>) -> Result<Json<Value>, ServerError> {
+    tokio::task::spawn_blocking(move || -> Result<Json<Value>, ServerError> {
+        let mut sessions = state.tweak_sessions.sessions.lock().unwrap();
+        let session = sessions.get_mut(&session_id).ok_or_else(|| ServerError::NotFound(format!("No tweak session: {session_id}")))?;
+
+        let old = get_toc(&mut session.container, false).map_err(|e| ServerError::InternalServerError(format!("{e:#}")))?;
+        let mut new_toc = Toc::new();
+        let root = new_toc.root;
+        build_toc(&mut new_toc, root, body.children);
+
+        commit_toc(&mut session.container, &new_toc, old.lang.as_deref(), old.uid.as_deref()).map_err(|e| ServerError::BadRequest(format!("{e:#}")))?;
+        Ok(Json(json!({"ok": true})))
+    })
+    .await
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))?
+}
+
 #[cfg(test)]
 mod tests {
     use axum::body::{to_bytes, Body};
@@ -295,6 +401,14 @@ mod tests {
         (status, String::from_utf8_lossy(&bytes).into_owned())
     }
 
+    async fn post_json(router: &axum::Router, uri: &str, body: serde_json::Value) -> (StatusCode, String) {
+        let req = Request::builder().method("POST").uri(uri).header("content-type", "application/json").body(Body::from(body.to_string())).unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
     #[tokio::test]
     async fn open_lists_every_real_container_file() {
         let (_dir, router, book_id) = test_app();
@@ -304,6 +418,60 @@ mod tests {
         let files: Vec<String> = json["files"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
         assert!(files.contains(&"chapter1.xhtml".to_string()), "{files:?}");
         assert!(files.contains(&"META-INF/container.xml".to_string()), "{files:?}");
+    }
+
+    #[tokio::test]
+    async fn a_real_toc_entry_added_via_the_tree_route_survives_commit_and_reopen() {
+        // Real end-to-end proof, matching #760's own definition of
+        // done: add a real TOC entry via the tree route, commit,
+        // reopen a fresh session, and confirm the entry is really
+        // there -- through the same live HTTP routes a real client
+        // would use.
+        let (_dir, router, book_id) = test_app();
+        let (status, body) = post(&router, &format!("/tweak/open/{book_id}/epub/default"), Body::empty()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let session_id = json["session_id"].as_str().unwrap().to_string();
+
+        // The fixture EPUB has no NCX/nav TOC of its own -- confirm
+        // get_toc reports a real, empty tree rather than erroring.
+        let (status, body) = get(&router, &format!("/tweak/toc/{session_id}")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["children"].as_array().unwrap().len(), 0, "{json}");
+
+        let new_tree = serde_json::json!({
+            "children": [
+                {"title": "Chapter One", "dest": "chapter1.xhtml", "frag": null, "children": []},
+            ]
+        });
+        let (status, body) = post_json(&router, &format!("/tweak/toc/{session_id}"), new_tree).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (status, _) = post(&router, &format!("/tweak/commit/{session_id}"), Body::empty()).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Re-open a fresh session and confirm the committed TOC really
+        // has the new entry.
+        let (status, body) = post(&router, &format!("/tweak/open/{book_id}/epub/default"), Body::empty()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let session_id2 = json["session_id"].as_str().unwrap().to_string();
+
+        let (status, body) = get(&router, &format!("/tweak/toc/{session_id2}")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let children = json["children"].as_array().unwrap();
+        assert_eq!(children.len(), 1, "{json}");
+        assert_eq!(children[0]["title"], "Chapter One");
+        assert_eq!(children[0]["dest"], "chapter1.xhtml");
+    }
+
+    #[tokio::test]
+    async fn set_toc_404s_for_an_unknown_session() {
+        let (_dir, router, _book_id) = test_app();
+        let (status, _) = post_json(&router, "/tweak/toc/no-such-session", serde_json::json!({"children": []})).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
