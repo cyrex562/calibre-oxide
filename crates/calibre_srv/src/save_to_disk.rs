@@ -35,10 +35,34 @@
 //!   directory-escape in upstream's own template evaluation if a
 //!   malicious/buggy template ever produced one. This port additionally
 //!   drops any component that sanitizes down to exactly `..` or empty,
-//!   and double-checks every final output path is still nested under
-//!   the chosen destination before writing, matching this project's
-//!   established defense-in-depth pattern (see `convert.rs`'s own
-//!   `output_fmt` validation).
+//!   and checks every final output path against the destination twice:
+//!   once lexically before `create_dir_all`, then again via
+//!   [`std::fs::canonicalize`] after (so a symlink pre-planted
+//!   *inside* the destination tree, which a lexical `starts_with` on
+//!   unresolved paths can't see, is also caught) -- see
+//!   `save_one_book`'s own doc.
+//! - **`dest` is a deliberately arbitrary absolute filesystem path,
+//!   not confined to a configured export root.** This matches this
+//!   issue's own filed scope ("a destination path... let the Tauri
+//!   side pick a real folder via `tauri-plugin-dialog`") and real
+//!   upstream's own GUI action, which is a plain OS folder picker with
+//!   no root restriction either. The route sits behind this crate's
+//!   standard `auth::require_auth` middleware like every other
+//!   mutating route (confirmed via `lib.rs`'s router: registered on
+//!   `api` before `route_layer(require_auth)` wraps it, not on the
+//!   small `auth_required=False` allowlist next to it) -- there is no
+//!   per-route authorization tier beyond "authenticated" anywhere in
+//!   this crate yet (every authenticated user can already add/delete/
+//!   overwrite any book file), so gating this one route behind a
+//!   finer-grained role would be new, cross-cutting RBAC work, not a
+//!   fix scoped to this route. Real residual risk in a multi-user
+//!   server deployment: an authenticated user can direct the server
+//!   process to write files anywhere it has filesystem permissions
+//!   for, not just under the library -- a genuinely new surface real
+//!   upstream never had (its own save-to-disk is Qt-GUI-local-only,
+//!   never reachable over the network). Worth a future dedicated
+//!   per-route permission system if this crate ever serves untrusted
+//!   multi-tenant users; out of scope for this issue.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -100,7 +124,16 @@ fn path_components(cache: &Cache, book_id: i32, template: &str, single_dir: bool
 /// Copies every requested (or, if none requested, every available)
 /// format of one book to `dest_root`, named from `template`. Returns
 /// the real paths written.
-fn save_one_book(cache: &Cache, book_id: i32, template: &str, dest_root: &Path, formats: Option<&[String]>, single_dir: bool) -> Result<Vec<String>, String> {
+///
+/// `canonical_dest_root` is `dest_root` already resolved via
+/// [`std::fs::canonicalize`] by the caller (once, not per book) --
+/// used below to catch a symlink planted *inside* the destination
+/// tree that would otherwise let a lexically-nested `out_path`
+/// resolve outside `dest_root` at write time. A plain `starts_with`
+/// on unresolved paths (this function's original version) can't see
+/// that: `dest_root/link -> /etc` still lexically starts with
+/// `dest_root` right up until the OS follows the symlink.
+fn save_one_book(cache: &Cache, book_id: i32, template: &str, dest_root: &Path, canonical_dest_root: &Path, formats: Option<&[String]>, single_dir: bool) -> Result<Vec<String>, String> {
     let row = book_row(cache, book_id)?;
     let available: Vec<String> = row["available_formats"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_uppercase())).collect()).unwrap_or_default();
     let wanted: Option<HashSet<String>> = formats.map(|f| f.iter().map(|s| s.to_uppercase()).collect());
@@ -126,20 +159,34 @@ fn save_one_book(cache: &Cache, book_id: i32, template: &str, dest_root: &Path, 
         // "Vol. 2").
         let out_path = PathBuf::from(format!("{}.{ext}", base_path.display()));
 
-        // Defense in depth: every sanitized component already had `/`
-        // and bare `..` stripped above, so this should never actually
-        // trip -- but a destination escape is exactly the class of
-        // bug worth double-checking rather than assuming, matching
-        // this project's established path-traversal-hardening pattern.
+        // Defense in depth, lexical pass: every sanitized component
+        // already had `/` and bare `..` stripped above, so this should
+        // never actually trip -- but a destination escape is exactly
+        // the class of bug worth double-checking rather than assuming.
         if !out_path.starts_with(dest_root) {
             return Err(format!("refusing to write outside the destination: {}", out_path.display()));
         }
 
-        if let Some(parent) = out_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        let Some(parent) = out_path.parent() else {
+            return Err(format!("refusing to write to a path with no parent directory: {}", out_path.display()));
+        };
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+
+        // Defense in depth, symlink-resolved pass: re-check *after*
+        // `create_dir_all` (so `canonicalize` has something real to
+        // resolve) that the directory we're about to write into still
+        // really lives under `canonical_dest_root` once every symlink
+        // is followed -- catches a symlink pre-planted somewhere
+        // inside an already-existing destination tree, which the
+        // lexical check above cannot see.
+        let canonical_parent = std::fs::canonicalize(parent).map_err(|e| e.to_string())?;
+        if !canonical_parent.starts_with(canonical_dest_root) {
+            return Err(format!("refusing to write outside the destination (symlink escape detected): {}", canonical_parent.display()));
         }
-        std::fs::copy(&src, &out_path).map_err(|e| e.to_string())?;
-        written.push(out_path.display().to_string());
+
+        let real_out_path = canonical_parent.join(out_path.file_name().expect("out_path always has a file name -- it's built by appending an extension"));
+        std::fs::copy(&src, &real_out_path).map_err(|e| e.to_string())?;
+        written.push(real_out_path.display().to_string());
     }
 
     if written.is_empty() {
@@ -159,18 +206,25 @@ pub async fn save_to_disk(State(state): State<AppState>, AxumPath(library_id): A
         return Err(ServerError::BadRequest("dest must be an absolute path".to_string()));
     }
 
-    let results = tokio::task::spawn_blocking(move || -> Vec<Value> {
-        std::fs::create_dir_all(&dest_root).ok();
-        body.book_ids
+    let results = tokio::task::spawn_blocking(move || -> Result<Vec<Value>, String> {
+        std::fs::create_dir_all(&dest_root).map_err(|e| e.to_string())?;
+        // Canonicalize once, outside the per-book loop -- see
+        // `save_one_book`'s own doc for why this (not a lexical
+        // `starts_with`) is what actually catches a symlink planted
+        // inside the destination tree.
+        let canonical_dest_root = std::fs::canonicalize(&dest_root).map_err(|e| e.to_string())?;
+        Ok(body
+            .book_ids
             .iter()
-            .map(|&book_id| match save_one_book(&cache, book_id, &body.template, &dest_root, body.formats.as_deref(), body.single_dir) {
+            .map(|&book_id| match save_one_book(&cache, book_id, &body.template, &dest_root, &canonical_dest_root, body.formats.as_deref(), body.single_dir) {
                 Ok(paths) => json!({"book_id": book_id, "ok": true, "paths": paths}),
                 Err(error) => json!({"book_id": book_id, "ok": false, "error": error}),
             })
-            .collect()
+            .collect())
     })
     .await
-    .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))?
+    .map_err(ServerError::InternalServerError)?;
 
     Ok(Json(json!({"results": results})))
 }
@@ -251,6 +305,26 @@ mod tests {
         assert_eq!(result["ok"], true, "{result}");
         let written = std::path::PathBuf::from(result["paths"][0].as_str().unwrap());
         assert!(written.starts_with(dest.path()), "the `..`/`etc` segments must not have escaped dest: {written:?}");
+    }
+
+    #[tokio::test]
+    async fn a_symlink_planted_inside_dest_cannot_be_used_to_escape_it() {
+        // A lexical `out_path.starts_with(dest_root)` check alone would
+        // pass here (`dest/escape/...` really does start with `dest`
+        // as *strings*) -- only resolving the symlink via
+        // `canonicalize` reveals it actually lands under `outside`,
+        // which this route must refuse to write into.
+        let (_dir, router, book_id) = test_app();
+        let dest = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dest.path().join("escape")).unwrap();
+
+        let (status, body) = post_json(&router, "/save-to-disk/default", serde_json::json!({"book_ids": [book_id], "template": "escape/{title}", "dest": dest.path().to_string_lossy()})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let result = &body["results"][0];
+        assert_eq!(result["ok"], false, "a symlink escape should be refused, not silently written: {result}");
+        assert!(result["error"].as_str().unwrap().contains("symlink escape"), "{result}");
+        assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none(), "nothing should have been written into the symlink target");
     }
 
     #[tokio::test]
