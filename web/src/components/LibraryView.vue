@@ -2,7 +2,7 @@
 import { computed, ref, watch } from "vue";
 import CategoryBrowser from "./CategoryBrowser.vue";
 import BookDetailsPanel from "./BookDetailsPanel.vue";
-import { addBook, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, renameSavedSearch, search, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary } from "../library/api";
+import { addBook, catalogDownloadUrl, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, renameSavedSearch, search, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
 import { isTauri, tauriInvoke } from "../tauri";
 import type { BookFieldChanges, BookSummary, FtsSnippet } from "../library/types";
@@ -128,6 +128,13 @@ function applySavedSearch(query: string) {
   activeQuery.value = query;
   offset.value = 0;
   manageOpen.value = false;
+}
+
+function exportCatalog() {
+  // A plain navigation, not fetch+blob -- the real response's own
+  // Content-Disposition: attachment header (catalog.rs) makes the
+  // browser download it natively.
+  window.open(catalogDownloadUrl(activeQuery.value), "_blank");
 }
 
 async function runSearch() {
@@ -448,6 +455,7 @@ async function addFolder() {
           <option v-for="[name, q] in Object.entries(savedSearches)" :key="name" :value="q">{{ name }}</option>
         </select>
         <button type="button" @click="openManage">Manage lists…</button>
+        <button type="button" :title="activeQuery ? 'Export the current search results as a CSV catalog' : 'Export the whole library as a CSV catalog'" @click="exportCatalog">Export catalog…</button>
       </template>
 
       <button type="button" :disabled="adding" @click="addInput?.click()">{{ adding ? "Adding…" : "Add Books…" }}</button>

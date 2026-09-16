@@ -166,6 +166,7 @@ pub mod auth;
 pub mod bonjour;
 pub mod books;
 pub mod books_cache;
+pub mod catalog;
 pub mod cdb;
 pub mod content;
 pub mod convert;
@@ -276,6 +277,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/saved-search/set/{name}", post(lists::set_saved_search))
         .route("/saved-search/delete/{name}", post(lists::delete_saved_search))
         .route("/saved-search/rename/{old_name}/{new_name}", post(lists::rename_saved_search))
+        .route("/catalog/generate", get(catalog::generate))
         .route("/cdb/add-book/{job_id}/{add_duplicates}/{filename}/{library_id}", post(cdb::add_book))
         .route("/cdb/delete-books/{book_ids}/{library_id}", post(cdb::delete_books))
         .route("/cdb/delete-books/{book_ids}", post(cdb::delete_books_no_library))
