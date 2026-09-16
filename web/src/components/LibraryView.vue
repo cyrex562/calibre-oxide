@@ -3,7 +3,7 @@ import { computed, ref, watch } from "vue";
 import CategoryBrowser from "./CategoryBrowser.vue";
 import NoteEditor from "./NoteEditor.vue";
 import BookDetailsPanel from "./BookDetailsPanel.vue";
-import { addBook, addCustomColumn, catalogDownloadUrl, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, removeCustomColumn, renameSavedSearch, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
+import { addBook, addCustomColumn, catalogDownloadUrl, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, removeCustomColumn, renameSavedSearch, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
 import { isTauri, tauriInvoke } from "../tauri";
 import { DEFAULT_LIBRARY_PREFS, fetchProfile, LIBRARY_PREFS_PROFILE, type LibraryPrefs } from "../settings/api";
@@ -261,6 +261,35 @@ function openNews() {
   newsOpen.value = true;
   newsError.value = null;
   newsDone.value = false;
+}
+
+const opmlInput = ref<HTMLInputElement | null>(null);
+const opmlImporting = ref(false);
+const opmlSummary = ref<string | null>(null);
+
+async function importOpmlFile(e: Event) {
+  const file = (e.target as HTMLInputElement).files?.[0];
+  if (!file) return;
+  opmlImporting.value = true;
+  opmlSummary.value = null;
+  newsError.value = null;
+  try {
+    const text = await file.text();
+    const feeds = await importOpml(text);
+    if (feeds.length === 0) {
+      opmlSummary.value = "No feeds found in that OPML file.";
+      return;
+    }
+    const existing = newsFeedUrls.value.split("\n").map((u) => u.trim()).filter(Boolean);
+    const newUrls = feeds.map((f) => f.feed_url).filter((u) => !existing.includes(u));
+    newsFeedUrls.value = [...existing, ...newUrls].join("\n");
+    opmlSummary.value = `Added ${newUrls.length} feed(s) from OPML${newUrls.length < feeds.length ? ` (${feeds.length - newUrls.length} already listed)` : ""}.`;
+  } catch (e) {
+    newsError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    opmlImporting.value = false;
+    if (opmlInput.value) opmlInput.value.value = "";
+  }
 }
 
 function sleep(ms: number): Promise<void> {
@@ -865,10 +894,15 @@ async function switchToOther() {
             <textarea v-model="newsFeedUrls" rows="4" placeholder="https://example.com/feed.xml" :disabled="newsFetching"></textarea>
           </label>
           <div class="bulk-actions">
+            <button type="button" :disabled="newsFetching || opmlImporting" @click="opmlInput?.click()">{{ opmlImporting ? "Importing…" : "Import OPML…" }}</button>
+            <input ref="opmlInput" type="file" accept=".opml,.xml,text/x-opml,text/xml" class="hidden-file-input" @change="importOpmlFile" />
+          </div>
+          <div class="bulk-actions">
             <button type="submit" class="read" :disabled="newsFetching || !newsFeedUrls.trim()">{{ newsFetching ? "Fetching…" : "Fetch" }}</button>
             <button type="button" :disabled="newsFetching" @click="newsOpen = false">Close</button>
           </div>
         </form>
+        <p v-if="opmlSummary" class="news-hint">{{ opmlSummary }}</p>
         <p v-if="newsDone" class="news-done">Added the fetched news as a new book.</p>
         <p v-if="newsError" class="error">{{ newsError }}</p>
       </div>

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { addBook, addFormat, catalogDownloadUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, removeDataFile, removeFormat, renameSavedSearch, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
+import { addBook, addFormat, catalogDownloadUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, removeDataFile, removeFormat, renameSavedSearch, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
 import type { BookSummary } from "./types";
 
 function bookStub(id: number): BookSummary {
@@ -446,5 +446,17 @@ describe("evaluateTemplate", () => {
     const result = await evaluateTemplate(7, "nope");
     expect(result.ok).toBe(false);
     expect(result.error).toContain("Unknown identifier");
+  });
+});
+
+describe("importOpml", () => {
+  it("posts the raw OPML text and returns the real parsed feed list", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ feeds: [{ title: "Feed One", feed_url: "https://example.com/feed1.xml" }] }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const feeds = await importOpml("<opml></opml>");
+
+    expect(fetchMock).toHaveBeenCalledWith("/opml/import", expect.objectContaining({ method: "POST", body: JSON.stringify({ opml: "<opml></opml>" }) }));
+    expect(feeds).toEqual([{ title: "Feed One", feed_url: "https://example.com/feed1.xml" }]);
   });
 });

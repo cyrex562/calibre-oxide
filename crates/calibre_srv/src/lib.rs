@@ -183,6 +183,7 @@ pub mod net_guard;
 pub mod news;
 pub mod notes;
 pub mod opds;
+pub mod opml;
 pub mod opts;
 pub mod reader_profiles;
 pub mod render_endpoints;
@@ -291,6 +292,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/saved-search/rename/{old_name}/{new_name}", post(lists::rename_saved_search))
         .route("/catalog/generate", get(catalog::generate))
         .route("/news/fetch", post(news::fetch_news))
+        .route("/opml/import", post(opml::import))
         .route("/news/status/{job_id}", get(news::news_status).post(news::news_status))
         .route("/share/email", post(share::share_email))
         .route("/custom-columns", get(custom_columns::list))
