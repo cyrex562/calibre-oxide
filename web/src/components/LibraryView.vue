@@ -3,7 +3,7 @@ import { computed, ref, watch } from "vue";
 import CategoryBrowser from "./CategoryBrowser.vue";
 import NoteEditor from "./NoteEditor.vue";
 import BookDetailsPanel from "./BookDetailsPanel.vue";
-import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
+import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
 import type { CheckLibraryResult, CustomRecipeOptions, DuplicateBook, NewsFeedInput, NewsSchedule, SaveToDiskResult } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
 import { isTauri, tauriInvoke } from "../tauri";
@@ -272,6 +272,12 @@ function exportCatalog() {
   // Content-Disposition: attachment header (catalog.rs) makes the
   // browser download it natively.
   window.open(catalogDownloadUrl(activeQuery.value), "_blank");
+}
+
+function exportLibraryArchive() {
+  // Same plain-navigation pattern as exportCatalog -- library_export.rs's
+  // own Content-Disposition header drives the real browser download.
+  window.open(libraryExportUrl(), "_blank");
 }
 
 // Fetch news/recipes -- a real, generic RSS/Atom feed reader (see
@@ -881,6 +887,7 @@ async function switchToOther() {
         <button type="button" @click="openCheckLibrary">Check library…</button>
         <button type="button" @click="openDuplicates">Find duplicates…</button>
         <button type="button" :title="activeQuery ? 'Export the current search results as a CSV catalog' : 'Export the whole library as a CSV catalog'" @click="exportCatalog">Export catalog…</button>
+        <button type="button" title="Download the whole library (every book and its metadata) as a real .zip archive for backup or transfer" @click="exportLibraryArchive">Export library archive…</button>
         <button type="button" @click="openNews">Fetch news…</button>
       </template>
 

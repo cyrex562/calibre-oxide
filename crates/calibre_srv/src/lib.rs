@@ -179,6 +179,7 @@ pub mod fts;
 pub mod jobs;
 pub mod legacy;
 pub mod library_broker;
+pub mod library_export;
 pub mod lists;
 pub mod mathjax;
 pub mod net_guard;
@@ -312,6 +313,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/news/schedules/remove/{id}", post(news_scheduler::remove_schedule))
         .route("/news/schedules/run-now/{id}", post(news_scheduler::run_schedule_now))
         .route("/tts/synthesize", post(tts::synthesize))
+        .route("/library/export/{library_id}", get(library_export::export))
         .route("/share/email", post(share::share_email))
         .route("/check-library/{library_id}", post(check_library::check))
         .route("/custom-columns", get(custom_columns::list))

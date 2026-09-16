@@ -229,6 +229,13 @@ export function catalogDownloadUrl(search: string): string {
   return `/catalog/generate${qs}`;
 }
 
+// Real, new route -- see crates/calibre_srv/src/library_export.rs's
+// own doc (real upstream's whole-library export is a Qt GUI action,
+// never exposed over HTTP there).
+export function libraryExportUrl(): string {
+  return "/library/export/default";
+}
+
 // Real, new route -- see crates/calibre_srv/src/news.rs's own doc for
 // why (fetching news/recipes is CLI/GUI-only in real upstream calibre,
 // never exposed over HTTP there). A real, generic RSS/Atom feed

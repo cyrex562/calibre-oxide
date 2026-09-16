@@ -17,6 +17,7 @@
 //! check/shutdown, binary/asset resolution) and [`settings`]
 //! (persisted library path).
 
+mod library_import;
 mod server;
 mod settings;
 
@@ -95,6 +96,45 @@ async fn choose_library(app: AppHandle) -> Result<bool, String> {
     };
     let path = picked.into_path().map_err(|e| e.to_string())?;
     open_library(&app, path)?;
+    Ok(true)
+}
+
+/// Real whole-library import (issue #761): picks a real `.zip` archive
+/// (the export side, `GET /library/export/{library_id}` on
+/// `calibre_srv`, produces exactly this shape -- a zip of the
+/// library's own on-disk layout), then a real destination parent
+/// folder, extracts the archive into a new subfolder there named
+/// after the archive's own filename, and opens it exactly like a
+/// freshly-picked library. Refuses to overwrite an existing directory
+/// rather than silently merging into it.
+#[tauri::command]
+async fn import_library_archive(app: AppHandle) -> Result<bool, String> {
+    let (tx, mut rx) = tauri::async_runtime::channel(1);
+    app.dialog().file().add_filter("Library archive", &["zip"]).pick_file(move |result| {
+        let _ = tx.try_send(result);
+    });
+    let Some(Some(archive)) = rx.recv().await else {
+        return Ok(false);
+    };
+    let archive_path = archive.into_path().map_err(|e| e.to_string())?;
+
+    let (tx2, mut rx2) = tauri::async_runtime::channel(1);
+    app.dialog().file().pick_folder(move |result| {
+        let _ = tx2.try_send(result);
+    });
+    let Some(Some(picked_parent)) = rx2.recv().await else {
+        return Ok(false);
+    };
+    let parent_dir = picked_parent.into_path().map_err(|e| e.to_string())?;
+
+    let stem = archive_path.file_stem().map(|s| s.to_string_lossy().into_owned()).filter(|s| !s.is_empty()).unwrap_or_else(|| "imported-library".to_string());
+    let dest = parent_dir.join(stem);
+    if dest.exists() {
+        return Err(format!("{} already exists -- choose a different destination", dest.display()));
+    }
+
+    library_import::extract_zip(&archive_path, &dest)?;
+    open_library(&app, dest)?;
     Ok(true)
 }
 
@@ -213,7 +253,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(ServerState::default())
-        .invoke_handler(tauri::generate_handler![ping, get_persisted_library, choose_library, choose_folder_and_add_books, list_recent_libraries, open_recent_library, get_auto_reopen, set_auto_reopen])
+        .invoke_handler(tauri::generate_handler![ping, get_persisted_library, choose_library, choose_folder_and_add_books, list_recent_libraries, open_recent_library, get_auto_reopen, set_auto_reopen, import_library_archive])
         .setup(|app| {
             // Auto-open the last library, if any, without waiting for
             // the frontend to ask -- real startup UX, not just a

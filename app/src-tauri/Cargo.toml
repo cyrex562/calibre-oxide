@@ -26,6 +26,10 @@ calibre_utils = { path = "../../crates/calibre_utils" }
 tauri-plugin-dialog = "2.7.3"
 reqwest = { version = "0.11", features = ["json"] }
 urlencoding = "2.1"
+zip = "0.6"
+
+[dev-dependencies]
+tempfile = "3"
 
 [features]
 # Feature used for production builds or when a dev server is not specified,

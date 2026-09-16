@@ -892,7 +892,9 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
+ "tempfile",
  "urlencoding",
+ "zip",
 ]
 
 [[package]]
@@ -951,6 +953,7 @@ dependencies = [
  "tower-http",
  "url",
  "urlencoding",
+ "walkdir",
  "zip",
 ]
 
