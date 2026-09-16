@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { addBook, addFormat, catalogDownloadUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchConversionBookData, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, removeFormat, renameSavedSearch, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch } from "./api";
+import { addBook, addFormat, catalogDownloadUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchConversionBookData, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, removeDataFile, removeFormat, renameSavedSearch, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
 import type { BookSummary } from "./types";
 
 function bookStub(id: number): BookSummary {
@@ -383,5 +383,49 @@ describe("shareEmail", () => {
       subject: "Subject",
       relay: { relay: "smtp.example.com", port: 587, encryption: "tls" },
     });
+  });
+});
+
+describe("fetchDataFiles / uploadDataFile / removeDataFile", () => {
+  it("lists against the real single-library route shape", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ data_files: { "data/notes.pdf": { size: 42, mtime_ns: 1 } } }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const files = await fetchDataFiles(7);
+
+    expect(fetchMock).toHaveBeenCalledWith("/data-files/list/7/default", undefined);
+    expect(files).toEqual({ "data/notes.pdf": { size: 42, mtime_ns: 1 } });
+  });
+
+  it("uploads a file as a data: URL and returns the updated list", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ error: "", data_files: { "data/a.txt": { size: 1, mtime_ns: 1 } } }) });
+    vi.stubGlobal("fetch", fetchMock);
+    const file = new File(["x"], "a.txt", { type: "text/plain" });
+
+    const files = await uploadDataFile(7, file);
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/data-files/upload/7/default");
+    const body = JSON.parse(init.body);
+    expect(body).toHaveLength(1);
+    expect(body[0].name).toBe("a.txt");
+    expect(body[0].data_url).toMatch(/^data:/);
+    expect(files).toEqual({ "data/a.txt": { size: 1, mtime_ns: 1 } });
+  });
+
+  it("throws the server's own error when upload fails", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => ({ error: "boom", data_files: {} }) }));
+    const file = new File(["x"], "a.txt");
+    await expect(uploadDataFile(7, file)).rejects.toThrow("boom");
+  });
+
+  it("removes by relpath and returns the updated list", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ data_files: {} }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const files = await removeDataFile(7, "data/a.txt");
+
+    expect(fetchMock).toHaveBeenCalledWith("/data-files/remove/7/default", expect.objectContaining({ method: "POST", body: JSON.stringify(["data/a.txt"]) }));
+    expect(files).toEqual({});
   });
 });

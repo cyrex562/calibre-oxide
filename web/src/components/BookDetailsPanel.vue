@@ -2,8 +2,8 @@
 import { computed, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import TweakEditor from "./TweakEditor.vue";
-import { addFormat, deleteBooks, fetchBook, fetchConversionBookData, fetchFieldMetadata, getConversionStatus, removeFormat, setCover, setFields, shareEmail, startConversion } from "../library/api";
-import type { SmtpRelayConfig } from "../library/api";
+import { addFormat, deleteBooks, fetchBook, fetchConversionBookData, fetchDataFiles, fetchFieldMetadata, getConversionStatus, removeDataFile, removeFormat, setCover, setFields, shareEmail, startConversion, uploadDataFile } from "../library/api";
+import type { DataFileStat, SmtpRelayConfig } from "../library/api";
 import type { BookFieldChanges, BookSummary, FieldMetaEntry } from "../library/types";
 
 const props = defineProps<{ bookId: number }>();
@@ -205,6 +205,7 @@ function startEditing() {
   }
   saveError.value = null;
   editing.value = true;
+  void loadDataFiles();
 }
 
 async function saveEdits() {
@@ -283,6 +284,62 @@ async function removeFormatClick(ext: string) {
     saveError.value = e instanceof Error ? e.message : String(e);
   } finally {
     formatBusy.value = false;
+  }
+}
+
+// Data files (issue #757) -- arbitrary files attached to a book
+// outside its standard formats. Loaded on demand (only once the edit
+// form is open) rather than alongside the book's own metadata, since
+// most books never have any and it's a real, separate fetch.
+const dataFiles = ref<Record<string, DataFileStat>>({});
+const dataFilesLoading = ref(false);
+const dataFileInput = ref<HTMLInputElement | null>(null);
+const dataFileBusy = ref(false);
+
+// `data/notes.pdf` -> `notes.pdf` for display -- the `data/` prefix
+// is this feature's own internal storage convention
+// (`extra_files::add_extra_files`'s own `format!("data/{name}")`),
+// not something a user should have to see or type.
+function dataFileName(relpath: string): string {
+  return relpath.startsWith("data/") ? relpath.slice("data/".length) : relpath;
+}
+
+async function loadDataFiles() {
+  dataFilesLoading.value = true;
+  try {
+    dataFiles.value = await fetchDataFiles(props.bookId);
+  } catch (e) {
+    saveError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    dataFilesLoading.value = false;
+  }
+}
+
+async function addDataFile(e: Event) {
+  const file = (e.target as HTMLInputElement).files?.[0];
+  if (!file) return;
+  dataFileBusy.value = true;
+  saveError.value = null;
+  try {
+    dataFiles.value = await uploadDataFile(props.bookId, file);
+  } catch (e) {
+    saveError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    dataFileBusy.value = false;
+    if (dataFileInput.value) dataFileInput.value.value = "";
+  }
+}
+
+async function removeDataFileClick(relpath: string) {
+  if (!confirm(`Remove "${dataFileName(relpath)}" from this book?`)) return;
+  dataFileBusy.value = true;
+  saveError.value = null;
+  try {
+    dataFiles.value = await removeDataFile(props.bookId, relpath);
+  } catch (e) {
+    saveError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    dataFileBusy.value = false;
   }
 }
 
@@ -507,6 +564,17 @@ const visibleCustomColumnValues = computed(() => {
           <input ref="formatInput" type="file" class="hidden-file-input" @change="addFormatFile" />
         </div>
 
+        <div class="format-manager">
+          <span class="format-manager-label">Data files</span>
+          <span v-if="dataFilesLoading" class="hint">Loading…</span>
+          <span v-for="[relpath, stat] in Object.entries(dataFiles)" :key="relpath" class="format-chip" :title="`${stat.size} bytes`">
+            {{ dataFileName(relpath) }}
+            <button type="button" class="format-chip-remove" :disabled="dataFileBusy" @click="removeDataFileClick(relpath)" :aria-label="`Remove ${dataFileName(relpath)}`">✕</button>
+          </span>
+          <button type="button" :disabled="dataFileBusy" @click="dataFileInput?.click()">{{ dataFileBusy ? "Working…" : "Add data file…" }}</button>
+          <input ref="dataFileInput" type="file" class="hidden-file-input" @change="addDataFile" />
+        </div>
+
         <p v-if="saveError" class="error">{{ saveError }}</p>
 
         <div class="formats">
@@ -671,6 +739,10 @@ const visibleCustomColumnValues = computed(() => {
   font-size: 0.85em;
   color: #555;
   font-weight: 600;
+}
+.hint {
+  font-size: 0.85em;
+  color: #888;
 }
 .format-chip {
   display: inline-flex;

@@ -16,6 +16,11 @@
 //!   files in a JSON body, `[{data_url, name}]`.
 //! - `POST /data-files/remove/{book_id}/{library_id}` -- remove by
 //!   relpath, a JSON array of relpaths.
+//! - `GET /data-files/list/{book_id}/{library_id}` -- real, **new**
+//!   route (issue #757): `upload`/`remove` both already return the
+//!   post-operation file list as a side effect, but nothing lets a
+//!   client fetch it *before* the first upload -- a real gap for any
+//!   UI that wants to show a book's already-attached data files.
 //!
 //! # Content-Type/disposition, narrowed beyond upstream's own fidelity
 //!
@@ -94,6 +99,17 @@ pub async fn get(State(state): State<AppState>, Path((book_id, relpath)): Path<(
         resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
     }
     Ok(resp)
+}
+
+/// `GET /data-files/list/{book_id}/{library_id}`.
+pub async fn list(State(state): State<AppState>, Path((book_id, library_id)): Path<(i32, String)>) -> Result<Json<Value>, ServerError> {
+    let cache = state.cache_for(Some(&library_id)).ok_or_else(|| ServerError::NotFound(format!("no library named {library_id:?}")))?;
+    let data_files = tokio::task::spawn_blocking(move || extra_files::list_extra_files(&cache, book_id, "data/**/*"))
+        .await
+        .map_err(|e| ServerError::InternalServerError(e.to_string()))?
+        .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+    let data_files_json: serde_json::Map<String, Value> = data_files.iter().map(|f| (f.relpath.clone(), encode_stat(f))).collect();
+    Ok(Json(serde_json::json!({ "data_files": Value::Object(data_files_json) })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -299,6 +315,34 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers().get("content-type").unwrap(), "application/octet-stream");
         assert!(resp.headers().get("content-disposition").unwrap().to_str().unwrap().starts_with("attachment"));
+    }
+
+    async fn get_json(router: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let value = if body.is_empty() { serde_json::Value::Null } else { serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null) };
+        (status, value)
+    }
+
+    #[tokio::test]
+    async fn list_reports_a_real_previously_uploaded_file() {
+        let (_dir, router, book_id) = test_app();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"pdf bytes here");
+        post_json(&router, &format!("/data-files/upload/{book_id}/default"), serde_json::json!([{"name": "notes.pdf", "data_url": format!("data:application/pdf;base64,{encoded}")}])).await;
+
+        let (status, body) = get_json(&router, &format!("/data-files/list/{book_id}/default")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["data_files"]["data/notes.pdf"]["size"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn list_is_empty_for_a_book_with_no_data_files() {
+        let (_dir, router, book_id) = test_app();
+        let (status, body) = get_json(&router, &format!("/data-files/list/{book_id}/default")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["data_files"].as_object().unwrap().is_empty());
     }
 
     #[tokio::test]
