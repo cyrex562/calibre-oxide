@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { addBook, addFormat, deleteBooks, fetchBooks, fetchConversionBookData, getConversionStatus, removeFormat, setCover, setFields, startConversion } from "./api";
+import { addBook, addFormat, deleteBooks, fetchBooks, fetchConversionBookData, ftsSearch, ftsSnippets, getConversionStatus, removeFormat, setCover, setFields, setFtsEnabled, startConversion } from "./api";
 import type { BookSummary } from "./types";
 
 function bookStub(id: number): BookSummary {
@@ -206,5 +206,65 @@ describe("getConversionStatus", () => {
     expect(status.running).toBe(false);
     expect(status.ok).toBe(true);
     expect(fetchMock.mock.calls[0][0]).toBe("/conversion/status/42");
+  });
+});
+
+describe("ftsSearch", () => {
+  it("returns enabled:true with the parsed result on a real 200", async () => {
+    const responseBody = { metadata: { "1": { title: "T", authors: "A" } }, indexing_status: { left: 0, total: 1 }, results: [{ book_id: 1, format: "EPUB" }] };
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => responseBody });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const outcome = await ftsSearch("rust");
+    expect(outcome.enabled).toBe(true);
+    if (outcome.enabled) expect(outcome.result).toEqual(responseBody);
+    expect(fetchMock.mock.calls[0][0]).toBe("/fts/search?query=rust");
+  });
+
+  it("returns enabled:false on a real 428 (Precondition Required), without throwing", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: false, status: 428 });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const outcome = await ftsSearch("rust");
+    expect(outcome).toEqual({ enabled: false });
+  });
+
+  it("still throws on a real, unrelated failure", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: false, status: 500, statusText: "Internal Server Error" });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(ftsSearch("rust")).rejects.toThrow(/500/);
+  });
+});
+
+describe("ftsSnippets", () => {
+  it("fetches snippets for the given book ids and unwraps the snippets field", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ snippets: { "1": [{ formats: ["EPUB"], text: "a snippet" }] } }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const snippets = await ftsSnippets([1], "rust");
+    expect(snippets["1"][0].text).toBe("a snippet");
+    expect(fetchMock.mock.calls[0][0]).toBe("/fts/snippets/1?query=rust");
+  });
+
+  it("short-circuits without a network call for an empty id list", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const snippets = await ftsSnippets([], "rust");
+    expect(snippets).toEqual({});
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("setFtsEnabled", () => {
+  it("posts the bare boolean body", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await setFtsEnabled(true);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/fts/indexing");
+    expect(init.body).toBe("true");
   });
 });

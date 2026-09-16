@@ -125,6 +125,28 @@ export interface ConversionStatus {
   fmt?: string;
 }
 
+// Real shapes from crates/calibre_srv/src/fts.rs.
+export interface FtsHit {
+  book_id: number;
+  format: string;
+}
+
+export interface FtsIndexingStatus {
+  left: number;
+  total: number;
+}
+
+export interface FtsSearchResult {
+  metadata: Record<string, { title: string; authors: string }>;
+  indexing_status: FtsIndexingStatus;
+  results: FtsHit[];
+}
+
+export interface FtsSnippet {
+  formats: string[];
+  text: string;
+}
+
 // Fields `POST /cdb/set-fields/{book_id}`'s `changes` object accepts
 // for this MVP's edit form -- see cdb.rs::value_to_field_string for
 // the full set the server understands (this is a subset).

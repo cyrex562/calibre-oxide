@@ -3,7 +3,7 @@
 // role for this slice, narrowed to only what the library-browser MVP
 // needs.
 
-import type { AddBookResult, BookFieldChanges, BookSummary, BooksInPage, CategoryEntry, CategoryPage, ConversionBookData, ConversionStatus, FieldMetadataResponse, SearchResult, VirtualLibraries } from "./types";
+import type { AddBookResult, BookFieldChanges, BookSummary, BooksInPage, CategoryEntry, CategoryPage, ConversionBookData, ConversionStatus, FieldMetadataResponse, FtsSearchResult, FtsSnippet, SearchResult, VirtualLibraries } from "./types";
 
 async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(url, init);
@@ -132,4 +132,43 @@ export function startConversion(bookId: number, inputFmt: string, outputFmt: str
 
 export function getConversionStatus(jobId: number): Promise<ConversionStatus> {
   return jsonFetch<ConversionStatus>(`/conversion/status/${jobId}`);
+}
+
+// Real full-text-search endpoints -- see crates/calibre_srv/src/fts.rs.
+
+export type FtsSearchOutcome = { enabled: true; result: FtsSearchResult } | { enabled: false };
+
+// Distinct from jsonFetch's own generic throw-on-!ok: `/fts/search`
+// returning 428 Precondition Required ("full text searching is not
+// enabled") is a real, expected outcome the caller needs to
+// distinguish from an actual error, not just another failure message.
+// (428, not 412 -- ServerError::PreconditionRequired maps to axum's
+// StatusCode::PRECONDITION_REQUIRED, RFC 6585's 428; 412 is a
+// different status, PRECONDITION_FAILED, not used here. Confirmed
+// against a real running calibre_srv, not just the type name.)
+export async function ftsSearch(query: string): Promise<FtsSearchOutcome> {
+  const resp = await fetch(`/fts/search?${new URLSearchParams({ query })}`);
+  if (resp.status === 428) return { enabled: false };
+  if (!resp.ok) throw new Error(`GET /fts/search failed: ${resp.status} ${resp.statusText}`);
+  return { enabled: true, result: (await resp.json()) as FtsSearchResult };
+}
+
+export async function ftsSnippets(bookIds: number[], query: string): Promise<Record<string, FtsSnippet[]>> {
+  if (bookIds.length === 0) return {};
+  const qs = new URLSearchParams({ query });
+  const data = await jsonFetch<{ snippets: Record<string, FtsSnippet[]> }>(`/fts/snippets/${bookIds.join(",")}?${qs}`);
+  return data.snippets;
+}
+
+// Unlike this file's other write endpoints, /fts/indexing's real
+// handler returns an empty 200 body (`Result<(), ServerError>` in
+// Rust), not `{}` -- jsonFetch's own unconditional `.json()` would
+// throw on that, so this calls `fetch` directly.
+export async function setFtsEnabled(enabled: boolean): Promise<void> {
+  const resp = await fetch(`/fts/indexing`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(enabled),
+  });
+  if (!resp.ok) throw new Error(`POST /fts/indexing failed: ${resp.status} ${resp.statusText}`);
 }
