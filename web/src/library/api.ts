@@ -160,6 +160,50 @@ export async function ftsSnippets(bookIds: number[], query: string): Promise<Rec
   return data.snippets;
 }
 
+// Virtual library / saved search management -- real, new routes (no
+// upstream calibre.srv route exists for either; both are GUI-only
+// preferences editing there). See crates/calibre_srv/src/lists.rs's
+// own doc for why this is a real addition, not a port.
+
+export function fetchSavedSearches(): Promise<Record<string, string>> {
+  return jsonFetch<Record<string, string>>("/ajax/saved-searches");
+}
+
+async function postNoBody(url: string): Promise<void> {
+  const resp = await fetch(url, { method: "POST" });
+  if (!resp.ok) throw new Error(`POST ${url} failed: ${resp.status} ${resp.statusText}`);
+}
+
+export async function setVirtualLibrary(name: string, query: string): Promise<void> {
+  const resp = await fetch(`/vl/set/${encodeURIComponent(name)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query }),
+  });
+  if (!resp.ok) throw new Error(`POST /vl/set failed: ${resp.status} ${resp.statusText}`);
+}
+
+export function deleteVirtualLibrary(name: string): Promise<void> {
+  return postNoBody(`/vl/delete/${encodeURIComponent(name)}`);
+}
+
+export async function setSavedSearch(name: string, query: string): Promise<void> {
+  const resp = await fetch(`/saved-search/set/${encodeURIComponent(name)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query }),
+  });
+  if (!resp.ok) throw new Error(`POST /saved-search/set failed: ${resp.status} ${resp.statusText}`);
+}
+
+export function deleteSavedSearch(name: string): Promise<void> {
+  return postNoBody(`/saved-search/delete/${encodeURIComponent(name)}`);
+}
+
+export function renameSavedSearch(oldName: string, newName: string): Promise<void> {
+  return postNoBody(`/saved-search/rename/${encodeURIComponent(oldName)}/${encodeURIComponent(newName)}`);
+}
+
 // Unlike this file's other write endpoints, /fts/indexing's real
 // handler returns an empty 200 body (`Result<(), ServerError>` in
 // Rust), not `{}` -- jsonFetch's own unconditional `.json()` would

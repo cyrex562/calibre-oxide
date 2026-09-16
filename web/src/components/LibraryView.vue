@@ -2,7 +2,7 @@
 import { computed, ref, watch } from "vue";
 import CategoryBrowser from "./CategoryBrowser.vue";
 import BookDetailsPanel from "./BookDetailsPanel.vue";
-import { addBook, fetchBooks, fetchFieldMetadata, fetchVirtualLibraries, ftsSearch, ftsSnippets, search, setFields, setFtsEnabled } from "../library/api";
+import { addBook, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, renameSavedSearch, search, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
 import { isTauri, tauriInvoke } from "../tauri";
 import type { BookFieldChanges, BookSummary, FtsSnippet } from "../library/types";
@@ -18,6 +18,7 @@ const offset = ref(0);
 
 const sortableFields = ref<[string, string][]>([]);
 const virtualLibraries = ref<Record<string, string>>({});
+const savedSearches = ref<Record<string, string>>({});
 
 const books = ref<BookSummary[]>([]);
 const totalNum = ref(0);
@@ -35,15 +36,99 @@ const currentPage = computed(() => Math.floor(offset.value / PAGE_SIZE) + 1);
 
 async function loadMetadata() {
   try {
-    const [fm, vls] = await Promise.all([fetchFieldMetadata(), fetchVirtualLibraries()]);
+    const [fm, vls, searches] = await Promise.all([fetchFieldMetadata(), fetchVirtualLibraries(), fetchSavedSearches()]);
     sortableFields.value = fm.sortable_fields;
     virtualLibraries.value = vls;
+    savedSearches.value = searches;
   } catch (e) {
     // Non-fatal -- the grid itself still works with default sort/no vl.
-    console.error("failed to load field metadata / virtual libraries", e);
+    console.error("failed to load field metadata / virtual libraries / saved searches", e);
   }
 }
 void loadMetadata();
+
+// Virtual library / saved search management -- real, new routes (see
+// crates/calibre_srv/src/lists.rs's own doc for why no upstream route
+// exists to port here).
+const manageOpen = ref(false);
+const manageError = ref<string | null>(null);
+const newVlName = ref("");
+const newVlQuery = ref("");
+const newSearchName = ref("");
+const newSearchQuery = ref("");
+
+function openManage() {
+  newVlQuery.value = activeQuery.value;
+  newSearchQuery.value = activeQuery.value;
+  manageError.value = null;
+  manageOpen.value = true;
+}
+
+async function createVirtualLibrary() {
+  if (!newVlName.value.trim() || !newVlQuery.value.trim()) return;
+  manageError.value = null;
+  try {
+    await setVirtualLibrary(newVlName.value.trim(), newVlQuery.value.trim());
+    newVlName.value = "";
+    await loadMetadata();
+  } catch (e) {
+    manageError.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
+async function removeVirtualLibrary(name: string) {
+  if (!confirm(`Delete the virtual library "${name}"?`)) return;
+  manageError.value = null;
+  try {
+    await deleteVirtualLibrary(name);
+    if (vl.value === name) vl.value = "";
+    await loadMetadata();
+  } catch (e) {
+    manageError.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
+async function createSavedSearch() {
+  if (!newSearchName.value.trim() || !newSearchQuery.value.trim()) return;
+  manageError.value = null;
+  try {
+    await setSavedSearch(newSearchName.value.trim(), newSearchQuery.value.trim());
+    newSearchName.value = "";
+    await loadMetadata();
+  } catch (e) {
+    manageError.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
+async function removeSavedSearch(name: string) {
+  if (!confirm(`Delete the saved search "${name}"?`)) return;
+  manageError.value = null;
+  try {
+    await deleteSavedSearch(name);
+    await loadMetadata();
+  } catch (e) {
+    manageError.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
+async function renameSavedSearchPrompt(name: string) {
+  const newName = prompt("Rename saved search to:", name);
+  if (!newName || newName === name) return;
+  manageError.value = null;
+  try {
+    await renameSavedSearch(name, newName);
+    await loadMetadata();
+  } catch (e) {
+    manageError.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
+function applySavedSearch(query: string) {
+  queryText.value = query;
+  activeQuery.value = query;
+  offset.value = 0;
+  manageOpen.value = false;
+}
 
 async function runSearch() {
   loading.value = true;
@@ -358,6 +443,11 @@ async function addFolder() {
           <option value="">All books</option>
           <option v-for="name in Object.keys(virtualLibraries)" :key="name" :value="name">{{ name }}</option>
         </select>
+        <select v-if="Object.keys(savedSearches).length" @change="applySavedSearch(($event.target as HTMLSelectElement).value)">
+          <option value="" disabled selected>Saved searches…</option>
+          <option v-for="[name, q] in Object.entries(savedSearches)" :key="name" :value="q">{{ name }}</option>
+        </select>
+        <button type="button" @click="openManage">Manage lists…</button>
       </template>
 
       <button type="button" :disabled="adding" @click="addInput?.click()">{{ adding ? "Adding…" : "Add Books…" }}</button>
@@ -457,6 +547,46 @@ async function addFolder() {
     </div>
 
     <BookDetailsPanel v-if="selectedBookId !== null" :book-id="selectedBookId" @close="selectedBookId = null" @updated="onDetailsUpdated" @deleted="onDetailsDeleted" />
+
+    <div v-if="manageOpen" class="manage-backdrop" @click.self="manageOpen = false">
+      <div class="manage-panel">
+        <button class="manage-close" @click="manageOpen = false">✕</button>
+        <p v-if="manageError" class="error">{{ manageError }}</p>
+
+        <section>
+          <h3>Virtual libraries</h3>
+          <ul class="manage-list">
+            <li v-for="[name, q] in Object.entries(virtualLibraries)" :key="name">
+              <span class="manage-name">{{ name }}</span>
+              <code class="manage-query">{{ q }}</code>
+              <button type="button" class="manage-remove" @click="removeVirtualLibrary(name)">Delete</button>
+            </li>
+          </ul>
+          <form class="manage-form" @submit.prevent="createVirtualLibrary">
+            <input v-model="newVlName" placeholder="Name" required />
+            <input v-model="newVlQuery" placeholder="Search query" required />
+            <button type="submit">Add</button>
+          </form>
+        </section>
+
+        <section>
+          <h3>Saved searches</h3>
+          <ul class="manage-list">
+            <li v-for="[name, q] in Object.entries(savedSearches)" :key="name">
+              <span class="manage-name">{{ name }}</span>
+              <code class="manage-query">{{ q }}</code>
+              <button type="button" @click="renameSavedSearchPrompt(name)">Rename</button>
+              <button type="button" class="manage-remove" @click="removeSavedSearch(name)">Delete</button>
+            </li>
+          </ul>
+          <form class="manage-form" @submit.prevent="createSavedSearch">
+            <input v-model="newSearchName" placeholder="Name" required />
+            <input v-model="newSearchQuery" placeholder="Search query" required />
+            <button type="submit">Add</button>
+          </form>
+        </section>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -666,5 +796,78 @@ async function addFolder() {
   margin: 0.6em 0 0;
   padding: 0;
   list-style: none;
+}
+.manage-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+}
+.manage-panel {
+  background: #fff;
+  border-radius: 6px;
+  padding: 1.5em;
+  max-width: 560px;
+  width: 90%;
+  max-height: 85vh;
+  overflow: auto;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 1.25em;
+}
+.manage-close {
+  position: absolute;
+  top: 0.5em;
+  right: 0.5em;
+  border: none;
+  background: none;
+  font-size: 1.1em;
+  cursor: pointer;
+}
+.manage-panel h3 {
+  margin: 0 0 0.5em;
+}
+.manage-list {
+  list-style: none;
+  margin: 0 0 0.75em;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4em;
+}
+.manage-list li {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+}
+.manage-name {
+  font-weight: 600;
+  flex-shrink: 0;
+}
+.manage-query {
+  color: #666;
+  font-size: 0.85em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+.manage-remove {
+  color: #b00020;
+}
+.manage-form {
+  display: flex;
+  gap: 0.5em;
+}
+.manage-form input {
+  flex: 1;
+  font: inherit;
+  padding: 0.35em 0.5em;
+  border: 1px solid #ccc;
+  border-radius: 4px;
 }
 </style>
