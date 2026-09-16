@@ -1432,6 +1432,15 @@ impl Cache {
                 value,
             )?,
             "identifiers" => self.set_identifiers_field(book_id, value)?,
+            // Any other name is checked against the real
+            // `custom_columns` table before giving up -- issue #720
+            // found this fallback used to unconditionally reject
+            // every custom-column label, contradicting that issue's
+            // own filing claim that `set_field` "already" wrote
+            // custom columns. It didn't; this is the fix.
+            _ if self.custom_column_lookup(field)?.is_some() => {
+                self.set_custom_column_value(book_id, field, value)?
+            }
             _ => anyhow::bail!("Field '{}' is not writable by this port's set_field", field),
         }
         Ok(())
@@ -2204,6 +2213,29 @@ mod tests {
             cache.get_custom_column_value(id, "f").unwrap(),
             Some("3.5".to_string())
         );
+    }
+
+    #[test]
+    fn set_field_dispatches_an_unrecognized_name_to_a_real_custom_column() {
+        // Regression test for issue #720: `set_field`'s fallback used
+        // to unconditionally `bail!` for any name it didn't
+        // special-case, which meant a real custom column's value
+        // could never be set through this generic entry point (the
+        // one `calibre_srv::cdb::set_fields` actually calls) even
+        // though `Cache::set_custom_column_value` itself worked fine
+        // called directly.
+        let (_dir, cache) = open_test_cache();
+        let id = insert_book(&cache, "T");
+        cache.add_custom_column("mycol", "My Column", "text", false).unwrap();
+        cache.set_field(id, "mycol", "hello").unwrap();
+        assert_eq!(cache.get_custom_column_value(id, "mycol").unwrap(), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn set_field_still_rejects_a_name_that_is_neither_builtin_nor_a_real_custom_column() {
+        let (_dir, cache) = open_test_cache();
+        let id = insert_book(&cache, "T");
+        assert!(cache.set_field(id, "not_a_real_field_or_column", "x").is_err());
     }
 
     #[test]

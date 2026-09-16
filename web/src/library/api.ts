@@ -3,7 +3,7 @@
 // role for this slice, narrowed to only what the library-browser MVP
 // needs.
 
-import type { AddBookResult, BookFieldChanges, BookSummary, BooksInPage, CategoryEntry, CategoryPage, ConversionBookData, ConversionStatus, FieldMetadataResponse, FtsSearchResult, FtsSnippet, SearchResult, VirtualLibraries } from "./types";
+import type { AddBookResult, BookFieldChanges, BookSummary, BooksInPage, CategoryEntry, CategoryPage, ConversionBookData, ConversionStatus, CustomColumnInfo, FieldMetadataResponse, FtsSearchResult, FtsSnippet, SearchResult, VirtualLibraries } from "./types";
 
 async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(url, init);
@@ -259,6 +259,27 @@ export async function shareEmail(bookId: number, format: string, from: string, t
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ book_id: bookId, format, from, to, subject, relay }),
   });
+}
+
+// Real, new routes -- see crates/calibre_srv/src/custom_columns.rs's
+// own doc for why (custom-column management is CLI-layer-only in real
+// upstream calibre, and its own remote-command `implementation()` is
+// unimplemented there too, never exposed over HTTP either way).
+export function fetchCustomColumns(): Promise<Record<string, CustomColumnInfo>> {
+  return jsonFetch<Record<string, CustomColumnInfo>>("/custom-columns");
+}
+
+export async function addCustomColumn(label: string, name: string, datatype: string): Promise<number> {
+  const data = await jsonFetch<{ num: number }>("/custom-columns/add", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ label, name, datatype }),
+  });
+  return data.num;
+}
+
+export function removeCustomColumn(label: string): Promise<void> {
+  return postNoBody(`/custom-columns/remove/${encodeURIComponent(label)}`);
 }
 
 // Unlike this file's other write endpoints, /fts/indexing's real
