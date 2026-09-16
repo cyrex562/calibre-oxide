@@ -103,7 +103,7 @@ mod tests {
             render_jobs: std::sync::Arc::new(crate::render_endpoints::RenderJobRegistry::new()),
             conversion_jobs: std::sync::Arc::new(crate::convert::ConversionJobRegistry::new()),
             news_jobs: std::sync::Arc::new(crate::news::NewsJobRegistry::new()),
-            tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()),
+            tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()), tts_voice: None,
         };
         let router = crate::test_router(state);
         (dir, router, seeded)
@@ -167,7 +167,7 @@ mod tests {
             render_jobs: std::sync::Arc::new(crate::render_endpoints::RenderJobRegistry::new()),
             conversion_jobs: std::sync::Arc::new(crate::convert::ConversionJobRegistry::new()),
             news_jobs: std::sync::Arc::new(crate::news::NewsJobRegistry::new()),
-            tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()),
+            tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()), tts_voice: None,
         };
         let router = crate::test_router(state);
         (src_dir, dest_dir, broker, router)

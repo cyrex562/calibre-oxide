@@ -46,6 +46,9 @@ struct Cli {
     /// Change a user's password (NAME:PASSWORD) and exit
     #[arg(long)]
     change_password: Option<String>,
+    /// Path to a real Piper .onnx voice model (its sibling .json config is used automatically) -- enables the reader's "Read aloud" TTS feature (issue #756) when set
+    #[arg(long)]
+    tts_voice: Option<PathBuf>,
     #[command(flatten)]
     opts: ServerOptions,
 }
@@ -134,6 +137,7 @@ async fn main() -> anyhow::Result<()> {
     let news_jobs = Arc::new(calibre_srv::news::NewsJobRegistry::new());
     let tweak_sessions = Arc::new(calibre_srv::tweak::TweakSessionRegistry::new());
     let news_schedules = Arc::new(calibre_srv::news_scheduler::NewsScheduleStore::new(&cli.library_path.join("news-schedules.sqlite"))?);
+    let tts_voice = cli.tts_voice.clone().map(|p| Arc::new(calibre_srv::tts::TtsVoiceConfig::from_model_path(p)));
     let state = AppState {
         libraries: None,
         cache: Arc::new(cache),
@@ -148,6 +152,7 @@ async fn main() -> anyhow::Result<()> {
         news_jobs,
         tweak_sessions,
         news_schedules,
+        tts_voice,
     };
 
     // Real background scheduler for #764's own recurring news

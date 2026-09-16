@@ -29,6 +29,12 @@ pub enum ServerError {
     UnprocessableEntity(String),
     #[error("{0}")]
     InternalServerError(String),
+    /// A real, new variant (not a port of an upstream `HTTPError`
+    /// subclass -- no route in this crate needed 503 before): used by
+    /// [`crate::tts::synthesize`] when no TTS voice was configured at
+    /// startup.
+    #[error("{0}")]
+    ServiceUnavailable(String),
     /// Port of `HTTPRedirect`/`HTTPTempRedirect`. `permanent` selects
     /// between them (301 vs 307).
     #[error("redirect to {location}")]
@@ -57,6 +63,7 @@ impl IntoResponse for ServerError {
             ServerError::PreconditionRequired(msg) => (StatusCode::PRECONDITION_REQUIRED, msg).into_response(),
             ServerError::UnprocessableEntity(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg).into_response(),
             ServerError::InternalServerError(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+            ServerError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg).into_response(),
             ServerError::Redirect { location, permanent } => {
                 if permanent {
                     Redirect::permanent(&location).into_response()

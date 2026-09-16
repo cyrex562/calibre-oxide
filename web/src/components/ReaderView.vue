@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute } from "vue-router";
 import { addBookmark, addHighlight, fetchManifest, getAnnotations, getLastReadPositions, setLastReadPosition } from "../reader/api";
 import { loadSpineFileInto, type ResolveContext } from "../reader/unserialize";
@@ -298,6 +298,83 @@ function prev() {
   }
 }
 
+// Real "Read aloud" TTS (#756) -- built on the new POST /tts/synthesize
+// route (crates/calibre_srv/src/tts.rs), which itself reuses
+// calibre_ebooks::tts::batch::text_to_raw_audio_data (already wraps
+// stream::Piper for exactly this "synthesize on demand" shape). Real,
+// disclosed narrowing: this synthesizes the current spine file's whole
+// visible text in one request/one WAV rather than per-sentence/per-
+// paragraph chunked streaming with sentence highlighting -- see
+// tts.rs's own doc.
+const readAloudActive = ref(false);
+const readAloudLoading = ref(false);
+const readAloudError = ref<string | null>(null);
+const audioEl = ref<HTMLAudioElement | null>(null);
+let currentAudioUrl: string | null = null;
+
+function releaseAudioUrl() {
+  if (currentAudioUrl) {
+    URL.revokeObjectURL(currentAudioUrl);
+    currentAudioUrl = null;
+  }
+}
+
+async function synthesizeAndPlayCurrentPage() {
+  const doc = iframeEl.value?.contentDocument;
+  const text = doc?.body?.innerText?.trim() ?? "";
+  if (!text) {
+    // Nothing to read on this (near-empty) page -- auto-advance if
+    // there's a next one, matching real upstream's own auto-advance
+    // once a page finishes; otherwise stop.
+    await advanceReadAloud();
+    return;
+  }
+  readAloudLoading.value = true;
+  readAloudError.value = null;
+  try {
+    const resp = await fetch("/tts/synthesize", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
+    if (!resp.ok) throw new Error((await resp.text()) || `${resp.status} ${resp.statusText}`);
+    const blob = await resp.blob();
+    releaseAudioUrl();
+    currentAudioUrl = URL.createObjectURL(blob);
+    await nextTick();
+    if (audioEl.value) {
+      audioEl.value.src = currentAudioUrl;
+      await audioEl.value.play();
+    }
+  } catch (e) {
+    readAloudError.value = e instanceof Error ? e.message : String(e);
+    readAloudActive.value = false;
+  } finally {
+    readAloudLoading.value = false;
+  }
+}
+
+async function advanceReadAloud() {
+  if (!manifest.value || spineIndex.value >= manifest.value.spine.length - 1) {
+    readAloudActive.value = false;
+    return;
+  }
+  await loadSpine(spineIndex.value + 1);
+  if (readAloudActive.value) await synthesizeAndPlayCurrentPage();
+}
+
+function onReadAloudEnded() {
+  if (readAloudActive.value) void advanceReadAloud();
+}
+
+function toggleReadAloud() {
+  readAloudActive.value = !readAloudActive.value;
+  if (readAloudActive.value) {
+    void synthesizeAndPlayCurrentPage();
+  } else {
+    audioEl.value?.pause();
+    releaseAudioUrl();
+  }
+}
+
+onBeforeUnmount(() => releaseAudioUrl());
+
 function onKeydown(e: KeyboardEvent) {
   if (e.key === keymap.value.readerNext) next();
   else if (e.key === keymap.value.readerPrev) prev();
@@ -355,6 +432,9 @@ function goToBookmark(bookmark: Bookmark) {
       <button @click="prev" :disabled="spineIndex <= 0">◀ Prev</button>
       <span class="title">{{ manifest?.metadata?.title ?? "" }}</span>
       <button @click="next" :disabled="!manifest || spineIndex >= manifest.spine.length - 1">Next ▶</button>
+      <button @click="toggleReadAloud" :disabled="!manifest" :class="{ active: readAloudActive }">
+        {{ readAloudLoading ? "Synthesizing…" : readAloudActive ? "⏹ Stop reading" : "🔊 Read aloud" }}
+      </button>
     </header>
 
     <p v-if="!bookId" class="empty">Open a book via <code>/read/&lt;book_id&gt;/&lt;fmt&gt;</code>.</p>
@@ -362,6 +442,8 @@ function goToBookmark(bookmark: Bookmark) {
     <p v-else-if="statusMessage" class="status">{{ statusMessage }}</p>
     <p v-if="bookmarkError" class="error">{{ bookmarkError }}</p>
     <p v-if="highlightError" class="error">{{ highlightError }}</p>
+    <p v-if="readAloudError" class="error">{{ readAloudError }}</p>
+    <audio v-show="readAloudActive" ref="audioEl" controls @ended="onReadAloudEnded" class="read-aloud-player" />
 
     <nav v-if="showToc" class="toc">
       <ul>
@@ -403,6 +485,15 @@ function goToBookmark(bookmark: Bookmark) {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.toolbar button.active {
+  background: #2a6fbf;
+  color: #fff;
+  border-color: #2a6fbf;
+}
+.read-aloud-player {
+  width: 100%;
+  padding: 0 0.5em;
 }
 .content {
   flex: 1;

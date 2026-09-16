@@ -346,6 +346,7 @@ mod tests {
             news_jobs: std::sync::Arc::new(crate::news::NewsJobRegistry::new()),
             tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()),
             news_schedules: std::sync::Arc::new(NewsScheduleStore::new_in_memory().unwrap()),
+            tts_voice: None,
         };
         let router = crate::test_router(state);
         (dir, router)
