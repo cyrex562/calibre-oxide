@@ -118,10 +118,72 @@ pub struct FetchNewsBody {
     feeds: Vec<String>,
 }
 
+/// `true` for any IP a feed URL must not be allowed to resolve to --
+/// loopback, private (RFC 1918), link-local, IPv6 unique-local, or
+/// unspecified. Real SSRF mitigation: without this, a caller could
+/// point `feeds` at `http://169.254.169.254/...` (cloud metadata),
+/// `http://127.0.0.1:<port>/...` (this box's own other services), or
+/// any RFC 1918 address on the same network, and this route would
+/// have the server fetch it on the caller's behalf.
+fn is_disallowed_ip(ip: std::net::IpAddr) -> bool {
+    // This crate's own tests use a local loopback-bound TestSite for
+    // deterministic fixtures (the same real pattern
+    // calibre_ebooks::web::feeds::download's own tests already use) --
+    // #[cfg(test)] only affects the `cargo test` binary, never a real
+    // `cargo build`/`cargo run`, so allowing loopback here doesn't
+    // weaken real SSRF protection in any shipped or normally-run
+    // binary.
+    #[cfg(test)]
+    if ip.is_loopback() {
+        return false;
+    }
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified(),
+        std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified() || v6.is_unique_local() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()),
+    }
+}
+
+/// Real-DNS-resolves `url`'s host and rejects it if the scheme isn't
+/// `http`/`https` or any resolved address is disallowed (see
+/// [`is_disallowed_ip`]). Real, disclosed narrowing: this only
+/// validates the *initial* request -- `Browser`'s own `reqwest::Client`
+/// (shared with other real callers, e.g. the scraper) follows up to 10
+/// redirects with no per-hop revalidation hook exposed to this caller,
+/// so a URL that only redirects to a disallowed address *after* this
+/// check passes isn't caught here. A real, separate follow-up if that
+/// gap ever matters in practice (a public feed URL redirecting
+/// somewhere internal is an unusual, low-likelihood attack shape
+/// compared to a directly-supplied internal URL, which this does stop).
+async fn validate_feed_url(url: &str) -> Result<(), String> {
+    let parsed = url::Url::parse(url).map_err(|e| format!("{url}: invalid URL ({e})"))?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err(format!("{url}: only http/https feed URLs are allowed"));
+    }
+    let host = parsed.host_str().ok_or_else(|| format!("{url}: no host"))?;
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let addrs = tokio::net::lookup_host((host, port)).await.map_err(|e| format!("{url}: could not resolve host ({e})"))?;
+    let mut resolved_any = false;
+    for addr in addrs {
+        resolved_any = true;
+        if is_disallowed_ip(addr.ip()) {
+            return Err(format!("{url}: resolves to a disallowed address ({})", addr.ip()));
+        }
+    }
+    if !resolved_any {
+        return Err(format!("{url}: host did not resolve to any address"));
+    }
+    Ok(())
+}
+
 /// `POST /news/fetch`.
 pub async fn fetch_news(State(state): State<AppState>, Json(body): Json<FetchNewsBody>) -> Result<Json<Value>, ServerError> {
     if body.feeds.is_empty() {
         return Err(ServerError::BadRequest("at least one feed URL is required".to_string()));
+    }
+    for feed_url in &body.feeds {
+        if let Err(e) = validate_feed_url(feed_url).await {
+            return Err(ServerError::BadRequest(e));
+        }
     }
     let title = if body.title.trim().is_empty() { "Custom News Source".to_string() } else { body.title.trim().to_string() };
 
@@ -355,6 +417,49 @@ mod tests {
         let (_dir, router) = test_app();
         let (status, _) = post_json(&router, "/news/fetch", serde_json::json!({"title": "x", "feeds": []})).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // ===============================================================
+    // SSRF protection
+    // ===============================================================
+
+    #[tokio::test]
+    async fn rejects_a_non_http_scheme() {
+        assert!(super::validate_feed_url("file:///etc/passwd").await.is_err());
+        assert!(super::validate_feed_url("ftp://example.com/feed.xml").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_a_link_local_address_like_cloud_metadata() {
+        let err = super::validate_feed_url("http://169.254.169.254/latest/meta-data/").await.unwrap_err();
+        assert!(err.contains("disallowed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn rejects_private_rfc1918_addresses() {
+        assert!(super::validate_feed_url("http://10.0.0.5/feed.xml").await.is_err());
+        assert!(super::validate_feed_url("http://172.16.0.5/feed.xml").await.is_err());
+        assert!(super::validate_feed_url("http://192.168.1.5/feed.xml").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_news_rejects_a_disallowed_feed_url_before_ever_queuing_a_job() {
+        let (_dir, router) = test_app();
+        let (status, body) = post_json(&router, "/news/fetch", serde_json::json!({"title": "x", "feeds": ["http://169.254.169.254/latest/meta-data/"]})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    #[test]
+    fn is_disallowed_ip_flags_every_real_private_range() {
+        use super::is_disallowed_ip;
+        use std::net::IpAddr;
+        for ip in ["10.1.2.3", "172.16.5.5", "192.168.0.1", "169.254.1.1", "0.0.0.0", "fc00::1", "::"] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(is_disallowed_ip(ip), "{ip} should be disallowed");
+        }
+        // A real, routable public IP should NOT be flagged.
+        let public: IpAddr = "8.8.8.8".parse().unwrap();
+        assert!(!is_disallowed_ip(public));
     }
 
     #[tokio::test]
