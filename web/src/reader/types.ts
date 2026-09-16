@@ -52,7 +52,7 @@ export interface BookManifest {
   files: Record<string, FileInfo>;
   metadata?: Record<string, unknown>;
   last_read_positions?: LastReadPosition[];
-  annotations_map?: { bookmark?: Bookmark[]; [key: string]: unknown[] | undefined };
+  annotations_map?: { bookmark?: Bookmark[]; highlight?: Highlight[]; [key: string]: unknown[] | undefined };
   // Cache-miss / job-status shaped response instead of a real manifest.
   job_status?: "waiting" | "running" | "finished" | "failed" | "unknown";
   aborted?: boolean;
@@ -75,6 +75,21 @@ export interface Bookmark {
   timestamp: string;
   pos: string;
   pos_type: string;
+}
+
+// Real shape `calibre_db::annotations` expects for a highlight (see
+// that module's own `MERGE_FIELDS`: `uuid` is the merge key, so
+// re-saving the same uuid replaces rather than duplicates). `start_cfi`/
+// `end_cfi` use this reader's own real (non-CFI) range-anchoring
+// scheme -- see reader/highlightRange.ts's own doc, same disclosed-
+// narrowing precedent as Bookmark's `pos_type` above.
+export interface Highlight {
+  type: "highlight";
+  uuid: string;
+  timestamp: string;
+  start_cfi: string;
+  end_cfi: string;
+  highlighted_text: string;
 }
 
 export interface LastReadPosition {

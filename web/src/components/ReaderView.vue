@@ -1,13 +1,15 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute } from "vue-router";
-import { addBookmark, fetchManifest, getAnnotations, getLastReadPositions, setLastReadPosition } from "../reader/api";
+import { addBookmark, addHighlight, fetchManifest, getAnnotations, getLastReadPositions, setLastReadPosition } from "../reader/api";
 import { loadSpineFileInto, type ResolveContext } from "../reader/unserialize";
 import { anchorLinkData } from "../reader/virtualLinks";
 import { decodePosition, encodePosition } from "../reader/position";
 import { flattenToc } from "../reader/toc";
+import { encodeBoundary, rangeFromEncoded } from "../reader/highlightRange";
+import { wrapHighlightRange } from "../reader/highlightDom";
 import { DEFAULT_READER_PREFS, fetchProfile, READER_PREFS_PROFILE, type ReaderPrefs } from "../settings/api";
-import type { Bookmark, BookManifest } from "../reader/types";
+import type { Bookmark, BookManifest, Highlight } from "../reader/types";
 
 const route = useRoute();
 
@@ -23,6 +25,8 @@ const showBookmarks = ref(false);
 const iframeEl = ref<HTMLIFrameElement | null>(null);
 const bookmarks = ref<Bookmark[]>([]);
 const bookmarkError = ref<string | null>(null);
+const highlights = ref<Highlight[]>([]);
+const highlightError = ref<string | null>(null);
 
 const tocEntries = computed(() => (manifest.value ? flattenToc(manifest.value.toc) : []));
 
@@ -59,7 +63,7 @@ function applyReaderPrefs() {
     style.id = READER_PREFS_STYLE_ID;
     doc.head?.appendChild(style);
   }
-  style.textContent = `html { font-size: ${readerPrefs.value.fontSizePercent}% !important; } body { background: ${bg} !important; color: ${fg} !important; }`;
+  style.textContent = `html { font-size: ${readerPrefs.value.fontSizePercent}% !important; } body { background: ${bg} !important; color: ${fg} !important; } mark.cx-highlight { background: #ffe066 !important; color: #111 !important; }`;
 }
 
 function deviceId(): string {
@@ -108,7 +112,24 @@ async function loadSpine(index: number, frag = "") {
     iframeEl.value.contentDocument.getElementById(frag)?.scrollIntoView();
   }
   installAnchorHandler(m);
+  installSelectionHandler();
+  renderHighlights();
   savePosition(frag);
+}
+
+// Real text-highlight rendering (issue #731) -- every highlight whose
+// own encoded boundaries belong to the spine file just loaded (a
+// highlight never spans more than one spine file in this reader, see
+// reader/highlightRange.ts's own doc) is re-wrapped in a real <mark>
+// each time that file loads, since loadSpineFileInto rebuilds the
+// iframe's document from scratch on every navigation.
+function renderHighlights() {
+  const doc = iframeEl.value?.contentDocument;
+  if (!doc) return;
+  for (const h of highlights.value) {
+    const range = rangeFromEncoded(doc, spineIndex.value, h.start_cfi, h.end_cfi);
+    if (range) wrapHighlightRange(range, "cx-highlight", { uuid: h.uuid });
+  }
 }
 
 function installAnchorHandler(m: BookManifest) {
@@ -132,6 +153,80 @@ function installAnchorHandler(m: BookManifest) {
     }
     void loadSpine(idx, data.frag);
   });
+}
+
+const HIGHLIGHT_POPOVER_ID = "calibre-oxide-highlight-popover";
+
+// Real text-selection -> highlight creation flow (issue #731). The
+// popover button is real content injected directly into the iframe's
+// own document (not a separate overlay positioned across the frame
+// boundary) so it naturally lives in the same coordinate space as the
+// selection it points at, with no cross-frame rect translation
+// needed. `loadSpineFileInto`'s own `document.open()/write()/close()`
+// (see unserialize.ts) resets the whole document -- including every
+// previously attached listener -- on each navigation, so re-attaching
+// here on every `loadSpine` call (matching `installAnchorHandler`'s
+// own identical pattern) is the correct, not redundant, thing to do.
+function installSelectionHandler() {
+  const doc = iframeEl.value?.contentDocument;
+  if (!doc) return;
+
+  const popover = doc.createElement("button");
+  popover.id = HIGHLIGHT_POPOVER_ID;
+  popover.type = "button";
+  popover.textContent = "Highlight";
+  popover.style.cssText = "position:absolute;z-index:1000;display:none;padding:0.3em 0.6em;border-radius:4px;border:none;background:#2a6df4;color:#fff;font:14px sans-serif;cursor:pointer;";
+  doc.body.appendChild(popover);
+  // Without this, the mousedown on the button itself would collapse
+  // the very selection it's meant to act on before the click handler
+  // below ever runs.
+  popover.addEventListener("mousedown", (e) => e.preventDefault());
+  popover.addEventListener("click", () => void createHighlightFromSelection());
+
+  doc.addEventListener("mouseup", () => {
+    const sel = doc.getSelection();
+    if (!sel || sel.isCollapsed || sel.rangeCount === 0 || !sel.toString().trim()) {
+      popover.style.display = "none";
+      return;
+    }
+    const rect = sel.getRangeAt(0).getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) {
+      popover.style.display = "none";
+      return;
+    }
+    const view = doc.defaultView;
+    popover.style.left = `${rect.left + (view?.scrollX ?? 0)}px`;
+    popover.style.top = `${rect.top + (view?.scrollY ?? 0) - 32}px`;
+    popover.style.display = "block";
+  });
+}
+
+async function createHighlightFromSelection() {
+  const doc = iframeEl.value?.contentDocument;
+  if (!doc) return;
+  const sel = doc.getSelection();
+  if (!sel || sel.isCollapsed || sel.rangeCount === 0) return;
+  const range = sel.getRangeAt(0);
+  const text = range.toString();
+  if (!text.trim()) return;
+
+  const startCfi = encodeBoundary(doc.body, spineIndex.value, range.startContainer, range.startOffset);
+  const endCfi = encodeBoundary(doc.body, spineIndex.value, range.endContainer, range.endOffset);
+  const popover = doc.getElementById(HIGHLIGHT_POPOVER_ID);
+  if (popover) popover.style.display = "none";
+  if (!startCfi || !endCfi) {
+    highlightError.value = "Could not anchor this selection to a real position -- try selecting within a single paragraph.";
+    return;
+  }
+  highlightError.value = null;
+  try {
+    const highlight = await addHighlight(bookId.value, fmt.value, startCfi, endCfi, text);
+    highlights.value = [...highlights.value, highlight];
+    wrapHighlightRange(range, "cx-highlight", { uuid: highlight.uuid });
+    sel.removeAllRanges();
+  } catch (e) {
+    highlightError.value = e instanceof Error ? e.message : String(e);
+  }
 }
 
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -163,6 +258,7 @@ async function init() {
     try {
       const map = await getAnnotations(bookId.value, fmt.value);
       bookmarks.value = map.bookmark ?? [];
+      highlights.value = map.highlight ?? [];
     } catch (e) {
       console.error("failed to load bookmarks", e);
     }
@@ -251,6 +347,7 @@ function goToBookmark(bookmark: Bookmark) {
     <p v-else-if="loadError" class="error">{{ loadError }}</p>
     <p v-else-if="statusMessage" class="status">{{ statusMessage }}</p>
     <p v-if="bookmarkError" class="error">{{ bookmarkError }}</p>
+    <p v-if="highlightError" class="error">{{ highlightError }}</p>
 
     <nav v-if="showToc" class="toc">
       <ul>
