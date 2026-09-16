@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { onBeforeUnmount, onMounted, ref } from "vue";
 import { isTauri, tauriInvoke } from "../tauri";
-import { DEFAULT_LIBRARY_PREFS, DEFAULT_READER_PREFS, fetchProfile, LIBRARY_PREFS_PROFILE, READER_PREFS_PROFILE, saveProfile, type LibraryPrefs, type ReaderPrefs } from "./api";
+import { DEFAULT_KEYMAP, DEFAULT_LIBRARY_PREFS, DEFAULT_READER_PREFS, fetchProfile, KEYMAP_ACTION_LABELS, KEYMAP_PROFILE, LIBRARY_PREFS_PROFILE, READER_PREFS_PROFILE, saveProfile, type KeymapAction, type KeymapPrefs, type LibraryPrefs, type ReaderPrefs } from "./api";
 
 const libraryPrefs = ref<LibraryPrefs>({ ...DEFAULT_LIBRARY_PREFS });
 const readerPrefs = ref<ReaderPrefs>({ ...DEFAULT_READER_PREFS });
+const keymap = ref<KeymapPrefs>({ ...DEFAULT_KEYMAP });
+const rebindingAction = ref<KeymapAction | null>(null);
 const loading = ref(true);
 const savedMessage = ref<string | null>(null);
 const error = ref<string | null>(null);
@@ -16,9 +18,10 @@ async function load() {
   loading.value = true;
   error.value = null;
   try {
-    const [lib, reader] = await Promise.all([fetchProfile<LibraryPrefs>(LIBRARY_PREFS_PROFILE), fetchProfile<ReaderPrefs>(READER_PREFS_PROFILE)]);
+    const [lib, reader, keys] = await Promise.all([fetchProfile<LibraryPrefs>(LIBRARY_PREFS_PROFILE), fetchProfile<ReaderPrefs>(READER_PREFS_PROFILE), fetchProfile<KeymapPrefs>(KEYMAP_PROFILE)]);
     if (lib) libraryPrefs.value = { ...DEFAULT_LIBRARY_PREFS, ...lib };
     if (reader) readerPrefs.value = { ...DEFAULT_READER_PREFS, ...reader };
+    if (keys) keymap.value = { ...DEFAULT_KEYMAP, ...keys };
     if (isTauri()) {
       showAppSettings.value = true;
       autoReopen.value = await tauriInvoke<boolean>("get_auto_reopen");
@@ -29,7 +32,11 @@ async function load() {
     loading.value = false;
   }
 }
-onMounted(load);
+onMounted(() => {
+  load();
+  window.addEventListener("keydown", onRebindKeydown);
+});
+onBeforeUnmount(() => window.removeEventListener("keydown", onRebindKeydown));
 
 async function saveLibraryPrefs() {
   savedMessage.value = null;
@@ -48,6 +55,32 @@ async function saveReaderPrefs() {
   try {
     await saveProfile(READER_PREFS_PROFILE, readerPrefs.value as unknown as Record<string, unknown>);
     savedMessage.value = "Reading preferences saved.";
+  } catch (e) {
+    error.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
+function startRebind(action: KeymapAction) {
+  rebindingAction.value = action;
+}
+
+function onRebindKeydown(e: KeyboardEvent) {
+  if (!rebindingAction.value) return;
+  e.preventDefault();
+  if (e.key === "Escape") {
+    rebindingAction.value = null;
+    return;
+  }
+  keymap.value = { ...keymap.value, [rebindingAction.value]: e.key };
+  rebindingAction.value = null;
+}
+
+async function saveKeymap() {
+  savedMessage.value = null;
+  error.value = null;
+  try {
+    await saveProfile(KEYMAP_PROFILE, keymap.value as unknown as Record<string, unknown>);
+    savedMessage.value = "Keyboard shortcuts saved.";
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e);
   }
@@ -128,6 +161,17 @@ async function toggleAutoReopen() {
         <button type="button" @click="saveReaderPrefs">Save reading settings</button>
       </section>
 
+      <section class="pane">
+        <h3>Keyboard shortcuts</h3>
+        <div v-for="(label, action) in KEYMAP_ACTION_LABELS" :key="action" class="field keymap-row">
+          <span>{{ label }}</span>
+          <button type="button" @click="startRebind(action as KeymapAction)">
+            {{ rebindingAction === action ? "Press a key… (Esc to cancel)" : keymap[action as KeymapAction] }}
+          </button>
+        </div>
+        <button type="button" @click="saveKeymap">Save keyboard shortcuts</button>
+      </section>
+
       <section v-if="showAppSettings" class="pane">
         <h3>App</h3>
         <label class="field checkbox">
@@ -175,6 +219,11 @@ async function toggleAutoReopen() {
 .field.checkbox {
   flex-direction: row;
   align-items: center;
+}
+.keymap-row {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
 }
 .error {
   color: #b00020;
