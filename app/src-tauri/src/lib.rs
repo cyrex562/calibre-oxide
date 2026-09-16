@@ -98,6 +98,23 @@ async fn choose_library(app: AppHandle) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Real "switch library" quick-switch UI's data source (issue #725):
+/// most-recently-opened libraries, newest first. This app stays
+/// single-library-per-instance (see `settings.rs`'s own doc) --
+/// switching means re-spawning `calibre_srv` against a different
+/// path, not serving several libraries at once.
+#[tauri::command]
+fn list_recent_libraries(app: AppHandle) -> Vec<String> {
+    settings::list_recent_libraries(&app).into_iter().map(|p| p.to_string_lossy().into_owned()).collect()
+}
+
+/// Re-opens a library from the recent-libraries list without going
+/// through the folder-picker dialog again.
+#[tauri::command]
+async fn open_recent_library(app: AppHandle, path: String) -> Result<(), String> {
+    open_library(&app, std::path::PathBuf::from(path))
+}
+
 /// Real extensions `calibre_ebooks::metadata::get_metadata`'s own
 /// dispatch table understands (`crates/calibre_ebooks/src/metadata/mod.rs`)
 /// -- sourced from that match arm list directly, not invented, so a
@@ -183,7 +200,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(ServerState::default())
-        .invoke_handler(tauri::generate_handler![ping, get_persisted_library, choose_library, choose_folder_and_add_books])
+        .invoke_handler(tauri::generate_handler![ping, get_persisted_library, choose_library, choose_folder_and_add_books, list_recent_libraries, open_recent_library])
         .setup(|app| {
             // Auto-open the last library, if any, without waiting for
             // the frontend to ask -- real startup UX, not just a

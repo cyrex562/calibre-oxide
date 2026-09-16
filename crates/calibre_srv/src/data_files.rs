@@ -8,8 +8,10 @@
 //!   real relpath contains `/` (e.g. `data/notes.pdf`) -- `axum`
 //!   requires a wildcard segment to be the last one in a route, so
 //!   (unlike every other endpoint in this crate) this route has no
-//!   trailing `library_id` segment at all rather than accepting-and-
-//!   ignoring one; single-library-only, same as everywhere else.
+//!   trailing `library_id` segment at all -- single-library-only for
+//!   this one endpoint specifically, not a narrowing shared with the
+//!   rest of the crate (`upload`/`remove` below do honor theirs, via
+//!   `AppState::cache_for`).
 //! - `POST /data-files/upload/{book_id}/{library_id}` -- base64-encoded
 //!   files in a JSON body, `[{data_url, name}]`.
 //! - `POST /data-files/remove/{book_id}/{library_id}` -- remove by
@@ -107,7 +109,8 @@ fn decode_data_url(data_url: &str) -> Result<Vec<u8>, ServerError> {
 
 /// `POST /data-files/upload/{book_id}/{library_id}`. Port of
 /// `upload_data_files`.
-pub async fn upload(State(state): State<AppState>, Path((book_id, _library_id)): Path<(i32, String)>, Json(body): Json<Vec<UploadSpec>>) -> Result<Json<Value>, ServerError> {
+pub async fn upload(State(state): State<AppState>, Path((book_id, library_id)): Path<(i32, String)>, Json(body): Json<Vec<UploadSpec>>) -> Result<Json<Value>, ServerError> {
+    let cache = state.cache_for(Some(&library_id)).ok_or_else(|| ServerError::NotFound(format!("no library named {library_id:?}")))?;
     let mut files = HashMap::new();
     for spec in &body {
         let data = decode_data_url(&spec.data_url)?;
@@ -115,7 +118,7 @@ pub async fn upload(State(state): State<AppState>, Path((book_id, _library_id)):
     }
 
     let (err, data_files) = tokio::task::spawn_blocking({
-        let cache = state.cache.clone();
+        let cache = cache.clone();
         move || -> anyhow::Result<(String, Vec<ExtraFile>)> {
             let err = match extra_files::add_extra_files(&cache, book_id, &files, true) {
                 Ok(_) => String::new(),
@@ -135,9 +138,10 @@ pub async fn upload(State(state): State<AppState>, Path((book_id, _library_id)):
 
 /// `POST /data-files/remove/{book_id}/{library_id}`. Port of
 /// `remove_data_files`.
-pub async fn remove(State(state): State<AppState>, Path((book_id, _library_id)): Path<(i32, String)>, Json(relpaths): Json<Vec<String>>) -> Result<Json<Value>, ServerError> {
+pub async fn remove(State(state): State<AppState>, Path((book_id, library_id)): Path<(i32, String)>, Json(relpaths): Json<Vec<String>>) -> Result<Json<Value>, ServerError> {
+    let cache = state.cache_for(Some(&library_id)).ok_or_else(|| ServerError::NotFound(format!("no library named {library_id:?}")))?;
     let (errors, data_files) = tokio::task::spawn_blocking({
-        let cache = state.cache.clone();
+        let cache = cache.clone();
         move || -> anyhow::Result<(HashMap<String, Option<String>>, Vec<ExtraFile>)> {
             let errors = extra_files::remove_extra_files(&cache, book_id, &relpaths, true)?;
             let data_files = extra_files::list_extra_files(&cache, book_id, "data/**/*")?;
@@ -205,6 +209,56 @@ mod tests {
         assert_eq!(resp.headers().get("content-disposition").unwrap().to_str().unwrap(), "attachment; filename=\"notes.pdf\"");
         let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&bytes[..], b"pdf bytes here");
+    }
+
+    fn test_app_with_two_libraries() -> (tempfile::TempDir, tempfile::TempDir, std::sync::Arc<crate::library_broker::LibraryBroker>, axum::Router, i32) {
+        let src_dir = tempfile::tempdir().unwrap();
+        let dest_dir = tempfile::tempdir().unwrap();
+        let book_id = {
+            let cache = Cache::new(src_dir.path()).unwrap();
+            let source = src_dir.path().join("Book.epub");
+            std::fs::write(&source, b"fake epub bytes").unwrap();
+            let mut meta = calibre_ebooks::metadata::MetaInformation::default();
+            meta.title = "Book".to_string();
+            meta.authors = vec!["Author".to_string()];
+            cache.add_book(&source, &meta).unwrap()
+        };
+        Cache::new(dest_dir.path()).unwrap();
+        let broker = std::sync::Arc::new(crate::library_broker::LibraryBroker::new(&[src_dir.path().to_path_buf(), dest_dir.path().to_path_buf()]).unwrap());
+        let default_cache = broker.get(None).expect("the broker's default library");
+        let state = crate::AppState { libraries: Some(broker.clone()), cache: default_cache, opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()), book_cache: std::sync::Arc::new(crate::books_cache::BookCache::open_temp()), jobs: std::sync::Arc::new(crate::jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))), render_jobs: std::sync::Arc::new(crate::render_endpoints::RenderJobRegistry::new()), conversion_jobs: std::sync::Arc::new(crate::convert::ConversionJobRegistry::new()), news_jobs: std::sync::Arc::new(crate::news::NewsJobRegistry::new()) };
+        let router = crate::test_router(state);
+        (src_dir, dest_dir, broker, router, book_id)
+    }
+
+    #[tokio::test]
+    async fn upload_with_a_real_library_id_segment_targets_that_library() {
+        // #725: `upload`/`remove` used to ignore their own
+        // {library_id} path segment entirely and always hit
+        // `state.cache` (the broker's default library) -- confirm the
+        // data file is really stored against the NAMED library.
+        let (src_dir, _dest_dir, broker, router, book_id) = test_app_with_two_libraries();
+        let src_name = src_dir.path().file_name().unwrap().to_str().unwrap();
+        let src_cache = broker.get(Some(src_name)).unwrap();
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"pdf bytes here");
+        let (status, body) = post_json(&router, &format!("/data-files/upload/{book_id}/{src_name}"), serde_json::json!([{"name": "notes.pdf", "data_url": format!("data:application/pdf;base64,{encoded}")}])).await;
+        assert_eq!(status, StatusCode::OK, "got: {body}");
+
+        let data_files = calibre_db::extra_files::list_extra_files(&src_cache, book_id, "data/**/*").unwrap();
+        assert!(data_files.iter().any(|f| f.relpath == "data/notes.pdf"), "the data file should really be stored in the named library's own cache");
+    }
+
+    #[tokio::test]
+    async fn upload_404s_for_an_unknown_library_id() {
+        // Must use multi-library mode: in single-library mode
+        // (`AppState::libraries == None`), `cache_for` always falls
+        // back to the default library regardless of the requested
+        // name -- an unknown name can only actually 404 once a real
+        // `LibraryBroker` is involved.
+        let (_src_dir, _dest_dir, _broker, router, book_id) = test_app_with_two_libraries();
+        let (status, _) = post_json(&router, &format!("/data-files/upload/{book_id}/no-such-library"), serde_json::json!([])).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

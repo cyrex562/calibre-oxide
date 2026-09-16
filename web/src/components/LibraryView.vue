@@ -470,6 +470,53 @@ async function addFolder() {
     addingFolder.value = false;
   }
 }
+
+// Switch-library quick-switch (issue #725, desktop-only). This app
+// stays single-library-per-instance -- "switching" re-spawns
+// calibre_srv against a different path and re-navigates the window
+// (app/src-tauri/src/lib.rs's open_library/open_recent_library), it
+// doesn't serve multiple libraries at once. The list is capped/
+// deduplicated server-side (app/src-tauri/src/settings.rs).
+const switchOpen = ref(false);
+const recentLibraries = ref<string[]>([]);
+const switching = ref(false);
+const switchError = ref<string | null>(null);
+
+async function openSwitchLibrary() {
+  switchError.value = null;
+  switchOpen.value = true;
+  try {
+    recentLibraries.value = await tauriInvoke<string[]>("list_recent_libraries");
+  } catch (e) {
+    switchError.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
+async function switchToRecent(path: string) {
+  switching.value = true;
+  switchError.value = null;
+  try {
+    await tauriInvoke<void>("open_recent_library", { path });
+    switchOpen.value = false;
+  } catch (e) {
+    switchError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    switching.value = false;
+  }
+}
+
+async function switchToOther() {
+  switching.value = true;
+  switchError.value = null;
+  try {
+    const picked = await tauriInvoke<boolean>("choose_library");
+    if (picked) switchOpen.value = false;
+  } catch (e) {
+    switchError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    switching.value = false;
+  }
+}
 </script>
 
 <template>
@@ -508,6 +555,7 @@ async function addFolder() {
       <button type="button" :disabled="adding" @click="addInput?.click()">{{ adding ? "Adding…" : "Add Books…" }}</button>
       <input ref="addInput" type="file" multiple class="hidden-file-input" @change="onAddFileSelected" />
       <button v-if="isTauri()" type="button" :disabled="addingFolder" @click="addFolder">{{ addingFolder ? "Adding…" : "Add Folder…" }}</button>
+      <button v-if="isTauri()" type="button" @click="openSwitchLibrary">Switch library…</button>
 
       <template v-if="!ftsMode">
         <button type="button" :class="{ active: selectMode }" @click="toggleSelectMode">
@@ -664,6 +712,24 @@ async function addFolder() {
         </form>
         <p v-if="newsDone" class="news-done">Added the fetched news as a new book.</p>
         <p v-if="newsError" class="error">{{ newsError }}</p>
+      </div>
+    </div>
+
+    <div v-if="switchOpen" class="manage-backdrop" @click.self="switchOpen = false">
+      <div class="manage-panel">
+        <button class="manage-close" @click="switchOpen = false">✕</button>
+        <h3>Switch library</h3>
+        <ul v-if="recentLibraries.length" class="manage-list">
+          <li v-for="path in recentLibraries" :key="path">
+            <button type="button" :disabled="switching" @click="switchToRecent(path)">{{ path }}</button>
+          </li>
+        </ul>
+        <p v-else class="news-hint">No other recently-opened libraries yet.</p>
+        <div class="bulk-actions">
+          <button type="button" class="read" :disabled="switching" @click="switchToOther">Browse for another…</button>
+          <button type="button" :disabled="switching" @click="switchOpen = false">Close</button>
+        </div>
+        <p v-if="switchError" class="error">{{ switchError }}</p>
       </div>
     </div>
   </div>
