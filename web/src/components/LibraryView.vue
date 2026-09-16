@@ -2,9 +2,9 @@
 import { computed, ref, watch } from "vue";
 import CategoryBrowser from "./CategoryBrowser.vue";
 import BookDetailsPanel from "./BookDetailsPanel.vue";
-import { addBook, fetchBooks, fetchFieldMetadata, fetchVirtualLibraries, ftsSearch, ftsSnippets, search, setFtsEnabled } from "../library/api";
+import { addBook, fetchBooks, fetchFieldMetadata, fetchVirtualLibraries, ftsSearch, ftsSnippets, search, setFields, setFtsEnabled } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
-import type { BookSummary, FtsSnippet } from "../library/types";
+import type { BookFieldChanges, BookSummary, FtsSnippet } from "../library/types";
 
 const PAGE_SIZE = 24;
 
@@ -184,6 +184,85 @@ function onDetailsDeleted() {
   void (ftsMode.value ? runFtsSearch() : runSearch());
 }
 
+// Bulk (multi-book) metadata editing -- client-side fan-out over the
+// existing per-book /cdb/set-fields, matching #716's own scope: no
+// bulk server endpoint exists (or is needed yet), just N real
+// requests with real per-book error aggregation so one bad book
+// doesn't silently swallow the rest.
+const selectMode = ref(false);
+const selectedIds = ref<Set<number>>(new Set());
+const bulkOpen = ref(false);
+const bulkBusy = ref(false);
+const bulkErrors = ref<string[]>([]);
+const bulkAddTags = ref("");
+const bulkRemoveTags = ref("");
+const bulkSeries = ref("");
+const bulkApplyRating = ref(false);
+const bulkRating = ref(0);
+
+function toggleSelectMode() {
+  selectMode.value = !selectMode.value;
+  if (!selectMode.value) {
+    selectedIds.value = new Set();
+    bulkOpen.value = false;
+  }
+}
+
+function toggleSelected(bookId: number) {
+  const next = new Set(selectedIds.value);
+  if (next.has(bookId)) next.delete(bookId);
+  else next.add(bookId);
+  selectedIds.value = next;
+}
+
+function onCardClick(bookId: number) {
+  if (selectMode.value) toggleSelected(bookId);
+  else selectedBookId.value = bookId;
+}
+
+async function runBulkEdit() {
+  const ids = [...selectedIds.value];
+  if (ids.length === 0) return;
+
+  const addTags = bulkAddTags.value.split(",").map((t) => t.trim()).filter(Boolean);
+  const removeTags = bulkRemoveTags.value.split(",").map((t) => t.trim()).filter(Boolean);
+  const setSeries = bulkSeries.value.trim();
+
+  bulkBusy.value = true;
+  bulkErrors.value = [];
+  for (const id of ids) {
+    try {
+      const changes: BookFieldChanges = {};
+      if (addTags.length || removeTags.length) {
+        const current = books.value.find((b) => b.id === id);
+        const tags = new Set(current?.tags ?? []);
+        for (const t of addTags) tags.add(t);
+        for (const t of removeTags) tags.delete(t);
+        changes.tags = [...tags];
+      }
+      if (setSeries) changes.series = setSeries;
+      if (bulkApplyRating.value) changes.rating = bulkRating.value;
+      if (Object.keys(changes).length === 0) continue;
+      await setFields(id, changes);
+    } catch (e) {
+      bulkErrors.value.push(`Book ${id}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  bulkBusy.value = false;
+
+  if (bulkErrors.value.length === 0) {
+    bulkOpen.value = false;
+    selectMode.value = false;
+    selectedIds.value = new Set();
+    bulkAddTags.value = "";
+    bulkRemoveTags.value = "";
+    bulkSeries.value = "";
+    bulkApplyRating.value = false;
+  }
+  cacheBust.value++;
+  await runSearch();
+}
+
 async function addBookFile(file: File, addDuplicates: boolean): Promise<void> {
   const result = await addBook(file, addDuplicates);
   if (result.duplicates && result.duplicates.length > 0 && result.book_id === undefined) {
@@ -241,7 +320,36 @@ async function onAddFileSelected(e: Event) {
 
       <button type="button" :disabled="adding" @click="addInput?.click()">{{ adding ? "Adding…" : "Add Book…" }}</button>
       <input ref="addInput" type="file" class="hidden-file-input" @change="onAddFileSelected" />
+
+      <template v-if="!ftsMode">
+        <button type="button" :class="{ active: selectMode }" @click="toggleSelectMode">
+          {{ selectMode ? "Cancel selection" : "Select…" }}
+        </button>
+        <button v-if="selectedIds.size > 0" type="button" @click="bulkOpen = true">Bulk edit ({{ selectedIds.size }})</button>
+      </template>
     </header>
+
+    <div v-if="bulkOpen" class="bulk-panel">
+      <div class="bulk-row">
+        <label>Add tags <input v-model="bulkAddTags" placeholder="scifi, classic" :disabled="bulkBusy" /></label>
+        <label>Remove tags <input v-model="bulkRemoveTags" placeholder="unwanted-tag" :disabled="bulkBusy" /></label>
+        <label>Set series <input v-model="bulkSeries" :disabled="bulkBusy" /></label>
+        <label class="bulk-rating">
+          <input type="checkbox" v-model="bulkApplyRating" :disabled="bulkBusy" />
+          Set rating
+          <input type="number" v-model.number="bulkRating" min="0" max="5" step="1" :disabled="bulkBusy || !bulkApplyRating" />
+        </label>
+      </div>
+      <div class="bulk-actions">
+        <button type="button" :disabled="bulkBusy" @click="runBulkEdit">
+          {{ bulkBusy ? "Applying…" : `Apply to ${selectedIds.size} book(s)` }}
+        </button>
+        <button type="button" :disabled="bulkBusy" @click="bulkOpen = false">Close</button>
+      </div>
+      <ul v-if="bulkErrors.length" class="bulk-errors">
+        <li v-for="(err, i) in bulkErrors" :key="i" class="error">{{ err }}</li>
+      </ul>
+    </div>
 
     <p v-if="addError" class="error add-error">{{ addError }}</p>
 
@@ -288,7 +396,8 @@ async function onAddFileSelected(e: Event) {
         <p v-else-if="books.length === 0" class="status">No books found.</p>
 
         <div class="grid">
-          <button v-for="book in books" :key="book.id" class="card" @click="selectedBookId = book.id">
+          <button v-for="book in books" :key="book.id" class="card" :class="{ selected: selectMode && selectedIds.has(book.id) }" @click="onCardClick(book.id)">
+            <input v-if="selectMode" type="checkbox" class="card-checkbox" :checked="selectedIds.has(book.id)" @click.stop="toggleSelected(book.id)" />
             <img :src="`${book.thumbnail}?v=${cacheBust}`" :alt="book.title" loading="lazy" />
             <div class="card-title">{{ book.title }}</div>
             <div class="card-authors">{{ (book.authors ?? []).join(" & ") }}</div>
@@ -360,6 +469,19 @@ async function onAddFileSelected(e: Event) {
   text-align: left;
   padding: 0;
   font: inherit;
+  position: relative;
+}
+.card.selected img {
+  outline: 3px solid #2a6df4;
+  outline-offset: -3px;
+}
+.card-checkbox {
+  position: absolute;
+  top: 0.3em;
+  left: 0.3em;
+  width: 1.1em;
+  height: 1.1em;
+  z-index: 1;
 }
 .card img {
   width: 100%;
@@ -459,5 +581,45 @@ async function onAddFileSelected(e: Event) {
   background: #fff3a0;
   color: inherit;
   padding: 0 0.1em;
+}
+.bulk-panel {
+  padding: 0.75em 1em;
+  background: #f7f7f7;
+  border-bottom: 1px solid #ddd;
+}
+.bulk-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1em;
+  align-items: flex-end;
+}
+.bulk-row label {
+  display: flex;
+  flex-direction: column;
+  font-size: 0.85em;
+  color: #555;
+  gap: 0.2em;
+}
+.bulk-row input[type="text"],
+.bulk-row input:not([type]) {
+  font: inherit;
+  padding: 0.35em 0.5em;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+}
+.bulk-rating {
+  flex-direction: row !important;
+  align-items: center;
+  gap: 0.4em !important;
+}
+.bulk-actions {
+  margin-top: 0.6em;
+  display: flex;
+  gap: 0.5em;
+}
+.bulk-errors {
+  margin: 0.6em 0 0;
+  padding: 0;
+  list-style: none;
 }
 </style>
