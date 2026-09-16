@@ -100,6 +100,40 @@ pub fn find_duplicate_books(cache: &Cache, title: &str, authors: &[String]) -> R
     Ok(find_identical_books(title, authors, &author_map, &aid_to_bids, &title_map))
 }
 
+/// Real whole-library duplicate scan (issue #762), reusing
+/// [`duplicate_detection_maps`]/[`find_identical_books`] exactly as
+/// they already are for the per-candidate add-time check -- the maps
+/// are built once (a real, disclosed O(n) full-table-scan, matching
+/// [`duplicate_detection_maps`]'s own doc), then every book is matched
+/// against them once, which is O(n) map lookups per book rather than a
+/// naive O(n²) re-scan. Returns each group of 2+ books this crate's
+/// existing same-author/near-same-title heuristic considers likely
+/// duplicates of each other, sorted by book id for stable output; a
+/// book with no match to any other book isn't returned at all.
+pub fn scan_library_for_duplicates(cache: &Cache) -> Result<Vec<Vec<i32>>> {
+    let (author_map, aid_to_bids, title_map) = duplicate_detection_maps(cache)?;
+
+    let mut seen: HashSet<i32> = HashSet::new();
+    let mut groups: Vec<Vec<i32>> = Vec::new();
+    for (&book_id, title) in &title_map {
+        if seen.contains(&book_id) {
+            continue;
+        }
+        let authors = real_authors(cache, book_id)?;
+        let matches = find_identical_books(title, &authors, &author_map, &aid_to_bids, &title_map);
+        for &id in &matches {
+            seen.insert(id);
+        }
+        if matches.len() > 1 {
+            let mut group: Vec<i32> = matches.into_iter().collect();
+            group.sort_unstable();
+            groups.push(group);
+        }
+    }
+    groups.sort_by_key(|g| g[0]);
+    Ok(groups)
+}
+
 /// `(title, authors)` for one book id -- port of upstream's
 /// `{'title': m.title, 'authors': m.authors}` per-duplicate report
 /// shape.
@@ -179,4 +213,67 @@ pub fn copy_one_book(
     // `Cache::add_book`-style call before this can do anything.
 
     Ok(Some(new_book_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use calibre_ebooks::metadata::MetaInformation;
+
+    fn add_book_with(cache: &Cache, dir: &std::path::Path, name: &str, title: &str, authors: &[&str]) -> i32 {
+        let source = dir.join(name);
+        std::fs::write(&source, b"content").unwrap();
+        let mut meta = MetaInformation::default();
+        meta.title = title.to_string();
+        meta.authors = authors.iter().map(|s| s.to_string()).collect();
+        cache.add_book(&source, &meta).unwrap()
+    }
+
+    #[test]
+    fn scan_library_for_duplicates_groups_two_real_near_duplicate_books() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        let a = add_book_with(&cache, dir.path(), "a.txt", "The Great Test", &["Ada Lovelace"]);
+        let b = add_book_with(&cache, dir.path(), "b.txt", "The Great Test", &["Ada Lovelace"]);
+        let _unrelated = add_book_with(&cache, dir.path(), "c.txt", "Something Else Entirely", &["Grace Hopper"]);
+
+        let groups = scan_library_for_duplicates(&cache).unwrap();
+
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        let mut group = groups[0].clone();
+        group.sort_unstable();
+        let mut expected = vec![a, b];
+        expected.sort_unstable();
+        assert_eq!(group, expected);
+    }
+
+    #[test]
+    fn scan_library_for_duplicates_reports_no_groups_for_a_real_library_of_distinct_books() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        add_book_with(&cache, dir.path(), "a.txt", "Book One", &["Author One"]);
+        add_book_with(&cache, dir.path(), "b.txt", "Book Two", &["Author Two"]);
+
+        let groups = scan_library_for_duplicates(&cache).unwrap();
+
+        assert!(groups.is_empty(), "{groups:?}");
+    }
+
+    #[test]
+    fn scan_library_for_duplicates_finds_a_group_of_three() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        let a = add_book_with(&cache, dir.path(), "a.txt", "Triple Book", &["Same Author"]);
+        let b = add_book_with(&cache, dir.path(), "b.txt", "Triple Book", &["Same Author"]);
+        let c = add_book_with(&cache, dir.path(), "c.txt", "Triple Book", &["Same Author"]);
+
+        let groups = scan_library_for_duplicates(&cache).unwrap();
+
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        let mut group = groups[0].clone();
+        group.sort_unstable();
+        let mut expected = vec![a, b, c];
+        expected.sort_unstable();
+        assert_eq!(group, expected);
+    }
 }

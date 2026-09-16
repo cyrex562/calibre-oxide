@@ -3,8 +3,8 @@ import { computed, ref, watch } from "vue";
 import CategoryBrowser from "./CategoryBrowser.vue";
 import NoteEditor from "./NoteEditor.vue";
 import BookDetailsPanel from "./BookDetailsPanel.vue";
-import { addBook, addCustomColumn, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, removeCustomColumn, renameSavedSearch, saveToDisk, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
-import type { CheckLibraryResult, SaveToDiskResult } from "../library/api";
+import { addBook, addCustomColumn, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, removeCustomColumn, renameSavedSearch, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
+import type { CheckLibraryResult, DuplicateBook, SaveToDiskResult } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
 import { isTauri, tauriInvoke } from "../tauri";
 import { DEFAULT_LIBRARY_PREFS, fetchProfile, LIBRARY_PREFS_PROFILE, type LibraryPrefs } from "../settings/api";
@@ -606,6 +606,36 @@ async function runSaveToDisk() {
   }
 }
 
+// Find duplicates (#762) -- real POST /duplicates/scan against the
+// whole library, reusing calibre_db::copy_to_library's existing
+// add-time collision-detection heuristic as a whole-library scan.
+const duplicatesOpen = ref(false);
+const duplicatesLoading = ref(false);
+const duplicatesError = ref<string | null>(null);
+const duplicateGroups = ref<DuplicateBook[][]>([]);
+
+async function openDuplicates() {
+  duplicatesOpen.value = true;
+  duplicatesError.value = null;
+  duplicatesLoading.value = true;
+  try {
+    const { groups } = await scanForDuplicates();
+    duplicateGroups.value = groups;
+  } catch (e) {
+    duplicatesError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    duplicatesLoading.value = false;
+  }
+}
+
+async function deleteDuplicateBook(bookId: number) {
+  if (!confirm(`Delete book ${bookId}? This cannot be undone.`)) return;
+  await deleteBooks([bookId]);
+  duplicateGroups.value = duplicateGroups.value.map((g) => g.filter((b) => b.book_id !== bookId)).filter((g) => g.length > 1);
+  cacheBust.value++;
+  await runSearch();
+}
+
 const addSummary = ref<string | null>(null);
 
 async function addOneBookFile(file: File, addDuplicates: boolean): Promise<"added" | "skipped"> {
@@ -769,6 +799,7 @@ async function switchToOther() {
         <button type="button" @click="openManage">Manage lists…</button>
         <button type="button" @click="openColumns">Custom columns…</button>
         <button type="button" @click="openCheckLibrary">Check library…</button>
+        <button type="button" @click="openDuplicates">Find duplicates…</button>
         <button type="button" :title="activeQuery ? 'Export the current search results as a CSV catalog' : 'Export the whole library as a CSV catalog'" @click="exportCatalog">Export catalog…</button>
         <button type="button" @click="openNews">Fetch news…</button>
       </template>
@@ -961,6 +992,29 @@ async function switchToOther() {
                 <li v-for="(f, i) in findings" :key="i">
                   <span class="manage-name">{{ f.a }}</span>
                   <code class="manage-query">{{ f.b }}</code>
+                </li>
+              </ul>
+            </div>
+          </template>
+        </section>
+      </div>
+    </div>
+
+    <div v-if="duplicatesOpen" class="manage-backdrop" @click.self="duplicatesOpen = false">
+      <div class="manage-panel">
+        <button class="manage-close" @click="duplicatesOpen = false">✕</button>
+        <section>
+          <h3>Find duplicates</h3>
+          <p v-if="duplicatesLoading">Scanning…</p>
+          <p v-else-if="duplicatesError" class="error">{{ duplicatesError }}</p>
+          <template v-else>
+            <p v-if="duplicateGroups.length === 0" class="news-hint">No likely duplicates found.</p>
+            <div v-for="(group, i) in duplicateGroups" :key="i">
+              <h4>Group {{ i + 1 }} ({{ group.length }} books)</h4>
+              <ul class="manage-list">
+                <li v-for="b in group" :key="b.book_id">
+                  <button type="button" @click="selectedBookId = b.book_id">{{ b.title }} — {{ b.authors.join(", ") }}</button>
+                  <button type="button" @click="deleteDuplicateBook(b.book_id)">Delete</button>
                 </li>
               </ul>
             </div>
