@@ -27,6 +27,34 @@ const sortableFields = ref<[string, string][]>([]);
 const virtualLibraries = ref<Record<string, string>>({});
 const savedSearches = ref<Record<string, string>>({});
 
+// Multi-field sort (issue #759) -- `sort` itself stays a single
+// comma-joined string (matches /ajax/search's own real request shape
+// and this port's existing library-prefs storage, which already
+// persists `sort` as a plain string -- no format change needed there).
+// This is just an ordered-list view/editor over that same string.
+const sortFields = computed(() => sort.value.split(",").map((s) => s.trim()).filter(Boolean));
+const primarySort = computed({
+  get: () => sortFields.value[0] ?? "timestamp",
+  set: (field: string) => {
+    sort.value = [field, ...sortFields.value.slice(1)].join(",");
+  },
+});
+const secondarySortFields = computed(() => sortFields.value.slice(1));
+const availableExtraSortFields = computed(() => sortableFields.value.filter(([key]) => !sortFields.value.includes(key)));
+
+function fieldLabel(key: string): string {
+  return sortableFields.value.find(([k]) => k === key)?.[1] ?? key;
+}
+
+function addSortField(field: string) {
+  if (!field || sortFields.value.includes(field)) return;
+  sort.value = [...sortFields.value, field].join(",");
+}
+
+function removeSortField(field: string) {
+  sort.value = sortFields.value.filter((f) => f !== field).join(",");
+}
+
 const books = ref<BookSummary[]>([]);
 const totalNum = ref(0);
 const loading = ref(false);
@@ -619,9 +647,19 @@ async function switchToOther() {
       </button>
 
       <template v-if="!ftsMode">
-        <select v-model="sort">
-          <option v-for="[key, label] in sortableFields" :key="key" :value="key">{{ label }}</option>
-        </select>
+        <div class="sort-fields">
+          <select v-model="primarySort">
+            <option v-for="[key, label] in sortableFields" :key="key" :value="key">{{ label }}</option>
+          </select>
+          <span v-for="field in secondarySortFields" :key="field" class="sort-chip">
+            {{ fieldLabel(field) }}
+            <button type="button" class="sort-chip-remove" :aria-label="`Stop sorting by ${fieldLabel(field)}`" @click="removeSortField(field)">✕</button>
+          </span>
+          <select v-if="availableExtraSortFields.length" :value="''" @change="addSortField(($event.target as HTMLSelectElement).value); ($event.target as HTMLSelectElement).value = ''">
+            <option value="" disabled>+ then sort by…</option>
+            <option v-for="[key, label] in availableExtraSortFields" :key="key" :value="key">{{ label }}</option>
+          </select>
+        </div>
         <select v-model="sortOrder">
           <option value="asc">Ascending</option>
           <option value="desc">Descending</option>
@@ -869,6 +907,28 @@ async function switchToOther() {
   padding: 0.5em;
   border-bottom: 1px solid #ddd;
   flex-wrap: wrap;
+}
+.sort-fields {
+  display: flex;
+  align-items: center;
+  gap: 0.3em;
+}
+.sort-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25em;
+  background: #eef2fb;
+  border-radius: 4px;
+  padding: 0.2em 0.4em;
+  font-size: 0.85em;
+}
+.sort-chip-remove {
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  font-size: 0.9em;
+  line-height: 1;
 }
 .search {
   display: flex;

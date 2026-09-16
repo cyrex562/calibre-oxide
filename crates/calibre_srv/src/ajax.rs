@@ -28,7 +28,9 @@
 //!   multi-field sort), no `get_additional_fields`.
 //! - `GET /ajax/search`: same query language as `opds::search`, JSON
 //!   shape instead of an Atom feed. Now supports `vl=` (issue #500),
-//!   via [`calibre_db::search::books_in_virtual_library`].
+//!   via [`calibre_db::search::books_in_virtual_library`], and a real
+//!   comma-separated multi-field `sort` (issue #759) -- unlike
+//!   `books_in` above, which stays single-field-only.
 //! - `GET /ajax/library-info`: single-library only.
 //!
 //! # New in issue #500 (part of the #432 browser-UI epic)
@@ -387,13 +389,20 @@ pub struct SearchQuery {
     vl: Option<String>,
 }
 
-/// `GET /ajax/search?query=...`. Port of `search`/`search_result`,
-/// single sort field (upstream supports a comma-separated multi-field
-/// sort; not needed yet). `vl=` (issue #500) restricts to a named
-/// virtual library.
+/// `GET /ajax/search?query=...`. Port of `search`/`search_result`.
+/// `sort` accepts a real comma-separated multi-field list (issue
+/// #759; matches upstream's own request shape) applied as a real
+/// tie-break chain -- ties on the first field fall through to the
+/// second, and so on. `sort_order` stays a single scalar applied to
+/// every field uniformly rather than upstream's own real per-field
+/// direction toggle -- a disclosed narrowing, not a silent mismatch;
+/// picking a different direction per field is a separable follow-up
+/// if it ever matters in practice. `vl=` (issue #500) restricts to a
+/// named virtual library.
 pub async fn search(State(state): State<AppState>, Query(q): Query<SearchQuery>) -> Result<Json<Value>, ServerError> {
     let (num, offset) = get_pagination(Some(q.num), Some(q.offset))?;
-    let sort_field = q.sort.as_deref().unwrap_or("title");
+    let sort_fields: Vec<&str> = q.sort.as_deref().unwrap_or("title").split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let sort_fields = if sort_fields.is_empty() { vec!["title"] } else { sort_fields };
     let sort_order = ensure_val(q.sort_order.as_deref(), &["asc", "desc"]);
     let query = q.query.unwrap_or_default();
     let vl = q.vl.unwrap_or_default();
@@ -415,13 +424,15 @@ pub async fn search(State(state): State<AppState>, Query(q): Query<SearchQuery>)
 
     let mut rows = fetch_rows(&state, ids).await?;
     rows.sort_by(|a, b| {
-        let ka = sort_key_for(a, sort_field);
-        let kb = sort_key_for(b, sort_field);
-        if sort_order == "asc" {
-            calibre_utils::icu::strcmp(&ka, &kb)
-        } else {
-            calibre_utils::icu::strcmp(&kb, &ka)
+        for field in &sort_fields {
+            let ka = sort_key_for(a, field);
+            let kb = sort_key_for(b, field);
+            let cmp = if sort_order == "asc" { calibre_utils::icu::strcmp(&ka, &kb) } else { calibre_utils::icu::strcmp(&kb, &ka) };
+            if cmp != std::cmp::Ordering::Equal {
+                return cmp;
+            }
         }
+        std::cmp::Ordering::Equal
     });
 
     let total_num = rows.len() as i64;
@@ -432,7 +443,7 @@ pub async fn search(State(state): State<AppState>, Query(q): Query<SearchQuery>)
         "sort_order": sort_order,
         "offset": offset,
         "num": page.len(),
-        "sort": sort_field,
+        "sort": sort_fields.join(","),
         "base_url": "/ajax/search",
         "query": query,
         "vl": vl,
@@ -672,6 +683,27 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["book_ids"], serde_json::json!([1]));
         assert_eq!(body["total_num"], 1);
+    }
+
+    #[tokio::test]
+    async fn search_multi_field_sort_breaks_ties_on_the_second_field() {
+        // Issue #759: a real comma-separated `sort` breaks a tie on
+        // the first field using the second. Two books share the same
+        // author (tying on `sort=authors`) but have different titles
+        // -- sorting by "authors,title" must order them by title
+        // within that tie, not leave them in whatever order the
+        // first-field-only sort happened to produce.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        let zeta_id = add_test_book(dir.path(), &cache, "Zeta", "Same Author");
+        let alpha_id = add_test_book(dir.path(), &cache, "Alpha", "Same Author");
+        let state = crate::AppState { libraries: None, cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()), book_cache: std::sync::Arc::new(crate::books_cache::BookCache::open_temp()), jobs: std::sync::Arc::new(crate::jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))), render_jobs: std::sync::Arc::new(crate::render_endpoints::RenderJobRegistry::new()), conversion_jobs: std::sync::Arc::new(crate::convert::ConversionJobRegistry::new()), news_jobs: std::sync::Arc::new(crate::news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), };
+        let router = crate::test_router(state);
+
+        let (status, body) = get_json(&router, "/ajax/search?sort=authors,title&sort_order=asc").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["sort"], "authors,title");
+        assert_eq!(body["book_ids"], serde_json::json!([alpha_id, zeta_id]), "{body}");
     }
 
     #[tokio::test]
