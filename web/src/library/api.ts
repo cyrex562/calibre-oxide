@@ -238,6 +238,29 @@ export function getNewsFetchStatus(jobId: number): Promise<NewsFetchStatus> {
   return jsonFetch<NewsFetchStatus>(`/news/status/${jobId}`);
 }
 
+// Real, new route -- see crates/calibre_srv/src/share.rs's own doc for
+// why (real upstream's own "send to email" feature is desktop-GUI-only,
+// never exposed over HTTP there). No persisted SMTP account server-side
+// yet (ties into the not-yet-built preferences epic) -- the relay
+// config is supplied on every call; LibraryView/BookDetailsPanel is
+// expected to remember it client-side (e.g. localStorage) for
+// convenience.
+export interface SmtpRelayConfig {
+  relay: string;
+  port?: number;
+  username?: string;
+  password?: string;
+  encryption?: "tls" | "ssl" | "none";
+}
+
+export async function shareEmail(bookId: number, format: string, from: string, to: string, relay: SmtpRelayConfig, subject?: string): Promise<void> {
+  await jsonFetch("/share/email", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ book_id: bookId, format, from, to, subject, relay }),
+  });
+}
+
 // Unlike this file's other write endpoints, /fts/indexing's real
 // handler returns an empty 200 body (`Result<(), ServerError>` in
 // Rust), not `{}` -- jsonFetch's own unconditional `.json()` would

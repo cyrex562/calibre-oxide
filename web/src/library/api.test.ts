@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { addBook, addFormat, catalogDownloadUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchConversionBookData, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, removeFormat, renameSavedSearch, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, startConversion, startNewsFetch } from "./api";
+import { addBook, addFormat, catalogDownloadUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchConversionBookData, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, removeFormat, renameSavedSearch, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch } from "./api";
 import type { BookSummary } from "./types";
 
 function bookStub(id: number): BookSummary {
@@ -364,5 +364,24 @@ describe("getNewsFetchStatus", () => {
     expect(status.ok).toBe(true);
     expect(status.book_id).toBe(5);
     expect(fetchMock.mock.calls[0][0]).toBe("/news/status/7");
+  });
+});
+
+describe("shareEmail", () => {
+  it("posts the book/format/addresses/relay in one body", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ ok: true }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await shareEmail(1, "epub", "me@example.com", "you@example.com", { relay: "smtp.example.com", port: 587, encryption: "tls" }, "Subject");
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/share/email");
+    expect(JSON.parse(init.body)).toEqual({
+      book_id: 1,
+      format: "epub",
+      from: "me@example.com",
+      to: "you@example.com",
+      subject: "Subject",
+      relay: { relay: "smtp.example.com", port: 587, encryption: "tls" },
+    });
   });
 });
