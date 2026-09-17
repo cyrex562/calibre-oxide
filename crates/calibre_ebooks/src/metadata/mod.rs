@@ -27,6 +27,7 @@ pub mod rb;
 pub mod rtf;
 pub mod search_internet;
 pub mod snb;
+pub mod sources;
 pub mod tag_mapper;
 pub mod toc;
 pub mod topaz;
