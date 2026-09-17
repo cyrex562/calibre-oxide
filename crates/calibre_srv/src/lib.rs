@@ -182,6 +182,7 @@ pub mod library_broker;
 pub mod library_export;
 pub mod lists;
 pub mod mathjax;
+pub mod metadata_search;
 pub mod net_guard;
 pub mod news;
 pub mod news_scheduler;
@@ -313,6 +314,8 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/news/schedules/remove/{id}", post(news_scheduler::remove_schedule))
         .route("/news/schedules/run-now/{id}", post(news_scheduler::run_schedule_now))
         .route("/tts/synthesize", post(tts::synthesize))
+        .route("/metadata/search", post(metadata_search::search))
+        .route("/metadata/cover-proxy", get(metadata_search::cover_proxy))
         .route("/library/export/{library_id}", get(library_export::export))
         .route("/share/email", post(share::share_email))
         .route("/check-library/{library_id}", post(check_library::check))
