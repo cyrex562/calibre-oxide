@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { useRouter } from "vue-router";
+import FetchMetadataDialog from "./FetchMetadataDialog.vue";
 import TweakEditor from "./TweakEditor.vue";
 import { addFormat, deleteBooks, evaluateTemplate, fetchBook, fetchBooks, fetchConversionBookData, fetchDataFiles, fetchFieldMetadata, getConversionStatus, removeDataFile, removeFormat, search, setCover, setFields, shareEmail, startConversion, uploadDataFile } from "../library/api";
 import type { ConversionOptionsOverride, DataFileStat, SmtpRelayConfig } from "../library/api";
@@ -464,6 +465,13 @@ async function onTweakUpdated() {
   emit("updated");
 }
 
+const fetchMetadataOpen = ref(false);
+
+async function onFetchMetadataUpdated() {
+  book.value = await fetchBook(props.bookId);
+  emit("updated");
+}
+
 const formatLinks = computed<[string, string][]>(() => {
   const b = book.value;
   if (!b) return [];
@@ -545,6 +553,7 @@ const visibleCustomColumnValues = computed(() => {
           <button v-if="readableFormat" class="read" @click="read">Read ({{ readableFormat.toUpperCase() }})</button>
           <a v-for="[fmt, url] in formatLinks" :key="fmt" :href="url" class="download"> Download {{ fmt.toUpperCase() }} </a>
           <button class="edit" @click="startEditing">Edit metadata</button>
+          <button class="edit" @click="fetchMetadataOpen = true">Fetch metadata online…</button>
           <button class="edit" @click="openConvert">Convert…</button>
           <button class="edit" @click="openShare">Send…</button>
           <button v-if="canTweak" class="edit" @click="tweakOpen = true">Tweak Book…</button>
@@ -740,6 +749,7 @@ const visibleCustomColumnValues = computed(() => {
     </div>
   </div>
   <TweakEditor v-if="tweakOpen" :book-id="bookId" @close="tweakOpen = false" @updated="onTweakUpdated" />
+  <FetchMetadataDialog v-if="fetchMetadataOpen" :book-id="bookId" :book="book" @close="fetchMetadataOpen = false" @updated="onFetchMetadataUpdated" />
 </template>
 
 <style scoped>

@@ -524,3 +524,60 @@ export function removeNewsSchedule(id: number): Promise<void> {
 export function runNewsScheduleNow(id: number): Promise<{ ok: boolean; book_id?: number; error?: string }> {
   return jsonFetch<{ ok: boolean; book_id?: number; error?: string }>(`/news/schedules/run-now/${id}`, { method: "POST" });
 }
+
+// Real, new routes -- see crates/calibre_srv/src/metadata_search.rs's
+// own doc. Part of the #750 epic: fetch a book's metadata/cover from
+// real online sources (Google Books, Open Library) for the user to
+// review and merge in, per-field, into the book's own record.
+export interface MetadataCandidate {
+  source: string;
+  title: string | null;
+  authors: string[];
+  description: string | null;
+  publisher: string | null;
+  pubdate: string | null;
+  tags: string[];
+  identifiers: Record<string, string>;
+  language: string | null;
+  cover_url: string | null;
+  rating: number | null;
+}
+
+export interface MetadataSearchParams {
+  title?: string;
+  authors?: string;
+  isbn?: string;
+}
+
+export function searchMetadataOnline(params: MetadataSearchParams): Promise<{ candidates: MetadataCandidate[]; source_errors: string[] }> {
+  return jsonFetch<{ candidates: MetadataCandidate[]; source_errors: string[] }>("/metadata/search", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(params),
+  });
+}
+
+// Routes a candidate's external cover image URL through the server's
+// own cover-proxy (avoids the CORS/mixed-origin issues fetching it
+// directly from the browser would hit) -- safe to use directly as an
+// <img> src.
+export function coverProxyUrl(url: string): string {
+  return `/metadata/cover-proxy?url=${encodeURIComponent(url)}`;
+}
+
+export async function fetchCoverProxyBlob(url: string): Promise<Blob> {
+  const resp = await fetch(coverProxyUrl(url));
+  if (!resp.ok) {
+    throw new Error(`GET ${coverProxyUrl(url)} failed: ${resp.status} ${resp.statusText}`);
+  }
+  return resp.blob();
+}
+
+export function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = () => reject(reader.error ?? new Error("failed to read blob"));
+    reader.readAsDataURL(blob);
+  });
+}

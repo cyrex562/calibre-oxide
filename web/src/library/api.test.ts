@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { addBook, addFormat, addNewsSchedule, catalogDownloadUrl, checkLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeDataFile, removeFormat, removeNewsSchedule, renameCategoryItem, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
+import { addBook, addFormat, addNewsSchedule, blobToDataUrl, catalogDownloadUrl, checkLibrary, coverProxyUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchCoverProxyBlob, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeDataFile, removeFormat, removeNewsSchedule, renameCategoryItem, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, searchMetadataOnline, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
 import type { BookSummary } from "./types";
 
 function bookStub(id: number): BookSummary {
@@ -602,5 +602,56 @@ describe("news schedules", () => {
 
     expect(fetchMock).toHaveBeenCalledWith("/news/schedules/run-now/7", { method: "POST" });
     expect(result).toEqual({ ok: true, book_id: 42 });
+  });
+});
+
+describe("metadata search (#750/#788)", () => {
+  it("searchMetadataOnline posts the params and returns candidates plus source_errors", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        candidates: [{ source: "Google Books", title: "Dune", authors: ["Frank Herbert"], description: null, publisher: null, pubdate: "1965", tags: [], identifiers: { isbn: "9780441013593" }, language: "en", cover_url: "https://example.com/c.jpg", rating: null }],
+        source_errors: ["Open Library: timed out"],
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await searchMetadataOnline({ title: "Dune", authors: "Frank Herbert" });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/metadata/search",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ title: "Dune", authors: "Frank Herbert" }) }),
+    );
+    expect(result.candidates).toHaveLength(1);
+    expect(result.candidates[0].title).toBe("Dune");
+    expect(result.source_errors).toEqual(["Open Library: timed out"]);
+  });
+
+  it("coverProxyUrl builds a same-origin URL with the target URL encoded", () => {
+    expect(coverProxyUrl("https://covers.openlibrary.org/b/id/1-L.jpg?default=false")).toBe(
+      "/metadata/cover-proxy?url=" + encodeURIComponent("https://covers.openlibrary.org/b/id/1-L.jpg?default=false"),
+    );
+  });
+
+  it("fetchCoverProxyBlob fetches the proxy URL and returns the response body as a Blob", async () => {
+    const blob = new Blob([new Uint8Array([1, 2, 3])], { type: "image/png" });
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, blob: async () => blob });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await fetchCoverProxyBlob("https://example.com/c.jpg");
+
+    expect(fetchMock).toHaveBeenCalledWith("/metadata/cover-proxy?url=" + encodeURIComponent("https://example.com/c.jpg"));
+    expect(result).toBe(blob);
+  });
+
+  it("fetchCoverProxyBlob throws with status text on a non-ok response", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 424, statusText: "Failed Dependency" }));
+    await expect(fetchCoverProxyBlob("https://example.com/c.jpg")).rejects.toThrow("424");
+  });
+
+  it("blobToDataUrl round-trips a real Blob through FileReader", async () => {
+    const blob = new Blob(["hello"], { type: "text/plain" });
+    const dataUrl = await blobToDataUrl(blob);
+    expect(dataUrl.startsWith("data:text/plain")).toBe(true);
   });
 });
