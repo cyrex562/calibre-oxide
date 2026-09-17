@@ -43,7 +43,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use calibre_ebooks::metadata::sources::{google_books, open_library, MetadataCandidate};
-use calibre_ebooks::scraper::{Browser, OpenOptions};
+use calibre_ebooks::scraper::Browser;
 
 use crate::errors::ServerError;
 use crate::AppState;
@@ -110,33 +110,133 @@ pub struct CoverProxyParams {
     pub url: String,
 }
 
-/// `GET /metadata/cover-proxy?url=...`.
-pub async fn cover_proxy(Query(params): Query<CoverProxyParams>) -> Result<Response, ServerError> {
-    let parsed = url::Url::parse(&params.url).map_err(|e| ServerError::BadRequest(format!("{}: invalid URL ({e})", params.url)))?;
-    if parsed.scheme() != "http" && parsed.scheme() != "https" {
-        return Err(ServerError::BadRequest(format!("{}: only http/https URLs are allowed", params.url)));
-    }
-    let host = parsed.host_str().ok_or_else(|| ServerError::BadRequest(format!("{}: no host", params.url)))?.to_string();
-    let port = parsed.port_or_known_default().unwrap_or(443);
-    crate::net_guard::resolve_and_check(&host, port).await.map_err(|e| ServerError::BadRequest(format!("{}: {e}", params.url)))?;
+/// Raster image types this route will actually proxy. Deliberately
+/// excludes `image/svg+xml` (SVG can carry `<script>`/event-handler
+/// XSS payloads) and anything non-image (a compromised or malicious
+/// upstream host could otherwise get this *same-origin* route to hand
+/// the browser `text/html` bytes it would then treat as same-origin
+/// content -- see [`cover_proxy`]'s own doc for the full threat this
+/// guards against).
+const ALLOWED_COVER_CONTENT_TYPES: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
 
-    let fetch_url = params.url.clone();
-    let (bytes, content_type) = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, String), String> {
-        let browser = Browser::new("", &[], true);
-        let resp = browser.open_novisit(&fetch_url, &OpenOptions::default()).map_err(|e| e.to_string())?;
-        if let Some(status) = resp.status() {
-            if status >= 400 {
-                return Err(format!("upstream returned HTTP {status}"));
-            }
+fn is_allowed_cover_content_type(content_type: &str) -> bool {
+    let base = content_type.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    ALLOWED_COVER_CONTENT_TYPES.contains(&base.as_str())
+}
+
+const MAX_COVER_REDIRECTS: u32 = 5;
+
+enum HopOutcome {
+    Redirect(String),
+    Body(Vec<u8>, String),
+}
+
+/// Distinguishes a caller/policy problem (bad URL, non-http scheme,
+/// blocked by the SSRF guard -- at the *initial* URL or at any
+/// redirect hop) from a genuine upstream-fetch problem (non-2xx
+/// status, malformed redirect, too many hops, network error) so
+/// [`cover_proxy`] can map them to the right HTTP status (400 vs 424)
+/// -- matching the status codes this route's own validation already
+/// used before the redirect-chasing loop existed.
+enum CoverFetchError {
+    Invalid(String),
+    Upstream(String),
+}
+
+impl std::fmt::Display for CoverFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CoverFetchError::Invalid(msg) | CoverFetchError::Upstream(msg) => write!(f, "{msg}"),
         }
-        let content_type = resp.header("content-type").unwrap_or("image/jpeg").to_string();
-        Ok((resp.read().to_vec(), content_type))
-    })
-    .await
-    .map_err(|e| ServerError::InternalServerError(e.to_string()))?
-    .map_err(ServerError::FailedDependency)?;
+    }
+}
+
+/// Real, disclosed choice: this fetch does **not** use the shared
+/// [`Browser`] (its underlying client follows redirects internally,
+/// with no hook to re-check a redirect target's resolved IP before
+/// following it -- a real SSRF bypass an attacker-controlled or
+/// compromised upstream host could exploit by 302-redirecting to an
+/// internal address after the *initial* host already passed
+/// [`crate::net_guard::resolve_and_check`]). Each hop here is fetched
+/// with redirects disabled and re-validated against the same guard
+/// before being followed, closing that gap.
+async fn fetch_cover_with_revalidated_redirects(start_url: &str) -> Result<(Vec<u8>, String), CoverFetchError> {
+    let mut current = start_url.to_string();
+    for _ in 0..=MAX_COVER_REDIRECTS {
+        let parsed = url::Url::parse(&current).map_err(|e| CoverFetchError::Invalid(format!("{current}: invalid URL ({e})")))?;
+        if parsed.scheme() != "http" && parsed.scheme() != "https" {
+            return Err(CoverFetchError::Invalid(format!("{current}: only http/https URLs are allowed")));
+        }
+        let host = parsed.host_str().ok_or_else(|| CoverFetchError::Invalid(format!("{current}: no host")))?.to_string();
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        crate::net_guard::resolve_and_check(&host, port).await.map_err(|e| CoverFetchError::Invalid(format!("{current}: {e}")))?;
+
+        let hop_url = current.clone();
+        let outcome = tokio::task::spawn_blocking(move || -> Result<HopOutcome, String> {
+            let client = reqwest::blocking::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|e| e.to_string())?;
+            let resp = client
+                .get(&hop_url)
+                .header(reqwest::header::USER_AGENT, calibre_utils::random_ua::random_common_chrome_user_agent())
+                .send()
+                .map_err(|e| e.to_string())?;
+            let status = resp.status();
+            if status.is_redirection() {
+                let location = resp
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| format!("{hop_url}: redirect with no Location header"))?;
+                return Ok(HopOutcome::Redirect(location));
+            }
+            if !status.is_success() {
+                return Err(format!("upstream returned HTTP {}", status.as_u16()));
+            }
+            let content_type = resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("application/octet-stream").to_string();
+            let bytes = resp.bytes().map_err(|e| e.to_string())?.to_vec();
+            Ok(HopOutcome::Body(bytes, content_type))
+        })
+        .await
+        .map_err(|e| CoverFetchError::Upstream(e.to_string()))?
+        .map_err(CoverFetchError::Upstream)?;
+
+        match outcome {
+            HopOutcome::Redirect(location) => {
+                let next = parsed.join(&location).map_err(|e| CoverFetchError::Upstream(format!("{current}: bad redirect location {location:?} ({e})")))?;
+                current = next.to_string();
+            }
+            HopOutcome::Body(bytes, content_type) => return Ok((bytes, content_type)),
+        }
+    }
+    Err(CoverFetchError::Upstream(format!("{start_url}: too many redirects")))
+}
+
+/// `GET /metadata/cover-proxy?url=...`. Fetches a candidate's cover
+/// image server-side and streams it back. Same-origin by construction
+/// (it's this server's own route), which is exactly why the response
+/// `Content-Type` can't be trusted blindly from upstream: a response
+/// this route serves is treated by the browser as coming from *this*
+/// app's origin, not the external image host's -- so an upstream host
+/// returning e.g. `text/html` with a script payload here would be a
+/// same-origin XSS vector if passed through unchecked. See
+/// [`ALLOWED_COVER_CONTENT_TYPES`] and the redirect re-validation in
+/// [`fetch_cover_with_revalidated_redirects`].
+pub async fn cover_proxy(Query(params): Query<CoverProxyParams>) -> Result<Response, ServerError> {
+    let (bytes, content_type) = fetch_cover_with_revalidated_redirects(&params.url).await.map_err(|e| match e {
+        CoverFetchError::Invalid(msg) => ServerError::BadRequest(msg),
+        CoverFetchError::Upstream(msg) => ServerError::FailedDependency(msg),
+    })?;
+
+    if !is_allowed_cover_content_type(&content_type) {
+        return Err(ServerError::FailedDependency(format!("upstream returned a non-image content type: {content_type}")));
+    }
 
     let mut response = Response::new(Body::from(bytes));
+    response.headers_mut().insert(header::CONTENT_DISPOSITION, HeaderValue::from_static("inline; filename=\"cover\""));
+    response.headers_mut().insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'none'; sandbox"));
     response
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_str(&content_type).unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")));
@@ -145,6 +245,7 @@ pub async fn cover_proxy(Query(params): Query<CoverProxyParams>) -> Result<Respo
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::io::{BufRead, BufReader, Write};
     use std::net::{TcpListener, TcpStream};
     use std::thread;
@@ -155,16 +256,26 @@ mod tests {
 
     use calibre_db::cache::Cache;
 
-    /// A tiny single-route HTTP/1.1 test server, serving one fixed
-    /// JSON/bytes body at any path -- matches the source clients' own
-    /// private `TestSite` helpers (not shared across crates'
-    /// `#[cfg(test)]` modules).
+    /// One route's canned response, for [`TestSite`].
+    enum TestRoute {
+        Ok(&'static str, &'static [u8]),
+        /// A 302 to an absolute URL (may point off-site -- e.g. to a
+        /// blocked address, to exercise the redirect-revalidation
+        /// guard without a second real listener).
+        Redirect(String),
+    }
+
+    /// A tiny multi-route HTTP/1.1 test server -- extends the source
+    /// clients' own private single-route `TestSite` helpers (not
+    /// shared across crates' `#[cfg(test)]` modules) with redirect
+    /// support, needed to test [`super::fetch_cover_with_revalidated_redirects`]'s
+    /// own multi-hop behavior.
     struct TestSite {
         addr: std::net::SocketAddr,
     }
 
     impl TestSite {
-        fn start(content_type: &'static str, body: &'static [u8]) -> TestSite {
+        fn start(routes: HashMap<&'static str, TestRoute>) -> TestSite {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             thread::spawn(move || {
@@ -175,22 +286,35 @@ mod tests {
                     if reader.read_line(&mut line).is_err() {
                         continue;
                     }
+                    let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
                     loop {
                         let mut l = String::new();
                         if reader.read_line(&mut l).is_err() || l.trim().is_empty() {
                             break;
                         }
                     }
-                    let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
-                    let _ = stream.write_all(resp.as_bytes());
-                    let _ = stream.write_all(body);
+                    match routes.get(path.as_str()) {
+                        Some(TestRoute::Ok(content_type, body)) => {
+                            let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                            let _ = stream.write_all(resp.as_bytes());
+                            let _ = stream.write_all(body);
+                        }
+                        Some(TestRoute::Redirect(location)) => {
+                            let resp = format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                            let _ = stream.write_all(resp.as_bytes());
+                        }
+                        None => {
+                            let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                            let _ = stream.write_all(resp.as_bytes());
+                        }
+                    }
                 }
             });
             TestSite { addr }
         }
 
-        fn url(&self) -> String {
-            format!("http://{}/cover.jpg", self.addr)
+        fn url(&self, path: &str) -> String {
+            format!("http://{}{}", self.addr, path)
         }
     }
 
@@ -251,14 +375,56 @@ mod tests {
 
     #[tokio::test]
     async fn cover_proxy_streams_real_bytes_with_the_real_content_type() {
-        let site = TestSite::start("image/png", b"\x89PNG\r\n\x1a\nnotreallyapngbutfine");
-        let req = Request::builder().method("GET").uri(format!("/metadata/cover-proxy?url={}", urlencoding_minimal(&site.url()))).body(Body::empty()).unwrap();
+        let site = TestSite::start(HashMap::from([("/cover.jpg", TestRoute::Ok("image/png", b"\x89PNG\r\n\x1a\nnotreallyapngbutfine"))]));
+        let req = Request::builder().method("GET").uri(format!("/metadata/cover-proxy?url={}", urlencoding_minimal(&site.url("/cover.jpg")))).body(Body::empty()).unwrap();
         let (_dir, router) = test_app();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers().get("content-type").unwrap().to_str().unwrap(), "image/png");
         let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&bytes[..], b"\x89PNG\r\n\x1a\nnotreallyapngbutfine");
+    }
+
+    #[tokio::test]
+    async fn cover_proxy_follows_a_real_redirect_to_a_legitimate_target() {
+        let site = TestSite::start(HashMap::from([
+            ("/redirect", TestRoute::Redirect("/final.jpg".to_string())),
+            ("/final.jpg", TestRoute::Ok("image/jpeg", b"realjpegbytes")),
+        ]));
+        let req = Request::builder().method("GET").uri(format!("/metadata/cover-proxy?url={}", urlencoding_minimal(&site.url("/redirect")))).body(Body::empty()).unwrap();
+        let (_dir, router) = test_app();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&bytes[..], b"realjpegbytes");
+    }
+
+    #[tokio::test]
+    async fn cover_proxy_rejects_a_redirect_that_targets_a_blocked_address() {
+        // The classic SSRF-via-redirect bypass this route's own
+        // redirect-revalidation loop exists to close: the *initial*
+        // URL (this TestSite, loopback) passes the guard, but its
+        // Location header points at a link-local/cloud-metadata
+        // address -- the second hop must be re-validated and
+        // rejected, not blindly followed.
+        let site = TestSite::start(HashMap::from([("/redirect", TestRoute::Redirect("http://169.254.169.254/latest/meta-data/".to_string()))]));
+        let req = Request::builder().method("GET").uri(format!("/metadata/cover-proxy?url={}", urlencoding_minimal(&site.url("/redirect")))).body(Body::empty()).unwrap();
+        let (_dir, router) = test_app();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn cover_proxy_rejects_a_non_image_content_type() {
+        // A compromised/malicious upstream returning `text/html` here
+        // would otherwise be a same-origin XSS vector (this route's
+        // response is served from *this* app's own origin) -- must be
+        // rejected, not passed through.
+        let site = TestSite::start(HashMap::from([("/evil", TestRoute::Ok("text/html", b"<script>alert(1)</script>"))]));
+        let req = Request::builder().method("GET").uri(format!("/metadata/cover-proxy?url={}", urlencoding_minimal(&site.url("/evil")))).body(Body::empty()).unwrap();
+        let (_dir, router) = test_app();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FAILED_DEPENDENCY);
     }
 
     #[tokio::test]
