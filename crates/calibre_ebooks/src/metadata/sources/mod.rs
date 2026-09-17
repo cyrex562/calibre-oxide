@@ -6,20 +6,24 @@
 //! candidate results per field. This port takes a narrower, disclosed
 //! first slice, per an explicit user architecture decision (2026-09-17,
 //! issue #750): only Google Books ([`google_books`]) and Open Library
-//! (a later sub-issue) -- both real, official, free, no-key public
-//! APIs, no scraping. Goodreads was considered and excluded: its public
-//! API was discontinued in December 2020 and its current ToS prohibits
+//! ([`open_library`]) -- both real, official, free, no-key public APIs,
+//! no scraping. Goodreads was considered and excluded: its public API
+//! was discontinued in December 2020 and its current ToS prohibits
 //! scraping -- matching real upstream calibre's own choice (no
 //! `goodreads.py` source plugin exists there either).
 //!
-//! There is no `Source` trait here (yet) -- with exactly one source
-//! client landing in this sub-issue, a trait would have no second
-//! implementor to prove its shape against. Each source module exposes
-//! its own `search`/`search_at` functions returning `Vec<MetadataCandidate>`
-//! directly; a later sub-issue (calibre_srv's search route) calls both
-//! concurrently and concatenates the results.
+//! There is no `Source` trait here -- with only two source clients,
+//! each with its own query-precedence rules and a different partial set
+//! of fields it can populate, a shared trait would either force an
+//! artificial lowest-common-denominator query shape or need an
+//! associated-type escape hatch with no real second use yet. Each
+//! source module exposes its own `search`/`search_at` functions
+//! returning `Vec<MetadataCandidate>` directly; a later sub-issue
+//! (calibre_srv's search route) calls both concurrently and
+//! concatenates the results.
 
 pub mod google_books;
+pub mod open_library;
 
 use std::collections::BTreeMap;
 
