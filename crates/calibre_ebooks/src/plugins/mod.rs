@@ -17,7 +17,7 @@
 
 pub mod pml2pmlz;
 
-use calibre_customize::registry::{PluginRegistry, RegisteredPlugin, RegistryError};
+use calibre_customize::registry::{PluginRegistry, RegistryError};
 use std::sync::Arc;
 
 /// Registers every builtin plugin this crate provides.
@@ -29,7 +29,7 @@ use std::sync::Arc;
 /// Markdown/Textile image references out of the text, and has no port
 /// yet.
 pub fn register_builtins(registry: &mut PluginRegistry) -> Result<(), RegistryError> {
-    registry.register(RegisteredPlugin::FileType(Arc::new(pml2pmlz::Pml2Pmlz)))?;
+    registry.register::<dyn calibre_customize::FileTypePlugin>(Arc::new(pml2pmlz::Pml2Pmlz))?;
     Ok(())
 }
 

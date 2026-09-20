@@ -1,4 +1,5 @@
 pub mod archives;
+pub mod input_plugin;
 pub mod options;
 pub mod plumber;
 pub mod preprocess;

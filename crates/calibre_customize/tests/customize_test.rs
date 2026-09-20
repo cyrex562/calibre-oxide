@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use calibre_customize::registry::{PluginRegistry, RegisteredPlugin, RegistryError};
+use calibre_customize::registry::{PluginRegistry, RegistryError};
 use calibre_customize::ui::run_plugins_on_import_from_registry;
 use calibre_customize::{FileTypePlugin, Plugin, PluginInstallationType};
 
@@ -59,7 +59,7 @@ fn a_registered_plugin_really_transforms_a_real_file_on_import() {
     std::fs::write(&src, "hello plugin").expect("write");
 
     let mut registry = PluginRegistry::new();
-    registry.register(RegisteredPlugin::FileType(Arc::new(UppercasePlugin))).expect("register");
+    registry.register::<dyn FileTypePlugin>(Arc::new(UppercasePlugin)).expect("register");
 
     let out = run_plugins_on_import_from_registry(&src, &registry);
 
@@ -74,7 +74,7 @@ fn a_disabled_plugin_really_does_not_touch_the_file() {
     std::fs::write(&src, "hello plugin").expect("write");
 
     let mut registry = PluginRegistry::new();
-    registry.register(RegisteredPlugin::FileType(Arc::new(UppercasePlugin))).expect("register");
+    registry.register::<dyn FileTypePlugin>(Arc::new(UppercasePlugin)).expect("register");
     registry.set_enabled("Uppercase TXT", false).expect("disable");
 
     let out = run_plugins_on_import_from_registry(&src, &registry);
@@ -86,7 +86,7 @@ fn a_disabled_plugin_really_does_not_touch_the_file() {
 #[test]
 fn the_registry_reports_the_plugins_real_metadata() {
     let mut registry = PluginRegistry::new();
-    registry.register(RegisteredPlugin::FileType(Arc::new(UppercasePlugin))).expect("register");
+    registry.register::<dyn FileTypePlugin>(Arc::new(UppercasePlugin)).expect("register");
 
     let listed = registry.list();
     assert_eq!(listed.len(), 1);
@@ -101,9 +101,9 @@ fn the_registry_reports_the_plugins_real_metadata() {
 #[test]
 fn registering_the_same_plugin_name_twice_is_refused() {
     let mut registry = PluginRegistry::new();
-    registry.register(RegisteredPlugin::FileType(Arc::new(UppercasePlugin))).expect("register");
+    registry.register::<dyn FileTypePlugin>(Arc::new(UppercasePlugin)).expect("register");
 
-    let err = registry.register(RegisteredPlugin::FileType(Arc::new(UppercasePlugin))).unwrap_err();
+    let err = registry.register::<dyn FileTypePlugin>(Arc::new(UppercasePlugin)).unwrap_err();
     assert_eq!(err, RegistryError::DuplicateName("Uppercase TXT".to_string()));
     assert_eq!(registry.len(), 1);
 }

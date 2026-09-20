@@ -87,13 +87,15 @@ use crate::web_socket::{self, ChangeEvent};
 use crate::AppState;
 
 /// Formats [`calibre_ebooks::conversion::plumber::convert_to_oebbook`]
-/// can actually read, matching its own real dispatch table exactly
-/// (issue #476's own research) -- used to filter a book's own
-/// `available_formats` down to ones that are real conversion *inputs*.
-const READABLE_FORMATS: &[&str] = &[
-    "EPUB", "MOBI", "AZW", "AZW3", "PRC", "HTML", "HTM", "XHTML", "TXT", "MD", "MARKDOWN", "TEXT", "TEXTILE", "DOCX", "CBZ", "ZIP", "FB2", "RB", "LIT", "SNB", "RTF", "PDF", "LRF", "TCR", "PDB", "ODT",
-    "DJVU", "RECIPE", "CHM", "AZW4",
-];
+/// can actually read -- **derived from the real input-plugin registry**
+/// (issue #796) rather than hand-transcribed, so it cannot drift out of
+/// sync with the dispatch the way the previous hardcoded const could.
+fn readable_formats() -> &'static [String] {
+    static FORMATS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    FORMATS.get_or_init(|| {
+        calibre_ebooks::conversion::input_plugin::supported_input_extensions_uppercase(calibre_ebooks::conversion::input_plugin::builtin_input_registry())
+    })
+}
 
 /// Formats `Plumber::write_output` can actually produce, matching its
 /// own real dispatch table exactly (issue #476's own research) --
@@ -230,7 +232,7 @@ pub async fn start_conversion(State(state): State<AppState>, AxumPath(book_id): 
     // just an unsafe one).
     let input_fmt_upper = body.input_fmt.to_uppercase();
     let output_fmt_upper = body.output_fmt.to_uppercase();
-    if !READABLE_FORMATS.contains(&input_fmt_upper.as_str()) {
+    if !readable_formats().iter().any(|f| f == &input_fmt_upper) {
         return Err(ServerError::BadRequest(format!("Unsupported input format: {}", body.input_fmt)));
     }
     if !WRITABLE_FORMATS.contains(&output_fmt_upper.as_str()) {
@@ -324,7 +326,7 @@ pub async fn conversion_status(State(state): State<AppState>, AxumPath(job_id): 
 pub async fn conversion_book_data(State(state): State<AppState>, AxumPath(book_id): AxumPath<i32>, Query(query): Query<HashMap<String, String>>) -> Result<Json<Value>, ServerError> {
     let row = fetch_book_row(&state, book_id).await?;
     let available: Vec<String> = row["available_formats"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
-    let mut input_formats: Vec<String> = available.into_iter().filter(|f| READABLE_FORMATS.contains(&f.as_str())).collect();
+    let mut input_formats: Vec<String> = available.into_iter().filter(|avail| readable_formats().iter().any(|f| f == avail)).collect();
     if let Some(preferred) = query.get("input_fmt") {
         let preferred_upper = preferred.to_uppercase();
         if let Some(pos) = input_formats.iter().position(|f| f == &preferred_upper) {

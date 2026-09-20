@@ -43,46 +43,47 @@
 //! is issue #798. This module only holds plugins that were registered
 //! in-process.
 
+use std::any::{Any, TypeId};
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::conversion::{InputFormatPlugin, OutputFormatPlugin};
 use crate::{FileTypePlugin, Plugin, PluginInstallationType};
 
-/// A plugin of one of the concrete kinds the registry can store and
-/// hand back out again.
+/// Marker implemented for each plugin *trait* that can be registered.
 ///
-/// The variants mirror the plugin traits in this crate. `Arc` (not
-/// `Box`) so the registry can hand out cheap clones without giving up
-/// ownership -- callers like [`crate::ui::run_plugins_on_import_from_registry`]
-/// need an owned collection to iterate.
-#[derive(Clone)]
-pub enum RegisteredPlugin {
-    FileType(Arc<dyn FileTypePlugin>),
-    InputFormat(Arc<dyn InputFormatPlugin>),
-    OutputFormat(Arc<dyn OutputFormatPlugin>),
+/// This is what lets a crate other than this one own a plugin trait and
+/// still register it here. `calibre_ebooks` needs exactly that: its
+/// `InputFormatPlugin::convert` returns an `OEBBook`, a type this crate
+/// cannot name (`calibre_ebooks` depends on `calibre_customize`, so the
+/// dependency cannot go the other way). A fixed enum of "the plugin
+/// kinds this crate knows about" could never express that; a trait the
+/// owning crate implements for its own `dyn Trait` can.
+///
+/// Implement it on the *unsized* trait object type, not on a concrete
+/// plugin:
+///
+/// ```ignore
+/// impl PluginKind for dyn MyPlugin {
+///     const KIND: &'static str = "MyPlugin";
+///     fn upcast(arc: Arc<Self>) -> Arc<dyn Plugin> { arc }
+/// }
+/// ```
+pub trait PluginKind: Send + Sync + 'static {
+    /// Stable label for this kind, used in listings and error messages.
+    const KIND: &'static str;
+
+    /// Upcast to the common [`Plugin`] view. Every plugin trait has
+    /// [`Plugin`] as a supertrait, so the body is just `arc` -- the
+    /// coercion is trait upcasting (stable since Rust 1.86). It has to
+    /// be written per-impl because the compiler cannot perform that
+    /// coercion generically over an unsized `Self`.
+    fn upcast(arc: Arc<Self>) -> Arc<dyn Plugin>;
 }
 
-impl RegisteredPlugin {
-    /// The common [`Plugin`] view, for the metadata every plugin has
-    /// regardless of kind. Relies on trait upcasting (stable since Rust
-    /// 1.86) -- each of these traits has [`Plugin`] as a supertrait.
-    pub fn as_plugin(&self) -> &dyn Plugin {
-        match self {
-            RegisteredPlugin::FileType(p) => p.as_ref(),
-            RegisteredPlugin::InputFormat(p) => p.as_ref(),
-            RegisteredPlugin::OutputFormat(p) => p.as_ref(),
-        }
-    }
-
-    /// A stable identifier for the plugin's kind, for listings and error
-    /// messages. Distinct from [`Plugin::type_name`], which a plugin can
-    /// override to anything it likes.
-    pub fn kind(&self) -> &'static str {
-        match self {
-            RegisteredPlugin::FileType(_) => "FileType",
-            RegisteredPlugin::InputFormat(_) => "InputFormat",
-            RegisteredPlugin::OutputFormat(_) => "OutputFormat",
-        }
+impl PluginKind for dyn FileTypePlugin {
+    const KIND: &'static str = "FileType";
+    fn upcast(arc: Arc<Self>) -> Arc<dyn Plugin> {
+        arc
     }
 }
 
@@ -102,17 +103,29 @@ pub enum RegistryError {
 }
 
 struct Entry {
-    plugin: RegisteredPlugin,
+    name: String,
+    /// The common metadata view. Kept alongside the typed slot below so
+    /// listing, priority ordering and enable/disable all work without
+    /// knowing the plugin's concrete kind.
+    meta: Arc<dyn Plugin>,
+    kind: &'static str,
     enabled: bool,
 }
 
 /// A flat, priority-ordered set of registered plugins.
 ///
-/// See the module doc for why this is owned rather than global, and why
-/// it is one list rather than one list per plugin type.
+/// See the module doc for why this is owned rather than global, and the
+/// [`PluginKind`] doc for how a plugin trait owned by another crate
+/// gets registered here.
 #[derive(Default)]
 pub struct PluginRegistry {
     entries: Vec<Entry>,
+    /// Per-plugin-trait storage, keyed by the trait object's `TypeId`.
+    /// Each value is a `Vec<(String, Arc<T>)>` for exactly one `T`,
+    /// boxed as `Any` because the map holds several different `T`s. The
+    /// concrete `T` is always known at both insertion and lookup, so the
+    /// downcasts below cannot fail.
+    typed: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
 }
 
 /// A registered plugin's metadata, flattened for listing (the plugin
@@ -134,17 +147,25 @@ impl PluginRegistry {
         PluginRegistry::default()
     }
 
-    /// Registers `plugin`, newly enabled.
+    /// Registers `plugin` under its own [`PluginKind`], newly enabled.
     ///
-    /// Rejects a name already present, matching upstream's `add_plugin`.
-    /// Names are compared case-sensitively and verbatim, the way
-    /// upstream compares them.
-    pub fn register(&mut self, plugin: RegisteredPlugin) -> Result<(), RegistryError> {
-        let name = plugin.as_plugin().name().to_string();
-        if self.entries.iter().any(|e| e.plugin.as_plugin().name() == name) {
+    /// Rejects a name already present -- across *all* kinds, matching
+    /// upstream's `add_plugin`, which checks one flat list.
+    pub fn register<T: PluginKind + ?Sized>(&mut self, plugin: Arc<T>) -> Result<(), RegistryError> {
+        let meta = T::upcast(Arc::clone(&plugin));
+        let name = meta.name().to_string();
+        if self.entries.iter().any(|e| e.name == name) {
             return Err(RegistryError::DuplicateName(name));
         }
-        self.entries.push(Entry { plugin, enabled: true });
+
+        self.typed
+            .entry(TypeId::of::<T>())
+            .or_insert_with(|| Box::new(Vec::<(String, Arc<T>)>::new()))
+            .downcast_mut::<Vec<(String, Arc<T>)>>()
+            .expect("the slot for a TypeId always holds that type's own Vec")
+            .push((name.clone(), plugin));
+
+        self.entries.push(Entry { name, meta, kind: T::KIND, enabled: true });
         Ok(())
     }
 
@@ -156,8 +177,8 @@ impl PluginRegistry {
     /// *Enabling* is always allowed -- `can_be_disabled` constrains only
     /// the disable direction, matching what the flag actually means.
     pub fn set_enabled(&mut self, name: &str, enabled: bool) -> Result<(), RegistryError> {
-        let entry = self.entries.iter_mut().find(|e| e.plugin.as_plugin().name() == name).ok_or_else(|| RegistryError::NotFound(name.to_string()))?;
-        if !enabled && !entry.plugin.as_plugin().can_be_disabled() {
+        let entry = self.entries.iter_mut().find(|e| e.name == name).ok_or_else(|| RegistryError::NotFound(name.to_string()))?;
+        if !enabled && !entry.meta.can_be_disabled() {
             return Err(RegistryError::CannotBeDisabled(name.to_string()));
         }
         entry.enabled = enabled;
@@ -165,7 +186,7 @@ impl PluginRegistry {
     }
 
     pub fn is_enabled(&self, name: &str) -> Option<bool> {
-        self.entries.iter().find(|e| e.plugin.as_plugin().name() == name).map(|e| e.enabled)
+        self.entries.iter().find(|e| e.name == name).map(|e| e.enabled)
     }
 
     pub fn len(&self) -> usize {
@@ -181,57 +202,50 @@ impl PluginRegistry {
     /// UI has to list them in order to offer re-enabling them.
     pub fn list(&self) -> Vec<PluginInfo> {
         let mut entries: Vec<&Entry> = self.entries.iter().collect();
-        entries.sort_by_key(|e| std::cmp::Reverse(e.plugin.as_plugin().priority()));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.meta.priority()));
         entries
             .into_iter()
-            .map(|e| {
-                let p = e.plugin.as_plugin();
-                PluginInfo {
-                    name: p.name().to_string(),
-                    version: p.version(),
-                    author: p.author().to_string(),
-                    description: p.description().to_string(),
-                    kind: e.plugin.kind(),
-                    enabled: e.enabled,
-                    can_be_disabled: p.can_be_disabled(),
-                    installation_type: p.installation_type(),
-                }
+            .map(|e| PluginInfo {
+                name: e.name.clone(),
+                version: e.meta.version(),
+                author: e.meta.author().to_string(),
+                description: e.meta.description().to_string(),
+                kind: e.kind,
+                enabled: e.enabled,
+                can_be_disabled: e.meta.can_be_disabled(),
+                installation_type: e.meta.installation_type(),
             })
             .collect()
     }
 
-    /// Enabled plugins of one kind, highest [`Plugin::priority`] first.
+    /// Every *enabled* plugin of one kind, highest [`Plugin::priority`]
+    /// first.
     ///
     /// Upstream sorts its single plugin list by priority descending
     /// (`ui.py`: `sort(key=lambda x: x.priority, reverse=True)`); this
     /// preserves that order within each kind. The sort is stable, so
     /// equal-priority plugins keep registration order rather than
     /// reordering unpredictably between calls.
-    fn enabled_of_kind<T: ?Sized>(&self, extract: impl Fn(&RegisteredPlugin) -> Option<Arc<T>>) -> Vec<Arc<T>> {
-        let mut matching: Vec<(u64, Arc<T>)> = self.entries.iter().filter(|e| e.enabled).filter_map(|e| extract(&e.plugin).map(|p| (e.plugin.as_plugin().priority(), p))).collect();
+    pub fn plugins_of<T: PluginKind + ?Sized>(&self) -> Vec<Arc<T>> {
+        let Some(slot) = self.typed.get(&TypeId::of::<T>()) else {
+            return Vec::new();
+        };
+        let all = slot.downcast_ref::<Vec<(String, Arc<T>)>>().expect("the slot for a TypeId always holds that type's own Vec");
+
+        let mut matching: Vec<(u64, Arc<T>)> = all
+            .iter()
+            .filter_map(|(name, plugin)| {
+                let entry = self.entries.iter().find(|e| &e.name == name)?;
+                entry.enabled.then(|| (entry.meta.priority(), Arc::clone(plugin)))
+            })
+            .collect();
         matching.sort_by_key(|(priority, _)| std::cmp::Reverse(*priority));
         matching.into_iter().map(|(_, p)| p).collect()
     }
 
+    /// Convenience for the kind this crate owns.
     pub fn file_type_plugins(&self) -> Vec<Arc<dyn FileTypePlugin>> {
-        self.enabled_of_kind(|p| match p {
-            RegisteredPlugin::FileType(p) => Some(Arc::clone(p)),
-            _ => None,
-        })
-    }
-
-    pub fn input_format_plugins(&self) -> Vec<Arc<dyn InputFormatPlugin>> {
-        self.enabled_of_kind(|p| match p {
-            RegisteredPlugin::InputFormat(p) => Some(Arc::clone(p)),
-            _ => None,
-        })
-    }
-
-    pub fn output_format_plugins(&self) -> Vec<Arc<dyn OutputFormatPlugin>> {
-        self.enabled_of_kind(|p| match p {
-            RegisteredPlugin::OutputFormat(p) => Some(Arc::clone(p)),
-            _ => None,
-        })
+        self.plugins_of::<dyn FileTypePlugin>()
     }
 }
 
@@ -239,6 +253,17 @@ impl PluginRegistry {
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+
+    /// A second, unrelated plugin trait -- stands in for one owned by
+    /// another crate (which is the real case: `calibre_ebooks` owns
+    /// `InputFormatPlugin`). Proves kinds are genuinely isolated.
+    trait OtherKind: Plugin {}
+    impl PluginKind for dyn OtherKind {
+        const KIND: &'static str = "OtherKind";
+        fn upcast(arc: Arc<Self>) -> Arc<dyn Plugin> {
+            arc
+        }
+    }
 
     /// A real (if small) `FileTypePlugin`: it renames the file it is
     /// given, so a test can observe that it actually ran, in what order,
@@ -285,8 +310,8 @@ mod tests {
         }
     }
 
-    fn file_type(m: Marker) -> RegisteredPlugin {
-        RegisteredPlugin::FileType(Arc::new(m))
+    fn file_type(m: Marker) -> Arc<dyn FileTypePlugin> {
+        Arc::new(m)
     }
 
     #[test]
@@ -298,8 +323,8 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].name(), "A");
         // ...and is not returned as some other kind.
-        assert!(reg.input_format_plugins().is_empty());
-        assert!(reg.output_format_plugins().is_empty());
+        // ...and is not returned under some other plugin trait.
+        assert!(reg.plugins_of::<dyn OtherKind>().is_empty());
     }
 
     #[test]
