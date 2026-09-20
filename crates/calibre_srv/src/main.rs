@@ -168,6 +168,7 @@ async fn main() -> anyhow::Result<()> {
         news_schedules,
         tts_voice,
         plugin_store,
+        plugin_registry: Arc::new(std::sync::Mutex::new(calibre_customize::registry::PluginRegistry::new())),
     };
 
     // Real background scheduler for #764's own recurring news

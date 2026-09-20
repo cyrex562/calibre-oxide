@@ -12,6 +12,7 @@ path = "src/main.rs"
 calibre_conversion = { path = "../calibre_conversion" }
 calibre_db = { path = "../calibre_db" }
 calibre_ebooks = { path = "../calibre_ebooks" }
+calibre_customize = { path = "../calibre_customize" }
 calibre_plugins_wasm = { path = "../calibre_plugins_wasm" }
 calibre_utils = { path = "../calibre_utils" }
 axum = { version = "0.8", features = ["ws"] }

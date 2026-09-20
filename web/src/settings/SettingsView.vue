@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from "vue";
 import { isTauri, tauriInvoke } from "../tauri";
+import { inspectPlugin, installPlugin, listPlugins, removePlugin, setPluginEnabled, type InstalledPlugin } from "../library/api";
 import { DEFAULT_KEYMAP, DEFAULT_LIBRARY_PREFS, DEFAULT_READER_PREFS, DEFAULT_TOOLBAR_PREFS, fetchProfile, KEYMAP_ACTION_LABELS, KEYMAP_PROFILE, LIBRARY_PREFS_PROFILE, READER_PREFS_PROFILE, saveProfile, TOOLBAR_ACTIONS, TOOLBAR_PREFS_PROFILE, type KeymapAction, type KeymapPrefs, type LibraryPrefs, type ReaderPrefs, type ToolbarActionId, type ToolbarPrefs } from "./api";
 
 const libraryPrefs = ref<LibraryPrefs>({ ...DEFAULT_LIBRARY_PREFS });
@@ -42,6 +43,81 @@ async function saveToolbarPrefs() {
     error.value = e instanceof Error ? e.message : String(e);
   }
 }
+// Plugin management (#801). Plugins run in a WASM sandbox with no
+// filesystem and no network unless their own manifest asks for it, so
+// the UI's job is to make that request visible -- especially BEFORE
+// install, via the inspect step.
+const plugins = ref<InstalledPlugin[]>([]);
+const pluginsAvailable = ref(false);
+const pluginError = ref<string | null>(null);
+const pluginPath = ref("");
+const pluginPreview = ref<InstalledPlugin | null>(null);
+const pluginBusy = ref(false);
+
+async function loadPlugins() {
+  pluginError.value = null;
+  try {
+    plugins.value = (await listPlugins()).plugins;
+    pluginsAvailable.value = true;
+  } catch {
+    // A server started without --plugin-dir answers 503 here. That is
+    // a configuration state, not an error to shout about, so the whole
+    // pane is simply hidden.
+    pluginsAvailable.value = false;
+  }
+}
+
+async function inspectPluginPath() {
+  pluginError.value = null;
+  pluginPreview.value = null;
+  pluginBusy.value = true;
+  try {
+    pluginPreview.value = await inspectPlugin(pluginPath.value.trim());
+  } catch (e) {
+    pluginError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    pluginBusy.value = false;
+  }
+}
+
+async function confirmInstallPlugin() {
+  pluginError.value = null;
+  pluginBusy.value = true;
+  try {
+    await installPlugin(pluginPath.value.trim());
+    pluginPreview.value = null;
+    pluginPath.value = "";
+    await loadPlugins();
+    savedMessage.value = "Plugin installed.";
+  } catch (e) {
+    pluginError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    pluginBusy.value = false;
+  }
+}
+
+async function removePluginClick(name: string) {
+  pluginError.value = null;
+  try {
+    await removePlugin(name);
+    await loadPlugins();
+  } catch (e) {
+    pluginError.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
+async function togglePlugin(p: InstalledPlugin) {
+  pluginError.value = null;
+  try {
+    await setPluginEnabled(p.name, !p.enabled);
+    await loadPlugins();
+  } catch (e) {
+    // Includes the real "this plugin declares it cannot be disabled"
+    // refusal -- surfaced rather than silently ignored.
+    pluginError.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
 const loading = ref(true);
 const savedMessage = ref<string | null>(null);
 const error = ref<string | null>(null);
@@ -66,6 +142,7 @@ async function load() {
       const missing = TOOLBAR_ACTIONS.map((a) => a.id).filter((id) => !saved.includes(id));
       toolbarOrder.value = [...saved, ...missing];
     }
+    await loadPlugins();
     if (isTauri()) {
       showAppSettings.value = true;
       autoReopen.value = await tauriInvoke<boolean>("get_auto_reopen");
@@ -232,6 +309,61 @@ async function toggleAutoReopen() {
         <button type="button" @click="saveToolbarPrefs">Save toolbar layout</button>
       </section>
 
+      <section v-if="pluginsAvailable" class="pane">
+        <h3>Plugins</h3>
+        <p class="hint">
+          Plugins run in a WebAssembly sandbox. They have no access to your files or the
+          network unless they ask for it, and anything they ask for is shown below before
+          you install.
+        </p>
+
+        <label class="field">
+          Install from a plugin package (.zip)
+          <input v-model="pluginPath" type="text" placeholder="/path/to/plugin.zip" />
+        </label>
+        <div class="plugin-actions">
+          <button type="button" :disabled="pluginBusy || !pluginPath.trim()" @click="inspectPluginPath">
+            {{ pluginBusy ? "Reading…" : "Review before installing" }}
+          </button>
+        </div>
+
+        <div v-if="pluginPreview" class="plugin-preview">
+          <h4>{{ pluginPreview.name }} {{ pluginPreview.version }}</h4>
+          <p class="plugin-meta">by {{ pluginPreview.author || "unknown" }} — {{ pluginPreview.description }}</p>
+          <p v-if="pluginPreview.capabilities.fully_sandboxed" class="plugin-safe">
+            ✓ Fully sandboxed — requests no file or network access.
+          </p>
+          <div v-else class="plugin-grants">
+            <p class="plugin-warn">This plugin is asking for access:</p>
+            <ul>
+              <li v-for="host in pluginPreview.capabilities.allowed_hosts" :key="host">
+                Network access to <code>{{ host }}</code>
+              </li>
+              <li v-for="hostPath in Object.keys(pluginPreview.capabilities.allowed_paths)" :key="hostPath">
+                File access to <code>{{ hostPath }}</code>
+              </li>
+            </ul>
+          </div>
+          <button type="button" :disabled="pluginBusy" @click="confirmInstallPlugin">Install this plugin</button>
+        </div>
+
+        <p v-if="pluginError" class="error">{{ pluginError }}</p>
+
+        <ul v-if="plugins.length" class="plugin-list">
+          <li v-for="p in plugins" :key="p.name" class="plugin-row">
+            <div class="plugin-body">
+              <div class="plugin-name">{{ p.name }} <span class="plugin-version">{{ p.version }}</span></div>
+              <div class="plugin-meta">{{ p.plugin_type }} — {{ p.description }}</div>
+              <div v-if="p.capabilities.fully_sandboxed" class="plugin-safe">Fully sandboxed</div>
+              <div v-else class="plugin-warn">Can reach: {{ p.capabilities.allowed_hosts.join(", ") || "(files)" }}</div>
+            </div>
+            <button type="button" @click="togglePlugin(p)">{{ p.enabled ? "Disable" : "Enable" }}</button>
+            <button type="button" class="delete" @click="removePluginClick(p.name)">Remove</button>
+          </li>
+        </ul>
+        <p v-else class="hint">No plugins installed.</p>
+      </section>
+
       <section v-if="showAppSettings" class="pane">
         <h3>App</h3>
         <label class="field checkbox">
@@ -300,6 +432,61 @@ async function toggleAutoReopen() {
 }
 .toolbar-row .field.checkbox {
   flex: 1;
+}
+.plugin-actions {
+  display: flex;
+  gap: 0.5em;
+}
+.plugin-preview,
+.plugin-row {
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  padding: 0.75em;
+}
+.plugin-preview h4 {
+  margin: 0 0 0.25em;
+}
+.plugin-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5em;
+}
+.plugin-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+}
+.plugin-body {
+  flex: 1;
+  min-width: 0;
+}
+.plugin-name {
+  font-weight: 600;
+}
+.plugin-version,
+.plugin-meta {
+  font-size: 0.85em;
+  color: #666;
+  font-weight: normal;
+}
+.plugin-safe {
+  color: #1b7f3a;
+  font-size: 0.85em;
+}
+.plugin-warn {
+  color: #a05a00;
+  font-size: 0.85em;
+}
+.plugin-grants ul {
+  margin: 0.25em 0 0.5em 1.2em;
+  padding: 0;
+  font-size: 0.9em;
+}
+.delete {
+  color: #b00020;
 }
 .error {
   color: #b00020;
