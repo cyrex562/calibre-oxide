@@ -25,10 +25,12 @@
 //! directly; those plugins cannot run here and never will. This is a
 //! new ecosystem with the same hook shapes and a real sandbox.
 
+pub mod file_type;
 pub mod host;
 pub mod manifest;
 pub mod store;
 
 pub use host::{LoadedPlugin, PluginPackage, WasmPluginError};
 pub use manifest::{Capabilities, Limits, Manifest, PluginType, ABI_VERSION};
+pub use file_type::WasmFileTypePlugin;
 pub use store::{PluginStore, StoreError};
