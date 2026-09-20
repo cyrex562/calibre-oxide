@@ -39,13 +39,14 @@
 //!
 //! # Disclosed narrowings
 //!
-//! - **GSUB substitution closure** (real `subset()`'s `extra_glyphs =
-//!   gsub.all_substitutions(...)` step, which keeps glyphs reachable
-//!   only via an OpenType layout substitution rule) isn't ported: GSUB
-//!   parsing is separate, low-priority, not-yet-ported scope (#555).
-//!   `extra_glyphs` is always empty here, matching what real upstream
-//!   itself falls back to when a font has no `GSUB` table (which is
-//!   the common case for most fonts).
+//! - ~~**GSUB substitution closure**~~ -- **ported as of #555.**
+//!   `extra_glyphs` now really comes from
+//!   [`super::gsub::GsubTable::all_substitutions`], so a glyph
+//!   reachable only through a substitution rule (an `fi` ligature no
+//!   character maps to directly, say) survives subsetting. A GSUB
+//!   table this port cannot parse degrades to an empty set with a
+//!   warning rather than failing the subset, matching upstream's own
+//!   `except` handling.
 //! - **CFF-flavored (`subset_postscript`) fonts**: real subsetting via
 //!   [`subset_cff`] (port of `CFFTable.subset`, issue #565, itself
 //!   built on #563/#564's DICT codec and table reader and #565's own
@@ -70,6 +71,7 @@ use super::cff::table::Cff;
 use super::cff::writer::Subset as CffSubset;
 use super::cmap::CmapTable;
 use super::container::Sfnt;
+use super::gsub::GsubTable;
 use super::errors::{NoGlyphs, UnsupportedFont};
 use super::glyf::GlyfTable;
 use super::head::HeadTable;
@@ -258,10 +260,25 @@ pub fn subset(raw: &[u8], chars: &HashSet<char>) -> Result<(Vec<u8>, IndexMap<[u
     let codes: Vec<u32> = char_codes.into_iter().collect();
     let mut character_map = cmap.get_character_map(&codes)?;
 
-    // GSUB substitution-derived extra glyphs -- always empty; see the
-    // module doc's disclosed narrowing (GSUB parsing is #555, not yet
-    // ported).
-    let extra_glyphs: HashSet<usize> = HashSet::new();
+    // Real GSUB substitution closure (issue #555): keeps glyphs that
+    // are reachable ONLY through an OpenType substitution rule -- e.g.
+    // an `fi` ligature glyph that no character maps to directly --
+    // from being dropped by subsetting.
+    //
+    // A GSUB table this port cannot parse must NOT fail the subset:
+    // upstream catches both UnsupportedFont and any other exception,
+    // warns, and carries on with an empty set (which is also exactly
+    // what a font with no GSUB table gets). Same tolerance here.
+    let extra_glyphs: HashSet<usize> = match sfnt.get(b"GSUB") {
+        Some(gsub_raw) => match GsubTable::parse(gsub_raw) {
+            Ok(gsub) => gsub.all_substitutions(character_map.values().filter_map(|g| u16::try_from(*g).ok())).into_iter().map(usize::from).collect(),
+            Err(e) => {
+                eprintln!("Unsupported GSUB table: {e}");
+                HashSet::new()
+            }
+        },
+        None => HashSet::new(),
+    };
 
     if sfnt.contains(b"loca") && sfnt.contains(b"glyf") {
         subset_truetype(&mut sfnt, &mut character_map, &extra_glyphs)?;
@@ -656,5 +673,58 @@ mod tests {
         chars.insert('Q');
         let err = subset(&font, &chars).unwrap_err();
         assert!(matches!(err, SubsetError::NoGlyphs(_)), "{err}");
+    }
+
+    /// End-to-end proof of what #555 actually bought: subsetting a real
+    /// font for `"Hi"` now KEEPS the dotless-i glyph (`ı`, U+0131),
+    /// which no requested character maps to and which is reachable only
+    /// through a GSUB substitution rule.
+    ///
+    /// Before GSUB parsing existed, `extra_glyphs` was always empty and
+    /// that glyph was silently discarded -- the exact failure mode the
+    /// substitution closure prevents. Verified against the real
+    /// DejaVuSans: glyph 43 (`H`) + glyph 76 (`i`) substitute to glyph
+    /// 243 (`ı`), confirmed independently by running upstream calibre's
+    /// own `gsub.py` on the same font.
+    #[test]
+    fn subsetting_keeps_a_glyph_reachable_only_through_a_gsub_rule() {
+        const FONT: &str = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+        let Ok(raw) = std::fs::read(FONT) else {
+            eprintln!("skipping: {FONT} not present on this machine");
+            return;
+        };
+
+        let chars: HashSet<char> = "Hi".chars().collect();
+        let (subset_raw, _old, _new, _warnings) = subset(&raw, &chars).expect("subsetting a real font should succeed");
+
+        // Re-parse the subset output and look at its glyf/loca: the
+        // dotless-i glyph must still carry real outline data.
+        let sfnt = Sfnt::parse(&subset_raw).expect("the subset output should itself be a valid font");
+        let head = HeadTable::parse(sfnt.get(b"head").expect("head")).unwrap();
+        let loca = LocaTable::load_offsets(sfnt.get(b"loca").expect("loca"), head.index_to_loc_format).expect("loca offsets");
+
+        const DOTLESS_I: usize = 243;
+        let (_off, sz) = loca.glyph_location(DOTLESS_I).expect("the dotless-i glyph id should still be in range");
+        assert!(sz > 0, "glyph {DOTLESS_I} (dotless i) should have survived subsetting via the GSUB substitution closure, but its outline is empty");
+    }
+
+    /// The same subset without the GSUB contribution would drop it --
+    /// pinned by asserting the closure really reports that glyph, so
+    /// the test above cannot pass for an unrelated reason (e.g. the
+    /// subsetter keeping every glyph).
+    #[test]
+    fn the_gsub_closure_is_what_puts_that_glyph_in_extra_glyphs() {
+        const FONT: &str = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+        let Ok(raw) = std::fs::read(FONT) else { return };
+        let sfnt = Sfnt::parse(&raw).unwrap();
+        let gsub = GsubTable::parse(sfnt.get(b"GSUB").expect("GSUB")).unwrap();
+
+        // 43 = 'H', 76 = 'i' in this font.
+        let closure = gsub.all_substitutions([43u16, 76]);
+        assert!(closure.contains(&243), "the closure should reach the dotless-i glyph: {closure:?}");
+
+        // And a subset that requested neither must NOT pull it in.
+        let unrelated = gsub.all_substitutions([1u16, 2, 3]);
+        assert!(!unrelated.contains(&243), "unrelated glyphs must not drag in the substitution");
     }
 }
