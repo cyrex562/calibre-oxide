@@ -293,7 +293,7 @@ mod tests {
 #[cfg(test)]
 mod registry_backed_tests {
     use super::*;
-    use crate::registry::{PluginRegistry, RegisteredPlugin};
+    use crate::registry::PluginRegistry;
     use crate::Plugin;
     use std::sync::Arc;
 
@@ -328,8 +328,8 @@ mod registry_backed_tests {
         }
     }
 
-    fn tagger(name: &str, tag: &str, priority: u64) -> RegisteredPlugin {
-        RegisteredPlugin::FileType(Arc::new(Tagger { name: name.to_string(), tag: tag.to_string(), enabled_for_import: true, priority }))
+    fn tagger(name: &str, tag: &str, priority: u64) -> Arc<dyn FileTypePlugin> {
+        Arc::new(Tagger { name: name.to_string(), tag: tag.to_string(), enabled_for_import: true, priority })
     }
 
     #[test]

@@ -27,89 +27,9 @@ pub fn convert_to_oebbook(input_path: &Path, extract_dir: &Path) -> Result<OEBBo
 
     fs::create_dir_all(extract_dir)?;
 
-    let book = if input_ext == "epub" {
-        use crate::input::epub_input::EPUBInput;
-        let input_plugin = EPUBInput::new();
-        input_plugin.convert(input_path, extract_dir)?
-    } else if ["mobi", "azw", "azw3", "prc"].contains(&input_ext.as_str()) {
-        use crate::input::mobi_input::MOBIInput;
-        let input_plugin = MOBIInput::new();
-        input_plugin.convert(input_path, extract_dir)?
-    } else if ["html", "htm", "xhtml"].contains(&input_ext.as_str()) {
-        use crate::input::html_input::HTMLInput;
-        let input_plugin = HTMLInput::new();
-        input_plugin.convert(input_path, extract_dir)?
-    } else if ["txt", "md", "markdown", "text", "textile"].contains(&input_ext.as_str()) {
-        use crate::input::txt_input::TXTInput;
-        let input_plugin = TXTInput::new();
-        input_plugin.convert(input_path, extract_dir)?
-    } else if input_ext == "docx" {
-        use crate::input::docx_input::DOCXInput;
-        let input_plugin = DOCXInput::new();
-        input_plugin.convert(input_path, extract_dir)?
-    } else if ["cbz", "zip"].contains(&input_ext.as_str()) {
-        use crate::input::comic_input::ComicInput;
-        let input_plugin = ComicInput::new();
-        input_plugin.convert(input_path, extract_dir)?
-    } else if input_ext == "fb2" {
-        use crate::input::fb2_input::FB2Input;
-        let input_plugin = FB2Input::new();
-        input_plugin.convert(input_path, extract_dir)?
-    } else if input_ext == "rb" {
-        use crate::input::rb_input::RBInput;
-        let input_plugin = RBInput::new();
-        input_plugin.convert(input_path, extract_dir)?
-    } else if input_ext == "lit" {
-        use crate::input::lit_input::LitInput;
-        let input_plugin = LitInput::new();
-        input_plugin.convert(input_path, extract_dir)?
-    } else if input_ext == "snb" {
-        use crate::input::snb_input::SnbInput;
-        let input_plugin = SnbInput::new();
-        input_plugin.convert(input_path, extract_dir)?
-    } else if input_ext == "rtf" {
-        use crate::input::rtf_input::RTFInput;
-        let input_plugin = RTFInput::new();
-        input_plugin.convert(input_path, extract_dir)?
-    } else if input_ext == "pdf" {
-        use crate::input::pdf_input::PDFInput;
-        let input_plugin = PDFInput::new();
-        input_plugin.convert(input_path, extract_dir)?
-    } else if input_ext == "lrf" {
-        use crate::input::lrf_input::LRFInput;
-        let input_plugin = LRFInput::new();
-        input_plugin.convert(input_path, extract_dir)?
-    } else if input_ext == "tcr" {
-        use crate::input::tcr_input::TCRInput;
-        let input_plugin = TCRInput::new();
-        input_plugin.convert(input_path, extract_dir)?
-    } else if input_ext == "pdb" {
-        use crate::input::pdb_input::PDBInput;
-        let input_plugin = PDBInput::new();
-        input_plugin.convert(input_path, extract_dir)?
-    } else if input_ext == "odt" {
-        use crate::input::odt_input::ODTInput;
-        let input_plugin = ODTInput::new();
-        input_plugin.convert(input_path, extract_dir)?
-    } else if input_ext == "djvu" {
-        use crate::input::djvu_input::DJVUInput;
-        let input_plugin = DJVUInput::new();
-        input_plugin.convert(input_path, extract_dir)?
-    } else if input_ext == "recipe" {
-        use crate::input::recipe_input::RecipeInput;
-        let input_plugin = RecipeInput::new();
-        input_plugin.convert(input_path, extract_dir)?
-    } else if input_ext == "chm" {
-        use crate::input::chm_input::CHMInput;
-        let input_plugin = CHMInput::new();
-        input_plugin.convert(input_path, extract_dir)?
-    } else if input_ext == "azw4" {
-        use crate::input::azw4_input::AZW4Input;
-        let input_plugin = AZW4Input::new();
-        input_plugin.convert(input_path, extract_dir)?
-    } else {
-        bail!("Unsupported input format: {}", input_ext);
-    };
+    let plugin = crate::conversion::input_plugin::resolve_input_plugin(crate::conversion::input_plugin::builtin_input_registry(), &input_ext)
+        .ok_or_else(|| anyhow::anyhow!("Unsupported input format: {}", input_ext))?;
+    let book = plugin.convert(input_path, extract_dir)?;
 
     Ok(book)
 }
