@@ -6,13 +6,16 @@
 
 pub mod cff;
 pub mod cmap;
+pub mod common;
 pub mod container;
 pub mod errors;
 pub mod glyf;
+pub mod gsub;
 pub mod head;
 pub mod kern;
 pub mod loca;
 pub mod maxp;
+pub mod merge;
 pub mod metrics;
 pub mod subset;
 
