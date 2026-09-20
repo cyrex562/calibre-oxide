@@ -212,153 +212,30 @@ impl Plumber {
             .map(|s| s.to_lowercase())
             .unwrap_or_default();
 
-        if output_ext == "epub" {
-            use crate::output::epub_output::EPUBOutput;
-            // Create parent directory if needed
-            if let Some(parent) = self.output_path.parent() {
-                if !parent.exists() {
-                    fs::create_dir_all(parent)?;
+        // Resolve the writer from the real output-plugin registry
+        // (#797) instead of a hardcoded chain. The `create_dir_all`
+        // boilerplate every branch used to repeat is hoisted here.
+        match crate::conversion::output_plugin::resolve_output_plugin(crate::conversion::output_plugin::builtin_output_registry(), &output_ext) {
+            Some(plugin) => {
+                if let Some(parent) = self.output_path.parent() {
+                    if !parent.exists() {
+                        fs::create_dir_all(parent)?;
+                    }
+                }
+                for warning in plugin.convert(&mut book, &self.output_path, &self.opts)? {
+                    eprintln!("Warning: {warning}");
                 }
             }
-            let output_plugin = EPUBOutput::new();
-            output_plugin.convert(&mut book, &self.output_path, &self.opts)?;
-        } else if output_ext == "docx" {
-            use crate::output::docx_output::DOCXOutput;
-            if let Some(parent) = self.output_path.parent() {
-                if !parent.exists() {
-                    fs::create_dir_all(parent)?;
+            None => {
+                // Preserved verbatim from the chain this replaces: an
+                // unrecognized extension is NOT an error, it falls back
+                // to OEB directory output.
+                if !self.output_path.exists() {
+                    fs::create_dir_all(&self.output_path)?;
                 }
+                let writer = crate::oeb::writer::OEBWriter::new();
+                writer.write_book(&mut book, &self.output_path)?;
             }
-            let output_plugin = DOCXOutput::new();
-            output_plugin.convert(&book, &self.output_path, &self.opts)?;
-        } else if ["mobi", "azw", "prc"].contains(&output_ext.as_str()) {
-            use crate::output::mobi_output::MOBIOutput;
-            // Ensure dir exists
-            if let Some(parent) = self.output_path.parent() {
-                if !parent.exists() {
-                    fs::create_dir_all(parent)?;
-                }
-            }
-            let output_plugin = MOBIOutput::new();
-            output_plugin.convert(&book, &self.output_path, &self.opts)?;
-        } else if output_ext == "rb" {
-            use crate::output::rb_output::RBOutput;
-            // Ensure dir exists
-            if let Some(parent) = self.output_path.parent() {
-                if !parent.exists() {
-                    fs::create_dir_all(parent)?;
-                }
-            }
-            let output_plugin = RBOutput::new();
-            output_plugin.convert(&book, &self.output_path, &self.opts)?;
-        } else if output_ext == "lit" {
-            use crate::output::lit_output::LitOutput;
-            // Ensure dir exists
-            if let Some(parent) = self.output_path.parent() {
-                if !parent.exists() {
-                    fs::create_dir_all(parent)?;
-                }
-            }
-            let output_plugin = LitOutput::new();
-            for warning in output_plugin.convert(&mut book, &self.output_path, &self.opts)? {
-                eprintln!("Warning: {warning}");
-            }
-        } else if ["txt", "md", "markdown", "text"].contains(&output_ext.as_str()) {
-            use crate::output::txt_output::TXTOutput;
-            // Ensure dir exists
-            if let Some(parent) = self.output_path.parent() {
-                if !parent.exists() {
-                    fs::create_dir_all(parent)?;
-                }
-            }
-            let output_plugin = TXTOutput::new();
-            output_plugin.convert(&mut book, &self.output_path, &self.opts)?;
-        } else if output_ext == "snb" {
-            use crate::output::snb_output::SnbOutput;
-            // Ensure dir exists
-            if let Some(parent) = self.output_path.parent() {
-                if !parent.exists() {
-                    fs::create_dir_all(parent)?;
-                }
-            }
-            let output_plugin = SnbOutput::new();
-            output_plugin.convert(&book, &self.output_path, &self.opts)?;
-        } else if output_ext == "rtf" {
-            use crate::output::rtf_output::RTFOutput;
-            if let Some(parent) = self.output_path.parent() {
-                if !parent.exists() {
-                    fs::create_dir_all(parent)?;
-                }
-            }
-            let output_plugin = RTFOutput::new();
-            output_plugin.convert(&book, &self.output_path, &self.opts)?;
-        } else if output_ext == "fb2" {
-            use crate::output::fb2_output::FB2Output;
-            if let Some(parent) = self.output_path.parent() {
-                if !parent.exists() {
-                    fs::create_dir_all(parent)?;
-                }
-            }
-            let output_plugin = FB2Output::new();
-            output_plugin.convert(&book, &self.output_path, &self.opts)?;
-        } else if output_ext == "pdf" {
-            use crate::output::pdf_output::PDFOutput;
-            if let Some(parent) = self.output_path.parent() {
-                if !parent.exists() {
-                    fs::create_dir_all(parent)?;
-                }
-            }
-            let output_plugin = PDFOutput::new();
-            output_plugin.convert(&book, &self.output_path, &self.opts)?;
-        } else if output_ext == "lrf" {
-            use crate::output::lrf_output::LRFOutput;
-            if let Some(parent) = self.output_path.parent() {
-                if !parent.exists() {
-                    fs::create_dir_all(parent)?;
-                }
-            }
-            let output_plugin = LRFOutput::new();
-            output_plugin.convert(&book, &self.output_path, &self.opts)?;
-        } else if output_ext == "oeb" {
-            use crate::output::oeb_output::OEBOutput;
-            let output_plugin = OEBOutput::new();
-            output_plugin.convert(&mut book, &self.output_path, &self.opts)?;
-        } else if output_ext == "pdb" {
-            use crate::output::pdb_output::PDBOutput;
-            // Ensure parent exists
-            if let Some(parent) = self.output_path.parent() {
-                if !parent.exists() {
-                    fs::create_dir_all(parent)?;
-                }
-            }
-            let output_plugin = PDBOutput::new();
-            output_plugin.convert(&book, &self.output_path, &self.opts)?;
-        } else if output_ext == "odt" {
-            use crate::output::odt_output::ODTOutput;
-            if let Some(parent) = self.output_path.parent() {
-                if !parent.exists() {
-                    fs::create_dir_all(parent)?;
-                }
-            }
-            let output_plugin = ODTOutput::new();
-            output_plugin.convert(&book, &self.output_path, &self.opts)?;
-        } else if output_ext == "tcr" {
-            use crate::output::tcr_output::TCROutput;
-            // Ensure parent exists
-            if let Some(parent) = self.output_path.parent() {
-                if !parent.exists() {
-                    fs::create_dir_all(parent)?;
-                }
-            }
-            let output_plugin = TCROutput::new();
-            output_plugin.convert(&book, &self.output_path, &self.opts)?;
-        } else {
-            // Default to OEB Directory Output
-            if !self.output_path.exists() {
-                fs::create_dir_all(&self.output_path)?;
-            }
-            let writer = crate::oeb::writer::OEBWriter::new();
-            writer.write_book(&mut book, &self.output_path)?;
         }
 
         println!("Done.");
