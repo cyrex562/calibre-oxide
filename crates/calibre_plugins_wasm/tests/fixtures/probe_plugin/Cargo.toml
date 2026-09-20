@@ -1,0 +1,19 @@
+[package]
+name = "probe_plugin"
+version = "0.1.0"
+edition = "2021"
+
+# Deliberately NOT a workspace member -- it targets wasm32-unknown-unknown
+# and is built out-of-band by build.sh, not by the host workspace build.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+extism-pdk = "1.4"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
