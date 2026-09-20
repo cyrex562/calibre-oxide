@@ -105,14 +105,29 @@ impl PluginPackage {
         Ok(PluginPackage { manifest, wasm })
     }
 
-    /// Instantiates the plugin under the sandbox its manifest declares.
+    /// Instantiates the plugin under the sandbox its manifest declares,
+    /// with no host functions.
     pub fn load(&self) -> Result<LoadedPlugin, WasmPluginError> {
+        self.load_with_host_functions(Vec::new())
+    }
+
+    /// Instantiates the plugin, additionally exposing `host_functions`
+    /// to it.
+    ///
+    /// Host functions are how a sandboxed plugin reaches anything at
+    /// all, so each one is a deliberate, audited hole in the sandbox
+    /// and belongs to the typed ABI that needs it -- not to this
+    /// module. `metadata_source` supplies an SSRF-guarded HTTP getter
+    /// this way (#800); the file-type ABI (#799) supplies none,
+    /// because it does not need any.
+    pub fn load_with_host_functions(&self, host_functions: Vec<extism::Function>) -> Result<LoadedPlugin, WasmPluginError> {
         let extism_manifest = build_extism_manifest(&self.wasm, &self.manifest.capabilities, &self.manifest.limits);
 
         // `with_wasi(false)`: a plugin gets no WASI surface at all.
         // Filesystem access, when granted, comes from `allowed_paths`
         // on the manifest above -- never from an ambient WASI context.
-        let plugin = ExtismPlugin::new(&extism_manifest, [], false).map_err(|e| WasmPluginError::Instantiate { name: self.manifest.name.clone(), reason: e.to_string() })?;
+        let plugin = ExtismPlugin::new(&extism_manifest, host_functions, false)
+            .map_err(|e| WasmPluginError::Instantiate { name: self.manifest.name.clone(), reason: e.to_string() })?;
 
         Ok(LoadedPlugin { manifest: self.manifest.clone(), plugin })
     }

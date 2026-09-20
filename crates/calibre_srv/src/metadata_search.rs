@@ -63,12 +63,13 @@ fn is_blank(s: &Option<String>) -> bool {
 }
 
 /// `POST /metadata/search`.
-pub async fn search(State(_state): State<AppState>, Json(body): Json<SearchBody>) -> Result<Json<Value>, ServerError> {
+pub async fn search(State(state): State<AppState>, Json(body): Json<SearchBody>) -> Result<Json<Value>, ServerError> {
     if is_blank(&body.title) && is_blank(&body.authors) && is_blank(&body.isbn) {
         return Err(ServerError::BadRequest("at least one of title, authors, or isbn is required".to_string()));
     }
 
     let SearchBody { title, authors, isbn } = body;
+    let (plugin_title, plugin_authors, plugin_isbn) = (title.clone(), authors.clone(), isbn.clone());
 
     let google_query = google_books::GoogleBooksQuery { title: title.clone(), authors: authors.clone(), isbn: isbn.clone() };
     let open_library_query = open_library::OpenLibraryQuery { title, authors, isbn };
@@ -98,11 +99,87 @@ pub async fn search(State(_state): State<AppState>, Json(body): Json<SearchBody>
         Err(e) => source_errors.push(format!("Open Library: {e}")),
     }
 
+    // Installed third-party WASM metadata sources (#800) contribute
+    // alongside the built-ins, under the same partial-failure rule.
+    if let Some(store) = state.plugin_store.as_ref() {
+        let plugin_query = calibre_plugins_wasm::metadata_source::MetadataQuery { title: plugin_title, authors: plugin_authors, isbn: plugin_isbn };
+        let store = std::sync::Arc::clone(store);
+        let (found, errs) = tokio::task::spawn_blocking(move || {
+            let mut found = Vec::new();
+            let mut errs = Vec::new();
+            run_wasm_metadata_plugins(&store, &plugin_query, &mut found, &mut errs);
+            (found, errs)
+        })
+        .await
+        .unwrap_or_else(|e| (Vec::new(), vec![format!("plugins: {e}")]));
+        candidates.extend(found);
+        source_errors.extend(errs);
+    }
+
     if candidates.is_empty() && !source_errors.is_empty() {
         return Err(ServerError::FailedDependency(source_errors.join("; ")));
     }
 
     Ok(Json(json!({"candidates": candidates, "source_errors": source_errors})))
+}
+
+/// Converts a WASM plugin's wire-form candidate into the real
+/// `MetadataCandidate` the rest of this server already speaks.
+///
+/// `calibre_plugins_wasm` deliberately mirrors the struct rather than
+/// importing it -- it must not depend on `calibre_ebooks`, or a WASM
+/// runtime would follow into every crate that does (see that crate's
+/// own doc). This is the one place the two shapes meet, and
+/// `every_metadata_candidate_field_survives_the_plugin_dto_round_trip`
+/// pins them together so they cannot drift silently.
+fn candidate_from_dto(dto: calibre_plugins_wasm::metadata_source::CandidateDto) -> MetadataCandidate {
+    MetadataCandidate {
+        source: dto.source,
+        title: dto.title,
+        authors: dto.authors,
+        description: dto.description,
+        publisher: dto.publisher,
+        pubdate: dto.pubdate,
+        tags: dto.tags,
+        identifiers: dto.identifiers,
+        language: dto.language,
+        cover_url: dto.cover_url,
+        rating: dto.rating,
+    }
+}
+
+/// Runs every installed WASM metadata-source plugin, appending their
+/// candidates and reporting any failures the same way a built-in
+/// source's failure is reported.
+///
+/// A plugin that fails must not fail the request -- it is exactly the
+/// partial-failure case `/metadata/search` already handles for its
+/// built-in sources, and third-party code is if anything more likely
+/// to break.
+fn run_wasm_metadata_plugins(
+    store: &calibre_plugins_wasm::PluginStore,
+    query: &calibre_plugins_wasm::metadata_source::MetadataQuery,
+    candidates: &mut Vec<MetadataCandidate>,
+    source_errors: &mut Vec<String>,
+) {
+    let packages = match store.list() {
+        Ok(p) => p,
+        Err(e) => {
+            source_errors.push(format!("plugins: {e}"));
+            return;
+        }
+    };
+
+    for pkg in packages {
+        if pkg.manifest.plugin_type != calibre_plugins_wasm::PluginType::MetadataSource {
+            continue;
+        }
+        let name = pkg.manifest.name.clone();
+        match calibre_plugins_wasm::WasmMetadataSource::load(&pkg).and_then(|s| s.search(query)) {
+            Ok(found) => candidates.extend(found.into_iter().map(candidate_from_dto)),
+            Err(e) => source_errors.push(format!("{name}: {e}")),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -335,7 +412,7 @@ mod tests {
             news_jobs: std::sync::Arc::new(crate::news::NewsJobRegistry::new()),
             tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()),
             news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()),
-            tts_voice: None,
+            tts_voice: None, plugin_store: None,
         };
         let router = crate::test_router(state);
         (dir, router)
@@ -348,6 +425,52 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let value = if bytes.is_empty() { serde_json::Value::Null } else { serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null) };
         (status, value)
+    }
+
+    #[test]
+    fn every_metadata_candidate_field_survives_the_plugin_dto_round_trip() {
+        // `calibre_plugins_wasm::CandidateDto` mirrors
+        // `MetadataCandidate` rather than importing it (that crate must
+        // not depend on calibre_ebooks, or wasmtime follows into every
+        // crate that does). This pins the two shapes together: if a
+        // field is added to one and not the other, this fails rather
+        // than silently dropping plugin-supplied data.
+        let dto = calibre_plugins_wasm::metadata_source::CandidateDto {
+            source: "A Plugin".to_string(),
+            title: Some("Dune".to_string()),
+            authors: vec!["Frank Herbert".to_string()],
+            description: Some("desc".to_string()),
+            publisher: Some("Ace".to_string()),
+            pubdate: Some("1965".to_string()),
+            tags: vec!["Fiction".to_string()],
+            identifiers: std::collections::BTreeMap::from([("isbn".to_string(), "9780441013593".to_string())]),
+            language: Some("en".to_string()),
+            cover_url: Some("https://example.com/c.jpg".to_string()),
+            rating: Some(4.5),
+        };
+
+        let candidate = super::candidate_from_dto(dto.clone());
+
+        assert_eq!(candidate.source, dto.source);
+        assert_eq!(candidate.title, dto.title);
+        assert_eq!(candidate.authors, dto.authors);
+        assert_eq!(candidate.description, dto.description);
+        assert_eq!(candidate.publisher, dto.publisher);
+        assert_eq!(candidate.pubdate, dto.pubdate);
+        assert_eq!(candidate.tags, dto.tags);
+        assert_eq!(candidate.identifiers, dto.identifiers);
+        assert_eq!(candidate.language, dto.language);
+        assert_eq!(candidate.cover_url, dto.cover_url);
+        assert_eq!(candidate.rating, dto.rating);
+
+        // Field-count guard: serializing both to JSON must produce the
+        // same key set, so an added field on either side is caught even
+        // if someone forgets to extend the assertions above.
+        let dto_keys: std::collections::BTreeSet<String> =
+            serde_json::to_value(&dto).unwrap().as_object().unwrap().keys().cloned().collect();
+        let candidate_keys: std::collections::BTreeSet<String> =
+            serde_json::to_value(&candidate).unwrap().as_object().unwrap().keys().cloned().collect();
+        assert_eq!(dto_keys, candidate_keys, "CandidateDto and MetadataCandidate have drifted apart");
     }
 
     #[tokio::test]

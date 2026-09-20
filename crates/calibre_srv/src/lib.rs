@@ -253,6 +253,11 @@ pub struct AppState {
     /// The single server-wide TTS voice, if `--tts-voice` was passed
     /// at startup -- see [`tts`]'s own doc.
     pub tts_voice: Option<Arc<tts::TtsVoiceConfig>>,
+    /// Installed third-party WASM plugins (issue #800). `None` when no
+    /// plugin directory was configured, which is the default -- a
+    /// server without one behaves exactly as it did before plugins
+    /// existed.
+    pub plugin_store: Option<Arc<calibre_plugins_wasm::PluginStore>>,
 }
 
 impl AppState {
@@ -443,7 +448,7 @@ mod tests {
             jobs: std::sync::Arc::new(jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
             render_jobs: std::sync::Arc::new(render_endpoints::RenderJobRegistry::new()),
             conversion_jobs: std::sync::Arc::new(convert::ConversionJobRegistry::new()),
-            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()), tts_voice: None,
+            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()), tts_voice: None, plugin_store: None,
         }
     }
 
@@ -469,7 +474,7 @@ mod tests {
             jobs: std::sync::Arc::new(jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
             render_jobs: std::sync::Arc::new(render_endpoints::RenderJobRegistry::new()),
             conversion_jobs: std::sync::Arc::new(convert::ConversionJobRegistry::new()),
-            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()), tts_voice: None,
+            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()), tts_voice: None, plugin_store: None,
         };
         let router = test_router(state);
         let (status, _) = get(&router, "/opds").await;
@@ -531,7 +536,7 @@ mod tests {
             jobs: std::sync::Arc::new(jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
             render_jobs: std::sync::Arc::new(render_endpoints::RenderJobRegistry::new()),
             conversion_jobs: std::sync::Arc::new(convert::ConversionJobRegistry::new()),
-            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()), tts_voice: None,
+            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()), tts_voice: None, plugin_store: None,
         };
         let router = test_router(state);
 

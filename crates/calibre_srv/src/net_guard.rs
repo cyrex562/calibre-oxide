@@ -16,18 +16,21 @@
 pub fn is_disallowed_ip(ip: std::net::IpAddr) -> bool {
     // This crate's own tests use local loopback-bound test servers for
     // deterministic fixtures (news.rs's TestSite, share.rs's inline
-    // SMTP server) -- #[cfg(test)] only affects the `cargo test`
-    // binary, never a real `cargo build`/`cargo run`, so allowing
-    // loopback here doesn't weaken real SSRF protection in any shipped
-    // or normally-run binary.
+    // SMTP server, metadata_search.rs's cover host) -- #[cfg(test)]
+    // only affects the `cargo test` binary, never a real
+    // `cargo build`/`cargo run`, so allowing loopback here doesn't
+    // weaken real SSRF protection in any shipped or normally-run
+    // binary.
     #[cfg(test)]
     if ip.is_loopback() {
         return false;
     }
-    match ip {
-        std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified(),
-        std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified() || v6.is_unique_local() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()),
-    }
+    // The policy itself now lives in `calibre_utils::net_guard` (issue
+    // #800), because `calibre_plugins_wasm`'s HTTP host function needs
+    // the identical check and cannot reach this crate. Delegated rather
+    // than duplicated -- a security check is the worst thing to have
+    // two copies of.
+    calibre_utils::net_guard::is_disallowed_ip(ip)
 }
 
 /// Real-DNS-resolves `host`/`port` and rejects it if any resolved

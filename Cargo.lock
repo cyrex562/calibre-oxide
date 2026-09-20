@@ -946,11 +946,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "calibre_customize",
+ "calibre_utils",
  "extism",
+ "reqwest 0.11.27",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
+ "url",
  "zip",
 ]
 
@@ -975,6 +978,7 @@ dependencies = [
  "calibre_conversion",
  "calibre_db",
  "calibre_ebooks",
+ "calibre_plugins_wasm",
  "calibre_utils",
  "chrono",
  "clap",

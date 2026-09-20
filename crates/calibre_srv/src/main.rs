@@ -49,6 +49,9 @@ struct Cli {
     /// Path to a real Piper .onnx voice model (its sibling .json config is used automatically) -- enables the reader's "Read aloud" TTS feature (issue #756) when set
     #[arg(long)]
     tts_voice: Option<PathBuf>,
+    /// Directory of installed third-party WASM plugins (issue #800). Unset means no plugins are loaded, which is the default.
+    #[arg(long)]
+    plugin_dir: Option<PathBuf>,
     #[command(flatten)]
     opts: ServerOptions,
 }
@@ -138,6 +141,17 @@ async fn main() -> anyhow::Result<()> {
     let tweak_sessions = Arc::new(calibre_srv::tweak::TweakSessionRegistry::new());
     let news_schedules = Arc::new(calibre_srv::news_scheduler::NewsScheduleStore::new(&cli.library_path.join("news-schedules.sqlite"))?);
     let tts_voice = cli.tts_voice.clone().map(|p| Arc::new(calibre_srv::tts::TtsVoiceConfig::from_model_path(p)));
+    // A plugin directory that cannot be opened is fatal rather than
+    // silently ignored: the user explicitly asked for plugins, and
+    // starting without them would look like the plugins simply did
+    // nothing.
+    let plugin_store = match cli.plugin_dir.clone() {
+        Some(dir) => Some(Arc::new(calibre_plugins_wasm::PluginStore::open(dir).unwrap_or_else(|e| {
+            eprintln!("error: could not open --plugin-dir: {e}");
+            std::process::exit(1);
+        }))),
+        None => None,
+    };
     let state = AppState {
         libraries: None,
         cache: Arc::new(cache),
@@ -153,6 +167,7 @@ async fn main() -> anyhow::Result<()> {
         tweak_sessions,
         news_schedules,
         tts_voice,
+        plugin_store,
     };
 
     // Real background scheduler for #764's own recurring news
