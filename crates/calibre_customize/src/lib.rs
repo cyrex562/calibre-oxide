@@ -79,5 +79,6 @@ pub trait FileTypePlugin: Plugin {
 pub mod builtins;
 pub mod conversion;
 pub mod profiles;
+pub mod registry;
 pub mod ui;
 pub mod zipplugin;

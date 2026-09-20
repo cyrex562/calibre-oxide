@@ -1,3 +1,4 @@
+use crate::registry::PluginRegistry;
 use crate::FileTypePlugin;
 use std::path::{Path, PathBuf};
 
@@ -22,9 +23,43 @@ pub fn run_plugins_on_import(path_to_file: &Path, plugins: &[Box<dyn FileTypePlu
     run_filetype_plugins(path_to_file, plugins, |p| p.on_import())
 }
 
+/// Registry-backed counterpart of [`run_plugins_on_import`] (issue
+/// #795): resolves the plugins to run from a [`PluginRegistry`] instead
+/// of requiring the caller to assemble its own slice.
+///
+/// This is the form that matches what upstream actually does -- its
+/// `run_plugins_on_import(path, ft)` takes no plugin list at all,
+/// because it scans the global `_initialized_plugins`. The
+/// slice-taking [`run_plugins_on_import`] is kept alongside it: it is
+/// still the right entry point for a caller that has a specific,
+/// already-known set of plugins (and is what
+/// `calibre_ebooks::metadata::worker::run_import_plugins` passes
+/// through today).
+///
+/// Only *enabled* plugins run -- [`PluginRegistry::file_type_plugins`]
+/// filters disabled ones out, in descending priority order.
+pub fn run_plugins_on_import_from_registry(path_to_file: &Path, registry: &PluginRegistry) -> PathBuf {
+    let plugins = registry.file_type_plugins();
+    let refs: Vec<&dyn FileTypePlugin> = plugins.iter().map(|p| p.as_ref()).collect();
+    run_filetype_plugin_refs(path_to_file, &refs, |p| p.on_import())
+}
+
 fn run_filetype_plugins(
     path_to_file: &Path,
     plugins: &[Box<dyn FileTypePlugin>],
+    occasion: impl Fn(&dyn FileTypePlugin) -> bool,
+) -> PathBuf {
+    let refs: Vec<&dyn FileTypePlugin> = plugins.iter().map(|p| p.as_ref()).collect();
+    run_filetype_plugin_refs(path_to_file, &refs, occasion)
+}
+
+/// The single real implementation, shared by the slice-taking and
+/// registry-backed entry points above so the extension/occasion
+/// filtering, ordering and panic-isolation behavior can't drift between
+/// them.
+fn run_filetype_plugin_refs(
+    path_to_file: &Path,
+    plugins: &[&dyn FileTypePlugin],
     occasion: impl Fn(&dyn FileTypePlugin) -> bool,
 ) -> PathBuf {
     let ext = path_to_file
@@ -35,7 +70,8 @@ fn run_filetype_plugins(
 
     let mut nfp = path_to_file.to_path_buf();
     for plugin in plugins {
-        if !occasion(plugin.as_ref()) {
+        let plugin = *plugin;
+        if !occasion(plugin) {
             continue;
         }
         let types = plugin.file_types();
@@ -251,5 +287,88 @@ mod tests {
         let plugins: Vec<Box<dyn FileTypePlugin>> = vec![Box::new(WildcardRename)];
         let out = run_plugins_on_import(&src, &plugins);
         assert_eq!(out, src.with_extension("wild"));
+    }
+}
+
+#[cfg(test)]
+mod registry_backed_tests {
+    use super::*;
+    use crate::registry::{PluginRegistry, RegisteredPlugin};
+    use crate::Plugin;
+    use std::sync::Arc;
+
+    /// Appends its own marker to the file stem, so the order plugins ran
+    /// in is directly readable off the resulting path.
+    struct Tagger {
+        name: String,
+        tag: String,
+        enabled_for_import: bool,
+        priority: u64,
+    }
+
+    impl Plugin for Tagger {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn priority(&self) -> u64 {
+            self.priority
+        }
+    }
+
+    impl FileTypePlugin for Tagger {
+        fn file_types(&self) -> Vec<String> {
+            vec!["txt".to_string()]
+        }
+        fn on_import(&self) -> bool {
+            self.enabled_for_import
+        }
+        fn run(&self, path: &Path) -> PathBuf {
+            let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+            path.with_file_name(format!("{stem}{}.txt", self.tag))
+        }
+    }
+
+    fn tagger(name: &str, tag: &str, priority: u64) -> RegisteredPlugin {
+        RegisteredPlugin::FileType(Arc::new(Tagger { name: name.to_string(), tag: tag.to_string(), enabled_for_import: true, priority }))
+    }
+
+    #[test]
+    fn plugins_resolved_from_the_registry_actually_run() {
+        let mut registry = PluginRegistry::new();
+        registry.register(tagger("a", "-A", 1)).unwrap();
+
+        let out = run_plugins_on_import_from_registry(Path::new("/tmp/book.txt"), &registry);
+        assert_eq!(out, Path::new("/tmp/book-A.txt"));
+    }
+
+    #[test]
+    fn registry_plugins_run_in_descending_priority_order() {
+        let mut registry = PluginRegistry::new();
+        // Registered low-priority first, so a result of "-HIGH-LOW"
+        // proves the registry's priority ordering drove execution, not
+        // registration order.
+        registry.register(tagger("low", "-LOW", 1)).unwrap();
+        registry.register(tagger("high", "-HIGH", 100)).unwrap();
+
+        let out = run_plugins_on_import_from_registry(Path::new("/tmp/book.txt"), &registry);
+        assert_eq!(out, Path::new("/tmp/book-HIGH-LOW.txt"));
+    }
+
+    #[test]
+    fn a_disabled_registry_plugin_does_not_run() {
+        let mut registry = PluginRegistry::new();
+        registry.register(tagger("on", "-ON", 10)).unwrap();
+        registry.register(tagger("off", "-OFF", 5)).unwrap();
+        registry.set_enabled("off", false).unwrap();
+
+        let out = run_plugins_on_import_from_registry(Path::new("/tmp/book.txt"), &registry);
+        assert_eq!(out, Path::new("/tmp/book-ON.txt"), "the disabled plugin must not have contributed its tag");
+    }
+
+    #[test]
+    fn an_empty_registry_leaves_the_path_untouched() {
+        let registry = PluginRegistry::new();
+        let path = Path::new("/tmp/book.txt");
+        assert_eq!(run_plugins_on_import_from_registry(path, &registry), path);
     }
 }

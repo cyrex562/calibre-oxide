@@ -33,6 +33,7 @@ pub mod opf_writer;
 pub mod output;
 pub mod pdb;
 pub mod pdf;
+pub mod plugins;
 pub mod pml;
 pub mod rb;
 pub mod readability;
