@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# Rebuilds probe_plugin.wasm. Requires: rustup target add wasm32-unknown-unknown
+# Rebuilds the checked-in .wasm fixtures.
+# Requires: rustup target add wasm32-unknown-unknown
 set -euo pipefail
-cd "$(dirname "$0")/probe_plugin"
-cargo build --release --target wasm32-unknown-unknown
-cp target/wasm32-unknown-unknown/release/probe_plugin.wasm ../probe_plugin.wasm
-echo "wrote $(cd .. && pwd)/probe_plugin.wasm"
+cd "$(dirname "$0")"
+for p in probe_plugin banner_plugin; do
+  (cd "$p" && cargo build --release --target wasm32-unknown-unknown)
+  cp "$p/target/wasm32-unknown-unknown/release/$p.wasm" "./$p.wasm"
+  echo "wrote $(pwd)/$p.wasm"
+done

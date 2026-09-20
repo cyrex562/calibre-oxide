@@ -1,0 +1,18 @@
+[package]
+name = "banner_plugin"
+version = "2.1.0"
+edition = "2021"
+
+# Not a workspace member: targets wasm32-unknown-unknown, built by ../build.sh.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+extism-pdk = "1.4"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
