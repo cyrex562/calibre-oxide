@@ -97,11 +97,22 @@ fn readable_formats() -> &'static [String] {
     })
 }
 
-/// Formats `Plumber::write_output` can actually produce, matching its
-/// own real dispatch table exactly (issue #476's own research) --
-/// AZW3 is a real, disclosed gap (no dedicated AZW3 output plugin
-/// exists anywhere in this crate yet, only AZW3 *input*).
-const WRITABLE_FORMATS: &[&str] = &["EPUB", "DOCX", "MOBI", "AZW", "PRC", "RB", "LIT", "TXT", "SNB", "RTF", "PDF", "LRF", "OEB", "PDB", "ODT", "TCR"];
+/// Formats `Plumber::write_output` can actually produce -- **derived
+/// from the real output-plugin registry** (issue #797) rather than
+/// hand-transcribed.
+///
+/// The previous hardcoded const had genuinely drifted: it omitted
+/// `MD`/`MARKDOWN`/`TEXT`, which `write_output` really did dispatch
+/// (they share `TXTOutput`). Deriving the list fixes that, so those
+/// three are now offered as conversion targets where they previously
+/// were not. AZW3 remains a real, disclosed gap -- no AZW3 *output*
+/// plugin exists anywhere in this crate, only AZW3 input.
+fn writable_formats() -> &'static [String] {
+    static FORMATS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    FORMATS.get_or_init(|| {
+        calibre_ebooks::conversion::output_plugin::supported_output_extensions_uppercase(calibre_ebooks::conversion::output_plugin::builtin_output_registry())
+    })
+}
 
 #[derive(Clone)]
 struct ConversionJobMeta {
@@ -235,7 +246,7 @@ pub async fn start_conversion(State(state): State<AppState>, AxumPath(book_id): 
     if !readable_formats().iter().any(|f| f == &input_fmt_upper) {
         return Err(ServerError::BadRequest(format!("Unsupported input format: {}", body.input_fmt)));
     }
-    if !WRITABLE_FORMATS.contains(&output_fmt_upper.as_str()) {
+    if !writable_formats().iter().any(|f| f == &output_fmt_upper) {
         return Err(ServerError::BadRequest(format!("Unsupported output format: {}", body.output_fmt)));
     }
 
@@ -335,7 +346,7 @@ pub async fn conversion_book_data(State(state): State<AppState>, AxumPath(book_i
         }
     }
 
-    let writable: Vec<String> = WRITABLE_FORMATS.iter().map(|s| s.to_string()).collect();
+    let writable: Vec<String> = writable_formats().to_vec();
     let output_formats = calibre_conversion::config::get_sorted_output_formats(query.get("output_fmt").map(String::as_str), &writable, None);
 
     Ok(Json(json!({
@@ -472,6 +483,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_real_conversion_to_a_newly_offered_md_target_actually_produces_a_file() {
+        // #797 added MD/MARKDOWN/TEXT to the offered output formats,
+        // because `write_output` really does dispatch them (they share
+        // TXTOutput) while the old hand-maintained const omitted them.
+        // Offering a format the server cannot actually produce would be
+        // worse than omitting it, so this converts for real rather than
+        // only asserting the format appears in a list.
+        let (_dir, router, book_id) = test_app();
+        let (status, job_id) = post_json(&router, &format!("/conversion/start/{book_id}"), serde_json::json!({"input_fmt": "epub", "output_fmt": "md"})).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let result = poll_until_done(&router, job_id.as_i64().unwrap()).await;
+        assert_eq!(result["ok"], true, "MD conversion failed: {result}");
+        assert_eq!(result["fmt"], "md");
+        assert!(result["size"].as_u64().unwrap() > 0, "MD conversion produced an empty file: {result}");
+
+        let (_status, data) = get_json(&router, &format!("/conversion/book-data/{book_id}")).await;
+        let formats: Vec<String> = data["input_formats"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        assert!(formats.contains(&"MD".to_string()), "converted MD format should now be listed: {formats:?}");
+    }
+
+    #[tokio::test]
     async fn a_real_option_override_is_actually_applied_not_just_accepted() {
         // Real regression test for #755: `unsmarten_punctuation` should
         // replace the smart/curly right-single-quote (U+2019) in the
@@ -569,6 +602,14 @@ mod tests {
         let outputs = data["output_formats"].as_array().unwrap();
         assert!(outputs.iter().any(|v| v == "EPUB"));
         assert!(outputs.iter().any(|v| v == "MOBI"));
+        // #797: the output list is now derived from the real output
+        // plugin registry. MD/MARKDOWN/TEXT are genuinely dispatched by
+        // `write_output` (they share TXTOutput) but the old
+        // hand-maintained const omitted them, so they were never
+        // offered. Assert they are, so the fix can't silently regress.
+        for newly_offered in ["MD", "MARKDOWN", "TEXT"] {
+            assert!(outputs.iter().any(|v| v == newly_offered), "{newly_offered} should now be offered as a conversion target");
+        }
     }
 
     #[tokio::test]
