@@ -580,4 +580,40 @@ mod write_output_threads_opts_tests {
         const UNCOMPRESSED: u16 = 1;
         assert_eq!(compression, UNCOMPRESSED, "Plumber's own opts.mobi.dont_compress should have really reached MOBIOutput::convert, not a default MobiWriterOpts");
     }
+
+    /// EPUB -> EPUB through the real `Plumber::run`, against a real,
+    /// non-synthetic EPUB (calibre's own shipped Quick Start Guide,
+    /// `old_src/resources/quick_start/eng.epub` -- 20 entries, a real
+    /// OPF, NCX, cover image and 15 content documents), rather than the
+    /// small hand-written HTML the other tests in this module build.
+    ///
+    /// Ported here from `calibre_conversion/tests/{pipeline,identity_conversion}_test.rs`
+    /// (issue #794). Those tested the separate trait-based conversion
+    /// engine deleted under #476 and had not compiled since; the files
+    /// are gone, but this assertion -- "a real-world EPUB survives a
+    /// round trip with its metadata and EPUB structure intact" -- was
+    /// genuinely not covered anywhere against the *real* pipeline, so it
+    /// moves here instead of being dropped with them.
+    #[test]
+    fn a_real_world_epub_survives_an_epub_to_epub_round_trip() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../old_src/resources/quick_start/eng.epub");
+        assert!(fixture.exists(), "real EPUB fixture missing at {}", fixture.display());
+
+        let out_dir = tempdir().unwrap();
+        let out_path = out_dir.path().join("round-tripped.epub");
+        Plumber::new(&fixture, &out_path).run().unwrap();
+
+        assert!(out_path.exists(), "no output EPUB was produced");
+        let mut archive = zip::ZipArchive::new(fs::File::open(&out_path).unwrap()).unwrap();
+
+        // Real EPUB container structure, not just "a zip exists".
+        assert!(archive.by_name("META-INF/container.xml").is_ok(), "output is missing META-INF/container.xml");
+
+        let names: Vec<String> = archive.file_names().map(str::to_string).collect();
+        let opf_name = names.iter().find(|n| n.ends_with(".opf")).unwrap_or_else(|| panic!("output has no OPF at all, entries: {names:?}")).clone();
+
+        let mut opf = String::new();
+        std::io::Read::read_to_string(&mut archive.by_name(&opf_name).unwrap(), &mut opf).unwrap();
+        assert!(opf.contains("Quick Start Guide"), "the real title did not survive the round trip; OPF was:\n{opf}");
+    }
 }
