@@ -81,4 +81,5 @@ pub mod conversion;
 pub mod profiles;
 pub mod registry;
 pub mod ui;
+/// See the module's own doc: superseded by `calibre_plugins_wasm` (#798).
 pub mod zipplugin;

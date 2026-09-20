@@ -1,0 +1,18 @@
+[package]
+name = "calibre_plugins_wasm"
+version = "0.1.0"
+edition = "2024"
+description = "WASM plugin host for calibre-oxide (issue #798) -- sandboxed, capability-restricted third-party plugins."
+
+[dependencies]
+calibre_customize = { path = "../calibre_customize" }
+extism = "1.30"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+anyhow = "1.0"
+zip = "0.6"
+
+[dev-dependencies]
+tempfile = "3.10"
+zip = "0.6"

@@ -1,0 +1,4 @@
+# Build artifacts for the out-of-band wasm fixture build (see ../build.sh).
+# Only the resulting ../probe_plugin.wasm is checked in.
+/target
+/Cargo.lock
