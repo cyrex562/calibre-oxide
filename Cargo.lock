@@ -976,6 +976,7 @@ dependencies = [
  "axum",
  "base64 0.21.7",
  "calibre_conversion",
+ "calibre_customize",
  "calibre_db",
  "calibre_ebooks",
  "calibre_plugins_wasm",

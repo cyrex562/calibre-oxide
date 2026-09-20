@@ -188,6 +188,7 @@ pub mod news;
 pub mod news_scheduler;
 pub mod notes;
 pub mod opds;
+pub mod plugins;
 pub mod opml;
 pub mod opts;
 pub mod reader_profiles;
@@ -258,6 +259,10 @@ pub struct AppState {
     /// server without one behaves exactly as it did before plugins
     /// existed.
     pub plugin_store: Option<Arc<calibre_plugins_wasm::PluginStore>>,
+    /// In-process registry backing the plugin management UI's
+    /// enable/disable (issue #801). Deliberately not persisted -- see
+    /// [`crate::plugins`]'s own doc.
+    pub plugin_registry: Arc<std::sync::Mutex<calibre_customize::registry::PluginRegistry>>,
 }
 
 impl AppState {
@@ -320,6 +325,11 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/news/schedules/run-now/{id}", post(news_scheduler::run_schedule_now))
         .route("/tts/synthesize", post(tts::synthesize))
         .route("/metadata/search", post(metadata_search::search))
+        .route("/plugins/list", get(plugins::list))
+        .route("/plugins/inspect", post(plugins::inspect))
+        .route("/plugins/install", post(plugins::install))
+        .route("/plugins/remove/{name}", post(plugins::remove))
+        .route("/plugins/set-enabled/{name}", post(plugins::set_enabled))
         .route("/metadata/cover-proxy", get(metadata_search::cover_proxy))
         .route("/library/export/{library_id}", get(library_export::export))
         .route("/share/email", post(share::share_email))
@@ -448,7 +458,7 @@ mod tests {
             jobs: std::sync::Arc::new(jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
             render_jobs: std::sync::Arc::new(render_endpoints::RenderJobRegistry::new()),
             conversion_jobs: std::sync::Arc::new(convert::ConversionJobRegistry::new()),
-            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()), tts_voice: None, plugin_store: None,
+            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()), tts_voice: None, plugin_store: None, plugin_registry: std::sync::Arc::new(std::sync::Mutex::new(calibre_customize::registry::PluginRegistry::new())),
         }
     }
 
@@ -474,7 +484,7 @@ mod tests {
             jobs: std::sync::Arc::new(jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
             render_jobs: std::sync::Arc::new(render_endpoints::RenderJobRegistry::new()),
             conversion_jobs: std::sync::Arc::new(convert::ConversionJobRegistry::new()),
-            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()), tts_voice: None, plugin_store: None,
+            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()), tts_voice: None, plugin_store: None, plugin_registry: std::sync::Arc::new(std::sync::Mutex::new(calibre_customize::registry::PluginRegistry::new())),
         };
         let router = test_router(state);
         let (status, _) = get(&router, "/opds").await;
@@ -536,7 +546,7 @@ mod tests {
             jobs: std::sync::Arc::new(jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
             render_jobs: std::sync::Arc::new(render_endpoints::RenderJobRegistry::new()),
             conversion_jobs: std::sync::Arc::new(convert::ConversionJobRegistry::new()),
-            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()), tts_voice: None, plugin_store: None,
+            news_jobs: std::sync::Arc::new(news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()), tts_voice: None, plugin_store: None, plugin_registry: std::sync::Arc::new(std::sync::Mutex::new(calibre_customize::registry::PluginRegistry::new())),
         };
         let router = test_router(state);
 

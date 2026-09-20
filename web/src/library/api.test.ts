@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { addBook, addFormat, addNewsSchedule, blobToDataUrl, catalogDownloadUrl, checkLibrary, coverProxyUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchCoverProxyBlob, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeDataFile, removeFormat, removeNewsSchedule, renameCategoryItem, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, searchMetadataOnline, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
+import { addBook, addFormat, addNewsSchedule, blobToDataUrl, inspectPlugin, installPlugin, listPlugins, removePlugin, setPluginEnabled, catalogDownloadUrl, checkLibrary, coverProxyUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchCoverProxyBlob, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeDataFile, removeFormat, removeNewsSchedule, renameCategoryItem, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, searchMetadataOnline, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
 import type { BookSummary } from "./types";
 
 function bookStub(id: number): BookSummary {
@@ -653,5 +653,84 @@ describe("metadata search (#750/#788)", () => {
     const blob = new Blob(["hello"], { type: "text/plain" });
     const dataUrl = await blobToDataUrl(blob);
     expect(dataUrl.startsWith("data:text/plain")).toBe(true);
+  });
+});
+
+describe("plugin management (#801)", () => {
+  const plugin = {
+    name: "Banner Plugin",
+    version: "2.1.0",
+    author: "A Third Party",
+    description: "stamps a banner",
+    plugin_type: "file_type",
+    file_types: ["txt"],
+    enabled: true,
+    capabilities: { allowed_hosts: [], allowed_paths: {}, fully_sandboxed: true },
+    limits: { timeout_ms: 5000, max_pages: 1024 },
+  };
+
+  it("listPlugins returns the installed plugins with their capabilities", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => ({ plugins: [plugin] }) }));
+
+    const { plugins } = await listPlugins();
+
+    expect(plugins).toHaveLength(1);
+    expect(plugins[0].name).toBe("Banner Plugin");
+    expect(plugins[0].capabilities.fully_sandboxed).toBe(true);
+  });
+
+  it("inspectPlugin posts the path and surfaces requested capabilities without installing", async () => {
+    const wantsNetwork = { ...plugin, capabilities: { allowed_hosts: ["example.com"], allowed_paths: {}, fully_sandboxed: false } };
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => wantsNetwork });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const inspected = await inspectPlugin("/tmp/p.zip");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/plugins/inspect",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ path: "/tmp/p.zip" }) }),
+    );
+    expect(inspected.capabilities.fully_sandboxed).toBe(false);
+    expect(inspected.capabilities.allowed_hosts).toEqual(["example.com"]);
+  });
+
+  it("installPlugin posts the path to the real install route", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => plugin });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await installPlugin("/tmp/p.zip");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/plugins/install",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ path: "/tmp/p.zip" }) }),
+    );
+  });
+
+  it("removePlugin url-encodes a name containing a space", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await removePlugin("Banner Plugin");
+
+    expect(fetchMock).toHaveBeenCalledWith("/plugins/remove/Banner%20Plugin", { method: "POST" });
+  });
+
+  it("setPluginEnabled posts the desired state", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ ok: true, enabled: false }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await setPluginEnabled("Banner Plugin", false);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/plugins/set-enabled/Banner%20Plugin",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ enabled: false }) }),
+    );
+    expect(result.enabled).toBe(false);
+  });
+
+  it("a refused disable surfaces the server's reason rather than failing silently", async () => {
+    // The server refuses when a plugin declares can_be_disabled = false.
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 400, statusText: "Bad Request" }));
+    await expect(setPluginEnabled("Essential", false)).rejects.toThrow("400");
   });
 });

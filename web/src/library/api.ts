@@ -581,3 +581,62 @@ export function blobToDataUrl(blob: Blob): Promise<string> {
     reader.readAsDataURL(blob);
   });
 }
+
+// Plugin management (#801, closing the #754 epic). See
+// crates/calibre_srv/src/plugins.rs.
+//
+// `capabilities` is the security-relevant part: a plugin runs in a
+// WASM sandbox with no filesystem and no network unless its own
+// manifest declares them, so the UI shows exactly what a plugin is
+// asking for -- before install, via `inspectPlugin`.
+export interface PluginCapabilities {
+  allowed_hosts: string[];
+  allowed_paths: Record<string, string>;
+  fully_sandboxed: boolean;
+}
+
+export interface InstalledPlugin {
+  name: string;
+  version: string;
+  author: string;
+  description: string;
+  plugin_type: string;
+  file_types: string[];
+  enabled: boolean;
+  capabilities: PluginCapabilities;
+  limits: { timeout_ms: number; max_pages: number };
+}
+
+export function listPlugins(): Promise<{ plugins: InstalledPlugin[] }> {
+  return jsonFetch<{ plugins: InstalledPlugin[] }>("/plugins/list");
+}
+
+// Reads a package's manifest WITHOUT installing it, so the user can
+// see what it wants before granting it.
+export function inspectPlugin(path: string): Promise<InstalledPlugin> {
+  return jsonFetch<InstalledPlugin>("/plugins/inspect", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+}
+
+export function installPlugin(path: string): Promise<InstalledPlugin> {
+  return jsonFetch<InstalledPlugin>("/plugins/install", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+}
+
+export function removePlugin(name: string): Promise<void> {
+  return postNoBody(`/plugins/remove/${encodeURIComponent(name)}`);
+}
+
+export function setPluginEnabled(name: string, enabled: boolean): Promise<{ ok: boolean; enabled: boolean }> {
+  return jsonFetch<{ ok: boolean; enabled: boolean }>(`/plugins/set-enabled/${encodeURIComponent(name)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled }),
+  });
+}

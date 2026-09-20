@@ -412,7 +412,7 @@ mod tests {
             news_jobs: std::sync::Arc::new(crate::news::NewsJobRegistry::new()),
             tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()),
             news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()),
-            tts_voice: None, plugin_store: None,
+            tts_voice: None, plugin_store: None, plugin_registry: std::sync::Arc::new(std::sync::Mutex::new(calibre_customize::registry::PluginRegistry::new())),
         };
         let router = crate::test_router(state);
         (dir, router)
