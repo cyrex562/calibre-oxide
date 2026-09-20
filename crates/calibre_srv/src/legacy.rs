@@ -429,7 +429,7 @@ mod tests {
             book_cache: Arc::new(crate::books_cache::BookCache::open_temp()),
             jobs: Arc::new(crate::jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
             render_jobs: Arc::new(crate::render_endpoints::RenderJobRegistry::new()),
-            conversion_jobs: Arc::new(crate::convert::ConversionJobRegistry::new()), news_jobs: Arc::new(crate::news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()), tts_voice: None,
+            conversion_jobs: Arc::new(crate::convert::ConversionJobRegistry::new()), news_jobs: Arc::new(crate::news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()), tts_voice: None, plugin_store: None,
         };
         let router = crate::test_router(state.clone());
         (dir, state, router)

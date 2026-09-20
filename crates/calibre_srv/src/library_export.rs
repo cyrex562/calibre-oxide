@@ -117,7 +117,7 @@ mod tests {
             news_jobs: std::sync::Arc::new(crate::news::NewsJobRegistry::new()),
             tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()),
             news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()),
-            tts_voice: None,
+            tts_voice: None, plugin_store: None,
         };
         let router = crate::test_router(state);
         (dir, router, book_id)
@@ -176,7 +176,7 @@ mod tests {
             news_jobs: std::sync::Arc::new(crate::news::NewsJobRegistry::new()),
             tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()),
             news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()),
-            tts_voice: None,
+            tts_voice: None, plugin_store: None,
         };
         let router = crate::test_router(state);
         (src_dir, dest_dir, broker, router)

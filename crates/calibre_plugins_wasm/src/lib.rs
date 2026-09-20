@@ -27,10 +27,40 @@
 
 pub mod file_type;
 pub mod host;
+pub mod metadata_source;
 pub mod manifest;
 pub mod store;
 
 pub use host::{LoadedPlugin, PluginPackage, WasmPluginError};
 pub use manifest::{Capabilities, Limits, Manifest, PluginType, ABI_VERSION};
 pub use file_type::WasmFileTypePlugin;
+pub use metadata_source::WasmMetadataSource;
 pub use store::{PluginStore, StoreError};
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static ALLOW_LOOPBACK: AtomicBool = AtomicBool::new(false);
+
+/// Permits loopback for this crate's own integration tests, which bind
+/// a real local HTTP server as a fixture.
+///
+/// This is a runtime opt-in rather than a `#[cfg(test)]` for a real
+/// reason: `cfg(test)` is **not** set for a library when its
+/// *integration* tests (`tests/*.rs`) compile, so a `cfg(test)` here
+/// would silently fail to apply exactly where it is needed. Making it
+/// an explicit call also keeps the weakening visible at the call site.
+///
+/// Never call this from shipped code.
+pub fn allow_loopback_for_tests() {
+    ALLOW_LOOPBACK.store(true, Ordering::Relaxed);
+}
+
+/// The SSRF policy the plugin HTTP host function applies: the shared
+/// strict policy from `calibre_utils`, plus this crate's test-only
+/// loopback allowance.
+pub(crate) fn loopback_aware_disallowed_ip(ip: std::net::IpAddr) -> bool {
+    if ALLOW_LOOPBACK.load(Ordering::Relaxed) && ip.is_loopback() {
+        return false;
+    }
+    calibre_utils::net_guard::is_disallowed_ip(ip)
+}
