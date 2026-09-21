@@ -181,6 +181,7 @@ pub mod legacy;
 pub mod library_broker;
 pub mod library_export;
 pub mod lists;
+pub mod annotations_browse;
 pub mod mapper;
 pub mod mathjax;
 pub mod metadata_search;
@@ -325,6 +326,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/news/schedules/remove/{id}", post(news_scheduler::remove_schedule))
         .route("/news/schedules/run-now/{id}", post(news_scheduler::run_schedule_now))
         .route("/tts/synthesize", post(tts::synthesize))
+        .route("/annotations/all", get(annotations_browse::all))
         .route("/mapper/preview", post(mapper::preview))
         .route("/mapper/preview/{library_id}", post(mapper::preview_for_library))
         .route("/mapper/apply", post(mapper::apply))
