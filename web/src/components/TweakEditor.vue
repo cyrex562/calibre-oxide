@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { onBeforeUnmount, ref } from "vue";
+import { insertAt, searchChars, type SpecialChar } from "../library/charSelect";
+import { computed, nextTick, onBeforeUnmount, ref } from "vue";
 import { commitTweakSession, discardTweakSession, fetchToc, fetchTweakFile, openTweakSession, saveToc, saveTweakFile, type TocNode } from "../library/tweak";
 import TocTreeNode from "./TocTreeNode.vue";
 
@@ -322,6 +323,31 @@ async function loadDiff() {
     diffBusy.value = false;
   }
 }
+
+// Character picker (#3.6). Typography is most of what hand-editing an
+// EPUB is for, and the characters that matter -- real quotes, real
+// dashes, non-breaking spaces -- are exactly the ones with no key on
+// the keyboard.
+const charPickerOpen = ref(false);
+const charQuery = ref("");
+const contentArea = ref<HTMLTextAreaElement | null>(null);
+
+const visibleChars = computed<SpecialChar[]>(() => searchChars(charQuery.value));
+
+function insertChar(c: SpecialChar) {
+  const area = contentArea.value;
+  // Without a focused textarea there is no cursor to insert at, so
+  // appending would silently put the character somewhere unexpected.
+  if (!area) return;
+  const { text, cursor } = insertAt(content.value, area.selectionStart, area.selectionEnd, c.char);
+  content.value = text;
+  // Restored after the DOM updates, or the browser puts the cursor
+  // back at the end of the rewritten value.
+  void nextTick(() => {
+    area.focus();
+    area.setSelectionRange(cursor, cursor);
+  });
+}
 </script>
 
 <template>
@@ -478,7 +504,22 @@ async function loadDiff() {
             </ul>
             <div class="file-content">
               <p v-if="!selectedFile" class="hint">Select a file to edit.</p>
-              <textarea v-else v-model="content" spellcheck="false"></textarea>
+              <template v-else>
+                <div class="char-bar">
+                  <button type="button" :class="{ active: charPickerOpen }" @click="charPickerOpen = !charPickerOpen">Ω Special characters</button>
+                </div>
+                <div v-if="charPickerOpen" class="char-picker">
+                  <input v-model="charQuery" type="search" placeholder="Search by name… (try &quot;nbsp&quot; or &quot;em dash&quot;)" />
+                  <p v-if="visibleChars.length === 0" class="hint">Nothing matches.</p>
+                  <div v-else class="char-grid">
+                    <button v-for="c in visibleChars" :key="c.char" type="button" :title="c.name" @click="insertChar(c)">
+                      <span class="char-glyph">{{ c.char }}</span>
+                      <span class="char-name">{{ c.name }}</span>
+                    </button>
+                  </div>
+                </div>
+                <textarea ref="contentArea" v-model="content" spellcheck="false"></textarea>
+              </template>
             </div>
           </div>
           <p v-if="fileError" class="error">{{ fileError }}</p>
@@ -788,6 +829,57 @@ h3 {
   .diff-file pre { background: #1b1e24; }
   .diff-add { background: #14301f; }
   .diff-remove { background: #3a1d1d; }
+}
+
+/* Character picker (#3.6). */
+.char-bar {
+  margin-bottom: 0.3rem;
+}
+.char-picker {
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  padding: 0.5rem;
+  margin-bottom: 0.4rem;
+}
+.char-picker input {
+  width: 100%;
+  margin-bottom: 0.4rem;
+}
+.char-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(7.5rem, 1fr));
+  gap: 0.25rem;
+  max-height: 14rem;
+  overflow-y: auto;
+}
+.char-grid button {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4rem;
+  padding: 0.2rem 0.4rem;
+  text-align: left;
+  overflow: hidden;
+}
+.char-glyph {
+  font-size: 1.1rem;
+  min-width: 1.4rem;
+  text-align: center;
+  /* An invisible character would otherwise collapse its cell, so the
+     box stays a fixed size whether or not the glyph draws anything. */
+  border: 1px dashed transparent;
+}
+.char-grid button:hover .char-glyph {
+  border-color: #bbb;
+}
+.char-name {
+  font-size: 0.74rem;
+  opacity: 0.7;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+@media (prefers-color-scheme: dark) {
+  .char-picker { border-color: #3a3d44; }
 }
 
 </style>
