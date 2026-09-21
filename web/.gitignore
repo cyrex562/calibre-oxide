@@ -6,3 +6,6 @@ dist-ssr/
 .vscode/*
 !.vscode/extensions.json
 .idea
+
+# Copied from node_modules at build time by scripts/copy-pdfjs-assets.mjs
+public/pdfjs/

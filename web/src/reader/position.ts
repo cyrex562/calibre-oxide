@@ -28,3 +28,21 @@ export function decodePosition(cfi: string | null | undefined): SimplePosition |
   if (Number.isNaN(spineIndex)) return null;
   return { spineIndex, frag: decodeURIComponent(rest.slice(sep + 1)) };
 }
+
+/**
+ * A stable per-browser id, so a reading position can be attributed to
+ * this device rather than overwriting another one's.
+ *
+ * Lives here rather than in a component because both readers -- EPUB
+ * and PDF -- need it, and two copies would drift into two different
+ * ids for the same browser.
+ */
+export function deviceId(): string {
+  const key = "calibre-oxide-device-id";
+  let id = localStorage.getItem(key);
+  if (!id) {
+    id = crypto.randomUUID();
+    localStorage.setItem(key, id);
+  }
+  return id;
+}
