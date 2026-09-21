@@ -3,14 +3,16 @@ import { computed, ref, watch } from "vue";
 import CategoryBrowser from "./CategoryBrowser.vue";
 import NoteEditor from "./NoteEditor.vue";
 import BookDetailsPanel from "./BookDetailsPanel.vue";
+import BookTable from "./BookTable.vue";
 import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
 import type { CheckLibraryResult, CustomRecipeOptions, DuplicateBook, NewsFeedInput, NewsSchedule, SaveToDiskResult } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
+import { clampWidth, columnsFor, DEFAULT_TABLE_PREFS, resolveColumns, TABLE_PREFS_PROFILE, type BookColumn, type LibraryViewMode, type TablePrefs } from "../library/columns";
 import { actionEnabled, LIBRARY_ACTIONS, visibleToolbarActions, type ActionContext, type LibraryAction, type LibraryActionId } from "../library/actions";
 import { onMenuAction, syncDesktopMenu } from "../library/desktopMenu";
 import { isTauri, tauriInvoke } from "../tauri";
-import { DEFAULT_LIBRARY_PREFS, DEFAULT_TOOLBAR_PREFS, fetchProfile, LIBRARY_PREFS_PROFILE, TOOLBAR_PREFS_PROFILE, type LibraryPrefs, type ToolbarActionId, type ToolbarPrefs } from "../settings/api";
-import type { BookFieldChanges, BookSummary, CustomColumnInfo, FtsSnippet } from "../library/types";
+import { DEFAULT_LIBRARY_PREFS, DEFAULT_TOOLBAR_PREFS, fetchProfile, LIBRARY_PREFS_PROFILE, saveProfile, TOOLBAR_PREFS_PROFILE, type LibraryPrefs, type ToolbarActionId, type ToolbarPrefs } from "../settings/api";
+import type { BookFieldChanges, BookSummary, CustomColumnInfo, FieldMetaEntry, FtsSnippet } from "../library/types";
 
 // Real, persisted default (issue #721) -- overwritten by
 // loadLibraryPrefs() below once its fetch resolves; starts at the
@@ -27,6 +29,7 @@ const vl = ref("");
 const offset = ref(0);
 
 const sortableFields = ref<[string, string][]>([]);
+const fieldMetadata = ref<Record<string, FieldMetaEntry>>({});
 const virtualLibraries = ref<Record<string, string>>({});
 const savedSearches = ref<Record<string, string>>({});
 
@@ -76,6 +79,7 @@ async function loadMetadata() {
   try {
     const [fm, vls, searches] = await Promise.all([fetchFieldMetadata(), fetchVirtualLibraries(), fetchSavedSearches()]);
     sortableFields.value = fm.sortable_fields;
+    fieldMetadata.value = fm.field_metadata;
     virtualLibraries.value = vls;
     savedSearches.value = searches;
   } catch (e) {
@@ -117,6 +121,89 @@ async function loadToolbarPrefs() {
   }
 }
 void loadToolbarPrefs();
+
+// ---------------------------------------------------------------
+// Table view (issue 1.1)
+// ---------------------------------------------------------------
+//
+// The table is the default view: this tool is aimed at PDF
+// collections, where covers are usually blank or identical and the
+// cover grid degrades into a wall of grey rectangles. The grid stays
+// one click away for libraries where covers do carry information.
+//
+// Column *decisions* -- what a cell shows, which columns exist, what a
+// header click means -- all live in library/columns.ts as pure
+// functions, so they are tested directly rather than through a mount.
+
+const tablePrefs = ref<TablePrefs>({ ...DEFAULT_TABLE_PREFS });
+
+async function loadTablePrefs() {
+  try {
+    const prefs = await fetchProfile<TablePrefs>(TABLE_PREFS_PROFILE);
+    if (prefs) tablePrefs.value = { ...DEFAULT_TABLE_PREFS, ...prefs };
+  } catch (e) {
+    console.error("failed to load table preferences", e);
+  }
+}
+void loadTablePrefs();
+
+async function saveTablePrefs() {
+  try {
+    await saveProfile(TABLE_PREFS_PROFILE, { ...tablePrefs.value });
+  } catch (e) {
+    console.error("failed to save table preferences", e);
+  }
+}
+
+const viewMode = computed<LibraryViewMode>(() => tablePrefs.value.view);
+
+/** Every column this library could show, including its custom ones. */
+const availableColumns = computed<BookColumn[]>(() => columnsFor(fieldMetadata.value, sortableFields.value));
+
+/** The columns actually rendered, with saved widths applied. */
+const visibleColumns = computed<BookColumn[]>(() => resolveColumns(availableColumns.value, tablePrefs.value));
+
+function setViewMode(mode: LibraryViewMode) {
+  tablePrefs.value = { ...tablePrefs.value, view: mode };
+  void saveTablePrefs();
+}
+
+function onTableSort(next: { sort: string; order: "asc" | "desc" }) {
+  sort.value = next.sort;
+  sortOrder.value = next.order;
+  offset.value = 0;
+  void runSearch();
+}
+
+// Resizing fires continuously during a drag, so the width is applied
+// live but only persisted once the pointer settles -- otherwise a
+// single drag would POST a preferences blob per animation frame.
+let widthSaveTimer: ReturnType<typeof setTimeout> | undefined;
+
+function onColumnResize(next: { key: string; width: number }) {
+  tablePrefs.value = { ...tablePrefs.value, widths: { ...tablePrefs.value.widths, [next.key]: clampWidth(next.width) } };
+  clearTimeout(widthSaveTimer);
+  widthSaveTimer = setTimeout(() => void saveTablePrefs(), 400);
+}
+
+const columnPickerOpen = ref(false);
+
+function toggleColumn(key: string) {
+  const current = tablePrefs.value.columns;
+  const next = current.includes(key) ? current.filter((k) => k !== key) : [...current, key];
+  tablePrefs.value = { ...tablePrefs.value, columns: next };
+  void saveTablePrefs();
+}
+
+function moveColumn(key: string, delta: number) {
+  const current = [...tablePrefs.value.columns];
+  const from = current.indexOf(key);
+  const to = from + delta;
+  if (from === -1 || to < 0 || to >= current.length) return;
+  [current[from], current[to]] = [current[to], current[from]];
+  tablePrefs.value = { ...tablePrefs.value, columns: current };
+  void saveTablePrefs();
+}
 
 function toolbarActionOrder(id: ToolbarActionId): number | undefined {
   const i = toolbarPrefs.value.order.indexOf(id);
@@ -1062,6 +1149,11 @@ onMenuAction(runAction);
           <option value="" disabled selected>Saved searches…</option>
           <option v-for="[name, q] in Object.entries(savedSearches)" :key="name" :value="q">{{ name }}</option>
         </select>
+        <div class="view-toggle" role="group" aria-label="Library view">
+          <button type="button" :class="{ active: viewMode === 'table' }" :aria-pressed="viewMode === 'table'" @click="setViewMode('table')">Table</button>
+          <button type="button" :class="{ active: viewMode === 'grid' }" :aria-pressed="viewMode === 'grid'" @click="setViewMode('grid')">Grid</button>
+        </div>
+        <button v-if="viewMode === 'table'" type="button" @click="columnPickerOpen = true">Columns…</button>
       </template>
 
       <!--
@@ -1155,7 +1247,22 @@ onMenuAction(runAction);
         <p v-else-if="loading" class="status">Loading…</p>
         <p v-else-if="books.length === 0" class="status">No books found.</p>
 
-        <div class="grid">
+        <BookTable
+          v-if="viewMode === 'table'"
+          :books="books"
+          :columns="visibleColumns"
+          :select-mode="selectMode"
+          :selected-ids="selectedIds"
+          :selected-book-id="selectedBookId"
+          :sort="sort"
+          :sort-order="sortOrder"
+          @select="selectedBookId = $event"
+          @toggle-selected="toggleSelected"
+          @sort-by="onTableSort"
+          @resize="onColumnResize"
+        />
+
+        <div v-else class="grid">
           <button v-for="book in books" :key="book.id" class="card" :class="{ selected: selectMode && selectedIds.has(book.id) }" @click="onCardClick(book.id)">
             <input v-if="selectMode" type="checkbox" class="card-checkbox" :checked="selectedIds.has(book.id)" @click.stop="toggleSelected(book.id)" />
             <img :src="`${book.thumbnail}?v=${cacheBust}`" :alt="book.title" loading="lazy" />
@@ -1212,6 +1319,27 @@ onMenuAction(runAction);
             <button type="submit">Add</button>
           </form>
         </section>
+      </div>
+    </div>
+
+    <div v-if="columnPickerOpen" class="manage-backdrop" @click.self="columnPickerOpen = false">
+      <div class="manage-panel">
+        <h3>Table columns</h3>
+        <p class="hint">Choose which columns the table shows, and their order.</p>
+        <ul class="column-list">
+          <li v-for="column in availableColumns" :key="column.key" class="column-row">
+            <label class="field checkbox">
+              <input type="checkbox" :checked="tablePrefs.columns.includes(column.key)" @change="toggleColumn(column.key)" />
+              {{ column.label }}
+              <span v-if="!column.sortKey" class="hint inline">(not sortable)</span>
+            </label>
+            <template v-if="tablePrefs.columns.includes(column.key)">
+              <button type="button" :disabled="tablePrefs.columns.indexOf(column.key) === 0" title="Move left" @click="moveColumn(column.key, -1)">←</button>
+              <button type="button" :disabled="tablePrefs.columns.indexOf(column.key) === tablePrefs.columns.length - 1" title="Move right" @click="moveColumn(column.key, 1)">→</button>
+            </template>
+          </li>
+        </ul>
+        <button type="button" @click="columnPickerOpen = false">Close</button>
       </div>
     </div>
 
@@ -1733,4 +1861,44 @@ onMenuAction(runAction);
   color: #2a7f2a;
   margin: 0.6em 0 0;
 }
+/* View toggle + column picker (issue 1.1). */
+.view-toggle {
+  display: inline-flex;
+  gap: 0;
+}
+.view-toggle button {
+  border-radius: 0;
+}
+.view-toggle button:first-child {
+  border-top-left-radius: 4px;
+  border-bottom-left-radius: 4px;
+}
+.view-toggle button:last-child {
+  border-top-right-radius: 4px;
+  border-bottom-right-radius: 4px;
+}
+.view-toggle button.active {
+  font-weight: 600;
+}
+.column-list {
+  list-style: none;
+  margin: 0 0 1rem;
+  padding: 0;
+  max-height: 55vh;
+  overflow-y: auto;
+}
+.column-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.15rem 0;
+}
+.column-row .field {
+  flex: 1;
+}
+.hint.inline {
+  font-size: 0.8em;
+  opacity: 0.7;
+}
+
 </style>
