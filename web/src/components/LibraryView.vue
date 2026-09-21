@@ -8,13 +8,14 @@ import ContextMenu from "./ContextMenu.vue";
 import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
 import type { CheckLibraryResult, CustomRecipeOptions, DuplicateBook, NewsFeedInput, NewsSchedule, SaveToDiskResult } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
+import { changesFor, isEmptySpec, REPLACEABLE_FIELDS, validateSpec, type BulkEditSpec } from "../library/bulkEdit";
 import { clampWidth, columnsFor, DEFAULT_TABLE_PREFS, resolveColumns, TABLE_PREFS_PROFILE, type BookColumn, type LibraryViewMode, type TablePrefs } from "../library/columns";
 import { actionEnabled, contextMenuEntries, LIBRARY_ACTIONS, visibleToolbarActions, type ActionContext, type LibraryAction, type LibraryActionId } from "../library/actions";
 import { onMenuAction, syncDesktopMenu } from "../library/desktopMenu";
 import { shortcutFor } from "../library/shortcuts";
 import { isTauri, tauriInvoke } from "../tauri";
 import { DEFAULT_KEYMAP, DEFAULT_LIBRARY_PREFS, DEFAULT_TOOLBAR_PREFS, fetchProfile, KEYMAP_PROFILE, libraryShortcuts, LIBRARY_PREFS_PROFILE, saveProfile, TOOLBAR_PREFS_PROFILE, type KeymapPrefs, type LibraryPrefs, type ToolbarActionId, type ToolbarPrefs } from "../settings/api";
-import type { BookFieldChanges, BookSummary, CustomColumnInfo, FieldMetaEntry, FtsSnippet } from "../library/types";
+import type { BookSummary, CustomColumnInfo, FieldMetaEntry, FtsSnippet } from "../library/types";
 
 // Real, persisted default (issue #721) -- overwritten by
 // loadLibraryPrefs() below once its fetch resolves; starts at the
@@ -703,11 +704,41 @@ const selectedIds = ref<Set<number>>(new Set());
 const bulkOpen = ref(false);
 const bulkBusy = ref(false);
 const bulkErrors = ref<string[]>([]);
-const bulkAddTags = ref("");
-const bulkRemoveTags = ref("");
-const bulkSeries = ref("");
+
+// Bulk edit (#1.6). The previous version reached add-tags,
+// remove-tags, set-series and a rating; `Cache::set_field` accepts
+// authors, publisher, languages, pubdate, comments, series_index and
+// any custom column too -- which is most of what tidying an imported
+// pile of PDFs actually needs.
+//
+// The change computation lives in library/bulkEdit.ts: deciding what
+// to write is where the bugs are, and they are invisible here until
+// the wrong thing has already been written to a hundred books.
+function emptySpec(): BulkEditSpec {
+  return {
+    tags: { mode: "add", value: "" },
+    authors: { mode: "add", value: "" },
+    languages: { mode: "add", value: "" },
+    publisher: "",
+    series: "",
+    seriesIndex: null,
+    rating: null,
+    pubdate: "",
+    comments: "",
+    custom: {},
+    searchReplace: { field: "title", find: "", replace: "", useRegex: false },
+  };
+}
+
+const bulkSpec = ref<BulkEditSpec>(emptySpec());
 const bulkApplyRating = ref(false);
 const bulkRating = ref(0);
+const bulkApplySeriesIndex = ref(false);
+const bulkSeriesIndex = ref(1);
+const bulkSummary = ref<string | null>(null);
+
+/** Custom columns offered in the bulk panel, by their row key. */
+const bulkCustomColumns = computed(() => Object.values(fieldMetadata.value).filter((f) => f.is_custom && f.label));
 
 function toggleSelectMode() {
   selectMode.value = !selectMode.value;
@@ -733,40 +764,58 @@ async function runBulkEdit() {
   const ids = [...selectedIds.value];
   if (ids.length === 0) return;
 
-  const addTags = bulkAddTags.value.split(",").map((t) => t.trim()).filter(Boolean);
-  const removeTags = bulkRemoveTags.value.split(",").map((t) => t.trim()).filter(Boolean);
-  const setSeries = bulkSeries.value.trim();
+  const spec: BulkEditSpec = {
+    ...bulkSpec.value,
+    rating: bulkApplyRating.value ? bulkRating.value : null,
+    seriesIndex: bulkApplySeriesIndex.value ? bulkSeriesIndex.value : null,
+  };
+
+  // Validate once, before touching a single book -- a bad regex
+  // found on book 57 of 200 leaves the edit half applied.
+  const problem = validateSpec(spec);
+  if (problem) {
+    bulkErrors.value = [problem];
+    return;
+  }
+  if (isEmptySpec(spec)) {
+    bulkErrors.value = ["Nothing to apply -- fill in at least one field."];
+    return;
+  }
 
   bulkBusy.value = true;
   bulkErrors.value = [];
+  bulkSummary.value = null;
+
+  let changed = 0;
+  let skipped = 0;
   for (const id of ids) {
+    const current = books.value.find((b) => b.id === id);
+    if (!current) {
+      bulkErrors.value.push(`Book ${id}: not on this page`);
+      continue;
+    }
     try {
-      const changes: BookFieldChanges = {};
-      if (addTags.length || removeTags.length) {
-        const current = books.value.find((b) => b.id === id);
-        const tags = new Set(current?.tags ?? []);
-        for (const t of addTags) tags.add(t);
-        for (const t of removeTags) tags.delete(t);
-        changes.tags = [...tags];
+      const changes = changesFor(current, spec);
+      if (!changes) {
+        skipped += 1;
+        continue;
       }
-      if (setSeries) changes.series = setSeries;
-      if (bulkApplyRating.value) changes.rating = bulkRating.value;
-      if (Object.keys(changes).length === 0) continue;
       await setFields(id, changes);
+      changed += 1;
     } catch (e) {
       bulkErrors.value.push(`Book ${id}: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
   bulkBusy.value = false;
+  bulkSummary.value = `Updated ${changed} book(s)${skipped ? `, ${skipped} already matched` : ""}${bulkErrors.value.length ? `, ${bulkErrors.value.length} failed` : ""}.`;
 
   if (bulkErrors.value.length === 0) {
     bulkOpen.value = false;
     selectMode.value = false;
     selectedIds.value = new Set();
-    bulkAddTags.value = "";
-    bulkRemoveTags.value = "";
-    bulkSeries.value = "";
+    bulkSpec.value = emptySpec();
     bulkApplyRating.value = false;
+    bulkApplySeriesIndex.value = false;
   }
   cacheBust.value++;
   await runSearch();
@@ -1294,22 +1343,83 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onLibraryKeydown));
     </header>
 
     <div v-if="bulkOpen" class="bulk-panel">
-      <div class="bulk-row">
-        <label>Add tags <input v-model="bulkAddTags" placeholder="scifi, classic" :disabled="bulkBusy" /></label>
-        <label>Remove tags <input v-model="bulkRemoveTags" placeholder="unwanted-tag" :disabled="bulkBusy" /></label>
-        <label>Set series <input v-model="bulkSeries" :disabled="bulkBusy" /></label>
-        <label class="bulk-rating">
-          <input type="checkbox" v-model="bulkApplyRating" :disabled="bulkBusy" />
-          Set rating
+      <div class="bulk-grid">
+        <label class="bulk-field">
+          <span>Tags</span>
+          <div class="bulk-combo">
+            <select v-model="bulkSpec.tags!.mode" :disabled="bulkBusy">
+              <option value="add">Add</option>
+              <option value="remove">Remove</option>
+              <option value="replace">Replace with</option>
+            </select>
+            <input v-model="bulkSpec.tags!.value" placeholder="scifi, classic" :disabled="bulkBusy" />
+          </div>
+        </label>
+
+        <label class="bulk-field">
+          <span>Authors</span>
+          <div class="bulk-combo">
+            <select v-model="bulkSpec.authors!.mode" :disabled="bulkBusy">
+              <option value="add">Add</option>
+              <option value="remove">Remove</option>
+              <option value="replace">Replace with</option>
+            </select>
+            <input v-model="bulkSpec.authors!.value" placeholder="Ann Lee, Bo Fox" :disabled="bulkBusy" />
+          </div>
+        </label>
+
+        <label class="bulk-field">
+          <span>Languages</span>
+          <div class="bulk-combo">
+            <select v-model="bulkSpec.languages!.mode" :disabled="bulkBusy">
+              <option value="add">Add</option>
+              <option value="remove">Remove</option>
+              <option value="replace">Replace with</option>
+            </select>
+            <input v-model="bulkSpec.languages!.value" placeholder="eng, fra" :disabled="bulkBusy" />
+          </div>
+        </label>
+
+        <label class="bulk-field"><span>Publisher</span><input v-model="bulkSpec.publisher" :disabled="bulkBusy" /></label>
+        <label class="bulk-field"><span>Series</span><input v-model="bulkSpec.series" :disabled="bulkBusy" /></label>
+        <label class="bulk-field"><span>Published</span><input v-model="bulkSpec.pubdate" type="date" :disabled="bulkBusy" /></label>
+        <label class="bulk-field"><span>Comments</span><input v-model="bulkSpec.comments" :disabled="bulkBusy" /></label>
+
+        <label class="bulk-field bulk-optional">
+          <span><input type="checkbox" v-model="bulkApplySeriesIndex" :disabled="bulkBusy" /> Series index</span>
+          <input type="number" v-model.number="bulkSeriesIndex" step="1" :disabled="bulkBusy || !bulkApplySeriesIndex" />
+        </label>
+
+        <label class="bulk-field bulk-optional">
+          <span><input type="checkbox" v-model="bulkApplyRating" :disabled="bulkBusy" /> Rating</span>
           <input type="number" v-model.number="bulkRating" min="0" max="5" step="1" :disabled="bulkBusy || !bulkApplyRating" />
         </label>
+
+        <label v-for="column in bulkCustomColumns" :key="column.label" class="bulk-field">
+          <span>{{ column.name || column.label }}</span>
+          <input :value="bulkSpec.custom![column.label] ?? ''" :disabled="bulkBusy" @input="bulkSpec.custom![column.label] = ($event.target as HTMLInputElement).value" />
+        </label>
       </div>
+
+      <fieldset class="bulk-replace">
+        <legend>Search and replace</legend>
+        <div class="bulk-combo">
+          <select v-model="bulkSpec.searchReplace!.field" :disabled="bulkBusy">
+            <option v-for="f in REPLACEABLE_FIELDS" :key="f" :value="f">{{ f }}</option>
+          </select>
+          <input v-model="bulkSpec.searchReplace!.find" placeholder="find…" :disabled="bulkBusy" />
+          <input v-model="bulkSpec.searchReplace!.replace" placeholder="replace with…" :disabled="bulkBusy" />
+          <label class="bulk-regex"><input type="checkbox" v-model="bulkSpec.searchReplace!.useRegex" :disabled="bulkBusy" /> Regex</label>
+        </div>
+      </fieldset>
+
       <div class="bulk-actions">
         <button type="button" :disabled="bulkBusy" @click="runBulkEdit">
           {{ bulkBusy ? "Applying…" : `Apply to ${selectedIds.size} book(s)` }}
         </button>
         <button type="button" :disabled="bulkBusy" @click="bulkOpen = false">Close</button>
       </div>
+      <p v-if="bulkSummary" class="status">{{ bulkSummary }}</p>
       <ul v-if="bulkErrors.length" class="bulk-errors">
         <li v-for="(err, i) in bulkErrors" :key="i" class="error">{{ err }}</li>
       </ul>
@@ -2015,6 +2125,60 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onLibraryKeydown));
 .hint.inline {
   font-size: 0.8em;
   opacity: 0.7;
+}
+
+/* Expanded bulk edit (#1.6). */
+.bulk-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 0.5rem 1rem;
+  margin-bottom: 0.75rem;
+}
+.bulk-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-size: 0.85rem;
+}
+.bulk-field > span {
+  opacity: 0.8;
+}
+.bulk-combo {
+  display: flex;
+  gap: 0.3rem;
+  flex-wrap: wrap;
+}
+.bulk-combo input {
+  flex: 1;
+  min-width: 8ch;
+}
+.bulk-optional > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.bulk-replace {
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  padding: 0.5rem 0.75rem 0.75rem;
+  margin-bottom: 0.75rem;
+}
+.bulk-replace legend {
+  font-size: 0.8rem;
+  opacity: 0.75;
+  padding: 0 0.3rem;
+}
+.bulk-regex {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+@media (prefers-color-scheme: dark) {
+  .bulk-replace {
+    border-color: #3a3d44;
+  }
 }
 
 </style>
