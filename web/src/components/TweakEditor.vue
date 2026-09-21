@@ -3,7 +3,7 @@ import { onBeforeUnmount, ref } from "vue";
 import { commitTweakSession, discardTweakSession, fetchToc, fetchTweakFile, openTweakSession, saveToc, saveTweakFile, type TocNode } from "../library/tweak";
 import TocTreeNode from "./TocTreeNode.vue";
 
-import { bookReport, checkBook, fixBookChecks, type BookReport, type CheckResult, spellCheckBook, type MisspelledWord, searchReplaceBook, type SearchReplaceResult } from "../library/api";
+import { bookReport, checkBook, fixBookChecks, type BookReport, type CheckResult, spellCheckBook, type MisspelledWord, searchReplaceBook, type SearchReplaceResult, bookDiff, bookFonts, type DiffFile, type FontFamily } from "../library/api";
 
 const props = defineProps<{ bookId: number }>();
 const emit = defineEmits<{ close: []; updated: [] }>();
@@ -140,7 +140,7 @@ onBeforeUnmount(() => {
 // ported with no caller anywhere. They act on the open session, so
 // they see unsaved edits -- checking the stored copy would report
 // problems already fixed in the editor.
-type EditorTab = "files" | "toc" | "check" | "report" | "spell" | "find";
+type EditorTab = "files" | "toc" | "check" | "report" | "spell" | "find" | "fonts" | "diff";
 const tab = ref<EditorTab>("files");
 
 const checkResult = ref<CheckResult | null>(null);
@@ -204,7 +204,9 @@ function openTab(next: EditorTab) {
   if (next === "check") void runCheck();
   if (next === "report") void loadReport();
   if (next === "spell") void runSpellCheck();
-  // Deliberately not auto-run: a search needs a query first.
+  if (next === "fonts") void loadFonts();
+  if (next === "diff") void loadDiff();
+  // Find is deliberately not auto-run: a search needs a query first.
 }
 
 function formatSize(bytes: number): string {
@@ -285,6 +287,41 @@ async function runReplaceAll() {
     findBusy.value = false;
   }
 }
+
+// Fonts (#3.6) and diff (#3.5).
+const fontFamilies = ref<FontFamily[]>([]);
+const fontsBusy = ref(false);
+const fontsError = ref<string | null>(null);
+
+async function loadFonts() {
+  if (!sessionId.value) return;
+  fontsBusy.value = true;
+  fontsError.value = null;
+  try {
+    fontFamilies.value = (await bookFonts(sessionId.value)).families;
+  } catch (e) {
+    fontsError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    fontsBusy.value = false;
+  }
+}
+
+const diffFiles = ref<DiffFile[]>([]);
+const diffBusy = ref(false);
+const diffError = ref<string | null>(null);
+
+async function loadDiff() {
+  if (!sessionId.value) return;
+  diffBusy.value = true;
+  diffError.value = null;
+  try {
+    diffFiles.value = (await bookDiff(sessionId.value)).files;
+  } catch (e) {
+    diffError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    diffBusy.value = false;
+  }
+}
 </script>
 
 <template>
@@ -302,9 +339,42 @@ async function runReplaceAll() {
           <button type="button" :class="{ active: tab === 'report' }" @click="openTab('report')">Report</button>
           <button type="button" :class="{ active: tab === 'spell' }" @click="openTab('spell')">Spelling</button>
           <button type="button" :class="{ active: tab === 'find' }" @click="openTab('find')">Find &amp; replace</button>
+          <button type="button" :class="{ active: tab === 'fonts' }" @click="openTab('fonts')">Fonts</button>
+          <button type="button" :class="{ active: tab === 'diff' }" @click="openTab('diff')">Changes</button>
         </div>
 
-        <section v-if="tab === 'find'" class="editor-tool">
+        <section v-if="tab === 'fonts'" class="editor-tool">
+          <div class="tool-actions">
+            <button type="button" :disabled="fontsBusy" @click="loadFonts">{{ fontsBusy ? "Loading…" : "Refresh" }}</button>
+          </div>
+          <p class="hint">A family this book asks for but does not embed renders as whatever the reading device happens to have.</p>
+          <p v-if="fontsError" class="error">{{ fontsError }}</p>
+          <p v-else-if="!fontsBusy && fontFamilies.length === 0" class="status">This book specifies no font families.</p>
+          <ul v-else class="check-list">
+            <li v-for="f in fontFamilies" :key="f.family" :class="f.embedded ? '' : 'level-warning'">
+              <span class="check-level">{{ f.embedded ? "embedded" : "missing" }}</span>
+              <span class="check-where">{{ f.family }}</span>
+              <span class="check-msg">{{ f.embedded ? "Shipped with the book." : "Not embedded — falls back to a device font." }}</span>
+              <span></span>
+            </li>
+          </ul>
+        </section>
+
+        <section v-else-if="tab === 'diff'" class="editor-tool">
+          <div class="tool-actions">
+            <button type="button" :disabled="diffBusy" @click="loadDiff">{{ diffBusy ? "Comparing…" : "Refresh" }}</button>
+          </div>
+          <p class="hint">Everything changed in this session — by hand, by find &amp; replace, or by the TOC editor — compared with the saved book.</p>
+          <p v-if="diffError" class="error">{{ diffError }}</p>
+          <p v-else-if="!diffBusy && diffFiles.length === 0" class="status">No changes yet.</p>
+          <div v-for="f in diffFiles" :key="f.name" class="diff-file">
+            <h4>{{ f.name }} <span class="diff-status">{{ f.status }}</span></h4>
+            <pre v-if="f.lines"><code><span v-for="(l, i) in f.lines" :key="i" :class="`diff-${l.tag}`">{{ l.tag === "add" ? "+" : l.tag === "remove" ? "-" : " " }} {{ l.text }}
+</span></code></pre>
+          </div>
+        </section>
+
+        <section v-else-if="tab === 'find'" class="editor-tool">
           <form class="find-form" @submit.prevent="runFind">
             <input v-model="findText" placeholder="Find…" :disabled="findBusy" />
             <input v-model="replaceText" placeholder="Replace with…" :disabled="findBusy" />
@@ -675,6 +745,49 @@ h3 {
 }
 .saved-template-name:hover {
   text-decoration: underline;
+}
+
+/* Diff view (#3.5). */
+.diff-file {
+  margin-bottom: 0.8rem;
+}
+.diff-file h4 {
+  margin: 0 0 0.25rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.82rem;
+}
+.diff-status {
+  font-family: inherit;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  opacity: 0.6;
+}
+.diff-file pre {
+  margin: 0;
+  padding: 0.4rem 0.6rem;
+  background: #f7f7f7;
+  border-radius: 4px;
+  overflow-x: auto;
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+.diff-add {
+  display: block;
+  background: #e6ffed;
+}
+.diff-remove {
+  display: block;
+  background: #ffeef0;
+}
+.diff-context {
+  display: block;
+  opacity: 0.65;
+}
+@media (prefers-color-scheme: dark) {
+  .diff-file pre { background: #1b1e24; }
+  .diff-add { background: #14301f; }
+  .diff-remove { background: #3a1d1d; }
 }
 
 </style>

@@ -352,6 +352,172 @@ pub async fn search_replace(State(state): State<AppState>, AxumPath(session_id):
     .map_err(|e| ServerError::InternalServerError(e.to_string()))?
 }
 
+
+// ===================================================================
+// Fonts (#816 item 3.6)
+// ===================================================================
+//
+// `oeb::polish::fonts::font_family_data` was ported and had no
+// caller. It answers the question that matters before shipping a
+// book: which font families does this book *ask* for, and which of
+// those does it actually carry?
+//
+// A family a book references but does not embed renders as whatever
+// the reading device happens to have -- which on an e-reader is
+// usually nothing like what the designer intended, and is invisible
+// until someone opens it on hardware.
+
+/// `GET /tweak/fonts/{session_id}`.
+pub async fn fonts(State(state): State<AppState>, AxumPath(session_id): AxumPath<String>) -> Result<Json<Value>, ServerError> {
+    tokio::task::spawn_blocking(move || -> Result<Json<Value>, ServerError> {
+        let families = state
+            .tweak_sessions
+            .with_container(&session_id, |container| calibre_ebooks::oeb::polish::fonts::font_family_data(container))
+            .ok_or_else(|| ServerError::NotFound(format!("No tweak session: {session_id}")))?
+            .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+
+        // Sorted so the listing is stable between requests -- a
+        // HashMap's order is not, and a panel that reshuffles on every
+        // refresh is hard to read.
+        let mut items: Vec<(String, bool)> = families.into_iter().collect();
+        items.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+
+        let embedded = items.iter().filter(|(_, e)| *e).count();
+        let entries: Vec<Value> = items.iter().map(|(family, is_embedded)| json!({ "family": family, "embedded": is_embedded })).collect();
+
+        Ok(Json(json!({
+            "count": entries.len(),
+            "embedded": embedded,
+            // The actionable number: families the book asks for but
+            // does not ship.
+            "not_embedded": entries.len() - embedded,
+            "families": entries,
+        })))
+    })
+    .await
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))?
+}
+
+
+// ===================================================================
+// Diff against the saved book (#816 item 3.5)
+// ===================================================================
+//
+// The editor, polish, search-and-replace and the TOC editor all write
+// into the same session, and the only way to see what they had
+// collectively done was to commit and look. This compares the open
+// session against the copy still in the library, so the whole set of
+// pending changes can be reviewed before committing them.
+
+/// Lines either side of a change to show for orientation.
+const DIFF_CONTEXT: usize = 2;
+
+/// A unified-style diff between two texts, as structured lines.
+///
+/// Returns `None` when they are identical, so an unchanged file
+/// produces no entry rather than an empty one.
+fn diff_lines(before: &str, after: &str) -> Option<Vec<Value>> {
+    use similar::{ChangeTag, TextDiff};
+
+    let diff = TextDiff::from_lines(before, after);
+    let mut out = Vec::new();
+    let mut any_change = false;
+
+    for group in diff.grouped_ops(DIFF_CONTEXT) {
+        for op in group {
+            for change in diff.iter_changes(&op) {
+                let tag = match change.tag() {
+                    ChangeTag::Delete => "remove",
+                    ChangeTag::Insert => "add",
+                    ChangeTag::Equal => "context",
+                };
+                if tag != "context" {
+                    any_change = true;
+                }
+                out.push(json!({
+                    "tag": tag,
+                    // 1-based, and absent on the side a line does not
+                    // exist -- an added line has no old number.
+                    "old_line": change.old_index().map(|i| i + 1),
+                    "new_line": change.new_index().map(|i| i + 1),
+                    "text": change.value().trim_end_matches('\n'),
+                }));
+            }
+        }
+    }
+
+    any_change.then_some(out)
+}
+
+/// `GET /tweak/diff/{session_id}` -- every file that differs from the
+/// saved book.
+pub async fn diff(State(state): State<AppState>, AxumPath(session_id): AxumPath<String>) -> Result<Json<Value>, ServerError> {
+    let (book_id, library_id) = state.tweak_sessions.session_book(&session_id).ok_or_else(|| ServerError::NotFound(format!("No tweak session: {session_id}")))?;
+    let cache = state.cache_for(library_id.as_deref()).ok_or_else(|| ServerError::NotFound(format!("no library named {:?}", library_id.unwrap_or_default())))?;
+
+    tokio::task::spawn_blocking(move || -> Result<Json<Value>, ServerError> {
+        // The saved copy, opened into its own temp directory so it
+        // cannot disturb the session's own extracted tree.
+        let ids: std::collections::HashSet<i32> = std::iter::once(book_id).collect();
+        let rows = cache.get_data_as_dict(None, true, Some(&ids), false).map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+        let row = rows.into_iter().next().ok_or_else(|| ServerError::NotFound(format!("no book with id {book_id}")))?;
+        let path = row.get("fmt_epub").and_then(|v| v.as_str()).ok_or_else(|| ServerError::NotFound(format!("no epub format for book {book_id}")))?.to_string();
+
+        let tdir = tempfile::tempdir().map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+        let mut saved = calibre_ebooks::oeb::polish::container::EpubContainer::open_zip(std::path::Path::new(&path), tdir.path()).map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+
+        let files = state
+            .tweak_sessions
+            .with_container(&session_id, |container| -> Vec<Value> {
+                let mut names: std::collections::BTreeSet<String> = container.name_path_map.keys().cloned().collect();
+                names.extend(saved.name_path_map.keys().cloned());
+
+                let mut out = Vec::new();
+                for name in names {
+                    let in_session = container.name_path_map.contains_key(&name);
+                    let in_saved = saved.name_path_map.contains_key(&name);
+
+                    // A file added or deleted in the session is a real
+                    // change, and a line diff of it against nothing
+                    // would be pure noise.
+                    if !in_saved {
+                        out.push(json!({ "name": name, "status": "added" }));
+                        continue;
+                    }
+                    if !in_session {
+                        out.push(json!({ "name": name, "status": "removed" }));
+                        continue;
+                    }
+
+                    if !crate::tweak::is_editable_as_text(&container.guess_type(&name)) {
+                        // Binary: compare bytes, but never try to show
+                        // a line diff of them.
+                        let a = saved.raw_data(&name, true).unwrap_or_default();
+                        let b = container.raw_data(&name, true).unwrap_or_default();
+                        if a != b {
+                            out.push(json!({ "name": name, "status": "binary-changed" }));
+                        }
+                        continue;
+                    }
+
+                    let before = saved.raw_data(&name, true).ok().and_then(|b| String::from_utf8(b).ok());
+                    let after = container.raw_data(&name, true).ok().and_then(|b| String::from_utf8(b).ok());
+                    let (Some(before), Some(after)) = (before, after) else { continue };
+
+                    if let Some(lines) = diff_lines(&before, &after) {
+                        out.push(json!({ "name": name, "status": "modified", "lines": lines }));
+                    }
+                }
+                out
+            })
+            .ok_or_else(|| ServerError::NotFound(format!("No tweak session: {session_id}")))?;
+
+        Ok(Json(json!({ "changed": files.len(), "files": files })))
+    })
+    .await
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))?
+}
+
 #[cfg(test)]
 mod tests {
     use axum::body::{to_bytes, Body};
@@ -694,6 +860,82 @@ mod tests {
         assert_eq!(post_json(&router, &format!("/tweak/search-replace/{session}"), json!({"find": ""})).await.0, StatusCode::BAD_REQUEST);
     }
 
+    // ---------------------------------------------------------------
+    // Fonts (#3.6) and diff (#3.5)
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn fonts_reports_families_and_whether_they_are_embedded() {
+        let (_d, router, book_id) = test_app();
+        let session = open_session(&router, book_id).await;
+
+        let (status, body) = get(&router, &format!("/tweak/fonts/{session}")).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // The actionable number: families a book asks for but does not
+        // ship, which render as whatever the device happens to have.
+        assert!(body["not_embedded"].is_number(), "{body}");
+        assert!(body["families"].is_array(), "{body}");
+    }
+
+    /// An unmodified session must produce an empty diff -- otherwise
+    /// the panel cries wolf on every open and nobody reads it.
+    #[tokio::test]
+    async fn an_untouched_session_differs_from_nothing() {
+        let (_d, router, book_id) = test_app();
+        let session = open_session(&router, book_id).await;
+
+        let (status, body) = get(&router, &format!("/tweak/diff/{session}")).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["changed"], 0, "a session with no edits should show no changes: {body}");
+    }
+
+    #[tokio::test]
+    async fn diff_shows_the_lines_an_edit_changed() {
+        let (_d, router, book_id) = test_app();
+        let session = open_session(&router, book_id).await;
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/tweak/file/{session}/chapter1.xhtml"))
+                    .body(Body::from("<html><body><p id=\"dup\">One</p><p>A brand new line.</p></body></html>"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+
+        let (_, body) = get(&router, &format!("/tweak/diff/{session}")).await;
+
+        assert_eq!(body["changed"], 1, "{body}");
+        let file = &body["files"][0];
+        assert_eq!(file["name"], "chapter1.xhtml");
+        assert_eq!(file["status"], "modified");
+
+        let tags: Vec<&str> = file["lines"].as_array().unwrap().iter().filter_map(|l| l["tag"].as_str()).collect();
+        assert!(tags.contains(&"add"), "an edit should show added lines: {tags:?}");
+        let added: Vec<&str> = file["lines"].as_array().unwrap().iter().filter(|l| l["tag"] == "add").filter_map(|l| l["text"].as_str()).collect();
+        assert!(added.iter().any(|t| t.contains("brand new line")), "{added:?}");
+    }
+
+    /// A search-and-replace writes through the same session, so the
+    /// diff has to see it -- that is the point of reviewing before
+    /// committing.
+    #[tokio::test]
+    async fn diff_sees_changes_made_by_other_editor_tools() {
+        let (_d, router, book_id) = test_app();
+        let session = open_session(&router, book_id).await;
+
+        post_json(&router, &format!("/tweak/search-replace/{session}"), json!({"find": "libary", "replace": "library"})).await;
+
+        let (_, body) = get(&router, &format!("/tweak/diff/{session}")).await;
+        assert!(body["changed"].as_u64().unwrap() >= 1, "{body}");
+    }
+
     #[tokio::test]
     async fn an_unknown_session_is_a_404_on_every_route() {
         let (_d, router, _) = test_app();
@@ -702,5 +944,7 @@ mod tests {
         assert_eq!(post(&router, "/tweak/check-fix/nope").await.0, StatusCode::NOT_FOUND);
         assert_eq!(get(&router, "/tweak/spell/nope").await.0, StatusCode::NOT_FOUND);
         assert_eq!(post_json(&router, "/tweak/search-replace/nope", json!({"find": "x"})).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(get(&router, "/tweak/fonts/nope").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(get(&router, "/tweak/diff/nope").await.0, StatusCode::NOT_FOUND);
     }
 }

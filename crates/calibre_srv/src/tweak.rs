@@ -120,6 +120,14 @@ impl TweakSessionRegistry {
         let mut sessions = self.sessions.lock().unwrap();
         sessions.get_mut(session_id).map(|session| f(&mut session.container))
     }
+
+    /// Which book a session is editing, for callers that need to
+    /// reach the *stored* copy -- the diff view compares the session
+    /// against what is actually saved.
+    pub(crate) fn session_book(&self, session_id: &str) -> Option<(i32, Option<String>)> {
+        let sessions = self.sessions.lock().unwrap();
+        sessions.get(session_id).map(|s| (s.book_id, s.library_id.clone()))
+    }
 }
 
 fn new_session_id() -> String {

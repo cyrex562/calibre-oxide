@@ -9,6 +9,8 @@ name = "calibre_srv"
 path = "src/main.rs"
 
 [dependencies]
+# Line diffs for the editor's before/after view (#816 item 3.5).
+similar = "2"
 # Validating user-supplied mapper patterns up front (#816 item 1.7).
 regex = "1"
 calibre_conversion = { path = "../calibre_conversion" }
