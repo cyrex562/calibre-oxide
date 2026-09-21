@@ -107,6 +107,19 @@ impl TweakSessionRegistry {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Runs `f` against an open session's container.
+    ///
+    /// Exists so sibling modules (`editor_tools.rs`) can operate on
+    /// the book being edited without the session map becoming part of
+    /// this crate's shared surface -- the registry keeps owning when a
+    /// session exists and how long its lock is held.
+    ///
+    /// Returns `None` when there is no such session.
+    pub(crate) fn with_container<T>(&self, session_id: &str, f: impl FnOnce(&mut EpubContainer) -> T) -> Option<T> {
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions.get_mut(session_id).map(|session| f(&mut session.container))
+    }
 }
 
 fn new_session_id() -> String {

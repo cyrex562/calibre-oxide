@@ -174,6 +174,7 @@ pub mod convert;
 pub mod custom_columns;
 pub mod data_files;
 pub mod duplicates;
+pub mod editor_tools;
 pub mod errors;
 pub mod fts;
 pub mod jobs;
@@ -354,6 +355,9 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/duplicates/scan/{library_id}", post(duplicates::scan))
         .route("/tweak/open/{book_id}/{fmt}/{library_id}", post(tweak::open_session))
         .route("/tweak/file/{session_id}/{*name}", get(tweak::get_file).post(tweak::set_file))
+        .route("/tweak/check/{session_id}", get(editor_tools::check))
+        .route("/tweak/check-fix/{session_id}", post(editor_tools::check_fix))
+        .route("/tweak/report/{session_id}", get(editor_tools::book_report))
         .route("/tweak/commit/{session_id}", post(tweak::commit))
         .route("/tweak/discard/{session_id}", post(tweak::discard))
         .route("/tweak/toc/{session_id}", get(tweak::get_toc_route).post(tweak::set_toc_route))

@@ -756,3 +756,42 @@ export async function fetchPluginCatalog(): Promise<{ configured: boolean; plugi
 export function installFromCatalog(name: string): Promise<InstalledPlugin> {
   return jsonFetch<InstalledPlugin>(`/plugins/install-from-catalog/${encodeURIComponent(name)}`, { method: "POST" });
 }
+
+// Editor check-book and reports (#816 items 3.3 / 3.2). Both engines
+// were fully ported with no caller; these routes act on the open
+// tweak session, so they see unsaved edits.
+export interface CheckItem {
+  type: string;
+  message: string;
+  file: string;
+  line: number | null;
+  col: number | null;
+  level: string;
+  help: string;
+  fixable: boolean;
+  fix_label: string | null;
+}
+
+export interface CheckResult {
+  count: number;
+  errors: number;
+  fixable: number;
+  items: CheckItem[];
+}
+
+export interface BookReport {
+  files: { count: number; total_size: number; items: { name: string; category: string; size: number; words: number }[] };
+  images: { count: number; items: { name: string; size: number; width: number; height: number; usage: number }[] };
+}
+
+export function checkBook(sessionId: string): Promise<CheckResult> {
+  return jsonFetch<CheckResult>(`/tweak/check/${encodeURIComponent(sessionId)}`);
+}
+
+export function fixBookChecks(sessionId: string): Promise<{ attempted: number; changed: boolean }> {
+  return jsonFetch<{ attempted: number; changed: boolean }>(`/tweak/check-fix/${encodeURIComponent(sessionId)}`, { method: "POST" });
+}
+
+export function bookReport(sessionId: string): Promise<BookReport> {
+  return jsonFetch<BookReport>(`/tweak/report/${encodeURIComponent(sessionId)}`);
+}

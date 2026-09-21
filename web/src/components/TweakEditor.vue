@@ -3,6 +3,8 @@ import { onBeforeUnmount, ref } from "vue";
 import { commitTweakSession, discardTweakSession, fetchToc, fetchTweakFile, openTweakSession, saveToc, saveTweakFile, type TocNode } from "../library/tweak";
 import TocTreeNode from "./TocTreeNode.vue";
 
+import { bookReport, checkBook, fixBookChecks, type BookReport, type CheckResult } from "../library/api";
+
 const props = defineProps<{ bookId: number }>();
 const emit = defineEmits<{ close: []; updated: [] }>();
 
@@ -133,6 +135,81 @@ function discardAndClose() {
 onBeforeUnmount(() => {
   if (sessionId.value) void discardTweakSession(sessionId.value);
 });
+
+// Check book and reports (#3.3 / #3.2). Both engines were fully
+// ported with no caller anywhere. They act on the open session, so
+// they see unsaved edits -- checking the stored copy would report
+// problems already fixed in the editor.
+type EditorTab = "files" | "toc" | "check" | "report";
+const tab = ref<EditorTab>("files");
+
+const checkResult = ref<CheckResult | null>(null);
+const checkBusy = ref(false);
+const checkError = ref<string | null>(null);
+const checkMessage = ref<string | null>(null);
+
+const report = ref<BookReport | null>(null);
+const reportBusy = ref(false);
+const reportError = ref<string | null>(null);
+
+async function runCheck() {
+  if (!sessionId.value) return;
+  checkBusy.value = true;
+  checkError.value = null;
+  checkMessage.value = null;
+  try {
+    checkResult.value = await checkBook(sessionId.value);
+  } catch (e) {
+    checkError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    checkBusy.value = false;
+  }
+}
+
+async function runFixes() {
+  if (!sessionId.value) return;
+  checkBusy.value = true;
+  checkError.value = null;
+  try {
+    const result = await fixBookChecks(sessionId.value);
+    checkMessage.value = result.changed ? `Fixed ${result.attempted} problem(s). Commit to keep the changes.` : "Nothing could be fixed automatically.";
+    await runCheck();
+  } catch (e) {
+    checkError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    checkBusy.value = false;
+  }
+}
+
+async function loadReport() {
+  if (!sessionId.value) return;
+  reportBusy.value = true;
+  reportError.value = null;
+  try {
+    report.value = await bookReport(sessionId.value);
+  } catch (e) {
+    reportError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    reportBusy.value = false;
+  }
+}
+
+function openTab(next: EditorTab) {
+  tab.value = next;
+  showToc.value = next === "toc";
+  if (next === "toc") void openToc();
+  // Both are computed from the live session, so they are re-run on
+  // each visit rather than cached -- an edit since last time would
+  // make a cached result quietly wrong.
+  if (next === "check") void runCheck();
+  if (next === "report") void loadReport();
+}
+
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
 </script>
 
 <template>
@@ -144,11 +221,58 @@ onBeforeUnmount(() => {
       <p v-else-if="error" class="error">{{ error }}</p>
       <template v-else>
         <div class="mode-tabs">
-          <button type="button" :class="{ active: !showToc }" @click="showToc = false">Files</button>
-          <button type="button" :class="{ active: showToc }" @click="openToc">Table of contents</button>
+          <button type="button" :class="{ active: tab === 'files' }" @click="openTab('files')">Files</button>
+          <button type="button" :class="{ active: tab === 'toc' }" @click="openTab('toc')">Table of contents</button>
+          <button type="button" :class="{ active: tab === 'check' }" @click="openTab('check')">Check book</button>
+          <button type="button" :class="{ active: tab === 'report' }" @click="openTab('report')">Report</button>
         </div>
 
-        <template v-if="!showToc">
+        <section v-if="tab === 'check'" class="editor-tool">
+          <div class="tool-actions">
+            <button type="button" :disabled="checkBusy" @click="runCheck">{{ checkBusy ? "Checking…" : "Re-check" }}</button>
+            <button type="button" :disabled="checkBusy || !checkResult?.fixable" @click="runFixes">
+              Fix {{ checkResult?.fixable ?? 0 }} automatically
+            </button>
+          </div>
+          <p v-if="checkError" class="error">{{ checkError }}</p>
+          <p v-if="checkMessage" class="status">{{ checkMessage }}</p>
+          <p v-if="checkResult && checkResult.count === 0" class="status">No problems found.</p>
+          <p v-else-if="checkResult" class="status">{{ checkResult.count }} item(s), {{ checkResult.errors }} error(s)</p>
+          <ul v-if="checkResult?.items.length" class="check-list">
+            <li v-for="(item, i) in checkResult.items" :key="i" :class="`level-${item.level}`">
+              <span class="check-level">{{ item.level }}</span>
+              <span class="check-where">{{ item.file }}<template v-if="item.line">:{{ item.line }}</template></span>
+              <span class="check-msg" :title="item.help">{{ item.message }}</span>
+              <span v-if="item.fixable" class="check-fixable">auto-fixable</span>
+            </li>
+          </ul>
+        </section>
+
+        <section v-else-if="tab === 'report'" class="editor-tool">
+          <div class="tool-actions">
+            <button type="button" :disabled="reportBusy" @click="loadReport">{{ reportBusy ? "Loading…" : "Refresh" }}</button>
+          </div>
+          <p v-if="reportError" class="error">{{ reportError }}</p>
+          <template v-else-if="report">
+            <p class="status">{{ report.files.count }} file(s), {{ formatSize(report.files.total_size) }} total · {{ report.images.count }} image(s)</p>
+            <ul class="report-list">
+              <li v-for="f in report.files.items" :key="f.name">
+                <span class="report-name">{{ f.name }}</span>
+                <span class="report-category">{{ f.category }}</span>
+                <span class="report-size">{{ formatSize(f.size) }}</span>
+              </li>
+            </ul>
+            <ul v-if="report.images.items.length" class="report-list">
+              <li v-for="img in report.images.items" :key="img.name">
+                <span class="report-name">{{ img.name }}</span>
+                <span class="report-category">{{ img.width }}×{{ img.height }}</span>
+                <span class="report-size">{{ formatSize(img.size) }} · used {{ img.usage }}×</span>
+              </li>
+            </ul>
+          </template>
+        </section>
+
+        <template v-if="tab === 'files'">
           <p class="hint">Plain-text editing of this EPUB's own internal files. No rich editor or live preview yet -- open the edited book in the reader afterward to check your changes.</p>
           <div class="editor">
             <ul class="file-list">
@@ -164,7 +288,7 @@ onBeforeUnmount(() => {
           <p v-if="fileError" class="error">{{ fileError }}</p>
         </template>
 
-        <template v-else>
+        <template v-else-if="tab === 'toc'">
           <p class="hint">Add, remove, reorder, and rename real table-of-contents entries. A destination points at a file in this book (e.g. "chapter1.xhtml"); ⚠ marks a destination that no longer exists.</p>
           <p v-if="tocLoading">Loading…</p>
           <template v-else>
@@ -321,4 +445,84 @@ h3 {
   border-radius: 4px;
   padding: 0.5em;
 }
+/* Check book and report panes (#3.3 / #3.2). */
+.editor-tool {
+  max-height: 55vh;
+  overflow-y: auto;
+}
+.tool-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+.check-list,
+.report-list {
+  list-style: none;
+  margin: 0 0 0.6rem;
+  padding: 0;
+  font-size: 0.84rem;
+}
+.check-list li {
+  display: grid;
+  grid-template-columns: 5rem minmax(8ch, 1fr) minmax(0, 2.2fr) auto;
+  gap: 0.5rem;
+  align-items: baseline;
+  padding: 0.2rem 0;
+  border-bottom: 1px solid #eee;
+}
+.check-level {
+  text-transform: uppercase;
+  font-size: 0.72rem;
+  letter-spacing: 0.05em;
+  opacity: 0.7;
+}
+.level-error .check-level,
+.level-critical .check-level {
+  color: #b3261e;
+  opacity: 1;
+  font-weight: 600;
+}
+.level-warning .check-level {
+  color: #9a6b08;
+  opacity: 1;
+}
+.check-where {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.78rem;
+  opacity: 0.75;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.check-msg {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.check-fixable {
+  font-size: 0.72rem;
+  opacity: 0.6;
+  white-space: nowrap;
+}
+.report-list li {
+  display: grid;
+  grid-template-columns: minmax(10ch, 2fr) minmax(6ch, 1fr) auto;
+  gap: 0.5rem;
+  padding: 0.15rem 0;
+  border-bottom: 1px solid #f0f0f0;
+}
+.report-name {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.78rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.report-category,
+.report-size {
+  opacity: 0.7;
+  white-space: nowrap;
+}
+@media (prefers-color-scheme: dark) {
+  .check-list li { border-bottom-color: #2b3037; }
+  .report-list li { border-bottom-color: #2b3037; }
+}
+
 </style>
