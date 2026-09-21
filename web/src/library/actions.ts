@@ -114,6 +114,8 @@ export type LibraryActionId =
   | "send-email"
   | "replace-cover"
   | "open-externally"
+  | "unpack-book"
+  | "repack-book"
   | "similar-books"
   | "polish"
   | "delete-book";
@@ -162,6 +164,10 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
 
   { id: "read", label: "Read", group: "book", requires: "single-selection", contextMenu: true },
   { id: "open-externally", label: "Open externally", group: "book", requires: "single-selection", contextMenu: true, desktopOnly: true },
+  // Unpack/repack hand a book to whatever editor the user prefers.
+  // Desktop-only: both need a real folder and real filesystem access.
+  { id: "unpack-book", label: "Unpack to folder…", group: "book", requires: "single-selection", contextMenu: true, desktopOnly: true },
+  { id: "repack-book", label: "Repack from folder…", group: "book", requires: "single-selection", contextMenu: true, desktopOnly: true },
   { id: "edit-metadata", label: "Edit metadata", group: "book", requires: "single-selection", contextMenu: true },
   { id: "fetch-metadata", label: "Fetch metadata online…", group: "book", requires: "single-selection", contextMenu: true },
   { id: "convert", label: "Convert…", group: "book", requires: "single-selection", contextMenu: true },

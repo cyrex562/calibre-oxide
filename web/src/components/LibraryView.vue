@@ -1201,7 +1201,7 @@ const pendingBookAction = ref<{ id: string; nonce: number } | null>(null);
 let actionNonce = 0;
 
 /** Book actions BookDetailsPanel knows how to perform. */
-const PANEL_ACTIONS: LibraryActionId[] = ["read", "edit-metadata", "fetch-metadata", "convert", "tweak-book", "quick-view", "test-template", "send-email", "replace-cover", "open-externally"];
+const PANEL_ACTIONS: LibraryActionId[] = ["read", "edit-metadata", "fetch-metadata", "convert", "tweak-book", "quick-view", "test-template", "send-email", "replace-cover", "open-externally", "unpack-book", "repack-book"];
 
 const contextEntries = computed(() => contextMenuEntries([...PANEL_ACTIONS, "similar-books", "mark-books", "polish", "bulk-edit", "save-to-disk", "delete-book"], actionContext.value));
 

@@ -535,6 +535,54 @@ const externalFormat = computed(() => {
   return formats.find((f) => !READABLE_FORMATS.includes(f)) ?? formats[0] ?? null;
 });
 
+// Unpack / repack (#1.12). Hands the book to whatever editor the
+// user prefers, then rebuilds it. `implode` verifies a marker file
+// `explode` left behind, so a folder that was never unpacked -- or
+// was unpacked from a different format -- is refused rather than
+// producing a broken book.
+const unpacking = ref(false);
+const unpackMessage = ref<string | null>(null);
+
+/** Only formats `calibre_ebooks::tweak::get_tools` knows how to explode. */
+const UNPACKABLE_FORMATS = ["epub", "azw3", "mobi", "azw", "docx", "htmlz"];
+const unpackableFormat = computed(() => book.value?.formats.find((f) => UNPACKABLE_FORMATS.includes(f)) ?? null);
+const canUnpack = computed(() => isTauri() && unpackableFormat.value !== null);
+
+async function unpackBook() {
+  const fmt = unpackableFormat.value;
+  if (!fmt) return;
+  unpacking.value = true;
+  unpackMessage.value = null;
+  openExternallyError.value = null;
+  try {
+    const result = await tauriInvoke<{ path: string } | null>("unpack_book", { bookId: props.bookId, fmt });
+    if (result) unpackMessage.value = `Unpacked to ${result.path}`;
+  } catch (e) {
+    openExternallyError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    unpacking.value = false;
+  }
+}
+
+async function repackBook() {
+  const fmt = unpackableFormat.value;
+  if (!fmt) return;
+  unpacking.value = true;
+  unpackMessage.value = null;
+  openExternallyError.value = null;
+  try {
+    const done = await tauriInvoke<boolean>("repack_book", { bookId: props.bookId, fmt });
+    if (done) {
+      unpackMessage.value = "Rebuilt and saved back to the library.";
+      emit("updated");
+    }
+  } catch (e) {
+    openExternallyError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    unpacking.value = false;
+  }
+}
+
 async function openExternally() {
   const fmt = externalFormat.value;
   if (!fmt) return;
@@ -662,6 +710,12 @@ function performAction(id: string) {
     case "open-externally":
       void openExternally();
       break;
+    case "unpack-book":
+      void unpackBook();
+      break;
+    case "repack-book":
+      void repackBook();
+      break;
     default:
       break;
   }
@@ -705,9 +759,12 @@ watch(
         </dl>
         <p v-if="deleteError" class="error">{{ deleteError }}</p>
         <p v-if="openExternallyError" class="error">{{ openExternallyError }}</p>
+        <p v-if="unpackMessage" class="status">{{ unpackMessage }}</p>
 
         <div class="formats">
           <button v-if="readableFormat" class="read" @click="read">Read ({{ readableFormat.toUpperCase() }})</button>
+          <button v-if="canUnpack" class="edit" :disabled="unpacking" @click="unpackBook">{{ unpacking ? "Working…" : `Unpack ${unpackableFormat?.toUpperCase()}…` }}</button>
+          <button v-if="canUnpack" class="edit" :disabled="unpacking" @click="repackBook">Repack…</button>
           <button v-if="canOpenExternally && externalFormat" class="edit" :disabled="openingExternally" @click="openExternally">
             {{ openingExternally ? "Opening…" : `Open ${externalFormat.toUpperCase()} externally` }}
           </button>
