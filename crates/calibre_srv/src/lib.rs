@@ -337,6 +337,8 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/metadata/search", post(metadata_search::search))
         .route("/plugins/list", get(plugins::list))
         .route("/plugins/inspect", post(plugins::inspect))
+        .route("/plugins/catalog", get(plugins::catalog))
+        .route("/plugins/install-from-catalog/{name}", post(plugins::install_from_catalog))
         .route("/plugins/install", post(plugins::install))
         .route("/plugins/remove/{name}", post(plugins::remove))
         .route("/plugins/set-enabled/{name}", post(plugins::set_enabled))

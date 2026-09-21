@@ -302,3 +302,87 @@ mod tests {
         assert!(!m.capabilities.is_fully_sandboxed(), "a plugin asking for network access must not look fully sandboxed");
     }
 }
+
+/// Compares two plugin version strings, newest-wins.
+///
+/// Versions in a manifest are free-form strings, so a plain string
+/// comparison is wrong in the most common case there is: `"1.10.0"`
+/// sorts *before* `"1.9.0"` lexically, which would tell a user their
+/// newer plugin is out of date and offer to downgrade it.
+///
+/// Numeric components are compared numerically, and a missing
+/// component counts as zero so `"1.2"` and `"1.2.0"` are equal. A
+/// non-numeric component (`"1.0-beta"`) falls back to comparing that
+/// component as text, which is not a full semver pre-release ordering
+/// but is predictable and never claims two different versions are the
+/// same.
+pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let split = |v: &str| -> Vec<String> { v.trim().split('.').map(str::to_string).collect() };
+    let (a_parts, b_parts) = (split(a), split(b));
+
+    for i in 0..a_parts.len().max(b_parts.len()) {
+        let ap = a_parts.get(i).map(String::as_str).unwrap_or("0");
+        let bp = b_parts.get(i).map(String::as_str).unwrap_or("0");
+        if ap == bp {
+            continue;
+        }
+        let ord = match (ap.parse::<u64>(), bp.parse::<u64>()) {
+            (Ok(an), Ok(bn)) => an.cmp(&bn),
+            // A numeric component outranks a non-numeric one at the
+            // same position: "1.0" is a release, "1.0-rc" is not.
+            (Ok(_), Err(_)) => Ordering::Greater,
+            (Err(_), Ok(_)) => Ordering::Less,
+            (Err(_), Err(_)) => ap.cmp(bp),
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::compare_versions;
+    use std::cmp::Ordering;
+
+    /// The case that makes this function necessary at all.
+    #[test]
+    fn ten_is_newer_than_nine() {
+        assert_eq!(compare_versions("1.10.0", "1.9.0"), Ordering::Greater);
+        assert!("1.10.0" < "1.9.0", "a plain string compare really does get this backwards");
+    }
+
+    #[test]
+    fn compares_component_by_component() {
+        assert_eq!(compare_versions("2.0.0", "1.9.9"), Ordering::Greater);
+        assert_eq!(compare_versions("1.2.3", "1.2.4"), Ordering::Less);
+        assert_eq!(compare_versions("1.2.3", "1.2.3"), Ordering::Equal);
+    }
+
+    #[test]
+    fn a_missing_component_counts_as_zero() {
+        assert_eq!(compare_versions("1.2", "1.2.0"), Ordering::Equal);
+        assert_eq!(compare_versions("1.2.1", "1.2"), Ordering::Greater);
+    }
+
+    #[test]
+    fn ignores_surrounding_whitespace() {
+        assert_eq!(compare_versions(" 1.0.0 ", "1.0.0"), Ordering::Equal);
+    }
+
+    #[test]
+    fn a_release_outranks_a_prerelease_at_the_same_position() {
+        assert_eq!(compare_versions("1.0.0", "1.0.0-rc1"), Ordering::Greater);
+        assert_eq!(compare_versions("1.0.0-rc1", "1.0.0"), Ordering::Less);
+    }
+
+    /// Never claim two different version strings are the same -- that
+    /// would hide an available update.
+    #[test]
+    fn different_non_numeric_versions_are_not_equal() {
+        assert_ne!(compare_versions("1.0.0-alpha", "1.0.0-beta"), Ordering::Equal);
+    }
+}

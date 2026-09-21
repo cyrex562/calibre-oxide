@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from "vue";
 import { isTauri, tauriInvoke } from "../tauri";
-import { inspectPlugin, installPlugin, listPlugins, removePlugin, setPluginEnabled, type InstalledPlugin } from "../library/api";
+import { fetchPluginCatalog, inspectPlugin, installFromCatalog, installPlugin, listPlugins, removePlugin, setPluginEnabled, type CatalogPlugin, type InstalledPlugin } from "../library/api";
 import { DEFAULT_KEYMAP, DEFAULT_LIBRARY_PREFS, DEFAULT_READER_PREFS, DEFAULT_TOOLBAR_PREFS, fetchProfile, KEYMAP_ACTION_LABELS, KEYMAP_PROFILE, LIBRARY_PREFS_PROFILE, READER_PREFS_PROFILE, saveProfile, TOOLBAR_ACTIONS, TOOLBAR_PREFS_PROFILE, type KeymapAction, type KeymapPrefs, type LibraryPrefs, type ReaderPrefs, type ToolbarActionId, type ToolbarPrefs } from "./api";
 
 const libraryPrefs = ref<LibraryPrefs>({ ...DEFAULT_LIBRARY_PREFS });
@@ -56,6 +56,42 @@ async function saveToolbarPrefs() {
 const plugins = ref<InstalledPlugin[]>([]);
 const pluginsAvailable = ref(false);
 const pluginError = ref<string | null>(null);
+// Plugin catalog (#1.14). A directory of installable packages --
+// a repo folder or git submodule, since plugins for this port have to
+// be written against its WASM ABI rather than carried over from
+// calibre's Python ones.
+const catalog = ref<CatalogPlugin[]>([]);
+const catalogConfigured = ref(false);
+const catalogBusy = ref(false);
+const catalogError = ref<string | null>(null);
+
+async function loadCatalog() {
+  catalogBusy.value = true;
+  catalogError.value = null;
+  try {
+    const result = await fetchPluginCatalog();
+    catalogConfigured.value = result.configured;
+    catalog.value = result.plugins;
+  } catch (e) {
+    catalogError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    catalogBusy.value = false;
+  }
+}
+
+async function installCatalogPlugin(name: string) {
+  catalogBusy.value = true;
+  catalogError.value = null;
+  try {
+    await installFromCatalog(name);
+    await Promise.all([loadCatalog(), loadPlugins()]);
+  } catch (e) {
+    catalogError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    catalogBusy.value = false;
+  }
+}
+
 const pluginPath = ref("");
 const pluginPreview = ref<InstalledPlugin | null>(null);
 const pluginBusy = ref(false);
@@ -161,6 +197,7 @@ async function load() {
 }
 onMounted(() => {
   load();
+  void loadCatalog();
   window.addEventListener("keydown", onRebindKeydown);
 });
 onBeforeUnmount(() => window.removeEventListener("keydown", onRebindKeydown));
@@ -322,6 +359,33 @@ async function toggleAutoReopen() {
           network unless they ask for it, and anything they ask for is shown below before
           you install.
         </p>
+
+        <div class="plugin-catalog">
+          <h4>Available plugins</h4>
+          <p v-if="!catalogConfigured" class="hint">
+            No plugin catalog is configured. Start the server with
+            <code>--plugin-catalog-dir &lt;path&gt;</code> pointing at a folder of plugin
+            packages to browse and install from here.
+          </p>
+          <template v-else>
+            <p v-if="catalog.length === 0" class="hint">The catalog is configured but empty.</p>
+            <ul v-else class="catalog-list">
+              <li v-for="p in catalog" :key="p.name" class="catalog-row">
+                <span class="catalog-name">{{ p.name }}</span>
+                <span class="catalog-version">
+                  {{ p.version }}
+                  <template v-if="p.installed_version && p.installed_version !== p.version">(installed {{ p.installed_version }})</template>
+                </span>
+                <span class="catalog-desc">{{ p.description }}</span>
+                <button v-if="p.update_available" type="button" :disabled="catalogBusy" @click="installCatalogPlugin(p.name)">Update</button>
+                <button v-else-if="!p.installed" type="button" :disabled="catalogBusy" @click="installCatalogPlugin(p.name)">Install</button>
+                <span v-else class="catalog-installed">Installed</span>
+              </li>
+            </ul>
+          </template>
+          <p v-if="catalogError" class="error">{{ catalogError }}</p>
+          <button type="button" :disabled="catalogBusy" @click="loadCatalog">{{ catalogBusy ? "Loading…" : "Refresh catalog" }}</button>
+        </div>
 
         <label class="field">
           Install from a plugin package (.zip)
@@ -500,4 +564,52 @@ async function toggleAutoReopen() {
 .saved {
   color: #1b7f3a;
 }
+/* Plugin catalog (#1.14). */
+.plugin-catalog {
+  margin-bottom: 1rem;
+}
+.plugin-catalog h4 {
+  margin: 0 0 0.3rem;
+  font-size: 0.8rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  opacity: 0.6;
+}
+.catalog-list {
+  list-style: none;
+  margin: 0 0 0.5rem;
+  padding: 0;
+}
+.catalog-row {
+  display: grid;
+  grid-template-columns: minmax(10ch, 1fr) auto minmax(0, 1.6fr) auto;
+  gap: 0.6rem;
+  align-items: baseline;
+  padding: 0.25rem 0;
+  border-bottom: 1px solid #eee;
+  font-size: 0.87rem;
+}
+.catalog-name {
+  font-weight: 600;
+}
+.catalog-version {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.7;
+  white-space: nowrap;
+}
+.catalog-desc {
+  opacity: 0.75;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.catalog-installed {
+  opacity: 0.55;
+  font-size: 0.85em;
+}
+@media (prefers-color-scheme: dark) {
+  .catalog-row {
+    border-bottom-color: #2b3037;
+  }
+}
+
 </style>
