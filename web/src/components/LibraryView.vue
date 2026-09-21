@@ -4,11 +4,12 @@ import CategoryBrowser from "./CategoryBrowser.vue";
 import NoteEditor from "./NoteEditor.vue";
 import BookDetailsPanel from "./BookDetailsPanel.vue";
 import BookTable from "./BookTable.vue";
+import ContextMenu from "./ContextMenu.vue";
 import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
 import type { CheckLibraryResult, CustomRecipeOptions, DuplicateBook, NewsFeedInput, NewsSchedule, SaveToDiskResult } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
 import { clampWidth, columnsFor, DEFAULT_TABLE_PREFS, resolveColumns, TABLE_PREFS_PROFILE, type BookColumn, type LibraryViewMode, type TablePrefs } from "../library/columns";
-import { actionEnabled, LIBRARY_ACTIONS, visibleToolbarActions, type ActionContext, type LibraryAction, type LibraryActionId } from "../library/actions";
+import { actionEnabled, contextMenuEntries, LIBRARY_ACTIONS, visibleToolbarActions, type ActionContext, type LibraryAction, type LibraryActionId } from "../library/actions";
 import { onMenuAction, syncDesktopMenu } from "../library/desktopMenu";
 import { isTauri, tauriInvoke } from "../tauri";
 import { DEFAULT_LIBRARY_PREFS, DEFAULT_TOOLBAR_PREFS, fetchProfile, LIBRARY_PREFS_PROFILE, saveProfile, TOOLBAR_PREFS_PROFILE, type LibraryPrefs, type ToolbarActionId, type ToolbarPrefs } from "../settings/api";
@@ -1109,6 +1110,61 @@ watch(
 );
 
 onMenuAction(runAction);
+
+// ---------------------------------------------------------------
+// Right-click menu (#1.2)
+// ---------------------------------------------------------------
+//
+// Book-scoped actions are implemented by BookDetailsPanel, so the
+// menu selects the book and hands the panel an action to perform
+// rather than duplicating a dozen controls here. Selection-scoped
+// actions this view owns outright.
+
+const contextMenu = ref<{ x: number; y: number } | null>(null);
+const pendingBookAction = ref<{ id: string; nonce: number } | null>(null);
+let actionNonce = 0;
+
+/** Book actions BookDetailsPanel knows how to perform. */
+const PANEL_ACTIONS: LibraryActionId[] = ["read", "edit-metadata", "fetch-metadata", "convert", "tweak-book", "quick-view", "test-template", "send-email", "replace-cover", "open-externally"];
+
+const contextEntries = computed(() => contextMenuEntries([...PANEL_ACTIONS, "bulk-edit", "save-to-disk", "delete-book"], actionContext.value));
+
+function openContextMenu(payload: { bookId: number; x: number; y: number }) {
+  // Right-clicking a row that is not part of the current selection
+  // acts on that row, matching every file manager: the click moves
+  // the selection first, then the menu describes it.
+  if (!selectMode.value) selectedBookId.value = payload.bookId;
+  else if (!selectedIds.value.has(payload.bookId)) toggleSelected(payload.bookId);
+  contextMenu.value = { x: payload.x, y: payload.y };
+}
+
+async function deleteSelectedBooks() {
+  const ids = selectMode.value && selectedIds.value.size > 0 ? [...selectedIds.value] : selectedBookId.value !== null ? [selectedBookId.value] : [];
+  if (ids.length === 0) return;
+  if (!window.confirm(`Delete ${ids.length} book(s)? This cannot be undone.`)) return;
+  try {
+    await deleteBooks(ids);
+    if (selectedBookId.value !== null && ids.includes(selectedBookId.value)) selectedBookId.value = null;
+    selectedIds.value = new Set();
+    await runSearch();
+  } catch (e) {
+    error.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
+function onContextChoose(id: LibraryActionId) {
+  if (id === "delete-book") {
+    void deleteSelectedBooks();
+    return;
+  }
+  if (id === "bulk-edit" || id === "save-to-disk") {
+    runAction(id);
+    return;
+  }
+  // Everything else belongs to the details panel.
+  actionNonce += 1;
+  pendingBookAction.value = { id, nonce: actionNonce };
+}
 </script>
 
 <template>
@@ -1260,10 +1316,11 @@ onMenuAction(runAction);
           @toggle-selected="toggleSelected"
           @sort-by="onTableSort"
           @resize="onColumnResize"
+          @context-menu="openContextMenu"
         />
 
         <div v-else class="grid">
-          <button v-for="book in books" :key="book.id" class="card" :class="{ selected: selectMode && selectedIds.has(book.id) }" @click="onCardClick(book.id)">
+          <button v-for="book in books" :key="book.id" class="card" :class="{ selected: selectMode && selectedIds.has(book.id) }" @click="onCardClick(book.id)" @contextmenu.prevent="openContextMenu({ bookId: book.id, x: $event.clientX, y: $event.clientY })">
             <input v-if="selectMode" type="checkbox" class="card-checkbox" :checked="selectedIds.has(book.id)" @click.stop="toggleSelected(book.id)" />
             <img :src="`${book.thumbnail}?v=${cacheBust}`" :alt="book.title" loading="lazy" />
             <div class="card-title">{{ book.title }}</div>
@@ -1279,7 +1336,9 @@ onMenuAction(runAction);
       </main>
     </div>
 
-    <BookDetailsPanel v-if="selectedBookId !== null" :book-id="selectedBookId" @close="selectedBookId = null" @updated="onDetailsUpdated" @deleted="onDetailsDeleted" @open-book="selectedBookId = $event" />
+    <ContextMenu v-if="contextMenu" :x="contextMenu.x" :y="contextMenu.y" :entries="contextEntries" @choose="onContextChoose" @close="contextMenu = null" />
+
+    <BookDetailsPanel v-if="selectedBookId !== null" :book-id="selectedBookId" :pending-action="pendingBookAction" @close="selectedBookId = null" @updated="onDetailsUpdated" @deleted="onDetailsDeleted" @open-book="selectedBookId = $event" />
     <NoteEditor v-if="noteTarget" :field="noteTarget.field" :item-name="noteTarget.itemName" @close="noteTarget = null" />
 
     <div v-if="manageOpen" class="manage-backdrop" @click.self="manageOpen = false">
