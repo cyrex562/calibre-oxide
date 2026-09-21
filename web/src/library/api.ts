@@ -696,3 +696,45 @@ export async function fetchAllAnnotations(opts: { type?: string; bookIds?: numbe
   const data = await jsonFetch<{ count: number; annotations: LibraryAnnotation[] }>(`/annotations/all${qs ? `?${qs}` : ""}`);
   return data.annotations;
 }
+
+// Polish (#816 item 1.10). `oeb::polish` is 92 files of merged engine
+// that had no caller at all until POST /polish.
+export interface PolishOptions {
+  jacket: boolean;
+  remove_jacket: boolean;
+  smarten_punctuation: boolean;
+  remove_unused_css: boolean;
+  compress_images: boolean;
+  upgrade_book: boolean;
+  add_soft_hyphens: boolean;
+  remove_soft_hyphens: boolean;
+  download_external_resources: boolean;
+  embed: boolean;
+  subset: boolean;
+  remove_unused_classes: boolean;
+  merge_identical_selectors: boolean;
+  merge_rules_with_identical_properties: boolean;
+  remove_unreferenced_sheets: boolean;
+  remove_ncx: boolean;
+}
+
+export interface PolishBookResult {
+  book_id: number;
+  changed: boolean;
+  report?: string[];
+  error?: string;
+}
+
+export interface PolishResult {
+  changed: number;
+  failed: number;
+  books: PolishBookResult[];
+}
+
+export function polishBooks(bookIds: number[], options: Partial<PolishOptions>): Promise<PolishResult> {
+  return jsonFetch<PolishResult>("/polish", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ book_ids: bookIds, options }),
+  });
+}

@@ -7,6 +7,7 @@ import BookTable from "./BookTable.vue";
 import ContextMenu from "./ContextMenu.vue";
 import MapperDialog from "./MapperDialog.vue";
 import AnnotationsBrowser from "./AnnotationsBrowser.vue";
+import PolishDialog from "./PolishDialog.vue";
 import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
 import type { CheckLibraryResult, CustomRecipeOptions, DuplicateBook, NewsFeedInput, NewsSchedule, SaveToDiskResult } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
@@ -1058,6 +1059,9 @@ const actionHandlers: Partial<Record<LibraryActionId, () => void>> = {
   },
   "pick-random": () => pickRandomBook(),
   "mark-books": () => markSelection(),
+  polish: () => {
+    polishOpen.value = true;
+  },
   "show-marked": () => toggleShowMarked(),
   "clear-marks": () => clearMarks(),
   "export-catalog": () => exportCatalog(),
@@ -1194,7 +1198,7 @@ let actionNonce = 0;
 /** Book actions BookDetailsPanel knows how to perform. */
 const PANEL_ACTIONS: LibraryActionId[] = ["read", "edit-metadata", "fetch-metadata", "convert", "tweak-book", "quick-view", "test-template", "send-email", "replace-cover", "open-externally"];
 
-const contextEntries = computed(() => contextMenuEntries([...PANEL_ACTIONS, "similar-books", "mark-books", "bulk-edit", "save-to-disk", "delete-book"], actionContext.value));
+const contextEntries = computed(() => contextMenuEntries([...PANEL_ACTIONS, "similar-books", "mark-books", "polish", "bulk-edit", "save-to-disk", "delete-book"], actionContext.value));
 
 function openContextMenu(payload: { bookId: number; x: number; y: number }) {
   // Right-clicking a row that is not part of the current selection
@@ -1411,6 +1415,17 @@ async function pickRandomBook() {
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e);
   }
+}
+
+// Polish (#1.10). Acts on the selection, or the open book when
+// nothing is explicitly selected.
+const polishOpen = ref(false);
+
+const polishScope = computed(() => (selectMode.value && selectedIds.value.size > 0 ? [...selectedIds.value] : selectedBookId.value !== null ? [selectedBookId.value] : []));
+
+async function onPolished() {
+  cacheBust.value++;
+  await runSearch();
 }
 </script>
 
@@ -1657,6 +1672,8 @@ async function pickRandomBook() {
         </footer>
       </main>
     </div>
+
+    <PolishDialog v-if="polishOpen && polishScope.length" :book-ids="polishScope" @close="polishOpen = false" @done="onPolished" />
 
     <AnnotationsBrowser v-if="annotationsOpen" @close="annotationsOpen = false" @open-book="openBookFromAnnotation" />
 
