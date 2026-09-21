@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from "vue";
 import { isTauri, tauriInvoke } from "../tauri";
+import { activeRules, COLORING_RULES_PROFILE, DEFAULT_COLORING_RULES, type ColoringRule, type ColoringRulesPrefs } from "../library/coloringRules";
 import { fetchPluginCatalog, inspectPlugin, installFromCatalog, installPlugin, listPlugins, removePlugin, setPluginEnabled, type CatalogPlugin, type InstalledPlugin, getEmailAccount, saveEmailAccount, type EmailAccount } from "../library/api";
 import { DEFAULT_KEYMAP, DEFAULT_LIBRARY_PREFS, DEFAULT_READER_PREFS, DEFAULT_TOOLBAR_PREFS, fetchProfile, KEYMAP_ACTION_LABELS, KEYMAP_PROFILE, LIBRARY_PREFS_PROFILE, READER_PREFS_PROFILE, saveProfile, TOOLBAR_ACTIONS, TOOLBAR_PREFS_PROFILE, type KeymapAction, type KeymapPrefs, type LibraryPrefs, type ReaderPrefs, type ToolbarActionId, type ToolbarPrefs } from "./api";
 
@@ -89,6 +90,49 @@ async function installCatalogPlugin(name: string) {
     catalogError.value = e instanceof Error ? e.message : String(e);
   } finally {
     catalogBusy.value = false;
+  }
+}
+
+// Row colouring rules (#4.1). A rule is a template evaluated per
+// book; a usable colour in the result colours that row. First enabled
+// matching rule wins, so this list's order is the precedence.
+const coloringRules = ref<ColoringRule[]>([]);
+const coloringSaved = ref(false);
+const coloringError = ref<string | null>(null);
+
+async function loadColoringRules() {
+  try {
+    const prefs = await fetchProfile<ColoringRulesPrefs>(COLORING_RULES_PROFILE);
+    coloringRules.value = prefs?.rules ?? DEFAULT_COLORING_RULES.rules;
+  } catch (e) {
+    console.error("failed to load colouring rules", e);
+  }
+}
+
+function addColoringRule() {
+  coloringRules.value = [...coloringRules.value, { name: `Rule ${coloringRules.value.length + 1}`, template: "", enabled: true }];
+}
+
+function removeColoringRule(index: number) {
+  coloringRules.value = coloringRules.value.filter((_, i) => i !== index);
+}
+
+function moveColoringRule(index: number, delta: number) {
+  const to = index + delta;
+  if (to < 0 || to >= coloringRules.value.length) return;
+  const next = [...coloringRules.value];
+  [next[index], next[to]] = [next[to], next[index]];
+  coloringRules.value = next;
+}
+
+async function saveColoringRules() {
+  coloringError.value = null;
+  coloringSaved.value = false;
+  try {
+    await saveProfile(COLORING_RULES_PROFILE, { rules: coloringRules.value });
+    coloringSaved.value = true;
+  } catch (e) {
+    coloringError.value = e instanceof Error ? e.message : String(e);
   }
 }
 
@@ -229,6 +273,7 @@ onMounted(() => {
   load();
   void loadCatalog();
   void loadEmailAccount();
+  void loadColoringRules();
   window.addEventListener("keydown", onRebindKeydown);
 });
 onBeforeUnmount(() => window.removeEventListener("keydown", onRebindKeydown));
@@ -384,6 +429,31 @@ async function toggleAutoReopen() {
       </section>
 
       <section v-if="pluginsAvailable" class="pane">
+        <h3>Row colours</h3>
+        <p class="hint">
+          Each rule is a template evaluated against every book; if it returns a colour
+          name or a hex value, that book's row takes it. The first enabled rule that
+          matches wins, so order matters — anything else is ignored.
+        </p>
+        <ul class="coloring-list">
+          <li v-for="(r, i) in coloringRules" :key="i" class="coloring-row">
+            <label class="field checkbox"><input type="checkbox" v-model="r.enabled" /></label>
+            <input v-model="r.name" class="coloring-name" placeholder="Name" />
+            <input v-model="r.template" class="coloring-template" placeholder="program: test(field('series'), 'blue', '')" />
+            <button type="button" :disabled="i === 0" title="Move up" @click="moveColoringRule(i, -1)">↑</button>
+            <button type="button" :disabled="i === coloringRules.length - 1" title="Move down" @click="moveColoringRule(i, 1)">↓</button>
+            <button type="button" title="Remove" @click="removeColoringRule(i)">✕</button>
+          </li>
+        </ul>
+        <div class="plugin-actions">
+          <button type="button" @click="addColoringRule">+ Add rule</button>
+          <button type="button" @click="saveColoringRules">Save colour rules</button>
+        </div>
+        <p v-if="coloringError" class="error">{{ coloringError }}</p>
+        <p v-else-if="coloringSaved" class="status">Saved. {{ activeRules(coloringRules).length }} rule(s) active.</p>
+      </section>
+
+      <section class="pane">
         <h3>Email</h3>
         <p class="hint">
           Used when sending a book by email. Everything here is saved except the
@@ -668,6 +738,27 @@ async function toggleAutoReopen() {
   .catalog-row {
     border-bottom-color: #2b3037;
   }
+}
+
+/* Colouring rules (#4.1). */
+.coloring-list {
+  list-style: none;
+  margin: 0 0 0.5rem;
+  padding: 0;
+}
+.coloring-row {
+  display: flex;
+  gap: 0.35rem;
+  align-items: center;
+  margin-bottom: 0.3rem;
+}
+.coloring-name {
+  width: 10rem;
+}
+.coloring-template {
+  flex: 1;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.82rem;
 }
 
 </style>

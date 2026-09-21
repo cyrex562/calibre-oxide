@@ -13,6 +13,8 @@ import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LI
 import type { CheckLibraryResult, CustomRecipeOptions, DuplicateBook, NewsFeedInput, NewsSchedule, SaveToDiskResult } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
 import { similarBooksQuery } from "../library/query";
+import { activeRules, colorForBook, COLORING_RULES_PROFILE, DEFAULT_COLORING_RULES, type ColoringRule, type ColoringRulesPrefs } from "../library/coloringRules";
+import { evaluateTemplateBulk } from "../library/api";
 import { changesFor, isEmptySpec, REPLACEABLE_FIELDS, validateSpec, type BulkEditSpec } from "../library/bulkEdit";
 import { clampWidth, columnsFor, DEFAULT_TABLE_PREFS, resolveColumns, TABLE_PREFS_PROFILE, type BookColumn, type LibraryViewMode, type TablePrefs } from "../library/columns";
 import { actionEnabled, contextMenuEntries, LIBRARY_ACTIONS, visibleToolbarActions, type ActionContext, type LibraryAction, type LibraryActionId } from "../library/actions";
@@ -1436,6 +1438,58 @@ async function onPolished() {
 // In-app help (#1.17), generated from the registry and the live
 // keymap so it cannot go stale.
 const helpOpen = ref(false);
+
+// ---------------------------------------------------------------
+// Row colouring rules (#4.1)
+// ---------------------------------------------------------------
+//
+// A rule is a template evaluated per book; a usable colour in the
+// result colours that row. Evaluation goes through the bulk route --
+// one request for the whole page rather than one per row.
+//
+// What a template returns is checked against an allowlist before it
+// reaches a `style` attribute (library/coloringRules.ts): a template
+// is user-authored text and can return anything.
+
+const coloringRules = ref<ColoringRule[]>([]);
+const rowColors = ref<Record<number, string>>({});
+
+async function loadColoringRules() {
+  try {
+    const prefs = await fetchProfile<ColoringRulesPrefs>(COLORING_RULES_PROFILE);
+    coloringRules.value = prefs?.rules ?? DEFAULT_COLORING_RULES.rules;
+  } catch (e) {
+    console.error("failed to load colouring rules", e);
+  }
+}
+void loadColoringRules();
+
+async function applyColoringRules() {
+  const rules = activeRules(coloringRules.value);
+  const ids = books.value.map((b) => b.id);
+  if (rules.length === 0 || ids.length === 0) {
+    rowColors.value = {};
+    return;
+  }
+  try {
+    // One request per rule, not per book: a rule is the same template
+    // for every row, and the server parses it once.
+    const perRule = await Promise.all(rules.map((r) => evaluateTemplateBulk(r.template, ids)));
+    const next: Record<number, string> = {};
+    for (const id of ids) {
+      const color = colorForBook(rules, perRule.map((results) => results[String(id)]));
+      if (color) next[id] = color;
+    }
+    rowColors.value = next;
+  } catch (e) {
+    // Colouring is decoration; a failure must not take down the list.
+    console.error("failed to apply colouring rules", e);
+    rowColors.value = {};
+  }
+}
+
+// Re-run whenever the visible set or the rules change.
+watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
 </script>
 
 <template>
@@ -1662,6 +1716,7 @@ const helpOpen = ref(false);
           @sort-by="onTableSort"
           @resize="onColumnResize"
           @context-menu="openContextMenu"
+          :row-colors="rowColors"
         />
 
         <div v-else class="grid">

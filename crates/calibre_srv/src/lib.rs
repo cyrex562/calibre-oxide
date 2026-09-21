@@ -351,6 +351,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/custom-columns", get(custom_columns::list))
         .route("/custom-columns/add", post(custom_columns::add))
         .route("/custom-columns/remove/{label}", post(custom_columns::remove))
+        .route("/template-tester/evaluate-bulk/{library_id}", post(template_tester::evaluate_bulk))
         .route("/template-tester/evaluate/{book_id}/{library_id}", post(template_tester::evaluate))
         .route("/save-to-disk/{library_id}", post(save_to_disk::save_to_disk))
         .route("/duplicates/scan/{library_id}", post(duplicates::scan))
