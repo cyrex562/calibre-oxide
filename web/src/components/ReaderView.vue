@@ -11,6 +11,7 @@ import { wrapHighlightRange } from "../reader/highlightDom";
 import PdfReader from "./PdfReader.vue";
 import { extractText, findMatches, totalMatches, type SpineMatches } from "../reader/search";
 import { isNoteReference, noteTextFor } from "../reader/footnotes";
+import { adjustSpeed, autoScrollPixels, DEFAULT_AUTO_SCROLL_SPEED, detectSwipe, type Point } from "../reader/gestures";
 import { DEFAULT_KEYMAP, DEFAULT_READER_PREFS, fetchProfile, KEYMAP_PROFILE, READER_PREFS_PROFILE, type KeymapPrefs, type ReaderPrefs } from "../settings/api";
 import type { Bookmark, BookManifest, Highlight } from "../reader/types";
 
@@ -125,6 +126,7 @@ async function loadSpine(index: number, frag = "") {
   }
   installAnchorHandler(m);
   installSelectionHandler();
+  installTouchHandler();
   renderHighlights();
   savePosition(frag);
 }
@@ -428,7 +430,10 @@ onMounted(() => {
   window.addEventListener("keydown", onKeydown);
   if (!isPdf.value) void init();
 });
-onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
+onBeforeUnmount(() => {
+  window.removeEventListener("keydown", onKeydown);
+  stopAutoScroll();
+});
 watch([bookId, fmt], () => {
   if (!isPdf.value) void init();
 });
@@ -608,6 +613,123 @@ async function showFootnote(m: BookManifest, name: string, frag: string, anchor:
   // Deferred so the click that opened it does not immediately close it.
   setTimeout(() => doc.addEventListener("click", dismiss, true), 0);
 }
+
+// ---------------------------------------------------------------
+// Touch gestures, auto-scroll and printing (#2.7 / #2.8)
+// ---------------------------------------------------------------
+//
+// The reader was mouse-and-keyboard only: on a tablet or a
+// touchscreen laptop there was no way to turn a page at all. The
+// geometry lives in reader/gestures.ts, where its thresholds can be
+// stated and tested -- every one of them is wrong in a specific,
+// reproducible way if guessed.
+
+function installTouchHandler() {
+  const doc = iframeEl.value?.contentDocument;
+  if (!doc) return;
+
+  let start: Point | null = null;
+
+  doc.addEventListener(
+    "touchstart",
+    (event) => {
+      const t = event.touches[0];
+      start = t ? { x: t.clientX, y: t.clientY, t: event.timeStamp } : null;
+    },
+    { passive: true },
+  );
+
+  doc.addEventListener(
+    "touchend",
+    (event) => {
+      const t = event.changedTouches[0];
+      if (!start || !t) return;
+      const swipe = detectSwipe(start, { x: t.clientX, y: t.clientY, t: event.timeStamp });
+      start = null;
+      // Only horizontal swipes turn pages: vertical ones are the
+      // reader scrolling, which the browser already handles.
+      if (swipe === "left") next();
+      else if (swipe === "right") prev();
+    },
+    { passive: true },
+  );
+}
+
+const autoScrolling = ref(false);
+const autoScrollSpeed = ref(DEFAULT_AUTO_SCROLL_SPEED);
+let autoScrollFrame: number | null = null;
+let autoScrollLast = 0;
+// Sub-pixel remainder: rounding every tick to a whole pixel would
+// make the slowest speeds round to zero and never move.
+let autoScrollRemainder = 0;
+
+function stepAutoScroll(now: number) {
+  const view = iframeEl.value?.contentWindow;
+  const doc = iframeEl.value?.contentDocument;
+  if (!autoScrolling.value || !view || !doc) return;
+
+  const elapsed = autoScrollLast ? now - autoScrollLast : 0;
+  autoScrollLast = now;
+
+  autoScrollRemainder += autoScrollPixels(autoScrollSpeed.value, elapsed);
+  const whole = Math.floor(autoScrollRemainder);
+  if (whole > 0) {
+    autoScrollRemainder -= whole;
+    const before = view.scrollY;
+    view.scrollBy(0, whole);
+    // At the bottom of a section, move to the next one rather than
+    // stalling against the end of the document.
+    if (view.scrollY === before) {
+      const m = manifest.value;
+      if (m && spineIndex.value < m.spine.length - 1) next();
+      else stopAutoScroll();
+    }
+  }
+  autoScrollFrame = view.requestAnimationFrame(stepAutoScroll);
+}
+
+function startAutoScroll() {
+  const view = iframeEl.value?.contentWindow;
+  if (!view) return;
+  autoScrolling.value = true;
+  autoScrollLast = 0;
+  autoScrollRemainder = 0;
+  autoScrollFrame = view.requestAnimationFrame(stepAutoScroll);
+}
+
+function stopAutoScroll() {
+  autoScrolling.value = false;
+  const view = iframeEl.value?.contentWindow;
+  if (autoScrollFrame !== null && view) view.cancelAnimationFrame(autoScrollFrame);
+  autoScrollFrame = null;
+}
+
+function toggleAutoScroll() {
+  if (autoScrolling.value) stopAutoScroll();
+  else startAutoScroll();
+}
+
+function changeAutoScrollSpeed(delta: number) {
+  autoScrollSpeed.value = adjustSpeed(autoScrollSpeed.value, delta);
+}
+
+/**
+ * Prints the section on screen (#2.8).
+ *
+ * The iframe prints itself, so the book's own stylesheet applies and
+ * the reader's chrome does not. Printing the *whole* book would mean
+ * assembling every spine file into one document first, which is a
+ * different feature; upstream generates a PDF for that.
+ */
+function printCurrentSection() {
+  const view = iframeEl.value?.contentWindow;
+  if (!view) return;
+  // Auto-scroll fighting the print dialog moves the page under the
+  // user while they are looking at it.
+  stopAutoScroll();
+  view.focus();
+  view.print();
+}
 </script>
 
 <template>
@@ -635,6 +757,15 @@ async function showFootnote(m: BookManifest, name: string, frag: string, anchor:
       <button @click="prev" :disabled="spineIndex <= 0">◀ Prev</button>
       <span class="title">{{ manifest?.metadata?.title ?? "" }}</span>
       <button @click="next" :disabled="!manifest || spineIndex >= manifest.spine.length - 1">Next ▶</button>
+      <button @click="printCurrentSection" :disabled="!manifest" title="Print the section on screen">Print</button>
+      <span class="autoscroll" :class="{ active: autoScrolling }">
+        <button @click="toggleAutoScroll" :disabled="!manifest">{{ autoScrolling ? "⏸ Auto-scroll" : "▶ Auto-scroll" }}</button>
+        <template v-if="autoScrolling">
+          <button @click="changeAutoScrollSpeed(-1)" title="Slower">−</button>
+          <span class="autoscroll-speed">{{ autoScrollSpeed }}×</span>
+          <button @click="changeAutoScrollSpeed(1)" title="Faster">+</button>
+        </template>
+      </span>
       <button @click="toggleReadAloud" :disabled="!manifest" :class="{ active: readAloudActive }">
         {{ readAloudLoading ? "Synthesizing…" : readAloudActive ? "⏹ Stop reading" : "🔊 Read aloud" }}
       </button>
@@ -844,6 +975,24 @@ async function showFootnote(m: BookManifest, name: string, frag: string, anchor:
   .book-search-hits li:hover {
     background: #252b36;
   }
+}
+
+/* Auto-scroll controls (#2.8). */
+.autoscroll {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+}
+.autoscroll.active {
+  outline: 1px solid currentColor;
+  border-radius: 4px;
+  padding: 0 0.15rem;
+}
+.autoscroll-speed {
+  font-variant-numeric: tabular-nums;
+  font-size: 0.85rem;
+  min-width: 2.5rem;
+  text-align: center;
 }
 
 </style>
