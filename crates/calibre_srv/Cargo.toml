@@ -9,6 +9,8 @@ name = "calibre_srv"
 path = "src/main.rs"
 
 [dependencies]
+# Validating user-supplied mapper patterns up front (#816 item 1.7).
+regex = "1"
 calibre_conversion = { path = "../calibre_conversion" }
 calibre_db = { path = "../calibre_db" }
 calibre_ebooks = { path = "../calibre_ebooks" }

@@ -640,3 +640,36 @@ export function setPluginEnabled(name: string, enabled: boolean): Promise<{ ok: 
     body: JSON.stringify({ enabled }),
   });
 }
+
+// Author/tag mapping (#816 item 1.7). Preview and apply run the same
+// computation server-side; only `applyMapper` writes.
+export interface MapperRule {
+  action: string;
+  query: string;
+  replace?: string;
+  match_type: string;
+}
+
+export interface MappedBook {
+  book_id: number;
+  title: string;
+  before: string[];
+  after: string[];
+}
+
+export interface MapperResult {
+  changed: number;
+  books: MappedBook[];
+}
+
+function mapperBody(field: "authors" | "tags", rules: MapperRule[], bookIds: number[]) {
+  return JSON.stringify({ field, rules, book_ids: bookIds });
+}
+
+export function previewMapper(field: "authors" | "tags", rules: MapperRule[], bookIds: number[] = []): Promise<MapperResult> {
+  return jsonFetch<MapperResult>("/mapper/preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: mapperBody(field, rules, bookIds) });
+}
+
+export function applyMapper(field: "authors" | "tags", rules: MapperRule[], bookIds: number[] = []): Promise<MapperResult> {
+  return jsonFetch<MapperResult>("/mapper/apply", { method: "POST", headers: { "Content-Type": "application/json" }, body: mapperBody(field, rules, bookIds) });
+}

@@ -5,6 +5,7 @@ import NoteEditor from "./NoteEditor.vue";
 import BookDetailsPanel from "./BookDetailsPanel.vue";
 import BookTable from "./BookTable.vue";
 import ContextMenu from "./ContextMenu.vue";
+import MapperDialog from "./MapperDialog.vue";
 import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
 import type { CheckLibraryResult, CustomRecipeOptions, DuplicateBook, NewsFeedInput, NewsSchedule, SaveToDiskResult } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
@@ -1047,6 +1048,9 @@ const actionHandlers: Partial<Record<LibraryActionId, () => void>> = {
   "custom-columns": () => openColumns(),
   "check-library": () => openCheckLibrary(),
   "find-duplicates": () => openDuplicates(),
+  "map-metadata": () => {
+    mapperOpen.value = true;
+  },
   "export-catalog": () => exportCatalog(),
   "export-library-archive": () => exportLibraryArchive(),
   "fetch-news": () => openNews(),
@@ -1074,6 +1078,7 @@ const HIDDEN_IN_FTS_MODE: ReadonlySet<LibraryActionId> = new Set<LibraryActionId
   "custom-columns",
   "check-library",
   "find-duplicates",
+  "map-metadata",
   "export-catalog",
   "export-library-archive",
   "fetch-news",
@@ -1271,6 +1276,19 @@ function onLibraryKeydown(event: KeyboardEvent) {
 
 onMounted(() => window.addEventListener("keydown", onLibraryKeydown));
 onBeforeUnmount(() => window.removeEventListener("keydown", onLibraryKeydown));
+
+// Author/tag mapping (#1.7). The engines -- metadata::author_mapper
+// and ::tag_mapper -- were ported long ago with nothing calling them;
+// this and POST /mapper/{preview,apply} are the callers.
+const mapperOpen = ref(false);
+
+/** Scope: the current selection, or the whole library when empty. */
+const mapperScope = computed(() => (selectMode.value ? [...selectedIds.value] : []));
+
+async function onMapperApplied() {
+  cacheBust.value++;
+  await runSearch();
+}
 </script>
 
 <template>
@@ -1502,6 +1520,8 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onLibraryKeydown));
         </footer>
       </main>
     </div>
+
+    <MapperDialog v-if="mapperOpen" :book-ids="mapperScope" @close="mapperOpen = false" @applied="onMapperApplied" />
 
     <ContextMenu v-if="contextMenu" :x="contextMenu.x" :y="contextMenu.y" :entries="contextEntries" @choose="onContextChoose" @close="contextMenu = null" />
 

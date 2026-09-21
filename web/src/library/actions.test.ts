@@ -22,9 +22,16 @@ describe("the registry itself", () => {
   // their `hidden`/`order` arrays. Renaming one silently drops a
   // user's saved toolbar layout for that action, which no type error
   // would catch -- the prefs are JSON on a server, not TypeScript.
-  it("keeps every pre-existing toolbar action id verbatim", () => {
+  it("keeps every pre-existing toolbar action id verbatim, in its original relative order", () => {
+    // Adding a *new* toolbar action is fine; renaming, dropping or
+    // reordering an existing one is not, because that is what the
+    // persisted prefs reference. So this asserts the original ids
+    // survive as a subsequence rather than as the whole list.
     const before = ["manage-lists", "custom-columns", "check-library", "find-duplicates", "export-catalog", "export-library-archive", "fetch-news", "add-books", "add-folder", "switch-library"];
-    expect(TOOLBAR_ACTIONS.map((a) => a.id)).toEqual(before);
+    const now = TOOLBAR_ACTIONS.map((a) => a.id);
+
+    for (const id of before) expect(now, `${id} disappeared from the toolbar registry`).toContain(id);
+    expect(now.filter((id) => before.includes(id))).toEqual(before);
   });
 
   it("does not offer book-scoped actions in the toolbar", () => {
@@ -137,9 +144,9 @@ describe("the native menu spec", () => {
 
 describe("what the toolbar renders", () => {
   // The ids LibraryView.vue actually supplies handlers for.
-  const HANDLED: LibraryActionId[] = ["manage-lists", "custom-columns", "check-library", "find-duplicates", "export-catalog", "export-library-archive", "fetch-news", "add-books", "add-folder", "switch-library", "select-mode", "bulk-edit", "save-to-disk"];
+  const HANDLED: LibraryActionId[] = ["manage-lists", "custom-columns", "check-library", "find-duplicates", "map-metadata", "export-catalog", "export-library-archive", "fetch-news", "add-books", "add-folder", "switch-library", "select-mode", "bulk-edit", "save-to-disk"];
 
-  const FTS_SUPPRESSED = new Set<LibraryActionId>(["manage-lists", "custom-columns", "check-library", "find-duplicates", "export-catalog", "export-library-archive", "fetch-news", "select-mode", "bulk-edit", "save-to-disk"]);
+  const FTS_SUPPRESSED = new Set<LibraryActionId>(["manage-lists", "custom-columns", "check-library", "find-duplicates", "map-metadata", "export-catalog", "export-library-archive", "fetch-news", "select-mode", "bulk-edit", "save-to-disk"]);
 
   const base = { handled: HANDLED, hidden: [] as LibraryActionId[] };
 
@@ -149,7 +156,7 @@ describe("what the toolbar renders", () => {
   // and nothing else in the suite would notice.
   it("renders the full desktop toolbar when nothing is hidden or suppressed", () => {
     const ids = visibleToolbarActions({ ...base, ctx: DESKTOP }).map((a) => a.id);
-    expect(ids).toEqual(["manage-lists", "custom-columns", "check-library", "find-duplicates", "export-catalog", "export-library-archive", "fetch-news", "add-books", "add-folder", "switch-library", "select-mode"]);
+    expect(ids).toEqual(["manage-lists", "custom-columns", "check-library", "find-duplicates", "map-metadata", "export-catalog", "export-library-archive", "fetch-news", "add-books", "add-folder", "switch-library", "select-mode"]);
   });
 
   it("drops the two desktop-only actions in a browser tab", () => {
