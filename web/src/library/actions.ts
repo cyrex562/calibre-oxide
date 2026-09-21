@@ -60,9 +60,17 @@ export interface LibraryAction {
    */
   desktopOnly?: boolean;
   /**
-   * Eligible for the header toolbar, and therefore offered in the
-   * toolbar-customization settings panel. Actions that only make
-   * sense against a specific book (`group: "book"`) are not.
+   * Three states, deliberately:
+   * - `true`  -- rendered in the toolbar *and* offered in the
+   *   toolbar-customization settings panel.
+   * - omitted -- rendered in the toolbar, but not customizable
+   *   (the selection actions, which appear and vanish with the
+   *   selection and so have nothing stable to reorder).
+   * - `false` -- never in the toolbar, because a dedicated control
+   *   already exists for it.
+   *
+   * Actions that only make sense against a specific book
+   * (`group: "book"`) are never toolbar-eligible.
    */
   toolbar?: boolean;
   /** Offered in a book's right-click context menu (#1.2). */
@@ -84,6 +92,8 @@ export type LibraryActionId =
   | "switch-library"
   // Selection-scoped.
   | "select-mode"
+  | "focus-search"
+  | "toggle-view"
   | "bulk-edit"
   | "save-to-disk"
   // Book-scoped.
@@ -122,6 +132,12 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   { id: "switch-library", label: "Switch library…", group: "library", requires: "none", toolbar: true, desktopOnly: true },
 
   { id: "select-mode", label: "Select…", group: "view", requires: "none" },
+  // `toolbar: false` because both already have dedicated controls --
+  // the search box and the Table/Grid switch. They are registry
+  // entries so a keyboard shortcut can bind to a real action id
+  // rather than needing a catalogue of its own.
+  { id: "focus-search", label: "Search", group: "view", requires: "none", toolbar: false },
+  { id: "toggle-view", label: "Switch table/grid", group: "view", requires: "none", toolbar: false },
   { id: "bulk-edit", label: "Bulk edit", group: "selection", requires: "selection" },
   { id: "save-to-disk", label: "Save to disk", group: "selection", requires: "selection" },
 

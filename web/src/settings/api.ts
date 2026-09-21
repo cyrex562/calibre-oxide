@@ -60,13 +60,56 @@ export const READER_PREFS_PROFILE = "reader-prefs";
 // dual-binding with a single real configurable key per action rather
 // than preserving both as permanent unconfigurable fallbacks -- a
 // real, disclosed narrowing, not an oversight.
-export type KeymapAction = "readerNext" | "readerPrev";
+// Extended to the library in #1.3. The two reader bindings were the
+// whole keymap until then, so this panel configured almost nothing.
+//
+// Library shortcuts are named by their *registry* action id, so a
+// binding always points at a real action and the three surfaces
+// (toolbar, context menu, shortcuts) cannot disagree about what
+// exists.
+export type LibraryKeymapAction = Extract<LibraryActionId, "focus-search" | "add-books" | "select-mode" | "bulk-edit" | "save-to-disk" | "delete-book" | "toggle-view" | "find-duplicates">;
+
+export type KeymapAction = "readerNext" | "readerPrev" | LibraryKeymapAction;
 
 export type KeymapPrefs = Record<KeymapAction, string>;
 
-export const DEFAULT_KEYMAP: KeymapPrefs = { readerNext: "ArrowRight", readerPrev: "ArrowLeft" };
+// Single, unmodified keys. That is only safe because `shortcutFor`
+// refuses to fire while the user is typing or holding a modifier --
+// without that guard these would eat ordinary text input.
+//
+// `save-to-disk` is "S" rather than "s": `KeyboardEvent.key` reports a
+// shifted letter in upper case, which is how the two stay distinct.
+export const DEFAULT_KEYMAP: KeymapPrefs = {
+  readerNext: "ArrowRight",
+  readerPrev: "ArrowLeft",
+  "focus-search": "/",
+  "add-books": "a",
+  "select-mode": "s",
+  "bulk-edit": "e",
+  "save-to-disk": "S",
+  "delete-book": "Delete",
+  "toggle-view": "v",
+  "find-duplicates": "d",
+};
 
-export const KEYMAP_ACTION_LABELS: Record<KeymapAction, string> = { readerNext: "Reader: next page", readerPrev: "Reader: previous page" };
+export const KEYMAP_ACTION_LABELS: Record<KeymapAction, string> = {
+  readerNext: "Reader: next page",
+  readerPrev: "Reader: previous page",
+  "focus-search": "Library: focus search",
+  "add-books": "Library: add books",
+  "select-mode": "Library: toggle select mode",
+  "bulk-edit": "Library: bulk edit selection",
+  "save-to-disk": "Library: save selection to disk",
+  "delete-book": "Library: delete selection",
+  "toggle-view": "Library: switch table/grid",
+  "find-duplicates": "Library: find duplicates",
+};
+
+/** The library half of the keymap, for `shortcutFor`. */
+export function libraryShortcuts(keymap: KeymapPrefs): ShortcutMap {
+  const { readerNext: _next, readerPrev: _prev, ...library } = keymap;
+  return library;
+}
 
 export const KEYMAP_PROFILE = "keymap";
 
@@ -82,7 +125,8 @@ export const KEYMAP_PROFILE = "keymap";
 // this panel already consumed, and every id string is unchanged, so
 // `ToolbarPrefs` blobs already persisted server-side still apply.
 export { TOOLBAR_ACTIONS, type ToolbarActionId } from "../library/actions";
-import type { ToolbarActionId } from "../library/actions";
+import type { LibraryActionId, ToolbarActionId } from "../library/actions";
+import type { ShortcutMap } from "../library/shortcuts";
 
 export interface ToolbarPrefs {
   /// Action ids hidden from the toolbar.
