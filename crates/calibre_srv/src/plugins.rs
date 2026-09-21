@@ -109,6 +109,52 @@ pub async fn install(State(state): State<AppState>, Json(body): Json<PathBody>) 
     Ok(Json(package_json(&pkg, true)))
 }
 
+/// `GET /plugins/catalog` -- what is available to install, and
+/// whether each is already installed or has a newer version waiting
+/// (issue #816 item 1.14).
+///
+/// The catalog is a plain directory of packages, not a hosted index:
+/// plugins for this port have to be written against its WASM ABI
+/// rather than carried over from calibre's Python ones, so the
+/// realistic source is a repo directory or a git submodule.
+pub async fn catalog(State(state): State<AppState>) -> Result<Json<Value>, ServerError> {
+    let store = store(&state)?;
+    let installed: std::collections::HashMap<String, String> =
+        store.list().map_err(|e| ServerError::InternalServerError(e.to_string()))?.into_iter().map(|p| (p.manifest.name.clone(), p.manifest.version.clone())).collect();
+
+    let entries: Vec<Value> = store
+        .catalog()
+        .into_iter()
+        .map(|(_, pkg)| {
+            let installed_version = installed.get(&pkg.manifest.name).cloned();
+            // Ordering matters here: a plain string compare would
+            // report "1.10.0" as older than "1.9.0" and offer a
+            // downgrade as an update.
+            let update_available = installed_version
+                .as_deref()
+                .map(|iv| calibre_plugins_wasm::manifest::compare_versions(&pkg.manifest.version, iv) == std::cmp::Ordering::Greater)
+                .unwrap_or(false);
+
+            let mut value = package_json(&pkg, true);
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("installed".to_string(), json!(installed_version.is_some()));
+                obj.insert("installed_version".to_string(), json!(installed_version));
+                obj.insert("update_available".to_string(), json!(update_available));
+            }
+            value
+        })
+        .collect();
+
+    Ok(Json(json!({ "configured": store.catalog_dir().is_some(), "plugins": entries })))
+}
+
+/// `POST /plugins/install-from-catalog/{name}`.
+pub async fn install_from_catalog(State(state): State<AppState>, AxumPath(name): AxumPath<String>) -> Result<Json<Value>, ServerError> {
+    let store = store(&state)?;
+    let pkg = store.install_from_catalog(&name).map_err(|e| ServerError::NotFound(e.to_string()))?;
+    Ok(Json(package_json(&pkg, true)))
+}
+
 /// `POST /plugins/remove/{name}`.
 pub async fn remove(State(state): State<AppState>, AxumPath(name): AxumPath<String>) -> Result<Json<Value>, ServerError> {
     let store = store(&state)?;
@@ -159,8 +205,12 @@ mod tests {
     use calibre_db::cache::Cache;
 
     fn write_package(dir: &std::path::Path, file: &str, name: &str, extra: &str) -> std::path::PathBuf {
+        write_package_versioned(dir, file, name, "1.2.3", extra)
+    }
+
+    fn write_package_versioned(dir: &std::path::Path, file: &str, name: &str, version: &str, extra: &str) -> std::path::PathBuf {
         let json = format!(
-            r#"{{"abi_version": 1, "name": "{name}", "version": "1.2.3", "author": "A Third Party",
+            r#"{{"abi_version": 1, "name": "{name}", "version": "{version}", "author": "A Third Party",
                  "description": "does a thing", "plugin_type": "file_type",
                  "wasm": "p.wasm", "file_types": ["txt"]{extra}}}"#
         );
@@ -174,6 +224,37 @@ mod tests {
         zip.write_all(b"\0asm\x01\x00\x00\x00").unwrap();
         zip.finish().unwrap();
         path
+    }
+
+    /// Like `test_app`, but the store also has a catalog directory.
+    /// Returns the temp dir, the router, and the catalog path so a
+    /// test can drop packages into it.
+    fn test_app_with_catalog() -> (tempfile::TempDir, axum::Router, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        let catalog = dir.path().join("catalog");
+        std::fs::create_dir_all(&catalog).unwrap();
+        let plugin_store = std::sync::Arc::new(calibre_plugins_wasm::PluginStore::open(dir.path().join("plugins")).unwrap().with_catalog(Some(catalog.clone())));
+
+        let state = crate::AppState {
+            libraries: None,
+            cache: std::sync::Arc::new(cache),
+            opts: std::sync::Arc::new(crate::opts::ServerOptions::default()),
+            auth: None,
+            changes: crate::web_socket::new_change_broadcaster(),
+            reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()),
+            book_cache: std::sync::Arc::new(crate::books_cache::BookCache::open_temp()),
+            jobs: std::sync::Arc::new(crate::jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
+            render_jobs: std::sync::Arc::new(crate::render_endpoints::RenderJobRegistry::new()),
+            conversion_jobs: std::sync::Arc::new(crate::convert::ConversionJobRegistry::new()),
+            news_jobs: std::sync::Arc::new(crate::news::NewsJobRegistry::new()),
+            tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()),
+            news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()),
+            tts_voice: None,
+            plugin_store: Some(plugin_store),
+            plugin_registry: std::sync::Arc::new(std::sync::Mutex::new(calibre_customize::registry::PluginRegistry::new())),
+        };
+        (dir, crate::test_router(state), catalog)
     }
 
     /// Builds a router with plugins either enabled (a real store) or
@@ -346,5 +427,112 @@ mod tests {
         let (_dir, router) = test_app(true);
         let (status, _) = post_json(&router, "/plugins/set-enabled/Ghost", serde_json::json!({"enabled": false})).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // ---------------------------------------------------------------
+    // Catalog (#816 item 1.14)
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn the_catalog_lists_what_is_available_to_install() {
+        let (_d, router, catalog) = test_app_with_catalog();
+        write_package(&catalog, "a.zip", "Alpha Plugin", "");
+        write_package(&catalog, "b.zip", "Beta Plugin", "");
+
+        let (status, body) = get_json(&router, "/plugins/catalog").await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["configured"], true);
+        let names: Vec<&str> = body["plugins"].as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["Alpha Plugin", "Beta Plugin"], "sorted by name: {body}");
+        assert_eq!(body["plugins"][0]["installed"], false);
+    }
+
+    #[tokio::test]
+    async fn a_server_without_a_catalog_says_so_rather_than_erroring() {
+        let (_d, router) = test_app(true);
+
+        let (status, body) = get_json(&router, "/plugins/catalog").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["configured"], false, "the UI needs to distinguish 'no catalog' from 'empty catalog': {body}");
+        assert_eq!(body["plugins"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn installing_from_the_catalog_really_installs_it() {
+        let (_d, router, catalog) = test_app_with_catalog();
+        write_package(&catalog, "a.zip", "Alpha Plugin", "");
+
+        let (status, body) = post_json(&router, "/plugins/install-from-catalog/Alpha%20Plugin", serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (_, listed) = get_json(&router, "/plugins/list").await;
+        assert_eq!(listed["plugins"][0]["name"], "Alpha Plugin");
+
+        let (_, cat) = get_json(&router, "/plugins/catalog").await;
+        assert_eq!(cat["plugins"][0]["installed"], true);
+        assert_eq!(cat["plugins"][0]["installed_version"], "1.2.3");
+        assert_eq!(cat["plugins"][0]["update_available"], false);
+    }
+
+    /// The reason `compare_versions` exists. A plain string compare
+    /// puts "1.10.0" *before* "1.9.0", so this would report the newer
+    /// catalog entry as not-an-update -- and the reverse case would
+    /// offer a downgrade as an update.
+    #[tokio::test]
+    async fn a_newer_catalog_version_is_reported_as_an_update() {
+        let (_d, router, catalog) = test_app_with_catalog();
+
+        let installed = write_package_versioned(catalog.parent().unwrap(), "old.zip", "Alpha Plugin", "1.9.0", "");
+        post_json(&router, "/plugins/install", serde_json::json!({ "path": installed.to_str().unwrap() })).await;
+
+        write_package_versioned(&catalog, "a.zip", "Alpha Plugin", "1.10.0", "");
+
+        let (_, body) = get_json(&router, "/plugins/catalog").await;
+
+        assert_eq!(body["plugins"][0]["installed_version"], "1.9.0");
+        assert_eq!(body["plugins"][0]["version"], "1.10.0");
+        assert_eq!(body["plugins"][0]["update_available"], true, "{body}");
+    }
+
+    #[tokio::test]
+    async fn an_older_catalog_version_is_not_offered_as_an_update() {
+        let (_d, router, catalog) = test_app_with_catalog();
+
+        let installed = write_package_versioned(catalog.parent().unwrap(), "new.zip", "Alpha Plugin", "2.0.0", "");
+        post_json(&router, "/plugins/install", serde_json::json!({ "path": installed.to_str().unwrap() })).await;
+
+        write_package_versioned(&catalog, "a.zip", "Alpha Plugin", "1.0.0", "");
+
+        let (_, body) = get_json(&router, "/plugins/catalog").await;
+        assert_eq!(body["plugins"][0]["update_available"], false, "{body}");
+    }
+
+    #[tokio::test]
+    async fn installing_something_not_in_the_catalog_is_a_404() {
+        let (_d, router, _) = test_app_with_catalog();
+        assert_eq!(post_json(&router, "/plugins/install-from-catalog/Nope", serde_json::json!({})).await.0, StatusCode::NOT_FOUND);
+    }
+
+    /// A catalog is a directory someone else maintains; one bad entry
+    /// must not hide every good one.
+    #[tokio::test]
+    async fn a_broken_catalog_entry_is_skipped_not_fatal() {
+        let (_d, router, catalog) = test_app_with_catalog();
+        write_package(&catalog, "good.zip", "Alpha Plugin", "");
+        std::fs::write(catalog.join("broken.zip"), b"not a zip at all").unwrap();
+        std::fs::write(catalog.join("notes.txt"), b"ignore me").unwrap();
+
+        let (status, body) = get_json(&router, "/plugins/catalog").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["plugins"].as_array().unwrap().len(), 1, "{body}");
+    }
+
+    #[tokio::test]
+    async fn the_catalog_needs_plugins_enabled() {
+        let (_d, router) = test_app(false);
+        assert_eq!(get_json(&router, "/plugins/catalog").await.0, StatusCode::SERVICE_UNAVAILABLE);
     }
 }

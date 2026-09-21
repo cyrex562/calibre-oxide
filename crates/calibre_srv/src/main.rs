@@ -52,6 +52,11 @@ struct Cli {
     /// Directory of installed third-party WASM plugins (issue #800). Unset means no plugins are loaded, which is the default.
     #[arg(long)]
     plugin_dir: Option<PathBuf>,
+
+    /// A directory of installable plugin packages -- a repo folder or
+    /// git submodule, not a hosted index (#816 item 1.14).
+    #[arg(long)]
+    plugin_catalog_dir: Option<PathBuf>,
     #[command(flatten)]
     opts: ServerOptions,
 }
@@ -146,10 +151,14 @@ async fn main() -> anyhow::Result<()> {
     // starting without them would look like the plugins simply did
     // nothing.
     let plugin_store = match cli.plugin_dir.clone() {
-        Some(dir) => Some(Arc::new(calibre_plugins_wasm::PluginStore::open(dir).unwrap_or_else(|e| {
-            eprintln!("error: could not open --plugin-dir: {e}");
-            std::process::exit(1);
-        }))),
+        Some(dir) => Some(Arc::new(
+            calibre_plugins_wasm::PluginStore::open(dir)
+                .unwrap_or_else(|e| {
+                    eprintln!("error: could not open --plugin-dir: {e}");
+                    std::process::exit(1);
+                })
+                .with_catalog(cli.plugin_catalog_dir.clone()),
+        )),
         None => None,
     };
     let state = AppState {

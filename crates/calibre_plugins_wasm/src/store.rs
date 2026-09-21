@@ -35,9 +35,18 @@ pub enum StoreError {
     UnsafeName(String),
 }
 
-/// A directory of installed plugin packages.
+/// A directory of installed plugin packages, optionally paired with
+/// a read-only *catalog* directory of packages available to install.
+///
+/// The catalog is deliberately a plain directory rather than a hosted
+/// index: plugins for this port have to be written against its WASM
+/// ABI rather than carried over from calibre's Python ones, so the
+/// realistic source is a `plugins/`/`contrib/` directory in the repo
+/// or a git submodule. That needs no infrastructure and works
+/// offline.
 pub struct PluginStore {
     dir: PathBuf,
+    catalog_dir: Option<PathBuf>,
 }
 
 impl PluginStore {
@@ -45,11 +54,48 @@ impl PluginStore {
     pub fn open(dir: impl Into<PathBuf>) -> Result<PluginStore, StoreError> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir).map_err(|e| StoreError::Directory { path: dir.clone(), reason: e.to_string() })?;
-        Ok(PluginStore { dir })
+        Ok(PluginStore { dir, catalog_dir: None })
+    }
+
+    /// Points this store at a catalog directory of installable
+    /// packages. Missing or unreadable is not an error -- a server
+    /// configured without one simply reports an empty catalog.
+    pub fn with_catalog(mut self, catalog_dir: Option<impl Into<PathBuf>>) -> PluginStore {
+        self.catalog_dir = catalog_dir.map(Into::into);
+        self
     }
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    pub fn catalog_dir(&self) -> Option<&Path> {
+        self.catalog_dir.as_deref()
+    }
+
+    /// Every installable package in the catalog directory.
+    ///
+    /// A file that is not a readable package is skipped rather than
+    /// failing the listing: a catalog is a directory someone else
+    /// maintains, and one bad entry must not hide the rest.
+    pub fn catalog(&self) -> Vec<(PathBuf, PluginPackage)> {
+        let Some(dir) = &self.catalog_dir else { return Vec::new() };
+        let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+
+        let mut out: Vec<(PathBuf, PluginPackage)> = entries
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.is_file() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip")))
+            .filter_map(|p| PluginPackage::read_zip(&p).ok().map(|pkg| (p, pkg)))
+            .collect();
+        out.sort_by(|a, b| a.1.manifest.name.cmp(&b.1.manifest.name));
+        out
+    }
+
+    /// Installs the catalog entry with this name.
+    pub fn install_from_catalog(&self, name: &str) -> Result<PluginPackage, StoreError> {
+        let (path, _) = self.catalog().into_iter().find(|(_, pkg)| pkg.manifest.name == name).ok_or_else(|| StoreError::NotInstalled(name.to_string()))?;
+        self.install(&path)
     }
 
     /// A plugin's name comes from its own manifest, i.e. from

@@ -738,3 +738,21 @@ export function polishBooks(bookIds: number[], options: Partial<PolishOptions>):
     body: JSON.stringify({ book_ids: bookIds, options }),
   });
 }
+
+// Plugin catalog (#816 item 1.14). A plain directory of installable
+// packages -- a repo folder or git submodule, not a hosted index:
+// plugins for this port must be written against its WASM ABI rather
+// than carried over from calibre's Python ones.
+export interface CatalogPlugin extends InstalledPlugin {
+  installed: boolean;
+  installed_version: string | null;
+  update_available: boolean;
+}
+
+export async function fetchPluginCatalog(): Promise<{ configured: boolean; plugins: CatalogPlugin[] }> {
+  return jsonFetch<{ configured: boolean; plugins: CatalogPlugin[] }>("/plugins/catalog");
+}
+
+export function installFromCatalog(name: string): Promise<InstalledPlugin> {
+  return jsonFetch<InstalledPlugin>(`/plugins/install-from-catalog/${encodeURIComponent(name)}`, { method: "POST" });
+}
