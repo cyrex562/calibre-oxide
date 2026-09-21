@@ -9,7 +9,16 @@ import { categoryItemToQuery } from "../library/query";
 import { isTauri, tauriInvoke } from "../tauri";
 import type { BookFieldChanges, BookSummary, FieldMetaEntry } from "../library/types";
 
-const props = defineProps<{ bookId: number }>();
+const props = defineProps<{
+  bookId: number;
+  /**
+   * An action to perform as soon as the book has loaded -- how the
+   * right-click menu (#1.2) reaches the panel's own controls. A
+   * counter accompanies it so choosing the *same* action twice in a
+   * row still fires: watching the id alone would see no change.
+   */
+  pendingAction?: { id: string; nonce: number } | null;
+}>();
 const emit = defineEmits<{ close: []; updated: []; deleted: [bookId: number]; "open-book": [bookId: number] }>();
 const router = useRouter();
 
@@ -555,6 +564,67 @@ const visibleCustomColumnValues = computed(() => {
   if (!b) return [];
   return customColumnFields.value.map((f) => ({ field: f, value: b[f.label] })).filter((v) => v.value !== null && v.value !== undefined && v.value !== "");
 });
+
+// ---------------------------------------------------------------
+// Right-click menu dispatch (#1.2)
+// ---------------------------------------------------------------
+//
+// The panel already owns every book-scoped action; the context menu
+// just needs a way to ask for one. Rather than duplicating those
+// controls, the menu selects the book and names an action, and this
+// performs it once the book has loaded.
+//
+// Unknown ids are ignored on purpose: the registry can list an action
+// before this panel implements it, and a menu entry that does nothing
+// is better than a crash. The menu itself only offers ids the view
+// declares as handled, so this should not happen in practice.
+function performAction(id: string) {
+  switch (id) {
+    case "read":
+      read();
+      break;
+    case "edit-metadata":
+      startEditing();
+      break;
+    case "fetch-metadata":
+      fetchMetadataOpen.value = true;
+      break;
+    case "convert":
+      void openConvert();
+      break;
+    case "tweak-book":
+      if (canTweak.value) tweakOpen.value = true;
+      break;
+    case "quick-view":
+      openQuickView();
+      break;
+    case "test-template":
+      templateTesterOpen.value = true;
+      break;
+    case "send-email":
+      openShare();
+      break;
+    case "replace-cover":
+      coverInput.value?.click();
+      break;
+    case "open-externally":
+      void openExternally();
+      break;
+    default:
+      break;
+  }
+}
+
+// Waits for the book itself: several of these actions read `book`,
+// and the panel mounts before the fetch resolves.
+watch(
+  () => [props.pendingAction?.nonce, book.value?.id] as const,
+  () => {
+    const pending = props.pendingAction;
+    if (pending && book.value) performAction(pending.id);
+  },
+  { immediate: true },
+);
 </script>
 
 <template>

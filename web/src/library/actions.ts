@@ -96,6 +96,7 @@ export type LibraryActionId =
   | "test-template"
   | "send-email"
   | "replace-cover"
+  | "open-externally"
   | "delete-book";
 
 /**
@@ -125,6 +126,7 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   { id: "save-to-disk", label: "Save to disk", group: "selection", requires: "selection" },
 
   { id: "read", label: "Read", group: "book", requires: "single-selection", contextMenu: true },
+  { id: "open-externally", label: "Open externally", group: "book", requires: "single-selection", contextMenu: true, desktopOnly: true },
   { id: "edit-metadata", label: "Edit metadata", group: "book", requires: "single-selection", contextMenu: true },
   { id: "fetch-metadata", label: "Fetch metadata online…", group: "book", requires: "single-selection", contextMenu: true },
   { id: "convert", label: "Convert…", group: "book", requires: "single-selection", contextMenu: true },
@@ -170,6 +172,53 @@ export function actionEnabled(action: LibraryAction, ctx: ActionContext): boolea
     case "single-selection":
       return ctx.selectionCount === 1;
   }
+}
+
+
+/** One entry of a right-click menu. */
+export interface ContextMenuEntry {
+  id: LibraryActionId;
+  label: string;
+  enabled: boolean;
+  /** Renders a separator above this entry. */
+  startsGroup?: boolean;
+}
+
+/**
+ * The right-click menu for a book, in registry order.
+ *
+ * Unlike the toolbar, this keeps disabled entries visible: a menu is
+ * also how someone discovers what is possible, and an action greyed
+ * out because nothing is selected teaches something, where an action
+ * that silently vanishes teaches nothing. Actions that are
+ * *unavailable* -- desktop-only, in a browser -- still drop out
+ * entirely, since no user action can ever satisfy them.
+ *
+ * Only actions in `handled` appear, so the menu can never offer
+ * something with no implementation behind it.
+ */
+export function contextMenuEntries(handled: Iterable<LibraryActionId>, ctx: ActionContext): ContextMenuEntry[] {
+  const handledSet = new Set(handled);
+  const eligible = LIBRARY_ACTIONS.filter((a) => (a.contextMenu || a.group === "selection") && handledSet.has(a.id) && actionAvailable(a, ctx));
+
+  // Registry order puts the selection-scoped actions first, which is
+  // right for the toolbar and wrong here: a menu opened by
+  // right-clicking a book leads with that book's own actions. Sorting
+  // by group is stable, so within a group registry order survives.
+  const groupRank: Record<ActionGroup, number> = { book: 0, selection: 1, library: 2, view: 3 };
+  eligible.sort((a, b) => groupRank[a.group] - groupRank[b.group]);
+
+  let previousGroup: ActionGroup | null = null;
+  return eligible.map((a) => {
+    const entry: ContextMenuEntry = {
+      id: a.id,
+      label: a.label,
+      enabled: actionEnabled(a, ctx),
+      ...(previousGroup !== null && previousGroup !== a.group ? { startsGroup: true } : {}),
+    };
+    previousGroup = a.group;
+    return entry;
+  });
 }
 
 /** Everything `visibleToolbarActions` needs to decide what renders. */

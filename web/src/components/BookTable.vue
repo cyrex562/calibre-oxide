@@ -27,6 +27,7 @@ const emit = defineEmits<{
   toggleSelected: [bookId: number];
   sortBy: [value: { sort: string; order: "asc" | "desc" }];
   resize: [value: { key: string; width: number }];
+  contextMenu: [value: { bookId: number; x: number; y: number }];
 }>();
 
 /** The column currently driving the sort, if it is one we show. */
@@ -123,6 +124,7 @@ function onRowKeydown(event: KeyboardEvent, bookId: number) {
           :class="{ selected: selectMode ? selectedIds.has(b.id) : selectedBookId === b.id }"
           @click="onRowClick(b.id)"
           @keydown="onRowKeydown($event, b.id)"
+          @contextmenu.prevent="emit('contextMenu', { bookId: b.id, x: $event.clientX, y: $event.clientY })"
         >
           <td v-if="selectMode" class="check-col">
             <input type="checkbox" :checked="selectedIds.has(b.id)" :aria-label="`Select ${b.title}`" @click.stop="emit('toggleSelected', b.id)" />
