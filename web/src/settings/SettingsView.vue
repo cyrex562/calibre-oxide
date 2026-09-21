@@ -16,8 +16,14 @@ const rebindingAction = ref<KeymapAction | null>(null);
 const toolbarHidden = ref<Set<ToolbarActionId>>(new Set());
 const toolbarOrder = ref<ToolbarActionId[]>(TOOLBAR_ACTIONS.map((a) => a.id));
 
+// The "(desktop app only)" note used to be baked into two of the
+// registry's label strings. It is now derived from the action's own
+// `desktopOnly` flag (#817), so the annotation can never disagree with
+// the flag that actually controls whether the button renders.
 function toolbarLabel(id: ToolbarActionId): string {
-  return TOOLBAR_ACTIONS.find((a) => a.id === id)?.label ?? id;
+  const action = TOOLBAR_ACTIONS.find((a) => a.id === id);
+  if (!action) return id;
+  return action.desktopOnly ? `${action.label} (desktop app only)` : action.label;
 }
 function toggleToolbarHidden(id: ToolbarActionId) {
   const next = new Set(toolbarHidden.value);

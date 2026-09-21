@@ -18,6 +18,8 @@
 //! (persisted library path).
 
 mod library_import;
+mod menu;
+mod page_event;
 mod server;
 mod settings;
 
@@ -25,6 +27,7 @@ use std::sync::Mutex;
 
 use tauri::{AppHandle, Manager, State, Url};
 use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_opener::OpenerExt;
 
 #[tauri::command]
 fn ping() -> String {
@@ -185,6 +188,10 @@ fn simple_job_id() -> String {
     format!("app-add-folder-{now}-{n}")
 }
 
+/// `CustomEvent` name announcing a completed drag-and-drop add. Must
+/// match the listener in `web/src/components/LibraryView.vue`.
+const BOOKS_ADDED_EVENT: &str = "oxide:books-added";
+
 #[derive(serde::Serialize, Default)]
 struct AddFolderResult {
     added: u32,
@@ -222,11 +229,21 @@ async fn choose_folder_and_add_books(app: AppHandle, state: State<'_, ServerStat
         .collect();
     files.sort();
 
+    Ok(Some(add_files_via_server(port, &files).await))
+}
+
+/// Uploads each file to the running `calibre_srv`'s `/cdb/add-book`,
+/// exactly as `web/`'s own per-file `addBook()` does.
+///
+/// Shared by the folder picker above and the drag-and-drop handler
+/// (issue #818) so the two paths cannot disagree about duplicate
+/// handling or error reporting.
+async fn add_files_via_server(port: u16, files: &[std::path::PathBuf]) -> AddFolderResult {
     let client = reqwest::Client::new();
     let mut result = AddFolderResult::default();
     for path in files {
         let filename = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-        let bytes = match std::fs::read(&path) {
+        let bytes = match std::fs::read(path) {
             Ok(b) => b,
             Err(e) => {
                 result.errors.push(format!("{filename}: {e}"));
@@ -244,16 +261,107 @@ async fn choose_folder_and_add_books(app: AppHandle, state: State<'_, ServerStat
             Err(e) => result.errors.push(format!("{filename}: {e}")),
         }
     }
+    result
+}
 
-    Ok(Some(result))
+/// Keeps only the files this app knows how to read metadata from.
+/// Applied to dropped paths, which -- unlike a folder scan -- can be
+/// anything the user happened to drag.
+fn keep_known_ebooks(paths: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
+    let mut files: Vec<std::path::PathBuf> = paths
+        .iter()
+        .filter(|p| p.is_file() && p.extension().and_then(|e| e.to_str()).map(|e| KNOWN_EBOOK_EXTENSIONS.contains(&e.to_lowercase().as_str())).unwrap_or(false))
+        .cloned()
+        .collect();
+    files.sort();
+    files
+}
+
+/// Rebuilds the native menu bar from the page's own action registry.
+///
+/// See `menu.rs` for why the page is the authority here rather than a
+/// hardcoded Rust-side list.
+#[tauri::command]
+fn set_menu_actions(app: AppHandle, actions: Vec<menu::MenuActionSpec>) -> Result<(), String> {
+    let window = app.get_webview_window("main").ok_or("no main window")?;
+    menu::install(&window, &actions).map_err(|e| e.to_string())
+}
+
+/// Opens one of a book's formats in the OS default application.
+///
+/// This is how PDFs are read today: the in-app reader is EPUB/KEPUB
+/// only (`is_viewable_format` in `calibre_srv`), so without this a
+/// PDF-first library has no way to open its own books.
+///
+/// The bytes come from the running `calibre_srv` rather than from the
+/// library folder directly, because `/ajax/book` deliberately strips
+/// the internal `fmt_<ext>` absolute paths before they reach the page
+/// -- correct for an API that can be served over a network, and not
+/// worth undoing for the desktop case. The trade-off is that this
+/// opens a copy under the temp directory, so edits made in an external
+/// application do not flow back into the library.
+#[tauri::command]
+async fn open_book_format(state: State<'_, ServerState>, app: AppHandle, book_id: i32, fmt: String) -> Result<(), String> {
+    let port = state.0.lock().unwrap().as_ref().map(|(_, p)| *p).ok_or("no library is currently open")?;
+
+    let ext = fmt.to_lowercase();
+    if ext.is_empty() || !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(format!("{fmt:?} is not a usable format name"));
+    }
+
+    let url = format!("http://127.0.0.1:{port}/get/{ext}/{book_id}");
+    let resp = reqwest::get(&url).await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("could not fetch the {} for book {book_id}: HTTP {}", ext.to_uppercase(), resp.status()));
+    }
+    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+
+    let dir = std::env::temp_dir().join("calibre-oxide-open");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // `book_id` is an integer and `ext` is alphanumeric-checked above,
+    // so this name cannot escape `dir`.
+    let path = dir.join(format!("{book_id}.{ext}"));
+    std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+
+    app.opener().open_path(path.to_string_lossy(), None::<&str>).map_err(|e| e.to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(ServerState::default())
-        .invoke_handler(tauri::generate_handler![ping, get_persisted_library, choose_library, choose_folder_and_add_books, list_recent_libraries, open_recent_library, get_auto_reopen, set_auto_reopen, import_library_archive])
+        .invoke_handler(tauri::generate_handler![ping, get_persisted_library, choose_library, choose_folder_and_add_books, list_recent_libraries, open_recent_library, get_auto_reopen, set_auto_reopen, import_library_archive, set_menu_actions, open_book_format])
+        .on_menu_event(|app, event| menu::forward(app, &event))
+        // Dropping files onto the window adds them, the same way the
+        // folder picker does. This has to be handled natively: Tauri's
+        // own drag-drop handling suppresses the webview's HTML5 drop
+        // events, so a listener on the page would never fire.
+        .on_window_event(|window, event| {
+            let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event else {
+                return;
+            };
+            let files = keep_known_ebooks(paths);
+            if files.is_empty() {
+                return;
+            }
+            let Some(webview) = window.get_webview_window("main") else {
+                return;
+            };
+            let Some(port) = webview.state::<ServerState>().0.lock().unwrap().as_ref().map(|(_, p)| *p) else {
+                page_event::dispatch(&webview, BOOKS_ADDED_EVENT, &serde_json::json!({ "error": "no library is currently open" }));
+                return;
+            };
+            tauri::async_runtime::spawn(async move {
+                let result = add_files_via_server(port, &files).await;
+                // The web UI does not listen on calibre_srv's
+                // websocket, so the grid will not refresh on its own
+                // -- tell the page directly.
+                page_event::dispatch(&webview, BOOKS_ADDED_EVENT, &result);
+            });
+        })
         .setup(|app| {
             // Auto-open the last library, if any, without waiting for
             // the frontend to ask -- real startup UX, not just a

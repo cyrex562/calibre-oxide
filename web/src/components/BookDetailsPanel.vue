@@ -6,6 +6,7 @@ import TweakEditor from "./TweakEditor.vue";
 import { addFormat, deleteBooks, evaluateTemplate, fetchBook, fetchBooks, fetchConversionBookData, fetchDataFiles, fetchFieldMetadata, getConversionStatus, removeDataFile, removeFormat, search, setCover, setFields, shareEmail, startConversion, uploadDataFile } from "../library/api";
 import type { ConversionOptionsOverride, DataFileStat, SmtpRelayConfig } from "../library/api";
 import { categoryItemToQuery } from "../library/query";
+import { isTauri, tauriInvoke } from "../tauri";
 import type { BookFieldChanges, BookSummary, FieldMetaEntry } from "../library/types";
 
 const props = defineProps<{ bookId: number }>();
@@ -454,6 +455,39 @@ const READABLE_FORMATS = ["epub", "kepub"];
 
 const readableFormat = computed(() => book.value?.formats.find((f) => READABLE_FORMATS.includes(f)) ?? null);
 
+// "Open externally" (#818). The in-app reader handles EPUB/KEPUB only
+// (`is_viewable_format` in calibre_srv), so for a PDF-first library
+// this is the only way to actually open a book -- and it stays useful
+// for any format the reader will never render.
+//
+// Desktop-only: handing a file to the OS default application is
+// exactly what a browser tab cannot do.
+const canOpenExternally = computed(() => isTauri() && (book.value?.formats.length ?? 0) > 0);
+const openingExternally = ref(false);
+const openExternallyError = ref<string | null>(null);
+
+/// Prefers a format the in-app reader *cannot* show: if a book has
+/// both an EPUB and a PDF, "Read" already covers the EPUB, so the
+/// useful thing to hand to the system viewer is the PDF.
+const externalFormat = computed(() => {
+  const formats = book.value?.formats ?? [];
+  return formats.find((f) => !READABLE_FORMATS.includes(f)) ?? formats[0] ?? null;
+});
+
+async function openExternally() {
+  const fmt = externalFormat.value;
+  if (!fmt) return;
+  openingExternally.value = true;
+  openExternallyError.value = null;
+  try {
+    await tauriInvoke<void>("open_book_format", { bookId: props.bookId, fmt });
+  } catch (e) {
+    openExternallyError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    openingExternally.value = false;
+  }
+}
+
 // Tweak Book (issue #719) -- crates/calibre_srv/src/tweak.rs's own
 // scope is real-EPUB-container-only for this first slice, so the
 // action is only offered when the book actually has that format.
@@ -548,9 +582,13 @@ const visibleCustomColumnValues = computed(() => {
           </template>
         </dl>
         <p v-if="deleteError" class="error">{{ deleteError }}</p>
+        <p v-if="openExternallyError" class="error">{{ openExternallyError }}</p>
 
         <div class="formats">
           <button v-if="readableFormat" class="read" @click="read">Read ({{ readableFormat.toUpperCase() }})</button>
+          <button v-if="canOpenExternally && externalFormat" class="edit" :disabled="openingExternally" @click="openExternally">
+            {{ openingExternally ? "Opening…" : `Open ${externalFormat.toUpperCase()} externally` }}
+          </button>
           <a v-for="[fmt, url] in formatLinks" :key="fmt" :href="url" class="download"> Download {{ fmt.toUpperCase() }} </a>
           <button class="edit" @click="startEditing">Edit metadata</button>
           <button class="edit" @click="fetchMetadataOpen = true">Fetch metadata online…</button>
