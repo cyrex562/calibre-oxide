@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from "vue";
 import { isTauri, tauriInvoke } from "../tauri";
-import { fetchPluginCatalog, inspectPlugin, installFromCatalog, installPlugin, listPlugins, removePlugin, setPluginEnabled, type CatalogPlugin, type InstalledPlugin } from "../library/api";
+import { fetchPluginCatalog, inspectPlugin, installFromCatalog, installPlugin, listPlugins, removePlugin, setPluginEnabled, type CatalogPlugin, type InstalledPlugin, getEmailAccount, saveEmailAccount, type EmailAccount } from "../library/api";
 import { DEFAULT_KEYMAP, DEFAULT_LIBRARY_PREFS, DEFAULT_READER_PREFS, DEFAULT_TOOLBAR_PREFS, fetchProfile, KEYMAP_ACTION_LABELS, KEYMAP_PROFILE, LIBRARY_PREFS_PROFILE, READER_PREFS_PROFILE, saveProfile, TOOLBAR_ACTIONS, TOOLBAR_PREFS_PROFILE, type KeymapAction, type KeymapPrefs, type LibraryPrefs, type ReaderPrefs, type ToolbarActionId, type ToolbarPrefs } from "./api";
 
 const libraryPrefs = ref<LibraryPrefs>({ ...DEFAULT_LIBRARY_PREFS });
@@ -89,6 +89,36 @@ async function installCatalogPlugin(name: string) {
     catalogError.value = e instanceof Error ? e.message : String(e);
   } finally {
     catalogBusy.value = false;
+  }
+}
+
+// Email account (#4.2). Everything but the password is persisted --
+// see the route's own doc for why the credential is deliberately not.
+const emailAccount = ref<EmailAccount>({ relay: "", port: 587, username: "", encryption: "tls", from: "" });
+const emailBusy = ref(false);
+const emailError = ref<string | null>(null);
+const emailSaved = ref(false);
+
+async function loadEmailAccount() {
+  try {
+    const account = await getEmailAccount();
+    if (account) emailAccount.value = { port: 587, encryption: "tls", ...account };
+  } catch (e) {
+    console.error("failed to load the email account", e);
+  }
+}
+
+async function persistEmailAccount() {
+  emailBusy.value = true;
+  emailError.value = null;
+  emailSaved.value = false;
+  try {
+    await saveEmailAccount(emailAccount.value);
+    emailSaved.value = true;
+  } catch (e) {
+    emailError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    emailBusy.value = false;
   }
 }
 
@@ -198,6 +228,7 @@ async function load() {
 onMounted(() => {
   load();
   void loadCatalog();
+  void loadEmailAccount();
   window.addEventListener("keydown", onRebindKeydown);
 });
 onBeforeUnmount(() => window.removeEventListener("keydown", onRebindKeydown));
@@ -353,6 +384,33 @@ async function toggleAutoReopen() {
       </section>
 
       <section v-if="pluginsAvailable" class="pane">
+        <h3>Email</h3>
+        <p class="hint">
+          Used when sending a book by email. Everything here is saved except the
+          password — this is stored on the server as plain JSON, and the server can
+          be reached over a network, so a saved password would be readable by more
+          people than you would expect. You will be asked for it when you send.
+        </p>
+        <label class="field">SMTP server <input v-model="emailAccount.relay" placeholder="smtp.example.com" :disabled="emailBusy" /></label>
+        <label class="field">Port <input v-model.number="emailAccount.port" type="number" min="1" max="65535" :disabled="emailBusy" /></label>
+        <label class="field">Username <input v-model="emailAccount.username" :disabled="emailBusy" /></label>
+        <label class="field">
+          Encryption
+          <select v-model="emailAccount.encryption" :disabled="emailBusy">
+            <option value="tls">STARTTLS</option>
+            <option value="ssl">SSL/TLS</option>
+            <option value="none">None</option>
+          </select>
+        </label>
+        <label class="field">Send from <input v-model="emailAccount.from" type="email" placeholder="you@example.com" :disabled="emailBusy" /></label>
+        <button type="button" :disabled="emailBusy || !emailAccount.relay.trim()" @click="persistEmailAccount">
+          {{ emailBusy ? "Saving…" : "Save email settings" }}
+        </button>
+        <p v-if="emailError" class="error">{{ emailError }}</p>
+        <p v-else-if="emailSaved" class="status">Saved.</p>
+      </section>
+
+      <section class="pane">
         <h3>Plugins</h3>
         <p class="hint">
           Plugins run in a WebAssembly sandbox. They have no access to your files or the

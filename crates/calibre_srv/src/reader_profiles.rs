@@ -121,7 +121,10 @@ impl ProfileStore {
     }
 }
 
-fn user_key(user: &Option<Extension<AuthenticatedUser>>) -> String {
+/// `pub(crate)` so an email account (`share.rs`) is keyed to the same
+/// user as every other stored profile -- a credential-adjacent
+/// setting must not be global when everything beside it is per-user.
+pub(crate) fn user_key(user: &Option<Extension<AuthenticatedUser>>) -> String {
     match user {
         Some(Extension(AuthenticatedUser(name))) => format!("user:{name}"),
         None => "user:".to_string(),
