@@ -304,17 +304,9 @@ fn set_menu_actions(app: AppHandle, actions: Vec<menu::MenuActionSpec>) -> Resul
 async fn open_book_format(state: State<'_, ServerState>, app: AppHandle, book_id: i32, fmt: String) -> Result<(), String> {
     let port = state.0.lock().unwrap().as_ref().map(|(_, p)| *p).ok_or("no library is currently open")?;
 
-    let ext = fmt.to_lowercase();
-    if ext.is_empty() || !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
-        return Err(format!("{fmt:?} is not a usable format name"));
-    }
+    let ext = checked_ext(&fmt)?;
 
-    let url = format!("http://127.0.0.1:{port}/get/{ext}/{book_id}");
-    let resp = reqwest::get(&url).await.map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!("could not fetch the {} for book {book_id}: HTTP {}", ext.to_uppercase(), resp.status()));
-    }
-    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+    let bytes = fetch_book_format(port, book_id, &ext).await?;
 
     let dir = std::env::temp_dir().join("calibre-oxide-open");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -326,6 +318,136 @@ async fn open_book_format(state: State<'_, ServerState>, app: AppHandle, book_id
     app.opener().open_path(path.to_string_lossy(), None::<&str>).map_err(|e| e.to_string())
 }
 
+/// Fetches one of a book's formats from the running `calibre_srv`.
+///
+/// Shared by [`open_book_format`] and [`unpack_book`]. Goes through
+/// the server rather than the library folder because `/ajax/book`
+/// deliberately strips the internal `fmt_<ext>` paths before they
+/// reach any client -- correct for an API that can be served over a
+/// network, and not worth undoing for the desktop case.
+async fn fetch_book_format(port: u16, book_id: i32, ext: &str) -> Result<Vec<u8>, String> {
+    let url = format!("http://127.0.0.1:{port}/get/{ext}/{book_id}");
+    let resp = reqwest::get(&url).await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("could not fetch the {} for book {book_id}: HTTP {}", ext.to_uppercase(), resp.status()));
+    }
+    Ok(resp.bytes().await.map_err(|e| e.to_string())?.to_vec())
+}
+
+/// Rejects anything that could escape a directory when used as a file
+/// extension. Both callers embed the result in a filesystem path.
+fn checked_ext(fmt: &str) -> Result<String, String> {
+    let ext = fmt.to_lowercase();
+    if ext.is_empty() || ext.len() > 10 || !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(format!("{fmt:?} is not a usable format name"));
+    }
+    Ok(ext)
+}
+
+async fn pick_folder(app: &AppHandle) -> Option<std::path::PathBuf> {
+    let (tx, mut rx) = tauri::async_runtime::channel(1);
+    app.dialog().file().pick_folder(move |result| {
+        let _ = tx.try_send(result);
+    });
+    let Some(Some(picked)) = rx.recv().await else {
+        return None;
+    };
+    picked.into_path().ok()
+}
+
+#[derive(serde::Serialize)]
+struct UnpackResult {
+    path: String,
+}
+
+/// Unpacks a book into a folder the user picks, for editing with
+/// whatever tools they prefer (issue #816 item 1.12).
+///
+/// `calibre_ebooks::tweak::explode` leaves a hidden marker file
+/// recording the source format; [`repack_book`] refuses to rebuild
+/// from a folder that has no marker, or whose marker disagrees with
+/// the target format. That check is upstream's own, and it is what
+/// stops a folder exploded from an EPUB being rebuilt as a MOBI.
+///
+/// Unpacks into a *subfolder* named after the book rather than
+/// directly into the chosen folder: exploding straight into, say, a
+/// Documents folder would scatter a book's innards across it.
+#[tauri::command]
+async fn unpack_book(state: State<'_, ServerState>, app: AppHandle, book_id: i32, fmt: String) -> Result<Option<UnpackResult>, String> {
+    let port = state.0.lock().unwrap().as_ref().map(|(_, p)| *p).ok_or("no library is currently open")?;
+    let ext = checked_ext(&fmt)?;
+
+    let Some(parent) = pick_folder(&app).await else {
+        return Ok(None);
+    };
+
+    let bytes = fetch_book_format(port, book_id, &ext).await?;
+
+    let tmp = std::env::temp_dir().join(format!("calibre-oxide-unpack-{book_id}.{ext}"));
+    std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+
+    let dest = parent.join(format!("book-{book_id}-{ext}"));
+    if dest.exists() {
+        return Err(format!("{} already exists -- choose a different folder", dest.display()));
+    }
+
+    // The `question` callback answers the joint MOBI6+KF8 prompt.
+    // Answering yes is right here: the user explicitly asked to
+    // unpack this book, and declining would silently do nothing.
+    calibre_ebooks::tweak::explode(&tmp, &dest, |_| true).map_err(|e| e.to_string())?.ok_or_else(|| "that book could not be unpacked".to_string())?;
+    let _ = std::fs::remove_file(&tmp);
+
+    let _ = app.opener().reveal_item_in_dir(&dest);
+    Ok(Some(UnpackResult { path: dest.to_string_lossy().into_owned() }))
+}
+
+/// Rebuilds a book from a folder produced by [`unpack_book`] and adds
+/// it back as that format.
+#[tauri::command]
+async fn repack_book(state: State<'_, ServerState>, app: AppHandle, book_id: i32, fmt: String) -> Result<bool, String> {
+    let port = state.0.lock().unwrap().as_ref().map(|(_, p)| *p).ok_or("no library is currently open")?;
+    let ext = checked_ext(&fmt)?;
+
+    let Some(dir) = pick_folder(&app).await else {
+        return Ok(false);
+    };
+
+    let rebuilt = std::env::temp_dir().join(format!("calibre-oxide-repack-{book_id}.{ext}"));
+    let _ = std::fs::remove_file(&rebuilt);
+    // `implode` verifies its own marker file, so a folder that was
+    // not produced by unpacking -- or was unpacked from a different
+    // format -- is refused here rather than producing a broken book.
+    calibre_ebooks::tweak::implode(&dir, &rebuilt).map_err(|e| e.to_string())?;
+
+    let bytes = std::fs::read(&rebuilt).map_err(|e| e.to_string())?;
+    let data_url = format!("data:application/octet-stream;base64,{}", base64_encode(&bytes));
+    let _ = std::fs::remove_file(&rebuilt);
+
+    let url = format!("http://127.0.0.1:{port}/cdb/set-fields/{book_id}");
+    let body = serde_json::json!({ "changes": { "added_formats": [{ "ext": ext, "data_url": data_url }] } });
+    let resp = reqwest::Client::new().post(&url).json(&body).send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("could not store the rebuilt book: HTTP {}", resp.status()));
+    }
+    Ok(true)
+}
+
+/// Minimal base64 for the `data_url` the set-fields route expects.
+/// Written out rather than pulling in a crate for one call site.
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { TABLE[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -333,7 +455,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(ServerState::default())
-        .invoke_handler(tauri::generate_handler![ping, get_persisted_library, choose_library, choose_folder_and_add_books, list_recent_libraries, open_recent_library, get_auto_reopen, set_auto_reopen, import_library_archive, set_menu_actions, open_book_format])
+        .invoke_handler(tauri::generate_handler![ping, get_persisted_library, choose_library, choose_folder_and_add_books, list_recent_libraries, open_recent_library, get_auto_reopen, set_auto_reopen, import_library_archive, set_menu_actions, open_book_format, unpack_book, repack_book])
         .on_menu_event(|app, event| menu::forward(app, &event))
         // Dropping files onto the window adds them, the same way the
         // folder picker does. This has to be handled natively: Tauri's
@@ -388,4 +510,117 @@ pub fn run() {
                 app_handle.state::<ServerState>().kill();
             }
         });
+}
+
+#[cfg(test)]
+mod unpack_tests {
+    use super::*;
+
+    /// Cross-checked against known RFC 4648 vectors, because a
+    /// hand-written encoder is exactly the kind of thing that is
+    /// subtly wrong only on the padded tail.
+    #[test]
+    fn base64_matches_the_rfc_test_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn base64_handles_bytes_outside_ascii() {
+        // Real book bytes are binary; an encoder that only worked on
+        // text would corrupt every EPUB it touched.
+        assert_eq!(base64_encode(&[0xff, 0xfe, 0xfd]), "//79");
+        assert_eq!(base64_encode(&[0x00, 0x00, 0x00]), "AAAA");
+    }
+
+    #[test]
+    fn checked_ext_rejects_path_traversal() {
+        // Both callers embed this in a filesystem path.
+        assert!(checked_ext("../../etc").is_err());
+        assert!(checked_ext("ep/ub").is_err());
+        assert!(checked_ext("").is_err());
+        assert!(checked_ext("averyverylongextension").is_err());
+        assert_eq!(checked_ext("EPUB").unwrap(), "epub");
+    }
+
+    /// The round-trip the unpack/repack pair depends on, against a
+    /// real EPUB rather than a stub.
+    #[test]
+    fn explode_then_implode_round_trips_a_real_epub() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("book.epub");
+        std::fs::write(&src, real_epub_bytes()).unwrap();
+
+        let exploded = dir.path().join("exploded");
+        calibre_ebooks::tweak::explode(&src, &exploded, |_| true).unwrap().expect("explode should succeed");
+        assert!(exploded.join("content.opf").exists(), "the OPF should be on disk for external editing");
+
+        // Edit it the way a user would, with their own tools.
+        let chapter = exploded.join("chapter1.xhtml");
+        let edited = std::fs::read_to_string(&chapter).unwrap().replace("Hello", "Goodbye");
+        std::fs::write(&chapter, &edited).unwrap();
+
+        let rebuilt = dir.path().join("rebuilt.epub");
+        calibre_ebooks::tweak::implode(&exploded, &rebuilt).unwrap();
+
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(&rebuilt).unwrap()).unwrap();
+        let mut text = String::new();
+        {
+            use std::io::Read;
+            zip.by_name("chapter1.xhtml").unwrap().read_to_string(&mut text).unwrap();
+        }
+        assert!(text.contains("Goodbye"), "the external edit must survive the rebuild: {text}");
+    }
+
+    /// `implode`'s marker check is what stops a folder exploded from
+    /// one format being rebuilt as another, or a folder that was
+    /// never exploded at all producing a broken book.
+    #[test]
+    fn implode_refuses_a_folder_that_was_never_exploded() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("just-a-folder");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(plain.join("something.txt"), b"x").unwrap();
+
+        let out = dir.path().join("out.epub");
+        assert!(calibre_ebooks::tweak::implode(&plain, &out).is_err());
+    }
+
+    fn real_epub_bytes() -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("mimetype"), "application/epub+zip").unwrap();
+        std::fs::create_dir_all(dir.path().join("META-INF")).unwrap();
+        std::fs::write(
+            dir.path().join("META-INF/container.xml"),
+            r#"<?xml version="1.0"?><container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0"><rootfiles><rootfile full-path="content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("chapter1.xhtml"), r#"<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><body><p>Hello, world!</p></body></html>"#).unwrap();
+        std::fs::write(
+            dir.path().join("content.opf"),
+            r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
+<metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="bookid">id1</dc:identifier><dc:title>Test</dc:title><dc:language>en</dc:language></metadata>
+<manifest><item id="c1" href="chapter1.xhtml" media-type="application/xhtml+xml"/></manifest>
+<spine><itemref idref="c1"/></spine>
+</package>"#,
+        )
+        .unwrap();
+
+        let epub_path = dir.path().join("out.epub");
+        let file = std::fs::File::create(&epub_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts = zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for name in ["mimetype", "META-INF/container.xml", "content.opf", "chapter1.xhtml"] {
+            zip.start_file(name, opts).unwrap();
+            use std::io::Write;
+            zip.write_all(&std::fs::read(dir.path().join(name)).unwrap()).unwrap();
+        }
+        zip.finish().unwrap();
+        std::fs::read(&epub_path).unwrap()
+    }
 }
