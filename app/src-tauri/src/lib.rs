@@ -462,6 +462,108 @@ async fn open_external_url(app: AppHandle, url: String) -> Result<(), String> {
     app.opener().open_url(url, None::<&str>).map_err(|e| e.to_string())
 }
 
+// ===================================================================
+// Auto-add folder (#816 item 4.4)
+// ===================================================================
+//
+// A folder watched for new books, so dropping a file into it adds it
+// to the library without opening the app.
+//
+// Polled rather than using filesystem notifications: a notification
+// fires the moment a file *appears*, which for anything arriving over
+// a network share or a browser download is while it is still being
+// written -- adding a half-copied book is worse than adding it a few
+// seconds later. Polling with a stability check avoids that without a
+// watcher dependency.
+
+/// How often the folder is scanned.
+const AUTO_ADD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// A file must be this old, and unchanged, before it is added --
+/// long enough that a copy still in progress is not mistaken for a
+/// finished one.
+const AUTO_ADD_SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Files in `dir` that look finished and are worth adding.
+fn auto_add_candidates(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let now = std::time::SystemTime::now();
+
+    let mut files: Vec<std::path::PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            if !p.is_file() {
+                return false;
+            }
+            let known = p.extension().and_then(|e| e.to_str()).map(|e| KNOWN_EBOOK_EXTENSIONS.contains(&e.to_lowercase().as_str())).unwrap_or(false);
+            if !known {
+                return false;
+            }
+            // Still settling: almost certainly still being written.
+            std::fs::metadata(p).and_then(|m| m.modified()).map(|m| now.duration_since(m).map(|age| age >= AUTO_ADD_SETTLE).unwrap_or(false)).unwrap_or(false)
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+#[tauri::command]
+fn get_auto_add_folder(app: AppHandle) -> Option<String> {
+    settings::get_auto_add_folder(&app).map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Picks a folder to watch, or clears the existing one.
+#[tauri::command]
+async fn choose_auto_add_folder(app: AppHandle, clear: bool) -> Result<Option<String>, String> {
+    if clear {
+        settings::set_auto_add_folder(&app, None).map_err(|e| e.to_string())?;
+        return Ok(None);
+    }
+    let Some(folder) = pick_folder(&app).await else {
+        return Ok(settings::get_auto_add_folder(&app).map(|p| p.to_string_lossy().into_owned()));
+    };
+    settings::set_auto_add_folder(&app, Some(folder.clone())).map_err(|e| e.to_string())?;
+    Ok(Some(folder.to_string_lossy().into_owned()))
+}
+
+/// Starts the background watcher.
+///
+/// A successfully added file is **removed** from the watched folder.
+/// That is the whole point of a drop folder -- leaving it would mean
+/// re-adding the same book on every scan, and de-duplicating by name
+/// would break the moment someone renamed a file.
+fn spawn_auto_add_watcher(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tauri::async_runtime::spawn_blocking(|| std::thread::sleep(AUTO_ADD_INTERVAL)).await.ok();
+
+            let Some(folder) = settings::get_auto_add_folder(&app) else { continue };
+            let Some(port) = app.state::<ServerState>().0.lock().unwrap().as_ref().map(|(_, p)| *p) else { continue };
+
+            let files = auto_add_candidates(&folder);
+            if files.is_empty() {
+                continue;
+            }
+
+            let result = add_files_via_server(port, &files).await;
+            for (path, ()) in files.iter().zip(std::iter::repeat(())) {
+                let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                // Only remove what really landed: a file that failed
+                // or was a duplicate stays put, so nothing is lost
+                // silently.
+                if !result.errors.iter().any(|e| e.starts_with(&name)) && !result.duplicates.contains(&name) {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+
+            if let Some(window) = app.get_webview_window("main") {
+                page_event::dispatch(&window, BOOKS_ADDED_EVENT, &result);
+            }
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -469,7 +571,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(ServerState::default())
-        .invoke_handler(tauri::generate_handler![ping, get_persisted_library, choose_library, choose_folder_and_add_books, list_recent_libraries, open_recent_library, get_auto_reopen, set_auto_reopen, import_library_archive, set_menu_actions, open_book_format, unpack_book, repack_book, open_external_url])
+        .invoke_handler(tauri::generate_handler![ping, get_persisted_library, choose_library, choose_folder_and_add_books, list_recent_libraries, open_recent_library, get_auto_reopen, set_auto_reopen, import_library_archive, set_menu_actions, open_book_format, unpack_book, repack_book, open_external_url, get_auto_add_folder, choose_auto_add_folder])
         .on_menu_event(|app, event| menu::forward(app, &event))
         // Dropping files onto the window adds them, the same way the
         // folder picker does. This has to be handled natively: Tauri's
@@ -505,6 +607,8 @@ pub fn run() {
             // auto_reopen preference (issue #721): a user who's
             // disabled it wants to land on the loading screen's
             // "choose a library" prompt instead every time.
+            spawn_auto_add_watcher(app.handle().clone());
+
             if settings::get_auto_reopen(app.handle()) {
                 if let Some(path) = settings::load_library_path(app.handle()) {
                     let handle = app.handle().clone();
@@ -636,5 +740,85 @@ mod unpack_tests {
         }
         zip.finish().unwrap();
         std::fs::read(&epub_path).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod auto_add_tests {
+    use super::*;
+
+    fn write_with_age(dir: &std::path::Path, name: &str, seconds_old: u64) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, b"x").unwrap();
+        // Backdate so the settle check sees a finished file.
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(seconds_old);
+        let f = std::fs::File::options().write(true).open(&path).unwrap();
+        f.set_modified(when).unwrap();
+        path
+    }
+
+    #[test]
+    fn picks_up_a_settled_ebook() {
+        let dir = tempfile::tempdir().unwrap();
+        write_with_age(dir.path(), "book.epub", 60);
+
+        let found = auto_add_candidates(dir.path());
+
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].ends_with("book.epub"));
+    }
+
+    /// A file that appeared a moment ago is very likely still being
+    /// written -- over a network share or by a browser download --
+    /// and adding a half-copied book is worse than adding it a few
+    /// seconds later.
+    #[test]
+    fn ignores_a_file_that_is_still_settling() {
+        let dir = tempfile::tempdir().unwrap();
+        write_with_age(dir.path(), "arriving.epub", 0);
+
+        assert!(auto_add_candidates(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn ignores_files_that_are_not_books() {
+        let dir = tempfile::tempdir().unwrap();
+        write_with_age(dir.path(), "notes.md", 60);
+        write_with_age(dir.path(), "archive.tar", 60);
+        write_with_age(dir.path(), "real.epub", 60);
+
+        let found = auto_add_candidates(dir.path());
+
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].ends_with("real.epub"));
+    }
+
+    #[test]
+    fn ignores_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("subdir.epub")).unwrap();
+
+        assert!(auto_add_candidates(dir.path()).is_empty(), "a directory named like a book is not a book");
+    }
+
+    #[test]
+    fn an_empty_or_missing_folder_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(auto_add_candidates(dir.path()).is_empty());
+        assert!(auto_add_candidates(&dir.path().join("does-not-exist")).is_empty());
+    }
+
+    /// Stable order, so a batch is added in a predictable sequence
+    /// rather than whatever the filesystem happened to return.
+    #[test]
+    fn results_are_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["c.epub", "a.epub", "b.epub"] {
+            write_with_age(dir.path(), name, 60);
+        }
+
+        let found: Vec<String> = auto_add_candidates(dir.path()).iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+
+        assert_eq!(found, vec!["a.epub", "b.epub", "c.epub"]);
     }
 }

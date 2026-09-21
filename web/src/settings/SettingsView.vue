@@ -93,6 +93,33 @@ async function installCatalogPlugin(name: string) {
   }
 }
 
+// Auto-add folder (#4.4). Desktop-only: watching a folder needs real
+// filesystem access, which a browser tab has none of.
+const autoAddFolder = ref<string | null>(null);
+const autoAddBusy = ref(false);
+const autoAddError = ref<string | null>(null);
+
+async function loadAutoAddFolder() {
+  if (!isTauri()) return;
+  try {
+    autoAddFolder.value = await tauriInvoke<string | null>("get_auto_add_folder");
+  } catch (e) {
+    console.error("failed to read the auto-add folder", e);
+  }
+}
+
+async function chooseAutoAddFolder(clear: boolean) {
+  autoAddBusy.value = true;
+  autoAddError.value = null;
+  try {
+    autoAddFolder.value = await tauriInvoke<string | null>("choose_auto_add_folder", { clear });
+  } catch (e) {
+    autoAddError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    autoAddBusy.value = false;
+  }
+}
+
 // Row colouring rules (#4.1). A rule is a template evaluated per
 // book; a usable colour in the result colours that row. First enabled
 // matching rule wins, so this list's order is the precedence.
@@ -274,6 +301,7 @@ onMounted(() => {
   void loadCatalog();
   void loadEmailAccount();
   void loadColoringRules();
+  void loadAutoAddFolder();
   window.addEventListener("keydown", onRebindKeydown);
 });
 onBeforeUnmount(() => window.removeEventListener("keydown", onRebindKeydown));
@@ -429,6 +457,26 @@ async function toggleAutoReopen() {
       </section>
 
       <section v-if="pluginsAvailable" class="pane">
+        <h3>Auto-add folder</h3>
+        <template v-if="isTauri()">
+          <p class="hint">
+            Books dropped into this folder are added to the library automatically and
+            then removed from it. A file that fails to add, or is already in the
+            library, is left where it is rather than disappearing.
+          </p>
+          <p class="field">{{ autoAddFolder || "No folder is being watched." }}</p>
+          <div class="plugin-actions">
+            <button type="button" :disabled="autoAddBusy" @click="chooseAutoAddFolder(false)">
+              {{ autoAddBusy ? "Working…" : autoAddFolder ? "Change folder…" : "Choose folder…" }}
+            </button>
+            <button v-if="autoAddFolder" type="button" :disabled="autoAddBusy" @click="chooseAutoAddFolder(true)">Stop watching</button>
+          </div>
+          <p v-if="autoAddError" class="error">{{ autoAddError }}</p>
+        </template>
+        <p v-else class="hint">Watching a folder needs filesystem access, so it is only available in the desktop app.</p>
+      </section>
+
+      <section class="pane">
         <h3>Row colours</h3>
         <p class="hint">
           Each rule is a template evaluated against every book; if it returns a colour
