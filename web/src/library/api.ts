@@ -894,3 +894,17 @@ export function saveEmailAccount(account: EmailAccount): Promise<{ ok: boolean }
     body: JSON.stringify(account),
   });
 }
+
+// Bulk template evaluation (#816 item 4.1). Colouring a page of rows
+// is one evaluation per row; the per-book route would be a request
+// per row.
+export async function evaluateTemplateBulk(template: string, bookIds: number[]): Promise<Record<string, string>> {
+  const data = await jsonFetch<{ ok: boolean; results?: Record<string, string>; error?: string }>("/template-tester/evaluate-bulk/default", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ template, book_ids: bookIds }),
+  });
+  // A broken template is an expected outcome while a rule is being
+  // written; the caller treats it as "this rule colours nothing".
+  return data.ok && data.results ? data.results : {};
+}

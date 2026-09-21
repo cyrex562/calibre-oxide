@@ -20,6 +20,13 @@ const props = defineProps<{
   selectedBookId: number | null;
   sort: string;
   sortOrder: "asc" | "desc";
+  /**
+   * Row colours from the colouring rules (#4.1), keyed by book id.
+   * Already validated against an allowlist -- see
+   * library/coloringRules.ts for why that matters before a value
+   * reaches a style attribute.
+   */
+  rowColors?: Record<number, string>;
 }>();
 
 const emit = defineEmits<{
@@ -122,6 +129,7 @@ function onRowKeydown(event: KeyboardEvent, bookId: number) {
           :key="b.id"
           tabindex="0"
           :class="{ selected: selectMode ? selectedIds.has(b.id) : selectedBookId === b.id }"
+          :style="rowColors?.[b.id] ? { color: rowColors[b.id] } : undefined"
           @click="onRowClick(b.id)"
           @keydown="onRowKeydown($event, b.id)"
           @contextmenu.prevent="emit('contextMenu', { bookId: b.id, x: $event.clientX, y: $event.clientY })"
