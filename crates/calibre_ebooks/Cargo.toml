@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# Bakes the vendored spell dictionaries into the binary (#865),
+# the same convention calibre_srv uses for MathJax.
+include_dir = "0.7"
 calibre_utils = { path = "../calibre_utils" }
 calibre_customize = { path = "../calibre_customize" }
 uuid = { version = "1.0", features = ["v4"] }

@@ -875,6 +875,7 @@ dependencies = [
  "hyphenation",
  "ignore",
  "image",
+ "include_dir",
  "indexmap 2.14.2",
  "jpeg-decoder",
  "lazy_static",

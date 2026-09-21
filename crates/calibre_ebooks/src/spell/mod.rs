@@ -25,6 +25,7 @@
 
 pub mod break_iterator;
 pub mod dictionary;
+pub mod vendored;
 pub mod import_from;
 
 /// Port of `calibre.spell.DictionaryLocale`.
