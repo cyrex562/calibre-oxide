@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute } from "vue-router";
-import { addBookmark, addHighlight, fetchManifest, getAnnotations, getLastReadPositions, setLastReadPosition } from "../reader/api";
+import { addBookmark, addHighlight, fetchBookFileText, fetchManifest, getAnnotations, getLastReadPositions, setLastReadPosition } from "../reader/api";
 import { loadSpineFileInto, type ResolveContext } from "../reader/unserialize";
 import { anchorLinkData } from "../reader/virtualLinks";
 import { decodePosition, deviceId, encodePosition } from "../reader/position";
@@ -9,6 +9,7 @@ import { flattenToc } from "../reader/toc";
 import { encodeBoundary, rangeFromEncoded } from "../reader/highlightRange";
 import { wrapHighlightRange } from "../reader/highlightDom";
 import PdfReader from "./PdfReader.vue";
+import { extractText, findMatches, totalMatches, type SpineMatches } from "../reader/search";
 import { DEFAULT_KEYMAP, DEFAULT_READER_PREFS, fetchProfile, KEYMAP_PROFILE, READER_PREFS_PROFILE, type KeymapPrefs, type ReaderPrefs } from "../settings/api";
 import type { Bookmark, BookManifest, Highlight } from "../reader/types";
 
@@ -419,6 +420,77 @@ function goToBookmark(bookmark: Bookmark) {
   showBookmarks.value = false;
   void loadSpine(pos.spineIndex, pos.frag);
 }
+
+// ---------------------------------------------------------------
+// In-book search (#2.2)
+// ---------------------------------------------------------------
+//
+// A book could be read but not searched, which for reference
+// material is most of the reason to open one.
+//
+// Every spine file is fetched and searched, so this is a real
+// whole-book search rather than a search of whatever happens to be on
+// screen. Files are fetched sequentially and the results stream in,
+// because a long book is many requests and a user should see early
+// hits rather than a spinner.
+
+const searchOpen = ref(false);
+const searchQuery = ref("");
+const searchWholeWord = ref(false);
+const searchCaseSensitive = ref(false);
+const searchResults = ref<SpineMatches[]>([]);
+const searching = ref(false);
+const searchProgress = ref(0);
+const searchError = ref<string | null>(null);
+
+/** Bumped per search so a superseded run stops writing results. */
+let searchRun = 0;
+
+const searchTotal = computed(() => totalMatches(searchResults.value));
+
+async function runBookSearch() {
+  const m = manifest.value;
+  const query = searchQuery.value.trim();
+  if (!m || !query) return;
+
+  const run = ++searchRun;
+  searching.value = true;
+  searchError.value = null;
+  searchResults.value = [];
+  searchProgress.value = 0;
+
+  const ctx = resolveContextFor(m);
+  const options = { wholeWord: searchWholeWord.value, caseSensitive: searchCaseSensitive.value };
+
+  try {
+    for (let i = 0; i < m.spine.length; i += 1) {
+      if (run !== searchRun) return; // a newer search started
+      const name = m.spine[i];
+      try {
+        const raw = await fetchBookFileText(ctx.bookId, ctx.fmt, ctx.size, ctx.mtime, name);
+        const parsed = JSON.parse(raw) as { tree: Parameters<typeof extractText>[0] };
+        const matches = findMatches(extractText(parsed.tree), query, options);
+        if (run !== searchRun) return;
+        if (matches.length > 0) searchResults.value = [...searchResults.value, { spineIndex: i, name, matches }];
+      } catch {
+        // One unreadable spine file must not abandon the rest of the
+        // book -- a search that silently stops halfway is worse than
+        // one that reports slightly fewer hits.
+      }
+      searchProgress.value = i + 1;
+    }
+  } catch (e) {
+    if (run === searchRun) searchError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    if (run === searchRun) searching.value = false;
+  }
+}
+
+async function goToSearchHit(result: SpineMatches) {
+  showToc.value = false;
+  showBookmarks.value = false;
+  await loadSpine(result.spineIndex);
+}
 </script>
 
 <template>
@@ -441,6 +513,7 @@ function goToBookmark(bookmark: Bookmark) {
       <router-link to="/" class="back">Library</router-link>
       <button @click="showBookmarks = false; showToc = !showToc" :disabled="!manifest">Contents</button>
       <button @click="showToc = false; showBookmarks = !showBookmarks" :disabled="!manifest">Bookmarks ({{ bookmarks.length }})</button>
+      <button @click="showToc = false; showBookmarks = false; searchOpen = !searchOpen" :disabled="!manifest" :class="{ active: searchOpen }">Search</button>
       <button @click="bookmarkCurrentPage" :disabled="!manifest">Bookmark this page</button>
       <button @click="prev" :disabled="spineIndex <= 0">◀ Prev</button>
       <span class="title">{{ manifest?.metadata?.title ?? "" }}</span>
@@ -457,6 +530,36 @@ function goToBookmark(bookmark: Bookmark) {
     <p v-if="highlightError" class="error">{{ highlightError }}</p>
     <p v-if="readAloudError" class="error">{{ readAloudError }}</p>
     <audio v-show="readAloudActive" ref="audioEl" controls @ended="onReadAloudEnded" class="read-aloud-player" />
+
+    <aside v-if="searchOpen" class="book-search">
+      <form class="book-search-form" @submit.prevent="runBookSearch">
+        <input v-model="searchQuery" type="search" placeholder="Search this book…" autofocus />
+        <button type="submit" :disabled="searching || !searchQuery.trim()">{{ searching ? "Searching…" : "Search" }}</button>
+      </form>
+      <div class="book-search-options">
+        <label><input v-model="searchWholeWord" type="checkbox" /> Whole word</label>
+        <label><input v-model="searchCaseSensitive" type="checkbox" /> Match case</label>
+        <span v-if="manifest && searching" class="book-search-progress">{{ searchProgress }} / {{ manifest.spine.length }}</span>
+      </div>
+
+      <p v-if="searchError" class="error">{{ searchError }}</p>
+      <p v-else-if="!searching && searchQuery.trim() && searchTotal === 0 && searchProgress > 0" class="status">No matches.</p>
+      <p v-else-if="searchTotal > 0" class="status">{{ searchTotal }} match(es) in {{ searchResults.length }} section(s)</p>
+
+      <ul class="book-search-results">
+        <li v-for="result in searchResults" :key="result.spineIndex">
+          <button type="button" class="book-search-section" @click="goToSearchHit(result)">
+            Section {{ result.spineIndex + 1 }} — {{ result.matches.length }} match(es)
+          </button>
+          <ul class="book-search-hits">
+            <li v-for="(m, i) in result.matches.slice(0, 5)" :key="i" @click="goToSearchHit(result)">
+              <span>{{ m.context.slice(0, m.contextOffset) }}</span><mark>{{ m.text }}</mark><span>{{ m.context.slice(m.contextOffset + m.text.length) }}</span>
+            </li>
+            <li v-if="result.matches.length > 5" class="book-search-more">+{{ result.matches.length - 5 }} more in this section</li>
+          </ul>
+        </li>
+      </ul>
+    </aside>
 
     <nav v-if="showToc" class="toc">
       <ul>
@@ -543,4 +646,87 @@ function goToBookmark(bookmark: Bookmark) {
 .error {
   color: #b00020;
 }
+/* In-book search (#2.2). */
+.book-search {
+  position: absolute;
+  top: 3rem;
+  left: 0;
+  right: 0;
+  max-height: 60vh;
+  overflow-y: auto;
+  background: #fff;
+  border-bottom: 1px solid #ccc;
+  padding: 0.6rem 0.8rem;
+  z-index: 10;
+}
+.book-search-form {
+  display: flex;
+  gap: 0.4rem;
+}
+.book-search-form input {
+  flex: 1;
+}
+.book-search-options {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  font-size: 0.82rem;
+  margin: 0.35rem 0;
+}
+.book-search-progress {
+  margin-left: auto;
+  opacity: 0.6;
+  font-variant-numeric: tabular-nums;
+}
+.book-search-results {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.book-search-section {
+  all: unset;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.85rem;
+  display: block;
+  margin-top: 0.4rem;
+}
+.book-search-section:hover {
+  text-decoration: underline;
+}
+.book-search-hits {
+  list-style: none;
+  margin: 0.2rem 0 0;
+  padding: 0 0 0 0.8rem;
+  font-size: 0.83rem;
+}
+.book-search-hits li {
+  cursor: pointer;
+  padding: 0.12rem 0;
+  border-left: 2px solid #e0e0e0;
+  padding-left: 0.5rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.book-search-hits li:hover {
+  background: #f3f6ff;
+}
+.book-search-more {
+  opacity: 0.6;
+  cursor: default !important;
+}
+@media (prefers-color-scheme: dark) {
+  .book-search {
+    background: #1a1d23;
+    border-bottom-color: #3a3d44;
+  }
+  .book-search-hits li {
+    border-left-color: #3a3d44;
+  }
+  .book-search-hits li:hover {
+    background: #252b36;
+  }
+}
+
 </style>
