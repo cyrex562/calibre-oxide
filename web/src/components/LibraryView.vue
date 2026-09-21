@@ -10,6 +10,7 @@ import AnnotationsBrowser from "./AnnotationsBrowser.vue";
 import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
 import type { CheckLibraryResult, CustomRecipeOptions, DuplicateBook, NewsFeedInput, NewsSchedule, SaveToDiskResult } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
+import { similarBooksQuery } from "../library/query";
 import { changesFor, isEmptySpec, REPLACEABLE_FIELDS, validateSpec, type BulkEditSpec } from "../library/bulkEdit";
 import { clampWidth, columnsFor, DEFAULT_TABLE_PREFS, resolveColumns, TABLE_PREFS_PROFILE, type BookColumn, type LibraryViewMode, type TablePrefs } from "../library/columns";
 import { actionEnabled, contextMenuEntries, LIBRARY_ACTIONS, visibleToolbarActions, type ActionContext, type LibraryAction, type LibraryActionId } from "../library/actions";
@@ -1055,6 +1056,10 @@ const actionHandlers: Partial<Record<LibraryActionId, () => void>> = {
   "browse-annotations": () => {
     annotationsOpen.value = true;
   },
+  "pick-random": () => pickRandomBook(),
+  "mark-books": () => markSelection(),
+  "show-marked": () => toggleShowMarked(),
+  "clear-marks": () => clearMarks(),
   "export-catalog": () => exportCatalog(),
   "export-library-archive": () => exportLibraryArchive(),
   "fetch-news": () => openNews(),
@@ -1084,6 +1089,8 @@ const HIDDEN_IN_FTS_MODE: ReadonlySet<LibraryActionId> = new Set<LibraryActionId
   "find-duplicates",
   "map-metadata",
   "browse-annotations",
+  "pick-random",
+  "mark-books",
   "export-catalog",
   "export-library-archive",
   "fetch-news",
@@ -1187,7 +1194,7 @@ let actionNonce = 0;
 /** Book actions BookDetailsPanel knows how to perform. */
 const PANEL_ACTIONS: LibraryActionId[] = ["read", "edit-metadata", "fetch-metadata", "convert", "tweak-book", "quick-view", "test-template", "send-email", "replace-cover", "open-externally"];
 
-const contextEntries = computed(() => contextMenuEntries([...PANEL_ACTIONS, "bulk-edit", "save-to-disk", "delete-book"], actionContext.value));
+const contextEntries = computed(() => contextMenuEntries([...PANEL_ACTIONS, "similar-books", "mark-books", "bulk-edit", "save-to-disk", "delete-book"], actionContext.value));
 
 function openContextMenu(payload: { bookId: number; x: number; y: number }) {
   // Right-clicking a row that is not part of the current selection
@@ -1213,6 +1220,14 @@ async function deleteSelectedBooks() {
 }
 
 function onContextChoose(id: LibraryActionId) {
+  if (id === "similar-books") {
+    if (selectedBookId.value !== null) void showSimilarBooks(selectedBookId.value);
+    return;
+  }
+  if (id === "mark-books") {
+    markSelection();
+    return;
+  }
   if (id === "delete-book") {
     void deleteSelectedBooks();
     return;
@@ -1302,6 +1317,101 @@ function openBookFromAnnotation(bookId: number) {
   annotationsOpen.value = false;
   selectedBookId.value = bookId;
 }
+
+// ---------------------------------------------------------------
+// Marks, similar books, random (#1.5 / #1.9 / #1.16)
+// ---------------------------------------------------------------
+//
+// Marks are what selection is not: they survive a new search, so
+// books can be gathered across several queries and then acted on
+// together. Session-only, matching upstream -- a mark is a working
+// note, not metadata, and persisting it would make it something the
+// user has to clean up.
+
+const markedIds = ref<Set<number>>(new Set());
+const showMarkedOnly = ref(false);
+
+function markSelection() {
+  const ids = selectMode.value && selectedIds.value.size > 0 ? [...selectedIds.value] : selectedBookId.value !== null ? [selectedBookId.value] : [];
+  if (ids.length === 0) return;
+  const next = new Set(markedIds.value);
+  // Toggle as a group: if everything in the selection is already
+  // marked, the user means to unmark it.
+  const allMarked = ids.every((id) => next.has(id));
+  for (const id of ids) {
+    if (allMarked) next.delete(id);
+    else next.add(id);
+  }
+  markedIds.value = next;
+}
+
+function clearMarks() {
+  markedIds.value = new Set();
+  if (showMarkedOnly.value) void toggleShowMarked();
+}
+
+/**
+ * Shows exactly the marked books, by fetching them directly rather
+ * than filtering the current page -- marks span searches, so most of
+ * them are usually not in whatever result set is on screen.
+ */
+async function toggleShowMarked() {
+  showMarkedOnly.value = !showMarkedOnly.value;
+  if (!showMarkedOnly.value) {
+    await runSearch();
+    return;
+  }
+  const ids = [...markedIds.value];
+  if (ids.length === 0) {
+    books.value = [];
+    totalNum.value = 0;
+    return;
+  }
+  loading.value = true;
+  error.value = null;
+  try {
+    books.value = await fetchBooks(ids);
+    totalNum.value = books.value.length;
+    offset.value = 0;
+  } catch (e) {
+    error.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    loading.value = false;
+  }
+}
+
+/** Similar books (#1.9): a plain search, using the existing engine. */
+async function showSimilarBooks(bookId: number) {
+  const book = books.value.find((b) => b.id === bookId) ?? (await fetchBooks([bookId]))[0];
+  if (!book) return;
+  const query = similarBooksQuery(
+    { id: book.id, authors: book.authors, tags: book.tags, series: book.series, publisher: typeof book.publisher === "string" ? book.publisher : null },
+    { authors: true, tags: true, series: true, publisher: true },
+  );
+  if (!query) {
+    error.value = "That book has no authors, tags, series or publisher to find similar books by.";
+    return;
+  }
+  if (showMarkedOnly.value) showMarkedOnly.value = false;
+  selectedBookId.value = null;
+  queryText.value = query;
+  activeQuery.value = query;
+  offset.value = 0;
+  await runSearch();
+}
+
+/** Random book (#1.16): opens one from the whole library. */
+async function pickRandomBook() {
+  try {
+    // Ids only -- the point is to pick one, not to render a page.
+    const all = await search({ query: "", num: 10000, offset: 0, sort: "id", sortOrder: "asc", vl: vl.value });
+    if (all.book_ids.length === 0) return;
+    const id = all.book_ids[Math.floor(Math.random() * all.book_ids.length)];
+    selectedBookId.value = id;
+  } catch (e) {
+    error.value = e instanceof Error ? e.message : String(e);
+  }
+}
 </script>
 
 <template>
@@ -1369,6 +1479,19 @@ function openBookFromAnnotation(bookId: number) {
       >
         {{ actionLabel(action) }}
       </button>
+      <!--
+        Marks need a visible home: "Show marked" and "Clear marks"
+        are deliberately not toolbar actions (they would clutter it
+        permanently), so they live in an indicator that only appears
+        once something is actually marked.
+      -->
+      <span v-if="markedIds.size > 0" class="marks-indicator">
+        <span class="marks-count">{{ markedIds.size }} marked</span>
+        <button type="button" :class="{ active: showMarkedOnly }" :aria-pressed="showMarkedOnly" @click="toggleShowMarked">
+          {{ showMarkedOnly ? "Show all" : "Show marked" }}
+        </button>
+        <button type="button" title="Clear all marks" @click="clearMarks">Clear</button>
+      </span>
       <input ref="addInput" type="file" multiple class="hidden-file-input" @change="onAddFileSelected" />
       <router-link to="/settings" class="settings-link">Settings…</router-link>
     </header>
@@ -1520,6 +1643,7 @@ function openBookFromAnnotation(bookId: number) {
         <div v-else class="grid">
           <button v-for="book in books" :key="book.id" class="card" :class="{ selected: selectMode && selectedIds.has(book.id) }" @click="onCardClick(book.id)" @contextmenu.prevent="openContextMenu({ bookId: book.id, x: $event.clientX, y: $event.clientY })">
             <input v-if="selectMode" type="checkbox" class="card-checkbox" :checked="selectedIds.has(book.id)" @click.stop="toggleSelected(book.id)" />
+            <span v-if="markedIds.has(book.id)" class="card-mark" title="Marked">●</span>
             <img :src="`${book.thumbnail}?v=${cacheBust}`" :alt="book.title" loading="lazy" />
             <div class="card-title">{{ book.title }}</div>
             <div class="card-authors">{{ (book.authors ?? []).join(" & ") }}</div>
@@ -1860,6 +1984,7 @@ function openBookFromAnnotation(bookId: number) {
   text-align: left;
   padding: 0;
   font: inherit;
+  /* Also the containing block for `.card-mark` and `.card-checkbox`. */
   position: relative;
 }
 .card.selected img {
@@ -2212,6 +2337,34 @@ function openBookFromAnnotation(bookId: number) {
 }
 @media (prefers-color-scheme: dark) {
   .bulk-replace {
+    border-color: #3a3d44;
+  }
+}
+
+/* Marks (#1.5). */
+.marks-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.15rem 0.45rem;
+  border: 1px solid #c8c8c8;
+  border-radius: 4px;
+}
+.marks-count {
+  font-size: 0.82rem;
+  opacity: 0.8;
+  white-space: nowrap;
+}
+.card-mark {
+  position: absolute;
+  top: 4px;
+  left: 6px;
+  color: #d97706;
+  font-size: 0.9rem;
+  text-shadow: 0 0 3px rgb(0 0 0 / 45%);
+}
+@media (prefers-color-scheme: dark) {
+  .marks-indicator {
     border-color: #3a3d44;
   }
 }

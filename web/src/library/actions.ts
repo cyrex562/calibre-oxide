@@ -86,6 +86,7 @@ export type LibraryActionId =
   | "find-duplicates"
   | "map-metadata"
   | "browse-annotations"
+  | "pick-random"
   | "export-catalog"
   | "export-library-archive"
   | "fetch-news"
@@ -94,6 +95,9 @@ export type LibraryActionId =
   | "switch-library"
   // Selection-scoped.
   | "select-mode"
+  | "mark-books"
+  | "show-marked"
+  | "clear-marks"
   | "focus-search"
   | "toggle-view"
   | "bulk-edit"
@@ -109,6 +113,7 @@ export type LibraryActionId =
   | "send-email"
   | "replace-cover"
   | "open-externally"
+  | "similar-books"
   | "delete-book";
 
 /**
@@ -128,6 +133,7 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   { id: "find-duplicates", label: "Find duplicates…", group: "library", requires: "none", toolbar: true },
   { id: "map-metadata", label: "Map authors/tags…", group: "library", requires: "none", toolbar: true },
   { id: "browse-annotations", label: "Annotations…", group: "library", requires: "none", toolbar: true },
+  { id: "pick-random", label: "Random book", group: "library", requires: "none", toolbar: true },
   { id: "export-catalog", label: "Export catalog…", group: "library", requires: "none", toolbar: true },
   { id: "export-library-archive", label: "Export library archive…", group: "library", requires: "none", toolbar: true },
   { id: "fetch-news", label: "Fetch news…", group: "library", requires: "none", toolbar: true },
@@ -136,6 +142,12 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   { id: "switch-library", label: "Switch library…", group: "library", requires: "none", toolbar: true, desktopOnly: true },
 
   { id: "select-mode", label: "Select…", group: "view", requires: "none" },
+  // Marks are the thing selection is not: they survive a new search,
+  // so books can be gathered across several queries and acted on
+  // together. Session-only, matching upstream.
+  { id: "mark-books", label: "Mark", group: "selection", requires: "selection" },
+  { id: "show-marked", label: "Show marked", group: "view", requires: "none", toolbar: false },
+  { id: "clear-marks", label: "Clear marks", group: "view", requires: "none", toolbar: false },
   // `toolbar: false` because both already have dedicated controls --
   // the search box and the Table/Grid switch. They are registry
   // entries so a keyboard shortcut can bind to a real action id
@@ -155,6 +167,7 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   { id: "test-template", label: "Test template…", group: "book", requires: "single-selection", contextMenu: true },
   { id: "send-email", label: "Send…", group: "book", requires: "single-selection", contextMenu: true },
   { id: "replace-cover", label: "Replace cover…", group: "book", requires: "single-selection", contextMenu: true },
+  { id: "similar-books", label: "Similar books", group: "book", requires: "single-selection", contextMenu: true },
   { id: "delete-book", label: "Delete", group: "book", requires: "selection", contextMenu: true },
 ];
 
