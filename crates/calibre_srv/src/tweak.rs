@@ -83,7 +83,7 @@ use crate::AppState;
 /// editability check so this module's own idea of "text file" matches
 /// the container's own decoding logic exactly, rather than
 /// duplicating a separate, potentially-divergent extension allowlist.
-fn is_editable_as_text(mime: &str) -> bool {
+pub(crate) fn is_editable_as_text(mime: &str) -> bool {
     calibre_ebooks::oeb::constants::OEB_STYLES.contains(&mime)
         || calibre_ebooks::oeb::constants::OEB_DOCS.contains(&mime)
         || mime == "text/plain"

@@ -808,3 +808,36 @@ export interface MisspelledWord {
 export function spellCheckBook(sessionId: string): Promise<{ count: number; words: MisspelledWord[] }> {
   return jsonFetch<{ count: number; words: MisspelledWord[] }>(`/tweak/spell/${encodeURIComponent(sessionId)}`);
 }
+
+// Search and replace across the book (#816 item 3.4). Acts on the
+// open tweak session, so a replace is part of the same
+// commit-or-discard decision as any other editor change.
+export interface SearchHit {
+  line: number;
+  text: string;
+  context: string;
+}
+
+export interface SearchFile {
+  name: string;
+  count: number;
+  samples: SearchHit[];
+}
+
+export interface SearchReplaceResult {
+  matches: number;
+  files: SearchFile[];
+  replaced: boolean;
+  changed_files: number;
+}
+
+export function searchReplaceBook(
+  sessionId: string,
+  opts: { find: string; replace?: string; regex?: boolean; caseSensitive?: boolean; dryRun?: boolean },
+): Promise<SearchReplaceResult> {
+  return jsonFetch<SearchReplaceResult>(`/tweak/search-replace/${encodeURIComponent(sessionId)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ find: opts.find, replace: opts.replace, regex: !!opts.regex, case_sensitive: !!opts.caseSensitive, dry_run: !!opts.dryRun }),
+  });
+}

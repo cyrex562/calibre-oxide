@@ -22,6 +22,7 @@ use calibre_ebooks::oeb::polish::report;
 use calibre_ebooks::oeb::polish::spell as polish_spell;
 use calibre_ebooks::spell::dictionary::{DictionaryMeta, Dictionaries};
 use calibre_ebooks::spell::{parse_lang_code, vendored, DictionaryLocale};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::errors::ServerError;
@@ -216,12 +217,147 @@ pub async fn spell_check(State(state): State<AppState>, AxumPath(session_id): Ax
     .map_err(|e| ServerError::InternalServerError(e.to_string()))?
 }
 
+
+// ===================================================================
+// Search and replace across the book (#816 item 3.4)
+// ===================================================================
+//
+// The editor could open one file at a time and edit it by hand. A
+// rename that appears in forty files was forty manual edits, which is
+// most of why an editor needs this at all.
+
+#[derive(Debug, Deserialize)]
+pub struct SearchReplaceBody {
+    pub find: String,
+    /// Omitted means "search only" -- nothing is written.
+    #[serde(default)]
+    pub replace: Option<String>,
+    #[serde(default)]
+    pub regex: bool,
+    #[serde(default)]
+    pub case_sensitive: bool,
+    /// Report what would change without writing it.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// How much text either side of a match to show.
+const CONTEXT_RADIUS: usize = 40;
+
+/// Builds the matcher.
+///
+/// A plain search is escaped rather than compiled: someone looking
+/// for `C++` or `(draft)` means those characters, and compiling the
+/// box as a pattern would either error or match something wildly
+/// unrelated. The same reasoning as the bulk metadata editor's
+/// search-and-replace.
+fn build_pattern(body: &SearchReplaceBody) -> Result<regex::Regex, ServerError> {
+    let raw = if body.regex { body.find.clone() } else { regex::escape(&body.find) };
+    let pattern = if body.case_sensitive { raw } else { format!("(?i){raw}") };
+    regex::Regex::new(&pattern).map_err(|e| ServerError::BadRequest(format!("invalid search pattern: {e}")))
+}
+
+/// Character-safe slice around a byte offset.
+///
+/// Slicing a UTF-8 string at an arbitrary byte offset panics on a
+/// multi-byte boundary, and book text is full of curly quotes and
+/// accented letters -- so the window is walked to real char
+/// boundaries rather than trusting arithmetic.
+fn context_around(text: &str, start: usize, end: usize) -> String {
+    let lo = text[..start].char_indices().rev().take(CONTEXT_RADIUS).last().map(|(i, _)| i).unwrap_or(start);
+    let hi = text[end..].char_indices().take(CONTEXT_RADIUS).last().map(|(i, c)| end + i + c.len_utf8()).unwrap_or(end);
+    text[lo..hi].split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `POST /tweak/search-replace/{session_id}`.
+///
+/// Acts on the open session, so a replace is part of the same
+/// commit-or-discard decision as any other editor change -- a user
+/// who dislikes the result can still discard the whole session.
+pub async fn search_replace(State(state): State<AppState>, AxumPath(session_id): AxumPath<String>, Json(body): Json<SearchReplaceBody>) -> Result<Json<Value>, ServerError> {
+    if body.find.is_empty() {
+        return Err(ServerError::BadRequest("find must not be empty".to_string()));
+    }
+    let pattern = build_pattern(&body)?;
+    // Validated before touching a single file: a bad pattern found
+    // halfway through leaves the book half-rewritten.
+    let writing = body.replace.is_some() && !body.dry_run;
+
+    tokio::task::spawn_blocking(move || -> Result<Json<Value>, ServerError> {
+        let outcome = state
+            .tweak_sessions
+            .with_container(&session_id, |container| -> anyhow::Result<(Vec<Value>, usize, usize)> {
+                let mut names: Vec<String> = container.name_path_map.keys().cloned().collect();
+                names.sort();
+
+                let mut files = Vec::new();
+                let mut total = 0usize;
+                let mut changed_files = 0usize;
+
+                for name in names {
+                    // Never offer to rewrite a binary: a "match" in
+                    // image bytes is noise at best and corruption at
+                    // worst.
+                    if !crate::tweak::is_editable_as_text(&container.guess_type(&name)) {
+                        continue;
+                    }
+                    let Ok(bytes) = container.raw_data(&name, true) else { continue };
+                    let Ok(text) = String::from_utf8(bytes) else { continue };
+
+                    let matches: Vec<(usize, usize)> = pattern.find_iter(&text).map(|m| (m.start(), m.end())).collect();
+                    if matches.is_empty() {
+                        continue;
+                    }
+                    total += matches.len();
+
+                    let samples: Vec<Value> = matches
+                        .iter()
+                        .take(5)
+                        .map(|(s, e)| {
+                            json!({
+                                // 1-based, matching how every editor
+                                // and error message counts lines.
+                                "line": text[..*s].matches('\n').count() + 1,
+                                "text": &text[*s..*e],
+                                "context": context_around(&text, *s, *e),
+                            })
+                        })
+                        .collect();
+
+                    files.push(json!({ "name": name, "count": matches.len(), "samples": samples }));
+
+                    if writing {
+                        if let Some(replacement) = &body.replace {
+                            let rewritten = pattern.replace_all(&text, replacement.as_str()).into_owned();
+                            if rewritten != text {
+                                container.write_file(&name, rewritten.as_bytes())?;
+                                changed_files += 1;
+                            }
+                        }
+                    }
+                }
+                Ok((files, total, changed_files))
+            })
+            .ok_or_else(|| ServerError::NotFound(format!("No tweak session: {session_id}")))?
+            .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+
+        Ok(Json(json!({
+            "matches": outcome.1,
+            "files": outcome.0,
+            "replaced": writing,
+            "changed_files": outcome.2,
+        })))
+    })
+    .await
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))?
+}
+
 #[cfg(test)]
 mod tests {
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
     use calibre_db::cache::Cache;
-    use serde_json::Value;
+    use serde_json::{json, Value};
     use tower::ServiceExt;
 
     /// A real EPUB carrying a genuine defect -- two elements sharing
@@ -425,6 +561,139 @@ mod tests {
         assert!(suggestions.iter().any(|s| *s == "library"), "expected 'library' among suggestions, got {suggestions:?}");
     }
 
+    async fn post_json(router: &axum::Router, uri: &str, body: Value) -> (StatusCode, Value) {
+        let req = Request::builder().method("POST").uri(uri).header("content-type", "application/json").body(Body::from(body.to_string())).unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    // ---------------------------------------------------------------
+    // Search and replace (#3.4)
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn search_reports_matches_with_a_line_and_context() {
+        let (_d, router, book_id) = test_app();
+        let session = open_session(&router, book_id).await;
+
+        let (status, body) = post_json(&router, &format!("/tweak/search-replace/{session}"), json!({"find": "misspelling"})).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["matches"].as_u64().unwrap() >= 1, "{body}");
+        let sample = &body["files"][0]["samples"][0];
+        assert!(sample["line"].as_u64().unwrap() >= 1, "lines are 1-based: {sample}");
+        assert!(sample["context"].as_str().unwrap().contains("misspelling"), "{sample}");
+    }
+
+    /// Searching must never write. The whole point of offering a
+    /// search without a `replace` is being able to look first.
+    #[tokio::test]
+    async fn searching_without_a_replacement_changes_nothing() {
+        let (_d, router, book_id) = test_app();
+        let session = open_session(&router, book_id).await;
+
+        let (_, body) = post_json(&router, &format!("/tweak/search-replace/{session}"), json!({"find": "misspelling"})).await;
+        assert_eq!(body["replaced"], false);
+        assert_eq!(body["changed_files"], 0);
+
+        let after = post_json(&router, &format!("/tweak/search-replace/{session}"), json!({"find": "misspelling"})).await.1;
+        assert_eq!(after["matches"], body["matches"], "a search must be repeatable with the same result");
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_reports_without_writing() {
+        let (_d, router, book_id) = test_app();
+        let session = open_session(&router, book_id).await;
+
+        let (_, body) = post_json(&router, &format!("/tweak/search-replace/{session}"), json!({"find": "libary", "replace": "library", "dry_run": true})).await;
+        assert!(body["matches"].as_u64().unwrap() >= 1, "{body}");
+        assert_eq!(body["replaced"], false, "a dry run must not write: {body}");
+
+        // Still there afterwards.
+        let after = post_json(&router, &format!("/tweak/search-replace/{session}"), json!({"find": "libary"})).await.1;
+        assert!(after["matches"].as_u64().unwrap() >= 1, "the dry run wrote anyway: {after}");
+    }
+
+    #[tokio::test]
+    async fn a_replace_really_rewrites_the_file() {
+        let (_d, router, book_id) = test_app();
+        let session = open_session(&router, book_id).await;
+
+        let (status, body) = post_json(&router, &format!("/tweak/search-replace/{session}"), json!({"find": "libary", "replace": "library"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["replaced"], true);
+        assert!(body["changed_files"].as_u64().unwrap() >= 1, "{body}");
+
+        let after = post_json(&router, &format!("/tweak/search-replace/{session}"), json!({"find": "libary"})).await.1;
+        assert_eq!(after["matches"], 0, "the misspelling should be gone: {after}");
+    }
+
+    /// Someone searching for "C++" or "(draft)" means those
+    /// characters. Compiling the box as a pattern would throw or
+    /// match something unrelated.
+    #[tokio::test]
+    async fn a_plain_search_treats_metacharacters_literally() {
+        let (_d, router, book_id) = test_app();
+        let session = open_session(&router, book_id).await;
+
+        // `.` would match any character if this were compiled.
+        let (_, dot) = post_json(&router, &format!("/tweak/search-replace/{session}"), json!({"find": "libary."})).await;
+        let (_, wildcard) = post_json(&router, &format!("/tweak/search-replace/{session}"), json!({"find": "libary.", "regex": true})).await;
+
+        assert_eq!(dot["matches"], 1, "the literal 'libary.' appears once: {dot}");
+        assert_eq!(wildcard["matches"], 1, "and so does the pattern here: {wildcard}");
+
+        // A pattern that only matches as a regex proves the flag works.
+        let (_, only_regex) = post_json(&router, &format!("/tweak/search-replace/{session}"), json!({"find": "lib.ry", "regex": true})).await;
+        let (_, as_plain) = post_json(&router, &format!("/tweak/search-replace/{session}"), json!({"find": "lib.ry"})).await;
+        assert!(only_regex["matches"].as_u64().unwrap() >= 1, "{only_regex}");
+        assert_eq!(as_plain["matches"], 0, "a plain search must not treat '.' as a wildcard: {as_plain}");
+    }
+
+    #[tokio::test]
+    async fn case_sensitivity_is_respected() {
+        let (_d, router, book_id) = test_app();
+        let session = open_session(&router, book_id).await;
+
+        let insensitive = post_json(&router, &format!("/tweak/search-replace/{session}"), json!({"find": "LIBARY"})).await.1;
+        let sensitive = post_json(&router, &format!("/tweak/search-replace/{session}"), json!({"find": "LIBARY", "case_sensitive": true})).await.1;
+
+        assert!(insensitive["matches"].as_u64().unwrap() >= 1, "{insensitive}");
+        assert_eq!(sensitive["matches"], 0, "{sensitive}");
+    }
+
+    /// A "match" inside image bytes is noise at best and corruption
+    /// at worst.
+    #[tokio::test]
+    async fn binary_files_are_never_searched_or_rewritten() {
+        let (_d, router, book_id) = test_app();
+        let session = open_session(&router, book_id).await;
+
+        let (_, body) = post_json(&router, &format!("/tweak/search-replace/{session}"), json!({"find": "e"})).await;
+        let names: Vec<&str> = body["files"].as_array().unwrap().iter().filter_map(|f| f["name"].as_str()).collect();
+
+        assert!(!names.iter().any(|n| n.ends_with(".png") || n.ends_with(".jpg")), "{names:?}");
+        assert!(names.iter().any(|n| n.ends_with(".xhtml") || n.ends_with(".opf")), "text files should be searched: {names:?}");
+    }
+
+    #[tokio::test]
+    async fn an_invalid_regex_is_refused_before_anything_is_touched() {
+        let (_d, router, book_id) = test_app();
+        let session = open_session(&router, book_id).await;
+
+        let (status, _) = post_json(&router, &format!("/tweak/search-replace/{session}"), json!({"find": "(unclosed", "regex": true, "replace": "x"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn an_empty_search_is_refused() {
+        let (_d, router, book_id) = test_app();
+        let session = open_session(&router, book_id).await;
+        assert_eq!(post_json(&router, &format!("/tweak/search-replace/{session}"), json!({"find": ""})).await.0, StatusCode::BAD_REQUEST);
+    }
+
     #[tokio::test]
     async fn an_unknown_session_is_a_404_on_every_route() {
         let (_d, router, _) = test_app();
@@ -432,5 +701,6 @@ mod tests {
         assert_eq!(get(&router, "/tweak/report/nope").await.0, StatusCode::NOT_FOUND);
         assert_eq!(post(&router, "/tweak/check-fix/nope").await.0, StatusCode::NOT_FOUND);
         assert_eq!(get(&router, "/tweak/spell/nope").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(post_json(&router, "/tweak/search-replace/nope", json!({"find": "x"})).await.0, StatusCode::NOT_FOUND);
     }
 }

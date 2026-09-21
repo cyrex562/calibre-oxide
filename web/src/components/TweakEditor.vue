@@ -3,7 +3,7 @@ import { onBeforeUnmount, ref } from "vue";
 import { commitTweakSession, discardTweakSession, fetchToc, fetchTweakFile, openTweakSession, saveToc, saveTweakFile, type TocNode } from "../library/tweak";
 import TocTreeNode from "./TocTreeNode.vue";
 
-import { bookReport, checkBook, fixBookChecks, type BookReport, type CheckResult, spellCheckBook, type MisspelledWord } from "../library/api";
+import { bookReport, checkBook, fixBookChecks, type BookReport, type CheckResult, spellCheckBook, type MisspelledWord, searchReplaceBook, type SearchReplaceResult } from "../library/api";
 
 const props = defineProps<{ bookId: number }>();
 const emit = defineEmits<{ close: []; updated: [] }>();
@@ -140,7 +140,7 @@ onBeforeUnmount(() => {
 // ported with no caller anywhere. They act on the open session, so
 // they see unsaved edits -- checking the stored copy would report
 // problems already fixed in the editor.
-type EditorTab = "files" | "toc" | "check" | "report" | "spell";
+type EditorTab = "files" | "toc" | "check" | "report" | "spell" | "find";
 const tab = ref<EditorTab>("files");
 
 const checkResult = ref<CheckResult | null>(null);
@@ -204,6 +204,7 @@ function openTab(next: EditorTab) {
   if (next === "check") void runCheck();
   if (next === "report") void loadReport();
   if (next === "spell") void runSpellCheck();
+  // Deliberately not auto-run: a search needs a query first.
 }
 
 function formatSize(bytes: number): string {
@@ -231,6 +232,59 @@ async function runSpellCheck() {
     spellBusy.value = false;
   }
 }
+
+// Search and replace (#3.4). The editor could open one file at a
+// time; a rename appearing in forty files was forty manual edits.
+const findText = ref("");
+const replaceText = ref("");
+const findRegex = ref(false);
+const findCaseSensitive = ref(false);
+const findResult = ref<SearchReplaceResult | null>(null);
+const findBusy = ref(false);
+const findError = ref<string | null>(null);
+const findMessage = ref<string | null>(null);
+
+async function runFind() {
+  if (!sessionId.value || !findText.value) return;
+  findBusy.value = true;
+  findError.value = null;
+  findMessage.value = null;
+  try {
+    findResult.value = await searchReplaceBook(sessionId.value, { find: findText.value, regex: findRegex.value, caseSensitive: findCaseSensitive.value });
+  } catch (e) {
+    findError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    findBusy.value = false;
+  }
+}
+
+/**
+ * Replaces everywhere.
+ *
+ * Confirmed first, and only after a search has shown what will be
+ * hit: a replace across a whole book is not something to discover the
+ * scope of afterwards. It is still undoable by discarding the
+ * session, which the confirmation says.
+ */
+async function runReplaceAll() {
+  if (!sessionId.value || !findText.value || !findResult.value) return;
+  const n = findResult.value.matches;
+  if (!window.confirm(`Replace ${n} occurrence(s) across ${findResult.value.files.length} file(s)? You can still discard the whole session afterwards.`)) return;
+
+  findBusy.value = true;
+  findError.value = null;
+  try {
+    const result = await searchReplaceBook(sessionId.value, { find: findText.value, replace: replaceText.value, regex: findRegex.value, caseSensitive: findCaseSensitive.value });
+    findMessage.value = `Replaced in ${result.changed_files} file(s). Commit to keep the changes.`;
+    await runFind();
+    // The open file may have been rewritten underneath the editor.
+    if (selectedFile.value) await selectFile(selectedFile.value);
+  } catch (e) {
+    findError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    findBusy.value = false;
+  }
+}
 </script>
 
 <template>
@@ -247,9 +301,41 @@ async function runSpellCheck() {
           <button type="button" :class="{ active: tab === 'check' }" @click="openTab('check')">Check book</button>
           <button type="button" :class="{ active: tab === 'report' }" @click="openTab('report')">Report</button>
           <button type="button" :class="{ active: tab === 'spell' }" @click="openTab('spell')">Spelling</button>
+          <button type="button" :class="{ active: tab === 'find' }" @click="openTab('find')">Find &amp; replace</button>
         </div>
 
-        <section v-if="tab === 'spell'" class="editor-tool">
+        <section v-if="tab === 'find'" class="editor-tool">
+          <form class="find-form" @submit.prevent="runFind">
+            <input v-model="findText" placeholder="Find…" :disabled="findBusy" />
+            <input v-model="replaceText" placeholder="Replace with…" :disabled="findBusy" />
+            <button type="submit" :disabled="findBusy || !findText">{{ findBusy ? "Searching…" : "Find" }}</button>
+            <button type="button" :disabled="findBusy || !findResult?.matches" title="Search first to see what will change" @click="runReplaceAll">
+              Replace all{{ findResult?.matches ? ` (${findResult.matches})` : "" }}
+            </button>
+          </form>
+          <div class="find-options">
+            <label><input v-model="findRegex" type="checkbox" /> Regex</label>
+            <label><input v-model="findCaseSensitive" type="checkbox" /> Match case</label>
+          </div>
+
+          <p v-if="findError" class="error">{{ findError }}</p>
+          <p v-if="findMessage" class="status">{{ findMessage }}</p>
+          <p v-else-if="findResult && findResult.matches === 0" class="status">No matches.</p>
+          <p v-else-if="findResult" class="status">{{ findResult.matches }} match(es) in {{ findResult.files.length }} file(s)</p>
+
+          <ul v-if="findResult?.files.length" class="check-list">
+            <li v-for="f in findResult.files" :key="f.name">
+              <span class="check-level">{{ f.count }}×</span>
+              <span class="check-where">
+                <button type="button" class="saved-template-name" @click="openTab('files'); selectFile(f.name)">{{ f.name }}</button>
+              </span>
+              <span class="check-msg">{{ f.samples.map((s) => `${s.line}: ${s.context}`).join(" · ") }}</span>
+              <span></span>
+            </li>
+          </ul>
+        </section>
+
+        <section v-else-if="tab === 'spell'" class="editor-tool">
           <div class="tool-actions">
             <button type="button" :disabled="spellBusy" @click="runSpellCheck">{{ spellBusy ? "Checking…" : "Re-check" }}</button>
           </div>
@@ -563,6 +649,32 @@ h3 {
 @media (prefers-color-scheme: dark) {
   .check-list li { border-bottom-color: #2b3037; }
   .report-list li { border-bottom-color: #2b3037; }
+}
+
+/* Find & replace (#3.4). */
+.find-form {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.35rem;
+}
+.find-form input {
+  flex: 1;
+  min-width: 10ch;
+}
+.find-options {
+  display: flex;
+  gap: 1rem;
+  font-size: 0.83rem;
+  margin-bottom: 0.5rem;
+}
+.saved-template-name {
+  all: unset;
+  cursor: pointer;
+  font-weight: 600;
+}
+.saved-template-name:hover {
+  text-decoration: underline;
 }
 
 </style>
