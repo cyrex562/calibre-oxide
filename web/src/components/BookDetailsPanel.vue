@@ -509,10 +509,14 @@ async function runTemplateTest() {
   }
 }
 
-// Only formats the reader MVP (#499) actually round-trips through
-// render_book are offered a "Read" link -- other formats still get a
-// plain download link.
-const READABLE_FORMATS = ["epub", "kepub"];
+// Formats the in-app reader can show. EPUB/KEPUB go through
+// `render_book`; PDF is rendered by PDF.js (#816 item 2.1), which
+// needs no server-side rendering at all -- it reads `/get/pdf/{id}`
+// directly.
+//
+// EPUB first: when a book has both, the EPUB reader offers contents,
+// bookmarks, highlights and read-aloud that the PDF view cannot.
+const READABLE_FORMATS = ["epub", "kepub", "pdf"];
 
 const readableFormat = computed(() => book.value?.formats.find((f) => READABLE_FORMATS.includes(f)) ?? null);
 

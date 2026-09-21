@@ -4,10 +4,11 @@ import { useRoute } from "vue-router";
 import { addBookmark, addHighlight, fetchManifest, getAnnotations, getLastReadPositions, setLastReadPosition } from "../reader/api";
 import { loadSpineFileInto, type ResolveContext } from "../reader/unserialize";
 import { anchorLinkData } from "../reader/virtualLinks";
-import { decodePosition, encodePosition } from "../reader/position";
+import { decodePosition, deviceId, encodePosition } from "../reader/position";
 import { flattenToc } from "../reader/toc";
 import { encodeBoundary, rangeFromEncoded } from "../reader/highlightRange";
 import { wrapHighlightRange } from "../reader/highlightDom";
+import PdfReader from "./PdfReader.vue";
 import { DEFAULT_KEYMAP, DEFAULT_READER_PREFS, fetchProfile, KEYMAP_PROFILE, READER_PREFS_PROFILE, type KeymapPrefs, type ReaderPrefs } from "../settings/api";
 import type { Bookmark, BookManifest, Highlight } from "../reader/types";
 
@@ -15,6 +16,12 @@ const route = useRoute();
 
 const bookId = computed(() => (route.params.bookId as string) || "");
 const fmt = computed(() => ((route.params.fmt as string) || "epub").toLowerCase());
+
+// PDFs take a completely different path: there is no manifest, no
+// spine and no CFI, so none of the EPUB pipeline below applies. The
+// desktop webview is WebKitGTK, which has no built-in PDF viewer, so
+// this is rendered by PDF.js rather than handed to an `<embed>`.
+const isPdf = computed(() => fmt.value === "pdf");
 
 const manifest = ref<BookManifest | null>(null);
 const loadError = ref<string | null>(null);
@@ -77,16 +84,6 @@ function applyReaderPrefs() {
     doc.head?.appendChild(style);
   }
   style.textContent = `html { font-size: ${readerPrefs.value.fontSizePercent}% !important; } body { background: ${bg} !important; color: ${fg} !important; } mark.cx-highlight { background: #ffe066 !important; color: #111 !important; }`;
-}
-
-function deviceId(): string {
-  const key = "calibre-oxide-device-id";
-  let id = localStorage.getItem(key);
-  if (!id) {
-    id = crypto.randomUUID();
-    localStorage.setItem(key, id);
-  }
-  return id;
 }
 
 async function pollManifest(): Promise<BookManifest> {
@@ -382,10 +379,12 @@ function onKeydown(e: KeyboardEvent) {
 
 onMounted(() => {
   window.addEventListener("keydown", onKeydown);
-  void init();
+  if (!isPdf.value) void init();
 });
 onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
-watch([bookId, fmt], () => void init());
+watch([bookId, fmt], () => {
+  if (!isPdf.value) void init();
+});
 
 function goToTocEntry(dest: string | null, frag: string | null) {
   const m = manifest.value;
@@ -423,7 +422,21 @@ function goToBookmark(bookmark: Bookmark) {
 </script>
 
 <template>
-  <div class="reader">
+  <!--
+    A PDF shares only the "Library" link with the EPUB reader: no
+    contents, bookmarks, spine navigation or read-aloud apply to it,
+    so it gets its own view rather than a toolbar full of disabled
+    buttons.
+  -->
+  <div v-if="isPdf" class="reader">
+    <header class="toolbar">
+      <router-link to="/" class="back">Library</router-link>
+      <span class="title">PDF</span>
+    </header>
+    <PdfReader :book-id="bookId" />
+  </div>
+
+  <div v-else class="reader">
     <header class="toolbar">
       <router-link to="/" class="back">Library</router-link>
       <button @click="showBookmarks = false; showToc = !showToc" :disabled="!manifest">Contents</button>
