@@ -10,6 +10,7 @@ import { encodeBoundary, rangeFromEncoded } from "../reader/highlightRange";
 import { wrapHighlightRange } from "../reader/highlightDom";
 import PdfReader from "./PdfReader.vue";
 import { extractText, findMatches, totalMatches, type SpineMatches } from "../reader/search";
+import { isNoteReference, noteTextFor } from "../reader/footnotes";
 import { DEFAULT_KEYMAP, DEFAULT_READER_PREFS, fetchProfile, KEYMAP_PROFILE, READER_PREFS_PROFILE, type KeymapPrefs, type ReaderPrefs } from "../settings/api";
 import type { Bookmark, BookManifest, Highlight } from "../reader/types";
 
@@ -153,6 +154,13 @@ function installAnchorHandler(m: BookManifest) {
     const data = anchorLinkData(anchor, m.link_uid);
     if (!data) return;
     event.preventDefault();
+
+    // A footnote pops over the text rather than navigating: following
+    // the link means losing your place and having to come back.
+    if (!data.missing && data.frag && isNoteReference(anchor.getAttribute("epub:type"), anchor.getAttribute("role"))) {
+      void showFootnote(m, data.name, data.frag, anchor);
+      return;
+    }
     if (data.missing) {
       statusMessage.value = `That link points to a resource that isn't part of this book.`;
       return;
@@ -182,17 +190,30 @@ function installSelectionHandler() {
   const doc = iframeEl.value?.contentDocument;
   if (!doc) return;
 
-  const popover = doc.createElement("button");
+  // A bar rather than a lone button (#2.4): highlighting was the only
+  // thing a selection could do, and copying a quotation is at least
+  // as common.
+  const popover = doc.createElement("div");
   popover.id = HIGHLIGHT_POPOVER_ID;
-  popover.type = "button";
-  popover.textContent = "Highlight";
-  popover.style.cssText = "position:absolute;z-index:1000;display:none;padding:0.3em 0.6em;border-radius:4px;border:none;background:#2a6df4;color:#fff;font:14px sans-serif;cursor:pointer;";
+  popover.style.cssText = "position:absolute;z-index:1000;display:none;gap:1px;border-radius:4px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.3);font:14px sans-serif;";
+
+  const makeButton = (label: string, onClick: () => void) => {
+    const button = doc.createElement("button");
+    button.type = "button";
+    button.textContent = label;
+    button.style.cssText = "padding:0.3em 0.7em;border:none;background:#2a6df4;color:#fff;cursor:pointer;font:inherit;";
+    // Without this, the mousedown on the button itself would collapse
+    // the very selection it is meant to act on before the click
+    // handler ever runs.
+    button.addEventListener("mousedown", (e) => e.preventDefault());
+    button.addEventListener("click", onClick);
+    popover.appendChild(button);
+    return button;
+  };
+
+  makeButton("Highlight", () => void createHighlightFromSelection());
+  makeButton("Copy", () => void copySelection(doc, popover));
   doc.body.appendChild(popover);
-  // Without this, the mousedown on the button itself would collapse
-  // the very selection it's meant to act on before the click handler
-  // below ever runs.
-  popover.addEventListener("mousedown", (e) => e.preventDefault());
-  popover.addEventListener("click", () => void createHighlightFromSelection());
 
   doc.addEventListener("mouseup", () => {
     const sel = doc.getSelection();
@@ -208,8 +229,33 @@ function installSelectionHandler() {
     const view = doc.defaultView;
     popover.style.left = `${rect.left + (view?.scrollX ?? 0)}px`;
     popover.style.top = `${rect.top + (view?.scrollY ?? 0) - 32}px`;
-    popover.style.display = "block";
+    popover.style.display = "flex";
   });
+}
+
+/**
+ * Copies the selection (#2.4).
+ *
+ * `navigator.clipboard` is unavailable in some webview contexts and
+ * requires a secure origin, so a failure falls back to the older
+ * `execCommand` path rather than silently doing nothing -- the user
+ * pressed a button labelled Copy.
+ */
+async function copySelection(doc: Document, popover: HTMLElement) {
+  const text = doc.getSelection()?.toString() ?? "";
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    try {
+      doc.execCommand("copy");
+    } catch {
+      statusMessage.value = "Could not copy the selection.";
+      return;
+    }
+  }
+  popover.style.display = "none";
+  statusMessage.value = "Copied.";
 }
 
 async function createHighlightFromSelection() {
@@ -490,6 +536,77 @@ async function goToSearchHit(result: SpineMatches) {
   showToc.value = false;
   showBookmarks.value = false;
   await loadSpine(result.spineIndex);
+}
+
+// ---------------------------------------------------------------
+// Popup footnotes (#2.6)
+// ---------------------------------------------------------------
+//
+// Note detection and text extraction live in reader/footnotes.ts,
+// verified against a real EPUB served by this stack: `epub:type`
+// survives serialization verbatim, so the marker really is there to
+// match on.
+
+const FOOTNOTE_POPOVER_ID = "calibre-oxide-footnote-popover";
+
+async function showFootnote(m: BookManifest, name: string, frag: string, anchor: Element) {
+  const doc = iframeEl.value?.contentDocument;
+  if (!doc) return;
+
+  let text: string | null = null;
+  try {
+    const ctx = resolveContextFor(m);
+    const raw = await fetchBookFileText(ctx.bookId, ctx.fmt, ctx.size, ctx.mtime, name);
+    const parsed = JSON.parse(raw) as { tree: Parameters<typeof noteTextFor>[0] };
+    text = noteTextFor(parsed.tree, frag);
+  } catch {
+    text = null;
+  }
+
+  // Fall back to ordinary navigation rather than showing an empty
+  // bubble: an unresolvable note is still a real link somewhere.
+  if (!text) {
+    const idx = m.spine.indexOf(name);
+    if (idx !== -1) void loadSpine(idx, frag);
+    return;
+  }
+
+  doc.getElementById(FOOTNOTE_POPOVER_ID)?.remove();
+
+  const popover = doc.createElement("div");
+  popover.id = FOOTNOTE_POPOVER_ID;
+  popover.textContent = text;
+  popover.style.cssText = [
+    "position:absolute",
+    "z-index:1001",
+    "max-width:min(34em, 80vw)",
+    "max-height:40vh",
+    "overflow-y:auto",
+    "padding:0.7em 0.9em",
+    "border-radius:6px",
+    "border:1px solid rgba(0,0,0,0.2)",
+    "background:#fffef8",
+    "color:#111",
+    "box-shadow:0 4px 18px rgba(0,0,0,0.25)",
+    "font:inherit",
+    "line-height:1.45",
+  ].join(";");
+
+  const rect = anchor.getBoundingClientRect();
+  const view = doc.defaultView;
+  popover.style.left = `${Math.max(8, rect.left + (view?.scrollX ?? 0) - 40)}px`;
+  popover.style.top = `${rect.bottom + (view?.scrollY ?? 0) + 6}px`;
+  doc.body.appendChild(popover);
+
+  // Dismissed by clicking anywhere else, which is what a reader
+  // expects and needs no close button competing with the note text.
+  const dismiss = (e: Event) => {
+    if (popover.contains(e.target as Node)) return;
+    popover.remove();
+    doc.removeEventListener("click", dismiss, true);
+  };
+  // Deferred so the click that opened it does not immediately close it.
+  setTimeout(() => doc.addEventListener("click", dismiss, true), 0);
 }
 </script>
 
