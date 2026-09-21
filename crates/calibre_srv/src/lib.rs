@@ -355,6 +355,8 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/duplicates/scan/{library_id}", post(duplicates::scan))
         .route("/tweak/open/{book_id}/{fmt}/{library_id}", post(tweak::open_session))
         .route("/tweak/file/{session_id}/{*name}", get(tweak::get_file).post(tweak::set_file))
+        .route("/tweak/diff/{session_id}", get(editor_tools::diff))
+        .route("/tweak/fonts/{session_id}", get(editor_tools::fonts))
         .route("/tweak/search-replace/{session_id}", post(editor_tools::search_replace))
         .route("/tweak/spell/{session_id}", get(editor_tools::spell_check))
         .route("/tweak/check/{session_id}", get(editor_tools::check))

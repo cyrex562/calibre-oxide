@@ -841,3 +841,30 @@ export function searchReplaceBook(
     body: JSON.stringify({ find: opts.find, replace: opts.replace, regex: !!opts.regex, case_sensitive: !!opts.caseSensitive, dry_run: !!opts.dryRun }),
   });
 }
+
+// Fonts and diff in the editor (#816 items 3.6 / 3.5).
+export interface FontFamily {
+  family: string;
+  embedded: boolean;
+}
+
+export function bookFonts(sessionId: string): Promise<{ count: number; embedded: number; not_embedded: number; families: FontFamily[] }> {
+  return jsonFetch(`/tweak/fonts/${encodeURIComponent(sessionId)}`);
+}
+
+export interface DiffLine {
+  tag: "add" | "remove" | "context";
+  old_line: number | null;
+  new_line: number | null;
+  text: string;
+}
+
+export interface DiffFile {
+  name: string;
+  status: "added" | "removed" | "modified" | "binary-changed";
+  lines?: DiffLine[];
+}
+
+export function bookDiff(sessionId: string): Promise<{ changed: number; files: DiffFile[] }> {
+  return jsonFetch(`/tweak/diff/${encodeURIComponent(sessionId)}`);
+}
