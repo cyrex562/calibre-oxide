@@ -7,6 +7,8 @@ import { addFormat, deleteBooks, evaluateTemplate, fetchBook, fetchBooks, fetchC
 import type { ConversionOptionsOverride, DataFileStat, SmtpRelayConfig } from "../library/api";
 import { categoryItemToQuery } from "../library/query";
 import { isTauri, tauriInvoke } from "../tauri";
+import { DEFAULT_SAVED_TEMPLATES, removeTemplate, saveTemplate, SAVED_TEMPLATES_PROFILE, TemplateNameError, wouldOverwrite, type SavedTemplate, type SavedTemplates } from "../library/savedTemplates";
+import { fetchProfile, saveProfile } from "../settings/api";
 import type { BookFieldChanges, BookSummary, FieldMetaEntry } from "../library/types";
 
 const props = defineProps<{
@@ -442,6 +444,56 @@ const templateRunning = ref(false);
 const templateResult = ref<string | null>(null);
 const templateError = ref<string | null>(null);
 
+// Saved templates (#1.15). The tester could evaluate a template but
+// not keep one, so every useful expression had to be retyped. The
+// mutation rules live in library/savedTemplates.ts -- the interesting
+// cases are all name collisions, which silently overwrite work if
+// handled wrong.
+const savedTemplates = ref<SavedTemplate[]>([]);
+const templateNameInput = ref("");
+const templateSaveError = ref<string | null>(null);
+
+async function loadSavedTemplates() {
+  try {
+    const stored = await fetchProfile<SavedTemplates>(SAVED_TEMPLATES_PROFILE);
+    savedTemplates.value = stored?.templates ?? DEFAULT_SAVED_TEMPLATES.templates;
+  } catch (e) {
+    console.error("failed to load saved templates", e);
+  }
+}
+void loadSavedTemplates();
+
+async function persistTemplates(next: SavedTemplate[]) {
+  savedTemplates.value = next;
+  try {
+    await saveProfile(SAVED_TEMPLATES_PROFILE, { templates: next });
+  } catch (e) {
+    templateSaveError.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
+async function saveCurrentTemplate() {
+  templateSaveError.value = null;
+  const name = templateNameInput.value;
+  // Say so *before* overwriting, not after.
+  if (wouldOverwrite(savedTemplates.value, name) && !window.confirm(`Replace the saved template "${name.trim()}"?`)) return;
+  try {
+    await persistTemplates(saveTemplate(savedTemplates.value, name, templateInput.value));
+    templateNameInput.value = "";
+  } catch (e) {
+    templateSaveError.value = e instanceof TemplateNameError ? e.message : String(e);
+  }
+}
+
+function loadSavedTemplate(name: string) {
+  const found = savedTemplates.value.find((t) => t.name === name);
+  if (found) templateInput.value = found.template;
+}
+
+async function deleteSavedTemplate(name: string) {
+  await persistTemplates(removeTemplate(savedTemplates.value, name));
+}
+
 async function runTemplateTest() {
   templateRunning.value = true;
   templateResult.value = null;
@@ -675,7 +727,21 @@ watch(
           <textarea v-model="templateInput" rows="2" spellcheck="false"></textarea>
           <div class="template-tester-actions">
             <button type="button" :disabled="templateRunning" @click="runTemplateTest">{{ templateRunning ? "Running…" : "Run" }}</button>
+            <select v-if="savedTemplates.length" :value="''" @change="loadSavedTemplate(($event.target as HTMLSelectElement).value); ($event.target as HTMLSelectElement).value = ''">
+              <option value="" disabled>Load saved…</option>
+              <option v-for="t in savedTemplates" :key="t.name" :value="t.name">{{ t.name }}</option>
+            </select>
+            <input v-model="templateNameInput" placeholder="Save as…" :disabled="templateRunning" />
+            <button type="button" :disabled="templateRunning || !templateNameInput.trim()" @click="saveCurrentTemplate">Save</button>
           </div>
+          <p v-if="templateSaveError" class="error">{{ templateSaveError }}</p>
+          <ul v-if="savedTemplates.length" class="saved-template-list">
+            <li v-for="t in savedTemplates" :key="t.name">
+              <button type="button" class="saved-template-name" @click="loadSavedTemplate(t.name)">{{ t.name }}</button>
+              <code>{{ t.template }}</code>
+              <button type="button" title="Delete this saved template" @click="deleteSavedTemplate(t.name)">✕</button>
+            </li>
+          </ul>
           <p v-if="templateResult !== null" class="template-result">{{ templateResult || "(empty result)" }}</p>
           <p v-if="templateError" class="error">{{ templateError }}</p>
         </div>
@@ -1158,4 +1224,34 @@ watch(
   width: 100%;
   max-width: 20em;
 }
+/* Saved templates (#1.15). */
+.saved-template-list {
+  list-style: none;
+  margin: 0.4rem 0 0;
+  padding: 0;
+  font-size: 0.82rem;
+}
+.saved-template-list li {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  padding: 0.15rem 0;
+}
+.saved-template-name {
+  all: unset;
+  cursor: pointer;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.saved-template-name:hover {
+  text-decoration: underline;
+}
+.saved-template-list code {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.75;
+}
+
 </style>

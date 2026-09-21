@@ -8,6 +8,7 @@ import ContextMenu from "./ContextMenu.vue";
 import MapperDialog from "./MapperDialog.vue";
 import AnnotationsBrowser from "./AnnotationsBrowser.vue";
 import PolishDialog from "./PolishDialog.vue";
+import HelpDialog from "./HelpDialog.vue";
 import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
 import type { CheckLibraryResult, CustomRecipeOptions, DuplicateBook, NewsFeedInput, NewsSchedule, SaveToDiskResult } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
@@ -1058,6 +1059,9 @@ const actionHandlers: Partial<Record<LibraryActionId, () => void>> = {
     annotationsOpen.value = true;
   },
   "pick-random": () => pickRandomBook(),
+  help: () => {
+    helpOpen.value = true;
+  },
   "mark-books": () => markSelection(),
   polish: () => {
     polishOpen.value = true;
@@ -1094,6 +1098,7 @@ const HIDDEN_IN_FTS_MODE: ReadonlySet<LibraryActionId> = new Set<LibraryActionId
   "map-metadata",
   "browse-annotations",
   "pick-random",
+  "help",
   "mark-books",
   "export-catalog",
   "export-library-archive",
@@ -1427,6 +1432,10 @@ async function onPolished() {
   cacheBust.value++;
   await runSearch();
 }
+
+// In-app help (#1.17), generated from the registry and the live
+// keymap so it cannot go stale.
+const helpOpen = ref(false);
 </script>
 
 <template>
@@ -1672,6 +1681,8 @@ async function onPolished() {
         </footer>
       </main>
     </div>
+
+    <HelpDialog v-if="helpOpen" :keymap="keymap" @close="helpOpen = false" />
 
     <PolishDialog v-if="polishOpen && polishScope.length" :book-ids="polishScope" @close="polishOpen = false" @done="onPolished" />
 

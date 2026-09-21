@@ -87,6 +87,7 @@ export type LibraryActionId =
   | "map-metadata"
   | "browse-annotations"
   | "pick-random"
+  | "help"
   | "export-catalog"
   | "export-library-archive"
   | "fetch-news"
@@ -135,6 +136,7 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   { id: "map-metadata", label: "Map authors/tags…", group: "library", requires: "none", toolbar: true },
   { id: "browse-annotations", label: "Annotations…", group: "library", requires: "none", toolbar: true },
   { id: "pick-random", label: "Random book", group: "library", requires: "none", toolbar: true },
+  { id: "help", label: "Help…", group: "library", requires: "none", toolbar: true },
   { id: "export-catalog", label: "Export catalog…", group: "library", requires: "none", toolbar: true },
   { id: "export-library-archive", label: "Export library archive…", group: "library", requires: "none", toolbar: true },
   { id: "fetch-news", label: "Fetch news…", group: "library", requires: "none", toolbar: true },
