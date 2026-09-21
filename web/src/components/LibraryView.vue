@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import CategoryBrowser from "./CategoryBrowser.vue";
 import NoteEditor from "./NoteEditor.vue";
 import BookDetailsPanel from "./BookDetailsPanel.vue";
@@ -11,8 +11,9 @@ import { parseSnippetSegments } from "../library/snippets";
 import { clampWidth, columnsFor, DEFAULT_TABLE_PREFS, resolveColumns, TABLE_PREFS_PROFILE, type BookColumn, type LibraryViewMode, type TablePrefs } from "../library/columns";
 import { actionEnabled, contextMenuEntries, LIBRARY_ACTIONS, visibleToolbarActions, type ActionContext, type LibraryAction, type LibraryActionId } from "../library/actions";
 import { onMenuAction, syncDesktopMenu } from "../library/desktopMenu";
+import { shortcutFor } from "../library/shortcuts";
 import { isTauri, tauriInvoke } from "../tauri";
-import { DEFAULT_LIBRARY_PREFS, DEFAULT_TOOLBAR_PREFS, fetchProfile, LIBRARY_PREFS_PROFILE, saveProfile, TOOLBAR_PREFS_PROFILE, type LibraryPrefs, type ToolbarActionId, type ToolbarPrefs } from "../settings/api";
+import { DEFAULT_KEYMAP, DEFAULT_LIBRARY_PREFS, DEFAULT_TOOLBAR_PREFS, fetchProfile, KEYMAP_PROFILE, libraryShortcuts, LIBRARY_PREFS_PROFILE, saveProfile, TOOLBAR_PREFS_PROFILE, type KeymapPrefs, type LibraryPrefs, type ToolbarActionId, type ToolbarPrefs } from "../settings/api";
 import type { BookFieldChanges, BookSummary, CustomColumnInfo, FieldMetaEntry, FtsSnippet } from "../library/types";
 
 // Real, persisted default (issue #721) -- overwritten by
@@ -1165,13 +1166,69 @@ function onContextChoose(id: LibraryActionId) {
   actionNonce += 1;
   pendingBookAction.value = { id, nonce: actionNonce };
 }
+
+// ---------------------------------------------------------------
+// Keyboard shortcuts (#1.3)
+// ---------------------------------------------------------------
+//
+// The third surface over the registry. Until now the keymap held two
+// bindings, both reader-only, and this view had no keydown handler at
+// all -- so the shortcuts settings panel configured almost nothing.
+//
+// The decision of whether a key press should fire lives in
+// library/shortcuts.ts, because the part worth getting right is when
+// *not* to act: a bare "a" must not steal the letter you are typing
+// into the search box.
+
+const keymap = ref<KeymapPrefs>({ ...DEFAULT_KEYMAP });
+
+async function loadKeymap() {
+  try {
+    const prefs = await fetchProfile<KeymapPrefs>(KEYMAP_PROFILE);
+    if (prefs) keymap.value = { ...DEFAULT_KEYMAP, ...prefs };
+  } catch (e) {
+    console.error("failed to load keyboard shortcuts", e);
+  }
+}
+void loadKeymap();
+
+const searchInput = ref<HTMLInputElement | null>(null);
+
+function onLibraryKeydown(event: KeyboardEvent) {
+  // A modal owns the keyboard while it is open -- firing library
+  // shortcuts underneath one would act on a view the user cannot
+  // currently see.
+  if (contextMenu.value || manageOpen.value || columnsOpen.value || columnPickerOpen.value || checkLibraryOpen.value || duplicatesOpen.value || saveToDiskOpen.value || newsOpen.value || switchOpen.value) return;
+
+  const id = shortcutFor(event, libraryShortcuts(keymap.value));
+  if (!id) return;
+
+  event.preventDefault();
+  if (id === "focus-search") {
+    searchInput.value?.focus();
+    searchInput.value?.select();
+    return;
+  }
+  if (id === "toggle-view") {
+    setViewMode(viewMode.value === "table" ? "grid" : "table");
+    return;
+  }
+  if (id === "delete-book") {
+    void deleteSelectedBooks();
+    return;
+  }
+  runAction(id);
+}
+
+onMounted(() => window.addEventListener("keydown", onLibraryKeydown));
+onBeforeUnmount(() => window.removeEventListener("keydown", onLibraryKeydown));
 </script>
 
 <template>
   <div class="library">
     <header class="toolbar">
       <form class="search" @submit.prevent="submitSearch">
-        <input v-model="queryText" type="search" :placeholder="ftsMode ? 'Search book contents…' : 'Search…'" />
+        <input ref="searchInput" v-model="queryText" type="search" :placeholder="ftsMode ? 'Search book contents…' : 'Search…'" />
         <button type="submit">Search</button>
       </form>
 
