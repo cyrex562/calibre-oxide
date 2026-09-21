@@ -114,6 +114,7 @@ export type LibraryActionId =
   | "replace-cover"
   | "open-externally"
   | "similar-books"
+  | "polish"
   | "delete-book";
 
 /**
@@ -168,6 +169,9 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   { id: "send-email", label: "Send…", group: "book", requires: "single-selection", contextMenu: true },
   { id: "replace-cover", label: "Replace cover…", group: "book", requires: "single-selection", contextMenu: true },
   { id: "similar-books", label: "Similar books", group: "book", requires: "single-selection", contextMenu: true },
+  // Selection-scoped rather than book-scoped: polishing a batch is
+  // the normal case, and the engine handles books independently.
+  { id: "polish", label: "Polish…", group: "selection", requires: "selection" },
   { id: "delete-book", label: "Delete", group: "book", requires: "selection", contextMenu: true },
 ];
 

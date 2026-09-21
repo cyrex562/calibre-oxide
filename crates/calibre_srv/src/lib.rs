@@ -191,6 +191,7 @@ pub mod news_scheduler;
 pub mod notes;
 pub mod opds;
 pub mod plugins;
+pub mod polish;
 pub mod opml;
 pub mod opts;
 pub mod reader_profiles;
@@ -327,6 +328,8 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/news/schedules/run-now/{id}", post(news_scheduler::run_schedule_now))
         .route("/tts/synthesize", post(tts::synthesize))
         .route("/annotations/all", get(annotations_browse::all))
+        .route("/polish", post(polish::polish))
+        .route("/polish/{library_id}", post(polish::polish_for_library))
         .route("/mapper/preview", post(mapper::preview))
         .route("/mapper/preview/{library_id}", post(mapper::preview_for_library))
         .route("/mapper/apply", post(mapper::apply))
