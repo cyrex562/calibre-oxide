@@ -70,30 +70,19 @@ export const KEYMAP_ACTION_LABELS: Record<KeymapAction, string> = { readerNext: 
 
 export const KEYMAP_PROFILE = "keymap";
 
-// Toolbar customization (#753). Real prerequisite this issue's own
-// body called out: this port had no action-registry concept at all
-// before this -- "what actions exist" was implicit in each
-// component's own template. This registry is a real, deliberate first
-// slice: the LibraryView.vue header's self-contained, always-simple
-// action buttons (open a panel, trigger a one-shot fetch/export) --
-// not the context-dependent controls (sort fields, bulk-edit, select
-// mode) that only make sense with live state alongside them, and not
-// ReaderView.vue's own toolbar (a real, separable follow-up if this
-// slice proves out).
-export type ToolbarActionId = "manage-lists" | "custom-columns" | "check-library" | "find-duplicates" | "export-catalog" | "export-library-archive" | "fetch-news" | "add-books" | "add-folder" | "switch-library";
-
-export const TOOLBAR_ACTIONS: { id: ToolbarActionId; label: string }[] = [
-  { id: "manage-lists", label: "Manage lists…" },
-  { id: "custom-columns", label: "Custom columns…" },
-  { id: "check-library", label: "Check library…" },
-  { id: "find-duplicates", label: "Find duplicates…" },
-  { id: "export-catalog", label: "Export catalog…" },
-  { id: "export-library-archive", label: "Export library archive…" },
-  { id: "fetch-news", label: "Fetch news…" },
-  { id: "add-books", label: "Add Books…" },
-  { id: "add-folder", label: "Add Folder… (desktop app only)" },
-  { id: "switch-library", label: "Switch library… (desktop app only)" },
-];
+// Toolbar customization (#753), now sourced from the full library
+// action registry (#817) rather than a list of its own.
+//
+// #753 built the first action registry here, deliberately scoped to
+// LibraryView.vue's self-contained header buttons. That scope stopped
+// being enough once context menus, keyboard shortcuts and the desktop
+// native menu all needed the same catalogue, so the registry moved to
+// library/actions.ts and grew per-action group/requirement metadata.
+// The toolbar-eligible subset re-exported here keeps the exact shape
+// this panel already consumed, and every id string is unchanged, so
+// `ToolbarPrefs` blobs already persisted server-side still apply.
+export { TOOLBAR_ACTIONS, type ToolbarActionId } from "../library/actions";
+import type { ToolbarActionId } from "../library/actions";
 
 export interface ToolbarPrefs {
   /// Action ids hidden from the toolbar.

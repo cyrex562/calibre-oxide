@@ -24,6 +24,12 @@ calibre_db = { path = "../../crates/calibre_db" }
 calibre_ebooks = { path = "../../crates/calibre_ebooks" }
 calibre_utils = { path = "../../crates/calibre_utils" }
 tauri-plugin-dialog = "2.7.3"
+# Hands a book file to the OS default application / file manager
+# (issue #818) -- the only way to open a PDF today, since the
+# in-app reader is EPUB/KEPUB-only until Phase 2.
+tauri-plugin-opener = "2.5"
+# Remembers window geometry across launches (issue #818).
+tauri-plugin-window-state = "2.4"
 reqwest = { version = "0.11", features = ["json"] }
 urlencoding = "2.1"
 zip = "0.6"

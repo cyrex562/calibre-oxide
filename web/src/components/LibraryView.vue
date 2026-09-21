@@ -6,6 +6,8 @@ import BookDetailsPanel from "./BookDetailsPanel.vue";
 import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
 import type { CheckLibraryResult, CustomRecipeOptions, DuplicateBook, NewsFeedInput, NewsSchedule, SaveToDiskResult } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
+import { actionEnabled, LIBRARY_ACTIONS, visibleToolbarActions, type ActionContext, type LibraryAction, type LibraryActionId } from "../library/actions";
+import { onMenuAction, syncDesktopMenu } from "../library/desktopMenu";
 import { isTauri, tauriInvoke } from "../tauri";
 import { DEFAULT_LIBRARY_PREFS, DEFAULT_TOOLBAR_PREFS, fetchProfile, LIBRARY_PREFS_PROFILE, TOOLBAR_PREFS_PROFILE, type LibraryPrefs, type ToolbarActionId, type ToolbarPrefs } from "../settings/api";
 import type { BookFieldChanges, BookSummary, CustomColumnInfo, FtsSnippet } from "../library/types";
@@ -115,10 +117,6 @@ async function loadToolbarPrefs() {
   }
 }
 void loadToolbarPrefs();
-
-function toolbarActionVisible(id: ToolbarActionId): boolean {
-  return !toolbarPrefs.value.hidden.includes(id);
-}
 
 function toolbarActionOrder(id: ToolbarActionId): number | undefined {
   const i = toolbarPrefs.value.order.indexOf(id);
@@ -823,6 +821,29 @@ async function addFolder() {
   }
 }
 
+// Drag-and-drop add (#818). The drop itself is handled natively --
+// Tauri's own drag-drop handling suppresses the webview's HTML5 drop
+// events, so there is nothing for the page to listen for until the
+// Rust side has already done the work and says so here.
+//
+// The page has to be told explicitly because it does not subscribe to
+// calibre_srv's websocket, so the `BooksAdded` change event the add
+// endpoint publishes never reaches it.
+function onBooksDropped(event: Event) {
+  const detail = (event as CustomEvent<AddFolderResult & { error?: string }>).detail;
+  if (!detail) return;
+  if (detail.error) {
+    addError.value = detail.error;
+    return;
+  }
+  addSummary.value = `Added ${detail.added} book(s)${detail.duplicates.length ? `, skipped ${detail.duplicates.length} duplicate(s)` : ""}${detail.errors.length ? `, ${detail.errors.length} failed` : ""}.`;
+  addError.value = detail.errors.length > 0 ? detail.errors.join("; ") : null;
+  cacheBust.value++;
+  void runSearch();
+}
+
+window.addEventListener("oxide:books-added", onBooksDropped);
+
 // Switch-library quick-switch (issue #725, desktop-only). This app
 // stays single-library-per-instance -- "switching" re-spawns
 // calibre_srv against a different path and re-navigates the window
@@ -869,6 +890,138 @@ async function switchToOther() {
     switching.value = false;
   }
 }
+
+// ---------------------------------------------------------------
+// Action registry wiring (#817)
+// ---------------------------------------------------------------
+//
+// This view's half of the registry: what each action *does*. The
+// registry itself (library/actions.ts) is data only, so that the
+// settings panel and the desktop native menu can read the catalogue
+// without importing this component's state.
+//
+// Anything not listed here simply does not render, which is what
+// keeps the catalogue honest: declaring an action in the registry
+// does not conjure a button for it.
+
+const actionHandlers: Partial<Record<LibraryActionId, () => void>> = {
+  "manage-lists": () => openManage(),
+  "custom-columns": () => openColumns(),
+  "check-library": () => openCheckLibrary(),
+  "find-duplicates": () => openDuplicates(),
+  "export-catalog": () => exportCatalog(),
+  "export-library-archive": () => exportLibraryArchive(),
+  "fetch-news": () => openNews(),
+  "add-books": () => addInput.value?.click(),
+  "add-folder": () => void addFolder(),
+  "switch-library": () => openSwitchLibrary(),
+  "select-mode": () => toggleSelectMode(),
+  "bulk-edit": () => {
+    bulkOpen.value = true;
+  },
+  "save-to-disk": () => openSaveToDisk(),
+};
+
+// Full-text search replaces the whole result area with a different
+// list, so the library-management panels and the selection actions --
+// all of which act on the metadata grid -- have never been shown
+// alongside it. Adding/switching libraries stayed available, and
+// still does.
+//
+// This is a LibraryView-specific mode rather than a property of the
+// actions themselves, so it is filtered here instead of becoming a
+// field in the shared registry.
+const HIDDEN_IN_FTS_MODE: ReadonlySet<LibraryActionId> = new Set<LibraryActionId>([
+  "manage-lists",
+  "custom-columns",
+  "check-library",
+  "find-duplicates",
+  "export-catalog",
+  "export-library-archive",
+  "fetch-news",
+  "select-mode",
+  "bulk-edit",
+  "save-to-disk",
+]);
+
+const actionContext = computed<ActionContext>(() => ({
+  selectionCount: selectMode.value ? selectedIds.value.size : selectedBookId.value !== null ? 1 : 0,
+  isDesktop: isTauri(),
+}));
+
+/**
+ * Per-action presentation that depends on live state. The registry
+ * supplies the stable label; anything that changes while the user
+ * watches (an in-flight "Adding…", a selection count, a tooltip that
+ * depends on whether a search is active) is layered on here.
+ */
+function actionLabel(action: LibraryAction): string {
+  switch (action.id) {
+    case "add-books":
+      return adding.value ? "Adding…" : action.label;
+    case "add-folder":
+      return addingFolder.value ? "Adding…" : action.label;
+    case "select-mode":
+      return selectMode.value ? "Cancel selection" : action.label;
+    case "bulk-edit":
+    case "save-to-disk":
+      return `${action.label} (${selectedIds.value.size})`;
+    default:
+      return action.label;
+  }
+}
+
+function actionBusy(action: LibraryAction): boolean {
+  if (action.id === "add-books") return adding.value;
+  if (action.id === "add-folder") return addingFolder.value;
+  return false;
+}
+
+function actionTitle(action: LibraryAction): string | undefined {
+  switch (action.id) {
+    case "export-catalog":
+      return activeQuery.value ? "Export the current search results as a CSV catalog" : "Export the whole library as a CSV catalog";
+    case "export-library-archive":
+      return "Download the whole library (every book and its metadata) as a real .zip archive for backup or transfer";
+    default:
+      return undefined;
+  }
+}
+
+/** `select-mode` is a toggle, so it reflects its on state. */
+function actionActive(action: LibraryAction): boolean {
+  return action.id === "select-mode" && selectMode.value;
+}
+
+const toolbarActions = computed<LibraryAction[]>(() =>
+  visibleToolbarActions({
+    handled: Object.keys(actionHandlers) as LibraryActionId[],
+    hidden: toolbarPrefs.value.hidden,
+    suppressed: ftsMode.value ? HIDDEN_IN_FTS_MODE : undefined,
+    ctx: actionContext.value,
+  }),
+);
+
+function runAction(id: LibraryActionId) {
+  const handler = actionHandlers[id];
+  if (!handler) return;
+  const action = LIBRARY_ACTIONS.find((a) => a.id === id);
+  if (action && !actionEnabled(action, actionContext.value)) return;
+  handler();
+}
+
+// Keep the desktop app's native menu in step with what this view can
+// currently do. Re-sent whenever enablement could have changed; a
+// no-op in a plain browser tab.
+watch(
+  [actionContext, ftsMode, toolbarPrefs],
+  () => {
+    void syncDesktopMenu(Object.keys(actionHandlers) as LibraryActionId[], actionContext.value);
+  },
+  { immediate: true, deep: true },
+);
+
+onMenuAction(runAction);
 </script>
 
 <template>
@@ -909,28 +1062,30 @@ async function switchToOther() {
           <option value="" disabled selected>Saved searches…</option>
           <option v-for="[name, q] in Object.entries(savedSearches)" :key="name" :value="q">{{ name }}</option>
         </select>
-        <button v-if="toolbarActionVisible('manage-lists')" type="button" :style="{ order: toolbarActionOrder('manage-lists') }" @click="openManage">Manage lists…</button>
-        <button v-if="toolbarActionVisible('custom-columns')" type="button" :style="{ order: toolbarActionOrder('custom-columns') }" @click="openColumns">Custom columns…</button>
-        <button v-if="toolbarActionVisible('check-library')" type="button" :style="{ order: toolbarActionOrder('check-library') }" @click="openCheckLibrary">Check library…</button>
-        <button v-if="toolbarActionVisible('find-duplicates')" type="button" :style="{ order: toolbarActionOrder('find-duplicates') }" @click="openDuplicates">Find duplicates…</button>
-        <button v-if="toolbarActionVisible('export-catalog')" type="button" :style="{ order: toolbarActionOrder('export-catalog') }" :title="activeQuery ? 'Export the current search results as a CSV catalog' : 'Export the whole library as a CSV catalog'" @click="exportCatalog">Export catalog…</button>
-        <button v-if="toolbarActionVisible('export-library-archive')" type="button" :style="{ order: toolbarActionOrder('export-library-archive') }" title="Download the whole library (every book and its metadata) as a real .zip archive for backup or transfer" @click="exportLibraryArchive">Export library archive…</button>
-        <button v-if="toolbarActionVisible('fetch-news')" type="button" :style="{ order: toolbarActionOrder('fetch-news') }" @click="openNews">Fetch news…</button>
       </template>
 
-      <button v-if="toolbarActionVisible('add-books')" type="button" :style="{ order: toolbarActionOrder('add-books') }" :disabled="adding" @click="addInput?.click()">{{ adding ? "Adding…" : "Add Books…" }}</button>
+      <!--
+        Every action button comes from the registry (#817). Before
+        this there were thirteen near-identical hardcoded buttons,
+        each repeating its own visibility and ordering lookup; the
+        registry is what the context menu, keyboard shortcuts and the
+        desktop native menu all read from, so rendering the toolbar
+        from it too is what keeps those four surfaces in agreement.
+      -->
+      <button
+        v-for="action in toolbarActions"
+        :key="action.id"
+        type="button"
+        :style="{ order: toolbarActionOrder(action.id) }"
+        :class="{ active: actionActive(action) }"
+        :disabled="actionBusy(action)"
+        :title="actionTitle(action)"
+        @click="runAction(action.id)"
+      >
+        {{ actionLabel(action) }}
+      </button>
       <input ref="addInput" type="file" multiple class="hidden-file-input" @change="onAddFileSelected" />
-      <button v-if="isTauri() && toolbarActionVisible('add-folder')" type="button" :style="{ order: toolbarActionOrder('add-folder') }" :disabled="addingFolder" @click="addFolder">{{ addingFolder ? "Adding…" : "Add Folder…" }}</button>
-      <button v-if="isTauri() && toolbarActionVisible('switch-library')" type="button" :style="{ order: toolbarActionOrder('switch-library') }" @click="openSwitchLibrary">Switch library…</button>
       <router-link to="/settings" class="settings-link">Settings…</router-link>
-
-      <template v-if="!ftsMode">
-        <button type="button" :class="{ active: selectMode }" @click="toggleSelectMode">
-          {{ selectMode ? "Cancel selection" : "Select…" }}
-        </button>
-        <button v-if="selectedIds.size > 0" type="button" @click="bulkOpen = true">Bulk edit ({{ selectedIds.size }})</button>
-        <button v-if="selectedIds.size > 0" type="button" @click="openSaveToDisk">Save to disk ({{ selectedIds.size }})</button>
-      </template>
     </header>
 
     <div v-if="bulkOpen" class="bulk-panel">
