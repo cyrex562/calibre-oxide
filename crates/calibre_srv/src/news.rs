@@ -384,16 +384,25 @@ mod tests {
         (status, value)
     }
 
+    /// Waits for a news job, which does real feed parsing and a real
+    /// OEB-to-EPUB conversion.
+    ///
+    /// The budget was 200 x 20ms = 4s, which is close enough to the
+    /// actual work that the suite flaked under parallel load -- a
+    /// different test tripping each run, while every one of them
+    /// passed in isolation at ~4s. That is a budget problem, not a
+    /// correctness one, so it is now 30s: still a real ceiling, far
+    /// enough above the work to stop reporting load as failure.
     async fn poll_until_done(router: &axum::Router, job_id: i64) -> serde_json::Value {
-        for _ in 0..200 {
+        for _ in 0..600 {
             let (status, body) = get_json(router, &format!("/news/status/{job_id}")).await;
             assert_eq!(status, StatusCode::OK, "{body}");
             if body["running"] == false {
                 return body;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        panic!("news job never finished within the polling budget");
+        panic!("news job never finished within the 30s polling budget");
     }
 
     fn rss_feed() -> &'static [u8] {
