@@ -407,6 +407,23 @@ async fn copy_to_library_handle(state: AppState, target_library_id: String, sour
         .ok_or_else(|| ServerError::NotFound(format!("no library named {:?}", source_library_id.clone().unwrap_or_default())))?;
     let dest_cache = state.cache_for(Some(&target_library_id)).ok_or_else(|| ServerError::NotFound(format!("no library named {target_library_id:?}")))?;
 
+    // `cache_for` deliberately ignores the library id when the server
+    // is serving a single library ([`AppState::cache_for`]: `None =>
+    // Some(self.cache)`). That is right for read routes, whose URL
+    // shape always carries a library id upstream even in
+    // single-library mode -- but it is wrong here, where telling two
+    // libraries apart is the entire point of the route.
+    //
+    // Without this check, copying to a target that does not exist
+    // returned 200 and duplicated every book into the library it
+    // already lived in. A data-modifying route must not succeed
+    // against a target it could not resolve.
+    if std::sync::Arc::ptr_eq(&src_cache, &dest_cache) {
+        return Err(ServerError::BadRequest(format!(
+            "cannot copy into the same library: this server is serving a single library, so {target_library_id:?} resolves to the source library itself"
+        )));
+    }
+
     let (response, copied_ids) = tokio::task::spawn_blocking(move || {
         let mut response = serde_json::Map::new();
         let mut copied_ids = Vec::new();
@@ -1026,6 +1043,40 @@ mod tests {
 
         let (status, _) = post_json(&router, &format!("/cdb/copy-to-library/NoSuchLibrary/{src_name}"), serde_json::json!({"book_ids": [1]})).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// Regression: in single-library mode this route used to return
+    /// 200 and copy every book back into the library it already lived
+    /// in, whatever target name was given.
+    ///
+    /// `AppState::cache_for` deliberately ignores the library id when
+    /// `libraries` is `None`, which is right for read routes but wrong
+    /// for the one route whose purpose is to tell two libraries apart.
+    /// The existing unknown-target test only covered the *two*-library
+    /// app, where `cache_for` really does return `None`, so nothing
+    /// caught this.
+    ///
+    /// `calibre_srv`'s own `main.rs` hardcodes `libraries: None`, so
+    /// single-library mode is what every real desktop-app user runs.
+    #[tokio::test]
+    async fn copy_to_library_refuses_a_bogus_target_in_single_library_mode() {
+        let (_dir, router) = test_app(1);
+
+        let (status, _) = post_json(&router, "/cdb/copy-to-library/a-library-that-does-not-exist", serde_json::json!({"book_ids": [1]})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "copying to a target that cannot be resolved must not succeed");
+    }
+
+    /// The damage the guard above prevents: the book count must be
+    /// unchanged after the refused copy.
+    #[tokio::test]
+    async fn a_refused_copy_does_not_duplicate_the_book() {
+        let (_dir, router) = test_app(1);
+
+        let (_, before) = get_json(&router, "/ajax/search?num=50").await;
+        let (_, _) = post_json(&router, "/cdb/copy-to-library/nowhere", serde_json::json!({"book_ids": [1]})).await;
+        let (_, after) = get_json(&router, "/ajax/search?num=50").await;
+
+        assert_eq!(before["book_ids"], after["book_ids"], "a refused copy must leave the library untouched");
     }
 
     #[tokio::test]
