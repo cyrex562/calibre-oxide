@@ -150,6 +150,78 @@ pub async fn share_email(State(state): State<AppState>, Query(q): Query<ShareQue
     Ok(Json(json!({"ok": true})))
 }
 
+
+// ===================================================================
+// Persisted email accounts (#816 item 4.2)
+// ===================================================================
+//
+// This module's own doc called SMTP persistence "a genuine, separate
+// follow-up once #721 lands". #721 landed -- the named-JSON-blob
+// store now has four consumers -- so this is that follow-up.
+//
+// # The password is deliberately not stored
+//
+// Everything else is: relay host, port, username, encryption and the
+// from address, which is the retyping that actually annoys. The
+// password is not, because this store is a plain JSON blob on the
+// server's filesystem, and `calibre_srv` can be served over a network
+// as well as run locally -- writing a credential there in the clear
+// changes who can read it in a way a user configuring an email
+// account would not expect.
+//
+// The client is free to hold the password for the session. If
+// plaintext-at-rest is an acceptable trade for a given deployment,
+// that is a decision worth taking explicitly rather than inheriting
+// from a default.
+
+/// Where email accounts live in the profile store.
+const EMAIL_ACCOUNT_PROFILE: &str = "email-account";
+
+/// The persisted half of an account -- everything but the secret.
+#[derive(Debug, Deserialize, serde::Serialize)]
+pub struct EmailAccountBody {
+    pub relay: String,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub encryption: Option<String>,
+    /// The address mail is sent from.
+    #[serde(default)]
+    pub from: Option<String>,
+}
+
+/// `POST /email-account` -- saves everything but the password.
+pub async fn save_email_account(
+    State(state): State<AppState>,
+    user: Option<axum::Extension<crate::auth::AuthenticatedUser>>,
+    Json(body): Json<EmailAccountBody>,
+) -> Result<Json<Value>, ServerError> {
+    if body.relay.trim().is_empty() {
+        return Err(ServerError::BadRequest("relay must not be empty".to_string()));
+    }
+    // Validated on save rather than at send time, so a typo surfaces
+    // while the user is looking at the form.
+    parse_encryption(body.encryption.as_deref())?;
+
+    let value = serde_json::to_value(&body).map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+    state
+        .reader_profiles
+        .save(&crate::reader_profiles::user_key(&user), EMAIL_ACCOUNT_PROFILE, value)
+        .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// `GET /email-account` -- the saved account, or null.
+pub async fn get_email_account(
+    State(state): State<AppState>,
+    user: Option<axum::Extension<crate::auth::AuthenticatedUser>>,
+) -> Result<Json<Value>, ServerError> {
+    let all = state.reader_profiles.get_all(&crate::reader_profiles::user_key(&user)).map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+    Ok(Json(json!({ "account": all.get(EMAIL_ACCOUNT_PROFILE).cloned() })))
+}
+
 #[cfg(test)]
 mod tests {
     use axum::body::{to_bytes, Body};
@@ -366,5 +438,68 @@ mod tests {
         let data = handle.join().unwrap();
         assert!(data.contains("A real subject"), "{data}");
         assert!(data.contains("Test Book.txt"), "{data}");
+    }
+
+    // ---------------------------------------------------------------
+    // Persisted email accounts (#816 item 4.2)
+    // ---------------------------------------------------------------
+
+    async fn get_account(router: &axum::Router) -> (StatusCode, serde_json::Value) {
+        let resp = router.clone().oneshot(Request::builder().uri("/email-account").body(Body::empty()).unwrap()).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+
+    #[tokio::test]
+    async fn an_account_round_trips() {
+        let (_dir, router, _) = test_app();
+
+        let (status, _) = post_json(&router, "/email-account", serde_json::json!({"relay": "smtp.example.com", "port": 587, "username": "me", "encryption": "tls", "from": "me@example.com"})).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = get_account(&router).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["account"]["relay"], "smtp.example.com");
+        assert_eq!(body["account"]["port"], 587);
+        assert_eq!(body["account"]["from"], "me@example.com");
+    }
+
+    /// The deliberate omission. This store is a plain JSON blob on the
+    /// server's filesystem and `calibre_srv` can be served over a
+    /// network, so a password written here changes who can read it in
+    /// a way a user configuring an email account would not expect.
+    #[tokio::test]
+    async fn a_password_is_never_stored_even_if_one_is_sent() {
+        let (_dir, router, _) = test_app();
+
+        post_json(&router, "/email-account", serde_json::json!({"relay": "smtp.example.com", "username": "me", "password": "hunter2", "from": "me@example.com"})).await;
+
+        let (_, body) = get_account(&router).await;
+        let stored = body["account"].to_string();
+        assert!(!stored.contains("hunter2"), "the password must not be persisted: {stored}");
+        assert!(!stored.contains("password"), "not even the field: {stored}");
+    }
+
+    #[tokio::test]
+    async fn no_account_yet_reports_null_rather_than_erroring() {
+        let (_dir, router, _) = test_app();
+        let (status, body) = get_account(&router).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["account"].is_null(), "{body}");
+    }
+
+    /// Caught while the user is looking at the form, not at send time.
+    #[tokio::test]
+    async fn an_invalid_encryption_is_refused_on_save() {
+        let (_dir, router, _) = test_app();
+        let (status, _) = post_json(&router, "/email-account", serde_json::json!({"relay": "smtp.example.com", "encryption": "carrier-pigeon"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn an_empty_relay_is_refused() {
+        let (_dir, router, _) = test_app();
+        assert_eq!(post_json(&router, "/email-account", serde_json::json!({"relay": "  "})).await.0, StatusCode::BAD_REQUEST);
     }
 }

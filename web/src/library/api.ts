@@ -868,3 +868,29 @@ export interface DiffFile {
 export function bookDiff(sessionId: string): Promise<{ changed: number; files: DiffFile[] }> {
   return jsonFetch(`/tweak/diff/${encodeURIComponent(sessionId)}`);
 }
+
+// Persisted email account (#816 item 4.2). Everything but the
+// password: the store is a plain JSON blob on the server and
+// calibre_srv can be served over a network, so a credential written
+// there would be readable by more people than a user configuring an
+// email account would expect.
+export interface EmailAccount {
+  relay: string;
+  port?: number | null;
+  username?: string | null;
+  encryption?: string | null;
+  from?: string | null;
+}
+
+export async function getEmailAccount(): Promise<EmailAccount | null> {
+  const data = await jsonFetch<{ account: EmailAccount | null }>("/email-account");
+  return data.account;
+}
+
+export function saveEmailAccount(account: EmailAccount): Promise<{ ok: boolean }> {
+  return jsonFetch<{ ok: boolean }>("/email-account", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(account),
+  });
+}

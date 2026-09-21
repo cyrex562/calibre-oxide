@@ -345,6 +345,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/plugins/set-enabled/{name}", post(plugins::set_enabled))
         .route("/metadata/cover-proxy", get(metadata_search::cover_proxy))
         .route("/library/export/{library_id}", get(library_export::export))
+        .route("/email-account", get(share::get_email_account).post(share::save_email_account))
         .route("/share/email", post(share::share_email))
         .route("/check-library/{library_id}", post(check_library::check))
         .route("/custom-columns", get(custom_columns::list))
