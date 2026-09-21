@@ -21,7 +21,7 @@ import { actionEnabled, contextMenuEntries, LIBRARY_ACTIONS, visibleToolbarActio
 import { onMenuAction, syncDesktopMenu } from "../library/desktopMenu";
 import { shortcutFor } from "../library/shortcuts";
 import { isTauri, tauriInvoke } from "../tauri";
-import { DEFAULT_KEYMAP, DEFAULT_LIBRARY_PREFS, DEFAULT_TOOLBAR_PREFS, fetchProfile, KEYMAP_PROFILE, libraryShortcuts, LIBRARY_PREFS_PROFILE, saveProfile, TOOLBAR_PREFS_PROFILE, type KeymapPrefs, type LibraryPrefs, type ToolbarActionId, type ToolbarPrefs } from "../settings/api";
+import { DEFAULT_KEYMAP, DEFAULT_LIBRARY_PREFS, DEFAULT_SAVE_TO_DISK_TEMPLATE, DEFAULT_TOOLBAR_PREFS, fetchProfile, KEYMAP_PROFILE, libraryShortcuts, LIBRARY_PREFS_PROFILE, saveProfile, TOOLBAR_PREFS_PROFILE, type KeymapPrefs, type LibraryPrefs, type ToolbarActionId, type ToolbarPrefs } from "../settings/api";
 import type { BookSummary, CustomColumnInfo, FieldMetaEntry, FtsSnippet } from "../library/types";
 
 // Real, persisted default (issue #721) -- overwritten by
@@ -834,7 +834,7 @@ async function runBulkEdit() {
 // calibre-template-language `{field}`-shorthand path template per
 // book server-side.
 const saveToDiskOpen = ref(false);
-const saveToDiskTemplate = ref("{author_sort}/{title}/{title} - {authors}");
+const saveToDiskTemplate = ref(DEFAULT_SAVE_TO_DISK_TEMPLATE);
 const saveToDiskDest = ref("");
 const saveToDiskBusy = ref(false);
 const saveToDiskResults = ref<SaveToDiskResult[]>([]);
@@ -844,6 +844,35 @@ function openSaveToDisk() {
   saveToDiskOpen.value = true;
   saveToDiskResults.value = [];
   saveToDiskError.value = null;
+  // Restored here rather than in `loadLibraryPrefs`, which runs
+  // before this ref exists.
+  void restoreSaveTemplate();
+}
+
+/**
+ * Brings back the user's own path template (#4.4).
+ *
+ * The template was always editable, but reset to the default on every
+ * open -- so anyone with their own folder layout retyped it each
+ * time, which is exactly the kind of small tax that makes a feature
+ * feel unfinished.
+ */
+async function restoreSaveTemplate() {
+  try {
+    const prefs = await fetchProfile<LibraryPrefs>(LIBRARY_PREFS_PROFILE);
+    if (prefs?.saveToDiskTemplate) saveToDiskTemplate.value = prefs.saveToDiskTemplate;
+  } catch {
+    // Keep the default; this is a convenience, not a requirement.
+  }
+}
+
+async function persistSaveTemplate() {
+  try {
+    const prefs = (await fetchProfile<LibraryPrefs>(LIBRARY_PREFS_PROFILE)) ?? DEFAULT_LIBRARY_PREFS;
+    await saveProfile(LIBRARY_PREFS_PROFILE, { ...prefs, saveToDiskTemplate: saveToDiskTemplate.value });
+  } catch (e) {
+    console.error("failed to remember the save-to-disk template", e);
+  }
 }
 
 async function runSaveToDisk() {
@@ -855,6 +884,9 @@ async function runSaveToDisk() {
   try {
     const { results } = await saveToDisk(ids, saveToDiskTemplate.value, saveToDiskDest.value.trim());
     saveToDiskResults.value = results;
+    // Remembered only after a save that worked, so a template being
+    // typed and abandoned does not become the stored one.
+    void persistSaveTemplate();
   } catch (e) {
     saveToDiskError.value = e instanceof Error ? e.message : String(e);
   } finally {

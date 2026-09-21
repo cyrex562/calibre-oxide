@@ -48,11 +48,17 @@ struct Settings {
     /// same way rather than silently stop reopening.
     #[serde(default = "default_auto_reopen")]
     auto_reopen: bool,
+    /// A folder watched for new books (#816 item 4.4). `None` means
+    /// the feature is off, which is the default -- a background
+    /// process that moves files around is not something to enable
+    /// without being asked.
+    #[serde(default)]
+    auto_add_folder: Option<PathBuf>,
 }
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { library_path: None, recent_libraries: Vec::new(), auto_reopen: true }
+        Settings { library_path: None, recent_libraries: Vec::new(), auto_reopen: true, auto_add_folder: None }
     }
 }
 
@@ -142,4 +148,17 @@ mod tests {
         push_recent(&mut list, PathBuf::from("/new"), 3);
         assert_eq!(list, vec![PathBuf::from("/new"), PathBuf::from("/lib0"), PathBuf::from("/lib1")]);
     }
+}
+
+/// The watched auto-add folder, if one is configured.
+pub fn get_auto_add_folder(app: &AppHandle) -> Option<PathBuf> {
+    read(app).auto_add_folder
+}
+
+/// Sets or clears the watched folder.
+pub fn set_auto_add_folder(app: &AppHandle, folder: Option<PathBuf>) -> std::io::Result<()> {
+    let path = settings_path(app)?;
+    let mut settings = read(app);
+    settings.auto_add_folder = folder;
+    std::fs::write(path, serde_json::to_vec_pretty(&settings)?)
 }

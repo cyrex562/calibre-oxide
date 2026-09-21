@@ -29,6 +29,12 @@ export async function saveProfile(name: string, profile: Record<string, unknown>
 
 export interface LibraryPrefs {
   sort: string;
+  /**
+   * Path template for save-to-disk (#816 item 4.4). The template was
+   * always editable; it just reset to the default on every open, so a
+   * user with their own layout retyped it each time.
+   */
+  saveToDiskTemplate?: string;
   sortOrder: "asc" | "desc";
   pageSize: number;
   /// What happens when adding a book detects a same-title/author
@@ -37,7 +43,9 @@ export interface LibraryPrefs {
   duplicateDefault: "ask" | "add" | "skip";
 }
 
-export const DEFAULT_LIBRARY_PREFS: LibraryPrefs = { sort: "timestamp", sortOrder: "desc", pageSize: 24, duplicateDefault: "ask" };
+export const DEFAULT_SAVE_TO_DISK_TEMPLATE = "{author_sort}/{title}/{title} - {authors}";
+
+export const DEFAULT_LIBRARY_PREFS: LibraryPrefs = { sort: "timestamp", sortOrder: "desc", pageSize: 24, duplicateDefault: "ask", saveToDiskTemplate: DEFAULT_SAVE_TO_DISK_TEMPLATE };
 
 export interface ReaderPrefs {
   fontSizePercent: number;
