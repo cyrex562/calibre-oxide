@@ -3,7 +3,7 @@ import { onBeforeUnmount, ref } from "vue";
 import { commitTweakSession, discardTweakSession, fetchToc, fetchTweakFile, openTweakSession, saveToc, saveTweakFile, type TocNode } from "../library/tweak";
 import TocTreeNode from "./TocTreeNode.vue";
 
-import { bookReport, checkBook, fixBookChecks, type BookReport, type CheckResult } from "../library/api";
+import { bookReport, checkBook, fixBookChecks, type BookReport, type CheckResult, spellCheckBook, type MisspelledWord } from "../library/api";
 
 const props = defineProps<{ bookId: number }>();
 const emit = defineEmits<{ close: []; updated: [] }>();
@@ -140,7 +140,7 @@ onBeforeUnmount(() => {
 // ported with no caller anywhere. They act on the open session, so
 // they see unsaved edits -- checking the stored copy would report
 // problems already fixed in the editor.
-type EditorTab = "files" | "toc" | "check" | "report";
+type EditorTab = "files" | "toc" | "check" | "report" | "spell";
 const tab = ref<EditorTab>("files");
 
 const checkResult = ref<CheckResult | null>(null);
@@ -203,12 +203,33 @@ function openTab(next: EditorTab) {
   // make a cached result quietly wrong.
   if (next === "check") void runCheck();
   if (next === "report") void loadReport();
+  if (next === "spell") void runSpellCheck();
 }
 
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+// Spell check (#3.1). Dictionaries ship with the binary (#865), so
+// this needs no configuration -- the engine was always real, the data
+// was what was missing.
+const spellWords = ref<MisspelledWord[]>([]);
+const spellBusy = ref(false);
+const spellError = ref<string | null>(null);
+
+async function runSpellCheck() {
+  if (!sessionId.value) return;
+  spellBusy.value = true;
+  spellError.value = null;
+  try {
+    spellWords.value = (await spellCheckBook(sessionId.value)).words;
+  } catch (e) {
+    spellError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    spellBusy.value = false;
+  }
 }
 </script>
 
@@ -225,9 +246,28 @@ function formatSize(bytes: number): string {
           <button type="button" :class="{ active: tab === 'toc' }" @click="openTab('toc')">Table of contents</button>
           <button type="button" :class="{ active: tab === 'check' }" @click="openTab('check')">Check book</button>
           <button type="button" :class="{ active: tab === 'report' }" @click="openTab('report')">Report</button>
+          <button type="button" :class="{ active: tab === 'spell' }" @click="openTab('spell')">Spelling</button>
         </div>
 
-        <section v-if="tab === 'check'" class="editor-tool">
+        <section v-if="tab === 'spell'" class="editor-tool">
+          <div class="tool-actions">
+            <button type="button" :disabled="spellBusy" @click="runSpellCheck">{{ spellBusy ? "Checking…" : "Re-check" }}</button>
+          </div>
+          <p class="hint">Checked against the en-US dictionary shipped with the app.</p>
+          <p v-if="spellError" class="error">{{ spellError }}</p>
+          <p v-else-if="!spellBusy && spellWords.length === 0" class="status">No misspellings found.</p>
+          <p v-else-if="spellWords.length" class="status">{{ spellWords.length }} word(s) not recognised</p>
+          <ul v-if="spellWords.length" class="check-list">
+            <li v-for="w in spellWords" :key="w.word">
+              <span class="check-level">{{ w.count }}×</span>
+              <span class="check-where">{{ w.files.join(", ") }}</span>
+              <span class="check-msg"><strong>{{ w.word }}</strong><template v-if="w.suggestions.length"> — {{ w.suggestions.join(", ") }}</template></span>
+              <span></span>
+            </li>
+          </ul>
+        </section>
+
+        <section v-else-if="tab === 'check'" class="editor-tool">
           <div class="tool-actions">
             <button type="button" :disabled="checkBusy" @click="runCheck">{{ checkBusy ? "Checking…" : "Re-check" }}</button>
             <button type="button" :disabled="checkBusy || !checkResult?.fixable" @click="runFixes">

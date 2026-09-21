@@ -19,6 +19,9 @@ use axum::extract::{Path as AxumPath, State};
 use axum::Json;
 use calibre_ebooks::oeb::polish::check::main::{fix_errors, run_checks};
 use calibre_ebooks::oeb::polish::report;
+use calibre_ebooks::oeb::polish::spell as polish_spell;
+use calibre_ebooks::spell::dictionary::{DictionaryMeta, Dictionaries};
+use calibre_ebooks::spell::{parse_lang_code, vendored, DictionaryLocale};
 use serde_json::{json, Value};
 
 use crate::errors::ServerError;
@@ -145,6 +148,74 @@ pub async fn book_report(State(state): State<AppState>, AxumPath(session_id): Ax
     .map_err(|e| ServerError::InternalServerError(e.to_string()))?
 }
 
+/// Builds the dictionary set from what ships with the binary.
+///
+/// Vendored rather than configured (#865): requiring a
+/// `--dictionaries-dir` or a system hunspell install means spell
+/// check silently does nothing on a machine that has neither, which
+/// is most Windows machines and plenty of Linux ones.
+fn dictionaries(locale: DictionaryLocale) -> Dictionaries {
+    let builtin: Vec<DictionaryMeta> = vendored::builtin();
+    Dictionaries::new(locale, Vec::new(), builtin, Vec::new(), |_| None, |_| None)
+}
+
+/// `GET /tweak/spell/{session_id}` -- misspelled words in the book
+/// being edited, with where each one appears.
+///
+/// The engine (`oeb::polish::spell` + `spell::dictionary`) was fully
+/// ported and had no caller. What was missing was dictionary *data*,
+/// which now ships with the binary.
+///
+/// Suggestions are computed only for the words actually returned, not
+/// for every word in the book: generating them is the expensive part,
+/// and a book has far more correct words than misspelled ones.
+pub async fn spell_check(State(state): State<AppState>, AxumPath(session_id): AxumPath<String>) -> Result<Json<Value>, ServerError> {
+    tokio::task::spawn_blocking(move || -> Result<Json<Value>, ServerError> {
+        // `eng-US` unless the book says otherwise; `get_all_words`
+        // needs a locale to attribute words to.
+        let locale = parse_lang_code("en-US").map_err(ServerError::InternalServerError)?;
+
+        let words = state
+            .tweak_sessions
+            .with_container(&session_id, |container| {
+                let mut counts = std::collections::HashMap::new();
+                polish_spell::get_all_words(container, &locale, &std::collections::HashSet::new(), &mut counts)
+            })
+            .ok_or_else(|| ServerError::NotFound(format!("No tweak session: {session_id}")))?
+            .map_err(|e| ServerError::InternalServerError(e.to_string()))?
+            .1;
+
+        let mut dicts = dictionaries(locale);
+
+        let mut misspelled: Vec<Value> = Vec::new();
+        for ((word, word_locale), locations) in words {
+            if dicts.recognized(&word, Some(&word_locale)) {
+                continue;
+            }
+            let files: Vec<String> = {
+                let mut names: Vec<String> = locations.iter().map(|l| l.file_name.clone()).collect();
+                names.sort();
+                names.dedup();
+                names
+            };
+            misspelled.push(json!({
+                "word": word,
+                "count": locations.len(),
+                "files": files,
+                "suggestions": dicts.suggestions(&word, Some(&word_locale)).into_iter().take(5).collect::<Vec<_>>(),
+            }));
+        }
+
+        // Most-frequent first: a word appearing thirty times is more
+        // likely a real problem than a one-off proper noun.
+        misspelled.sort_by(|a, b| b["count"].as_u64().cmp(&a["count"].as_u64()).then_with(|| a["word"].as_str().cmp(&b["word"].as_str())));
+
+        Ok(Json(json!({ "count": misspelled.len(), "words": misspelled })))
+    })
+    .await
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))?
+}
+
 #[cfg(test)]
 mod tests {
     use axum::body::{to_bytes, Body};
@@ -167,7 +238,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             dir.path().join("chapter1.xhtml"),
-            r#"<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><body><p id="dup">One</p><p id="dup">Two</p></body></html>"#,
+            r#"<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><body><p id="dup">One</p><p id="dup">Two</p><p>A clear misspelling: libary.</p></body></html>"#,
         )
         .unwrap();
         std::fs::write(
@@ -320,11 +391,46 @@ mod tests {
         assert!(after > before, "the report should see the unsaved edit: {before} -> {after}");
     }
 
+    /// The engine was always real; what was missing was dictionary
+    /// data, which now ships with the binary (#865). This proves the
+    /// whole path works end to end against a book with a genuine
+    /// misspelling in it.
+    #[tokio::test]
+    async fn spell_check_finds_a_real_misspelling() {
+        let (_d, router, book_id) = test_app();
+        let session = open_session(&router, book_id).await;
+
+        let (status, body) = get(&router, &format!("/tweak/spell/{session}")).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let words: Vec<&str> = body["words"].as_array().unwrap().iter().filter_map(|w| w["word"].as_str()).collect();
+        assert!(words.contains(&"libary"), "expected the misspelling to be flagged, got {words:?}");
+        // And correctly-spelled words must not be.
+        assert!(!words.contains(&"misspelling"), "a correct word was flagged: {words:?}");
+    }
+
+    #[tokio::test]
+    async fn spell_check_offers_suggestions_and_locations() {
+        let (_d, router, book_id) = test_app();
+        let session = open_session(&router, book_id).await;
+
+        let (_, body) = get(&router, &format!("/tweak/spell/{session}")).await;
+        let entry = body["words"].as_array().unwrap().iter().find(|w| w["word"] == "libary").expect("the misspelling should be listed");
+
+        assert!(entry["files"].as_array().is_some_and(|f| !f.is_empty()), "a misspelling with no location cannot be found: {entry}");
+        assert!(entry["count"].as_u64().unwrap_or(0) >= 1, "{entry}");
+        // Suggestions are what make the report actionable rather than
+        // merely accusatory.
+        let suggestions: Vec<&str> = entry["suggestions"].as_array().unwrap().iter().filter_map(|s| s.as_str()).collect();
+        assert!(suggestions.iter().any(|s| *s == "library"), "expected 'library' among suggestions, got {suggestions:?}");
+    }
+
     #[tokio::test]
     async fn an_unknown_session_is_a_404_on_every_route() {
         let (_d, router, _) = test_app();
         assert_eq!(get(&router, "/tweak/check/nope").await.0, StatusCode::NOT_FOUND);
         assert_eq!(get(&router, "/tweak/report/nope").await.0, StatusCode::NOT_FOUND);
         assert_eq!(post(&router, "/tweak/check-fix/nope").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(get(&router, "/tweak/spell/nope").await.0, StatusCode::NOT_FOUND);
     }
 }

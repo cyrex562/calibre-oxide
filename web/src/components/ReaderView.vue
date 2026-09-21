@@ -12,6 +12,7 @@ import PdfReader from "./PdfReader.vue";
 import { extractText, findMatches, totalMatches, type SpineMatches } from "../reader/search";
 import { isNoteReference, noteTextFor } from "../reader/footnotes";
 import { adjustSpeed, autoScrollPixels, DEFAULT_AUTO_SCROLL_SPEED, detectSwipe, type Point } from "../reader/gestures";
+import { isTauri, tauriInvoke } from "../tauri";
 import { clampPageIndex, pageCount, pageForScroll, pagedModeCss, scrollForPage } from "../reader/paged";
 import { DEFAULT_KEYMAP, DEFAULT_READER_PREFS, fetchProfile, KEYMAP_PROFILE, READER_PREFS_PROFILE, type KeymapPrefs, type ReaderPrefs } from "../settings/api";
 import type { Bookmark, BookManifest, Highlight } from "../reader/types";
@@ -217,6 +218,7 @@ function installSelectionHandler() {
 
   makeButton("Highlight", () => void createHighlightFromSelection());
   makeButton("Copy", () => void copySelection(doc, popover));
+  makeButton("Look up", () => void lookUpSelection(doc, popover));
   doc.body.appendChild(popover);
 
   doc.addEventListener("mouseup", () => {
@@ -260,6 +262,36 @@ async function copySelection(doc: Document, popover: HTMLElement) {
   }
   popover.style.display = "none";
   statusMessage.value = "Copied.";
+}
+
+/**
+ * Looks the selection up in a dictionary (#816's 2.8 remainder).
+ *
+ * This port has no definitions corpus of its own -- the vendored
+ * Hunspell dictionaries are word *lists*, which can confirm a word
+ * exists but cannot define it -- so a lookup opens an external
+ * dictionary site rather than pretending otherwise.
+ *
+ * That leaves the app and sends the selected word to a third party,
+ * which is why it is a deliberate button press rather than anything
+ * automatic, and why the desktop path goes through a command that
+ * refuses any scheme but http/https.
+ */
+async function lookUpSelection(doc: Document, popover: HTMLElement) {
+  const text = doc.getSelection()?.toString().trim() ?? "";
+  if (!text) return;
+  // A whole paragraph is not a dictionary query; take the first word.
+  const word = text.split(/\s+/)[0].replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
+  if (!word) return;
+
+  const url = `https://en.wiktionary.org/wiki/${encodeURIComponent(word)}`;
+  popover.style.display = "none";
+  try {
+    if (isTauri()) await tauriInvoke<void>("open_external_url", { url });
+    else window.open(url, "_blank", "noopener,noreferrer");
+  } catch (e) {
+    statusMessage.value = e instanceof Error ? e.message : String(e);
+  }
 }
 
 async function createHighlightFromSelection() {

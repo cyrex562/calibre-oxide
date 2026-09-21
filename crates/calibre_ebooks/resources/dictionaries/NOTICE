@@ -1,0 +1,49 @@
+Vendored spell-check dictionaries
+=================================
+
+These are Hunspell dictionaries, baked into the binary so spell check
+works with no configuration and no network access. They are data, not
+code, and each keeps its own licence.
+
+Provenance was established from the files and their packaging, not
+assumed. Upstream calibre ships its own en-US copy with no attribution
+of any kind -- no header, nothing in its COPYRIGHT, nothing in its
+build scripts -- so that copy is deliberately NOT used here.
+
+
+en-US/  -- SCOWL (Spell Checker Oriented Word Lists)
+----------------------------------------------------
+
+Taken from the Debian `hunspell-en-us` package, which documents its
+own origin and licence (/usr/share/doc/hunspell-en-us/copyright).
+
+  Maintained by Kevin Atkinson <kevina@users.sourceforge.net>
+  Upstream: http://wordlist.sourceforge.net/
+  Copyright 2000-2011 by Kevin Atkinson
+
+  Permission to use, copy, modify, distribute and sell these word
+  lists, the associated scripts, the output created from the scripts,
+  and its documentation for any purpose is hereby granted without fee,
+  provided that the above copyright notice appears in all copies and
+  that both that copyright notice and this permission notice appear in
+  supporting documentation. Kevin Atkinson makes no representations
+  about the suitability of this array for any purpose. It is provided
+  "as is" without express or implied warranty.
+
+Alan Beale also deserves credit; see the SCOWL README for the full
+list of contributors and component copyrights.
+
+
+en-GB/  -- British English MySpell dictionary
+----------------------------------------------
+
+Taken from calibre's own resources. Unlike its en-US, this one states
+its licence and authorship in its own `en-GB.aff` header:
+
+  "Affix file for British English MySpell dictionary.
+   Built from scratch for MySpell. Released under LGPL.
+   David Bartlett, Andrew Brown, Marco A.G.Pinto.
+   V 3.0.2, 2021-11-01"
+
+Licence: LGPL. The header above is preserved verbatim in the shipped
+`en-GB.aff`, so the licence travels with the file.

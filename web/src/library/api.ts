@@ -795,3 +795,16 @@ export function fixBookChecks(sessionId: string): Promise<{ attempted: number; c
 export function bookReport(sessionId: string): Promise<BookReport> {
   return jsonFetch<BookReport>(`/tweak/report/${encodeURIComponent(sessionId)}`);
 }
+
+// Spell check (#816 item 3.1). The engine was always real; what was
+// missing was dictionary data, which now ships with the binary.
+export interface MisspelledWord {
+  word: string;
+  count: number;
+  files: string[];
+  suggestions: string[];
+}
+
+export function spellCheckBook(sessionId: string): Promise<{ count: number; words: MisspelledWord[] }> {
+  return jsonFetch<{ count: number; words: MisspelledWord[] }>(`/tweak/spell/${encodeURIComponent(sessionId)}`);
+}
