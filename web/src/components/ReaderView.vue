@@ -12,6 +12,7 @@ import PdfReader from "./PdfReader.vue";
 import { extractText, findMatches, totalMatches, type SpineMatches } from "../reader/search";
 import { isNoteReference, noteTextFor } from "../reader/footnotes";
 import { adjustSpeed, autoScrollPixels, DEFAULT_AUTO_SCROLL_SPEED, detectSwipe, type Point } from "../reader/gestures";
+import { clampPageIndex, pageCount, pageForScroll, pagedModeCss, scrollForPage } from "../reader/paged";
 import { DEFAULT_KEYMAP, DEFAULT_READER_PREFS, fetchProfile, KEYMAP_PROFILE, READER_PREFS_PROFILE, type KeymapPrefs, type ReaderPrefs } from "../settings/api";
 import type { Bookmark, BookManifest, Highlight } from "../reader/types";
 
@@ -121,6 +122,7 @@ async function loadSpine(index: number, frag = "") {
   spineIndex.value = index;
   await loadSpineFileInto(iframeEl.value.contentDocument, resolveContextFor(m), name);
   applyReaderPrefs();
+  applyPagedMode();
   if (frag) {
     iframeEl.value.contentDocument.getElementById(frag)?.scrollIntoView();
   }
@@ -422,16 +424,18 @@ function toggleReadAloud() {
 onBeforeUnmount(() => releaseAudioUrl());
 
 function onKeydown(e: KeyboardEvent) {
-  if (e.key === keymap.value.readerNext) next();
-  else if (e.key === keymap.value.readerPrev) prev();
+  if (e.key === keymap.value.readerNext) nextPage();
+  else if (e.key === keymap.value.readerPrev) prevPage();
 }
 
 onMounted(() => {
   window.addEventListener("keydown", onKeydown);
+  window.addEventListener("resize", onReaderResize);
   if (!isPdf.value) void init();
 });
 onBeforeUnmount(() => {
   window.removeEventListener("keydown", onKeydown);
+  window.removeEventListener("resize", onReaderResize);
   stopAutoScroll();
 });
 watch([bookId, fmt], () => {
@@ -648,8 +652,8 @@ function installTouchHandler() {
       start = null;
       // Only horizontal swipes turn pages: vertical ones are the
       // reader scrolling, which the browser already handles.
-      if (swipe === "left") next();
-      else if (swipe === "right") prev();
+      if (swipe === "left") nextPage();
+      else if (swipe === "right") prevPage();
     },
     { passive: true },
   );
@@ -730,6 +734,112 @@ function printCurrentSection() {
   view.focus();
   view.print();
 }
+
+// ---------------------------------------------------------------
+// Paged mode (#2.3)
+// ---------------------------------------------------------------
+//
+// The reader only ever scrolled. Paged mode is what most people mean
+// by reading an ebook: fixed pages that turn.
+//
+// The content is laid out with CSS multi-column at exactly the
+// viewport width, so it flows into side-by-side columns and turning a
+// page is a horizontal scroll -- no re-layout, no measuring text, and
+// the book's own stylesheet still applies. The arithmetic lives in
+// reader/paged.ts, where its off-by-ones can be stated and tested.
+
+const PAGED_STYLE_ID = "calibre-oxide-paged-mode";
+
+const pagedMode = ref(false);
+const currentPage = ref(0);
+const pagesInSection = ref(1);
+
+function pagedViewport(): { width: number; height: number } | null {
+  const view = iframeEl.value?.contentWindow;
+  if (!view) return null;
+  return { width: view.innerWidth, height: view.innerHeight };
+}
+
+/** Installs or removes the multi-column layout. */
+function applyPagedMode() {
+  const doc = iframeEl.value?.contentDocument;
+  if (!doc?.head) return;
+
+  let style = doc.getElementById(PAGED_STYLE_ID) as HTMLStyleElement | null;
+  if (!style) {
+    style = doc.createElement("style");
+    style.id = PAGED_STYLE_ID;
+    doc.head.appendChild(style);
+  }
+
+  if (!pagedMode.value) {
+    style.textContent = "";
+    pagesInSection.value = 1;
+    currentPage.value = 0;
+    return;
+  }
+
+  const vp = pagedViewport();
+  if (!vp) return;
+  style.textContent = pagedModeCss(vp.width, vp.height);
+  measurePages();
+}
+
+function measurePages() {
+  const doc = iframeEl.value?.contentDocument;
+  const vp = pagedViewport();
+  if (!doc?.documentElement || !vp) return;
+  pagesInSection.value = pageCount(doc.documentElement.scrollWidth, vp.width);
+  currentPage.value = clampPageIndex(pageForScroll(doc.documentElement.scrollLeft, vp.width), pagesInSection.value);
+}
+
+function goToPage(page: number) {
+  const doc = iframeEl.value?.contentDocument;
+  const vp = pagedViewport();
+  if (!doc?.documentElement || !vp) return;
+  const target = clampPageIndex(page, pagesInSection.value);
+  doc.documentElement.scrollLeft = scrollForPage(target, vp.width);
+  currentPage.value = target;
+}
+
+/**
+ * Page forward, crossing into the next section at the end.
+ *
+ * In scrolling mode "next" has always meant the next section; in
+ * paged mode it means the next *page*, and only falls through to the
+ * next section once there are no pages left.
+ */
+function nextPage() {
+  if (!pagedMode.value) {
+    next();
+    return;
+  }
+  if (currentPage.value < pagesInSection.value - 1) goToPage(currentPage.value + 1);
+  else next();
+}
+
+function prevPage() {
+  if (!pagedMode.value) {
+    prev();
+    return;
+  }
+  if (currentPage.value > 0) goToPage(currentPage.value - 1);
+  else prev();
+}
+
+function togglePagedMode() {
+  pagedMode.value = !pagedMode.value;
+  applyPagedMode();
+  // Auto-scroll scrolls vertically, which a paged layout has none of.
+  if (pagedMode.value) stopAutoScroll();
+}
+
+// A resize changes the column width, so the layout and the page count
+// both have to be recomputed -- otherwise the reader is left showing
+// a position that no longer exists.
+function onReaderResize() {
+  if (pagedMode.value) applyPagedMode();
+}
 </script>
 
 <template>
@@ -754,9 +864,11 @@ function printCurrentSection() {
       <button @click="showToc = false; showBookmarks = !showBookmarks" :disabled="!manifest">Bookmarks ({{ bookmarks.length }})</button>
       <button @click="showToc = false; showBookmarks = false; searchOpen = !searchOpen" :disabled="!manifest" :class="{ active: searchOpen }">Search</button>
       <button @click="bookmarkCurrentPage" :disabled="!manifest">Bookmark this page</button>
-      <button @click="prev" :disabled="spineIndex <= 0">◀ Prev</button>
+      <button @click="prevPage" :disabled="!pagedMode && spineIndex <= 0">◀ Prev</button>
       <span class="title">{{ manifest?.metadata?.title ?? "" }}</span>
-      <button @click="next" :disabled="!manifest || spineIndex >= manifest.spine.length - 1">Next ▶</button>
+      <button @click="nextPage" :disabled="!manifest || (!pagedMode && spineIndex >= manifest.spine.length - 1)">Next ▶</button>
+      <button @click="togglePagedMode" :disabled="!manifest" :class="{ active: pagedMode }" title="Switch between paged and scrolling">{{ pagedMode ? "Paged" : "Scrolling" }}</button>
+      <span v-if="pagedMode" class="page-indicator">{{ currentPage + 1 }} / {{ pagesInSection }}</span>
       <button @click="printCurrentSection" :disabled="!manifest" title="Print the section on screen">Print</button>
       <span class="autoscroll" :class="{ active: autoScrolling }">
         <button @click="toggleAutoScroll" :disabled="!manifest">{{ autoScrolling ? "⏸ Auto-scroll" : "▶ Auto-scroll" }}</button>
@@ -992,6 +1104,15 @@ function printCurrentSection() {
   font-variant-numeric: tabular-nums;
   font-size: 0.85rem;
   min-width: 2.5rem;
+  text-align: center;
+}
+
+/* Paged mode (#2.3). */
+.page-indicator {
+  font-variant-numeric: tabular-nums;
+  font-size: 0.85rem;
+  opacity: 0.7;
+  min-width: 3.5rem;
   text-align: center;
 }
 
