@@ -673,3 +673,26 @@ export function previewMapper(field: "authors" | "tags", rules: MapperRule[], bo
 export function applyMapper(field: "authors" | "tags", rules: MapperRule[], bookIds: number[] = []): Promise<MapperResult> {
   return jsonFetch<MapperResult>("/mapper/apply", { method: "POST", headers: { "Content-Type": "application/json" }, body: mapperBody(field, rules, bookIds) });
 }
+
+// Library-wide annotation browser (#816 item 1.8). Per-book
+// annotations were always reachable; this answers "what have I
+// highlighted across the whole library".
+export interface LibraryAnnotation {
+  id: number;
+  book_id: number;
+  title: string;
+  format: string;
+  text: string;
+  type: string;
+  timestamp: string | null;
+}
+
+export async function fetchAllAnnotations(opts: { type?: string; bookIds?: number[]; limit?: number } = {}): Promise<LibraryAnnotation[]> {
+  const params = new URLSearchParams();
+  if (opts.type) params.set("type", opts.type);
+  if (opts.bookIds?.length) params.set("book_ids", opts.bookIds.join(","));
+  if (opts.limit) params.set("limit", String(opts.limit));
+  const qs = params.toString();
+  const data = await jsonFetch<{ count: number; annotations: LibraryAnnotation[] }>(`/annotations/all${qs ? `?${qs}` : ""}`);
+  return data.annotations;
+}

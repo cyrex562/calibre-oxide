@@ -6,6 +6,7 @@ import BookDetailsPanel from "./BookDetailsPanel.vue";
 import BookTable from "./BookTable.vue";
 import ContextMenu from "./ContextMenu.vue";
 import MapperDialog from "./MapperDialog.vue";
+import AnnotationsBrowser from "./AnnotationsBrowser.vue";
 import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
 import type { CheckLibraryResult, CustomRecipeOptions, DuplicateBook, NewsFeedInput, NewsSchedule, SaveToDiskResult } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
@@ -1051,6 +1052,9 @@ const actionHandlers: Partial<Record<LibraryActionId, () => void>> = {
   "map-metadata": () => {
     mapperOpen.value = true;
   },
+  "browse-annotations": () => {
+    annotationsOpen.value = true;
+  },
   "export-catalog": () => exportCatalog(),
   "export-library-archive": () => exportLibraryArchive(),
   "fetch-news": () => openNews(),
@@ -1079,6 +1083,7 @@ const HIDDEN_IN_FTS_MODE: ReadonlySet<LibraryActionId> = new Set<LibraryActionId
   "check-library",
   "find-duplicates",
   "map-metadata",
+  "browse-annotations",
   "export-catalog",
   "export-library-archive",
   "fetch-news",
@@ -1288,6 +1293,14 @@ const mapperScope = computed(() => (selectMode.value ? [...selectedIds.value] : 
 async function onMapperApplied() {
   cacheBust.value++;
   await runSearch();
+}
+
+// Library-wide annotation browser (#1.8).
+const annotationsOpen = ref(false);
+
+function openBookFromAnnotation(bookId: number) {
+  annotationsOpen.value = false;
+  selectedBookId.value = bookId;
 }
 </script>
 
@@ -1520,6 +1533,8 @@ async function onMapperApplied() {
         </footer>
       </main>
     </div>
+
+    <AnnotationsBrowser v-if="annotationsOpen" @close="annotationsOpen = false" @open-book="openBookFromAnnotation" />
 
     <MapperDialog v-if="mapperOpen" :book-ids="mapperScope" @close="mapperOpen = false" @applied="onMapperApplied" />
 

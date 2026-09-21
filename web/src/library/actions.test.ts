@@ -144,9 +144,9 @@ describe("the native menu spec", () => {
 
 describe("what the toolbar renders", () => {
   // The ids LibraryView.vue actually supplies handlers for.
-  const HANDLED: LibraryActionId[] = ["manage-lists", "custom-columns", "check-library", "find-duplicates", "map-metadata", "export-catalog", "export-library-archive", "fetch-news", "add-books", "add-folder", "switch-library", "select-mode", "bulk-edit", "save-to-disk"];
+  const HANDLED: LibraryActionId[] = ["manage-lists", "custom-columns", "check-library", "find-duplicates", "map-metadata", "browse-annotations", "export-catalog", "export-library-archive", "fetch-news", "add-books", "add-folder", "switch-library", "select-mode", "bulk-edit", "save-to-disk"];
 
-  const FTS_SUPPRESSED = new Set<LibraryActionId>(["manage-lists", "custom-columns", "check-library", "find-duplicates", "map-metadata", "export-catalog", "export-library-archive", "fetch-news", "select-mode", "bulk-edit", "save-to-disk"]);
+  const FTS_SUPPRESSED = new Set<LibraryActionId>(["manage-lists", "custom-columns", "check-library", "find-duplicates", "map-metadata", "browse-annotations", "export-catalog", "export-library-archive", "fetch-news", "select-mode", "bulk-edit", "save-to-disk"]);
 
   const base = { handled: HANDLED, hidden: [] as LibraryActionId[] };
 
@@ -156,7 +156,7 @@ describe("what the toolbar renders", () => {
   // and nothing else in the suite would notice.
   it("renders the full desktop toolbar when nothing is hidden or suppressed", () => {
     const ids = visibleToolbarActions({ ...base, ctx: DESKTOP }).map((a) => a.id);
-    expect(ids).toEqual(["manage-lists", "custom-columns", "check-library", "find-duplicates", "map-metadata", "export-catalog", "export-library-archive", "fetch-news", "add-books", "add-folder", "switch-library", "select-mode"]);
+    expect(ids).toEqual(["manage-lists", "custom-columns", "check-library", "find-duplicates", "map-metadata", "browse-annotations", "export-catalog", "export-library-archive", "fetch-news", "add-books", "add-folder", "switch-library", "select-mode"]);
   });
 
   it("drops the two desktop-only actions in a browser tab", () => {

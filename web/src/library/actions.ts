@@ -85,6 +85,7 @@ export type LibraryActionId =
   | "check-library"
   | "find-duplicates"
   | "map-metadata"
+  | "browse-annotations"
   | "export-catalog"
   | "export-library-archive"
   | "fetch-news"
@@ -126,6 +127,7 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   { id: "check-library", label: "Check library…", group: "library", requires: "none", toolbar: true },
   { id: "find-duplicates", label: "Find duplicates…", group: "library", requires: "none", toolbar: true },
   { id: "map-metadata", label: "Map authors/tags…", group: "library", requires: "none", toolbar: true },
+  { id: "browse-annotations", label: "Annotations…", group: "library", requires: "none", toolbar: true },
   { id: "export-catalog", label: "Export catalog…", group: "library", requires: "none", toolbar: true },
   { id: "export-library-archive", label: "Export library archive…", group: "library", requires: "none", toolbar: true },
   { id: "fetch-news", label: "Fetch news…", group: "library", requires: "none", toolbar: true },
