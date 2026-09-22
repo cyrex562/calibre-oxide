@@ -39,6 +39,8 @@ use axum::extract::{Path as AxumPath, State};
 use axum::http::{header, HeaderValue};
 use axum::response::Response;
 
+use anyhow::Context;
+
 use crate::errors::ServerError;
 use crate::AppState;
 
@@ -54,6 +56,18 @@ fn build_library_zip(library_path: &Path) -> anyhow::Result<Vec<u8>> {
             if rel.as_os_str().is_empty() {
                 continue;
             }
+            // Skip the runtime state directory. It holds the writer
+            // lock and the write-ahead journal -- per-process state
+            // that would be actively wrong to restore from a backup,
+            // and on Windows actively unreadable: `try_lock` there is
+            // `LockFileEx`, a byte-range lock that blocks reads of the
+            // locked region, so copying `writer.lock` fails outright
+            // and took the whole export down with it. (On Linux
+            // `flock` is advisory and reads sail through, which is why
+            // this only ever showed up on Windows.)
+            if rel.starts_with(calibre_db::constants::LIBRARY_HANDLE_DIR_NAME) {
+                continue;
+            }
             // Zip entry names use forward slashes on every platform,
             // matching the real zip spec (not the host OS separator).
             let name = rel.to_string_lossy().replace('\\', "/");
@@ -61,8 +75,10 @@ fn build_library_zip(library_path: &Path) -> anyhow::Result<Vec<u8>> {
                 zip.add_directory(format!("{name}/"), options)?;
             } else if entry.file_type().is_file() {
                 zip.start_file(name, options)?;
-                let mut f = std::fs::File::open(path)?;
-                std::io::copy(&mut f, &mut zip)?;
+                let mut f = std::fs::File::open(path)
+                    .with_context(|| format!("opening {} for export", path.display()))?;
+                std::io::copy(&mut f, &mut zip)
+                    .with_context(|| format!("reading {} for export", path.display()))?;
             }
         }
         zip.finish()?;

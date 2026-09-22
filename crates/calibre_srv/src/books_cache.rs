@@ -66,7 +66,13 @@ pub fn abspath(path: &Path) -> io::Result<PathBuf> {
     {
         let s = abs.to_string_lossy();
         if !s.starts_with(r"\\?\") {
-            return Ok(PathBuf::from(format!(r"\\?\{s}")));
+            // Separators must be normalized *before* the prefix goes
+            // on. `\\?\` introduces a verbatim path, and Windows stops
+            // treating `/` as a separator inside one -- so prefixing a
+            // path that still contains forward slashes produces a name
+            // like `relative/path` as a single literal component,
+            // which no later `join` or `parent` can take apart again.
+            return Ok(PathBuf::from(format!(r"\\?\{}", s.replace('/', r"\"))));
         }
     }
     Ok(abs)
@@ -335,9 +341,15 @@ mod tests {
     fn abspath_of_a_relative_path_is_absolute() {
         let out = abspath(Path::new("relative/path")).unwrap();
         assert!(out.is_absolute());
-        assert!(out.ends_with("relative/path"));
+        // Compared component-wise against a real path rather than a
+        // string literal: Windows renders the tail with backslashes,
+        // behind a `\\?\` prefix.
+        assert!(out.ends_with(Path::new("relative").join("path")), "{out:?}");
     }
 
+    // As the name says -- on Windows `abspath` deliberately adds the
+    // `\\?\` long-path prefix, so "unchanged" is only ever true here.
+    #[cfg(not(windows))]
     #[test]
     fn abspath_of_an_already_absolute_path_is_unchanged_on_non_windows() {
         let dir = tempfile::tempdir().unwrap();
