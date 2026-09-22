@@ -18,6 +18,11 @@ pub mod imageops;
 pub mod imghdr;
 pub mod localization;
 pub mod localunzip;
+// Linux-only: `flock`/`geteuid` plus an abstract-namespace Unix domain
+// socket (`std::os::linux::net::SocketAddrExt`), which no other platform
+// has. See the module's own doc -- the Windows and macOS/BSD branches of
+// upstream's `lock.py` were deliberately not ported.
+#[cfg(target_os = "linux")]
 pub mod lock;
 pub mod logging;
 pub mod lzx;
@@ -52,6 +57,9 @@ pub mod smartypants;
 pub mod smtp;
 pub mod socket_inheritance;
 pub mod speedups;
+// Unix-only: POSIX `fcntl` record locks (`libc::flock`, `F_SETLK`), which
+// have no Windows equivalent here.
+#[cfg(unix)]
 pub mod tdir_in_cache;
 pub mod terminal;
 pub mod text2int;

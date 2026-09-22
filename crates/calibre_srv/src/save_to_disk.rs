@@ -307,6 +307,12 @@ mod tests {
         assert!(written.starts_with(dest.path()), "the `..`/`etc` segments must not have escaped dest: {written:?}");
     }
 
+    // Unix-only: creating a directory symlink on Windows needs either
+    // Developer Mode or SeCreateSymbolicLinkPrivilege, so this test
+    // cannot set up its own fixture there. The guard it covers
+    // (`canonicalize`-based escape detection) is itself portable --
+    // only the test's setup is not.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_symlink_planted_inside_dest_cannot_be_used_to_escape_it() {
         // A lexical `out_path.starts_with(dest_root)` check alone would

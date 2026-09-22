@@ -1,0 +1,60 @@
+# Builds and tests on a real Windows host with the real MSVC toolchain.
+#
+# This repo had no CI at all, which is why three ungated `cfg` breaks sat
+# in the tree unnoticed -- nothing had ever compiled the workspace for a
+# non-Unix target. A Linux-only developer cannot catch that class of bug
+# locally, so it has to be caught here.
+#
+# MSVC is the toolchain that matters: it is what `rustup` installs by
+# default on Windows and what Tauri targets. Cross-compiling to
+# `x86_64-pc-windows-gnu` from Linux is useful for a fast local check,
+# but it is a different toolchain and does not prove this one works.
+
+name: windows
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the workspace
+        run: cargo build --workspace
+
+      # `--all-targets` so test code is type-checked too: two of the three
+      # portability breaks this job exists to catch were in tests, not in
+      # shipped code.
+      - name: Check every target
+        run: cargo check --workspace --all-targets
+
+      - name: Test
+        run: cargo test --workspace --lib
+
+  frontend:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install and test web/
+        working-directory: web
+        run: |
+          npm install
+          npm test
+          npm run build
