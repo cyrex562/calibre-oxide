@@ -85,6 +85,41 @@ Creating a directory symlink on Windows requires Developer Mode or
 The guard it covers is portable; only the fixture is not — which does mean
 that particular security property goes unverified on Windows.
 
+## Troubleshooting
+
+### `LINK : fatal error LNK1104: cannot open file ...exe`
+
+The linker could not write its own output, because something else had
+that file open. Nothing to do with the code — the same commit links
+fine in CI.
+
+In order of likelihood:
+
+1. **Windows Defender's real-time scanner** opens each freshly written
+   `.exe` to scan it, and the linker can lose that race. This is the
+   usual cause on a Windows Rust build. Exclude the build directory
+   (PowerShell as Administrator):
+
+   ```powershell
+   Add-MpPreference -ExclusionPath "<repo>\target"
+   ```
+
+2. **A previous copy is still running.** The binary in the message names
+   the process to look for:
+
+   ```powershell
+   Get-Process ebook_convert -ErrorAction SilentlyContinue | Stop-Process
+   ```
+
+3. **Another `cargo` is building the same workspace** in a second
+   terminal, or a `tauri build` is running concurrently. Cargo locks its
+   own target directory, but a `tauri build` invoking a nested cargo can
+   still overlap with a manual one.
+
+Simply re-running the build frequently succeeds, since the race is
+timing-dependent — but if it happens more than once, do the exclusion
+rather than keep retrying.
+
 ## Known gaps
 
 - **Text-to-speech is untested on Windows.** `ort` (ONNX Runtime) does ship
