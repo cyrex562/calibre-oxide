@@ -186,13 +186,29 @@ fn save_one_book(cache: &Cache, book_id: i32, template: &str, dest_root: &Path, 
 
         let real_out_path = canonical_parent.join(out_path.file_name().expect("out_path always has a file name -- it's built by appending an extension"));
         std::fs::copy(&src, &real_out_path).map_err(|e| e.to_string())?;
-        written.push(real_out_path.display().to_string());
+        written.push(reportable_path(&real_out_path));
     }
 
     if written.is_empty() {
         return Err(format!("no requested format is available for book {book_id} (available: {available:?})"));
     }
     Ok(written)
+}
+
+/// Renders a canonicalized path for the caller to display.
+///
+/// The security check above deliberately works on `canonicalize`d
+/// paths, and on Windows that returns a verbatim `\\?\C:\...` path.
+/// That form is correct to compare and correct to open, but it is not
+/// what anyone expects to see in "saved to ..." -- so the prefix comes
+/// back off for reporting only, leaving the checked path untouched.
+fn reportable_path(path: &Path) -> String {
+    let shown = path.display().to_string();
+    #[cfg(windows)]
+    if let Some(stripped) = shown.strip_prefix(r"\\?\") {
+        return stripped.to_string();
+    }
+    shown
 }
 
 /// `POST /save-to-disk/{library_id}`.
@@ -289,10 +305,23 @@ mod tests {
         let paths = result["paths"].as_array().unwrap();
         assert_eq!(paths.len(), 1);
         let written = std::path::PathBuf::from(paths[0].as_str().unwrap());
-        assert!(written.starts_with(dest.path()), "{written:?} should be under {:?}", dest.path());
+        let root = reported_dest(dest.path());
+        assert!(written.starts_with(&root), "{written:?} should be under {root:?}");
         assert_eq!(std::fs::read_to_string(&written).unwrap(), "hello world");
         assert!(written.to_string_lossy().contains("Jane Doe"));
         assert!(written.to_string_lossy().contains("My Book"));
+    }
+
+    /// The destination as the handler itself will report it.
+    ///
+    /// A bare `dest.path()` is not comparable on Windows: the handler
+    /// canonicalizes, and canonicalizing expands an 8.3 short name, so
+    /// a `TEMP` of `C:\Users\RUNNER~1\...` comes back as
+    /// `C:\Users\runneradmin\...` and a `starts_with` against the
+    /// original fails for a path that is in fact exactly where it
+    /// should be.
+    fn reported_dest(dest: &std::path::Path) -> std::path::PathBuf {
+        std::path::PathBuf::from(super::reportable_path(&std::fs::canonicalize(dest).unwrap()))
     }
 
     #[tokio::test]
@@ -304,9 +333,18 @@ mod tests {
         let result = &body["results"][0];
         assert_eq!(result["ok"], true, "{result}");
         let written = std::path::PathBuf::from(result["paths"][0].as_str().unwrap());
-        assert!(written.starts_with(dest.path()), "the `..`/`etc` segments must not have escaped dest: {written:?}");
+        assert!(
+            written.starts_with(reported_dest(dest.path())),
+            "the `..`/`etc` segments must not have escaped dest: {written:?}"
+        );
     }
 
+    // Unix-only: creating a directory symlink on Windows needs either
+    // Developer Mode or SeCreateSymbolicLinkPrivilege, so this test
+    // cannot set up its own fixture there. The guard it covers
+    // (`canonicalize`-based escape detection) is itself portable --
+    // only the test's setup is not.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_symlink_planted_inside_dest_cannot_be_used_to_escape_it() {
         // A lexical `out_path.starts_with(dest_root)` check alone would

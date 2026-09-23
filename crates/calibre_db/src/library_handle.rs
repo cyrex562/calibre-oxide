@@ -1248,14 +1248,10 @@ fn publish_over_network(
         let scratch_path = local_scratch_path();
         let outcome: io::Result<()> = (|| {
             stage(&scratch_path)?;
-            let scratch_file = File::open(&scratch_path)?;
-            scratch_file.sync_all()?;
-            drop(scratch_file);
+            sync_file(&scratch_path)?;
 
             fs::copy(&scratch_path, tmp_path)?;
-            let tmp_file = File::open(tmp_path)?;
-            tmp_file.sync_all()?;
-            drop(tmp_file);
+            sync_file(tmp_path)?;
 
             fs::rename(tmp_path, target)?;
             Ok(())
@@ -2128,6 +2124,19 @@ fn mark_committed(path: &Path) -> io::Result<()> {
         (&file).write_all(b"1")?;
     }
     file.sync_all()
+}
+
+/// `fsync`s a file that already exists on disk, by path.
+///
+/// Opened for **writing** rather than with [`File::open`], which is
+/// read-only. On Unix either would do -- `fsync(2)` does not care how
+/// the descriptor was opened -- but Windows implements `sync_all` as
+/// `FlushFileBuffers`, which requires the handle to carry
+/// `GENERIC_WRITE` and fails the whole publish with
+/// `ERROR_ACCESS_DENIED` otherwise. Found by the Windows CI job; it
+/// cannot reproduce on this project's Linux development machines.
+fn sync_file(path: &Path) -> io::Result<()> {
+    OpenOptions::new().write(true).open(path)?.sync_all()
 }
 
 /// `fsync`s a directory so a just-`rename`d entry survives a crash --

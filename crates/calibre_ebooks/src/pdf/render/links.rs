@@ -498,8 +498,14 @@ mod tests {
 
     #[test]
     fn abspath_normcase_collapses_dotdot() {
-        let p = abspath_normcase(Path::new("/a/b/../c"));
-        assert_eq!(p, PathBuf::from("/a/c"));
+        // Built from a real absolute path rather than a literal
+        // `/a/b/../c`: a leading slash is not absolute on Windows, so
+        // the literal form would be resolved against the current
+        // directory and the assertion would be testing the harness
+        // rather than the collapsing this covers.
+        let base = std::env::current_dir().unwrap();
+        let p = abspath_normcase(&base.join("a").join("b").join("..").join("c"));
+        assert_eq!(p, base.join("a").join("c"));
     }
 
     #[test]

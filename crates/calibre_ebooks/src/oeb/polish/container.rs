@@ -1788,6 +1788,18 @@ fn nlinks(_path: &Path) -> u64 {
     1
 }
 
+/// Whether [`nlinks`] can actually tell a hard-linked file from a
+/// normal one.
+///
+/// The whole hard-link optimization is only safe because a later write
+/// checks `nlinks(...) > 1` and detaches the shared inode first. Off
+/// Unix `nlinks` has no way to answer and always says `1`, so that
+/// check would never fire -- and since Windows *does* support hard
+/// links on NTFS, `clone_dir` would happily create them and then edit
+/// the clone straight through into the original book. Copying instead
+/// costs disk and time; getting this wrong costs the user their file.
+const HARD_LINKS_ARE_DETECTABLE: bool = cfg!(unix);
+
 /// Clone a folder using hard links where possible, falling back to a
 /// real copy (matches `clone_dir`'s `hardlink_file`/`shutil.copy2`
 /// fallback). `dest` is created if missing.
@@ -1799,7 +1811,7 @@ fn clone_dir(src: &Path, dest: &Path) -> Result<()> {
         let dpath = dest.join(entry.file_name());
         if spath.is_dir() {
             clone_dir(&spath, &dpath)?;
-        } else if fs::hard_link(&spath, &dpath).is_err() {
+        } else if !HARD_LINKS_ARE_DETECTABLE || fs::hard_link(&spath, &dpath).is_err() {
             fs::copy(&spath, &dpath)?;
         }
     }

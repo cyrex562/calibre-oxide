@@ -633,9 +633,14 @@ mod tests {
             Link::new("./b.html", base).path.as_deref(),
             Some(Path::new("/books/one/text/b.html"))
         );
+        // A leading slash is a Windows *file-URL* marker, not part of
+        // the name -- `file:///C:/x` means `C:/x`. `url_to_local_path`
+        // strips it there deliberately, matching upstream, so the
+        // expected path differs by platform.
+        let rooted = if cfg!(windows) { "abs/c.html" } else { "/abs/c.html" };
         assert_eq!(
             Link::new("/abs/c.html", base).path.as_deref(),
-            Some(Path::new("/abs/c.html"))
+            Some(Path::new(rooted))
         );
     }
 

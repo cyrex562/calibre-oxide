@@ -1,0 +1,47 @@
+# Normalize line endings on checkout, on every platform.
+#
+# Several ported data tables are verified byte-for-byte against a live
+# run of the Python original -- `rtf2xml::char_set`, for instance,
+# asserts an exact character count. A CRLF checkout on Windows adds one
+# byte per line and breaks those assertions, which reads as a porting
+# bug when it is really a checkout artifact.
+#
+# `text=auto` still lets git detect and leave binary files alone; the
+# explicit entries below are belt-and-braces for fixture formats git
+# might not recognise.
+* text=auto eol=lf
+
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.webp binary
+*.ico  binary
+*.pdf  binary
+*.zip  binary
+*.epub binary
+*.mobi binary
+*.azw3 binary
+*.kepub binary
+*.docx binary
+*.odt  binary
+*.rtf  binary
+*.chm  binary
+*.wasm binary
+*.ttf  binary
+*.otf  binary
+*.woff binary
+*.woff2 binary
+*.onnx binary
+*.mo   binary
+*.db   binary
+*.sqlite binary
+
+# The upstream Python reference tree is kept verbatim -- it is read for
+# comparison during porting, never built, and some of it (Windows C++
+# sources, a .bat) is legitimately CRLF in upstream.
+old_src/** -text
+
+# Batch files need CRLF to be reliably interpreted by cmd.exe.
+*.bat text eol=crlf
+*.cmd text eol=crlf

@@ -183,6 +183,10 @@ pub fn actual_case_for_name(container: &impl NameLookup, name: &str) -> anyhow::
     Ok(ans.join("/"))
 }
 
+/// Whether this platform's filesystem distinguishes `A.html` from
+/// `a.html`. Used to decide when an `exists` check is enough on its own.
+const CASE_SENSITIVE_PATHS: bool = !cfg!(any(windows, target_os = "macos"));
+
 /// Port of `corrected_case_for_name`. Returns `None` where Python
 /// returns `None` (case-insensitive match not found, or a non-terminal
 /// path component turned out to be a file).
@@ -195,21 +199,31 @@ pub fn corrected_case_for_name(container: &impl NameLookup, name: &str) -> Optio
         } else {
             format!("{}/{}", ans.join("/"), x)
         };
-        let correct = if container.exists(&base) {
+        // `exists` is only proof of an exact-case match on a
+        // case-sensitive filesystem. On Windows (and a default macOS
+        // volume) it also answers yes for a file whose real name
+        // differs only in case -- which is precisely the case this
+        // function exists to correct, so taking the fast path there
+        // would return the caller's own wrong spelling unchanged and
+        // write it into an EPUB that then breaks on case-sensitive
+        // readers.
+        let exact_case_is_certain = CASE_SENSITIVE_PATHS && container.exists(&base);
+        let correct = if exact_case_is_certain {
             Some((*x).to_string())
         } else {
             let path = container.name_to_abspath(&base);
-            let pdir = path.parent()?;
-            let entries = std::fs::read_dir(pdir).ok()?;
-            let mut found = None;
-            for entry in entries.flatten() {
-                let candidate = entry.file_name().to_string_lossy().into_owned();
-                if candidate.to_lowercase() == x.to_lowercase() {
-                    found = Some(candidate);
-                    break;
-                }
-            }
-            found
+            let found = path.parent().and_then(|pdir| {
+                let entries = std::fs::read_dir(pdir).ok()?;
+                entries.flatten().find_map(|entry| {
+                    let candidate = entry.file_name().to_string_lossy().into_owned();
+                    (candidate.to_lowercase() == x.to_lowercase()).then_some(candidate)
+                })
+            });
+            // Fall back to the caller's spelling if the directory could
+            // not be listed at all: before this, an existing file always
+            // yielded a name, and an unreadable parent directory should
+            // not start turning that into `None`.
+            found.or_else(|| container.exists(&base).then(|| (*x).to_string()))
         };
         ans.push(correct?);
     }

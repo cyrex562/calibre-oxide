@@ -151,12 +151,16 @@ pub fn limit_component(x: &str, limit: usize) -> String {
 ///
 /// Port of `calibre.utils.filenames.samefile`. On Unix this is exactly
 /// `os.path.samefile`: both paths must exist and resolve to the same
-/// device/inode pair. On Windows the Python falls back to comparing
-/// normalized absolute path strings (case-insensitively) when the
-/// paths aren't identical strings; that fallback is reproduced here
-/// with `dunce`-free `std::fs::canonicalize`, which is the closest
-/// portable equivalent without pulling in `GetFileInformationByHandle`
-/// bindings.
+/// file.
+///
+/// Unix compares the `(dev, ino)` pair. Windows asks for the
+/// equivalent `(volume serial, file index)` via
+/// `GetFileInformationByHandle`, falling back to a case-insensitive
+/// comparison of canonicalized paths for anything that cannot be
+/// opened as a file -- directories, most usefully. The Python only
+/// ever had the path-string fallback; the handle query is stricter,
+/// and needed, because the fallback cannot see two hard links to one
+/// file as the same file.
 ///
 /// Returns `false` (rather than erroring) when either path doesn't
 /// exist, matching the Python's `os.path.samefile` behavior of raising
@@ -171,7 +175,27 @@ pub fn samefile(a: &Path, b: &Path) -> bool {
         };
         ma.dev() == mb.dev() && ma.ino() == mb.ino()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // Ask the filesystem for the real identity first. A
+        // canonicalized-path comparison cannot see that two different
+        // names are hard links to one file, and `copy_files` uses this
+        // to decide whether to skip a copy -- a false "different"
+        // there means calling `fs::copy` with a source and destination
+        // that are the same bytes on disk.
+        if let (Some(ia), Some(ib)) = (file_identity(a), file_identity(b)) {
+            return ia == ib;
+        }
+        // Directories, or anything we could not open, fall back to the
+        // path comparison this used to do everywhere.
+        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(ca), Ok(cb)) => ca
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&cb.to_string_lossy()),
+            _ => false,
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
             (Ok(ca), Ok(cb)) => ca
@@ -180,6 +204,31 @@ pub fn samefile(a: &Path, b: &Path) -> bool {
             _ => false,
         }
     }
+}
+
+/// `(volume serial, file index)` -- Windows' answer to a `(dev, ino)`
+/// pair, and the only way to tell two hard links to one file apart
+/// from two genuinely separate files.
+///
+/// `None` when the path cannot be opened as a file at all, which
+/// includes every directory: opening one needs
+/// `FILE_FLAG_BACKUP_SEMANTICS`, which [`std::fs::File::open`] does not
+/// pass. Callers fall back to comparing canonical paths there.
+#[cfg(windows)]
+fn file_identity(path: &Path) -> Option<(u32, u64)> {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // Safety: `file` owns a live handle for the duration of the call,
+    // and `info` is a correctly-sized, writable output buffer.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
+        return None;
+    }
+    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    Some((info.dwVolumeSerialNumber, index))
 }
 
 #[cfg(test)]

@@ -1337,7 +1337,11 @@ mod tests {
                     None,
                 )
                 .unwrap_err();
-            assert_eq!(err.fname, "/no/such/path.png");
+            // As in `html::input`, the leading slash of a `file://`
+            // URL is stripped on Windows, where it marks a drive-letter
+            // path (`file:///C:/x`) rather than belonging to the name.
+            let expected = if cfg!(windows) { "no/such/path.png" } else { "/no/such/path.png" };
+            assert_eq!(err.fname, expected);
         }
 
         #[test]

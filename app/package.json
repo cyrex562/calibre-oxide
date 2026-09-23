@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "node scripts/bundle-config.mjs && tauri build --config src-tauri/tauri.bundle.conf.json"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1",
