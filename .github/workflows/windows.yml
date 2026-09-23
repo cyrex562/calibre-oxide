@@ -43,6 +43,13 @@ jobs:
       - name: Test
         run: cargo test --workspace --lib
 
+      # The documented way to produce the desktop executable is a
+      # *release* build, and release codegen is not the same codegen the
+      # steps above exercise. Without this, the one command a Windows
+      # user actually runs is the one command CI never tried.
+      - name: Build release
+        run: cargo build --release --workspace
+
   frontend:
     runs-on: windows-latest
     steps:

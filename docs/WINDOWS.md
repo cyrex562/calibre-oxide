@@ -6,14 +6,18 @@ has and has not actually been verified.
 
 ## Status
 
-The workspace **type-checks clean for Windows**, including the Tauri app.
-That was established by cross-compiling from Linux to
-`x86_64-pc-windows-gnu` with `--all-targets`.
+The workspace **builds and passes its tests on a real Windows host with
+the real MSVC toolchain** — 5,210 tests, verified by
+`.github/workflows/windows.yml` on `windows-latest`. That job runs on
+every push and pull request, and is the thing to trust over this page.
 
-It has **not** been built or run on a real Windows host yet. The
-`.github/workflows/windows.yml` job exists to close exactly that gap: it
-builds and tests on `windows-latest` with the real MSVC toolchain on every
-push and pull request. Trust that job over this page.
+Getting there took fixing seven genuine Windows defects, three of which
+could have cost a user data. None were reachable from a Linux development
+machine, which is the whole argument for that job.
+
+What is still unverified is the app actually *running*: CI builds and
+tests, it does not launch a window. Starting up, rendering, and spawning
+`calibre_srv` all still want a human on a real desktop.
 
 ## Prerequisites
 
@@ -34,8 +38,14 @@ issue — that would mean something changed.
 The app spawns `calibre_srv` as a child process and points it at the built
 `web/` frontend, so both have to exist before the app will start. It looks
 for a bundled resource first and falls back to the workspace's own
-`target/` and `web/dist` — which is what makes the development flow below
-work without packaging anything.
+`target/` and `web/dist`.
+
+**The order below is mandatory, not advisory.** `tauri build` declares
+`calibre_srv.exe` and `web/dist` as bundle resources, and a declared
+resource that does not exist is a hard bundle error — so steps 1 and 2
+have to have happened first. That is deliberate: the alternative is a
+packaged app that builds happily and then cannot find its own backend at
+runtime.
 
 ```powershell
 git clone https://github.com/cyrex562/calibre-oxide.git
@@ -77,10 +87,6 @@ that particular security property goes unverified on Windows.
 
 ## Known gaps
 
-- **`tauri build` will not produce a working installer yet.** `tauri.conf.json`
-  declares no `bundle.resources`, so a packaged app ships without
-  `calibre_srv.exe` or `web/dist` and cannot find them at runtime. The
-  development flow above is unaffected. Tracked separately.
 - **Text-to-speech is untested on Windows.** `ort` (ONNX Runtime) does ship
   prebuilt binaries for `windows-msvc`, so it is expected to work, but
   nobody has run it.

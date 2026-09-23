@@ -72,3 +72,11 @@ Thumbs.db
 /output*.txt
 /output*.opf
 /output*.epub
+
+# Captured build/test output, in any directory. The existing patterns
+# above are root-anchored (a leading `/`), which is how four of these
+# came to be committed inside crates/ without anyone noticing.
+**/check_output*.txt
+**/test_output*.txt
+**/test_output*.log
+**/build_error*.log
