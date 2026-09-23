@@ -28,9 +28,6 @@
     "targets": "all",
     "icon": [
       "icons/icon.ico"
-    ],
-    "resources": {
-      "../../web/dist/": "web-dist/"
-    }
+    ]
   }
 }

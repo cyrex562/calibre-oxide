@@ -1,8 +1,0 @@
-{
-  "bundle": {
-    "resources": {
-      "../../web/dist/": "web-dist/",
-      "../../target/release/calibre_srv.exe": "calibre_srv.exe"
-    }
-  }
-}
