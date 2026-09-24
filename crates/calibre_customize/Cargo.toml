@@ -3,6 +3,7 @@ name = "calibre_customize"
 version = "0.1.0"
 edition = "2024"
 
+license.workspace = true
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"

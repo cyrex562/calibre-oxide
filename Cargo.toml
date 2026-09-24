@@ -13,8 +13,17 @@ members = [
     "crates/calibre_utils",
     "e2e",
     "tools/harness",
+    "xtask",
 ]
 # The old iced-based prototype lives in app-iced-prototype/ for reference —
 # not a workspace member.
 exclude = ["app-iced-prototype"]
 resolver = "2"
+
+# Inherited by every crate via `license.workspace = true`.
+# calibre is GPL v3 (see old_src/LICENSE and its own `__license__`
+# declarations, none of which say "or later"), and this is a
+# derivative port of it, so GPL-3.0-only is what it must carry.
+[workspace.package]
+license = "GPL-3.0-only"
+

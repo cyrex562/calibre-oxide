@@ -14,6 +14,16 @@ import type { BookFieldChanges, BookSummary, FieldMetaEntry } from "../library/t
 const props = defineProps<{
   bookId: number;
   /**
+   * Render as a docked column rather than a centred modal.
+   *
+   * calibre keeps book details permanently visible beside the list,
+   * and reading a row's details there costs no interaction. As a modal
+   * it covers the list it describes and has to be dismissed before the
+   * next row can be looked at, which is the opposite of how the panel
+   * is actually used.
+   */
+  docked?: boolean;
+  /**
    * An action to perform as soon as the book has loaded -- how the
    * right-click menu (#1.2) reaches the panel's own controls. A
    * counter accompanies it so choosing the *same* action twice in a
@@ -738,9 +748,9 @@ watch(
 </script>
 
 <template>
-  <div class="backdrop" @click.self="emit('close')">
-    <div class="panel">
-      <button class="close" @click="emit('close')">✕</button>
+  <div :class="docked ? 'docked-host' : 'backdrop'" @click.self="!docked && emit('close')">
+    <div class="panel" :class="{ docked }">
+      <button class="close" :title="docked ? 'Hide details' : 'Close'" @click="emit('close')">✕</button>
       <p v-if="loading">Loading…</p>
       <p v-else-if="error" class="error">{{ error }}</p>
       <template v-else-if="book && !editing">
@@ -1006,6 +1016,27 @@ watch(
   max-height: 85vh;
   overflow: auto;
   position: relative;
+}
+/* Docked: the panel *is* the column, so the modal's centring, rounding
+   and width caps all have to come back off. */
+.docked-host {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+}
+.panel.docked {
+  border-radius: 0;
+  max-width: none;
+  width: 100%;
+  max-height: none;
+  height: 100%;
+  padding: 1em;
+  overflow-y: auto;
+}
+@media (prefers-color-scheme: dark) {
+  .panel {
+    background: #22262c;
+  }
 }
 .close {
   position: absolute;

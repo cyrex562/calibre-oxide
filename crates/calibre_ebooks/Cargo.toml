@@ -3,6 +3,7 @@ name = "calibre_ebooks"
 version = "0.1.0"
 edition = "2021"
 
+license.workspace = true
 [dependencies]
 # Bakes the vendored spell dictionaries into the binary (#865),
 # the same convention calibre_srv uses for MathJax.

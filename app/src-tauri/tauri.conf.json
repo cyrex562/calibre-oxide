@@ -28,6 +28,11 @@
     "targets": "all",
     "icon": [
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "wix": {
+        "upgradeCode": "6e1d9587-da7b-5de4-b46f-8bc2cc356f91"
+      }
+    }
   }
 }

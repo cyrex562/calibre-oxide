@@ -1,0 +1,3 @@
+[alias]
+# Build automation lives in xtask/ -- see `cargo xtask help`.
+xtask = "run --package xtask --release --"

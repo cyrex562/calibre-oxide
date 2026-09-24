@@ -2,6 +2,7 @@
 name = "calibre_plugins_wasm"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 description = "WASM plugin host for calibre-oxide (issue #798) -- sandboxed, capability-restricted third-party plugins."
 
 [dependencies]

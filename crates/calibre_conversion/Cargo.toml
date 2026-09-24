@@ -3,6 +3,7 @@ name = "calibre_conversion"
 version = "0.1.0"
 edition = "2021"
 
+license.workspace = true
 [dependencies]
 calibre_ebooks = { path = "../calibre_ebooks" }
 calibre_utils = { path = "../calibre_utils" }

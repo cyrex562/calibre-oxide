@@ -3,6 +3,7 @@ name = "calibre_utils"
 version = "0.1.0"
 edition = "2021"
 
+license.workspace = true
 [dependencies]
 lazy_static = "1.4"
 directories = "5.0"

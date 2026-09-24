@@ -1,0 +1,91 @@
+calibre-oxide
+=============
+
+A Rust port of calibre <https://calibre-ebook.com/>.
+
+Copyright of the original work is held by Kovid Goyal and the calibre
+contributors. calibre is licensed GPL v3, and this project is a
+derivative of it, so it is GPL v3 as well. See LICENSE for the full
+text.
+
+    This program is free software: you can redistribute it and/or
+    modify it under the terms of the GNU General Public License,
+    version 3, as published by the Free Software Foundation.
+
+    This program is distributed in the hope that it will be useful, but
+    WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+    General Public License for more details.
+
+`GPL-3.0-only`, not `-or-later`: calibre's own `__license__`
+declarations say "GPL v3" / "GPL 3" throughout, with no "or later"
+anywhere, and a derivative cannot widen the original's grant.
+
+The vendored upstream Python sources under `old_src/` are calibre's own
+and are kept verbatim as the reference the port is checked against.
+
+
+A non-free component is currently included
+------------------------------------------
+
+**The RAR/CBR support in this project is not free software, and its
+presence means a built binary as a whole is not redistributable under
+the GPL.** This is disclosed rather than hidden; it is a deliberate
+choice to keep the feature.
+
+`unrar_sys` vendors Alexander Roshal's UnRAR sources. The Rust crate
+declares `MIT OR Apache-2.0`, but that covers only the wrapper -- the
+bundled C++ carries the UnRAR licence, which says:
+
+    UnRAR source code may be used in any software to handle RAR
+    archives without limitations free of charge, but cannot be used to
+    develop RAR (WinRAR) compatible archiver and to re-create RAR
+    compression algorithm, which is proprietary.
+
+That is a restriction on *use*. GPL v3 section 7 does not permit
+imposing further restrictions on recipients, so the UnRAR licence is
+GPL-incompatible, and the clause also makes it non-free by both the
+Debian Free Software Guidelines and the FSF's definition.
+
+Consequences, stated plainly:
+
+  * Linux distributions will not package a binary built this way, and
+    would need RAR support removed first.
+  * Redistributing built binaries is not something the GPL authorises
+    here, because the combined work cannot satisfy both licences.
+  * Building from source for your own use is unaffected.
+
+If this matters for how you intend to distribute the project, the fix
+is to drop the `unrar` dependency from `calibre_utils` and the
+RAR/CBR paths that use it (`calibre_utils::unrar`,
+`calibre_ebooks::metadata::rar`, `input::rar_input`, and the RAR arm of
+`comic::input`). Everything else is GPL-clean.
+
+
+Bundled third-party material
+----------------------------
+
+Beyond the Rust dependency tree (whose licences travel with the crates
+and are overwhelmingly MIT/Apache-2.0), these are checked in or shipped
+inside the binary:
+
+  * `old_src/resources/images/` -- calibre's own icon set. GPL v3, same
+    as the rest of calibre.
+
+  * `crates/calibre_srv/resources/mathjax/` -- MathJax 3.1.4,
+    Apache-2.0. Vendored so mathematical content renders offline.
+
+  * `web/public/pdfjs/` -- PDF.js runtime data (character maps and the
+    standard-font set), Apache-2.0. The standard fonts additionally
+    carry their own terms; `LICENSE_FOXIT` and `LICENSE_LIBERATION`
+    sit beside them.
+
+  * `crates/calibre_ebooks/resources/dictionaries/` -- Hunspell
+    dictionaries. en-US is SCOWL (Kevin Atkinson, permissive); en-GB is
+    LGPL. Provenance for both was established from the files rather
+    than assumed -- see the NOTICE in that directory, which also
+    records why calibre's own unattributed en-US is deliberately not
+    used.
+
+  * espeak-ng, reached through the `espeak-ng` crate, is GPL-3.0-or-later
+    and compatible with this project's GPL v3.

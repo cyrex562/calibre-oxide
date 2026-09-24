@@ -2,6 +2,7 @@
 name = "calibre_oxide_app"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "calibre-oxide desktop app (Tauri + Vue)"
 
 # The default Cargo layout would use src/main.rs for the binary. Tauri v2

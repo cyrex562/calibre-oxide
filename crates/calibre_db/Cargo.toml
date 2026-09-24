@@ -3,6 +3,7 @@ name = "calibre_db"
 version = "0.1.0"
 edition = "2021"
 
+license.workspace = true
 [dependencies]
 calibre_utils = { path = "../calibre_utils" }
 rusqlite = { version = "0.30", features = ["bundled", "functions", "collation", "hooks"] }

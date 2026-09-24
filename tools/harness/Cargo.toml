@@ -2,6 +2,7 @@
 name = "harness"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "Iterative-porting harness for calibre-oxide"
 
 [[bin]]

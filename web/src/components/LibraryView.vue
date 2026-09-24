@@ -9,6 +9,7 @@ import MapperDialog from "./MapperDialog.vue";
 import AnnotationsBrowser from "./AnnotationsBrowser.vue";
 import PolishDialog from "./PolishDialog.vue";
 import HelpDialog from "./HelpDialog.vue";
+import { LAYOUT_KEY, type LayoutPrefs, type Panel, parseLayout, resizedWidth } from "../library/layout";
 import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
 import type { CheckLibraryResult, CustomRecipeOptions, DuplicateBook, NewsFeedInput, NewsSchedule, SaveToDiskResult } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
@@ -194,6 +195,82 @@ function onColumnResize(next: { key: string; width: number }) {
   tablePrefs.value = { ...tablePrefs.value, widths: { ...tablePrefs.value.widths, [next.key]: clampWidth(next.width) } };
   clearTimeout(widthSaveTimer);
   widthSaveTimer = setTimeout(() => void saveTablePrefs(), 400);
+}
+
+// --- Panel layout -------------------------------------------------
+//
+// calibre's window is three columns over a status bar: categories on
+// the left, the book list in the middle, details on the right. Both
+// side panels hide, and the splitters between them drag. Widths
+// persist, because a panel that forgets its size every launch is one
+// the user re-drags every launch.
+//
+// The arithmetic and the stored-blob parsing live in `library/layout`
+// so they can be tested without mounting anything.
+
+const initialLayout = parseLayout(readStoredLayout());
+const sidebarVisible = ref(initialLayout.sidebarVisible);
+const detailsVisible = ref(initialLayout.detailsVisible);
+const sidebarWidth = ref(initialLayout.sidebarWidth);
+const detailsWidth = ref(initialLayout.detailsWidth);
+
+function readStoredLayout(): string | null {
+  try {
+    return localStorage.getItem(LAYOUT_KEY);
+  } catch {
+    // Storage can be unavailable (private mode, disabled cookies);
+    // defaults are a fine answer and not worth failing a render over.
+    return null;
+  }
+}
+
+function saveLayout() {
+  try {
+    localStorage.setItem(
+      LAYOUT_KEY,
+      JSON.stringify({
+        sidebarVisible: sidebarVisible.value,
+        detailsVisible: detailsVisible.value,
+        sidebarWidth: sidebarWidth.value,
+        detailsWidth: detailsWidth.value,
+      } satisfies LayoutPrefs),
+    );
+  } catch {
+    // As above: the layout simply will not persist.
+  }
+}
+
+watch([sidebarVisible, detailsVisible], saveLayout);
+
+/**
+ * Drags a splitter.
+ *
+ * Pointer capture is what makes this reliable: without it a fast drag
+ * outruns the 4px handle, the element stops receiving moves, and the
+ * panel sticks mid-resize with the button still held.
+ */
+function startResize(which: Panel, event: PointerEvent) {
+  event.preventDefault();
+  const handle = event.currentTarget as HTMLElement;
+  const startX = event.clientX;
+  const startWidth = which === "sidebar" ? sidebarWidth.value : detailsWidth.value;
+  handle.setPointerCapture?.(event.pointerId);
+
+  const onMove = (move: PointerEvent) => {
+    const next = resizedWidth(which, startWidth, startX, move.clientX);
+    if (which === "sidebar") sidebarWidth.value = next;
+    else detailsWidth.value = next;
+  };
+  const onUp = (up: PointerEvent) => {
+    handle.releasePointerCapture?.(up.pointerId);
+    handle.removeEventListener("pointermove", onMove);
+    handle.removeEventListener("pointerup", onUp);
+    handle.removeEventListener("pointercancel", onUp);
+    saveLayout();
+  };
+  handle.addEventListener("pointermove", onMove);
+  handle.addEventListener("pointerup", onUp);
+  handle.addEventListener("pointercancel", onUp);
 }
 
 const columnPickerOpen = ref(false);
@@ -1693,7 +1770,16 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
     <p v-if="addSummary" class="status add-summary">{{ addSummary }}</p>
 
     <div class="body">
-      <CategoryBrowser class="sidebar" @select="onCategorySelect" @view-note="openNote" @renamed="onCategoryRenamed" />
+      <template v-if="sidebarVisible">
+        <CategoryBrowser class="sidebar" :style="{ width: sidebarWidth + 'px' }" @select="onCategorySelect" @view-note="openNote" @renamed="onCategoryRenamed" />
+        <div
+          class="splitter"
+          role="separator"
+          aria-orientation="vertical"
+          title="Drag to resize"
+          @pointerdown="startResize('sidebar', $event)"
+        ></div>
+      </template>
 
       <main v-if="ftsMode" class="grid-area">
         <p v-if="ftsError" class="error">{{ ftsError }}</p>
@@ -1767,7 +1853,48 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
           <button :disabled="offset + pageSize >= totalNum" @click="nextPage">Next ▶</button>
         </footer>
       </main>
+
+      <!--
+        Docked, not overlaid: calibre keeps details beside the list so
+        arrowing down the rows updates them continuously. As a modal it
+        covered the very list it describes.
+      -->
+      <template v-if="detailsVisible && selectedBookId !== null">
+        <div
+          class="splitter"
+          role="separator"
+          aria-orientation="vertical"
+          title="Drag to resize"
+          @pointerdown="startResize('details', $event)"
+        ></div>
+        <aside class="details-column" :style="{ width: detailsWidth + 'px' }">
+          <BookDetailsPanel
+            :book-id="selectedBookId"
+            :pending-action="pendingBookAction"
+            docked
+            @close="detailsVisible = false"
+            @updated="onDetailsUpdated"
+            @deleted="onDetailsDeleted"
+            @open-book="selectedBookId = $event"
+          />
+        </aside>
+      </template>
     </div>
+
+    <!--
+      Status bar: calibre's is always-on and is where the counts live.
+      The panel toggles sit here rather than in the toolbar because
+      they are view state, not actions on books.
+    -->
+    <footer class="status-bar">
+      <span class="status-count">{{ totalNum }} book<span v-if="totalNum !== 1">s</span></span>
+      <span v-if="selectedIds.size > 0" class="status-sel">{{ selectedIds.size }} selected</span>
+      <span v-if="markedIds.size > 0" class="status-sel">{{ markedIds.size }} marked</span>
+      <span class="status-spacer"></span>
+      <span class="status-sort">Sorted by {{ fieldLabel(sort) }} ({{ sortOrder === "asc" ? "ascending" : "descending" }})</span>
+      <button type="button" class="status-toggle" :class="{ active: sidebarVisible }" :aria-pressed="sidebarVisible" title="Show or hide the category browser" @click="sidebarVisible = !sidebarVisible">Categories</button>
+      <button type="button" class="status-toggle" :class="{ active: detailsVisible }" :aria-pressed="detailsVisible" title="Show or hide book details" @click="detailsVisible = !detailsVisible">Details</button>
+    </footer>
 
     <HelpDialog v-if="helpOpen" :keymap="keymap" @close="helpOpen = false" />
 
@@ -1779,7 +1906,6 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
 
     <ContextMenu v-if="contextMenu" :x="contextMenu.x" :y="contextMenu.y" :entries="contextEntries" @choose="onContextChoose" @close="contextMenu = null" />
 
-    <BookDetailsPanel v-if="selectedBookId !== null" :book-id="selectedBookId" :pending-action="pendingBookAction" @close="selectedBookId = null" @updated="onDetailsUpdated" @deleted="onDetailsDeleted" @open-book="selectedBookId = $event" />
     <NoteEditor v-if="noteTarget" :field="noteTarget.field" :item-name="noteTarget.itemName" @close="noteTarget = null" />
 
     <div v-if="manageOpen" class="manage-backdrop" @click.self="manageOpen = false">
@@ -2075,12 +2201,76 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
   overflow: hidden;
 }
 .sidebar {
-  width: 220px;
+  /* Width is set inline from the saved layout and the drag. */
   flex-shrink: 0;
-  border-right: 1px solid #ddd;
+  overflow: auto;
+  min-height: 0;
+}
+.details-column {
+  flex-shrink: 0;
+  min-height: 0;
+  overflow: hidden;
+  border-left: 1px solid #ddd;
+}
+/* A thin, full-height grab strip between panels. It is deliberately
+   wider on hover than at rest: 4px is the right visual weight for a
+   divider but an awkward target, so the hit area grows once the
+   pointer is near it. */
+.splitter {
+  flex: 0 0 4px;
+  cursor: col-resize;
+  background: #ddd;
+  transition: background 0.12s ease;
+  touch-action: none;
+}
+.splitter:hover,
+.splitter:active {
+  background: #2a6df4;
+}
+.status-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.75em;
+  padding: 0.3em 0.75em;
+  border-top: 1px solid #ddd;
+  font-size: 0.85em;
+  flex-shrink: 0;
+  background: #f5f5f5;
+}
+.status-spacer {
+  flex: 1;
+}
+.status-count {
+  font-weight: 600;
+}
+.status-sel {
+  opacity: 0.75;
+}
+.status-sort {
+  opacity: 0.7;
+}
+.status-toggle {
+  padding: 0.15em 0.6em;
+  font-size: 0.95em;
+}
+@media (prefers-color-scheme: dark) {
+  .splitter {
+    background: #3a3d44;
+  }
+  .status-bar {
+    background: #22262c;
+    border-top-color: #3a3d44;
+  }
+  .details-column {
+    border-left-color: #3a3d44;
+  }
 }
 .grid-area {
   flex: 1;
+  /* `min-width: 0` is load-bearing: without it a flex item refuses to
+     shrink below its content, so a wide book table pushes the details
+     column out of the window rather than scrolling within its own. */
+  min-width: 0;
   display: flex;
   flex-direction: column;
   overflow: auto;

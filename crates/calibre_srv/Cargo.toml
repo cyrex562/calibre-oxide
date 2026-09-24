@@ -2,6 +2,7 @@
 name = "calibre_srv"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "calibre-oxide content server (issue #60) -- an axum/tokio HTTP server replacing calibre's own hand-rolled event loop."
 
 [[bin]]

@@ -85,8 +85,33 @@ pub fn resolve_web_dist(app: &AppHandle) -> io::Result<PathBuf> {
 /// `--add-user` ever called): a locally-spawned server that only this
 /// app's own window ever talks to has nothing to authenticate against.
 pub fn spawn(bin: &Path, library_path: &Path, static_dir: &Path, port: u16) -> io::Result<Child> {
-    Command::new(bin).arg(library_path).arg("--static-dir").arg(static_dir).arg("--port").arg(port.to_string()).spawn()
+    let mut cmd = Command::new(bin);
+    cmd.arg(library_path).arg("--static-dir").arg(static_dir).arg("--port").arg(port.to_string());
+    no_console_window(&mut cmd);
+    cmd.spawn()
 }
+
+/// Keeps Windows from opening a console window for the server.
+///
+/// `calibre_srv` is a console-subsystem binary, so launching it from a
+/// GUI app hands it a fresh console -- a second window that sits behind
+/// the app announcing "content server listening on ...". The app itself
+/// never had this problem (`main.rs` sets `windows_subsystem`); the
+/// child is a separate process and needs telling separately.
+///
+/// `CREATE_NO_WINDOW` is 0x0800_0000. Spelled out rather than pulled
+/// from `windows-sys` because this crate does not otherwise depend on
+/// it, and one documented constant is a smaller thing to own than a
+/// dependency.
+#[cfg(windows)]
+fn no_console_window(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn no_console_window(_cmd: &mut Command) {}
 
 /// Polls a real TCP connect to `127.0.0.1:<port>` until it succeeds or
 /// `timeout` elapses. A successful connect is a real readiness signal

@@ -2,6 +2,7 @@
 name = "calibre_oxide_e2e"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 publish = false
 
 [dependencies]

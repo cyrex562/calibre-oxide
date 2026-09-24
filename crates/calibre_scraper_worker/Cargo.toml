@@ -2,6 +2,7 @@
 name = "calibre_scraper_worker"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "Headless-ish JS-rendering fetch worker for calibre_ebooks::scraper::WebEngineBrowser, driven by an OS-native webview (wry/tao -- the same stack the Tauri app uses)."
 
 [[bin]]

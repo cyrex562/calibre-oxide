@@ -51,28 +51,62 @@ runtime.
 git clone https://github.com/cyrex562/calibre-oxide.git
 cd calibre-oxide
 
-# 1. The Rust side, including the calibre_srv binary the app spawns.
-cargo build --workspace
+cargo xtask build
+```
 
-# 2. The web UI the app actually displays.
-cd web
-npm install
-npm run build
-cd ..
+That runs the three steps in order — Rust workspace, web UI, desktop
+app — which is the whole reason it exists: getting the order wrong
+fails somewhere that does not mention the order. `cargo xtask package`
+also produces the installers, and `cargo xtask help` lists the rest.
 
-# 3. The desktop app.
-cd app
-npm install
-npm run tauri:dev
+By hand, if you want only one of them:
+
+```powershell
+cargo build --release --workspace        # includes calibre_srv, which the app spawns
+cd web  ; npm install ; npm run build    # the UI the app displays
+cd ..\app ; npm install ; npm run tauri:build
 ```
 
 On first launch the app asks for a library folder and remembers it.
 
+## Installing over an existing version
+
+The MSI is a major-upgrade installer: running a newer one replaces the
+installed version in place, with no need to uninstall first.
+
+Two things make that safe, and both are deliberate:
+
+**The upgrade code is pinned.** Windows identifies an existing
+installation by its MSI `UpgradeCode`, and Tauri otherwise *derives*
+one from the product name — so renaming the product would silently turn
+future installers into a second app alongside the first rather than an
+upgrade. `tauri.conf.json` pins it to the value already derived for
+`calibre-oxide`, which is why installs made before it was pinned still
+upgrade cleanly rather than duplicating.
+
+**No user data lives in the install directory.** Nothing here writes
+beside its own executable. Libraries live wherever you put them, and
+everything else — settings, reader profiles, saved searches, the render
+cache — lives under `%APPDATA%` and `%LOCALAPPDATA%`, which the
+installer never touches. Uninstalling removes the program and leaves
+the library alone.
+
+One consequence worth knowing: MSI upgrades key off the version number,
+so installing the *same* version over itself is not an upgrade —
+Windows offers repair or remove instead. Bump `version` in
+`tauri.conf.json` for a release meant to install over an older one.
+
 ## Running the tests
 
 ```powershell
+cargo xtask test
+```
+
+which runs the Rust suite and the web suite. By hand:
+
+```powershell
 cargo test --workspace --lib
-cd web; npm test
+cd web ; npm test
 ```
 
 Use `--lib`. Some `tests/` files in `calibre_db` are stale and fail for
