@@ -21,45 +21,60 @@ text.
 declarations say "GPL v3" / "GPL 3" throughout, with no "or later"
 anywhere, and a derivative cannot widen the original's grant.
 
-The vendored upstream Python sources under `old_src/` are calibre's own
-and are kept verbatim as the reference the port is checked against.
+
+calibre's own source is included here
+-------------------------------------
+
+`old_src/` is calibre's Python source, checked in unmodified -- roughly
+4,800 files and 63 MB. It is the largest third-party component of this
+repository by a wide margin, and it is calibre's work, not this
+project's.
+
+It is never built or executed; it is the reference the port is written
+and verified against. Around 276 ported modules carry a
+`Port of old_src/...` header naming the exact upstream file they derive
+from, so provenance is recorded per module rather than only in this
+file.
+
+calibre's own licence text travels with it at `old_src/LICENSE`, and
+is the same GPL v3 that governs this project.
 
 
-A non-free component is currently included
-------------------------------------------
+RAR support is not free software
+--------------------------------
 
-**The RAR/CBR support in this project is not free software, and its
-presence means a built binary as a whole is not redistributable under
-the GPL.** This is disclosed rather than hidden; it is a deliberate
-choice to keep the feature.
+This repository does not contain any UnRAR source. RAR/CBR support
+comes from the `unrar` crate, which Cargo fetches at build time, and
+`unrar_sys` vendors Alexander Roshal's UnRAR sources inside itself. So
+nothing here needs relicensing -- but anyone building or shipping this
+should know what they are linking.
 
-`unrar_sys` vendors Alexander Roshal's UnRAR sources. The Rust crate
-declares `MIT OR Apache-2.0`, but that covers only the wrapper -- the
-bundled C++ carries the UnRAR licence, which says:
+The crate declares `MIT OR Apache-2.0`, which covers only the Rust
+wrapper. The bundled C++ carries the UnRAR licence:
 
     UnRAR source code may be used in any software to handle RAR
     archives without limitations free of charge, but cannot be used to
     develop RAR (WinRAR) compatible archiver and to re-create RAR
     compression algorithm, which is proprietary.
 
-That is a restriction on *use*. GPL v3 section 7 does not permit
-imposing further restrictions on recipients, so the UnRAR licence is
-GPL-incompatible, and the clause also makes it non-free by both the
-Debian Free Software Guidelines and the FSF's definition.
+That restricts *use*, which GPL v3 section 7 does not permit adding, so
+it is GPL-incompatible and non-free by both the Debian Free Software
+Guidelines and the FSF's definition.
 
-Consequences, stated plainly:
+What this does and does not affect:
 
-  * Linux distributions will not package a binary built this way, and
-    would need RAR support removed first.
-  * Redistributing built binaries is not something the GPL authorises
-    here, because the combined work cannot satisfy both licences.
-  * Building from source for your own use is unaffected.
+  * **Source, as published here: unaffected.** No UnRAR code is in this
+    repository, and everything in it is GPL v3.
+  * **Building from source for your own use: unaffected.**
+  * **Distributing built binaries:** the combined work cannot satisfy
+    both licences, so the GPL does not authorise it, and Linux
+    distributions will not package it.
 
-If this matters for how you intend to distribute the project, the fix
-is to drop the `unrar` dependency from `calibre_utils` and the
-RAR/CBR paths that use it (`calibre_utils::unrar`,
-`calibre_ebooks::metadata::rar`, `input::rar_input`, and the RAR arm of
-`comic::input`). Everything else is GPL-clean.
+To get a binary without that constraint, drop the `unrar` dependency
+from `calibre_utils` and the RAR/CBR paths using it
+(`calibre_utils::unrar`, `calibre_ebooks::metadata::rar`,
+`input::rar_input`, and the RAR arm of `comic::input`). Everything else
+is GPL-clean.
 
 
 Bundled third-party material

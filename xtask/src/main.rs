@@ -56,7 +56,7 @@ fn print_help() {
          \x20 server    just the Rust workspace (includes calibre_srv and the CLIs)\n\
          \x20 web       just the web UI that the app displays\n\
          \x20 app       the desktop app, assuming the two above are already built\n\
-         \x20 package   build everything, then produce installers\n\
+         \x20 package   build everything, then produce installers (needs network)\n\
          \x20 test      the Rust test suite and the web test suite\n\n\
          \x20 --debug   build unoptimized (default is release)\n"
     );
@@ -99,11 +99,28 @@ fn build_app(release: bool) -> Result<()> {
     if !release {
         eprintln!("  note: --debug does not apply to the desktop app; `tauri build` is always optimized");
     }
-    npm(&["run", "tauri:build"], &app).context("tauri build failed in app/")
+    // Deliberately `--no-bundle`: this produces a runnable app and
+    // nothing else. Generating installers is `package`, and it is kept
+    // separate because bundling is the part that can fail for reasons
+    // having nothing to do with the code -- the Linux AppImage bundler
+    // downloads its tooling from GitHub at build time, so `build` would
+    // otherwise need working network to a specific host to finish.
+    npm(&["run", "tauri:build"], &app).context("building the desktop app failed")?;
+    let exe = root().join("target").join("release").join(if cfg!(windows) { "calibre_oxide_app.exe" } else { "calibre_oxide_app" });
+    eprintln!("\n  built {}", exe.display());
+    Ok(())
 }
 
 fn package() -> Result<()> {
-    build_all(true)?;
+    build_rust(true)?;
+    build_web()?;
+    step("packaging installers");
+    let app = root().join("app");
+    npm(&["install"], &app).context("npm install failed in app/")?;
+    npm(&["run", "tauri:package"], &app).context(
+        "packaging failed -- note that the Linux AppImage bundler downloads its tooling \
+         from GitHub while it runs, so this step needs network access that `build` does not",
+    )?;
     let bundle = root().join("target").join("release").join("bundle");
     step(&format!("installers are in {}", bundle.display()));
     Ok(())

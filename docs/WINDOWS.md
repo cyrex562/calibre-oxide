@@ -56,8 +56,11 @@ cargo xtask build
 
 That runs the three steps in order — Rust workspace, web UI, desktop
 app — which is the whole reason it exists: getting the order wrong
-fails somewhere that does not mention the order. `cargo xtask package`
-also produces the installers, and `cargo xtask help` lists the rest.
+fails somewhere that does not mention the order. It ends at a runnable
+`calibre_oxide_app.exe`.
+
+`cargo xtask package` additionally produces the MSI and NSIS
+installers; `cargo xtask help` lists the rest.
 
 By hand, if you want only one of them:
 
