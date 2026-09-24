@@ -1,4 +1,20 @@
-//! `ebook-convert` CLI. Real argument validation via
+//! `ebook-convert` CLI.
+//!
+//! The file is named with a hyphen so the binary is, matching
+//! upstream's command name -- which this CLI already reported as its
+//! own (`cli_options`'s `#[command(name = "ebook-convert")]`) while
+//! shipping as `ebook_convert`.
+//!
+//! That mattered for more than tidiness. `calibre_ebooks` also had an
+//! `ebook-convert` binary, a twenty-line positional-argument stub
+//! superseded by this one once #476 and #126 landed. Cargo normalises
+//! `-` to `_` for the intermediate artifact, so *both* targets linked
+//! to `deps/ebook_convert`, and two concurrent linkers racing for one
+//! output path is `LNK1104: cannot open file` on Windows -- reproduced
+//! on CI and on a user's machine. On Linux the same race is silent.
+//! The stub is gone and this is the only converter binary.
+//!
+//! Real argument validation via
 //! [`calibre_conversion::cli_helpers::check_command_line_options`]
 //! (matching upstream's `.EXT` output-shorthand and `.recipe`
 //! readability exemption), real option parsing via

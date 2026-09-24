@@ -64,7 +64,7 @@ Binaries land in `target/release/`:
 | `calibre_oxide_app` | the desktop application |
 | `calibre_srv` | the content server (the app spawns this) |
 | `calibredb` | library management from the command line |
-| `ebook_convert` | format conversion |
+| `ebook-convert` | format conversion |
 | `ebook-meta` | metadata inspection and editing |
 
 ## Layout
@@ -73,7 +73,7 @@ Binaries land in `target/release/`:
 crates/
   calibre_db            library database, and the calibredb CLI
   calibre_ebooks        formats, metadata, OEB, polish, TTS — the largest crate
-  calibre_conversion    the conversion pipeline and ebook_convert
+  calibre_conversion    the conversion pipeline and ebook-convert
   calibre_srv           content server (HTTP API, OPDS, reader backend)
   calibre_utils         shared utilities
   calibre_customize     plugin registry

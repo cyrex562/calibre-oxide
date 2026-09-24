@@ -132,7 +132,17 @@ fine in CI.
 
 In order of likelihood:
 
-1. **Windows Defender's real-time scanner** opens each freshly written
+1. **Two binaries with the same normalised name.** Cargo turns `-` into
+   `_` for the intermediate artifact in `target/*/deps/`, so bin targets
+   named `foo-bar` and `foo_bar` — even in different crates — link to
+   the same path, and two linkers racing for one output file is exactly
+   this error. This bit us once for real: `ebook-convert` and
+   `ebook_convert` both existed, and it failed on CI and on a user's
+   machine while being completely silent on Linux. If you add a binary,
+   check `cargo metadata` for a normalised-name clash before assuming
+   the environment is at fault.
+
+2. **Windows Defender's real-time scanner** opens each freshly written
    `.exe` to scan it, and the linker can lose that race. This is the
    usual cause on a Windows Rust build. Exclude the build directory
    (PowerShell as Administrator):
@@ -141,14 +151,14 @@ In order of likelihood:
    Add-MpPreference -ExclusionPath "<repo>\target"
    ```
 
-2. **A previous copy is still running.** The binary in the message names
+3. **A previous copy is still running.** The binary in the message names
    the process to look for:
 
    ```powershell
-   Get-Process ebook_convert -ErrorAction SilentlyContinue | Stop-Process
+   Get-Process ebook-convert -ErrorAction SilentlyContinue | Stop-Process
    ```
 
-3. **Another `cargo` is building the same workspace** in a second
+4. **Another `cargo` is building the same workspace** in a second
    terminal, or a `tauri build` is running concurrently. Cargo locks its
    own target directory, but a `tauri build` invoking a nested cargo can
    still overlap with a manual one.
