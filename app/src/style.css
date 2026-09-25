@@ -1,21 +1,16 @@
-:root {
-  font-family: system-ui, -apple-system, sans-serif;
-  line-height: 1.5;
-  color: #222;
-  background-color: #fafafa;
-}
+/*
+  Splash-only styling.
 
-body {
-  margin: 0;
-}
+  The design tokens come from `web/src/style.css`, imported alongside
+  this in `main.ts` — this file must not restate them. It previously
+  carried its own palette (`color: #222`, `background-color: #fafafa`)
+  with no dark-mode handling, so on a dark desktop the first screen was
+  a light card that then handed over to a dark window.
 
-button {
-  cursor: pointer;
-  padding: 0.5rem 1rem;
-  border-radius: 4px;
-  border: 1px solid #999;
-  background: #fff;
-}
-button:hover {
-  background: #f0f0f0;
+  Everything else the splash needs — buttons, inputs, focus rings — is
+  already in the shared sheet's base control rules.
+*/
+
+#app {
+  min-height: 100vh;
 }

@@ -73,6 +73,16 @@ fn open_library(app: &AppHandle, library_path: std::path::PathBuf) -> Result<(),
     let window = app.get_webview_window("main").ok_or("no main window")?;
     window.navigate(url).map_err(|e| e.to_string())?;
 
+    // The window says which library is open. Two windows on two
+    // libraries are otherwise indistinguishable in a task switcher,
+    // where the title is all you get.
+    let name = library_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| library_path.to_string_lossy().into_owned());
+    let _ = window.set_title(&format!("calibre-oxide — {name}"));
+
     let _ = settings::save_library_path(app, &library_path);
     Ok(())
 }
