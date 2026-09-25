@@ -5,6 +5,7 @@ import NoteEditor from "./NoteEditor.vue";
 import BookDetailsPanel from "./BookDetailsPanel.vue";
 import BookTable from "./BookTable.vue";
 import ContextMenu from "./ContextMenu.vue";
+import ToolbarButton from "./ToolbarButton.vue";
 import MapperDialog from "./MapperDialog.vue";
 import AnnotationsBrowser from "./AnnotationsBrowser.vue";
 import PolishDialog from "./PolishDialog.vue";
@@ -18,11 +19,11 @@ import { activeRules, colorForBook, COLORING_RULES_PROFILE, DEFAULT_COLORING_RUL
 import { evaluateTemplateBulk } from "../library/api";
 import { changesFor, isEmptySpec, REPLACEABLE_FIELDS, validateSpec, type BulkEditSpec } from "../library/bulkEdit";
 import { clampWidth, columnsFor, DEFAULT_TABLE_PREFS, resolveColumns, TABLE_PREFS_PROFILE, type BookColumn, type LibraryViewMode, type TablePrefs } from "../library/columns";
-import { actionEnabled, contextMenuEntries, LIBRARY_ACTIONS, toolbarActionEnabled, visibleToolbarActions, type ActionContext, type LibraryAction, type LibraryActionId } from "../library/actions";
+import { actionEnabled, contextMenuEntries, LIBRARY_ACTIONS, toolbarActionEnabled, TOOLBAR_LAYOUT, type ToolbarEntry, type ToolbarItem, visibleToolbarActions, type ActionContext, type LibraryAction, type LibraryActionId } from "../library/actions";
 import { onMenuAction, syncDesktopMenu } from "../library/desktopMenu";
 import { shortcutFor } from "../library/shortcuts";
 import { isTauri, tauriInvoke } from "../tauri";
-import { DEFAULT_KEYMAP, DEFAULT_LIBRARY_PREFS, DEFAULT_SAVE_TO_DISK_TEMPLATE, DEFAULT_TOOLBAR_PREFS, fetchProfile, KEYMAP_PROFILE, libraryShortcuts, LIBRARY_PREFS_PROFILE, saveProfile, TOOLBAR_PREFS_PROFILE, type KeymapPrefs, type LibraryPrefs, type ToolbarActionId, type ToolbarPrefs } from "../settings/api";
+import { DEFAULT_KEYMAP, DEFAULT_LIBRARY_PREFS, DEFAULT_SAVE_TO_DISK_TEMPLATE, DEFAULT_TOOLBAR_PREFS, fetchProfile, KEYMAP_PROFILE, libraryShortcuts, LIBRARY_PREFS_PROFILE, saveProfile, TOOLBAR_PREFS_PROFILE, type KeymapPrefs, type LibraryPrefs, type ToolbarPrefs } from "../settings/api";
 import type { BookSummary, CustomColumnInfo, FieldMetaEntry, FtsSnippet } from "../library/types";
 
 // Real, persisted default (issue #721) -- overwritten by
@@ -290,11 +291,6 @@ function moveColumn(key: string, delta: number) {
   [current[from], current[to]] = [current[to], current[from]];
   tablePrefs.value = { ...tablePrefs.value, columns: current };
   void saveTablePrefs();
-}
-
-function toolbarActionOrder(id: ToolbarActionId): number | undefined {
-  const i = toolbarPrefs.value.order.indexOf(id);
-  return i === -1 ? undefined : i;
 }
 
 // Virtual library / saved search management -- real, new routes (see
@@ -1319,17 +1315,6 @@ function actionDisabled(action: LibraryAction): boolean {
   return actionBusy(action) || !toolbarActionEnabled(action, actionContext.value);
 }
 
-function actionTitle(action: LibraryAction): string | undefined {
-  switch (action.id) {
-    case "export-catalog":
-      return activeQuery.value ? "Export the current search results as a CSV catalog" : "Export the whole library as a CSV catalog";
-    case "export-library-archive":
-      return "Download the whole library (every book and its metadata) as a real .zip archive for backup or transfer";
-    default:
-      return undefined;
-  }
-}
-
 /** `select-mode` is a toggle, so it reflects its on state. */
 function actionActive(action: LibraryAction): boolean {
   return action.id === "select-mode" && selectMode.value;
@@ -1345,37 +1330,135 @@ const toolbarActions = computed<LibraryAction[]>(() =>
 );
 
 /**
- * The actions that get a permanent toolbar slot.
- *
- * Splitting the registry's toolbar set rather than capping it by count:
- * which actions matter is a property of the action, not of how many
- * happen to precede it, and a count would reshuffle the toolbar as
- * availability changes with the selection.
- */
-const primaryToolbarActions = computed<LibraryAction[]>(() => toolbarActions.value.filter((a) => a.primary));
-
-/** Everything else, reached through the overflow menu. */
-const overflowToolbarActions = computed<LibraryAction[]>(() => toolbarActions.value.filter((a) => !a.primary));
-
-/**
  * Opens the overflow beneath its button.
  *
  * Reuses `ContextMenu` -- the same component the right-click menu uses,
  * reading the same registry, so an action cannot appear in one place
  * and behave differently in the other.
  */
-const toolbarMenu = ref<{ x: number; y: number } | null>(null);
+/**
+ * The toolbar, resolved from `TOOLBAR_LAYOUT` against what this view
+ * can actually do.
+ *
+ * A slot whose action this view does not handle, or that the platform
+ * cannot offer, is dropped entirely -- but a slot that merely needs a
+ * selection stays and renders disabled, so the row does not reflow as
+ * the selection changes.
+ */
+const toolbarItems = computed(() => {
+  const shown = new Set(toolbarActions.value.map((a) => a.id));
+  return TOOLBAR_LAYOUT.filter((item) => {
+    if (item.kind === "separator" || item.kind === "spring" || item.kind === "menu") return true;
+    return shown.has(item.id);
+  });
+});
 
-/** Overflow entries, in the shape `ContextMenu` already renders. */
-const toolbarMenuEntries = computed(() =>
-  overflowToolbarActions.value.map((a) => ({ id: a.id, label: actionLabel(a), enabled: !actionDisabled(a) })),
-);
+/** Resolves a slot id to its registry entry. */
+function actionFor(id: LibraryActionId): LibraryAction | undefined {
+  return LIBRARY_ACTIONS.find((a) => a.id === id);
+}
 
-function openToolbarOverflow(event: MouseEvent) {
-  const box = (event.currentTarget as HTMLElement).getBoundingClientRect();
-  // Anchored below the button rather than at the pointer: a menu tied
-  // to the control it belongs to stays put wherever the click landed.
-  toolbarMenu.value = { x: box.left, y: box.bottom };
+function itemKey(item: ToolbarItem, index: number): string {
+  return item.kind === "separator" || item.kind === "spring" ? `${item.kind}-${index}` : `${item.kind}-${item.id}`;
+}
+
+function itemHasMenu(item: ToolbarItem): boolean {
+  return item.kind === "split" || item.kind === "menu";
+}
+
+/** The body was clicked. A pure menu slot opens its menu instead. */
+function onItemRun(item: ToolbarItem) {
+  if (item.kind === "menu") {
+    openSlotMenu(item.menu, { x: 0, y: 0 });
+    return;
+  }
+  if (item.kind === "action" || item.kind === "split") runAction(item.id);
+}
+
+function onItemMenu(item: ToolbarItem, anchor: { x: number; y: number }) {
+  if (item.kind === "split" || item.kind === "menu") openSlotMenu(item.menu, anchor);
+}
+
+function itemLabel(item: { kind: string; id?: string; label?: string }): string {
+  // The library slot wears the open library's name: which library you
+  // are in is state, and state belongs on a label.
+  if (item.kind === "menu") return item.id === "library" ? libraryName.value || "Library" : item.label ?? "";
+  const action = actionFor(item.id as LibraryActionId);
+  return action ? actionLabel(action) : "";
+}
+
+function itemIcon(item: { kind: string; id?: string; icon?: string }): string | undefined {
+  if (item.kind === "menu") return item.icon;
+  return actionFor(item.id as LibraryActionId)?.icon;
+}
+
+function itemDisabled(item: { kind: string; id?: string }): boolean {
+  if (item.kind === "menu") return false;
+  const action = actionFor(item.id as LibraryActionId);
+  return action ? actionDisabled(action) : true;
+}
+
+function itemTitle(item: { kind: string; id?: string }): string | undefined {
+  if (item.kind === "menu") return libraryPath.value || undefined;
+  const action = actionFor(item.id as LibraryActionId);
+  if (!action) return undefined;
+  const parts = [action.tooltip ?? action.label];
+  if (action.accel) parts.push(`(${action.accel})`);
+  return parts.join(" ");
+}
+
+function itemActive(item: { kind: string; id?: string }): boolean {
+  if (item.kind === "menu") return false;
+  const action = actionFor(item.id as LibraryActionId);
+  return action ? actionActive(action) : false;
+}
+
+/**
+ * Expands a slot's menu into entries, dropping anything this view
+ * cannot run and collapsing separators that end up adjacent.
+ */
+function menuEntriesFor(entries: ToolbarEntry[]) {
+  const handled = new Set(toolbarActions.value.map((a) => a.id));
+  const out: { id: LibraryActionId; label: string; enabled: boolean; startsGroup?: boolean }[] = [];
+  let pendingSeparator = false;
+  for (const entry of entries) {
+    if (entry === "-") {
+      // Only becomes a real separator if something follows it.
+      pendingSeparator = out.length > 0;
+      continue;
+    }
+    // Dynamic blocks are not wired yet; skip rather than render a dead
+    // entry. Tracked as P2 in docs/UI_DESIGN.md §2.2.
+    if (entry.startsWith("$")) continue;
+    const id = entry as LibraryActionId;
+    const action = actionFor(id);
+    if (!action || !handled.has(id)) continue;
+    out.push({ id, label: actionLabel(action), enabled: !actionDisabled(action), startsGroup: pendingSeparator });
+    pendingSeparator = false;
+  }
+  return out;
+}
+
+/**
+ * The open toolbar dropdown, if any.
+ *
+ * Holds its own entries rather than deriving them from an id, because
+ * the overflow menu's contents are assembled from several slots at
+ * once and do not correspond to any single one.
+ */
+const toolbarMenu = ref<{
+  x: number;
+  y: number;
+  entries: { id: LibraryActionId; label: string; enabled: boolean; startsGroup?: boolean }[];
+} | null>(null);
+
+const toolbarMenuEntries = computed(() => toolbarMenu.value?.entries ?? []);
+
+/** Opens a slot's dropdown, anchored beneath it. */
+function openSlotMenu(entries: ToolbarEntry[], anchor: { x: number; y: number }) {
+  const resolved = menuEntriesFor(entries);
+  if (resolved.length === 0) return;
+  toolbarMenu.value = { ...anchor, entries: resolved };
 }
 
 function onToolbarMenuChoose(id: LibraryActionId) {
@@ -1713,6 +1796,45 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
 <template>
   <div class="library">
     <header class="toolbar">
+      <div class="toolbar-row toolbar-actions">
+      <!--
+        Rendered from TOOLBAR_LAYOUT (#817, then docs/UI_DESIGN.md §2.2).
+        The registry is what the context menu, keyboard shortcuts and
+        the desktop native menu all read from, so rendering the toolbar
+        from it too is what keeps those four surfaces in agreement.
+      -->
+      <template v-for="(item, i) in toolbarItems" :key="itemKey(item, i)">
+        <span v-if="item.kind === 'separator'" class="tb-sep" aria-hidden="true"></span>
+        <span v-else-if="item.kind === 'spring'" class="toolbar-gap"></span>
+        <ToolbarButton
+          v-else
+          :label="itemLabel(item)"
+          :icon="itemIcon(item)"
+          :has-menu="itemHasMenu(item)"
+          :disabled="itemDisabled(item)"
+          :active="itemActive(item)"
+          :title="itemTitle(item)"
+          @run="onItemRun(item)"
+          @menu="onItemMenu(item, $event)"
+        />
+      </template>
+
+      <!--
+        Marks need a visible home: "Show marked" and "Clear marks"
+        are deliberately not toolbar actions (they would clutter it
+        permanently), so they live in an indicator that only appears
+        once something is actually marked.
+      -->
+      <span v-if="markedIds.size > 0" class="marks-indicator">
+        <span class="marks-count">{{ markedIds.size }} marked</span>
+        <button type="button" :class="{ active: showMarkedOnly }" :aria-pressed="showMarkedOnly" @click="toggleShowMarked">
+          {{ showMarkedOnly ? "Show all" : "Show marked" }}
+        </button>
+        <button type="button" title="Clear all marks" @click="clearMarks">Clear</button>
+      </span>
+      <input ref="addInput" type="file" multiple class="hidden-file-input" @change="onAddFileSelected" />
+      <router-link to="/settings" class="settings-link">Settings…</router-link>
+      </div>
       <div class="toolbar-row toolbar-find">
       <form class="search" @submit.prevent="submitSearch">
         <input ref="searchInput" v-model="queryText" type="search" :placeholder="ftsMode ? 'Search book contents…' : 'Search…'" />
@@ -1758,52 +1880,6 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
 
       </div>
 
-      <div class="toolbar-row toolbar-actions">
-      <!--
-        Every action button comes from the registry (#817). Before
-        this there were thirteen near-identical hardcoded buttons,
-        each repeating its own visibility and ordering lookup; the
-        registry is what the context menu, keyboard shortcuts and the
-        desktop native menu all read from, so rendering the toolbar
-        from it too is what keeps those four surfaces in agreement.
-      -->
-      <button
-        v-for="action in primaryToolbarActions"
-        :key="action.id"
-        type="button"
-        :style="{ order: toolbarActionOrder(action.id) }"
-        :class="{ active: actionActive(action) }"
-        :disabled="actionDisabled(action)"
-        :title="actionTitle(action)"
-        @click="runAction(action.id)"
-      >
-        {{ actionLabel(action) }}
-      </button>
-      <!--
-        Marks need a visible home: "Show marked" and "Clear marks"
-        are deliberately not toolbar actions (they would clutter it
-        permanently), so they live in an indicator that only appears
-        once something is actually marked.
-      -->
-      <span v-if="markedIds.size > 0" class="marks-indicator">
-        <span class="marks-count">{{ markedIds.size }} marked</span>
-        <button type="button" :class="{ active: showMarkedOnly }" :aria-pressed="showMarkedOnly" @click="toggleShowMarked">
-          {{ showMarkedOnly ? "Show all" : "Show marked" }}
-        </button>
-        <button type="button" title="Clear all marks" @click="clearMarks">Clear</button>
-      </span>
-      <!--
-        Overflow, so the toolbar stays one row. calibre does the same;
-        rendering all fourteen library actions inline cost three
-        wrapped rows before any book was on screen.
-      -->
-      <button v-if="overflowToolbarActions.length" type="button" class="toolbar-more" @click="openToolbarOverflow">
-        More ▾
-      </button>
-      <span class="toolbar-gap"></span>
-      <input ref="addInput" type="file" multiple class="hidden-file-input" @change="onAddFileSelected" />
-      <router-link to="/settings" class="settings-link">Settings…</router-link>
-      </div>
     </header>
 
     <div v-if="bulkOpen" class="bulk-panel">
@@ -2341,8 +2417,23 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
   flex: 1 1 auto;
   min-width: 0;
 }
-.toolbar-more {
-  font-weight: 600;
+/* A 1px rule at 60% height, not a full-height divider: a toolbar
+   separator should group, not fence. */
+.tb-sep {
+  flex: 0 0 1px;
+  align-self: center;
+  height: 60%;
+  background: var(--border);
+  margin: 0 var(--sp-2);
+}
+/* The action row is taller than the find row and sets its own height
+   from the button, so it must not be squeezed by the flex column. */
+.toolbar-actions {
+  min-height: var(--tb-h);
+  gap: var(--sp-1);
+}
+.toolbar-find {
+  min-height: 34px;
 }
 .sort-fields {
   display: flex;
