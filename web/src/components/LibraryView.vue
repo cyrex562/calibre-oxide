@@ -15,6 +15,7 @@ import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LI
 import type { CheckLibraryResult, CustomRecipeOptions, DuplicateBook, NewsFeedInput, NewsSchedule, SaveToDiskResult } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
 import { similarBooksQuery } from "../library/query";
+import { pathFromLibraryId, recentLibraryEntries } from "../library/recentLibraries";
 import { readSavedChoice, readVlChoice, savedMenuItems, type SavedMenuId, type VlMenuId, vlMenuItems } from "../library/searchMenus";
 import { applySortChoice, type SortMenuId, sortSummary as summariseSort } from "../library/sortMenu";
 import { activeRules, colorForBook, COLORING_RULES_PROFILE, DEFAULT_COLORING_RULES, type ColoringRule, type ColoringRulesPrefs } from "../library/coloringRules";
@@ -1254,14 +1255,26 @@ const recentLibraries = ref<string[]>([]);
 const switching = ref(false);
 const switchError = ref<string | null>(null);
 
+/**
+ * Refreshes the recents list.
+ *
+ * Failure is swallowed: recents are a convenience, and the dialog and
+ * menu both still offer the two real routes without them. A browser
+ * tab has no such command at all, which is the common case rather than
+ * an error.
+ */
+async function loadRecentLibraries() {
+  try {
+    recentLibraries.value = await tauriInvoke<string[]>("list_recent_libraries");
+  } catch {
+    recentLibraries.value = [];
+  }
+}
+
 async function openSwitchLibrary() {
   switchError.value = null;
   switchOpen.value = true;
-  try {
-    recentLibraries.value = await tauriInvoke<string[]>("list_recent_libraries");
-  } catch (e) {
-    switchError.value = e instanceof Error ? e.message : String(e);
-  }
+  await loadRecentLibraries();
 }
 
 async function switchToRecent(path: string) {
@@ -1473,8 +1486,8 @@ function onItemRun(item: ToolbarItem) {
 }
 
 function onItemMenu(item: ToolbarItem, anchor: { x: number; y: number }) {
-  if (item.kind === "split" || item.kind === "menu") openSlotMenu(item.menu, anchor);
-  else if (item.kind === "overflow") openSlotMenu(toolbarOverflowIds(), anchor);
+  if (item.kind === "split" || item.kind === "menu") void openSlotMenu(item.menu, anchor);
+  else if (item.kind === "overflow") void openSlotMenu(toolbarOverflowIds(), anchor);
 }
 
 function itemLabel(item: ToolbarItem): string {
@@ -1521,27 +1534,54 @@ function itemActive(item: ToolbarItem): boolean {
  * Expands a slot's menu into entries, dropping anything this view
  * cannot run and collapsing separators that end up adjacent.
  */
+/**
+ * A toolbar menu id: either a registry action, or a dynamic entry that
+ * only exists while the menu is open.
+ *
+ * `lib:<path>` opens that library. The path is carried in the id
+ * rather than looked up by index, because the recents list is refetched
+ * whenever the menu opens and an index would go stale between the
+ * render and the click.
+ */
+type SlotMenuId = LibraryActionId | `lib:${string}`;
+
 function menuEntriesFor(entries: ToolbarEntry[]) {
   const handled = new Set(toolbarActions.value.map((a) => a.id));
-  const out: { id: LibraryActionId; label: string; enabled: boolean; startsGroup?: boolean }[] = [];
+  const out: { id: SlotMenuId; label: string; enabled: boolean; startsGroup?: boolean }[] = [];
   let pendingSeparator = false;
+
+  const push = (entry: { id: SlotMenuId; label: string; enabled: boolean }) => {
+    out.push({ ...entry, startsGroup: pendingSeparator });
+    pendingSeparator = false;
+  };
+
   for (const entry of entries) {
     if (entry === "-") {
       // Only becomes a real separator if something follows it.
       pendingSeparator = out.length > 0;
       continue;
     }
-    // Dynamic blocks are not wired yet; skip rather than render a dead
-    // entry. Tracked as P2 in docs/UI_DESIGN.md §2.2.
+
+    if (entry === "$recent-libraries") {
+      for (const recent of recentLibraryEntries(recentLibraries.value, libraryPath.value)) {
+        push({ id: recent.id, label: recent.label, enabled: !switching.value });
+      }
+      continue;
+    }
+
+    // Other dynamic blocks are not wired yet; skipped rather than
+    // rendered dead. Tracked as P2 in docs/UI_DESIGN.md §2.2.
     if (entry.startsWith("$")) continue;
+
     const id = entry as LibraryActionId;
     const action = actionFor(id);
     if (!action || !handled.has(id)) continue;
-    out.push({ id, label: actionLabel(action), enabled: !actionDisabled(action), startsGroup: pendingSeparator });
-    pendingSeparator = false;
+    push({ id, label: actionLabel(action), enabled: !actionDisabled(action) });
   }
   return out;
 }
+
+
 
 /**
  * The open toolbar dropdown, if any.
@@ -1553,21 +1593,29 @@ function menuEntriesFor(entries: ToolbarEntry[]) {
 const toolbarMenu = ref<{
   x: number;
   y: number;
-  entries: { id: LibraryActionId; label: string; enabled: boolean; startsGroup?: boolean }[];
+  entries: { id: SlotMenuId; label: string; enabled: boolean; startsGroup?: boolean }[];
 } | null>(null);
 
 const toolbarMenuEntries = computed(() => toolbarMenu.value?.entries ?? []);
 
 /** Opens a slot's dropdown, anchored beneath it. */
-function openSlotMenu(entries: ToolbarEntry[], anchor: { x: number; y: number }) {
+async function openSlotMenu(entries: ToolbarEntry[], anchor: { x: number; y: number }) {
+  // Refreshed on open rather than cached: another window may have
+  // opened a library since this one last looked.
+  if (entries.includes("$recent-libraries")) await loadRecentLibraries();
   const resolved = menuEntriesFor(entries);
   if (resolved.length === 0) return;
   toolbarMenu.value = { ...anchor, entries: resolved };
 }
 
-function onToolbarMenuChoose(id: LibraryActionId) {
+function onToolbarMenuChoose(id: SlotMenuId) {
   toolbarMenu.value = null;
-  runAction(id);
+  const path = pathFromLibraryId(id);
+  if (path !== null) {
+    void switchToRecent(path);
+    return;
+  }
+  runAction(id as LibraryActionId);
 }
 
 function runAction(id: LibraryActionId) {
