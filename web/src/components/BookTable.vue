@@ -172,14 +172,14 @@ function onRowKeydown(event: KeyboardEvent, bookId: number) {
      the browser re-derives widths from content and resizing appears
      to do nothing. */
   table-layout: fixed;
-  font-size: 0.9rem;
+  font-size: var(--fs-body);
 }
 
 .book-table th,
 .book-table td {
   text-align: left;
   padding: 0.35rem 0.55rem;
-  border-bottom: 1px solid #e0e0e0;
+  border-bottom: 1px solid var(--border);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -193,8 +193,8 @@ function onRowKeydown(event: KeyboardEvent, bookId: number) {
   position: sticky;
   top: 0;
   z-index: 1;
-  background: #f5f5f5;
-  border-bottom: 2px solid #d0d0d0;
+  background: var(--bg-bar);
+  border-bottom: 2px solid var(--border);
   font-weight: 600;
   user-select: none;
 }
@@ -215,7 +215,7 @@ function onRowKeydown(event: KeyboardEvent, bookId: number) {
 }
 
 .sort-indicator {
-  font-size: 0.7em;
+  font-size: var(--fs-micro);
   opacity: 0.75;
 }
 
@@ -231,7 +231,7 @@ function onRowKeydown(event: KeyboardEvent, bookId: number) {
 }
 
 .resize-handle:hover {
-  background: #bbb;
+  background: var(--fg-faint);
 }
 
 .book-table tbody tr {
@@ -239,15 +239,15 @@ function onRowKeydown(event: KeyboardEvent, bookId: number) {
 }
 
 .book-table tbody tr:hover {
-  background: #f0f6ff;
+  background: var(--accent-soft);
 }
 
 .book-table tbody tr.selected {
-  background: #dbeafe;
+  background: var(--bg-selected);
 }
 
 .book-table tbody tr:focus-visible {
-  outline: 2px solid #2563eb;
+  outline: 2px solid var(--accent);
   outline-offset: -2px;
 }
 
@@ -261,23 +261,4 @@ function onRowKeydown(event: KeyboardEvent, bookId: number) {
   font-variant-numeric: tabular-nums;
 }
 
-@media (prefers-color-scheme: dark) {
-  .book-table th,
-  .book-table td {
-    border-bottom-color: #333;
-  }
-  .book-table thead th {
-    background: #222;
-    border-bottom-color: #444;
-  }
-  .book-table tbody tr:hover {
-    background: #1e293b;
-  }
-  .book-table tbody tr.selected {
-    background: #1e3a5f;
-  }
-  .resize-handle:hover {
-    background: #555;
-  }
-}
 </style>

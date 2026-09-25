@@ -71,28 +71,28 @@ function moveDown(i: number) {
   min-width: 6em;
   font: inherit;
   padding: 0.25em 0.4em;
-  border: 1px solid #ddd;
+  border: 1px solid var(--border);
   border-radius: 4px;
 }
 .toc-dest {
   flex: 1;
   min-width: 6em;
   font: inherit;
-  font-size: 0.85em;
+  font-size: var(--fs-small);
   padding: 0.25em 0.4em;
-  border: 1px solid #ddd;
+  border: 1px solid var(--border);
   border-radius: 4px;
-  color: #555;
+  color: var(--fg-muted);
 }
 .toc-warning {
-  color: #b00020;
+  color: var(--danger);
 }
 .toc-row button {
-  font-size: 0.8em;
+  font-size: var(--fs-small);
   padding: 0.2em 0.4em;
   cursor: pointer;
 }
 .toc-row button.danger {
-  color: #b00020;
+  color: var(--danger);
 }
 </style>

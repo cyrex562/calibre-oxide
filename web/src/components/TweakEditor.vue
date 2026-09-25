@@ -563,7 +563,7 @@ function insertChar(c: SpecialChar) {
   z-index: 10;
 }
 .panel {
-  background: #fff;
+  background: var(--bg);
   border-radius: 6px;
   padding: 1.5em;
   width: 90%;
@@ -581,15 +581,15 @@ function insertChar(c: SpecialChar) {
   right: 0.5em;
   border: none;
   background: none;
-  font-size: 1.1em;
+  font-size: var(--fs-medium);
   cursor: pointer;
 }
 h3 {
   margin: 0;
 }
 .hint {
-  color: #888;
-  font-size: 0.85em;
+  color: var(--fg-faint);
+  font-size: var(--fs-small);
   margin: 0;
 }
 .editor {
@@ -605,7 +605,7 @@ h3 {
   width: 260px;
   flex-shrink: 0;
   overflow: auto;
-  border: 1px solid #ddd;
+  border: 1px solid var(--border);
   border-radius: 4px;
 }
 .file-list button {
@@ -617,12 +617,12 @@ h3 {
   padding: 0.35em 0.5em;
   cursor: pointer;
   font: inherit;
-  font-size: 0.85em;
+  font-size: var(--fs-small);
   word-break: break-all;
 }
 .file-list button.active {
-  background: #2a6df4;
-  color: #fff;
+  background: var(--accent);
+  color: var(--fg-on-accent);
 }
 .file-content {
   flex: 1;
@@ -632,9 +632,9 @@ h3 {
 .file-content textarea {
   flex: 1;
   font-family: ui-monospace, monospace;
-  font-size: 0.85em;
+  font-size: var(--fs-small);
   padding: 0.5em;
-  border: 1px solid #ddd;
+  border: 1px solid var(--border);
   border-radius: 4px;
   resize: none;
 }
@@ -643,19 +643,19 @@ h3 {
   gap: 0.5em;
 }
 .read {
-  background: #2a6df4;
-  color: #fff;
+  background: var(--accent);
+  color: var(--fg-on-accent);
   border: none;
   padding: 0.5em 1em;
   border-radius: 4px;
   cursor: pointer;
 }
 .error {
-  color: #b00020;
+  color: var(--danger);
 }
 .saved {
-  color: #1b7f3a;
-  font-size: 0.85em;
+  color: var(--success);
+  font-size: var(--fs-small);
   margin: 0;
 }
 .mode-tabs {
@@ -664,21 +664,21 @@ h3 {
 }
 .mode-tabs button {
   padding: 0.35em 0.75em;
-  border: 1px solid #ddd;
+  border: 1px solid var(--border);
   border-radius: 4px;
-  background: #f7f7f7;
+  background: var(--bg-sunken);
   cursor: pointer;
 }
 .mode-tabs button.active {
-  background: #2a6df4;
-  color: #fff;
-  border-color: #2a6df4;
+  background: var(--accent);
+  color: var(--fg-on-accent);
+  border-color: var(--accent);
 }
 .toc-editor {
   flex: 1;
   min-height: 0;
   overflow: auto;
-  border: 1px solid #ddd;
+  border: 1px solid var(--border);
   border-radius: 4px;
   padding: 0.5em;
 }
@@ -697,7 +697,7 @@ h3 {
   list-style: none;
   margin: 0 0 0.6rem;
   padding: 0;
-  font-size: 0.84rem;
+  font-size: var(--fs-small);
 }
 .check-list li {
   display: grid;
@@ -705,27 +705,27 @@ h3 {
   gap: 0.5rem;
   align-items: baseline;
   padding: 0.2rem 0;
-  border-bottom: 1px solid #eee;
+  border-bottom: 1px solid var(--border);
 }
 .check-level {
   text-transform: uppercase;
-  font-size: 0.72rem;
+  font-size: var(--fs-micro);
   letter-spacing: 0.05em;
   opacity: 0.7;
 }
 .level-error .check-level,
 .level-critical .check-level {
-  color: #b3261e;
+  color: var(--danger);
   opacity: 1;
   font-weight: 600;
 }
 .level-warning .check-level {
-  color: #9a6b08;
+  color: var(--warning);
   opacity: 1;
 }
 .check-where {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 0.78rem;
+  font-size: var(--fs-small);
   opacity: 0.75;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -735,7 +735,7 @@ h3 {
   text-overflow: ellipsis;
 }
 .check-fixable {
-  font-size: 0.72rem;
+  font-size: var(--fs-micro);
   opacity: 0.6;
   white-space: nowrap;
 }
@@ -744,11 +744,11 @@ h3 {
   grid-template-columns: minmax(10ch, 2fr) minmax(6ch, 1fr) auto;
   gap: 0.5rem;
   padding: 0.15rem 0;
-  border-bottom: 1px solid #f0f0f0;
+  border-bottom: 1px solid var(--border);
 }
 .report-name {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 0.78rem;
+  font-size: var(--fs-small);
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -756,10 +756,6 @@ h3 {
 .report-size {
   opacity: 0.7;
   white-space: nowrap;
-}
-@media (prefers-color-scheme: dark) {
-  .check-list li { border-bottom-color: #2b3037; }
-  .report-list li { border-bottom-color: #2b3037; }
 }
 
 /* Find & replace (#3.4). */
@@ -776,7 +772,7 @@ h3 {
 .find-options {
   display: flex;
   gap: 1rem;
-  font-size: 0.83rem;
+  font-size: var(--fs-small);
   margin-bottom: 0.5rem;
 }
 .saved-template-name {
@@ -795,11 +791,11 @@ h3 {
 .diff-file h4 {
   margin: 0 0 0.25rem;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 0.82rem;
+  font-size: var(--fs-small);
 }
 .diff-status {
   font-family: inherit;
-  font-size: 0.72rem;
+  font-size: var(--fs-micro);
   text-transform: uppercase;
   letter-spacing: 0.05em;
   opacity: 0.6;
@@ -807,28 +803,23 @@ h3 {
 .diff-file pre {
   margin: 0;
   padding: 0.4rem 0.6rem;
-  background: #f7f7f7;
+  background: var(--bg-sunken);
   border-radius: 4px;
   overflow-x: auto;
-  font-size: 0.78rem;
+  font-size: var(--fs-small);
   line-height: 1.45;
 }
 .diff-add {
   display: block;
-  background: #e6ffed;
+  background: var(--diff-add);
 }
 .diff-remove {
   display: block;
-  background: #ffeef0;
+  background: var(--diff-remove);
 }
 .diff-context {
   display: block;
   opacity: 0.65;
-}
-@media (prefers-color-scheme: dark) {
-  .diff-file pre { background: #1b1e24; }
-  .diff-add { background: #14301f; }
-  .diff-remove { background: #3a1d1d; }
 }
 
 /* Character picker (#3.6). */
@@ -836,7 +827,7 @@ h3 {
   margin-bottom: 0.3rem;
 }
 .char-picker {
-  border: 1px solid #ddd;
+  border: 1px solid var(--border);
   border-radius: 4px;
   padding: 0.5rem;
   margin-bottom: 0.4rem;
@@ -861,7 +852,7 @@ h3 {
   overflow: hidden;
 }
 .char-glyph {
-  font-size: 1.1rem;
+  font-size: var(--fs-medium);
   min-width: 1.4rem;
   text-align: center;
   /* An invisible character would otherwise collapse its cell, so the
@@ -869,17 +860,14 @@ h3 {
   border: 1px dashed transparent;
 }
 .char-grid button:hover .char-glyph {
-  border-color: #bbb;
+  border-color: var(--border-strong);
 }
 .char-name {
-  font-size: 0.74rem;
+  font-size: var(--fs-micro);
   opacity: 0.7;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-@media (prefers-color-scheme: dark) {
-  .char-picker { border-color: #3a3d44; }
 }
 
 </style>

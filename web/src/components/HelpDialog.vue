@@ -106,7 +106,7 @@ const readerShortcuts = computed(() =>
 }
 .help-group h4 {
   margin: 0 0 0.3rem;
-  font-size: 0.78rem;
+  font-size: var(--fs-small);
   letter-spacing: 0.08em;
   text-transform: uppercase;
   opacity: 0.6;
@@ -122,27 +122,22 @@ const readerShortcuts = computed(() =>
   gap: 0.6rem;
   align-items: baseline;
   padding: 0.15rem 0;
-  font-size: 0.87rem;
+  font-size: var(--fs-small);
 }
 .help-nokey {
   opacity: 0.35;
 }
 .help-note {
   opacity: 0.6;
-  font-size: 0.85em;
+  font-size: var(--fs-small);
 }
 kbd {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 0.8em;
-  border: 1px solid #ccc;
+  font-size: var(--fs-small);
+  border: 1px solid var(--border);
   border-bottom-width: 2px;
   border-radius: 3px;
   padding: 0.05em 0.4em;
   justify-self: start;
-}
-@media (prefers-color-scheme: dark) {
-  kbd {
-    border-color: #4a4d55;
-  }
 }
 </style>

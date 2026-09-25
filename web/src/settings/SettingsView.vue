@@ -643,7 +643,7 @@ async function toggleAutoReopen() {
   flex-direction: column;
   gap: 0.75em;
   padding: 1em;
-  border: 1px solid #ddd;
+  border: 1px solid var(--border);
   border-radius: 6px;
 }
 .pane h3 {
@@ -685,7 +685,7 @@ async function toggleAutoReopen() {
 }
 .plugin-preview,
 .plugin-row {
-  border: 1px solid #ddd;
+  border: 1px solid var(--border);
   border-radius: 4px;
   padding: 0.75em;
 }
@@ -714,31 +714,31 @@ async function toggleAutoReopen() {
 }
 .plugin-version,
 .plugin-meta {
-  font-size: 0.85em;
-  color: #666;
+  font-size: var(--fs-small);
+  color: var(--fg-muted);
   font-weight: normal;
 }
 .plugin-safe {
-  color: #1b7f3a;
-  font-size: 0.85em;
+  color: var(--success);
+  font-size: var(--fs-small);
 }
 .plugin-warn {
-  color: #a05a00;
-  font-size: 0.85em;
+  color: var(--warning);
+  font-size: var(--fs-small);
 }
 .plugin-grants ul {
   margin: 0.25em 0 0.5em 1.2em;
   padding: 0;
-  font-size: 0.9em;
+  font-size: var(--fs-body);
 }
 .delete {
-  color: #b00020;
+  color: var(--danger);
 }
 .error {
-  color: #b00020;
+  color: var(--danger);
 }
 .saved {
-  color: #1b7f3a;
+  color: var(--success);
 }
 /* Plugin catalog (#1.14). */
 .plugin-catalog {
@@ -746,7 +746,7 @@ async function toggleAutoReopen() {
 }
 .plugin-catalog h4 {
   margin: 0 0 0.3rem;
-  font-size: 0.8rem;
+  font-size: var(--fs-small);
   letter-spacing: 0.08em;
   text-transform: uppercase;
   opacity: 0.6;
@@ -762,8 +762,8 @@ async function toggleAutoReopen() {
   gap: 0.6rem;
   align-items: baseline;
   padding: 0.25rem 0;
-  border-bottom: 1px solid #eee;
-  font-size: 0.87rem;
+  border-bottom: 1px solid var(--border);
+  font-size: var(--fs-small);
 }
 .catalog-name {
   font-weight: 600;
@@ -780,12 +780,7 @@ async function toggleAutoReopen() {
 }
 .catalog-installed {
   opacity: 0.55;
-  font-size: 0.85em;
-}
-@media (prefers-color-scheme: dark) {
-  .catalog-row {
-    border-bottom-color: #2b3037;
-  }
+  font-size: var(--fs-small);
 }
 
 /* Colouring rules (#4.1). */
@@ -806,7 +801,7 @@ async function toggleAutoReopen() {
 .coloring-template {
   flex: 1;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 0.82rem;
+  font-size: var(--fs-small);
 }
 
 </style>

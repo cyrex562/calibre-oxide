@@ -157,7 +157,7 @@ async function save() {
   z-index: 10;
 }
 .panel {
-  background: #fff;
+  background: var(--bg);
   border-radius: 6px;
   padding: 1.5em;
   max-width: 640px;
@@ -175,7 +175,7 @@ async function save() {
   right: 0.5em;
   border: none;
   background: none;
-  font-size: 1.1em;
+  font-size: var(--fs-medium);
   cursor: pointer;
 }
 h3 {
@@ -189,12 +189,12 @@ h3 {
   max-width: 100%;
 }
 .note-edit {
-  border: 1px solid #ccc;
+  border: 1px solid var(--border);
   border-radius: 4px;
   padding: 0.5em;
 }
 .note-edit:focus {
-  outline: 2px solid #2a6df4;
+  outline: 2px solid var(--accent);
 }
 .hidden-file-input {
   display: none;
@@ -205,14 +205,14 @@ h3 {
   flex-wrap: wrap;
 }
 .read {
-  background: #2a6df4;
-  color: #fff;
+  background: var(--accent);
+  color: var(--fg-on-accent);
   border: none;
   padding: 0.5em 1em;
   border-radius: 4px;
   cursor: pointer;
 }
 .error {
-  color: #b00020;
+  color: var(--danger);
 }
 </style>

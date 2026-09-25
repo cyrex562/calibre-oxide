@@ -112,8 +112,8 @@ watch(() => [props.x, props.y, props.entries], reposition, { flush: "post" });
   z-index: 1000;
   min-width: 190px;
   padding: 0.25rem;
-  background: #fff;
-  border: 1px solid #ccc;
+  background: var(--bg);
+  border: 1px solid var(--border);
   border-radius: 6px;
   box-shadow: 0 6px 20px rgb(0 0 0 / 18%);
   display: flex;
@@ -129,13 +129,13 @@ watch(() => [props.x, props.y, props.entries], reposition, { flush: "post" });
   cursor: pointer;
   padding: 0.35rem 0.7rem;
   border-radius: 4px;
-  font-size: 0.9rem;
+  font-size: var(--fs-body);
   white-space: nowrap;
 }
 
 .item:hover:not(:disabled),
 .item:focus-visible {
-  background: #e8f0fe;
+  background: var(--accent-soft);
 }
 
 .item:disabled {
@@ -145,28 +145,15 @@ watch(() => [props.x, props.y, props.entries], reposition, { flush: "post" });
 
 .sep {
   border: none;
-  border-top: 1px solid #e0e0e0;
+  border-top: 1px solid var(--border);
   margin: 0.25rem 0.3rem;
 }
 
 .empty {
   margin: 0;
   padding: 0.35rem 0.7rem;
-  font-size: 0.85rem;
+  font-size: var(--fs-small);
   opacity: 0.6;
 }
 
-@media (prefers-color-scheme: dark) {
-  .context-menu {
-    background: #24262b;
-    border-color: #3a3d44;
-  }
-  .item:hover:not(:disabled),
-  .item:focus-visible {
-    background: #31404f;
-  }
-  .sep {
-    border-top-color: #3a3d44;
-  }
-}
 </style>

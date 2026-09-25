@@ -110,8 +110,8 @@ onMounted(load);
   gap: 0.6rem;
   align-items: baseline;
   padding: 0.35rem 0;
-  border-bottom: 1px solid #eee;
-  font-size: 0.86rem;
+  border-bottom: 1px solid var(--border);
+  font-size: var(--fs-small);
 }
 .annot-book {
   all: unset;
@@ -126,7 +126,7 @@ onMounted(load);
 }
 .annot-type {
   opacity: 0.6;
-  font-size: 0.8em;
+  font-size: var(--fs-small);
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
@@ -138,10 +138,5 @@ onMounted(load);
   opacity: 0.6;
   font-variant-numeric: tabular-nums;
   text-align: right;
-}
-@media (prefers-color-scheme: dark) {
-  .annot-row {
-    border-bottom-color: #2b3037;
-  }
 }
 </style>

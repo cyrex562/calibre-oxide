@@ -191,14 +191,14 @@ const scopeLabel = computed(() => (props.bookIds.length > 0 ? `${props.bookIds.l
 .preview {
   max-height: 40vh;
   overflow-y: auto;
-  border-top: 1px solid #ddd;
+  border-top: 1px solid var(--border);
   padding-top: 0.5rem;
 }
 .preview-list {
   list-style: none;
   margin: 0;
   padding: 0;
-  font-size: 0.85rem;
+  font-size: var(--fs-small);
 }
 .preview-list li {
   display: grid;
@@ -206,7 +206,7 @@ const scopeLabel = computed(() => (props.bookIds.length > 0 ? `${props.bookIds.l
   gap: 0.5rem;
   align-items: baseline;
   padding: 0.2rem 0;
-  border-bottom: 1px solid #f0f0f0;
+  border-bottom: 1px solid var(--border);
 }
 .preview-title {
   font-weight: 600;
@@ -220,13 +220,5 @@ const scopeLabel = computed(() => (props.bookIds.length > 0 ? `${props.bookIds.l
 }
 .preview-arrow {
   opacity: 0.5;
-}
-@media (prefers-color-scheme: dark) {
-  .preview {
-    border-top-color: #3a3d44;
-  }
-  .preview-list li {
-    border-bottom-color: #2b3037;
-  }
 }
 </style>

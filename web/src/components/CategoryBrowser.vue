@@ -113,7 +113,7 @@ async function renameItem(item: CategoryItem) {
 .cat-heading {
   margin: 0;
   padding: 0.5em 0.6em 0.4em;
-  font-size: 0.75rem;
+  font-size: var(--fs-micro);
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.06em;
@@ -121,7 +121,7 @@ async function renameItem(item: CategoryItem) {
 }
 .cat-empty {
   padding: 0 0.6em;
-  font-size: 0.85em;
+  font-size: var(--fs-small);
   opacity: 0.7;
   line-height: 1.4;
 }
@@ -154,11 +154,11 @@ ul {
 .note-btn {
   flex-shrink: 0;
   background: none;
-  border: 1px solid #ccc;
+  border: 1px solid var(--border);
   border-radius: 4px;
   padding: 0.15em 0.5em;
   margin-right: 0.4em;
-  font-size: 0.8em;
+  font-size: var(--fs-small);
   cursor: pointer;
 }
 .cat-toggle {
@@ -168,11 +168,11 @@ ul {
   padding-left: 0.75em;
 }
 .count {
-  color: #888;
-  font-size: 0.85em;
+  color: var(--fg-faint);
+  font-size: var(--fs-small);
 }
 .error {
-  color: #b00020;
+  color: var(--danger);
   padding: 0.5em;
 }
 </style>

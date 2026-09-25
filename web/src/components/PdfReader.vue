@@ -167,14 +167,14 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 0.5rem;
   padding: 0.4rem 0.6rem;
-  border-bottom: 1px solid #ddd;
+  border-bottom: 1px solid var(--border);
   flex-wrap: wrap;
 }
 .pdf-page {
   display: inline-flex;
   align-items: center;
   gap: 0.3rem;
-  font-size: 0.85rem;
+  font-size: var(--fs-small);
 }
 .pdf-page input {
   width: 5rem;
@@ -187,13 +187,13 @@ onBeforeUnmount(() => {
 }
 .pdf-scale {
   font-variant-numeric: tabular-nums;
-  font-size: 0.85rem;
+  font-size: var(--fs-small);
   min-width: 3.5rem;
   text-align: center;
 }
 .pdf-progress {
   margin-left: auto;
-  font-size: 0.85rem;
+  font-size: var(--fs-small);
   opacity: 0.7;
   font-variant-numeric: tabular-nums;
 }
@@ -205,15 +205,14 @@ onBeforeUnmount(() => {
   justify-content: center;
   align-items: flex-start;
   padding: 1rem;
+  /* Deliberately not a token. A PDF page is white paper, and every
+     PDF viewer surrounds it with the same neutral grey in light and
+     dark alike -- following the app theme here would make the page
+     itself look wrong rather than making the viewer look integrated. */
   background: #525659;
 }
 canvas {
   box-shadow: 0 2px 10px rgb(0 0 0 / 35%);
-  background: #fff;
-}
-@media (prefers-color-scheme: dark) {
-  .pdf-toolbar {
-    border-bottom-color: #3a3d44;
-  }
+  background: var(--bg);
 }
 </style>

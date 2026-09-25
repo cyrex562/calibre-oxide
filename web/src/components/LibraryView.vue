@@ -2307,7 +2307,7 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
   flex-direction: column;
   gap: 0.35em;
   padding: 0.4em 0.5em;
-  border-bottom: 1px solid #ddd;
+  border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
 .toolbar-row {
@@ -2341,17 +2341,17 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
   display: inline-flex;
   align-items: center;
   gap: 0.25em;
-  background: #eef2fb;
+  background: var(--accent-soft);
   border-radius: 4px;
   padding: 0.2em 0.4em;
-  font-size: 0.85em;
+  font-size: var(--fs-small);
 }
 .sort-chip-remove {
   background: none;
   border: none;
   cursor: pointer;
   padding: 0;
-  font-size: 0.9em;
+  font-size: var(--fs-body);
   line-height: 1;
 }
 .search {
@@ -2378,7 +2378,7 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
   flex-shrink: 0;
   min-height: 0;
   overflow: hidden;
-  border-left: 1px solid #ddd;
+  border-left: 1px solid var(--border);
 }
 /* A thin, full-height grab strip between panels. It is deliberately
    wider on hover than at rest: 4px is the right visual weight for a
@@ -2387,23 +2387,23 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
 .splitter {
   flex: 0 0 4px;
   cursor: col-resize;
-  background: #ddd;
+  background: var(--border);
   transition: background 0.12s ease;
   touch-action: none;
 }
 .splitter:hover,
 .splitter:active {
-  background: #2a6df4;
+  background: var(--accent);
 }
 .status-bar {
   display: flex;
   align-items: center;
   gap: 0.75em;
   padding: 0.3em 0.75em;
-  border-top: 1px solid #ddd;
-  font-size: 0.85em;
+  border-top: 1px solid var(--border);
+  font-size: var(--fs-small);
   flex-shrink: 0;
-  background: #f5f5f5;
+  background: var(--bg-bar);
 }
 .status-spacer {
   flex: 1;
@@ -2416,7 +2416,7 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
    most likely headed next. */
 .status-library {
   padding: 0.1em 0.5em;
-  font-size: 0.95em;
+  font-size: var(--fs-body);
   max-width: 28ch;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2430,19 +2430,7 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
 }
 .status-toggle {
   padding: 0.15em 0.6em;
-  font-size: 0.95em;
-}
-@media (prefers-color-scheme: dark) {
-  .splitter {
-    background: #3a3d44;
-  }
-  .status-bar {
-    background: #22262c;
-    border-top-color: #3a3d44;
-  }
-  .details-column {
-    border-left-color: #3a3d44;
-  }
+  font-size: var(--fs-body);
 }
 .grid-area {
   flex: 1;
@@ -2487,7 +2475,7 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
   position: relative;
 }
 .card.selected img {
-  outline: 3px solid #2a6df4;
+  outline: 3px solid var(--accent);
   outline-offset: -3px;
 }
 .card-checkbox {
@@ -2505,15 +2493,15 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
 }
 .card-title {
   font-weight: 600;
-  font-size: 0.85em;
+  font-size: var(--fs-small);
   margin-top: 0.25em;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 .card-authors {
-  font-size: 0.8em;
-  color: #666;
+  font-size: var(--fs-small);
+  color: var(--fg-muted);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2530,7 +2518,7 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
   padding: 1em;
 }
 .error {
-  color: #b00020;
+  color: var(--danger);
 }
 .add-error,
 .add-summary {
@@ -2540,13 +2528,13 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
   display: none;
 }
 .toolbar button.active {
-  background: #2a6df4;
-  color: #fff;
-  border-color: #2a6df4;
+  background: var(--accent);
+  color: var(--fg-on-accent);
+  border-color: var(--accent);
 }
 .settings-link {
   padding: 0.35em 0.7em;
-  border: 1px solid #ccc;
+  border: 1px solid var(--border);
   border-radius: 4px;
   color: inherit;
   text-decoration: none;
@@ -2559,7 +2547,7 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
   align-items: flex-start;
 }
 .fts-indexing {
-  color: #a06a00;
+  color: var(--warning);
 }
 .fts-results {
   list-style: none;
@@ -2570,11 +2558,11 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
 }
 .fts-result {
   padding: 0.75em;
-  border-bottom: 1px solid #eee;
+  border-bottom: 1px solid var(--border);
   cursor: pointer;
 }
 .fts-result:hover {
-  background: #f7f7f7;
+  background: var(--bg-sunken);
 }
 .fts-result-header {
   display: flex;
@@ -2586,29 +2574,29 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
   font-weight: 600;
 }
 .fts-result-authors {
-  color: #666;
-  font-size: 0.9em;
+  color: var(--fg-muted);
+  font-size: var(--fs-body);
 }
 .fts-result-formats {
-  color: #999;
-  font-size: 0.8em;
+  color: var(--fg-faint);
+  font-size: var(--fs-small);
   text-transform: uppercase;
   margin-left: auto;
 }
 .fts-snippet {
   margin: 0.4em 0 0;
-  font-size: 0.9em;
-  color: #444;
+  font-size: var(--fs-body);
+  color: var(--fg-muted);
 }
 .fts-snippet mark {
-  background: #fff3a0;
+  background: var(--highlight);
   color: inherit;
   padding: 0 0.1em;
 }
 .bulk-panel {
   padding: 0.75em 1em;
-  background: #f7f7f7;
-  border-bottom: 1px solid #ddd;
+  background: var(--bg-sunken);
+  border-bottom: 1px solid var(--border);
 }
 .bulk-row {
   display: flex;
@@ -2619,15 +2607,15 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
 .bulk-row label {
   display: flex;
   flex-direction: column;
-  font-size: 0.85em;
-  color: #555;
+  font-size: var(--fs-small);
+  color: var(--fg-muted);
   gap: 0.2em;
 }
 .bulk-row input[type="text"],
 .bulk-row input:not([type]) {
   font: inherit;
   padding: 0.35em 0.5em;
-  border: 1px solid #ccc;
+  border: 1px solid var(--border);
   border-radius: 4px;
 }
 .bulk-rating {
@@ -2655,7 +2643,7 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
   z-index: 10;
 }
 .manage-panel {
-  background: #fff;
+  background: var(--bg);
   border-radius: 6px;
   padding: 1.5em;
   max-width: 560px;
@@ -2673,7 +2661,7 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
   right: 0.5em;
   border: none;
   background: none;
-  font-size: 1.1em;
+  font-size: var(--fs-medium);
   cursor: pointer;
 }
 .manage-panel h3 {
@@ -2697,15 +2685,15 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
   flex-shrink: 0;
 }
 .manage-query {
-  color: #666;
-  font-size: 0.85em;
+  color: var(--fg-muted);
+  font-size: var(--fs-small);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   flex: 1;
 }
 .manage-remove {
-  color: #b00020;
+  color: var(--danger);
 }
 .manage-form {
   display: flex;
@@ -2715,35 +2703,35 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
   flex: 1;
   font: inherit;
   padding: 0.35em 0.5em;
-  border: 1px solid #ccc;
+  border: 1px solid var(--border);
   border-radius: 4px;
 }
 .news-panel {
   max-width: 480px;
 }
 .news-hint {
-  color: #666;
-  font-size: 0.9em;
+  color: var(--fg-muted);
+  font-size: var(--fs-body);
   margin: 0;
 }
 .news-field {
   display: flex;
   flex-direction: column;
   gap: 0.3em;
-  font-size: 0.85em;
-  color: #555;
+  font-size: var(--fs-small);
+  color: var(--fg-muted);
   margin-bottom: 0.75em;
 }
 .news-field input,
 .news-field textarea {
   font: inherit;
   padding: 0.35em 0.5em;
-  border: 1px solid #ccc;
+  border: 1px solid var(--border);
   border-radius: 4px;
   resize: vertical;
 }
 .news-done {
-  color: #2a7f2a;
+  color: var(--success);
   margin: 0.6em 0 0;
 }
 /* View toggle + column picker (issue 1.1). */
@@ -2782,7 +2770,7 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
   flex: 1;
 }
 .hint.inline {
-  font-size: 0.8em;
+  font-size: var(--fs-small);
   opacity: 0.7;
 }
 
@@ -2797,7 +2785,7 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
   display: flex;
   flex-direction: column;
   gap: 0.2rem;
-  font-size: 0.85rem;
+  font-size: var(--fs-small);
 }
 .bulk-field > span {
   opacity: 0.8;
@@ -2817,13 +2805,13 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
   gap: 0.35rem;
 }
 .bulk-replace {
-  border: 1px solid #ddd;
+  border: 1px solid var(--border);
   border-radius: 4px;
   padding: 0.5rem 0.75rem 0.75rem;
   margin-bottom: 0.75rem;
 }
 .bulk-replace legend {
-  font-size: 0.8rem;
+  font-size: var(--fs-small);
   opacity: 0.75;
   padding: 0 0.3rem;
 }
@@ -2831,13 +2819,8 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
   display: inline-flex;
   align-items: center;
   gap: 0.3rem;
-  font-size: 0.85rem;
+  font-size: var(--fs-small);
   white-space: nowrap;
-}
-@media (prefers-color-scheme: dark) {
-  .bulk-replace {
-    border-color: #3a3d44;
-  }
 }
 
 /* Marks (#1.5). */
@@ -2846,11 +2829,11 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
   align-items: center;
   gap: 0.35rem;
   padding: 0.15rem 0.45rem;
-  border: 1px solid #c8c8c8;
+  border: 1px solid var(--border-strong);
   border-radius: 4px;
 }
 .marks-count {
-  font-size: 0.82rem;
+  font-size: var(--fs-small);
   opacity: 0.8;
   white-space: nowrap;
 }
@@ -2858,14 +2841,9 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
   position: absolute;
   top: 4px;
   left: 6px;
-  color: #d97706;
-  font-size: 0.9rem;
+  color: var(--mark);
+  font-size: var(--fs-body);
   text-shadow: 0 0 3px rgb(0 0 0 / 45%);
-}
-@media (prefers-color-scheme: dark) {
-  .marks-indicator {
-    border-color: #3a3d44;
-  }
 }
 
 </style>

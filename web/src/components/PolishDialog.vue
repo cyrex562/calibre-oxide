@@ -142,18 +142,18 @@ async function run() {
 }
 .hint.inline {
   display: block;
-  font-size: 0.78em;
+  font-size: var(--fs-small);
   opacity: 0.65;
   margin-left: 1.5rem;
 }
 .polish-css {
-  border: 1px solid #ddd;
+  border: 1px solid var(--border);
   border-radius: 4px;
   padding: 0.4rem 0.7rem 0.6rem;
   margin-bottom: 0.6rem;
 }
 .polish-css legend {
-  font-size: 0.8rem;
+  font-size: var(--fs-small);
   opacity: 0.75;
 }
 .polish-buttons {
@@ -167,25 +167,17 @@ async function run() {
   padding: 0;
   max-height: 34vh;
   overflow-y: auto;
-  font-size: 0.85rem;
+  font-size: var(--fs-small);
 }
 .polish-results li {
   display: flex;
   gap: 0.6rem;
   padding: 0.2rem 0;
-  border-bottom: 1px solid #f0f0f0;
+  border-bottom: 1px solid var(--border);
 }
 .polish-report {
   opacity: 0.75;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-@media (prefers-color-scheme: dark) {
-  .polish-css {
-    border-color: #3a3d44;
-  }
-  .polish-results li {
-    border-bottom-color: #2b3037;
-  }
 }
 </style>

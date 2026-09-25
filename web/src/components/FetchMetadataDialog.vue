@@ -275,7 +275,7 @@ async function applyPicked() {
   z-index: 10;
 }
 .panel {
-  background: #fff;
+  background: var(--bg);
   border-radius: 6px;
   padding: 1.5em;
   width: 90%;
@@ -293,15 +293,15 @@ async function applyPicked() {
   right: 0.5em;
   border: none;
   background: none;
-  font-size: 1.1em;
+  font-size: var(--fs-medium);
   cursor: pointer;
 }
 h3 {
   margin: 0;
 }
 .hint {
-  color: #888;
-  font-size: 0.85em;
+  color: var(--fg-faint);
+  font-size: var(--fs-small);
   margin: 0;
 }
 .search-form {
@@ -314,7 +314,7 @@ h3 {
   display: flex;
   flex-direction: column;
   gap: 0.25em;
-  font-size: 0.85em;
+  font-size: var(--fs-small);
 }
 .candidates {
   list-style: none;
@@ -328,7 +328,7 @@ h3 {
   display: flex;
   align-items: center;
   gap: 0.75em;
-  border: 1px solid #ddd;
+  border: 1px solid var(--border);
   border-radius: 4px;
   padding: 0.5em;
 }
@@ -337,7 +337,7 @@ h3 {
   height: 58px;
   object-fit: cover;
   flex-shrink: 0;
-  background: #eee;
+  background: var(--bg-hover);
 }
 .candidate-body {
   flex: 1;
@@ -348,25 +348,25 @@ h3 {
 }
 .candidate-authors,
 .candidate-source {
-  font-size: 0.85em;
-  color: #666;
+  font-size: var(--fs-small);
+  color: var(--fg-muted);
 }
 .back {
   align-self: flex-start;
   border: none;
   background: none;
   cursor: pointer;
-  color: #2563eb;
+  color: var(--accent);
   padding: 0;
 }
 .picker {
   border-collapse: collapse;
   width: 100%;
-  font-size: 0.9em;
+  font-size: var(--fs-body);
 }
 .picker th,
 .picker td {
-  border: 1px solid #ddd;
+  border: 1px solid var(--border);
   padding: 0.4em 0.5em;
   text-align: left;
   vertical-align: top;
@@ -376,9 +376,9 @@ h3 {
   overflow-wrap: anywhere;
 }
 .error {
-  color: #b00020;
+  color: var(--danger);
 }
 .saved {
-  color: #1b7f3a;
+  color: var(--success);
 }
 </style>
