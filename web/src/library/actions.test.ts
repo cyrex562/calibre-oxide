@@ -201,3 +201,43 @@ describe("what the toolbar renders", () => {
     expect(visibleToolbarActions({ handled: [], hidden: [], ctx: DESKTOP })).toEqual([]);
   });
 });
+
+describe("primary toolbar actions", () => {
+  // The toolbar renders `primary` actions inline and the rest behind an
+  // overflow. Before that split, all fourteen library actions rendered
+  // inline and wrapped onto three rows, costing ~160px of vertical
+  // space above the book list.
+  it("marks only a handful as primary, so the toolbar stays one row", () => {
+    const primary = LIBRARY_ACTIONS.filter((a) => a.primary);
+    expect(primary.length).toBeGreaterThan(0);
+    expect(primary.length).toBeLessThanOrEqual(8);
+  });
+
+  it("only offers a permanent slot to something the toolbar shows at all", () => {
+    for (const action of LIBRARY_ACTIONS.filter((a) => a.primary)) {
+      expect(action.toolbar, `${action.id} is primary but not toolbar-eligible`).not.toBe(false);
+    }
+  });
+
+  // A book action's availability depends on the selection, so pinning
+  // one to the toolbar would give it a slot that is disabled most of
+  // the time.
+  it("keeps selection-dependent actions out of the permanent set", () => {
+    for (const action of LIBRARY_ACTIONS.filter((a) => a.primary)) {
+      expect(action.requires, `${action.id} is primary but needs a selection`).toBe("none");
+    }
+  });
+
+  it("splits the toolbar set cleanly in two, losing nothing", () => {
+    const shown = visibleToolbarActions({
+      handled: LIBRARY_ACTIONS.map((a) => a.id),
+      hidden: [],
+      ctx: DESKTOP,
+    });
+    const primary = shown.filter((a) => a.primary);
+    const overflow = shown.filter((a) => !a.primary);
+    expect(primary.length + overflow.length).toBe(shown.length);
+    // Every action still reachable from one surface or the other.
+    expect(new Set([...primary, ...overflow].map((a) => a.id)).size).toBe(shown.length);
+  });
+});

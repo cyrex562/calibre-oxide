@@ -153,8 +153,16 @@ function onRowKeydown(event: KeyboardEvent, bookId: number) {
   drags the toolbar and sidebar off-screen with it.
 */
 .table-scroll {
-  overflow-x: auto;
-  overflow-y: visible;
+  /* Fills the column and scrolls inside itself, both axes.
+     Without `flex: 1` the table sizes to its own content, so an empty
+     or short library left the list hugging the top of the window with
+     a screen of dead space under it, and the pagination stranded in
+     the middle. `min-height: 0` is what actually permits the shrink --
+     a flex item defaults to `min-height: auto` and refuses to go below
+     its content, which silently defeats the overflow. */
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
   width: 100%;
 }
 

@@ -82,8 +82,17 @@ async function renameItem(item: CategoryItem) {
 
 <template>
   <nav class="category-browser">
+    <h2 class="cat-heading">Categories</h2>
     <p v-if="error" class="error">{{ error }}</p>
     <p v-if="renameError" class="error">{{ renameError }}</p>
+    <!--
+      An empty library still gets a panel that reads as a panel. With
+      nothing here at all the column was simply blank, which looks like
+      a failed render rather than an empty library.
+    -->
+    <p v-if="!error && categories.length === 0" class="cat-empty">
+      Nothing to browse yet. Authors, series and tags appear here once the library has books.
+    </p>
     <ul>
       <li v-for="cat in categories" :key="cat.url">
         <button class="cat-toggle" @click="toggle(cat)">{{ cat.name }}</button>
@@ -101,6 +110,21 @@ async function renameItem(item: CategoryItem) {
 </template>
 
 <style scoped>
+.cat-heading {
+  margin: 0;
+  padding: 0.5em 0.6em 0.4em;
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  opacity: 0.6;
+}
+.cat-empty {
+  padding: 0 0.6em;
+  font-size: 0.85em;
+  opacity: 0.7;
+  line-height: 1.4;
+}
 .category-browser {
   overflow: auto;
 }

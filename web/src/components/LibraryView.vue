@@ -1277,6 +1277,45 @@ const toolbarActions = computed<LibraryAction[]>(() =>
   }),
 );
 
+/**
+ * The actions that get a permanent toolbar slot.
+ *
+ * Splitting the registry's toolbar set rather than capping it by count:
+ * which actions matter is a property of the action, not of how many
+ * happen to precede it, and a count would reshuffle the toolbar as
+ * availability changes with the selection.
+ */
+const primaryToolbarActions = computed<LibraryAction[]>(() => toolbarActions.value.filter((a) => a.primary));
+
+/** Everything else, reached through the overflow menu. */
+const overflowToolbarActions = computed<LibraryAction[]>(() => toolbarActions.value.filter((a) => !a.primary));
+
+/**
+ * Opens the overflow beneath its button.
+ *
+ * Reuses `ContextMenu` -- the same component the right-click menu uses,
+ * reading the same registry, so an action cannot appear in one place
+ * and behave differently in the other.
+ */
+const toolbarMenu = ref<{ x: number; y: number } | null>(null);
+
+/** Overflow entries, in the shape `ContextMenu` already renders. */
+const toolbarMenuEntries = computed(() =>
+  overflowToolbarActions.value.map((a) => ({ id: a.id, label: actionLabel(a), enabled: !actionBusy(a) })),
+);
+
+function openToolbarOverflow(event: MouseEvent) {
+  const box = (event.currentTarget as HTMLElement).getBoundingClientRect();
+  // Anchored below the button rather than at the pointer: a menu tied
+  // to the control it belongs to stays put wherever the click landed.
+  toolbarMenu.value = { x: box.left, y: box.bottom };
+}
+
+function onToolbarMenuChoose(id: LibraryActionId) {
+  toolbarMenu.value = null;
+  runAction(id);
+}
+
 function runAction(id: LibraryActionId) {
   const handler = actionHandlers[id];
   if (!handler) return;
@@ -1604,6 +1643,7 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
 <template>
   <div class="library">
     <header class="toolbar">
+      <div class="toolbar-row toolbar-find">
       <form class="search" @submit.prevent="submitSearch">
         <input ref="searchInput" v-model="queryText" type="search" :placeholder="ftsMode ? 'Search book contents…' : 'Search…'" />
         <button type="submit">Search</button>
@@ -1646,6 +1686,9 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
         <button v-if="viewMode === 'table'" type="button" @click="columnPickerOpen = true">Columns…</button>
       </template>
 
+      </div>
+
+      <div class="toolbar-row toolbar-actions">
       <!--
         Every action button comes from the registry (#817). Before
         this there were thirteen near-identical hardcoded buttons,
@@ -1655,7 +1698,7 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
         from it too is what keeps those four surfaces in agreement.
       -->
       <button
-        v-for="action in toolbarActions"
+        v-for="action in primaryToolbarActions"
         :key="action.id"
         type="button"
         :style="{ order: toolbarActionOrder(action.id) }"
@@ -1679,8 +1722,18 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
         </button>
         <button type="button" title="Clear all marks" @click="clearMarks">Clear</button>
       </span>
+      <!--
+        Overflow, so the toolbar stays one row. calibre does the same;
+        rendering all fourteen library actions inline cost three
+        wrapped rows before any book was on screen.
+      -->
+      <button v-if="overflowToolbarActions.length" type="button" class="toolbar-more" @click="openToolbarOverflow">
+        More ▾
+      </button>
+      <span class="toolbar-gap"></span>
       <input ref="addInput" type="file" multiple class="hidden-file-input" @change="onAddFileSelected" />
       <router-link to="/settings" class="settings-link">Settings…</router-link>
+      </div>
     </header>
 
     <div v-if="bulkOpen" class="bulk-panel">
@@ -1905,6 +1958,8 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
     <MapperDialog v-if="mapperOpen" :book-ids="mapperScope" @close="mapperOpen = false" @applied="onMapperApplied" />
 
     <ContextMenu v-if="contextMenu" :x="contextMenu.x" :y="contextMenu.y" :entries="contextEntries" @choose="onContextChoose" @close="contextMenu = null" />
+
+    <ContextMenu v-if="toolbarMenu" :x="toolbarMenu.x" :y="toolbarMenu.y" :entries="toolbarMenuEntries" @choose="onToolbarMenuChoose" @close="toolbarMenu = null" />
 
     <NoteEditor v-if="noteTarget" :field="noteTarget.field" :item-name="noteTarget.itemName" @close="noteTarget = null" />
 
@@ -2156,13 +2211,39 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
   flex-direction: column;
   height: 100vh;
 }
+/* Two purposeful rows rather than one wrapping flex: a wrapping
+   toolbar reflows as buttons come and go with the selection, so the
+   list jumps down the screen while you are reading it. Fixed rows keep
+   the content below at a constant height. */
 .toolbar {
   display: flex;
-  align-items: center;
-  gap: 0.5em;
-  padding: 0.5em;
+  flex-direction: column;
+  gap: 0.35em;
+  padding: 0.4em 0.5em;
   border-bottom: 1px solid #ddd;
-  flex-wrap: wrap;
+  flex-shrink: 0;
+}
+.toolbar-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4em;
+  /* One line each. Anything that does not fit scrolls rather than
+     wrapping onto a new row. */
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.toolbar-row > * {
+  flex-shrink: 0;
+}
+/* Pushes Settings to the far end, the way a toolbar's least-used
+   control usually sits. */
+.toolbar-gap {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.toolbar-more {
+  font-weight: 600;
 }
 .sort-fields {
   display: flex;
@@ -2271,10 +2352,25 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
      shrink below its content, so a wide book table pushes the details
      column out of the window rather than scrolling within its own. */
   min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
-  overflow: auto;
+  /* `hidden`, not `auto`: the list scrolls inside itself so the
+     pagination below it stays put instead of scrolling away. */
+  overflow: hidden;
   padding: 0.5em;
+}
+/* The grid view is the other thing that fills this column. */
+.grid-area > .grid {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+/* Pinned to the bottom of the column rather than sitting directly
+   under a short list. */
+.pagination {
+  margin-top: auto;
+  flex-shrink: 0;
 }
 .grid {
   display: grid;

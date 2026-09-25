@@ -73,6 +73,16 @@ export interface LibraryAction {
    * (`group: "book"`) are never toolbar-eligible.
    */
   toolbar?: boolean;
+  /**
+   * Show inline on the toolbar rather than behind its overflow menu.
+   *
+   * Rendering all fourteen library actions inline wrapped the toolbar
+   * onto three rows and cost ~160px of vertical space before a single
+   * book was visible. calibre keeps one row and puts the rest behind an
+   * overflow, so this marks the handful that earn a permanent slot;
+   * everything else is one click away and nothing is lost.
+   */
+  primary?: boolean;
   /** Offered in a book's right-click context menu (#1.2). */
   contextMenu?: boolean;
 }
@@ -133,18 +143,18 @@ export type LibraryActionId =
 export const LIBRARY_ACTIONS: LibraryAction[] = [
   { id: "manage-lists", label: "Manage lists…", group: "library", requires: "none", toolbar: true },
   { id: "custom-columns", label: "Custom columns…", group: "library", requires: "none", toolbar: true },
-  { id: "check-library", label: "Check library…", group: "library", requires: "none", toolbar: true },
-  { id: "find-duplicates", label: "Find duplicates…", group: "library", requires: "none", toolbar: true },
+  { id: "check-library", label: "Check library…", group: "library", requires: "none", toolbar: true, primary: true },
+  { id: "find-duplicates", label: "Find duplicates…", group: "library", requires: "none", toolbar: true, primary: true },
   { id: "map-metadata", label: "Map authors/tags…", group: "library", requires: "none", toolbar: true },
   { id: "browse-annotations", label: "Annotations…", group: "library", requires: "none", toolbar: true },
   { id: "pick-random", label: "Random book", group: "library", requires: "none", toolbar: true },
   { id: "help", label: "Help…", group: "library", requires: "none", toolbar: true },
   { id: "export-catalog", label: "Export catalog…", group: "library", requires: "none", toolbar: true },
   { id: "export-library-archive", label: "Export library archive…", group: "library", requires: "none", toolbar: true },
-  { id: "fetch-news", label: "Fetch news…", group: "library", requires: "none", toolbar: true },
-  { id: "add-books", label: "Add Books…", group: "library", requires: "none", toolbar: true },
-  { id: "add-folder", label: "Add Folder…", group: "library", requires: "none", toolbar: true, desktopOnly: true },
-  { id: "switch-library", label: "Switch library…", group: "library", requires: "none", toolbar: true, desktopOnly: true },
+  { id: "fetch-news", label: "Fetch news…", group: "library", requires: "none", toolbar: true, primary: true },
+  { id: "add-books", label: "Add Books…", group: "library", requires: "none", toolbar: true, primary: true },
+  { id: "add-folder", label: "Add Folder…", group: "library", requires: "none", toolbar: true, desktopOnly: true, primary: true },
+  { id: "switch-library", label: "Switch library…", group: "library", requires: "none", toolbar: true, desktopOnly: true, primary: true },
 
   { id: "select-mode", label: "Select…", group: "view", requires: "none" },
   // Marks are the thing selection is not: they survive a new search,
