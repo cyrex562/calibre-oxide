@@ -15,6 +15,7 @@ import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LI
 import type { CheckLibraryResult, CustomRecipeOptions, DuplicateBook, NewsFeedInput, NewsSchedule, SaveToDiskResult } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
 import { similarBooksQuery } from "../library/query";
+import { readSavedChoice, readVlChoice, savedMenuItems, type SavedMenuId, type VlMenuId, vlMenuItems } from "../library/searchMenus";
 import { applySortChoice, type SortMenuId, sortSummary as summariseSort } from "../library/sortMenu";
 import { activeRules, colorForBook, COLORING_RULES_PROFILE, DEFAULT_COLORING_RULES, type ColoringRule, type ColoringRulesPrefs } from "../library/coloringRules";
 import { evaluateTemplateBulk } from "../library/api";
@@ -116,6 +117,49 @@ function onSortMenuChoose(id: SortMenuId) {
   sortOrder.value = next.order;
   offset.value = 0;
   void runSearch();
+}
+
+/**
+ * Virtual-library menu, replacing a `<select>`.
+ *
+ * A select cannot manage its own options, so creating or deleting a
+ * virtual library lived in a separate "Manage lists" dialog with no
+ * relationship to the control that applies one. The menu carries both.
+ */
+const vlMenuEntries = computed(() => vlMenuItems(Object.keys(virtualLibraries.value), vl.value));
+
+const vlMenu = ref<{ x: number; y: number } | null>(null);
+
+function onVlMenuChoose(id: VlMenuId) {
+  vlMenu.value = null;
+  const choice = readVlChoice(id);
+  if (choice.kind === "manage") manageOpen.value = true;
+  else vl.value = choice.name;
+}
+
+/** The label the virtual-library button wears: the active one, or all. */
+const vlLabel = computed(() => vl.value || "All books");
+
+/**
+ * Saved-search menu, also replacing a `<select>`.
+ *
+ * The select had a `disabled selected` placeholder option as its
+ * label, which is the standard workaround for a select that acts like
+ * a menu -- and a sign it should have been a menu.
+ */
+const savedMenuEntries = computed(() => savedMenuItems(Object.keys(savedSearches.value)));
+
+const savedMenu = ref<{ x: number; y: number } | null>(null);
+
+function onSavedMenuChoose(id: SavedMenuId) {
+  savedMenu.value = null;
+  const choice = readSavedChoice(id);
+  if (choice.kind === "manage") {
+    manageOpen.value = true;
+    return;
+  }
+  const query = savedSearches.value[choice.name];
+  if (query !== undefined) applySavedSearch(query);
 }
 
 const sortMenu = ref<{ x: number; y: number } | null>(null);
@@ -1896,14 +1940,54 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
       <router-link to="/settings" class="settings-link">Settings…</router-link>
       </div>
       <div class="toolbar-row toolbar-find">
-      <form class="search" @submit.prevent="submitSearch">
-        <input ref="searchInput" v-model="queryText" type="search" :placeholder="ftsMode ? 'Search book contents…' : 'Search…'" />
-        <button type="submit">Search</button>
-      </form>
+      <!--
+        Virtual library first, as calibre does: it scopes everything
+        the search box then operates on, so it reads left to right.
+      -->
+      <ToolbarButton
+        label=""
+        icon="vl"
+        compact
+        has-menu
+        :title="`Virtual library: ${vlLabel}`"
+        @run="vlMenu = { x: 0, y: 0 }"
+        @menu="vlMenu = $event"
+      />
+      <span class="vl-name" :class="{ active: vl !== '' }">{{ vlLabel }}</span>
+      <button v-if="vl !== ''" type="button" class="vl-clear" title="Show all books again" @click="vl = ''">✕</button>
 
-      <button type="button" :class="{ active: ftsMode }" @click="ftsMode = !ftsMode">
-        {{ ftsMode ? "Full-text search" : "Metadata search" }}
-      </button>
+      <ToolbarButton
+        label="Sort"
+        icon="sort"
+        compact
+        has-menu
+        :title="`Sorted by ${sortSummary}`"
+        @run="openSortMenu({ x: 0, y: 0 })"
+        @menu="openSortMenu($event)"
+      />
+
+      <!--
+        The search field owns its own mode. Full-text search used to be
+        a separate labelled button beside the box, which described a
+        property of the search as though it were an action.
+      -->
+      <form class="search" @submit.prevent="submitSearch">
+        <button
+          type="button"
+          class="in-field"
+          :class="{ active: ftsMode }"
+          :aria-pressed="ftsMode"
+          :title="ftsMode ? 'Searching inside books — click for metadata search' : 'Search inside book text'"
+          @click="ftsMode = !ftsMode"
+        >
+          <img src="/icons/fts.png" alt="Full-text search" class="in-field-icon" />
+        </button>
+        <input ref="searchInput" v-model="queryText" type="search" :placeholder="ftsMode ? 'Search book contents…' : 'Search…'" />
+        <button v-if="queryText" type="button" class="in-field" title="Clear" @click="queryText = ''; submitSearch()">✕</button>
+        <button type="submit" class="search-go" title="Search">
+          <img src="/icons/search.png" alt="Search" class="in-field-icon" />
+        </button>
+      </form>
 
       <template v-if="!ftsMode">
         <!--
@@ -1919,14 +2003,15 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
           @run="openSortMenu({ x: 0, y: 0 })"
           @menu="openSortMenu($event)"
         />
-        <select v-model="vl">
-          <option value="">All books</option>
-          <option v-for="name in Object.keys(virtualLibraries)" :key="name" :value="name">{{ name }}</option>
-        </select>
-        <select v-if="Object.keys(savedSearches).length" @change="applySavedSearch(($event.target as HTMLSelectElement).value)">
-          <option value="" disabled selected>Saved searches…</option>
-          <option v-for="[name, q] in Object.entries(savedSearches)" :key="name" :value="q">{{ name }}</option>
-        </select>
+        <ToolbarButton
+          label=""
+          icon="folder_saved_search"
+          compact
+          has-menu
+          title="Saved searches"
+          @run="savedMenu = { x: 0, y: 0 }"
+          @menu="savedMenu = $event"
+        />
         <div class="view-toggle" role="group" aria-label="Library view">
           <button type="button" :class="{ active: viewMode === 'table' }" :aria-pressed="viewMode === 'table'" @click="setViewMode('table')">Table</button>
           <button type="button" :class="{ active: viewMode === 'grid' }" :aria-pressed="viewMode === 'grid'" @click="setViewMode('grid')">Grid</button>
@@ -2178,6 +2263,10 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
     <ContextMenu v-if="toolbarMenu" :x="toolbarMenu.x" :y="toolbarMenu.y" :entries="toolbarMenuEntries" @choose="onToolbarMenuChoose" @close="toolbarMenu = null" />
 
     <ContextMenu v-if="sortMenu" :x="sortMenu.x" :y="sortMenu.y" :entries="sortMenuEntries" @choose="onSortMenuChoose" @close="sortMenu = null" />
+
+    <ContextMenu v-if="vlMenu" :x="vlMenu.x" :y="vlMenu.y" :entries="vlMenuEntries" @choose="onVlMenuChoose" @close="vlMenu = null" />
+
+    <ContextMenu v-if="savedMenu" :x="savedMenu.x" :y="savedMenu.y" :entries="savedMenuEntries" @choose="onSavedMenuChoose" @close="savedMenu = null" />
 
     <NoteEditor v-if="noteTarget" :field="noteTarget.field" :item-name="noteTarget.itemName" @close="noteTarget = null" />
 
@@ -2515,14 +2604,95 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
   font-size: var(--fs-body);
   line-height: 1;
 }
+/*
+  The field, its mode toggle, its clear button and its submit read as
+  one control: the border is on the form and the children are
+  transparent, so the icons sit *inside* the field rather than beside
+  it. Separate bordered buttons next to a bordered input is the web-form
+  look this is meant to get away from.
+*/
 .search {
   display: flex;
+  align-items: center;
   flex: 1;
-  min-width: 200px;
-  gap: 0.25em;
+  min-width: 220px;
+  max-width: 560px;
+  height: var(--ctl-h);
+  padding: 0 var(--sp-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+}
+.search:focus-within {
+  border-color: var(--accent);
+  box-shadow: var(--focus-ring);
 }
 .search input {
   flex: 1;
+  min-width: 0;
+  height: 100%;
+  border: none;
+  background: none;
+  padding: 0 var(--sp-2);
+}
+.search input:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+/* Strip the browser's own search affordances -- it draws a second
+   clear button that does not match ours. */
+.search input::-webkit-search-cancel-button {
+  display: none;
+}
+.in-field,
+.search-go {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 20px;
+  min-width: 20px;
+  padding: 0 var(--sp-1);
+  border: none;
+  background: none;
+  border-radius: var(--radius);
+  color: var(--fg-muted);
+  font-size: var(--fs-small);
+}
+.in-field:hover,
+.search-go:hover {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+.in-field.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.in-field-icon {
+  width: 14px;
+  height: 14px;
+  filter: var(--icon-filter);
+}
+
+/* The active virtual library is named next to its button, because
+   which subset of the library you are looking at is the kind of state
+   that should never need a click to discover. */
+.vl-name {
+  font-size: var(--fs-small);
+  color: var(--fg-faint);
+  white-space: nowrap;
+  max-width: 18ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.vl-name.active {
+  color: var(--accent);
+  font-weight: 600;
+}
+.vl-clear {
+  height: var(--ctl-h-sm);
+  min-width: var(--ctl-h-sm);
+  padding: 0;
+  font-size: var(--fs-small);
 }
 .body {
   flex: 1;
