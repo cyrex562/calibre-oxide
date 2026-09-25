@@ -158,6 +158,54 @@ async fn open_recent_library(app: AppHandle, path: String) -> Result<(), String>
     open_library(&app, std::path::PathBuf::from(path))
 }
 
+/// Creates a new library and opens it.
+///
+/// Pointing `calibre_srv` at an empty directory already produces a
+/// working library -- it creates `metadata.db` and its sidecars on
+/// first run. What was missing was any way to *say* that: the only
+/// library affordance was "Switch library -> Browse for another",
+/// which reads as "find an existing one" and gives no hint that
+/// choosing an empty folder makes a new one.
+///
+/// Asks for a parent folder and a name rather than a single folder
+/// pick, because "create" and "open" want different dialogs: picking a
+/// folder to create *inside* is a different question from picking the
+/// library itself, and conflating them is how a user ends up with a
+/// library at the root of their documents folder.
+#[tauri::command]
+async fn create_library(app: AppHandle, name: String) -> Result<Option<String>, String> {
+    let trimmed = name.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("a library needs a name".to_string());
+    }
+    // Rejected rather than sanitized: silently renaming what someone
+    // typed produces a folder they then cannot find.
+    if trimmed.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|']) || trimmed.starts_with('.') {
+        return Err("a library name cannot contain / \\ : * ? \" < > | or start with a dot".to_string());
+    }
+
+    let (tx, mut rx) = tauri::async_runtime::channel(1);
+    app.dialog().file().pick_folder(move |result| {
+        let _ = tx.try_send(result);
+    });
+    let Some(Some(parent)) = rx.recv().await else {
+        return Ok(None);
+    };
+    let parent = parent.into_path().map_err(|e| e.to_string())?;
+    let target = parent.join(&trimmed);
+
+    // Refuse rather than merge. An existing directory may be somebody
+    // else's data, and opening it as a library would adopt whatever is
+    // inside.
+    if target.exists() {
+        return Err(format!("{} already exists", target.display()));
+    }
+    std::fs::create_dir(&target).map_err(|e| format!("could not create {}: {e}", target.display()))?;
+
+    open_library(&app, target.clone())?;
+    Ok(Some(target.to_string_lossy().into_owned()))
+}
+
 /// Issue #721's one real app-level preference: whether to reopen the
 /// last library automatically on launch (see `settings.rs`'s own doc
 /// on why this defaults to `true`).
@@ -571,7 +619,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(ServerState::default())
-        .invoke_handler(tauri::generate_handler![ping, get_persisted_library, choose_library, choose_folder_and_add_books, list_recent_libraries, open_recent_library, get_auto_reopen, set_auto_reopen, import_library_archive, set_menu_actions, open_book_format, unpack_book, repack_book, open_external_url, get_auto_add_folder, choose_auto_add_folder])
+        .invoke_handler(tauri::generate_handler![ping, get_persisted_library, choose_library, create_library, choose_folder_and_add_books, list_recent_libraries, open_recent_library, get_auto_reopen, set_auto_reopen, import_library_archive, set_menu_actions, open_book_format, unpack_book, repack_book, open_external_url, get_auto_add_folder, choose_auto_add_folder])
         .on_menu_event(|app, event| menu::forward(app, &event))
         // Dropping files onto the window adds them, the same way the
         // folder picker does. This has to be handled natively: Tauri's

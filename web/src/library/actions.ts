@@ -104,6 +104,7 @@ export type LibraryActionId =
   | "add-books"
   | "add-folder"
   | "switch-library"
+  | "new-library"
   // Selection-scoped.
   | "select-mode"
   | "mark-books"
@@ -155,6 +156,10 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   { id: "add-books", label: "Add Books…", group: "library", requires: "none", toolbar: true, primary: true },
   { id: "add-folder", label: "Add Folder…", group: "library", requires: "none", toolbar: true, desktopOnly: true, primary: true },
   { id: "switch-library", label: "Switch library…", group: "library", requires: "none", toolbar: true, desktopOnly: true, primary: true },
+  // Pointing the server at an empty folder has always produced a
+  // working library; there was simply no way to say so. "Switch
+  // library -> Browse for another" reads as "find an existing one".
+  { id: "new-library", label: "New library…", group: "library", requires: "none", toolbar: true, desktopOnly: true, primary: true },
 
   { id: "select-mode", label: "Select…", group: "view", requires: "none" },
   // Marks are the thing selection is not: they survive a new search,

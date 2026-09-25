@@ -908,3 +908,25 @@ export async function evaluateTemplateBulk(template: string, bookIds: number[]):
   // written; the caller treats it as "this rule colours nothing".
   return data.ok && data.results ? data.results : {};
 }
+
+export interface LibraryInfo {
+  /** Display name — the library folder's own name. */
+  name: string;
+  /** Absolute path on disk, for disambiguating same-named libraries. */
+  path: string;
+}
+
+/**
+ * Which library is open.
+ *
+ * Until recently `/ajax/library-info` reported a hardcoded name and no
+ * path at all, so nothing the UI could show distinguished one library
+ * from another.
+ */
+export async function fetchLibraryInfo(): Promise<LibraryInfo> {
+  const res = await fetch("/ajax/library-info");
+  if (!res.ok) throw new Error(`library info: ${res.status}`);
+  const body = (await res.json()) as { library_map?: Record<string, string>; default_library?: string; library_path?: string };
+  const id = body.default_library ?? "default";
+  return { name: body.library_map?.[id] ?? "Library", path: body.library_path ?? "" };
+}

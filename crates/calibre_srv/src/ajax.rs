@@ -454,10 +454,26 @@ pub async fn search(State(state): State<AppState>, Query(q): Query<SearchQuery>)
 
 /// `GET /ajax/library-info`. Port of `library_info`, single-library
 /// only.
-pub async fn library_info() -> Json<Value> {
+pub async fn library_info(State(state): State<AppState>) -> Json<Value> {
+    let path = state.cache.backend.library_path.clone();
+    // The folder's own name, which is what a user calls a library --
+    // upstream does the same, and an absolute path is too long to be a
+    // label. Falls back to the full path for a root or otherwise
+    // nameless directory rather than showing an empty string.
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+
     Json(serde_json::json!({
-        "library_map": { LIBRARY_ID: "calibre-oxide Library" },
+        "library_map": { LIBRARY_ID: name },
         "default_library": LIBRARY_ID,
+        // The real path, so the UI can say *which* library is open.
+        // Before this the name was the hardcoded string "calibre-oxide
+        // Library" and the path was not exposed at all, so nothing on
+        // screen could tell one library from another.
+        "library_path": path.to_string_lossy(),
     }))
 }
 
@@ -747,6 +763,42 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["default_library"], "default");
         assert!(body["library_map"]["default"].is_string());
+    }
+
+    // The name used to be the hardcoded string "calibre-oxide Library"
+    // and the path was not reported at all, so nothing the UI could
+    // display distinguished one open library from another.
+    #[tokio::test]
+    async fn library_info_names_the_real_library_and_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = dir.path().join("Science Fiction");
+        std::fs::create_dir(&library).unwrap();
+        let cache = Cache::new(&library).unwrap();
+        let state = crate::AppState {
+            libraries: None,
+            cache: std::sync::Arc::new(cache),
+            opts: std::sync::Arc::new(crate::opts::ServerOptions::default()),
+            auth: None,
+            changes: crate::web_socket::new_change_broadcaster(),
+            reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()),
+            book_cache: std::sync::Arc::new(crate::books_cache::BookCache::open_temp()),
+            jobs: std::sync::Arc::new(crate::jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
+            render_jobs: std::sync::Arc::new(crate::render_endpoints::RenderJobRegistry::new()),
+            conversion_jobs: std::sync::Arc::new(crate::convert::ConversionJobRegistry::new()),
+            news_jobs: std::sync::Arc::new(crate::news::NewsJobRegistry::new()),
+            tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()),
+            news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()),
+            tts_voice: None,
+            plugin_store: None,
+            plugin_registry: std::sync::Arc::new(std::sync::Mutex::new(calibre_customize::registry::PluginRegistry::new())),
+        };
+        let router = crate::test_router(state);
+
+        let (status, body) = get_json(&router, "/ajax/library-info").await;
+        assert_eq!(status, StatusCode::OK);
+        // The folder's own name, which is what a user calls a library.
+        assert_eq!(body["library_map"]["default"], "Science Fiction");
+        assert_eq!(body["library_path"].as_str().unwrap(), library.to_string_lossy());
     }
 
     #[tokio::test]

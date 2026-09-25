@@ -10,7 +10,7 @@ import AnnotationsBrowser from "./AnnotationsBrowser.vue";
 import PolishDialog from "./PolishDialog.vue";
 import HelpDialog from "./HelpDialog.vue";
 import { LAYOUT_KEY, type LayoutPrefs, type Panel, parseLayout, resizedWidth } from "../library/layout";
-import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
+import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchLibraryInfo, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
 import type { CheckLibraryResult, CustomRecipeOptions, DuplicateBook, NewsFeedInput, NewsSchedule, SaveToDiskResult } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
 import { similarBooksQuery } from "../library/query";
@@ -1104,6 +1104,60 @@ window.addEventListener("oxide:books-added", onBooksDropped);
 // (app/src-tauri/src/lib.rs's open_library/open_recent_library), it
 // doesn't serve multiple libraries at once. The list is capped/
 // deduplicated server-side (app/src-tauri/src/settings.rs).
+const libraryName = ref("");
+const libraryPath = ref("");
+
+async function loadLibraryInfo() {
+  try {
+    const info = await fetchLibraryInfo();
+    libraryName.value = info.name;
+    libraryPath.value = info.path;
+  } catch {
+    // Not worth surfacing: the status bar simply omits the label, and
+    // every other part of the window works without it.
+  }
+}
+
+const newLibraryOpen = ref(false);
+const newLibraryName = ref("");
+const newLibraryError = ref<string | null>(null);
+const creatingLibrary = ref(false);
+
+function openNewLibrary() {
+  newLibraryName.value = "";
+  newLibraryError.value = null;
+  newLibraryOpen.value = true;
+}
+
+/**
+ * Creates a library and opens it.
+ *
+ * The name is collected here and the *parent* folder in the native
+ * dialog that follows, rather than asking for one folder: "where shall
+ * I put it" and "what is it called" are different questions, and
+ * merging them is how a library ends up created at the root of
+ * someone's documents folder.
+ */
+async function createLibrary() {
+  const name = newLibraryName.value.trim();
+  if (!name) {
+    newLibraryError.value = "Give the library a name.";
+    return;
+  }
+  creatingLibrary.value = true;
+  newLibraryError.value = null;
+  try {
+    const created = await tauriInvoke<string | null>("create_library", { name });
+    // `null` means the folder dialog was cancelled, which is not an
+    // error -- leave the prompt open so the name typed is not lost.
+    if (created) newLibraryOpen.value = false;
+  } catch (e) {
+    newLibraryError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    creatingLibrary.value = false;
+  }
+}
+
 const switchOpen = ref(false);
 const recentLibraries = ref<string[]>([]);
 const switching = ref(false);
@@ -1185,6 +1239,7 @@ const actionHandlers: Partial<Record<LibraryActionId, () => void>> = {
   "add-books": () => addInput.value?.click(),
   "add-folder": () => void addFolder(),
   "switch-library": () => openSwitchLibrary(),
+  "new-library": () => openNewLibrary(),
   "select-mode": () => toggleSelectMode(),
   "bulk-edit": () => {
     bulkOpen.value = true;
@@ -1453,7 +1508,10 @@ function onLibraryKeydown(event: KeyboardEvent) {
   runAction(id);
 }
 
-onMounted(() => window.addEventListener("keydown", onLibraryKeydown));
+onMounted(() => {
+  window.addEventListener("keydown", onLibraryKeydown);
+  void loadLibraryInfo();
+});
 onBeforeUnmount(() => window.removeEventListener("keydown", onLibraryKeydown));
 
 // Author/tag mapping (#1.7). The engines -- metadata::author_mapper
@@ -1940,6 +1998,20 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
       they are view state, not actions on books.
     -->
     <footer class="status-bar">
+      <!--
+        Which library is open. Before this nothing on screen said, and
+        `/ajax/library-info` reported a hardcoded name with no path, so
+        two libraries were indistinguishable once you were inside one.
+      -->
+      <button
+        v-if="libraryName"
+        type="button"
+        class="status-library"
+        :title="libraryPath ? `${libraryPath}\nClick to switch library` : 'Click to switch library'"
+        @click="openSwitchLibrary"
+      >
+        📚 {{ libraryName }}
+      </button>
       <span class="status-count">{{ totalNum }} book<span v-if="totalNum !== 1">s</span></span>
       <span v-if="selectedIds.size > 0" class="status-sel">{{ selectedIds.size }} selected</span>
       <span v-if="markedIds.size > 0" class="status-sel">{{ markedIds.size }} marked</span>
@@ -2185,6 +2257,21 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
       </div>
     </div>
 
+    <div v-if="newLibraryOpen" class="manage-backdrop" @click.self="newLibraryOpen = false">
+      <div class="manage-panel">
+        <button class="manage-close" @click="newLibraryOpen = false">✕</button>
+        <h3>New library</h3>
+        <p class="hint">Name the library, then choose the folder to create it in. It opens straight away, empty and ready for books.</p>
+        <form class="manage-form" @submit.prevent="createLibrary">
+          <input v-model="newLibraryName" placeholder="Library name" :disabled="creatingLibrary" autofocus />
+          <button type="submit" :disabled="creatingLibrary || !newLibraryName.trim()">
+            {{ creatingLibrary ? "Creating…" : "Choose folder…" }}
+          </button>
+        </form>
+        <p v-if="newLibraryError" class="error">{{ newLibraryError }}</p>
+      </div>
+    </div>
+
     <div v-if="switchOpen" class="manage-backdrop" @click.self="switchOpen = false">
       <div class="manage-panel">
         <button class="manage-close" @click="switchOpen = false">✕</button>
@@ -2323,6 +2410,17 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
 }
 .status-count {
   font-weight: 600;
+}
+/* The library label reads as a control because it is one -- clicking
+   it switches library, which is where anyone looking at the name is
+   most likely headed next. */
+.status-library {
+  padding: 0.1em 0.5em;
+  font-size: 0.95em;
+  max-width: 28ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .status-sel {
   opacity: 0.75;
