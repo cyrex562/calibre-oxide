@@ -18,7 +18,7 @@ import { activeRules, colorForBook, COLORING_RULES_PROFILE, DEFAULT_COLORING_RUL
 import { evaluateTemplateBulk } from "../library/api";
 import { changesFor, isEmptySpec, REPLACEABLE_FIELDS, validateSpec, type BulkEditSpec } from "../library/bulkEdit";
 import { clampWidth, columnsFor, DEFAULT_TABLE_PREFS, resolveColumns, TABLE_PREFS_PROFILE, type BookColumn, type LibraryViewMode, type TablePrefs } from "../library/columns";
-import { actionEnabled, contextMenuEntries, LIBRARY_ACTIONS, visibleToolbarActions, type ActionContext, type LibraryAction, type LibraryActionId } from "../library/actions";
+import { actionEnabled, contextMenuEntries, LIBRARY_ACTIONS, toolbarActionEnabled, visibleToolbarActions, type ActionContext, type LibraryAction, type LibraryActionId } from "../library/actions";
 import { onMenuAction, syncDesktopMenu } from "../library/desktopMenu";
 import { shortcutFor } from "../library/shortcuts";
 import { isTauri, tauriInvoke } from "../tauri";
@@ -1307,6 +1307,18 @@ function actionBusy(action: LibraryAction): boolean {
   return false;
 }
 
+/**
+ * Whether a toolbar entry should be clickable.
+ *
+ * Two separate reasons to be disabled: the action is mid-flight, or it
+ * needs a selection there isn't one of. The second used to remove the
+ * button entirely, which made the toolbar reflow as the selection
+ * changed; it now stays put and greys out.
+ */
+function actionDisabled(action: LibraryAction): boolean {
+  return actionBusy(action) || !toolbarActionEnabled(action, actionContext.value);
+}
+
 function actionTitle(action: LibraryAction): string | undefined {
   switch (action.id) {
     case "export-catalog":
@@ -1356,7 +1368,7 @@ const toolbarMenu = ref<{ x: number; y: number } | null>(null);
 
 /** Overflow entries, in the shape `ContextMenu` already renders. */
 const toolbarMenuEntries = computed(() =>
-  overflowToolbarActions.value.map((a) => ({ id: a.id, label: actionLabel(a), enabled: !actionBusy(a) })),
+  overflowToolbarActions.value.map((a) => ({ id: a.id, label: actionLabel(a), enabled: !actionDisabled(a) })),
 );
 
 function openToolbarOverflow(event: MouseEvent) {
@@ -1761,7 +1773,7 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
         type="button"
         :style="{ order: toolbarActionOrder(action.id) }"
         :class="{ active: actionActive(action) }"
-        :disabled="actionBusy(action)"
+        :disabled="actionDisabled(action)"
         :title="actionTitle(action)"
         @click="runAction(action.id)"
       >

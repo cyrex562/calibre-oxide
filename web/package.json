@@ -9,8 +9,9 @@
     "preview": "vite preview",
     "test": "vitest run",
     "copy-pdfjs": "node scripts/copy-pdfjs-assets.mjs",
-    "prebuild": "node scripts/copy-pdfjs-assets.mjs",
-    "predev": "node scripts/copy-pdfjs-assets.mjs"
+    "prebuild": "node scripts/copy-pdfjs-assets.mjs && node scripts/copy-icons.mjs",
+    "predev": "node scripts/copy-pdfjs-assets.mjs && node scripts/copy-icons.mjs",
+    "copy-icons": "node scripts/copy-icons.mjs"
   },
   "dependencies": {
     "dompurify": "^3.4.15",

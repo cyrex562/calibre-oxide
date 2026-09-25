@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { actionAvailable, actionEnabled, buildMenuSpec, findAction, LIBRARY_ACTIONS, TOOLBAR_ACTIONS, visibleToolbarActions, type ActionContext, type LibraryAction, type LibraryActionId } from "./actions";
+import { actionAvailable, actionEnabled, buildMenuSpec, findAction, LIBRARY_ACTIONS, toolbarActionEnabled, TOOLBAR_ACTIONS, TOOLBAR_LAYOUT, toolbarLayoutActionIds, visibleToolbarActions, type ActionContext, type LibraryAction, type LibraryActionId } from "./actions";
 
 const DESKTOP: ActionContext = { selectionCount: 0, isDesktop: true };
 const BROWSER: ActionContext = { selectionCount: 0, isDesktop: false };
@@ -144,7 +144,7 @@ describe("the native menu spec", () => {
 
 describe("what the toolbar renders", () => {
   // The ids LibraryView.vue actually supplies handlers for.
-  const HANDLED: LibraryActionId[] = ["manage-lists", "custom-columns", "check-library", "find-duplicates", "map-metadata", "browse-annotations", "export-catalog", "export-library-archive", "fetch-news", "add-books", "add-folder", "switch-library", "select-mode", "bulk-edit", "save-to-disk"];
+  const HANDLED: LibraryActionId[] = ["manage-lists", "custom-columns", "check-library", "find-duplicates", "map-metadata", "browse-annotations", "export-catalog", "export-library-archive", "fetch-news", "add-books", "add-folder", "switch-library", "new-library", "select-mode", "bulk-edit", "save-to-disk"];
 
   const FTS_SUPPRESSED = new Set<LibraryActionId>(["manage-lists", "custom-columns", "check-library", "find-duplicates", "map-metadata", "browse-annotations", "export-catalog", "export-library-archive", "fetch-news", "select-mode", "bulk-edit", "save-to-disk"]);
 
@@ -156,7 +156,14 @@ describe("what the toolbar renders", () => {
   // and nothing else in the suite would notice.
   it("renders the full desktop toolbar when nothing is hidden or suppressed", () => {
     const ids = visibleToolbarActions({ ...base, ctx: DESKTOP }).map((a) => a.id);
-    expect(ids).toEqual(["manage-lists", "custom-columns", "check-library", "find-duplicates", "map-metadata", "browse-annotations", "export-catalog", "export-library-archive", "fetch-news", "add-books", "add-folder", "switch-library", "select-mode"]);
+    // Selection-scoped entries are present with nothing selected: the
+    // toolbar renders them disabled rather than reflowing around them.
+    expect(ids).toEqual([
+      "manage-lists", "custom-columns", "check-library", "find-duplicates", "map-metadata",
+      "browse-annotations", "export-catalog", "export-library-archive", "fetch-news",
+      "add-books", "add-folder", "switch-library", "new-library",
+      "select-mode", "bulk-edit", "save-to-disk",
+    ]);
   });
 
   it("drops the two desktop-only actions in a browser tab", () => {
@@ -166,14 +173,24 @@ describe("what the toolbar renders", () => {
     expect(ids).toContain("add-books");
   });
 
-  it("reveals the selection actions only once books are selected", () => {
+  // The toolbar must not change *shape* with the selection -- a button
+  // that appears and disappears moves its neighbours out from under the
+  // cursor between one click and the next.
+  it("keeps the same entries whether or not books are selected", () => {
     const none = visibleToolbarActions({ ...base, ctx: DESKTOP }).map((a) => a.id);
-    expect(none).not.toContain("bulk-edit");
-    expect(none).not.toContain("save-to-disk");
-
     const some = visibleToolbarActions({ ...base, ctx: { ...DESKTOP, selectionCount: 2 } }).map((a) => a.id);
-    expect(some).toContain("bulk-edit");
-    expect(some).toContain("save-to-disk");
+    expect(some).toEqual(none);
+  });
+
+  it("reports selection actions as disabled until something is selected", () => {
+    const bulk = LIBRARY_ACTIONS.find((a) => a.id === "bulk-edit")!;
+    expect(toolbarActionEnabled(bulk, DESKTOP)).toBe(false);
+    expect(toolbarActionEnabled(bulk, { ...DESKTOP, selectionCount: 2 })).toBe(true);
+  });
+
+  it("leaves always-available actions enabled with no selection", () => {
+    const add = LIBRARY_ACTIONS.find((a) => a.id === "add-books")!;
+    expect(toolbarActionEnabled(add, DESKTOP)).toBe(true);
   });
 
   it("honours the user's hidden list", () => {
@@ -186,9 +203,10 @@ describe("what the toolbar renders", () => {
   it("keeps only add/switch-library in full-text search mode", () => {
     // FTS replaces the result grid, so the actions that operate on
     // that grid have never been shown beside it -- but adding books
-    // and switching library always were.
+    // and choosing a library always were, and creating one is as valid
+    // here as switching to one.
     const ids = visibleToolbarActions({ ...base, suppressed: FTS_SUPPRESSED, ctx: DESKTOP }).map((a) => a.id);
-    expect(ids).toEqual(["add-books", "add-folder", "switch-library"]);
+    expect(ids).toEqual(["add-books", "add-folder", "switch-library", "new-library"]);
   });
 
   it("never puts a book-scoped action in the toolbar", () => {
@@ -239,5 +257,62 @@ describe("primary toolbar actions", () => {
     expect(primary.length + overflow.length).toBe(shown.length);
     // Every action still reachable from one surface or the other.
     expect(new Set([...primary, ...overflow].map((a) => a.id)).size).toBe(shown.length);
+  });
+});
+
+describe("TOOLBAR_LAYOUT", () => {
+  // A typo'd id here is a button that silently does nothing, which no
+  // other test would notice.
+  it("only names actions that exist", () => {
+    const known = new Set(LIBRARY_ACTIONS.map((a) => a.id));
+    for (const id of toolbarLayoutActionIds()) {
+      expect(known.has(id), `${id} is in TOOLBAR_LAYOUT but not in the registry`).toBe(true);
+    }
+  });
+
+  it("gives every button an icon", () => {
+    for (const item of TOOLBAR_LAYOUT) {
+      if (item.kind === "action" || item.kind === "split") {
+        const action = LIBRARY_ACTIONS.find((a) => a.id === item.id)!;
+        expect(action.icon, `${item.id} has a toolbar slot but no icon`).toBeTruthy();
+      }
+      if (item.kind === "menu") expect(item.icon).toBeTruthy();
+    }
+  });
+
+  // A slot whose primary needs a selection is disabled most of the
+  // time, which wastes the scarcest space in the window.
+  it("never gives a slot to something that needs a selection", () => {
+    for (const item of TOOLBAR_LAYOUT) {
+      if (item.kind !== "action" && item.kind !== "split") continue;
+      const action = LIBRARY_ACTIONS.find((a) => a.id === item.id)!;
+      if (action.group === "book" || action.requires !== "none") {
+        // Book actions are allowed a slot -- they are the point of a
+        // library -- but they must be reachable with one selected.
+        expect(["single-selection", "selection"]).toContain(action.requires);
+      }
+    }
+  });
+
+  it("does not list the same action twice", () => {
+    const ids = toolbarLayoutActionIds();
+    expect(new Set(ids).size, `duplicates: ${ids.filter((v, i) => ids.indexOf(v) !== i)}`).toBe(ids.length);
+  });
+
+  it("has exactly one spring, so the right-hand cluster is unambiguous", () => {
+    expect(TOOLBAR_LAYOUT.filter((i) => i.kind === "spring")).toHaveLength(1);
+  });
+
+  it("never starts or ends with a separator", () => {
+    expect(TOOLBAR_LAYOUT[0].kind).not.toBe("separator");
+    expect(TOOLBAR_LAYOUT[TOOLBAR_LAYOUT.length - 1].kind).not.toBe("separator");
+  });
+
+  it("puts no empty menu on a split button", () => {
+    for (const item of TOOLBAR_LAYOUT) {
+      if (item.kind === "split" || item.kind === "menu") {
+        expect(item.menu.filter((e) => e !== "-").length, `${item.id} has an empty menu`).toBeGreaterThan(0);
+      }
+    }
   });
 });
