@@ -4,7 +4,7 @@ import CategoryBrowser from "./CategoryBrowser.vue";
 import NoteEditor from "./NoteEditor.vue";
 import BookDetailsPanel from "./BookDetailsPanel.vue";
 import BookTable from "./BookTable.vue";
-import ContextMenu from "./ContextMenu.vue";
+import ContextMenu, { type ContextMenuEntry } from "./ContextMenu.vue";
 import ToolbarButton from "./ToolbarButton.vue";
 import MapperDialog from "./MapperDialog.vue";
 import AnnotationsBrowser from "./AnnotationsBrowser.vue";
@@ -15,6 +15,7 @@ import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LI
 import type { CheckLibraryResult, CustomRecipeOptions, DuplicateBook, NewsFeedInput, NewsSchedule, SaveToDiskResult } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
 import { similarBooksQuery } from "../library/query";
+import { applySortChoice, type SortMenuId, sortSummary as summariseSort } from "../library/sortMenu";
 import { activeRules, colorForBook, COLORING_RULES_PROFILE, DEFAULT_COLORING_RULES, type ColoringRule, type ColoringRulesPrefs } from "../library/coloringRules";
 import { evaluateTemplateBulk } from "../library/api";
 import { changesFor, isEmptySpec, REPLACEABLE_FIELDS, validateSpec, type BulkEditSpec } from "../library/bulkEdit";
@@ -64,13 +65,63 @@ function fieldLabel(key: string): string {
   return sortableFields.value.find(([k]) => k === key)?.[1] ?? key;
 }
 
-function addSortField(field: string) {
-  if (!field || sortFields.value.includes(field)) return;
-  sort.value = [...sortFields.value, field].join(",");
+/**
+ * The Sort dropdown's contents.
+ *
+ * Replaces two `<select>`s plus a row of removable chips. The
+ * underlying model is unchanged -- `sort` is still one comma-joined
+ * string -- this is purely a better way to present it. calibre does
+ * the same (`gui2/layout.py`, a `sort.png` menu button), and the
+ * select-plus-chips version was the most form-like control in the
+ * window.
+ *
+ * Ids are namespaced because one flat menu carries three different
+ * kinds of choice: which field leads, which direction, and which extra
+ * field to append.
+ */
+const sortMenuEntries = computed<ContextMenuEntry<SortMenuId>[]>(() => {
+  const entries: ContextMenuEntry<SortMenuId>[] = [];
+
+  for (const [key, label] of sortableFields.value) {
+    entries.push({ id: `field:${key}`, label, enabled: true, checked: primarySort.value === key });
+  }
+
+  entries.push({ id: "dir:asc", label: "Ascending", enabled: true, checked: sortOrder.value === "asc", startsGroup: true });
+  entries.push({ id: "dir:desc", label: "Descending", enabled: true, checked: sortOrder.value === "desc" });
+
+  // Only offered once a secondary sort exists, so the common case --
+  // one field, one direction -- stays a short menu.
+  for (const [i, field] of secondarySortFields.value.entries()) {
+    entries.push({
+      id: `drop:${field}`,
+      label: `Remove “then by ${fieldLabel(field)}”`,
+      enabled: true,
+      startsGroup: i === 0,
+    });
+  }
+
+  for (const [i, [key, label]] of availableExtraSortFields.value.entries()) {
+    entries.push({ id: `add:${key}`, label: `Then by ${label}`, enabled: true, startsGroup: i === 0 });
+  }
+  return entries;
+});
+
+/** One line summarising the sort, for the button and the status bar. */
+const sortSummary = computed(() => summariseSort({ sort: sort.value, order: sortOrder.value }, fieldLabel));
+
+function onSortMenuChoose(id: SortMenuId) {
+  sortMenu.value = null;
+  const next = applySortChoice({ sort: sort.value, order: sortOrder.value }, id);
+  sort.value = next.sort;
+  sortOrder.value = next.order;
+  offset.value = 0;
+  void runSearch();
 }
 
-function removeSortField(field: string) {
-  sort.value = sortFields.value.filter((f) => f !== field).join(",");
+const sortMenu = ref<{ x: number; y: number } | null>(null);
+
+function openSortMenu(anchorRect: { x: number; y: number }) {
+  sortMenu.value = anchorRect;
 }
 
 const books = ref<BookSummary[]>([]);
@@ -1855,23 +1906,19 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
       </button>
 
       <template v-if="!ftsMode">
-        <div class="sort-fields">
-          <select v-model="primarySort">
-            <option v-for="[key, label] in sortableFields" :key="key" :value="key">{{ label }}</option>
-          </select>
-          <span v-for="field in secondarySortFields" :key="field" class="sort-chip">
-            {{ fieldLabel(field) }}
-            <button type="button" class="sort-chip-remove" :aria-label="`Stop sorting by ${fieldLabel(field)}`" @click="removeSortField(field)">✕</button>
-          </span>
-          <select v-if="availableExtraSortFields.length" :value="''" @change="addSortField(($event.target as HTMLSelectElement).value); ($event.target as HTMLSelectElement).value = ''">
-            <option value="" disabled>+ then sort by…</option>
-            <option v-for="[key, label] in availableExtraSortFields" :key="key" :value="key">{{ label }}</option>
-          </select>
-        </div>
-        <select v-model="sortOrder">
-          <option value="asc">Ascending</option>
-          <option value="desc">Descending</option>
-        </select>
+        <!--
+          One Sort button, not two selects and a row of chips. The
+          model underneath is unchanged; this is presentation.
+        -->
+        <ToolbarButton
+          label="Sort"
+          icon="sort"
+          compact
+          has-menu
+          :title="`Sorted by ${sortSummary}`"
+          @run="openSortMenu({ x: 0, y: 0 })"
+          @menu="openSortMenu($event)"
+        />
         <select v-model="vl">
           <option value="">All books</option>
           <option v-for="name in Object.keys(virtualLibraries)" :key="name" :value="name">{{ name }}</option>
@@ -2113,7 +2160,7 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
       <span v-if="selectedIds.size > 0" class="status-sel">{{ selectedIds.size }} selected</span>
       <span v-if="markedIds.size > 0" class="status-sel">{{ markedIds.size }} marked</span>
       <span class="status-spacer"></span>
-      <span class="status-sort">Sorted by {{ fieldLabel(sort) }} ({{ sortOrder === "asc" ? "ascending" : "descending" }})</span>
+      <span class="status-sort">Sorted by {{ sortSummary }}</span>
       <button type="button" class="status-toggle" :class="{ active: sidebarVisible }" :aria-pressed="sidebarVisible" title="Show or hide the category browser" @click="sidebarVisible = !sidebarVisible">Categories</button>
       <button type="button" class="status-toggle" :class="{ active: detailsVisible }" :aria-pressed="detailsVisible" title="Show or hide book details" @click="detailsVisible = !detailsVisible">Details</button>
     </footer>
@@ -2129,6 +2176,8 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
     <ContextMenu v-if="contextMenu" :x="contextMenu.x" :y="contextMenu.y" :entries="contextEntries" @choose="onContextChoose" @close="contextMenu = null" />
 
     <ContextMenu v-if="toolbarMenu" :x="toolbarMenu.x" :y="toolbarMenu.y" :entries="toolbarMenuEntries" @choose="onToolbarMenuChoose" @close="toolbarMenu = null" />
+
+    <ContextMenu v-if="sortMenu" :x="sortMenu.x" :y="sortMenu.y" :entries="sortMenuEntries" @choose="onSortMenuChoose" @close="sortMenu = null" />
 
     <NoteEditor v-if="noteTarget" :field="noteTarget.field" :item-name="noteTarget.itemName" @close="noteTarget = null" />
 

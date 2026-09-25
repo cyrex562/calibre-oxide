@@ -1,4 +1,4 @@
-<script setup lang="ts">
+<script setup lang="ts" generic="T extends string = LibraryActionId">
 // Right-click menu over the action registry (issue 1.2 of the #816
 // epic).
 //
@@ -12,22 +12,30 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import type { LibraryActionId } from "../library/actions";
 
-export interface ContextMenuEntry {
-  id: LibraryActionId;
+export interface ContextMenuEntry<T extends string = LibraryActionId> {
+  id: T;
   label: string;
   enabled: boolean;
   /** Starts a visual group; rendered as a separator above this entry. */
   startsGroup?: boolean;
+  /**
+   * Draws a tick. Used for the menus that replaced `<select>`s -- sort
+   * field, sort direction, virtual library -- where the menu has to
+   * show the current value, not just offer the options.
+   */
+  checked?: boolean;
+  /** Right-aligned accelerator, e.g. `"Ctrl+S"`. Display only. */
+  accel?: string;
 }
 
 const props = defineProps<{
   /** Viewport coordinates of the click that opened the menu. */
   x: number;
   y: number;
-  entries: ContextMenuEntry[];
+  entries: ContextMenuEntry<T>[];
 }>();
 
-const emit = defineEmits<{ choose: [id: LibraryActionId]; close: [] }>();
+const emit = defineEmits<{ choose: [id: T]; close: [] }>();
 
 const root = ref<HTMLElement | null>(null);
 const position = ref({ left: props.x, top: props.y });
@@ -49,7 +57,7 @@ function reposition() {
 
 const enabledEntries = computed(() => props.entries.filter((e) => e.enabled));
 
-function choose(entry: ContextMenuEntry) {
+function choose(entry: ContextMenuEntry<T>) {
   if (!entry.enabled) return;
   emit("choose", entry.id);
   emit("close");
@@ -99,14 +107,51 @@ watch(() => [props.x, props.y, props.entries], reposition, { flush: "post" });
     <p v-if="enabledEntries.length === 0" class="empty" role="none">No actions available</p>
     <template v-for="entry in entries" :key="entry.id">
       <hr v-if="entry.startsGroup" class="sep" role="separator" />
-      <button type="button" role="menuitem" class="item" :disabled="!entry.enabled" @click="choose(entry)">
-        {{ entry.label }}
+      <button
+        type="button"
+        :role="entry.checked === undefined ? 'menuitem' : 'menuitemradio'"
+        :aria-checked="entry.checked"
+        class="item"
+        :class="{ checked: entry.checked }"
+        :disabled="!entry.enabled"
+        @click="choose(entry)"
+      >
+        <span class="tick" aria-hidden="true">{{ entry.checked ? "✓" : "" }}</span>
+        <span class="item-label">{{ entry.label }}</span>
+        <span v-if="entry.accel" class="accel">{{ entry.accel }}</span>
       </button>
     </template>
   </div>
 </template>
 
 <style scoped>
+/* A fixed tick column so labels align whether or not a menu has any
+   checkable entries -- indenting only the ticked ones makes the list
+   look ragged. */
+.item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+.tick {
+  flex: 0 0 12px;
+  font-size: var(--fs-small);
+  color: var(--accent);
+}
+.item-label {
+  flex: 1;
+  text-align: left;
+  white-space: nowrap;
+}
+.accel {
+  color: var(--fg-faint);
+  font-size: var(--fs-small);
+  padding-left: var(--sp-5);
+}
+.item.checked .item-label {
+  font-weight: 600;
+}
+
 .context-menu {
   position: fixed;
   z-index: 1000;
