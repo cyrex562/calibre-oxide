@@ -377,6 +377,15 @@ export type ToolbarItem =
   | { kind: "split"; id: LibraryActionId; menu: ToolbarEntry[] }
   /** A named menu that is not itself an action -- the library button. */
   | { kind: "menu"; id: string; label: string; icon: string; menu: ToolbarEntry[] }
+  /**
+   * Everything toolbar-eligible that no other slot placed.
+   *
+   * Computed rather than listed: a hand-written overflow silently
+   * orphans an action the moment one is added to the registry without
+   * being given a home, which is exactly what happened when the old
+   * static `More` was removed.
+   */
+  | { kind: "overflow" }
   | { kind: "separator" }
   /** Pushes everything after it to the far end. */
   | { kind: "spring" };
@@ -411,12 +420,22 @@ export const TOOLBAR_LAYOUT: ToolbarItem[] = [
   { kind: "action", id: "fetch-news" },
   { kind: "separator" },
   { kind: "split", id: "delete-book", menu: ["-", "$restore-deleted"] },
+  { kind: "overflow" },
   { kind: "spring" },
   // Label is replaced at render time with the open library's name:
   // which library you are in is state, and state belongs on a label.
   { kind: "menu", id: "library", label: "Library", icon: "lt", menu: ["switch-library", "new-library", "-", "$recent-libraries", "-", "check-library", "find-duplicates"] },
   { kind: "split", id: "help", menu: ["$shortcuts", "$about"] },
 ];
+
+/**
+ * Toolbar-eligible actions that no slot or menu in `TOOLBAR_LAYOUT`
+ * mentions — the overflow's contents.
+ */
+export function toolbarOverflowIds(): LibraryActionId[] {
+  const placed = new Set(toolbarLayoutActionIds());
+  return LIBRARY_ACTIONS.filter((a) => a.toolbar && a.group !== "book" && !placed.has(a.id)).map((a) => a.id);
+}
 
 /** Every action id `TOOLBAR_LAYOUT` can reach, on a button or in a menu. */
 export function toolbarLayoutActionIds(): LibraryActionId[] {

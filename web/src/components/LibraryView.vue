@@ -19,7 +19,7 @@ import { activeRules, colorForBook, COLORING_RULES_PROFILE, DEFAULT_COLORING_RUL
 import { evaluateTemplateBulk } from "../library/api";
 import { changesFor, isEmptySpec, REPLACEABLE_FIELDS, validateSpec, type BulkEditSpec } from "../library/bulkEdit";
 import { clampWidth, columnsFor, DEFAULT_TABLE_PREFS, resolveColumns, TABLE_PREFS_PROFILE, type BookColumn, type LibraryViewMode, type TablePrefs } from "../library/columns";
-import { actionEnabled, contextMenuEntries, LIBRARY_ACTIONS, toolbarActionEnabled, TOOLBAR_LAYOUT, type ToolbarEntry, type ToolbarItem, visibleToolbarActions, type ActionContext, type LibraryAction, type LibraryActionId } from "../library/actions";
+import { actionEnabled, contextMenuEntries, LIBRARY_ACTIONS, toolbarActionEnabled, TOOLBAR_LAYOUT, type ToolbarEntry, type ToolbarItem, toolbarOverflowIds, visibleToolbarActions, type ActionContext, type LibraryAction, type LibraryActionId } from "../library/actions";
 import { onMenuAction, syncDesktopMenu } from "../library/desktopMenu";
 import { shortcutFor } from "../library/shortcuts";
 import { isTauri, tauriInvoke } from "../tauri";
@@ -1348,7 +1348,8 @@ const toolbarActions = computed<LibraryAction[]>(() =>
 const toolbarItems = computed(() => {
   const shown = new Set(toolbarActions.value.map((a) => a.id));
   return TOOLBAR_LAYOUT.filter((item) => {
-    if (item.kind === "separator" || item.kind === "spring" || item.kind === "menu") return true;
+    if (item.kind === "overflow") return toolbarOverflowIds().some((id) => shown.has(id));
+    if (!("id" in item) || item.kind === "menu") return true;
     return shown.has(item.id);
   });
 });
@@ -1359,27 +1360,31 @@ function actionFor(id: LibraryActionId): LibraryAction | undefined {
 }
 
 function itemKey(item: ToolbarItem, index: number): string {
-  return item.kind === "separator" || item.kind === "spring" ? `${item.kind}-${index}` : `${item.kind}-${item.id}`;
+  return "id" in item ? `${item.kind}-${item.id}` : `${item.kind}-${index}`;
 }
 
 function itemHasMenu(item: ToolbarItem): boolean {
-  return item.kind === "split" || item.kind === "menu";
+  return item.kind === "split" || item.kind === "menu" || item.kind === "overflow";
 }
 
 /** The body was clicked. A pure menu slot opens its menu instead. */
 function onItemRun(item: ToolbarItem) {
-  if (item.kind === "menu") {
-    openSlotMenu(item.menu, { x: 0, y: 0 });
+  if (item.kind === "action" || item.kind === "split") {
+    runAction(item.id);
     return;
   }
-  if (item.kind === "action" || item.kind === "split") runAction(item.id);
+  // A pure menu has no primary action, so clicking its body opens it.
+  onItemMenu(item, { x: 0, y: 0 });
 }
 
 function onItemMenu(item: ToolbarItem, anchor: { x: number; y: number }) {
   if (item.kind === "split" || item.kind === "menu") openSlotMenu(item.menu, anchor);
+  else if (item.kind === "overflow") openSlotMenu(toolbarOverflowIds(), anchor);
 }
 
-function itemLabel(item: { kind: string; id?: string; label?: string }): string {
+function itemLabel(item: ToolbarItem): string {
+  if (item.kind === "overflow") return "More";
+  if (item.kind === "separator" || item.kind === "spring") return "";
   // The library slot wears the open library's name: which library you
   // are in is state, and state belongs on a label.
   if (item.kind === "menu") return item.id === "library" ? libraryName.value || "Library" : item.label ?? "";
@@ -1387,19 +1392,23 @@ function itemLabel(item: { kind: string; id?: string; label?: string }): string 
   return action ? actionLabel(action) : "";
 }
 
-function itemIcon(item: { kind: string; id?: string; icon?: string }): string | undefined {
+function itemIcon(item: ToolbarItem): string | undefined {
+  if (item.kind === "overflow") return "h-ellipsis";
   if (item.kind === "menu") return item.icon;
+  if (!("id" in item)) return undefined;
   return actionFor(item.id as LibraryActionId)?.icon;
 }
 
-function itemDisabled(item: { kind: string; id?: string }): boolean {
-  if (item.kind === "menu") return false;
+function itemDisabled(item: ToolbarItem): boolean {
+  if (!("id" in item) || item.kind === "menu") return false;
   const action = actionFor(item.id as LibraryActionId);
   return action ? actionDisabled(action) : true;
 }
 
-function itemTitle(item: { kind: string; id?: string }): string | undefined {
+function itemTitle(item: ToolbarItem): string | undefined {
+  if (item.kind === "overflow") return "Everything else";
   if (item.kind === "menu") return libraryPath.value || undefined;
+  if (!("id" in item)) return undefined;
   const action = actionFor(item.id as LibraryActionId);
   if (!action) return undefined;
   const parts = [action.tooltip ?? action.label];
@@ -1407,8 +1416,8 @@ function itemTitle(item: { kind: string; id?: string }): string | undefined {
   return parts.join(" ");
 }
 
-function itemActive(item: { kind: string; id?: string }): boolean {
-  if (item.kind === "menu") return false;
+function itemActive(item: ToolbarItem): boolean {
+  if (!("id" in item) || item.kind === "menu") return false;
   const action = actionFor(item.id as LibraryActionId);
   return action ? actionActive(action) : false;
 }

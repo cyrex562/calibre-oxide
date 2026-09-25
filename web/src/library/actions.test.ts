@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { actionAvailable, actionEnabled, buildMenuSpec, findAction, LIBRARY_ACTIONS, toolbarActionEnabled, TOOLBAR_ACTIONS, TOOLBAR_LAYOUT, toolbarLayoutActionIds, visibleToolbarActions, type ActionContext, type LibraryAction, type LibraryActionId } from "./actions";
+import { actionAvailable, actionEnabled, buildMenuSpec, findAction, LIBRARY_ACTIONS, toolbarActionEnabled, TOOLBAR_ACTIONS, TOOLBAR_LAYOUT, toolbarLayoutActionIds, toolbarOverflowIds, visibleToolbarActions, type ActionContext, type LibraryAction, type LibraryActionId } from "./actions";
 
 const DESKTOP: ActionContext = { selectionCount: 0, isDesktop: true };
 const BROWSER: ActionContext = { selectionCount: 0, isDesktop: false };
@@ -313,6 +313,35 @@ describe("TOOLBAR_LAYOUT", () => {
       if (item.kind === "split" || item.kind === "menu") {
         expect(item.menu.filter((e) => e !== "-").length, `${item.id} has an empty menu`).toBeGreaterThan(0);
       }
+    }
+  });
+});
+
+describe("toolbar overflow", () => {
+  // The regression this exists to prevent: replacing the old static
+  // `More ▾` with TOOLBAR_LAYOUT silently orphaned four actions --
+  // manage-lists, custom-columns, browse-annotations and pick-random --
+  // because nothing checked that every eligible action had a home.
+  it("gives every toolbar-eligible action a home", () => {
+    const placed = new Set(toolbarLayoutActionIds());
+    const overflow = new Set(toolbarOverflowIds());
+    const homeless = LIBRARY_ACTIONS
+      .filter((a) => a.toolbar && a.group !== "book")
+      .filter((a) => !placed.has(a.id) && !overflow.has(a.id))
+      .map((a) => a.id);
+    expect(homeless, `no toolbar home: ${homeless.join(", ")}`).toEqual([]);
+  });
+
+  it("does not repeat a slotted action in the overflow", () => {
+    const placed = new Set(toolbarLayoutActionIds());
+    for (const id of toolbarOverflowIds()) {
+      expect(placed.has(id), `${id} is both slotted and in the overflow`).toBe(false);
+    }
+  });
+
+  it("keeps book-scoped actions out of the overflow", () => {
+    for (const id of toolbarOverflowIds()) {
+      expect(LIBRARY_ACTIONS.find((a) => a.id === id)!.group).not.toBe("book");
     }
   });
 });
