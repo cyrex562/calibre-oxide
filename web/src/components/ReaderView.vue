@@ -27,6 +27,9 @@ const fmt = computed(() => ((route.params.fmt as string) || "epub").toLowerCase(
 // desktop webview is WebKitGTK, which has no built-in PDF viewer, so
 // this is rendered by PDF.js rather than handed to an `<embed>`.
 const isPdf = computed(() => fmt.value === "pdf");
+// The PDF view has no manifest to read a title out of, so the child
+// reports the one it fetches. Until it does, the header says "PDF".
+const pdfTitle = ref("");
 
 const manifest = ref<BookManifest | null>(null);
 const loadError = ref<string | null>(null);
@@ -884,9 +887,9 @@ function onReaderResize() {
   <div v-if="isPdf" class="reader">
     <header class="toolbar">
       <router-link to="/" class="back">Library</router-link>
-      <span class="title">PDF</span>
+      <span class="title">{{ pdfTitle || "PDF" }}</span>
     </header>
-    <PdfReader :book-id="bookId" />
+    <PdfReader :book-id="bookId" @title="pdfTitle = $event" />
   </div>
 
   <div v-else class="reader">

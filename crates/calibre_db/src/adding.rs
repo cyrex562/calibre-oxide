@@ -324,6 +324,22 @@ fn add_book_from_formats(cache: &Arc<Mutex<Cache>>, formats: &[PathBuf]) -> Resu
     meta.title = title_from_stem(&stem);
     meta.authors = vec!["Unknown".to_string()];
 
+    // Take the cover, and only the cover, from the file itself.
+    //
+    // Title and authors deliberately stay filename-derived: that is
+    // what this function has always done and what upstream's own
+    // directory import does, and changing it would silently retitle
+    // books on a path whose whole premise is "the filename is the
+    // metadata". The cover is different -- there is nothing in a
+    // filename to derive one from, so without this a folder import
+    // produces a shelf of placeholders even when every file has a
+    // cover (or, for a PDF, a first page) to show.
+    if let Ok(from_file) = calibre_ebooks::metadata::get_metadata(first) {
+        if !from_file.cover_data.1.is_empty() {
+            meta.cover_data = from_file.cover_data;
+        }
+    }
+
     let guard = cache.lock().unwrap();
     let book_id = guard.add_book(first, &meta)?;
     for extra in &formats[1..] {
@@ -422,4 +438,35 @@ pub fn add_book(cache: &Cache, title: &str, authors: &[String]) -> Result<i32> {
     // For this sprint, we focus on the `books` table entry.
 
     Ok(book_id)
+}
+
+#[cfg(test)]
+mod cover_tests {
+    use super::*;
+    use crate::cache::Cache;
+
+    /// The two-page fixture `calibre_ebooks::pdf::rasterize` uses --
+    /// one PDF, checked in once.
+    const TWO_PAGE_PDF: &[u8] = include_bytes!("../../calibre_ebooks/tests/data/two-page.pdf");
+
+    #[test]
+    fn a_directory_import_takes_the_cover_from_the_file_and_the_title_from_its_name() {
+        if !calibre_ebooks::pdf::rasterize::is_available() {
+            eprintln!("skipping: no PDFium library available");
+            return;
+        }
+        let library = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("Some Scanned Book.pdf"), TWO_PAGE_PDF).unwrap();
+
+        let cache = Arc::new(Mutex::new(Cache::new(library.path()).unwrap()));
+        let book_id = import_book_directory(&cache, source.path(), &[]).unwrap().expect("a book should have been imported");
+
+        let cache = cache.lock().unwrap();
+        // The title still comes from the filename -- this path's whole
+        // premise -- while the cover now comes from the file.
+        assert_eq!(cache.field_for(book_id, "title").unwrap().as_deref(), Some("Some Scanned Book"));
+        assert!(cache.has_cover(book_id).unwrap(), "a folder import should store the cover the file carries");
+        assert!(crate::covers::cover_path(&cache, book_id).unwrap().exists());
+    }
 }

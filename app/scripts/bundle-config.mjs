@@ -51,6 +51,18 @@ if (missing.length > 0) {
   process.exit(1);
 }
 
+// PDFium is optional: without it the app runs and PDFs import, they
+// just do not get a cover rendered from page 1. So a missing library
+// is a warning rather than one of the hard failures above -- but it
+// does have to be bundled when it *is* present, or an installed app
+// would silently lose a feature that worked in the dev checkout.
+const pdfiumLib = process.platform === "win32" ? "pdfium.dll" : process.platform === "darwin" ? "libpdfium.dylib" : "libpdfium.so";
+const pdfiumBuilt = join(repoRoot, "target", "release", pdfiumLib);
+const hasPdfium = existsSync(pdfiumBuilt);
+if (!hasPdfium) {
+  console.warn(`note: ${pdfiumLib} is not in target/release — PDF covers will be unavailable in the packaged app.\n      Run: cargo xtask fetch-pdfium`);
+}
+
 // Destinations match what `server.rs` probes: the binary at the resource
 // root, `web-dist/` beside it.
 const config = {
@@ -58,6 +70,7 @@ const config = {
     resources: {
       [serverSource]: serverExe,
       [webDistSource]: "web-dist/",
+      ...(hasPdfium ? { [`../../target/release/${pdfiumLib}`]: pdfiumLib } : {}),
     },
   },
 };

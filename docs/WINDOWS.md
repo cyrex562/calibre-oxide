@@ -72,6 +72,30 @@ cd ..\app ; npm install ; npm run tauri:build
 
 On first launch the app asks for a library folder and remembers it.
 
+### PDF covers (optional)
+
+PDFs get their cover rendered from page 1, and the reader can export a
+page as an image — both need `pdfium.dll`, which is not part of the
+build:
+
+```powershell
+cargo xtask fetch-pdfium
+```
+
+This downloads the prebuilt DLL from
+[pdfium-binaries](https://github.com/bblanchon/pdfium-binaries) and
+copies it into `target\debug` and `target\release`, where the binaries
+look for it. Do it **before** `cargo xtask package` if you want the
+installer to carry it — the packaging step bundles it when present and
+warns when it is not.
+
+Nothing else depends on it. Skipping this leaves every other feature
+working; PDFs just import without covers. `CALIBRE_OXIDE_PDFIUM` points
+at a copy kept somewhere else.
+
+It uses `curl.exe` and `tar.exe`, both of which ship with Windows 10
+1803 and later.
+
 ## Installing over an existing version
 
 The MSI is a major-upgrade installer: running a newer one replaces the

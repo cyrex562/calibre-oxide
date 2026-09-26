@@ -3,7 +3,7 @@ import { computed, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import FetchMetadataDialog from "./FetchMetadataDialog.vue";
 import TweakEditor from "./TweakEditor.vue";
-import { addFormat, deleteBooks, evaluateTemplate, fetchBook, fetchBooks, fetchConversionBookData, fetchDataFiles, fetchFieldMetadata, getConversionStatus, removeDataFile, removeFormat, search, setCover, setFields, shareEmail, startConversion, uploadDataFile } from "../library/api";
+import { addFormat, coverFromPdfPage, deleteBooks, evaluateTemplate, fetchBook, fetchBooks, fetchConversionBookData, fetchDataFiles, fetchFieldMetadata, getConversionStatus, removeDataFile, removeFormat, search, setCover, setFields, shareEmail, startConversion, uploadDataFile } from "../library/api";
 import type { ConversionOptionsOverride, DataFileStat, SmtpRelayConfig } from "../library/api";
 import { categoryItemToQuery } from "../library/query";
 import { isTauri, tauriInvoke } from "../tauri";
@@ -320,6 +320,36 @@ async function replaceCover(e: Event) {
   } finally {
     saving.value = false;
     if (coverInput.value) coverInput.value.value = "";
+  }
+}
+
+/**
+ * Regenerates the cover from the PDF's first page.
+ *
+ * Offered only when there is a PDF to render: on any other book the
+ * action would fail with a 404 that says nothing useful, and a
+ * disabled entry explains itself.
+ */
+const canCoverFromPdf = computed(() => (book.value?.formats ?? []).some((f) => f.toLowerCase() === "pdf"));
+
+async function coverFromPdf() {
+  if (!canCoverFromPdf.value) {
+    // Reachable from the context menu, which enables book actions by
+    // how many books are selected and knows nothing about formats.
+    // Saying so beats doing nothing.
+    saveError.value = "This book has no PDF to render a cover from.";
+    return;
+  }
+  saving.value = true;
+  saveError.value = null;
+  try {
+    await coverFromPdfPage(props.bookId, 1);
+    book.value = await fetchBook(props.bookId);
+    emit("updated");
+  } catch (e) {
+    saveError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    saving.value = false;
   }
 }
 
@@ -738,6 +768,9 @@ function performAction(id: string) {
     case "replace-cover":
       coverInput.value?.click();
       break;
+    case "cover-from-pdf":
+      void coverFromPdf();
+      break;
     case "open-externally":
       void openExternally();
       break;
@@ -954,6 +987,7 @@ watch(
           <div class="cover-edit">
             <img :src="coverSrc" alt="" class="cover" />
             <button type="button" @click="coverInput?.click()">Replace cover…</button>
+            <button v-if="canCoverFromPdf" type="button" :disabled="saving" title="Render the first page of the PDF as the cover" @click="coverFromPdf">Cover from page 1</button>
             <input ref="coverInput" type="file" accept="image/jpeg,image/png" class="hidden-file-input" @change="replaceCover" />
           </div>
           <div class="fields">

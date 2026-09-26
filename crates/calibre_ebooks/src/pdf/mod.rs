@@ -11,6 +11,11 @@
 //! | `image_writer.py` | [`image_writer`] | Documented gap: depends on the separately-tracked `pdf/render/` native PDF serializer + Qt page geometry; page-size/unit-conversion math ported for real. |
 //! | `develop.py` | [`develop`] | Documented gap: Qt+podofo CLI dev tool, entirely dependent on `html_writer.py`'s rendering core. |
 //!
+//! [`rasterize`] is not from this directory: it ports the page-rendering
+//! half of `ebooks/metadata/pdf.py` (`read_info`'s cover extraction and
+//! `page_images`), which lives here because it is PDF machinery rather
+//! than metadata parsing. See its own module docs.
+//!
 //! `reflow.py` + `pdftohtml.py` together form calibre's "real" PDF-input
 //! pipeline (shell out to poppler's `pdftohtml -xml`, then reflow the
 //! resulting layout XML into clean HTML). This crate already has a
@@ -24,6 +29,7 @@ pub mod develop;
 pub mod html_writer;
 pub mod image_writer;
 pub mod pdftohtml;
+pub mod rasterize;
 pub mod reflow;
 pub mod render;
 pub mod utils;

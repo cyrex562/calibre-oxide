@@ -353,6 +353,25 @@ impl Cache {
             .unwrap_or_default();
         self.add_format(book_id, source_path, ext, true)?;
 
+        // Store whatever cover the format carried. Nothing did this
+        // before, which is why every book added through the UI or
+        // `calibredb add` showed a placeholder tile no matter what was
+        // embedded in it -- `get_metadata` has always returned
+        // `cover_data` for EPUB, MOBI, FB2, DOCX and (since the PDF
+        // rasterizer landed) PDF, and every one of those was thrown
+        // away here.
+        //
+        // A cover that cannot be written is not worth failing an
+        // import over: the book itself is already on disk and in the
+        // database by this point, and a missing cover is visible and
+        // fixable from the UI in a way a half-added book is not.
+        let (_, cover) = &metadata.cover_data;
+        if !cover.is_empty() {
+            if let Err(e) = crate::covers::set_cover(self, book_id, cover) {
+                log::warn!("book {book_id} was added but its cover could not be stored: {e}");
+            }
+        }
+
         Ok(book_id)
     }
 
@@ -2523,6 +2542,40 @@ mod tests {
 
     fn journaled_delete_count(library_path: &Path) -> usize {
         journaled_op_count(library_path, "DeleteFile")
+    }
+
+    #[test]
+    fn add_book_stores_the_cover_the_format_carried() {
+        let (dir, cache) = open_test_cache();
+        let source = write_temp_file(dir.path(), "src.epub", b"epub bytes");
+
+        let mut meta = MetaInformation::default();
+        meta.title = "Covered".to_string();
+        meta.authors = vec!["An Author".to_string()];
+        meta.cover_data = (Some("jpg".to_string()), b"pretend jpeg bytes".to_vec());
+
+        let book_id = cache.add_book(&source, &meta).unwrap();
+
+        // Both halves matter: the file on disk is what gets served,
+        // and `has_cover` is what the grid consults before asking for
+        // it. Before this, neither happened for any format.
+        assert!(cache.has_cover(book_id).unwrap(), "has_cover was not set");
+        let cover = crate::covers::cover_path(&cache, book_id).unwrap();
+        assert_eq!(fs::read(&cover).unwrap(), b"pretend jpeg bytes");
+    }
+
+    #[test]
+    fn add_book_without_a_cover_leaves_has_cover_off() {
+        let (_dir, cache) = open_test_cache();
+        let source = write_temp_file(_dir.path(), "src.epub", b"epub bytes");
+
+        let mut meta = MetaInformation::default();
+        meta.title = "Bare".to_string();
+        meta.authors = vec!["An Author".to_string()];
+
+        let book_id = cache.add_book(&source, &meta).unwrap();
+        assert!(!cache.has_cover(book_id).unwrap());
+        assert!(!crate::covers::cover_path(&cache, book_id).unwrap().exists());
     }
 
     #[test]

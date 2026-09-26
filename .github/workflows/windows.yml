@@ -40,6 +40,15 @@ jobs:
       - name: Check every target
         run: cargo check --workspace --all-targets
 
+      # PDF page rendering binds PDFium at runtime, so the workspace
+      # builds without it -- and the tests that exercise it *skip*
+      # without it, which would make this job silently prove nothing
+      # about the one platform where a dynamically-loaded native
+      # library is least likely to behave. Fetching it here is what
+      # makes those tests actually run.
+      - name: Fetch PDFium
+        run: cargo xtask fetch-pdfium
+
       - name: Test
         run: cargo test --workspace --lib
 

@@ -62,7 +62,8 @@ fn open_library(app: &AppHandle, library_path: std::path::PathBuf) -> Result<(),
     let static_dir = server::resolve_web_dist(app).map_err(|e| e.to_string())?;
     let port = server::find_free_port().map_err(|e| e.to_string())?;
 
-    let child = server::spawn(&bin, &library_path, &static_dir, port).map_err(|e| e.to_string())?;
+    let pdfium = server::resolve_pdfium(app);
+    let child = server::spawn(&bin, &library_path, &static_dir, port, pdfium.as_deref()).map_err(|e| e.to_string())?;
     *state.0.lock().unwrap() = Some((child, port));
 
     if !server::wait_until_ready(port, std::time::Duration::from_secs(10)) {

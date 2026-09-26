@@ -92,6 +92,19 @@ export async function setCover(bookId: number, file: File): Promise<void> {
   await jsonFetch(`/cdb/set-cover/${bookId}`, { method: "POST", body: file });
 }
 
+/**
+ * Renders a page of the book's PDF on the server and stores it as the
+ * cover.
+ *
+ * The reader does this in the browser instead -- it already has the
+ * page rendered, and posting those pixels to `setCover` is one step
+ * rather than two. This is for the book nobody has open: a PDF added
+ * before covers were generated, or one whose first page is blank.
+ */
+export async function coverFromPdfPage(bookId: number, page = 1): Promise<void> {
+  await jsonFetch(`/cdb/cover-from-pdf-page/${bookId}/${page}`, { method: "POST" });
+}
+
 export async function deleteBooks(ids: number[]): Promise<void> {
   if (ids.length === 0) return;
   await jsonFetch(`/cdb/delete-books/${ids.join(",")}`, { method: "POST" });

@@ -14,11 +14,17 @@
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 
-import { clampPage, clampScale, loadPdfJs, PDF_ASSET_OPTIONS, pdfUrl, renderPage } from "../reader/pdf";
+import { clampPage, clampScale, COVER_WIDTH, loadPdfJs, PDF_ASSET_OPTIONS, pageImageFileName, type PageImageFormat, pdfUrl, renderPage, renderPageToBlob } from "../reader/pdf";
 import { getLastReadPositions, setLastReadPosition } from "../reader/api";
 import { deviceId } from "../reader/position";
+import { coverFromPdfPage, fetchBook, setCover } from "../library/api";
+import ContextMenu, { type ContextMenuEntry } from "./ContextMenu.vue";
 
 const props = defineProps<{ bookId: string }>();
+
+// The reader header had nothing but the word "PDF" in it; the title is
+// fetched here anyway, to name an exported page file after the book.
+const emit = defineEmits<{ title: [value: string] }>();
 
 const canvas = ref<HTMLCanvasElement | null>(null);
 // `shallowRef`, not `ref`: a deep reactive proxy over a PDF document
@@ -32,6 +38,91 @@ const page = ref(1);
 const scale = ref(1);
 const loading = ref(true);
 const error = ref<string | null>(null);
+const title = ref("");
+
+// Transient feedback for the two actions below. They finish quickly
+// and have no visible result inside the reader -- a new cover shows up
+// in the library, and a download lands in the browser's own UI -- so
+// without a line of text it is not obvious anything happened.
+const notice = ref<string | null>(null);
+let noticeTimer: ReturnType<typeof setTimeout> | undefined;
+function say(message: string) {
+  notice.value = message;
+  clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => (notice.value = null), 4000);
+}
+
+const busy = ref(false);
+const exportMenu = ref<{ x: number; y: number } | null>(null);
+
+const EXPORT_FORMATS: ContextMenuEntry<PageImageFormat>[] = [
+  { id: "jpg", label: "JPEG image (.jpg)", enabled: true },
+  { id: "png", label: "PNG image (.png)", enabled: true },
+];
+
+function openExportMenu(event: MouseEvent) {
+  const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+  exportMenu.value = { x: rect.left, y: rect.bottom };
+}
+
+/**
+ * Stores the page on screen as the book's cover.
+ *
+ * Rendered fresh at `COVER_WIDTH` rather than read back off the
+ * displayed canvas, which is at whatever zoom the reader is at.
+ *
+ * Falls back to rendering it server-side if encoding the canvas
+ * fails. `canvas.toBlob` is the one step here with no coverage: the
+ * desktop app runs on WebKitGTK, which cannot be driven headlessly on
+ * the machine this is developed on, so its JPEG encoding is untested
+ * in the browser that matters most. The fallback costs three lines and
+ * uses a route that exists anyway.
+ */
+async function useAsCover() {
+  const d = doc.value;
+  if (!d || busy.value) return;
+  busy.value = true;
+  try {
+    let blob: Blob | null = null;
+    try {
+      blob = await renderPageToBlob(d, page.value, COVER_WIDTH, "jpg");
+    } catch {
+      blob = null;
+    }
+    if (blob) await setCover(Number(props.bookId), new File([blob], "cover.jpg", { type: "image/jpeg" }));
+    else await coverFromPdfPage(Number(props.bookId), page.value);
+    say(`Page ${page.value} is now the cover.`);
+  } catch (e) {
+    say(`Could not set the cover: ${e instanceof Error ? e.message : String(e)}`);
+  } finally {
+    busy.value = false;
+  }
+}
+
+/** Saves the page on screen as an image file. */
+async function exportPage(format: PageImageFormat) {
+  exportMenu.value = null;
+  const d = doc.value;
+  if (!d || busy.value) return;
+  busy.value = true;
+  try {
+    const blob = await renderPageToBlob(d, page.value, COVER_WIDTH, format);
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = pageImageFileName(title.value, page.value, format);
+    link.click();
+    // Not revoked synchronously: Chromium and WebKit both start the
+    // download asynchronously after the click, and revoking first
+    // cancels it.
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+    say(`Saved ${link.download}.`);
+  } catch (e) {
+    say(`Could not export the page: ${e instanceof Error ? e.message : String(e)}`);
+  } finally {
+    busy.value = false;
+  }
+}
 
 // PDF.js renders asynchronously; a fast click-through would otherwise
 // interleave two renders onto one canvas and leave whichever finished
@@ -63,6 +154,15 @@ async function load() {
     const loaded = await task.promise;
     doc.value = loaded;
     pageCount.value = loaded.numPages;
+
+    // Not fatal: the title only names an exported file and fills the
+    // header, and neither is worth failing to open a book over.
+    void fetchBook(Number(props.bookId))
+      .then((book) => {
+        title.value = book.title ?? "";
+        emit("title", title.value);
+      })
+      .catch(() => {});
 
     // Restore where we were, if anything was stored.
     try {
@@ -122,6 +222,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   window.removeEventListener("keydown", onKeydown);
+  clearTimeout(noticeTimer);
   // Frees the worker's copy of the document; without this, opening
   // several PDFs in a session leaks each one.
   void doc.value?.destroy();
@@ -143,8 +244,15 @@ onBeforeUnmount(() => {
         <span class="pdf-scale">{{ Math.round(scale * 100) }}%</span>
         <button type="button" title="Zoom in" @click="zoom(0.25)">+</button>
       </span>
+      <span class="pdf-sep" />
+      <button type="button" :disabled="!doc || busy" title="Store this page as the book's cover" @click="useAsCover">Use as cover</button>
+      <button type="button" :disabled="!doc || busy" title="Save this page as an image file" @click="openExportMenu">Export page…</button>
       <span class="pdf-progress">{{ progressLabel }}</span>
     </div>
+
+    <ContextMenu v-if="exportMenu" :x="exportMenu.x" :y="exportMenu.y" :entries="EXPORT_FORMATS" @choose="exportPage" @close="exportMenu = null" />
+
+    <p v-if="notice" class="notice">{{ notice }}</p>
 
     <p v-if="loading" class="status">Loading PDF…</p>
     <p v-if="error" class="error">{{ error }}</p>
@@ -190,6 +298,19 @@ onBeforeUnmount(() => {
   font-size: var(--fs-small);
   min-width: 3.5rem;
   text-align: center;
+}
+.pdf-sep {
+  width: 1px;
+  align-self: stretch;
+  margin: 0 0.2rem;
+  background: var(--border);
+}
+.notice {
+  margin: 0;
+  padding: 0.35rem 0.6rem;
+  font-size: var(--fs-small);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-raised);
 }
 .pdf-progress {
   margin-left: auto;

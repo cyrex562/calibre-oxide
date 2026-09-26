@@ -37,6 +37,7 @@ fn run() -> Result<()> {
         "server" => build_rust(release),
         "web" => build_web(),
         "package" => package(),
+        "fetch-pdfium" => fetch_pdfium(),
         "test" => test_all(),
         "help" | "--help" | "-h" => {
             print_help();
@@ -57,7 +58,8 @@ fn print_help() {
          \x20 web       just the web UI that the app displays\n\
          \x20 app       the desktop app, assuming the two above are already built\n\
          \x20 package   build everything, then produce installers (needs network)\n\
-         \x20 test      the Rust test suite and the web test suite\n\n\
+         \x20 test      the Rust test suite and the web test suite\n\
+         \x20 fetch-pdfium  download the PDF rendering library (needed for PDF covers)\n\n\
          \x20 --debug   build unoptimized (default is release)\n"
     );
 }
@@ -124,6 +126,115 @@ fn package() -> Result<()> {
     let bundle = root().join("target").join("release").join("bundle");
     step(&format!("installers are in {}", bundle.display()));
     Ok(())
+}
+
+/// Downloads PDFium and puts it where the built binaries will find it.
+///
+/// # Why this is a separate command and not part of `build`
+///
+/// PDF page rendering -- covers from page 1, exporting a page as an
+/// image -- needs Google's PDFium, a C++ library with no pure-Rust
+/// equivalent. It is bound at *run* time (`crates/calibre_ebooks/src/
+/// pdf/rasterize.rs` explains why), so nothing here is needed to
+/// compile or test the workspace: without it, PDFs simply import
+/// without covers.
+///
+/// Keeping it out of `build` is the point. `build` works offline; this
+/// reaches GitHub. Folding a network download into the build step is
+/// exactly what makes `ort` painful in this workspace.
+///
+/// # Why `curl` and `tar` rather than Rust crates
+///
+/// They avoid adding an HTTP stack, a gzip decoder and a tar reader to
+/// a build tool that currently depends on `anyhow` alone. Both ship
+/// with Windows 10 1803 and later as `curl.exe` and `tar.exe`, and are
+/// standard on macOS and Linux, so this is not a shell script in
+/// disguise -- it invokes two binaries directly, the same way the rest
+/// of this file invokes `cargo` and `npm`.
+fn fetch_pdfium() -> Result<()> {
+    let asset = pdfium_asset_name()?;
+    let url = format!("https://github.com/bblanchon/pdfium-binaries/releases/latest/download/{asset}");
+
+    let root = root();
+    let staging = root.join("target").join("pdfium");
+    std::fs::create_dir_all(&staging).with_context(|| format!("creating {}", staging.display()))?;
+    let archive = staging.join(&asset);
+
+    step(&format!("downloading {asset}"));
+    // `-f` so an HTTP error is a failure rather than a saved error
+    // page; `-L` because the download URL is a redirect.
+    exec(Command::new("curl").args(["-fsSL", "-o"]).arg(&archive).arg(&url), "curl").with_context(|| format!("downloading {url}"))?;
+
+    step("extracting");
+    exec(Command::new("tar").arg("-xzf").arg(&archive).arg("-C").arg(&staging), "tar").context("extracting the PDFium archive")?;
+
+    // The archive lays the library out the way the platform does:
+    // `bin/pdfium.dll` on Windows, `lib/libpdfium.{so,dylib}`
+    // elsewhere.
+    let (subdir, lib_name) = if cfg!(windows) {
+        ("bin", "pdfium.dll")
+    } else if cfg!(target_os = "macos") {
+        ("lib", "libpdfium.dylib")
+    } else {
+        ("lib", "libpdfium.so")
+    };
+    let extracted = staging.join(subdir).join(lib_name);
+    if !extracted.exists() {
+        bail!("{} is not in the downloaded archive -- the release layout may have changed", extracted.display());
+    }
+
+    // Both profiles: which one a developer runs is their business, and
+    // the file is small enough that copying it twice is not worth
+    // making them choose.
+    let mut installed = Vec::new();
+    for profile in ["debug", "release"] {
+        let dir = root.join("target").join(profile);
+        if !dir.exists() {
+            continue;
+        }
+        let dest = dir.join(lib_name);
+        std::fs::copy(&extracted, &dest).with_context(|| format!("copying to {}", dest.display()))?;
+        installed.push(dest);
+    }
+
+    if installed.is_empty() {
+        // Nothing has been built yet, so there is nowhere for it to
+        // go that the loader would look. Say where it ended up rather
+        // than silently succeeding.
+        eprintln!(
+            "\n  downloaded to {}\n  target/debug and target/release do not exist yet -- build first, then run this again",
+            extracted.display()
+        );
+        return Ok(());
+    }
+
+    eprintln!();
+    for path in &installed {
+        eprintln!("  installed {}", path.display());
+    }
+    Ok(())
+}
+
+/// The release asset for the host platform.
+fn pdfium_asset_name() -> Result<String> {
+    let os = if cfg!(windows) {
+        "win"
+    } else if cfg!(target_os = "macos") {
+        "mac"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        bail!("no prebuilt PDFium is published for this operating system");
+    };
+
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        "x86" => "x86",
+        other => bail!("no prebuilt PDFium is published for {other}"),
+    };
+
+    Ok(format!("pdfium-{os}-{arch}.tgz"))
 }
 
 fn test_all() -> Result<()> {
