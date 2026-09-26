@@ -880,3 +880,95 @@ mod auto_add_tests {
         assert_eq!(found, vec!["a.epub", "b.epub", "c.epub"]);
     }
 }
+
+/// Guards the access-control wiring.
+///
+/// The window navigates to the `calibre_srv` it spawns, so its page is
+/// *remote* content and every command it invokes needs an explicit
+/// capability. Getting that wrong does not fail to compile and does not
+/// fail any other test -- it fails at runtime, in the user's hands,
+/// with "Command X not allowed by ACL". That is how it reached a user
+/// the first time.
+#[cfg(test)]
+mod acl_tests {
+    use std::collections::BTreeSet;
+
+    /// The commands `run()` actually registers, read from this file.
+    ///
+    /// `generate_handler!` does not expose its list, so it is parsed
+    /// back out of the source. Coarse, but it is the only way to
+    /// compare what is *registered* against what is *permitted*, which
+    /// is the pair that drifts.
+    fn registered_commands() -> BTreeSet<String> {
+        let src = include_str!("lib.rs");
+        let start = src.find("generate_handler![").expect("generate_handler! call");
+        let body = &src[start + "generate_handler![".len()..];
+        let end = body.find(']').expect("closing bracket");
+        body[..end]
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    fn permitted_commands(capability: &str) -> BTreeSet<String> {
+        let json: serde_json::Value = serde_json::from_str(capability).expect("capability json");
+        json["permissions"]
+            .as_array()
+            .expect("permissions array")
+            .iter()
+            .filter_map(|p| p.as_str())
+            .filter_map(|p| p.strip_prefix("allow-"))
+            // The generator slugifies underscores to hyphens; reverse
+            // it to compare against the command names.
+            .map(|p| p.replace('-', "_"))
+            .collect()
+    }
+
+    const SERVED_UI: &str = include_str!("../capabilities/served-ui.json");
+    const APP_LOCAL: &str = include_str!("../capabilities/app-local.json");
+
+    #[test]
+    fn every_registered_command_is_reachable_from_the_served_ui() {
+        let registered = registered_commands();
+        let permitted = permitted_commands(SERVED_UI);
+        let missing: Vec<_> = registered.difference(&permitted).collect();
+        assert!(
+            missing.is_empty(),
+            "these commands are registered but not permitted for the served UI, so \
+             invoking them fails at runtime with \"not allowed by ACL\": {missing:?}"
+        );
+    }
+
+    #[test]
+    fn every_registered_command_is_reachable_from_the_splash() {
+        let registered = registered_commands();
+        let permitted = permitted_commands(APP_LOCAL);
+        let missing: Vec<_> = registered.difference(&permitted).collect();
+        assert!(missing.is_empty(), "not permitted for the local splash: {missing:?}");
+    }
+
+    /// A permission for a command that no longer exists is dead weight,
+    /// and reads as though the command is still there.
+    #[test]
+    fn no_capability_names_a_command_that_does_not_exist() {
+        let registered = registered_commands();
+        for (name, capability) in [("served-ui", SERVED_UI), ("app-local", APP_LOCAL)] {
+            let stale: Vec<_> = permitted_commands(capability).difference(&registered).cloned().collect();
+            assert!(stale.is_empty(), "{name} permits commands that are not registered: {stale:?}");
+        }
+    }
+
+    /// The port is chosen at startup, so the grant has to cover any of
+    /// them. A fixed port here would work until the first collision.
+    #[test]
+    fn the_remote_grant_covers_a_loopback_origin_on_any_port() {
+        let json: serde_json::Value = serde_json::from_str(SERVED_UI).unwrap();
+        let urls: Vec<&str> = json["remote"]["urls"].as_array().unwrap().iter().map(|u| u.as_str().unwrap()).collect();
+        assert!(urls.iter().any(|u| u.starts_with("http://127.0.0.1:")), "no loopback grant: {urls:?}");
+        assert!(
+            urls.iter().all(|u| u.ends_with(":*")),
+            "a fixed port would break as soon as it is taken: {urls:?}"
+        );
+    }
+}

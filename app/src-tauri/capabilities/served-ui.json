@@ -1,0 +1,33 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "served-ui",
+  "description": "The library UI served by the calibre_srv this app spawns. It runs on a loopback origin with a port chosen at startup, so it is remote content by Tauri's reckoning and needs its commands granted explicitly.",
+  "windows": [
+    "main"
+  ],
+  "remote": {
+    "urls": [
+      "http://127.0.0.1:*",
+      "http://localhost:*"
+    ]
+  },
+  "permissions": [
+    "allow-ping",
+    "allow-get-persisted-library",
+    "allow-choose-library",
+    "allow-create-library",
+    "allow-list-recent-libraries",
+    "allow-open-recent-library",
+    "allow-import-library-archive",
+    "allow-choose-folder-and-add-books",
+    "allow-get-auto-add-folder",
+    "allow-choose-auto-add-folder",
+    "allow-open-book-format",
+    "allow-unpack-book",
+    "allow-repack-book",
+    "allow-open-external-url",
+    "allow-set-menu-actions",
+    "allow-get-auto-reopen",
+    "allow-set-auto-reopen"
+  ]
+}

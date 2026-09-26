@@ -1,0 +1,28 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "app-local",
+  "description": "The bundled splash screen: choosing, creating and reopening a library before the served UI takes over.",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "allow-ping",
+    "allow-get-persisted-library",
+    "allow-choose-library",
+    "allow-create-library",
+    "allow-list-recent-libraries",
+    "allow-open-recent-library",
+    "allow-import-library-archive",
+    "allow-choose-folder-and-add-books",
+    "allow-get-auto-add-folder",
+    "allow-choose-auto-add-folder",
+    "allow-open-book-format",
+    "allow-unpack-book",
+    "allow-repack-book",
+    "allow-open-external-url",
+    "allow-set-menu-actions",
+    "allow-get-auto-reopen",
+    "allow-set-auto-reopen"
+  ]
+}
