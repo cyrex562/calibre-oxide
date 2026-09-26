@@ -209,6 +209,12 @@ const editSeries = ref("");
 const editSeriesIndex = ref("");
 const editTags = ref("");
 const editRating = ref(0);
+// Publisher, published date and comments are all standard fields that
+// `Cache::set_field` has always handled -- they were simply never
+// offered by this form, so there was no way to set them from the app.
+const editPublisher = ref("");
+const editPubdate = ref("");
+const editComments = ref("");
 const coverInput = ref<HTMLInputElement | null>(null);
 
 // Custom columns (issue #720) -- discovered from /ajax/field-metadata
@@ -240,6 +246,11 @@ function startEditing() {
   editSeriesIndex.value = b.series_index != null ? String(b.series_index) : "";
   editTags.value = (b.tags ?? []).join(", ");
   editRating.value = b.rating ?? 0;
+  editPublisher.value = (b.publisher as string | null) ?? "";
+  // The server sends an ISO timestamp; `<input type="date">` wants
+  // just the date part, and rejects the whole string otherwise.
+  editPubdate.value = typeof b.pubdate === "string" ? b.pubdate.slice(0, 10) : "";
+  editComments.value = (b.comments as string | null) ?? "";
   editCustomValues.value = {};
   for (const field of customColumnFields.value) {
     const raw = b[field.label];
@@ -270,7 +281,13 @@ async function saveEdits() {
       series: editSeries.value,
       tags: editTags.value.split(",").map((t) => t.trim()).filter(Boolean),
       rating: editRating.value,
+      publisher: editPublisher.value,
+      comments: editComments.value,
     };
+    // Sent only when set: an empty string is not a date, and clearing
+    // the field should leave the stored value alone rather than
+    // writing a value the column cannot hold.
+    if (editPubdate.value.trim() !== "") changes.pubdate = editPubdate.value;
     if (editSeriesIndex.value.trim() !== "") {
       const idx = Number(editSeriesIndex.value);
       if (!Number.isNaN(idx)) changes.series_index = idx;
@@ -946,6 +963,9 @@ watch(
             <label>Series index <input v-model="editSeriesIndex" type="number" step="0.1" /></label>
             <label>Tags <input v-model="editTags" placeholder="scifi, classic" /></label>
             <label>Rating <input v-model.number="editRating" type="number" min="0" max="5" step="1" /></label>
+            <label>Publisher <input v-model="editPublisher" /></label>
+            <label>Published <input v-model="editPubdate" type="date" /></label>
+            <label class="edit-comments">Comments <textarea v-model="editComments" rows="4"></textarea></label>
             <template v-for="field in customColumnFields" :key="field.key">
               <label v-if="field.is_editable && field.datatype === 'bool'" class="checkbox-field">
                 <input type="checkbox" :checked="editCustomValues[field.label] === 'true'" @change="editCustomValues[field.label] = ($event.target as HTMLInputElement).checked ? 'true' : 'false'" />

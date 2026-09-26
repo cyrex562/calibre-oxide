@@ -1003,18 +1003,31 @@ impl Cache {
 
             let mut formats = Vec::new();
             let mut available_formats = Vec::new();
-            let mut data_formats: Vec<String> = Vec::new();
+            // `name` is the file's own stem as recorded when the format
+            // was added. Reading it -- rather than recomputing
+            // `sanitize_file_name(title)` -- is what keeps a book
+            // openable after its title is edited: the file on disk does
+            // not change name, so recomputing produced a path that did
+            // not exist and the format silently vanished from the row.
+            // Every route that serves a book (`/get/{fmt}`, convert,
+            // open-externally, download) reads these keys, so all of
+            // them 404'd at once.
+            let mut data_formats: Vec<(String, String)> = Vec::new();
             {
                 let conn = self.backend.conn.lock().unwrap();
-                let mut stmt = conn.prepare("SELECT format FROM data WHERE book = ?1")?;
-                let rows = stmt.query_map([book_id], |row| row.get::<_, String>(0))?;
+                let mut stmt = conn.prepare("SELECT format, name FROM data WHERE book = ?1")?;
+                let rows = stmt.query_map([book_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
                 for row in rows {
                     data_formats.push(row?);
                 }
             }
-            for fmt in &data_formats {
+            for (fmt, stem) in &data_formats {
                 available_formats.push(fmt.to_uppercase());
-                let file_name = format!("{}.{}", sanitize_file_name(&title), fmt.to_lowercase());
+                // An older row, or one written before `name` was
+                // populated, falls back to the title -- which is what
+                // the filename would have been at that point anyway.
+                let stem = if stem.is_empty() { sanitize_file_name(&title) } else { stem.clone() };
+                let file_name = format!("{}.{}", stem, fmt.to_lowercase());
                 let abs_path = library_path.join(&path_rel).join(&file_name);
                 if abs_path.exists() {
                     let out_path = if prefix != library_path {
@@ -3101,6 +3114,42 @@ mod tests {
             cache.field_for(id, "series_index").unwrap(),
             Some("3.5".to_string())
         );
+    }
+
+    /// Renaming a book must not orphan its files.
+    ///
+    /// The row builder used to recompute each format's filename from
+    /// the *current* title, while the file on disk keeps the name it
+    /// was given when added. Editing a title therefore produced a path
+    /// that did not exist, the `fmt_*` key vanished, and every route
+    /// that serves a book -- read, open externally, download, convert
+    /// -- returned 404 for a book that was sitting right there.
+    #[test]
+    fn a_renamed_book_can_still_be_opened() {
+        let (dir, cache) = open_test_cache();
+
+        let source = dir.path().join("original.pdf");
+        std::fs::write(&source, b"%PDF-1.4 pretend").unwrap();
+        let mut meta = MetaInformation::default();
+        meta.title = "Original Title".to_string();
+        meta.authors = vec!["An Author".to_string()];
+        let id = cache.add_book(&source, &meta).unwrap();
+
+        let row = |cache: &Cache| cache.get_data_as_dict(None, false, None, false).unwrap()[0].clone();
+
+        let before = row(&cache);
+        let path_before = before["fmt_pdf"].as_str().expect("the format resolves before the rename").to_string();
+        assert!(std::path::Path::new(&path_before).exists());
+
+        cache.set_field(id, "title", "A Completely Different Title").unwrap();
+
+        let after = row(&cache);
+        let path_after = after["fmt_pdf"].as_str().expect("the format must still resolve after a rename");
+        assert!(
+            std::path::Path::new(path_after).exists(),
+            "the recorded path {path_after} does not exist, so every route serving this book will 404"
+        );
+        assert_eq!(after["title"], "A Completely Different Title");
     }
 
     #[test]
