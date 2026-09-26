@@ -3,7 +3,7 @@
 // role for this slice, narrowed to only what the library-browser MVP
 // needs.
 
-import type { AddBookResult, BookFieldChanges, BookSummary, BooksInPage, CategoryEntry, CategoryPage, ConversionBookData, ConversionStatus, CustomColumnInfo, FieldMetadataResponse, FtsSearchResult, FtsSnippet, SearchResult, VirtualLibraries } from "./types";
+import type { AddBookResult, BookFieldChanges, BookSummary, BooksInPage, CategoryEntry, CategoryPage, ConversionBookData, ConversionStatus, CustomColumnInfo, FieldMetadataResponse, FtsSearchResult, FtsSnippet, RenameFilesResponse, SearchResult, VirtualLibraries } from "./types";
 
 async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(url, init);
@@ -90,6 +90,26 @@ export async function setFields(bookId: number, changes: BookFieldChanges): Prom
 
 export async function setCover(bookId: number, file: File): Promise<void> {
   await jsonFetch(`/cdb/set-cover/${bookId}`, { method: "POST", body: file });
+}
+
+/**
+ * Renames the files of one or more books, or -- with `dryRun` -- says
+ * what renaming them would do.
+ *
+ * `template` is a calibre `{field}` template, the same dialect
+ * save-to-disk uses; a string with no substitutions in it is a literal
+ * name, which is how a single book gets renamed by hand.
+ *
+ * Preview and apply are the same request deliberately: the names shown
+ * in a preview are then produced by exactly the code that will use
+ * them, collision handling included.
+ */
+export async function renameFiles(bookIds: number[], template: string, dryRun: boolean): Promise<RenameFilesResponse> {
+  return await jsonFetch<RenameFilesResponse>("/rename-files/default", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ book_ids: bookIds, template, dry_run: dryRun }),
+  });
 }
 
 /**

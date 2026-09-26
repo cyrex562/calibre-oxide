@@ -197,6 +197,7 @@ pub mod opml;
 pub mod opts;
 pub mod reader_profiles;
 pub mod rename;
+pub mod rename_files;
 pub mod render_endpoints;
 pub mod save_to_disk;
 pub mod share;
@@ -355,6 +356,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/template-tester/evaluate-bulk/{library_id}", post(template_tester::evaluate_bulk))
         .route("/template-tester/evaluate/{book_id}/{library_id}", post(template_tester::evaluate))
         .route("/save-to-disk/{library_id}", post(save_to_disk::save_to_disk))
+        .route("/rename-files/{library_id}", post(rename_files::rename_files))
         .route("/duplicates/scan/{library_id}", post(duplicates::scan))
         .route("/tweak/open/{book_id}/{fmt}/{library_id}", post(tweak::open_session))
         .route("/tweak/file/{session_id}/{*name}", get(tweak::get_file).post(tweak::set_file))

@@ -195,3 +195,21 @@ export interface BookFieldChanges {
   // fallback dispatches any name matching a real custom_columns row -- see issue #720).
   [key: string]: unknown;
 }
+
+/** One book's outcome from `POST /rename-files` (issue #885). */
+export interface RenameFileResult {
+  book_id: number;
+  title: string;
+  /** The filename stem the book's formats use now. */
+  current: string;
+  /** Absent when the template could not produce a usable name. */
+  proposed?: string;
+  changed: boolean;
+  error?: string;
+}
+
+export interface RenameFilesResponse {
+  dry_run: boolean;
+  renamed: number;
+  results: RenameFileResult[];
+}

@@ -11,7 +11,7 @@ import AnnotationsBrowser from "./AnnotationsBrowser.vue";
 import PolishDialog from "./PolishDialog.vue";
 import HelpDialog from "./HelpDialog.vue";
 import { LAYOUT_KEY, type LayoutPrefs, type Panel, parseLayout, resizedWidth } from "../library/layout";
-import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchLibraryInfo, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
+import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchLibraryInfo, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameFiles, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
 import type { CheckLibraryResult, CustomRecipeOptions, DuplicateBook, NewsFeedInput, NewsSchedule, SaveToDiskResult } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
 import { similarBooksQuery } from "../library/query";
@@ -27,7 +27,8 @@ import { onMenuAction, syncDesktopMenu } from "../library/desktopMenu";
 import { shortcutFor } from "../library/shortcuts";
 import { isTauri, tauriInvoke } from "../tauri";
 import { DEFAULT_KEYMAP, DEFAULT_LIBRARY_PREFS, DEFAULT_SAVE_TO_DISK_TEMPLATE, DEFAULT_TOOLBAR_PREFS, fetchProfile, KEYMAP_PROFILE, libraryShortcuts, LIBRARY_PREFS_PROFILE, saveProfile, TOOLBAR_PREFS_PROFILE, type KeymapPrefs, type LibraryPrefs, type ToolbarPrefs } from "../settings/api";
-import type { BookSummary, CustomColumnInfo, FieldMetaEntry, FtsSnippet } from "../library/types";
+import type { BookSummary, CustomColumnInfo, FieldMetaEntry, FtsSnippet, RenameFileResult } from "../library/types";
+import { DEFAULT_RENAME_TEMPLATE, describeRename, initialRenameTemplate, previewIsCurrent, type RenamePreviewKey, summarizeRename } from "../library/renameFiles";
 
 // Real, persisted default (issue #721) -- overwritten by
 // loadLibraryPrefs() below once its fetch resolves; starts at the
@@ -1044,6 +1045,88 @@ async function persistSaveTemplate() {
   }
 }
 
+// Rename files (#885). The title of a book and the name of the file
+// holding it are separate things; this changes only the second.
+//
+// Preview is mandatory rather than optional: a rename cannot be
+// undone, so Apply stays disabled until the names on screen were
+// computed for exactly this template and this selection.
+const renameOpen = ref(false);
+const renameTemplate = ref(DEFAULT_RENAME_TEMPLATE);
+const renameBusy = ref(false);
+const renameResults = ref<RenameFileResult[]>([]);
+const renameApplied = ref(false);
+const renameError = ref<string | null>(null);
+const renamePreviewedFor = ref<RenamePreviewKey | null>(null);
+
+const renameScope = computed(() => (selectMode.value && selectedIds.value.size > 0 ? [...selectedIds.value] : selectedBookId.value !== null ? [selectedBookId.value] : []));
+const renameCanApply = computed(() => !renameBusy.value && !renameApplied.value && previewIsCurrent(renamePreviewedFor.value, renameTemplate.value, renameScope.value) && renameResults.value.some((r) => r.changed));
+const renameSummary = computed(() => (renameResults.value.length ? describeRename(summarizeRename(renameResults.value), renameApplied.value) : ""));
+
+async function openRenameFiles() {
+  const ids = renameScope.value;
+  if (ids.length === 0) return;
+  renameOpen.value = true;
+  renameResults.value = [];
+  renameApplied.value = false;
+  renameError.value = null;
+  renamePreviewedFor.value = null;
+
+  // Prefilling with the book's current filename needs to know what it
+  // is, and a dry run already reports that in `current` for every
+  // book -- whatever template it was asked about. So the dialog opens
+  // with one, purely to read the current names back; the proposal it
+  // also returns is discarded, and no preview is shown until the user
+  // asks for one.
+  // Busy while the probe is in flight, so a fast typist's name cannot
+  // be overwritten by the prefill arriving late.
+  renameBusy.value = true;
+  try {
+    const { results } = await renameFiles(ids, "{title}", true);
+    renameTemplate.value = initialRenameTemplate(results.map((r) => r.current));
+  } catch {
+    renameTemplate.value = DEFAULT_RENAME_TEMPLATE;
+  } finally {
+    renameBusy.value = false;
+  }
+}
+
+async function previewRename() {
+  const ids = renameScope.value;
+  if (ids.length === 0 || !renameTemplate.value.trim()) return;
+  renameBusy.value = true;
+  renameError.value = null;
+  renameApplied.value = false;
+  try {
+    const { results } = await renameFiles(ids, renameTemplate.value, true);
+    renameResults.value = results;
+    renamePreviewedFor.value = { template: renameTemplate.value, bookIds: ids };
+  } catch (e) {
+    renameResults.value = [];
+    renamePreviewedFor.value = null;
+    renameError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    renameBusy.value = false;
+  }
+}
+
+async function applyRename() {
+  if (!renameCanApply.value) return;
+  renameBusy.value = true;
+  renameError.value = null;
+  try {
+    const { results } = await renameFiles(renameScope.value, renameTemplate.value, false);
+    renameResults.value = results;
+    renameApplied.value = true;
+    // The `fmt_*` paths every row carries have moved.
+    await runSearch();
+  } catch (e) {
+    renameError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    renameBusy.value = false;
+  }
+}
+
 async function runSaveToDisk() {
   const ids = selectMode.value && selectedIds.value.size > 0 ? [...selectedIds.value] : selectedBookId.value !== null ? [selectedBookId.value] : [];
   if (ids.length === 0 || !saveToDiskDest.value.trim()) return;
@@ -1349,6 +1432,7 @@ const actionHandlers: Partial<Record<LibraryActionId, () => void>> = {
     bulkOpen.value = true;
   },
   "save-to-disk": () => openSaveToDisk(),
+  "rename-files": () => void openRenameFiles(),
 };
 
 // Full-text search replaces the whole result area with a different
@@ -1399,6 +1483,7 @@ function actionLabel(action: LibraryAction): string {
       return selectMode.value ? "Cancel selection" : action.label;
     case "bulk-edit":
     case "save-to-disk":
+    case "rename-files":
       return `${action.label} (${selectedIds.value.size})`;
     default:
       return action.label;
@@ -1733,7 +1818,7 @@ function onLibraryKeydown(event: KeyboardEvent) {
   // A modal owns the keyboard while it is open -- firing library
   // shortcuts underneath one would act on a view the user cannot
   // currently see.
-  if (contextMenu.value || manageOpen.value || columnsOpen.value || columnPickerOpen.value || checkLibraryOpen.value || duplicatesOpen.value || saveToDiskOpen.value || newsOpen.value || switchOpen.value) return;
+  if (contextMenu.value || manageOpen.value || columnsOpen.value || columnPickerOpen.value || checkLibraryOpen.value || duplicatesOpen.value || saveToDiskOpen.value || renameOpen.value || newsOpen.value || switchOpen.value) return;
 
   const id = shortcutFor(event, libraryShortcuts(keymap.value));
   if (!id) return;
@@ -2456,6 +2541,42 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
       </div>
     </div>
 
+    <div v-if="renameOpen" class="manage-backdrop" @click.self="renameOpen = false">
+      <div class="manage-panel">
+        <button class="manage-close" @click="renameOpen = false">✕</button>
+        <h3>Rename files ({{ renameScope.length }})</h3>
+        <p class="news-hint">
+          Renames the book files on disk. The title, author and library folder are not touched — this changes only what the file is called.
+          Type a name, or a template such as <code>{{ '{title} - {authors}' }}</code>; the same fields save-to-disk accepts work here.
+        </p>
+        <form @submit.prevent="previewRename">
+          <label class="news-field">
+            New name or template
+            <input v-model="renameTemplate" placeholder="{title} - {authors}" :disabled="renameBusy" />
+          </label>
+          <div class="bulk-actions">
+            <button type="submit" :disabled="renameBusy || !renameTemplate.trim()">{{ renameBusy ? "Working…" : "Preview" }}</button>
+            <!--
+              Renaming cannot be undone, so this stays disabled until
+              the table below was computed for exactly this template
+              and this selection -- editing either invalidates it.
+            -->
+            <button type="button" class="read" :disabled="!renameCanApply" @click="applyRename">Rename</button>
+            <button type="button" :disabled="renameBusy" @click="renameOpen = false">Close</button>
+          </div>
+        </form>
+        <p v-if="renameError" class="error">{{ renameError }}</p>
+        <p v-if="renameSummary" class="news-hint">{{ renameSummary }}</p>
+        <ul v-if="renameResults.length" class="manage-list">
+          <li v-for="r in renameResults" :key="r.book_id">
+            <span v-if="r.error" class="error">{{ r.title }}: {{ r.error }}</span>
+            <span v-else-if="r.changed" class="manage-name">{{ r.current || "(unnamed)" }} → {{ r.proposed }}</span>
+            <span v-else class="manage-name muted">{{ r.current }} (unchanged)</span>
+          </li>
+        </ul>
+      </div>
+    </div>
+
     <div v-if="saveToDiskOpen" class="manage-backdrop" @click.self="saveToDiskOpen = false">
       <div class="manage-panel">
         <button class="manage-close" @click="saveToDiskOpen = false">✕</button>
@@ -3062,6 +3183,13 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
 .manage-name {
   font-weight: 600;
   flex-shrink: 0;
+}
+/* A rename preview lists every selected book, including the ones
+   already named correctly -- they are context, not the result, and
+   should not read with the same weight as the rows that will move. */
+.manage-name.muted {
+  font-weight: 400;
+  color: var(--fg-muted);
 }
 .manage-query {
   color: var(--fg-muted);
