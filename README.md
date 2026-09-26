@@ -87,6 +87,17 @@ Binaries land in `target/release/`:
 | `ebook-convert` | format conversion |
 | `ebook-meta` | metadata inspection and editing |
 
+## How a library works
+
+A library is **a folder you own**, with an index inside it. Books are tracked
+where they already sit; files are never moved or renamed unless you ask. This is
+a deliberate divergence from calibre, which owns its library folder and moves
+files to match their metadata — see
+[docs/LIBRARY_MODEL.md](docs/LIBRARY_MODEL.md) for the model, the reasoning, and
+the filesystem edge cases it has to survive.
+
+A real calibre library still opens and reads correctly.
+
 ## Layout
 
 ```
