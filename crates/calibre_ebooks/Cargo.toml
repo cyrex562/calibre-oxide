@@ -15,6 +15,7 @@ roxmltree = "0.18"
 zip = "0.6"
 thiserror = "1.0"
 anyhow = "1.0"
+log = "0.4"
 regex = "1.10"
 fancy-regex = "0.19"
 lazy_static = "1.4"
@@ -26,6 +27,12 @@ byteorder = "1.5.0"
 flate2 = "1.0"
 base64 = "0.21"
 lopdf = "0.38.0"
+# Rasterizing PDF pages (covers, page export). Bound dynamically at
+# runtime -- deliberately NOT a build-time dependency on a native
+# library; see `src/pdf/rasterize.rs` for why. `default-features`
+# off drops its optional `image` 0.25 bridge, which would pull a
+# second copy of `image` in beside this crate's own 0.24.
+pdfium-render = { version = "0.9", default-features = false, features = ["pdfium_latest", "thread_safe"] }
 bzip2 = "0.4"
 clap = { version = "4.4", features = ["derive"] }
 url = "2.5"

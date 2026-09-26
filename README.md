@@ -45,11 +45,31 @@ bundles the other two and building them out of order fails somewhere
 that does not mention the order.
 
 ```
-cargo xtask build      # everything, ending in a runnable app
-cargo xtask package    # the above, plus installers — see the note below
-cargo xtask test       # the Rust suite and the web suite
-cargo xtask help       # the rest
+cargo xtask build          # everything, ending in a runnable app
+cargo xtask package        # the above, plus installers — see the note below
+cargo xtask test           # the Rust suite and the web suite
+cargo xtask fetch-pdfium   # the PDF rendering library — see below
+cargo xtask help           # the rest
 ```
+
+### PDF covers
+
+Rendering a PDF page — which is how a PDF gets a cover, and what
+"Export page as…" in the reader saves — needs Google's PDFium, a C++
+library with no pure-Rust equivalent. It is **optional**: nothing here
+needs it to build, test or run, and without it PDFs simply import with
+no cover.
+
+```
+cargo xtask fetch-pdfium
+```
+
+That downloads the prebuilt library for your platform from
+[pdfium-binaries](https://github.com/bblanchon/pdfium-binaries)
+(Apache-2.0) and puts it beside the built binaries, where they look for
+it. It is a separate command precisely so that `build` keeps working
+offline. `CALIBRE_OXIDE_PDFIUM` overrides where it is looked for, if
+you have a copy elsewhere.
 
 `build` stops at a runnable application and needs no network.
 `package` is separate on purpose: producing installers is the part that

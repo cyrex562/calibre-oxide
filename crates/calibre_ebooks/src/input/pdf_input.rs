@@ -57,8 +57,11 @@ impl PDFInput {
         book.manifest.hrefs.insert(href.clone(), id.clone());
         book.spine.add(&id, true);
 
-        // Metadata
-        if let Ok(info) = crate::metadata::pdf::get_metadata(&mut fs::File::open(input_path)?) {
+        // Metadata. The `quick` variant because only the title and
+        // authors are used below -- the full `get_metadata` also
+        // rasterizes page 1 for a cover, which a conversion input
+        // stage has no use for.
+        if let Ok(info) = crate::metadata::pdf::get_quick_metadata(&mut fs::File::open(input_path)?) {
             if !info.title.is_empty() && info.title != "Unknown" {
                 book.metadata.add("title", &info.title);
             }

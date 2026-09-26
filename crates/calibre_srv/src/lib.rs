@@ -372,6 +372,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/cdb/delete-books/{book_ids}/{library_id}", post(cdb::delete_books))
         .route("/cdb/delete-books/{book_ids}", post(cdb::delete_books_no_library))
         .route("/cdb/set-cover/{book_id}", post(cdb::set_cover))
+        .route("/cdb/cover-from-pdf-page/{book_id}/{page}", post(cdb::cover_from_pdf_page))
         .route("/cdb/set-fields/{book_id}/{library_id}", post(cdb::set_fields))
         .route("/cdb/set-fields/{book_id}", post(cdb::set_fields_no_library))
         .route("/cdb/copy-to-library/{target_library_id}/{library_id}", post(cdb::copy_to_library))

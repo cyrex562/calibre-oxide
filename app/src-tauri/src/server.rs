@@ -80,13 +80,60 @@ pub fn resolve_web_dist(app: &AppHandle) -> io::Result<PathBuf> {
     Err(io::Error::new(io::ErrorKind::NotFound, "web/dist not found -- run `npm run build` in web/ first"))
 }
 
+/// Locates the PDFium library the server renders PDF pages with.
+///
+/// Optional, unlike the two above: without it the server still runs
+/// and PDFs still import, they just get no cover rendered from page 1.
+/// So this returns `Option` rather than `io::Result` -- "not installed"
+/// is a normal state, not a failure to report.
+///
+/// The server would find a copy sitting next to its own binary on its
+/// own (see `rasterize::candidate_library_paths`), but in a packaged
+/// app the resource directory is not where the binary is on every
+/// platform -- a Linux `.deb` puts resources under `/usr/lib/<app>/`.
+/// Resolving it here and passing it explicitly means one answer on all
+/// three platforms.
+pub fn resolve_pdfium(app: &AppHandle) -> Option<PathBuf> {
+    let lib_name = if cfg!(windows) {
+        "pdfium.dll"
+    } else if cfg!(target_os = "macos") {
+        "libpdfium.dylib"
+    } else {
+        "libpdfium.so"
+    };
+
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        let candidate = resource_dir.join(lib_name);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    let root = dev_workspace_root();
+    for profile in ["debug", "release"] {
+        let candidate = root.join("target").join(profile).join(lib_name);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// Spawns `calibre_srv <library_path> --static-dir <static_dir> --port
 /// <port>` -- real auth stays off (`calibre_srv`'s own default with no
 /// `--add-user` ever called): a locally-spawned server that only this
 /// app's own window ever talks to has nothing to authenticate against.
-pub fn spawn(bin: &Path, library_path: &Path, static_dir: &Path, port: u16) -> io::Result<Child> {
+pub fn spawn(bin: &Path, library_path: &Path, static_dir: &Path, port: u16, pdfium: Option<&Path>) -> io::Result<Child> {
     let mut cmd = Command::new(bin);
     cmd.arg(library_path).arg("--static-dir").arg(static_dir).arg("--port").arg(port.to_string());
+    if let Some(pdfium) = pdfium {
+        // Read by `calibre_ebooks::pdf::rasterize`. An environment
+        // variable rather than a flag because every binary in the
+        // workspace that can render a PDF reads the same one --
+        // `calibredb` included -- and only one of them has a CLI this
+        // app constructs.
+        cmd.env(calibre_ebooks::pdf::rasterize::LIBRARY_PATH_VAR, pdfium);
+    }
     no_console_window(&mut cmd);
     cmd.spawn()
 }

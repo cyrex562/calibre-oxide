@@ -48,7 +48,11 @@ async fn serve_path(path: std::path::PathBuf, content_type: &str, download_name:
     Ok(resp)
 }
 
-async fn fetch_book_row(cache: std::sync::Arc<calibre_db::cache::Cache>, book_id: i32) -> Result<serde_json::Value, ServerError> {
+/// `pub(crate)`: also used by `cdb.rs`'s cover-from-a-PDF-page route,
+/// which needs a format's real on-disk path and must resolve it the
+/// same way `/get` does rather than re-deriving it (re-derivation is
+/// exactly what made a renamed book's formats unreachable).
+pub(crate) async fn fetch_book_row(cache: std::sync::Arc<calibre_db::cache::Cache>, book_id: i32) -> Result<serde_json::Value, ServerError> {
     let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<serde_json::Value>> {
         let ids: std::collections::HashSet<i32> = std::iter::once(book_id).collect();
         cache.get_data_as_dict(None, true, Some(&ids), false)

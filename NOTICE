@@ -104,3 +104,23 @@ inside the binary:
 
   * espeak-ng, reached through the `espeak-ng` crate, is GPL-3.0-or-later
     and compatible with this project's GPL v3.
+
+
+Downloaded at the user's request, not bundled
+---------------------------------------------
+
+  * **PDFium** -- Google's PDF library, used to render a PDF page to an
+    image (a cover from page 1; "Export page as..." in the reader).
+    BSD-3-Clause, plus the licences of its own vendored third-party
+    code, all of which travel with the download.
+
+    It is not in this repository and is not fetched by the build.
+    `cargo xtask fetch-pdfium` downloads a prebuilt copy from
+    <https://github.com/bblanchon/pdfium-binaries> (whose own build
+    scripts are Apache-2.0) if and when someone asks for it, and the
+    packaging step bundles it only if it is already there.
+
+    BSD-3-Clause is GPL-compatible, so unlike UnRAR above this places
+    no constraint on distributing a built binary. It is listed here
+    rather than under "bundled" only because nothing arrives with a
+    plain `git clone`.

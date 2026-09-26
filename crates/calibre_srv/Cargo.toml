@@ -52,5 +52,10 @@ reqwest = { version = "0.11", features = ["blocking"] }
 
 [dev-dependencies]
 tower = "0.5"
+# Tests only: decoding a stored cover to check *which* PDF page it came
+# from. Production code here never touches pixels -- the rasterizer and
+# its encoders live in calibre_ebooks -- so this genuinely belongs in
+# dev-dependencies rather than being the #761 mistake again.
+image = { version = "0.24", default-features = false, features = ["jpeg", "png"] }
 tokio-tungstenite = "0.30.0"
 futures-util = "0.3.34"

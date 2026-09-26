@@ -137,6 +137,7 @@ export type LibraryActionId =
   | "test-template"
   | "send-email"
   | "replace-cover"
+  | "cover-from-pdf"
   | "open-externally"
   | "unpack-book"
   | "repack-book"
@@ -204,6 +205,7 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   { id: "test-template", label: "Test template…", group: "book", requires: "single-selection", contextMenu: true, icon: "template_funcs", tooltip: "Try a template against a real book" },
   { id: "send-email", label: "Send…", group: "book", requires: "single-selection", contextMenu: true, icon: "mail", accel: "Ctrl+E", tooltip: "Email a book to a device or address" },
   { id: "replace-cover", label: "Replace cover…", group: "book", requires: "single-selection", contextMenu: true, icon: "default_cover", tooltip: "Replace the cover image" },
+  { id: "cover-from-pdf", label: "Cover from PDF page 1", group: "book", requires: "single-selection", contextMenu: true, icon: "default_cover", tooltip: "Render the first page of the PDF as the cover" },
   { id: "similar-books", label: "Similar books", group: "book", requires: "single-selection", contextMenu: true, icon: "similar", tooltip: "Find books like this one" },
   // Selection-scoped rather than book-scoped: polishing a batch is
   // the normal case, and the engine handles books independently.
@@ -411,7 +413,7 @@ export const TOOLBAR_LAYOUT: ToolbarItem[] = [
   // below, as it does in calibre's own toolbar. Listing it twice would
   // make the Add menu look fuller than it is without adding a route.
   { kind: "split", id: "add-books", menu: ["add-folder"] },
-  { kind: "split", id: "edit-metadata", menu: ["fetch-metadata", "replace-cover", "-", "bulk-edit", "map-metadata", "-", "test-template"] },
+  { kind: "split", id: "edit-metadata", menu: ["fetch-metadata", "replace-cover", "cover-from-pdf", "-", "bulk-edit", "map-metadata", "-", "test-template"] },
   { kind: "separator" },
   { kind: "split", id: "convert", menu: ["polish", "tweak-book", "-", "unpack-book", "repack-book"] },
   { kind: "split", id: "read", menu: ["open-externally", "quick-view", "-", "$recently-viewed", "-", "similar-books"] },

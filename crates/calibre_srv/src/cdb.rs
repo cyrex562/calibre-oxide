@@ -203,6 +203,71 @@ pub async fn set_cover(State(state): State<AppState>, Path(book_id): Path<i32>, 
     Ok(Json(serde_json::json!([book_id])))
 }
 
+/// How wide a cover rendered from a PDF page comes out -- the same
+/// width the reader renders one at in the browser, so a cover does not
+/// change size depending on which of the two produced it.
+const COVER_WIDTH: u32 = calibre_ebooks::pdf::rasterize::DEFAULT_COVER_WIDTH;
+
+/// `POST /cdb/cover-from-pdf-page/{book_id}/{page}`.
+///
+/// Renders one page of the book's PDF and stores it as the cover.
+///
+/// This exists alongside [`set_cover`], which takes image bytes from
+/// the client, because the two have different callers. The reader
+/// normally posts the pixels it already has on a canvas; what it
+/// cannot do is re-cover a book nobody has opened -- a PDF imported
+/// before covers were generated, or one whose first page is a blank
+/// scan. That is a server-side render, and it is also the path
+/// `calibredb` and any future bulk re-cover job would take, neither of
+/// which has a browser to render in. The reader falls back to it too,
+/// if encoding its canvas fails.
+pub async fn cover_from_pdf_page(State(state): State<AppState>, Path((book_id, page)): Path<(i32, usize)>) -> Result<Json<Value>, ServerError> {
+    use calibre_ebooks::pdf::rasterize;
+
+    let cache = state.cache.clone();
+    let row = crate::content::fetch_book_row(cache.clone(), book_id).await?;
+    let pdf_path = row
+        .get("fmt_pdf")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ServerError::NotFound(format!("book {book_id} has no PDF format")))?
+        .to_string();
+
+    let cover = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ServerError> {
+        let bytes = std::fs::read(&pdf_path).map_err(|e| ServerError::NotFound(format!("could not read {pdf_path}: {e}")))?;
+        let rendered = rasterize::render_page(&bytes, page, COVER_WIDTH).map_err(rasterize_error)?;
+        rendered.encode(rasterize::PageImageFormat::Jpeg, rasterize::DEFAULT_JPEG_QUALITY).map_err(rasterize_error)
+    })
+    .await
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))??;
+
+    tokio::task::spawn_blocking({
+        let cache = cache.clone();
+        let cover = cover.clone();
+        move || calibre_db::covers::set_cover(&cache, book_id, &cover)
+    })
+    .await
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))?
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+
+    web_socket::publish(&state, ChangeEvent::MetadataChanged { book_ids: vec![book_id] });
+    Ok(Json(serde_json::json!({ "book_id": book_id, "page": page, "bytes": cover.len() })))
+}
+
+/// Maps a rendering failure onto the status that tells the client what
+/// to do about it: a missing PDFium is the server's problem to fix
+/// (503, and the UI falls back to rendering in the browser), a page
+/// past the end is the request's problem (400), and a broken PDF is
+/// neither (422).
+fn rasterize_error(e: calibre_ebooks::pdf::rasterize::RasterizeError) -> ServerError {
+    use calibre_ebooks::pdf::rasterize::RasterizeError as E;
+    match e {
+        E::Unavailable { .. } => ServerError::ServiceUnavailable(e.to_string()),
+        E::PageOutOfRange { .. } => ServerError::BadRequest(e.to_string()),
+        E::Pdf(_) => ServerError::UnprocessableEntity(e.to_string()),
+        E::Encode(_) => ServerError::InternalServerError(e.to_string()),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SetFieldsBody {
     changes: serde_json::Map<String, Value>,
@@ -643,14 +708,21 @@ mod tests {
         cache.add_book(&source, &meta).unwrap()
     }
 
+    /// Split out of [`test_app`] so a test that needs to keep its own
+    /// handle on the `Cache` (to read a cover back off disk, say) can
+    /// build a router around that same handle rather than a second one
+    /// over the same database.
+    fn test_state(cache: std::sync::Arc<Cache>) -> crate::AppState {
+        crate::AppState { libraries: None, cache, opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()), book_cache: std::sync::Arc::new(crate::books_cache::BookCache::open_temp()), jobs: std::sync::Arc::new(crate::jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))), render_jobs: std::sync::Arc::new(crate::render_endpoints::RenderJobRegistry::new()), conversion_jobs: std::sync::Arc::new(crate::convert::ConversionJobRegistry::new()), news_jobs: std::sync::Arc::new(crate::news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()), tts_voice: None, plugin_store: None, plugin_registry: std::sync::Arc::new(std::sync::Mutex::new(calibre_customize::registry::PluginRegistry::new())), }
+    }
+
     fn test_app(book_count: usize) -> (tempfile::TempDir, axum::Router) {
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::new(dir.path()).unwrap();
         for i in 0..book_count {
             add_test_book(dir.path(), &cache, &format!("Book {i}"), "Author");
         }
-        let state = crate::AppState { libraries: None, cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()), book_cache: std::sync::Arc::new(crate::books_cache::BookCache::open_temp()), jobs: std::sync::Arc::new(crate::jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))), render_jobs: std::sync::Arc::new(crate::render_endpoints::RenderJobRegistry::new()), conversion_jobs: std::sync::Arc::new(crate::convert::ConversionJobRegistry::new()), news_jobs: std::sync::Arc::new(crate::news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()), tts_voice: None, plugin_store: None, plugin_registry: std::sync::Arc::new(std::sync::Mutex::new(calibre_customize::registry::PluginRegistry::new())), };
-        let router = crate::test_router(state);
+        let router = crate::test_router(test_state(std::sync::Arc::new(cache)));
         (dir, router)
     }
 
@@ -679,6 +751,103 @@ mod tests {
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let value = if body.is_empty() { serde_json::Value::Null } else { serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null) };
         (status, value)
+    }
+
+    /// The same two-page fixture `calibre_ebooks::pdf::rasterize` uses
+    /// -- one PDF, checked in once. Page 1 draws a blue rectangle and
+    /// page 2 a red one, which is how the tests below tell which page
+    /// actually became the cover.
+    const TWO_PAGE_PDF: &[u8] = include_bytes!("../../calibre_ebooks/tests/data/two-page.pdf");
+
+    /// Adds a PDF the way the `/cdb/add-book` route does -- through
+    /// `get_metadata`, not a hand-built `MetaInformation`. That matters
+    /// here: rendering page 1 as the cover is something `get_metadata`
+    /// does, so a test that supplied its own metadata would silently
+    /// not be testing the import-time cover at all.
+    fn add_pdf_book(dir: &std::path::Path, cache: &Cache, title: &str) -> i32 {
+        let source = dir.join(format!("{title}.pdf"));
+        std::fs::write(&source, TWO_PAGE_PDF).unwrap();
+        let mut meta = calibre_ebooks::metadata::get_metadata(&source).unwrap();
+        // The fixture carries no Info dictionary, and a title is what
+        // the library folder is named after.
+        meta.title = title.to_string();
+        meta.authors = vec!["Author".to_string()];
+        cache.add_book(&source, &meta).unwrap()
+    }
+
+    /// Skips rather than fails without PDFium installed -- see
+    /// `rasterize`'s own tests for why that is the right default.
+    fn require_pdfium() -> bool {
+        if calibre_ebooks::pdf::rasterize::is_available() {
+            return true;
+        }
+        eprintln!("skipping: no PDFium library available");
+        false
+    }
+
+    /// Which of the fixture's pages a stored cover came from, read off
+    /// the colour of the rectangle that page draws.
+    ///
+    /// Reports the dominant channel rather than an exact pixel: covers
+    /// are stored as JPEG, so the blue rectangle comes back as
+    /// (0, 0, 254) and an equality check would fail for a reason that
+    /// has nothing to do with which page was rendered.
+    fn cover_page(cache: &Cache, book_id: i32) -> &'static str {
+        let path = calibre_db::covers::cover_path(cache, book_id).unwrap();
+        let img = image::load_from_memory(&std::fs::read(path).unwrap()).unwrap().to_rgb8();
+        let scale = img.width() as f32 / 612.0;
+        let px = img.get_pixel((200.0 * scale) as u32, ((792.0 - 350.0) * scale) as u32);
+        match (px[0], px[2]) {
+            (r, b) if b > 200 && r < 60 => "page 1 (blue)",
+            (r, b) if r > 200 && b < 60 => "page 2 (red)",
+            _ => "neither page's rectangle",
+        }
+    }
+
+    #[tokio::test]
+    async fn cover_from_pdf_page_replaces_the_cover_with_the_page_asked_for() {
+        if !require_pdfium() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let cache = std::sync::Arc::new(Cache::new(dir.path()).unwrap());
+        let book_id = add_pdf_book(dir.path(), &cache, "Scanned");
+        let router = crate::test_router(test_state(cache.clone()));
+
+        // Importing already gave it page 1 (blue).
+        assert!(cache.has_cover(book_id).unwrap(), "a PDF should get a cover on import");
+        assert_eq!(cover_page(&cache, book_id), "page 1 (blue)");
+
+        // Re-cover from page 2 (red) -- the case this route exists
+        // for: page 1 was a blank scan or a title sheet.
+        let (status, body) = post_json(&router, &format!("/cdb/cover-from-pdf-page/{book_id}/2"), serde_json::json!(null)).await;
+        assert_eq!(status, StatusCode::OK, "got: {body}");
+        assert_eq!(cover_page(&cache, book_id), "page 2 (red)");
+    }
+
+    #[tokio::test]
+    async fn cover_from_pdf_page_rejects_a_page_past_the_end() {
+        if !require_pdfium() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let cache = std::sync::Arc::new(Cache::new(dir.path()).unwrap());
+        let book_id = add_pdf_book(dir.path(), &cache, "Scanned");
+        let router = crate::test_router(test_state(cache.clone()));
+
+        let (status, _) = post_json(&router, &format!("/cdb/cover-from-pdf-page/{book_id}/9"), serde_json::json!(null)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // And the cover it already had is untouched.
+        assert_eq!(cover_page(&cache, book_id), "page 1 (blue)");
+    }
+
+    #[tokio::test]
+    async fn cover_from_pdf_page_404s_for_a_book_with_no_pdf() {
+        // Book 1 is the EPUB `test_app` adds -- a real book, just not
+        // one with a PDF to render.
+        let (_dir, router) = test_app(1);
+        let (status, _) = post_json(&router, "/cdb/cover-from-pdf-page/1/1", serde_json::json!(null)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

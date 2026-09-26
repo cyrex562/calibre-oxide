@@ -125,3 +125,78 @@ export async function renderPage(doc: PDFDocumentProxy, pageNumber: number, targ
 
   await page.render({ canvas, canvasContext: context, viewport }).promise;
 }
+
+/**
+ * Width a cover rendered from a page comes out at.
+ *
+ * Deliberately the same number as `rasterize::DEFAULT_COVER_WIDTH` on
+ * the server: a cover picked in the reader and one generated at import
+ * should not differ in size depending on which produced it.
+ */
+export const COVER_WIDTH = 1000;
+
+export type PageImageFormat = "jpg" | "png";
+
+export function imageMimeType(format: PageImageFormat): string {
+  return format === "png" ? "image/png" : "image/jpeg";
+}
+
+/**
+ * The scale at which a page `unscaledWidth` points wide renders
+ * `targetWidth` pixels wide.
+ *
+ * Exporting and cover-picking both want a fixed output size rather
+ * than whatever the reader happens to be zoomed to -- someone reading
+ * at 25% should not get a 150px cover.
+ */
+export function scaleForWidth(unscaledWidth: number, targetWidth: number): number {
+  if (!Number.isFinite(unscaledWidth) || unscaledWidth <= 0) return 1;
+  if (!Number.isFinite(targetWidth) || targetWidth <= 0) return 1;
+  return targetWidth / unscaledWidth;
+}
+
+/**
+ * What an exported page is saved as.
+ *
+ * Mirrors the server's own download naming (`content.rs`: 60
+ * characters, quotes and slashes replaced) so a page exported from
+ * the reader and a book downloaded from the library do not follow
+ * two different conventions. Backslashes are included because this
+ * app runs on Windows, where they are separators too.
+ */
+export function pageImageFileName(title: string, page: number, format: PageImageFormat): string {
+  const safe = (title || "book").slice(0, 60).replace(/["/\\]/g, "_").trim() || "book";
+  return `${safe} - page ${page}.${format}`;
+}
+
+/**
+ * Renders one page off-screen at a fixed width and encodes it.
+ *
+ * Off-screen rather than reading back the canvas already on display:
+ * that one is at the reader's current zoom and device pixel ratio,
+ * which is the wrong size for a cover and a surprising size for an
+ * export.
+ */
+export async function renderPageToBlob(doc: PDFDocumentProxy, pageNumber: number, targetWidth: number, format: PageImageFormat): Promise<Blob> {
+  const page = await doc.getPage(pageNumber);
+  const scale = scaleForWidth(page.getViewport({ scale: 1 }).width, targetWidth);
+  const viewport = page.getViewport({ scale });
+
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.floor(viewport.width));
+  canvas.height = Math.max(1, Math.floor(viewport.height));
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("could not get a 2d drawing context for the PDF page");
+
+  // A PDF page is paper. Without this the transparent areas encode as
+  // black in JPEG, which has no alpha channel -- a cover that is
+  // mostly black where the page is blank.
+  context.fillStyle = "#ffffff";
+  context.fillRect(0, 0, canvas.width, canvas.height);
+
+  await page.render({ canvas, canvasContext: context, viewport }).promise;
+
+  return await new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob((blob) => (blob ? resolve(blob) : reject(new Error("the page could not be encoded as an image"))), imageMimeType(format), 0.9);
+  });
+}
