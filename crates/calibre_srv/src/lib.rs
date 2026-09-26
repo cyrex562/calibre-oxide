@@ -290,6 +290,7 @@ impl AppState {
 /// via each `@endpoint`'s own `auth_required=False`; nothing in this
 /// increment needs that yet).
 pub fn router(state: AppState) -> axum::Router {
+    use axum::extract::DefaultBodyLimit;
     use axum::middleware;
     use axum::routing::{get, post};
 
@@ -444,7 +445,38 @@ pub fn router(state: AppState) -> axum::Router {
     // module doc.
     let mathjax_routes = axum::Router::new().route("/mathjax", get(mathjax::mathjax_root)).route("/mathjax/{*which}", get(mathjax::mathjax_file));
 
-    api.merge(mathjax_routes).with_state(state)
+    // Axum's own default body limit is 2MB, which is far below what a
+    // book is: a 13MB PDF was rejected with 413, and a scanned one can
+    // be 200MB. `max_request_body_size` has been in `ServerOptions`
+    // since the options were ported -- carrying upstream's own 500MB
+    // default -- but nothing ever read it, so the 2MB default applied
+    // and the option silently did nothing.
+    //
+    // Applied here, outside the auth layer, so the limit is enforced
+    // before a body is buffered rather than after.
+    let body_limit = body_limit_bytes(state.opts.max_request_body_size);
+
+    api.merge(mathjax_routes).with_state(state).layer(DefaultBodyLimit::max(body_limit))
+}
+
+/// Converts the configured megabyte limit into bytes.
+///
+/// Clamped rather than trusted: the option is a float taken from the
+/// command line, and a negative or absurd value would otherwise become
+/// a nonsense `usize` -- zero, or a wrap-around that disables the limit
+/// entirely. The ceiling is generous enough for any real book and low
+/// enough to stay a limit.
+fn body_limit_bytes(megabytes: f64) -> usize {
+    const MIN_MB: f64 = 1.0;
+    const MAX_MB: f64 = 4096.0;
+    // NaN is the only value with no sensible direction, so it takes
+    // the floor. `clamp` already maps the infinities to the right end
+    // -- treating `+inf` as "smallest possible limit" would be a
+    // surprising reading of "no limit given".
+    if megabytes.is_nan() {
+        return (MIN_MB * 1024.0 * 1024.0) as usize;
+    }
+    (megabytes.clamp(MIN_MB, MAX_MB) * 1024.0 * 1024.0) as usize
 }
 
 /// [`router`], plus a mocked [`axum::extract::ConnectInfo`] so
@@ -463,6 +495,81 @@ pub fn test_router(state: AppState) -> axum::Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod body_limit {
+        use super::*;
+
+        #[test]
+        fn the_default_is_upstreams_own_500mb() {
+            let opts = opts::ServerOptions::default();
+            assert_eq!(body_limit_bytes(opts.max_request_body_size), 500 * 1024 * 1024);
+        }
+
+        // Axum's default is 2MB. A 13MB PDF was rejected with 413 by a
+        // real user before the configured limit was actually applied,
+        // and a scanned book can be 200MB.
+        #[test]
+        fn the_default_admits_a_book_sized_upload() {
+            let limit = body_limit_bytes(opts::ServerOptions::default().max_request_body_size);
+            assert!(limit > 13 * 1024 * 1024, "a 13MB PDF must fit");
+            assert!(limit > 250 * 1024 * 1024, "a scanned book can be 200MB+");
+        }
+
+        #[test]
+        fn megabytes_become_bytes() {
+            assert_eq!(body_limit_bytes(1.0), 1024 * 1024);
+            assert_eq!(body_limit_bytes(64.0), 64 * 1024 * 1024);
+        }
+
+        // The value comes off a command line as a float, so it can be
+        // anything. A negative would otherwise wrap to an enormous
+        // `usize` and disable the limit entirely.
+        #[test]
+        fn a_nonsense_value_still_leaves_a_real_limit() {
+            for bad in [-1.0, 0.0, f64::NAN, f64::NEG_INFINITY] {
+                let limit = body_limit_bytes(bad);
+                assert_eq!(limit, 1024 * 1024, "{bad} should clamp to the 1MB floor");
+            }
+        }
+
+        /// The end-to-end version: a body larger than axum's own 2MB
+        /// default must actually reach a handler through the real
+        /// router, not merely compute a large number.
+        ///
+        /// Uses an add-book request with deliberately junk bytes: the
+        /// point is the body size, and any status other than 413 proves
+        /// the limit let it through. Returning 400 for unreadable
+        /// contents is a pass.
+        #[tokio::test]
+        async fn a_body_over_axums_2mb_default_is_not_rejected_by_size() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_with_static_dir(dir.path());
+            let app = router(state).layer(axum::extract::connect_info::MockConnectInfo(
+                std::net::SocketAddr::from(([127, 0, 0, 1], 12345)),
+            ));
+
+            let body = vec![0u8; 5 * 1024 * 1024];
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/cdb/add-book/job1/n/big.epub/-")
+                .body(axum::body::Body::from(body))
+                .unwrap();
+
+            let response = tower::ServiceExt::oneshot(app, request).await.unwrap();
+            assert_ne!(
+                response.status(),
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                "a 5MB upload was rejected on size; the configured limit is not being applied"
+            );
+        }
+
+        #[test]
+        fn an_absurd_value_is_capped_rather_than_trusted() {
+            assert_eq!(body_limit_bytes(f64::INFINITY), 4096 * 1024 * 1024);
+            assert_eq!(body_limit_bytes(1_000_000.0), 4096 * 1024 * 1024);
+        }
+    }
+
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
