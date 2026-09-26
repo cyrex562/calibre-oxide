@@ -525,7 +525,9 @@ impl Cache {
         // derives it from untrusted input (e.g. an HTTP request body,
         // see `calibre_srv::cdb::set_fields`) must not be able to
         // embed a path separator here and write outside `book_dir`.
-        let file_name = format!("{}.{}", sanitize_file_name(&title), sanitize_file_name(&format.to_lowercase()));
+        let ext = sanitize_file_name(&format.to_lowercase());
+        let stem = self.free_format_stem(book_id, &format, &book_dir, &sanitize_file_name(&title), &ext)?;
+        let file_name = format!("{stem}.{ext}");
         let dest_path = book_dir.join(&file_name);
         if dest_path.exists() && !replace {
             return Ok(false);
@@ -560,37 +562,80 @@ impl Cache {
         )?;
         conn.execute(
             "INSERT OR REPLACE INTO data (book, format, uncompressed_size, name) VALUES (?1, ?2, ?3, ?4)",
-            (book_id, format.to_uppercase(), size, sanitize_file_name(&title)),
+            (book_id, format.to_uppercase(), size, &stem),
         )?;
         drop(conn);
         Ok(true)
     }
 
-    /// Removes the first on-disk file matching `fmt`'s extension from
-    /// the book's folder and its `data` table row, if any.
+    /// A filename stem inside `book_dir` that this book may write its
+    /// `format` file to without destroying somebody else's.
+    ///
+    /// `preferred` (the sanitized title) is used as-is in the ordinary
+    /// case. It is not usable when a *different* book already owns a
+    /// file of that name, which happens more easily than it sounds:
+    /// a book's folder is `<author>/<title>`, so two books with the
+    /// same author and title share one -- and both would then want
+    /// `<title>.<ext>`.
+    ///
+    /// Before this, `add_format` took the name unconditionally and
+    /// copied over whatever was there, because `add_book` passes
+    /// `replace = true` for a book's first format. Adding two books
+    /// with the same title therefore left one file on disk holding the
+    /// second book's contents, with *both* `data` rows naming it: the
+    /// first book silently became a copy of the second. Verified
+    /// before fixing, and covered by
+    /// `adding_a_second_book_with_the_same_title_does_not_overwrite_the_first`.
+    ///
+    /// A file this book already owns for this same format is not a
+    /// collision -- that is a re-add, and `replace` decides it.
+    fn free_format_stem(&self, book_id: i32, format: &str, book_dir: &Path, preferred: &str, ext: &str) -> anyhow::Result<String> {
+        let own_name: Option<String> = {
+            let conn = self.backend.conn.lock().unwrap();
+            conn.query_row("SELECT name FROM data WHERE book = ?1 AND format = ?2", (book_id, format.to_uppercase()), |row| row.get(0)).ok()
+        };
+
+        let mut candidate = preferred.to_string();
+        // Bounded so a directory somebody has filled with `Title
+        // (1..n).pdf` cannot spin here forever.
+        for suffix in 1..1000 {
+            if own_name.as_deref() == Some(candidate.as_str()) || !book_dir.join(format!("{candidate}.{ext}")).exists() {
+                return Ok(candidate);
+            }
+            candidate = format!("{preferred} ({suffix})");
+        }
+        anyhow::bail!("could not find an unused filename for {preferred}.{ext} in {}", book_dir.display())
+    }
+
+    /// Removes this book's `fmt` file from its folder, and the `data`
+    /// row naming it.
+    ///
+    /// The file is found through `data.name` rather than by scanning
+    /// the folder for the first thing with a matching extension, which
+    /// is what this used to do. Two books with the same author and
+    /// title share a folder, so "first file with this extension" can
+    /// easily be the *other* book's -- removing one format would then
+    /// delete a different book entirely. `data.name` says which file
+    /// is ours; nothing else does.
     pub fn remove_format(&self, book_id: i32, fmt: &str) -> anyhow::Result<()> {
         let path_rel = match self.field_for(book_id, "path")? {
             Some(p) if !p.is_empty() => p,
             _ => return Ok(()),
         };
         let book_dir = self.backend.library_path.join(&path_rel);
-        let target_ext = fmt.to_lowercase();
 
-        if let Ok(entries) = fs::read_dir(&book_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() {
-                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                        if ext.to_lowercase() == target_ext {
-                            // Port of issue #93's crate-wide write-path
-                            // retrofit: real, journaled, crash-safe
-                            // removal through `LibraryHandle` instead of
-                            // a raw `fs::remove_file`.
-                            self.backend.write_handle()?.remove_atomic(&path)?;
-                            break;
-                        }
-                    }
-                }
+        let name: Option<String> = {
+            let conn = self.backend.conn.lock().unwrap();
+            conn.query_row("SELECT name FROM data WHERE book = ?1 AND format = ?2", (book_id, fmt.to_uppercase()), |row| row.get(0)).ok()
+        };
+
+        if let Some(name) = name {
+            let path = book_dir.join(format!("{name}.{}", fmt.to_lowercase()));
+            if path.is_file() {
+                // Port of issue #93's crate-wide write-path retrofit:
+                // real, journaled, crash-safe removal through
+                // `LibraryHandle` instead of a raw `fs::remove_file`.
+                self.backend.write_handle()?.remove_atomic(&path)?;
             }
         }
 
@@ -800,7 +845,153 @@ impl Cache {
             "UPDATE books SET path = ?1 WHERE id = ?2",
             (&new_rel_path_str, book_id),
         )?;
+        // Both branches above renamed every format file to
+        // `sanitize(new_title).<ext>`; `data.name` has to say so.
+        //
+        // It did not, and that was a real latent bug: `data.name` is
+        // what `get_data_as_dict` builds `fmt_<ext>` paths from, so
+        // after a title change through here the database pointed at
+        // the pre-rename filename and every route that serves a book
+        // would 404. The same mismatch, from the other direction, is
+        // what `a_renamed_book_can_still_be_opened` was added for.
+        conn.execute(
+            "UPDATE data SET name = ?1 WHERE book = ?2",
+            (sanitize_file_name(new_title), book_id),
+        )?;
         Ok(())
+    }
+
+    /// Every format this book has, as `(FORMAT, filename stem)` --
+    /// `data.name` being calibre's own record of what each format is
+    /// actually called on disk.
+    pub fn format_file_names(&self, book_id: i32) -> anyhow::Result<Vec<(String, String)>> {
+        let conn = self.backend.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT format, name FROM data WHERE book = ?1 ORDER BY format")?;
+        let rows = stmt.query_map([book_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// The stem this book's format files share, if they share one.
+    ///
+    /// `None` when the book has no formats, or when two formats
+    /// disagree -- which is possible for a book whose formats were
+    /// added under different titles, since [`Cache::add_format`] names
+    /// a file after the title at the moment it is added.
+    pub fn format_file_stem(&self, book_id: i32) -> anyhow::Result<Option<String>> {
+        let names = self.format_file_names(book_id)?;
+        let mut iter = names.into_iter().map(|(_, name)| name);
+        let Some(first) = iter.next() else { return Ok(None) };
+        Ok(if iter.all(|n| n == first) { Some(first) } else { None })
+    }
+
+    /// A stem this book can rename its files to without colliding
+    /// with anything already in its folder.
+    ///
+    /// Returns `preferred` (sanitized) when it is free, and
+    /// `preferred (1)`, `preferred (2)`... when it is not. Files this
+    /// book already owns do not count as collisions -- renaming a book
+    /// to the name it already has must not yield `Title (1)`.
+    ///
+    /// Callers use this *before* [`Cache::rename_format_files`], which
+    /// refuses a collision rather than resolving one: a rename cannot
+    /// be undone, so the name a preview shows has to be the name that
+    /// is actually used, which means resolving collisions up front
+    /// rather than at write time.
+    pub fn available_format_stem(&self, book_id: i32, preferred: &str) -> anyhow::Result<String> {
+        let preferred = sanitize_file_name(preferred);
+        if preferred.trim().is_empty() {
+            anyhow::bail!("a filename cannot be empty");
+        }
+
+        let rel_path = match self.field_for(book_id, "path")? {
+            Some(p) if !p.is_empty() => p,
+            _ => return Ok(preferred),
+        };
+        let book_dir = self.backend.library_path.join(&rel_path);
+        let formats = self.format_file_names(book_id)?;
+
+        let mut candidate = preferred.clone();
+        for suffix in 1..1000 {
+            let free = formats.iter().all(|(format, own_name)| {
+                let ext = format.to_lowercase();
+                *own_name == candidate || !book_dir.join(format!("{candidate}.{ext}")).exists()
+            });
+            if free {
+                return Ok(candidate);
+            }
+            candidate = format!("{preferred} ({suffix})");
+        }
+        anyhow::bail!("could not find an unused filename based on {preferred:?} in {}", book_dir.display())
+    }
+
+    /// Renames every one of a book's format files to `new_stem`,
+    /// keeping each extension, and records the new name in `data`.
+    ///
+    /// This is the deliberate half of the title/filename split: it
+    /// changes what the files are called and nothing else -- not the
+    /// title, not the author, not the folder they sit in, all of
+    /// which are metadata-derived and have their own operations.
+    ///
+    /// Driven by the `data` table rather than by listing the
+    /// directory, which is what [`Cache::rename_book_files`] does.
+    /// That is the point: the rows and the files have to end up
+    /// agreeing, and iterating the rows means a file this does not
+    /// know about (`cover.jpg`, `metadata.opf`, anything a user
+    /// dropped in the folder) is left alone rather than swept up by a
+    /// wildcard.
+    ///
+    /// Returns the formats it actually renamed. A format whose file is
+    /// already called `new_stem` is not one of them.
+    ///
+    /// Refuses rather than overwrites if the destination exists and is
+    /// not the file being renamed -- two books can legitimately share
+    /// a folder (same author, same title), so a collision here is a
+    /// real possibility and silently destroying the other book's file
+    /// is not an acceptable outcome of a rename.
+    pub fn rename_format_files(&self, book_id: i32, new_stem: &str) -> anyhow::Result<Vec<String>> {
+        let new_stem = sanitize_file_name(new_stem);
+        if new_stem.trim().is_empty() {
+            anyhow::bail!("a filename cannot be empty");
+        }
+
+        let rel_path = match self.field_for(book_id, "path")? {
+            Some(p) if !p.is_empty() => p,
+            _ => return Ok(Vec::new()),
+        };
+        let book_dir = self.backend.library_path.join(&rel_path);
+
+        let handle = self.backend.write_handle()?;
+        let mut renamed = Vec::new();
+
+        for (format, old_stem) in self.format_file_names(book_id)? {
+            if old_stem == new_stem {
+                continue;
+            }
+            let ext = format.to_lowercase();
+            let old_path = book_dir.join(format!("{old_stem}.{ext}"));
+            let new_path = book_dir.join(format!("{new_stem}.{ext}"));
+
+            if new_path.exists() {
+                anyhow::bail!("{} already exists", new_path.display());
+            }
+            // A `data` row whose file is missing is not a reason to
+            // abandon the rename: the row still has to be corrected,
+            // or it keeps pointing at a name nothing will ever have.
+            if old_path.exists() {
+                handle.rename_atomic(&old_path, &new_path)?;
+            }
+
+            let conn = self.backend.conn.lock().unwrap();
+            conn.execute("UPDATE data SET name = ?1 WHERE book = ?2 AND format = ?3", (&new_stem, book_id, &format))?;
+            drop(conn);
+            renamed.push(format);
+        }
+
+        Ok(renamed)
     }
 
     /// Renames the book's folder/files (via [`Cache::rename_book_files`])
@@ -3203,6 +3394,259 @@ mod tests {
             "the recorded path {path_after} does not exist, so every route serving this book will 404"
         );
         assert_eq!(after["title"], "A Completely Different Title");
+    }
+
+    /// Adds a book with one PDF whose source filename is `stem`.
+    fn add_pdf(dir: &Path, cache: &Cache, title: &str, author: &str, stem: &str) -> i32 {
+        let source = dir.join(format!("{stem}.pdf"));
+        fs::write(&source, b"%PDF-1.4 pretend").unwrap();
+        let mut meta = MetaInformation::default();
+        meta.title = title.to_string();
+        meta.authors = vec![author.to_string()];
+        cache.add_book(&source, &meta).unwrap()
+    }
+
+    #[test]
+    fn renaming_files_moves_them_and_records_the_new_name() {
+        let (dir, cache) = open_test_cache();
+        let id = add_pdf(dir.path(), &cache, "A Title", "An Author", "whatever");
+
+        let before = cache.get_data_as_dict(None, false, None, false).unwrap()[0]["fmt_pdf"].as_str().unwrap().to_string();
+        assert!(Path::new(&before).exists());
+
+        let renamed = cache.rename_format_files(id, "Nineteen Eighty-Four").unwrap();
+        assert_eq!(renamed, vec!["PDF".to_string()]);
+
+        // The row and the disk have to agree -- that invariant is the
+        // whole reason this function updates `data` rather than only
+        // moving files.
+        assert_eq!(cache.format_file_stem(id).unwrap().as_deref(), Some("Nineteen Eighty-Four"));
+        let after = cache.get_data_as_dict(None, false, None, false).unwrap()[0]["fmt_pdf"].as_str().unwrap().to_string();
+        assert!(after.ends_with("Nineteen Eighty-Four.pdf"), "got {after}");
+        assert!(Path::new(&after).exists(), "the recorded path does not exist, so every route serving this book will 404");
+        assert!(!Path::new(&before).exists(), "the old file is still there");
+    }
+
+    #[test]
+    fn renaming_files_leaves_the_title_and_folder_alone() {
+        let (dir, cache) = open_test_cache();
+        let id = add_pdf(dir.path(), &cache, "A Title", "An Author", "A Title");
+
+        cache.rename_format_files(id, "Something Else").unwrap();
+
+        // The point of the whole issue: naming the file is not
+        // retitling the book.
+        assert_eq!(cache.field_for(id, "title").unwrap().as_deref(), Some("A Title"));
+        assert_eq!(cache.field_for(id, "path").unwrap().as_deref(), Some("An Author/A Title"));
+    }
+
+    #[test]
+    fn renaming_files_leaves_the_cover_alone() {
+        let (dir, cache) = open_test_cache();
+        let id = add_pdf(dir.path(), &cache, "A Title", "An Author", "A Title");
+        crate::covers::set_cover(&cache, id, b"pretend jpeg").unwrap();
+
+        cache.rename_format_files(id, "Something Else").unwrap();
+
+        // `cover.jpg` is a fixed name every reader of a library
+        // expects; sweeping it up in a filename rename would orphan
+        // it. Driving off `data` rather than the directory is what
+        // makes that automatic.
+        assert!(crate::covers::cover_path(&cache, id).unwrap().exists());
+    }
+
+    /// A book's folder is `<author>/<title>`, and its files are named
+    /// after the title -- so two books by the same author with the
+    /// same title wanted the same path. `add_book` passes
+    /// `replace = true`, so the second copy simply overwrote the
+    /// first, and both `data` rows then named one file holding the
+    /// second book's contents. Opening the first book handed you the
+    /// second. Verified before it was fixed.
+    #[test]
+    fn adding_a_second_book_with_the_same_title_does_not_overwrite_the_first() {
+        let (dir, cache) = open_test_cache();
+        let first_src = dir.path().join("one.pdf");
+        fs::write(&first_src, b"BOOK ONE").unwrap();
+        let second_src = dir.path().join("two.pdf");
+        fs::write(&second_src, b"BOOK TWO").unwrap();
+
+        let mut meta = MetaInformation::default();
+        meta.title = "Same Title".to_string();
+        meta.authors = vec!["Same Author".to_string()];
+        let first = cache.add_book(&first_src, &meta).unwrap();
+        let second = cache.add_book(&second_src, &meta).unwrap();
+
+        // They do share a folder -- that part is by design.
+        assert_eq!(cache.field_for(first, "path").unwrap(), cache.field_for(second, "path").unwrap());
+
+        let path_of = |id: i32| {
+            cache.get_data_as_dict(None, false, None, false).unwrap().into_iter().find(|r| r["id"] == id).unwrap()["fmt_pdf"].as_str().unwrap().to_string()
+        };
+        let (first_path, second_path) = (path_of(first), path_of(second));
+
+        assert_ne!(first_path, second_path, "both books still point at one file");
+        assert_eq!(fs::read(&first_path).unwrap(), b"BOOK ONE");
+        assert_eq!(fs::read(&second_path).unwrap(), b"BOOK TWO");
+        // The disambiguated one is the second arrival, not the first.
+        assert!(second_path.ends_with("Same Title (1).pdf"), "got {second_path}");
+    }
+
+    #[test]
+    fn re_adding_the_same_format_to_one_book_still_replaces_its_own_file() {
+        let (dir, cache) = open_test_cache();
+        let id = add_pdf(dir.path(), &cache, "A Title", "An Author", "A Title");
+
+        let replacement = dir.path().join("newer.pdf");
+        fs::write(&replacement, b"NEWER CONTENT").unwrap();
+        assert!(cache.add_format(id, &replacement, "pdf", true).unwrap());
+
+        // Its own file is not a collision: this must overwrite in
+        // place rather than leave `A Title (1).pdf` beside the old one.
+        assert_eq!(cache.format_file_stem(id).unwrap().as_deref(), Some("A Title"));
+        let path = cache.get_data_as_dict(None, false, None, false).unwrap()[0]["fmt_pdf"].as_str().unwrap().to_string();
+        assert_eq!(fs::read(&path).unwrap(), b"NEWER CONTENT");
+        assert!(!dir.path().join("An Author/A Title/A Title (1).pdf").exists());
+    }
+
+    /// `remove_format` used to delete the first file in the folder
+    /// with a matching extension. In a folder shared by two books that
+    /// is a coin flip, and losing it deletes a book nobody asked to
+    /// touch.
+    #[test]
+    fn removing_a_format_deletes_this_books_file_and_not_the_other_ones() {
+        let (dir, cache) = open_test_cache();
+        let first_src = dir.path().join("one.pdf");
+        fs::write(&first_src, b"BOOK ONE").unwrap();
+        let second_src = dir.path().join("two.pdf");
+        fs::write(&second_src, b"BOOK TWO").unwrap();
+
+        let mut meta = MetaInformation::default();
+        meta.title = "Same Title".to_string();
+        meta.authors = vec!["Same Author".to_string()];
+        let first = cache.add_book(&first_src, &meta).unwrap();
+        let second = cache.add_book(&second_src, &meta).unwrap();
+
+        let second_path = cache.get_data_as_dict(None, false, None, false).unwrap().into_iter().find(|r| r["id"] == second).unwrap()["fmt_pdf"].as_str().unwrap().to_string();
+
+        cache.remove_format(first, "pdf").unwrap();
+
+        assert!(Path::new(&second_path).exists(), "removing one book's format deleted the other book's file");
+        assert_eq!(fs::read(&second_path).unwrap(), b"BOOK TWO");
+        assert!(!dir.path().join("Same Author/Same Title/Same Title.pdf").exists(), "the format that was asked for is still there");
+    }
+
+    #[test]
+    fn an_available_stem_steps_around_a_name_that_is_taken() {
+        let (dir, cache) = open_test_cache();
+        let id = add_pdf(dir.path(), &cache, "A Title", "An Author", "A Title");
+        let book_dir = dir.path().join("An Author/A Title");
+        fs::write(book_dir.join("Taken.pdf"), b"someone else's").unwrap();
+
+        assert_eq!(cache.available_format_stem(id, "Free").unwrap(), "Free");
+        assert_eq!(cache.available_format_stem(id, "Taken").unwrap(), "Taken (1)");
+        // Its own name is not a collision -- otherwise renaming a book
+        // to what it is already called would walk it to `(1)`.
+        assert_eq!(cache.available_format_stem(id, "A Title").unwrap(), "A Title");
+    }
+
+    #[test]
+    fn an_available_stem_must_be_free_for_every_format_the_book_has() {
+        let (dir, cache) = open_test_cache();
+        let id = add_pdf(dir.path(), &cache, "A Title", "An Author", "A Title");
+        let epub = dir.path().join("x.epub");
+        fs::write(&epub, b"epub bytes").unwrap();
+        cache.add_format(id, &epub, "epub", true).unwrap();
+
+        // Only the EPUB name is taken, but a rename moves both files,
+        // so the stem is unusable for the book as a whole.
+        let book_dir = dir.path().join("An Author/A Title");
+        fs::write(book_dir.join("Wanted.epub"), b"someone else's").unwrap();
+        assert_eq!(cache.available_format_stem(id, "Wanted").unwrap(), "Wanted (1)");
+    }
+
+    #[test]
+    fn renaming_files_refuses_to_overwrite_an_existing_file() {
+        let (dir, cache) = open_test_cache();
+        let id = add_pdf(dir.path(), &cache, "A Title", "An Author", "A Title");
+
+        // Something else already occupies the name being asked for.
+        // Two books with the same author and title really do share a
+        // folder, so this is a reachable state, not a contrived one.
+        let book_dir = dir.path().join("An Author/A Title");
+        fs::write(book_dir.join("Taken.pdf"), b"someone else's book").unwrap();
+
+        let err = cache.rename_format_files(id, "Taken").unwrap_err().to_string();
+        assert!(err.contains("already exists"), "got: {err}");
+
+        // Nothing moved, and the file that was in the way is intact.
+        assert_eq!(cache.format_file_stem(id).unwrap().as_deref(), Some("A Title"));
+        assert_eq!(fs::read(book_dir.join("Taken.pdf")).unwrap(), b"someone else's book");
+        assert!(book_dir.join("A Title.pdf").exists());
+    }
+
+    #[test]
+    fn renaming_files_rejects_a_name_that_sanitizes_away_to_nothing() {
+        let (dir, cache) = open_test_cache();
+        let id = add_pdf(dir.path(), &cache, "A Title", "An Author", "A Title");
+        assert!(cache.rename_format_files(id, "   ").is_err());
+        assert!(cache.rename_format_files(id, "..").is_err());
+        assert_eq!(cache.format_file_stem(id).unwrap().as_deref(), Some("A Title"));
+    }
+
+    #[test]
+    fn renaming_files_to_the_name_they_already_have_is_a_no_op() {
+        let (dir, cache) = open_test_cache();
+        let id = add_pdf(dir.path(), &cache, "A Title", "An Author", "A Title");
+        assert!(cache.rename_format_files(id, "A Title").unwrap().is_empty());
+    }
+
+    #[test]
+    fn renaming_files_sanitizes_a_name_that_would_escape_the_folder() {
+        let (dir, cache) = open_test_cache();
+        let id = add_pdf(dir.path(), &cache, "A Title", "An Author", "A Title");
+
+        cache.rename_format_files(id, "../../etc/passwd").unwrap();
+
+        let stem = cache.format_file_stem(id).unwrap().unwrap();
+        assert!(!stem.contains('/') && !stem.contains('\\'), "got {stem}");
+        let path = cache.get_data_as_dict(None, false, None, false).unwrap()[0]["fmt_pdf"].as_str().unwrap().to_string();
+        assert!(Path::new(&path).starts_with(dir.path()), "{path} escaped the library");
+    }
+
+    /// `rename_book_files` moves every format to `<new title>.<ext>`
+    /// but used not to say so in `data.name`, so after a title change
+    /// through it the database pointed at the old filename -- the same
+    /// 404 `a_renamed_book_can_still_be_opened` covers, reached from
+    /// the other side.
+    #[test]
+    fn a_title_change_that_moves_files_keeps_the_recorded_name_in_step() {
+        let (dir, cache) = open_test_cache();
+        let id = add_pdf(dir.path(), &cache, "Old Title", "Old Author", "Old Title");
+
+        cache.update_book_metadata(id, "New Title", "New Author").unwrap();
+
+        assert_eq!(cache.format_file_stem(id).unwrap().as_deref(), Some("New Title"));
+        let path = cache.get_data_as_dict(None, false, None, false).unwrap()[0]["fmt_pdf"].as_str().expect("the format must still resolve").to_string();
+        assert!(Path::new(&path).exists(), "the recorded path {path} does not exist");
+    }
+
+    #[test]
+    fn a_book_whose_formats_were_added_under_different_titles_has_no_single_stem() {
+        let (dir, cache) = open_test_cache();
+        let id = add_pdf(dir.path(), &cache, "First Title", "An Author", "First Title");
+
+        // `add_format` names a file after the title at the moment it
+        // runs, so retitling between two adds leaves the two formats
+        // with different stems.
+        cache.set_field(id, "title", "Second Title").unwrap();
+        let epub = dir.path().join("x.epub");
+        fs::write(&epub, b"epub bytes").unwrap();
+        cache.add_format(id, &epub, "epub", true).unwrap();
+
+        assert_eq!(cache.format_file_stem(id).unwrap(), None);
+        // ...and renaming brings them back into line.
+        cache.rename_format_files(id, "One Name").unwrap();
+        assert_eq!(cache.format_file_stem(id).unwrap().as_deref(), Some("One Name"));
     }
 
     #[test]

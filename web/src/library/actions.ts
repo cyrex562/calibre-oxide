@@ -138,6 +138,7 @@ export type LibraryActionId =
   | "send-email"
   | "replace-cover"
   | "cover-from-pdf"
+  | "rename-files"
   | "open-externally"
   | "unpack-book"
   | "repack-book"
@@ -190,6 +191,7 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   { id: "toggle-view", label: "Switch table/grid", group: "view", requires: "none", toolbar: false, icon: "grid" },
   { id: "bulk-edit", label: "Bulk edit", group: "selection", requires: "selection", icon: "merge_books", accel: "Ctrl+Shift+E", tooltip: "Change a field across every selected book" },
   { id: "save-to-disk", label: "Save to disk", group: "selection", requires: "selection", icon: "save", accel: "Ctrl+S", tooltip: "Write book files to a folder" },
+  { id: "rename-files", label: "Rename files…", group: "selection", requires: "selection", contextMenu: true, icon: "template_funcs", tooltip: "Rename the files on disk, without changing the title" },
 
   { id: "read", label: "Read", group: "book", requires: "single-selection", contextMenu: true, icon: "view", accel: "Enter", tooltip: "Open in the built-in reader" },
   { id: "open-externally", label: "Open externally", group: "book", requires: "single-selection", contextMenu: true, desktopOnly: true, icon: "external-link", accel: "Ctrl+Enter", tooltip: "Open in the system's default application" },
@@ -418,7 +420,7 @@ export const TOOLBAR_LAYOUT: ToolbarItem[] = [
   { kind: "split", id: "convert", menu: ["polish", "tweak-book", "-", "unpack-book", "repack-book"] },
   { kind: "split", id: "read", menu: ["open-externally", "quick-view", "-", "$recently-viewed", "-", "similar-books"] },
   { kind: "separator" },
-  { kind: "split", id: "save-to-disk", menu: ["send-email", "-", "export-catalog", "export-library-archive"] },
+  { kind: "split", id: "save-to-disk", menu: ["rename-files", "send-email", "-", "export-catalog", "export-library-archive"] },
   { kind: "action", id: "fetch-news" },
   { kind: "separator" },
   { kind: "split", id: "delete-book", menu: ["-", "$restore-deleted"] },
