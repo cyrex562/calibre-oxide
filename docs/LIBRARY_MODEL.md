@@ -277,10 +277,23 @@ writing to files on read-only volumes and to cloud placeholders.
   file writes* for crash atomicity and is consumed and cleaned during recovery.
   `changes/` is *durable metadata history* and is never discarded except by
   compaction. Merging them would give one of them the wrong lifetime.
+- **There is no single hash chain, and cannot be.** The file-operation journal
+  chains every entry to the previous one, which works because it has exactly one
+  writer. This log has one writer per machine and no way for them to agree on
+  who comes next — two peers extending one chain both claim the same
+  predecessor, and the chain breaks under normal use. Entries are chained **per
+  origin** instead: each install has its own sequence and chain, and the merged
+  log is several chains side by side. A deleted or edited entry still leaves a
+  detectable gap or mismatch in *that* origin's sequence. Same reason git
+  branches rather than demanding a global commit order.
 - **Change filenames must not collide across machines.** The file-op journal's
   monotonic sequence number is fine for one writer and wrong for two syncing
   peers, which would both mint the same number. Names need a per-install id and
-  a uuid as well.
+  a nonce as well.
+- **A compacted gap must not read as tampering.** Compaction deletes entries by
+  design, so each origin's watermark records the last sequence *and its hash*,
+  letting verification bridge the gap the way `JournalCheckpoint::boundary_hash`
+  does for the file journal.
 - **Ordering needs a hybrid logical clock**, not wall time. Otherwise a machine
   with a fast clock always wins every conflict.
 - **Conflicts resolve per field, last writer wins by HLC.** Union-merging
