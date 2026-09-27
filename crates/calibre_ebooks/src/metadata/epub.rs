@@ -1,5 +1,6 @@
 use crate::html_cover_fallback::{extract_calibre_cover, extract_cover_from_embedded_svg};
 use crate::metadata::MetaInformation;
+use crate::metadata::zip_edit::placeholders;
 use crate::opf::parse_opf;
 use crate::xmltree::{Xml, XmlNodeId};
 use anyhow::{Context, Result};
@@ -317,7 +318,7 @@ const OPF_NS: &str = "http://www.idpf.org/2007/opf";
 pub fn set_metadata(path: &Path, mi: &MetaInformation) -> Result<()> {
     let (opf_path, opf_content) = read_opf(path)?;
     let updated = rewrite_opf(&opf_content, mi)?;
-    replace_zip_entry(path, &opf_path, &updated)
+    crate::metadata::zip_edit::replace_entry(path, &opf_path, &updated)
 }
 
 /// The OPF's path inside the archive, and its text.
@@ -380,14 +381,18 @@ fn rewrite_opf(opf: &str, mi: &MetaInformation) -> Result<Vec<u8>> {
     xml.ensure_namespace_declared(Some("dc"), DC_NS);
     xml.ensure_namespace_declared(Some("opf"), OPF_NS);
 
-    if !mi.title.trim().is_empty() {
-        replace_dc(&mut xml, metadata, "title", std::slice::from_ref(&mi.title), &[]);
+    if let Some(title) = placeholders::real_title(&mi.title) {
+        replace_dc(&mut xml, metadata, "title", &[title.to_string()], &[]);
     }
     // `opf:role="aut"` is what distinguishes an author from an editor or
     // illustrator; a reader that ignores it still shows the name, but one
     // that honours it would file the book wrongly without it.
-    replace_dc(&mut xml, metadata, "creator", &mi.authors, &[("opf:role", "aut")]);
-    replace_dc(&mut xml, metadata, "language", &mi.languages, &[]);
+    if let Some(authors) = placeholders::real_authors(&mi.authors) {
+        replace_dc(&mut xml, metadata, "creator", authors, &[("opf:role", "aut")]);
+    }
+    if let Some(languages) = placeholders::real_languages(&mi.languages) {
+        replace_dc(&mut xml, metadata, "language", languages, &[]);
+    }
     replace_dc(&mut xml, metadata, "subject", &mi.tags, &[]);
 
     if let Some(publisher) = mi.publisher.as_ref().filter(|p| !p.trim().is_empty()) {
@@ -444,46 +449,6 @@ fn set_identifiers(xml: &mut Xml, metadata: XmlNodeId, mi: &MetaInformation) {
         xml.set_attr(element, "opf:scheme", wanted_scheme);
         xml.insert_element(metadata, element, None);
     }
-}
-
-/// Rewrites `archive_path` inside the zip at `path`, leaving every other
-/// entry byte-identical.
-///
-/// Writes a whole new archive to a temp file and renames over the
-/// original, so an interrupted write cannot truncate somebody's book.
-fn replace_zip_entry(path: &Path, archive_path: &str, content: &[u8]) -> Result<()> {
-    let staging = tempfile::Builder::new().prefix("set-metadata").tempfile_in(path.parent().unwrap_or(Path::new(".")))?;
-    {
-        // The source archive is opened *inside* this block so its file
-        // handle is closed before the rename below. Windows refuses to
-        // replace a file that anything still has open ("Access is
-        // denied", os error 5) where Unix allows it -- so on Linux this
-        // scoping looks like style and on Windows it is the difference
-        // between working and not.
-        let mut archive = ZipArchive::new(std::fs::File::open(path)?)?;
-        let mut out = zip::ZipWriter::new(std::fs::File::create(staging.path())?);
-        for i in 0..archive.len() {
-            let mut entry = archive.by_index(i)?;
-            let name = entry.name().to_string();
-            // `mimetype` must stay first and stored, or the file stops
-            // being a recognisable EPUB. Preserving each entry's own
-            // compression method keeps that true without special-casing.
-            let options = zip::write::FileOptions::default().compression_method(entry.compression());
-            out.start_file(&name, options)?;
-            if name == archive_path {
-                out.write_all(content)?;
-            } else {
-                std::io::copy(&mut entry, &mut out)?;
-            }
-        }
-        out.finish()?;
-    }
-
-    // `persist` renames, which is atomic within a filesystem -- and the
-    // temp file is deliberately created beside the book so it is the same
-    // one.
-    staging.persist(path).map_err(|e| anyhow::anyhow!("replacing {}: {e}", path.display()))?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -609,6 +574,26 @@ mod set_metadata_tests {
 
         let read_back = get_metadata(std::fs::File::open(&path).unwrap()).unwrap();
         assert_eq!(read_back.publisher.as_deref(), Some("Old Publisher"), "the publisher should have been left as it was");
+    }
+
+    /// `MetaInformation::default()` is *not* empty -- it carries
+    /// `title = "Unknown"`, `authors = ["Unknown"]`, `languages = ["und"]`.
+    /// Treating non-empty as "the caller set this" would write those
+    /// placeholders over a real book. Caught by the ODT writer's tests,
+    /// which checked language where this file's first test checked only
+    /// publisher (which defaults to `None` and so hid the bug).
+    #[test]
+    fn placeholder_metadata_does_not_overwrite_real_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = a_book(&dir);
+
+        // Everything at its default: this must be a no-op, not a wipe.
+        set_metadata(&path, &MetaInformation::default()).unwrap();
+
+        let read_back = get_metadata(std::fs::File::open(&path).unwrap()).unwrap();
+        assert_eq!(read_back.title, "Old Title", "the real title was overwritten with a placeholder");
+        assert_eq!(read_back.authors, vec!["Old Author".to_string()], "the real author was overwritten");
+        assert_eq!(read_back.languages, vec!["fr".to_string()], "the real language was overwritten with \"und\"");
     }
 
     /// Writing metadata must not disturb the rest of the book.

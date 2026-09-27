@@ -36,6 +36,7 @@ pub mod utils;
 pub mod worker;
 pub mod xmp;
 pub mod zip;
+pub mod zip_edit;
 
 // Re-export commonly used items
 pub use archive::{archive_type, get_comic_metadata, is_comic, parse_comic_comment};
