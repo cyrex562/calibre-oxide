@@ -124,6 +124,10 @@ builtin_input_plugin!(DjvuInputPlugin, "DJVU Input", crate::input::djvu_input::D
 builtin_input_plugin!(RecipeInputPlugin, "Recipe Input", crate::input::recipe_input::RecipeInput, ["recipe"]);
 builtin_input_plugin!(ChmInputPlugin, "CHM Input", crate::input::chm_input::CHMInput, ["chm"]);
 builtin_input_plugin!(Azw4InputPlugin, "AZW4 Input", crate::input::azw4_input::AZW4Input, ["azw4"]);
+// Registered as part of #812. `HTMLZInput` was written and tested
+// (`tests/htmlz_input_test.rs`) but never reachable: a `.htmlz` is a zip
+// holding HTML plus an OPF, which is exactly what it extracts.
+builtin_input_plugin!(HtmlzInputPlugin, "HTMLZ Input", crate::input::htmlz_input::HTMLZInput, ["htmlz"]);
 
 /// Registers every builtin input-format plugin.
 pub fn register_builtin_input_plugins(registry: &mut PluginRegistry) -> Result<(), RegistryError> {
@@ -153,6 +157,7 @@ pub fn register_builtin_input_plugins(registry: &mut PluginRegistry) -> Result<(
         RecipeInputPlugin,
         ChmInputPlugin,
         Azw4InputPlugin,
+        HtmlzInputPlugin,
     );
     Ok(())
 }
@@ -237,9 +242,23 @@ mod tests {
             "RB", "LIT", "SNB", "RTF", "PDF", "LRF", "TCR", "PDB", "ODT", "DJVU", "RECIPE", "CHM", "AZW4",
         ];
         let mut expected: Vec<String> = old_hardcoded_readable_formats.iter().map(|s| s.to_string()).collect();
+        // Added deliberately by #812, not drifted into: `HTMLZInput` was
+        // written and tested but unreachable. Listed separately from the
+        // transcribed table so the transcription stays a faithful record
+        // of what the old `if/else` chain accepted.
+        expected.push("HTMLZ".to_string());
         expected.sort();
 
         assert_eq!(supported_input_extensions_uppercase(builtin_input_registry()), expected);
+    }
+
+    /// #812: the engine existed and passed its own tests the whole time.
+    /// Only the registry entry was missing, so no conversion could reach
+    /// it -- the "written but unwired" shape this project keeps finding.
+    #[test]
+    fn htmlz_input_is_reachable() {
+        let plugin = resolve_input_plugin(builtin_input_registry(), "htmlz").expect("HTMLZ input should resolve");
+        assert_eq!(plugin.name(), "HTMLZ Input");
     }
 
     #[test]
@@ -254,11 +273,13 @@ mod tests {
     }
 
     #[test]
-    fn all_twenty_builtin_input_plugins_register_without_a_name_collision() {
+    fn every_builtin_input_plugin_registers_without_a_name_collision() {
+        // 20 transcribed from the old dispatch chain, plus HTMLZ (#812).
+        const EXPECTED: usize = 21;
         let mut registry = PluginRegistry::new();
         register_builtin_input_plugins(&mut registry).unwrap();
-        assert_eq!(registry.len(), 20);
-        assert_eq!(registry.plugins_of::<dyn InputFormatPlugin>().len(), 20);
+        assert_eq!(registry.len(), EXPECTED);
+        assert_eq!(registry.plugins_of::<dyn InputFormatPlugin>().len(), EXPECTED);
     }
 
     #[test]

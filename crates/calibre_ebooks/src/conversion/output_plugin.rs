@@ -123,6 +123,23 @@ macro_rules! builtin_output_plugin {
     (@call mut_book_warnings, $inner:path, $book:ident, $path:ident, $opts:ident) => {{
         <$inner>::new().convert($book, $path, $opts)
     }};
+    // The `_no_opts` pair is for engines written before
+    // `ConversionOptions` existed, whose `convert` takes only the book
+    // and the path. **They therefore ignore every conversion option** --
+    // an output profile or a margin set for one of these formats has no
+    // effect. Threading options through them is real work on each engine
+    // rather than registry plumbing, so it is not done here; the
+    // alternative was leaving the formats unreachable altogether (#812).
+    (@call mut_book_no_opts, $inner:path, $book:ident, $path:ident, $opts:ident) => {{
+        let _ = $opts;
+        <$inner>::new().convert($book, $path)?;
+        Ok(Vec::new())
+    }};
+    (@call ref_book_no_opts, $inner:path, $book:ident, $path:ident, $opts:ident) => {{
+        let _ = $opts;
+        <$inner>::new().convert(&*$book, $path)?;
+        Ok(Vec::new())
+    }};
 }
 
 // Extension sets transcribed verbatim from the `if/else` chain in
@@ -143,6 +160,18 @@ builtin_output_plugin!(OebOutputPlugin, "OEB Output", crate::output::oeb_output:
 builtin_output_plugin!(PdbOutputPlugin, "PDB Output", crate::output::pdb_output::PDBOutput, ["pdb"], ref_book);
 builtin_output_plugin!(OdtOutputPlugin, "ODT Output", crate::output::odt_output::ODTOutput, ["odt"], ref_book);
 builtin_output_plugin!(TcrOutputPlugin, "TCR Output", crate::output::tcr_output::TCROutput, ["tcr"], ref_book);
+// Registered as part of #812. All three engines were written and tested
+// but deliberately left unreachable when the registry was introduced
+// (#797), which scoped itself to preserving the old `if/else` dispatch
+// exactly. Wiring them is the whole of that deferral.
+builtin_output_plugin!(HtmlzOutputPlugin, "HTMLZ Output", crate::output::htmlz_output::HTMLZOutput, ["htmlz"], mut_book_no_opts);
+builtin_output_plugin!(PmlOutputPlugin, "PML Output", crate::output::pml_output::PMLOutput, ["pml"], ref_book_no_opts);
+// Note: `HTMLOutput` treats its path as a *directory* and writes a tree
+// of files into it, unlike every other output plugin, which writes one
+// file. That matches upstream's own HTML output, which also produces a
+// directory -- but a caller that assumes `output_path` names a file will
+// be surprised.
+builtin_output_plugin!(HtmlOutputPlugin, "HTML Output", crate::output::html_output::HTMLOutput, ["html"], mut_book_no_opts);
 
 /// Registers every builtin output-format plugin.
 ///
@@ -176,6 +205,9 @@ pub fn register_builtin_output_plugins(registry: &mut PluginRegistry) -> Result<
         PdbOutputPlugin,
         OdtOutputPlugin,
         TcrOutputPlugin,
+        HtmlzOutputPlugin,
+        PmlOutputPlugin,
+        HtmlOutputPlugin,
     );
     Ok(())
 }
@@ -227,10 +259,13 @@ mod tests {
     }
 
     #[test]
-    fn all_fifteen_builtin_output_plugins_register_without_a_name_collision() {
+    fn every_builtin_output_plugin_registers_without_a_name_collision() {
+        // 15 transcribed from the old dispatch chain, plus HTMLZ, PML and
+        // HTML, which #812 wired after #797 deliberately left them out.
+        const EXPECTED: usize = 18;
         let mut registry = PluginRegistry::new();
         register_builtin_output_plugins(&mut registry).unwrap();
-        assert_eq!(registry.len(), 15);
+        assert_eq!(registry.len(), EXPECTED);
     }
 
     #[test]
@@ -258,12 +293,19 @@ mod tests {
     }
 
     #[test]
-    fn the_three_unreachable_output_modules_are_still_unreachable() {
-        // Documents the pre-existing gap this issue deliberately did not
-        // change: html/htmlz/pml outputs were never dispatched before.
+    fn the_three_formerly_unreachable_output_modules_are_now_reachable() {
+        // Was `the_three_unreachable_output_modules_are_still_unreachable`,
+        // which pinned the gap #797 deliberately did not close: those
+        // engines existed and were tested, but the registry was scoped to
+        // reproducing the old `if/else` dispatch exactly, so wiring them
+        // would have been a silent scope increase.
+        //
+        // #812 is that wiring, done deliberately -- so the guard flips
+        // rather than being deleted. It still earns its place: it is what
+        // fails if one of the three is dropped from the registry again.
         let registry = builtin_output_registry();
         for ext in ["html", "htmlz", "pml"] {
-            assert!(resolve_output_plugin(registry, ext).is_none(), "{ext} output was not dispatched before #797 and should not have been silently added");
+            assert!(resolve_output_plugin(registry, ext).is_some(), "{ext} output was wired by #812 and should stay reachable");
         }
     }
 
