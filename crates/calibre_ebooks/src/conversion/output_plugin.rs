@@ -203,6 +203,62 @@ impl Plugin for KepubOutputPlugin {
     }
 }
 
+/// AZW3 output (#812) -- Kindle's KF8 format, written on its own rather
+/// than as the KF8 half of a joint MOBI6+KF8 file.
+///
+/// Hand-written because `KF8Book` is not one of the `*_output` engines
+/// the macro delegates to: the book is built by `create_kf8_book` and
+/// then serialised by `KF8Book::to_bytes`, which assembles the PalmDB
+/// header and records itself. That mirrors upstream's `AZW3Output`,
+/// which calls `create_kf8_book(..., for_joint=False)` and then
+/// `kf8.write(output_path)`.
+pub struct Azw3OutputPlugin;
+
+impl Plugin for Azw3OutputPlugin {
+    fn name(&self) -> &str {
+        "AZW3 Output"
+    }
+    fn description(&self) -> &str {
+        "Write an OEB book out as a Kindle KF8 (AZW3) file"
+    }
+    fn installation_type(&self) -> Option<PluginInstallationType> {
+        Some(PluginInstallationType::Builtin)
+    }
+    fn type_name(&self) -> &str {
+        "Output"
+    }
+}
+
+impl OutputFormatPlugin for Azw3OutputPlugin {
+    fn file_types(&self) -> Vec<String> {
+        vec!["azw3".to_string()]
+    }
+
+    fn convert(&self, book: &mut OEBBook, output_path: &Path, opts: &ConversionOptions) -> Result<Vec<String>> {
+        // Mapped from the real `ConversionOptions` rather than taking
+        // `Kf8WriterOpts::default()`: the four MOBI writer options mean
+        // the same thing for KF8, and silently ignoring a `dont_compress`
+        // the user asked for is the kind of thing #690 had to go back and
+        // fix for the MOBI path.
+        let kf8_opts = crate::mobi::writer8::main::Kf8WriterOpts {
+            dont_compress: opts.mobi.dont_compress,
+            prefer_author_sort: opts.mobi.prefer_author_sort,
+            share_not_sync: opts.mobi.share_not_sync,
+            mobi_keep_original_images: opts.mobi.mobi_keep_original_images,
+            extra_css: opts.extra_css.clone(),
+            ..Default::default()
+        };
+
+        let kf8 = crate::mobi::writer8::main::create_kf8_book(book, kf8_opts)?;
+        // `to_bytes` needs the metadata for record0's EXTH block, and the
+        // book is borrowed mutably above, so the serialise step reads it
+        // back afterwards rather than holding both borrows at once.
+        let bytes = kf8.to_bytes(&book.metadata)?;
+        std::fs::write(output_path, &bytes)?;
+        Ok(Vec::new())
+    }
+}
+
 impl OutputFormatPlugin for KepubOutputPlugin {
     fn file_types(&self) -> Vec<String> {
         vec!["kepub".to_string()]
@@ -273,6 +329,7 @@ pub fn register_builtin_output_plugins(registry: &mut PluginRegistry) -> Result<
         PmlOutputPlugin,
         HtmlOutputPlugin,
         KepubOutputPlugin,
+        Azw3OutputPlugin,
     );
     Ok(())
 }
@@ -327,8 +384,8 @@ mod tests {
     fn every_builtin_output_plugin_registers_without_a_name_collision() {
         // 15 transcribed from the old dispatch chain, plus HTMLZ, PML and
         // HTML, which #812 wired after #797 deliberately left them out,
-        // plus KEPUB, which #812 added as a real new plugin.
-        const EXPECTED: usize = 19;
+        // plus KEPUB and AZW3, which #812 added as real new plugins.
+        const EXPECTED: usize = 20;
         let mut registry = PluginRegistry::new();
         register_builtin_output_plugins(&mut registry).unwrap();
         assert_eq!(registry.len(), EXPECTED);
