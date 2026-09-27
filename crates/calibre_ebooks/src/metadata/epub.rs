@@ -452,11 +452,15 @@ fn set_identifiers(xml: &mut Xml, metadata: XmlNodeId, mi: &MetaInformation) {
 /// Writes a whole new archive to a temp file and renames over the
 /// original, so an interrupted write cannot truncate somebody's book.
 fn replace_zip_entry(path: &Path, archive_path: &str, content: &[u8]) -> Result<()> {
-    let source = std::fs::File::open(path)?;
-    let mut archive = ZipArchive::new(source)?;
-
     let staging = tempfile::Builder::new().prefix("set-metadata").tempfile_in(path.parent().unwrap_or(Path::new(".")))?;
     {
+        // The source archive is opened *inside* this block so its file
+        // handle is closed before the rename below. Windows refuses to
+        // replace a file that anything still has open ("Access is
+        // denied", os error 5) where Unix allows it -- so on Linux this
+        // scoping looks like style and on Windows it is the difference
+        // between working and not.
+        let mut archive = ZipArchive::new(std::fs::File::open(path)?)?;
         let mut out = zip::ZipWriter::new(std::fs::File::create(staging.path())?);
         for i in 0..archive.len() {
             let mut entry = archive.by_index(i)?;
