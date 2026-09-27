@@ -118,6 +118,7 @@ export type LibraryActionId =
   | "add-folder"
   | "switch-library"
   | "new-library"
+  | "open-library-folder"
   // Selection-scoped.
   | "select-mode"
   | "mark-books"
@@ -138,6 +139,7 @@ export type LibraryActionId =
   | "send-email"
   | "replace-cover"
   | "cover-from-pdf"
+  | "open-book-folder"
   | "rename-files"
   | "open-externally"
   | "unpack-book"
@@ -175,6 +177,7 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   // working library; there was simply no way to say so. "Switch
   // library -> Browse for another" reads as "find an existing one".
   { id: "new-library", label: "New library…", group: "library", requires: "none", toolbar: true, desktopOnly: true, primary: true, icon: "lt", tooltip: "Create an empty library and open it" },
+  { id: "open-library-folder", label: "Open library folder", group: "library", requires: "none", desktopOnly: true, icon: "tb_folder", tooltip: "Show this library's folder in the file browser" },
 
   { id: "select-mode", label: "Select…", group: "view", requires: "none" },
   // Marks are the thing selection is not: they survive a new search,
@@ -207,6 +210,7 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   { id: "test-template", label: "Test template…", group: "book", requires: "single-selection", contextMenu: true, icon: "template_funcs", tooltip: "Try a template against a real book" },
   { id: "send-email", label: "Send…", group: "book", requires: "single-selection", contextMenu: true, icon: "mail", accel: "Ctrl+E", tooltip: "Email a book to a device or address" },
   { id: "replace-cover", label: "Replace cover…", group: "book", requires: "single-selection", contextMenu: true, icon: "default_cover", tooltip: "Replace the cover image" },
+  { id: "open-book-folder", label: "Open containing folder", group: "book", requires: "single-selection", contextMenu: true, desktopOnly: true, icon: "tb_folder", tooltip: "Show this book's files in the file browser" },
   { id: "cover-from-pdf", label: "Cover from PDF page 1", group: "book", requires: "single-selection", contextMenu: true, icon: "default_cover", tooltip: "Render the first page of the PDF as the cover" },
   { id: "similar-books", label: "Similar books", group: "book", requires: "single-selection", contextMenu: true, icon: "similar", tooltip: "Find books like this one" },
   // Selection-scoped rather than book-scoped: polishing a batch is
@@ -428,7 +432,7 @@ export const TOOLBAR_LAYOUT: ToolbarItem[] = [
   { kind: "spring" },
   // Label is replaced at render time with the open library's name:
   // which library you are in is state, and state belongs on a label.
-  { kind: "menu", id: "library", label: "Library", icon: "lt", menu: ["switch-library", "new-library", "-", "$recent-libraries", "-", "check-library", "find-duplicates"] },
+  { kind: "menu", id: "library", label: "Library", icon: "lt", menu: ["switch-library", "new-library", "open-library-folder", "-", "$recent-libraries", "-", "check-library", "find-duplicates"] },
   { kind: "split", id: "help", menu: ["$shortcuts", "$about"] },
 ];
 

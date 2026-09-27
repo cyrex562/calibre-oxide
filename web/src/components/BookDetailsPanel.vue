@@ -644,6 +644,16 @@ async function repackBook() {
   }
 }
 
+/** Shows this book's files in the system file browser (#886). */
+async function revealBookFolder() {
+  openExternallyError.value = null;
+  try {
+    await tauriInvoke<void>("reveal_book_folder", { bookId: props.bookId });
+  } catch (e) {
+    openExternallyError.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
 async function openExternally() {
   const fmt = externalFormat.value;
   if (!fmt) return;
@@ -773,6 +783,9 @@ function performAction(id: string) {
       break;
     case "open-externally":
       void openExternally();
+      break;
+    case "open-book-folder":
+      void revealBookFolder();
       break;
     case "unpack-book":
       void unpackBook();

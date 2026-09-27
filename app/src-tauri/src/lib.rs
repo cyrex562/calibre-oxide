@@ -377,6 +377,75 @@ async fn open_book_format(state: State<'_, ServerState>, app: AppHandle, book_id
     app.opener().open_path(path.to_string_lossy(), None::<&str>).map_err(|e| e.to_string())
 }
 
+// ===================================================================
+// Revealing a library or a book in the system file browser (#886)
+// ===================================================================
+//
+// Neither command takes a path from the page. The window displays
+// content served over HTTP, which Tauri treats as remote for exactly
+// this reason -- a command that opened any path it was handed would be
+// a file-browser-anywhere primitive reachable from the page. Both
+// resolve their own paths from state the Rust side already owns, and
+// the book one additionally checks that what it resolved is still
+// inside the library.
+
+/// Opens `path` in the system file browser, after checking it is inside
+/// `library`.
+///
+/// Both sides are canonicalised before comparing. A lexical
+/// `starts_with` on unresolved paths cannot see a symlink planted
+/// inside the library that points out of it -- the same check
+/// `save_to_disk.rs` makes for its destination root, and for the same
+/// reason.
+fn open_inside_library(app: &AppHandle, library: &std::path::Path, path: &std::path::Path) -> Result<(), String> {
+    let real_library = library.canonicalize().map_err(|e| format!("{}: {e}", library.display()))?;
+    let real_path = path.canonicalize().map_err(|e| format!("{}: {e}", path.display()))?;
+    if !real_path.starts_with(&real_library) {
+        return Err(format!("{} is not inside the library", path.display()));
+    }
+    app.opener().open_path(real_path.to_string_lossy(), None::<&str>).map_err(|e| e.to_string())
+}
+
+/// Opens the library's own folder in the system file browser.
+#[tauri::command]
+fn reveal_library_folder(app: AppHandle) -> Result<(), String> {
+    let library = settings::load_library_path(&app).ok_or("no library is currently open")?;
+    // The library is trivially inside itself; going through the same
+    // helper keeps the canonicalisation and the error text identical.
+    open_inside_library(&app, &library.clone(), &library)
+}
+
+/// Opens the folder holding one book's files.
+///
+/// The book's folder is `<library>/<books.path>`, and `books.path` is
+/// already in every book row -- `ajax::book_json` strips the internal
+/// `fmt_<ext>` absolute paths before they reach a client but keeps
+/// `path`, so this needs no new route.
+#[tauri::command]
+async fn reveal_book_folder(state: State<'_, ServerState>, app: AppHandle, book_id: i32) -> Result<(), String> {
+    let port = state.0.lock().unwrap().as_ref().map(|(_, p)| *p).ok_or("no library is currently open")?;
+    let library = settings::load_library_path(&app).ok_or("no library is currently open")?;
+
+    let relative = fetch_book_relative_path(port, book_id).await?;
+    // An empty `path` means the book's files sit in the library root,
+    // which is the normal case for a tracked folder (#889) and would
+    // otherwise join to the library itself -- which is the right
+    // answer, so no special case is needed beyond not rejecting it.
+    let folder = library.join(relative.trim_start_matches(['/', '\\']));
+    open_inside_library(&app, &library, &folder)
+}
+
+/// Reads one book's `path` column through the running server.
+async fn fetch_book_relative_path(port: u16, book_id: i32) -> Result<String, String> {
+    let url = format!("http://127.0.0.1:{port}/ajax/book/{book_id}");
+    let response = reqwest::get(&url).await.map_err(|e| e.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("no book with id {book_id}"));
+    }
+    let row: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
+    row.get("path").and_then(|v| v.as_str()).map(str::to_string).ok_or_else(|| format!("book {book_id} has no folder recorded"))
+}
+
 /// Fetches one of a book's formats from the running `calibre_srv`.
 ///
 /// Shared by [`open_book_format`] and [`unpack_book`]. Goes through
@@ -630,7 +699,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(ServerState::default())
-        .invoke_handler(tauri::generate_handler![ping, get_persisted_library, choose_library, create_library, choose_folder_and_add_books, list_recent_libraries, open_recent_library, get_auto_reopen, set_auto_reopen, import_library_archive, set_menu_actions, open_book_format, unpack_book, repack_book, open_external_url, get_auto_add_folder, choose_auto_add_folder])
+        .invoke_handler(tauri::generate_handler![ping, get_persisted_library, choose_library, create_library, choose_folder_and_add_books, list_recent_libraries, open_recent_library, get_auto_reopen, set_auto_reopen, import_library_archive, set_menu_actions, open_book_format, unpack_book, repack_book, open_external_url, reveal_library_folder, reveal_book_folder, get_auto_add_folder, choose_auto_add_folder])
         .on_menu_event(|app, event| menu::forward(app, &event))
         // Dropping files onto the window adds them, the same way the
         // folder picker does. This has to be handled natively: Tauri's

@@ -42,6 +42,8 @@ const COMMANDS: &[&str] = &[
     "unpack_book",
     "repack_book",
     "open_external_url",
+    "reveal_library_folder",
+    "reveal_book_folder",
     // App shell
     "set_menu_actions",
     "get_auto_reopen",
