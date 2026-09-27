@@ -159,11 +159,22 @@ pub fn detect(cache: &Cache, scan: &ScanReport) -> Result<DriftReport> {
     // swap produces no *unclaimed* paths at all, so without the second
     // group there would be nothing to match against.
     let displaced: HashSet<&str> = absent.iter().map(|r| r.path.as_str()).filter(|p| on_disk.contains(*p)).collect();
+
+    // Files the user removed while keeping (#896) are neither untracked
+    // nor match candidates. No book claims them, so without this they
+    // would be reported as unclaimed files needing attention -- which is
+    // precisely the state the user chose -- and could be matched to an
+    // unrelated absent book that happened to share their content.
+    let ignored = cache.ignored();
     let mut untracked: Vec<&str> = scan
         .files
         .iter()
         .map(|f| f.relative_path.as_str())
         .filter(|p| !claimed.contains(p) || displaced.contains(p))
+        .filter(|p| {
+            let hash = hash_of(&library.join(p));
+            !ignored.is_ignored(p, hash.as_deref()).unwrap_or(false)
+        })
         .collect();
     untracked.sort();
 

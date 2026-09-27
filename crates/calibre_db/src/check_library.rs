@@ -1,3 +1,22 @@
+//! # Superseded by `library_check` (#897)
+//!
+//! **Prefer [`crate::library_check`].** This port is kept because it is a
+//! faithful one and because `calibredb check_library` still shapes its
+//! output, but two of its answers cannot be trusted here:
+//!
+//! - It recognises a book directory by calibre's `Title (id)` naming, a
+//!   convention this project has never produced (see `restore.rs`'s own
+//!   note), and after #889 there are no per-book directories at all --
+//!   so `missing_formats`/`extra_formats` are unreliable.
+//! - `corrupted_formats` reports any format whose content differs from
+//!   its recorded hash, which in a folder the user edits is the *normal*
+//!   result of annotating a PDF. A check that calls that damage is one
+//!   people learn to dismiss.
+//!
+//! `library_check` answers the same questions by composing
+//! `scan` + `drift`, so the edge cases are handled once rather than
+//! twice, differently.
+
 use crate::checksums::{ChecksumError, ChecksumStore};
 use crate::constants::{
     LIBRARY_HANDLE_DIR_NAME, NOTES_DIR_NAME as REAL_NOTES_DIR_NAME,

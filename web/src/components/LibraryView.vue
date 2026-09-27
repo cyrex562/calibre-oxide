@@ -12,7 +12,7 @@ import PolishDialog from "./PolishDialog.vue";
 import HelpDialog from "./HelpDialog.vue";
 import { LAYOUT_KEY, type LayoutPrefs, type Panel, parseLayout, resizedWidth } from "../library/layout";
 import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchLibraryInfo, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameFiles, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
-import type { CheckLibraryResult, CustomRecipeOptions, DuplicateGroup, NewsFeedInput, NewsSchedule, SaveToDiskResult } from "../library/api";
+import type { CheckLibraryFinding, CheckLibraryResult, CustomRecipeOptions, DuplicateGroup, NewsFeedInput, NewsSchedule, SaveToDiskResult } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
 import { similarBooksQuery } from "../library/query";
 import { pathFromLibraryId, recentLibraryEntries } from "../library/recentLibraries";
@@ -502,10 +502,25 @@ const checkLibraryLoading = ref(false);
 const checkLibraryError = ref<string | null>(null);
 const checkLibraryResult = ref<CheckLibraryResult | null>(null);
 
+/**
+ * The non-empty categories, in the order `CHECK_LIBRARY_LABELS` lists
+ * them — most worth reading first. `conclusive`/`needs_attention` are
+ * booleans in the same object and are not categories.
+ */
 const checkLibraryNonEmpty = computed(() => {
-  if (!checkLibraryResult.value) return [];
-  return Object.entries(checkLibraryResult.value).filter(([, findings]) => findings.length > 0);
+  const result = checkLibraryResult.value;
+  if (!result) return [];
+  return Object.keys(CHECK_LIBRARY_LABELS)
+    .map((key) => [key, result[key]] as const)
+    .filter((entry): entry is readonly [string, CheckLibraryFinding[]] => Array.isArray(entry[1]) && entry[1].length > 0);
 });
+
+/**
+ * False when a folder could not be read. Saying so matters: the check
+ * deliberately computes no missing-file list in that case, and a silent
+ * empty list would read as "nothing is missing".
+ */
+const checkLibraryConclusive = computed(() => checkLibraryResult.value?.conclusive !== false);
 
 async function openCheckLibrary() {
   checkLibraryOpen.value = true;
@@ -2519,13 +2534,21 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
           <p v-if="checkLibraryLoading">Scanning…</p>
           <p v-else-if="checkLibraryError" class="error">{{ checkLibraryError }}</p>
           <template v-else-if="checkLibraryResult">
-            <p v-if="checkLibraryNonEmpty.length === 0" class="news-hint">No problems found.</p>
+            <!--
+              An incomplete scan computes no missing-file list at all, so
+              saying "no problems found" would be a lie. Told first,
+              because it changes how everything below should be read.
+            -->
+            <p v-if="!checkLibraryConclusive" class="error">
+              A folder could not be read, so this check is incomplete — nothing is reported as missing, because a file that cannot be seen cannot be told from one that is gone.
+            </p>
+            <p v-if="checkLibraryNonEmpty.length === 0" class="news-hint">{{ checkLibraryConclusive ? "No problems found." : "Nothing else to report." }}</p>
             <div v-for="[key, findings] in checkLibraryNonEmpty" :key="key">
               <h4>{{ CHECK_LIBRARY_LABELS[key] ?? key }} ({{ findings.length }})</h4>
               <ul class="manage-list">
                 <li v-for="(f, i) in findings" :key="i">
-                  <span class="manage-name">{{ f.a }}</span>
-                  <code class="manage-query">{{ f.b }}</code>
+                  <span class="manage-name">{{ f.title || "—" }}</span>
+                  <code class="manage-query">{{ f.path }}</code>
                 </li>
               </ul>
             </div>

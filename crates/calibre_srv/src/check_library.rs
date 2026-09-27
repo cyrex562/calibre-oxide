@@ -20,40 +20,44 @@ use axum::extract::{Path, State};
 use axum::Json;
 use serde_json::{json, Value};
 
-use calibre_db::check_library::CheckLibrary;
 
 use crate::errors::ServerError;
 use crate::AppState;
 
-fn encode_triples(items: &[(String, String, i32)]) -> Value {
-    json!(items.iter().map(|(a, b, id)| json!({"a": a, "b": b, "book_id": id})).collect::<Vec<_>>())
+fn encode(findings: &[calibre_db::library_check::Finding]) -> Value {
+    json!(findings.iter().map(|f| json!({"book_id": f.book_id, "title": f.title, "path": f.path})).collect::<Vec<_>>())
 }
 
 /// `POST /check-library/{library_id}`.
 pub async fn check(State(state): State<AppState>, Path(library_id): Path<String>) -> Result<Json<Value>, ServerError> {
     let cache = state.cache_for(Some(&library_id)).ok_or_else(|| ServerError::NotFound(format!("no library named {library_id:?}")))?;
 
-    let result = tokio::task::spawn_blocking(move || {
-        let library_path = cache.backend.library_path.clone();
-        let mut checker = CheckLibrary::new(library_path, &cache);
-        checker.scan_library(vec![], vec![]);
-        json!({
-            "invalid_titles": encode_triples(&checker.invalid_titles),
-            "extra_titles": encode_triples(&checker.extra_titles),
-            "invalid_authors": encode_triples(&checker.invalid_authors),
-            "extra_authors": encode_triples(&checker.extra_authors),
-            "missing_formats": encode_triples(&checker.missing_formats),
-            "extra_formats": encode_triples(&checker.extra_formats),
-            "extra_files": encode_triples(&checker.extra_files),
-            "missing_covers": encode_triples(&checker.missing_covers),
-            "extra_covers": encode_triples(&checker.extra_covers),
-            "malformed_formats": encode_triples(&checker.malformed_formats),
-            "malformed_paths": encode_triples(&checker.malformed_paths),
-            "corrupted_formats": encode_triples(&checker.corrupted_formats),
-            "corrupted_covers": encode_triples(&checker.corrupted_covers),
-        })
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+        // `library_check` rather than the `check_library` port (#897).
+        // That port recognised book folders by calibre's `Title (id)`
+        // naming, which this project never produced, and reported every
+        // edited file as a corrupted one -- so half its answers were
+        // unreliable and the other half cried wolf. See its module docs.
+        let check = calibre_db::library_check::check(&cache)?;
+        Ok(json!({
+            "missing_files": encode(&check.missing_files),
+            "untracked_files": encode(&check.untracked_files),
+            "moved_files": encode(&check.moved_files),
+            "changed_files": encode(&check.changed_files),
+            "missing_covers": encode(&check.missing_covers),
+            "unreadable_folders": encode(&check.unreadable_folders),
+            "orphaned_books": encode(&check.orphaned_books),
+            "ignored_files": encode(&check.ignored_files),
+            "nested_libraries": encode(&check.nested_libraries),
+            // Whether the scan saw the whole library. False means
+            // `missing_files` was not computed at all, and the UI has to
+            // say so rather than implying nothing is missing.
+            "conclusive": check.conclusive,
+            "needs_attention": check.needs_attention(),
+        }))
     })
     .await
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))?
     .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
 
     Ok(Json(result))
@@ -102,19 +106,43 @@ mod tests {
         let (_dir, router) = test_app();
         let (status, body) = post_json(&router, "/check-library/default").await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["invalid_authors"], serde_json::json!([]));
-        assert_eq!(body["extra_formats"], serde_json::json!([]));
+        assert_eq!(body["missing_files"], serde_json::json!([]));
+        assert_eq!(body["untracked_files"], serde_json::json!([]));
+        assert_eq!(body["needs_attention"], false);
+        assert_eq!(body["conclusive"], true);
     }
 
+    /// A file that is not a book is not a library problem.
+    ///
+    /// The old check reported any unrecognised top-level entry as an
+    /// "invalid author" -- because in calibre's layout a top-level
+    /// directory *is* an author. A stray `.bin` being described that way
+    /// is a good illustration of why the categories had to change (#897).
     #[tokio::test]
-    async fn a_real_extra_unrecognized_top_level_entry_is_reported() {
+    async fn a_file_that_is_not_a_book_is_not_reported() {
         let (dir, router) = test_app();
         std::fs::write(dir.path().join("not_a_real_calibre_file.bin"), b"junk").unwrap();
 
         let (status, body) = post_json(&router, "/check-library/default").await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        let invalid_authors = body["invalid_authors"].as_array().unwrap();
-        assert!(invalid_authors.iter().any(|v| v["a"] == "not_a_real_calibre_file.bin"), "{body}");
+        assert_eq!(body["untracked_files"], serde_json::json!([]), "{body}");
+        assert_eq!(body["needs_attention"], false, "{body}");
+    }
+
+    /// A book file the library does not know about *is* worth reporting.
+    #[tokio::test]
+    async fn an_unclaimed_book_file_is_reported_as_untracked() {
+        let (dir, router) = test_app();
+        std::fs::write(dir.path().join("dropped in.epub"), b"epub bytes").unwrap();
+        // Past the scanner's settle window, which exists so a file still
+        // being copied is not indexed half-written.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        filetime::set_file_mtime(dir.path().join("dropped in.epub"), filetime::FileTime::from_system_time(old)).ok();
+
+        let (status, body) = post_json(&router, "/check-library/default").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let untracked = body["untracked_files"].as_array().unwrap();
+        assert!(untracked.iter().any(|v| v["path"] == "dropped in.epub"), "{body}");
     }
 
     #[tokio::test]

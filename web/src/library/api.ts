@@ -467,29 +467,46 @@ export async function renameCategoryItem(category: string, itemName: string, new
 // own doc for why (real upstream's "Check Library" dialog is Qt
 // GUI-only, never exposed over HTTP there).
 export interface CheckLibraryFinding {
-  a: string;
-  b: string;
-  book_id: number;
+  /** Null for a finding about a file rather than a book. */
+  book_id: number | null;
+  title: string;
+  /** Relative to the library root. */
+  path: string;
 }
 
-export type CheckLibraryResult = Record<string, CheckLibraryFinding[]>;
+/**
+ * Category name to findings, plus two booleans.
+ *
+ * `conclusive` is false when a folder could not be read — `missing_files`
+ * is then not computed at all, and the UI has to say so rather than
+ * implying nothing is missing.
+ */
+export type CheckLibraryResult = Record<string, CheckLibraryFinding[] | boolean>;
 
 // Human-readable labels for each real result key, matching
 // calibre_db::cli::cmd_check_library's own upstream-derived labels.
+/**
+ * What the library check reports, in the order it is worth reading (#897).
+ *
+ * The categories changed with the check itself: the old ones described
+ * calibre's `<Author>/<Title (id)>` folder convention, which this project
+ * no longer maintains, and called every edited file a corrupted one.
+ *
+ * "Changed since the last check" is deliberately not "corrupted". A file
+ * whose content differs might be an edit or bit rot, and nothing can tell
+ * those apart — claiming damage asserts something unknowable, and the
+ * person who knows whether they opened it is the user.
+ */
 export const CHECK_LIBRARY_LABELS: Record<string, string> = {
-  invalid_titles: "Invalid titles",
-  extra_titles: "Extra titles",
-  invalid_authors: "Invalid authors",
-  extra_authors: "Extra authors",
-  missing_formats: "Missing book formats",
-  extra_formats: "Extra book formats",
-  extra_files: "Unknown files in books",
-  missing_covers: "Missing cover files",
-  extra_covers: "Cover files not in database",
-  malformed_formats: "Malformed formats",
-  malformed_paths: "Malformed book paths",
-  corrupted_formats: "Corrupted book formats",
-  corrupted_covers: "Corrupted cover files",
+  missing_files: "Files that are gone",
+  orphaned_books: "Books waiting to be relocated",
+  untracked_files: "Books in the folder that are not in the library",
+  unreadable_folders: "Folders that could not be read",
+  missing_covers: "Covers that are gone",
+  moved_files: "Files found somewhere new",
+  changed_files: "Changed since the last check",
+  ignored_files: "Removed from the library, kept on disk",
+  nested_libraries: "Folders skipped — they are libraries of their own",
 };
 
 export function checkLibrary(): Promise<CheckLibraryResult> {
