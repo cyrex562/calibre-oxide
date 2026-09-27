@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { addBook, addFormat, addNewsSchedule, blobToDataUrl, inspectPlugin, installPlugin, listPlugins, removePlugin, setPluginEnabled, catalogDownloadUrl, checkLibrary, coverProxyUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchCoverProxyBlob, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeDataFile, removeFormat, removeNewsSchedule, renameCategoryItem, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, scanLibrary, searchMetadataOnline, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
+import { addBook, addFormat, addNewsSchedule, blobToDataUrl, inspectPlugin, installPlugin, listPlugins, removePlugin, setPluginEnabled, catalogDownloadUrl, checkLibrary, coverProxyUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchCoverProxyBlob, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeDataFile, removeFormat, removeNewsSchedule, renameCategoryItem, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, scanLibrary, fetchOrphans, relocateOrphan, uploadOrphanFile, forgetOrphan, fetchIgnored, unignoreFile, searchMetadataOnline, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
 import type { BookSummary } from "./types";
 
 function bookStub(id: number): BookSummary {
@@ -508,6 +508,77 @@ describe("checkLibrary", () => {
     expect(fetchMock).toHaveBeenCalledWith("/check-library/default", { method: "POST" });
     expect(result.invalid_authors).toHaveLength(1);
     expect(result.extra_formats).toEqual([]);
+  });
+});
+
+describe("orphan resolution", () => {
+  it("lists orphans with where the file used to be", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => [{ book_id: 4, format: "PDF", last_known_path: "Receipts/scan0042.pdf", noticed_at: "2026-09-27" }] });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const orphans = await fetchOrphans();
+
+    expect(fetchMock).toHaveBeenCalledWith("/orphans/default", undefined);
+    expect(orphans[0].last_known_path).toBe("Receipts/scan0042.pdf");
+  });
+
+  it("relocates to a path inside the library and reports the content verdict", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ outcome: "content_differs", message: "not the one that was recorded" }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await relocateOrphan(4, "PDF", "Manuals/boiler v2.pdf");
+
+    expect(fetchMock).toHaveBeenCalledWith("/orphans/relocate/4/PDF/default", expect.objectContaining({ method: "POST", body: JSON.stringify({ path: "Manuals/boiler v2.pdf" }) }));
+    expect(result.outcome).toBe("content_differs");
+  });
+
+  it("puts the filename in the upload URL, encoded", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ outcome: "content_matches", message: "same file" }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await uploadOrphanFile(4, "PDF", new File([new Uint8Array([1, 2, 3])], "Boiler Manual.pdf"));
+
+    expect(fetchMock).toHaveBeenCalledWith("/orphans/upload/4/PDF/default/Boiler%20Manual.pdf", expect.objectContaining({ method: "POST" }));
+  });
+
+  it("asks to keep the metadata when a filename is given", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ forgotten: 4, metadata_saved_as: "boiler.opf" }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await forgetOrphan(4, "boiler.opf");
+
+    expect(fetchMock).toHaveBeenCalledWith("/orphans/forget/4/default?keep_metadata=boiler.opf", { method: "POST" });
+    expect(result.metadata_saved_as).toBe("boiler.opf");
+  });
+
+  it("omits the query entirely when the metadata is not being kept", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ forgotten: 4, metadata_saved_as: null }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await forgetOrphan(4);
+
+    expect(fetchMock).toHaveBeenCalledWith("/orphans/forget/4/default", { method: "POST" });
+  });
+});
+
+describe("the ignore list", () => {
+  it("lists ignored files with their titles", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => [{ path: "Boiler Manual.pdf", title: "Boiler Manual", ignored_at: "2026-09-27" }] });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const files = await fetchIgnored();
+
+    expect(fetchMock).toHaveBeenCalledWith("/ignored/default", undefined);
+    expect(files[0].title).toBe("Boiler Manual");
+  });
+
+  it("posts the path to unignore", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => null });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await unignoreFile("Boiler Manual.pdf");
+
+    expect(fetchMock).toHaveBeenCalledWith("/ignored/unignore/default", expect.objectContaining({ method: "POST", body: JSON.stringify({ path: "Boiler Manual.pdf" }) }));
   });
 });
 
