@@ -1,0 +1,629 @@
+//! Walking a library folder to find the books in it (issue #891, part
+//! of #889).
+//!
+//! # Phase one of two
+//!
+//! Opening a folder already creates the database — `Backend::new`
+//! creates the directory and the schema if absent. What it never did is
+//! notice the files already sitting in it. This is that walk.
+//!
+//! It is deliberately the cheap half. Every file yields one `stat` and
+//! nothing more: no hashing, no metadata parsing, no reading of
+//! content. A folder of five thousand PDFs has to be browsable in
+//! seconds, and hashing it is minutes to hours of I/O — so the
+//! hash-derived conclusions (which files are duplicates, which belong
+//! to one book) are a separate pass that lands afterwards.
+//!
+//! # A scan that failed must not conclude anything
+//!
+//! The most dangerous thing a scanner of somebody else's folder can do
+//! is decide a file is gone when it merely could not be read. A network
+//! share that dropped, a permissions error on one subdirectory, a
+//! sleeping external disk — each makes files *look* absent, and acting
+//! on that turns a temporary condition into a library full of orphans.
+//!
+//! So [`ScanReport::is_complete`] is false whenever any directory could
+//! not be read, and the drift and orphan passes are required to check
+//! it before concluding a single file is missing. A partial scan is
+//! still useful for *finding* new files; it is worthless for deciding
+//! what is gone.
+
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+
+use anyhow::{Context, Result};
+
+use calibre_utils::filenames::{file_facts, FileFacts};
+
+use crate::constants::LIBRARY_HANDLE_DIR_NAME;
+
+/// How long a file must have been untouched before it is indexed.
+///
+/// A file that appeared a moment ago is very likely still being written
+/// — a browser download, a copy over a network share, a scanner writing
+/// page by page. Indexing it half-complete records a size and (once the
+/// hashing pass runs) a hash for a file that is about to be different.
+///
+/// Matches the desktop app's auto-add watcher, which settled on the same
+/// five seconds for the same reason.
+pub const DEFAULT_SETTLE: Duration = Duration::from_secs(5);
+
+/// Names that are never books, whatever their extension.
+///
+/// Extends the ignore list `check_library` already carries with the
+/// things a NAS or a cloud client leaves lying around.
+const JUNK_NAMES: &[&str] = &[
+    ".ds_store",
+    "thumbs.db",
+    "desktop.ini",
+    ".directory",
+    "metadata.db",
+    "metadata_db_prefs_backup.json",
+    "metadata.opf",
+    "cover.jpg",
+];
+
+/// Directory names that are somebody else's business.
+const JUNK_DIRS: &[&str] = &[
+    LIBRARY_HANDLE_DIR_NAME,
+    "@eadir",          // Synology thumbnails
+    ".@__thumb",       // QNAP
+    "#recycle",        // Synology
+    "$recycle.bin",    // Windows
+    "system volume information",
+    ".trash",
+    ".trashes",
+    ".git",
+];
+
+#[derive(Debug, Clone)]
+pub struct ScanOptions {
+    pub settle: Duration,
+    /// Extensions worth indexing, lowercase and without the dot.
+    pub extensions: HashSet<String>,
+}
+
+impl Default for ScanOptions {
+    fn default() -> Self {
+        ScanOptions {
+            settle: DEFAULT_SETTLE,
+            // `metadata_extensions` is the list this crate already
+            // treats as "a book file", minus `opf`, which is metadata
+            // *about* a book rather than one.
+            extensions: crate::adding::metadata_extensions().iter().filter(|e| **e != "opf").map(|e| e.to_string()).collect(),
+        }
+    }
+}
+
+/// One book file found on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredFile {
+    /// Relative to the library root, `/`-separated so the value is the
+    /// same on every platform and can go straight into `books.path` and
+    /// `data.name`.
+    pub relative_path: String,
+    /// The `books.path` half: the folder, `""` for the library root.
+    pub folder: String,
+    /// The `data.name` half: the filename without its extension.
+    pub stem: String,
+    /// Lowercase, no dot.
+    pub extension: String,
+    pub facts: FileFacts,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ScanReport {
+    pub files: Vec<DiscoveredFile>,
+    /// Directories skipped because they hold a library of their own.
+    pub nested_libraries: Vec<String>,
+    /// Files skipped because they are still settling.
+    pub settling: Vec<String>,
+    /// Files skipped because the bytes are not local — a cloud-sync
+    /// placeholder. Reading one downloads it.
+    pub offline: Vec<String>,
+    /// Directories that could not be read. Any entry here makes the
+    /// scan incomplete.
+    pub unreadable: Vec<String>,
+}
+
+impl ScanReport {
+    /// Whether every directory under the library was successfully read.
+    ///
+    /// **Check this before concluding a file is missing.** A scan with
+    /// an unreadable directory cannot tell "gone" from "not visible
+    /// right now", and treating the second as the first is how a dropped
+    /// network share becomes a library full of orphans.
+    pub fn is_complete(&self) -> bool {
+        self.unreadable.is_empty()
+    }
+}
+
+/// Walks `library_path` and reports the book files in it.
+///
+/// `now` is passed in rather than read from the clock so the settle
+/// window is testable without sleeping.
+pub fn walk(library_path: &Path, options: &ScanOptions, now: SystemTime) -> Result<ScanReport> {
+    let mut report = ScanReport::default();
+    // The root failing is different from a subdirectory failing: there
+    // is nothing to report on, and returning an empty report would say
+    // "this library has no books".
+    let root_entries = std::fs::read_dir(library_path).with_context(|| format!("reading the library folder {}", library_path.display()))?;
+    drop(root_entries);
+
+    walk_dir(library_path, library_path, options, now, &mut report);
+    report.files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    Ok(report)
+}
+
+fn walk_dir(root: &Path, dir: &Path, options: &ScanOptions, now: SystemTime, report: &mut ScanReport) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => {
+            report.unreadable.push(relative_to(root, dir));
+            return;
+        }
+    };
+
+    let mut subdirs = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            // An entry that cannot even be read counts as an unreadable
+            // directory: something in here is invisible to us, and that
+            // is exactly the condition that must not become an orphan.
+            report.unreadable.push(relative_to(root, dir));
+            continue;
+        };
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let lower = name.to_ascii_lowercase();
+
+        // `file_type` rather than `metadata`: it does not follow
+        // symlinks, which is what lets a directory symlink be
+        // recognised and skipped before it is descended into.
+        let Ok(file_type) = entry.file_type() else {
+            report.unreadable.push(relative_to(root, dir));
+            continue;
+        };
+
+        if file_type.is_dir() {
+            if JUNK_DIRS.contains(&lower.as_str()) {
+                continue;
+            }
+            if holds_its_own_library(&path) {
+                report.nested_libraries.push(relative_to(root, &path));
+                continue;
+            }
+            subdirs.push(path);
+            continue;
+        }
+
+        if file_type.is_symlink() {
+            // A symlink to a file is indexed by its own path -- the
+            // library contains this name, whatever it points at. A
+            // symlink to a *directory* is not descended into, because a
+            // loop would otherwise walk forever; `is_dir` above is false
+            // for it since `file_type` does not follow the link.
+            if path.is_dir() {
+                continue;
+            }
+        }
+
+        if JUNK_NAMES.contains(&lower.as_str()) {
+            continue;
+        }
+        // Before the extension check, not after: an iCloud placeholder
+        // for `Big Scan.pdf` is named `.Big Scan.pdf.icloud`, so its
+        // extension is `icloud` and the allowlist below would discard
+        // it as an uninteresting file rather than reporting that a book
+        // is here but not local.
+        if let Some(inner) = cloud_placeholder_for(name) {
+            if extension_of(&inner).is_some_and(|e| options.extensions.contains(&e)) {
+                report.offline.push(relative_to(root, &path));
+            }
+            continue;
+        }
+        let Some(extension) = extension_of(name) else { continue };
+        if !options.extensions.contains(&extension) {
+            continue;
+        }
+        if is_offline_on_disk(&path) {
+            report.offline.push(relative_to(root, &path));
+            continue;
+        }
+        let Some(facts) = file_facts(&path) else {
+            // Present in the listing but not stat-able: another
+            // unreadable condition, not an absent file.
+            report.unreadable.push(relative_to(root, dir));
+            continue;
+        };
+        if is_settling(&facts, options.settle, now) {
+            report.settling.push(relative_to(root, &path));
+            continue;
+        }
+
+        let relative_path = relative_to(root, &path);
+        let folder = relative_to(root, dir);
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(name).to_string();
+        report.files.push(DiscoveredFile { relative_path, folder, stem, extension, facts });
+    }
+
+    subdirs.sort();
+    for subdir in subdirs {
+        walk_dir(root, &subdir, options, now, report);
+    }
+}
+
+/// Whether `dir` is a library in its own right.
+///
+/// Descending into one would double-track every book it contains: the
+/// nested library's own database already knows about them, and this one
+/// would claim them too. Recognised by the two things every library has.
+fn holds_its_own_library(dir: &Path) -> bool {
+    dir.join("metadata.db").exists() || dir.join(LIBRARY_HANDLE_DIR_NAME).is_dir()
+}
+
+/// The real filename an iCloud placeholder stands in for.
+///
+/// macOS evicts `Big Scan.pdf` by replacing it with
+/// `.Big Scan.pdf.icloud`. The name is the only signal there is, and it
+/// is a reliable one — but it means the placeholder's own extension is
+/// `icloud`, so the book extension has to be read out of the inner name.
+fn cloud_placeholder_for(name: &str) -> Option<String> {
+    let inner = name.strip_prefix('.')?.strip_suffix(".icloud")?;
+    (!inner.is_empty()).then(|| inner.to_string())
+}
+
+fn extension_of(name: &str) -> Option<String> {
+    Path::new(name).extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase)
+}
+
+/// Whether a file that is present under its own name has no local
+/// bytes.
+///
+/// OneDrive and Dropbox keep the real filename and mark the file
+/// instead, so unlike iCloud there is nothing in the name to notice.
+/// Reading one downloads it, which on a metered connection is somebody's
+/// data allowance, so it is reported and left alone until it is local.
+fn is_offline_on_disk(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_OFFLINE: u32 = 0x0000_1000;
+        const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0004_0000;
+        const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let attrs = metadata.file_attributes();
+            let placeholder = FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
+            return attrs & placeholder != 0;
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        // No portable equivalent: Linux has no such attribute, and the
+        // macOS case is caught by name above.
+        let _ = path;
+    }
+    false
+}
+
+fn is_settling(facts: &FileFacts, settle: Duration, now: SystemTime) -> bool {
+    let Some(mtime_ms) = facts.mtime_ms else {
+        // No modification time to judge by. Indexing it is the better
+        // risk: refusing would mean never indexing anything on a
+        // filesystem that reports no mtime.
+        return false;
+    };
+    let now_ms = now.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    // A file stamped in the future (clock skew, a bad archive) is not
+    // settling -- it would otherwise be skipped on every scan forever.
+    now_ms.saturating_sub(mtime_ms) < settle.as_millis() as u64 && mtime_ms <= now_ms
+}
+
+/// `/`-separated path relative to the library root.
+fn relative_to(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Far enough in the past that nothing is settling.
+    fn much_later() -> SystemTime {
+        SystemTime::now() + Duration::from_secs(3600)
+    }
+
+    fn write(path: &Path, bytes: &[u8]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn scan(dir: &Path) -> ScanReport {
+        walk(dir, &ScanOptions::default(), much_later()).unwrap()
+    }
+
+    fn names(report: &ScanReport) -> Vec<&str> {
+        report.files.iter().map(|f| f.relative_path.as_str()).collect()
+    }
+
+    #[test]
+    fn finds_books_in_the_library_root() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("Boiler Manual.pdf"), b"%PDF");
+        write(&dir.path().join("scan0042.pdf"), b"%PDF");
+
+        let report = scan(dir.path());
+        assert_eq!(names(&report), vec!["Boiler Manual.pdf", "scan0042.pdf"]);
+        assert!(report.is_complete());
+    }
+
+    #[test]
+    fn a_root_level_book_has_an_empty_folder_and_its_real_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("scan0001.pdf"), b"%PDF");
+
+        let file = &scan(dir.path()).files[0];
+        assert_eq!(file.folder, "", "a book in the root has no subfolder");
+        assert_eq!(file.stem, "scan0001");
+        assert_eq!(file.extension, "pdf");
+    }
+
+    #[test]
+    fn recurses_into_subfolders_and_records_them() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("Receipts/2019 invoice.pdf"), b"%PDF");
+        write(&dir.path().join("Receipts/Old/2015.pdf"), b"%PDF");
+
+        let report = scan(dir.path());
+        assert_eq!(names(&report), vec!["Receipts/2019 invoice.pdf", "Receipts/Old/2015.pdf"]);
+        assert_eq!(report.files[0].folder, "Receipts");
+        assert_eq!(report.files[1].folder, "Receipts/Old");
+    }
+
+    #[test]
+    fn ignores_files_that_are_not_books() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("book.pdf"), b"%PDF");
+        write(&dir.path().join("notes.xlsx"), b"x");
+        write(&dir.path().join("photo.jpeg"), b"x");
+        write(&dir.path().join("README"), b"x");
+
+        assert_eq!(names(&scan(dir.path())), vec!["book.pdf"]);
+    }
+
+    #[test]
+    fn ignores_os_and_nas_junk() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("book.pdf"), b"%PDF");
+        write(&dir.path().join(".DS_Store"), b"x");
+        write(&dir.path().join("Thumbs.db"), b"x");
+        write(&dir.path().join("@eaDir/thumb.pdf"), b"x");
+        write(&dir.path().join("#recycle/deleted.pdf"), b"x");
+
+        assert_eq!(names(&scan(dir.path())), vec!["book.pdf"]);
+    }
+
+    /// The library's own files are not books in it.
+    #[test]
+    fn ignores_the_librarys_own_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("book.pdf"), b"%PDF");
+        write(&dir.path().join("metadata.opf"), b"<opf/>");
+        write(&dir.path().join("cover.jpg"), b"jpeg");
+        write(&dir.path().join(LIBRARY_HANDLE_DIR_NAME).join("changes").join("x.pdf"), b"x");
+
+        assert_eq!(names(&scan(dir.path())), vec!["book.pdf"]);
+    }
+
+    /// E2. Absorbing a nested library would double-track every book in
+    /// it -- its own database already claims them.
+    #[test]
+    fn skips_a_subfolder_that_is_a_library_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("mine.pdf"), b"%PDF");
+        write(&dir.path().join("Someone Elses Library/metadata.db"), b"SQLite");
+        write(&dir.path().join("Someone Elses Library/theirs.pdf"), b"%PDF");
+
+        let report = scan(dir.path());
+        assert_eq!(names(&report), vec!["mine.pdf"]);
+        assert_eq!(report.nested_libraries, vec!["Someone Elses Library"]);
+    }
+
+    #[test]
+    fn a_nested_library_is_recognised_by_its_state_folder_too() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("Nested").join(LIBRARY_HANDLE_DIR_NAME)).unwrap();
+        write(&dir.path().join("Nested/theirs.pdf"), b"%PDF");
+
+        let report = scan(dir.path());
+        assert!(report.files.is_empty());
+        assert_eq!(report.nested_libraries, vec!["Nested"]);
+    }
+
+    /// E6. A file that appeared a moment ago is probably still being
+    /// written, and indexing it half-copied records the wrong size.
+    #[test]
+    fn a_file_still_being_written_is_left_for_the_next_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("arriving.pdf"), b"%PDF");
+
+        // "Now" is the moment the file was written, so it is inside the
+        // settle window.
+        let report = walk(dir.path(), &ScanOptions::default(), SystemTime::now()).unwrap();
+        assert!(report.files.is_empty(), "{:?}", names(&report));
+        assert_eq!(report.settling, vec!["arriving.pdf"]);
+
+        // And it is picked up once it has stopped changing.
+        assert_eq!(names(&scan(dir.path())), vec!["arriving.pdf"]);
+    }
+
+    /// A file stamped in the future would otherwise be inside the
+    /// settle window on every scan for as long as the skew lasted, and
+    /// never get indexed at all.
+    #[test]
+    fn a_file_stamped_in_the_future_is_not_treated_as_settling() {
+        let facts = FileFacts {
+            identity: calibre_utils::filenames::FileIdentity { volume: 1, index: 1 },
+            size: 10,
+            mtime_ms: Some(9_000_000),
+        };
+        let now = SystemTime::UNIX_EPOCH + Duration::from_millis(1_000_000);
+        assert!(!is_settling(&facts, DEFAULT_SETTLE, now));
+    }
+
+    #[test]
+    fn a_file_with_no_modification_time_is_indexed_rather_than_skipped_forever() {
+        let facts = FileFacts {
+            identity: calibre_utils::filenames::FileIdentity { volume: 1, index: 1 },
+            size: 10,
+            mtime_ms: None,
+        };
+        assert!(!is_settling(&facts, DEFAULT_SETTLE, SystemTime::now()));
+    }
+
+    /// E17, the one that turns a dropped share into a library of
+    /// orphans. The scan still reports what it found; what it must not
+    /// do is claim to be complete.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_subfolder_makes_the_scan_incomplete() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("readable.pdf"), b"%PDF");
+        let locked = dir.path().join("locked");
+        write(&locked.join("hidden.pdf"), b"%PDF");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let report = scan(dir.path());
+        // Restore before the assertions, so a failure does not leave an
+        // undeletable temp directory behind.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(names(&report), vec!["readable.pdf"], "what was readable is still reported");
+        assert!(!report.is_complete(), "a scan that could not read a folder must not claim completeness");
+        assert_eq!(report.unreadable, vec!["locked"]);
+    }
+
+    /// An unreadable *root* is different: there is nothing to report on,
+    /// and an empty report would read as "this library has no books".
+    #[test]
+    fn an_unreadable_library_root_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("not-there");
+        assert!(walk(&missing, &ScanOptions::default(), much_later()).is_err());
+    }
+
+    #[test]
+    fn a_clean_scan_reports_itself_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("book.pdf"), b"%PDF");
+        assert!(scan(dir.path()).is_complete());
+    }
+
+    /// E18. Reading one of these downloads it, which on a metered
+    /// connection is somebody's data allowance.
+    #[test]
+    fn an_icloud_placeholder_is_reported_rather_than_read() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("book.pdf"), b"%PDF");
+        // iCloud evicts `Big Scan.pdf` by leaving this in its place.
+        write(&dir.path().join(".Big Scan.pdf.icloud"), b"placeholder");
+
+        let report = scan(dir.path());
+        assert_eq!(names(&report), vec!["book.pdf"]);
+        assert_eq!(report.offline, vec![".Big Scan.pdf.icloud"]);
+    }
+
+    /// The ordering bug this had at first: a placeholder's own extension
+    /// is `icloud`, so an extension check placed before the placeholder
+    /// check discards it as an uninteresting file and never reports that
+    /// a book is here but not local.
+    #[test]
+    fn an_icloud_placeholder_for_a_non_book_is_not_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join(".holiday.mov.icloud"), b"placeholder");
+        write(&dir.path().join(".Big Scan.pdf.icloud"), b"placeholder");
+
+        let report = scan(dir.path());
+        assert_eq!(report.offline, vec![".Big Scan.pdf.icloud"], "only evicted *books* are worth reporting");
+    }
+
+    #[test]
+    fn placeholder_names_are_parsed_back_to_the_real_filename() {
+        assert_eq!(cloud_placeholder_for(".Big Scan.pdf.icloud").as_deref(), Some("Big Scan.pdf"));
+        // Not a placeholder: no leading dot.
+        assert_eq!(cloud_placeholder_for("Big Scan.pdf.icloud"), None);
+        assert_eq!(cloud_placeholder_for("book.pdf"), None);
+        assert_eq!(cloud_placeholder_for(".icloud"), None);
+    }
+
+    /// E7. Without this a symlinked loop walks until the stack runs out.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_symlink_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("real/book.pdf"), b"%PDF");
+        std::os::unix::fs::symlink(dir.path(), dir.path().join("real/loop")).unwrap();
+
+        let report = scan(dir.path());
+        assert_eq!(names(&report), vec!["real/book.pdf"]);
+    }
+
+    /// A symlink to a *file* is a name the library contains, so it is
+    /// indexed -- unlike a directory link, which is only ever a way
+    /// back into somewhere already walked.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_symlink_is_indexed_under_its_own_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real.pdf");
+        write(&target, b"%PDF");
+        std::os::unix::fs::symlink(&target, dir.path().join("alias.pdf")).unwrap();
+
+        assert_eq!(names(&scan(dir.path())), vec!["alias.pdf", "real.pdf"]);
+    }
+
+    #[test]
+    fn extensions_are_matched_regardless_of_case() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("SHOUTING.PDF"), b"%PDF");
+        write(&dir.path().join("Mixed.EpUb"), b"x");
+
+        let report = scan(dir.path());
+        assert_eq!(report.files.len(), 2);
+        assert!(report.files.iter().all(|f| f.extension == f.extension.to_lowercase()));
+    }
+
+    #[test]
+    fn a_stat_is_recorded_for_every_file_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = b"%PDF-1.4 and some content";
+        write(&dir.path().join("book.pdf"), bytes);
+
+        let file = &scan(dir.path()).files[0];
+        assert_eq!(file.facts.size, bytes.len() as u64);
+        assert!(file.facts.mtime_ms.is_some());
+    }
+
+    /// Paths use `/` on every platform, because they go straight into
+    /// `books.path`, which has to mean the same thing in a library
+    /// carried between Windows and Linux.
+    #[test]
+    fn relative_paths_are_slash_separated() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("a/b/book.pdf"), b"%PDF");
+        assert_eq!(names(&scan(dir.path())), vec!["a/b/book.pdf"]);
+    }
+
+    #[test]
+    fn an_empty_library_is_a_clean_empty_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = scan(dir.path());
+        assert!(report.files.is_empty());
+        assert!(report.is_complete());
+    }
+}

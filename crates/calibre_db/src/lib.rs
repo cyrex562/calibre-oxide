@@ -30,6 +30,7 @@ pub mod locking;
 pub mod notes;
 #[cfg(unix)]
 mod power_monitor;
+pub mod scan;
 pub mod restore;
 pub mod schema_upgrades;
 pub mod search;
