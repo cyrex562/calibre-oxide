@@ -330,5 +330,17 @@ writing to files on read-only volumes and to cloud placeholders.
 | every `Cache` write method | append to the change log before applying SQL — the same crate-wide retrofit shape as #93's "every durable write goes through `LibraryHandle`" |
 | `filenames::file_identity` | make public |
 | `adding.rs` | `find_books_in_directory`'s stem grouping is no longer the grouping rule |
-| auto-add watcher | currently deletes the source after import; in this model a watched folder inside the library is just a scan |
+| auto-add watcher | **done:** a watched folder *inside* the library is scanned in place; only one outside it is still drained after import. The old unconditional delete-after-import would have deleted the book's own file, and watching the library root would have deleted every book it indexed. Re-adding is prevented by the records plus the ignore list (E12), which is what made the delete trick unnecessary. New: `scan::rescan`, `POST /scan-library/{library_id}`. |
 | `duplicates.rs` | extend from author/title to content hash |
+
+### Rescan ordering
+
+`scan::rescan` re-attaches moved files **before** indexing new ones, and the order is
+load-bearing. A file that turns up somewhere new is usually a file that left somewhere old —
+the same book, moved. Indexing first would mint a second book for it and leave the first
+pointing at nothing, so a single drag in the user's file manager would turn one book into a
+duplicate plus an orphan.
+
+Re-attachment is safe on an incomplete scan because it concludes from a file that *was*
+found, not from one that was not. Only `missing` needs the whole library to have been seen,
+and nothing in a rescan acts on it (E17).

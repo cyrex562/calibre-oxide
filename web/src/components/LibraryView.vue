@@ -11,7 +11,8 @@ import AnnotationsBrowser from "./AnnotationsBrowser.vue";
 import PolishDialog from "./PolishDialog.vue";
 import HelpDialog from "./HelpDialog.vue";
 import { LAYOUT_KEY, type LayoutPrefs, type Panel, parseLayout, resizedWidth } from "../library/layout";
-import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchLibraryInfo, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameFiles, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
+import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary,
+  scanLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchLibraryInfo, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameFiles, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
 import type { CheckLibraryFinding, CheckLibraryResult, CustomRecipeOptions, DuplicateGroup, NewsFeedInput, NewsSchedule, SaveToDiskResult } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
 import { similarBooksQuery } from "../library/query";
@@ -521,6 +522,49 @@ const checkLibraryNonEmpty = computed(() => {
  * empty list would read as "nothing is missing".
  */
 const checkLibraryConclusive = computed(() => checkLibraryResult.value?.conclusive !== false);
+
+const rescanBusy = ref(false);
+const rescanSummary = ref<string | null>(null);
+
+/**
+ * Untracked files are files the user can see in their own folder that
+ * the library does not list — so the check reports them and this puts
+ * them in. Offered from the check dialog rather than as its own menu
+ * item because that is where the user has just been told they exist.
+ *
+ * A scan also re-attaches anything that moved, so the check is re-run
+ * afterwards instead of assuming what changed.
+ */
+async function rescanLibraryFolder() {
+  rescanBusy.value = true;
+  rescanSummary.value = null;
+  checkLibraryError.value = null;
+  try {
+    const result = await scanLibrary();
+    const parts: string[] = [];
+    if (result.added.length > 0) parts.push(`${result.added.length} added`);
+    if (result.relocated > 0) parts.push(`${result.relocated} found in a new place`);
+    // Named rather than counted: a file the scan refused to add is
+    // exactly what the user needs to know the name of.
+    if (result.settling.length > 0) parts.push(`still being written: ${result.settling.join(", ")}`);
+    if (result.ignored.length > 0) parts.push(`kept out because you removed them: ${result.ignored.join(", ")}`);
+    for (const failure of result.failed) parts.push(`${failure.path}: ${failure.error}`);
+    if (!result.conclusive) parts.push("a folder could not be read, so this is partial");
+    rescanSummary.value = parts.length > 0 ? parts.join(" · ") : "Nothing to add.";
+    await runSearch();
+    checkLibraryResult.value = await checkLibrary();
+  } catch (e) {
+    checkLibraryError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    rescanBusy.value = false;
+  }
+}
+
+/** Whether the check found files on disk that no book claims. */
+const checkLibraryHasUntracked = computed(() => {
+  const untracked = checkLibraryResult.value?.untracked_files;
+  return Array.isArray(untracked) && untracked.length > 0;
+});
 
 async function openCheckLibrary() {
   checkLibraryOpen.value = true;
@@ -2543,6 +2587,16 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
               A folder could not be read, so this check is incomplete — nothing is reported as missing, because a file that cannot be seen cannot be told from one that is gone.
             </p>
             <p v-if="checkLibraryNonEmpty.length === 0" class="news-hint">{{ checkLibraryConclusive ? "No problems found." : "Nothing else to report." }}</p>
+            <!--
+              Only when there is something to add. A button that does
+              nothing is worse than no button.
+            -->
+            <div v-if="checkLibraryHasUntracked" class="plugin-actions">
+              <button type="button" :disabled="rescanBusy" @click="rescanLibraryFolder">
+                {{ rescanBusy ? "Scanning…" : "Add the untracked files to the library" }}
+              </button>
+            </div>
+            <p v-if="rescanSummary" class="news-hint">{{ rescanSummary }}</p>
             <div v-for="[key, findings] in checkLibraryNonEmpty" :key="key">
               <h4>{{ CHECK_LIBRARY_LABELS[key] ?? key }} ({{ findings.length }})</h4>
               <ul class="manage-list">

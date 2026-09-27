@@ -198,6 +198,7 @@ pub mod opts;
 pub mod reader_profiles;
 pub mod rename;
 pub mod rename_files;
+pub mod scan_library;
 pub mod render_endpoints;
 pub mod save_to_disk;
 pub mod share;
@@ -350,6 +351,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/email-account", get(share::get_email_account).post(share::save_email_account))
         .route("/share/email", post(share::share_email))
         .route("/check-library/{library_id}", post(check_library::check))
+        .route("/scan-library/{library_id}", post(scan_library::scan))
         .route("/custom-columns", get(custom_columns::list))
         .route("/custom-columns/add", post(custom_columns::add))
         .route("/custom-columns/remove/{label}", post(custom_columns::remove))

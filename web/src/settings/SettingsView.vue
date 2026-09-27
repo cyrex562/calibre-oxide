@@ -464,6 +464,12 @@ async function toggleAutoReopen() {
             then removed from it. A file that fails to add, or is already in the
             library, is left where it is rather than disappearing.
           </p>
+          <p class="hint">
+            A folder <em>inside</em> the library works differently: its files are
+            already in the library, so they are indexed where they sit and nothing is
+            moved or removed. Choose the library folder itself to have new files picked
+            up wherever you put them.
+          </p>
           <p class="field">{{ autoAddFolder || "No folder is being watched." }}</p>
           <div class="plugin-actions">
             <button type="button" :disabled="autoAddBusy" @click="chooseAutoAddFolder(false)">

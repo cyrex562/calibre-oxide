@@ -655,12 +655,55 @@ async fn choose_auto_add_folder(app: AppHandle, clear: bool) -> Result<Option<St
     Ok(Some(folder.to_string_lossy().into_owned()))
 }
 
+/// Whether `folder` is the library itself or sits inside it.
+///
+/// Decides what the watcher does with what it finds, so it has to be
+/// right about symlinks: both sides are canonicalised, because a watched
+/// folder that is a symlink into the library is inside it however
+/// different the two paths look. If either side cannot be canonicalised
+/// the answer is "outside", which is the conservative direction -- an
+/// import leaves the original in place for the user to see, while a
+/// wrong "inside" would skip importing a file that genuinely needed it.
+fn folder_is_inside_library(folder: &std::path::Path, library: &std::path::Path) -> bool {
+    let (Ok(folder), Ok(library)) = (folder.canonicalize(), library.canonicalize()) else {
+        return false;
+    };
+    folder == library || folder.starts_with(&library)
+}
+
+/// Brings the library index up to date with its folder, in place.
+///
+/// Nothing is copied and nothing is deleted: the files are already in
+/// the library, so there is nothing to import them *to*.
+async fn scan_library_via_server(port: u16) -> Result<serde_json::Value, String> {
+    let url = format!("http://127.0.0.1:{port}/scan-library/-");
+    let resp = reqwest::Client::new().post(&url).send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    resp.json::<serde_json::Value>().await.map_err(|e| e.to_string())
+}
+
 /// Starts the background watcher.
 ///
-/// A successfully added file is **removed** from the watched folder.
-/// That is the whole point of a drop folder -- leaving it would mean
-/// re-adding the same book on every scan, and de-duplicating by name
-/// would break the moment someone renamed a file.
+/// What it does depends on where the watched folder is, and the
+/// distinction matters because getting it wrong destroys files.
+///
+/// **Outside the library** it is a drop folder: each file is imported
+/// and then **removed** from the folder. That is the point of a drop
+/// folder -- leaving it would mean re-adding the same book on every
+/// scan, and de-duplicating by name would break the moment someone
+/// renamed a file.
+///
+/// **Inside the library** it is not a drop folder at all, it is part of
+/// the library (#889), and the same behaviour would be a bug twice over:
+/// importing would copy a file that is already there, and removing the
+/// source would delete the book's own file. Watching the library root
+/// would delete every book it indexed. So a folder inside the library is
+/// *scanned* instead -- the index catches up with the folder and nothing
+/// on disk is touched. Re-adding is prevented by the records themselves,
+/// plus the ignore list for files the user removed but kept (#896), which
+/// is what made the delete-after-import trick unnecessary here.
 fn spawn_auto_add_watcher(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         loop {
@@ -669,20 +712,42 @@ fn spawn_auto_add_watcher(app: AppHandle) {
             let Some(folder) = settings::get_auto_add_folder(&app) else { continue };
             let Some(port) = app.state::<ServerState>().0.lock().unwrap().as_ref().map(|(_, p)| *p) else { continue };
 
-            let files = auto_add_candidates(&folder);
-            if files.is_empty() {
-                continue;
-            }
+            let inside = settings::load_library_path(&app).is_some_and(|library| folder_is_inside_library(&folder, &library));
 
-            let result = add_files_via_server(port, &files).await;
-            for (path, ()) in files.iter().zip(std::iter::repeat(())) {
-                let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-                // Only remove what really landed: a file that failed
-                // or was a duplicate stays put, so nothing is lost
-                // silently.
-                if !result.errors.iter().any(|e| e.starts_with(&name)) && !result.duplicates.contains(&name) {
-                    let _ = std::fs::remove_file(path);
+            let result = if inside {
+                // A scan reads the whole library, not just the watched
+                // folder -- cheaper than it sounds (a `stat` per file)
+                // and it means a file moved anywhere in the library is
+                // re-attached rather than duplicated.
+                match scan_library_via_server(port).await {
+                    Ok(scanned) => AddFolderResult {
+                        added: scanned["added"].as_array().map(|a| a.len() as u32).unwrap_or(0),
+                        duplicates: Vec::new(),
+                        errors: scanned["failed"].as_array().map(|f| f.iter().map(|e| format!("{}: {}", e["path"].as_str().unwrap_or_default(), e["error"].as_str().unwrap_or_default())).collect()).unwrap_or_default(),
+                    },
+                    Err(e) => AddFolderResult { added: 0, duplicates: Vec::new(), errors: vec![e] },
                 }
+            } else {
+                let files = auto_add_candidates(&folder);
+                if files.is_empty() {
+                    continue;
+                }
+                let result = add_files_via_server(port, &files).await;
+                for path in &files {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                    // Only remove what really landed: a file that failed
+                    // or was a duplicate stays put, so nothing is lost
+                    // silently.
+                    if !result.errors.iter().any(|e| e.starts_with(&name)) && !result.duplicates.contains(&name) {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+                result
+            };
+
+            // Nothing changed: not worth waking the page every 20s.
+            if result.added == 0 && result.errors.is_empty() && result.duplicates.is_empty() {
+                continue;
             }
 
             if let Some(window) = app.get_webview_window("main") {
@@ -1040,5 +1105,102 @@ mod acl_tests {
             urls.iter().all(|u| u.ends_with(":*")),
             "a fixed port would break as soon as it is taken: {urls:?}"
         );
+    }
+}
+
+/// The watcher's whole behaviour turns on this: a folder inside the
+/// library is scanned, one outside is drained. Answering "outside" for a
+/// folder that is really inside would delete the books it found.
+#[cfg(test)]
+mod watched_folder_tests {
+    use super::folder_is_inside_library;
+
+    #[test]
+    fn the_library_root_itself_is_inside() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(folder_is_inside_library(dir.path(), dir.path()), "watching the library root must not be read as a drop folder -- it would delete every book it indexed");
+    }
+
+    #[test]
+    fn a_subfolder_of_the_library_is_inside() {
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = dir.path().join("Inbox");
+        std::fs::create_dir(&inbox).unwrap();
+        assert!(folder_is_inside_library(&inbox, dir.path()));
+    }
+
+    #[test]
+    fn a_deeply_nested_subfolder_is_inside() {
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir.path().join("Manuals/Boilers/New");
+        std::fs::create_dir_all(&deep).unwrap();
+        assert!(folder_is_inside_library(&deep, dir.path()));
+    }
+
+    #[test]
+    fn an_unrelated_folder_is_outside() {
+        let library = tempfile::tempdir().unwrap();
+        let downloads = tempfile::tempdir().unwrap();
+        assert!(!folder_is_inside_library(downloads.path(), library.path()));
+    }
+
+    /// The library's *parent* is not inside it. A drop folder that
+    /// happens to contain the library is still a drop folder.
+    #[test]
+    fn the_librarys_parent_is_outside() {
+        let parent = tempfile::tempdir().unwrap();
+        let library = parent.path().join("Books");
+        std::fs::create_dir(&library).unwrap();
+        assert!(!folder_is_inside_library(parent.path(), &library));
+    }
+
+    /// A sibling whose name merely starts with the library's. Comparing
+    /// paths as strings would call `/tmp/lib-extra` a child of `/tmp/lib`.
+    #[test]
+    fn a_sibling_with_a_similar_name_is_outside() {
+        let parent = tempfile::tempdir().unwrap();
+        let library = parent.path().join("Books");
+        let sibling = parent.path().join("Books-inbox");
+        std::fs::create_dir(&library).unwrap();
+        std::fs::create_dir(&sibling).unwrap();
+        assert!(!folder_is_inside_library(&sibling, &library), "a name prefix is not containment");
+    }
+
+    /// A symlink pointing into the library is inside it, however
+    /// different the two paths look. Missing this would drain a folder
+    /// whose files are the library's own.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_into_the_library_is_inside() {
+        let library = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let real = library.path().join("Inbox");
+        std::fs::create_dir(&real).unwrap();
+        let link = elsewhere.path().join("watched");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert!(folder_is_inside_library(&link, library.path()), "a symlink into the library points at the library's own files");
+    }
+
+    /// And the converse: a symlink *out* of the library is outside it,
+    /// so a folder reachable through the library tree is still drained.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_out_of_the_library_is_outside() {
+        let library = tempfile::tempdir().unwrap();
+        let downloads = tempfile::tempdir().unwrap();
+        let link = library.path().join("inbox");
+        std::os::unix::fs::symlink(downloads.path(), &link).unwrap();
+
+        assert!(!folder_is_inside_library(&link, library.path()));
+    }
+
+    /// A folder that is not there cannot be canonicalised. "Outside" is
+    /// the safe answer: an import leaves the original where the user can
+    /// see it, whereas a wrong "inside" silently skips it.
+    #[test]
+    fn a_missing_folder_is_treated_as_outside() {
+        let library = tempfile::tempdir().unwrap();
+        assert!(!folder_is_inside_library(&library.path().join("gone"), library.path()));
     }
 }
