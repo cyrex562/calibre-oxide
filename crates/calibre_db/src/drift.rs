@@ -247,8 +247,10 @@ pub fn apply_relocations(cache: &Cache, report: &DriftReport) -> Result<usize> {
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
 
         cache.set_book_path(relocation.book_id, &folder)?;
-        let conn = cache.backend.conn.lock().unwrap();
-        conn.execute("UPDATE data SET name = ?1 WHERE book = ?2 AND format = ?3", (stem, relocation.book_id, &relocation.format))?;
+        // Through `set_format_name` rather than raw SQL so the rename
+        // reaches the change log: the log is the authority (#899), and a
+        // relocation it never saw is one the next rebuild undoes.
+        cache.set_format_name(relocation.book_id, &relocation.format, stem)?;
     }
     Ok(report.moved.len())
 }
