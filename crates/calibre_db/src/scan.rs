@@ -979,4 +979,112 @@ mod index_tests {
         assert!(result.indexed.added.is_empty(), "a settling file must not be indexed");
         assert_eq!(result.scanned.settling, vec!["half-copied.pdf"]);
     }
+
+    /// Copies a library's `.calibre-oxide/` state into a fresh folder and
+    /// rebuilds `metadata.db` from the change log alone.
+    ///
+    /// The log is meant to be the authority (#899), so anything a rebuild
+    /// cannot reproduce was never really recorded.
+    fn rebuild_elsewhere(source: &Path) -> (tempfile::TempDir, Cache) {
+        let fresh = tempfile::tempdir().unwrap();
+        let state = fresh.path().join(".calibre-oxide");
+        std::fs::create_dir_all(&state).unwrap();
+        for entry in walkdir::WalkDir::new(source.join(".calibre-oxide")).into_iter().filter_map(Result::ok) {
+            let relative = entry.path().strip_prefix(source.join(".calibre-oxide")).unwrap();
+            // `metadata.db` is the thing being rebuilt, so it must not be
+            // copied -- and neither may the writer lock.
+            if relative.as_os_str().is_empty() || relative.starts_with("journal") || relative.to_string_lossy().contains("writer.lock") {
+                continue;
+            }
+            let destination = state.join(relative);
+            if entry.file_type().is_dir() {
+                std::fs::create_dir_all(&destination).unwrap();
+            } else {
+                std::fs::copy(entry.path(), &destination).unwrap();
+            }
+        }
+        let cache = Cache::new(fresh.path()).unwrap();
+        cache.rebuild_from_change_log().unwrap();
+        (fresh, cache)
+    }
+
+    /// A file the user moved inside their own folder is re-attached
+    /// silently -- and that re-attachment has to reach the log, or the
+    /// next rebuild sends the book back to a path with no file at it.
+    #[test]
+    fn a_relocation_survives_a_rebuild_from_the_log() {
+        let (dir, cache) = library();
+        write(&dir.path().join("Boiler Manual.pdf"), b"%PDF-1.4 boiler");
+        let book_id = crate::scan::rescan(&cache, much_later()).unwrap().indexed.added[0];
+        let uuid = cache.book_uuid(book_id).unwrap().unwrap();
+
+        std::fs::create_dir_all(dir.path().join("Manuals")).unwrap();
+        std::fs::rename(dir.path().join("Boiler Manual.pdf"), dir.path().join("Manuals/Boiler Manual.pdf")).unwrap();
+        assert_eq!(crate::scan::rescan(&cache, much_later()).unwrap().relocated, 1);
+        assert_eq!(cache.field_for(book_id, "path").unwrap().unwrap(), "Manuals");
+
+        let (_fresh, rebuilt) = rebuild_elsewhere(dir.path());
+        let rebuilt_id = rebuilt.book_id_for_uuid(&uuid).unwrap().expect("the book should come back from the log");
+        assert_eq!(rebuilt.field_for(rebuilt_id, "path").unwrap().unwrap(), "Manuals", "the rebuild put the book back at its pre-move path, so the relocation never reached the log");
+    }
+
+    /// The same for a rename: `data.name` is the only authority for which
+    /// file belongs to a book (#885), so the log has to carry it.
+    #[test]
+    fn a_renamed_file_survives_a_rebuild_from_the_log() {
+        let (dir, cache) = library();
+        write(&dir.path().join("Boiler Manual.pdf"), b"%PDF-1.4 boiler");
+        let book_id = crate::scan::rescan(&cache, much_later()).unwrap().indexed.added[0];
+        let uuid = cache.book_uuid(book_id).unwrap().unwrap();
+
+        std::fs::rename(dir.path().join("Boiler Manual.pdf"), dir.path().join("boiler-v2.pdf")).unwrap();
+        assert_eq!(crate::scan::rescan(&cache, much_later()).unwrap().relocated, 1);
+
+        let (_fresh, rebuilt) = rebuild_elsewhere(dir.path());
+        let rebuilt_id = rebuilt.book_id_for_uuid(&uuid).unwrap().unwrap();
+        let names = rebuilt.format_file_names(rebuilt_id).unwrap();
+        assert_eq!(names, vec![("PDF".to_string(), "boiler-v2".to_string())], "the rebuild lost the new filename");
+    }
+
+    /// Resolving an orphan is a real edit to where a book's file is, so
+    /// it has to reach the log like any other. Goes through the same
+    /// primitives as a relocation but by a different route -- the user
+    /// pointing at a file rather than the scanner matching one.
+    #[test]
+    fn resolving_an_orphan_survives_a_rebuild_from_the_log() {
+        let (dir, cache) = library();
+        write(&dir.path().join("Boiler Manual.pdf"), b"%PDF-1.4 boiler");
+        let book_id = crate::scan::rescan(&cache, much_later()).unwrap().indexed.added[0];
+        let uuid = cache.book_uuid(book_id).unwrap().unwrap();
+
+        // Lost the file, then found it again under a new name in a
+        // subfolder -- both halves of the location change at once.
+        std::fs::remove_file(dir.path().join("Boiler Manual.pdf")).unwrap();
+        cache.orphans().mark(book_id, "PDF", "Boiler Manual.pdf").unwrap();
+        write(&dir.path().join("Manuals/boiler-recovered.pdf"), b"%PDF-1.4 boiler");
+        crate::orphans::relocate(&cache, book_id, "PDF", &dir.path().join("Manuals/boiler-recovered.pdf")).unwrap();
+
+        let (_fresh, rebuilt) = rebuild_elsewhere(dir.path());
+        let rebuilt_id = rebuilt.book_id_for_uuid(&uuid).unwrap().unwrap();
+        assert_eq!(rebuilt.field_for(rebuilt_id, "path").unwrap().unwrap(), "Manuals");
+        assert_eq!(rebuilt.format_file_names(rebuilt_id).unwrap(), vec![("PDF".to_string(), "boiler-recovered".to_string())]);
+    }
+
+    /// A rename must not cost the recorded hash. Dropping it would make
+    /// the next scan re-read the whole file to learn what it already
+    /// knew, and would make the content-match check in an orphan
+    /// relocation unable to conclude anything.
+    #[test]
+    fn renaming_a_format_keeps_its_recorded_hash() {
+        let (dir, cache) = library();
+        write(&dir.path().join("Boiler Manual.pdf"), b"%PDF-1.4 boiler");
+        let book_id = crate::scan::rescan(&cache, much_later()).unwrap().indexed.added[0];
+
+        let before = cache.checksums().recorded_identity(book_id, "format", "PDF").unwrap().0;
+        assert!(before.is_some(), "the scan should have recorded a hash to begin with");
+
+        cache.set_format_name(book_id, "PDF", "renamed").unwrap();
+
+        assert_eq!(cache.checksums().recorded_identity(book_id, "format", "PDF").unwrap().0, before, "a rename does not change the content");
+    }
 }

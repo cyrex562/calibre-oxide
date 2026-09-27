@@ -288,8 +288,20 @@ impl Cache {
     /// books. Replay needs to write it anyway, so it gets a named door
     /// rather than a hole in the guard.
     pub fn set_book_path(&self, book_id: i32, rel_path: &str) -> anyhow::Result<()> {
-        let conn = self.backend.conn.lock().unwrap();
-        conn.execute("UPDATE books SET path = ?1 WHERE id = ?2", (rel_path, book_id))?;
+        {
+            // Scoped so the log append below happens with the connection
+            // lock released: appending wants an fsync, and holding the
+            // mutex across it would serialise every other write behind
+            // disk I/O.
+            let conn = self.backend.conn.lock().unwrap();
+            conn.execute("UPDATE books SET path = ?1 WHERE id = ?2", (rel_path, book_id))?;
+        }
+        // Replay restores the folder from a `path` field-set, so that is
+        // what this emits. Without it a relocation (#894) is applied to
+        // the database and never recorded, and the next rebuild sends
+        // the book back to a path with no file at it.
+        let value = rel_path.to_string();
+        self.record_for_book(book_id, |book| crate::change_log::ChangeOp::FieldSet { book, field: "path".to_string(), value: Some(value) });
         Ok(())
     }
 
@@ -309,14 +321,42 @@ impl Cache {
         if let Some(hash) = hash {
             self.checksums().record_hash(book_id, "format", &format.to_uppercase(), hash, size)?;
         }
+        let (format_name, stem_name, recorded_hash) = (format.to_uppercase(), name.to_string(), hash.map(str::to_string));
+        self.record_for_book(book_id, |book| crate::change_log::ChangeOp::FormatSet { book, format: format_name, name: stem_name, size, hash: recorded_hash });
+        Ok(())
+    }
+
+    /// Renames the file a format points at, without touching the disk.
+    ///
+    /// The counterpart to [`Cache::set_book_path`] for the other half of
+    /// a file's location: `books.path` is the folder, `data.name` the
+    /// filename, and a move can change either. Reads the existing size
+    /// and hash forward rather than taking them as arguments, because a
+    /// rename does not change the content -- and a `FormatSet` that
+    /// dropped the hash would make the next scan re-read the file to
+    /// work out what it already knew.
+    pub fn set_format_name(&self, book_id: i32, format: &str, name: &str) -> anyhow::Result<()> {
+        let format_upper = format.to_uppercase();
+        let size: i64 = {
+            let conn = self.backend.conn.lock().unwrap();
+            conn.execute("UPDATE data SET name = ?1 WHERE book = ?2 AND format = ?3", (name, book_id, &format_upper))?;
+            conn.query_row("SELECT uncompressed_size FROM data WHERE book = ?1 AND format = ?2", (book_id, &format_upper), |row| row.get(0)).unwrap_or(0)
+        };
+        let (recorded_hash, _) = self.checksums().recorded_identity(book_id, "format", &format_upper).unwrap_or((None, None));
+        let stem_name = name.to_string();
+        self.record_for_book(book_id, |book| crate::change_log::ChangeOp::FormatSet { book, format: format_upper, name: stem_name, size, hash: recorded_hash });
         Ok(())
     }
 
     /// Drops a `data` row without touching the filesystem -- replay's
     /// counterpart to [`Cache::remove_format`].
     pub fn forget_format_row(&self, book_id: i32, format: &str) -> anyhow::Result<()> {
-        let conn = self.backend.conn.lock().unwrap();
-        conn.execute("DELETE FROM data WHERE book = ?1 AND format = ?2", (book_id, format.to_uppercase()))?;
+        {
+            let conn = self.backend.conn.lock().unwrap();
+            conn.execute("DELETE FROM data WHERE book = ?1 AND format = ?2", (book_id, format.to_uppercase()))?;
+        }
+        let format_name = format.to_uppercase();
+        self.record_for_book(book_id, |book| crate::change_log::ChangeOp::FormatRemoved { book, format: format_name });
         Ok(())
     }
 
