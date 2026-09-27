@@ -548,6 +548,81 @@ export function scanLibrary(): Promise<ScanLibraryResult> {
   return jsonFetch<ScanLibraryResult>("/scan-library/default", { method: "POST" });
 }
 
+/** A book entry whose file is gone — renamed, moved out, or deleted. */
+export interface Orphan {
+  book_id: number;
+  format: string;
+  /** Where it was last seen. Often all somebody needs to find it again. */
+  last_known_path: string;
+  noticed_at: string;
+}
+
+/**
+ * Whether the file the user picked is the one that was lost.
+ *
+ * `content_differs` is the case that must reach the user: they may be
+ * supplying a re-downloaded copy, or they may have picked the wrong
+ * file, and only they can tell which.
+ */
+export interface RelocateResult {
+  outcome: "content_matches" | "content_differs" | "nothing_to_compare";
+  message: string;
+}
+
+/** A file removed from the library but kept on disk. */
+export interface IgnoredFile {
+  path: string;
+  title: string;
+  ignored_at: string;
+}
+
+export function fetchOrphans(): Promise<Orphan[]> {
+  return jsonFetch<Orphan[]>("/orphans/default");
+}
+
+/** Points an orphan at a file already inside the library. */
+export function relocateOrphan(bookId: number, format: string, path: string): Promise<RelocateResult> {
+  return jsonFetch<RelocateResult>(`/orphans/relocate/${bookId}/${encodeURIComponent(format)}/default`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+}
+
+/**
+ * Copies a file back into the library and points the orphan at it.
+ *
+ * The `File` goes straight into the body, the same way `addBook` and
+ * `setCover` send theirs — `fetch` streams it, so nothing reads the
+ * whole thing into a buffer first.
+ */
+export function uploadOrphanFile(bookId: number, format: string, file: File): Promise<RelocateResult> {
+  return jsonFetch<RelocateResult>(`/orphans/upload/${bookId}/${encodeURIComponent(format)}/default/${encodeURIComponent(file.name)}`, { method: "POST", body: file });
+}
+
+/**
+ * Drops the entry. `keepMetadataAs` writes the book's metadata to that
+ * filename in the library first — tags, ratings and reading progress
+ * cannot be re-typed the way a book can be re-downloaded.
+ */
+export function forgetOrphan(bookId: number, keepMetadataAs?: string): Promise<{ forgotten: number; metadata_saved_as: string | null }> {
+  const query = keepMetadataAs ? `?keep_metadata=${encodeURIComponent(keepMetadataAs)}` : "";
+  return jsonFetch<{ forgotten: number; metadata_saved_as: string | null }>(`/orphans/forget/${bookId}/default${query}`, { method: "POST" });
+}
+
+export function fetchIgnored(): Promise<IgnoredFile[]> {
+  return jsonFetch<IgnoredFile[]>("/ignored/default");
+}
+
+/** Lets the scanner pick a file up again. Does not add it — the next scan does. */
+export function unignoreFile(path: string): Promise<void> {
+  return jsonFetch<void>("/ignored/unignore/default", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+}
+
 // Real, new route -- see crates/calibre_srv/src/save_to_disk.rs's own
 // doc (real upstream's "Save to disk" is a Qt GUI action, never
 // exposed over HTTP there).

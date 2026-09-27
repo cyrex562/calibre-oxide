@@ -197,6 +197,7 @@ pub mod opml;
 pub mod opts;
 pub mod reader_profiles;
 pub mod rename;
+pub mod orphans;
 pub mod rename_files;
 pub mod scan_library;
 pub mod render_endpoints;
@@ -352,6 +353,12 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/share/email", post(share::share_email))
         .route("/check-library/{library_id}", post(check_library::check))
         .route("/scan-library/{library_id}", post(scan_library::scan))
+        .route("/orphans/{library_id}", get(orphans::list))
+        .route("/orphans/relocate/{book_id}/{format}/{library_id}", post(orphans::relocate))
+        .route("/orphans/upload/{book_id}/{format}/{library_id}/{filename}", post(orphans::upload))
+        .route("/orphans/forget/{book_id}/{library_id}", post(orphans::forget))
+        .route("/ignored/{library_id}", get(orphans::ignored))
+        .route("/ignored/unignore/{library_id}", post(orphans::unignore))
         .route("/custom-columns", get(custom_columns::list))
         .route("/custom-columns/add", post(custom_columns::add))
         .route("/custom-columns/remove/{label}", post(custom_columns::remove))
