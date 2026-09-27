@@ -96,8 +96,15 @@ fn safe_join(bookdir: &Path, relpath: &str) -> Option<PathBuf> {
 }
 
 fn book_dir(cache: &Cache, book_id: i32) -> anyhow::Result<Option<PathBuf>> {
-    let path_rel = cache.field_for(book_id, "path")?;
-    Ok(path_rel.filter(|p| !p.is_empty()).map(|p| cache.backend.library_path.join(p)))
+    // An empty `path` is the library root, and that is where a book in a
+    // tracked folder normally lives (#893). It used to mean "this book
+    // has no folder yet", because every book got an `<author>/<title>/`
+    // one -- so filtering it out became a refusal to attach a data file
+    // to any root-level book.
+    //
+    // `None` still means the book does not exist at all, which is the
+    // distinction callers actually branch on.
+    Ok(cache.field_for(book_id, "path")?.map(|p| if p.is_empty() { cache.backend.library_path.clone() } else { cache.backend.library_path.join(p) }))
 }
 
 /// Port of `list_extra_files`. `pattern` matches

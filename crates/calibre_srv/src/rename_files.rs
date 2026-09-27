@@ -268,7 +268,7 @@ mod tests {
 
         assert_eq!(cache.format_file_stem(id).unwrap().as_deref(), Some("Renamed"));
         assert_eq!(cache.field_for(id, "title").unwrap().as_deref(), Some("A Title"));
-        assert!(dir.path().join("An Author/A Title/Renamed.pdf").exists());
+        assert!(dir.path().join("Renamed.pdf").exists());
     }
 
     #[tokio::test]
@@ -280,7 +280,7 @@ mod tests {
         let (status, body) = post(&router, serde_json::json!({ "book_ids": [id], "template": "{title} - {authors}" })).await;
         assert_eq!(status, StatusCode::OK, "got: {body}");
         assert_eq!(body["results"][0]["proposed"], "Dune - Frank Herbert");
-        assert!(dir.path().join("Frank Herbert/Dune/Dune - Frank Herbert.pdf").exists());
+        assert!(dir.path().join("Dune - Frank Herbert.pdf").exists());
     }
 
     #[tokio::test]
@@ -312,8 +312,8 @@ mod tests {
         assert_eq!(cache.format_file_stem(first).unwrap().as_deref(), Some("Same"));
         assert_eq!(cache.format_file_stem(second).unwrap().as_deref(), Some("Same (1)"));
         // Both files really are still there.
-        assert!(dir.path().join("An Author/Same/Same.pdf").exists());
-        assert!(dir.path().join("An Author/Same/Same (1).pdf").exists());
+        assert!(dir.path().join("Same.pdf").exists());
+        assert!(dir.path().join("Same (1).pdf").exists());
     }
 
     #[tokio::test]

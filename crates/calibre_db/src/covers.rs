@@ -104,6 +104,25 @@ mod tests {
     use super::*;
     use calibre_ebooks::metadata::MetaInformation;
 
+    /// Gives a book a folder of its own and moves its files into it.
+    ///
+    /// `add_book` no longer creates one (#893), and a book whose files sit
+    /// in the library root has no "beside the book" to speak of --
+    /// `legacy_cover_path` deliberately returns `None` there, because
+    /// `<library>/cover.jpg` is nobody's cover in particular. A test whose
+    /// subject *is* that old location has to arrange it.
+    fn give_it_its_own_folder(dir: &tempfile::TempDir, cache: &Cache, book_id: i32) -> PathBuf {
+        let folder = "An Author/A Book";
+        let book_dir = dir.path().join(folder);
+        std::fs::create_dir_all(&book_dir).unwrap();
+        for (format, name) in cache.format_file_names(book_id).unwrap() {
+            let file = format!("{name}.{}", format.to_lowercase());
+            std::fs::rename(dir.path().join(&file), book_dir.join(&file)).unwrap();
+        }
+        cache.set_book_path(book_id, folder).unwrap();
+        book_dir
+    }
+
     fn library_with_book() -> (tempfile::TempDir, Cache, i32) {
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::new(dir.path()).unwrap();
@@ -124,7 +143,7 @@ mod tests {
         let path = cover_path(&cache, id).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"cover bytes");
         assert!(path.starts_with(dir.path().join(LIBRARY_HANDLE_DIR_NAME)), "{}", path.display());
-        assert!(!dir.path().join("An Author/A Book/cover.jpg").exists());
+        assert!(!dir.path().join("cover.jpg").exists(), "a new cover should not be written beside the book");
         assert!(cache.has_cover(id).unwrap());
     }
 
@@ -160,7 +179,7 @@ mod tests {
     #[test]
     fn a_cover_already_beside_the_book_is_still_found() {
         let (dir, cache, id) = library_with_book();
-        let legacy = dir.path().join("An Author/A Book/cover.jpg");
+        let legacy = give_it_its_own_folder(&dir, &cache, id).join("cover.jpg");
         std::fs::write(&legacy, b"OLD COVER").unwrap();
 
         assert_eq!(cover_path(&cache, id).unwrap(), legacy);
@@ -174,7 +193,7 @@ mod tests {
     #[test]
     fn replacing_a_legacy_cover_takes_effect() {
         let (dir, cache, id) = library_with_book();
-        let legacy = dir.path().join("An Author/A Book/cover.jpg");
+        let legacy = give_it_its_own_folder(&dir, &cache, id).join("cover.jpg");
         std::fs::write(&legacy, b"OLD COVER").unwrap();
 
         set_cover(&cache, id, b"NEW COVER").unwrap();

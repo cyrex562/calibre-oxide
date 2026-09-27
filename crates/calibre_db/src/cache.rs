@@ -235,6 +235,23 @@ impl Cache {
         crate::removal::IgnoreStore::new(self.backend.conn.clone(), &self.backend.library_path)
     }
 
+    /// The folder holding a book's files.
+    ///
+    /// `None` only when the book does not exist. An **empty** `path` is
+    /// the library root, which is where a book in a tracked folder
+    /// normally lives (#893) -- and four separate call sites used to
+    /// treat it as "this book has no folder", because before #893 every
+    /// book got an `<author>/<title>/` one. Three of those became silent
+    /// no-ops for any root-level book: `remove_format` deleted nothing,
+    /// `rename_format_files` renamed nothing, and
+    /// `available_format_stem` skipped collision detection entirely.
+    ///
+    /// One helper rather than four call sites making the same judgement,
+    /// since the judgement was wrong in three of them.
+    pub fn book_dir(&self, book_id: i32) -> anyhow::Result<Option<std::path::PathBuf>> {
+        Ok(self.field_for(book_id, "path")?.map(|rel| if rel.is_empty() { self.backend.library_path.clone() } else { self.backend.library_path.join(rel) }))
+    }
+
     /// A book's uuid -- the only identifier that means the same thing
     /// on two machines, since `books.id` is a local autoincrement.
     pub fn book_uuid(&self, book_id: i32) -> anyhow::Result<Option<String>> {
@@ -465,17 +482,22 @@ impl Cache {
     /// every insert (matching real calibre) -- fixed the same way #212
     /// fixed it in `library.rs`: an explicit `UPDATE` after insert.
     pub fn add_book(&self, source_path: &Path, metadata: &MetaInformation) -> anyhow::Result<i32> {
-        let author_name = metadata
-            .authors
-            .first()
-            .map(|s| s.as_str())
-            .unwrap_or("Unknown");
-        let author_folder = sanitize_file_name(author_name);
-        let title_folder = sanitize_file_name(&metadata.title);
-        let rel_path = Path::new(&author_folder).join(&title_folder);
-        let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
-
-        let book_id = self.add_book_db_entry(metadata, &rel_path_str)?;
+        // The library root, not `<author>/<title>/` (#893).
+        //
+        // This method brings a file in from outside the library; one
+        // already inside it is indexed by
+        // [`Cache::register_book_in_place`]. And "in" now means the
+        // folder itself, so an imported book is indistinguishable from
+        // one copied in by hand -- the point of a folder somebody
+        // organises themselves. They move it where they want it and the
+        // next scan follows.
+        //
+        // Author/title folders were calibre's way of guaranteeing a
+        // unique path per book. With filenames coming from the source and
+        // collisions resolved by `free_format_stem`, nothing needs them,
+        // and creating them imposes a structure on somebody else's
+        // folder.
+        let book_id = self.add_book_db_entry(metadata, "")?;
 
         // Delegate the actual file copy to `add_format` (same naming
         // scheme, same `data` table row) rather than duplicating it --
@@ -796,12 +818,22 @@ impl Cache {
             return Ok(false);
         }
 
-        let stem = self.free_format_stem(book_id, &format, &book_dir, &preferred, &ext)?;
+        let stem = self.free_format_stem(book_id, &format, &book_dir, &preferred, &ext, source_path)?;
         let file_name = format!("{stem}.{ext}");
         let dest_path = book_dir.join(&file_name);
         if dest_path.exists() && !replace {
             return Ok(false);
         }
+
+        // The source may already *be* the destination, now that a book's
+        // folder can be the library root: adding `<library>/dune.pdf`
+        // computes a destination of exactly that path. Copying a file
+        // onto itself is not a no-op -- the write truncates the source
+        // before reading it -- so the copy is skipped and only the `data`
+        // row written. Compared by filesystem identity rather than path
+        // text, which sees through a symlink or a differently-spelled but
+        // equal path.
+        let already_in_place = calibre_utils::filenames::samefile(source_path, &dest_path);
 
         // Port of issue #93's crate-wide write-path retrofit: real,
         // journaled, crash-safe, large-file-safe copy-in through
@@ -810,10 +842,11 @@ impl Cache {
         // `copy_atomic` streams both its hashing and copying passes,
         // so this never buffers a whole book file in memory even for
         // a large audiobook/PDF.
-        let hash = self
-            .backend
-            .write_handle()?
-            .copy_atomic(source_path, &dest_path)?;
+        let hash = if already_in_place {
+            blake3::hash(&fs::read(&dest_path)?).to_hex().to_string()
+        } else {
+            self.backend.write_handle()?.copy_atomic(source_path, &dest_path)?
+        };
         let size = fs::metadata(&dest_path)?.len() as i64;
 
         // Port of docs/FAULT_TOLERANCE.md §8: "every book file's
@@ -880,7 +913,7 @@ impl Cache {
     ///
     /// A file this book already owns for this same format is not a
     /// collision -- that is a re-add, and `replace` decides it.
-    fn free_format_stem(&self, book_id: i32, format: &str, book_dir: &Path, preferred: &str, ext: &str) -> anyhow::Result<String> {
+    fn free_format_stem(&self, book_id: i32, format: &str, book_dir: &Path, preferred: &str, ext: &str, source_path: &Path) -> anyhow::Result<String> {
         let own_name: Option<String> = {
             let conn = self.backend.conn.lock().unwrap();
             conn.query_row("SELECT name FROM data WHERE book = ?1 AND format = ?2", (book_id, format.to_uppercase()), |row| row.get(0)).ok()
@@ -890,7 +923,15 @@ impl Cache {
         // Bounded so a directory somebody has filled with `Title
         // (1..n).pdf` cannot spin here forever.
         for suffix in 1..1000 {
-            if own_name.as_deref() == Some(candidate.as_str()) || !book_dir.join(format!("{candidate}.{ext}")).exists() {
+            let occupant = book_dir.join(format!("{candidate}.{ext}"));
+            // The source file is not a collision with itself. Now that a
+            // book's folder can be the library root (#893), adding
+            // `<library>/dune.pdf` computes a destination of exactly that
+            // path -- so without this the file being added looks like an
+            // existing occupant and every add walks its own name to
+            // `dune (1).pdf`.
+            let is_the_source = calibre_utils::filenames::samefile(source_path, &occupant);
+            if own_name.as_deref() == Some(candidate.as_str()) || is_the_source || !occupant.exists() {
                 return Ok(candidate);
             }
             candidate = format!("{preferred} ({suffix})");
@@ -909,11 +950,9 @@ impl Cache {
     /// delete a different book entirely. `data.name` says which file
     /// is ours; nothing else does.
     pub fn remove_format(&self, book_id: i32, fmt: &str) -> anyhow::Result<()> {
-        let path_rel = match self.field_for(book_id, "path")? {
-            Some(p) if !p.is_empty() => p,
-            _ => return Ok(()),
+        let Some(book_dir) = self.book_dir(book_id)? else {
+            return Ok(());
         };
-        let book_dir = self.backend.library_path.join(&path_rel);
 
         let name: Option<String> = {
             let conn = self.backend.conn.lock().unwrap();
@@ -1042,6 +1081,10 @@ impl Cache {
         new_author: &str,
     ) -> anyhow::Result<()> {
         let old_rel_path = self.field_for(book_id, "path")?.unwrap_or_default();
+        // Deliberate, unlike the three guards `book_dir` replaced: a book
+        // whose files sit in the library root has no folder of its own to
+        // move, and moving the library into a subfolder of itself is not
+        // what anybody means by this.
         if old_rel_path.is_empty() {
             return Ok(());
         }
@@ -1221,11 +1264,9 @@ impl Cache {
             anyhow::bail!("a filename cannot be empty");
         }
 
-        let rel_path = match self.field_for(book_id, "path")? {
-            Some(p) if !p.is_empty() => p,
-            _ => return Ok(preferred),
+        let Some(book_dir) = self.book_dir(book_id)? else {
+            return Ok(preferred);
         };
-        let book_dir = self.backend.library_path.join(&rel_path);
         let formats = self.format_file_names(book_id)?;
 
         let mut candidate = preferred.clone();
@@ -1272,11 +1313,9 @@ impl Cache {
             anyhow::bail!("a filename cannot be empty");
         }
 
-        let rel_path = match self.field_for(book_id, "path")? {
-            Some(p) if !p.is_empty() => p,
-            _ => return Ok(Vec::new()),
+        let Some(book_dir) = self.book_dir(book_id)? else {
+            return Ok(Vec::new());
         };
-        let book_dir = self.backend.library_path.join(&rel_path);
 
         let handle = self.backend.write_handle()?;
         let mut renamed = Vec::new();
@@ -3064,8 +3103,14 @@ mod tests {
     /// substring rather than deserializing the real type.
     fn journaled_op_count(library_path: &Path, tag: &str) -> usize {
         let journal_dir = library_path.join(".calibre-oxide").join("journal");
+        // A missing journal directory means zero journaled operations,
+        // not a broken fixture. It is absent whenever nothing has needed
+        // a durable write yet -- which since #893 includes adding a book
+        // whose file is already where it is going, since there is no copy
+        // to journal.
         fs::read_dir(&journal_dir)
-            .unwrap()
+            .into_iter()
+            .flatten()
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("op"))
             .filter(|e| {
@@ -3115,7 +3160,7 @@ mod tests {
     }
 
     #[test]
-    fn add_book_creates_the_author_title_folder_and_copies_the_file() {
+    fn add_book_places_the_file_in_the_library_root() {
         let (dir, cache) = open_test_cache();
         let source = write_temp_file(dir.path(), "src.epub", b"epub bytes");
 
@@ -3125,13 +3170,15 @@ mod tests {
 
         let book_id = cache.add_book(&source, &meta).unwrap();
 
+        // The library root (#893): `add_book` brings a file in, and "in"
+        // is the folder itself rather than a structure imposed on it.
         assert_eq!(
             cache.field_for(book_id, "path").unwrap(),
-            Some("My Author/My Title".to_string())
+            Some(String::new())
         );
         // `src.epub`, not `My Title.epub`: the folder is still derived
         // from the metadata, the filename no longer is (#893).
-        let dest = dir.path().join("My Author/My Title/src.epub");
+        let dest = dir.path().join("src.epub");
         assert_eq!(fs::read(dest).unwrap(), b"epub bytes");
     }
 
@@ -3154,7 +3201,11 @@ mod tests {
     #[test]
     fn add_format_records_the_format_in_the_data_table() {
         let (dir, cache) = open_test_cache();
-        let source = write_temp_file(dir.path(), "src.epub", b"epub bytes");
+        // Deliberately from *outside* the library: this test asserts a
+        // journaled copy, and adding a file that is already at its
+        // destination performs no copy to journal (#893).
+        let outside = tempfile::tempdir().unwrap();
+        let source = write_temp_file(outside.path(), "src.epub", b"epub bytes");
         let mut meta = MetaInformation::default();
         meta.title = "T".to_string();
         meta.authors = vec!["A".to_string()];
@@ -3200,13 +3251,13 @@ mod tests {
         // though it would land under a different name.
         assert!(!cache.add_format(book_id, &source2, "epub", false).unwrap());
 
-        let first_dest = dir.path().join("A/T/src.epub");
+        let first_dest = dir.path().join("src.epub");
         assert_eq!(fs::read(&first_dest).unwrap(), b"first");
 
         // With `replace`, the new file lands under its own name and the
         // one it replaced is removed rather than orphaned.
         assert!(cache.add_format(book_id, &source2, "epub", true).unwrap());
-        assert_eq!(fs::read(dir.path().join("A/T/src2.epub")).unwrap(), b"second");
+        assert_eq!(fs::read(dir.path().join("src2.epub")).unwrap(), b"second");
         assert!(!first_dest.exists(), "the replaced file was left behind");
     }
 
@@ -3362,7 +3413,7 @@ mod tests {
         meta.authors = vec!["A".to_string()];
         let book_id = cache.add_book(&source, &meta).unwrap();
 
-        let dest = dir.path().join("A/T/src.epub");
+        let dest = dir.path().join("src.epub");
         assert_eq!(
             cache
                 .checksums()
@@ -3403,26 +3454,51 @@ mod tests {
     }
 
     #[test]
-    fn delete_book_removes_the_row_and_the_folder() {
+    fn delete_book_removes_the_row_and_the_file() {
         let (dir, cache) = open_test_cache();
         let source = write_temp_file(dir.path(), "src.epub", b"x");
         let mut meta = MetaInformation::default();
         meta.title = "T".to_string();
         meta.authors = vec!["A".to_string()];
         let book_id = cache.add_book(&source, &meta).unwrap();
-        assert!(dir.path().join("A/T").exists());
+        assert!(dir.path().join("src.epub").exists());
 
         cache.delete_book(book_id).unwrap();
 
         assert_eq!(cache.field_for(book_id, "title").unwrap(), None);
-        assert!(!dir.path().join("A/T").exists());
+        // The file survives, and that is deliberate. `delete_book`
+        // removes the book's own *folder*, and a root-level book has
+        // none -- the "folder" would be the library itself, which the
+        // empty-path guard exists to protect. Deleting a root-level
+        // book's file is `removal::delete_with_file`'s job (#896), which
+        // names the file explicitly.
+        assert!(dir.path().join("src.epub").exists());
 
-        // delete_book now goes through the real LibraryHandle (issue
-        // #93's crate-wide write-path retrofit), not a raw
-        // `fs::remove_dir_all` -- prove it by checking a real
-        // journaled `DeleteFile` entry landed (see the comment in
-        // `remove_format_deletes_the_file_and_its_data_row` for why
-        // this doesn't just count every `.op` file).
+        // No journaled delete, because nothing on disk was deleted --
+        // see above. The LibraryHandle retrofit is still exercised by
+        // `delete_book`'s folder path, covered by the folder-move tests.
+        //
+        // Originally: delete_book goes through the real LibraryHandle
+        // (issue #93's crate-wide write-path retrofit) rather than a raw
+        // `fs::remove_dir_all`, proven by a journaled `DeleteFile` entry.
+        // Still true, but only reachable for a book with its own folder,
+        // which the test below covers.
+        assert_eq!(journaled_delete_count(dir.path()), 0);
+    }
+
+    /// `delete_book` still removes a book's own folder through the real
+    /// `LibraryHandle`, journaled -- the behaviour #93 retrofitted. Only
+    /// reachable for a book that has a folder, which since #893 has to be
+    /// arranged rather than assumed.
+    #[test]
+    fn delete_book_removes_a_books_own_folder_through_the_write_handle() {
+        let (dir, cache) = open_test_cache();
+        let book_id = add_pdf_in_its_own_folder(dir.path(), &cache, "T", "A", "src");
+        assert!(dir.path().join("A/T").exists());
+
+        cache.delete_book(book_id).unwrap();
+
+        assert!(!dir.path().join("A/T").exists());
         assert_eq!(journaled_delete_count(dir.path()), 1);
     }
 
@@ -3449,11 +3525,7 @@ mod tests {
     #[test]
     fn moving_a_books_folder_renames_it_on_disk_and_updates_the_path() {
         let (dir, cache) = open_test_cache();
-        let source = write_temp_file(dir.path(), "src.epub", b"x");
-        let mut meta = MetaInformation::default();
-        meta.title = "Old Title".to_string();
-        meta.authors = vec!["Old Author".to_string()];
-        let book_id = cache.add_book(&source, &meta).unwrap();
+        let book_id = add_pdf_in_its_own_folder(dir.path(), &cache, "Old Title", "Old Author", "src");
 
         cache
             .rename_book_files(book_id, "New Title", "New Author")
@@ -3470,11 +3542,11 @@ mod tests {
         // not just the directory.
         assert!(dir
             .path()
-            .join("New Author/New Title/New Title.epub")
+            .join("New Author/New Title/New Title.pdf")
             .exists());
         assert!(!dir
             .path()
-            .join("New Author/New Title/Old Title.epub")
+            .join("New Author/New Title/src.pdf")
             .exists());
 
         // rename_book_files now goes through the real LibraryHandle
@@ -3494,17 +3566,11 @@ mod tests {
     fn moving_a_book_leaves_the_old_author_directory_when_another_book_still_uses_it() {
         let (dir, cache) = open_test_cache();
 
-        let source_a = write_temp_file(dir.path(), "a.epub", b"a");
-        let mut meta_a = MetaInformation::default();
-        meta_a.title = "Book A".to_string();
-        meta_a.authors = vec!["Shared Author".to_string()];
-        let book_a = cache.add_book(&source_a, &meta_a).unwrap();
+        let book_a = add_pdf_in_its_own_folder(dir.path(), &cache, "Book A", "Shared Author", "a");
 
-        let source_b = write_temp_file(dir.path(), "b.epub", b"b");
-        let mut meta_b = MetaInformation::default();
-        meta_b.title = "Book B".to_string();
-        meta_b.authors = vec!["Shared Author".to_string()];
-        cache.add_book(&source_b, &meta_b).unwrap();
+        // A second book under the same author, so the author directory
+        // is not empty after Book A moves out.
+        add_pdf_in_its_own_folder(dir.path(), &cache, "Book B", "Shared Author", "b");
 
         cache
             .rename_book_files(book_a, "Book A", "Solo Author")
@@ -3533,11 +3599,7 @@ mod tests {
         // investigation this project already did into that).
         cache.backend.install_network_tier_handle_for_test();
 
-        let source = write_temp_file(dir.path(), "src.epub", b"epub bytes");
-        let mut meta = MetaInformation::default();
-        meta.title = "Old Title".to_string();
-        meta.authors = vec!["Old Author".to_string()];
-        let book_id = cache.add_book(&source, &meta).unwrap();
+        let book_id = add_pdf_in_its_own_folder(dir.path(), &cache, "Old Title", "Old Author", "src");
 
         cache
             .rename_book_files(book_id, "New Title", "New Author")
@@ -3550,11 +3612,11 @@ mod tests {
         assert!(!dir.path().join("Old Author").exists());
         assert!(dir
             .path()
-            .join("New Author/New Title/New Title.epub")
+            .join("New Author/New Title/New Title.pdf")
             .exists());
         assert!(!dir
             .path()
-            .join("New Author/New Title/Old Title.epub")
+            .join("New Author/New Title/src.pdf")
             .exists());
 
         // A real Batch entry landed (not a series of individual
@@ -3586,7 +3648,7 @@ mod tests {
         let dest_dir = tempdir().unwrap();
         cache.clone_to(dest_dir.path()).unwrap();
 
-        assert!(dest_dir.path().join("A/T/src.epub").exists());
+        assert!(dest_dir.path().join("src.epub").exists());
     }
 
     // --- get_data_as_dict ---
@@ -3745,6 +3807,26 @@ mod tests {
     }
 
     /// Adds a book with one PDF whose source filename is `stem`.
+    /// Adds a book and then gives it a folder of its own, the way a
+    /// calibre-style library is laid out.
+    ///
+    /// `add_book` no longer creates one (#893), so a test whose *subject*
+    /// is per-book folders -- `rename_book_files`, the legacy cover
+    /// location -- has to construct that layout explicitly rather than
+    /// relying on it as a side effect.
+    fn add_pdf_in_its_own_folder(dir: &Path, cache: &Cache, title: &str, author: &str, stem: &str) -> i32 {
+        let id = add_pdf(dir, cache, title, author, stem);
+        let folder = format!("{}/{}", sanitize_file_name(author), sanitize_file_name(title));
+        let book_dir = dir.join(&folder);
+        fs::create_dir_all(&book_dir).unwrap();
+        for (format, name) in cache.format_file_names(id).unwrap() {
+            let file = format!("{name}.{}", format.to_lowercase());
+            fs::rename(dir.join(&file), book_dir.join(&file)).unwrap();
+        }
+        cache.set_book_path(id, &folder).unwrap();
+        id
+    }
+
     fn add_pdf(dir: &Path, cache: &Cache, title: &str, author: &str, stem: &str) -> i32 {
         let source = dir.join(format!("{stem}.pdf"));
         fs::write(&source, b"%PDF-1.4 pretend").unwrap();
@@ -3783,7 +3865,7 @@ mod tests {
     fn editing_metadata_leaves_the_files_where_they_are() {
         let (dir, cache) = open_test_cache();
         let id = add_pdf(dir.path(), &cache, "Old Title", "Old Author", "scan0001");
-        let original = dir.path().join("Old Author/Old Title/scan0001.pdf");
+        let original = dir.path().join("scan0001.pdf");
         assert!(original.exists());
 
         cache.update_book_metadata(id, "A Completely New Title", "A Different Author").unwrap();
@@ -3792,7 +3874,7 @@ mod tests {
         assert_eq!(cache.field_for(id, "title").unwrap().as_deref(), Some("A Completely New Title"));
         // ...and not one byte moved.
         assert!(original.exists(), "editing the title moved the file");
-        assert_eq!(cache.field_for(id, "path").unwrap().as_deref(), Some("Old Author/Old Title"));
+        assert_eq!(cache.field_for(id, "path").unwrap().as_deref(), Some(""));
         assert_eq!(cache.format_file_stem(id).unwrap().as_deref(), Some("scan0001"));
         assert!(!dir.path().join("A Different Author").exists());
 
@@ -3808,7 +3890,7 @@ mod tests {
     fn setting_the_title_field_leaves_the_files_where_they_are() {
         let (dir, cache) = open_test_cache();
         let id = add_pdf(dir.path(), &cache, "Old Title", "An Author", "scan0001");
-        let original = dir.path().join("An Author/Old Title/scan0001.pdf");
+        let original = dir.path().join("scan0001.pdf");
 
         cache.set_field(id, "title", "Renamed In The UI").unwrap();
 
@@ -3826,7 +3908,7 @@ mod tests {
         // The point of the whole issue: naming the file is not
         // retitling the book.
         assert_eq!(cache.field_for(id, "title").unwrap().as_deref(), Some("A Title"));
-        assert_eq!(cache.field_for(id, "path").unwrap().as_deref(), Some("An Author/A Title"));
+        assert_eq!(cache.field_for(id, "path").unwrap().as_deref(), Some(""));
     }
 
     #[test]
@@ -3924,7 +4006,7 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"NEWER CONTENT");
         // ...and the file it replaced is gone, not left behind with
         // nothing pointing at it.
-        assert!(!dir.path().join("An Author/A Title/A Title.pdf").exists(), "the replaced file was orphaned on disk");
+        assert!(!dir.path().join("A Title.pdf").exists(), "the replaced file was orphaned on disk");
     }
 
     /// Re-adding a format under the *same* name overwrites in place, and
@@ -3958,7 +4040,7 @@ mod tests {
         assert!(cache.add_format(id, &again, "pdf", true).unwrap());
 
         assert_eq!(cache.format_file_stem(id).unwrap().as_deref(), Some("book"));
-        assert!(!dir.path().join("An Author/A Title/book (1).pdf").exists());
+        assert!(!dir.path().join("book (1).pdf").exists());
         let path = cache.get_data_as_dict(None, false, None, false).unwrap()[0]["fmt_pdf"].as_str().unwrap().to_string();
         assert_eq!(fs::read(&path).unwrap(), b"SECOND VERSION");
     }
@@ -3987,14 +4069,14 @@ mod tests {
 
         assert!(Path::new(&second_path).exists(), "removing one book's format deleted the other book's file");
         assert_eq!(fs::read(&second_path).unwrap(), b"BOOK TWO");
-        assert!(!dir.path().join("Same Author/Same Title/Same Title.pdf").exists(), "the format that was asked for is still there");
+        assert!(!dir.path().join("Same Title.pdf").exists(), "the format that was asked for is still there");
     }
 
     #[test]
     fn an_available_stem_steps_around_a_name_that_is_taken() {
         let (dir, cache) = open_test_cache();
         let id = add_pdf(dir.path(), &cache, "A Title", "An Author", "A Title");
-        let book_dir = dir.path().join("An Author/A Title");
+        let book_dir = dir.path().to_path_buf();
         fs::write(book_dir.join("Taken.pdf"), b"someone else's").unwrap();
 
         assert_eq!(cache.available_format_stem(id, "Free").unwrap(), "Free");
@@ -4014,7 +4096,7 @@ mod tests {
 
         // Only the EPUB name is taken, but a rename moves both files,
         // so the stem is unusable for the book as a whole.
-        let book_dir = dir.path().join("An Author/A Title");
+        let book_dir = dir.path().to_path_buf();
         fs::write(book_dir.join("Wanted.epub"), b"someone else's").unwrap();
         assert_eq!(cache.available_format_stem(id, "Wanted").unwrap(), "Wanted (1)");
     }
@@ -4027,7 +4109,7 @@ mod tests {
         // Something else already occupies the name being asked for.
         // Two books with the same author and title really do share a
         // folder, so this is a reachable state, not a contrived one.
-        let book_dir = dir.path().join("An Author/A Title");
+        let book_dir = dir.path().to_path_buf();
         fs::write(book_dir.join("Taken.pdf"), b"someone else's book").unwrap();
 
         let err = cache.rename_format_files(id, "Taken").unwrap_err().to_string();
@@ -4079,7 +4161,7 @@ mod tests {
     #[test]
     fn moving_a_books_folder_keeps_the_recorded_name_in_step() {
         let (dir, cache) = open_test_cache();
-        let id = add_pdf(dir.path(), &cache, "Old Title", "Old Author", "Old Title");
+        let id = add_pdf_in_its_own_folder(dir.path(), &cache, "Old Title", "Old Author", "Old Title");
 
         cache.rename_book_files(id, "New Title", "New Author").unwrap();
 
