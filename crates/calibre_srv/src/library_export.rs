@@ -56,17 +56,31 @@ fn build_library_zip(library_path: &Path) -> anyhow::Result<Vec<u8>> {
             if rel.as_os_str().is_empty() {
                 continue;
             }
-            // Skip the runtime state directory. It holds the writer
-            // lock and the write-ahead journal -- per-process state
-            // that would be actively wrong to restore from a backup,
-            // and on Windows actively unreadable: `try_lock` there is
-            // `LockFileEx`, a byte-range lock that blocks reads of the
-            // locked region, so copying `writer.lock` fails outright
-            // and took the whole export down with it. (On Linux
-            // `flock` is advisory and reads sail through, which is why
-            // this only ever showed up on Windows.)
-            if rel.starts_with(calibre_db::constants::LIBRARY_HANDLE_DIR_NAME) {
-                continue;
+            // The runtime state directory is *partly* excluded, and the
+            // distinction matters a great deal.
+            //
+            // Excluded: the writer lock and the write-ahead journal.
+            // Both are per-process state that would be actively wrong
+            // to restore from a backup, and on Windows `writer.lock` is
+            // actively unreadable -- `try_lock` there is `LockFileEx`, a
+            // byte-range lock that blocks reads of the locked region, so
+            // copying it fails outright and took the whole export down
+            // with it. (On Linux `flock` is advisory and reads sail
+            // through, which is why that only ever showed up on
+            // Windows.)
+            //
+            // Included: everything durable. This used to skip the whole
+            // directory, which was correct only while nothing durable
+            // lived in it. It now holds the **change log** -- the
+            // library's authority, from which `metadata.db` is rebuilt
+            // (#899) -- along with covers (#893) and content checksums.
+            // Excluding those would make an export a library that
+            // cannot be rebuilt and has no cover images: a backup that
+            // looks complete and is not.
+            if let Ok(inside) = rel.strip_prefix(calibre_db::constants::LIBRARY_HANDLE_DIR_NAME) {
+                if is_per_process_state(inside) {
+                    continue;
+                }
             }
             // Zip entry names use forward slashes on every platform,
             // matching the real zip spec (not the host OS separator).
@@ -84,6 +98,19 @@ fn build_library_zip(library_path: &Path) -> anyhow::Result<Vec<u8>> {
         zip.finish()?;
     }
     Ok(buf)
+}
+
+/// Whether a path inside the state directory is per-process rather than
+/// part of the library.
+///
+/// An allowlist would be the safer shape in general, but here a
+/// *denylist* is right: a new durable file added to the state directory
+/// should be exported by default. Getting that backwards is how the
+/// change log came to be silently excluded from backups in the first
+/// place.
+fn is_per_process_state(inside_state_dir: &std::path::Path) -> bool {
+    let first = inside_state_dir.components().next().map(|c| c.as_os_str().to_string_lossy().to_ascii_lowercase());
+    matches!(first.as_deref(), Some("writer.lock") | Some("journal"))
 }
 
 /// `GET /library/export/{library_id}`.
@@ -104,24 +131,17 @@ pub async fn export(State(state): State<AppState>, AxumPath(library_id): AxumPat
 
 #[cfg(test)]
 mod tests {
+    use super::is_per_process_state;
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
     use calibre_db::cache::Cache;
 
-    fn test_app() -> (tempfile::TempDir, axum::Router, i32) {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = Cache::new(dir.path()).unwrap();
-        let source = dir.path().join("Book.txt");
-        std::fs::write(&source, b"hello export test").unwrap();
-        let mut meta = calibre_ebooks::metadata::MetaInformation::default();
-        meta.title = "Export Test Book".to_string();
-        meta.authors = vec!["Jane Doe".to_string()];
-        let book_id = cache.add_book(&source, &meta).unwrap();
-        let state = crate::AppState {
+    fn state_for(cache: std::sync::Arc<Cache>) -> crate::AppState {
+        crate::AppState {
             libraries: None,
-            cache: std::sync::Arc::new(cache),
+            cache,
             opts: std::sync::Arc::new(crate::opts::ServerOptions::default()),
             auth: None,
             changes: crate::web_socket::new_change_broadcaster(),
@@ -134,7 +154,36 @@ mod tests {
             tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()),
             news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()),
             tts_voice: None, plugin_store: None, plugin_registry: std::sync::Arc::new(std::sync::Mutex::new(calibre_customize::registry::PluginRegistry::new())),
-        };
+        }
+    }
+
+    /// Like [`test_app`], but hands back the very `Cache` the router
+    /// uses. A test that opened a second one over the same library would
+    /// fail on the writer lock -- correctly, since that lock exists to
+    /// stop two writers.
+    fn test_app_with_cache() -> (tempfile::TempDir, axum::Router, std::sync::Arc<Cache>, i32) {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = std::sync::Arc::new(Cache::new(dir.path()).unwrap());
+        let source = dir.path().join("Book.txt");
+        std::fs::write(&source, b"hello export test").unwrap();
+        let mut meta = calibre_ebooks::metadata::MetaInformation::default();
+        meta.title = "Export Test Book".to_string();
+        meta.authors = vec!["Jane Doe".to_string()];
+        let book_id = cache.add_book(&source, &meta).unwrap();
+        let router = crate::test_router(state_for(cache.clone()));
+        (dir, router, cache, book_id)
+    }
+
+    fn test_app() -> (tempfile::TempDir, axum::Router, i32) {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        let source = dir.path().join("Book.txt");
+        std::fs::write(&source, b"hello export test").unwrap();
+        let mut meta = calibre_ebooks::metadata::MetaInformation::default();
+        meta.title = "Export Test Book".to_string();
+        meta.authors = vec!["Jane Doe".to_string()];
+        let book_id = cache.add_book(&source, &meta).unwrap();
+        let state = state_for(std::sync::Arc::new(cache));
         let router = crate::test_router(state);
         (dir, router, book_id)
     }
@@ -204,5 +253,67 @@ mod tests {
         let req = Request::builder().uri("/library/export/no-such-library").body(Body::empty()).unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The state directory holds the **change log** -- the library's
+    /// authority, from which `metadata.db` is rebuilt -- plus covers and
+    /// checksums. An export that skipped it would be a library that
+    /// cannot be rebuilt and has no cover images: a backup that looks
+    /// complete and is not.
+    #[tokio::test]
+    async fn the_export_carries_the_change_log_and_covers() {
+        let (_dir, router, cache, book_id) = test_app_with_cache();
+        calibre_db::covers::set_cover(&cache, book_id, b"cover bytes").unwrap();
+        cache.set_field(book_id, "rating", "8").unwrap();
+
+        let req = Request::builder().uri("/library/export/default").body(Body::empty()).unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+        let names = zip_entry_names(&bytes);
+        let state = calibre_db::constants::LIBRARY_HANDLE_DIR_NAME;
+        assert!(names.iter().any(|n| n.starts_with(&format!("{state}/changes/"))), "the change log is missing from the export: {names:?}");
+        assert!(names.iter().any(|n| n.starts_with(&format!("{state}/covers/"))), "covers are missing from the export: {names:?}");
+    }
+
+    /// Per-process state stays out. `writer.lock` additionally cannot be
+    /// read on Windows while held, which took the whole export down
+    /// before it was excluded.
+    #[tokio::test]
+    async fn the_export_leaves_out_the_lock_and_the_journal() {
+        let (_dir, router, cache, book_id) = test_app_with_cache();
+        // Force the writer lock and journal into existence.
+        cache.set_field(book_id, "title", "Touched").unwrap();
+        calibre_db::covers::set_cover(&cache, book_id, b"cover").unwrap();
+
+        let req = Request::builder().uri("/library/export/default").body(Body::empty()).unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+        let names = zip_entry_names(&bytes);
+        let state = calibre_db::constants::LIBRARY_HANDLE_DIR_NAME;
+        assert!(!names.iter().any(|n| n.contains("writer.lock")), "{names:?}");
+        assert!(!names.iter().any(|n| n.starts_with(&format!("{state}/journal"))), "{names:?}");
+    }
+
+    fn zip_entry_names(bytes: &[u8]) -> Vec<String> {
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).expect("a real zip");
+        (0..archive.len()).map(|i| archive.by_index(i).unwrap().name().to_string()).collect()
+    }
+
+    #[test]
+    fn only_the_lock_and_journal_count_as_per_process_state() {
+        use std::path::Path;
+        assert!(is_per_process_state(Path::new("writer.lock")));
+        assert!(is_per_process_state(Path::new("journal")));
+        assert!(is_per_process_state(Path::new("journal/abc.op")));
+        // Everything durable is exported -- a denylist, so a newly added
+        // durable file is included by default rather than silently lost.
+        assert!(!is_per_process_state(Path::new("changes/0001.json")));
+        assert!(!is_per_process_state(Path::new("covers/uuid.jpg")));
+        assert!(!is_per_process_state(Path::new("checksums.db")));
+        assert!(!is_per_process_state(Path::new("snapshots/x.jsonl")));
+        assert!(!is_per_process_state(Path::new("install-id")));
     }
 }

@@ -24,7 +24,7 @@ lives in a `.calibre-oxide/` subdirectory alongside the index.
 └── .calibre-oxide/
     ├── changes/                  the authoritative append-only change log
     ├── snapshots/                periodic compaction of the log
-    ├── covers/                   content-addressed cover blobs
+    ├── covers/<uuid>.jpg         covers, keyed by book uuid
     ├── checksums.db              content hashes and file identity
     └── journal/                  the existing file-operation write-ahead journal
 ```
@@ -301,9 +301,17 @@ writing to files on read-only volumes and to cloud placeholders.
 - **Compaction must not outrun sync.** Deleting change files a peer has not
   merged yet loses their edits, so compaction needs a retention horizon rather
   than deleting everything a snapshot covers.
-- **Cover blobs do not go in the log.** They live content-addressed under
-  `covers/`, with the log recording only the reference — the same blob/tree
-  split git uses.
+- **Cover blobs do not go in the log.** They live under `covers/`, with the
+  log recording only the reference — the same blob/tree split git uses.
+  Currently keyed by book uuid rather than content hash; content-addressing
+  is a later refinement, and the uuid is already stable across machines.
+- **Anything durable in the state directory must be exported.** The library
+  export skipped `.calibre-oxide/` wholesale, which was correct only while
+  nothing durable lived there. It now holds the change log, so a blanket skip
+  produced a backup that could not be rebuilt. The rule is a *denylist* —
+  `writer.lock` and `journal/` are excluded, everything else is included —
+  so a newly added durable file is exported by default rather than silently
+  lost.
 
 ## Open
 
@@ -316,7 +324,7 @@ writing to files on read-only volumes and to cloud placeholders.
 | `Cache::add_format` | stop naming files after the title; take the name from the source |
 | `Cache::add_book` | record in place; copy in only from outside the library |
 | `Cache::rename_book_files` | no longer runs on a title change |
-| `covers::cover_path` | `.calibre-oxide/covers/<id>.jpg` |
+| `covers::cover_path` | **done:** `.calibre-oxide/covers/<uuid>.jpg`, keyed by uuid rather than the local autoincrement `id` so two machines cannot mint the same cover filename. Reads fall back to a legacy `<book dir>/cover.jpg` until the next write, which retires it. |
 | `check_library` | drop the `Title (id)` folder regex, which this project never produced; make the content-mismatch check an *edit*, not corruption (E14) |
 | `checksums.rs` | add a content → book lookup |
 | every `Cache` write method | append to the change log before applying SQL — the same crate-wide retrofit shape as #93's "every durable write goes through `LibraryHandle`" |
