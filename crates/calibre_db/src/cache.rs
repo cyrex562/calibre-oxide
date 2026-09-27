@@ -536,7 +536,20 @@ impl Cache {
         let bytes = fs::read(&absolute)?;
         let size = bytes.len() as i64;
         let hash = blake3::hash(&bytes).to_hex().to_string();
-        self.record_format_row(book_id, &ext, &stem, size, Some(&hash))?;
+        {
+            let conn = self.backend.conn.lock().unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO data (book, format, uncompressed_size, name) VALUES (?1, ?2, ?3, ?4)",
+                (book_id, ext.to_uppercase(), size, &stem),
+            )?;
+        }
+        // The identity as well as the hash: a file that stays put is
+        // exactly the file whose rename we will later want to detect
+        // from one `stat` rather than by reading it again.
+        self.checksums().record_hash_with_identity(book_id, "format", &ext.to_uppercase(), &hash, size, calibre_utils::filenames::identity(&absolute))?;
+
+        let (format_name, stem_name) = (ext.to_uppercase(), stem.clone());
+        self.record_for_book(book_id, |book| crate::change_log::ChangeOp::FormatSet { book, format: format_name, name: stem_name, size, hash: Some(hash) });
 
         let (_, cover) = &metadata.cover_data;
         if !cover.is_empty() {

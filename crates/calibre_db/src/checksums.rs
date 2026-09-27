@@ -200,6 +200,28 @@ impl ChecksumStore {
                     ON file_checksums (blake3_hex);",
             )?;
         }
+
+        // `(volume, file_index)` -- the filesystem's own identity for the
+        // file, from `calibre_utils::filenames::identity`. Added after
+        // the table existed, so an existing sidecar needs the columns
+        // bolted on rather than recreated: dropping and rebuilding would
+        // throw away every recorded hash.
+        //
+        // Nullable because a row written before this, or on a platform
+        // that cannot report an identity, simply has none -- and the
+        // drift pass falls back to matching on content.
+        for column in ["volume", "file_index"] {
+            let exists: bool = conn
+                .prepare("SELECT 1 FROM pragma_table_info('file_checksums') WHERE name = ?1")
+                .and_then(|mut stmt| stmt.exists([column]))
+                .unwrap_or(false);
+            if !exists {
+                // A failure here is not fatal: without the column,
+                // identity matching is unavailable and content matching
+                // still works.
+                let _ = conn.execute(&format!("ALTER TABLE checksums_db.file_checksums ADD COLUMN {column} INTEGER"), ());
+            }
+        }
         Ok(())
     }
 
@@ -228,19 +250,93 @@ impl ChecksumStore {
         hash: &str,
         size: i64,
     ) -> Result<(), ChecksumError> {
+        self.record_hash_with_identity(book_id, kind, key, hash, size, None)
+    }
+
+    /// As [`ChecksumStore::record_hash`], also recording the
+    /// filesystem's own identity for the file.
+    ///
+    /// The identity is what makes a rename detectable without reading
+    /// anything: it survives a move within a volume, so a file found at
+    /// an unexpected path can be recognised from one `stat` instead of a
+    /// full hash. It also catches the case content matching cannot --
+    /// a file that was both edited *and* moved.
+    pub fn record_hash_with_identity(
+        &self,
+        book_id: i32,
+        kind: &str,
+        key: &str,
+        hash: &str,
+        size: i64,
+        identity: Option<calibre_utils::filenames::FileIdentity>,
+    ) -> Result<(), ChecksumError> {
         self.initialize()?;
         let conn = self.conn.lock().unwrap();
+        let (volume, index) = match identity {
+            Some(id) => (Some(id.volume as i64), Some(id.index as i64)),
+            None => (None, None),
+        };
         conn.execute(
             "INSERT INTO checksums_db.file_checksums
-                (book_id, kind, key, blake3_hex, size, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))
+                (book_id, kind, key, blake3_hex, size, updated_at, volume, file_index)
+             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'), ?6, ?7)
              ON CONFLICT(book_id, kind, key) DO UPDATE SET
                 blake3_hex = excluded.blake3_hex,
                 size = excluded.size,
-                updated_at = excluded.updated_at",
-            (book_id, kind, key, hash, size),
+                updated_at = excluded.updated_at,
+                -- Keep the old identity when the caller has none, rather
+                -- than erasing a usable one with a NULL.
+                volume = COALESCE(excluded.volume, volume),
+                file_index = COALESCE(excluded.file_index, file_index)",
+            (book_id, kind, key, hash, size, volume, index),
         )?;
         Ok(())
+    }
+
+    /// What was recorded for one file: its hash, and its filesystem
+    /// identity if one was captured.
+    ///
+    /// Both optional and independently so -- a row written before
+    /// identities were stored has a hash and no identity, and a
+    /// platform that cannot report one leaves it null for ever.
+    #[allow(clippy::type_complexity)]
+    pub fn recorded_identity(&self, book_id: i32, kind: &str, key: &str) -> Result<(Option<String>, Option<calibre_utils::filenames::FileIdentity>), ChecksumError> {
+        self.initialize()?;
+        let conn = self.conn.lock().unwrap();
+        let row: Option<(String, Option<i64>, Option<i64>)> = conn
+            .query_row(
+                "SELECT blake3_hex, volume, file_index FROM checksums_db.file_checksums
+                 WHERE book_id = ?1 AND kind = ?2 AND key = ?3",
+                (book_id, kind, key),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+
+        Ok(match row {
+            Some((hash, Some(volume), Some(index))) => (Some(hash), Some(calibre_utils::filenames::FileIdentity { volume: volume as u64, index: index as u64 })),
+            Some((hash, _, _)) => (Some(hash), None),
+            None => (None, None),
+        })
+    }
+
+    /// Which book owns the file with this filesystem identity.
+    ///
+    /// The cheap half of rename recovery: one `stat` on a file found at
+    /// an unexpected path answers "whose is this?" without reading a
+    /// byte of it.
+    pub fn find_by_identity(&self, identity: calibre_utils::filenames::FileIdentity) -> Result<Vec<(i32, String, String)>, ChecksumError> {
+        self.initialize()?;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT book_id, kind, key FROM checksums_db.file_checksums
+             WHERE volume = ?1 AND file_index = ?2 ORDER BY book_id, kind, key",
+        )?;
+        let rows = stmt.query_map((identity.volume as i64, identity.index as i64), |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     /// Reads `path` and records its BLAKE3 -- the "at add time" half
