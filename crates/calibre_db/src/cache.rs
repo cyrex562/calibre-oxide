@@ -499,6 +499,77 @@ impl Cache {
         Ok(book_id)
     }
 
+    /// Indexes a file that is **already inside the library**, without
+    /// copying or moving it.
+    ///
+    /// The scanner's entry point (#891): a folder the user filled is
+    /// full of books that are already where they belong, and importing
+    /// them would mean copying every file next to itself.
+    ///
+    /// Deliberately a separate method rather than teaching
+    /// [`Cache::add_book`] to notice that its source happens to sit
+    /// under the library root. Behaviour that changes based on an
+    /// implicit path relationship is the kind that surprises somebody
+    /// much later, and it would have silently reinterpreted every test
+    /// fixture that writes its source file into the library directory
+    /// for convenience.
+    ///
+    /// `relative_path` is `/`-separated and relative to the library
+    /// root, exactly as [`crate::scan::DiscoveredFile`] reports it.
+    pub fn register_book_in_place(&self, relative_path: &str, metadata: &MetaInformation) -> anyhow::Result<i32> {
+        let relative = relative_path.trim_start_matches(['/', '\\']);
+        let path = Path::new(relative);
+        let stem = path.file_stem().and_then(|s| s.to_str()).ok_or_else(|| anyhow::anyhow!("a book file needs a name"))?.to_string();
+        let ext = path.extension().and_then(|e| e.to_str()).ok_or_else(|| anyhow::anyhow!("a book file needs an extension"))?.to_ascii_lowercase();
+        let folder = path.parent().map(|p| p.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+
+        let absolute = self.backend.library_path.join(relative);
+        if !absolute.is_file() {
+            anyhow::bail!("{} is not a file in this library", absolute.display());
+        }
+
+        let book_id = self.add_book_db_entry(metadata, &folder)?;
+
+        // Hash and size come from the file where it lies. No
+        // `copy_atomic`, so nothing is written to the library at all --
+        // indexing a folder must not rewrite it.
+        let bytes = fs::read(&absolute)?;
+        let size = bytes.len() as i64;
+        let hash = blake3::hash(&bytes).to_hex().to_string();
+        self.record_format_row(book_id, &ext, &stem, size, Some(&hash))?;
+
+        let (_, cover) = &metadata.cover_data;
+        if !cover.is_empty() {
+            if let Err(e) = crate::covers::set_cover(self, book_id, cover) {
+                log::warn!("indexed {relative} but its cover could not be stored: {e}");
+            }
+        }
+        Ok(book_id)
+    }
+
+    /// Whether some book already claims this file.
+    ///
+    /// Compared on `(books.path, data.name, format)`, which is exactly
+    /// what locates a file on disk -- so a second scan of the same
+    /// folder recognises what it indexed the first time instead of
+    /// adding every book again.
+    pub fn book_for_file(&self, relative_path: &str) -> anyhow::Result<Option<i32>> {
+        let path = Path::new(relative_path.trim_start_matches(['/', '\\']));
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { return Ok(None) };
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else { return Ok(None) };
+        let folder = path.parent().map(|p| p.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+
+        let conn = self.backend.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT b.id FROM books b JOIN data d ON d.book = b.id
+                 WHERE b.path = ?1 AND d.name = ?2 AND d.format = ?3",
+                (&folder, stem, ext.to_uppercase()),
+                |row| row.get::<_, i32>(0),
+            )
+            .ok())
+    }
+
     /// Adds a book entry to the database without copying files (used
     /// by `restore.rs`'s OPF-driven restore). See this section's docs
     /// for the `uuid`-preservation fix.
