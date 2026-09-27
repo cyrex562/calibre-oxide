@@ -134,6 +134,68 @@ pub fn scan_library_for_duplicates(cache: &Cache) -> Result<Vec<Vec<i32>>> {
     Ok(groups)
 }
 
+/// Why two books were reported as duplicates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DuplicateKind {
+    /// Their titles and authors match. What upstream's Find Duplicates
+    /// compares, and what this crate compared exclusively until #892.
+    Metadata,
+    /// They hold a byte-identical file. Strictly stronger evidence, and
+    /// it needs no metadata to have been filled in at all.
+    Content,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuplicateGroup {
+    pub book_ids: Vec<i32>,
+    pub kind: DuplicateKind,
+}
+
+/// Books holding byte-identical files (#892).
+///
+/// Complements [`scan_library_for_duplicates`], which compares titles
+/// and authors, and fixes both of that approach's blind spots: it misses
+/// identical files whose metadata was filled in differently, and it
+/// pairs genuinely different books that happen to share a title.
+///
+/// Only sees books whose formats have a recorded hash. One added before
+/// checksums existed, or by real calibre (which never writes this
+/// sidecar), is invisible here rather than reported as unique --
+/// the same limitation `check_library`'s corruption check has.
+pub fn scan_library_for_content_duplicates(cache: &Cache) -> Result<Vec<Vec<i32>>> {
+    let mut groups: Vec<Vec<i32>> = cache.checksums().books_sharing_content("format")?.into_iter().map(|(_, ids)| ids).collect();
+    groups.sort_by_key(|g| g[0]);
+    groups.dedup();
+    Ok(groups)
+}
+
+/// Both kinds of duplicate in one pass, content first.
+///
+/// Content is reported ahead of metadata, and a pair found by content is
+/// not reported again by metadata: byte-identical is the stronger claim,
+/// and telling somebody the same two books are duplicates twice for two
+/// reasons is noise rather than information.
+pub fn scan_library_for_all_duplicates(cache: &Cache) -> Result<Vec<DuplicateGroup>> {
+    let content = scan_library_for_content_duplicates(cache)?;
+    let mut reported: HashSet<i32> = HashSet::new();
+    let mut groups: Vec<DuplicateGroup> = Vec::new();
+
+    for ids in content {
+        reported.extend(ids.iter().copied());
+        groups.push(DuplicateGroup { book_ids: ids, kind: DuplicateKind::Content });
+    }
+
+    for ids in scan_library_for_duplicates(cache)? {
+        // Skip a metadata group whose books are already accounted for by
+        // content; keep one that brings in a book content did not.
+        if ids.iter().all(|id| reported.contains(id)) {
+            continue;
+        }
+        groups.push(DuplicateGroup { book_ids: ids, kind: DuplicateKind::Metadata });
+    }
+    Ok(groups)
+}
+
 /// `(title, authors)` for one book id -- port of upstream's
 /// `{'title': m.title, 'authors': m.authors}` per-duplicate report
 /// shape.
@@ -275,5 +337,111 @@ mod tests {
         let mut expected = vec![a, b, c];
         expected.sort_unstable();
         assert_eq!(group, expected);
+    }
+}
+
+#[cfg(test)]
+mod content_duplicate_tests {
+    use super::*;
+    use calibre_ebooks::metadata::MetaInformation;
+
+    fn add(dir: &std::path::Path, cache: &Cache, title: &str, author: &str, file: &str, bytes: &[u8]) -> i32 {
+        let source = dir.join(file);
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, bytes).unwrap();
+        let mut meta = MetaInformation::default();
+        meta.title = title.to_string();
+        meta.authors = vec![author.to_string()];
+        cache.add_book(&source, &meta).unwrap()
+    }
+
+    fn library() -> (tempfile::TempDir, Cache) {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        (dir, cache)
+    }
+
+    /// The blind spot the metadata-only comparison has: the same file
+    /// added twice under different titles is invisible to it.
+    #[test]
+    fn identical_files_with_different_metadata_are_found() {
+        let (dir, cache) = library();
+        let a = add(dir.path(), &cache, "Boiler Manual", "Acme", "src/one.pdf", b"IDENTICAL BYTES");
+        let b = add(dir.path(), &cache, "Untitled Scan 42", "Unknown", "src/two.pdf", b"IDENTICAL BYTES");
+
+        // Metadata alone sees nothing here.
+        assert!(scan_library_for_duplicates(&cache).unwrap().is_empty());
+
+        let groups = scan_library_for_content_duplicates(&cache).unwrap();
+        assert_eq!(groups, vec![vec![a.min(b), a.max(b)]]);
+    }
+
+    #[test]
+    fn different_files_are_not_content_duplicates() {
+        let (dir, cache) = library();
+        add(dir.path(), &cache, "One", "A", "src/one.pdf", b"FIRST");
+        add(dir.path(), &cache, "Two", "B", "src/two.pdf", b"SECOND");
+        assert!(scan_library_for_content_duplicates(&cache).unwrap().is_empty());
+    }
+
+    /// A book whose own two formats happen to hold identical bytes is
+    /// one book, not a duplicate of itself.
+    #[test]
+    fn a_books_own_identical_formats_are_not_a_duplicate() {
+        let (dir, cache) = library();
+        let id = add(dir.path(), &cache, "One Book", "A", "src/book.pdf", b"SAME BYTES");
+        let epub = dir.path().join("src/book.epub");
+        std::fs::write(&epub, b"SAME BYTES").unwrap();
+        cache.add_format(id, &epub, "epub", true).unwrap();
+
+        assert!(scan_library_for_content_duplicates(&cache).unwrap().is_empty());
+    }
+
+    /// Content is the stronger claim, so a pair found both ways is
+    /// reported once, as content.
+    #[test]
+    fn a_pair_found_both_ways_is_reported_once() {
+        let (dir, cache) = library();
+        add(dir.path(), &cache, "Same Title", "Same Author", "src/one.pdf", b"IDENTICAL");
+        add(dir.path(), &cache, "Same Title", "Same Author", "src/two.pdf", b"IDENTICAL");
+
+        let groups = scan_library_for_all_duplicates(&cache).unwrap();
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        assert_eq!(groups[0].kind, DuplicateKind::Content);
+    }
+
+    /// A metadata group that brings in a book content did not see is
+    /// still worth reporting.
+    #[test]
+    fn a_metadata_only_group_is_still_reported() {
+        let (dir, cache) = library();
+        add(dir.path(), &cache, "Shared Title", "An Author", "src/one.pdf", b"DIFFERENT ONE");
+        add(dir.path(), &cache, "Shared Title", "An Author", "src/two.pdf", b"DIFFERENT TWO");
+
+        let groups = scan_library_for_all_duplicates(&cache).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].kind, DuplicateKind::Metadata);
+    }
+
+    #[test]
+    fn a_library_with_no_duplicates_reports_none() {
+        let (dir, cache) = library();
+        add(dir.path(), &cache, "One", "A", "src/one.pdf", b"FIRST");
+        assert!(scan_library_for_all_duplicates(&cache).unwrap().is_empty());
+    }
+
+    /// Covers are not compared against format files: two books whose
+    /// covers match say nothing about their contents.
+    #[test]
+    fn covers_are_not_compared_with_format_files() {
+        let (dir, cache) = library();
+        let a = add(dir.path(), &cache, "One", "A", "src/one.pdf", b"SHARED BYTES");
+        let b = add(dir.path(), &cache, "Two", "B", "src/two.pdf", b"OTHER");
+        // Give the second book a cover whose bytes match the first
+        // book's *format* file.
+        crate::covers::set_cover(&cache, b, b"SHARED BYTES").unwrap();
+
+        assert!(scan_library_for_content_duplicates(&cache).unwrap().is_empty(), "a cover matched a format file");
+        let _ = a;
     }
 }
