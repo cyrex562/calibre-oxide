@@ -20,11 +20,19 @@ lives in a `.calibre-oxide/` subdirectory alongside the index.
 ├── scan0042.pdf                  the title can be anything; the file keeps its name
 ├── Receipts/
 │   └── 2019 invoice.pdf          books.path = "Receipts"
+├── metadata.db                   a DERIVED query cache -- disposable, see below
 └── .calibre-oxide/
-    ├── metadata.db               the index
-    ├── covers/17.jpg             covers live here, not beside the file
-    └── checksums.db              content hashes and file identity
+    ├── changes/                  the authoritative append-only change log
+    ├── snapshots/                periodic compaction of the log
+    ├── covers/                   content-addressed cover blobs
+    ├── checksums.db              content hashes and file identity
+    └── journal/                  the existing file-operation write-ahead journal
 ```
+
+`metadata.db` stays at the library root, where it already is and where calibre
+expects it. That placement is deliberate now rather than incidental: a hidden
+dotfolder is exactly what a zip tool skips and a drag-select misses, so the file
+a user would recognise as important sits where they will see and copy it.
 
 ### Why this is not less portable
 
@@ -204,13 +212,88 @@ hides someone's books.
 | E22 | Deleting an orphan's entry | offer to keep the metadata as a sidecar OPF first. Hand-entered metadata is the expensive part, not the file |
 | E23 | The folder is left empty | ask once: keep the index for a folder to be refilled, or remove it. Never delete a database without asking |
 
+## Durability: the change log is authoritative
+
+Decided 2026-09-27. The question was per-file `metadata.opf` sidecars versus a
+git-like structure; they turn out to defend against disjoint failures, and only
+one of those failures is likely.
+
+| Failure | Per-file OPF | Change log |
+| --- | --- | --- |
+| `metadata.db` corrupted by a crash | rebuild, lossy | rebuild, exact |
+| **Corrupted by two machines syncing the folder** | rebuild, lossy | does not corrupt |
+| The index directory is deleted | survives | gone |
+| One file copied out to a USB stick | metadata travels | left behind |
+| Undo a bulk edit | no | nearly free |
+| Two app instances writing | no help | safe by construction |
+
+**`.calibre-oxide/changes/` is the authority; `metadata.db` is a derived query
+cache.** Delete the database and it rebuilds exactly from a snapshot plus the
+log tail. Corruption stops being data loss and becomes an inconvenience.
+
+Three reasons this beats sidecars:
+
+1. **Cloud sync is the failure that will actually happen.** The library is the
+   user's own folder, so it ends up in OneDrive or Dropbox. SQLite written from
+   two machines through a file-sync service corrupts — no locking, no
+   coordination, two versions of one binary file. A log of one-file-per-change
+   merges under naive sync; a database file does not.
+2. **The pattern is already in the tree.** `.calibre-oxide/journal/` is an
+   append-only, BLAKE3-chained, one-file-per-entry log with sequence numbers,
+   commit markers, recovery on open, and a broken chain reported as hard
+   corruption. Extending that shape one layer up is consistent, and the hard
+   parts (fsync ordering, chain verification, recovery) are solved.
+3. **Two sources of truth is a bug generator.** A live-mirrored OPF beside every
+   file means the database says one thing and the sidecar another, with nothing
+   declaring a winner — the same shape as the three `data.name`-versus-disk bugs
+   fixed in #885.
+
+### Where the git analogy breaks
+
+Git's answer to "what if `.git` is deleted" is *you keep your files and lose
+history*, and that is acceptable there because **the files are the valuable
+thing**. Here it is inverted: a book can be re-downloaded, but 500 hand-entered
+ratings cannot be re-typed. So the expensive thing must not live only in a
+hidden directory. Two mitigations, neither of which is per-file sidecars:
+
+- `metadata.db` stays **visible** at the library root (above).
+- A single compacted `snapshots/` file gives "rebuild from something
+  inspectable" at one file rather than thousands.
+
+OPF sidecars survive as a deliberate **export** action, for when a file really
+does leave the library — the case they are genuinely good at.
+
+### Considered and rejected: metadata inside the files
+
+Writing XMP into the PDF itself needs no extra files and travels perfectly, and
+`metadata/xmp.rs` exists. It is fatal for a non-obvious reason: it changes the
+file's content hash on every metadata edit, so every rating change would look
+like an external modification to the drift detection above — and it means
+writing to files on read-only volumes and to cloud placeholders.
+
+### Design content this implies
+
+- **Two logs, deliberately separate.** The existing `journal/` guards *physical
+  file writes* for crash atomicity and is consumed and cleaned during recovery.
+  `changes/` is *durable metadata history* and is never discarded except by
+  compaction. Merging them would give one of them the wrong lifetime.
+- **Change filenames must not collide across machines.** The file-op journal's
+  monotonic sequence number is fine for one writer and wrong for two syncing
+  peers, which would both mint the same number. Names need a per-install id and
+  a uuid as well.
+- **Ordering needs a hybrid logical clock**, not wall time. Otherwise a machine
+  with a fast clock always wins every conflict.
+- **Conflicts resolve per field, last writer wins by HLC.** Union-merging
+  set-valued fields like tags looks clever and surprises anyone who removed one.
+- **Compaction must not outrun sync.** Deleting change files a peer has not
+  merged yet loses their edits, so compaction needs a retention horizon rather
+  than deleting everything a snapshot covers.
+- **Cover blobs do not go in the log.** They live content-addressed under
+  `covers/`, with the log recording only the reference — the same blob/tree
+  split git uses.
+
 ## Open
 
-- **Rebuildability.** If `.calibre-oxide/` is lost, so is everything. Writing
-  `<name>.opf` beside each file on every metadata edit would make the folder
-  genuinely self-describing and `restore.rs` genuinely useful — at the cost of
-  doubling the file count in a folder whose cleanliness is the point. Not
-  decided.
 - **Watcher.** Deferred, above. `notify` is not currently a dependency.
 
 ## What this changes in existing code
@@ -223,6 +306,7 @@ hides someone's books.
 | `covers::cover_path` | `.calibre-oxide/covers/<id>.jpg` |
 | `check_library` | drop the `Title (id)` folder regex, which this project never produced; make the content-mismatch check an *edit*, not corruption (E14) |
 | `checksums.rs` | add a content → book lookup |
+| every `Cache` write method | append to the change log before applying SQL — the same crate-wide retrofit shape as #93's "every durable write goes through `LibraryHandle`" |
 | `filenames::file_identity` | make public |
 | `adding.rs` | `find_books_in_directory`'s stem grouping is no longer the grouping rule |
 | auto-add watcher | currently deletes the source after import; in this model a watched folder inside the library is just a scan |
