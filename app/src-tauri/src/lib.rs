@@ -302,15 +302,19 @@ async fn add_files_via_server(port: u16, files: &[std::path::PathBuf]) -> AddFol
     let mut result = AddFolderResult::default();
     for path in files {
         let filename = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-        let bytes = match std::fs::read(path) {
-            Ok(b) => b,
+        // Streamed rather than read whole (#883). A dropped batch of
+        // scanned PDFs used to cost roughly their combined size in
+        // memory, on this side *and* the server's, before a byte moved.
+        let file = match tokio::fs::File::open(path).await {
+            Ok(file) => file,
             Err(e) => {
                 result.errors.push(format!("{filename}: {e}"));
                 continue;
             }
         };
+        let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
         let url = format!("http://127.0.0.1:{port}/cdb/add-book/{}/n/{}/-", simple_job_id(), urlencoding::encode(&filename));
-        match client.post(&url).body(bytes).send().await {
+        match client.post(&url).body(body).send().await {
             Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
                 Ok(body) if body.get("book_id").is_some() => result.added += 1,
                 Ok(_) => result.duplicates.push(filename),

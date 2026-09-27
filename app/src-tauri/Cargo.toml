@@ -31,7 +31,15 @@ tauri-plugin-dialog = "2.7.3"
 tauri-plugin-opener = "2.5"
 # Remembers window geometry across launches (issue #818).
 tauri-plugin-window-state = "2.4"
-reqwest = { version = "0.11", features = ["json"] }
+# `stream` is what lets a book be uploaded without being read into
+# memory first (#883) -- see `add_files_via_server`.
+reqwest = { version = "0.11", features = ["json", "stream"] }
+# Async file reads for that same streamed upload. In `[dependencies]`
+# deliberately: this is runtime code, and this repo has twice shipped a
+# runtime dependency into `[dev-dependencies]` where only `cargo build
+# --bin` caught it.
+tokio = { version = "1", features = ["fs"] }
+tokio-util = { version = "0.7", features = ["io"] }
 urlencoding = "2.1"
 zip = "0.6"
 

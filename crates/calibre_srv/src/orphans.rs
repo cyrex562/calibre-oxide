@@ -23,7 +23,6 @@
 //! thing: state the user has to be able to see and undo. A hidden list
 //! of files the app refuses to show is its own kind of bug.
 
-use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use serde::Deserialize;
@@ -102,36 +101,45 @@ pub async fn relocate(State(state): State<AppState>, Path((book_id, format, libr
 ///
 /// The "copy the file back in" resolution. The bytes are written to the
 /// library root under `filename` and the entry is pointed at them.
-pub async fn upload(State(state): State<AppState>, Path((book_id, format, library_id, filename)): Path<(i32, String, String, String)>, body: Bytes) -> Result<Json<Value>, ServerError> {
+pub async fn upload(State(state): State<AppState>, Path((book_id, format, library_id, filename)): Path<(i32, String, String, String)>, body: axum::body::Body) -> Result<Json<Value>, ServerError> {
     let cache = cache_or_404(&state, &library_id)?;
-    if body.is_empty() {
+
+    // `sanitize_file_name` is what stops `../` and friends: the name
+    // comes from a client and is about to become a real path.
+    let safe = calibre_utils::filenames::sanitize_file_name(&filename);
+    if safe.trim().is_empty() {
+        return Err(ServerError::BadRequest(format!("{filename:?} is not a usable filename")));
+    }
+    let destination = cache.backend.library_path.join(&safe);
+    // Checked before a byte is written. Refusing beats overwriting: the
+    // existing file may be another book's, and this route's whole job is
+    // to stop a file being lost.
+    if destination.exists() {
+        return Err(ServerError::BadRequest(format!("{safe} already exists in the library; point at it directly instead of uploading over it")));
+    }
+
+    // Streamed (#883) -- a scanned PDF can be hundreds of megabytes, and
+    // nothing here needs it in memory.
+    let written = crate::upload::stream_to_file(body, &destination).await?;
+    if written == 0 {
+        // An empty file is not a book, and leaving it would have the next
+        // scan index it as one.
+        let _ = tokio::fs::remove_file(&destination).await;
         return Err(ServerError::BadRequest("no file content was uploaded".into()));
     }
 
-    let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<calibre_db::orphans::RelocateOutcome> {
-        // `sanitize_file_name` is what stops `../` and friends: the name
-        // comes from a client and is about to become a real path.
-        let safe = calibre_utils::filenames::sanitize_file_name(&filename);
-        if safe.trim().is_empty() {
-            anyhow::bail!("{filename:?} is not a usable filename");
-        }
-        let destination = cache.backend.library_path.join(&safe);
-        // Refusing beats overwriting: the existing file may be another
-        // book's, and this route's whole job is to stop a file being
-        // lost.
-        if destination.exists() {
-            anyhow::bail!("{safe} already exists in the library; point at it directly instead of uploading over it");
-        }
-        std::fs::write(&destination, &body)?;
-
-        match calibre_db::orphans::relocate(&cache, book_id, &format, &destination) {
-            Ok(outcome) => Ok(outcome),
-            Err(e) => {
-                // Do not leave a file behind that nothing refers to: the
-                // next scan would index it as a book of its own, so a
-                // failed repair would quietly invent a duplicate.
-                let _ = std::fs::remove_file(&destination);
-                Err(e)
+    let outcome = tokio::task::spawn_blocking({
+        let destination = destination.clone();
+        move || -> anyhow::Result<calibre_db::orphans::RelocateOutcome> {
+            match calibre_db::orphans::relocate(&cache, book_id, &format, &destination) {
+                Ok(outcome) => Ok(outcome),
+                Err(e) => {
+                    // Do not leave a file behind that nothing refers to:
+                    // the next scan would index it as a book of its own,
+                    // so a failed repair would quietly invent a duplicate.
+                    let _ = std::fs::remove_file(&destination);
+                    Err(e)
+                }
             }
         }
     })
