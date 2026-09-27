@@ -195,7 +195,9 @@ impl ChecksumStore {
                     size INTEGER NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (book_id, kind, key)
-                );",
+                );
+                CREATE INDEX IF NOT EXISTS checksums_db.file_checksums_by_hash
+                    ON file_checksums (blake3_hex);",
             )?;
         }
         Ok(())
@@ -306,6 +308,39 @@ impl ChecksumStore {
     ) -> Result<VerifyOutcome, ChecksumError> {
         let bytes = fs::read(path)?;
         self.verify_bytes(book_id, kind, key, &bytes)
+    }
+
+    /// Which recorded files have this content (#890).
+    ///
+    /// The store is keyed `(book_id, kind, key)`, which answers "what is
+    /// book 12's hash?" but not "which book is this file?" -- and the
+    /// second is the question rename recovery asks. A file found at an
+    /// unexpected path is identified by hashing it and looking the hash
+    /// up here; a hit means the file moved rather than a book losing its
+    /// file, and it can be re-attached without troubling the user.
+    ///
+    /// Returns `(book_id, kind, key)` per match. More than one match is
+    /// normal and meaningful: two books can genuinely hold byte-identical
+    /// files, which is a duplicate to resolve rather than an error.
+    pub fn find_by_hash(&self, blake3_hex: &str) -> Result<Vec<(i32, String, String)>, ChecksumError> {
+        self.initialize()?;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT book_id, kind, key FROM checksums_db.file_checksums WHERE blake3_hex = ?1 ORDER BY book_id, kind, key")?;
+        let rows = stmt.query_map([blake3_hex], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Whether any recorded file has this content.
+    ///
+    /// Cheaper than [`ChecksumStore::find_by_hash`] when the answer is
+    /// only being used to decide whether a hash lookup is worth doing at
+    /// all.
+    pub fn any_with_hash(&self, blake3_hex: &str) -> Result<bool, ChecksumError> {
+        Ok(!self.find_by_hash(blake3_hex)?.is_empty())
     }
 
     /// Drops one file's stored checksum -- call when the file it
@@ -469,5 +504,76 @@ mod tests {
         fs::write(&path, b"corrupted!").unwrap();
         let err = store.verify_file(1, "format", "EPUB", &path).unwrap_err();
         assert!(matches!(err, ChecksumError::Mismatch { .. }));
+    }
+}
+
+#[cfg(test)]
+mod hash_lookup_tests {
+    use super::*;
+    use crate::cache::Cache;
+
+    /// The `Cache` is returned rather than dropped: the store borrows
+    /// its connection, so letting it go would close the database out
+    /// from under every query below.
+    fn store() -> (tempfile::TempDir, Cache, ChecksumStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        let store = cache.checksums();
+        (dir, cache, store)
+    }
+
+    #[test]
+    fn a_recorded_hash_can_be_looked_up_by_content() {
+        let (_dir, _cache, store) = store();
+        store.record_hash(7, "format", "PDF", "abc123", 100).unwrap();
+
+        assert_eq!(store.find_by_hash("abc123").unwrap(), vec![(7, "format".to_string(), "PDF".to_string())]);
+        assert!(store.any_with_hash("abc123").unwrap());
+    }
+
+    #[test]
+    fn an_unknown_hash_finds_nothing() {
+        let (_dir, _cache, store) = store();
+        store.record_hash(7, "format", "PDF", "abc123", 100).unwrap();
+        assert!(store.find_by_hash("nothing-like-it").unwrap().is_empty());
+        assert!(!store.any_with_hash("nothing-like-it").unwrap());
+    }
+
+    /// Two books genuinely holding byte-identical files is a duplicate
+    /// to resolve, not an error -- so every match is returned rather
+    /// than the first.
+    #[test]
+    fn identical_content_in_two_books_returns_both() {
+        let (_dir, _cache, store) = store();
+        store.record_hash(1, "format", "PDF", "same", 10).unwrap();
+        store.record_hash(2, "format", "PDF", "same", 10).unwrap();
+
+        assert_eq!(store.find_by_hash("same").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_covers_hash_is_distinguishable_from_a_formats() {
+        let (_dir, _cache, store) = store();
+        store.record_hash(1, "format", "PDF", "shared", 10).unwrap();
+        store.record_hash(1, "cover", "", "shared", 10).unwrap();
+
+        let found = store.find_by_hash("shared").unwrap();
+        assert!(found.contains(&(1, "cover".to_string(), String::new())));
+        assert!(found.contains(&(1, "format".to_string(), "PDF".to_string())));
+    }
+
+    /// The rename-recovery path: a file turns up at an unexpected place,
+    /// gets hashed, and the hash says which book it belongs to.
+    #[test]
+    fn a_moved_file_is_identified_by_hashing_it() {
+        let (dir, _cache, store) = store();
+        let path = dir.path().join("wherever.pdf");
+        std::fs::write(&path, b"%PDF-1.4 the real bytes").unwrap();
+        store.record_file(42, "format", "PDF", &path).unwrap();
+
+        // Simulating the scan: something unexpected is here, so hash it.
+        let hash = blake3::hash(&std::fs::read(&path).unwrap()).to_hex().to_string();
+        let found = store.find_by_hash(&hash).unwrap();
+        assert_eq!(found, vec![(42, "format".to_string(), "PDF".to_string())]);
     }
 }
