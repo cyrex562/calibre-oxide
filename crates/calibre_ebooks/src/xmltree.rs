@@ -323,12 +323,25 @@ impl Xml {
     /// `opf.py`'s `set_guide_item`, which explicitly passes
     /// `nsmap={'opf': OPF_NAMESPACES['opf']}`) call this before/along
     /// with [`Xml::new_element`].
+    /// Checked per *prefix*, not per URI.
+    ///
+    /// The obvious implementation asks "is this URI declared anywhere?"
+    /// and returns early if so -- but that is wrong for the case this
+    /// mostly exists to serve. An OPF usually binds the OPF namespace as
+    /// the **default** (`xmlns="...opf"`), and an unprefixed attribute is
+    /// in *no* namespace, so `opf:role` still needs `xmlns:opf` even
+    /// though the same URI is already in scope. Deduplicating by URI made
+    /// this a silent no-op and produced XML that would not re-parse.
+    ///
+    /// A prefix already bound to a *different* URI is left alone: changing
+    /// it would re-point every name using it, which is worse than the
+    /// caller's name being unresolvable.
     pub fn ensure_namespace_declared(&mut self, prefix: Option<&str>, uri: &str) {
-        if self.doc_namespaces.values().any(|v| v == uri) {
+        let prefix = prefix.map(|s| s.to_string());
+        if self.doc_namespaces.contains_key(&prefix) {
             return;
         }
-        self.doc_namespaces
-            .insert(prefix.map(|s| s.to_string()), uri.to_string());
+        self.doc_namespaces.insert(prefix, uri.to_string());
     }
 
     /// Detaches `id` from its parent's child list. The node itself

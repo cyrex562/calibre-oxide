@@ -596,6 +596,42 @@ mod set_metadata_tests {
         assert_eq!(read_back.languages, vec!["fr".to_string()], "the real language was overwritten with \"und\"");
     }
 
+    /// Most real OPFs bind the OPF namespace as the *default*
+    /// (`xmlns="...opf"`) and never declare an `opf:` prefix -- this
+    /// file's main fixture declares one, which hid a bug where writing
+    /// `opf:role` produced XML that would not re-parse. Found when the
+    /// `calibre_db` embed test used a leaner OPF.
+    #[test]
+    fn an_opf_that_declares_no_opf_prefix_still_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lean.epub");
+        {
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+            zip.start_file("mimetype", zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored)).unwrap();
+            zip.write_all(b"application/epub+zip").unwrap();
+            let deflated = zip::write::FileOptions::default();
+            zip.start_file("META-INF/container.xml", deflated).unwrap();
+            zip.write_all(br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#).unwrap();
+            zip.start_file("content.opf", deflated).unwrap();
+            // Only `xmlns` and `xmlns:dc`. No `xmlns:opf`.
+            zip.write_all(br#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="uid"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Stale</dc:title><dc:identifier id="uid">urn:uuid:test</dc:identifier></metadata><manifest><item id="c1" href="c1.html" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="c1"/></spine></package>"#).unwrap();
+            zip.start_file("c1.html", deflated).unwrap();
+            zip.write_all(br#"<html xmlns="http://www.w3.org/1999/xhtml"><body><p>Text</p></body></html>"#).unwrap();
+            zip.finish().unwrap();
+        }
+
+        let mut mi = MetaInformation::default();
+        mi.title = "Written".to_string();
+        // An author is what triggers `opf:role`.
+        mi.authors = vec!["Ann Author".to_string()];
+        set_metadata(&path, &mi).unwrap();
+
+        // The real assertion: the result re-parses at all.
+        let read_back = get_metadata(std::fs::File::open(&path).unwrap()).unwrap();
+        assert_eq!(read_back.title, "Written");
+        assert_eq!(read_back.authors, vec!["Ann Author".to_string()]);
+    }
+
     /// Writing metadata must not disturb the rest of the book.
     #[test]
     fn the_other_zip_entries_are_untouched() {
