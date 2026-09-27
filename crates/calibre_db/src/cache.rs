@@ -925,7 +925,19 @@ impl Cache {
     /// database at all (issue #260's territory), so a crash between a
     /// successful rename/batch and the DB update is a real, smaller,
     /// separate gap not addressed here.
-    fn rename_book_files(
+    /// Moves a book's folder to `<new_author>/<new_title>` and renames
+    /// every format inside it.
+    ///
+    /// **Nothing calls this automatically.** It used to run on every
+    /// title or author change via [`Cache::update_book_metadata`], which
+    /// meant correcting a typo rearranged files the user had placed
+    /// deliberately (#893). It is now an operation in its own right, the
+    /// folder-level counterpart to
+    /// [`Cache::rename_format_files`]'s filename-level one.
+    ///
+    /// Public rather than private because it has no automatic caller
+    /// left: the only way to reach it is to ask for it.
+    pub fn rename_book_files(
         &self,
         book_id: i32,
         new_title: &str,
@@ -1216,8 +1228,20 @@ impl Cache {
         title: &str,
         author: &str,
     ) -> anyhow::Result<()> {
-        self.rename_book_files(book_id, title, author)?;
-
+        // Deliberately no longer renames the book's files (#893).
+        //
+        // It used to call `rename_book_files` first, which moved the
+        // book's folder to `<new author>/<new title>` and renamed every
+        // format inside it. That made the two inseparable in the other
+        // direction from #885: correcting a typo in a title silently
+        // rearranged files the user had put where they wanted them, and
+        // on a library synced or backed up by path it rewrote history
+        // that other tools were tracking.
+        //
+        // Moving a book's files is still available as its own operation
+        // (`rename_book_files` for the folder, `rename_format_files` for
+        // the filenames) -- it is just no longer a side effect of editing
+        // metadata.
         let mut conn = self.backend.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
@@ -3325,7 +3349,7 @@ mod tests {
     }
 
     #[test]
-    fn update_book_metadata_renames_the_folder_and_updates_the_author_link() {
+    fn moving_a_books_folder_renames_it_on_disk_and_updates_the_path() {
         let (dir, cache) = open_test_cache();
         let source = write_temp_file(dir.path(), "src.epub", b"x");
         let mut meta = MetaInformation::default();
@@ -3334,17 +3358,13 @@ mod tests {
         let book_id = cache.add_book(&source, &meta).unwrap();
 
         cache
-            .update_book_metadata(book_id, "New Title", "New Author")
+            .rename_book_files(book_id, "New Title", "New Author")
             .unwrap();
 
-        assert_eq!(
-            cache.field_for(book_id, "title").unwrap(),
-            Some("New Title".to_string())
-        );
-        assert_eq!(
-            cache.field_for(book_id, "authors").unwrap(),
-            Some("New Author".to_string())
-        );
+        // The metadata is deliberately untouched: moving a book's files
+        // and editing its title are separate operations since #893, and
+        // this one is only the move.
+        assert_eq!(cache.field_for(book_id, "title").unwrap(), Some("Old Title".to_string()));
         assert!(dir.path().join("New Author/New Title").exists());
         assert!(!dir.path().join("Old Author").exists());
 
@@ -3373,7 +3393,7 @@ mod tests {
     }
 
     #[test]
-    fn update_book_metadata_leaves_the_old_author_directory_when_another_book_still_uses_it() {
+    fn moving_a_book_leaves_the_old_author_directory_when_another_book_still_uses_it() {
         let (dir, cache) = open_test_cache();
 
         let source_a = write_temp_file(dir.path(), "a.epub", b"a");
@@ -3389,7 +3409,7 @@ mod tests {
         cache.add_book(&source_b, &meta_b).unwrap();
 
         cache
-            .update_book_metadata(book_a, "Book A", "Solo Author")
+            .rename_book_files(book_a, "Book A", "Solo Author")
             .unwrap();
 
         // "Shared Author" is still not empty (Book B's directory is
@@ -3422,13 +3442,12 @@ mod tests {
         let book_id = cache.add_book(&source, &meta).unwrap();
 
         cache
-            .update_book_metadata(book_id, "New Title", "New Author")
+            .rename_book_files(book_id, "New Title", "New Author")
             .unwrap();
 
-        assert_eq!(
-            cache.field_for(book_id, "title").unwrap(),
-            Some("New Title".to_string())
-        );
+        // Only the files moved -- the title is not this operation's
+        // business (#893).
+        assert_eq!(cache.field_for(book_id, "title").unwrap(), Some("Old Title".to_string()));
         assert!(dir.path().join("New Author/New Title").exists());
         assert!(!dir.path().join("Old Author").exists());
         assert!(dir
@@ -3656,6 +3675,47 @@ mod tests {
         assert!(after.ends_with("Nineteen Eighty-Four.pdf"), "got {after}");
         assert!(Path::new(&after).exists(), "the recorded path does not exist, so every route serving this book will 404");
         assert!(!Path::new(&before).exists(), "the old file is still there");
+    }
+
+    /// The other direction of #885's split, and the whole point of
+    /// #893: editing metadata must not move anything on disk. It used
+    /// to, so correcting a typo in a title rearranged files the user had
+    /// put where they wanted them.
+    #[test]
+    fn editing_metadata_leaves_the_files_where_they_are() {
+        let (dir, cache) = open_test_cache();
+        let id = add_pdf(dir.path(), &cache, "Old Title", "Old Author", "scan0001");
+        let original = dir.path().join("Old Author/Old Title/scan0001.pdf");
+        assert!(original.exists());
+
+        cache.update_book_metadata(id, "A Completely New Title", "A Different Author").unwrap();
+
+        // Metadata changed...
+        assert_eq!(cache.field_for(id, "title").unwrap().as_deref(), Some("A Completely New Title"));
+        // ...and not one byte moved.
+        assert!(original.exists(), "editing the title moved the file");
+        assert_eq!(cache.field_for(id, "path").unwrap().as_deref(), Some("Old Author/Old Title"));
+        assert_eq!(cache.format_file_stem(id).unwrap().as_deref(), Some("scan0001"));
+        assert!(!dir.path().join("A Different Author").exists());
+
+        // And the book is still reachable, which is the failure mode the
+        // old coupling produced when `data.name` fell out of step.
+        let path = cache.get_data_as_dict(None, false, None, false).unwrap()[0]["fmt_pdf"].as_str().unwrap().to_string();
+        assert!(Path::new(&path).exists(), "{path} does not exist");
+    }
+
+    /// Same, through `set_field` -- the path the server's metadata editor
+    /// actually takes.
+    #[test]
+    fn setting_the_title_field_leaves_the_files_where_they_are() {
+        let (dir, cache) = open_test_cache();
+        let id = add_pdf(dir.path(), &cache, "Old Title", "An Author", "scan0001");
+        let original = dir.path().join("An Author/Old Title/scan0001.pdf");
+
+        cache.set_field(id, "title", "Renamed In The UI").unwrap();
+
+        assert_eq!(cache.field_for(id, "title").unwrap().as_deref(), Some("Renamed In The UI"));
+        assert!(original.exists());
     }
 
     #[test]
@@ -3893,16 +3953,19 @@ mod tests {
     }
 
     /// `rename_book_files` moves every format to `<new title>.<ext>`
-    /// but used not to say so in `data.name`, so after a title change
-    /// through it the database pointed at the old filename -- the same
-    /// 404 `a_renamed_book_can_still_be_opened` covers, reached from
-    /// the other side.
+    /// but used not to say so in `data.name`, so afterwards the database
+    /// pointed at the old filename -- the same 404
+    /// `a_renamed_book_can_still_be_opened` covers, reached from the
+    /// other side.
+    ///
+    /// Calls `rename_book_files` directly: since #893 a metadata change
+    /// no longer triggers it.
     #[test]
-    fn a_title_change_that_moves_files_keeps_the_recorded_name_in_step() {
+    fn moving_a_books_folder_keeps_the_recorded_name_in_step() {
         let (dir, cache) = open_test_cache();
         let id = add_pdf(dir.path(), &cache, "Old Title", "Old Author", "Old Title");
 
-        cache.update_book_metadata(id, "New Title", "New Author").unwrap();
+        cache.rename_book_files(id, "New Title", "New Author").unwrap();
 
         assert_eq!(cache.format_file_stem(id).unwrap().as_deref(), Some("New Title"));
         let path = cache.get_data_as_dict(None, false, None, false).unwrap()[0]["fmt_pdf"].as_str().expect("the format must still resolve").to_string();
