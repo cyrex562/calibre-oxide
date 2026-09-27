@@ -202,12 +202,18 @@ impl Library {
         Ok(books)
     }
 
-    pub fn get_cover_path(&self, book: &Book) -> Option<PathBuf> {
-        if book.has_cover {
-            Some(self.path.join(&book.path).join("cover.jpg"))
-        } else {
-            None
+    /// Where this book's cover is, if it has one.
+    ///
+    /// Delegates to `covers::cover_path` rather than recomputing
+    /// `<book folder>/cover.jpg`: covers moved into the library's state
+    /// directory (#893), and a second independent copy of the old rule
+    /// here would report a path that does not exist.
+    pub fn get_cover_path(&mut self, book: &Book) -> Option<PathBuf> {
+        if !book.has_cover {
+            return None;
         }
+        let cache = self.as_cache();
+        crate::covers::cover_path(&cache, book.id).ok()
     }
 
     pub fn get_default_book_file(&self, book: &Book) -> Option<PathBuf> {
@@ -864,9 +870,13 @@ mod tests {
             .unwrap();
         assert_eq!(has_cover, 1);
 
-        // 5. Verify File
-        let dest_cover = full_book_dir.join("cover.jpg");
-        assert!(dest_cover.exists());
+        // 5. Verify File -- in the library's state directory, not beside
+        // the book (#893). A flat library would otherwise have every
+        // book sharing one `cover.jpg`.
+        let cache = lib.as_cache();
+        let dest_cover = crate::covers::cover_path(&cache, book_id).unwrap();
+        assert!(dest_cover.exists(), "{}", dest_cover.display());
+        assert!(!full_book_dir.join("cover.jpg").exists(), "a new cover should not be written beside the book");
     }
 
     #[test]
