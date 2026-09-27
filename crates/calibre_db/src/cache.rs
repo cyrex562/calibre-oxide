@@ -671,7 +671,34 @@ impl Cache {
         // see `calibre_srv::cdb::set_fields`) must not be able to
         // embed a path separator here and write outside `book_dir`.
         let ext = sanitize_file_name(&format.to_lowercase());
-        let stem = self.free_format_stem(book_id, &format, &book_dir, &sanitize_file_name(&title), &ext)?;
+        // The file keeps the name it arrived with (#893). It used to be
+        // renamed to the book's title, which made the two inseparable:
+        // the only way to change a filename was to retitle the book,
+        // and retitling always renamed the file. In a folder the user
+        // manages by hand, neither is wanted.
+        //
+        // The title is still the fallback, for a source with no usable
+        // stem at all -- there has to be *some* name.
+        let from_source = source_path.file_stem().and_then(|s| s.to_str()).map(sanitize_file_name).filter(|s| !s.trim().is_empty());
+        let preferred = from_source.unwrap_or_else(|| sanitize_file_name(&title));
+
+        // `replace` is asked about the book's *format*, not about a
+        // filename. Checking the destination path instead was correct
+        // only while filenames were derived from the title, so a book's
+        // EPUB always had one possible name. Now that the name comes
+        // from the source, a second EPUB arriving under a different name
+        // would find its destination free, slip past a `replace = false`
+        // caller, and overwrite the `data` row -- leaving the first file
+        // on disk with nothing pointing at it.
+        let existing_name: Option<String> = {
+            let conn = self.backend.conn.lock().unwrap();
+            conn.query_row("SELECT name FROM data WHERE book = ?1 AND format = ?2", (book_id, format.to_uppercase()), |row| row.get(0)).ok()
+        };
+        if existing_name.is_some() && !replace {
+            return Ok(false);
+        }
+
+        let stem = self.free_format_stem(book_id, &format, &book_dir, &preferred, &ext)?;
         let file_name = format!("{stem}.{ext}");
         let dest_path = book_dir.join(&file_name);
         if dest_path.exists() && !replace {
@@ -710,6 +737,24 @@ impl Cache {
             (book_id, format.to_uppercase(), size, &stem),
         )?;
         drop(conn);
+
+        // A replacement that landed under a different name leaves the
+        // file it replaced behind with no `data` row pointing at it --
+        // an invisible file taking up space, and one that
+        // `check_library` would later report as a stray.
+        if let Some(old_name) = existing_name.filter(|old| *old != stem) {
+            let orphan = book_dir.join(format!("{old_name}.{ext}"));
+            if orphan.is_file() {
+                match self.backend.write_handle() {
+                    Ok(handle) => {
+                        if let Err(e) = handle.remove_atomic(&orphan) {
+                            log::warn!("replaced {format} for book {book_id} but could not remove {}: {e}", orphan.display());
+                        }
+                    }
+                    Err(e) => log::warn!("replaced {format} for book {book_id} but could not remove {}: {e}", orphan.display()),
+                }
+            }
+        }
 
         let (format_name, stem_name) = (format.to_uppercase(), stem.clone());
         self.record_for_book(book_id, |book| crate::change_log::ChangeOp::FormatSet { book, format: format_name, name: stem_name, size, hash: Some(hash) });
@@ -2962,7 +3007,9 @@ mod tests {
             cache.field_for(book_id, "path").unwrap(),
             Some("My Author/My Title".to_string())
         );
-        let dest = dir.path().join("My Author/My Title/My Title.epub");
+        // `src.epub`, not `My Title.epub`: the folder is still derived
+        // from the metadata, the filename no longer is (#893).
+        let dest = dir.path().join("My Author/My Title/src.epub");
         assert_eq!(fs::read(dest).unwrap(), b"epub bytes");
     }
 
@@ -3026,13 +3073,19 @@ mod tests {
         let book_id = cache.add_book(&source, &meta).unwrap();
 
         let source2 = write_temp_file(dir.path(), "src2.epub", b"second");
+        // `replace` is about the book's *format*, not a filename: the
+        // book already has an EPUB, so a second one is refused even
+        // though it would land under a different name.
         assert!(!cache.add_format(book_id, &source2, "epub", false).unwrap());
 
-        let dest = dir.path().join("A/T/T.epub");
-        assert_eq!(fs::read(&dest).unwrap(), b"first");
+        let first_dest = dir.path().join("A/T/src.epub");
+        assert_eq!(fs::read(&first_dest).unwrap(), b"first");
 
+        // With `replace`, the new file lands under its own name and the
+        // one it replaced is removed rather than orphaned.
         assert!(cache.add_format(book_id, &source2, "epub", true).unwrap());
-        assert_eq!(fs::read(&dest).unwrap(), b"second");
+        assert_eq!(fs::read(dir.path().join("A/T/src2.epub")).unwrap(), b"second");
+        assert!(!first_dest.exists(), "the replaced file was left behind");
     }
 
     #[test]
@@ -3187,7 +3240,7 @@ mod tests {
         meta.authors = vec!["A".to_string()];
         let book_id = cache.add_book(&source, &meta).unwrap();
 
-        let dest = dir.path().join("A/T/T.epub");
+        let dest = dir.path().join("A/T/src.epub");
         assert_eq!(
             cache
                 .checksums()
@@ -3416,7 +3469,7 @@ mod tests {
         let dest_dir = tempdir().unwrap();
         cache.clone_to(dest_dir.path()).unwrap();
 
-        assert!(dest_dir.path().join("A/T/T.epub").exists());
+        assert!(dest_dir.path().join("A/T/src.epub").exists());
     }
 
     // --- get_data_as_dict ---
@@ -3479,7 +3532,7 @@ mod tests {
         assert_eq!(rec["available_formats"], serde_json::json!(["EPUB"]));
         let formats = rec["formats"].as_array().unwrap();
         assert_eq!(formats.len(), 1);
-        assert!(formats[0].as_str().unwrap().ends_with("T.epub"));
+        assert!(formats[0].as_str().unwrap().ends_with("src.epub"), "got {:?}", formats[0]);
         assert_eq!(rec["fmt_epub"], formats[0]);
     }
 
@@ -3665,8 +3718,37 @@ mod tests {
         assert_ne!(first_path, second_path, "both books still point at one file");
         assert_eq!(fs::read(&first_path).unwrap(), b"BOOK ONE");
         assert_eq!(fs::read(&second_path).unwrap(), b"BOOK TWO");
-        // The disambiguated one is the second arrival, not the first.
-        assert!(second_path.ends_with("Same Title (1).pdf"), "got {second_path}");
+    }
+
+    /// Since #893 a file keeps its source name, so two books with the
+    /// same title no longer want the same filename -- the collision case
+    /// is now two *sources* with the same name, which is just as easy to
+    /// hit (two folders of `scan0001.pdf`).
+    #[test]
+    fn two_sources_with_the_same_name_do_not_overwrite_each_other() {
+        let (dir, cache) = open_test_cache();
+        let first_src = dir.path().join("a").join("scan0001.pdf");
+        let second_src = dir.path().join("b").join("scan0001.pdf");
+        for (path, bytes) in [(&first_src, &b"BOOK ONE"[..]), (&second_src, &b"BOOK TWO"[..])] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+
+        let mut meta = MetaInformation::default();
+        meta.title = "Same Title".to_string();
+        meta.authors = vec!["Same Author".to_string()];
+        let first = cache.add_book(&first_src, &meta).unwrap();
+        let second = cache.add_book(&second_src, &meta).unwrap();
+
+        let path_of = |id: i32| {
+            cache.get_data_as_dict(None, false, None, false).unwrap().into_iter().find(|r| r["id"] == id).unwrap()["fmt_pdf"].as_str().unwrap().to_string()
+        };
+        let (first_path, second_path) = (path_of(first), path_of(second));
+
+        assert_ne!(first_path, second_path);
+        assert_eq!(fs::read(&first_path).unwrap(), b"BOOK ONE");
+        assert_eq!(fs::read(&second_path).unwrap(), b"BOOK TWO");
+        assert!(second_path.ends_with("scan0001 (1).pdf"), "got {second_path}");
     }
 
     #[test]
@@ -3678,12 +3760,31 @@ mod tests {
         fs::write(&replacement, b"NEWER CONTENT").unwrap();
         assert!(cache.add_format(id, &replacement, "pdf", true).unwrap());
 
-        // Its own file is not a collision: this must overwrite in
-        // place rather than leave `A Title (1).pdf` beside the old one.
-        assert_eq!(cache.format_file_stem(id).unwrap().as_deref(), Some("A Title"));
+        // The replacement brings its own name with it (#893)...
+        assert_eq!(cache.format_file_stem(id).unwrap().as_deref(), Some("newer"));
         let path = cache.get_data_as_dict(None, false, None, false).unwrap()[0]["fmt_pdf"].as_str().unwrap().to_string();
         assert_eq!(fs::read(&path).unwrap(), b"NEWER CONTENT");
-        assert!(!dir.path().join("An Author/A Title/A Title (1).pdf").exists());
+        // ...and the file it replaced is gone, not left behind with
+        // nothing pointing at it.
+        assert!(!dir.path().join("An Author/A Title/A Title.pdf").exists(), "the replaced file was orphaned on disk");
+    }
+
+    /// Re-adding a format under the *same* name overwrites in place, and
+    /// does not walk the name to `(1)`.
+    #[test]
+    fn re_adding_a_format_under_the_same_name_overwrites_it() {
+        let (dir, cache) = open_test_cache();
+        let id = add_pdf(dir.path(), &cache, "A Title", "An Author", "book");
+
+        let again = dir.path().join("again").join("book.pdf");
+        fs::create_dir_all(again.parent().unwrap()).unwrap();
+        fs::write(&again, b"SECOND VERSION").unwrap();
+        assert!(cache.add_format(id, &again, "pdf", true).unwrap());
+
+        assert_eq!(cache.format_file_stem(id).unwrap().as_deref(), Some("book"));
+        assert!(!dir.path().join("An Author/A Title/book (1).pdf").exists());
+        let path = cache.get_data_as_dict(None, false, None, false).unwrap()[0]["fmt_pdf"].as_str().unwrap().to_string();
+        assert_eq!(fs::read(&path).unwrap(), b"SECOND VERSION");
     }
 
     /// `remove_format` used to delete the first file in the folder

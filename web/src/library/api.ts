@@ -142,7 +142,9 @@ export function fileToDataUrl(file: File): Promise<string> {
 export async function addFormat(bookId: number, file: File): Promise<BookSummary> {
   const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
   const dataUrl = await fileToDataUrl(file);
-  return setFields(bookId, { added_formats: [{ ext, data_url: dataUrl }] });
+  // The name travels too: since #893 a format file keeps the name it
+  // arrived with rather than being renamed to the book's title.
+  return setFields(bookId, { added_formats: [{ ext, data_url: dataUrl, name: file.name }] });
 }
 
 export function removeFormat(bookId: number, ext: string): Promise<BookSummary> {

@@ -189,7 +189,7 @@ export interface BookFieldChanges {
   pubdate?: string;
   // `set-fields`'s own special-cased keys (cdb.rs::set_fields_handle) --
   // not plain metadata fields, but accepted in the same `changes` object.
-  added_formats?: { ext: string; data_url: string }[];
+  added_formats?: { ext: string; data_url: string; name?: string }[];
   removed_formats?: string[];
   // Custom column values, keyed by their bare label (calibre_db::cache::Cache::set_field's
   // fallback dispatches any name matching a real custom_columns row -- see issue #720).

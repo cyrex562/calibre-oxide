@@ -85,7 +85,9 @@ mod tests {
         let args = vec![book_id.to_string(), file_path.to_string_lossy().to_string()];
         cmd.run(&mut db, &args).unwrap();
 
-        let dest = db.path().join("Author/Test Book/Test Book.epub");
+        // `source.epub`, not `Test Book.epub`: a format file keeps the
+        // name it arrived with (#893).
+        let dest = db.path().join("Author/Test Book/source.epub");
         assert!(
             dest.exists(),
             "format file should be copied into the book's folder"
