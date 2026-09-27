@@ -6,6 +6,7 @@ pub mod book;
 pub mod cache;
 pub mod catalogs;
 pub mod categories;
+pub mod change_log;
 pub mod check_library;
 pub mod checksums;
 pub mod cli;
