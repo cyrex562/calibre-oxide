@@ -32,6 +32,9 @@ blake3 = "1.5"
 unicode_names2 = "2.0.0"
 image = { version = "0.24", default-features = false, features = ["png", "jpeg", "gif"] }
 zip = "0.6"
+# Sending a removed book's file to the system wastebasket rather than
+# erasing it (#896). MIT, so GPL-compatible.
+trash = "5.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

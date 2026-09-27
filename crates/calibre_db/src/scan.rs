@@ -337,6 +337,10 @@ pub struct IndexReport {
     /// `(relative path, why)` for files that could not be indexed. One
     /// bad file does not abandon the rest of the folder.
     pub failed: Vec<(String, String)>,
+    /// Files skipped because the user removed the book and kept the file
+    /// (#896). Reported rather than quietly omitted: a hidden list of
+    /// files the app refuses to show is its own kind of bug.
+    pub ignored: Vec<String>,
 }
 
 /// Creates a book for every discovered file the library does not
@@ -372,6 +376,17 @@ pub fn index_scan(cache: &crate::cache::Cache, library_path: &Path, report: &Sca
         }
 
         let absolute = library_path.join(&file.relative_path);
+
+        // Removed by the user, who chose to keep the file. Without this
+        // the scan does exactly its job and puts the book straight back.
+        // Checked against the path *and* the content, so the ignore
+        // survives the file being renamed afterwards.
+        let hash = crate::removal::hash_for_ignore_check(&absolute);
+        if cache.ignored().is_ignored(&file.relative_path, hash.as_deref()).unwrap_or(false) {
+            indexed.ignored.push(file.relative_path.clone());
+            continue;
+        }
+
         // A file whose metadata cannot be read is still a book. Falling
         // back to the filename is what the user would do, and refusing
         // to index it would leave a file sitting in the library that
