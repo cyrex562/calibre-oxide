@@ -208,6 +208,7 @@ pub mod tts;
 pub mod tweak;
 pub mod users;
 pub mod users_api;
+pub mod upload;
 pub mod utils;
 pub mod web_socket;
 

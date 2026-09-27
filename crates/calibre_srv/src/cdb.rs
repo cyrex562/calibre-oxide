@@ -75,7 +75,7 @@ fn valid_extension(ext: &str) -> bool {
 
 /// `POST /cdb/add-book/{job_id}/{add_duplicates}/{filename}/{library_id}`.
 /// Port of `cdb_add_book`.
-pub async fn add_book(State(state): State<AppState>, Path((job_id, add_duplicates, filename, _library_id)): Path<(String, String, String, String)>, body: Bytes) -> Result<Json<Value>, ServerError> {
+pub async fn add_book(State(state): State<AppState>, Path((job_id, add_duplicates, filename, _library_id)): Path<(String, String, String, String)>, body: axum::body::Body) -> Result<Json<Value>, ServerError> {
     if filename.is_empty() {
         return Err(ServerError::BadRequest("An empty filename is not allowed".to_string()));
     }
@@ -93,7 +93,10 @@ pub async fn add_book(State(state): State<AppState>, Path((job_id, add_duplicate
     let tmp_dir = std::env::temp_dir().join(format!("cdb-add-book-{}", rand::rng().random::<u64>()));
     tokio::fs::create_dir_all(&tmp_dir).await.map_err(|e| ServerError::InternalServerError(e.to_string()))?;
     let tmp_path = tmp_dir.join(&sanitized);
-    tokio::fs::write(&tmp_path, &body).await.map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+    // Streamed rather than buffered (#883): `Bytes` would have axum hold
+    // the whole book in memory before this function ran, and the only
+    // thing done with it is this write.
+    crate::upload::stream_to_file(body, &tmp_path).await?;
 
     let result = tokio::task::spawn_blocking({
         let cache = state.cache.clone();
