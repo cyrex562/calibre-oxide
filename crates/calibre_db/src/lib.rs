@@ -30,6 +30,7 @@ pub mod library_handle;
 pub mod listeners;
 pub mod locking;
 pub mod notes;
+pub mod orphans;
 #[cfg(unix)]
 mod power_monitor;
 pub mod scan;

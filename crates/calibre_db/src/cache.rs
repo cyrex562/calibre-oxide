@@ -224,6 +224,12 @@ impl Cache {
         }
     }
 
+    /// This library's orphan list (#895) -- book entries whose files are
+    /// gone.
+    pub fn orphans(&self) -> crate::orphans::OrphanStore {
+        crate::orphans::OrphanStore::new(self.backend.conn.clone(), &self.backend.library_path)
+    }
+
     /// A book's uuid -- the only identifier that means the same thing
     /// on two machines, since `books.id` is a local autoincrement.
     pub fn book_uuid(&self, book_id: i32) -> anyhow::Result<Option<String>> {
