@@ -1,8 +1,10 @@
 use crate::html_cover_fallback::{extract_calibre_cover, extract_cover_from_embedded_svg};
 use crate::metadata::MetaInformation;
 use crate::opf::parse_opf;
+use crate::xmltree::{Xml, XmlNodeId};
 use anyhow::{Context, Result};
-use std::io::{Read, Seek};
+use std::collections::HashMap;
+use std::io::{Read, Seek, Write};
 use std::path::Path;
 use zip::ZipArchive;
 
@@ -289,5 +291,394 @@ mod tests {
         assert!(mi.cover_data.1.is_empty(), "no pre-fallback matches and the Qt fallback isn't ported, so no cover_data");
 
         Ok(())
+    }
+}
+
+const DC_NS: &str = "http://purl.org/dc/elements/1.1/";
+const OPF_NS: &str = "http://www.idpf.org/2007/opf";
+
+/// Writes `mi` into an existing EPUB's OPF, in place (#834).
+///
+/// The `metadata` element is **edited**, not regenerated. Regenerating it
+/// is the obvious shortcut and it loses things that live there and are
+/// not `dc:*`: the `<meta name="cover">` pointer at the cover image, and
+/// calibre's own `calibre:series` / `calibre:title_sort` entries. A book
+/// whose cover vanished on a metadata edit would be a bad trade for
+/// simpler code.
+///
+/// Two invariants that a naive replace breaks, both tested:
+///
+/// - The `dc:identifier` named by `package/@unique-identifier` is left
+///   alone. Removing every `dc:identifier` and adding an ISBN would strip
+///   the book's unique id and make the EPUB invalid.
+/// - Only fields `mi` actually carries are touched. A `MetaInformation`
+///   with no publisher must not *delete* the book's publisher — the
+///   caller is setting fields, not declaring the complete set.
+pub fn set_metadata(path: &Path, mi: &MetaInformation) -> Result<()> {
+    let (opf_path, opf_content) = read_opf(path)?;
+    let updated = rewrite_opf(&opf_content, mi)?;
+    replace_zip_entry(path, &opf_path, &updated)
+}
+
+/// The OPF's path inside the archive, and its text.
+fn read_opf(path: &Path) -> Result<(String, String)> {
+    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut archive = ZipArchive::new(file).context("not a zip archive")?;
+
+    let container_xml = {
+        let mut f = archive.by_name("META-INF/container.xml").context("META-INF/container.xml not found")?;
+        let mut s = String::new();
+        f.read_to_string(&mut s)?;
+        s
+    };
+    let opf_path = extract_opf_path_from_container(&container_xml).context("could not find the OPF path in container.xml")?;
+
+    let mut f = archive.by_name(&opf_path).with_context(|| format!("{opf_path} not found in the archive"))?;
+    let mut opf = String::new();
+    f.read_to_string(&mut opf)?;
+    Ok((opf_path, opf))
+}
+
+/// Replaces every `dc:<local>` child of `metadata` with one element per
+/// value.
+///
+/// `values` being empty means "leave this field alone", not "clear it" --
+/// see [`set_metadata`]'s own doc for why.
+fn replace_dc(xml: &mut Xml, metadata: XmlNodeId, local: &str, values: &[String], attrs: &[(&str, &str)]) {
+    if values.is_empty() {
+        return;
+    }
+    for child in xml.element_children(metadata) {
+        if xml.namespace(child) == Some(DC_NS) && xml.local_name(child) == Some(local) {
+            xml.detach(child);
+        }
+    }
+    for value in values {
+        let element = xml.new_element(local, Some(DC_NS));
+        xml.set_element_text(element, value.as_str());
+        for (name, attr_value) in attrs {
+            xml.set_attr(element, name, *attr_value);
+        }
+        xml.insert_element(metadata, element, None);
+    }
+}
+
+fn rewrite_opf(opf: &str, mi: &MetaInformation) -> Result<Vec<u8>> {
+    let mut xml = Xml::parse(opf).context("parsing the OPF")?;
+    // Read only to fail early on something that is not an OPF at all.
+    xml.root_element().context("the OPF has no root element")?;
+
+    let ns: HashMap<&str, &str> = [("opf", OPF_NS), ("dc", DC_NS)].into_iter().collect();
+    let metadata = *xml
+        .opf_xpath("//opf:metadata", &ns)
+        .first()
+        .context("the OPF has no metadata element")?;
+
+    // `dc:` has to be declared for the elements below to serialize with a
+    // usable prefix. Many OPFs declare it on `metadata` rather than
+    // `package`, and some not at all when they use no dc elements yet.
+    xml.ensure_namespace_declared(Some("dc"), DC_NS);
+    xml.ensure_namespace_declared(Some("opf"), OPF_NS);
+
+    if !mi.title.trim().is_empty() {
+        replace_dc(&mut xml, metadata, "title", std::slice::from_ref(&mi.title), &[]);
+    }
+    // `opf:role="aut"` is what distinguishes an author from an editor or
+    // illustrator; a reader that ignores it still shows the name, but one
+    // that honours it would file the book wrongly without it.
+    replace_dc(&mut xml, metadata, "creator", &mi.authors, &[("opf:role", "aut")]);
+    replace_dc(&mut xml, metadata, "language", &mi.languages, &[]);
+    replace_dc(&mut xml, metadata, "subject", &mi.tags, &[]);
+
+    if let Some(publisher) = mi.publisher.as_ref().filter(|p| !p.trim().is_empty()) {
+        replace_dc(&mut xml, metadata, "publisher", std::slice::from_ref(publisher), &[]);
+    }
+    if let Some(comments) = mi.comments.as_ref().filter(|c| !c.trim().is_empty()) {
+        replace_dc(&mut xml, metadata, "description", std::slice::from_ref(comments), &[]);
+    }
+    if let Some(pubdate) = mi.pubdate {
+        // ISO 8601, which is what `parse_opf` reads back.
+        replace_dc(&mut xml, metadata, "date", &[pubdate.to_rfc3339()], &[]);
+    }
+
+    set_identifiers(&mut xml, metadata, mi);
+    Ok(xml.serialize())
+}
+
+/// Writes `mi`'s identifiers, preserving the book's unique id.
+///
+/// The `dc:identifier` whose `id` matches `package/@unique-identifier` is
+/// the book's identity. Replacing every identifier -- the obvious way to
+/// write an ISBN -- removes it and leaves an EPUB that readers reject, so
+/// this only ever updates an identifier matching the scheme being set, or
+/// appends a new one. Nothing here detaches an identifier, which is what
+/// keeps the unique one safe without having to name it.
+fn set_identifiers(xml: &mut Xml, metadata: XmlNodeId, mi: &MetaInformation) {
+    for (scheme, value) in &mi.identifiers {
+        if value.trim().is_empty() {
+            continue;
+        }
+        let wanted_scheme = scheme.to_uppercase();
+
+        // Update an existing element for this scheme if there is one,
+        // rather than adding a duplicate.
+        let mut updated = false;
+        for child in xml.element_children(metadata) {
+            if xml.namespace(child) != Some(DC_NS) || xml.local_name(child) != Some("identifier") {
+                continue;
+            }
+            if xml.get_attr(child, "opf:scheme").map(|s| s.to_uppercase()) == Some(wanted_scheme.clone()) {
+                xml.set_element_text(child, value.as_str());
+                updated = true;
+                break;
+            }
+        }
+        if updated {
+            continue;
+        }
+
+        // The unique identifier is never repurposed, even when it has no
+        // scheme and this one would otherwise be a natural fit for it.
+        let element = xml.new_element("identifier", Some(DC_NS));
+        xml.set_element_text(element, value.as_str());
+        xml.set_attr(element, "opf:scheme", wanted_scheme);
+        xml.insert_element(metadata, element, None);
+    }
+}
+
+/// Rewrites `archive_path` inside the zip at `path`, leaving every other
+/// entry byte-identical.
+///
+/// Writes a whole new archive to a temp file and renames over the
+/// original, so an interrupted write cannot truncate somebody's book.
+fn replace_zip_entry(path: &Path, archive_path: &str, content: &[u8]) -> Result<()> {
+    let source = std::fs::File::open(path)?;
+    let mut archive = ZipArchive::new(source)?;
+
+    let staging = tempfile::Builder::new().prefix("set-metadata").tempfile_in(path.parent().unwrap_or(Path::new(".")))?;
+    {
+        let mut out = zip::ZipWriter::new(std::fs::File::create(staging.path())?);
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i)?;
+            let name = entry.name().to_string();
+            // `mimetype` must stay first and stored, or the file stops
+            // being a recognisable EPUB. Preserving each entry's own
+            // compression method keeps that true without special-casing.
+            let options = zip::write::FileOptions::default().compression_method(entry.compression());
+            out.start_file(&name, options)?;
+            if name == archive_path {
+                out.write_all(content)?;
+            } else {
+                std::io::copy(&mut entry, &mut out)?;
+            }
+        }
+        out.finish()?;
+    }
+
+    // `persist` renames, which is atomic within a filesystem -- and the
+    // temp file is deliberately created beside the book so it is the same
+    // one.
+    staging.persist(path).map_err(|e| anyhow::anyhow!("replacing {}: {e}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod set_metadata_tests {
+    use super::*;
+
+    /// A real EPUB whose OPF has the things a naive metadata rewrite
+    /// destroys: a unique identifier, a cover pointer, and a
+    /// calibre-specific `meta`.
+    fn write_epub(path: &Path) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+
+        zip.start_file("mimetype", zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored)).unwrap();
+        zip.write_all(b"application/epub+zip").unwrap();
+
+        let deflated = zip::write::FileOptions::default();
+        zip.start_file("META-INF/container.xml", deflated).unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#).unwrap();
+
+        zip.start_file("content.opf", deflated).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="uid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
+    <dc:title>Old Title</dc:title>
+    <dc:creator opf:role="aut">Old Author</dc:creator>
+    <dc:language>fr</dc:language>
+    <dc:publisher>Old Publisher</dc:publisher>
+    <dc:identifier id="uid">urn:uuid:11111111-1111-1111-1111-111111111111</dc:identifier>
+    <meta name="cover" content="cover-image"/>
+    <meta name="calibre:series" content="Old Series"/>
+  </metadata>
+  <manifest>
+    <item id="c1" href="c1.html" media-type="application/xhtml+xml"/>
+    <item id="cover-image" href="cover.jpg" media-type="image/jpeg"/>
+  </manifest>
+  <spine><itemref idref="c1"/></spine>
+</package>"#,
+        )
+        .unwrap();
+
+        zip.start_file("c1.html", deflated).unwrap();
+        zip.write_all(br#"<html xmlns="http://www.w3.org/1999/xhtml"><body><p>Text</p></body></html>"#).unwrap();
+        zip.start_file("cover.jpg", deflated).unwrap();
+        zip.write_all(b"\xff\xd8\xff not really a jpeg").unwrap();
+
+        zip.finish().unwrap();
+    }
+
+    fn opf_of(path: &Path) -> String {
+        let mut archive = ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
+        let mut opf = String::new();
+        archive.by_name("content.opf").unwrap().read_to_string(&mut opf).unwrap();
+        opf
+    }
+
+    fn a_book(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let path = dir.path().join("book.epub");
+        write_epub(&path);
+        path
+    }
+
+    #[test]
+    fn title_and_authors_round_trip_through_get_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = a_book(&dir);
+
+        let mut mi = MetaInformation::default();
+        mi.title = "New Title".to_string();
+        mi.authors = vec!["Ann Author".to_string(), "Bob Writer".to_string()];
+        set_metadata(&path, &mi).unwrap();
+
+        let read_back = get_metadata(std::fs::File::open(&path).unwrap()).unwrap();
+        assert_eq!(read_back.title, "New Title");
+        assert_eq!(read_back.authors, vec!["Ann Author".to_string(), "Bob Writer".to_string()]);
+    }
+
+    /// The trap a naive "replace all dc:identifier" implementation falls
+    /// into: the book's unique id is a `dc:identifier`, and losing it
+    /// makes the EPUB invalid.
+    #[test]
+    fn setting_an_isbn_keeps_the_books_unique_identifier() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = a_book(&dir);
+
+        let mut mi = MetaInformation::default();
+        mi.title = "New Title".to_string();
+        mi.identifiers.insert("isbn".to_string(), "9780441013593".to_string());
+        set_metadata(&path, &mi).unwrap();
+
+        let opf = opf_of(&path);
+        assert!(opf.contains("urn:uuid:11111111-1111-1111-1111-111111111111"), "the unique identifier was lost:\n{opf}");
+        assert!(opf.contains("9780441013593"), "the ISBN was not written:\n{opf}");
+    }
+
+    /// The other trap: regenerating `metadata` wholesale drops the cover
+    /// pointer, so the book silently loses its cover on a title edit.
+    #[test]
+    fn the_cover_pointer_and_calibre_meta_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = a_book(&dir);
+
+        let mut mi = MetaInformation::default();
+        mi.title = "New Title".to_string();
+        set_metadata(&path, &mi).unwrap();
+
+        let opf = opf_of(&path);
+        assert!(opf.contains(r#"name="cover""#), "the cover pointer was lost:\n{opf}");
+        assert!(opf.contains("calibre:series"), "calibre's own metadata was lost:\n{opf}");
+    }
+
+    /// Setting a title must not clear the publisher. The caller is
+    /// setting fields, not declaring the complete set.
+    #[test]
+    fn a_field_the_caller_did_not_set_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = a_book(&dir);
+
+        let mut mi = MetaInformation::default();
+        mi.title = "New Title".to_string();
+        set_metadata(&path, &mi).unwrap();
+
+        let read_back = get_metadata(std::fs::File::open(&path).unwrap()).unwrap();
+        assert_eq!(read_back.publisher.as_deref(), Some("Old Publisher"), "the publisher should have been left as it was");
+    }
+
+    /// Writing metadata must not disturb the rest of the book.
+    #[test]
+    fn the_other_zip_entries_are_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = a_book(&dir);
+        let before: Vec<u8> = {
+            let mut archive = ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+            let mut bytes = Vec::new();
+            archive.by_name("cover.jpg").unwrap().read_to_end(&mut bytes).unwrap();
+            bytes
+        };
+
+        let mut mi = MetaInformation::default();
+        mi.title = "New Title".to_string();
+        set_metadata(&path, &mi).unwrap();
+
+        let mut archive = ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let mut after = Vec::new();
+        archive.by_name("cover.jpg").unwrap().read_to_end(&mut after).unwrap();
+        assert_eq!(after, before, "the cover image should be byte-identical");
+        assert!(archive.by_name("c1.html").is_ok(), "the content should still be there");
+    }
+
+    /// `mimetype` must remain the first entry and stored uncompressed, or
+    /// the file stops being a recognisable EPUB.
+    #[test]
+    fn the_mimetype_entry_stays_first_and_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = a_book(&dir);
+
+        let mut mi = MetaInformation::default();
+        mi.title = "New Title".to_string();
+        set_metadata(&path, &mi).unwrap();
+
+        let mut archive = ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let first = archive.by_index(0).unwrap();
+        assert_eq!(first.name(), "mimetype");
+        assert_eq!(first.compression(), zip::CompressionMethod::Stored, "mimetype must not be deflated");
+    }
+
+    /// Repeated edits must not accumulate duplicate elements.
+    #[test]
+    fn setting_the_title_twice_leaves_one_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = a_book(&dir);
+
+        let mut mi = MetaInformation::default();
+        mi.title = "First".to_string();
+        set_metadata(&path, &mi).unwrap();
+        mi.title = "Second".to_string();
+        set_metadata(&path, &mi).unwrap();
+
+        let opf = opf_of(&path);
+        assert_eq!(opf.matches("<dc:title").count(), 1, "titles accumulated:\n{opf}");
+        assert!(opf.contains("Second"));
+        assert!(!opf.contains("First"));
+    }
+
+    #[test]
+    fn tags_and_languages_are_written_as_repeated_elements() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = a_book(&dir);
+
+        let mut mi = MetaInformation::default();
+        mi.title = "New".to_string();
+        mi.tags = vec!["Science Fiction".to_string(), "Classics".to_string()];
+        mi.languages = vec!["en".to_string()];
+        set_metadata(&path, &mi).unwrap();
+
+        let read_back = get_metadata(std::fs::File::open(&path).unwrap()).unwrap();
+        assert!(read_back.tags.contains(&"Science Fiction".to_string()), "{:?}", read_back.tags);
+        assert!(read_back.tags.contains(&"Classics".to_string()), "{:?}", read_back.tags);
+        assert_eq!(read_back.languages, vec!["en".to_string()], "the old French language should have been replaced");
     }
 }

@@ -143,9 +143,24 @@ impl Xml {
         }];
         let root_id: XmlNodeId = 0;
 
+        // Collected from *every* element, not just the root. An OPF very
+        // commonly declares `xmlns:dc` and `xmlns:opf` on `<metadata>`
+        // rather than on `<package>`, and serialization emits this map on
+        // the root element -- so taking only the root's declarations threw
+        // those away, and any `dc:`/`opf:` name then serialized with a
+        // prefix nothing declared, producing XML that will not re-parse.
+        //
+        // Caveat, deliberately accepted: a document that binds the same
+        // prefix to different URIs in different subtrees collapses to one
+        // binding. Nothing in this project's formats does that, and the
+        // alternative is per-element scope tracking for a case that does
+        // not arise.
         let mut doc_namespaces = IndexMap::new();
-        for ns in doc.root_element().namespaces() {
-            doc_namespaces.insert(ns.name().map(|s| s.to_string()), ns.uri().to_string());
+        for element in doc.descendants().filter(|n| n.is_element()) {
+            for ns in element.namespaces() {
+                let prefix = ns.name().map(|s| s.to_string());
+                doc_namespaces.entry(prefix).or_insert_with(|| ns.uri().to_string());
+            }
         }
 
         for child in doc.root().children() {
@@ -604,7 +619,27 @@ fn convert(
         let namespace = node.tag_name().namespace().map(|s| s.to_string());
         let mut attrs = IndexMap::new();
         for attr in node.attributes() {
-            attrs.insert(attr.name().to_string(), attr.value().to_string());
+            // `attr.name()` is the *local* name: roxmltree drops the
+            // prefix. Storing that loses information, because an
+            // unprefixed attribute is a different attribute -- `role` is
+            // not `opf:role`, and readers that key on `opf:scheme` to find
+            // an ISBN stop finding it. Two attributes differing only by
+            // prefix would also collide in this map.
+            //
+            // So the qualified name is reconstructed from the attribute's
+            // namespace URI and whatever prefix the document declared for
+            // it. An attribute with no namespace keeps its bare name.
+            let qualified = match attr.namespace() {
+                Some(uri) => match node.lookup_prefix(uri) {
+                    Some(prefix) if !prefix.is_empty() => format!("{prefix}:{}", attr.name()),
+                    // Declared as the default namespace, or not declared
+                    // at all. An attribute cannot use the default
+                    // namespace, so there is no prefix to write.
+                    _ => attr.name().to_string(),
+                },
+                None => attr.name().to_string(),
+            };
+            attrs.insert(qualified, attr.value().to_string());
         }
         let sourceline = Some(doc.text_pos_at(node.range().start).row);
         let id = nodes.len();
