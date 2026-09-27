@@ -86,7 +86,13 @@ pub async fn add_book(State(state): State<AppState>, Path((job_id, add_duplicate
     }
     let add_duplicates = add_duplicates == "y" || add_duplicates == "1";
 
-    let tmp_path = std::env::temp_dir().join(format!("cdb-add-book-{}.{}", rand::rng().random::<u64>(), ext));
+    // A temp *directory* holding the file under its real name, rather
+    // than one temp file with a mangled name. `Cache::add_format` now
+    // takes the filename from its source (#893), so a mangled temp name
+    // would land in the library as `cdb-add-book-8134772.pdf`.
+    let tmp_dir = std::env::temp_dir().join(format!("cdb-add-book-{}", rand::rng().random::<u64>()));
+    tokio::fs::create_dir_all(&tmp_dir).await.map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+    let tmp_path = tmp_dir.join(&sanitized);
     tokio::fs::write(&tmp_path, &body).await.map_err(|e| ServerError::InternalServerError(e.to_string()))?;
 
     let result = tokio::task::spawn_blocking({
@@ -122,7 +128,7 @@ pub async fn add_book(State(state): State<AppState>, Path((job_id, add_duplicate
     .await
     .map_err(|e| ServerError::InternalServerError(e.to_string()))??;
 
-    let _ = tokio::fs::remove_file(&tmp_path).await;
+    let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
 
     if let Some(book_id) = result.get("book_id").and_then(|v| v.as_i64()) {
         web_socket::publish(&state, ChangeEvent::BooksAdded { book_ids: vec![book_id as i32] });
@@ -281,6 +287,14 @@ pub struct SetFieldsBody {
 struct AddedFormat {
     ext: String,
     data_url: String,
+    /// The name the file had on the client, if it sent one.
+    ///
+    /// Optional because an older client does not send it. Since #893 a
+    /// format file keeps the name it arrived with, and without this
+    /// there is no name to keep -- the fallback is the book's title,
+    /// which is what every format used to be called.
+    #[serde(default)]
+    name: Option<String>,
 }
 
 fn decode_data_url(data_url: &str) -> Result<Vec<u8>, ServerError> {
@@ -360,8 +374,25 @@ async fn set_fields_handle(state: AppState, book_id: i32, library_id: Option<Str
                 // (`../`) and absolute-path (`/etc/...`) payloads.
                 return Err(ServerError::BadRequest("Format has an invalid extension".to_string()));
             }
-            let tmp_name = format!("cdb-upload-{book_id}-{}.{}", rand::rng().random::<u64>(), ext);
-            let tmp_path = std::env::temp_dir().join(tmp_name);
+            // A temp *directory* holding the file under the name the
+            // client gave it: `add_format` takes the library filename
+            // from its source, so a mangled temp name would land in the
+            // library as `cdb-upload-3-91827364.pdf`.
+            //
+            // `sanitize_file_name` because this is a client-supplied
+            // name being used as a path component. It cannot contain a
+            // separator afterwards, so it cannot escape `tmp_dir` -- and
+            // `add_format` sanitizes again for the library itself.
+            let tmp_dir = std::env::temp_dir().join(format!("cdb-upload-{book_id}-{}", rand::rng().random::<u64>()));
+            std::fs::create_dir_all(&tmp_dir).map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+            let file_name = match fmt.name.as_deref().map(sanitize_file_name).filter(|n| !n.trim().is_empty()) {
+                Some(name) => name,
+                // No name from the client: fall back to the extension
+                // alone, which makes `add_format`'s own title fallback
+                // take over.
+                None => format!("upload.{ext}"),
+            };
+            let tmp_path = tmp_dir.join(&file_name);
             std::fs::write(&tmp_path, &data).map_err(|e| ServerError::InternalServerError(e.to_string()))?;
             let result = tokio::task::spawn_blocking({
                 let cache = cache.clone();
@@ -370,7 +401,7 @@ async fn set_fields_handle(state: AppState, book_id: i32, library_id: Option<Str
             })
             .await
             .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
-            let _ = std::fs::remove_file(&tmp_path);
+            let _ = std::fs::remove_dir_all(&tmp_dir);
             result.map_err(|e| ServerError::InternalServerError(e.to_string()))?;
         }
     }
