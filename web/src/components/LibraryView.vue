@@ -1045,6 +1045,21 @@ async function persistSaveTemplate() {
   }
 }
 
+/**
+ * Opens the library's own folder in the system file browser (#886).
+ *
+ * The Rust side resolves the path from its own state rather than taking
+ * one from here -- see `reveal_library_folder` for why a command that
+ * opened any path it was handed would be the wrong shape.
+ */
+async function revealLibraryFolder() {
+  try {
+    await tauriInvoke<void>("reveal_library_folder");
+  } catch (e) {
+    error.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
 // Rename files (#885). The title of a book and the name of the file
 // holding it are separate things; this changes only the second.
 //
@@ -1433,6 +1448,7 @@ const actionHandlers: Partial<Record<LibraryActionId, () => void>> = {
   },
   "save-to-disk": () => openSaveToDisk(),
   "rename-files": () => void openRenameFiles(),
+  "open-library-folder": () => void revealLibraryFolder(),
 };
 
 // Full-text search replaces the whole result area with a different
@@ -1738,7 +1754,7 @@ const pendingBookAction = ref<{ id: string; nonce: number } | null>(null);
 let actionNonce = 0;
 
 /** Book actions BookDetailsPanel knows how to perform. */
-const PANEL_ACTIONS: LibraryActionId[] = ["read", "edit-metadata", "fetch-metadata", "convert", "tweak-book", "quick-view", "test-template", "send-email", "replace-cover", "cover-from-pdf", "open-externally", "unpack-book", "repack-book"];
+const PANEL_ACTIONS: LibraryActionId[] = ["read", "edit-metadata", "fetch-metadata", "convert", "tweak-book", "quick-view", "test-template", "send-email", "replace-cover", "cover-from-pdf", "open-externally", "open-book-folder", "unpack-book", "repack-book"];
 
 const contextEntries = computed(() => contextMenuEntries([...PANEL_ACTIONS, "similar-books", "mark-books", "polish", "bulk-edit", "save-to-disk", "delete-book"], actionContext.value));
 

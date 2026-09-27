@@ -20,6 +20,8 @@
     "allow-open-book-format",
     "allow-unpack-book",
     "allow-repack-book",
+    "allow-reveal-library-folder",
+    "allow-reveal-book-folder",
     "allow-open-external-url",
     "allow-set-menu-actions",
     "allow-get-auto-reopen",
