@@ -25,14 +25,31 @@ impl CmdEmbedMetadata {
                 .collect()
         };
 
+        let cache = db.as_cache();
         for id in ids {
-            // In the Python code, this calls `db.embed_metadata`.
-            // Currently Library::embed_metadata isn't fully separate, but `backup_metadata_to_opf`
-            // is the closest equivalent for updating the OPF file.
-            // Real embedding into EPUB/MOBI etc would require `calibre_ebooks` support for writing those formats with metadata.
-            // For now, we update the OPF which is a critical part of "embedding" in terms of saving metadata to disk.
+            // The OPF sidecar is still written: it is what `restore`
+            // rebuilds from, and it carries fields no book format has a
+            // place for.
             db.backup_metadata_to_opf(id)?;
-            println!("Processed book id: {}", id);
+
+            // And now the real thing (#834). Formats with no writer yet
+            // are named as skipped rather than passed over in silence --
+            // reporting "Processed book id: 4" while touching none of its
+            // files is what made the old behaviour misleading.
+            match crate::embed::embed_metadata(&cache, id) {
+                Ok(outcomes) if outcomes.is_empty() => println!("Book {id}: no formats to embed into"),
+                Ok(outcomes) => {
+                    for (format, outcome) in outcomes {
+                        match outcome {
+                            crate::embed::FormatOutcome::Embedded => println!("Book {id}: embedded metadata into {format}"),
+                            crate::embed::FormatOutcome::NoWriter => println!("Book {id}: {format} skipped -- no metadata writer for it yet"),
+                            crate::embed::FormatOutcome::FileMissing => println!("Book {id}: {format} skipped -- the file is missing"),
+                            crate::embed::FormatOutcome::Failed(why) => println!("Book {id}: {format} failed -- {why}"),
+                        }
+                    }
+                }
+                Err(e) => println!("Book {id}: could not embed metadata -- {e:#}"),
+            }
         }
         Ok(())
     }

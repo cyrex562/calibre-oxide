@@ -2,6 +2,7 @@ pub mod adding;
 pub mod annotations;
 pub mod backend;
 pub mod backup;
+pub mod embed;
 pub mod book;
 pub mod cache;
 pub mod catalogs;
