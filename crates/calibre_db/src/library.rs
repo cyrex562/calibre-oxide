@@ -796,9 +796,9 @@ mod tests {
             )
             .unwrap();
 
-        // 2. Rename
-        lib.update_book_metadata(book_id, "New Title", "New Author")
-            .unwrap();
+        // 2. Rename. Directly, not via `update_book_metadata`: since
+        // #893 editing metadata no longer moves a book's files.
+        lib.as_cache().rename_book_files(book_id, "New Title", "New Author").unwrap();
 
         // 3. Verify DB Update
         let new_path: String = lib
