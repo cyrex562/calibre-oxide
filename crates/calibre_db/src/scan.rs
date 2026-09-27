@@ -325,6 +325,73 @@ fn relative_to(root: &Path, path: &Path) -> String {
     path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/")
 }
 
+/// What indexing a scan did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct IndexReport {
+    /// Books created from files that were not tracked before.
+    pub added: Vec<i32>,
+    /// Files already claimed by a book — a rescan recognising its own
+    /// earlier work, which is the normal case on every scan after the
+    /// first.
+    pub already_known: usize,
+    /// `(relative path, why)` for files that could not be indexed. One
+    /// bad file does not abandon the rest of the folder.
+    pub failed: Vec<(String, String)>,
+}
+
+/// Creates a book for every discovered file the library does not
+/// already know about.
+///
+/// Each file's own embedded metadata is read here — title, authors, and
+/// for a PDF the cover rendered from page 1. That is the expensive part
+/// of phase one, and it is still far cheaper than hashing: it reads a
+/// header rather than the whole file.
+///
+/// **Does not move or copy anything.** Indexing a folder the user filled
+/// must leave it exactly as it was found.
+///
+/// Grouping several files into one book ([`crate::grouping`]) is not
+/// applied yet: it depends on content hashes, which arrive in the
+/// background pass. Until then each file is its own book, and merging is
+/// something the later pass does rather than something this has to
+/// guess at.
+pub fn index_scan(cache: &crate::cache::Cache, library_path: &Path, report: &ScanReport) -> IndexReport {
+    let mut indexed = IndexReport::default();
+
+    for file in &report.files {
+        match cache.book_for_file(&file.relative_path) {
+            Ok(Some(_)) => {
+                indexed.already_known += 1;
+                continue;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                indexed.failed.push((file.relative_path.clone(), e.to_string()));
+                continue;
+            }
+        }
+
+        let absolute = library_path.join(&file.relative_path);
+        // A file whose metadata cannot be read is still a book. Falling
+        // back to the filename is what the user would do, and refusing
+        // to index it would leave a file sitting in the library that
+        // nothing ever shows.
+        let mut metadata = calibre_ebooks::metadata::get_metadata(&absolute).unwrap_or_default();
+        if metadata.title.trim().is_empty() || metadata.title == "Unknown" {
+            metadata.title = file.stem.clone();
+        }
+        if metadata.authors.is_empty() {
+            metadata.authors = vec!["Unknown".to_string()];
+        }
+
+        match cache.register_book_in_place(&file.relative_path, &metadata) {
+            Ok(id) => indexed.added.push(id),
+            Err(e) => indexed.failed.push((file.relative_path.clone(), e.to_string())),
+        }
+    }
+    indexed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,5 +692,145 @@ mod tests {
         let report = scan(dir.path());
         assert!(report.files.is_empty());
         assert!(report.is_complete());
+    }
+}
+
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+    use crate::cache::Cache;
+
+    fn library() -> (tempfile::TempDir, Cache) {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        (dir, cache)
+    }
+
+    fn write(path: &Path, bytes: &[u8]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn scan_and_index(dir: &Path, cache: &Cache) -> IndexReport {
+        let report = walk(dir, &ScanOptions::default(), SystemTime::now() + Duration::from_secs(3600)).unwrap();
+        index_scan(cache, dir, &report)
+    }
+
+    /// The headline: opening a folder of PDFs populates the library.
+    #[test]
+    fn a_folder_of_books_becomes_a_library() {
+        let (dir, cache) = library();
+        write(&dir.path().join("Boiler Manual.pdf"), b"%PDF-1.4 one");
+        write(&dir.path().join("Receipts/2019 invoice.pdf"), b"%PDF-1.4 two");
+
+        let indexed = scan_and_index(dir.path(), &cache);
+        assert_eq!(indexed.added.len(), 2, "{indexed:?}");
+        assert!(indexed.failed.is_empty(), "{indexed:?}");
+
+        let titles: Vec<String> = indexed.added.iter().map(|id| cache.field_for(*id, "title").unwrap().unwrap()).collect();
+        assert!(titles.contains(&"Boiler Manual".to_string()), "{titles:?}");
+        assert!(titles.contains(&"2019 invoice".to_string()), "{titles:?}");
+    }
+
+    /// **Nothing moves.** Indexing a folder somebody else filled must
+    /// leave it exactly as it was found -- this is the property the whole
+    /// tracked model rests on.
+    #[test]
+    fn indexing_does_not_move_or_copy_a_single_file() {
+        let (dir, cache) = library();
+        let original = dir.path().join("Receipts/2019 invoice.pdf");
+        write(&original, b"%PDF-1.4 content");
+
+        scan_and_index(dir.path(), &cache);
+
+        assert!(original.exists(), "the file moved");
+        assert_eq!(std::fs::read(&original).unwrap(), b"%PDF-1.4 content");
+        // No author/title tree was created beside it.
+        let top: Vec<String> = std::fs::read_dir(dir.path()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert!(top.iter().all(|n| n == "Receipts" || n == "metadata.db" || n.starts_with(".calibre-oxide") || n.starts_with("metadata.db-")), "unexpected entries: {top:?}");
+    }
+
+    #[test]
+    fn a_books_recorded_location_matches_where_the_file_actually_is() {
+        let (dir, cache) = library();
+        write(&dir.path().join("Receipts/2019 invoice.pdf"), b"%PDF");
+
+        let id = scan_and_index(dir.path(), &cache).added[0];
+        assert_eq!(cache.field_for(id, "path").unwrap().as_deref(), Some("Receipts"));
+        assert_eq!(cache.format_file_stem(id).unwrap().as_deref(), Some("2019 invoice"));
+
+        // And the book resolves to a file that is really there.
+        let row = cache.get_data_as_dict(None, false, None, false).unwrap()[0].clone();
+        let served = row["fmt_pdf"].as_str().expect("the format should resolve");
+        assert_eq!(Path::new(served), dir.path().join("Receipts/2019 invoice.pdf"));
+    }
+
+    /// Scanning twice must not double the library -- the normal case on
+    /// every open after the first.
+    #[test]
+    fn a_second_scan_recognises_what_the_first_one_indexed() {
+        let (dir, cache) = library();
+        write(&dir.path().join("a.pdf"), b"%PDF one");
+        write(&dir.path().join("b.pdf"), b"%PDF two");
+
+        let first = scan_and_index(dir.path(), &cache);
+        assert_eq!(first.added.len(), 2);
+
+        let second = scan_and_index(dir.path(), &cache);
+        assert!(second.added.is_empty(), "{second:?}");
+        assert_eq!(second.already_known, 2);
+        assert_eq!(cache.all_book_ids().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_file_added_later_is_picked_up_without_re_adding_the_rest() {
+        let (dir, cache) = library();
+        write(&dir.path().join("a.pdf"), b"%PDF one");
+        scan_and_index(dir.path(), &cache);
+
+        write(&dir.path().join("b.pdf"), b"%PDF two");
+        let second = scan_and_index(dir.path(), &cache);
+
+        assert_eq!(second.added.len(), 1);
+        assert_eq!(second.already_known, 1);
+    }
+
+    /// Two files with the same name in different folders are different
+    /// books -- the lookup is on the whole location, not the filename.
+    #[test]
+    fn the_same_filename_in_two_folders_is_two_books() {
+        let (dir, cache) = library();
+        write(&dir.path().join("a/scan0001.pdf"), b"%PDF one");
+        write(&dir.path().join("b/scan0001.pdf"), b"%PDF two");
+
+        let indexed = scan_and_index(dir.path(), &cache);
+        assert_eq!(indexed.added.len(), 2, "{indexed:?}");
+    }
+
+    /// A file with no readable metadata is still a book: refusing would
+    /// leave it sitting in the library with nothing showing it.
+    #[test]
+    fn a_file_with_unreadable_metadata_is_titled_from_its_name() {
+        let (dir, cache) = library();
+        write(&dir.path().join("not really a pdf.pdf"), b"this is not a PDF at all");
+
+        let indexed = scan_and_index(dir.path(), &cache);
+        assert_eq!(indexed.added.len(), 1, "{indexed:?}");
+        assert_eq!(cache.field_for(indexed.added[0], "title").unwrap().as_deref(), Some("not really a pdf"));
+    }
+
+    #[test]
+    fn an_empty_folder_indexes_nothing() {
+        let (dir, cache) = library();
+        assert_eq!(scan_and_index(dir.path(), &cache), IndexReport::default());
+    }
+
+    #[test]
+    fn registering_a_file_that_is_not_there_is_an_error() {
+        let (_dir, cache) = library();
+        let meta = calibre_ebooks::metadata::MetaInformation::default();
+        assert!(cache.register_book_in_place("nope.pdf", &meta).is_err());
     }
 }
