@@ -18,6 +18,7 @@ mod device_monitor;
 pub mod errors;
 pub mod extra_files;
 pub mod field_metadata;
+pub mod drift;
 pub mod fields;
 pub mod formatter_functions;
 pub mod fts;
