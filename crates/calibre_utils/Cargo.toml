@@ -5,6 +5,9 @@ edition = "2021"
 
 license.workspace = true
 [dependencies]
+# Argument parsing for the `calibre-smtp` console tool (#813). In
+# `[dependencies]`, not dev: it is used by a real binary target.
+clap = { version = "4.4", features = ["derive"] }
 lazy_static = "1.4"
 directories = "5.0"
 log = "0.4"
