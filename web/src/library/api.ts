@@ -523,8 +523,22 @@ export interface DuplicateBook {
   authors: string[];
 }
 
-export function scanForDuplicates(): Promise<{ groups: DuplicateBook[][] }> {
-  return jsonFetch<{ groups: DuplicateBook[][] }>("/duplicates/scan/default", { method: "POST" });
+/**
+ * Why a group was reported (#892).
+ *
+ * `content` means the books hold a byte-identical file, which is
+ * strictly stronger evidence than matching metadata and needs no
+ * metadata to have been filled in at all.
+ */
+export type DuplicateReason = "content" | "metadata";
+
+export interface DuplicateGroup {
+  books: DuplicateBook[];
+  reason: DuplicateReason;
+}
+
+export function scanForDuplicates(): Promise<{ groups: DuplicateGroup[] }> {
+  return jsonFetch<{ groups: DuplicateGroup[] }>("/duplicates/scan/default", { method: "POST" });
 }
 
 // Real, new routes -- see crates/calibre_srv/src/news_scheduler.rs's

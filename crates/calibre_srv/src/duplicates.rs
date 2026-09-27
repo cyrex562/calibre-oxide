@@ -43,18 +43,31 @@ pub async fn scan(State(state): State<AppState>, AxumPath(library_id): AxumPath<
     let cache = state.cache_for(Some(&library_id)).ok_or_else(|| ServerError::NotFound(format!("no library named {library_id:?}")))?;
 
     let groups = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Value>> {
-        let raw_groups = copy_to_library::scan_library_for_duplicates(&cache)?;
-        raw_groups
+        // Both kinds (#892). Content-identical files are reported as
+        // well as title/author matches, which fixes both of the
+        // metadata-only comparison's blind spots: it missed identical
+        // files whose metadata was entered differently, and it paired
+        // genuinely different books that happened to share a title.
+        copy_to_library::scan_library_for_all_duplicates(&cache)?
             .into_iter()
-            .map(|ids| -> anyhow::Result<Value> {
-                let books: anyhow::Result<Vec<Value>> = ids
-                    .into_iter()
-                    .map(|id| {
+            .map(|group| -> anyhow::Result<Value> {
+                let books: anyhow::Result<Vec<Value>> = group
+                    .book_ids
+                    .iter()
+                    .map(|&id| {
                         let (title, authors) = copy_to_library::book_title_and_authors(&cache, id)?;
                         Ok(json!({"book_id": id, "title": title, "authors": authors}))
                     })
                     .collect();
-                Ok(json!(books?))
+                let reason = match group.kind {
+                    copy_to_library::DuplicateKind::Content => "content",
+                    copy_to_library::DuplicateKind::Metadata => "metadata",
+                };
+                // A shape change: each group was a bare array of books
+                // and is now an object. The only client is this repo's
+                // own frontend, updated in the same commit -- worth
+                // noting rather than pretending it is compatible.
+                Ok(json!({"books": books?, "reason": reason}))
             })
             .collect()
     })
@@ -73,9 +86,13 @@ mod tests {
 
     use calibre_db::cache::Cache;
 
+    /// Each book gets **distinct** content. The fixture used to write
+    /// `b"content"` for every book, which the content-based scan added in
+    /// #892 correctly reports as duplicates -- two byte-identical files
+    /// are duplicates, whatever their metadata says.
     fn add_book(dir: &std::path::Path, cache: &Cache, name: &str, title: &str, authors: &[&str]) -> i32 {
         let source = dir.join(name);
-        std::fs::write(&source, b"content").unwrap();
+        std::fs::write(&source, format!("content of {name}")).unwrap();
         let mut meta = calibre_ebooks::metadata::MetaInformation::default();
         meta.title = title.to_string();
         meta.authors = authors.iter().map(|s| s.to_string()).collect();
@@ -130,10 +147,36 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         let groups = body["groups"].as_array().unwrap();
         assert_eq!(groups.len(), 1, "{body}");
-        let ids: Vec<i64> = groups[0].as_array().unwrap().iter().map(|b| b["book_id"].as_i64().unwrap()).collect();
+        let ids: Vec<i64> = groups[0]["books"].as_array().unwrap().iter().map(|b| b["book_id"].as_i64().unwrap()).collect();
         assert!(ids.contains(&(a as i64)));
         assert!(ids.contains(&(b as i64)));
-        assert_eq!(groups[0][0]["title"], "The Great Test");
+        assert_eq!(groups[0]["books"][0]["title"], "The Great Test");
+        // Different files, same title and author -- so the reason is
+        // metadata, and the UI can say so rather than implying the
+        // stronger claim.
+        assert_eq!(groups[0]["reason"], "metadata");
+    }
+
+    /// The blind spot metadata comparison has: the same file under two
+    /// different titles was invisible before #892.
+    #[tokio::test]
+    async fn two_byte_identical_books_are_reported_as_a_content_duplicate() {
+        let (_dir, router, ()) = test_app_with(|dir, cache| {
+            for name in ["a.txt", "b.txt"] {
+                let source = dir.join(name);
+                std::fs::write(&source, b"exactly the same bytes").unwrap();
+                let mut meta = calibre_ebooks::metadata::MetaInformation::default();
+                meta.title = format!("Title for {name}");
+                meta.authors = vec!["Whoever".to_string()];
+                cache.add_book(&source, &meta).unwrap();
+            }
+        });
+
+        let (status, body) = post_json(&router, "/duplicates/scan/default").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let groups = body["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 1, "{body}");
+        assert_eq!(groups[0]["reason"], "content");
     }
 
     #[tokio::test]

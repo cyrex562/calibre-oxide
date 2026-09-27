@@ -334,6 +334,51 @@ impl ChecksumStore {
         Ok(out)
     }
 
+    /// Every set of books holding a byte-identical file, as
+    /// `(hash, book ids)`.
+    ///
+    /// One `GROUP BY` rather than a hash lookup per book: a library-wide
+    /// duplicate scan asks this once, and doing it per book would be a
+    /// query per book for an answer the database can produce in a single
+    /// pass.
+    ///
+    /// `kind` selects what is compared -- `"format"` for book files,
+    /// `"cover"` for cover images. Comparing across kinds would pair a
+    /// book whose cover happens to match another book's format file,
+    /// which is meaningless.
+    pub fn books_sharing_content(&self, kind: &str) -> Result<Vec<(String, Vec<i32>)>, ChecksumError> {
+        self.initialize()?;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT blake3_hex, book_id FROM checksums_db.file_checksums
+             WHERE kind = ?1
+               AND blake3_hex IN (
+                   SELECT blake3_hex FROM checksums_db.file_checksums
+                   WHERE kind = ?1 GROUP BY blake3_hex HAVING COUNT(DISTINCT book_id) > 1
+               )
+             ORDER BY blake3_hex, book_id",
+        )?;
+        let rows = stmt.query_map([kind], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?)))?;
+
+        let mut groups: Vec<(String, Vec<i32>)> = Vec::new();
+        for row in rows {
+            let (hash, book_id) = row?;
+            match groups.last_mut() {
+                Some((current, ids)) if *current == hash => {
+                    // A book with two formats of identical content
+                    // appears twice for one hash; it is one book, not a
+                    // duplicate of itself.
+                    if !ids.contains(&book_id) {
+                        ids.push(book_id);
+                    }
+                }
+                _ => groups.push((hash, vec![book_id])),
+            }
+        }
+        groups.retain(|(_, ids)| ids.len() > 1);
+        Ok(groups)
+    }
+
     /// Whether any recorded file has this content.
     ///
     /// Cheaper than [`ChecksumStore::find_by_hash`] when the answer is

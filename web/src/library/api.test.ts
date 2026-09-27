@@ -550,14 +550,18 @@ describe("saveToDisk", () => {
 
 describe("scanForDuplicates", () => {
   it("posts to the real single-library route and returns the parsed groups", async () => {
-    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ groups: [[{ book_id: 1, title: "A", authors: ["X"] }, { book_id: 2, title: "A", authors: ["X"] }]] }) });
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ groups: [{ books: [{ book_id: 1, title: "A", authors: ["X"] }, { book_id: 2, title: "A", authors: ["X"] }], reason: "content" }] }),
+    });
     vi.stubGlobal("fetch", fetchMock);
 
     const { groups } = await scanForDuplicates();
 
     expect(fetchMock).toHaveBeenCalledWith("/duplicates/scan/default", { method: "POST" });
     expect(groups).toHaveLength(1);
-    expect(groups[0]).toHaveLength(2);
+    expect(groups[0].books).toHaveLength(2);
+    expect(groups[0].reason).toBe("content");
   });
 });
 

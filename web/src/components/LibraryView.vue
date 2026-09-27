@@ -12,7 +12,7 @@ import PolishDialog from "./PolishDialog.vue";
 import HelpDialog from "./HelpDialog.vue";
 import { LAYOUT_KEY, type LayoutPrefs, type Panel, parseLayout, resizedWidth } from "../library/layout";
 import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchLibraryInfo, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameFiles, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
-import type { CheckLibraryResult, CustomRecipeOptions, DuplicateBook, NewsFeedInput, NewsSchedule, SaveToDiskResult } from "../library/api";
+import type { CheckLibraryResult, CustomRecipeOptions, DuplicateGroup, NewsFeedInput, NewsSchedule, SaveToDiskResult } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
 import { similarBooksQuery } from "../library/query";
 import { pathFromLibraryId, recentLibraryEntries } from "../library/recentLibraries";
@@ -1167,7 +1167,7 @@ async function runSaveToDisk() {
 const duplicatesOpen = ref(false);
 const duplicatesLoading = ref(false);
 const duplicatesError = ref<string | null>(null);
-const duplicateGroups = ref<DuplicateBook[][]>([]);
+const duplicateGroups = ref<DuplicateGroup[]>([]);
 
 async function openDuplicates() {
   duplicatesOpen.value = true;
@@ -1186,7 +1186,7 @@ async function openDuplicates() {
 async function deleteDuplicateBook(bookId: number) {
   if (!confirm(`Delete book ${bookId}? This cannot be undone.`)) return;
   await deleteBooks([bookId]);
-  duplicateGroups.value = duplicateGroups.value.map((g) => g.filter((b) => b.book_id !== bookId)).filter((g) => g.length > 1);
+  duplicateGroups.value = duplicateGroups.value.map((g) => ({ ...g, books: g.books.filter((b) => b.book_id !== bookId) })).filter((g) => g.books.length > 1);
   cacheBust.value++;
   await runSearch();
 }
@@ -2544,9 +2544,17 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
           <template v-else>
             <p v-if="duplicateGroups.length === 0" class="news-hint">No likely duplicates found.</p>
             <div v-for="(group, i) in duplicateGroups" :key="i">
-              <h4>Group {{ i + 1 }} ({{ group.length }} books)</h4>
+              <!--
+                Saying *why* matters: an identical file is a safe delete,
+                while a title/author match may be two genuinely different
+                books that happen to share a title.
+              -->
+              <h4>
+                Group {{ i + 1 }} ({{ group.books.length }} books) —
+                {{ group.reason === "content" ? "identical files" : "same title and author" }}
+              </h4>
               <ul class="manage-list">
-                <li v-for="b in group" :key="b.book_id">
+                <li v-for="b in group.books" :key="b.book_id">
                   <button type="button" @click="selectedBookId = b.book_id">{{ b.title }} — {{ b.authors.join(", ") }}</button>
                   <button type="button" @click="deleteDuplicateBook(b.book_id)">Delete</button>
                 </li>
