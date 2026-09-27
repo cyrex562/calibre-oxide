@@ -1,9 +1,27 @@
+//! `.pdb` input: dispatches on the container's identity (#926).
+//!
+//! A Palm database is a **container**, not a format — the same extension
+//! carries PalmDoc, eReader/PML, zTXT, Plucker, Haodoo and embedded PDF,
+//! distinguished only by the 8-byte type+creator pair in the header. So
+//! this reads that pair and routes, the way
+//! `calibre.ebooks.pdb.input.PDBInput` does through `get_reader`.
+//!
+//! It previously did not look at the identity at all: it wrote every
+//! record out as `record_N.bin` and built an HTML page listing them with
+//! hex previews. That produced no error, so a user converting a Palm book
+//! got a page of byte counts and no indication anything had gone wrong —
+//! and the real PML converter sat unregistered beside it. Silent wrong
+//! output is worse than a refusal, which is why an unsupported identity
+//! is now an error that names the format.
+//!
+//! eReader/PML and embedded PDF are dispatched to real readers. zTXT,
+//! Plucker and Haodoo are recognised and refused by name -- no reader for
+//! them exists in this tree yet, and saying so beats guessing.
+
 use crate::oeb::book::OEBBook;
-use crate::oeb::container::DirContainer;
-use crate::oeb::manifest::ManifestItem;
+use crate::pdb::identity::{format_for, identity_of, PdbFormat};
 use crate::pdb::reader::PdbReader;
-use anyhow::{Context, Result};
-use std::fs;
+use anyhow::{bail, Context, Result};
 use std::path::Path;
 
 pub struct PDBInput;
@@ -14,64 +32,57 @@ impl PDBInput {
     }
 
     pub fn convert(&self, input_path: &Path, output_dir: &Path) -> Result<OEBBook> {
-        fs::create_dir_all(output_dir)?;
+        std::fs::create_dir_all(output_dir)?;
 
-        let mut reader = PdbReader::new(input_path).context("Failed to open PDB")?;
+        let identity = {
+            let reader = PdbReader::new(input_path).context("Failed to open PDB")?;
+            identity_of(&reader.header)
+        };
 
-        let header = reader.header.clone();
-        let num_records = header.num_records;
+        match format_for(&identity) {
+            // eReader's text is PML, which is what `PMLInput` reads. It
+            // stays a separate module rather than being inlined, because
+            // it is a real format reader in its own right; this is the
+            // dispatch upstream performs through `FORMAT_READERS`.
+            Some(PdbFormat::EReader) => crate::input::pml_input::PMLInput::new().convert(input_path, output_dir),
 
-        let mut content = String::new();
-        content.push_str("<html><body><h1>PDB Records</h1><ul>");
-
-        // Dump records to files
-        for i in 0..num_records {
-            if let Ok(data) = reader.read_record(i as usize) {
-                let filename = format!("record_{}.bin", i);
-                let filepath = output_dir.join(&filename);
-                fs::write(&filepath, &data)?;
-
-                // Try to treat as text for the index page
-                let text_preview = String::from_utf8_lossy(&data);
-                let preview_short = if text_preview.len() > 100 {
-                    &text_preview[..100]
-                } else {
-                    &text_preview
-                };
-
-                content.push_str(&format!(
-                    "<li><b>Record {}:</b> {} bytes - Preview: {}...</li>",
-                    i,
-                    data.len(),
-                    html_escape::encode_text(preview_short)
-                ));
+            // A `.pdb` can carry a whole PDF. The records concatenate
+            // back into one, which the real PDF input then handles.
+            // Reassembled here rather than through `pdb::pdf::Reader`
+            // because that type's `extract_content` discards the
+            // `OEBBook` its own `PDFInput` call produces, and this
+            // function has to return one.
+            Some(PdbFormat::Pdf) => {
+                let mut file = std::fs::File::open(input_path)?;
+                let header = crate::pdb::header::PdbHeader::parse(&mut file)?;
+                let mut pdf_bytes = Vec::new();
+                for i in 0..header.records.len() {
+                    pdf_bytes.extend_from_slice(&header.section_data(&mut file, i)?);
+                }
+                let staging = tempfile::Builder::new().suffix(".pdf").tempfile()?;
+                std::fs::write(staging.path(), &pdf_bytes).context("writing the reassembled PDF")?;
+                crate::input::pdf_input::PDFInput::new().convert(staging.path(), output_dir).context("converting the PDF carried inside the Palm database")
             }
+
+            // Named individually rather than lumped into one message: a
+            // person who knows their book is a zTXT can tell that this
+            // recognised the format and has not implemented it, which is
+            // a different problem from a corrupt file.
+            Some(other) => bail!(
+                "this is a {} Palm database ({identity}), which is recognised but not yet supported — eReader/PML and embedded-PDF .pdb files convert today",
+                other.name()
+            ),
+
+            None => bail!(
+                "{} is not a Palm database this can read: its type/creator identity is {identity:?}, which matches no known format",
+                input_path.display()
+            ),
         }
-        content.push_str("</ul></body></html>");
+    }
+}
 
-        let content_filename = "index.html";
-        let content_path = output_dir.join(content_filename);
-        fs::write(&content_path, &content)?;
-
-        // Build OEBBook
-        let container = Box::new(DirContainer::new(output_dir));
-        let mut book = OEBBook::new(container);
-
-        let id = "content".to_string();
-        let href = content_filename.to_string();
-
-        book.manifest.items.insert(
-            id.clone(),
-            ManifestItem::new(&id, &href, "application/xhtml+xml"),
-        );
-        book.manifest.hrefs.insert(href.clone(), id.clone());
-        book.spine.add(&id, true);
-
-        // Metadata from PDB Header
-        let name = header.name.clone();
-        book.metadata.add("title", &name);
-        book.metadata.add("creator", "Unknown"); // PDB header doesn't have author field in standard part
-
-        Ok(book)
+impl Default for PDBInput {
+    fn default() -> Self {
+        Self::new()
     }
 }
