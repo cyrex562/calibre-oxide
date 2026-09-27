@@ -177,6 +177,130 @@ impl Cache {
         crate::checksums::ChecksumStore::new(self.backend.conn.clone(), &self.backend.library_path)
     }
 
+    // ---------------------------------------------------------------
+    // The change log (#901): every durable metadata write appends
+    // before it touches SQL.
+    // ---------------------------------------------------------------
+    //
+    // The log is the library's authority and `metadata.db` is a cache
+    // rebuilt from it, so a write that reaches the database without
+    // reaching the log is invisible to a rebuild -- it is data loss
+    // that only shows up much later, when someone recovers from a
+    // corrupt database and finds an edit missing. That is why these go
+    // through one helper rather than each write path calling the log
+    // itself.
+
+    /// Appends `op` to the change log, unless a replay is feeding us
+    /// changes that are already in it.
+    ///
+    /// A failure to append is logged and swallowed rather than failing
+    /// the write. The alternative -- refusing to edit metadata because
+    /// history could not be recorded -- makes an unwritable log
+    /// directory into an unusable library, and the database write that
+    /// follows is still perfectly good. `ChangeLog::verify` and the
+    /// rebuild path are where a damaged log is meant to surface.
+    fn record(&self, op: crate::change_log::ChangeOp) {
+        if self.backend.is_replaying() {
+            return;
+        }
+        match self.backend.change_log() {
+            Ok(log) => {
+                if let Err(e) = log.append(op) {
+                    log::warn!("could not record a change in the library log: {e}");
+                }
+            }
+            Err(e) => log::warn!("could not open the library change log: {e}"),
+        }
+    }
+
+    /// Convenience for the common case: look up the book's uuid and
+    /// record an op built from it. Does nothing if the book has no
+    /// uuid, which means it does not exist.
+    fn record_for_book(&self, book_id: i32, build: impl FnOnce(String) -> crate::change_log::ChangeOp) {
+        match self.book_uuid(book_id) {
+            Ok(Some(uuid)) => self.record(build(uuid)),
+            Ok(None) => log::warn!("no uuid for book {book_id}; change not recorded"),
+            Err(e) => log::warn!("could not read the uuid for book {book_id}: {e}"),
+        }
+    }
+
+    /// A book's uuid -- the only identifier that means the same thing
+    /// on two machines, since `books.id` is a local autoincrement.
+    pub fn book_uuid(&self, book_id: i32) -> anyhow::Result<Option<String>> {
+        let conn = self.backend.conn.lock().unwrap();
+        Ok(conn.query_row("SELECT uuid FROM books WHERE id = ?1", (book_id,), |row| row.get::<_, Option<String>>(0)).ok().flatten())
+    }
+
+    /// The reverse: which local book, if any, a uuid refers to.
+    pub fn book_id_for_uuid(&self, uuid: &str) -> anyhow::Result<Option<i32>> {
+        let conn = self.backend.conn.lock().unwrap();
+        Ok(conn.query_row("SELECT id FROM books WHERE uuid = ?1", (uuid,), |row| row.get::<_, i32>(0)).ok())
+    }
+
+    /// Creates a bare book row carrying `uuid`, for replay.
+    ///
+    /// The schema's `books_insert_trg` overwrites `uuid` on every
+    /// insert (matching real calibre), so it is set by a follow-up
+    /// UPDATE -- the same workaround `add_book_db_entry` already needs,
+    /// and for the same reason.
+    pub fn insert_book_with_uuid(&self, uuid: &str) -> anyhow::Result<i32> {
+        let conn = self.backend.conn.lock().unwrap();
+        conn.execute("INSERT INTO books (title, author_sort, path, has_cover, series_index) VALUES ('Unknown', '', '', 0, 1.0)", ())?;
+        let id = conn.last_insert_rowid() as i32;
+        conn.execute("UPDATE books SET uuid = ?1 WHERE id = ?2", (uuid, id))?;
+        Ok(id)
+    }
+
+    /// Sets a book's folder, relative to the library root.
+    ///
+    /// Separate from [`Cache::set_field`], which deliberately refuses
+    /// `path`: that guard exists because `path` is where a book's files
+    /// live, not a metadata field a user edits, and letting it through
+    /// the general field writer would make a typo in a bulk edit move
+    /// books. Replay needs to write it anyway, so it gets a named door
+    /// rather than a hole in the guard.
+    pub fn set_book_path(&self, book_id: i32, rel_path: &str) -> anyhow::Result<()> {
+        let conn = self.backend.conn.lock().unwrap();
+        conn.execute("UPDATE books SET path = ?1 WHERE id = ?2", (rel_path, book_id))?;
+        Ok(())
+    }
+
+    /// Writes a `data` row without touching the filesystem.
+    ///
+    /// Replay's counterpart to [`Cache::add_format`], which copies a
+    /// file in as well. Rebuilding an index must not move anybody's
+    /// files around.
+    pub fn record_format_row(&self, book_id: i32, format: &str, name: &str, size: i64, hash: Option<&str>) -> anyhow::Result<()> {
+        {
+            let conn = self.backend.conn.lock().unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO data (book, format, uncompressed_size, name) VALUES (?1, ?2, ?3, ?4)",
+                (book_id, format.to_uppercase(), size, name),
+            )?;
+        }
+        if let Some(hash) = hash {
+            self.checksums().record_hash(book_id, "format", &format.to_uppercase(), hash, size)?;
+        }
+        Ok(())
+    }
+
+    /// Drops a `data` row without touching the filesystem -- replay's
+    /// counterpart to [`Cache::remove_format`].
+    pub fn forget_format_row(&self, book_id: i32, format: &str) -> anyhow::Result<()> {
+        let conn = self.backend.conn.lock().unwrap();
+        conn.execute("DELETE FROM data WHERE book = ?1 AND format = ?2", (book_id, format.to_uppercase()))?;
+        Ok(())
+    }
+
+    /// Rebuilds this library's tables from its change log.
+    ///
+    /// The recovery path the whole design rests on: `metadata.db` is a
+    /// cache, so losing it costs a rebuild rather than the library.
+    pub fn rebuild_from_change_log(&self) -> anyhow::Result<crate::change_log::ReplayReport> {
+        let log = self.backend.change_log()?;
+        crate::change_log::replay_into(self, &log)
+    }
+
     /// `SELECT total_changes()` -- SQLite's built-in running count of
     /// every row inserted/updated/deleted on this connection since it
     /// was opened (a real SQL function, not just a C API -- no extra
@@ -496,6 +620,27 @@ impl Cache {
         }
 
         tx.commit()?;
+        drop(conn);
+
+        // Recorded as an add plus a field write per column, rather than
+        // one fat op carrying the whole row. It keeps replay to a single
+        // `set_field` path, and it means a later edit to any one of
+        // these fields supersedes just that one during compaction.
+        if let Some(uuid) = self.book_uuid(book_id)? {
+            self.record(crate::change_log::ChangeOp::BookAdded { book: uuid.clone() });
+            let fields: Vec<(&str, String)> = vec![
+                ("title", metadata.title.clone()),
+                ("author_sort", author_name.to_string()),
+                ("path", rel_path.to_string()),
+                ("series_index", metadata.series_index.to_string()),
+            ];
+            for (field, value) in fields {
+                self.record(crate::change_log::ChangeOp::FieldSet { book: uuid.clone(), field: field.to_string(), value: Some(value) });
+            }
+            if !metadata.authors.is_empty() {
+                self.record(crate::change_log::ChangeOp::FieldSet { book: uuid, field: "authors".to_string(), value: Some(metadata.authors.join(" & ")) });
+            }
+        }
         Ok(book_id)
     }
 
@@ -565,6 +710,9 @@ impl Cache {
             (book_id, format.to_uppercase(), size, &stem),
         )?;
         drop(conn);
+
+        let (format_name, stem_name) = (format.to_uppercase(), stem.clone());
+        self.record_for_book(book_id, |book| crate::change_log::ChangeOp::FormatSet { book, format: format_name, name: stem_name, size, hash: Some(hash) });
         Ok(true)
     }
 
@@ -645,12 +793,16 @@ impl Cache {
         self.checksums()
             .remove(book_id, "format", &fmt.to_uppercase())?;
 
-        let conn = self.backend.conn.lock().unwrap();
-        conn.execute(
-            "DELETE FROM data WHERE book = ?1 AND format = ?2",
-            (book_id, fmt.to_uppercase()),
-        )?;
-        drop(conn);
+        {
+            let conn = self.backend.conn.lock().unwrap();
+            conn.execute(
+                "DELETE FROM data WHERE book = ?1 AND format = ?2",
+                (book_id, fmt.to_uppercase()),
+            )?;
+        }
+
+        let format = fmt.to_uppercase();
+        self.record_for_book(book_id, |book| crate::change_log::ChangeOp::FormatRemoved { book, format });
         Ok(())
     }
 
@@ -659,10 +811,17 @@ impl Cache {
     /// for it) and its on-disk folder.
     pub fn delete_book(&self, book_id: i32) -> anyhow::Result<()> {
         let path_rel = self.field_for(book_id, "path")?;
+        // Read before the row is deleted: afterwards there is no uuid
+        // to record the removal against, and an unrecorded removal
+        // comes back on the next rebuild.
+        let uuid = self.book_uuid(book_id)?;
         self.checksums().remove_all_for_book(book_id)?;
         {
             let conn = self.backend.conn.lock().unwrap();
             conn.execute("DELETE FROM books WHERE id = ?1", (book_id,))?;
+        }
+        if let Some(uuid) = uuid {
+            self.record(crate::change_log::ChangeOp::BookRemoved { book: uuid });
         }
         if let Some(rel_path) = path_rel {
             if !rel_path.is_empty() {
@@ -985,9 +1144,18 @@ impl Cache {
                 handle.rename_atomic(&old_path, &new_path)?;
             }
 
-            let conn = self.backend.conn.lock().unwrap();
-            conn.execute("UPDATE data SET name = ?1 WHERE book = ?2 AND format = ?3", (&new_stem, book_id, &format))?;
-            drop(conn);
+            {
+                let conn = self.backend.conn.lock().unwrap();
+                conn.execute("UPDATE data SET name = ?1 WHERE book = ?2 AND format = ?3", (&new_stem, book_id, &format))?;
+            }
+
+            // A rename is "this format is now this file", which is the
+            // same statement `FormatSet` already makes -- one op for
+            // both is what keeps `data.name` and the file on disk from
+            // drifting the way they did before #885.
+            let size = std::fs::metadata(&new_path).map(|m| m.len() as i64).unwrap_or(0);
+            let (format_name, stem) = (format.clone(), new_stem.clone());
+            self.record_for_book(book_id, |book| crate::change_log::ChangeOp::FormatSet { book, format: format_name, name: stem, size, hash: None });
             renamed.push(format);
         }
 
@@ -1683,6 +1851,16 @@ impl Cache {
     /// - No dirtying/notification, no composite-field recalculation
     ///   (e.g. setting `authors` does not recompute `author_sort`).
     pub fn set_field(&self, book_id: i32, field: &str, value: &str) -> anyhow::Result<()> {
+        self.set_field_inner(book_id, field, value)?;
+        // Recorded after the write, not before: a change that was
+        // logged and then failed to apply would come back on the next
+        // rebuild as an edit the user never successfully made.
+        let (field, value) = (field.to_string(), value.to_string());
+        self.record_for_book(book_id, |book| crate::change_log::ChangeOp::FieldSet { book, field, value: Some(value) });
+        Ok(())
+    }
+
+    fn set_field_inner(&self, book_id: i32, field: &str, value: &str) -> anyhow::Result<()> {
         match field {
             "title" | "sort" | "uuid" if value.is_empty() => {
                 // Matches upstream: these three fields silently no-op

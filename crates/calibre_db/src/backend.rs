@@ -74,6 +74,7 @@ use serde_json::Value as JsonValue;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -229,6 +230,31 @@ pub struct Backend {
     /// only ever acquired the first time something actually needs to
     /// write. See [`Backend::write_handle`].
     write_handle: Arc<Mutex<Option<Arc<crate::library_handle::LibraryHandle>>>>,
+    /// The library's authoritative change log (#899), lazily opened and
+    /// shared across every clone of this `Backend` for the same reason
+    /// the write handle is -- and one more: the log holds this
+    /// install's next sequence number, so two `ChangeLog` values over
+    /// one library in one process would both hand out the same number
+    /// and each overwrite the other's entry.
+    change_log: Arc<Mutex<Option<Arc<crate::change_log::ChangeLog>>>>,
+    /// Set while a replay is applying changes, so the write paths that
+    /// normally append to the log do not append what they are being
+    /// fed. Without it, rebuilding the database would double every
+    /// entry in the log it was rebuilt from.
+    replaying: Arc<AtomicBool>,
+}
+
+/// Suppresses change-log appends for as long as it is alive.
+///
+/// A guard rather than a pair of set/clear calls: a flag left set is
+/// silently no longer recording history, which is the worst failure
+/// this system can have and the hardest to notice.
+pub struct ReplayGuard(Arc<AtomicBool>);
+
+impl Drop for ReplayGuard {
+    fn drop(&mut self) {
+        self.0.store(false, AtomicOrdering::SeqCst);
+    }
 }
 
 impl Backend {
@@ -327,6 +353,8 @@ impl Backend {
             #[allow(deprecated)]
             prefs: HashMap::new(),
             write_handle: Arc::new(Mutex::new(None)),
+            change_log: Arc::new(Mutex::new(None)),
+            replaying: Arc::new(AtomicBool::new(false)),
         };
 
         // Port of `DB.__init__`'s `self.library_id` access: "Guarantee
@@ -399,6 +427,39 @@ impl Backend {
         )?);
         *guard = Some(Arc::clone(&handle));
         Ok(handle)
+    }
+
+    /// The library's change log, opened on first use and shared with
+    /// every clone of this `Backend`.
+    ///
+    /// Lazy for the same reason [`Backend::write_handle`] is: opening a
+    /// `Backend` must stay cheap and safe to do many times over one
+    /// library, and opening the log reads every entry in it to find
+    /// this install's chain tip.
+    pub fn change_log(&self) -> anyhow::Result<Arc<crate::change_log::ChangeLog>> {
+        let mut guard = self.change_log.lock().unwrap();
+        if let Some(log) = guard.as_ref() {
+            return Ok(Arc::clone(log));
+        }
+        let log = Arc::new(crate::change_log::ChangeLog::open(&self.library_path)?);
+        *guard = Some(Arc::clone(&log));
+        Ok(log)
+    }
+
+    /// Whether a replay is currently feeding changes into the database.
+    ///
+    /// Write paths consult this before appending: during a replay they
+    /// are applying entries that are *already* in the log, and
+    /// appending again would double the log every time the database was
+    /// rebuilt from it.
+    pub fn is_replaying(&self) -> bool {
+        self.replaying.load(AtomicOrdering::SeqCst)
+    }
+
+    /// Suppresses change-log appends until the returned guard drops.
+    pub fn begin_replay(&self) -> ReplayGuard {
+        self.replaying.store(true, AtomicOrdering::SeqCst);
+        ReplayGuard(Arc::clone(&self.replaying))
     }
 
     /// Test-only: pre-seeds this `Backend`'s cached write handle with

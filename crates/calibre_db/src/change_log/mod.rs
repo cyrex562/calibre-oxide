@@ -31,14 +31,16 @@
 //! | [`hlc`] | ordering changes made on machines whose clocks disagree |
 //! | [`change`] | what a change is: the op, its stamp, its chain link |
 //! | [`store`] | the on-disk log: append, replay, verify, compact |
+//! | [`apply`] | putting a logged change back into `metadata.db` |
 //!
 //! # Scope of this pass
 //!
-//! The store and nothing else. No `Cache` write path appends to it yet
-//! — that is #901, a crate-wide retrofit of the same shape as #93's
-//! "every durable write goes through `LibraryHandle`" — and no merge
-//! runs on open, which is #902. Landing the store alone keeps the tree
-//! working and makes the retrofit reviewable in slices.
+//! The store (#900) and the first slice of the write-path retrofit
+//! (#901). `set_field`, `add_book_db_entry`, `add_format`,
+//! `remove_format` and `delete_book` append; the remaining write
+//! methods do not yet, and the audit test that would forbid that is
+//! the end of the retrofit rather than its beginning. No merge runs on
+//! open — that is #902.
 //!
 //! # One correction to the filed design
 //!
@@ -56,10 +58,12 @@
 //! without requiring coordination that cannot exist. Same reason git
 //! branches rather than demanding a global commit order.
 
+pub mod apply;
 pub mod change;
 pub mod hlc;
 pub mod store;
 
+pub use apply::{replay_into, ReplayReport};
 pub use change::{Change, ChangeOp, ChangeParseError};
 pub use hlc::{Hlc, HlcClock};
 pub use store::{ChangeLog, CompactionReport, InstallId, Replay, SnapshotHeader, VerifyReport, Watermark, DEFAULT_RETENTION};
