@@ -407,6 +407,50 @@ pub fn index_scan(cache: &crate::cache::Cache, library_path: &Path, report: &Sca
     indexed
 }
 
+/// What a rescan did.
+#[derive(Debug)]
+pub struct Rescan {
+    /// The walk itself. Carries `is_complete`, which the caller must
+    /// check before telling anyone a book is gone.
+    pub scanned: ScanReport,
+    /// Books whose recorded path was corrected to where the file
+    /// actually is. Silent by design (#894): the user moved a file
+    /// inside their own folder, which is allowed.
+    pub relocated: usize,
+    /// New books created from files nothing claimed.
+    pub indexed: IndexReport,
+}
+
+/// Walks the library, re-attaches what moved, and indexes what is new.
+///
+/// The order is the whole point. Re-attachment runs **before** indexing
+/// because a file that turned up in a new place is usually a file that
+/// left an old one -- the same book, moved. Indexing first would create
+/// a second book for it and leave the first pointing at nothing, so one
+/// drag-and-drop in the user's file manager would turn one book into a
+/// duplicate plus an orphan.
+///
+/// Nothing is moved, copied, or deleted. This is how a folder the user
+/// filled becomes a library: by being read.
+///
+/// `now` is passed in rather than read from the clock, like [`walk`]'s:
+/// every file a test has just written is inside the settle window, so a
+/// rescan that read the clock itself would find nothing and could only
+/// be tested by sleeping.
+pub fn rescan(cache: &crate::cache::Cache, now: SystemTime) -> Result<Rescan> {
+    let library = cache.backend.library_path.clone();
+    let scanned = walk(&library, &ScanOptions::default(), now)?;
+
+    // Safe on an incomplete scan: a relocation is concluded from a file
+    // that *was* found, not from one that was not. Only `missing` needs
+    // the scan to have seen everything, and nothing here acts on it.
+    let drifted = crate::drift::detect(cache, &scanned)?;
+    let relocated = crate::drift::apply_relocations(cache, &drifted)?;
+
+    let indexed = index_scan(cache, &library, &scanned);
+    Ok(Rescan { scanned, relocated, indexed })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -728,6 +772,11 @@ mod index_tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    /// Far enough ahead that nothing written by a test is still settling.
+    fn much_later() -> SystemTime {
+        SystemTime::now() + Duration::from_secs(3600)
+    }
+
     fn scan_and_index(dir: &Path, cache: &Cache) -> IndexReport {
         let report = walk(dir, &ScanOptions::default(), SystemTime::now() + Duration::from_secs(3600)).unwrap();
         index_scan(cache, dir, &report)
@@ -847,5 +896,87 @@ mod index_tests {
         let (_dir, cache) = library();
         let meta = calibre_ebooks::metadata::MetaInformation::default();
         assert!(cache.register_book_in_place("nope.pdf", &meta).is_err());
+    }
+
+    /// A rescan of a folder the user filled: every file becomes a book,
+    /// and nothing on disk changes.
+    #[test]
+    fn rescan_indexes_an_untracked_folder_in_place() {
+        let (dir, cache) = library();
+        write(&dir.path().join("Boiler Manual.pdf"), b"%PDF-1.4 boiler");
+        write(&dir.path().join("Receipts/2019.pdf"), b"%PDF-1.4 receipt");
+
+        let result = rescan(&cache, much_later()).unwrap();
+
+        assert_eq!(result.indexed.added.len(), 2);
+        assert_eq!(result.relocated, 0);
+        assert!(result.scanned.is_complete());
+        assert!(dir.path().join("Boiler Manual.pdf").exists(), "indexing must not move the file");
+        assert!(dir.path().join("Receipts/2019.pdf").exists(), "nor the one in a subfolder");
+    }
+
+    /// The second rescan recognises its own earlier work rather than
+    /// adding everything again.
+    #[test]
+    fn rescanning_twice_adds_nothing_the_second_time() {
+        let (dir, cache) = library();
+        write(&dir.path().join("Boiler Manual.pdf"), b"%PDF-1.4 boiler");
+
+        assert_eq!(rescan(&cache, much_later()).unwrap().indexed.added.len(), 1);
+
+        let second = rescan(&cache, much_later()).unwrap();
+        assert!(second.indexed.added.is_empty(), "the same file must not become a second book");
+        assert_eq!(second.indexed.already_known, 1);
+    }
+
+    /// The case the ordering exists for. Indexing before re-attaching
+    /// would make the moved file a *new* book and leave the original
+    /// pointing at nothing -- one drag in a file manager turning one
+    /// book into a duplicate plus an orphan.
+    #[test]
+    fn rescan_reattaches_a_moved_file_instead_of_duplicating_it() {
+        let (dir, cache) = library();
+        write(&dir.path().join("Boiler Manual.pdf"), b"%PDF-1.4 boiler");
+
+        let book_id = rescan(&cache, much_later()).unwrap().indexed.added[0];
+
+        // The user files it away in their own folder.
+        std::fs::create_dir_all(dir.path().join("Manuals")).unwrap();
+        std::fs::rename(dir.path().join("Boiler Manual.pdf"), dir.path().join("Manuals/Boiler Manual.pdf")).unwrap();
+
+        let result = rescan(&cache, much_later()).unwrap();
+
+        assert_eq!(result.relocated, 1, "the move should be recognised");
+        assert!(result.indexed.added.is_empty(), "a moved file is not a new book");
+        assert_eq!(cache.field_for(book_id, "path").unwrap().unwrap(), "Manuals", "the record should follow the file");
+    }
+
+    /// A file the user removed from the library while keeping the file
+    /// must not be silently put back by the next scan.
+    #[test]
+    fn rescan_respects_the_ignore_list() {
+        let (dir, cache) = library();
+        write(&dir.path().join("Boiler Manual.pdf"), b"%PDF-1.4 boiler");
+
+        let book_id = rescan(&cache, much_later()).unwrap().indexed.added[0];
+        crate::removal::remove(&cache, book_id, false).unwrap();
+
+        let result = rescan(&cache, much_later()).unwrap();
+        assert!(result.indexed.added.is_empty(), "a removed-but-kept file must stay out");
+        assert_eq!(result.indexed.ignored, vec!["Boiler Manual.pdf"]);
+    }
+
+    /// A file still being written is not indexed yet -- half a book is
+    /// worse than a book a few seconds late.
+    #[test]
+    fn rescan_leaves_a_settling_file_for_the_next_pass() {
+        let (dir, cache) = library();
+        write(&dir.path().join("half-copied.pdf"), b"%PDF-1.4");
+
+        // Real clock: the file was written microseconds ago, so it is
+        // inside the settle window.
+        let result = rescan(&cache, SystemTime::now()).unwrap();
+        assert!(result.indexed.added.is_empty(), "a settling file must not be indexed");
+        assert_eq!(result.scanned.settling, vec!["half-copied.pdf"]);
     }
 }

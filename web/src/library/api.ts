@@ -513,6 +513,41 @@ export function checkLibrary(): Promise<CheckLibraryResult> {
   return jsonFetch<CheckLibraryResult>("/check-library/default", { method: "POST" });
 }
 
+/**
+ * The result of bringing the index up to date with the folder.
+ *
+ * Distinct from `checkLibrary`, which only reports: this one writes.
+ */
+export interface ScanLibraryResult {
+  /** Ids of books created from files nothing claimed. */
+  added: number[];
+  already_known: number;
+  /**
+   * Records corrected to where the file actually is. Not a problem —
+   * moving a file inside your own folder is allowed.
+   */
+  relocated: number;
+  /** Removed from the library but kept on disk, so deliberately skipped. */
+  ignored: string[];
+  /** Still being written. The next scan picks them up. */
+  settling: string[];
+  /** Cloud-sync placeholders, not downloaded. */
+  offline: string[];
+  nested_libraries: string[];
+  failed: { path: string; error: string }[];
+  /**
+   * False when a folder could not be read, so the scan saw only part of
+   * the library. What was added is still right; what is absent is
+   * unknown, and the UI must not imply the library is now in sync.
+   */
+  conclusive: boolean;
+  unreadable: string[];
+}
+
+export function scanLibrary(): Promise<ScanLibraryResult> {
+  return jsonFetch<ScanLibraryResult>("/scan-library/default", { method: "POST" });
+}
+
 // Real, new route -- see crates/calibre_srv/src/save_to_disk.rs's own
 // doc (real upstream's "Save to disk" is a Qt GUI action, never
 // exposed over HTTP there).

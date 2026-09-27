@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { addBook, addFormat, addNewsSchedule, blobToDataUrl, inspectPlugin, installPlugin, listPlugins, removePlugin, setPluginEnabled, catalogDownloadUrl, checkLibrary, coverProxyUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchCoverProxyBlob, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeDataFile, removeFormat, removeNewsSchedule, renameCategoryItem, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, searchMetadataOnline, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
+import { addBook, addFormat, addNewsSchedule, blobToDataUrl, inspectPlugin, installPlugin, listPlugins, removePlugin, setPluginEnabled, catalogDownloadUrl, checkLibrary, coverProxyUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchCoverProxyBlob, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeDataFile, removeFormat, removeNewsSchedule, renameCategoryItem, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, scanLibrary, searchMetadataOnline, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
 import type { BookSummary } from "./types";
 
 function bookStub(id: number): BookSummary {
@@ -508,6 +508,24 @@ describe("checkLibrary", () => {
     expect(fetchMock).toHaveBeenCalledWith("/check-library/default", { method: "POST" });
     expect(result.invalid_authors).toHaveLength(1);
     expect(result.extra_formats).toEqual([]);
+  });
+});
+
+describe("scanLibrary", () => {
+  it("posts to the real single-library route and returns the parsed result", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ added: [7, 8], already_known: 3, relocated: 1, ignored: [], settling: ["half.pdf"], offline: [], nested_libraries: [], failed: [], conclusive: true, unreadable: [] }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await scanLibrary();
+
+    expect(fetchMock).toHaveBeenCalledWith("/scan-library/default", { method: "POST" });
+    expect(result.added).toEqual([7, 8]);
+    expect(result.relocated).toBe(1);
+    expect(result.settling).toEqual(["half.pdf"]);
+    expect(result.conclusive).toBe(true);
   });
 });
 
