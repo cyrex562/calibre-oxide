@@ -230,6 +230,11 @@ impl Cache {
         crate::orphans::OrphanStore::new(self.backend.conn.clone(), &self.backend.library_path)
     }
 
+    /// Files the scanner must not re-add after a removal (#896).
+    pub fn ignored(&self) -> crate::removal::IgnoreStore {
+        crate::removal::IgnoreStore::new(self.backend.conn.clone(), &self.backend.library_path)
+    }
+
     /// A book's uuid -- the only identifier that means the same thing
     /// on two machines, since `books.id` is a local autoincrement.
     pub fn book_uuid(&self, book_id: i32) -> anyhow::Result<Option<String>> {
@@ -749,9 +754,12 @@ impl Cache {
         let path_rel = self
             .field_for(book_id, "path")?
             .ok_or_else(|| anyhow::anyhow!("Book {book_id} not found"))?;
-        if path_rel.is_empty() {
-            anyhow::bail!("Book has no path");
-        }
+        // An empty `path` is the library root, and that is now an
+        // ordinary place for a book to live (#889/#893). It used to mean
+        // "this book has not been placed in a folder yet", because every
+        // book got an `<author>/<title>/` one -- so what was a useful
+        // guard became a refusal to add a second format to any book in a
+        // tracked folder.
         let title = self.field_for(book_id, "title")?.unwrap_or_default();
 
         let book_dir = self.backend.library_path.join(&path_rel);
@@ -3921,6 +3929,24 @@ mod tests {
 
     /// Re-adding a format under the *same* name overwrites in place, and
     /// does not walk the name to `(1)`.
+    /// An empty `books.path` means the library root, which is where a
+    /// book in a tracked folder normally lives (#889). A guard that
+    /// refused it was correct only while every book got its own
+    /// `<author>/<title>/` folder.
+    #[test]
+    fn a_format_can_be_added_to_a_book_whose_files_are_in_the_library_root() {
+        let (dir, cache) = open_test_cache();
+        let id = add_pdf(dir.path(), &cache, "A Title", "An Author", "book");
+        cache.set_book_path(id, "").unwrap();
+
+        let epub = dir.path().join("elsewhere").join("book.epub");
+        fs::create_dir_all(epub.parent().unwrap()).unwrap();
+        fs::write(&epub, b"epub bytes").unwrap();
+
+        assert!(cache.add_format(id, &epub, "epub", true).unwrap());
+        assert!(dir.path().join("book.epub").exists(), "the format should land in the library root");
+    }
+
     #[test]
     fn re_adding_a_format_under_the_same_name_overwrites_it() {
         let (dir, cache) = open_test_cache();
