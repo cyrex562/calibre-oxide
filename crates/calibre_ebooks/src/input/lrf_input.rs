@@ -1,8 +1,23 @@
+//! LRF input: not supported, and it says so.
+//!
+//! This used to write a page reading "LRF Content Not Supported Yet" and
+//! return it as the book. It is registered, so `ebook-convert book.lrf
+//! out.epub` reported **success** and handed the user that page -- a
+//! conversion that looks done and produced nothing.
+//!
+//! LRF is a discontinued Sony format whose content is a tree of binary
+//! objects (`old_src/.../lrf/{lrfparser,objects,tags}.py`). There is no
+//! parser for it in this tree, and unlike TCR (#943) it is not a small
+//! port. So this refuses, with a message that says what is wrong and
+//! distinguishes "not implemented" from "your file is broken".
+//!
+//! Found while auditing the registered input plugins for placeholders.
+//! Two of the four claimed something could not be done that could
+//! (#942 CHM, #943 TCR); this one is accurate about the obstacle, and the
+//! defect was only that it reported success anyway.
+
 use crate::oeb::book::OEBBook;
-use crate::oeb::container::DirContainer;
-use crate::oeb::manifest::ManifestItem;
-use anyhow::{Context, Result};
-use std::fs;
+use anyhow::{bail, Result};
 use std::path::Path;
 
 pub struct LRFInput;
@@ -12,43 +27,33 @@ impl LRFInput {
         LRFInput
     }
 
-    pub fn convert(&self, input_path: &Path, output_dir: &Path) -> Result<OEBBook> {
-        // Just extract metadata and create a placeholder book.
-        // Full LRF content extraction is out of scope for this batch.
+    pub fn convert(&self, input_path: &Path, _output_dir: &Path) -> Result<OEBBook> {
+        bail!(
+            "cannot convert {}: LRF content extraction is not implemented. \
+             LRF stores its text as a tree of binary objects and no parser for it exists in this build",
+            input_path.display()
+        )
+    }
+}
 
-        fs::create_dir_all(output_dir)?;
-        let content_filename = "index.html";
-        let content_path = output_dir.join(content_filename);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        let html_content = "<html><body><h1>LRF Content Not Supported Yet</h1><p>The LRF format is a proprietary binary format. Content extraction is not yet implemented.</p></body></html>";
-        fs::write(&content_path, html_content)?;
+    /// The defect was not the missing feature -- it was reporting success.
+    #[test]
+    fn conversion_fails_instead_of_returning_a_fabricated_book() {
+        let dir = tempfile::tempdir().unwrap();
+        let book = dir.path().join("book.lrf");
+        std::fs::write(&book, b"LRF bytes").unwrap();
+        let out = dir.path().join("out");
 
-        // Build OEBBook
-        let container = Box::new(DirContainer::new(output_dir));
-        let mut book = OEBBook::new(container);
-
-        let id = "content".to_string();
-        let href = content_filename.to_string();
-
-        book.manifest.items.insert(
-            id.clone(),
-            ManifestItem::new(&id, &href, "application/xhtml+xml"),
-        );
-        book.manifest.hrefs.insert(href.clone(), id.clone());
-        book.spine.add(&id, true);
-
-        // Metadata
-        if let Ok(info) = crate::metadata::lrf::get_metadata(fs::File::open(input_path)?) {
-            book.metadata.add("title", &info.title);
-            if !info.authors.is_empty() {
-                book.metadata.add("creator", &info.authors[0]);
-            }
-        }
-
-        if book.metadata.get("title").is_empty() {
-            book.metadata.add("title", "Converted LRF");
-        }
-
-        Ok(book)
+        let message = match LRFInput::new().convert(&book, &out) {
+            Ok(_) => panic!("an unimplemented format must not convert successfully"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(message.contains("not implemented"), "the error should say what is missing: {message}");
+        assert!(message.contains("book.lrf"), "the error should name the file: {message}");
+        assert!(!out.exists(), "nothing should have been written");
     }
 }
