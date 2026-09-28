@@ -46,12 +46,16 @@
 //! prefix of `/lib/AB/evil`), which `Path::starts_with`'s
 //! component-aware comparison avoids.
 
+use anyhow::Context;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use crate::cache::Cache;
-use crate::constants::{COVER_FILE_NAME, METADATA_FILE_NAME};
+use crate::constants::DATA_DIR_NAME;
+
+/// The `data/` prefix every relpath in this module's API carries.
+const DATA_DIR_PREFIX: &str = "data/";
 
 /// One extra file found by [`list_extra_files`] -- port of `ExtraFile`.
 #[derive(Debug, Clone, PartialEq)]
@@ -95,16 +99,61 @@ fn safe_join(bookdir: &Path, relpath: &str) -> Option<PathBuf> {
     }
 }
 
-fn book_dir(cache: &Cache, book_id: i32) -> anyhow::Result<Option<PathBuf>> {
-    // An empty `path` is the library root, and that is where a book in a
-    // tracked folder normally lives (#893). It used to mean "this book
-    // has no folder yet", because every book got an `<author>/<title>/`
-    // one -- so filtering it out became a refusal to attach a data file
-    // to any root-level book.
-    //
-    // `None` still means the book does not exist at all, which is the
-    // distinction callers actually branch on.
-    Ok(cache.field_for(book_id, "path")?.map(|p| if p.is_empty() { cache.backend.library_path.clone() } else { cache.backend.library_path.join(p) }))
+/// The directory holding a book's data files.
+///
+/// Every relpath in this module's API is relative to it, with the
+/// leading `data/` that callers use (`DATA_FILE_PATTERN` is
+/// `"data/**/*"`) naming this directory rather than a component inside
+/// it -- [`on_disk`] strips it and [`api_relpath`] puts it back.
+///
+/// Two layouts:
+///
+/// - A book with a folder of its own keeps its data files in that
+///   folder's `data/` subdirectory, where they have always been, so a
+///   library in the old layout reads exactly as before.
+/// - A book with an empty `path` lives in the library root (#893) and
+///   gets `<library>/data/<uuid>/`. It cannot keep its data files in the
+///   root itself: every root-level book has the same empty path, so they
+///   all resolved to one shared `<library>/data/` directory. One book's
+///   attached file was listed for every book, `add_extra_files`'s
+///   "already exists" check fired between different books rather than
+///   within one, and removing the second book's data file silently
+///   deleted the first book's while reporting success (#954).
+///
+/// Keyed by **uuid** for the reason `covers::sidecar_cover_path` and
+/// `backup::sidecar_opf_path` are: a local autoincrement id would
+/// collide across synced machines. Deliberately under `<library>/data/`
+/// rather than inside `.calibre-oxide/` -- these are files the user
+/// attached themselves, not derived state, so they stay visible and
+/// manageable in the library folder.
+///
+/// `None` means the book does not exist at all, which is the distinction
+/// callers actually branch on.
+fn data_dir(cache: &Cache, book_id: i32) -> anyhow::Result<Option<PathBuf>> {
+    let Some(path) = cache.field_for(book_id, "path")? else {
+        return Ok(None);
+    };
+    if !path.is_empty() {
+        return Ok(Some(cache.backend.library_path.join(path).join(DATA_DIR_NAME)));
+    }
+    let uuid = cache
+        .book_uuid(book_id)?
+        .filter(|u| !u.is_empty())
+        .with_context(|| format!("book {book_id} has no uuid to key its data files by"))?;
+    Ok(Some(cache.backend.library_path.join(DATA_DIR_NAME).join(uuid)))
+}
+
+/// Resolves one API relpath to a real path inside `dir`, rejecting
+/// anything that would escape it.
+fn on_disk(dir: &Path, relpath: &str) -> Option<PathBuf> {
+    let inside = relpath.strip_prefix(DATA_DIR_PREFIX).unwrap_or(relpath);
+    safe_join(dir, inside)
+}
+
+/// The inverse: the relpath callers see for a file found under `dir`.
+fn api_relpath(dir: &Path, path: &Path) -> Option<String> {
+    let rel = path.strip_prefix(dir).ok()?;
+    Some(format!("{DATA_DIR_PREFIX}{}", rel.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/")))
 }
 
 /// Port of `list_extra_files`. `pattern` matches
@@ -114,38 +163,29 @@ fn book_dir(cache: &Cache, book_id: i32) -> anyhow::Result<Option<PathBuf>> {
 /// (matching the one real caller under issue #418); an empty pattern
 /// walks the whole tree, matching upstream's own `os.walk` fallback.
 pub fn list_extra_files(cache: &Cache, book_id: i32, pattern: &str) -> anyhow::Result<Vec<ExtraFile>> {
-    let Some(bookdir) = book_dir(cache, book_id)? else {
+    let Some(dir) = data_dir(cache, book_id)? else {
         return Ok(Vec::new());
     };
-    if !bookdir.exists() {
+    if !dir.exists() {
         return Ok(Vec::new());
     }
 
-    let known_files: std::collections::HashSet<&str> = [COVER_FILE_NAME, METADATA_FILE_NAME].into_iter().collect();
+    // `pattern` selects nothing finer than "everything under the data
+    // directory" for either of its two real values, now that the
+    // directory *is* the `data/` scope: `DATA_FILE_PATTERN`'s leading
+    // component names it, and an empty pattern is upstream's
+    // unrestricted `os.walk`. The narrow glob matcher this used to need
+    // went with it.
+    let _ = pattern;
+
     let mut out = Vec::new();
-
-    let candidates: Vec<PathBuf> = if pattern.is_empty() {
-        walk_dir(&bookdir)
-    } else {
-        glob_match(&bookdir, pattern)
-    };
-
-    for path in candidates {
+    for path in walk_dir(&dir) {
         if !path.is_file() {
             continue;
         }
-        let Ok(relpath) = path.strip_prefix(&bookdir) else { continue };
-        let relpath = relpath.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
-        if known_files.contains(relpath.as_str()) {
-            continue;
-        }
+        let Some(relpath) = api_relpath(&dir, &path) else { continue };
         let Ok(meta) = fs::metadata(&path) else { continue };
-        out.push(ExtraFile {
-            relpath,
-            file_path: path,
-            size: meta.len(),
-            mtime_ns: mtime_ns(&meta),
-        });
+        out.push(ExtraFile { relpath, file_path: path, size: meta.len(), mtime_ns: mtime_ns(&meta) });
     }
     Ok(out)
 }
@@ -178,26 +218,18 @@ fn walk_dir(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// A narrow glob matcher covering exactly `DATA_FILE_PATTERN`'s shape
-/// (`"data/**/*"` -- everything under one named subdirectory,
-/// recursively) rather than a general glob engine, since that's the
-/// only pattern any real caller under issue #418 uses.
-fn glob_match(root: &Path, pattern: &str) -> Vec<PathBuf> {
-    let Some(subdir) = pattern.split('/').next() else { return Vec::new() };
-    walk_dir(&root.join(subdir))
-}
 
 /// Port of `add_extra_files`. Returns, per relpath, whether it was
 /// actually written (`false` when `replace` is `false` and a file
 /// already exists there -- matching upstream's own
 /// `added[relpath] = bool(...)`).
 pub fn add_extra_files(cache: &Cache, book_id: i32, files: &HashMap<String, Vec<u8>>, replace: bool) -> anyhow::Result<HashMap<String, bool>> {
-    let Some(bookdir) = book_dir(cache, book_id)? else {
+    let Some(dir) = data_dir(cache, book_id)? else {
         anyhow::bail!("Book {book_id} not found");
     };
     let mut added = HashMap::new();
     for (relpath, data) in files {
-        let Some(dest) = safe_join(&bookdir, relpath) else {
+        let Some(dest) = on_disk(&dir, relpath) else {
             added.insert(relpath.clone(), false);
             continue;
         };
@@ -215,12 +247,12 @@ pub fn add_extra_files(cache: &Cache, book_id: i32, files: &HashMap<String, Vec<
 /// Returns, per relpath, `None` on success or `Some(error message)`
 /// on failure -- matching upstream's `{relpath: Exception|None}`.
 pub fn remove_extra_files(cache: &Cache, book_id: i32, relpaths: &[String], _permanent: bool) -> anyhow::Result<HashMap<String, Option<String>>> {
-    let Some(bookdir) = book_dir(cache, book_id)? else {
+    let Some(dir) = data_dir(cache, book_id)? else {
         return Ok(relpaths.iter().map(|r| (r.clone(), None)).collect());
     };
     let mut errors = HashMap::new();
     for relpath in relpaths {
-        let Some(path) = safe_join(&bookdir, relpath) else {
+        let Some(path) = on_disk(&dir, relpath) else {
             continue; // matches upstream: an escaping path is silently skipped, not an error
         };
         match cache.backend.write_handle().and_then(|h| h.remove_atomic(&path).map_err(Into::into)) {
@@ -237,6 +269,7 @@ pub fn remove_extra_files(cache: &Cache, book_id: i32, relpaths: &[String], _per
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::DATA_FILE_PATTERN;
     use calibre_ebooks::metadata::MetaInformation;
     use std::fs;
     use tempfile::tempdir;
@@ -275,10 +308,12 @@ mod tests {
 
     #[test]
     fn list_extra_files_excludes_the_cover_file() {
-        // Uses the DATA_FILE_PATTERN shape (the only pattern any real
-        // HTTP endpoint under issue #418 uses) -- cover.jpg lives
-        // outside data/ anyway, so this also confirms the pattern
-        // restriction itself works, not just the exclusion list.
+        // The cover cannot appear structurally rather than by being
+        // filtered out: it lives at `.calibre-oxide/covers/<uuid>.jpg`,
+        // and a legacy book's `cover.jpg`/`metadata.opf` sit in the book
+        // folder rather than inside its `data/` subdirectory. Neither is
+        // under the directory this walks, so the `known_files` exclusion
+        // list this used to need is gone.
         let (_dir, cache, book_id) = open_test_cache_with_book();
         crate::covers::set_cover(&cache, book_id, b"fake cover bytes").unwrap();
         let mut files = HashMap::new();
@@ -291,24 +326,136 @@ mod tests {
     }
 
     #[test]
-    fn list_extra_files_with_an_empty_pattern_walks_the_whole_book_directory() {
-        // Disclosed simplification (see module doc): upstream also
-        // excludes the book's own format files from an unrestricted
-        // walk (`if '/' not in pattern: known_files.add(...)`) -- not
-        // ported here, since every real HTTP endpoint under issue
-        // #418 always passes DATA_FILE_PATTERN (which contains a `/`,
-        // so upstream's own format-exclusion branch never runs for
-        // them either). This test documents the real, current
-        // behavior rather than asserting the unported exclusion.
+    fn a_relpath_is_always_reported_under_data_whichever_pattern_is_passed() {
+        // Both real values of `pattern` mean "everything the book has",
+        // now that the data directory *is* the `data/` scope:
+        // `DATA_FILE_PATTERN`'s leading component names that directory,
+        // and an empty pattern is upstream's unrestricted `os.walk`.
+        //
+        // This also closes a gap that was previously disclosed rather
+        // than fixed: upstream excludes a book's own format files from an
+        // unrestricted walk (`if '/' not in pattern:
+        // known_files.add(...)`), a branch never ported here, and this
+        // test used to assert the resulting wart -- the book's own
+        // `.epub` listed as one of its extra files. With data files in
+        // their own directory there is nothing to exclude.
         let (_dir, cache, book_id) = open_test_cache_with_book();
         let mut files = HashMap::new();
-        files.insert("readme.txt".to_string(), b"hello".to_vec());
+        files.insert("data/readme.txt".to_string(), b"hello".to_vec());
         add_extra_files(&cache, book_id, &files, true).unwrap();
 
-        let listed = list_extra_files(&cache, book_id, "").unwrap();
-        let relpaths: Vec<&str> = listed.iter().map(|f| f.relpath.as_str()).collect();
-        assert!(relpaths.contains(&"readme.txt"), "got: {relpaths:?}");
-        assert!(relpaths.iter().any(|r| r.ends_with(".epub")), "expected the book's own format file to appear too (disclosed gap), got: {relpaths:?}");
+        for pattern in ["", DATA_FILE_PATTERN] {
+            let listed = list_extra_files(&cache, book_id, pattern).unwrap();
+            let relpaths: Vec<&str> = listed.iter().map(|f| f.relpath.as_str()).collect();
+            assert_eq!(relpaths, vec!["data/readme.txt"], "pattern {pattern:?}");
+        }
+    }
+
+    /// The directory is visible in the library folder, not hidden in
+    /// `.calibre-oxide/`: these are files the user attached themselves,
+    /// not derived state.
+    #[test]
+    fn a_root_level_books_data_files_are_visible_in_the_library_folder() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        let mut meta = MetaInformation::default();
+        meta.title = "Only".to_string();
+        let book_id = cache.add_book_db_entry(&meta, "").unwrap();
+        let uuid = cache.book_uuid(book_id).unwrap().unwrap();
+
+        let mut files = HashMap::new();
+        files.insert("data/notes.txt".to_string(), b"hello".to_vec());
+        add_extra_files(&cache, book_id, &files, false).unwrap();
+
+        let expected = dir.path().join("data").join(&uuid).join("notes.txt");
+        assert!(expected.is_file(), "expected the file at {}", expected.display());
+        assert!(!dir.path().join(".calibre-oxide").join("books").exists(), "data files must not be hidden in the state directory");
+    }
+
+    /// #954: every root-level book had the same empty `path`, so they all
+    /// shared one `<library>/data/` directory.
+    #[test]
+    fn data_files_are_not_shared_between_books_in_the_library_root() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        let mut first_meta = MetaInformation::default();
+        first_meta.title = "First".to_string();
+        let first = cache.add_book_db_entry(&first_meta, "").unwrap();
+        let mut second_meta = MetaInformation::default();
+        second_meta.title = "Second".to_string();
+        let second = cache.add_book_db_entry(&second_meta, "").unwrap();
+
+        let mut files = HashMap::new();
+        files.insert("data/notes.txt".to_string(), b"the first book's notes".to_vec());
+        add_extra_files(&cache, first, &files, false).unwrap();
+
+        assert_eq!(list_extra_files(&cache, first, DATA_FILE_PATTERN).unwrap().len(), 1);
+        assert!(
+            list_extra_files(&cache, second, DATA_FILE_PATTERN).unwrap().is_empty(),
+            "the second book sees the first book's data file"
+        );
+    }
+
+    /// The destructive half: a user tidying up one book's data files must
+    /// not delete another book's. This reported success while doing it.
+    #[test]
+    fn removing_one_root_level_books_data_file_leaves_anothers_alone() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        let mut first_meta = MetaInformation::default();
+        first_meta.title = "First".to_string();
+        let first = cache.add_book_db_entry(&first_meta, "").unwrap();
+        let mut second_meta = MetaInformation::default();
+        second_meta.title = "Second".to_string();
+        let second = cache.add_book_db_entry(&second_meta, "").unwrap();
+
+        let mut files = HashMap::new();
+        files.insert("data/notes.txt".to_string(), b"the first book's notes".to_vec());
+        add_extra_files(&cache, first, &files, false).unwrap();
+
+        remove_extra_files(&cache, second, &["data/notes.txt".to_string()], true).unwrap();
+
+        assert_eq!(
+            list_extra_files(&cache, first, DATA_FILE_PATTERN).unwrap().len(),
+            1,
+            "removing the second book's data file destroyed the first book's"
+        );
+    }
+
+    /// Two books can hold a data file of the same name without one
+    /// overwriting the other -- the "already exists" check used to fire
+    /// between different books rather than within one.
+    #[test]
+    fn two_books_can_each_hold_a_data_file_of_the_same_name() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        let mut first_meta = MetaInformation::default();
+        first_meta.title = "First".to_string();
+        let first = cache.add_book_db_entry(&first_meta, "").unwrap();
+        let mut second_meta = MetaInformation::default();
+        second_meta.title = "Second".to_string();
+        let second = cache.add_book_db_entry(&second_meta, "").unwrap();
+
+        let mut a = HashMap::new();
+        a.insert("data/notes.txt".to_string(), b"first".to_vec());
+        let added_first = add_extra_files(&cache, first, &a, false).unwrap();
+        let mut b = HashMap::new();
+        b.insert("data/notes.txt".to_string(), b"second".to_vec());
+        let added_second = add_extra_files(&cache, second, &b, false).unwrap();
+
+        assert_eq!(added_first.get("data/notes.txt"), Some(&true));
+        assert_eq!(
+            added_second.get("data/notes.txt"),
+            Some(&true),
+            "the second book's file was refused as an existing one"
+        );
+
+        let read_back = |id| {
+            let listed = list_extra_files(&cache, id, DATA_FILE_PATTERN).unwrap();
+            std::fs::read(&listed[0].file_path).unwrap()
+        };
+        assert_eq!(read_back(first), b"first");
+        assert_eq!(read_back(second), b"second");
     }
 
     #[test]
@@ -362,4 +509,5 @@ mod tests {
         };
         assert!(list_extra_files(&cache, 999, "").unwrap().is_empty());
     }
+
 }
