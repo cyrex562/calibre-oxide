@@ -28,11 +28,12 @@ pub enum FormatOutcome {
 
 /// Formats this can write metadata into.
 ///
-/// Kept as an explicit list rather than "try and see", so
-/// [`FormatOutcome::NoWriter`] is reported before a file is opened and a
-/// caller can tell "not supported" from "tried and failed".
+/// Delegates to `calibre_ebooks`, which owns the dispatch: duplicating the
+/// list here is how the two would drift, and a `has_writer` that disagreed
+/// with the writer would report `NoWriter` for a format that works, or
+/// try one that does not.
 pub fn has_writer(format: &str) -> bool {
-    matches!(format.to_ascii_uppercase().as_str(), "EPUB" | "ODT" | "DOCX" | "PDF" | "FB2" | "RTF")
+    calibre_ebooks::metadata::can_set_metadata(format)
 }
 
 /// Assembles the metadata to embed from the library's own record.
@@ -109,18 +110,7 @@ pub fn embed_metadata(cache: &Cache, book_id: i32) -> Result<Vec<(String, Format
             continue;
         }
 
-        let result = match format.to_ascii_uppercase().as_str() {
-            "EPUB" => calibre_ebooks::metadata::epub::set_metadata(&path, &mi),
-            "ODT" => calibre_ebooks::metadata::odt::set_metadata(&path, &mi),
-            "DOCX" => calibre_ebooks::metadata::docx::set_metadata(&path, &mi),
-            "PDF" => calibre_ebooks::metadata::pdf::set_metadata(&path, &mi),
-            "FB2" => calibre_ebooks::metadata::fb2::set_metadata(&path, &mi),
-            "RTF" => calibre_ebooks::metadata::rtf::set_metadata(&path, &mi),
-            // Unreachable while this matches `has_writer`, and a real
-            // error rather than a silent success if the two ever drift.
-            other => Err(anyhow::anyhow!("{other} claims a writer but none is wired")),
-        };
-        match result {
+        match calibre_ebooks::metadata::set_metadata(&path, &mi) {
             Ok(()) => {
                 // The file's content changed, so the recorded hash is now
                 // wrong. Leaving it stale would make the next scan report
