@@ -9,6 +9,16 @@ pub struct OEBWriter {
     pub pretty_print: bool,
 }
 
+/// Which identifier `package/@unique-identifier` names, and whether it had
+/// to be invented.
+struct UniqueIdentifier {
+    id: String,
+    value: String,
+    /// True when the book carried no identifier and one was generated, in
+    /// which case the element itself has to be written too.
+    generated: bool,
+}
+
 impl OEBWriter {
     pub fn new() -> Self {
         Self { pretty_print: true }
@@ -61,6 +71,19 @@ impl OEBWriter {
 /// reader looks at and which makes the EPUB invalid, since EPUB 2 requires
 /// those elements. It is also why a converted book's title read back as
 /// "Unknown".
+fn unique_identifier(book: &OEBBook) -> UniqueIdentifier {
+    for term in ["identifier", "dc:identifier"] {
+        for item in book.metadata.get(term) {
+            if let Some(id) = item.get_attribute("id").filter(|id| !id.is_empty()) {
+                return UniqueIdentifier { id: id.to_string(), value: item.value.clone(), generated: false };
+            }
+        }
+    }
+    // A book with no identifier cannot be a valid EPUB, and inventing a
+    // uuid is what every producer does in that case.
+    UniqueIdentifier { id: "uuid_id".to_string(), value: format!("urn:uuid:{}", uuid::Uuid::new_v4()), generated: true }
+}
+
 fn dublin_core_tag(term: &str) -> Option<String> {
     // Already namespaced by the caller.
     if let Some(rest) = term.strip_prefix("dc:") {
@@ -95,11 +118,39 @@ fn dublin_core_tag(term: &str) -> Option<String> {
     pub fn write_opf(&self, book: &OEBBook) -> Result<String> {
         let mut out = String::new();
         out.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
-        out.push_str(r#"<package xmlns="http://www.idpf.org/2007/opf" version="2.0">"#);
+
+        // EPUB 2 requires `dc:title`, `dc:identifier` and `dc:language`,
+        // and requires `package/@unique-identifier` to name the
+        // identifier's `id`. None of the three was emitted, so every book
+        // this produced was invalid -- a validating reader refuses it.
+        // Worked out before the `<package>` tag because the attribute goes
+        // on it.
+        let identifier = Self::unique_identifier(book);
+        out.push_str(&format!(
+            r#"<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="{}">"#,
+            escape_xml(&identifier.id)
+        ));
         out.push('\n');
 
         // Metadata
         out.push_str("  <metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:opf=\"http://www.idpf.org/2007/opf\">\n");
+
+        // Written when the book carries none of its own, so the required
+        // elements are present even for an input that had no metadata at
+        // all -- a bare HTML file, say.
+        if identifier.generated {
+            out.push_str(&format!(
+                "    <dc:identifier id=\"{}\" opf:scheme=\"uuid\">{}</dc:identifier>\n",
+                escape_xml(&identifier.id),
+                escape_xml(&identifier.value)
+            ));
+        }
+        if book.metadata.get("language").is_empty() && book.metadata.get("dc:language").is_empty() {
+            // `und` is BCP-47's own "undetermined" -- the honest value for
+            // a book whose language nothing stated, and a valid one,
+            // unlike omitting the element.
+            out.push_str("    <dc:language>und</dc:language>\n");
+        }
         for item in &book.metadata.items {
             if let Some(tag) = Self::dublin_core_tag(&item.term) {
                 // `<dc:title>Value</dc:title>`, with any `opf:role` /
