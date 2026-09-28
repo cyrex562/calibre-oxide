@@ -161,7 +161,7 @@ pub fn run_command(cmd: &str, args: &[String], ctx: &DBCtx) -> Result<()> {
             cmd_remove_format::CmdRemoveFormat::new().run(&mut db, args)
         }
         "switch" => cmd_switch::CmdSwitch::new().run(args),
-        "restore_database" => cmd_restore_database::CmdRestoreDatabase::new().run(args),
+        "restore_database" => cmd_restore_database::CmdRestoreDatabase::new().run(&ctx.library_path, args),
 
         _ => Err(anyhow!("Unknown command: {}", cmd)),
     }

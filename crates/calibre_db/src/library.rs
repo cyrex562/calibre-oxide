@@ -377,10 +377,15 @@ impl Library {
         let Some(book) = book_opt else {
             return Err(LibraryError::InvalidPath); // Or BookNotFound
         };
-        if book.path.is_empty() {
-            // Python skips invisible/pathless books rather than erroring.
-            return Ok(());
-        }
+        // No longer skipped when `path` is empty. That guard came from
+        // upstream, where an empty path means a book with no folder and
+        // so nothing to write a `metadata.opf` beside. Since #889 an
+        // empty path is the *normal* case -- the book sits in the
+        // library root -- so the guard silently skipped every book in a
+        // current library while `backup_metadata` still reported
+        // "Backup complete". The OPF is a uuid-keyed sidecar now
+        // (`backup::sidecar_opf_path`) and needs no book folder.
+        let _ = &book;
         let cache = Arc::new(Mutex::new(self.as_cache()));
         crate::backup::backup_metadata(&cache, book_id)
             .map_err(|e| LibraryError::Transaction(e.to_string()))
