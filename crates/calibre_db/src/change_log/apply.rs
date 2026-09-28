@@ -118,6 +118,35 @@ pub fn apply(cache: &Cache, change: &Change) -> Result<bool> {
             }
             None => Ok(false),
         },
+
+        // Library-scoped from here down: nothing to resolve a uuid
+        // against, so these always apply.
+        ChangeOp::PrefSet { key, value } => {
+            match value {
+                Some(value) => cache.set_preference(key, value)?,
+                None => cache.clear_preference(key)?,
+            }
+            Ok(true)
+        }
+        ChangeOp::CustomColumnAdded { label, name, datatype, is_multiple } => {
+            // Replaying a log twice, or a peer's add for a column this
+            // machine already has -- the same already-there case
+            // `BookAdded` handles, and `add_custom_column` errors on a
+            // duplicate label rather than ignoring it.
+            if cache.custom_column_id(label)?.is_some() {
+                return Ok(true);
+            }
+            cache.add_custom_column(label, name, datatype, *is_multiple)?;
+            Ok(true)
+        }
+        ChangeOp::CustomColumnRemoved { label } => {
+            if cache.custom_column_id(label)?.is_none() {
+                // Already the desired end state.
+                return Ok(true);
+            }
+            cache.remove_custom_column(label)?;
+            Ok(true)
+        }
     }
 }
 
@@ -321,5 +350,93 @@ mod tests {
         // And the flag is off again afterwards, so ordinary writes
         // resume recording.
         assert!(!cache.backend.is_replaying());
+    }
+
+    /// The point of carrying schema in the log (#901): a replay has to be
+    /// able to rebuild the column *and* the value in it. Without the
+    /// definition, a restored `#rating` would have nowhere to go.
+    #[test]
+    fn replay_rebuilds_a_custom_column_and_then_a_value_in_it() {
+        let (_dir, cache) = cache();
+        let log = cache.backend.change_log().unwrap();
+
+        // Recorded in the order they happened: the column exists before
+        // anything is written to it. The single total order is what makes
+        // that hold on replay too.
+        let created = log
+            .append(ChangeOp::CustomColumnAdded {
+                label: "rating".into(),
+                name: "My Rating".into(),
+                datatype: "int".into(),
+                is_multiple: false,
+            })
+            .unwrap();
+        let added = log.append(ChangeOp::BookAdded { book: "uuid-1".into() }).unwrap();
+
+        assert!(apply(&cache, &created).unwrap());
+        assert!(apply(&cache, &added).unwrap());
+
+        let column = cache.custom_column_id("rating").unwrap();
+        assert!(column.is_some(), "replay did not recreate the column");
+
+        // And it really holds a value, which is the part that would fail
+        // if only the value had been logged.
+        let book = cache.book_id_for_uuid("uuid-1").unwrap().unwrap();
+        cache.set_custom_column_value(book, "rating", "7").unwrap();
+        assert_eq!(cache.get_custom_column_value(book, "rating").unwrap().as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn replaying_a_custom_column_twice_does_not_error_on_the_duplicate_label() {
+        let (_dir, cache) = cache();
+        let log = cache.backend.change_log().unwrap();
+        let created = log
+            .append(ChangeOp::CustomColumnAdded { label: "shelf".into(), name: "Shelf".into(), datatype: "text".into(), is_multiple: false })
+            .unwrap();
+
+        assert!(apply(&cache, &created).unwrap());
+        // `add_custom_column` refuses a duplicate label outright, so
+        // replay has to check first -- the same already-there case
+        // `BookAdded` handles.
+        assert!(apply(&cache, &created).unwrap(), "a second replay must be a no-op, not an error");
+    }
+
+    #[test]
+    fn replay_removes_a_custom_column_and_tolerates_it_already_being_gone() {
+        let (_dir, cache) = cache();
+        let log = cache.backend.change_log().unwrap();
+        cache.add_custom_column("shelf", "Shelf", "text", false).unwrap();
+
+        let removed = log.append(ChangeOp::CustomColumnRemoved { label: "shelf".into() }).unwrap();
+        assert!(apply(&cache, &removed).unwrap());
+        assert!(cache.custom_column_id("shelf").unwrap().is_none());
+        assert!(apply(&cache, &removed).unwrap(), "already gone is the desired end state");
+    }
+
+    #[test]
+    fn replay_sets_and_clears_a_library_preference() {
+        let (_dir, cache) = cache();
+        let log = cache.backend.change_log().unwrap();
+
+        let set = log.append(ChangeOp::PrefSet { key: "sort".into(), value: Some("title".into()) }).unwrap();
+        assert!(apply(&cache, &set).unwrap());
+        assert_eq!(cache.get_preference("sort").unwrap().as_deref(), Some("title"));
+
+        let cleared = log.append(ChangeOp::PrefSet { key: "sort".into(), value: None }).unwrap();
+        assert!(apply(&cache, &cleared).unwrap());
+        assert_eq!(cache.get_preference("sort").unwrap(), None);
+    }
+
+    /// Library-scoped ops have no book to resolve, so they must not be
+    /// filtered out by `replay_into`'s unknown-book guard.
+    #[test]
+    fn a_library_scoped_change_is_not_skipped_as_an_unknown_book() {
+        let (_dir, cache) = cache();
+        let log = cache.backend.change_log().unwrap();
+        log.append(ChangeOp::PrefSet { key: "sort".into(), value: Some("author".into()) }).unwrap();
+
+        let report = replay_into(&cache, &log).unwrap();
+        assert_eq!(report.skipped_unknown_book, 0, "{report:?}");
+        assert_eq!(cache.get_preference("sort").unwrap().as_deref(), Some("author"));
     }
 }

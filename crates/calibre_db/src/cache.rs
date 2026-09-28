@@ -1887,6 +1887,15 @@ impl Cache {
         }
 
         tx.commit()?;
+        // Before recording: appending fsyncs, and #901 warns against
+        // doing that with the connection mutex held.
+        drop(conn);
+        self.record(crate::change_log::ChangeOp::CustomColumnAdded {
+            label: label.to_string(),
+            name: name.to_string(),
+            datatype: datatype.to_string(),
+            is_multiple,
+        });
         Ok(col_id)
     }
 
@@ -1952,26 +1961,36 @@ impl Cache {
         Ok(())
     }
 
-    pub fn remove_custom_column(&self, label: &str) -> anyhow::Result<()> {
-        let mut conn = self.backend.conn.lock().unwrap();
-        let col_id: Option<i32> = conn
-            .query_row(
-                "SELECT id FROM custom_columns WHERE label = ?1",
-                [label],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(id) = col_id else {
-            anyhow::bail!("Column '{}' not found", label);
-        };
+    /// A custom column's id by label, or `None` if there is no such
+    /// column. Lets replay tell "already applied" from "needs applying"
+    /// without provoking the duplicate-label error.
+    pub fn custom_column_id(&self, label: &str) -> anyhow::Result<Option<i32>> {
+        Ok(self.custom_column_lookup(label)?.map(|(id, _)| id))
+    }
 
-        let tx = conn.transaction()?;
-        tx.execute("DELETE FROM custom_columns WHERE id = ?1", [id])?;
-        // `id` is an integer we control (from the `custom_columns` row
-        // just looked up), not user input -- no injection risk from
-        // building the table name via `format!`.
-        tx.execute(&format!("DROP TABLE IF EXISTS custom_column_{id}"), [])?;
-        tx.commit()?;
+    pub fn remove_custom_column(&self, label: &str) -> anyhow::Result<()> {
+        {
+            let mut conn = self.backend.conn.lock().unwrap();
+            let col_id: Option<i32> = conn
+                .query_row(
+                    "SELECT id FROM custom_columns WHERE label = ?1",
+                    [label],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(id) = col_id else {
+                anyhow::bail!("Column '{}' not found", label);
+            };
+
+            let tx = conn.transaction()?;
+            tx.execute("DELETE FROM custom_columns WHERE id = ?1", [id])?;
+            // `id` is an integer we control (from the `custom_columns` row
+            // just looked up), not user input -- no injection risk from
+            // building the table name via `format!`.
+            tx.execute(&format!("DROP TABLE IF EXISTS custom_column_{id}"), [])?;
+            tx.commit()?;
+        }
+        self.record(crate::change_log::ChangeOp::CustomColumnRemoved { label: label.to_string() });
         Ok(())
     }
 
@@ -2447,8 +2466,25 @@ impl Cache {
 
     /// Port of `Library::set_preference`.
     pub fn set_preference(&self, key: &str, val: &str) -> anyhow::Result<()> {
-        let conn = self.backend.conn.lock().unwrap();
-        conn.execute("INSERT OR REPLACE INTO preferences (key, val) VALUES (?1, ?2)", (key, val))?;
+        {
+            let conn = self.backend.conn.lock().unwrap();
+            conn.execute("INSERT OR REPLACE INTO preferences (key, val) VALUES (?1, ?2)", (key, val))?;
+        }
+        // Outside the lock: appending fsyncs, and holding the connection
+        // mutex across that would serialise every reader behind disk I/O
+        // (#901's own warning).
+        self.record(crate::change_log::ChangeOp::PrefSet { key: key.to_string(), value: Some(val.to_string()) });
+        Ok(())
+    }
+
+    /// Removes a preference, so replay can express "this was unset"
+    /// rather than only "this was set to something".
+    pub fn clear_preference(&self, key: &str) -> anyhow::Result<()> {
+        {
+            let conn = self.backend.conn.lock().unwrap();
+            conn.execute("DELETE FROM preferences WHERE key = ?1", [key])?;
+        }
+        self.record(crate::change_log::ChangeOp::PrefSet { key: key.to_string(), value: None });
         Ok(())
     }
 
@@ -4406,6 +4442,52 @@ mod tests {
         assert_eq!(
             cache_b.field_for(id, "title").unwrap(),
             Some("Second".to_string())
+        );
+    }
+
+    /// #901: library-scoped writes reach the log too, so a rebuild can
+    /// restore preferences and not just books.
+    #[test]
+    fn setting_and_clearing_a_preference_is_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+
+        cache.set_preference("sort", "title").unwrap();
+        cache.clear_preference("sort").unwrap();
+
+        let log = cache.backend.change_log().unwrap();
+        let replay = log.replay().unwrap();
+        let ops: Vec<&crate::change_log::ChangeOp> = replay.changes().map(|c| &c.op).collect();
+        assert!(
+            ops.iter().any(|op| matches!(op, crate::change_log::ChangeOp::PrefSet { key, value: Some(v) } if key == "sort" && v == "title")),
+            "{ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(op, crate::change_log::ChangeOp::PrefSet { key, value: None } if key == "sort")),
+            "clearing a preference has to be expressible, or a replay cannot unset it: {ops:?}"
+        );
+    }
+
+    /// The schema half of #901: the column's *definition* is logged, not
+    /// just the values in it.
+    #[test]
+    fn creating_and_removing_a_custom_column_is_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+
+        cache.add_custom_column("shelf", "Shelf", "text", false).unwrap();
+        cache.remove_custom_column("shelf").unwrap();
+
+        let log = cache.backend.change_log().unwrap();
+        let replay = log.replay().unwrap();
+        let ops: Vec<&crate::change_log::ChangeOp> = replay.changes().map(|c| &c.op).collect();
+        assert!(
+            ops.iter().any(|op| matches!(op, crate::change_log::ChangeOp::CustomColumnAdded { label, datatype, .. } if label == "shelf" && datatype == "text")),
+            "{ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(op, crate::change_log::ChangeOp::CustomColumnRemoved { label } if label == "shelf")),
+            "{ops:?}"
         );
     }
 }

@@ -366,12 +366,12 @@ impl ChangeLog {
 
         // Walk backwards keeping the last change per supersede key --
         // the later one alone produces the same state.
-        let mut seen: HashSet<(String, String, String)> = HashSet::new();
+        let mut seen: HashSet<(crate::change_log::ChangeTarget, String, String)> = HashSet::new();
         let mut kept: Vec<Change> = Vec::new();
         for change in candidates.iter().rev() {
             match change.op.supersede_key() {
-                Some((book, kind, name)) => {
-                    let key = (book.to_string(), kind.to_string(), name.to_string());
+                Some((target, kind, name)) => {
+                    let key = (target, kind.to_string(), name.to_string());
                     if seen.insert(key) {
                         kept.push(change.clone());
                     } else {

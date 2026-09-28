@@ -64,6 +64,6 @@ pub mod hlc;
 pub mod store;
 
 pub use apply::{replay_into, ReplayReport};
-pub use change::{Change, ChangeOp, ChangeParseError};
+pub use change::{Change, ChangeOp, ChangeParseError, ChangeTarget};
 pub use hlc::{Hlc, HlcClock};
 pub use store::{ChangeLog, CompactionReport, InstallId, Replay, SnapshotHeader, VerifyReport, Watermark, DEFAULT_RETENTION};
