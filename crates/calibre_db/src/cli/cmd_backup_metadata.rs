@@ -41,15 +41,34 @@ impl CmdBackupMetadata {
         };
 
         println!("Backing up metadata for {} books...", book_ids.len());
+        let mut written = 0usize;
+        let mut failed = 0usize;
         for (i, id) in book_ids.iter().enumerate() {
-            if i % 100 == 0 {
+            if i > 0 && i % 100 == 0 {
                 println!("Processed {}/{}...", i, book_ids.len());
             }
-            if let Err(e) = db.backup_metadata_to_opf(*id) {
-                eprintln!("Failed to backup book {}: {}", id, e);
+            match db.backup_metadata_to_opf(*id) {
+                Ok(()) => written += 1,
+                Err(e) => {
+                    failed += 1;
+                    eprintln!("Failed to backup book {}: {}", id, e);
+                }
             }
         }
-        println!("Backup complete.");
+
+        // Report what was actually written. This used to print
+        // "Backup complete." unconditionally, which meant a library
+        // where every single book was skipped -- the case for every
+        // library in #889's layout, since `backup_metadata_to_opf`
+        // returned early for a book with an empty `path` -- still
+        // reported success with no backup on disk at all. A
+        // data-protection command must not claim to have done
+        // something it did not do.
+        if failed > 0 {
+            println!("Backed up {written} of {} books; {failed} failed.", book_ids.len());
+        } else {
+            println!("Backed up {written} books.");
+        }
         Ok(())
     }
 }

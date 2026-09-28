@@ -537,6 +537,29 @@ impl Cache {
         // collisions resolved by `free_format_stem`, nothing needs them,
         // and creating them imposes a structure on somebody else's
         // folder.
+        // A uuid parsed out of the book file is metadata *about* the
+        // book, not this library's identity for the row. `opf.rs` maps
+        // any `urn:uuid:` `dc:identifier` onto `MetaInformation::uuid`,
+        // and `add_book_db_entry` would write it straight over the uuid
+        // `books_insert_trg` generated -- so two files carrying the same
+        // identifier (the same book added twice, or two EPUBs from one
+        // generator) ended up sharing one `books.uuid`. Since #889 that
+        // uuid is the filename of the book's cover sidecar, so the
+        // second book's cover overwrote the first's and both then showed
+        // the same picture (#950).
+        //
+        // The value is kept as an identifier so it is not lost. An
+        // explicit uuid supplied by a caller still stands: restore and
+        // change-log replay legitimately reinstate a uuid this library
+        // issued earlier, and they do not come through here.
+        let metadata = &{
+            let mut owned = metadata.clone();
+            if let Some(from_file) = owned.uuid.take() {
+                owned.identifiers.entry("uuid".to_string()).or_insert(from_file);
+            }
+            owned
+        };
+
         let book_id = self.add_book_db_entry(metadata, "")?;
 
         // Delegate the actual file copy to `add_format` (same naming

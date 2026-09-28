@@ -290,6 +290,32 @@ where
     let handle = crate::library_handle::LibraryHandle::open(lib_path)
         .context("Failed to open library handle")?;
 
+    // Find what there is to restore *from* before touching the
+    // database. This used to run after `metadata.db` had already been
+    // renamed to `metadata_pre_restore.db`, so a library with no OPFs
+    // on disk was left with a freshly created, completely empty
+    // `metadata.db` -- the restore reported success having destroyed the
+    // index it was asked to rebuild. That was unreachable while
+    // `--really-do-it` could never be parsed (#949); it is reachable
+    // now, so the order matters.
+    let mut book_dirs: Vec<PathBuf> = WalkDir::new(lib_path)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name() == "metadata.opf")
+        .filter_map(|e| e.path().parent().map(|p| p.to_path_buf()))
+        .collect();
+    book_dirs.sort();
+
+    if book_dirs.is_empty() {
+        anyhow::bail!(
+            "found no metadata.opf files under {} -- there is nothing to rebuild the \
+             database from, so it has been left untouched. Run `calibredb \
+             backup_metadata --all` first to write the per-book metadata a restore \
+             reads.",
+            lib_path.display()
+        );
+    }
+
     let db_path = lib_path.join("metadata.db");
 
     if db_path.exists() {
@@ -307,14 +333,6 @@ where
 
     let cache = Cache::new(lib_path)?;
     progress_callback("Created new database schema.".to_string());
-
-    let mut book_dirs: Vec<PathBuf> = WalkDir::new(lib_path)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name() == "metadata.opf")
-        .filter_map(|e| e.path().parent().map(|p| p.to_path_buf()))
-        .collect();
-    book_dirs.sort();
 
     let mut used_ids: HashSet<i32> = HashSet::new();
     let mut report = RestoreReport::default();
