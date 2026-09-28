@@ -240,8 +240,19 @@ impl<'a> CheckLibrary<'a> {
                 }
 
                 if !path.is_dir() {
-                    self.invalid_authors
-                        .push((file_name.to_string(), file_name.to_string(), 0));
+                    // A plain file at the library root is only an
+                    // "invalid author" in the managed `<author>/<title
+                    // (id)>/` tree. Since #889 the library folder holds
+                    // book files directly, so the file is far more
+                    // likely to be a book the database already knows
+                    // about -- every book added by `calibredb add` has
+                    // an empty `path` and lands here. Reporting those
+                    // made `check_library` call a perfectly healthy
+                    // library broken, one line per book.
+                    if !self.is_claimed_by_a_book_in_the_root(file_name) {
+                        self.invalid_authors
+                            .push((file_name.to_string(), file_name.to_string(), 0));
+                    }
                     continue;
                 }
 
@@ -265,6 +276,126 @@ impl<'a> CheckLibrary<'a> {
 
         // Check for missing books (in DB but not on disk)
         self.check_missing_books();
+
+        // Everything the author-tree walk could not reach (#889).
+        let reached: HashSet<i32> = self
+            .book_dirs
+            .iter()
+            .filter_map(|(_, _, id)| id.parse::<i32>().ok())
+            .collect();
+        self.verify_books_from_the_database(&reached);
+    }
+
+    /// Whether `file_name` at the library root is a format file some
+    /// book in the database already claims.
+    ///
+    /// Compared case-insensitively, like every other filename
+    /// comparison here, because the check has to hold on Windows and
+    /// macOS too.
+    fn is_claimed_by_a_book_in_the_root(&self, file_name: &str) -> bool {
+        let wanted = file_name.to_lowercase();
+        self.all_ids.iter().any(|&id| {
+            let in_root = matches!(self.db.get_book(id), Ok(Some(book)) if book.path.is_empty());
+            in_root
+                && self
+                    .db
+                    .format_files(id)
+                    .map(|list| {
+                        list.iter()
+                            .any(|(name, ext)| format!("{}.{}", name, ext).to_lowercase() == wanted)
+                    })
+                    .unwrap_or(false)
+        })
+    }
+
+    /// Verifies every book at the location the database records for it.
+    ///
+    /// Book discovery used to be driven entirely by walking
+    /// `<author>/<title (id)>/` directories and parsing the id out of
+    /// the folder name -- the managed layout #889 replaced. A book's
+    /// files now sit wherever in the library folder its owner put them,
+    /// and a book added through `calibredb add` has an empty `path`: it
+    /// lives in the library root and matches no author/title folder at
+    /// all. Every check below was therefore dead for such a book, which
+    /// meant the format checksum verification that
+    /// `docs/FAULT_TOLERANCE.md` §8 is all about never ran on a library
+    /// in the shape this application actually produces -- real
+    /// corruption went unreported while `check_library` exited zero.
+    ///
+    /// The author-tree walk is left in place for libraries still in the
+    /// old shape; this pass covers every book it did not reach.
+    fn verify_books_from_the_database(&mut self, already_checked: &HashSet<i32>) {
+        for &book_id in &self.all_ids.clone() {
+            if already_checked.contains(&book_id) {
+                continue;
+            }
+            let Ok(Some(book)) = self.db.get_book(book_id) else {
+                continue;
+            };
+            let dir = self.library_path.join(&book.path);
+
+            // Resolve the on-disk spelling once: a format row records a
+            // stem and an extension, and the real file may differ in
+            // case from `<stem>.<lowercased ext>`.
+            let on_disk: HashMap<String, String> = fs::read_dir(&dir)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter_map(|e| e.file_name().to_str().map(|n| (n.to_lowercase(), n.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            for (name, ext) in self.db.format_files(book_id).unwrap_or_default() {
+                let wanted = format!("{}.{}", name, ext).to_lowercase();
+                let Some(actual) = on_disk.get(&wanted) else {
+                    self.missing_formats.push((
+                        book.title.clone(),
+                        dir.join(format!("{}.{}", name, ext.to_lowercase())).to_string_lossy().to_string(),
+                        book_id,
+                    ));
+                    continue;
+                };
+                let file_path = dir.join(actual);
+                if let Err(ChecksumError::Mismatch { .. }) =
+                    self.checksums.verify_file(book_id, "format", &ext.to_uppercase(), &file_path)
+                {
+                    self.corrupted_formats.push((
+                        book.title.clone(),
+                        file_path.to_string_lossy().to_string(),
+                        book_id,
+                    ));
+                }
+            }
+
+            // Covers moved out of the book folder and into
+            // `.calibre-oxide/covers/` (see `covers::sidecar_cover_path`),
+            // so looking for a `cover.jpg` beside the book -- which is
+            // what the walk above still does -- finds nothing for any
+            // book whose cover was written by the current code. Ask the
+            // covers module where it actually put it.
+            if self.db.has_cover(book_id).unwrap_or(false) {
+                match crate::covers::cover_path(self.db, book_id) {
+                    Ok(cover) if cover.is_file() => {
+                        if let Err(ChecksumError::Mismatch { .. }) =
+                            self.checksums.verify_file(book_id, "cover", "", &cover)
+                        {
+                            self.corrupted_covers.push((
+                                book.title.clone(),
+                                cover.to_string_lossy().to_string(),
+                                book_id,
+                            ));
+                        }
+                    }
+                    Ok(cover) => self.missing_covers.push((
+                        book.title.clone(),
+                        cover.to_string_lossy().to_string(),
+                        book_id,
+                    )),
+                    Err(_) => {}
+                }
+            }
+        }
     }
 
     fn process_author_dir(&mut self, auth_path: &Path, auth_dir_name: &str) {
@@ -623,6 +754,85 @@ mod tests {
             .record_file(book_id, "format", "EPUB", &file_path)
             .unwrap();
         file_path
+    }
+
+    /// A book in the library root, the way `calibredb add` records one
+    /// since #889: `books.path` is empty and the file sits at the top
+    /// level rather than in an `<author>/<title (id)>/` folder.
+    fn seed_flat_book(dir: &Path, book_id: i32, file_name: &str, bytes: &[u8]) -> PathBuf {
+        let backend = Backend::new(dir).unwrap();
+        let stem = Path::new(file_name).file_stem().unwrap().to_str().unwrap();
+        {
+            let conn = backend.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO books (id, title, author_sort, path) VALUES (?1, 'Flat Book', 'Author A', '')",
+                (book_id,),
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO data (book, format, uncompressed_size, name) VALUES (?1, 'EPUB', ?2, ?3)",
+                (book_id, bytes.len() as i64, stem),
+            )
+            .unwrap();
+        }
+        let file_path = dir.join(file_name);
+        fs::write(&file_path, bytes).unwrap();
+        let lib = Cache::new(dir).unwrap();
+        lib.checksums()
+            .record_file(book_id, "format", "EPUB", &file_path)
+            .unwrap();
+        file_path
+    }
+
+    #[test]
+    fn a_healthy_book_in_the_library_root_is_not_reported_as_a_problem() {
+        let dir = tempdir().unwrap();
+        seed_flat_book(dir.path(), 1, "A Book.epub", b"original bytes");
+
+        let lib = Cache::new(dir.path()).unwrap();
+        let mut checker = CheckLibrary::new(dir.path().to_path_buf(), &lib);
+        checker.scan_library(vec![], vec![]);
+
+        // The whole point of #889's layout: the book file lives at the
+        // top level. Calling it an invalid author name reported every
+        // book in a healthy library as broken.
+        assert!(checker.invalid_authors.is_empty(), "{:?}", checker.invalid_authors);
+        assert!(checker.corrupted_formats.is_empty(), "{:?}", checker.corrupted_formats);
+        assert!(checker.missing_formats.is_empty(), "{:?}", checker.missing_formats);
+    }
+
+    #[test]
+    fn scan_library_flags_a_tampered_book_in_the_library_root() {
+        let dir = tempdir().unwrap();
+        let file_path = seed_flat_book(dir.path(), 1, "A Book.epub", b"original bytes");
+        fs::write(&file_path, b"corrupted on disk").unwrap();
+
+        let lib = Cache::new(dir.path()).unwrap();
+        let mut checker = CheckLibrary::new(dir.path().to_path_buf(), &lib);
+        checker.scan_library(vec![], vec![]);
+
+        // Before the database-driven pass this was silently empty: the
+        // book matched no author/title folder, so §8's checksum
+        // verification never ran for it and corruption in a real
+        // library went unreported.
+        assert_eq!(checker.corrupted_formats.len(), 1, "{:?}", checker.corrupted_formats);
+        assert_eq!(checker.corrupted_formats[0].2, 1);
+    }
+
+    #[test]
+    fn scan_library_flags_a_deleted_book_file_in_the_library_root() {
+        let dir = tempdir().unwrap();
+        let file_path = seed_flat_book(dir.path(), 1, "A Book.epub", b"original bytes");
+        fs::remove_file(&file_path).unwrap();
+
+        let lib = Cache::new(dir.path()).unwrap();
+        let mut checker = CheckLibrary::new(dir.path().to_path_buf(), &lib);
+        checker.scan_library(vec![], vec![]);
+
+        // `check_missing_books` skips any book whose `path` is empty,
+        // so a root-level book losing its file was invisible too.
+        assert_eq!(checker.missing_formats.len(), 1, "{:?}", checker.missing_formats);
+        assert_eq!(checker.missing_formats[0].2, 1);
     }
 
     #[test]
