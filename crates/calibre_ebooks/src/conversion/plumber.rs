@@ -283,7 +283,10 @@ mod dump_input_tests {
 
         let opf_text = fs::read_to_string(dump_dir.join("content.opf")).unwrap();
         assert!(opf_text.contains("<manifest>"));
-        assert!(opf_text.contains("<spine>"));
+        // `<spine toc="...">` rather than a bare `<spine>`: EPUB 2 requires
+        // the spine to name an NCX, so asserting the bare form was
+        // asserting the invalid shape.
+        assert!(opf_text.contains("<spine toc="), "the spine should name an NCX:\n{opf_text}");
     }
 }
 
