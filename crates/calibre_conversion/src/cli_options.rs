@@ -113,6 +113,10 @@ pub struct ConvertArgs {
     pub insert_metadata: bool,
     #[arg(long)]
     pub prefer_metadata_cover: bool,
+
+    /// Read metadata from this OPF file and apply it to the output.
+    #[arg(long, value_name = "FILE")]
+    pub read_metadata_from_opf: Option<std::path::PathBuf>,
     #[arg(short = 'v', long, action = clap::ArgAction::Count)]
     pub verbose: u8,
     #[arg(long)]
@@ -207,6 +211,7 @@ impl ConvertArgs {
         o.remove_first_image = self.remove_first_image;
         o.insert_metadata = self.insert_metadata;
         o.prefer_metadata_cover = self.prefer_metadata_cover;
+        o.read_metadata_from_opf = self.read_metadata_from_opf;
         o.verbose = self.verbose;
         o.pretty_print = self.pretty_print;
 
