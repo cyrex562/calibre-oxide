@@ -57,7 +57,7 @@ use std::path::Path;
 /// beside the dispatch below so the two cannot drift -- a test asserts
 /// they agree.
 pub fn can_set_metadata(extension: &str) -> bool {
-    matches!(extension.to_lowercase().as_str(), "epub" | "odt" | "docx" | "pdf" | "fb2" | "rtf")
+    matches!(extension.to_lowercase().as_str(), "epub" | "odt" | "docx" | "pdf" | "fb2" | "rtf" | "htmlz" | "txtz")
 }
 
 /// Writes `mi` into the book file at `path`, in place (#834).
@@ -81,9 +81,10 @@ pub fn set_metadata<P: AsRef<Path>>(path: P, mi: &MetaInformation) -> Result<()>
         "pdf" => pdf::set_metadata(path, mi),
         "fb2" => fb2::set_metadata(path, mi),
         "rtf" => rtf::set_metadata(path, mi),
+        "htmlz" | "txtz" => extz::set_metadata(path, mi),
         // Named rather than lumped together: "no writer for MOBI yet" is
         // a different thing to tell a user than "that is not a book".
-        "mobi" | "prc" | "azw" | "azw3" | "lit" | "rb" | "imp" | "lrf" | "lrx" | "azw4" | "chm" | "snb" | "pdb" | "updb" | "txt" | "html" | "htm" | "xhtml" => {
+        "mobi" | "prc" | "azw" | "azw3" | "lit" | "rb" | "imp" | "lrf" | "lrx" | "azw4" | "chm" | "snb" | "pdb" | "updb" | "txt" | "html" | "htm" | "xhtml" | "zip" | "cbz" | "rar" | "cbr" => {
             bail!("no metadata writer for {ext} yet")
         }
         _ => bail!("Unsupported format: {}", ext),
@@ -119,6 +120,10 @@ pub fn get_metadata<P: AsRef<Path>>(path: P) -> Result<MetaInformation> {
         "txt" => txt::get_metadata(stream),
         "rtf" => rtf::get_metadata(stream),
         "html" | "htm" | "xhtml" => html::get_metadata(stream),
+        // EXTZ: a zip of content plus an OPF. Both were missing from this
+        // dispatcher, so a `.htmlz` -- which this project both converts to
+        // and from -- had no readable metadata at all.
+        "htmlz" | "txtz" => extz::get_metadata(stream),
         "zip" | "cbz" => zip::get_metadata(stream),
         "rar" | "cbr" => rar::get_metadata(stream),
         // "xmp" => xmp::get_metadata(stream), // XMP usually sidecar?
@@ -141,7 +146,7 @@ mod set_metadata_dispatch_tests {
         // or the other rather than being untested.
         let extensions = [
             "epub", "mobi", "prc", "azw", "azw3", "fb2", "lit", "pdf", "rb", "imp", "lrf", "lrx", "azw4", "chm", "docx", "odt", "snb", "pdb", "updb", "txt",
-            "rtf", "html", "htm", "xhtml", "zip", "cbz", "rar", "cbr",
+            "rtf", "html", "htm", "xhtml", "zip", "cbz", "rar", "cbr", "htmlz", "txtz",
         ];
 
         for ext in extensions {
@@ -172,11 +177,11 @@ mod set_metadata_dispatch_tests {
         }
     }
 
-    /// The six formats with writers, named explicitly so removing one is a
+    /// The formats with writers, named explicitly so removing one is a
     /// deliberate act rather than a quiet regression.
     #[test]
     fn the_six_written_formats_are_claimed() {
-        for ext in ["epub", "odt", "docx", "pdf", "fb2", "rtf"] {
+        for ext in ["epub", "odt", "docx", "pdf", "fb2", "rtf", "htmlz", "txtz"] {
             assert!(can_set_metadata(ext), "{ext} should be writable");
             assert!(can_set_metadata(&ext.to_uppercase()), "{ext} should be recognised case-insensitively");
         }

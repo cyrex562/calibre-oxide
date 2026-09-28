@@ -364,7 +364,12 @@ fn replace_dc(xml: &mut Xml, metadata: XmlNodeId, local: &str, values: &[String]
     }
 }
 
-fn rewrite_opf(opf: &str, mi: &MetaInformation) -> Result<Vec<u8>> {
+/// Rewrites an OPF's `metadata` element from `mi`.
+///
+/// Shared with [`crate::metadata::extz::set_metadata`]: HTMLZ and TXTZ are
+/// zips carrying an OPF, so updating their metadata is the same edit as an
+/// EPUB's, only the OPF is located differently.
+pub(crate) fn rewrite_opf(opf: &str, mi: &MetaInformation) -> Result<Vec<u8>> {
     let mut xml = Xml::parse(opf).context("parsing the OPF")?;
     // Read only to fail early on something that is not an OPF at all.
     xml.root_element().context("the OPF has no root element")?;
