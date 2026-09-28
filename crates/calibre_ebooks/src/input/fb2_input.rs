@@ -120,7 +120,16 @@ impl FB2Input {
                     .decode(clean_text)
                     .context("Failed to decode base64 binary")?;
 
-                let file_path = output_dir.join(id);
+                // `id` is an attribute out of the FB2's own XML, so it is
+                // untrusted: `join("../../x")` would write outside the
+                // output directory. See `input::safe_join`.
+                // This is one binary, not a loop -- returning `Ok`
+                // skips it and leaves the rest of the book intact, which
+                // is what dropping a single image should cost.
+                let Some(file_path) = crate::input::safe_join(output_dir, id) else {
+                    log::warn!("skipping FB2 binary whose id escapes the output directory: {id:?}");
+                    return Ok(());
+                };
                 fs::write(&file_path, data)?;
 
                 book.manifest.items.insert(

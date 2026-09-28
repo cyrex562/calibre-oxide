@@ -55,7 +55,15 @@ impl CHMInput {
                 log::warn!("could not read {entry} from {}", input_path.display());
                 continue;
             };
-            let destination = output_dir.join(relative);
+            // Entry paths come from a file the user did not write, so
+            // they are untrusted input. `output_dir.join("../../x")`
+            // escapes the output directory and writes wherever the process
+            // can reach -- the zip-slip shape, and an ebook converter
+            // handles files off the internet by definition.
+            let Some(destination) = super::safe_join(output_dir, relative) else {
+                log::warn!("skipping CHM entry that escapes the output directory: {entry}");
+                continue;
+            };
             if let Some(parent) = destination.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -171,6 +179,61 @@ mod tests {
         if index.exists() {
             let text = std::fs::read_to_string(&index).unwrap();
             assert!(!text.contains("Not Supported Yet"), "the placeholder page is still being written:\n{text}");
+        }
+    }
+
+    /// A CHM is a file the user did not write, so its entry paths are
+    /// untrusted. Joining one straight onto the output directory is the
+    /// zip-slip shape: `output_dir.join("../../x")` escapes and writes
+    /// wherever the process can reach.
+    #[test]
+    fn an_entry_that_escapes_the_output_directory_is_rejected() {
+        let base = Path::new("/tmp/out");
+        for hostile in [
+            "../escaped.html",
+            "../../escaped.html",
+            "a/../../escaped.html",
+            "a/b/../../../escaped.html",
+            "/absolute.html",
+            "..",
+            ".",
+            "",
+        ] {
+            assert_eq!(super::super::safe_join(base, hostile), None, "{hostile:?} should have been rejected");
+        }
+    }
+
+    /// The exact shape the old code let through: leading slashes were
+    /// stripped with `trim_start_matches('/')`, which turns
+    /// `/../../etc/x` into `../../etc/x` and then joins it.
+    #[test]
+    fn stripping_a_leading_slash_does_not_reopen_the_escape() {
+        let base = Path::new("/tmp/out");
+        let entry = "/../../etc/passwd";
+        let stripped = entry.trim_start_matches('/');
+        assert_eq!(stripped, "../../etc/passwd", "this is what the old code produced");
+        assert_eq!(super::super::safe_join(base, stripped), None, "and it must not be joinable");
+    }
+
+    /// Ordinary entries still work, including nested ones and `./`.
+    #[test]
+    fn ordinary_entries_are_joined_under_the_output_directory() {
+        let base = Path::new("/tmp/out");
+        assert_eq!(super::super::safe_join(base, "index.html"), Some(base.join("index.html")));
+        assert_eq!(super::super::safe_join(base, "images/logo.png"), Some(base.join("images/logo.png")));
+        assert_eq!(super::super::safe_join(base, "./index.html"), Some(base.join("index.html")));
+        assert_eq!(super::super::safe_join(base, "a/./b/c.html"), Some(base.join("a/b/c.html")));
+    }
+
+    /// Every result stays under the base -- the property the guard exists
+    /// for, asserted directly rather than inferred from the rejections.
+    #[test]
+    fn every_accepted_path_stays_under_the_base() {
+        let base = Path::new("/tmp/out");
+        for entry in ["index.html", "a/b.png", "./x/y/z.css", "weird..name.html", "..hidden.html"] {
+            if let Some(joined) = super::super::safe_join(base, entry) {
+                assert!(joined.starts_with(base), "{entry:?} produced {joined:?}, which is outside {base:?}");
+            }
         }
     }
 

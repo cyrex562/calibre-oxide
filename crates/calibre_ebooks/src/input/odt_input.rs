@@ -197,7 +197,12 @@ fn extract_pictures<R: Read + std::io::Seek>(
         if rel.is_empty() {
             continue;
         }
-        let dest = pictures_dir.join(rel);
+        // `rel` comes from a zip entry name, so `Pictures/../../x` would
+        // escape once the prefix is trimmed -- see `input::safe_join`.
+        let Some(dest) = crate::input::safe_join(&pictures_dir, rel) else {
+            log::warn!("skipping ODT picture that escapes the output directory: {name}");
+            continue;
+        };
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).with_context(|| format!("Failed to create {parent:?}"))?;
         }
