@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use chrono::Utc;
 
 use crate::metadata::meta::MetaInformation;
+use crate::metadata::zip_edit::placeholders;
 use crate::oeb::book::OEBBook;
 
 /// Port of `meta_info_to_oeb_metadata`: copy every non-null field of
@@ -22,9 +23,14 @@ pub fn meta_info_to_oeb_metadata(
     m: &mut crate::oeb::metadata::Metadata,
     override_input_metadata: bool,
 ) {
-    if !mi.title.is_empty() {
+    // Guarded by `real_title`, not `is_empty`. `MetaInformation::default()`
+    // sets `title = "Unknown"`, which is *not* empty -- so an
+    // `is_empty` check made every conversion clear the book's real title
+    // and write "Unknown" over it. Upstream guards with `mi.is_null`,
+    // which treats that placeholder as absent; this is the same rule.
+    if let Some(title) = placeholders::real_title(&mi.title) {
         m.clear("title");
-        m.add("title", &mi.title);
+        m.add("title", title);
     }
     if let Some(title_sort) = mi.title_sort.as_deref().filter(|s| !s.is_empty()) {
         if m.first("title").is_none() {
@@ -33,7 +39,9 @@ pub fn meta_info_to_oeb_metadata(
         m.clear("title_sort");
         m.add("title_sort", title_sort);
     }
-    if !mi.authors.is_empty() {
+    // Same placeholder trap: the default is `["Unknown"]`, so an
+    // `is_empty` check replaced every book's real authors with "Unknown".
+    if let Some(authors) = placeholders::real_authors(&mi.authors) {
         m.filter("creator", |x| {
             let role = x
                 .get_attribute("role")
@@ -41,7 +49,7 @@ pub fn meta_info_to_oeb_metadata(
                 .unwrap_or_default();
             role == "aut" || role.is_empty()
         });
-        for a in &mi.authors {
+        for a in authors {
             let mut attrib = HashMap::new();
             attrib.insert("role".to_string(), "aut".to_string());
             if let Some(author_sort) = mi.author_sort.as_deref().filter(|s| !s.is_empty()) {
@@ -97,9 +105,10 @@ pub fn meta_info_to_oeb_metadata(
                 .unwrap_or(false)
         });
     }
-    if !mi.languages.is_empty() {
+    // And again: the default is `["und"]`.
+    if let Some(languages) = placeholders::real_languages(&mi.languages) {
         m.clear("language");
-        for lang in &mi.languages {
+        for lang in languages {
             if !lang.is_empty() && !lang.eq_ignore_ascii_case("und") {
                 m.add("language", lang);
             }

@@ -1,6 +1,6 @@
 use crate::conversion::options::ConversionOptions;
 use crate::oeb::book::OEBBook;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::tempdir;
@@ -163,7 +163,21 @@ impl Plumber {
 
         let opts = &self.opts;
         let mut report = |msg: &str| println!("{msg}");
-        let user_metadata = MetaInformation::default();
+        // Upstream's `read_user_metadata`: the OPF's metadata when
+        // `--read-metadata-from-opf` was given, and otherwise blank, which
+        // leaves `MergeMetadata` carrying through whatever the input file
+        // already said.
+        //
+        // A failure to read the OPF is *not* swallowed. Being asked to
+        // apply specific metadata and silently applying none would produce
+        // a book that looks converted and has the wrong title on it.
+        let user_metadata = match &opts.read_metadata_from_opf {
+            Some(path) => {
+                let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+                crate::opf::parse_opf(&text).with_context(|| format!("parsing {}", path.display()))?
+            }
+            None => MetaInformation::default(),
+        };
         let jacket_opts = opts.jacket_options();
 
         DataURL.call(book);
@@ -357,6 +371,94 @@ mod write_output_threads_opts_tests {
     /// way `mobi_output_test.rs`'s own option test does) -- a real
     /// `.mobi` conversion with `opts.mobi.dont_compress = true` set on
     /// the `Plumber` itself produces real uncompressed output.
+    /// `--read-metadata-from-opf` is how calibre's own GUI puts *library*
+    /// metadata into a converted file. Without it a conversion keeps
+    /// whatever the input said, so a title corrected in the library never
+    /// reaches the output.
+    #[test]
+    fn read_metadata_from_opf_overrides_the_inputs_own_title() {
+        let src = tempdir().unwrap();
+        let html_path = src.path().join("book.html");
+        fs::write(&html_path, "<html><head><title>The Input's Own Title</title></head><body><p>Text.</p></body></html>").unwrap();
+
+        let opf_path = src.path().join("metadata.opf");
+        fs::write(
+            &opf_path,
+            r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="uid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
+    <dc:title>The Library's Corrected Title</dc:title>
+    <dc:creator opf:role="aut">Ann Author</dc:creator>
+    <dc:identifier id="uid">urn:uuid:test</dc:identifier>
+  </metadata>
+  <manifest/>
+  <spine/>
+</package>"#,
+        )
+        .unwrap();
+
+        let out_dir = tempdir().unwrap();
+        let epub_path = out_dir.path().join("book.epub");
+
+        let mut opts = ConversionOptions::default();
+        opts.read_metadata_from_opf = Some(opf_path);
+        Plumber::with_options(&html_path, &epub_path, opts).run().unwrap();
+
+        let produced = crate::metadata::get_metadata(&epub_path).unwrap();
+        assert_eq!(produced.title, "The Library's Corrected Title", "the OPF's title should have won over the input's");
+        assert!(produced.authors.contains(&"Ann Author".to_string()), "the OPF's author should have reached the output: {:?}", produced.authors);
+    }
+
+    /// Without the flag, the input's own metadata is what comes through --
+    /// the behaviour every existing conversion relies on.
+    #[test]
+    fn without_the_flag_the_inputs_own_metadata_is_kept() {
+        let src = tempdir().unwrap();
+        let html_path = src.path().join("book.html");
+        fs::write(&html_path, "<html><head><title>The Input's Own Title</title></head><body><p>Text.</p></body></html>").unwrap();
+
+        let out_dir = tempdir().unwrap();
+        let epub_path = out_dir.path().join("book.epub");
+        Plumber::new(&html_path, &epub_path).run().unwrap();
+
+        assert_eq!(crate::metadata::get_metadata(&epub_path).unwrap().title, "The Input's Own Title");
+    }
+
+    /// Being asked to apply specific metadata and silently applying none
+    /// would produce a book that looks converted and carries the wrong
+    /// title. So a missing OPF fails the conversion.
+    #[test]
+    fn a_missing_opf_fails_rather_than_being_ignored() {
+        let src = tempdir().unwrap();
+        let html_path = src.path().join("book.html");
+        fs::write(&html_path, "<html><body><p>Text.</p></body></html>").unwrap();
+
+        let out_dir = tempdir().unwrap();
+        let epub_path = out_dir.path().join("book.epub");
+
+        let mut opts = ConversionOptions::default();
+        opts.read_metadata_from_opf = Some(src.path().join("not-there.opf"));
+        let err = Plumber::with_options(&html_path, &epub_path, opts).run().expect_err("a missing OPF should fail the conversion");
+        assert!(format!("{err:#}").contains("not-there.opf"), "the error should name the file: {err:#}");
+    }
+
+    /// An OPF that is not parseable is the same class of problem.
+    #[test]
+    fn an_unparseable_opf_fails_rather_than_being_ignored() {
+        let src = tempdir().unwrap();
+        let html_path = src.path().join("book.html");
+        fs::write(&html_path, "<html><body><p>Text.</p></body></html>").unwrap();
+        let opf_path = src.path().join("broken.opf");
+        fs::write(&opf_path, "<package><metadata>unclosed").unwrap();
+
+        let out_dir = tempdir().unwrap();
+        let epub_path = out_dir.path().join("book.epub");
+
+        let mut opts = ConversionOptions::default();
+        opts.read_metadata_from_opf = Some(opf_path);
+        assert!(Plumber::with_options(&html_path, &epub_path, opts).run().is_err(), "an unparseable OPF should fail the conversion");
+    }
+
     #[test]
     fn plumber_threads_a_real_mobi_option_from_conversion_options_through_to_the_output_file() {
         let src = tempdir().unwrap();

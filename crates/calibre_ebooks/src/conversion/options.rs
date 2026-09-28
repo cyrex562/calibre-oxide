@@ -106,6 +106,14 @@ pub struct ConversionOptions {
     pub remove_first_image: bool,
     pub insert_metadata: bool,
     pub prefer_metadata_cover: bool,
+    /// Read the metadata to apply from this OPF instead of using only what
+    /// the input file carries.
+    ///
+    /// Upstream's `--read-metadata-from-opf`. This is how calibre's own
+    /// GUI conversion puts *library* metadata into the output: without it
+    /// a converted file keeps whatever the input happened to say, so a
+    /// title corrected in the library never reaches the new file.
+    pub read_metadata_from_opf: Option<std::path::PathBuf>,
     pub verbose: u8,
     pub pretty_print: bool,
 
@@ -150,6 +158,7 @@ impl Default for ConversionOptions {
             remove_first_image: false,
             insert_metadata: false,
             prefer_metadata_cover: false,
+            read_metadata_from_opf: None,
             verbose: 0,
             pretty_print: false,
 

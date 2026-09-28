@@ -50,6 +50,48 @@ impl OEBWriter {
         Ok(())
     }
 
+/// The `dc:`-prefixed tag for a metadata term, or `None` if the term is
+/// not a Dublin Core element and belongs in a `<meta name=... content=...>`.
+///
+/// This used to be `term.starts_with("dc:")`, which nothing satisfied:
+/// every producer in this crate adds bare terms (`m.add("title", ..)` in
+/// `meta_info_to_oeb_metadata`, `html_input`, and the rest). So **every
+/// OPF this writer produced had no `dc:title`, `dc:creator` or
+/// `dc:language`** -- only `<meta name="title" content="..."/>`, which no
+/// reader looks at and which makes the EPUB invalid, since EPUB 2 requires
+/// those elements. It is also why a converted book's title read back as
+/// "Unknown".
+fn dublin_core_tag(term: &str) -> Option<String> {
+    // Already namespaced by the caller.
+    if let Some(rest) = term.strip_prefix("dc:") {
+        return Some(format!("dc:{rest}"));
+    }
+    // The Dublin Core 1.1 element set, which is exactly what OPF 2.0
+    // permits inside `<metadata>`. Anything else is a `<meta>`.
+    const DC_ELEMENTS: [&str; 15] = [
+        "title",
+        "creator",
+        "contributor",
+        "subject",
+        "description",
+        "publisher",
+        "date",
+        "type",
+        "format",
+        "identifier",
+        "source",
+        "language",
+        "relation",
+        "coverage",
+        "rights",
+    ];
+    let lower = term.to_ascii_lowercase();
+    if DC_ELEMENTS.contains(&lower.as_str()) {
+        return Some(format!("dc:{lower}"));
+    }
+    None
+}
+
     pub fn write_opf(&self, book: &OEBBook) -> Result<String> {
         let mut out = String::new();
         out.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
@@ -59,21 +101,9 @@ impl OEBWriter {
         // Metadata
         out.push_str("  <metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:opf=\"http://www.idpf.org/2007/opf\">\n");
         for item in &book.metadata.items {
-            if item.term.starts_with("dc:") || item.term.starts_with('{') {
-                // naive sanity check, already namespaced normally
-                // Dublin core elements usually don't have attributes in basic use,
-                // but OEB defines roles etc. My MetadataItem struct needs to be checked.
-                // It has `attributes` map.
-                let tag = if item.term.starts_with('{') {
-                    // resolve namespace logic later if needed, for now assume simple storage
-                    // But wait, my reader sanitized names.
-                    item.term.clone() // Placeholder, ideally specific handling
-                } else {
-                    item.term.clone()
-                };
-
-                // Basic DC output: <dc:title>Value</dc:title>
-                // If it has attributes like opf:role...
+            if let Some(tag) = Self::dublin_core_tag(&item.term) {
+                // `<dc:title>Value</dc:title>`, with any `opf:role` /
+                // `opf:file-as` attributes the item carries.
                 let mut attrs_str = String::new();
                 for (k, v) in &item.attrib {
                     attrs_str.push_str(&format!(" {}=\"{}\"", k, escape_xml(v)));
