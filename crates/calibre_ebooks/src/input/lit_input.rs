@@ -44,7 +44,14 @@ impl LitInput {
             .get_metadata()
             .context("Failed to read LIT metadata")?;
         let opf_path = container.litfile.opf_path.clone();
-        fs::write(output_dir.join(&opf_path), opf.as_bytes())?;
+        // Paths out of the LIT's own manifest are untrusted -- see
+        // `input::safe_join`.
+        let opf_destination = crate::input::safe_join(output_dir, &opf_path)
+            .ok_or_else(|| anyhow::anyhow!("the LIT's OPF path {opf_path:?} escapes the output directory"))?;
+        if let Some(parent) = opf_destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&opf_destination, opf.as_bytes())?;
 
         let mut book = OEBBook::new(Box::new(DirContainer::new(output_dir)));
 
@@ -59,7 +66,10 @@ impl LitInput {
                 .read(&item.path)
                 .with_context(|| format!("Failed to read {} from LIT file", item.path))?;
 
-            let target = output_dir.join(&item.path);
+            let Some(target) = crate::input::safe_join(output_dir, &item.path) else {
+                log::warn!("skipping LIT entry that escapes the output directory: {}", item.path);
+                continue;
+            };
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
             }
