@@ -57,7 +57,7 @@ use std::path::Path;
 /// beside the dispatch below so the two cannot drift -- a test asserts
 /// they agree.
 pub fn can_set_metadata(extension: &str) -> bool {
-    matches!(extension.to_lowercase().as_str(), "epub" | "odt" | "docx" | "pdf" | "fb2" | "rtf" | "htmlz" | "txtz" | "mobi" | "azw" | "prc")
+    matches!(extension.to_lowercase().as_str(), "epub" | "odt" | "docx" | "pdf" | "fb2" | "rtf" | "htmlz" | "txtz" | "mobi" | "azw" | "prc" | "azw3")
 }
 
 /// Writes `mi` into the book file at `path`, in place (#834).
@@ -84,10 +84,18 @@ pub fn set_metadata<P: AsRef<Path>>(path: P, mi: &MetaInformation) -> Result<()>
         "htmlz" | "txtz" => extz::set_metadata(path, mi),
         // AZW3/KF8 is deliberately absent: its record layout differs and
         // this writer is the MOBI6 one.
-        "mobi" | "azw" | "prc" => mobi::set_metadata(path, mi),
+        // azw3 (KF8) too: it is the same Palm database with the same
+        // record 0 and the same EXTH block, which is all this writer
+        // touches, and upstream's `MOBIMetadataWriter` claims
+        // `{mobi, prc, azw, azw3, azw4}` and routes every one of them to
+        // the same `metadata/mobi.py:set_metadata` with no KF8 special
+        // case. `get_metadata` here has always read azw3 through this
+        // same module; only the writer was excluded, and the "no writer
+        // for azw3 yet" it reported was not true of the code.
+        "mobi" | "azw" | "prc" | "azw3" => mobi::set_metadata(path, mi),
         // Named rather than lumped together: "no writer for MOBI yet" is
         // a different thing to tell a user than "that is not a book".
-        "azw3" | "lit" | "rb" | "imp" | "lrf" | "lrx" | "azw4" | "chm" | "snb" | "pdb" | "updb" | "txt" | "html" | "htm" | "xhtml" | "zip" | "cbz" | "rar" | "cbr" => {
+        "lit" | "rb" | "imp" | "lrf" | "lrx" | "azw4" | "chm" | "snb" | "pdb" | "updb" | "txt" | "html" | "htm" | "xhtml" | "zip" | "cbz" | "rar" | "cbr" => {
             bail!("no metadata writer for {ext} yet")
         }
         _ => bail!("Unsupported format: {}", ext),

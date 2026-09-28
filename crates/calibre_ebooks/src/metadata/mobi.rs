@@ -743,6 +743,64 @@ mod set_metadata_tests {
         assert!(after.iter().any(|(c, _)| *c == 101), "the publisher was not written");
     }
 
+    /// The same file, declared KF8.
+    ///
+    /// `file_version` lives at record 0 offset 0x24; 8 marks the file as
+    /// KF8, which is what an `.azw3` is. Nothing else about the Palm
+    /// database or the EXTH block differs, which is the point: the writer
+    /// touches only those, so a KF8 file needs no separate code path --
+    /// and upstream's MOBI metadata writer likewise claims `azw3` and
+    /// routes it to the same function.
+    fn declare_kf8(path: &Path) {
+        let mut data = std::fs::read(path).unwrap();
+        let record0 = u32::from_be_bytes([data[78], data[79], data[80], data[81]]) as usize;
+        data[record0 + 0x24..record0 + 0x28].copy_from_slice(&8u32.to_be_bytes());
+        std::fs::write(path, data).unwrap();
+    }
+
+    /// #834: `azw3` reported "no metadata writer for azw3 yet" while
+    /// `get_metadata` had always read it through this very module. The
+    /// exclusion was not true of the code.
+    #[test]
+    fn an_azw3_round_trips_through_the_public_dispatcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let mobi = a_mobi(&dir);
+        let path = dir.path().join("book.azw3");
+        std::fs::rename(&mobi, &path).unwrap();
+        declare_kf8(&path);
+
+        assert!(crate::metadata::can_set_metadata("azw3"), "azw3 is still advertised as unwritable");
+
+        let mut mi = MetaInformation::default();
+        mi.title = "Corrected KF8 Title".to_string();
+        mi.authors = vec!["Ann Author".to_string()];
+        crate::metadata::set_metadata(&path, &mi).unwrap();
+
+        // Read back through the public reader, which routes azw3 here too.
+        let got = crate::metadata::get_metadata(&path).unwrap();
+        assert_eq!(got.title, "Corrected KF8 Title");
+        assert!(got.authors.contains(&"Ann Author".to_string()), "{:?}", got.authors);
+    }
+
+    /// The KF8 file has to stay a valid Palm database as well -- the same
+    /// offset arithmetic that `the_record_offsets_stay_consistent` covers
+    /// for MOBI6, checked through the file the dispatcher actually wrote.
+    #[test]
+    fn an_azw3_stays_readable_after_repeated_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mobi = a_mobi(&dir);
+        let path = dir.path().join("book.azw3");
+        std::fs::rename(&mobi, &path).unwrap();
+        declare_kf8(&path);
+
+        for n in 0..3 {
+            let mut mi = MetaInformation::default();
+            mi.title = format!("Pass {n}");
+            crate::metadata::set_metadata(&path, &mi).unwrap();
+            assert_eq!(crate::metadata::get_metadata(&path).unwrap().title, format!("Pass {n}"));
+        }
+    }
+
     #[test]
     fn a_file_that_is_not_a_mobi_is_refused() {
         let dir = tempfile::tempdir().unwrap();
