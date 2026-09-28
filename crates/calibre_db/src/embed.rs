@@ -176,13 +176,16 @@ mod tests {
     #[test]
     fn a_format_without_a_writer_is_reported() {
         let (dir, cache, book_id) = library_with_an_epub();
-        let mobi = dir.path().join("book.mobi");
-        std::fs::write(&mobi, b"not really a mobi").unwrap();
-        cache.add_format(book_id, &mobi, "MOBI", true).unwrap();
+        // LIT, not MOBI: MOBI gained a writer (#834), and a test that used
+        // it to stand for "unsupported" would silently stop testing the
+        // NoWriter path rather than failing.
+        let lit = dir.path().join("book.lit");
+        std::fs::write(&lit, b"not really a lit").unwrap();
+        cache.add_format(book_id, &lit, "LIT", true).unwrap();
 
         let outcomes = embed_metadata(&cache, book_id).unwrap();
-        let mobi_outcome = outcomes.iter().find(|(f, _)| f == "MOBI").map(|(_, o)| o.clone());
-        assert_eq!(mobi_outcome, Some(FormatOutcome::NoWriter), "{outcomes:?}");
+        let lit_outcome = outcomes.iter().find(|(f, _)| f == "LIT").map(|(_, o)| o.clone());
+        assert_eq!(lit_outcome, Some(FormatOutcome::NoWriter), "{outcomes:?}");
     }
 
     /// Embedding changes the file, so its recorded checksum has to be
@@ -226,7 +229,11 @@ mod tests {
         assert!(has_writer("pdf") && has_writer("PDF"));
         assert!(has_writer("fb2") && has_writer("FB2"));
         assert!(has_writer("rtf") && has_writer("RTF"));
-        for absent in ["MOBI", "AZW3", "LIT", "SNB"] {
+        assert!(has_writer("mobi") && has_writer("MOBI"));
+        assert!(has_writer("htmlz") && has_writer("txtz"));
+        // AZW3 stays absent on purpose: its record layout differs from
+        // MOBI6's and the writer is the MOBI6 one.
+        for absent in ["AZW3", "LIT", "SNB", "PDB"] {
             assert!(!has_writer(absent), "{absent} has no writer yet and must not claim one");
         }
     }
