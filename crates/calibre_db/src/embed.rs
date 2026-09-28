@@ -32,7 +32,7 @@ pub enum FormatOutcome {
 /// [`FormatOutcome::NoWriter`] is reported before a file is opened and a
 /// caller can tell "not supported" from "tried and failed".
 pub fn has_writer(format: &str) -> bool {
-    matches!(format.to_ascii_uppercase().as_str(), "EPUB" | "ODT" | "DOCX" | "PDF" | "FB2")
+    matches!(format.to_ascii_uppercase().as_str(), "EPUB" | "ODT" | "DOCX" | "PDF" | "FB2" | "RTF")
 }
 
 /// Assembles the metadata to embed from the library's own record.
@@ -115,6 +115,7 @@ pub fn embed_metadata(cache: &Cache, book_id: i32) -> Result<Vec<(String, Format
             "DOCX" => calibre_ebooks::metadata::docx::set_metadata(&path, &mi),
             "PDF" => calibre_ebooks::metadata::pdf::set_metadata(&path, &mi),
             "FB2" => calibre_ebooks::metadata::fb2::set_metadata(&path, &mi),
+            "RTF" => calibre_ebooks::metadata::rtf::set_metadata(&path, &mi),
             // Unreachable while this matches `has_writer`, and a real
             // error rather than a silent success if the two ever drift.
             other => Err(anyhow::anyhow!("{other} claims a writer but none is wired")),
@@ -234,7 +235,8 @@ mod tests {
         assert!(has_writer("odt") && has_writer("docx"));
         assert!(has_writer("pdf") && has_writer("PDF"));
         assert!(has_writer("fb2") && has_writer("FB2"));
-        for absent in ["MOBI", "AZW3", "RTF", "LIT"] {
+        assert!(has_writer("rtf") && has_writer("RTF"));
+        for absent in ["MOBI", "AZW3", "LIT", "SNB"] {
             assert!(!has_writer(absent), "{absent} has no writer yet and must not claim one");
         }
     }
