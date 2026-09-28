@@ -57,7 +57,7 @@ use std::path::Path;
 /// beside the dispatch below so the two cannot drift -- a test asserts
 /// they agree.
 pub fn can_set_metadata(extension: &str) -> bool {
-    matches!(extension.to_lowercase().as_str(), "epub" | "odt" | "docx" | "pdf" | "fb2" | "rtf" | "htmlz" | "txtz")
+    matches!(extension.to_lowercase().as_str(), "epub" | "odt" | "docx" | "pdf" | "fb2" | "rtf" | "htmlz" | "txtz" | "mobi" | "azw" | "prc")
 }
 
 /// Writes `mi` into the book file at `path`, in place (#834).
@@ -82,9 +82,12 @@ pub fn set_metadata<P: AsRef<Path>>(path: P, mi: &MetaInformation) -> Result<()>
         "fb2" => fb2::set_metadata(path, mi),
         "rtf" => rtf::set_metadata(path, mi),
         "htmlz" | "txtz" => extz::set_metadata(path, mi),
+        // AZW3/KF8 is deliberately absent: its record layout differs and
+        // this writer is the MOBI6 one.
+        "mobi" | "azw" | "prc" => mobi::set_metadata(path, mi),
         // Named rather than lumped together: "no writer for MOBI yet" is
         // a different thing to tell a user than "that is not a book".
-        "mobi" | "prc" | "azw" | "azw3" | "lit" | "rb" | "imp" | "lrf" | "lrx" | "azw4" | "chm" | "snb" | "pdb" | "updb" | "txt" | "html" | "htm" | "xhtml" | "zip" | "cbz" | "rar" | "cbr" => {
+        "azw3" | "lit" | "rb" | "imp" | "lrf" | "lrx" | "azw4" | "chm" | "snb" | "pdb" | "updb" | "txt" | "html" | "htm" | "xhtml" | "zip" | "cbz" | "rar" | "cbr" => {
             bail!("no metadata writer for {ext} yet")
         }
         _ => bail!("Unsupported format: {}", ext),
@@ -181,7 +184,7 @@ mod set_metadata_dispatch_tests {
     /// deliberate act rather than a quiet regression.
     #[test]
     fn the_six_written_formats_are_claimed() {
-        for ext in ["epub", "odt", "docx", "pdf", "fb2", "rtf", "htmlz", "txtz"] {
+        for ext in ["epub", "odt", "docx", "pdf", "fb2", "rtf", "htmlz", "txtz", "mobi", "azw", "prc"] {
             assert!(can_set_metadata(ext), "{ext} should be writable");
             assert!(can_set_metadata(&ext.to_uppercase()), "{ext} should be recognised case-insensitively");
         }
