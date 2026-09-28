@@ -9,6 +9,14 @@ pub struct RunArgs {
 
 }
 
+/// `calibredb restore_database`.
+///
+/// Legacy, and deliberately so (#951): it rebuilds `metadata.db` from
+/// `<author>/<title>/metadata.opf` files, which only a library in the
+/// pre-#889 layout has. Recovery for a library written by this
+/// application is a replay of the change log (#899) -- see
+/// [`crate::restore`]'s module documentation for why there is one
+/// recovery mechanism rather than two.
 pub struct CmdRestoreDatabase;
 
 impl CmdRestoreDatabase {

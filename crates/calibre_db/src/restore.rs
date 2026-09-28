@@ -3,6 +3,31 @@
 //! each book's own directory, for when the database itself is lost or
 //! corrupt but the library's files survive.
 //!
+//! # This is a legacy path (#951)
+//!
+//! **Recovery goes through the change log**, not through here. #899
+//! decided that `.calibre-oxide/changes/` is the authoritative record of
+//! a library and `metadata.db` is a disposable derived cache; rebuilding
+//! the cache is therefore a replay of that log, and there is deliberately
+//! one recovery mechanism rather than two.
+//!
+//! What remains here reads a library in the **old `<author>/<title>/`
+//! layout**, where each book's `metadata.opf` sits in its own folder.
+//! That is the only shape this can work on: since #889 a book's files
+//! live wherever in the library folder its owner put them, and
+//! `backup_metadata` writes a uuid-keyed sidecar
+//! (`backup::sidecar_opf_path`) which cannot say *which files on disk
+//! belong to the book* -- `data.name` is the only authority for that
+//! (#885), and an OPF does not carry it. Teaching an OPF to carry it was
+//! considered and rejected in #951: it would mean inventing schema to
+//! build a second recovery path alongside the authoritative one.
+//!
+//! So `backup_metadata` is kept as **calibre-compatible export** -- a
+//! per-book OPF another application can read -- and not as the input to a
+//! recovery. A library that has only ever been written by this
+//! application has no `metadata.opf` files for [`restore_database`] to
+//! find, and it says so rather than rebuilding an empty database.
+//!
 //! # Scope of this pass
 //!
 //! Upstream's `Restore` is a `Thread` subclass that stages the rebuilt
@@ -309,9 +334,13 @@ where
     if book_dirs.is_empty() {
         anyhow::bail!(
             "found no metadata.opf files under {} -- there is nothing to rebuild the \
-             database from, so it has been left untouched. Run `calibredb \
-             backup_metadata --all` first to write the per-book metadata a restore \
-             reads.",
+             database from, so it has been left untouched. This command reads the old \
+             `<author>/<title>/metadata.opf` layout only; for a library written by \
+             this application, recovery replays the change log in \
+             `.calibre-oxide/changes/` instead (see #899). Note that `calibredb \
+             backup_metadata` does not help here -- it writes uuid-keyed OPF \
+             sidecars for export to other applications, which cannot record which \
+             files on disk belong to which book.",
             lib_path.display()
         );
     }

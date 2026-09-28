@@ -1,6 +1,13 @@
 use crate::Library;
 use anyhow::Result;
 
+/// `calibredb backup_metadata`.
+///
+/// Writes a per-book OPF sidecar for **export to other applications**
+/// that read calibre libraries. It is not the input to
+/// `restore_database`: an OPF cannot record which files on disk belong to
+/// the book (`data.name` is the authority, #885), so recovery replays the
+/// change log instead (#899/#951).
 pub struct CmdBackupMetadata;
 
 impl CmdBackupMetadata {
