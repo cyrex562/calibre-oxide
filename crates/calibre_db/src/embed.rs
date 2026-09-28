@@ -231,9 +231,15 @@ mod tests {
         assert!(has_writer("rtf") && has_writer("RTF"));
         assert!(has_writer("mobi") && has_writer("MOBI"));
         assert!(has_writer("htmlz") && has_writer("txtz"));
-        // AZW3 stays absent on purpose: its record layout differs from
-        // MOBI6's and the writer is the MOBI6 one.
-        for absent in ["AZW3", "LIT", "SNB", "PDB"] {
+        // AZW3 used to be asserted absent here, on the stated grounds
+        // that "its record layout differs from MOBI6's and the writer is
+        // the MOBI6 one". That reason was not true: the writer touches
+        // only the Palm record list and record 0's EXTH block, which KF8
+        // shares with MOBI6 -- `get_metadata` had always read azw3
+        // through the same module, and upstream's MOBI metadata writer
+        // claims azw3 and routes it to the same function.
+        assert!(has_writer("azw3") && has_writer("AZW3"));
+        for absent in ["LIT", "SNB", "PDB"] {
             assert!(!has_writer(absent), "{absent} has no writer yet and must not claim one");
         }
     }
