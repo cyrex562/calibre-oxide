@@ -371,6 +371,78 @@ mod write_output_threads_opts_tests {
     /// way `mobi_output_test.rs`'s own option test does) -- a real
     /// `.mobi` conversion with `opts.mobi.dont_compress = true` set on
     /// the `Plumber` itself produces real uncompressed output.
+    /// EPUB 2 requires `dc:title`, `dc:identifier` and `dc:language`, and
+    /// requires `package/@unique-identifier` to name the identifier's
+    /// `id`. None of the three was emitted, so every book this produced
+    /// was invalid -- a validating reader refuses it outright.
+    #[test]
+    fn a_converted_epub_has_the_elements_epub2_requires() {
+        let src = tempdir().unwrap();
+        let html_path = src.path().join("book.html");
+        // No metadata beyond the title: the worst case, and the common one.
+        fs::write(&html_path, "<html><head><title>A Book</title></head><body><p>Text.</p></body></html>").unwrap();
+
+        let out_dir = tempdir().unwrap();
+        let epub_path = out_dir.path().join("book.epub");
+        Plumber::new(&html_path, &epub_path).run().unwrap();
+
+        let mut zip = zip::ZipArchive::new(fs::File::open(&epub_path).unwrap()).unwrap();
+        let opf_name = (0..zip.len()).map(|i| zip.by_index(i).unwrap().name().to_string()).find(|n| n.ends_with(".opf")).expect("there should be an OPF");
+        let mut opf = String::new();
+        {
+            use std::io::Read;
+            zip.by_name(&opf_name).unwrap().read_to_string(&mut opf).unwrap();
+        }
+
+        assert!(opf.contains("<dc:title>"), "no dc:title:\n{opf}");
+        assert!(opf.contains("<dc:identifier"), "no dc:identifier:\n{opf}");
+        assert!(opf.contains("<dc:language>"), "no dc:language:\n{opf}");
+
+        // The attribute must name an id that actually exists on an
+        // identifier -- a dangling one is as invalid as none at all.
+        let unique_id = opf.split(r#"unique-identifier=""#).nth(1).and_then(|rest| rest.split('"').next()).expect("no unique-identifier attribute").to_string();
+        assert!(!unique_id.is_empty(), "the unique-identifier attribute is empty:\n{opf}");
+        assert!(opf.contains(&format!(r#"id="{unique_id}""#)), "unique-identifier={unique_id:?} names no element:\n{opf}");
+    }
+
+    /// When the book has its own identifier, that one is named rather than
+    /// a freshly invented one -- otherwise a round trip would give the book
+    /// a new identity each time.
+    #[test]
+    fn an_existing_identifier_is_kept_as_the_unique_one() {
+        let src = tempdir().unwrap();
+        let html_path = src.path().join("book.html");
+        fs::write(&html_path, "<html><head><title>A Book</title></head><body><p>Text.</p></body></html>").unwrap();
+
+        let opf_path = src.path().join("metadata.opf");
+        fs::write(
+            &opf_path,
+            r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="uid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>A Book</dc:title>
+    <dc:identifier id="uid">urn:uuid:11111111-1111-1111-1111-111111111111</dc:identifier>
+  </metadata>
+  <manifest/><spine/>
+</package>"#,
+        )
+        .unwrap();
+
+        let out_dir = tempdir().unwrap();
+        let epub_path = out_dir.path().join("book.epub");
+        let mut opts = ConversionOptions::default();
+        opts.read_metadata_from_opf = Some(opf_path);
+        Plumber::with_options(&html_path, &epub_path, opts).run().unwrap();
+
+        let mut zip = zip::ZipArchive::new(fs::File::open(&epub_path).unwrap()).unwrap();
+        let mut opf = String::new();
+        {
+            use std::io::Read;
+            zip.by_name("content.opf").unwrap().read_to_string(&mut opf).unwrap();
+        }
+        assert!(opf.contains("11111111-1111-1111-1111-111111111111"), "the book's own identifier should have been carried through:\n{opf}");
+    }
+
     /// `--read-metadata-from-opf` is how calibre's own GUI puts *library*
     /// metadata into a converted file. Without it a conversion keeps
     /// whatever the input said, so a title corrected in the library never
