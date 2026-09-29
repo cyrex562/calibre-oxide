@@ -18,7 +18,7 @@ import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LI
   uploadOrphanFile,
   forgetOrphan,
   fetchIgnored,
-  unignoreFile, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchLibraryInfo, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameFiles, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
+  unignoreFile, deleteBooks, embedMetadata, summarizeEmbed, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchLibraryInfo, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameFiles, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
 import type { CheckLibraryFinding, CheckLibraryResult, CustomRecipeOptions, DuplicateGroup, IgnoredFile, NewsFeedInput, NewsSchedule, Orphan, SaveToDiskResult } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
 import { similarBooksQuery } from "../library/query";
@@ -1178,6 +1178,53 @@ const saveToDiskBusy = ref(false);
 const saveToDiskResults = ref<SaveToDiskResult[]>([]);
 const saveToDiskError = ref<string | null>(null);
 
+// Embed metadata into the book files themselves (#958). The counterpart
+// to "Rename files": that changes the name on disk, this changes the
+// metadata *inside* each file, so a reader app shows the title this
+// library has rather than the one the file shipped with.
+const embedOpen = ref(false);
+const embedBusy = ref(false);
+const embedDone = ref(false);
+const embedCount = ref(0);
+const embedProblems = ref<string[]>([]);
+const embedError = ref<string | null>(null);
+
+function openEmbedMetadata() {
+  embedOpen.value = true;
+  embedBusy.value = false;
+  embedDone.value = false;
+  embedCount.value = 0;
+  embedProblems.value = [];
+  embedError.value = null;
+}
+
+/**
+ * Deliberately behind a confirm step rather than firing on click: this
+ * rewrites the user's actual book files, which is not something to do
+ * on a mis-click, and unlike most actions here it cannot be undone.
+ */
+async function runEmbedMetadata() {
+  const ids = renameScope.value;
+  if (ids.length === 0) return;
+  embedBusy.value = true;
+  embedError.value = null;
+  embedProblems.value = [];
+  try {
+    const summary = summarizeEmbed(await embedMetadata(ids));
+    embedCount.value = summary.embedded;
+    embedProblems.value = summary.problems;
+    embedDone.value = true;
+    // Each rewritten file has a new size on disk, and `embed_metadata`
+    // updates the `data` row to match, so the sizes in the grid are
+    // stale until this reloads them.
+    await runSearch();
+  } catch (e) {
+    embedError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    embedBusy.value = false;
+  }
+}
+
 function openSaveToDisk() {
   saveToDiskOpen.value = true;
   saveToDiskResults.value = [];
@@ -1616,6 +1663,7 @@ const actionHandlers: Partial<Record<LibraryActionId, () => void>> = {
   },
   "save-to-disk": () => openSaveToDisk(),
   "rename-files": () => void openRenameFiles(),
+  "embed-metadata": () => openEmbedMetadata(),
   "open-library-folder": () => void revealLibraryFolder(),
 };
 
@@ -1668,6 +1716,7 @@ function actionLabel(action: LibraryAction): string {
     case "bulk-edit":
     case "save-to-disk":
     case "rename-files":
+    case "embed-metadata":
       return `${action.label} (${selectedIds.value.size})`;
     default:
       return action.label;
@@ -2002,7 +2051,7 @@ function onLibraryKeydown(event: KeyboardEvent) {
   // A modal owns the keyboard while it is open -- firing library
   // shortcuts underneath one would act on a view the user cannot
   // currently see.
-  if (contextMenu.value || manageOpen.value || columnsOpen.value || columnPickerOpen.value || checkLibraryOpen.value || duplicatesOpen.value || saveToDiskOpen.value || renameOpen.value || newsOpen.value || switchOpen.value) return;
+  if (contextMenu.value || manageOpen.value || columnsOpen.value || columnPickerOpen.value || checkLibraryOpen.value || duplicatesOpen.value || saveToDiskOpen.value || renameOpen.value || embedOpen.value || newsOpen.value || switchOpen.value) return;
 
   const id = shortcutFor(event, libraryShortcuts(keymap.value));
   if (!id) return;
@@ -2838,6 +2887,34 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
             <span v-else class="manage-name muted">{{ r.current }} (unchanged)</span>
           </li>
         </ul>
+      </div>
+    </div>
+
+    <div v-if="embedOpen" class="manage-backdrop" @click.self="embedOpen = false">
+      <div class="manage-panel">
+        <button class="manage-close" @click="embedOpen = false">✕</button>
+        <h3>Embed metadata in files</h3>
+        <p class="news-hint">
+          Writes this library's metadata into the selected book file(s), so another reader app shows the title, authors and
+          cover recorded here rather than whatever the file shipped with. This rewrites the files themselves and cannot be undone.
+          Formats with no metadata writer yet are listed below and left untouched.
+        </p>
+        <div v-if="!embedDone" class="bulk-actions">
+          <button type="button" class="read" :disabled="embedBusy" @click="runEmbedMetadata">
+            {{ embedBusy ? "Embedding…" : `Embed into ${renameScope.length} book(s)` }}
+          </button>
+          <button type="button" :disabled="embedBusy" @click="embedOpen = false">Cancel</button>
+        </div>
+        <template v-else>
+          <p class="manage-name">{{ embedCount }} file(s) updated.</p>
+          <ul v-if="embedProblems.length" class="manage-list">
+            <li v-for="(problem, i) in embedProblems" :key="i"><span class="error">{{ problem }}</span></li>
+          </ul>
+          <div class="bulk-actions">
+            <button type="button" @click="embedOpen = false">Close</button>
+          </div>
+        </template>
+        <p v-if="embedError" class="error">{{ embedError }}</p>
       </div>
     </div>
 

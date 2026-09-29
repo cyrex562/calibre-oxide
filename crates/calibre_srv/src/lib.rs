@@ -387,6 +387,8 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/cdb/cover-from-pdf-page/{book_id}/{page}", post(cdb::cover_from_pdf_page))
         .route("/cdb/set-fields/{book_id}/{library_id}", post(cdb::set_fields))
         .route("/cdb/set-fields/{book_id}", post(cdb::set_fields_no_library))
+        .route("/cdb/embed-metadata/{book_ids}/{library_id}", post(cdb::embed_metadata))
+        .route("/cdb/embed-metadata/{book_ids}", post(cdb::embed_metadata_no_library))
         .route("/cdb/copy-to-library/{target_library_id}/{library_id}", post(cdb::copy_to_library))
         .route("/cdb/copy-to-library/{target_library_id}", post(cdb::copy_to_library_no_source))
         .route("/cdb/cmd/{which}/{version}", get(cdb::cmd).post(cdb::cmd))

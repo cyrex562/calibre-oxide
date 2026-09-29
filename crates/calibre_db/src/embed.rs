@@ -112,11 +112,35 @@ pub fn embed_metadata(cache: &Cache, book_id: i32) -> Result<Vec<(String, Format
 
         match calibre_ebooks::metadata::set_metadata(&path, &mi) {
             Ok(()) => {
-                // The file's content changed, so the recorded hash is now
-                // wrong. Leaving it stale would make the next scan report
-                // the book as edited outside the app (#894).
-                if let Err(e) = cache.checksums().record_file(book_id, "format", &format.to_uppercase(), &path) {
-                    log::warn!("embedded metadata into {} but could not re-record its checksum: {e}", path.display());
+                // Writing into the file changed its bytes, so three
+                // records of it are now stale together: the checksum, the
+                // `data` row's `uncompressed_size`, and the change log.
+                //
+                // This used to re-record only the checksum. The size then
+                // kept its pre-embed value -- 888 bytes recorded for a
+                // 930-byte file in the test below -- which is what the
+                // API reports to a client. Worse, nothing reached the
+                // change log at all, so under #899 (the log is
+                // authoritative and `metadata.db` is a derived cache) a
+                // rebuild restored the *old* size and hash and quietly
+                // undid the fact that the file had been rewritten.
+                //
+                // `record_format_row` does all three from one call, which
+                // is the point of it -- keeping them in step by
+                // construction rather than by three call sites
+                // remembering to agree.
+                match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        let hash = blake3::hash(&bytes).to_hex().to_string();
+                        if let Err(e) = cache.record_format_row(book_id, &format, &name, bytes.len() as i64, Some(&hash)) {
+                            log::warn!("embedded metadata into {} but could not re-record it: {e}", path.display());
+                        }
+                    }
+                    // The write succeeded, so the book really does have
+                    // the new metadata; failing to re-read it for hashing
+                    // does not undo that, and reporting `Failed` here
+                    // would be a lie.
+                    Err(e) => log::warn!("embedded metadata into {} but could not re-read it to re-record its size and hash: {e}", path.display()),
                 }
                 outcomes.push((format, FormatOutcome::Embedded));
             }
@@ -242,5 +266,73 @@ mod tests {
         for absent in ["LIT", "SNB", "PDB"] {
             assert!(!has_writer(absent), "{absent} has no writer yet and must not claim one");
         }
+    }
+
+    /// Embedding rewrites the file, so the size the database reports has
+    /// to change with it. It used to stay at the pre-embed value, which
+    /// is the number the API hands a client.
+    #[test]
+    fn embedding_updates_the_recorded_file_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        let src = dir.path().join("A Book.epub");
+        write_epub(&src);
+        let mut mi = calibre_ebooks::metadata::MetaInformation::default();
+        mi.title = "Original".to_string();
+        let book_id = cache.add_book(&src, &mi).unwrap();
+
+        // A title long enough that the rewritten file is a different size.
+        cache.set_field(book_id, "title", "A Much Longer Corrected Title Than Before").unwrap();
+        assert_eq!(embed_metadata(&cache, book_id).unwrap(), vec![("EPUB".to_string(), FormatOutcome::Embedded)]);
+
+        let recorded: i64 = cache
+            .backend
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT uncompressed_size FROM data WHERE book = ?1", [book_id], |r| r.get(0))
+            .unwrap();
+        let (_, name) = cache.format_file_names(book_id).unwrap().into_iter().next().unwrap();
+        let on_disk = std::fs::metadata(cache.book_dir(book_id).unwrap().unwrap().join(format!("{name}.epub"))).unwrap().len() as i64;
+
+        assert_eq!(recorded, on_disk, "the recorded size must match the file it describes");
+    }
+
+    /// #899: the log is authoritative and `metadata.db` is a derived
+    /// cache, so a rewrite that never reaches the log is a rewrite a
+    /// rebuild would undo.
+    #[test]
+    fn embedding_records_the_new_size_and_hash_in_the_change_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        let src = dir.path().join("A Book.epub");
+        write_epub(&src);
+        let mut mi = calibre_ebooks::metadata::MetaInformation::default();
+        mi.title = "Original".to_string();
+        let book_id = cache.add_book(&src, &mi).unwrap();
+        cache.set_field(book_id, "title", "A Much Longer Corrected Title Than Before").unwrap();
+
+        let hash_before = cache.checksums().recorded_identity(book_id, "format", "EPUB").unwrap().0;
+        embed_metadata(&cache, book_id).unwrap();
+        let hash_after = cache.checksums().recorded_identity(book_id, "format", "EPUB").unwrap().0;
+        assert_ne!(hash_before, hash_after, "the content changed, so the checksum must have");
+
+        // The last FormatSet for this book must describe the file as it is
+        // now, not as it was before the rewrite.
+        let log = cache.backend.change_log().unwrap();
+        let replay = log.replay().unwrap();
+        let last = replay
+            .changes()
+            .filter_map(|c| match &c.op {
+                crate::change_log::ChangeOp::FormatSet { format, size, hash, .. } if format == "EPUB" => Some((*size, hash.clone())),
+                _ => None,
+            })
+            .last()
+            .expect("embedding must record a FormatSet");
+
+        let (_, name) = cache.format_file_names(book_id).unwrap().into_iter().next().unwrap();
+        let on_disk = std::fs::metadata(cache.book_dir(book_id).unwrap().unwrap().join(format!("{name}.epub"))).unwrap().len() as i64;
+        assert_eq!(last.0, on_disk, "the logged size is stale");
+        assert_eq!(last.1, hash_after, "the logged hash is stale");
     }
 }
