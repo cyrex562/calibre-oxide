@@ -36,7 +36,7 @@ use anyhow::{Context, Result};
 
 use calibre_utils::filenames::{file_facts, FileFacts};
 
-use crate::constants::LIBRARY_HANDLE_DIR_NAME;
+use crate::constants::{DATA_DIR_NAME, LIBRARY_HANDLE_DIR_NAME};
 
 /// How long a file must have been untouched before it is indexed.
 ///
@@ -188,6 +188,21 @@ fn walk_dir(root: &Path, dir: &Path, options: &ScanOptions, now: SystemTime, rep
 
         if file_type.is_dir() {
             if JUNK_DIRS.contains(&lower.as_str()) {
+                continue;
+            }
+            // The library's own `data/` directory holds the files users
+            // attach to a book (`calibre_db::extra_files`), one
+            // subdirectory per book uuid. They live in the library folder
+            // rather than inside `.calibre-oxide/` deliberately -- they
+            // are the user's files, not derived state (#954) -- which
+            // means the scanner walks straight into them unless told not
+            // to. A companion `.epub` attached to a book would otherwise
+            // be indexed as a book of its own on the next scan.
+            //
+            // Only at the top level: a folder someone happens to have
+            // named `data` further down is their own, and the books in it
+            // are real books.
+            if dir == root && lower == DATA_DIR_NAME {
                 continue;
             }
             if holds_its_own_library(&path) {
@@ -752,6 +767,36 @@ mod tests {
         assert!(report.files.is_empty());
         assert!(report.is_complete());
     }
+
+    /// #954: a book's attached data files live in `<library>/data/<uuid>/`
+    /// -- in the library folder, not `.calibre-oxide/`, because they are
+    /// the user's own files. So the scanner walks into them unless told
+    /// not to, and a companion `.epub` would be indexed as a book of its
+    /// own.
+    #[test]
+    fn does_not_index_a_books_attached_data_files_as_books() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("At The Root.epub"), b"PK\x03\x04");
+        let attached = dir.path().join("data").join("a-book-uuid");
+        std::fs::create_dir_all(&attached).unwrap();
+        write(&attached.join("Companion.epub"), b"PK\x03\x04");
+
+        // The root book is the control: it proves the scan really ran.
+        assert_eq!(names(&scan(dir.path())), vec!["At The Root.epub"]);
+    }
+
+    /// Only the *top-level* `data/` is the library's own. A folder someone
+    /// named `data` inside their own structure holds real books.
+    #[test]
+    fn a_nested_folder_named_data_is_still_walked() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("Reference").join("data");
+        std::fs::create_dir_all(&nested).unwrap();
+        write(&nested.join("Handbook.epub"), b"PK\x03\x04");
+
+        assert_eq!(names(&scan(dir.path())), vec!["Reference/data/Handbook.epub"]);
+    }
+
 }
 
 #[cfg(test)]

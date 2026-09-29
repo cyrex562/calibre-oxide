@@ -55,6 +55,12 @@ lazy_static::lazy_static! {
     static ref IGNORE_AT_TOP_LEVEL: HashSet<&'static str> = {
         let mut s = HashSet::new();
         s.insert("metadata.db");
+        // The library's own `data/` directory: one subdirectory per book
+        // uuid holding the files that book's owner attached (#954). It is
+        // in the library folder rather than `.calibre-oxide/` on purpose,
+        // so without this it reads as an author directory whose every
+        // uuid subdirectory is an "invalid title".
+        s.insert(DATA_DIR_NAME);
         // Real SQLite WAL-mode sidecar files (`Backend::new` enables
         // WAL mode for every real `Cache`/`Library` connection this
         // port opens) -- a real, pre-existing false positive found
