@@ -24,11 +24,33 @@ use serde::{Deserialize, Serialize};
 
 use super::hlc::Hlc;
 
+/// What a change applies to (#901).
+///
+/// Not every change is about a book: a custom column's *definition* and
+/// a preference belong to the library itself. Replay and compaction both
+/// need to know what an op addresses without matching on the op, so
+/// every op answers [`ChangeOp::target`].
+///
+/// Derived from the variant rather than carried as a field, so a
+/// nonsensical pairing — a `BookAdded` claiming library scope — cannot be
+/// constructed at all. The scope is still explicit, just statically so.
+///
+/// One log and one total order across all of it, deliberately: #902 has
+/// to resolve conflicts *between* book-level and library-level changes,
+/// and two streams would mean two orderings to reconcile.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ChangeTarget {
+    /// One book, by uuid.
+    Book(String),
+    /// The library itself: schema and preferences.
+    Library,
+}
+
 /// One durable metadata mutation.
 ///
-/// Every variant names the book by uuid. Adding a variant is a
-/// compatibility event for peers on older versions — see
-/// [`Change::from_json`].
+/// Book-scoped variants name the book by uuid; the rest apply to the
+/// library. Adding a variant is a compatibility event for peers on older
+/// versions — see [`Change::from_json`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ChangeOp {
@@ -59,19 +81,55 @@ pub enum ChangeOp {
 
     /// Points the book at a cover blob under `covers/`, or clears it.
     CoverSet { book: String, blob: Option<String> },
+
+    /// Sets one library preference. `None` clears it.
+    ///
+    /// Library-scoped: a preference is not owned by any book.
+    PrefSet { key: String, value: Option<String> },
+
+    /// Creates a custom column — its *definition*, not a value in it.
+    ///
+    /// The log carries schema as well as contents (#901), because
+    /// `metadata.db` is only genuinely a disposable derived cache if a
+    /// replay can rebuild the columns the values live in. A log that
+    /// restored a book's `#rating` without creating `#rating` first
+    /// would have nowhere to put it.
+    ///
+    /// Ordering therefore matters: this has to be replayed before any
+    /// `FieldSet` naming the column. The single total order gives that
+    /// for free, since the column is always created before a value can
+    /// be written to it.
+    CustomColumnAdded { label: String, name: String, datatype: String, is_multiple: bool },
+
+    /// Drops a custom column and its values.
+    CustomColumnRemoved { label: String },
 }
 
 impl ChangeOp {
-    /// The uuid of the book this change is about. Every variant has
-    /// one; replay needs it without matching on the op.
-    pub fn book(&self) -> &str {
+    /// What this change applies to. Replay and compaction need it
+    /// without matching on the op.
+    pub fn target(&self) -> ChangeTarget {
         match self {
             ChangeOp::BookAdded { book }
             | ChangeOp::BookRemoved { book }
             | ChangeOp::FieldSet { book, .. }
             | ChangeOp::FormatSet { book, .. }
             | ChangeOp::FormatRemoved { book, .. }
-            | ChangeOp::CoverSet { book, .. } => book,
+            | ChangeOp::CoverSet { book, .. } => ChangeTarget::Book(book.clone()),
+            ChangeOp::PrefSet { .. } | ChangeOp::CustomColumnAdded { .. } | ChangeOp::CustomColumnRemoved { .. } => ChangeTarget::Library,
+        }
+    }
+
+    /// The book this change is about, if it is about one.
+    pub fn book(&self) -> Option<&str> {
+        match self {
+            ChangeOp::BookAdded { book }
+            | ChangeOp::BookRemoved { book }
+            | ChangeOp::FieldSet { book, .. }
+            | ChangeOp::FormatSet { book, .. }
+            | ChangeOp::FormatRemoved { book, .. }
+            | ChangeOp::CoverSet { book, .. } => Some(book),
+            ChangeOp::PrefSet { .. } | ChangeOp::CustomColumnAdded { .. } | ChangeOp::CustomColumnRemoved { .. } => None,
         }
     }
 
@@ -81,16 +139,25 @@ impl ChangeOp {
     /// the later one alone, so the earlier can be dropped. `None`
     /// means "never supersedes anything" — `BookRemoved` has to stay,
     /// because dropping it would resurrect the book on the next replay.
-    pub fn supersede_key(&self) -> Option<(&str, &str, &str)> {
+    pub fn supersede_key(&self) -> Option<(ChangeTarget, &str, &str)> {
         match self {
-            ChangeOp::FieldSet { book, field, .. } => Some((book, "field", field)),
-            ChangeOp::FormatSet { book, format, .. } => Some((book, "format", format)),
-            ChangeOp::CoverSet { book, .. } => Some((book, "cover", "")),
+            ChangeOp::FieldSet { book, field, .. } => Some((ChangeTarget::Book(book.clone()), "field", field)),
+            ChangeOp::FormatSet { book, format, .. } => Some((ChangeTarget::Book(book.clone()), "format", format)),
+            ChangeOp::CoverSet { book, .. } => Some((ChangeTarget::Book(book.clone()), "cover", "")),
+            // Per key, so two preferences never supersede each other.
+            ChangeOp::PrefSet { key, .. } => Some((ChangeTarget::Library, "pref", key)),
             // `BookAdded` is not superseded by a later `BookAdded`
             // (there is never a second one) and must not be dropped:
             // replay needs it to create the row every other change
-            // targets.
-            ChangeOp::BookAdded { .. } | ChangeOp::BookRemoved { .. } | ChangeOp::FormatRemoved { .. } => None,
+            // targets. The custom-column pair is the same case one level
+            // up -- dropping the `Added` would leave a replay with values
+            // and no column to put them in, and dropping the `Removed`
+            // would resurrect the column.
+            ChangeOp::BookAdded { .. }
+            | ChangeOp::BookRemoved { .. }
+            | ChangeOp::FormatRemoved { .. }
+            | ChangeOp::CustomColumnAdded { .. }
+            | ChangeOp::CustomColumnRemoved { .. } => None,
         }
     }
 }
@@ -291,7 +358,7 @@ mod tests {
             ChangeOp::CoverSet { book: "u".into(), blob: None },
         ];
         for op in ops {
-            assert_eq!(op.book(), "u");
+            assert_eq!(op.book(), Some("u"));
         }
     }
 
@@ -321,5 +388,41 @@ mod tests {
         let a = ChangeOp::FieldSet { book: "a".into(), field: "title".into(), value: None };
         let b = ChangeOp::FieldSet { book: "b".into(), field: "title".into(), value: None };
         assert_ne!(a.supersede_key(), b.supersede_key());
+    }
+
+    /// #901: two preferences must not supersede each other, and a schema
+    /// change must never be compacted away.
+    #[test]
+    fn library_scoped_ops_supersede_per_key_and_schema_is_never_dropped() {
+        let sort = ChangeOp::PrefSet { key: "sort".into(), value: Some("title".into()) };
+        let sort_again = ChangeOp::PrefSet { key: "sort".into(), value: Some("author".into()) };
+        let other = ChangeOp::PrefSet { key: "columns".into(), value: None };
+
+        assert_eq!(sort.supersede_key(), sort_again.supersede_key(), "the later write wins for the same key");
+        assert_ne!(sort.supersede_key(), other.supersede_key(), "different preferences are independent");
+
+        // Dropping either of these would leave a replay with values and
+        // no column to put them in, or resurrect a deleted column.
+        assert!(ChangeOp::CustomColumnAdded { label: "shelf".into(), name: "Shelf".into(), datatype: "text".into(), is_multiple: false }.supersede_key().is_none());
+        assert!(ChangeOp::CustomColumnRemoved { label: "shelf".into() }.supersede_key().is_none());
+    }
+
+    /// A preference and a book field with the same name are different
+    /// things, and compaction keys must not conflate them.
+    #[test]
+    fn a_library_op_never_shares_a_supersede_key_with_a_book_op() {
+        let pref = ChangeOp::PrefSet { key: "title".into(), value: None };
+        let field = ChangeOp::FieldSet { book: "title".into(), field: "title".into(), value: None };
+        assert_ne!(pref.supersede_key(), field.supersede_key());
+    }
+
+    #[test]
+    fn target_says_what_each_op_applies_to() {
+        assert_eq!(ChangeOp::BookAdded { book: "u".into() }.target(), ChangeTarget::Book("u".into()));
+        assert_eq!(ChangeOp::PrefSet { key: "sort".into(), value: None }.target(), ChangeTarget::Library);
+        assert_eq!(ChangeOp::CustomColumnRemoved { label: "shelf".into() }.target(), ChangeTarget::Library);
+        // A library-scoped op has no book, which is how replay knows not
+        // to look one up.
+        assert_eq!(ChangeOp::PrefSet { key: "sort".into(), value: None }.book(), None);
     }
 }
