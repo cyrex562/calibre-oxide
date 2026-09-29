@@ -481,13 +481,25 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "hits the real, rate-limited Google Books and Open Library APIs -- run explicitly with `cargo test -- --ignored`"]
     async fn search_by_title_returns_candidates_from_at_least_one_real_source() {
         // A real live-network test (no mock server -- both source
         // clients' own base URLs are hardcoded, not injectable through
-        // this route). Tolerate one source being unavailable (this
-        // box's own Google Books quota is known-exhausted, see #785's
-        // PR) but require at least one real candidate to come back --
-        // that's the one behavior this route actually promises.
+        // this route). It requires at least one real candidate, which is
+        // the one behaviour this route promises, and that is exactly why
+        // it cannot run unattended: it fails whenever both sources are
+        // unavailable at once. It did, on a Windows CI runner, on a
+        // documentation-only pull request.
+        //
+        // Ignored rather than taught to tolerate an empty result,
+        // because tolerating one would leave nothing asserted -- an
+        // empty response is precisely what a broken route returns. Same
+        // treatment, and the same reason, as
+        // `google_books::tests::a_real_live_google_books_search_returns_a_real_dune_candidate`.
+        //
+        // The shape of each source's parsing is covered offline by
+        // `search_parses_a_real_google_books_response_shape` and friends;
+        // what is lost here is only the live end-to-end contract.
         let (_dir, router) = test_app();
         let (status, body) = post_json(&router, "/metadata/search", serde_json::json!({"title": "Dune", "authors": "Frank Herbert"})).await;
         assert_eq!(status, StatusCode::OK, "{body}");
