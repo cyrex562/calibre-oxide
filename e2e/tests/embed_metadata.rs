@@ -179,3 +179,46 @@ fn an_edit_outside_the_app_is_reported_as_corrupted() {
          paired test above vacuous: {out}"
     );
 }
+
+/// The route the UI calls, through the really-spawned server (#958).
+///
+/// The in-process route tests in `calibre_srv` cover its logic; this is
+/// the layer that would catch the route not being registered at all, or
+/// registered at a path the client does not use.
+#[test]
+fn the_real_server_embeds_metadata_over_http() {
+    use std::time::Duration;
+    use calibre_oxide_e2e::{find_free_port, spawn_calibre_srv, wait_until_ready};
+
+    let Some(static_dir) = web_dist() else {
+        eprintln!("skipping: web/dist not built -- run `npm run build` in web/ first");
+        return;
+    };
+
+    let lib = TestLibrary::new();
+    let book = lib.path().join("A Book.epub");
+    write_epub(&book, "Stale Title");
+    assert!(run(lib.path(), &["add", book.to_str().unwrap()]).status.success());
+    assert!(run(lib.path(), &["set_metadata", "1", "title", "Corrected Over HTTP"]).status.success());
+
+    let port = find_free_port();
+    let _srv = spawn_calibre_srv(lib.path(), &static_dir, port);
+    assert!(wait_until_ready(port, Duration::from_secs(10)), "calibre_srv never became ready on port {port}");
+
+    // Exactly what web/src/library/api.ts::embedMetadata() sends.
+    let client = reqwest::blocking::Client::new();
+    let response: serde_json::Value = client
+        .post(format!("http://127.0.0.1:{port}/cdb/embed-metadata/1"))
+        .send()
+        .expect("embed-metadata request failed")
+        .json()
+        .expect("response was not valid JSON");
+
+    assert_eq!(response["books"]["1"]["formats"]["EPUB"]["status"], "embedded", "{response}");
+    assert_eq!(title_in_file(&lib.path().join("A Book.epub")), "Corrected Over HTTP");
+}
+
+fn web_dist() -> Option<std::path::PathBuf> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent()?.join("web").join("dist");
+    dir.join("index.html").is_file().then_some(dir)
+}

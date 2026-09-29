@@ -128,6 +128,7 @@ export type LibraryActionId =
   | "toggle-view"
   | "bulk-edit"
   | "save-to-disk"
+  | "embed-metadata"
   // Book-scoped.
   | "read"
   | "edit-metadata"
@@ -195,6 +196,10 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   { id: "bulk-edit", label: "Bulk edit", group: "selection", requires: "selection", icon: "merge_books", accel: "Ctrl+Shift+E", tooltip: "Change a field across every selected book" },
   { id: "save-to-disk", label: "Save to disk", group: "selection", requires: "selection", icon: "save", accel: "Ctrl+S", tooltip: "Write book files to a folder" },
   { id: "rename-files", label: "Rename files…", group: "selection", requires: "selection", contextMenu: true, icon: "template_funcs", tooltip: "Rename the files on disk, without changing the title" },
+  // The counterpart to "Rename files": that changes the name on disk,
+  // this changes the metadata *inside* the file, so a reader app shows
+  // the title this library has rather than the one the file shipped with.
+  { id: "embed-metadata", label: "Embed metadata in files", group: "selection", requires: "selection", contextMenu: true, icon: "save", tooltip: "Write this library's metadata into the book files themselves" },
 
   { id: "read", label: "Read", group: "book", requires: "single-selection", contextMenu: true, icon: "view", accel: "Enter", tooltip: "Open in the built-in reader" },
   { id: "open-externally", label: "Open externally", group: "book", requires: "single-selection", contextMenu: true, desktopOnly: true, icon: "external-link", accel: "Ctrl+Enter", tooltip: "Open in the system's default application" },

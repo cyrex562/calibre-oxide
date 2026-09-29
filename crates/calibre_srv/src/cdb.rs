@@ -184,6 +184,90 @@ async fn delete_books_handle(state: AppState, book_ids: String, library_id: Opti
     Ok(Json(serde_json::json!({})))
 }
 
+/// `POST /cdb/embed-metadata/{book_ids}/{library_id}` (#958).
+///
+/// Writes the library's own metadata into the book files themselves, so a
+/// correction made here reaches the file a reader app opens. The engine
+/// (`calibre_db::embed`) and the `calibredb embed_metadata` command have
+/// been real for a while; until now there was no way to reach either from
+/// the app.
+pub async fn embed_metadata(State(state): State<AppState>, Path((book_ids, library_id)): Path<(String, String)>) -> Result<Json<Value>, ServerError> {
+    embed_metadata_handle(state, book_ids, Some(library_id)).await
+}
+
+/// Same as [`embed_metadata`], for a URL with no `{library_id}` segment
+/// -- matching every other library_id-aware route pair in this file.
+pub async fn embed_metadata_no_library(State(state): State<AppState>, Path(book_ids): Path<String>) -> Result<Json<Value>, ServerError> {
+    embed_metadata_handle(state, book_ids, None).await
+}
+
+async fn embed_metadata_handle(state: AppState, book_ids: String, library_id: Option<String>) -> Result<Json<Value>, ServerError> {
+    let cache = state.cache_for(library_id.as_deref()).ok_or_else(|| ServerError::NotFound(format!("no library named {:?}", library_id.clone().unwrap_or_default())))?;
+
+    let mut ids = Vec::new();
+    for part in book_ids.split(',') {
+        let Ok(id) = part.trim().parse::<i32>() else {
+            return Err(ServerError::BadRequest(format!("invalid book_ids: {book_ids}")));
+        };
+        ids.push(id);
+    }
+
+    let results = tokio::task::spawn_blocking({
+        let cache = cache.clone();
+        let ids = ids.clone();
+        move || -> Vec<(i32, Result<Vec<(String, calibre_db::embed::FormatOutcome)>, String>)> {
+            // One book failing outright does not stop the rest: a
+            // selection of fifty books with one missing file should embed
+            // the other forty-nine, and say which one it could not.
+            ids.into_iter()
+                .map(|id| (id, calibre_db::embed::embed_metadata(&cache, id).map_err(|e| format!("{e:#}"))))
+                .collect()
+        }
+    })
+    .await
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+
+    // Reported per format, not as a bare success. `FormatOutcome` already
+    // distinguishes "written" from "there is no writer for LIT" and from
+    // "the file is missing", and a user whose book did not change needs to
+    // be told which of those happened rather than shown a tick.
+    let mut books = serde_json::Map::new();
+    let mut changed = Vec::new();
+    for (id, result) in results {
+        match result {
+            Ok(outcomes) => {
+                if outcomes.iter().any(|(_, o)| matches!(o, calibre_db::embed::FormatOutcome::Embedded)) {
+                    changed.push(id);
+                }
+                let formats: serde_json::Map<String, Value> = outcomes
+                    .into_iter()
+                    .map(|(format, outcome)| {
+                        let value = match outcome {
+                            calibre_db::embed::FormatOutcome::Embedded => serde_json::json!({"status": "embedded"}),
+                            calibre_db::embed::FormatOutcome::NoWriter => serde_json::json!({"status": "no_writer", "detail": format!("no metadata writer for {format} yet")}),
+                            calibre_db::embed::FormatOutcome::FileMissing => serde_json::json!({"status": "file_missing", "detail": "the file the library points at is not there"}),
+                            calibre_db::embed::FormatOutcome::Failed(why) => serde_json::json!({"status": "failed", "detail": why}),
+                        };
+                        (format, value)
+                    })
+                    .collect();
+                books.insert(id.to_string(), serde_json::json!({"formats": formats}));
+            }
+            Err(why) => {
+                books.insert(id.to_string(), serde_json::json!({"error": why}));
+            }
+        }
+    }
+
+    // Embedding rewrites each file, so its recorded size and hash change
+    // (`calibre_db::embed` updates the `data` row). Clients showing a file
+    // size have stale numbers until they refresh.
+    if !changed.is_empty() {
+        web_socket::publish(&state, ChangeEvent::MetadataChanged { book_ids: changed });
+    }
+    Ok(Json(serde_json::json!({"books": books})))
+}
+
 fn sniff_image_format(data: &[u8]) -> Option<&'static str> {
     if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
         Some("jpeg")
@@ -1360,6 +1444,113 @@ mod tests {
 
         let (status, _) = post_json(&router, "/cdb/cmd/search/99", serde_json::json!(["query"])).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// A real EPUB, so `set_metadata` has something it can actually write
+    /// into -- `add_test_book`'s "fake epub bytes" is not a zip.
+    fn add_real_epub(dir: &std::path::Path, cache: &Cache, title: &str) -> i32 {
+        use std::io::Write;
+        let source = dir.join(format!("{title}.epub"));
+        {
+            let file = std::fs::File::create(&source).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file("mimetype", zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored)).unwrap();
+            zip.write_all(b"application/epub+zip").unwrap();
+            let deflated = zip::write::FileOptions::default();
+            zip.start_file("META-INF/container.xml", deflated).unwrap();
+            zip.write_all(br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#).unwrap();
+            zip.start_file("content.opf", deflated).unwrap();
+            zip.write_all(format!(r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="uid"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>{title}</dc:title><dc:identifier id="uid">urn:uuid:{title}</dc:identifier></metadata><manifest><item id="c1" href="c1.html" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="c1"/></spine></package>"#).as_bytes()).unwrap();
+            zip.start_file("c1.html", deflated).unwrap();
+            zip.write_all(br#"<html xmlns="http://www.w3.org/1999/xhtml"><body><p>Text.</p></body></html>"#).unwrap();
+            zip.finish().unwrap();
+        }
+        let mut meta = calibre_ebooks::metadata::MetaInformation::default();
+        meta.title = title.to_string();
+        cache.add_book(&source, &meta).unwrap()
+    }
+
+    fn title_in_file(path: &std::path::Path) -> String {
+        use std::io::Read;
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
+        let mut opf = String::new();
+        archive.by_name("content.opf").unwrap().read_to_string(&mut opf).unwrap();
+        opf.split("<dc:title>").nth(1).and_then(|r| r.split("</dc:title>").next()).unwrap_or_default().to_string()
+    }
+
+    /// #958: the route exists so a correction made in the library reaches
+    /// the file a reader app opens.
+    #[tokio::test]
+    async fn embed_metadata_writes_the_librarys_title_into_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = std::sync::Arc::new(Cache::new(dir.path()).unwrap());
+        let book_id = add_real_epub(dir.path(), &cache, "Stale");
+        cache.set_field(book_id, "title", "Corrected Title").unwrap();
+        let router = crate::test_router(test_state(cache.clone()));
+
+        let (status, body) = post_json(&router, &format!("/cdb/embed-metadata/{book_id}/-"), serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["books"][book_id.to_string()]["formats"]["EPUB"]["status"], "embedded", "{body}");
+
+        let (_, name) = cache.format_file_names(book_id).unwrap().into_iter().next().unwrap();
+        let path = cache.book_dir(book_id).unwrap().unwrap().join(format!("{name}.epub"));
+        assert_eq!(title_in_file(&path), "Corrected Title", "the file still has its old title");
+    }
+
+    /// A format with no writer is named, with a reason. Returning a bare
+    /// success would tell the user their LIT file was updated when nothing
+    /// touched it.
+    #[tokio::test]
+    async fn embed_metadata_names_a_format_it_cannot_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = std::sync::Arc::new(Cache::new(dir.path()).unwrap());
+        let book_id = add_real_epub(dir.path(), &cache, "Stale");
+        let lit = dir.path().join("extra.lit");
+        std::fs::write(&lit, b"not really a lit file").unwrap();
+        cache.add_format(book_id, &lit, "lit", true).unwrap();
+        let router = crate::test_router(test_state(cache.clone()));
+
+        let (status, body) = post_json(&router, &format!("/cdb/embed-metadata/{book_id}/-"), serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["books"][book_id.to_string()]["formats"]["LIT"]["status"], "no_writer", "{body}");
+        assert!(body["books"][book_id.to_string()]["formats"]["LIT"]["detail"].as_str().unwrap().contains("LIT"), "{body}");
+        // The writable one still got written.
+        assert_eq!(body["books"][book_id.to_string()]["formats"]["EPUB"]["status"], "embedded", "{body}");
+    }
+
+    /// One unusable book must not abandon the rest of a selection.
+    #[tokio::test]
+    async fn embed_metadata_keeps_going_past_a_book_it_cannot_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = std::sync::Arc::new(Cache::new(dir.path()).unwrap());
+        let good = add_real_epub(dir.path(), &cache, "Good");
+        let router = crate::test_router(test_state(cache.clone()));
+
+        let (status, body) = post_json(&router, &format!("/cdb/embed-metadata/{good},9999/-"), serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["books"][good.to_string()]["formats"]["EPUB"]["status"], "embedded", "{body}");
+        assert!(body["books"]["9999"]["error"].is_string(), "the missing book should be reported, not silently dropped: {body}");
+    }
+
+    #[tokio::test]
+    async fn embed_metadata_rejects_an_unparseable_book_id() {
+        let (_dir, router) = test_app(1);
+        let (status, _) = post_json(&router, "/cdb/embed-metadata/notanumber/-", serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// The no-library form, kept for parity with every other route pair
+    /// in this file.
+    #[tokio::test]
+    async fn embed_metadata_works_without_a_library_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = std::sync::Arc::new(Cache::new(dir.path()).unwrap());
+        let book_id = add_real_epub(dir.path(), &cache, "Stale");
+        let router = crate::test_router(test_state(cache.clone()));
+
+        let (status, body) = post_json(&router, &format!("/cdb/embed-metadata/{book_id}"), serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["books"][book_id.to_string()]["formats"]["EPUB"]["status"], "embedded", "{body}");
     }
 }
 

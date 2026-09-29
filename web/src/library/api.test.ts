@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { addBook, addFormat, addNewsSchedule, blobToDataUrl, inspectPlugin, installPlugin, listPlugins, removePlugin, setPluginEnabled, catalogDownloadUrl, checkLibrary, coverProxyUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchCoverProxyBlob, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeDataFile, removeFormat, removeNewsSchedule, renameCategoryItem, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, scanLibrary, fetchOrphans, relocateOrphan, uploadOrphanFile, forgetOrphan, fetchIgnored, unignoreFile, searchMetadataOnline, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
+import { embedMetadata, summarizeEmbed, addBook, addFormat, addNewsSchedule, blobToDataUrl, inspectPlugin, installPlugin, listPlugins, removePlugin, setPluginEnabled, catalogDownloadUrl, checkLibrary, coverProxyUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchCoverProxyBlob, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeDataFile, removeFormat, removeNewsSchedule, renameCategoryItem, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, scanLibrary, fetchOrphans, relocateOrphan, uploadOrphanFile, forgetOrphan, fetchIgnored, unignoreFile, searchMetadataOnline, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
 import type { BookSummary } from "./types";
 
 function bookStub(id: number): BookSummary {
@@ -139,6 +139,66 @@ describe("deleteBooks", () => {
 
     await deleteBooks([]);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("embedMetadata", () => {
+  it("posts a comma-joined id list to the embed-metadata URL", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ books: {} }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await embedMetadata([4, 5]);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/cdb/embed-metadata/4,5");
+    expect(init.method).toBe("POST");
+  });
+
+  it("short-circuits without a network call for an empty id list", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    expect(await embedMetadata([])).toEqual({ books: {} });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("summarizeEmbed", () => {
+  it("counts written files rather than listing them", () => {
+    const summary = summarizeEmbed({
+      books: {
+        "1": { formats: { EPUB: { status: "embedded" }, MOBI: { status: "embedded" } } },
+        "2": { formats: { EPUB: { status: "embedded" } } },
+      },
+    });
+    expect(summary.embedded).toBe(3);
+    expect(summary.problems).toEqual([]);
+  });
+
+  it("reports a format with no writer without calling it a failure", () => {
+    const summary = summarizeEmbed({
+      books: { "1": { formats: { EPUB: { status: "embedded" }, LIT: { status: "no_writer", detail: "no metadata writer for LIT yet" } } } },
+    });
+    expect(summary.embedded).toBe(1);
+    expect(summary.problems).toEqual(["Book 1: no metadata writer for LIT yet"]);
+  });
+
+  it("puts the most serious problems first", () => {
+    const summary = summarizeEmbed({
+      books: {
+        "1": { formats: { LIT: { status: "no_writer" } } },
+        "2": { formats: { EPUB: { status: "file_missing" } } },
+        "3": { formats: { EPUB: { status: "failed", detail: "not a zip" } } },
+        "4": { error: "no book with id 4" },
+      },
+    });
+    // Unreadable book, then a real failure, then a missing file, then
+    // the merely-unsupported format.
+    expect(summary.problems).toEqual([
+      "Book 4: no book with id 4",
+      "Book 3 (EPUB): not a zip",
+      "Book 2 (EPUB): file missing",
+      "Book 1: no metadata writer for LIT yet",
+    ]);
   });
 });
 

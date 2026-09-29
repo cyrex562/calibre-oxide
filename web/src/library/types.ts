@@ -208,6 +208,24 @@ export interface RenameFileResult {
   error?: string;
 }
 
+/** One format's outcome from an embed-metadata run (#958). */
+export interface EmbedFormatOutcome {
+  /** `embedded` | `no_writer` | `file_missing` | `failed` */
+  status: string;
+  /** Why, for every status but `embedded`. */
+  detail?: string;
+}
+
+export interface EmbedBookOutcome {
+  formats?: Record<string, EmbedFormatOutcome>;
+  /** Present instead of `formats` when the book itself could not be read. */
+  error?: string;
+}
+
+export interface EmbedMetadataResponse {
+  books: Record<string, EmbedBookOutcome>;
+}
+
 export interface RenameFilesResponse {
   dry_run: boolean;
   renamed: number;

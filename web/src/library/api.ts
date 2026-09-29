@@ -3,7 +3,7 @@
 // role for this slice, narrowed to only what the library-browser MVP
 // needs.
 
-import type { AddBookResult, BookFieldChanges, BookSummary, BooksInPage, CategoryEntry, CategoryPage, ConversionBookData, ConversionStatus, CustomColumnInfo, FieldMetadataResponse, FtsSearchResult, FtsSnippet, RenameFilesResponse, SearchResult, VirtualLibraries } from "./types";
+import type { AddBookResult, BookFieldChanges, BookSummary, BooksInPage, CategoryEntry, CategoryPage, ConversionBookData, ConversionStatus, CustomColumnInfo, EmbedMetadataResponse, FieldMetadataResponse, FtsSearchResult, FtsSnippet, RenameFilesResponse, SearchResult, VirtualLibraries } from "./types";
 
 async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(url, init);
@@ -123,6 +123,51 @@ export async function renameFiles(bookIds: number[], template: string, dryRun: b
  */
 export async function coverFromPdfPage(bookId: number, page = 1): Promise<void> {
   await jsonFetch(`/cdb/cover-from-pdf-page/${bookId}/${page}`, { method: "POST" });
+}
+
+/**
+ * Writes the library's own metadata into the book files themselves, so a
+ * correction made here reaches the file a reader app opens (#958).
+ *
+ * Reports per format rather than resolving to nothing: a book can have
+ * one format written and another skipped for want of a writer, and the
+ * caller has to be able to say which. `status` is `embedded`,
+ * `no_writer`, `file_missing` or `failed`, with a `detail` for all but
+ * the first.
+ */
+export async function embedMetadata(ids: number[]): Promise<EmbedMetadataResponse> {
+  if (ids.length === 0) return { books: {} };
+  return await jsonFetch<EmbedMetadataResponse>(`/cdb/embed-metadata/${ids.join(",")}`, { method: "POST" });
+}
+
+/**
+ * Flattens an embed run into one line per outcome worth telling the user
+ * about, newest concern first: a book that could not be read at all,
+ * then a format that failed, then one with no writer. Formats that were
+ * written are counted rather than listed -- "3 files updated" is more
+ * use than three identical lines.
+ */
+export function summarizeEmbed(response: EmbedMetadataResponse): { embedded: number; problems: string[] } {
+  let embedded = 0;
+  const failed: string[] = [];
+  const missing: string[] = [];
+  const unwritable: string[] = [];
+  const unreadable: string[] = [];
+
+  for (const [bookId, outcome] of Object.entries(response.books)) {
+    if (outcome.error) {
+      unreadable.push(`Book ${bookId}: ${outcome.error}`);
+      continue;
+    }
+    for (const [format, result] of Object.entries(outcome.formats ?? {})) {
+      if (result.status === "embedded") embedded += 1;
+      else if (result.status === "failed") failed.push(`Book ${bookId} (${format}): ${result.detail ?? "failed"}`);
+      else if (result.status === "file_missing") missing.push(`Book ${bookId} (${format}): file missing`);
+      else unwritable.push(`Book ${bookId}: no metadata writer for ${format} yet`);
+    }
+  }
+
+  return { embedded, problems: [...unreadable, ...failed, ...missing, ...unwritable] };
 }
 
 export async function deleteBooks(ids: number[]): Promise<void> {
