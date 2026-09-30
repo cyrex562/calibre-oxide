@@ -63,7 +63,11 @@ fn open_library(app: &AppHandle, library_path: std::path::PathBuf) -> Result<(),
     let port = server::find_free_port().map_err(|e| e.to_string())?;
 
     let pdfium = server::resolve_pdfium(app);
-    let child = server::spawn(&bin, &library_path, &static_dir, port, pdfium.as_deref()).map_err(|e| e.to_string())?;
+    // Every library this user has opened before is served alongside the
+    // current one, so `library_id` in a URL addresses something real and
+    // copy-to-library has somewhere to copy to (#959).
+    let also_serve = settings::list_recent_libraries(app);
+    let child = server::spawn(&bin, &library_path, &static_dir, port, pdfium.as_deref(), &also_serve).map_err(|e| e.to_string())?;
     *state.0.lock().unwrap() = Some((child, port));
 
     if !server::wait_until_ready(port, std::time::Duration::from_secs(10)) {

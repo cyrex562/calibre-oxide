@@ -129,6 +129,7 @@ export type LibraryActionId =
   | "bulk-edit"
   | "save-to-disk"
   | "embed-metadata"
+  | "copy-to-library"
   // Book-scoped.
   | "read"
   | "edit-metadata"
@@ -200,6 +201,7 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   // this changes the metadata *inside* the file, so a reader app shows
   // the title this library has rather than the one the file shipped with.
   { id: "embed-metadata", label: "Embed metadata in files", group: "selection", requires: "selection", contextMenu: true, icon: "save", tooltip: "Write this library's metadata into the book files themselves" },
+  { id: "copy-to-library", label: "Copy to library…", group: "selection", requires: "selection", contextMenu: true, icon: "copy_to_library", tooltip: "Copy or move the selected books into another library" },
 
   { id: "read", label: "Read", group: "book", requires: "single-selection", contextMenu: true, icon: "view", accel: "Enter", tooltip: "Open in the built-in reader" },
   { id: "open-externally", label: "Open externally", group: "book", requires: "single-selection", contextMenu: true, desktopOnly: true, icon: "external-link", accel: "Ctrl+Enter", tooltip: "Open in the system's default application" },

@@ -282,7 +282,21 @@ impl AppState {
     pub fn cache_for(&self, library_id: Option<&str>) -> Option<Arc<Cache>> {
         match &self.libraries {
             None => Some(self.cache.clone()),
-            Some(broker) => broker.get(library_id),
+            // `-` means "no particular library" in this port's own URLs:
+            // every route that takes a `{library_id}` segment needs
+            // *something* in it, and the web UI fills it with `-` (see
+            // `web/src/library/api.ts`, e.g.
+            // `/cdb/add-book/{job}/{dup}/{name}/-`).
+            //
+            // It never mattered while `libraries` was always `None`,
+            // because this function ignored the id entirely. The moment a
+            // broker exists it matters a great deal: the broker knows no
+            // library called `-`, so every one of those calls would have
+            // started 404ing the day a second library was configured.
+            // Normalised here rather than in the broker, which is a
+            // faithful port of upstream's own `get` and has no such
+            // placeholder.
+            Some(broker) => broker.get(library_id.filter(|id| *id != "-")),
         }
     }
 }

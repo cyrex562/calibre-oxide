@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { embedMetadata, summarizeEmbed, addBook, addFormat, addNewsSchedule, blobToDataUrl, inspectPlugin, installPlugin, listPlugins, removePlugin, setPluginEnabled, catalogDownloadUrl, checkLibrary, coverProxyUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchCoverProxyBlob, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeDataFile, removeFormat, removeNewsSchedule, renameCategoryItem, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, scanLibrary, fetchOrphans, relocateOrphan, uploadOrphanFile, forgetOrphan, fetchIgnored, unignoreFile, searchMetadataOnline, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
+import { copyToLibrary, fetchLibraryInfo, embedMetadata, summarizeEmbed, addBook, addFormat, addNewsSchedule, blobToDataUrl, inspectPlugin, installPlugin, listPlugins, removePlugin, setPluginEnabled, catalogDownloadUrl, checkLibrary, coverProxyUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchCoverProxyBlob, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeDataFile, removeFormat, removeNewsSchedule, renameCategoryItem, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, scanLibrary, fetchOrphans, relocateOrphan, uploadOrphanFile, forgetOrphan, fetchIgnored, unignoreFile, searchMetadataOnline, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
 import type { BookSummary } from "./types";
 
 function bookStub(id: number): BookSummary {
@@ -139,6 +139,54 @@ describe("deleteBooks", () => {
 
     await deleteBooks([]);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("copyToLibrary", () => {
+  it("posts the book ids and the move flag to the target library", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ "1": { ok: true, payload: 7 } }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await copyToLibrary("Archive", [1], true);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/cdb/copy-to-library/Archive/-");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body)).toEqual({ book_ids: [1], move_books: true, duplicate_action: "add" });
+    expect(result["1"].payload).toBe(7);
+  });
+
+  it("escapes a library id with characters that need it", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await copyToLibrary("My Books/2024", [1]);
+    expect(fetchMock.mock.calls[0][0]).toBe("/cdb/copy-to-library/My%20Books%2F2024/-");
+  });
+
+  it("short-circuits without a network call for an empty id list", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    expect(await copyToLibrary("Archive", [])).toEqual({});
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("fetchLibraryInfo", () => {
+  it("reports every library the server hosts, not just the open one", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ library_map: { Home: "Home", Archive: "Archive" }, default_library: "Home", library_path: "/books/Home" }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const info = await fetchLibraryInfo();
+    expect(info.id).toBe("Home");
+    expect(info.name).toBe("Home");
+    expect(info.path).toBe("/books/Home");
+    // The map is what the copy-to-library target picker reads; discarding
+    // it left nothing to offer as a destination.
+    expect(info.libraries).toEqual({ Home: "Home", Archive: "Archive" });
   });
 });
 

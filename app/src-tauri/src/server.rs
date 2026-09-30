@@ -123,9 +123,26 @@ pub fn resolve_pdfium(app: &AppHandle) -> Option<PathBuf> {
 /// <port>` -- real auth stays off (`calibre_srv`'s own default with no
 /// `--add-user` ever called): a locally-spawned server that only this
 /// app's own window ever talks to has nothing to authenticate against.
-pub fn spawn(bin: &Path, library_path: &Path, static_dir: &Path, port: u16, pdfium: Option<&Path>) -> io::Result<Child> {
+/// `also_serve` are the user's other known libraries, passed as
+/// `--library` so that a `library_id` in a URL means something (#959).
+/// Without them the server hosts one library and copy-to-library has
+/// nowhere to copy to, however many libraries the user has opened before.
+///
+/// The currently-open library is deliberately not repeated in this list:
+/// it is the positional argument, and the broker would skip a duplicate
+/// path anyway.
+pub fn spawn(bin: &Path, library_path: &Path, static_dir: &Path, port: u16, pdfium: Option<&Path>, also_serve: &[PathBuf]) -> io::Result<Child> {
     let mut cmd = Command::new(bin);
     cmd.arg(library_path).arg("--static-dir").arg(static_dir).arg("--port").arg(port.to_string());
+    for other in also_serve {
+        // A library the user has since deleted or unplugged must not stop
+        // the app from starting; `LibraryBroker::new` skips a path with no
+        // `metadata.db`, but a path that is gone entirely is cheaper to
+        // drop here than to have the server decide about.
+        if other != library_path && other.join("metadata.db").is_file() {
+            cmd.arg("--library").arg(other);
+        }
+    }
     if let Some(pdfium) = pdfium {
         // Read by `calibre_ebooks::pdf::rasterize`. An environment
         // variable rather than a flag because every binary in the

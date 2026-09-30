@@ -18,7 +18,7 @@ import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LI
   uploadOrphanFile,
   forgetOrphan,
   fetchIgnored,
-  unignoreFile, deleteBooks, embedMetadata, summarizeEmbed, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchLibraryInfo, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameFiles, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
+  unignoreFile, copyToLibrary, deleteBooks, embedMetadata, summarizeEmbed, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchLibraryInfo, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameFiles, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
 import type { CheckLibraryFinding, CheckLibraryResult, CustomRecipeOptions, DuplicateGroup, IgnoredFile, NewsFeedInput, NewsSchedule, Orphan, SaveToDiskResult } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
 import { similarBooksQuery } from "../library/query";
@@ -1178,6 +1178,52 @@ const saveToDiskBusy = ref(false);
 const saveToDiskResults = ref<SaveToDiskResult[]>([]);
 const saveToDiskError = ref<string | null>(null);
 
+// Every library this server hosts, for the copy-to-library target picker
+// (#959). One entry when the server was started with a single library,
+// which is why the action says so rather than opening an empty list.
+const libraryId = ref("");
+const libraryMap = ref<Record<string, string>>({});
+
+const copyTargets = computed(() => Object.entries(libraryMap.value).filter(([id]) => id !== libraryId.value).map(([id, name]) => ({ id, name })));
+
+const copyOpen = ref(false);
+const copyBusy = ref(false);
+const copyTarget = ref("");
+const copyMove = ref(false);
+const copyResults = ref<string[]>([]);
+const copyDone = ref(false);
+const copyError = ref<string | null>(null);
+
+function openCopyToLibrary() {
+  copyOpen.value = true;
+  copyBusy.value = false;
+  copyDone.value = false;
+  copyResults.value = [];
+  copyError.value = null;
+  copyMove.value = false;
+  copyTarget.value = copyTargets.value[0]?.id ?? "";
+}
+
+async function runCopyToLibrary() {
+  const ids = renameScope.value;
+  if (ids.length === 0 || !copyTarget.value) return;
+  copyBusy.value = true;
+  copyError.value = null;
+  try {
+    const response = await copyToLibrary(copyTarget.value, ids, copyMove.value);
+    // Per book, because one already present in the target is skipped
+    // while its neighbours are copied.
+    copyResults.value = Object.entries(response).map(([bookId, outcome]) => (outcome.ok ? `Book ${bookId}: copied` : `Book ${bookId}: ${outcome.error ?? "not copied"}`));
+    copyDone.value = true;
+    // A move takes books out of this library, so the grid is stale.
+    if (copyMove.value) await runSearch();
+  } catch (e) {
+    copyError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    copyBusy.value = false;
+  }
+}
+
 // Embed metadata into the book files themselves (#958). The counterpart
 // to "Rename files": that changes the name on disk, this changes the
 // metadata *inside* each file, so a reader app shows the title this
@@ -1517,6 +1563,8 @@ async function loadLibraryInfo() {
     const info = await fetchLibraryInfo();
     libraryName.value = info.name;
     libraryPath.value = info.path;
+    libraryId.value = info.id;
+    libraryMap.value = info.libraries;
   } catch {
     // Not worth surfacing: the status bar simply omits the label, and
     // every other part of the window works without it.
@@ -1664,6 +1712,7 @@ const actionHandlers: Partial<Record<LibraryActionId, () => void>> = {
   "save-to-disk": () => openSaveToDisk(),
   "rename-files": () => void openRenameFiles(),
   "embed-metadata": () => openEmbedMetadata(),
+  "copy-to-library": () => openCopyToLibrary(),
   "open-library-folder": () => void revealLibraryFolder(),
 };
 
@@ -1717,6 +1766,7 @@ function actionLabel(action: LibraryAction): string {
     case "save-to-disk":
     case "rename-files":
     case "embed-metadata":
+    case "copy-to-library":
       return `${action.label} (${selectedIds.value.size})`;
     default:
       return action.label;
@@ -2051,7 +2101,7 @@ function onLibraryKeydown(event: KeyboardEvent) {
   // A modal owns the keyboard while it is open -- firing library
   // shortcuts underneath one would act on a view the user cannot
   // currently see.
-  if (contextMenu.value || manageOpen.value || columnsOpen.value || columnPickerOpen.value || checkLibraryOpen.value || duplicatesOpen.value || saveToDiskOpen.value || renameOpen.value || embedOpen.value || newsOpen.value || switchOpen.value) return;
+  if (contextMenu.value || manageOpen.value || columnsOpen.value || columnPickerOpen.value || checkLibraryOpen.value || duplicatesOpen.value || saveToDiskOpen.value || renameOpen.value || embedOpen.value || copyOpen.value || newsOpen.value || switchOpen.value) return;
 
   const id = shortcutFor(event, libraryShortcuts(keymap.value));
   if (!id) return;
@@ -2886,6 +2936,42 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
             <span v-else-if="r.changed" class="manage-name">{{ r.current || "(unnamed)" }} → {{ r.proposed }}</span>
             <span v-else class="manage-name muted">{{ r.current }} (unchanged)</span>
           </li>
+        </ul>
+      </div>
+    </div>
+
+    <div v-if="copyOpen" class="manage-backdrop" @click.self="copyOpen = false">
+      <div class="manage-panel">
+        <button class="manage-close" @click="copyOpen = false">✕</button>
+        <h3>Copy to library</h3>
+        <p v-if="copyTargets.length === 0" class="news-hint">
+          This server is hosting only this library, so there is nowhere to copy to. Open another library once and it becomes
+          available here.
+        </p>
+        <template v-else>
+          <p class="news-hint">Copies the selected book(s), with their formats and cover, into another library this server hosts.</p>
+          <form @submit.prevent="runCopyToLibrary">
+            <label class="news-field">
+              Destination library
+              <select v-model="copyTarget" :disabled="copyBusy">
+                <option v-for="target in copyTargets" :key="target.id" :value="target.id">{{ target.name }}</option>
+              </select>
+            </label>
+            <label class="news-field">
+              <input v-model="copyMove" type="checkbox" :disabled="copyBusy" />
+              Remove from this library afterwards (move rather than copy)
+            </label>
+            <div class="bulk-actions">
+              <button type="submit" class="read" :disabled="copyBusy || !copyTarget">
+                {{ copyBusy ? "Copying…" : `${copyMove ? "Move" : "Copy"} ${renameScope.length} book(s)` }}
+              </button>
+              <button type="button" :disabled="copyBusy" @click="copyOpen = false">Close</button>
+            </div>
+          </form>
+        </template>
+        <p v-if="copyError" class="error">{{ copyError }}</p>
+        <ul v-if="copyDone && copyResults.length" class="manage-list">
+          <li v-for="(line, i) in copyResults" :key="i"><span class="manage-name">{{ line }}</span></li>
         </ul>
       </div>
     </div>
