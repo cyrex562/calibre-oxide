@@ -183,6 +183,71 @@ pub async fn get_file(State(state): State<AppState>, AxumPath((session_id, name)
     .map_err(|e| ServerError::InternalServerError(e.to_string()))?
 }
 
+/// `GET /tweak/raw/{session_id}/{*name}` -- any file in the session as
+/// raw bytes, with its guessed content type (#960).
+///
+/// [`get_file`] deliberately refuses anything that is not editable text,
+/// which is right for an editor buffer and wrong for a preview: a preview
+/// needs the book's images and fonts too, and they are exactly the files
+/// that refusal excludes. So this serves bytes and lets the browser
+/// decide what to do with them.
+///
+/// Guarded by the same `has_name` check as every other session route, so
+/// a crafted `name` can only reach a file the container already knows
+/// about -- there is no filesystem path built from it.
+pub async fn get_raw(State(state): State<AppState>, AxumPath((session_id, name)): AxumPath<(String, String)>) -> Result<axum::response::Response, ServerError> {
+    let (data, mime) = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, String), ServerError> {
+        let mut sessions = state.tweak_sessions.sessions.lock().unwrap();
+        let session = sessions.get_mut(&session_id).ok_or_else(|| ServerError::NotFound(format!("No tweak session: {session_id}")))?;
+        if !session.container.has_name(&name) {
+            return Err(ServerError::NotFound(format!("No file named {name:?} in this session")));
+        }
+        let mime = session.container.guess_type(&name);
+        let data = session.container.raw_data(&name, true).map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+        Ok((data, mime))
+    })
+    .await
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))??;
+
+    use axum::http::header;
+    use axum::response::IntoResponse;
+
+    // A book is untrusted input -- people download EPUBs -- and this
+    // route serves its files on the app's own origin. Without these
+    // headers, a book containing `evil.xhtml` or a scripted `cover.svg`
+    // would execute that script with full app privileges the moment
+    // anything navigated to its URL: same origin as the UI, so same
+    // access to every authenticated `/cdb/*` route.
+    //
+    // The preview is unaffected, because it never lets the browser
+    // interpret these bytes as a document: it `fetch`es them and builds
+    // its own blob URLs (`library/tweakPreview.ts`). `Content-Disposition`
+    // and CSP apply to navigations and documents, neither of which a
+    // `fetch` creates.
+    //
+    // The real content type is kept rather than coerced to
+    // `application/octet-stream`, because the preview needs it: a blob
+    // built from this response carries its type, and an `<img>` will not
+    // render an image typed as a byte stream. SVG stays `image/svg+xml`
+    // for that reason -- scripts in an SVG loaded through `<img>` do not
+    // execute, and the headers below cover the navigation case.
+    Ok((
+        [
+            (header::CONTENT_TYPE, mime),
+            // Forces a download rather than a render on direct navigation.
+            (header::CONTENT_DISPOSITION, "attachment".to_string()),
+            // No content-type sniffing, so a mislabelled file cannot be
+            // reinterpreted as something executable.
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+            // Belt and braces: anything that does get rendered loads
+            // nothing and runs nothing, in an opaque origin.
+            (header::CONTENT_SECURITY_POLICY, "default-src 'none'; sandbox".to_string()),
+        ],
+        data,
+    )
+        .into_response())
+}
+
 /// `POST /tweak/file/{session_id}/{*name}` -- the request body is the
 /// file's new raw text content.
 pub async fn set_file(State(state): State<AppState>, AxumPath((session_id, name)): AxumPath<(String, String)>, body: String) -> Result<(), ServerError> {
@@ -550,6 +615,68 @@ mod tests {
         let session_id = json["session_id"].as_str().unwrap();
         let (status, _) = get(&router, &format!("/tweak/file/{session_id}/cover.png")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// #960: the preview needs the book's images, which are exactly the
+    /// files `/tweak/file` refuses.
+    #[tokio::test]
+    async fn get_raw_serves_a_binary_file_that_get_file_rejects() {
+        let (_dir, router, book_id) = test_app();
+        let (_, body) = post(&router, &format!("/tweak/open/{book_id}/epub/default"), Body::empty()).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let session_id = json["session_id"].as_str().unwrap();
+
+        // The same name, through both routes, to show the difference is the
+        // route rather than the file.
+        let (text_status, _) = get(&router, &format!("/tweak/file/{session_id}/cover.png")).await;
+        assert_eq!(text_status, StatusCode::BAD_REQUEST);
+
+        let (raw_status, raw_body) = get(&router, &format!("/tweak/raw/{session_id}/cover.png")).await;
+        assert_eq!(raw_status, StatusCode::OK, "the preview cannot render images without this");
+        assert!(!raw_body.is_empty(), "expected the image's bytes");
+    }
+
+    /// A book is untrusted input, and this route serves its files on the
+    /// app's own origin. Without these headers a scripted `cover.svg` or a
+    /// stray `evil.xhtml` inside an EPUB would run with the UI's
+    /// privileges the moment anything navigated to its URL.
+    #[tokio::test]
+    async fn get_raw_cannot_be_used_to_run_a_books_own_script_on_the_app_origin() {
+        let (_dir, router, book_id) = test_app();
+        let (_, body) = post(&router, &format!("/tweak/open/{book_id}/epub/default"), Body::empty()).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let session_id = json["session_id"].as_str().unwrap();
+
+        let req = Request::builder().uri(format!("/tweak/raw/{session_id}/cover.png")).body(Body::empty()).unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let headers = resp.headers();
+        // Downloads rather than renders on direct navigation.
+        assert_eq!(headers.get("content-disposition").unwrap(), "attachment");
+        // A mislabelled file cannot be reinterpreted as something active.
+        assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
+        // And anything that does get rendered loads and runs nothing.
+        let csp = headers.get("content-security-policy").unwrap().to_str().unwrap();
+        assert!(csp.contains("default-src 'none'"), "got: {csp}");
+        assert!(csp.contains("sandbox"), "got: {csp}");
+
+        // The real type survives: the preview builds blob URLs from this
+        // response, and an <img> will not render a byte stream.
+        assert_eq!(headers.get("content-type").unwrap(), "image/png");
+    }
+
+    #[tokio::test]
+    async fn get_raw_404s_for_a_name_the_container_does_not_have() {
+        let (_dir, router, book_id) = test_app();
+        let (_, body) = post(&router, &format!("/tweak/open/{book_id}/epub/default"), Body::empty()).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let session_id = json["session_id"].as_str().unwrap();
+
+        // The `has_name` guard is what keeps a crafted name from reaching
+        // anything the container does not already know about.
+        let (status, _) = get(&router, &format!("/tweak/raw/{session_id}/../../etc/passwd")).await;
+        assert_ne!(status, StatusCode::OK, "a name outside the container must not resolve");
     }
 
     #[tokio::test]

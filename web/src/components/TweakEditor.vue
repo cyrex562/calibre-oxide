@@ -2,6 +2,7 @@
 import { insertAt, searchChars, type SpecialChar } from "../library/charSelect";
 import { computed, nextTick, onBeforeUnmount, ref } from "vue";
 import { commitTweakSession, discardTweakSession, fetchToc, fetchTweakFile, openTweakSession, saveToc, saveTweakFile, type TocNode } from "../library/tweak";
+import { buildPreview, previewableFiles, readPreviewSources, type PreviewSources } from "../library/tweakPreview";
 import TocTreeNode from "./TocTreeNode.vue";
 
 import { bookReport, checkBook, fixBookChecks, type BookReport, type CheckResult, spellCheckBook, type MisspelledWord, searchReplaceBook, type SearchReplaceResult, bookDiff, bookFonts, type DiffFile, type FontFamily } from "../library/api";
@@ -61,6 +62,82 @@ async function saveTocTree() {
 
 const dirty = () => content.value !== savedContent.value;
 
+// Live preview (#960).
+//
+// Renders the session's own bytes -- the file as it is in this textarea
+// right now, not as it was last saved -- so editing a stylesheet shows up
+// without a save. See `library/tweakPreview.ts` for why this does not
+// reuse the reader's renderer.
+const previewOpen = ref(false);
+const previewSources = ref<PreviewSources>({ spine: [], opfName: null });
+const previewTarget = ref<string | null>(null);
+const previewError = ref<string | null>(null);
+const previewFrame = ref<HTMLIFrameElement | null>(null);
+let previewTimer: ReturnType<typeof setTimeout> | undefined;
+let previewBlobUrls: string[] = [];
+
+const previewTargets = computed(() => previewableFiles(previewSources.value, files.value));
+
+/** Whether the file open in the editor is itself previewable. */
+const editingContentFile = computed(() => !!selectedFile.value && /\.x?html?$/i.test(selectedFile.value));
+
+async function togglePreview() {
+  previewOpen.value = !previewOpen.value;
+  if (!previewOpen.value) {
+    releasePreviewBlobs();
+    return;
+  }
+  if (sessionId.value && previewSources.value.spine.length === 0) {
+    previewSources.value = await readPreviewSources(sessionId.value, files.value);
+  }
+  // Editing a content file previews *that* file; editing a stylesheet
+  // previews the first spine item, which is the decision on #960 -- never
+  // an empty pane, and the picker reaches the rest.
+  if (!previewTarget.value || editingContentFile.value) {
+    previewTarget.value = editingContentFile.value ? selectedFile.value : (previewTargets.value[0] ?? null);
+  }
+  await renderPreview();
+}
+
+function releasePreviewBlobs() {
+  for (const url of previewBlobUrls) URL.revokeObjectURL(url);
+  previewBlobUrls = [];
+}
+
+async function renderPreview() {
+  if (!previewOpen.value || !sessionId.value || !previewTarget.value) return;
+  previewError.value = null;
+  try {
+    // The unsaved buffer for whichever file is open, so the preview shows
+    // what is on screen rather than what is on disk.
+    const overrides = selectedFile.value ? { [selectedFile.value]: content.value } : {};
+    const { html, blobUrls } = await buildPreview(sessionId.value, previewTarget.value, overrides);
+    const doc = previewFrame.value?.contentDocument;
+    if (!doc) return;
+    doc.open();
+    doc.write(html);
+    doc.close();
+    // Revoked only after the new document is in place: doing it before
+    // would pull the previous render's images out from under it, and not
+    // at all would leak one blob per keystroke.
+    releasePreviewBlobs();
+    previewBlobUrls = blobUrls;
+  } catch (e) {
+    previewError.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
+/**
+ * Re-render once typing stops. Chosen over re-rendering per keystroke so
+ * a fast typist triggers one render rather than forty, and over
+ * render-on-save because "live" is the point of the feature.
+ */
+function schedulePreview() {
+  if (!previewOpen.value) return;
+  clearTimeout(previewTimer);
+  previewTimer = setTimeout(() => void renderPreview(), 400);
+}
+
 async function open() {
   loading.value = true;
   error.value = null;
@@ -85,6 +162,13 @@ async function selectFile(name: string) {
     selectedFile.value = name;
     content.value = text;
     savedContent.value = text;
+    if (previewOpen.value) {
+      // Opening a content file moves the preview to it; opening a
+      // stylesheet leaves the preview where it was, since that is the
+      // page whose styling is being changed.
+      if (/\.x?html?$/i.test(name)) previewTarget.value = name;
+      await renderPreview();
+    }
   } catch (e) {
     fileError.value = e instanceof Error ? e.message : String(e);
   }
@@ -123,6 +207,8 @@ async function commitAndClose() {
 }
 
 function discardAndClose() {
+  clearTimeout(previewTimer);
+  releasePreviewBlobs();
   if (sessionId.value) void discardTweakSession(sessionId.value);
   sessionId.value = null;
   emit("close");
@@ -495,7 +581,7 @@ function insertChar(c: SpecialChar) {
         </section>
 
         <template v-if="tab === 'files'">
-          <p class="hint">Plain-text editing of this EPUB's own internal files. No rich editor or live preview yet -- open the edited book in the reader afterward to check your changes.</p>
+          <p class="hint">Plain-text editing of this EPUB's own internal files. Turn on the preview to see your changes rendered as you type.</p>
           <div class="editor">
             <ul class="file-list">
               <li v-for="name in files" :key="name">
@@ -507,6 +593,15 @@ function insertChar(c: SpecialChar) {
               <template v-else>
                 <div class="char-bar">
                   <button type="button" :class="{ active: charPickerOpen }" @click="charPickerOpen = !charPickerOpen">Ω Special characters</button>
+                  <button type="button" :class="{ active: previewOpen }" @click="togglePreview">
+                    {{ previewOpen ? "Hide preview" : "Show preview" }}
+                  </button>
+                  <label v-if="previewOpen && previewTargets.length > 1">
+                    Previewing
+                    <select v-model="previewTarget" @change="renderPreview">
+                      <option v-for="name in previewTargets" :key="name" :value="name">{{ name }}</option>
+                    </select>
+                  </label>
                 </div>
                 <div v-if="charPickerOpen" class="char-picker">
                   <input v-model="charQuery" type="search" placeholder="Search by name… (try &quot;nbsp&quot; or &quot;em dash&quot;)" />
@@ -518,7 +613,17 @@ function insertChar(c: SpecialChar) {
                     </button>
                   </div>
                 </div>
-                <textarea ref="contentArea" v-model="content" spellcheck="false"></textarea>
+                <div class="edit-and-preview" :class="{ 'with-preview': previewOpen }">
+                  <textarea ref="contentArea" v-model="content" spellcheck="false" @input="schedulePreview"></textarea>
+                  <div v-if="previewOpen" class="preview-pane">
+                    <p v-if="previewTargets.length === 0" class="hint">This book has no content file to preview.</p>
+                    <!-- Sandboxed: a book's own scripts must not reach the
+                         editor around them. `allow-same-origin` is needed for
+                         the document to be written into at all. -->
+                    <iframe ref="previewFrame" class="preview-frame" sandbox="allow-same-origin" title="Preview"></iframe>
+                    <p v-if="previewError" class="error">{{ previewError }}</p>
+                  </div>
+                </div>
               </template>
             </div>
           </div>
@@ -628,6 +733,31 @@ h3 {
   flex: 1;
   min-width: 0;
   display: flex;
+}
+/* Stands exactly where the bare <textarea> used to in `.file-content`'s
+   row layout, so hiding the preview leaves the editor as it was. */
+.edit-and-preview {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  gap: 0.5rem;
+}
+.edit-and-preview.with-preview > textarea {
+  /* Half each, rather than letting the textarea keep all of it. */
+  flex: 1 1 50%;
+}
+.preview-pane {
+  flex: 1 1 50%;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.preview-frame {
+  flex: 1;
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: #fff;
 }
 .file-content textarea {
   flex: 1;
