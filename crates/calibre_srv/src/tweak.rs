@@ -209,8 +209,43 @@ pub async fn get_raw(State(state): State<AppState>, AxumPath((session_id, name))
     .await
     .map_err(|e| ServerError::InternalServerError(e.to_string()))??;
 
+    use axum::http::header;
     use axum::response::IntoResponse;
-    Ok(([(axum::http::header::CONTENT_TYPE, mime)], data).into_response())
+
+    // A book is untrusted input -- people download EPUBs -- and this
+    // route serves its files on the app's own origin. Without these
+    // headers, a book containing `evil.xhtml` or a scripted `cover.svg`
+    // would execute that script with full app privileges the moment
+    // anything navigated to its URL: same origin as the UI, so same
+    // access to every authenticated `/cdb/*` route.
+    //
+    // The preview is unaffected, because it never lets the browser
+    // interpret these bytes as a document: it `fetch`es them and builds
+    // its own blob URLs (`library/tweakPreview.ts`). `Content-Disposition`
+    // and CSP apply to navigations and documents, neither of which a
+    // `fetch` creates.
+    //
+    // The real content type is kept rather than coerced to
+    // `application/octet-stream`, because the preview needs it: a blob
+    // built from this response carries its type, and an `<img>` will not
+    // render an image typed as a byte stream. SVG stays `image/svg+xml`
+    // for that reason -- scripts in an SVG loaded through `<img>` do not
+    // execute, and the headers below cover the navigation case.
+    Ok((
+        [
+            (header::CONTENT_TYPE, mime),
+            // Forces a download rather than a render on direct navigation.
+            (header::CONTENT_DISPOSITION, "attachment".to_string()),
+            // No content-type sniffing, so a mislabelled file cannot be
+            // reinterpreted as something executable.
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+            // Belt and braces: anything that does get rendered loads
+            // nothing and runs nothing, in an opaque origin.
+            (header::CONTENT_SECURITY_POLICY, "default-src 'none'; sandbox".to_string()),
+        ],
+        data,
+    )
+        .into_response())
 }
 
 /// `POST /tweak/file/{session_id}/{*name}` -- the request body is the
@@ -599,6 +634,36 @@ mod tests {
         let (raw_status, raw_body) = get(&router, &format!("/tweak/raw/{session_id}/cover.png")).await;
         assert_eq!(raw_status, StatusCode::OK, "the preview cannot render images without this");
         assert!(!raw_body.is_empty(), "expected the image's bytes");
+    }
+
+    /// A book is untrusted input, and this route serves its files on the
+    /// app's own origin. Without these headers a scripted `cover.svg` or a
+    /// stray `evil.xhtml` inside an EPUB would run with the UI's
+    /// privileges the moment anything navigated to its URL.
+    #[tokio::test]
+    async fn get_raw_cannot_be_used_to_run_a_books_own_script_on_the_app_origin() {
+        let (_dir, router, book_id) = test_app();
+        let (_, body) = post(&router, &format!("/tweak/open/{book_id}/epub/default"), Body::empty()).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let session_id = json["session_id"].as_str().unwrap();
+
+        let req = Request::builder().uri(format!("/tweak/raw/{session_id}/cover.png")).body(Body::empty()).unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let headers = resp.headers();
+        // Downloads rather than renders on direct navigation.
+        assert_eq!(headers.get("content-disposition").unwrap(), "attachment");
+        // A mislabelled file cannot be reinterpreted as something active.
+        assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
+        // And anything that does get rendered loads and runs nothing.
+        let csp = headers.get("content-security-policy").unwrap().to_str().unwrap();
+        assert!(csp.contains("default-src 'none'"), "got: {csp}");
+        assert!(csp.contains("sandbox"), "got: {csp}");
+
+        // The real type survives: the preview builds blob URLs from this
+        // response, and an <img> will not render a byte stream.
+        assert_eq!(headers.get("content-type").unwrap(), "image/png");
     }
 
     #[tokio::test]
