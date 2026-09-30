@@ -183,6 +183,36 @@ pub async fn get_file(State(state): State<AppState>, AxumPath((session_id, name)
     .map_err(|e| ServerError::InternalServerError(e.to_string()))?
 }
 
+/// `GET /tweak/raw/{session_id}/{*name}` -- any file in the session as
+/// raw bytes, with its guessed content type (#960).
+///
+/// [`get_file`] deliberately refuses anything that is not editable text,
+/// which is right for an editor buffer and wrong for a preview: a preview
+/// needs the book's images and fonts too, and they are exactly the files
+/// that refusal excludes. So this serves bytes and lets the browser
+/// decide what to do with them.
+///
+/// Guarded by the same `has_name` check as every other session route, so
+/// a crafted `name` can only reach a file the container already knows
+/// about -- there is no filesystem path built from it.
+pub async fn get_raw(State(state): State<AppState>, AxumPath((session_id, name)): AxumPath<(String, String)>) -> Result<axum::response::Response, ServerError> {
+    let (data, mime) = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, String), ServerError> {
+        let mut sessions = state.tweak_sessions.sessions.lock().unwrap();
+        let session = sessions.get_mut(&session_id).ok_or_else(|| ServerError::NotFound(format!("No tweak session: {session_id}")))?;
+        if !session.container.has_name(&name) {
+            return Err(ServerError::NotFound(format!("No file named {name:?} in this session")));
+        }
+        let mime = session.container.guess_type(&name);
+        let data = session.container.raw_data(&name, true).map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+        Ok((data, mime))
+    })
+    .await
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))??;
+
+    use axum::response::IntoResponse;
+    Ok(([(axum::http::header::CONTENT_TYPE, mime)], data).into_response())
+}
+
 /// `POST /tweak/file/{session_id}/{*name}` -- the request body is the
 /// file's new raw text content.
 pub async fn set_file(State(state): State<AppState>, AxumPath((session_id, name)): AxumPath<(String, String)>, body: String) -> Result<(), ServerError> {
@@ -550,6 +580,38 @@ mod tests {
         let session_id = json["session_id"].as_str().unwrap();
         let (status, _) = get(&router, &format!("/tweak/file/{session_id}/cover.png")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// #960: the preview needs the book's images, which are exactly the
+    /// files `/tweak/file` refuses.
+    #[tokio::test]
+    async fn get_raw_serves_a_binary_file_that_get_file_rejects() {
+        let (_dir, router, book_id) = test_app();
+        let (_, body) = post(&router, &format!("/tweak/open/{book_id}/epub/default"), Body::empty()).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let session_id = json["session_id"].as_str().unwrap();
+
+        // The same name, through both routes, to show the difference is the
+        // route rather than the file.
+        let (text_status, _) = get(&router, &format!("/tweak/file/{session_id}/cover.png")).await;
+        assert_eq!(text_status, StatusCode::BAD_REQUEST);
+
+        let (raw_status, raw_body) = get(&router, &format!("/tweak/raw/{session_id}/cover.png")).await;
+        assert_eq!(raw_status, StatusCode::OK, "the preview cannot render images without this");
+        assert!(!raw_body.is_empty(), "expected the image's bytes");
+    }
+
+    #[tokio::test]
+    async fn get_raw_404s_for_a_name_the_container_does_not_have() {
+        let (_dir, router, book_id) = test_app();
+        let (_, body) = post(&router, &format!("/tweak/open/{book_id}/epub/default"), Body::empty()).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let session_id = json["session_id"].as_str().unwrap();
+
+        // The `has_name` guard is what keeps a crafted name from reaching
+        // anything the container does not already know about.
+        let (status, _) = get(&router, &format!("/tweak/raw/{session_id}/../../etc/passwd")).await;
+        assert_ne!(status, StatusCode::OK, "a name outside the container must not resolve");
     }
 
     #[tokio::test]
