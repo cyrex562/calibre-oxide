@@ -97,6 +97,21 @@ pub fn spawn_calibre_srv(library: &Path, static_dir: &Path, port: u16) -> ChildG
     ChildGuard(child)
 }
 
+/// Same as [`spawn_calibre_srv`], hosting `extra` additional libraries
+/// alongside `library` (which stays the default).
+///
+/// The `--library` flag this passes is what makes a `library_id` in a URL
+/// mean anything: with one library the server ignores it entirely.
+pub fn spawn_calibre_srv_with_libraries(library: &Path, extra: &[&Path], static_dir: &Path, port: u16) -> ChildGuard {
+    let mut command = Command::new(oxide_bin("calibre_srv"));
+    command.arg(library).arg("--static-dir").arg(static_dir).arg("--port").arg(port.to_string());
+    for path in extra {
+        command.arg("--library").arg(path);
+    }
+    let child = command.stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("failed to spawn calibre_srv");
+    ChildGuard(child)
+}
+
 /// Polls a real TCP connect until `calibre_srv` (or anything else
 /// listening on `port`) is actually accepting connections.
 pub fn wait_until_ready(port: u16, timeout: Duration) -> bool {

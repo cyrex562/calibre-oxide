@@ -26,8 +26,20 @@ use calibre_srv::{auth::AuthGate, opts::ServerOptions, router, users::UserManage
 #[derive(Parser)]
 #[command(about = "calibre-oxide content server")]
 struct Cli {
-    /// Path to the calibre library to serve
+    /// Path to the calibre library to serve. This one is the *default*
+    /// library: it also holds the server's own state (the user
+    /// database, reader profiles, news schedules), so it is a
+    /// positional rather than one of `--library`'s equals.
     library_path: PathBuf,
+    /// Serve an additional library, addressed by `library_id` in every
+    /// URL that takes one. Repeatable.
+    ///
+    /// Separate from the positional so that the default library --
+    /// the one that owns server-side state and answers a request naming
+    /// no library -- stays unambiguous. `library_id` comes from the
+    /// folder's own name (`library_broker::library_id_from_path`).
+    #[arg(long = "library")]
+    extra_libraries: Vec<PathBuf>,
     /// Add a user (NAME:PASSWORD) to the user database and exit, rather than starting the server
     #[arg(long)]
     add_user: Option<String>,
@@ -161,8 +173,24 @@ async fn main() -> anyhow::Result<()> {
         )),
         None => None,
     };
+    // Only built when there is actually more than one library. With a
+    // single library `cache_for` short-circuits to `cache` and never
+    // consults a broker, so building one would open the same library a
+    // second time for nothing.
+    let libraries = if cli.extra_libraries.is_empty() {
+        None
+    } else {
+        let mut paths = vec![cli.library_path.clone()];
+        paths.extend(cli.extra_libraries.iter().cloned());
+        let broker = Arc::new(calibre_srv::library_broker::LibraryBroker::new(&paths)?);
+        for (id, name) in broker.library_map() {
+            println!("serving library {id:?} ({name})");
+        }
+        Some(broker)
+    };
+
     let state = AppState {
-        libraries: None,
+        libraries,
         cache: Arc::new(cache),
         opts: Arc::new(cli.opts),
         auth,

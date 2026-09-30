@@ -1552,5 +1552,24 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["books"][book_id.to_string()]["formats"]["EPUB"]["status"], "embedded", "{body}");
     }
+
+    /// The compatibility trap this change had to avoid: every
+    /// `{library_id}` URL the web UI builds fills that segment with `-`
+    /// (see `web/src/library/api.ts`). The broker knows no library called
+    /// `-`, so without normalising it in `cache_for`, every one of those
+    /// calls would have started 404ing the day a second library was
+    /// configured -- which is the day this change makes possible.
+    #[tokio::test]
+    async fn a_dash_library_id_still_means_the_default_library() {
+        let (src_dir, _dest_dir, broker, router) = test_app_with_two_libraries();
+        let src_name = src_dir.path().file_name().unwrap().to_str().unwrap();
+        assert!(broker.get(Some("-")).is_none(), "the broker itself knows no library called `-`; that is why cache_for normalises it");
+
+        // `delete-books` is a route the UI really calls with `-`.
+        let (status, _) = post_json(&router, "/cdb/delete-books/1/-", serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::OK, "a `-` library id must resolve to the default library");
+
+        assert!(broker.get(Some(src_name)).unwrap().all_book_ids().unwrap().is_empty(), "the delete should have hit the default library");
+    }
 }
 

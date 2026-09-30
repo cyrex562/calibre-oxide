@@ -1135,6 +1135,15 @@ export interface LibraryInfo {
   name: string;
   /** Absolute path on disk, for disambiguating same-named libraries. */
   path: string;
+  /** `library_id` of the open library. */
+  id: string;
+  /**
+   * Every library this server hosts, `library_id` to display name (#959).
+   *
+   * One entry when the server was started with a single library, which is
+   * how it reads for anyone who has only ever opened one.
+   */
+  libraries: Record<string, string>;
 }
 
 /**
@@ -1149,5 +1158,27 @@ export async function fetchLibraryInfo(): Promise<LibraryInfo> {
   if (!res.ok) throw new Error(`library info: ${res.status}`);
   const body = (await res.json()) as { library_map?: Record<string, string>; default_library?: string; library_path?: string };
   const id = body.default_library ?? "default";
-  return { name: body.library_map?.[id] ?? "Library", path: body.library_path ?? "" };
+  const libraries = body.library_map ?? {};
+  return { name: libraries[id] ?? "Library", path: body.library_path ?? "", id, libraries };
+}
+
+/**
+ * Copies books into another library this server hosts (#959, #816 item
+ * 1.4).
+ *
+ * The target is a `library_id` from `LibraryInfo.libraries`, not a path:
+ * the server only copies into a library it already has open, so a folder
+ * it was not started with is not a valid destination.
+ *
+ * Returns the per-book outcome the route reports — a book that already
+ * exists in the target can be skipped while its neighbours are copied, so
+ * a single overall success would be the wrong shape.
+ */
+export async function copyToLibrary(targetLibraryId: string, bookIds: number[], moveBooks = false): Promise<Record<string, { ok: boolean; payload?: number; error?: string }>> {
+  if (bookIds.length === 0) return {};
+  return await jsonFetch(`/cdb/copy-to-library/${encodeURIComponent(targetLibraryId)}/-`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ book_ids: bookIds, move_books: moveBooks, duplicate_action: "add" }),
+  });
 }
