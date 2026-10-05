@@ -1179,6 +1179,10 @@ export async function copyToLibrary(targetLibraryId: string, bookIds: number[], 
   return await jsonFetch(`/cdb/copy-to-library/${encodeURIComponent(targetLibraryId)}/-`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ book_ids: bookIds, move_books: moveBooks, duplicate_action: "add" }),
+    // The wire key is `move`, not `move_books`. This used to send the
+    // latter, which the server's serde silently ignores -- so the dialog's
+    // "move rather than copy" checkbox never moved anything and always
+    // copied, and the test below pinned the same wrong key so it passed.
+    body: JSON.stringify({ book_ids: bookIds, move: moveBooks, duplicate_action: "add" }),
   });
 }

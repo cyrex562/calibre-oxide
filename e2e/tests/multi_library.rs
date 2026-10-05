@@ -63,7 +63,7 @@ fn a_real_server_copies_a_book_between_two_hosted_libraries() {
     // Exactly the request web/src/library/api.ts builds for copy-to-library.
     let response: serde_json::Value = client
         .post(format!("{base}/cdb/copy-to-library/{archive_id}/-"))
-        .json(&serde_json::json!({"book_ids": [1], "move_books": false, "duplicate_action": "add"}))
+        .json(&serde_json::json!({"book_ids": [1], "move": false, "duplicate_action": "add"}))
         .send()
         .expect("copy-to-library request failed")
         .json()
@@ -83,6 +83,23 @@ fn a_real_server_copies_a_book_between_two_hosted_libraries() {
         .json()
         .unwrap();
     assert_eq!(search["total_num"], 1, "the book did not arrive in the archive library: {search}");
+
+    // The assertion that was missing, and that let #965 through: a book
+    // *row* is not a book. This test originally stopped at the line above,
+    // which a copy that copied no file at all also satisfied -- and the
+    // "move" option then deleted the original over it.
+    let landed = std::fs::read_dir(archive.path())
+        .unwrap()
+        .flatten()
+        .find(|e| e.file_name().to_string_lossy().ends_with(".txt"))
+        .expect("no book file arrived in the archive library's folder");
+    assert_eq!(
+        std::fs::read_to_string(landed.path()).unwrap(),
+        "Travelling Book\n\n\nJane Doe\n",
+        "the copied file's contents are not the original's"
+    );
+    // And the original is still where it was: this was a copy.
+    assert!(home.path().join("Travelling Book.txt").is_file(), "a plain copy removed the source file");
 }
 
 /// The regression this change had to avoid: the web UI fills every
@@ -119,4 +136,54 @@ fn a_dash_library_id_still_reaches_the_default_library_over_http() {
 
     let unknown = client.get(format!("http://127.0.0.1:{port}/orphans/NoSuchLibrary")).send().unwrap();
     assert_eq!(unknown.status(), 404, "an unknown library id must still 404 rather than silently using the default");
+}
+
+/// The destructive path (#965). A move deletes the original on the strength
+/// of the copy having succeeded, so the file has to be in the destination
+/// -- with the right bytes -- by the time the source is gone. It was not:
+/// the copy made a database row only, and the move then destroyed the
+/// user's only copy of the book.
+#[test]
+fn moving_a_book_leaves_its_file_in_the_destination_and_removes_it_from_the_source() {
+    let Some(static_dir) = web_dist() else {
+        eprintln!("skipping: web/dist not built -- run `npm run build` in web/ first");
+        return;
+    };
+
+    let home = TestLibrary::new();
+    let archive = TestLibrary::new();
+    add_book(home.path(), "Moving Book");
+    let archive_id = archive.path().file_name().unwrap().to_str().unwrap().replace(' ', "_");
+
+    let port = find_free_port();
+    let _srv = spawn_calibre_srv_with_libraries(home.path(), &[archive.path()], &static_dir, port);
+    assert!(wait_until_ready(port, Duration::from_secs(10)), "calibre_srv never became ready on port {port}");
+
+    let client = reqwest::blocking::Client::new();
+    let response: serde_json::Value = client
+        .post(format!("http://127.0.0.1:{port}/cdb/copy-to-library/{archive_id}/-"))
+        .json(&serde_json::json!({"book_ids": [1], "move": true, "duplicate_action": "add"}))
+        .send()
+        .expect("move request failed")
+        .json()
+        .expect("response was not valid JSON");
+    assert_eq!(response["1"]["ok"], true, "{response}");
+
+    // The file is in the destination, intact.
+    let landed = std::fs::read_dir(archive.path())
+        .unwrap()
+        .flatten()
+        .find(|e| e.file_name().to_string_lossy().ends_with(".txt"))
+        .expect("the move deleted the original but no file arrived in the destination");
+    assert_eq!(std::fs::read_to_string(landed.path()).unwrap(), "Moving Book\n\n\nJane Doe\n");
+
+    // And it is gone from where it came from.
+    let remaining: serde_json::Value = client
+        .get(format!("http://127.0.0.1:{port}/ajax/search"))
+        .query(&[("query", ""), ("num", "24"), ("offset", "0")])
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(remaining["total_num"], 0, "a move should remove the book from the source library: {remaining}");
 }
