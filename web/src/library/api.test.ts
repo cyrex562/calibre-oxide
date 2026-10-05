@@ -151,7 +151,10 @@ describe("copyToLibrary", () => {
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe("/cdb/copy-to-library/Archive/-");
     expect(init.method).toBe("POST");
-    expect(JSON.parse(init.body)).toEqual({ book_ids: [1], move_books: true, duplicate_action: "add" });
+    // `move`, the key the server actually reads (`CopyToLibraryBody`'s
+    // `#[serde(rename = "move")]`). Asserting `move_books` here is how the
+    // checkbox came to do nothing while this test passed.
+    expect(JSON.parse(init.body)).toEqual({ book_ids: [1], move: true, duplicate_action: "add" });
     expect(result["1"].payload).toBe(7);
   });
 
