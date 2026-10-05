@@ -213,6 +213,16 @@ impl Cache {
         }
     }
 
+    /// Records that a book's cover was set, for [`crate::covers::set_cover`],
+    /// which writes `has_cover` itself rather than through `set_field`.
+    ///
+    /// `blob` is the cover's content hash: the log records the hash and not
+    /// the image, because a change is a small JSON document and a cover is
+    /// a megabyte of JPEG (see `change_log::change`).
+    pub(crate) fn record_cover_set(&self, book_id: i32, blob: String) {
+        self.record_for_book(book_id, |book| crate::change_log::ChangeOp::CoverSet { book, blob: Some(blob) });
+    }
+
     /// Convenience for the common case: look up the book's uuid and
     /// record an op built from it. Does nothing if the book has no
     /// uuid, which means it does not exist.
@@ -431,12 +441,22 @@ impl Cache {
         val: &serde_json::Value,
         namespace: Option<&str>,
     ) -> Result<()> {
-        match namespace {
-            Some(ns) => self
-                .backend
-                .set_pref(&format!("namespaced:{ns}:{name}"), val),
-            None => self.backend.set_pref(name, val),
+        let key = match namespace {
+            Some(ns) => format!("namespaced:{ns}:{name}"),
+            None => name.to_string(),
+        };
+        self.backend.set_pref(&key, val)?;
+
+        // Saved searches, virtual libraries and user categories are all
+        // stored through here, and it appended nothing: a rebuild from the
+        // log lost every one of them. The value is recorded as the exact
+        // JSON text `Backend::set_pref` stored, so replay -- which writes
+        // `preferences.val` through `set_preference` -- reproduces the row
+        // byte for byte.
+        if let Ok(raw) = serde_json::to_string(val) {
+            self.record(crate::change_log::ChangeOp::PrefSet { key, value: Some(raw) });
         }
+        Ok(())
     }
 
     /// Port of `Cache.field_for` for the standard (non-custom-column)
@@ -728,6 +748,14 @@ impl Cache {
             None => None,
         };
 
+        // Taken once, so the value written to the row and the value
+        // recorded in the log are the same string. Each `INSERT` used to
+        // call `Utc::now()` for itself, and neither was recorded at all:
+        // a rebuild gave every book the schema's default timestamps, so a
+        // real publication date from the book's own metadata was lost.
+        let timestamp = metadata.timestamp.unwrap_or_else(chrono::Utc::now).to_rfc3339();
+        let pubdate = metadata.pubdate.unwrap_or_else(chrono::Utc::now).to_rfc3339();
+
         let book_id = match taken_id {
             Some(id) => {
                 tx.execute(
@@ -738,8 +766,8 @@ impl Cache {
                         &metadata.title,
                         author_name,
                         rel_path,
-                        metadata.timestamp.unwrap_or_else(chrono::Utc::now).to_rfc3339(),
-                        metadata.pubdate.unwrap_or_else(chrono::Utc::now).to_rfc3339(),
+                        &timestamp,
+                        &pubdate,
                         metadata.series_index,
                     ),
                 )?;
@@ -753,8 +781,8 @@ impl Cache {
                         &metadata.title,
                         author_name,
                         rel_path,
-                        metadata.timestamp.unwrap_or_else(chrono::Utc::now).to_rfc3339(),
-                        metadata.pubdate.unwrap_or_else(chrono::Utc::now).to_rfc3339(),
+                        &timestamp,
+                        &pubdate,
                         metadata.series_index,
                     ),
                 )?;
@@ -813,7 +841,16 @@ impl Cache {
                 ("author_sort", author_name.to_string()),
                 ("path", rel_path.to_string()),
                 ("series_index", metadata.series_index.to_string()),
+                ("timestamp", timestamp.clone()),
+                ("pubdate", pubdate.clone()),
             ];
+            let mut fields = fields;
+            // An explicit `title_sort` is written over the trigger's
+            // computed default, so it has to be logged or a rebuild
+            // silently goes back to the computed one.
+            if let Some(sort) = metadata.title_sort.as_deref() {
+                fields.push(("sort", sort.to_string()));
+            }
             for (field, value) in fields {
                 self.record(crate::change_log::ChangeOp::FieldSet { book: uuid.clone(), field: field.to_string(), value: Some(value) });
             }
@@ -926,11 +963,27 @@ impl Cache {
             "UPDATE books SET timestamp = datetime('now') WHERE id = ?1",
             (book_id,),
         )?;
+        // Read back rather than recomputed, so the log carries the exact
+        // string the database now holds. `datetime('now')` is evaluated
+        // by SQLite, and a second call from Rust would be a different
+        // instant in a different format.
+        let stamped: Option<String> = conn.query_row("SELECT timestamp FROM books WHERE id = ?1", (book_id,), |row| row.get(0)).ok();
         conn.execute(
             "INSERT OR REPLACE INTO data (book, format, uncompressed_size, name) VALUES (?1, ?2, ?3, ?4)",
             (book_id, format.to_uppercase(), size, &stem),
         )?;
         drop(conn);
+
+        // Adding a format stamps the book's `timestamp`, and nothing
+        // recorded that. It surfaced as soon as the change-log audit
+        // compared a rebuilt library to the original: every book's
+        // timestamp came back as whatever the add recorded *before* this
+        // overwrote it. Later in the log than `add_book`'s own timestamp,
+        // so it supersedes it on replay exactly as it did on the live
+        // database.
+        if let Some(stamped) = stamped {
+            self.record_for_book(book_id, |book| crate::change_log::ChangeOp::FieldSet { book, field: "timestamp".to_string(), value: Some(stamped) });
+        }
 
         // A replacement that landed under a different name leaves the
         // file it replaced behind with no `data` row pointing at it --
@@ -1260,11 +1313,14 @@ impl Cache {
         }
 
         let new_rel_path_str = new_rel_path.to_string_lossy().replace('\\', "/");
-        let conn = self.backend.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE books SET path = ?1 WHERE id = ?2",
-            (&new_rel_path_str, book_id),
-        )?;
+
+        // Through `set_book_path` and `set_format_name`, which write the
+        // same rows and also append to the change log. This used to run
+        // both `UPDATE`s itself, so a folder rename left the log saying
+        // the book was still at its old path -- a rebuild put it back
+        // where no file was.
+        self.set_book_path(book_id, &new_rel_path_str)?;
+
         // Both branches above renamed every format file to
         // `sanitize(new_title).<ext>`; `data.name` has to say so.
         //
@@ -1274,10 +1330,10 @@ impl Cache {
         // the pre-rename filename and every route that serves a book
         // would 404. The same mismatch, from the other direction, is
         // what `a_renamed_book_can_still_be_opened` was added for.
-        conn.execute(
-            "UPDATE data SET name = ?1 WHERE book = ?2",
-            (sanitize_file_name(new_title), book_id),
-        )?;
+        let new_stem = sanitize_file_name(new_title);
+        for (format, _) in self.format_file_names(book_id)? {
+            self.set_format_name(book_id, &format, &new_stem)?;
+        }
         Ok(())
     }
 
@@ -1467,6 +1523,20 @@ impl Cache {
         )?;
 
         tx.commit()?;
+        drop(conn);
+
+        // This is the path `calibredb set_metadata title` takes, and it
+        // appended nothing: a rebuild from the log restored the book's
+        // old title. Found by the change-log audit, not by a user -- yet.
+        //
+        // The three fields it writes, as the same `FieldSet`s `set_field`
+        // would record, so replay needs no special case. `authors` is
+        // written as the single name it links, and `author_sort` as the
+        // same string, exactly as the statements above do.
+        let (title, author) = (title.to_string(), author.to_string());
+        self.record_for_book(book_id, |book| crate::change_log::ChangeOp::FieldSet { book, field: "title".to_string(), value: Some(title) });
+        self.record_for_book(book_id, |book| crate::change_log::ChangeOp::FieldSet { book, field: "author_sort".to_string(), value: Some(author.clone()) });
+        self.record_for_book(book_id, |book| crate::change_log::ChangeOp::FieldSet { book, field: "authors".to_string(), value: Some(author) });
         Ok(())
     }
 
@@ -1958,6 +2028,14 @@ impl Cache {
             }
             _ => conn.execute(&sql, (book_id, value)),
         }?;
+        drop(conn);
+
+        // Named `#label`, the way calibre names a custom column's field,
+        // so replay can tell it from a built-in one. This appended
+        // nothing: a rebuild from the log lost every custom column value
+        // in the library while keeping the column itself.
+        let (field, value) = (format!("#{label}"), value.to_string());
+        self.record_for_book(book_id, |book| crate::change_log::ChangeOp::FieldSet { book, field, value: Some(value) });
         Ok(())
     }
 
@@ -2008,7 +2086,30 @@ impl Cache {
     /// `rename_items` (which also updates every affected book's
     /// composite/sort fields), matching `legacy.rs`'s own already-
     /// disclosed narrowing.
+    /// An author's, tag's or publisher's id by name, for replay: ids are
+    /// local to one machine, so a log can only refer to an item by name.
+    pub fn item_id_by_name(&self, table: &str, name: &str) -> anyhow::Result<Option<i32>> {
+        anyhow::ensure!(matches!(table, "authors" | "tags" | "publishers"), "not a renameable item table: {table}");
+        let conn = self.backend.conn.lock().unwrap();
+        Ok(conn.query_row(&format!("SELECT id FROM {table} WHERE name = ?1"), [name], |row| row.get(0)).optional()?)
+    }
+
     fn rename_item(&self, table: &str, link_table: &str, link_col: &str, old_id: i32, new_name: &str) -> anyhow::Result<()> {
+        // The old name has to be read before the rename, since afterwards
+        // there is nothing left to read it from.
+        let old_name: Option<String> = {
+            let conn = self.backend.conn.lock().unwrap();
+            conn.query_row(&format!("SELECT name FROM {table} WHERE id = ?1"), [old_id], |row| row.get(0)).optional()?
+        };
+        self.rename_item_in_db(table, link_table, link_col, old_id, new_name)?;
+        // Outside the connection lock: appending fsyncs.
+        if let Some(from) = old_name {
+            self.record(crate::change_log::ChangeOp::ItemRenamed { kind: table.to_string(), from, to: new_name.to_string() });
+        }
+        Ok(())
+    }
+
+    fn rename_item_in_db(&self, table: &str, link_table: &str, link_col: &str, old_id: i32, new_name: &str) -> anyhow::Result<()> {
         let mut conn = self.backend.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let existing: Option<i32> = tx.query_row(&format!("SELECT id FROM {table} WHERE name = ?1 AND id != ?2"), (new_name, old_id), |row| row.get(0)).optional()?;
@@ -2154,7 +2255,11 @@ impl Cache {
                 // Matches upstream: these three fields silently no-op
                 // on an empty value rather than clearing it.
             }
-            "title" | "sort" | "author_sort" | "uuid" => {
+            // `isbn` and `lccn` are legacy `books` columns calibre keeps for
+            // compatibility. `Library::set_metadata` wrote them with raw SQL
+            // because `set_field` had no arm for them, which is also how
+            // those writes escaped the change log.
+            "title" | "sort" | "author_sort" | "uuid" | "isbn" | "lccn" => {
                 let conn = self.backend.conn.lock().unwrap();
                 conn.execute(
                     &format!("UPDATE books SET {field} = ?1 WHERE id = ?2"),

@@ -59,6 +59,8 @@
 //! branches rather than demanding a global commit order.
 
 pub mod apply;
+#[cfg(test)]
+mod audit;
 pub mod change;
 pub mod hlc;
 pub mod store;

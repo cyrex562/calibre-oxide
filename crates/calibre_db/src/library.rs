@@ -597,11 +597,10 @@ impl Library {
     }
 
     pub fn set_preference(&mut self, key: &str, val: &str) -> Result<(), LibraryError> {
-        self.conn().execute(
-            "INSERT OR REPLACE INTO preferences (key, val) VALUES (?1, ?2)",
-            (key, val),
-        )?;
-        Ok(())
+        // Through `Cache`, which records the change. This used to write the
+        // row itself, so `calibredb`'s preference writes never reached the
+        // change log and a rebuild lost them.
+        self.as_cache().set_preference(key, val).map_err(|e| LibraryError::Transaction(e.to_string()))
     }
 
     pub fn get_custom_column_value(
@@ -664,20 +663,12 @@ impl Library {
                     return Err(LibraryError::Transaction("Book not found".to_string()));
                 }
             }
-            "sort" | "author_sort" | "isbn" | "lccn" | "uuid" => {
-                let sql = format!("UPDATE books SET {} = ?1 WHERE id = ?2", field);
-                self.conn().execute(&sql, (value, book_id))?;
-            }
-            "pubdate" | "timestamp" => {
-                let sql = format!("UPDATE books SET {} = ?1 WHERE id = ?2", field);
-                self.conn().execute(&sql, (value, book_id))?;
-            }
-            "series_index" => {
-                let val = value.parse::<f64>().unwrap_or(1.0);
-                self.conn().execute(
-                    "UPDATE books SET series_index = ?1 WHERE id = ?2",
-                    (val, book_id),
-                )?;
+            // Every other field goes through `Cache::set_field`, which is
+            // what records it. These arms used to run their own `UPDATE`,
+            // so `calibredb set_metadata sort|author_sort|pubdate|
+            // timestamp|series_index|isbn|lccn|uuid` never reached the log.
+            "sort" | "author_sort" | "isbn" | "lccn" | "uuid" | "pubdate" | "timestamp" | "series_index" => {
+                self.as_cache().set_field(book_id, field, value).map_err(|e| LibraryError::Transaction(e.to_string()))?;
             }
             _ => {
                 return Err(LibraryError::Transaction(format!(
