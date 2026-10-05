@@ -147,7 +147,40 @@ pub struct Cache {
 impl Cache {
     pub fn new<P: AsRef<Path>>(library_path: P) -> Result<Self> {
         let backend = Backend::new(library_path)?;
-        Ok(Self::from_backend(backend))
+        let cache = Self::from_backend(backend);
+        // Bring in whatever other machines have written since this library
+        // was last open -- and, on a library whose `metadata.db` was
+        // deleted, rebuild it from the log (#902, #899). Best effort: a
+        // merge that cannot run must not stop the library opening.
+        match cache.merge_pending_changes() {
+            Ok(report) => {
+                for conflict in &report.conflicts {
+                    log::warn!("merge conflict on {:?} {}: kept the {:?} value", conflict.book, conflict.what, conflict.winner);
+                }
+            }
+            Err(e) => log::warn!("could not merge pending changes on open: {e:#}"),
+        }
+        Ok(cache)
+    }
+
+    /// Applies every change in the log that this database has not seen
+    /// (#902): other machines' edits delivered by file sync, or the whole
+    /// log for a database that was deleted.
+    ///
+    /// Cheap to call often -- with nothing new it is a directory listing.
+    pub fn merge_pending_changes(&self) -> anyhow::Result<crate::change_log::MergeReport> {
+        let report = crate::change_log::merge_pending(self)?;
+        if report.applied > 0 {
+            // Values were written behind the field cache's back.
+            *self.field_cache.lock().unwrap() = None;
+        }
+        Ok(report)
+    }
+
+    /// Disagreements between this machine and peers that past merges
+    /// resolved, newest first.
+    pub fn recent_merge_conflicts(&self, limit: usize) -> anyhow::Result<Vec<crate::change_log::Conflict>> {
+        crate::change_log::recent_conflicts(self, limit)
     }
 
     /// Wraps an already-open [`Backend`] (e.g. [`crate::library::Library`]'s
@@ -204,11 +237,16 @@ impl Cache {
             return;
         }
         match self.backend.change_log() {
-            Ok(log) => {
-                if let Err(e) = log.append(op) {
-                    log::warn!("could not record a change in the library log: {e}");
+            Ok(log) => match log.append(op) {
+                // Stamp the value's clock, so a peer's older change for it
+                // cannot later overwrite what was just written (#902).
+                Ok(change) => {
+                    if let Err(e) = crate::change_log::merge::note_local(self, &change) {
+                        log::warn!("recorded a change but could not stamp its merge clock: {e}");
+                    }
                 }
-            }
+                Err(e) => log::warn!("could not record a change in the library log: {e}"),
+            },
             Err(e) => log::warn!("could not open the library change log: {e}"),
         }
     }

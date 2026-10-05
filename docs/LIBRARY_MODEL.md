@@ -327,11 +327,42 @@ writing to files on read-only volumes and to cloud placeholders.
 | `covers::cover_path` | **done:** `.calibre-oxide/covers/<uuid>.jpg`, keyed by uuid rather than the local autoincrement `id` so two machines cannot mint the same cover filename. Reads fall back to a legacy `<book dir>/cover.jpg` until the next write, which retires it. |
 | `check_library` | drop the `Title (id)` folder regex, which this project never produced; make the content-mismatch check an *edit*, not corruption (E14) |
 | `checksums.rs` | add a content → book lookup |
-| every `Cache` write method | append to the change log — the same crate-wide retrofit shape as #93's "every durable write goes through `LibraryHandle`". **Partly done:** the location primitives (`set_book_path`, `record_format_row`, `forget_format_row`, `set_format_name`) now log, which closed a real bug — `apply_relocations` wrote `data.name` with raw SQL, so a moved file was re-attached in the database and never recorded, and the next rebuild undid it. Appends happen with the connection lock released. Custom columns, prefs and covers still need new `ChangeOp` variants; see #901. |
+| every `Cache` write method | append to the change log — the same crate-wide retrofit shape as #93's "every durable write goes through `LibraryHandle`". **Done, and enforced:** `change_log/audit.rs` performs each public write, rebuilds a second library from the log alone, and compares the two; a second test fails if a function that runs a mutating statement is neither audited nor explained. It found a dozen writes that had been silent (`calibredb set_metadata title`, bulk renames, custom column values, saved searches, covers, timestamps). **Still not in the log:** annotations and reading positions (#967) and the legacy item deleters (#968). |
 | `filenames::file_identity` | make public |
 | `adding.rs` | `find_books_in_directory`'s stem grouping is no longer the grouping rule |
 | auto-add watcher | **done:** a watched folder *inside* the library is scanned in place; only one outside it is still drained after import. The old unconditional delete-after-import would have deleted the book's own file, and watching the library root would have deleted every book it indexed. Re-adding is prevented by the records plus the ignore list (E12), which is what made the delete trick unnecessary. New: `scan::rescan`, `POST /scan-library/{library_id}`. |
 | `duplicates.rs` | extend from author/title to content hash |
+
+### Merging another machine's changes
+
+`change_log/merge.rs`. Merging is **not** "replay the log on open". A full replay is last-writer-wins by
+construction, but it builds the database from nothing: it would reassign every book's local `id` (which
+URLs, notes and open windows refer to) and destroy whatever is not in the log yet (#967). So a merge applies
+only what is *new*, on top of what is there, which needs two things a rebuild does not:
+
+- **Which changes have been applied.** A *set* of change keys (`{stamp}-{origin}`, readable from the file
+  name), not a high-water mark — file sync delivers in any order, so an origin's seq 7 can arrive before its
+  seq 6. A change that cannot be applied yet (its book's `BookAdded` has not arrived) stays unapplied and is
+  retried; marking it done would lose it. The common case — nothing new — is one directory listing.
+- **How recently each value was written.** Every contested value (a *cell*: one field of one book, one
+  format, one cover, one preference) carries the stamp and origin of the change that last wrote it, and an
+  incoming change applies only if it sorts after that. **Per field, last writer wins** — union-merging tags
+  looks clever and surprises anyone who removed one. `FormatRemoved` shares a cell with `FormatSet`, or a
+  peer's older "format added" would resurrect a format removed later.
+
+This state lives **in `metadata.db`**, not a sidecar: the clocks describe the database, so deleting it (the
+recovery step this design exists to make safe) must delete them too, or they would claim changes were applied
+to a database that no longer has them.
+
+Opening a database that has books but no merge state *adopts* this install's own history — marks it applied and
+records its stamps, without re-applying — as a pass finished **before** any peer change is looked at. Done inline
+in stamp order, a peer's old change was reached before the local clocks existed and overwrote a newer local value.
+
+Two limitations, stated in the module: `ItemRenamed` composes rather than overwrites, so it is applied
+unconditionally and a rename arriving *older* than a later edit naming the old item will rename that edit's
+value too; and concurrent edits are indistinguishable from sequential ones, because an HLC stamp cannot say
+whether the later writer had seen the earlier — so a peer's edit replacing a local one is always reported as a
+conflict. Telling them apart needs each change to name the value it overwrote.
 
 ### Rescan ordering
 
