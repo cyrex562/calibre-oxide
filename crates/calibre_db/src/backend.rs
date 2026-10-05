@@ -237,23 +237,38 @@ pub struct Backend {
     /// one library in one process would both hand out the same number
     /// and each overwrite the other's entry.
     change_log: Arc<Mutex<Option<Arc<crate::change_log::ChangeLog>>>>,
-    /// Set while a replay is applying changes, so the write paths that
-    /// normally append to the log do not append what they are being
-    /// fed. Without it, rebuilding the database would double every
-    /// entry in the log it was rebuilt from.
-    replaying: Arc<AtomicBool>,
 }
 
-/// Suppresses change-log appends for as long as it is alive.
+thread_local! {
+    /// How many replays are applying changes on *this thread* right now.
+    ///
+    /// While non-zero, the write paths that normally append to the log do
+    /// not append what they are being fed -- without that, rebuilding the
+    /// database would double every entry in the log it was rebuilt from.
+    ///
+    /// **Per thread, not per backend.** It used to be an `AtomicBool` on
+    /// the backend, which is fine for a one-shot rebuild at startup and
+    /// wrong for merging a peer's changes into a database that is in use:
+    /// for as long as the merge ran, an edit made on any *other* thread
+    /// would skip being logged -- silently losing the user's own change
+    /// from the authoritative record. A merge applies synchronously on the
+    /// calling thread, so a thread-local suppresses exactly the writes it
+    /// is making and nothing else.
+    static REPLAY_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Suppresses change-log appends on the current thread for as long as it
+/// is alive.
 ///
 /// A guard rather than a pair of set/clear calls: a flag left set is
 /// silently no longer recording history, which is the worst failure
-/// this system can have and the hardest to notice.
-pub struct ReplayGuard(Arc<AtomicBool>);
+/// this system can have and the hardest to notice. `!Send`, so it cannot
+/// be carried to a thread whose counter it did not raise.
+pub struct ReplayGuard(std::marker::PhantomData<*const ()>);
 
 impl Drop for ReplayGuard {
     fn drop(&mut self) {
-        self.0.store(false, AtomicOrdering::SeqCst);
+        REPLAY_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
     }
 }
 
@@ -354,7 +369,6 @@ impl Backend {
             prefs: HashMap::new(),
             write_handle: Arc::new(Mutex::new(None)),
             change_log: Arc::new(Mutex::new(None)),
-            replaying: Arc::new(AtomicBool::new(false)),
         };
 
         // Port of `DB.__init__`'s `self.library_id` access: "Guarantee
@@ -453,13 +467,15 @@ impl Backend {
     /// appending again would double the log every time the database was
     /// rebuilt from it.
     pub fn is_replaying(&self) -> bool {
-        self.replaying.load(AtomicOrdering::SeqCst)
+        REPLAY_DEPTH.with(|d| d.get() > 0)
     }
 
-    /// Suppresses change-log appends until the returned guard drops.
+    /// Suppresses change-log appends on this thread until the returned
+    /// guard drops. Nests: each guard raises the count and each drop
+    /// lowers it.
     pub fn begin_replay(&self) -> ReplayGuard {
-        self.replaying.store(true, AtomicOrdering::SeqCst);
-        ReplayGuard(Arc::clone(&self.replaying))
+        REPLAY_DEPTH.with(|d| d.set(d.get() + 1));
+        ReplayGuard(std::marker::PhantomData)
     }
 
     /// Test-only: pre-seeds this `Backend`'s cached write handle with

@@ -235,6 +235,85 @@ impl ChangeLog {
         &self.origin
     }
 
+    /// Whether `library_path` has any log content at all, without creating
+    /// anything.
+    ///
+    /// [`ChangeLog::open`] creates directories and an install id, and
+    /// reads the entire log. A library that has never had a log should not
+    /// grow `.calibre-oxide/changes/` just because something opened it to
+    /// read, so the question "is there anything to merge?" has to be
+    /// answerable first, by looking and not touching.
+    pub fn has_entries(library_path: &Path) -> bool {
+        let base = library_path.join(LIBRARY_HANDLE_DIR_NAME);
+        let any_json = |dir: &Path, ext: &str| {
+            fs::read_dir(dir).is_ok_and(|entries| entries.flatten().any(|e| e.path().extension().and_then(|x| x.to_str()) == Some(ext)))
+        };
+        any_json(&base.join("changes"), "json") || any_json(&base.join("snapshots"), "jsonl")
+    }
+
+    /// Pulls this log's clock past a stamp seen on another machine.
+    ///
+    /// [`ChangeLog::open`] already does this for everything on disk when
+    /// the log is opened. It does not help for a file that *arrives
+    /// afterwards* -- which is exactly what file sync delivers to a running
+    /// app. Without calling this for each, a peer's change from slightly in
+    /// the future keeps beating local edits made after it was merged: the
+    /// user's most recent edit losing to one they already saw.
+    pub fn observe(&self, hlc: Hlc) {
+        self.state.lock().unwrap().clock.observe(hlc);
+    }
+
+    /// Changes that are on disk but not in `applied`, as of now.
+    ///
+    /// `applied` holds [`change_key`]s. The key is read off each *file
+    /// name* -- the name already carries the stamp and the origin -- so
+    /// the common case, a merge with nothing new, costs one directory
+    /// listing and opens no files. A log of fifty thousand entries is not
+    /// fifty thousand reads every time the library opens.
+    ///
+    /// Entries that cannot be read *yet* are returned by name rather than
+    /// failing the merge: a peer's file can be seen mid-sync, and it will
+    /// parse next time.
+    pub fn unapplied(&self, applied: &std::collections::HashSet<String>) -> Result<Unapplied> {
+        let mut out = Unapplied::default();
+        let entries = fs::read_dir(&self.changes_dir).with_context(|| format!("reading {}", self.changes_dir.display()))?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_string) else { continue };
+            if !name.ends_with(".json") || is_sync_conflict_copy(&name) {
+                continue;
+            }
+            let Some(key) = key_from_file_name(&name) else { continue };
+            if applied.contains(&key) {
+                continue;
+            }
+            match fs::read(&path).map(|bytes| Change::from_json(&bytes)) {
+                Ok(Ok(change)) => out.changes.push(change),
+                _ => out.unreadable.push(name),
+            }
+        }
+        out.changes.sort_by(total_order);
+        Ok(out)
+    }
+
+    /// The name of the newest snapshot, if there is one, without reading it.
+    pub fn newest_snapshot_name(&self) -> Option<String> {
+        let mut newest: Option<String> = None;
+        for entry in fs::read_dir(&self.snapshots_dir).ok()?.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".jsonl") && newest.as_ref().is_none_or(|n| name > *n) {
+                newest = Some(name);
+            }
+        }
+        newest
+    }
+
+    /// The changes the newest snapshot collapses, for a merge that has not
+    /// yet seen them.
+    pub fn snapshot_changes(&self) -> Result<Vec<Change>> {
+        Ok(self.latest_snapshot()?.1)
+    }
+
     /// Appends a change and returns the entry written.
     ///
     /// Durable before it returns: the entry file is fsynced, then the
@@ -528,6 +607,37 @@ impl ChangeLog {
         }
         Ok(final_path)
     }
+}
+
+/// What [`ChangeLog::unapplied`] found.
+#[derive(Debug, Default)]
+pub struct Unapplied {
+    /// In total order, ready to apply.
+    pub changes: Vec<Change>,
+    /// File names that could not be read or parsed *yet*.
+    pub unreadable: Vec<String>,
+}
+
+/// The identity of a change, as recorded in the merge state: its stamp and
+/// its origin.
+///
+/// Unique per change -- an origin's clock is strictly increasing, so it
+/// never mints the same stamp twice -- and, unlike the sequence number, it
+/// is readable from the file name without opening the file. See
+/// [`key_from_file_name`].
+pub fn change_key(change: &Change) -> String {
+    format!("{}-{}", change.hlc.file_prefix(), change.origin)
+}
+
+/// [`change_key`] recovered from a change file's name:
+/// `{wall:013}-{counter:05}-{origin}-{nonce}.json`.
+///
+/// The origin is a 16-character hex id with no `-` in it, which is what
+/// makes dropping the trailing nonce a single split.
+pub fn key_from_file_name(name: &str) -> Option<String> {
+    let stem = name.strip_suffix(".json")?;
+    let (key, nonce) = stem.rsplit_once('-')?;
+    (!nonce.is_empty() && key.matches('-').count() == 2).then(|| key.to_string())
 }
 
 /// Whether a filename is a sync service's conflict copy rather than a

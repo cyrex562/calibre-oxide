@@ -24,7 +24,7 @@
 //! this was chosen over writing a `metadata.opf` sidecar next to every
 //! book file.
 //!
-//! # The three pieces
+//! # The pieces
 //!
 //! | | |
 //! | --- | --- |
@@ -32,15 +32,20 @@
 //! | [`change`] | what a change is: the op, its stamp, its chain link |
 //! | [`store`] | the on-disk log: append, replay, verify, compact |
 //! | [`apply`] | putting a logged change back into `metadata.db` |
+//! | [`merge`] | folding other machines' changes into a database in use |
 //!
-//! # Scope of this pass
+//! # State of the work
 //!
-//! The store (#900) and the first slice of the write-path retrofit
-//! (#901). `set_field`, `add_book_db_entry`, `add_format`,
-//! `remove_format` and `delete_book` append; the remaining write
-//! methods do not yet, and the audit test that would forbid that is
-//! the end of the retrofit rather than its beginning. No merge runs on
-//! open — that is #902.
+//! The store (#900), the write-path retrofit (#901) and merge on open
+//! (#902) are in. Every durable write the public API offers reaches the
+//! log, and `audit` proves it by rebuilding a library from the log alone
+//! after each one; opening a library whose `metadata.db` is gone rebuilds
+//! it, and opening one whose log has gained files from another machine
+//! merges them, per field, last writer wins.
+//!
+//! Not in yet: annotations and reading positions (#967 -- a rebuild still
+//! destroys them), a background merge for a running app, configurable
+//! compaction retention, and surfacing conflicts in the UI.
 //!
 //! # One correction to the filed design
 //!
@@ -63,9 +68,11 @@ pub mod apply;
 mod audit;
 pub mod change;
 pub mod hlc;
+pub mod merge;
 pub mod store;
 
 pub use apply::{replay_into, ReplayReport};
-pub use change::{Change, ChangeOp, ChangeParseError, ChangeTarget};
+pub use change::{Cell, Change, ChangeOp, ChangeParseError, ChangeTarget};
+pub use merge::{merge_pending, recent_conflicts, Conflict, MergeReport, Winner};
 pub use hlc::{Hlc, HlcClock};
 pub use store::{ChangeLog, CompactionReport, InstallId, Replay, SnapshotHeader, VerifyReport, Watermark, DEFAULT_RETENTION};

@@ -118,7 +118,47 @@ pub enum ChangeOp {
     ItemRenamed { kind: String, from: String, to: String },
 }
 
+/// The unit a last-writer-wins comparison is about: one value that two
+/// peers might both have written (#902).
+///
+/// A cell is **not** the same thing as a compaction key
+/// ([`ChangeOp::supersede_key`]), though they overlap. Compaction asks "can
+/// the earlier of two changes be dropped?"; a cell asks "if two changes
+/// arrive out of order, which one's value is the library's?". They differ
+/// for [`ChangeOp::FormatRemoved`]: it must never be *dropped* by
+/// compaction, but it has to be *compared* against [`ChangeOp::FormatSet`]
+/// for the same format -- otherwise a peer's older "format added" arriving
+/// after a newer "format removed" would bring a deleted format back.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Cell {
+    /// The book's uuid, or empty for the library itself.
+    pub scope: String,
+    /// What within that scope: `field:title`, `format:EPUB`, `cover`,
+    /// `pref:<key>`, `column:<label>`.
+    pub key: String,
+}
+
 impl ChangeOp {
+    /// The value this change writes, if it writes one that two peers could
+    /// contend over. `None` for changes that are not last-writer-wins:
+    /// creating or removing a book, renaming an item -- those compose
+    /// rather than overwrite, and are applied unconditionally.
+    pub fn cell(&self) -> Option<Cell> {
+        let book = |b: &str, key: String| Some(Cell { scope: b.to_string(), key });
+        let library = |key: String| Some(Cell { scope: String::new(), key });
+        match self {
+            ChangeOp::FieldSet { book: b, field, .. } => book(b, format!("field:{field}")),
+            // One cell for both, deliberately: see the type's docs.
+            ChangeOp::FormatSet { book: b, format, .. } | ChangeOp::FormatRemoved { book: b, format } => book(b, format!("format:{format}")),
+            ChangeOp::CoverSet { book: b, .. } => book(b, "cover".to_string()),
+            ChangeOp::PrefSet { key, .. } => library(format!("pref:{key}")),
+            // A column that is added, removed and added again is one
+            // contested value, not three independent ones.
+            ChangeOp::CustomColumnAdded { label, .. } | ChangeOp::CustomColumnRemoved { label } => library(format!("column:{label}")),
+            ChangeOp::BookAdded { .. } | ChangeOp::BookRemoved { .. } | ChangeOp::ItemRenamed { .. } => None,
+        }
+    }
+
     /// What this change applies to. Replay and compaction need it
     /// without matching on the op.
     pub fn target(&self) -> ChangeTarget {
@@ -452,5 +492,41 @@ mod tests {
         assert_eq!(rename.target(), ChangeTarget::Library);
         assert_eq!(rename.book(), None);
         assert!(rename.supersede_key().is_none());
+    }
+
+    /// Format add and remove contend over the same value.
+    #[test]
+    fn a_format_removal_shares_a_cell_with_a_format_add() {
+        let set = ChangeOp::FormatSet { book: "u".into(), format: "EPUB".into(), name: "n".into(), size: 1, hash: None };
+        let removed = ChangeOp::FormatRemoved { book: "u".into(), format: "EPUB".into() };
+        assert_eq!(set.cell(), removed.cell());
+        assert!(set.cell().is_some());
+        // ...while compaction still must not drop the removal.
+        assert!(removed.supersede_key().is_none());
+    }
+
+    #[test]
+    fn different_fields_and_different_books_are_different_cells() {
+        let title = ChangeOp::FieldSet { book: "a".into(), field: "title".into(), value: None };
+        let other_field = ChangeOp::FieldSet { book: "a".into(), field: "rating".into(), value: None };
+        let other_book = ChangeOp::FieldSet { book: "b".into(), field: "title".into(), value: None };
+        assert_ne!(title.cell(), other_field.cell());
+        assert_ne!(title.cell(), other_book.cell());
+    }
+
+    /// Creating or removing a book, and renaming an item, compose rather
+    /// than overwrite -- there is no "older value" to lose.
+    #[test]
+    fn changes_that_compose_have_no_cell() {
+        assert_eq!(ChangeOp::BookAdded { book: "u".into() }.cell(), None);
+        assert_eq!(ChangeOp::BookRemoved { book: "u".into() }.cell(), None);
+        assert_eq!(ChangeOp::ItemRenamed { kind: "tags".into(), from: "a".into(), to: "b".into() }.cell(), None);
+    }
+
+    #[test]
+    fn a_column_added_then_removed_is_one_contested_value() {
+        let added = ChangeOp::CustomColumnAdded { label: "shelf".into(), name: "Shelf".into(), datatype: "text".into(), is_multiple: false };
+        let removed = ChangeOp::CustomColumnRemoved { label: "shelf".into() };
+        assert_eq!(added.cell(), removed.cell());
     }
 }
