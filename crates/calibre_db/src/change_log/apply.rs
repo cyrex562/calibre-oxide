@@ -90,6 +90,12 @@ pub fn apply(cache: &Cache, change: &Change) -> Result<bool> {
                 // has to restore it, through its own named method.
                 if field == "path" {
                     cache.set_book_path(id, value)?;
+                } else if let Some(label) = field.strip_prefix('#') {
+                    // A custom column's value, named the way calibre names
+                    // it. Recorded by `set_custom_column_value`, which
+                    // used to append nothing, so a rebuild lost every
+                    // custom column value in the library.
+                    cache.set_custom_column_value(id, label, value)?;
                 } else {
                     cache.set_field(id, field, value)?;
                 }
@@ -137,6 +143,25 @@ pub fn apply(cache: &Cache, change: &Change) -> Result<bool> {
                 return Ok(true);
             }
             cache.add_custom_column(label, name, datatype, *is_multiple)?;
+            Ok(true)
+        }
+        ChangeOp::ItemRenamed { kind, from, to } => {
+            // Looked up by name, because an id is local to one machine.
+            // An item that is not there is already the desired end state --
+            // renamed away by an earlier replay, or never present here --
+            // so it counts as applied, like removing a book that is gone.
+            let (table, rename): (&str, fn(&Cache, i32, &str) -> Result<()>) = match kind.as_str() {
+                "authors" => ("authors", Cache::rename_author),
+                "tags" => ("tags", Cache::rename_tag),
+                "publishers" => ("publishers", Cache::rename_publisher),
+                // A peer on a newer version renamed something this one has
+                // no concept of. Skipped rather than failed, as for any
+                // unknown op (see `Change::from_json`).
+                _ => return Ok(false),
+            };
+            if let Some(id) = cache.item_id_by_name(table, from)? {
+                rename(cache, id, to)?;
+            }
             Ok(true)
         }
         ChangeOp::CustomColumnRemoved { label } => {
@@ -438,5 +463,34 @@ mod tests {
         let report = replay_into(&cache, &log).unwrap();
         assert_eq!(report.skipped_unknown_book, 0, "{report:?}");
         assert_eq!(cache.get_preference("sort").unwrap().as_deref(), Some("author"));
+    }
+
+    #[test]
+    fn replaying_an_item_rename_renames_it_and_tolerates_it_already_being_done() {
+        let (_dir, cache) = cache();
+        let log = cache.backend.change_log().unwrap();
+        let book = log.append(ChangeOp::BookAdded { book: "uuid-1".into() }).unwrap();
+        apply(&cache, &book).unwrap();
+        let id = cache.book_id_for_uuid("uuid-1").unwrap().unwrap();
+        cache.set_field(id, "tags", "old-name").unwrap();
+
+        let rename = log.append(ChangeOp::ItemRenamed { kind: "tags".into(), from: "old-name".into(), to: "new-name".into() }).unwrap();
+        assert!(apply(&cache, &rename).unwrap());
+        assert_eq!(cache.field_for(id, "tags").unwrap().as_deref(), Some("new-name"));
+
+        // Replayed twice: the item is already gone, which is the desired end
+        // state and must count as applied rather than failing.
+        assert!(apply(&cache, &rename).unwrap());
+        assert_eq!(cache.field_for(id, "tags").unwrap().as_deref(), Some("new-name"));
+    }
+
+    /// A peer on a newer version may rename something this one has no
+    /// concept of. Skipped, not fatal -- like any unknown op.
+    #[test]
+    fn an_item_rename_of_an_unknown_kind_is_skipped() {
+        let (_dir, cache) = cache();
+        let log = cache.backend.change_log().unwrap();
+        let rename = log.append(ChangeOp::ItemRenamed { kind: "moods".into(), from: "a".into(), to: "b".into() }).unwrap();
+        assert!(!apply(&cache, &rename).unwrap());
     }
 }

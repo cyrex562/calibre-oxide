@@ -92,8 +92,15 @@ pub fn set_cover(cache: &Cache, book_id: i32, data: &[u8]) -> Result<()> {
     // Port of docs/FAULT_TOLERANCE.md §8: "cover images... same
     // rule" as book-format files.
     cache.checksums().record_file(book_id, "cover", "", &path)?;
-    let conn = cache.backend.conn.lock().unwrap();
-    conn.execute("UPDATE books SET has_cover = 1 WHERE id = ?1", (book_id,))?;
+    {
+        let conn = cache.backend.conn.lock().unwrap();
+        conn.execute("UPDATE books SET has_cover = 1 WHERE id = ?1", (book_id,))?;
+    }
+
+    // `ChangeOp::CoverSet` existed from the start and had no producer at
+    // all, so a rebuild from the log lost every cover flag. Outside the
+    // connection lock, since appending fsyncs.
+    cache.record_cover_set(book_id, blake3::hash(data).to_hex().to_string());
 
     // Invalidate thumbnail cache if it existed (TODO)
     Ok(())

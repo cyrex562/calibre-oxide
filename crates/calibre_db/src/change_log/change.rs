@@ -103,6 +103,19 @@ pub enum ChangeOp {
 
     /// Drops a custom column and its values.
     CustomColumnRemoved { label: String },
+
+    /// Renames an author, tag or publisher everywhere it is used.
+    ///
+    /// One op for what the database does in one statement, rather than a
+    /// `FieldSet` per affected book: renaming a tag shared by ten thousand
+    /// books would otherwise be ten thousand fsynced log files. It also
+    /// expresses the *merge* case exactly -- renaming into a name that
+    /// already exists folds the two together, which a per-book snapshot of
+    /// the final value could only approximate.
+    ///
+    /// Library-scoped: it is about the item, not about any one book.
+    /// `kind` is `authors`, `tags` or `publishers`, the table renamed.
+    ItemRenamed { kind: String, from: String, to: String },
 }
 
 impl ChangeOp {
@@ -116,7 +129,7 @@ impl ChangeOp {
             | ChangeOp::FormatSet { book, .. }
             | ChangeOp::FormatRemoved { book, .. }
             | ChangeOp::CoverSet { book, .. } => ChangeTarget::Book(book.clone()),
-            ChangeOp::PrefSet { .. } | ChangeOp::CustomColumnAdded { .. } | ChangeOp::CustomColumnRemoved { .. } => ChangeTarget::Library,
+            ChangeOp::PrefSet { .. } | ChangeOp::CustomColumnAdded { .. } | ChangeOp::CustomColumnRemoved { .. } | ChangeOp::ItemRenamed { .. } => ChangeTarget::Library,
         }
     }
 
@@ -129,7 +142,7 @@ impl ChangeOp {
             | ChangeOp::FormatSet { book, .. }
             | ChangeOp::FormatRemoved { book, .. }
             | ChangeOp::CoverSet { book, .. } => Some(book),
-            ChangeOp::PrefSet { .. } | ChangeOp::CustomColumnAdded { .. } | ChangeOp::CustomColumnRemoved { .. } => None,
+            ChangeOp::PrefSet { .. } | ChangeOp::CustomColumnAdded { .. } | ChangeOp::CustomColumnRemoved { .. } | ChangeOp::ItemRenamed { .. } => None,
         }
     }
 
@@ -157,7 +170,11 @@ impl ChangeOp {
             | ChangeOp::BookRemoved { .. }
             | ChangeOp::FormatRemoved { .. }
             | ChangeOp::CustomColumnAdded { .. }
-            | ChangeOp::CustomColumnRemoved { .. } => None,
+            | ChangeOp::CustomColumnRemoved { .. }
+            // Never superseded: a rename composes with whatever else was
+            // done to the item, and dropping one would leave later ops
+            // naming an item that, on replay, still has its old name.
+            | ChangeOp::ItemRenamed { .. } => None,
         }
     }
 }
@@ -424,5 +441,16 @@ mod tests {
         // A library-scoped op has no book, which is how replay knows not
         // to look one up.
         assert_eq!(ChangeOp::PrefSet { key: "sort".into(), value: None }.book(), None);
+    }
+
+    /// A rename is about the item, not any book, and must never be
+    /// compacted away: dropping one would leave later ops naming an item
+    /// that, on replay, still has its old name.
+    #[test]
+    fn an_item_rename_is_library_scoped_and_never_superseded() {
+        let rename = ChangeOp::ItemRenamed { kind: "tags".into(), from: "old".into(), to: "new".into() };
+        assert_eq!(rename.target(), ChangeTarget::Library);
+        assert_eq!(rename.book(), None);
+        assert!(rename.supersede_key().is_none());
     }
 }
