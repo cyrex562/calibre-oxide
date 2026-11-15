@@ -18,7 +18,7 @@ import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LI
   uploadOrphanFile,
   forgetOrphan,
   fetchIgnored,
-  unignoreFile, copyToLibrary, deleteBooks, embedMetadata, summarizeEmbed, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchLibraryInfo, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameFiles, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
+  unignoreFile, copyToLibrary, describeCopyOutcome, deleteBooks, embedMetadata, summarizeEmbed, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchLibraryInfo, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameFiles, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
 import type { CheckLibraryFinding, CheckLibraryResult, CustomRecipeOptions, DuplicateGroup, IgnoredFile, NewsFeedInput, NewsSchedule, Orphan, SaveToDiskResult } from "../library/api";
 import { parseSnippetSegments } from "../library/snippets";
 import { similarBooksQuery } from "../library/query";
@@ -1213,7 +1213,7 @@ async function runCopyToLibrary() {
     const response = await copyToLibrary(copyTarget.value, ids, copyMove.value);
     // Per book, because one already present in the target is skipped
     // while its neighbours are copied.
-    copyResults.value = Object.entries(response).map(([bookId, outcome]) => (outcome.ok ? `Book ${bookId}: copied` : `Book ${bookId}: ${outcome.error ?? "not copied"}`));
+    copyResults.value = Object.entries(response).map(([bookId, outcome]) => describeCopyOutcome(bookId, outcome));
     copyDone.value = true;
     // A move takes books out of this library, so the grid is stale.
     if (copyMove.value) await runSearch();

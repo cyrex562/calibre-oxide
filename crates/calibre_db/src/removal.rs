@@ -148,8 +148,8 @@ impl IgnoreStore {
 pub struct RemovalReport {
     /// Files left on disk and added to the ignore list.
     pub ignored: Vec<String>,
-    /// Files sent to the wastebasket, or deleted outright where there is
-    /// none.
+    /// Files sent to the wastebasket. Never deleted outright: with no
+    /// wastebasket a file stays and is listed in `failed`.
     pub deleted: Vec<String>,
     /// `(path, why)` for files that could not be deleted. The entry is
     /// still removed: the book is gone from the library either way, and

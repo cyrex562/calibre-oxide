@@ -1170,11 +1170,38 @@ export async function fetchLibraryInfo(): Promise<LibraryInfo> {
  * the server only copies into a library it already has open, so a folder
  * it was not started with is not a valid destination.
  *
+ * The request key is `move_books`, which is what the server documents
+ * (it also accepts the bare `move`).
+ *
  * Returns the per-book outcome the route reports — a book that already
  * exists in the target can be skipped while its neighbours are copied, so
  * a single overall success would be the wrong shape.
  */
-export async function copyToLibrary(targetLibraryId: string, bookIds: number[], moveBooks = false): Promise<Record<string, { ok: boolean; payload?: number; error?: string }>> {
+export interface CopyOutcome {
+  ok: boolean;
+  /** The new book's id when `ok`; the reason (a string) when not; null for a skipped duplicate. */
+  payload?: number | string | null;
+  /** Kept for older servers that reported the reason here. */
+  error?: string;
+  /** Custom columns that were not copied: the target has no same-named, same-typed column. */
+  skipped_custom_columns?: string[];
+  /** The copy worked but something about the source cleanup did not. */
+  warnings?: string[];
+}
+
+/** A one-line description of what happened to one book. */
+export function describeCopyOutcome(bookId: string, outcome: CopyOutcome): string {
+  if (!outcome.ok) {
+    const why = typeof outcome.payload === "string" ? outcome.payload : (outcome.error ?? "not copied");
+    return `Book ${bookId}: ${why}`;
+  }
+  if (outcome.payload === null || outcome.payload === undefined) return `Book ${bookId}: skipped (already in the target)`;
+  const notes = [...(outcome.warnings ?? [])];
+  if (outcome.skipped_custom_columns?.length) notes.push(`custom columns not copied: ${outcome.skipped_custom_columns.join(", ")}`);
+  return notes.length ? `Book ${bookId}: copied (${notes.join("; ")})` : `Book ${bookId}: copied`;
+}
+
+export async function copyToLibrary(targetLibraryId: string, bookIds: number[], moveBooks = false): Promise<Record<string, CopyOutcome>> {
   if (bookIds.length === 0) return {};
   return await jsonFetch(`/cdb/copy-to-library/${encodeURIComponent(targetLibraryId)}/-`, {
     method: "POST",

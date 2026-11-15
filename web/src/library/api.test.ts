@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { copyToLibrary, fetchLibraryInfo, embedMetadata, summarizeEmbed, addBook, addFormat, addNewsSchedule, blobToDataUrl, inspectPlugin, installPlugin, listPlugins, removePlugin, setPluginEnabled, catalogDownloadUrl, checkLibrary, coverProxyUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchCoverProxyBlob, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeDataFile, removeFormat, removeNewsSchedule, renameCategoryItem, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, scanLibrary, fetchOrphans, relocateOrphan, uploadOrphanFile, forgetOrphan, fetchIgnored, unignoreFile, searchMetadataOnline, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
+import { copyToLibrary, describeCopyOutcome, fetchLibraryInfo, embedMetadata, summarizeEmbed, addBook, addFormat, addNewsSchedule, blobToDataUrl, inspectPlugin, installPlugin, listPlugins, removePlugin, setPluginEnabled, catalogDownloadUrl, checkLibrary, coverProxyUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchCoverProxyBlob, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeDataFile, removeFormat, removeNewsSchedule, renameCategoryItem, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, scanLibrary, fetchOrphans, relocateOrphan, uploadOrphanFile, forgetOrphan, fetchIgnored, unignoreFile, searchMetadataOnline, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
 import type { BookSummary } from "./types";
 
 function bookStub(id: number): BookSummary {
@@ -153,6 +153,13 @@ describe("copyToLibrary", () => {
     expect(init.method).toBe("POST");
     expect(JSON.parse(init.body)).toEqual({ book_ids: [1], move_books: true, duplicate_action: "add" });
     expect(result["1"].payload).toBe(7);
+  });
+
+  it("describes a failed move with the server's reason, and notes skipped custom columns", () => {
+    expect(describeCopyOutcome("3", { ok: false, payload: "copied as book 9, but the source book was kept: differs" })).toBe("Book 3: copied as book 9, but the source book was kept: differs");
+    expect(describeCopyOutcome("3", { ok: true, payload: null })).toBe("Book 3: skipped (already in the target)");
+    expect(describeCopyOutcome("3", { ok: true, payload: 9, skipped_custom_columns: ["pages"] })).toBe("Book 3: copied (custom columns not copied: pages)");
+    expect(describeCopyOutcome("3", { ok: true, payload: 9 })).toBe("Book 3: copied");
   });
 
   it("escapes a library id with characters that need it", async () => {

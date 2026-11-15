@@ -366,7 +366,7 @@ const ACCOUNTED: &[(&str, Account)] = &[
     ("cache.rs::clear_preference", Case("clear_preference")),
     ("cache.rs::add_format", Case("add_format")),
     ("cache.rs::remove_format", Case("remove_format")),
-    ("cache.rs::delete_book", Case("delete_book")),
+    ("cache.rs::delete_book_with", Case("delete_book")),
     ("cache.rs::rename_format_files", Case("rename_format_files")),
     ("cache.rs::register_book_in_place", Case("register_book_in_place")),
     ("cache.rs::add_book_db_entry_with_id", Case("add_format")),
