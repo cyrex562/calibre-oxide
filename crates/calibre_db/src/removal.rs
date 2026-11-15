@@ -165,68 +165,31 @@ pub struct RemovalReport {
 /// puts the book straight back.
 pub fn remove_from_library(cache: &Cache, book_id: i32) -> Result<RemovalReport> {
     let mut report = RemovalReport::default();
-    let title = cache.field_for(book_id, "title")?.unwrap_or_default();
-    let store = cache.ignored();
-
-    for (path, hash) in book_files(cache, book_id)? {
-        store.ignore(&path, hash.as_deref(), &title)?;
-        report.ignored.push(path);
-    }
     cache.orphans().clear_all_for_book(book_id)?;
-    cache.delete_book(book_id)?;
+    // Touches no file; records the ignore entries itself, before the row
+    // and its checksums go.
+    let outcome = cache.delete_book_keep_files(book_id)?;
+    report.ignored = outcome.ignored;
     Ok(report)
 }
 
-/// Takes a book out of the library **and** removes its files.
+/// Takes a book out of the library **and** removes the files it owns.
 ///
-/// To the system wastebasket where one exists, so the choice stays
-/// recoverable — the explicit second option, not the default. No ignore
-/// entry is recorded: there is no file left to re-add, and an ignore for
-/// a path that no longer exists would only accumulate.
+/// To the system wastebasket, so the choice stays recoverable -- the
+/// explicit second option, not the default. Only the book's own format
+/// files (and its `cover.jpg`/`metadata.opf` when its folder is its
+/// alone) are removed: never the folder as a whole, since in a tracked
+/// library many books share one. A file that cannot be trashed is left
+/// in place (never hard-deleted), listed in `failed`, and ignored so a
+/// rescan does not re-add it.
 pub fn delete_with_file(cache: &Cache, book_id: i32) -> Result<RemovalReport> {
     let mut report = RemovalReport::default();
-    let library = cache.backend.library_path.clone();
-
-    for (path, _) in book_files(cache, book_id)? {
-        let absolute = library.join(&path);
-        if !absolute.is_file() {
-            continue;
-        }
-        match trash::delete(&absolute) {
-            Ok(()) => report.deleted.push(path),
-            Err(e) => {
-                // No wastebasket (a headless server, some network
-                // mounts, a container) is the common reason. Falling back
-                // to a permanent delete is right here: the user asked for
-                // the file to go, and refusing would leave them unable to
-                // delete anything on such a system.
-                match std::fs::remove_file(&absolute) {
-                    Ok(()) => report.deleted.push(path),
-                    Err(remove_err) => report.failed.push((path, format!("{e}; and deleting outright also failed: {remove_err}"))),
-                }
-            }
-        }
-    }
-
     cache.orphans().clear_all_for_book(book_id)?;
-    cache.delete_book(book_id)?;
+    let outcome = cache.delete_book_with(book_id, crate::cache::BookFiles::Trash)?;
+    report.deleted = outcome.trashed;
+    report.ignored = outcome.ignored;
+    report.failed = outcome.failed;
     Ok(report)
-}
-
-/// Every file a book owns, as `(relative path, recorded hash)`.
-fn book_files(cache: &Cache, book_id: i32) -> Result<Vec<(String, Option<String>)>> {
-    let folder = cache.field_for(book_id, "path")?.unwrap_or_default();
-    let checksums = cache.checksums();
-    Ok(cache
-        .format_file_names(book_id)?
-        .into_iter()
-        .map(|(format, name)| {
-            let file = format!("{name}.{}", format.to_lowercase());
-            let path = if folder.is_empty() { file } else { format!("{folder}/{file}") };
-            let (hash, _) = checksums.recorded_identity(book_id, "format", &format).unwrap_or((None, None));
-            (path, hash)
-        })
-        .collect())
 }
 
 /// Reads a file's hash for an ignore check, or `None` if it cannot be
@@ -415,6 +378,92 @@ mod tests {
         // Otherwise the orphan list would keep naming a book that no
         // longer exists.
         assert!(cache.orphans().list().unwrap().is_empty());
+    }
+
+    /// The data-loss bug: books found in one folder share `books.path`,
+    /// and removing one used to `remove_dir_all` the folder.
+    #[test]
+    fn deleting_one_book_leaves_its_folder_mates_and_non_book_files() {
+        let (dir, cache) = library();
+        write(&dir.path().join("Receipts/a.pdf"), b"%PDF a");
+        write(&dir.path().join("Receipts/b.pdf"), b"%PDF b");
+        write(&dir.path().join("Receipts/notes.zzz"), b"not a book");
+        assert_eq!(index(dir.path(), &cache), 2);
+        let id = cache.book_for_file("Receipts/a.pdf").unwrap().unwrap();
+        let other = cache.book_for_file("Receipts/b.pdf").unwrap().unwrap();
+
+        let report = delete_with_file(&cache, id).unwrap();
+
+        assert_eq!(report.deleted, vec!["Receipts/a.pdf"], "{report:?}");
+        assert!(!dir.path().join("Receipts/a.pdf").exists());
+        assert!(dir.path().join("Receipts/b.pdf").exists());
+        assert!(dir.path().join("Receipts/notes.zzz").exists());
+        assert!(cache.field_for(other, "title").unwrap().is_some());
+    }
+
+    #[test]
+    fn removing_one_book_from_the_library_touches_no_file_in_a_shared_folder() {
+        let (dir, cache) = library();
+        write(&dir.path().join("Receipts/a.pdf"), b"%PDF a");
+        write(&dir.path().join("Receipts/b.pdf"), b"%PDF b");
+        write(&dir.path().join("Receipts/notes.zzz"), b"not a book");
+        index(dir.path(), &cache);
+        let id = cache.book_for_file("Receipts/a.pdf").unwrap().unwrap();
+
+        let report = remove_from_library(&cache, id).unwrap();
+
+        assert_eq!(report.ignored, vec!["Receipts/a.pdf"]);
+        assert!(dir.path().join("Receipts/a.pdf").exists());
+        assert!(dir.path().join("Receipts/b.pdf").exists());
+        assert!(dir.path().join("Receipts/notes.zzz").exists());
+        assert_eq!(index(dir.path(), &cache), 0, "the removed book was re-added by a rescan");
+    }
+
+    /// A dedicated `Author/Title` folder is emptied -- including its
+    /// cover and OPF -- and removed; the library root stays.
+    #[test]
+    fn a_dedicated_folder_is_emptied_and_removed() {
+        let (dir, cache) = library();
+        write(&dir.path().join("Author/Title (1)/Title - Author.epub"), b"epub");
+        write(&dir.path().join("Author/Title (1)/cover.jpg"), b"jpg");
+        write(&dir.path().join("Author/Title (1)/metadata.opf"), b"opf");
+        assert_eq!(index(dir.path(), &cache), 1);
+        let id = cache.all_book_ids().unwrap()[0];
+
+        let report = delete_with_file(&cache, id).unwrap();
+
+        assert_eq!(report.deleted.len(), 3, "{report:?}");
+        assert!(!dir.path().join("Author/Title (1)").exists());
+        assert!(dir.path().exists());
+        assert!(dir.path().join("metadata.db").exists());
+    }
+
+    /// The reverse of the shared-folder case: the same files are only
+    /// swept up when the folder really is the book's alone.
+    #[test]
+    fn a_shared_folders_cover_and_opf_are_not_taken() {
+        let (dir, cache) = library();
+        write(&dir.path().join("Shared/a.epub"), b"epub a");
+        write(&dir.path().join("Shared/b.epub"), b"epub b");
+        write(&dir.path().join("Shared/cover.jpg"), b"jpg");
+        index(dir.path(), &cache);
+        let id = cache.book_for_file("Shared/a.epub").unwrap().unwrap();
+        delete_with_file(&cache, id).unwrap();
+        assert!(dir.path().join("Shared/cover.jpg").exists());
+        assert!(dir.path().join("Shared/b.epub").exists());
+    }
+
+    #[test]
+    fn a_root_level_book_loses_only_its_file_and_the_root_survives() {
+        let (dir, cache) = library();
+        write(&dir.path().join("a.pdf"), b"%PDF a");
+        write(&dir.path().join("b.pdf"), b"%PDF b");
+        index(dir.path(), &cache);
+        let id = cache.book_for_file("a.pdf").unwrap().unwrap();
+        delete_with_file(&cache, id).unwrap();
+        assert!(!dir.path().join("a.pdf").exists());
+        assert!(dir.path().join("b.pdf").exists());
+        assert!(dir.path().is_dir());
     }
 
     #[test]

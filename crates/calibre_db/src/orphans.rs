@@ -287,7 +287,7 @@ pub fn forget(cache: &Cache, book_id: i32, keep_metadata_at: Option<&Path>) -> R
         std::fs::write(destination, opf).with_context(|| format!("saving metadata to {}", destination.display()))?;
     }
     cache.orphans().clear_all_for_book(book_id)?;
-    cache.delete_book(book_id)?;
+    cache.delete_book_keep_files(book_id)?;
     Ok(())
 }
 
