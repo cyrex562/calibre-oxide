@@ -380,6 +380,33 @@ fn deleting_a_book_clears_its_custom_values_and_orphaned_items() {
     assert_integrity(f.root());
 }
 
+/// Writes to a normalized column while another connection checkpoints the
+/// WAL the way the library's background thread does. A write that begins
+/// with a read and then upgrades to a write cannot wait out the other
+/// connection's lock, so it failed with "database is locked".
+#[test]
+fn normalized_writes_survive_a_concurrent_wal_checkpoint() {
+    let (f, cache) = open();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let checkpointer = {
+        let (stop, root) = (stop.clone(), f.root().to_path_buf());
+        std::thread::spawn(move || {
+            let conn = raw(&root);
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+            }
+        })
+    };
+    for i in 0..100 {
+        let v = format!("Genre {}, Shared", i % 7);
+        cache.set_custom_column_value(4, "genre", &v).unwrap_or_else(|e| panic!("write {i}: {e:#}"));
+        cache.set_custom_column_value(4, "saga", &format!("Saga {} [{i}]", i % 3)).unwrap_or_else(|e| panic!("write {i}: {e:#}"));
+        cache.set_custom_column_value(4, "stars", &(i % 11).to_string()).unwrap_or_else(|e| panic!("write {i}: {e:#}"));
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    checkpointer.join().unwrap();
+}
+
 // ---- the change log ---------------------------------------------------
 
 #[test]

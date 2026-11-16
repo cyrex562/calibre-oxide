@@ -795,7 +795,7 @@ impl Cache {
         explicit_id: Option<i32>,
     ) -> anyhow::Result<i32> {
         let mut conn = self.backend.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
         let author_name = metadata
             .authors
@@ -1745,7 +1745,7 @@ impl Cache {
         // the filenames) -- it is just no longer a side effect of editing
         // metadata.
         let mut conn = self.backend.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
         tx.execute(
             "UPDATE books SET title = ?1, author_sort = ?2 WHERE id = ?3",
@@ -2152,7 +2152,7 @@ impl Cache {
             anyhow::bail!("Column with label '{}' already exists", label);
         }
 
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT INTO custom_columns(label, name, datatype, is_multiple, editable, display, normalized) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6)",
             (label, name, datatype, is_multiple, &display_json, normalized),
@@ -2264,7 +2264,7 @@ impl Cache {
             let Some(def) = crate::custom_columns::column(&conn, label)? else {
                 anyhow::bail!("Column '{}' not found", label);
             };
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             tx.execute("DELETE FROM custom_columns WHERE id = ?1", [def.num])?;
             crate::custom_columns::drop_schema(&tx, def.num)?;
             tx.commit()?;
@@ -2312,7 +2312,7 @@ impl Cache {
 
     fn rename_item_in_db(&self, table: &str, link_table: &str, link_col: &str, old_id: i32, new_name: &str) -> anyhow::Result<()> {
         let mut conn = self.backend.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let existing: Option<i32> = tx.query_row(&format!("SELECT id FROM {table} WHERE name = ?1 AND id != ?2"), (new_name, old_id), |row| row.get(0)).optional()?;
         match existing {
             Some(target_id) => {
@@ -2568,7 +2568,7 @@ impl Cache {
         value: &str,
     ) -> anyhow::Result<()> {
         let mut conn = self.backend.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
             &format!("DELETE FROM {link_table} WHERE book = ?1"),
             (book_id,),
@@ -2611,7 +2611,7 @@ impl Cache {
             .filter(|s| !s.is_empty())
             .collect();
         let mut conn = self.backend.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
             &format!("DELETE FROM {link_table} WHERE book = ?1"),
             (book_id,),
@@ -2652,7 +2652,7 @@ impl Cache {
     fn set_rating_field(&self, book_id: i32, value: &str) -> anyhow::Result<()> {
         let rating: i32 = value.parse().unwrap_or(0);
         let mut conn = self.backend.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute("DELETE FROM books_ratings_link WHERE book = ?1", (book_id,))?;
         if rating > 0 {
             let rating_id: i32 = {
@@ -2676,7 +2676,7 @@ impl Cache {
 
     fn set_identifiers_field(&self, book_id: i32, value: &str) -> anyhow::Result<()> {
         let mut conn = self.backend.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute("DELETE FROM identifiers WHERE book = ?1", (book_id,))?;
         for pair in value.split(',') {
             let pair = pair.trim();

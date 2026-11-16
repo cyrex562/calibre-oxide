@@ -436,7 +436,15 @@ fn parse_datetime(v: &str) -> Result<Option<String>> {
 /// the series index now stored when the column is a series (so the caller
 /// can log it), and errors on a value the column cannot hold.
 pub fn write_value(conn: &Connection, def: &ColumnDef, book: i32, value: &str) -> Result<Option<f64>> {
-    let tx = conn.unchecked_transaction()?;
+    // IMMEDIATE, not the default deferred: this transaction starts by
+    // *reading* (looking up the value row, the book's current links) and
+    // only then writes. A deferred transaction upgrades read -> write at
+    // that point, and when another connection holds the write lock (the
+    // library's background WAL-checkpoint thread opens its own connection
+    // and runs `wal_checkpoint(TRUNCATE)`) SQLite cannot honour the busy
+    // timeout for an upgrade -- it fails at once with "database is locked".
+    // Taking the write lock at BEGIN lets the busy timeout do its job.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let result = write_value_inner(&tx, def, book, value);
     if result.is_ok() {
         tx.commit()?;
