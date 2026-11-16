@@ -52,9 +52,12 @@
 //! (BLAKE3) is already in the library or was already imported earlier in this
 //! run. On top of that:
 //! * [`DuplicatePolicy::SkipTitleAuthor`] skips a *book* whose title and authors
-//!   match an existing book's (case- and space-insensitive; a book with no
-//!   real author is never matched on title alone, since "scan0042" is a
-//!   filename, not a title);
+//!   match an existing book's after normalisation ([`crate::dedupe`]: case,
+//!   diacritics, punctuation, leading articles, `(z-lib.org)`-style noise,
+//!   `Last, First` against `First Last`, initials; *any* shared author
+//!   matches); a book with no real author is never matched on title alone,
+//!   since "scan0042" is a filename, not a title. Fuzzy matching is not used
+//!   here: skipping a file is irreversible enough to want strong evidence;
 //! * [`DuplicatePolicy::AddFormatsToExisting`] (calibre's "automerge") adds a
 //!   matching book's new formats to the existing record instead of making a
 //!   second one -- formats it already has are skipped, never replaced.
@@ -364,39 +367,18 @@ fn stage_copy(source: &Path, dest: &Path, control: &JobControl) -> std::io::Resu
 // The job
 // ---------------------------------------------------------------------
 
-fn title_key(title: &str) -> String {
-    title.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
-}
-
-fn authors_key(authors: &[String]) -> Option<String> {
-    let mut real: Vec<String> = authors.iter().map(|a| title_key(a)).filter(|a| !a.is_empty() && a != "unknown").collect();
-    if real.is_empty() {
-        return None;
-    }
-    real.sort();
-    Some(real.join("&"))
-}
-
-/// `(title, authors)` -> the book that has them, for every book. `None`
-/// for books added during this run whose id is not known yet.
+/// `(normalised title, normalised author)` -> the book that has them, one
+/// entry per author. `None` for books added during this run whose id is not
+/// known yet. Keys are [`crate::dedupe::exact_keys`], the same ones the
+/// add-time check and the scan's exact tier use, so an import skips
+/// `Hobbit, The (z-lib.org)` by `Tolkien, J. R. R.` when `The Hobbit` by
+/// `J.R.R. Tolkien` is already there -- and never matches on an unknown
+/// author.
 fn title_author_index(cache: &Cache) -> Result<HashMap<(String, String), Option<i32>>> {
-    let conn = cache.backend.conn.lock().unwrap();
-    let mut authors: HashMap<i32, Vec<String>> = HashMap::new();
-    {
-        let mut stmt = conn.prepare("SELECT l.book, a.name FROM books_authors_link l JOIN authors a ON a.id = l.author ORDER BY l.id")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?)))?;
-        for row in rows {
-            let (book, name) = row?;
-            authors.entry(book).or_default().push(name);
-        }
-    }
     let mut index = HashMap::new();
-    let mut stmt = conn.prepare("SELECT id, title FROM books ORDER BY id")?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?)))?;
-    for row in rows {
-        let (id, title) = row?;
-        if let Some(key) = authors_key(authors.get(&id).map(Vec::as_slice).unwrap_or(&[])) {
-            index.entry((title_key(&title), key)).or_insert(Some(id));
+    for record in crate::dedupe::load_records(cache)? {
+        for key in crate::dedupe::exact_keys(&record.title, &record.authors) {
+            index.entry(key).or_insert(Some(record.id));
         }
     }
     Ok(index)
@@ -667,29 +649,30 @@ fn import_batch(
         }
 
         if matches!(policy, DuplicatePolicy::SkipTitleAuthor | DuplicatePolicy::AddFormatsToExisting) {
-            match authors_key(&mi.authors) {
-                None => report.unmatched_without_author += 1,
-                Some(akey) => {
-                    let key = (title_key(&mi.title), akey);
-                    if let Some(existing) = title_index.get(&key).copied() {
-                        let exists_with = existing;
-                        if policy == DuplicatePolicy::AddFormatsToExisting {
-                            if let Some(id) = exists_with {
-                                merges.push((id, plan.keep, plan.group));
-                                continue;
-                            }
+            let keys = crate::dedupe::exact_keys(&mi.title, &mi.authors);
+            if keys.is_empty() {
+                report.unmatched_without_author += 1;
+            } else {
+                if let Some(existing) = keys.iter().find_map(|k| title_index.get(k).copied()) {
+                    let exists_with = existing;
+                    if policy == DuplicatePolicy::AddFormatsToExisting {
+                        if let Some(id) = exists_with {
+                            merges.push((id, plan.keep, plan.group));
+                            continue;
                         }
-                        for (fi, staged) in plan.keep {
-                            let file = &g.files[fi];
-                            report.skipped_duplicate_title += 1;
-                            control.ignored.fetch_add(1, Ordering::Relaxed);
-                            capped(&mut report.duplicates, Duplicate { path: path_string(&file.path), duplicate_of: exists_with });
-                            ledger.push((path_string(&file.path), LedgerRow { hash: staged.digest.hash.clone(), size: file.size as i64, mtime_ns: file.mtime_ns, outcome: "duplicate_title".into(), policy: policy.name().into() }, None));
-                            let _ = fs::remove_file(&staged.path);
-                        }
-                        continue;
                     }
-                    title_index.insert(key, None);
+                    for (fi, staged) in plan.keep {
+                        let file = &g.files[fi];
+                        report.skipped_duplicate_title += 1;
+                        control.ignored.fetch_add(1, Ordering::Relaxed);
+                        capped(&mut report.duplicates, Duplicate { path: path_string(&file.path), duplicate_of: exists_with });
+                        ledger.push((path_string(&file.path), LedgerRow { hash: staged.digest.hash.clone(), size: file.size as i64, mtime_ns: file.mtime_ns, outcome: "duplicate_title".into(), policy: policy.name().into() }, None));
+                        let _ = fs::remove_file(&staged.path);
+                    }
+                    continue;
+                }
+                for key in keys {
+                    title_index.entry(key).or_insert(None);
                 }
             }
         }
@@ -716,8 +699,8 @@ fn import_batch(
                 for hash in item.files.iter().map(|f| f.hash.clone()) {
                     run_hashes.insert(hash, Some(book.id));
                 }
-                if let Some(akey) = authors_key(&item.metadata.authors) {
-                    title_index.insert((title_key(&item.metadata.title), akey), Some(book.id));
+                for key in crate::dedupe::exact_keys(&item.metadata.title, &item.metadata.authors) {
+                    title_index.insert(key, Some(book.id));
                 }
                 let first_source = &batch[sources[0].0].files[sources[0].1];
                 capped(
