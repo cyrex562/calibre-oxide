@@ -138,7 +138,20 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let cache = Cache::new(&cli.library_path)?;
+    let cache = Arc::new(Cache::new(&cli.library_path)?);
+    // calibre expires its trash on open. Off the main path: a library with a
+    // lot in its trash must not delay the server, and on a share every
+    // removal is a round trip.
+    {
+        let cache = cache.clone();
+        std::thread::spawn(move || {
+            if let Some(report) = cache.expire_trash_if_due() {
+                if !report.removed.is_empty() {
+                    println!("expired {} old item(s) from the library trash", report.removed.len());
+                }
+            }
+        });
+    }
     let auth = if cli.opts.auth {
         let users = UserManager::new(&userdb_path(&cli))?;
         Some(Arc::new(AuthGate::new(users, "calibre-oxide".to_string(), cli.opts.ban_for, cli.opts.ban_after)))
@@ -191,7 +204,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState {
         libraries,
-        cache: Arc::new(cache),
+        cache,
         opts: Arc::new(cli.opts),
         auth,
         changes: calibre_srv::web_socket::new_change_broadcaster(),

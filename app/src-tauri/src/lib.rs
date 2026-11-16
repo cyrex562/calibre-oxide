@@ -262,17 +262,21 @@ struct AddFolderResult {
     errors: Vec<String>,
 }
 
-/// Real folder-import counterpart to `web/`'s own per-file `addBook()`
-/// (`web/src/library/api.ts`) -- a plain browser file input can't read
-/// an arbitrary folder's worth of files by path, so this drives the
-/// same `/cdb/add-book` endpoint directly from the Tauri backend
-/// instead, which *can* pick a real folder (`tauri-plugin-dialog`) and
-/// read real files from it. Flat (non-recursive) scan for this first
-/// slice -- matches upstream `calibredb add`'s own default without
-/// `-r`, a real, disclosed narrowing rather than silently always
-/// recursing.
+/// The folder picker behind "Add folder".
+///
+/// Only *picks*: it returns the chosen folder's path (or `None` if the dialog
+/// was cancelled) and the web UI's Add-folder dialog does the rest by posting
+/// it to `POST /import-folder` with the user's choices -- one book per folder
+/// or several, what to do about duplicates, recursive or not. That route is a
+/// job with progress and cancel that copies the tree into the library,
+/// collects every error instead of stopping at the first, and never modifies
+/// the folder.
+///
+/// This used to be a flat, non-recursive loop here that uploaded each file
+/// through `/cdb/add-book` one request at a time with no progress, titled
+/// every book from its filename and gave up on nothing it could not read.
 #[tauri::command]
-async fn choose_folder_and_add_books(app: AppHandle, state: State<'_, ServerState>) -> Result<Option<AddFolderResult>, String> {
+async fn choose_import_folder(app: AppHandle) -> Result<Option<String>, String> {
     let (tx, mut rx) = tauri::async_runtime::channel(1);
     app.dialog().file().pick_folder(move |result| {
         let _ = tx.try_send(result);
@@ -281,18 +285,7 @@ async fn choose_folder_and_add_books(app: AppHandle, state: State<'_, ServerStat
         return Ok(None);
     };
     let dir = picked.into_path().map_err(|e| e.to_string())?;
-
-    let port = state.0.lock().unwrap().as_ref().map(|(_, p)| *p).ok_or("no library is currently open")?;
-
-    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-        .map_err(|e| e.to_string())?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_file() && p.extension().and_then(|e| e.to_str()).map(|e| KNOWN_EBOOK_EXTENSIONS.contains(&e.to_lowercase().as_str())).unwrap_or(false))
-        .collect();
-    files.sort();
-
-    Ok(Some(add_files_via_server(port, &files).await))
+    Ok(Some(dir.to_string_lossy().into_owned()))
 }
 
 /// Uploads each file to the running `calibre_srv`'s `/cdb/add-book`,
@@ -776,7 +769,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(ServerState::default())
-        .invoke_handler(tauri::generate_handler![ping, get_persisted_library, choose_library, create_library, choose_folder_and_add_books, list_recent_libraries, open_recent_library, get_auto_reopen, set_auto_reopen, import_library_archive, set_menu_actions, open_book_format, unpack_book, repack_book, open_external_url, reveal_library_folder, reveal_book_folder, get_auto_add_folder, choose_auto_add_folder])
+        .invoke_handler(tauri::generate_handler![ping, get_persisted_library, choose_library, create_library, choose_import_folder, list_recent_libraries, open_recent_library, get_auto_reopen, set_auto_reopen, import_library_archive, set_menu_actions, open_book_format, unpack_book, repack_book, open_external_url, reveal_library_folder, reveal_book_folder, get_auto_add_folder, choose_auto_add_folder])
         .on_menu_event(|app, event| menu::forward(app, &event))
         // Dropping files onto the window adds them, the same way the
         // folder picker does. This has to be handled natively: Tauri's
