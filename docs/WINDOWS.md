@@ -129,15 +129,14 @@ Windows offers repair or remove instead. Bump `version` in
 cargo xtask test
 ```
 
-which runs the Rust suite and the web suite. By hand:
+which is the local merge gate: every Rust test (unit, integration and the
+black-box `e2e/` crate, which spawns the built binaries and needs `web/dist`,
+built for you if missing), then the web suite. It keeps going after a
+failure, prints a per-crate summary, and exits non-zero if anything failed.
+Doctests are not included; run them with `cargo test --workspace --doc`.
 
-```powershell
-cargo test --workspace --lib
-cd web ; npm test
-```
-
-Use `--lib`. Some `tests/` files in `calibre_db` are stale and fail for
-reasons unrelated to any current work.
+By hand: `cargo build --workspace --bins`, then
+`cargo test --workspace --no-fail-fast`, then `cd web ; npm test`.
 
 One test is deliberately skipped on Windows:
 `save_to_disk`'s `a_symlink_planted_inside_dest_cannot_be_used_to_escape_it`.

@@ -242,21 +242,22 @@ fn apply_metadata(cache: &Cache, book_id: i32, meta: &MetaInformation) -> Result
     Ok(())
 }
 
-/// Restores a single book's metadata from the `metadata.opf` in its
-/// own directory -- a no-op if there is no such file (nothing to
+/// Restores a single book's metadata from its OPF backup (the sidecar
+/// first, then `metadata.opf` in its own directory) -- a no-op if there is no such file (nothing to
 /// restore from).
 pub fn restore_from_opf(cache: &Arc<Mutex<Cache>>, book_id: i32) -> Result<()> {
+    // The sidecar `backup_metadata` writes now, else the `metadata.opf`
+    // beside the book that older libraries (and real calibre) use.
     let opf_path = {
         let guard = cache.lock().unwrap();
-        let path_rel = guard
-            .backend
-            .field_for(book_id, "path")?
-            .context("Book path not found in DB")?;
-        guard
-            .backend
-            .library_path
-            .join(path_rel)
-            .join("metadata.opf")
+        let sidecar = crate::backup::sidecar_opf_path(&guard, book_id).ok().filter(|p| p.is_file());
+        match sidecar {
+            Some(p) => p,
+            None => {
+                let path_rel = guard.backend.field_for(book_id, "path")?.context("Book path not found in DB")?;
+                guard.backend.library_path.join(path_rel).join("metadata.opf")
+            }
+        }
     };
 
     if !opf_path.exists() {

@@ -27,8 +27,16 @@ use std::time::{Duration, Instant};
 /// works whichever profile `cargo build`/`cargo test` was last run
 /// with for that binary.
 pub fn oxide_bin(name: &str) -> PathBuf {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let exe_name = if cfg!(windows) { format!("{name}.exe") } else { name.to_string() };
+    // Next to this very test binary (`target/<profile>/deps/<test>.exe` ->
+    // `target/<profile>/`), so a relocated `CARGO_TARGET_DIR` is honoured.
+    if let Some(profile_dir) = std::env::current_exe().ok().and_then(|p| p.parent().and_then(|d| d.parent()).map(|d| d.to_path_buf())) {
+        let candidate = profile_dir.join(&exe_name);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     for profile in ["debug", "release"] {
         let candidate = root.join("target").join(profile).join(&exe_name);
         if candidate.exists() {
@@ -134,7 +142,23 @@ pub fn wait_until_ready(port: u16, timeout: Duration) -> bool {
 pub fn upstream_calibredb() -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     let exe_name = if cfg!(windows) { "calibredb.exe" } else { "calibredb" };
-    std::env::split_paths(&path_var).map(|dir| dir.join(exe_name)).find(|candidate| candidate.is_file())
+    // `cargo test` puts `target/<profile>` (and `deps`) on PATH, which is
+    // where *this port's* `calibredb` lives. Matching it would "compare"
+    // the port with itself and then fail on the first upstream-only flag.
+    let ours: Vec<PathBuf> = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|deps| deps.to_path_buf()))
+        .into_iter()
+        .flat_map(|deps| {
+            let profile = deps.parent().map(|p| p.to_path_buf());
+            [Some(deps), profile].into_iter().flatten()
+        })
+        .filter_map(|d| d.canonicalize().ok())
+        .collect();
+    std::env::split_paths(&path_var)
+        .filter(|dir| !dir.canonicalize().map(|d| ours.contains(&d)).unwrap_or(false))
+        .map(|dir| dir.join(exe_name))
+        .find(|candidate| candidate.is_file())
 }
 
 /// Runs the real `calibre_scraper_worker` binary's JSON-lines

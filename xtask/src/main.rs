@@ -58,7 +58,7 @@ fn print_help() {
          \x20 web       just the web UI that the app displays\n\
          \x20 app       the desktop app, assuming the two above are already built\n\
          \x20 package   build everything, then produce installers (needs network)\n\
-         \x20 test      the Rust test suite and the web test suite\n\
+         \x20 test      the local merge gate: all Rust tests (unit, integration, e2e) and the web tests\n\
          \x20 fetch-pdfium  download the PDF rendering library (needed for PDF covers)\n\n\
          \x20 --debug   build unoptimized (default is release)\n"
     );
@@ -237,15 +237,167 @@ fn pdfium_asset_name() -> Result<String> {
     Ok(format!("pdfium-{os}-{arch}.tgz"))
 }
 
+/// The local merge gate: every Rust test in the workspace (unit,
+/// integration and the black-box `e2e/` crate), then the web suite.
+///
+/// Nothing stops at the first failure -- a full list of what is broken
+/// is worth more than the first item -- and the exit status is non-zero
+/// if anything at all failed.
+///
+/// Doctests are left out on purpose: they relink a separate binary per
+/// snippet, which costs minutes, and the crates' examples are not where
+/// regressions have shown up. Run them with `cargo test --workspace --doc`.
 fn test_all() -> Result<()> {
-    step("running the Rust tests");
-    // `--lib` deliberately: some `tests/` files in calibre_db are stale
-    // and fail for reasons unrelated to any current change. The Windows
-    // CI job uses the same scope.
-    cargo(&["test", "--workspace", "--lib"], &root()).context("the Rust test suite failed")?;
-    step("running the web tests");
-    npm(&["install"], &root().join("web")).context("npm install failed in web/")?;
-    npm(&["test"], &root().join("web")).context("the web test suite failed")
+    let started = std::time::Instant::now();
+    let mut failures: Vec<String> = Vec::new();
+
+    // The web UI has to be built for `e2e/` to exercise the real
+    // server-plus-UI path; without `web/dist` those tests print "skipping"
+    // and pass, which would make the gate lie.
+    step("preparing the web UI");
+    let web = root().join("web");
+    let web_ready = npm(&["install"], &web).context("npm install failed in web/").and_then(|()| {
+        if web.join("dist").join("index.html").is_file() {
+            Ok(())
+        } else {
+            npm(&["run", "build"], &web).context("npm run build failed in web/")
+        }
+    });
+    if let Err(e) = &web_ready {
+        failures.push(format!("web: could not prepare ({e:#})"));
+    }
+
+    // `e2e/` spawns the compiled binaries (calibredb, calibre_srv, ...);
+    // `cargo test` only builds the binaries of the package under test.
+    step("building the workspace binaries (the e2e tests spawn them)");
+    if let Err(e) = cargo(&["build", "--workspace", "--bins"], &root()) {
+        failures.push(format!("building the workspace binaries failed ({e:#})"));
+    }
+
+    step("running the Rust tests (unit + integration + e2e)");
+    let packages = target_packages();
+    let (status_ok, per_crate) = run_cargo_tests(&packages);
+
+    let web_tests = if web_ready.is_ok() {
+        step("running the web tests");
+        match npm(&["test"], &web) {
+            Ok(()) => true,
+            Err(e) => {
+                failures.push(format!("web tests failed ({e:#})"));
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    eprintln!("\n=== summary ===");
+    let (mut passed, mut failed, mut ignored) = (0, 0, 0);
+    let mut names: Vec<_> = per_crate.keys().collect();
+    names.sort();
+    for name in names {
+        let c = &per_crate[name];
+        eprintln!("  {name:<28} {:>5} passed {:>3} failed {:>3} ignored", c.passed, c.failed, c.ignored);
+        passed += c.passed;
+        failed += c.failed;
+        ignored += c.ignored;
+    }
+    eprintln!("  {:<28} {passed:>5} passed {failed:>3} failed {ignored:>3} ignored", "TOTAL (rust)");
+    eprintln!("  web tests: {}", if web_tests { "passed" } else { "FAILED or not run" });
+    eprintln!("  elapsed: {:.0?}", started.elapsed());
+
+    if !status_ok {
+        failures.push(format!("the Rust test run reported failures ({failed} failed tests, or a binary that did not build or run)"));
+    }
+    if failures.is_empty() {
+        eprintln!("\nALL TESTS PASSED");
+        Ok(())
+    } else {
+        for f in &failures {
+            eprintln!("  FAILED: {f}");
+        }
+        bail!("{} part(s) of the test run failed", failures.len())
+    }
+}
+
+#[derive(Default)]
+struct Counts {
+    passed: u32,
+    failed: u32,
+    ignored: u32,
+}
+
+/// Maps a cargo target name (as it appears in a test binary's file name,
+/// dashes as underscores) to its package.
+fn target_packages() -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let cargo_bin = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let Ok(out) = Command::new(cargo_bin).args(["metadata", "--no-deps", "--format-version", "1"]).current_dir(root()).output() else {
+        return map;
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else { return map };
+    for pkg in v["packages"].as_array().into_iter().flatten() {
+        let pname = pkg["name"].as_str().unwrap_or_default();
+        for t in pkg["targets"].as_array().into_iter().flatten() {
+            if let Some(n) = t["name"].as_str() {
+                map.insert(n.replace('-', "_"), pname.to_string());
+            }
+        }
+    }
+    map
+}
+
+/// Pulls `N` out of `... N passed; ...` style parts of a `test result:` line.
+fn count_before(line: &str, word: &str) -> u32 {
+    line.split(';')
+        .find_map(|part| {
+            let part = part.trim();
+            let part = part.rsplit(':').next().unwrap_or(part).trim();
+            let part = part.trim_start_matches("ok.").trim_start_matches("FAILED.").trim();
+            part.strip_suffix(word).and_then(|n| n.trim().parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+/// Runs `cargo test`, echoing everything, while totting up each test
+/// binary's `test result:` line under the package it belongs to.
+/// Returns whether cargo exited successfully.
+fn run_cargo_tests(packages: &std::collections::HashMap<String, String>) -> (bool, std::collections::HashMap<String, Counts>) {
+    use std::io::BufRead;
+    let mut per_crate: std::collections::HashMap<String, Counts> = std::collections::HashMap::new();
+    let cargo_bin = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+
+    // One pipe for both streams so "Running <binary>" (stderr) stays
+    // ahead of that binary's results (stdout).
+    let Ok((reader, writer)) = std::io::pipe() else { return (false, per_crate) };
+    let Ok(writer2) = writer.try_clone() else { return (false, per_crate) };
+    let child = Command::new(cargo_bin)
+        .args(["test", "--workspace", "--lib", "--bins", "--tests", "--no-fail-fast"])
+        .current_dir(root())
+        .stdout(writer)
+        .stderr(writer2)
+        .spawn();
+    let Ok(mut child) = child else { return (false, per_crate) };
+
+    let mut current = String::from("(unknown)");
+    for line in std::io::BufReader::new(reader).lines().map_while(|l| l.ok()) {
+        println!("{line}");
+        let t = line.trim_start();
+        if let Some(rest) = t.strip_prefix("Running ") {
+            // `Running unittests src/lib.rs (target\debug\deps\calibre_db-0123abcd.exe)`
+            let exe = rest.rsplit(['\\', '/']).next().unwrap_or("").trim_end_matches(')');
+            let stem = exe.trim_end_matches(".exe");
+            let target = stem.rsplit_once('-').map(|(n, _)| n).unwrap_or(stem);
+            current = packages.get(target).cloned().unwrap_or_else(|| target.to_string());
+        } else if t.starts_with("test result:") {
+            let entry = per_crate.entry(current.clone()).or_default();
+            entry.passed += count_before(t, "passed");
+            entry.failed += count_before(t, "failed");
+            entry.ignored += count_before(t, "ignored");
+        }
+    }
+    let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+    (ok, per_crate)
 }
 
 fn step(what: &str) {

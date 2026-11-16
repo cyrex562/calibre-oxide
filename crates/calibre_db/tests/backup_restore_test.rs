@@ -22,7 +22,9 @@ fn test_backup_restore_roundtrip() {
     // 1. Basic Backup
     backup::backup_metadata(&cache, book_id).expect("Backup failed");
 
-    let opf_path = dir.path().join("BookPath").join("metadata.opf");
+    // OPF backups live in the library's own sidecar directory now (#889),
+    // keyed by uuid, not in the book folder.
+    let opf_path = backup::sidecar_opf_path(&cache.lock().unwrap(), book_id).unwrap();
     assert!(opf_path.exists());
     let opf_content = std::fs::read_to_string(&opf_path).unwrap();
     assert!(opf_content.contains("<dc:title>Original Title</dc:title>"));

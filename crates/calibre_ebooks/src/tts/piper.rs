@@ -245,10 +245,21 @@ mod tests {
     use super::*;
 
     fn test_engine() -> espeak_ng::EspeakNg {
-        let dir = std::env::temp_dir().join("calibre_oxide_espeak_ng_test_data");
-        std::fs::create_dir_all(&dir).unwrap();
-        espeak_ng::install_bundled_language(&dir, "en").unwrap();
-        espeak_ng::EspeakNg::with_data_dir("en-us", &dir).expect("bundled en-us data must load")
+        // The engine reads its data files from this directory on every
+        // call, and `install_bundled_language` rewrites them in place.
+        // These tests run in parallel, so installing per test into one
+        // shared directory let one test truncate a file another was
+        // reading (the old `text_to_sentence_ids_...` flake). Install
+        // exactly once per process, into a directory no other process
+        // shares either.
+        static DATA_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        let dir = DATA_DIR.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!("calibre_oxide_espeak_ng_test_data_{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            espeak_ng::install_bundled_language(&dir, "en").unwrap();
+            dir
+        });
+        espeak_ng::EspeakNg::with_data_dir("en-us", dir).expect("bundled en-us data must load")
     }
 
     fn real_voice_config_json() -> serde_json::Value {
