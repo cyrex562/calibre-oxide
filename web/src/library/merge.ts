@@ -52,9 +52,9 @@ export const MERGE_MODE_LABELS: Record<MergeMode, string> = {
 };
 
 export const MERGE_MODE_NOTES: Record<MergeMode, string> = {
-  merge_and_delete: "Formats and missing metadata move to the destination. The other books are removed and their leftover files go to the wastebasket.",
+  merge_and_delete: "Formats and missing metadata move to the destination. The other books are removed and their leftover files go to the library trash (Library → Trash…).",
   merge_keep_sources: "Formats and missing metadata are copied to the destination. The other books are not changed or deleted.",
-  formats_only: "Only formats move. The destination's metadata is not touched, and the other books are removed with their leftover files going to the wastebasket.",
+  formats_only: "Only formats move. The destination's metadata is not touched, and the other books are removed with their leftover files going to the library trash.",
 };
 
 function plural(n: number, one: string, many = `${one}s`): string {
@@ -64,7 +64,7 @@ function plural(n: number, one: string, many = `${one}s`): string {
 /**
  * The confirmation shown after a dry run: what moves, what is kept
  * because the destination already has it, and what goes to the
- * wastebasket. One sentence per fact, nothing the user has to decode.
+ * library trash. One sentence per fact, nothing the user has to decode.
  */
 export function summarizeMerge(r: MergeResponse): string[] {
   const lines: string[] = [];
@@ -93,7 +93,7 @@ export function summarizeMerge(r: MergeResponse): string[] {
   } else {
     const deleted = r.results.filter((s) => s.deleted).length;
     lines.push(`${plural(deleted, "book")} will be removed from the library.`);
-    lines.push(r.trashed.length ? `${plural(r.trashed.length, "file")} will go to the wastebasket: ${r.trashed.join(", ")}.` : "No files go to the wastebasket.");
+    lines.push(r.trashed.length ? `${plural(r.trashed.length, "file")} will move to the library trash: ${r.trashed.join(", ")}.` : "No files go to the library trash (Library → Trash…).");
   }
   for (const s of r.results) if (s.error) lines.push(`Cannot merge "${s.title}": ${s.error}`);
   for (const w of r.warnings) lines.push(`Note: ${w}`);
@@ -104,7 +104,7 @@ export function summarizeMerge(r: MergeResponse): string[] {
 export function describeMergeResult(r: MergeResponse): string {
   const merged = r.results.filter((s) => !s.error).length;
   const parts = [`Merged ${plural(merged, "book")}.`];
-  if (r.trashed.length) parts.push(`${plural(r.trashed.length, "file")} sent to the wastebasket.`);
+  if (r.trashed.length) parts.push(`${plural(r.trashed.length, "file")} moved to the library trash.`);
   if (r.failed.length) parts.push(`Left in place because it could not be trashed: ${r.failed.map((f) => f.path).join(", ")}.`);
   for (const e of r.errors) parts.push(`Book ${e.book_id} was not merged: ${e.error}`);
   return parts.join(" ");

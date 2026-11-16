@@ -352,3 +352,20 @@ describe("toolbar overflow", () => {
     }
   });
 });
+
+describe("the trash action", () => {
+  it("is available everywhere, needs no selection, and lives in the Library menu rather than the toolbar", () => {
+    const trash = LIBRARY_ACTIONS.find((a) => a.id === "trash")!;
+    expect(trash).toBeDefined();
+    expect(trash.requires).toBe("none");
+    expect(trash.toolbar).toBeFalsy();
+    expect(TOOLBAR_ACTIONS.map((a) => a.id)).not.toContain("trash");
+    const library = TOOLBAR_LAYOUT.find((i) => i.kind === "menu" && i.id === "library");
+    expect(library && "menu" in library ? library.menu : []).toContain("trash");
+  });
+
+  it("is not suppressed by being a browser tab: restoring a deleted book works the same there", () => {
+    const trash = LIBRARY_ACTIONS.find((a) => a.id === "trash")!;
+    expect(trash.desktopOnly).toBeFalsy();
+  });
+});

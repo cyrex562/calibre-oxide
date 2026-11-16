@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { copyToLibrary, describeCopyOutcome, fetchLibraryInfo, embedMetadata, summarizeEmbed, addBook, addFormat, addNewsSchedule, blobToDataUrl, inspectPlugin, installPlugin, listPlugins, removePlugin, setPluginEnabled, catalogDownloadUrl, checkLibrary, coverProxyUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchCoverProxyBlob, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeDataFile, removeFormat, removeNewsSchedule, renameCategoryItem, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, scanLibrary, fetchOrphans, relocateOrphan, uploadOrphanFile, forgetOrphan, fetchIgnored, unignoreFile, searchMetadataOnline, backfillHashes, cancelLibraryJob, describeJobProgress, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
+import { importFolder, fetchUntracked, fetchTrash, restoreTrashEntry, deleteTrashEntry, emptyTrash, copyToLibrary, describeCopyOutcome, fetchLibraryInfo, embedMetadata, summarizeEmbed, addBook, addFormat, addNewsSchedule, blobToDataUrl, inspectPlugin, installPlugin, listPlugins, removePlugin, setPluginEnabled, catalogDownloadUrl, checkLibrary, coverProxyUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchCoverProxyBlob, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeDataFile, removeFormat, removeNewsSchedule, renameCategoryItem, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, scanLibrary, fetchOrphans, relocateOrphan, uploadOrphanFile, forgetOrphan, fetchIgnored, unignoreFile, searchMetadataOnline, backfillHashes, cancelLibraryJob, describeJobProgress, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
 import type { BookSummary } from "./types";
 
 function bookStub(id: number): BookSummary {
@@ -1016,5 +1016,73 @@ describe("plugin management (#801)", () => {
     // The server refuses when a plugin declares can_be_disabled = false.
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 400, statusText: "Bad Request" }));
     await expect(setPluginEnabled("Essential", false)).rejects.toThrow("400");
+  });
+});
+
+describe("importFolder", () => {
+  it("posts the choices to the import route and follows the job to its report", async () => {
+    const report = { books_added: 2, conclusive: true };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ job_id: 9, kind: "import", state: "running" }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => job("running", { kind: "import", progress: progress({ phase: "importing", total: 4, added: 1 }) }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => job("finished", { kind: "import", report }) });
+    vi.stubGlobal("fetch", fetchMock);
+    const phases: string[] = [];
+
+    const result = await importFolder({ source: " /books ", mode: "one_book_per_folder", policy: "add_anyway", recursive: false }, { intervalMs: 0, onProgress: (j) => phases.push(j.progress.phase) });
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/import-folder/-", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source: "/books", mode: "one_book_per_folder", policy: "add_anyway", recursive: false }),
+    });
+    expect(phases).toEqual(["importing", "indexing"]);
+    expect(result).toEqual(report);
+  });
+
+  it("carries the server's reason when it refuses to start", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 400, statusText: "Bad Request", text: async () => "that folder is inside the library already; scan the library to add the books in it" }));
+    await expect(importFolder({ source: "/lib/x", mode: "multiple_books_per_folder", policy: "skip_exact_content", recursive: true })).rejects.toThrow(/400 Bad Request — that folder is inside the library already/);
+  });
+
+  it("describes its progress by files, books and skipped duplicates", () => {
+    expect(describeJobProgress(progress({ phase: "importing", total: 10, hashed: 3, already_known: 2, errors: 1, added: 4, ignored: 0 }) as never)).toBe("Importing… 6 of 10 files · 4 books added");
+    expect(describeJobProgress(progress({ phase: "importing", total: 10, hashed: 6, added: 5, ignored: 1 }) as never)).toContain("1 duplicates skipped");
+  });
+});
+
+describe("fetchUntracked", () => {
+  it("asks for the count without scanning", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ untracked: 12, at_least: false, tracked: 3, conclusive: true }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    expect(await fetchUntracked(500)).toEqual({ untracked: 12, at_least: false, tracked: 3, conclusive: true });
+
+    expect(fetchMock).toHaveBeenCalledWith("/library-untracked/-?max=500", undefined);
+  });
+});
+
+describe("the trash", () => {
+  it("lists, restores, deletes and empties through the trash routes", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ count: 0, entries: [], book_id: 3, removed: 2 }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await fetchTrash();
+    expect(fetchMock).toHaveBeenLastCalledWith("/trash/-", undefined);
+
+    await restoreTrashEntry({ kind: "format", key: "7", format: "PDF" });
+    expect(fetchMock).toHaveBeenLastCalledWith("/trash/restore/-", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind: "format", key: "7", format: "PDF" }) });
+
+    await deleteTrashEntry({ kind: "book", key: "7" });
+    expect(fetchMock).toHaveBeenLastCalledWith("/trash/delete/-", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind: "book", key: "7" }) });
+
+    expect(await emptyTrash()).toMatchObject({ removed: 2 });
+    expect(fetchMock).toHaveBeenLastCalledWith("/trash/empty/-", { method: "POST" });
+  });
+
+  it("surfaces why a restore was refused", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 400, statusText: "Bad Request", text: async () => "the book already has a PDF; remove it before restoring this one" }));
+    await expect(restoreTrashEntry({ kind: "format", key: "7", format: "PDF" })).rejects.toThrow(/already has a PDF/);
   });
 });

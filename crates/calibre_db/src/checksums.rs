@@ -153,6 +153,19 @@ pub struct HashRecord {
     pub identity: Option<calibre_utils::filenames::FileIdentity>,
 }
 
+/// One row of the folder importer's ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerRow {
+    pub hash: String,
+    pub size: i64,
+    /// The source file's modification time, nanoseconds since the epoch.
+    pub mtime_ns: i64,
+    /// `imported`, `merged`, `duplicate_content` or `duplicate_title`.
+    pub outcome: String,
+    /// The duplicate policy in force when it was decided.
+    pub policy: String,
+}
+
 /// See this module's doc comment for the full design.
 pub struct ChecksumStore {
     conn: Arc<Mutex<Connection>>,
@@ -218,6 +231,18 @@ impl ChecksumStore {
                     book_id INTEGER PRIMARY KEY,
                     format TEXT NOT NULL,
                     queued_at TEXT NOT NULL
+                );
+                -- What the folder importer has done with each source file,
+                -- so a rerun skips it without reading it again.
+                CREATE TABLE IF NOT EXISTS checksums_db.import_ledger (
+                    source TEXT NOT NULL PRIMARY KEY,
+                    blake3_hex TEXT NOT NULL,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    outcome TEXT NOT NULL,
+                    policy TEXT NOT NULL,
+                    book_uuid TEXT,
+                    imported_at TEXT NOT NULL
                 );",
             )?;
         }
@@ -614,6 +639,38 @@ impl ChecksumStore {
         }
         groups.retain(|(_, ids)| ids.len() > 1);
         Ok(groups)
+    }
+
+    /// What the importer recorded for a source file, if anything.
+    pub fn import_ledger_lookup(&self, source: &str) -> Result<Option<LedgerRow>, ChecksumError> {
+        self.initialize()?;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT blake3_hex, size, mtime_ns, outcome, policy FROM checksums_db.import_ledger WHERE source = ?1")?;
+        let mut rows = stmt.query([source])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(LedgerRow { hash: row.get(0)?, size: row.get(1)?, mtime_ns: row.get(2)?, outcome: row.get(3)?, policy: row.get(4)? })),
+            None => Ok(None),
+        }
+    }
+
+    /// Records the importer's decisions for a batch of source files, in one
+    /// `BEGIN IMMEDIATE` transaction.
+    pub fn import_ledger_record(&self, rows: &[(String, LedgerRow, Option<String>)]) -> Result<(), ChecksumError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.initialize()?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        for (source, row, uuid) in rows {
+            tx.execute(
+                "INSERT OR REPLACE INTO checksums_db.import_ledger (source, blake3_hex, size, mtime_ns, outcome, policy, book_uuid, imported_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))",
+                (source, &row.hash, row.size, row.mtime_ns, &row.outcome, &row.policy, uuid),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Whether any recorded file has this content.

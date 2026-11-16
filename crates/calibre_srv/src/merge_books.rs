@@ -4,7 +4,7 @@
 //!   Body `{dest, sources, mode, keep_duplicate_formats, dry_run}`;
 //!   `mode` is `merge_and_delete` (default), `merge_keep_sources` or
 //!   `formats_only`. Answers with a per-source report, the files sent to the
-//!   wastebasket and any warnings. With `dry_run` it only says what it would do.
+//!   library trash (.caltrash) and any warnings. With `dry_run` it only says what it would do.
 //! - `POST /duplicates/merge-exact/{library_id}` -- the bulk operation for
 //!   **exact-content groups only** (never title/author matches). Body
 //!   `{dry_run, keep_duplicate_formats, plan_fingerprint}`. `dry_run`
@@ -160,7 +160,7 @@ pub async fn merge_exact(State(state): State<AppState>, Path(library_id): Path<S
     if confirmed != fingerprint {
         return Ok((StatusCode::CONFLICT, Json(json!({"error": "the library has changed since that plan was made; run the dry run again", "plan_fingerprint": fingerprint}))).into_response());
     }
-    let params = JobParams { merge_plan: plan, keep_duplicate_formats: body.keep_duplicate_formats };
+    let params = JobParams { merge_plan: plan, keep_duplicate_formats: body.keep_duplicate_formats, ..Default::default() };
     Ok(match library_jobs::start_with(cache, JobKind::MergeExact, None, params) {
         Started::New(job) => (StatusCode::ACCEPTED, Json(json!({"job_id": job.id, "state": "running", "already_running": false, "status_url": format!("/library-jobs/{}", job.id)}))).into_response(),
         Started::AlreadyRunning(job) => (StatusCode::ACCEPTED, Json(json!({"job_id": job.id, "state": "running", "already_running": true, "status_url": format!("/library-jobs/{}", job.id)}))).into_response(),

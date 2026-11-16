@@ -34,7 +34,7 @@ const COMMANDS: &[&str] = &[
     "open_recent_library",
     "import_library_archive",
     // Adding books
-    "choose_folder_and_add_books",
+    "choose_import_folder",
     "get_auto_add_folder",
     "choose_auto_add_folder",
     // Books on disk

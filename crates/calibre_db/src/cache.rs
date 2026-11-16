@@ -133,7 +133,10 @@ pub struct FormatFileInfo {
 /// What [`Cache::delete_book_with`] does with the book's files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BookFiles {
-    /// Send the book's own files to the system wastebasket.
+    /// Move the book's own files into the library's `.caltrash`, from where
+    /// they can be listed and restored ([`crate::trash`]). Calibre's own
+    /// behaviour; and unlike the system wastebasket it works on a network
+    /// share, which has none.
     Trash,
     /// Touch no file; record the format files in the ignore list.
     Keep,
@@ -143,7 +146,7 @@ pub enum BookFiles {
 /// root and `/`-separated.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BookDeletion {
-    /// Files sent to the wastebasket.
+    /// Files moved into the library's `.caltrash`.
     pub trashed: Vec<String>,
     /// Format files left on disk and put on the ignore list.
     pub ignored: Vec<String>,
@@ -154,15 +157,15 @@ pub struct BookDeletion {
     pub folder_removed: Option<String>,
 }
 
-struct OwnFile {
-    rel: String,
-    hash: Option<String>,
-    is_format: bool,
+pub(crate) struct OwnFile {
+    pub(crate) rel: String,
+    pub(crate) hash: Option<String>,
+    pub(crate) is_format: bool,
 }
 
 /// True for a relative path made only of ordinary components: no `..`,
 /// no root or drive, no `.`, and nothing inside `.calibre-oxide`.
-fn path_is_plain(rel: &str) -> bool {
+pub(crate) fn path_is_plain(rel: &str) -> bool {
     use std::path::Component;
     let p = Path::new(rel);
     let mut first = true;
@@ -218,6 +221,67 @@ pub struct InPlaceFile {
     pub identity: Option<calibre_utils::filenames::FileIdentity>,
     /// Owes the lazy metadata pass (embedded title/authors/cover).
     pub queue_enrichment: bool,
+}
+
+/// One file of a book being imported: already copied into the library's
+/// staging area and verified there.
+#[derive(Debug, Clone)]
+pub struct ImportFile {
+    pub staged: PathBuf,
+    /// Lowercase extension, no dot.
+    pub ext: String,
+    pub size: i64,
+    /// BLAKE3, lowercase hex, of the verified copy.
+    pub hash: String,
+}
+
+/// A book for [`Cache::import_books_batch`].
+#[derive(Debug, Clone)]
+pub struct ImportItem {
+    pub metadata: MetaInformation,
+    pub files: Vec<ImportFile>,
+}
+
+/// A book [`Cache::import_books_batch`] created.
+#[derive(Debug, Clone)]
+pub struct ImportedBook {
+    pub id: i32,
+    pub uuid: Option<String>,
+    /// `Author/Title (id)`.
+    pub folder: String,
+    /// Each file's path relative to the library root.
+    pub files: Vec<String>,
+}
+
+/// calibre's `PATH_LIMIT`: how much of an author or title goes into a
+/// folder name (shorter on Windows, where the whole path has 260).
+fn path_limit() -> usize {
+    if cfg!(windows) {
+        40
+    } else {
+        100
+    }
+}
+
+fn clip_name(name: &str, limit: usize) -> String {
+    let sanitized = sanitize_file_name(name);
+    let clipped: String = sanitized.chars().take(limit).collect();
+    let clipped = clipped.trim_end_matches(['.', ' ']).trim_start().to_string();
+    if clipped.is_empty() {
+        "Unknown".to_string()
+    } else {
+        clipped
+    }
+}
+
+/// calibre's `construct_path_name`: `("Author/Title (id)", "Title - Author")`.
+/// The id stays whole however long the title is.
+pub fn import_names(book_id: i32, title: &str, author: &str) -> (String, String) {
+    let author_dir = clip_name(author, path_limit());
+    let title_dir = clip_name(title, path_limit());
+    let folder = format!("{author_dir}/{title_dir}{}", crate::constants::BOOK_ID_PATH_TEMPLATE.replace("{}", &book_id.to_string()));
+    let stem = format!("{} - {}", clip_name(title, 35), clip_name(author, 35));
+    (folder, stem)
 }
 
 /// The key under which a file is looked up in
@@ -860,6 +924,144 @@ impl Cache {
             .collect()
     }
 
+    /// Creates books from files the caller has already copied and verified
+    /// into the library's staging area, laying each out the way calibre's
+    /// own add does: `<Author>/<Title> (<id>)/<Title> - <Author>.<ext>`.
+    ///
+    /// One `BEGIN IMMEDIATE` transaction for the whole batch, a savepoint per
+    /// book. The id is only known once the row exists and the folder name
+    /// contains it, so inside the transaction each book is inserted, its
+    /// files are *renamed* from staging to their final names (journaled; a
+    /// same-volume rename, never a copy), and its `data` rows and hashes
+    /// written. If any step fails, that book's files go back to staging and
+    /// its savepoint rolls back; the rest of the batch is unaffected. The
+    /// change log gets one batch entry afterwards, as for a scan.
+    ///
+    /// Results are in the order of `items`.
+    pub fn import_books_batch(&self, items: &[ImportItem]) -> Vec<anyhow::Result<ImportedBook>> {
+        if items.is_empty() {
+            return Vec::new();
+        }
+        let fail_all = |e: anyhow::Error| -> Vec<anyhow::Result<ImportedBook>> { items.iter().map(|_| Err(anyhow::anyhow!("{e:#}"))).collect() };
+        if let Err(e) = self.checksums().initialize() {
+            return fail_all(e.into());
+        }
+        let handle = match self.backend.write_handle() {
+            Ok(h) => h,
+            Err(e) => return fail_all(e.into()),
+        };
+        let library = self.backend.library_path.clone();
+
+        struct Done {
+            book: ImportedBook,
+            ops: Vec<crate::change_log::ChangeOp>,
+        }
+        let mut outcomes: Vec<anyhow::Result<Done>> = Vec::with_capacity(items.len());
+        {
+            let mut conn = self.backend.conn.lock().unwrap();
+            let mut tx = match conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
+                Ok(tx) => tx,
+                Err(e) => return fail_all(e.into()),
+            };
+            for item in items {
+                let one = (|| -> anyhow::Result<Done> {
+                    let sp = tx.savepoint()?;
+                    let mut metadata = item.metadata.clone();
+                    // A uuid inside the file is metadata about the book, not
+                    // this library's identity for the row (see `add_book`).
+                    metadata.uuid = None;
+                    let inserted = Self::insert_book_in_tx(&sp, &metadata, "", None)?;
+                    let author = metadata.authors.first().map(String::as_str).unwrap_or("Unknown");
+                    let (folder, stem) = import_names(inserted.id, &metadata.title, author);
+                    sp.execute("UPDATE books SET path = ?1 WHERE id = ?2", (&folder, inserted.id))?;
+
+                    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+                    let result = (|| -> anyhow::Result<Vec<(String, i64, String)>> {
+                        let mut rows = Vec::new();
+                        for file in &item.files {
+                            let dest = library.join(&folder).join(format!("{stem}.{}", file.ext));
+                            if dest.exists() {
+                                anyhow::bail!("{} already exists", dest.display());
+                            }
+                            if let Some(parent) = dest.parent() {
+                                fs::create_dir_all(parent)?;
+                            }
+                            handle.rename_atomic(&file.staged, &dest)?;
+                            moved.push((file.staged.clone(), dest.clone()));
+                            let format = file.ext.to_uppercase();
+                            sp.execute(
+                                "INSERT OR REPLACE INTO data (book, format, uncompressed_size, name) VALUES (?1, ?2, ?3, ?4)",
+                                (inserted.id, &format, file.size, &stem),
+                            )?;
+                            crate::checksums::ChecksumStore::record_hash_on(&sp, inserted.id, "format", &format, &file.hash, file.size, calibre_utils::filenames::identity(&dest))?;
+                            rows.push((format, file.size, file.hash.clone()));
+                        }
+                        Ok(rows)
+                    })();
+                    let rows = match result.and_then(|rows| sp.commit().map(|_| rows).map_err(Into::into)) {
+                        Ok(rows) => rows,
+                        Err(e) => {
+                            // Back to staging; the savepoint rolls back when
+                            // `sp` is dropped uncommitted.
+                            for (from, to) in moved.iter().rev() {
+                                let _ = handle.rename_atomic(to, from);
+                            }
+                            let dir = library.join(&folder);
+                            let _ = fs::remove_dir(&dir);
+                            if let Some(parent) = dir.parent() {
+                                let _ = fs::remove_dir(parent);
+                            }
+                            return Err(e);
+                        }
+                    };
+
+                    let mut ops = Self::book_added_ops(&inserted, &metadata, &folder);
+                    if let Some(uuid) = inserted.uuid.clone() {
+                        for (format, size, hash) in &rows {
+                            ops.push(crate::change_log::ChangeOp::FormatSet { book: uuid.clone(), format: format.clone(), name: stem.clone(), size: *size, hash: Some(hash.clone()) });
+                        }
+                    }
+                    let files = item.files.iter().map(|f| format!("{folder}/{stem}.{}", f.ext)).collect();
+                    Ok(Done { book: ImportedBook { id: inserted.id, uuid: inserted.uuid, folder, files }, ops })
+                })();
+                outcomes.push(one);
+            }
+            if let Err(e) = tx.commit() {
+                // Nothing was committed, so every file must go back.
+                drop(conn);
+                for (item, outcome) in items.iter().zip(&outcomes) {
+                    if let Ok(done) = outcome {
+                        for (file, rel) in item.files.iter().zip(&done.book.files) {
+                            let _ = handle.rename_atomic(&library.join(rel), &file.staged);
+                        }
+                    }
+                }
+                return fail_all(e.into());
+            }
+        }
+
+        let mut all_ops = Vec::new();
+        for outcome in outcomes.iter_mut().flatten() {
+            all_ops.append(&mut outcome.ops);
+        }
+        self.record_many(all_ops);
+
+        outcomes
+            .into_iter()
+            .zip(items)
+            .map(|(outcome, item)| {
+                let done = outcome?;
+                let (_, cover) = &item.metadata.cover_data;
+                if !cover.is_empty() {
+                    if let Err(e) = crate::covers::set_cover(self, done.book.id, cover) {
+                        log::warn!("imported book {} but its cover could not be stored: {e}", done.book.id);
+                    }
+                }
+                Ok(done.book)
+            })
+            .collect()
+    }
+
     /// Every `(folder, file stem, FORMAT)` the library already has a row
     /// for, as one string key per file -- see [`file_key`]. One query, so
     /// a scan can tell new files from known ones without asking the
@@ -1147,10 +1349,6 @@ impl Cache {
         let stem = self.free_format_stem(book_id, &format, &book_dir, &preferred, &ext, source_path)?;
         let file_name = format!("{stem}.{ext}");
         let dest_path = book_dir.join(&file_name);
-        if dest_path.exists() && !replace {
-            return Ok(false);
-        }
-
         // The source may already *be* the destination, now that a book's
         // folder can be the library root: adding `<library>/dune.pdf`
         // computes a destination of exactly that path. Copying a file
@@ -1160,6 +1358,15 @@ impl Cache {
         // text, which sees through a symlink or a differently-spelled but
         // equal path.
         let already_in_place = calibre_utils::filenames::samefile(source_path, &dest_path);
+
+        // A file already at the destination refuses `replace = false` --
+        // except when it is the source itself. Then nothing is overwritten
+        // (the format row was checked above): the file is just being
+        // claimed. This used to refuse that too, which is why `merge`
+        // passes `replace = true` for the in-place sibling case.
+        if dest_path.exists() && !replace && !already_in_place {
+            return Ok(false);
+        }
 
         // Port of issue #93's crate-wide write-path retrofit: real,
         // journaled, crash-safe, large-file-safe copy-in through
@@ -1291,7 +1498,20 @@ impl Cache {
     /// easily be the *other* book's -- removing one format would then
     /// delete a different book entirely. `data.name` says which file
     /// is ours; nothing else does.
+    ///
+    /// The file goes to the library's trash (`.caltrash/f/<book id>`) and can
+    /// be restored, as calibre does; [`Cache::remove_format_permanently`] is
+    /// for a file that should not be kept.
     pub fn remove_format(&self, book_id: i32, fmt: &str) -> anyhow::Result<()> {
+        self.remove_format_inner(book_id, fmt, false)
+    }
+
+    /// [`Cache::remove_format`] without the trash: the file is deleted.
+    pub fn remove_format_permanently(&self, book_id: i32, fmt: &str) -> anyhow::Result<()> {
+        self.remove_format_inner(book_id, fmt, true)
+    }
+
+    fn remove_format_inner(&self, book_id: i32, fmt: &str, permanently: bool) -> anyhow::Result<()> {
         let Some(book_dir) = self.book_dir(book_id)? else {
             return Ok(());
         };
@@ -1304,10 +1524,18 @@ impl Cache {
         if let Some(name) = name {
             let path = book_dir.join(format!("{name}.{}", fmt.to_lowercase()));
             if path.is_file() {
-                // Port of issue #93's crate-wide write-path retrofit:
-                // real, journaled, crash-safe removal through
-                // `LibraryHandle` instead of a raw `fs::remove_file`.
-                self.backend.write_handle()?.remove_atomic(&path)?;
+                if permanently {
+                    // Port of issue #93's crate-wide write-path retrofit:
+                    // real, journaled, crash-safe removal through
+                    // `LibraryHandle` instead of a raw `fs::remove_file`.
+                    self.backend.write_handle()?.remove_atomic(&path)?;
+                } else {
+                    // calibre's `remove_formats`: into `.caltrash/f/<id>`, so
+                    // the format can be restored. Failing here leaves the row
+                    // and the file exactly as they were.
+                    let hash = self.checksums().recorded_identity(book_id, "format", &fmt.to_uppercase()).ok().and_then(|(h, _)| h);
+                    self.move_format_to_trash(book_id, fmt, &name, &path, hash)?;
+                }
             }
         }
 
@@ -1409,6 +1637,10 @@ impl Cache {
             }
         }
 
+        // Everything the trash needs to put the book back, read while the
+        // row still exists.
+        let manifest = if files == BookFiles::Trash { Some(self.trash_manifest_for(book_id, uuid.clone(), &title, &path_rel, &own)?) } else { None };
+
         self.checksums().remove_all_for_book(book_id)?;
         {
             let conn = self.backend.conn.lock().unwrap();
@@ -1424,32 +1656,20 @@ impl Cache {
             // Ignore entries were recorded before the row went.
             BookFiles::Keep => {}
             BookFiles::Trash => {
-                for file in &own {
-                    let absolute = library.join(&file.rel);
-                    if !absolute.is_file() {
-                        continue;
-                    }
-                    match trash_one(&absolute) {
-                        Ok(()) => outcome.trashed.push(file.rel.clone()),
-                        Err(why) => {
-                            if file.is_format {
-                                match self.ignored().ignore(&file.rel, file.hash.as_deref(), &title) {
-                                    Ok(()) => outcome.ignored.push(file.rel.clone()),
-                                    Err(e) => log::warn!("could not record {} in the ignore list: {e}", file.rel),
-                                }
-                            }
-                            outcome.failed.push((file.rel.clone(), why));
+                // Into the library's own `.caltrash`, as calibre does -- see
+                // `crate::trash`. A same-volume rename, so it works on a
+                // network share that has no recycle bin.
+                let moved = self.move_book_to_trash(manifest.expect("built above for Trash"), cover_sidecar.filter(|c| c.is_file()));
+                outcome.trashed = moved.moved;
+                for (rel, why) in moved.failed {
+                    if own.iter().any(|f| f.rel == rel && f.is_format) {
+                        let hash = own.iter().find(|f| f.rel == rel).and_then(|f| f.hash.clone());
+                        match self.ignored().ignore(&rel, hash.as_deref(), &title) {
+                            Ok(()) => outcome.ignored.push(rel.clone()),
+                            Err(e) => log::warn!("could not record {rel} in the ignore list: {e}"),
                         }
                     }
-                }
-                // The sidecar cover is this app's own index state, not a
-                // user file; remove it through the journaled handle.
-                if let Some(cover) = cover_sidecar.filter(|c| c.is_file()) {
-                    if let Ok(handle) = self.backend.write_handle() {
-                        if let Err(e) = handle.remove_atomic(&cover) {
-                            log::warn!("could not remove cover {}: {e}", cover.display());
-                        }
-                    }
+                    outcome.failed.push((rel, why));
                 }
                 if outcome.failed.is_empty() {
                     outcome.folder_removed = self.remove_book_folder_if_empty(&path_rel, dedicated);
@@ -1477,7 +1697,7 @@ impl Cache {
     }
 
     /// The files this book owns on disk, relative to the library root.
-    fn own_files(&self, book_id: i32, path_rel: &str, dedicated: bool) -> anyhow::Result<Vec<OwnFile>> {
+    pub(crate) fn own_files(&self, book_id: i32, path_rel: &str, dedicated: bool) -> anyhow::Result<Vec<OwnFile>> {
         if !path_rel.is_empty() && !path_is_plain(path_rel) {
             log::warn!("book {book_id} has an unusable path {path_rel:?}; none of its files will be touched");
             return Ok(Vec::new());
@@ -3853,7 +4073,30 @@ mod tests {
     }
 
     #[test]
-    fn remove_format_deletes_the_file_and_its_data_row() {
+    fn remove_format_moves_the_file_to_the_library_trash_and_drops_its_data_row() {
+        let (dir, cache) = open_test_cache();
+        let source = write_temp_file(dir.path(), "src.epub", b"epub bytes");
+        let mut meta = MetaInformation::default();
+        meta.title = "T".to_string();
+        meta.authors = vec!["A".to_string()];
+        let book_id = cache.add_book(&source, &meta).unwrap();
+        cache.add_format(book_id, &source, "epub", true).unwrap();
+        let renames_before = journaled_op_count(dir.path(), "RenameFile");
+
+        cache.remove_format(book_id, "epub").unwrap();
+
+        // Gone from the folder, in the trash (calibre's `f/<id>/<ext>`), and
+        // restorable -- not erased.
+        assert!(!dir.path().join("A/T/T.epub").exists());
+        assert_eq!(cache.field_for(book_id, "formats").unwrap(), None);
+        assert_eq!(fs::read(cache.trash_dir().join("f").join(book_id.to_string()).join("epub")).unwrap(), b"epub bytes");
+        // Through the real LibraryHandle: a journaled rename, not a delete.
+        assert_eq!(journaled_op_count(dir.path(), "RenameFile"), renames_before + 1);
+        assert_eq!(journaled_delete_count(dir.path()), 0);
+    }
+
+    #[test]
+    fn remove_format_permanently_deletes_the_file_and_its_data_row() {
         let (dir, cache) = open_test_cache();
         let source = write_temp_file(dir.path(), "src.epub", b"epub bytes");
         let mut meta = MetaInformation::default();
@@ -3862,10 +4105,11 @@ mod tests {
         let book_id = cache.add_book(&source, &meta).unwrap();
         cache.add_format(book_id, &source, "epub", true).unwrap();
 
-        cache.remove_format(book_id, "epub").unwrap();
+        cache.remove_format_permanently(book_id, "epub").unwrap();
 
         assert!(!dir.path().join("A/T/T.epub").exists());
         assert_eq!(cache.field_for(book_id, "formats").unwrap(), None);
+        assert!(cache.list_trash().unwrap().is_empty(), "nothing is kept");
 
         // remove_format now goes through the real LibraryHandle (issue
         // #93's crate-wide write-path retrofit), not a raw

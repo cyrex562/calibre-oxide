@@ -33,6 +33,7 @@
 //! - `POST /scan-library/{library_id}` -- scan, then enrich ([`crate::scan_library`])
 //! - `POST /enrich-library/{library_id}` -- the metadata pass alone (resume)
 //! - `POST /hash-backfill/{library_id}` -- hash every file with no hash
+//! - `POST /import-folder/{library_id}` -- copy a folder tree in ([`crate::import_folder`])
 //! - `GET /library-jobs`, `GET /library-jobs/{id}`, `POST /library-jobs/{id}/cancel`
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -62,15 +63,18 @@ pub enum JobKind {
     HashBackfill,
     /// Merge exact-content duplicate groups (a plan the user confirmed).
     MergeExact,
+    /// Copy a folder tree into the library (`POST /import-folder`).
+    Import,
 }
 
 impl JobKind {
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             JobKind::Scan => "scan",
             JobKind::Enrich => "enrich",
             JobKind::HashBackfill => "hash_backfill",
             JobKind::MergeExact => "merge_exact",
+            JobKind::Import => "import",
         }
     }
 }
@@ -176,6 +180,8 @@ pub fn start(cache: Arc<Cache>, kind: JobKind, workers: Option<usize>) -> Starte
 pub struct JobParams {
     pub merge_plan: Vec<calibre_db::merge::PlannedGroup>,
     pub keep_duplicate_formats: bool,
+    /// The folder to import and how, for [`JobKind::Import`].
+    pub import: Option<(std::path::PathBuf, calibre_db::import::ImportOptions)>,
 }
 
 pub fn start_with(cache: Arc<Cache>, kind: JobKind, workers: Option<usize>, params: JobParams) -> Started {
@@ -245,6 +251,10 @@ fn run(cache: &Cache, kind: JobKind, options: &PipelineOptions, control: &JobCon
         JobKind::Enrich => Ok(serde_json::to_value(calibre_db::scan_pipeline::enrich_pending(cache, options, control)?)?),
         JobKind::HashBackfill => Ok(serde_json::to_value(calibre_db::scan_pipeline::backfill_hashes(cache, options, control)?)?),
         JobKind::MergeExact => Ok(serde_json::to_value(calibre_db::merge::execute_content_merges(cache, &params.merge_plan, params.keep_duplicate_formats, control))?),
+        JobKind::Import => {
+            let (source, import_options) = params.import.as_ref().ok_or_else(|| anyhow::anyhow!("an import job needs a source folder"))?;
+            Ok(serde_json::to_value(calibre_db::import::import_folder(cache, source, import_options, options, control)?)?)
+        }
     }
 }
 

@@ -36,7 +36,7 @@ use anyhow::{Context, Result};
 
 use calibre_utils::filenames::{file_facts, FileFacts};
 
-use crate::constants::{DATA_DIR_NAME, LIBRARY_HANDLE_DIR_NAME};
+use crate::constants::{DATA_DIR_NAME, LIBRARY_HANDLE_DIR_NAME, NOTES_DIR_NAME, TRASH_DIR_NAME};
 
 /// How long a file must have been untouched before it is indexed.
 ///
@@ -67,6 +67,10 @@ const JUNK_NAMES: &[&str] = &[
 /// Directory names that are somebody else's business.
 const JUNK_DIRS: &[&str] = &[
     LIBRARY_HANDLE_DIR_NAME,
+    // The library's own trash: books moved here have been deleted, and a
+    // scan that walked in would add every one of them straight back.
+    TRASH_DIR_NAME,
+    NOTES_DIR_NAME,
     "@eadir",          // Synology thumbnails
     ".@__thumb",       // QNAP
     "#recycle",        // Synology
@@ -76,6 +80,17 @@ const JUNK_DIRS: &[&str] = &[
     ".trashes",
     ".git",
 ];
+
+/// Whether a directory (given lowercase) is somebody else's business: the
+/// library's own state, the trash, a NAS's thumbnail cache.
+pub(crate) fn is_junk_dir(lower: &str) -> bool {
+    JUNK_DIRS.contains(&lower)
+}
+
+/// Whether a file (given lowercase) is clutter, not a book.
+pub(crate) fn is_junk_name(lower: &str) -> bool {
+    JUNK_NAMES.contains(&lower)
+}
 
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
@@ -164,7 +179,7 @@ pub fn walk_controlled(library_path: &Path, options: &ScanOptions, now: SystemTi
 }
 
 fn walk_dir(root: &Path, dir: &Path, options: &ScanOptions, now: SystemTime, report: &mut ScanReport, control: Option<&crate::scan_pipeline::JobControl>) {
-    if control.is_some_and(|c| c.is_cancelled()) {
+    if control.is_some_and(|c| c.is_cancelled() || c.walk_limit_reached()) {
         return;
     }
     let entries = match std::fs::read_dir(dir) {
@@ -400,6 +415,51 @@ pub fn index_scan(cache: &crate::cache::Cache, library_path: &Path, report: &Sca
         log::warn!("indexed the folder but could not read its books' metadata: {e}");
     }
     indexed
+}
+
+/// How many book files in the library folder no book claims yet.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct UntrackedCount {
+    pub untracked: usize,
+    /// The count stopped at its cap: there are at least this many.
+    pub at_least: bool,
+    /// Book files the library already tracks, among those seen.
+    pub tracked: usize,
+    /// Every folder was readable and the walk was not cut short.
+    pub conclusive: bool,
+}
+
+/// Counts the files a scan would add, without reading any of them: one
+/// walk, no hashing. Stops once `cap` untracked files have been found, so
+/// asking about a share with a million files is not a million `stat`s.
+///
+/// This is what lets the app say "this folder has N untracked book files --
+/// scan now?" when a library is opened over a folder somebody filled, and
+/// then leave the (long) scan to be the user's choice.
+///
+/// Files on the ignore list by path are not counted. A file that is
+/// ignored by *content* only is, since telling needs a read: the scan
+/// itself will skip it.
+pub fn count_untracked(cache: &crate::cache::Cache, now: SystemTime, cap: usize) -> Result<UntrackedCount> {
+    let library = cache.backend.library_path.clone();
+    let known = cache.indexed_file_keys()?;
+    let (ignored_paths, _) = cache.ignored().snapshot()?;
+    let control = crate::scan_pipeline::JobControl::default();
+    // At most `known.len()` of the files seen can be tracked, so seeing this
+    // many means at least `cap` are not.
+    control.stop_after_seen.store((known.len() + cap.max(1)) as u64, std::sync::atomic::Ordering::Relaxed);
+    let scanned = walk_controlled(&library, &ScanOptions::default(), now, Some(&control))?;
+    let (mut untracked, mut tracked) = (0, 0);
+    for file in &scanned.files {
+        if known.contains(&crate::cache::file_key(&file.folder, &file.stem, &file.extension)) {
+            tracked += 1;
+        } else if !ignored_paths.contains(&file.relative_path) {
+            untracked += 1;
+        }
+    }
+    // Cut short only by the limit above, which guarantees `cap` untracked.
+    let at_least = control.walk_limit_reached();
+    Ok(UntrackedCount { untracked, at_least, tracked, conclusive: scanned.is_complete() })
 }
 
 /// What a rescan did.
@@ -1132,5 +1192,71 @@ mod index_tests {
         cache.set_format_name(book_id, "PDF", "renamed").unwrap();
 
         assert_eq!(cache.checksums().recorded_identity(book_id, "format", "PDF").unwrap().0, before, "a rename does not change the content");
+    }
+}
+
+#[cfg(test)]
+mod untracked_tests {
+    use super::*;
+    use crate::cache::Cache;
+
+    fn write(path: &Path, bytes: &[u8]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn later() -> SystemTime {
+        SystemTime::now() + Duration::from_secs(3600)
+    }
+
+    /// The prompt on opening a folder: how many book files nothing tracks,
+    /// without reading or changing any of them.
+    #[test]
+    fn counts_the_files_a_scan_would_add_and_none_it_would_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        write(&dir.path().join("known.pdf"), b"%PDF known");
+        write(&dir.path().join("a/new1.pdf"), b"%PDF 1");
+        write(&dir.path().join("a/new2.epub"), b"PK");
+        write(&dir.path().join("b/ignored.pdf"), b"%PDF ignored");
+        write(&dir.path().join("notes.txt.bak"), b"not a book");
+        let mut meta = calibre_ebooks::metadata::MetaInformation::default();
+        meta.title = "Known".to_string();
+        cache.register_book_in_place("known.pdf", &meta).unwrap();
+        cache.ignored().ignore("b/ignored.pdf", None, "Ignored").unwrap();
+        let before: Vec<_> = std::fs::read_dir(dir.path()).unwrap().flatten().map(|e| e.file_name()).collect();
+
+        let count = count_untracked(&cache, later(), 1000).unwrap();
+
+        assert_eq!(count, UntrackedCount { untracked: 2, at_least: false, tracked: 1, conclusive: true });
+        let after: Vec<_> = std::fs::read_dir(dir.path()).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(before, after);
+        assert!(cache.all_book_ids().unwrap().len() == 1, "counting must not add anything");
+    }
+
+    #[test]
+    fn stops_at_the_cap_and_says_there_are_at_least_that_many() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        for i in 0..30 {
+            write(&dir.path().join(format!("d{}/f{i}.pdf", i % 3)), b"%PDF");
+        }
+
+        let count = count_untracked(&cache, later(), 5).unwrap();
+
+        assert!(count.at_least);
+        assert!(count.untracked >= 5 && count.untracked < 30, "{count:?}");
+    }
+
+    #[test]
+    fn an_empty_library_has_nothing_untracked_and_the_trash_is_not_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        write(&dir.path().join(".caltrash/b/1/old.pdf"), b"%PDF");
+        let count = count_untracked(&cache, later(), 100).unwrap();
+        assert_eq!(count.untracked, 0);
+        assert!(!count.at_least);
     }
 }

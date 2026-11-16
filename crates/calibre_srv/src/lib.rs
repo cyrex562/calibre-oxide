@@ -202,6 +202,8 @@ pub mod orphans;
 pub mod rename_files;
 pub mod scan_library;
 pub mod library_jobs;
+pub mod library_trash;
+pub mod import_folder;
 pub mod render_endpoints;
 pub mod save_to_disk;
 pub mod share;
@@ -298,7 +300,13 @@ impl AppState {
             // Normalised here rather than in the broker, which is a
             // faithful port of upstream's own `get` and has no such
             // placeholder.
-            Some(broker) => broker.get(library_id.filter(|id| *id != "-")),
+            //
+            // `default` is the other spelling: the job routes (`/scan-library/
+            // default`, `/hash-backfill/default`, ...) have always been called
+            // with it, and a broker keys libraries by folder name, so with
+            // any broker at all (the desktop app serves every recent library)
+            // those answered 404. A library really named `default` still wins.
+            Some(broker) => broker.get(library_id.filter(|id| *id != "-")).or_else(|| (library_id == Some("default")).then(|| broker.get(None)).flatten()),
         }
     }
 }
@@ -372,6 +380,13 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/scan-library/{library_id}", post(scan_library::scan))
         .route("/enrich-library/{library_id}", post(library_jobs::enrich))
         .route("/hash-backfill/{library_id}", post(library_jobs::hash_backfill))
+        .route("/library-untracked/{library_id}", get(scan_library::untracked))
+        .route("/import-folder/{library_id}", post(import_folder::import))
+        .route("/trash/{library_id}", get(library_trash::list))
+        .route("/trash/restore/{library_id}", post(library_trash::restore))
+        .route("/trash/delete/{library_id}", post(library_trash::delete))
+        .route("/trash/empty/{library_id}", post(library_trash::empty))
+        .route("/trash/expire/{library_id}", post(library_trash::expire))
         .route("/library-jobs", get(library_jobs::list))
         .route("/library-jobs/{job_id}", get(library_jobs::status))
         .route("/library-jobs/{job_id}/cancel", post(library_jobs::cancel))
