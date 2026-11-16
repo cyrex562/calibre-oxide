@@ -151,7 +151,11 @@ fn test_custom_column_types() {
         .add_custom_column("seriescol", "Series Col", "series", false)
         .unwrap();
 
-    // Multiple text (Not supported yet, should fail)
-    let res = db.add_custom_column("multitcol", "Multi Col", "text", true);
-    assert!(res.is_err());
+    // Multiple-value text is a normal calibre column (a value table plus a link table).
+    db.add_custom_column("multitcol", "Multi Col", "text", true).unwrap();
+    // `is_multiple` only means something for text and composite columns.
+    db.add_custom_column("multiint", "Multi Int", "int", true).unwrap();
+    let map = db.get_custom_column_label_map().unwrap();
+    assert_eq!(map["multitcol"]["is_multiple"], true);
+    assert_eq!(map["multiint"]["is_multiple"], false);
 }
