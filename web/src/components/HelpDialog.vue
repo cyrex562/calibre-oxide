@@ -32,6 +32,7 @@ const REQUIREMENT_NOTES: Record<LibraryAction["requires"], string> = {
   none: "",
   selection: "needs at least one book selected",
   "single-selection": "needs exactly one book selected",
+  "multi-selection": "needs two or more books selected",
 };
 
 /** The binding for an action, if it has one. */

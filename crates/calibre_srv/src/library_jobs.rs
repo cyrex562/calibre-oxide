@@ -60,6 +60,8 @@ pub enum JobKind {
     Scan,
     Enrich,
     HashBackfill,
+    /// Merge exact-content duplicate groups (a plan the user confirmed).
+    MergeExact,
 }
 
 impl JobKind {
@@ -68,6 +70,7 @@ impl JobKind {
             JobKind::Scan => "scan",
             JobKind::Enrich => "enrich",
             JobKind::HashBackfill => "hash_backfill",
+            JobKind::MergeExact => "merge_exact",
         }
     }
 }
@@ -165,6 +168,17 @@ pub enum Started {
 
 /// Starts `kind` over `cache`'s library on a blocking thread.
 pub fn start(cache: Arc<Cache>, kind: JobKind, workers: Option<usize>) -> Started {
+    start_with(cache, kind, workers, JobParams::default())
+}
+
+/// What a job needs beyond its kind. Only the merge uses any.
+#[derive(Default, Clone)]
+pub struct JobParams {
+    pub merge_plan: Vec<calibre_db::merge::PlannedGroup>,
+    pub keep_duplicate_formats: bool,
+}
+
+pub fn start_with(cache: Arc<Cache>, kind: JobKind, workers: Option<usize>, params: JobParams) -> Started {
     let library = cache.backend.library_path.to_string_lossy().to_string();
     let reg = registry();
     let mut jobs = reg.jobs.lock().unwrap();
@@ -200,7 +214,7 @@ pub fn start(cache: Arc<Cache>, kind: JobKind, workers: Option<usize>) -> Starte
     tokio::task::spawn_blocking(move || {
         // A panic in the pipeline must end the job, not leave it
         // "running" for ever.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&cache, kind, &options, &worker_job.control)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&cache, kind, &options, &worker_job.control, &params)));
         let (state, report, error) = match result {
             Ok(Ok(report)) => {
                 let state = if worker_job.control.is_cancelled() { JobState::Cancelled } else { JobState::Finished };
@@ -215,7 +229,7 @@ pub fn start(cache: Arc<Cache>, kind: JobKind, workers: Option<usize>) -> Starte
     Started::New(job)
 }
 
-fn run(cache: &Cache, kind: JobKind, options: &PipelineOptions, control: &JobControl) -> anyhow::Result<Value> {
+fn run(cache: &Cache, kind: JobKind, options: &PipelineOptions, control: &JobControl, params: &JobParams) -> anyhow::Result<Value> {
     match kind {
         JobKind::Scan => {
             let rescan = calibre_db::scan::rescan_files(cache, SystemTime::now(), options, control)?;
@@ -230,6 +244,7 @@ fn run(cache: &Cache, kind: JobKind, options: &PipelineOptions, control: &JobCon
         }
         JobKind::Enrich => Ok(serde_json::to_value(calibre_db::scan_pipeline::enrich_pending(cache, options, control)?)?),
         JobKind::HashBackfill => Ok(serde_json::to_value(calibre_db::scan_pipeline::backfill_hashes(cache, options, control)?)?),
+        JobKind::MergeExact => Ok(serde_json::to_value(calibre_db::merge::execute_content_merges(cache, &params.merge_plan, params.keep_duplicate_formats, control))?),
     }
 }
 

@@ -187,7 +187,7 @@ thread_local! {
 
 /// Sends one file to the system wastebasket. Never falls back to a
 /// permanent delete: if there is no wastebasket the file stays.
-fn trash_one(path: &Path) -> Result<(), String> {
+pub(crate) fn trash_one(path: &Path) -> Result<(), String> {
     #[cfg(test)]
     if FORCE_TRASH_FAILURE.with(|f| f.get()) {
         return Err("forced trash failure".to_string());
@@ -1463,7 +1463,7 @@ impl Cache {
     /// the library root and is never dedicated. Case-insensitive, so a
     /// case-folding filesystem cannot make two books share a folder
     /// unnoticed.
-    fn folder_is_dedicated(&self, book_id: i32, path_rel: &str) -> anyhow::Result<bool> {
+    pub(crate) fn folder_is_dedicated(&self, book_id: i32, path_rel: &str) -> anyhow::Result<bool> {
         if path_rel.is_empty() {
             return Ok(false);
         }

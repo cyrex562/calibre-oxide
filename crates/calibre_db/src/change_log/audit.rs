@@ -269,6 +269,33 @@ const CASES: &[Case] = &[
         std::fs::write(&incoming, b"PK epub stand-in").unwrap();
         c.add_format(f.first, &incoming, "epub", true).unwrap();
     }),
+    // Merge books: formats, every metadata rule, a cover, custom columns,
+    // and the deletion of the sources, all through the ordinary write
+    // paths -- so a rebuild from the log must reproduce the merged library.
+    case!("merge_books (merge and delete)", |c, f| {
+        let dir = tempfile::tempdir().unwrap();
+        let incoming = dir.path().join("second.epub");
+        std::fs::write(&incoming, b"PK second's epub").unwrap();
+        c.add_format(f.second, &incoming, "epub", true).unwrap();
+        c.set_field(f.second, "comments", "second's comment").unwrap();
+        c.set_field(f.second, "identifiers", "isbn:9780000000009").unwrap();
+        c.set_field(f.second, "languages", "eng").unwrap();
+        c.set_field(f.second, "rating", "7").unwrap();
+        c.set_field(f.second, "series", "Merged Series").unwrap();
+        c.set_custom_column_value(f.second, "shelf", "Second Shelf").unwrap();
+        c.set_custom_column_value(f.second, "genre", "Zebra, Quokka").unwrap();
+        c.set_custom_column_value(f.second, "mood", "Sad").unwrap();
+        c.set_custom_column_value(f.second, "pages", "99").unwrap();
+        crate::covers::set_cover(c, f.second, b"\xFF\xD8\xFF\xE0 second's cover").unwrap();
+        crate::merge::merge_books(c, f.first, &[f.second], &crate::merge::MergeOptions::default()).unwrap();
+    }),
+    case!("merge_books (keep sources, dry run changes nothing)", |c, f| {
+        let dry = crate::merge::MergeOptions { dry_run: true, ..Default::default() };
+        crate::merge::merge_books(c, f.first, &[f.second], &dry).unwrap();
+        let keep = crate::merge::MergeOptions { mode: crate::merge::MergeMode::MergeKeepSources, ..Default::default() };
+        c.set_field(f.second, "comments", "to be copied").unwrap();
+        crate::merge::merge_books(c, f.first, &[f.second], &keep).unwrap();
+    }),
     // A batch registered in one transaction and one run of change-log
     // entries, as the scan does it: several books, one of them with a
     // second author, one with a cover, all of which must be in the log.
