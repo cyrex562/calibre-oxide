@@ -24,7 +24,7 @@
 //!   plugin-driven pre-import format conversion -- no plugin system
 //!   in this crate; the uploaded bytes are used as-is).
 //! - `POST /cdb/delete-books/{book_ids}` -- `removal::delete_with_file`
-//!   per id: the book's own files go to the wastebasket, never its folder.
+//!   per id: the book's own files go to the library trash (.caltrash), never its folder.
 //! - `POST /cdb/set-cover/{book_id}` -- raw image bytes in the request
 //!   body, sniffed for a real JPEG/PNG magic number (matching
 //!   upstream's own `imghdr.what` check in `set-fields`; `set-cover`
@@ -167,10 +167,11 @@ async fn delete_books_handle(state: AppState, book_ids: String, library_id: Opti
         ids.push(id);
     }
 
-    // Files go to the wastebasket (calibre's own semantics for "delete"),
-    // and only the files each book owns: never a whole folder, since books
-    // found in one folder share a `path`. A file that could not be
-    // trashed is left in place and reported, not hard-deleted.
+    // Files go to the library's own trash, `.caltrash` (calibre's semantics
+    // for "delete": recoverable, and it exists on a network share, which has
+    // no recycle bin), and only the files each book owns: never a whole
+    // folder, since books found in one folder share a `path`. A file that
+    // could not be moved is left in place and reported, not hard-deleted.
     let failed = tokio::task::spawn_blocking({
         let cache = cache.clone();
         let ids = ids.clone();
@@ -761,7 +762,7 @@ fn run_show_metadata(cache: &calibre_db::cache::Cache, args: &[Value]) -> anyhow
 /// Port of `cmd_remove.implementation`: `args[0]` is a list of book
 /// ids, `args[1]` is `permanent` -- accepted for request-shape
 /// compatibility but has no effect: like the [`delete_books`] handler,
-/// the book's own files always go to the wastebasket, never a permanent
+/// the book's own files always go to the library trash, never a permanent
 /// delete.
 fn run_remove(cache: &calibre_db::cache::Cache, args: &[Value]) -> anyhow::Result<Value> {
     let ids: Vec<i32> = args

@@ -169,6 +169,9 @@ pub struct JobControl {
     /// Files opened for hashing. Equal to `hashed` unless something read
     /// a file twice.
     pub file_opens: AtomicU64,
+    /// When non-zero, the walk stops once it has seen this many files:
+    /// a bounded look, for "how many untracked files are there, roughly".
+    pub stop_after_seen: AtomicU64,
 }
 
 /// A point-in-time copy of a [`JobControl`], for the status route.
@@ -199,6 +202,13 @@ impl JobControl {
 
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed)
+    }
+
+    /// Whether a bounded walk ([`JobControl::stop_after_seen`]) has seen
+    /// as many files as it was allowed.
+    pub fn walk_limit_reached(&self) -> bool {
+        let limit = self.stop_after_seen.load(Ordering::Relaxed);
+        limit > 0 && self.seen.load(Ordering::Relaxed) >= limit
     }
 
     pub fn set_phase(&self, phase: &str) {

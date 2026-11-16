@@ -15,8 +15,12 @@
 //! Not "when a library is opened", which an earlier version of this
 //! comment claimed and the code never did: opening a folder creates the
 //! database and does not look at the files in it. The callers are Check
-//! Library's "add the untracked files" action, and the desktop app's
-//! watcher when the folder it watches is inside the library.
+//! Library's "add the untracked files" action, the desktop app's watcher
+//! when the folder it watches is inside the library, and the prompt shown
+//! when a library is opened over a folder with untracked book files: the app
+//! asks `GET /library-untracked/{library_id}` (a count, no scan) and offers
+//! to run this -- it never starts it by itself, since on a share it takes
+//! long.
 //!
 //! # A job, not a request
 //!
@@ -43,6 +47,29 @@ use crate::AppState;
 pub async fn scan(State(state): State<AppState>, Path(library_id): Path<String>, Query(query): Query<StartQuery>) -> Result<Response, ServerError> {
     let cache = state.cache_for(Some(&library_id)).ok_or_else(|| ServerError::NotFound(format!("no library named {library_id:?}")))?;
     Ok(respond(cache, JobKind::Scan, &query).await)
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct UntrackedQuery {
+    /// Stop counting at this many. The default is enough to say "lots".
+    pub max: Option<usize>,
+}
+
+/// `GET /library-untracked/{library_id}` -- how many book files in the
+/// library folder nothing tracks yet, **without scanning**: one walk, no
+/// reads, stopping at `max` (default 10,000; `at_least` then says so).
+///
+/// This is the question behind "This folder has N untracked book files --
+/// scan now?". Opening a folder does not scan it, and on a share a scan takes
+/// long, so the app asks first; this is what it asks with.
+pub async fn untracked(State(state): State<AppState>, Path(library_id): Path<String>, Query(query): Query<UntrackedQuery>) -> Result<axum::Json<serde_json::Value>, ServerError> {
+    let cache = state.cache_for(Some(&library_id)).ok_or_else(|| ServerError::NotFound(format!("no library named {library_id:?}")))?;
+    let cap = query.max.unwrap_or(10_000).clamp(1, 1_000_000);
+    let count = tokio::task::spawn_blocking(move || calibre_db::scan::count_untracked(&cache, std::time::SystemTime::now(), cap))
+        .await
+        .map_err(|e| ServerError::InternalServerError(e.to_string()))?
+        .map_err(|e| ServerError::InternalServerError(format!("{e:#}")))?;
+    Ok(axum::Json(serde_json::to_value(count).unwrap_or_default()))
 }
 
 #[cfg(test)]
@@ -109,6 +136,40 @@ mod tests {
     fn make_settled(path: &std::path::Path) {
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
         filetime::set_file_mtime(path, filetime::FileTime::from_system_time(old)).unwrap();
+    }
+
+    /// The prompt behind "This folder has N untracked book files -- scan
+    /// now?": the count comes from a walk, and nothing is added by asking.
+    #[tokio::test]
+    async fn the_untracked_count_is_reported_without_scanning() {
+        let (dir, router) = test_app();
+        let (status, body) = get_json(&router, "/library-untracked/default").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["untracked"], 0);
+
+        std::fs::create_dir_all(dir.path().join("Shelf")).unwrap();
+        for name in ["a.pdf", "b.epub", "Shelf/c.pdf"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"%PDF x").unwrap();
+            make_settled(&path);
+        }
+        let (_, body) = get_json(&router, "/library-untracked/-").await;
+        assert_eq!(body["untracked"], 3, "{body}");
+        assert_eq!(body["tracked"], 0);
+        assert_eq!(body["at_least"], false);
+        assert_eq!(body["conclusive"], true);
+
+        let (_, capped) = get_json(&router, "/library-untracked/-?max=2").await;
+        assert_eq!(capped["at_least"], true, "{capped}");
+
+        // Asking added nothing; scanning does, and then there is nothing left.
+        let (_, ajax) = get_json(&router, "/ajax/book/1").await;
+        assert!(ajax.is_null() || ajax.get("title").is_none(), "counting must not create books: {ajax}");
+        let (_, scanned) = post_json(&router, "/scan-library/default?wait=true").await;
+        assert_eq!(scanned["added"].as_array().unwrap().len(), 3);
+        let (_, after) = get_json(&router, "/library-untracked/-").await;
+        assert_eq!(after["untracked"], 0);
+        assert_eq!(after["tracked"], 3);
     }
 
     #[tokio::test]
