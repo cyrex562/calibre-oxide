@@ -45,7 +45,9 @@ export type ActionRequirement =
   /** At least one book selected. */
   | "selection"
   /** Exactly one book selected. */
-  | "single-selection";
+  | "single-selection"
+  /** Two or more books selected (merging needs something to merge). */
+  | "multi-selection";
 
 export interface LibraryAction {
   id: LibraryActionId;
@@ -127,6 +129,7 @@ export type LibraryActionId =
   | "focus-search"
   | "toggle-view"
   | "bulk-edit"
+  | "merge-books"
   | "save-to-disk"
   | "embed-metadata"
   | "copy-to-library"
@@ -195,6 +198,9 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   { id: "focus-search", label: "Search", group: "view", requires: "none", toolbar: false, icon: "search", accel: "Ctrl+F" },
   { id: "toggle-view", label: "Switch table/grid", group: "view", requires: "none", toolbar: false, icon: "grid" },
   { id: "bulk-edit", label: "Bulk edit", group: "selection", requires: "selection", icon: "merge_books", accel: "Ctrl+Shift+E", tooltip: "Change a field across every selected book" },
+  // Calibre's "Merge book records": the first selected book is the default
+  // destination. Needs two books, so it is not offered with one selected.
+  { id: "merge-books", label: "Merge books…", group: "selection", requires: "multi-selection", contextMenu: true, icon: "merge_books", tooltip: "Merge the selected books into one record" },
   { id: "save-to-disk", label: "Save to disk", group: "selection", requires: "selection", icon: "save", accel: "Ctrl+S", tooltip: "Write book files to a folder" },
   { id: "rename-files", label: "Rename files…", group: "selection", requires: "selection", contextMenu: true, icon: "template_funcs", tooltip: "Rename the files on disk, without changing the title" },
   // The counterpart to "Rename files": that changes the name on disk,
@@ -259,6 +265,8 @@ export function actionEnabled(action: LibraryAction, ctx: ActionContext): boolea
       return ctx.selectionCount >= 1;
     case "single-selection":
       return ctx.selectionCount === 1;
+    case "multi-selection":
+      return ctx.selectionCount >= 2;
   }
 }
 

@@ -94,6 +94,13 @@ describe("enablement", () => {
     expect(actionEnabled(action("convert"), { ...BROWSER, selectionCount: 2 })).toBe(false);
   });
 
+  it("requires two or more books for merge", () => {
+    expect(actionEnabled(action("merge-books"), { ...BROWSER, selectionCount: 0 })).toBe(false);
+    expect(actionEnabled(action("merge-books"), { ...BROWSER, selectionCount: 1 })).toBe(false);
+    expect(actionEnabled(action("merge-books"), { ...BROWSER, selectionCount: 2 })).toBe(true);
+    expect(actionEnabled(action("merge-books"), { ...BROWSER, selectionCount: 9 })).toBe(true);
+  });
+
   it("lets delete act on a whole selection", () => {
     // Deleting is deliberately `selection`, not `single-selection`:
     // removing several books at once is a normal thing to want.
@@ -289,7 +296,7 @@ describe("TOOLBAR_LAYOUT", () => {
       if (action.group === "book" || action.requires !== "none") {
         // Book actions are allowed a slot -- they are the point of a
         // library -- but they must be reachable with one selected.
-        expect(["single-selection", "selection"]).toContain(action.requires);
+        expect(["single-selection", "selection", "multi-selection"]).toContain(action.requires);
       }
     }
   });

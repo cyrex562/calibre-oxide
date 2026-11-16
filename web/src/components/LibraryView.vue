@@ -20,6 +20,9 @@ import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LI
   fetchIgnored,
   unignoreFile, copyToLibrary, describeCopyOutcome, deleteBooks, embedMetadata, summarizeEmbed, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchLibraryInfo, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameFiles, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
 import type { CheckLibraryFinding, CheckLibraryResult, CustomRecipeOptions, DuplicateGroup, IgnoredFile, NewsFeedInput, NewsSchedule, Orphan, SaveToDiskResult } from "../library/api";
+import { mergeBooks, planBulkMerge, runBulkMerge } from "../library/api";
+import type { BulkMergePlan, DuplicateBook, MergeMode, MergeResponse } from "../library/api";
+import { DEFAULT_DESTINATION_HINT, MERGE_MODE_LABELS, MERGE_MODE_NOTES, defaultMergeDestination, describeMergeResult, describeRecord, summarizeMerge } from "../library/merge";
 import { parseSnippetSegments } from "../library/snippets";
 import { similarBooksQuery } from "../library/query";
 import { pathFromLibraryId, recentLibraryEntries } from "../library/recentLibraries";
@@ -1520,6 +1523,148 @@ async function deleteDuplicateBook(bookId: number) {
   await runSearch();
 }
 
+// ---------------------------------------------------------------
+// Merge books: from a duplicate group ("Merge into…") or from a
+// selection of two or more books (the "merge-books" action).
+// The engine is crates/calibre_db/src/merge.rs; this is the review
+// step. Nothing changes until the user has seen a dry run and
+// confirms it.
+// ---------------------------------------------------------------
+const mergeOpen = ref(false);
+const mergeBooksList = ref<DuplicateBook[]>([]);
+const mergeDest = ref<number | null>(null);
+const mergeMode = ref<MergeMode>("merge_and_delete");
+const mergeKeepDuplicates = ref(false);
+const mergePreview = ref<MergeResponse | null>(null);
+const mergeBusy = ref(false);
+const mergeError = ref<string | null>(null);
+const mergeDone = ref<string | null>(null);
+const mergeModes = Object.keys(MERGE_MODE_LABELS) as MergeMode[];
+const mergePreviewLines = computed(() => (mergePreview.value ? summarizeMerge(mergePreview.value) : []));
+
+function openMerge(books: DuplicateBook[], dest: number | null) {
+  mergeBooksList.value = books;
+  mergeDest.value = dest;
+  mergeMode.value = "merge_and_delete";
+  mergeKeepDuplicates.value = false;
+  mergePreview.value = null;
+  mergeError.value = null;
+  mergeDone.value = null;
+  mergeOpen.value = true;
+}
+
+function openMergeForGroup(group: DuplicateGroup) {
+  openMerge(group.books, group.suggested_dest ?? defaultMergeDestination(group.books));
+}
+
+// calibre's rule: the first selected book is the destination.
+async function openMergeForSelection() {
+  const ids = [...selectedIds.value];
+  if (ids.length < 2) return;
+  const books = await fetchBooks(ids);
+  openMerge(
+    books.map((b) => ({ book_id: b.id, title: b.title, authors: b.authors, formats: b.formats.length })),
+    ids[0],
+  );
+}
+
+// Any change to what will be merged invalidates the preview the user saw.
+watch([mergeDest, mergeMode, mergeKeepDuplicates], () => {
+  mergePreview.value = null;
+});
+
+async function reviewMerge() {
+  if (mergeDest.value === null) return;
+  mergeBusy.value = true;
+  mergeError.value = null;
+  try {
+    mergePreview.value = await mergeBooks({ dest: mergeDest.value, sources: mergeBooksList.value.map((b) => b.book_id).filter((id) => id !== mergeDest.value), mode: mergeMode.value, keep_duplicate_formats: mergeKeepDuplicates.value, dry_run: true });
+  } catch (e) {
+    mergeError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    mergeBusy.value = false;
+  }
+}
+
+async function confirmMerge() {
+  if (mergeDest.value === null || !mergePreview.value) return;
+  mergeBusy.value = true;
+  mergeError.value = null;
+  try {
+    const result = await mergeBooks({ dest: mergeDest.value, sources: mergeBooksList.value.map((b) => b.book_id).filter((id) => id !== mergeDest.value), mode: mergeMode.value, keep_duplicate_formats: mergeKeepDuplicates.value });
+    mergeDone.value = describeMergeResult(result);
+    mergePreview.value = null;
+    mergeOpen.value = false;
+    selectedIds.value = new Set();
+    cacheBust.value++;
+    await runSearch();
+    // Refresh the groups so the merged ones disappear.
+    if (duplicatesOpen.value) await openDuplicates();
+  } catch (e) {
+    mergeError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    mergeBusy.value = false;
+  }
+}
+
+// Bulk: every exact-content group, merged into its best record. Dry run
+// first; the plan's fingerprint is what the user confirms.
+const bulkPlan = ref<BulkMergePlan | null>(null);
+const dupBulkBusy = ref(false);
+const bulkProgress = ref<string | null>(null);
+const bulkJobId = ref<number | null>(null);
+const bulkKeepDuplicates = ref(false);
+const dupBulkSummary = ref<string | null>(null);
+
+async function planBulk() {
+  dupBulkBusy.value = true;
+  dupBulkSummary.value = null;
+  duplicatesError.value = null;
+  try {
+    bulkPlan.value = await planBulkMerge();
+  } catch (e) {
+    duplicatesError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    dupBulkBusy.value = false;
+  }
+}
+
+async function executeBulk() {
+  const plan = bulkPlan.value;
+  if (!plan) return;
+  dupBulkBusy.value = true;
+  dupBulkSummary.value = null;
+  try {
+    const report = await runBulkMerge(plan.plan_fingerprint, bulkKeepDuplicates.value, {
+      onStart: (id) => (bulkJobId.value = id),
+      onProgress: (job) => (bulkProgress.value = `Merging… ${job.progress.seen.toLocaleString("en-US")} of ${job.progress.total.toLocaleString("en-US")} groups`),
+    });
+    const parts = [`${report.groups_merged.toLocaleString("en-US")} of ${report.groups_planned.toLocaleString("en-US")} groups merged (${report.books_merged.toLocaleString("en-US")} books), ${report.trashed.length.toLocaleString("en-US")} files sent to the wastebasket`];
+    if (report.cancelled) parts.push("stopped early — run it again to continue");
+    if (report.errors.length) parts.push(`${report.errors.length} group(s) had problems and were left as they were: ${report.errors.slice(0, 3).map(([id, why]) => `book ${id}: ${why}`).join("; ")}`);
+    dupBulkSummary.value = parts.join(" · ");
+    bulkPlan.value = null;
+    cacheBust.value++;
+    await runSearch();
+    await openDuplicates();
+  } catch (e) {
+    duplicatesError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    dupBulkBusy.value = false;
+    bulkProgress.value = null;
+    bulkJobId.value = null;
+  }
+}
+
+async function cancelBulk() {
+  if (bulkJobId.value === null) return;
+  try {
+    await cancelLibraryJob(bulkJobId.value);
+  } catch (e) {
+    duplicatesError.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
 const addSummary = ref<string | null>(null);
 
 async function addOneBookFile(file: File, addDuplicates: boolean): Promise<"added" | "skipped"> {
@@ -1781,6 +1926,7 @@ const actionHandlers: Partial<Record<LibraryActionId, () => void>> = {
   "bulk-edit": () => {
     bulkOpen.value = true;
   },
+  "merge-books": () => void openMergeForSelection(),
   "save-to-disk": () => openSaveToDisk(),
   "rename-files": () => void openRenameFiles(),
   "embed-metadata": () => openEmbedMetadata(),
@@ -1812,6 +1958,7 @@ const HIDDEN_IN_FTS_MODE: ReadonlySet<LibraryActionId> = new Set<LibraryActionId
   "fetch-news",
   "select-mode",
   "bulk-edit",
+  "merge-books",
   "save-to-disk",
 ]);
 
@@ -2173,7 +2320,7 @@ function onLibraryKeydown(event: KeyboardEvent) {
   // A modal owns the keyboard while it is open -- firing library
   // shortcuts underneath one would act on a view the user cannot
   // currently see.
-  if (contextMenu.value || manageOpen.value || columnsOpen.value || columnPickerOpen.value || checkLibraryOpen.value || duplicatesOpen.value || saveToDiskOpen.value || renameOpen.value || embedOpen.value || copyOpen.value || newsOpen.value || switchOpen.value) return;
+  if (contextMenu.value || manageOpen.value || columnsOpen.value || columnPickerOpen.value || checkLibraryOpen.value || duplicatesOpen.value || mergeOpen.value || saveToDiskOpen.value || renameOpen.value || embedOpen.value || copyOpen.value || newsOpen.value || switchOpen.value) return;
 
   const id = shortcutFor(event, libraryShortcuts(keymap.value));
   if (!id) return;
@@ -2977,6 +3124,38 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
           <p v-if="duplicatesLoading">Scanning…</p>
           <p v-else-if="duplicatesError" class="error">{{ duplicatesError }}</p>
           <template v-else>
+            <!--
+              Bulk merge is for identical files only: those are the same
+              book, so the choice of which record survives can be made
+              by rule. Title/author matches are never merged in bulk.
+            -->
+            <div v-if="duplicateGroups.some((g) => g.reason === 'content')" class="bulk-merge">
+              <button v-if="!bulkPlan" type="button" :disabled="dupBulkBusy" @click="planBulk">
+                {{ dupBulkBusy ? "Working…" : "Merge all identical-file groups…" }}
+              </button>
+              <div v-else class="bulk-plan" role="group" aria-label="Bulk merge plan">
+                <p>
+                  <strong>{{ bulkPlan.group_count.toLocaleString("en-US") }} groups</strong> of identical files: each is merged into its best record
+                  (most formats, then most metadata, then a cover), {{ bulkPlan.books_to_merge.toLocaleString("en-US") }} other books are removed, and their
+                  leftover files go to the wastebasket. Nothing has been changed yet.
+                </p>
+                <ul class="manage-list">
+                  <li v-for="g in bulkPlan.groups.slice(0, 5)" :key="g.dest">
+                    Keep “{{ g.books.find((b) => b.book_id === g.dest)?.title }}” ← {{ g.sources.length }} other{{ g.sources.length === 1 ? "" : "s" }}
+                  </li>
+                  <li v-if="bulkPlan.groups.length > 5" class="news-hint">…and {{ (bulkPlan.groups.length - 5).toLocaleString("en-US") }} more groups</li>
+                </ul>
+                <label><input v-model="bulkKeepDuplicates" type="checkbox" :disabled="dupBulkBusy" /> Keep a differing copy of a format as a data file instead of discarding it</label>
+                <div class="plugin-actions">
+                  <button type="button" :disabled="dupBulkBusy" @click="executeBulk">{{ dupBulkBusy ? "Merging…" : `Merge ${bulkPlan.group_count.toLocaleString("en-US")} groups` }}</button>
+                  <button v-if="dupBulkBusy" type="button" @click="cancelBulk">Cancel</button>
+                  <button v-else type="button" @click="bulkPlan = null">Back</button>
+                </div>
+                <p v-if="bulkProgress" class="news-hint" role="status">{{ bulkProgress }}</p>
+              </div>
+              <p v-if="dupBulkSummary" class="news-hint" role="status">{{ dupBulkSummary }}</p>
+            </div>
+            <p v-if="mergeDone" class="news-hint" role="status">{{ mergeDone }}</p>
             <p v-if="duplicateGroups.length === 0" class="news-hint">No likely duplicates found.</p>
             <div v-for="(group, i) in duplicateGroups" :key="i">
               <!--
@@ -2987,6 +3166,7 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
               <h4>
                 Group {{ i + 1 }} ({{ group.books.length }} books) —
                 {{ group.reason === "content" ? "identical files" : "same title and author" }}
+                <button type="button" :title="DEFAULT_DESTINATION_HINT" @click="openMergeForGroup(group)">Merge into…</button>
               </h4>
               <ul class="manage-list">
                 <li v-for="b in group.books" :key="b.book_id">
@@ -2997,6 +3177,49 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
             </div>
           </template>
         </section>
+      </div>
+    </div>
+
+    <div v-if="mergeOpen" class="manage-backdrop" @click.self="mergeOpen = false">
+      <div class="manage-panel" role="dialog" aria-label="Merge books">
+        <button class="manage-close" @click="mergeOpen = false">✕</button>
+        <h3>Merge books ({{ mergeBooksList.length }})</h3>
+        <p class="news-hint">
+          Choose the record to keep. The others' formats and any metadata the destination lacks are merged into it.
+          <span :title="DEFAULT_DESTINATION_HINT">(Why is one pre-selected?)</span>
+        </p>
+        <ul class="manage-list">
+          <li v-for="b in mergeBooksList" :key="b.book_id">
+            <label>
+              <input v-model="mergeDest" type="radio" name="merge-dest" :value="b.book_id" :disabled="mergeBusy" />
+              {{ b.title }} — {{ b.authors.join(", ") }}
+              <small v-if="describeRecord(b)" class="news-hint">({{ describeRecord(b) }})</small>
+            </label>
+          </li>
+        </ul>
+        <label>
+          Mode
+          <select v-model="mergeMode" :disabled="mergeBusy">
+            <option v-for="m in mergeModes" :key="m" :value="m">{{ MERGE_MODE_LABELS[m] }}</option>
+          </select>
+        </label>
+        <p class="news-hint">{{ MERGE_MODE_NOTES[mergeMode] }}</p>
+        <label v-if="mergeMode !== 'merge_keep_sources'">
+          <input v-model="mergeKeepDuplicates" type="checkbox" :disabled="mergeBusy" />
+          Keep a differing copy of a format the destination already has, as a data file
+        </label>
+        <p v-if="mergeError" class="error">{{ mergeError }}</p>
+        <div v-if="mergePreview" role="group" aria-label="What will happen">
+          <h4>This will:</h4>
+          <ul>
+            <li v-for="(line, i) in mergePreviewLines" :key="i">{{ line }}</li>
+          </ul>
+        </div>
+        <div class="plugin-actions">
+          <button v-if="!mergePreview" type="button" :disabled="mergeBusy || mergeDest === null" @click="reviewMerge">Review…</button>
+          <button v-else type="button" :disabled="mergeBusy || !mergePreview.ok" @click="confirmMerge">{{ mergeBusy ? "Merging…" : "Merge" }}</button>
+          <button type="button" @click="mergeOpen = false">Cancel</button>
+        </div>
       </div>
     </div>
 

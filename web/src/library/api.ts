@@ -614,7 +614,7 @@ export interface LibraryJobProgress {
 
 export interface LibraryJob<R = unknown> {
   id: number;
-  kind: "scan" | "enrich" | "hash_backfill";
+  kind: "scan" | "enrich" | "hash_backfill" | "merge_exact";
   state: "running" | "finished" | "cancelled" | "failed";
   progress: LibraryJobProgress;
   /** Present once the job has ended. */
@@ -648,8 +648,9 @@ export function cancelLibraryJob(jobId: number): Promise<LibraryJob> {
  * the status route and resolves with the job's final report. A cancelled
  * job resolves (its report says `cancelled`); a failed one rejects.
  */
-async function runLibraryJob<R>(startUrl: string, handlers: LibraryJobHandlers<R>): Promise<R> {
-  const started = await jsonFetch<{ job_id: number }>(startUrl, { method: "POST" });
+async function runLibraryJob<R>(startUrl: string, handlers: LibraryJobHandlers<R>, body?: unknown): Promise<R> {
+  const init: RequestInit = body === undefined ? { method: "POST" } : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
+  const started = await jsonFetch<{ job_id: number }>(startUrl, init);
   handlers.onStart?.(started.job_id);
   for (;;) {
     const job = await fetchLibraryJob<R>(started.job_id);
@@ -804,6 +805,11 @@ export interface DuplicateBook {
   book_id: number;
   title: string;
   authors: string[];
+  /** How many formats the book has. */
+  formats?: number;
+  /** How many of authors, series, publisher, tags, comments, rating, identifiers, languages are filled in. */
+  metadata?: number;
+  has_cover?: boolean;
 }
 
 /**
@@ -818,10 +824,106 @@ export type DuplicateReason = "content" | "metadata";
 export interface DuplicateGroup {
   books: DuplicateBook[];
   reason: DuplicateReason;
+  /** The record the server would merge the others into; see `defaultMergeDestination`. */
+  suggested_dest?: number | null;
 }
 
 export function scanForDuplicates(): Promise<{ groups: DuplicateGroup[] }> {
   return jsonFetch<{ groups: DuplicateGroup[] }>("/duplicates/scan/default", { method: "POST" });
+}
+
+// ---- Merge books (crates/calibre_srv/src/merge_books.rs) ----
+
+export type MergeMode = "merge_and_delete" | "merge_keep_sources" | "formats_only";
+
+export interface MergeRequest {
+  dest: number;
+  sources: number[];
+  mode?: MergeMode;
+  keep_duplicate_formats?: boolean;
+  dry_run?: boolean;
+}
+
+/** What happened (or, for a dry run, would happen) to one source book. */
+export interface MergeSourceResult {
+  book_id: number;
+  title: string;
+  formats_moved: string[];
+  formats_identical: string[];
+  formats_discarded: string[];
+  formats_kept_as_data_file: [string, string][];
+  formats_left_on_source: string[];
+  data_files_moved: string[];
+  deleted: boolean;
+  trashed: string[];
+  failed: [string, string][];
+  error: string | null;
+  warnings: string[];
+}
+
+export interface MergeResponse {
+  ok: boolean;
+  dry_run: boolean;
+  dest: number;
+  mode: MergeMode;
+  results: MergeSourceResult[];
+  metadata_changed: string[];
+  cover_from: number | null;
+  /** Everything sent to the wastebasket. */
+  trashed: string[];
+  failed: { book_id: number; path: string; error: string }[];
+  errors: { book_id: number; error: string }[];
+  warnings: string[];
+}
+
+/** Merges `sources` into `dest`. With `dry_run` nothing is changed. */
+export function mergeBooks(req: MergeRequest): Promise<MergeResponse> {
+  return jsonFetch<MergeResponse>("/cdb/merge-books/default", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
+}
+
+export interface BulkMergePlanBook extends DuplicateBook {
+  formats: number;
+  metadata: number;
+  has_cover: boolean;
+}
+
+export interface BulkMergePlan {
+  dry_run: true;
+  groups: { dest: number; sources: number[]; books: BulkMergePlanBook[] }[];
+  group_count: number;
+  books_to_merge: number;
+  /** Echo this back to execute exactly this plan. */
+  plan_fingerprint: string;
+}
+
+export interface BulkMergeReport {
+  groups_planned: number;
+  groups_merged: number;
+  books_merged: number;
+  trashed: string[];
+  errors: [number, string][];
+  cancelled: boolean;
+}
+
+/** The dry run: what merging every exact-content group would do. Changes nothing. */
+export function planBulkMerge(): Promise<BulkMergePlan> {
+  return jsonFetch<BulkMergePlan>("/duplicates/merge-exact/default", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ dry_run: true }),
+  });
+}
+
+/**
+ * Executes the plan the user confirmed, as a cancellable job. The server
+ * refuses (409) if the library has changed since `planFingerprint`.
+ */
+export function runBulkMerge(planFingerprint: string, keepDuplicateFormats: boolean, handlers: LibraryJobHandlers<BulkMergeReport> = {}): Promise<BulkMergeReport> {
+  return runLibraryJob<BulkMergeReport>("/duplicates/merge-exact/default", handlers, { dry_run: false, plan_fingerprint: planFingerprint, keep_duplicate_formats: keepDuplicateFormats });
 }
 
 // Real, new routes -- see crates/calibre_srv/src/news_scheduler.rs's
