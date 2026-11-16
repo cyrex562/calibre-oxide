@@ -57,6 +57,18 @@ pub fn replay_into(cache: &Cache, log: &ChangeLog) -> Result<ReplayReport> {
             report.skipped_unknown_book += 1;
         }
     }
+
+    // A removal that keeps its file ignores it, and a book that was trashed
+    // and later restored has the same path again. Replay sees the removal
+    // before the restore, so it ignores a file the rebuilt library then
+    // tracks. An indexed file is never ignored: drop those entries.
+    if let Ok(ignored) = cache.ignored().list() {
+        for entry in ignored {
+            if cache.book_for_file(&entry.path).ok().flatten().is_some() {
+                let _ = cache.ignored().unignore(&entry.path);
+            }
+        }
+    }
     Ok(report)
 }
 

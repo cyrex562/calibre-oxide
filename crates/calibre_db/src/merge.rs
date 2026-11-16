@@ -70,8 +70,9 @@
 //!    and that source is marked failed.
 //! 3. Metadata, then data files (copied, verified).
 //! 4. Only now, per source that passed every check: the source is deleted
-//!    through [`crate::removal::delete_with_file`] (wastebasket, never a
-//!    recursive directory delete, and a file the destination now claims --
+//!    through [`crate::removal::delete_with_file`] (into the library's own
+//!    `.caltrash` -- also on a network share --, never a recursive directory
+//!    delete, and a file the destination now claims --
 //!    the same file in a shared folder -- is kept).
 //!
 //! So at every instant the destination holds a superset of what it had, and a
@@ -360,13 +361,12 @@ pub fn merge_books(cache: &Cache, dest_id: i32, src_ids: &[i32], opts: &MergeOpt
 /// file) and the error says so.
 fn copy_format_verified(cache: &Cache, dest_id: i32, src_path: &Path, fmt: &str) -> Result<PathBuf> {
     let want = digest(src_path)?;
-    // `replace = true` because the caller has already established the
-    // destination has no row for `fmt`, and `add_format(.., false)` also
-    // refuses a source that already sits where it would land -- exactly the
-    // in-place sibling case, where the file is simply claimed, not copied.
-    // It cannot overwrite anything: `free_format_stem` never picks a name
-    // another file occupies.
-    if !cache.add_format(dest_id, src_path, fmt, true)? {
+    // `replace = false`: the caller has established the destination has no
+    // row for `fmt`, and a source that already sits where it would land (the
+    // in-place sibling case) is simply claimed, not copied. It cannot
+    // overwrite anything: `free_format_stem` never picks a name another file
+    // occupies.
+    if !cache.add_format(dest_id, src_path, fmt, false)? {
         bail!("the destination already has a {fmt} format");
     }
     let landed = cache
@@ -382,7 +382,7 @@ fn copy_format_verified(cache: &Cache, dest_id: i32, src_path: &Path, fmt: &str)
     let got = digest(&landed).and_then(|d| if d.hash == want.hash && d.size == want.size { Ok(()) } else { bail!("size or content differs") });
     if let Err(e) = got {
         if !calibre_utils::filenames::samefile(&landed, src_path) {
-            let _ = cache.remove_format(dest_id, fmt);
+            let _ = cache.remove_format_permanently(dest_id, fmt);
         }
         bail!("the copy of {fmt} in the destination could not be verified ({e:#}); it was removed and the source left alone");
     }

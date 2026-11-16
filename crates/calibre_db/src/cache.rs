@@ -133,7 +133,10 @@ pub struct FormatFileInfo {
 /// What [`Cache::delete_book_with`] does with the book's files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BookFiles {
-    /// Send the book's own files to the system wastebasket.
+    /// Move the book's own files into the library's `.caltrash`, from where
+    /// they can be listed and restored ([`crate::trash`]). Calibre's own
+    /// behaviour; and unlike the system wastebasket it works on a network
+    /// share, which has none.
     Trash,
     /// Touch no file; record the format files in the ignore list.
     Keep,
@@ -143,7 +146,7 @@ pub enum BookFiles {
 /// root and `/`-separated.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BookDeletion {
-    /// Files sent to the wastebasket.
+    /// Files moved into the library's `.caltrash`.
     pub trashed: Vec<String>,
     /// Format files left on disk and put on the ignore list.
     pub ignored: Vec<String>,
@@ -154,15 +157,15 @@ pub struct BookDeletion {
     pub folder_removed: Option<String>,
 }
 
-struct OwnFile {
-    rel: String,
-    hash: Option<String>,
-    is_format: bool,
+pub(crate) struct OwnFile {
+    pub(crate) rel: String,
+    pub(crate) hash: Option<String>,
+    pub(crate) is_format: bool,
 }
 
 /// True for a relative path made only of ordinary components: no `..`,
 /// no root or drive, no `.`, and nothing inside `.calibre-oxide`.
-fn path_is_plain(rel: &str) -> bool {
+pub(crate) fn path_is_plain(rel: &str) -> bool {
     use std::path::Component;
     let p = Path::new(rel);
     let mut first = true;
@@ -1147,10 +1150,6 @@ impl Cache {
         let stem = self.free_format_stem(book_id, &format, &book_dir, &preferred, &ext, source_path)?;
         let file_name = format!("{stem}.{ext}");
         let dest_path = book_dir.join(&file_name);
-        if dest_path.exists() && !replace {
-            return Ok(false);
-        }
-
         // The source may already *be* the destination, now that a book's
         // folder can be the library root: adding `<library>/dune.pdf`
         // computes a destination of exactly that path. Copying a file
@@ -1160,6 +1159,15 @@ impl Cache {
         // text, which sees through a symlink or a differently-spelled but
         // equal path.
         let already_in_place = calibre_utils::filenames::samefile(source_path, &dest_path);
+
+        // A file already at the destination refuses `replace = false` --
+        // except when it is the source itself. Then nothing is overwritten
+        // (the format row was checked above): the file is just being
+        // claimed. This used to refuse that too, which is why `merge`
+        // passes `replace = true` for the in-place sibling case.
+        if dest_path.exists() && !replace && !already_in_place {
+            return Ok(false);
+        }
 
         // Port of issue #93's crate-wide write-path retrofit: real,
         // journaled, crash-safe, large-file-safe copy-in through
@@ -1291,7 +1299,20 @@ impl Cache {
     /// easily be the *other* book's -- removing one format would then
     /// delete a different book entirely. `data.name` says which file
     /// is ours; nothing else does.
+    ///
+    /// The file goes to the library's trash (`.caltrash/f/<book id>`) and can
+    /// be restored, as calibre does; [`Cache::remove_format_permanently`] is
+    /// for a file that should not be kept.
     pub fn remove_format(&self, book_id: i32, fmt: &str) -> anyhow::Result<()> {
+        self.remove_format_inner(book_id, fmt, false)
+    }
+
+    /// [`Cache::remove_format`] without the trash: the file is deleted.
+    pub fn remove_format_permanently(&self, book_id: i32, fmt: &str) -> anyhow::Result<()> {
+        self.remove_format_inner(book_id, fmt, true)
+    }
+
+    fn remove_format_inner(&self, book_id: i32, fmt: &str, permanently: bool) -> anyhow::Result<()> {
         let Some(book_dir) = self.book_dir(book_id)? else {
             return Ok(());
         };
@@ -1304,10 +1325,18 @@ impl Cache {
         if let Some(name) = name {
             let path = book_dir.join(format!("{name}.{}", fmt.to_lowercase()));
             if path.is_file() {
-                // Port of issue #93's crate-wide write-path retrofit:
-                // real, journaled, crash-safe removal through
-                // `LibraryHandle` instead of a raw `fs::remove_file`.
-                self.backend.write_handle()?.remove_atomic(&path)?;
+                if permanently {
+                    // Port of issue #93's crate-wide write-path retrofit:
+                    // real, journaled, crash-safe removal through
+                    // `LibraryHandle` instead of a raw `fs::remove_file`.
+                    self.backend.write_handle()?.remove_atomic(&path)?;
+                } else {
+                    // calibre's `remove_formats`: into `.caltrash/f/<id>`, so
+                    // the format can be restored. Failing here leaves the row
+                    // and the file exactly as they were.
+                    let hash = self.checksums().recorded_identity(book_id, "format", &fmt.to_uppercase()).ok().and_then(|(h, _)| h);
+                    self.move_format_to_trash(book_id, fmt, &name, &path, hash)?;
+                }
             }
         }
 
@@ -1409,6 +1438,10 @@ impl Cache {
             }
         }
 
+        // Everything the trash needs to put the book back, read while the
+        // row still exists.
+        let manifest = if files == BookFiles::Trash { Some(self.trash_manifest_for(book_id, uuid.clone(), &title, &path_rel, &own)?) } else { None };
+
         self.checksums().remove_all_for_book(book_id)?;
         {
             let conn = self.backend.conn.lock().unwrap();
@@ -1424,32 +1457,20 @@ impl Cache {
             // Ignore entries were recorded before the row went.
             BookFiles::Keep => {}
             BookFiles::Trash => {
-                for file in &own {
-                    let absolute = library.join(&file.rel);
-                    if !absolute.is_file() {
-                        continue;
-                    }
-                    match trash_one(&absolute) {
-                        Ok(()) => outcome.trashed.push(file.rel.clone()),
-                        Err(why) => {
-                            if file.is_format {
-                                match self.ignored().ignore(&file.rel, file.hash.as_deref(), &title) {
-                                    Ok(()) => outcome.ignored.push(file.rel.clone()),
-                                    Err(e) => log::warn!("could not record {} in the ignore list: {e}", file.rel),
-                                }
-                            }
-                            outcome.failed.push((file.rel.clone(), why));
+                // Into the library's own `.caltrash`, as calibre does -- see
+                // `crate::trash`. A same-volume rename, so it works on a
+                // network share that has no recycle bin.
+                let moved = self.move_book_to_trash(manifest.expect("built above for Trash"), cover_sidecar.filter(|c| c.is_file()));
+                outcome.trashed = moved.moved;
+                for (rel, why) in moved.failed {
+                    if own.iter().any(|f| f.rel == rel && f.is_format) {
+                        let hash = own.iter().find(|f| f.rel == rel).and_then(|f| f.hash.clone());
+                        match self.ignored().ignore(&rel, hash.as_deref(), &title) {
+                            Ok(()) => outcome.ignored.push(rel.clone()),
+                            Err(e) => log::warn!("could not record {rel} in the ignore list: {e}"),
                         }
                     }
-                }
-                // The sidecar cover is this app's own index state, not a
-                // user file; remove it through the journaled handle.
-                if let Some(cover) = cover_sidecar.filter(|c| c.is_file()) {
-                    if let Ok(handle) = self.backend.write_handle() {
-                        if let Err(e) = handle.remove_atomic(&cover) {
-                            log::warn!("could not remove cover {}: {e}", cover.display());
-                        }
-                    }
+                    outcome.failed.push((rel, why));
                 }
                 if outcome.failed.is_empty() {
                     outcome.folder_removed = self.remove_book_folder_if_empty(&path_rel, dedicated);
@@ -1477,7 +1498,7 @@ impl Cache {
     }
 
     /// The files this book owns on disk, relative to the library root.
-    fn own_files(&self, book_id: i32, path_rel: &str, dedicated: bool) -> anyhow::Result<Vec<OwnFile>> {
+    pub(crate) fn own_files(&self, book_id: i32, path_rel: &str, dedicated: bool) -> anyhow::Result<Vec<OwnFile>> {
         if !path_rel.is_empty() && !path_is_plain(path_rel) {
             log::warn!("book {book_id} has an unusable path {path_rel:?}; none of its files will be touched");
             return Ok(Vec::new());

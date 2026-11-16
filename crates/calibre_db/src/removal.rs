@@ -9,7 +9,8 @@
 //! keypress has made a strong assumption on their behalf. So the two
 //! are separate operations: [`remove_from_library`] takes the book out
 //! of the index and leaves the file alone; [`delete_with_file`] does
-//! both, through the system wastebasket where there is one.
+//! both, into the library's own `.caltrash` ([`crate::trash`]) -- calibre's
+//! trash, which exists on a network share where the OS wastebasket does not.
 //!
 //! # The ignore list, and why it is not optional
 //!
@@ -168,8 +169,8 @@ impl IgnoreStore {
 pub struct RemovalReport {
     /// Files left on disk and added to the ignore list.
     pub ignored: Vec<String>,
-    /// Files sent to the wastebasket. Never deleted outright: with no
-    /// wastebasket a file stays and is listed in `failed`.
+    /// Files moved into the library's trash. Never deleted outright: a file
+    /// that cannot be moved stays and is listed in `failed`.
     pub deleted: Vec<String>,
     /// `(path, why)` for files that could not be deleted. The entry is
     /// still removed: the book is gone from the library either way, and
@@ -195,13 +196,13 @@ pub fn remove_from_library(cache: &Cache, book_id: i32) -> Result<RemovalReport>
 
 /// Takes a book out of the library **and** removes the files it owns.
 ///
-/// To the system wastebasket, so the choice stays recoverable -- the
-/// explicit second option, not the default. Only the book's own format
-/// files (and its `cover.jpg`/`metadata.opf` when its folder is its
-/// alone) are removed: never the folder as a whole, since in a tracked
-/// library many books share one. A file that cannot be trashed is left
-/// in place (never hard-deleted), listed in `failed`, and ignored so a
-/// rescan does not re-add it.
+/// Into the library's `.caltrash` (`crate::trash`), so the choice stays
+/// recoverable -- list, restore, or empty it -- the explicit second option,
+/// not the default. Only the book's own format files (and its
+/// `cover.jpg`/`metadata.opf` when its folder is its alone) move: never the
+/// folder as a whole, since in a tracked library many books share one. A
+/// file that cannot be moved is left in place (never hard-deleted), listed
+/// in `failed`, and ignored so a rescan does not re-add it.
 pub fn delete_with_file(cache: &Cache, book_id: i32) -> Result<RemovalReport> {
     let mut report = RemovalReport::default();
     cache.orphans().clear_all_for_book(book_id)?;

@@ -259,6 +259,26 @@ const CASES: &[Case] = &[
     // Already recorded -- kept so they stay that way.
     case!("remove_format", |c, f| c.remove_format(f.first, "PDF").unwrap()),
     case!("delete_book", |c, f| c.delete_book(f.second).unwrap()),
+    // The trash: a book trashed and restored comes back under its own uuid
+    // with its fields, and an edit made afterwards must replay onto it. A
+    // restore that logged nothing would leave the rebuilt library without
+    // the book at all.
+    case!("trash_book + restore_trashed_book", |c, f| {
+        c.delete_book(f.second).unwrap();
+        let entry = c.list_trash().unwrap().remove(0);
+        let restored = c.restore_trashed_book(&entry.key).unwrap();
+        c.set_field(restored.book_id, "tags", "back-from-the-trash").unwrap();
+    }),
+    case!("remove_format + restore_trashed_format", |c, f| {
+        c.remove_format(f.first, "PDF").unwrap();
+        let entry = c.list_trash().unwrap().remove(0);
+        c.restore_trashed_format(&entry.key, "PDF").unwrap();
+        c.set_field(f.first, "tags", "format-came-back").unwrap();
+    }),
+    case!("trash_book (stays removed)", |c, f| {
+        c.delete_book_with(f.first, crate::cache::BookFiles::Trash).unwrap();
+        c.empty_trash().unwrap();
+    }),
     case!("rename_format_files", |c, f| { c.rename_format_files(f.first, "renamed-on-disk").unwrap(); }),
     case!("set_preference", |c, _| c.set_preference("audit_pref", "audit_value").unwrap()),
     case!("add_custom_column", |c, _| { c.add_custom_column("extra", "Extra", "text", false).unwrap(); }),
@@ -466,7 +486,7 @@ const ACCOUNTED: &[(&str, Account)] = &[
     ("cache.rs::set_preference", Case("set_preference")),
     ("cache.rs::clear_preference", Case("clear_preference")),
     ("cache.rs::add_format", Case("add_format")),
-    ("cache.rs::remove_format", Case("remove_format")),
+    ("cache.rs::remove_format_inner", Case("remove_format")),
     ("cache.rs::delete_book_with", Case("delete_book")),
     ("cache.rs::rename_format_files", Case("rename_format_files")),
     ("cache.rs::register_books_in_place", Case("register_books_in_place (batch)")),

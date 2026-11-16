@@ -36,7 +36,7 @@ use anyhow::{Context, Result};
 
 use calibre_utils::filenames::{file_facts, FileFacts};
 
-use crate::constants::{DATA_DIR_NAME, LIBRARY_HANDLE_DIR_NAME};
+use crate::constants::{DATA_DIR_NAME, LIBRARY_HANDLE_DIR_NAME, NOTES_DIR_NAME, TRASH_DIR_NAME};
 
 /// How long a file must have been untouched before it is indexed.
 ///
@@ -67,6 +67,10 @@ const JUNK_NAMES: &[&str] = &[
 /// Directory names that are somebody else's business.
 const JUNK_DIRS: &[&str] = &[
     LIBRARY_HANDLE_DIR_NAME,
+    // The library's own trash: books moved here have been deleted, and a
+    // scan that walked in would add every one of them straight back.
+    TRASH_DIR_NAME,
+    NOTES_DIR_NAME,
     "@eadir",          // Synology thumbnails
     ".@__thumb",       // QNAP
     "#recycle",        // Synology
