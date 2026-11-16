@@ -380,6 +380,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/scan-library/{library_id}", post(scan_library::scan))
         .route("/enrich-library/{library_id}", post(library_jobs::enrich))
         .route("/hash-backfill/{library_id}", post(library_jobs::hash_backfill))
+        .route("/pdf-fingerprint/{library_id}", post(library_jobs::pdf_fingerprint))
         .route("/library-untracked/{library_id}", get(scan_library::untracked))
         .route("/import-folder/{library_id}", post(import_folder::import))
         .route("/trash/{library_id}", get(library_trash::list))
