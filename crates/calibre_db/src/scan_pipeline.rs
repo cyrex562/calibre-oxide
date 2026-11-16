@@ -117,7 +117,7 @@ pub struct PipelineOptions {
 }
 
 impl PipelineOptions {
-    fn batch_done(&self, control: &JobControl) {
+    pub(crate) fn batch_done(&self, control: &JobControl) {
         if let Some(hook) = &self.after_batch {
             hook(control);
         }
@@ -230,7 +230,7 @@ impl JobControl {
 ///
 /// Order of the *output* is fixed; order of execution is not, which is
 /// fine because `work` only reads.
-fn parallel_map<T: Sync, R: Send>(items: &[T], workers: usize, control: &JobControl, work: impl Fn(&T) -> R + Sync) -> Vec<Option<R>> {
+pub(crate) fn parallel_map<T: Sync, R: Send>(items: &[T], workers: usize, control: &JobControl, work: impl Fn(&T) -> R + Sync) -> Vec<Option<R>> {
     let slots: Vec<Mutex<Option<R>>> = items.iter().map(|_| Mutex::new(None)).collect();
     let next = AtomicUsize::new(0);
     let run = || loop {

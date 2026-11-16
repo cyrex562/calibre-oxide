@@ -223,6 +223,67 @@ pub struct InPlaceFile {
     pub queue_enrichment: bool,
 }
 
+/// One file of a book being imported: already copied into the library's
+/// staging area and verified there.
+#[derive(Debug, Clone)]
+pub struct ImportFile {
+    pub staged: PathBuf,
+    /// Lowercase extension, no dot.
+    pub ext: String,
+    pub size: i64,
+    /// BLAKE3, lowercase hex, of the verified copy.
+    pub hash: String,
+}
+
+/// A book for [`Cache::import_books_batch`].
+#[derive(Debug, Clone)]
+pub struct ImportItem {
+    pub metadata: MetaInformation,
+    pub files: Vec<ImportFile>,
+}
+
+/// A book [`Cache::import_books_batch`] created.
+#[derive(Debug, Clone)]
+pub struct ImportedBook {
+    pub id: i32,
+    pub uuid: Option<String>,
+    /// `Author/Title (id)`.
+    pub folder: String,
+    /// Each file's path relative to the library root.
+    pub files: Vec<String>,
+}
+
+/// calibre's `PATH_LIMIT`: how much of an author or title goes into a
+/// folder name (shorter on Windows, where the whole path has 260).
+fn path_limit() -> usize {
+    if cfg!(windows) {
+        40
+    } else {
+        100
+    }
+}
+
+fn clip_name(name: &str, limit: usize) -> String {
+    let sanitized = sanitize_file_name(name);
+    let clipped: String = sanitized.chars().take(limit).collect();
+    let clipped = clipped.trim_end_matches(['.', ' ']).trim_start().to_string();
+    if clipped.is_empty() {
+        "Unknown".to_string()
+    } else {
+        clipped
+    }
+}
+
+/// calibre's `construct_path_name`: `("Author/Title (id)", "Title - Author")`.
+/// The id stays whole however long the title is.
+pub fn import_names(book_id: i32, title: &str, author: &str) -> (String, String) {
+    let author_dir = clip_name(author, path_limit());
+    let title_dir = clip_name(title, path_limit());
+    let folder = format!("{author_dir}/{title_dir}{}", crate::constants::BOOK_ID_PATH_TEMPLATE.replace("{}", &book_id.to_string()));
+    let stem = format!("{} - {}", clip_name(title, 35), clip_name(author, 35));
+    (folder, stem)
+}
+
 /// The key under which a file is looked up in
 /// [`Cache::indexed_file_keys`]: exactly what `book_for_file` matches on
 /// -- folder, stem, and the upper-cased format.
@@ -859,6 +920,144 @@ impl Cache {
                     }
                 }
                 Ok(done.inserted.id)
+            })
+            .collect()
+    }
+
+    /// Creates books from files the caller has already copied and verified
+    /// into the library's staging area, laying each out the way calibre's
+    /// own add does: `<Author>/<Title> (<id>)/<Title> - <Author>.<ext>`.
+    ///
+    /// One `BEGIN IMMEDIATE` transaction for the whole batch, a savepoint per
+    /// book. The id is only known once the row exists and the folder name
+    /// contains it, so inside the transaction each book is inserted, its
+    /// files are *renamed* from staging to their final names (journaled; a
+    /// same-volume rename, never a copy), and its `data` rows and hashes
+    /// written. If any step fails, that book's files go back to staging and
+    /// its savepoint rolls back; the rest of the batch is unaffected. The
+    /// change log gets one batch entry afterwards, as for a scan.
+    ///
+    /// Results are in the order of `items`.
+    pub fn import_books_batch(&self, items: &[ImportItem]) -> Vec<anyhow::Result<ImportedBook>> {
+        if items.is_empty() {
+            return Vec::new();
+        }
+        let fail_all = |e: anyhow::Error| -> Vec<anyhow::Result<ImportedBook>> { items.iter().map(|_| Err(anyhow::anyhow!("{e:#}"))).collect() };
+        if let Err(e) = self.checksums().initialize() {
+            return fail_all(e.into());
+        }
+        let handle = match self.backend.write_handle() {
+            Ok(h) => h,
+            Err(e) => return fail_all(e.into()),
+        };
+        let library = self.backend.library_path.clone();
+
+        struct Done {
+            book: ImportedBook,
+            ops: Vec<crate::change_log::ChangeOp>,
+        }
+        let mut outcomes: Vec<anyhow::Result<Done>> = Vec::with_capacity(items.len());
+        {
+            let mut conn = self.backend.conn.lock().unwrap();
+            let mut tx = match conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
+                Ok(tx) => tx,
+                Err(e) => return fail_all(e.into()),
+            };
+            for item in items {
+                let one = (|| -> anyhow::Result<Done> {
+                    let sp = tx.savepoint()?;
+                    let mut metadata = item.metadata.clone();
+                    // A uuid inside the file is metadata about the book, not
+                    // this library's identity for the row (see `add_book`).
+                    metadata.uuid = None;
+                    let inserted = Self::insert_book_in_tx(&sp, &metadata, "", None)?;
+                    let author = metadata.authors.first().map(String::as_str).unwrap_or("Unknown");
+                    let (folder, stem) = import_names(inserted.id, &metadata.title, author);
+                    sp.execute("UPDATE books SET path = ?1 WHERE id = ?2", (&folder, inserted.id))?;
+
+                    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+                    let result = (|| -> anyhow::Result<Vec<(String, i64, String)>> {
+                        let mut rows = Vec::new();
+                        for file in &item.files {
+                            let dest = library.join(&folder).join(format!("{stem}.{}", file.ext));
+                            if dest.exists() {
+                                anyhow::bail!("{} already exists", dest.display());
+                            }
+                            if let Some(parent) = dest.parent() {
+                                fs::create_dir_all(parent)?;
+                            }
+                            handle.rename_atomic(&file.staged, &dest)?;
+                            moved.push((file.staged.clone(), dest.clone()));
+                            let format = file.ext.to_uppercase();
+                            sp.execute(
+                                "INSERT OR REPLACE INTO data (book, format, uncompressed_size, name) VALUES (?1, ?2, ?3, ?4)",
+                                (inserted.id, &format, file.size, &stem),
+                            )?;
+                            crate::checksums::ChecksumStore::record_hash_on(&sp, inserted.id, "format", &format, &file.hash, file.size, calibre_utils::filenames::identity(&dest))?;
+                            rows.push((format, file.size, file.hash.clone()));
+                        }
+                        Ok(rows)
+                    })();
+                    let rows = match result.and_then(|rows| sp.commit().map(|_| rows).map_err(Into::into)) {
+                        Ok(rows) => rows,
+                        Err(e) => {
+                            // Back to staging; the savepoint rolls back when
+                            // `sp` is dropped uncommitted.
+                            for (from, to) in moved.iter().rev() {
+                                let _ = handle.rename_atomic(to, from);
+                            }
+                            let dir = library.join(&folder);
+                            let _ = fs::remove_dir(&dir);
+                            if let Some(parent) = dir.parent() {
+                                let _ = fs::remove_dir(parent);
+                            }
+                            return Err(e);
+                        }
+                    };
+
+                    let mut ops = Self::book_added_ops(&inserted, &metadata, &folder);
+                    if let Some(uuid) = inserted.uuid.clone() {
+                        for (format, size, hash) in &rows {
+                            ops.push(crate::change_log::ChangeOp::FormatSet { book: uuid.clone(), format: format.clone(), name: stem.clone(), size: *size, hash: Some(hash.clone()) });
+                        }
+                    }
+                    let files = item.files.iter().map(|f| format!("{folder}/{stem}.{}", f.ext)).collect();
+                    Ok(Done { book: ImportedBook { id: inserted.id, uuid: inserted.uuid, folder, files }, ops })
+                })();
+                outcomes.push(one);
+            }
+            if let Err(e) = tx.commit() {
+                // Nothing was committed, so every file must go back.
+                drop(conn);
+                for (item, outcome) in items.iter().zip(&outcomes) {
+                    if let Ok(done) = outcome {
+                        for (file, rel) in item.files.iter().zip(&done.book.files) {
+                            let _ = handle.rename_atomic(&library.join(rel), &file.staged);
+                        }
+                    }
+                }
+                return fail_all(e.into());
+            }
+        }
+
+        let mut all_ops = Vec::new();
+        for outcome in outcomes.iter_mut().flatten() {
+            all_ops.append(&mut outcome.ops);
+        }
+        self.record_many(all_ops);
+
+        outcomes
+            .into_iter()
+            .zip(items)
+            .map(|(outcome, item)| {
+                let done = outcome?;
+                let (_, cover) = &item.metadata.cover_data;
+                if !cover.is_empty() {
+                    if let Err(e) = crate::covers::set_cover(self, done.book.id, cover) {
+                        log::warn!("imported book {} but its cover could not be stored: {e}", done.book.id);
+                    }
+                }
+                Ok(done.book)
             })
             .collect()
     }

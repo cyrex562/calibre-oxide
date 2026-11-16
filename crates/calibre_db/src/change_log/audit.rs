@@ -275,6 +275,21 @@ const CASES: &[Case] = &[
         c.restore_trashed_format(&entry.key, "PDF").unwrap();
         c.set_field(f.first, "tags", "format-came-back").unwrap();
     }),
+    // The folder importer's batch write: books laid out `Author/Title (id)`,
+    // with their formats and hashes, from files staged in the library.
+    case!("import_books_batch", |c, _| {
+        let staged = c.backend.library_path.join(crate::constants::LIBRARY_HANDLE_DIR_NAME).join("import-staging").join("audit");
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(staged.join("imported.pdf"), b"%PDF imported").unwrap();
+        let mut meta = MetaInformation::default();
+        meta.title = "Imported".to_string();
+        meta.authors = vec!["Import Author".to_string()];
+        let item = crate::cache::ImportItem {
+            metadata: meta,
+            files: vec![crate::cache::ImportFile { staged: staged.join("imported.pdf"), ext: "pdf".to_string(), size: 13, hash: blake3::hash(b"%PDF imported").to_hex().to_string() }],
+        };
+        c.import_books_batch(&[item]).remove(0).unwrap();
+    }),
     case!("trash_book (stays removed)", |c, f| {
         c.delete_book_with(f.first, crate::cache::BookFiles::Trash).unwrap();
         c.empty_trash().unwrap();
@@ -491,6 +506,7 @@ const ACCOUNTED: &[(&str, Account)] = &[
     ("cache.rs::rename_format_files", Case("rename_format_files")),
     ("cache.rs::register_books_in_place", Case("register_books_in_place (batch)")),
     ("cache.rs::insert_book_in_tx", Case("register_books_in_place (batch)")),
+    ("cache.rs::import_books_batch", Case("import_books_batch")),
     ("covers.rs::set_cover", Case("covers::set_cover")),
     ("backend.rs::set_pref", Case("Cache::set_pref (plain key)")),
     ("cache.rs::set_book_path", Replay("records a `path` FieldSet itself; exercised by the rename_book_files case")),

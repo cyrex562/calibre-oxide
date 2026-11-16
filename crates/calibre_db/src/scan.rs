@@ -81,6 +81,17 @@ const JUNK_DIRS: &[&str] = &[
     ".git",
 ];
 
+/// Whether a directory (given lowercase) is somebody else's business: the
+/// library's own state, the trash, a NAS's thumbnail cache.
+pub(crate) fn is_junk_dir(lower: &str) -> bool {
+    JUNK_DIRS.contains(&lower)
+}
+
+/// Whether a file (given lowercase) is clutter, not a book.
+pub(crate) fn is_junk_name(lower: &str) -> bool {
+    JUNK_NAMES.contains(&lower)
+}
+
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
     pub settle: Duration,

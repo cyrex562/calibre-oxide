@@ -27,6 +27,7 @@ pub mod fts;
 pub mod lazy;
 pub mod legacy;
 pub mod grouping;
+pub mod import;
 pub mod library;
 pub mod library_check;
 pub mod library_handle;
