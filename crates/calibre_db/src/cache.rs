@@ -2545,7 +2545,13 @@ impl Cache {
             // every custom-column label, contradicting that issue's
             // own filing claim that `set_field` "already" wrote
             // custom columns. It didn't; this is the fix.
-            _ if self.custom_column_lookup(field)?.is_some() => {
+            _ if {
+                // A column (`label` or `#label`) or a series column's
+                // `<label>_index`.
+                let conn = self.backend.conn.lock().unwrap();
+                crate::custom_columns::resolve(&conn, field)?.is_some()
+            } =>
+            {
                 self.set_custom_column_value(book_id, field, value)?
             }
             _ => anyhow::bail!("Field '{}' is not writable by this port's set_field", field),
@@ -3472,11 +3478,16 @@ mod tests {
         cache
             .add_custom_column("mycol", "My Column", "int", true)
             .unwrap();
+        cache.add_custom_column("tags2", "Tags 2", "text", true).unwrap();
         let map = cache.custom_column_label_map().unwrap();
         let entry = map.get("mycol").unwrap();
         assert_eq!(entry["name"], "My Column");
         assert_eq!(entry["datatype"], "int");
-        assert_eq!(entry["is_multiple"], true);
+        // calibre keeps is_multiple only for text and composite columns.
+        assert_eq!(entry["is_multiple"], false);
+        assert_eq!(entry["normalized"], false);
+        assert_eq!(map["tags2"]["is_multiple"], true);
+        assert_eq!(map["tags2"]["normalized"], true);
     }
 
     #[test]

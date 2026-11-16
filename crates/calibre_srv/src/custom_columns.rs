@@ -61,19 +61,25 @@ pub struct AddCustomColumnBody {
     datatype: String,
     #[serde(default)]
     is_multiple: bool,
+    /// The column's display settings -- an enumeration's `enum_values`,
+    /// a text column's `is_names`, ... (calibre's `display` JSON).
+    #[serde(default)]
+    display: Option<Value>,
 }
 
 /// `POST /custom-columns/add`.
 pub async fn add(State(state): State<AppState>, Json(body): Json<AddCustomColumnBody>) -> Result<Json<Value>, ServerError> {
     let col_id = tokio::task::spawn_blocking({
         let cache = state.cache.clone();
-        move || cache.add_custom_column(&body.label, &body.name, &body.datatype, body.is_multiple)
+        move || {
+            let display = body.display.unwrap_or_else(|| serde_json::json!({}));
+            cache.add_custom_column_with_display(&body.label, &body.name, &body.datatype, body.is_multiple, &display)
+        }
     })
     .await
     .map_err(|e| ServerError::InternalServerError(e.to_string()))?
-    // A duplicate label / unsupported combination (e.g. a
-    // multiple-value text column, see `Cache::add_custom_column`'s
-    // own doc) is a client error, not a server one.
+    // A duplicate label / bad label or datatype is a client error, not a
+    // server one.
     .map_err(|e| ServerError::BadRequest(e.to_string()))?;
     Ok(Json(serde_json::json!({"num": col_id})))
 }
@@ -187,5 +193,36 @@ mod tests {
         let (status, body) = get_json(&router, &format!("/ajax/book/{book_id}")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["mycol"], "hello there");
+    }
+    #[tokio::test]
+    async fn multiple_text_enumeration_and_series_columns_round_trip_through_the_routes() {
+        let (_dir, router, book_id) = test_app();
+        for body in [
+            serde_json::json!({"label": "genre", "name": "Genre", "datatype": "text", "is_multiple": true}),
+            serde_json::json!({"label": "mood", "name": "Mood", "datatype": "enumeration", "display": {"enum_values": ["Happy", "Sad"]}}),
+            serde_json::json!({"label": "saga", "name": "Saga", "datatype": "series"}),
+        ] {
+            let (status, body) = post_json(&router, "/custom-columns/add", body).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let (_, listed) = get_json(&router, "/custom-columns").await;
+        assert_eq!(listed["genre"]["normalized"], true);
+        assert_eq!(listed["genre"]["is_multiple"], true);
+        assert_eq!(listed["mood"]["display"]["enum_values"][1], "Sad");
+
+        let uri = format!("/cdb/set-fields/{book_id}");
+        let (status, body) = post_json(&router, &uri, serde_json::json!({"changes": {"genre": "Noir, Classic", "mood": "Sad", "saga": "Saga One [3]"}})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, book) = get_json(&router, &format!("/ajax/book/{book_id}")).await;
+        assert_eq!(book["genre"], "Noir, Classic");
+        assert_eq!(book["mood"], "Sad");
+        assert_eq!(book["saga"], "Saga One");
+        assert_eq!(book["saga_index"], 3.0);
+
+        // A value the enumeration does not list is refused, not stored.
+        let (status, _) = post_json(&router, &uri, serde_json::json!({"changes": {"mood": "Angry"}})).await;
+        assert_ne!(status, StatusCode::OK);
+        let (_, book) = get_json(&router, &format!("/ajax/book/{book_id}")).await;
+        assert_eq!(book["mood"], "Sad");
     }
 }
