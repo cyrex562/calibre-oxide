@@ -77,10 +77,9 @@ impl CandidateMetadata {
         if title == normalise(stem) {
             return false;
         }
-        let has_author = self.authors.iter().any(|a| {
-            let a = normalise(a);
-            !a.is_empty() && a != "unknown" && a != "unknown author"
-        });
+        // The "an unknown author is not evidence" rule lives in
+        // `dedupe`, so every duplicate check applies the same one.
+        let has_author = self.authors.iter().any(|a| !crate::dedupe::is_unknown_author(a));
         has_author || self.isbn.as_deref().is_some_and(|i| !i.trim().is_empty())
     }
 
@@ -230,7 +229,7 @@ pub fn group(candidates: &[Candidate]) -> Grouping {
 
 /// Lowercase, collapse whitespace, drop punctuation that varies between
 /// otherwise identical metadata.
-fn normalise(value: &str) -> String {
+pub(crate) fn normalise(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut last_was_space = true;
     for ch in value.chars() {
@@ -247,7 +246,7 @@ fn normalise(value: &str) -> String {
     out.trim().to_string()
 }
 
-fn is_boilerplate(normalised_title: &str) -> bool {
+pub(crate) fn is_boilerplate(normalised_title: &str) -> bool {
     if BOILERPLATE_TITLES.contains(&normalised_title) {
         return true;
     }

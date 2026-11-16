@@ -156,6 +156,53 @@ Two constraints shape this:
   only with a real title plus at least one of author or ISBN, and never a
   known-junk title.
 
+## Finding the same book recorded differently
+
+Content hashes find the same *file*. The same *book* is often recorded
+differently: `The Hobbit` / `Hobbit, The (z-lib.org)`, `J.R.R. Tolkien` /
+`Tolkien, J. R. R.`, an ISBN-10 and its ISBN-13. `calibre_db::dedupe` finds
+those, and `POST /duplicates/scan/{library_id}` reports each group with its
+strongest `reason`, a `confidence`, and the per-pair `evidence`:
+
+| Reason | Evidence | Confidence |
+| --- | --- | --- |
+| `content` | identical bytes | 1.00 |
+| `identifier` | an equal, *valid* ISBN (10 and 13 compared as 13) or equal `asin`/`amazon*`/`goodreads`/`google`/`doi` | 0.95-0.97 |
+| `title_author_exact` | equal normalised title and an equal normalised author | 0.90 |
+| `title_author_fuzzy` | equal once edition/bracket noise or a subtitle is removed, or a small edit apart, with an initials-compatible author | 0.55-0.80 |
+
+Rules that keep this from flooding the user:
+
+- **An unknown author is not evidence.** `Unknown`, `Unknown Author`,
+  `Anonymous`, `Various`, calibre's translated `Unknown`, or nothing. A book
+  with no specific author can only be grouped by content or identifier, never by
+  title. `grouping.rs` uses the same rule.
+- **A title alone is not evidence, and the same title by a different author is
+  a different book.**
+- **Volumes are never normalised away.** `Vol. 1`/`Vol. 2`, `Part I`/`Part II`,
+  `Book One`/`Book Two` stay distinct: numbers survive in every key, a subtitle
+  that names a volume is never dropped, and an edit-distance match needs equal
+  numeric signatures.
+- **Two subtitled titles do not match on their shared prefix**
+  (`Discworld: Mort` is not `Discworld: Eric`); only "subtitle on one side only"
+  does.
+- Junk ISBNs (bad checksum, `0000000000`) match nothing, and an identifier shared
+  by more than 50 books is treated as a bulk-edit accident.
+- Candidates are blocked by author surname, so a 50k-book library is a sum of
+  small comparisons, not a pairwise scan.
+- `?min=` drops weaker evidence *before* merging, so a fuzzy edge never bridges
+  two groups in an `exact` scan. The bulk `/duplicates/merge-exact` never reads
+  this scan: it plans from byte-identical files only, so a fuzzy group is merged
+  only by a person confirming it.
+- The add-time check, `copy_one_book`'s duplicate check and the import policy
+  `skip_title_author` use the *exact* keys only (skipping a file is irreversible
+  enough to want strong evidence), and match on *any* shared author rather than
+  calibre's all-authors intersection.
+
+The normalisation (what differs from calibre's `fuzzy_title` and
+`find_identical_books`, and why Jaro-Winkler is not used) is documented in
+`crates/calibre_db/src/dedupe.rs`.
+
 ## The life of a tracked file
 
 ```
@@ -447,7 +494,7 @@ writing to files on read-only volumes and to cloud placeholders.
 | `filenames::file_identity` | make public |
 | `adding.rs` | `find_books_in_directory`'s stem grouping is no longer the grouping rule |
 | auto-add watcher | **done:** a watched folder *inside* the library is scanned in place; only one outside it is still drained after import. The old unconditional delete-after-import would have deleted the book's own file, and watching the library root would have deleted every book it indexed. Re-adding is prevented by the records plus the ignore list (E12), which is what made the delete trick unnecessary. New: `scan::rescan`, `POST /scan-library/{library_id}`. |
-| `duplicates.rs` | extend from author/title to content hash |
+| `duplicates.rs` | **done:** content hash (#892), then identifiers and normalised/fuzzy title+author (`calibre_db::dedupe`, with `reason`, `confidence`, `evidence` and `?min=`) |
 
 ### Rescan ordering
 

@@ -280,6 +280,28 @@ fn title_and_author_matches_are_skipped_only_when_asked_and_only_with_a_real_aut
     assert_eq!(titles(&cache2), vec!["Dune", "loose"]);
 }
 
+/// The import policy uses `dedupe`'s normalised exact keys: the same book
+/// spelled differently is skipped, a different book by the same author and an
+/// `Unknown` author are not.
+#[test]
+fn title_and_author_skipping_uses_the_normalised_keys() {
+    let (_lib, cache) = library();
+    let first = tempfile::tempdir().unwrap();
+    write(&first.path().join("hobbit.epub"), &epub("The Hobbit", "J.R.R. Tolkien", "a"));
+    write(&first.path().join("mystery.epub"), &epub("Mystery", "Unknown", "m1"));
+    run(&cache, first.path(), &ImportOptions::default());
+
+    let second = tempfile::tempdir().unwrap();
+    write(&second.path().join("same.epub"), &epub("Hobbit, The (z-lib.org)", "Tolkien, J. R. R.", "b"));
+    write(&second.path().join("other.epub"), &epub("The Silmarillion", "J.R.R. Tolkien", "c"));
+    write(&second.path().join("unknown.epub"), &epub("Mystery", "Unknown", "m2"));
+    let report = run(&cache, second.path(), &ImportOptions { policy: DuplicatePolicy::SkipTitleAuthor, ..Default::default() });
+    assert_eq!(report.skipped_duplicate_title, 1, "{report:?}");
+    assert_eq!(report.books_added, 2, "{report:?}");
+    assert_eq!(report.unmatched_without_author, 1, "{report:?}");
+    assert!(titles(&cache).contains(&"The Silmarillion".to_string()));
+}
+
 #[test]
 fn formats_are_added_to_the_existing_record_when_asked() {
     let (_lib, cache) = library();

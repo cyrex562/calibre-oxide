@@ -843,6 +843,13 @@ describe("scanForDuplicates", () => {
     expect(groups[0].books).toHaveLength(2);
     expect(groups[0].reason).toBe("content");
   });
+
+  it("asks the server for a minimum strength only when given one", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ groups: [] }) });
+    vi.stubGlobal("fetch", fetchMock);
+    await scanForDuplicates("exact");
+    expect(fetchMock).toHaveBeenCalledWith("/duplicates/scan/default?min=exact", { method: "POST" });
+  });
 });
 
 describe("news schedules", () => {

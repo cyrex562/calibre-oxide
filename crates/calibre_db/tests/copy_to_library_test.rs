@@ -128,6 +128,23 @@ fn find_duplicate_books_matches_same_author_same_title() {
 }
 
 #[test]
+fn find_duplicate_books_uses_the_normalised_exact_keys() {
+    use calibre_db::copy_to_library::find_duplicate_books;
+
+    let dir = tempdir().unwrap();
+    let cache = Cache::new(dir.path()).unwrap();
+    let hobbit = seed_book_with_author(&cache, "The Hobbit", "J.R.R. Tolkien");
+    seed_book_with_author(&cache, "Mystery", "Unknown");
+
+    let same = |title: &str, author: &str| find_duplicate_books(&cache, title, &[author.to_string()]).unwrap();
+    assert_eq!(same("Hobbit, The (z-lib.org)", "Tolkien, J. R. R."), [hobbit].into_iter().collect());
+    assert_eq!(same("THE HOBBIT", "J. R. R. Tolkien"), [hobbit].into_iter().collect());
+    assert!(same("The Hobbit", "Somebody Else").is_empty(), "same title, different author");
+    assert!(same("The Hobbit: There and Back Again", "J.R.R. Tolkien").is_empty(), "a fuzzy match must not block an add");
+    assert!(same("Mystery", "Unknown").is_empty(), "an unknown author never matches");
+}
+
+#[test]
 fn find_duplicate_books_is_empty_for_a_genuinely_new_book() {
     use calibre_db::copy_to_library::find_duplicate_books;
 

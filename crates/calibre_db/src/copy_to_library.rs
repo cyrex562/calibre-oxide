@@ -17,8 +17,10 @@
 //! conversion options and annotations, and the `add_formats_to_existing`
 //! automerge action. Duplicate handling is a plain
 //! `check_duplicates: bool`: when true and
-//! [`crate::utils::find_identical_books`] finds a same-author/near-same-
-//! title match in the destination, the copy is skipped (`Ok(None)`).
+//! [`find_duplicate_books`] finds a same-author, same-normalised-title match
+//! in the destination (the [`crate::dedupe`] exact tier, since tranche 8;
+//! before that [`crate::utils::find_identical_books`]), the copy is skipped
+//! (`Ok(None)`).
 //!
 //! Also fixed while wiring this in: the source book's author list was
 //! a documented heuristic (`vec![author_sort]`, treating the whole
@@ -34,12 +36,11 @@
 //! correctness this issue is about, not a performance pass.
 
 use crate::cache::Cache;
-use crate::utils::find_identical_books;
 use anyhow::{Context, Result};
 use indexmap::IndexMap;
 use std::collections::HashSet;
 
-/// Builds the three lookup maps [`find_identical_books`] needs
+/// Builds the three lookup maps [`crate::utils::find_identical_books`] needs
 /// (lowercase author name -> author ids, author id -> book ids, book
 /// id -> title) from every book currently in `cache`.
 pub(crate) fn duplicate_detection_maps(
@@ -87,47 +88,33 @@ pub(crate) fn duplicate_detection_maps(
     Ok((author_map, aid_to_bids, title_map))
 }
 
-/// Real duplicate detection (issue #424's `cdb_add_book`), reusing
-/// the exact same author-intersection algorithm [`copy_one_book`]'s
-/// own `check_duplicates` path already uses -- see this module's own
-/// doc for what's narrower here than upstream's real
-/// `find_identical_books` (a same-author/near-same-title match, not
-/// upstream's full fuzzy-title heuristics).
+/// The add-time duplicate check (issue #424's `cdb_add_book`, and
+/// [`copy_one_book`]'s `check_duplicates`): books already in `cache` with the
+/// same *normalised* title and an overlapping author -- the
+/// [`crate::dedupe`] exact tier, not its fuzzy one, so adding a book is only
+/// refused on strong evidence. `The Hobbit` matches `Hobbit, The (z-lib.org)`,
+/// `Tolkien, J.R.R.` matches `J. R. R. Tolkien`, and an `Unknown` author
+/// matches nothing.
+///
+/// Differs from `calibre.db.utils.find_identical_books` (which
+/// [`crate::utils::find_identical_books`] still ports for `legacy.rs`) in the
+/// ways `dedupe`'s module doc lists; the one that matters here is that *any*
+/// shared author matches rather than all of them.
 pub fn find_duplicate_books(cache: &Cache, title: &str, authors: &[String]) -> Result<HashSet<i32>> {
-    let (author_map, aid_to_bids, title_map) = duplicate_detection_maps(cache)?;
-    Ok(find_identical_books(title, authors, &author_map, &aid_to_bids, &title_map))
+    Ok(crate::dedupe::ExactIndex::build(cache)?.lookup(title, authors))
 }
 
-/// Real whole-library duplicate scan (issue #762), reusing
-/// [`duplicate_detection_maps`]/[`find_identical_books`] exactly as
-/// they already are for the per-candidate add-time check -- the maps
-/// are built once (a real, disclosed O(n) full-table-scan, matching
-/// [`duplicate_detection_maps`]'s own doc), then every book is matched
-/// against them once, which is O(n) map lookups per book rather than a
-/// naive O(n²) re-scan. Returns each group of 2+ books this crate's
-/// existing same-author/near-same-title heuristic considers likely
-/// duplicates of each other, sorted by book id for stable output; a
-/// book with no match to any other book isn't returned at all.
+/// Real whole-library duplicate scan (issue #762): each group of 2+ books
+/// whose normalised titles and authors match exactly ([`crate::dedupe`]'s
+/// `title_author_exact` tier, with identifiers and fuzzy matching left out;
+/// [`crate::dedupe::scan_library`] has everything). Sorted by lowest book id;
+/// a book matching nothing is not returned.
 pub fn scan_library_for_duplicates(cache: &Cache) -> Result<Vec<Vec<i32>>> {
-    let (author_map, aid_to_bids, title_map) = duplicate_detection_maps(cache)?;
-
-    let mut seen: HashSet<i32> = HashSet::new();
-    let mut groups: Vec<Vec<i32>> = Vec::new();
-    for (&book_id, title) in &title_map {
-        if seen.contains(&book_id) {
-            continue;
-        }
-        let authors = real_authors(cache, book_id)?;
-        let matches = find_identical_books(title, &authors, &author_map, &aid_to_bids, &title_map);
-        for &id in &matches {
-            seen.insert(id);
-        }
-        if matches.len() > 1 {
-            let mut group: Vec<i32> = matches.into_iter().collect();
-            group.sort_unstable();
-            groups.push(group);
-        }
+    let mut records = crate::dedupe::load_records(cache)?;
+    for r in &mut records {
+        r.identifiers.clear();
     }
+    let mut groups: Vec<Vec<i32>> = crate::dedupe::find_groups(&records, &[], crate::dedupe::Strength::Exact).into_iter().map(|g| g.book_ids).collect();
     groups.sort_by_key(|g| g[0]);
     Ok(groups)
 }
@@ -278,10 +265,9 @@ pub fn copy_one_book_detailed(src_cache: &Cache, dest_cache: &Cache, book_id: i3
 
     // 2. Check Duplicates in Dest
     if check_duplicates {
-        let (author_map, aid_to_bids, title_map) = duplicate_detection_maps(dest_cache)?;
-        let matches = find_identical_books(&title, &authors, &author_map, &aid_to_bids, &title_map);
+        let matches = find_duplicate_books(dest_cache, &title, &authors)?;
         if !matches.is_empty() {
-            // A same-author/near-same-title book already exists in the
+            // A same-author, same-normalised-title book already exists in the
             // destination -- report "duplicate, nothing added" rather
             // than the (larger, separate) automerge path real
             // calibre's `add_formats_to_existing` action takes.

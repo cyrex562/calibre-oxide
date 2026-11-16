@@ -25,6 +25,8 @@ import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LI
 import type { CheckLibraryFinding, CheckLibraryResult, CustomRecipeOptions, DuplicateGroup, IgnoredFile, NewsFeedInput, NewsSchedule, Orphan, SaveToDiskResult } from "../library/api";
 import { mergeBooks, planBulkMerge, runBulkMerge } from "../library/api";
 import type { BulkMergePlan, DuplicateBook, MergeMode, MergeResponse } from "../library/api";
+import { MIN_OPTIONS, confidencePercent, countByReason, evidenceLines, filterGroups, needsReview, reasonBadge, reasonLabel } from "../library/duplicates";
+import type { DuplicateMin } from "../library/duplicates";
 import { DEFAULT_DESTINATION_HINT, MERGE_MODE_LABELS, MERGE_MODE_NOTES, defaultMergeDestination, describeMergeResult, describeRecord, summarizeMerge } from "../library/merge";
 import { parseSnippetSegments } from "../library/snippets";
 import { similarBooksQuery } from "../library/query";
@@ -1458,6 +1460,10 @@ const duplicatesOpen = ref(false);
 const duplicatesLoading = ref(false);
 const duplicatesError = ref<string | null>(null);
 const duplicateGroups = ref<DuplicateGroup[]>([]);
+// The scan reports everything; this is only what is shown.
+const duplicateMin = ref<DuplicateMin>("fuzzy");
+const visibleDuplicateGroups = computed(() => filterGroups(duplicateGroups.value, duplicateMin.value));
+const duplicateStrengthCounts = computed(() => countByReason(duplicateGroups.value));
 
 async function openDuplicates() {
   duplicatesOpen.value = true;
@@ -3264,8 +3270,15 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
               <p v-if="dupBulkSummary" class="news-hint" role="status">{{ dupBulkSummary }}</p>
             </div>
             <p v-if="mergeDone" class="news-hint" role="status">{{ mergeDone }}</p>
+            <label v-if="duplicateGroups.length > 0" class="dup-filter">
+              Show
+              <select v-model="duplicateMin" aria-label="Minimum match strength">
+                <option v-for="o in MIN_OPTIONS" :key="o.value" :value="o.value">{{ o.label }}{{ duplicateStrengthCounts[o.value] === undefined ? "" : ` (${duplicateStrengthCounts[o.value]})` }}</option>
+              </select>
+            </label>
             <p v-if="duplicateGroups.length === 0" class="news-hint">No likely duplicates found.</p>
-            <div v-for="(group, i) in duplicateGroups" :key="i">
+            <p v-else-if="visibleDuplicateGroups.length === 0" class="news-hint">No groups this strong. Show weaker matches to see {{ duplicateGroups.length }} more.</p>
+            <div v-for="(group, i) in visibleDuplicateGroups" :key="i">
               <!--
                 Saying *why* matters: an identical file is a safe delete,
                 while a title/author match may be two genuinely different
@@ -3273,7 +3286,11 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
               -->
               <h4>
                 Group {{ i + 1 }} ({{ group.books.length }} books) —
-                {{ group.reason === "content" ? "identical files" : "same title and author" }}
+                {{ reasonLabel(group.reason) }}
+                <span class="dup-badge" :class="`dup-badge-${reasonBadge(group.reason).tone}`" :title="evidenceLines(group).join('\n')" data-testid="dup-badge">
+                  {{ reasonBadge(group.reason).text }}<template v-if="group.confidence !== undefined"> · {{ confidencePercent(group.confidence) }}</template>
+                </span>
+                <span v-if="needsReview(group)" class="news-hint">check these are the same book before merging</span>
                 <button type="button" :title="DEFAULT_DESTINATION_HINT" @click="openMergeForGroup(group)">Merge into…</button>
               </h4>
               <ul class="manage-list">
@@ -4114,6 +4131,32 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
 }
 .news-panel {
   max-width: 480px;
+}
+.dup-filter {
+  display: inline-flex;
+  gap: 0.4rem;
+  align-items: center;
+  margin: 0.5rem 0;
+}
+.dup-badge {
+  display: inline-block;
+  padding: 0 0.5rem;
+  border-radius: 999px;
+  font-size: 0.75em;
+  font-weight: 600;
+  border: 1px solid currentColor;
+}
+.dup-badge-certain {
+  color: #1a7f37;
+}
+.dup-badge-strong {
+  color: #0969da;
+}
+.dup-badge-likely {
+  color: #9a6700;
+}
+.dup-badge-review {
+  color: #bc4c00;
 }
 .news-hint {
   color: var(--fg-muted);
