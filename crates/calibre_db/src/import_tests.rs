@@ -440,6 +440,13 @@ fn an_import_survives_a_rebuild_from_the_change_log() {
 }
 
 #[test]
+fn windows_verbatim_prefixes_are_not_shown_to_people() {
+    assert_eq!(path_string(Path::new("\\\\?\\C:\\Books\\x.pdf")), "C:\\Books\\x.pdf");
+    assert_eq!(path_string(Path::new("\\\\?\\UNC\\nas\\share\\x.pdf")), "\\\\nas\\share\\x.pdf");
+    assert_eq!(path_string(Path::new("/home/me/x.pdf")), "/home/me/x.pdf");
+}
+
+#[test]
 fn names_follow_calibres_construct_path_name() {
     let (folder, stem) = crate::cache::import_names(7, "A/B: C?", "Jane. ");
     assert_eq!(folder, "Jane/A_B_ C_ (7)");

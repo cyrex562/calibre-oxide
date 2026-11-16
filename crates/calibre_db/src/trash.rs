@@ -244,6 +244,23 @@ pub struct ExpireReport {
     pub failed: Vec<(String, String)>,
 }
 
+/// calibre marks `.caltrash` hidden and not content-indexed on Windows, where
+/// a leading dot hides nothing. Best effort: a failure changes only what a
+/// file manager shows.
+#[cfg(windows)]
+fn hide_on_windows(path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NOT_CONTENT_INDEXED};
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path that outlives the call.
+    unsafe {
+        SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED);
+    }
+}
+
+#[cfg(not(windows))]
+fn hide_on_windows(_path: &Path) {}
+
 fn plain_name(name: &str) -> bool {
     !name.is_empty() && !name.contains(['/', '\\']) && name != "." && name != ".." && !name.contains(':')
 }
@@ -276,8 +293,12 @@ impl Cache {
 
     fn ensure_trash_dir(&self) -> Result<PathBuf> {
         let dir = self.trash_dir();
+        let fresh = !dir.exists();
         fs::create_dir_all(dir.join("b")).with_context(|| format!("creating {}", dir.display()))?;
         fs::create_dir_all(dir.join("f"))?;
+        if fresh {
+            hide_on_windows(&dir);
+        }
         Ok(dir)
     }
 

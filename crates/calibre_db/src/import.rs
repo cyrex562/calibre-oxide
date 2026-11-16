@@ -402,8 +402,19 @@ fn title_author_index(cache: &Cache) -> Result<HashMap<(String, String), Option<
     Ok(index)
 }
 
+/// A path as text for the report and the ledger. `canonicalize` on Windows
+/// yields `\\?\C:\...` (and `\\?\UNC\server\share\...`), which is
+/// correct and unreadable; this gives the form a person would type. One
+/// spelling everywhere, so the ledger's keys agree with themselves.
 fn path_string(p: &Path) -> String {
-    p.to_string_lossy().to_string()
+    let s = p.to_string_lossy().to_string();
+    if let Some(rest) = s.strip_prefix("\\\\?\\UNC\\") {
+        return format!("\\\\{rest}");
+    }
+    match s.strip_prefix("\\\\?\\") {
+        Some(rest) => rest.to_string(),
+        None => s,
+    }
 }
 
 /// What happened to one file of a group while it was being staged.
