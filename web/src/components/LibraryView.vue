@@ -23,6 +23,7 @@ import type { CheckLibraryFinding, CheckLibraryResult, CustomRecipeOptions, Dupl
 import { parseSnippetSegments } from "../library/snippets";
 import { similarBooksQuery } from "../library/query";
 import { pathFromLibraryId, recentLibraryEntries } from "../library/recentLibraries";
+import { storageBanner, type StorageInfo } from "../library/storageBanner";
 import { readSavedChoice, readVlChoice, savedMenuItems, type SavedMenuId, type VlMenuId, vlMenuItems } from "../library/searchMenus";
 import { applySortChoice, type SortMenuId, sortSummary as summariseSort } from "../library/sortMenu";
 import { activeRules, colorForBook, COLORING_RULES_PROFILE, DEFAULT_COLORING_RULES, type ColoringRule, type ColoringRulesPrefs } from "../library/coloringRules";
@@ -1557,10 +1558,14 @@ window.addEventListener("oxide:books-added", onBooksDropped);
 // deduplicated server-side (app/src-tauri/src/settings.rs).
 const libraryName = ref("");
 const libraryPath = ref("");
+const storage = ref<StorageInfo | null>(null);
+const banner = computed(() => storageBanner(storage.value));
+const bannerDismissed = ref(false);
 
 async function loadLibraryInfo() {
   try {
     const info = await fetchLibraryInfo();
+    storage.value = info.storage;
     libraryName.value = info.name;
     libraryPath.value = info.path;
     libraryId.value = info.id;
@@ -2438,6 +2443,15 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
       </div>
 
     </header>
+
+    <!--
+      Where the library lives (#258). Advice only and dismissible: the
+      library stays fully usable, and the banner links to nothing.
+    -->
+    <div v-if="banner && !bannerDismissed" class="storage-banner" :class="banner.level" role="status">
+      <span class="storage-banner-text"><strong>{{ banner.title }}.</strong> {{ banner.detail }}</span>
+      <button type="button" class="storage-banner-close" title="Dismiss" aria-label="Dismiss" @click="bannerDismissed = true">×</button>
+    </div>
 
     <div v-if="bulkOpen" class="bulk-panel">
       <div class="bulk-grid">
@@ -3341,6 +3355,30 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
 /* The library label reads as a control because it is one -- clicking
    it switches library, which is where anyone looking at the name is
    most likely headed next. */
+.storage-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.75em;
+  padding: 0.4em 0.75em;
+  font-size: var(--fs-body);
+  background: color-mix(in srgb, var(--accent, #3b82f6) 14%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--accent, #3b82f6) 40%, transparent);
+}
+.storage-banner.warning {
+  background: color-mix(in srgb, #f59e0b 20%, transparent);
+  border-bottom-color: color-mix(in srgb, #f59e0b 55%, transparent);
+}
+.storage-banner-text {
+  flex: 1;
+}
+.storage-banner-close {
+  border: none;
+  background: transparent;
+  color: inherit;
+  font-size: 1.2em;
+  line-height: 1;
+  cursor: pointer;
+}
 .status-library {
   padding: 0.1em 0.5em;
   font-size: var(--fs-body);

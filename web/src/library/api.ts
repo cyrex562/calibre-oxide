@@ -3,6 +3,7 @@
 // role for this slice, narrowed to only what the library-browser MVP
 // needs.
 
+import { parseStorageInfo, type StorageInfo } from "./storageBanner";
 import type { AddBookResult, BookFieldChanges, BookSummary, BooksInPage, CategoryEntry, CategoryPage, ConversionBookData, ConversionStatus, CustomColumnInfo, EmbedMetadataResponse, FieldMetadataResponse, FtsSearchResult, FtsSnippet, RenameFilesResponse, SearchResult, VirtualLibraries } from "./types";
 
 async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
@@ -1144,6 +1145,8 @@ export interface LibraryInfo {
    * how it reads for anyone who has only ever opened one.
    */
   libraries: Record<string, string>;
+  /** Where the library lives and whether another program has it open (#258); null from an older server. */
+  storage: StorageInfo | null;
 }
 
 /**
@@ -1156,10 +1159,10 @@ export interface LibraryInfo {
 export async function fetchLibraryInfo(): Promise<LibraryInfo> {
   const res = await fetch("/ajax/library-info");
   if (!res.ok) throw new Error(`library info: ${res.status}`);
-  const body = (await res.json()) as { library_map?: Record<string, string>; default_library?: string; library_path?: string };
+  const body = (await res.json()) as { library_map?: Record<string, string>; default_library?: string; library_path?: string; storage?: unknown };
   const id = body.default_library ?? "default";
   const libraries = body.library_map ?? {};
-  return { name: libraries[id] ?? "Library", path: body.library_path ?? "", id, libraries };
+  return { name: libraries[id] ?? "Library", path: body.library_path ?? "", id, libraries, storage: parseStorageInfo(body.storage) };
 }
 
 /**

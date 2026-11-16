@@ -490,6 +490,12 @@ pub async fn library_info(State(state): State<AppState>) -> Json<Value> {
         // Library" and the path was not exposed at all, so nothing on
         // screen could tell one library from another.
         "library_path": path.to_string_lossy(),
+        // Where the library lives and what that implies (#258): the
+        // storage tier (`network` for an SMB/NFS share), the SQLite
+        // journal mode in effect (`delete` on a network tier, never
+        // WAL), and any signals that another program has the library
+        // open. The web UI shows a banner from this.
+        "storage": state.cache.backend.storage_status(),
     }))
 }
 
@@ -779,6 +785,19 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["default_library"], "default");
         assert!(body["library_map"]["default"].is_string());
+    }
+
+    // Issue #258: the UI banner reads the tier, journal mode and in-use
+    // signals from here.
+    #[tokio::test]
+    async fn library_info_reports_the_storage_tier_and_journal_mode() {
+        let (_dir, router) = test_app(0);
+        let (_, body) = get_json(&router, "/ajax/library-info").await;
+        let storage = &body["storage"];
+        assert!(storage["tier"].is_string());
+        assert!(["wal", "delete"].contains(&storage["journal_mode"].as_str().unwrap()));
+        assert!(storage["in_use"].is_array());
+        assert!(storage["write_blocked_reason"].is_null());
     }
 
     // The name used to be the hardcoded string "calibre-oxide Library"
