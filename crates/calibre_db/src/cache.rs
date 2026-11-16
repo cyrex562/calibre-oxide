@@ -4073,7 +4073,30 @@ mod tests {
     }
 
     #[test]
-    fn remove_format_deletes_the_file_and_its_data_row() {
+    fn remove_format_moves_the_file_to_the_library_trash_and_drops_its_data_row() {
+        let (dir, cache) = open_test_cache();
+        let source = write_temp_file(dir.path(), "src.epub", b"epub bytes");
+        let mut meta = MetaInformation::default();
+        meta.title = "T".to_string();
+        meta.authors = vec!["A".to_string()];
+        let book_id = cache.add_book(&source, &meta).unwrap();
+        cache.add_format(book_id, &source, "epub", true).unwrap();
+        let renames_before = journaled_op_count(dir.path(), "RenameFile");
+
+        cache.remove_format(book_id, "epub").unwrap();
+
+        // Gone from the folder, in the trash (calibre's `f/<id>/<ext>`), and
+        // restorable -- not erased.
+        assert!(!dir.path().join("A/T/T.epub").exists());
+        assert_eq!(cache.field_for(book_id, "formats").unwrap(), None);
+        assert_eq!(fs::read(cache.trash_dir().join("f").join(book_id.to_string()).join("epub")).unwrap(), b"epub bytes");
+        // Through the real LibraryHandle: a journaled rename, not a delete.
+        assert_eq!(journaled_op_count(dir.path(), "RenameFile"), renames_before + 1);
+        assert_eq!(journaled_delete_count(dir.path()), 0);
+    }
+
+    #[test]
+    fn remove_format_permanently_deletes_the_file_and_its_data_row() {
         let (dir, cache) = open_test_cache();
         let source = write_temp_file(dir.path(), "src.epub", b"epub bytes");
         let mut meta = MetaInformation::default();
@@ -4082,10 +4105,11 @@ mod tests {
         let book_id = cache.add_book(&source, &meta).unwrap();
         cache.add_format(book_id, &source, "epub", true).unwrap();
 
-        cache.remove_format(book_id, "epub").unwrap();
+        cache.remove_format_permanently(book_id, "epub").unwrap();
 
         assert!(!dir.path().join("A/T/T.epub").exists());
         assert_eq!(cache.field_for(book_id, "formats").unwrap(), None);
+        assert!(cache.list_trash().unwrap().is_empty(), "nothing is kept");
 
         // remove_format now goes through the real LibraryHandle (issue
         // #93's crate-wide write-path retrofit), not a raw
