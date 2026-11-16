@@ -32,6 +32,7 @@ pub mod library_check;
 pub mod library_handle;
 pub mod listeners;
 pub mod locking;
+pub mod merge;
 pub mod notes;
 pub mod orphans;
 #[cfg(unix)]

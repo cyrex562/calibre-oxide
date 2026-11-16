@@ -243,6 +243,36 @@ pub fn add_extra_files(cache: &Cache, book_id: i32, files: &HashMap<String, Vec<
     Ok(added)
 }
 
+/// Copies the file at `source` into the book's data directory under
+/// `relpath` (the `data/` prefix optional), streaming it through the
+/// journaled handle rather than buffering it. A name already taken is
+/// auto-renamed `stem (1).ext`, `stem (2).ext`... -- calibre's
+/// `add_extra_file(..., auto_rename=True)`, which `merge_extra_files`
+/// uses. Returns the relpath actually written and the content's BLAKE3.
+pub fn copy_extra_file_in(cache: &Cache, book_id: i32, source: &Path, relpath: &str) -> anyhow::Result<(String, String)> {
+    let Some(dir) = data_dir(cache, book_id)? else {
+        anyhow::bail!("Book {book_id} not found");
+    };
+    let inside = relpath.strip_prefix(DATA_DIR_PREFIX).unwrap_or(relpath);
+    let wanted = Path::new(inside);
+    let stem = wanted.file_stem().and_then(|s| s.to_str()).unwrap_or("file").to_string();
+    let ext = wanted.extension().and_then(|s| s.to_str()).map(|e| format!(".{e}")).unwrap_or_default();
+    let parent = wanted.parent().map(|p| p.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+    for n in 0..1000 {
+        let name = if n == 0 { format!("{stem}{ext}") } else { format!("{stem} ({n}){ext}") };
+        let candidate = if parent.is_empty() { name } else { format!("{parent}/{name}") };
+        let Some(dest) = safe_join(&dir, &candidate) else {
+            anyhow::bail!("{relpath:?} does not name a place inside the book's data directory");
+        };
+        if dest.exists() {
+            continue;
+        }
+        let hash = cache.backend.write_handle()?.copy_atomic(source, &dest)?;
+        return Ok((format!("{DATA_DIR_PREFIX}{candidate}"), hash));
+    }
+    anyhow::bail!("could not find an unused name for {relpath:?} in book {book_id}'s data directory")
+}
+
 /// Port of `remove_extra_files`, always permanent (see module doc).
 /// Returns, per relpath, `None` on success or `Some(error message)`
 /// on failure -- matching upstream's `{relpath: Exception|None}`.
