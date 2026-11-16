@@ -195,8 +195,16 @@ rather than keep retrying.
 - **Text-to-speech is untested on Windows.** `ort` (ONNX Runtime) does ship
   prebuilt binaries for `windows-msvc`, so it is expected to work, but
   nobody has run it.
+- **Libraries on a NAS work, with caveats.** A UNC path (`\\nas\books`), a
+  mapped drive, or a `subst` drive pointing at one is classified as network
+  storage (#258): the library uses SQLite's rollback journal instead of WAL,
+  writes are retried and verified, and the UI shows a banner recommending a
+  local copy for large edits. If calibre (or oxide on another computer) has
+  the library open, oxide refuses to write and says why. This has been
+  unit-tested but not against a real SMB share on Windows. A share the OS
+  reports as local can be forced with `CALIBRE_OXIDE_STORAGE_TIER=network`.
 - **Platform integration is Linux-only by design**, and degrades rather than
-  breaks: device-removal and sleep/resume monitors (#258), "Open With"
+  breaks: device-removal and sleep/resume monitors (#258, still open), "Open With"
   application discovery, and the system font directories all fall back to
   conservative defaults elsewhere.
 

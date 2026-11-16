@@ -30,6 +30,22 @@ Every write path must classify its target as one of:
 The classification is cheap: `GetDriveTypeW` on Windows, `/proc/mounts` +
 `statfs` on Linux. Store it on the library handle, not per operation.
 
+As implemented (issue #258, classification half; `storage_safety.rs`):
+
+- **Windows**: a UNC path (`\\server\share`, `\\?\UNC\...`) is Network. A
+  drive letter goes through `GetDriveTypeW`: `DRIVE_REMOTE` is Network,
+  `DRIVE_REMOVABLE` and `DRIVE_CDROM` are Local-external, the rest
+  Local-internal. The path is canonicalized first (symlinks and junctions),
+  and `subst` drives are followed with `QueryDosDeviceW`, so `S:` substed
+  to a UNC path is Network.
+- **Linux**: the `/proc/mounts` fstype (`nfs`, `nfs4`, `cifs`, `smb3`,
+  `fuse.sshfs`, ...).
+- **Override**: `CALIBRE_OXIDE_STORAGE_TIER=network|external|local` forces
+  the tier, for a share the OS reports as local.
+- Out of scope, still open in #258: the device-removal and sleep/resume
+  monitors on Windows. Cloud-sync folders (OneDrive, Dropbox) are not
+  classified as a tier; they are ordinary local disks to this code.
+
 ## 2. The write discipline
 
 **Every** durable mutation to a library folder or to `metadata.db` follows
@@ -59,13 +75,22 @@ identified by uuid).
 
 ## 3. SQLite discipline
 
-- `metadata.db` and all sidecar databases MUST open in **WAL** mode with
-  `synchronous=FULL`.
+- `metadata.db` and all sidecar databases open with `synchronous=FULL`, in
+  **WAL** mode on local tiers and in **`journal_mode=DELETE`** (rollback
+  journal) on the Network tier. SQLite's WAL needs shared memory and is
+  documented as unsupported on network filesystems, so it can corrupt the
+  database or fail to lock there. Sidecars follow `metadata.db`'s mode.
+  A database found in WAL mode on a network tier (first opened locally, or
+  by an older oxide) is switched back to DELETE on open, but only while this
+  process holds the writer lock and only if SQLite confirms the switch; if
+  it cannot, the open is refused with a message rather than continuing in
+  WAL over the network.
 - All schema-altering statements run inside `BEGIN IMMEDIATE ... COMMIT`.
 - Every write path checkpoints (`PRAGMA wal_checkpoint(TRUNCATE)`) after
-  the operation is journaled and before it is acked. On external/network
-  storage, checkpoint every write. On local-internal, checkpoint every 32
-  writes or 5 s.
+  the operation is journaled and before it is acked, on local tiers: every 32
+  writes or 5 s (a background thread). The Network tier has no WAL, so there
+  is nothing to checkpoint and the thread is not started; DELETE mode
+  commits durably on every transaction.
 - Never open the SQLite file with `journal_mode=MEMORY` or
   `synchronous=OFF` on any tier.
 
@@ -102,6 +127,32 @@ identified by uuid).
   filesystem uuid + top-level `.calibre-oxide/library.id`) does not match
   what we recorded pre-suspend, the handle transitions to `Detached`.
   This is the codified answer to the airport-SSD incident.
+
+### Library in use by another program (#258 follow-up)
+
+Real calibre writes no marker into the library. Its GUI, `calibre-server`
+and `calibredb` share a per-user, per-machine named mutex
+(`calibre-singleinstance-<user>-db`; `utils/lock.py`), which excludes them
+from each other on one machine and says nothing about *which* library or
+about other machines. Oxide therefore combines what is detectable
+(`storage_safety.rs`), all at open time:
+
+| Signal | Platform | Effect |
+|---|---|---|
+| `metadata.db` cannot be opened with share mode 0 (another process has it open; retried ~0.6 s to ride out an antivirus scan) | Windows, local and SMB | refuses writes |
+| `BEGIN EXCLUSIVE` returns busy (another connection is mid-transaction) | all | refuses writes |
+| calibre's named mutex is held | Windows | warning only (it is not tied to a library) |
+| writer lock held, record in `.calibre-oxide/writer.owner` names a different process or host | all | refuses writes, names the host and pid |
+
+`writer.owner` holds host, pid and a timestamp refreshed every 30 s on the
+Network tier. If the OS lock is free but the record names another host and
+is under 120 s old (judged on the file server's own clock, by comparing
+mtimes, so clock skew between machines does not matter), the file server is
+not enforcing locks across clients and that host is probably still writing,
+so the open is refused. An older record is treated as left by a crash and
+taken over with a warning. A second `Backend` in the same process never
+trips these probes. `CALIBRE_OXIDE_ALLOW_SHARED_LIBRARY=1` skips the probes.
+The server reports all of this in `/ajax/library-info` under `storage`.
 
 ## 6. Network storage
 

@@ -107,7 +107,10 @@ impl FtsConnection {
             // sidecar database needs its own journal_mode/synchronous
             // pragma -- unqualified PRAGMA journal_mode only applies
             // to `main`, not to an ATTACHed schema.
-            conn.execute_batch("PRAGMA fts_db.journal_mode=WAL; PRAGMA fts_db.synchronous=FULL;")?;
+            // Follows `main`'s mode (#258).
+            conn.execute_batch(&crate::storage_safety::sidecar_journal_sql(
+                &conn, "fts_db",
+            ))?;
 
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS fts_db.dirtied_formats (

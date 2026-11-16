@@ -176,9 +176,10 @@ impl NotesConnection {
             // sidecar database needs its own journal_mode/synchronous
             // pragma -- unqualified PRAGMA journal_mode only applies
             // to `main`, not to an ATTACHed schema.
-            conn.execute_batch(
-                "PRAGMA notes_db.journal_mode=WAL; PRAGMA notes_db.synchronous=FULL;",
-            )?;
+            // Follows `main`'s mode (#258).
+            conn.execute_batch(&crate::storage_safety::sidecar_journal_sql(
+                &conn, "notes_db",
+            ))?;
 
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS notes_db.notes (

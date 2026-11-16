@@ -183,9 +183,12 @@ impl ChecksumStore {
             // sidecar database needs its own journal_mode/synchronous
             // pragma -- unqualified PRAGMA journal_mode only applies
             // to `main`, not to an ATTACHed schema.
-            conn.execute_batch(
-                "PRAGMA checksums_db.journal_mode=WAL; PRAGMA checksums_db.synchronous=FULL;",
-            )?;
+            // Follows `main`'s mode, so a network-tier library never
+            // gets a WAL sidecar (#258).
+            conn.execute_batch(&crate::storage_safety::sidecar_journal_sql(
+                &conn,
+                "checksums_db",
+            ))?;
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS checksums_db.file_checksums (
                     book_id INTEGER NOT NULL,

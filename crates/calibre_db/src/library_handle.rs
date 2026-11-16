@@ -424,6 +424,90 @@ fn classify_writer_lock_error(e: fs::TryLockError) -> LibraryHandleError {
     }
 }
 
+/// Who holds the writer lock, recorded next to it in `writer.owner`.
+/// A separate file (not the lock file itself) because on Windows a
+/// locked byte range cannot be read by another process, and the whole
+/// point is that the *loser* can read who the winner is.
+const WRITER_OWNER_FILE_NAME: &str = "writer.owner";
+/// Scratch file whose mtime is the file server's "now" (see
+/// [`owner_record_age`]).
+const CLOCK_PROBE_FILE_NAME: &str = "clock.probe";
+/// How often a network-tier handle refreshes its owner record.
+const WRITER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+/// An owner record on another host older than this (by the file
+/// server's own clock) is treated as left behind by a crash.
+const WRITER_STALE_AFTER: Duration = Duration::from_secs(120);
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct WriterOwner {
+    pub host: String,
+    pub pid: u32,
+    pub updated_unix: u64,
+}
+
+impl WriterOwner {
+    fn this_process() -> Self {
+        WriterOwner {
+            host: crate::storage_safety::local_hostname(),
+            pid: std::process::id(),
+            updated_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        }
+    }
+
+    fn is_this_host(&self) -> bool {
+        self.host == crate::storage_safety::local_hostname()
+    }
+
+    fn is_this_process(&self) -> bool {
+        self.is_this_host() && self.pid == std::process::id()
+    }
+}
+
+fn read_writer_owner(handle_dir: &Path) -> Option<WriterOwner> {
+    let text = fs::read_to_string(handle_dir.join(WRITER_OWNER_FILE_NAME)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn write_writer_owner(handle_dir: &Path) -> io::Result<()> {
+    let json = serde_json::to_string(&WriterOwner::this_process())
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    fs::write(handle_dir.join(WRITER_OWNER_FILE_NAME), json)
+}
+
+/// Age of the owner record, measured entirely on the file server's
+/// clock: write a probe file and compare its mtime to the owner file's.
+/// Comparing against this machine's own clock would misjudge staleness
+/// whenever the two machines' clocks differ.
+fn owner_record_age(handle_dir: &Path) -> Option<Duration> {
+    let probe = handle_dir.join(CLOCK_PROBE_FILE_NAME);
+    fs::write(&probe, b"").ok()?;
+    let now = fs::metadata(&probe).ok()?.modified().ok()?;
+    let then = fs::metadata(handle_dir.join(WRITER_OWNER_FILE_NAME))
+        .ok()?
+        .modified()
+        .ok()?;
+    Some(now.duration_since(then).unwrap_or(Duration::ZERO))
+}
+
+/// The user-facing sentence for a foreign writer-lock owner.
+fn describe_writer_owner(owner: &WriterOwner, last_seen: Option<Duration>) -> String {
+    let who = if owner.is_this_host() {
+        format!("another oxide process on this computer (process {})", owner.pid)
+    } else {
+        format!("oxide on the computer '{}' (process {})", owner.host, owner.pid)
+    };
+    let seen = match last_seen {
+        Some(a) => format!(" It was last active {}s ago.", a.as_secs()),
+        None => String::new(),
+    };
+    format!(
+        "This library is open for editing by {who}.{seen} Close it there first; if that computer crashed, wait two minutes and reopen."
+    )
+}
+
 /// Test-only: like `LibraryHandle::open_impl(dir, retention, false,
 /// false)`, but retries briefly on `AlreadyLocked` -- extra defense in
 /// depth on top of [`FLOCK_TEST_SERIALIZE`] for tests that deliberately
@@ -473,6 +557,16 @@ pub enum LibraryHandleError {
     Io(#[from] io::Error),
     #[error("another process already holds the writer lock for this library")]
     AlreadyLocked,
+    /// The writer lock is held by an oxide instance whose owner record
+    /// (`writer.owner`) names a different process or host. Same meaning
+    /// as [`LibraryHandleError::AlreadyLocked`], with the who/where.
+    #[error("{0}")]
+    LockedByOther(String),
+    /// Another program (calibre, or something else holding `metadata.db`
+    /// open) was detected using the library; the message names the
+    /// signal that fired. See `storage_safety`.
+    #[error("{0}")]
+    InUse(String),
     /// Real per docs/FAULT_TOLERANCE.md §4's contract ("no retries
     /// hidden in the handle"); reserved -- nothing yet produces this
     /// (see module doc).
@@ -655,6 +749,39 @@ pub(crate) struct Shared {
     /// this.
     #[cfg(unix)]
     inhibitor: Mutex<Option<std::os::fd::OwnedFd>>,
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        // Runs while `lock_file` is still held, so no other writer can
+        // have replaced the owner record in between. Skipped while
+        // suspended (lock released; the record may be someone else's).
+        let holding = self.lock_file.lock().map(|g| g.is_some()).unwrap_or(false);
+        if holding {
+            if let Some(owner) = read_writer_owner(&self.handle_dir) {
+                if owner.is_this_process() {
+                    let _ = fs::remove_file(self.handle_dir.join(WRITER_OWNER_FILE_NAME));
+                }
+            }
+        }
+    }
+}
+
+/// Network tier only: keeps the owner record's timestamp fresh so a
+/// writer on another host can tell a live holder from a crashed one
+/// (see [`WRITER_STALE_AFTER`]). Exits once the handle is gone.
+fn spawn_owner_heartbeat(shared: std::sync::Weak<Shared>) {
+    let _ = std::thread::Builder::new()
+        .name("calibre-oxide-writer-heartbeat".to_string())
+        .spawn(move || loop {
+            std::thread::sleep(WRITER_HEARTBEAT_INTERVAL);
+            let Some(shared) = shared.upgrade() else {
+                return;
+            };
+            if shared.lock_file.lock().map(|g| g.is_some()).unwrap_or(false) {
+                let _ = write_writer_owner(&shared.handle_dir);
+            }
+        });
 }
 
 impl Shared {
@@ -1020,7 +1147,12 @@ impl Shared {
     /// that sidesteps the "multiple independent `Backend` instances"
     /// complexity a registry-based design would have needed.
     pub(crate) fn prepare_for_suspend(&self) {
-        checkpoint_wal_best_effort(&self.library_path);
+        // A network-tier library is in rollback-journal (DELETE) mode,
+        // so there is no WAL to checkpoint -- and opening extra
+        // connections over the network is exactly what to avoid.
+        if self.tier != StorageTier::Network {
+            checkpoint_wal_best_effort(&self.library_path);
+        }
         fsync_dir(Some(&self.journal_dir)).ok();
         *self.lock_file.lock().unwrap() = None; // drop -> releases the OS lock
         self.set_state(HandleState::Suspended);
@@ -1080,6 +1212,7 @@ impl Shared {
             Ok(head) => {
                 *self.journal_head.lock().unwrap() = head;
                 *self.lock_file.lock().unwrap() = Some(lock_file);
+                let _ = write_writer_owner(&self.handle_dir);
                 self.set_state(HandleState::Open);
             }
             Err(_) => {
@@ -1586,15 +1719,6 @@ impl LibraryHandle {
         let handle_dir = library_path.join(LIBRARY_HANDLE_DIR_NAME);
         fs::create_dir_all(&handle_dir)?;
 
-        let lock_path = handle_dir.join(WRITER_LOCK_FILE_NAME);
-        let lock_file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(&lock_path)?;
-        if let Err(e) = lock_file.try_lock() {
-            return Err(classify_writer_lock_error(e));
-        }
-
         let (tier, network_retry_policy) = match force_tier_and_policy {
             Some((tier, policy)) => (tier, policy),
             None => (
@@ -1602,6 +1726,49 @@ impl LibraryHandle {
                 REAL_NETWORK_RETRY_POLICY,
             ),
         };
+
+        let lock_path = handle_dir.join(WRITER_LOCK_FILE_NAME);
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)?;
+        if let Err(e) = lock_file.try_lock() {
+            let base = classify_writer_lock_error(e);
+            if matches!(base, LibraryHandleError::AlreadyLocked) {
+                if let Some(owner) = read_writer_owner(&handle_dir) {
+                    if !owner.is_this_process() {
+                        return Err(LibraryHandleError::LockedByOther(describe_writer_owner(
+                            &owner, None,
+                        )));
+                    }
+                }
+            }
+            return Err(base);
+        }
+        // The OS lock is ours. If the previous owner record is from a
+        // different host, either that host crashed (stale: take over) or
+        // the file server does not enforce locks across clients (NFS
+        // without lockd, some NAS firmware) and that host is still
+        // writing. On a network tier a recent heartbeat distinguishes the
+        // two; refuse rather than risk two writers.
+        if tier == StorageTier::Network {
+            if let Some(owner) = read_writer_owner(&handle_dir) {
+                if !owner.is_this_host() {
+                    let age = owner_record_age(&handle_dir);
+                    if matches!(age, Some(a) if a < WRITER_STALE_AFTER) {
+                        return Err(LibraryHandleError::LockedByOther(describe_writer_owner(
+                            &owner, age,
+                        )));
+                    }
+                    log::warn!(
+                        "taking over a stale writer lock left by host {} (pid {})",
+                        owner.host,
+                        owner.pid
+                    );
+                }
+            }
+        }
+        write_writer_owner(&handle_dir)?;
         let suspended_block_timeout =
             force_suspended_block_timeout.unwrap_or(REAL_SUSPENDED_BLOCK_TIMEOUT);
 
@@ -1634,6 +1801,10 @@ impl LibraryHandle {
             #[cfg(unix)]
             inhibitor: Mutex::new(None),
         });
+
+        if tier == StorageTier::Network {
+            spawn_owner_heartbeat(Arc::downgrade(&shared));
+        }
 
         #[cfg(unix)]
         {
@@ -2156,7 +2327,7 @@ fn fsync_dir(dir: Option<&Path>) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-pub(crate) fn classify_storage_tier(path: &Path) -> StorageTier {
+pub(crate) fn classify_storage_tier_os(path: &Path) -> StorageTier {
     let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let mounts = fs::read_to_string("/proc/mounts").unwrap_or_default();
     let Some((device, fstype)) = best_matching_mount(&mounts, &target) else {
@@ -2265,15 +2436,24 @@ fn load_or_create_library_id(handle_dir: &Path) -> io::Result<String> {
     }
 }
 
+/// Issue #258 (classification half): UNC paths are `Network`, drive
+/// letters go through `GetDriveTypeW` (`DRIVE_REMOTE` is `Network`,
+/// `DRIVE_REMOVABLE` is `LocalExternal`), and `subst`/junction/symlink
+/// indirection is resolved first. The decision logic lives in
+/// [`crate::storage_safety::classify_windows_path`], where it is
+/// unit-tested without a real share. The device-removal and
+/// sleep/resume monitors of #258 are NOT addressed here.
 #[cfg(windows)]
-pub(crate) fn classify_storage_tier(_path: &Path) -> StorageTier {
-    // Real classification needs `GetDriveTypeW`, which this port
-    // can't compile-check or test on this workspace's Linux-only
-    // toolchain -- see module doc. `LocalInternal` is the
-    // conservative default (assume the least caution is needed only
-    // when we genuinely can't tell otherwise, matching this file's
-    // `/proc/mounts`-unavailable fallback on Unix).
-    StorageTier::LocalInternal
+pub(crate) fn classify_storage_tier_os(path: &Path) -> StorageTier {
+    crate::storage_safety::classify_windows(path)
+}
+
+/// The tier a library path is treated as:
+/// `CALIBRE_OXIDE_STORAGE_TIER` if set (a user override for a share the
+/// OS misreports, and a hook for exercising network behaviour without a
+/// real share), otherwise the OS classification.
+pub(crate) fn classify_storage_tier(path: &Path) -> StorageTier {
+    crate::storage_safety::tier_override().unwrap_or_else(|| classify_storage_tier_os(path))
 }
 
 /// Parses `/proc/mounts` (`device mount_point fstype ...` per line,
@@ -2423,6 +2603,89 @@ mod tests {
         // Releases automatically once the first handle (and its lock
         // file descriptor) drops.
         assert!(LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, true, false).is_ok());
+    }
+
+    fn plant_owner(dir: &Path, host: &str, pid: u32) {
+        let handle_dir = dir.join(LIBRARY_HANDLE_DIR_NAME);
+        fs::create_dir_all(&handle_dir).unwrap();
+        let owner = WriterOwner { host: host.to_string(), pid, updated_unix: 0 };
+        fs::write(
+            handle_dir.join(WRITER_OWNER_FILE_NAME),
+            serde_json::to_string(&owner).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_writer_owner_record_names_this_process_and_is_removed_on_drop() {
+        let _flock_test_guard = flock_test_guard();
+        let dir = tempdir().unwrap();
+        let handle =
+            LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, false, false).unwrap();
+        let owner = read_writer_owner(&dir.path().join(LIBRARY_HANDLE_DIR_NAME)).unwrap();
+        assert!(owner.is_this_process());
+        drop(handle);
+        assert!(!dir
+            .path()
+            .join(LIBRARY_HANDLE_DIR_NAME)
+            .join(WRITER_OWNER_FILE_NAME)
+            .exists());
+    }
+
+    #[test]
+    fn a_lock_lost_to_another_host_names_that_host() {
+        let _flock_test_guard = flock_test_guard();
+        let dir = tempdir().unwrap();
+        let _first =
+            LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, false, false).unwrap();
+        // The first holder's record is overwritten as if by a holder on
+        // another machine sharing this directory.
+        plant_owner(dir.path(), "NAS-CLIENT-2", 4242);
+        let err = LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, false, false)
+            .err()
+            .expect("must not open");
+        match err {
+            LibraryHandleError::LockedByOther(msg) => {
+                assert!(msg.contains("NAS-CLIENT-2"), "{msg}");
+                assert!(msg.contains("4242"), "{msg}");
+            }
+            other => panic!("expected LockedByOther, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn on_a_network_tier_a_fresh_foreign_owner_blocks_even_when_the_os_lock_is_free() {
+        let _flock_test_guard = flock_test_guard();
+        let dir = tempdir().unwrap();
+        // A lockless file server: nothing holds the OS lock, but the
+        // other host's record was written just now.
+        plant_owner(dir.path(), "OTHER-HOST", 7);
+        let err = LibraryHandle::open_for_network_tier_test(dir.path())
+            .err()
+            .expect("a recently-active foreign writer must block");
+        assert!(matches!(err, LibraryHandleError::LockedByOther(_)), "{err:?}");
+        // The same record on a local tier is stale by policy: the OS
+        // lock is the authority there.
+        assert!(LibraryHandle::open_impl(dir.path(), JOURNAL_PRUNE_RETENTION, false, false).is_ok());
+    }
+
+    #[test]
+    fn on_a_network_tier_a_stale_foreign_owner_is_taken_over() {
+        let _flock_test_guard = flock_test_guard();
+        let dir = tempdir().unwrap();
+        plant_owner(dir.path(), "OTHER-HOST", 7);
+        let owner_path = dir.path().join(LIBRARY_HANDLE_DIR_NAME).join(WRITER_OWNER_FILE_NAME);
+        let hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+        fs::File::options()
+            .write(true)
+            .open(&owner_path)
+            .unwrap()
+            .set_modified(hour_ago)
+            .unwrap();
+        let handle = LibraryHandle::open_for_network_tier_test(dir.path()).unwrap();
+        assert_eq!(handle.tier(), StorageTier::Network);
+        let owner = read_writer_owner(&dir.path().join(LIBRARY_HANDLE_DIR_NAME)).unwrap();
+        assert!(owner.is_this_process());
     }
 
     #[test]

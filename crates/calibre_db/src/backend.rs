@@ -206,6 +206,67 @@ fn spawn_checkpoint_thread(
         });
 }
 
+fn refuse_open(msg: String) -> SqlError {
+    SqlError::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+        Some(msg),
+    )
+}
+
+/// Puts `metadata.db` in the journal mode its tier needs (#258) and
+/// returns the mode in effect (`"wal"` or `"delete"`).
+///
+/// Local tiers get WAL as before. The network tier gets DELETE, and a
+/// database found in WAL mode there (a library first opened locally, or
+/// by an older oxide) is converted back -- but only while this process
+/// holds the writer lock, and only if SQLite reports the switch took
+/// (it cannot while another connection has the file open). Otherwise
+/// the open is refused with a message, never silently continued in WAL
+/// over the network, which can corrupt the database.
+fn configure_journal_mode(
+    conn: &Connection,
+    library_path: &Path,
+    tier: crate::library_handle::StorageTier,
+) -> SqlResult<String> {
+    use crate::storage_safety::JournalMode;
+    let want = JournalMode::for_tier(tier);
+    let current: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+    if want == JournalMode::Wal {
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
+        return Ok("wal".to_string());
+    }
+    if JournalMode::parse(&current) != Some(JournalMode::Delete) {
+        // Converting rewrites the file header; only do it as the sole
+        // writer.
+        let handle_dir = library_path.join(crate::constants::LIBRARY_HANDLE_DIR_NAME);
+        let lock_result = std::fs::create_dir_all(&handle_dir).and_then(|_| {
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(handle_dir.join(crate::constants::WRITER_LOCK_FILE_NAME))?;
+            f.try_lock()
+                .map(|_| f)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::WouldBlock, e.to_string()))
+        });
+        let _lock = lock_result.map_err(|_| {
+            refuse_open(format!(
+                "This library is on network storage but its database is in WAL mode (journal mode {current}), \
+                 which is unsafe over a network share, and another program has the library locked so it cannot \
+                 be switched back. Close the other program (calibre or oxide on another computer) and reopen."
+            ))
+        })?;
+        let now: String = conn.query_row("PRAGMA journal_mode=DELETE", [], |r| r.get(0))?;
+        if JournalMode::parse(&now) != Some(JournalMode::Delete) {
+            return Err(refuse_open(format!(
+                "This library is on network storage but its database is still in {now} mode, which is unsafe \
+                 over a network share. Another program has the database open; close it and reopen this library."
+            )));
+        }
+    }
+    conn.execute_batch("PRAGMA synchronous=FULL;")?;
+    Ok("delete".to_string())
+}
+
 /// `Clone` is cheap and shares the same live connection (`conn` is an
 /// `Arc<Mutex<Connection>>`) -- used by [`crate::library::Library`] to
 /// hand its own connection to [`crate::cache::Cache`]/`search.rs`
@@ -242,6 +303,33 @@ pub struct Backend {
     /// fed. Without it, rebuilding the database would double every
     /// entry in the log it was rebuilt from.
     replaying: Arc<AtomicBool>,
+    /// The tier this library was classified as when opened (#258).
+    storage_tier: crate::library_handle::StorageTier,
+    /// `metadata.db`'s journal mode as actually in effect (`"wal"` or
+    /// `"delete"`); `"delete"` on the network tier.
+    journal_mode: String,
+    /// Whether this open started the background WAL checkpoint thread
+    /// (never on a network tier).
+    checkpoint_thread_running: bool,
+    /// Signals, found at open time, that another program has the
+    /// library open. Hard ones make [`Backend::write_handle`] refuse.
+    in_use: Arc<crate::storage_safety::InUseReport>,
+    /// Keeps this process's "this path is open" registration alive for
+    /// as long as any clone of this `Backend` is.
+    _open_guard: Arc<crate::storage_safety::ProcessOpenGuard>,
+}
+
+/// What the server and UI show about where the library lives (#258).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StorageStatus {
+    /// `local_internal`, `local_external` or `network`.
+    pub tier: &'static str,
+    /// `wal` or `delete`.
+    pub journal_mode: String,
+    /// Signals that another program has the library open.
+    pub in_use: Vec<crate::storage_safety::InUseSignal>,
+    /// Set when writes are refused because of a hard in-use signal.
+    pub write_blocked_reason: Option<String>,
 }
 
 /// Suppresses change-log appends for as long as it is alive.
@@ -293,6 +381,19 @@ impl Backend {
         })?;
         let db_path = library_path.join("metadata.db");
 
+        // Issue #258: the tier decides the journal mode, so classify
+        // before the first connection is opened.
+        let tier = force_tier
+            .unwrap_or_else(|| crate::library_handle::classify_storage_tier(&library_path));
+
+        // Is another program using this library? Probed before this
+        // process opens its own handle on `metadata.db`, which would
+        // otherwise be what the probe trips over.
+        let (open_guard, other_backend_in_process) =
+            crate::storage_safety::ProcessOpenGuard::register(&library_path);
+        let mut in_use = crate::storage_safety::InUseReport::default();
+        crate::storage_safety::probe_before_open(&db_path, other_backend_in_process, &mut in_use);
+
         let mut conn = Connection::open(&db_path)?;
 
         // Port of `Connection.__init__`'s pragmas.
@@ -301,15 +402,14 @@ impl Backend {
         )?;
 
         // docs/FAULT_TOLERANCE.md §3 (issue #93/#260, not an upstream
-        // port -- real calibre doesn't set these): WAL mode +
-        // synchronous=FULL, unconditionally, on every open. Never
-        // journal_mode=MEMORY/synchronous=OFF on any tier, per §3's
-        // own explicit prohibition -- there's nothing tier-dependent
-        // about turning WAL on in the first place, only about how
-        // aggressively it gets checkpointed afterward (still not
-        // implemented -- see this crate's `library_handle.rs` module
-        // doc and issue #260 for exactly what's deferred and why).
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
+        // port -- real calibre doesn't set these): synchronous=FULL on
+        // every open, never journal_mode=MEMORY/synchronous=OFF on any
+        // tier. The journal mode itself is tier-dependent (#258): WAL
+        // on local storage, DELETE on the network tier, where WAL's
+        // shared memory is unsupported.
+        let journal_mode = configure_journal_mode(&conn, &library_path, tier)?;
+
+        crate::storage_safety::probe_sqlite_busy(&conn, other_backend_in_process, &mut in_use);
 
         register_functions(&conn)?;
 
@@ -346,7 +446,7 @@ impl Backend {
              UPDATE authors SET sort=author_to_author_sort(name) WHERE sort IS NULL;",
         )?;
 
-        let backend = Backend {
+        let mut backend = Backend {
             library_path,
             db_path,
             conn: Arc::new(Mutex::new(conn)),
@@ -355,6 +455,11 @@ impl Backend {
             write_handle: Arc::new(Mutex::new(None)),
             change_log: Arc::new(Mutex::new(None)),
             replaying: Arc::new(AtomicBool::new(false)),
+            storage_tier: tier,
+            journal_mode: journal_mode.clone(),
+            checkpoint_thread_running: false,
+            in_use: Arc::new(in_use),
+            _open_guard: Arc::new(open_guard),
         };
 
         // Port of `DB.__init__`'s `self.library_id` access: "Guarantee
@@ -381,28 +486,59 @@ impl Backend {
         // migrated library's bootstrap doesn't trigger wasted
         // checkpoint attempts (or silently consume part of the real
         // write-count threshold) on an essentially-empty WAL.
-        let tier = force_tier
-            .unwrap_or_else(|| crate::library_handle::classify_storage_tier(&backend.library_path));
-        let cadence = force_cadence.unwrap_or(REAL_CHECKPOINT_CADENCE);
-        let cadence_state = Arc::new(Mutex::new(CheckpointCadenceState {
-            writes_since_checkpoint: 0,
-            last_checkpoint: Instant::now(),
-        }));
-        spawn_checkpoint_thread(
-            backend.library_path.clone(),
-            tier,
-            cadence,
-            Arc::downgrade(&cadence_state),
-        );
-        {
-            let cadence_state = Arc::clone(&cadence_state);
-            backend.conn.lock().unwrap().commit_hook(Some(move || {
-                cadence_state.lock().unwrap().writes_since_checkpoint += 1;
-                false // never request a rollback
+        //
+        // Issue #258: a network-tier library is in DELETE mode, so
+        // there is no WAL to checkpoint -- no checkpoint thread (it
+        // would open a second connection over the network for
+        // nothing) and no commit hook.
+        if journal_mode == "wal" {
+            let cadence = force_cadence.unwrap_or(REAL_CHECKPOINT_CADENCE);
+            let cadence_state = Arc::new(Mutex::new(CheckpointCadenceState {
+                writes_since_checkpoint: 0,
+                last_checkpoint: Instant::now(),
             }));
+            spawn_checkpoint_thread(
+                backend.library_path.clone(),
+                tier,
+                cadence,
+                Arc::downgrade(&cadence_state),
+            );
+            {
+                let cadence_state = Arc::clone(&cadence_state);
+                backend.conn.lock().unwrap().commit_hook(Some(move || {
+                    cadence_state.lock().unwrap().writes_since_checkpoint += 1;
+                    false // never request a rollback
+                }));
+            }
+            backend.checkpoint_thread_running = true;
         }
 
         Ok(backend)
+    }
+
+    /// The tier this library was classified as at open time.
+    pub fn storage_tier(&self) -> crate::library_handle::StorageTier {
+        self.storage_tier
+    }
+
+    /// `"wal"` or `"delete"`: the journal mode `metadata.db` is in.
+    pub fn journal_mode(&self) -> &str {
+        &self.journal_mode
+    }
+
+    /// Whether the background WAL checkpoint thread was started.
+    pub fn checkpoint_thread_running(&self) -> bool {
+        self.checkpoint_thread_running
+    }
+
+    /// Tier, journal mode and in-use signals, for the server and UI.
+    pub fn storage_status(&self) -> StorageStatus {
+        StorageStatus {
+            tier: crate::storage_safety::tier_name(self.storage_tier),
+            journal_mode: self.journal_mode.clone(),
+            in_use: self.in_use.signals.clone(),
+            write_blocked_reason: self.in_use.blocking_message(),
+        }
     }
 
     /// The real [`crate::library_handle::LibraryHandle`] for this
@@ -421,6 +557,12 @@ impl Backend {
         let mut guard = self.write_handle.lock().unwrap();
         if let Some(handle) = guard.as_ref() {
             return Ok(Arc::clone(handle));
+        }
+        // Another program using the library (calibre, or an editor on
+        // another machine) is a reason to refuse every write, with the
+        // signal that fired in the message (#258).
+        if let Some(reason) = self.in_use.blocking_message() {
+            return Err(crate::library_handle::LibraryHandleError::InUse(reason));
         }
         let handle = Arc::new(crate::library_handle::LibraryHandle::open(
             &self.library_path,
@@ -1043,23 +1185,123 @@ mod tests {
         wait_for_checkpoint(dir.path(), Duration::from_secs(2));
     }
 
+    // Issue #258: the network tier uses a rollback journal, never WAL,
+    // and starts no WAL checkpoint thread (this replaces a test that
+    // asserted a per-write WAL checkpoint on the network tier, which
+    // passed vacuously once there is no WAL at all).
     #[test]
-    fn checkpoint_cadence_fires_on_every_single_write_on_network_tier() {
+    fn network_tier_opens_in_delete_mode_with_no_wal_and_no_checkpoint_thread() {
         let dir = tempdir().unwrap();
         let backend = Backend::new_with_checkpoint_cadence_test(
             dir.path(),
             Some(crate::library_handle::StorageTier::Network),
-            CheckpointCadencePolicy {
-                write_threshold: 1000, // irrelevant on Network -- every write checkpoints
-                time_threshold: Duration::from_secs(600),
-                poll_interval: FAST_TEST_CHECKPOINT_POLL,
-            },
+            REAL_CHECKPOINT_CADENCE,
         )
         .unwrap();
-
+        assert_eq!(backend.journal_mode(), "delete");
+        assert!(!backend.checkpoint_thread_running());
+        let live: String = backend
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(live.to_lowercase(), "delete");
         write_one_book(&backend, 0);
+        assert!(!dir.path().join("metadata.db-wal").exists());
+        assert!(!dir.path().join("metadata.db-shm").exists());
+        let status = backend.storage_status();
+        assert_eq!(status.tier, "network");
+        assert_eq!(status.journal_mode, "delete");
+    }
 
-        wait_for_checkpoint(dir.path(), Duration::from_secs(2));
+    #[test]
+    fn local_tier_keeps_wal_and_the_checkpoint_thread() {
+        let (_dir, backend) = open_test_library();
+        assert_eq!(backend.journal_mode(), "wal");
+        assert!(backend.checkpoint_thread_running());
+        assert_eq!(backend.storage_status().tier, "local_internal");
+    }
+
+    #[test]
+    fn a_wal_database_found_on_a_network_tier_is_switched_back_to_delete() {
+        let dir = tempdir().unwrap();
+        {
+            let local = Backend::new(dir.path()).unwrap();
+            write_one_book(&local, 0);
+            assert_eq!(local.journal_mode(), "wal");
+        }
+        let network = Backend::new_with_checkpoint_cadence_test(
+            dir.path(),
+            Some(crate::library_handle::StorageTier::Network),
+            REAL_CHECKPOINT_CADENCE,
+        )
+        .unwrap();
+        assert_eq!(network.journal_mode(), "delete");
+        // The book written in WAL mode survived the conversion.
+        let n: i64 = network
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM books", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+        // Sidecars follow main: no WAL on the network tier.
+        let sql = crate::storage_safety::sidecar_journal_sql(&network.conn.lock().unwrap(), "x");
+        assert!(sql.contains("journal_mode=DELETE"), "{sql}");
+    }
+
+    #[test]
+    fn a_wal_database_that_cannot_be_switched_is_refused_not_used_in_wal() {
+        let dir = tempdir().unwrap();
+        {
+            let local = Backend::new(dir.path()).unwrap();
+            write_one_book(&local, 0);
+        }
+        // Another connection keeps the database open mid-read, so the
+        // WAL -> DELETE switch cannot take.
+        let other = Connection::open(dir.path().join("metadata.db")).unwrap();
+        other.execute_batch("BEGIN; SELECT count(*) FROM books;").unwrap();
+        let result = Backend::new_with_checkpoint_cadence_test(
+            dir.path(),
+            Some(crate::library_handle::StorageTier::Network),
+            REAL_CHECKPOINT_CADENCE,
+        );
+        assert!(result.is_err(), "must refuse rather than continue in WAL");
+    }
+
+    #[test]
+    fn writes_and_the_change_log_work_in_delete_mode() {
+        let dir = tempdir().unwrap();
+        let backend = Backend::new_with_checkpoint_cadence_test(
+            dir.path(),
+            Some(crate::library_handle::StorageTier::Network),
+            REAL_CHECKPOINT_CADENCE,
+        )
+        .unwrap();
+        for n in 0..3 {
+            write_one_book(&backend, n);
+        }
+        backend.write_handle().unwrap();
+        backend.change_log().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn another_program_holding_metadata_db_open_blocks_writes_with_a_clear_message() {
+        let dir = tempdir().unwrap();
+        drop(Backend::new(dir.path()).unwrap());
+        // Stands in for calibre's long-lived SQLite connection.
+        let _other_program = std::fs::File::open(dir.path().join("metadata.db")).unwrap();
+        let backend = Backend::new(dir.path()).unwrap();
+        let status = backend.storage_status();
+        assert!(status.in_use.iter().any(|s| s.signal == "exclusive_open_denied"));
+        let err = backend.write_handle().err().expect("writes must be refused");
+        assert!(matches!(
+            err,
+            crate::library_handle::LibraryHandleError::InUse(_)
+        ));
+        assert!(err.to_string().contains("metadata.db"));
     }
 
     #[test]
