@@ -1279,8 +1279,11 @@ mod tests {
     #[test]
     fn date_search_year_only_query_matches_whole_year() {
         let field = date_field(&[
-            ("2020-05-01T00:00:00+00:00", &[1]),
-            ("2021-01-01T00:00:00+00:00", &[2]),
+            // Mid-year on purpose: date search compares in local time (as
+            // calibre does), so a midnight-UTC Jan 1 is the previous year
+            // west of Greenwich and the test would depend on the runner's TZ.
+            ("2020-05-01T12:00:00+00:00", &[1]),
+            ("2021-06-01T12:00:00+00:00", &[2]),
         ]);
         let m = DateSearch::call("2020", &field).unwrap();
         assert_eq!(m, hs(&[1]));

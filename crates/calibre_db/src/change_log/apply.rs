@@ -74,7 +74,7 @@ pub fn apply(cache: &Cache, change: &Change) -> Result<bool> {
         }
         ChangeOp::BookRemoved { book } => match cache.book_id_for_uuid(book)? {
             Some(id) => {
-                cache.delete_book(id)?;
+                cache.delete_book_keep_files(id)?;
                 Ok(true)
             }
             // Removing a book that is not here is the desired end state

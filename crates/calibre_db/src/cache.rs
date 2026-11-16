@@ -130,6 +130,71 @@ pub struct FormatFileInfo {
     pub path: PathBuf,
 }
 
+/// What [`Cache::delete_book_with`] does with the book's files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BookFiles {
+    /// Send the book's own files to the system wastebasket.
+    Trash,
+    /// Touch no file; record the format files in the ignore list.
+    Keep,
+}
+
+/// What a book removal did on disk. Paths are relative to the library
+/// root and `/`-separated.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BookDeletion {
+    /// Files sent to the wastebasket.
+    pub trashed: Vec<String>,
+    /// Format files left on disk and put on the ignore list.
+    pub ignored: Vec<String>,
+    /// `(path, why)` for files that could not be trashed. They were left
+    /// in place, never hard-deleted.
+    pub failed: Vec<(String, String)>,
+    /// The book's folder, if it was emptied and removed.
+    pub folder_removed: Option<String>,
+}
+
+struct OwnFile {
+    rel: String,
+    hash: Option<String>,
+    is_format: bool,
+}
+
+/// True for a relative path made only of ordinary components: no `..`,
+/// no root or drive, no `.`, and nothing inside `.calibre-oxide`.
+fn path_is_plain(rel: &str) -> bool {
+    use std::path::Component;
+    let p = Path::new(rel);
+    let mut first = true;
+    for c in p.components() {
+        match c {
+            Component::Normal(n) => {
+                if first && n.to_string_lossy().eq_ignore_ascii_case(crate::constants::LIBRARY_HANDLE_DIR_NAME) {
+                    return false;
+                }
+                first = false;
+            }
+            _ => return false,
+        }
+    }
+    !first
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FORCE_TRASH_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sends one file to the system wastebasket. Never falls back to a
+/// permanent delete: if there is no wastebasket the file stays.
+fn trash_one(path: &Path) -> Result<(), String> {
+    #[cfg(test)]
+    if FORCE_TRASH_FAILURE.with(|f| f.get()) {
+        return Err("forced trash failure".to_string());
+    }
+    trash::delete(path).map_err(|e| e.to_string())
+}
+
 pub struct Cache {
     pub backend: Backend,
     /// Issue #222 phase 3: a lazily-loaded, per-`Cache`-instance
@@ -1104,15 +1169,84 @@ impl Cache {
         Ok(())
     }
 
-    /// Deletes a book's row (the real schema's `books_delete_trg`
-    /// cascades cleanup of every link/data/comments/identifiers row
-    /// for it) and its on-disk folder.
+    /// Deletes a book's row, and **only the files that book owns**,
+    /// sending them to the system wastebasket.
+    ///
+    /// This is the safe default for a caller that has no opinion about
+    /// the files; see [`Cache::delete_book_with`] for the rules and for
+    /// the keep-the-files variant. It no longer removes the book's
+    /// folder: `books.path` is shared by every book a scan found in one
+    /// folder (`register_book_in_place`), so removing "the folder" used
+    /// to take the siblings and any non-book files with it.
+    ///
+    /// Files that could not be sent to the wastebasket are left where
+    /// they are and logged; use [`Cache::delete_book_with`] to get them
+    /// back as data.
     pub fn delete_book(&self, book_id: i32) -> anyhow::Result<()> {
-        let path_rel = self.field_for(book_id, "path")?;
+        let outcome = self.delete_book_with(book_id, BookFiles::Trash)?;
+        for (path, why) in &outcome.failed {
+            log::warn!("book {book_id} was removed but {path} could not be sent to the wastebasket and was left in place: {why}");
+        }
+        Ok(())
+    }
+
+    /// Removes a book from the library, leaving every file where it is.
+    /// The format files are recorded in the ignore list so a rescan
+    /// does not add the book straight back. Used for "remove from
+    /// library, keep the file", and by change-log replay (which must
+    /// never touch a user's files on the strength of a log entry).
+    pub fn delete_book_keep_files(&self, book_id: i32) -> anyhow::Result<BookDeletion> {
+        self.delete_book_with(book_id, BookFiles::Keep)
+    }
+
+    /// The one real implementation of book removal.
+    ///
+    /// Everything that is read from the database (the folder, the format
+    /// file names, whether the folder is shared, the checksums) is read
+    /// **before** the row is deleted, since the `books_delete_trg`
+    /// trigger cascades the rest away.
+    ///
+    /// With [`BookFiles::Trash`] only the book's own files go: each
+    /// `data` row's `<name>.<format>` in the book's folder, and -- only
+    /// when no other book row has the same `path`, checked in the
+    /// database rather than inferred from naming -- the folder's
+    /// `cover.jpg` and `metadata.opf`. Never a recursive directory
+    /// delete. The folder is removed afterwards only if it is empty,
+    /// is not the library root and is not inside `.calibre-oxide`.
+    ///
+    /// A file that cannot be trashed is **not** hard-deleted. It stays,
+    /// is reported in [`BookDeletion::failed`], and is put on the ignore
+    /// list so the next scan does not resurrect the book.
+    pub fn delete_book_with(&self, book_id: i32, files: BookFiles) -> anyhow::Result<BookDeletion> {
+        let mut outcome = BookDeletion::default();
+        let Some(path_rel) = self.field_for(book_id, "path")? else {
+            // No such book: nothing on disk can be attributed to it.
+            self.checksums().remove_all_for_book(book_id)?;
+            let conn = self.backend.conn.lock().unwrap();
+            conn.execute("DELETE FROM books WHERE id = ?1", (book_id,))?;
+            return Ok(outcome);
+        };
+        let title = self.field_for(book_id, "title")?.unwrap_or_default();
         // Read before the row is deleted: afterwards there is no uuid
         // to record the removal against, and an unrecorded removal
         // comes back on the next rebuild.
         let uuid = self.book_uuid(book_id)?;
+        let dedicated = self.folder_is_dedicated(book_id, &path_rel)?;
+        let own = self.own_files(book_id, &path_rel, dedicated)?;
+        let cover_sidecar = crate::covers::sidecar_cover_path(self, book_id).ok();
+
+        if files == BookFiles::Keep {
+            // Recorded first, and with `?`: a book removed without its
+            // ignore entry is re-added by the next scan, so failing here
+            // (row untouched) beats succeeding without it. Only the format
+            // files are what a scan would re-add.
+            let library = &self.backend.library_path;
+            for file in own.iter().filter(|f| f.is_format && library.join(&f.rel).is_file()) {
+                self.ignored().ignore(&file.rel, file.hash.as_deref(), &title)?;
+                outcome.ignored.push(file.rel.clone());
+            }
+        }
+
         self.checksums().remove_all_for_book(book_id)?;
         {
             let conn = self.backend.conn.lock().unwrap();
@@ -1121,30 +1255,135 @@ impl Cache {
         if let Some(uuid) = uuid {
             self.record(crate::change_log::ChangeOp::BookRemoved { book: uuid });
         }
-        if let Some(rel_path) = path_rel {
-            if !rel_path.is_empty() {
-                let dir_path = self.backend.library_path.join(rel_path);
-                if dir_path.exists() {
-                    // A failed cleanup shouldn't undo the already-committed
-                    // DB delete; warn and move on, same as the original
-                    // `library.rs` behavior this replaces. Port of issue
-                    // #93's crate-wide write-path retrofit: real,
-                    // journaled, crash-safe removal through
-                    // `LibraryHandle` instead of a raw `fs::remove_dir_all`.
-                    match self.backend.write_handle() {
-                        Ok(handle) => {
-                            if let Err(e) = handle.remove_atomic(&dir_path) {
-                                eprintln!("Warning: failed to delete directory {dir_path:?}: {e}");
+
+        let library = self.backend.library_path.clone();
+        match files {
+            // Ignore entries were recorded before the row went.
+            BookFiles::Keep => {}
+            BookFiles::Trash => {
+                for file in &own {
+                    let absolute = library.join(&file.rel);
+                    if !absolute.is_file() {
+                        continue;
+                    }
+                    match trash_one(&absolute) {
+                        Ok(()) => outcome.trashed.push(file.rel.clone()),
+                        Err(why) => {
+                            if file.is_format {
+                                match self.ignored().ignore(&file.rel, file.hash.as_deref(), &title) {
+                                    Ok(()) => outcome.ignored.push(file.rel.clone()),
+                                    Err(e) => log::warn!("could not record {} in the ignore list: {e}", file.rel),
+                                }
                             }
-                        }
-                        Err(e) => {
-                            eprintln!("Warning: failed to delete directory {dir_path:?}: {e}");
+                            outcome.failed.push((file.rel.clone(), why));
                         }
                     }
                 }
+                // The sidecar cover is this app's own index state, not a
+                // user file; remove it through the journaled handle.
+                if let Some(cover) = cover_sidecar.filter(|c| c.is_file()) {
+                    if let Ok(handle) = self.backend.write_handle() {
+                        if let Err(e) = handle.remove_atomic(&cover) {
+                            log::warn!("could not remove cover {}: {e}", cover.display());
+                        }
+                    }
+                }
+                if outcome.failed.is_empty() {
+                    outcome.folder_removed = self.remove_book_folder_if_empty(&path_rel, dedicated);
+                }
             }
         }
-        Ok(())
+        Ok(outcome)
+    }
+
+    /// True when no *other* book row has this `path`. An empty path is
+    /// the library root and is never dedicated. Case-insensitive, so a
+    /// case-folding filesystem cannot make two books share a folder
+    /// unnoticed.
+    fn folder_is_dedicated(&self, book_id: i32, path_rel: &str) -> anyhow::Result<bool> {
+        if path_rel.is_empty() {
+            return Ok(false);
+        }
+        let conn = self.backend.conn.lock().unwrap();
+        let others: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM books WHERE id != ?1 AND lower(path) = lower(?2)",
+            (book_id, path_rel),
+            |row| row.get(0),
+        )?;
+        Ok(others == 0)
+    }
+
+    /// The files this book owns on disk, relative to the library root.
+    fn own_files(&self, book_id: i32, path_rel: &str, dedicated: bool) -> anyhow::Result<Vec<OwnFile>> {
+        if !path_rel.is_empty() && !path_is_plain(path_rel) {
+            log::warn!("book {book_id} has an unusable path {path_rel:?}; none of its files will be touched");
+            return Ok(Vec::new());
+        }
+        let checksums = self.checksums();
+        let mut out = Vec::new();
+        for (format, name) in self.format_file_names(book_id)? {
+            if name.is_empty() || name.contains(['/', '\\']) || !path_is_plain(&name) {
+                log::warn!("book {book_id} has an unusable format file name {name:?}; skipping it");
+                continue;
+            }
+            // Another book claiming the very same file must keep it.
+            let claimed_elsewhere: bool = {
+                let conn = self.backend.conn.lock().unwrap();
+                conn.query_row(
+                    "SELECT COUNT(*) FROM data d JOIN books b ON b.id = d.book
+                     WHERE d.book != ?1 AND lower(b.path) = lower(?2)
+                       AND lower(d.name) = lower(?3) AND upper(d.format) = upper(?4)",
+                    (book_id, path_rel, &name, &format),
+                    |row| row.get::<_, i64>(0),
+                )? > 0
+            };
+            if claimed_elsewhere {
+                continue;
+            }
+            let file = format!("{name}.{}", format.to_lowercase());
+            let rel = if path_rel.is_empty() { file } else { format!("{path_rel}/{file}") };
+            let (hash, _) = checksums.recorded_identity(book_id, "format", &format).unwrap_or((None, None));
+            out.push(OwnFile { rel, hash, is_format: true });
+        }
+        if dedicated {
+            for extra in ["cover.jpg", "metadata.opf"] {
+                out.push(OwnFile { rel: format!("{path_rel}/{extra}"), hash: None, is_format: false });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Removes `path_rel` (and, for a dedicated calibre-style
+    /// `Author/Title` folder, an author folder left empty) only if
+    /// empty. Uses `fs::remove_dir`, which refuses a non-empty
+    /// directory, so no content can be lost here even by a race.
+    fn remove_book_folder_if_empty(&self, path_rel: &str, dedicated: bool) -> Option<String> {
+        if path_rel.is_empty() || !path_is_plain(path_rel) {
+            return None;
+        }
+        let library = &self.backend.library_path;
+        let mut removed = None;
+        let mut current = PathBuf::from(path_rel);
+        loop {
+            if current.as_os_str().is_empty() {
+                break;
+            }
+            let absolute = library.join(&current);
+            if !absolute.is_dir() || fs::remove_dir(&absolute).is_err() {
+                break;
+            }
+            if removed.is_none() {
+                removed = Some(path_rel.to_string());
+            }
+            if !dedicated {
+                break;
+            }
+            match current.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => current = parent.to_path_buf(),
+                _ => break,
+            }
+        }
+        removed
     }
 
     /// Moves a book's folder to match a new title/author and renames
@@ -3670,40 +3909,117 @@ mod tests {
         cache.delete_book(book_id).unwrap();
 
         assert_eq!(cache.field_for(book_id, "title").unwrap(), None);
-        // The file survives, and that is deliberate. `delete_book`
-        // removes the book's own *folder*, and a root-level book has
-        // none -- the "folder" would be the library itself, which the
-        // empty-path guard exists to protect. Deleting a root-level
-        // book's file is `removal::delete_with_file`'s job (#896), which
-        // names the file explicitly.
-        assert!(dir.path().join("src.epub").exists());
-
-        // No journaled delete, because nothing on disk was deleted --
-        // see above. The LibraryHandle retrofit is still exercised by
-        // `delete_book`'s folder path, covered by the folder-move tests.
-        //
-        // Originally: delete_book goes through the real LibraryHandle
-        // (issue #93's crate-wide write-path retrofit) rather than a raw
-        // `fs::remove_dir_all`, proven by a journaled `DeleteFile` entry.
-        // Still true, but only reachable for a book with its own folder,
-        // which the test below covers.
+        // The book's own file goes to the wastebasket -- by name, not by
+        // removing a folder (a root-level book has none; its "folder"
+        // is the library itself).
+        assert!(!dir.path().join("src.epub").exists());
         assert_eq!(journaled_delete_count(dir.path()), 0);
     }
 
-    /// `delete_book` still removes a book's own folder through the real
-    /// `LibraryHandle`, journaled -- the behaviour #93 retrofitted. Only
-    /// reachable for a book that has a folder, which since #893 has to be
-    /// arranged rather than assumed.
+    /// A dedicated per-book folder is emptied (its own files only) and
+    /// then removed, along with the now-empty author folder.
     #[test]
-    fn delete_book_removes_a_books_own_folder_through_the_write_handle() {
+    fn delete_book_empties_and_removes_a_dedicated_folder() {
         let (dir, cache) = open_test_cache();
         let book_id = add_pdf_in_its_own_folder(dir.path(), &cache, "T", "A", "src");
+        fs::write(dir.path().join("A/T/cover.jpg"), b"jpg").unwrap();
+        fs::write(dir.path().join("A/T/metadata.opf"), b"opf").unwrap();
         assert!(dir.path().join("A/T").exists());
 
         cache.delete_book(book_id).unwrap();
 
         assert!(!dir.path().join("A/T").exists());
-        assert_eq!(journaled_delete_count(dir.path()), 1);
+        assert!(!dir.path().join("A").exists());
+        assert!(dir.path().exists());
+    }
+
+    /// The bug: books scanned from one folder share `books.path`, and
+    /// deleting one removed the folder with its siblings and every
+    /// non-book file in it.
+    #[test]
+    fn delete_book_leaves_siblings_and_non_book_files_in_a_shared_folder() {
+        let (dir, cache) = open_test_cache();
+        let folder = dir.path().join("Receipts");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("a.pdf"), b"%PDF a").unwrap();
+        fs::write(folder.join("b.pdf"), b"%PDF b").unwrap();
+        fs::write(folder.join("notes.txt"), b"not a book").unwrap();
+        fs::write(folder.join("cover.jpg"), b"someone else's picture").unwrap();
+        let mut meta = MetaInformation::default();
+        meta.title = "A".to_string();
+        let a = cache.register_book_in_place("Receipts/a.pdf", &meta).unwrap();
+        meta.title = "B".to_string();
+        let b = cache.register_book_in_place("Receipts/b.pdf", &meta).unwrap();
+
+        let outcome = cache.delete_book_with(a, BookFiles::Trash).unwrap();
+
+        assert_eq!(outcome.trashed, vec!["Receipts/a.pdf".to_string()]);
+        assert!(!folder.join("a.pdf").exists());
+        assert!(folder.join("b.pdf").exists(), "a sibling book was deleted");
+        assert!(folder.join("notes.txt").exists(), "a non-book file was deleted");
+        assert!(folder.join("cover.jpg").exists(), "a shared folder's cover.jpg is not this book's");
+        assert!(cache.field_for(b, "title").unwrap().is_some());
+        assert_eq!(outcome.folder_removed, None);
+    }
+
+    /// Deleting the last book of a folder that still holds a non-book file
+    /// must not remove the folder.
+    #[test]
+    fn delete_book_never_removes_a_folder_that_is_not_empty() {
+        let (dir, cache) = open_test_cache();
+        let folder = dir.path().join("Docs");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("a.pdf"), b"%PDF a").unwrap();
+        fs::write(folder.join("keep.txt"), b"mine").unwrap();
+        let id = cache.register_book_in_place("Docs/a.pdf", &MetaInformation::default()).unwrap();
+
+        cache.delete_book(id).unwrap();
+
+        assert!(!folder.join("a.pdf").exists());
+        assert!(folder.join("keep.txt").exists());
+    }
+
+    /// Without a wastebasket the file stays: no silent hard delete.
+    #[test]
+    fn delete_book_keeps_the_file_and_reports_when_trashing_fails() {
+        let (dir, cache) = open_test_cache();
+        let source = write_temp_file(dir.path(), "src.epub", b"x");
+        let mut meta = MetaInformation::default();
+        meta.title = "T".to_string();
+        let book_id = cache.add_book(&source, &meta).unwrap();
+
+        FORCE_TRASH_FAILURE.with(|f| f.set(true));
+        let outcome = cache.delete_book_with(book_id, BookFiles::Trash);
+        FORCE_TRASH_FAILURE.with(|f| f.set(false));
+        let outcome = outcome.unwrap();
+
+        assert_eq!(outcome.failed.len(), 1, "{outcome:?}");
+        assert!(outcome.trashed.is_empty());
+        assert!(dir.path().join("src.epub").exists(), "the file must not be hard-deleted");
+        // Ignored, so the next scan does not resurrect the book.
+        assert_eq!(cache.ignored().list().unwrap().len(), 1);
+    }
+
+    /// The library root is never removed, however empty it ends up.
+    #[test]
+    fn delete_book_never_removes_the_library_root() {
+        let (dir, cache) = open_test_cache();
+        let source = write_temp_file(dir.path(), "src.epub", b"x");
+        let book_id = cache.add_book(&source, &MetaInformation::default()).unwrap();
+        let outcome = cache.delete_book_with(book_id, BookFiles::Trash).unwrap();
+        assert_eq!(outcome.folder_removed, None);
+        assert!(dir.path().exists());
+        assert!(dir.path().join("metadata.db").exists());
+    }
+
+    #[test]
+    fn path_is_plain_rejects_escapes_and_the_state_directory() {
+        assert!(path_is_plain("A/B"));
+        assert!(!path_is_plain(""));
+        assert!(!path_is_plain("../x"));
+        assert!(!path_is_plain("A/../x"));
+        assert!(!path_is_plain("/abs"));
+        assert!(!path_is_plain(".calibre-oxide/covers"));
     }
 
     #[test]

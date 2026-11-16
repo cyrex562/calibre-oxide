@@ -23,7 +23,8 @@
 //!   check already uses. Not ported: `run_import_plugins` (upstream's
 //!   plugin-driven pre-import format conversion -- no plugin system
 //!   in this crate; the uploaded bytes are used as-is).
-//! - `POST /cdb/delete-books/{book_ids}` -- `Cache::delete_book` per id.
+//! - `POST /cdb/delete-books/{book_ids}` -- `removal::delete_with_file`
+//!   per id: the book's own files go to the wastebasket, never its folder.
 //! - `POST /cdb/set-cover/{book_id}` -- raw image bytes in the request
 //!   body, sniffed for a real JPEG/PNG magic number (matching
 //!   upstream's own `imghdr.what` check in `set-fields`; `set-cover`
@@ -166,22 +167,33 @@ async fn delete_books_handle(state: AppState, book_ids: String, library_id: Opti
         ids.push(id);
     }
 
-    tokio::task::spawn_blocking({
+    // Files go to the wastebasket (calibre's own semantics for "delete"),
+    // and only the files each book owns: never a whole folder, since books
+    // found in one folder share a `path`. A file that could not be
+    // trashed is left in place and reported, not hard-deleted.
+    let failed = tokio::task::spawn_blocking({
         let cache = cache.clone();
         let ids = ids.clone();
-        move || -> anyhow::Result<()> {
+        move || -> anyhow::Result<Vec<(i32, String, String)>> {
+            let mut failed = Vec::new();
             for id in ids {
-                cache.delete_book(id)?;
+                let report = calibre_db::removal::delete_with_file(&cache, id)?;
+                failed.extend(report.failed.into_iter().map(|(path, why)| (id, path, why)));
             }
-            Ok(())
+            Ok(failed)
         }
     })
     .await
     .map_err(|e| ServerError::InternalServerError(e.to_string()))?
-    .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+    .map_err(|e| ServerError::InternalServerError(format!("{e:#}")))?;
 
     web_socket::publish(&state, ChangeEvent::BooksDeleted { book_ids: ids });
-    Ok(Json(serde_json::json!({})))
+    if failed.is_empty() {
+        Ok(Json(serde_json::json!({})))
+    } else {
+        let failed: Vec<Value> = failed.into_iter().map(|(id, path, why)| serde_json::json!({"book_id": id, "path": path, "error": why})).collect();
+        Ok(Json(serde_json::json!({"failed": failed})))
+    }
 }
 
 /// `POST /cdb/embed-metadata/{book_ids}/{library_id}` (#958).
@@ -558,7 +570,9 @@ async fn set_fields_handle(state: AppState, book_id: i32, library_id: Option<Str
 #[derive(Debug, Deserialize)]
 pub struct CopyToLibraryBody {
     book_ids: Vec<i32>,
-    #[serde(default, rename = "move")]
+    /// Documented key is `move_books`; the bare `move` is accepted too
+    /// (an earlier server spelling, and what upstream's API names it).
+    #[serde(default, alias = "move")]
     move_books: bool,
     #[serde(default = "default_duplicate_action")]
     duplicate_action: String,
@@ -607,38 +621,59 @@ async fn copy_to_library_handle(state: AppState, target_library_id: String, sour
         )));
     }
 
-    let (response, copied_ids) = tokio::task::spawn_blocking(move || {
+    let (response, added_ids, removed_ids) = tokio::task::spawn_blocking(move || {
         let mut response = serde_json::Map::new();
-        let mut copied_ids = Vec::new();
+        // `removed_ids` are source ids; `added_ids` are destination ids.
+        let mut removed_ids = Vec::new();
+        let mut added_ids: Vec<i32> = Vec::new();
         for book_id in book_ids {
-            match calibre_db::copy_to_library::copy_one_book(&src_cache, &dest_cache, book_id, check_duplicates) {
-                Ok(Some(new_id)) => {
-                    response.insert(book_id.to_string(), serde_json::json!({"ok": true, "payload": new_id}));
-                    copied_ids.push(book_id);
+            match calibre_db::copy_to_library::copy_one_book_detailed(&src_cache, &dest_cache, book_id, check_duplicates) {
+                Ok(Some(copied)) => {
+                    added_ids.push(copied.book_id);
+                    let mut entry = serde_json::json!({"ok": true, "payload": copied.book_id});
+                    if !copied.skipped_custom_columns.is_empty() {
+                        entry["skipped_custom_columns"] = serde_json::json!(copied.skipped_custom_columns);
+                    }
+                    if move_books {
+                        // The source goes only once the destination copy
+                        // has been verified file by file; otherwise the
+                        // source stays and the entry reports why.
+                        match calibre_db::copy_to_library::remove_source_after_copy(&src_cache, &dest_cache, book_id, copied.book_id) {
+                            Ok(report) => {
+                                removed_ids.push(book_id);
+                                if !report.failed.is_empty() {
+                                    entry["warnings"] = serde_json::json!(report.failed.iter().map(|(p, why)| format!("could not remove {p} from the source library: {why}")).collect::<Vec<_>>());
+                                }
+                            }
+                            Err(e) => {
+                                entry = serde_json::json!({
+                                    "ok": false,
+                                    "payload": format!("copied to the destination as book {}, but the source book was kept: {e:#}", copied.book_id),
+                                    "copied_as": copied.book_id,
+                                });
+                            }
+                        }
+                    }
+                    response.insert(book_id.to_string(), entry);
                 }
                 Ok(None) => {
                     response.insert(book_id.to_string(), serde_json::json!({"ok": true, "payload": null}));
                 }
                 Err(e) => {
-                    response.insert(book_id.to_string(), serde_json::json!({"ok": false, "payload": e.to_string()}));
+                    response.insert(book_id.to_string(), serde_json::json!({"ok": false, "payload": format!("{e:#}")}));
                 }
             }
         }
-        if move_books {
-            for id in &copied_ids {
-                let _ = src_cache.delete_book(*id);
-            }
-        }
-        (Value::Object(response), copied_ids)
+        (Value::Object(response), added_ids, removed_ids)
     })
     .await
     .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
 
-    if !copied_ids.is_empty() {
-        web_socket::publish(&state, ChangeEvent::BooksAdded { book_ids: copied_ids.clone() });
-        if move_books {
-            web_socket::publish(&state, ChangeEvent::BooksDeleted { book_ids: copied_ids });
-        }
+    if !added_ids.is_empty() {
+        web_socket::publish(&state, ChangeEvent::BooksAdded { book_ids: added_ids });
+    }
+    if !removed_ids.is_empty() {
+        web_socket::publish(&state, ChangeEvent::BooksDeleted { book_ids: removed_ids });
     }
 
     Ok(Json(response))
@@ -725,9 +760,9 @@ fn run_show_metadata(cache: &calibre_db::cache::Cache, args: &[Value]) -> anyhow
 
 /// Port of `cmd_remove.implementation`: `args[0]` is a list of book
 /// ids, `args[1]` is `permanent` -- accepted for request-shape
-/// compatibility but has no effect, matching this crate's existing
-/// [`delete_books`] handler: `Cache::delete_book` has no recycle-bin
-/// concept to preserve or bypass, it's unconditionally permanent.
+/// compatibility but has no effect: like the [`delete_books`] handler,
+/// the book's own files always go to the wastebasket, never a permanent
+/// delete.
 fn run_remove(cache: &calibre_db::cache::Cache, args: &[Value]) -> anyhow::Result<Value> {
     let ids: Vec<i32> = args
         .first()
@@ -741,7 +776,7 @@ fn run_remove(cache: &calibre_db::cache::Cache, args: &[Value]) -> anyhow::Resul
         anyhow::bail!("You must specify at least one book to remove");
     }
     for id in &ids {
-        cache.delete_book(*id)?;
+        calibre_db::removal::delete_with_file(cache, *id)?;
     }
     Ok(Value::Null)
 }
@@ -1306,6 +1341,90 @@ mod tests {
 
         assert!(broker.get(Some(src_name)).unwrap().all_book_ids().unwrap().is_empty(), "move should remove the book from the source library");
         assert_eq!(broker.get(Some(dest_name)).unwrap().all_book_ids().unwrap().len(), 1);
+    }
+
+    /// #965: a copy has to bring the *files*, not just a row.
+    #[tokio::test]
+    async fn copy_to_library_brings_the_format_file_and_cover_along() {
+        let (src_dir, dest_dir, broker, router) = test_app_with_two_libraries();
+        let src_name = src_dir.path().file_name().unwrap().to_str().unwrap();
+        let dest_name = dest_dir.path().file_name().unwrap().to_str().unwrap();
+        let src_cache = broker.get(Some(src_name)).unwrap();
+        calibre_db::covers::set_cover(&src_cache, 1, b"cover bytes").unwrap();
+
+        let (status, body) = post_json(&router, &format!("/cdb/copy-to-library/{dest_name}/{src_name}"), serde_json::json!({"book_ids": [1]})).await;
+        assert_eq!(status, StatusCode::OK, "got: {body}");
+        let new_id = body["1"]["payload"].as_i64().unwrap() as i32;
+
+        let dest_cache = broker.get(Some(dest_name)).unwrap();
+        let formats = dest_cache.format_file_info(new_id).unwrap();
+        assert_eq!(formats.len(), 1, "the destination book has no formats");
+        assert_eq!(std::fs::read(&formats[0].path).unwrap(), b"fake epub bytes");
+        assert!(dest_cache.has_cover(new_id).unwrap());
+        assert_eq!(dest_cache.field_for(new_id, "authors").unwrap().as_deref(), Some("Jane Doe"));
+        // The source book and its file are still there after a plain copy.
+        assert!(src_dir.path().join("Source Book.epub").exists());
+    }
+
+    /// The key the web client sends, and the one the server documents.
+    #[tokio::test]
+    async fn copy_to_library_accepts_move_books_and_moves() {
+        let (src_dir, dest_dir, broker, router) = test_app_with_two_libraries();
+        let src_name = src_dir.path().file_name().unwrap().to_str().unwrap();
+        let dest_name = dest_dir.path().file_name().unwrap().to_str().unwrap();
+
+        let (status, body) = post_json(&router, &format!("/cdb/copy-to-library/{dest_name}/{src_name}"), serde_json::json!({"book_ids": [1], "move_books": true})).await;
+        assert_eq!(status, StatusCode::OK, "got: {body}");
+        assert_eq!(body["1"]["ok"], true, "got: {body}");
+
+        assert!(broker.get(Some(src_name)).unwrap().all_book_ids().unwrap().is_empty(), "move_books was ignored");
+        let dest_cache = broker.get(Some(dest_name)).unwrap();
+        let new_id = dest_cache.all_book_ids().unwrap()[0];
+        let formats = dest_cache.format_file_info(new_id).unwrap();
+        assert_eq!(std::fs::read(&formats[0].path).unwrap(), b"fake epub bytes", "the moved book must keep its file");
+    }
+
+    /// A copy that cannot complete must never cost the user the source.
+    #[tokio::test]
+    async fn a_move_whose_copy_fails_leaves_the_source_intact() {
+        let (src_dir, dest_dir, broker, router) = test_app_with_two_libraries();
+        let src_name = src_dir.path().file_name().unwrap().to_str().unwrap();
+        let dest_name = dest_dir.path().file_name().unwrap().to_str().unwrap();
+        // The recorded format file has gone missing from the source.
+        let src_cache = broker.get(Some(src_name)).unwrap();
+        let file = src_cache.format_file_info(1).unwrap().remove(0).path;
+        std::fs::remove_file(&file).unwrap();
+
+        let (status, body) = post_json(&router, &format!("/cdb/copy-to-library/{dest_name}/{src_name}"), serde_json::json!({"book_ids": [1], "move_books": true})).await;
+        assert_eq!(status, StatusCode::OK, "got: {body}");
+        assert_eq!(body["1"]["ok"], false, "got: {body}");
+
+        assert_eq!(src_cache.all_book_ids().unwrap(), vec![1], "the source book was deleted by a failed move");
+        assert!(broker.get(Some(dest_name)).unwrap().all_book_ids().unwrap().is_empty(), "a half-copied book was left behind");
+    }
+
+    /// The route used to hard-delete a book's whole folder.
+    #[tokio::test]
+    async fn delete_books_leaves_a_books_folder_mates_alone() {
+        let (src_dir, _dest_dir, broker, router) = test_app_with_two_libraries();
+        let src_name = src_dir.path().file_name().unwrap().to_str().unwrap();
+        let src_cache = broker.get(Some(src_name)).unwrap();
+        let folder = src_dir.path().join("Shared");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("a.epub"), b"a").unwrap();
+        std::fs::write(folder.join("b.epub"), b"b").unwrap();
+        std::fs::write(folder.join("notes.zzz"), b"mine").unwrap();
+        let meta = calibre_ebooks::metadata::MetaInformation::default();
+        let a = src_cache.register_book_in_place("Shared/a.epub", &meta).unwrap();
+        let b = src_cache.register_book_in_place("Shared/b.epub", &meta).unwrap();
+
+        let (status, body) = post_json(&router, &format!("/cdb/delete-books/{a}/{src_name}"), serde_json::json!(null)).await;
+        assert_eq!(status, StatusCode::OK, "got: {body}");
+
+        assert!(!folder.join("a.epub").exists());
+        assert!(folder.join("b.epub").exists(), "a sibling book was deleted");
+        assert!(folder.join("notes.zzz").exists(), "a non-book file was deleted");
+        assert!(src_cache.field_for(b, "title").unwrap().is_some());
     }
 
     #[tokio::test]
