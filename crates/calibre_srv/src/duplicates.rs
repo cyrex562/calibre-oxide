@@ -16,13 +16,11 @@
 //!
 //! # Real, disclosed narrowing versus upstream
 //!
-//! - **Review-and-delete only, no merge.** Real upstream's Find
-//!   Duplicates action can also merge two duplicate records' formats
-//!   into one. This route (and the frontend panel built on it) only
-//!   reports groups for the user to inspect and delete the unwanted
-//!   copy from -- matching this issue's own filed scope, which
-//!   explicitly calls a merge action "a reasonable, separable
-//!   follow-up if the simpler review-and-delete flow ships first."
+//! - **This route only reports.** Merging a group's records is
+//!   [`crate::merge_books`] (`POST /cdb/merge-books`, and the bulk
+//!   `POST /duplicates/merge-exact` for exact-content groups); each group
+//!   here carries what the UI needs to pick a destination
+//!   (`formats`/`metadata`/`has_cover` per book, and `suggested_dest`).
 //! - **Same title/author-intersection heuristic as the add-time
 //!   check**, not upstream's own fuzzier matching -- see
 //!   `calibre_db::utils::find_identical_books`'s own doc for what's
@@ -34,6 +32,7 @@ use axum::Json;
 use serde_json::{json, Value};
 
 use calibre_db::copy_to_library;
+use calibre_db::merge;
 
 use crate::errors::ServerError;
 use crate::AppState;
@@ -51,12 +50,18 @@ pub async fn scan(State(state): State<AppState>, AxumPath(library_id): AxumPath<
         copy_to_library::scan_library_for_all_duplicates(&cache)?
             .into_iter()
             .map(|group| -> anyhow::Result<Value> {
+                // `formats`, `metadata` and `has_cover` are what the merge
+                // engine ranks records by (`calibre_db::merge::best_destination`);
+                // the UI applies the same rule to pre-select a destination.
+                let mut summaries = Vec::new();
                 let books: anyhow::Result<Vec<Value>> = group
                     .book_ids
                     .iter()
                     .map(|&id| {
                         let (title, authors) = copy_to_library::book_title_and_authors(&cache, id)?;
-                        Ok(json!({"book_id": id, "title": title, "authors": authors}))
+                        let s = merge::book_summary(&cache, id)?;
+                        summaries.push(s);
+                        Ok(json!({"book_id": id, "title": title, "authors": authors, "formats": s.formats, "metadata": s.metadata, "has_cover": s.has_cover}))
                     })
                     .collect();
                 let reason = match group.kind {
@@ -67,7 +72,7 @@ pub async fn scan(State(state): State<AppState>, AxumPath(library_id): AxumPath<
                 // and is now an object. The only client is this repo's
                 // own frontend, updated in the same commit -- worth
                 // noting rather than pretending it is compatible.
-                Ok(json!({"books": books?, "reason": reason}))
+                Ok(json!({"books": books?, "reason": reason, "suggested_dest": merge::best_destination(&summaries)}))
             })
             .collect()
     })

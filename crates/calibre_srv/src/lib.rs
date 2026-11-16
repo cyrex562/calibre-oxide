@@ -185,6 +185,7 @@ pub mod lists;
 pub mod annotations_browse;
 pub mod mapper;
 pub mod mathjax;
+pub mod merge_books;
 pub mod metadata_search;
 pub mod net_guard;
 pub mod news;
@@ -388,6 +389,9 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/save-to-disk/{library_id}", post(save_to_disk::save_to_disk))
         .route("/rename-files/{library_id}", post(rename_files::rename_files))
         .route("/duplicates/scan/{library_id}", post(duplicates::scan))
+        .route("/duplicates/merge-exact/{library_id}", post(merge_books::merge_exact))
+        .route("/cdb/merge-books/{library_id}", post(merge_books::merge_books))
+        .route("/cdb/merge-books", post(merge_books::merge_books_no_library))
         .route("/tweak/open/{book_id}/{fmt}/{library_id}", post(tweak::open_session))
         .route("/tweak/file/{session_id}/{*name}", get(tweak::get_file).post(tweak::set_file))
         .route("/tweak/raw/{session_id}/{*name}", get(tweak::get_raw))
