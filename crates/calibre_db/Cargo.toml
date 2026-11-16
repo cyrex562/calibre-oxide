@@ -36,6 +36,12 @@ zip = "0.6"
 # erasing it (#896). MIT, so GPL-compatible.
 trash = "5.2"
 
+# Windows storage-tier classification (GetDriveTypeW / QueryDosDeviceW)
+# and the calibre-running mutex probe (#258). Same version as the one
+# already in the tree.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 zbus = { version = "5", features = ["blocking"] }

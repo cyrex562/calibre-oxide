@@ -42,6 +42,7 @@ pub mod restore;
 pub mod schema_upgrades;
 pub mod search;
 pub mod sqlite_extension;
+pub mod storage_safety;
 pub mod tables;
 pub mod utils;
 pub mod view;
