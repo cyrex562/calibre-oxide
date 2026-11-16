@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { importFolder, fetchUntracked, fetchTrash, restoreTrashEntry, deleteTrashEntry, emptyTrash, copyToLibrary, describeCopyOutcome, fetchLibraryInfo, embedMetadata, summarizeEmbed, addBook, addFormat, addNewsSchedule, blobToDataUrl, inspectPlugin, installPlugin, listPlugins, removePlugin, setPluginEnabled, catalogDownloadUrl, checkLibrary, coverProxyUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchCoverProxyBlob, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeDataFile, removeFormat, removeNewsSchedule, renameCategoryItem, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, scanLibrary, fetchOrphans, relocateOrphan, uploadOrphanFile, forgetOrphan, fetchIgnored, unignoreFile, searchMetadataOnline, backfillHashes, cancelLibraryJob, describeJobProgress, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
+import { importFolder, fetchUntracked, fetchTrash, restoreTrashEntry, deleteTrashEntry, emptyTrash, copyToLibrary, describeCopyOutcome, fetchLibraryInfo, embedMetadata, summarizeEmbed, addBook, addFormat, addNewsSchedule, blobToDataUrl, inspectPlugin, installPlugin, listPlugins, removePlugin, setPluginEnabled, catalogDownloadUrl, checkLibrary, coverProxyUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchCoverProxyBlob, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeDataFile, removeFormat, removeNewsSchedule, renameCategoryItem, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, scanLibrary, fetchOrphans, relocateOrphan, uploadOrphanFile, forgetOrphan, fetchIgnored, unignoreFile, searchMetadataOnline, backfillHashes, fingerprintPdfs, cancelLibraryJob, describeJobProgress, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
 import type { BookSummary } from "./types";
 
 function bookStub(id: number): BookSummary {
@@ -781,12 +781,39 @@ describe("backfillHashes", () => {
   });
 });
 
+describe("fingerprintPdfs", () => {
+  it("starts the pdf-fingerprint job and resolves with its report", async () => {
+    const report = { fingerprinted: 8, total: 10, failed: [["Bad/book.pdf", "encrypted"]], failed_count: 1, missing: [], missing_count: 1, cancelled: false };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ job_id: 4 }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => job("finished", { id: 4, kind: "pdf_fingerprint", report }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await fingerprintPdfs({ intervalMs: 0 });
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/pdf-fingerprint/default", { method: "POST" });
+    expect(result.fingerprinted).toBe(8);
+    expect(result.failed_count).toBe(1);
+  });
+
+  it("rejects with the server's reason when the job fails (no PDFium installed)", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ job_id: 5 }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => job("failed", { id: 5, kind: "pdf_fingerprint", error: "PDF fingerprinting needs the PDFium library" }) });
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(fingerprintPdfs({ intervalMs: 0 })).rejects.toThrow("PDFium");
+  });
+});
+
 describe("describeJobProgress", () => {
   it("says what each phase is doing, with thousands separators", () => {
     expect(describeJobProgress(progress({ phase: "walking", seen: 12345 }))).toBe("Looking through the folder… 12,345 files so far");
     expect(describeJobProgress(progress({ phase: "indexing", added: 900, errors: 1, total: 5000 }))).toBe("Adding books… 901 of 5,000 new files");
     expect(describeJobProgress(progress({ phase: "enriching", enriched: 10, total: 40 }))).toBe("Reading titles and covers… 10 of 40");
     expect(describeJobProgress(progress({ phase: "hashing", hashed: 3, total: 1000 }))).toBe("Reading files… 3 of 1,000");
+    expect(describeJobProgress(progress({ phase: "fingerprinting", fingerprinted: 3, errors: 1, total: 2000 }))).toBe("Analysing PDF pages… 4 of 2,000");
     expect(describeJobProgress(progress({ phase: "" }))).toBe("Working…");
   });
 });

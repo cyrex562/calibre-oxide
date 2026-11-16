@@ -15,17 +15,17 @@ import ImportFolderDialog from "./ImportFolderDialog.vue";
 import { describeScanOutcome, dismissKey, scanPromptHint, scanPromptText, shouldPrompt, type UntrackedCount } from "../library/scanPrompt";
 import { LAYOUT_KEY, type LayoutPrefs, type Panel, parseLayout, resizedWidth } from "../library/layout";
 import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary,
-  scanLibrary, backfillHashes, cancelLibraryJob, describeJobProgress,
+  scanLibrary, backfillHashes, fingerprintPdfs, cancelLibraryJob, describeJobProgress,
   fetchOrphans,
   relocateOrphan,
   uploadOrphanFile,
   forgetOrphan,
   fetchIgnored,
   unignoreFile, copyToLibrary, describeCopyOutcome, deleteBooks, embedMetadata, summarizeEmbed, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchLibraryInfo, fetchUntracked, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameFiles, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
-import type { CheckLibraryFinding, CheckLibraryResult, CustomRecipeOptions, DuplicateGroup, IgnoredFile, NewsFeedInput, NewsSchedule, Orphan, SaveToDiskResult } from "../library/api";
+import type { PdfScanStatus, CheckLibraryFinding, CheckLibraryResult, CustomRecipeOptions, DuplicateGroup, IgnoredFile, NewsFeedInput, NewsSchedule, Orphan, SaveToDiskResult } from "../library/api";
 import { mergeBooks, planBulkMerge, runBulkMerge } from "../library/api";
 import type { BulkMergePlan, DuplicateBook, MergeMode, MergeResponse } from "../library/api";
-import { MIN_OPTIONS, confidencePercent, countByReason, evidenceLines, filterGroups, needsReview, reasonBadge, reasonLabel } from "../library/duplicates";
+import { MIN_OPTIONS, confidencePercent, countByReason, evidenceLines, filterGroups, fingerprintAction, isSuggested, needsReview, pdfLine, reasonBadge, reasonLabel } from "../library/duplicates";
 import type { DuplicateMin } from "../library/duplicates";
 import { DEFAULT_DESTINATION_HINT, MERGE_MODE_LABELS, MERGE_MODE_NOTES, defaultMergeDestination, describeMergeResult, describeRecord, summarizeMerge } from "../library/merge";
 import { parseSnippetSegments } from "../library/snippets";
@@ -1464,14 +1464,18 @@ const duplicateGroups = ref<DuplicateGroup[]>([]);
 const duplicateMin = ref<DuplicateMin>("fuzzy");
 const visibleDuplicateGroups = computed(() => filterGroups(duplicateGroups.value, duplicateMin.value));
 const duplicateStrengthCounts = computed(() => countByReason(duplicateGroups.value));
+// How many PDFs are not yet fingerprinted, for page-content matching.
+const pdfStatus = ref<PdfScanStatus | undefined>(undefined);
+const pdfAction = computed(() => fingerprintAction(pdfStatus.value));
 
 async function openDuplicates() {
   duplicatesOpen.value = true;
   duplicatesError.value = null;
   duplicatesLoading.value = true;
   try {
-    const { groups } = await scanForDuplicates();
+    const { groups, pdf } = await scanForDuplicates();
     duplicateGroups.value = groups;
+    pdfStatus.value = pdf;
   } catch (e) {
     duplicatesError.value = e instanceof Error ? e.message : String(e);
   } finally {
@@ -1519,6 +1523,48 @@ async function cancelPrepare() {
   if (prepareJobId.value === null) return;
   try {
     await cancelLibraryJob(prepareJobId.value);
+  } catch (e) {
+    duplicatesError.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
+// Scan-vs-OCR and optimizer re-saves are found from the pages themselves,
+// which means rendering a few pages of every PDF once. A long job on a big
+// library, so: progress, Cancel, and it resumes where it stopped.
+const fingerprintBusy = ref(false);
+const fingerprintProgress = ref<string | null>(null);
+const fingerprintSummary = ref<string | null>(null);
+const fingerprintJobId = ref<number | null>(null);
+
+async function runFingerprint() {
+  fingerprintBusy.value = true;
+  fingerprintSummary.value = null;
+  fingerprintProgress.value = null;
+  try {
+    const result = await fingerprintPdfs({
+      onStart: (id) => (fingerprintJobId.value = id),
+      onProgress: (job) => (fingerprintProgress.value = describeJobProgress(job.progress)),
+    });
+    const parts: string[] = [];
+    if (result.cancelled) parts.push("stopped early — run it again to continue");
+    parts.push(`${result.fingerprinted.toLocaleString("en-US")} of ${result.total.toLocaleString("en-US")} PDFs analysed`);
+    if (result.failed_count > 0) parts.push(`${result.failed_count} could not be read (encrypted or damaged)`);
+    if (result.missing_count > 0) parts.push(`${result.missing_count} listed but not found on disk`);
+    fingerprintSummary.value = parts.join(" · ");
+    await openDuplicates();
+  } catch (e) {
+    duplicatesError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    fingerprintBusy.value = false;
+    fingerprintProgress.value = null;
+    fingerprintJobId.value = null;
+  }
+}
+
+async function cancelFingerprint() {
+  if (fingerprintJobId.value === null) return;
+  try {
+    await cancelLibraryJob(fingerprintJobId.value);
   } catch (e) {
     duplicatesError.value = e instanceof Error ? e.message : String(e);
   }
@@ -3235,6 +3281,20 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
           </div>
           <p v-if="prepareProgress" class="news-hint" role="status">{{ prepareProgress }}</p>
           <p v-if="prepareSummary" class="news-hint">{{ prepareSummary }}</p>
+          <!--
+            A scan and its OCR copy, or a PDF and its optimized copy, share
+            no bytes and often no metadata; they are found from their pages,
+            which have to be analysed once.
+          -->
+          <div v-if="pdfAction || fingerprintBusy" class="plugin-actions">
+            <button type="button" data-testid="fingerprint-pdfs" :disabled="fingerprintBusy" @click="runFingerprint">
+              {{ fingerprintBusy ? "Analysing PDFs…" : pdfAction?.label }}
+            </button>
+            <button v-if="fingerprintBusy" type="button" @click="cancelFingerprint">Cancel</button>
+          </div>
+          <p v-if="pdfAction?.note" class="news-hint">{{ pdfAction.note }}</p>
+          <p v-if="fingerprintProgress" class="news-hint" role="status">{{ fingerprintProgress }}</p>
+          <p v-if="fingerprintSummary" class="news-hint">{{ fingerprintSummary }}</p>
           <p v-if="duplicatesLoading">Scanning…</p>
           <p v-else-if="duplicatesError" class="error">{{ duplicatesError }}</p>
           <template v-else>
@@ -3296,6 +3356,8 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
               <ul class="manage-list">
                 <li v-for="b in group.books" :key="b.book_id">
                   <button type="button" @click="selectedBookId = b.book_id">{{ b.title }} — {{ b.authors.join(", ") }}</button>
+                  <span v-if="pdfLine(b)" class="news-hint" data-testid="dup-pdf-line">{{ pdfLine(b) }}</span>
+                  <span v-if="isSuggested(group, b) && group.reason.startsWith('pdf_')" class="news-hint">suggested to keep</span>
                   <button type="button" @click="deleteDuplicateBook(b.book_id)">Delete</button>
                 </li>
               </ul>
