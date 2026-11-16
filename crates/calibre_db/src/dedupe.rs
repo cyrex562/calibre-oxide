@@ -14,6 +14,12 @@
 //! | `Identifier` | `identifier` | 0.95-0.97 | an equal, *valid* ISBN (10 and 13 compared as 13), or an equal `asin`/`amazon*`, `goodreads`, `google`, `doi` |
 //! | `Exact` | `title_author_exact` | 0.90 | equal normalised title and an equal normalised author |
 //! | `Fuzzy` | `title_author_fuzzy` | 0.55-0.80 | see below |
+//! | `PdfResave` / `PdfOcr` / `PdfText` | `pdf_resave` / `pdf_ocr_variant` / `pdf_text_match` | 0.85 / 0.80 / 0.60 | the same PDF's pages and text; see [`crate::pdf_similarity`] |
+//!
+//! The three PDF tiers rank **between `Exact` and `Fuzzy`** (`Fuzzy < PdfText <
+//! PdfOcr < PdfResave < Exact`): they are found from page content, not metadata,
+//! and stronger than a guess from a title but weaker than a title and author
+//! that agree. `?min=pdf` is the lowest of the three.
 //!
 //! Overlapping evidence merges into one group (union-find) and the group
 //! reports its strongest reason, plus every edge that joined it. Asking for a
@@ -126,9 +132,16 @@ pub const MAX_EDIT_BLOCK: usize = 3000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Strength {
     Fuzzy = 1,
-    Exact = 2,
-    Identifier = 3,
-    Content = 4,
+    /// The same words on different pages (`pdf_text_match`).
+    PdfText = 2,
+    /// The same pages, one with a text layer and one without
+    /// (`pdf_ocr_variant`).
+    PdfOcr = 3,
+    /// The same pages and text, differently written (`pdf_resave`).
+    PdfResave = 4,
+    Exact = 5,
+    Identifier = 6,
+    Content = 7,
 }
 
 impl Strength {
@@ -139,7 +152,15 @@ impl Strength {
             Strength::Identifier => "identifier",
             Strength::Exact => "title_author_exact",
             Strength::Fuzzy => "title_author_fuzzy",
+            Strength::PdfResave => "pdf_resave",
+            Strength::PdfOcr => "pdf_ocr_variant",
+            Strength::PdfText => "pdf_text_match",
         }
+    }
+
+    /// Whether this is one of the three page-content tiers.
+    pub fn is_pdf(self) -> bool {
+        matches!(self, Strength::PdfText | Strength::PdfOcr | Strength::PdfResave)
     }
 
     /// Parses the `?min=` query value.
@@ -149,6 +170,10 @@ impl Strength {
             "identifier" => Some(Strength::Identifier),
             "exact" | "title_author_exact" => Some(Strength::Exact),
             "fuzzy" | "title_author_fuzzy" => Some(Strength::Fuzzy),
+            // The page-content level: every PDF reason, and everything above.
+            "pdf" | "pdf_text_match" => Some(Strength::PdfText),
+            "pdf_ocr_variant" => Some(Strength::PdfOcr),
+            "pdf_resave" => Some(Strength::PdfResave),
             _ => None,
         }
     }
@@ -161,7 +186,7 @@ impl Strength {
 /// NFKD, combining marks removed, a few non-decomposing letters folded,
 /// lowercased, typographic quotes and dashes made ASCII. Punctuation is
 /// otherwise left alone.
-fn fold(s: &str) -> String {
+pub(crate) fn fold(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.nfkd() {
         if is_combining_mark(c) {
@@ -190,7 +215,7 @@ fn fold(s: &str) -> String {
 
 /// Alphanumerics only, one space between words. Apostrophes vanish (no
 /// space), `&` is `and`, everything else is a separator.
-fn plain(s: &str) -> String {
+pub(crate) fn plain(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut pending_space = false;
     for c in s.chars() {
@@ -677,6 +702,13 @@ fn star(ids: &[usize], records: &[BookRecord], strength: Strength, confidence: f
 /// `content_groups` are sets of book ids already known to hold identical
 /// files. Only evidence at least as strong as `min` is used.
 pub fn find_groups(records: &[BookRecord], content_groups: &[Vec<i32>], min: Strength) -> Vec<Group> {
+    find_groups_with(records, content_groups, &[], min)
+}
+
+/// [`find_groups`] with extra edges from page-content matching
+/// ([`crate::pdf_similarity`]), which the caller computes because it needs
+/// the sidecar. Edges naming a book not in `records` are ignored.
+pub fn find_groups_with(records: &[BookRecord], content_groups: &[Vec<i32>], pdf_edges: &[crate::pdf_similarity::PdfEdge], min: Strength) -> Vec<Group> {
     let index: HashMap<i32, usize> = records.iter().enumerate().map(|(i, r)| (r.id, i)).collect();
     let mut edges: Vec<Evidence> = Vec::new();
 
@@ -751,6 +783,19 @@ pub fn find_groups(records: &[BookRecord], content_groups: &[Vec<i32>], min: Str
         if min <= Strength::Fuzzy {
             fuzzy_edges(records, &prepared, &exact_pairs, &mut edges);
         }
+    }
+
+    // Page content.
+    for e in pdf_edges {
+        if !(index.contains_key(&e.a) && index.contains_key(&e.b)) {
+            continue;
+        }
+        let strength = match e.found.kind {
+            crate::pdf_similarity::PdfKind::Resave => Strength::PdfResave,
+            crate::pdf_similarity::PdfKind::OcrVariant => Strength::PdfOcr,
+            crate::pdf_similarity::PdfKind::TextMatch => Strength::PdfText,
+        };
+        edges.push(Evidence { a: e.a, b: e.b, strength, confidence: e.found.confidence, detail: e.found.detail.clone() });
     }
 
     // Merge.
@@ -925,15 +970,58 @@ pub fn load_records(cache: &Cache) -> Result<Vec<BookRecord>> {
     Ok(records)
 }
 
+/// What the scan knows about a book's PDF, for showing and for choosing
+/// which copy to keep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PdfBookInfo {
+    pub page_count: u32,
+    pub has_text: bool,
+    pub size: i64,
+}
+
+/// A scan's groups, and what it knows about the library's PDFs.
+pub struct ScanOutcome {
+    pub groups: Vec<Group>,
+    /// Fingerprinted PDFs, by book.
+    pub pdf: HashMap<i32, PdfBookInfo>,
+    pub status: crate::pdf_similarity::PdfStatus,
+}
+
 /// Every duplicate group in the library at `min` strength or stronger.
 pub fn scan_library(cache: &Cache, min: Strength) -> Result<Vec<Group>> {
+    Ok(scan_library_full(cache, min)?.groups)
+}
+
+/// [`scan_library`], and the PDF facts the response needs. Only PDFs that
+/// have been fingerprinted take part in page-content matching; `status` says
+/// how many have not.
+pub fn scan_library_full(cache: &Cache, min: Strength) -> Result<ScanOutcome> {
     let records = load_records(cache)?;
     let content: Vec<Vec<i32>> = if min <= Strength::Content {
         crate::copy_to_library::scan_library_for_content_duplicates(cache)?
     } else {
         Vec::new()
     };
-    Ok(find_groups(&records, &content, min))
+    let loaded = cache.checksums().pdf_fingerprints()?;
+    let mut pdf = HashMap::new();
+    for l in &loaded {
+        for &book in &l.books {
+            pdf.insert(book, PdfBookInfo { page_count: l.fingerprint.page_count, has_text: l.fingerprint.has_text, size: l.size });
+        }
+    }
+    let edges = if min <= Strength::PdfResave { crate::pdf_similarity::edges_for(&loaded).0 } else { Vec::new() };
+    let groups = find_groups_with(&records, &content, &edges, min);
+    Ok(ScanOutcome { groups, pdf, status: cache.checksums().pdf_status()? })
+}
+
+/// Which copy of a PDF group to keep: the one with a text layer, then the
+/// one with more pages, then the larger file, then the lowest id. An
+/// optimizer shrinks images, so of two re-saves the larger is the original;
+/// of a scan and its OCR the text layer is what was added on purpose. A book
+/// with no fingerprint ranks last.
+pub fn best_pdf_destination(ids: &[i32], pdf: &HashMap<i32, PdfBookInfo>) -> Option<i32> {
+    let rank = |id: &i32| pdf.get(id).map(|p| (true, p.has_text, p.page_count, p.size)).unwrap_or((false, false, 0, 0));
+    ids.iter().copied().max_by(|a, b| rank(a).cmp(&rank(b)).then(b.cmp(a)))
 }
 
 /// An index of a library's exact `(title, author)` keys, for asking "is
