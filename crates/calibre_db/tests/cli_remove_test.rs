@@ -22,7 +22,9 @@ fn test_remove_format() {
     };
 
     // Need source file
-    let source_path = temp_dir.join("source.epub");
+    // Outside the library: books are imported into the library root now, and
+    // a source file left inside it would be mistaken for the imported copy.
+    let source_path = std::env::temp_dir().join("calibre_oxide_test_remove_fmt_source.epub");
     fs::write(&source_path, "dummy content").unwrap();
 
     let book_id = lib.add_book(&source_path, &meta).unwrap();
@@ -35,7 +37,7 @@ fn test_remove_format() {
     let mut found = false;
     for entry in fs::read_dir(&book_dir).unwrap() {
         let path = entry.unwrap().path();
-        if path.extension().unwrap().to_str().unwrap() == "epub" {
+        if path.extension().is_some_and(|e| e == "epub") {
             found = true;
             break;
         }
