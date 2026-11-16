@@ -390,8 +390,20 @@ pub fn copy_one_book_detailed(src_cache: &Cache, dest_cache: &Cache, book_id: i3
             let compatible = dest_columns
                 .get(&label)
                 .is_some_and(|d| d.get("datatype") == src_col.get("datatype") && d.get("is_multiple") == src_col.get("is_multiple"));
-            if compatible {
+            // A same-typed column can still refuse a value: an enumeration
+            // whose list in the destination does not include it. That is a
+            // skipped column, not a failed copy.
+            let enum_ok = src_col.get("datatype").and_then(|d| d.as_str()) != Some("enumeration")
+                || dest_columns
+                    .get(&label)
+                    .and_then(|d| d["display"]["enum_values"].as_array())
+                    .is_some_and(|allowed| allowed.iter().any(|a| a.as_str() == Some(value.as_str())));
+            if compatible && enum_ok {
                 dest_cache.set_custom_column_value(new_id, &label, &value)?;
+                // A series' index travels with its name.
+                if let Some(index) = src_cache.get_custom_series_index(book_id, &label)? {
+                    dest_cache.set_custom_column_value(new_id, &format!("{label}_index"), &index.to_string())?;
+                }
             } else {
                 skipped.push(label);
             }

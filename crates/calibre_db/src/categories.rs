@@ -96,7 +96,7 @@ fn category_from_link_table(
     // same as this crate's other fixed-identifier SQL (e.g.
     // `custom_column_{id}` table names).
     let sql = format!(
-        "SELECT {item_table}.id, {item_table}.{name_column}, {link_table}.book \
+        "SELECT {item_table}.id, CAST({item_table}.{name_column} AS TEXT), {link_table}.book \
          FROM {link_table} JOIN {item_table} ON {item_table}.id = {link_table}.{link_column}"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -158,6 +158,20 @@ fn sort_tags(tags: &mut [Tag], sort: &str) {
     }
 }
 
+/// `(link table, link column, item table, name column)` for a standard
+/// category key or a normalized custom column's `#label`.
+fn category_tables(conn: &rusqlite::Connection, key: &str) -> Result<Option<(String, String, String, String)>> {
+    if let Some(&(_, link_table, link_column, item_table, name_column)) = STANDARD_CATEGORIES.iter().find(|(k, ..)| *k == key) {
+        return Ok(Some((link_table.into(), link_column.into(), item_table.into(), name_column.into())));
+    }
+    if key.starts_with('#') {
+        if let Some(def) = crate::custom_columns::column(conn, key)?.filter(|d| d.normalized) {
+            return Ok(Some((def.link_table(), "value".into(), def.table(), "value".into())));
+        }
+    }
+    Ok(None)
+}
+
 /// Real per-category, per-item tag-browser data. `sort` must be one
 /// of `"name"` (default upstream)/`"popularity"`/`"rating"`, matching
 /// upstream's `CATEGORY_SORTS`; anything else is an error, same as
@@ -199,6 +213,15 @@ pub fn get_categories(cache: &Cache, sort: &str, book_ids: Option<&HashSet<i32>>
         categories.insert(key.to_string(), tags);
     }
 
+    // Every normalized custom column is a category too (`#label`), as
+    // upstream's `is_category` flag on a normalized column makes it: its
+    // items are the value table's rows, its books the link table's.
+    for def in crate::custom_columns::all_columns(&conn)?.into_iter().filter(|d| d.normalized) {
+        let mut tags = category_from_link_table(&conn, &def.link_table(), "value", &def.table(), "value", book_ids, &ratings)?;
+        sort_tags(&mut tags, sort);
+        categories.insert(format!("#{}", def.label), tags);
+    }
+
     Ok(categories)
 }
 
@@ -210,10 +233,10 @@ pub fn get_categories(cache: &Cache, sort: &str, book_ids: Option<&HashSet<i32>>
 /// module's own narrowed category list, and returns an error rather
 /// than silently an empty set.
 pub fn book_ids_for_category_item(cache: &Cache, category: &str, item_id: i32) -> Result<HashSet<i32>> {
-    let Some(&(_, link_table, link_column, _, _)) = STANDARD_CATEGORIES.iter().find(|(key, ..)| *key == category) else {
+    let conn = cache.backend.conn.lock().unwrap();
+    let Some((link_table, link_column, _, _)) = category_tables(&conn, category)? else {
         bail!("category {category} not found");
     };
-    let conn = cache.backend.conn.lock().unwrap();
     let sql = format!("SELECT book FROM {link_table} WHERE {link_column} = ?1");
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([item_id], |row| row.get::<_, i32>(0))?;
@@ -230,21 +253,21 @@ pub fn book_ids_for_category_item(cache: &Cache, category: &str, item_id: i32) -
 /// `STANDARD_CATEGORIES`' keys, same restriction as
 /// [`book_ids_for_category_item`].
 pub fn get_item_id(cache: &Cache, field: &str, item_name: &str) -> Result<Option<i32>> {
-    let Some(&(_, _, _, item_table, name_column)) = STANDARD_CATEGORIES.iter().find(|(key, ..)| *key == field) else {
+    let conn = cache.backend.conn.lock().unwrap();
+    let Some((_, _, item_table, name_column)) = category_tables(&conn, field)? else {
         bail!("field {field} not found");
     };
-    let conn = cache.backend.conn.lock().unwrap();
     let sql = format!("SELECT id FROM {item_table} WHERE {name_column} = ?1");
     Ok(conn.query_row(&sql, [item_name], |row| row.get(0)).optional()?)
 }
 
 /// Port of `Cache.get_item_name` -- the reverse of [`get_item_id`].
 pub fn get_item_name(cache: &Cache, field: &str, item_id: i32) -> Result<Option<String>> {
-    let Some(&(_, _, _, item_table, name_column)) = STANDARD_CATEGORIES.iter().find(|(key, ..)| *key == field) else {
+    let conn = cache.backend.conn.lock().unwrap();
+    let Some((_, _, item_table, name_column)) = category_tables(&conn, field)? else {
         bail!("field {field} not found");
     };
-    let conn = cache.backend.conn.lock().unwrap();
-    let sql = format!("SELECT {name_column} FROM {item_table} WHERE id = ?1");
+    let sql = format!("SELECT CAST({name_column} AS TEXT) FROM {item_table} WHERE id = ?1");
     Ok(conn.query_row(&sql, [item_id], |row| row.get(0)).optional()?)
 }
 

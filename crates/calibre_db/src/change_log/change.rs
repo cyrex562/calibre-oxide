@@ -99,7 +99,18 @@ pub enum ChangeOp {
     /// `FieldSet` naming the column. The single total order gives that
     /// for free, since the column is always created before a value can
     /// be written to it.
-    CustomColumnAdded { label: String, name: String, datatype: String, is_multiple: bool },
+    ///
+    /// `display` is the column's display JSON (an enumeration's allowed
+    /// values, a names column's flag); absent when it is `{}`, so a log
+    /// written before this field existed still parses and hashes the same.
+    CustomColumnAdded {
+        label: String,
+        name: String,
+        datatype: String,
+        is_multiple: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display: Option<String>,
+    },
 
     /// Drops a custom column and its values.
     CustomColumnRemoved { label: String },
@@ -420,7 +431,7 @@ mod tests {
 
         // Dropping either of these would leave a replay with values and
         // no column to put them in, or resurrect a deleted column.
-        assert!(ChangeOp::CustomColumnAdded { label: "shelf".into(), name: "Shelf".into(), datatype: "text".into(), is_multiple: false }.supersede_key().is_none());
+        assert!(ChangeOp::CustomColumnAdded { label: "shelf".into(), name: "Shelf".into(), datatype: "text".into(), is_multiple: false, display: None }.supersede_key().is_none());
         assert!(ChangeOp::CustomColumnRemoved { label: "shelf".into() }.supersede_key().is_none());
     }
 

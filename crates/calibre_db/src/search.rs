@@ -802,8 +802,8 @@ fn resolve_location(loc: &str) -> Option<LocationKind> {
 /// Every location string [`resolve_location`] recognizes -- passed to
 /// [`QueryParser::new`] so `location:query` prefixes tokenize
 /// correctly.
-fn search_locations() -> Vec<String> {
-    [
+fn search_locations(cache: &Cache) -> Vec<String> {
+    let mut locations: Vec<String> = [
         "all",
         // Not resolved by `resolve_location`/`get_matches` -- handled
         // specially in `evaluate` as a saved-search expansion. Still
@@ -845,7 +845,10 @@ fn search_locations() -> Vec<String> {
     ]
     .iter()
     .map(|s| s.to_string())
-    .collect()
+    .collect();
+    // `#label` for every custom column, as calibre's `search_term_map`.
+    locations.extend(cache.custom_column_label_map().unwrap_or_default().into_keys().map(|label| format!("#{label}")));
+    locations
 }
 
 /// Text-searchable fields swept by a bare `all` (or no-location) query.
@@ -905,6 +908,65 @@ fn parse_identifiers(joined: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// `#label:query` -- a search on a custom column, dispatched on the
+/// column's datatype like `Parser.get_matches` does for fields with
+/// `is_custom`. Values come from [`Cache::field_for`], which reads the
+/// column in whichever shape (one table, or value + link tables) it has.
+fn custom_column_matches(
+    cache: &Cache,
+    label: &str,
+    query: &str,
+    candidates: &HashSet<i32>,
+) -> Result<HashSet<i32>, SearchError> {
+    let Some(def) = cache.custom_column_def(label)? else {
+        return Ok(HashSet::new());
+    };
+    let field = format!("#{label}");
+    let grouped = fetch_grouped(cache, &field, candidates)?;
+    match def.datatype.as_str() {
+        "int" => NumericSearch::call(&icu_lower(query), &grouped, &field, NumDatatype::Int, candidates, false),
+        "float" => NumericSearch::call(&icu_lower(query), &grouped, &field, NumDatatype::Float, candidates, false),
+        // calibre stores 0-10 and searches in stars, like the built-in rating.
+        "rating" => NumericSearch::call(&icu_lower(query), &grouped, &field, NumDatatype::Rating, candidates, false),
+        "datetime" => DateSearch::call(&icu_lower(query), &grouped),
+        // `bool_custom_columns_are_tristate` defaults to yes.
+        "bool" => BooleanSearch::call(&icu_lower(query), &grouped, true),
+        _ => {
+            let lowered = icu_lower(query);
+            let (has_value, wanted) = match lowered.as_str() {
+                "true" => (true, true),
+                "false" => (false, true),
+                _ => (false, false),
+            };
+            if wanted {
+                // "has any value" / "has none"
+                let mut out = HashSet::new();
+                for (val, ids) in &grouped {
+                    if val.as_ref().is_some_and(|v| !v.is_empty()) == has_value {
+                        out.extend(ids.iter().copied());
+                    }
+                }
+                return Ok(out);
+            }
+            let sep = if def.is_multiple { Some(def.separators().1) } else { None };
+            let (mk, q) = matchkind(query, false);
+            let mut matches = HashSet::new();
+            for (val, ids) in &grouped {
+                if let Some(v) = val {
+                    let parts = match sep {
+                        Some(sep) => split_multi(sep, v),
+                        None => vec![v.clone()],
+                    };
+                    if text_match(&q, &parts, mk, true, false)? {
+                        matches.extend(ids.iter().copied());
+                    }
+                }
+            }
+            Ok(matches)
+        }
+    }
+}
+
 /// Port of `Parser.get_matches`, narrowed to the fixed location table
 /// above. Unknown locations match nothing (same as upstream: `if
 /// location not in self.all_search_locations: return matches`).
@@ -918,6 +980,9 @@ fn get_matches(
         return Ok(HashSet::new());
     }
     let loc = icu_lower(location);
+    if let Some(label) = loc.strip_prefix('#') {
+        return custom_column_matches(cache, label, query, candidates);
+    }
     let Some(kind) = resolve_location(&loc) else {
         return Ok(HashSet::new());
     };
@@ -1067,7 +1132,7 @@ fn evaluate_saved_search(
 
     seen.insert(name_lower.clone());
     let result = (|| -> Result<HashSet<i32>, SearchError> {
-        let mut parser = QueryParser::new(search_locations());
+        let mut parser = QueryParser::new(search_locations(cache));
         let tree = parser.parse(&saved_query).map_err(|e| SearchError::Parse(e.to_string()))?;
         evaluate(cache, &tree, candidates, seen)
     })();
@@ -1087,7 +1152,7 @@ pub fn search(cache: &Cache, query: &str) -> anyhow::Result<Vec<i32>> {
         v.sort_unstable();
         return Ok(v);
     }
-    let mut parser = QueryParser::new(search_locations());
+    let mut parser = QueryParser::new(search_locations(cache));
     let tree = parser
         .parse(query)
         .map_err(|e| SearchError::Parse(e.to_string()))?;

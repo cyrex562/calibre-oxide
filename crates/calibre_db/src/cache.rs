@@ -545,6 +545,11 @@ impl Cache {
                 .optional()
                 .map(|v| v.map(|n| n.to_string()));
         }
+        if field_name.starts_with('#') {
+            // A custom column (`#label`, or `#label_index` for a series
+            // column's index); never cached in the built-in field store.
+            return self.get_custom_column_value(book_id, field_name);
+        }
         self.with_field_store(|store| store.field_for(book_id, field_name))
     }
 
@@ -1223,6 +1228,7 @@ impl Cache {
             // No such book: nothing on disk can be attributed to it.
             self.checksums().remove_all_for_book(book_id)?;
             let conn = self.backend.conn.lock().unwrap();
+            crate::custom_columns::purge_book(&conn, book_id)?;
             conn.execute("DELETE FROM books WHERE id = ?1", (book_id,))?;
             return Ok(outcome);
         };
@@ -1250,6 +1256,7 @@ impl Cache {
         self.checksums().remove_all_for_book(book_id)?;
         {
             let conn = self.backend.conn.lock().unwrap();
+            crate::custom_columns::purge_book(&conn, book_id)?;
             conn.execute("DELETE FROM books WHERE id = ?1", (book_id,))?;
         }
         if let Some(uuid) = uuid {
@@ -2011,6 +2018,10 @@ impl Cache {
             for label in custom_columns.keys() {
                 let val = self.get_custom_column_value(book_id, label)?;
                 x.insert(label.clone(), serde_json::json!(val));
+                if custom_columns[label]["datatype"] == "series" {
+                    let index = self.get_custom_series_index(book_id, label)?;
+                    x.insert(format!("{label}_index"), serde_json::json!(index));
+                }
             }
 
             out.push(serde_json::Value::Object(x));
@@ -2110,91 +2121,44 @@ impl Cache {
         Ok(raw.as_deref().and_then(|s| calibre_utils::date::parse_date(s, true)).unwrap_or_else(|| chrono::DateTime::UNIX_EPOCH))
     }
 
-    /// `datatype` is one of `bool`/`int`/`float`/`rating` (one-to-one
-    /// numeric value table) or `text`/`comments`/`series` (one-to-one
-    /// text value table, non-`is_multiple` only -- see the error
-    /// below); anything else falls back to a generic text value table,
-    /// same as `Library`'s original behavior.
-    pub fn add_custom_column(
+    /// Creates a custom column with calibre's exact schema for its
+    /// datatype (see [`crate::custom_columns`]): a one-table column for
+    /// `datetime`/`comments`/`int`/`bool`/`float`/`composite`, a value
+    /// table plus link table (with indices, triggers and tag-browser
+    /// views) for `text`/`series`/`enumeration`/`rating`. `is_multiple`
+    /// only applies to `text` and `composite`, as in calibre.
+    pub fn add_custom_column(&self, label: &str, name: &str, datatype: &str, is_multiple: bool) -> anyhow::Result<i32> {
+        self.add_custom_column_with_display(label, name, datatype, is_multiple, &serde_json::json!({}))
+    }
+
+    /// [`Cache::add_custom_column`] with the column's `display` settings
+    /// (an enumeration's `enum_values`, a text column's `is_names`, ...).
+    pub fn add_custom_column_with_display(
         &self,
         label: &str,
         name: &str,
         datatype: &str,
         is_multiple: bool,
+        display: &serde_json::Value,
     ) -> anyhow::Result<i32> {
+        crate::custom_columns::validate_new_column(label, datatype)?;
+        let normalized = crate::custom_columns::is_normalized(datatype);
+        let is_multiple = is_multiple && matches!(datatype, "text" | "composite");
+        let display_json = serde_json::to_string(display)?;
         let mut conn = self.backend.conn.lock().unwrap();
 
-        let count: i32 = conn.query_row(
-            "SELECT COUNT(*) FROM custom_columns WHERE label = ?1",
-            [label],
-            |row| row.get(0),
-        )?;
+        let count: i32 = conn.query_row("SELECT COUNT(*) FROM custom_columns WHERE label = ?1", [label], |row| row.get(0))?;
         if count > 0 {
             anyhow::bail!("Column with label '{}' already exists", label);
         }
 
         let tx = conn.transaction()?;
-
         tx.execute(
-            "INSERT INTO custom_columns
-            (label, name, datatype, mark_for_delete, editable, display, is_multiple, normalized)
-            VALUES (?1, ?2, ?3, 0, 1, '{}', ?4, 0)",
-            (label, name, datatype, is_multiple),
+            "INSERT INTO custom_columns(label, name, datatype, is_multiple, editable, display, normalized) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6)",
+            (label, name, datatype, is_multiple, &display_json, normalized),
         )?;
-        let col_id = tx.last_insert_rowid() as i32;
-        let table_name = format!("custom_column_{}", col_id);
-
-        match datatype {
-            "bool" | "int" | "float" | "rating" => {
-                let value_type = if datatype == "float" || datatype == "rating" {
-                    "REAL"
-                } else {
-                    "INTEGER"
-                };
-                // `UNIQUE(book)` (matching real calibre's own schema
-                // for these tables) is what makes `set_custom_column_value`'s
-                // `INSERT OR REPLACE` actually replace an existing
-                // row instead of silently accumulating a new one on
-                // every write -- a real bug found while testing
-                // `formatter_functions.rs`'s `check_yes_no` (issue
-                // #515), which calls `set_custom_column_value` more
-                // than once for the same book (no prior test did).
-                tx.execute(
-                    &format!(
-                        "CREATE TABLE {table_name} (id INTEGER PRIMARY KEY, book INTEGER, value {value_type}, UNIQUE(book))"
-                    ),
-                    [],
-                )?;
-                tx.execute(
-                    &format!("CREATE INDEX idx_{col_id}_book ON {table_name} (book)"),
-                    [],
-                )?;
-            }
-            "text" | "comments" | "series" => {
-                if is_multiple {
-                    anyhow::bail!("Multiple-value text columns not yet supported in this port");
-                }
-                tx.execute(
-                    &format!(
-                        "CREATE TABLE {table_name} (id INTEGER PRIMARY KEY, book INTEGER, value TEXT, UNIQUE(book))"
-                    ),
-                    [],
-                )?;
-                tx.execute(
-                    &format!("CREATE INDEX idx_{col_id}_book ON {table_name} (book)"),
-                    [],
-                )?;
-            }
-            _ => {
-                tx.execute(
-                    &format!(
-                        "CREATE TABLE {table_name} (id INTEGER PRIMARY KEY, book INTEGER, value TEXT)"
-                    ),
-                    [],
-                )?;
-            }
-        }
-
+        let col_id = tx.last_insert_rowid();
+        crate::custom_columns::create_schema(&tx, col_id, datatype, normalized)?;
         tx.commit()?;
         // Before recording: appending fsyncs, and #901 warns against
         // doing that with the connection mutex held.
@@ -2204,77 +2168,86 @@ impl Cache {
             name: name.to_string(),
             datatype: datatype.to_string(),
             is_multiple,
+            display: (display_json != "{}").then_some(display_json),
         });
-        Ok(col_id)
+        Ok(col_id as i32)
+    }
+
+    /// A custom column's definition (storage shape, separators, enum
+    /// values), by label (a leading `#` is accepted).
+    pub fn custom_column_def(&self, label: &str) -> Result<Option<crate::custom_columns::ColumnDef>> {
+        let conn = self.backend.conn.lock().unwrap();
+        crate::custom_columns::column(&conn, label)
     }
 
     fn custom_column_lookup(&self, label: &str) -> Result<Option<(i32, String)>> {
         let conn = self.backend.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT id, datatype FROM custom_columns WHERE label = ?1",
-            [label],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()
+        Ok(crate::custom_columns::column(&conn, label)?.map(|c| (c.num, c.datatype)))
     }
 
+    /// A book's value in a custom column, as text. A multiple-value column
+    /// comes back joined with its separator (`", "`, or `" & "` for a
+    /// names column) in the order it was written; a rating is calibre's
+    /// 0-10 scale; a series is just the series name -- read the index with
+    /// [`Cache::get_custom_series_index`], or ask for `<label>_index`.
     pub fn get_custom_column_value(&self, book_id: i32, label: &str) -> Result<Option<String>> {
-        let Some((col_id, datatype)) = self.custom_column_lookup(label)? else {
-            return Ok(None);
-        };
-        let table_name = format!("custom_column_{col_id}");
+        use crate::custom_columns::{self as cc, Target};
         let conn = self.backend.conn.lock().unwrap();
-        conn.query_row(
-            &format!("SELECT value FROM {table_name} WHERE book = ?1"),
-            [book_id],
-            |row| match datatype.as_str() {
-                "int" | "bool" => row.get::<_, i32>(0).map(|v| v.to_string()),
-                "float" | "rating" => row.get::<_, f64>(0).map(|v| v.to_string()),
-                _ => row.get(0),
-            },
-        )
-        .optional()
+        match cc::resolve(&conn, label)? {
+            None => Ok(None),
+            Some(Target::Value(def)) => cc::read_value(&conn, &def, book_id),
+            Some(Target::SeriesIndex(def)) => Ok(cc::read_series_index(&conn, &def, book_id)?.map(|n| n.to_string())),
+        }
     }
 
-    pub fn set_custom_column_value(
-        &self,
-        book_id: i32,
-        label: &str,
-        value: &str,
-    ) -> anyhow::Result<()> {
-        let Some((col_id, datatype)) = self.custom_column_lookup(label)? else {
+    /// A book's index in a series custom column (`None` without a series).
+    pub fn get_custom_series_index(&self, book_id: i32, label: &str) -> Result<Option<f64>> {
+        let conn = self.backend.conn.lock().unwrap();
+        match crate::custom_columns::column(&conn, label)? {
+            Some(def) => crate::custom_columns::read_series_index(&conn, &def, book_id),
+            None => Ok(None),
+        }
+    }
+
+    /// Sets a custom column's value for a book, the way calibre does for
+    /// the column's datatype (see [`crate::custom_columns`]). An empty
+    /// value clears it. `<label>_index` sets a series column's index.
+    /// Errors for an enumeration value outside the column's list and for
+    /// text that is not a number/date/yes-no where the column needs one.
+    pub fn set_custom_column_value(&self, book_id: i32, label: &str, value: &str) -> anyhow::Result<()> {
+        use crate::custom_columns::{self as cc, Target};
+        let label = label.strip_prefix('#').unwrap_or(label);
+        let conn = self.backend.conn.lock().unwrap();
+        let Some(target) = cc::resolve(&conn, label)? else {
             anyhow::bail!("Custom column with label '{}' not found", label);
         };
-        let table_name = format!("custom_column_{col_id}");
-        let conn = self.backend.conn.lock().unwrap();
-        let sql = format!("INSERT OR REPLACE INTO {table_name} (book, value) VALUES (?1, ?2)");
-        match datatype.as_str() {
-            // Accepts both `"0"`/`"1"` (this crate's own round-trip
-            // convention -- `get_custom_column_value` always reads a
-            // bool column back as that exact string, never
-            // `"true"`/`"false"`) and `"true"`/`"false"` -- a real,
-            // previously-latent bug where only the latter parsed
-            // (`"1".parse::<bool>()` fails and silently fell back to
-            // `false`), found while wiring `formatter_functions.rs`'s
-            // `check_yes_no` (issue #515).
-            "bool" => conn.execute(
-                &sql,
-                (book_id, value.parse::<i32>().map(|n| n != 0).or_else(|_| value.parse::<bool>()).unwrap_or(false) as i32),
-            ),
-            "int" => conn.execute(&sql, (book_id, value.parse::<i32>().unwrap_or(0))),
-            "float" | "rating" => {
-                conn.execute(&sql, (book_id, value.parse::<f64>().unwrap_or(0.0)))
+        // What goes in the log: the column's value, and for a series the
+        // index it ended up with, so a replay (or a compacted log) does not
+        // depend on what index the book happened to hold before.
+        let mut logged = Vec::new();
+        match target {
+            Target::Value(def) => {
+                let index = cc::write_value(&conn, &def, book_id, value)?;
+                let value = if def.datatype == "series" { cc::split_series_value(value).0 } else { value.to_string() };
+                logged.push((def.label.clone(), value));
+                if let Some(idx) = index {
+                    logged.push((format!("{}_index", def.label), idx.to_string()));
+                }
             }
-            _ => conn.execute(&sql, (book_id, value)),
-        }?;
+            Target::SeriesIndex(def) => {
+                if let Some(idx) = cc::write_series_index(&conn, &def, book_id, value)? {
+                    logged.push((format!("{}_index", def.label), idx.to_string()));
+                }
+            }
+        }
         drop(conn);
 
         // Named `#label`, the way calibre names a custom column's field,
-        // so replay can tell it from a built-in one. This appended
-        // nothing: a rebuild from the log lost every custom column value
-        // in the library while keeping the column itself.
-        let (field, value) = (format!("#{label}"), value.to_string());
-        self.record_for_book(book_id, |book| crate::change_log::ChangeOp::FieldSet { book, field, value: Some(value) });
+        // so replay can tell it from a built-in one.
+        for (field, value) in logged {
+            let field = format!("#{field}");
+            self.record_for_book(book_id, |book| crate::change_log::ChangeOp::FieldSet { book, field, value: Some(value) });
+        }
         Ok(())
     }
 
@@ -2288,23 +2261,12 @@ impl Cache {
     pub fn remove_custom_column(&self, label: &str) -> anyhow::Result<()> {
         {
             let mut conn = self.backend.conn.lock().unwrap();
-            let col_id: Option<i32> = conn
-                .query_row(
-                    "SELECT id FROM custom_columns WHERE label = ?1",
-                    [label],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let Some(id) = col_id else {
+            let Some(def) = crate::custom_columns::column(&conn, label)? else {
                 anyhow::bail!("Column '{}' not found", label);
             };
-
             let tx = conn.transaction()?;
-            tx.execute("DELETE FROM custom_columns WHERE id = ?1", [id])?;
-            // `id` is an integer we control (from the `custom_columns` row
-            // just looked up), not user input -- no injection risk from
-            // building the table name via `format!`.
-            tx.execute(&format!("DROP TABLE IF EXISTS custom_column_{id}"), [])?;
+            tx.execute("DELETE FROM custom_columns WHERE id = ?1", [def.num])?;
+            crate::custom_columns::drop_schema(&tx, def.num)?;
             tx.commit()?;
         }
         self.record(crate::change_log::ChangeOp::CustomColumnRemoved { label: label.to_string() });
