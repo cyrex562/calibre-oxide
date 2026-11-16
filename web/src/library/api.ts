@@ -876,23 +876,40 @@ export interface DuplicateBook {
 }
 
 /**
- * Why a group was reported (#892).
+ * Why a group was reported, strongest first.
  *
- * `content` means the books hold a byte-identical file, which is
- * strictly stronger evidence than matching metadata and needs no
- * metadata to have been filled in at all.
+ * `content`: a byte-identical file (#892), needing no metadata at all.
+ * `identifier`: an equal, valid ISBN (10 and 13 compared as 13) or other
+ * strong identifier. `title_author_exact`: equal after normalisation (case,
+ * diacritics, articles, `(z-lib.org)` noise, "Last, First", initials).
+ * `title_author_fuzzy`: probably the same book, but a person has to say so.
+ * See crates/calibre_db/src/dedupe.rs.
  */
-export type DuplicateReason = "content" | "metadata";
+export type DuplicateReason = "content" | "identifier" | "title_author_exact" | "title_author_fuzzy";
+
+/** One reason two books in a group were joined. */
+export interface DuplicateEvidence {
+  books: [number, number];
+  reason: DuplicateReason;
+  /** 0 to 1. */
+  confidence: number;
+  detail: string;
+}
 
 export interface DuplicateGroup {
   books: DuplicateBook[];
   reason: DuplicateReason;
+  /** 0 to 1: the highest confidence among the group's evidence. */
+  confidence?: number;
+  evidence?: DuplicateEvidence[];
   /** The record the server would merge the others into; see `defaultMergeDestination`. */
   suggested_dest?: number | null;
 }
 
-export function scanForDuplicates(): Promise<{ groups: DuplicateGroup[] }> {
-  return jsonFetch<{ groups: DuplicateGroup[] }>("/duplicates/scan/default", { method: "POST" });
+/** `min` is applied by the server (weaker evidence is not used at all). Omit for everything. */
+export function scanForDuplicates(min?: "content" | "identifier" | "exact" | "fuzzy"): Promise<{ groups: DuplicateGroup[] }> {
+  const query = min ? `?min=${min}` : "";
+  return jsonFetch<{ groups: DuplicateGroup[] }>(`/duplicates/scan/default${query}`, { method: "POST" });
 }
 
 // ---- Merge books (crates/calibre_srv/src/merge_books.rs) ----
