@@ -12,7 +12,7 @@ import PolishDialog from "./PolishDialog.vue";
 import HelpDialog from "./HelpDialog.vue";
 import { LAYOUT_KEY, type LayoutPrefs, type Panel, parseLayout, resizedWidth } from "../library/layout";
 import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary,
-  scanLibrary,
+  scanLibrary, backfillHashes, cancelLibraryJob, describeJobProgress,
   fetchOrphans,
   relocateOrphan,
   uploadOrphanFile,
@@ -532,6 +532,19 @@ const checkLibraryConclusive = computed(() => checkLibraryResult.value?.conclusi
 
 const rescanBusy = ref(false);
 const rescanSummary = ref<string | null>(null);
+/** Live progress line while the scan job runs, and the id Cancel acts on. */
+const rescanProgress = ref<string | null>(null);
+const rescanJobId = ref<number | null>(null);
+
+/** Stops the running scan. It keeps what it has added; scanning again continues. */
+async function cancelRescan() {
+  if (rescanJobId.value === null) return;
+  try {
+    await cancelLibraryJob(rescanJobId.value);
+  } catch (e) {
+    checkLibraryError.value = e instanceof Error ? e.message : String(e);
+  }
+}
 
 /**
  * Untracked files are files the user can see in their own folder that
@@ -545,10 +558,17 @@ const rescanSummary = ref<string | null>(null);
 async function rescanLibraryFolder() {
   rescanBusy.value = true;
   rescanSummary.value = null;
+  rescanProgress.value = null;
   checkLibraryError.value = null;
   try {
-    const result = await scanLibrary();
+    // A scan of a big folder runs for a long time, so it is a background
+    // job: show how far it has got, and let the user stop it.
+    const result = await scanLibrary({
+      onStart: (id) => (rescanJobId.value = id),
+      onProgress: (job) => (rescanProgress.value = describeJobProgress(job.progress)),
+    });
     const parts: string[] = [];
+    if (result.cancelled) parts.push("stopped early — scan again to continue where it left off");
     if (result.added.length > 0) parts.push(`${result.added.length} added`);
     if (result.relocated > 0) parts.push(`${result.relocated} found in a new place`);
     // Named rather than counted: a file the scan refused to add is
@@ -564,6 +584,8 @@ async function rescanLibraryFolder() {
     checkLibraryError.value = e instanceof Error ? e.message : String(e);
   } finally {
     rescanBusy.value = false;
+    rescanProgress.value = null;
+    rescanJobId.value = null;
   }
 }
 
@@ -1442,6 +1464,51 @@ async function openDuplicates() {
     duplicatesError.value = e instanceof Error ? e.message : String(e);
   } finally {
     duplicatesLoading.value = false;
+  }
+}
+
+// Identical-file detection compares content hashes, and a library opened
+// from real calibre has none. This reads every book file once to record
+// one -- a long job on a big library, so it shows progress, can be
+// cancelled, and picks up where it stopped when run again.
+const prepareBusy = ref(false);
+const prepareProgress = ref<string | null>(null);
+const prepareSummary = ref<string | null>(null);
+const prepareJobId = ref<number | null>(null);
+
+async function prepareForDuplicates() {
+  prepareBusy.value = true;
+  prepareSummary.value = null;
+  prepareProgress.value = null;
+  try {
+    const result = await backfillHashes({
+      onStart: (id) => (prepareJobId.value = id),
+      onProgress: (job) => (prepareProgress.value = describeJobProgress(job.progress)),
+    });
+    const parts: string[] = [];
+    if (result.cancelled) parts.push("stopped early — run it again to continue");
+    parts.push(result.total === 0 ? "Every file already had a hash." : `${result.hashed.toLocaleString("en-US")} of ${result.total.toLocaleString("en-US")} files read`);
+    // Named rather than only counted: a file that could not be read is a
+    // file the duplicate check cannot see.
+    if (result.missing_count > 0) parts.push(`${result.missing_count} listed but not found on disk`);
+    if (result.unreadable_count > 0) parts.push(`${result.unreadable_count} could not be read`);
+    prepareSummary.value = parts.join(" · ");
+    await openDuplicates();
+  } catch (e) {
+    duplicatesError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    prepareBusy.value = false;
+    prepareProgress.value = null;
+    prepareJobId.value = null;
+  }
+}
+
+async function cancelPrepare() {
+  if (prepareJobId.value === null) return;
+  try {
+    await cancelLibraryJob(prepareJobId.value);
+  } catch (e) {
+    duplicatesError.value = e instanceof Error ? e.message : String(e);
   }
 }
 
@@ -2817,7 +2884,9 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
               <button type="button" :disabled="rescanBusy" @click="rescanLibraryFolder">
                 {{ rescanBusy ? "Scanning…" : "Add the untracked files to the library" }}
               </button>
+              <button v-if="rescanBusy" type="button" @click="cancelRescan">Cancel</button>
             </div>
+            <p v-if="rescanProgress" class="news-hint" role="status">{{ rescanProgress }}</p>
             <p v-if="rescanSummary" class="news-hint">{{ rescanSummary }}</p>
             <div v-for="[key, findings] in checkLibraryGenericFindings" :key="key">
               <h4>{{ CHECK_LIBRARY_LABELS[key] ?? key }} ({{ findings.length }})</h4>
@@ -2892,6 +2961,19 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
         <button class="manage-close" @click="duplicatesOpen = false">✕</button>
         <section>
           <h3>Find duplicates</h3>
+          <!--
+            Identical files are found by content hash, which only exist
+            for books this app added or scanned. A library opened from real
+            calibre needs them recorded first.
+          -->
+          <div class="plugin-actions">
+            <button type="button" :disabled="prepareBusy" @click="prepareForDuplicates">
+              {{ prepareBusy ? "Reading files…" : "Prepare for duplicate detection" }}
+            </button>
+            <button v-if="prepareBusy" type="button" @click="cancelPrepare">Cancel</button>
+          </div>
+          <p v-if="prepareProgress" class="news-hint" role="status">{{ prepareProgress }}</p>
+          <p v-if="prepareSummary" class="news-hint">{{ prepareSummary }}</p>
           <p v-if="duplicatesLoading">Scanning…</p>
           <p v-else-if="duplicatesError" class="error">{{ duplicatesError }}</p>
           <template v-else>

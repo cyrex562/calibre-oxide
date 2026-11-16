@@ -684,7 +684,11 @@ fn folder_is_inside_library(folder: &std::path::Path, library: &std::path::Path)
 /// Nothing is copied and nothing is deleted: the files are already in
 /// the library, so there is nothing to import them *to*.
 async fn scan_library_via_server(port: u16) -> Result<serde_json::Value, String> {
-    let url = format!("http://127.0.0.1:{port}/scan-library/-");
+    // `wait=true`: the route starts a background job and answers at once
+    // by default. The watcher wants the finished report (how many were
+    // added), and it is its own loop, so holding this request open blocks
+    // nothing else. The job itself is visible, and cancellable, in the page.
+    let url = format!("http://127.0.0.1:{port}/scan-library/-?wait=true");
     let resp = reqwest::Client::new().post(&url).send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));

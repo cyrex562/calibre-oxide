@@ -92,6 +92,7 @@ struct Recorded {
     format: String,
     path: String,
     hash: Option<String>,
+    size: Option<i64>,
     identity: Option<FileIdentity>,
 }
 
@@ -106,6 +107,7 @@ pub fn detect(cache: &Cache, scan: &ScanReport) -> Result<DriftReport> {
     let recorded = recorded_files(cache)?;
 
     let on_disk: HashSet<&str> = scan.files.iter().map(|f| f.relative_path.as_str()).collect();
+    let on_disk_facts: HashMap<&str, &calibre_utils::filenames::FileFacts> = scan.files.iter().map(|f| (f.relative_path.as_str(), &f.facts)).collect();
     let claimed: HashSet<&str> = recorded.iter().map(|r| r.path.as_str()).collect();
 
     let mut report = DriftReport { conclusive: scan.is_complete(), ..Default::default() };
@@ -146,6 +148,20 @@ pub fn detect(cache: &Cache, scan: &ScanReport) -> Result<DriftReport> {
 
         // Our file, where it should be. The only question left is
         // whether the bytes are still the ones we recorded.
+        //
+        // Answered from the size the walk already read off the directory
+        // entry. Hashing every recorded file here meant every rescan read
+        // the whole library -- hundreds of gigabytes on a NAS -- to learn
+        // that nothing had changed. A file whose size differs is read and
+        // compared; one whose size matches is taken as unchanged. That
+        // misses an edit that keeps the exact byte count, which is the
+        // price: nothing in a rescan acts on `edited`, and Check Library's
+        // checksum verification is the full-content check.
+        let size_matches = matches!((record.size, on_disk_facts.get(record.path.as_str())), (Some(recorded), Some(actual)) if recorded as u64 == actual.size);
+        if size_matches {
+            report.unchanged += 1;
+            continue;
+        }
         match (&record.hash, hash_of(&full)) {
             (Some(recorded_hash), Some(actual)) if *recorded_hash != actual => {
                 report.edited.push(Edit { book_id: record.book_id, format: record.format.clone(), path: record.path.clone() });
@@ -165,16 +181,18 @@ pub fn detect(cache: &Cache, scan: &ScanReport) -> Result<DriftReport> {
     // would be reported as unclaimed files needing attention -- which is
     // precisely the state the user chose -- and could be matched to an
     // unrelated absent book that happened to share their content.
-    let ignored = cache.ignored();
+    //
+    // By path only, from one snapshot of the list -- not by hashing every
+    // unclaimed file, which on a first scan is every file in the folder.
+    // The content half of the ignore check is applied below, but only to
+    // files that are about to be hashed anyway.
+    let (ignored_paths, ignored_hashes) = cache.ignored().snapshot().unwrap_or_default();
     let mut untracked: Vec<&str> = scan
         .files
         .iter()
         .map(|f| f.relative_path.as_str())
         .filter(|p| !claimed.contains(p) || displaced.contains(p))
-        .filter(|p| {
-            let hash = hash_of(&library.join(p));
-            !ignored.is_ignored(p, hash.as_deref()).unwrap_or(false)
-        })
+        .filter(|p| !ignored_paths.contains(*p))
         .collect();
     untracked.sort();
 
@@ -185,14 +203,28 @@ pub fn detect(cache: &Cache, scan: &ScanReport) -> Result<DriftReport> {
     let mut still_absent: Vec<&Recorded> = Vec::new();
 
     let mut by_identity: HashMap<FileIdentity, &str> = HashMap::new();
-    let mut by_hash: HashMap<String, Vec<&str>> = HashMap::new();
     for path in &untracked {
-        let full = library.join(path);
-        if let Some(facts) = file_facts(&full) {
+        if let Some(facts) = on_disk_facts.get(*path) {
             by_identity.entry(facts.identity).or_insert(path);
         }
-        if let Some(hash) = hash_of(&full) {
-            by_hash.entry(hash).or_default().push(path);
+    }
+
+    // Content matching reads files, so it is built only when some absent
+    // record could not be matched by identity and has a hash to match on.
+    // A first scan of a folder (nothing absent) and a rescan where every
+    // move kept its identity read nothing here.
+    let needs_content = absent.iter().any(|r| r.hash.is_some() && !r.identity.is_some_and(|id| by_identity.contains_key(&id)));
+    let mut by_hash: HashMap<String, Vec<&str>> = HashMap::new();
+    if needs_content {
+        for path in &untracked {
+            if let Some(hash) = hash_of(&library.join(path)) {
+                // A file the user removed and kept, found by content after
+                // being renamed, is not a candidate for anything.
+                if ignored_hashes.contains(&hash) {
+                    continue;
+                }
+                by_hash.entry(hash).or_default().push(path);
+            }
         }
     }
 
@@ -269,14 +301,18 @@ fn recorded_files(cache: &Cache) -> Result<Vec<Recorded>> {
         out
     };
 
-    let checksums = cache.checksums();
+    // One query for every record, not one per file.
+    let mut records = cache.checksums().all_format_records().unwrap_or_default();
     Ok(rows
         .into_iter()
         .map(|(book_id, folder, format, name)| {
             let file = format!("{name}.{}", format.to_lowercase());
             let path = if folder.is_empty() { file } else { format!("{folder}/{file}") };
-            let (hash, identity) = checksums.recorded_identity(book_id, "format", &format).unwrap_or((None, None));
-            Recorded { book_id, format, path, hash, identity }
+            let (hash, size, identity) = match records.remove(&(book_id, format.clone())) {
+                Some((hash, size, identity)) => (Some(hash), Some(size), identity),
+                None => (None, None, None),
+            };
+            Recorded { book_id, format, path, hash, size, identity }
         })
         .collect())
 }

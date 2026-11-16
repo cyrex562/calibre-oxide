@@ -142,6 +142,17 @@ pub enum VerifyOutcome {
     NoRecord,
 }
 
+/// One hash to record, for [`ChecksumStore::record_many`].
+#[derive(Debug, Clone)]
+pub struct HashRecord {
+    pub book_id: i32,
+    pub kind: String,
+    pub key: String,
+    pub hash: String,
+    pub size: i64,
+    pub identity: Option<calibre_utils::filenames::FileIdentity>,
+}
+
 /// See this module's doc comment for the full design.
 pub struct ChecksumStore {
     conn: Arc<Mutex<Connection>>,
@@ -200,7 +211,14 @@ impl ChecksumStore {
                     PRIMARY KEY (book_id, kind, key)
                 );
                 CREATE INDEX IF NOT EXISTS checksums_db.file_checksums_by_hash
-                    ON file_checksums (blake3_hex);",
+                    ON file_checksums (blake3_hex);
+                -- Books the in-place scan registered from their filename
+                -- alone, still owed their embedded metadata and cover.
+                CREATE TABLE IF NOT EXISTS checksums_db.enrichment_queue (
+                    book_id INTEGER PRIMARY KEY,
+                    format TEXT NOT NULL,
+                    queued_at TEXT NOT NULL
+                );",
             )?;
         }
 
@@ -275,6 +293,25 @@ impl ChecksumStore {
     ) -> Result<(), ChecksumError> {
         self.initialize()?;
         let conn = self.conn.lock().unwrap();
+        Self::record_hash_on(&conn, book_id, kind, key, hash, size, identity)?;
+        Ok(())
+    }
+
+    /// The statement behind [`ChecksumStore::record_hash_with_identity`],
+    /// on a connection the caller already holds -- so a batch can record
+    /// many hashes inside the transaction that creates the books they
+    /// describe, rather than locking and committing once per file.
+    ///
+    /// The sidecar must already be attached ([`ChecksumStore::initialize`]).
+    pub(crate) fn record_hash_on(
+        conn: &Connection,
+        book_id: i32,
+        kind: &str,
+        key: &str,
+        hash: &str,
+        size: i64,
+        identity: Option<calibre_utils::filenames::FileIdentity>,
+    ) -> SqlResult<()> {
         let (volume, index) = match identity {
             Some(id) => (Some(id.volume as i64), Some(id.index as i64)),
             None => (None, None),
@@ -294,6 +331,85 @@ impl ChecksumStore {
             (book_id, kind, key, hash, size, volume, index),
         )?;
         Ok(())
+    }
+
+    /// Records many hashes in one `BEGIN IMMEDIATE` transaction -- the
+    /// batch form of [`ChecksumStore::record_hash_with_identity`], for the
+    /// hash backfill, where a commit per file would be most of its cost.
+    pub fn record_many(&self, records: &[HashRecord]) -> Result<(), ChecksumError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        self.initialize()?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        for r in records {
+            Self::record_hash_on(&tx, r.book_id, &r.kind, &r.key, &r.hash, r.size, r.identity)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Queues a book for the lazy metadata pass (cover, embedded title
+    /// and authors). On a connection the caller holds, for the same
+    /// reason as [`ChecksumStore::record_hash_on`].
+    pub(crate) fn queue_enrichment_on(conn: &Connection, book_id: i32, format: &str) -> SqlResult<()> {
+        conn.execute(
+            "INSERT OR REPLACE INTO checksums_db.enrichment_queue (book_id, format, queued_at) VALUES (?1, ?2, datetime('now'))",
+            (book_id, format),
+        )?;
+        Ok(())
+    }
+
+    /// Books still waiting for the metadata pass, as
+    /// `(book_id, format, file stem, folder)`, lowest id first.
+    ///
+    /// The queue is the whole of the pass's state, which is what makes it
+    /// resumable: a book leaves it only once it has been enriched, so a
+    /// rerun after a cancel or a crash sees exactly what is left.
+    pub fn pending_enrichment(&self) -> Result<Vec<(i32, String, String, String)>, ChecksumError> {
+        self.initialize()?;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT q.book_id, q.format, d.name, b.path
+             FROM checksums_db.enrichment_queue q
+             JOIN data d ON d.book = q.book_id AND d.format = q.format
+             JOIN books b ON b.id = q.book_id
+             ORDER BY q.book_id",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?;
+        Ok(rows.collect::<SqlResult<Vec<_>>>()?)
+    }
+
+    /// Takes a book off the metadata queue: it was enriched, or there is
+    /// nothing more to learn from its file.
+    pub fn finish_enrichment(&self, book_id: i32) -> Result<(), ChecksumError> {
+        self.initialize()?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM checksums_db.enrichment_queue WHERE book_id = ?1", (book_id,))?;
+        Ok(())
+    }
+
+    /// Every format file with no recorded content hash, as
+    /// `(book_id, format, file stem, folder)`.
+    ///
+    /// This is every file of a library opened from real calibre, which
+    /// never writes this sidecar. One query for the whole library rather
+    /// than a lookup per file.
+    pub fn formats_without_hash(&self) -> Result<Vec<(i32, String, String, String)>, ChecksumError> {
+        self.initialize()?;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT d.book, d.format, d.name, b.path
+             FROM data d JOIN books b ON b.id = d.book
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM checksums_db.file_checksums c
+                 WHERE c.book_id = d.book AND c.kind = 'format' AND c.key = d.format
+             )
+             ORDER BY d.book, d.format",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?;
+        Ok(rows.collect::<SqlResult<Vec<_>>>()?)
     }
 
     /// What was recorded for one file: its hash, and its filesystem
@@ -320,6 +436,28 @@ impl ChecksumStore {
             Some((hash, _, _)) => (Some(hash), None),
             None => (None, None),
         })
+    }
+
+    /// Every recorded format file as `(book_id, FORMAT) -> (hash, size,
+    /// identity)`, in one query.
+    ///
+    /// For passes that look at every file ([`crate::drift`]): calling
+    /// [`ChecksumStore::recorded_identity`] per file is a query -- and a
+    /// schema check -- each, which on a library of 300,000 files is most
+    /// of the pass.
+    #[allow(clippy::type_complexity)]
+    pub fn all_format_records(&self) -> Result<std::collections::HashMap<(i32, String), (String, i64, Option<calibre_utils::filenames::FileIdentity>)>, ChecksumError> {
+        self.initialize()?;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT book_id, key, blake3_hex, size, volume, file_index FROM checksums_db.file_checksums WHERE kind = 'format'")?;
+        let rows = stmt.query_map([], |row| {
+            let identity = match (row.get::<_, Option<i64>>(4)?, row.get::<_, Option<i64>>(5)?) {
+                (Some(volume), Some(index)) => Some(calibre_utils::filenames::FileIdentity { volume: volume as u64, index: index as u64 }),
+                _ => None,
+            };
+            Ok(((row.get::<_, i32>(0)?, row.get::<_, String>(1)?), (row.get::<_, String>(2)?, row.get::<_, i64>(3)?, identity)))
+        })?;
+        Ok(rows.collect::<SqlResult<_>>()?)
     }
 
     /// Which book owns the file with this filesystem identity.

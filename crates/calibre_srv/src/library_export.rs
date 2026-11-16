@@ -44,13 +44,68 @@ use anyhow::Context;
 use crate::errors::ServerError;
 use crate::AppState;
 
+/// A consistent copy of a SQLite database, as bytes.
+///
+/// `VACUUM INTO` writes a new database file from one read snapshot, so it
+/// contains everything committed -- including what is still sitting in the
+/// `-wal` file -- and needs no companion files to open. That is the point:
+/// the export used to copy `metadata.db` and its `-wal` and `-shm` as three
+/// separate files read at three different moments. A write landing between
+/// the reads, or a WAL the copy was taken without, gave an archive whose
+/// database was missing committed rows or would not open.
+///
+/// Tier-aware for free. A library on network storage is in `DELETE` journal
+/// mode with no WAL at all (`storage_safety.rs`); the snapshot is the same
+/// read either way, and there is simply no sidecar to leave out.
+///
+/// `None` when the file is not a database SQLite can read (or is locked
+/// hard): the caller then copies it as it is, sidecars included, rather
+/// than failing the whole export.
+fn consistent_database_copy(path: &Path) -> Option<Vec<u8>> {
+    let scratch = tempfile::tempdir().ok()?;
+    let target = scratch.path().join("snapshot.db");
+    let conn = rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE).ok()?;
+    conn.busy_timeout(std::time::Duration::from_secs(10)).ok()?;
+    conn.execute("VACUUM INTO ?1", [target.to_string_lossy().as_ref()]).ok()?;
+    drop(conn);
+    std::fs::read(&target).ok()
+}
+
+/// `metadata.db-wal` -> `metadata.db`: the database a SQLite sidecar
+/// belongs to.
+fn sidecar_owner(path: &Path) -> Option<std::path::PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    let base = ["-wal", "-shm", "-journal"].iter().find_map(|suffix| name.strip_suffix(suffix))?;
+    base.ends_with(".db").then(|| path.with_file_name(base))
+}
+
 fn build_library_zip(library_path: &Path) -> anyhow::Result<Vec<u8>> {
+    let entries: Vec<walkdir::DirEntry> = walkdir::WalkDir::new(library_path).into_iter().filter_map(Result::ok).collect();
+
+    // Databases first, each as one consistent snapshot; their `-wal`,
+    // `-shm` and `-journal` files are then left out, because the snapshot
+    // already contains what they held and a stale one beside it could only
+    // confuse the restored copy.
+    let mut snapshots: std::collections::HashMap<std::path::PathBuf, Vec<u8>> = std::collections::HashMap::new();
+    for entry in &entries {
+        let path = entry.path();
+        if entry.file_type().is_file() && path.extension().and_then(|e| e.to_str()) == Some("db") {
+            let in_per_process_state = path.strip_prefix(library_path).ok().and_then(|rel| rel.strip_prefix(calibre_db::constants::LIBRARY_HANDLE_DIR_NAME).ok()).is_some_and(is_per_process_state);
+            if in_per_process_state {
+                continue;
+            }
+            if let Some(bytes) = consistent_database_copy(path) {
+                snapshots.insert(path.to_path_buf(), bytes);
+            }
+        }
+    }
+
     let mut buf = Vec::new();
     {
         let cursor = std::io::Cursor::new(&mut buf);
         let mut zip = zip::ZipWriter::new(cursor);
         let options = zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-        for entry in walkdir::WalkDir::new(library_path).into_iter().filter_map(Result::ok) {
+        for entry in &entries {
             let path = entry.path();
             let rel = path.strip_prefix(library_path)?;
             if rel.as_os_str().is_empty() {
@@ -88,7 +143,14 @@ fn build_library_zip(library_path: &Path) -> anyhow::Result<Vec<u8>> {
             if entry.file_type().is_dir() {
                 zip.add_directory(format!("{name}/"), options)?;
             } else if entry.file_type().is_file() {
+                if sidecar_owner(path).is_some_and(|owner| snapshots.contains_key(&owner)) {
+                    continue;
+                }
                 zip.start_file(name, options)?;
+                if let Some(snapshot) = snapshots.get(path) {
+                    std::io::Write::write_all(&mut zip, snapshot).with_context(|| format!("writing the snapshot of {} for export", path.display()))?;
+                    continue;
+                }
                 let mut f = std::fs::File::open(path)
                     .with_context(|| format!("opening {} for export", path.display()))?;
                 std::io::copy(&mut f, &mut zip)
@@ -131,7 +193,7 @@ pub async fn export(State(state): State<AppState>, AxumPath(library_id): AxumPat
 
 #[cfg(test)]
 mod tests {
-    use super::is_per_process_state;
+    use super::{is_per_process_state, sidecar_owner};
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
@@ -295,6 +357,49 @@ mod tests {
         let state = calibre_db::constants::LIBRARY_HANDLE_DIR_NAME;
         assert!(!names.iter().any(|n| n.contains("writer.lock")), "{names:?}");
         assert!(!names.iter().any(|n| n.starts_with(&format!("{state}/journal"))), "{names:?}");
+    }
+
+    /// The export used to copy `metadata.db`, `-wal` and `-shm` as three
+    /// files read at three moments. What it must hand back instead is one
+    /// database that already contains everything committed, opens on its
+    /// own, and has no sidecar beside it to go stale.
+    #[tokio::test]
+    async fn the_export_database_is_consistent_with_writes_still_in_the_wal() {
+        let (dir, router, cache, book_id) = test_app_with_cache();
+        // Commits that may well still be in the write-ahead log.
+        cache.set_field(book_id, "title", "Edited While Exporting").unwrap();
+        cache.set_field(book_id, "rating", "8").unwrap();
+
+        let req = Request::builder().uri("/library/export/default").body(Body::empty()).unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+        let names = zip_entry_names(&bytes);
+        assert!(!names.iter().any(|n| n.ends_with("-wal") || n.ends_with("-shm")), "a stale sidecar was exported beside the snapshot: {names:?}");
+
+        // Extract only the database: no sidecars exist to help it.
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).unwrap();
+        let extracted = tempfile::tempdir().unwrap();
+        let mut db = Vec::new();
+        std::io::Read::read_to_end(&mut archive.by_name("metadata.db").unwrap(), &mut db).unwrap();
+        std::fs::write(extracted.path().join("metadata.db"), db).unwrap();
+
+        let conn = rusqlite::Connection::open(extracted.path().join("metadata.db")).unwrap();
+        let title: String = conn.query_row("SELECT title FROM books WHERE id = ?1", [book_id], |r| r.get(0)).unwrap();
+        assert_eq!(title, "Edited While Exporting", "a committed write is missing from the exported database");
+        let integrity: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0)).unwrap();
+        assert_eq!(integrity, "ok");
+        drop(dir);
+    }
+
+    #[test]
+    fn a_sqlite_sidecar_is_recognised_by_the_database_it_belongs_to() {
+        use std::path::Path;
+        assert_eq!(sidecar_owner(Path::new("lib/metadata.db-wal")), Some(Path::new("lib/metadata.db").to_path_buf()));
+        assert_eq!(sidecar_owner(Path::new("lib/.calibre-oxide/checksums.db-shm")), Some(Path::new("lib/.calibre-oxide/checksums.db").to_path_buf()));
+        // A book that happens to be called something-wal is not one.
+        assert_eq!(sidecar_owner(Path::new("lib/notes-wal")), None);
+        assert_eq!(sidecar_owner(Path::new("lib/metadata.db")), None);
     }
 
     fn zip_entry_names(bytes: &[u8]) -> Vec<String> {

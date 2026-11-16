@@ -274,6 +274,49 @@ pub fn page_count(pdf: &[u8]) -> Result<usize> {
 pub fn render_page(pdf: &[u8], page_number: usize, target_width: u32) -> Result<RenderedPage> {
     let pdfium = pdfium().ok_or_else(unavailable)?;
     let document = pdfium.load_pdf_from_byte_slice(pdf, None).map_err(|e| RasterizeError::Pdf(e.to_string()))?;
+    render_document_page(&document, page_number, target_width)
+}
+
+/// The Info-dictionary strings of a PDF.
+#[derive(Debug, Default, Clone)]
+pub struct PdfInfo {
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub keywords: Option<String>,
+    pub subject: Option<String>,
+}
+
+/// Reads a PDF's Info strings and, optionally, renders page 1 as a cover
+/// JPEG -- **from the file on disk**, without loading it into memory.
+///
+/// PDFium reads through a file callback, fetching only the cross-reference
+/// data and the objects page 1 needs. For a 500 MB scan that is the
+/// difference between a few megabytes of reads and a 500 MB allocation per
+/// worker, which is what [`page_count`]/[`render_page`] (taking `&[u8]`)
+/// would cost. Used by the in-place scan's metadata pass.
+pub fn info_and_cover_from_path(path: &Path, want_cover: bool) -> Result<(PdfInfo, Option<Vec<u8>>)> {
+    use pdfium_render::prelude::PdfDocumentMetadataTagType as Tag;
+
+    let pdfium = pdfium().ok_or_else(unavailable)?;
+    let document = pdfium.load_pdf_from_file(path, None).map_err(|e| RasterizeError::Pdf(e.to_string()))?;
+    let metadata = document.metadata();
+    let get = |tag: Tag| metadata.get(tag).map(|t| t.value().to_string()).filter(|v| !v.trim().is_empty());
+    let info = PdfInfo { title: get(Tag::Title), author: get(Tag::Author), keywords: get(Tag::Keywords), subject: get(Tag::Subject) };
+    let cover = if want_cover {
+        match render_document_page(&document, 1, DEFAULT_COVER_WIDTH).and_then(|page| page.encode(PageImageFormat::Jpeg, DEFAULT_JPEG_QUALITY)) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                log::debug!("no cover rendered from {}: {e}", path.display());
+                None
+            }
+        }
+    } else {
+        None
+    };
+    Ok((info, cover))
+}
+
+fn render_document_page(document: &pdfium_render::prelude::PdfDocument<'_>, page_number: usize, target_width: u32) -> Result<RenderedPage> {
     let pages = document.pages();
     let count = pages.len() as usize;
 

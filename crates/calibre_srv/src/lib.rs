@@ -200,6 +200,7 @@ pub mod rename;
 pub mod orphans;
 pub mod rename_files;
 pub mod scan_library;
+pub mod library_jobs;
 pub mod render_endpoints;
 pub mod save_to_disk;
 pub mod share;
@@ -368,6 +369,11 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/share/email", post(share::share_email))
         .route("/check-library/{library_id}", post(check_library::check))
         .route("/scan-library/{library_id}", post(scan_library::scan))
+        .route("/enrich-library/{library_id}", post(library_jobs::enrich))
+        .route("/hash-backfill/{library_id}", post(library_jobs::hash_backfill))
+        .route("/library-jobs", get(library_jobs::list))
+        .route("/library-jobs/{job_id}", get(library_jobs::status))
+        .route("/library-jobs/{job_id}/cancel", post(library_jobs::cancel))
         .route("/orphans/{library_id}", get(orphans::list))
         .route("/orphans/relocate/{book_id}/{format}/{library_id}", post(orphans::relocate))
         .route("/orphans/upload/{book_id}/{format}/{library_id}/{filename}", post(orphans::upload))

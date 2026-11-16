@@ -32,6 +32,55 @@ pub fn get_quick_metadata<R: Read + Seek>(stream: R) -> Result<MetaInformation> 
     get_metadata_with_cover(stream, false)
 }
 
+/// The biggest PDF read into memory for its metadata when PDFium is not
+/// available to read it from disk.
+const MAX_IN_MEMORY_PDF_BYTES: u64 = 64 * 1024 * 1024;
+
+/// [`get_metadata`] for a file on disk, without loading the file.
+///
+/// PDFium reads the Info strings and renders page 1 through a file
+/// callback, fetching only what it needs (see
+/// [`crate::pdf::rasterize::info_and_cover_from_path`]). The stream
+/// readers above have to buffer the whole file for `lopdf`; for a 500 MB
+/// scan that is a 500 MB allocation per call, which a library scan makes
+/// hundreds of thousands of times.
+///
+/// When PDFium is unavailable or cannot open the file, falls back to the
+/// stream reader -- but only up to [`MAX_IN_MEMORY_PDF_BYTES`]. Above
+/// that the error says so and the caller keeps the filename for a title,
+/// which is better than exhausting memory on a metadata nicety.
+pub fn get_metadata_from_path(path: &Path) -> Result<MetaInformation> {
+    match crate::pdf::rasterize::info_and_cover_from_path(path, true) {
+        Ok((info, cover)) => {
+            let mut mi = MetaInformation::default();
+            if let Some(title) = info.title {
+                mi.title = title;
+            }
+            if let Some(author) = info.author {
+                mi.authors = crate::metadata::authors::string_to_authors(&author);
+            }
+            for value in [info.keywords, info.subject].into_iter().flatten() {
+                for tag in value.split(&[',', ';'][..]).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+                    if !mi.tags.contains(&tag) {
+                        mi.tags.push(tag);
+                    }
+                }
+            }
+            if let Some(data) = cover {
+                mi.cover_data = (Some("jpg".to_string()), data);
+            }
+            Ok(mi)
+        }
+        Err(e) => {
+            let size = std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?.len();
+            if size > MAX_IN_MEMORY_PDF_BYTES {
+                anyhow::bail!("{} is {} MB and PDFium could not read it ({e}); not loading it into memory for its metadata", path.display(), size / (1024 * 1024));
+            }
+            get_metadata(std::io::BufReader::new(std::fs::File::open(path)?))
+        }
+    }
+}
+
 /// Port of `get_metadata(stream, cover)`.
 ///
 /// A failure to render the cover is deliberately not a failure to read

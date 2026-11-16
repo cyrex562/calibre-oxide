@@ -110,6 +110,12 @@ pub fn get_metadata<P: AsRef<Path>>(path: P) -> Result<MetaInformation> {
         .map(|s| s.to_lowercase())
         .unwrap_or_default();
 
+    // A PDF is read from disk by PDFium rather than loaded whole -- see
+    // `pdf::get_metadata_from_path`.
+    if ext == "pdf" {
+        return pdf::get_metadata_from_path(path);
+    }
+
     let file = File::open(path)?;
     let stream = BufReader::new(file);
 
@@ -118,7 +124,7 @@ pub fn get_metadata<P: AsRef<Path>>(path: P) -> Result<MetaInformation> {
         "mobi" | "prc" | "azw" | "azw3" => mobi::get_metadata(stream),
         "fb2" => fb2::get_metadata(stream),
         "lit" => lit::get_metadata(stream),
-        "pdf" => pdf::get_metadata(stream),
+        "pdf" => pdf::get_metadata(stream), // unreachable: handled above
         "rb" => rb::get_metadata(stream),
         "imp" => imp::get_metadata(stream),
         "lrf" | "lrx" => lrx::get_metadata(stream),

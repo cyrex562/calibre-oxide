@@ -100,6 +100,33 @@ is minutes to hours of I/O. The scan must not block on it:
 2. **In the background** — hash each file, then apply the hash-derived
    conclusions: duplicate pairs and format grouping. These appear as they land.
 
+As built (`calibre_db::scan_pipeline`, run as a cancellable job by
+`calibre_srv::library_jobs`), the split sits in a different place, because the
+hash turned out to be the cheap half to do *once* and the embedded metadata the
+expensive half to do lazily:
+
+1. **Scan** — each new file is streamed **once** through BLAKE3 (1 MiB reads,
+   size counted in the same pass, never a whole-file read). That one read
+   serves the ignore list, the checksum record and the book entry. The book
+   appears titled from its filename, in batches of one `BEGIN IMMEDIATE`
+   transaction each, as soon as a batch commits. Files already indexed are
+   found with one query and are not opened at all.
+2. **Enrichment** — embedded title, authors and the cover, for the books the
+   scan queued (`checksums_db.enrichment_queue`). A PDF is read by PDFium from
+   disk, not loaded into memory. It fills in only what is still a placeholder,
+   so a title the user changed in between is kept. Resumable by construction:
+   a book leaves the queue only when done.
+3. **Hash backfill** — every format file with no recorded hash, which is every
+   file of a library real calibre made. Same streaming read; resumable because
+   the work list is "files with no hash".
+
+Reads run on a small bounded pool (default 3; `CALIBRE_OXIDE_SCAN_WORKERS`, or
+`?workers=` on the route); every database write stays on one thread in sorted
+order, so the result does not depend on the thread count. Cancel is checked
+between read chunks. A batch is committed whole or not at all, so a cancelled or
+crashed scan leaves no half-registered book, and a rerun skips whatever already
+has a book.
+
 ## When two files are one book
 
 Filename agreement is **not** evidence. Two files called `scan0001` in
@@ -247,6 +274,36 @@ Three reasons this beats sidecars:
    file means the database says one thing and the sidecar another, with nothing
    declaring a winner — the same shape as the three `data.name`-versus-disk bugs
    fixed in #885.
+
+### Batched entries: one fsync per hundred books
+
+An entry is a file, and a durable entry is a file that has been fsynced. A book
+registered by the scan is nine ops, so a library of 300,000 files was 2.7
+million fsyncs — days on a network share, and 18,000 of them (about 40 seconds)
+for a 2,000-file smoke test on a local disk.
+
+`ChangeOp::Batch { ops }` records several ops as **one entry**: one file, one
+fsync, one link in the hash chain. The scan writes one per batch of books.
+
+- **Replay is unchanged.** The inner ops are applied in order, exactly as if
+  they were separate entries (`apply::apply_op`). The audit
+  `every_write_survives_a_rebuild_from_the_log` covers a batch, and the scan
+  tests rebuild a batched scan from its log and compare.
+- **A batch is atomic in the log.** It is one file, parsed whole or rejected by
+  its hash, so a crash cannot leave half of one — stricter than the per-op
+  entries it replaces, where a crash could leave a book with an add and no
+  fields.
+- **The gap that remains is the one every write here already had**: the database
+  commit comes first and the log append second, so a crash in between leaves a
+  batch of books the log does not know about. It is now a hundred books wide
+  instead of one. `ChangeLog::verify` and a rebuild are where it would surface,
+  and a rerun of the scan does not repair it (the books exist, so they are
+  skipped); a rebuild would drop them and the next scan would re-add them from
+  the files — a loss of nothing but their ids.
+- **Compaction keeps a batch whole.** It has no single supersede key, so a later
+  edit of one of its fields is not collapsed into it. That costs disk, not
+  correctness: the later entry replays after the batch and wins.
+- **Single adds are unchanged**: one entry per op.
 
 ### Where the git analogy breaks
 

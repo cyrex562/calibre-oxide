@@ -588,10 +588,120 @@ export interface ScanLibraryResult {
    */
   conclusive: boolean;
   unreadable: string[];
+  /** The job was cancelled part-way; what was added is kept and a rerun continues. */
+  cancelled?: boolean;
 }
 
-export function scanLibrary(): Promise<ScanLibraryResult> {
-  return jsonFetch<ScanLibraryResult>("/scan-library/default", { method: "POST" });
+/**
+ * Live counters of a background library job. Which ones move depends on
+ * the job: a scan counts `seen` then `added`, the metadata pass
+ * `enriched`, the hash backfill `hashed`.
+ */
+export interface LibraryJobProgress {
+  /** "walking" | "indexing" | "enriching" | "hashing" */
+  phase: string;
+  cancelled: boolean;
+  total: number;
+  seen: number;
+  hashed: number;
+  added: number;
+  already_known: number;
+  ignored: number;
+  enriched: number;
+  errors: number;
+  bytes_hashed: number;
+}
+
+export interface LibraryJob<R = unknown> {
+  id: number;
+  kind: "scan" | "enrich" | "hash_backfill";
+  state: "running" | "finished" | "cancelled" | "failed";
+  progress: LibraryJobProgress;
+  /** Present once the job has ended. */
+  report: R | null;
+  error: string | null;
+}
+
+export interface LibraryJobHandlers<R = unknown> {
+  /** Called once with the job's id, so the caller can offer Cancel. */
+  onStart?: (jobId: number) => void;
+  /** Called with every status poll. */
+  onProgress?: (job: LibraryJob<R>) => void;
+  /** Milliseconds between polls. */
+  intervalMs?: number;
+}
+
+export function fetchLibraryJob<R = unknown>(jobId: number): Promise<LibraryJob<R>> {
+  return jsonFetch<LibraryJob<R>>(`/library-jobs/${jobId}`);
+}
+
+/** Asks a running job to stop. It stops at its next read chunk and keeps what it did. */
+export function cancelLibraryJob(jobId: number): Promise<LibraryJob> {
+  return jsonFetch<LibraryJob>(`/library-jobs/${jobId}/cancel`, { method: "POST" });
+}
+
+/**
+ * Starts a library job and follows it to the end.
+ *
+ * The routes answer at once with the job's id, because a scan of a large
+ * folder takes far longer than a request should be held open; this polls
+ * the status route and resolves with the job's final report. A cancelled
+ * job resolves (its report says `cancelled`); a failed one rejects.
+ */
+async function runLibraryJob<R>(startUrl: string, handlers: LibraryJobHandlers<R>): Promise<R> {
+  const started = await jsonFetch<{ job_id: number }>(startUrl, { method: "POST" });
+  handlers.onStart?.(started.job_id);
+  for (;;) {
+    const job = await fetchLibraryJob<R>(started.job_id);
+    handlers.onProgress?.(job);
+    if (job.state === "failed") throw new Error(job.error ?? "the job failed");
+    if (job.state !== "running") return job.report as R;
+    await new Promise((resolve) => setTimeout(resolve, handlers.intervalMs ?? 500));
+  }
+}
+
+export function scanLibrary(handlers: LibraryJobHandlers<ScanLibraryResult> = {}): Promise<ScanLibraryResult> {
+  return runLibraryJob<ScanLibraryResult>("/scan-library/default", handlers);
+}
+
+/** What the hash backfill did. */
+export interface HashBackfillResult {
+  /** Files that now have a content hash. */
+  hashed: number;
+  /** Files that had none when the job started. */
+  total: number;
+  /** Listed in the library but not on disk. Reported, not fatal. */
+  missing: string[];
+  missing_count: number;
+  unreadable: [string, string][];
+  unreadable_count: number;
+  cancelled: boolean;
+}
+
+/**
+ * Gives every book file in the library a content hash, which is what lets
+ * "Find duplicates" see identical files in a library that was never
+ * scanned here (every library opened from real calibre).
+ */
+export function backfillHashes(handlers: LibraryJobHandlers<HashBackfillResult> = {}): Promise<HashBackfillResult> {
+  return runLibraryJob<HashBackfillResult>("/hash-backfill/default", handlers);
+}
+
+/** One line for a job's progress, for the UI to show while it runs. */
+export function describeJobProgress(p: LibraryJobProgress): string {
+  const n = (v: number) => v.toLocaleString("en-US");
+  switch (p.phase) {
+    case "walking":
+      return `Looking through the folder… ${n(p.seen)} files so far`;
+    case "indexing":
+      return `Adding books… ${n(p.added + p.errors)} of ${n(p.total)} new files`;
+    case "enriching":
+      return `Reading titles and covers… ${n(p.enriched + p.errors)} of ${n(p.total)}`;
+    case "hashing":
+      return `Reading files… ${n(p.hashed + p.errors)} of ${n(p.total)}`;
+    default:
+      return "Working…";
+  }
 }
 
 /** A book entry whose file is gone — renamed, moved out, or deleted. */
