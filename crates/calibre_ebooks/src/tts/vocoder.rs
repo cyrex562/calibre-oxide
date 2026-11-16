@@ -185,7 +185,7 @@ mod tests {
         let mut cfg = translate_voice_config(&value);
         cfg.sentence_delay = 0.5;
 
-        let dir = std::env::temp_dir().join("calibre_oxide_vocoder_test_espeak_data");
+        let dir = std::env::temp_dir().join("calibre_oxide_vocoder_test_espeak_data_padding");
         std::fs::create_dir_all(&dir).unwrap();
         espeak_ng::install_bundled_language(&dir, "en").unwrap();
         let engine = espeak_ng::EspeakNg::with_data_dir(&cfg.espeak_voice_name, &dir).unwrap();
