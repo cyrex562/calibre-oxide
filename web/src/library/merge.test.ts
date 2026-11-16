@@ -71,12 +71,12 @@ describe("summarizeMerge", () => {
     expect(text).toContain("tags");
     expect(text).toContain('cover of "Dup"');
     expect(text).toContain("1 book will be removed");
-    expect(text).toContain("1 file will go to the wastebasket: Dup.pdf");
+    expect(text).toContain("1 file will move to the library trash: Dup.pdf");
   });
   it("says nothing is deleted in keep-sources mode, and skips metadata in formats-only mode", () => {
     const keep = summarizeMerge(response({ mode: "merge_keep_sources" })).join("\n");
     expect(keep).toContain("The other books are kept.");
-    expect(keep).not.toContain("wastebasket");
+    expect(keep).not.toContain("trash");
     const formatsOnly = summarizeMerge(response({ mode: "formats_only" })).join("\n");
     expect(formatsOnly).not.toContain("Metadata");
   });
@@ -90,7 +90,7 @@ describe("summarizeMerge", () => {
 describe("describeMergeResult", () => {
   it("reports trashed and un-trashable files", () => {
     const r = response({ dry_run: false, failed: [{ book_id: 2, path: "x.pdf", error: "locked" }] });
-    expect(describeMergeResult(r)).toBe("Merged 1 book. 1 file sent to the wastebasket. Left in place because it could not be trashed: x.pdf.");
+    expect(describeMergeResult(r)).toBe("Merged 1 book. 1 file moved to the library trash. Left in place because it could not be trashed: x.pdf.");
   });
 });
 

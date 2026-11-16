@@ -10,6 +10,9 @@ import MapperDialog from "./MapperDialog.vue";
 import AnnotationsBrowser from "./AnnotationsBrowser.vue";
 import PolishDialog from "./PolishDialog.vue";
 import HelpDialog from "./HelpDialog.vue";
+import TrashDialog from "./TrashDialog.vue";
+import ImportFolderDialog from "./ImportFolderDialog.vue";
+import { describeScanOutcome, dismissKey, scanPromptHint, scanPromptText, shouldPrompt, type UntrackedCount } from "../library/scanPrompt";
 import { LAYOUT_KEY, type LayoutPrefs, type Panel, parseLayout, resizedWidth } from "../library/layout";
 import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary,
   scanLibrary, backfillHashes, cancelLibraryJob, describeJobProgress,
@@ -18,7 +21,7 @@ import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LI
   uploadOrphanFile,
   forgetOrphan,
   fetchIgnored,
-  unignoreFile, copyToLibrary, describeCopyOutcome, deleteBooks, embedMetadata, summarizeEmbed, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchLibraryInfo, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameFiles, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
+  unignoreFile, copyToLibrary, describeCopyOutcome, deleteBooks, embedMetadata, summarizeEmbed, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchLibraryInfo, fetchUntracked, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameFiles, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
 import type { CheckLibraryFinding, CheckLibraryResult, CustomRecipeOptions, DuplicateGroup, IgnoredFile, NewsFeedInput, NewsSchedule, Orphan, SaveToDiskResult } from "../library/api";
 import { mergeBooks, planBulkMerge, runBulkMerge } from "../library/api";
 import type { BulkMergePlan, DuplicateBook, MergeMode, MergeResponse } from "../library/api";
@@ -1639,7 +1642,7 @@ async function executeBulk() {
       onStart: (id) => (bulkJobId.value = id),
       onProgress: (job) => (bulkProgress.value = `Merging… ${job.progress.seen.toLocaleString("en-US")} of ${job.progress.total.toLocaleString("en-US")} groups`),
     });
-    const parts = [`${report.groups_merged.toLocaleString("en-US")} of ${report.groups_planned.toLocaleString("en-US")} groups merged (${report.books_merged.toLocaleString("en-US")} books), ${report.trashed.length.toLocaleString("en-US")} files sent to the wastebasket`];
+    const parts = [`${report.groups_merged.toLocaleString("en-US")} of ${report.groups_planned.toLocaleString("en-US")} groups merged (${report.books_merged.toLocaleString("en-US")} books), ${report.trashed.length.toLocaleString("en-US")} files moved to the library trash`];
     if (report.cancelled) parts.push("stopped early — run it again to continue");
     if (report.errors.length) parts.push(`${report.errors.length} group(s) had problems and were left as they were: ${report.errors.slice(0, 3).map(([id, why]) => `book ${id}: ${why}`).join("; ")}`);
     dupBulkSummary.value = parts.join(" · ");
@@ -1719,24 +1722,103 @@ interface AddFolderResult {
   errors: string[];
 }
 
-const addingFolder = ref(false);
+// "Add folder" is a job now, not a loop of uploads: the dialog picks the
+// folder, the mode (one book per folder / several) and what to do about
+// duplicates, copies recursively with progress and cancel, and reports
+// every file it could not read instead of dropping it.
+const importOpen = ref(false);
 
-async function addFolder() {
-  addingFolder.value = true;
+function addFolder() {
   addError.value = null;
   addSummary.value = null;
+  importOpen.value = true;
+}
+
+async function onImported() {
+  cacheBust.value++;
+  await runSearch();
+  void loadLibraryInfo();
+}
+
+// The library, as a folder somebody filled: opening it does not scan it, and on
+// a share a scan is long, so ask first. `untracked` is a walk with no reads.
+const untracked = ref<UntrackedCount | null>(null);
+const scanPromptDismissed = ref(false);
+const promptScanBusy = ref(false);
+const promptScanProgress = ref<string | null>(null);
+const promptScanJobId = ref<number | null>(null);
+const promptScanSummary = ref<string | null>(null);
+const promptScanError = ref<string | null>(null);
+
+function readDismissed(path: string): boolean {
   try {
-    const result = await tauriInvoke<AddFolderResult | null>("choose_folder_and_add_books");
-    if (!result) return; // dialog cancelled
-    addSummary.value = `Added ${result.added} book(s) from the folder${result.duplicates.length ? `, skipped ${result.duplicates.length} duplicate(s)` : ""}${result.errors.length ? `, ${result.errors.length} failed` : ""}.`;
-    if (result.errors.length > 0) addError.value = result.errors.join("; ");
+    return sessionStorage.getItem(dismissKey(path)) === "1";
+  } catch {
+    return false;
+  }
+}
+
+async function checkUntracked() {
+  try {
+    const found = await fetchUntracked();
+    scanPromptDismissed.value = readDismissed(libraryPath.value);
+    untracked.value = found;
+  } catch {
+    // A prompt is a courtesy; the library works without it.
+  }
+}
+
+function dismissScanPrompt() {
+  scanPromptDismissed.value = true;
+  try {
+    sessionStorage.setItem(dismissKey(libraryPath.value), "1");
+  } catch {
+    // Remembered for this page only.
+  }
+}
+
+function closeScanResult() {
+  promptScanSummary.value = null;
+  promptScanError.value = null;
+  dismissScanPrompt();
+}
+
+async function scanFromPrompt() {
+  promptScanBusy.value = true;
+  promptScanError.value = null;
+  promptScanSummary.value = null;
+  try {
+    const result = await scanLibrary({
+      onStart: (id) => (promptScanJobId.value = id),
+      onProgress: (job) => (promptScanProgress.value = describeJobProgress(job.progress)),
+    });
+    promptScanSummary.value = describeScanOutcome(result);
     cacheBust.value++;
     await runSearch();
+    await checkUntracked();
   } catch (e) {
-    addError.value = e instanceof Error ? e.message : String(e);
+    promptScanError.value = e instanceof Error ? e.message : String(e);
   } finally {
-    addingFolder.value = false;
+    promptScanBusy.value = false;
+    promptScanProgress.value = null;
+    promptScanJobId.value = null;
   }
+}
+
+async function stopPromptScan() {
+  if (promptScanJobId.value === null) return;
+  try {
+    await cancelLibraryJob(promptScanJobId.value);
+  } catch (e) {
+    promptScanError.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
+const trashOpen = ref(false);
+
+async function onTrashChanged() {
+  cacheBust.value++;
+  await runSearch();
 }
 
 // Drag-and-drop add (#818). The drop itself is handled natively --
@@ -1782,6 +1864,7 @@ async function loadLibraryInfo() {
     libraryPath.value = info.path;
     libraryId.value = info.id;
     libraryMap.value = info.libraries;
+    void checkUntracked();
   } catch {
     // Not worth surfacing: the status bar simply omits the label, and
     // every other part of the window works without it.
@@ -1919,7 +2002,10 @@ const actionHandlers: Partial<Record<LibraryActionId, () => void>> = {
   "export-library-archive": () => exportLibraryArchive(),
   "fetch-news": () => openNews(),
   "add-books": () => addInput.value?.click(),
-  "add-folder": () => void addFolder(),
+  "add-folder": () => addFolder(),
+  trash: () => {
+    trashOpen.value = true;
+  },
   "switch-library": () => openSwitchLibrary(),
   "new-library": () => openNewLibrary(),
   "select-mode": () => toggleSelectMode(),
@@ -1977,8 +2063,6 @@ function actionLabel(action: LibraryAction): string {
   switch (action.id) {
     case "add-books":
       return adding.value ? "Adding…" : action.label;
-    case "add-folder":
-      return addingFolder.value ? "Adding…" : action.label;
     case "select-mode":
       return selectMode.value ? "Cancel selection" : action.label;
     case "bulk-edit":
@@ -1994,7 +2078,6 @@ function actionLabel(action: LibraryAction): string {
 
 function actionBusy(action: LibraryAction): boolean {
   if (action.id === "add-books") return adding.value;
-  if (action.id === "add-folder") return addingFolder.value;
   return false;
 }
 
@@ -2667,6 +2750,27 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
       <button type="button" class="storage-banner-close" title="Dismiss" aria-label="Dismiss" @click="bannerDismissed = true">×</button>
     </div>
 
+    <!--
+      A folder somebody filled is not scanned just by being opened. Ask, say
+      how many, and let the user decide: on a share a scan takes long.
+    -->
+    <div v-if="shouldPrompt(untracked, scanPromptDismissed) || promptScanBusy || promptScanSummary || promptScanError" class="storage-banner scan-prompt" role="status">
+      <span class="storage-banner-text">
+        <template v-if="promptScanBusy"><strong>Scanning.</strong> {{ promptScanProgress ?? "Starting…" }}</template>
+        <template v-else-if="promptScanError"><strong>Scan failed.</strong> {{ promptScanError }}</template>
+        <template v-else-if="promptScanSummary"><strong>Scan finished.</strong> {{ promptScanSummary }}</template>
+        <template v-else-if="untracked">
+          <strong>{{ scanPromptText(untracked) }}</strong> {{ scanPromptHint(untracked) }}
+        </template>
+      </span>
+      <button v-if="promptScanBusy" type="button" @click="stopPromptScan">Stop</button>
+      <template v-else-if="!promptScanSummary && !promptScanError">
+        <button type="button" @click="scanFromPrompt">Scan now</button>
+        <button type="button" @click="dismissScanPrompt">Not now</button>
+      </template>
+      <button v-else type="button" class="storage-banner-close" title="Dismiss" aria-label="Dismiss" @click="closeScanResult">×</button>
+    </div>
+
     <div v-if="bulkOpen" class="bulk-panel">
       <div class="bulk-grid">
         <label class="bulk-field">
@@ -2895,6 +2999,10 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
     </footer>
 
     <HelpDialog v-if="helpOpen" :keymap="keymap" @close="helpOpen = false" />
+
+    <TrashDialog v-if="trashOpen" @close="trashOpen = false" @changed="onTrashChanged" />
+
+    <ImportFolderDialog v-if="importOpen" @close="importOpen = false" @imported="onImported" />
 
     <PolishDialog v-if="polishOpen && polishScope.length" :book-ids="polishScope" @close="polishOpen = false" @done="onPolished" />
 
@@ -3137,7 +3245,7 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
                 <p>
                   <strong>{{ bulkPlan.group_count.toLocaleString("en-US") }} groups</strong> of identical files: each is merged into its best record
                   (most formats, then most metadata, then a cover), {{ bulkPlan.books_to_merge.toLocaleString("en-US") }} other books are removed, and their
-                  leftover files go to the wastebasket. Nothing has been changed yet.
+                  leftover files go to the library trash (Library → Trash…). Nothing has been changed yet.
                 </p>
                 <ul class="manage-list">
                   <li v-for="g in bulkPlan.groups.slice(0, 5)" :key="g.dest">

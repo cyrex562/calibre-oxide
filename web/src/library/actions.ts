@@ -121,6 +121,7 @@ export type LibraryActionId =
   | "switch-library"
   | "new-library"
   | "open-library-folder"
+  | "trash"
   // Selection-scoped.
   | "select-mode"
   | "mark-books"
@@ -182,6 +183,7 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   // working library; there was simply no way to say so. "Switch
   // library -> Browse for another" reads as "find an existing one".
   { id: "new-library", label: "New library…", group: "library", requires: "none", toolbar: true, desktopOnly: true, primary: true, icon: "lt", tooltip: "Create an empty library and open it" },
+  { id: "trash", label: "Trash…", group: "library", requires: "none", icon: "remove_books", tooltip: "Restore or permanently delete books and formats you removed" },
   { id: "open-library-folder", label: "Open library folder", group: "library", requires: "none", desktopOnly: true, icon: "tb_folder", tooltip: "Show this library's folder in the file browser" },
 
   { id: "select-mode", label: "Select…", group: "view", requires: "none" },
@@ -447,7 +449,7 @@ export const TOOLBAR_LAYOUT: ToolbarItem[] = [
   { kind: "spring" },
   // Label is replaced at render time with the open library's name:
   // which library you are in is state, and state belongs on a label.
-  { kind: "menu", id: "library", label: "Library", icon: "lt", menu: ["switch-library", "new-library", "open-library-folder", "-", "$recent-libraries", "-", "check-library", "find-duplicates"] },
+  { kind: "menu", id: "library", label: "Library", icon: "lt", menu: ["switch-library", "new-library", "open-library-folder", "-", "$recent-libraries", "-", "check-library", "find-duplicates", "trash"] },
   { kind: "split", id: "help", menu: ["$shortcuts", "$about"] },
 ];
 

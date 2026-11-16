@@ -3,13 +3,31 @@
 // role for this slice, narrowed to only what the library-browser MVP
 // needs.
 
+import { importBody, type ImportFolderRequest, type ImportReport } from "./importFolder";
+import type { UntrackedCount } from "./scanPrompt";
 import { parseStorageInfo, type StorageInfo } from "./storageBanner";
+import type { RestoreRequest, TrashListing } from "./trash";
 import type { AddBookResult, BookFieldChanges, BookSummary, BooksInPage, CategoryEntry, CategoryPage, ConversionBookData, ConversionStatus, CustomColumnInfo, EmbedMetadataResponse, FieldMetadataResponse, FtsSearchResult, FtsSnippet, RenameFilesResponse, SearchResult, VirtualLibraries } from "./types";
+
+/**
+ * What the server said about a failure, when it said something short: a
+ * refusal such as "that folder is inside the library already" is the whole
+ * explanation, and "400 Bad Request" alone throws it away.
+ */
+async function failureDetail(resp: Response): Promise<string> {
+  try {
+    if (typeof resp.text !== "function") return "";
+    const text = (await resp.text()).trim();
+    return text && text.length <= 300 && !text.startsWith("<") && !text.startsWith("{") ? ` — ${text}` : "";
+  } catch {
+    return "";
+  }
+}
 
 async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(url, init);
   if (!resp.ok) {
-    throw new Error(`${init?.method ?? "GET"} ${url} failed: ${resp.status} ${resp.statusText}`);
+    throw new Error(`${init?.method ?? "GET"} ${url} failed: ${resp.status} ${resp.statusText}${await failureDetail(resp)}`);
   }
   return (await resp.json()) as T;
 }
@@ -614,7 +632,7 @@ export interface LibraryJobProgress {
 
 export interface LibraryJob<R = unknown> {
   id: number;
-  kind: "scan" | "enrich" | "hash_backfill" | "merge_exact";
+  kind: "scan" | "enrich" | "hash_backfill" | "merge_exact" | "import";
   state: "running" | "finished" | "cancelled" | "failed";
   progress: LibraryJobProgress;
   /** Present once the job has ended. */
@@ -700,9 +718,54 @@ export function describeJobProgress(p: LibraryJobProgress): string {
       return `Reading titles and covers… ${n(p.enriched + p.errors)} of ${n(p.total)}`;
     case "hashing":
       return `Reading files… ${n(p.hashed + p.errors)} of ${n(p.total)}`;
+    case "importing":
+      return `Importing… ${n(p.hashed + p.already_known + p.errors)} of ${n(p.total)} files · ${n(p.added)} books added${p.ignored ? ` · ${n(p.ignored)} duplicates skipped` : ""}`;
     default:
       return "Working…";
   }
+}
+
+/** Copies a folder tree into the library, as a job: see `importFolder.ts`. */
+export function importFolder(request: ImportFolderRequest, handlers: LibraryJobHandlers<ImportReport> = {}): Promise<ImportReport> {
+  return runLibraryJob<ImportReport>("/import-folder/-", handlers, importBody(request));
+}
+
+/** How many book files in the library folder nothing tracks yet. A walk; reads nothing, adds nothing. */
+export function fetchUntracked(max = 10000): Promise<UntrackedCount> {
+  return jsonFetch<UntrackedCount>(`/library-untracked/-?max=${max}`);
+}
+
+/** The library's trash (calibre's `.caltrash`). Also expires what is old enough. */
+export function fetchTrash(): Promise<TrashListing> {
+  return jsonFetch<TrashListing>("/trash/-");
+}
+
+function postEntry<T>(action: string, body: RestoreRequest): Promise<T> {
+  return jsonFetch<T>(`/trash/${action}/-`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+}
+
+export interface RestoreResult {
+  book_id: number;
+  title?: string;
+  format?: string;
+  path?: string;
+  restored?: string[];
+  /** `[original, where it went]` for files whose name had been taken. */
+  renamed?: [string, string][];
+}
+
+export function restoreTrashEntry(request: RestoreRequest): Promise<RestoreResult> {
+  return postEntry<RestoreResult>("restore", request);
+}
+
+/** For ever. The caller has asked the user first. */
+export function deleteTrashEntry(request: RestoreRequest): Promise<void> {
+  return postEntry<void>("delete", request);
+}
+
+/** For ever. The caller has asked the user first. */
+export function emptyTrash(): Promise<{ removed: number }> {
+  return jsonFetch<{ removed: number }>("/trash/empty/-", { method: "POST" });
 }
 
 /** A book entry whose file is gone — renamed, moved out, or deleted. */
@@ -869,7 +932,7 @@ export interface MergeResponse {
   results: MergeSourceResult[];
   metadata_changed: string[];
   cover_from: number | null;
-  /** Everything sent to the wastebasket. */
+  /** Everything moved to the library trash. */
   trashed: string[];
   failed: { book_id: number; path: string; error: string }[];
   errors: { book_id: number; error: string }[];

@@ -184,12 +184,71 @@ becomes the user's problem.
 once** rather than file by file. Two books that swap filenames both look absent
 individually; matched as a set they are two renames.
 
+## The trash
+
+Delete used to mean "send to the OS wastebasket". Windows has no Recycle Bin
+for a file on an SMB share (nor do most NAS mounts), so on exactly the library
+this app is for, delete failed and the file stayed. calibre never had that
+problem: since 6.0 a library delete moves the book into **`.caltrash` inside
+the library** (`db/backend.py`: `move_book_to_trash`, `move_book_files_to_trash`,
+`expire_old_trash`, `list_trash_entries`; `gui2/trash.py`). This is that.
+
+* `.caltrash/b/<book id>/` holds a deleted book; `.caltrash/f/<book id>/<ext>`
+  plus `metadata.json` a format removed from a book that remains.
+* Entries expire after the `expire_old_trash_after` library preference (seconds;
+  default 14 days, never under a day). Expiry runs when the trash is listed and
+  is throttled to once an hour per library, like calibre's.
+* They can be listed, restored, deleted for good, or emptied: `GET /trash`,
+  `POST /trash/restore|delete|empty|expire`, and **Library → Trash…**.
+* A move is a same-volume `rename` through `LibraryHandle::rename_atomic`
+  (journaled; retried on a network tier) — never copy-then-delete. If
+  `.caltrash` is on another volume the move fails and the file stays.
+
+**How it differs from calibre, because the folder may be shared.** calibre moves
+a book's *folder*; here a folder can hold many books and the user's own files,
+so only the book's **own files** move (its `data` rows' files, plus `cover.jpg`
+and `metadata.opf` when its folder is its alone), as `delete_book_with` has
+always done. The entry holds them flat, with an `oxide-trash.json` manifest:
+the original relative path of each file, the uuid, the metadata a restore
+writes back. A trashed in-place file is restorable to its **original relative
+path**; if something has taken the name since it comes back as
+`name (restored).ext`, never over it.
+
+* Trashing records **no** ignore entry — the file is no longer in its folder,
+  so a rescan cannot find it — and the scanner does not walk `.caltrash`.
+* Restoring clears any ignore entry for the file, so a book is never both
+  present and hidden.
+* The change log: a trash is `BookRemoved` / `FormatRemoved`; a restore is the
+  ordinary add (`BookAdded`, its fields, path, a `FormatSet` per file) under the
+  **same uuid**. A rebuild from the log lands on the right state for any
+  sequence of trash and restore without reading `.caltrash`; replay also drops
+  an ignore entry for a file the rebuilt library tracks.
+* A restored book keeps its id if that id is free, else gets a new one.
+
+## Importing a folder tree
+
+`POST /import-folder` (`calibre_db::import`) copies a folder tree *into* the
+library — the counterpart of scanning, which indexes files already there.
+
+* Modes (calibre's): *several books per folder* (files sharing a stem are one
+  book's formats) or *one book per folder*.
+* Duplicate policies: skip identical content (default), also skip same
+  title+author, add new formats to the matching book (calibre's "automerge"),
+  or add everything.
+* One read per source file: copied into `.calibre-oxide/import-staging` while
+  being hashed, the copy re-read and compared (size + BLAKE3), then **renamed**
+  into `Author/Title (id)/Title - Author.ext` in one transaction per batch.
+* Resumable: a ledger in the checksum sidecar remembers every source file's
+  outcome, so a rerun skips what was done without reading it. The source is
+  never modified.
+
 ## Behaviour decided
 
 | | |
 | --- | --- |
-| Adding from outside the folder | the file is copied to the **folder root**, keeping its own filename; ` (1)` on collision. An import is then indistinguishable from a file copied in by hand. |
-| Deleting a book | **asks**, with "remove from library" preselected and "delete the file as well" the explicit second choice. In a folder the user owns, erasing their file on a keypress is not a default. File deletion goes to the system trash where possible. |
+| Adding single files from outside the folder | the file is copied to the **folder root**, keeping its own filename; ` (1)` on collision. An import is then indistinguishable from a file copied in by hand. |
+| Adding a *folder* (Add folder / `POST /import-folder`) | a job: the tree is copied in, recursively, into calibre's `Author/Title (id)/Title - Author.ext` layout, with real embedded metadata. See "Importing a folder tree" below. |
+| Deleting a book | **asks**, with "remove from library" preselected and "delete the file as well" the explicit second choice. In a folder the user owns, erasing their file on a keypress is not a default. File deletion moves the book's own files into the library's `.caltrash` (see "The trash"), as calibre does — the OS bin is not used, because a network share has none. |
 | Change detection | scan on open and on demand. A filesystem watcher is a later addition, for local volumes only — it is a new dependency and unreliable on network shares and at scale. |
 | Moving between libraries | ask move-or-copy once per operation. |
 | Covers | `.calibre-oxide/covers/<id>.jpg`. `<book dir>/cover.jpg` collides for every book in a flat folder. |
