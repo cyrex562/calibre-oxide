@@ -237,7 +237,6 @@ fn custom_column_datetime_reads_back() {
 }
 
 #[test]
-#[ignore = "bug: normalized custom columns (is_multiple text) live in custom_column_N + books_custom_column_N_link; oxide reads/writes only custom_column_N.book"]
 fn custom_column_multiple_text_reads_back() {
     let (_f, cache) = open();
     for b in BOOKS {
@@ -247,7 +246,6 @@ fn custom_column_multiple_text_reads_back() {
 }
 
 #[test]
-#[ignore = "bug: normalized custom columns (series) live in custom_column_N + books_custom_column_N_link; oxide reads/writes only custom_column_N.book"]
 fn custom_column_series_reads_back() {
     let (_f, cache) = open();
     for b in BOOKS {
@@ -260,7 +258,6 @@ fn custom_column_series_reads_back() {
 }
 
 #[test]
-#[ignore = "bug: normalized custom columns (enumeration) live in custom_column_N + books_custom_column_N_link; oxide reads/writes only custom_column_N.book"]
 fn custom_column_enumeration_reads_back() {
     let (_f, cache) = open();
     for b in BOOKS {
@@ -269,7 +266,6 @@ fn custom_column_enumeration_reads_back() {
 }
 
 #[test]
-#[ignore = "bug: normalized custom columns (rating) live in custom_column_N + books_custom_column_N_link; oxide reads/writes only custom_column_N.book"]
 fn custom_column_rating_reads_back() {
     let (_f, cache) = open();
     for b in BOOKS {
@@ -353,7 +349,6 @@ fn writing_a_plain_custom_column_round_trips_and_leaves_calibres_schema_intact()
 }
 
 #[test]
-#[ignore = "bug: set_custom_column_value on a normalized column (genre) writes a `book` column calibre's value table does not have, so it fails or corrupts the table's meaning"]
 fn writing_a_normalized_custom_column_round_trips() {
     let fixture = build_calibre_library();
     let schema_before = schema_objects(fixture.root());
@@ -427,7 +422,6 @@ fn copy_to_a_calibre_made_library_with_matching_columns_carries_plain_custom_val
 }
 
 #[test]
-#[ignore = "bug: copy-to-library of normalized custom columns (genre/saga/mood/stars) is not supported; values are read from and written to the wrong tables"]
 fn copy_to_a_calibre_made_library_with_matching_columns_carries_normalized_custom_values() {
     let (_src_fixture, src) = open();
     let dest_fixture = build_empty_calibre_library();
@@ -453,7 +447,6 @@ fn copy_leaves_the_source_library_unchanged() {
 }
 
 #[test]
-#[ignore = "bug: copy_one_book_detailed fails outright when the source has any normalized custom column (series/enumeration/rating/multi-text): it queries custom_column_N.book, which only exists on non-normalized tables"]
 fn copy_from_a_library_with_normalized_custom_columns_works() {
     let (_src_fixture, src) = open();
     let dest_dir = tempfile::tempdir().unwrap();

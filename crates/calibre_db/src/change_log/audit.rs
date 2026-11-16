@@ -55,14 +55,14 @@ fn snapshot(cache: &Cache) -> Vec<String> {
 
     let labels: Vec<String> = {
         let conn = cache.backend.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT label, name, datatype, is_multiple FROM custom_columns ORDER BY label").unwrap();
-        let rows: Vec<(String, String, String, i32)> = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        let mut stmt = conn.prepare("SELECT label, name, datatype, is_multiple, display, normalized FROM custom_columns ORDER BY label").unwrap();
+        let rows: Vec<(String, String, String, i32, String, i32)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        for (label, name, datatype, multiple) in &rows {
-            lines.push(format!("column {label} name={name} type={datatype} multiple={multiple}"));
+        for (label, name, datatype, multiple, display, normalized) in &rows {
+            lines.push(format!("column {label} name={name} type={datatype} multiple={multiple} normalized={normalized} display={display}"));
         }
         rows.into_iter().map(|(label, ..)| label).collect()
     };
@@ -90,6 +90,9 @@ fn snapshot(cache: &Cache) -> Vec<String> {
         for label in &labels {
             let value = cache.get_custom_column_value(*id, label).unwrap().unwrap_or_default();
             lines.push(format!("book {uuid} custom {label}={value}"));
+            // A series column's index (empty for any other column).
+            let index = cache.get_custom_column_value(*id, &format!("{label}_index")).unwrap().unwrap_or_default();
+            lines.push(format!("book {uuid} custom {label}_index={index}"));
         }
     }
 
@@ -145,6 +148,25 @@ fn build_fixture(dir: &Path, cache: &Cache) -> Fixture {
     cache.set_field(first, "publisher", "Shared Press").unwrap();
     cache.set_field(second, "publisher", "Shared Press").unwrap();
     cache.add_custom_column("shelf", "Shelf", "text", false).unwrap();
+    // One column of every other datatype, calibre's shapes, so each kind of
+    // value write is proven to reach the log (and to replay).
+    cache.add_custom_column("genre", "Genre", "text", true).unwrap();
+    cache.add_custom_column("saga", "Saga", "series", false).unwrap();
+    let moods = serde_json::json!({"enum_values": ["Happy", "Sad"], "enum_colors": [], "use_decorations": false});
+    cache.add_custom_column_with_display("mood", "Mood", "enumeration", false, &moods).unwrap();
+    cache.add_custom_column("stars", "Stars", "rating", false).unwrap();
+    cache.add_custom_column("pages", "Pages", "int", false).unwrap();
+    cache.add_custom_column("score", "Score", "float", false).unwrap();
+    cache.add_custom_column("read", "Read", "bool", false).unwrap();
+    cache.add_custom_column("finished", "Finished", "datetime", false).unwrap();
+    cache.add_custom_column("notes", "Notes", "comments", false).unwrap();
+    // Values already in place, so a case that clears one has something to
+    // clear (setting and clearing in one case would be no observable change).
+    cache.set_custom_column_value(first, "genre", "Zebra, Apple, Mango").unwrap();
+    cache.set_custom_column_value(first, "saga", "The Saga [2.5]").unwrap();
+    cache.set_custom_column_value(second, "saga", "The Saga [3]").unwrap();
+    cache.set_custom_column_value(first, "mood", "Happy").unwrap();
+    cache.set_custom_column_value(first, "stars", "6").unwrap();
     Fixture { first, second }
 }
 
@@ -215,6 +237,24 @@ const CASES: &[Case] = &[
         c.rename_publisher(id, "Renamed Press").unwrap()
     }),
     case!("set_custom_column_value", |c, f| c.set_custom_column_value(f.first, "shelf", "Top Shelf").unwrap()),
+    case!("set_custom_column_value (multiple text, order kept)", |c, f| c.set_custom_column_value(f.second, "genre", "Mango, Zebra, apple, MANGO").unwrap()),
+    case!("set_custom_column_value (multiple text, cleared)", |c, f| c.set_custom_column_value(f.first, "genre", "").unwrap()),
+    case!("set_custom_column_value (series, with index)", |c, f| c.set_custom_column_value(f.second, "saga", "Another Saga [4]").unwrap()),
+    case!("set_custom_column_value (series, index kept)", |c, f| c.set_custom_column_value(f.first, "saga", "Renamed Saga").unwrap()),
+    case!("set_custom_column_value (series index)", |c, f| c.set_custom_column_value(f.first, "saga_index", "9").unwrap()),
+    case!("set_custom_column_value (series, cleared)", |c, f| c.set_custom_column_value(f.first, "saga", "").unwrap()),
+    case!("set_custom_column_value (enumeration)", |c, f| c.set_custom_column_value(f.first, "mood", "Sad").unwrap()),
+    case!("set_custom_column_value (rating)", |c, f| c.set_custom_column_value(f.second, "stars", "9").unwrap()),
+    case!("set_custom_column_value (rating, cleared)", |c, f| c.set_custom_column_value(f.first, "stars", "0").unwrap()),
+    case!("set_custom_column_value (int)", |c, f| c.set_custom_column_value(f.first, "pages", "412").unwrap()),
+    case!("set_custom_column_value (float)", |c, f| c.set_custom_column_value(f.first, "score", "8.25").unwrap()),
+    case!("set_custom_column_value (bool)", |c, f| c.set_custom_column_value(f.first, "read", "true").unwrap()),
+    case!("set_custom_column_value (datetime)", |c, f| c.set_custom_column_value(f.first, "finished", "2022-01-15 00:00:00+00:00").unwrap()),
+    case!("set_custom_column_value (comments)", |c, f| c.set_custom_column_value(f.first, "notes", "<p>hi</p>").unwrap()),
+    case!("add_custom_column_with_display (enumeration)", |c, _| {
+        let display = serde_json::json!({"enum_values": ["One", "Two"], "enum_colors": [], "use_decorations": false});
+        c.add_custom_column_with_display("choice", "Choice", "enumeration", false, &display).unwrap();
+    }),
     case!("covers::set_cover", |c, f| crate::covers::set_cover(c, f.first, b"\xFF\xD8\xFF\xE0 not really a jpeg").unwrap()),
     // Already recorded -- kept so they stay that way.
     case!("remove_format", |c, f| c.remove_format(f.first, "PDF").unwrap()),
@@ -359,8 +399,14 @@ const ACCOUNTED: &[(&str, Account)] = &[
     ("cache.rs::set_identifiers_field", Case("set_field identifiers")),
     ("cache.rs::update_book_metadata", Case("update_book_metadata")),
     ("cache.rs::rename_item_in_db", Case("rename_tag")),
-    ("cache.rs::set_custom_column_value", Case("set_custom_column_value")),
-    ("cache.rs::add_custom_column", Case("add_custom_column")),
+    ("cache.rs::add_custom_column_with_display", Case("add_custom_column")),
+    ("custom_columns.rs::write_value_inner", Case("set_custom_column_value (multiple text, order kept)")),
+    ("custom_columns.rs::write_series_index", Case("set_custom_column_value (series index)")),
+    ("custom_columns.rs::item_id", Case("set_custom_column_value (series, with index)")),
+    ("custom_columns.rs::remove_unused_items", Case("set_custom_column_value (multiple text, cleared)")),
+    ("custom_columns.rs::purge_book", Case("delete_book")),
+    ("custom_columns.rs::create_schema", Case("add_custom_column_with_display (enumeration)")),
+    ("custom_columns.rs::drop_schema", Case("remove_custom_column")),
     ("cache.rs::remove_custom_column", Case("remove_custom_column")),
     ("cache.rs::set_preference", Case("set_preference")),
     ("cache.rs::clear_preference", Case("clear_preference")),

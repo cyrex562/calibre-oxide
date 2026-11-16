@@ -404,7 +404,7 @@ mod tests {
         assert_eq!(info.label, "shelf");
         assert_eq!(info.name.as_deref(), Some("Shelf"));
         assert_eq!(info.datatype.as_deref(), Some("text"));
-        assert!(!info.is_category, "non-normalized column should not be a tag-browser category");
+        assert!(info.is_category, "a text column is normalized in calibre, so it is a tag-browser category");
         assert!(info.is_multiple.is_none(), "is_multiple=false column should have no separator dict");
         assert_eq!(FieldMetadata::is_custom_field("#shelf"), true);
         assert_eq!(FieldMetadata::is_custom_field("title"), false);
@@ -415,25 +415,17 @@ mod tests {
 
     #[test]
     fn from_cache_marks_a_normalized_multi_valued_custom_column_as_a_category() {
-        // `Cache::add_custom_column` always inserts `normalized = 0`
-        // and rejects `is_multiple=true` text columns outright (it
-        // has no normalized/tag-like custom column support yet), so
-        // this test sets the row directly to exercise `from_cache`'s
-        // own `normalized`/`is_multiple` -> `is_category`/separator-dict
-        // mapping against real `custom_columns` table data either way.
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::new(dir.path()).unwrap();
-        cache.add_custom_column("mytags", "My Tags", "text", false).unwrap();
-        {
-            let conn = cache.backend.conn.lock().unwrap();
-            conn.execute("UPDATE custom_columns SET normalized = 1, is_multiple = 1 WHERE label = 'mytags'", []).unwrap();
-        }
+        cache.add_custom_column("mytags", "My Tags", "text", true).unwrap();
+        cache.add_custom_column("pages", "Pages", "int", false).unwrap();
 
         let fm = FieldMetadata::from_cache(&cache).unwrap();
         let info = fm.get("#mytags").unwrap();
         assert!(info.is_category, "normalized column should be a tag-browser category");
         let seps = info.is_multiple.as_ref().expect("is_multiple=true column should have a separator dict");
         assert_eq!(seps.list_to_ui.as_deref(), Some(", "));
+        assert!(!fm.get("#pages").unwrap().is_category, "a one-table column is not a category");
     }
 
     #[test]

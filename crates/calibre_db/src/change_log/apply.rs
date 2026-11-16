@@ -134,7 +134,7 @@ pub fn apply(cache: &Cache, change: &Change) -> Result<bool> {
             }
             Ok(true)
         }
-        ChangeOp::CustomColumnAdded { label, name, datatype, is_multiple } => {
+        ChangeOp::CustomColumnAdded { label, name, datatype, is_multiple, display } => {
             // Replaying a log twice, or a peer's add for a column this
             // machine already has -- the same already-there case
             // `BookAdded` handles, and `add_custom_column` errors on a
@@ -142,7 +142,8 @@ pub fn apply(cache: &Cache, change: &Change) -> Result<bool> {
             if cache.custom_column_id(label)?.is_some() {
                 return Ok(true);
             }
-            cache.add_custom_column(label, name, datatype, *is_multiple)?;
+            let display = display.as_deref().and_then(|d| serde_json::from_str(d).ok()).unwrap_or_else(|| serde_json::json!({}));
+            cache.add_custom_column_with_display(label, name, datatype, *is_multiple, &display)?;
             Ok(true)
         }
         ChangeOp::ItemRenamed { kind, from, to } => {
@@ -394,6 +395,7 @@ mod tests {
                 name: "My Rating".into(),
                 datatype: "int".into(),
                 is_multiple: false,
+                display: None,
             })
             .unwrap();
         let added = log.append(ChangeOp::BookAdded { book: "uuid-1".into() }).unwrap();
@@ -416,7 +418,7 @@ mod tests {
         let (_dir, cache) = cache();
         let log = cache.backend.change_log().unwrap();
         let created = log
-            .append(ChangeOp::CustomColumnAdded { label: "shelf".into(), name: "Shelf".into(), datatype: "text".into(), is_multiple: false })
+            .append(ChangeOp::CustomColumnAdded { label: "shelf".into(), name: "Shelf".into(), datatype: "text".into(), is_multiple: false, display: None })
             .unwrap();
 
         assert!(apply(&cache, &created).unwrap());

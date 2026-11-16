@@ -14,6 +14,7 @@ pub mod cli;
 pub mod constants;
 pub mod copy_to_library;
 pub mod covers;
+pub mod custom_columns;
 #[cfg(unix)]
 mod device_monitor;
 pub mod errors;
