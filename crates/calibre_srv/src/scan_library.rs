@@ -8,54 +8,41 @@
 //!
 //! Part of the tracked-in-place model (#889), where the folder is the
 //! library and this route is how the folder's current contents become
-//! the library's current contents. Called when a library is opened, on
-//! an explicit refresh, and by the desktop app's watcher when the folder
-//! it watches is inside the library.
+//! the library's current contents.
+//!
+//! # Who calls it
+//!
+//! Not "when a library is opened", which an earlier version of this
+//! comment claimed and the code never did: opening a folder creates the
+//! database and does not look at the files in it. The callers are Check
+//! Library's "add the untracked files" action, and the desktop app's
+//! watcher when the folder it watches is inside the library.
+//!
+//! # A job, not a request
+//!
+//! A scan of a share with hundreds of thousands of files runs for a long
+//! time, so the route starts a job ([`crate::library_jobs`]) and answers
+//! `202` with its id; progress and cancel are on `/library-jobs/{id}`.
+//! `?wait=true` holds the response until the job ends and answers with the
+//! final report -- the shape this route had when it was synchronous, for
+//! callers that want exactly that (the desktop watcher, tests).
+//!
+//! The job has two stages. The first reads each new file once, for its
+//! content hash, and registers it as a book titled from its filename --
+//! books appear as batches commit. The second reads embedded metadata and
+//! renders covers, filling in only what the user has not already changed.
 
-use axum::extract::{Path, State};
-use axum::Json;
-use serde_json::{json, Value};
+use axum::extract::{Path, Query, State};
+use axum::response::Response;
 
 use crate::errors::ServerError;
+use crate::library_jobs::{respond, JobKind, StartQuery};
 use crate::AppState;
 
 /// `POST /scan-library/{library_id}`.
-pub async fn scan(State(state): State<AppState>, Path(library_id): Path<String>) -> Result<Json<Value>, ServerError> {
+pub async fn scan(State(state): State<AppState>, Path(library_id): Path<String>, Query(query): Query<StartQuery>) -> Result<Response, ServerError> {
     let cache = state.cache_for(Some(&library_id)).ok_or_else(|| ServerError::NotFound(format!("no library named {library_id:?}")))?;
-
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
-        let rescan = calibre_db::scan::rescan(&cache, std::time::SystemTime::now())?;
-        Ok(json!({
-            "added": rescan.indexed.added,
-            "already_known": rescan.indexed.already_known,
-            // Books whose recorded path was corrected. Reported so a
-            // refresh can say what it did, but not as a problem: moving
-            // a file inside your own folder is allowed.
-            "relocated": rescan.relocated,
-            // Skipped because the user removed the book and kept the
-            // file (#896). Surfaced rather than omitted -- a scan that
-            // silently refuses to add a file the user can see is
-            // indistinguishable from a broken one.
-            "ignored": rescan.indexed.ignored,
-            // Still being written. Not an error: the next scan gets them.
-            "settling": rescan.scanned.settling,
-            // Cloud-sync placeholders. Reading one would download it.
-            "offline": rescan.scanned.offline,
-            "nested_libraries": rescan.scanned.nested_libraries,
-            "failed": rescan.indexed.failed.iter().map(|(path, why)| json!({"path": path, "error": why})).collect::<Vec<_>>(),
-            // False means a directory could not be read, so the folder
-            // was only partly seen. What was added is still correct;
-            // what is absent is unknown. The UI has to say so rather
-            // than implying the library is now in sync.
-            "conclusive": rescan.scanned.is_complete(),
-            "unreadable": rescan.scanned.unreadable,
-        }))
-    })
-    .await
-    .map_err(|e| ServerError::InternalServerError(e.to_string()))?
-    .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
-
-    Ok(Json(result))
+    Ok(respond(cache, JobKind::Scan, &query).await)
 }
 
 #[cfg(test)]
@@ -127,7 +114,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_library_scans_to_nothing() {
         let (_dir, router) = test_app();
-        let (status, body) = post_json(&router, "/scan-library/default").await;
+        let (status, body) = post_json(&router, "/scan-library/default?wait=true").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["added"], serde_json::json!([]));
         assert_eq!(body["relocated"], 0);
@@ -143,7 +130,7 @@ mod tests {
         std::fs::write(&book, b"%PDF-1.4 boiler").unwrap();
         make_settled(&book);
 
-        let (status, body) = post_json(&router, "/scan-library/default").await;
+        let (status, body) = post_json(&router, "/scan-library/default?wait=true").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["added"].as_array().unwrap().len(), 1, "{body}");
         assert!(book.exists(), "the scan must not move the file it indexed");
@@ -156,8 +143,8 @@ mod tests {
         std::fs::write(&book, b"%PDF-1.4 boiler").unwrap();
         make_settled(&book);
 
-        post_json(&router, "/scan-library/default").await;
-        let (_, body) = post_json(&router, "/scan-library/default").await;
+        post_json(&router, "/scan-library/default?wait=true").await;
+        let (_, body) = post_json(&router, "/scan-library/default?wait=true").await;
         assert_eq!(body["added"], serde_json::json!([]), "{body}");
         assert_eq!(body["already_known"], 1, "{body}");
     }
@@ -168,13 +155,90 @@ mod tests {
         let (dir, router) = test_app();
         std::fs::write(dir.path().join("half-copied.pdf"), b"%PDF").unwrap();
 
-        let (_, body) = post_json(&router, "/scan-library/default").await;
+        let (_, body) = post_json(&router, "/scan-library/default?wait=true").await;
         assert_eq!(body["added"], serde_json::json!([]), "{body}");
         assert_eq!(
             body["settling"],
             serde_json::json!(["half-copied.pdf"]),
             "{body}"
         );
+    }
+
+    async fn get_json(router: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+
+    /// Polls a job until it is no longer running.
+    async fn wait_for_job(router: &axum::Router, id: u64) -> serde_json::Value {
+        for _ in 0..600 {
+            let (_, job) = get_json(router, &format!("/library-jobs/{id}")).await;
+            if job["state"] != "running" {
+                return job;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("job {id} never finished");
+    }
+
+    /// Without `?wait`, the route starts a job and answers at once with
+    /// its id; the status route then reports progress and the report.
+    #[tokio::test]
+    async fn a_scan_is_a_job_with_status_and_a_final_report() {
+        let (dir, router) = test_app();
+        for name in ["a.pdf", "b.pdf", "c.pdf"] {
+            let book = dir.path().join(name);
+            std::fs::write(&book, format!("%PDF-1.4 {name}")).unwrap();
+            make_settled(&book);
+        }
+
+        let (status, started) = post_json(&router, "/scan-library/default").await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{started}");
+        let id = started["job_id"].as_u64().expect("a job id");
+
+        let job = wait_for_job(&router, id).await;
+        assert_eq!(job["state"], "finished", "{job}");
+        assert_eq!(job["kind"], "scan");
+        assert_eq!(job["report"]["added"].as_array().unwrap().len(), 3, "{job}");
+        assert_eq!(job["progress"]["added"], 3, "{job}");
+        assert_eq!(job["progress"]["hashed"], 3, "{job}");
+        assert_eq!(job["progress"]["errors"], 0, "{job}");
+        assert_eq!(job["report"]["enrichment"]["remaining"], 0, "{job}");
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_finished_or_unknown_job_is_harmless() {
+        let (_dir, router) = test_app();
+        let (_, started) = post_json(&router, "/scan-library/default").await;
+        let id = started["job_id"].as_u64().unwrap();
+        wait_for_job(&router, id).await;
+
+        let (status, job) = post_json(&router, &format!("/library-jobs/{id}/cancel")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(job["state"], "finished", "cancel must not rewrite a finished job");
+
+        let (status, _) = post_json(&router, "/library-jobs/999999999/cancel").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// The backfill is a job too, and it hashes files a library opened
+    /// from real calibre never had hashes for.
+    #[tokio::test]
+    async fn the_hash_backfill_is_a_job_that_records_missing_hashes() {
+        let (dir, router) = test_app();
+        let book = dir.path().join("a.pdf");
+        std::fs::write(&book, b"%PDF-1.4 a").unwrap();
+        make_settled(&book);
+        post_json(&router, "/scan-library/default?wait=true").await;
+
+        let (status, body) = post_json(&router, "/hash-backfill/default?wait=true").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // The scan already hashed it, so there is nothing left to do.
+        assert_eq!(body["total"], 0, "{body}");
+        assert_eq!(body["state"], "finished");
     }
 
     #[tokio::test]
