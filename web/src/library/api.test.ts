@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { copyToLibrary, describeCopyOutcome, fetchLibraryInfo, embedMetadata, summarizeEmbed, addBook, addFormat, addNewsSchedule, blobToDataUrl, inspectPlugin, installPlugin, listPlugins, removePlugin, setPluginEnabled, catalogDownloadUrl, checkLibrary, coverProxyUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchCoverProxyBlob, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeDataFile, removeFormat, removeNewsSchedule, renameCategoryItem, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, scanLibrary, fetchOrphans, relocateOrphan, uploadOrphanFile, forgetOrphan, fetchIgnored, unignoreFile, searchMetadataOnline, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
+import { copyToLibrary, describeCopyOutcome, fetchLibraryInfo, embedMetadata, summarizeEmbed, addBook, addFormat, addNewsSchedule, blobToDataUrl, inspectPlugin, installPlugin, listPlugins, removePlugin, setPluginEnabled, catalogDownloadUrl, checkLibrary, coverProxyUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchCoverProxyBlob, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeDataFile, removeFormat, removeNewsSchedule, renameCategoryItem, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, scanLibrary, fetchOrphans, relocateOrphan, uploadOrphanFile, forgetOrphan, fetchIgnored, unignoreFile, searchMetadataOnline, backfillHashes, cancelLibraryJob, describeJobProgress, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
 import type { BookSummary } from "./types";
 
 function bookStub(id: number): BookSummary {
@@ -697,21 +697,97 @@ describe("the ignore list", () => {
   });
 });
 
+const progress = (over: Record<string, unknown> = {}) => ({ phase: "indexing", cancelled: false, total: 0, seen: 0, hashed: 0, added: 0, already_known: 0, ignored: 0, enriched: 0, errors: 0, bytes_hashed: 0, ...over });
+const job = (state: string, over: Record<string, unknown> = {}) => ({ id: 7, kind: "scan", state, progress: progress(), report: null, error: null, ...over });
+
 describe("scanLibrary", () => {
-  it("posts to the real single-library route and returns the parsed result", async () => {
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({ added: [7, 8], already_known: 3, relocated: 1, ignored: [], settling: ["half.pdf"], offline: [], nested_libraries: [], failed: [], conclusive: true, unreadable: [] }),
-    });
+  it("starts a job on the real single-library route, follows it, and returns its final report", async () => {
+    const report = { added: [7, 8], already_known: 3, relocated: 1, ignored: [], settling: ["half.pdf"], offline: [], nested_libraries: [], failed: [], conclusive: true, unreadable: [] };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ job_id: 7, kind: "scan", state: "running" }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => job("running", { progress: progress({ added: 1, total: 2 }) }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => job("finished", { report }) });
     vi.stubGlobal("fetch", fetchMock);
+    const seen: number[] = [];
+    let started = -1;
 
-    const result = await scanLibrary();
+    const result = await scanLibrary({ intervalMs: 0, onStart: (id) => (started = id), onProgress: (j) => seen.push(j.progress.added) });
 
-    expect(fetchMock).toHaveBeenCalledWith("/scan-library/default", { method: "POST" });
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/scan-library/default", { method: "POST" });
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/library-jobs/7", undefined);
+    expect(started).toBe(7);
+    expect(seen).toEqual([1, 0]);
     expect(result.added).toEqual([7, 8]);
     expect(result.relocated).toBe(1);
     expect(result.settling).toEqual(["half.pdf"]);
     expect(result.conclusive).toBe(true);
+  });
+
+  it("resolves with the partial report when the job was cancelled", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ job_id: 7 }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => job("cancelled", { report: { added: [1], cancelled: true, conclusive: false } }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await scanLibrary({ intervalMs: 0 });
+
+    expect(result.cancelled).toBe(true);
+    expect(result.conclusive).toBe(false);
+  });
+
+  it("rejects with the server's message when the job failed", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ job_id: 7 }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => job("failed", { error: "reading the library folder: gone" }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(scanLibrary({ intervalMs: 0 })).rejects.toThrow("reading the library folder: gone");
+  });
+
+  it("surfaces a refusal to start, such as another job already running", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 409, statusText: "Conflict" }));
+    await expect(scanLibrary()).rejects.toThrow("409");
+  });
+});
+
+describe("cancelLibraryJob", () => {
+  it("posts to the job's cancel route", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => job("running") });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await cancelLibraryJob(7);
+
+    expect(fetchMock).toHaveBeenCalledWith("/library-jobs/7/cancel", { method: "POST" });
+  });
+});
+
+describe("backfillHashes", () => {
+  it("runs the hash backfill as a job and returns what it did", async () => {
+    const report = { hashed: 40, total: 42, missing: ["Gone/book.epub"], missing_count: 1, unreadable: [["Locked/b.pdf", "denied"]], unreadable_count: 1, cancelled: false };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ job_id: 9 }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => job("finished", { id: 9, kind: "hash_backfill", report }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await backfillHashes({ intervalMs: 0 });
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/hash-backfill/default", { method: "POST" });
+    expect(result.hashed).toBe(40);
+    expect(result.missing).toEqual(["Gone/book.epub"]);
+  });
+});
+
+describe("describeJobProgress", () => {
+  it("says what each phase is doing, with thousands separators", () => {
+    expect(describeJobProgress(progress({ phase: "walking", seen: 12345 }))).toBe("Looking through the folder… 12,345 files so far");
+    expect(describeJobProgress(progress({ phase: "indexing", added: 900, errors: 1, total: 5000 }))).toBe("Adding books… 901 of 5,000 new files");
+    expect(describeJobProgress(progress({ phase: "enriching", enriched: 10, total: 40 }))).toBe("Reading titles and covers… 10 of 40");
+    expect(describeJobProgress(progress({ phase: "hashing", hashed: 3, total: 1000 }))).toBe("Reading files… 3 of 1,000");
+    expect(describeJobProgress(progress({ phase: "" }))).toBe("Working…");
   });
 });
 
