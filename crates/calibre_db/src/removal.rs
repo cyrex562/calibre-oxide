@@ -112,6 +112,26 @@ impl IgnoreStore {
         }
     }
 
+    /// Every ignored path and every ignored content hash, loaded once.
+    ///
+    /// A scan checks each candidate file; asking [`IgnoreStore::is_ignored`]
+    /// per file is two queries (and a schema check) each. This is one
+    /// query for the whole list, and it lets a path-ignored file be
+    /// skipped without being read at all.
+    pub fn snapshot(&self) -> Result<(std::collections::HashSet<String>, std::collections::HashSet<String>)> {
+        self.initialize()?;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT path, blake3_hex FROM checksums_db.ignored_files")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)))?;
+        let (mut paths, mut hashes) = (std::collections::HashSet::new(), std::collections::HashSet::new());
+        for row in rows {
+            let (path, hash) = row?;
+            paths.insert(path);
+            hashes.extend(hash);
+        }
+        Ok((paths, hashes))
+    }
+
     /// Everything currently being skipped, newest last.
     pub fn list(&self) -> Result<Vec<IgnoredFile>> {
         self.initialize()?;
@@ -195,7 +215,9 @@ pub fn delete_with_file(cache: &Cache, book_id: i32) -> Result<RemovalReport> {
 /// Reads a file's hash for an ignore check, or `None` if it cannot be
 /// read.
 pub fn hash_for_ignore_check(path: &Path) -> Option<String> {
-    std::fs::read(path).ok().map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+    // Streamed: this used to `fs::read` the file, which for a 500 MB scan
+    // is a 500 MB allocation to learn 32 bytes.
+    crate::scan_pipeline::hash_stream(path, None).ok().map(|digest| digest.hash)
 }
 
 /// Removes a book by [`remove_from_library`] or [`delete_with_file`].

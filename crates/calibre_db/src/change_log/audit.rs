@@ -269,6 +269,34 @@ const CASES: &[Case] = &[
         std::fs::write(&incoming, b"PK epub stand-in").unwrap();
         c.add_format(f.first, &incoming, "epub", true).unwrap();
     }),
+    // A batch registered in one transaction and one run of change-log
+    // entries, as the scan does it: several books, one of them with a
+    // second author, one with a cover, all of which must be in the log.
+    case!("register_books_in_place (batch)", |c, _| {
+        let library = c.backend.library_path.clone();
+        let mut items = Vec::new();
+        for (i, name) in ["Batch One.pdf", "Batch Two.pdf", "Batch Three.pdf"].iter().enumerate() {
+            let bytes = format!("%PDF-1.4 batch {i}");
+            std::fs::write(library.join(name), &bytes).unwrap();
+            let mut meta = MetaInformation::default();
+            meta.title = name.trim_end_matches(".pdf").to_string();
+            meta.authors = if i == 1 { vec!["First Batch Author".to_string(), "Second Batch Author".to_string()] } else { vec!["Unknown".to_string()] };
+            if i == 2 {
+                meta.cover_data = (Some("jpg".to_string()), b"\xFF\xD8\xFF\xE0 batch cover".to_vec());
+            }
+            items.push(crate::cache::InPlaceFile {
+                relative_path: name.to_string(),
+                metadata: meta,
+                size: bytes.len() as i64,
+                hash: blake3::hash(bytes.as_bytes()).to_hex().to_string(),
+                identity: None,
+                queue_enrichment: true,
+            });
+        }
+        for result in c.register_books_in_place(&items) {
+            result.unwrap();
+        }
+    }),
     case!("register_book_in_place", |c, _| {
         std::fs::write(c.backend.library_path.join("Loose Book.pdf"), b"%PDF-1.4 loose").unwrap();
         let mut meta = MetaInformation::default();
@@ -414,8 +442,8 @@ const ACCOUNTED: &[(&str, Account)] = &[
     ("cache.rs::remove_format", Case("remove_format")),
     ("cache.rs::delete_book_with", Case("delete_book")),
     ("cache.rs::rename_format_files", Case("rename_format_files")),
-    ("cache.rs::register_book_in_place", Case("register_book_in_place")),
-    ("cache.rs::add_book_db_entry_with_id", Case("add_format")),
+    ("cache.rs::register_books_in_place", Case("register_books_in_place (batch)")),
+    ("cache.rs::insert_book_in_tx", Case("register_books_in_place (batch)")),
     ("covers.rs::set_cover", Case("covers::set_cover")),
     ("backend.rs::set_pref", Case("Cache::set_pref (plain key)")),
     ("cache.rs::set_book_path", Replay("records a `path` FieldSet itself; exercised by the rename_book_files case")),

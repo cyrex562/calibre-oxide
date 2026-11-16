@@ -62,7 +62,23 @@ pub fn replay_into(cache: &Cache, log: &ChangeLog) -> Result<ReplayReport> {
 
 /// Applies one change. Returns whether it could be applied at all.
 pub fn apply(cache: &Cache, change: &Change) -> Result<bool> {
-    match &change.op {
+    apply_op(cache, &change.op)
+}
+
+/// Applies one op -- the body of [`apply`], separate so a
+/// [`ChangeOp::Batch`] can apply its inner ops the same way.
+fn apply_op(cache: &Cache, op: &ChangeOp) -> Result<bool> {
+    match op {
+        ChangeOp::Batch { ops } => {
+            // In order, each exactly as if it were its own entry. Applied
+            // only if every inner op was: one that could not be (an unknown
+            // book) is reported rather than hidden inside its batch.
+            let mut all = true;
+            for inner in ops {
+                all &= apply_op(cache, inner)?;
+            }
+            Ok(all)
+        }
         ChangeOp::BookAdded { book } => {
             // Already there: replaying a log twice, or a peer's add for
             // a book this machine also knows.

@@ -144,6 +144,13 @@ impl ScanReport {
 /// `now` is passed in rather than read from the clock so the settle
 /// window is testable without sleeping.
 pub fn walk(library_path: &Path, options: &ScanOptions, now: SystemTime) -> Result<ScanReport> {
+    walk_controlled(library_path, options, now, None)
+}
+
+/// [`walk`], counting files on `control` as it goes and stopping early
+/// (with the partial report) when it is cancelled. The caller must check
+/// `control.is_cancelled()` before treating a report as a whole scan.
+pub fn walk_controlled(library_path: &Path, options: &ScanOptions, now: SystemTime, control: Option<&crate::scan_pipeline::JobControl>) -> Result<ScanReport> {
     let mut report = ScanReport::default();
     // The root failing is different from a subdirectory failing: there
     // is nothing to report on, and returning an empty report would say
@@ -151,12 +158,15 @@ pub fn walk(library_path: &Path, options: &ScanOptions, now: SystemTime) -> Resu
     let root_entries = std::fs::read_dir(library_path).with_context(|| format!("reading the library folder {}", library_path.display()))?;
     drop(root_entries);
 
-    walk_dir(library_path, library_path, options, now, &mut report);
+    walk_dir(library_path, library_path, options, now, &mut report, control);
     report.files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     Ok(report)
 }
 
-fn walk_dir(root: &Path, dir: &Path, options: &ScanOptions, now: SystemTime, report: &mut ScanReport) {
+fn walk_dir(root: &Path, dir: &Path, options: &ScanOptions, now: SystemTime, report: &mut ScanReport, control: Option<&crate::scan_pipeline::JobControl>) {
+    if control.is_some_and(|c| c.is_cancelled()) {
+        return;
+    }
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(_) => {
@@ -261,11 +271,14 @@ fn walk_dir(root: &Path, dir: &Path, options: &ScanOptions, now: SystemTime, rep
         let folder = relative_to(root, dir);
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(name).to_string();
         report.files.push(DiscoveredFile { relative_path, folder, stem, extension, facts });
+        if let Some(control) = control {
+            control.seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     subdirs.sort();
     for subdir in subdirs {
-        walk_dir(root, &subdir, options, now, report);
+        walk_dir(root, &subdir, options, now, report, control);
     }
 }
 
@@ -356,15 +369,20 @@ pub struct IndexReport {
     /// (#896). Reported rather than quietly omitted: a hidden list of
     /// files the app refuses to show is its own kind of bug.
     pub ignored: Vec<String>,
+    /// The job was cancelled before every file was handled. What was
+    /// registered stays registered; a rerun does the rest.
+    pub cancelled: bool,
 }
 
 /// Creates a book for every discovered file the library does not
-/// already know about.
+/// already know about, then reads each new book's embedded metadata and
+/// cover -- both phases, to completion, on the calling thread's terms.
 ///
-/// Each file's own embedded metadata is read here — title, authors, and
-/// for a PDF the cover rendered from page 1. That is the expensive part
-/// of phase one, and it is still far cheaper than hashing: it reads a
-/// header rather than the whole file.
+/// This is the synchronous form, for callers that want a finished result
+/// (tests, the CLI). The server runs the two phases as separate stages of
+/// a job, so books appear after the first and are enriched during the
+/// second: see [`crate::scan_pipeline`], which also explains the
+/// batching, the single read per file and the worker pool.
 ///
 /// **Does not move or copy anything.** Indexing a folder the user filled
 /// must leave it exactly as it was found.
@@ -375,49 +393,11 @@ pub struct IndexReport {
 /// something the later pass does rather than something this has to
 /// guess at.
 pub fn index_scan(cache: &crate::cache::Cache, library_path: &Path, report: &ScanReport) -> IndexReport {
-    let mut indexed = IndexReport::default();
-
-    for file in &report.files {
-        match cache.book_for_file(&file.relative_path) {
-            Ok(Some(_)) => {
-                indexed.already_known += 1;
-                continue;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                indexed.failed.push((file.relative_path.clone(), e.to_string()));
-                continue;
-            }
-        }
-
-        let absolute = library_path.join(&file.relative_path);
-
-        // Removed by the user, who chose to keep the file. Without this
-        // the scan does exactly its job and puts the book straight back.
-        // Checked against the path *and* the content, so the ignore
-        // survives the file being renamed afterwards.
-        let hash = crate::removal::hash_for_ignore_check(&absolute);
-        if cache.ignored().is_ignored(&file.relative_path, hash.as_deref()).unwrap_or(false) {
-            indexed.ignored.push(file.relative_path.clone());
-            continue;
-        }
-
-        // A file whose metadata cannot be read is still a book. Falling
-        // back to the filename is what the user would do, and refusing
-        // to index it would leave a file sitting in the library that
-        // nothing ever shows.
-        let mut metadata = calibre_ebooks::metadata::get_metadata(&absolute).unwrap_or_default();
-        if metadata.title.trim().is_empty() || metadata.title == "Unknown" {
-            metadata.title = file.stem.clone();
-        }
-        if metadata.authors.is_empty() {
-            metadata.authors = vec!["Unknown".to_string()];
-        }
-
-        match cache.register_book_in_place(&file.relative_path, &metadata) {
-            Ok(id) => indexed.added.push(id),
-            Err(e) => indexed.failed.push((file.relative_path.clone(), e.to_string())),
-        }
+    let options = crate::scan_pipeline::PipelineOptions::default();
+    let control = crate::scan_pipeline::JobControl::default();
+    let indexed = crate::scan_pipeline::index_files(cache, library_path, report, &options, &control);
+    if let Err(e) = crate::scan_pipeline::enrich_pending(cache, &options, &control) {
+        log::warn!("indexed the folder but could not read its books' metadata: {e}");
     }
     indexed
 }
@@ -453,8 +433,29 @@ pub struct Rescan {
 /// rescan that read the clock itself would find nothing and could only
 /// be tested by sleeping.
 pub fn rescan(cache: &crate::cache::Cache, now: SystemTime) -> Result<Rescan> {
+    let control = crate::scan_pipeline::JobControl::default();
+    let options = crate::scan_pipeline::PipelineOptions::default();
+    let rescan = rescan_files(cache, now, &options, &control)?;
+    if let Err(e) = crate::scan_pipeline::enrich_pending(cache, &options, &control) {
+        log::warn!("indexed the folder but could not read its books' metadata: {e}");
+    }
+    Ok(rescan)
+}
+
+/// Phase one of [`rescan`] only: walk, re-attach what moved, register
+/// what is new from its filename and content hash. Embedded metadata and
+/// covers are left queued for [`crate::scan_pipeline::enrich_pending`].
+///
+/// Counts on and honours `control`. If it was cancelled, the walk may be
+/// partial: `Rescan::scanned` then says nothing about what is *absent*,
+/// and the caller must not conclude anything from it.
+pub fn rescan_files(cache: &crate::cache::Cache, now: SystemTime, options: &crate::scan_pipeline::PipelineOptions, control: &crate::scan_pipeline::JobControl) -> Result<Rescan> {
     let library = cache.backend.library_path.clone();
-    let scanned = walk(&library, &ScanOptions::default(), now)?;
+    control.set_phase("walking");
+    let scanned = walk_controlled(&library, &ScanOptions::default(), now, Some(control))?;
+    if control.is_cancelled() {
+        return Ok(Rescan { scanned, relocated: 0, indexed: IndexReport { cancelled: true, ..Default::default() } });
+    }
 
     // Safe on an incomplete scan: a relocation is concluded from a file
     // that *was* found, not from one that was not. Only `missing` needs
@@ -462,7 +463,7 @@ pub fn rescan(cache: &crate::cache::Cache, now: SystemTime) -> Result<Rescan> {
     let drifted = crate::drift::detect(cache, &scanned)?;
     let relocated = crate::drift::apply_relocations(cache, &drifted)?;
 
-    let indexed = index_scan(cache, &library, &scanned);
+    let indexed = crate::scan_pipeline::index_files(cache, &library, &scanned, options, control);
     Ok(Rescan { scanned, relocated, indexed })
 }
 

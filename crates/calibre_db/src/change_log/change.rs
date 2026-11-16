@@ -127,6 +127,27 @@ pub enum ChangeOp {
     /// Library-scoped: it is about the item, not about any one book.
     /// `kind` is `authors`, `tags` or `publishers`, the table renamed.
     ItemRenamed { kind: String, from: String, to: String },
+
+    /// Several ops that happened together, durable as **one** entry: one
+    /// file, one fsync, one link in the hash chain.
+    ///
+    /// Exists for the folder scan, which registers books by the hundred.
+    /// Each book is nine ops, and an entry is a file that has to be
+    /// fsynced: 300,000 books was 2.7 million fsyncs, which on a network
+    /// share is days. A batch makes it one per hundred books.
+    ///
+    /// Replay applies the inner ops in order, exactly as if they were
+    /// separate entries -- they are the same ops, so nothing about what a
+    /// rebuild produces changes. What is lost is granularity in
+    /// *compaction*: a batch is kept whole and never collapsed into a later
+    /// write to the same field (`supersede_key` is `None`). That costs disk,
+    /// not correctness: the later write replays after the batch and wins.
+    ///
+    /// Atomicity is a property of the file: it parses completely or the
+    /// hash check rejects it, so a crash cannot leave half a batch in the
+    /// log -- the whole of it or none of it, which is stricter than the
+    /// per-op entries this replaces.
+    Batch { ops: Vec<ChangeOp> },
 }
 
 impl ChangeOp {
@@ -140,7 +161,7 @@ impl ChangeOp {
             | ChangeOp::FormatSet { book, .. }
             | ChangeOp::FormatRemoved { book, .. }
             | ChangeOp::CoverSet { book, .. } => ChangeTarget::Book(book.clone()),
-            ChangeOp::PrefSet { .. } | ChangeOp::CustomColumnAdded { .. } | ChangeOp::CustomColumnRemoved { .. } | ChangeOp::ItemRenamed { .. } => ChangeTarget::Library,
+            ChangeOp::PrefSet { .. } | ChangeOp::CustomColumnAdded { .. } | ChangeOp::CustomColumnRemoved { .. } | ChangeOp::ItemRenamed { .. } | ChangeOp::Batch { .. } => ChangeTarget::Library,
         }
     }
 
@@ -153,7 +174,7 @@ impl ChangeOp {
             | ChangeOp::FormatSet { book, .. }
             | ChangeOp::FormatRemoved { book, .. }
             | ChangeOp::CoverSet { book, .. } => Some(book),
-            ChangeOp::PrefSet { .. } | ChangeOp::CustomColumnAdded { .. } | ChangeOp::CustomColumnRemoved { .. } | ChangeOp::ItemRenamed { .. } => None,
+            ChangeOp::PrefSet { .. } | ChangeOp::CustomColumnAdded { .. } | ChangeOp::CustomColumnRemoved { .. } | ChangeOp::ItemRenamed { .. } | ChangeOp::Batch { .. } => None,
         }
     }
 
@@ -185,7 +206,10 @@ impl ChangeOp {
             // Never superseded: a rename composes with whatever else was
             // done to the item, and dropping one would leave later ops
             // naming an item that, on replay, still has its old name.
-            | ChangeOp::ItemRenamed { .. } => None,
+            | ChangeOp::ItemRenamed { .. }
+            // A batch is kept whole: it spans books and fields, so there is
+            // no single key it supersedes or is superseded by.
+            | ChangeOp::Batch { .. } => None,
         }
     }
 }

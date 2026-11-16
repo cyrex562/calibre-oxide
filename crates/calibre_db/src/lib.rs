@@ -37,6 +37,7 @@ pub mod orphans;
 #[cfg(unix)]
 mod power_monitor;
 pub mod scan;
+pub mod scan_pipeline;
 pub mod removal;
 pub mod restore;
 pub mod schema_upgrades;

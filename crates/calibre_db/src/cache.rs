@@ -195,6 +195,38 @@ fn trash_one(path: &Path) -> Result<(), String> {
     trash::delete(path).map_err(|e| e.to_string())
 }
 
+/// What [`Cache::insert_book_in_tx`] created.
+pub(crate) struct InsertedBook {
+    pub id: i32,
+    pub uuid: Option<String>,
+    pub timestamp: String,
+    pub pubdate: String,
+}
+
+/// One file already inside the library, ready to become a book:
+/// everything [`Cache::register_books_in_place`] needs, so registering
+/// never has to read the file.
+#[derive(Debug, Clone)]
+pub struct InPlaceFile {
+    /// `/`-separated, relative to the library root.
+    pub relative_path: String,
+    pub metadata: MetaInformation,
+    /// Bytes actually read while hashing.
+    pub size: i64,
+    /// BLAKE3, lowercase hex, from the same single read as `size`.
+    pub hash: String,
+    pub identity: Option<calibre_utils::filenames::FileIdentity>,
+    /// Owes the lazy metadata pass (embedded title/authors/cover).
+    pub queue_enrichment: bool,
+}
+
+/// The key under which a file is looked up in
+/// [`Cache::indexed_file_keys`]: exactly what `book_for_file` matches on
+/// -- folder, stem, and the upper-cased format.
+pub fn file_key(folder: &str, stem: &str, format: &str) -> String {
+    format!("{folder}\u{0}{stem}\u{0}{}", format.to_ascii_uppercase())
+}
+
 pub struct Cache {
     pub backend: Backend,
     /// Issue #222 phase 3: a lazily-loaded, per-`Cache`-instance
@@ -276,6 +308,16 @@ impl Cache {
             }
             Err(e) => log::warn!("could not open the library change log: {e}"),
         }
+    }
+
+    /// [`Cache::record`] for a run of ops, written as a single
+    /// [`crate::change_log::ChangeOp::Batch`] entry: one file and one
+    /// fsync however many ops. Same failure policy: logged and swallowed.
+    fn record_many(&self, ops: Vec<crate::change_log::ChangeOp>) {
+        if ops.is_empty() {
+            return;
+        }
+        self.record(crate::change_log::ChangeOp::Batch { ops });
     }
 
     /// Records that a book's cover was set, for [`crate::covers::set_cover`],
@@ -704,46 +746,129 @@ impl Cache {
     /// root, exactly as [`crate::scan::DiscoveredFile`] reports it.
     pub fn register_book_in_place(&self, relative_path: &str, metadata: &MetaInformation) -> anyhow::Result<i32> {
         let relative = relative_path.trim_start_matches(['/', '\\']);
-        let path = Path::new(relative);
-        let stem = path.file_stem().and_then(|s| s.to_str()).ok_or_else(|| anyhow::anyhow!("a book file needs a name"))?.to_string();
-        let ext = path.extension().and_then(|e| e.to_str()).ok_or_else(|| anyhow::anyhow!("a book file needs an extension"))?.to_ascii_lowercase();
-        let folder = path.parent().map(|p| p.to_string_lossy().replace('\\', "/")).unwrap_or_default();
-
         let absolute = self.backend.library_path.join(relative);
         if !absolute.is_file() {
             anyhow::bail!("{} is not a file in this library", absolute.display());
         }
-
-        let book_id = self.add_book_db_entry(metadata, &folder)?;
-
-        // Hash and size come from the file where it lies. No
-        // `copy_atomic`, so nothing is written to the library at all --
+        // Streamed, never buffered: this used to `fs::read` the whole file.
+        // No `copy_atomic` either, so nothing is written to the library --
         // indexing a folder must not rewrite it.
-        let bytes = fs::read(&absolute)?;
-        let size = bytes.len() as i64;
-        let hash = blake3::hash(&bytes).to_hex().to_string();
-        {
-            let conn = self.backend.conn.lock().unwrap();
-            conn.execute(
-                "INSERT OR REPLACE INTO data (book, format, uncompressed_size, name) VALUES (?1, ?2, ?3, ?4)",
-                (book_id, ext.to_uppercase(), size, &stem),
-            )?;
+        let digest = crate::scan_pipeline::hash_stream(&absolute, None)?;
+        let item = InPlaceFile {
+            relative_path: relative.to_string(),
+            metadata: metadata.clone(),
+            size: digest.size as i64,
+            hash: digest.hash,
+            identity: calibre_utils::filenames::identity(&absolute),
+            queue_enrichment: false,
+        };
+        self.register_books_in_place(&[item]).remove(0)
+    }
+
+    /// Registers many already-in-place files in **one** `BEGIN IMMEDIATE`
+    /// transaction, and records them in the change log as one batch.
+    ///
+    /// Each book runs inside its own savepoint, so a book that cannot be
+    /// inserted is rolled back on its own and reported in its slot of the
+    /// result, without losing the rest of the batch. Nothing is ever left
+    /// half-registered: a book's `books` row, authors, `data` row, content
+    /// hash and enrichment-queue row are committed together or not at all.
+    ///
+    /// Order of operations is the one every write here follows: database
+    /// commit first, log second ([`Cache::set_field`] says why). A crash in
+    /// the gap leaves books the log does not know -- the same window a
+    /// single [`Cache::register_book_in_place`] always had, now one batch
+    /// wide; see `docs/LIBRARY_MODEL.md`.
+    ///
+    /// Results are in the order of `items`.
+    pub fn register_books_in_place(&self, items: &[InPlaceFile]) -> Vec<anyhow::Result<i32>> {
+        if items.is_empty() {
+            return Vec::new();
         }
-        // The identity as well as the hash: a file that stays put is
-        // exactly the file whose rename we will later want to detect
-        // from one `stat` rather than by reading it again.
-        self.checksums().record_hash_with_identity(book_id, "format", &ext.to_uppercase(), &hash, size, calibre_utils::filenames::identity(&absolute))?;
+        let fail_all = |e: anyhow::Error| -> Vec<anyhow::Result<i32>> { items.iter().map(|_| Err(anyhow::anyhow!("{e:#}"))).collect() };
+        if let Err(e) = self.checksums().initialize() {
+            return fail_all(e.into());
+        }
 
-        let (format_name, stem_name) = (ext.to_uppercase(), stem.clone());
-        self.record_for_book(book_id, |book| crate::change_log::ChangeOp::FormatSet { book, format: format_name, name: stem_name, size, hash: Some(hash) });
+        struct Done {
+            inserted: InsertedBook,
+            ops: Vec<crate::change_log::ChangeOp>,
+        }
+        let mut outcomes: Vec<anyhow::Result<Done>> = Vec::with_capacity(items.len());
+        {
+            let mut conn = self.backend.conn.lock().unwrap();
+            let mut tx = match conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
+                Ok(tx) => tx,
+                Err(e) => return fail_all(e.into()),
+            };
+            for item in items {
+                let one = (|| -> anyhow::Result<Done> {
+                    let relative = item.relative_path.trim_start_matches(['/', '\\']);
+                    let path = Path::new(relative);
+                    let stem = path.file_stem().and_then(|s| s.to_str()).ok_or_else(|| anyhow::anyhow!("a book file needs a name"))?.to_string();
+                    let ext = path.extension().and_then(|e| e.to_str()).ok_or_else(|| anyhow::anyhow!("a book file needs an extension"))?.to_ascii_lowercase();
+                    let folder = path.parent().map(|p| p.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+                    let format = ext.to_uppercase();
 
-        let (_, cover) = &metadata.cover_data;
-        if !cover.is_empty() {
-            if let Err(e) = crate::covers::set_cover(self, book_id, cover) {
-                log::warn!("indexed {relative} but its cover could not be stored: {e}");
+                    let sp = tx.savepoint()?;
+                    let inserted = Self::insert_book_in_tx(&sp, &item.metadata, &folder, None)?;
+                    sp.execute(
+                        "INSERT OR REPLACE INTO data (book, format, uncompressed_size, name) VALUES (?1, ?2, ?3, ?4)",
+                        (inserted.id, &format, item.size, &stem),
+                    )?;
+                    // The identity as well as the hash: a file that stays put is
+                    // exactly the file whose rename we will later want to detect
+                    // from one `stat` rather than by reading it again.
+                    crate::checksums::ChecksumStore::record_hash_on(&sp, inserted.id, "format", &format, &item.hash, item.size, item.identity)?;
+                    if item.queue_enrichment {
+                        crate::checksums::ChecksumStore::queue_enrichment_on(&sp, inserted.id, &format)?;
+                    }
+                    sp.commit()?;
+
+                    let mut ops = Self::book_added_ops(&inserted, &item.metadata, &folder);
+                    if let Some(uuid) = inserted.uuid.clone() {
+                        ops.push(crate::change_log::ChangeOp::FormatSet { book: uuid, format, name: stem, size: item.size, hash: Some(item.hash.clone()) });
+                    }
+                    Ok(Done { inserted, ops })
+                })();
+                outcomes.push(one);
+            }
+            if let Err(e) = tx.commit() {
+                return fail_all(e.into());
             }
         }
-        Ok(book_id)
+
+        let mut all_ops = Vec::new();
+        for outcome in outcomes.iter_mut().flatten() {
+            all_ops.append(&mut outcome.ops);
+        }
+        self.record_many(all_ops);
+
+        outcomes
+            .into_iter()
+            .zip(items)
+            .map(|(outcome, item)| {
+                let done = outcome?;
+                let (_, cover) = &item.metadata.cover_data;
+                if !cover.is_empty() {
+                    if let Err(e) = crate::covers::set_cover(self, done.inserted.id, cover) {
+                        log::warn!("indexed {} but its cover could not be stored: {e}", item.relative_path);
+                    }
+                }
+                Ok(done.inserted.id)
+            })
+            .collect()
+    }
+
+    /// Every `(folder, file stem, FORMAT)` the library already has a row
+    /// for, as one string key per file -- see [`file_key`]. One query, so
+    /// a scan can tell new files from known ones without asking the
+    /// database about each file in turn.
+    pub fn indexed_file_keys(&self) -> anyhow::Result<std::collections::HashSet<String>> {
+        let conn = self.backend.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT b.path, d.name, d.format FROM books b JOIN data d ON d.book = b.id")?;
+        let rows = stmt.query_map([], |row| Ok(file_key(&row.get::<_, String>(0)?, &row.get::<_, String>(1)?, &row.get::<_, String>(2)?)))?;
+        Ok(rows.collect::<Result<_>>()?)
     }
 
     /// Whether some book already claims this file.
@@ -794,9 +919,35 @@ impl Cache {
         rel_path: &str,
         explicit_id: Option<i32>,
     ) -> anyhow::Result<i32> {
-        let mut conn = self.backend.conn.lock().unwrap();
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let inserted = {
+            let mut conn = self.backend.conn.lock().unwrap();
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let inserted = Self::insert_book_in_tx(&tx, metadata, rel_path, explicit_id)?;
+            tx.commit()?;
+            inserted
+        };
+        // One entry per op, as it always was: a single add is not worth
+        // changing what its log looks like (see `register_books_in_place`
+        // for the batched form).
+        for op in Self::book_added_ops(&inserted, metadata, rel_path) {
+            self.record(op);
+        }
+        Ok(inserted.id)
+    }
 
+    /// The rows of a new book -- `books`, its authors and the links --
+    /// written on a transaction the caller owns, so one transaction can
+    /// carry a whole batch of books (see [`Cache::register_books_in_place`]).
+    ///
+    /// Writes only the database. The caller commits, and then records
+    /// [`Cache::book_added_ops`] in the change log -- in that order, for the
+    /// reason [`Cache::set_field`] gives.
+    pub(crate) fn insert_book_in_tx(
+        tx: &rusqlite::Connection,
+        metadata: &MetaInformation,
+        rel_path: &str,
+        explicit_id: Option<i32>,
+    ) -> anyhow::Result<InsertedBook> {
         let author_name = metadata
             .authors
             .first()
@@ -897,38 +1048,43 @@ impl Cache {
             )?;
         }
 
-        tx.commit()?;
-        drop(conn);
+        let uuid: Option<String> = tx.query_row("SELECT uuid FROM books WHERE id = ?1", (book_id,), |row| row.get::<_, Option<String>>(0)).ok().flatten();
+        Ok(InsertedBook { id: book_id, uuid, timestamp, pubdate })
+    }
 
-        // Recorded as an add plus a field write per column, rather than
-        // one fat op carrying the whole row. It keeps replay to a single
-        // `set_field` path, and it means a later edit to any one of
-        // these fields supersedes just that one during compaction.
-        if let Some(uuid) = self.book_uuid(book_id)? {
-            self.record(crate::change_log::ChangeOp::BookAdded { book: uuid.clone() });
-            let fields: Vec<(&str, String)> = vec![
-                ("title", metadata.title.clone()),
-                ("author_sort", author_name.to_string()),
-                ("path", rel_path.to_string()),
-                ("series_index", metadata.series_index.to_string()),
-                ("timestamp", timestamp.clone()),
-                ("pubdate", pubdate.clone()),
-            ];
-            let mut fields = fields;
-            // An explicit `title_sort` is written over the trigger's
-            // computed default, so it has to be logged or a rebuild
-            // silently goes back to the computed one.
-            if let Some(sort) = metadata.title_sort.as_deref() {
-                fields.push(("sort", sort.to_string()));
-            }
-            for (field, value) in fields {
-                self.record(crate::change_log::ChangeOp::FieldSet { book: uuid.clone(), field: field.to_string(), value: Some(value) });
-            }
-            if !metadata.authors.is_empty() {
-                self.record(crate::change_log::ChangeOp::FieldSet { book: uuid, field: "authors".to_string(), value: Some(metadata.authors.join(" & ")) });
-            }
+    /// The change-log entries for a book [`Cache::insert_book_in_tx`] just
+    /// created.
+    ///
+    /// Recorded as an add plus a field write per column, rather than one
+    /// fat op carrying the whole row. It keeps replay to a single
+    /// `set_field` path, and it means a later edit to any one of these
+    /// fields supersedes just that one during compaction.
+    pub(crate) fn book_added_ops(inserted: &InsertedBook, metadata: &MetaInformation, rel_path: &str) -> Vec<crate::change_log::ChangeOp> {
+        use crate::change_log::ChangeOp;
+        let Some(uuid) = inserted.uuid.clone() else { return Vec::new() };
+        let author_name = metadata.authors.first().map(|s| s.as_str()).unwrap_or("Unknown");
+        let mut fields: Vec<(&str, String)> = vec![
+            ("title", metadata.title.clone()),
+            ("author_sort", author_name.to_string()),
+            ("path", rel_path.to_string()),
+            ("series_index", metadata.series_index.to_string()),
+            ("timestamp", inserted.timestamp.clone()),
+            ("pubdate", inserted.pubdate.clone()),
+        ];
+        // An explicit `title_sort` is written over the trigger's
+        // computed default, so it has to be logged or a rebuild
+        // silently goes back to the computed one.
+        if let Some(sort) = metadata.title_sort.as_deref() {
+            fields.push(("sort", sort.to_string()));
         }
-        Ok(book_id)
+        let mut ops = vec![ChangeOp::BookAdded { book: uuid.clone() }];
+        for (field, value) in fields {
+            ops.push(ChangeOp::FieldSet { book: uuid.clone(), field: field.to_string(), value: Some(value) });
+        }
+        if !metadata.authors.is_empty() {
+            ops.push(ChangeOp::FieldSet { book: uuid, field: "authors".to_string(), value: Some(metadata.authors.join(" & ")) });
+        }
+        ops
     }
 
     /// Copies `source_path` into the book's folder as `<title>.<fmt>`
