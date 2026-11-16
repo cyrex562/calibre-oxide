@@ -342,6 +342,67 @@ fn render_document_page(document: &pdfium_render::prelude::PdfDocument<'_>, page
     })
 }
 
+/// One page of a [`SampledPdf`]: a small grayscale render and its text.
+pub struct SampledPage {
+    /// 0-based.
+    pub index: usize,
+    pub width: u32,
+    pub height: u32,
+    /// One byte per pixel, row-major.
+    pub gray: Vec<u8>,
+}
+
+/// What [`sample_pdf_from_path`] read from one PDF.
+pub struct SampledPdf {
+    pub page_count: usize,
+    pub pages: Vec<SampledPage>,
+    /// Extracted text, one entry per page, for the pages `text_pages`
+    /// asked for (in order). Empty strings for a page with no text layer.
+    pub text: Vec<String>,
+}
+
+/// Renders the pages in `render` (0-based) at a long side of `long_side`
+/// pixels, grayscale, and extracts the text of the pages in `text_pages`
+/// (0-based) -- **straight from the file**, loaded once, through PDFium's
+/// file callback (see [`info_and_cover_from_path`]), so a 500 MB scan on a
+/// NAS costs the pages it touches rather than the whole file.
+///
+/// `choose` is handed the page count and returns `(pages to render, pages
+/// to extract text from)`, so the caller can pick them without a second
+/// open. Indices at or past the end are dropped. A page that will not render
+/// is skipped rather than failing the document; an encrypted or corrupt
+/// document is [`RasterizeError::Pdf`].
+///
+/// Oxide-specific: nothing here is ported from calibre. It exists for
+/// `calibre_db::pdf_similarity`.
+pub fn sample_pdf_from_path(path: &Path, long_side: u32, choose: impl FnOnce(usize) -> (Vec<usize>, Vec<usize>)) -> Result<SampledPdf> {
+    let pdfium = pdfium().ok_or_else(unavailable)?;
+    let document = pdfium.load_pdf_from_file(path, None).map_err(|e| RasterizeError::Pdf(e.to_string()))?;
+    let pages = document.pages();
+    let page_count = pages.len() as usize;
+    let (render, text_pages) = choose(page_count);
+
+    let mut sampled = Vec::new();
+    for index in render.into_iter().filter(|&i| i < page_count) {
+        let Ok(page) = pages.get((index as u16).into()) else { continue };
+        let (pw, ph) = (page.width().value.max(1.0), page.height().value.max(1.0));
+        let scale = long_side as f32 / pw.max(ph);
+        let (w, h) = (((pw * scale).round() as i32).max(1), ((ph * scale).round() as i32).max(1));
+        let config = PdfRenderConfig::new().set_target_size(w, h).render_form_data(false);
+        let Ok(bitmap) = page.render_with_config(&config) else { continue };
+        let rgba = bitmap.as_rgba_bytes();
+        let gray = rgba.chunks_exact(4).map(|p| ((p[0] as u32 * 299 + p[1] as u32 * 587 + p[2] as u32 * 114) / 1000) as u8).collect();
+        sampled.push(SampledPage { index, width: bitmap.width() as u32, height: bitmap.height() as u32, gray });
+    }
+
+    let mut text = Vec::new();
+    for index in text_pages.into_iter().filter(|&i| i < page_count) {
+        let t = pages.get((index as u16).into()).ok().and_then(|p| p.text().ok().map(|t| t.all())).unwrap_or_default();
+        text.push(t);
+    }
+    Ok(SampledPdf { page_count, pages: sampled, text })
+}
+
 /// Port of `pdf.py`'s `page_images`: renders the inclusive page range
 /// `first..=last` and hands back one encoded image per page.
 ///
