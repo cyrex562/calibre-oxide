@@ -533,6 +533,7 @@ const EXCLUDED: &[(&str, &str)] = &[
     ("checksums.rs", "the checksum sidecar db"),
     ("orphans.rs", "the checksum sidecar db"),
     ("removal.rs", "the checksum sidecar db"),
+    ("pdf_similarity/", "tests of the PDF fingerprint cache, which lives in the checksum sidecar db"),
     ("restore.rs", "legacy OPF restore (#951); rebuilds metadata.db rather than writing library content"),
     ("change_log/", "the log itself"),
     ("fts/", "the full-text-search sidecar db, rebuilt from book files"),

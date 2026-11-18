@@ -167,6 +167,16 @@ pub struct LedgerRow {
 }
 
 /// See this module's doc comment for the full design.
+/// A PDF format owed a fingerprint.
+#[derive(Debug, Clone)]
+pub struct PendingPdf {
+    pub book_id: i32,
+    pub format: String,
+    pub hash: String,
+    pub name: String,
+    pub folder: String,
+}
+
 pub struct ChecksumStore {
     conn: Arc<Mutex<Connection>>,
     db_path: PathBuf,
@@ -243,6 +253,20 @@ impl ChecksumStore {
                     policy TEXT NOT NULL,
                     book_uuid TEXT,
                     imported_at TEXT NOT NULL
+                );
+                -- Page and text fingerprints of PDFs (`pdf_similarity`),
+                -- keyed by the content hash so identical files share a row.
+                CREATE TABLE IF NOT EXISTS checksums_db.pdf_fingerprints (
+                    blake3_hex TEXT NOT NULL PRIMARY KEY,
+                    version INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    error TEXT,
+                    page_count INTEGER NOT NULL DEFAULT 0,
+                    has_text INTEGER NOT NULL DEFAULT 0,
+                    text_chars INTEGER NOT NULL DEFAULT 0,
+                    pages BLOB,
+                    minhash BLOB,
+                    computed_at TEXT NOT NULL
                 );",
             )?;
         }
@@ -695,6 +719,136 @@ impl ChecksumStore {
         )?;
         Ok(())
     }
+
+    // ------------------------------------------------------------------
+    // PDF fingerprints (`pdf_similarity`)
+    //
+    // A cache of something computed from a file's content, kept in the
+    // sidecar with the hashes it is keyed by. It is not library metadata, so
+    // none of this goes through `Cache` or the change log (the same as the
+    // hashes themselves), and a library rebuilt from the log just recomputes
+    // it. Rows are keyed by content, so deleting a book leaves its row: the
+    // next book with that content reuses it.
+    // ------------------------------------------------------------------
+
+    /// PDF formats with a content hash and no current-version fingerprint
+    /// (neither a good one nor a recorded failure).
+    pub fn pdf_fingerprints_pending(&self) -> Result<Vec<PendingPdf>, ChecksumError> {
+        self.initialize()?;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT c.book_id, c.key, c.blake3_hex, d.name, b.path
+             FROM checksums_db.file_checksums c
+             JOIN data d ON d.book = c.book_id AND d.format = c.key
+             JOIN books b ON b.id = c.book_id
+             WHERE c.kind = 'format' AND UPPER(c.key) = 'PDF'
+               AND NOT EXISTS (SELECT 1 FROM checksums_db.pdf_fingerprints p WHERE p.blake3_hex = c.blake3_hex AND p.version = ?1)
+             ORDER BY c.blake3_hex, c.book_id",
+        )?;
+        let rows = stmt.query_map([crate::pdf_similarity::FINGERPRINT_VERSION], |row| {
+            Ok(PendingPdf { book_id: row.get(0)?, format: row.get(1)?, hash: row.get(2)?, name: row.get(3)?, folder: row.get(4)? })
+        })?;
+        Ok(rows.collect::<SqlResult<Vec<_>>>()?)
+    }
+
+    /// Stores a fingerprint, or the reason there is none (so it is not
+    /// retried until the version changes).
+    pub fn record_pdf_fingerprint(&self, hash: &str, outcome: &Result<crate::pdf_similarity::PdfFingerprint, String>) -> Result<(), ChecksumError> {
+        self.initialize()?;
+        let conn = self.conn.lock().unwrap();
+        let version = crate::pdf_similarity::FINGERPRINT_VERSION;
+        match outcome {
+            Ok(fp) => conn.execute(
+                "INSERT OR REPLACE INTO checksums_db.pdf_fingerprints
+                 (blake3_hex, version, status, error, page_count, has_text, text_chars, pages, minhash, computed_at)
+                 VALUES (?1, ?2, 'ok', NULL, ?3, ?4, ?5, ?6, ?7, strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
+                rusqlite::params![hash, version, fp.page_count, fp.has_text, fp.text_chars, fp.encode_pages(), fp.encode_minhash()],
+            )?,
+            Err(why) => conn.execute(
+                "INSERT OR REPLACE INTO checksums_db.pdf_fingerprints (blake3_hex, version, status, error, computed_at)
+                 VALUES (?1, ?2, 'failed', ?3, strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
+                rusqlite::params![hash, version, why],
+            )?,
+        };
+        Ok(())
+    }
+
+    /// Whether this content has a current-version row (good or failed).
+    pub fn has_pdf_fingerprint(&self, hash: &str) -> Result<bool, ChecksumError> {
+        self.initialize()?;
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM checksums_db.pdf_fingerprints WHERE blake3_hex = ?1 AND version = ?2",
+                rusqlite::params![hash, crate::pdf_similarity::FINGERPRINT_VERSION],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// The recorded failure reason for this content, if it failed.
+    pub fn pdf_fingerprint_error(&self, hash: &str) -> Result<Option<String>, ChecksumError> {
+        self.initialize()?;
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT error FROM checksums_db.pdf_fingerprints WHERE blake3_hex = ?1 AND version = ?2 AND status = 'failed'",
+                rusqlite::params![hash, crate::pdf_similarity::FINGERPRINT_VERSION],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Every good, current fingerprint with the books that hold that content.
+    pub fn pdf_fingerprints(&self) -> Result<Vec<crate::pdf_similarity::LibraryFingerprint>, ChecksumError> {
+        use crate::pdf_similarity::{LibraryFingerprint, PdfFingerprint};
+        self.initialize()?;
+        let conn = self.conn.lock().unwrap();
+        let mut books: std::collections::HashMap<String, (Vec<i32>, i64)> = std::collections::HashMap::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT c.blake3_hex, c.book_id, c.size FROM checksums_db.file_checksums c
+                 JOIN data d ON d.book = c.book_id AND d.format = c.key
+                 WHERE c.kind = 'format' AND UPPER(c.key) = 'PDF' ORDER BY c.book_id",
+            )?;
+            for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i32>(1)?, r.get::<_, i64>(2)?)))? {
+                let (hash, book, size) = row?;
+                let entry = books.entry(hash).or_default();
+                entry.0.push(book);
+                entry.1 = size;
+            }
+        }
+        let mut stmt = conn.prepare("SELECT blake3_hex, page_count, has_text, text_chars, pages, minhash FROM checksums_db.pdf_fingerprints WHERE status = 'ok' AND version = ?1 ORDER BY blake3_hex")?;
+        let mut out = Vec::new();
+        for row in stmt.query_map([crate::pdf_similarity::FINGERPRINT_VERSION], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?, r.get::<_, bool>(2)?, r.get::<_, u32>(3)?, r.get::<_, Vec<u8>>(4)?, r.get::<_, Vec<u8>>(5)?))
+        })? {
+            let (hash, page_count, has_text, text_chars, pages, minhash) = row?;
+            let Some(pages) = PdfFingerprint::decode_pages(&pages) else { continue };
+            let Some((ids, size)) = books.get(&hash) else { continue };
+            out.push(LibraryFingerprint { books: ids.clone(), size: *size, fingerprint: PdfFingerprint { page_count, pages, text_chars, has_text, minhash: PdfFingerprint::decode_minhash(&minhash) }, hash });
+        }
+        Ok(out)
+    }
+
+    /// How many of the library's PDF formats are fingerprinted, failed, owed
+    /// a fingerprint, or have no hash to key one by.
+    pub fn pdf_status(&self) -> Result<crate::pdf_similarity::PdfStatus, ChecksumError> {
+        self.initialize()?;
+        let conn = self.conn.lock().unwrap();
+        let version = crate::pdf_similarity::FINGERPRINT_VERSION;
+        let count = |sql: &str| -> SqlResult<usize> { conn.query_row(sql, [version], |r| r.get::<_, i64>(0)).map(|n| n as usize) };
+        let hashed_join = "FROM data d JOIN checksums_db.file_checksums c ON c.book_id = d.book AND c.kind = 'format' AND c.key = d.format";
+        let fp_join = "JOIN checksums_db.pdf_fingerprints p ON p.blake3_hex = c.blake3_hex AND p.version = ?1";
+        let fingerprinted = count(&format!("SELECT count(*) {hashed_join} {fp_join} WHERE UPPER(d.format) = 'PDF' AND p.status = 'ok'"))?;
+        let failed = count(&format!("SELECT count(*) {hashed_join} {fp_join} WHERE UPPER(d.format) = 'PDF' AND p.status = 'failed'"))?;
+        let hashed = count(&format!("SELECT count(*) {hashed_join} WHERE UPPER(d.format) = 'PDF' AND ?1 = ?1"))?;
+        let all = count("SELECT count(*) FROM data d WHERE UPPER(d.format) = 'PDF' AND ?1 = ?1")?;
+        Ok(crate::pdf_similarity::PdfStatus { fingerprinted, failed, pending: hashed.saturating_sub(fingerprinted + failed), unhashed: all.saturating_sub(hashed) })
+    }
+
 
     /// Drops every stored checksum for a book -- call when the whole
     /// book (and its on-disk folder) is deleted.

@@ -165,6 +165,8 @@ pub struct JobControl {
     /// Books given their embedded metadata.
     pub enriched: AtomicU64,
     pub errors: AtomicU64,
+    /// PDFs given a page/text fingerprint.
+    pub fingerprinted: AtomicU64,
     pub bytes_hashed: AtomicU64,
     /// Files opened for hashing. Equal to `hashed` unless something read
     /// a file twice.
@@ -187,6 +189,7 @@ pub struct Progress {
     pub ignored: u64,
     pub enriched: u64,
     pub errors: u64,
+    pub fingerprinted: u64,
     pub bytes_hashed: u64,
     pub file_opens: u64,
 }
@@ -228,6 +231,7 @@ impl JobControl {
             ignored: load(&self.ignored),
             enriched: load(&self.enriched),
             errors: load(&self.errors),
+            fingerprinted: load(&self.fingerprinted),
             bytes_hashed: load(&self.bytes_hashed),
             file_opens: load(&self.file_opens),
         }

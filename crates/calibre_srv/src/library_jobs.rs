@@ -33,6 +33,7 @@
 //! - `POST /scan-library/{library_id}` -- scan, then enrich ([`crate::scan_library`])
 //! - `POST /enrich-library/{library_id}` -- the metadata pass alone (resume)
 //! - `POST /hash-backfill/{library_id}` -- hash every file with no hash
+//! - `POST /pdf-fingerprint/{library_id}` -- page/text fingerprints of PDFs ([`calibre_db::pdf_similarity`])
 //! - `POST /import-folder/{library_id}` -- copy a folder tree in ([`crate::import_folder`])
 //! - `POST /duplicates/scan/{library_id}?job=true` -- the duplicate scan ([`crate::duplicates`])
 //! - `GET /library-jobs`, `GET /library-jobs/{id}`, `POST /library-jobs/{id}/cancel`
@@ -62,6 +63,9 @@ pub enum JobKind {
     Scan,
     Enrich,
     HashBackfill,
+    /// Fingerprint every PDF that has a hash and no fingerprint
+    /// (`POST /pdf-fingerprint`), for the scan-vs-OCR and re-save matching.
+    PdfFingerprint,
     /// Merge exact-content duplicate groups (a plan the user confirmed).
     MergeExact,
     /// Copy a folder tree into the library (`POST /import-folder`).
@@ -76,6 +80,7 @@ impl JobKind {
             JobKind::Scan => "scan",
             JobKind::Enrich => "enrich",
             JobKind::HashBackfill => "hash_backfill",
+            JobKind::PdfFingerprint => "pdf_fingerprint",
             JobKind::MergeExact => "merge_exact",
             JobKind::Import => "import",
             JobKind::Dedupe => "dedupe",
@@ -256,6 +261,7 @@ fn run(cache: &Cache, kind: JobKind, options: &PipelineOptions, control: &JobCon
         }
         JobKind::Enrich => Ok(serde_json::to_value(calibre_db::scan_pipeline::enrich_pending(cache, options, control)?)?),
         JobKind::HashBackfill => Ok(serde_json::to_value(calibre_db::scan_pipeline::backfill_hashes(cache, options, control)?)?),
+        JobKind::PdfFingerprint => Ok(serde_json::to_value(calibre_db::pdf_similarity::fingerprint_pdfs(cache, options, control)?)?),
         JobKind::MergeExact => Ok(serde_json::to_value(calibre_db::merge::execute_content_merges(cache, &params.merge_plan, params.keep_duplicate_formats, control))?),
         JobKind::Dedupe => crate::duplicates::run_job(cache, params.dedupe_min.unwrap_or(calibre_db::dedupe::Strength::Fuzzy), control),
         JobKind::Import => {
@@ -356,6 +362,15 @@ pub async fn enrich(State(state): State<AppState>, Path(library_id): Path<String
 /// content hash one, so de-duplication sees the whole library.
 pub async fn hash_backfill(State(state): State<AppState>, Path(library_id): Path<String>, Query(query): Query<StartQuery>) -> Result<Response, ServerError> {
     Ok(respond(library_cache(&state, &library_id)?, JobKind::HashBackfill, &query).await)
+}
+
+/// `POST /pdf-fingerprint/{library_id}` -- reads each PDF with a content hash
+/// and no fingerprint once (page hashes and text), so the duplicate scan can
+/// tell a scan from its OCR and a PDF from its optimized copy. Cancellable and
+/// resumable; PDFs it cannot read are recorded and reported, not retried. Fails
+/// (and records nothing against any PDF) if PDFium is not installed.
+pub async fn pdf_fingerprint(State(state): State<AppState>, Path(library_id): Path<String>, Query(query): Query<StartQuery>) -> Result<Response, ServerError> {
+    Ok(respond(library_cache(&state, &library_id)?, JobKind::PdfFingerprint, &query).await)
 }
 
 /// `GET /library-jobs` -- newest first.

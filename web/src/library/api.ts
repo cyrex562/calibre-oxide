@@ -627,12 +627,14 @@ export interface LibraryJobProgress {
   ignored: number;
   enriched: number;
   errors: number;
+  /** PDFs given a page/text fingerprint. */
+  fingerprinted?: number;
   bytes_hashed: number;
 }
 
 export interface LibraryJob<R = unknown> {
   id: number;
-  kind: "scan" | "enrich" | "hash_backfill" | "merge_exact" | "import";
+  kind: "scan" | "enrich" | "hash_backfill" | "pdf_fingerprint" | "merge_exact" | "import";
   state: "running" | "finished" | "cancelled" | "failed";
   progress: LibraryJobProgress;
   /** Present once the job has ended. */
@@ -718,6 +720,8 @@ export function describeJobProgress(p: LibraryJobProgress): string {
       return `Reading titles and covers… ${n(p.enriched + p.errors)} of ${n(p.total)}`;
     case "hashing":
       return `Reading files… ${n(p.hashed + p.errors)} of ${n(p.total)}`;
+    case "fingerprinting":
+      return `Analysing PDF pages… ${n((p.fingerprinted ?? 0) + p.errors)} of ${n(p.total)}`;
     case "importing":
       return `Importing… ${n(p.hashed + p.already_known + p.errors)} of ${n(p.total)} files · ${n(p.added)} books added${p.ignored ? ` · ${n(p.ignored)} duplicates skipped` : ""}`;
     default:
@@ -873,6 +877,8 @@ export interface DuplicateBook {
   /** How many of authors, series, publisher, tags, comments, rating, identifiers, languages are filled in. */
   metadata?: number;
   has_cover?: boolean;
+  /** Present for a fingerprinted PDF: what distinguishes a scan from its OCR. */
+  pdf?: { pages: number; has_text: boolean; size: number } | null;
 }
 
 /**
@@ -885,7 +891,25 @@ export interface DuplicateBook {
  * `title_author_fuzzy`: probably the same book, but a person has to say so.
  * See crates/calibre_db/src/dedupe.rs.
  */
-export type DuplicateReason = "content" | "identifier" | "title_author_exact" | "title_author_fuzzy";
+export type DuplicateReason =
+  | "content"
+  | "identifier"
+  | "title_author_exact"
+  | "title_author_fuzzy"
+  | "pdf_resave"
+  | "pdf_ocr_variant"
+  | "pdf_text_match";
+
+/** Where the library's PDFs stand for page-content matching. */
+export interface PdfScanStatus {
+  fingerprinted: number;
+  /** Could not be read (encrypted, corrupt); recorded, not retried. */
+  failed: number;
+  /** Have a content hash and no fingerprint: what "Fingerprint PDFs" would do. */
+  pending: number;
+  /** Have no content hash yet. */
+  unhashed: number;
+}
 
 /** One reason two books in a group were joined. */
 export interface DuplicateEvidence {
@@ -907,9 +931,31 @@ export interface DuplicateGroup {
 }
 
 /** `min` is applied by the server (weaker evidence is not used at all). Omit for everything. */
-export function scanForDuplicates(min?: "content" | "identifier" | "exact" | "fuzzy"): Promise<{ groups: DuplicateGroup[] }> {
+export function scanForDuplicates(min?: "content" | "identifier" | "exact" | "pdf" | "fuzzy"): Promise<{ groups: DuplicateGroup[]; pdf?: PdfScanStatus; pdf_unfingerprinted?: number }> {
   const query = min ? `?min=${min}` : "";
-  return jsonFetch<{ groups: DuplicateGroup[] }>(`/duplicates/scan/default${query}`, { method: "POST" });
+  return jsonFetch<{ groups: DuplicateGroup[]; pdf?: PdfScanStatus; pdf_unfingerprinted?: number }>(`/duplicates/scan/default${query}`, { method: "POST" });
+}
+
+/** What the PDF fingerprint job did. */
+export interface PdfFingerprintResult {
+  /** Distinct file contents fingerprinted. */
+  fingerprinted: number;
+  total: number;
+  /** `[path, reason]` for PDFs that could not be read (encrypted or corrupt). */
+  failed: [string, string][];
+  failed_count: number;
+  missing: string[];
+  missing_count: number;
+  cancelled: boolean;
+}
+
+/**
+ * Reads each PDF that has a content hash and no fingerprint, once, so
+ * "Find duplicates" can match a scan to its OCR and a PDF to its optimized
+ * copy. Cancellable; run again to continue. Rejects if PDFium is not installed.
+ */
+export function fingerprintPdfs(handlers: LibraryJobHandlers<PdfFingerprintResult> = {}): Promise<PdfFingerprintResult> {
+  return runLibraryJob<PdfFingerprintResult>("/pdf-fingerprint/default", handlers);
 }
 
 // ---- Merge books (crates/calibre_srv/src/merge_books.rs) ----

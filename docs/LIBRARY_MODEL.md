@@ -171,6 +171,8 @@ strongest `reason`, a `confidence`, and the per-pair `evidence`:
 | `title_author_exact` | equal normalised title and an equal normalised author | 0.90 |
 | `title_author_fuzzy` | equal once edition/bracket noise or a subtitle is removed, or a small edit apart, with an initials-compatible author | 0.55-0.80 |
 
+(PDFs matched by their pages, between exact and fuzzy, are the next section.)
+
 Rules that keep this from flooding the user:
 
 - **An unknown author is not evidence.** `Unknown`, `Unknown Author`,
@@ -202,6 +204,66 @@ Rules that keep this from flooding the user:
 The normalisation (what differs from calibre's `fuzzy_title` and
 `find_identical_books`, and why Jaro-Winkler is not used) is documented in
 `crates/calibre_db/src/dedupe.rs`.
+
+## Finding the same PDF saved differently
+
+Neither hashes nor titles see two kinds of duplicate: a **scan and its OCR copy**
+(the same page images once with and once without a text layer, usually
+re-encoded too) and an **optimizer re-save** (downsampled images, re-encoded
+streams, stripped metadata). They share no bytes and often no title or author
+(or have only a filename-derived title), so they are found from the *pages*.
+`calibre_db::pdf_similarity` does it; calibre has no such feature, so nothing
+is ported.
+
+**Fingerprint.** One per distinct file content, computed once from the file on
+disk through PDFium and cached in `.calibre-oxide/checksums.db` (table
+`pdf_fingerprints`, keyed by the BLAKE3 the scan recorded, with a `version`
+column and a recorded `failed` status for PDFs PDFium cannot open). It is a
+sidecar cache like the hashes themselves: not library metadata, not in the
+change log, recomputed after a rebuild. It holds the page count; a 256-bit
+signature of up to 8 sampled pages (first three, last three, two in the
+middle; rendered with a long side of 640 px, cropped to its ink (found by
+binarising against the local background, scanner borders dropped), then a
+difference hash of the gray means of a 17 x 16 grid, with a mask of the bits
+too close to call); whether
+there is a text layer; and a 128-slot MinHash of the word 3-shingles of the
+first 48 pages' text.
+
+**Job.** `POST /pdf-fingerprint/{library_id}` is a cancellable, resumable
+library job. It fingerprints every PDF that has a content hash and no
+current-version fingerprint (the hash backfill gives the rest a hash), reads
+each distinct content once, records PDFs it cannot read as failed (never
+retried until the algorithm's version changes), and fails without recording
+anything if PDFium is not installed.
+
+**Matching.** Never all-pairs: candidates come from bit-sampling LSH (16 tables of
+14 signature bits; two pages collide only on the same page number, give or
+take two, among documents whose page counts are within two), and a text MinHash LSH for the text-only tier; then
+the sampled pages are aligned (a cover added or dropped shifts the front, not
+the end) and compared at a distance of at most 48 of 256 bits (disagreements among the
+bits both pages trust). Measured on real PDFium renders (the ignored
+benchmark `crates/calibre_db/tests/pdf_signature_benchmark.rs`), a page
+and its scan, OCR copy or optimizer re-encode are at most 17 apart and
+different pages at least 60. Two *independent* scans of one book with
+different skew do not match by pixels; their OCR text can (`pdf_text_match`). A pair matches when
+at least 3 non-blank pages were compared and 75% match (a one- or two-page
+PDF needs equal counts and every page). Blank and near-blank pages are never
+compared.
+
+| Reason | Evidence | Confidence |
+| --- | --- | --- |
+| `pdf_resave` | same pages; same text (MinHash similarity at least 0.8) or no text on either | 0.85 |
+| `pdf_ocr_variant` | same pages; exactly one has a text layer, or both do with similarity 0.3-0.8 (two OCR runs) | 0.80 / 0.75 |
+| `pdf_text_match` | different pages, but both have text, similarity at least 0.9, page counts within 2 | 0.60 |
+
+These rank **between `exact` and `fuzzy`**; `?min=pdf` includes them and
+everything stronger. Same pages with *different* words (similarity under 0.3)
+is not a match: that is two books from one template. Only fingerprinted PDFs
+take part and the scan reports how many are not (`pdf_unfingerprinted`), so the
+UI can offer to run the job. They never reach the bulk `merge-exact`.
+`suggested_dest` for these groups is the copy with a text layer, then more
+pages, then the larger file (an optimizer shrinks images, so the larger of two
+re-saves is the original).
 
 ## The life of a tracked file
 
