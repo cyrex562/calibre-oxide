@@ -145,18 +145,17 @@ pub fn upstream_calibredb() -> Option<PathBuf> {
     // `cargo test` puts `target/<profile>` (and `deps`) on PATH, which is
     // where *this port's* `calibredb` lives. Matching it would "compare"
     // the port with itself and then fail on the first upstream-only flag.
-    let ours: Vec<PathBuf> = std::env::current_exe()
+    // The whole target directory is ours, not just this profile: `cargo
+    // xtask` runs from `target/release` and puts that on PATH too.
+    let target_dir: Option<PathBuf> = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|deps| deps.to_path_buf()))
-        .into_iter()
-        .flat_map(|deps| {
-            let profile = deps.parent().map(|p| p.to_path_buf());
-            [Some(deps), profile].into_iter().flatten()
-        })
-        .filter_map(|d| d.canonicalize().ok())
-        .collect();
+        .and_then(|exe| exe.parent()?.parent()?.parent().map(|t| t.to_path_buf())) // deps -> profile -> target
+        .and_then(|t| t.canonicalize().ok());
     std::env::split_paths(&path_var)
-        .filter(|dir| !dir.canonicalize().map(|d| ours.contains(&d)).unwrap_or(false))
+        .filter(|dir| match (&target_dir, dir.canonicalize()) {
+            (Some(target), Ok(d)) => !d.starts_with(target),
+            _ => true,
+        })
         .map(|dir| dir.join(exe_name))
         .find(|candidate| candidate.is_file())
 }
