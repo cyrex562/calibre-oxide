@@ -119,8 +119,16 @@ fn optimized(img: &[u8], quality: u8) -> Vec<u8> {
     jpeg(back.as_raw(), quality)
 }
 
-fn hash(img: &[u8]) -> Option<u64> {
-    page_hash(img, W as u32, H as u32)
+/// The signature of a synthetic page, rendered at twice its size as the
+/// fingerprint's render would be.
+fn hash(img: &[u8]) -> Option<PageHash> {
+    let buf = image::GrayImage::from_raw(W as u32, H as u32, img.to_vec()).unwrap();
+    let big = image::imageops::resize(&buf, 2 * W as u32, 2 * H as u32, image::imageops::FilterType::Triangle);
+    page_signature(big.as_raw(), 2 * W as u32, 2 * H as u32).map(|(bits, mask)| PageHash { index: 0, bits, mask, blank: false })
+}
+
+fn distance(a: &PageHash, b: &PageHash) -> u32 {
+    page_distance(a, b).unwrap_or(SIGNATURE_BITS)
 }
 
 // ---------------------------------------------------------------------
@@ -129,19 +137,19 @@ fn hash(img: &[u8]) -> Option<u64> {
 
 #[test]
 fn blank_pages_have_no_hash() {
-    assert_eq!(hash(&vec![255u8; W * H]), None, "white page");
-    assert_eq!(hash(&vec![20u8; W * H]), None, "uniformly dark page");
+    assert!(hash(&vec![255u8; W * H]).is_none(), "white page");
+    assert!(hash(&vec![20u8; W * H]).is_none(), "uniformly dark page");
     let mut r = Rng(1);
-    assert_eq!(hash(&noisy(&vec![235u8; W * H], &mut r, 12.0)), None, "a blank scan: paper grain only");
+    assert!(hash(&noisy(&vec![235u8; W * H], &mut r, 12.0)).is_none(), "a blank scan: paper grain only");
     // A page holding only a page number.
     let mut img = vec![238u8; W * H];
     fill(&mut img, 122, 300, 130, 308, 40);
-    assert_eq!(hash(&img), None, "page-number-only page");
+    assert!(hash(&img).is_none(), "page-number-only page");
     // A blank scan with a dark border.
     let mut img = vec![235u8; W * H];
     fill(&mut img, 0, 0, W, 5, 25);
     fill(&mut img, 0, 0, 6, H, 25);
-    assert_eq!(hash(&noisy(&img, &mut r, 8.0)), None, "blank page with a scanner border");
+    assert!(hash(&noisy(&img, &mut r, 8.0)).is_none(), "blank page with a scanner border");
 }
 
 #[test]
@@ -167,10 +175,10 @@ fn same_pages_are_close_and_different_pages_are_far() {
             optimized(&scan_of(&original, seed + 4000, 2, 2, true, 85), 30),
         ];
         for v in &variants {
-            same.push(hamming(h, hash(v).expect("a variant of a text page is not blank")));
+            same.push(distance(&h, &hash(v).expect("a variant of a text page is not blank")));
         }
         let other = hash(&page(seed + 5000 + r.below(1000))).unwrap();
-        diff.push(hamming(h, other));
+        diff.push(distance(&h, &other));
     }
     same.sort_unstable();
     diff.sort_unstable();
@@ -246,7 +254,7 @@ fn a_fingerprint_survives_its_encoding() {
 /// random (seeded: `seed` is the book), with text from `seed` if `text`.
 fn fp(seed: u64, pages: u32, text: bool, _salt: u64) -> PdfFingerprint {
     let mut r = Rng(seed.wrapping_mul(0x1234_5678_9ABC_DEF1) | 1);
-    let hashes: Vec<PageHash> = sample_indices(pages as usize).into_iter().map(|i| PageHash { index: i as u32, hash: r.next(), blank: false }).collect();
+    let hashes: Vec<PageHash> = sample_indices(pages as usize).into_iter().map(|i| PageHash { index: i as u32, bits: [r.next(), r.next(), r.next(), r.next()], mask: [u64::MAX; 4], blank: false }).collect();
     let (has_text, text_chars, minhash) = if text { (true, 9000, super::minhash(&lorem(seed, 3000))) } else { (false, 0, Vec::new()) };
     PdfFingerprint { page_count: pages, pages: hashes, text_chars, has_text, minhash }
 }
@@ -256,8 +264,9 @@ fn rerendered(f: &PdfFingerprint, seed: u64, bits: u32) -> PdfFingerprint {
     let mut r = Rng(seed | 1);
     let mut g = f.clone();
     for p in g.pages.iter_mut().filter(|p| !p.blank) {
-        for _ in 0..r.below(bits as u64 + 1) {
-            p.hash ^= 1 << r.below(64);
+        for _ in 0..r.below(4 * bits as u64 + 1) {
+            let bit = r.below(256);
+            p.bits[(bit / 64) as usize] ^= 1 << (bit % 64);
         }
     }
     g
@@ -267,7 +276,7 @@ fn blank_all(f: &PdfFingerprint) -> PdfFingerprint {
     let mut g = f.clone();
     for p in g.pages.iter_mut() {
         p.blank = true;
-        p.hash = 0;
+        p.bits = [0; 4];
     }
     g
 }
@@ -280,8 +289,8 @@ fn with_cover_added(f: &PdfFingerprint, cover_seed: u64) -> PdfFingerprint {
     // Re-sample for the longer document, taking the original's hash for
     // every position that is the original's page `i - 1` and a fresh hash
     // for the rest (a page the original sampled nothing of).
-    let known: std::collections::HashMap<u32, u64> = f.pages.iter().map(|p| (p.index + 1, p.hash)).collect();
-    let pages = sample_indices(n as usize).into_iter().map(|i| PageHash { index: i as u32, hash: known.get(&(i as u32)).copied().unwrap_or_else(|| r.next()), blank: false }).collect();
+    let known: std::collections::HashMap<u32, [u64; 4]> = f.pages.iter().map(|p| (p.index + 1, p.bits)).collect();
+    let pages = sample_indices(n as usize).into_iter().map(|i| PageHash { index: i as u32, bits: known.get(&(i as u32)).copied().unwrap_or_else(|| [r.next(), r.next(), r.next(), r.next()]), mask: [u64::MAX; 4], blank: false }).collect();
     PdfFingerprint { page_count: n, pages, ..f.clone() }
 }
 
@@ -325,7 +334,7 @@ fn a_short_document_needs_every_page_and_equal_counts() {
     assert!(visual_match(&a, &fp(22, 2, false, 0)).is_none());
     // One page right, one wrong.
     let mut b = a.clone();
-    b.pages[1].hash = !b.pages[1].hash;
+    b.pages[1].bits = b.pages[1].bits.map(|w| !w);
     assert!(visual_match(&a, &b).is_none());
     // A page count of 3 against 2.
     let c = fp(21, 3, false, 0);
@@ -709,3 +718,4 @@ fn a_real_scan_its_ocr_copy_and_an_optimized_copy_group_and_another_book_does_no
     assert!(reasons.contains(&"pdf_ocr_variant") && reasons.contains(&"pdf_resave"), "{evidence:?}");
     assert!(outcome.pdf[&ids[1]].has_text && !outcome.pdf[&ids[0]].has_text);
 }
+

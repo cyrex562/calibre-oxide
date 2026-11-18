@@ -494,7 +494,7 @@ mod tests {
             x ^= x << 17;
             x
         };
-        let hashes = sample_indices(pages as usize).into_iter().map(|i| PageHash { index: i as u32, hash: next(), blank: false }).collect();
+        let hashes = sample_indices(pages as usize).into_iter().map(|i| PageHash::new(i as u32, [next(), next(), next(), next()])).collect();
         let text: String = (0..3000).map(|i| format!("w{} ", (i as u64).wrapping_mul(text_seed + 7) % 2500)).collect();
         PdfFingerprint { page_count: pages, pages: hashes, text_chars: if has_text { 9000 } else { 0 }, has_text, minhash: if has_text { minhash(&words(&text)) } else { Vec::new() } }
     }
@@ -518,10 +518,10 @@ mod tests {
     /// scan's last, each a few bits off.
     fn ocr_of(scan: &calibre_db::pdf_similarity::PdfFingerprint) -> calibre_db::pdf_similarity::PdfFingerprint {
         let mut ocr = fingerprint(1, scan.page_count + 1, true, 3);
-        let known: std::collections::HashMap<u32, u64> = scan.pages.iter().map(|p| (p.index + 1, p.hash ^ 0b101)).collect();
+        let known: std::collections::HashMap<u32, [u64; 4]> = scan.pages.iter().map(|p| (p.index + 1, [p.bits[0] ^ 0b101, p.bits[1], p.bits[2] ^ 0b1000, p.bits[3]])).collect();
         for p in ocr.pages.iter_mut() {
             if let Some(h) = known.get(&p.index) {
-                p.hash = *h;
+                p.bits = *h;
             }
         }
         ocr

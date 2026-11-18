@@ -220,9 +220,12 @@ disk through PDFium and cached in `.calibre-oxide/checksums.db` (table
 `pdf_fingerprints`, keyed by the BLAKE3 the scan recorded, with a `version`
 column and a recorded `failed` status for PDFs PDFium cannot open). It is a
 sidecar cache like the hashes themselves: not library metadata, not in the
-change log, recomputed after a rebuild. It holds the page count; a 64-bit
-perceptual hash of up to 8 sampled pages (first three, last three, two in the
-middle; a long side of 256 px, grayscale, margins trimmed, DCT pHash); whether
+change log, recomputed after a rebuild. It holds the page count; a 256-bit
+signature of up to 8 sampled pages (first three, last three, two in the
+middle; rendered with a long side of 640 px, cropped to its ink (found by
+binarising against the local background, scanner borders dropped), then a
+difference hash of the gray means of a 17 x 16 grid, with a mask of the bits
+too close to call); whether
 there is a text layer; and a 128-slot MinHash of the word 3-shingles of the
 first 48 pages' text.
 
@@ -233,11 +236,16 @@ each distinct content once, records PDFs it cannot read as failed (never
 retried until the algorithm's version changes), and fails without recording
 anything if PDFium is not installed.
 
-**Matching.** Never all-pairs: candidates come from multi-index hashing (four
-16-bit chunks of each page hash, indexed with the page count, looked up at
-page counts within two), and a text MinHash LSH for the text-only tier; then
+**Matching.** Never all-pairs: candidates come from bit-sampling LSH (16 tables of
+14 signature bits; two pages collide only on the same page number, give or
+take two, among documents whose page counts are within two), and a text MinHash LSH for the text-only tier; then
 the sampled pages are aligned (a cover added or dropped shifts the front, not
-the end) and compared at a Hamming distance of at most 10. A pair matches when
+the end) and compared at a distance of at most 48 of 256 bits (disagreements among the
+bits both pages trust). Measured on real PDFium renders (the ignored
+benchmark `crates/calibre_db/tests/pdf_signature_benchmark.rs`), a page
+and its scan, OCR copy or optimizer re-encode are at most 17 apart and
+different pages at least 60. Two *independent* scans of one book with
+different skew do not match by pixels; their OCR text can (`pdf_text_match`). A pair matches when
 at least 3 non-blank pages were compared and 75% match (a one- or two-page
 PDF needs equal counts and every page). Blank and near-blank pages are never
 compared.

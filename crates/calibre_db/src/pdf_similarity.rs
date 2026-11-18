@@ -25,7 +25,7 @@
 //! [`crate::checksums::ChecksumStore::record_pdf_fingerprint`]):
 //!
 //! * `page_count`;
-//! * a 64-bit perceptual hash ([`page_hash`]) of up to [`SAMPLE_PAGES`] = 8
+//! * a 256-bit page signature ([`page_signature`]) of up to [`SAMPLE_PAGES`] = 8
 //!   sampled pages: the first three, the last three and two in the middle
 //!   ([`sample_indices`]; every page of a document of 8 or fewer). The
 //!   front/back anchoring is deliberate: a scan that gained or lost a cover
@@ -36,59 +36,89 @@
 //!   [`MINHASH_LEN`]-slot MinHash of the word 3-shingles of that text
 //!   ([`minhash`]).
 //!
-//! ## The page hash
+//! ## The page signature
 //!
 //! The page is rendered by PDFium to a grayscale image with a long side of
-//! [`RENDER_LONG_SIDE`] = 256 px (`rasterize::sample_pdf_from_path`), then
-//! [`page_hash`] makes it comparable across the differences between a scan
-//! and its copy:
+//! [`RENDER_LONG_SIDE`] = 640 px (`rasterize::sample_pdf_from_path`), then
+//! [`page_signature`] makes it comparable across the differences between a
+//! scan and its copy:
 //!
-//! 1. **ink map**: the page is averaged into a fixed 48x64 grid (about 25
-//!    pixels a cell), so scanner grain and JPEG noise, a few gray levels a
-//!    cell, vanish under text, which is tens. "Ink" is a cell 40 or more gray
-//!    levels below the paper (the 90th-percentile cell);
-//! 2. **trim margins**: a scanner's dark border (an outermost row or column
-//!    more than 100 below the paper) is peeled off, a cell at a time and one
-//!    more, then the page is cropped to its ink (a row or column needs two ink
-//!    cells, so a speck of dust is not content). A shifted, bordered or
-//!    differently framed scan crops to the same text block;
-//! 3. area-average the crop to 32x32 and take its DCT; the 64 lowest-
-//!    frequency AC coefficients, each against their median, are the 64 bits
-//!    (a classic pHash, written here on plain slices: no new dependency).
+//! 1. **ink** ([`page_grids`]): a pixel is ink when it is darker than the mean
+//!    of its own neighbourhood by 8% of the paper level, so paper tone,
+//!    uneven lighting and the strength of JPEG blur do not move it;
+//! 2. **trim**: a row or column with one unbroken run of ink across more than
+//!    55% of it (gaps of two pixels allowed, for noise) is a scanner's border
+//!    and is dropped. A line of text is not, however dense: it breaks at every
+//!    word gap. The page is then cropped to its ink's 1st-99th percentile, so
+//!    a shifted, bordered or differently framed scan crops to the same text
+//!    block;
+//! 3. **signature**: the *gray* page (not the ink map, which only decides
+//!    the crop and blankness) is averaged over the crop in a 17 x 16 grid, and
+//!    each cell against its right-hand neighbour is one bit (a difference
+//!    hash, 16 x 16 = 256 bits). A pair of cells within half a gray level of
+//!    each other gives an *untrusted* bit (it is a coin flip between two
+//!    encodings), recorded in a mask; [`page_distance`] counts disagreements
+//!    among the bits both pages trust, scaled to 256, and refuses to compare
+//!    pages sharing fewer than [`MIN_TRUSTED_BITS`].
 //!
-//! A page whose ink is under 1% of its cells is **blank** (no hash, never
-//! compared): a white page, a uniformly dark one, paper grain, and a page
-//! holding only a page number all land here.
+//! Why not a DCT pHash: the pages of one book are the same gray texture (one
+//! font, one line grid), and a low-frequency transform sees only the shape of
+//! the text block, which every page shares. What tells pages apart is the
+//! content of each cell: where a paragraph ends, a heading, which words fall
+//! where. The first version (a 64-bit pHash at 256 px) matched a re-encoded
+//! scan to its own page only 55-75% of the time and to some *other* page
+//! 13-32% of the time.
+//!
+//! A page whose ink is under 2% of its pixels is **blank** (no signature,
+//! never compared): a white page, a uniformly dark one, paper grain, and a
+//! page holding only a page number all land here.
 //!
 //! # Matching
 //!
 //! Never all-pairs ([`find_pairs`]).
 //!
-//! **Candidates** come from multi-index hashing on the page hashes: each
-//! non-blank sampled page's hash is split into four 16-bit chunks and
-//! indexed under `(page_count, chunk number, chunk value)`. A fingerprint
-//! looks up its own chunks under page counts `n-2..=n+2` and a pair is a
-//! candidate when at least [`MIN_CANDIDATE_PAGES`] = 2 of its pages hit (one
-//! for a document with at most two usable pages). A posting list longer than
-//! [`MAX_POSTING`] is a chunk value that says nothing and is skipped. Chunk
-//! equality is a *filter*, not a proof: two page hashes within the match
-//! distance share a chunk only with probability roughly 35% at distance 8
-//! (about 90% at 4), so a pair is missed only if it fails that on every page:
-//! at 6 matching pages, under 10% miss at distance 8, and real re-renders of
-//! one source image are usually far closer than that. Verification, not the
-//! index, decides.
+//! **Candidates** come from bit-sampling LSH on the page signatures: 16
+//! tables, each keyed by a fixed choice of 14 of the 256 bits (a page is left
+//! out of a table where any of its 14 is untrusted). Documents are taken a
+//! page count at a time with the two counts above it, and two pages collide
+//! when they share a key *and* their page numbers are within
+//! [`MAX_PAGE_DIFF`] (a copy collides on its own page, give or take a shifted
+//! cover; anything else is chance). A pair is a candidate when at least
+//! [`MIN_CANDIDATE_PAGES`] = 2 of its sampled pages collide (one for a
+//! document with at most two usable pages). A key shared by more than
+//! [`MAX_POSTING`] pages says nothing and is skipped. A copy is found if it
+//! collides in any table: at the measured same-page distances (under 20 of
+//! 256 bits, 8%) a table hits with probability about 0.31 and some table of 16
+//! with about 99.7%, a page at a time. Random pages collide about once in
+//! 1,000 tables, and needing two aligned pages makes a random candidate pair
+//! rare (3,000 random fingerprints of near-equal length give under 3,000
+//! candidates of 4.5 million pairs). Verification, not the index, decides.
 //!
 //! **Verify** ([`visual_match`]) aligns the sample pages. Equal page counts
 //! compare the same positions. Unequal counts (a cover added, a trailing
 //! blank dropped, up to [`MAX_PAGE_DIFF`] = 2) try every shift of the front
 //! frame, with the end frame shifted by the page-count difference less that,
 //! and keep the alignment with the most matching pages. A pair of pages
-//! match at Hamming distance <= [`PAGE_MATCH_DISTANCE`] = 10 (the test
-//! `same_pages_are_close_and_different_pages_are_far` prints the evidence: on
-//! 400 synthetic scans, shifted/bordered/JPEG/downsampled copies of 80 pages,
-//! same-page distances had median 4, p90 8, p99 12, max 14, and different
-//! pages never came closer than 14 bits, p10 20, median 28. Those pages are
-//! synthetic, not PDFium renders of real books: see the PR notes). A pair of
+//! match at a [`page_distance`] of at most [`PAGE_MATCH_DISTANCE`] = 48 of
+//! 256. The evidence is the ignored benchmark
+//! `tests/pdf_signature_benchmark.rs`, on real PDFium renders of two
+//! generated 24-page Times-Roman books:
+//!
+//! | Case | Same page | Other pages |
+//! | --- | --- | --- |
+//! | clean render, other pages of the book / the other book | | min 89 / 95, median 120 |
+//! | independent scan (noise, border, tone, JPEG q75), no skew | max 14, p95 10 | min 92 |
+//! | one scan re-encoded at q85 / q50 | max 1 | min 61 |
+//! | one scan downsampled x0.5 at q30 / x0.35 at q20 | max 17 / 15 | min 66 / 60 |
+//! | independent scan skewed 0.4 or 0.8 degrees | 107-154 | 88-162 |
+//!
+//! Every page got a signature in every case. The last row is a limit: two
+//! *independent* scans of one book on different scanners, with different
+//! skew, do not match by pixels (their OCR text can, as `pdf_text_match`).
+//! What this finds is one scan and the copies made from it: OCR'd, optimised,
+//! re-saved. The unit test `same_pages_are_close_and_different_pages_are_far`
+//! checks the same on synthetic pages (400 shifted, bordered, JPEG and
+//! downsampled copies of 80: same-page max 41, other pages min 90). A pair of
 //! documents matches visually when at least [`MIN_COMPARED`] = 3 non-blank
 //! pages were compared and at least 75% of them match. A document of one or
 //! two pages needs equal page counts and *every* page to match, and gets a
@@ -111,8 +141,10 @@
 //!
 //! # What can go wrong
 //!
-//! * **Pages that look alike.** A 64-bit pHash of a text page is coarse; two
-//!   books from one publisher template can land close. The guards are the 75%
+//! * **Pages that look alike.** Different pages of one book come no closer
+//!   than about 90 of 256 bits on clean renders, but a scan's pages are
+//!   closer to each other (60 at worst above) than clean ones, and two books
+//!   from one publisher template are untested. The guards are the 75%
 //!   and 3-page rules, the blank rule, the text-disagreement rule above, and
 //!   that the alignment is chosen by matches, so the number it needs is
 //!   already a best case.
@@ -132,21 +164,24 @@ use serde::Serialize;
 use crate::cache::Cache;
 use crate::scan_pipeline::{format_file_path, parallel_map, JobControl, PipelineOptions};
 
+mod ink;
+pub use ink::{ink_grid, page_grids, PageGrids};
+
 /// Bump when the hash, sampling or MinHash changes: every row with another
 /// version is recomputed.
-pub const FINGERPRINT_VERSION: u32 = 1;
+pub const FINGERPRINT_VERSION: u32 = 2;
 /// Pages hashed per PDF.
 pub const SAMPLE_PAGES: usize = 8;
 /// Long side of the render the hash is made from.
-pub const RENDER_LONG_SIDE: u32 = 256;
+pub const RENDER_LONG_SIDE: u32 = 640;
 /// Pages (from the start) whose text is read.
 pub const TEXT_PAGES: usize = 48;
 /// A text layer is at least this many letters or digits a page, on average.
 pub const MIN_TEXT_CHARS_PER_PAGE: u32 = 20;
 /// Slots in a text MinHash.
 pub const MINHASH_LEN: usize = 128;
-/// Hamming distance, in bits of 64, at or under which two pages are the same.
-pub const PAGE_MATCH_DISTANCE: u32 = 10;
+/// [`page_distance`], in bits of 256, at or under which two pages are the same.
+pub const PAGE_MATCH_DISTANCE: u32 = 48;
 /// Fraction of compared pages that must match.
 pub const MATCH_FRACTION: f32 = 0.75;
 /// Non-blank pages that must be compared (documents of up to two pages
@@ -158,6 +193,11 @@ pub const MAX_PAGE_DIFF: u32 = 2;
 pub const MIN_CANDIDATE_PAGES: u32 = 2;
 /// An index posting list longer than this is ignored.
 pub const MAX_POSTING: usize = 200;
+/// Trusted bits two pages must share to be compared at all.
+pub const MIN_TRUSTED_BITS: u32 = 64;
+/// Bits sampled for one table of the page index, and the number of tables.
+const TABLE_BITS: usize = 14;
+const TABLES: usize = 16;
 /// Jaccard at or above which two text layers are the same text.
 pub const SAME_TEXT_JACCARD: f32 = 0.8;
 /// Jaccard below which two text layers are different books.
@@ -178,196 +218,74 @@ pub const TINY_PENALTY: f32 = 0.85;
 // The page hash
 // ---------------------------------------------------------------------
 
-/// One sampled page.
+/// One sampled page: a 256-bit signature, and which of its bits are to be
+/// trusted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageHash {
     /// 0-based page number.
     pub index: u32,
-    /// Zero when `blank`.
-    pub hash: u64,
+    /// The signature bits; zero when `blank`.
+    pub bits: [u64; 4],
+    /// The bits whose comparison was decisive when the page was read. A bit
+    /// that is not set is a coin flip between two encodings of one scan, so
+    /// [`page_distance`] ignores it.
+    pub mask: [u64; 4],
     pub blank: bool,
 }
 
-/// How many bits differ.
-pub fn hamming(a: u64, b: u64) -> u32 {
-    (a ^ b).count_ones()
+impl PageHash {
+    /// A page whose every bit is trusted.
+    pub fn new(index: u32, bits: [u64; 4]) -> Self {
+        PageHash { index, bits, mask: [u64::MAX; 4], blank: false }
+    }
+
+    pub fn blank(index: u32) -> Self {
+        PageHash { index, bits: [0; 4], mask: [0; 4], blank: true }
+    }
 }
 
-/// The ink map's grid, and what counts as ink in it. A cell is the mean of
-/// about 25 pixels of a 256 px render; "deficit" is how far it is below the
-/// paper (the 90th percentile cell).
-const GRID_W: usize = 48;
-const GRID_H: usize = 64;
-const INK_DEFICIT: f32 = 40.0;
-/// A border line (the outermost row or column) darker than this is a scanner
-/// edge, not content.
-const BORDER_DEFICIT: f32 = 100.0;
-const BORDER_MAX_CELLS: usize = 6;
-/// A page with less ink than this share of its cells is blank.
-const MIN_INK_PERCENT: usize = 1;
+/// Columns and rows of the grid of cell means a page is reduced to. One bit a
+/// pair of neighbouring cells in a row: 16 x 16 = 256 bits.
+const GRID_COLS: usize = 17;
+const GRID_ROWS: usize = 16;
+/// Bits in a signature.
+pub const SIGNATURE_BITS: u32 = 256;
+/// A cell that differs from its right-hand neighbour by no more than this many
+/// gray levels (of 255) gives an *untrusted* bit.
+const BIT_MARGIN: f32 = 0.5;
 
-/// `(u, v)` of the 64 DCT coefficients that make the hash, low frequency
-/// first, DC excluded.
-fn coefficient_order() -> Vec<(usize, usize)> {
-    let mut all: Vec<(usize, usize)> = (0..=8).flat_map(|u| (0..=8).map(move |v| (u, v))).filter(|&(u, v)| u + v >= 1).collect();
-    all.sort_by_key(|&(u, v)| (u + v, u));
-    all.truncate(64);
-    all
-}
-
-/// Hashes one grayscale page (one byte a pixel, row-major). `None` for a
-/// blank page. See the module docs for what it does.
-pub fn page_hash(gray: &[u8], width: u32, height: u32) -> Option<u64> {
-    analyse_page(gray, width, height).map(|a| a.0)
-}
-
-/// [`page_hash`] and the crop it hashed `(x0, x1, y0, y1)` in 2x2-downsampled
-/// pixels, for the tests that tune it.
-pub(crate) fn analyse_page(gray: &[u8], width: u32, height: u32) -> Option<(u64, (usize, usize, usize, usize))> {
-    let (w, h) = (width as usize, height as usize);
-    if w < GRID_W || h < GRID_H || gray.len() < w * h {
-        return None;
-    }
-
-    // An ink map: the mean of each cell of a fixed grid, against the paper.
-    // Averaging over a cell of ~25 pixels is what makes it robust: scanner and
-    // JPEG noise is a few gray levels per cell, text is tens.
-    let mut cells = vec![0f32; GRID_W * GRID_H];
-    for cy in 0..GRID_H {
-        let (y0, y1) = (cy * h / GRID_H, ((cy + 1) * h / GRID_H).max(cy * h / GRID_H + 1));
-        for cx in 0..GRID_W {
-            let (x0, x1) = (cx * w / GRID_W, ((cx + 1) * w / GRID_W).max(cx * w / GRID_W + 1));
-            let mut sum = 0u32;
-            for y in y0..y1 {
-                sum += gray[y * w + x0..y * w + x1].iter().map(|&v| v as u32).sum::<u32>();
-            }
-            cells[cy * GRID_W + cx] = sum as f32 / ((y1 - y0) * (x1 - x0)) as f32;
-        }
-    }
-    let mut sorted = cells.clone();
-    sorted.sort_by(|a, b| a.total_cmp(b));
-    let paper = sorted[sorted.len() * 9 / 10];
-    let deficit: Vec<f32> = cells.iter().map(|v| (paper - v).max(0.0)).collect();
-
-    // Peel a dark scanner border: while the outermost line is mostly very
-    // dark, drop it (and one more, for the sliver of a cell it only partly
-    // covers).
-    let (mut l, mut r, mut t, mut b) = (0usize, GRID_W, 0usize, GRID_H);
-    let mut peeled = [false; 4];
-    for _ in 0..BORDER_MAX_CELLS {
-        let mean = |cells: &mut dyn Iterator<Item = usize>| -> f32 {
-            let (mut sum, mut n) = (0f32, 0f32);
-            for i in cells {
-                sum += deficit[i];
-                n += 1.0;
-            }
-            if n > 0.0 {
-                sum / n
-            } else {
-                0.0
-            }
-        };
-        let mut moved = false;
-        if r > l + 2 && b > t + 2 {
-            if mean(&mut (l..r).map(|x| t * GRID_W + x)) > BORDER_DEFICIT {
-                t += 1;
-                peeled[0] = true;
-                moved = true;
-            }
-            if mean(&mut (l..r).map(|x| (b - 1) * GRID_W + x)) > BORDER_DEFICIT {
-                b -= 1;
-                peeled[1] = true;
-                moved = true;
-            }
-            if mean(&mut (t..b).map(|y| y * GRID_W + l)) > BORDER_DEFICIT {
-                l += 1;
-                peeled[2] = true;
-                moved = true;
-            }
-            if mean(&mut (t..b).map(|y| y * GRID_W + r - 1)) > BORDER_DEFICIT {
-                r -= 1;
-                peeled[3] = true;
-                moved = true;
-            }
-        }
-        if !moved {
-            break;
-        }
-    }
-    if peeled[0] {
-        t += 1;
-    }
-    if peeled[1] {
-        b -= 1;
-    }
-    if peeled[2] {
-        l += 1;
-    }
-    if peeled[3] {
-        r -= 1;
-    }
-    if r <= l + 2 || b <= t + 2 {
-        return None;
-    }
-
-    // Where the ink is.
-    let ink = |x: usize, y: usize| deficit[y * GRID_W + x] > INK_DEFICIT;
-    let total_ink = (t..b).map(|y| (l..r).filter(|&x| ink(x, y)).count()).sum::<usize>();
-    if total_ink * 100 < MIN_INK_PERCENT * GRID_W * GRID_H {
-        return None;
-    }
-    // A row or column needs two ink cells to count: a speck is not content.
-    let rows: Vec<usize> = (t..b).filter(|&y| (l..r).filter(|&x| ink(x, y)).count() >= 2).collect();
-    let cols: Vec<usize> = (l..r).filter(|&x| (t..b).filter(|&y| ink(x, y)).count() >= 2).collect();
-    let (&c0, &c1) = (cols.first()?, cols.last()?);
-    let (&r0, &r1) = (rows.first()?, rows.last()?);
-    let (c0, c1) = widen(c0, c1 + 1, GRID_W);
-    let (r0, r1) = widen(r0, r1 + 1, GRID_H);
-
-    // The crop, in pixels, to 32x32 by area average.
-    let (px0, px1) = (c0 * w / GRID_W, (c1 * w / GRID_W).max(c0 * w / GRID_W + 1));
-    let (py0, py1) = (r0 * h / GRID_H, (r1 * h / GRID_H).max(r0 * h / GRID_H + 1));
-    const N: usize = 32;
-    let mut block = [[0f32; N]; N];
-    for (ty, line) in block.iter_mut().enumerate() {
-        let sy0 = py0 + ty * (py1 - py0) / N;
-        let sy1 = (py0 + (ty + 1) * (py1 - py0) / N).max(sy0 + 1).min(h);
-        for (tx, cell) in line.iter_mut().enumerate() {
-            let sx0 = px0 + tx * (px1 - px0) / N;
-            let sx1 = (px0 + (tx + 1) * (px1 - px0) / N).max(sx0 + 1).min(w);
-            let mut sum = 0u32;
-            let mut n = 0u32;
-            for sy in sy0..sy1 {
-                for &v in &gray[sy * w + sx0..sy * w + sx1] {
-                    sum += v as u32;
-                    n += 1;
+/// The signature of one grayscale page (one byte a pixel, row-major) as
+/// `(bits, trusted)`; `None` for a blank page. See the module docs.
+pub fn page_signature(gray: &[u8], width: u32, height: u32) -> Option<([u64; 4], [u64; 4])> {
+    let grids = page_grids(gray, width, height, GRID_COLS, GRID_ROWS)?;
+    let (mut bits, mut mask) = ([0u64; 4], [0u64; 4]);
+    for y in 0..GRID_ROWS {
+        for x in 0..GRID_COLS - 1 {
+            let diff = grids.mean[y * GRID_COLS + x + 1] - grids.mean[y * GRID_COLS + x];
+            let bit = y * (GRID_COLS - 1) + x;
+            if diff.abs() > BIT_MARGIN {
+                mask[bit / 64] |= 1 << (bit % 64);
+                if diff > 0.0 {
+                    bits[bit / 64] |= 1 << (bit % 64);
                 }
             }
-            *cell = if n > 0 { sum as f32 / n as f32 } else { 0.0 };
         }
     }
+    Some((bits, mask))
+}
 
-    // Separable DCT, only the coefficients that can be wanted (u, v <= 8).
-    let cos: Vec<[f32; N]> = (0..=8).map(|u| std::array::from_fn(|x| (((2 * x + 1) as f32) * (u as f32) * std::f32::consts::PI / (2.0 * N as f32)).cos())).collect();
-    let mut rows_dct = [[0f32; 9]; N];
-    for y in 0..N {
-        for (u, c) in cos.iter().enumerate() {
-            rows_dct[y][u] = (0..N).map(|x| block[y][x] * c[x]).sum();
-        }
+/// How far apart two pages are, in bits out of [`SIGNATURE_BITS`]: the
+/// disagreements among the bits both trust, scaled up to the full width. `None`
+/// when they trust fewer than [`MIN_TRUSTED_BITS`] in common (a nearly empty
+/// page says too little to compare).
+pub fn page_distance(a: &PageHash, b: &PageHash) -> Option<u32> {
+    let (mut both, mut bad) = (0u32, 0u32);
+    for i in 0..4 {
+        let common = a.mask[i] & b.mask[i];
+        both += common.count_ones();
+        bad += ((a.bits[i] ^ b.bits[i]) & common).count_ones();
     }
-    let coefficient = |u: usize, v: usize| -> f32 { (0..N).map(|y| rows_dct[y][u] * cos[v][y]).sum() };
-    let order = coefficient_order();
-    let values: Vec<f32> = order.iter().map(|&(u, v)| coefficient(u, v)).collect();
-    let mut sorted = values.clone();
-    sorted.sort_by(|a, b| a.total_cmp(b));
-    let median = (sorted[31] + sorted[32]) / 2.0;
-    let mut hash = 0u64;
-    for (bit, value) in values.iter().enumerate() {
-        if *value > median {
-            hash |= 1 << bit;
-        }
-    }
-    Some((hash, (px0, px1, py0, py1)))
+    (both >= MIN_TRUSTED_BITS).then(|| bad * SIGNATURE_BITS / both)
 }
 
 /// A crop narrower than a quarter of the page (a single line of text) is
@@ -460,25 +378,33 @@ impl PdfFingerprint {
         self.pages.iter().filter(|p| !p.blank).count()
     }
 
-    /// `index (4) | hash (8) | blank (1)` a page.
+    /// `index (4) | blank (1) | bits (32) | trusted mask (32)` a page.
     pub fn encode_pages(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.pages.len() * 13);
+        let mut out = Vec::with_capacity(self.pages.len() * PAGE_RECORD);
         for p in &self.pages {
             out.extend_from_slice(&p.index.to_le_bytes());
-            out.extend_from_slice(&p.hash.to_le_bytes());
             out.push(p.blank as u8);
+            for w in p.bits.iter().chain(&p.mask) {
+                out.extend_from_slice(&w.to_le_bytes());
+            }
         }
         out
     }
 
     pub fn decode_pages(bytes: &[u8]) -> Option<Vec<PageHash>> {
-        if bytes.len() % 13 != 0 {
+        if bytes.len() % PAGE_RECORD != 0 {
             return None;
         }
+        let word = |c: &[u8], i: usize| u64::from_le_bytes(c[5 + 8 * i..13 + 8 * i].try_into().unwrap());
         Some(
             bytes
-                .chunks_exact(13)
-                .map(|c| PageHash { index: u32::from_le_bytes(c[0..4].try_into().unwrap()), hash: u64::from_le_bytes(c[4..12].try_into().unwrap()), blank: c[12] != 0 })
+                .chunks_exact(PAGE_RECORD)
+                .map(|c| PageHash {
+                    index: u32::from_le_bytes(c[0..4].try_into().unwrap()),
+                    blank: c[4] != 0,
+                    bits: [word(c, 0), word(c, 1), word(c, 2), word(c, 3)],
+                    mask: [word(c, 4), word(c, 5), word(c, 6), word(c, 7)],
+                })
                 .collect(),
         )
     }
@@ -521,9 +447,9 @@ pub fn fingerprint_sampled(sampled: &calibre_ebooks::pdf::rasterize::SampledPdf)
     let pages: Vec<PageHash> = sampled
         .pages
         .iter()
-        .map(|p| match page_hash(&p.gray, p.width, p.height) {
-            Some(hash) => PageHash { index: p.index as u32, hash, blank: false },
-            None => PageHash { index: p.index as u32, hash: 0, blank: true },
+        .map(|p| match page_signature(&p.gray, p.width, p.height) {
+            Some((bits, mask)) => PageHash { index: p.index as u32, bits, mask, blank: false },
+            None => PageHash::blank(p.index as u32),
         })
         .collect();
 
@@ -601,9 +527,10 @@ pub fn visual_match(a: &PdfFingerprint, b: &PdfFingerprint) -> Option<VisualMatc
                 if !(front || back) || seen.contains(&(pa.index, pb.index)) {
                     continue;
                 }
+                // A page too empty to compare says nothing either way.
+                let Some(d) = page_distance(pa, pb) else { continue };
                 seen.push((pa.index, pb.index));
                 compared += 1;
-                let d = hamming(pa.hash, pb.hash);
                 if d <= PAGE_MATCH_DISTANCE {
                     matched += 1;
                     distance_sum += d;
@@ -675,6 +602,8 @@ pub fn classify(a: &PdfFingerprint, b: &PdfFingerprint) -> Option<PdfMatch> {
 
 const BANDS: usize = 16;
 const ROWS: usize = MINHASH_LEN / BANDS;
+/// Bytes a page takes in the sidecar: index, blank flag, bits, trusted mask.
+const PAGE_RECORD: usize = 4 + 1 + 32 + 32;
 
 /// What [`find_pairs`] did, for the scale tests and the logs.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -684,7 +613,8 @@ pub struct IndexStats {
     pub candidates: usize,
     /// Pairs that were verified as a match.
     pub matches: usize,
-    /// Posting lists skipped for being longer than [`MAX_POSTING`].
+    /// Groups of colliding entries skipped for being larger than
+    /// [`MAX_POSTING`].
     pub skipped_postings: usize,
 }
 
@@ -704,79 +634,147 @@ fn band_key(minhash: &[u16], band: usize) -> u64 {
     h
 }
 
+/// Which [`TABLE_BITS`] of the 256 signature bits each of the [`TABLES`]
+/// tables samples. Fixed, so an index built later agrees with one built now.
+fn table_layout() -> Vec<[u8; TABLE_BITS]> {
+    (0..TABLES)
+        .map(|t| {
+            let mut chosen = [0u8; TABLE_BITS];
+            let mut used = [false; 256];
+            let mut n = 0;
+            let mut counter = 0u64;
+            while n < TABLE_BITS {
+                let bit = (splitmix(t as u64 * 7919 + counter) % 256) as usize;
+                counter += 1;
+                if !used[bit] {
+                    used[bit] = true;
+                    chosen[n] = bit as u8;
+                    n += 1;
+                }
+            }
+            chosen
+        })
+        .collect()
+}
+
+/// A page's key in one table: the sampled bits, or `None` if any of them is
+/// untrusted (a key with a coin-flip bit in it would not match its own copy).
+fn page_key(page: &PageHash, positions: &[u8; TABLE_BITS]) -> Option<u64> {
+    let mut key = 0u64;
+    for (n, &bit) in positions.iter().enumerate() {
+        let (word, shift) = (bit as usize / 64, bit as usize % 64);
+        if page.mask[word] >> shift & 1 == 0 {
+            return None;
+        }
+        key |= (page.bits[word] >> shift & 1) << n;
+    }
+    Some(key)
+}
+
+struct Entry {
+    key: u64,
+    pc: u32,
+    id: u32,
+    slot: u16,
+    /// The sampled page's index (0 for a MinHash band).
+    page: u32,
+}
+
+/// Records, in `hits`, every pair of entries that share a key, whose page
+/// counts are within [`MAX_PAGE_DIFF`] and of which the lower is `anchor`:
+/// the pair `(lower id, higher id)` maps to a bitmask of the lower id's slots
+/// that collided. A group of more than [`MAX_POSTING`] colliding entries is a
+/// key that says nothing (a near-empty page) and is skipped.
+fn collide(mut entries: Vec<Entry>, anchor: u32, hits: &mut HashMap<(u32, u32), u16>, skipped: &mut usize) {
+    entries.sort_unstable_by_key(|e| (e.key, e.pc, e.id));
+    let mut start = 0;
+    while start < entries.len() {
+        let mut end = start + 1;
+        while end < entries.len() && entries[end].key == entries[start].key {
+            end += 1;
+        }
+        let group = &entries[start..end];
+        start = end;
+        if group.len() > MAX_POSTING {
+            *skipped += 1;
+            continue;
+        }
+        for (i, a) in group.iter().enumerate() {
+            if a.pc != anchor {
+                continue;
+            }
+            for b in &group[i + 1..] {
+                if b.pc - a.pc > MAX_PAGE_DIFF {
+                    break;
+                }
+                // A copy collides on its own page, give or take the shift a
+                // changed page count allows; any other collision is chance.
+                if a.id == b.id || a.page.abs_diff(b.page) > MAX_PAGE_DIFF {
+                    continue;
+                }
+                let (lo, hi, slot) = if a.id < b.id { (a.id, b.id, a.slot) } else { (b.id, a.id, b.slot) };
+                *hits.entry((lo, hi)).or_insert(0) |= 1 << slot;
+            }
+        }
+    }
+}
+
 /// Every matching pair among `fps`, by the index and then verification.
 /// Work grows with the number of *candidate* pairs, not with `n^2`.
+///
+/// Fingerprints are taken a page count at a time (with the two counts above
+/// it, which is how far a scan may differ), so the working set is a few
+/// hundred documents however large the library: for each of [`TABLES`] tables,
+/// every non-blank sampled page whose [`TABLE_BITS`] sampled bits are all
+/// trusted is keyed by them, and pages that share a key are paired.
 pub fn find_pairs(fps: &[PdfFingerprint]) -> (Vec<PdfPair>, IndexStats) {
+    use std::collections::BTreeMap;
     let mut stats = IndexStats { fingerprints: fps.len(), ..Default::default() };
+    let layout = table_layout();
 
-    let mut visual: HashMap<(u32, u8, u16), Vec<u32>> = HashMap::new();
-    let mut text: HashMap<(u32, u8, u64), Vec<u32>> = HashMap::new();
+    let mut by_count: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
     for (i, fp) in fps.iter().enumerate() {
-        for p in fp.pages.iter().filter(|p| !p.blank) {
-            for c in 0..4u8 {
-                let chunk = (p.hash >> (16 * c as u32)) as u16;
-                let list = visual.entry((fp.page_count, c, chunk)).or_default();
-                if list.last() != Some(&(i as u32)) {
-                    list.push(i as u32);
-                }
-            }
-        }
-        if fp.minhash.len() == MINHASH_LEN {
-            for band in 0..BANDS {
-                text.entry((fp.page_count, band as u8, band_key(&fp.minhash, band))).or_default().push(i as u32);
-            }
-        }
+        by_count.entry(fp.page_count).or_default().push(i);
     }
-    stats.skipped_postings = visual.values().filter(|l| l.len() > MAX_POSTING).count() + text.values().filter(|l| l.len() > MAX_POSTING).count();
 
     let mut pairs = Vec::new();
-    for (i, fp) in fps.iter().enumerate() {
-        let mut hits: HashMap<u32, u32> = HashMap::new();
-        let usable: Vec<&PageHash> = fp.pages.iter().filter(|p| !p.blank).collect();
-        for p in usable.iter() {
-            let mut slot_hits: Vec<u32> = Vec::new();
-            for pc in fp.page_count.saturating_sub(MAX_PAGE_DIFF)..=fp.page_count + MAX_PAGE_DIFF {
-                for c in 0..4u8 {
-                    let chunk = (p.hash >> (16 * c as u32)) as u16;
-                    if let Some(list) = visual.get(&(pc, c, chunk)) {
-                        if list.len() > MAX_POSTING {
-                            continue;
-                        }
-                        slot_hits.extend(list.iter().copied().filter(|&j| j as usize > i));
-                    }
-                }
-            }
-            slot_hits.sort_unstable();
-            slot_hits.dedup();
-            for j in slot_hits {
-                *hits.entry(j).or_insert(0) += 1;
-            }
-        }
-        let needed = MIN_CANDIDATE_PAGES.min(usable.len() as u32).max(1);
-        let mut candidates: Vec<u32> = hits.into_iter().filter(|&(_, n)| n >= needed).map(|(j, _)| j).collect();
+    for &anchor in by_count.keys() {
+        let window: Vec<usize> = by_count.range(anchor..=anchor + MAX_PAGE_DIFF).flat_map(|(_, ids)| ids.iter().copied()).collect();
+        let mut hits: HashMap<(u32, u32), u16> = HashMap::new();
 
-        if fp.minhash.len() == MINHASH_LEN {
-            for pc in fp.page_count.saturating_sub(MAX_PAGE_DIFF)..=fp.page_count + MAX_PAGE_DIFF {
-                for band in 0..BANDS {
-                    if let Some(list) = text.get(&(pc, band as u8, band_key(&fp.minhash, band))) {
-                        if list.len() > MAX_POSTING {
-                            continue;
-                        }
-                        candidates.extend(list.iter().copied().filter(|&j| j as usize > i));
+        for positions in &layout {
+            let mut entries = Vec::new();
+            for &i in &window {
+                let fp = &fps[i];
+                for (slot, page) in fp.pages.iter().filter(|p| !p.blank).enumerate() {
+                    if let Some(key) = page_key(page, positions) {
+                        entries.push(Entry { key, pc: fp.page_count, id: i as u32, slot: slot as u16, page: page.index });
                     }
                 }
             }
+            collide(entries, anchor, &mut hits, &mut stats.skipped_postings);
         }
-        candidates.sort_unstable();
-        candidates.dedup();
-        stats.candidates += candidates.len();
-        for j in candidates {
-            if let Some(found) = classify(fp, &fps[j as usize]) {
+        for band in 0..BANDS {
+            let entries: Vec<Entry> = window.iter().filter(|&&i| fps[i].minhash.len() == MINHASH_LEN).map(|&i| Entry { key: band_key(&fps[i].minhash, band), pc: fps[i].page_count, id: i as u32, slot: 8, page: 0 }).collect();
+            collide(entries, anchor, &mut hits, &mut stats.skipped_postings);
+        }
+
+        let mut candidates: Vec<((u32, u32), u16)> = hits.into_iter().collect();
+        candidates.sort_unstable_by_key(|(pair, _)| *pair);
+        for ((lo, hi), mask) in candidates {
+            let (a, b) = (&fps[lo as usize], &fps[hi as usize]);
+            let needed = MIN_CANDIDATE_PAGES.min(a.usable_pages().min(b.usable_pages()) as u32).max(1);
+            if (mask & 0xFF).count_ones() < needed && mask & 0x100 == 0 {
+                continue;
+            }
+            stats.candidates += 1;
+            if let Some(found) = classify(a, b) {
                 stats.matches += 1;
-                pairs.push(PdfPair { a: i, b: j as usize, found });
+                pairs.push(PdfPair { a: lo as usize, b: hi as usize, found });
             }
         }
     }
+    pairs.sort_by_key(|p| (p.a, p.b));
     (pairs, stats)
 }
 
@@ -786,8 +784,7 @@ pub fn find_pairs(fps: &[PdfFingerprint]) -> (Vec<PdfPair>, IndexStats) {
 
 /// Most files read at once. PDFium serialises its calls (`thread_safe`), so
 /// extra workers overlap only the hashing and the disk wait; two is what that
-/// can use. (Not measured against a real PDFium in the tranche-9 sandbox: see
-/// the PR notes.)
+/// can use. (Not tuned by measurement.)
 pub const MAX_FINGERPRINT_WORKERS: usize = 2;
 
 /// What the fingerprint job did.
