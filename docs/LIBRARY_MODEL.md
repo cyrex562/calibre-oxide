@@ -195,6 +195,17 @@ Rules that keep this from flooding the user:
   (`calibre_db::junk_metadata`) serves both extraction and dedupe, so libraries
   imported before it benefit too. PDF Info strings in UTF-16 (BOM `FE FF` /
   `FF FE`) are decoded, not rendered as `?? G U R P S`.
+- **Content vetoes a title match.** A title-tier pair (`title_author_exact`,
+  `title_author_fuzzy`) is dropped, before grouping, when both books are PDFs
+  with current fingerprints, the page comparison did not match them, and their
+  content plainly differs: page counts more than 10% (and more than 2) apart, or
+  three or more usable pages each, no visual alignment, and text layers with
+  Jaccard under 0.3. Fifteen volumes of one periodical no longer form a group.
+- **A template-leftover title is junk.** An embedded title carried by 5 or more
+  books holding different files, and not resembling most of those books' file
+  names (`Nathanael-Roux_Affinity-Publisher_Template-PHB_v0.1` on 196 unrelated
+  PDFs), gives no title evidence. A title that resembles the file names
+  (`Collected Poems` five times) is real.
 - **Zero-byte files are never content duplicates** (they all share the hash of
   nothing) and are never in the bulk `merge-exact` plan. The scan response lists
   them separately as `empty_files` / `empty_file_count`, and the duplicates
@@ -279,8 +290,10 @@ compared.
 | Reason | Evidence | Confidence |
 | --- | --- | --- |
 | `pdf_resave` | same pages; same text (MinHash similarity at least 0.8) or no text on either | 0.85 |
-| `pdf_ocr_variant` | same pages; exactly one has a text layer, or both do with *distinctive* similarity 0.5-0.8 over at least 64 distinctive slots (two OCR runs) | 0.80 / 0.75 |
+| `pdf_ocr_variant` | same pages; exactly one has a text layer, or both do, **both are scanned (image pages)**, with *distinctive* similarity 0.5-0.8 over at least 64 distinctive slots (two OCR runs) | 0.80 / 0.75 |
 | `pdf_text_match` | different pages, but both have text, *distinctive* similarity at least 0.9 over at least 64 distinctive slots, page counts within 2 | 0.60 |
+
+*Scanned* (fingerprint version 3) means at least 75% of the sampled pages have an image object covering 80% or more of the page. Two OCR runs are text over page images; short born-digital documents on one layout (instruction-set reference pages, a series of character sheets) are never OCR variants of each other, and a pair where either side is not scanned is not matched this way.
 
 *Distinctive* means the text boilerplate is left out: a MinHash slot value held
 by at least `max(5, 0.5%)` of the library's documents is a shingle many

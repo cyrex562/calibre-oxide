@@ -131,8 +131,17 @@
 //! | exactly one side has a text layer | `pdf_ocr_variant` | 0.80 |
 //! | neither has text | `pdf_resave` | 0.85 |
 //! | both have text, MinHash Jaccard >= 0.8 | `pdf_resave` | 0.85 |
-//! | both have text, 0.5 <= *distinctive* Jaccard < 0.8, over at least 64 distinctive slots | `pdf_ocr_variant` (two OCR runs) | 0.75 |
+//! | both have text, **both scanned**, 0.5 <= *distinctive* Jaccard < 0.8, over at least 64 distinctive slots | `pdf_ocr_variant` (two OCR runs) | 0.75 |
 //! | both have text, anything lower | *no match*: the same look but other words is a different book (a template) | |
+//!
+//! **Scanned** (fingerprint version 3): at least 75% of the sampled pages have
+//! an image object covering 80% or more of the page. Two OCR runs of one scan
+//! are text laid over page images; the real trial still produced nine false
+//! `pdf_ocr_variant`s from the both-text sub-tier, every one a short born-digital
+//! document on a shared layout (x86 instruction reference pages `MOVHPS`/`MOVLPS`,
+//! `CLC`/`CLD`; `Booster Set Guide - Cyberpunk`/`- Dystopian`; `AWN`/`CWN -
+//! Character Sheet`), whose pages are vector text and no images. A pair where
+//! either side is not scanned is not an OCR variant of each other.
 //!
 //! "Distinctive" is the point of tranche 11. Two OCR runs of one scan share
 //! almost every content word (a recognition error costs only the three
@@ -203,7 +212,7 @@ pub use ink::{ink_grid, page_grids, PageGrids};
 
 /// Bump when the hash, sampling or MinHash changes: every row with another
 /// version is recomputed.
-pub const FINGERPRINT_VERSION: u32 = 2;
+pub const FINGERPRINT_VERSION: u32 = 3;
 /// Pages hashed per PDF.
 pub const SAMPLE_PAGES: usize = 8;
 /// Long side of the render the hash is made from.
@@ -485,6 +494,10 @@ pub struct PdfFingerprint {
     /// Letters and digits over the pages whose text was read.
     pub text_chars: u32,
     pub has_text: bool,
+    /// The sampled pages are images: at least 75% of them have an image
+    /// object covering 80% or more of the page (a scan, with or without an
+    /// invisible OCR text layer). A born-digital PDF is not.
+    pub scanned: bool,
     /// Empty if there is no text (or under three words).
     pub minhash: Vec<u16>,
 }
@@ -575,7 +588,8 @@ pub fn fingerprint_sampled(sampled: &calibre_ebooks::pdf::rasterize::SampledPdf)
     let pages_read = sampled.text.len().max(1) as u32;
     let has_text = text_chars >= MIN_TEXT_CHARS_PER_PAGE * pages_read;
     let minhash = if has_text { minhash(&words(&all_text)) } else { Vec::new() };
-    Ok(PdfFingerprint { page_count: sampled.page_count as u32, pages, text_chars, has_text, minhash })
+    let scanned = !sampled.pages.is_empty() && sampled.pages.iter().filter(|p| p.image_page).count() * 4 >= sampled.pages.len() * 3;
+    Ok(PdfFingerprint { page_count: sampled.page_count as u32, pages, text_chars, has_text, scanned, minhash })
 }
 
 /// Fingerprints the PDF at `path`, reading it once through PDFium's file
@@ -714,6 +728,9 @@ pub fn classify_with(a: &PdfFingerprint, b: &PdfFingerprint, stops: &StopSlots) 
                 // text: two OCR runs of one scan, or two documents on one
                 // template. Only the words that are *not* library-wide
                 // boilerplate can tell them apart.
+                // Two OCR runs are runs over *images*: born-digital pages with
+                // real text are never OCR variants of each other.
+                _ if !(a.scanned && b.scanned) => return None,
                 _ => match distinctive_jaccard(&a.minhash, &b.minhash, stops) {
                     Some((j, n)) if n >= MIN_DISTINCTIVE_SLOTS && j >= DIFFERENT_TEXT_JACCARD => (PdfKind::OcrVariant, CONFIDENCE_OCR_TWO_LAYERS, format!("different text layers (similarity {j:.2})")),
                     // The same look, other words: a template, not a copy.

@@ -292,6 +292,15 @@ impl ChecksumStore {
                 let _ = conn.execute(&format!("ALTER TABLE checksums_db.file_checksums ADD COLUMN {column} INTEGER"), ());
             }
         }
+        // `scanned` (fingerprint version 3): whether the PDF's pages are
+        // images. Rows of older versions are recomputed anyway.
+        let has_scanned: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('pdf_fingerprints', 'checksums_db') WHERE name = 'scanned'")
+            .and_then(|mut stmt| stmt.exists([]))
+            .unwrap_or(false);
+        if !has_scanned {
+            let _ = conn.execute("ALTER TABLE checksums_db.pdf_fingerprints ADD COLUMN scanned INTEGER NOT NULL DEFAULT 0", ());
+        }
         Ok(())
     }
 
@@ -777,9 +786,9 @@ impl ChecksumStore {
         match outcome {
             Ok(fp) => conn.execute(
                 "INSERT OR REPLACE INTO checksums_db.pdf_fingerprints
-                 (blake3_hex, version, status, error, page_count, has_text, text_chars, pages, minhash, computed_at)
-                 VALUES (?1, ?2, 'ok', NULL, ?3, ?4, ?5, ?6, ?7, strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
-                rusqlite::params![hash, version, fp.page_count, fp.has_text, fp.text_chars, fp.encode_pages(), fp.encode_minhash()],
+                 (blake3_hex, version, status, error, page_count, has_text, text_chars, pages, minhash, scanned, computed_at)
+                 VALUES (?1, ?2, 'ok', NULL, ?3, ?4, ?5, ?6, ?7, ?8, strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
+                rusqlite::params![hash, version, fp.page_count, fp.has_text, fp.text_chars, fp.encode_pages(), fp.encode_minhash(), fp.scanned],
             )?,
             Err(why) => conn.execute(
                 "INSERT OR REPLACE INTO checksums_db.pdf_fingerprints (blake3_hex, version, status, error, computed_at)
@@ -837,15 +846,15 @@ impl ChecksumStore {
                 entry.1 = size;
             }
         }
-        let mut stmt = conn.prepare("SELECT blake3_hex, page_count, has_text, text_chars, pages, minhash FROM checksums_db.pdf_fingerprints WHERE status = 'ok' AND version = ?1 ORDER BY blake3_hex")?;
+        let mut stmt = conn.prepare("SELECT blake3_hex, page_count, has_text, text_chars, pages, minhash, scanned FROM checksums_db.pdf_fingerprints WHERE status = 'ok' AND version = ?1 ORDER BY blake3_hex")?;
         let mut out = Vec::new();
         for row in stmt.query_map([crate::pdf_similarity::FINGERPRINT_VERSION], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?, r.get::<_, bool>(2)?, r.get::<_, u32>(3)?, r.get::<_, Vec<u8>>(4)?, r.get::<_, Vec<u8>>(5)?))
+            Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?, r.get::<_, bool>(2)?, r.get::<_, u32>(3)?, r.get::<_, Vec<u8>>(4)?, r.get::<_, Vec<u8>>(5)?, r.get::<_, bool>(6)?))
         })? {
-            let (hash, page_count, has_text, text_chars, pages, minhash) = row?;
+            let (hash, page_count, has_text, text_chars, pages, minhash, scanned) = row?;
             let Some(pages) = PdfFingerprint::decode_pages(&pages) else { continue };
             let Some((ids, size)) = books.get(&hash) else { continue };
-            out.push(LibraryFingerprint { books: ids.clone(), size: *size, fingerprint: PdfFingerprint { page_count, pages, text_chars, has_text, minhash: PdfFingerprint::decode_minhash(&minhash) }, hash });
+            out.push(LibraryFingerprint { books: ids.clone(), size: *size, fingerprint: PdfFingerprint { page_count, pages, text_chars, has_text, scanned, minhash: PdfFingerprint::decode_minhash(&minhash) }, hash });
         }
         Ok(out)
     }

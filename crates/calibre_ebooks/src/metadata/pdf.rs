@@ -53,13 +53,16 @@ pub fn get_metadata_from_path(path: &Path) -> Result<MetaInformation> {
     match crate::pdf::rasterize::info_and_cover_from_path(path, true) {
         Ok((info, cover)) => {
             let mut mi = MetaInformation::default();
+            // PDFium decodes every Info string as PDFDocEncoding; a producer
+            // that wrote UTF-8 comes back as mojibake, repaired here so this
+            // path agrees with the `lopdf` reader below.
             if let Some(title) = info.title {
-                mi.title = title;
+                mi.title = repair_mojibake(&title);
             }
             if let Some(author) = info.author {
-                mi.authors = crate::metadata::authors::string_to_authors(&author);
+                mi.authors = crate::metadata::authors::string_to_authors(&repair_mojibake(&author));
             }
-            for value in [info.keywords, info.subject].into_iter().flatten() {
+            for value in [info.keywords, info.subject].into_iter().flatten().map(|v| repair_mojibake(&v)) {
                 for tag in value.split(&[',', ';'][..]).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
                     if !mi.tags.contains(&tag) {
                         mi.tags.push(tag);
@@ -230,6 +233,47 @@ fn from_pdf_object(obj: &Object) -> Result<String> {
     }
 }
 
+/// PDFDocEncoding (ISO 32000-1, Annex D) for 0x80-0xA0, the part that is not
+/// Latin-1. 0x9F is undefined and maps to U+FFFD.
+const PDFDOC_80: [char; 33] = [
+    '\u{2022}', '\u{2020}', '\u{2021}', '\u{2026}', '\u{2014}', '\u{2013}', '\u{192}', '\u{2044}', '\u{2039}', '\u{203A}', '\u{2212}', '\u{2030}', '\u{201E}', '\u{201C}', '\u{201D}', '\u{2018}', '\u{2019}', '\u{201A}', '\u{2122}', '\u{FB01}', '\u{FB02}', '\u{141}', '\u{152}', '\u{160}', '\u{178}',
+    '\u{17D}', '\u{131}', '\u{142}', '\u{153}', '\u{161}', '\u{17E}', '\u{FFFD}', '\u{20AC}',
+];
+
+/// One byte of a PDFDocEncoding string.
+pub(crate) fn pdfdoc_char(b: u8) -> char {
+    match b {
+        0x80..=0xA0 => PDFDOC_80[(b - 0x80) as usize],
+        _ => b as char,
+    }
+}
+
+/// The byte a character stands for in PDFDocEncoding, if it has one.
+fn pdfdoc_byte(c: char) -> Option<u8> {
+    match c as u32 {
+        0..=0x7F | 0xA1..=0xFF => Some(c as u32 as u8),
+        // PDFium may hand 0x80-0x9F through as the C1 control of that number.
+        0x80..=0x9F => Some(c as u32 as u8),
+        _ => PDFDOC_80.iter().position(|&x| x == c).filter(|&i| c != '\u{FFFD}' && i < 33).map(|i| 0x80 + i as u8),
+    }
+}
+
+/// Undoes UTF-8 that was read as PDFDocEncoding (`EncyclopÃ¦dia` for
+/// `Encyclopaedia` with the ae ligature): many producers write UTF-8 into an
+/// Info string, and PDFium decodes it as PDFDocEncoding. If every character is
+/// a PDFDocEncoding character and their bytes are valid UTF-8 that contains
+/// non-ASCII, that UTF-8 is what was meant; anything else is returned unchanged.
+pub(crate) fn repair_mojibake(s: &str) -> String {
+    if s.is_ascii() {
+        return s.to_string();
+    }
+    let bytes: Option<Vec<u8>> = s.chars().map(pdfdoc_byte).collect();
+    match bytes.as_deref().map(std::str::from_utf8) {
+        Some(Ok(fixed)) if !fixed.is_ascii() => fixed.to_string(),
+        _ => s.to_string(),
+    }
+}
+
 /// Decodes a PDF "text string" (ISO 32000-1, 7.9.2.2): UTF-16BE with a
 /// `FE FF` byte-order mark, UTF-16LE with `FF FE` (not in the spec but written
 /// by real producers), UTF-8 with `EF BB BF` (PDF 2.0), otherwise
@@ -251,7 +295,7 @@ pub(crate) fn decode_pdf_text(bytes: &[u8]) -> String {
         [0xEF, 0xBB, 0xBF, rest @ ..] => String::from_utf8_lossy(rest).into_owned(),
         _ => match std::str::from_utf8(bytes) {
             Ok(s) => s.to_string(),
-            Err(_) => bytes.iter().map(|&b| b as char).collect(),
+            Err(_) => bytes.iter().map(|&b| pdfdoc_char(b)).collect(),
         },
     };
     // A PDF 2.0 language escape (ESC lang ESC) can sit inside a UTF-16 string.
@@ -267,6 +311,30 @@ mod tests {
     use super::*;
     use lopdf::Dictionary;
     use lopdf::Object;
+
+    /// BOM -> UTF-16; valid UTF-8 with non-ASCII -> UTF-8 (many producers
+    /// write it); otherwise PDFDocEncoding, with its own table for 0x80-0xA0.
+    #[test]
+    fn info_strings_are_utf16_then_utf8_then_pdfdoc() {
+        let utf16: Vec<u8> = [0xFE, 0xFF].into_iter().chain("Encyclop\u{e6}dia".encode_utf16().flat_map(|u| u.to_be_bytes())).collect();
+        assert_eq!(decode_pdf_text(&utf16), "Encyclop\u{e6}dia");
+        assert_eq!(decode_pdf_text("Encyclop\u{e6}dia metropolitana".as_bytes()), "Encyclop\u{e6}dia metropolitana");
+        // Not valid UTF-8: PDFDocEncoding, where 0x90 is a right quote and 0x80 a bullet.
+        assert_eq!(decode_pdf_text(b"Don\x90t \x80 Caf\xe9"), "Don\u{2019}t \u{2022} Caf\u{e9}");
+        assert_eq!(decode_pdf_text(b"\xa0 5"), "\u{20ac} 5");
+    }
+
+    #[test]
+    fn mojibake_from_pdfium_is_repaired_and_real_text_is_not_touched() {
+        assert_eq!(repair_mojibake("Encyclop\u{c3}\u{a6}dia metropolitana"), "Encyclop\u{e6}dia metropolitana");
+        // A right quote (E2 80 99) read as PDFDocEncoding.
+        let mangled: String = [0xE2u8, 0x80, 0x99].iter().map(|&b| pdfdoc_char(b)).collect();
+        assert_eq!(repair_mojibake(&format!("Don{mangled}t")), "Don\u{2019}t");
+        // Genuine Latin-1 text, ASCII and non-Latin text stay as they are.
+        assert_eq!(repair_mojibake("Caf\u{e9}"), "Caf\u{e9}");
+        assert_eq!(repair_mojibake("Plain"), "Plain");
+        assert_eq!(repair_mojibake("\u{4e16}\u{754c}"), "\u{4e16}\u{754c}");
+    }
 
     #[test]
     fn utf16_info_strings_are_decoded_not_mangled() {

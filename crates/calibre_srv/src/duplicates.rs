@@ -532,7 +532,7 @@ mod tests {
         };
         let hashes = sample_indices(pages as usize).into_iter().map(|i| PageHash::new(i as u32, [next(), next(), next(), next()])).collect();
         let text: String = (0..3000).map(|i| format!("w{} ", (i as u64).wrapping_mul(text_seed + 7) % 2500)).collect();
-        PdfFingerprint { page_count: pages, pages: hashes, text_chars: if has_text { 9000 } else { 0 }, has_text, minhash: if has_text { minhash(&words(&text)) } else { Vec::new() } }
+        PdfFingerprint { page_count: pages, pages: hashes, text_chars: if has_text { 9000 } else { 0 }, has_text, scanned: true, minhash: if has_text { minhash(&words(&text)) } else { Vec::new() } }
     }
 
     fn add_pdf(dir: &std::path::Path, cache: &Cache, name: &str, title: &str, authors: &[&str], bytes: &[u8]) -> i32 {

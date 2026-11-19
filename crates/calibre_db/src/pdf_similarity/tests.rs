@@ -256,7 +256,7 @@ fn fp(seed: u64, pages: u32, text: bool, _salt: u64) -> PdfFingerprint {
     let mut r = Rng(seed.wrapping_mul(0x1234_5678_9ABC_DEF1) | 1);
     let hashes: Vec<PageHash> = sample_indices(pages as usize).into_iter().map(|i| PageHash { index: i as u32, bits: [r.next(), r.next(), r.next(), r.next()], mask: [u64::MAX; 4], blank: false }).collect();
     let (has_text, text_chars, minhash) = if text { (true, 9000, super::minhash(&lorem(seed, 3000))) } else { (false, 0, Vec::new()) };
-    PdfFingerprint { page_count: pages, pages: hashes, text_chars, has_text, minhash }
+    PdfFingerprint { page_count: pages, pages: hashes, text_chars, has_text, scanned: false, minhash }
 }
 
 /// The same book re-rendered: every hash gets up to `bits` bits flipped.
@@ -398,7 +398,7 @@ fn the_same_pages_and_the_same_text_is_a_resave() {
 
 #[test]
 fn two_different_ocr_runs_are_an_ocr_variant_with_less_confidence() {
-    let base = fp(4, 300, false, 0);
+    let base = PdfFingerprint { scanned: true, ..fp(4, 300, false, 0) };
     let a = with_text(&base, 10);
     let mut words_b = lorem(10, 3000);
     for (i, w) in words_b.iter_mut().enumerate() {
@@ -411,6 +411,32 @@ fn two_different_ocr_runs_are_an_ocr_variant_with_less_confidence() {
     assert!((DIFFERENT_TEXT_JACCARD..SAME_TEXT_JACCARD).contains(&j), "{j}");
     let m = classify(&a, &b).unwrap();
     assert_eq!((m.kind, m.confidence), (PdfKind::OcrVariant, CONFIDENCE_OCR_TWO_LAYERS));
+}
+
+/// Short born-digital documents on one layout (instruction reference pages,
+/// a series of character sheets) share most of their words and look alike,
+/// but vector text is not a scan: never an OCR variant of each other.
+#[test]
+fn born_digital_pages_with_similar_text_are_not_ocr_variants() {
+    let words_a = lorem(40, 400);
+    let mut words_b = words_a.clone();
+    for (i, w) in words_b.iter_mut().enumerate() {
+        if i % 20 == 0 {
+            *w = format!("other{i}");
+        }
+    }
+    for pages in [1u32, 3, 4, 40] {
+        let base = fp(60 + pages as u64, pages, false, 0);
+        let a = with_words(&base, &words_a);
+        let b = with_words(&rerendered(&base, 5, 3), &words_b);
+        assert!(jaccard(&a.minhash, &b.minhash).unwrap() >= 0.5);
+        assert!(classify(&a, &b).is_none(), "{pages} born-digital pages matched");
+        // The same two documents as scans are.
+        let (sa, sb) = (PdfFingerprint { scanned: true, ..a }, PdfFingerprint { scanned: true, ..b });
+        if pages >= 3 {
+            assert_eq!(classify(&sa, &sb).map(|m| m.kind), Some(PdfKind::OcrVariant), "{pages}");
+        }
+    }
 }
 
 #[test]
@@ -504,7 +530,7 @@ fn real_text_still_matches_among_boilerplate() {
 /// across the library; two real OCR runs of one scan are still found.
 #[test]
 fn template_documents_are_not_ocr_variants_but_two_ocr_runs_are() {
-    let base = fp(300, 300, false, 0);
+    let base = PdfFingerprint { scanned: true, ..fp(300, 300, false, 0) };
     let template = lorem(7777, 2250);
     let mut docs: Vec<PdfFingerprint> = (0..12u64)
         .map(|i| {
@@ -809,5 +835,19 @@ fn a_real_scan_its_ocr_copy_and_an_optimized_copy_group_and_another_book_does_no
     let reasons: Vec<&str> = outcome.groups[0].evidence.iter().map(|e| e.strength.reason()).collect();
     assert!(reasons.contains(&"pdf_ocr_variant") && reasons.contains(&"pdf_resave"), "{evidence:?}");
     assert!(outcome.pdf[&ids[1]].has_text && !outcome.pdf[&ids[0]].has_text);
+    // Every one of these is a picture of a page.
+    assert!(cache.checksums().pdf_fingerprints().unwrap().iter().all(|l| l.fingerprint.scanned));
+}
+
+/// A PDF whose pages are drawn text and shapes, not images, is not "scanned".
+#[test]
+fn a_born_digital_pdf_is_not_scanned() {
+    if !calibre_ebooks::pdf::rasterize::is_available() {
+        eprintln!("skipping: no PDFium library available");
+        return;
+    }
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../calibre_ebooks/tests/data/two-page.pdf");
+    let fp = fingerprint_file(&path).unwrap();
+    assert!(!fp.scanned);
 }
 

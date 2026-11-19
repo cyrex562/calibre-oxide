@@ -390,6 +390,9 @@ pub struct SampledPage {
     pub height: u32,
     /// One byte per pixel, row-major.
     pub gray: Vec<u8>,
+    /// An image object covers at least 80% of the page: the page is a picture
+    /// (a scan), whatever text layer sits on it.
+    pub image_page: bool,
 }
 
 /// What [`sample_pdf_from_path`] read from one PDF.
@@ -429,11 +432,15 @@ pub fn sample_pdf_from_path(path: &Path, long_side: u32, choose: impl FnOnce(usi
         let (pw, ph) = (page.width().value.max(1.0), page.height().value.max(1.0));
         let scale = long_side as f32 / pw.max(ph);
         let (w, h) = (((pw * scale).round() as i32).max(1), ((ph * scale).round() as i32).max(1));
+        let image_page = {
+            use pdfium_render::prelude::{PdfPageObjectCommon, PdfPageObjectType, PdfPageObjectsCommon};
+            page.objects().iter().filter(|o| o.object_type() == PdfPageObjectType::Image).filter_map(|o| o.bounds().ok()).any(|b| b.width().value * b.height().value >= 0.8 * pw * ph)
+        };
         let config = PdfRenderConfig::new().set_target_size(w, h).render_form_data(false);
         let Ok(bitmap) = page.render_with_config(&config) else { continue };
         let rgba = bitmap.as_rgba_bytes();
         let gray = rgba.chunks_exact(4).map(|p| ((p[0] as u32 * 299 + p[1] as u32 * 587 + p[2] as u32 * 114) / 1000) as u8).collect();
-        sampled.push(SampledPage { index, width: bitmap.width() as u32, height: bitmap.height() as u32, gray });
+        sampled.push(SampledPage { index, width: bitmap.width() as u32, height: bitmap.height() as u32, gray, image_page });
     }
 
     let mut text = Vec::new();
