@@ -116,6 +116,13 @@ expensive half to do lazily:
    disk, not loaded into memory. It fills in only what is still a placeholder,
    so a title the user changed in between is kept. Resumable by construction:
    a book leaves the queue only when done.
+   A book whose metadata cannot be written (or whose batch of books cannot be
+   registered) is a **per-file error** in the job's report (`failed`, plus the
+   job's error count) and the scan carries on; a failed batch is retried book by
+   book. Author, tag and language lists are de-duplicated (trimmed,
+   case-insensitive, empty dropped, first occurrence kept) before they are linked,
+   because the link tables are `UNIQUE(book, item)` over `NOCASE` names, and a
+   book listing one author twice used to abort the whole scan.
 3. **Hash backfill** — every format file with no recorded hash, which is every
    file of a library real calibre made. Same streaming read; resumable because
    the work list is "files with no hash".
@@ -179,8 +186,27 @@ Rules that keep this from flooding the user:
   `Anonymous`, `Various`, calibre's translated `Unknown`, or nothing. A book
   with no specific author can only be grouped by content or identifier, never by
   title. `grouping.rs` uses the same rule.
+- **Junk embedded metadata is not evidence either**, and is not trusted at
+  extraction: a title like `ACDSee 32 print job`, `Microsoft Word - foo.doc`
+  (the prefix is stripped when what remains means something), `Untitled`,
+  `Document1`, or a bare filename such as `F:\On Hold\1-45.tif`, and an author
+  such as `Admin`, `Administrator`, `Owner` or `User`, is treated as absent, so
+  the filename title applies. One short documented list
+  (`calibre_db::junk_metadata`) serves both extraction and dedupe, so libraries
+  imported before it benefit too. PDF Info strings in UTF-16 (BOM `FE FF` /
+  `FF FE`) are decoded, not rendered as `?? G U R P S`.
+- **Zero-byte files are never content duplicates** (they all share the hash of
+  nothing) and are never in the bulk `merge-exact` plan. The scan response lists
+  them separately as `empty_files` / `empty_file_count`, and the duplicates
+  panel mentions them.
 - **A title alone is not evidence, and the same title by a different author is
   a different book.**
+- **Titles that differ by a designator are different books.** Underscores and
+  runs of separators are spaces (`Elven_Names_-_Male` = `Elven Names - Male`),
+  and an edit-distance match is vetoed when a word on one side and not the
+  other is a number or version, a Roman numeral, a single letter
+  (`Templates A to H` / `P to Z`), a volume/part/chapter word, or one of a tiny
+  set of opposites (`male`/`female`, `men`/`women`).
 - **Volumes are never normalised away.** `Vol. 1`/`Vol. 2`, `Part I`/`Part II`,
   `Book One`/`Book Two` stay distinct: numbers survive in every key, a subtitle
   that names a volume is never dropped, and an edit-distance match needs equal
@@ -253,12 +279,29 @@ compared.
 | Reason | Evidence | Confidence |
 | --- | --- | --- |
 | `pdf_resave` | same pages; same text (MinHash similarity at least 0.8) or no text on either | 0.85 |
-| `pdf_ocr_variant` | same pages; exactly one has a text layer, or both do with similarity 0.3-0.8 (two OCR runs) | 0.80 / 0.75 |
-| `pdf_text_match` | different pages, but both have text, similarity at least 0.9, page counts within 2 | 0.60 |
+| `pdf_ocr_variant` | same pages; exactly one has a text layer, or both do with *distinctive* similarity 0.5-0.8 over at least 64 distinctive slots (two OCR runs) | 0.80 / 0.75 |
+| `pdf_text_match` | different pages, but both have text, *distinctive* similarity at least 0.9 over at least 64 distinctive slots, page counts within 2 | 0.60 |
+
+*Distinctive* means the text boilerplate is left out: a MinHash slot value held
+by at least `max(5, 0.5%)` of the library's documents is a shingle many
+documents share (Google Books' "This is a digital copy of a book that was
+preserved for generations..." notice, which is all the text an old Google scan
+has in its first 48 pages; a licence; a publisher's template), and says nothing
+about two particular books. Without this, unrelated Google scans matched at
+similarity 1.00, and documents built from one template (the Intel instruction
+pages `MOVHPS`/`MOVLPS`, a publisher's whole line) were taken for two OCR runs.
+
+Page-content pairs make groups by **complete linkage**, not transitively: two
+clusters merge only when every cross pair has an edge (a cluster of up to three
+may chain), so a run of weak pairs cannot chain 49 unrelated books into one
+group. Books holding identical files count as one node.
 
 These rank **between `exact` and `fuzzy`**; `?min=pdf` includes them and
-everything stronger. Same pages with *different* words (similarity under 0.3)
-is not a match: that is two books from one template. Only fingerprinted PDFs
+everything stronger. Same pages with *different* words (similarity under 0.5,
+or too little distinctive text) is not a match: that is two books from one
+template. The fingerprint job runs **one** file at a time (two PDFium workers
+killed the server process on a real library), and every PDFium call in the
+process is serialised behind one lock. Only fingerprinted PDFs
 take part and the scan reports how many are not (`pdf_unfingerprinted`), so the
 UI can offer to run the job. They never reach the bulk `merge-exact`.
 `suggested_dest` for these groups is the copy with a text layer, then more

@@ -64,10 +64,70 @@ fn print_help() {
     );
 }
 
-/// The repo root, found from this crate rather than the current
-/// directory, so `cargo xtask` works from anywhere in the tree.
+/// The repo root: the nearest directory at or above the **current working
+/// directory** that holds a `Cargo.toml` with a `[workspace]` table and an
+/// `xtask` directory, so `cargo xtask` works from anywhere in the tree.
+///
+/// Not `CARGO_MANIFEST_DIR`: that is baked in when xtask is compiled, and the
+/// binary lives in the shared target directory, so whichever worktree built it
+/// last would be "the repo" for every other (`fetch-pdfium` once downloaded
+/// into a deleted worktree). The compile-time path is only the fallback, for
+/// a run from outside any workspace.
 fn root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("xtask/ always has a parent").to_path_buf()
+    std::env::current_dir().ok().and_then(|cwd| find_workspace_root(&cwd)).unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("xtask/ always has a parent").to_path_buf())
+}
+
+/// Walks up from `start` to the workspace root (see [`root`]).
+fn find_workspace_root(start: &Path) -> Option<PathBuf> {
+    start.ancestors().find(|dir| dir.join("xtask").is_dir() && std::fs::read_to_string(dir.join("Cargo.toml")).is_ok_and(|toml| toml.lines().any(|line| line.trim() == "[workspace]"))).map(Path::to_path_buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("xtask-root-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_root_is_found_from_a_subdirectory_of_whichever_tree_we_are_in() {
+        for tree in ["one", "two"] {
+            let dir = scratch(tree);
+            std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+            std::fs::create_dir_all(dir.join("xtask")).unwrap();
+            let deep = dir.join("crates").join("deep");
+            std::fs::create_dir_all(&deep).unwrap();
+            assert_eq!(find_workspace_root(&deep), Some(dir.clone()));
+            assert_eq!(find_workspace_root(&dir), Some(dir.clone()));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn a_cargo_toml_without_workspace_or_without_xtask_is_not_the_root() {
+        let dir = scratch("nested");
+        std::fs::write(dir.join("Cargo.toml"), "[workspace]\n").unwrap();
+        // No xtask directory: not the root.
+        assert_eq!(find_workspace_root(&dir), None);
+        std::fs::create_dir_all(dir.join("xtask")).unwrap();
+        let member = dir.join("crates").join("member");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(member.join("Cargo.toml"), "[package]\nname = \"m\"\n").unwrap();
+        // A member's own manifest is skipped for the workspace above it.
+        assert_eq!(find_workspace_root(&member), Some(dir.clone()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_running_trees_root_is_the_workspace_it_is_in() {
+        // `cargo test` runs from the package directory; the walk finds this repo.
+        let found = find_workspace_root(&std::env::current_dir().unwrap()).expect("inside the workspace");
+        assert!(found.join("xtask").join("Cargo.toml").is_file());
+    }
 }
 
 fn build_all(release: bool) -> Result<()> {

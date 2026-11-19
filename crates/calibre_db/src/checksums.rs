@@ -637,10 +637,10 @@ impl ChecksumStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT blake3_hex, book_id FROM checksums_db.file_checksums
-             WHERE kind = ?1
+             WHERE kind = ?1 AND size > 0
                AND blake3_hex IN (
                    SELECT blake3_hex FROM checksums_db.file_checksums
-                   WHERE kind = ?1 GROUP BY blake3_hex HAVING COUNT(DISTINCT book_id) > 1
+                   WHERE kind = ?1 AND size > 0 GROUP BY blake3_hex HAVING COUNT(DISTINCT book_id) > 1
                )
              ORDER BY blake3_hex, book_id",
         )?;
@@ -663,6 +663,23 @@ impl ChecksumStore {
         }
         groups.retain(|(_, ids)| ids.len() > 1);
         Ok(groups)
+    }
+
+    /// `(book id, format key)` of every recorded file of size 0.
+    ///
+    /// Empty files all share one hash (the BLAKE3 of nothing), so they are
+    /// kept **out** of [`Self::books_sharing_content`]: two empty files are
+    /// not the same book. They are reported on their own instead.
+    pub fn empty_files(&self, kind: &str) -> Result<Vec<(i32, String)>, ChecksumError> {
+        self.initialize()?;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT book_id, key FROM checksums_db.file_checksums WHERE kind = ?1 AND size = 0 ORDER BY book_id, key")?;
+        let rows = stmt.query_map([kind], |row| Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     /// What the importer recorded for a source file, if anything.

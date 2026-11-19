@@ -224,10 +224,42 @@ pub fn set_metadata(path: &Path, mi: &MetaInformation) -> Result<()> {
 
 fn from_pdf_object(obj: &Object) -> Result<String> {
     match obj {
-        Object::String(bytes, _) => Ok(String::from_utf8_lossy(bytes).to_string()),
+        Object::String(bytes, _) => Ok(decode_pdf_text(bytes)),
         Object::Name(bytes) => Ok(String::from_utf8_lossy(bytes).to_string()),
         _ => anyhow::bail!("Not a string object"),
     }
+}
+
+/// Decodes a PDF "text string" (ISO 32000-1, 7.9.2.2): UTF-16BE with a
+/// `FE FF` byte-order mark, UTF-16LE with `FF FE` (not in the spec but written
+/// by real producers), UTF-8 with `EF BB BF` (PDF 2.0), otherwise
+/// PDFDocEncoding.
+///
+/// Reading a UTF-16 string as UTF-8 gave titles like `<FFFD><FFFD> G U R P S`
+/// (the BOM as replacement characters, every other byte a NUL), which then
+/// became the book's title and a bogus duplicate-detection key. PDFDocEncoding
+/// is Latin-1 for the range producers actually use, so a string that is not
+/// valid UTF-8 is read as Latin-1 rather than lossily.
+pub(crate) fn decode_pdf_text(bytes: &[u8]) -> String {
+    fn utf16(bytes: &[u8], big_endian: bool) -> String {
+        let units: Vec<u16> = bytes.chunks_exact(2).map(|c| if big_endian { u16::from_be_bytes([c[0], c[1]]) } else { u16::from_le_bytes([c[0], c[1]]) }).collect();
+        String::from_utf16_lossy(&units)
+    }
+    let text = match bytes {
+        [0xFE, 0xFF, rest @ ..] => utf16(rest, true),
+        [0xFF, 0xFE, rest @ ..] => utf16(rest, false),
+        [0xEF, 0xBB, 0xBF, rest @ ..] => String::from_utf8_lossy(rest).into_owned(),
+        _ => match std::str::from_utf8(bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => bytes.iter().map(|&b| b as char).collect(),
+        },
+    };
+    // A PDF 2.0 language escape (ESC lang ESC) can sit inside a UTF-16 string.
+    let text = match (text.find('\u{1b}'), text.rfind('\u{1b}')) {
+        (Some(a), Some(b)) if b > a => format!("{}{}", &text[..a], &text[b + 1..]),
+        _ => text,
+    };
+    text.trim_end_matches('\0').to_string()
 }
 
 #[cfg(test)]
@@ -235,6 +267,40 @@ mod tests {
     use super::*;
     use lopdf::Dictionary;
     use lopdf::Object;
+
+    #[test]
+    fn utf16_info_strings_are_decoded_not_mangled() {
+        // "GURPS Ultra" as UTF-16BE with a BOM, and as UTF-16LE with a BOM.
+        let be: Vec<u8> = [0xFE, 0xFF].into_iter().chain("GURPS Ultra".encode_utf16().flat_map(|u| u.to_be_bytes())).collect();
+        let le: Vec<u8> = [0xFF, 0xFE].into_iter().chain("GURPS Ultra".encode_utf16().flat_map(|u| u.to_le_bytes())).collect();
+        assert_eq!(decode_pdf_text(&be), "GURPS Ultra");
+        assert_eq!(decode_pdf_text(&le), "GURPS Ultra");
+        // Non-ASCII survives; so does a UTF-8 BOM and plain ASCII.
+        let accented: Vec<u8> = [0xFE, 0xFF].into_iter().chain("Caf\u{e9} \u{4e16}\u{754c}".encode_utf16().flat_map(|u| u.to_be_bytes())).collect();
+        assert_eq!(decode_pdf_text(&accented), "Caf\u{e9} \u{4e16}\u{754c}");
+        assert_eq!(decode_pdf_text(b"\xEF\xBB\xBFPlain"), "Plain");
+        assert_eq!(decode_pdf_text(b"Plain Title"), "Plain Title");
+        // PDFDocEncoding / Latin-1 bytes are not lossy-replaced.
+        assert_eq!(decode_pdf_text(b"Caf\xe9"), "Caf\u{e9}");
+    }
+
+    #[test]
+    fn a_utf16_title_in_an_info_dictionary_reads_back_whole() -> Result<()> {
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let info_id = doc.new_object_id();
+        let title: Vec<u8> = [0xFE, 0xFF].into_iter().chain("GURPS Ultra-Tech".encode_utf16().flat_map(|u| u.to_be_bytes())).collect();
+        let mut info = Dictionary::new();
+        info.set("Title", Object::String(title, lopdf::StringFormat::Hexadecimal));
+        doc.objects.insert(info_id, Object::Dictionary(info));
+        doc.trailer.set("Info", Object::Reference(info_id));
+        doc.trailer.set("Root", Object::Reference(pages_id));
+        let mut buffer = Vec::new();
+        doc.save_to(&mut buffer)?;
+        let mi = get_metadata(std::io::Cursor::new(buffer))?;
+        assert_eq!(mi.title, "GURPS Ultra-Tech");
+        Ok(())
+    }
 
     #[test]
     fn test_pdf_metadata() -> Result<()> {

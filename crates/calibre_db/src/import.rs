@@ -385,11 +385,12 @@ fn read_sidecars(g: &Group) -> Sidecar {
 /// `mi` as it was. Used for embedded metadata, then again for the OPF
 /// sidecar, which therefore wins.
 fn overlay(mi: &mut calibre_ebooks::metadata::MetaInformation, found: &calibre_ebooks::metadata::MetaInformation) {
-    let title = found.title.trim();
-    if !title.is_empty() && title != "Unknown" {
-        mi.title = title.to_string();
+    // Junk titles/authors (see `junk_metadata`) count as absent, so the
+    // filename the caller already put in `mi` stays.
+    if let Some(title) = crate::junk_metadata::clean_title(&found.title).filter(|t| t != "Unknown") {
+        mi.title = title;
     }
-    let real: Vec<String> = found.authors.iter().map(|a| a.trim().to_string()).filter(|a| !a.is_empty() && a != "Unknown").collect();
+    let real: Vec<String> = crate::junk_metadata::clean_authors(&found.authors).into_iter().filter(|a| a != "Unknown").collect();
     if !real.is_empty() {
         mi.authors = real;
     }

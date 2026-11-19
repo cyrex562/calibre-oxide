@@ -930,10 +930,18 @@ export interface DuplicateGroup {
   suggested_dest?: number | null;
 }
 
+/** A zero-byte book file. Never grouped as a duplicate of another empty file; listed on its own. */
+export interface EmptyFile {
+  book_id: number;
+  format: string;
+  title: string;
+  authors: string[];
+}
+
 /** `min` is applied by the server (weaker evidence is not used at all). Omit for everything. */
-export function scanForDuplicates(min?: "content" | "identifier" | "exact" | "pdf" | "fuzzy"): Promise<{ groups: DuplicateGroup[]; pdf?: PdfScanStatus; pdf_unfingerprinted?: number }> {
+export function scanForDuplicates(min?: "content" | "identifier" | "exact" | "pdf" | "fuzzy"): Promise<{ groups: DuplicateGroup[]; pdf?: PdfScanStatus; pdf_unfingerprinted?: number; empty_files?: EmptyFile[] }> {
   const query = min ? `?min=${min}` : "";
-  return jsonFetch<{ groups: DuplicateGroup[]; pdf?: PdfScanStatus; pdf_unfingerprinted?: number }>(`/duplicates/scan/default${query}`, { method: "POST" });
+  return jsonFetch<{ groups: DuplicateGroup[]; pdf?: PdfScanStatus; pdf_unfingerprinted?: number; empty_files?: EmptyFile[] }>(`/duplicates/scan/default${query}`, { method: "POST" });
 }
 
 /** What the PDF fingerprint job did. */

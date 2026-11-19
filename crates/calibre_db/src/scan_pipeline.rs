@@ -384,7 +384,7 @@ pub fn index_files(cache: &Cache, library_path: &Path, report: &ScanReport, opti
             });
         }
 
-        let results = cache.register_books_in_place(&items);
+        let results = register_batch_resilient(&items, |batch| cache.register_books_in_place(batch));
         for (item, result) in items.iter().zip(results) {
             match result {
                 Ok(id) => {
@@ -403,9 +403,26 @@ pub fn index_files(cache: &Cache, library_path: &Path, report: &ScanReport, opti
     indexed
 }
 
+/// Registers `items` as one batch; if every book of a multi-book batch comes
+/// back failed (a batch-level failure such as the commit, rather than one bad
+/// book -- those are isolated by their own savepoints), retries them one at a
+/// time so a single poisonous book is reported on its own and the rest of the
+/// library still gets indexed.
+fn register_batch_resilient(items: &[InPlaceFile], register: impl Fn(&[InPlaceFile]) -> Vec<Result<i32>>) -> Vec<Result<i32>> {
+    let results = register(items);
+    if items.len() > 1 && results.iter().all(|r| r.is_err()) {
+        return items.iter().map(|item| register(std::slice::from_ref(item)).remove(0)).collect();
+    }
+    results
+}
+
 /// What the metadata pass did.
 #[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
 pub struct EnrichReport {
+    /// `(book path, error)` for books whose metadata could not be written.
+    /// One bad book is recorded here and the pass carries on; it used to
+    /// abort the whole job.
+    pub failed: Vec<(String, String)>,
     /// Books that gained a title, authors or a cover.
     pub enriched: usize,
     /// Books whose file has nothing more to say (unreadable metadata, or
@@ -455,10 +472,16 @@ pub fn enrich_pending(cache: &Cache, options: &PipelineOptions, control: &JobCon
                     control.enriched.fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(metadata) => {
-                    if apply_enrichment(cache, *book_id, name, &metadata)? {
-                        report.enriched += 1;
-                    } else {
-                        report.nothing_to_add += 1;
+                    match apply_enrichment(cache, *book_id, name, &metadata) {
+                        Ok(true) => report.enriched += 1,
+                        Ok(false) => report.nothing_to_add += 1,
+                        Err(e) => {
+                            // One book's metadata must not stop the library's
+                            // scan. Its filename title stays; it leaves the
+                            // queue so a rerun does not trip on it forever.
+                            control.errors.fetch_add(1, Ordering::Relaxed);
+                            push_capped(&mut report.failed, (format!("{folder}/{name}").trim_start_matches('/').to_string(), format!("{e:#}")));
+                        }
                     }
                     cache.checksums().finish_enrichment(*book_id)?;
                     control.enriched.fetch_add(1, Ordering::Relaxed);
@@ -477,13 +500,17 @@ pub fn enrich_pending(cache: &Cache, options: &PipelineOptions, control: &JobCon
 fn apply_enrichment(cache: &Cache, book_id: i32, stem: &str, metadata: &calibre_ebooks::metadata::MetaInformation) -> Result<bool> {
     let mut changed = false;
 
-    let title = metadata.title.trim();
-    if !title.is_empty() && title != "Unknown" && title != stem && cache.field_for(book_id, "title")?.as_deref() == Some(stem) {
-        cache.set_field(book_id, "title", title)?;
-        changed = true;
+    // Junk (`... print job`, `Microsoft Word - x.doc`, a bare filename) is
+    // treated as absent so the filename title stays; see `junk_metadata`.
+    let cleaned = crate::junk_metadata::clean_title(&metadata.title);
+    if let Some(title) = cleaned.as_deref().filter(|t| *t != "Unknown" && *t != stem) {
+        if cache.field_for(book_id, "title")?.as_deref() == Some(stem) {
+            cache.set_field(book_id, "title", title)?;
+            changed = true;
+        }
     }
 
-    let real_authors: Vec<&str> = metadata.authors.iter().map(|a| a.trim()).filter(|a| !a.is_empty() && *a != "Unknown").collect();
+    let real_authors: Vec<String> = crate::junk_metadata::clean_authors(&metadata.authors).into_iter().filter(|a| a != "Unknown").collect();
     if !real_authors.is_empty() && cache.field_for(book_id, "authors")?.as_deref().is_none_or(|a| a == "Unknown") {
         cache.set_field(book_id, "authors", &real_authors.join(" & "))?;
         changed = true;
@@ -920,6 +947,68 @@ mod tests {
         let report = enrich_pending(&cache, &options(1, 100), &JobControl::default()).unwrap();
         assert_eq!(report.missing, vec!["gone"]);
         assert_eq!(report.remaining, 1);
+    }
+
+    /// A whole-batch failure falls back to one book at a time, so the one
+    /// poisonous book is the only casualty.
+    #[test]
+    fn a_failed_batch_is_retried_book_by_book() {
+        let item = |name: &str| {
+            let mut metadata = calibre_ebooks::metadata::MetaInformation::default();
+            metadata.title = name.to_string();
+            InPlaceFile { relative_path: name.to_string(), metadata, size: 1, hash: "00".repeat(32), identity: None, queue_enrichment: false }
+        };
+        let items = [item("a.pdf"), item("poison.pdf"), item("c.pdf")];
+        let register = |batch: &[InPlaceFile]| -> Vec<Result<i32>> {
+            let poisoned = batch.iter().any(|i| i.relative_path == "poison.pdf");
+            batch
+                .iter()
+                .map(|i| if poisoned && (batch.len() > 1 || i.relative_path == "poison.pdf") { Err(anyhow::anyhow!("boom")) } else { Ok(1) })
+                .collect()
+        };
+        let results = register_batch_resilient(&items, register);
+        assert!(results[0].is_ok() && results[2].is_ok());
+        assert!(results[1].is_err());
+    }
+
+    /// One book whose metadata cannot be written is a per-file error; the
+    /// enrichment pass still finishes every other book.
+    #[test]
+    fn a_book_that_cannot_be_enriched_is_reported_and_the_pass_continues() {
+        let (dir, cache) = library();
+        let html = |title: &str, author: &str| format!("<html><head><title>{title}</title><meta name=\"author\" content=\"{author}\"/></head><body>x</body></html>");
+        write(&dir.path().join("a1.html"), html("Good One", "Fine Author").as_bytes());
+        write(&dir.path().join("a2.html"), html("Bad One", "Boom Author").as_bytes());
+        write(&dir.path().join("a3.html"), html("Good Three", "Fine Author").as_bytes());
+        index_files(&cache, dir.path(), &walked(dir.path()), &options(1, 100), &JobControl::default());
+        cache
+            .backend
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch("CREATE TRIGGER boom BEFORE INSERT ON books_authors_link WHEN (SELECT name FROM authors WHERE id = NEW.author) = 'Boom Author' BEGIN SELECT RAISE(ABORT, 'boom'); END;")
+            .unwrap();
+        let control = JobControl::default();
+        let report = enrich_pending(&cache, &options(1, 100), &control).unwrap();
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert!(report.failed[0].0.contains("a2"), "{report:?}");
+        assert_eq!(control.errors.load(Ordering::Relaxed), 1);
+        assert_eq!(report.remaining, 0);
+        let three = cache.book_for_file("a3.html").unwrap().unwrap();
+        assert_eq!(cache.field_for(three, "title").unwrap().as_deref(), Some("Good Three"));
+    }
+
+    /// The scan-level face of the duplicate-author crash: embedded metadata
+    /// listing the same author twice enriches cleanly.
+    #[test]
+    fn enrichment_with_a_repeated_author_does_not_fail() {
+        let (dir, cache) = library();
+        write(&dir.path().join("d.html"), b"<html><head><title>Dup Title</title><meta name=\"author\" content=\"Same Person &amp; same person\"/></head><body>x</body></html>");
+        index_files(&cache, dir.path(), &walked(dir.path()), &options(1, 100), &JobControl::default());
+        let report = enrich_pending(&cache, &options(1, 100), &JobControl::default()).unwrap();
+        assert!(report.failed.is_empty(), "{report:?}");
+        let id = cache.book_for_file("d.html").unwrap().unwrap();
+        assert_eq!(cache.field_for(id, "title").unwrap().as_deref(), Some("Dup Title"));
     }
 
     #[test]

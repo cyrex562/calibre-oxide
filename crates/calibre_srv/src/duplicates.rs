@@ -51,6 +51,11 @@
 //! optimizer shrinks images, so the larger of two re-saves is the original).
 //! They are never part of `merge-exact`.
 //!
+//! Zero-byte files are not content duplicates of each other (they all hash
+//! alike) and are never in a group or in `merge-exact`; the response lists them
+//! as `"empty_files": [{book_id, format, title, authors}]` with
+//! `"empty_file_count"`.
+//!
 //! The pre-tranche-8 `"metadata"` reason is now `"title_author_exact"`. The
 //! only client is this repo's frontend, changed in the same commit.
 //!
@@ -139,7 +144,15 @@ pub fn scan_report(cache: &Cache, min: Strength, control: Option<&JobControl>) -
     }
     // `pdf_unfingerprinted` is what `POST /pdf-fingerprint` would do; a PDF
     // with no content hash yet needs `POST /hash-backfill` first.
-    Ok(json!({"groups": out, "min": min.reason(), "pdf_unfingerprinted": outcome.status.pending, "pdf": outcome.status}))
+    //
+    // `empty_files` are zero-byte book files: never grouped as duplicates of
+    // each other (they all hash alike), so listed here for the user to clean up.
+    let mut empty = Vec::with_capacity(outcome.empty_files.len());
+    for (id, format) in &outcome.empty_files {
+        let (title, authors) = copy_to_library::book_title_and_authors(cache, *id)?;
+        empty.push(json!({"book_id": id, "format": format, "title": title, "authors": authors}));
+    }
+    Ok(json!({"groups": out, "min": min.reason(), "pdf_unfingerprinted": outcome.status.pending, "pdf": outcome.status, "empty_files": empty, "empty_file_count": empty.len()}))
 }
 
 fn round2(x: f32) -> f64 {
@@ -420,6 +433,29 @@ mod tests {
         let (status, body) = post_json(&router, "/duplicates/scan/default").await;
         assert_eq!(status, StatusCode::OK);
         assert!(body["groups"].as_array().unwrap().is_empty(), "{body}");
+    }
+
+    /// Zero-byte files are reported as `empty_files`, never as a content
+    /// group, and the bulk merge plan does not contain them.
+    #[tokio::test]
+    async fn empty_files_are_listed_separately_and_never_grouped_or_merged() {
+        let (_dir, router, _) = test_app_with(|dir, cache| {
+            for (name, title) in [("z1.txt", "Zero One"), ("z2.txt", "Zero Two")] {
+                let source = dir.join(name);
+                std::fs::write(&source, b"").unwrap();
+                let mut meta = calibre_ebooks::metadata::MetaInformation::default();
+                meta.title = title.to_string();
+                meta.authors = vec![format!("Author {title}")];
+                cache.add_book(&source, &meta).unwrap();
+            }
+        });
+        let (status, scan) = post_json(&router, "/duplicates/scan/default").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(scan["groups"].as_array().unwrap().is_empty(), "{scan}");
+        assert_eq!(scan["empty_file_count"], 2, "{scan}");
+        assert_eq!(scan["empty_files"].as_array().unwrap().len(), 2);
+        let (_, plan) = post_with_body(&router, "/duplicates/merge-exact/default", serde_json::json!({})).await;
+        assert_eq!(plan["group_count"], 0, "{plan}");
     }
 
     /// The bulk merge acts on byte-identical files only. A fuzzy or exact

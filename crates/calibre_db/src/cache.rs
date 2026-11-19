@@ -1267,11 +1267,13 @@ impl Cache {
         // Link every author, not just the first -- `author_name`
         // above is only used for `author_sort`, which upstream also
         // derives from just the primary author.
-        let link_names: Vec<&str> = if metadata.authors.is_empty() {
-            vec!["Unknown"]
-        } else {
-            metadata.authors.iter().map(|s| s.as_str()).collect()
-        };
+        // Deduplicated first: `books_authors_link` is UNIQUE(book, author)
+        // and `authors.name` is NOCASE, so "A", "a" and " A " are one
+        // author, and linking them twice used to abort the insert.
+        let mut link_names: Vec<&str> = dedupe_names(metadata.authors.iter().map(|s| s.as_str()));
+        if link_names.is_empty() {
+            link_names.push("Unknown");
+        }
         for name in link_names {
             let author_id: i32 = {
                 let mut stmt = tx.prepare("SELECT id FROM authors WHERE name = ?1")?;
@@ -3068,11 +3070,9 @@ impl Cache {
         sep: &str,
         value: &str,
     ) -> anyhow::Result<()> {
-        let items: Vec<&str> = value
-            .split(sep)
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect();
+        // Link tables are UNIQUE(book, item) over NOCASE names: a repeated
+        // item ("a & A") must be linked once, not abort the write.
+        let items: Vec<&str> = dedupe_names(value.split(sep));
         let mut conn = self.backend.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
@@ -3435,6 +3435,23 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Trims each name, drops empty ones and drops repeats, keeping the first
+/// occurrence. "Repeat" is case-insensitive, matching the NOCASE collation of
+/// the `authors`/`tags`/... name columns, so the result can be linked to a
+/// book without tripping the `UNIQUE(book, <item>)` constraint of its link
+/// table. The one shared helper for every place that links a list of names.
+pub(crate) fn dedupe_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for name in names {
+        let name = name.trim();
+        if !name.is_empty() && seen.insert(name.to_lowercase()) {
+            out.push(name);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -4632,6 +4649,41 @@ mod tests {
     }
 
     // --- get_data_as_dict ---
+
+    #[test]
+    fn dedupe_names_trims_drops_empty_and_repeats_case_insensitively() {
+        let got = dedupe_names(["Ann Lee", "  ann lee ", "", "  ", "Bob", "BOB", "Cy"]);
+        assert_eq!(got, vec!["Ann Lee", "Bob", "Cy"]);
+    }
+
+    /// A book whose author list repeats a name (or differs only in case or
+    /// whitespace) used to hit UNIQUE(book, author) and abort the insert.
+    #[test]
+    fn a_book_with_duplicate_authors_is_added_with_each_author_once() {
+        let (dir, cache) = open_test_cache();
+        let source = write_temp_file(dir.path(), "dup.epub", b"x");
+        let mut meta = MetaInformation::default();
+        meta.title = "Dup".to_string();
+        meta.authors = vec!["Alice".into(), "alice".into(), "  ALICE ".into(), "Bob".into(), "".into()];
+        let id = cache.add_book(&source, &meta).unwrap();
+        assert_eq!(cache.field_for(id, "authors").unwrap().as_deref(), Some("Alice & Bob"));
+        // Only blanks: falls back to "Unknown" rather than no author.
+        let mut meta = MetaInformation::default();
+        meta.title = "Blank".to_string();
+        meta.authors = vec![" ".into()];
+        let id = cache.add_book(&source, &meta).unwrap();
+        assert_eq!(cache.field_for(id, "authors").unwrap().as_deref(), Some("Unknown"));
+    }
+
+    #[test]
+    fn set_field_with_repeated_items_links_each_once() {
+        let (_dir, cache) = open_test_cache();
+        let id = insert_book(&cache, "T");
+        cache.set_field(id, "authors", "Ann & ann & Bob").unwrap();
+        assert_eq!(cache.field_for(id, "authors").unwrap().as_deref(), Some("Ann & Bob"));
+        cache.set_field(id, "tags", "x, X, y").unwrap();
+        assert_eq!(cache.field_for(id, "tags").unwrap().as_deref(), Some("x, y"));
+    }
 
     #[test]
     fn get_data_as_dict_includes_core_fields_authors_and_tags() {

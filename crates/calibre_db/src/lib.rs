@@ -29,6 +29,7 @@ pub mod fts;
 pub mod lazy;
 pub mod legacy;
 pub mod grouping;
+pub mod junk_metadata;
 pub mod import;
 pub mod library;
 pub mod library_check;
