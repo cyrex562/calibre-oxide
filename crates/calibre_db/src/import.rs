@@ -29,9 +29,14 @@
 //!    The source is only ever *read*.
 //! 4. **Decides duplicates** ([`DuplicatePolicy`]) from the hash, before the
 //!    expensive part.
-//! 5. **Reads real embedded metadata** from the staged copy (title, authors,
-//!    cover -- what the scan's enrichment pass fills in, here up front), falling
-//!    back to the filename for a file with nothing in it.
+//! 5. **Reads real metadata**: the embedded metadata of the staged copy
+//!    (title, authors, series, publisher, tags, identifiers, languages,
+//!    comments, rating, cover), falling back to the filename for a file with
+//!    nothing in it; then calibre-style `.opf` sidecars in the *source* folder
+//!    -- `<stem>.opf` beside a book file, or `metadata.opf` when the book is
+//!    alone in its folder -- which take precedence, with `cover.jpg`/`cover.png`
+//!    beside the `metadata.opf` as the cover when the book has none. Duplicate
+//!    checks use the final values.
 //! 6. **Writes in batches**: [`Cache::import_books_batch`] creates the
 //!    books in one transaction and renames the verified staged files into
 //!    calibre's `Author/Title (id)/Title - Author.ext` layout.
@@ -280,6 +285,9 @@ fn metadata_priority(ext: &str) -> usize {
 
 struct Group {
     files: Vec<Candidate>,
+    /// The only book in its folder, so a `metadata.opf` there is about this
+    /// book (always true in one-book-per-folder mode).
+    solo_in_dir: bool,
 }
 
 fn group(candidates: Vec<Candidate>, mode: ImportMode, skipped_same_format: &mut Vec<String>) -> Vec<Group> {
@@ -310,9 +318,117 @@ fn group(candidates: Vec<Candidate>, mode: ImportMode, skipped_same_format: &mut
             }
         }
         kept.sort_by(|a, b| metadata_priority(&a.ext).cmp(&metadata_priority(&b.ext)).then(a.ext.cmp(&b.ext)));
-        groups.push(Group { files: kept });
+        groups.push(Group { files: kept, solo_in_dir: true });
+    }
+    let mut per_dir: HashMap<PathBuf, usize> = HashMap::new();
+    for g in &groups {
+        *per_dir.entry(g.files[0].dir.clone()).or_default() += 1;
+    }
+    for g in &mut groups {
+        g.solo_in_dir = per_dir[&g.files[0].dir] == 1;
     }
     groups
+}
+
+/// What a book's sidecars say, read from the **source** folder (the staged
+/// copy has no neighbours).
+#[derive(Default)]
+struct Sidecar {
+    opf: Option<calibre_ebooks::metadata::MetaInformation>,
+    cover: Option<(String, Vec<u8>)>,
+}
+
+/// Cap on a sidecar cover: a sane cover is a few hundred KiB.
+const SIDECAR_COVER_MAX: u64 = 32 * 1024 * 1024;
+
+/// calibre-style sidecars of a group: `<stem>.opf` next to a book file, and
+/// `metadata.opf` in the folder when the book is alone in it (what calibre's
+/// own library layout and `calibredb export` produce). The per-file sidecar
+/// wins over the folder-level one. A `cover.jpg`/`cover.png` next to the
+/// `metadata.opf` that was used is the fallback cover.
+fn read_sidecars(g: &Group) -> Sidecar {
+    let mut out = Sidecar::default();
+    let parse = |p: &Path| -> Option<calibre_ebooks::metadata::MetaInformation> {
+        let text = fs::read_to_string(p).ok()?;
+        calibre_ebooks::opf::parse_opf(&text).ok()
+    };
+    for f in &g.files {
+        let p = f.dir.join(format!("{}.opf", f.stem));
+        if let Some(m) = parse(&p) {
+            out.opf = Some(m);
+            break;
+        }
+    }
+    if out.opf.is_none() && g.solo_in_dir {
+        let dir = &g.files[0].dir;
+        if let Some(m) = parse(&dir.join("metadata.opf")) {
+            out.opf = Some(m);
+        }
+    }
+    if out.opf.is_some() && g.solo_in_dir {
+        let dir = &g.files[0].dir;
+        for name in ["cover.jpg", "cover.jpeg", "cover.png"] {
+            let p = dir.join(name);
+            if fs::metadata(&p).map(|m| m.is_file() && m.len() > 0 && m.len() <= SIDECAR_COVER_MAX).unwrap_or(false) {
+                if let Ok(bytes) = fs::read(&p) {
+                    out.cover = Some((p.extension().and_then(|e| e.to_str()).unwrap_or("jpg").to_string(), bytes));
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Lays `found`'s real values over `mi`: a value `found` does not have (or
+/// has only as the parser's placeholder -- "Unknown", language "und") leaves
+/// `mi` as it was. Used for embedded metadata, then again for the OPF
+/// sidecar, which therefore wins.
+fn overlay(mi: &mut calibre_ebooks::metadata::MetaInformation, found: &calibre_ebooks::metadata::MetaInformation) {
+    let title = found.title.trim();
+    if !title.is_empty() && title != "Unknown" {
+        mi.title = title.to_string();
+    }
+    let real: Vec<String> = found.authors.iter().map(|a| a.trim().to_string()).filter(|a| !a.is_empty() && a != "Unknown").collect();
+    if !real.is_empty() {
+        mi.authors = real;
+    }
+    if found.title_sort.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+        mi.title_sort = found.title_sort.clone();
+    }
+    if found.pubdate.is_some() {
+        mi.pubdate = found.pubdate;
+    }
+    if let Some(p) = found.publisher.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        mi.publisher = Some(p.to_string());
+    }
+    let tags: Vec<String> = found.tags.iter().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
+    if !tags.is_empty() {
+        mi.tags = tags;
+    }
+    if let Some(series) = found.series.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        mi.series = Some(series.to_string());
+        mi.series_index = found.series_index;
+    }
+    let langs: Vec<String> = found.languages.iter().map(|l| l.trim().to_string()).filter(|l| !l.is_empty() && l != "und").collect();
+    if !langs.is_empty() {
+        mi.languages = langs;
+    }
+    if found.comments.as_deref().is_some_and(|c| !c.trim().is_empty()) {
+        mi.comments = found.comments.clone();
+    }
+    if found.rating.is_some_and(|r| r > 0.0) {
+        mi.rating = found.rating;
+    }
+    for (k, v) in &found.identifiers {
+        // `calibre:<id>` points into the library the OPF came from.
+        if !k.is_empty() && !v.trim().is_empty() && k != "calibre" {
+            mi.identifiers.insert(k.clone(), v.trim().to_string());
+        }
+    }
+    if !found.cover_data.1.is_empty() {
+        mi.cover_data = found.cover_data.clone();
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -617,7 +733,8 @@ fn import_batch(
     //    format. In parallel: a PDF cover render is not free.
     let metas = crate::scan_pipeline::parallel_map(&planned, pipeline.workers, control, |p| {
         let best = p.keep.iter().min_by_key(|(fi, _)| metadata_priority(&batch[p.group].files[*fi].ext)).expect("a plan keeps at least one file");
-        calibre_ebooks::metadata::get_metadata(&best.1.path).ok()
+        let embedded = calibre_ebooks::metadata::get_metadata(&best.1.path).ok();
+        (embedded, read_sidecars(&batch[p.group]))
     });
     if control.is_cancelled() {
         return Ok(false);
@@ -633,19 +750,21 @@ fn import_batch(
         let mut mi = calibre_ebooks::metadata::MetaInformation::default();
         mi.title = first.stem.clone();
         mi.authors = vec!["Unknown".to_string()];
-        if let Some(Some(found)) = meta {
-            let title = found.title.trim();
-            if !title.is_empty() && title != "Unknown" {
-                mi.title = title.to_string();
+        // Embedded metadata first, then the sidecar OPF over it (calibre's
+        // add does the same). Everything below -- duplicate checks and the
+        // book itself -- sees the final values.
+        if let Some((embedded, sidecar)) = meta {
+            if let Some(found) = embedded {
+                overlay(&mut mi, &found);
             }
-            let real: Vec<String> = found.authors.iter().map(|a| a.trim().to_string()).filter(|a| !a.is_empty() && a != "Unknown").collect();
-            if !real.is_empty() {
-                mi.authors = real;
+            if let Some(opf) = &sidecar.opf {
+                overlay(&mut mi, opf);
             }
-            mi.title_sort = found.title_sort.clone();
-            mi.pubdate = found.pubdate;
-            mi.series_index = found.series_index;
-            mi.cover_data = found.cover_data.clone();
+            if mi.cover_data.1.is_empty() {
+                if let Some(cover) = sidecar.cover {
+                    mi.cover_data = (Some(cover.0), cover.1);
+                }
+            }
         }
 
         if matches!(policy, DuplicatePolicy::SkipTitleAuthor | DuplicatePolicy::AddFormatsToExisting) {

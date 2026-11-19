@@ -19,6 +19,11 @@ fn write(path: &Path, bytes: &[u8]) {
 /// A real, minimal EPUB whose OPF carries a title and an author, which is
 /// what the importer must read instead of guessing from the filename.
 fn epub(title: &str, author: &str, nonce: &str) -> Vec<u8> {
+    epub_with(title, author, nonce, "")
+}
+
+/// [`epub`] with extra `metadata` XML (publisher, subjects, ...).
+fn epub_with(title: &str, author: &str, nonce: &str, extra: &str) -> Vec<u8> {
     let mut out = std::io::Cursor::new(Vec::new());
     {
         let mut zip = zip::ZipWriter::new(&mut out);
@@ -33,7 +38,7 @@ fn epub(title: &str, author: &str, nonce: &str) -> Vec<u8> {
         zip.start_file("OEBPS/content.opf", stored).unwrap();
         zip.write_all(
             format!(
-                r#"<?xml version="1.0" encoding="utf-8"?><package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="id"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf"><dc:title>{title}</dc:title><dc:creator opf:role="aut">{author}</dc:creator><dc:identifier id="id">{nonce}</dc:identifier><dc:language>en</dc:language></metadata><manifest/><spine/></package>"#
+                r#"<?xml version="1.0" encoding="utf-8"?><package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="id"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf"><dc:title>{title}</dc:title><dc:creator opf:role="aut">{author}</dc:creator><dc:identifier id="id">{nonce}</dc:identifier><dc:language>en</dc:language>{extra}</metadata><manifest/><spine/></package>"#
             )
             .as_bytes(),
         )
@@ -477,4 +482,95 @@ fn names_follow_calibres_construct_path_name() {
     let (folder, stem) = crate::cache::import_names(12345, &long, &long);
     assert!(folder.ends_with(" (12345)"), "{folder}");
     assert!(folder.len() < 220 && stem.len() < 80, "{} {}", folder.len(), stem.len());
+}
+
+fn opf(title: &str, author: &str, extra: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="utf-8"?><package xmlns="http://www.idpf.org/2007/opf" version="2.0"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf"><dc:title>{title}</dc:title><dc:creator opf:role="aut">{author}</dc:creator>{extra}</metadata></package>"#
+    )
+}
+
+const RICH: &str = r#"<dc:publisher>Chilton</dc:publisher><dc:subject>scifi</dc:subject><dc:subject>classic</dc:subject><dc:identifier opf:scheme="ISBN">9780441172719</dc:identifier><dc:description>A desert planet.</dc:description><meta name="calibre:series" content="Dune Chronicles"/><meta name="calibre:series_index" content="1"/><meta name="calibre:rating" content="8"/>"#;
+
+fn field(cache: &Cache, id: i32, f: &str) -> String {
+    cache.field_for(id, f).unwrap().unwrap_or_default()
+}
+
+#[test]
+fn embedded_publisher_tags_identifiers_series_languages_comments_and_rating_are_kept() {
+    let (_lib, cache) = library();
+    let src = tempfile::tempdir().unwrap();
+    write(&src.path().join("a.epub"), &epub_with("Dune", "Frank Herbert", "1", RICH));
+
+    let report = run(&cache, src.path(), &ImportOptions::default());
+
+    let id = report.added[0].book_id;
+    assert_eq!(field(&cache, id, "publisher"), "Chilton");
+    let tags = field(&cache, id, "tags");
+    assert!(tags.contains("scifi") && tags.contains("classic"), "{tags}");
+    assert_eq!(field(&cache, id, "identifiers"), "isbn:9780441172719");
+    assert_eq!(field(&cache, id, "series"), "Dune Chronicles");
+    assert_eq!(field(&cache, id, "languages"), "en");
+    assert_eq!(field(&cache, id, "comments"), "A desert planet.");
+    assert_eq!(field(&cache, id, "rating"), "8");
+}
+
+#[test]
+fn a_metadata_opf_beats_the_embedded_metadata_and_its_cover_is_used() {
+    let (_lib, cache) = library();
+    let src = tempfile::tempdir().unwrap();
+    let dir = src.path().join("Frank Herbert").join("Dune (7)");
+    write(&dir.join("dune.epub"), &epub_with("Embedded Title", "Embedded Author", "1", "<dc:publisher>Embedded Press</dc:publisher>"));
+    write(&dir.join("metadata.opf"), opf("Dune", "Frank Herbert", RICH).as_bytes());
+    write(&dir.join("cover.jpg"), &[0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3, 4]);
+
+    let report = run(&cache, src.path(), &ImportOptions::default());
+
+    assert_eq!(report.books_added, 1, "{report:?}");
+    let id = report.added[0].book_id;
+    assert_eq!(field(&cache, id, "title"), "Dune");
+    assert_eq!(field(&cache, id, "authors"), "Frank Herbert");
+    assert_eq!(field(&cache, id, "publisher"), "Chilton");
+    assert_eq!(field(&cache, id, "series"), "Dune Chronicles");
+    assert!(cache.has_cover(id).unwrap(), "the sidecar cover was not used");
+    // The sidecar files themselves are not books.
+    assert_eq!(report.files_seen, 1);
+}
+
+#[test]
+fn a_stem_opf_beside_a_file_applies_to_that_file_and_not_its_neighbours() {
+    let (_lib, cache) = library();
+    let src = tempfile::tempdir().unwrap();
+    write(&src.path().join("one.epub"), &epub("Scan1", "Unknown", "1"));
+    write(&src.path().join("one.opf"), opf("First Book", "Ann Author", "<dc:publisher>P1</dc:publisher>").as_bytes());
+    write(&src.path().join("two.epub"), &epub("Scan2", "Unknown", "2"));
+    // Two books share the folder, so this one is nobody's metadata.
+    write(&src.path().join("metadata.opf"), opf("Wrong", "Nobody", "").as_bytes());
+
+    let report = run(&cache, src.path(), &ImportOptions::default());
+
+    assert_eq!(report.books_added, 2, "{report:?}");
+    assert_eq!(titles(&cache), vec!["First Book", "Scan2"]);
+    let first = report.added.iter().find(|a| a.title == "First Book").unwrap();
+    assert_eq!(field(&cache, first.book_id, "publisher"), "P1");
+    assert_eq!(field(&cache, first.book_id, "authors"), "Ann Author");
+}
+
+/// The exact title/author check must see what the book will really be
+/// called, which with a sidecar is not what the file says.
+#[test]
+fn duplicate_checks_use_the_opf_title_and_authors() {
+    let (_lib, cache) = library();
+    let first = tempfile::tempdir().unwrap();
+    write(&first.path().join("dune.epub"), &epub("Dune", "Frank Herbert", "a"));
+    run(&cache, first.path(), &ImportOptions::default());
+
+    let second = tempfile::tempdir().unwrap();
+    write(&second.path().join("x.epub"), &epub("Something Else", "Someone Else", "b"));
+    write(&second.path().join("x.opf"), opf("Dune", "Frank Herbert", "").as_bytes());
+
+    let report = run(&cache, second.path(), &ImportOptions { policy: DuplicatePolicy::SkipTitleAuthor, ..Default::default() });
+
+    assert_eq!(report.skipped_duplicate_title, 1, "{report:?}");
+    assert_eq!(report.books_added, 0);
 }

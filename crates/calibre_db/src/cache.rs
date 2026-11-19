@@ -188,16 +188,6 @@ thread_local! {
     pub(crate) static FORCE_TRASH_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Sends one file to the system wastebasket. Never falls back to a
-/// permanent delete: if there is no wastebasket the file stays.
-pub(crate) fn trash_one(path: &Path) -> Result<(), String> {
-    #[cfg(test)]
-    if FORCE_TRASH_FAILURE.with(|f| f.get()) {
-        return Err("forced trash failure".to_string());
-    }
-    trash::delete(path).map_err(|e| e.to_string())
-}
-
 /// What [`Cache::insert_book_in_tx`] created.
 pub(crate) struct InsertedBook {
     pub id: i32,
@@ -1057,9 +1047,58 @@ impl Cache {
                         log::warn!("imported book {} but its cover could not be stored: {e}", done.book.id);
                     }
                 }
+                self.apply_descriptive_metadata(done.book.id, &item.metadata);
                 Ok(done.book)
             })
             .collect()
+    }
+
+    /// Writes the descriptive fields [`Cache::insert_book_in_tx`] does not
+    /// (publisher, series, tags, identifiers, languages, comments, rating),
+    /// through [`Cache::set_field`] so each one is logged like any edit.
+    ///
+    /// Best effort per field: the book and its files are already committed,
+    /// and a field that cannot be written is worth a warning, not losing the
+    /// book. Placeholder values (language `und`) are not written, and a tag
+    /// or identifier containing the field's own separator is skipped rather
+    /// than split into pieces.
+    pub(crate) fn apply_descriptive_metadata(&self, book_id: i32, m: &MetaInformation) {
+        let mut set = |field: &str, value: String| {
+            if let Err(e) = self.set_field(book_id, field, &value) {
+                log::warn!("book {book_id}: could not set {field}: {e:#}");
+            }
+        };
+        if let Some(p) = m.publisher.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+            set("publisher", p.to_string());
+        }
+        if let Some(s) = m.series.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            set("series", s.to_string());
+        }
+        let mut tags: Vec<&str> = Vec::new();
+        for t in m.tags.iter().map(|t| t.trim()).filter(|t| !t.is_empty() && !t.contains(',')) {
+            if !tags.contains(&t) {
+                tags.push(t);
+            }
+        }
+        if !tags.is_empty() {
+            set("tags", tags.join(", "));
+        }
+        let langs: Vec<&str> = m.languages.iter().map(|l| l.trim()).filter(|l| !l.is_empty() && *l != "und" && !l.contains(',')).collect();
+        if !langs.is_empty() {
+            set("languages", langs.join(", "));
+        }
+        let mut ids: Vec<String> = m.identifiers.iter().filter(|(k, v)| !k.is_empty() && !v.trim().is_empty() && !k.contains([',', ':']) && !v.contains(',')).map(|(k, v)| format!("{k}:{}", v.trim())).collect();
+        ids.sort();
+        if !ids.is_empty() {
+            set("identifiers", ids.join(","));
+        }
+        if let Some(c) = m.comments.as_deref().filter(|c| !c.trim().is_empty()) {
+            set("comments", c.to_string());
+        }
+        // calibre stores a rating as 0-10 (half stars).
+        if let Some(r) = m.rating.filter(|r| *r > 0.0) {
+            set("rating", (r.round() as i32).clamp(1, 10).to_string());
+        }
     }
 
     /// Every `(folder, file stem, FORMAT)` the library already has a row
@@ -1647,7 +1686,7 @@ impl Cache {
             crate::custom_columns::purge_book(&conn, book_id)?;
             conn.execute("DELETE FROM books WHERE id = ?1", (book_id,))?;
         }
-        if let Some(uuid) = uuid {
+        if let Some(uuid) = uuid.clone() {
             self.record(crate::change_log::ChangeOp::BookRemoved { book: uuid });
         }
 
@@ -1672,11 +1711,43 @@ impl Cache {
                     outcome.failed.push((rel, why));
                 }
                 if outcome.failed.is_empty() {
+                    // `data/` subfolders emptied by the move would keep the
+                    // folder from going.
+                    self.prune_empty_data_dirs(&path_rel, dedicated, uuid.as_deref());
                     outcome.folder_removed = self.remove_book_folder_if_empty(&path_rel, dedicated);
                 }
             }
         }
         Ok(outcome)
+    }
+
+    /// Removes directories left empty under the book's `data/` (or
+    /// `data/<uuid>` for a root book). `remove_dir` only ever removes an empty
+    /// directory, so no file can be lost here.
+    fn prune_empty_data_dirs(&self, path_rel: &str, dedicated: bool, uuid: Option<&str>) {
+        if !path_is_plain(path_rel) && !path_rel.is_empty() {
+            return;
+        }
+        let library = &self.backend.library_path;
+        let root = if path_rel.is_empty() {
+            let Some(uuid) = uuid.filter(|u| !u.is_empty()) else { return };
+            library.join(crate::constants::DATA_DIR_NAME).join(uuid)
+        } else if dedicated {
+            library.join(path_rel).join(crate::constants::DATA_DIR_NAME)
+        } else {
+            return;
+        };
+        fn prune(dir: &Path) {
+            if let Ok(entries) = fs::read_dir(dir) {
+                for e in entries.flatten() {
+                    if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                        prune(&e.path());
+                    }
+                }
+            }
+            let _ = fs::remove_dir(dir);
+        }
+        prune(&root);
     }
 
     /// True when no *other* book row has this `path`. An empty path is
@@ -1731,6 +1802,22 @@ impl Cache {
         if dedicated {
             for extra in ["cover.jpg", "metadata.opf"] {
                 out.push(OwnFile { rel: format!("{path_rel}/{extra}"), hash: None, is_format: false });
+            }
+        }
+        // The book's `data/` files (a dedicated folder's own `data/`, or
+        // `data/<uuid>/` for a book in the library root) go with it, so a
+        // delete -- and a merge, which deletes its sources -- leaves nothing
+        // behind and a restore brings them back.
+        if dedicated || path_rel.is_empty() {
+            let library = &self.backend.library_path;
+            if let Ok(extras) = crate::extra_files::list_extra_files(self, book_id, crate::constants::DATA_FILE_PATTERN) {
+                for extra in extras {
+                    let Ok(rel) = extra.file_path.strip_prefix(library) else { continue };
+                    let rel = rel.to_string_lossy().replace('\\', "/");
+                    if path_is_plain(&rel) {
+                        out.push(OwnFile { rel, hash: None, is_format: false });
+                    }
+                }
             }
         }
         Ok(out)
