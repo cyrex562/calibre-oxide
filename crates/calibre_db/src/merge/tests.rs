@@ -348,6 +348,68 @@ fn a_source_that_cannot_be_trashed_is_still_merged_and_its_files_stay() {
     assert!(path.is_file(), "never hard-deleted");
 }
 
+fn data_files(c: &Cache, id: i32) -> Vec<String> {
+    let mut v: Vec<String> = crate::extra_files::list_extra_files(c, id, "data/**/*").unwrap().into_iter().map(|f| f.relpath).collect();
+    v.sort();
+    v
+}
+
+/// The OS recycle bin does not exist on a network share, so a source's data
+/// files must leave through the library's own trash: nothing stays in the
+/// source's folder, nothing is lost, and a restore brings them back.
+#[test]
+fn a_sources_data_files_go_to_the_library_trash_and_come_back_on_restore() {
+    let l = lib();
+    let dest = l.book("d", "pdf", "dest pdf", "T", "A");
+    let src = l.in_folder("shelf", "s.epub", "src epub");
+    let mut files = std::collections::HashMap::new();
+    files.insert("data/x/notes.txt".to_string(), b"first".to_vec());
+    files.insert("data/y/notes.txt".to_string(), b"second".to_vec());
+    files.insert("data/top.txt".to_string(), b"third".to_vec());
+    crate::extra_files::add_extra_files(&l.cache, src, &files, true).unwrap();
+    assert_eq!(data_files(&l.cache, src).len(), 3);
+
+    let report = merge_books(&l.cache, dest, &[src], &opts(MergeMode::MergeAndDelete)).unwrap();
+
+    assert!(report.sources[0].failed.is_empty(), "{report:?}");
+    assert!(!l.exists(src));
+    let landed: Vec<String> = crate::extra_files::list_extra_files(&l.cache, dest, "data/**/*").unwrap().into_iter().map(|f| std::fs::read_to_string(f.file_path).unwrap()).collect();
+    assert_eq!(landed.len(), 3, "{landed:?}");
+    for want in ["first", "second", "third"] {
+        assert!(landed.iter().any(|c| c == want), "{want} missing from {landed:?}");
+    }
+    // Nothing left behind: the source's folder is gone entirely.
+    assert!(!l.dir.path().join("shelf").exists(), "the source's folder was left behind");
+    // In the library trash, and restorable.
+    let entry = l.cache.list_trash().unwrap().into_iter().find(|e| e.book_id == src).expect("a trash entry");
+    assert!(entry.problem.is_none(), "{entry:?}");
+    l.cache.restore_trashed_book(&entry.key).unwrap();
+    assert_eq!(std::fs::read_to_string(l.dir.path().join("shelf/data/x/notes.txt")).unwrap(), "first");
+    assert_eq!(std::fs::read_to_string(l.dir.path().join("shelf/data/y/notes.txt")).unwrap(), "second");
+    assert_eq!(std::fs::read_to_string(l.dir.path().join("shelf/data/top.txt")).unwrap(), "third");
+}
+
+/// A root-level book keeps its data under `data/<uuid>/`.
+#[test]
+fn a_root_books_data_files_are_trashed_with_it_too() {
+    let l = lib();
+    let dest = l.book("d", "pdf", "dest pdf", "T", "A");
+    let src = l.book("s", "epub", "src epub", "T", "A");
+    let mut files = std::collections::HashMap::new();
+    files.insert("data/n.txt".to_string(), b"note".to_vec());
+    crate::extra_files::add_extra_files(&l.cache, src, &files, true).unwrap();
+    let uuid = l.cache.book_uuid(src).unwrap().unwrap();
+    let original = l.dir.path().join("data").join(&uuid).join("n.txt");
+    assert!(original.is_file());
+
+    merge_books(&l.cache, dest, &[src], &opts(MergeMode::MergeAndDelete)).unwrap();
+
+    assert!(!original.exists());
+    assert!(!l.dir.path().join("data").join(&uuid).exists(), "the emptied data folder was left behind");
+    assert_eq!(data_files(&l.cache, dest), vec!["data/n.txt"]);
+    assert!(l.cache.list_trash().unwrap().iter().any(|e| e.book_id == src));
+}
+
 #[test]
 fn a_dry_run_reports_and_changes_nothing() {
     let l = lib();
