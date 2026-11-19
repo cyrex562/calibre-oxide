@@ -350,7 +350,17 @@ impl Cache {
         let files = own
             .iter()
             .map(|f| {
-                let (_, stored) = split_rel(&f.rel);
+                let (folder, mut stored) = split_rel(&f.rel);
+                // A file from `data/` may sit in a subfolder, and two
+                // subfolders can hold the same file name: flatten the path
+                // so the entry's names cannot collide.
+                if !f.is_format {
+                    let own = path_rel.trim_matches('/');
+                    let below = f.rel.strip_prefix(own).map(|r| r.trim_start_matches('/')).unwrap_or(&folder);
+                    if below.contains('/') {
+                        stored = below.replace('/', "~~");
+                    }
+                }
                 let (name, format) = if f.is_format {
                     let p = Path::new(&stored);
                     (p.file_stem().map(|s| s.to_string_lossy().to_string()), p.extension().map(|e| e.to_string_lossy().to_uppercase()))

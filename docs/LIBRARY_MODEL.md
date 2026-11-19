@@ -316,8 +316,12 @@ the library** (`db/backend.py`: `move_book_to_trash`, `move_book_files_to_trash`
 **How it differs from calibre, because the folder may be shared.** calibre moves
 a book's *folder*; here a folder can hold many books and the user's own files,
 so only the book's **own files** move (its `data` rows' files, plus `cover.jpg`
-and `metadata.opf` when its folder is its alone), as `delete_book_with` has
-always done. The entry holds them flat, with an `oxide-trash.json` manifest:
+and `metadata.opf` when its folder is its alone, plus the book's `data/` extra
+files when the folder is its alone or the book lives in the library root under
+`data/<uuid>/`), as `delete_book_with` has always done. Merge deletes its
+sources the same way, so a merged-away book's extra files travel in its trash
+entry (restorable with it) and its emptied folder goes; the OS recycle bin is
+never involved. The entry holds them flat, with an `oxide-trash.json` manifest:
 the original relative path of each file, the uuid, the metadata a restore
 writes back. A trashed in-place file is restorable to its **original relative
 path**; if something has taken the name since it comes back as
@@ -347,6 +351,16 @@ library — the counterpart of scanning, which indexes files already there.
 * One read per source file: copied into `.calibre-oxide/import-staging` while
   being hashed, the copy re-read and compared (size + BLAKE3), then **renamed**
   into `Author/Title (id)/Title - Author.ext` in one transaction per batch.
+* Metadata is carried over, not just title/author: from the embedded metadata
+  the title, authors, series (and index), publisher, tags, identifiers (ISBN
+  etc.), languages, comments, rating, pubdate and cover; then calibre-style
+  **sidecars in the source folder** override it — `<stem>.opf` beside a book
+  file, or `metadata.opf` when the book is the only one in its folder — and a
+  `cover.jpg`/`cover.png` beside the used `metadata.opf` is the cover when the
+  book has none. The title/author duplicate checks use these final values.
+  (Placeholders — title/author `Unknown`, language `und` — never override a
+  real value; tags/identifiers containing a comma are skipped, since the
+  field writers join on commas.)
 * Resumable: a ledger in the checksum sidecar remembers every source file's
   outcome, so a rerun skips what was done without reading it. The source is
   never modified.
@@ -358,6 +372,7 @@ library — the counterpart of scanning, which indexes files already there.
 | Adding single files from outside the folder | the file is copied to the **folder root**, keeping its own filename; ` (1)` on collision. An import is then indistinguishable from a file copied in by hand. |
 | Adding a *folder* (Add folder / `POST /import-folder`) | a job: the tree is copied in, recursively, into calibre's `Author/Title (id)/Title - Author.ext` layout, with real embedded metadata. See "Importing a folder tree" below. |
 | Deleting a book | **asks**, with "remove from library" preselected and "delete the file as well" the explicit second choice. In a folder the user owns, erasing their file on a keypress is not a default. File deletion moves the book's own files into the library's `.caltrash` (see "The trash"), as calibre does — the OS bin is not used, because a network share has none. |
+| Auto-add drop folder (outside the library) | a file that was *added* is **moved** into `<drop folder>/.added/` (renamed `name (1).ext` on a collision, never overwritten) — never deleted, and not the OS bin, which an SMB share lacks. Which files were added is decided per exact path from the add result, not by matching names in messages. Duplicates and failures stay in the drop folder. |
 | Change detection | scan on open and on demand. A filesystem watcher is a later addition, for local volumes only — it is a new dependency and unreliable on network shares and at scale. |
 | Moving between libraries | ask move-or-copy once per operation. |
 | Covers | `.calibre-oxide/covers/<id>.jpg`. `<book dir>/cover.jpg` collides for every book in a flat folder. |

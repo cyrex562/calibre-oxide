@@ -54,7 +54,8 @@
 //!   are never kept: they add nothing.
 //! * **Files are copied, verified, then the source is trashed**, never
 //!   moved: see below. calibre reads each file into the destination and
-//!   deletes the source book to the recycle bin; this does the same, but only
+//!   deletes the source book to its trash; this does the same -- into the
+//!   library's own `.caltrash`, data files included, never the OS recycle bin -- but only
 //!   after checking size and BLAKE3 of what landed.
 //! * **Not one SQL transaction.** Each metadata field goes through the same
 //!   write path as an ordinary edit (so the change log records it and a
@@ -394,8 +395,8 @@ fn has_own_data_files(cache: &Cache, book_id: i32) -> bool {
 }
 
 /// calibre's `merge_extra_files`: copy the source's data files into the
-/// destination (conflicts auto-renamed), verify, then trash the originals so
-/// the source's folder can go. Skipped, with a warning, when the source
+/// destination (conflicts auto-renamed) and verify. The originals are moved
+/// to the in-library trash with the source book when it is deleted. Skipped, with a warning, when the source
 /// shares its folder with other books, because `data/` is then theirs too.
 fn merge_data_files(cache: &Cache, dest_id: i32, sr: &mut SourceReport, dry: bool) -> Result<()> {
     let path = cache.field_for(sr.book_id, "path")?.unwrap_or_default();
@@ -406,7 +407,6 @@ fn merge_data_files(cache: &Cache, dest_id: i32, sr: &mut SourceReport, dry: boo
         return Ok(());
     }
     let files = crate::extra_files::list_extra_files(cache, sr.book_id, crate::constants::DATA_FILE_PATTERN)?;
-    let library = cache.backend.library_path.clone();
     for file in files {
         if dry {
             sr.data_files_moved.push(file.relpath.clone());
@@ -419,19 +419,11 @@ fn merge_data_files(cache: &Cache, dest_id: i32, sr: &mut SourceReport, dry: boo
             bail!("the copy of {} does not match the original", file.relpath);
         }
         sr.data_files_moved.push(relpath);
-        match crate::cache::trash_one(&file.file_path) {
-            Ok(()) => sr.trashed.push(rel(cache, &file.file_path)),
-            Err(why) => sr.failed.push((rel(cache, &file.file_path), why)),
-        }
-        // Empty directories left behind; `remove_dir` refuses a non-empty one.
-        let mut dir = file.file_path.parent().map(Path::to_path_buf);
-        while let Some(d) = dir {
-            if d == library || !d.starts_with(&library) || std::fs::remove_dir(&d).is_err() {
-                break;
-            }
-            let was_data = d.file_name().is_some_and(|n| n == crate::constants::DATA_DIR_NAME);
-            dir = if was_data { None } else { d.parent().map(Path::to_path_buf) };
-        }
+        // The original is *not* removed here: it stays until the source book
+        // is deleted, which moves it into the library's own `.caltrash`
+        // together with the book (a restore brings it back). It used to go to
+        // the OS recycle bin, which a network share does not have, so the
+        // file was left behind and the source's folder could not go.
     }
     Ok(())
 }
