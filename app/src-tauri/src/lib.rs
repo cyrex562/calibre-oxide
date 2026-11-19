@@ -260,6 +260,11 @@ struct AddFolderResult {
     added: u32,
     duplicates: Vec<String>,
     errors: Vec<String>,
+    /// Exact source paths that were added as new books. Internal (not
+    /// sent to the page): the auto-add watcher decides what to move
+    /// aside from this, never by matching names in the messages above.
+    #[serde(skip)]
+    added_paths: Vec<std::path::PathBuf>,
 }
 
 /// The folder picker behind "Add folder".
@@ -313,7 +318,10 @@ async fn add_files_via_server(port: u16, files: &[std::path::PathBuf]) -> AddFol
         let url = format!("http://127.0.0.1:{port}/cdb/add-book/{}/n/{}/-", simple_job_id(), urlencoding::encode(&filename));
         match client.post(&url).body(body).send().await {
             Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
-                Ok(body) if body.get("book_id").is_some() => result.added += 1,
+                Ok(body) if body.get("book_id").is_some() => {
+                    result.added += 1;
+                    result.added_paths.push(path.clone());
+                }
                 Ok(_) => result.duplicates.push(filename),
                 Err(e) => result.errors.push(format!("{filename}: {e}")),
             },
@@ -637,6 +645,44 @@ fn auto_add_candidates(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     files
 }
 
+/// Subfolder of the drop folder that receives files once they have been
+/// added. It is a directory, so `auto_add_candidates` (which only looks
+/// at plain files directly in the folder) never picks it up again.
+const AUTO_ADD_DONE_DIR: &str = ".added";
+
+/// Moves an added source file into `<drop folder>/.added/`, returning
+/// where it went. A name collision is resolved by renaming (`a (1).epub`),
+/// never by overwriting, so no file is ever lost.
+fn move_to_added(drop_folder: &std::path::Path, source: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let dest_dir = drop_folder.join(AUTO_ADD_DONE_DIR);
+    std::fs::create_dir_all(&dest_dir)?;
+    let name = source.file_name().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"))?;
+    let stem = std::path::Path::new(name).file_stem().unwrap_or(name).to_string_lossy().into_owned();
+    let ext = std::path::Path::new(name).extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    let mut n = 0u32;
+    loop {
+        let candidate = if n == 0 { dest_dir.join(name) } else { dest_dir.join(format!("{stem} ({n}){ext}")) };
+        // `hard_link` fails if the target exists, so this claims the name
+        // atomically; a plain exists()+rename would race.
+        match std::fs::hard_link(source, &candidate) {
+            Ok(()) => {
+                std::fs::remove_file(source)?;
+                return Ok(candidate);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
+            Err(_) => {
+                // No hard links here (some network shares): fall back to
+                // a rename after checking the name is free.
+                if !candidate.exists() {
+                    std::fs::rename(source, &candidate)?;
+                    return Ok(candidate);
+                }
+                n += 1;
+            }
+        }
+    }
+}
+
 #[tauri::command]
 fn get_auto_add_folder(app: AppHandle) -> Option<String> {
     settings::get_auto_add_folder(&app).map(|p| p.to_string_lossy().into_owned())
@@ -695,10 +741,12 @@ async fn scan_library_via_server(port: u16) -> Result<serde_json::Value, String>
 /// distinction matters because getting it wrong destroys files.
 ///
 /// **Outside the library** it is a drop folder: each file is imported
-/// and then **removed** from the folder. That is the point of a drop
-/// folder -- leaving it would mean re-adding the same book on every
-/// scan, and de-duplicating by name would break the moment someone
-/// renamed a file.
+/// and then **moved** into an `.added/` subfolder of the drop folder
+/// (never deleted -- the OS Recycle Bin does not exist on network
+/// shares, and an import is not proof the library copy is good).
+/// Moving it out of the way is the point of a drop folder -- leaving it
+/// would mean re-adding the same book on every scan, and de-duplicating
+/// by name would break the moment someone renamed a file.
 ///
 /// **Inside the library** it is not a drop folder at all, it is part of
 /// the library (#889), and the same behaviour would be a bug twice over:
@@ -726,11 +774,12 @@ fn spawn_auto_add_watcher(app: AppHandle) {
                 // re-attached rather than duplicated.
                 match scan_library_via_server(port).await {
                     Ok(scanned) => AddFolderResult {
+                        added_paths: Vec::new(),
                         added: scanned["added"].as_array().map(|a| a.len() as u32).unwrap_or(0),
                         duplicates: Vec::new(),
                         errors: scanned["failed"].as_array().map(|f| f.iter().map(|e| format!("{}: {}", e["path"].as_str().unwrap_or_default(), e["error"].as_str().unwrap_or_default())).collect()).unwrap_or_default(),
                     },
-                    Err(e) => AddFolderResult { added: 0, duplicates: Vec::new(), errors: vec![e] },
+                    Err(e) => AddFolderResult { added: 0, duplicates: Vec::new(), errors: vec![e], added_paths: Vec::new() },
                 }
             } else {
                 let files = auto_add_candidates(&folder);
@@ -738,13 +787,12 @@ fn spawn_auto_add_watcher(app: AppHandle) {
                     continue;
                 }
                 let result = add_files_via_server(port, &files).await;
-                for path in &files {
-                    let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-                    // Only remove what really landed: a file that failed
-                    // or was a duplicate stays put, so nothing is lost
-                    // silently.
-                    if !result.errors.iter().any(|e| e.starts_with(&name)) && !result.duplicates.contains(&name) {
-                        let _ = std::fs::remove_file(path);
+                // Only what really landed is set aside, decided per exact
+                // path: a failed or duplicate file stays put, so nothing
+                // is lost silently.
+                for path in &result.added_paths {
+                    if let Err(e) = move_to_added(&folder, path) {
+                        eprintln!("auto-add: could not move {} aside: {e}", path.display());
                     }
                 }
                 result
@@ -997,6 +1045,33 @@ mod auto_add_tests {
         std::fs::create_dir(dir.path().join("subdir.epub")).unwrap();
 
         assert!(auto_add_candidates(dir.path()).is_empty(), "a directory named like a book is not a book");
+    }
+
+    #[test]
+    fn move_to_added_moves_the_file_and_keeps_it_out_of_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = write_with_age(dir.path(), "book.epub", 60);
+
+        let dest = move_to_added(dir.path(), &src).unwrap();
+
+        assert!(!src.exists());
+        assert_eq!(dest, dir.path().join(".added").join("book.epub"));
+        assert!(dest.exists());
+        assert!(auto_add_candidates(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn move_to_added_never_overwrites_on_a_name_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        for content in [b"first".as_slice(), b"second", b"third"] {
+            let src = dir.path().join("book.epub");
+            std::fs::write(&src, content).unwrap();
+            move_to_added(dir.path(), &src).unwrap();
+        }
+        let done = dir.path().join(".added");
+        assert_eq!(std::fs::read(done.join("book.epub")).unwrap(), b"first");
+        assert_eq!(std::fs::read(done.join("book (1).epub")).unwrap(), b"second");
+        assert_eq!(std::fs::read(done.join("book (2).epub")).unwrap(), b"third");
     }
 
     #[test]
