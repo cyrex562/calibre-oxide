@@ -634,7 +634,7 @@ export interface LibraryJobProgress {
 
 export interface LibraryJob<R = unknown> {
   id: number;
-  kind: "scan" | "enrich" | "hash_backfill" | "pdf_fingerprint" | "merge_exact" | "import" | "dedupe" | "resolve";
+  kind: "scan" | "enrich" | "hash_backfill" | "pdf_fingerprint" | "merge_exact" | "import" | "dedupe" | "resolve" | "prepare";
   state: "running" | "finished" | "cancelled" | "failed";
   progress: LibraryJobProgress;
   /** Present once the job has ended. */
@@ -706,6 +706,68 @@ export interface HashBackfillResult {
  */
 export function backfillHashes(handlers: LibraryJobHandlers<HashBackfillResult> = {}): Promise<HashBackfillResult> {
   return runLibraryJob<HashBackfillResult>("/hash-backfill/default", handlers);
+}
+
+/** The stages of the prepare chain, in order. */
+export const PREPARE_STAGES = ["scan", "hash", "fingerprint", "dedupe"] as const;
+export type PrepareStage = (typeof PREPARE_STAGES)[number];
+
+/** What the chained prepare job did; each stage's own report, or `{ error }` if it failed. */
+export interface PrepareResult {
+  started_at_stage: PrepareStage;
+  finished: boolean;
+  stages: Partial<Record<PrepareStage, Record<string, unknown> & { error?: string }>>;
+}
+
+/**
+ * Scan, hash, PDF-fingerprint and duplicate-scan the library as one job.
+ * Resumable: a rerun continues at the stage the last one reached.
+ */
+export function prepareLibrary(handlers: LibraryJobHandlers<PrepareResult> = {}): Promise<PrepareResult> {
+  return runLibraryJob<PrepareResult>("/prepare-library/default", handlers);
+}
+
+/** Which prepare stage a job's current phase belongs to, or null if it is not one of them. */
+export function prepareStageOfPhase(phase: string): PrepareStage | null {
+  switch (phase) {
+    case "walking":
+    case "indexing":
+    case "enriching":
+      return "scan";
+    case "hashing":
+      return "hash";
+    case "fingerprinting":
+      return "fingerprint";
+    case "matching":
+    case "describing":
+      return "dedupe";
+    default:
+      return null;
+  }
+}
+
+/** "Step 2 of 4 · Reading files… 10 of 50" for the prepare job's progress. */
+export function describePrepareProgress(p: LibraryJobProgress): string {
+  const stage = prepareStageOfPhase(p.phase);
+  const line = describeJobProgress(p);
+  if (stage === null) return line;
+  return `Step ${PREPARE_STAGES.indexOf(stage) + 1} of ${PREPARE_STAGES.length} · ${line}`;
+}
+
+/** One line for the finished prepare job: what it read, and which stages failed. */
+export function describePrepareResult(r: PrepareResult, cancelled = false): string {
+  const parts: string[] = [];
+  if (cancelled || !r.finished) parts.push("stopped early — run it again to continue");
+  const failed = PREPARE_STAGES.filter((s) => r.stages[s]?.error);
+  for (const s of failed) parts.push(`${s} failed: ${r.stages[s]?.error}`);
+  const hash = r.stages.hash as { hashed?: number; total?: number } | undefined;
+  if (hash && typeof hash.total === "number") {
+    parts.push(hash.total === 0 ? "every file already had a hash" : `${(hash.hashed ?? 0).toLocaleString("en-US")} of ${hash.total.toLocaleString("en-US")} files hashed`);
+  }
+  const fp = r.stages.fingerprint as { fingerprinted?: number; failed_count?: number } | undefined;
+  if (fp && typeof fp.fingerprinted === "number" && fp.fingerprinted > 0) parts.push(`${fp.fingerprinted.toLocaleString("en-US")} PDFs analysed`);
+  if (fp && (fp.failed_count ?? 0) > 0) parts.push(`${fp.failed_count} PDFs could not be read`);
+  return parts.length ? parts.join(" · ") : "Ready for duplicate detection.";
 }
 
 /** One line for a job's progress, for the UI to show while it runs. */

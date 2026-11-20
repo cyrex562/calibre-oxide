@@ -50,38 +50,53 @@ const MAX_IN_MEMORY_PDF_BYTES: u64 = 64 * 1024 * 1024;
 /// that the error says so and the caller keeps the filename for a title,
 /// which is better than exhausting memory on a metadata nicety.
 pub fn get_metadata_from_path(path: &Path) -> Result<MetaInformation> {
-    match crate::pdf::rasterize::info_and_cover_from_path(path, true) {
-        Ok((info, cover)) => {
-            let mut mi = MetaInformation::default();
-            // PDFium decodes every Info string as PDFDocEncoding; a producer
-            // that wrote UTF-8 comes back as mojibake, repaired here so this
-            // path agrees with the `lopdf` reader below.
-            if let Some(title) = info.title {
-                mi.title = repair_mojibake(&title);
+    get_metadata_from_path_at(path, Some(crate::pdf::rasterize::scan_cover_width()))
+}
+
+/// [`get_metadata_from_path`] with the cover's width chosen (`None`: no
+/// cover).
+pub fn get_metadata_from_path_at(path: &Path, cover_width: Option<u32>) -> Result<MetaInformation> {
+    match crate::pdf::rasterize::info_and_cover_from_path_at(path, cover_width) {
+        Ok((info, cover)) => Ok(metadata_from_pdfium_info(info, cover)),
+        Err(e) => get_metadata_without_pdfium(path, &e.to_string()),
+    }
+}
+
+/// The stream reader for a file PDFium could not read (`why`), with the
+/// [`MAX_IN_MEMORY_PDF_BYTES`] cap. Also the fallback after the out-of-process
+/// worker reports an error, so a bad PDF is never retried inside the server.
+pub fn get_metadata_without_pdfium(path: &Path, why: &str) -> Result<MetaInformation> {
+    let size = std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?.len();
+    if size > MAX_IN_MEMORY_PDF_BYTES {
+        anyhow::bail!("{} is {} MB and PDFium could not read it ({why}); not loading it into memory for its metadata", path.display(), size / (1024 * 1024));
+    }
+    get_metadata(std::io::BufReader::new(std::fs::File::open(path)?))
+}
+
+/// Builds metadata from what PDFium read: the Info strings and a page-1 cover.
+/// Shared by the in-process path and the out-of-process PDF worker's results.
+pub fn metadata_from_pdfium_info(info: crate::pdf::rasterize::PdfInfo, cover: Option<Vec<u8>>) -> MetaInformation {
+    let mut mi = MetaInformation::default();
+    // PDFium decodes every Info string as PDFDocEncoding; a producer
+    // that wrote UTF-8 comes back as mojibake, repaired here so this
+    // path agrees with the `lopdf` reader below.
+    if let Some(title) = info.title {
+        mi.title = repair_mojibake(&title);
+    }
+    if let Some(author) = info.author {
+        mi.authors = crate::metadata::authors::string_to_authors(&repair_mojibake(&author));
+    }
+    for value in [info.keywords, info.subject].into_iter().flatten().map(|v| repair_mojibake(&v)) {
+        for tag in value.split(&[',', ';'][..]).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+            if !mi.tags.contains(&tag) {
+                mi.tags.push(tag);
             }
-            if let Some(author) = info.author {
-                mi.authors = crate::metadata::authors::string_to_authors(&repair_mojibake(&author));
-            }
-            for value in [info.keywords, info.subject].into_iter().flatten().map(|v| repair_mojibake(&v)) {
-                for tag in value.split(&[',', ';'][..]).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
-                    if !mi.tags.contains(&tag) {
-                        mi.tags.push(tag);
-                    }
-                }
-            }
-            if let Some(data) = cover {
-                mi.cover_data = (Some("jpg".to_string()), data);
-            }
-            Ok(mi)
-        }
-        Err(e) => {
-            let size = std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?.len();
-            if size > MAX_IN_MEMORY_PDF_BYTES {
-                anyhow::bail!("{} is {} MB and PDFium could not read it ({e}); not loading it into memory for its metadata", path.display(), size / (1024 * 1024));
-            }
-            get_metadata(std::io::BufReader::new(std::fs::File::open(path)?))
         }
     }
+    if let Some(data) = cover {
+        mi.cover_data = (Some("jpg".to_string()), data);
+    }
+    mi
 }
 
 /// Port of `get_metadata(stream, cover)`.

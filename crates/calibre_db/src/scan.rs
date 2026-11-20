@@ -34,7 +34,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 
-use calibre_utils::filenames::{file_facts, FileFacts};
+use calibre_utils::filenames::{file_facts_from_metadata, FileFacts};
 
 use crate::constants::{DATA_DIR_NAME, LIBRARY_HANDLE_DIR_NAME, NOTES_DIR_NAME, TRASH_DIR_NAME};
 
@@ -140,6 +140,11 @@ pub struct ScanReport {
     /// Directories that could not be read. Any entry here makes the
     /// scan incomplete.
     pub unreadable: Vec<String>,
+    /// Content hashes the drift pass already computed for untracked files
+    /// (to look for a moved file), by relative path. Indexing uses them
+    /// instead of reading the files again; each is valid only for the size the
+    /// walk saw.
+    pub precomputed: std::collections::HashMap<String, crate::scan_pipeline::FileDigest>,
 }
 
 impl ScanReport {
@@ -267,11 +272,19 @@ fn walk_dir(root: &Path, dir: &Path, options: &ScanOptions, now: SystemTime, rep
         if !options.extensions.contains(&extension) {
             continue;
         }
-        if is_offline_on_disk(&path) {
+        // One `stat` for the entry, shared by the offline check and the facts
+        // (on Windows the directory listing already carried it). A symlink
+        // is followed, as it always was.
+        let metadata = if file_type.is_symlink() { std::fs::metadata(&path) } else { entry.metadata() };
+        let Ok(metadata) = metadata else {
+            report.unreadable.push(relative_to(root, dir));
+            continue;
+        };
+        if is_offline_metadata(&metadata) {
             report.offline.push(relative_to(root, &path));
             continue;
         }
-        let Some(facts) = file_facts(&path) else {
+        let Some(facts) = file_facts_from_metadata(&path, &metadata) else {
             // Present in the listing but not stat-able: another
             // unreadable condition, not an absent file.
             report.unreadable.push(relative_to(root, dir));
@@ -328,26 +341,24 @@ fn extension_of(name: &str) -> Option<String> {
 /// instead, so unlike iCloud there is nothing in the name to notice.
 /// Reading one downloads it, which on a metered connection is somebody's
 /// data allowance, so it is reported and left alone until it is local.
-fn is_offline_on_disk(path: &Path) -> bool {
+fn is_offline_metadata(metadata: &std::fs::Metadata) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_OFFLINE: u32 = 0x0000_1000;
         const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0004_0000;
         const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
-        if let Ok(metadata) = std::fs::metadata(path) {
-            let attrs = metadata.file_attributes();
-            let placeholder = FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
-            return attrs & placeholder != 0;
-        }
+        let attrs = metadata.file_attributes();
+        let placeholder = FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
+        return attrs & placeholder != 0;
     }
     #[cfg(not(windows))]
     {
         // No portable equivalent: Linux has no such attribute, and the
         // macOS case is caught by name above.
-        let _ = path;
+        let _ = metadata;
+        false
     }
-    false
 }
 
 fn is_settling(facts: &FileFacts, settle: Duration, now: SystemTime) -> bool {
@@ -429,6 +440,11 @@ pub struct UntrackedCount {
     pub conclusive: bool,
 }
 
+/// How long [`count_untracked`] may walk before giving up and reporting what
+/// it has so far (as "at least"). Opening a library must not mean walking all
+/// of a very large, fully tracked one.
+pub const UNTRACKED_COUNT_BUDGET: Duration = Duration::from_secs(4);
+
 /// Counts the files a scan would add, without reading any of them: one
 /// walk, no hashing. Stops once `cap` untracked files have been found, so
 /// asking about a share with a million files is not a million `stat`s.
@@ -448,6 +464,9 @@ pub fn count_untracked(cache: &crate::cache::Cache, now: SystemTime, cap: usize)
     // At most `known.len()` of the files seen can be tracked, so seeing this
     // many means at least `cap` are not.
     control.stop_after_seen.store((known.len() + cap.max(1)) as u64, std::sync::atomic::Ordering::Relaxed);
+    // A fully tracked library has nothing to stop the walk early on, so it is
+    // also bounded by time: a count that ran out of it is a lower bound.
+    control.set_walk_budget(UNTRACKED_COUNT_BUDGET);
     let scanned = walk_controlled(&library, &ScanOptions::default(), now, Some(&control))?;
     let (mut untracked, mut tracked) = (0, 0);
     for file in &scanned.files {
@@ -512,7 +531,9 @@ pub fn rescan(cache: &crate::cache::Cache, now: SystemTime) -> Result<Rescan> {
 pub fn rescan_files(cache: &crate::cache::Cache, now: SystemTime, options: &crate::scan_pipeline::PipelineOptions, control: &crate::scan_pipeline::JobControl) -> Result<Rescan> {
     let library = cache.backend.library_path.clone();
     control.set_phase("walking");
-    let scanned = walk_controlled(&library, &ScanOptions::default(), now, Some(control))?;
+    let walk_started = std::time::Instant::now();
+    let mut scanned = walk_controlled(&library, &ScanOptions::default(), now, Some(control))?;
+    control.add_time("walk", walk_started.elapsed());
     if control.is_cancelled() {
         return Ok(Rescan { scanned, relocated: 0, indexed: IndexReport { cancelled: true, ..Default::default() } });
     }
@@ -520,8 +541,12 @@ pub fn rescan_files(cache: &crate::cache::Cache, now: SystemTime, options: &crat
     // Safe on an incomplete scan: a relocation is concluded from a file
     // that *was* found, not from one that was not. Only `missing` needs
     // the scan to have seen everything, and nothing here acts on it.
+    let drift_started = std::time::Instant::now();
     let drifted = crate::drift::detect(cache, &scanned)?;
     let relocated = crate::drift::apply_relocations(cache, &drifted)?;
+    control.add_time("drift", drift_started.elapsed());
+    // Anything the drift pass had to read is not read again by indexing.
+    scanned.precomputed = drifted.hashes;
 
     let indexed = crate::scan_pipeline::index_files(cache, &library, &scanned, options, control);
     Ok(Rescan { scanned, relocated, indexed })

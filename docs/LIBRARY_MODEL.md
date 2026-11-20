@@ -127,6 +127,80 @@ expensive half to do lazily:
    file of a library real calibre made. Same streaming read; resumable because
    the work list is "files with no hash".
 
+### At the scale of a hundred thousand PDFs
+
+Measured on a 9,767-file, 114 GB folder: the scan took about an hour and the
+PDF fingerprints 67 minutes on one worker, and a native PDFium crash with two
+in-process workers had killed the whole server. What changed (tranche 13):
+
+- **PDFium runs in worker processes** (`calibre_pdf_worker`, `calibre_db::pdf_worker`).
+  The enrichment pass and the fingerprint job send each PDF to a pool of
+  workers (default half the cores, at most 4; `CALIBRE_OXIDE_PDF_WORKERS`, or
+  `?pdf_workers=` on the job routes; `0` means "read in the server, one at a
+  time", the old way). A crash kills one worker, never the server: the file is
+  recorded as `crashed` (or `timed out` after `CALIBRE_OXIDE_PDF_TIMEOUT_SECS`,
+  default 120), a fresh worker takes over and the run goes on. A fingerprinted
+  file is never read again until `FINGERPRINT_VERSION` changes, so a poison file
+  is read once. The worker binary is looked for next to the running executable
+  (it is built and shipped with `calibre_srv`), or at
+  `CALIBRE_OXIDE_PDF_WORKER`; without it the in-process path is used.
+- **In-flight marks and suspects.** Before a PDF is handed to a reader it is
+  written to `checksums_db.inflight` (kind `enrich` by book id, `fingerprint` by
+  content hash). A worker crash or timeout is recorded the moment it happens.
+  If the *server* dies, the files found in flight on the next run are
+  **suspects**, not failures (the process may have died on any of them, or on
+  none): they are read first, one at a time, each in a fresh single worker
+  (in-process when there is no pool), re-marked as `enrich-suspect` /
+  `fingerprint-suspect` before being sent. One that crashes or times out on its
+  own is recorded as such; one still marked `-suspect` at the next start killed
+  the process on its own retry and is recorded as crashed without a third try.
+  Innocent files are never condemned by someone else's crash. A worker also
+  exits at once when its stdin closes (parent gone), even mid-request.
+- **One open per PDF.** A request to a worker can ask for the Info strings, a
+  cover and the fingerprint together. Enrichment asks for the fingerprint too
+  when the file's content hash is known and it has no fingerprint, so the scan
+  leaves the PDFs fingerprinted and the separate job has little left to do.
+- **Smaller covers.** Covers rendered by the scan are 600 px wide
+  (`CALIBRE_OXIDE_SCAN_COVER_WIDTH`, or `?cover_width=`), down from 1,000: plenty
+  for the grid and the detail pane, and about a third cheaper to render.
+  Covers added any other way keep their size.
+- **Enrichment writes in batches.** Reads stay in small chunks (a cancel is
+  prompt); writes are one `BEGIN IMMEDIATE` transaction per `batch_size` books
+  (100), each book in its own savepoint, and one `ChangeOp::Batch` per
+  transaction holding exactly the `FieldSet`/`CoverSet` ops the per-field writes
+  used to log. Previously every title, author and cover was its own commit and
+  its own two-fsync log entry, and each re-read of a field reloaded the whole
+  field cache. A rebuild from the log gives the same library
+  (`batched_enrichment_equals_per_field_writes`). One book whose write fails is
+  rolled back alone and reported, as before; it leaves the queue.
+- **`?enrich=false`** on `POST /scan-library` stops after indexing and leaves
+  metadata and covers queued; `POST /enrich-library` drains the queue later (or
+  on a quieter day). The report says `enrichment_deferred`.
+- **Where the time goes.** Every job report has `timings_ms`: `walk`, `drift`,
+  `index_hash`, `index_write`, `enrich_read`, `enrich_write`, `covers` (the cover
+  files, kept apart from `enrich_write`), `fingerprint`, and
+  `prepare_<stage>` for the chained job. Read times are wall time of a parallel
+  phase, not summed worker time.
+- **Cheaper rescans.** The walk takes size, mtime and the offline attribute from
+  the directory entry's own metadata (one `stat` where there were three; on
+  Windows the identity still needs a handle), and the drift pass reuses the
+  walk's facts instead of opening every tracked file again. When some recorded
+  file is absent, only *untracked files of an absent file's recorded size* are
+  hashed to look for it (streamed, in parallel), where before every untracked
+  file was read whole into memory one at a time; indexing reuses those hashes
+  (`ScanReport::precomputed`), so nothing is read twice. Opening a library with
+  `GET /library-untracked` stops walking after four seconds and reports "at
+  least" (`at_least: true`); a fully tracked library no
+  longer costs a full walk each time it is opened.
+- **One chained job.** `POST /prepare-library` runs scan, hash backfill, PDF
+  fingerprints and the duplicate scan in order. The stage it reached is written
+  to `.calibre-oxide/prepare-stage.json` before it starts, so a rerun resumes at
+  that stage (each stage also resumes itself); `?restart=true` begins again at
+  the scan, and `GET /prepare-library` reports the stage. The duplicates panel's
+  "Prepare for duplicate detection" button starts it, shows "Step n of 4" and
+  loads the groups when it ends. A stage that fails (no
+  PDFium for the fingerprints) is reported and the chain carries on.
+
 Reads run on a small bounded pool (default 3; `CALIBRE_OXIDE_SCAN_WORKERS`, or
 `?workers=` on the route); every database write stays on one thread in sorted
 order, so the result does not depend on the thread count. Cancel is checked
@@ -312,9 +386,11 @@ group. Books holding identical files count as one node.
 These rank **between `exact` and `fuzzy`**; `?min=pdf` includes them and
 everything stronger. Same pages with *different* words (similarity under 0.5,
 or too little distinctive text) is not a match: that is two books from one
-template. The fingerprint job runs **one** file at a time (two PDFium workers
-killed the server process on a real library), and every PDFium call in the
-process is serialised behind one lock. Only fingerprinted PDFs
+template. The fingerprint job reads PDFs in separate worker processes when the
+worker binary is available (see "At the scale of a hundred thousand PDFs"); in
+the server process it still runs **one** file at a time (two in-process PDFium
+workers killed the server on a real library), with every PDFium call
+serialised behind one lock. Only fingerprinted PDFs
 take part and the scan reports how many are not (`pdf_unfingerprinted`), so the
 UI can offer to run the job. They never reach the bulk `merge-exact`.
 `suggested_dest` for these groups is the copy with a text layer, then more
@@ -639,6 +715,27 @@ fsync, one link in the hash chain. The scan writes one per batch of books.
   edit of one of its fields is not collapsed into it. That costs disk, not
   correctness: the later entry replays after the batch and wins.
 - **Single adds are unchanged**: one entry per op.
+
+### Compaction and opening a large log
+
+Opening the log used to read and parse every entry file to find this install's
+chain tip and set the clock. It now reads the newest snapshot's **header** (its
+watermarks give each origin's compacted tip, and when it was taken bounds every
+stamp inside it) and the **names** of the loose entries after it (a name carries
+its stamp and origin), and opens only this install's newest entry for its
+sequence and hash. A name it cannot parse, or an unreadable newest entry, falls
+back to the full replay. `opening_from_the_tip_agrees_with_a_full_replay` pins
+the two to the same tip.
+
+`ChangeLog::compact` is unchanged in what it may collapse -- only entries past
+the retention horizon (60 days), so a peer that was away keeps its edits -- but
+it now writes no snapshot when nothing is past the horizon. A finished library
+job calls `compact_if_needed`: when more than 2,000 loose entries are lying
+around (`CALIBRE_OXIDE_CHANGE_LOG_COMPACT_AT`) it compacts, which on a young
+library is a no-op by design. What keeps a fresh 100,000-file scan from
+leaving 100,000 entries is the batching above: a few thousand entries, not
+hundreds of thousands. `a_compacted_and_reopened_log_still_rebuilds_the_library`
+compacts, reopens from the snapshot tail, edits and rebuilds.
 
 ### Where the git analogy breaks
 

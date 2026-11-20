@@ -359,6 +359,28 @@ const CASES: &[Case] = &[
             result.unwrap();
         }
     }),
+    // The scan's metadata pass, as one transaction and one log entry: a title,
+    // two authors and a cover written over a placeholder book.
+    case!("write_enrichment_batch", |c, _| {
+        let bytes = b"%PDF-1.4 enrich me".to_vec();
+        std::fs::write(c.backend.library_path.join("Enrich Me.pdf"), &bytes).unwrap();
+        let mut meta = MetaInformation::default();
+        meta.title = "Enrich Me".to_string();
+        meta.authors = vec!["Unknown".to_string()];
+        let item = crate::cache::InPlaceFile { relative_path: "Enrich Me.pdf".to_string(), metadata: meta, size: bytes.len() as i64, hash: blake3::hash(&bytes).to_hex().to_string(), identity: None, queue_enrichment: true };
+        let id = c.register_books_in_place(&[item]).remove(0).unwrap();
+        let write = crate::enrich_batch::EnrichmentWrite {
+            book_id: id,
+            label: "Enrich Me".to_string(),
+            stem: "Enrich Me".to_string(),
+            title: Some("A Real Title".to_string()),
+            authors: vec!["Real One".to_string(), "Real Two".to_string()],
+            cover: Some(b"\xFF\xD8\xFF\xE0 enriched cover".to_vec()),
+        };
+        for result in c.write_enrichment_batch(&[write], None) {
+            result.unwrap();
+        }
+    }),
     case!("register_book_in_place", |c, _| {
         std::fs::write(c.backend.library_path.join("Loose Book.pdf"), b"%PDF-1.4 loose").unwrap();
         let mut meta = MetaInformation::default();
@@ -484,7 +506,6 @@ use Account::*;
 const ACCOUNTED: &[(&str, Account)] = &[
     ("cache.rs::set_field_inner", Case("set_field title")),
     ("cache.rs::set_many_to_one_field", Case("set_field publisher")),
-    ("cache.rs::set_many_to_many_field", Case("set_field tags")),
     ("cache.rs::set_rating_field", Case("set_field rating")),
     ("cache.rs::set_identifiers_field", Case("set_field identifiers")),
     ("cache.rs::update_book_metadata", Case("update_book_metadata")),
@@ -505,6 +526,8 @@ const ACCOUNTED: &[(&str, Account)] = &[
     ("cache.rs::delete_book_with", Case("delete_book")),
     ("cache.rs::rename_format_files", Case("rename_format_files")),
     ("cache.rs::register_books_in_place", Case("register_books_in_place (batch)")),
+    ("enrich_batch.rs::write_enrichment_batch", Case("write_enrichment_batch")),
+    ("cache.rs::link_many_to_many_in", Case("set_field tags")),
     ("cache.rs::insert_book_in_tx", Case("register_books_in_place (batch)")),
     ("cache.rs::import_books_batch", Case("import_books_batch")),
     ("covers.rs::set_cover", Case("covers::set_cover")),

@@ -15,7 +15,7 @@ import ImportFolderDialog from "./ImportFolderDialog.vue";
 import { describeScanOutcome, dismissKey, scanPromptHint, scanPromptText, shouldPrompt, type UntrackedCount } from "../library/scanPrompt";
 import { LAYOUT_KEY, type LayoutPrefs, type Panel, parseLayout, resizedWidth } from "../library/layout";
 import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary,
-  scanLibrary, backfillHashes, fingerprintPdfs, cancelLibraryJob, describeJobProgress,
+  scanLibrary, prepareLibrary, describePrepareProgress, describePrepareResult, fingerprintPdfs, cancelLibraryJob, describeJobProgress,
   fetchOrphans,
   relocateOrphan,
   uploadOrphanFile,
@@ -1501,18 +1501,18 @@ async function prepareForDuplicates() {
   prepareSummary.value = null;
   prepareProgress.value = null;
   try {
-    const result = await backfillHashes({
+    // One job: scan, hash, PDF fingerprints, duplicate scan. Its stage
+    // is kept on the server, so running it again resumes where it stopped.
+    let cancelled = false;
+    const result = await prepareLibrary({
       onStart: (id) => (prepareJobId.value = id),
-      onProgress: (job) => (prepareProgress.value = describeJobProgress(job.progress)),
+      onProgress: (job) => {
+        prepareProgress.value = describePrepareProgress(job.progress);
+        cancelled = job.progress.cancelled;
+      },
     });
-    const parts: string[] = [];
-    if (result.cancelled) parts.push("stopped early — run it again to continue");
-    parts.push(result.total === 0 ? "Every file already had a hash." : `${result.hashed.toLocaleString("en-US")} of ${result.total.toLocaleString("en-US")} files read`);
-    // Named rather than only counted: a file that could not be read is a
-    // file the duplicate check cannot see.
-    if (result.missing_count > 0) parts.push(`${result.missing_count} listed but not found on disk`);
-    if (result.unreadable_count > 0) parts.push(`${result.unreadable_count} could not be read`);
-    prepareSummary.value = parts.join(" · ");
+    prepareSummary.value = describePrepareResult(result, cancelled);
+    // The chain's last stage already scanned for duplicates; load the groups.
     await dupStore.scan();
   } catch (e) {
     duplicatesError.value = e instanceof Error ? e.message : String(e);

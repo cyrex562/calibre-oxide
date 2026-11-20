@@ -371,7 +371,7 @@ fn cancel_keeps_what_was_committed_and_a_rerun_finishes_the_rest() {
     }
     let before = snapshot(src.path());
     // One group per batch; cancel the moment the first batch has committed.
-    let pipeline = PipelineOptions { workers: 1, batch_size: 4, after_batch: Some(Arc::new(|c: &JobControl| c.cancel())) };
+    let pipeline = PipelineOptions { workers: 1, batch_size: 4, after_batch: Some(Arc::new(|c: &JobControl| c.cancel())), ..Default::default() };
     let control = JobControl::new();
 
     let first = import_folder(&cache, src.path(), &ImportOptions::default(), &pipeline, &control).unwrap();

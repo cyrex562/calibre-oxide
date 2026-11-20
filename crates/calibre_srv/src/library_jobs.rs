@@ -30,10 +30,16 @@
 //!
 //! # Routes
 //!
-//! - `POST /scan-library/{library_id}` -- scan, then enrich ([`crate::scan_library`])
+//! - `POST /scan-library/{library_id}` -- scan, then enrich ([`crate::scan_library`]);
+//!   `?enrich=false` stops after the scan and leaves the metadata and covers
+//!   queued for `/enrich-library`
 //! - `POST /enrich-library/{library_id}` -- the metadata pass alone (resume)
 //! - `POST /hash-backfill/{library_id}` -- hash every file with no hash
 //! - `POST /pdf-fingerprint/{library_id}` -- page/text fingerprints of PDFs ([`calibre_db::pdf_similarity`])
+//! - `POST /prepare-library/{library_id}` -- the whole chain for duplicate
+//!   detection: scan, hash backfill, PDF fingerprints, duplicate scan, with
+//!   the stage persisted so a rerun resumes (`?restart=true` starts over);
+//!   `GET /prepare-library/{library_id}` says which stage it stands at
 //! - `POST /import-folder/{library_id}` -- copy a folder tree in ([`crate::import_folder`])
 //! - `POST /duplicates/scan/{library_id}?job=true` -- the duplicate scan ([`crate::duplicates`])
 //! - `GET /library-jobs`, `GET /library-jobs/{id}`, `POST /library-jobs/{id}/cancel`
@@ -74,6 +80,9 @@ pub enum JobKind {
     Dedupe,
     /// A bulk duplicate resolve (`POST /duplicates/resolve`, executing).
     Resolve,
+    /// Scan, hash backfill, PDF fingerprints, duplicate scan, in that order
+    /// (`POST /prepare-library`).
+    Prepare,
 }
 
 impl JobKind {
@@ -87,6 +96,7 @@ impl JobKind {
             JobKind::Import => "import",
             JobKind::Dedupe => "dedupe",
             JobKind::Resolve => "resolve",
+            JobKind::Prepare => "prepare",
         }
     }
 }
@@ -198,6 +208,17 @@ pub struct JobParams {
     pub dedupe_min: Option<calibre_db::dedupe::Strength>,
     /// The plan of a [`JobKind::Resolve`] job.
     pub resolve: Option<crate::duplicates_review::ResolveJob>,
+    /// For [`JobKind::Scan`]: stop after indexing, leaving the metadata and
+    /// covers queued for [`JobKind::Enrich`] (`?enrich=false`).
+    pub defer_enrichment: bool,
+    /// PDF worker processes for the jobs that read PDFs (`?pdf_workers=`);
+    /// `0` reads in-process. `None`: the environment's setting or the default.
+    pub pdf_workers: Option<usize>,
+    /// Width of the covers rendered from PDFs (`?cover_width=`); `None`: 600.
+    pub cover_width: Option<u32>,
+    /// For [`JobKind::Prepare`]: begin again at the scan instead of resuming
+    /// at the stage a previous run reached.
+    pub restart: bool,
 }
 
 pub fn start_with(cache: Arc<Cache>, kind: JobKind, workers: Option<usize>, params: JobParams) -> Started {
@@ -228,27 +249,53 @@ pub fn start_with(cache: Arc<Cache>, kind: JobKind, workers: Option<usize>, para
     }
     drop(jobs);
 
-    let options = match workers {
+    let mut options = match workers {
         Some(n) => PipelineOptions::with_workers(n),
         None => PipelineOptions::default(),
     };
+    options.pdf_workers = params.pdf_workers;
+    options.cover_width = params.cover_width;
     let worker_job = job.clone();
     tokio::task::spawn_blocking(move || {
         // A panic in the pipeline must end the job, not leave it
         // "running" for ever.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&cache, kind, &options, &worker_job.control, &params)));
         let (state, report, error) = match result {
-            Ok(Ok(report)) => {
+            Ok(Ok(mut report)) => {
                 let state = if worker_job.control.is_cancelled() { JobState::Cancelled } else { JobState::Finished };
+                // Where the time went, by phase, on every job's report.
+                if let Some(map) = report.as_object_mut() {
+                    map.insert("timings_ms".into(), json!(worker_job.control.snapshot().timings_ms));
+                }
                 (state, Some(report), None)
             }
             Ok(Err(e)) => (JobState::Failed, None, Some(format!("{e:#}"))),
             Err(_) => (JobState::Failed, None, Some("the job panicked".to_string())),
         };
+        // Library jobs are what write the change log in bulk, so this is where
+        // a log grown past its threshold is compacted (entries inside the
+        // retention horizon are never touched; see `ChangeLog::compact`).
+        compact_change_log(&cache);
         *worker_job.outcome.lock().unwrap() = Outcome { state, report, error, finished_at: Some(now_secs()) };
         let _ = worker_job.done.send(true);
     });
     Started::New(job)
+}
+
+/// Loose change-log entries past which a finished job compacts the log:
+/// `CALIBRE_OXIDE_CHANGE_LOG_COMPACT_AT`, else
+/// [`calibre_db::change_log::DEFAULT_COMPACT_THRESHOLD`].
+fn compact_threshold() -> usize {
+    std::env::var("CALIBRE_OXIDE_CHANGE_LOG_COMPACT_AT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(calibre_db::change_log::DEFAULT_COMPACT_THRESHOLD)
+}
+
+fn compact_change_log(cache: &Cache) {
+    let Ok(log) = cache.backend.change_log() else { return };
+    match log.compact_if_needed(compact_threshold(), now_secs() * 1000) {
+        Ok(Some(report)) if report.dropped > 0 => eprintln!("compacted the change log: {} superseded entries dropped, {} kept", report.dropped, report.retained),
+        Ok(_) => {}
+        Err(e) => eprintln!("could not compact the change log: {e:#}"),
+    }
 }
 
 fn run(cache: &Cache, kind: JobKind, options: &PipelineOptions, control: &JobControl, params: &JobParams) -> anyhow::Result<Value> {
@@ -258,12 +305,15 @@ fn run(cache: &Cache, kind: JobKind, options: &PipelineOptions, control: &JobCon
             let mut report = scan_report(&rescan, control.is_cancelled());
             // The books exist now; fill in their metadata and covers as a
             // second stage, so the first is not held up by page renders.
-            if !control.is_cancelled() {
+            if params.defer_enrichment {
+                report["enrichment_deferred"] = json!(true);
+            } else if !control.is_cancelled() {
                 let enriched = calibre_db::scan_pipeline::enrich_pending(cache, options, control)?;
                 report["enrichment"] = serde_json::to_value(enriched)?;
             }
             Ok(report)
         }
+        JobKind::Prepare => run_prepare(cache, options, control, params),
         JobKind::Enrich => Ok(serde_json::to_value(calibre_db::scan_pipeline::enrich_pending(cache, options, control)?)?),
         JobKind::HashBackfill => Ok(serde_json::to_value(calibre_db::scan_pipeline::backfill_hashes(cache, options, control)?)?),
         JobKind::PdfFingerprint => Ok(serde_json::to_value(calibre_db::pdf_similarity::fingerprint_pdfs(cache, options, control)?)?),
@@ -278,6 +328,86 @@ fn run(cache: &Cache, kind: JobKind, options: &PipelineOptions, control: &JobCon
             Ok(serde_json::to_value(calibre_db::import::import_folder(cache, source, import_options, options, control)?)?)
         }
     }
+}
+
+/// The stages of [`JobKind::Prepare`], in order.
+pub const PREPARE_STAGES: [&str; 4] = ["scan", "hash", "fingerprint", "dedupe"];
+
+fn prepare_stage_path(cache: &Cache) -> std::path::PathBuf {
+    cache.backend.library_path.join(calibre_db::constants::LIBRARY_HANDLE_DIR_NAME).join("prepare-stage.json")
+}
+
+/// The stage a prepare run would start at: where the last one stopped, or the
+/// scan if it finished (or never ran).
+pub fn prepare_stage(cache: &Cache) -> &'static str {
+    let stage = std::fs::read_to_string(prepare_stage_path(cache)).ok().and_then(|text| serde_json::from_str::<Value>(&text).ok()).and_then(|v| v["stage"].as_str().map(str::to_string));
+    PREPARE_STAGES.iter().copied().find(|s| Some(*s) == stage.as_deref()).unwrap_or(PREPARE_STAGES[0])
+}
+
+fn persist_prepare_stage(cache: &Cache, stage: &str) {
+    let path = prepare_stage_path(cache);
+    let text = json!({"stage": stage, "updated_at": now_secs()}).to_string();
+    let temp = path.with_extension("json.partial");
+    if std::fs::write(&temp, text).and_then(|_| std::fs::rename(&temp, &path)).is_err() {
+        eprintln!("could not record the prepare stage {stage}");
+    }
+}
+
+/// Everything duplicate detection needs, as one job: **scan** (walk, index,
+/// then metadata and covers), **hash** (content hashes for every file the scan
+/// did not hash), **fingerprint** (PDF page/text fingerprints) and **dedupe**
+/// (the duplicate scan). Each stage resumes by itself (its work list is what
+/// the database says is left), and the stage reached is written to
+/// `.calibre-oxide/prepare-stage.json` before it starts, so a rerun -- after a
+/// cancel, a crash or a restart -- continues at that stage instead of
+/// walking the library again. A stage that fails (PDFium missing for the
+/// fingerprints, say) is reported and the chain goes on; a cancel stops it
+/// where it is.
+fn run_prepare(cache: &Cache, options: &PipelineOptions, control: &JobControl, params: &JobParams) -> anyhow::Result<Value> {
+    let start = if params.restart { PREPARE_STAGES[0] } else { prepare_stage(cache) };
+    let mut stages = serde_json::Map::new();
+    let mut finished = true;
+    for stage in PREPARE_STAGES.iter().copied().skip_while(|s| *s != start) {
+        if control.is_cancelled() {
+            finished = false;
+            break;
+        }
+        persist_prepare_stage(cache, stage);
+        let began = std::time::Instant::now();
+        let outcome: anyhow::Result<Value> = match stage {
+            "scan" => (|| {
+                let rescan = calibre_db::scan::rescan_files(cache, SystemTime::now(), options, control)?;
+                let mut report = scan_report(&rescan, control.is_cancelled());
+                if params.defer_enrichment {
+                    report["enrichment_deferred"] = json!(true);
+                } else if !control.is_cancelled() {
+                    report["enrichment"] = serde_json::to_value(calibre_db::scan_pipeline::enrich_pending(cache, options, control)?)?;
+                }
+                Ok(report)
+            })(),
+            "hash" => calibre_db::scan_pipeline::backfill_hashes(cache, options, control).map(|r| json!(r)),
+            "fingerprint" => calibre_db::pdf_similarity::fingerprint_pdfs(cache, options, control).map(|r| json!(r)),
+            _ => crate::duplicates::run_job(cache, calibre_db::dedupe::Strength::Fuzzy, control),
+        };
+        control.add_time(&format!("prepare_{stage}"), began.elapsed());
+        match outcome {
+            Ok(report) => {
+                stages.insert(stage.to_string(), report);
+            }
+            Err(e) => {
+                stages.insert(stage.to_string(), json!({"error": format!("{e:#}")}));
+            }
+        }
+        if control.is_cancelled() {
+            finished = false;
+            break;
+        }
+    }
+    if finished {
+        // Done: the next run starts over at the scan.
+        persist_prepare_stage(cache, "done");
+    }
+    Ok(json!({"started_at_stage": start, "stages": stages, "finished": finished}))
 }
 
 /// The scan's final report, in the shape `POST /scan-library` has always
@@ -314,7 +444,8 @@ fn scan_report(rescan: &calibre_db::scan::Rescan, cancelled: bool) -> Value {
 /// Shared by the three `POST` routes: start, then either answer at once
 /// with the job's id or (`?wait=true`) hold the response until it ends.
 pub async fn respond(cache: Arc<Cache>, kind: JobKind, query: &StartQuery) -> Response {
-    let (job, already_running) = match start(cache, kind, query.workers) {
+    let params = JobParams { restart: query.restart == Some(true), defer_enrichment: query.enrich == Some(false), pdf_workers: query.pdf_workers, cover_width: query.cover_width.map(|w| w.clamp(100, 4000)), ..Default::default() };
+    let (job, already_running) = match start_with(cache, kind, query.workers, params) {
         Started::New(job) => (job, false),
         Started::AlreadyRunning(job) => (job, true),
         Started::Busy(active) => {
@@ -354,6 +485,17 @@ pub struct StartQuery {
     /// Concurrent readers; defaults to a NAS-friendly 3
     /// (`CALIBRE_OXIDE_SCAN_WORKERS` overrides the default).
     pub workers: Option<usize>,
+    /// `false` on the scan route: index the files and stop, leaving metadata
+    /// and covers queued (`POST /enrich-library` does them later).
+    pub enrich: Option<bool>,
+    /// PDF worker processes (default: half the cores, at most 4;
+    /// `CALIBRE_OXIDE_PDF_WORKERS` sets the default). `0` reads PDFs in the
+    /// server process, one at a time.
+    pub pdf_workers: Option<usize>,
+    /// Width in pixels of covers rendered from PDFs (default 600).
+    pub cover_width: Option<u32>,
+    /// On the prepare route: start over at the scan instead of resuming.
+    pub restart: Option<bool>,
 }
 
 fn library_cache(state: &AppState, library_id: &str) -> Result<Arc<Cache>, ServerError> {
@@ -380,6 +522,21 @@ pub async fn hash_backfill(State(state): State<AppState>, Path(library_id): Path
 /// (and records nothing against any PDF) if PDFium is not installed.
 pub async fn pdf_fingerprint(State(state): State<AppState>, Path(library_id): Path<String>, Query(query): Query<StartQuery>) -> Result<Response, ServerError> {
     Ok(respond(library_cache(&state, &library_id)?, JobKind::PdfFingerprint, &query).await)
+}
+
+/// `POST /prepare-library/{library_id}` -- scan, hash, fingerprint and
+/// duplicate-scan in one resumable job (see [`run_prepare`]). Takes the scan's
+/// `enrich`, `workers`, `pdf_workers` and `cover_width` parameters, and
+/// `restart=true` to ignore the stage a previous run reached.
+pub async fn prepare(State(state): State<AppState>, Path(library_id): Path<String>, Query(query): Query<StartQuery>) -> Result<Response, ServerError> {
+    Ok(respond(library_cache(&state, &library_id)?, JobKind::Prepare, &query).await)
+}
+
+/// `GET /prepare-library/{library_id}` -- the stage the next prepare run would
+/// start at, and the stages in order.
+pub async fn prepare_status(State(state): State<AppState>, Path(library_id): Path<String>) -> Result<Json<Value>, ServerError> {
+    let cache = library_cache(&state, &library_id)?;
+    Ok(Json(json!({"stage": prepare_stage(&cache), "stages": PREPARE_STAGES})))
 }
 
 /// `GET /library-jobs` -- newest first.

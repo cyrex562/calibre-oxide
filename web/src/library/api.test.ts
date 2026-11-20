@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { importFolder, fetchUntracked, fetchTrash, restoreTrashEntry, deleteTrashEntry, emptyTrash, copyToLibrary, describeCopyOutcome, fetchLibraryInfo, embedMetadata, summarizeEmbed, addBook, addFormat, addNewsSchedule, blobToDataUrl, inspectPlugin, installPlugin, listPlugins, removePlugin, setPluginEnabled, catalogDownloadUrl, checkLibrary, coverProxyUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchCoverProxyBlob, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeDataFile, removeFormat, removeNewsSchedule, renameCategoryItem, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, scanLibrary, fetchOrphans, relocateOrphan, uploadOrphanFile, forgetOrphan, fetchIgnored, unignoreFile, searchMetadataOnline, backfillHashes, fingerprintPdfs, cancelLibraryJob, describeJobProgress, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
+import { importFolder, fetchUntracked, fetchTrash, restoreTrashEntry, deleteTrashEntry, emptyTrash, copyToLibrary, describeCopyOutcome, fetchLibraryInfo, embedMetadata, summarizeEmbed, addBook, addFormat, addNewsSchedule, blobToDataUrl, inspectPlugin, installPlugin, listPlugins, removePlugin, setPluginEnabled, catalogDownloadUrl, checkLibrary, coverProxyUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchCoverProxyBlob, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeDataFile, removeFormat, removeNewsSchedule, renameCategoryItem, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, scanLibrary, fetchOrphans, relocateOrphan, uploadOrphanFile, forgetOrphan, fetchIgnored, unignoreFile, searchMetadataOnline, backfillHashes, fingerprintPdfs, prepareLibrary, prepareStageOfPhase, describePrepareProgress, describePrepareResult, cancelLibraryJob, describeJobProgress, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
 import type { BookSummary } from "./types";
 
 function bookStub(id: number): BookSummary {
@@ -1118,5 +1118,55 @@ describe("the trash", () => {
   it("surfaces why a restore was refused", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 400, statusText: "Bad Request", text: async () => "the book already has a PDF; remove it before restoring this one" }));
     await expect(restoreTrashEntry({ kind: "format", key: "7", format: "PDF" })).rejects.toThrow(/already has a PDF/);
+  });
+});
+
+describe("prepareLibrary", () => {
+  it("starts the chained prepare job and resolves with its stage reports", async () => {
+    const report = { started_at_stage: "scan", finished: true, stages: { scan: { added: [1] }, hash: { hashed: 3, total: 3 }, fingerprint: { fingerprinted: 2, failed_count: 0 }, dedupe: {} } };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ job_id: 9 }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => job("running", { id: 9, kind: "prepare", progress: progress({ phase: "hashing" }) }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => job("finished", { id: 9, kind: "prepare", report }) });
+    vi.stubGlobal("fetch", fetchMock);
+    const phases: string[] = [];
+
+    const result = await prepareLibrary({ intervalMs: 0, onProgress: (j) => phases.push(j.progress.phase) });
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/prepare-library/default", { method: "POST" });
+    expect(phases).toEqual(["hashing", "indexing"]);
+    expect(result.finished).toBe(true);
+    expect(result.stages.hash?.hashed).toBe(3);
+  });
+
+  it("rejects when the job fails", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ job_id: 9 }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => job("failed", { id: 9, kind: "prepare", error: "disk gone" }) });
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(prepareLibrary({ intervalMs: 0 })).rejects.toThrow("disk gone");
+  });
+});
+
+describe("prepare progress and summary", () => {
+  it("maps each phase to its stage of four", () => {
+    expect(["walking", "indexing", "enriching", "hashing", "fingerprinting", "matching", "describing", "other"].map(prepareStageOfPhase)).toEqual(["scan", "scan", "scan", "hash", "fingerprint", "dedupe", "dedupe", null]);
+  });
+
+  it("prefixes the step number to the progress line", () => {
+    expect(describePrepareProgress(progress({ phase: "hashing", hashed: 5, total: 50 }))).toBe("Step 2 of 4 · Reading files… 5 of 50");
+    expect(describePrepareProgress(progress({ phase: "fingerprinting", fingerprinted: 1, total: 4 }))).toContain("Step 3 of 4");
+    expect(describePrepareProgress(progress({ phase: "nonsense" }))).toBe("Working…");
+  });
+
+  it("summarises a finished run, naming failed stages", () => {
+    const ok = { started_at_stage: "scan", finished: true, stages: { hash: { hashed: 2, total: 5 }, fingerprint: { fingerprinted: 7, failed_count: 1 } } } as never;
+    expect(describePrepareResult(ok)).toBe("2 of 5 files hashed · 7 PDFs analysed · 1 PDFs could not be read");
+    const failed = { started_at_stage: "scan", finished: true, stages: { fingerprint: { error: "no PDFium" } } } as never;
+    expect(describePrepareResult(failed)).toContain("fingerprint failed: no PDFium");
+    expect(describePrepareResult({ started_at_stage: "hash", finished: false, stages: {} } as never)).toContain("stopped early");
+    expect(describePrepareResult({ started_at_stage: "scan", finished: true, stages: {} } as never)).toBe("Ready for duplicate detection.");
   });
 });

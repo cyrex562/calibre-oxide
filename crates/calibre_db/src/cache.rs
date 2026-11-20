@@ -367,7 +367,7 @@ impl Cache {
     /// [`Cache::record`] for a run of ops, written as a single
     /// [`crate::change_log::ChangeOp::Batch`] entry: one file and one
     /// fsync however many ops. Same failure policy: logged and swallowed.
-    fn record_many(&self, ops: Vec<crate::change_log::ChangeOp>) {
+    pub(crate) fn record_many(&self, ops: Vec<crate::change_log::ChangeOp>) {
         if ops.is_empty() {
             return;
         }
@@ -3085,11 +3085,29 @@ impl Cache {
         sep: &str,
         value: &str,
     ) -> anyhow::Result<()> {
+        let mut conn = self.backend.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        Self::link_many_to_many_in(&tx, book_id, table, name_col, link_table, link_col, sep, value)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The body of [`Cache::set_many_to_many_field`] on a transaction the
+    /// caller owns, so a batch of books can share one commit.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn link_many_to_many_in(
+        tx: &rusqlite::Connection,
+        book_id: i32,
+        table: &str,
+        name_col: &str,
+        link_table: &str,
+        link_col: &str,
+        sep: &str,
+        value: &str,
+    ) -> anyhow::Result<()> {
         // Link tables are UNIQUE(book, item) over NOCASE names: a repeated
         // item ("a & A") must be linked once, not abort the write.
         let items: Vec<&str> = dedupe_names(value.split(sep));
-        let mut conn = self.backend.conn.lock().unwrap();
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
             &format!("DELETE FROM {link_table} WHERE book = ?1"),
             (book_id,),
@@ -3123,7 +3141,6 @@ impl Cache {
                 )?;
             }
         }
-        tx.commit()?;
         Ok(())
     }
 

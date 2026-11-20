@@ -202,7 +202,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::cache::Cache;
 use crate::scan_pipeline::{format_file_path, parallel_map, JobControl, PipelineOptions};
@@ -276,7 +276,7 @@ pub const TINY_PENALTY: f32 = 0.85;
 
 /// One sampled page: a 256-bit signature, and which of its bits are to be
 /// trusted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PageHash {
     /// 0-based page number.
     pub index: u32,
@@ -487,7 +487,7 @@ pub fn distinctive_jaccard(a: &[u16], b: &[u16], stops: &StopSlots) -> Option<(f
 // The fingerprint
 // ---------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PdfFingerprint {
     pub page_count: u32,
     pub pages: Vec<PageHash>,
@@ -605,8 +605,20 @@ pub fn fingerprint_file(path: &Path) -> Result<PdfFingerprint> {
 /// Whether an error from [`fingerprint_file`] means "no PDFium", which is
 /// not the PDF's fault and must not be recorded against it.
 pub fn is_unavailable(error: &anyhow::Error) -> bool {
-    matches!(error.downcast_ref::<calibre_ebooks::pdf::rasterize::RasterizeError>(), Some(calibre_ebooks::pdf::rasterize::RasterizeError::Unavailable { .. }))
+    matches!(error.downcast_ref::<calibre_ebooks::pdf::rasterize::RasterizeError>(), Some(calibre_ebooks::pdf::rasterize::RasterizeError::Unavailable { .. })) || error.downcast_ref::<NoWorker>().is_some()
 }
+
+/// The PDF worker process could not be started: nothing is the file's fault.
+#[derive(Debug)]
+struct NoWorker(String);
+
+impl std::fmt::Display for NoWorker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "could not start the PDF worker: {}", self.0)
+    }
+}
+
+impl std::error::Error for NoWorker {}
 
 // ---------------------------------------------------------------------
 // Matching
@@ -933,7 +945,9 @@ pub fn find_pairs(fps: &[PdfFingerprint]) -> (Vec<PdfPair>, IndexStats) {
 // The fingerprint job
 // ---------------------------------------------------------------------
 
-/// Most files read at once: **one**.
+/// Most files read at once **in this process**: **one**. (With the
+/// out-of-process worker pool, [`crate::pdf_worker`], there are as many as the
+/// pool has workers; each has a PDFium of its own.)
 ///
 /// PDFium is not safe for concurrent use of documents, whatever the
 /// `pdfium-render` `thread_safe` feature suggests. With two workers the whole
@@ -969,17 +983,54 @@ pub struct FingerprintReport {
 /// until [`FINGERPRINT_VERSION`] changes.
 ///
 /// Errors (rather than recording failures) if PDFium is not installed.
+///
+/// # Worker processes and poison files
+///
+/// When a PDF worker binary is available ([`crate::pdf_worker`]) the files are
+/// read by a pool of worker processes, in parallel. A worker that crashes or
+/// hangs on a file is replaced, and the file is recorded as failed with the
+/// reason `crashed` or `timed out` (not retried until the version changes).
+/// Without a worker binary the files are read in this process, one at a time.
+///
+/// In both modes a file is marked *in flight* in the database before it is
+/// read. If the whole process dies, the next run finds the marks and treats
+/// those files as **suspects**, not failures: the process may have died on any
+/// one of them (or on none, if it was simply stopped). Suspects are read first,
+/// one at a time, each in a fresh single worker (in this process when there is
+/// no pool), marked `fingerprint-suspect` before it is sent. One that crashes
+/// or times out on its own is recorded as such; one still marked
+/// `fingerprint-suspect` at the next start killed the process on its own
+/// retry, and is recorded as crashed without a third try.
 pub fn fingerprint_pdfs(cache: &Cache, options: &PipelineOptions, control: &JobControl) -> Result<FingerprintReport> {
     use std::sync::atomic::Ordering;
     control.set_phase("fingerprinting");
+    let started = std::time::Instant::now();
     let library = cache.backend.library_path.clone();
-    let todo = cache.checksums().pdf_fingerprints_pending()?;
+    let store = cache.checksums();
+    let mut report = FingerprintReport::default();
+
+    // Files a previous run was reading when the process died. Recorded as
+    // crashed, so this run does not read them again.
+    for hash in store.take_inflight("fingerprint-suspect")? {
+        let why = "crashed: this PDF was being read alone when the process died, so it was not tried again".to_string();
+        store.record_pdf_fingerprint(&hash, &Err(why.clone()))?;
+        control.errors.fetch_add(1, Ordering::Relaxed);
+        report.failed_count += 1;
+        if report.failed.len() < 100 {
+            report.failed.push((format!("(content {hash})"), why));
+        }
+    }
+
+    let suspects: std::collections::HashSet<String> = store.take_inflight("fingerprint")?.into_iter().collect();
+
+    let todo = store.pdf_fingerprints_pending()?;
     control.total.store(todo.len() as u64, Ordering::Relaxed);
-    let mut report = FingerprintReport { total: todo.len(), ..Default::default() };
+    report.total = todo.len();
     if todo.is_empty() {
         return Ok(report);
     }
-    if !calibre_ebooks::pdf::rasterize::is_available() {
+    let pool = options.pdf_pool.resolve(options.pdf_workers);
+    if pool.is_none() && !calibre_ebooks::pdf::rasterize::is_available() {
         bail!("PDF fingerprinting needs the PDFium library, which was not found (run `cargo xtask fetch-pdfium` or set {})", calibre_ebooks::pdf::rasterize::LIBRARY_PATH_VAR);
     }
 
@@ -996,17 +1047,40 @@ pub fn fingerprint_pdfs(cache: &Cache, options: &PipelineOptions, control: &JobC
     // Formats sharing a hash after the first are done with it.
     let shared: u64 = (todo.len() - by_hash.len()) as u64;
 
-    let workers = options.workers.clamp(1, MAX_FINGERPRINT_WORKERS);
+    let workers = match &pool {
+        Some(pool) => pool.workers(),
+        None => options.workers.clamp(1, MAX_FINGERPRINT_WORKERS),
+    };
     let mut abort: Option<anyhow::Error> = None;
-    for chunk in by_hash.chunks(options.batch_size.max(1)) {
+    // Suspects first, one to a batch; then everything else.
+    let (suspect_items, rest): (Vec<_>, Vec<_>) = by_hash.into_iter().partition(|(hash, _)| suspects.contains(hash));
+    let mut batches: Vec<(&[(String, Vec<(String, String, String)>)], bool)> = suspect_items.chunks(1).map(|c| (c, true)).collect();
+    batches.extend(rest.chunks(options.batch_size.max(1)).map(|c| (c, false)));
+    for (chunk, suspect) in batches {
         if control.is_cancelled() {
             break;
         }
-        let results = parallel_map(chunk, workers, control, |(_, locations)| -> Result<Option<(String, Result<PdfFingerprint>)>> {
+        let kind = if suspect { "fingerprint-suspect" } else { "fingerprint" };
+        let workers = if suspect { 1 } else { workers };
+        let batch_pool: Option<std::sync::Arc<crate::pdf_worker::Pool>> = if suspect { pool.as_ref().map(|p| std::sync::Arc::new(p.isolated())) } else { pool.clone() };
+        let results = parallel_map(chunk, workers, control, |(hash, locations)| -> Result<Option<(String, Result<PdfFingerprint>)>> {
             for (folder, name, format) in locations {
                 let Some(path) = format_file_path(&library, folder, name, format) else { continue };
                 let display = path.display().to_string();
-                return match fingerprint_file(&path) {
+                store.mark_inflight(kind, hash)?;
+                let outcome = match &batch_pool {
+                    Some(pool) => fingerprint_via_pool(pool, &path),
+                    None => fingerprint_file(&path),
+                };
+                if let Err(e) = &outcome {
+                    // A crash or a hang is recorded the moment it happens, so
+                    // it survives whatever happens to this run next.
+                    if !is_unavailable(e) && is_worker_failure(e) {
+                        store.record_pdf_fingerprint(hash, &Err(format!("{e:#}")))?;
+                    }
+                }
+                store.clear_inflight(kind, hash)?;
+                return match outcome {
                     Ok(fp) => Ok(Some((display, Ok(fp)))),
                     Err(e) if is_unavailable(&e) => Err(e),
                     Err(e) => Ok(Some((display, Err(e)))),
@@ -1052,8 +1126,51 @@ pub fn fingerprint_pdfs(cache: &Cache, options: &PipelineOptions, control: &JobC
         options.batch_done(control);
     }
     control.already_known.fetch_add(shared, Ordering::Relaxed);
+    control.add_time("fingerprint", started.elapsed());
     report.cancelled = control.is_cancelled();
     Ok(report)
+}
+
+/// Marker for the errors [`fingerprint_via_pool`] makes from a worker that
+/// died or hung: they are the file's fault, unlike "no worker".
+#[derive(Debug)]
+struct WorkerFailure(String);
+
+impl std::fmt::Display for WorkerFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for WorkerFailure {}
+
+fn is_worker_failure(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<WorkerFailure>().is_some()
+}
+
+/// [`fingerprint_file`] through a worker process. A missing PDFium in the
+/// worker is [`is_unavailable`]; a worker that dies or hangs is a
+/// [`WorkerFailure`] whose text is `crashed: ...` or `timed out: ...`.
+pub fn fingerprint_via_pool(pool: &crate::pdf_worker::Pool, path: &Path) -> Result<PdfFingerprint> {
+    use crate::pdf_worker::{Reply, Request};
+    let reply = pool.run(Request { id: 0, path: path.to_string_lossy().to_string(), cover_width: None, fingerprint: true });
+    match reply {
+        Reply::Done(resp) => {
+            if resp.unavailable {
+                return Err(anyhow::Error::new(calibre_ebooks::pdf::rasterize::RasterizeError::Unavailable { searched: "the PDF worker's PDFium".to_string(), var: calibre_ebooks::pdf::rasterize::LIBRARY_PATH_VAR }));
+            }
+            if let Some(error) = resp.error {
+                bail!("{error}");
+            }
+            match (resp.fingerprint, resp.fingerprint_error) {
+                (Some(fp), _) => Ok(fp),
+                (None, Some(why)) => bail!("{why}"),
+                (None, None) => bail!("the PDF worker returned no fingerprint"),
+            }
+        }
+        reply @ (Reply::Crashed(_) | Reply::TimedOut) => Err(anyhow::Error::new(WorkerFailure(reply.failure_reason().unwrap_or_default()))),
+        Reply::SpawnFailed(why) => Err(anyhow::Error::new(NoWorker(why))),
+    }
 }
 
 // ---------------------------------------------------------------------

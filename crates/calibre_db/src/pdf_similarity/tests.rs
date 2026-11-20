@@ -851,3 +851,113 @@ fn a_born_digital_pdf_is_not_scanned() {
     assert!(!fp.scanned);
 }
 
+// ---------------------------------------------------------------------
+// Worker pool (tranche 13)
+// ---------------------------------------------------------------------
+
+fn pool_options(workers: usize, timeout: std::time::Duration) -> PipelineOptions {
+    PipelineOptions { pdf_pool: crate::pdf_worker::PdfPoolChoice::Pool(std::sync::Arc::new(crate::pdf_worker::tests::fake_pool(workers, timeout))), ..PipelineOptions::with_workers(workers) }
+}
+
+fn inflight(cache: &Cache) -> i64 {
+    cache.backend.conn.lock().unwrap().query_row("SELECT COUNT(*) FROM checksums_db.inflight", [], |r| r.get(0)).unwrap()
+}
+
+/// A worker that crashes or hangs on a file costs that file: it is recorded
+/// as failed with the reason, the worker is replaced and the run goes on.
+#[test]
+fn the_pool_records_a_crash_and_a_hang_and_the_run_continues() {
+    let (dir, cache) = library();
+    let good: Vec<i32> = (0..4).map(|i| add_pdf(dir.path(), &cache, &format!("good{i}"), format!("%PDF-1.4 good {i}").as_bytes())).collect();
+    let crash = add_pdf(dir.path(), &cache, "crash1", b"%PDF-1.4 crash");
+    let hang = add_pdf(dir.path(), &cache, "hang1", b"%PDF-1.4 hang");
+
+    let report = fingerprint_pdfs(&cache, &pool_options(2, std::time::Duration::from_millis(4000)), &JobControl::new()).unwrap();
+    assert_eq!((report.total, report.fingerprinted, report.failed_count), (6, 4, 2), "{report:?}");
+    let store = cache.checksums();
+    assert!(store.pdf_fingerprint_error(&hash_of(&cache, crash)).unwrap().unwrap().starts_with("crashed:"));
+    assert!(store.pdf_fingerprint_error(&hash_of(&cache, hang)).unwrap().unwrap().starts_with("timed out:"));
+    for id in &good {
+        assert!(store.has_pdf_fingerprint(&hash_of(&cache, *id)).unwrap());
+        assert_eq!(store.pdf_fingerprint_error(&hash_of(&cache, *id)).unwrap(), None);
+    }
+    assert_eq!(store.pdf_status().unwrap(), PdfStatus { fingerprinted: 4, failed: 2, pending: 0, unhashed: 0 });
+    assert_eq!(inflight(&cache), 0);
+
+    // Recorded, so a rerun does not walk into them again.
+    let again = fingerprint_pdfs(&cache, &pool_options(2, std::time::Duration::from_millis(4000)), &JobControl::new()).unwrap();
+    assert_eq!((again.total, again.fingerprinted, again.failed_count), (0, 0, 0));
+}
+
+/// A run that died with files in flight (the whole process, not a worker)
+/// does not condemn them: they are suspects, read first, alone. An innocent
+/// one is fingerprinted; the poison one is recorded after its own retry.
+#[test]
+fn files_left_in_flight_by_a_dead_run_are_suspects_retried_alone() {
+    let (dir, cache) = library();
+    let innocent = add_pdf(dir.path(), &cache, "good-but-marked", b"%PDF-1.4 marked");
+    let poison = add_pdf(dir.path(), &cache, "crash-marked", b"%PDF-1.4 poison");
+    let fine = add_pdf(dir.path(), &cache, "good-fine", b"%PDF-1.4 fine");
+    let store = cache.checksums();
+    store.mark_inflight("fingerprint", &hash_of(&cache, innocent)).unwrap();
+    store.mark_inflight("fingerprint", &hash_of(&cache, poison)).unwrap();
+
+    let pool = pool_options(2, std::time::Duration::from_secs(60));
+    let report = fingerprint_pdfs(&cache, &pool, &JobControl::new()).unwrap();
+    assert_eq!((report.total, report.fingerprinted, report.failed_count), (3, 2, 1), "{report:?}");
+    assert!(store.has_pdf_fingerprint(&hash_of(&cache, innocent)).unwrap());
+    assert_eq!(store.pdf_fingerprint_error(&hash_of(&cache, innocent)).unwrap(), None, "an innocent file is not condemned");
+    assert!(store.has_pdf_fingerprint(&hash_of(&cache, fine)).unwrap());
+    assert!(store.pdf_fingerprint_error(&hash_of(&cache, poison)).unwrap().unwrap().starts_with("crashed:"), "the poison file is recorded after its own retry");
+    assert_eq!(inflight(&cache), 0);
+}
+
+/// A suspect still marked from its isolated retry killed the process on its
+/// own: recorded as crashed without a third try.
+#[test]
+fn a_suspect_that_killed_the_process_on_its_own_retry_is_recorded_without_another_try() {
+    let (dir, cache) = library();
+    let marked = add_pdf(dir.path(), &cache, "good-marked-twice", b"%PDF-1.4 twice");
+    cache.checksums().mark_inflight("fingerprint-suspect", &hash_of(&cache, marked)).unwrap();
+    let report = fingerprint_pdfs(&cache, &pool_options(1, std::time::Duration::from_secs(60)), &JobControl::new()).unwrap();
+    assert_eq!((report.total, report.fingerprinted, report.failed_count), (0, 0, 1), "{report:?}");
+    assert!(cache.checksums().pdf_fingerprint_error(&hash_of(&cache, marked)).unwrap().unwrap().starts_with("crashed:"));
+    assert_eq!(inflight(&cache), 0);
+}
+
+/// No worker could be started: the job fails and records nothing against any
+/// PDF (it is not their fault), so a later run with a worker does them all.
+#[test]
+fn a_pool_that_cannot_start_fails_the_job_and_blames_no_file() {
+    let (dir, cache) = library();
+    add_pdf(dir.path(), &cache, "one", b"%PDF-1.4 one");
+    let broken = crate::pdf_worker::Pool::new(crate::pdf_worker::PoolConfig { program: "/definitely/not/a/worker".into(), args: Vec::new(), envs: Vec::new(), workers: 1, timeout: std::time::Duration::from_secs(5) });
+    let options = PipelineOptions { pdf_pool: crate::pdf_worker::PdfPoolChoice::Pool(std::sync::Arc::new(broken)), ..PipelineOptions::with_workers(1) };
+    assert!(fingerprint_pdfs(&cache, &options, &JobControl::new()).is_err());
+    assert_eq!(cache.checksums().pdf_status().unwrap(), PdfStatus { fingerprinted: 0, failed: 0, pending: 1, unhashed: 0 });
+    assert_eq!(inflight(&cache), 0);
+}
+
+/// The out-of-process worker and the in-process reader produce the same
+/// fingerprint for a real PDF (needs PDFium; skipped without it).
+#[test]
+fn the_pool_and_the_in_process_reader_fingerprint_a_real_pdf_identically() {
+    if !calibre_ebooks::pdf::rasterize::is_available() {
+        eprintln!("skipped: PDFium is not installed");
+        return;
+    }
+    const TWO_PAGE: &[u8] = include_bytes!("../../../calibre_ebooks/tests/data/two-page.pdf");
+    let (dir_a, in_process) = library();
+    let (dir_b, pooled) = library();
+    add_pdf(dir_a.path(), &in_process, "two", TWO_PAGE);
+    add_pdf(dir_b.path(), &pooled, "two", TWO_PAGE);
+
+    let direct = PipelineOptions { pdf_pool: crate::pdf_worker::PdfPoolChoice::InProcess, ..PipelineOptions::with_workers(1) };
+    assert_eq!(fingerprint_pdfs(&in_process, &direct, &JobControl::new()).unwrap().fingerprinted, 1);
+    assert_eq!(fingerprint_pdfs(&pooled, &pool_options(1, std::time::Duration::from_secs(120)), &JobControl::new()).unwrap().fingerprinted, 1);
+
+    let a = in_process.checksums().pdf_fingerprints().unwrap();
+    let b = pooled.checksums().pdf_fingerprints().unwrap();
+    assert_eq!((a.len(), b.len()), (1, 1));
+    assert_eq!(a[0].fingerprint, b[0].fingerprint);
+}

@@ -9,6 +9,13 @@ description = "calibre-oxide content server (issue #60) -- an axum/tokio HTTP se
 name = "calibre_srv"
 path = "src/main.rs"
 
+# Reads PDFs for the library jobs in a process of its own, so a crash or a hang
+# in PDFium costs one file instead of the server. Built with `calibre_srv` so it
+# sits next to it, where `calibre_db::pdf_worker::locate_worker` looks.
+[[bin]]
+name = "calibre_pdf_worker"
+path = "src/bin/calibre_pdf_worker.rs"
+
 [dependencies]
 # Line diffs for the editor's before/after view (#816 item 3.5).
 similar = "2"
