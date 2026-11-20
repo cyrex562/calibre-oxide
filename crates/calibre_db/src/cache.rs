@@ -384,6 +384,19 @@ impl Cache {
         self.record_for_book(book_id, |book| crate::change_log::ChangeOp::CoverSet { book, blob: Some(blob) });
     }
 
+    /// Gives a book the folder it will keep its files in (`books.path`),
+    /// recorded in the change log. For a book that was just created with no
+    /// folder and has no files yet; it moves nothing.
+    pub fn place_book_in_folder(&self, book_id: i32, folder: &str) -> anyhow::Result<()> {
+        {
+            let conn = self.backend.conn.lock().unwrap();
+            conn.execute("UPDATE books SET path = ?1 WHERE id = ?2", (folder, book_id))?;
+        }
+        let folder = folder.to_string();
+        self.record_for_book(book_id, |book| crate::change_log::ChangeOp::FieldSet { book, field: "path".to_string(), value: Some(folder) });
+        Ok(())
+    }
+
     /// Convenience for the common case: look up the book's uuid and
     /// record an op built from it. Does nothing if the book has no
     /// uuid, which means it does not exist.

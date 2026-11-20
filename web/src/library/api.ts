@@ -3,6 +3,7 @@
 // role for this slice, narrowed to only what the library-browser MVP
 // needs.
 
+import type { AbsorbReport, AbsorbableList } from "./absorb";
 import { importBody, type ImportFolderRequest, type ImportReport } from "./importFolder";
 import type { UntrackedCount } from "./scanPrompt";
 import { parseStorageInfo, type StorageInfo } from "./storageBanner";
@@ -634,7 +635,7 @@ export interface LibraryJobProgress {
 
 export interface LibraryJob<R = unknown> {
   id: number;
-  kind: "scan" | "enrich" | "hash_backfill" | "pdf_fingerprint" | "merge_exact" | "import" | "dedupe" | "resolve" | "prepare";
+  kind: "scan" | "enrich" | "hash_backfill" | "pdf_fingerprint" | "merge_exact" | "import" | "dedupe" | "resolve" | "prepare" | "absorb" | "unabsorb" | "copy";
   state: "running" | "finished" | "cancelled" | "failed";
   progress: LibraryJobProgress;
   /** Present once the job has ended. */
@@ -786,6 +787,17 @@ export function describeJobProgress(p: LibraryJobProgress): string {
       return `Analysing PDF pages… ${n((p.fingerprinted ?? 0) + p.errors)} of ${n(p.total)}`;
     case "importing":
       return `Importing… ${n(p.hashed + p.already_known + p.errors)} of ${n(p.total)} files · ${n(p.added)} books added${p.ignored ? ` · ${n(p.ignored)} duplicates skipped` : ""}`;
+    case "checking":
+    case "columns":
+      return "Checking the calibre library…";
+    case "absorbing":
+      return `Bringing in books… ${n(p.added + p.already_known + p.errors)} of ${n(p.total)}${p.already_known ? ` (${n(p.already_known)} already in)` : ""}`;
+    case "finishing":
+      return "Finishing…";
+    case "removing":
+      return `Removing books… ${n(p.added)} of ${n(p.total)}`;
+    case "copying":
+      return `Copying… ${n(p.added + p.already_known + p.errors)} of ${n(p.total)} books${p.already_known ? ` · ${n(p.already_known)} duplicates skipped` : ""}`;
     case "matching":
       return "Comparing every book in the library…";
     case "describing":
@@ -800,6 +812,27 @@ export function describeJobProgress(p: LibraryJobProgress): string {
 /** Copies a folder tree into the library, as a job: see `importFolder.ts`. */
 export function importFolder(request: ImportFolderRequest, handlers: LibraryJobHandlers<ImportReport> = {}): Promise<ImportReport> {
   return runLibraryJob<ImportReport>("/import-folder/-", handlers, importBody(request));
+}
+
+/** The calibre libraries found inside this library (a bounded walk; reads no book). */
+export function fetchAbsorbable(): Promise<AbsorbableList> {
+  return jsonFetch<AbsorbableList>("/absorbable-libraries/-");
+}
+
+/** Registers a nested calibre library's books in place, as a job: see `absorb.ts`. */
+export function absorbLibrary(path: string, handlers: LibraryJobHandlers<AbsorbReport> = {}): Promise<AbsorbReport> {
+  return runLibraryJob<AbsorbReport>("/absorb-library/-", handlers, { path });
+}
+
+/** Undoes an absorb: puts the nested metadata.db back and removes the books (database rows only). */
+export function unabsorbLibrary(path: string, handlers: LibraryJobHandlers<UnabsorbReport> = {}): Promise<UnabsorbReport> {
+  return runLibraryJob<UnabsorbReport>("/unabsorb-library/-", handlers, { path });
+}
+
+export interface UnabsorbReport {
+  removed: number;
+  database_restored: boolean;
+  cancelled: boolean;
 }
 
 /** How many book files in the library folder nothing tracks yet. A walk; reads nothing, adds nothing. */

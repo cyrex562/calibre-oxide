@@ -41,6 +41,11 @@
 //!   the stage persisted so a rerun resumes (`?restart=true` starts over);
 //!   `GET /prepare-library/{library_id}` says which stage it stands at
 //! - `POST /import-folder/{library_id}` -- copy a folder tree in ([`crate::import_folder`])
+//! - `GET /absorbable-libraries/{library_id}`, `POST /absorb-library/{library_id}`,
+//!   `POST /unabsorb-library/{library_id}` -- bring a calibre library nested in
+//!   this one in, in place, and undo it ([`crate::absorb_library`])
+//! - `POST /cdb/copy-to-library/{target}/{source}?job=true` -- the cross-library
+//!   copy as a job ([`crate::cdb`])
 //! - `POST /duplicates/scan/{library_id}?job=true` -- the duplicate scan ([`crate::duplicates`])
 //! - `GET /library-jobs`, `GET /library-jobs/{id}`, `POST /library-jobs/{id}/cancel`
 
@@ -83,6 +88,14 @@ pub enum JobKind {
     /// Scan, hash backfill, PDF fingerprints, duplicate scan, in that order
     /// (`POST /prepare-library`).
     Prepare,
+    /// Register the books of a calibre library nested in this one, in place
+    /// (`POST /absorb-library`).
+    Absorb,
+    /// Undo an absorb (`POST /unabsorb-library`).
+    Unabsorb,
+    /// Copy or move books from another library into this one
+    /// (`POST /cdb/copy-to-library/...?job=true`).
+    Copy,
 }
 
 impl JobKind {
@@ -97,6 +110,9 @@ impl JobKind {
             JobKind::Dedupe => "dedupe",
             JobKind::Resolve => "resolve",
             JobKind::Prepare => "prepare",
+            JobKind::Absorb => "absorb",
+            JobKind::Unabsorb => "unabsorb",
+            JobKind::Copy => "copy",
         }
     }
 }
@@ -142,6 +158,11 @@ pub struct LibraryJob {
 impl LibraryJob {
     pub fn state(&self) -> JobState {
         self.outcome.lock().unwrap().state
+    }
+
+    /// The final report, once the job has ended with one.
+    pub fn report(&self) -> Option<Value> {
+        self.outcome.lock().unwrap().report.clone()
     }
 
     /// Resolves once the job has finished, however it ended.
@@ -219,6 +240,20 @@ pub struct JobParams {
     /// For [`JobKind::Prepare`]: begin again at the scan instead of resuming
     /// at the stage a previous run reached.
     pub restart: bool,
+    /// The nested library folder and how to absorb it ([`JobKind::Absorb`]; for
+    /// [`JobKind::Unabsorb`] only the folder).
+    pub absorb: Option<(String, calibre_db::absorb::AbsorbOptions)>,
+    /// The books to copy and where from ([`JobKind::Copy`]).
+    pub copy: Option<CopyJob>,
+}
+
+/// A cross-library copy: the source library, its books and the options. The
+/// destination is the library the job runs on.
+#[derive(Clone)]
+pub struct CopyJob {
+    pub source: Arc<Cache>,
+    pub book_ids: Vec<i32>,
+    pub options: calibre_db::copy_to_library::CopyOptions,
 }
 
 pub fn start_with(cache: Arc<Cache>, kind: JobKind, workers: Option<usize>, params: JobParams) -> Started {
@@ -322,6 +357,18 @@ fn run(cache: &Cache, kind: JobKind, options: &PipelineOptions, control: &JobCon
         JobKind::Resolve => {
             let job = params.resolve.as_ref().ok_or_else(|| anyhow::anyhow!("a resolve job needs a plan"))?;
             crate::duplicates_review::run_resolve_job(cache, job, control)
+        }
+        JobKind::Absorb => {
+            let (folder, absorb_options) = params.absorb.as_ref().ok_or_else(|| anyhow::anyhow!("an absorb job needs a folder"))?;
+            Ok(serde_json::to_value(calibre_db::absorb::absorb_library(cache, folder, absorb_options, options, control)?)?)
+        }
+        JobKind::Unabsorb => {
+            let (folder, _) = params.absorb.as_ref().ok_or_else(|| anyhow::anyhow!("an unabsorb job needs a folder"))?;
+            Ok(serde_json::to_value(calibre_db::absorb::unabsorb_library(cache, folder, control)?)?)
+        }
+        JobKind::Copy => {
+            let job = params.copy.as_ref().ok_or_else(|| anyhow::anyhow!("a copy job needs its books"))?;
+            Ok(serde_json::to_value(calibre_db::copy_to_library::copy_books(&job.source, cache, &job.book_ids, job.options, control)?)?)
         }
         JobKind::Import => {
             let (source, import_options) = params.import.as_ref().ok_or_else(|| anyhow::anyhow!("an import job needs a source folder"))?;

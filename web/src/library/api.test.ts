@@ -814,6 +814,8 @@ describe("describeJobProgress", () => {
     expect(describeJobProgress(progress({ phase: "enriching", enriched: 10, total: 40 }))).toBe("Reading titles and covers… 10 of 40");
     expect(describeJobProgress(progress({ phase: "hashing", hashed: 3, total: 1000 }))).toBe("Reading files… 3 of 1,000");
     expect(describeJobProgress(progress({ phase: "fingerprinting", fingerprinted: 3, errors: 1, total: 2000 }))).toBe("Analysing PDF pages… 4 of 2,000");
+    expect(describeJobProgress(progress({ phase: "absorbing", added: 10, already_known: 5, errors: 1, total: 1200 }))).toBe("Bringing in books… 16 of 1,200 (5 already in)");
+    expect(describeJobProgress(progress({ phase: "copying", added: 3, already_known: 1, total: 8 }))).toBe("Copying… 4 of 8 books · 1 duplicates skipped");
     expect(describeJobProgress(progress({ phase: "" }))).toBe("Working…");
   });
 });

@@ -593,6 +593,112 @@ library — the counterpart of scanning, which indexes files already there.
   outcome, so a rerun skips what was done without reading it. The source is
   never modified.
 
+## Absorbing a calibre library that sits inside the library
+
+A NAS root often holds several calibre libraries next to loose folders of
+books. One oxide library rooted at the share should see all of it, so that
+duplicates are found *across* it. The scan steps around a folder with a live
+`metadata.db` (E2), and the folder import refuses a source inside the library,
+so a nested calibre library gets in by **absorbing** it
+(`calibre_db::absorb`):
+
+* `GET /absorbable-libraries/{lib}` lists the nested calibre libraries (a
+  bounded, time-budgeted walk of folders only, like the untracked count), each
+  with its book count and `state`: `available` (live `metadata.db`) or
+  `absorbed`.
+* `POST /absorb-library/{lib}` `{path}` (relative to the library, or absolute
+  inside it) is a library job: progress, cancel and a final report on
+  `/library-jobs/{id}`. `POST /unabsorb-library/{lib}` `{path}` is the undo.
+  Refusals (`400`, before any job): a path outside the library, the library
+  itself, no `metadata.db`, an oxide library, a database calibre appears to
+  have open (tranche 3's in-use probes, or a non-empty `-journal`/`-wal`).
+
+**What it does.** The nested `metadata.db` is opened `SQLITE_OPEN_READ_ONLY` and
+never written. Each book is registered **in place**: `books.path` is the
+nested folder's path relative to the library followed by calibre's own
+`Author/Title (id)`, so `<library>/<path>/<name>.<ext>` is the file where it
+already is. Nothing is moved, copied or written.
+
+**Carried:** title, sort, author sort, authors (with each new author's sort and
+link, in order), series and index, tags, publisher, identifiers, languages (in
+order), rating, comments, isbn/lccn, `timestamp` (date added), `pubdate` and
+`last_modified`, the calibre uuid, the formats with their real file names and
+sizes, the cover, every custom column of every kind, annotations and reading
+positions.
+
+* *Covers* are not copied: calibre's `cover.jpg` is
+  `<book folder>/cover.jpg`, exactly the legacy location
+  `covers::legacy_cover_path` already reads, so the book points at it. Setting
+  a new cover later writes the `.calibre-oxide/covers/<uuid>.jpg` sidecar and
+  retires the old file, as for any other book.
+* *Custom columns*: a column this library lacks is created with the same label,
+  name, type, `is_multiple` and display; values (normalized ones included) are
+  written straight into the destination's value and link tables, so a value
+  containing a separator survives. A label that exists here with another type
+  is reported in `custom_column_conflicts` and its values are skipped.
+* *Uuids* are kept unless this library already has the uuid (the same library
+  copied twice): the book then keeps the fresh uuid its row got, and
+  `{source_uuid: new_uuid}` is reported (`uuid_remapped`) and recorded in
+  `.calibre-oxide/absorbed-libraries.json`.
+* *Hashes*: every format (and the cover) is streamed through BLAKE3 in the
+  job's own read, in parallel and bounded like the scan's, and recorded in the
+  same transaction. The content-duplicate tier sees the books at once and the
+  hash backfill finds nothing to do.
+* *Change log*: one `BEGIN IMMEDIATE` transaction (a savepoint per book, so
+  one bad book is rolled back alone) and one change-log `Batch` entry per
+  batch of ~100 books, database first, log second. A rebuild from the log gives
+  the same books, formats, covers and custom values.
+* A format or cover the database lists that is not on disk is reported
+  (`missing_files`); the book is registered without it.
+
+**Not carried:** calibre's saved searches, virtual libraries and other library
+preferences; notes (`.calnotes`) and conversion options; the link/sort of an
+author this library already has (the existing author wins); and, in the
+change log, `last_modified` and annotations/reading positions (they are in the
+database, but a rebuild from the log does not restore them).
+
+**Resumable.** The database is the record of progress: a source book is
+absorbed already when this library has a book whose `path` is the prefixed path
+(calibre's folder name carries the book id). A cancelled or crashed absorb is
+resumed by running it again; what was done is skipped without being read.
+Per-book errors are isolated and reported. Cancel is checked between read
+chunks; a batch whose reading was interrupted writes nothing.
+
+**Finishing.** When every book is in (none failed, not cancelled) the nested
+`metadata.db` — and its `-wal`/`-shm`/`-journal` — is renamed to
+`metadata.db.absorbed-by-calibre-oxide`. From then on the folder is not "a
+library of its own" (`scan::holds_its_own_library` only honours a **live**
+`metadata.db`): the scan descends into it, finds every absorbed file already
+tracked (0 untracked, no duplicates of the absorbed books) and picks up a loose
+file dropped in later. With failures the database is left in place so the
+absorb can be retried, unless `allow_failures` asks to finish anyway (the
+failed books' files are then found as loose files).
+
+**Undo.** Rename `metadata.db.absorbed-by-calibre-oxide` back to
+`metadata.db` and the folder is a calibre library again that the scan steps
+around — but its books are still in the oxide database until removed. The
+`POST /unabsorb-library` job does both: it renames the file back and removes
+the books under that folder from the database (**rows only, never a file**,
+and nothing goes on the ignore list).
+
+## Copying between libraries
+
+`POST /cdb/copy-to-library/{target}/{source}` copies or moves books between two
+open libraries through the destination's own write paths. Since tranche 14a:
+
+* `?job=true` runs it as a library job (`kind: copy`): the route answers `202`
+  with a job id, progress counts books (`added` copied, `already_known`
+  duplicates skipped, `errors`), cancel stops between books, and the report has
+  one entry per source book. Without it the route answers as it always did
+  (`{source id: {ok, payload}}`), now from the same engine.
+* The duplicate index (`dedupe::ExactIndex`) is built **once** per run and kept
+  current as books are added; it used to be rebuilt for every book, which is
+  O(n²) over a bulk copy.
+* Copied books are filed as `Author/Title (id)/` (the layout of the folder
+  import and of calibre), not dropped in the library root.
+* `verify_copy` (what a move relies on) hashes both sides **streamed** in
+  megabyte chunks instead of reading both files into memory.
+
 ## Behaviour decided
 
 | | |
@@ -617,7 +723,7 @@ hides someone's books.
 | # | Case | Handling |
 | --- | --- | --- |
 | E1 | Subfolders | recurse; record the subfolder in `books.path` |
-| E2 | A subfolder that is itself a library — **risk** | skip any directory containing `metadata.db` or `.calibre-oxide/`; absorbing a nested library double-tracks every book in it |
+| E2 | A subfolder that is itself a library — **risk** | skip any directory containing a **live** `metadata.db` or `.calibre-oxide/`; descending into one double-tracks every book in it. A calibre library is brought in deliberately by **absorbing** it (see "Absorbing a calibre library that sits inside the library"), after which its database is renamed and the folder is ordinary |
 | E3 | Grouping | see "When two files are one book" |
 | E4 | Non-book files | extension allowlist; a sibling image with a matching stem is a candidate cover |
 | E5 | OS junk — `.DS_Store`, `Thumbs.db`, `@eaDir` | ignore list, extending `check_library`'s existing one |
