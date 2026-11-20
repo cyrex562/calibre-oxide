@@ -31,6 +31,8 @@ import DuplicateReview from "./DuplicateReview.vue";
 import ResolveDialog from "./ResolveDialog.vue";
 import { createDuplicatesStore } from "../library/duplicatesStore";
 import { createResolveController } from "../library/resolve";
+import { createOrganizeController } from "../library/organize";
+import OrganizeDialog from "./OrganizeDialog.vue";
 import { DEFAULT_DESTINATION_HINT, MERGE_MODE_LABELS, MERGE_MODE_NOTES, defaultMergeDestination, describeMergeResult, describeRecord, summarizeMerge } from "../library/merge";
 import { parseSnippetSegments } from "../library/snippets";
 import { similarBooksQuery } from "../library/query";
@@ -1468,6 +1470,14 @@ const duplicatesError = ref<string | null>(null);
 const dupStore = createDuplicatesStore();
 const resolveController = createResolveController();
 const resolveOpen = ref(false);
+const organizeController = createOrganizeController();
+const organizeOpen = ref(false);
+/** Organize files: the selected books when there are any (select mode), else the open book is not assumed. */
+const organizeSelection = computed(() => (selectMode.value ? [...selectedIds.value] : []));
+function openOrganize() {
+  organizeController.open(organizeSelection.value.length);
+  organizeOpen.value = true;
+}
 // How many PDFs are not yet fingerprinted, for page-content matching.
 const pdfStatus = computed<PdfScanStatus | undefined>(() => dupStore.state.pdf);
 // Zero-byte files: not duplicates of each other, listed separately.
@@ -1996,6 +2006,7 @@ const actionHandlers: Partial<Record<LibraryActionId, () => void>> = {
   "custom-columns": () => openColumns(),
   "check-library": () => openCheckLibrary(),
   "find-duplicates": () => openDuplicates(),
+  "organize-files": () => openOrganize(),
   "map-metadata": () => {
     mapperOpen.value = true;
   },
@@ -2048,6 +2059,7 @@ const HIDDEN_IN_FTS_MODE: ReadonlySet<LibraryActionId> = new Set<LibraryActionId
   "custom-columns",
   "check-library",
   "find-duplicates",
+  "organize-files",
   "map-metadata",
   "browse-annotations",
   "pick-random",
@@ -2417,7 +2429,7 @@ function onLibraryKeydown(event: KeyboardEvent) {
   // A modal owns the keyboard while it is open -- firing library
   // shortcuts underneath one would act on a view the user cannot
   // currently see.
-  if (contextMenu.value || manageOpen.value || columnsOpen.value || columnPickerOpen.value || checkLibraryOpen.value || duplicatesOpen.value || mergeOpen.value || saveToDiskOpen.value || renameOpen.value || embedOpen.value || copyOpen.value || newsOpen.value || switchOpen.value) return;
+  if (contextMenu.value || manageOpen.value || columnsOpen.value || columnPickerOpen.value || checkLibraryOpen.value || organizeOpen.value || duplicatesOpen.value || mergeOpen.value || saveToDiskOpen.value || renameOpen.value || embedOpen.value || copyOpen.value || newsOpen.value || switchOpen.value) return;
 
   const id = shortcutFor(event, libraryShortcuts(keymap.value));
   if (!id) return;
@@ -3313,6 +3325,7 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
     </div>
 
     <ResolveDialog v-if="duplicatesOpen && resolveOpen" :store="dupStore" :controller="resolveController" @close="resolveOpen = false" @changed="onDuplicatesChanged" />
+    <OrganizeDialog v-if="organizeOpen" :controller="organizeController" :selected-ids="organizeSelection" @close="organizeOpen = false" @changed="onDuplicatesChanged" />
 
     <div v-if="mergeOpen" class="manage-backdrop" @click.self="mergeOpen = false">
       <div class="manage-panel" role="dialog" aria-label="Merge books">
