@@ -724,6 +724,21 @@ mod content_duplicate_tests {
         assert_eq!(groups, vec![vec![a.min(b), a.max(b)]]);
     }
 
+    /// Zero-byte files all hash alike, and are not the same book: they are
+    /// excluded from content groups and listed on their own.
+    #[test]
+    fn empty_files_are_not_content_duplicates_but_are_listed() {
+        let (dir, cache) = library();
+        let a = add(dir.path(), &cache, "Empty One", "A", "src/e1.pdf", b"");
+        let b = add(dir.path(), &cache, "Empty Two", "B", "src/e2.pdf", b"");
+        let c = add(dir.path(), &cache, "Real One", "C", "src/r1.pdf", b"REAL BYTES");
+        let d = add(dir.path(), &cache, "Real Two", "D", "src/r2.pdf", b"REAL BYTES");
+        let groups = scan_library_for_content_duplicates(&cache).unwrap();
+        assert_eq!(groups, vec![vec![c.min(d), c.max(d)]], "only the non-empty pair groups");
+        let empties: Vec<i32> = cache.checksums().empty_files("format").unwrap().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(empties, vec![a.min(b), a.max(b)]);
+    }
+
     #[test]
     fn different_files_are_not_content_duplicates() {
         let (dir, cache) = library();

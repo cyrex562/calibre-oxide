@@ -56,14 +56,26 @@
 //! `FPDF_DestroyLibrary` to be called once per process. A `Pdfium`
 //! value owns that pair, so creating one per render would init and
 //! destroy the library repeatedly. [`pdfium`] holds a single instance
-//! in a `OnceLock`; `pdfium-render`'s `thread_safe` feature serialises
-//! access to the (not thread-safe) C++ core behind it, which is what
-//! makes a shared instance sound to hand out to several server
-//! request threads at once.
+//! in a `OnceLock`.
+//!
+//! # Why one process-wide lock
+//!
+//! `pdfium-render`'s `thread_safe` feature was believed to make a shared
+//! instance sound to use from several threads. It does not make
+//! *documents* safe to use concurrently: the PDF fingerprint job running
+//! two workers killed the whole server process in native code within
+//! seconds on a real library, while one worker fingerprinted every file.
+//! So **every** PDFium entry point in this module ([`is_available`],
+//! [`page_count`], [`render_page`] (and so [`page_images`] and
+//! [`first_page_cover`]), [`info_and_cover_from_path`] and
+//! [`sample_pdf_from_path`]) holds one global mutex for as long as it has a
+//! library call or a document alive. Cover rendering, the reader's page
+//! images and the fingerprint job therefore cannot overlap. This is the
+//! only module that touches PDFium; keep it that way.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use pdfium_render::prelude::{PdfRenderConfig, Pdfium};
 
@@ -240,6 +252,30 @@ fn pdfium() -> Option<&'static Pdfium> {
         .as_ref()
 }
 
+/// The one lock every use of PDFium in the process takes. See the module
+/// docs.
+static PDFIUM_LOCK: Mutex<()> = Mutex::new(());
+
+/// Held while PDFium is in use. A panic in a render poisons nothing worth
+/// keeping (the lock guards no data), so a poisoned lock is simply taken.
+struct PdfiumGuard {
+    _guard: MutexGuard<'static, ()>,
+}
+
+fn lock_pdfium() -> PdfiumGuard {
+    let guard = PDFIUM_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    #[cfg(test)]
+    tests::enter();
+    PdfiumGuard { _guard: guard }
+}
+
+#[cfg(test)]
+impl Drop for PdfiumGuard {
+    fn drop(&mut self) {
+        tests::leave();
+    }
+}
+
 fn unavailable() -> RasterizeError {
     RasterizeError::Unavailable {
         searched: searched_paths().iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "),
@@ -254,11 +290,13 @@ fn unavailable() -> RasterizeError {
 /// than treating [`RasterizeError::Unavailable`] as an error worth
 /// reporting.
 pub fn is_available() -> bool {
+    let _lock = lock_pdfium();
     pdfium().is_some()
 }
 
 /// How many pages the document has.
 pub fn page_count(pdf: &[u8]) -> Result<usize> {
+    let _lock = lock_pdfium();
     let pdfium = pdfium().ok_or_else(unavailable)?;
     let document = pdfium.load_pdf_from_byte_slice(pdf, None).map_err(|e| RasterizeError::Pdf(e.to_string()))?;
     Ok(document.pages().len() as usize)
@@ -272,6 +310,7 @@ pub fn page_count(pdf: &[u8]) -> Result<usize> {
 /// page as somebody's cover. `target_width` is clamped to
 /// [`MAX_RENDER_WIDTH`].
 pub fn render_page(pdf: &[u8], page_number: usize, target_width: u32) -> Result<RenderedPage> {
+    let _lock = lock_pdfium();
     let pdfium = pdfium().ok_or_else(unavailable)?;
     let document = pdfium.load_pdf_from_byte_slice(pdf, None).map_err(|e| RasterizeError::Pdf(e.to_string()))?;
     render_document_page(&document, page_number, target_width)
@@ -297,6 +336,7 @@ pub struct PdfInfo {
 pub fn info_and_cover_from_path(path: &Path, want_cover: bool) -> Result<(PdfInfo, Option<Vec<u8>>)> {
     use pdfium_render::prelude::PdfDocumentMetadataTagType as Tag;
 
+    let _lock = lock_pdfium();
     let pdfium = pdfium().ok_or_else(unavailable)?;
     let document = pdfium.load_pdf_from_file(path, None).map_err(|e| RasterizeError::Pdf(e.to_string()))?;
     let metadata = document.metadata();
@@ -350,6 +390,9 @@ pub struct SampledPage {
     pub height: u32,
     /// One byte per pixel, row-major.
     pub gray: Vec<u8>,
+    /// An image object covers at least 80% of the page: the page is a picture
+    /// (a scan), whatever text layer sits on it.
+    pub image_page: bool,
 }
 
 /// What [`sample_pdf_from_path`] read from one PDF.
@@ -376,6 +419,7 @@ pub struct SampledPdf {
 /// Oxide-specific: nothing here is ported from calibre. It exists for
 /// `calibre_db::pdf_similarity`.
 pub fn sample_pdf_from_path(path: &Path, long_side: u32, choose: impl FnOnce(usize) -> (Vec<usize>, Vec<usize>)) -> Result<SampledPdf> {
+    let _lock = lock_pdfium();
     let pdfium = pdfium().ok_or_else(unavailable)?;
     let document = pdfium.load_pdf_from_file(path, None).map_err(|e| RasterizeError::Pdf(e.to_string()))?;
     let pages = document.pages();
@@ -388,11 +432,15 @@ pub fn sample_pdf_from_path(path: &Path, long_side: u32, choose: impl FnOnce(usi
         let (pw, ph) = (page.width().value.max(1.0), page.height().value.max(1.0));
         let scale = long_side as f32 / pw.max(ph);
         let (w, h) = (((pw * scale).round() as i32).max(1), ((ph * scale).round() as i32).max(1));
+        let image_page = {
+            use pdfium_render::prelude::{PdfPageObjectCommon, PdfPageObjectType, PdfPageObjectsCommon};
+            page.objects().iter().filter(|o| o.object_type() == PdfPageObjectType::Image).filter_map(|o| o.bounds().ok()).any(|b| b.width().value * b.height().value >= 0.8 * pw * ph)
+        };
         let config = PdfRenderConfig::new().set_target_size(w, h).render_form_data(false);
         let Ok(bitmap) = page.render_with_config(&config) else { continue };
         let rgba = bitmap.as_rgba_bytes();
         let gray = rgba.chunks_exact(4).map(|p| ((p[0] as u32 * 299 + p[1] as u32 * 587 + p[2] as u32 * 114) / 1000) as u8).collect();
-        sampled.push(SampledPage { index, width: bitmap.width() as u32, height: bitmap.height() as u32, gray });
+        sampled.push(SampledPage { index, width: bitmap.width() as u32, height: bitmap.height() as u32, gray, image_page });
     }
 
     let mut text = Vec::new();
@@ -427,6 +475,45 @@ pub fn first_page_cover(pdf: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    static MAX_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
+    pub(super) fn enter() {
+        let now = ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
+        MAX_ACTIVE.fetch_max(now, Ordering::SeqCst);
+    }
+
+    pub(super) fn leave() {
+        ACTIVE.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Every entry point takes the one lock: however many threads call in,
+    /// never two are inside PDFium at once.
+    #[test]
+    fn pdfium_is_never_entered_by_two_threads_at_once() {
+        const TWO_PAGE: &[u8] = include_bytes!("../../tests/data/two-page.pdf");
+        MAX_ACTIVE.store(0, Ordering::SeqCst);
+        let threads: Vec<_> = (0..6)
+            .map(|n| {
+                std::thread::spawn(move || {
+                    for _ in 0..8 {
+                        // Fine if PDFium is absent: the lock is taken first.
+                        let _ = is_available();
+                        let _ = page_count(TWO_PAGE);
+                        let _ = render_page(TWO_PAGE, 1 + n % 2, 64);
+                        let _ = first_page_cover(TWO_PAGE);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(MAX_ACTIVE.load(Ordering::SeqCst), 1, "PDFium was used concurrently");
+        assert_eq!(ACTIVE.load(Ordering::SeqCst), 0);
+    }
 
     /// A real two-page PDF: page 1 draws "PAGE ONE" and a blue
     /// rectangle, page 2 "PAGE TWO" and a red one. The colours are

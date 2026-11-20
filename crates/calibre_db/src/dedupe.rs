@@ -73,6 +73,8 @@
 //!   nothing. A book with no *specific* author can only be grouped by
 //!   content or identifier, never by title. (This is [`is_unknown_author`],
 //!   which `grouping.rs` now uses too.)
+//! * A junk author or title from [`crate::junk_metadata`] (`Admin`, `Owner`,
+//!   `... print job`, a bare `foo.tif` filename, ...): never matching evidence.
 //! * A boilerplate title (`Untitled`, `Document1`, `Microsoft Word - x`, only
 //!   digits ...), by the same list `grouping.rs` uses.
 //! * The same title with a different author. The fuzzy tier needs an author
@@ -94,7 +96,13 @@
 //!    on one side only): 0.60-0.65. Two books that *both* have subtitles never
 //!    match this way, so `Discworld: Mort` is not `Discworld: Eric`; or
 //! 3. their core keys are at least 12 characters and a small edit apart
-//!    (Levenshtein <= 2 and <= len/8), with equal numeric signatures: 0.60-0.65.
+//!    (Levenshtein <= 2 and <= len/8), with equal numeric signatures: 0.60-0.65,
+//!    **unless the titles differ by a distinguishing token** (a number or
+//!    version, Roman numeral, single letter, volume/part word, or one of a tiny
+//!    list of opposites such as `male`/`female`): `Names - Female` is not
+//!    `Names - Male`, `Templates A to H` is not `P to Z`, `1.00` is not `1.01`.
+//!    Underscores and runs of separators are already separators in [`plain`],
+//!    so `Elven_Names_-_Male` and `Elven Names - Male` are one title.
 //!    Blocks with more than [`MAX_EDIT_BLOCK`] distinct titles skip this rule.
 //!
 //! # Deviations from calibre
@@ -334,7 +342,12 @@ impl TitleKeys {
 /// The keys for `title`, or `None` when the title carries no information
 /// (empty, `Untitled`, only digits ...).
 pub fn title_keys(title: &str) -> Option<TitleKeys> {
-    let folded = fold(title.trim());
+    if crate::junk_metadata::is_junk_title(title) {
+        return None;
+    }
+    // Underscores are word separators in filenames (`Elven_Names_-_Male`);
+    // made spaces first so article stripping and the other rules see words.
+    let folded = fold(title.trim()).replace('_', " ");
     let base = TRAILING_SITE.replace(&folded, "").into_owned();
 
     let exact_text = strip_articles(&strip_brackets(&base, |inner| !is_noise(inner)));
@@ -376,7 +389,7 @@ const UNKNOWN_AUTHORS: &[&str] = &[
 /// shared by every duplicate check: such an author is **not evidence**.
 pub fn is_unknown_author(name: &str) -> bool {
     let p = plain(&fold(name.trim()));
-    UNKNOWN_AUTHORS.contains(&p.as_str())
+    UNKNOWN_AUTHORS.contains(&p.as_str()) || crate::junk_metadata::is_junk_author(name)
 }
 
 lazy_static! {
@@ -591,6 +604,54 @@ fn asin_key(value: &str) -> Option<(String, f32)> {
 
 /// Levenshtein distance when it is at most `k`, else `None`. Banded, so a
 /// comparison costs O(k * len) rather than O(len^2).
+/// Short words that are not acronyms, and so do not make titles different.
+const SHORT_FUNCTION_WORDS: &[&str] = &["the", "and", "of", "to", "in", "on", "for", "an", "la", "le", "de", "el", "or", "at", "by", "du", "des", "und", "der", "die", "das"];
+
+/// Pairs of words that are opposites: titles differing by one of these are
+/// different books (`Names - Female` / `Names - Male`). Deliberately tiny;
+/// everything else is caught by the data-driven rule in
+/// [`titles_differ_by_designator`].
+const ANTONYMS: &[(&str, &str)] = &[("male", "female"), ("men", "women"), ("man", "woman"), ("boys", "girls"), ("boy", "girl"), ("his", "her"), ("good", "evil"), ("before", "after")];
+
+/// Whether two core titles (already normalised to space-separated words)
+/// differ by a *distinguishing* token, which vetoes an edit-distance match.
+///
+/// A word present in one title and absent in the other is distinguishing
+/// when it is a number or version (`2`, `00`, `01`, `3rd`), a Roman numeral,
+/// a number word, a single letter other than the article `a` (`A to H` /
+/// `P to Z`), a volume/part/chapter designator, or one half of an
+/// [`ANTONYMS`] pair. Typos and spelling variants (`colour`/`color`) are
+/// none of these, so they still match.
+fn titles_differ_by_designator(a: &str, b: &str) -> bool {
+    let a_words: Vec<&str> = a.split(' ').filter(|w| !w.is_empty()).collect();
+    let b_words: Vec<&str> = b.split(' ').filter(|w| !w.is_empty()).collect();
+    let a_only: Vec<&str> = a_words.iter().filter(|w| !b_words.contains(w)).copied().collect();
+    let b_only: Vec<&str> = b_words.iter().filter(|w| !a_words.contains(w)).copied().collect();
+    let distinguishing = |w: &&str| is_number_token(w) || VOLUME_WORDS.contains(w) || (w.chars().count() == 1 && *w != "a");
+    // A *conflict* needs a designator on **both** sides: `02` vs `03`,
+    // `1895` vs `1902`, `A to H` vs `P to Z`. A designator on one side only
+    // (`... (1)`, `4e`, `2022`) is an extra marker on a copy of the same thing.
+    if a_only.iter().any(distinguishing) && b_only.iter().any(distinguishing) {
+        return true;
+    }
+    // `vol 1` vs `vol supplement`: a volume word followed by different values.
+    let values = |words: &[&str]| -> HashSet<String> { words.windows(2).filter(|w| VOLUME_WORDS.contains(&w[0])).map(|w| w[1].to_string()).collect() };
+    let (av, bv) = (values(&a_words), values(&b_words));
+    if av.difference(&bv).next().is_some() && bv.difference(&av).next().is_some() {
+        return true;
+    }
+    // Short acronym-like words that differ on *both* sides (`AWN` / `CWN`
+    // Character Sheet), a trailing plural `s` not counting (`GM` = `GMs`).
+    // One side only is just extra words (`... PF Version`).
+    let fold_s = |w: &str| -> String { w.strip_suffix('s').filter(|r| r.chars().count() >= 2).unwrap_or(w).to_string() };
+    let acronyms = |only: &[&str]| -> HashSet<String> { only.iter().filter(|w| (2..=4).contains(&w.chars().count()) && w.chars().all(|c| c.is_alphabetic()) && !SHORT_FUNCTION_WORDS.contains(w)).map(|w| fold_s(w)).collect() };
+    let (aa, ba) = (acronyms(&a_only), acronyms(&b_only));
+    if aa.difference(&ba).next().is_some() && ba.difference(&aa).next().is_some() {
+        return true;
+    }
+    ANTONYMS.iter().any(|(x, y)| (a_only.contains(x) && b_only.contains(y)) || (a_only.contains(y) && b_only.contains(x)))
+}
+
 fn levenshtein_within(a: &[char], b: &[char], k: usize) -> Option<usize> {
     if a.len().abs_diff(b.len()) > k {
         return None;
@@ -632,6 +693,9 @@ pub struct BookRecord {
     pub authors: Vec<String>,
     /// `(type, value)` rows of the `identifiers` table.
     pub identifiers: Vec<(String, String)>,
+    /// The file names (without extension) of the book's formats. Used only to
+    /// tell a title that came from a template (see [`template_leftover_titles`]).
+    pub stems: Vec<String>,
 }
 
 /// One reason two books were joined.
@@ -709,8 +773,34 @@ pub fn find_groups(records: &[BookRecord], content_groups: &[Vec<i32>], min: Str
 /// ([`crate::pdf_similarity`]), which the caller computes because it needs
 /// the sidecar. Edges naming a book not in `records` are ignored.
 pub fn find_groups_with(records: &[BookRecord], content_groups: &[Vec<i32>], pdf_edges: &[crate::pdf_similarity::PdfEdge], min: Strength) -> Vec<Group> {
+    find_groups_vetoed(records, content_groups, pdf_edges, &[], min)
+}
+
+/// [`find_groups_with`], with the PDFs' fingerprints so that **content can
+/// veto a title match**: two books joined only by their titles, whose PDFs are
+/// both fingerprinted, are not joined when the PDF comparison does not match
+/// them and the content plainly differs (see [`content_contradicts`]). Applied
+/// to each title-tier pair *before* grouping, so a chain of title matches
+/// breaks at the books that differ instead of gluing 15 volumes of a periodical
+/// into one group.
+pub fn find_groups_vetoed(records: &[BookRecord], content_groups: &[Vec<i32>], pdf_edges: &[crate::pdf_similarity::PdfEdge], fingerprints: &[crate::pdf_similarity::LibraryFingerprint], min: Strength) -> Vec<Group> {
     let index: HashMap<i32, usize> = records.iter().enumerate().map(|(i, r)| (r.id, i)).collect();
     let mut edges: Vec<Evidence> = Vec::new();
+
+    // Book -> fingerprint row, and which fingerprint pairs the PDF comparison matched.
+    let fp_of: HashMap<usize, usize> = fingerprints.iter().enumerate().flat_map(|(f, l)| l.books.iter().filter_map(|b| index.get(b).map(|&i| (i, f))).collect::<Vec<_>>()).collect();
+    let matched: HashSet<(usize, usize)> = pdf_edges
+        .iter()
+        .filter_map(|e| Some((*fp_of.get(index.get(&e.a)?)?, *fp_of.get(index.get(&e.b)?)?)))
+        .map(|(a, b)| (a.min(b), a.max(b)))
+        .collect();
+    let content_veto = |i: usize, j: usize| -> bool {
+        let (Some(&fa), Some(&fb)) = (fp_of.get(&i), fp_of.get(&j)) else { return false };
+        fa != fb && !matched.contains(&(fa.min(fb), fa.max(fb))) && content_contradicts(&fingerprints[fa].fingerprint, &fingerprints[fb].fingerprint)
+    };
+    // Two books with the same title whose *file names* are about the same work
+    // but differ by a volume/number/year are different books.
+    let veto = |i: usize, j: usize| -> bool { stems_differ_by_designator(&records[i].stems, &records[j].stems) || content_veto(i, j) };
 
     // Content.
     for g in content_groups {
@@ -743,10 +833,12 @@ pub fn find_groups_with(records: &[BookRecord], content_groups: &[Vec<i32>], pdf
 
     // Title and author.
     if min <= Strength::Exact {
+        let template_titles = template_leftover_titles(records, content_groups, &index);
         let prepared: Vec<Prepared> = records
             .iter()
-            .map(|r| {
-                let keys = title_keys(&r.title);
+            .enumerate()
+            .map(|(i, r)| {
+                let keys = if template_titles.contains(&i) { None } else { title_keys(&r.title) };
                 let sig = keys.as_ref().map(TitleKeys::signature).unwrap_or_default();
                 Prepared { keys, sig, authors: parse_authors(&r.authors) }
             })
@@ -769,11 +861,22 @@ pub fn find_groups_with(records: &[BookRecord], content_groups: &[Vec<i32>], pdf
         for key in exact_keys {
             let ids = &exact[key];
             if ids.len() > 1 {
-                star(ids, records, Strength::Exact, 0.90, &format!("same title \"{}\" and author \"{}\"", key.0, key.1), &mut edges);
-                for w in ids.iter() {
-                    for v in ids.iter() {
-                        if w < v {
-                            exact_pairs.insert((*w, *v));
+                // Split the bucket into sets whose members' content does not
+                // contradict each other (a template title shared by unrelated PDFs).
+                let mut sets: Vec<Vec<usize>> = Vec::new();
+                for &i in ids {
+                    match sets.iter_mut().find(|set| set.iter().all(|&j| !veto(i, j))) {
+                        Some(set) => set.push(i),
+                        None => sets.push(vec![i]),
+                    }
+                }
+                for set in sets.iter().filter(|set| set.len() > 1) {
+                    star(set, records, Strength::Exact, 0.90, &format!("same title \"{}\" and author \"{}\"", key.0, key.1), &mut edges);
+                    for w in set.iter() {
+                        for v in set.iter() {
+                            if w < v {
+                                exact_pairs.insert((*w, *v));
+                            }
                         }
                     }
                 }
@@ -781,11 +884,12 @@ pub fn find_groups_with(records: &[BookRecord], content_groups: &[Vec<i32>], pdf
         }
 
         if min <= Strength::Fuzzy {
-            fuzzy_edges(records, &prepared, &exact_pairs, &mut edges);
+            fuzzy_edges(records, &prepared, &exact_pairs, &veto, &mut edges);
         }
     }
 
     // Page content.
+    let mut pdf_evidence: Vec<Evidence> = Vec::new();
     for e in pdf_edges {
         if !(index.contains_key(&e.a) && index.contains_key(&e.b)) {
             continue;
@@ -795,8 +899,11 @@ pub fn find_groups_with(records: &[BookRecord], content_groups: &[Vec<i32>], pdf
             crate::pdf_similarity::PdfKind::OcrVariant => Strength::PdfOcr,
             crate::pdf_similarity::PdfKind::TextMatch => Strength::PdfText,
         };
-        edges.push(Evidence { a: e.a, b: e.b, strength, confidence: e.found.confidence, detail: e.found.detail.clone() });
+        if strength >= min {
+            pdf_evidence.push(Evidence { a: e.a, b: e.b, strength, confidence: e.found.confidence, detail: e.found.detail.clone() });
+        }
     }
+    edges.extend(complete_linkage(pdf_evidence, content_groups, &index, records.len()));
 
     // Merge.
     edges.retain(|e| e.strength >= min);
@@ -825,6 +932,174 @@ pub fn find_groups_with(records: &[BookRecord], content_groups: &[Vec<i32>], pdf
     groups
 }
 
+/// Clusters up to this many may chain (`A~B`, `B~C`) without the third edge.
+const CHAIN_ALLOWANCE: usize = 3;
+
+/// Keeps a page-content edge only if its two ends end up in one **clique**.
+///
+/// Union-find over every pair makes one group of any chain of pairs, and a
+/// run of weak "same template" pairs once chained 49 unrelated books together.
+/// Page-content evidence therefore joins books by *complete linkage*: edges
+/// are taken strongest first, and two clusters merge only when every cross
+/// pair has an edge. Books holding identical files are one node (they are
+/// already joined by the content tier, and only one of them carries the
+/// fingerprint edge). Small clusters (up to [`CHAIN_ALLOWANCE`] nodes in all)
+/// may chain, since a scan, its OCR and an optimized copy often have two of the
+/// three edges. Returns the edges whose ends share a cluster.
+fn complete_linkage(mut pdf: Vec<Evidence>, content_groups: &[Vec<i32>], index: &HashMap<i32, usize>, n: usize) -> Vec<Evidence> {
+    if pdf.len() < 3 {
+        // One or two edges cannot make a chain longer than the allowance.
+        return pdf;
+    }
+    let mut same_file = UnionFind::new(n);
+    for g in content_groups {
+        let ids: Vec<usize> = g.iter().filter_map(|id| index.get(id).copied()).collect();
+        for w in ids.windows(2) {
+            same_file.union(w[0], w[1]);
+        }
+    }
+    pdf.sort_by(|x, y| y.strength.cmp(&x.strength).then(y.confidence.total_cmp(&x.confidence)).then((x.a, x.b).cmp(&(y.a, y.b))));
+    let node = |uf: &mut UnionFind, id: i32| uf.find(index[&id]);
+    let pair = |a: usize, b: usize| (a.min(b), a.max(b));
+
+    let mut linked: HashSet<(usize, usize)> = HashSet::new();
+    let mut ends: Vec<(usize, usize)> = Vec::with_capacity(pdf.len());
+    for e in &pdf {
+        let (a, b) = (node(&mut same_file, e.a), node(&mut same_file, e.b));
+        linked.insert(pair(a, b));
+        ends.push((a, b));
+    }
+
+    let mut cluster_of: HashMap<usize, usize> = HashMap::new();
+    let mut members: HashMap<usize, Vec<usize>> = HashMap::new();
+    for &(a, b) in &ends {
+        for x in [a, b] {
+            cluster_of.entry(x).or_insert(x);
+            members.entry(x).or_insert_with(|| vec![x]);
+        }
+    }
+    for &(a, b) in &ends {
+        let (ca, cb) = (cluster_of[&a], cluster_of[&b]);
+        if ca == cb {
+            continue;
+        }
+        let small = members[&ca].len() + members[&cb].len() <= CHAIN_ALLOWANCE;
+        let complete = small || members[&ca].iter().all(|x| members[&cb].iter().all(|y| linked.contains(&pair(*x, *y))));
+        if complete {
+            let moved = members.remove(&cb).unwrap();
+            for m in &moved {
+                cluster_of.insert(*m, ca);
+            }
+            members.get_mut(&ca).unwrap().extend(moved);
+        }
+    }
+    pdf.into_iter().zip(ends).filter(|(_, (a, b))| cluster_of[a] == cluster_of[b]).map(|(e, _)| e).collect()
+}
+
+/// Whether two books' file names (stems) say they are different parts of one
+/// work: some pair of stems is *about the same work* (at least 60% of the
+/// shorter one's words are shared) and every such pair differs by a designator
+/// ([`titles_differ_by_designator`]: `vol_02_1839` / `vol_03_1840`). Unrelated
+/// stems never veto (a real duplicate may have a different file name), and a
+/// pair of stems that agree exactly on the designators means no veto.
+pub fn stems_differ_by_designator(a: &[String], b: &[String]) -> bool {
+    let norm = |s: &String| plain(&fold(&s.replace('_', " ")));
+    let (a, b): (Vec<String>, Vec<String>) = (a.iter().map(norm).collect(), b.iter().map(norm).collect());
+    let mut similar_and_differ = false;
+    for x in &a {
+        for y in &b {
+            let (xw, yw): (HashSet<&str>, HashSet<&str>) = (x.split(' ').collect(), y.split(' ').collect());
+            let shorter = xw.len().min(yw.len());
+            if shorter == 0 || xw.intersection(&yw).count() * 10 < shorter * 6 {
+                continue;
+            }
+            if titles_differ_by_designator(x, y) {
+                similar_and_differ = true;
+            } else {
+                return false;
+            }
+        }
+    }
+    similar_and_differ
+}
+
+/// Whether two *different, unmatched* PDFs plainly contain different things:
+/// page counts more than 10% apart (and more than two pages), or both with at
+/// least three usable sampled pages, no visual alignment, and text layers that
+/// share almost nothing (Jaccard under 0.3). Used only to veto a title match;
+/// it never creates one.
+pub fn content_contradicts(a: &crate::pdf_similarity::PdfFingerprint, b: &crate::pdf_similarity::PdfFingerprint) -> bool {
+    let (pa, pb) = (a.page_count as f32, b.page_count as f32);
+    let diff = (pa - pb).abs();
+    if diff > 2.0 && diff > 0.10 * pa.max(pb) {
+        return true;
+    }
+    if a.usable_pages() >= 3 && b.usable_pages() >= 3 && crate::pdf_similarity::visual_match(a, b).is_none() {
+        if let Some(j) = crate::pdf_similarity::jaccard(&a.minhash, &b.minhash) {
+            return a.has_text && b.has_text && j < 0.3;
+        }
+    }
+    false
+}
+
+/// A title that is not a title: the same embedded string on at least
+/// [`TEMPLATE_TITLE_BOOKS`] books holding *different* files, which does not
+/// resemble most of those books' file names. It is what a template left behind
+/// (`Nathanael-Roux_Affinity-Publisher_Template-PHB_v0.1` on 196 unrelated
+/// PDFs; `Terry Herc - 1d100 Derelict Spaceships - Letter` on several). Such a
+/// title is no evidence, as an `Untitled` is none. Returns record indices.
+///
+/// A title that resembles the books' file names (the 15 volumes of one
+/// periodical, `Collected Poems` five times) is a real title and stays; those
+/// are for the content veto to separate.
+pub fn template_leftover_titles(records: &[BookRecord], content_groups: &[Vec<i32>], index: &HashMap<i32, usize>) -> HashSet<usize> {
+    let mut same_file = UnionFind::new(records.len());
+    for g in content_groups {
+        let ids: Vec<usize> = g.iter().filter_map(|id| index.get(id).copied()).collect();
+        for w in ids.windows(2) {
+            same_file.union(w[0], w[1]);
+        }
+    }
+    let mut by_title: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, r) in records.iter().enumerate() {
+        let key = plain(&fold(&r.title.replace('_', " ")));
+        if !key.is_empty() {
+            by_title.entry(key).or_default().push(i);
+        }
+    }
+    let words = |s: &str| -> HashSet<String> { plain(&fold(&s.replace('_', " "))).split(' ').filter(|w| !w.is_empty()).map(str::to_string).collect() };
+    let mut out = HashSet::new();
+    for (key, members) in by_title {
+        if members.len() < TEMPLATE_TITLE_BOOKS {
+            continue;
+        }
+        let distinct: HashSet<usize> = members.iter().map(|&i| same_file.find(i)).collect();
+        if distinct.len() < TEMPLATE_TITLE_BOOKS {
+            continue;
+        }
+        let title_words = words(&key);
+        let resembling = members
+            .iter()
+            .filter(|&&i| {
+                records[i].stems.is_empty() || records[i].stems.iter().any(|stem| {
+                    let sw = words(stem);
+                    let inter = sw.intersection(&title_words).count();
+                    let union = sw.union(&title_words).count().max(1);
+                    inter * 2 >= union || (!title_words.is_empty() && title_words.is_subset(&sw)) || (!sw.is_empty() && sw.is_subset(&title_words))
+                })
+            })
+            .count();
+        if resembling * 2 <= members.len() {
+            out.extend(members);
+        }
+    }
+    out
+}
+
+/// Books that must carry one title, with different files, before it is called
+/// a template leftover.
+pub const TEMPLATE_TITLE_BOOKS: usize = 5;
+
 /// Of two books' author lists, the best way they overlap: `Some(true)` an
 /// equal author, `Some(false)` only an initials-compatible one.
 fn author_overlap(a: &[NormAuthor], b: &[NormAuthor]) -> Option<bool> {
@@ -842,7 +1117,7 @@ fn author_overlap(a: &[NormAuthor], b: &[NormAuthor]) -> Option<bool> {
     best
 }
 
-fn fuzzy_edges(records: &[BookRecord], prepared: &[Prepared], exact_pairs: &HashSet<(usize, usize)>, edges: &mut Vec<Evidence>) {
+fn fuzzy_edges(records: &[BookRecord], prepared: &[Prepared], exact_pairs: &HashSet<(usize, usize)>, veto: &dyn Fn(usize, usize) -> bool, edges: &mut Vec<Evidence>) {
     // Block by surname.
     let mut blocks: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, p) in prepared.iter().enumerate() {
@@ -865,6 +1140,9 @@ fn fuzzy_edges(records: &[BookRecord], prepared: &[Prepared], exact_pairs: &Hash
             return;
         }
         let Some(equal_author) = author_overlap(&prepared[lo].authors, &prepared[hi].authors) else { return };
+        if veto(lo, hi) {
+            return;
+        }
         if !seen_pairs.insert((lo, hi)) {
             return;
         }
@@ -921,7 +1199,7 @@ fn fuzzy_edges(records: &[BookRecord], prepared: &[Prepared], exact_pairs: &Hash
                         }
                         let len = chars[x].len().max(chars[y].len());
                         if let Some(d) = levenshtein_within(&chars[x], &chars[y], 2) {
-                            if d >= 1 && d * 8 <= len {
+                            if d >= 1 && d * 8 <= len && !titles_differ_by_designator(list[x].0, list[y].0) {
                                 let rule = format!("titles {d} edit(s) apart (\"{}\" / \"{}\")", list[x].0, list[y].0);
                                 for &i in list[x].1.iter().take(500) {
                                     for &j in list[y].1.iter().take(500) {
@@ -961,11 +1239,19 @@ pub fn load_records(cache: &Cache) -> Result<Vec<BookRecord>> {
             identifiers.entry(book).or_default().push((kind, val));
         }
     }
+    let mut stems: HashMap<i32, Vec<String>> = HashMap::new();
+    {
+        let mut stmt = conn.prepare("SELECT book, name FROM data")?;
+        for row in stmt.query_map([], |r| Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?)))? {
+            let (book, name) = row?;
+            stems.entry(book).or_default().push(name);
+        }
+    }
     let mut records = Vec::new();
     let mut stmt = conn.prepare("SELECT id, title FROM books ORDER BY id")?;
     for row in stmt.query_map([], |r| Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?)))? {
         let (id, title) = row?;
-        records.push(BookRecord { id, title, authors: authors.remove(&id).unwrap_or_default(), identifiers: identifiers.remove(&id).unwrap_or_default() });
+        records.push(BookRecord { id, title, authors: authors.remove(&id).unwrap_or_default(), identifiers: identifiers.remove(&id).unwrap_or_default(), stems: stems.remove(&id).unwrap_or_default() });
     }
     Ok(records)
 }
@@ -985,6 +1271,9 @@ pub struct ScanOutcome {
     /// Fingerprinted PDFs, by book.
     pub pdf: HashMap<i32, PdfBookInfo>,
     pub status: crate::pdf_similarity::PdfStatus,
+    /// Zero-byte book files, `(book id, format)`. Never grouped as content
+    /// duplicates (they all share the hash of nothing); reported separately.
+    pub empty_files: Vec<(i32, String)>,
 }
 
 /// Every duplicate group in the library at `min` strength or stronger.
@@ -1009,9 +1298,9 @@ pub fn scan_library_full(cache: &Cache, min: Strength) -> Result<ScanOutcome> {
             pdf.insert(book, PdfBookInfo { page_count: l.fingerprint.page_count, has_text: l.fingerprint.has_text, size: l.size });
         }
     }
-    let edges = if min <= Strength::PdfResave { crate::pdf_similarity::edges_for(&loaded).0 } else { Vec::new() };
-    let groups = find_groups_with(&records, &content, &edges, min);
-    Ok(ScanOutcome { groups, pdf, status: cache.checksums().pdf_status()? })
+    let edges = if min <= Strength::Exact { crate::pdf_similarity::edges_for(&loaded).0 } else { Vec::new() };
+    let groups = find_groups_vetoed(&records, &content, &edges, &loaded, min);
+    Ok(ScanOutcome { groups, pdf, status: cache.checksums().pdf_status()?, empty_files: cache.checksums().empty_files("format")? })
 }
 
 /// Which copy of a PDF group to keep: the one with a text layer, then the
@@ -1059,7 +1348,7 @@ mod tests {
     use super::*;
 
     fn rec(id: i32, title: &str, authors: &[&str], identifiers: &[(&str, &str)]) -> BookRecord {
-        BookRecord { id, title: title.to_string(), authors: authors.iter().map(|s| s.to_string()).collect(), identifiers: identifiers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect() }
+        BookRecord { id, title: title.to_string(), authors: authors.iter().map(|s| s.to_string()).collect(), identifiers: identifiers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), stems: Vec::new() }
     }
 
     fn groups(records: &[BookRecord], min: Strength) -> Vec<Vec<i32>> {
@@ -1221,6 +1510,240 @@ mod tests {
         let g = find_groups(&recs, &[], Strength::Fuzzy);
         assert_eq!((g[0].strength, g[0].strength.reason()), (Strength::Exact, "title_author_exact"));
         assert!(g[0].confidence >= 0.9);
+    }
+
+    /// The trial's false positives: titles one small edit apart that name
+    /// different books (underscores are separators, so they are the same
+    /// words as the spaced forms).
+    #[test]
+    fn titles_a_designator_apart_do_not_group() {
+        let cases: &[(&str, &str)] = &[
+            ("100_Elven_Names_-_Female", "100_Elven_Names_-_Male"),
+            ("Dragon_Templates_A_to_H", "Dragon_Templates_P_to_Z"),
+            ("Helpful_List_-_Mori_Names_-_Female", "Helpful_List_-_Mori_Names_-_Male"),
+            ("Some_Magazine_Special__1_00", "Some_Magazine_Special__1_01"),
+            ("Monster Manual Players Guide Men Names", "Monster Manual Players Guide Women Names"),
+            ("Campaign Setting Handbook 3rd", "Campaign Setting Handbook 4th"),
+            ("The Great Adventures Series Volume", "The Great Adventures Series Volumes"),
+        ];
+        for (ta, tb) in cases {
+            let recs = vec![rec(1, ta, &["Some Author"], &[]), rec(2, tb, &["Some Author"], &[])];
+            assert!(groups(&recs, Strength::Fuzzy).is_empty(), "must not group: {ta:?} / {tb:?}");
+        }
+    }
+
+    #[test]
+    fn spelling_and_subtitle_variants_still_group() {
+        let cases: &[(&str, &str)] = &[
+            ("The_Fellowship_of_the_Ring", "Fellowship of the Ringe"),
+            ("The Colour of Magic", "The Color of Magic"),
+            ("Sapiens_-_A_Brief_History_of_Humankind", "Sapiens"),
+            ("the hobbit: there and back again", "Hobbit, The: There and Back Again!"),
+        ];
+        for (ta, tb) in cases {
+            let recs = vec![rec(1, ta, &["Some Author"], &[]), rec(2, tb, &["Some Author"], &[])];
+            assert_eq!(groups(&recs, Strength::Fuzzy), vec![vec![1, 2]], "should group: {ta:?} / {tb:?}");
+        }
+    }
+
+    #[test]
+    fn short_acronyms_that_differ_veto_but_extra_words_do_not() {
+        let recs = vec![rec(1, "AWN - Character Sheet", &["Some Author"], &[]), rec(2, "CWN - Character Sheet", &["Some Author"], &[])];
+        assert!(groups(&recs, Strength::Fuzzy).is_empty());
+        assert!(titles_differ_by_designator("awn character sheet", "cwn character sheet"));
+        assert!(!titles_differ_by_designator("starship maker", "starship maker pf version"));
+        assert!(!titles_differ_by_designator("the colour of magic", "colour of magic"));
+        // A typo of a long word is still a typo.
+        let recs = vec![rec(1, "The_Fellowship_of_the_Ring", &["Some Author"], &[]), rec(2, "Fellowship of the Ringe", &["Some Author"], &[])];
+        assert_eq!(groups(&recs, Strength::Fuzzy), vec![vec![1, 2]]);
+        // Extra words (a subtitle/version suffix) still group.
+        let recs = vec![rec(1, "Starship_Maker", &["Some Author"], &[]), rec(2, "Starship_Maker_-_PF_Version", &["Some Author"], &[])];
+        assert_eq!(groups(&recs, Strength::Fuzzy).len(), 1, "{:?}", groups(&recs, Strength::Fuzzy));
+    }
+
+    /// Fifteen volumes of a periodical: same title and author, image-only
+    /// scans of similar length, told apart by their file names.
+    #[test]
+    fn file_names_that_differ_by_volume_veto_a_title_match() {
+        let stems = ["civil_engineer_and_architects_journal_vol_02_1839", "civil_engineer_and_architects_journal_vol_03_1840", "civil_engineer_and_architects_journal_vol_05_1839", "civil_engineer_and_architects_journal_vol_05_1842"];
+        let mut recs: Vec<BookRecord> = (1..=4).map(|i| rec(i, "The Civil Engineer and Architect's Journal", &["William Laxton"], &[])).collect();
+        for (r, stem) in recs.iter_mut().zip(stems) {
+            r.stems = vec![stem.to_string()];
+        }
+        assert!(groups(&recs, Strength::Fuzzy).is_empty(), "{:?}", groups(&recs, Strength::Fuzzy));
+        // Unrelated stems do not veto: a real duplicate may be named anything.
+        recs[1].stems = vec!["scan0042".to_string()];
+        recs[0].stems = vec!["civil_engineer_and_architects_journal_vol_02_1839".to_string()];
+        let got = groups(&recs[..2], Strength::Fuzzy);
+        assert_eq!(got, vec![vec![1, 2]]);
+        // The same stem on both (or no stems) never vetoes.
+        recs[1].stems = recs[0].stems.clone();
+        assert_eq!(groups(&recs[..2], Strength::Fuzzy), vec![vec![1, 2]]);
+        recs[1].stems.clear();
+        assert_eq!(groups(&recs[..2], Strength::Fuzzy), vec![vec![1, 2]]);
+    }
+
+    fn stem_veto(a: &str, b: &str) -> bool {
+        stems_differ_by_designator(&[a.to_string()], &[b.to_string()])
+    }
+
+    /// A marker on one side only is a copy of the same thing; a conflicting
+    /// value on each side is a different volume, year or number.
+    #[test]
+    fn stems_veto_only_on_conflicting_designators() {
+        let same = [
+            ("8021AS-2020 (1)", "8021AS-2020"),
+            ("GURPS - Template Toolkit 1 - Characters 4e", "GURPS - Template Toolkit 1 - Characters"),
+            ("SR 7100 - Core Rulebook - 1e", "SR 7100 - Rules"),
+            ("GURPS - GM Screen 4e", "GURPS - GMs Screen - 4e"),
+            ("ISO_IEC 27001 - Information security management", "ISO_IEC 27001_2022_ Information security management"),
+        ];
+        for (a, b) in same {
+            assert!(!stem_veto(a, b), "must not veto: {a:?} / {b:?}");
+        }
+        let different = [
+            ("civil_engineer_and_architects_journal_vol_02_1839", "civil_engineer_and_architects_journal_vol_03_1840"),
+            ("ore_dressing_vol_1_1903", "ore_dressing_vol_2_1903"),
+            ("the_boy_scouts_year_book_1917", "the_boy_scouts_year_book_1920"),
+            ("perfection_in_baking_1895", "perfection_in_baking_1902"),
+            ("09-148r1_OGC_Web_Service", "09-149r1_OGC_Web_Service"),
+            ("T-REC-J.1108-201901", "T-REC-J.1109-201901"),
+            ("SR 7213 - Aztlan", "SR 7313 - Aztlan"),
+            ("a_treatise_on_coal_mining_vol_1_1900", "a_treatise_on_coal_mining_vol_supplement_1900"),
+        ];
+        for (a, b) in different {
+            assert!(stem_veto(a, b), "must veto: {a:?} / {b:?}");
+        }
+    }
+
+    #[test]
+    fn designator_veto_is_data_driven() {
+        assert!(titles_differ_by_designator("names female", "names male"));
+        assert!(titles_differ_by_designator("templates a to h", "templates p to z"));
+        assert!(titles_differ_by_designator("special 1 00", "special 1 01"));
+        assert!(!titles_differ_by_designator("colour of magic", "color of magic"));
+        assert!(!titles_differ_by_designator("the ring", "ring"));
+    }
+
+    #[test]
+    fn junk_authors_and_titles_are_not_evidence() {
+        // The same junk author on two different books must not group them,
+        // and a print-job title never keys a group.
+        let recs = vec![rec(1, "Dragon Lore", &["Admin"], &[]), rec(2, "Dragon Lore", &["Admin"], &[])];
+        assert!(groups(&recs, Strength::Fuzzy).is_empty());
+        let recs = vec![rec(1, "ACDSee 32 print job", &["RDL_python"], &[]), rec(2, "ACDSee 32 print job", &["RDL_python"], &[])];
+        assert!(groups(&recs, Strength::Fuzzy).is_empty());
+        let recs = vec![rec(1, "F:\\On Hold\\1-45.tif", &["Some Person"], &[]), rec(2, "F:\\On Hold\\1-45.tif", &["Some Person"], &[])];
+        assert!(groups(&recs, Strength::Fuzzy).is_empty());
+        // Real authors still group.
+        let recs = vec![rec(1, "Dragon Lore", &["Ann Lee"], &[]), rec(2, "Dragon Lore", &["Ann Lee"], &[])];
+        assert_eq!(groups(&recs, Strength::Fuzzy), vec![vec![1, 2]]);
+    }
+
+    fn pdf_edge(a: i32, b: i32) -> crate::pdf_similarity::PdfEdge {
+        crate::pdf_similarity::PdfEdge { a, b, found: crate::pdf_similarity::PdfMatch { kind: crate::pdf_similarity::PdfKind::OcrVariant, confidence: 0.75, detail: String::new() } }
+    }
+
+    fn pdf_groups(n: i32, edges: &[(i32, i32)], content: &[Vec<i32>]) -> Vec<Vec<i32>> {
+        let recs: Vec<BookRecord> = (1..=n).map(|i| rec(i, &format!("Book {i}"), &[&format!("Author {i}")], &[])).collect();
+        let edges: Vec<_> = edges.iter().map(|&(a, b)| pdf_edge(a, b)).collect();
+        let mut g: Vec<Vec<i32>> = find_groups_with(&recs, content, &edges, Strength::PdfText).into_iter().map(|g| g.book_ids).collect();
+        g.sort();
+        g
+    }
+
+    /// A chain of weak pairs (`1~2`, `2~3`, ... `9~10`) used to be one group
+    /// of ten through transitivity. Page-content groups are cliques.
+    fn lib_fp(book: i32, pages: u32) -> crate::pdf_similarity::LibraryFingerprint {
+        use crate::pdf_similarity::{PageHash, PdfFingerprint};
+        let mut bits = [0u64; 4];
+        for (k, w) in bits.iter_mut().enumerate() {
+            *w = (book as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(k as u32 * 7) ^ (k as u64);
+        }
+        let fingerprint = PdfFingerprint { page_count: pages, pages: vec![PageHash::new(0, bits)], text_chars: 0, has_text: false, scanned: false, minhash: Vec::new() };
+        crate::pdf_similarity::LibraryFingerprint { hash: format!("h{book}"), books: vec![book], fingerprint, size: 1 }
+    }
+
+    /// Fifteen volumes of one periodical share a title and author but not
+    /// content: their PDFs plainly differ in length, so content vetoes the
+    /// title match. Volumes whose content does not contradict still group.
+    #[test]
+    fn content_vetoes_a_title_match_between_different_pdfs() {
+        let recs: Vec<BookRecord> = (1..=4).map(|i| rec(i, "The Civil Engineer and Architect's Journal", &["William Laxton"], &[])).collect();
+        let fps: Vec<_> = [(1, 100), (2, 102), (3, 300), (4, 500)].into_iter().map(|(b, p)| lib_fp(b, p)).collect();
+        let mut got: Vec<Vec<i32>> = find_groups_vetoed(&recs, &[], &[], &fps, Strength::Fuzzy).into_iter().map(|g| g.book_ids).collect();
+        got.sort();
+        assert_eq!(got, vec![vec![1, 2]], "only the two of similar length group");
+        // Without fingerprints there is nothing to contradict: all four group.
+        assert_eq!(groups(&recs, Strength::Fuzzy), vec![vec![1, 2, 3, 4]]);
+        // A PDF edge between 1 and 3 (the comparison matched them) overrides the veto.
+        let edge = pdf_edge(1, 3);
+        let got = find_groups_vetoed(&recs, &[], &[edge], &fps, Strength::Fuzzy);
+        assert!(got.iter().any(|g| g.book_ids.contains(&1) && g.book_ids.contains(&3)));
+    }
+
+    #[test]
+    fn content_veto_applies_to_fuzzy_pairs_too() {
+        let recs = vec![rec(1, "Sapiens: A Brief History", &["Yuval Harari"], &[]), rec(2, "Sapiens", &["Yuval Harari"], &[])];
+        let fps = vec![lib_fp(1, 200), lib_fp(2, 20)];
+        assert!(find_groups_vetoed(&recs, &[], &[], &fps, Strength::Fuzzy).is_empty());
+        let fps = vec![lib_fp(1, 200), lib_fp(2, 201)];
+        assert_eq!(find_groups_vetoed(&recs, &[], &[], &fps, Strength::Fuzzy).len(), 1);
+    }
+
+    /// A title left behind by a template, on many different files that do not
+    /// look like it, is not evidence; a real shared title is.
+    #[test]
+    fn a_template_leftover_title_is_not_evidence() {
+        let mut recs: Vec<BookRecord> = (1..=6).map(|i| rec(i, "Nathanael-Roux_Affinity-Publisher_Template-PHB_v0.1", &["Ennead Games"], &[])).collect();
+        for (r, stem) in recs.iter_mut().zip(["Tome of Fiends", "Book of Lairs", "Arcane Compendium", "Bestiary Two", "Realm Atlas", "Hero Handbook"]) {
+            r.stems = vec![stem.to_string()];
+        }
+        assert!(groups(&recs, Strength::Fuzzy).is_empty(), "template title grouped unrelated files");
+        // The same shape with titles that resemble the file names is a real title.
+        let mut poems: Vec<BookRecord> = (1..=6).map(|i| rec(i, "Collected Poems", &["Ann Lee"], &[])).collect();
+        for (i, r) in poems.iter_mut().enumerate() {
+            r.stems = vec![format!("Collected Poems {}", ["complete", "annotated", "searchable", "clean", "original", "pristine"][i])];
+        }
+        assert_eq!(groups(&poems, Strength::Fuzzy), vec![vec![1, 2, 3, 4, 5, 6]]);
+        // Fewer than five is never called a template, and the same file five times is one file.
+        let few: Vec<BookRecord> = recs.iter().take(4).cloned().collect();
+        assert_eq!(groups(&few, Strength::Fuzzy).len(), 1);
+    }
+
+    #[test]
+    fn a_chain_of_pdf_pairs_is_not_one_group() {
+        let chain: Vec<(i32, i32)> = (1..10).map(|i| (i, i + 1)).collect();
+        let groups = pdf_groups(10, &chain, &[]);
+        assert!(groups.iter().all(|g| g.len() <= 3), "{groups:?}");
+        assert!(!groups.is_empty());
+    }
+
+    #[test]
+    fn a_full_clique_of_pdf_pairs_is_one_group() {
+        let mut edges = Vec::new();
+        for a in 1..=6 {
+            for b in a + 1..=6 {
+                edges.push((a, b));
+            }
+        }
+        assert_eq!(pdf_groups(6, &edges, &[]), vec![vec![1, 2, 3, 4, 5, 6]]);
+    }
+
+    /// A scan, its OCR and an optimized copy may have only two of the three
+    /// edges and are still one group; a pair is a group.
+    #[test]
+    fn a_trio_may_chain_and_a_pair_is_a_group() {
+        assert_eq!(pdf_groups(3, &[(1, 2), (2, 3)], &[]), vec![vec![1, 2, 3]]);
+        assert_eq!(pdf_groups(2, &[(1, 2)], &[]), vec![vec![1, 2]]);
+    }
+
+    /// Books holding identical files are one node: the fingerprint edge
+    /// names only one of them, and the clique test must not be defeated by that.
+    #[test]
+    fn books_with_identical_files_count_as_one_node_in_a_clique() {
+        // 1 and 2 are the same file; 3 and 4 are copies of it, as (1,3) (1,4) (3,4).
+        assert_eq!(pdf_groups(4, &[(1, 3), (1, 4), (3, 4)], &[vec![1, 2]]), vec![vec![1, 2, 3, 4]]);
     }
 
     #[test]

@@ -131,13 +131,56 @@
 //! | exactly one side has a text layer | `pdf_ocr_variant` | 0.80 |
 //! | neither has text | `pdf_resave` | 0.85 |
 //! | both have text, MinHash Jaccard >= 0.8 | `pdf_resave` | 0.85 |
-//! | both have text, 0.3 <= Jaccard < 0.8 | `pdf_ocr_variant` (two OCR runs) | 0.75 |
-//! | both have text, Jaccard < 0.3 | *no match*: the same look but other words is a different book (a series template) | |
+//! | both have text, **both scanned**, 0.5 <= *distinctive* Jaccard < 0.8, over at least 64 distinctive slots | `pdf_ocr_variant` (two OCR runs) | 0.75 |
+//! | both have text, anything lower | *no match*: the same look but other words is a different book (a template) | |
+//!
+//! **Scanned** (fingerprint version 3): at least 75% of the sampled pages have
+//! an image object covering 80% or more of the page. Two OCR runs of one scan
+//! are text laid over page images; the real trial still produced nine false
+//! `pdf_ocr_variant`s from the both-text sub-tier, every one a short born-digital
+//! document on a shared layout (x86 instruction reference pages `MOVHPS`/`MOVLPS`,
+//! `CLC`/`CLD`; `Booster Set Guide - Cyberpunk`/`- Dystopian`; `AWN`/`CWN -
+//! Character Sheet`), whose pages are vector text and no images. A pair where
+//! either side is not scanned is not an OCR variant of each other.
+//!
+//! "Distinctive" is the point of tranche 11. Two OCR runs of one scan share
+//! almost every content word (a recognition error costs only the three
+//! shingles around it), so their Jaccard is high (about 0.75 at a 3% error rate
+//! per run). Born-digital documents on one *template* (the Intel instruction
+//! reference pages `MOVHPS`/`MOVLPS`, `CMPSD`/`CMPSS`; a `Names - Female` / `-
+//! Male` pair; a publisher's whole line of supplements) share the template's
+//! boilerplate and have a moderate Jaccard, which the old lower bound of 0.3
+//! accepted: a 49-book group of unrelated supplements formed this way. The
+//! lower bound is now 0.5, and the Jaccard is taken only over the MinHash slots
+//! that are not **library-wide boilerplate** ([`StopSlots`]): a slot value held
+//! by at least `max(5, 0.5%)` of the library's documents is a shingle that
+//! many documents share, and says nothing about these two. A pair left with
+//! fewer than [`MIN_DISTINCTIVE_SLOTS`] = 64 of the 128 slots has too little
+//! distinctive text to be judged at all. (Whether the pages are scanned images
+//! is *not* used: it would need the fingerprint to record it and a version
+//! bump, and a born-digital re-save with the same words is a legitimate
+//! `pdf_resave`.)
 //!
 //! With no visual match, two text-bearing PDFs of at least
-//! [`TEXT_MATCH_MIN_CHARS`] letters whose Jaccard is >= 0.9 and whose page
-//! counts are within two are `pdf_text_match` (0.60): the same words
-//! re-typeset. These come from a second index, MinHash LSH (16 bands of 8).
+//! [`TEXT_MATCH_MIN_CHARS`] letters whose *distinctive* Jaccard is >= 0.9 over at
+//! least 64 distinctive slots and whose page counts are within two are
+//! `pdf_text_match` (0.60): the same words re-typeset. These come from a second
+//! index, MinHash LSH (16 bands of 8). Old Google Books scans have no OCR text
+//! in their first 48 pages except Google's standard notice ("This is a digital
+//! copy of a book that was preserved for generations on library shelves..."),
+//! so every such book has the same ~3,000 characters and a Jaccard of 1.00 with
+//! every other. The notice is in hundreds of documents, so its slots are
+//! boilerplate, are dropped, and what is left (nothing) is not enough to match.
+//!
+//! # Groups are not chains
+//!
+//! Pairs become groups in [`crate::dedupe`], which used to union every pair
+//! transitively, so a chain of weak pairs `A~B`, `B~C`, `C~D`... made one big
+//! group. Page-content pairs now join a group by **complete linkage**: two
+//! clusters of books (books holding identical files count as one) merge only if
+//! *every* cross pair has a page-content edge. A cluster of up to three is
+//! allowed to chain (a scan, its OCR and an optimized copy often have two
+//! edges and a missing third). Metadata evidence is unchanged.
 //!
 //! # What can go wrong
 //!
@@ -169,7 +212,7 @@ pub use ink::{ink_grid, page_grids, PageGrids};
 
 /// Bump when the hash, sampling or MinHash changes: every row with another
 /// version is recomputed.
-pub const FINGERPRINT_VERSION: u32 = 2;
+pub const FINGERPRINT_VERSION: u32 = 3;
 /// Pages hashed per PDF.
 pub const SAMPLE_PAGES: usize = 8;
 /// Long side of the render the hash is made from.
@@ -200,8 +243,21 @@ const TABLE_BITS: usize = 14;
 const TABLES: usize = 16;
 /// Jaccard at or above which two text layers are the same text.
 pub const SAME_TEXT_JACCARD: f32 = 0.8;
-/// Jaccard below which two text layers are different books.
-pub const DIFFERENT_TEXT_JACCARD: f32 = 0.3;
+/// Jaccard (over distinctive slots) below which two text layers are
+/// different books. Two OCR runs of one scan share most of their words (an
+/// error in a run costs the three shingles that contain it, so a 3% word
+/// error rate in each run leaves a Jaccard near 0.75); two documents built
+/// from one template (instruction-set reference pages, a publisher's series)
+/// share the template and little else.
+pub const DIFFERENT_TEXT_JACCARD: f32 = 0.5;
+/// A shingle (MinHash slot value) held by at least this many distinct
+/// documents is boilerplate, whatever the fraction; see [`StopSlots`].
+pub const STOP_MIN_DOCS: usize = 5;
+/// ... or by this fraction of the library's documents with text, if more.
+pub const STOP_FRACTION: f32 = 0.005;
+/// Text slots left after dropping boilerplate that a text comparison needs
+/// to count at all (of [`MINHASH_LEN`]).
+pub const MIN_DISTINCTIVE_SLOTS: usize = 64;
 /// Jaccard for a text-only match.
 pub const TEXT_MATCH_JACCARD: f32 = 0.9;
 /// Letters a text-only match needs on each side.
@@ -357,6 +413,76 @@ pub fn jaccard(a: &[u16], b: &[u16]) -> Option<f32> {
     Some(a.iter().zip(b).filter(|(x, y)| x == y).count() as f32 / a.len() as f32)
 }
 
+/// The MinHash slots whose value is **boilerplate**: the same value in the
+/// same slot in at least `max(`[`STOP_MIN_DOCS`]`, `[`STOP_FRACTION`]` of the
+/// documents with text)` distinct documents.
+///
+/// A slot holds the smallest hash of the document's word 3-shingles, so a
+/// value shared by many unrelated documents is a shingle they all contain:
+/// Google's "This is a digital copy of a book that was preserved for
+/// generations..." notice (the only text of an old Google Books scan with no
+/// OCR in its first pages), a licence, a publisher's page furniture. Such a
+/// slot is no evidence that two documents are the same text, so
+/// [`distinctive_jaccard`] leaves it out. Counted over distinct contents (a
+/// copy of a file is one row), so one book in several versions is not mistaken
+/// for boilerplate until it has five of them.
+#[derive(Debug, Default, Clone)]
+pub struct StopSlots {
+    stop: std::collections::HashSet<u32>,
+}
+
+impl StopSlots {
+    fn key(slot: usize, value: u16) -> u32 {
+        (slot as u32) << 16 | value as u32
+    }
+
+    /// Counts slot values over `fps`.
+    pub fn from_fingerprints(fps: &[PdfFingerprint]) -> Self {
+        let with_text = fps.iter().filter(|f| f.minhash.len() == MINHASH_LEN).count();
+        let threshold = STOP_MIN_DOCS.max((with_text as f32 * STOP_FRACTION).ceil() as usize);
+        let mut counts: HashMap<u32, usize> = HashMap::new();
+        for f in fps.iter().filter(|f| f.minhash.len() == MINHASH_LEN) {
+            for (slot, &v) in f.minhash.iter().enumerate() {
+                *counts.entry(Self::key(slot, v)).or_insert(0) += 1;
+            }
+        }
+        StopSlots { stop: counts.into_iter().filter(|(_, n)| *n >= threshold).map(|(k, _)| k).collect() }
+    }
+
+    pub fn is_stop(&self, slot: usize, value: u16) -> bool {
+        !self.stop.is_empty() && self.stop.contains(&Self::key(slot, value))
+    }
+
+    pub fn len(&self) -> usize {
+        self.stop.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.stop.is_empty()
+    }
+}
+
+/// [`jaccard`] over the slots where neither side holds boilerplate: `(estimate,
+/// slots compared)`. `None` if there are no such slots or the hashes cannot be
+/// compared. The caller decides how many compared slots are enough
+/// ([`MIN_DISTINCTIVE_SLOTS`]).
+pub fn distinctive_jaccard(a: &[u16], b: &[u16], stops: &StopSlots) -> Option<(f32, usize)> {
+    if a.is_empty() || a.len() != b.len() {
+        return None;
+    }
+    let (mut usable, mut equal) = (0usize, 0usize);
+    for (i, (x, y)) in a.iter().zip(b).enumerate() {
+        if stops.is_stop(i, *x) || stops.is_stop(i, *y) {
+            continue;
+        }
+        usable += 1;
+        if x == y {
+            equal += 1;
+        }
+    }
+    (usable > 0).then(|| (equal as f32 / usable as f32, usable))
+}
+
 // ---------------------------------------------------------------------
 // The fingerprint
 // ---------------------------------------------------------------------
@@ -368,6 +494,10 @@ pub struct PdfFingerprint {
     /// Letters and digits over the pages whose text was read.
     pub text_chars: u32,
     pub has_text: bool,
+    /// The sampled pages are images: at least 75% of them have an image
+    /// object covering 80% or more of the page (a scan, with or without an
+    /// invisible OCR text layer). A born-digital PDF is not.
+    pub scanned: bool,
     /// Empty if there is no text (or under three words).
     pub minhash: Vec<u16>,
 }
@@ -458,7 +588,8 @@ pub fn fingerprint_sampled(sampled: &calibre_ebooks::pdf::rasterize::SampledPdf)
     let pages_read = sampled.text.len().max(1) as u32;
     let has_text = text_chars >= MIN_TEXT_CHARS_PER_PAGE * pages_read;
     let minhash = if has_text { minhash(&words(&all_text)) } else { Vec::new() };
-    Ok(PdfFingerprint { page_count: sampled.page_count as u32, pages, text_chars, has_text, minhash })
+    let scanned = !sampled.pages.is_empty() && sampled.pages.iter().filter(|p| p.image_page).count() * 4 >= sampled.pages.len() * 3;
+    Ok(PdfFingerprint { page_count: sampled.page_count as u32, pages, text_chars, has_text, scanned, minhash })
 }
 
 /// Fingerprints the PDF at `path`, reading it once through PDFium's file
@@ -572,8 +703,18 @@ pub struct PdfMatch {
     pub detail: String,
 }
 
-/// What a pair of fingerprints are, if anything.
+/// What a pair of fingerprints are, if anything, with no knowledge of the
+/// rest of the library (so no boilerplate is recognised). The library-wide
+/// path is [`classify_with`].
 pub fn classify(a: &PdfFingerprint, b: &PdfFingerprint) -> Option<PdfMatch> {
+    classify_with(a, b, &StopSlots::default())
+}
+
+/// [`classify`], leaving out the text boilerplate in `stops` wherever two
+/// *different* texts are being judged to be one (two OCR layers; a text-only
+/// match). A pair whose pages match and whose text is the same by the plain
+/// Jaccard is a re-save and needs no such care.
+pub fn classify_with(a: &PdfFingerprint, b: &PdfFingerprint, stops: &StopSlots) -> Option<PdfMatch> {
     let jac = jaccard(&a.minhash, &b.minhash);
     if let Some(v) = visual_match(a, b) {
         let pages = format!("{} of {} sampled pages match (page counts {} and {})", v.matched, v.compared, a.page_count, b.page_count);
@@ -583,16 +724,25 @@ pub fn classify(a: &PdfFingerprint, b: &PdfFingerprint) -> Option<PdfMatch> {
             (false, false) => (PdfKind::Resave, CONFIDENCE_RESAVE, "both are image-only".to_string()),
             (true, true) => match jac {
                 Some(j) if j >= SAME_TEXT_JACCARD => (PdfKind::Resave, CONFIDENCE_RESAVE, format!("same text (similarity {j:.2})")),
-                Some(j) if j >= DIFFERENT_TEXT_JACCARD => (PdfKind::OcrVariant, CONFIDENCE_OCR_TWO_LAYERS, format!("different text layers (similarity {j:.2})")),
-                // The same look, other words: a template, not a copy.
-                _ => return None,
+                // Two text layers over the same pages that are not the same
+                // text: two OCR runs of one scan, or two documents on one
+                // template. Only the words that are *not* library-wide
+                // boilerplate can tell them apart.
+                // Two OCR runs are runs over *images*: born-digital pages with
+                // real text are never OCR variants of each other.
+                _ if !(a.scanned && b.scanned) => return None,
+                _ => match distinctive_jaccard(&a.minhash, &b.minhash, stops) {
+                    Some((j, n)) if n >= MIN_DISTINCTIVE_SLOTS && j >= DIFFERENT_TEXT_JACCARD => (PdfKind::OcrVariant, CONFIDENCE_OCR_TWO_LAYERS, format!("different text layers (similarity {j:.2})")),
+                    // The same look, other words: a template, not a copy.
+                    _ => return None,
+                },
             },
         };
         return Some(PdfMatch { kind, confidence: confidence * penalty, detail: format!("{pages}; {what}") });
     }
-    let j = jac?;
+    let (j, n) = distinctive_jaccard(&a.minhash, &b.minhash, stops)?;
     let close = (a.page_count as i64 - b.page_count as i64).unsigned_abs() as u32 <= MAX_PAGE_DIFF;
-    (a.has_text && b.has_text && close && j >= TEXT_MATCH_JACCARD && a.text_chars >= TEXT_MATCH_MIN_CHARS && b.text_chars >= TEXT_MATCH_MIN_CHARS)
+    (a.has_text && b.has_text && close && n >= MIN_DISTINCTIVE_SLOTS && j >= TEXT_MATCH_JACCARD && a.text_chars >= TEXT_MATCH_MIN_CHARS && b.text_chars >= TEXT_MATCH_MIN_CHARS)
         .then(|| PdfMatch { kind: PdfKind::TextMatch, confidence: CONFIDENCE_TEXT, detail: format!("same text (similarity {j:.2}) on different pages ({} and {} pages)", a.page_count, b.page_count) })
 }
 
@@ -731,6 +881,7 @@ pub fn find_pairs(fps: &[PdfFingerprint]) -> (Vec<PdfPair>, IndexStats) {
     use std::collections::BTreeMap;
     let mut stats = IndexStats { fingerprints: fps.len(), ..Default::default() };
     let layout = table_layout();
+    let stops = StopSlots::from_fingerprints(fps);
 
     let mut by_count: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
     for (i, fp) in fps.iter().enumerate() {
@@ -768,7 +919,7 @@ pub fn find_pairs(fps: &[PdfFingerprint]) -> (Vec<PdfPair>, IndexStats) {
                 continue;
             }
             stats.candidates += 1;
-            if let Some(found) = classify(a, b) {
+            if let Some(found) = classify_with(a, b, &stops) {
                 stats.matches += 1;
                 pairs.push(PdfPair { a: lo as usize, b: hi as usize, found });
             }
@@ -782,10 +933,17 @@ pub fn find_pairs(fps: &[PdfFingerprint]) -> (Vec<PdfPair>, IndexStats) {
 // The fingerprint job
 // ---------------------------------------------------------------------
 
-/// Most files read at once. PDFium serialises its calls (`thread_safe`), so
-/// extra workers overlap only the hashing and the disk wait; two is what that
-/// can use. (Not tuned by measurement.)
-pub const MAX_FINGERPRINT_WORKERS: usize = 2;
+/// Most files read at once: **one**.
+///
+/// PDFium is not safe for concurrent use of documents, whatever the
+/// `pdfium-render` `thread_safe` feature suggests. With two workers the whole
+/// `calibre_srv` process died within seconds on a real library (about 9,000
+/// PDFs), silently, in native code. One thread fingerprinted all 8,952 of them
+/// without trouble, and the server job with one worker finished 8,812 PDFs in
+/// 67 minutes. Every PDFium call in the process is now also serialised behind
+/// one global lock (`calibre_ebooks::pdf::rasterize`), so more workers could
+/// overlap only the hashing anyway.
+pub const MAX_FINGERPRINT_WORKERS: usize = 1;
 
 /// What the fingerprint job did.
 #[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]

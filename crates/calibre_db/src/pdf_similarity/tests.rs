@@ -256,7 +256,7 @@ fn fp(seed: u64, pages: u32, text: bool, _salt: u64) -> PdfFingerprint {
     let mut r = Rng(seed.wrapping_mul(0x1234_5678_9ABC_DEF1) | 1);
     let hashes: Vec<PageHash> = sample_indices(pages as usize).into_iter().map(|i| PageHash { index: i as u32, bits: [r.next(), r.next(), r.next(), r.next()], mask: [u64::MAX; 4], blank: false }).collect();
     let (has_text, text_chars, minhash) = if text { (true, 9000, super::minhash(&lorem(seed, 3000))) } else { (false, 0, Vec::new()) };
-    PdfFingerprint { page_count: pages, pages: hashes, text_chars, has_text, minhash }
+    PdfFingerprint { page_count: pages, pages: hashes, text_chars, has_text, scanned: false, minhash }
 }
 
 /// The same book re-rendered: every hash gets up to `bits` bits flipped.
@@ -398,7 +398,7 @@ fn the_same_pages_and_the_same_text_is_a_resave() {
 
 #[test]
 fn two_different_ocr_runs_are_an_ocr_variant_with_less_confidence() {
-    let base = fp(4, 300, false, 0);
+    let base = PdfFingerprint { scanned: true, ..fp(4, 300, false, 0) };
     let a = with_text(&base, 10);
     let mut words_b = lorem(10, 3000);
     for (i, w) in words_b.iter_mut().enumerate() {
@@ -411,6 +411,32 @@ fn two_different_ocr_runs_are_an_ocr_variant_with_less_confidence() {
     assert!((DIFFERENT_TEXT_JACCARD..SAME_TEXT_JACCARD).contains(&j), "{j}");
     let m = classify(&a, &b).unwrap();
     assert_eq!((m.kind, m.confidence), (PdfKind::OcrVariant, CONFIDENCE_OCR_TWO_LAYERS));
+}
+
+/// Short born-digital documents on one layout (instruction reference pages,
+/// a series of character sheets) share most of their words and look alike,
+/// but vector text is not a scan: never an OCR variant of each other.
+#[test]
+fn born_digital_pages_with_similar_text_are_not_ocr_variants() {
+    let words_a = lorem(40, 400);
+    let mut words_b = words_a.clone();
+    for (i, w) in words_b.iter_mut().enumerate() {
+        if i % 20 == 0 {
+            *w = format!("other{i}");
+        }
+    }
+    for pages in [1u32, 3, 4, 40] {
+        let base = fp(60 + pages as u64, pages, false, 0);
+        let a = with_words(&base, &words_a);
+        let b = with_words(&rerendered(&base, 5, 3), &words_b);
+        assert!(jaccard(&a.minhash, &b.minhash).unwrap() >= 0.5);
+        assert!(classify(&a, &b).is_none(), "{pages} born-digital pages matched");
+        // The same two documents as scans are.
+        let (sa, sb) = (PdfFingerprint { scanned: true, ..a }, PdfFingerprint { scanned: true, ..b });
+        if pages >= 3 {
+            assert_eq!(classify(&sa, &sb).map(|m| m.kind), Some(PdfKind::OcrVariant), "{pages}");
+        }
+    }
 }
 
 #[test]
@@ -460,6 +486,98 @@ fn the_index_finds_copies_among_unrelated_books() {
     assert!(find(30, 502).is_some(), "cover-added not found");
     assert_eq!(pairs.len(), 3, "unexpected pairs: {pairs:?}");
     assert!(stats.candidates < 100, "{stats:?}");
+}
+
+fn with_words(f: &PdfFingerprint, words: &[String]) -> PdfFingerprint {
+    PdfFingerprint { has_text: true, text_chars: 9000, minhash: minhash(words), ..f.clone() }
+}
+
+/// Old Google Books scans have no OCR text in their first pages except
+/// Google's notice, so unrelated books have the same text (Jaccard 1.00).
+/// Text shared by many documents is boilerplate and is not evidence.
+#[test]
+fn text_shared_by_many_documents_is_not_a_text_match() {
+    let notice = lorem(9999, 500);
+    let docs: Vec<PdfFingerprint> = (0..12).map(|i| with_words(&fp(2000 + i, 300 + (i % 2) as u32, false, 0), &notice)).collect();
+    // Alone, a pair looks like a perfect text match: this is the bug.
+    assert_eq!(classify(&docs[0], &docs[1]).map(|m| m.kind), Some(PdfKind::TextMatch));
+    // With the library's view of what is boilerplate, none of them match.
+    let stops = StopSlots::from_fingerprints(&docs);
+    assert!(!stops.is_empty());
+    assert!(classify_with(&docs[0], &docs[1], &stops).is_none());
+    let (pairs, _) = find_pairs(&docs);
+    assert!(pairs.is_empty(), "boilerplate-only documents matched: {pairs:?}");
+}
+
+/// ... but two books with the same real text still match when each also
+/// carries the notice.
+#[test]
+fn real_text_still_matches_among_boilerplate() {
+    let notice = lorem(9999, 500);
+    let with_notice = |seed: u64| -> Vec<String> { notice.iter().cloned().chain(lorem(seed, 3000)).collect() };
+    let mut docs: Vec<PdfFingerprint> = (0..12).map(|i| with_words(&fp(3000 + i, 300 + (i % 2) as u32, false, 0), &with_notice(100 + i))).collect();
+    // Two more holding the *same* real text on different pages.
+    docs.push(with_words(&fp(4000, 300, false, 0), &with_notice(555)));
+    docs.push(with_words(&fp(4001, 301, false, 0), &with_notice(555)));
+    let (pairs, _) = find_pairs(&docs);
+    assert_eq!(pairs.len(), 1, "{pairs:?}");
+    assert_eq!((pairs[0].a, pairs[0].b, pairs[0].found.kind), (12, 13, PdfKind::TextMatch));
+}
+
+/// Documents on one template (a series, an instruction-set reference) look
+/// alike page for page and share most of their words, with a Jaccard that the
+/// old 0.3 rule took for two OCR runs. Their shared words are boilerplate
+/// across the library; two real OCR runs of one scan are still found.
+#[test]
+fn template_documents_are_not_ocr_variants_but_two_ocr_runs_are() {
+    let base = PdfFingerprint { scanned: true, ..fp(300, 300, false, 0) };
+    let template = lorem(7777, 2250);
+    let mut docs: Vec<PdfFingerprint> = (0..12u64)
+        .map(|i| {
+            let words: Vec<String> = template.iter().cloned().chain(lorem(8000 + i, 750)).collect();
+            with_words(&rerendered(&base, 10 + i, 3), &words)
+        })
+        .collect();
+    // Two template documents alone are 0.6 alike: moderate, over the old bar.
+    let j = jaccard(&docs[0].minhash, &docs[1].minhash).unwrap();
+    assert!((0.45..0.8).contains(&j), "{j}");
+    // Two OCR runs of one scan: one word in twenty differs between them.
+    let scan_words = lorem(900, 3000);
+    let mut other_run = scan_words.clone();
+    for (i, w) in other_run.iter_mut().enumerate() {
+        if i % 20 == 0 {
+            *w = format!("ocr{i}");
+        }
+    }
+    docs.push(with_words(&rerendered(&base, 100, 3), &scan_words));
+    docs.push(with_words(&rerendered(&base, 101, 3), &other_run));
+    let (pairs, _) = find_pairs(&docs);
+    let found: Vec<(usize, usize, PdfKind)> = pairs.iter().map(|p| (p.a, p.b, p.found.kind)).collect();
+    assert_eq!(found, vec![(12, 13, PdfKind::OcrVariant)], "{found:?}");
+}
+
+/// A pair left with too little distinctive text is not judged at all.
+#[test]
+fn too_few_distinctive_slots_is_no_match() {
+    let a = minhash(&lorem(1, 3000));
+    let b = a.clone();
+    // A library of ten documents that all hold `a`'s first 100 slots (and
+    // differ in the rest): those 100 slots are boilerplate.
+    let docs: Vec<PdfFingerprint> = (0..10)
+        .map(|i| {
+            let mut m: Vec<u16> = a.clone();
+            for slot in 100..MINHASH_LEN {
+                m[slot] = m[slot].wrapping_add(i as u16 + 1);
+            }
+            PdfFingerprint { has_text: true, text_chars: 9000, minhash: m, ..fp(5, 300, false, 0) }
+        })
+        .collect();
+    let stops = StopSlots::from_fingerprints(&docs);
+    let (_, usable) = distinctive_jaccard(&a, &b, &stops).unwrap();
+    assert!(usable < MIN_DISTINCTIVE_SLOTS, "{usable}");
+    let (x, y) = (PdfFingerprint { has_text: true, text_chars: 9000, minhash: a, ..fp(5, 300, false, 0) }, PdfFingerprint { has_text: true, text_chars: 9000, minhash: b, ..fp(6, 300, false, 0) });
+    assert!(classify_with(&x, &y, &stops).is_none());
+    assert!(classify(&x, &y).is_some(), "without the library's view it is a plain text match");
 }
 
 /// The index must not be all-pairs. 3,000 fingerprints is 4.5 million pairs.
@@ -717,5 +835,19 @@ fn a_real_scan_its_ocr_copy_and_an_optimized_copy_group_and_another_book_does_no
     let reasons: Vec<&str> = outcome.groups[0].evidence.iter().map(|e| e.strength.reason()).collect();
     assert!(reasons.contains(&"pdf_ocr_variant") && reasons.contains(&"pdf_resave"), "{evidence:?}");
     assert!(outcome.pdf[&ids[1]].has_text && !outcome.pdf[&ids[0]].has_text);
+    // Every one of these is a picture of a page.
+    assert!(cache.checksums().pdf_fingerprints().unwrap().iter().all(|l| l.fingerprint.scanned));
+}
+
+/// A PDF whose pages are drawn text and shapes, not images, is not "scanned".
+#[test]
+fn a_born_digital_pdf_is_not_scanned() {
+    if !calibre_ebooks::pdf::rasterize::is_available() {
+        eprintln!("skipping: no PDFium library available");
+        return;
+    }
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../calibre_ebooks/tests/data/two-page.pdf");
+    let fp = fingerprint_file(&path).unwrap();
+    assert!(!fp.scanned);
 }
 

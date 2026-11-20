@@ -21,7 +21,7 @@ import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LI
   uploadOrphanFile,
   forgetOrphan,
   fetchIgnored,
-  unignoreFile, copyToLibrary, describeCopyOutcome, deleteBooks, embedMetadata, summarizeEmbed, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchLibraryInfo, fetchUntracked, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameFiles, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
+  type EmptyFile, unignoreFile, copyToLibrary, describeCopyOutcome, deleteBooks, embedMetadata, summarizeEmbed, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchLibraryInfo, fetchUntracked, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameFiles, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
 import type { PdfScanStatus, CheckLibraryFinding, CheckLibraryResult, CustomRecipeOptions, DuplicateGroup, IgnoredFile, NewsFeedInput, NewsSchedule, Orphan, SaveToDiskResult } from "../library/api";
 import { mergeBooks, planBulkMerge, runBulkMerge } from "../library/api";
 import type { BulkMergePlan, DuplicateBook, MergeMode, MergeResponse } from "../library/api";
@@ -1466,6 +1466,8 @@ const visibleDuplicateGroups = computed(() => filterGroups(duplicateGroups.value
 const duplicateStrengthCounts = computed(() => countByReason(duplicateGroups.value));
 // How many PDFs are not yet fingerprinted, for page-content matching.
 const pdfStatus = ref<PdfScanStatus | undefined>(undefined);
+// Zero-byte files: not duplicates of each other, listed separately.
+const emptyFiles = ref<EmptyFile[]>([]);
 const pdfAction = computed(() => fingerprintAction(pdfStatus.value));
 
 async function openDuplicates() {
@@ -1473,7 +1475,8 @@ async function openDuplicates() {
   duplicatesError.value = null;
   duplicatesLoading.value = true;
   try {
-    const { groups, pdf } = await scanForDuplicates();
+    const { groups, pdf, empty_files } = await scanForDuplicates();
+    emptyFiles.value = empty_files ?? [];
     duplicateGroups.value = groups;
     pdfStatus.value = pdf;
   } catch (e) {
@@ -3295,6 +3298,10 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
           <p v-if="pdfAction?.note" class="news-hint">{{ pdfAction.note }}</p>
           <p v-if="fingerprintProgress" class="news-hint" role="status">{{ fingerprintProgress }}</p>
           <p v-if="fingerprintSummary" class="news-hint">{{ fingerprintSummary }}</p>
+          <p v-if="emptyFiles.length" class="news-hint" data-testid="empty-files">
+            {{ emptyFiles.length }} empty (0-byte) file{{ emptyFiles.length === 1 ? "" : "s" }}, not counted as duplicates:
+            {{ emptyFiles.slice(0, 5).map((f) => `${f.title} (.${f.format.toLowerCase()})`).join(", ") }}{{ emptyFiles.length > 5 ? ", …" : "" }}
+          </p>
           <p v-if="duplicatesLoading">Scanning…</p>
           <p v-else-if="duplicatesError" class="error">{{ duplicatesError }}</p>
           <template v-else>
