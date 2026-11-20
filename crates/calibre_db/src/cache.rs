@@ -2431,13 +2431,14 @@ impl Cache {
             x.insert(
                 "cover".into(),
                 serde_json::json!(if has_cover {
-                    Some(
-                        prefix
-                            .join(&path_rel)
-                            .join("cover.jpg")
-                            .to_string_lossy()
-                            .to_string(),
-                    )
+                    // Where the cover really is: `.calibre-oxide/covers/<uuid>.jpg`,
+                    // or a legacy `<folder>/cover.jpg` (see `covers::cover_path`).
+                    // Hard-coding `<folder>/cover.jpg` 404'd every cover in a
+                    // scanned library. Re-rooted under `prefix` like the rest.
+                    let real = crate::covers::cover_path(self, book_id)
+                        .unwrap_or_else(|_| library_path.join(&path_rel).join("cover.jpg"));
+                    let rel = real.strip_prefix(&library_path).map(Path::to_path_buf).unwrap_or(real);
+                    Some(prefix.join(rel).to_string_lossy().to_string())
                 } else {
                     None
                 }),

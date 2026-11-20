@@ -952,6 +952,10 @@ async function runSearch() {
   }
 }
 
+// Declared before the immediate watcher below reads it: a `const` read
+// before its line throws (temporal dead zone) and blanked the whole view.
+const ftsMode = ref(false);
+
 watch([activeQuery, sort, sortOrder, vl, offset], () => {
   if (!ftsMode.value) void runSearch();
 }, { immediate: true });
@@ -968,7 +972,6 @@ interface FtsDisplayResult {
   snippets: FtsSnippet[];
 }
 
-const ftsMode = ref(false);
 const ftsLoading = ref(false);
 const ftsError = ref<string | null>(null);
 const ftsNotEnabled = ref(false);

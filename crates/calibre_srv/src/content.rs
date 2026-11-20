@@ -168,6 +168,31 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    /// Covers live in `.calibre-oxide/covers/<uuid>.jpg`, not
+    /// `<book folder>/cover.jpg`; `/get/cover` and `/get/thumb` must
+    /// serve them from there (they 404'd every cover before).
+    #[tokio::test]
+    async fn get_serves_a_cover_from_the_sidecar_covers_folder() {
+        let (_dir, state, router) = test_app();
+        let book_id = {
+            let cache = state.cache.clone();
+            tokio::task::spawn_blocking(move || {
+                let id = cache.get_data_as_dict(None, true, None, false).unwrap()[0]["id"].as_i64().unwrap() as i32;
+                calibre_db::covers::set_cover(&cache, id, b"\xff\xd8\xff fake jpeg").unwrap();
+                id
+            })
+            .await
+            .unwrap()
+        };
+        for what in ["cover", "thumb"] {
+            let req = Request::builder().uri(format!("/get/{what}/{book_id}")).body(Body::empty()).unwrap();
+            let resp = router.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "/get/{what}");
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(&body[..], b"\xff\xd8\xff fake jpeg");
+        }
+    }
+
     #[tokio::test]
     async fn get_404s_for_an_unknown_book_id() {
         let (_dir, _state, router) = test_app();
