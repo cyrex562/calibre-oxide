@@ -604,6 +604,9 @@ fn asin_key(value: &str) -> Option<(String, f32)> {
 
 /// Levenshtein distance when it is at most `k`, else `None`. Banded, so a
 /// comparison costs O(k * len) rather than O(len^2).
+/// Short words that are not acronyms, and so do not make titles different.
+const SHORT_FUNCTION_WORDS: &[&str] = &["the", "and", "of", "to", "in", "on", "for", "an", "la", "le", "de", "el", "or", "at", "by", "du", "des", "und", "der", "die", "das"];
+
 /// Pairs of words that are opposites: titles differing by one of these are
 /// different books (`Names - Female` / `Names - Male`). Deliberately tiny;
 /// everything else is caught by the data-driven rule in
@@ -626,6 +629,12 @@ fn titles_differ_by_designator(a: &str, b: &str) -> bool {
     let b_only: Vec<&str> = b_words.iter().filter(|w| !a_words.contains(w)).copied().collect();
     let distinguishing = |w: &&str| is_number_token(w) || VOLUME_WORDS.contains(w) || (w.chars().count() == 1 && *w != "a");
     if a_only.iter().chain(&b_only).any(distinguishing) {
+        return true;
+    }
+    // Short acronym-like words that differ on *both* sides (`AWN` / `CWN`
+    // Character Sheet). One side only is just extra words (`... PF Version`).
+    let acronym = |w: &&str| (2..=4).contains(&w.chars().count()) && w.chars().all(|c| c.is_alphabetic()) && !SHORT_FUNCTION_WORDS.contains(w);
+    if a_only.iter().any(acronym) && b_only.iter().any(acronym) {
         return true;
     }
     ANTONYMS.iter().any(|(x, y)| (a_only.contains(x) && b_only.contains(y)) || (a_only.contains(y) && b_only.contains(x)))
@@ -773,10 +782,13 @@ pub fn find_groups_vetoed(records: &[BookRecord], content_groups: &[Vec<i32>], p
         .filter_map(|e| Some((*fp_of.get(index.get(&e.a)?)?, *fp_of.get(index.get(&e.b)?)?)))
         .map(|(a, b)| (a.min(b), a.max(b)))
         .collect();
-    let veto = |i: usize, j: usize| -> bool {
+    let content_veto = |i: usize, j: usize| -> bool {
         let (Some(&fa), Some(&fb)) = (fp_of.get(&i), fp_of.get(&j)) else { return false };
         fa != fb && !matched.contains(&(fa.min(fb), fa.max(fb))) && content_contradicts(&fingerprints[fa].fingerprint, &fingerprints[fb].fingerprint)
     };
+    // Two books with the same title whose *file names* are about the same work
+    // but differ by a volume/number/year are different books.
+    let veto = |i: usize, j: usize| -> bool { stems_differ_by_designator(&records[i].stems, &records[j].stems) || content_veto(i, j) };
 
     // Content.
     for g in content_groups {
@@ -970,6 +982,33 @@ fn complete_linkage(mut pdf: Vec<Evidence>, content_groups: &[Vec<i32>], index: 
         }
     }
     pdf.into_iter().zip(ends).filter(|(_, (a, b))| cluster_of[a] == cluster_of[b]).map(|(e, _)| e).collect()
+}
+
+/// Whether two books' file names (stems) say they are different parts of one
+/// work: some pair of stems is *about the same work* (at least 60% of the
+/// shorter one's words are shared) and every such pair differs by a designator
+/// ([`titles_differ_by_designator`]: `vol_02_1839` / `vol_03_1840`). Unrelated
+/// stems never veto (a real duplicate may have a different file name), and a
+/// pair of stems that agree exactly on the designators means no veto.
+pub fn stems_differ_by_designator(a: &[String], b: &[String]) -> bool {
+    let norm = |s: &String| plain(&fold(&s.replace('_', " ")));
+    let (a, b): (Vec<String>, Vec<String>) = (a.iter().map(norm).collect(), b.iter().map(norm).collect());
+    let mut similar_and_differ = false;
+    for x in &a {
+        for y in &b {
+            let (xw, yw): (HashSet<&str>, HashSet<&str>) = (x.split(' ').collect(), y.split(' ').collect());
+            let shorter = xw.len().min(yw.len());
+            if shorter == 0 || xw.intersection(&yw).count() * 10 < shorter * 6 {
+                continue;
+            }
+            if titles_differ_by_designator(x, y) {
+                similar_and_differ = true;
+            } else {
+                return false;
+            }
+        }
+    }
+    similar_and_differ
 }
 
 /// Whether two *different, unmatched* PDFs plainly contain different things:
@@ -1496,6 +1535,43 @@ mod tests {
     }
 
     #[test]
+    fn short_acronyms_that_differ_veto_but_extra_words_do_not() {
+        let recs = vec![rec(1, "AWN - Character Sheet", &["Some Author"], &[]), rec(2, "CWN - Character Sheet", &["Some Author"], &[])];
+        assert!(groups(&recs, Strength::Fuzzy).is_empty());
+        assert!(titles_differ_by_designator("awn character sheet", "cwn character sheet"));
+        assert!(!titles_differ_by_designator("starship maker", "starship maker pf version"));
+        assert!(!titles_differ_by_designator("the colour of magic", "colour of magic"));
+        // A typo of a long word is still a typo.
+        let recs = vec![rec(1, "The_Fellowship_of_the_Ring", &["Some Author"], &[]), rec(2, "Fellowship of the Ringe", &["Some Author"], &[])];
+        assert_eq!(groups(&recs, Strength::Fuzzy), vec![vec![1, 2]]);
+        // Extra words (a subtitle/version suffix) still group.
+        let recs = vec![rec(1, "Starship_Maker", &["Some Author"], &[]), rec(2, "Starship_Maker_-_PF_Version", &["Some Author"], &[])];
+        assert_eq!(groups(&recs, Strength::Fuzzy).len(), 1, "{:?}", groups(&recs, Strength::Fuzzy));
+    }
+
+    /// Fifteen volumes of a periodical: same title and author, image-only
+    /// scans of similar length, told apart by their file names.
+    #[test]
+    fn file_names_that_differ_by_volume_veto_a_title_match() {
+        let stems = ["civil_engineer_and_architects_journal_vol_02_1839", "civil_engineer_and_architects_journal_vol_03_1840", "civil_engineer_and_architects_journal_vol_05_1839", "civil_engineer_and_architects_journal_vol_05_1842"];
+        let mut recs: Vec<BookRecord> = (1..=4).map(|i| rec(i, "The Civil Engineer and Architect's Journal", &["William Laxton"], &[])).collect();
+        for (r, stem) in recs.iter_mut().zip(stems) {
+            r.stems = vec![stem.to_string()];
+        }
+        assert!(groups(&recs, Strength::Fuzzy).is_empty(), "{:?}", groups(&recs, Strength::Fuzzy));
+        // Unrelated stems do not veto: a real duplicate may be named anything.
+        recs[1].stems = vec!["scan0042".to_string()];
+        recs[0].stems = vec!["civil_engineer_and_architects_journal_vol_02_1839".to_string()];
+        let got = groups(&recs[..2], Strength::Fuzzy);
+        assert_eq!(got, vec![vec![1, 2]]);
+        // The same stem on both (or no stems) never vetoes.
+        recs[1].stems = recs[0].stems.clone();
+        assert_eq!(groups(&recs[..2], Strength::Fuzzy), vec![vec![1, 2]]);
+        recs[1].stems.clear();
+        assert_eq!(groups(&recs[..2], Strength::Fuzzy), vec![vec![1, 2]]);
+    }
+
+    #[test]
     fn designator_veto_is_data_driven() {
         assert!(titles_differ_by_designator("names female", "names male"));
         assert!(titles_differ_by_designator("templates a to h", "templates p to z"));
@@ -1582,7 +1658,7 @@ mod tests {
         // The same shape with titles that resemble the file names is a real title.
         let mut poems: Vec<BookRecord> = (1..=6).map(|i| rec(i, "Collected Poems", &["Ann Lee"], &[])).collect();
         for (i, r) in poems.iter_mut().enumerate() {
-            r.stems = vec![format!("Collected Poems vol {i}")];
+            r.stems = vec![format!("Collected Poems {}", ["complete", "annotated", "searchable", "clean", "original", "pristine"][i])];
         }
         assert_eq!(groups(&poems, Strength::Fuzzy), vec![vec![1, 2, 3, 4, 5, 6]]);
         // Fewer than five is never called a template, and the same file five times is one file.
