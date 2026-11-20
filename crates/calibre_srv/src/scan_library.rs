@@ -270,6 +270,61 @@ mod tests {
         assert_eq!(job["report"]["enrichment"]["remaining"], 0, "{job}");
     }
 
+    async fn json_call(router: &axum::Router, method: &str, uri: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder().method(method).uri(uri).header("content-type", "application/json").body(Body::from(body.to_string())).unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+
+    /// Organize: dry run, execute only with the dry run's fingerprint, undo.
+    #[tokio::test]
+    async fn organize_is_a_dry_run_then_a_fingerprinted_job_then_undoable() {
+        let (dir, router) = test_app();
+        let book = dir.path().join("inbox").join("Alpha.pdf");
+        std::fs::create_dir_all(book.parent().unwrap()).unwrap();
+        std::fs::write(&book, b"%PDF alpha").unwrap();
+        make_settled(&book);
+        post_json(&router, "/scan-library/default?wait=true").await;
+        let t = "Sorted/{title}";
+
+        let (status, dry) = json_call(&router, "POST", "/organize-library/default", serde_json::json!({"template": t})).await;
+        assert_eq!(status, StatusCode::OK, "{dry}");
+        assert_eq!(dry["files"], 1, "{dry}");
+        assert_eq!(dry["moves"][0]["to"], "Sorted/Alpha.pdf");
+        assert!(book.exists(), "a dry run moves nothing");
+
+        let (status, _) = json_call(&router, "POST", "/organize-library/default", serde_json::json!({"template": t, "dry_run": false})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "executing needs a fingerprint");
+        let (status, _) = json_call(&router, "POST", "/organize-library/default", serde_json::json!({"template": t, "dry_run": false, "plan_fingerprint": "nope"})).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status, _) = json_call(&router, "POST", "/organize-library/default", serde_json::json!({"template": "Other/{title}", "dry_run": false, "plan_fingerprint": dry["plan_fingerprint"]})).await;
+        assert_eq!(status, StatusCode::CONFLICT, "a different template is a different plan");
+
+        let (status, started) = json_call(&router, "POST", "/organize-library/default", serde_json::json!({"template": t, "dry_run": false, "plan_fingerprint": dry["plan_fingerprint"]})).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{started}");
+        let job = wait_for_job(&router, started["job_id"].as_u64().unwrap()).await;
+        assert_eq!(job["state"], "finished", "{job}");
+        assert_eq!(job["report"]["books_moved"], 1, "{job}");
+        assert!(dir.path().join("Sorted/Alpha.pdf").is_file());
+
+        let (_, runs) = get_json(&router, "/organize-runs/default").await;
+        let run_id = runs["runs"][0]["run_id"].as_str().unwrap().to_string();
+        let (status, started) = json_call(&router, "POST", "/unorganize-library/default", serde_json::json!({"run_id": run_id})).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{started}");
+        let job = wait_for_job(&router, started["job_id"].as_u64().unwrap()).await;
+        assert_eq!(job["report"]["books_restored"], 1, "{job}");
+        assert!(book.is_file());
+    }
+
+    #[tokio::test]
+    async fn organize_refuses_two_scopes_at_once() {
+        let (_dir, router) = test_app();
+        let (status, _) = json_call(&router, "POST", "/organize-library/default", serde_json::json!({"book_ids": [1], "path_prefix": "x"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
     /// Each job's state is written to `.calibre-oxide/jobs.json`.
     #[tokio::test]
     async fn a_jobs_state_is_persisted_in_the_library() {

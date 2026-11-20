@@ -47,6 +47,8 @@
 //! - `POST /cdb/copy-to-library/{target}/{source}?job=true` -- the cross-library
 //!   copy as a job ([`crate::cdb`])
 //! - `POST /duplicates/scan/{library_id}?job=true` -- the duplicate scan ([`crate::duplicates`])
+//! - `POST /organize-library/{library_id}`, `POST /unorganize-library/{library_id}`
+//!   -- move files by template, and undo ([`crate::organize_library`])
 //! - `GET /library-jobs`, `GET /library-jobs/{id}`, `POST /library-jobs/{id}/cancel`
 //!
 //! # Surviving a restart
@@ -104,6 +106,10 @@ pub enum JobKind {
     /// Copy or move books from another library into this one
     /// (`POST /cdb/copy-to-library/...?job=true`).
     Copy,
+    /// Move books' files to where a template says (`POST /organize-library`).
+    Organize,
+    /// Reverse an organize run (`POST /unorganize-library`).
+    UndoOrganize,
 }
 
 impl JobKind {
@@ -121,6 +127,8 @@ impl JobKind {
             JobKind::Absorb => "absorb",
             JobKind::Unabsorb => "unabsorb",
             JobKind::Copy => "copy",
+            JobKind::Organize => "organize",
+            JobKind::UndoOrganize => "undo_organize",
         }
     }
 
@@ -138,6 +146,8 @@ impl JobKind {
             JobKind::Absorb,
             JobKind::Unabsorb,
             JobKind::Copy,
+            JobKind::Organize,
+            JobKind::UndoOrganize,
         ]
         .into_iter()
         .find(|k| k.name() == name)
@@ -404,6 +414,10 @@ pub struct JobParams {
     pub absorb: Option<(String, calibre_db::absorb::AbsorbOptions)>,
     /// The books to copy and where from ([`JobKind::Copy`]).
     pub copy: Option<CopyJob>,
+    /// The confirmed plan of a [`JobKind::Organize`] job.
+    pub organize: Option<calibre_db::organize::OrganizePlan>,
+    /// The run a [`JobKind::UndoOrganize`] job reverses.
+    pub undo_run: Option<String>,
 }
 
 /// A cross-library copy: the source library, its books and the options. The
@@ -558,6 +572,14 @@ fn run(cache: &Cache, kind: JobKind, options: &PipelineOptions, control: &JobCon
         JobKind::Unabsorb => {
             let (folder, _) = params.absorb.as_ref().ok_or_else(|| anyhow::anyhow!("an unabsorb job needs a folder"))?;
             Ok(serde_json::to_value(calibre_db::absorb::unabsorb_library(cache, folder, control)?)?)
+        }
+        JobKind::Organize => {
+            let plan = params.organize.as_ref().ok_or_else(|| anyhow::anyhow!("an organize job needs its plan"))?;
+            Ok(serde_json::to_value(calibre_db::organize::execute(cache, plan, control)?)?)
+        }
+        JobKind::UndoOrganize => {
+            let run_id = params.undo_run.as_ref().ok_or_else(|| anyhow::anyhow!("an undo needs a run id"))?;
+            Ok(serde_json::to_value(calibre_db::organize::undo(cache, run_id, control)?)?)
         }
         JobKind::Copy => {
             let job = params.copy.as_ref().ok_or_else(|| anyhow::anyhow!("a copy job needs its books"))?;

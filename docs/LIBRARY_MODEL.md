@@ -699,6 +699,48 @@ open libraries through the destination's own write paths. Since tranche 14a:
 * `verify_copy` (what a move relies on) hashes both sides **streamed** in
   megabyte chunks instead of reading both files into memory.
 
+## Jobs survive a restart (tranche 14b)
+
+The job registry used to live only in memory. The last state of every job
+(kind, summarized params, state, report, timestamps) is now written to
+`.calibre-oxide/jobs.json` on each state change (temp file + rename; reports
+over 256 KB are dropped from the file). When a server opens a library it reads
+the file back: a job recorded `running` by a process that is gone is reported
+`interrupted` (`GET /library-jobs`, with `resumable` and `resume_route` for the
+kinds that continue from what the database says is left: scan, enrich, hash
+backfill, PDF fingerprint, prepare). Restored jobs get new ids
+(`params.previous_id` keeps the old one). The web UI shows "Resume <job>" on
+open, and the desktop app's library switch (which kills the server) asks first
+when `GET /library-jobs` reports a running job. The app waits up to 60 s
+(`CALIBRE_OXIDE_READY_TIMEOUT_SECS`) for the server to come up.
+
+## Organizing files by template
+
+Books scanned in place keep their original paths. `calibre_db::organize` moves
+each book's **own format files** to where a save-to-disk style template says
+(default `{author_sort}/{title}`: folder `Author`, file `Title.ext`), inside the
+library.
+
+* `POST /organize-library/{lib}` `{template?, book_ids | search | path_prefix,
+  dry_run, plan_fingerprint}`. The dry run is the default and returns the moves
+  (from -> to), conflicts, skipped books and a `plan_fingerprint`; executing
+  needs that fingerprint, re-plans and answers `409` if the plan changed. It
+  starts an `organize` job. `POST /unorganize-library/{lib}` `{run_id}` and
+  `GET /organize-runs/{lib}` are the undo.
+* Never overwrites: a target that exists, or that another book in the plan
+  takes, gets ` (2)`, ` (3)` on the file name.
+* Only the book's own files move, never a folder as a whole (books share
+  folders; the tranche 1 delete-safety rule). `cover.jpg`/`metadata.opf`
+  sidecars stay; an old folder is removed only once empty (`remove_dir`).
+* Each rename is `LibraryHandle::rename_atomic`; the database follows through
+  `Cache::set_book_path` / `set_format_name`, so a change-log rebuild
+  reproduces the layout. One book is all or nothing: if a rename fails (for
+  example a junction onto another volume, which a rename cannot cross) the
+  book's files already moved go back and it is reported failed. Nothing is
+  copied across volumes.
+* Each run is recorded in `.calibre-oxide/organize-runs/<run_id>.json`;
+  undo skips books that were moved since.
+
 ## Behaviour decided
 
 | | |
