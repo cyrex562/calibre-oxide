@@ -993,8 +993,14 @@ pub struct FingerprintReport {
 /// Without a worker binary the files are read in this process, one at a time.
 ///
 /// In both modes a file is marked *in flight* in the database before it is
-/// read. If the whole process dies on a file, the next run finds the mark and
-/// records that file as crashed instead of walking into the same crash again.
+/// read. If the whole process dies, the next run finds the marks and treats
+/// those files as **suspects**, not failures: the process may have died on any
+/// one of them (or on none, if it was simply stopped). Suspects are read first,
+/// one at a time, each in a fresh single worker (in this process when there is
+/// no pool), marked `fingerprint-suspect` before it is sent. One that crashes
+/// or times out on its own is recorded as such; one still marked
+/// `fingerprint-suspect` at the next start killed the process on its own
+/// retry, and is recorded as crashed without a third try.
 pub fn fingerprint_pdfs(cache: &Cache, options: &PipelineOptions, control: &JobControl) -> Result<FingerprintReport> {
     use std::sync::atomic::Ordering;
     control.set_phase("fingerprinting");
@@ -1005,8 +1011,8 @@ pub fn fingerprint_pdfs(cache: &Cache, options: &PipelineOptions, control: &JobC
 
     // Files a previous run was reading when the process died. Recorded as
     // crashed, so this run does not read them again.
-    for hash in store.take_inflight("fingerprint")? {
-        let why = "crashed: this PDF was being read when a previous run died, so it was not tried again".to_string();
+    for hash in store.take_inflight("fingerprint-suspect")? {
+        let why = "crashed: this PDF was being read alone when the process died, so it was not tried again".to_string();
         store.record_pdf_fingerprint(&hash, &Err(why.clone()))?;
         control.errors.fetch_add(1, Ordering::Relaxed);
         report.failed_count += 1;
@@ -1014,6 +1020,8 @@ pub fn fingerprint_pdfs(cache: &Cache, options: &PipelineOptions, control: &JobC
             report.failed.push((format!("(content {hash})"), why));
         }
     }
+
+    let suspects: std::collections::HashSet<String> = store.take_inflight("fingerprint")?.into_iter().collect();
 
     let todo = store.pdf_fingerprints_pending()?;
     control.total.store(todo.len() as u64, Ordering::Relaxed);
@@ -1044,16 +1052,23 @@ pub fn fingerprint_pdfs(cache: &Cache, options: &PipelineOptions, control: &JobC
         None => options.workers.clamp(1, MAX_FINGERPRINT_WORKERS),
     };
     let mut abort: Option<anyhow::Error> = None;
-    for chunk in by_hash.chunks(options.batch_size.max(1)) {
+    // Suspects first, one to a batch; then everything else.
+    let (suspect_items, rest): (Vec<_>, Vec<_>) = by_hash.into_iter().partition(|(hash, _)| suspects.contains(hash));
+    let mut batches: Vec<(&[(String, Vec<(String, String, String)>)], bool)> = suspect_items.chunks(1).map(|c| (c, true)).collect();
+    batches.extend(rest.chunks(options.batch_size.max(1)).map(|c| (c, false)));
+    for (chunk, suspect) in batches {
         if control.is_cancelled() {
             break;
         }
+        let kind = if suspect { "fingerprint-suspect" } else { "fingerprint" };
+        let workers = if suspect { 1 } else { workers };
+        let batch_pool: Option<std::sync::Arc<crate::pdf_worker::Pool>> = if suspect { pool.as_ref().map(|p| std::sync::Arc::new(p.isolated())) } else { pool.clone() };
         let results = parallel_map(chunk, workers, control, |(hash, locations)| -> Result<Option<(String, Result<PdfFingerprint>)>> {
             for (folder, name, format) in locations {
                 let Some(path) = format_file_path(&library, folder, name, format) else { continue };
                 let display = path.display().to_string();
-                store.mark_inflight("fingerprint", hash)?;
-                let outcome = match &pool {
+                store.mark_inflight(kind, hash)?;
+                let outcome = match &batch_pool {
                     Some(pool) => fingerprint_via_pool(pool, &path),
                     None => fingerprint_file(&path),
                 };
@@ -1064,7 +1079,7 @@ pub fn fingerprint_pdfs(cache: &Cache, options: &PipelineOptions, control: &JobC
                         store.record_pdf_fingerprint(hash, &Err(format!("{e:#}")))?;
                     }
                 }
-                store.clear_inflight("fingerprint", hash)?;
+                store.clear_inflight(kind, hash)?;
                 return match outcome {
                     Ok(fp) => Ok(Some((display, Ok(fp)))),
                     Err(e) if is_unavailable(&e) => Err(e),

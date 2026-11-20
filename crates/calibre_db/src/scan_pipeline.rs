@@ -511,16 +511,20 @@ pub fn enrich_pending(cache: &Cache, options: &PipelineOptions, control: &JobCon
     let store = cache.checksums();
     let mut report = EnrichReport::default();
 
-    // Books a previous run was reading when it died.
-    for key in store.take_inflight("enrich")? {
+    // Books whose isolated retry killed the process: crashed, not tried again.
+    for key in store.take_inflight("enrich-suspect")? {
         if let Ok(book_id) = key.parse::<i32>() {
             store.finish_enrichment(book_id)?;
             control.errors.fetch_add(1, Ordering::Relaxed);
-            push_capped(&mut report.failed, (format!("book {book_id}"), "crashed: this PDF was being read when a previous run died, so it was not tried again".to_string()));
+            push_capped(&mut report.failed, (format!("book {book_id}"), "crashed: this PDF was being read alone when the process died, so it was not tried again".to_string()));
         }
     }
+    // Books a previous run was reading when it died are suspects, not
+    // failures: read first, alone, in a fresh worker.
+    let suspects: std::collections::HashSet<i32> = store.take_inflight("enrich")?.into_iter().filter_map(|k| k.parse().ok()).collect();
 
-    let pending = store.pending_enrichment()?;
+    let mut pending = store.pending_enrichment()?;
+    pending.sort_by_key(|(book_id, ..)| !suspects.contains(book_id));
     control.total.store(pending.len() as u64, Ordering::Relaxed);
     let pool = if pending.iter().any(|(_, format, _, _)| format.eq_ignore_ascii_case("pdf")) { options.pdf_pool.resolve(options.pdf_workers) } else { None };
     let read_threads = pool.as_ref().map_or(options.workers, |p| p.workers().max(options.workers));
@@ -569,11 +573,19 @@ pub fn enrich_pending(cache: &Cache, options: &PipelineOptions, control: &JobCon
         staged.clear();
     };
 
-    // Small chunks: a cancel should not wait for a hundred PDF renders.
-    for chunk in pending.chunks((read_threads * 4).max(4)) {
+    // Suspects one to a batch (they are sorted first), then small chunks: a
+    // cancel should not wait for a hundred PDF renders.
+    let suspect_count = pending.iter().take_while(|(book_id, ..)| suspects.contains(book_id)).count();
+    let (suspect_part, rest_part) = pending.split_at(suspect_count);
+    let mut batches: Vec<(&[(i32, String, String, String)], bool)> = suspect_part.chunks(1).map(|c| (c, true)).collect();
+    batches.extend(rest_part.chunks((read_threads * 4).max(4)).map(|c| (c, false)));
+    for (chunk, suspect) in batches {
         if control.is_cancelled() {
             break;
         }
+        let (enrich_kind, fp_kind) = if suspect { ("enrich-suspect", "fingerprint-suspect") } else { ("enrich", "fingerprint") };
+        let read_threads = if suspect { 1 } else { read_threads };
+        let pool: Option<std::sync::Arc<crate::pdf_worker::Pool>> = if suspect { pool.as_ref().map(|p| std::sync::Arc::new(p.isolated())) } else { pool.clone() };
         let read_started = std::time::Instant::now();
         let extracted = parallel_map(chunk, read_threads, control, |(book_id, format, name, folder)| -> Read {
             let Some(path) = format_file_path(&library, folder, name, format) else { return Read::Missing };
@@ -587,14 +599,14 @@ pub fn enrich_pending(cache: &Cache, options: &PipelineOptions, control: &JobCon
             let key = book_id.to_string();
             let hash = store.recorded_identity(*book_id, "format", format).ok().and_then(|(hash, _)| hash);
             let wants_fingerprint = pool.is_some() && hash.as_deref().is_some_and(|h| !store.has_pdf_fingerprint(h).unwrap_or(true));
-            let _ = store.mark_inflight("enrich", &key);
+            let _ = store.mark_inflight(enrich_kind, &key);
             if wants_fingerprint {
-                let _ = store.mark_inflight("fingerprint", hash.as_deref().unwrap_or_default());
+                let _ = store.mark_inflight(fp_kind, hash.as_deref().unwrap_or_default());
             }
             let finish = || {
-                let _ = store.clear_inflight("enrich", &key);
+                let _ = store.clear_inflight(enrich_kind, &key);
                 if let Some(h) = hash.as_deref().filter(|_| wants_fingerprint) {
-                    let _ = store.clear_inflight("fingerprint", h);
+                    let _ = store.clear_inflight(fp_kind, h);
                 }
             };
             let in_process = || calibre_ebooks::metadata::pdf::get_metadata_from_path_at(&path, Some(cover_width)).map(Box::new).map(Read::Meta).unwrap_or_else(|_| Read::Meta(Box::default()));
@@ -1252,25 +1264,43 @@ mod tests {
         assert!(cache.backend.change_log().unwrap().verify().unwrap().is_clean());
     }
 
-    /// A run that died while a PDF was being read leaves it marked; the next
-    /// run records that book as crashed and does not read the file again.
+    /// A run that died while PDFs were being read leaves them marked; they are
+    /// suspects, read first and alone. The innocent one is enriched; the
+    /// poison one crashes on its own retry and is recorded.
     #[test]
-    fn a_book_left_in_flight_by_a_dead_run_is_recorded_as_crashed_not_retried() {
+    fn books_left_in_flight_by_a_dead_run_are_suspects_retried_alone() {
         let (dir, cache) = library();
         write(&dir.path().join("good-a.pdf"), b"%PDF-1.4 a");
-        write(&dir.path().join("good-b.pdf"), b"%PDF-1.4 b");
+        write(&dir.path().join("crash-b.pdf"), b"%PDF-1.4 b");
+        write(&dir.path().join("good-c.pdf"), b"%PDF-1.4 c");
         index_files(&cache, dir.path(), &walked(dir.path()), &options(1, 100), &JobControl::default());
-        let a = cache.book_for_file("good-a.pdf").unwrap().unwrap();
+        let id = |name: &str| cache.book_for_file(name).unwrap().unwrap();
+        let (a, b, c) = (id("good-a.pdf"), id("crash-b.pdf"), id("good-c.pdf"));
         cache.checksums().mark_inflight("enrich", &a.to_string()).unwrap();
+        cache.checksums().mark_inflight("enrich", &b.to_string()).unwrap();
 
-        let report = enrich_pending(&cache, &pool_options(1, 100), &JobControl::default()).unwrap();
+        let report = enrich_pending(&cache, &pool_options(2, 100), &JobControl::default()).unwrap();
         assert_eq!(report.remaining, 0);
         assert_eq!(report.failed.len(), 1, "{report:?}");
-        assert!(report.failed[0].1.starts_with("crashed:") && report.failed[0].0 == format!("book {a}"), "{report:?}");
-        assert_eq!(cache.field_for(a, "title").unwrap().as_deref(), Some("good-a"), "the marked file was not read");
-        let b = cache.book_for_file("good-b.pdf").unwrap().unwrap();
-        assert_eq!(cache.field_for(b, "title").unwrap().as_deref(), Some("Title of good-b"));
+        assert!(report.failed[0].0.contains("crash-b") && report.failed[0].1.starts_with("crashed:"), "{report:?}");
+        assert_eq!(cache.field_for(a, "title").unwrap().as_deref(), Some("Title of good-a"), "an innocent suspect is enriched");
+        assert_eq!(cache.field_for(c, "title").unwrap().as_deref(), Some("Title of good-c"));
         assert_eq!(inflight_rows(&cache), 0);
+    }
+
+    /// Marked from its isolated retry: it killed the process alone, so it is
+    /// recorded as crashed without another try.
+    #[test]
+    fn an_enrich_suspect_that_killed_the_process_on_its_retry_is_not_tried_again() {
+        let (dir, cache) = library();
+        write(&dir.path().join("good-a.pdf"), b"%PDF-1.4 a");
+        index_files(&cache, dir.path(), &walked(dir.path()), &options(1, 100), &JobControl::default());
+        let a = cache.book_for_file("good-a.pdf").unwrap().unwrap();
+        cache.checksums().mark_inflight("enrich-suspect", &a.to_string()).unwrap();
+        let report = enrich_pending(&cache, &pool_options(1, 100), &JobControl::default()).unwrap();
+        assert_eq!(report.remaining, 0);
+        assert!(report.failed.len() == 1 && report.failed[0].1.starts_with("crashed:"), "{report:?}");
+        assert_eq!(cache.field_for(a, "title").unwrap().as_deref(), Some("good-a"), "not read");
     }
 
     /// Without a worker, a PDF is read in-process, and it is marked in flight

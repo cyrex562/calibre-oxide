@@ -48,3 +48,20 @@ fn the_worker_is_located_through_the_environment_variable() {
     assert!(located.is_file());
     std::env::remove_var(calibre_db::pdf_worker::WORKER_PATH_VAR);
 }
+
+/// A worker exits promptly when its parent goes away (stdin closes), instead of
+/// sitting in a read for ever.
+#[test]
+fn the_worker_exits_when_its_stdin_closes() {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(env!("CARGO_BIN_EXE_calibre_pdf_worker")).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    drop(child.stdin.take());
+    let started = std::time::Instant::now();
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(10), "the worker did not exit");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}

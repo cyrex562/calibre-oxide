@@ -889,21 +889,39 @@ fn the_pool_records_a_crash_and_a_hang_and_the_run_continues() {
     assert_eq!((again.total, again.fingerprinted, again.failed_count), (0, 0, 0));
 }
 
-/// A run that died with a file in flight (the whole process, not a worker)
-/// records that file as crashed on resume instead of retrying it forever.
+/// A run that died with files in flight (the whole process, not a worker)
+/// does not condemn them: they are suspects, read first, alone. An innocent
+/// one is fingerprinted; the poison one is recorded after its own retry.
 #[test]
-fn a_file_left_in_flight_by_a_dead_run_is_recorded_as_crashed_and_skipped() {
+fn files_left_in_flight_by_a_dead_run_are_suspects_retried_alone() {
     let (dir, cache) = library();
-    let poison = add_pdf(dir.path(), &cache, "good-but-marked", b"%PDF-1.4 marked");
+    let innocent = add_pdf(dir.path(), &cache, "good-but-marked", b"%PDF-1.4 marked");
+    let poison = add_pdf(dir.path(), &cache, "crash-marked", b"%PDF-1.4 poison");
     let fine = add_pdf(dir.path(), &cache, "good-fine", b"%PDF-1.4 fine");
-    cache.checksums().mark_inflight("fingerprint", &hash_of(&cache, poison)).unwrap();
-
-    let report = fingerprint_pdfs(&cache, &pool_options(1, std::time::Duration::from_secs(60)), &JobControl::new()).unwrap();
-    assert_eq!((report.total, report.fingerprinted, report.failed_count), (1, 1, 1), "{report:?}");
-    assert!(report.failed[0].1.starts_with("crashed:"), "{report:?}");
     let store = cache.checksums();
-    assert!(store.pdf_fingerprint_error(&hash_of(&cache, poison)).unwrap().unwrap().starts_with("crashed:"));
+    store.mark_inflight("fingerprint", &hash_of(&cache, innocent)).unwrap();
+    store.mark_inflight("fingerprint", &hash_of(&cache, poison)).unwrap();
+
+    let pool = pool_options(2, std::time::Duration::from_secs(60));
+    let report = fingerprint_pdfs(&cache, &pool, &JobControl::new()).unwrap();
+    assert_eq!((report.total, report.fingerprinted, report.failed_count), (3, 2, 1), "{report:?}");
+    assert!(store.has_pdf_fingerprint(&hash_of(&cache, innocent)).unwrap());
+    assert_eq!(store.pdf_fingerprint_error(&hash_of(&cache, innocent)).unwrap(), None, "an innocent file is not condemned");
     assert!(store.has_pdf_fingerprint(&hash_of(&cache, fine)).unwrap());
+    assert!(store.pdf_fingerprint_error(&hash_of(&cache, poison)).unwrap().unwrap().starts_with("crashed:"), "the poison file is recorded after its own retry");
+    assert_eq!(inflight(&cache), 0);
+}
+
+/// A suspect still marked from its isolated retry killed the process on its
+/// own: recorded as crashed without a third try.
+#[test]
+fn a_suspect_that_killed_the_process_on_its_own_retry_is_recorded_without_another_try() {
+    let (dir, cache) = library();
+    let marked = add_pdf(dir.path(), &cache, "good-marked-twice", b"%PDF-1.4 twice");
+    cache.checksums().mark_inflight("fingerprint-suspect", &hash_of(&cache, marked)).unwrap();
+    let report = fingerprint_pdfs(&cache, &pool_options(1, std::time::Duration::from_secs(60)), &JobControl::new()).unwrap();
+    assert_eq!((report.total, report.fingerprinted, report.failed_count), (0, 0, 1), "{report:?}");
+    assert!(cache.checksums().pdf_fingerprint_error(&hash_of(&cache, marked)).unwrap().unwrap().starts_with("crashed:"));
     assert_eq!(inflight(&cache), 0);
 }
 

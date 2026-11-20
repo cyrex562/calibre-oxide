@@ -144,14 +144,18 @@ in-process workers had killed the whole server. What changed (tranche 13):
   is read once. The worker binary is looked for next to the running executable
   (it is built and shipped with `calibre_srv`), or at
   `CALIBRE_OXIDE_PDF_WORKER`; without it the in-process path is used.
-- **In-flight marks.** Before a PDF is handed to a reader it is written to
-  `checksums_db.inflight` (kind `enrich` by book id, `fingerprint` by content
-  hash). If the whole process dies on a file, the next run finds the mark and
-  records that file as `crashed` instead of trying it again, in both modes. A
-  worker crash is recorded the moment it happens. The cost of this rule: files
-  that were in flight when the *server itself* was killed (at most one per
-  worker) are recorded as crashed along with the real culprit; a later
-  `FINGERPRINT_VERSION` bump retries them.
+- **In-flight marks and suspects.** Before a PDF is handed to a reader it is
+  written to `checksums_db.inflight` (kind `enrich` by book id, `fingerprint` by
+  content hash). A worker crash or timeout is recorded the moment it happens.
+  If the *server* dies, the files found in flight on the next run are
+  **suspects**, not failures (the process may have died on any of them, or on
+  none): they are read first, one at a time, each in a fresh single worker
+  (in-process when there is no pool), re-marked as `enrich-suspect` /
+  `fingerprint-suspect` before being sent. One that crashes or times out on its
+  own is recorded as such; one still marked `-suspect` at the next start killed
+  the process on its own retry and is recorded as crashed without a third try.
+  Innocent files are never condemned by someone else's crash. A worker also
+  exits at once when its stdin closes (parent gone), even mid-request.
 - **One open per PDF.** A request to a worker can ask for the Info strings, a
   cover and the fingerprint together. Enrichment asks for the fingerprint too
   when the file's content hash is known and it has no fingerprint, so the scan
@@ -192,7 +196,9 @@ in-process workers had killed the whole server. What changed (tranche 13):
   fingerprints and the duplicate scan in order. The stage it reached is written
   to `.calibre-oxide/prepare-stage.json` before it starts, so a rerun resumes at
   that stage (each stage also resumes itself); `?restart=true` begins again at
-  the scan, and `GET /prepare-library` reports the stage. A stage that fails (no
+  the scan, and `GET /prepare-library` reports the stage. The duplicates panel's
+  "Prepare for duplicate detection" button starts it, shows "Step n of 4" and
+  loads the groups when it ends. A stage that fails (no
   PDFium for the fingerprints) is reported and the chain carries on.
 
 Reads run on a small bounded pool (default 3; `CALIBRE_OXIDE_SCAN_WORKERS`, or

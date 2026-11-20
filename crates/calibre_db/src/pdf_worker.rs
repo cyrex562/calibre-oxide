@@ -169,6 +169,42 @@ pub fn serve<R: BufRead, W: Write>(input: R, mut output: W, handler: impl Fn(&Re
     Ok(())
 }
 
+/// [`serve`] for the real worker process: stdin is read on a thread of its
+/// own, and when it ends (the parent closed the pipe or died, which the OS
+/// turns into end-of-file) the process exits **at once**, even in the middle of
+/// a request. Without that a worker stuck inside PDFium on a hung file would
+/// outlive a dead parent for ever, since it would never get back to reading.
+pub fn serve_process(handler: impl Fn(&Request) -> Response) -> std::io::Result<()> {
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            match line {
+                Ok(line) => {
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        std::process::exit(0);
+    });
+    let mut output = std::io::stdout().lock();
+    for line in rx {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(request) = serde_json::from_str::<Request>(&line) else { continue };
+        let text = serde_json::to_string(&handler(&request)).map_err(std::io::Error::other)?;
+        output.write_all(b"\n")?;
+        output.write_all(text.as_bytes())?;
+        output.write_all(b"\n")?;
+        output.flush()?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------
 // Finding and configuring the worker
 // ---------------------------------------------------------------------
@@ -277,6 +313,13 @@ pub struct Pool {
 impl Pool {
     pub fn new(config: PoolConfig) -> Pool {
         Pool { config, state: Mutex::new(PoolState::default()), freed: Condvar::new(), next_id: AtomicU64::new(1), started: AtomicU64::new(0) }
+    }
+
+    /// A fresh pool of one worker with this pool's settings: where a file
+    /// that was in flight when a run died is read alone, so that if it is the
+    /// culprit nothing else is lost with it.
+    pub fn isolated(&self) -> Pool {
+        Pool::new(PoolConfig { workers: 1, ..self.config.clone() })
     }
 
     pub fn workers(&self) -> usize {
