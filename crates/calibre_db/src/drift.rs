@@ -34,7 +34,7 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 
-use calibre_utils::filenames::{file_facts, FileIdentity};
+use calibre_utils::filenames::FileIdentity;
 
 use crate::cache::Cache;
 use crate::scan::ScanReport;
@@ -84,6 +84,11 @@ pub struct DriftReport {
     /// Whether the scan saw the whole library. When false, `missing` was
     /// not computed: absence could not be distinguished from invisibility.
     pub conclusive: bool,
+    /// Content hashes computed for untracked files while looking for moved
+    /// files, by relative path. Only files whose size equals that of a
+    /// recorded file that was not found are ever read, and a rescan hands
+    /// these to indexing so nothing is read twice.
+    pub hashes: HashMap<String, crate::scan_pipeline::FileDigest>,
 }
 
 /// One recorded `(book, format)` and where it should be.
@@ -127,7 +132,8 @@ pub fn detect(cache: &Cache, scan: &ScanReport) -> Result<DriftReport> {
         }
 
         let full = library.join(&record.path);
-        let actual_identity = file_facts(&full).map(|f| f.identity);
+        // From the walk's own `stat`, not another open of the file.
+        let actual_identity = on_disk_facts.get(record.path.as_str()).map(|f| f.identity);
 
         // Something is at our path, but is it our file? If the identity
         // differs *and* belongs to another record, the files were
@@ -209,22 +215,33 @@ pub fn detect(cache: &Cache, scan: &ScanReport) -> Result<DriftReport> {
         }
     }
 
-    // Content matching reads files, so it is built only when some absent
-    // record could not be matched by identity and has a hash to match on.
-    // A first scan of a folder (nothing absent) and a rescan where every
-    // move kept its identity read nothing here.
-    let needs_content = absent.iter().any(|r| r.hash.is_some() && !r.identity.is_some_and(|id| by_identity.contains_key(&id)));
+    // Content matching reads files, so it reads as few as it can: only the
+    // untracked files whose size equals the recorded size of an absent record
+    // that identity could not match and that has a hash to match on (a file
+    // of another size cannot have its content). A first scan of a folder
+    // (nothing absent) and a rescan where every move kept its identity read
+    // nothing here; one absent file used to make this read -- whole, into
+    // memory, one at a time -- every untracked file in the library, which
+    // indexing then hashed again.
+    let wanted_sizes: HashSet<u64> = absent
+        .iter()
+        .filter(|r| r.hash.is_some() && !r.identity.is_some_and(|id| by_identity.contains_key(&id)))
+        .filter_map(|r| r.size.and_then(|s| u64::try_from(s).ok()))
+        .collect();
     let mut by_hash: HashMap<String, Vec<&str>> = HashMap::new();
-    if needs_content {
-        for path in &untracked {
-            if let Some(hash) = hash_of(&library.join(path)) {
-                // A file the user removed and kept, found by content after
-                // being renamed, is not a candidate for anything.
-                if ignored_hashes.contains(&hash) {
-                    continue;
-                }
-                by_hash.entry(hash).or_default().push(path);
+    if !wanted_sizes.is_empty() {
+        let candidates: Vec<&str> = untracked.iter().copied().filter(|p| on_disk_facts.get(*p).is_some_and(|f| wanted_sizes.contains(&f.size))).collect();
+        let control = crate::scan_pipeline::JobControl::default();
+        let digests = crate::scan_pipeline::parallel_map(&candidates, crate::scan_pipeline::default_workers(), &control, |path| crate::scan_pipeline::hash_stream(&library.join(path), None).ok());
+        for (path, digest) in candidates.iter().zip(digests) {
+            let Some(Some(digest)) = digest else { continue };
+            report.hashes.insert(path.to_string(), digest.clone());
+            // A file the user removed and kept, found by content after
+            // being renamed, is not a candidate for anything.
+            if ignored_hashes.contains(&digest.hash) {
+                continue;
             }
+            by_hash.entry(digest.hash).or_default().push(path);
         }
     }
 
@@ -318,7 +335,7 @@ fn recorded_files(cache: &Cache) -> Result<Vec<Recorded>> {
 }
 
 fn hash_of(path: &std::path::Path) -> Option<String> {
-    std::fs::read(path).ok().map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+    crate::scan_pipeline::hash_stream(path, None).ok().map(|digest| digest.hash)
 }
 
 #[cfg(test)]
@@ -610,5 +627,64 @@ mod tests {
         let second = detect(&cache, &scan(dir.path())).unwrap();
         assert!(second.moved.is_empty(), "{second:?}");
         assert_eq!(second.unchanged, 1);
+    }
+
+    /// One absent file used to make the drift pass read *every* untracked file
+    /// (whole, into memory, one at a time) to look for it by content, and
+    /// indexing then hashed them all again. Now only untracked files of the
+    /// absent file's size are read, and indexing reuses what was read.
+    #[test]
+    fn one_absent_file_does_not_make_the_drift_pass_read_every_untracked_file() {
+        let (dir, cache) = library();
+        let original = b"%PDF the original content, a bit long".to_vec();
+        write(&dir.path().join("keeper.pdf"), b"%PDF keeper content stays");
+        write(&dir.path().join("lost.pdf"), &original);
+        index(dir.path(), &cache);
+
+        // `lost.pdf` is copied elsewhere (a new identity, so only its content
+        // can find it) and removed; a decoy has its size but other bytes; and
+        // many unrelated files turn up, all of other sizes.
+        std::fs::remove_file(dir.path().join("lost.pdf")).unwrap();
+        write(&dir.path().join("elsewhere/lost-copy.pdf"), &original);
+        let mut decoy = original.clone();
+        *decoy.last_mut().unwrap() ^= 0x55;
+        write(&dir.path().join("decoy.pdf"), &decoy);
+        for i in 0..25 {
+            write(&dir.path().join(format!("new/unrelated{i:02}.pdf")), format!("%PDF unrelated {i} {}", "x".repeat(100 + i)).as_bytes());
+        }
+
+        let report = detect(&cache, &scan(dir.path())).unwrap();
+        assert_eq!(report.moved.len(), 1, "{report:?}");
+        assert_eq!((report.moved[0].to.as_str(), report.moved[0].evidence), ("elsewhere/lost-copy.pdf", Evidence::Content));
+        let mut read: Vec<&str> = report.hashes.keys().map(String::as_str).collect();
+        read.sort();
+        assert_eq!(read, vec!["decoy.pdf", "elsewhere/lost-copy.pdf"], "only files of the absent file's size were read");
+        assert!(report.hashes.values().all(|d| d.size == original.len() as u64));
+
+        // And a rescan indexes the rest without reading the decoy again: 25
+        // unrelated files are opened once each, the decoy not at all.
+        let control = crate::scan_pipeline::JobControl::default();
+        let options = crate::scan_pipeline::PipelineOptions { workers: 1, batch_size: 10, ..Default::default() };
+        let rescan = crate::scan::rescan_files(&cache, SystemTime::now() + Duration::from_secs(3600), &options, &control).unwrap();
+        assert_eq!(rescan.relocated, 1);
+        assert_eq!(rescan.indexed.added.len(), 26, "{:?}", rescan.indexed.failed);
+        assert_eq!(control.file_opens.load(std::sync::atomic::Ordering::Relaxed), 25, "the decoy's hash came from the drift pass");
+        let decoy_id = cache.book_for_file("decoy.pdf").unwrap().unwrap();
+        let (hash, _) = cache.checksums().recorded_identity(decoy_id, "format", "PDF").unwrap();
+        assert_eq!(hash.unwrap(), blake3::hash(&decoy).to_hex().to_string());
+    }
+
+    /// Nothing absent, nothing to look for: no untracked file is read.
+    #[test]
+    fn with_nothing_absent_the_drift_pass_reads_no_untracked_file() {
+        let (dir, cache) = library();
+        write(&dir.path().join("a.pdf"), b"%PDF one");
+        index(dir.path(), &cache);
+        for i in 0..5 {
+            write(&dir.path().join(format!("new{i}.pdf")), format!("%PDF new {i}").as_bytes());
+        }
+        let report = detect(&cache, &scan(dir.path())).unwrap();
+        assert!(report.hashes.is_empty());
+        assert_eq!(report.untracked.len(), 5);
     }
 }

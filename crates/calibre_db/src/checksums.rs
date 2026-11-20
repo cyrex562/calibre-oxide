@@ -267,6 +267,17 @@ impl ChecksumStore {
                     pages BLOB,
                     minhash BLOB,
                     computed_at TEXT NOT NULL
+                );
+                -- Files a PDF reader is working on right now (kind, key):
+                -- written before the file is handed over, removed when the
+                -- result is back. A row left behind at the start of a job is
+                -- a file that was being read when the process died, which the
+                -- job records as crashed instead of trying again.
+                CREATE TABLE IF NOT EXISTS checksums_db.inflight (
+                    kind TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    PRIMARY KEY (kind, key)
                 );",
             )?;
         }
@@ -406,6 +417,39 @@ impl ChecksumStore {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Marks `(kind, key)` as being read right now. Durable before it
+    /// returns, so a crash mid-read leaves the mark behind.
+    pub fn mark_inflight(&self, kind: &str, key: &str) -> Result<(), ChecksumError> {
+        self.initialize()?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute("INSERT OR REPLACE INTO checksums_db.inflight (kind, key, started_at) VALUES (?1, ?2, datetime('now'))", (kind, key))?;
+        Ok(())
+    }
+
+    /// Removes the mark set by [`ChecksumStore::mark_inflight`].
+    pub fn clear_inflight(&self, kind: &str, key: &str) -> Result<(), ChecksumError> {
+        self.initialize()?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM checksums_db.inflight WHERE kind = ?1 AND key = ?2", (kind, key))?;
+        Ok(())
+    }
+
+    /// Every key of `kind` still marked in flight, removing the marks. Called
+    /// at the start of a job, when nothing of that kind can really be in
+    /// flight (one job per library), so what is found was left by a run that
+    /// died.
+    pub fn take_inflight(&self, kind: &str) -> Result<Vec<String>, ChecksumError> {
+        self.initialize()?;
+        let conn = self.conn.lock().unwrap();
+        let keys: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT key FROM checksums_db.inflight WHERE kind = ?1 ORDER BY key")?;
+            let rows = stmt.query_map([kind], |r| r.get::<_, String>(0))?;
+            rows.collect::<SqlResult<Vec<_>>>()?
+        };
+        conn.execute("DELETE FROM checksums_db.inflight WHERE kind = ?1", [kind])?;
+        Ok(keys)
     }
 
     /// Queues a book for the lazy metadata pass (cover, embedded title

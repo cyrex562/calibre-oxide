@@ -84,6 +84,11 @@ use pdfium_render::prelude::{PdfRenderConfig, Pdfium};
 /// than a thumbnail that looks soft at any useful size.
 pub const DEFAULT_COVER_WIDTH: u32 = 1000;
 
+/// Width the library scan renders PDF covers at. Plenty for the cover grid and
+/// the detail pane, and a render at 600 is roughly a third cheaper than at
+/// 1000. Override with `CALIBRE_OXIDE_SCAN_COVER_WIDTH`.
+pub const SCAN_COVER_WIDTH: u32 = 600;
+
 /// Upper bound on a render, so a bad number cannot reach the
 /// allocator. A letter page at this width is ~5,200px tall and ~83MB
 /// of RGBA -- already well past what a cover or an exported page
@@ -334,26 +339,62 @@ pub struct PdfInfo {
 /// worker, which is what [`page_count`]/[`render_page`] (taking `&[u8]`)
 /// would cost. Used by the in-place scan's metadata pass.
 pub fn info_and_cover_from_path(path: &Path, want_cover: bool) -> Result<(PdfInfo, Option<Vec<u8>>)> {
-    use pdfium_render::prelude::PdfDocumentMetadataTagType as Tag;
+    info_and_cover_from_path_at(path, want_cover.then_some(DEFAULT_COVER_WIDTH))
+}
 
+/// [`info_and_cover_from_path`] with the cover's width chosen by the caller:
+/// `None` reads the Info strings only. The library scan renders covers at
+/// [`scan_cover_width`], smaller than [`DEFAULT_COVER_WIDTH`], because a scan
+/// of a big collection spends most of its time on those renders.
+pub fn info_and_cover_from_path_at(path: &Path, cover_width: Option<u32>) -> Result<(PdfInfo, Option<Vec<u8>>)> {
     let _lock = lock_pdfium();
     let pdfium = pdfium().ok_or_else(unavailable)?;
     let document = pdfium.load_pdf_from_file(path, None).map_err(|e| RasterizeError::Pdf(e.to_string()))?;
+    Ok(info_and_cover_of(&document, path, cover_width))
+}
+
+fn info_and_cover_of(document: &pdfium_render::prelude::PdfDocument<'_>, path: &Path, cover_width: Option<u32>) -> (PdfInfo, Option<Vec<u8>>) {
+    use pdfium_render::prelude::PdfDocumentMetadataTagType as Tag;
+
     let metadata = document.metadata();
     let get = |tag: Tag| metadata.get(tag).map(|t| t.value().to_string()).filter(|v| !v.trim().is_empty());
     let info = PdfInfo { title: get(Tag::Title), author: get(Tag::Author), keywords: get(Tag::Keywords), subject: get(Tag::Subject) };
-    let cover = if want_cover {
-        match render_document_page(&document, 1, DEFAULT_COVER_WIDTH).and_then(|page| page.encode(PageImageFormat::Jpeg, DEFAULT_JPEG_QUALITY)) {
+    let cover = match cover_width {
+        Some(width) => match render_document_page(document, 1, width).and_then(|page| page.encode(PageImageFormat::Jpeg, DEFAULT_JPEG_QUALITY)) {
             Ok(bytes) => Some(bytes),
             Err(e) => {
                 log::debug!("no cover rendered from {}: {e}", path.display());
                 None
             }
-        }
-    } else {
-        None
+        },
+        None => None,
     };
-    Ok((info, cover))
+    (info, cover)
+}
+
+/// Width scan covers are rendered at: `CALIBRE_OXIDE_SCAN_COVER_WIDTH` if set
+/// (clamped to 100..=[`MAX_RENDER_WIDTH`]), else [`SCAN_COVER_WIDTH`].
+pub fn scan_cover_width() -> u32 {
+    std::env::var("CALIBRE_OXIDE_SCAN_COVER_WIDTH").ok().and_then(|v| v.trim().parse::<u32>().ok()).map(|w| w.clamp(100, MAX_RENDER_WIDTH)).unwrap_or(SCAN_COVER_WIDTH)
+}
+
+/// What [`read_pdf_from_path`] was asked for and found.
+pub struct PdfRead {
+    pub info: PdfInfo,
+    pub cover: Option<Vec<u8>>,
+    pub sampled: Option<SampledPdf>,
+}
+
+/// Info strings, an optional page-1 cover and an optional page sample, from
+/// **one** open of the file. The out-of-process worker's "both" request: a PDF
+/// whose metadata and fingerprint are both owed is read once, not twice.
+pub fn read_pdf_from_path(path: &Path, cover_width: Option<u32>, sample: Option<(u32, Box<dyn FnOnce(usize) -> (Vec<usize>, Vec<usize>)>)>) -> Result<PdfRead> {
+    let _lock = lock_pdfium();
+    let pdfium = pdfium().ok_or_else(unavailable)?;
+    let document = pdfium.load_pdf_from_file(path, None).map_err(|e| RasterizeError::Pdf(e.to_string()))?;
+    let (info, cover) = info_and_cover_of(&document, path, cover_width);
+    let sampled = sample.map(|(long_side, choose)| sample_document(&document, long_side, choose));
+    Ok(PdfRead { info, cover, sampled })
 }
 
 fn render_document_page(document: &pdfium_render::prelude::PdfDocument<'_>, page_number: usize, target_width: u32) -> Result<RenderedPage> {
@@ -422,6 +463,10 @@ pub fn sample_pdf_from_path(path: &Path, long_side: u32, choose: impl FnOnce(usi
     let _lock = lock_pdfium();
     let pdfium = pdfium().ok_or_else(unavailable)?;
     let document = pdfium.load_pdf_from_file(path, None).map_err(|e| RasterizeError::Pdf(e.to_string()))?;
+    Ok(sample_document(&document, long_side, choose))
+}
+
+fn sample_document(document: &pdfium_render::prelude::PdfDocument<'_>, long_side: u32, choose: impl FnOnce(usize) -> (Vec<usize>, Vec<usize>)) -> SampledPdf {
     let pages = document.pages();
     let page_count = pages.len() as usize;
     let (render, text_pages) = choose(page_count);
@@ -448,7 +493,7 @@ pub fn sample_pdf_from_path(path: &Path, long_side: u32, choose: impl FnOnce(usi
         let t = pages.get((index as u16).into()).ok().and_then(|p| p.text().ok().map(|t| t.all())).unwrap_or_default();
         text.push(t);
     }
-    Ok(SampledPdf { page_count, pages: sampled, text })
+    SampledPdf { page_count, pages: sampled, text }
 }
 
 /// Port of `pdf.py`'s `page_images`: renders the inclusive page range

@@ -291,12 +291,20 @@ impl FileFacts {
 /// paths.
 pub fn file_facts(path: &Path) -> Option<FileFacts> {
     let metadata = std::fs::metadata(path).ok()?;
+    file_facts_from_metadata(path, &metadata)
+}
+
+/// [`file_facts`] from a `Metadata` the caller already has -- a directory
+/// walk gets one for free from each entry, and asking again doubled the
+/// `stat`s of every scan. Only the identity can still cost a syscall (on
+/// Windows it is read through a handle).
+pub fn file_facts_from_metadata(path: &Path, metadata: &std::fs::Metadata) -> Option<FileFacts> {
     let mtime_ms = metadata
         .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_millis() as u64);
-    Some(FileFacts { identity: identity_of(path, &metadata)?, size: metadata.len(), mtime_ms })
+    Some(FileFacts { identity: identity_of(path, metadata)?, size: metadata.len(), mtime_ms })
 }
 
 /// Just the identity, for callers that already have the size elsewhere.

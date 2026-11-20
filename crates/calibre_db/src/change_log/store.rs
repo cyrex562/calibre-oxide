@@ -65,6 +65,10 @@ use super::hlc::{Hlc, HlcClock};
 /// Shorter would be tidier and would lose data.
 pub const DEFAULT_RETENTION: Duration = Duration::from_secs(60 * 60 * 24 * 60);
 
+/// Loose entries past which [`ChangeLog::compact_if_needed`] compacts.
+/// `CALIBRE_OXIDE_CHANGE_LOG_COMPACT_AT` overrides it.
+pub const DEFAULT_COMPACT_THRESHOLD: usize = 2_000;
+
 /// Identifies one installation of the app. Persisted, because it is
 /// half of every change's identity and a new one each run would make
 /// every restart look like a new peer.
@@ -181,6 +185,36 @@ impl VerifyReport {
     }
 }
 
+/// Where a log stands, found by [`ChangeLog::read_tip`].
+struct Tip {
+    /// The newest stamp on disk, this origin's and every peer's.
+    clock: Hlc,
+    /// This origin's newest `(seq, hash)`.
+    own: Option<(u64, String)>,
+}
+
+/// The stamp and origin an entry file's name carries:
+/// `{wall_ms:013}-{counter:05}-{origin}-{nonce:8}.json` (see
+/// [`Change::file_name`]). `None` for a name that does not follow it.
+fn parse_entry_name(name: &str) -> Option<(Hlc, String)> {
+    let stem = name.strip_suffix(".json")?;
+    let wall_ms: u64 = stem.get(..13)?.parse().ok()?;
+    if stem.as_bytes().get(13) != Some(&b'-') {
+        return None;
+    }
+    let counter: u32 = stem.get(14..19)?.parse().ok()?;
+    if stem.as_bytes().get(19) != Some(&b'-') {
+        return None;
+    }
+    let rest = stem.get(20..)?;
+    // `-{nonce}`: eight characters after the last dash.
+    let cut = rest.len().checked_sub(9)?;
+    if rest.as_bytes().get(cut) != Some(&b'-') {
+        return None;
+    }
+    Some((Hlc { wall_ms, counter }, rest[..cut].to_string()))
+}
+
 #[derive(Debug)]
 struct LocalState {
     clock: HlcClock,
@@ -218,6 +252,21 @@ impl ChangeLog {
             state: Mutex::new(LocalState { clock: HlcClock::resuming_from(Hlc::ZERO), next_seq: 1, prev_hash: None }),
         };
 
+        // Normally the tip is found from the newest snapshot's header and the
+        // names of the entries after it. Replaying everything (reading and
+        // parsing every entry file, and the whole snapshot) is the fallback
+        // for a log laid out in a way the fast path cannot read.
+        if let Some(tip) = log.read_tip()? {
+            let mut state = log.state.lock().unwrap();
+            state.clock.observe(tip.clock);
+            if let Some((seq, hash)) = tip.own {
+                state.next_seq = seq + 1;
+                state.prev_hash = Some(hash);
+            }
+            drop(state);
+            return Ok(log);
+        }
+
         let replay = log.replay()?;
         let mut state = log.state.lock().unwrap();
         for change in replay.changes() {
@@ -229,6 +278,91 @@ impl ChangeLog {
         }
         drop(state);
         Ok(log)
+    }
+
+    /// What [`ChangeLog::open`] needs to continue the log, without reading it
+    /// all: the newest snapshot's **header** (its watermarks say where every
+    /// origin's compacted history ended, and when it was taken bounds every
+    /// stamp inside it), then the *names* of the entries after it, which carry
+    /// their stamp and origin. Only this origin's newest entry is opened, for
+    /// its sequence and hash.
+    ///
+    /// `None` when a name cannot be understood, or the newest own entry cannot
+    /// be read: the caller then replays everything.
+    fn read_tip(&self) -> Result<Option<Tip>> {
+        let (header, _) = self.latest_snapshot_header()?;
+        let mut tip = Tip { clock: Hlc::ZERO, own: None };
+        let mut newest_own: Option<(String, PathBuf)> = None;
+        if let Some(header) = &header {
+            tip.clock = tip.clock.max(header.taken_at);
+            if let Some(w) = header.watermarks.get(&self.origin.0) {
+                if w.seq > 0 {
+                    tip.own = Some((w.seq, w.hash.clone()));
+                }
+            }
+        }
+        for entry in fs::read_dir(&self.changes_dir).with_context(|| format!("reading {}", self.changes_dir.display()))?.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_string) else { continue };
+            if !name.ends_with(".json") || is_sync_conflict_copy(&name) {
+                continue;
+            }
+            let Some((hlc, origin)) = parse_entry_name(&name) else { return Ok(None) };
+            tip.clock = tip.clock.max(hlc);
+            if origin == self.origin.0 && newest_own.as_ref().is_none_or(|(current, _)| name > *current) {
+                newest_own = Some((name, path));
+            }
+        }
+        if let Some((_, path)) = newest_own {
+            let Ok(bytes) = fs::read(&path) else { return Ok(None) };
+            let Ok(change) = Change::from_json(&bytes) else { return Ok(None) };
+            if tip.own.as_ref().is_none_or(|(seq, _)| change.seq > *seq) {
+                tip.own = Some((change.seq, change.hash));
+            }
+        }
+        Ok(Some(tip))
+    }
+
+    /// The newest snapshot's header alone (its first line).
+    fn latest_snapshot_header(&self) -> Result<(Option<SnapshotHeader>, ())> {
+        use std::io::BufRead;
+        let mut newest: Option<PathBuf> = None;
+        if let Ok(entries) = fs::read_dir(&self.snapshots_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                if newest.as_ref().is_none_or(|current| path.file_name() > current.file_name()) {
+                    newest = Some(path);
+                }
+            }
+        }
+        let Some(path) = newest else { return Ok((None, ())) };
+        let mut first = String::new();
+        std::io::BufReader::new(fs::File::open(&path).with_context(|| format!("reading {}", path.display()))?).read_line(&mut first)?;
+        if first.trim().is_empty() {
+            return Ok((None, ()));
+        }
+        let header: SnapshotHeader = serde_json::from_str(first.trim()).with_context(|| format!("reading the header of {}", path.display()))?;
+        Ok((Some(header), ()))
+    }
+
+    /// How many loose entry files the log holds (names only; nothing is read).
+    pub fn entry_count(&self) -> usize {
+        fs::read_dir(&self.changes_dir).map(|entries| entries.flatten().filter(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(".json"))).count()).unwrap_or(0)
+    }
+
+    /// Compacts ([`ChangeLog::compact`], with [`DEFAULT_RETENTION`]) when more
+    /// than `threshold` entries are lying around; otherwise does nothing.
+    /// `None` when no compaction was needed. Entries inside the retention
+    /// horizon are never touched, so on a young library this reports "nothing
+    /// to compact" however many entries there are.
+    pub fn compact_if_needed(&self, threshold: usize, now_ms: u64) -> Result<Option<CompactionReport>> {
+        if self.entry_count() <= threshold {
+            return Ok(None);
+        }
+        self.compact(DEFAULT_RETENTION, now_ms).map(Some)
     }
 
     pub fn origin(&self) -> &InstallId {
@@ -367,6 +501,12 @@ impl ChangeLog {
                 continue;
             }
             compactable_files.push(change);
+        }
+        // Nothing past the horizon: no new snapshot to write (it would only
+        // copy the old one), and nothing to delete.
+        if compactable_files.is_empty() {
+            report.retained = candidates.len();
+            return Ok(report);
         }
         candidates.extend(compactable_files.iter().cloned());
         candidates.sort_by(total_order);
@@ -703,6 +843,98 @@ mod tests {
         let replay = log.replay().unwrap();
         assert_eq!(replay.len(), 1);
         assert_eq!(replay.changes().next().unwrap().op, field("u1", "title", "Third"));
+    }
+
+    /// Opening reads the snapshot's header and the entry names, not the log:
+    /// it must land on exactly the tip a full replay finds -- own chain, clock
+    /// past every stamp (peers' too) -- with and without a snapshot.
+    #[test]
+    fn opening_from_the_tip_agrees_with_a_full_replay() {
+        let (dir, log) = log();
+        let a = append_at(&log, DAY_MS, 1, None, field("u1", "title", "First"));
+        let b = append_at(&log, 2 * DAY_MS, 2, Some(a.hash.clone()), field("u1", "title", "Second"));
+        append_at(&log, 90 * DAY_MS, 3, Some(b.hash.clone()), field("u1", "rating", "8"));
+        // A peer's entry, stamped later than ours.
+        let peer = Change::new(Hlc { wall_ms: 95 * DAY_MS, counter: 3 }, "peerpeerpeerpeer".to_string(), 7, None, field("u2", "title", "Theirs"));
+        fs::write(log.changes_dir.join(peer.file_name("abcdef12")), serde_json::to_vec(&peer).unwrap()).unwrap();
+
+        let check = |expect_snapshot: bool| {
+            let full = {
+                // The slow path, forced by hand.
+                let reopened = ChangeLog { changes_dir: log.changes_dir.clone(), snapshots_dir: log.snapshots_dir.clone(), origin: log.origin.clone(), state: Mutex::new(LocalState { clock: HlcClock::resuming_from(Hlc::ZERO), next_seq: 1, prev_hash: None }) };
+                let replay = reopened.replay().unwrap();
+                let mut state = reopened.state.lock().unwrap();
+                for change in replay.changes() {
+                    state.clock.observe(change.hlc);
+                    if change.origin == reopened.origin.0 && change.seq >= state.next_seq {
+                        state.next_seq = change.seq + 1;
+                        state.prev_hash = Some(change.hash.clone());
+                    }
+                }
+                (state.next_seq, state.prev_hash.clone(), state.clock.now())
+            };
+            let fast = ChangeLog::open(dir.path()).unwrap();
+            assert_eq!(fast.latest_snapshot_header().unwrap().0.is_some(), expect_snapshot);
+            let state = fast.state.lock().unwrap();
+            assert_eq!((state.next_seq, state.prev_hash.clone()), (full.0, full.1.clone()));
+            // `now()` is past everything on disk, in both.
+            drop(state);
+            let after = fast.state.lock().unwrap().clock.now();
+            assert!(after > Hlc { wall_ms: 95 * DAY_MS, counter: 3 }, "{after:?}");
+            assert!(full.2 > Hlc { wall_ms: 95 * DAY_MS, counter: 3 });
+        };
+        check(false);
+
+        // Everything older than the horizon goes into a snapshot; the
+        // recent entry and the peer's stay loose.
+        log.compact(DEFAULT_RETENTION, 100 * DAY_MS).unwrap();
+        check(true);
+        let reopened = ChangeLog::open(dir.path()).unwrap();
+        let next = reopened.append(field("u1", "title", "After")).unwrap();
+        assert_eq!(next.seq, 4, "the chain continues past the tip");
+    }
+
+    #[test]
+    fn a_tip_with_only_a_snapshot_still_continues_the_chain() {
+        let (dir, log) = log();
+        let a = append_at(&log, DAY_MS, 1, None, field("u1", "title", "First"));
+        append_at(&log, 2 * DAY_MS, 2, Some(a.hash.clone()), field("u1", "title", "Second"));
+        log.compact(DEFAULT_RETENTION, 100 * DAY_MS).unwrap();
+        assert_eq!(log.entry_count(), 0, "every loose entry was collapsed away");
+        let reopened = ChangeLog::open(dir.path()).unwrap();
+        let next = reopened.append(field("u1", "title", "Third")).unwrap();
+        assert_eq!(next.seq, 3);
+        assert!(reopened.verify().unwrap().is_clean());
+    }
+
+    #[test]
+    fn compact_if_needed_waits_for_the_threshold_and_respects_the_horizon() {
+        let (_dir, log) = log();
+        let mut prev = None;
+        for seq in 1..=5u64 {
+            let c = append_at(&log, DAY_MS * seq, seq, prev.clone(), field("u1", "title", &format!("T{seq}")));
+            prev = Some(c.hash);
+        }
+        assert!(log.compact_if_needed(5, 100 * DAY_MS).unwrap().is_none(), "at the threshold, not past it");
+        let report = log.compact_if_needed(4, 100 * DAY_MS).unwrap().expect("past it");
+        assert_eq!((report.dropped, report.retained), (4, 1));
+        // Nothing old left: past the threshold again, but nothing to do and no
+        // second snapshot written.
+        let snapshots = || fs::read_dir(&log.snapshots_dir).unwrap().count();
+        let before = snapshots();
+        let again = log.compact_if_needed(0, 100 * DAY_MS).unwrap();
+        assert!(again.is_none() || again.is_some_and(|r| r.dropped == 0));
+        assert_eq!(snapshots(), before);
+
+        // A young log is never compacted, however long.
+        let dir2 = tempfile::tempdir().unwrap();
+        let young = ChangeLog::open(dir2.path()).unwrap();
+        for seq in 1..=5u64 {
+            append_at(&young, 99 * DAY_MS + seq, seq, None, field("u1", "title", "x"));
+        }
+        let report = young.compact_if_needed(0, 100 * DAY_MS).unwrap().unwrap();
+        assert_eq!((report.dropped, report.within_horizon), (0, 5));
+        assert_eq!(young.entry_count(), 5, "inside the retention horizon: untouched");
     }
 
     #[test]

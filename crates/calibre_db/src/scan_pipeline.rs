@@ -114,6 +114,16 @@ pub struct PipelineOptions {
     /// for tests that need to cancel at an exact point (a cancel timed by
     /// a clock is a flaky test), and for anything that wants a heartbeat.
     pub after_batch: Option<std::sync::Arc<dyn Fn(&JobControl) + Send + Sync>>,
+    /// Which reader the PDF jobs use: the out-of-process worker pool when a
+    /// worker binary is found (the default), or always the in-process reader.
+    pub pdf_pool: crate::pdf_worker::PdfPoolChoice,
+    /// How many PDF worker processes, overriding `CALIBRE_OXIDE_PDF_WORKERS`
+    /// and the default (half the cores, at most 4). `Some(0)` means none: the
+    /// in-process reader.
+    pub pdf_workers: Option<usize>,
+    /// Width of covers rendered from PDFs during enrichment; `None` is
+    /// [`calibre_ebooks::pdf::rasterize::scan_cover_width`].
+    pub cover_width: Option<u32>,
 }
 
 impl PipelineOptions {
@@ -135,7 +145,7 @@ pub fn default_workers() -> usize {
 
 impl Default for PipelineOptions {
     fn default() -> Self {
-        PipelineOptions { workers: default_workers(), batch_size: 100, after_batch: None }
+        PipelineOptions { workers: default_workers(), batch_size: 100, after_batch: None, pdf_pool: Default::default(), pdf_workers: None, cover_width: None }
     }
 }
 
@@ -174,6 +184,11 @@ pub struct JobControl {
     /// When non-zero, the walk stops once it has seen this many files:
     /// a bounded look, for "how many untracked files are there, roughly".
     pub stop_after_seen: AtomicU64,
+    /// Wall time spent per named phase, in milliseconds (see
+    /// [`JobControl::add_time`]).
+    timings: Mutex<std::collections::BTreeMap<String, u64>>,
+    /// When set, a bounded walk also stops at this instant.
+    walk_deadline: Mutex<Option<std::time::Instant>>,
 }
 
 /// A point-in-time copy of a [`JobControl`], for the status route.
@@ -192,6 +207,10 @@ pub struct Progress {
     pub fingerprinted: u64,
     pub bytes_hashed: u64,
     pub file_opens: u64,
+    /// Where the time went, in milliseconds, by phase: `walk`, `drift`,
+    /// `index_hash`, `index_write`, `enrich_read`, `enrich_write`, `covers`,
+    /// `fingerprint`, `hash_backfill`. A phase that did not run is absent.
+    pub timings_ms: std::collections::BTreeMap<String, u64>,
 }
 
 impl JobControl {
@@ -211,7 +230,17 @@ impl JobControl {
     /// as many files as it was allowed.
     pub fn walk_limit_reached(&self) -> bool {
         let limit = self.stop_after_seen.load(Ordering::Relaxed);
-        limit > 0 && self.seen.load(Ordering::Relaxed) >= limit
+        (limit > 0 && self.seen.load(Ordering::Relaxed) >= limit) || self.walk_deadline.lock().unwrap().is_some_and(|d| std::time::Instant::now() >= d)
+    }
+
+    /// Makes a bounded walk stop after `budget` of wall time as well.
+    pub fn set_walk_budget(&self, budget: std::time::Duration) {
+        *self.walk_deadline.lock().unwrap() = Some(std::time::Instant::now() + budget);
+    }
+
+    /// Adds `elapsed` to the named phase's total.
+    pub fn add_time(&self, phase: &str, elapsed: std::time::Duration) {
+        *self.timings.lock().unwrap().entry(phase.to_string()).or_insert(0) += elapsed.as_millis() as u64;
     }
 
     pub fn set_phase(&self, phase: &str) {
@@ -234,6 +263,7 @@ impl JobControl {
             fingerprinted: load(&self.fingerprinted),
             bytes_hashed: load(&self.bytes_hashed),
             file_opens: load(&self.file_opens),
+            timings_ms: self.timings.lock().unwrap().clone(),
         }
     }
 }
@@ -342,7 +372,16 @@ pub fn index_files(cache: &Cache, library_path: &Path, report: &ScanReport, opti
         if control.is_cancelled() {
             break;
         }
-        let digests = parallel_map(chunk, options.workers, control, |file| hash_stream(&library_path.join(&file.relative_path), Some(control)));
+        let hash_started = std::time::Instant::now();
+        let digests = parallel_map(chunk, options.workers, control, |file| match report.precomputed.get(&file.relative_path) {
+            // Hashed by the drift pass, which had to read it to look for a
+            // moved file. Valid only for the size the walk saw.
+            Some(known) if known.size == file.facts.size => {
+                Ok(known.clone())
+            }
+            _ => hash_stream(&library_path.join(&file.relative_path), Some(control)),
+        });
+        control.add_time("index_hash", hash_started.elapsed());
 
         // Sorted (the walk sorts) and walked in order by this one thread,
         // so ids do not depend on which worker finished first.
@@ -384,7 +423,9 @@ pub fn index_files(cache: &Cache, library_path: &Path, report: &ScanReport, opti
             });
         }
 
+        let write_started = std::time::Instant::now();
         let results = register_batch_resilient(&items, |batch| cache.register_books_in_place(batch));
+        control.add_time("index_write", write_started.elapsed());
         for (item, result) in items.iter().zip(results) {
             match result {
                 Ok(id) => {
@@ -441,89 +482,199 @@ pub struct EnrichReport {
 /// Fills in only what is still the placeholder: a title that is still
 /// the filename, authors that are still "Unknown", a book with no cover.
 /// A book the user has edited in the meantime keeps their edits.
+///
+/// # PDFs and the worker pool
+///
+/// A PDF is read by PDFium, native code that can crash or hang on a bad file.
+/// When a PDF worker binary is available ([`crate::pdf_worker`]) PDFs are read
+/// in worker processes, in parallel: a crash or a timeout is recorded against
+/// that one book (it keeps its filename title and leaves the queue) and the
+/// pass goes on. If the content hash is known and the PDF has no fingerprint
+/// yet, the worker computes the fingerprint in the same open of the file.
+/// Without a worker binary the PDF is read in-process, as before.
+///
+/// Either way a PDF is marked *in flight* in the database before it is
+/// handed over. A run that died while reading one (a crash of this process
+/// rather than of a worker) finds the mark on its next start and records the
+/// book as crashed instead of trying the same file again.
+///
+/// # Writes
+///
+/// Reading is in small chunks, so a cancel is prompt; writing is in batches of
+/// [`PipelineOptions::batch_size`] books, one transaction and one change-log
+/// entry each ([`Cache::write_enrichment_batch`]).
 pub fn enrich_pending(cache: &Cache, options: &PipelineOptions, control: &JobControl) -> Result<EnrichReport> {
+    use crate::enrich_batch::EnrichmentWrite;
+
     control.set_phase("enriching");
     let library = cache.backend.library_path.clone();
-    let pending = cache.checksums().pending_enrichment()?;
-    control.total.store(pending.len() as u64, Ordering::Relaxed);
+    let store = cache.checksums();
     let mut report = EnrichReport::default();
 
-    // Small chunks: a cancel should not wait for a hundred PDF renders.
-    for chunk in pending.chunks((options.workers * 4).max(4)) {
-        if control.is_cancelled() {
-            break;
+    // Books a previous run was reading when it died.
+    for key in store.take_inflight("enrich")? {
+        if let Ok(book_id) = key.parse::<i32>() {
+            store.finish_enrichment(book_id)?;
+            control.errors.fetch_add(1, Ordering::Relaxed);
+            push_capped(&mut report.failed, (format!("book {book_id}"), "crashed: this PDF was being read when a previous run died, so it was not tried again".to_string()));
         }
-        let extracted = parallel_map(chunk, options.workers, control, |(_, format, name, folder)| match format_file_path(&library, folder, name, format) {
-            None => Err(None),
-            Some(path) => calibre_ebooks::metadata::get_metadata(&path).map_err(Some),
-        });
+    }
 
-        for ((book_id, _, name, folder), result) in chunk.iter().zip(extracted) {
-            let Some(result) = result else { continue }; // cancelled
+    let pending = store.pending_enrichment()?;
+    control.total.store(pending.len() as u64, Ordering::Relaxed);
+    let pool = if pending.iter().any(|(_, format, _, _)| format.eq_ignore_ascii_case("pdf")) { options.pdf_pool.resolve(options.pdf_workers) } else { None };
+    let read_threads = pool.as_ref().map_or(options.workers, |p| p.workers().max(options.workers));
+    let cover_width = options.cover_width.unwrap_or_else(calibre_ebooks::pdf::rasterize::scan_cover_width);
+
+    enum Read {
+        /// The file is not on disk.
+        Missing,
+        /// What the file says (possibly nothing).
+        Meta(Box<calibre_ebooks::metadata::MetaInformation>),
+        /// The reader died or hung on it.
+        Crashed(String),
+    }
+
+    let mut staged: Vec<EnrichmentWrite> = Vec::new();
+    let mut crashed: std::collections::HashSet<i32> = std::collections::HashSet::new();
+
+    let flush = |staged: &mut Vec<EnrichmentWrite>, crashed: &std::collections::HashSet<i32>, report: &mut EnrichReport| {
+        if staged.is_empty() {
+            return;
+        }
+        let results = cache.write_enrichment_batch(staged, Some(control));
+        for (write, result) in staged.iter().zip(results) {
+            if !crashed.contains(&write.book_id) {
+                control.enriched.fetch_add(1, Ordering::Relaxed);
+            }
             match result {
-                Err(None) => {
-                    control.errors.fetch_add(1, Ordering::Relaxed);
-                    push_capped(&mut report.missing, format!("{folder}/{name}").trim_start_matches('/').to_string());
-                }
-                Err(Some(_)) => {
-                    // Unreadable metadata: the filename title is final.
-                    cache.checksums().finish_enrichment(*book_id)?;
-                    report.nothing_to_add += 1;
-                    control.enriched.fetch_add(1, Ordering::Relaxed);
-                }
-                Ok(metadata) => {
-                    match apply_enrichment(cache, *book_id, name, &metadata) {
-                        Ok(true) => report.enriched += 1,
-                        Ok(false) => report.nothing_to_add += 1,
-                        Err(e) => {
-                            // One book's metadata must not stop the library's
-                            // scan. Its filename title stays; it leaves the
-                            // queue so a rerun does not trip on it forever.
-                            control.errors.fetch_add(1, Ordering::Relaxed);
-                            push_capped(&mut report.failed, (format!("{folder}/{name}").trim_start_matches('/').to_string(), format!("{e:#}")));
-                        }
+                Ok(true) => report.enriched += 1,
+                Ok(false) => {
+                    if !crashed.contains(&write.book_id) {
+                        report.nothing_to_add += 1
                     }
-                    cache.checksums().finish_enrichment(*book_id)?;
-                    control.enriched.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    // One book's metadata must not stop the library's scan.
+                    // Its filename title stays; it leaves the queue so a
+                    // rerun does not trip on it forever.
+                    control.errors.fetch_add(1, Ordering::Relaxed);
+                    push_capped(&mut report.failed, (write.label.clone(), format!("{e:#}")));
+                    // The batch failed as a whole if the commit did; make sure
+                    // none of these stay queued to fail again.
+                    let _ = cache.checksums().finish_enrichment(write.book_id);
                 }
             }
         }
+        staged.clear();
+    };
+
+    // Small chunks: a cancel should not wait for a hundred PDF renders.
+    for chunk in pending.chunks((read_threads * 4).max(4)) {
+        if control.is_cancelled() {
+            break;
+        }
+        let read_started = std::time::Instant::now();
+        let extracted = parallel_map(chunk, read_threads, control, |(book_id, format, name, folder)| -> Read {
+            let Some(path) = format_file_path(&library, folder, name, format) else { return Read::Missing };
+            if !format.eq_ignore_ascii_case("pdf") {
+                return match calibre_ebooks::metadata::get_metadata(&path) {
+                    Ok(mi) => Read::Meta(Box::new(mi)),
+                    // Unreadable metadata: the filename title is final.
+                    Err(_) => Read::Meta(Box::default()),
+                };
+            }
+            let key = book_id.to_string();
+            let hash = store.recorded_identity(*book_id, "format", format).ok().and_then(|(hash, _)| hash);
+            let wants_fingerprint = pool.is_some() && hash.as_deref().is_some_and(|h| !store.has_pdf_fingerprint(h).unwrap_or(true));
+            let _ = store.mark_inflight("enrich", &key);
+            if wants_fingerprint {
+                let _ = store.mark_inflight("fingerprint", hash.as_deref().unwrap_or_default());
+            }
+            let finish = || {
+                let _ = store.clear_inflight("enrich", &key);
+                if let Some(h) = hash.as_deref().filter(|_| wants_fingerprint) {
+                    let _ = store.clear_inflight("fingerprint", h);
+                }
+            };
+            let in_process = || calibre_ebooks::metadata::pdf::get_metadata_from_path_at(&path, Some(cover_width)).map(Box::new).map(Read::Meta).unwrap_or_else(|_| Read::Meta(Box::default()));
+            let Some(pool) = pool.as_ref() else {
+                let out = in_process();
+                finish();
+                return out;
+            };
+            let reply = pool.run(crate::pdf_worker::Request { id: 0, path: path.to_string_lossy().to_string(), cover_width: Some(cover_width), fingerprint: wants_fingerprint });
+            let out = match reply {
+                crate::pdf_worker::Reply::Done(resp) => {
+                    if resp.unavailable || resp.error.is_some() {
+                        // PDFium could not read it (or is not there). The
+                        // stream reader may still find a title; PDFium is not
+                        // tried again in this process.
+                        let why = resp.error.clone().unwrap_or_default();
+                        Read::Meta(calibre_ebooks::metadata::pdf::get_metadata_without_pdfium(&path, &why).map(Box::new).unwrap_or_default())
+                    } else {
+                        if let (Some(h), true) = (hash.as_deref(), wants_fingerprint) {
+                            if let Some(fp) = &resp.fingerprint {
+                                let _ = store.record_pdf_fingerprint(h, &Ok(fp.clone()));
+                            } else if let Some(why) = &resp.fingerprint_error {
+                                let _ = store.record_pdf_fingerprint(h, &Err(why.clone()));
+                            }
+                        }
+                        let info = resp.info.clone().unwrap_or_default().into();
+                        Read::Meta(Box::new(calibre_ebooks::metadata::pdf::metadata_from_pdfium_info(info, resp.cover())))
+                    }
+                }
+                reply @ (crate::pdf_worker::Reply::Crashed(_) | crate::pdf_worker::Reply::TimedOut) => {
+                    let why = reply.failure_reason().unwrap_or_default();
+                    if let (Some(h), true) = (hash.as_deref(), wants_fingerprint) {
+                        let _ = store.record_pdf_fingerprint(h, &Err(why.clone()));
+                    }
+                    Read::Crashed(why)
+                }
+                crate::pdf_worker::Reply::SpawnFailed(why) => {
+                    log::warn!("the PDF worker could not be started ({why}); reading in-process");
+                    in_process()
+                }
+            };
+            finish();
+            out
+        });
+        control.add_time("enrich_read", read_started.elapsed());
+
+        for ((book_id, _, name, folder), result) in chunk.iter().zip(extracted) {
+            let Some(result) = result else { continue }; // cancelled
+            let display = format!("{folder}/{name}").trim_start_matches('/').to_string();
+            match result {
+                Read::Missing => {
+                    control.errors.fetch_add(1, Ordering::Relaxed);
+                    push_capped(&mut report.missing, display);
+                }
+                Read::Crashed(why) => {
+                    control.errors.fetch_add(1, Ordering::Relaxed);
+                    push_capped(&mut report.failed, (display.clone(), why));
+                    crashed.insert(*book_id);
+                    staged.push(EnrichmentWrite { book_id: *book_id, label: display, stem: name.clone(), ..Default::default() });
+                }
+                Read::Meta(metadata) => {
+                    // Junk (`... print job`, `Microsoft Word - x.doc`, a bare
+                    // filename) is treated as absent so the filename title
+                    // stays; see `junk_metadata`.
+                    let title = crate::junk_metadata::clean_title(&metadata.title);
+                    let authors: Vec<String> = crate::junk_metadata::clean_authors(&metadata.authors).into_iter().filter(|a| a != "Unknown").collect();
+                    let (_, cover) = &metadata.cover_data;
+                    staged.push(EnrichmentWrite { book_id: *book_id, label: display, stem: name.clone(), title, authors, cover: (!cover.is_empty()).then(|| cover.clone()) });
+                }
+            }
+        }
+        if staged.len() >= options.batch_size.max(1) {
+            flush(&mut staged, &crashed, &mut report);
+        }
         options.batch_done(control);
     }
+    flush(&mut staged, &crashed, &mut report);
     report.cancelled = control.is_cancelled();
     report.remaining = cache.checksums().pending_enrichment()?.len();
     Ok(report)
-}
-
-/// Writes what the file knows over what is still a placeholder. Through
-/// `set_field` and `set_cover`, so every change reaches the change log.
-fn apply_enrichment(cache: &Cache, book_id: i32, stem: &str, metadata: &calibre_ebooks::metadata::MetaInformation) -> Result<bool> {
-    let mut changed = false;
-
-    // Junk (`... print job`, `Microsoft Word - x.doc`, a bare filename) is
-    // treated as absent so the filename title stays; see `junk_metadata`.
-    let cleaned = crate::junk_metadata::clean_title(&metadata.title);
-    if let Some(title) = cleaned.as_deref().filter(|t| *t != "Unknown" && *t != stem) {
-        if cache.field_for(book_id, "title")?.as_deref() == Some(stem) {
-            cache.set_field(book_id, "title", title)?;
-            changed = true;
-        }
-    }
-
-    let real_authors: Vec<String> = crate::junk_metadata::clean_authors(&metadata.authors).into_iter().filter(|a| a != "Unknown").collect();
-    if !real_authors.is_empty() && cache.field_for(book_id, "authors")?.as_deref().is_none_or(|a| a == "Unknown") {
-        cache.set_field(book_id, "authors", &real_authors.join(" & "))?;
-        changed = true;
-    }
-
-    let (_, cover) = &metadata.cover_data;
-    if !cover.is_empty() && !cache.has_cover(book_id)? {
-        match crate::covers::set_cover(cache, book_id, cover) {
-            Ok(()) => changed = true,
-            Err(e) => log::warn!("book {book_id} was enriched but its cover could not be stored: {e}"),
-        }
-    }
-    Ok(changed)
 }
 
 /// What the hash backfill did.
@@ -552,6 +703,7 @@ pub struct BackfillReport {
 /// valid on its own, so there is nothing half-done to discard.
 pub fn backfill_hashes(cache: &Cache, options: &PipelineOptions, control: &JobControl) -> Result<BackfillReport> {
     control.set_phase("hashing");
+    let started = std::time::Instant::now();
     let library = cache.backend.library_path.clone();
     let todo = cache.checksums().formats_without_hash()?;
     control.total.store(todo.len() as u64, Ordering::Relaxed);
@@ -595,6 +747,7 @@ pub fn backfill_hashes(cache: &Cache, options: &PipelineOptions, control: &JobCo
         report.hashed += records.len();
         options.batch_done(control);
     }
+    control.add_time("hash_backfill", started.elapsed());
     report.cancelled = control.is_cancelled();
     Ok(report)
 }
@@ -630,7 +783,7 @@ mod tests {
     }
 
     fn options(workers: usize, batch_size: usize) -> PipelineOptions {
-        PipelineOptions { workers, batch_size, after_batch: None }
+        PipelineOptions { workers, batch_size, after_batch: None, ..Default::default() }
     }
 
     /// Everything a rebuild has to reproduce, as sorted lines.
@@ -834,6 +987,7 @@ mod tests {
                     hook_control.cancel();
                 }
             })),
+            ..Default::default()
         };
         let first = index_files(&cache, dir.path(), &report, &cancelling, &control);
         assert!(first.cancelled);
@@ -1022,5 +1176,219 @@ mod tests {
         assert!(indexed.added.is_empty());
         assert_eq!(indexed.failed.len(), 1);
         assert!(indexed.failed[0].1.contains("changed"));
+    }
+
+    // -----------------------------------------------------------------
+    // Tranche 13: worker pool, batched enrichment, compaction, timings
+    // -----------------------------------------------------------------
+
+    fn pool_options(workers: usize, batch_size: usize) -> PipelineOptions {
+        PipelineOptions {
+            workers,
+            batch_size,
+            pdf_pool: crate::pdf_worker::PdfPoolChoice::Pool(std::sync::Arc::new(crate::pdf_worker::tests::fake_pool(workers, std::time::Duration::from_secs(60)))),
+            ..PipelineOptions::default()
+        }
+    }
+
+    fn inflight_rows(cache: &Cache) -> i64 {
+        count(cache, "SELECT COUNT(*) FROM checksums_db.inflight")
+    }
+
+    fn change_files(dir: &Path) -> usize {
+        std::fs::read_dir(dir.join(crate::constants::LIBRARY_HANDLE_DIR_NAME).join("changes")).unwrap().count()
+    }
+
+    /// PDFs are read by worker processes; a file that kills its worker costs
+    /// that one book (it keeps its filename title and leaves the queue, and
+    /// its fingerprint is recorded as crashed), everything else is enriched,
+    /// the PDFs' fingerprints are computed in the same read, and the whole
+    /// chunk is written as one change-log entry that a rebuild reproduces.
+    #[test]
+    fn a_pool_enriches_pdfs_and_a_crash_costs_one_book() {
+        let (dir, cache) = library();
+        for name in ["good-a", "good-b", "good-c", "crash-d", "plain-e"] {
+            write(&dir.path().join(format!("shelf/{name}.pdf")), format!("%PDF-1.4 {name}").as_bytes());
+        }
+        index_files(&cache, dir.path(), &walked(dir.path()), &options(2, 100), &JobControl::default());
+        let entries_after_indexing = change_files(dir.path());
+
+        let control = JobControl::default();
+        let report = enrich_pending(&cache, &pool_options(2, 2), &control).unwrap();
+        assert_eq!(report.remaining, 0, "{report:?}");
+        assert_eq!(report.enriched, 3, "{report:?}");
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert!(report.failed[0].0.contains("crash-d") && report.failed[0].1.starts_with("crashed:"), "{report:?}");
+
+        let title_of = |name: &str| {
+            let id = cache.book_for_file(&format!("shelf/{name}.pdf")).unwrap().unwrap();
+            (id, cache.field_for(id, "title").unwrap().unwrap(), cache.field_for(id, "authors").unwrap().unwrap(), cache.has_cover(id).unwrap())
+        };
+        assert_eq!(title_of("good-a").1, "Title of good-a");
+        assert_eq!((title_of("good-b").2, title_of("good-b").3), ("An Author".to_string(), true));
+        let (crash_id, crash_title, crash_author, crash_cover) = title_of("crash-d");
+        assert_eq!((crash_title.as_str(), crash_author.as_str(), crash_cover), ("crash-d", "Unknown", false), "the poison file keeps its placeholders");
+        let (_, plain_title, _, _) = title_of("plain-e");
+        assert_eq!(plain_title, "plain-e", "a file with nothing to say keeps its filename title");
+
+        // The fingerprints came out of the same reads.
+        let store = cache.checksums();
+        for name in ["good-a", "good-b", "good-c"] {
+            let id = cache.book_for_file(&format!("shelf/{name}.pdf")).unwrap().unwrap();
+            let (hash, _) = store.recorded_identity(id, "format", "PDF").unwrap();
+            assert!(store.has_pdf_fingerprint(&hash.unwrap()).unwrap(), "{name} was fingerprinted by the enrichment read");
+        }
+        let (crash_hash, _) = store.recorded_identity(crash_id, "format", "PDF").unwrap();
+        assert!(store.pdf_fingerprint_error(&crash_hash.unwrap()).unwrap().unwrap().starts_with("crashed:"));
+        assert_eq!(inflight_rows(&cache), 0, "nothing is left marked");
+
+        // Batched writes: the 5 books are one chunk, so one log entry beyond
+        // the indexing batch -- not a file per field.
+        assert_eq!(change_files(dir.path()), entries_after_indexing + 1);
+        assert!(control.snapshot().timings_ms.contains_key("enrich_read") && control.snapshot().timings_ms.contains_key("enrich_write") && control.snapshot().timings_ms.contains_key("covers"));
+        let before = snapshot(&cache);
+        let (_rebuilt_dir, rebuilt) = rebuild_from_log_only(dir.path());
+        assert_eq!(snapshot(&rebuilt), before, "a rebuild from the change log reproduces the batched enrichment");
+        assert!(cache.backend.change_log().unwrap().verify().unwrap().is_clean());
+    }
+
+    /// A run that died while a PDF was being read leaves it marked; the next
+    /// run records that book as crashed and does not read the file again.
+    #[test]
+    fn a_book_left_in_flight_by_a_dead_run_is_recorded_as_crashed_not_retried() {
+        let (dir, cache) = library();
+        write(&dir.path().join("good-a.pdf"), b"%PDF-1.4 a");
+        write(&dir.path().join("good-b.pdf"), b"%PDF-1.4 b");
+        index_files(&cache, dir.path(), &walked(dir.path()), &options(1, 100), &JobControl::default());
+        let a = cache.book_for_file("good-a.pdf").unwrap().unwrap();
+        cache.checksums().mark_inflight("enrich", &a.to_string()).unwrap();
+
+        let report = enrich_pending(&cache, &pool_options(1, 100), &JobControl::default()).unwrap();
+        assert_eq!(report.remaining, 0);
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert!(report.failed[0].1.starts_with("crashed:") && report.failed[0].0 == format!("book {a}"), "{report:?}");
+        assert_eq!(cache.field_for(a, "title").unwrap().as_deref(), Some("good-a"), "the marked file was not read");
+        let b = cache.book_for_file("good-b.pdf").unwrap().unwrap();
+        assert_eq!(cache.field_for(b, "title").unwrap().as_deref(), Some("Title of good-b"));
+        assert_eq!(inflight_rows(&cache), 0);
+    }
+
+    /// Without a worker, a PDF is read in-process, and it is marked in flight
+    /// around the read all the same (a crash of this very process is what the
+    /// mark exists for).
+    #[test]
+    fn in_process_pdf_reads_are_marked_and_cleared() {
+        let (dir, cache) = library();
+        write(&dir.path().join("junk.pdf"), b"%PDF-1.4 not really a pdf");
+        index_files(&cache, dir.path(), &walked(dir.path()), &options(1, 100), &JobControl::default());
+        let in_process = PipelineOptions { pdf_pool: crate::pdf_worker::PdfPoolChoice::InProcess, ..options(1, 100) };
+        let report = enrich_pending(&cache, &in_process, &JobControl::default()).unwrap();
+        assert_eq!((report.remaining, report.failed.len()), (0, 0), "{report:?}");
+        assert_eq!(inflight_rows(&cache), 0);
+    }
+
+    /// The batched write must leave the library exactly as writing field by
+    /// field did.
+    #[test]
+    fn batched_enrichment_equals_per_field_writes() {
+        let html = |title: &str, author: &str| format!("<html><head><title>{title}</title><meta name=\"author\" content=\"{author}\"/></head><body>x</body></html>");
+        let files = [("a1.html", html("Alpha", "Ann Author")), ("a2.html", html("Beta", "Bob & Cy")), ("a3.html", html("Gamma", "Ann Author")), ("a4.html", html("scan0004", "Unknown"))];
+
+        let (dir_batched, batched) = library();
+        let (dir_fields, fields) = library();
+        for (dir, _) in [(&dir_batched, 0), (&dir_fields, 1)] {
+            for (name, body) in &files {
+                write(&dir.path().join(name), body.as_bytes());
+            }
+        }
+        for (dir, cache) in [(&dir_batched, &batched), (&dir_fields, &fields)] {
+            index_files(cache, dir.path(), &walked(dir.path()), &options(1, 100), &JobControl::default());
+        }
+        // The user edits one book between the passes: it must be left alone.
+        for cache in [&batched, &fields] {
+            let id = cache.book_for_file("a3.html").unwrap().unwrap();
+            cache.set_field(id, "title", "Mine").unwrap();
+        }
+
+        // Batched: the pass itself, two books to a batch.
+        enrich_pending(&batched, &options(1, 2), &JobControl::default()).unwrap();
+
+        // Field by field: what the pass used to do.
+        for (name, _) in &files {
+            let id = fields.book_for_file(name).unwrap().unwrap();
+            let stem = name.trim_end_matches(".html");
+            let meta = calibre_ebooks::metadata::get_metadata(&dir_fields.path().join(name)).unwrap();
+            if let Some(title) = crate::junk_metadata::clean_title(&meta.title).filter(|t| t != "Unknown" && t != stem) {
+                if fields.field_for(id, "title").unwrap().as_deref() == Some(stem) {
+                    fields.set_field(id, "title", &title).unwrap();
+                }
+            }
+            let authors: Vec<String> = crate::junk_metadata::clean_authors(&meta.authors).into_iter().filter(|a| a != "Unknown").collect();
+            if !authors.is_empty() && fields.field_for(id, "authors").unwrap().as_deref().is_none_or(|a| a == "Unknown") {
+                fields.set_field(id, "authors", &authors.join(" & ")).unwrap();
+            }
+            fields.checksums().finish_enrichment(id).unwrap();
+        }
+
+        let normalise = |lines: Vec<String>| -> Vec<String> {
+            // uuids and paths differ between two libraries; compare the rest.
+            let mut out: Vec<String> = lines.into_iter().map(|l| l.splitn(2, '|').nth(1).unwrap().to_string()).collect();
+            out.sort();
+            out
+        };
+        assert_eq!(normalise(snapshot(&batched)), normalise(snapshot(&fields)));
+        assert_eq!(count(&batched, "SELECT COUNT(*) FROM checksums_db.enrichment_queue"), 0);
+
+        let before = snapshot(&batched);
+        let (_rebuilt_dir, rebuilt) = rebuild_from_log_only(dir_batched.path());
+        assert_eq!(snapshot(&rebuilt), before);
+    }
+
+    /// A log compacted after a big scan, reopened from its snapshot and tail,
+    /// still rebuilds the library -- including edits made after the reopen.
+    #[test]
+    fn a_compacted_and_reopened_log_still_rebuilds_the_library() {
+        let (dir, cache) = library();
+        fill(dir.path(), 40);
+        index_files(&cache, dir.path(), &walked(dir.path()), &options(2, 10), &JobControl::default());
+        enrich_pending(&cache, &PipelineOptions { pdf_pool: crate::pdf_worker::PdfPoolChoice::InProcess, ..options(2, 10) }, &JobControl::default()).unwrap();
+        let id = cache.book_for_file("shelf1/book0001.pdf").unwrap().unwrap();
+        cache.set_field(id, "title", "Before Compaction").unwrap();
+        cache.set_field(id, "title", "Edited Twice").unwrap();
+
+        let log = cache.backend.change_log().unwrap();
+        let loose_before = log.entry_count();
+        // Everything is past the horizon at this "now".
+        let report = log.compact_if_needed(0, u64::MAX / 2).unwrap().expect("past the threshold");
+        assert!(report.dropped >= 1, "the superseded title write is collapsed: {report:?}");
+        assert_eq!(log.entry_count(), 0, "{loose_before} loose entries became a snapshot");
+        drop(log);
+        drop(cache);
+
+        // Reopened: the tip comes from the snapshot header alone.
+        let reopened = Cache::new(dir.path()).unwrap();
+        reopened.set_field(id, "title", "After Reopen").unwrap();
+        let log = reopened.backend.change_log().unwrap();
+        assert!(log.verify().unwrap().is_clean(), "{:?}", log.verify().unwrap());
+
+        let before = snapshot(&reopened);
+        let (_rebuilt_dir, rebuilt) = rebuild_from_log_only(dir.path());
+        assert_eq!(snapshot(&rebuilt), before);
+        assert!(before.iter().any(|l| l.contains("After Reopen")));
+    }
+
+    /// Every phase of a scan reports where its time went.
+    #[test]
+    fn a_scan_reports_per_phase_timings() {
+        let (dir, cache) = library();
+        write(&dir.path().join("a.html"), b"<html><head><title>T</title></head><body>x</body></html>");
+        let control = JobControl::default();
+        let options = PipelineOptions { pdf_pool: crate::pdf_worker::PdfPoolChoice::InProcess, ..options(1, 10) };
+        crate::scan::rescan_files(&cache, SystemTime::now() + Duration::from_secs(3600), &options, &control).unwrap();
+        enrich_pending(&cache, &options, &control).unwrap();
+        let timings = control.snapshot().timings_ms;
+        for phase in ["walk", "drift", "index_hash", "index_write", "enrich_read", "enrich_write", "covers"] {
+            assert!(timings.contains_key(phase), "no {phase} timing in {timings:?}");
+        }
     }
 }

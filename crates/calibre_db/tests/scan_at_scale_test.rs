@@ -22,7 +22,7 @@ fn open() -> (CalibreFixture, Cache) {
 }
 
 fn options(workers: usize, batch_size: usize) -> PipelineOptions {
-    PipelineOptions { workers, batch_size, after_batch: None }
+    PipelineOptions { workers, batch_size, after_batch: None, ..Default::default() }
 }
 
 fn format_rows(cache: &Cache) -> i64 {
@@ -117,6 +117,7 @@ fn backfill_cancels_and_resumes_where_it_stopped() {
         workers: 2,
         batch_size: 2,
         after_batch: Some(std::sync::Arc::new(move |_: &JobControl| hook.cancel())),
+        ..Default::default()
     };
     let first = backfill_hashes(&cache, &cancelling, &control).unwrap();
     assert!(first.cancelled);

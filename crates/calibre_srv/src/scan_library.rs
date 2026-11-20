@@ -354,4 +354,66 @@ mod tests {
         let (status, _) = post_json(&router, "/scan-library/no-such-library").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
+
+    fn html_book(dir: &std::path::Path, name: &str, title: &str) {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("<html><head><title>{title}</title><meta name=\"author\" content=\"Real Author\"/></head><body>x</body></html>")).unwrap();
+        make_settled(&path);
+    }
+
+    /// `?enrich=false` indexes and stops; the queue is drained later by
+    /// `/enrich-library`. Every report says where the time went.
+    #[tokio::test]
+    async fn enrich_false_defers_the_metadata_pass_and_reports_timings() {
+        let (dir, router) = test_app();
+        html_book(dir.path(), "scan001.html", "Real Title");
+
+        let (status, body) = post_json(&router, "/scan-library/default?wait=true&enrich=false").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["added"].as_array().unwrap().len(), 1, "{body}");
+        assert_eq!(body["enrichment_deferred"], true, "{body}");
+        assert!(body.get("enrichment").is_none(), "{body}");
+        for phase in ["walk", "drift", "index_hash", "index_write"] {
+            assert!(body["timings_ms"][phase].is_number(), "no {phase} in {body}");
+        }
+        let (_, ajax) = get_json(&router, "/ajax/book/1").await;
+        assert_eq!(ajax["title"], "scan001", "the title is still the filename: {ajax}");
+
+        let (_, enriched) = post_json(&router, "/enrich-library/default?wait=true").await;
+        assert_eq!(enriched["enriched"], 1, "{enriched}");
+        assert!(enriched["timings_ms"]["enrich_write"].is_number(), "{enriched}");
+        let (_, ajax) = get_json(&router, "/ajax/book/1").await;
+        assert_eq!(ajax["title"], "Real Title", "{ajax}");
+    }
+
+    /// The chained job runs every stage, and a rerun picks up at the stage the
+    /// last one reached.
+    #[tokio::test]
+    async fn prepare_chains_the_stages_and_resumes_where_it_stopped() {
+        let (dir, router) = test_app();
+        html_book(dir.path(), "a.html", "Alpha Title");
+
+        let (status, body) = post_json(&router, "/prepare-library/default?wait=true").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["finished"], true, "{body}");
+        assert_eq!(body["started_at_stage"], "scan");
+        for stage in ["scan", "hash", "fingerprint", "dedupe"] {
+            assert!(body["stages"][stage].is_object(), "no {stage} in {body}");
+        }
+        assert_eq!(body["stages"]["scan"]["added"].as_array().unwrap().len(), 1, "{body}");
+        let (_, status_body) = get_json(&router, "/prepare-library/default").await;
+        assert_eq!(status_body["stage"], "scan", "a finished chain starts over at the scan: {status_body}");
+
+        // A run that stopped at the fingerprint stage resumes there: no walk.
+        std::fs::write(dir.path().join(".calibre-oxide/prepare-stage.json"), r#"{"stage":"fingerprint"}"#).unwrap();
+        let (_, resumed) = post_json(&router, "/prepare-library/default?wait=true").await;
+        assert_eq!(resumed["started_at_stage"], "fingerprint", "{resumed}");
+        assert!(resumed["stages"]["scan"].is_null() && resumed["stages"]["hash"].is_null(), "{resumed}");
+        assert!(resumed["stages"]["dedupe"].is_object(), "{resumed}");
+
+        // `restart=true` ignores the persisted stage.
+        std::fs::write(dir.path().join(".calibre-oxide/prepare-stage.json"), r#"{"stage":"dedupe"}"#).unwrap();
+        let (_, restarted) = post_json(&router, "/prepare-library/default?wait=true&restart=true").await;
+        assert_eq!(restarted["started_at_stage"], "scan", "{restarted}");
+    }
 }
