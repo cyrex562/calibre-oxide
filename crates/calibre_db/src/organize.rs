@@ -351,6 +351,26 @@ fn move_files(cache: &Cache, files: &[(String, String)]) -> Result<()> {
     Ok(())
 }
 
+/// A cover kept the calibre way, as `<book folder>/cover.jpg` (absorbed calibre
+/// libraries), is found through `books.path`. The move leaves `cover.jpg` where
+/// it is (the folder may be shared), so once the path changes the cover would be
+/// lost. Copy it to the sidecar store first; `covers::cover_path` then finds it
+/// there after the move, and the legacy one again after an undo.
+fn keep_cover(cache: &Cache, book_id: i32) -> Result<()> {
+    let Some(legacy) = crate::covers::legacy_cover_path(cache, book_id)?.filter(|p| p.is_file()) else {
+        return Ok(());
+    };
+    let sidecar = crate::covers::sidecar_cover_path(cache, book_id)?;
+    if sidecar.is_file() {
+        return Ok(());
+    }
+    if let Some(parent) = sidecar.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(&legacy, &sidecar).with_context(|| format!("copying {} to {}", legacy.display(), sidecar.display()))?;
+    Ok(())
+}
+
 fn record(cache: &Cache, book_id: i32, path: &str, names: &BTreeMap<String, String>, current_path: &str) -> Result<()> {
     for (format, stem) in names {
         cache.set_format_name(book_id, format, stem)?;
@@ -374,6 +394,10 @@ pub fn execute(cache: &Cache, plan: &OrganizePlan, control: &JobControl) -> Resu
             break;
         }
         let pairs: Vec<(String, String)> = book.files.iter().map(|f| (f.from.clone(), f.to.clone())).collect();
+        if let Err(e) = keep_cover(cache, book.book_id) {
+            report.failed.push(Skipped { book_id: book.book_id, reason: format!("could not keep its cover: {e:#}") });
+            continue;
+        }
         if let Err(e) = move_files(cache, &pairs) {
             report.failed.push(Skipped { book_id: book.book_id, reason: format!("{e:#}") });
             continue;
@@ -527,6 +551,27 @@ mod tests {
         assert_eq!(cache.format_files(alpha).unwrap(), vec![("Alpha".to_string(), "PDF".to_string())]);
         // Nothing left to do.
         assert!(super::plan(&cache, "Sorted/{title}", &Scope::Ids(vec![alpha])).unwrap().books.is_empty());
+    }
+
+    /// An absorbed calibre book keeps its cover as `<folder>/cover.jpg`, found
+    /// through `books.path`. Organizing leaves that file in place, so the cover
+    /// must still resolve after the move (and after an undo).
+    #[test]
+    fn a_calibre_style_cover_survives_the_move_and_the_undo() {
+        let (dir, cache) = library();
+        write(&dir.path().join("inbox/Alpha.pdf"), b"%PDF alpha");
+        write(&dir.path().join("inbox/cover.jpg"), b"\xff\xd8 alpha cover");
+        index(dir.path(), &cache);
+        let alpha = book_with_title(&cache, "Alpha");
+        assert_eq!(std::fs::read(crate::covers::cover_path(&cache, alpha).unwrap()).unwrap(), b"\xff\xd8 alpha cover");
+
+        let plan = plan(&cache, "Sorted/{title}", &Scope::Ids(vec![alpha])).unwrap();
+        let report = execute(&cache, &plan, &JobControl::new()).unwrap();
+        assert_eq!(report.books_moved, 1, "{report:?}");
+        assert_eq!(std::fs::read(crate::covers::cover_path(&cache, alpha).unwrap()).unwrap(), b"\xff\xd8 alpha cover", "the cover is still found after the move");
+
+        undo(&cache, &report.run_id, &JobControl::new()).unwrap();
+        assert_eq!(std::fs::read(crate::covers::cover_path(&cache, alpha).unwrap()).unwrap(), b"\xff\xd8 alpha cover", "and after the undo");
     }
 
     #[test]
