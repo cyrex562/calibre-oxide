@@ -628,13 +628,25 @@ fn titles_differ_by_designator(a: &str, b: &str) -> bool {
     let a_only: Vec<&str> = a_words.iter().filter(|w| !b_words.contains(w)).copied().collect();
     let b_only: Vec<&str> = b_words.iter().filter(|w| !a_words.contains(w)).copied().collect();
     let distinguishing = |w: &&str| is_number_token(w) || VOLUME_WORDS.contains(w) || (w.chars().count() == 1 && *w != "a");
-    if a_only.iter().chain(&b_only).any(distinguishing) {
+    // A *conflict* needs a designator on **both** sides: `02` vs `03`,
+    // `1895` vs `1902`, `A to H` vs `P to Z`. A designator on one side only
+    // (`... (1)`, `4e`, `2022`) is an extra marker on a copy of the same thing.
+    if a_only.iter().any(distinguishing) && b_only.iter().any(distinguishing) {
+        return true;
+    }
+    // `vol 1` vs `vol supplement`: a volume word followed by different values.
+    let values = |words: &[&str]| -> HashSet<String> { words.windows(2).filter(|w| VOLUME_WORDS.contains(&w[0])).map(|w| w[1].to_string()).collect() };
+    let (av, bv) = (values(&a_words), values(&b_words));
+    if av.difference(&bv).next().is_some() && bv.difference(&av).next().is_some() {
         return true;
     }
     // Short acronym-like words that differ on *both* sides (`AWN` / `CWN`
-    // Character Sheet). One side only is just extra words (`... PF Version`).
-    let acronym = |w: &&str| (2..=4).contains(&w.chars().count()) && w.chars().all(|c| c.is_alphabetic()) && !SHORT_FUNCTION_WORDS.contains(w);
-    if a_only.iter().any(acronym) && b_only.iter().any(acronym) {
+    // Character Sheet), a trailing plural `s` not counting (`GM` = `GMs`).
+    // One side only is just extra words (`... PF Version`).
+    let fold_s = |w: &str| -> String { w.strip_suffix('s').filter(|r| r.chars().count() >= 2).unwrap_or(w).to_string() };
+    let acronyms = |only: &[&str]| -> HashSet<String> { only.iter().filter(|w| (2..=4).contains(&w.chars().count()) && w.chars().all(|c| c.is_alphabetic()) && !SHORT_FUNCTION_WORDS.contains(w)).map(|w| fold_s(w)).collect() };
+    let (aa, ba) = (acronyms(&a_only), acronyms(&b_only));
+    if aa.difference(&ba).next().is_some() && ba.difference(&aa).next().is_some() {
         return true;
     }
     ANTONYMS.iter().any(|(x, y)| (a_only.contains(x) && b_only.contains(y)) || (a_only.contains(y) && b_only.contains(x)))
@@ -1569,6 +1581,39 @@ mod tests {
         assert_eq!(groups(&recs[..2], Strength::Fuzzy), vec![vec![1, 2]]);
         recs[1].stems.clear();
         assert_eq!(groups(&recs[..2], Strength::Fuzzy), vec![vec![1, 2]]);
+    }
+
+    fn stem_veto(a: &str, b: &str) -> bool {
+        stems_differ_by_designator(&[a.to_string()], &[b.to_string()])
+    }
+
+    /// A marker on one side only is a copy of the same thing; a conflicting
+    /// value on each side is a different volume, year or number.
+    #[test]
+    fn stems_veto_only_on_conflicting_designators() {
+        let same = [
+            ("8021AS-2020 (1)", "8021AS-2020"),
+            ("GURPS - Template Toolkit 1 - Characters 4e", "GURPS - Template Toolkit 1 - Characters"),
+            ("SR 7100 - Core Rulebook - 1e", "SR 7100 - Rules"),
+            ("GURPS - GM Screen 4e", "GURPS - GMs Screen - 4e"),
+            ("ISO_IEC 27001 - Information security management", "ISO_IEC 27001_2022_ Information security management"),
+        ];
+        for (a, b) in same {
+            assert!(!stem_veto(a, b), "must not veto: {a:?} / {b:?}");
+        }
+        let different = [
+            ("civil_engineer_and_architects_journal_vol_02_1839", "civil_engineer_and_architects_journal_vol_03_1840"),
+            ("ore_dressing_vol_1_1903", "ore_dressing_vol_2_1903"),
+            ("the_boy_scouts_year_book_1917", "the_boy_scouts_year_book_1920"),
+            ("perfection_in_baking_1895", "perfection_in_baking_1902"),
+            ("09-148r1_OGC_Web_Service", "09-149r1_OGC_Web_Service"),
+            ("T-REC-J.1108-201901", "T-REC-J.1109-201901"),
+            ("SR 7213 - Aztlan", "SR 7313 - Aztlan"),
+            ("a_treatise_on_coal_mining_vol_1_1900", "a_treatise_on_coal_mining_vol_supplement_1900"),
+        ];
+        for (a, b) in different {
+            assert!(stem_veto(a, b), "must veto: {a:?} / {b:?}");
+        }
     }
 
     #[test]
