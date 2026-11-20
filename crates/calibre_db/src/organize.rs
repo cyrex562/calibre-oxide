@@ -599,16 +599,6 @@ mod tests {
     #[test]
     fn a_failed_rename_rolls_the_books_other_files_back() {
         let (dir, cache) = library();
-        write(&dir.path().join("inbox/Alpha.pdf"), b"%PDF alpha");
-        index(dir.path(), &cache);
-        let alpha = book_with_title(&cache, "Alpha");
-        cache.add_format(alpha, "EPUB", &{
-            let p = dir.path().join("inbox/Alpha.epub");
-            write(&p, b"epub");
-            p
-        })
-        .ok();
-        // Whatever the second format did, a hand-built two-file move that fails
         // on its second step must leave the first file where it was.
         write(&dir.path().join("x/one.txt"), b"1");
         let pairs = vec![("x/one.txt".to_string(), "y/one.txt".to_string()), ("x/missing.txt".to_string(), "y/missing.txt".to_string())];
