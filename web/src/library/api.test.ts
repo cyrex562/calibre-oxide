@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { importFolder, fetchUntracked, fetchTrash, restoreTrashEntry, deleteTrashEntry, emptyTrash, copyToLibrary, describeCopyOutcome, fetchLibraryInfo, embedMetadata, summarizeEmbed, addBook, addFormat, addNewsSchedule, blobToDataUrl, inspectPlugin, installPlugin, listPlugins, removePlugin, setPluginEnabled, catalogDownloadUrl, checkLibrary, coverProxyUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchCoverProxyBlob, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeDataFile, removeFormat, removeNewsSchedule, renameCategoryItem, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, scanLibrary, fetchOrphans, relocateOrphan, uploadOrphanFile, forgetOrphan, fetchIgnored, unignoreFile, searchMetadataOnline, backfillHashes, fingerprintPdfs, prepareLibrary, prepareStageOfPhase, describePrepareProgress, describePrepareResult, cancelLibraryJob, describeJobProgress, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
+import { type LibraryJob, fetchLibraryJobs, resumableJob, resumeLibraryJob, runningLibraryJob, switchWarning, importFolder, fetchUntracked, fetchTrash, restoreTrashEntry, deleteTrashEntry, emptyTrash, copyToLibrary, describeCopyOutcome, fetchLibraryInfo, embedMetadata, summarizeEmbed, addBook, addFormat, addNewsSchedule, blobToDataUrl, inspectPlugin, installPlugin, listPlugins, removePlugin, setPluginEnabled, catalogDownloadUrl, checkLibrary, coverProxyUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchCoverProxyBlob, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeDataFile, removeFormat, removeNewsSchedule, renameCategoryItem, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, scanLibrary, fetchOrphans, relocateOrphan, uploadOrphanFile, forgetOrphan, fetchIgnored, unignoreFile, searchMetadataOnline, backfillHashes, fingerprintPdfs, prepareLibrary, prepareStageOfPhase, describePrepareProgress, describePrepareResult, cancelLibraryJob, describeJobProgress, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
 import type { BookSummary } from "./types";
 
 function bookStub(id: number): BookSummary {
@@ -699,6 +699,30 @@ describe("the ignore list", () => {
 
 const progress = (over: Record<string, unknown> = {}) => ({ phase: "indexing", cancelled: false, total: 0, seen: 0, hashed: 0, added: 0, already_known: 0, ignored: 0, enriched: 0, errors: 0, bytes_hashed: 0, ...over });
 const job = (state: string, over: Record<string, unknown> = {}) => ({ id: 7, kind: "scan", state, progress: progress(), report: null, error: null, ...over });
+
+describe("library job registry helpers", () => {
+  it("warns before a switch only when a job is running, and finds a resumable interrupted one", async () => {
+    const jobs = [job("interrupted", { id: 9, kind: "prepare", resumable: true, resume_route: "prepare-library" }), job("running", { id: 8, kind: "scan" }), job("interrupted", { id: 5, kind: "prepare", resumable: true })];
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => ({ jobs }) }));
+    expect((await runningLibraryJob())?.id).toBe(8);
+    expect(switchWarning(await runningLibraryJob())).toMatch(/scan job is still running/);
+    expect(switchWarning(null)).toBeNull();
+    const list = (await fetchLibraryJobs()) as LibraryJob[];
+    expect(resumableJob(list)?.id).toBe(9);
+    // A newer job of the same kind supersedes the interrupted one.
+    expect(resumableJob([job("finished", { id: 10, kind: "prepare" }), ...list.slice(0, 1)] as LibraryJob[])).toBeNull();
+  });
+
+  it("resumes through the job's own route", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ job_id: 11 }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => job("finished", { id: 11, report: {} }) });
+    vi.stubGlobal("fetch", fetchMock);
+    await resumeLibraryJob(job("interrupted", { kind: "prepare", resumable: true, resume_route: "prepare-library" }) as LibraryJob, { intervalMs: 0 });
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/prepare-library/default", { method: "POST" });
+  });
+});
 
 describe("scanLibrary", () => {
   it("starts a job on the real single-library route, follows it, and returns its final report", async () => {

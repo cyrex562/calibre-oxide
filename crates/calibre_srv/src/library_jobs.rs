@@ -48,6 +48,14 @@
 //!   copy as a job ([`crate::cdb`])
 //! - `POST /duplicates/scan/{library_id}?job=true` -- the duplicate scan ([`crate::duplicates`])
 //! - `GET /library-jobs`, `GET /library-jobs/{id}`, `POST /library-jobs/{id}/cancel`
+//!
+//! # Surviving a restart
+//!
+//! The last state of each job (kind, summarized params, state, report,
+//! timestamps) is written to `<library>/.calibre-oxide/jobs.json` on every
+//! state change. A job recorded as `running` by a process that is gone is read
+//! back as `interrupted` ([`restore`]); for the kinds that resume by
+//! themselves (`resume_route`) the status JSON says `resumable`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -115,6 +123,40 @@ impl JobKind {
             JobKind::Copy => "copy",
         }
     }
+
+    pub fn from_name(name: &str) -> Option<JobKind> {
+        [
+            JobKind::Scan,
+            JobKind::Enrich,
+            JobKind::HashBackfill,
+            JobKind::PdfFingerprint,
+            JobKind::MergeExact,
+            JobKind::Import,
+            JobKind::Dedupe,
+            JobKind::Resolve,
+            JobKind::Prepare,
+            JobKind::Absorb,
+            JobKind::Unabsorb,
+            JobKind::Copy,
+        ]
+        .into_iter()
+        .find(|k| k.name() == name)
+    }
+
+    /// The `POST /<route>/{library_id}` that continues this kind of job after
+    /// it was interrupted. Only the jobs that resume from what the database
+    /// says is left have one: they need no parameters to pick up where they
+    /// stopped. (An absorb resumes too, but needs its folder -- see `params`.)
+    pub fn resume_route(self) -> Option<&'static str> {
+        match self {
+            JobKind::Scan => Some("scan-library"),
+            JobKind::Enrich => Some("enrich-library"),
+            JobKind::HashBackfill => Some("hash-backfill"),
+            JobKind::PdfFingerprint => Some("pdf-fingerprint"),
+            JobKind::Prepare => Some("prepare-library"),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,11 +166,16 @@ pub enum JobState {
     /// Stopped on request. What was done is kept; a rerun continues.
     Cancelled,
     Failed,
+    /// Was running when the server process ended (read back from
+    /// `.calibre-oxide/jobs.json`). What it did is kept; for a resumable kind
+    /// a rerun continues.
+    Interrupted,
 }
 
 impl JobState {
     fn name(self) -> &'static str {
         match self {
+            JobState::Interrupted => "interrupted",
             JobState::Running => "running",
             JobState::Finished => "finished",
             JobState::Cancelled => "cancelled",
@@ -150,6 +197,8 @@ pub struct LibraryJob {
     /// The library folder, which is what "one job per library" keys on.
     library: String,
     started_at: u64,
+    /// The small, serializable part of the job's parameters.
+    params: Value,
     pub control: Arc<JobControl>,
     outcome: Mutex<Outcome>,
     done: tokio::sync::watch::Sender<bool>,
@@ -185,18 +234,128 @@ impl LibraryJob {
             "error": outcome.error,
             "started_at": self.started_at,
             "finished_at": outcome.finished_at,
+            "params": self.params,
+            // Offered for a job that was cut off: POST to
+            // `/<resume_route>/{library_id}` continues it.
+            "resumable": outcome.state == JobState::Interrupted && self.kind.resume_route().is_some(),
+            "resume_route": self.kind.resume_route(),
+        })
+    }
+
+    /// The record written to `jobs.json`: the job's state as of now.
+    fn record(&self) -> Value {
+        let outcome = self.outcome.lock().unwrap();
+        // A report can be large (a scan lists every failed file); the file is
+        // rewritten on each state change, so cap what it keeps.
+        let report = outcome.report.as_ref().filter(|r| r.to_string().len() <= MAX_PERSISTED_REPORT);
+        json!({
+            "id": self.id,
+            "kind": self.kind.name(),
+            "library": self.library,
+            "state": outcome.state.name(),
+            "report": report,
+            "report_truncated": outcome.report.is_some() && report.is_none(),
+            "error": outcome.error,
+            "started_at": self.started_at,
+            "finished_at": outcome.finished_at,
+            "params": self.params,
         })
     }
 }
 
+/// Reports larger than this (serialized) are not kept in `jobs.json`.
+const MAX_PERSISTED_REPORT: usize = 256 * 1024;
+
 struct Registry {
     next_id: AtomicU64,
     jobs: Mutex<Vec<Arc<LibraryJob>>>,
+    /// Libraries whose `jobs.json` has been read back already.
+    restored: Mutex<std::collections::HashSet<String>>,
+    /// Serializes writes of `jobs.json`.
+    persist_lock: Mutex<()>,
 }
 
 fn registry() -> &'static Registry {
     static REGISTRY: OnceLock<Registry> = OnceLock::new();
-    REGISTRY.get_or_init(|| Registry { next_id: AtomicU64::new(1), jobs: Mutex::new(Vec::new()) })
+    REGISTRY.get_or_init(|| Registry { next_id: AtomicU64::new(1), jobs: Mutex::new(Vec::new()), restored: Mutex::new(Default::default()), persist_lock: Mutex::new(()) })
+}
+
+/// `<library>/.calibre-oxide/jobs.json`: the last state of this library's
+/// jobs (kind, parameters, state, report, timestamps), rewritten on every
+/// state change.
+pub fn jobs_file(library: &str) -> std::path::PathBuf {
+    std::path::Path::new(library).join(calibre_db::constants::LIBRARY_HANDLE_DIR_NAME).join("jobs.json")
+}
+
+/// Writes every job of `library` that the registry holds to its `jobs.json`
+/// (temp file then rename, so a crash mid-write leaves the old file).
+fn persist(library: &str) {
+    let reg = registry();
+    let _guard = reg.persist_lock.lock().unwrap();
+    let records: Vec<Value> = reg.jobs.lock().unwrap().iter().filter(|j| j.library == library).map(|j| j.record()).collect();
+    let path = jobs_file(library);
+    let write = || -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let temp = path.with_extension("json.partial");
+        std::fs::write(&temp, serde_json::to_vec_pretty(&json!({"version": 1, "jobs": records}))?)?;
+        std::fs::rename(&temp, &path)
+    };
+    if let Err(e) = write() {
+        eprintln!("could not record the library jobs in {}: {e}", path.display());
+    }
+}
+
+/// Reads `library`'s `jobs.json` back into the registry, once per process. A
+/// job recorded as `running` belongs to a process that no longer exists, so it
+/// comes back `interrupted` (and the file is rewritten to say so). Restored
+/// jobs get new ids -- the old ones may collide with this process's -- and
+/// keep the old one as `params.previous_id`.
+pub fn restore(library: &str) {
+    let reg = registry();
+    if !reg.restored.lock().unwrap().insert(library.to_string()) {
+        return;
+    }
+    let Some(doc) = std::fs::read_to_string(jobs_file(library)).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) else { return };
+    let mut interrupted_any = false;
+    let mut restored = Vec::new();
+    for rec in doc["jobs"].as_array().into_iter().flatten() {
+        let Some(kind) = rec["kind"].as_str().and_then(JobKind::from_name) else { continue };
+        let state = match rec["state"].as_str() {
+            Some("running") | Some("interrupted") => JobState::Interrupted,
+            Some("finished") => JobState::Finished,
+            Some("cancelled") => JobState::Cancelled,
+            Some("failed") => JobState::Failed,
+            _ => continue,
+        };
+        interrupted_any |= rec["state"].as_str() == Some("running");
+        let mut params = if rec["params"].is_object() { rec["params"].clone() } else { json!({}) };
+        params["previous_id"] = rec["id"].clone();
+        let (done, _) = tokio::sync::watch::channel(true);
+        restored.push(Arc::new(LibraryJob {
+            id: reg.next_id.fetch_add(1, Ordering::SeqCst),
+            kind,
+            library: library.to_string(),
+            started_at: rec["started_at"].as_u64().unwrap_or(0),
+            params,
+            control: JobControl::new(),
+            outcome: Mutex::new(Outcome {
+                state,
+                report: rec["report"].as_object().map(|_| rec["report"].clone()),
+                error: rec["error"].as_str().map(str::to_string),
+                finished_at: rec["finished_at"].as_u64(),
+            }),
+            done,
+        }));
+    }
+    if restored.is_empty() {
+        return;
+    }
+    reg.jobs.lock().unwrap().extend(restored);
+    if interrupted_any {
+        persist(library);
+    }
 }
 
 fn now_secs() -> u64 {
@@ -256,8 +415,39 @@ pub struct CopyJob {
     pub options: calibre_db::copy_to_library::CopyOptions,
 }
 
+impl JobParams {
+    /// The parts of the parameters worth keeping in `jobs.json` (the plans and
+    /// source caches are not serializable and not needed to describe a job).
+    fn summary(&self) -> Value {
+        let mut map = serde_json::Map::new();
+        if self.restart {
+            map.insert("restart".into(), json!(true));
+        }
+        if self.defer_enrichment {
+            map.insert("defer_enrichment".into(), json!(true));
+        }
+        if let Some(n) = self.pdf_workers {
+            map.insert("pdf_workers".into(), json!(n));
+        }
+        if let Some(w) = self.cover_width {
+            map.insert("cover_width".into(), json!(w));
+        }
+        if let Some((folder, _)) = &self.import {
+            map.insert("folder".into(), json!(folder.to_string_lossy()));
+        }
+        if let Some((folder, _)) = &self.absorb {
+            map.insert("folder".into(), json!(folder));
+        }
+        if let Some(copy) = &self.copy {
+            map.insert("book_count".into(), json!(copy.book_ids.len()));
+        }
+        Value::Object(map)
+    }
+}
+
 pub fn start_with(cache: Arc<Cache>, kind: JobKind, workers: Option<usize>, params: JobParams) -> Started {
     let library = cache.backend.library_path.to_string_lossy().to_string();
+    restore(&library);
     let reg = registry();
     let mut jobs = reg.jobs.lock().unwrap();
 
@@ -271,6 +461,7 @@ pub fn start_with(cache: Arc<Cache>, kind: JobKind, workers: Option<usize>, para
         kind,
         library,
         started_at: now_secs(),
+        params: params.summary(),
         control: JobControl::new(),
         outcome: Mutex::new(Outcome { state: JobState::Running, report: None, error: None, finished_at: None }),
         done,
@@ -283,6 +474,7 @@ pub fn start_with(cache: Arc<Cache>, kind: JobKind, workers: Option<usize>, para
         }
     }
     drop(jobs);
+    persist(&job.library);
 
     let mut options = match workers {
         Some(n) => PipelineOptions::with_workers(n),
@@ -312,6 +504,7 @@ pub fn start_with(cache: Arc<Cache>, kind: JobKind, workers: Option<usize>, para
         // retention horizon are never touched; see `ChangeLog::compact`).
         compact_change_log(&cache);
         *worker_job.outcome.lock().unwrap() = Outcome { state, report, error, finished_at: Some(now_secs()) };
+        persist(&worker_job.library);
         let _ = worker_job.done.send(true);
     });
     Started::New(job)
@@ -587,7 +780,10 @@ pub async fn prepare_status(State(state): State<AppState>, Path(library_id): Pat
 }
 
 /// `GET /library-jobs` -- newest first.
-pub async fn list() -> Json<Value> {
+pub async fn list(State(state): State<AppState>) -> Json<Value> {
+    // Bring back what an earlier process left in this library's jobs.json, so
+    // a job it was running shows as interrupted.
+    restore(&state.cache.backend.library_path.to_string_lossy());
     let mut jobs: Vec<Arc<LibraryJob>> = registry().jobs.lock().unwrap().clone();
     jobs.sort_by_key(|j| std::cmp::Reverse(j.id));
     Json(json!({"jobs": jobs.iter().map(|j| j.to_json()).collect::<Vec<_>>()}))

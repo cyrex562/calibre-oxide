@@ -636,7 +636,11 @@ export interface LibraryJobProgress {
 export interface LibraryJob<R = unknown> {
   id: number;
   kind: "scan" | "enrich" | "hash_backfill" | "pdf_fingerprint" | "merge_exact" | "import" | "dedupe" | "resolve" | "prepare" | "absorb" | "unabsorb" | "copy";
-  state: "running" | "finished" | "cancelled" | "failed";
+  /** `interrupted`: the server process ended while it ran (read back from `.calibre-oxide/jobs.json`). */
+  state: "running" | "finished" | "cancelled" | "failed" | "interrupted";
+  /** Interrupted and able to continue by itself: POST `/<resume_route>/default`. */
+  resumable?: boolean;
+  resume_route?: string | null;
   progress: LibraryJobProgress;
   /** Present once the job has ended. */
   report: R | null;
@@ -650,6 +654,39 @@ export interface LibraryJobHandlers<R = unknown> {
   onProgress?: (job: LibraryJob<R>) => void;
   /** Milliseconds between polls. */
   intervalMs?: number;
+}
+
+/** Every job the server knows of, newest first (including ones a previous process left interrupted). */
+export async function fetchLibraryJobs(): Promise<LibraryJob[]> {
+  return (await jsonFetch<{ jobs: LibraryJob[] }>("/library-jobs")).jobs;
+}
+
+/** The job running now, if any. */
+export async function runningLibraryJob(): Promise<LibraryJob | null> {
+  return (await fetchLibraryJobs()).find((j) => j.state === "running") ?? null;
+}
+
+/** The newest interrupted job that can be resumed, unless a newer job of the same kind has run since (jobs are newest first). */
+export function resumableJob(jobs: LibraryJob[]): LibraryJob | null {
+  const idx = jobs.findIndex((j) => j.state === "interrupted" && j.resumable);
+  if (idx < 0) return null;
+  const superseded = jobs.slice(0, idx).some((j) => j.kind === jobs[idx].kind);
+  return superseded ? null : jobs[idx];
+}
+
+/**
+ * Whether switching library should ask first, and what to say: a running
+ * job is stopped when the server for this library is replaced.
+ */
+export function switchWarning(running: LibraryJob | null): string | null {
+  if (!running) return null;
+  return `A ${running.kind.replace(/_/g, " ")} job is still running in this library. Switching library stops it (it can be resumed later). Switch anyway?`;
+}
+
+/** Continues an interrupted job by starting its resume route, and follows it. */
+export function resumeLibraryJob(job: LibraryJob, handlers: LibraryJobHandlers = {}): Promise<unknown> {
+  if (!job.resume_route) return Promise.reject(new Error(`a ${job.kind} job cannot be resumed from here`));
+  return runLibraryJob<unknown>(`/${job.resume_route}/default`, handlers);
 }
 
 export function fetchLibraryJob<R = unknown>(jobId: number): Promise<LibraryJob<R>> {

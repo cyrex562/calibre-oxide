@@ -270,6 +270,48 @@ mod tests {
         assert_eq!(job["report"]["enrichment"]["remaining"], 0, "{job}");
     }
 
+    /// Each job's state is written to `.calibre-oxide/jobs.json`.
+    #[tokio::test]
+    async fn a_jobs_state_is_persisted_in_the_library() {
+        let (dir, router) = test_app();
+        let (_, started) = post_json(&router, "/scan-library/default").await;
+        let id = started["job_id"].as_u64().unwrap();
+        wait_for_job(&router, id).await;
+
+        let text = std::fs::read_to_string(dir.path().join(".calibre-oxide").join("jobs.json")).expect("jobs.json is written");
+        let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let rec = doc["jobs"].as_array().unwrap().iter().find(|j| j["id"] == id).expect("the job is recorded");
+        assert_eq!(rec["kind"], "scan");
+        assert_eq!(rec["state"], "finished");
+        assert!(rec["report"].is_object());
+    }
+
+    /// A job a dead process left `running` comes back as `interrupted`, and a
+    /// resumable kind says where to continue it.
+    #[tokio::test]
+    async fn a_job_left_running_by_a_dead_process_is_reported_interrupted() {
+        let (dir, router) = test_app();
+        let handle = dir.path().join(".calibre-oxide");
+        std::fs::create_dir_all(&handle).unwrap();
+        let rec = |id: u64, kind: &str, state: &str| serde_json::json!({"id": id, "kind": kind, "library": "x", "state": state, "report": null, "error": null, "started_at": 5, "finished_at": null, "params": {}});
+        let doc = serde_json::json!({"version": 1, "jobs": [rec(1, "prepare", "running"), rec(2, "scan", "finished"), rec(3, "resolve", "running")]});
+        std::fs::write(handle.join("jobs.json"), doc.to_string()).unwrap();
+
+        let (_, body) = get_json(&router, "/library-jobs").await;
+        let jobs = body["jobs"].as_array().unwrap();
+        let prepare = jobs.iter().find(|j| j["params"]["previous_id"] == 1).expect("restored");
+        assert_eq!(prepare["state"], "interrupted", "{body}");
+        assert_eq!(prepare["resumable"], true);
+        assert_eq!(prepare["resume_route"], "prepare-library");
+        let resolve = jobs.iter().find(|j| j["params"]["previous_id"] == 3).unwrap();
+        assert_eq!(resolve["state"], "interrupted");
+        assert_eq!(resolve["resumable"], false, "a resolve has nothing to resume from");
+        assert_eq!(jobs.iter().find(|j| j["params"]["previous_id"] == 2).unwrap()["state"], "finished");
+        // And the file now says so too.
+        let again: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(handle.join("jobs.json")).unwrap()).unwrap();
+        assert!(again["jobs"].as_array().unwrap().iter().all(|j| j["state"] != "running"));
+    }
+
     #[tokio::test]
     async fn cancelling_a_finished_or_unknown_job_is_harmless() {
         let (_dir, router) = test_app();

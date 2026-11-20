@@ -70,8 +70,11 @@ fn open_library(app: &AppHandle, library_path: std::path::PathBuf) -> Result<(),
     let child = server::spawn(&bin, &library_path, &static_dir, port, pdfium.as_deref(), &also_serve).map_err(|e| e.to_string())?;
     *state.0.lock().unwrap() = Some((child, port));
 
-    if !server::wait_until_ready(port, std::time::Duration::from_secs(10)) {
-        return Err(format!("calibre_srv did not become ready on port {port} within 10s"));
+    // Opening a large library (a NAS-sized metadata.db, a change-log replay)
+    // can take well over ten seconds before the server binds its port.
+    let ready_within = server::ready_timeout();
+    if !server::wait_until_ready(port, ready_within) {
+        return Err(format!("calibre_srv did not become ready on port {port} within {}s", ready_within.as_secs()));
     }
 
     let url = Url::parse(&format!("http://127.0.0.1:{port}/")).map_err(|e| e.to_string())?;
