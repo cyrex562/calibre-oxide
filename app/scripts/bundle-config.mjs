@@ -25,23 +25,23 @@
 import { existsSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { bundleResources, platformNames } from "./bundle-resources.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const srcTauri = join(here, "..", "src-tauri");
 const repoRoot = join(here, "..", "..");
 
-const serverExe = process.platform === "win32" ? "calibre_srv.exe" : "calibre_srv";
-
-// Paths inside the config are relative to `src-tauri/`, which is where
-// Tauri resolves them from.
-const serverSource = `../../target/release/${serverExe}`;
-const webDistSource = "../../web/dist/";
+const { serverExe, workerExe, pdfiumLib } = platformNames(process.platform);
 
 // Fail here, with a sentence that says what to run, rather than letting
 // Tauri fail later with a bare "resource path doesn't exist".
 const missing = [];
-if (!existsSync(join(repoRoot, "target", "release", serverExe))) {
-  missing.push(`  ${serverExe} — run: cargo build --release --workspace`);
+for (const exe of [serverExe, workerExe]) {
+  // The worker is a second binary of calibre_srv; without it the server
+  // falls back to slow in-process PDFium, so it is required, not optional.
+  if (!existsSync(join(repoRoot, "target", "release", exe))) {
+    missing.push(`  ${exe} — run: cargo build --release --workspace`);
+  }
 }
 if (!existsSync(join(repoRoot, "web", "dist", "index.html"))) {
   missing.push("  web/dist — run: npm install && npm run build   (in web/)");
@@ -56,7 +56,6 @@ if (missing.length > 0) {
 // is a warning rather than one of the hard failures above -- but it
 // does have to be bundled when it *is* present, or an installed app
 // would silently lose a feature that worked in the dev checkout.
-const pdfiumLib = process.platform === "win32" ? "pdfium.dll" : process.platform === "darwin" ? "libpdfium.dylib" : "libpdfium.so";
 const pdfiumBuilt = join(repoRoot, "target", "release", pdfiumLib);
 const hasPdfium = existsSync(pdfiumBuilt);
 if (!hasPdfium) {
@@ -67,11 +66,7 @@ if (!hasPdfium) {
 // root, `web-dist/` beside it.
 const config = {
   bundle: {
-    resources: {
-      [serverSource]: serverExe,
-      [webDistSource]: "web-dist/",
-      ...(hasPdfium ? { [`../../target/release/${pdfiumLib}`]: pdfiumLib } : {}),
-    },
+    resources: bundleResources(process.platform, hasPdfium),
   },
 };
 

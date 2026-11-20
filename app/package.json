@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
+    "test": "node --test scripts/",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "node scripts/bundle-config.mjs && tauri build --config src-tauri/tauri.bundle.conf.json --no-bundle",

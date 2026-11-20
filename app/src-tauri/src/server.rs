@@ -177,6 +177,28 @@ fn no_console_window(cmd: &mut Command) {
 #[cfg(not(windows))]
 fn no_console_window(_cmd: &mut Command) {}
 
+/// How long to wait for the server to accept connections: 60 s, or
+/// `CALIBRE_OXIDE_READY_TIMEOUT_SECS`.
+pub fn ready_timeout() -> Duration {
+    parse_ready_timeout(std::env::var("CALIBRE_OXIDE_READY_TIMEOUT_SECS").ok().as_deref())
+}
+
+fn parse_ready_timeout(raw: Option<&str>) -> Duration {
+    Duration::from_secs(raw.and_then(|v| v.trim().parse::<u64>().ok()).filter(|s| *s > 0).unwrap_or(60))
+}
+
+#[cfg(test)]
+mod ready_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn a_large_library_gets_a_minute_by_default() {
+        assert_eq!(parse_ready_timeout(None), Duration::from_secs(60));
+        assert_eq!(parse_ready_timeout(Some("garbage")), Duration::from_secs(60));
+        assert_eq!(parse_ready_timeout(Some("120")), Duration::from_secs(120));
+    }
+}
+
 /// Polls a real TCP connect to `127.0.0.1:<port>` until it succeeds or
 /// `timeout` elapses. A successful connect is a real readiness signal
 /// here (not just "the process exists"): `calibre_srv`'s own startup

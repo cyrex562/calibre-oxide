@@ -96,6 +96,20 @@ at a copy kept somewhere else.
 It uses `curl.exe` and `tar.exe`, both of which ship with Windows 10
 1803 and later.
 
+### The PDF worker
+
+Scanning and enrichment render PDFs in a separate process,
+`calibre_pdf_worker.exe` (a second binary of `calibre_srv`, so a crash in
+PDFium cannot take the server down). `calibre_srv` finds it **next to
+its own exe**; without it the server falls back to slow in-process
+PDFium. `app/scripts/bundle-config.mjs` therefore bundles
+`calibre_srv.exe`, `calibre_pdf_worker.exe` and `pdfium.dll` flat in the
+resource directory, and the app runs `calibre_srv` from there, so both
+the worker and the DLL are found (the worker also inherits
+`CALIBRE_OXIDE_PDFIUM` from the server). Packaging fails if the worker
+is not built (`cargo build --release --workspace`). The file list is
+in `app/scripts/bundle-resources.mjs`, tested by `npm test` in `app/`.
+
 ## Installing over an existing version
 
 The MSI is a major-upgrade installer: running a newer one replaces the

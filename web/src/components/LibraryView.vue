@@ -15,6 +15,7 @@ import ImportFolderDialog from "./ImportFolderDialog.vue";
 import { describeScanOutcome, dismissKey, scanPromptHint, scanPromptText, shouldPrompt, type UntrackedCount } from "../library/scanPrompt";
 import { LAYOUT_KEY, type LayoutPrefs, type Panel, parseLayout, resizedWidth } from "../library/layout";
 import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary,
+  type LibraryJob, fetchLibraryJobs, resumableJob, resumeLibraryJob, runningLibraryJob, switchWarning,
   scanLibrary, prepareLibrary, describePrepareProgress, describePrepareResult, fingerprintPdfs, cancelLibraryJob, describeJobProgress,
   fetchOrphans,
   relocateOrphan,
@@ -1893,6 +1894,7 @@ async function createLibrary() {
     newLibraryError.value = "Give the library a name.";
     return;
   }
+  if (!(await confirmSwitchOverRunningJob())) return;
   creatingLibrary.value = true;
   newLibraryError.value = null;
   try {
@@ -1934,7 +1936,22 @@ async function openSwitchLibrary() {
   await loadRecentLibraries();
 }
 
+/**
+ * Replacing the library's server kills whatever job it is running, so ask
+ * first. A failed check (an older server, a network blip) does not block
+ * the switch: the user asked for it.
+ */
+async function confirmSwitchOverRunningJob(): Promise<boolean> {
+  try {
+    const warning = switchWarning(await runningLibraryJob());
+    return warning === null || window.confirm(warning);
+  } catch {
+    return true;
+  }
+}
+
 async function switchToRecent(path: string) {
+  if (!(await confirmSwitchOverRunningJob())) return;
   switching.value = true;
   switchError.value = null;
   try {
@@ -1948,6 +1965,7 @@ async function switchToRecent(path: string) {
 }
 
 async function switchToOther() {
+  if (!(await confirmSwitchOverRunningJob())) return;
   switching.value = true;
   switchError.value = null;
   try {
@@ -2424,8 +2442,42 @@ function onLibraryKeydown(event: KeyboardEvent) {
 onMounted(() => {
   window.addEventListener("keydown", onLibraryKeydown);
   void loadLibraryInfo();
+  void loadInterruptedJob();
 });
 onBeforeUnmount(() => window.removeEventListener("keydown", onLibraryKeydown));
+
+// A job the previous server process was running when it ended (a crash, or
+// switching library) comes back from `.calibre-oxide/jobs.json` as
+// `interrupted`; the resumable kinds offer to continue.
+const interruptedJob = ref<LibraryJob | null>(null);
+const resumeBusy = ref(false);
+const resumeProgress = ref<string | null>(null);
+const resumeError = ref<string | null>(null);
+
+async function loadInterruptedJob() {
+  try {
+    interruptedJob.value = resumableJob(await fetchLibraryJobs());
+  } catch {
+    // An older server has no such route; there is nothing to offer.
+  }
+}
+
+async function resumeInterrupted() {
+  const job = interruptedJob.value;
+  if (!job) return;
+  resumeBusy.value = true;
+  resumeError.value = null;
+  try {
+    await resumeLibraryJob(job, { onProgress: (j) => (resumeProgress.value = describeJobProgress(j.progress)) });
+    interruptedJob.value = null;
+    await loadLibraryInfo();
+  } catch (e) {
+    resumeError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    resumeBusy.value = false;
+    resumeProgress.value = null;
+  }
+}
 
 // Author/tag mapping (#1.7). The engines -- metadata::author_mapper
 // and ::tag_mapper -- were ported long ago with nothing calling them;
@@ -2765,6 +2817,16 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
         <button type="button" @click="dismissScanPrompt">Not now</button>
       </template>
       <button v-else type="button" class="storage-banner-close" title="Dismiss" aria-label="Dismiss" @click="closeScanResult">×</button>
+    </div>
+
+    <div v-if="interruptedJob" class="storage-banner scan-prompt" role="status">
+      <span class="storage-banner-text">
+        <template v-if="resumeBusy"><strong>Resuming.</strong> {{ resumeProgress ?? "Starting…" }}</template>
+        <template v-else-if="resumeError"><strong>Could not resume.</strong> {{ resumeError }}</template>
+        <template v-else><strong>A {{ interruptedJob.kind.replace(/_/g, " ") }} job was interrupted.</strong> What it did is kept; it can carry on from there.</template>
+      </span>
+      <button v-if="!resumeBusy" type="button" @click="resumeInterrupted">Resume {{ interruptedJob.kind.replace(/_/g, " ") }}</button>
+      <button v-if="!resumeBusy" type="button" @click="interruptedJob = null">Dismiss</button>
     </div>
 
     <div v-if="bulkOpen" class="bulk-panel">
