@@ -72,6 +72,8 @@ pub enum JobKind {
     Import,
     /// The duplicate scan (`POST /duplicates/scan/{id}?job=true`).
     Dedupe,
+    /// A bulk duplicate resolve (`POST /duplicates/resolve`, executing).
+    Resolve,
 }
 
 impl JobKind {
@@ -84,6 +86,7 @@ impl JobKind {
             JobKind::MergeExact => "merge_exact",
             JobKind::Import => "import",
             JobKind::Dedupe => "dedupe",
+            JobKind::Resolve => "resolve",
         }
     }
 }
@@ -193,6 +196,8 @@ pub struct JobParams {
     pub import: Option<(std::path::PathBuf, calibre_db::import::ImportOptions)>,
     /// The minimum strength of a duplicate scan ([`JobKind::Dedupe`]).
     pub dedupe_min: Option<calibre_db::dedupe::Strength>,
+    /// The plan of a [`JobKind::Resolve`] job.
+    pub resolve: Option<crate::duplicates_review::ResolveJob>,
 }
 
 pub fn start_with(cache: Arc<Cache>, kind: JobKind, workers: Option<usize>, params: JobParams) -> Started {
@@ -264,6 +269,10 @@ fn run(cache: &Cache, kind: JobKind, options: &PipelineOptions, control: &JobCon
         JobKind::PdfFingerprint => Ok(serde_json::to_value(calibre_db::pdf_similarity::fingerprint_pdfs(cache, options, control)?)?),
         JobKind::MergeExact => Ok(serde_json::to_value(calibre_db::merge::execute_content_merges(cache, &params.merge_plan, params.keep_duplicate_formats, control))?),
         JobKind::Dedupe => crate::duplicates::run_job(cache, params.dedupe_min.unwrap_or(calibre_db::dedupe::Strength::Fuzzy), control),
+        JobKind::Resolve => {
+            let job = params.resolve.as_ref().ok_or_else(|| anyhow::anyhow!("a resolve job needs a plan"))?;
+            crate::duplicates_review::run_resolve_job(cache, job, control)
+        }
         JobKind::Import => {
             let (source, import_options) = params.import.as_ref().ok_or_else(|| anyhow::anyhow!("an import job needs a source folder"))?;
             Ok(serde_json::to_value(calibre_db::import::import_folder(cache, source, import_options, options, control)?)?)

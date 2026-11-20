@@ -15,6 +15,8 @@ pub mod constants;
 pub mod copy_to_library;
 pub mod covers;
 pub mod dedupe;
+pub mod dedupe_exemptions;
+pub mod resolve;
 pub mod pdf_similarity;
 pub mod custom_columns;
 #[cfg(unix)]

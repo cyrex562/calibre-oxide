@@ -634,7 +634,7 @@ export interface LibraryJobProgress {
 
 export interface LibraryJob<R = unknown> {
   id: number;
-  kind: "scan" | "enrich" | "hash_backfill" | "pdf_fingerprint" | "merge_exact" | "import";
+  kind: "scan" | "enrich" | "hash_backfill" | "pdf_fingerprint" | "merge_exact" | "import" | "dedupe" | "resolve";
   state: "running" | "finished" | "cancelled" | "failed";
   progress: LibraryJobProgress;
   /** Present once the job has ended. */
@@ -724,6 +724,12 @@ export function describeJobProgress(p: LibraryJobProgress): string {
       return `Analysing PDF pages… ${n((p.fingerprinted ?? 0) + p.errors)} of ${n(p.total)}`;
     case "importing":
       return `Importing… ${n(p.hashed + p.already_known + p.errors)} of ${n(p.total)} files · ${n(p.added)} books added${p.ignored ? ` · ${n(p.ignored)} duplicates skipped` : ""}`;
+    case "matching":
+      return "Comparing every book in the library…";
+    case "describing":
+      return `Preparing groups… ${n(p.seen)} of ${n(p.total)}`;
+    case "resolving":
+      return `Resolving… ${n(p.seen)} of ${n(p.total)} groups`;
     default:
       return "Working…";
   }
@@ -878,7 +884,25 @@ export interface DuplicateBook {
   metadata?: number;
   has_cover?: boolean;
   /** Present for a fingerprinted PDF: what distinguishes a scan from its OCR. */
-  pdf?: { pages: number; has_text: boolean; size: number } | null;
+  pdf?: { pages: number; has_text: boolean; scanned?: boolean; size: number } | null;
+  uuid?: string;
+  /** Every format file: its path relative to the library, size in bytes, and modified time (unix seconds). */
+  files?: DuplicateFile[];
+  /** The book's folder, relative to the library. */
+  path?: string;
+  /** Bytes of all its formats. */
+  size?: number;
+  /** The newest modified time among its files (unix seconds). */
+  mtime?: number | null;
+  /** A thumbnail URL, when the book has a cover. */
+  cover_url?: string | null;
+}
+
+export interface DuplicateFile {
+  format: string;
+  path: string;
+  size: number;
+  mtime: number | null;
 }
 
 /**
@@ -928,6 +952,14 @@ export interface DuplicateGroup {
   evidence?: DuplicateEvidence[];
   /** The record the server would merge the others into; see `defaultMergeDestination`. */
   suggested_dest?: number | null;
+  /** Stable across rescans: a hash of the members' uuids. */
+  id?: string;
+  /** How many books the group holds. */
+  size?: number;
+  /** Why the server suggests that copy to keep. */
+  keeper_reason?: string;
+  /** Bytes the other copies hold. */
+  bytes_reclaimable?: number;
 }
 
 /** A zero-byte book file. Never grouped as a duplicate of another empty file; listed on its own. */
@@ -942,6 +974,212 @@ export interface EmptyFile {
 export function scanForDuplicates(min?: "content" | "identifier" | "exact" | "pdf" | "fuzzy"): Promise<{ groups: DuplicateGroup[]; pdf?: PdfScanStatus; pdf_unfingerprinted?: number; empty_files?: EmptyFile[] }> {
   const query = min ? `?min=${min}` : "";
   return jsonFetch<{ groups: DuplicateGroup[]; pdf?: PdfScanStatus; pdf_unfingerprinted?: number; empty_files?: EmptyFile[] }>(`/duplicates/scan/default${query}`, { method: "POST" });
+}
+
+// ---- Reviewing and resolving duplicates at scale (crates/calibre_srv/src/duplicates_review.rs) ----
+
+export type DuplicateSort = "confidence" | "size" | "reason" | "reclaimable";
+
+export interface DuplicatesQuery {
+  offset?: number;
+  limit?: number;
+  reasons?: DuplicateReason[];
+  minConfidence?: number;
+  maxConfidence?: number;
+  /** Prefix of a file or folder path under the library. */
+  path?: string;
+  sort?: DuplicateSort;
+  order?: "asc" | "desc";
+}
+
+/** One page of the server's last scan. */
+export interface DuplicatePage {
+  has_scan: true;
+  /** The library changed since the scan (other than through this panel). */
+  stale: boolean;
+  generation: number;
+  scanned_at: number;
+  /** Groups after the filters. */
+  total: number;
+  /** Groups in the scan. */
+  all_total: number;
+  offset: number;
+  limit: number;
+  groups: DuplicateGroup[];
+  /** Groups per reason under every filter except the reason filter. */
+  facets: { reason: Partial<Record<DuplicateReason, number>> };
+  pdf?: PdfScanStatus;
+  pdf_unfingerprinted?: number;
+  empty_files?: EmptyFile[];
+  exemptions_applied?: number;
+}
+
+export type DuplicatePageOrNone = DuplicatePage | { has_scan: false };
+
+export function duplicatesQueryString(q: DuplicatesQuery): string {
+  const p = new URLSearchParams();
+  if (q.offset) p.set("offset", String(q.offset));
+  if (q.limit) p.set("limit", String(q.limit));
+  if (q.reasons && q.reasons.length > 0) p.set("reason", q.reasons.join(","));
+  if (q.minConfidence !== undefined && q.minConfidence > 0) p.set("min_confidence", String(q.minConfidence));
+  if (q.maxConfidence !== undefined && q.maxConfidence < 1) p.set("max_confidence", String(q.maxConfidence));
+  if (q.path && q.path.trim()) p.set("path", q.path.trim());
+  if (q.sort && q.sort !== "confidence") p.set("sort", q.sort);
+  if (q.order) p.set("order", q.order);
+  const s = p.toString();
+  return s ? `?${s}` : "";
+}
+
+/** A page of the last scan, or `{has_scan: false}` if the library has not been scanned this session. */
+export function fetchDuplicateGroups(q: DuplicatesQuery = {}): Promise<DuplicatePageOrNone> {
+  return jsonFetch<DuplicatePageOrNone>(`/duplicates/groups/default${duplicatesQueryString(q)}`);
+}
+
+/** What the scan job reports: counts, no groups (those are paged). */
+export interface DuplicateScanSummary {
+  generation: number;
+  group_count: number;
+  facets: { reason: Partial<Record<DuplicateReason, number>> };
+  pdf?: PdfScanStatus;
+  pdf_unfingerprinted?: number;
+  empty_files?: EmptyFile[];
+  exemptions_applied?: number;
+}
+
+/** Scans the whole library as a cancellable job with progress; the groups are then paged with `fetchDuplicateGroups`. */
+export function runDuplicateScan(min: DuplicateMinParam, handlers: LibraryJobHandlers<DuplicateScanSummary> = {}): Promise<DuplicateScanSummary> {
+  return runLibraryJob<DuplicateScanSummary>(`/duplicates/scan/default?job=true&min=${min}`, handlers);
+}
+
+export type DuplicateMinParam = "content" | "identifier" | "exact" | "pdf" | "fuzzy";
+
+/** Forgets groups the UI has dealt with (after a merge or delete done through other routes). `bookIds` are books deleted from groups. */
+export function dropDuplicateGroups(groupIds: string[], bookIds: number[] = []): Promise<{ dropped: number; remaining: number | null; stale: boolean | null }> {
+  return jsonFetch("/duplicates/drop/default", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ group_ids: groupIds, book_ids: bookIds }) });
+}
+
+export interface DuplicateExemption {
+  id: string;
+  created_at: number;
+  members: { uuid: string; title: string; authors: string[]; book_id: number | null; present: boolean }[];
+}
+
+export interface ExemptResult {
+  exemption: DuplicateExemption;
+  pairs: number;
+  dropped_group_ids: string[];
+  /** A group overlapped the exempted books without being inside them: rescan to re-split it. */
+  needs_rescan: boolean;
+}
+
+/** "These are not duplicates": every pair among the group's books (or `bookIds`) is exempt from now on. */
+export function markNotDuplicates(target: { groupId?: string; bookIds?: number[] }): Promise<ExemptResult> {
+  return jsonFetch<ExemptResult>("/duplicates/exempt/default", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ group_id: target.groupId, book_ids: target.bookIds ?? [] }) });
+}
+
+export function fetchExemptions(): Promise<{ exemptions: DuplicateExemption[]; count: number }> {
+  return jsonFetch("/duplicates/exemptions/default");
+}
+
+/** Undoes one dismissal (`{id}`) or all of them (`{all: true}`). The groups come back with the next scan. */
+export function removeExemption(target: { id: string } | { all: true }): Promise<{ removed: number; needs_rescan: boolean }> {
+  return jsonFetch("/duplicates/exemptions/remove/default", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(target) });
+}
+
+export type ResolveAction = "keep_best_trash_rest" | "merge_as_formats";
+
+export interface ResolveSelection {
+  action: ResolveAction;
+  /** Reasons to include. The server defaults to `["content"]`; title tiers are only ever included when listed. */
+  tiers?: DuplicateReason[];
+  minConfidence?: number;
+  pathPrefix?: string;
+  /** Explicit groups; overrides tiers, confidence and path. */
+  groupIds?: string[];
+  /** `{group id: book id}` keeper overrides. */
+  keepers?: Record<string, number>;
+  keepDuplicateFormats?: boolean;
+}
+
+export interface ResolvePlanGroup {
+  group_id: string;
+  reason: DuplicateReason;
+  confidence: number;
+  action: ResolveAction;
+  keeper: DuplicateBook;
+  keeper_reason: string;
+  others: DuplicateBook[];
+  bytes_freed: number;
+}
+
+export interface ResolvePlan {
+  dry_run: true;
+  action: ResolveAction;
+  plan_fingerprint: string;
+  groups: ResolvePlanGroup[];
+  totals: { groups: number; books: number; bytes_freed: number };
+  skipped: { group_id: string; reason: string }[];
+  missing_group_ids: string[];
+  /** False for a merge: restoring the run does not undo what was merged into the keeper. */
+  fully_restorable: boolean;
+  note: string;
+}
+
+export interface ResolveReport {
+  run_id: string;
+  action: ResolveAction;
+  groups_planned: number;
+  groups_done: number;
+  done_groups: string[];
+  books_trashed: number;
+  bytes_freed: number;
+  trashed_files: string[];
+  errors: [string, string][];
+  cancelled: boolean;
+  fully_restorable: boolean;
+}
+
+function resolveBody(sel: ResolveSelection, extra: Record<string, unknown>): string {
+  return JSON.stringify({
+    action: sel.action,
+    ...(sel.tiers ? { tiers: sel.tiers } : {}),
+    ...(sel.minConfidence !== undefined ? { min_confidence: sel.minConfidence } : {}),
+    ...(sel.pathPrefix && sel.pathPrefix.trim() ? { path_prefix: sel.pathPrefix.trim() } : {}),
+    ...(sel.groupIds ? { group_ids: sel.groupIds } : {}),
+    ...(sel.keepers && Object.keys(sel.keepers).length > 0 ? { keepers: sel.keepers } : {}),
+    keep_duplicate_formats: sel.keepDuplicateFormats ?? false,
+    ...extra,
+  });
+}
+
+/** The mandatory dry run: what resolving would do. Changes nothing. */
+export function planResolve(sel: ResolveSelection): Promise<ResolvePlan> {
+  return jsonFetch<ResolvePlan>("/duplicates/resolve/default", { method: "POST", headers: { "Content-Type": "application/json" }, body: resolveBody(sel, { dry_run: true }) });
+}
+
+/**
+ * Executes the plan the user confirmed (`planFingerprint`), as a cancellable job.
+ * The server refuses (409) if the library or the selection changed since the preview.
+ */
+export function runResolve(sel: ResolveSelection, planFingerprint: string, handlers: LibraryJobHandlers<ResolveReport> = {}): Promise<ResolveReport> {
+  return runLibraryJob<ResolveReport>("/duplicates/resolve/default", handlers, JSON.parse(resolveBody(sel, { dry_run: false, plan_fingerprint: planFingerprint })));
+}
+
+export interface ResolveRun {
+  run_id: string;
+  books: number;
+  bytes: number;
+  deleted_at: number;
+}
+
+/** Runs that still have books in the library trash. */
+export function fetchResolveRuns(): Promise<{ runs: ResolveRun[] }> {
+  return jsonFetch("/duplicates/runs/default");
+}
+
+/** Puts back every book the run trashed. */
+export function restoreResolveRun(runId: string): Promise<{ run_id: string; restored: { book_id: number; title: string }[]; failed: [string, string][]; needs_rescan: boolean }> {
+  return jsonFetch(`/duplicates/runs/default/${encodeURIComponent(runId)}/restore`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
 }
 
 /** What the PDF fingerprint job did. */

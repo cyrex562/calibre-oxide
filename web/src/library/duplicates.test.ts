@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MIN_OPTIONS, confidencePercent, countByReason, evidenceLines, filterGroups, fingerprintAction, isSuggested, needsReview, pdfLine, reasonBadge, reasonLabel } from "./duplicates";
+import { MIN_OPTIONS, confidencePercent, countByReason, evidenceLines, filterGroups, fileSummary, fingerprintAction, formatMtime, isImageOnlyScan, isMetadataOnly, isSuggested, needsReview, pdfLine, primaryPath, reasonBadge, reasonLabel } from "./duplicates";
 import type { DuplicateGroup, DuplicateReason } from "./api";
 
 const group = (reason: DuplicateReason, confidence = 0.9): DuplicateGroup => ({ books: [], reason, confidence });
@@ -127,5 +127,29 @@ describe("isSuggested", () => {
     expect(isSuggested({ suggested_dest: 4 }, { book_id: 4 })).toBe(true);
     expect(isSuggested({ suggested_dest: 4 }, { book_id: 5 })).toBe(false);
     expect(isSuggested({ suggested_dest: null }, { book_id: 5 })).toBe(false);
+  });
+});
+
+describe("the compare card's lines (tranche 12)", () => {
+  const book = { book_id: 1, title: "T", authors: [], files: [{ format: "EPUB", path: "A/T.epub", size: 1536, mtime: 0 }, { format: "PDF", path: "A/T.pdf", size: 3 * 1024 * 1024, mtime: 0 }], path: "A" };
+  it("lists each format with its size, and shows the first file's path", () => {
+    expect(fileSummary(book)).toBe("EPUB 2 KB · PDF 3.0 MB");
+    expect(primaryPath(book)).toBe("A/T.epub");
+    expect(primaryPath({ path: "Folder" })).toBe("Folder");
+    expect(primaryPath({})).toBe("");
+  });
+  it("formats a modified time, or nothing when unknown", () => {
+    expect(formatMtime(null)).toBe("");
+    expect(formatMtime(0)).toBe("");
+    expect(formatMtime(1_700_000_000)).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
+  });
+  it("calls a PDF with pages and no text layer an image-only scan", () => {
+    expect(isImageOnlyScan({ pdf: { pages: 10, has_text: false, scanned: true, size: 1 } })).toBe(true);
+    expect(isImageOnlyScan({ pdf: { pages: 10, has_text: true, scanned: true, size: 1 } })).toBe(false);
+    expect(isImageOnlyScan({ pdf: null })).toBe(false);
+  });
+  it("knows which tiers are metadata only", () => {
+    expect(["content", "pdf_resave", "pdf_ocr_variant", "pdf_text_match"].some((r) => isMetadataOnly(r as DuplicateReason))).toBe(false);
+    expect(["identifier", "title_author_exact", "title_author_fuzzy"].every((r) => isMetadataOnly(r as DuplicateReason))).toBe(true);
   });
 });

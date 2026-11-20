@@ -235,6 +235,13 @@ impl ChangeLog {
         &self.origin
     }
 
+    /// The sequence number this install's next change will get: a counter
+    /// that only grows, so two readings differ exactly when this install
+    /// has logged a change in between. Cheap (no disk read).
+    pub fn next_sequence(&self) -> u64 {
+        self.state.lock().unwrap().next_seq
+    }
+
     /// Appends a change and returns the entry written.
     ///
     /// Durable before it returns: the entry file is fsynced, then the

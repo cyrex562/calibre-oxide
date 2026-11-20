@@ -321,6 +321,102 @@ UI can offer to run the job. They never reach the bulk `merge-exact`.
 pages, then the larger file (an optimizer shrinks images, so the larger of two
 re-saves is the original).
 
+## Reviewing and resolving duplicates at scale
+
+A real library gives hundreds of groups (467 on 9,767 books), so the panel
+works a page at a time and can act on many groups at once. The code is
+`calibre_db::dedupe_exemptions`, `calibre_db::resolve` and
+`calibre_srv::duplicates_review`.
+
+### "Not duplicates" (exemptions)
+
+An exemption is a *set* of books that are pairwise not duplicates (marking a
+group of 50 is one entry, not 1,225 pairs). Each member is recorded by its
+**uuid** and by the **content hashes** of its files (never the hash of an empty
+file), so a book that is deleted and imported again (new uuid, same bytes) stays
+exempt. They live in one JSON library preference, `oxide.duplicate_exemptions`,
+written through `set_preference`, so they are in the **change log** (a
+`PrefSet`): they survive restarts, rescans and a database rebuild from the log.
+No new table or log op.
+
+The scan turns them into cannot-link edges between book ids and applies them
+before and while grouping: as a veto on the title tiers, by splitting identical-
+file and identifier buckets into compatible sets, by dropping page-content edges
+between exempt books, and, finally, while merging evidence into groups (a cluster
+never joins another if any cross pair is exempt), so a chain `A~B`, `B~C` cannot
+reunite an exempt `A`, `C`. A group whose members are all mutually exempt
+disappears; a partly exempt one splits.
+
+* `POST /duplicates/exempt/{lib}` `{group_id}` or `{book_ids}` ->
+  `{exemption, pairs, dropped_group_ids, needs_rescan}`
+* `GET /duplicates/exemptions/{lib}` -> `{exemptions: [{id, created_at, members:
+  [{uuid, title, authors, book_id, present}]}], count}`
+* `POST /duplicates/exemptions/remove/{lib}` `{id}` or `{all: true}` ->
+  `{removed, needs_rescan}` (the hidden groups return with the next scan)
+
+### The scan result is kept and paged
+
+Every scan (the route, or the `?job=true` job) stores a **snapshot** per library
+in memory: the groups, each with a stable **id** (a hash of the sorted member
+uuids, so the same books keep the id across rescans), the suggested keeper and
+why, and what the panel shows about each book, all loaded in a few batched
+queries (the old payload cost about ten queries per book). The snapshot carries
+`Cache::change_watermark()` (this install's change-log sequence plus the book and
+format row counts). When the library changes afterwards, `GET /duplicates/groups`
+still serves it but says `"stale": true` and resolving is refused (409) until a
+rescan. Routes here that change the library themselves (exempt, resolve, drop)
+update the snapshot and keep it current, so the user keeps their place.
+
+* `POST /duplicates/scan/{lib}?min=` answers the whole result as before (each
+  group now has `id`, `size`, `keeper_reason`, `bytes_reclaimable`, and each
+  book `uuid`, `files [{format, path, size, mtime}]`, `path`, `size`, `mtime`,
+  `cover_url`, and `pdf.scanned`). With `&job=true` the job report is a summary
+  (`group_count`, `facets`, PDF and empty-file status) and the groups are paged.
+* `GET /duplicates/groups/{lib}?offset&limit&reason=a,b&min_confidence&
+  max_confidence&path&sort=confidence|size|reason|reclaimable&order` ->
+  `{has_scan, stale, total, all_total, offset, limit, groups, facets:
+  {reason: {tier: n}}, ...}`. `limit` defaults to 50 (max 200); `path` is a
+  case-insensitive prefix of a file or folder path relative to the library;
+  `facets.reason` counts every tier under all filters *except* the tier filter.
+* `POST /duplicates/drop/{lib}` `{group_ids, book_ids?}` forgets groups (after
+  the UI merged them with the existing routes) or removes deleted books from
+  their groups (a group left with one book goes).
+
+### Bulk resolve
+
+`POST /duplicates/resolve/{lib}`, body `{dry_run (default true), action, tiers,
+min_confidence, path_prefix, group_ids, keepers, keep_duplicate_formats,
+plan_fingerprint}`.
+
+* **Selection**: explicit `group_ids`, or `tiers` (default **`["content"]`**; the
+  title/author, identifier and fuzzy tiers are included only when named) with a
+  confidence floor and a path prefix. `keepers` overrides a group's keeper.
+* **Action**: `keep_best_trash_rest` moves the other books (with their files) to
+  the library trash; `merge_as_formats` merges them into the keeper with the
+  merge engine (`merge_and_delete`), which trashes them.
+* **Dry run is mandatory.** It returns `{plan_fingerprint, groups: [{group_id,
+  reason, confidence, keeper, keeper_reason, others, bytes_freed}], totals:
+  {groups, books, bytes_freed}, skipped, fully_restorable, note}`. Executing needs
+  `dry_run: false` and that fingerprint, and answers 409 when the plan differs
+  (the library changed, the selection changed, groups were dropped). It starts a
+  cancellable `resolve` library job: `202 {job_id, run_id}`; the job's report is
+  `{run_id, groups_done, books_trashed, bytes_freed, errors, ...}`. Per group,
+  the keeper must still exist and have a file on disk or nothing in that group
+  is touched.
+* **Keeper heuristic** (`resolve::choose_keeper`, and the reason is reported):
+  PDF groups prefer a text layer, then not an image-only scan, then more pages,
+  then the larger file, then the richer record; other groups prefer more
+  formats, then the richer record, then a cover, then the better format (EPUB
+  over MOBI over PDF over TXT), then more bytes, then the lowest id.
+* **Undo**: every book a run trashes is tagged with the `run_id` in its trash
+  manifest. `GET /duplicates/runs/{lib}` lists runs with books still in the
+  trash; `POST /duplicates/runs/{lib}/{run_id}/restore` restores all of them
+  (same uuid, same id if free). **A merge is not fully undone by that**: the
+  sources come back, but the formats and metadata folded into the keeper stay.
+  That is why a dry run is required and the UI says so.
+
+`POST /duplicates/merge-exact` is unchanged: content groups only.
+
 ## The life of a tracked file
 
 ```
