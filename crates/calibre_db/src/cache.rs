@@ -572,6 +572,20 @@ impl Cache {
         self.backend.library_id().unwrap_or_default()
     }
 
+    /// A token that changes whenever the library does: this install's change
+    /// log sequence (every logged write moves it), plus the number of books
+    /// and of format rows, which catches changes the log does not see (a
+    /// scan registering files, a rebuild). Equal tokens mean "nothing
+    /// written in between", for caches of derived results such as the
+    /// duplicate scan.
+    pub fn change_watermark(&self) -> String {
+        let seq = self.backend.change_log().map(|l| l.next_sequence()).unwrap_or(0);
+        let conn = self.backend.conn.lock().unwrap();
+        let books: i64 = conn.query_row("SELECT COUNT(*) FROM books", [], |r| r.get(0)).unwrap_or(-1);
+        let formats: i64 = conn.query_row("SELECT COUNT(*) FROM data", [], |r| r.get(0)).unwrap_or(-1);
+        format!("{seq}.{books}.{formats}")
+    }
+
     /// Port of `Cache.all_book_ids`. Previously nonexistent -- callers
     /// (namely `search.rs`) worked around its absence by assuming book
     /// ids fell in some hardcoded range.
@@ -2417,13 +2431,14 @@ impl Cache {
             x.insert(
                 "cover".into(),
                 serde_json::json!(if has_cover {
-                    Some(
-                        prefix
-                            .join(&path_rel)
-                            .join("cover.jpg")
-                            .to_string_lossy()
-                            .to_string(),
-                    )
+                    // Where the cover really is: `.calibre-oxide/covers/<uuid>.jpg`,
+                    // or a legacy `<folder>/cover.jpg` (see `covers::cover_path`).
+                    // Hard-coding `<folder>/cover.jpg` 404'd every cover in a
+                    // scanned library. Re-rooted under `prefix` like the rest.
+                    let real = crate::covers::cover_path(self, book_id)
+                        .unwrap_or_else(|_| library_path.join(&path_rel).join("cover.jpg"));
+                    let rel = real.strip_prefix(&library_path).map(Path::to_path_buf).unwrap_or(real);
+                    Some(prefix.join(rel).to_string_lossy().to_string())
                 } else {
                     None
                 }),

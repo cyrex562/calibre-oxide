@@ -21,12 +21,15 @@ import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LI
   uploadOrphanFile,
   forgetOrphan,
   fetchIgnored,
-  type EmptyFile, unignoreFile, copyToLibrary, describeCopyOutcome, deleteBooks, embedMetadata, summarizeEmbed, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchLibraryInfo, fetchUntracked, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameFiles, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
+  type EmptyFile, unignoreFile, copyToLibrary, describeCopyOutcome, deleteBooks, embedMetadata, summarizeEmbed, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchLibraryInfo, fetchUntracked, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameFiles, renameSavedSearch, runNewsScheduleNow, saveToDisk, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
 import type { PdfScanStatus, CheckLibraryFinding, CheckLibraryResult, CustomRecipeOptions, DuplicateGroup, IgnoredFile, NewsFeedInput, NewsSchedule, Orphan, SaveToDiskResult } from "../library/api";
-import { mergeBooks, planBulkMerge, runBulkMerge } from "../library/api";
-import type { BulkMergePlan, DuplicateBook, MergeMode, MergeResponse } from "../library/api";
-import { MIN_OPTIONS, confidencePercent, countByReason, evidenceLines, filterGroups, fingerprintAction, isSuggested, needsReview, pdfLine, reasonBadge, reasonLabel } from "../library/duplicates";
-import type { DuplicateMin } from "../library/duplicates";
+import { mergeBooks } from "../library/api";
+import type { DuplicateBook, MergeMode, MergeResponse } from "../library/api";
+import { fingerprintAction } from "../library/duplicates";
+import DuplicateReview from "./DuplicateReview.vue";
+import ResolveDialog from "./ResolveDialog.vue";
+import { createDuplicatesStore } from "../library/duplicatesStore";
+import { createResolveController } from "../library/resolve";
 import { DEFAULT_DESTINATION_HINT, MERGE_MODE_LABELS, MERGE_MODE_NOTES, defaultMergeDestination, describeMergeResult, describeRecord, summarizeMerge } from "../library/merge";
 import { parseSnippetSegments } from "../library/snippets";
 import { similarBooksQuery } from "../library/query";
@@ -949,6 +952,10 @@ async function runSearch() {
   }
 }
 
+// Declared before the immediate watcher below reads it: a `const` read
+// before its line throws (temporal dead zone) and blanked the whole view.
+const ftsMode = ref(false);
+
 watch([activeQuery, sort, sortOrder, vl, offset], () => {
   if (!ftsMode.value) void runSearch();
 }, { immediate: true });
@@ -965,7 +972,6 @@ interface FtsDisplayResult {
   snippets: FtsSnippet[];
 }
 
-const ftsMode = ref(false);
 const ftsLoading = ref(false);
 const ftsError = ref<string | null>(null);
 const ftsNotEnabled = ref(false);
@@ -1453,38 +1459,33 @@ async function runSaveToDisk() {
   }
 }
 
-// Find duplicates (#762) -- real POST /duplicates/scan against the
-// whole library, reusing calibre_db::copy_to_library's existing
-// add-time collision-detection heuristic as a whole-library scan.
+// Find duplicates: the server scans the whole library once (a job, with
+// progress), keeps the result, and the panel pages through it. The state and
+// the rules are in ../library/duplicatesStore.ts and ../library/resolve.ts.
 const duplicatesOpen = ref(false);
-const duplicatesLoading = ref(false);
 const duplicatesError = ref<string | null>(null);
-const duplicateGroups = ref<DuplicateGroup[]>([]);
-// The scan reports everything; this is only what is shown.
-const duplicateMin = ref<DuplicateMin>("fuzzy");
-const visibleDuplicateGroups = computed(() => filterGroups(duplicateGroups.value, duplicateMin.value));
-const duplicateStrengthCounts = computed(() => countByReason(duplicateGroups.value));
+const dupStore = createDuplicatesStore();
+const resolveController = createResolveController();
+const resolveOpen = ref(false);
 // How many PDFs are not yet fingerprinted, for page-content matching.
-const pdfStatus = ref<PdfScanStatus | undefined>(undefined);
+const pdfStatus = computed<PdfScanStatus | undefined>(() => dupStore.state.pdf);
 // Zero-byte files: not duplicates of each other, listed separately.
-const emptyFiles = ref<EmptyFile[]>([]);
+const emptyFiles = computed<EmptyFile[]>(() => dupStore.state.emptyFiles);
 const pdfAction = computed(() => fingerprintAction(pdfStatus.value));
 
+// Opens the panel on the server's last scan, or scans if there is none.
 async function openDuplicates() {
   duplicatesOpen.value = true;
   duplicatesError.value = null;
-  duplicatesLoading.value = true;
-  try {
-    const { groups, pdf, empty_files } = await scanForDuplicates();
-    emptyFiles.value = empty_files ?? [];
-    duplicateGroups.value = groups;
-    pdfStatus.value = pdf;
-  } catch (e) {
-    duplicatesError.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    duplicatesLoading.value = false;
-  }
+  await dupStore.open();
 }
+
+// After books changed under the panel (a delete, a resolve run): refresh the library list.
+async function onDuplicatesChanged() {
+  cacheBust.value++;
+  await runSearch();
+}
+
 
 // Identical-file detection compares content hashes, and a library opened
 // from real calibre has none. This reads every book file once to record
@@ -1512,7 +1513,7 @@ async function prepareForDuplicates() {
     if (result.missing_count > 0) parts.push(`${result.missing_count} listed but not found on disk`);
     if (result.unreadable_count > 0) parts.push(`${result.unreadable_count} could not be read`);
     prepareSummary.value = parts.join(" · ");
-    await openDuplicates();
+    await dupStore.scan();
   } catch (e) {
     duplicatesError.value = e instanceof Error ? e.message : String(e);
   } finally {
@@ -1554,7 +1555,7 @@ async function runFingerprint() {
     if (result.failed_count > 0) parts.push(`${result.failed_count} could not be read (encrypted or damaged)`);
     if (result.missing_count > 0) parts.push(`${result.missing_count} listed but not found on disk`);
     fingerprintSummary.value = parts.join(" · ");
-    await openDuplicates();
+    await dupStore.scan();
   } catch (e) {
     duplicatesError.value = e instanceof Error ? e.message : String(e);
   } finally {
@@ -1571,14 +1572,6 @@ async function cancelFingerprint() {
   } catch (e) {
     duplicatesError.value = e instanceof Error ? e.message : String(e);
   }
-}
-
-async function deleteDuplicateBook(bookId: number) {
-  if (!confirm(`Delete book ${bookId}? This cannot be undone.`)) return;
-  await deleteBooks([bookId]);
-  duplicateGroups.value = duplicateGroups.value.map((g) => ({ ...g, books: g.books.filter((b) => b.book_id !== bookId) })).filter((g) => g.books.length > 1);
-  cacheBust.value++;
-  await runSearch();
 }
 
 // ---------------------------------------------------------------
@@ -1600,7 +1593,11 @@ const mergeDone = ref<string | null>(null);
 const mergeModes = Object.keys(MERGE_MODE_LABELS) as MergeMode[];
 const mergePreviewLines = computed(() => (mergePreview.value ? summarizeMerge(mergePreview.value) : []));
 
-function openMerge(books: DuplicateBook[], dest: number | null) {
+// The duplicate group a merge was opened from, so it can leave the list afterwards.
+const mergeGroupId = ref<string | null>(null);
+
+function openMerge(books: DuplicateBook[], dest: number | null, groupId: string | null = null) {
+  mergeGroupId.value = groupId;
   mergeBooksList.value = books;
   mergeDest.value = dest;
   mergeMode.value = "merge_and_delete";
@@ -1612,7 +1609,7 @@ function openMerge(books: DuplicateBook[], dest: number | null) {
 }
 
 function openMergeForGroup(group: DuplicateGroup) {
-  openMerge(group.books, group.suggested_dest ?? defaultMergeDestination(group.books));
+  openMerge(group.books, dupStore.keeperFor(group) ?? defaultMergeDestination(group.books), group.id ?? null);
 }
 
 // calibre's rule: the first selected book is the destination.
@@ -1656,70 +1653,14 @@ async function confirmMerge() {
     selectedIds.value = new Set();
     cacheBust.value++;
     await runSearch();
-    // Refresh the groups so the merged ones disappear.
-    if (duplicatesOpen.value) await openDuplicates();
+    // The merged group leaves the list (and the server's copy of the scan) at
+    // once; the rest of the page stays where it was.
+    if (duplicatesOpen.value && mergeGroupId.value) await dupStore.resolved([mergeGroupId.value]);
+    mergeGroupId.value = null;
   } catch (e) {
     mergeError.value = e instanceof Error ? e.message : String(e);
   } finally {
     mergeBusy.value = false;
-  }
-}
-
-// Bulk: every exact-content group, merged into its best record. Dry run
-// first; the plan's fingerprint is what the user confirms.
-const bulkPlan = ref<BulkMergePlan | null>(null);
-const dupBulkBusy = ref(false);
-const bulkProgress = ref<string | null>(null);
-const bulkJobId = ref<number | null>(null);
-const bulkKeepDuplicates = ref(false);
-const dupBulkSummary = ref<string | null>(null);
-
-async function planBulk() {
-  dupBulkBusy.value = true;
-  dupBulkSummary.value = null;
-  duplicatesError.value = null;
-  try {
-    bulkPlan.value = await planBulkMerge();
-  } catch (e) {
-    duplicatesError.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    dupBulkBusy.value = false;
-  }
-}
-
-async function executeBulk() {
-  const plan = bulkPlan.value;
-  if (!plan) return;
-  dupBulkBusy.value = true;
-  dupBulkSummary.value = null;
-  try {
-    const report = await runBulkMerge(plan.plan_fingerprint, bulkKeepDuplicates.value, {
-      onStart: (id) => (bulkJobId.value = id),
-      onProgress: (job) => (bulkProgress.value = `Merging… ${job.progress.seen.toLocaleString("en-US")} of ${job.progress.total.toLocaleString("en-US")} groups`),
-    });
-    const parts = [`${report.groups_merged.toLocaleString("en-US")} of ${report.groups_planned.toLocaleString("en-US")} groups merged (${report.books_merged.toLocaleString("en-US")} books), ${report.trashed.length.toLocaleString("en-US")} files moved to the library trash`];
-    if (report.cancelled) parts.push("stopped early — run it again to continue");
-    if (report.errors.length) parts.push(`${report.errors.length} group(s) had problems and were left as they were: ${report.errors.slice(0, 3).map(([id, why]) => `book ${id}: ${why}`).join("; ")}`);
-    dupBulkSummary.value = parts.join(" · ");
-    bulkPlan.value = null;
-    cacheBust.value++;
-    await runSearch();
-    await openDuplicates();
-  } catch (e) {
-    duplicatesError.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    dupBulkBusy.value = false;
-    bulkProgress.value = null;
-    bulkJobId.value = null;
-  }
-}
-
-async function cancelBulk() {
-  if (bulkJobId.value === null) return;
-  try {
-    await cancelLibraryJob(bulkJobId.value);
-  } catch (e) {
-    duplicatesError.value = e instanceof Error ? e.message : String(e);
   }
 }
 
@@ -3267,7 +3208,7 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
     </div>
 
     <div v-if="duplicatesOpen" class="manage-backdrop" @click.self="duplicatesOpen = false">
-      <div class="manage-panel">
+      <div class="manage-panel dup-panel">
         <button class="manage-close" @click="duplicatesOpen = false">✕</button>
         <section>
           <h3>Find duplicates</h3>
@@ -3302,77 +3243,14 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
             {{ emptyFiles.length }} empty (0-byte) file{{ emptyFiles.length === 1 ? "" : "s" }}, not counted as duplicates:
             {{ emptyFiles.slice(0, 5).map((f) => `${f.title} (.${f.format.toLowerCase()})`).join(", ") }}{{ emptyFiles.length > 5 ? ", …" : "" }}
           </p>
-          <p v-if="duplicatesLoading">Scanning…</p>
-          <p v-else-if="duplicatesError" class="error">{{ duplicatesError }}</p>
-          <template v-else>
-            <!--
-              Bulk merge is for identical files only: those are the same
-              book, so the choice of which record survives can be made
-              by rule. Title/author matches are never merged in bulk.
-            -->
-            <div v-if="duplicateGroups.some((g) => g.reason === 'content')" class="bulk-merge">
-              <button v-if="!bulkPlan" type="button" :disabled="dupBulkBusy" @click="planBulk">
-                {{ dupBulkBusy ? "Working…" : "Merge all identical-file groups…" }}
-              </button>
-              <div v-else class="bulk-plan" role="group" aria-label="Bulk merge plan">
-                <p>
-                  <strong>{{ bulkPlan.group_count.toLocaleString("en-US") }} groups</strong> of identical files: each is merged into its best record
-                  (most formats, then most metadata, then a cover), {{ bulkPlan.books_to_merge.toLocaleString("en-US") }} other books are removed, and their
-                  leftover files go to the library trash (Library → Trash…). Nothing has been changed yet.
-                </p>
-                <ul class="manage-list">
-                  <li v-for="g in bulkPlan.groups.slice(0, 5)" :key="g.dest">
-                    Keep “{{ g.books.find((b) => b.book_id === g.dest)?.title }}” ← {{ g.sources.length }} other{{ g.sources.length === 1 ? "" : "s" }}
-                  </li>
-                  <li v-if="bulkPlan.groups.length > 5" class="news-hint">…and {{ (bulkPlan.groups.length - 5).toLocaleString("en-US") }} more groups</li>
-                </ul>
-                <label><input v-model="bulkKeepDuplicates" type="checkbox" :disabled="dupBulkBusy" /> Keep a differing copy of a format as a data file instead of discarding it</label>
-                <div class="plugin-actions">
-                  <button type="button" :disabled="dupBulkBusy" @click="executeBulk">{{ dupBulkBusy ? "Merging…" : `Merge ${bulkPlan.group_count.toLocaleString("en-US")} groups` }}</button>
-                  <button v-if="dupBulkBusy" type="button" @click="cancelBulk">Cancel</button>
-                  <button v-else type="button" @click="bulkPlan = null">Back</button>
-                </div>
-                <p v-if="bulkProgress" class="news-hint" role="status">{{ bulkProgress }}</p>
-              </div>
-              <p v-if="dupBulkSummary" class="news-hint" role="status">{{ dupBulkSummary }}</p>
-            </div>
-            <p v-if="mergeDone" class="news-hint" role="status">{{ mergeDone }}</p>
-            <label v-if="duplicateGroups.length > 0" class="dup-filter">
-              Show
-              <select v-model="duplicateMin" aria-label="Minimum match strength">
-                <option v-for="o in MIN_OPTIONS" :key="o.value" :value="o.value">{{ o.label }}{{ duplicateStrengthCounts[o.value] === undefined ? "" : ` (${duplicateStrengthCounts[o.value]})` }}</option>
-              </select>
-            </label>
-            <p v-if="duplicateGroups.length === 0" class="news-hint">No likely duplicates found.</p>
-            <p v-else-if="visibleDuplicateGroups.length === 0" class="news-hint">No groups this strong. Show weaker matches to see {{ duplicateGroups.length }} more.</p>
-            <div v-for="(group, i) in visibleDuplicateGroups" :key="i">
-              <!--
-                Saying *why* matters: an identical file is a safe delete,
-                while a title/author match may be two genuinely different
-                books that happen to share a title.
-              -->
-              <h4>
-                Group {{ i + 1 }} ({{ group.books.length }} books) —
-                {{ reasonLabel(group.reason) }}
-                <span class="dup-badge" :class="`dup-badge-${reasonBadge(group.reason).tone}`" :title="evidenceLines(group).join('\n')" data-testid="dup-badge">
-                  {{ reasonBadge(group.reason).text }}<template v-if="group.confidence !== undefined"> · {{ confidencePercent(group.confidence) }}</template>
-                </span>
-                <span v-if="needsReview(group)" class="news-hint">check these are the same book before merging</span>
-                <button type="button" :title="DEFAULT_DESTINATION_HINT" @click="openMergeForGroup(group)">Merge into…</button>
-              </h4>
-              <ul class="manage-list">
-                <li v-for="b in group.books" :key="b.book_id">
-                  <button type="button" @click="selectedBookId = b.book_id">{{ b.title }} — {{ b.authors.join(", ") }}</button>
-                  <span v-if="pdfLine(b)" class="news-hint" data-testid="dup-pdf-line">{{ pdfLine(b) }}</span>
-                  <span v-if="isSuggested(group, b) && group.reason.startsWith('pdf_')" class="news-hint">suggested to keep</span>
-                  <button type="button" @click="deleteDuplicateBook(b.book_id)">Delete</button>
-                </li>
-              </ul>
-            </div>
-          </template>
+          <p v-if="duplicatesError" class="error">{{ duplicatesError }}</p>
+          <p v-if="mergeDone" class="news-hint" role="status">{{ mergeDone }}</p>
+          <DuplicateReview :store="dupStore" @merge="openMergeForGroup" @details="(id) => (selectedBookId = id)" @resolve="resolveOpen = true" @changed="onDuplicatesChanged" />
         </section>
       </div>
     </div>
+
+    <ResolveDialog v-if="duplicatesOpen && resolveOpen" :store="dupStore" :controller="resolveController" @close="resolveOpen = false" @changed="onDuplicatesChanged" />
 
     <div v-if="mergeOpen" class="manage-backdrop" @click.self="mergeOpen = false">
       <div class="manage-panel" role="dialog" aria-label="Merge books">
@@ -4200,6 +4078,11 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
 }
 .news-panel {
   max-width: 480px;
+}
+/* The duplicate review lays copies out side by side, so it needs the room. */
+.dup-panel {
+  max-width: min(1200px, 96vw);
+  width: 96vw;
 }
 .dup-filter {
   display: inline-flex;

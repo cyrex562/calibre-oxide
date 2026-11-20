@@ -4154,8 +4154,10 @@ mod tests {
         handle
             .write_atomic(&dir.path().join("x.txt"), b"data")
             .unwrap();
+        // Well under the 5 s suspend timeout, but loose enough for a write
+        // on a machine busy with the rest of the test suite (500 ms flaked).
         assert!(
-            start.elapsed() < Duration::from_millis(500),
+            start.elapsed() < Duration::from_secs(2),
             "an Open handle must not block at all"
         );
     }

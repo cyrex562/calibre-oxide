@@ -14,6 +14,15 @@
 //! That module's doc is where the normalisation rules and their deviations
 //! from calibre live.
 //!
+//! # Paging, "not duplicates" and bulk resolve (tranche 12)
+//!
+//! Every scan also becomes an in-memory snapshot that is paged with
+//! `GET /duplicates/groups/{library_id}`; groups carry a stable `id`, the
+//! suggested keeper and why, and per-file path, size and mtime. The job form
+//! (`?job=true`) reports a summary, not the groups. Dismissing groups, the
+//! bulk `resolve` job and its undo are in [`crate::duplicates_review`], which
+//! has the routes and their shapes.
+//!
 //! # Request
 //!
 //! `POST /duplicates/scan/{library_id}?min=fuzzy|pdf|exact|identifier|content`
@@ -77,9 +86,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use calibre_db::cache::Cache;
-use calibre_db::copy_to_library;
-use calibre_db::dedupe::{self, Strength};
-use calibre_db::merge;
+use calibre_db::dedupe::Strength;
 use calibre_db::scan_pipeline::JobControl;
 
 use crate::errors::ServerError;
@@ -101,67 +108,20 @@ fn parse_min(min: Option<&str>) -> Result<Strength, ServerError> {
     }
 }
 
-/// The scan's answer: every group at `min` or stronger, as JSON. Shared by
-/// the route and the `dedupe` job, which checks `control` between groups.
-pub fn scan_report(cache: &Cache, min: Strength, control: Option<&JobControl>) -> anyhow::Result<Value> {
-    use std::sync::atomic::Ordering;
-    if let Some(c) = control {
-        c.set_phase("matching");
-    }
-    let outcome = dedupe::scan_library_full(cache, min)?;
-    let groups = outcome.groups;
-    if let Some(c) = control {
-        c.set_phase("describing");
-        c.total.store(groups.len() as u64, Ordering::Relaxed);
-    }
-    let mut out = Vec::with_capacity(groups.len());
-    for group in &groups {
-        if control.is_some_and(|c| c.is_cancelled()) {
-            break;
-        }
-        // `formats`, `metadata` and `has_cover` are what the merge engine
-        // ranks records by (`merge::best_destination`); the UI applies the
-        // same rule to pre-select a destination.
-        let mut summaries = Vec::new();
-        let mut books = Vec::new();
-        for &id in &group.book_ids {
-            let (title, authors) = copy_to_library::book_title_and_authors(cache, id)?;
-            let s = merge::book_summary(cache, id)?;
-            // Present only for a fingerprinted PDF: what the user needs to
-            // choose between a scan and its OCR.
-            let pdf = outcome.pdf.get(&id).map(|p| json!({"pages": p.page_count, "has_text": p.has_text, "size": p.size}));
-            books.push(json!({"book_id": id, "title": title, "authors": authors, "formats": s.formats, "metadata": s.metadata, "has_cover": s.has_cover, "pdf": pdf}));
-            summaries.push(s);
-        }
-        let evidence: Vec<Value> = group.evidence.iter().map(|e| json!({"books": [e.a, e.b], "reason": e.strength.reason(), "confidence": round2(e.confidence), "detail": e.detail})).collect();
-        // A PDF-evidence group is ranked by what distinguishes the copies (a
-        // text layer, then pages, then size); the rest by the merge rule.
-        let suggested = if group.strength.is_pdf() { dedupe::best_pdf_destination(&group.book_ids, &outcome.pdf) } else { merge::best_destination(&summaries) };
-        out.push(json!({"books": books, "reason": group.strength.reason(), "confidence": round2(group.confidence), "evidence": evidence, "suggested_dest": suggested}));
-        if let Some(c) = control {
-            c.seen.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    // `pdf_unfingerprinted` is what `POST /pdf-fingerprint` would do; a PDF
-    // with no content hash yet needs `POST /hash-backfill` first.
-    //
-    // `empty_files` are zero-byte book files: never grouped as duplicates of
-    // each other (they all hash alike), so listed here for the user to clean up.
-    let mut empty = Vec::with_capacity(outcome.empty_files.len());
-    for (id, format) in &outcome.empty_files {
-        let (title, authors) = copy_to_library::book_title_and_authors(cache, *id)?;
-        empty.push(json!({"book_id": id, "format": format, "title": title, "authors": authors}));
-    }
-    Ok(json!({"groups": out, "min": min.reason(), "pdf_unfingerprinted": outcome.status.pending, "pdf": outcome.status, "empty_files": empty, "empty_file_count": empty.len()}))
+/// The scan's answer: every group at `min` or stronger, as JSON, with each
+/// book's files, sizes and PDF facts (see [`crate::duplicates_review`]). The
+/// scan also becomes the library's in-memory snapshot, which
+/// `GET /duplicates/groups` pages through.
+pub fn scan_report(cache: &Cache, min: Strength, control: Option<&JobControl>, library_id: &str) -> anyhow::Result<Value> {
+    let snapshot = crate::duplicates_review::build_snapshot(cache, min, control)?;
+    Ok(crate::duplicates_review::full_report(cache, &snapshot, library_id))
 }
 
-fn round2(x: f32) -> f64 {
-    ((x as f64) * 100.0).round() / 100.0
-}
-
-/// What the `dedupe` job runs.
+/// What the `dedupe` job runs: the scan, reported as a summary (facets and
+/// counts, no groups: they are paged from the snapshot the scan stored).
 pub fn run_job(cache: &Cache, min: Strength, control: &JobControl) -> anyhow::Result<Value> {
-    scan_report(cache, min, Some(control))
+    let snapshot = crate::duplicates_review::build_snapshot(cache, min, Some(control))?;
+    Ok(crate::duplicates_review::summary_json(&snapshot))
 }
 
 /// `POST /duplicates/scan/{library_id}`.
@@ -178,7 +138,7 @@ pub async fn scan(State(state): State<AppState>, AxumPath(library_id): AxumPath<
         });
     }
 
-    let report = tokio::task::spawn_blocking(move || scan_report(&cache, min, None))
+    let report = tokio::task::spawn_blocking(move || scan_report(&cache, min, None, &library_id))
         .await
         .map_err(|e| ServerError::InternalServerError(e.to_string()))?
         .map_err(|e| ServerError::InternalServerError(format!("{e:#}")))?;
@@ -231,6 +191,14 @@ mod tests {
         };
         let router = crate::test_router(state);
         (dir, router, seeded)
+    }
+
+    async fn get_json(router: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
     }
 
     async fn post_json(router: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
@@ -514,8 +482,11 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         assert_eq!(job["state"], "finished", "{job}");
-        assert_eq!(job["report"]["groups"].as_array().unwrap().len(), 1, "{job}");
-        assert_eq!(job["report"]["groups"][0]["reason"], "title_author_exact");
+        // The job reports a summary; the groups are paged from the snapshot it stored.
+        assert_eq!(job["report"]["group_count"], 1, "{job}");
+        assert_eq!(job["report"]["facets"]["reason"]["title_author_exact"], 1, "{job}");
+        let (_, page) = get_json(&router, "/duplicates/groups/default").await;
+        assert_eq!(page["groups"][0]["reason"], "title_author_exact");
     }
 
     // ---- PDFs found from their pages (tranche 9) ----
@@ -609,6 +580,8 @@ mod tests {
         let scan_book = books.iter().find(|b| b["book_id"] == scan as i64).unwrap();
         assert_eq!(scan_book["pdf"]["has_text"], false);
         assert_eq!(scan_book["pdf"]["pages"], 300);
+        assert_eq!(scan_book["pdf"]["scanned"], true);
+        assert!(ocr_group["keeper_reason"].as_str().unwrap().contains("text layer"), "{ocr_group}");
 
         let resave = by_reason("pdf_resave");
         assert_eq!(group_ids(resave), vec![original as i64, optimized as i64]);

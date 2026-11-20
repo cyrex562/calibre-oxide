@@ -119,7 +119,7 @@ export function pdfLine(book: Pick<DuplicateBook, "pdf">): string {
   return `${pages} · ${pdf.has_text ? "text layer" : "image only"} · ${formatBytes(pdf.size)}`;
 }
 
-function formatBytes(n: number): string {
+export function formatBytes(n: number): string {
   if (n >= 1024 * 1024 * 1024) return `${(n / 1024 / 1024 / 1024).toFixed(1)} GB`;
   if (n >= 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
   if (n >= 1024) return `${Math.round(n / 1024)} KB`;
@@ -138,6 +138,56 @@ export function fingerprintAction(status: PdfScanStatus | undefined): { label: s
     label: `Fingerprint PDFs (${n} not yet analysed)`,
     note: status.unhashed > 0 ? `${status.unhashed.toLocaleString("en-US")} more PDFs have no content hash yet; use “Prepare for duplicate detection” for those.` : null,
   };
+}
+
+/** Every reason, strongest first: the order the filter chips and the resolve dialog list them in. */
+export const ALL_REASONS: DuplicateReason[] = ["content", "identifier", "title_author_exact", "pdf_resave", "pdf_ocr_variant", "pdf_text_match", "title_author_fuzzy"];
+
+/**
+ * Tiers that rest on metadata alone (a shared title and author, an identifier):
+ * two different books can share them, so bulk resolving never includes them
+ * unless the person ticks them.
+ */
+export function isMetadataOnly(reason: DuplicateReason): boolean {
+  return reason === "title_author_exact" || reason === "title_author_fuzzy" || reason === "identifier";
+}
+
+/** The tiers a bulk resolve starts with ticked: identical files only. */
+export const DEFAULT_RESOLVE_TIERS: DuplicateReason[] = ["content"];
+
+/** "2026-03-04 17:05" from unix seconds, or "" when unknown. */
+export function formatMtime(seconds: number | null | undefined): string {
+  if (!seconds) return "";
+  const d = new Date(seconds * 1000);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/** "EPUB 1.2 MB · PDF 40.0 MB": each format with its size. */
+export function fileSummary(book: Pick<DuplicateBook, "files">): string {
+  return (book.files ?? []).map((f) => `${f.format} ${formatBytes(f.size)}`).join(" · ");
+}
+
+/** The path to show for a book: its first file's path, or its folder. */
+export function primaryPath(book: Pick<DuplicateBook, "files" | "path">): string {
+  return book.files?.[0]?.path ?? book.path ?? "";
+}
+
+/** Whether a PDF is an image-only scan: pages but no text layer. */
+export function isImageOnlyScan(book: Pick<DuplicateBook, "pdf">): boolean {
+  return !!book.pdf && !book.pdf.has_text && book.pdf.scanned !== false;
+}
+
+/** "Delete" goes to the library trash, which keeps books for a while: say so. */
+export function trashConfirmText(title: string): string {
+  return `Move “${title}” to the library trash? It can be restored from Library → Trash… until the trash is emptied or expires.`;
+}
+
+/** One line for a plan's totals: "12 groups · 12 books to the trash · 1.4 GB". */
+export function describePlanTotals(totals: { groups: number; books: number; bytes_freed: number }, action: "keep_best_trash_rest" | "merge_as_formats"): string {
+  const n = (v: number) => v.toLocaleString("en-US");
+  const books = action === "merge_as_formats" ? `${n(totals.books)} book${totals.books === 1 ? "" : "s"} merged into their keepers` : `${n(totals.books)} book${totals.books === 1 ? "" : "s"} moved to the trash`;
+  return `${n(totals.groups)} group${totals.groups === 1 ? "" : "s"} · ${books} · about ${formatBytes(totals.bytes_freed)} freed`;
 }
 
 /** Whether the choice of which copy to keep is the server's (a PDF group) and so worth labelling. */

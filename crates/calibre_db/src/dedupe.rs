@@ -126,6 +126,7 @@ use unicode_normalization::char::is_combining_mark;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::cache::Cache;
+use crate::dedupe_exemptions::CannotLink;
 
 /// An identifier shared by more books than this is treated as a bad bulk
 /// edit rather than evidence.
@@ -696,6 +697,8 @@ pub struct BookRecord {
     /// The file names (without extension) of the book's formats. Used only to
     /// tell a title that came from a template (see [`template_leftover_titles`]).
     pub stems: Vec<String>,
+    /// `books.uuid`: what exemptions and group ids are keyed by.
+    pub uuid: String,
 }
 
 /// One reason two books were joined.
@@ -761,6 +764,20 @@ fn star(ids: &[usize], records: &[BookRecord], strength: Strength, confidence: f
     }
 }
 
+/// Splits `ids` into sets in which no pair satisfies `bad` (greedy, in order),
+/// keeping only sets of two or more. With nothing exempt this is `ids` itself.
+fn split_compatible(ids: &[usize], bad: &dyn Fn(usize, usize) -> bool) -> Vec<Vec<usize>> {
+    let mut sets: Vec<Vec<usize>> = Vec::new();
+    for &i in ids {
+        match sets.iter_mut().find(|set| set.iter().all(|&j| !bad(i, j))) {
+            Some(set) => set.push(i),
+            None => sets.push(vec![i]),
+        }
+    }
+    sets.retain(|s| s.len() > 1);
+    sets
+}
+
 /// Finds duplicate groups.
 ///
 /// `content_groups` are sets of book ids already known to hold identical
@@ -784,6 +801,18 @@ pub fn find_groups_with(records: &[BookRecord], content_groups: &[Vec<i32>], pdf
 /// breaks at the books that differ instead of gluing 15 volumes of a periodical
 /// into one group.
 pub fn find_groups_vetoed(records: &[BookRecord], content_groups: &[Vec<i32>], pdf_edges: &[crate::pdf_similarity::PdfEdge], fingerprints: &[crate::pdf_similarity::LibraryFingerprint], min: Strength) -> Vec<Group> {
+    find_groups_full(records, content_groups, pdf_edges, fingerprints, min, &CannotLink::new())
+}
+
+/// [`find_groups_vetoed`] with **cannot-link** pairs (the user's "not a
+/// duplicate" exemptions, [`crate::dedupe_exemptions`]): two books that may not
+/// share a group never do, whatever the evidence. Applied as a veto on the title
+/// tiers, by splitting the content and identifier buckets into compatible sets,
+/// by dropping page-content edges between them, and finally while merging
+/// evidence (a cluster is never joined to another if any cross pair is
+/// exempt), so a chain `A~B`, `B~C` cannot reunite an exempt `A`, `C`.
+pub fn find_groups_full(records: &[BookRecord], content_groups: &[Vec<i32>], pdf_edges: &[crate::pdf_similarity::PdfEdge], fingerprints: &[crate::pdf_similarity::LibraryFingerprint], min: Strength, cannot_link: &CannotLink) -> Vec<Group> {
+    let cannot = |i: usize, j: usize| -> bool { !cannot_link.is_empty() && cannot_link.get(&records[i].id).is_some_and(|s| s.contains(&records[j].id)) };
     let index: HashMap<i32, usize> = records.iter().enumerate().map(|(i, r)| (r.id, i)).collect();
     let mut edges: Vec<Evidence> = Vec::new();
 
@@ -800,12 +829,15 @@ pub fn find_groups_vetoed(records: &[BookRecord], content_groups: &[Vec<i32>], p
     };
     // Two books with the same title whose *file names* are about the same work
     // but differ by a volume/number/year are different books.
-    let veto = |i: usize, j: usize| -> bool { stems_differ_by_designator(&records[i].stems, &records[j].stems) || content_veto(i, j) };
+    let veto = |i: usize, j: usize| -> bool { cannot(i, j) || stems_differ_by_designator(&records[i].stems, &records[j].stems) || content_veto(i, j) };
 
-    // Content.
+    // Content. A group of identical files is split into sets whose members
+    // the user has not exempted from each other.
     for g in content_groups {
         let ids: Vec<usize> = g.iter().filter_map(|id| index.get(id).copied()).collect();
-        star(&ids, records, Strength::Content, 1.0, "identical file contents", &mut edges);
+        for set in split_compatible(&ids, &cannot) {
+            star(&set, records, Strength::Content, 1.0, "identical file contents", &mut edges);
+        }
     }
 
     // Identifiers.
@@ -826,7 +858,9 @@ pub fn find_groups_vetoed(records: &[BookRecord], content_groups: &[Vec<i32>], p
         for key in keys {
             let (conf, ids) = &buckets[key];
             if ids.len() > 1 && ids.len() <= MAX_IDENTIFIER_BUCKET {
-                star(ids, records, Strength::Identifier, *conf, &format!("same {key}"), &mut edges);
+                for set in split_compatible(ids, &cannot) {
+                    star(&set, records, Strength::Identifier, *conf, &format!("same {key}"), &mut edges);
+                }
             }
         }
     }
@@ -891,7 +925,8 @@ pub fn find_groups_vetoed(records: &[BookRecord], content_groups: &[Vec<i32>], p
     // Page content.
     let mut pdf_evidence: Vec<Evidence> = Vec::new();
     for e in pdf_edges {
-        if !(index.contains_key(&e.a) && index.contains_key(&e.b)) {
+        let (Some(&ia), Some(&ib)) = (index.get(&e.a), index.get(&e.b)) else { continue };
+        if cannot(ia, ib) {
             continue;
         }
         let strength = match e.found.kind {
@@ -908,8 +943,36 @@ pub fn find_groups_vetoed(records: &[BookRecord], content_groups: &[Vec<i32>], p
     // Merge.
     edges.retain(|e| e.strength >= min);
     let mut uf = UnionFind::new(records.len());
-    for e in &edges {
-        uf.union(index[&e.a], index[&e.b]);
+    if cannot_link.is_empty() {
+        for e in &edges {
+            uf.union(index[&e.a], index[&e.b]);
+        }
+    } else {
+        // Strongest evidence first; an edge joins two clusters only if no
+        // member of one is exempt from a member of the other. An edge that
+        // would is dropped (the books stay apart unless other evidence
+        // joins them without the conflict).
+        edges.sort_by(|x, y| y.strength.cmp(&x.strength).then(y.confidence.total_cmp(&x.confidence)).then((x.a, x.b).cmp(&(y.a, y.b))));
+        let mut members: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut kept: Vec<Evidence> = Vec::with_capacity(edges.len());
+        for e in edges {
+            let (ia, ib) = (index[&e.a], index[&e.b]);
+            let (ra, rb) = (uf.find(ia), uf.find(ib));
+            if ra != rb {
+                let ma = members.get(&ra).cloned().unwrap_or_else(|| vec![ra]);
+                let mb = members.get(&rb).cloned().unwrap_or_else(|| vec![rb]);
+                if ma.iter().any(|&x| mb.iter().any(|&y| cannot(x, y))) {
+                    continue;
+                }
+                members.remove(&ra);
+                members.remove(&rb);
+                uf.union(ra, rb);
+                let root = uf.find(ra);
+                members.insert(root, ma.into_iter().chain(mb).collect());
+            }
+            kept.push(e);
+        }
+        edges = kept;
     }
     let mut by_root: HashMap<usize, Vec<Evidence>> = HashMap::new();
     for e in edges {
@@ -1248,10 +1311,10 @@ pub fn load_records(cache: &Cache) -> Result<Vec<BookRecord>> {
         }
     }
     let mut records = Vec::new();
-    let mut stmt = conn.prepare("SELECT id, title FROM books ORDER BY id")?;
-    for row in stmt.query_map([], |r| Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?)))? {
-        let (id, title) = row?;
-        records.push(BookRecord { id, title, authors: authors.remove(&id).unwrap_or_default(), identifiers: identifiers.remove(&id).unwrap_or_default(), stems: stems.remove(&id).unwrap_or_default() });
+    let mut stmt = conn.prepare("SELECT id, title, IFNULL(uuid, '') FROM books ORDER BY id")?;
+    for row in stmt.query_map([], |r| Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))? {
+        let (id, title, uuid) = row?;
+        records.push(BookRecord { id, title, authors: authors.remove(&id).unwrap_or_default(), identifiers: identifiers.remove(&id).unwrap_or_default(), stems: stems.remove(&id).unwrap_or_default(), uuid });
     }
     Ok(records)
 }
@@ -1262,12 +1325,19 @@ pub fn load_records(cache: &Cache) -> Result<Vec<BookRecord>> {
 pub struct PdfBookInfo {
     pub page_count: u32,
     pub has_text: bool,
+    /// Mostly image pages (a scan). With `has_text` false this is an
+    /// image-only PDF, the worst copy to keep.
+    pub scanned: bool,
     pub size: i64,
 }
 
 /// A scan's groups, and what it knows about the library's PDFs.
 pub struct ScanOutcome {
     pub groups: Vec<Group>,
+    /// Every book in the library as the matcher saw it (with its `uuid`).
+    pub records: Vec<BookRecord>,
+    /// How many "not a duplicate" exemptions were applied.
+    pub exemptions_applied: usize,
     /// Fingerprinted PDFs, by book.
     pub pdf: HashMap<i32, PdfBookInfo>,
     pub status: crate::pdf_similarity::PdfStatus,
@@ -1295,22 +1365,110 @@ pub fn scan_library_full(cache: &Cache, min: Strength) -> Result<ScanOutcome> {
     let mut pdf = HashMap::new();
     for l in &loaded {
         for &book in &l.books {
-            pdf.insert(book, PdfBookInfo { page_count: l.fingerprint.page_count, has_text: l.fingerprint.has_text, size: l.size });
+            pdf.insert(book, PdfBookInfo { page_count: l.fingerprint.page_count, has_text: l.fingerprint.has_text, scanned: l.fingerprint.scanned, size: l.size });
         }
     }
     let edges = if min <= Strength::Exact { crate::pdf_similarity::edges_for(&loaded).0 } else { Vec::new() };
-    let groups = find_groups_vetoed(&records, &content, &edges, &loaded, min);
-    Ok(ScanOutcome { groups, pdf, status: cache.checksums().pdf_status()?, empty_files: cache.checksums().empty_files("format")? })
+    let cannot_link = crate::dedupe_exemptions::cannot_link(cache, &records)?;
+    let exemptions_applied = cannot_link.values().map(|s| s.len()).sum::<usize>() / 2;
+    let groups = find_groups_full(&records, &content, &edges, &loaded, min, &cannot_link);
+    Ok(ScanOutcome { groups, records, exemptions_applied, pdf, status: cache.checksums().pdf_status()?, empty_files: cache.checksums().empty_files("format")? })
 }
 
-/// Which copy of a PDF group to keep: the one with a text layer, then the
-/// one with more pages, then the larger file, then the lowest id. An
-/// optimizer shrinks images, so of two re-saves the larger is the original;
+/// Which copy of a PDF group to keep: the one with a text layer, then not an
+/// image-only scan, then more pages, then the larger file, then the lowest id.
+/// An optimizer shrinks images, so of two re-saves the larger is the original;
 /// of a scan and its OCR the text layer is what was added on purpose. A book
 /// with no fingerprint ranks last.
 pub fn best_pdf_destination(ids: &[i32], pdf: &HashMap<i32, PdfBookInfo>) -> Option<i32> {
-    let rank = |id: &i32| pdf.get(id).map(|p| (true, p.has_text, p.page_count, p.size)).unwrap_or((false, false, 0, 0));
+    let rank = |id: &i32| pdf.get(id).map(|p| (true, p.has_text, !(p.scanned && !p.has_text), p.page_count, p.size)).unwrap_or((false, false, false, 0, 0));
     ids.iter().copied().max_by(|a, b| rank(a).cmp(&rank(b)).then(b.cmp(a)))
+}
+
+/// One format file of a book, as the duplicate panel shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BookFile {
+    /// Upper-case, `EPUB`.
+    pub format: String,
+    /// Path relative to the library root, `/`-separated.
+    pub path: String,
+    pub size: i64,
+}
+
+/// What the duplicate panel and the keeper heuristic need to know about a
+/// book beyond title and authors. Loaded for many books at once by
+/// [`load_facts`] (a handful of queries in all, not ten per book).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BookFacts {
+    pub id: i32,
+    /// `books.path`: the folder, relative to the library root.
+    pub folder: String,
+    pub files: Vec<BookFile>,
+    /// How many of authors (known), series, publisher, tags, comments, rating,
+    /// identifiers, languages are filled in; the same count
+    /// `merge::book_summary` makes.
+    pub metadata: u32,
+    pub has_cover: bool,
+}
+
+impl BookFacts {
+    pub fn total_size(&self) -> i64 {
+        self.files.iter().map(|f| f.size.max(0)).sum()
+    }
+}
+
+/// [`BookFacts`] for `ids`, from a few `IN (...)` queries per chunk of 400
+/// books. `records` supplies authors and identifiers (already in memory).
+pub fn load_facts(cache: &Cache, ids: &[i32], records: &HashMap<i32, &BookRecord>) -> Result<HashMap<i32, BookFacts>> {
+    let mut out: HashMap<i32, BookFacts> = HashMap::new();
+    let conn = cache.backend.conn.lock().unwrap();
+    for chunk in ids.chunks(400) {
+        let list = chunk.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        {
+            let mut stmt = conn.prepare(&format!("SELECT id, IFNULL(path, ''), IFNULL(has_cover, 0) FROM books WHERE id IN ({list})"))?;
+            for row in stmt.query_map([], |r| Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))? {
+                let (id, folder, has_cover) = row?;
+                out.insert(id, BookFacts { id, folder, has_cover: has_cover != 0, ..Default::default() });
+            }
+        }
+        {
+            let mut stmt = conn.prepare(&format!("SELECT book, format, name, IFNULL(uncompressed_size, 0) FROM data WHERE book IN ({list}) ORDER BY book, id"))?;
+            for row in stmt.query_map([], |r| Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?)))? {
+                let (book, format, name, size) = row?;
+                if let Some(f) = out.get_mut(&book) {
+                    let file = format!("{name}.{}", format.to_lowercase());
+                    let path = if f.folder.is_empty() { file } else { format!("{}/{file}", f.folder.trim_end_matches('/')) };
+                    f.files.push(BookFile { format: format.to_uppercase(), path, size });
+                }
+            }
+        }
+        let mut filled: HashMap<i32, u32> = HashMap::new();
+        for sql in [
+            format!("SELECT DISTINCT book FROM books_series_link WHERE book IN ({list})"),
+            format!("SELECT DISTINCT book FROM books_publishers_link WHERE book IN ({list})"),
+            format!("SELECT DISTINCT book FROM books_tags_link WHERE book IN ({list})"),
+            format!("SELECT DISTINCT book FROM books_languages_link WHERE book IN ({list})"),
+            format!("SELECT DISTINCT book FROM comments WHERE TRIM(text) != '' AND book IN ({list})"),
+            format!("SELECT DISTINCT l.book FROM books_ratings_link l JOIN ratings r ON r.id = l.rating WHERE r.rating > 0 AND l.book IN ({list})"),
+        ] {
+            let mut stmt = conn.prepare(&sql)?;
+            for row in stmt.query_map([], |r| r.get::<_, i32>(0))? {
+                *filled.entry(row?).or_default() += 1;
+            }
+        }
+        for (&id, f) in out.iter_mut().filter(|(id, _)| chunk.contains(id)) {
+            f.metadata = filled.get(&id).copied().unwrap_or(0);
+            if let Some(r) = records.get(&id) {
+                if !r.identifiers.is_empty() {
+                    f.metadata += 1;
+                }
+                if r.authors.first().is_some_and(|a| !is_unknown_author(a)) {
+                    f.metadata += 1;
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// An index of a library's exact `(title, author)` keys, for asking "is
@@ -1348,7 +1506,7 @@ mod tests {
     use super::*;
 
     fn rec(id: i32, title: &str, authors: &[&str], identifiers: &[(&str, &str)]) -> BookRecord {
-        BookRecord { id, title: title.to_string(), authors: authors.iter().map(|s| s.to_string()).collect(), identifiers: identifiers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), stems: Vec::new() }
+        BookRecord { id, title: title.to_string(), authors: authors.iter().map(|s| s.to_string()).collect(), identifiers: identifiers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), stems: Vec::new(), uuid: format!("uuid-{id}") }
     }
 
     fn groups(records: &[BookRecord], min: Strength) -> Vec<Vec<i32>> {
@@ -1853,5 +2011,61 @@ mod tests {
         let g = find_groups(&recs, &[], Strength::Fuzzy);
         eprintln!("dedupe scale: {} books -> {} groups in {:?}", recs.len(), g.len(), start.elapsed());
         assert!(g.len() >= 2000, "the planted duplicates were found");
+    }
+
+    // ---- "not a duplicate" exemptions (tranche 12) ----
+
+    fn cannot(pairs: &[(i32, i32)]) -> CannotLink {
+        let mut m = CannotLink::new();
+        for &(a, b) in pairs {
+            m.entry(a).or_default().insert(b);
+            m.entry(b).or_default().insert(a);
+        }
+        m
+    }
+
+    fn ids_of(groups: &[Group]) -> Vec<Vec<i32>> {
+        groups.iter().map(|g| g.book_ids.clone()).collect()
+    }
+
+    #[test]
+    fn a_group_whose_members_are_all_exempt_disappears() {
+        let recs = vec![rec(1, "The Hobbit", &["J.R.R. Tolkien"], &[]), rec(2, "Hobbit, The", &["Tolkien, J.R.R."], &[]), rec(3, "The Hobbit", &["J. R. R. Tolkien"], &[])];
+        assert_eq!(ids_of(&find_groups_full(&recs, &[], &[], &[], Strength::Fuzzy, &CannotLink::new())), vec![vec![1, 2, 3]]);
+        let all = cannot(&[(1, 2), (1, 3), (2, 3)]);
+        assert!(find_groups_full(&recs, &[], &[], &[], Strength::Fuzzy, &all).is_empty());
+    }
+
+    #[test]
+    fn a_partly_exempt_group_splits_and_the_exempt_pair_is_never_together() {
+        let recs = vec![rec(1, "The Hobbit", &["J.R.R. Tolkien"], &[]), rec(2, "Hobbit, The", &["Tolkien, J.R.R."], &[]), rec(3, "The Hobbit", &["J. R. R. Tolkien"], &[])];
+        let groups = find_groups_full(&recs, &[], &[], &[], Strength::Fuzzy, &cannot(&[(1, 2)]));
+        assert_eq!(ids_of(&groups), vec![vec![1, 3]]);
+        // 2 and 3 remain a pair when the exempt one is 1/3.
+        let groups = find_groups_full(&recs, &[], &[], &[], Strength::Fuzzy, &cannot(&[(1, 3)]));
+        assert_eq!(ids_of(&groups), vec![vec![1, 2]]);
+    }
+
+    #[test]
+    fn a_chain_of_evidence_cannot_reunite_an_exempt_pair() {
+        // 1~2 by one ISBN and 2~3 by another; 1 and 3 are exempt.
+        let recs = vec![
+            rec(1, "Alpha One", &["A. Writer"], &[("isbn", "9780261102217")]),
+            rec(2, "Beta Two", &["B. Writer"], &[("isbn", "9780261102217"), ("isbn", "9780140449136")]),
+            rec(3, "Gamma Three", &["C. Writer"], &[("isbn", "9780140449136")]),
+        ];
+        assert_eq!(ids_of(&find_groups_full(&recs, &[], &[], &[], Strength::Fuzzy, &CannotLink::new())), vec![vec![1, 2, 3]]);
+        let groups = find_groups_full(&recs, &[], &[], &[], Strength::Fuzzy, &cannot(&[(1, 3)]));
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        assert!(!(groups[0].book_ids.contains(&1) && groups[0].book_ids.contains(&3)), "{groups:?}");
+    }
+
+    #[test]
+    fn identical_files_are_split_by_exemptions_too() {
+        let recs = vec![rec(1, "One", &["A. Writer"], &[]), rec(2, "Two", &["B. Writer"], &[]), rec(3, "Three", &["C. Writer"], &[])];
+        let content = vec![vec![1, 2, 3]];
+        assert_eq!(ids_of(&find_groups_full(&recs, &content, &[], &[], Strength::Fuzzy, &CannotLink::new())), vec![vec![1, 2, 3]]);
+        assert_eq!(ids_of(&find_groups_full(&recs, &content, &[], &[], Strength::Fuzzy, &cannot(&[(2, 3)]))), vec![vec![1, 2]]);
+        assert!(find_groups_full(&recs, &content, &[], &[], Strength::Fuzzy, &cannot(&[(1, 2), (1, 3), (2, 3)])).is_empty());
     }
 }

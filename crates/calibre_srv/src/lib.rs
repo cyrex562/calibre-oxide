@@ -174,6 +174,7 @@ pub mod convert;
 pub mod custom_columns;
 pub mod data_files;
 pub mod duplicates;
+pub mod duplicates_review;
 pub mod editor_tools;
 pub mod errors;
 pub mod fts;
@@ -406,6 +407,14 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/rename-files/{library_id}", post(rename_files::rename_files))
         .route("/duplicates/scan/{library_id}", post(duplicates::scan))
         .route("/duplicates/merge-exact/{library_id}", post(merge_books::merge_exact))
+        .route("/duplicates/groups/{library_id}", get(duplicates_review::groups))
+        .route("/duplicates/drop/{library_id}", post(duplicates_review::drop_route))
+        .route("/duplicates/exempt/{library_id}", post(duplicates_review::exempt))
+        .route("/duplicates/exemptions/{library_id}", get(duplicates_review::exemptions))
+        .route("/duplicates/exemptions/remove/{library_id}", post(duplicates_review::remove_exemption))
+        .route("/duplicates/resolve/{library_id}", post(duplicates_review::resolve_route))
+        .route("/duplicates/runs/{library_id}", get(duplicates_review::runs))
+        .route("/duplicates/runs/{library_id}/{run_id}/restore", post(duplicates_review::restore_run))
         .route("/cdb/merge-books/{library_id}", post(merge_books::merge_books))
         .route("/cdb/merge-books", post(merge_books::merge_books_no_library))
         .route("/tweak/open/{book_id}/{fmt}/{library_id}", post(tweak::open_session))

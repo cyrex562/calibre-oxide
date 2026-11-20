@@ -140,6 +140,35 @@ pub(crate) struct BookManifest {
     /// Whether the sidecar cover travelled with the entry.
     #[serde(default)]
     stored_cover: bool,
+    /// The bulk-resolve run that trashed this book (see [`with_trash_run`]),
+    /// so a whole run can be undone at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
+}
+
+thread_local! {
+    static TRASH_RUN: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` with every book trashed *on this thread* inside it tagged with
+/// `run_id` in its trash manifest. Used by the duplicate resolver so
+/// "restore this run" can find exactly what the run trashed (a merge trashes
+/// its sources through the same path, so they are tagged too).
+pub fn with_trash_run<T>(run_id: &str, f: impl FnOnce() -> T) -> T {
+    struct Reset(Option<String>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            TRASH_RUN.with(|r| *r.borrow_mut() = previous);
+        }
+    }
+    let previous = TRASH_RUN.with(|r| r.borrow_mut().replace(run_id.to_string()));
+    let _reset = Reset(previous);
+    f()
+}
+
+fn current_trash_run() -> Option<String> {
+    TRASH_RUN.with(|r| r.borrow().clone())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,6 +240,9 @@ pub struct TrashEntry {
     pub original_path: String,
     /// Why this entry cannot be restored, if it cannot.
     pub problem: Option<String>,
+    /// The duplicate-resolve run that trashed it, if one did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 /// What a book moved into the trash did.
@@ -383,6 +415,7 @@ impl Cache {
             files,
             has_cover: self.has_cover(book_id).unwrap_or(false),
             stored_cover: false,
+            run_id: current_trash_run(),
         })
     }
 
@@ -565,6 +598,7 @@ impl Cache {
                 expires_at: m.deleted_at + expiry,
                 original_path: m.path,
                 problem: None,
+                run_id: m.run_id,
             }),
             Err(_) => {
                 // Something calibre put there, or a half-written entry:
@@ -594,6 +628,7 @@ impl Cache {
                     expires_at: at + expiry,
                     original_path: String::new(),
                     problem: Some("this entry has no oxide-trash.json, so it cannot be restored here".to_string()),
+                    run_id: None,
                 })
             }
         }
@@ -618,6 +653,7 @@ impl Cache {
             expires_at: deleted_at + expiry,
             original_path: m.formats.values().next().map(|f| f.rel_dir.clone()).unwrap_or_default(),
             problem: None,
+            run_id: None,
         })
     }
 
@@ -925,6 +961,62 @@ impl Cache {
                 None
             }
         }
+    }
+}
+
+/// What [`Cache::restore_trash_run`] did.
+#[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
+pub struct RunRestore {
+    pub restored: Vec<RestoredBook>,
+    /// `(entry key, why)` for entries that could not be restored (already in
+    /// the library, expired and gone, missing file). They stay in the trash.
+    pub failed: Vec<(String, String)>,
+}
+
+/// One bulk-resolve run as the trash shows it.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TrashRun {
+    pub run_id: String,
+    pub books: usize,
+    pub bytes: i64,
+    /// Unix seconds of the newest entry.
+    pub deleted_at: i64,
+}
+
+impl Cache {
+    /// The book entries a resolve run trashed, newest first.
+    pub fn trash_entries_for_run(&self, run_id: &str) -> Result<Vec<TrashEntry>> {
+        Ok(self.list_trash()?.into_iter().filter(|e| e.kind == TrashKind::Book && e.run_id.as_deref() == Some(run_id)).collect())
+    }
+
+    /// Every run that still has entries in the trash, newest first.
+    pub fn trash_runs(&self) -> Result<Vec<TrashRun>> {
+        let mut by_run: BTreeMap<String, TrashRun> = BTreeMap::new();
+        for e in self.list_trash()? {
+            let Some(run_id) = e.run_id.clone().filter(|_| e.kind == TrashKind::Book) else { continue };
+            let run = by_run.entry(run_id.clone()).or_insert(TrashRun { run_id, books: 0, bytes: 0, deleted_at: 0 });
+            run.books += 1;
+            run.bytes += e.size;
+            run.deleted_at = run.deleted_at.max(e.deleted_at);
+        }
+        let mut runs: Vec<TrashRun> = by_run.into_values().collect();
+        runs.sort_by(|a, b| b.deleted_at.cmp(&a.deleted_at).then(a.run_id.cmp(&b.run_id)));
+        Ok(runs)
+    }
+
+    /// Restores every book the run trashed, each as [`Cache::restore_trashed_book`]
+    /// does (same uuid, same id if free). A failure on one entry does not stop
+    /// the rest. **This does not undo a merge's changes to the keeper** (formats
+    /// copied in, metadata folded in); it only brings the trashed books back.
+    pub fn restore_trash_run(&self, run_id: &str) -> Result<RunRestore> {
+        let mut out = RunRestore::default();
+        for entry in self.trash_entries_for_run(run_id)? {
+            match self.restore_trashed_book(&entry.key) {
+                Ok(book) => out.restored.push(book),
+                Err(e) => out.failed.push((entry.key, format!("{e:#}"))),
+            }
+        }
+        Ok(out)
     }
 }
 
