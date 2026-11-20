@@ -635,7 +635,7 @@ export interface LibraryJobProgress {
 
 export interface LibraryJob<R = unknown> {
   id: number;
-  kind: "scan" | "enrich" | "hash_backfill" | "pdf_fingerprint" | "merge_exact" | "import" | "dedupe" | "resolve" | "prepare" | "absorb" | "unabsorb" | "copy";
+  kind: "scan" | "enrich" | "hash_backfill" | "pdf_fingerprint" | "merge_exact" | "import" | "dedupe" | "resolve" | "prepare" | "absorb" | "unabsorb" | "copy" | "organize" | "undo_organize";
   /** `interrupted`: the server process ended while it ran (read back from `.calibre-oxide/jobs.json`). */
   state: "running" | "finished" | "cancelled" | "failed" | "interrupted";
   /** Interrupted and able to continue by itself: POST `/<resume_route>/default`. */
@@ -1312,6 +1312,90 @@ export function fetchResolveRuns(): Promise<{ runs: ResolveRun[] }> {
 /** Puts back every book the run trashed. */
 export function restoreResolveRun(runId: string): Promise<{ run_id: string; restored: { book_id: number; title: string }[]; failed: [string, string][]; needs_rescan: boolean }> {
   return jsonFetch(`/duplicates/runs/default/${encodeURIComponent(runId)}/restore`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+}
+
+/** Which books to organize: exactly one of the three, or none for every book. */
+export interface OrganizeScope {
+  bookIds?: number[];
+  search?: string;
+  pathPrefix?: string;
+}
+
+export interface OrganizeMove {
+  book_id: number;
+  title: string;
+  format: string;
+  from: string;
+  to: string;
+  /** The name had to be numbered, because the target was taken. */
+  suffixed: boolean;
+}
+
+export interface OrganizePlan {
+  plan_fingerprint: string;
+  template: string;
+  books: number;
+  files: number;
+  /** Books whose target name was taken and so got a number. */
+  conflicts: number;
+  already_organized: number;
+  skipped: { book_id: number; reason: string }[];
+  /** At most 500; `books` and `files` are the totals. */
+  moves: OrganizeMove[];
+}
+
+export interface OrganizeReport {
+  run_id: string;
+  books_planned: number;
+  books_moved: number;
+  files_moved: number;
+  failed: { book_id: number; reason: string }[];
+  cancelled: boolean;
+}
+
+export interface OrganizeUndoReport {
+  run_id: string;
+  books_restored: number;
+  files_restored: number;
+  skipped: { book_id: number; reason: string }[];
+}
+
+export interface OrganizeRun {
+  run_id: string;
+  /** Seconds since the epoch. */
+  created_at: number;
+  books: number;
+  undone: boolean;
+}
+
+function organizeBody(template: string, scope: OrganizeScope, extra: Record<string, unknown>): string {
+  return JSON.stringify({
+    ...(template.trim() ? { template: template.trim() } : {}),
+    ...(scope.bookIds ? { book_ids: scope.bookIds } : {}),
+    ...(scope.search !== undefined ? { search: scope.search } : {}),
+    ...(scope.pathPrefix !== undefined ? { path_prefix: scope.pathPrefix } : {}),
+    ...extra,
+  });
+}
+
+/** The dry run: what organizing would move. Changes nothing. */
+export function planOrganize(template: string, scope: OrganizeScope): Promise<OrganizePlan> {
+  return jsonFetch<OrganizePlan>("/organize-library/default", { method: "POST", headers: { "Content-Type": "application/json" }, body: organizeBody(template, scope, { dry_run: true }) });
+}
+
+/** Executes the previewed plan as a job. The server answers 409 if the library or scope changed since. */
+export function runOrganize(template: string, scope: OrganizeScope, planFingerprint: string, handlers: LibraryJobHandlers<OrganizeReport> = {}): Promise<OrganizeReport> {
+  return runLibraryJob<OrganizeReport>("/organize-library/default", handlers, JSON.parse(organizeBody(template, scope, { dry_run: false, plan_fingerprint: planFingerprint })));
+}
+
+/** Runs that can be undone, newest first as the server lists them. */
+export function fetchOrganizeRuns(): Promise<{ runs: OrganizeRun[] }> {
+  return jsonFetch("/organize-runs/default");
+}
+
+/** Moves a run's files back, as a job. */
+export function undoOrganize(runId: string, handlers: LibraryJobHandlers<OrganizeUndoReport> = {}): Promise<OrganizeUndoReport> {
+  return runLibraryJob<OrganizeUndoReport>("/unorganize-library/default", handlers, { run_id: runId });
 }
 
 /** What the PDF fingerprint job did. */
