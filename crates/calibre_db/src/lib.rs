@@ -19,6 +19,7 @@ pub mod dedupe_exemptions;
 pub mod resolve;
 pub mod pdf_similarity;
 pub mod pdf_worker;
+pub mod absorb;
 pub mod enrich_batch;
 pub mod custom_columns;
 #[cfg(unix)]

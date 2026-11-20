@@ -249,6 +249,26 @@ fn source_formats(src_cache: &Cache, book_id: i32) -> Result<Vec<SourceFormat>> 
 /// file exists, and if a later step fails the partly-built destination
 /// book is removed again; the source is never touched here.
 pub fn copy_one_book_detailed(src_cache: &Cache, dest_cache: &Cache, book_id: i32, check_duplicates: bool) -> Result<Option<CopiedBook>> {
+    if check_duplicates {
+        // One book: one index. A caller copying many builds the index once
+        // itself and uses [`copy_one_book_with_index`] (or [`copy_books`]).
+        let mut index = crate::dedupe::ExactIndex::build(dest_cache)?;
+        copy_one_book_with_index(src_cache, dest_cache, book_id, Some(&mut index))
+    } else {
+        copy_one_book_with_index(src_cache, dest_cache, book_id, None)
+    }
+}
+
+/// [`copy_one_book_detailed`] against a duplicate index the caller owns.
+///
+/// With `Some(index)` a book matching one already in the destination is
+/// skipped (`Ok(None)`), and a book that is copied is added to `index`, so
+/// the index stays current for the next book -- building it again for every
+/// book was O(n^2) over a bulk copy. With `None` nothing is checked.
+///
+/// The destination book is filed in `Author/Title (id)/` (the layout of
+/// [`crate::import`] and of calibre itself), not dropped in the library root.
+pub fn copy_one_book_with_index(src_cache: &Cache, dest_cache: &Cache, book_id: i32, mut index: Option<&mut crate::dedupe::ExactIndex>) -> Result<Option<CopiedBook>> {
     // 1. Read the source. Everything is read straight from the tables so
     // that values containing separators survive.
     type Row = (String, Option<String>, Option<String>, f64, Option<String>, Option<String>);
@@ -264,8 +284,8 @@ pub fn copy_one_book_detailed(src_cache: &Cache, dest_cache: &Cache, book_id: i3
     let authors = real_authors(src_cache, book_id)?;
 
     // 2. Check Duplicates in Dest
-    if check_duplicates {
-        let matches = find_duplicate_books(dest_cache, &title, &authors)?;
+    if let Some(index) = index.as_deref() {
+        let matches = index.lookup(&title, &authors);
         if !matches.is_empty() {
             // A same-author, same-normalised-title book already exists in the
             // destination -- report "duplicate, nothing added" rather
@@ -289,14 +309,16 @@ pub fn copy_one_book_detailed(src_cache: &Cache, dest_cache: &Cache, book_id: i3
         mi.authors = authors;
     }
 
-    // 4. Create the destination book on the real add path.
-    let new_id = match formats.first() {
-        Some(first) => dest_cache.add_book(&first.path, &mi)?,
-        None => dest_cache.add_book_db_entry(&mi, "")?,
-    };
+    // 4. Create the destination book and file it under `Author/Title (id)`:
+    //    the row first (the id is in the folder's name), then its formats
+    //    through `add_format`, which writes into the book's folder.
+    let new_id = dest_cache.add_book_db_entry(&mi, "")?;
 
     let result = (|| -> Result<Vec<String>> {
-        for f in formats.iter().skip(1) {
+        let author = mi.authors.first().map(String::as_str).unwrap_or("Unknown");
+        let (folder, _) = crate::cache::import_names(new_id, &mi.title, author);
+        dest_cache.place_book_in_folder(new_id, &folder)?;
+        for f in &formats {
             if !dest_cache.add_format(new_id, &f.path, &f.format, true)? {
                 anyhow::bail!("could not add the {} format to the new book", f.format);
             }
@@ -404,7 +426,12 @@ pub fn copy_one_book_detailed(src_cache: &Cache, dest_cache: &Cache, book_id: i3
     })();
 
     match result {
-        Ok(skipped_custom_columns) => Ok(Some(CopiedBook { book_id: new_id, skipped_custom_columns })),
+        Ok(skipped_custom_columns) => {
+            if let Some(index) = index.as_deref_mut() {
+                index.insert(new_id, &mi.title, &mi.authors);
+            }
+            Ok(Some(CopiedBook { book_id: new_id, skipped_custom_columns }))
+        }
         Err(e) => {
             // Do not leave a half-built book behind. It only holds files
             // this function just copied, so sending them to the
@@ -434,7 +461,9 @@ pub fn verify_copy(src_cache: &Cache, dest_cache: &Cache, src_id: i32, dest_id: 
         if dest_len != src_len {
             anyhow::bail!("the destination {key} file is {dest_len} bytes but the source's is {src_len}");
         }
-        let hash = |p: &std::path::Path| -> Result<String> { Ok(blake3::hash(&std::fs::read(p)?).to_hex().to_string()) };
+        // Streamed in megabyte chunks: this used to read both whole files
+        // into memory, which for a large PDF or audiobook is the file twice.
+        let hash = |p: &std::path::Path| -> Result<String> { Ok(crate::scan_pipeline::hash_stream(p, None).with_context(|| format!("reading {}", p.display()))?.hash) };
         if hash(&d.path)? != hash(&f.path)? {
             anyhow::bail!("the destination {key} file differs from the source's");
         }
@@ -457,6 +486,105 @@ pub fn verify_copy(src_cache: &Cache, dest_cache: &Cache, src_id: i32, dest_id: 
 pub fn remove_source_after_copy(src_cache: &Cache, dest_cache: &Cache, src_id: i32, dest_id: i32) -> Result<crate::removal::RemovalReport> {
     verify_copy(src_cache, dest_cache, src_id, dest_id).with_context(|| format!("not removing source book {src_id}: the copy could not be verified"))?;
     crate::removal::delete_with_file(src_cache, src_id)
+}
+
+/// What to do in a bulk copy.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CopyOptions {
+    /// Skip a book the destination already has (same normalised title and an
+    /// overlapping author).
+    pub check_duplicates: bool,
+    /// Remove each source book after its copy has been verified.
+    pub move_books: bool,
+}
+
+/// What happened to one source book of a bulk copy.
+#[derive(Debug, Clone, Default, serde::Serialize, PartialEq, Eq)]
+pub struct CopyEntry {
+    pub source_id: i32,
+    /// The copy (or, for a move, the removal) went through. A duplicate
+    /// skipped is `ok` with no `copied_as`.
+    pub ok: bool,
+    /// The new book's id in the destination.
+    pub copied_as: Option<i32>,
+    /// Skipped because the destination has it already.
+    pub duplicate: bool,
+    pub error: Option<String>,
+    pub skipped_custom_columns: Vec<String>,
+    pub warnings: Vec<String>,
+    /// For a move: the source book was removed.
+    pub source_removed: bool,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct CopyReport {
+    pub entries: Vec<CopyEntry>,
+    pub copied: usize,
+    pub duplicates: usize,
+    pub failed: usize,
+    pub removed_from_source: usize,
+    pub cancelled: bool,
+}
+
+/// Copies (or moves) `book_ids` from `src_cache` into `dest_cache`: the cross
+/// library copy as a job body. Counts on `control` (`total`, `added` for books
+/// copied, `already_known` for duplicates skipped, `errors`) and stops between
+/// books when it is cancelled; what was copied stays.
+///
+/// The duplicate index is built **once** and kept current as books are added,
+/// and a failing book is reported without stopping the rest.
+pub fn copy_books(src_cache: &Cache, dest_cache: &Cache, book_ids: &[i32], options: CopyOptions, control: &crate::scan_pipeline::JobControl) -> Result<CopyReport> {
+    use std::sync::atomic::Ordering;
+    control.set_phase("copying");
+    control.total.store(book_ids.len() as u64, Ordering::Relaxed);
+    let mut index = if options.check_duplicates { Some(crate::dedupe::ExactIndex::build(dest_cache)?) } else { None };
+    let mut report = CopyReport::default();
+    for &book_id in book_ids {
+        if control.is_cancelled() {
+            report.cancelled = true;
+            break;
+        }
+        let mut entry = CopyEntry { source_id: book_id, ..Default::default() };
+        match copy_one_book_with_index(src_cache, dest_cache, book_id, index.as_mut()) {
+            Ok(Some(copied)) => {
+                entry.ok = true;
+                entry.copied_as = Some(copied.book_id);
+                entry.skipped_custom_columns = copied.skipped_custom_columns;
+                report.copied += 1;
+                control.added.fetch_add(1, Ordering::Relaxed);
+                if options.move_books {
+                    // The source goes only once the copy has been verified
+                    // file by file; otherwise it stays and the entry says why.
+                    match remove_source_after_copy(src_cache, dest_cache, book_id, copied.book_id) {
+                        Ok(removal) => {
+                            entry.source_removed = true;
+                            report.removed_from_source += 1;
+                            entry.warnings = removal.failed.iter().map(|(p, why)| format!("could not remove {p} from the source library: {why}")).collect();
+                        }
+                        Err(e) => {
+                            entry.ok = false;
+                            entry.error = Some(format!("copied to the destination as book {}, but the source book was kept: {e:#}", copied.book_id));
+                            report.failed += 1;
+                            control.errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+            Ok(None) => {
+                entry.ok = true;
+                entry.duplicate = true;
+                report.duplicates += 1;
+                control.already_known.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                entry.error = Some(format!("{e:#}"));
+                report.failed += 1;
+                control.errors.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        report.entries.push(entry);
+    }
+    Ok(report)
 }
 
 #[cfg(test)]

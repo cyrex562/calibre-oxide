@@ -315,6 +315,13 @@ fn walk_dir(root: &Path, dir: &Path, options: &ScanOptions, now: SystemTime, rep
 /// Descending into one would double-track every book it contains: the
 /// nested library's own database already knows about them, and this one
 /// would claim them too. Recognised by the two things every library has.
+///
+/// Only a **live** `metadata.db` counts. A calibre library this library has
+/// absorbed ([`crate::absorb`]) has had its database renamed to
+/// `metadata.db.absorbed-by-calibre-oxide`, so it is no longer "a library of
+/// its own": the scan descends into it, finds its files already tracked, and
+/// would pick up a loose file dropped into it later. Renaming the database
+/// back is the undo.
 fn holds_its_own_library(dir: &Path) -> bool {
     dir.join("metadata.db").exists() || dir.join(LIBRARY_HANDLE_DIR_NAME).is_dir()
 }

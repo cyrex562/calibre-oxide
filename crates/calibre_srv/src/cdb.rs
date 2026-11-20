@@ -583,7 +583,68 @@ fn default_duplicate_action() -> String {
     "add".to_string()
 }
 
-async fn copy_to_library_handle(state: AppState, target_library_id: String, source_library_id: Option<String>, body: CopyToLibraryBody) -> Result<Json<Value>, ServerError> {
+/// `?job=true` on the copy routes: run the copy as a library job and answer
+/// with its id at once, instead of holding the request until every book is
+/// copied. Progress, cancel and the report are on `/library-jobs/{id}`.
+#[derive(Debug, Default, Deserialize)]
+pub struct CopyToLibraryQuery {
+    #[serde(default)]
+    job: bool,
+}
+
+/// One book's entry in this route's long-standing response shape.
+fn legacy_entry(entry: &Value) -> Value {
+    let copied_as = entry.get("copied_as").and_then(Value::as_i64);
+    if entry["duplicate"] == true {
+        return serde_json::json!({"ok": true, "payload": null});
+    }
+    if let Some(error) = entry["error"].as_str() {
+        let mut failed = serde_json::json!({"ok": false, "payload": error});
+        if let Some(id) = copied_as {
+            failed["copied_as"] = serde_json::json!(id);
+        }
+        return failed;
+    }
+    let mut ok = serde_json::json!({"ok": true, "payload": copied_as});
+    if entry["skipped_custom_columns"].as_array().is_some_and(|a| !a.is_empty()) {
+        ok["skipped_custom_columns"] = entry["skipped_custom_columns"].clone();
+    }
+    if entry["warnings"].as_array().is_some_and(|a| !a.is_empty()) {
+        ok["warnings"] = entry["warnings"].clone();
+    }
+    ok
+}
+
+/// The `{source id: entry}` response of a finished copy, and the ids to tell
+/// connected clients about: books added to the destination, books removed
+/// from the source.
+fn legacy_response(report: &Value) -> (Value, Vec<i32>, Vec<i32>) {
+    let mut response = serde_json::Map::new();
+    let (mut added, mut removed) = (Vec::new(), Vec::new());
+    for entry in report["entries"].as_array().into_iter().flatten() {
+        let source_id = entry["source_id"].as_i64().unwrap_or(0) as i32;
+        if let Some(id) = entry["copied_as"].as_i64() {
+            added.push(id as i32);
+        }
+        if entry["source_removed"] == true {
+            removed.push(source_id);
+        }
+        response.insert(source_id.to_string(), legacy_entry(entry));
+    }
+    (Value::Object(response), added, removed)
+}
+
+fn publish_copy_events(state: &AppState, added: Vec<i32>, removed: Vec<i32>) {
+    if !added.is_empty() {
+        web_socket::publish(state, ChangeEvent::BooksAdded { book_ids: added });
+    }
+    if !removed.is_empty() {
+        web_socket::publish(state, ChangeEvent::BooksDeleted { book_ids: removed });
+    }
+}
+
+async fn copy_to_library_handle(state: AppState, target_library_id: String, source_library_id: Option<String>, query: CopyToLibraryQuery, body: CopyToLibraryBody) -> Result<axum::response::Response, ServerError> {
+    use axum::response::IntoResponse;
     let CopyToLibraryBody { book_ids, move_books, duplicate_action } = body;
     if book_ids.is_empty() {
         return Err(ServerError::BadRequest("book_ids must not be empty".to_string()));
@@ -598,7 +659,7 @@ async fn copy_to_library_handle(state: AppState, target_library_id: String, sour
     if duplicate_action != "add" && duplicate_action != "ignore" {
         return Err(ServerError::BadRequest("duplicate_action must be one of: add, ignore".to_string()));
     }
-    let check_duplicates = duplicate_action == "ignore";
+    let options = calibre_db::copy_to_library::CopyOptions { check_duplicates: duplicate_action == "ignore", move_books };
 
     let src_cache = state
         .cache_for(source_library_id.as_deref())
@@ -622,62 +683,37 @@ async fn copy_to_library_handle(state: AppState, target_library_id: String, sour
         )));
     }
 
-    let (response, added_ids, removed_ids) = tokio::task::spawn_blocking(move || {
-        let mut response = serde_json::Map::new();
-        // `removed_ids` are source ids; `added_ids` are destination ids.
-        let mut removed_ids = Vec::new();
-        let mut added_ids: Vec<i32> = Vec::new();
-        for book_id in book_ids {
-            match calibre_db::copy_to_library::copy_one_book_detailed(&src_cache, &dest_cache, book_id, check_duplicates) {
-                Ok(Some(copied)) => {
-                    added_ids.push(copied.book_id);
-                    let mut entry = serde_json::json!({"ok": true, "payload": copied.book_id});
-                    if !copied.skipped_custom_columns.is_empty() {
-                        entry["skipped_custom_columns"] = serde_json::json!(copied.skipped_custom_columns);
+    if query.job {
+        use crate::library_jobs::{self, CopyJob, JobKind, JobParams, Started};
+        let params = JobParams { copy: Some(CopyJob { source: src_cache, book_ids, options }), ..Default::default() };
+        return Ok(match library_jobs::start_with(dest_cache, JobKind::Copy, None, params) {
+            Started::New(job) => {
+                // Connected clients learn of the books when the job is done.
+                let (watched, state) = (job.clone(), state.clone());
+                tokio::spawn(async move {
+                    watched.wait().await;
+                    if let Some(report) = watched.report() {
+                        let (_, added, removed) = legacy_response(&report);
+                        publish_copy_events(&state, added, removed);
                     }
-                    if move_books {
-                        // The source goes only once the destination copy
-                        // has been verified file by file; otherwise the
-                        // source stays and the entry reports why.
-                        match calibre_db::copy_to_library::remove_source_after_copy(&src_cache, &dest_cache, book_id, copied.book_id) {
-                            Ok(report) => {
-                                removed_ids.push(book_id);
-                                if !report.failed.is_empty() {
-                                    entry["warnings"] = serde_json::json!(report.failed.iter().map(|(p, why)| format!("could not remove {p} from the source library: {why}")).collect::<Vec<_>>());
-                                }
-                            }
-                            Err(e) => {
-                                entry = serde_json::json!({
-                                    "ok": false,
-                                    "payload": format!("copied to the destination as book {}, but the source book was kept: {e:#}", copied.book_id),
-                                    "copied_as": copied.book_id,
-                                });
-                            }
-                        }
-                    }
-                    response.insert(book_id.to_string(), entry);
-                }
-                Ok(None) => {
-                    response.insert(book_id.to_string(), serde_json::json!({"ok": true, "payload": null}));
-                }
-                Err(e) => {
-                    response.insert(book_id.to_string(), serde_json::json!({"ok": false, "payload": format!("{e:#}")}));
-                }
+                });
+                (axum::http::StatusCode::ACCEPTED, Json(serde_json::json!({"job_id": job.id, "kind": "copy", "state": "running", "already_running": false, "status_url": format!("/library-jobs/{}", job.id)}))).into_response()
             }
-        }
-        (Value::Object(response), added_ids, removed_ids)
+            Started::AlreadyRunning(job) => (axum::http::StatusCode::ACCEPTED, Json(serde_json::json!({"job_id": job.id, "kind": "copy", "state": "running", "already_running": true, "status_url": format!("/library-jobs/{}", job.id)}))).into_response(),
+            Started::Busy(active) => (axum::http::StatusCode::CONFLICT, Json(serde_json::json!({"error": "another job is already running on this library", "job_id": active.id, "kind": active.kind.name()}))).into_response(),
+        });
+    }
+
+    let report = tokio::task::spawn_blocking(move || {
+        let control = calibre_db::scan_pipeline::JobControl::default();
+        calibre_db::copy_to_library::copy_books(&src_cache, &dest_cache, &book_ids, options, &control)
     })
     .await
-    .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
-
-    if !added_ids.is_empty() {
-        web_socket::publish(&state, ChangeEvent::BooksAdded { book_ids: added_ids });
-    }
-    if !removed_ids.is_empty() {
-        web_socket::publish(&state, ChangeEvent::BooksDeleted { book_ids: removed_ids });
-    }
-
-    Ok(Json(response))
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))?
+    .map_err(|e| ServerError::InternalServerError(format!("{e:#}")))?;
+    let (response, added_ids, removed_ids) = legacy_response(&serde_json::to_value(&report).map_err(|e| ServerError::InternalServerError(e.to_string()))?);
+    publish_copy_events(&state, added_ids, removed_ids);
+    Ok(Json(response).into_response())
 }
 
 /// `POST /cdb/copy-to-library/{target_library_id}/{library_id}`. Port
@@ -690,14 +726,14 @@ async fn copy_to_library_handle(state: AppState, target_library_id: String, sour
 /// meaningless without automerge support, so this port doesn't parse
 /// them at all rather than silently ignoring accepted-but-inert
 /// fields.
-pub async fn copy_to_library(State(state): State<AppState>, Path((target_library_id, library_id)): Path<(String, String)>, Json(body): Json<CopyToLibraryBody>) -> Result<Json<Value>, ServerError> {
-    copy_to_library_handle(state, target_library_id, Some(library_id), body).await
+pub async fn copy_to_library(State(state): State<AppState>, Path((target_library_id, library_id)): Path<(String, String)>, Query(query): Query<CopyToLibraryQuery>, Json(body): Json<CopyToLibraryBody>) -> Result<axum::response::Response, ServerError> {
+    copy_to_library_handle(state, target_library_id, Some(library_id), query, body).await
 }
 
 /// Same as [`copy_to_library`], for a URL with no source
 /// `{library_id}` segment -- always copies from the default library.
-pub async fn copy_to_library_no_source(State(state): State<AppState>, Path(target_library_id): Path<String>, Json(body): Json<CopyToLibraryBody>) -> Result<Json<Value>, ServerError> {
-    copy_to_library_handle(state, target_library_id, None, body).await
+pub async fn copy_to_library_no_source(State(state): State<AppState>, Path(target_library_id): Path<String>, Query(query): Query<CopyToLibraryQuery>, Json(body): Json<CopyToLibraryBody>) -> Result<axum::response::Response, ServerError> {
+    copy_to_library_handle(state, target_library_id, None, query, body).await
 }
 
 /// One `calibre_db::cli` command reachable via [`cmd`] -- port of a
@@ -1365,6 +1401,68 @@ mod tests {
         assert_eq!(dest_cache.field_for(new_id, "authors").unwrap().as_deref(), Some("Jane Doe"));
         // The source book and its file are still there after a plain copy.
         assert!(src_dir.path().join("Source Book.epub").exists());
+    }
+
+    /// The copied book is filed as `Author/Title (id)`, not dropped in the
+    /// library root.
+    #[tokio::test]
+    async fn copy_to_library_files_the_book_under_author_and_title() {
+        let (src_dir, dest_dir, broker, router) = test_app_with_two_libraries();
+        let src_name = src_dir.path().file_name().unwrap().to_str().unwrap();
+        let dest_name = dest_dir.path().file_name().unwrap().to_str().unwrap();
+
+        let (status, body) = post_json(&router, &format!("/cdb/copy-to-library/{dest_name}/{src_name}"), serde_json::json!({"book_ids": [1]})).await;
+        assert_eq!(status, StatusCode::OK, "got: {body}");
+        let new_id = body["1"]["payload"].as_i64().unwrap() as i32;
+        let dest_cache = broker.get(Some(dest_name)).unwrap();
+        let path = dest_cache.field_for(new_id, "path").unwrap().unwrap();
+        assert_eq!(path, format!("Jane Doe/Source Book ({new_id})"));
+        let file = dest_cache.format_file_info(new_id).unwrap().remove(0).path;
+        assert_eq!(file.parent().unwrap(), dest_dir.path().join(&path));
+        assert!(!dest_dir.path().join("Source Book.epub").exists(), "nothing is dropped in the library root");
+    }
+
+    /// `?job=true` answers with a job id, and the job reports progress and the
+    /// per-book result.
+    #[tokio::test]
+    async fn copy_to_library_as_a_job_reports_progress_and_what_was_copied() {
+        let (src_dir, dest_dir, broker, router) = test_app_with_two_libraries();
+        let src_name = src_dir.path().file_name().unwrap().to_str().unwrap();
+        let dest_name = dest_dir.path().file_name().unwrap().to_str().unwrap();
+        let src_cache = broker.get(Some(src_name)).unwrap();
+        add_test_book(src_dir.path(), &src_cache, "Second Book", "Jane Doe");
+
+        let (status, started) = post_json(&router, &format!("/cdb/copy-to-library/{dest_name}/{src_name}?job=true"), serde_json::json!({"book_ids": [1, 2], "duplicate_action": "ignore"})).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "got: {started}");
+        assert_eq!(started["kind"], "copy");
+        let id = started["job_id"].as_u64().unwrap();
+        let mut job = serde_json::Value::Null;
+        for _ in 0..400 {
+            job = get_json(&router, &format!("/library-jobs/{id}")).await.1;
+            if job["state"] != "running" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(job["state"], "finished", "{job}");
+        assert_eq!(job["report"]["copied"], 2, "{job}");
+        assert_eq!(job["progress"]["total"], 2);
+        assert_eq!(job["progress"]["added"], 2);
+        assert_eq!(broker.get(Some(dest_name)).unwrap().all_book_ids().unwrap().len(), 2);
+
+        // Again: both are duplicates now, counted as such.
+        let (_, started) = post_json(&router, &format!("/cdb/copy-to-library/{dest_name}/{src_name}?job=true"), serde_json::json!({"book_ids": [1, 2], "duplicate_action": "ignore"})).await;
+        let id = started["job_id"].as_u64().unwrap();
+        for _ in 0..400 {
+            job = get_json(&router, &format!("/library-jobs/{id}")).await.1;
+            if job["state"] != "running" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(job["report"]["duplicates"], 2, "{job}");
+        assert_eq!(job["progress"]["already_known"], 2);
+        assert_eq!(broker.get(Some(dest_name)).unwrap().all_book_ids().unwrap().len(), 2);
     }
 
     /// The key the web client sends, and the one the server documents.

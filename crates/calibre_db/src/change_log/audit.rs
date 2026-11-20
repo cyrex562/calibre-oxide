@@ -198,6 +198,33 @@ macro_rules! lib_case {
     };
 }
 
+/// A calibre-made library (calibre's schema, one book with its files) at
+/// `Nested Calibre` under `library`, left as calibre leaves one: no
+/// `.calibre-oxide` folder.
+fn nested_calibre_library(library: &Path) {
+    let nested = library.join("Nested Calibre");
+    {
+        let n = Cache::new(&nested).unwrap();
+        n.add_custom_column("shelf", "Shelf", "text", false).unwrap();
+        n.add_custom_column("nested_only", "Nested Only", "series", false).unwrap();
+        {
+            let conn = n.backend.conn.lock().unwrap();
+            conn.execute("INSERT INTO books (id, title, author_sort, path, has_cover) VALUES (1, 'Nested Book', 'Nested Author', 'Nested Author/Nested Book (1)', 1)", []).unwrap();
+            conn.execute("INSERT INTO authors (name, sort) VALUES ('Nested Author', 'Author, Nested')", []).unwrap();
+            conn.execute("INSERT INTO books_authors_link (book, author) SELECT 1, id FROM authors WHERE name = 'Nested Author'", []).unwrap();
+            conn.execute("INSERT INTO data (book, format, uncompressed_size, name) VALUES (1, 'PDF', 13, 'Nested Book - Nested Author')", []).unwrap();
+        }
+        n.set_custom_column_value(1, "shelf", "Nested Shelf").unwrap();
+        n.set_custom_column_value(1, "nested_only", "Nested Saga [2]").unwrap();
+        n.set_field(1, "tags", "nested tag").unwrap();
+        let dir = nested.join("Nested Author/Nested Book (1)");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Nested Book - Nested Author.pdf"), b"%PDF-1.4 nest").unwrap();
+        std::fs::write(dir.join("cover.jpg"), b"\xFF\xD8\xFF\xE0 nested cover").unwrap();
+    }
+    std::fs::remove_dir_all(nested.join(crate::constants::LIBRARY_HANDLE_DIR_NAME)).unwrap();
+}
+
 /// One real write per public mutating operation. Adding a method that
 /// mutates the database means adding a case here, and
 /// [`every_mutating_method_is_audited`] fails until you do.
@@ -401,6 +428,20 @@ const CASES: &[Case] = &[
         c.set_book_path(f.first, rel).unwrap();
         c.rename_book_files(f.first, "Retitled", "Shared Author").unwrap();
     }),
+    case!("place_book_in_folder", |c, f| c.place_book_in_folder(f.first, "Shared Author/First Book (1)").unwrap()),
+    // A calibre library nested in this one, brought in place: its book with
+    // its author, a custom column this library lacks and one it has.
+    case!("absorb_library", |c, _| {
+        nested_calibre_library(&c.backend.library_path);
+        crate::absorb::absorb_library(c, "Nested Calibre", &Default::default(), &crate::scan_pipeline::PipelineOptions::with_workers(1), &crate::scan_pipeline::JobControl::default()).unwrap();
+    }),
+    case!("unabsorb_library", |c, f| {
+        nested_calibre_library(&c.backend.library_path);
+        crate::absorb::absorb_library(c, "Nested Calibre", &Default::default(), &crate::scan_pipeline::PipelineOptions::with_workers(1), &crate::scan_pipeline::JobControl::default()).unwrap();
+        crate::absorb::unabsorb_library(c, "Nested Calibre", &crate::scan_pipeline::JobControl::default()).unwrap();
+        // Something must differ from the start for the case to prove anything.
+        c.set_field(f.first, "title", "Changed After").unwrap();
+    }),
     case!("clear_preference", |c, _| {
         c.set_preference("audit_pref", "audit_value").unwrap();
         c.clear_preference("audit_pref").unwrap();
@@ -530,6 +571,10 @@ const ACCOUNTED: &[(&str, Account)] = &[
     ("cache.rs::link_many_to_many_in", Case("set_field tags")),
     ("cache.rs::insert_book_in_tx", Case("register_books_in_place (batch)")),
     ("cache.rs::import_books_batch", Case("import_books_batch")),
+    ("cache.rs::place_book_in_folder", Case("place_book_in_folder")),
+    ("absorb.rs::register_one", Case("absorb_library")),
+    ("absorb.rs::intern", Case("absorb_library")),
+    ("absorb.rs::unabsorb_library", Case("unabsorb_library")),
     ("covers.rs::set_cover", Case("covers::set_cover")),
     ("backend.rs::set_pref", Case("Cache::set_pref (plain key)")),
     ("cache.rs::set_book_path", Replay("records a `path` FieldSet itself; exercised by the rename_book_files case")),

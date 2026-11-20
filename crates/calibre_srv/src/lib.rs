@@ -204,6 +204,7 @@ pub mod rename_files;
 pub mod scan_library;
 pub mod library_jobs;
 pub mod library_trash;
+pub mod absorb_library;
 pub mod import_folder;
 pub mod render_endpoints;
 pub mod save_to_disk;
@@ -385,6 +386,9 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/prepare-library/{library_id}", post(library_jobs::prepare).get(library_jobs::prepare_status))
         .route("/library-untracked/{library_id}", get(scan_library::untracked))
         .route("/import-folder/{library_id}", post(import_folder::import))
+        .route("/absorbable-libraries/{library_id}", get(absorb_library::list))
+        .route("/absorb-library/{library_id}", post(absorb_library::absorb))
+        .route("/unabsorb-library/{library_id}", post(absorb_library::unabsorb))
         .route("/trash/{library_id}", get(library_trash::list))
         .route("/trash/restore/{library_id}", post(library_trash::restore))
         .route("/trash/delete/{library_id}", post(library_trash::delete))

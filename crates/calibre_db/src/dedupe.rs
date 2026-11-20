@@ -1477,9 +1477,33 @@ pub struct ExactIndex {
     map: HashMap<(String, String), Vec<i32>>,
 }
 
+thread_local! {
+    /// How many times [`ExactIndex::build`] ran on this thread. A seam for
+    /// tests that prove a bulk copy builds the destination's index once, not
+    /// once per book.
+    static EXACT_INDEX_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`ExactIndex::build`] calls made on the calling thread so far.
+pub fn exact_index_builds_on_this_thread() -> usize {
+    EXACT_INDEX_BUILDS.with(|c| c.get())
+}
+
 impl ExactIndex {
     pub fn build(cache: &Cache) -> Result<Self> {
+        EXACT_INDEX_BUILDS.with(|c| c.set(c.get() + 1));
         Ok(Self::from_records(&load_records(cache)?))
+    }
+
+    /// Adds one book, so an index built once stays current while books are
+    /// added to the library it describes.
+    pub fn insert(&mut self, id: i32, title: &str, authors: &[String]) {
+        for key in exact_keys(title, authors) {
+            let ids = self.map.entry(key).or_default();
+            if ids.last() != Some(&id) {
+                ids.push(id);
+            }
+        }
     }
 
     pub fn from_records(records: &[BookRecord]) -> Self {
