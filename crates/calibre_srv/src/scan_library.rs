@@ -333,9 +333,21 @@ mod tests {
         let id = started["job_id"].as_u64().unwrap();
         wait_for_job(&router, id).await;
 
-        let text = std::fs::read_to_string(dir.path().join(".calibre-oxide").join("jobs.json")).expect("jobs.json is written");
-        let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
-        let rec = doc["jobs"].as_array().unwrap().iter().find(|j| j["id"] == id).expect("the job is recorded");
+        // The job reads as finished a moment before its final state is saved,
+        // so give the save a little time instead of racing it.
+        let path = dir.path().join(".calibre-oxide").join("jobs.json");
+        let mut rec = serde_json::Value::Null;
+        for _ in 0..50 {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let doc: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+                if let Some(found) = doc["jobs"].as_array().and_then(|jobs| jobs.iter().find(|j| j["id"] == id && j["state"] == "finished")) {
+                    rec = found.clone();
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(rec.is_object(), "jobs.json records the finished job");
         assert_eq!(rec["kind"], "scan");
         assert_eq!(rec["state"], "finished");
         assert!(rec["report"].is_object());

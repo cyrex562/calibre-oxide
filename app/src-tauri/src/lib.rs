@@ -17,7 +17,9 @@
 //! check/shutdown, binary/asset resolution) and [`settings`]
 //! (persisted library path).
 
+mod folder_check;
 mod library_import;
+mod logs;
 mod menu;
 mod page_event;
 mod server;
@@ -27,6 +29,7 @@ use std::sync::Mutex;
 
 use tauri::{AppHandle, Manager, State, Url};
 use tauri_plugin_dialog::DialogExt;
+
 use tauri_plugin_opener::OpenerExt;
 
 #[tauri::command]
@@ -55,8 +58,28 @@ impl ServerState {
 /// previously-persisted library) and the "choose library" flow (a
 /// freshly-picked one).
 fn open_library(app: &AppHandle, library_path: std::path::PathBuf) -> Result<(), String> {
+    // A failure from an earlier attempt must not be shown as this one's.
+    *app.state::<logs::LaunchFailureState>().0.lock().unwrap() = None;
+    let result = start_library(app, library_path);
+    // Whatever the outcome is, the splash can ask for it: a start that
+    // fails on a background thread (the automatic reopen at launch) has no
+    // caller to return the error to.
+    let dir = logs::log_dir(app);
+    let failures = app.state::<logs::LaunchFailureState>();
+    match &result {
+        Ok(()) => *failures.0.lock().unwrap() = None,
+        Err(message) => {
+            logs::append_app_log(&dir, &format!("could not open library: {message}"));
+            *failures.0.lock().unwrap() = Some(logs::LaunchFailure::new(message.clone(), &dir));
+        }
+    }
+    result
+}
+
+fn start_library(app: &AppHandle, library_path: std::path::PathBuf) -> Result<(), String> {
     let state = app.state::<ServerState>();
     state.kill();
+    let log_dir = logs::log_dir(app);
 
     let bin = server::resolve_calibre_srv_binary(app).map_err(|e| e.to_string())?;
     let static_dir = server::resolve_web_dist(app).map_err(|e| e.to_string())?;
@@ -67,15 +90,27 @@ fn open_library(app: &AppHandle, library_path: std::path::PathBuf) -> Result<(),
     // current one, so `library_id` in a URL addresses something real and
     // copy-to-library has somewhere to copy to (#959).
     let also_serve = settings::list_recent_libraries(app);
-    let child = server::spawn(&bin, &library_path, &static_dir, port, pdfium.as_deref(), &also_serve).map_err(|e| e.to_string())?;
-    *state.0.lock().unwrap() = Some((child, port));
+    // A log that cannot be opened must not stop the library opening.
+    let log = logs::rotate_server_log(&log_dir).map_err(|e| logs::append_app_log(&log_dir, &format!("cannot open server log: {e}"))).ok();
+    let mut child = server::spawn(&bin, &library_path, &static_dir, port, pdfium.as_deref(), &also_serve, log).map_err(|e| format!("could not start {}: {e}", bin.display()))?;
 
     // Opening a large library (a NAS-sized metadata.db, a change-log replay)
     // can take well over ten seconds before the server binds its port.
     let ready_within = server::ready_timeout();
-    if !server::wait_until_ready(port, ready_within) {
-        return Err(format!("calibre_srv did not become ready on port {port} within {}s", ready_within.as_secs()));
+    let readiness = server::wait_until_ready(port, ready_within, || child.try_wait().ok().flatten().map(|status| status.to_string()));
+    match readiness {
+        server::Readiness::Ready => {}
+        server::Readiness::Exited(how) => {
+            let _ = child.wait();
+            return Err(format!("calibre_srv stopped while starting ({how})"));
+        }
+        server::Readiness::TimedOut => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("calibre_srv did not become ready on port {port} within {}s", ready_within.as_secs()));
+        }
     }
+    *state.0.lock().unwrap() = Some((child, port));
 
     let url = Url::parse(&format!("http://127.0.0.1:{port}/")).map_err(|e| e.to_string())?;
     let window = app.get_webview_window("main").ok_or("no main window")?;
@@ -116,8 +151,42 @@ async fn choose_library(app: AppHandle) -> Result<bool, String> {
         return Ok(false);
     };
     let path = picked.into_path().map_err(|e| e.to_string())?;
+    // Not a library yet: ask before the server writes a database into it.
+    if !folder_check::is_existing_library(&path) && !confirm(&app, "Create a new library?", folder_check::NEW_LIBRARY_PROMPT.to_string(), "Create library", "Cancel").await {
+        return Ok(false);
+    }
+    if folder_check::is_on_network_drive(&path) && !confirm(&app, "Network drive", folder_check::network_warning(&path), "Open anyway", "Cancel").await {
+        return Ok(false);
+    }
     open_library(&app, path)?;
     Ok(true)
+}
+
+/// A native OK/Cancel question; `true` only for the OK button.
+async fn confirm(app: &AppHandle, title: &str, message: String, ok: &str, cancel: &str) -> bool {
+    use tauri_plugin_dialog::{MessageDialogButtons, MessageDialogKind};
+    let (tx, mut rx) = tauri::async_runtime::channel(1);
+    app.dialog().message(message).title(title).kind(MessageDialogKind::Warning).buttons(MessageDialogButtons::OkCancelCustom(ok.to_string(), cancel.to_string())).show(move |yes| {
+        let _ = tx.try_send(yes);
+    });
+    rx.recv().await.unwrap_or(false)
+}
+
+/// Why the last attempt to start a library failed, with the tail of the
+/// server's log, or `None` if the last attempt worked. The splash asks
+/// for this while it waits, because a start that fails in the background
+/// (reopening the last library at launch) has no caller to return to.
+#[tauri::command]
+fn get_launch_failure(state: State<'_, logs::LaunchFailureState>) -> Option<logs::LaunchFailure> {
+    state.0.lock().unwrap().clone()
+}
+
+/// Opens the folder holding `server.log` and `app.log`.
+#[tauri::command]
+fn open_log_folder(app: AppHandle) -> Result<(), String> {
+    let dir = logs::log_dir(&app);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    app.opener().open_path(dir.to_string_lossy(), None::<&str>).map_err(|e| e.to_string())
 }
 
 /// Real whole-library import (issue #761): picks a real `.zip` archive
@@ -211,6 +280,9 @@ async fn create_library(app: AppHandle, name: String) -> Result<Option<String>, 
     };
     let parent = parent.into_path().map_err(|e| e.to_string())?;
     let target = parent.join(&trimmed);
+    if folder_check::is_on_network_drive(&parent) && !confirm(&app, "Network drive", folder_check::network_warning(&parent), "Create anyway", "Cancel").await {
+        return Ok(None);
+    }
 
     // Refuse rather than merge. An existing directory may be somebody
     // else's data, and opening it as a library would adopt whatever is
@@ -293,6 +365,17 @@ async fn choose_import_folder(app: AppHandle) -> Result<Option<String>, String> 
         return Ok(None);
     };
     let dir = picked.into_path().map_err(|e| e.to_string())?;
+    Ok(Some(dir.to_string_lossy().into_owned()))
+}
+
+/// A native folder picker for the web UI's "Export a copy" dialog: the chosen
+/// folder's path, or `None` if the dialog was cancelled. It only picks; the
+/// server plans and writes the copy.
+#[tauri::command]
+async fn pick_folder(app: AppHandle) -> Result<Option<String>, String> {
+    let Some(dir) = pick_folder_path(&app).await else {
+        return Ok(None);
+    };
     Ok(Some(dir.to_string_lossy().into_owned()))
 }
 
@@ -484,7 +567,7 @@ fn checked_ext(fmt: &str) -> Result<String, String> {
     Ok(ext)
 }
 
-async fn pick_folder(app: &AppHandle) -> Option<std::path::PathBuf> {
+async fn pick_folder_path(app: &AppHandle) -> Option<std::path::PathBuf> {
     let (tx, mut rx) = tauri::async_runtime::channel(1);
     app.dialog().file().pick_folder(move |result| {
         let _ = tx.try_send(result);
@@ -517,7 +600,7 @@ async fn unpack_book(state: State<'_, ServerState>, app: AppHandle, book_id: i32
     let port = state.0.lock().unwrap().as_ref().map(|(_, p)| *p).ok_or("no library is currently open")?;
     let ext = checked_ext(&fmt)?;
 
-    let Some(parent) = pick_folder(&app).await else {
+    let Some(parent) = pick_folder_path(&app).await else {
         return Ok(None);
     };
 
@@ -548,7 +631,7 @@ async fn repack_book(state: State<'_, ServerState>, app: AppHandle, book_id: i32
     let port = state.0.lock().unwrap().as_ref().map(|(_, p)| *p).ok_or("no library is currently open")?;
     let ext = checked_ext(&fmt)?;
 
-    let Some(dir) = pick_folder(&app).await else {
+    let Some(dir) = pick_folder_path(&app).await else {
         return Ok(false);
     };
 
@@ -698,7 +781,7 @@ async fn choose_auto_add_folder(app: AppHandle, clear: bool) -> Result<Option<St
         settings::set_auto_add_folder(&app, None).map_err(|e| e.to_string())?;
         return Ok(None);
     }
-    let Some(folder) = pick_folder(&app).await else {
+    let Some(folder) = pick_folder_path(&app).await else {
         return Ok(settings::get_auto_add_folder(&app).map(|p| p.to_string_lossy().into_owned()));
     };
     settings::set_auto_add_folder(&app, Some(folder.clone())).map_err(|e| e.to_string())?;
@@ -820,7 +903,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(ServerState::default())
-        .invoke_handler(tauri::generate_handler![ping, get_persisted_library, choose_library, create_library, choose_import_folder, list_recent_libraries, open_recent_library, get_auto_reopen, set_auto_reopen, import_library_archive, set_menu_actions, open_book_format, unpack_book, repack_book, open_external_url, reveal_library_folder, reveal_book_folder, get_auto_add_folder, choose_auto_add_folder])
+        .manage(logs::LaunchFailureState::default())
+        .invoke_handler(tauri::generate_handler![ping, get_launch_failure, open_log_folder, get_persisted_library, choose_library, create_library, choose_import_folder, list_recent_libraries, open_recent_library, get_auto_reopen, set_auto_reopen, import_library_archive, set_menu_actions, open_book_format, unpack_book, repack_book, open_external_url, reveal_library_folder, reveal_book_folder, get_auto_add_folder, choose_auto_add_folder, pick_folder])
         .on_menu_event(|app, event| menu::forward(app, &event))
         // Dropping files onto the window adds them, the same way the
         // folder picker does. This has to be handled natively: Tauri's
@@ -862,9 +946,8 @@ pub fn run() {
                 if let Some(path) = settings::load_library_path(app.handle()) {
                     let handle = app.handle().clone();
                     std::thread::spawn(move || {
-                        if let Err(e) = open_library(&handle, path) {
-                            eprintln!("failed to reopen the last library on startup: {e}");
-                        }
+                        // open_library has already logged this and recorded it for the splash.
+                        let _ = open_library(&handle, path);
                     });
                 }
             }

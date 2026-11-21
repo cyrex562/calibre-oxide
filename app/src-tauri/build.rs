@@ -26,6 +26,9 @@
 
 const COMMANDS: &[&str] = &[
     "ping",
+    // Launch diagnostics
+    "get_launch_failure",
+    "open_log_folder",
     // Library lifecycle
     "get_persisted_library",
     "choose_library",
@@ -37,6 +40,8 @@ const COMMANDS: &[&str] = &[
     "choose_import_folder",
     "get_auto_add_folder",
     "choose_auto_add_folder",
+    // A native folder picker for "Export a copy"
+    "pick_folder",
     // Books on disk
     "open_book_format",
     "unpack_book",

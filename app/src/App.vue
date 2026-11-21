@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { onMounted, onUnmounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 
 // The real library UI is the browser app served from web/dist, spawned
@@ -30,15 +30,60 @@ async function checkPersistedLibrary() {
     invoke<string[]>("list_recent_libraries").catch(() => [] as string[]),
   ]);
   recents.value = recentList;
+  watchAutoReopen = !!path;
   status.value = path ? "opening" : "no-library";
 }
 
+/** What the Rust side recorded when the last start failed (see logs.rs). */
+interface LaunchFailure {
+  message: string;
+  log_tail: string[];
+  log_dir: string;
+}
+const failure = ref<LaunchFailure | null>(null);
+
 function fail(e: unknown) {
   status.value = "error";
-  errorMessage.value = e instanceof Error ? e.message : String(e);
+  errorMessage.value = typeof e === "string" ? e : e instanceof Error ? e.message : String(e);
+  // The command's own error is one line; the log tail says why.
+  invoke<LaunchFailure | null>("get_launch_failure")
+    .then((f) => (failure.value = f))
+    .catch(() => {});
+}
+
+async function openLogFolder() {
+  try {
+    await invoke("open_log_folder");
+  } catch (e) {
+    errorMessage.value = `Could not open the log folder: ${e}`;
+  }
+}
+
+// Reopening the last library at launch runs on a background thread, so a
+// failure there reaches nobody as a return value. While the splash says
+// "Starting your library", ask now and then whether it failed instead.
+let failurePoll: ReturnType<typeof setInterval> | undefined;
+// Only for the automatic reopen: a start the user triggered reports its own
+// result, and a failure left over from before it must not be shown again.
+let watchAutoReopen = false;
+async function pollForFailure() {
+  if (!watchAutoReopen || status.value !== "opening") return;
+  try {
+    const f = await invoke<LaunchFailure | null>("get_launch_failure");
+    if (f && status.value === "opening") {
+      watchAutoReopen = false;
+      failure.value = f;
+      errorMessage.value = f.message;
+      status.value = "error";
+    }
+  } catch {
+    // Not fatal: the next tick asks again.
+  }
 }
 
 async function pickLibrary() {
+  watchAutoReopen = false;
+  failure.value = null;
   status.value = "opening";
   errorMessage.value = "";
   try {
@@ -68,6 +113,8 @@ async function createLibrary() {
 }
 
 async function openRecent(path: string) {
+  watchAutoReopen = false;
+  failure.value = null;
   status.value = "opening";
   errorMessage.value = "";
   try {
@@ -83,7 +130,11 @@ function shortName(path: string): string {
   return parts[parts.length - 1] ?? path;
 }
 
-onMounted(checkPersistedLibrary);
+onMounted(() => {
+  checkPersistedLibrary();
+  failurePoll = setInterval(pollForFailure, 1000);
+});
+onUnmounted(() => clearInterval(failurePoll));
 </script>
 
 <template>
@@ -96,7 +147,16 @@ onMounted(checkPersistedLibrary);
     <div v-else class="card">
       <h1>calibre-oxide</h1>
 
-      <p v-if="status === 'error'" class="error">Could not open that library: {{ errorMessage }}</p>
+      <div v-if="status === 'error'" class="failure" role="alert">
+        <p class="error">Could not open that library: {{ errorMessage }}</p>
+        <template v-if="failure">
+          <p v-if="failure.log_tail.length" class="sub">The end of the server log:</p>
+          <pre v-if="failure.log_tail.length" class="log-tail">{{ failure.log_tail.join("\n") }}</pre>
+          <p v-else class="sub">The server wrote nothing to its log.</p>
+          <p class="sub log-path">Logs are in {{ failure.log_dir }}</p>
+        </template>
+        <button type="button" @click="openLogFolder">Open log folder</button>
+      </div>
 
       <!--
         Says what a library *is*. The single most common confusion:
@@ -110,7 +170,7 @@ onMounted(checkPersistedLibrary);
           <button type="button" class="primary" @click="creating = true">Create a library…</button>
           <button type="button" @click="pickLibrary">Open a library…</button>
         </div>
-        <p class="sub">Creating one makes an empty folder ready for books. Opening one can point at an existing folder, or at an empty folder to start fresh.</p>
+        <p class="sub">Creating one makes an empty folder ready for books. Opening one can point at an existing library; on a folder with no library yet you are asked before one is created there.</p>
       </template>
 
       <form v-else class="create" @submit.prevent="createLibrary">
@@ -268,6 +328,29 @@ h1 {
   margin: 0;
   font-size: var(--fs-small);
   color: var(--fg-faint);
+}
+
+.failure {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  text-align: left;
+}
+.log-tail {
+  margin: 0;
+  padding: var(--sp-4);
+  max-height: 220px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg);
+  font-size: var(--fs-micro);
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: text;
+}
+.log-path {
+  word-break: break-all;
 }
 
 .error {

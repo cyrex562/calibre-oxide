@@ -635,7 +635,7 @@ export interface LibraryJobProgress {
 
 export interface LibraryJob<R = unknown> {
   id: number;
-  kind: "scan" | "enrich" | "hash_backfill" | "pdf_fingerprint" | "merge_exact" | "import" | "dedupe" | "resolve" | "prepare" | "absorb" | "unabsorb" | "copy" | "organize" | "undo_organize" | "retitle" | "undo_retitle";
+  kind: "scan" | "enrich" | "hash_backfill" | "pdf_fingerprint" | "merge_exact" | "import" | "dedupe" | "resolve" | "prepare" | "absorb" | "unabsorb" | "copy" | "organize" | "undo_organize" | "retitle" | "undo_retitle" | "mirror";
   /** `interrupted`: the server process ended while it ran (read back from `.calibre-oxide/jobs.json`). */
   state: "running" | "finished" | "cancelled" | "failed" | "interrupted";
   /** Interrupted and able to continue by itself: POST `/<resume_route>/default`. */
@@ -2235,4 +2235,126 @@ export async function copyToLibrary(targetLibraryId: string, bookIds: number[], 
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ book_ids: bookIds, move_books: moveBooks, duplicate_action: "add" }),
   });
+}
+
+// ----- Export a copy (`POST /mirror-library`) ----------------------------
+
+export type MirrorMode = "travel" | "mirror";
+
+/** Which books a travel copy holds: one of `book_ids` / `folder_prefix`, or everything. */
+export interface MirrorScope {
+  all?: boolean;
+  book_ids?: number[];
+  folder_prefix?: string;
+}
+
+export interface MirrorRequest {
+  target: string;
+  mode: MirrorMode;
+  scope?: MirrorScope;
+  remove_missing: boolean;
+  overwrite_changed: boolean;
+}
+
+export interface MirrorCount {
+  files: number;
+  bytes: number;
+}
+
+export interface MirrorKindTotals {
+  copy_new: MirrorCount;
+  update: MirrorCount;
+  unchanged: MirrorCount;
+  remove: MirrorCount;
+  conflict: MirrorCount;
+}
+
+export interface MirrorTotals extends MirrorKindTotals {
+  bytes_to_copy: number;
+  by_kind: Record<string, MirrorKindTotals>;
+}
+
+export interface MirrorPlanItem {
+  path: string;
+  kind: string;
+  bytes: number;
+  reason: string | null;
+}
+
+export type MirrorAction = "copy_new" | "update" | "remove" | "conflict";
+
+export interface MirrorPlan {
+  fingerprint: string;
+  mode: MirrorMode;
+  target: string;
+  new_target: boolean;
+  /** `local_internal` | `local_external` | `network`. */
+  tier: string;
+  network: boolean;
+  books: number;
+  scope: string;
+  totals: MirrorTotals;
+  /** At most 500 per action; `totals` are complete. */
+  items: Record<MirrorAction, MirrorPlanItem[]>;
+  truncated: Record<MirrorAction, boolean>;
+  /** Travel: change-log entries made on the copy itself. */
+  copy_edits: { count: number; paths: string[] };
+  /** Files the database lists that are not on disk. */
+  missing_sources: { count: number; paths: string[] };
+}
+
+export interface MirrorProblem {
+  path: string;
+  message: string;
+}
+
+export interface MirrorReport {
+  run_id: string;
+  mode: MirrorMode;
+  target: string;
+  copied: number;
+  updated: number;
+  unchanged: number;
+  removed: number;
+  bytes_copied: number;
+  conflicts: MirrorProblem[];
+  failures: MirrorProblem[];
+  cancelled: boolean;
+  edits_set_aside: number;
+  trash: string | null;
+  complete: boolean;
+}
+
+export interface MirrorTarget {
+  target: string;
+  mode: MirrorMode;
+  /** As the server stored it: `"all"`, `{ book_ids }`, `{ folder_prefix }` or `{ too_large }`. */
+  scope: "all" | { book_ids: number[] } | { folder_prefix: string } | { too_large: number } | null;
+  remove_missing: boolean;
+  overwrite_changed: boolean;
+  /** Seconds since the epoch. */
+  last_run_at: number;
+  last_run_id: string | null;
+  last_result: { complete: boolean; cancelled?: boolean; copied?: number; updated?: number; unchanged?: number; removed?: number; conflicts?: number; failures?: number; bytes_copied?: number; error?: string } | null;
+  /** Whether the folder answers right now. */
+  reachable: boolean;
+}
+
+/** The dry run: what the copy would do. Changes nothing. */
+export function planMirror(request: MirrorRequest): Promise<MirrorPlan> {
+  return jsonFetch<MirrorPlan>("/mirror-library/default", { ...JSON_POST, body: JSON.stringify({ ...request, dry_run: true }) });
+}
+
+/** Runs the previewed copy as a job. The server answers 409 if it is no longer that plan. */
+export function runMirror(request: MirrorRequest, fingerprint: string, handlers: LibraryJobHandlers<MirrorReport> = {}): Promise<MirrorReport> {
+  return runLibraryJob<MirrorReport>("/mirror-library/default", handlers, { ...request, dry_run: false, fingerprint });
+}
+
+export async function fetchMirrorTargets(): Promise<MirrorTarget[]> {
+  return (await jsonFetch<{ targets: MirrorTarget[] }>("/mirror-targets/default")).targets;
+}
+
+/** Forgets a remembered target. Never deletes a file. */
+export async function forgetMirrorTarget(target: string): Promise<MirrorTarget[]> {
+  return (await jsonFetch<{ targets: MirrorTarget[] }>("/mirror-targets/remove/default", { ...JSON_POST, body: JSON.stringify({ target }) })).targets;
 }
