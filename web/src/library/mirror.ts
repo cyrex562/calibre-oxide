@@ -308,11 +308,13 @@ export function createMirrorController(api: MirrorApi = realApi, env: MirrorEnv 
   }
 
   /** Prefills the draft from a remembered target and previews it. */
+  /** Overwriting the copy's own edits is a one-off decision: a refresh always
+   *  starts with it off, whatever the last run used. */
   async function refresh(target: MirrorTarget, selectedIds: number[]): Promise<void> {
     const scope = targetScopeKind(target);
     state.rememberedIds = null;
     state.notice = null;
-    state.draft = { mode: target.mode, target: target.target, scope: scope.scope, folderPrefix: scope.folderPrefix, removeMissing: target.remove_missing, overwriteChanged: target.overwrite_changed };
+    state.draft = { mode: target.mode, target: target.target, scope: scope.scope, folderPrefix: scope.folderPrefix, removeMissing: target.remove_missing, overwriteChanged: false };
     if (target.scope && typeof target.scope === "object" && "book_ids" in target.scope) state.rememberedIds = [...target.scope.book_ids];
     if (scope.needsSelection) {
       state.plan = null;
