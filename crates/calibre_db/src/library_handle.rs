@@ -2452,7 +2452,7 @@ pub(crate) fn classify_storage_tier_os(path: &Path) -> StorageTier {
 /// `CALIBRE_OXIDE_STORAGE_TIER` if set (a user override for a share the
 /// OS misreports, and a hook for exercising network behaviour without a
 /// real share), otherwise the OS classification.
-pub(crate) fn classify_storage_tier(path: &Path) -> StorageTier {
+pub fn classify_storage_tier(path: &Path) -> StorageTier {
     crate::storage_safety::tier_override().unwrap_or_else(|| classify_storage_tier_os(path))
 }
 

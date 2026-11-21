@@ -13,6 +13,8 @@
   },
   "permissions": [
     "allow-ping",
+    "allow-get-launch-failure",
+    "allow-open-log-folder",
     "allow-get-persisted-library",
     "allow-choose-library",
     "allow-create-library",

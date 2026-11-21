@@ -18,7 +18,7 @@
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Manager};
@@ -131,7 +131,7 @@ pub fn resolve_pdfium(app: &AppHandle) -> Option<PathBuf> {
 /// The currently-open library is deliberately not repeated in this list:
 /// it is the positional argument, and the broker would skip a duplicate
 /// path anyway.
-pub fn spawn(bin: &Path, library_path: &Path, static_dir: &Path, port: u16, pdfium: Option<&Path>, also_serve: &[PathBuf]) -> io::Result<Child> {
+pub fn spawn(bin: &Path, library_path: &Path, static_dir: &Path, port: u16, pdfium: Option<&Path>, also_serve: &[PathBuf], log: Option<std::fs::File>) -> io::Result<Child> {
     let mut cmd = Command::new(bin);
     cmd.arg(library_path).arg("--static-dir").arg(static_dir).arg("--port").arg(port.to_string());
     for other in also_serve {
@@ -150,6 +150,13 @@ pub fn spawn(bin: &Path, library_path: &Path, static_dir: &Path, port: u16, pdfi
         // `calibredb` included -- and only one of them has a CLI this
         // app constructs.
         cmd.env(calibre_ebooks::pdf::rasterize::LIBRARY_PATH_VAR, pdfium);
+    }
+    // With no console (see below) stdout/stderr go nowhere, and a server
+    // that fails to start would die silently. Both streams go to the same
+    // file so the order of lines is the order things happened.
+    cmd.stdin(Stdio::null());
+    if let Some(log) = log {
+        cmd.stderr(Stdio::from(log.try_clone()?)).stdout(Stdio::from(log));
     }
     no_console_window(&mut cmd);
     cmd.spawn()
@@ -199,20 +206,63 @@ mod ready_timeout_tests {
     }
 }
 
-/// Polls a real TCP connect to `127.0.0.1:<port>` until it succeeds or
-/// `timeout` elapses. A successful connect is a real readiness signal
-/// here (not just "the process exists"): `calibre_srv`'s own startup
-/// only binds the listener once its router/state setup has already
-/// completed, so nothing accepts a connection before it's actually
-/// ready to serve requests.
-pub fn wait_until_ready(port: u16, timeout: Duration) -> bool {
+/// How waiting for the server ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Readiness {
+    Ready,
+    /// The process ended before it ever accepted a connection; carries a
+    /// description of how ("exit code: 1").
+    Exited(String),
+    TimedOut,
+}
+
+/// Polls a real TCP connect to `127.0.0.1:<port>` until it succeeds,
+/// `exited` reports the process is gone, or `timeout` elapses. A
+/// successful connect is a real readiness signal here (not just "the
+/// process exists"): `calibre_srv`'s own startup only binds the listener
+/// once its router/state setup has already completed, so nothing accepts
+/// a connection before it's actually ready to serve requests.
+///
+/// `exited` is what makes a crash on startup (a missing DLL, a corrupt
+/// library) fail in a moment instead of after the full timeout.
+pub fn wait_until_ready(port: u16, timeout: Duration, mut exited: impl FnMut() -> Option<String>) -> Readiness {
     let deadline = Instant::now() + timeout;
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     while Instant::now() < deadline {
         if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
-            return true;
+            return Readiness::Ready;
+        }
+        if let Some(how) = exited() {
+            return Readiness::Exited(how);
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    false
+    Readiness::TimedOut
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+
+    #[test]
+    fn ready_when_something_listens() {
+        let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = l.local_addr().unwrap().port();
+        assert_eq!(wait_until_ready(port, Duration::from_secs(5), || None), Readiness::Ready);
+    }
+
+    #[test]
+    fn a_dead_process_fails_fast_not_after_the_timeout() {
+        let port = find_free_port().unwrap();
+        let started = Instant::now();
+        let r = wait_until_ready(port, Duration::from_secs(30), || Some("exit code: 1".into()));
+        assert_eq!(r, Readiness::Exited("exit code: 1".into()));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn times_out_when_nothing_listens_and_nothing_died() {
+        let port = find_free_port().unwrap();
+        assert_eq!(wait_until_ready(port, Duration::from_millis(300), || None), Readiness::TimedOut);
+    }
 }

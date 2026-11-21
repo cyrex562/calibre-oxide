@@ -26,6 +26,9 @@
 
 const COMMANDS: &[&str] = &[
     "ping",
+    // Launch diagnostics
+    "get_launch_failure",
+    "open_log_folder",
     // Library lifecycle
     "get_persisted_library",
     "choose_library",
