@@ -534,6 +534,9 @@ enum Account {
     /// A real write that is **not** in the log, on purpose, for now. The
     /// reason must name the issue tracking it.
     Unlogged(&'static str),
+    /// Writes a private scratch copy of a database (a snapshot being
+    /// prepared for export), never the open library.
+    Scratch(&'static str),
 }
 use Account::*;
 
@@ -573,6 +576,9 @@ const ACCOUNTED: &[(&str, Account)] = &[
     ("cache.rs::import_books_batch", Case("import_books_batch")),
     ("cache.rs::place_book_in_folder", Case("place_book_in_folder")),
     ("absorb.rs::register_one", Case("absorb_library")),
+    ("mirror.rs::prune_checksums", Scratch("prunes the travel copy's checksums snapshot in the mirror's scratch folder")),
+    ("mirror.rs::prune_notes", Scratch("prunes the travel copy's notes snapshot in the mirror's scratch folder")),
+    ("mirror.rs::rewrite_metadata", Scratch("prunes and re-identifies the copy's metadata.db snapshot in the mirror's scratch folder")),
     ("absorb.rs::intern", Case("absorb_library")),
     ("absorb.rs::unabsorb_library", Case("unabsorb_library")),
     ("covers.rs::set_cover", Case("covers::set_cover")),
