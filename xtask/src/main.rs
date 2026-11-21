@@ -138,7 +138,10 @@ fn build_all(release: bool) -> Result<()> {
 
 fn build_rust(release: bool) -> Result<()> {
     step("building the Rust workspace");
-    let mut args = vec!["build", "--workspace"];
+    // xtask itself is excluded: it is the running exe (`cargo xtask` runs
+    // target/release/xtask.exe), and Windows refuses to replace a running
+    // exe whenever cargo decides to rebuild it.
+    let mut args = vec!["build", "--workspace", "--exclude", "xtask"];
     if release {
         args.push("--release");
     }
@@ -183,7 +186,8 @@ fn package() -> Result<()> {
         "packaging failed -- note that the Linux AppImage bundler downloads its tooling \
          from GitHub while it runs, so this step needs network access that `build` does not",
     )?;
-    let bundle = root().join("target").join("release").join("bundle");
+    let target = std::env::var_os("CARGO_TARGET_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| root().join("target"));
+    let bundle = target.join("release").join("bundle");
     step(&format!("installers are in {}", bundle.display()));
     Ok(())
 }
