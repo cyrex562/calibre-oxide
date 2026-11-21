@@ -63,6 +63,17 @@ fn new_collator(strength: Option<Strength>, case_first: Option<CaseFirst>) -> Co
     Collator::try_new(&Default::default(), options).expect("icu collator data is compiled in via the `compiled_data` feature")
 }
 
+// Building a collator loads and validates its tables, which costs far more
+// than a comparison. The comparators below are called once per pair while
+// sorting (9,767 books sorted by title made ~130k calls and took ~1.5 s with
+// a fresh collator each time), so each kind is built once per thread.
+thread_local! {
+    static SECONDARY: Collator = new_collator(Some(Strength::Secondary), None);
+    static UPPER_FIRST: Collator = new_collator(None, Some(CaseFirst::UpperFirst));
+    static PRIMARY: Collator = new_collator(Some(Strength::Primary), None);
+    static NUMERIC: Collator = new_numeric_collator();
+}
+
 fn new_numeric_collator() -> Collator {
     let mut options = CollatorOptions::new();
     options.strength = Some(Strength::Secondary);
@@ -91,7 +102,7 @@ fn new_numeric_collator() -> Collator {
 /// (natural-sort digit sequences, e.g. `"item2" < "item10"`) is a user
 /// preference this crate has no settings UI for -- not enabled here.
 pub fn strcmp(a: &str, b: &str) -> Ordering {
-    new_collator(Some(Strength::Secondary), None).compare(a, b)
+    SECONDARY.with(|c| c.compare(a, b))
 }
 
 /// Port of `calibre.utils.icu.case_sensitive_strcmp`
@@ -103,13 +114,13 @@ pub fn strcmp(a: &str, b: &str) -> Ordering {
 /// a separate, explicitly-opted-into function precisely because it's
 /// NOT the default sort behavior.
 pub fn case_sensitive_strcmp(a: &str, b: &str) -> Ordering {
-    new_collator(None, Some(CaseFirst::UpperFirst)).compare(a, b)
+    UPPER_FIRST.with(|c| c.compare(a, b))
 }
 
 /// Port of `calibre.utils.icu.primary_strcmp`: case- and
 /// accent-insensitive locale-aware comparison.
 pub fn primary_strcmp(a: &str, b: &str) -> Ordering {
-    new_collator(Some(Strength::Primary), None).compare(a, b)
+    PRIMARY.with(|c| c.compare(a, b))
 }
 
 pub fn lower(text: &str) -> String {
@@ -143,7 +154,7 @@ pub fn capitalize(text: &str) -> String {
 /// with `Vec::sort_by`/`.then_with(...)` wherever upstream would embed
 /// `numeric_sort_key(x)` in a tuple sort key.
 pub fn numeric_strcmp(a: &str, b: &str) -> Ordering {
-    new_numeric_collator().compare(a, b)
+    NUMERIC.with(|c| c.compare(a, b))
 }
 
 /// Port of `calibre.utils.icu.safe_chr` (issue #584): converts a

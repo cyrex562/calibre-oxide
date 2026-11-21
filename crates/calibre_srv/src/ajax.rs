@@ -422,12 +422,13 @@ pub async fn search(State(state): State<AppState>, Query(q): Query<SearchQuery>)
     .into_iter()
     .collect();
 
-    let mut rows = fetch_rows(&state, ids).await?;
-    rows.sort_by(|a, b| {
-        for field in &sort_fields {
-            let ka = sort_key_for(a, field);
-            let kb = sort_key_for(b, field);
-            let cmp = if sort_order == "asc" { calibre_utils::icu::strcmp(&ka, &kb) } else { calibre_utils::icu::strcmp(&kb, &ka) };
+    let rows = fetch_rows(&state, ids).await?;
+    // Each row's sort keys are built once, not once per comparison.
+    let mut keyed: Vec<(i64, Vec<String>)> = rows.iter().map(|r| (r["id"].as_i64().unwrap_or(0), sort_fields.iter().map(|f| sort_key_for(r, f)).collect())).collect();
+    drop(rows);
+    keyed.sort_by(|(_, a), (_, b)| {
+        for (ka, kb) in a.iter().zip(b.iter()) {
+            let cmp = if sort_order == "asc" { calibre_utils::icu::strcmp(ka, kb) } else { calibre_utils::icu::strcmp(kb, ka) };
             if cmp != std::cmp::Ordering::Equal {
                 return cmp;
             }
@@ -435,8 +436,8 @@ pub async fn search(State(state): State<AppState>, Query(q): Query<SearchQuery>)
         std::cmp::Ordering::Equal
     });
 
-    let total_num = rows.len() as i64;
-    let page: Vec<i64> = rows.into_iter().skip(offset.max(0) as usize).take(num.max(0) as usize).map(|r| r["id"].as_i64().unwrap_or(0)).collect();
+    let total_num = keyed.len() as i64;
+    let page: Vec<i64> = keyed.into_iter().skip(offset.max(0) as usize).take(num.max(0) as usize).map(|(id, _)| id).collect();
 
     Ok(Json(serde_json::json!({
         "total_num": total_num,
