@@ -90,8 +90,11 @@ pub enum ImportMode {
     /// calibre's "assume one book per folder".
     OneBookPerFolder,
     /// calibre's "assume multiple books per folder": formats grouped by
-    /// filename stem.
+    /// filename stem. Spelled `multiple_books_per_folder` on the wire, as the
+    /// route documents and the web UI sends; `multiple_per_folder` is still
+    /// read so jobs saved before the rename keep resuming.
     #[default]
+    #[serde(rename = "multiple_books_per_folder", alias = "multiple_per_folder")]
     MultiplePerFolder,
 }
 

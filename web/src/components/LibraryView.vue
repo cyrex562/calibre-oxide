@@ -4111,40 +4111,6 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
   padding: 0;
   list-style: none;
 }
-.manage-backdrop {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.4);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 10;
-}
-.manage-panel {
-  background: var(--bg);
-  border-radius: 6px;
-  padding: 1.5em;
-  max-width: 560px;
-  width: 90%;
-  max-height: 85vh;
-  overflow: auto;
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  gap: 1.25em;
-}
-.manage-close {
-  position: absolute;
-  top: 0.5em;
-  right: 0.5em;
-  border: none;
-  background: none;
-  font-size: var(--fs-medium);
-  cursor: pointer;
-}
-.manage-panel h3 {
-  margin: 0 0 0.5em;
-}
 .manage-list {
   list-style: none;
   margin: 0 0 0.75em;

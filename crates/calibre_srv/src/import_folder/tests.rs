@@ -56,6 +56,26 @@ async fn the_options_are_taken_from_the_body() {
     assert_eq!(cache.all_book_ids().unwrap().len(), 1);
 }
 
+/// Every mode and policy the web UI offers (`web/src/library/importFolder.ts`)
+/// is accepted, spelled as it sends them. The UI's default once failed with a
+/// 422 because the server spelled the mode `multiple_per_folder`.
+#[tokio::test]
+async fn every_option_the_web_ui_sends_is_accepted() {
+    for mode in ["multiple_books_per_folder", "one_book_per_folder", "multiple_per_folder"] {
+        for policy in ["skip_exact_content", "skip_title_author", "add_formats_to_existing", "add_anyway"] {
+            let (_dir, cache, router) = app();
+            let src = tempfile::tempdir().unwrap();
+            std::fs::write(src.path().join("a.pdf"), b"%PDF a").unwrap();
+            let body = json!({"source": src.path().to_string_lossy(), "mode": mode, "policy": policy, "recursive": true});
+            let (status, started) = call(&router, "POST", "/import-folder/-", Some(body)).await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{mode}/{policy}: {started}");
+            let job = finished(&router, started["job_id"].as_u64().unwrap()).await;
+            assert_eq!(job["report"]["books_added"], 1, "{mode}/{policy}: {job}");
+            assert_eq!(cache.all_book_ids().unwrap().len(), 1);
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_bad_source_is_refused_before_a_job_starts() {
     let (dir, _cache, router) = app();
