@@ -27,6 +27,7 @@ use std::sync::Mutex;
 
 use tauri::{AppHandle, Manager, State, Url};
 use tauri_plugin_dialog::DialogExt;
+
 use tauri_plugin_opener::OpenerExt;
 
 #[tauri::command]
@@ -296,6 +297,17 @@ async fn choose_import_folder(app: AppHandle) -> Result<Option<String>, String> 
     Ok(Some(dir.to_string_lossy().into_owned()))
 }
 
+/// A native folder picker for the web UI's "Export a copy" dialog: the chosen
+/// folder's path, or `None` if the dialog was cancelled. It only picks; the
+/// server plans and writes the copy.
+#[tauri::command]
+async fn pick_folder(app: AppHandle) -> Result<Option<String>, String> {
+    let Some(dir) = pick_folder_path(&app).await else {
+        return Ok(None);
+    };
+    Ok(Some(dir.to_string_lossy().into_owned()))
+}
+
 /// Uploads each file to the running `calibre_srv`'s `/cdb/add-book`,
 /// exactly as `web/`'s own per-file `addBook()` does.
 ///
@@ -484,7 +496,7 @@ fn checked_ext(fmt: &str) -> Result<String, String> {
     Ok(ext)
 }
 
-async fn pick_folder(app: &AppHandle) -> Option<std::path::PathBuf> {
+async fn pick_folder_path(app: &AppHandle) -> Option<std::path::PathBuf> {
     let (tx, mut rx) = tauri::async_runtime::channel(1);
     app.dialog().file().pick_folder(move |result| {
         let _ = tx.try_send(result);
@@ -517,7 +529,7 @@ async fn unpack_book(state: State<'_, ServerState>, app: AppHandle, book_id: i32
     let port = state.0.lock().unwrap().as_ref().map(|(_, p)| *p).ok_or("no library is currently open")?;
     let ext = checked_ext(&fmt)?;
 
-    let Some(parent) = pick_folder(&app).await else {
+    let Some(parent) = pick_folder_path(&app).await else {
         return Ok(None);
     };
 
@@ -548,7 +560,7 @@ async fn repack_book(state: State<'_, ServerState>, app: AppHandle, book_id: i32
     let port = state.0.lock().unwrap().as_ref().map(|(_, p)| *p).ok_or("no library is currently open")?;
     let ext = checked_ext(&fmt)?;
 
-    let Some(dir) = pick_folder(&app).await else {
+    let Some(dir) = pick_folder_path(&app).await else {
         return Ok(false);
     };
 
@@ -698,7 +710,7 @@ async fn choose_auto_add_folder(app: AppHandle, clear: bool) -> Result<Option<St
         settings::set_auto_add_folder(&app, None).map_err(|e| e.to_string())?;
         return Ok(None);
     }
-    let Some(folder) = pick_folder(&app).await else {
+    let Some(folder) = pick_folder_path(&app).await else {
         return Ok(settings::get_auto_add_folder(&app).map(|p| p.to_string_lossy().into_owned()));
     };
     settings::set_auto_add_folder(&app, Some(folder.clone())).map_err(|e| e.to_string())?;
@@ -820,7 +832,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(ServerState::default())
-        .invoke_handler(tauri::generate_handler![ping, get_persisted_library, choose_library, create_library, choose_import_folder, list_recent_libraries, open_recent_library, get_auto_reopen, set_auto_reopen, import_library_archive, set_menu_actions, open_book_format, unpack_book, repack_book, open_external_url, reveal_library_folder, reveal_book_folder, get_auto_add_folder, choose_auto_add_folder])
+        .invoke_handler(tauri::generate_handler![ping, get_persisted_library, choose_library, create_library, choose_import_folder, list_recent_libraries, open_recent_library, get_auto_reopen, set_auto_reopen, import_library_archive, set_menu_actions, open_book_format, unpack_book, repack_book, open_external_url, reveal_library_folder, reveal_book_folder, get_auto_add_folder, choose_auto_add_folder, pick_folder])
         .on_menu_event(|app, event| menu::forward(app, &event))
         // Dropping files onto the window adds them, the same way the
         // folder picker does. This has to be handled natively: Tauri's

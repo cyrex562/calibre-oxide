@@ -64,10 +64,7 @@ use crate::AppState;
 fn consistent_database_copy(path: &Path) -> Option<Vec<u8>> {
     let scratch = tempfile::tempdir().ok()?;
     let target = scratch.path().join("snapshot.db");
-    let conn = rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE).ok()?;
-    conn.busy_timeout(std::time::Duration::from_secs(10)).ok()?;
-    conn.execute("VACUUM INTO ?1", [target.to_string_lossy().as_ref()]).ok()?;
-    drop(conn);
+    calibre_db::mirror::snapshot_database(path, &target).ok()?;
     std::fs::read(&target).ok()
 }
 
@@ -90,8 +87,7 @@ fn build_library_zip(library_path: &Path) -> anyhow::Result<Vec<u8>> {
     for entry in &entries {
         let path = entry.path();
         if entry.file_type().is_file() && path.extension().and_then(|e| e.to_str()) == Some("db") {
-            let in_per_process_state = path.strip_prefix(library_path).ok().and_then(|rel| rel.strip_prefix(calibre_db::constants::LIBRARY_HANDLE_DIR_NAME).ok()).is_some_and(is_per_process_state);
-            if in_per_process_state {
+            if path.strip_prefix(library_path).ok().is_some_and(|rel| calibre_db::mirror::is_excluded(&rel.to_string_lossy())) {
                 continue;
             }
             if let Some(bytes) = consistent_database_copy(path) {
@@ -111,31 +107,18 @@ fn build_library_zip(library_path: &Path) -> anyhow::Result<Vec<u8>> {
             if rel.as_os_str().is_empty() {
                 continue;
             }
-            // The runtime state directory is *partly* excluded, and the
-            // distinction matters a great deal.
-            //
-            // Excluded: the writer lock and the write-ahead journal.
-            // Both are per-process state that would be actively wrong
-            // to restore from a backup, and on Windows `writer.lock` is
-            // actively unreadable -- `try_lock` there is `LockFileEx`, a
-            // byte-range lock that blocks reads of the locked region, so
-            // copying it fails outright and took the whole export down
-            // with it. (On Linux `flock` is advisory and reads sail
-            // through, which is why that only ever showed up on
-            // Windows.)
-            //
-            // Included: everything durable. This used to skip the whole
-            // directory, which was correct only while nothing durable
-            // lived in it. It now holds the **change log** -- the
-            // library's authority, from which `metadata.db` is rebuilt
-            // (#899) -- along with covers (#893) and content checksums.
-            // Excluding those would make an export a library that
-            // cannot be rebuilt and has no cover images: a backup that
-            // looks complete and is not.
-            if let Ok(inside) = rel.strip_prefix(calibre_db::constants::LIBRARY_HANDLE_DIR_NAME) {
-                if is_per_process_state(inside) {
-                    continue;
-                }
+            // What is left out is one list shared with the copy/mirror
+            // ([`calibre_db::mirror::is_excluded`]): the trash, the writer lock
+            // and journal (per-process state that would be wrong to restore;
+            // on Windows `writer.lock` is even unreadable while held, which
+            // took the whole export down), job records, import staging, run
+            // records, SQLite sidecars and half-written files. The rest of the
+            // state directory is durable and *is* exported -- the change log
+            // (the library's authority, from which `metadata.db` is rebuilt),
+            // covers and checksums -- so a new durable file is carried by
+            // default instead of silently missing from every backup.
+            if calibre_db::mirror::is_excluded(&rel.to_string_lossy()) {
+                continue;
             }
             // Zip entry names use forward slashes on every platform,
             // matching the real zip spec (not the host OS separator).
@@ -162,19 +145,6 @@ fn build_library_zip(library_path: &Path) -> anyhow::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Whether a path inside the state directory is per-process rather than
-/// part of the library.
-///
-/// An allowlist would be the safer shape in general, but here a
-/// *denylist* is right: a new durable file added to the state directory
-/// should be exported by default. Getting that backwards is how the
-/// change log came to be silently excluded from backups in the first
-/// place.
-fn is_per_process_state(inside_state_dir: &std::path::Path) -> bool {
-    let first = inside_state_dir.components().next().map(|c| c.as_os_str().to_string_lossy().to_ascii_lowercase());
-    matches!(first.as_deref(), Some("writer.lock") | Some("journal"))
-}
-
 /// `GET /library/export/{library_id}`.
 pub async fn export(State(state): State<AppState>, AxumPath(library_id): AxumPath<String>) -> Result<Response, ServerError> {
     let cache = state.cache_for(Some(&library_id)).ok_or_else(|| ServerError::NotFound(format!("no library named {library_id:?}")))?;
@@ -193,7 +163,7 @@ pub async fn export(State(state): State<AppState>, AxumPath(library_id): AxumPat
 
 #[cfg(test)]
 mod tests {
-    use super::{is_per_process_state, sidecar_owner};
+    use super::sidecar_owner;
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
@@ -407,18 +377,24 @@ mod tests {
         (0..archive.len()).map(|i| archive.by_index(i).unwrap().name().to_string()).collect()
     }
 
-    #[test]
-    fn only_the_lock_and_journal_count_as_per_process_state() {
-        use std::path::Path;
-        assert!(is_per_process_state(Path::new("writer.lock")));
-        assert!(is_per_process_state(Path::new("journal")));
-        assert!(is_per_process_state(Path::new("journal/abc.op")));
-        // Everything durable is exported -- a denylist, so a newly added
-        // durable file is included by default rather than silently lost.
-        assert!(!is_per_process_state(Path::new("changes/0001.json")));
-        assert!(!is_per_process_state(Path::new("covers/uuid.jpg")));
-        assert!(!is_per_process_state(Path::new("checksums.db")));
-        assert!(!is_per_process_state(Path::new("snapshots/x.jsonl")));
-        assert!(!is_per_process_state(Path::new("install-id")));
+    /// The export used to carry the library's trash (`.caltrash`) and the
+    /// server's job records; it now leaves out exactly what a copy leaves out.
+    #[tokio::test]
+    async fn the_export_leaves_out_the_trash_and_job_records() {
+        let (dir, router, cache, book_id) = test_app_with_cache();
+        cache.set_field(book_id, "title", "Touched").unwrap();
+        std::fs::create_dir_all(dir.path().join(".caltrash/x")).unwrap();
+        std::fs::write(dir.path().join(".caltrash/x/gone.txt"), "deleted book").unwrap();
+        let state = dir.path().join(calibre_db::constants::LIBRARY_HANDLE_DIR_NAME);
+        std::fs::write(state.join("jobs.json"), "{}").unwrap();
+        std::fs::create_dir_all(state.join("import-staging")).unwrap();
+        std::fs::write(state.join("import-staging/x.pdf"), "x").unwrap();
+
+        let req = Request::builder().uri("/library/export/default").body(Body::empty()).unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let names = zip_entry_names(&bytes);
+        assert!(!names.iter().any(|n| n.contains("caltrash") || n.contains("jobs.json") || n.contains("import-staging")), "{names:?}");
+        assert!(names.contains(&"metadata.db".to_string()));
     }
 }

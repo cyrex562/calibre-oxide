@@ -46,6 +46,7 @@ pub mod library_handle;
 pub mod listeners;
 pub mod locking;
 pub mod merge;
+pub mod mirror;
 pub mod notes;
 pub mod orphans;
 #[cfg(unix)]

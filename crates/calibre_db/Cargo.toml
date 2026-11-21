@@ -35,6 +35,8 @@ zip = "0.6"
 # Sending a removed book's file to the system wastebasket rather than
 # erasing it (#896). MIT, so GPL-compatible.
 trash = "5.2"
+# Scratch folders for the database snapshots the mirror/export builds.
+tempfile = "3.10"
 
 # Windows storage-tier classification (GetDriveTypeW / QueryDosDeviceW)
 # and the calibre-running mutex probe (#258). Same version as the one
