@@ -230,7 +230,7 @@ describe("remembered targets", () => {
     expect(c.planIsCurrent([1])).toBe(true);
 
     // A run that overwrote the copy's edits does not make the next refresh do so.
-    await c.refresh(target({ mode: "travel", scope: { all: true }, remove_missing: true, overwrite_changed: true, target: "D:\\Laptop" }), [1]);
+    await c.refresh(target({ mode: "travel", scope: "all", remove_missing: true, overwrite_changed: true, target: "D:\\Laptop" }), [1]);
     expect(c.state.draft.overwriteChanged).toBe(false);
     expect(api.planMirror).toHaveBeenLastCalledWith(expect.objectContaining({ overwrite_changed: false }));
 
