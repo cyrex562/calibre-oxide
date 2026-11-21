@@ -356,6 +356,15 @@ fn registry_key(library_path: &Path) -> PathBuf {
         .unwrap_or_else(|_| library_path.to_path_buf())
 }
 
+/// Whether this process has a `Backend` open on `library_path` right now
+/// (the server's libraries, a library window). The mirror uses it to refuse a
+/// target that is a live library: copying over files a running library holds
+/// open would corrupt it.
+pub fn is_open_in_process(library_path: &Path) -> bool {
+    let key = registry_key(library_path);
+    OPEN_IN_PROCESS.lock().ok().and_then(|g| g.as_ref().map(|m| m.contains_key(&key))).unwrap_or(false)
+}
+
 /// While alive, marks `library_path` as open in this process.
 #[derive(Debug)]
 pub(crate) struct ProcessOpenGuard {

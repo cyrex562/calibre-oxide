@@ -110,6 +110,7 @@ export type LibraryActionId =
   | "check-library"
   | "find-duplicates"
   | "organize-files"
+  | "export-copy"
   | "fix-titles"
   | "fix-titles-selected"
   | "map-metadata"
@@ -188,6 +189,7 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   // library -> Browse for another" reads as "find an existing one".
   { id: "new-library", label: "New library…", group: "library", requires: "none", toolbar: true, desktopOnly: true, primary: true, icon: "lt", tooltip: "Create an empty library and open it" },
   { id: "organize-files", label: "Organize files…", group: "library", requires: "none", icon: "tb_folder", tooltip: "Move books' files inside the library to folders and names from a template" },
+  { id: "export-copy", label: "Export a copy…", group: "library", requires: "none", icon: "bookshelf", tooltip: "Copy the library (or some books) to another folder or drive: a travel copy you can refresh, or a backup mirror" },
   { id: "fix-titles", label: "Fix titles…", group: "library", requires: "none", icon: "edit_input", tooltip: "Find junk titles in the library, suggest clean ones, and set them (optionally in the files too)" },
   { id: "trash", label: "Trash…", group: "library", requires: "none", icon: "remove_books", tooltip: "Restore or permanently delete books and formats you removed" },
   { id: "open-library-folder", label: "Open library folder", group: "library", requires: "none", desktopOnly: true, icon: "tb_folder", tooltip: "Show this library's folder in the file browser" },
@@ -457,7 +459,7 @@ export const TOOLBAR_LAYOUT: ToolbarItem[] = [
   { kind: "spring" },
   // Label is replaced at render time with the open library's name:
   // which library you are in is state, and state belongs on a label.
-  { kind: "menu", id: "library", label: "Library", icon: "lt", menu: ["switch-library", "new-library", "open-library-folder", "-", "$recent-libraries", "-", "check-library", "find-duplicates", "organize-files", "fix-titles", "trash"] },
+  { kind: "menu", id: "library", label: "Library", icon: "lt", menu: ["switch-library", "new-library", "open-library-folder", "-", "$recent-libraries", "-", "check-library", "find-duplicates", "organize-files", "fix-titles", "-", "export-copy", "trash"] },
   { kind: "split", id: "help", menu: ["$shortcuts", "$about"] },
 ];
 

@@ -71,6 +71,8 @@ const JUNK_DIRS: &[&str] = &[
     // scan that walked in would add every one of them straight back.
     TRASH_DIR_NAME,
     NOTES_DIR_NAME,
+    // Where a mirror refresh puts what it removed from a copy.
+    ".mirror-trash",
     "@eadir",          // Synology thumbnails
     ".@__thumb",       // QNAP
     "#recycle",        // Synology

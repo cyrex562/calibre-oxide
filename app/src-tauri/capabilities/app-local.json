@@ -19,6 +19,7 @@
     "allow-choose-import-folder",
     "allow-get-auto-add-folder",
     "allow-choose-auto-add-folder",
+    "allow-pick-folder",
     "allow-open-book-format",
     "allow-unpack-book",
     "allow-repack-book",

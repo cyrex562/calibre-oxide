@@ -35,6 +35,8 @@ import { createDuplicatesStore } from "../library/duplicatesStore";
 import { createResolveController } from "../library/resolve";
 import { createOrganizeController } from "../library/organize";
 import OrganizeDialog from "./OrganizeDialog.vue";
+import { createMirrorController } from "../library/mirror";
+import MirrorDialog from "./MirrorDialog.vue";
 import { createRetitleController } from "../library/retitle";
 import RetitleDialog from "./RetitleDialog.vue";
 import { DEFAULT_DESTINATION_HINT, MERGE_MODE_LABELS, MERGE_MODE_NOTES, defaultMergeDestination, describeMergeResult, describeRecord, summarizeMerge } from "../library/merge";
@@ -1503,6 +1505,14 @@ function openOrganize() {
   organizeController.open(organizeSelection.value.length);
   organizeOpen.value = true;
 }
+// Export a copy: a travel copy or a backup mirror to another folder or drive.
+// The scope follows the selection like Organize; nothing in the library changes.
+const mirrorController = createMirrorController();
+const mirrorOpen = ref(false);
+function openMirror() {
+  mirrorController.open(organizeSelection.value.length);
+  mirrorOpen.value = true;
+}
 // Fix titles: find junk titles, suggest clean ones, set / embed / rename in one
 // run (undoable). From the Library menu it looks at every book; from the
 // selection and the context menu, at the selected books.
@@ -2047,6 +2057,7 @@ const actionHandlers: Partial<Record<LibraryActionId, () => void>> = {
   "check-library": () => openCheckLibrary(),
   "find-duplicates": () => openDuplicates(),
   "organize-files": () => openOrganize(),
+  "export-copy": () => openMirror(),
   "fix-titles": () => openRetitle("all"),
   "fix-titles-selected": () => openRetitle("selected"),
   "map-metadata": () => {
@@ -2103,6 +2114,7 @@ const HIDDEN_IN_FTS_MODE: ReadonlySet<LibraryActionId> = new Set<LibraryActionId
   "check-library",
   "find-duplicates",
   "organize-files",
+  "export-copy",
   "fix-titles",
   "map-metadata",
   "browse-annotations",
@@ -2475,7 +2487,7 @@ function onLibraryKeydown(event: KeyboardEvent) {
   // A modal owns the keyboard while it is open -- firing library
   // shortcuts underneath one would act on a view the user cannot
   // currently see.
-  if (contextMenu.value || manageOpen.value || columnsOpen.value || columnPickerOpen.value || checkLibraryOpen.value || organizeOpen.value || retitleOpen.value || duplicatesOpen.value || compareController.state.open || mergeOpen.value || saveToDiskOpen.value || renameOpen.value || embedOpen.value || copyOpen.value || newsOpen.value || switchOpen.value) return;
+  if (contextMenu.value || manageOpen.value || columnsOpen.value || columnPickerOpen.value || checkLibraryOpen.value || organizeOpen.value || mirrorOpen.value || retitleOpen.value || duplicatesOpen.value || compareController.state.open || mergeOpen.value || saveToDiskOpen.value || renameOpen.value || embedOpen.value || copyOpen.value || newsOpen.value || switchOpen.value) return;
 
   const id = shortcutFor(event, libraryShortcuts(keymap.value));
   if (!id) return;
@@ -3372,6 +3384,7 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
 
     <ResolveDialog v-if="duplicatesOpen && resolveOpen" :store="dupStore" :controller="resolveController" @close="resolveOpen = false" @changed="onDuplicatesChanged" />
     <CompareDuplicates v-if="compareController.state.open" :controller="compareController" @close="compareController.close()" />
+    <MirrorDialog v-if="mirrorOpen" :controller="mirrorController" :selected-ids="organizeSelection" @close="mirrorOpen = false" />
     <OrganizeDialog v-if="organizeOpen" :controller="organizeController" :selected-ids="organizeSelection" @close="organizeOpen = false" @changed="onDuplicatesChanged" />
     <RetitleDialog v-if="retitleOpen" :controller="retitleController" :selected-ids="retitleSelection" @close="retitleOpen = false" @changed="onRetitleChanged" />
 

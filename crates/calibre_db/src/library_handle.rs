@@ -1340,6 +1340,24 @@ fn retry_with_backoff<T>(
     }
 }
 
+/// Runs `attempt` under the network tier's retry policy (§6: exponential
+/// backoff, five minutes at most) while `retryable` says the error is worth
+/// another try; any other error is returned at once. The mirror writes to
+/// folders that are not libraries, so it cannot use the handle's own writers,
+/// but it shares this retry discipline rather than growing a second one.
+pub(crate) fn retry_io_while<T>(retryable: impl Fn(&io::Error) -> bool, mut attempt: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let outcome = retry_with_backoff(&REAL_NETWORK_RETRY_POLICY, || match attempt() {
+        Ok(v) => Ok(Ok(v)),
+        Err(e) if retryable(&e) => Err(LibraryHandleError::Io(e)),
+        Err(e) => Ok(Err(e)),
+    });
+    match outcome {
+        Ok(inner) => inner,
+        Err(LibraryHandleError::Io(e)) => Err(e),
+        Err(other) => Err(io::Error::other(other.to_string())),
+    }
+}
+
 /// A genuinely local path (never under `library_path`, which may
 /// itself be the network mount) to stage a payload in before
 /// uploading it -- §6's "assemble the full payload locally in a

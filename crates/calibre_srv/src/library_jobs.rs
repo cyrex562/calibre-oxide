@@ -51,6 +51,9 @@
 //!   -- move files by template, and undo ([`crate::organize_library`])
 //! - `POST /retitle-library/{library_id}`, `POST /unretitle-library/{library_id}`
 //!   -- fix titles (set, embed, rename) and undo ([`crate::retitle_library`])
+//! - `POST /mirror-library/{library_id}` -- a travel copy or a backup mirror
+//!   to another folder ([`crate::library_mirror`]); remembered targets at
+//!   `GET /mirror-targets/{library_id}`
 //! - `GET /library-jobs`, `GET /library-jobs/{id}`, `POST /library-jobs/{id}/cancel`
 //!
 //! # Surviving a restart
@@ -116,6 +119,10 @@ pub enum JobKind {
     Retitle,
     /// Reverse a retitle run (`POST /unretitle-library`).
     UndoRetitle,
+    /// Copy the library to another folder: a travel copy or a backup mirror
+    /// (`POST /mirror-library`). Continued by running it again: what it
+    /// finished is in the copy's manifest.
+    Mirror,
 }
 
 impl JobKind {
@@ -137,6 +144,7 @@ impl JobKind {
             JobKind::UndoOrganize => "undo_organize",
             JobKind::Retitle => "retitle",
             JobKind::UndoRetitle => "undo_retitle",
+            JobKind::Mirror => "mirror",
         }
     }
 
@@ -158,6 +166,7 @@ impl JobKind {
             JobKind::UndoOrganize,
             JobKind::Retitle,
             JobKind::UndoRetitle,
+            JobKind::Mirror,
         ]
         .into_iter()
         .find(|k| k.name() == name)
@@ -430,6 +439,8 @@ pub struct JobParams {
     pub undo_run: Option<String>,
     /// The approved titles and options of a [`JobKind::Retitle`] job.
     pub retitle: Option<RetitleJob>,
+    /// The confirmed plan of a [`JobKind::Mirror`] job.
+    pub mirror: Option<Arc<calibre_db::mirror::MirrorPlan>>,
 }
 
 /// The approved titles of a retitle run and what to do besides setting them.
@@ -476,6 +487,11 @@ impl JobParams {
         }
         if let Some(retitle) = &self.retitle {
             map.insert("book_count".into(), json!(retitle.items.len()));
+        }
+        if let Some(plan) = &self.mirror {
+            map.insert("target".into(), json!(plan.target.display().to_string()));
+            map.insert("mode".into(), json!(plan.mode.name()));
+            map.insert("book_count".into(), json!(plan.books));
         }
         Value::Object(map)
     }
@@ -610,6 +626,10 @@ fn run(cache: &Cache, kind: JobKind, options: &PipelineOptions, control: &JobCon
         JobKind::UndoRetitle => {
             let run_id = params.undo_run.as_ref().ok_or_else(|| anyhow::anyhow!("an undo needs a run id"))?;
             Ok(serde_json::to_value(calibre_db::retitle::undo(cache, run_id, control)?)?)
+        }
+        JobKind::Mirror => {
+            let plan = params.mirror.as_ref().ok_or_else(|| anyhow::anyhow!("a mirror job needs its plan"))?;
+            crate::library_mirror::run_job(cache, plan, control)
         }
         JobKind::Copy => {
             let job = params.copy.as_ref().ok_or_else(|| anyhow::anyhow!("a copy job needs its books"))?;
