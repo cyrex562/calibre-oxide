@@ -11,12 +11,13 @@
 // mounts into a jsdom element perfectly well, and the component takes
 // plain props with no router, store or network behind it.
 
-import { createApp, nextTick, type App } from "vue";
+import { createApp, nextTick, shallowReactive, type App } from "vue";
 import { afterEach, describe, expect, it } from "vitest";
 
 import BookTable from "./BookTable.vue";
 import { columnsFor, resolveColumns, DEFAULT_TABLE_PREFS, type BookColumn } from "../library/columns";
-import type { BookSummary } from "../library/types";
+import type { BookFieldChanges, BookSummary } from "../library/types";
+import { commitCellEdit } from "../library/inlineEdit";
 
 let app: App | null = null;
 let host: HTMLElement | null = null;
@@ -66,7 +67,8 @@ function mount(props: Record<string, unknown> = {}) {
   const emitted: Emitted = { select: [], toggleSelected: [], sortBy: [], resize: [] };
 
   app = createApp(BookTable, {
-    books: [book(1), book(2)],
+    ids: [1, 2],
+    getBook: (id: number) => book(id),
     columns: COLUMNS,
     selectMode: false,
     selectedIds: new Set<number>(),
@@ -109,7 +111,7 @@ describe("rendering", () => {
   });
 
   it("shows an empty table body rather than breaking when there are no books", () => {
-    const { el } = mount({ books: [] });
+    const { el } = mount({ ids: [] });
     expect(el.querySelectorAll("tbody tr")).toHaveLength(0);
     expect(el.querySelectorAll("thead th").length).toBeGreaterThan(0);
   });
@@ -209,5 +211,235 @@ describe("column widths", () => {
   it("gives every column a resize handle", () => {
     const { el } = mount();
     expect(el.querySelectorAll("thead .resize-handle")).toHaveLength(COLUMNS.length);
+  });
+});
+
+describe("virtual rendering", () => {
+  it("renders a bounded number of rows for a 50,000 book list, with spacers for the rest", () => {
+    const ids = Array.from({ length: 50_000 }, (_, i) => i + 1);
+    const { el } = mount({ ids, getBook: (id: number) => book(id) });
+    const rows = el.querySelectorAll("tbody tr:not(.spacer)");
+    expect(rows.length).toBeLessThan(100);
+    expect(rows.length).toBeGreaterThan(0);
+    const bottom = el.querySelector<HTMLElement>("tbody tr.spacer");
+    expect(parseInt(bottom!.style.height, 10)).toBeGreaterThan(1_000_000);
+  });
+
+  it("shows muted placeholder rows until a row has loaded", () => {
+    const { el } = mount({ ids: [1, 2, 3], getBook: (id: number) => (id === 2 ? book(2) : undefined) });
+    const rows = el.querySelectorAll("tbody tr");
+    expect(rows).toHaveLength(3);
+    expect(rows[0].classList.contains("placeholder")).toBe(true);
+    expect(rows[1].classList.contains("placeholder")).toBe(false);
+    expect(rows[1].textContent).toContain("Book 2");
+  });
+
+  it("reports the rendered range so the rows can be loaded", () => {
+    const ranges: { first: number; last: number }[] = [];
+    mount({ ids: Array.from({ length: 5000 }, (_, i) => i + 1), onRange: (r: { first: number; last: number }) => ranges.push(r) });
+    expect(ranges[0].first).toBe(0);
+    expect(ranges[0].last).toBeLessThan(100);
+  });
+
+  it("moves the rendered window when the list is scrolled", async () => {
+    const ids = Array.from({ length: 5000 }, (_, i) => i + 1);
+    const { el } = mount({ ids, getBook: (id: number) => book(id) });
+    const scroller = el.querySelector<HTMLElement>(".table-scroll")!;
+    scroller.scrollTop = 30 * 2000;
+    scroller.dispatchEvent(new Event("scroll"));
+    await nextTick();
+    const first = el.querySelector<HTMLElement>("tbody tr:not(.spacer)")!;
+    expect(Number(first.dataset.id)).toBeGreaterThan(1900);
+  });
+
+  it("emits a range selection for shift-click in select mode", () => {
+    const ranged: number[] = [];
+    const { el } = mount({ selectMode: true, onRangeSelect: (id: number) => ranged.push(id) });
+    el.querySelectorAll<HTMLElement>("tbody tr")[1].dispatchEvent(new MouseEvent("click", { bubbles: true, shiftKey: true }));
+    expect(ranged).toEqual([2]);
+  });
+
+  it("asks to navigate on arrow and page keys", () => {
+    const keys: string[] = [];
+    const { el } = mount({ onNavigate: (k: string) => keys.push(k) });
+    el.querySelector("tbody tr")!.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
+    el.querySelector("tbody tr")!.dispatchEvent(new KeyboardEvent("keydown", { key: "PageDown", bubbles: true }));
+    expect(keys).toEqual(["ArrowDown", "PageDown"]);
+  });
+});
+
+describe("editing in place", () => {
+  const EDIT_COLUMNS: BookColumn[] = resolveColumns(columnsFor({}, [["title", "Title"], ["authors", "Authors"], ["series", "Series"]]), { ...DEFAULT_TABLE_PREFS, columns: ["title", "authors", "series", "formats"] });
+
+  /** A table wired to a tiny reactive store, with `save` standing in for the set-fields call. */
+  function mountEditable(rows: BookSummary[], save: (id: number, changes: BookFieldChanges) => Promise<BookSummary>, extra: Record<string, unknown> = {}) {
+    const store = shallowReactive(new Map(rows.map((b) => [b.id, b])));
+    const target = {
+      getById: (id: number) => store.get(id),
+      patch: (id: number, c: Partial<BookSummary>) => {
+        const before = store.get(id);
+        if (before) store.set(id, { ...before, ...c } as BookSummary);
+        return before;
+      },
+      put: (b: BookSummary) => void store.set(b.id, b),
+    };
+    return {
+      store,
+      ...mount({
+        columns: EDIT_COLUMNS,
+        ids: rows.map((r) => r.id),
+        getBook: (id: number) => store.get(id),
+        commit: (bookId: number, column: BookColumn, raw: string) => commitCellEdit({ target, bookId, column, raw, save }),
+        ...extra,
+      }),
+    };
+  }
+
+  const cell = (el: HTMLElement, row: number, col: number) => el.querySelectorAll("tbody tr")[row].querySelectorAll("td")[col] as HTMLElement;
+  const flush = async () => {
+    await nextTick();
+    await new Promise((r) => setTimeout(r, 0));
+    await nextTick();
+  };
+  const type = (el: HTMLElement, text: string, key: string) => {
+    const input = el.querySelector<HTMLInputElement>("input.cell-editor")!;
+    input.value = text;
+    input.dispatchEvent(new Event("input"));
+    input.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true }));
+  };
+
+  it("clicking an empty title cell opens an input; Enter saves through set-fields and the row shows the value", async () => {
+    const calls: [number, BookFieldChanges][] = [];
+    const { el, store } = mountEditable([book(1, { title: "" })], async (id, changes) => {
+      calls.push([id, changes]);
+      return book(id, { title: String(changes.title) });
+    });
+    expect(cell(el, 0, 0).classList.contains("empty-editable")).toBe(true);
+    expect(cell(el, 0, 0).getAttribute("data-hint")).toBe("Set title…");
+
+    cell(el, 0, 0).click();
+    await nextTick();
+    expect(el.querySelector("input.cell-editor")).not.toBeNull();
+
+    type(el, "My New Title", "Enter");
+    await flush();
+
+    expect(calls).toEqual([[1, { title: "My New Title" }]]);
+    expect(el.querySelector("input.cell-editor")).toBeNull();
+    expect(cell(el, 0, 0).textContent?.trim()).toBe("My New Title");
+    expect(store.get(1)!.title).toBe("My New Title");
+  });
+
+  it("a single click on a filled cell only selects the row", async () => {
+    const { el, emitted } = mountEditable([book(1)], async () => book(1));
+    cell(el, 0, 0).click();
+    await nextTick();
+    expect(el.querySelector("input.cell-editor")).toBeNull();
+    expect(emitted.select).toEqual([1]);
+  });
+
+  it("double-click edits a filled cell, with its value in the input", async () => {
+    const { el } = mountEditable([book(1, { title: "Old" })], async () => book(1));
+    cell(el, 0, 0).dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    await nextTick();
+    expect(el.querySelector<HTMLInputElement>("input.cell-editor")!.value).toBe("Old");
+  });
+
+  it("F2 edits the title of the selected row", async () => {
+    const { el } = mountEditable([book(1, { title: "Old" })], async () => book(1), { selectedBookId: 1 });
+    el.querySelector("tbody tr")!.dispatchEvent(new KeyboardEvent("keydown", { key: "F2", bubbles: true }));
+    await nextTick();
+    expect(el.querySelector<HTMLInputElement>("input.cell-editor")!.value).toBe("Old");
+  });
+
+  it("Escape cancels without saving", async () => {
+    let calls = 0;
+    const { el, store } = mountEditable([book(1, { title: "Old" })], async () => ((calls += 1), book(1)));
+    cell(el, 0, 0).dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    await nextTick();
+    type(el, "Nope", "Escape");
+    await flush();
+    expect(el.querySelector("input.cell-editor")).toBeNull();
+    expect(calls).toBe(0);
+    expect(store.get(1)!.title).toBe("Old");
+  });
+
+  it("Tab saves and moves to the next editable cell", async () => {
+    const calls: BookFieldChanges[] = [];
+    const { el } = mountEditable([book(1, { title: "Old" })], async (id, changes) => (calls.push(changes), book(id, { title: String(changes.title ?? "Old") })));
+    cell(el, 0, 0).dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    await nextTick();
+    type(el, "Tabbed", "Tab");
+    await flush();
+    expect(calls).toEqual([{ title: "Tabbed" }]);
+    expect(cell(el, 0, 1).querySelector("input.cell-editor")).not.toBeNull();
+  });
+
+  it("blur with an unchanged value closes the editor without calling the API", async () => {
+    let calls = 0;
+    const { el } = mountEditable([book(1, { title: "Same" })], async () => ((calls += 1), book(1)));
+    cell(el, 0, 0).dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    await nextTick();
+    el.querySelector<HTMLInputElement>("input.cell-editor")!.dispatchEvent(new Event("blur"));
+    await flush();
+    expect(calls).toBe(0);
+    expect(el.querySelector("input.cell-editor")).toBeNull();
+  });
+
+  it("blur saves a changed value", async () => {
+    const calls: BookFieldChanges[] = [];
+    const { el } = mountEditable([book(1, { title: "Old" })], async (id, changes) => (calls.push(changes), book(id, { title: String(changes.title) })));
+    cell(el, 0, 0).dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    await nextTick();
+    const input = el.querySelector<HTMLInputElement>("input.cell-editor")!;
+    input.value = "Blurred";
+    input.dispatchEvent(new Event("input"));
+    input.dispatchEvent(new Event("blur"));
+    await flush();
+    expect(calls).toEqual([{ title: "Blurred" }]);
+  });
+
+  it("on a failed save rolls the row back, keeps the editor open with the typed value and shows the error", async () => {
+    const { el, store } = mountEditable([book(1, { title: "Old" })], async () => {
+      throw new Error("read-only library");
+    });
+    cell(el, 0, 0).dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    await nextTick();
+    type(el, "Typed", "Enter");
+    await flush();
+    expect(store.get(1)!.title).toBe("Old");
+    expect(el.querySelector<HTMLInputElement>("input.cell-editor")!.value).toBe("Typed");
+    expect(el.querySelector(".cell-error")?.textContent).toContain("read-only library");
+  });
+
+  it("a parse error stays inline too", async () => {
+    const { el } = mountEditable([book(1, { title: "Old" })], async () => book(1));
+    cell(el, 0, 0).dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    await nextTick();
+    type(el, "   ", "Enter");
+    await flush();
+    expect(el.querySelector(".cell-error")?.textContent).toContain("empty");
+  });
+
+  it("read-only columns never open an editor", async () => {
+    const { el } = mountEditable([book(1)], async () => book(1));
+    cell(el, 0, 3).dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    cell(el, 0, 3).click();
+    await nextTick();
+    expect(el.querySelector(".cell-editor")).toBeNull();
+  });
+
+  it("is read-only when no commit handler is given", async () => {
+    const { el } = mount({ columns: EDIT_COLUMNS, ids: [1], getBook: () => book(1, { title: "" }) });
+    cell(el, 0, 0).click();
+    await nextTick();
+    expect(el.querySelector(".cell-editor")).toBeNull();
+  });
+
+  it("does not start editing from a click in select mode", async () => {
+    const { el } = mountEditable([book(1, { title: "" })], async () => book(1), { selectMode: true });
+    el.querySelectorAll<HTMLElement>("tbody tr")[0].querySelectorAll<HTMLElement>("td")[1].click();
+    await nextTick();
+    expect(el.querySelector(".cell-editor")).toBeNull();
   });
 });

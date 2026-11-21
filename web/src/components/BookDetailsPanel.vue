@@ -30,6 +30,8 @@ const props = defineProps<{
    * row still fires: watching the id alone would see no change.
    */
   pendingAction?: { id: string; nonce: number } | null;
+  /** Bumped when the book was changed elsewhere (an in-place edit in the list). */
+  refreshKey?: number;
 }>();
 const emit = defineEmits<{ close: []; updated: []; deleted: [bookId: number]; "open-book": [bookId: number] }>();
 const router = useRouter();
@@ -716,6 +718,18 @@ async function load(id: number) {
   }
 }
 watch(() => props.bookId, load, { immediate: true });
+// The list edited this book in place: re-read it without resetting the panel's state.
+watch(
+  () => props.refreshKey,
+  async () => {
+    if (editing.value) return;
+    try {
+      book.value = await fetchBook(props.bookId);
+    } catch {
+      // The next full load will report it.
+    }
+  },
+);
 
 // The cover/thumbnail URLs are stable paths (`/get/cover/{id}`) --
 // after replacing the cover the browser would otherwise keep showing

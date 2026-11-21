@@ -398,10 +398,6 @@ async function toggleAutoReopen() {
           </select>
         </label>
         <label class="field">
-          Books per page
-          <input v-model.number="libraryPrefs.pageSize" type="number" min="6" max="200" step="1" />
-        </label>
-        <label class="field">
           When adding a book that looks like a duplicate
           <select v-model="libraryPrefs.duplicateDefault">
             <option value="ask">Ask every time</option>

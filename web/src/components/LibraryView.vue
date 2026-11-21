@@ -4,6 +4,10 @@ import CategoryBrowser from "./CategoryBrowser.vue";
 import NoteEditor from "./NoteEditor.vue";
 import BookDetailsPanel from "./BookDetailsPanel.vue";
 import BookTable from "./BookTable.vue";
+import BookGrid from "./BookGrid.vue";
+import { createBookWindow } from "../library/bookWindow";
+import { commitCellEdit, type CommitResult } from "../library/inlineEdit";
+import { navigateIndex } from "../library/virtualList";
 import ContextMenu, { type ContextMenuEntry } from "./ContextMenu.vue";
 import ToolbarButton from "./ToolbarButton.vue";
 import MapperDialog from "./MapperDialog.vue";
@@ -55,14 +59,18 @@ import { onMenuAction, syncDesktopMenu } from "../library/desktopMenu";
 import { shortcutFor } from "../library/shortcuts";
 import { isTauri, tauriInvoke } from "../tauri";
 import { DEFAULT_KEYMAP, DEFAULT_LIBRARY_PREFS, DEFAULT_SAVE_TO_DISK_TEMPLATE, DEFAULT_TOOLBAR_PREFS, fetchProfile, KEYMAP_PROFILE, libraryShortcuts, LIBRARY_PREFS_PROFILE, saveProfile, TOOLBAR_PREFS_PROFILE, type KeymapPrefs, type LibraryPrefs, type ToolbarPrefs } from "../settings/api";
-import type { BookSummary, CustomColumnInfo, FieldMetaEntry, FtsSnippet, RenameFileResult } from "../library/types";
+import type { CustomColumnInfo, FieldMetaEntry, FtsSnippet, RenameFileResult } from "../library/types";
 import { DEFAULT_RENAME_TEMPLATE, describeRename, initialRenameTemplate, previewIsCurrent, type RenamePreviewKey, summarizeRename } from "../library/renameFiles";
 
 // Real, persisted default (issue #721) -- overwritten by
 // loadLibraryPrefs() below once its fetch resolves; starts at the
 // same value DEFAULT_LIBRARY_PREFS uses so there's no visible flash
 // for a user with no saved preferences yet.
-const pageSize = ref(DEFAULT_LIBRARY_PREFS.pageSize);
+// Marks (see the marks section below) feed the list's id source, so they
+// are declared before the first search runs.
+const markedIds = ref<Set<number>>(new Set());
+const showMarkedOnly = ref(false);
+
 const duplicateDefault = ref<LibraryPrefs["duplicateDefault"]>(DEFAULT_LIBRARY_PREFS.duplicateDefault);
 
 const queryText = ref("");
@@ -70,7 +78,6 @@ const activeQuery = ref(""); // committed query -- what's actually sent, vs. the
 const sort = ref(DEFAULT_LIBRARY_PREFS.sort);
 const sortOrder = ref<"asc" | "desc">(DEFAULT_LIBRARY_PREFS.sortOrder);
 const vl = ref("");
-const offset = ref(0);
 
 const sortableFields = ref<[string, string][]>([]);
 const fieldMetadata = ref<Record<string, FieldMetaEntry>>({});
@@ -145,7 +152,6 @@ function onSortMenuChoose(id: SortMenuId) {
   const next = applySortChoice({ sort: sort.value, order: sortOrder.value }, id);
   sort.value = next.sort;
   sortOrder.value = next.order;
-  offset.value = 0;
   void runSearch();
 }
 
@@ -198,19 +204,32 @@ function openSortMenu(anchorRect: { x: number; y: number }) {
   sortMenu.value = anchorRect;
 }
 
-const books = ref<BookSummary[]>([]);
-const totalNum = ref(0);
+// The library list is one continuous, virtualised list. `win` holds the
+// ordered id of every matching book plus a lazy cache of the summaries
+// the viewport has needed (library/bookWindow.ts).
+const ALL_ROWS = 100_000_000;
+
+async function fetchIdList() {
+  if (showMarkedOnly.value) {
+    const ids = [...markedIds.value];
+    return { ids, total: ids.length };
+  }
+  const result = await search({ query: activeQuery.value, num: ALL_ROWS, offset: 0, sort: sort.value, sortOrder: sortOrder.value, vl: vl.value });
+  return { ids: result.book_ids, total: result.total_num };
+}
+
+const win = createBookWindow({ fetchIds: fetchIdList, fetchBooks });
+const totalNum = win.total;
 const loading = ref(false);
 const error = ref<string | null>(null);
 const selectedBookId = ref<number | null>(null);
 const cacheBust = ref(0);
+const tableRef = ref<InstanceType<typeof BookTable> | null>(null);
+const gridRef = ref<InstanceType<typeof BookGrid> | null>(null);
 
 const addInput = ref<HTMLInputElement | null>(null);
 const adding = ref(false);
 const addError = ref<string | null>(null);
-
-const pageCount = computed(() => Math.max(1, Math.ceil(totalNum.value / pageSize.value)));
-const currentPage = computed(() => Math.floor(offset.value / pageSize.value) + 1);
 
 async function loadMetadata() {
   try {
@@ -232,7 +251,6 @@ async function loadLibraryPrefs() {
     if (!prefs) return;
     sort.value = prefs.sort;
     sortOrder.value = prefs.sortOrder;
-    pageSize.value = prefs.pageSize;
     duplicateDefault.value = prefs.duplicateDefault;
   } catch (e) {
     // Non-fatal -- the grid still works with the built-in defaults.
@@ -308,7 +326,6 @@ function setViewMode(mode: LibraryViewMode) {
 function onTableSort(next: { sort: string; order: "asc" | "desc" }) {
   sort.value = next.sort;
   sortOrder.value = next.order;
-  offset.value = 0;
   void runSearch();
 }
 
@@ -766,7 +783,6 @@ async function removeCustomColumnClick(label: string) {
 function applySavedSearch(query: string) {
   queryText.value = query;
   activeQuery.value = query;
-  offset.value = 0;
   manageOpen.value = false;
 }
 
@@ -938,35 +954,52 @@ async function fetchNews() {
   }
 }
 
+/**
+ * Re-run the current query after something changed (an edit, delete,
+ * import, resolve). The scroll position and the loaded rows are kept:
+ * rows already on screen stay until their fresh copy arrives, so
+ * nothing flashes.
+ */
 async function runSearch() {
   loading.value = true;
   error.value = null;
   try {
-    const result = await search({
-      query: activeQuery.value,
-      num: pageSize.value,
-      offset: offset.value,
-      sort: sort.value,
-      sortOrder: sortOrder.value,
-      vl: vl.value,
-    });
-    totalNum.value = result.total_num;
-    books.value = await fetchBooks(result.book_ids);
-  } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e);
-    books.value = [];
-    totalNum.value = 0;
+    // Colours are re-evaluated for the rows on screen; the old ones stay until replaced.
+    colorChecked.clear();
+    await win.refresh();
+    error.value = win.error.value;
+    pruneSelection();
   } finally {
     loading.value = false;
   }
+}
+
+/** A different query, sort or virtual library: start again from the top. */
+async function resetSearch() {
+  loading.value = true;
+  error.value = null;
+  try {
+    await win.reset();
+    error.value = win.error.value;
+  } finally {
+    loading.value = false;
+  }
+}
+
+/** After a refresh, selected books that no longer match are dropped from the selection. */
+function pruneSelection() {
+  if (selectedIds.value.size === 0) return;
+  const next = new Set<number>();
+  for (const id of selectedIds.value) if (win.indexOf(id) >= 0) next.add(id);
+  if (next.size !== selectedIds.value.size) selectedIds.value = next;
 }
 
 // Declared before the immediate watcher below reads it: a `const` read
 // before its line throws (temporal dead zone) and blanked the whole view.
 const ftsMode = ref(false);
 
-watch([activeQuery, sort, sortOrder, vl, offset], () => {
-  if (!ftsMode.value) void runSearch();
+watch([activeQuery, sort, sortOrder, vl], () => {
+  if (!ftsMode.value) void resetSearch();
 }, { immediate: true });
 
 // Full-text search -- a separate result shape/backend (crates/calibre_srv/src/fts.rs)
@@ -1055,21 +1088,13 @@ function snippetSegments(text: string) {
 
 function submitSearch() {
   activeQuery.value = queryText.value;
-  offset.value = 0;
 }
 
 function onCategorySelect(categoryQuery: string) {
   queryText.value = categoryQuery;
   activeQuery.value = categoryQuery;
-  offset.value = 0;
 }
 
-function nextPage() {
-  if (offset.value + pageSize.value < totalNum.value) offset.value += pageSize.value;
-}
-function prevPage() {
-  if (offset.value > 0) offset.value = Math.max(0, offset.value - pageSize.value);
-}
 
 function onDetailsUpdated() {
   cacheBust.value++;
@@ -1139,16 +1164,92 @@ function toggleSelectMode() {
   }
 }
 
+/** The row a shift-click range starts from: the last one toggled. */
+let selectAnchor: number | null = null;
+
 function toggleSelected(bookId: number) {
   const next = new Set(selectedIds.value);
   if (next.has(bookId)) next.delete(bookId);
   else next.add(bookId);
   selectedIds.value = next;
+  selectAnchor = bookId;
 }
 
-function onCardClick(bookId: number) {
-  if (selectMode.value) toggleSelected(bookId);
-  else selectedBookId.value = bookId;
+/** Shift-click: select everything between the anchor and this row, loaded or not. */
+function rangeSelect(bookId: number) {
+  const from = selectAnchor === null ? -1 : win.indexOf(selectAnchor);
+  const to = win.indexOf(bookId);
+  if (from < 0 || to < 0) {
+    toggleSelected(bookId);
+    return;
+  }
+  const next = new Set(selectedIds.value);
+  for (const id of win.idsBetween(from, to)) next.add(id);
+  selectedIds.value = next;
+}
+
+/** Every matching book, by id: the whole list, not just what is loaded. */
+function selectAll() {
+  selectedIds.value = new Set(win.ids.value);
+}
+
+function onCardClick(bookId: number, event?: MouseEvent) {
+  if (selectMode.value) {
+    if (event?.shiftKey) rangeSelect(bookId);
+    else toggleSelected(bookId);
+  } else selectedBookId.value = bookId;
+}
+
+// Which rows the views are showing: load exactly those (plus overscan).
+function onRange(range: { first: number; last: number }) {
+  renderedRange.value = range;
+  win.setRange(range.first, range.last);
+}
+
+/** Arrow/page/Home/End on the list: move the selected row and keep it in view. */
+function onNavigate(key: string) {
+  const n = win.ids.value.length;
+  if (n === 0) return;
+  const current = selectedBookId.value === null ? -1 : win.indexOf(selectedBookId.value);
+  let next: number | null;
+  if (viewMode.value === "table") {
+    next = navigateIndex(key, current, n, tableRef.value?.pageRows() ?? 10);
+  } else {
+    const { columns, pageRows } = gridRef.value?.layout() ?? { columns: 1, pageRows: 3 };
+    const clampTo = (i: number) => Math.min(n - 1, Math.max(0, i));
+    const from = current < 0 ? 0 : current;
+    if (current < 0 && key !== "Home" && key !== "End") next = 0;
+    else if (key === "ArrowLeft") next = clampTo(from - 1);
+    else if (key === "ArrowRight") next = clampTo(from + 1);
+    else if (key === "ArrowUp") next = clampTo(from - columns);
+    else if (key === "ArrowDown") next = clampTo(from + columns);
+    else if (key === "PageUp") next = clampTo(from - columns * Math.max(1, pageRows - 1));
+    else if (key === "PageDown") next = clampTo(from + columns * Math.max(1, pageRows - 1));
+    else if (key === "Home") next = 0;
+    else if (key === "End") next = n - 1;
+    else next = null;
+  }
+  if (next === null) return;
+  const id = win.idAt(next);
+  if (id === undefined) return;
+  selectedBookId.value = id;
+  (viewMode.value === "table" ? tableRef.value : gridRef.value)?.scrollToIndex(next);
+}
+
+// In-place edits from the table: applied to the row at once, saved with
+// the same set-fields call the details panel uses, rolled back on failure.
+// The row keeps its place even if the edit changes its sort key -- the
+// list is only re-sorted by the next refresh or query.
+const detailsRefresh = ref(0);
+
+async function commitEdit(bookId: number, column: BookColumn, raw: string): Promise<CommitResult> {
+  const result = await commitCellEdit({ target: win, bookId, column, raw, save: setFields });
+  if (result.status === "saved") {
+    if (selectedBookId.value === bookId) detailsRefresh.value++;
+    colorChecked.delete(bookId);
+    void applyColoringRules();
+  }
+  return result;
 }
 
 async function runBulkEdit() {
@@ -1179,10 +1280,17 @@ async function runBulkEdit() {
 
   let changed = 0;
   let skipped = 0;
+  // A selection can reach rows that were never scrolled to (select
+  // all, a long shift-range): fetch the ones that are not loaded.
+  try {
+    await win.ensureLoaded(ids);
+  } catch (e) {
+    bulkErrors.value.push(`Could not read the selected books: ${e instanceof Error ? e.message : String(e)}`);
+  }
   for (const id of ids) {
-    const current = books.value.find((b) => b.id === id);
+    const current = win.getById(id);
     if (!current) {
-      bulkErrors.value.push(`Book ${id}: not on this page`);
+      bulkErrors.value.push(`Book ${id}: could not be loaded`);
       continue;
     }
     try {
@@ -2580,9 +2688,6 @@ function openBookFromAnnotation(bookId: number) {
 // note, not metadata, and persisting it would make it something the
 // user has to clean up.
 
-const markedIds = ref<Set<number>>(new Set());
-const showMarkedOnly = ref(false);
-
 function markSelection() {
   const ids = selectMode.value && selectedIds.value.size > 0 ? [...selectedIds.value] : selectedBookId.value !== null ? [selectedBookId.value] : [];
   if (ids.length === 0) return;
@@ -2609,32 +2714,14 @@ function clearMarks() {
  */
 async function toggleShowMarked() {
   showMarkedOnly.value = !showMarkedOnly.value;
-  if (!showMarkedOnly.value) {
-    await runSearch();
-    return;
-  }
-  const ids = [...markedIds.value];
-  if (ids.length === 0) {
-    books.value = [];
-    totalNum.value = 0;
-    return;
-  }
-  loading.value = true;
-  error.value = null;
-  try {
-    books.value = await fetchBooks(ids);
-    totalNum.value = books.value.length;
-    offset.value = 0;
-  } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    loading.value = false;
-  }
+  // The list's id source reads `showMarkedOnly`: exactly the marked
+  // ids, in place of a search.
+  await resetSearch();
 }
 
 /** Similar books (#1.9): a plain search, using the existing engine. */
 async function showSimilarBooks(bookId: number) {
-  const book = books.value.find((b) => b.id === bookId) ?? (await fetchBooks([bookId]))[0];
+  const book = win.getById(bookId) ?? (await fetchBooks([bookId]))[0];
   if (!book) return;
   const query = similarBooksQuery(
     { id: book.id, authors: book.authors, tags: book.tags, series: book.series, publisher: typeof book.publisher === "string" ? book.publisher : null },
@@ -2648,15 +2735,14 @@ async function showSimilarBooks(bookId: number) {
   selectedBookId.value = null;
   queryText.value = query;
   activeQuery.value = query;
-  offset.value = 0;
-  await runSearch();
+  await resetSearch();
 }
 
 /** Random book (#1.16): opens one from the whole library. */
 async function pickRandomBook() {
   try {
     // Ids only -- the point is to pick one, not to render a page.
-    const all = await search({ query: "", num: 10000, offset: 0, sort: "id", sortOrder: "asc", vl: vl.value });
+    const all = await search({ query: "", num: ALL_ROWS, offset: 0, sort: "id", sortOrder: "asc", vl: vl.value });
     if (all.book_ids.length === 0) return;
     const id = all.book_ids[Math.floor(Math.random() * all.book_ids.length)];
     selectedBookId.value = id;
@@ -2705,32 +2791,58 @@ async function loadColoringRules() {
 }
 void loadColoringRules();
 
+/** Rows currently rendered (visible plus overscan), as reported by the table/grid. */
+const renderedRange = ref({ first: 0, last: 0 });
+/** Ids already evaluated against the current rules, so scrolling does not re-ask. */
+const colorChecked = new Set<number>();
+let colorGeneration = 0;
+
 async function applyColoringRules() {
   const rules = activeRules(coloringRules.value);
-  const ids = books.value.map((b) => b.id);
-  if (rules.length === 0 || ids.length === 0) {
+  if (rules.length === 0) {
     rowColors.value = {};
+    colorChecked.clear();
     return;
   }
+  // Only the rows on screen that have loaded and have not been coloured yet.
+  const { first, last } = renderedRange.value;
+  const ids = win.ids.value.slice(first, last).filter((id) => win.cache.has(id) && !colorChecked.has(id));
+  if (ids.length === 0) return;
+  const generation = colorGeneration;
+  for (const id of ids) colorChecked.add(id);
   try {
     // One request per rule, not per book: a rule is the same template
     // for every row, and the server parses it once.
     const perRule = await Promise.all(rules.map((r) => evaluateTemplateBulk(r.template, ids)));
-    const next: Record<number, string> = {};
+    if (generation !== colorGeneration) return;
+    const next = { ...rowColors.value };
     for (const id of ids) {
       const color = colorForBook(rules, perRule.map((results) => results[String(id)]));
       if (color) next[id] = color;
+      else delete next[id];
     }
     rowColors.value = next;
   } catch (e) {
     // Colouring is decoration; a failure must not take down the list.
     console.error("failed to apply colouring rules", e);
-    rowColors.value = {};
+    for (const id of ids) colorChecked.delete(id);
   }
 }
 
-// Re-run whenever the visible set or the rules change.
-watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
+// Re-run whenever rows load, the visible set moves, or the rules change.
+watch([win.version, renderedRange], () => void applyColoringRules());
+// A new query: colours belong to the old rows.
+watch(win.resetCount, () => {
+  colorGeneration++;
+  colorChecked.clear();
+  rowColors.value = {};
+});
+watch(coloringRules, () => {
+  colorGeneration++;
+  colorChecked.clear();
+  rowColors.value = {};
+  void applyColoringRules();
+}, { deep: true });
 </script>
 
 <template>
@@ -3033,41 +3145,50 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
 
       <main v-else class="grid-area">
         <p v-if="error" class="error">{{ error }}</p>
-        <p v-else-if="loading" class="status">Loading…</p>
-        <p v-else-if="books.length === 0" class="status">No books found.</p>
+        <p v-else-if="loading && totalNum === 0" class="status">Loading…</p>
+        <p v-else-if="!loading && totalNum === 0" class="status">No books found.</p>
 
         <BookTable
           v-if="viewMode === 'table'"
-          :books="books"
+          ref="tableRef"
+          :ids="win.ids.value"
+          :get-book="win.getById"
           :columns="visibleColumns"
           :select-mode="selectMode"
           :selected-ids="selectedIds"
           :selected-book-id="selectedBookId"
           :sort="sort"
           :sort-order="sortOrder"
+          :reset-key="win.resetCount.value"
+          :commit="commitEdit"
           @select="selectedBookId = $event"
           @toggle-selected="toggleSelected"
+          @range-select="rangeSelect"
           @sort-by="onTableSort"
           @resize="onColumnResize"
           @context-menu="openContextMenu"
+          @range="onRange"
+          @navigate="onNavigate"
           :row-colors="rowColors"
         />
 
-        <div v-else class="grid">
-          <button v-for="book in books" :key="book.id" class="card" :class="{ selected: selectMode && selectedIds.has(book.id) }" @click="onCardClick(book.id)" @contextmenu.prevent="openContextMenu({ bookId: book.id, x: $event.clientX, y: $event.clientY })">
-            <input v-if="selectMode" type="checkbox" class="card-checkbox" :checked="selectedIds.has(book.id)" @click.stop="toggleSelected(book.id)" />
-            <span v-if="markedIds.has(book.id)" class="card-mark" title="Marked">●</span>
-            <img :src="`${book.thumbnail}?v=${cacheBust}`" :alt="book.title" loading="lazy" />
-            <div class="card-title">{{ book.title }}</div>
-            <div class="card-authors">{{ (book.authors ?? []).join(" & ") }}</div>
-          </button>
-        </div>
-
-        <footer class="pagination">
-          <button :disabled="offset === 0" @click="prevPage">◀ Prev</button>
-          <span>Page {{ currentPage }} / {{ pageCount }} ({{ totalNum }} books)</span>
-          <button :disabled="offset + pageSize >= totalNum" @click="nextPage">Next ▶</button>
-        </footer>
+        <BookGrid
+          v-else
+          ref="gridRef"
+          :ids="win.ids.value"
+          :get-book="win.getById"
+          :select-mode="selectMode"
+          :selected-ids="selectedIds"
+          :selected-book-id="selectedBookId"
+          :marked-ids="markedIds"
+          :cache-bust="cacheBust"
+          :reset-key="win.resetCount.value"
+          @select="onCardClick"
+          @toggle-selected="(id: number, e: MouseEvent) => (e.shiftKey ? rangeSelect(id) : toggleSelected(id))"
+          @context-menu="openContextMenu"
+          @range="onRange"
+          @navigate="onNavigate"
+        />
       </main>
 
       <!--
@@ -3087,6 +3208,7 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
           <BookDetailsPanel
             :book-id="selectedBookId"
             :pending-action="pendingBookAction"
+            :refresh-key="detailsRefresh"
             docked
             @close="detailsVisible = false"
             @updated="onDetailsUpdated"
@@ -3117,8 +3239,10 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
       >
         📚 {{ libraryName }}
       </button>
-      <span class="status-count">{{ totalNum }} book<span v-if="totalNum !== 1">s</span></span>
-      <span v-if="selectedIds.size > 0" class="status-sel">{{ selectedIds.size }} selected</span>
+      <span class="status-count">{{ totalNum.toLocaleString() }} book<span v-if="totalNum !== 1">s</span></span>
+      <span v-if="totalNum > 0 && renderedRange.last > renderedRange.first" class="status-sort status-rows" title="Rows currently loaded around the viewport">rows {{ (renderedRange.first + 1).toLocaleString() }}–{{ renderedRange.last.toLocaleString() }}</span>
+      <button v-if="selectMode && totalNum > 0" type="button" class="status-toggle" title="Select every matching book" @click="selectAll">Select all {{ totalNum.toLocaleString() }}</button>
+      <span v-if="selectedIds.size > 0" class="status-sel">{{ selectedIds.size.toLocaleString() }} selected</span>
       <span v-if="markedIds.size > 0" class="status-sel">{{ markedIds.size }} marked</span>
       <span class="status-spacer"></span>
       <span class="status-sort">Sorted by {{ sortSummary }}</span>
@@ -3920,76 +4044,9 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
   display: flex;
   flex-direction: column;
   /* `hidden`, not `auto`: the list scrolls inside itself so the
-     pagination below it stays put instead of scrolling away. */
+     status bar below it stays put instead of scrolling away. */
   overflow: hidden;
   padding: 0.5em;
-}
-/* The grid view is the other thing that fills this column. */
-.grid-area > .grid {
-  flex: 1;
-  min-height: 0;
-  overflow: auto;
-}
-/* Pinned to the bottom of the column rather than sitting directly
-   under a short list. */
-.pagination {
-  margin-top: auto;
-  flex-shrink: 0;
-}
-.grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
-  gap: 1em;
-  flex: 1;
-}
-.card {
-  background: none;
-  border: none;
-  cursor: pointer;
-  text-align: left;
-  padding: 0;
-  font: inherit;
-  /* Also the containing block for `.card-mark` and `.card-checkbox`. */
-  position: relative;
-}
-.card.selected img {
-  outline: 3px solid var(--accent);
-  outline-offset: -3px;
-}
-.card-checkbox {
-  position: absolute;
-  top: 0.3em;
-  left: 0.3em;
-  width: 1.1em;
-  height: 1.1em;
-  z-index: 1;
-}
-.card img {
-  width: 100%;
-  height: auto;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
-}
-.card-title {
-  font-weight: 600;
-  font-size: var(--fs-small);
-  margin-top: 0.25em;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.card-authors {
-  font-size: var(--fs-small);
-  color: var(--fg-muted);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.pagination {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 1em;
-  padding: 0.75em 0;
 }
 .status,
 .error {
@@ -4339,14 +4396,6 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
   font-size: var(--fs-small);
   opacity: 0.8;
   white-space: nowrap;
-}
-.card-mark {
-  position: absolute;
-  top: 4px;
-  left: 6px;
-  color: var(--mark);
-  font-size: var(--fs-body);
-  text-shadow: 0 0 3px rgb(0 0 0 / 45%);
 }
 
 </style>

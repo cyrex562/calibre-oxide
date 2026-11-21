@@ -41,7 +41,20 @@ export interface BookColumn {
   sortKey?: string;
   /** Column width in pixels. */
   width: number;
+  /** How a cell in this column is edited in place; absent means read-only. */
+  editor?: CellEditor;
 }
+
+/** The in-place editor a column offers (see inlineEdit.ts for parsing). */
+export type CellEditor =
+  | { type: "text" }
+  | { type: "authors" }
+  | { type: "list" }
+  | { type: "number"; integer?: boolean }
+  | { type: "rating" }
+  | { type: "date" }
+  | { type: "enum"; values: string[] }
+  | { type: "bool" };
 
 /**
  * Columns shown to someone who has never configured any, in order.
@@ -52,19 +65,19 @@ export interface BookColumn {
 export const DEFAULT_VISIBLE_KEYS = ["title", "authors", "series", "tags", "publisher", "timestamp", "formats"];
 
 /** Per-field display rules, keyed by the book row's own key. */
-const KNOWN_COLUMNS: Record<string, { label: string; kind: ColumnKind; width: number }> = {
-  title: { label: "Title", kind: "text", width: 320 },
-  authors: { label: "Authors", kind: "list", width: 200 },
+const KNOWN_COLUMNS: Record<string, { label: string; kind: ColumnKind; width: number; editor?: CellEditor }> = {
+  title: { label: "Title", kind: "text", width: 320, editor: { type: "text" } },
+  authors: { label: "Authors", kind: "list", width: 200, editor: { type: "authors" } },
   author_sort: { label: "Author sort", kind: "text", width: 200 },
-  series: { label: "Series", kind: "text", width: 160 },
-  series_index: { label: "#", kind: "number", width: 60 },
-  tags: { label: "Tags", kind: "list", width: 180 },
-  publisher: { label: "Publisher", kind: "text", width: 160 },
-  rating: { label: "Rating", kind: "rating", width: 110 },
-  pubdate: { label: "Published", kind: "date", width: 120 },
+  series: { label: "Series", kind: "text", width: 160, editor: { type: "text" } },
+  series_index: { label: "#", kind: "number", width: 60, editor: { type: "number" } },
+  tags: { label: "Tags", kind: "list", width: 180, editor: { type: "list" } },
+  publisher: { label: "Publisher", kind: "text", width: 160, editor: { type: "text" } },
+  rating: { label: "Rating", kind: "rating", width: 110, editor: { type: "rating" } },
+  pubdate: { label: "Published", kind: "date", width: 120, editor: { type: "date" } },
   timestamp: { label: "Date added", kind: "date", width: 120 },
   last_modified: { label: "Modified", kind: "date", width: 120 },
-  languages: { label: "Languages", kind: "list", width: 110 },
+  languages: { label: "Languages", kind: "list", width: 110, editor: { type: "list" } },
   formats: { label: "Formats", kind: "formats", width: 120 },
   identifiers: { label: "Identifiers", kind: "text", width: 160 },
   isbn: { label: "ISBN", kind: "text", width: 140 },
@@ -100,6 +113,37 @@ function kindForDatatype(datatype: string | null): ColumnKind {
 }
 
 /**
+ * The editor a custom column gets, or undefined when it is not edited
+ * in place. Rating is left out on purpose: custom ratings are stored
+ * on calibre's 0..10 scale but shown as stars unscaled, so an inline
+ * edit could not round-trip.
+ */
+function editorForCustom(entry: FieldMetaEntry): CellEditor | undefined {
+  if (entry.is_editable === false) return undefined;
+  switch (entry.datatype) {
+    case "text":
+      return entry.is_multiple ? { type: "list" } : { type: "text" };
+    case "series":
+      return { type: "text" };
+    case "enumeration": {
+      const display = entry.display as { enum_values?: unknown } | undefined;
+      const values = Array.isArray(display?.enum_values) ? display.enum_values.map(String) : [];
+      return values.length > 0 ? { type: "enum", values } : undefined;
+    }
+    case "int":
+      return { type: "number", integer: true };
+    case "float":
+      return { type: "number" };
+    case "bool":
+      return { type: "bool" };
+    case "datetime":
+      return { type: "date" };
+    default:
+      return undefined;
+  }
+}
+
+/**
  * Every column that can be shown for this library, in a stable order:
  * the known standard fields first (in `KNOWN_COLUMNS` order), then any
  * custom columns the library defines.
@@ -121,11 +165,13 @@ export function columnsFor(fieldMetadata: Record<string, FieldMetaEntry>, sortab
     if (!entry.is_custom) continue;
     const key = entry.label;
     if (!key || NEVER_A_COLUMN.has(key) || columns.some((c) => c.key === key)) continue;
+    const editor = editorForCustom(entry);
     columns.push({
       key,
       label: entry.name || key,
       kind: kindForDatatype(entry.datatype),
       width: 140,
+      ...(editor ? { editor } : {}),
       ...(sortableKeys.has(entry.key) ? { sortKey: entry.key } : {}),
     });
   }
