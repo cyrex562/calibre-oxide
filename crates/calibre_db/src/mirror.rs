@@ -1241,18 +1241,6 @@ fn diff(files: &BTreeMap<String, SourceFile>, target: &Path, old: Option<&Manife
         items.push(item);
     }
 
-    // The copy's own edits to its change log belong with its database: a refresh
-    // that replaces either would discard them.
-    if !copy_edits.is_empty() && !overwrite {
-        for item in &mut items {
-            let is_db = item.rel == "metadata.db" || item.rel.starts_with(&format!("{LIBRARY_HANDLE_DIR_NAME}/snapshots/"));
-            if is_db && matches!(item.action, Action::Update | Action::CopyNew) {
-                item.reason = Some(format!("the copy has {} change(s) of its own; refreshing would discard them", copy_edits.len()));
-                item.action = Action::Conflict;
-            }
-        }
-    }
-
     // What the library no longer has.
     for (rel, m) in &manifest {
         if files.contains_key(*rel) {
@@ -1269,6 +1257,30 @@ fn diff(files: &BTreeMap<String, SourceFile>, target: &Path, old: Option<&Manife
             (Action::Conflict, Some("no longer in the library, but changed in the copy, so it was not removed".to_string()))
         };
         items.push(PlanItem { rel: (*rel).to_string(), kind: m.kind, action, size, mtime_ms: m.mtime_ms, blake3: Some(m.blake3.clone()), source: None, generated: false, reason, entry: Some((*m).clone()), recorded: None });
+    }
+
+    // The copy's own change-log entries are chained to the copy's baseline
+    // snapshot and recorded in its metadata.db: the three belong together. A
+    // refresh that writes, replaces or removes the database or any snapshot
+    // (a new source history gives the snapshot a new name, so this is not only
+    // "replacing the same file") would leave the edits pointing at a baseline
+    // that is gone. Without `overwrite_changed` all of those wait; with it, the
+    // database is always rewritten so the edits are set aside with it.
+    if !copy_edits.is_empty() {
+        let snapshots = format!("{LIBRARY_HANDLE_DIR_NAME}/snapshots/");
+        let is_db = |item: &PlanItem| item.rel == "metadata.db" || item.rel.starts_with(&snapshots);
+        let touches = items.iter().any(|i| is_db(i) && matches!(i.action, Action::Update | Action::CopyNew | Action::Remove));
+        if touches {
+            for item in items.iter_mut().filter(|i| is_db(i)) {
+                if !overwrite && matches!(item.action, Action::Update | Action::CopyNew | Action::Remove) {
+                    item.reason = Some(format!("the copy has {} change(s) of its own; refreshing would discard them", copy_edits.len()));
+                    item.action = Action::Conflict;
+                } else if overwrite && item.rel == "metadata.db" && item.action == Action::Unchanged && item.source.is_some() {
+                    item.reason = Some("replaces the copy's edited database".into());
+                    item.action = Action::Update;
+                }
+            }
+        }
     }
     items.sort_by(|a, b| a.rel.cmp(&b.rel));
     items
@@ -2063,6 +2075,47 @@ mod tests {
         assert_ne!(copy.field_for(ids[0], "rating").unwrap().as_deref(), Some("10"));
         assert_eq!(copy.field_for(ids[1], "rating").unwrap().as_deref(), Some("2"));
         assert!(target.path().join(MIRROR_TRASH_DIR).join(&report.run_id).exists());
+    }
+
+    /// Found on the trial library: the library changed a field and changed it
+    /// back, so its database snapshot was byte-identical but its history grew,
+    /// which gives the copy's baseline snapshot a new name. The refresh then
+    /// added the new snapshot and removed the old one -- neither "replaces"
+    /// metadata.db -- and left the copy's own edit chained to a baseline that
+    /// was gone.
+    #[test]
+    fn a_new_history_baseline_waits_for_the_copys_own_edits_too() {
+        let (_dir, cache, _s, ids) = sample();
+        let target = target_dir();
+        let opts = travel_opts(MirrorScope::All);
+        run(&cache, target.path(), &opts);
+        {
+            let copy = Cache::new(target.path()).unwrap();
+            copy.set_field(ids[0], "rating", "10").unwrap();
+        }
+        let before = cache.field_for(ids[1], "rating").unwrap();
+        cache.set_field(ids[1], "rating", "2").unwrap();
+        cache.set_field(ids[1], "rating", before.as_deref().unwrap_or("")).unwrap();
+
+        let plan = plan(&cache, target.path().to_str().unwrap(), &opts).unwrap();
+        assert!(!plan.copy_edits.is_empty());
+        let snapshots: Vec<&PlanItem> = plan.items.iter().filter(|i| i.rel.contains("/snapshots/")).collect();
+        assert!(!snapshots.is_empty());
+        assert!(snapshots.iter().all(|i| matches!(i.action, Action::Conflict | Action::Unchanged)), "{snapshots:?}");
+        assert!(plan.items.iter().all(|i| !(i.rel.contains("/snapshots/") && matches!(i.action, Action::CopyNew | Action::Remove | Action::Update))));
+        execute(&cache, &plan, &JobControl::new()).unwrap();
+        {
+            let copy = Cache::new(target.path()).unwrap();
+            assert_eq!(copy.field_for(ids[0], "rating").unwrap().as_deref(), Some("10"));
+        }
+
+        // Overwriting rewrites the database too, so edits, baseline and
+        // database move together.
+        let forced = MirrorOptions { overwrite_changed: true, ..opts };
+        let (_, report) = run(&cache, target.path(), &forced);
+        assert!(report.complete && report.edits_set_aside > 0, "{report:?}");
+        let copy = Cache::new(target.path()).unwrap();
+        assert_ne!(copy.field_for(ids[0], "rating").unwrap().as_deref(), Some("10"));
     }
 
     #[test]
