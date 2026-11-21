@@ -1,19 +1,33 @@
 <script setup lang="ts">
-// Sortable, resizable column table for the library (issue 1.1 of the
-// #816 epic).
+// Sortable, resizable, virtualised column table for the library.
+//
+// One continuous list: only the rows near the viewport are in the DOM,
+// between two spacer rows that stand in for the rest, so the scrollbar
+// represents every matching book however many there are.
 //
 // Presentational on purpose: every decision about *what* a cell says,
 // which columns exist and what a header click should do lives in
-// library/columns.ts as pure, tested functions. This component does
-// layout, pointer handling and events.
+// library/columns.ts; what an edit means lives in library/inlineEdit.ts;
+// which rows exist and which are loaded lives in library/bookWindow.ts.
+// This component does layout, pointer handling and events.
 
-import { ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import { formatCell, MAX_COLUMN_WIDTH, MIN_COLUMN_WIDTH, nextSort, type BookColumn } from "../library/columns";
+import { defaultEditKey, editKeyAction, initialText, isEditable, isEmptyCell, neighbourEditableKey, startsEditing, type CommitResult } from "../library/inlineEdit";
 import type { BookSummary } from "../library/types";
+import { windowRange } from "../library/virtualList";
+
+/** Height of one row, in pixels. Fixed: virtual scrolling depends on it. */
+const ROW_HEIGHT = 30;
+/** Used until the scroller has been measured (and in jsdom, which never measures). */
+const FALLBACK_VIEWPORT = 600;
 
 const props = defineProps<{
-  books: BookSummary[];
+  /** Every row's book id, in order. */
+  ids: number[];
+  /** The loaded summary for an id, or undefined while it is still loading. */
+  getBook: (id: number) => BookSummary | undefined;
   columns: BookColumn[];
   selectMode: boolean;
   selectedIds: Set<number>;
@@ -27,15 +41,102 @@ const props = defineProps<{
    * reaches a style attribute.
    */
   rowColors?: Record<number, string>;
+  /** Changes when the list is for a new query: scrolls back to the top. */
+  resetKey?: number;
+  /** Saves an in-place edit. Without it cells are read-only. */
+  commit?: (bookId: number, column: BookColumn, raw: string) => Promise<CommitResult>;
 }>();
 
 const emit = defineEmits<{
   select: [bookId: number];
   toggleSelected: [bookId: number];
+  rangeSelect: [bookId: number];
   sortBy: [value: { sort: string; order: "asc" | "desc" }];
   resize: [value: { key: string; width: number }];
   contextMenu: [value: { bookId: number; x: number; y: number }];
+  /** Rows `[first, last)` are rendered (visible plus overscan): load them. */
+  range: [value: { first: number; last: number }];
+  /** A navigation key (arrows, page keys, Home/End) on the list. */
+  navigate: [key: string];
 }>();
+
+// ---------------------------------------------------------------
+// Windowing
+// ---------------------------------------------------------------
+
+const scroller = ref<HTMLElement | null>(null);
+const scrollTop = ref(0);
+const viewportHeight = ref(FALLBACK_VIEWPORT);
+const headerHeight = ref(0);
+
+const range = computed(() => windowRange({ count: props.ids.length, rowHeight: ROW_HEIGHT, scrollTop: scrollTop.value, viewportHeight: Math.max(ROW_HEIGHT, viewportHeight.value - headerHeight.value) }));
+const rowIndexes = computed(() => {
+  const out: number[] = [];
+  for (let i = range.value.start; i < range.value.end; i++) out.push(i);
+  return out;
+});
+
+watch(
+  () => [range.value.start, range.value.end] as const,
+  ([first, last]) => emit("range", { first, last }),
+  { immediate: true },
+);
+
+function measure() {
+  const el = scroller.value;
+  if (!el) return;
+  if (el.clientHeight > 0) viewportHeight.value = el.clientHeight;
+  headerHeight.value = el.querySelector("thead")?.getBoundingClientRect().height ?? 0;
+}
+
+function onScroll() {
+  const el = scroller.value;
+  if (el) scrollTop.value = el.scrollTop;
+}
+
+let resizeObserver: ResizeObserver | null = null;
+onMounted(() => {
+  measure();
+  if (typeof ResizeObserver !== "undefined" && scroller.value) {
+    resizeObserver = new ResizeObserver(measure);
+    resizeObserver.observe(scroller.value);
+  }
+});
+onBeforeUnmount(() => resizeObserver?.disconnect());
+
+watch(
+  () => props.resetKey,
+  () => {
+    if (scroller.value) scroller.value.scrollTop = 0;
+    scrollTop.value = 0;
+    editing.value = null;
+  },
+);
+
+/** Scrolls so row `index` is fully visible, below the sticky header. */
+function scrollToIndex(index: number) {
+  const el = scroller.value;
+  if (!el) return;
+  const viewport = Math.max(ROW_HEIGHT, (el.clientHeight || viewportHeight.value) - headerHeight.value);
+  const top = index * ROW_HEIGHT;
+  let next = el.scrollTop;
+  if (top < next) next = top;
+  else if (top + ROW_HEIGHT > next + viewport) next = top + ROW_HEIGHT - viewport;
+  if (next !== el.scrollTop) el.scrollTop = next;
+  scrollTop.value = el.scrollTop;
+}
+
+/** How many rows fit on screen, for PageUp/PageDown. */
+function pageRows(): number {
+  return Math.max(1, Math.floor((viewportHeight.value - headerHeight.value) / ROW_HEIGHT));
+}
+
+/** The scroll position's visible rows, for the status bar. */
+function visibleRows() {
+  return { first: range.value.first, last: range.value.last };
+}
+
+defineExpose({ scrollToIndex, pageRows, visibleRows, startEdit: (id: number, key?: string) => startEdit(id, key) });
 
 /** The column currently driving the sort, if it is one we show. */
 function sortIndicator(column: BookColumn): "" | "▲" | "▼" {
@@ -80,9 +181,15 @@ function endResize(event: PointerEvent) {
   resizing.value = null;
 }
 
-function onRowClick(bookId: number) {
-  if (props.selectMode) emit("toggleSelected", bookId);
-  else emit("select", bookId);
+// ---------------------------------------------------------------
+// Rows
+// ---------------------------------------------------------------
+
+function onRowClick(bookId: number, event?: MouseEvent) {
+  if (props.selectMode) {
+    if (event?.shiftKey) emit("rangeSelect", bookId);
+    else emit("toggleSelected", bookId);
+  } else emit("select", bookId);
 }
 
 /**
@@ -91,14 +198,158 @@ function onRowClick(bookId: number) {
  * roles and key handling are supplied explicitly.
  */
 function onRowKeydown(event: KeyboardEvent, bookId: number) {
+  if (editing.value) return;
   if (event.key !== "Enter" && event.key !== " ") return;
   event.preventDefault();
   onRowClick(bookId);
 }
+
+const NAV_KEYS = new Set(["ArrowDown", "ArrowUp", "PageDown", "PageUp", "Home", "End"]);
+
+function onListKeydown(event: KeyboardEvent) {
+  const target = event.target as HTMLElement | null;
+  if (target && (target.tagName === "INPUT" || target.tagName === "SELECT" || target.tagName === "TEXTAREA")) return;
+  if (event.ctrlKey || event.metaKey || event.altKey) return;
+  if (NAV_KEYS.has(event.key)) {
+    event.preventDefault();
+    emit("navigate", event.key);
+    scroller.value?.focus({ preventScroll: true });
+    return;
+  }
+  if (startsEditing(event) && props.commit) {
+    const id = props.selectedBookId ?? (target?.closest("tr")?.getAttribute("data-id") ? Number(target?.closest("tr")?.getAttribute("data-id")) : null);
+    if (id === null) return;
+    event.preventDefault();
+    startEdit(id, lastCellKey.value ?? undefined);
+  }
+}
+
+// ---------------------------------------------------------------
+// In-place editing
+// ---------------------------------------------------------------
+
+interface EditState {
+  id: number;
+  key: string;
+  text: string;
+  error: string | null;
+  busy: boolean;
+}
+
+const editing = ref<EditState | null>(null);
+/** The column of the cell last clicked: F2 edits that one. */
+const lastCellKey = ref<string | null>(null);
+/** Set while an editor is being closed on purpose, so its blur does not also save. */
+let closing = false;
+
+function columnByKey(key: string): BookColumn | undefined {
+  return props.columns.find((c) => c.key === key);
+}
+
+function startEdit(id: number, key?: string) {
+  if (!props.commit) return;
+  const book = props.getBook(id);
+  const column = columnByKey(key ?? "") && isEditable(columnByKey(key ?? "")!) ? columnByKey(key!)! : columnByKey(defaultEditKey(props.columns) ?? "");
+  if (!book || !column || !isEditable(column)) return;
+  closing = false;
+  editing.value = { id, key: column.key, text: initialText(book, column), error: null, busy: false };
+}
+
+function onCellClick(event: MouseEvent, book: BookSummary, column: BookColumn) {
+  lastCellKey.value = column.key;
+  if (!props.commit || props.selectMode || !isEditable(column)) return;
+  if (event.shiftKey || event.ctrlKey || event.metaKey) return;
+  if (editing.value && editing.value.id === book.id && editing.value.key === column.key) return;
+  if (isEmptyCell(book, column)) startEdit(book.id, column.key);
+}
+
+function onCellDblClick(book: BookSummary, column: BookColumn) {
+  if (!props.commit || !isEditable(column)) return;
+  startEdit(book.id, column.key);
+}
+
+async function finishEdit(then: "stay" | "next" | "prev" = "stay") {
+  const state = editing.value;
+  if (!state || state.busy || !props.commit) return;
+  const column = columnByKey(state.key);
+  if (!column) {
+    editing.value = null;
+    return;
+  }
+  closing = true;
+  state.busy = true;
+  let result: CommitResult;
+  try {
+    result = await props.commit(state.id, column, state.text);
+  } catch (e) {
+    result = { status: "error", message: e instanceof Error ? e.message : String(e) };
+  }
+  state.busy = false;
+  if (editing.value !== state) return; // the list was reset while saving
+  if (result.status === "error") {
+    // Keep the editor open with what was typed.
+    state.error = result.message;
+    closing = false;
+    await nextTick();
+    focusEditor();
+    return;
+  }
+  editing.value = null;
+  if (then !== "stay") {
+    const nextKey = neighbourEditableKey(props.columns, state.key, then === "next" ? 1 : -1);
+    if (nextKey) startEdit(state.id, nextKey);
+  }
+}
+
+function cancelEdit() {
+  closing = true;
+  editing.value = null;
+  void nextTick(() => scroller.value?.focus({ preventScroll: true }));
+}
+
+function onEditorKeydown(event: KeyboardEvent) {
+  const action = editKeyAction(event);
+  if (!action) return;
+  event.preventDefault();
+  event.stopPropagation();
+  if (action === "cancel") cancelEdit();
+  else if (action === "save") void finishEdit("stay").then(() => scroller.value?.focus({ preventScroll: true }));
+  else void finishEdit(action);
+}
+
+function onEditorBlur() {
+  if (closing) return;
+  void finishEdit("stay");
+}
+
+function focusEditor() {
+  scroller.value?.querySelector<HTMLElement>(".cell-editor")?.focus();
+}
+
+const vFocus = {
+  mounted(el: HTMLElement) {
+    el.focus();
+    if (el instanceof HTMLInputElement && el.type === "text") el.select();
+  },
+};
+
+function isEditingCell(id: number, column: BookColumn): boolean {
+  return editing.value !== null && editing.value.id === id && editing.value.key === column.key;
+}
+
+const BOOL_OPTIONS = [
+  { value: "", label: "" },
+  { value: "true", label: "Yes" },
+  { value: "false", label: "No" },
+];
+
+function hint(column: BookColumn): string {
+  return `Set ${column.label.toLowerCase()}…`;
+}
 </script>
 
 <template>
-  <div class="table-scroll">
+  <div ref="scroller" class="table-scroll" tabindex="-1" @scroll.passive="onScroll" @keydown="onListKeydown">
     <table class="book-table">
       <thead>
         <tr>
@@ -124,23 +375,53 @@ function onRowKeydown(event: KeyboardEvent, bookId: number) {
       </thead>
 
       <tbody>
-        <tr
-          v-for="b in books"
-          :key="b.id"
-          tabindex="0"
-          :class="{ selected: selectMode ? selectedIds.has(b.id) : selectedBookId === b.id }"
-          :style="rowColors?.[b.id] ? { color: rowColors[b.id] } : undefined"
-          @click="onRowClick(b.id)"
-          @keydown="onRowKeydown($event, b.id)"
-          @contextmenu.prevent="emit('contextMenu', { bookId: b.id, x: $event.clientX, y: $event.clientY })"
-        >
-          <td v-if="selectMode" class="check-col">
-            <input type="checkbox" :checked="selectedIds.has(b.id)" :aria-label="`Select ${b.title}`" @click.stop="emit('toggleSelected', b.id)" />
-          </td>
-          <td v-for="column in columns" :key="column.key" :style="{ width: `${column.width}px` }" :class="[`kind-${column.kind}`]" :title="formatCell(b, column)">
-            {{ formatCell(b, column) }}
-          </td>
-        </tr>
+        <tr v-if="range.padTop > 0" class="spacer" aria-hidden="true" :style="{ height: `${range.padTop}px` }"><td :colspan="columns.length + (selectMode ? 1 : 0)"></td></tr>
+        <template v-for="i in rowIndexes" :key="ids[i]">
+          <tr
+            v-if="getBook(ids[i])"
+            :data-id="ids[i]"
+            tabindex="0"
+            :class="{ selected: selectMode ? selectedIds.has(ids[i]) : selectedBookId === ids[i] }"
+            :style="rowColors?.[ids[i]] ? { color: rowColors[ids[i]] } : undefined"
+            @click="onRowClick(ids[i], $event)"
+            @keydown="onRowKeydown($event, ids[i])"
+            @contextmenu.prevent="emit('contextMenu', { bookId: ids[i], x: $event.clientX, y: $event.clientY })"
+          >
+            <td v-if="selectMode" class="check-col">
+              <input type="checkbox" :checked="selectedIds.has(ids[i])" :aria-label="`Select ${getBook(ids[i])!.title}`" @click.stop="onRowClick(ids[i], $event)" />
+            </td>
+            <td
+              v-for="column in columns"
+              :key="column.key"
+              :style="{ width: `${column.width}px` }"
+              :class="[`kind-${column.kind}`, { editable: commit && isEditable(column), 'empty-editable': commit && isEditable(column) && isEmptyCell(getBook(ids[i])!, column), editing: isEditingCell(ids[i], column), 'has-error': isEditingCell(ids[i], column) && editing?.error }]"
+              :data-hint="commit && isEditable(column) ? hint(column) : undefined"
+              :title="isEditingCell(ids[i], column) && editing?.error ? editing.error : formatCell(getBook(ids[i])!, column)"
+              @click="onCellClick($event, getBook(ids[i])!, column)"
+              @dblclick="onCellDblClick(getBook(ids[i])!, column)"
+            >
+              <template v-if="isEditingCell(ids[i], column) && editing">
+                <select v-if="column.editor?.type === 'enum' || column.editor?.type === 'bool'" v-model="editing.text" v-focus class="cell-editor" :disabled="editing.busy" @keydown="onEditorKeydown" @blur="onEditorBlur" @click.stop @dblclick.stop @change="finishEdit('stay')">
+                  <template v-if="column.editor?.type === 'enum'">
+                    <option value=""></option>
+                    <option v-for="v in column.editor.values" :key="v" :value="v">{{ v }}</option>
+                  </template>
+                  <template v-else>
+                    <option v-for="o in BOOL_OPTIONS" :key="o.value" :value="o.value">{{ o.label }}</option>
+                  </template>
+                </select>
+                <input v-else v-model="editing.text" v-focus class="cell-editor" :type="column.editor?.type === 'date' ? 'date' : 'text'" :placeholder="column.editor?.type === 'rating' ? '0 to 5' : ''" :disabled="editing.busy" :aria-label="`Edit ${column.label}`" @keydown="onEditorKeydown" @blur="onEditorBlur" @click.stop @dblclick.stop />
+                <span v-if="editing.error" class="cell-error" role="alert">{{ editing.error }}</span>
+              </template>
+              <template v-else>{{ formatCell(getBook(ids[i])!, column) }}</template>
+            </td>
+          </tr>
+          <tr v-else class="placeholder" :data-id="ids[i]" aria-hidden="true">
+            <td v-if="selectMode" class="check-col"></td>
+            <td v-for="column in columns" :key="column.key" :style="{ width: `${column.width}px` }"><span class="ph"></span></td>
+          </tr>
+        </template>
+        <tr v-if="range.padBottom > 0" class="spacer" aria-hidden="true" :style="{ height: `${range.padBottom}px` }"><td :colspan="columns.length + (selectMode ? 1 : 0)"></td></tr>
       </tbody>
     </table>
   </div>
@@ -152,6 +433,9 @@ function onRowKeydown(event: KeyboardEvent, bookId: number) {
   scrolls sideways once columns are wider than the viewport, which
   drags the toolbar and sidebar off-screen with it.
 */
+.table-scroll:focus {
+  outline: none;
+}
 .table-scroll {
   /* Fills the column and scrolls inside itself, both axes.
      Without `flex: 1` the table sizes to its own content, so an empty
@@ -183,6 +467,74 @@ function onRowKeydown(event: KeyboardEvent, bookId: number) {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* Rows are a fixed 30px (ROW_HEIGHT in the script): the virtual list
+   computes positions from it, so a row must never grow. */
+.book-table tbody td {
+  box-sizing: border-box;
+  height: 30px;
+  padding-top: 0;
+  padding-bottom: 0;
+  line-height: 29px;
+}
+.book-table tbody tr.spacer td {
+  height: inherit;
+  padding: 0;
+  border: 0;
+}
+.book-table tbody tr.spacer {
+  pointer-events: none;
+}
+.book-table tbody tr.placeholder td {
+  opacity: 0.5;
+}
+.ph {
+  display: inline-block;
+  width: 60%;
+  height: 0.7em;
+  border-radius: 3px;
+  background: var(--border);
+  vertical-align: middle;
+}
+
+/* Editing in place. */
+.book-table td.editable.empty-editable {
+  cursor: text;
+}
+.book-table td.empty-editable:not(.editing):hover::after {
+  content: attr(data-hint);
+  color: var(--fg-faint);
+  font-style: italic;
+}
+.book-table td.editing {
+  padding: 0 2px;
+  overflow: visible;
+  position: relative;
+}
+.cell-editor {
+  box-sizing: border-box;
+  width: 100%;
+  height: 26px;
+  font: inherit;
+  padding: 0 0.4rem;
+}
+.book-table td.has-error .cell-editor {
+  outline: 2px solid var(--danger);
+}
+.cell-error {
+  position: absolute;
+  left: 2px;
+  top: 100%;
+  z-index: 3;
+  background: var(--danger);
+  color: #fff;
+  font-size: var(--fs-small);
+  line-height: 1.3;
+  padding: 0.15rem 0.45rem;
+  border-radius: 3px;
+  white-space: normal;
+  max-width: 320px;
 }
 
 .book-table thead th {

@@ -36,7 +36,8 @@ export interface LibraryPrefs {
    */
   saveToDiskTemplate?: string;
   sortOrder: "asc" | "desc";
-  pageSize: number;
+  /** Retired: the library list is one continuous list now. Old saved values are still read and ignored. */
+  pageSize?: number;
   /// What happens when adding a book detects a same-title/author
   /// duplicate: "ask" prompts every time (the pre-#721 default
   /// behavior), "add"/"skip" act immediately with no prompt.
@@ -45,7 +46,7 @@ export interface LibraryPrefs {
 
 export const DEFAULT_SAVE_TO_DISK_TEMPLATE = "{author_sort}/{title}/{title} - {authors}";
 
-export const DEFAULT_LIBRARY_PREFS: LibraryPrefs = { sort: "timestamp", sortOrder: "desc", pageSize: 24, duplicateDefault: "ask", saveToDiskTemplate: DEFAULT_SAVE_TO_DISK_TEMPLATE };
+export const DEFAULT_LIBRARY_PREFS: LibraryPrefs = { sort: "timestamp", sortOrder: "desc", duplicateDefault: "ask", saveToDiskTemplate: DEFAULT_SAVE_TO_DISK_TEMPLATE };
 
 export interface ReaderPrefs {
   fontSizePercent: number;
