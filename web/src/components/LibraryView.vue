@@ -29,6 +29,8 @@ import type { DuplicateBook, MergeMode, MergeResponse } from "../library/api";
 import { fingerprintAction } from "../library/duplicates";
 import DuplicateReview from "./DuplicateReview.vue";
 import ResolveDialog from "./ResolveDialog.vue";
+import CompareDuplicates from "./CompareDuplicates.vue";
+import { createCompareController, MAX_BOOKS as COMPARE_MAX } from "../library/compare";
 import { createDuplicatesStore } from "../library/duplicatesStore";
 import { createResolveController } from "../library/resolve";
 import { createOrganizeController } from "../library/organize";
@@ -1472,6 +1474,27 @@ const duplicatesError = ref<string | null>(null);
 const dupStore = createDuplicatesStore();
 const resolveController = createResolveController();
 const resolveOpen = ref(false);
+// Compare copies side by side (from a group card, or a selection of 2 to 8
+// books): rules and state in ../library/compare.ts.
+const compareController = createCompareController(undefined, {
+  libraryChanged: () => void onDuplicatesChanged(),
+  groupsChanged: () => dupStore.refill(),
+});
+function openCompareForGroup(group: DuplicateGroup) {
+  void compareController.open(
+    group.books.map((b) => b.book_id),
+    { group },
+  );
+}
+function openCompareForSelection() {
+  const ids = [...selectedIds.value];
+  if (ids.length < 2) return;
+  if (ids.length > COMPARE_MAX) {
+    window.alert(`Compare takes 2 to ${COMPARE_MAX} books at once (${ids.length} are selected).`);
+    return;
+  }
+  void compareController.open(ids);
+}
 const organizeController = createOrganizeController();
 const organizeOpen = ref(false);
 /** Organize files: the selected books when there are any (select mode), else the open book is not assumed. */
@@ -2057,6 +2080,7 @@ const actionHandlers: Partial<Record<LibraryActionId, () => void>> = {
     bulkOpen.value = true;
   },
   "merge-books": () => void openMergeForSelection(),
+  "compare-duplicates": () => openCompareForSelection(),
   "save-to-disk": () => openSaveToDisk(),
   "rename-files": () => void openRenameFiles(),
   "embed-metadata": () => openEmbedMetadata(),
@@ -2091,6 +2115,7 @@ const HIDDEN_IN_FTS_MODE: ReadonlySet<LibraryActionId> = new Set<LibraryActionId
   "select-mode",
   "bulk-edit",
   "merge-books",
+  "compare-duplicates",
   "save-to-disk",
 ]);
 
@@ -2450,7 +2475,7 @@ function onLibraryKeydown(event: KeyboardEvent) {
   // A modal owns the keyboard while it is open -- firing library
   // shortcuts underneath one would act on a view the user cannot
   // currently see.
-  if (contextMenu.value || manageOpen.value || columnsOpen.value || columnPickerOpen.value || checkLibraryOpen.value || organizeOpen.value || retitleOpen.value || duplicatesOpen.value || mergeOpen.value || saveToDiskOpen.value || renameOpen.value || embedOpen.value || copyOpen.value || newsOpen.value || switchOpen.value) return;
+  if (contextMenu.value || manageOpen.value || columnsOpen.value || columnPickerOpen.value || checkLibraryOpen.value || organizeOpen.value || retitleOpen.value || duplicatesOpen.value || compareController.state.open || mergeOpen.value || saveToDiskOpen.value || renameOpen.value || embedOpen.value || copyOpen.value || newsOpen.value || switchOpen.value) return;
 
   const id = shortcutFor(event, libraryShortcuts(keymap.value));
   if (!id) return;
@@ -3340,12 +3365,13 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
           </p>
           <p v-if="duplicatesError" class="error">{{ duplicatesError }}</p>
           <p v-if="mergeDone" class="news-hint" role="status">{{ mergeDone }}</p>
-          <DuplicateReview :store="dupStore" @merge="openMergeForGroup" @details="(id) => (selectedBookId = id)" @resolve="resolveOpen = true" @changed="onDuplicatesChanged" />
+          <DuplicateReview :store="dupStore" @merge="openMergeForGroup" @compare="openCompareForGroup" @details="(id) => (selectedBookId = id)" @resolve="resolveOpen = true" @changed="onDuplicatesChanged" />
         </section>
       </div>
     </div>
 
     <ResolveDialog v-if="duplicatesOpen && resolveOpen" :store="dupStore" :controller="resolveController" @close="resolveOpen = false" @changed="onDuplicatesChanged" />
+    <CompareDuplicates v-if="compareController.state.open" :controller="compareController" @close="compareController.close()" />
     <OrganizeDialog v-if="organizeOpen" :controller="organizeController" :selected-ids="organizeSelection" @close="organizeOpen = false" @changed="onDuplicatesChanged" />
     <RetitleDialog v-if="retitleOpen" :controller="retitleController" :selected-ids="retitleSelection" @close="retitleOpen = false" @changed="onRetitleChanged" />
 

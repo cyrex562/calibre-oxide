@@ -27,6 +27,13 @@
 //!   fails (a different volume behind a junction, a locked file), the files of
 //!   that book already moved go back and the book is reported as failed; nothing
 //!   is copied across volumes.
+//! - **Move to a folder.** [`plan_to`] with [`Target::Folder`] is the same plan
+//!   and the same executor with an explicit destination folder instead of a
+//!   template: every file keeps its name (a taken name still gets ` (2)`), the
+//!   folder is created if missing, and the run is recorded and undone like any
+//!   other (`POST /move-books`, `POST /unorganize-library`). The folder is
+//!   checked by [`validate_folder`]: relative to the library, no `..`, nothing
+//!   reserved, no symlink on the way out.
 //! - **Undoable.** Every run writes `.calibre-oxide/organize-runs/<run_id>.json`
 //!   with each book's old and new place; [`undo`] reverses it, skipping books
 //!   changed since.
@@ -160,9 +167,98 @@ fn in_scope(cache: &Cache, scope: &Scope) -> Result<Vec<i32>> {
     Ok(ids)
 }
 
+/// Where a plan puts the books.
+#[derive(Debug, Clone, Copy)]
+pub enum Target<'a> {
+    /// A save-to-disk style template: folder and file name from the metadata.
+    Template(&'a str),
+    /// One folder, relative to the library (already through [`validate_folder`]);
+    /// each file keeps its own name.
+    Folder(&'a str),
+}
+
+/// Names Windows will not let a file or folder have.
+const RESERVED: [&str; 22] = ["con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9"];
+
+/// A destination folder from the user, checked and normalised: `/`-separated,
+/// relative to the library root. Rejects an empty path, an absolute one (a
+/// drive, a UNC path, a leading slash), `..`, characters no platform allows in
+/// a name, reserved names, and the library's own state folders. `.` components
+/// and repeated separators are dropped.
+pub fn validate_folder(folder: &str) -> std::result::Result<String, String> {
+    let f = folder.trim().replace('\\', "/");
+    if f.is_empty() {
+        return Err("a destination folder is required".into());
+    }
+    if f.starts_with('/') || f.contains(':') || Path::new(&f).is_absolute() {
+        return Err("the folder must be relative to the library (no drive, no leading slash)".into());
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for part in f.split('/') {
+        let part = part.trim();
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            return Err("the folder must stay inside the library (no `..`)".into());
+        }
+        if part.chars().any(|c| c.is_control() || "<>:\"|?*".contains(c)) {
+            return Err(format!("`{part}` has a character a folder name cannot have"));
+        }
+        if part.ends_with('.') || part.ends_with(' ') {
+            return Err(format!("`{part}` ends with a dot or a space"));
+        }
+        let stem = part.split('.').next().unwrap_or(part).to_lowercase();
+        if RESERVED.contains(&stem.as_str()) {
+            return Err(format!("`{part}` is a reserved name"));
+        }
+        let lower = part.to_lowercase();
+        if lower == crate::constants::LIBRARY_HANDLE_DIR_NAME.to_lowercase() || lower == ".caltrash" || lower == ".calibre-oxide" {
+            return Err(format!("`{part}` is the library's own folder"));
+        }
+        if part.chars().count() > 120 {
+            return Err("a folder name is too long".into());
+        }
+        parts.push(part);
+    }
+    if parts.is_empty() {
+        return Err("a destination folder is required".into());
+    }
+    Ok(parts.join("/"))
+}
+
+/// Whether any existing part of `rel` under `library` is a symlink or junction
+/// (a way out of the library).
+fn passes_through_link(library: &Path, rel: &str) -> bool {
+    let mut at = library.to_path_buf();
+    for part in rel.split('/').filter(|p| !p.is_empty()) {
+        at.push(part);
+        match std::fs::symlink_metadata(&at) {
+            Ok(m) if m.file_type().is_symlink() => return true,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    false
+}
+
 /// The dry run: what [`execute`] would do. Changes nothing.
 pub fn plan(cache: &Cache, template: &str, scope: &Scope) -> Result<OrganizePlan> {
+    plan_to(cache, Target::Template(template), scope)
+}
+
+/// [`plan`] for any [`Target`].
+pub fn plan_to(cache: &Cache, target: Target<'_>, scope: &Scope) -> Result<OrganizePlan> {
     let library = &cache.backend.library_path;
+    let label = match target {
+        Target::Template(t) => t.to_string(),
+        Target::Folder(f) => format!("move to {f}"),
+    };
+    if let Target::Folder(f) = target {
+        if passes_through_link(library, f) {
+            return Err(anyhow!("the folder {f} goes through a link out of the library"));
+        }
+    }
     let mut books = Vec::new();
     let mut skipped = Vec::new();
     let mut already = 0usize;
@@ -177,15 +273,30 @@ pub fn plan(cache: &Cache, template: &str, scope: &Scope) -> Result<OrganizePlan
             skipped.push(Skipped { book_id, reason: "the book has no files".into() });
             continue;
         }
-        let parts = match components(cache, book_id, template) {
-            Ok(p) => p,
-            Err(e) => {
-                skipped.push(Skipped { book_id, reason: format!("the template failed: {e}") });
-                continue;
+        // The destination folder, and the file name when the target decides it
+        // (a template does; a folder keeps each file's own).
+        let (new_path, fixed_stem): (String, Option<String>) = match target {
+            Target::Template(template) => {
+                let parts = match components(cache, book_id, template) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        skipped.push(Skipped { book_id, reason: format!("the template failed: {e}") });
+                        continue;
+                    }
+                };
+                let (stem, dirs) = parts.split_last().expect("components is never empty");
+                (dirs.join("/"), Some(stem.clone()))
+            }
+            Target::Folder(folder) => (folder.to_string(), None),
+        };
+        let stem_for = |old_stem: &str, n: usize| -> String {
+            let base = fixed_stem.clone().unwrap_or_else(|| old_stem.to_string());
+            if n == 0 {
+                base
+            } else {
+                format!("{base} ({})", n + 1)
             }
         };
-        let (stem, dirs) = parts.split_last().expect("components is never empty");
-        let new_path = dirs.join("/");
 
         // Each format's current file, and the extension it really has on disk.
         let mut current: Vec<(String, String, String, String)> = Vec::new(); // (FORMAT, old stem, ext, from rel)
@@ -206,20 +317,19 @@ pub fn plan(cache: &Cache, template: &str, scope: &Scope) -> Result<OrganizePlan
         }
 
         // The first suffix at which every target is free (or is the book's own file).
-        let mut chosen: Option<(String, bool)> = None;
+        let mut chosen: Option<(usize, bool)> = None;
         for n in 0..1000 {
-            let candidate = if n == 0 { stem.clone() } else { format!("{stem} ({})", n + 1) };
-            let ok = current.iter().all(|(_, _, ext, from)| {
-                let to = join_rel(&new_path, &format!("{candidate}.{ext}"));
+            let ok = current.iter().all(|(_, old_stem, ext, from)| {
+                let to = join_rel(&new_path, &format!("{}.{ext}", stem_for(old_stem, n)));
                 let (to_l, from_l) = (to.to_lowercase(), from.to_lowercase());
                 to_l == from_l || (!taken.contains(&to_l) && !library.join(&to).exists())
             });
             if ok {
-                chosen = Some((candidate, n > 0));
+                chosen = Some((n, n > 0));
                 break;
             }
         }
-        let Some((new_stem, suffixed)) = chosen else {
+        let Some((suffix_n, suffixed)) = chosen else {
             skipped.push(Skipped { book_id, reason: "no free file name".into() });
             continue;
         };
@@ -227,10 +337,11 @@ pub fn plan(cache: &Cache, template: &str, scope: &Scope) -> Result<OrganizePlan
         let mut files = Vec::new();
         let (mut old_names, mut new_names) = (BTreeMap::new(), BTreeMap::new());
         for (format, old_stem, ext, from) in &current {
+            let new_stem = stem_for(old_stem, suffix_n);
             let to = join_rel(&new_path, &format!("{new_stem}.{ext}"));
             taken.insert(to.to_lowercase());
             old_names.insert(format.clone(), old_stem.clone());
-            new_names.insert(format.clone(), new_stem.clone());
+            new_names.insert(format.clone(), new_stem);
             if &to != from {
                 files.push(PlannedFile { format: format.clone(), from: from.clone(), to });
             }
@@ -241,8 +352,8 @@ pub fn plan(cache: &Cache, template: &str, scope: &Scope) -> Result<OrganizePlan
         }
         books.push(PlannedBook { book_id, title, old_path, new_path, old_names, new_names, files, suffixed });
     }
-    let fingerprint = fingerprint(template, &books);
-    Ok(OrganizePlan { template: template.to_string(), books, skipped, already_organized: already, fingerprint })
+    let fingerprint = fingerprint(&label, &books);
+    Ok(OrganizePlan { template: label, books, skipped, already_organized: already, fingerprint })
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -672,5 +783,110 @@ mod tests {
         let p = plan(&cache, "Sorted/{title}", &Scope::PathPrefix("inbox".into())).unwrap();
         assert_eq!(p.books.len(), 1);
         assert_eq!(p.books[0].title, "Alpha");
+    }
+
+    // ---- Move to a folder (tranche 16) ----
+
+    #[test]
+    fn a_folder_is_validated_relative_to_the_library() {
+        assert_eq!(validate_folder("Sorted/PDFs").unwrap(), "Sorted/PDFs");
+        assert_eq!(validate_folder(r"  Sorted\Two//./Three ").unwrap(), "Sorted/Two/Three");
+        for bad in ["", "   ", ".", "..", "../x", "a/../../b", "a/..", "/abs", r"\\server\share", "C:/x", r"C:\x", "x:y", "a/CON", "nul.txt/b", "a/.caltrash", ".calibre-oxide/x", "bad*name", "a/b?", "trailing.", "tab\there"] {
+            assert!(validate_folder(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn the_folder_plan_changes_nothing_keeps_names_and_names_every_move() {
+        let (dir, cache) = library();
+        write(&dir.path().join("inbox/Alpha.pdf"), b"%PDF alpha");
+        write(&dir.path().join("inbox/Beta.pdf"), b"%PDF beta");
+        index(dir.path(), &cache);
+        let alpha = book_with_title(&cache, "Alpha");
+
+        let p = plan_to(&cache, Target::Folder("Keep/These"), &Scope::Ids(vec![alpha])).unwrap();
+        assert_eq!(p.books.len(), 1);
+        assert_eq!(p.books[0].files[0].to, "Keep/These/Alpha.pdf");
+        assert_eq!(p.books[0].new_names["PDF"], "Alpha", "the file keeps its name");
+        assert!(dir.path().join("inbox/Alpha.pdf").exists() && !dir.path().join("Keep").exists(), "a dry run moves nothing");
+        assert_eq!(p.fingerprint, plan_to(&cache, Target::Folder("Keep/These"), &Scope::Ids(vec![alpha])).unwrap().fingerprint);
+        assert_ne!(p.fingerprint, plan_to(&cache, Target::Folder("Other"), &Scope::Ids(vec![alpha])).unwrap().fingerprint);
+    }
+
+    #[test]
+    fn move_to_a_folder_creates_it_updates_the_database_and_is_undone_by_the_organize_undo() {
+        let (dir, cache) = library();
+        write(&dir.path().join("inbox/Alpha.pdf"), b"%PDF alpha");
+        write(&dir.path().join("inbox/Beta.pdf"), b"%PDF beta");
+        index(dir.path(), &cache);
+        let alpha = book_with_title(&cache, "Alpha");
+
+        let p = plan_to(&cache, Target::Folder("Keep/These"), &Scope::Ids(vec![alpha])).unwrap();
+        let report = execute(&cache, &p, &JobControl::new()).unwrap();
+        assert_eq!((report.books_moved, report.failed.len()), (1, 0), "{report:?}");
+        assert!(dir.path().join("Keep/These/Alpha.pdf").is_file());
+        assert!(dir.path().join("inbox/Beta.pdf").is_file(), "the neighbour stays");
+        assert_eq!(cache.field_for(alpha, "path").unwrap().unwrap(), "Keep/These");
+        // Already there: nothing to do.
+        assert!(plan_to(&cache, Target::Folder("Keep/These"), &Scope::Ids(vec![alpha])).unwrap().books.is_empty());
+
+        let undone = undo(&cache, &report.run_id, &JobControl::new()).unwrap();
+        assert_eq!(undone.books_restored, 1, "{undone:?}");
+        assert!(dir.path().join("inbox/Alpha.pdf").is_file());
+        assert!(!dir.path().join("Keep").exists(), "the folder the move made is gone again");
+        assert_eq!(cache.field_for(alpha, "path").unwrap().unwrap(), "inbox");
+    }
+
+    #[test]
+    fn moving_two_books_to_one_folder_numbers_the_second_and_overwrites_nothing() {
+        let (dir, cache) = library();
+        write(&dir.path().join("a/Same.pdf"), b"%PDF one");
+        write(&dir.path().join("b/Same.pdf"), b"%PDF two");
+        write(&dir.path().join("Dest/Same.pdf"), b"%PDF already here");
+        index(dir.path(), &cache);
+        let ids: Vec<i32> = cache.all_book_ids().unwrap().into_iter().filter(|id| cache.field_for(*id, "path").unwrap().unwrap_or_default() != "Dest").collect();
+        assert_eq!(ids.len(), 2);
+
+        let p = plan_to(&cache, Target::Folder("Dest"), &Scope::Ids(ids)).unwrap();
+        assert_eq!(p.conflicts(), 2, "both find the name taken: one by the file there, one by the first book");
+        let report = execute(&cache, &p, &JobControl::new()).unwrap();
+        assert_eq!(report.failed.len(), 0, "{report:?}");
+        let mut names: Vec<String> = std::fs::read_dir(dir.path().join("Dest")).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, ["Same (2).pdf", "Same (3).pdf", "Same.pdf"]);
+        assert_eq!(std::fs::read(dir.path().join("Dest/Same.pdf")).unwrap(), b"%PDF already here");
+    }
+
+    #[test]
+    fn a_folder_that_leaves_the_library_through_a_link_is_refused() {
+        let (dir, cache) = library();
+        let outside = tempfile::tempdir().unwrap();
+        write(&dir.path().join("inbox/Alpha.pdf"), b"%PDF alpha");
+        index(dir.path(), &cache);
+        let link = dir.path().join("Escape");
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_dir(outside.path(), &link).is_ok();
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(outside.path(), &link).is_ok();
+        if !made {
+            return; // no permission to make a symlink here
+        }
+        assert!(plan_to(&cache, Target::Folder("Escape/Sub"), &Scope::All).is_err());
+        assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none(), "nothing was written outside");
+    }
+
+    #[test]
+    fn a_folder_move_survives_a_rebuild_from_the_change_log() {
+        let (dir, cache) = library();
+        write(&dir.path().join("inbox/Alpha.pdf"), b"%PDF alpha");
+        index(dir.path(), &cache);
+        let alpha = book_with_title(&cache, "Alpha");
+        let p = plan_to(&cache, Target::Folder("Keep"), &Scope::Ids(vec![alpha])).unwrap();
+        assert_eq!(execute(&cache, &p, &JobControl::new()).unwrap().books_moved, 1);
+
+        cache.rebuild_from_change_log().unwrap();
+        let again = book_with_title(&cache, "Alpha");
+        assert_eq!(cache.field_for(again, "path").unwrap().unwrap(), "Keep");
+        assert!(dir.path().join("Keep/Alpha.pdf").is_file());
     }
 }

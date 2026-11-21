@@ -174,6 +174,7 @@ pub mod convert;
 pub mod custom_columns;
 pub mod data_files;
 pub mod duplicates;
+pub mod duplicates_compare;
 pub mod duplicates_review;
 pub mod editor_tools;
 pub mod errors;
@@ -392,6 +393,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/absorb-library/{library_id}", post(absorb_library::absorb))
         .route("/unabsorb-library/{library_id}", post(absorb_library::unabsorb))
         .route("/organize-library/{library_id}", post(organize_library::organize))
+        .route("/move-books/{library_id}", post(organize_library::move_books))
         .route("/unorganize-library/{library_id}", post(organize_library::unorganize))
         .route("/organize-runs/{library_id}", get(organize_library::runs))
         .route("/retitle-library/{library_id}", post(retitle_library::retitle))
@@ -426,6 +428,10 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/duplicates/exemptions/{library_id}", get(duplicates_review::exemptions))
         .route("/duplicates/exemptions/remove/{library_id}", post(duplicates_review::remove_exemption))
         .route("/duplicates/resolve/{library_id}", post(duplicates_review::resolve_route))
+        .route("/duplicates/compare/{library_id}", get(duplicates_compare::compare))
+        .route("/duplicates/manual-groups/{library_id}", get(duplicates_compare::manual_groups_list).post(duplicates_compare::manual_groups_post))
+        .route("/duplicates/manual-groups/remove/{library_id}", post(duplicates_compare::manual_groups_remove))
+        .route("/duplicates/refresh-books/{library_id}", post(duplicates_compare::refresh_books))
         .route("/duplicates/runs/{library_id}", get(duplicates_review::runs))
         .route("/duplicates/runs/{library_id}/{run_id}/restore", post(duplicates_review::restore_run))
         .route("/cdb/merge-books/{library_id}", post(merge_books::merge_books))
@@ -768,3 +774,7 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 }
+
+#[cfg(test)]
+#[path = "compare_and_move_tests.rs"]
+mod compare_and_move_tests;

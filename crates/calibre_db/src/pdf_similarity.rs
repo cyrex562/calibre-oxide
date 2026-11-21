@@ -126,13 +126,37 @@
 //!
 //! **Classify** ([`classify`]), given a visual match:
 //!
-//! | Evidence | Kind | Confidence |
+//! | Evidence | Kind | Confidence band |
 //! | --- | --- | --- |
-//! | exactly one side has a text layer | `pdf_ocr_variant` | 0.80 |
-//! | neither has text | `pdf_resave` | 0.85 |
-//! | both have text, MinHash Jaccard >= 0.8 | `pdf_resave` | 0.85 |
-//! | both have text, **both scanned**, 0.5 <= *distinctive* Jaccard < 0.8, over at least 64 distinctive slots | `pdf_ocr_variant` (two OCR runs) | 0.75 |
+//! | exactly one side has a text layer | `pdf_ocr_variant` | 0.72-0.92 |
+//! | neither has text | `pdf_resave` | 0.80-0.97 |
+//! | both have text, MinHash Jaccard >= 0.8 | `pdf_resave` | 0.80-0.97 |
+//! | both have text, **both scanned**, 0.5 <= *distinctive* Jaccard < 0.8, over at least 64 distinctive slots | `pdf_ocr_variant` (two OCR runs) | 0.68-0.88 |
 //! | both have text, anything lower | *no match*: the same look but other words is a different book (a template) | |
+//!
+//! # Graded confidence (tranche 16)
+//!
+//! The tier says *what kind* of copy a pair is; where the confidence falls in
+//! the tier's band says *how well the measurements agree*. [`grade`] takes what
+//! was measured ([`Measured`]) and returns `low + strength * (high - low)`, then
+//! the tiny-document penalty. `strength` is 0 to 1:
+//!
+//! * **pages**: the fraction of compared sample pages that matched, from
+//!   [`MATCH_FRACTION`] (0) to all of them (1);
+//! * **distance**: the mean page distance of the matched pages, from
+//!   [`PAGE_MATCH_DISTANCE`] (0) to identical (1);
+//! * **text**: the text Jaccard, over the range that tier accepts (0.8-1.0 for
+//!   a re-save, 0.5-0.8 for two OCR layers, 0.9-1.0 for a text match).
+//!
+//! A re-save with text and two OCR layers weigh them 0.4 / 0.3 / 0.3; a pair
+//! with no text to compare (a scan and its OCR, two image-only copies) weighs
+//! pages and distance equally; a text match (no visual match at all) weighs the
+//! text 0.7 and how close the page counts are 0.3. A stronger measurement never
+//! lowers the score (tested), and the bands do not overlap their neighbours'
+//! tops by more than they must, so sorting by confidence still puts the tiers
+//! in a sensible order: `pdf_text_match` 0.50-0.75 tops out below a re-save's
+//! floor. The measured numbers travel with the match ([`PdfMatch::measured`]) and
+//! are written into its `detail`.
 //!
 //! **Scanned** (fingerprint version 3): at least 75% of the sampled pages have
 //! an image object covering 80% or more of the page. Two OCR runs of one scan
@@ -263,10 +287,14 @@ pub const TEXT_MATCH_JACCARD: f32 = 0.9;
 /// Letters a text-only match needs on each side.
 pub const TEXT_MATCH_MIN_CHARS: u32 = 2000;
 
-pub const CONFIDENCE_RESAVE: f32 = 0.85;
-pub const CONFIDENCE_OCR: f32 = 0.80;
-pub const CONFIDENCE_OCR_TWO_LAYERS: f32 = 0.75;
-pub const CONFIDENCE_TEXT: f32 = 0.60;
+/// The confidence band of each tier, `(floor, ceiling)`: a match is placed in
+/// its tier's band by [`grade`]. Tiers keep their order: a re-save is never
+/// less certain than the floor of its band, and a text match never more than
+/// its ceiling.
+pub const BAND_RESAVE: (f32, f32) = (0.80, 0.97);
+pub const BAND_OCR: (f32, f32) = (0.72, 0.92);
+pub const BAND_OCR_TWO_LAYERS: (f32, f32) = (0.68, 0.88);
+pub const BAND_TEXT: (f32, f32) = (0.50, 0.75);
 /// Multiplier for a document of one or two pages.
 pub const TINY_PENALTY: f32 = 0.85;
 
@@ -438,10 +466,15 @@ impl StopSlots {
 
     /// Counts slot values over `fps`.
     pub fn from_fingerprints(fps: &[PdfFingerprint]) -> Self {
-        let with_text = fps.iter().filter(|f| f.minhash.len() == MINHASH_LEN).count();
+        Self::from_refs(fps.iter())
+    }
+
+    /// [`Self::from_fingerprints`] over borrowed fingerprints, wherever they live.
+    pub fn from_refs<'a>(fps: impl Iterator<Item = &'a PdfFingerprint> + Clone) -> Self {
+        let with_text = fps.clone().filter(|f| f.minhash.len() == MINHASH_LEN).count();
         let threshold = STOP_MIN_DOCS.max((with_text as f32 * STOP_FRACTION).ceil() as usize);
         let mut counts: HashMap<u32, usize> = HashMap::new();
-        for f in fps.iter().filter(|f| f.minhash.len() == MINHASH_LEN) {
+        for f in fps.filter(|f| f.minhash.len() == MINHASH_LEN) {
             for (slot, &v) in f.minhash.iter().enumerate() {
                 *counts.entry(Self::key(slot, v)).or_insert(0) += 1;
             }
@@ -624,6 +657,17 @@ impl std::error::Error for NoWorker {}
 // Matching
 // ---------------------------------------------------------------------
 
+/// One pair of sampled pages that were compared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PagePair {
+    /// 0-based page of the first / second document.
+    pub a: u32,
+    pub b: u32,
+    /// [`page_distance`], of 256.
+    pub distance: u32,
+    pub matched: bool,
+}
+
 /// How two fingerprints' sampled pages line up.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VisualMatch {
@@ -632,11 +676,31 @@ pub struct VisualMatch {
     pub mean_distance: f32,
     /// One of the two has at most two pages.
     pub tiny: bool,
+    /// Every page pair compared in the chosen alignment, in sample order.
+    pub pages: Vec<PagePair>,
 }
 
 /// Compares the sampled pages of `a` and `b`. `None` when they do not match
 /// visually, by the rules in the module docs.
 pub fn visual_match(a: &PdfFingerprint, b: &PdfFingerprint) -> Option<VisualMatch> {
+    align(a, b).filter(|m| accepts(a, m))
+}
+
+/// Whether an alignment is enough to call two documents visually the same.
+fn accepts(a: &PdfFingerprint, m: &VisualMatch) -> bool {
+    if m.tiny {
+        // Every page of a tiny document, and none of them blank.
+        m.compared == a.page_count && m.matched == m.compared
+    } else {
+        m.compared >= MIN_COMPARED && m.matched as f32 >= MATCH_FRACTION * m.compared as f32
+    }
+}
+
+/// The best alignment of the sampled pages of `a` and `b`, whether or not it
+/// is good enough to be a match (the compare view shows the numbers of a pair
+/// that does not match). `None` when the page counts are too far apart to
+/// align at all.
+pub fn align(a: &PdfFingerprint, b: &PdfFingerprint) -> Option<VisualMatch> {
     let diff = a.page_count as i64 - b.page_count as i64;
     if diff.unsigned_abs() as u32 > MAX_PAGE_DIFF {
         return None;
@@ -660,7 +724,7 @@ pub fn visual_match(a: &PdfFingerprint, b: &PdfFingerprint) -> Option<VisualMatc
             continue;
         }
         let mut seen: Vec<(u32, u32)> = Vec::new();
-        let mut compared = 0u32;
+        let mut pages: Vec<PagePair> = Vec::new();
         let mut matched = 0u32;
         let mut distance_sum = 0u32;
         for pa in a.pages.iter().filter(|p| !p.blank) {
@@ -673,27 +737,20 @@ pub fn visual_match(a: &PdfFingerprint, b: &PdfFingerprint) -> Option<VisualMatc
                 // A page too empty to compare says nothing either way.
                 let Some(d) = page_distance(pa, pb) else { continue };
                 seen.push((pa.index, pb.index));
-                compared += 1;
-                if d <= PAGE_MATCH_DISTANCE {
+                let is_match = d <= PAGE_MATCH_DISTANCE;
+                if is_match {
                     matched += 1;
                     distance_sum += d;
                 }
+                pages.push(PagePair { a: pa.index, b: pb.index, distance: d, matched: is_match });
             }
         }
-        let candidate = VisualMatch { compared, matched, mean_distance: if matched > 0 { distance_sum as f32 / matched as f32 } else { 0.0 }, tiny };
+        let candidate = VisualMatch { compared: pages.len() as u32, matched, mean_distance: if matched > 0 { distance_sum as f32 / matched as f32 } else { 0.0 }, tiny, pages };
         if best.as_ref().is_none_or(|cur| candidate.matched > cur.matched) {
             best = Some(candidate);
         }
     }
-
-    let m = best?;
-    let ok = if tiny {
-        // Every page of a tiny document, and none of them blank.
-        m.compared == a.page_count && m.matched == m.compared
-    } else {
-        m.compared >= MIN_COMPARED && m.matched as f32 >= MATCH_FRACTION * m.compared as f32
-    };
-    ok.then_some(m)
+    best
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -708,11 +765,98 @@ pub enum PdfKind {
     TextMatch,
 }
 
+/// What was measured about a pair, which [`grade`] turns into a confidence and
+/// the match's `detail` says in words.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Measured {
+    /// Sample pages compared / matched in the alignment (0 for a text match,
+    /// which has no visual match).
+    pub compared: u32,
+    pub matched: u32,
+    /// Mean [`page_distance`] of the matched pages, of 256.
+    pub mean_distance: f32,
+    /// The text similarity the tier rests on, when there is text to compare:
+    /// the plain Jaccard for a re-save, the distinctive Jaccard otherwise.
+    pub text_similarity: Option<f32>,
+    /// `|page count a - page count b|`.
+    pub page_count_diff: u32,
+}
+
+impl Measured {
+    fn from_alignment(v: &VisualMatch, a: &PdfFingerprint, b: &PdfFingerprint, text: Option<f32>) -> Measured {
+        Measured { compared: v.compared, matched: v.matched, mean_distance: v.mean_distance, text_similarity: text, page_count_diff: a.page_count.abs_diff(b.page_count) }
+    }
+}
+
+/// Which band a match is graded in. One more than [`PdfKind`]: an OCR variant
+/// is graded differently when its two sides are two OCR runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Band {
+    Resave,
+    Ocr,
+    OcrTwoLayers,
+    Text,
+}
+
+impl Band {
+    pub fn range(self) -> (f32, f32) {
+        match self {
+            Band::Resave => BAND_RESAVE,
+            Band::Ocr => BAND_OCR,
+            Band::OcrTwoLayers => BAND_OCR_TWO_LAYERS,
+            Band::Text => BAND_TEXT,
+        }
+    }
+}
+
+fn unit(x: f32) -> f32 {
+    if x.is_nan() {
+        0.0
+    } else {
+        x.clamp(0.0, 1.0)
+    }
+}
+
+/// `x` placed in `lo..=hi` as 0 to 1.
+fn within(x: f32, lo: f32, hi: f32) -> f32 {
+    unit((x - lo) / (hi - lo))
+}
+
+/// The confidence of a match in `band`, from what was measured, with the
+/// tiny-document penalty if `tiny`. See "Graded confidence" in the module
+/// docs: always within the band (times the penalty), never lower for a stronger
+/// measurement.
+pub fn grade(band: Band, m: &Measured, tiny: bool) -> f32 {
+    let pages = if m.compared == 0 { 0.0 } else { within(m.matched as f32 / m.compared as f32, MATCH_FRACTION, 1.0) };
+    let distance = unit(1.0 - m.mean_distance / PAGE_MATCH_DISTANCE as f32);
+    let strength = match band {
+        Band::Ocr => 0.5 * pages + 0.5 * distance,
+        Band::Resave => match m.text_similarity {
+            Some(j) => 0.4 * pages + 0.3 * distance + 0.3 * within(j, SAME_TEXT_JACCARD, 1.0),
+            None => 0.5 * pages + 0.5 * distance,
+        },
+        Band::OcrTwoLayers => 0.4 * pages + 0.3 * distance + 0.3 * within(m.text_similarity.unwrap_or(DIFFERENT_TEXT_JACCARD), DIFFERENT_TEXT_JACCARD, SAME_TEXT_JACCARD),
+        Band::Text => {
+            let close = unit(1.0 - m.page_count_diff as f32 / MAX_PAGE_DIFF as f32);
+            0.7 * within(m.text_similarity.unwrap_or(TEXT_MATCH_JACCARD), TEXT_MATCH_JACCARD, 1.0) + 0.3 * close
+        }
+    };
+    let (lo, hi) = band.range();
+    (lo + unit(strength) * (hi - lo)) * if tiny { TINY_PENALTY } else { 1.0 }
+}
+
+/// "7 of 8 sample pages match (mean page distance 12 of 256)".
+fn pages_phrase(m: &Measured) -> String {
+    format!("{} of {} sample pages match (mean page distance {:.0} of {})", m.matched, m.compared, m.mean_distance, SIGNATURE_BITS)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PdfMatch {
     pub kind: PdfKind,
+    /// Graded within the tier's band, see [`grade`].
     pub confidence: f32,
     pub detail: String,
+    pub measured: Measured,
 }
 
 /// What a pair of fingerprints are, if anything, with no knowledge of the
@@ -729,13 +873,12 @@ pub fn classify(a: &PdfFingerprint, b: &PdfFingerprint) -> Option<PdfMatch> {
 pub fn classify_with(a: &PdfFingerprint, b: &PdfFingerprint, stops: &StopSlots) -> Option<PdfMatch> {
     let jac = jaccard(&a.minhash, &b.minhash);
     if let Some(v) = visual_match(a, b) {
-        let pages = format!("{} of {} sampled pages match (page counts {} and {})", v.matched, v.compared, a.page_count, b.page_count);
-        let penalty = if v.tiny { TINY_PENALTY } else { 1.0 };
-        let (kind, confidence, what) = match (a.has_text, b.has_text) {
-            (true, false) | (false, true) => (PdfKind::OcrVariant, CONFIDENCE_OCR, "one has a text layer and the other is image-only".to_string()),
-            (false, false) => (PdfKind::Resave, CONFIDENCE_RESAVE, "both are image-only".to_string()),
+        let counts = format!("page counts {} and {}", a.page_count, b.page_count);
+        let (kind, band, text, what) = match (a.has_text, b.has_text) {
+            (true, false) | (false, true) => (PdfKind::OcrVariant, Band::Ocr, None, "one has a text layer and the other is image-only".to_string()),
+            (false, false) => (PdfKind::Resave, Band::Resave, None, "both are image-only".to_string()),
             (true, true) => match jac {
-                Some(j) if j >= SAME_TEXT_JACCARD => (PdfKind::Resave, CONFIDENCE_RESAVE, format!("same text (similarity {j:.2})")),
+                Some(j) if j >= SAME_TEXT_JACCARD => (PdfKind::Resave, Band::Resave, Some(j), format!("text similarity {j:.2}")),
                 // Two text layers over the same pages that are not the same
                 // text: two OCR runs of one scan, or two documents on one
                 // template. Only the words that are *not* library-wide
@@ -744,18 +887,46 @@ pub fn classify_with(a: &PdfFingerprint, b: &PdfFingerprint, stops: &StopSlots) 
                 // real text are never OCR variants of each other.
                 _ if !(a.scanned && b.scanned) => return None,
                 _ => match distinctive_jaccard(&a.minhash, &b.minhash, stops) {
-                    Some((j, n)) if n >= MIN_DISTINCTIVE_SLOTS && j >= DIFFERENT_TEXT_JACCARD => (PdfKind::OcrVariant, CONFIDENCE_OCR_TWO_LAYERS, format!("different text layers (similarity {j:.2})")),
+                    Some((j, n)) if n >= MIN_DISTINCTIVE_SLOTS && j >= DIFFERENT_TEXT_JACCARD => (PdfKind::OcrVariant, Band::OcrTwoLayers, Some(j), format!("different text layers, text similarity {j:.2}")),
                     // The same look, other words: a template, not a copy.
                     _ => return None,
                 },
             },
         };
-        return Some(PdfMatch { kind, confidence: confidence * penalty, detail: format!("{pages}; {what}") });
+        let measured = Measured::from_alignment(&v, a, b, text);
+        let confidence = grade(band, &measured, v.tiny);
+        return Some(PdfMatch { kind, confidence, detail: format!("{}; {what} ({counts})", pages_phrase(&measured)), measured });
     }
     let (j, n) = distinctive_jaccard(&a.minhash, &b.minhash, stops)?;
-    let close = (a.page_count as i64 - b.page_count as i64).unsigned_abs() as u32 <= MAX_PAGE_DIFF;
-    (a.has_text && b.has_text && close && n >= MIN_DISTINCTIVE_SLOTS && j >= TEXT_MATCH_JACCARD && a.text_chars >= TEXT_MATCH_MIN_CHARS && b.text_chars >= TEXT_MATCH_MIN_CHARS)
-        .then(|| PdfMatch { kind: PdfKind::TextMatch, confidence: CONFIDENCE_TEXT, detail: format!("same text (similarity {j:.2}) on different pages ({} and {} pages)", a.page_count, b.page_count) })
+    let diff = a.page_count.abs_diff(b.page_count);
+    let close = diff <= MAX_PAGE_DIFF;
+    if !(a.has_text && b.has_text && close && n >= MIN_DISTINCTIVE_SLOTS && j >= TEXT_MATCH_JACCARD && a.text_chars >= TEXT_MATCH_MIN_CHARS && b.text_chars >= TEXT_MATCH_MIN_CHARS) {
+        return None;
+    }
+    let measured = Measured { compared: 0, matched: 0, mean_distance: 0.0, text_similarity: Some(j), page_count_diff: diff };
+    Some(PdfMatch { kind: PdfKind::TextMatch, confidence: grade(Band::Text, &measured, false), detail: format!("text similarity {j:.2} on different pages ({} and {} pages)", a.page_count, b.page_count), measured })
+}
+
+/// Everything known about how two fingerprinted PDFs compare, for the compare
+/// view: the page alignment even when it is not a match, the text similarity,
+/// and the verdict [`classify_with`] gives.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Comparison {
+    /// The best page alignment (`None` when the page counts are too far apart
+    /// to align at all).
+    pub alignment: Option<VisualMatch>,
+    /// Whether that alignment is good enough to be a visual match.
+    pub visual_match: bool,
+    /// The plain MinHash Jaccard of the two text layers.
+    pub text_jaccard: Option<f32>,
+    /// What the library's duplicate scan would say about the pair.
+    pub found: Option<PdfMatch>,
+}
+
+pub fn compare(a: &PdfFingerprint, b: &PdfFingerprint, stops: &StopSlots) -> Comparison {
+    let alignment = align(a, b);
+    let visual = alignment.as_ref().is_some_and(|m| accepts(a, m));
+    Comparison { alignment, visual_match: visual, text_jaccard: jaccard(&a.minhash, &b.minhash), found: classify_with(a, b, stops) }
 }
 
 // ---------------------------------------------------------------------

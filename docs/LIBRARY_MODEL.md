@@ -361,11 +361,24 @@ at least 3 non-blank pages were compared and 75% match (a one- or two-page
 PDF needs equal counts and every page). Blank and near-blank pages are never
 compared.
 
-| Reason | Evidence | Confidence |
+| Reason | Evidence | Confidence band |
 | --- | --- | --- |
-| `pdf_resave` | same pages; same text (MinHash similarity at least 0.8) or no text on either | 0.85 |
-| `pdf_ocr_variant` | same pages; exactly one has a text layer, or both do, **both are scanned (image pages)**, with *distinctive* similarity 0.5-0.8 over at least 64 distinctive slots (two OCR runs) | 0.80 / 0.75 |
-| `pdf_text_match` | different pages, but both have text, *distinctive* similarity at least 0.9 over at least 64 distinctive slots, page counts within 2 | 0.60 |
+| `pdf_resave` | same pages; same text (MinHash similarity at least 0.8) or no text on either | 0.80-0.97 |
+| `pdf_ocr_variant` | same pages; exactly one has a text layer, or both do, **both are scanned (image pages)**, with *distinctive* similarity 0.5-0.8 over at least 64 distinctive slots (two OCR runs) | 0.72-0.92 / 0.68-0.88 |
+| `pdf_text_match` | different pages, but both have text, *distinctive* similarity at least 0.9 over at least 64 distinctive slots, page counts within 2 | 0.50-0.75 |
+
+The confidence is **graded inside its band** by what was measured (tranche 16):
+the fraction of compared sample pages that matched (75% is the floor, all of them
+the ceiling), the mean page distance of the matched pages (48 of 256 is the
+floor, identical the ceiling), and the text similarity over the range the tier
+accepts. A re-save with text, and two OCR layers, weigh them 0.4 / 0.3 / 0.3; a
+pair with no text to compare weighs pages and distance equally; a text match
+weighs the text 0.7 and how close the page counts are 0.3. A stronger measurement
+never lowers the score; a one- or two-page document keeps its 0.85 penalty. The
+measured numbers are in the match's `detail` ("7 of 8 sample pages match (mean
+page distance 12 of 256); text similarity 0.93") and in `GET /duplicates/compare`.
+No fingerprint version change: the fingerprint is the same, only the comparison
+differs.
 
 *Scanned* (fingerprint version 3) means at least 75% of the sampled pages have an image object covering 80% or more of the page. Two OCR runs are text over page images; short born-digital documents on one layout (instruction-set reference pages, a series of character sheets) are never OCR variants of each other, and a pair where either side is not scanned is not matched this way.
 
@@ -429,6 +442,41 @@ disappears; a partly exempt one splits.
   [{uuid, title, authors, book_id, present}]}], count}`
 * `POST /duplicates/exemptions/remove/{lib}` `{id}` or `{all: true}` ->
   `{removed, needs_rescan}` (the hidden groups return with the next scan)
+
+### Comparing copies, and groups of your own (tranche 16)
+
+* `GET /duplicates/compare/{lib}?ids=1,2,3` (2 to 8 books, any books; 400
+  otherwise) -> `{books, pairs, suggested_keeper, keeper_reason, pdf}`. Each book
+  carries what a review card shows (built by the review snapshot's own builder,
+  read from the library now); each pair `{a, b, identical_bytes (true / false /
+  null = not hashed yet), identical_formats, exempt, pdf, evidence}` where `pdf`
+  is `null` (a side has no PDF), `{fingerprinted: false, missing}` (not analysed
+  yet: not an error) or the comparison from the cached fingerprints: `kind`,
+  graded `confidence`, `detail`, `visual_match`, the sample `pages` compared
+  (`{a, b, distance, matched}`), `compared`, `matched`, `mean_distance`,
+  `text_jaccard`, `page_counts`.
+* **Manual groups** (`dedupe_manual_groups.rs`): sets of books the user put
+  together, in the preference `oxide.duplicate_manual_groups` by book uuid (like
+  exemptions). `POST /duplicates/manual-groups/{lib}` `{book_ids}` creates (books
+  already in a group of the user's join it), `{group_id, add: [..]}` /
+  `{group_id, remove: [..]}` change it; `POST /duplicates/manual-groups/remove/{lib}`
+  `{group_id}` deletes; `GET /duplicates/manual-groups/{lib}` lists. A group with
+  fewer than two live books disappears. In the review snapshot they are groups with
+  reason `manual` (confidence 1, "Your group"). A manual group and the detected
+  groups that share a book with it are **one** group (reason `manual`, all the
+  detected evidence kept, plus a "grouped by you" note); the snapshot keeps
+  detected groups and manual sets apart and derives the groups from both, so
+  changes need no rescan. The matcher never makes them, so **exemptions do not
+  split them**; the newest action wins: putting books in a group removes the
+  exemptions whose books are all in it, and "not duplicates" takes the books out of
+  any group that holds two or more of them. Bulk resolve treats `manual` as a
+  metadata-only tier: never in the default tiers, only on an explicit tick.
+* `POST /duplicates/refresh-books/{lib}` `{book_ids}`: the caller changed those
+  books itself; re-reads them into the snapshot and keeps it from going stale.
+* `POST /move-books/{lib}` `{book_ids, folder, dry_run?, plan_fingerprint?}`:
+  moves books' files to a folder relative to the library with the organize
+  engine (`organize::plan_to` with `Target::Folder`, the same executor and run
+  log, undone with `POST /unorganize-library`); see `organize.rs`.
 
 ### The scan result is kept and paged
 

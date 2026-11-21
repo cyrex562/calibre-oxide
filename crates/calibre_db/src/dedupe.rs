@@ -151,6 +151,10 @@ pub enum Strength {
     Exact = 5,
     Identifier = 6,
     Content = 7,
+    /// Books the user grouped themselves (tranche 16). Never produced by the
+    /// matcher; only the review snapshot carries it, and a bulk resolve treats it
+    /// like the other metadata-only tiers (explicit tick).
+    Manual = 8,
 }
 
 impl Strength {
@@ -158,6 +162,7 @@ impl Strength {
     pub fn reason(self) -> &'static str {
         match self {
             Strength::Content => "content",
+            Strength::Manual => "manual",
             Strength::Identifier => "identifier",
             Strength::Exact => "title_author_exact",
             Strength::Fuzzy => "title_author_fuzzy",
@@ -1346,6 +1351,17 @@ pub struct ScanOutcome {
     pub empty_files: Vec<(i32, String)>,
 }
 
+/// What the keeper heuristic and the panel know about each fingerprinted PDF, by book.
+pub fn pdf_book_infos(loaded: &[crate::pdf_similarity::LibraryFingerprint]) -> HashMap<i32, PdfBookInfo> {
+    let mut pdf = HashMap::new();
+    for l in loaded {
+        for &book in &l.books {
+            pdf.insert(book, PdfBookInfo { page_count: l.fingerprint.page_count, has_text: l.fingerprint.has_text, scanned: l.fingerprint.scanned, size: l.size });
+        }
+    }
+    pdf
+}
+
 /// Every duplicate group in the library at `min` strength or stronger.
 pub fn scan_library(cache: &Cache, min: Strength) -> Result<Vec<Group>> {
     Ok(scan_library_full(cache, min)?.groups)
@@ -1362,12 +1378,7 @@ pub fn scan_library_full(cache: &Cache, min: Strength) -> Result<ScanOutcome> {
         Vec::new()
     };
     let loaded = cache.checksums().pdf_fingerprints()?;
-    let mut pdf = HashMap::new();
-    for l in &loaded {
-        for &book in &l.books {
-            pdf.insert(book, PdfBookInfo { page_count: l.fingerprint.page_count, has_text: l.fingerprint.has_text, scanned: l.fingerprint.scanned, size: l.size });
-        }
-    }
+    let pdf = pdf_book_infos(&loaded);
     let edges = if min <= Strength::Exact { crate::pdf_similarity::edges_for(&loaded).0 } else { Vec::new() };
     let cannot_link = crate::dedupe_exemptions::cannot_link(cache, &records)?;
     let exemptions_applied = cannot_link.values().map(|s| s.len()).sum::<usize>() / 2;
@@ -1823,7 +1834,7 @@ mod tests {
     }
 
     fn pdf_edge(a: i32, b: i32) -> crate::pdf_similarity::PdfEdge {
-        crate::pdf_similarity::PdfEdge { a, b, found: crate::pdf_similarity::PdfMatch { kind: crate::pdf_similarity::PdfKind::OcrVariant, confidence: 0.75, detail: String::new() } }
+        crate::pdf_similarity::PdfEdge { a, b, found: crate::pdf_similarity::PdfMatch { kind: crate::pdf_similarity::PdfKind::OcrVariant, confidence: 0.75, detail: String::new(), measured: crate::pdf_similarity::Measured { compared: 8, matched: 8, mean_distance: 0.0, text_similarity: None, page_count_diff: 0 } } }
     }
 
     fn pdf_groups(n: i32, edges: &[(i32, i32)], content: &[Vec<i32>]) -> Vec<Vec<i32>> {

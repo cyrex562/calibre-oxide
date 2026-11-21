@@ -17,7 +17,7 @@ import type { DuplicatesStore } from "../library/duplicatesStore";
 import { isTauri, tauriInvoke } from "../tauri";
 
 const props = defineProps<{ store: DuplicatesStore }>();
-const emit = defineEmits<{ merge: [group: DuplicateGroup]; details: [bookId: number]; resolve: []; changed: [] }>();
+const emit = defineEmits<{ merge: [group: DuplicateGroup]; compare: [group: DuplicateGroup]; details: [bookId: number]; resolve: []; changed: [] }>();
 
 const store = props.store;
 const state = store.state;
@@ -194,6 +194,7 @@ function dismissedLabel(e: { members: { title: string }[] }): string {
           <span v-if="group.bytes_reclaimable" class="hint">· {{ formatBytes(group.bytes_reclaimable) }} in the extra copies</span>
           <span v-if="needsReview(group)" class="hint warn">check these are the same book first</span>
           <span class="spacer"></span>
+          <button type="button" data-testid="compare" :disabled="group.books.length > 8" :title="group.books.length > 8 ? 'Compare takes up to 8 books at once' : 'Look at these copies side by side: pages, files and metadata'" @click="emit('compare', group)">Compare…</button>
           <button type="button" data-testid="dismiss" title="Never suggest these books as duplicates of each other again" @click="dismiss(group)">Not duplicates</button>
           <button type="button" @click="merge(group)">Merge into…</button>
         </header>

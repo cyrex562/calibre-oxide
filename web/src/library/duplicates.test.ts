@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MIN_OPTIONS, confidencePercent, countByReason, evidenceLines, filterGroups, fileSummary, fingerprintAction, formatMtime, isImageOnlyScan, isMetadataOnly, isSuggested, needsReview, pdfLine, primaryPath, reasonBadge, reasonLabel } from "./duplicates";
+import { ALL_REASONS, DEFAULT_RESOLVE_TIERS, MIN_OPTIONS, confidencePercent, countByReason, evidenceLines, filterGroups, fileSummary, fingerprintAction, formatMtime, isImageOnlyScan, isMetadataOnly, isSuggested, needsReview, pdfLine, primaryPath, reasonBadge, reasonLabel } from "./duplicates";
 import type { DuplicateGroup, DuplicateReason } from "./api";
 
 const group = (reason: DuplicateReason, confidence = 0.9): DuplicateGroup => ({ books: [], reason, confidence });
@@ -151,5 +151,31 @@ describe("the compare card's lines (tranche 12)", () => {
   it("knows which tiers are metadata only", () => {
     expect(["content", "pdf_resave", "pdf_ocr_variant", "pdf_text_match"].some((r) => isMetadataOnly(r as DuplicateReason))).toBe(false);
     expect(["identifier", "title_author_exact", "title_author_fuzzy"].every((r) => isMetadataOnly(r as DuplicateReason))).toBe(true);
+  });
+});
+
+describe("the user's own groups", () => {
+  it("are badged as yours, certain, and labelled", () => {
+    expect(reasonBadge("manual")).toEqual({ text: "Your group", tone: "certain" });
+    expect(reasonLabel("manual")).toBe("your group");
+    expect(needsReview({ reason: "manual" })).toBe(false);
+  });
+
+  it("are the strongest kind, so every minimum level still shows them", () => {
+    expect(ALL_REASONS[0]).toBe("manual");
+    const mixed = [group("manual", 1), group("content", 1), group("pdf_resave", 0.97)];
+    expect(filterGroups(mixed, "content").map((g) => g.reason)).toEqual(["manual", "content"]);
+    expect(filterGroups(mixed, "pdf")).toHaveLength(3);
+  });
+
+  it("are metadata-only for a bulk resolve, so never ticked by default", () => {
+    expect(isMetadataOnly("manual")).toBe(true);
+    expect(DEFAULT_RESOLVE_TIERS).not.toContain("manual");
+  });
+
+  it("show a graded PDF confidence as a whole percent", () => {
+    expect(confidencePercent(0.9132)).toBe("91%");
+    expect(confidencePercent(0.5)).toBe("50%");
+    expect(confidencePercent(0.97)).toBe("97%");
   });
 });

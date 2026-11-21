@@ -134,6 +134,7 @@ export type LibraryActionId =
   | "toggle-view"
   | "bulk-edit"
   | "merge-books"
+  | "compare-duplicates"
   | "save-to-disk"
   | "embed-metadata"
   | "copy-to-library"
@@ -208,6 +209,7 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   // Calibre's "Merge book records": the first selected book is the default
   // destination. Needs two books, so it is not offered with one selected.
   { id: "merge-books", label: "Merge books…", group: "selection", requires: "multi-selection", contextMenu: true, icon: "merge_books", tooltip: "Merge the selected books into one record" },
+  { id: "compare-duplicates", label: "Compare as duplicates…", group: "selection", requires: "multi-selection", contextMenu: true, icon: "merge", tooltip: "Look at 2 to 8 selected books side by side: pages, files and metadata, then keep one" },
   { id: "save-to-disk", label: "Save to disk", group: "selection", requires: "selection", icon: "save", accel: "Ctrl+S", tooltip: "Write book files to a folder" },
   { id: "rename-files", label: "Rename files…", group: "selection", requires: "selection", contextMenu: true, icon: "template_funcs", tooltip: "Rename the files on disk, without changing the title" },
   { id: "fix-titles-selected", label: "Fix titles…", group: "selection", requires: "selection", contextMenu: true, icon: "edit_input", tooltip: "Suggest clean titles for the selected books, then set them, write them into the files and rename the files" },
