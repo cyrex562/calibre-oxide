@@ -441,6 +441,12 @@ fn join_rel(dir: &str, name: &str) -> String {
     }
 }
 
+/// A `/`-separated relative path of plain names: no empty, `.` or `..` part,
+/// no drive, root or backslash.
+fn is_plain_rel(rel: &str) -> bool {
+    !rel.is_empty() && rel.split('/').all(|part| !part.is_empty() && part != "." && part != ".." && !part.contains(['\\', ':']))
+}
+
 fn abs(root: &Path, rel: &str) -> PathBuf {
     rel.split('/').fold(root.to_path_buf(), |p, part| p.join(part))
 }
@@ -531,7 +537,16 @@ pub fn validate_target(source: &Path, raw: &str) -> Result<PathBuf> {
 pub fn read_manifest(target: &Path) -> anyhow::Result<Option<Manifest>> {
     let path = target.join(MANIFEST_NAME);
     match fs::read_to_string(&path) {
-        Ok(text) => Ok(Some(serde_json::from_str(&text).with_context(|| format!("{} is not a readable manifest", path.display()))?)),
+        Ok(text) => {
+            let manifest: Manifest = serde_json::from_str(&text).with_context(|| format!("{} is not a readable manifest", path.display()))?;
+            // The manifest lives in the copy, which may be on a USB disk or a
+            // share someone else can write: every path in it must stay inside
+            // the copy, or a refresh could set aside files elsewhere.
+            if let Some(bad) = manifest.files.iter().find(|f| !is_plain_rel(&f.path)) {
+                anyhow::bail!("{} lists a path outside the copy ({:?}); it was not written by calibre-oxide", path.display(), bad.path);
+            }
+            Ok(Some(manifest))
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
     }
@@ -2132,4 +2147,22 @@ mod tests {
         assert!(covers.len() <= 1, "{covers:?}");
         drop(dir);
     }
+
+    #[test]
+    fn a_manifest_path_outside_the_copy_is_refused() {
+        for bad in ["../x.pdf", "a/../../x.pdf", "/abs.pdf", "C:/x.pdf", "a\\..\\x","", "a//b", "./a"] {
+            assert!(!super::is_plain_rel(bad), "{bad:?} should be refused");
+        }
+        assert!(super::is_plain_rel("Author/Title (1)/book.pdf"));
+        let target = tempfile::tempdir().unwrap();
+        let manifest = serde_json::json!({
+            "version": 1, "source_id": "s", "mode": "mirror", "run_id": "r", "written_at_ms": 0,
+            "scope": "all", "complete": true,
+            "files": [{"path": "../outside.pdf", "size": 1, "mtime_ms": 0, "blake3": "x", "kind": "format"}]
+        });
+        std::fs::write(target.path().join(super::MANIFEST_NAME), manifest.to_string()).unwrap();
+        let err = super::read_manifest(target.path()).unwrap_err().to_string();
+        assert!(err.contains("outside the copy"), "{err}");
+    }
+
 }
