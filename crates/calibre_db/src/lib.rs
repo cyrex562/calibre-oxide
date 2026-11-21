@@ -16,6 +16,7 @@ pub mod copy_to_library;
 pub mod covers;
 pub mod dedupe;
 pub mod dedupe_exemptions;
+pub mod dedupe_manual_groups;
 pub mod organize;
 pub mod rename_proposal;
 pub mod retitle;

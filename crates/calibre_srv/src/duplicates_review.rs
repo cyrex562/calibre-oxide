@@ -19,6 +19,18 @@
 //! (exempt, resolve, drop) update the snapshot and keep it current, so the
 //! user keeps their place; changes made elsewhere are caught by the watermark.
 //!
+//! # Your groups
+//!
+//! Groups the user made ([`calibre_db::dedupe_manual_groups`]) are part of the
+//! snapshot as groups with reason `"manual"`, confidence 1. The snapshot keeps
+//! the *detected* groups and the *manual* sets apart and **derives** the groups
+//! from both ([`Snapshot::derive`]): a manual set and the detected groups that
+//! share a book with it are one group, which keeps every piece of the detected
+//! evidence and adds a "grouped by you" note per pair. Every change to either
+//! side re-derives, so adding a book to a manual group, removing one, or
+//! resolving a group needs no rescan. Resolve treats `manual` like the other
+//! metadata-only tiers: never in the default tiers, only on an explicit tick.
+//!
 //! # Routes
 //!
 //! * `GET /duplicates/groups/{lib}?offset&limit&reason=a,b&min_confidence&max_confidence&path&sort&order`
@@ -35,6 +47,10 @@
 //!   caller's own, so the snapshot is not stale.
 //! * `POST /duplicates/exempt/{lib}` -- `{group_id}` or `{book_ids}`: "not
 //!   duplicates" for every pair among them ([`calibre_db::dedupe_exemptions`]).
+//!   Manual groups holding two or more of those books lose them (the newest
+//!   action wins).
+//! * `GET /duplicates/compare/{lib}?ids=1,2,3` and the `manual-groups` routes
+//!   are in [`crate::duplicates_compare`].
 //! * `GET /duplicates/exemptions/{lib}`, `POST /duplicates/exemptions/remove/{lib}`
 //!   (`{id}` or `{all: true}`) -- the Dismissed list and undo.
 //! * `POST /duplicates/resolve/{lib}` -- the bulk resolve job, below.
@@ -120,6 +136,15 @@ pub struct SnapGroup {
     pub bytes_reclaimable: i64,
     /// Lower-cased relative paths of every file and folder, for the path filter.
     pub paths_lc: Vec<String>,
+    /// The user's group this is (or contains), see [`calibre_db::dedupe_manual_groups`].
+    pub manual_id: Option<String>,
+}
+
+/// A user-made group, resolved to the books that exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManualSet {
+    pub id: String,
+    pub book_ids: Vec<i32>,
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +155,11 @@ pub struct Snapshot {
     pub watermark: String,
     pub min: Strength,
     pub created_at: u64,
+    /// What the matcher found, as it found it.
+    pub detected: Vec<SnapGroup>,
+    /// The user's own groups.
+    pub manual: Vec<ManualSet>,
+    /// What the panel shows: derived from `detected` and `manual`.
     pub groups: Vec<SnapGroup>,
     pub books: HashMap<i32, SnapBook>,
     pub pdf_status: calibre_db::pdf_similarity::PdfStatus,
@@ -168,6 +198,134 @@ pub fn forget(cache: &Cache) {
     registry().lock().unwrap().remove(&key_of(cache));
 }
 
+/// The snapshot's view of a group of books: its keeper and what resolving it
+/// would free. `None` when there is no book to keep.
+#[allow(clippy::too_many_arguments)]
+fn make_group(books: &HashMap<i32, SnapBook>, mut ids: Vec<i32>, strength: Strength, confidence: f32, evidence: Vec<Evidence>, pdf_group: bool, manual_id: Option<String>) -> Option<SnapGroup> {
+    ids.sort_unstable();
+    ids.dedup();
+    let uuids: Vec<String> = ids.iter().filter_map(|id| books.get(id).map(|b| b.uuid.clone())).collect();
+    let facts: HashMap<i32, BookFacts> = ids.iter().filter_map(|id| books.get(id).map(|b| (*id, b.facts.clone()))).collect();
+    let pdf: HashMap<i32, PdfBookInfo> = ids.iter().filter_map(|id| books.get(id).and_then(|b| b.pdf.map(|p| (*id, p)))).collect();
+    let candidates = resolve::candidates(&ids, &facts, &pdf);
+    let keeper = resolve::choose_keeper(pdf_group, &candidates)?;
+    let others: Vec<&BookFacts> = ids.iter().filter(|id| **id != keeper.id).filter_map(|id| facts.get(id)).collect();
+    let keeper_facts = facts.get(&keeper.id).cloned().unwrap_or_default();
+    let bytes_reclaimable = resolve::bytes_freed(ResolveAction::KeepBestTrashRest, &keeper_facts, &others);
+    let mut paths_lc: Vec<String> = Vec::new();
+    for id in &ids {
+        if let Some(f) = facts.get(id) {
+            if !f.folder.is_empty() {
+                paths_lc.push(f.folder.to_lowercase());
+            }
+            paths_lc.extend(f.files.iter().map(|file| file.path.to_lowercase()));
+        }
+    }
+    Some(SnapGroup { id: dedupe_exemptions::set_id(&uuids), strength, confidence, books: ids, evidence, keeper, bytes_reclaimable, paths_lc, manual_id })
+}
+
+/// The user's groups as the snapshot holds them.
+pub fn manual_sets(cache: &Cache) -> anyhow::Result<Vec<ManualSet>> {
+    Ok(calibre_db::dedupe_manual_groups::live(cache)?.into_iter().map(|g| ManualSet { id: g.id, book_ids: g.book_ids }).collect())
+}
+
+/// What the panel shows about each of `ids`, read from the library now (the
+/// snapshot's own copy can be old, and a book the user just grouped may not be
+/// in it at all).
+pub fn load_books(cache: &Cache, ids: &[i32]) -> anyhow::Result<HashMap<i32, SnapBook>> {
+    load_books_from(cache, &dedupe::load_records(cache)?, ids)
+}
+
+/// [`load_books`] given the library's records already read.
+pub fn load_books_from(cache: &Cache, records: &[dedupe::BookRecord], ids: &[i32]) -> anyhow::Result<HashMap<i32, SnapBook>> {
+    let by_id: HashMap<i32, &dedupe::BookRecord> = records.iter().map(|r| (r.id, r)).collect();
+    let mut ids: Vec<i32> = ids.iter().copied().filter(|id| by_id.contains_key(id)).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let facts = dedupe::load_facts(cache, &ids, &by_id)?;
+    let pdf = dedupe::pdf_book_infos(&cache.checksums().pdf_fingerprints()?);
+    let mut out = HashMap::with_capacity(ids.len());
+    for id in ids {
+        let r = by_id[&id];
+        out.insert(id, SnapBook { id, uuid: r.uuid.clone(), title: r.title.clone(), authors: r.authors.clone(), facts: facts.get(&id).cloned().unwrap_or(BookFacts { id, ..Default::default() }), pdf: pdf.get(&id).copied() });
+    }
+    Ok(out)
+}
+
+impl Snapshot {
+    /// Recomputes `groups` from `detected` and `manual`: books joined by either
+    /// are one group. A detected group no manual set touches is passed through
+    /// as it is; a group with a manual set in it has reason `manual`,
+    /// confidence 1, every detected piece of evidence, and a "grouped by you"
+    /// note for each pair of the user's set.
+    pub fn derive(&mut self) {
+        let n = self.detected.len();
+        let node_books: Vec<&[i32]> = self.detected.iter().map(|g| g.books.as_slice()).chain(self.manual.iter().map(|m| m.book_ids.as_slice())).collect();
+        let mut parent: Vec<usize> = (0..node_books.len()).collect();
+        fn find(parent: &mut [usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
+            }
+            x
+        }
+        let mut owner: HashMap<i32, usize> = HashMap::new();
+        for (i, books) in node_books.iter().enumerate() {
+            for b in *books {
+                match owner.get(b) {
+                    Some(&o) => {
+                        let (ra, rb) = (find(&mut parent, o), find(&mut parent, i));
+                        if ra != rb {
+                            parent[ra.max(rb)] = ra.min(rb);
+                        }
+                    }
+                    None => {
+                        owner.insert(*b, i);
+                    }
+                }
+            }
+        }
+        let mut components: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for i in 0..node_books.len() {
+            let root = find(&mut parent, i);
+            components.entry(root).or_default().push(i);
+        }
+
+        let mut groups: Vec<SnapGroup> = Vec::with_capacity(components.len());
+        for nodes in components.values() {
+            if let [only] = nodes.as_slice() {
+                if *only < n {
+                    groups.push(self.detected[*only].clone());
+                    continue;
+                }
+            }
+            let (detected, manual): (Vec<usize>, Vec<usize>) = nodes.iter().copied().partition(|i| *i < n);
+            let mut ids: Vec<i32> = nodes.iter().flat_map(|i| node_books[*i].iter().copied()).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            let mut evidence: Vec<Evidence> = Vec::new();
+            for m in &manual {
+                let set = &self.manual[*m - n].book_ids;
+                if let Some((first, rest)) = set.split_first() {
+                    evidence.extend(rest.iter().map(|other| Evidence { a: *first, b: *other, strength: Strength::Manual, confidence: 1.0, detail: "grouped by you".to_string() }));
+                }
+            }
+            let pdf_group = detected.iter().any(|i| self.detected[*i].strength.is_pdf());
+            for d in &detected {
+                evidence.extend(self.detected[*d].evidence.iter().cloned());
+            }
+            evidence.sort_by(|x, y| y.strength.cmp(&x.strength).then(y.confidence.total_cmp(&x.confidence)).then((x.a, x.b).cmp(&(y.a, y.b))));
+            evidence.truncate(dedupe::MAX_EVIDENCE);
+            let manual_id = manual.first().map(|m| self.manual[*m - n].id.clone());
+            if let Some(g) = make_group(&self.books, ids, Strength::Manual, 1.0, evidence, pdf_group, manual_id) {
+                groups.push(g);
+            }
+        }
+        groups.sort_by(|a, b| b.strength.cmp(&a.strength).then(a.books.first().cmp(&b.books.first())));
+        self.groups = groups;
+    }
+}
+
 /// Scans the library and stores the result as its snapshot.
 pub fn build_snapshot(cache: &Cache, min: Strength, control: Option<&JobControl>) -> anyhow::Result<Arc<Snapshot>> {
     if let Some(c) = control {
@@ -180,8 +338,10 @@ pub fn build_snapshot(cache: &Cache, min: Strength, control: Option<&JobControl>
         c.set_phase("describing");
         c.total.store(outcome.groups.len() as u64, Ordering::Relaxed);
     }
+    let _ = calibre_db::dedupe_manual_groups::prune(cache);
+    let manual = manual_sets(cache)?;
     let records: HashMap<i32, &dedupe::BookRecord> = outcome.records.iter().map(|r| (r.id, r)).collect();
-    let mut ids: Vec<i32> = outcome.groups.iter().flat_map(|g| g.book_ids.iter().copied()).collect();
+    let mut ids: Vec<i32> = outcome.groups.iter().flat_map(|g| g.book_ids.iter().copied()).chain(manual.iter().flat_map(|m| m.book_ids.iter().copied())).collect();
     ids.sort_unstable();
     ids.dedup();
     let facts = dedupe::load_facts(cache, &ids, &records)?;
@@ -192,27 +352,14 @@ pub fn build_snapshot(cache: &Cache, min: Strength, control: Option<&JobControl>
         books.insert(id, SnapBook { id, uuid: r.uuid.clone(), title: r.title.clone(), authors: r.authors.clone(), facts: facts.get(&id).cloned().unwrap_or(BookFacts { id, ..Default::default() }), pdf: outcome.pdf.get(&id).copied() });
     }
 
-    let mut groups = Vec::with_capacity(outcome.groups.len());
+    let mut detected = Vec::with_capacity(outcome.groups.len());
     for g in &outcome.groups {
         if control.is_some_and(|c| c.is_cancelled()) {
             break;
         }
-        let uuids: Vec<String> = g.book_ids.iter().filter_map(|id| books.get(id).map(|b| b.uuid.clone())).collect();
-        let candidates = resolve::candidates(&g.book_ids, &facts, &outcome.pdf);
-        let Some(keeper) = resolve::choose_keeper(g.strength.is_pdf(), &candidates) else { continue };
-        let others: Vec<&BookFacts> = g.book_ids.iter().filter(|id| **id != keeper.id).filter_map(|id| facts.get(id)).collect();
-        let keeper_facts = facts.get(&keeper.id).cloned().unwrap_or_default();
-        let bytes_reclaimable = resolve::bytes_freed(ResolveAction::KeepBestTrashRest, &keeper_facts, &others);
-        let mut paths_lc: Vec<String> = Vec::new();
-        for id in &g.book_ids {
-            if let Some(f) = facts.get(id) {
-                if !f.folder.is_empty() {
-                    paths_lc.push(f.folder.to_lowercase());
-                }
-                paths_lc.extend(f.files.iter().map(|file| file.path.to_lowercase()));
-            }
+        if let Some(group) = make_group(&books, g.book_ids.clone(), g.strength, g.confidence, g.evidence.clone(), g.strength.is_pdf(), None) {
+            detected.push(group);
         }
-        groups.push(SnapGroup { id: dedupe_exemptions::set_id(&uuids), strength: g.strength, confidence: g.confidence, books: g.book_ids.clone(), evidence: g.evidence.clone(), keeper, bytes_reclaimable, paths_lc });
         if let Some(c) = control {
             c.seen.fetch_add(1, Ordering::Relaxed);
         }
@@ -227,27 +374,37 @@ pub fn build_snapshot(cache: &Cache, min: Strength, control: Option<&JobControl>
         })
         .collect();
 
-    let snapshot = Snapshot { generation: GENERATION.fetch_add(1, Ordering::SeqCst), watermark, min, created_at: now_secs(), groups, books, pdf_status: outcome.status, empty_files, exemptions_applied: outcome.exemptions_applied };
+    let mut snapshot = Snapshot { generation: GENERATION.fetch_add(1, Ordering::SeqCst), watermark, min, created_at: now_secs(), detected, manual, groups: Vec::new(), books, pdf_status: outcome.status, empty_files, exemptions_applied: outcome.exemptions_applied };
+    snapshot.derive();
     Ok(store(cache, snapshot))
 }
 
 /// Drops `group_ids` from the snapshot, and (when `adopt` and the snapshot was
 /// current at `expected_watermark`) moves its watermark to the library's now.
-fn update_snapshot(cache: &Cache, expected_watermark: Option<&str>, adopt: bool, edit: impl FnOnce(&mut Snapshot)) {
+pub(crate) fn update_snapshot(cache: &Cache, expected_watermark: Option<&str>, adopt: bool, edit: impl FnOnce(&mut Snapshot)) {
     let mut reg = registry().lock().unwrap();
     let Some(current) = reg.get(&key_of(cache)).cloned() else { return };
     let mut next = (*current).clone();
     let was_current = expected_watermark.map(|w| w == current.watermark).unwrap_or(true);
     edit(&mut next);
+    next.derive();
     if adopt && was_current {
         next.watermark = cache.change_watermark();
     }
     reg.insert(key_of(cache), Arc::new(next));
 }
 
+/// Forgets the groups with these ids (as the panel knows them), the detected
+/// groups and manual sets they were made of included.
 fn drop_groups(snapshot: &mut Snapshot, ids: &HashSet<String>) -> usize {
     let before = snapshot.groups.len();
-    snapshot.groups.retain(|g| !ids.contains(&g.id));
+    let gone: Vec<HashSet<i32>> = snapshot.groups.iter().filter(|g| ids.contains(&g.id)).map(|g| g.books.iter().copied().collect()).collect();
+    if gone.is_empty() {
+        return 0;
+    }
+    snapshot.detected.retain(|d| !gone.iter().any(|set| d.books.iter().any(|b| set.contains(b))));
+    snapshot.manual.retain(|m| !gone.iter().any(|set| m.book_ids.iter().any(|b| set.contains(b))));
+    snapshot.derive();
     before - snapshot.groups.len()
 }
 
@@ -255,7 +412,7 @@ fn drop_groups(snapshot: &mut Snapshot, ids: &HashSet<String>) -> usize {
 // JSON
 // ---------------------------------------------------------------------------
 
-fn round2(x: f32) -> f64 {
+pub(crate) fn round2(x: f32) -> f64 {
     ((x as f64) * 100.0).round() / 100.0
 }
 
@@ -266,7 +423,13 @@ fn file_mtime(library: &FsPath, rel: &str) -> Option<u64> {
 /// A book as the panel shows it. `with_mtime` stats its files (a page does;
 /// the whole-library compatibility report does not).
 fn book_json(snap: &Snapshot, id: i32, library: &FsPath, library_id: &str, with_mtime: bool) -> Value {
-    let Some(b) = snap.books.get(&id) else { return json!({"book_id": id}) };
+    book_json_from(&snap.books, id, library, library_id, with_mtime)
+}
+
+/// [`book_json`] over any set of loaded books (the compare view's, which are
+/// read fresh rather than from the snapshot).
+pub fn book_json_from(books: &HashMap<i32, SnapBook>, id: i32, library: &FsPath, library_id: &str, with_mtime: bool) -> Value {
+    let Some(b) = books.get(&id) else { return json!({"book_id": id}) };
     let mut newest: Option<u64> = None;
     let files: Vec<Value> = b
         .facts
@@ -278,7 +441,7 @@ fn book_json(snap: &Snapshot, id: i32, library: &FsPath, library_id: &str, with_
             json!({"format": f.format, "path": f.path, "size": f.size, "mtime": mtime})
         })
         .collect();
-    let pdf = b.pdf.map(|p| json!({"pages": p.page_count, "has_text": p.has_text, "scanned": p.scanned, "size": p.size}));
+    let pdf = b.pdf.map(|p| json!({"pages": p.page_count, "has_text": p.has_text, "scanned": p.scanned, "image_only": !p.has_text && p.scanned, "size": p.size}));
     json!({
         "book_id": id,
         "uuid": b.uuid,
@@ -286,6 +449,7 @@ fn book_json(snap: &Snapshot, id: i32, library: &FsPath, library_id: &str, with_
         "authors": b.authors,
         // The count, as before: what the merge ranking read.
         "formats": b.facts.files.len(),
+        "format_list": b.facts.files.iter().map(|f| f.format.clone()).collect::<Vec<_>>(),
         "files": files,
         "path": b.facts.folder,
         "size": b.facts.total_size(),
@@ -297,7 +461,7 @@ fn book_json(snap: &Snapshot, id: i32, library: &FsPath, library_id: &str, with_
     })
 }
 
-fn group_json(snap: &Snapshot, g: &SnapGroup, library: &FsPath, library_id: &str, with_mtime: bool, with_evidence: bool) -> Value {
+pub(crate) fn group_json(snap: &Snapshot, g: &SnapGroup, library: &FsPath, library_id: &str, with_mtime: bool, with_evidence: bool) -> Value {
     let books: Vec<Value> = g.books.iter().map(|id| book_json(snap, *id, library, library_id, with_mtime)).collect();
     let evidence: Vec<Value> = if with_evidence { g.evidence.iter().map(|e| json!({"books": [e.a, e.b], "reason": e.strength.reason(), "confidence": round2(e.confidence), "detail": e.detail})).collect() } else { Vec::new() };
     json!({
@@ -310,6 +474,7 @@ fn group_json(snap: &Snapshot, g: &SnapGroup, library: &FsPath, library_id: &str
         "suggested_dest": g.keeper.id,
         "keeper_reason": g.keeper.reason,
         "bytes_reclaimable": g.bytes_reclaimable,
+        "manual_group_id": g.manual_id,
     })
 }
 
@@ -376,6 +541,10 @@ fn norm_prefix(p: &str) -> String {
 fn reasons_of(csv: &str) -> Result<HashSet<&'static str>, ServerError> {
     let mut out = HashSet::new();
     for r in csv.split(',').map(str::trim).filter(|r| !r.is_empty()) {
+        if r == "manual" {
+            out.insert(Strength::Manual.reason());
+            continue;
+        }
         let Some(s) = Strength::parse_min(r) else { return Err(ServerError::BadRequest(format!("unknown reason {r:?}"))) };
         // `parse_min` maps "pdf" to the weakest page-content tier, and a
         // reason filter means exactly that tier.
@@ -467,15 +636,15 @@ pub fn page_json(cache: &Cache, snap: &Snapshot, q: &GroupsQuery, library_id: &s
     }))
 }
 
-fn cache_for(state: &AppState, library_id: &str) -> Result<Arc<Cache>, ServerError> {
+pub(crate) fn cache_for(state: &AppState, library_id: &str) -> Result<Arc<Cache>, ServerError> {
     state.cache_for(Some(library_id)).ok_or_else(|| ServerError::NotFound(format!("no library named {library_id:?}")))
 }
 
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, ServerError> + Send + 'static) -> Result<T, ServerError> {
+pub(crate) async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, ServerError> + Send + 'static) -> Result<T, ServerError> {
     tokio::task::spawn_blocking(f).await.map_err(|e| ServerError::InternalServerError(e.to_string()))?
 }
 
-fn internal(e: anyhow::Error) -> ServerError {
+pub(crate) fn internal(e: anyhow::Error) -> ServerError {
     ServerError::InternalServerError(format!("{e:#}"))
 }
 
@@ -507,7 +676,7 @@ pub struct DropBody {
 }
 
 fn remove_books(snapshot: &mut Snapshot, gone: &HashSet<i32>) {
-    for g in &mut snapshot.groups {
+    for g in &mut snapshot.detected {
         g.books.retain(|b| !gone.contains(b));
         g.evidence.retain(|e| !gone.contains(&e.a) && !gone.contains(&e.b));
         if gone.contains(&g.keeper.id) {
@@ -516,7 +685,12 @@ fn remove_books(snapshot: &mut Snapshot, gone: &HashSet<i32>) {
             }
         }
     }
-    snapshot.groups.retain(|g| g.books.len() >= 2);
+    snapshot.detected.retain(|g| g.books.len() >= 2);
+    for m in &mut snapshot.manual {
+        m.book_ids.retain(|b| !gone.contains(b));
+    }
+    snapshot.manual.retain(|m| m.book_ids.len() >= 2);
+    snapshot.derive();
 }
 
 fn default_true() -> bool {
@@ -586,6 +760,9 @@ pub async fn exempt(State(state): State<AppState>, Path(library_id): Path<String
         }
         let before = snapshot_for(&cache).map(|s| s.watermark.clone());
         let ex = dedupe_exemptions::add(&cache, &ids).map_err(internal)?;
+        // The newest action wins: books marked "not duplicates" leave a group of the user's own.
+        let separated = calibre_db::dedupe_manual_groups::separate(&cache, &ids).map_err(internal)?;
+        let manual_after = manual_sets(&cache).map_err(internal)?;
         let set: HashSet<i32> = ids.iter().copied().collect();
         // Groups wholly inside the set vanish. A group that merely overlaps it
         // in two or more books would have to be re-split: that needs a rescan.
@@ -604,9 +781,10 @@ pub async fn exempt(State(state): State<AppState>, Path(library_id): Path<String
         let drop_set: HashSet<String> = dropped_ids.iter().cloned().collect();
         update_snapshot(&cache, before.as_deref(), !needs_rescan, |s| {
             drop_groups(s, &drop_set);
+            s.manual = manual_after;
         });
         let pairs = ids.len() * (ids.len() - 1) / 2;
-        Ok(json!({"exemption": exemption_json(&cache, &ex), "pairs": pairs, "dropped_group_ids": dropped_ids, "needs_rescan": needs_rescan}))
+        Ok(json!({"exemption": exemption_json(&cache, &ex), "pairs": pairs, "dropped_group_ids": dropped_ids, "needs_rescan": needs_rescan, "manual_groups_changed": separated}))
     })
     .await?;
     Ok(Json(out))
@@ -836,8 +1014,12 @@ pub async fn resolve_route(State(state): State<AppState>, Path(library_id): Path
 pub fn run_resolve_job(cache: &Cache, job: &ResolveJob, control: &JobControl) -> anyhow::Result<Value> {
     let report = resolve::execute_resolve(cache, &job.run_id, job.action, &job.plan, job.keep_duplicate_formats, control);
     let done: HashSet<String> = report.done_groups.iter().cloned().collect();
+    // A resolved group of the user's own has fewer than two live books left: it goes.
+    let _ = calibre_db::dedupe_manual_groups::prune(cache);
+    let manual_after = manual_sets(cache)?;
     update_snapshot(cache, Some(&job.watermark), true, |s| {
         drop_groups(s, &done);
+        s.manual = manual_after;
     });
     let mut out = serde_json::to_value(&report)?;
     out["fully_restorable"] = json!(job.action == ResolveAction::KeepBestTrashRest);

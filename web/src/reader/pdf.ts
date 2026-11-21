@@ -97,6 +97,12 @@ export function pdfUrl(bookId: string): string {
 export interface RenderTarget {
   canvas: HTMLCanvasElement;
   scale: number;
+  /**
+   * Called with the render task as soon as it exists, so a caller that is
+   * about to show another page can `cancel()` this one (the promise then
+   * rejects with PDF.js's `RenderingCancelledException`).
+   */
+  onTask?: (task: { cancel: () => void }) => void;
 }
 
 /**
@@ -123,7 +129,9 @@ export async function renderPage(doc: PDFDocumentProxy, pageNumber: number, targ
   const context = canvas.getContext("2d");
   if (!context) throw new Error("could not get a 2d drawing context for the PDF page");
 
-  await page.render({ canvas, canvasContext: context, viewport }).promise;
+  const task = page.render({ canvas, canvasContext: context, viewport });
+  target.onTask?.(task);
+  await task.promise;
 }
 
 /**

@@ -1018,7 +1018,9 @@ export interface DuplicateBook {
   metadata?: number;
   has_cover?: boolean;
   /** Present for a fingerprinted PDF: what distinguishes a scan from its OCR. */
-  pdf?: { pages: number; has_text: boolean; scanned?: boolean; size: number } | null;
+  pdf?: { pages: number; has_text: boolean; scanned?: boolean; image_only?: boolean; size: number } | null;
+  /** The formats it has, upper case. */
+  format_list?: string[];
   uuid?: string;
   /** Every format file: its path relative to the library, size in bytes, and modified time (unix seconds). */
   files?: DuplicateFile[];
@@ -1056,7 +1058,9 @@ export type DuplicateReason =
   | "title_author_fuzzy"
   | "pdf_resave"
   | "pdf_ocr_variant"
-  | "pdf_text_match";
+  | "pdf_text_match"
+  /** Books the user grouped themselves (tranche 16). */
+  | "manual";
 
 /** Where the library's PDFs stand for page-content matching. */
 export interface PdfScanStatus {
@@ -1094,6 +1098,8 @@ export interface DuplicateGroup {
   keeper_reason?: string;
   /** Bytes the other copies hold. */
   bytes_reclaimable?: number;
+  /** The user's own group this is (or contains), if any. */
+  manual_group_id?: string | null;
 }
 
 /** A zero-byte book file. Never grouped as a duplicate of another empty file; listed on its own. */
@@ -1314,6 +1320,125 @@ export function fetchResolveRuns(): Promise<{ runs: ResolveRun[] }> {
 /** Puts back every book the run trashed. */
 export function restoreResolveRun(runId: string): Promise<{ run_id: string; restored: { book_id: number; title: string }[]; failed: [string, string][]; needs_rescan: boolean }> {
   return jsonFetch(`/duplicates/runs/default/${encodeURIComponent(runId)}/restore`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+}
+
+// ---- Comparing duplicates, the user's groups, moving books (crates/calibre_srv/src/duplicates_compare.rs) ----
+
+export interface ComparePageMatch {
+  /** 0-based sample pages of the first and second book. */
+  a: number;
+  b: number;
+  /** Of 256: how different the two pages look. */
+  distance: number;
+  matched: boolean;
+}
+
+export interface ComparePdf {
+  /** False until both PDFs have been analysed (not an error). */
+  fingerprinted: boolean;
+  missing?: number[];
+  /** The `pdf_*` reason the library scan would give the pair, or null if it is not a match. */
+  kind?: DuplicateReason | null;
+  /** Graded within the tier's band. */
+  confidence?: number | null;
+  detail?: string | null;
+  visual_match?: boolean;
+  compared?: number;
+  matched?: number;
+  mean_distance?: number;
+  pages?: ComparePageMatch[];
+  text_jaccard?: number | null;
+  page_counts?: [number, number];
+  has_text?: [boolean, boolean];
+}
+
+export interface ComparePair {
+  a: number;
+  b: number;
+  /** True when a format of each has the same content; null when a file has no hash yet. */
+  identical_bytes: boolean | null;
+  identical_formats: string[];
+  /** The user said these two are not duplicates. */
+  exempt: boolean;
+  /** Null when either book has no PDF. */
+  pdf: ComparePdf | null;
+  evidence: { reason: DuplicateReason; confidence: number; detail: string }[];
+}
+
+export interface CompareBook extends DuplicateBook {
+  suggested?: boolean;
+}
+
+export interface CompareResult {
+  ids: number[];
+  books: CompareBook[];
+  pairs: ComparePair[];
+  suggested_keeper: number | null;
+  keeper_reason: string | null;
+  pdf: { books: number; fingerprinted: number };
+}
+
+/** 2 to 8 books, any books, from the library as it is now. */
+export function fetchCompare(ids: number[]): Promise<CompareResult> {
+  return jsonFetch<CompareResult>(`/duplicates/compare/default?ids=${ids.join(",")}`);
+}
+
+export interface ManualGroup {
+  id: string;
+  created_at: number;
+  members: { uuid: string; title: string; authors: string[]; book_id: number | null; present: boolean }[];
+  book_ids: number[];
+  /** The review snapshot's group it is part of, when there is a scan. */
+  snapshot_group_id?: string | null;
+}
+
+export interface ManualGroupResult {
+  manual_group: ManualGroup | null;
+  /** The review snapshot's group (with any detected group it overlaps folded in); null without a scan. */
+  group: DuplicateGroup | null;
+  /** The group had fewer than two books left and is gone. */
+  removed: boolean;
+}
+
+const JSON_POST = { method: "POST", headers: { "Content-Type": "application/json" } } as const;
+
+/** The user's groups. */
+export function fetchManualGroups(): Promise<{ count: number; groups: ManualGroup[] }> {
+  return jsonFetch("/duplicates/manual-groups/default");
+}
+
+/** Makes a group of the books (at least two). Books already in a group of the user's bring it along. */
+export function createManualGroup(bookIds: number[]): Promise<ManualGroupResult> {
+  return jsonFetch<ManualGroupResult>("/duplicates/manual-groups/default", { ...JSON_POST, body: JSON.stringify({ book_ids: bookIds }) });
+}
+
+export function addToManualGroup(groupId: string, bookIds: number[]): Promise<ManualGroupResult> {
+  return jsonFetch<ManualGroupResult>("/duplicates/manual-groups/default", { ...JSON_POST, body: JSON.stringify({ group_id: groupId, add: bookIds }) });
+}
+
+export function removeFromManualGroup(groupId: string, bookIds: number[]): Promise<ManualGroupResult> {
+  return jsonFetch<ManualGroupResult>("/duplicates/manual-groups/default", { ...JSON_POST, body: JSON.stringify({ group_id: groupId, remove: bookIds }) });
+}
+
+export function deleteManualGroup(groupId: string): Promise<{ removed: boolean; group_id: string }> {
+  return jsonFetch("/duplicates/manual-groups/remove/default", { ...JSON_POST, body: JSON.stringify({ group_id: groupId }) });
+}
+
+/** Tells the review list that these books were changed by the caller itself (title, file name, folder), so a resolve is not refused for it. */
+export function refreshDuplicateBooks(bookIds: number[]): Promise<{ refreshed: number; has_scan: boolean; stale?: boolean | null }> {
+  return jsonFetch("/duplicates/refresh-books/default", { ...JSON_POST, body: JSON.stringify({ book_ids: bookIds }) });
+}
+
+export type MovePlan = OrganizePlan & { folder: string };
+
+/** The dry run of moving books to a folder (relative to the library). Changes nothing. */
+export function planMoveBooks(bookIds: number[], folder: string): Promise<MovePlan> {
+  return jsonFetch<MovePlan>("/move-books/default", { ...JSON_POST, body: JSON.stringify({ book_ids: bookIds, folder, dry_run: true }) });
+}
+
+/** Moves the previewed books, as a job; the run is undone with `undoOrganize`. */
+export function runMoveBooks(bookIds: number[], folder: string, planFingerprint: string, handlers: LibraryJobHandlers<OrganizeReport> = {}): Promise<OrganizeReport> {
+  return runLibraryJob<OrganizeReport>("/move-books/default", handlers, { book_ids: bookIds, folder, dry_run: false, plan_fingerprint: planFingerprint });
 }
 
 /** Which books to organize: exactly one of the three, or none for every book. */

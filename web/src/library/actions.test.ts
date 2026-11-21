@@ -101,6 +101,14 @@ describe("enablement", () => {
     expect(actionEnabled(action("merge-books"), { ...BROWSER, selectionCount: 9 })).toBe(true);
   });
 
+  it("offers Compare as duplicates for two or more books, in the context menu", () => {
+    const compare = action("compare-duplicates");
+    expect(compare.contextMenu).toBe(true);
+    expect(actionEnabled(compare, { ...BROWSER, selectionCount: 1 })).toBe(false);
+    expect(actionEnabled(compare, { ...BROWSER, selectionCount: 2 })).toBe(true);
+    expect(actionEnabled(compare, { ...BROWSER, selectionCount: 8 })).toBe(true);
+  });
+
   it("lets delete act on a whole selection", () => {
     // Deleting is deliberately `selection`, not `single-selection`:
     // removing several books at once is a normal thing to want.

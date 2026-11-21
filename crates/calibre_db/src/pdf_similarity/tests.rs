@@ -381,7 +381,7 @@ fn image_only_against_text_layer_is_an_ocr_variant() {
     let ocr = with_text(&rerendered(&scan, 5, 6), 1);
     let m = classify(&scan, &ocr).unwrap();
     assert_eq!(m.kind, PdfKind::OcrVariant);
-    assert_eq!(m.confidence, CONFIDENCE_OCR);
+    assert!(in_band(m.confidence, BAND_OCR), "{}", m.confidence);
     assert_eq!(classify(&ocr, &scan).unwrap().kind, PdfKind::OcrVariant);
 }
 
@@ -393,7 +393,8 @@ fn the_same_pages_and_the_same_text_is_a_resave() {
     // Both image-only.
     let c = fp(3, 300, false, 0);
     let m = classify(&c, &rerendered(&c, 7, 6)).unwrap();
-    assert_eq!((m.kind, m.confidence), (PdfKind::Resave, CONFIDENCE_RESAVE));
+    assert_eq!(m.kind, PdfKind::Resave);
+    assert!(in_band(m.confidence, BAND_RESAVE), "{}", m.confidence);
 }
 
 #[test]
@@ -410,7 +411,8 @@ fn two_different_ocr_runs_are_an_ocr_variant_with_less_confidence() {
     let j = jaccard(&a.minhash, &b.minhash).unwrap();
     assert!((DIFFERENT_TEXT_JACCARD..SAME_TEXT_JACCARD).contains(&j), "{j}");
     let m = classify(&a, &b).unwrap();
-    assert_eq!((m.kind, m.confidence), (PdfKind::OcrVariant, CONFIDENCE_OCR_TWO_LAYERS));
+    assert_eq!(m.kind, PdfKind::OcrVariant);
+    assert!(in_band(m.confidence, BAND_OCR_TWO_LAYERS), "{}", m.confidence);
 }
 
 /// Short born-digital documents on one layout (instruction reference pages,
@@ -452,7 +454,8 @@ fn the_same_words_on_different_pages_is_a_text_match() {
     let a = with_text(&fp(6, 300, false, 0), 30);
     let b = PdfFingerprint { page_count: 301, pages: fp(7, 301, false, 0).pages, ..with_text(&fp(7, 301, false, 0), 30) };
     let m = classify(&a, &b).unwrap();
-    assert_eq!((m.kind, m.confidence), (PdfKind::TextMatch, CONFIDENCE_TEXT));
+    assert_eq!(m.kind, PdfKind::TextMatch);
+    assert!(in_band(m.confidence, BAND_TEXT), "{}", m.confidence);
     // Not when the page counts are far apart, or the text is short.
     let far = PdfFingerprint { page_count: 320, ..b.clone() };
     assert!(classify(&a, &far).is_none());
@@ -464,7 +467,8 @@ fn the_same_words_on_different_pages_is_a_text_match() {
 fn a_tiny_document_is_less_confident() {
     let a = fp(8, 2, false, 0);
     let m = classify(&a, &rerendered(&a, 2, 3)).unwrap();
-    assert!((m.confidence - CONFIDENCE_RESAVE * TINY_PENALTY).abs() < 1e-6);
+    assert!(in_band(m.confidence / TINY_PENALTY, BAND_RESAVE), "{}", m.confidence);
+    assert!(m.confidence < BAND_RESAVE.1 * TINY_PENALTY + 1e-6);
 }
 
 // ---------------------------------------------------------------------
@@ -960,4 +964,166 @@ fn the_pool_and_the_in_process_reader_fingerprint_a_real_pdf_identically() {
     let b = pooled.checksums().pdf_fingerprints().unwrap();
     assert_eq!((a.len(), b.len()), (1, 1));
     assert_eq!(a[0].fingerprint, b[0].fingerprint);
+}
+
+// ---------------------------------------------------------------------
+// Graded confidence
+// ---------------------------------------------------------------------
+
+fn in_band(c: f32, (lo, hi): (f32, f32)) -> bool {
+    c >= lo - 1e-6 && c <= hi + 1e-6
+}
+
+fn measured(matched: u32, compared: u32, mean_distance: f32, text: Option<f32>, diff: u32) -> Measured {
+    Measured { compared, matched, mean_distance, text_similarity: text, page_count_diff: diff }
+}
+
+const BANDS_UNDER_TEST: [Band; 4] = [Band::Resave, Band::Ocr, Band::OcrTwoLayers, Band::Text];
+
+/// The best and the thinnest match each tier accepts.
+fn extremes(band: Band) -> (Measured, Measured) {
+    match band {
+        Band::Resave => (measured(8, 8, 0.0, Some(1.0), 0), measured(6, 8, PAGE_MATCH_DISTANCE as f32, Some(SAME_TEXT_JACCARD), 0)),
+        Band::Ocr => (measured(8, 8, 0.0, None, 0), measured(6, 8, PAGE_MATCH_DISTANCE as f32, None, 0)),
+        Band::OcrTwoLayers => (measured(8, 8, 0.0, Some(SAME_TEXT_JACCARD), 0), measured(6, 8, PAGE_MATCH_DISTANCE as f32, Some(DIFFERENT_TEXT_JACCARD), 0)),
+        Band::Text => (measured(0, 0, 0.0, Some(1.0), 0), measured(0, 0, 0.0, Some(TEXT_MATCH_JACCARD), MAX_PAGE_DIFF)),
+    }
+}
+
+#[test]
+fn the_best_and_the_thinnest_match_of_a_tier_sit_on_the_bands_edges() {
+    for band in BANDS_UNDER_TEST {
+        let (lo, hi) = band.range();
+        let (best, worst) = extremes(band);
+        assert!((grade(band, &best, false) - hi).abs() < 1e-5, "{band:?} best");
+        assert!((grade(band, &worst, false) - lo).abs() < 1e-5, "{band:?} worst");
+        // The penalty scales the band, never lifts it.
+        assert!((grade(band, &best, true) - hi * TINY_PENALTY).abs() < 1e-5);
+        assert!((grade(band, &worst, true) - lo * TINY_PENALTY).abs() < 1e-5);
+    }
+}
+
+#[test]
+fn the_bands_are_the_specified_ones_and_the_tiers_order() {
+    assert_eq!(BAND_RESAVE, (0.80, 0.97));
+    assert_eq!(BAND_OCR, (0.72, 0.92));
+    assert_eq!(BAND_OCR_TWO_LAYERS, (0.68, 0.88));
+    assert_eq!(BAND_TEXT, (0.50, 0.75));
+    // A text match tops out below every page-content tier's floor but the weakest's ceiling.
+    assert!(BAND_TEXT.1 < BAND_OCR_TWO_LAYERS.0 + 0.1);
+    // Floors descend with the tier, and so do ceilings.
+    assert!(BAND_RESAVE.0 > BAND_OCR.0 && BAND_OCR.0 > BAND_OCR_TWO_LAYERS.0 && BAND_OCR_TWO_LAYERS.0 > BAND_TEXT.0);
+    assert!(BAND_RESAVE.1 > BAND_OCR.1 && BAND_OCR.1 > BAND_OCR_TWO_LAYERS.1 && BAND_OCR_TWO_LAYERS.1 > BAND_TEXT.1);
+}
+
+/// A stronger measurement never gives a lower score, whichever one is varied.
+#[test]
+fn a_stronger_measurement_never_scores_lower() {
+    for band in BANDS_UNDER_TEST {
+        let (best, worst) = extremes(band);
+        let text_lo = worst.text_similarity.unwrap_or(0.0);
+        let text_hi = best.text_similarity.unwrap_or(0.0);
+        let has_text = best.text_similarity.is_some();
+        let mid = has_text.then_some((text_lo + text_hi) / 2.0);
+        for tiny in [false, true] {
+            // More pages matching, of 8 compared.
+            let mut last = f32::MIN;
+            for matched in 6..=8 {
+                let c = grade(band, &measured(matched, 8, 20.0, mid, 1), tiny);
+                assert!(c >= last, "{band:?} matched {matched}: {c} < {last}");
+                last = c;
+            }
+            // Smaller mean distance.
+            let mut last = f32::MIN;
+            for d in (0..=PAGE_MATCH_DISTANCE).rev() {
+                let c = grade(band, &measured(7, 8, d as f32, mid, 1), tiny);
+                assert!(c >= last, "{band:?} distance {d}: {c} < {last}");
+                last = c;
+            }
+            // Higher text similarity.
+            if has_text {
+                let mut last = f32::MIN;
+                for step in 0..=20 {
+                    let j = text_lo + (text_hi - text_lo) * step as f32 / 20.0;
+                    let c = grade(band, &measured(7, 8, 20.0, Some(j), 1), tiny);
+                    assert!(c >= last, "{band:?} text {j}: {c} < {last}");
+                    last = c;
+                }
+            }
+            // Page counts closer together.
+            let mut last = f32::MIN;
+            for diff in (0..=MAX_PAGE_DIFF).rev() {
+                let c = grade(band, &measured(7, 8, 20.0, mid, diff), tiny);
+                assert!(c >= last, "{band:?} diff {diff}: {c} < {last}");
+                last = c;
+            }
+        }
+    }
+}
+
+/// However the measurements fall, the score stays in the band (the tiny penalty
+/// scales the band): out-of-range measurements are clamped, not extrapolated.
+#[test]
+fn every_score_stays_inside_its_band() {
+    for band in BANDS_UNDER_TEST {
+        let (lo, hi) = band.range();
+        for matched in 0..=10u32 {
+            for d in [0.0f32, 1.0, 24.0, 48.0, 200.0] {
+                for j in [None, Some(0.0), Some(0.5), Some(0.85), Some(1.0), Some(2.0)] {
+                    for diff in 0..5 {
+                        let m = measured(matched, 8, d, j, diff);
+                        let c = grade(band, &m, false);
+                        assert!(c >= lo - 1e-6 && c <= hi + 1e-6, "{band:?} {m:?}: {c}");
+                        let t = grade(band, &m, true);
+                        assert!(t >= lo * TINY_PENALTY - 1e-6 && t <= hi * TINY_PENALTY + 1e-6);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_cleaner_copy_scores_higher_than_a_noisier_one_of_the_same_tier() {
+    let base = fp(30, 300, false, 0);
+    let clean = classify(&base, &rerendered(&base, 5, 1)).unwrap();
+    let noisy = classify(&base, &rerendered(&base, 5, 9)).unwrap();
+    assert_eq!((clean.kind, noisy.kind), (PdfKind::Resave, PdfKind::Resave));
+    assert!(clean.confidence >= noisy.confidence, "{} vs {}", clean.confidence, noisy.confidence);
+    assert!(clean.measured.mean_distance <= noisy.measured.mean_distance);
+    // A copy whose pages all match scores above one where one in four does not.
+    let mut partial = rerendered(&base, 6, 1);
+    for p in partial.pages.iter_mut().skip(6) {
+        p.bits = [!p.bits[0], !p.bits[1], !p.bits[2], !p.bits[3]];
+    }
+    let weaker = classify(&base, &partial).unwrap();
+    assert!(weaker.measured.matched < weaker.measured.compared);
+    assert!(clean.confidence > weaker.confidence, "{} vs {}", clean.confidence, weaker.confidence);
+}
+
+#[test]
+fn the_evidence_detail_states_what_was_measured() {
+    let scan = fp(1, 300, false, 0);
+    let ocr = with_text(&rerendered(&scan, 5, 6), 1);
+    let m = classify(&scan, &ocr).unwrap();
+    assert!(m.detail.contains(&format!("{} of {} sample pages match", m.measured.matched, m.measured.compared)), "{}", m.detail);
+    let a = with_text(&fp(2, 300, false, 0), 2);
+    let b = rerendered(&a, 6, 3);
+    let m = classify(&a, &b).unwrap();
+    assert!(m.detail.contains("text similarity"), "{}", m.detail);
+    assert!(m.measured.text_similarity.unwrap() >= SAME_TEXT_JACCARD);
+}
+
+#[test]
+fn compare_reports_the_alignment_even_when_the_pair_is_not_a_match() {
+    let a = fp(40, 300, false, 0);
+    let same = compare(&a, &rerendered(&a, 3, 2), &StopSlots::default());
+    assert!(same.visual_match && same.found.is_some());
+    let pages = &same.alignment.as_ref().unwrap().pages;
+    assert!(!pages.is_empty() && pages.iter().all(|p| p.matched && p.distance <= PAGE_MATCH_DISTANCE));
+    let other = compare(&a, &fp(41, 300, false, 0), &StopSlots::default());
+    assert!(!other.visual_match && other.found.is_none());
+    assert!(other.alignment.as_ref().unwrap().pages.iter().all(|p| !p.matched));
+    // Page counts too far apart to align at all.
+    assert!(compare(&a, &fp(40, 500, false, 0), &StopSlots::default()).alignment.is_none());
 }

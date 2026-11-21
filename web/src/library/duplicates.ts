@@ -14,6 +14,7 @@ export type DuplicateMin = "fuzzy" | "pdf" | "exact" | "identifier" | "content";
 
 /** Strongest first. A higher rank is stronger evidence. */
 const RANK: Record<DuplicateReason, number> = {
+  manual: 8,
   content: 7,
   identifier: 6,
   title_author_exact: 5,
@@ -35,6 +36,7 @@ export const MIN_OPTIONS: { value: DuplicateMin; label: string }[] = [
 ];
 
 const LABELS: Record<DuplicateReason, string> = {
+  manual: "your group",
   content: "identical files",
   identifier: "same ISBN or identifier",
   title_author_exact: "same title and author",
@@ -53,6 +55,8 @@ export type BadgeTone = "certain" | "strong" | "likely" | "review";
 /** The short badge for a reason. `review` means a person must confirm. */
 export function reasonBadge(reason: DuplicateReason): { text: string; tone: BadgeTone } {
   switch (reason) {
+    case "manual":
+      return { text: "Your group", tone: "certain" };
     case "content":
       return { text: "Identical file", tone: "certain" };
     case "identifier":
@@ -141,7 +145,7 @@ export function fingerprintAction(status: PdfScanStatus | undefined): { label: s
 }
 
 /** Every reason, strongest first: the order the filter chips and the resolve dialog list them in. */
-export const ALL_REASONS: DuplicateReason[] = ["content", "identifier", "title_author_exact", "pdf_resave", "pdf_ocr_variant", "pdf_text_match", "title_author_fuzzy"];
+export const ALL_REASONS: DuplicateReason[] = ["manual", "content", "identifier", "title_author_exact", "pdf_resave", "pdf_ocr_variant", "pdf_text_match", "title_author_fuzzy"];
 
 /**
  * Tiers that rest on metadata alone (a shared title and author, an identifier):
@@ -149,7 +153,7 @@ export const ALL_REASONS: DuplicateReason[] = ["content", "identifier", "title_a
  * unless the person ticks them.
  */
 export function isMetadataOnly(reason: DuplicateReason): boolean {
-  return reason === "title_author_exact" || reason === "title_author_fuzzy" || reason === "identifier";
+  return reason === "title_author_exact" || reason === "title_author_fuzzy" || reason === "identifier" || reason === "manual";
 }
 
 /** The tiers a bulk resolve starts with ticked: identical files only. */

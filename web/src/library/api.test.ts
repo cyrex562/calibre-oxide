@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { type LibraryJob, fetchLibraryJobs, resumableJob, resumeLibraryJob, runningLibraryJob, switchWarning, importFolder, fetchUntracked, fetchTrash, restoreTrashEntry, deleteTrashEntry, emptyTrash, copyToLibrary, describeCopyOutcome, fetchLibraryInfo, embedMetadata, summarizeEmbed, addBook, addFormat, addNewsSchedule, blobToDataUrl, inspectPlugin, installPlugin, listPlugins, removePlugin, setPluginEnabled, catalogDownloadUrl, checkLibrary, coverProxyUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchCoverProxyBlob, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeDataFile, removeFormat, removeNewsSchedule, renameCategoryItem, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, scanLibrary, fetchOrphans, relocateOrphan, uploadOrphanFile, forgetOrphan, fetchIgnored, unignoreFile, searchMetadataOnline, backfillHashes, fingerprintPdfs, prepareLibrary, prepareStageOfPhase, describePrepareProgress, describePrepareResult, cancelLibraryJob, describeJobProgress, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
+import { addToManualGroup, createManualGroup, deleteManualGroup, fetchCompare, planMoveBooks, refreshDuplicateBooks, removeFromManualGroup } from "./api";
 import type { BookSummary } from "./types";
 
 function bookStub(id: number): BookSummary {
@@ -1194,5 +1195,40 @@ describe("prepare progress and summary", () => {
     expect(describePrepareResult(failed)).toContain("fingerprint failed: no PDFium");
     expect(describePrepareResult({ started_at_stage: "hash", finished: false, stages: {} } as never)).toContain("stopped early");
     expect(describePrepareResult({ started_at_stage: "scan", finished: true, stages: {} } as never)).toBe("Ready for duplicate detection.");
+  });
+});
+
+describe("the compare, manual group and move routes", () => {
+  function stub(body: unknown = {}) {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => body });
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  }
+  const post = (body: unknown) => ({ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+
+  it("asks to compare the books by id", async () => {
+    const fetchMock = stub({ ids: [1, 2], books: [], pairs: [] });
+    await fetchCompare([1, 2, 3]);
+    expect(fetchMock).toHaveBeenCalledWith("/duplicates/compare/default?ids=1,2,3", undefined);
+  });
+
+  it("creates, extends, trims and deletes the user's groups", async () => {
+    const fetchMock = stub();
+    await createManualGroup([1, 2]);
+    expect(fetchMock).toHaveBeenLastCalledWith("/duplicates/manual-groups/default", post({ book_ids: [1, 2] }));
+    await addToManualGroup("mg-1", [3]);
+    expect(fetchMock).toHaveBeenLastCalledWith("/duplicates/manual-groups/default", post({ group_id: "mg-1", add: [3] }));
+    await removeFromManualGroup("mg-1", [3]);
+    expect(fetchMock).toHaveBeenLastCalledWith("/duplicates/manual-groups/default", post({ group_id: "mg-1", remove: [3] }));
+    await deleteManualGroup("mg-1");
+    expect(fetchMock).toHaveBeenLastCalledWith("/duplicates/manual-groups/remove/default", post({ group_id: "mg-1" }));
+  });
+
+  it("tells the review list which books the caller changed, and previews a move first", async () => {
+    const fetchMock = stub();
+    await refreshDuplicateBooks([4]);
+    expect(fetchMock).toHaveBeenLastCalledWith("/duplicates/refresh-books/default", post({ book_ids: [4] }));
+    await planMoveBooks([4], "Sorted/Here");
+    expect(fetchMock).toHaveBeenLastCalledWith("/move-books/default", post({ book_ids: [4], folder: "Sorted/Here", dry_run: true }));
   });
 });

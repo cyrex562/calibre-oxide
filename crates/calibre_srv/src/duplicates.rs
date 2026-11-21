@@ -45,10 +45,12 @@
 //!
 //! # PDFs found from their pages (tranche 9)
 //!
-//! `pdf_resave` (0.85: same pages and text, e.g. an optimizer's output),
-//! `pdf_ocr_variant` (0.80: same pages, one with a text layer and one
-//! image-only, or two different OCR runs) and `pdf_text_match` (0.60: same
-//! words, different pages) rank **between `exact` and `fuzzy`**, and
+//! `pdf_resave` (0.80-0.97: same pages and text, e.g. an optimizer's output),
+//! `pdf_ocr_variant` (0.68-0.92: same pages, one with a text layer and one
+//! image-only, or two different OCR runs) and `pdf_text_match` (0.50-0.75: same
+//! words, different pages) -- each graded inside its band by what was
+//! measured (sample pages matched, their distance, text similarity; see
+//! `calibre_db::pdf_similarity`) -- rank **between `exact` and `fuzzy`**, and
 //! `?min=pdf` is the level that includes them (and everything above, but not
 //! fuzzy). They come only from PDFs that `POST /pdf-fingerprint` has
 //! analysed, and the response says how many have not: `"pdf_unfingerprinted"`
@@ -572,7 +574,9 @@ mod tests {
 
         let ocr_group = by_reason("pdf_ocr_variant");
         assert_eq!(group_ids(ocr_group), vec![scan as i64, ocr as i64]);
-        assert_eq!(ocr_group["confidence"], 0.8);
+        // Graded within the OCR-variant band (0.72-0.92): every sampled page matches, a few bits off.
+        let conf = ocr_group["confidence"].as_f64().unwrap();
+        assert!((0.72..=0.92).contains(&conf) && conf > 0.85, "{conf}");
         // The copy with the text layer is the one to keep, and the UI is told
         // how the two differ.
         assert_eq!(ocr_group["suggested_dest"], ocr as i64);
@@ -585,7 +589,9 @@ mod tests {
 
         let resave = by_reason("pdf_resave");
         assert_eq!(group_ids(resave), vec![original as i64, optimized as i64]);
-        assert_eq!(resave["confidence"], 0.85);
+        // Identical pages and text: the top of the re-save band (0.80-0.97).
+        let conf = resave["confidence"].as_f64().unwrap();
+        assert!((0.80..=0.97).contains(&conf) && conf >= 0.96, "{conf}");
         // Same pages, same text: the larger file is the original.
         assert_eq!(resave["suggested_dest"], original as i64);
 

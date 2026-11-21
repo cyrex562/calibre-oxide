@@ -179,6 +179,26 @@ pub fn remove(cache: &Cache, id: &str) -> Result<bool> {
     Ok(removed)
 }
 
+/// Removes the exemptions that a user-made group has overruled: those whose
+/// members are **all** among `group_uuids` and of which at least one is in
+/// `touching` (the books the user just put in the group). An exemption that
+/// also covers books outside the group is left alone (it says something about
+/// those too); a manual group is never split by an exemption in any case (see
+/// [`crate::dedupe_manual_groups`]). Returns how many were removed.
+pub fn remove_within(cache: &Cache, group_uuids: &[String], touching: &[String]) -> Result<usize> {
+    let group: HashSet<&str> = group_uuids.iter().map(String::as_str).collect();
+    let touched: HashSet<&str> = touching.iter().map(String::as_str).collect();
+    let _guard = WRITE.lock().unwrap();
+    let mut doc = load(cache)?;
+    let before = doc.exemptions.len();
+    doc.exemptions.retain(|e| !(e.members.iter().all(|m| group.contains(m.uuid.as_str())) && e.members.iter().any(|m| touched.contains(m.uuid.as_str()))));
+    let removed = before - doc.exemptions.len();
+    if removed > 0 {
+        save(cache, &doc)?;
+    }
+    Ok(removed)
+}
+
 /// Removes every exemption; how many there were.
 pub fn clear(cache: &Cache) -> Result<usize> {
     let _guard = WRITE.lock().unwrap();
