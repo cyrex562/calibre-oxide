@@ -148,6 +148,73 @@ pub(crate) async fn fetch_rows_from_cache(cache: std::sync::Arc<calibre_db::cach
         .map_err(|e| ServerError::InternalServerError(e.to_string()))
 }
 
+/// Fields [`sort_row`] can build without a full [`fetch_rows`] row.
+const FAST_SORT_FIELDS: &[&str] = &[
+    "title", "sort", "authors", "author_sort", "publisher", "series", "uuid", "comments", "isbn", "identifiers",
+    "rating", "size", "series_index", "tags", "languages", "timestamp", "pubdate", "last_modified", "id",
+];
+
+/// Each matching book's id and its sort keys, one key per sort field.
+///
+/// The keys are exactly what [`sort_key_for`] makes of a [`fetch_rows`]
+/// row, but for the usual fields they are built from only those fields:
+/// a full row also reads the cover, every format and every custom column
+/// with queries of their own, which is what made sorting 9,767 books take
+/// about a second. Any other field (a custom column, say) uses full rows
+/// as before. Books without a title are left out, as `get_data_as_dict`
+/// leaves them out.
+async fn sort_keys(cache: &std::sync::Arc<calibre_db::cache::Cache>, ids: HashSet<i32>, fields: &[&str]) -> Result<Vec<(i64, Vec<String>)>, ServerError> {
+    if !fields.iter().all(|f| FAST_SORT_FIELDS.contains(f)) {
+        let rows = fetch_rows_from_cache(cache.clone(), ids).await?;
+        return Ok(rows.iter().map(|r| (r["id"].as_i64().unwrap_or(0), fields.iter().map(|f| sort_key_for(r, f)).collect())).collect());
+    }
+    let cache = cache.clone();
+    let fields: Vec<String> = fields.iter().map(|f| f.to_string()).collect();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(i64, Vec<String>)>> {
+        let mut ids: Vec<i32> = ids.into_iter().collect();
+        ids.sort_unstable();
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(row) = sort_row(&cache, id, &fields)? {
+                out.push((id as i64, fields.iter().map(|f| sort_key_for(&row, f)).collect()));
+            }
+        }
+        Ok(out)
+    })
+    .await
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))?
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))
+}
+
+/// The part of `get_data_as_dict`'s row that `fields` sort on, built the
+/// same way (same field, same parsing), so [`sort_key_for`] gives the same
+/// key. `None` for a book without a title.
+fn sort_row(cache: &calibre_db::cache::Cache, id: i32, fields: &[String]) -> anyhow::Result<Option<Value>> {
+    let Some(title) = cache.field_for(id, "title")? else { return Ok(None) };
+    let mut row = serde_json::Map::new();
+    row.insert("id".into(), serde_json::json!(id));
+    row.insert("title".into(), serde_json::json!(title));
+    for field in fields {
+        // `sort_key_for` reads `sort` for title and `author_sort` for authors.
+        let stored = match field.as_str() {
+            "title" => "sort",
+            "authors" => "author_sort",
+            f => f,
+        };
+        let value = match stored {
+            "id" => continue,
+            "rating" | "series_index" => serde_json::json!(cache.field_for(id, stored)?.and_then(|s| s.parse::<f64>().ok())),
+            "size" => serde_json::json!(cache.field_for(id, stored)?.and_then(|s| s.parse::<i64>().ok())),
+            "isbn" | "identifiers" => serde_json::json!(cache.field_for(id, stored)?.unwrap_or_default()),
+            "tags" => serde_json::json!(cache.field_for(id, stored)?.map(|s| s.split(", ").map(|t| t.trim().to_string()).collect::<Vec<_>>()).unwrap_or_default()),
+            "languages" => serde_json::json!(cache.field_for(id, stored)?.map(|s| s.split(", ").map(str::to_string).collect::<Vec<_>>()).unwrap_or_default()),
+            _ => serde_json::json!(cache.field_for(id, stored)?),
+        };
+        row.insert(stored.to_string(), value);
+    }
+    Ok(Some(Value::Object(row)))
+}
+
 /// `GET /ajax/book/{book_id}`. Port of `book`, `id_is_uuid` not
 /// supported (see module doc).
 pub async fn book(State(state): State<AppState>, Path(book_id): Path<String>) -> Result<Json<Value>, ServerError> {
@@ -422,10 +489,8 @@ pub async fn search(State(state): State<AppState>, Query(q): Query<SearchQuery>)
     .into_iter()
     .collect();
 
-    let rows = fetch_rows(&state, ids).await?;
     // Each row's sort keys are built once, not once per comparison.
-    let mut keyed: Vec<(i64, Vec<String>)> = rows.iter().map(|r| (r["id"].as_i64().unwrap_or(0), sort_fields.iter().map(|f| sort_key_for(r, f)).collect())).collect();
-    drop(rows);
+    let mut keyed = sort_keys(&state.cache, ids, &sort_fields).await?;
     keyed.sort_by(|(_, a), (_, b)| {
         for (ka, kb) in a.iter().zip(b.iter()) {
             let cmp = if sort_order == "asc" { calibre_utils::icu::strcmp(ka, kb) } else { calibre_utils::icu::strcmp(kb, ka) };
@@ -743,6 +808,36 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["sort"], "authors,title");
         assert_eq!(body["book_ids"], serde_json::json!([alpha_id, zeta_id]), "{body}");
+    }
+
+    /// The fast sort keys are exactly the keys the full rows give, for every
+    /// field the fast path takes, on books with those fields set, unset and
+    /// odd (multi-valued, fractional, missing).
+    #[tokio::test]
+    async fn fast_sort_keys_match_the_full_row_keys_for_every_fast_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        let a = add_test_book(dir.path(), &cache, "The Zeta Book", "Zed Writer & Ann Other");
+        let b = add_test_book(dir.path(), &cache, "alpha", "Bea Author");
+        let _c = add_test_book(dir.path(), &cache, "Émile", "Unknown");
+        for (field, value) in [("publisher", "Pub"), ("series", "Saga"), ("series_index", "2.5"), ("rating", "8"), ("tags", "b, a, c"), ("languages", "eng, fra"), ("pubdate", "2001-02-03T00:00:00+00:00"), ("comments", "x"), ("identifiers", "isbn:9780000000002")] {
+            cache.set_field(a, field, value).unwrap();
+        }
+        cache.set_field(b, "series", "Another").unwrap();
+        cache.set_field(b, "rating", "3").unwrap();
+        let cache = std::sync::Arc::new(cache);
+        let all: std::collections::HashSet<i32> = cache.all_book_ids().unwrap().into_iter().collect();
+        let rows = super::fetch_rows_from_cache(cache.clone(), all.clone()).await.unwrap();
+        for field in super::FAST_SORT_FIELDS {
+            let mut fast = super::sort_keys(&cache, all.clone(), &[field]).await.unwrap();
+            fast.sort_by_key(|(id, _)| *id);
+            let mut full: Vec<(i64, Vec<String>)> = rows.iter().map(|r| (r["id"].as_i64().unwrap(), vec![super::sort_key_for(r, field)])).collect();
+            full.sort_by_key(|(id, _)| *id);
+            assert_eq!(fast, full, "sort keys differ for {field}");
+        }
+        // A field the fast path doesn't know still sorts, through the full rows.
+        let other = super::sort_keys(&cache, all.clone(), &["formats"]).await.unwrap();
+        assert_eq!(other.len(), all.len());
     }
 
     #[tokio::test]
