@@ -8,7 +8,8 @@
 // preview, isolates errors per book and records every run. This module holds the
 // dialog's state machine so its rules can be tested:
 //
-// * a row is pre-checked when its title needs fixing and a suggestion exists;
+// * a row is pre-checked when its title needs fixing and a suggestion that
+//   reads like a title exists (not a catalogue number such as `MR1494.ch4`);
 // * the table is shown in pages (thousands of rows must stay usable);
 // * a checked row with an empty title cannot be applied;
 // * the header checkbox and the reason filter act on every row of the filter, not just the page.
@@ -37,10 +38,12 @@ export interface RetitleRowState {
   currentFile: string;
   proposedFile: string | null;
   formats: string[];
+  /** The suggestion reads like a title (see the server's `looks_like_title`). */
+  confident: boolean;
   checked: boolean;
 }
 
-/** A row is pre-checked when its title is wrong and something was suggested. */
+/** A row is pre-checked when its title is wrong and a confident suggestion exists. */
 export function rowFromServer(r: RetitleRow): RetitleRowState {
   return {
     bookId: r.book_id,
@@ -50,8 +53,19 @@ export function rowFromServer(r: RetitleRow): RetitleRowState {
     currentFile: r.current_file,
     proposedFile: r.proposed_file,
     formats: r.formats,
-    checked: r.reason !== "ok" && r.reason !== "no_suggestion" && r.suggested_title.trim() !== "",
+    confident: r.confident !== false,
+    checked: r.reason !== "ok" && r.reason !== "no_suggestion" && r.confident !== false && r.suggested_title.trim() !== "",
   };
+}
+
+/**
+ * Ready-to-apply rows first, then suggestions to check, then books with no
+ * suggestion, then the fine ones; stable within each, so the server's order
+ * holds otherwise. A first page of "Type a title" rows hid the 600 good ones.
+ */
+export function orderRows(rows: RetitleRowState[]): RetitleRowState[] {
+  const rank = (r: RetitleRowState) => (r.checked ? 0 : r.reason === "ok" ? 3 : r.reason === "no_suggestion" ? 2 : 1);
+  return rows.map((r, i) => [r, i] as const).sort((a, b) => rank(a[0]) - rank(b[0]) || a[1] - b[1]).map(([r]) => r);
 }
 
 export const REASON_LABEL: Record<RetitleReason, string> = {
@@ -239,7 +253,7 @@ export function createRetitleController(api: RetitleApi = realApi) {
     try {
       const template = state.renameTemplate;
       const res = await api.suggestRetitles(scopeFor(state.scope, selectedIds), template);
-      state.rows = res.rows.map(rowFromServer);
+      state.rows = orderRows(res.rows.map(rowFromServer));
       state.serverTotal = res.total;
       state.truncated = res.truncated;
       state.templateAtFind = template.trim();

@@ -113,6 +113,7 @@ function cancelRun() {
                 </td>
                 <td>
                   <span class="badge" :class="r.reason">{{ REASON_LABEL[r.reason] }}</span>
+                  <span v-if="!r.confident && r.reason !== 'ok' && r.reason !== 'no_suggestion'" class="badge unsure" title="Suggested from a file name that looks like a catalogue number, so not selected: check it first">check</span>
                 </td>
                 <td class="path">
                   {{ r.currentFile }}<template v-if="state.renameFiles && r.proposedFile && r.proposedFile !== r.currentFile"> → {{ r.proposedFile }}</template>
@@ -279,6 +280,10 @@ td input.invalid {
 }
 .badge.no_suggestion {
   color: var(--error, #cf222e);
+}
+.badge.unsure {
+  margin-left: 0.25rem;
+  color: var(--muted, #6e7781);
 }
 .retitle-done {
   display: flex;

@@ -1413,6 +1413,8 @@ export interface RetitleRow {
   /** Empty for `no_suggestion`: the user types one. */
   suggested_title: string;
   reason: RetitleReason;
+  /** Whether the suggestion reads like a title rather than a catalogue number; only these start selected. */
+  confident: boolean;
   /** The file stem(s) now. */
   current_file: string;
   formats: string[];

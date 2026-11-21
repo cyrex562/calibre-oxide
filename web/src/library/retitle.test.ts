@@ -18,6 +18,7 @@ import {
   visibleRows,
 } from "./retitle";
 import type { RetitleApi } from "./retitle";
+import { orderRows } from "./retitle";
 import { fetchRetitleRuns, runRetitle, suggestRetitles, undoRetitle } from "./api";
 import type { RetitleReport, RetitleRow, RetitleSuggestions } from "./api";
 
@@ -26,6 +27,7 @@ const row = (over: Partial<RetitleRow> = {}): RetitleRow => ({
   current_title: "Untitled",
   suggested_title: "Dragon Lore",
   reason: "junk",
+  confident: true,
   current_file: "Dragon_Lore",
   formats: ["PDF"],
   proposed_file: "Dragon Lore",
@@ -49,6 +51,18 @@ describe("rows", () => {
     expect(rowFromServer(row()).checked).toBe(true);
     expect(rowFromServer(row({ reason: "template_leftover" })).checked).toBe(true);
     expect(rowFromServer(row({ reason: "ok", suggested_title: "Untitled" })).checked).toBe(false);
+    expect(rowFromServer(row({ suggested_title: "MR1494.ch4", confident: false })).checked).toBe(false);
+  });
+
+  it("orders ready rows first, then ones to check, then ones needing a title, then fine ones", () => {
+    const rows = [
+      row({ book_id: 1, reason: "ok", current_title: "Fine", suggested_title: "Fine" }),
+      row({ book_id: 2, reason: "no_suggestion", suggested_title: "" }),
+      row({ book_id: 3, suggested_title: "MR1494.ch4", confident: false }),
+      row({ book_id: 4 }),
+      row({ book_id: 5 }),
+    ].map(rowFromServer);
+    expect(orderRows(rows).map((r) => r.bookId)).toEqual([4, 5, 3, 2, 1]);
     const none = rowFromServer(row({ reason: "no_suggestion", suggested_title: "" }));
     expect(none.checked).toBe(false);
     expect(none.title).toBe("");

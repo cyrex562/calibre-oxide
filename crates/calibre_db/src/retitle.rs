@@ -111,6 +111,18 @@ pub fn suggest_title(current_title: &str, stems: &[String]) -> Option<String> {
     stems.iter().map(|s| humanize_stem(s)).find(|h| !h.is_empty() && !is_junk_title(h) && !h.eq_ignore_ascii_case(current))
 }
 
+/// Whether a suggested title reads like a title rather than a code.
+///
+/// File names on a real collection are often catalogue numbers
+/// (`MR1494.ch4`, `EG080102`): better than nothing as a hint, worse than the
+/// embedded title they would replace. Such a suggestion is still offered,
+/// just not pre-selected. A title is one with two real words, or one word of
+/// four letters or more (`flags`, `CUT012 Pirates`).
+pub fn looks_like_title(s: &str) -> bool {
+    let alpha: Vec<&str> = s.split(|c: char| !c.is_alphanumeric()).filter(|w| w.chars().count() >= 2 && w.chars().all(char::is_alphabetic)).collect();
+    alpha.len() >= 2 || alpha.iter().any(|w| w.chars().count() >= 4)
+}
+
 /// One book in a suggestion pass.
 #[derive(Debug, Clone, Serialize)]
 pub struct SuggestedRow {
@@ -118,6 +130,9 @@ pub struct SuggestedRow {
     pub current_title: String,
     pub suggested_title: String,
     pub reason: Reason,
+    /// Whether the suggestion reads like a title ([`looks_like_title`]); the
+    /// UI pre-selects only these.
+    pub confident: bool,
     /// The file stem(s) now, `" | "`-joined when the formats disagree.
     pub current_file: String,
     pub formats: Vec<String>,
@@ -183,7 +198,7 @@ pub fn suggest(cache: &Cache, scope: &Scope, rename_template: &str) -> Result<Su
         };
         let formats: Vec<String> = cache.format_file_names(record.id)?.into_iter().map(|(f, _)| f).collect();
         let proposed_file = if suggested.is_empty() || formats.is_empty() { None } else { propose_stem(cache, record.id, template, Some(&suggested), &mut claimed).ok() };
-        rows.push(SuggestedRow { book_id: record.id, current_title: record.title.clone(), suggested_title: suggested, reason, current_file: stems.join(" | "), formats, proposed_file });
+        rows.push(SuggestedRow { book_id: record.id, current_title: record.title.clone(), confident: reason == Reason::Ok || looks_like_title(&suggested), suggested_title: suggested, reason, current_file: stems.join(" | "), formats, proposed_file });
     }
     Ok(Suggestions { truncated: total > rows.iter().filter(|r| r.reason != Reason::Ok).count(), rows, total })
 }
@@ -539,6 +554,16 @@ mod tests {
     }
 
     // --- suggestion rules ---------------------------------------------
+
+    #[test]
+    fn a_catalogue_number_is_suggested_but_not_confidently() {
+        for code in ["MR1494.ch4", "EG080102", "MISBTRM07A", "HLT", "06", ""] {
+            assert!(!looks_like_title(code), "{code}");
+        }
+        for title in ["flags", "CUT012 Pirates", "APOM 1 Heists", "Encyclopedia Metropolitana Vol 20 1845", "Name Maker - Kaiju"] {
+            assert!(looks_like_title(title), "{title}");
+        }
+    }
 
     #[test]
     fn a_stem_is_humanised() {
