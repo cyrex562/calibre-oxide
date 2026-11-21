@@ -44,9 +44,6 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use calibre_db::cache::Cache;
-use calibre_db::formatter_functions::{CacheCatalog, CacheFunctions, CacheValueSource};
-use calibre_utils::filenames::sanitize_file_name;
-use calibre_utils::formatter::string_format;
 
 use crate::errors::ServerError;
 use crate::web_socket::{self, ChangeEvent};
@@ -92,33 +89,9 @@ fn propose(cache: &Cache, book_id: i32, template: &str, claimed: &mut std::colle
     let title = cache.field_for(book_id, "title").ok().flatten().unwrap_or_default();
     let current = cache.format_file_stem(book_id).ok().flatten().unwrap_or_default();
 
-    let proposed = (|| -> Result<String, String> {
-        let value_source = CacheValueSource::new(cache, book_id).map_err(|e| e.to_string())?;
-        let functions = CacheFunctions::new(cache, book_id);
-        let rendered = string_format::evaluate_template(template, &value_source, &CacheCatalog, &functions)?;
-
-        // A filename, not a path: a template written for save-to-disk
-        // has `/` in it, and the last component is the part that names
-        // the file. Taking it rather than rejecting the template means
-        // somebody can paste the template they already use.
-        let last = rendered.rsplit('/').next().unwrap_or(&rendered).trim();
-        let stem = sanitize_file_name(last);
-        if stem.trim().is_empty() {
-            return Err("the template produced an empty filename".to_string());
-        }
-
-        let folder = cache.field_for(book_id, "path").ok().flatten().unwrap_or_default();
-        let mut stem = cache.available_format_stem(book_id, &stem).map_err(|e| e.to_string())?;
-        let mut suffix = 1;
-        while !claimed.insert((folder.clone(), stem.clone())) {
-            stem = format!("{} ({suffix})", sanitize_file_name(last));
-            suffix += 1;
-            if suffix > 1000 {
-                return Err("too many books in one folder want this name".to_string());
-            }
-        }
-        Ok(stem)
-    })();
+    // The evaluation, the last-component rule and the collision handling
+    // live in `calibre_db::rename_proposal`, shared with "Fix titles".
+    let proposed = calibre_db::rename_proposal::propose_stem(cache, book_id, template, None, claimed);
 
     Proposal { book_id, title, current, proposed }
 }

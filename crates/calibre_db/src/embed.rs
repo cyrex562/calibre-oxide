@@ -135,6 +135,16 @@ pub fn embed_metadata(cache: &Cache, book_id: i32) -> Result<Vec<(String, Format
                         if let Err(e) = cache.record_format_row(book_id, &format, &name, bytes.len() as i64, Some(&hash)) {
                             log::warn!("embedded metadata into {} but could not re-record it: {e}", path.display());
                         }
+                        // The rewrite replaced the file (a temp file renamed
+                        // over it), so its on-disk identity changed too. A
+                        // stale identity is kept by `record_hash` when none is
+                        // given; record the new one so a later scan does not
+                        // see a file nobody owns at this path.
+                        if let Some(identity) = calibre_utils::filenames::identity(&path) {
+                            if let Err(e) = cache.checksums().record_hash_with_identity(book_id, "format", &format.to_uppercase(), &hash, bytes.len() as i64, Some(identity)) {
+                                log::warn!("embedded metadata into {} but could not record its file identity: {e}", path.display());
+                            }
+                        }
                     }
                     // The write succeeded, so the book really does have
                     // the new metadata; failing to re-read it for hashing
@@ -334,5 +344,49 @@ mod tests {
         let on_disk = std::fs::metadata(cache.book_dir(book_id).unwrap().unwrap().join(format!("{name}.epub"))).unwrap().len() as i64;
         assert_eq!(last.0, on_disk, "the logged size is stale");
         assert_eq!(last.1, hash_after, "the logged hash is stale");
+    }
+
+    /// The dedupe goal: after a PDF is rewritten, everything the duplicate
+    /// scan keys on describes the new bytes -- the title in the file, the
+    /// content hash and size (and so the content groups), the file identity --
+    /// and the new content is queued for a page fingerprint (fingerprints are
+    /// keyed by content hash, so the old one never matches the new bytes).
+    #[test]
+    fn embedding_into_a_pdf_refreshes_what_the_duplicate_scan_keys_on() {
+        const TWO_PAGE: &[u8] = include_bytes!("../../calibre_ebooks/tests/data/two-page.pdf");
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        let path = dir.path().join("scan0001.pdf");
+        std::fs::write(&path, TWO_PAGE).unwrap();
+        let mut meta = calibre_ebooks::metadata::MetaInformation::default();
+        meta.title = "scan0001".to_string();
+        let book_id = cache.register_book_in_place("scan0001.pdf", &meta).unwrap();
+
+        // The state a scan leaves: a recorded hash, and a fingerprint for it.
+        let old_hash = blake3::hash(TWO_PAGE).to_hex().to_string();
+        cache.checksums().record_hash(book_id, "format", "PDF", &old_hash, TWO_PAGE.len() as i64).unwrap();
+        cache.checksums().record_pdf_fingerprint(&old_hash, &Err("test".to_string())).unwrap();
+        assert!(cache.checksums().pdf_fingerprints_pending().unwrap().is_empty());
+
+        cache.set_field(book_id, "title", "A Much Cleaner Title Than The Scan Had").unwrap();
+        assert_eq!(embed_metadata(&cache, book_id).unwrap(), vec![("PDF".to_string(), FormatOutcome::Embedded)]);
+
+        let on_disk = calibre_ebooks::metadata::pdf::get_metadata_from_path(&path).unwrap();
+        assert_eq!(on_disk.title, "A Much Cleaner Title Than The Scan Had");
+
+        let bytes = std::fs::read(&path).unwrap();
+        let new_hash = blake3::hash(&bytes).to_hex().to_string();
+        assert_ne!(new_hash, old_hash);
+        let (recorded_hash, identity) = cache.checksums().recorded_identity(book_id, "format", "PDF").unwrap();
+        assert_eq!(recorded_hash.as_deref(), Some(new_hash.as_str()), "the recorded hash must be the rewritten file's");
+        if let Some(actual) = calibre_utils::filenames::identity(&path) {
+            assert_eq!(identity, Some(actual), "the recorded file identity must be the rewritten file's");
+        }
+        let size: i64 = cache.backend.conn.lock().unwrap().query_row("SELECT uncompressed_size FROM data WHERE book = ?1", [book_id], |r| r.get(0)).unwrap();
+        assert_eq!(size, bytes.len() as i64);
+
+        let pending = cache.checksums().pdf_fingerprints_pending().unwrap();
+        assert_eq!(pending.len(), 1, "the new content is owed a fingerprint: {pending:?}");
+        assert_eq!((pending[0].book_id, pending[0].hash.as_str()), (book_id, new_hash.as_str()));
     }
 }

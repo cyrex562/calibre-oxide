@@ -635,7 +635,7 @@ export interface LibraryJobProgress {
 
 export interface LibraryJob<R = unknown> {
   id: number;
-  kind: "scan" | "enrich" | "hash_backfill" | "pdf_fingerprint" | "merge_exact" | "import" | "dedupe" | "resolve" | "prepare" | "absorb" | "unabsorb" | "copy" | "organize" | "undo_organize";
+  kind: "scan" | "enrich" | "hash_backfill" | "pdf_fingerprint" | "merge_exact" | "import" | "dedupe" | "resolve" | "prepare" | "absorb" | "unabsorb" | "copy" | "organize" | "undo_organize" | "retitle" | "undo_retitle";
   /** `interrupted`: the server process ended while it ran (read back from `.calibre-oxide/jobs.json`). */
   state: "running" | "finished" | "cancelled" | "failed" | "interrupted";
   /** Interrupted and able to continue by itself: POST `/<resume_route>/default`. */
@@ -839,6 +839,8 @@ export function describeJobProgress(p: LibraryJobProgress): string {
       return "Comparing every book in the library…";
     case "describing":
       return `Preparing groups… ${n(p.seen)} of ${n(p.total)}`;
+    case "retitling":
+      return `Fixing titles… ${n(p.seen)} of ${n(p.total)} books`;
     case "resolving":
       return `Resolving… ${n(p.seen)} of ${n(p.total)} groups`;
     default:
@@ -1396,6 +1398,101 @@ export function fetchOrganizeRuns(): Promise<{ runs: OrganizeRun[] }> {
 /** Moves a run's files back, as a job. */
 export function undoOrganize(runId: string, handlers: LibraryJobHandlers<OrganizeUndoReport> = {}): Promise<OrganizeUndoReport> {
   return runLibraryJob<OrganizeUndoReport>("/unorganize-library/default", handlers, { run_id: runId });
+}
+
+// ----- Fix titles (`POST /retitle-library`) -----------------------------
+
+/** Which books to look at: the listed ones (all returned), or every book (only those that need fixing). */
+export type RetitleScope = { bookIds: number[] } | { all: true };
+
+export type RetitleReason = "junk" | "template_leftover" | "ok" | "no_suggestion";
+
+export interface RetitleRow {
+  book_id: number;
+  current_title: string;
+  /** Empty for `no_suggestion`: the user types one. */
+  suggested_title: string;
+  reason: RetitleReason;
+  /** The file stem(s) now. */
+  current_file: string;
+  formats: string[];
+  /** The stem the rename template gives with the suggested title; null when there is none to show. */
+  proposed_file: string | null;
+}
+
+export interface RetitleSuggestions {
+  rename_template: string;
+  /** Books needing a fix in the scope, whether or not they fit in `rows`. */
+  total: number;
+  /** `rows` is shorter than `total` (the server caps at 5000). */
+  truncated: boolean;
+  rows: RetitleRow[];
+}
+
+export interface RetitleItem {
+  book_id: number;
+  /** The title the user saw: the server skips the book if it holds another now. */
+  expected_title: string;
+  title: string;
+}
+
+export interface RetitleOptions {
+  embed: boolean;
+  renameFiles: boolean;
+  renameTemplate: string;
+}
+
+export interface RetitleReport {
+  run_id: string;
+  books_planned: number;
+  retitled: number;
+  embedded: number;
+  renamed: number;
+  /** `reason`: `changed_since_preview`, `invalid` or `no_such_book`. */
+  skipped: { book_id: number; reason: string }[];
+  /** `stage`: `title`, `embed` or `rename`; `title_set` says the new title is stored anyway. */
+  failed: { book_id: number; stage: string; reason: string; title_set: boolean }[];
+  cancelled: boolean;
+}
+
+export interface RetitleUndoReport {
+  run_id: string;
+  titles_restored: number;
+  files_restored: number;
+  re_embedded: number;
+  skipped: { book_id: number; reason: string }[];
+  failed: { book_id: number; stage: string; reason: string; title_set: boolean }[];
+  cancelled: boolean;
+}
+
+export interface RetitleRun {
+  run_id: string;
+  /** Seconds since the epoch. */
+  created_at: number;
+  books: number;
+  undone: boolean;
+}
+
+/** The dry run: titles that need fixing, with a suggestion each. Changes nothing. */
+export function suggestRetitles(scope: RetitleScope, renameTemplate: string): Promise<RetitleSuggestions> {
+  const body = { dry_run: true, scope: "all" in scope ? { all: true } : { book_ids: scope.bookIds }, ...(renameTemplate.trim() ? { rename_template: renameTemplate.trim() } : {}) };
+  return jsonFetch<RetitleSuggestions>("/retitle-library/default", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+}
+
+/** Applies the approved titles as a job (set, optionally embed, optionally rename). */
+export function runRetitle(items: RetitleItem[], options: RetitleOptions, handlers: LibraryJobHandlers<RetitleReport> = {}): Promise<RetitleReport> {
+  const body = { dry_run: false, items, embed: options.embed, rename_files: options.renameFiles, ...(options.renameTemplate.trim() ? { rename_template: options.renameTemplate.trim() } : {}) };
+  return runLibraryJob<RetitleReport>("/retitle-library/default", handlers, body);
+}
+
+/** Recorded runs, newest first. */
+export function fetchRetitleRuns(): Promise<{ runs: RetitleRun[] }> {
+  return jsonFetch("/retitle-runs/default");
+}
+
+/** Puts a run's titles and file names back, as a job. */
+export function undoRetitle(runId: string, handlers: LibraryJobHandlers<RetitleUndoReport> = {}): Promise<RetitleUndoReport> {
+  return runLibraryJob<RetitleUndoReport>("/unretitle-library/default", handlers, { run_id: runId });
 }
 
 /** What the PDF fingerprint job did. */

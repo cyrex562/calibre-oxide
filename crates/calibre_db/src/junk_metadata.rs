@@ -74,7 +74,7 @@ fn squash(s: &str) -> String {
     out
 }
 
-fn has_file_extension(s: &str) -> bool {
+pub(crate) fn has_file_extension(s: &str) -> bool {
     match s.trim().rsplit_once('.') {
         Some((stem, ext)) => !stem.trim().is_empty() && !ext.contains(char::is_whitespace) && FILE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()),
         None => false,
