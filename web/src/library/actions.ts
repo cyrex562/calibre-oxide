@@ -110,6 +110,8 @@ export type LibraryActionId =
   | "check-library"
   | "find-duplicates"
   | "organize-files"
+  | "fix-titles"
+  | "fix-titles-selected"
   | "map-metadata"
   | "browse-annotations"
   | "pick-random"
@@ -185,6 +187,7 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   // library -> Browse for another" reads as "find an existing one".
   { id: "new-library", label: "New library…", group: "library", requires: "none", toolbar: true, desktopOnly: true, primary: true, icon: "lt", tooltip: "Create an empty library and open it" },
   { id: "organize-files", label: "Organize files…", group: "library", requires: "none", icon: "tb_folder", tooltip: "Move books' files inside the library to folders and names from a template" },
+  { id: "fix-titles", label: "Fix titles…", group: "library", requires: "none", icon: "edit_input", tooltip: "Find junk titles in the library, suggest clean ones, and set them (optionally in the files too)" },
   { id: "trash", label: "Trash…", group: "library", requires: "none", icon: "remove_books", tooltip: "Restore or permanently delete books and formats you removed" },
   { id: "open-library-folder", label: "Open library folder", group: "library", requires: "none", desktopOnly: true, icon: "tb_folder", tooltip: "Show this library's folder in the file browser" },
 
@@ -207,6 +210,7 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   { id: "merge-books", label: "Merge books…", group: "selection", requires: "multi-selection", contextMenu: true, icon: "merge_books", tooltip: "Merge the selected books into one record" },
   { id: "save-to-disk", label: "Save to disk", group: "selection", requires: "selection", icon: "save", accel: "Ctrl+S", tooltip: "Write book files to a folder" },
   { id: "rename-files", label: "Rename files…", group: "selection", requires: "selection", contextMenu: true, icon: "template_funcs", tooltip: "Rename the files on disk, without changing the title" },
+  { id: "fix-titles-selected", label: "Fix titles…", group: "selection", requires: "selection", contextMenu: true, icon: "edit_input", tooltip: "Suggest clean titles for the selected books, then set them, write them into the files and rename the files" },
   // The counterpart to "Rename files": that changes the name on disk,
   // this changes the metadata *inside* the file, so a reader app shows
   // the title this library has rather than the one the file shipped with.
@@ -451,7 +455,7 @@ export const TOOLBAR_LAYOUT: ToolbarItem[] = [
   { kind: "spring" },
   // Label is replaced at render time with the open library's name:
   // which library you are in is state, and state belongs on a label.
-  { kind: "menu", id: "library", label: "Library", icon: "lt", menu: ["switch-library", "new-library", "open-library-folder", "-", "$recent-libraries", "-", "check-library", "find-duplicates", "organize-files", "trash"] },
+  { kind: "menu", id: "library", label: "Library", icon: "lt", menu: ["switch-library", "new-library", "open-library-folder", "-", "$recent-libraries", "-", "check-library", "find-duplicates", "organize-files", "fix-titles", "trash"] },
   { kind: "split", id: "help", menu: ["$shortcuts", "$about"] },
 ];
 

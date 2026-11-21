@@ -33,6 +33,8 @@ import { createDuplicatesStore } from "../library/duplicatesStore";
 import { createResolveController } from "../library/resolve";
 import { createOrganizeController } from "../library/organize";
 import OrganizeDialog from "./OrganizeDialog.vue";
+import { createRetitleController } from "../library/retitle";
+import RetitleDialog from "./RetitleDialog.vue";
 import { DEFAULT_DESTINATION_HINT, MERGE_MODE_LABELS, MERGE_MODE_NOTES, defaultMergeDestination, describeMergeResult, describeRecord, summarizeMerge } from "../library/merge";
 import { parseSnippetSegments } from "../library/snippets";
 import { similarBooksQuery } from "../library/query";
@@ -1478,6 +1480,21 @@ function openOrganize() {
   organizeController.open(organizeSelection.value.length);
   organizeOpen.value = true;
 }
+// Fix titles: find junk titles, suggest clean ones, set / embed / rename in one
+// run (undoable). From the Library menu it looks at every book; from the
+// selection and the context menu, at the selected books.
+const retitleController = createRetitleController();
+const retitleOpen = ref(false);
+const retitleSelection = computed(() => (selectMode.value && selectedIds.value.size > 0 ? [...selectedIds.value] : selectedBookId.value !== null ? [selectedBookId.value] : []));
+function openRetitle(scope: "all" | "selected") {
+  if (scope === "selected" && retitleSelection.value.length === 0) return;
+  retitleController.open(scope);
+  retitleOpen.value = true;
+}
+async function onRetitleChanged() {
+  cacheBust.value++;
+  await runSearch();
+}
 // How many PDFs are not yet fingerprinted, for page-content matching.
 const pdfStatus = computed<PdfScanStatus | undefined>(() => dupStore.state.pdf);
 // Zero-byte files: not duplicates of each other, listed separately.
@@ -2007,6 +2024,8 @@ const actionHandlers: Partial<Record<LibraryActionId, () => void>> = {
   "check-library": () => openCheckLibrary(),
   "find-duplicates": () => openDuplicates(),
   "organize-files": () => openOrganize(),
+  "fix-titles": () => openRetitle("all"),
+  "fix-titles-selected": () => openRetitle("selected"),
   "map-metadata": () => {
     mapperOpen.value = true;
   },
@@ -2060,6 +2079,7 @@ const HIDDEN_IN_FTS_MODE: ReadonlySet<LibraryActionId> = new Set<LibraryActionId
   "check-library",
   "find-duplicates",
   "organize-files",
+  "fix-titles",
   "map-metadata",
   "browse-annotations",
   "pick-random",
@@ -2094,6 +2114,7 @@ function actionLabel(action: LibraryAction): string {
     case "bulk-edit":
     case "save-to-disk":
     case "rename-files":
+    case "fix-titles-selected":
     case "embed-metadata":
     case "copy-to-library":
       return `${action.label} (${selectedIds.value.size})`;
@@ -2429,7 +2450,7 @@ function onLibraryKeydown(event: KeyboardEvent) {
   // A modal owns the keyboard while it is open -- firing library
   // shortcuts underneath one would act on a view the user cannot
   // currently see.
-  if (contextMenu.value || manageOpen.value || columnsOpen.value || columnPickerOpen.value || checkLibraryOpen.value || organizeOpen.value || duplicatesOpen.value || mergeOpen.value || saveToDiskOpen.value || renameOpen.value || embedOpen.value || copyOpen.value || newsOpen.value || switchOpen.value) return;
+  if (contextMenu.value || manageOpen.value || columnsOpen.value || columnPickerOpen.value || checkLibraryOpen.value || organizeOpen.value || retitleOpen.value || duplicatesOpen.value || mergeOpen.value || saveToDiskOpen.value || renameOpen.value || embedOpen.value || copyOpen.value || newsOpen.value || switchOpen.value) return;
 
   const id = shortcutFor(event, libraryShortcuts(keymap.value));
   if (!id) return;
@@ -3326,6 +3347,7 @@ watch([books, coloringRules], () => void applyColoringRules(), { deep: true });
 
     <ResolveDialog v-if="duplicatesOpen && resolveOpen" :store="dupStore" :controller="resolveController" @close="resolveOpen = false" @changed="onDuplicatesChanged" />
     <OrganizeDialog v-if="organizeOpen" :controller="organizeController" :selected-ids="organizeSelection" @close="organizeOpen = false" @changed="onDuplicatesChanged" />
+    <RetitleDialog v-if="retitleOpen" :controller="retitleController" :selected-ids="retitleSelection" @close="retitleOpen = false" @changed="onRetitleChanged" />
 
     <div v-if="mergeOpen" class="manage-backdrop" @click.self="mergeOpen = false">
       <div class="manage-panel" role="dialog" aria-label="Merge books">

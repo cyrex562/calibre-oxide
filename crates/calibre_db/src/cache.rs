@@ -2205,8 +2205,12 @@ impl Cache {
             // both is what keeps `data.name` and the file on disk from
             // drifting the way they did before #885.
             let size = std::fs::metadata(&new_path).map(|m| m.len() as i64).unwrap_or(0);
+            // A rename does not change the content: carry the recorded hash
+            // forward (as `set_format_name` does) rather than logging a
+            // `FormatSet` without one, which a rebuild would read as "no hash".
+            let (recorded_hash, _) = self.checksums().recorded_identity(book_id, "format", &format).unwrap_or((None, None));
             let (format_name, stem) = (format.clone(), new_stem.clone());
-            self.record_for_book(book_id, |book| crate::change_log::ChangeOp::FormatSet { book, format: format_name, name: stem, size, hash: None });
+            self.record_for_book(book_id, |book| crate::change_log::ChangeOp::FormatSet { book, format: format_name, name: stem, size, hash: recorded_hash });
             renamed.push(format);
         }
 

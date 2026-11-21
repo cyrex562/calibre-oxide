@@ -206,6 +206,7 @@ pub mod library_jobs;
 pub mod library_trash;
 pub mod absorb_library;
 pub mod organize_library;
+pub mod retitle_library;
 pub mod import_folder;
 pub mod render_endpoints;
 pub mod save_to_disk;
@@ -393,6 +394,9 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/organize-library/{library_id}", post(organize_library::organize))
         .route("/unorganize-library/{library_id}", post(organize_library::unorganize))
         .route("/organize-runs/{library_id}", get(organize_library::runs))
+        .route("/retitle-library/{library_id}", post(retitle_library::retitle))
+        .route("/unretitle-library/{library_id}", post(retitle_library::unretitle))
+        .route("/retitle-runs/{library_id}", get(retitle_library::runs))
         .route("/trash/{library_id}", get(library_trash::list))
         .route("/trash/restore/{library_id}", post(library_trash::restore))
         .route("/trash/delete/{library_id}", post(library_trash::delete))

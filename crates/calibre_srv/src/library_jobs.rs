@@ -49,6 +49,8 @@
 //! - `POST /duplicates/scan/{library_id}?job=true` -- the duplicate scan ([`crate::duplicates`])
 //! - `POST /organize-library/{library_id}`, `POST /unorganize-library/{library_id}`
 //!   -- move files by template, and undo ([`crate::organize_library`])
+//! - `POST /retitle-library/{library_id}`, `POST /unretitle-library/{library_id}`
+//!   -- fix titles (set, embed, rename) and undo ([`crate::retitle_library`])
 //! - `GET /library-jobs`, `GET /library-jobs/{id}`, `POST /library-jobs/{id}/cancel`
 //!
 //! # Surviving a restart
@@ -110,6 +112,10 @@ pub enum JobKind {
     Organize,
     /// Reverse an organize run (`POST /unorganize-library`).
     UndoOrganize,
+    /// Set titles, optionally embed them and rename files (`POST /retitle-library`).
+    Retitle,
+    /// Reverse a retitle run (`POST /unretitle-library`).
+    UndoRetitle,
 }
 
 impl JobKind {
@@ -129,6 +135,8 @@ impl JobKind {
             JobKind::Copy => "copy",
             JobKind::Organize => "organize",
             JobKind::UndoOrganize => "undo_organize",
+            JobKind::Retitle => "retitle",
+            JobKind::UndoRetitle => "undo_retitle",
         }
     }
 
@@ -148,6 +156,8 @@ impl JobKind {
             JobKind::Copy,
             JobKind::Organize,
             JobKind::UndoOrganize,
+            JobKind::Retitle,
+            JobKind::UndoRetitle,
         ]
         .into_iter()
         .find(|k| k.name() == name)
@@ -418,6 +428,15 @@ pub struct JobParams {
     pub organize: Option<calibre_db::organize::OrganizePlan>,
     /// The run a [`JobKind::UndoOrganize`] job reverses.
     pub undo_run: Option<String>,
+    /// The approved titles and options of a [`JobKind::Retitle`] job.
+    pub retitle: Option<RetitleJob>,
+}
+
+/// The approved titles of a retitle run and what to do besides setting them.
+#[derive(Clone)]
+pub struct RetitleJob {
+    pub items: Vec<calibre_db::retitle::Item>,
+    pub options: calibre_db::retitle::ApplyOptions,
 }
 
 /// A cross-library copy: the source library, its books and the options. The
@@ -454,6 +473,9 @@ impl JobParams {
         }
         if let Some(copy) = &self.copy {
             map.insert("book_count".into(), json!(copy.book_ids.len()));
+        }
+        if let Some(retitle) = &self.retitle {
+            map.insert("book_count".into(), json!(retitle.items.len()));
         }
         Value::Object(map)
     }
@@ -580,6 +602,14 @@ fn run(cache: &Cache, kind: JobKind, options: &PipelineOptions, control: &JobCon
         JobKind::UndoOrganize => {
             let run_id = params.undo_run.as_ref().ok_or_else(|| anyhow::anyhow!("an undo needs a run id"))?;
             Ok(serde_json::to_value(calibre_db::organize::undo(cache, run_id, control)?)?)
+        }
+        JobKind::Retitle => {
+            let job = params.retitle.as_ref().ok_or_else(|| anyhow::anyhow!("a retitle job needs its titles"))?;
+            Ok(serde_json::to_value(calibre_db::retitle::apply(cache, &job.items, &job.options, control)?)?)
+        }
+        JobKind::UndoRetitle => {
+            let run_id = params.undo_run.as_ref().ok_or_else(|| anyhow::anyhow!("an undo needs a run id"))?;
+            Ok(serde_json::to_value(calibre_db::retitle::undo(cache, run_id, control)?)?)
         }
         JobKind::Copy => {
             let job = params.copy.as_ref().ok_or_else(|| anyhow::anyhow!("a copy job needs its books"))?;

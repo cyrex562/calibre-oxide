@@ -111,6 +111,16 @@ impl<'a> CacheValueSource<'a> {
         let row = rows.into_iter().next().ok_or_else(|| anyhow::anyhow!("Unknown book id {book_id}"))?;
         Ok(Self { row, _cache: cache })
     }
+
+    /// The same source with one field's value replaced, so a template can be
+    /// evaluated for a value the book does not hold yet (the file name a
+    /// *suggested* title would give). Nothing is written to the library.
+    pub fn with_override(mut self, field: &str, value: &str) -> Self {
+        if let Some(row) = self.row.as_object_mut() {
+            row.insert(field.trim_start_matches('#').to_string(), serde_json::Value::String(value.to_string()));
+        }
+        self
+    }
 }
 
 fn json_scalar_or_join(v: &serde_json::Value) -> Option<String> {

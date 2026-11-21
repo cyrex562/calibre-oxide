@@ -17,6 +17,8 @@ pub mod covers;
 pub mod dedupe;
 pub mod dedupe_exemptions;
 pub mod organize;
+pub mod rename_proposal;
+pub mod retitle;
 pub mod resolve;
 pub mod pdf_similarity;
 pub mod pdf_worker;
