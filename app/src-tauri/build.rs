@@ -49,6 +49,7 @@ const COMMANDS: &[&str] = &[
     "open_external_url",
     "reveal_library_folder",
     "reveal_book_folder",
+    "reveal_book_file",
     // App shell
     "set_menu_actions",
     "get_auto_reopen",
