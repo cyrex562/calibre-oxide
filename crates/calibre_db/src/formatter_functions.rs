@@ -108,7 +108,16 @@ impl<'a> CacheValueSource<'a> {
     pub fn new(cache: &'a Cache, book_id: i32) -> anyhow::Result<Self> {
         let ids: HashSet<i32> = std::iter::once(book_id).collect();
         let rows = cache.get_data_as_dict(None, false, Some(&ids), false)?;
-        let row = rows.into_iter().next().ok_or_else(|| anyhow::anyhow!("Unknown book id {book_id}"))?;
+        let mut row = rows.into_iter().next().ok_or_else(|| anyhow::anyhow!("Unknown book id {book_id}"))?;
+        // A book outside any series has the placeholder index 1.0; as calibre's
+        // save-to-disk does, a template sees it as empty, so `{series_index}`
+        // (and `{series_index:|| - }`) print nothing for a book with no series.
+        if let Some(obj) = row.as_object_mut() {
+            let in_series = obj.get("series").is_some_and(|s| s.as_str().is_some_and(|s| !s.is_empty()));
+            if !in_series && obj.contains_key("series_index") {
+                obj.insert("series_index".into(), serde_json::Value::String(String::new()));
+            }
+        }
         Ok(Self { row, _cache: cache })
     }
 

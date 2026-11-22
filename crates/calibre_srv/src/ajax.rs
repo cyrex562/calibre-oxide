@@ -278,6 +278,17 @@ pub async fn books(State(state): State<AppState>, Query(q): Query<BooksQuery>) -
     Ok(Json(Value::Object(ans)))
 }
 
+/// `#label` -> display name, for the custom columns that are categories.
+fn custom_category_names(cache: &calibre_db::cache::Cache) -> std::collections::HashMap<String, String> {
+    cache
+        .custom_column_label_map()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, v)| v["normalized"].as_bool().unwrap_or(false))
+        .map(|(label, v)| (format!("#{label}"), v["name"].as_str().unwrap_or(&label).to_string()))
+        .collect()
+}
+
 /// `GET /ajax/categories`. Port of `categories`, narrowed per module
 /// doc (no icons, no "All books"/"Newest" pseudo-entries).
 pub async fn categories_list(State(state): State<AppState>) -> Result<Json<Value>, ServerError> {
@@ -297,6 +308,19 @@ pub async fn categories_list(State(state): State<AppState>) -> Result<Json<Value
         ans.push(serde_json::json!({
             "url": format!("/ajax/category/{key}"),
             "name": name,
+            "is_category": true,
+        }));
+    }
+    // A normalized custom column (text, series, ...) with values is a category
+    // too, keyed `#label`, shown under the column's own name.
+    let names = custom_category_names(&state.cache);
+    for (key, items) in cats.iter().filter(|(k, _)| k.starts_with('#')) {
+        if items.is_empty() {
+            continue;
+        }
+        ans.push(serde_json::json!({
+            "url": format!("/ajax/category/{key}"),
+            "name": names.get(key.as_str()).cloned().unwrap_or_else(|| key.clone()),
             "is_category": true,
         }));
     }
@@ -331,7 +355,7 @@ pub async fn category(State(state): State<AppState>, Path(name): Path<String>, Q
     let sort = ensure_val(q.sort.as_deref(), &["name", "rating", "popularity"]);
     let sort_order = ensure_val(q.sort_order.as_deref(), &["asc", "desc"]);
 
-    let category_display_name = crate::opds::CATEGORY_NAMES.iter().find(|(k, _)| *k == name).map(|(_, n)| *n);
+    let category_display_name: Option<String> = crate::opds::CATEGORY_NAMES.iter().find(|(k, _)| *k == name).map(|(_, n)| n.to_string()).or_else(|| custom_category_names(&state.cache).get(name.as_str()).cloned());
     let Some(category_display_name) = category_display_name else {
         return Err(ServerError::NotFound(format!("Category {name:?} not found")));
     };

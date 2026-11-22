@@ -39,6 +39,10 @@ import { createDuplicatesStore } from "../library/duplicatesStore";
 import { createResolveController } from "../library/resolve";
 import { createOrganizeController } from "../library/organize";
 import OrganizeDialog from "./OrganizeDialog.vue";
+import NamingDialog from "./NamingDialog.vue";
+import { createNamingController } from "../library/naming";
+import { COLUMN_EXPLANATIONS, COLUMN_PRESETS, columnDraftProblem, createColumn, presetDraft, type ColumnPreset } from "../library/columnPresets";
+import { fetchNaming } from "../library/api";
 import { createMirrorController } from "../library/mirror";
 import MirrorDialog from "./MirrorDialog.vue";
 import { createRetitleController } from "../library/retitle";
@@ -783,6 +787,36 @@ function openNote(field: string, itemName: string) {
   noteTarget.value = { field, itemName };
 }
 
+// One-click presets (edition, game line, volume): pick one, edit the name, create.
+const presetPicked = ref<{ preset: ColumnPreset; label: string; name: string; datatype: string } | null>(null);
+function pickColumnPreset(preset: ColumnPreset) {
+  presetPicked.value = { preset, ...presetDraft(preset) };
+  columnsError.value = null;
+}
+async function createPresetColumn() {
+  const d = presetPicked.value;
+  if (!d) return;
+  const problem = columnDraftProblem(d, Object.keys(customColumns.value));
+  if (problem) {
+    columnsError.value = problem;
+    return;
+  }
+  columnsError.value = null;
+  try {
+    await createColumn(d);
+    presetPicked.value = null;
+    await onColumnsChanged();
+  } catch (e) {
+    columnsError.value = e instanceof Error ? e.message : String(e);
+  }
+}
+/** A column was added or removed: the table's column picker, the category browser and the details follow without a reload. */
+async function onColumnsChanged() {
+  await loadCustomColumns();
+  categoriesRefresh.value++;
+  cacheBust.value++;
+}
+
 async function createCustomColumn() {
   if (!newColumnLabel.value.trim() || !newColumnName.value.trim()) return;
   columnsError.value = null;
@@ -790,7 +824,7 @@ async function createCustomColumn() {
     await addCustomColumn(newColumnLabel.value.trim(), newColumnName.value.trim(), newColumnDatatype.value);
     newColumnLabel.value = "";
     newColumnName.value = "";
-    await loadCustomColumns();
+    await onColumnsChanged();
   } catch (e) {
     columnsError.value = e instanceof Error ? e.message : String(e);
   }
@@ -801,7 +835,7 @@ async function removeCustomColumnClick(label: string) {
   columnsError.value = null;
   try {
     await removeCustomColumn(label);
-    await loadCustomColumns();
+    await onColumnsChanged();
   } catch (e) {
     columnsError.value = e instanceof Error ? e.message : String(e);
   }
@@ -1124,6 +1158,15 @@ function onCategorySelect(categoryQuery: string) {
 
 
 function onDetailsUpdated() {
+  cacheBust.value++;
+  void (ftsMode.value ? runFtsSearch() : runSearch());
+}
+
+/** Bumped to make the category browser (folders and categories) reload. */
+const categoriesRefresh = ref(0);
+
+/** Books were moved or a folder renamed: refresh the list in place (position kept). */
+function onFoldersChanged() {
   cacheBust.value++;
   void (ftsMode.value ? runFtsSearch() : runSearch());
 }
@@ -1540,7 +1583,9 @@ async function openRenameFiles() {
   renameBusy.value = true;
   try {
     const { results } = await renameFiles(ids, "{title}", true);
-    renameTemplate.value = initialRenameTemplate(results.map((r) => r.current));
+    const initial = initialRenameTemplate(results.map((r) => r.current));
+    // Several books (no single current name to start from): the library's convention.
+    renameTemplate.value = initial === DEFAULT_RENAME_TEMPLATE ? ((await conventionFileTemplate()) ?? initial) : initial;
   } catch {
     renameTemplate.value = DEFAULT_RENAME_TEMPLATE;
   } finally {
@@ -1636,9 +1681,40 @@ const organizeController = createOrganizeController();
 const organizeOpen = ref(false);
 /** Organize files: the selected books when there are any (select mode), else the open book is not assumed. */
 const organizeSelection = computed(() => (selectMode.value ? [...selectedIds.value] : []));
-function openOrganize() {
+async function openOrganize(prefill?: { template: string; scope: "selected" | "all" }) {
   organizeController.open(organizeSelection.value.length);
+  if (prefill) {
+    organizeController.state.draft.template = prefill.template;
+    organizeController.state.draft.scope = prefill.scope === "selected" && organizeSelection.value.length > 0 ? "selected" : "all";
+  } else {
+    // The library's naming convention is the default template; the dialog can still override it.
+    try {
+      organizeController.state.draft.template = (await fetchNaming()).combined;
+    } catch {
+      // The built-in default stays.
+    }
+  }
   organizeOpen.value = true;
+}
+
+// File naming: the library's folder and file naming convention.
+const namingController = createNamingController();
+const namingOpen = ref(false);
+const namingSampleIds = computed(() => (selectMode.value && selectedIds.value.size > 0 ? [...selectedIds.value].slice(0, 5) : selectedBookId.value !== null ? [selectedBookId.value] : []));
+function openNaming() {
+  namingOpen.value = true;
+}
+function applyNaming(template: string, scope: "selected" | "all") {
+  namingOpen.value = false;
+  void openOrganize({ template, scope });
+}
+/** The file name template new runs start from (the convention's), or null when it cannot be read. */
+async function conventionFileTemplate(): Promise<string | null> {
+  try {
+    return (await fetchNaming()).file_template;
+  } catch {
+    return null;
+  }
 }
 // Export a copy: a travel copy or a backup mirror to another folder or drive.
 // The scope follows the selection like Organize; nothing in the library changes.
@@ -1658,6 +1734,10 @@ function openRetitle(scope: "all" | "selected") {
   if (scope === "selected" && retitleSelection.value.length === 0) return;
   retitleController.open(scope);
   retitleOpen.value = true;
+  // Its rename template starts from the library's naming convention.
+  void conventionFileTemplate().then((t) => {
+    if (t && retitleController.state.rows.length === 0) retitleController.state.renameTemplate = t;
+  });
 }
 async function onRetitleChanged() {
   cacheBust.value++;
@@ -2191,7 +2271,8 @@ const actionHandlers: Partial<Record<LibraryActionId, () => void>> = {
   "custom-columns": () => openColumns(),
   "check-library": () => openCheckLibrary(),
   "find-duplicates": () => openDuplicates(),
-  "organize-files": () => openOrganize(),
+  "organize-files": () => void openOrganize(),
+  "file-naming": () => openNaming(),
   "export-copy": () => openMirror(),
   "fix-titles": () => openRetitle("all"),
   "fix-titles-selected": () => openRetitle("selected"),
@@ -3126,7 +3207,7 @@ watch(coloringRules, () => {
 
     <div class="body">
       <template v-if="sidebarVisible">
-        <CategoryBrowser class="sidebar" :style="{ width: sidebarWidth + 'px' }" @select="onCategorySelect" @view-note="openNote" @renamed="onCategoryRenamed" />
+        <CategoryBrowser class="sidebar" :style="{ width: sidebarWidth + 'px' }" :selected-ids="renameScope" :refresh-key="categoriesRefresh" @select="onCategorySelect" @view-note="openNote" @renamed="onCategoryRenamed" @folders-changed="onFoldersChanged" />
         <div
           class="splitter"
           role="separator"
@@ -3389,6 +3470,22 @@ watch(coloringRules, () => {
             </li>
             <li v-if="Object.keys(customColumns).length === 0">No custom columns yet.</li>
           </ul>
+          <div class="column-presets" data-testid="column-presets">
+            <h4>Quick add</h4>
+            <div class="preset-buttons">
+              <button v-for="p in COLUMN_PRESETS" :key="p.id" type="button" :data-testid="`preset-${p.id}`" :disabled="p.label in customColumns" :title="p.label in customColumns ? `#${p.label} already exists` : p.hint" @click="pickColumnPreset(p)">{{ p.title }}</button>
+            </div>
+            <form v-if="presetPicked" class="manage-form" data-testid="preset-form" @submit.prevent="createPresetColumn">
+              <input v-model="presetPicked.name" aria-label="Display name" data-testid="preset-name" required />
+              <code class="manage-query">#{{ presetPicked.label }} ({{ presetPicked.datatype }})</code>
+              <button type="submit" data-testid="preset-create">Create</button>
+            </form>
+            <p v-if="presetPicked" class="hint">Creates the column <code>#{{ presetPicked.label }}</code> as {{ presetPicked.datatype === "int" ? "a whole number" : "text" }}. {{ presetPicked.preset.hint }}</p>
+            <ul class="hint column-notes">
+              <li v-for="line in COLUMN_EXPLANATIONS" :key="line">{{ line }}</li>
+            </ul>
+          </div>
+          <h4>Or make your own</h4>
           <form class="manage-form" @submit.prevent="createCustomColumn">
             <input v-model="newColumnLabel" placeholder="Label (e.g. shelf)" pattern="[a-zA-Z0-9_]+" title="Letters, numbers, and underscores only" required />
             <input v-model="newColumnName" placeholder="Display name (e.g. Shelf)" required />
@@ -3549,6 +3646,7 @@ watch(coloringRules, () => {
     <ResolveDialog v-if="duplicatesOpen && resolveOpen" :store="dupStore" :controller="resolveController" @close="resolveOpen = false" @changed="onDuplicatesChanged" />
     <CompareDuplicates v-if="compareController.state.open" :controller="compareController" @close="compareController.close()" />
     <MirrorDialog v-if="mirrorOpen" :controller="mirrorController" :selected-ids="organizeSelection" @close="mirrorOpen = false" />
+    <NamingDialog v-if="namingOpen" :controller="namingController" :sample-ids="namingSampleIds" :selected-count="organizeSelection.length" @close="namingOpen = false" @apply="applyNaming" />
     <OrganizeDialog v-if="organizeOpen" :controller="organizeController" :selected-ids="organizeSelection" @close="organizeOpen = false" @changed="onDuplicatesChanged" />
     <RetitleDialog v-if="retitleOpen" :controller="retitleController" :selected-ids="retitleSelection" @close="retitleOpen = false" @changed="onRetitleChanged" />
 
@@ -4263,6 +4361,16 @@ watch(coloringRules, () => {
 }
 .manage-remove {
   color: var(--danger);
+}
+.preset-buttons {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.4rem;
+}
+.column-notes {
+  margin: 0.4rem 0;
+  padding-left: 1.1rem;
 }
 .manage-form {
   display: flex;

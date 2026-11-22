@@ -628,3 +628,93 @@ async fn move_books_numbers_a_taken_name_and_the_move_survives_a_rebuild() {
         assert_eq!(l.folder_of(id), "Pile", "book {id} after a rebuild");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Folders and the naming convention (tranche 19b)
+// ---------------------------------------------------------------------------
+
+async fn move_into(l: &Lib, id: i32, folder: &str) {
+    let (_, plan) = l.post("/move-books/default", json!({"book_ids": [id], "folder": folder})).await;
+    let (_, started) = l.post("/move-books/default", json!({"book_ids": [id], "folder": folder, "dry_run": false, "plan_fingerprint": plan["plan_fingerprint"]})).await;
+    l.wait_job(&started).await;
+}
+
+#[tokio::test]
+async fn library_folders_lists_nested_counts_and_an_empty_library_has_none() {
+    let l = lib();
+    let (status, tree) = l.get("/library-folders/default").await;
+    assert_eq!((status, tree["total"].as_u64(), tree["folders"].as_array().unwrap().len()), (StatusCode::OK, Some(0), 0));
+    let a = l.add("a.txt", "Alpha Primer", "Ada Lovelace", b"alpha");
+    let b = l.add("b.txt", "Totally Different", "Bob Writer", b"bravo");
+    move_into(&l, a, "Gaming/RPG/Rifts").await;
+    move_into(&l, b, "Gaming/RPG/Rifts/Sub").await;
+    let (_, tree) = l.get("/library-folders/default").await;
+    let rows: Vec<(String, u64, u64)> = tree["folders"].as_array().unwrap().iter().map(|f| (f["path"].as_str().unwrap().to_string(), f["books"].as_u64().unwrap(), f["books_here"].as_u64().unwrap())).collect();
+    assert_eq!(rows, [("Gaming".to_string(), 2, 0), ("Gaming/RPG".to_string(), 2, 0), ("Gaming/RPG/Rifts".to_string(), 2, 1), ("Gaming/RPG/Rifts/Sub".to_string(), 1, 1)]);
+
+    let (status, made) = l.post("/library-folders/default", json!({"path": "Gaming/RPG/Later"})).await;
+    assert_eq!((status, made["path"].as_str()), (StatusCode::OK, Some("Gaming/RPG/Later")));
+    assert!(l.path.join("Gaming/RPG/Later").is_dir());
+    assert_eq!(l.post("/library-folders/default", json!({"path": "../x"})).await.0, StatusCode::BAD_REQUEST);
+    let (_, tree) = l.get("/library-folders/default").await;
+    assert!(tree["folders"].as_array().unwrap().iter().any(|f| f["path"] == "Gaming/RPG/Later" && f["empty"] == true));
+    assert_eq!(l.post("/library-folders/delete/default", json!({"path": "Gaming/RPG/Later"})).await.0, StatusCode::OK);
+    assert!(!l.path.join("Gaming/RPG/Later").exists());
+}
+
+#[tokio::test]
+async fn rename_folder_previews_applies_undoes_and_refuses_a_collision() {
+    let l = lib();
+    let a = l.add("a.txt", "Alpha Primer", "Ada Lovelace", b"alpha");
+    let b = l.add("b.txt", "Totally Different", "Bob Writer", b"bravo");
+    move_into(&l, a, "Gaming/Rifts").await;
+    move_into(&l, b, "Gaming/Palladium").await;
+    let (status, _) = l.post("/rename-folder/default", json!({"from": "Gaming/Rifts", "to": "Gaming/Palladium"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a rename onto an existing folder is refused");
+    let (status, plan) = l.post("/rename-folder/default", json!({"from": "Gaming/Rifts", "to": "Gaming/Rifts RPG"})).await;
+    assert_eq!((status, plan["books"].as_u64()), (StatusCode::OK, Some(1)), "{plan}");
+    assert!(l.path.join("Gaming/Rifts").exists(), "a dry run moves nothing");
+    assert_eq!(l.post("/rename-folder/default", json!({"from": "Gaming/Rifts", "to": "Gaming/Rifts RPG", "dry_run": false, "plan_fingerprint": "nope"})).await.0, StatusCode::CONFLICT);
+    let (status, started) = l.post("/rename-folder/default", json!({"from": "Gaming/Rifts", "to": "Gaming/Rifts RPG", "dry_run": false, "plan_fingerprint": plan["plan_fingerprint"]})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{started}");
+    let job = l.wait_job(&started).await;
+    assert_eq!(l.folder_of(a), "Gaming/Rifts RPG");
+    let (status, undone) = l.post("/unorganize-library/default", json!({"run_id": job["report"]["run_id"]})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{undone}");
+    l.wait_job(&undone).await;
+    assert_eq!(l.folder_of(a), "Gaming/Rifts");
+}
+
+#[tokio::test]
+async fn the_naming_convention_round_trips_and_previews() {
+    let l = lib();
+    let a = l.add("a.txt", "Alpha Primer", "Ada Lovelace", b"alpha");
+    let (_, n) = l.get("/naming/default").await;
+    assert_eq!((n["combined"].as_str(), n["folder_template"].as_str()), (Some("{author_sort}/{title}"), Some("{author_sort}")));
+    let (status, saved) = l.call("PUT", "/naming/default", Some(json!({"folder_template": "Gaming/{series}", "file_template": "{series:|| }{title}"}))).await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(l.get("/naming/default").await.1["combined"], "Gaming/{series}/{series:|| }{title}");
+    assert_eq!(l.call("PUT", "/naming/default", Some(json!({"folder_template": "x", "file_template": ""}))).await.0, StatusCode::BAD_REQUEST);
+    let (status, p) = l.post("/naming-preview/default", json!({"folder_template": "Gaming/{series}", "file_template": "{series:|| }{title}", "book_ids": [a]})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(p["previews"][0]["path"], "Gaming/Alpha Primer.txt", "{p}");
+    // No template given to organize: the convention is the default.
+    let (_, plan) = l.post("/organize-library/default", json!({"book_ids": [a]})).await;
+    assert_eq!(plan["template"], "Gaming/{series}/{series:|| }{title}");
+}
+
+#[tokio::test]
+async fn a_text_custom_column_with_values_is_a_category_without_a_reload() {
+    let l = lib();
+    let a = l.add("a.txt", "Alpha Primer", "Ada Lovelace", b"alpha");
+    l.cache.add_custom_column("game_line", "Game line", "text", false).unwrap();
+    let (_, cats) = l.get("/ajax/categories").await;
+    assert!(!cats.as_array().unwrap().iter().any(|c| c["name"] == "Game line"), "no values yet, so nothing to browse");
+    l.cache.set_custom_column_value(a, "game_line", "Rifts").unwrap();
+    let (_, cats) = l.get("/ajax/categories").await;
+    let entry = cats.as_array().unwrap().iter().find(|c| c["name"] == "Game line").expect("the column is a category");
+    assert_eq!(entry["url"], "/ajax/category/#game_line");
+    let (status, page) = l.get("/ajax/category/%23game_line").await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!((page["category_name"].as_str(), page["items"][0]["name"].as_str(), page["items"][0]["count"].as_i64()), (Some("Game line"), Some("Rifts"), Some(1)));
+}

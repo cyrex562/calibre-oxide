@@ -78,7 +78,99 @@ fn apply_display_format(val: &str, fmt: &str) -> String {
     if fmt.is_empty() || val.is_empty() {
         return val.to_string();
     }
-    val.to_string()
+    python_format(val, fmt).unwrap_or_else(|| val.to_string())
+}
+
+/// The common part of Python's format-spec mini-language, enough for naming
+/// templates: `[[fill]align][sign][0][width][.precision][type]` with `s`
+/// (string), `d` (integral number) and `f` (fixed point) types, e.g. `0>2.0f`
+/// turns the series index `7.0` into `07`. Anything else (`e`, `g`, `,`, `#`,
+/// a spec that does not parse) returns `None` and the value is used as it is,
+/// which is also what a template with a bad spec has always done here.
+fn python_format(val: &str, fmt: &str) -> Option<String> {
+    let c: Vec<char> = fmt.chars().collect();
+    let is_align = |ch: char| "<>^=".contains(ch);
+    let (mut i, mut fill, mut align) = (0usize, ' ', None);
+    if c.len() >= 2 && is_align(c[1]) {
+        fill = c[0];
+        align = Some(c[1]);
+        i = 2;
+    } else if !c.is_empty() && is_align(c[0]) {
+        align = Some(c[0]);
+        i = 1;
+    }
+    let mut sign = '-';
+    if i < c.len() && "+- ".contains(c[i]) {
+        sign = c[i];
+        i += 1;
+    }
+    let mut zero = false;
+    if i < c.len() && c[i] == '0' {
+        zero = true;
+        i += 1;
+    }
+    let digits = |i: &mut usize| -> Option<usize> {
+        let start = *i;
+        while *i < c.len() && c[*i].is_ascii_digit() {
+            *i += 1;
+        }
+        (*i > start).then(|| c[start..*i].iter().collect::<String>().parse().ok()).flatten()
+    };
+    let width = digits(&mut i).unwrap_or(0);
+    let mut precision = None;
+    if i < c.len() && c[i] == '.' {
+        i += 1;
+        precision = Some(digits(&mut i)?);
+    }
+    let kind = match c.len() - i {
+        0 => None,
+        1 => Some(c[i]),
+        _ => return None,
+    };
+    let number = matches!(kind, Some('d' | 'f' | 'F'));
+    let (body, negative) = match kind {
+        Some('f' | 'F') => {
+            let x: f64 = val.trim().parse().ok()?;
+            (format!("{:.*}", precision.unwrap_or(6), x.abs()), x < 0.0)
+        }
+        Some('d') => {
+            let x: f64 = val.trim().parse().ok()?;
+            if x.fract() != 0.0 || precision.is_some() {
+                return None;
+            }
+            (format!("{}", x.abs() as i64), x < 0.0)
+        }
+        Some('s') | None => {
+            if zero || sign != '-' {
+                return None;
+            }
+            (match precision {
+                Some(p) => val.chars().take(p).collect(),
+                None => val.to_string(),
+            }, false)
+        }
+        _ => return None,
+    };
+    let sign_text = match (negative, sign) {
+        (true, _) => "-",
+        (false, '+') if number => "+",
+        (false, ' ') if number => " ",
+        _ => "",
+    };
+    if zero && align.is_none() {
+        align = Some('=');
+        fill = '0';
+    }
+    let align = align.unwrap_or(if number { '>' } else { '<' });
+    let len = sign_text.chars().count() + body.chars().count();
+    let pad = width.saturating_sub(len);
+    let fill_str = |n: usize| fill.to_string().repeat(n);
+    Some(match align {
+        '<' => format!("{sign_text}{body}{}", fill_str(pad)),
+        '^' => format!("{}{sign_text}{body}{}", fill_str(pad / 2), fill_str(pad - pad / 2)),
+        '=' => format!("{sign_text}{}{body}", fill_str(pad)),
+        _ => format!("{}{sign_text}{body}", fill_str(pad)),
+    })
 }
 
 /// Port of `TemplateFormatter.format_field`.
@@ -199,6 +291,30 @@ mod tests {
 
     fn source(pairs: &[(&str, &str)]) -> DictValueSource {
         DictValueSource::new(pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect())
+    }
+
+    #[test]
+    fn python_format_specs_pad_and_round_like_python() {
+        let f = |v: &str, s: &str| apply_display_format(v, s);
+        assert_eq!(f("7.0", "0>2.0f"), "07");
+        assert_eq!(f("7", "0>3.0f"), "007");
+        assert_eq!(f("12.0", "0>2.0f"), "12");
+        assert_eq!(f("7.5", ".1f"), "7.5");
+        assert_eq!(f("7.0", "03d"), "007");
+        assert_eq!(f("7.5", "d"), "7.5", "not an integer: left as it is");
+        assert_eq!(f("ab", ">4"), "  ab");
+        assert_eq!(f("ab", "*^6s"), "**ab**");
+        assert_eq!(f("abcdef", ".3"), "abc");
+        assert_eq!(f("-3.0", "05.1f"), "-03.0");
+        assert_eq!(f("3", "+.0f"), "+3");
+        assert_eq!(f("x", "garbage"), "x", "a spec that does not parse leaves the value");
+        assert_eq!(f("x", "0>2e"), "x");
+    }
+
+    #[test]
+    fn vformat_pads_a_numeric_field_and_keeps_conditional_text() {
+        let values = source(&[("series_index", "7.0"), ("series", "WWN"), ("edition", "")]);
+        assert_eq!(vformat("{series:|| }{series_index:|0>2.0f| - }{edition: (||)}x", &values, &PureCatalog, &PureFunctions).unwrap(), "WWN 07 - x");
     }
 
     #[test]

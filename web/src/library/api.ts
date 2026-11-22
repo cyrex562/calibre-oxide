@@ -2358,3 +2358,74 @@ export async function fetchMirrorTargets(): Promise<MirrorTarget[]> {
 export async function forgetMirrorTarget(target: string): Promise<MirrorTarget[]> {
   return (await jsonFetch<{ targets: MirrorTarget[] }>("/mirror-targets/remove/default", { ...JSON_POST, body: JSON.stringify({ target }) })).targets;
 }
+
+// ----- Folders and the naming convention (tranche 19b) ------------------
+
+export interface LibraryFolder {
+  /** `/`-separated, relative to the library. */
+  path: string;
+  /** Books in this folder and below it. */
+  books: number;
+  /** Books directly in it. */
+  books_here: number;
+  /** Made by the user and holding no books yet. */
+  empty: boolean;
+}
+
+/** The library's folder tree: one pass over the books' folders, counts include sub-folders. */
+export function fetchLibraryFolders(): Promise<{ total: number; folders: LibraryFolder[] }> {
+  return jsonFetch("/library-folders/default");
+}
+
+/** Makes an empty folder (the directory is created and remembered). */
+export function createLibraryFolder(path: string): Promise<{ path: string }> {
+  return jsonFetch("/library-folders/default", { ...JSON_POST, body: JSON.stringify({ path }) });
+}
+
+/** Removes an empty folder. */
+export function deleteLibraryFolder(path: string): Promise<{ ok: boolean }> {
+  return jsonFetch("/library-folders/delete/default", { ...JSON_POST, body: JSON.stringify({ path }) });
+}
+
+export type RenameFolderPlan = OrganizePlan & { from: string; to: string };
+
+/** The dry run of renaming a folder: every book in it moves, sub-folders and file names kept. */
+export function planRenameFolder(from: string, to: string): Promise<RenameFolderPlan> {
+  return jsonFetch<RenameFolderPlan>("/rename-folder/default", { ...JSON_POST, body: JSON.stringify({ from, to, dry_run: true }) });
+}
+
+/** Renames the previewed folder, as a job; undo with `undoOrganize`. */
+export function runRenameFolder(from: string, to: string, planFingerprint: string, handlers: LibraryJobHandlers<OrganizeReport> = {}): Promise<OrganizeReport> {
+  return runLibraryJob<OrganizeReport>("/rename-folder/default", handlers, { from, to, dry_run: false, plan_fingerprint: planFingerprint });
+}
+
+export interface NamingConvention {
+  folder_template: string;
+  file_template: string;
+  /** `folder/file`, the one template organize takes. */
+  combined: string;
+  defaults: { folder_template: string; file_template: string };
+}
+
+export interface NamingPreview {
+  book_id: number;
+  title: string;
+  folder: string | null;
+  file: string | null;
+  /** `folder/file.ext` as organize would place it. */
+  path: string | null;
+  error: string | null;
+}
+
+export function fetchNaming(): Promise<NamingConvention> {
+  return jsonFetch("/naming/default");
+}
+
+export function saveNaming(folderTemplate: string, fileTemplate: string): Promise<NamingConvention> {
+  return jsonFetch("/naming/default", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ folder_template: folderTemplate, file_template: fileTemplate }) });
+}
+
+/** Runs the templates over up to 5 books (those given, else spread over the library). */
+export function previewNaming(folderTemplate: string, fileTemplate: string, bookIds?: number[]): Promise<{ previews: NamingPreview[]; combined: string }> {
+  return jsonFetch("/naming-preview/default", { ...JSON_POST, body: JSON.stringify({ folder_template: folderTemplate, file_template: fileTemplate, ...(bookIds && bookIds.length > 0 ? { book_ids: bookIds } : {}) }) });
+}
