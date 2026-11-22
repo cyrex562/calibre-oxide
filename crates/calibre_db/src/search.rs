@@ -765,6 +765,8 @@ enum LocationKind {
     KeyPair(&'static str, Option<&'static str>),
     Text(&'static str),
     MultiText(&'static str, &'static str),
+    /// `folder:` -- the book's `path` is this folder or inside it, by whole path segment.
+    Folder,
 }
 
 /// Fixed field-name -> location table standing in for
@@ -786,6 +788,7 @@ fn resolve_location(loc: &str) -> Option<LocationKind> {
         "comments" | "comment" => LocationKind::Text("comments"),
         "uuid" => LocationKind::Text("uuid"),
         "path" => LocationKind::Text("path"),
+        "folder" => LocationKind::Folder,
         "id" => LocationKind::Numeric("id", NumDatatype::Int),
         "series_index" => LocationKind::Numeric("series_index", NumDatatype::Float),
         "rating" => LocationKind::Numeric("rating", NumDatatype::Rating),
@@ -830,6 +833,7 @@ fn search_locations(cache: &Cache) -> Vec<String> {
         "comment",
         "uuid",
         "path",
+        "folder",
         "id",
         "series_index",
         "rating",
@@ -967,6 +971,20 @@ fn custom_column_matches(
     }
 }
 
+/// A folder as `folder:` compares it: `/`-separated, no leading or trailing
+/// separator, case-folded (Windows volumes are case-insensitive).
+fn normalize_folder(folder: &str) -> String {
+    let parts: Vec<&str> = folder.split(['/', '\\']).map(str::trim).filter(|p| !p.is_empty() && *p != ".").collect();
+    icu_lower(&parts.join("/"))
+}
+
+/// Whether the book `path` is `wanted` or inside it, by whole segment: `Rift`
+/// holds `Rift` and `Rift/Core` but not `Rifts`.
+fn folder_contains(wanted: &str, path: &str) -> bool {
+    let path = normalize_folder(path);
+    path == wanted || path.strip_prefix(wanted).is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// Port of `Parser.get_matches`, narrowed to the fixed location table
 /// above. Unknown locations match nothing (same as upstream: `if
 /// location not in self.all_search_locations: return matches`).
@@ -1050,6 +1068,18 @@ fn get_matches(
             for (val, ids) in fetch_grouped(cache, field, candidates)? {
                 if let Some(v) = val {
                     if text_match(&q, &[v], mk, true, false)? {
+                        matches.extend(ids);
+                    }
+                }
+            }
+            Ok(matches)
+        }
+        LocationKind::Folder => {
+            let wanted = normalize_folder(query);
+            let mut matches = HashSet::new();
+            for (val, ids) in fetch_grouped(cache, "path", candidates)? {
+                if let Some(v) = val {
+                    if folder_contains(&wanted, &v) {
                         matches.extend(ids);
                     }
                 }
@@ -1555,6 +1585,46 @@ mod tests {
             .unwrap();
         }
         book_id
+    }
+
+    fn book_at(cache: &Cache, title: &str, path: &str) -> i32 {
+        let id = insert_book(cache, title, &[], &[]);
+        cache.backend.conn.lock().unwrap().execute("UPDATE books SET path = ? WHERE id = ?", rusqlite::params![path, id]).unwrap();
+        id
+    }
+
+    #[test]
+    fn folder_search_matches_whole_path_segments_only() {
+        let (_dir, cache) = make_cache();
+        let rift = book_at(&cache, "A", "Gaming/RPG/Rift");
+        let core = book_at(&cache, "B", "Gaming/RPG/Rift/Core");
+        let rifts = book_at(&cache, "C", "Gaming/RPG/Rifts");
+        let rpg = book_at(&cache, "D", "Gaming/RPG");
+        let other = book_at(&cache, "E", "Reference");
+        let s = |q: &str| search(&cache, q).unwrap();
+        assert_eq!(s("folder:\"Gaming/RPG/Rift\""), vec![rift, core], "Rift is not Rifts");
+        assert_eq!(s("folder:\"Gaming/RPG/Rifts\""), vec![rifts]);
+        assert_eq!(s("folder:\"Gaming/RPG\""), vec![rift, core, rifts, rpg]);
+        assert_eq!(s("folder:Gaming"), vec![rift, core, rifts, rpg]);
+        assert_eq!(s("folder:Reference"), vec![other]);
+        assert_eq!(s("folder:Gam"), Vec::<i32>::new(), "a partial segment is not a folder");
+        // Case, stray separators and a leading dot segment do not matter.
+        assert_eq!(s("folder:\"gaming/rpg/\""), vec![rift, core, rifts, rpg]);
+        assert_eq!(s("folder:\"/Gaming//RPG/./Rift\""), vec![rift, core]);
+        // It combines with the rest of the language.
+        assert_eq!(s("folder:Gaming and not folder:\"Gaming/RPG/Rift\""), vec![rifts, rpg]);
+    }
+
+    #[test]
+    fn folder_search_treats_backslashes_and_regex_characters_as_plain_text() {
+        let (_dir, cache) = make_cache();
+        let win = book_at(&cache, "W", "Gaming\\RPG\\Rift");
+        let paren = book_at(&cache, "P", "Games (old)/A+B");
+        assert_eq!(search(&cache, "folder:\"Gaming/RPG\"").unwrap(), vec![win], "a Windows-style stored path still matches");
+        assert_eq!(search(&cache, "folder:\"Gaming\\\\RPG\"").unwrap(), vec![win], "and so does a backslash in the query");
+        assert_eq!(search(&cache, "folder:\"Games (old)/A+B\"").unwrap(), vec![paren]);
+        assert_eq!(search(&cache, "folder:\"Games (old)\"").unwrap(), vec![paren]);
+        assert_eq!(search(&cache, "folder:~.*").unwrap(), Vec::<i32>::new(), "no regex or `=` operators: the text is the folder");
     }
 
     #[test]
