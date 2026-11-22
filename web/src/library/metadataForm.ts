@@ -54,9 +54,10 @@ export function cloneForm(form: MetaForm): MetaForm {
 export function isFormDirty(form: MetaForm, baseline: MetaForm): boolean {
   const { custom: c1, ...rest1 } = form;
   const { custom: c2, ...rest2 } = baseline;
-  if (JSON.stringify(rest1) !== JSON.stringify(rest2)) return true;
+  // A number input hands back a number for what was filled in as a string.
+  if (JSON.stringify({ ...rest1, seriesIndex: String(rest1.seriesIndex ?? "") }) !== JSON.stringify({ ...rest2, seriesIndex: String(rest2.seriesIndex ?? "") })) return true;
   const keys = new Set([...Object.keys(c1), ...Object.keys(c2)]);
-  for (const k of keys) if ((c1[k] ?? "") !== (c2[k] ?? "")) return true;
+  for (const k of keys) if (String(c1[k] ?? "") !== String(c2[k] ?? "")) return true;
   return false;
 }
 
@@ -74,13 +75,13 @@ export function changesFromForm(form: MetaForm, customFields: FieldMetaEntry[]):
   // Sent only when set: an empty string is not a date, and clearing
   // the field should leave the stored value alone.
   if (form.pubdate.trim() !== "") changes.pubdate = form.pubdate;
-  if (form.seriesIndex.trim() !== "") {
+  if (String(form.seriesIndex ?? "").trim() !== "") {
     const idx = Number(form.seriesIndex);
     if (!Number.isNaN(idx)) changes.series_index = idx;
   }
   for (const field of customFields) {
     if (!field.is_editable) continue;
-    changes[field.label] = form.custom[field.label] ?? "";
+    changes[field.label] = String(form.custom[field.label] ?? "");
   }
   return changes;
 }

@@ -1425,7 +1425,7 @@ watch(
   /* Fits the panel width; the panel itself is resizable. */
   display: block;
   width: 100%;
-  max-height: 60vh;
+  max-height: 45vh;
   object-fit: contain;
 }
 .cover-button {

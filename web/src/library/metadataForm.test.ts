@@ -83,3 +83,15 @@ describe("drafts", () => {
     expect(store.take(1)).toBeNull();
   });
 });
+
+describe("number inputs", () => {
+  it("copes with v-model handing back numbers for string fields", () => {
+    const base = formFromBook(book, [edition]);
+    const form = cloneForm(base) as unknown as Record<string, unknown>;
+    form.seriesIndex = 1; // what a number input produces for "1"
+    expect(isFormDirty(form as never, base)).toBe(false);
+    form.seriesIndex = 2.5;
+    expect(isFormDirty(form as never, base)).toBe(true);
+    expect(changesFromForm(form as never, []).series_index).toBe(2.5);
+  });
+});

@@ -419,6 +419,7 @@ function startResize(which: Panel, event: PointerEvent) {
 
 const columnPickerOpen = ref(false);
 
+
 function setColumnKeys(columns: string[]) {
   tablePrefs.value = { ...tablePrefs.value, columns };
   void saveTablePrefs();
@@ -539,6 +540,13 @@ async function renameSavedSearchPrompt(name: string) {
 // that module's own doc) -- a real, disclosed narrowing rather than a
 // checkbox that would look like it works but doesn't.
 const columnsOpen = ref(false);
+
+// A custom column made (or removed) in the Custom columns dialog must
+// show up in the column picker without a reload: re-read the field
+// metadata when that dialog closes.
+watch(columnsOpen, (open, was) => {
+  if (was && !open) void loadMetadata();
+});
 const columnsError = ref<string | null>(null);
 const customColumns = ref<Record<string, CustomColumnInfo>>({});
 const newColumnLabel = ref("");
@@ -4360,6 +4368,11 @@ watch(coloringRules, () => {
 }
 .column-row .field {
   flex: 1;
+}
+.column-row .field.checkbox {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.4rem;
 }
 .column-row[draggable="true"] {
   cursor: grab;
