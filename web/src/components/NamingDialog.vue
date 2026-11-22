@@ -64,7 +64,7 @@ async function saveAndApply(scope: "selected" | "all") {
           <li v-for="p in state.previews" :key="p.book_id">
             <span class="path">{{ p.path ?? "—" }}</span>
             <span v-if="p.error" class="error"> {{ p.error }}</span>
-            <span class="hint"> {{ p.title }}</span>
+            <span class="hint title">{{ p.title }}</span>
           </li>
         </ul>
       </section>
@@ -163,6 +163,9 @@ async function saveAndApply(scope: "selected" | "all") {
 .path {
   font-family: monospace;
   overflow-wrap: anywhere;
+}
+.title {
+  margin-left: 0.75rem;
 }
 .tokens dl {
   display: grid;

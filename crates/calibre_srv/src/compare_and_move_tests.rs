@@ -702,3 +702,19 @@ async fn the_naming_convention_round_trips_and_previews() {
     let (_, plan) = l.post("/organize-library/default", json!({"book_ids": [a]})).await;
     assert_eq!(plan["template"], "Gaming/{series}/{series:|| }{title}");
 }
+
+#[tokio::test]
+async fn a_text_custom_column_with_values_is_a_category_without_a_reload() {
+    let l = lib();
+    let a = l.add("a.txt", "Alpha Primer", "Ada Lovelace", b"alpha");
+    l.cache.add_custom_column("game_line", "Game line", "text", false).unwrap();
+    let (_, cats) = l.get("/ajax/categories").await;
+    assert!(!cats.as_array().unwrap().iter().any(|c| c["name"] == "Game line"), "no values yet, so nothing to browse");
+    l.cache.set_custom_column_value(a, "game_line", "Rifts").unwrap();
+    let (_, cats) = l.get("/ajax/categories").await;
+    let entry = cats.as_array().unwrap().iter().find(|c| c["name"] == "Game line").expect("the column is a category");
+    assert_eq!(entry["url"], "/ajax/category/#game_line");
+    let (status, page) = l.get("/ajax/category/%23game_line").await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!((page["category_name"].as_str(), page["items"][0]["name"].as_str(), page["items"][0]["count"].as_i64()), (Some("Game line"), Some("Rifts"), Some(1)));
+}

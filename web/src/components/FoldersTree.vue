@@ -14,6 +14,8 @@ import {
 } from "../library/folders";
 import ContextMenu, { type ContextMenuEntry } from "./ContextMenu.vue";
 
+const vFocus = { mounted: (el: HTMLElement) => el.focus() };
+
 const props = defineProps<{ selectedIds: number[]; refreshKey: number }>();
 const emit = defineEmits<{ select: [query: string, label: string]; changed: [] }>();
 
@@ -184,12 +186,14 @@ function planTitle(): string {
 
 <template>
   <section class="folders" aria-label="Folders">
-    <button type="button" class="folders-toggle" :aria-expanded="open" @click="open = !open">
-      <span class="twisty" aria-hidden="true">{{ open ? "▾" : "▸" }}</span>
-      <span class="folders-name">Folders</span>
-      <span class="count">{{ total }}</span>
-      <span class="folders-add" role="button" tabindex="0" title="New top-level folder" data-testid="new-root-folder" @click.stop="askNew('')" @keydown.enter.stop="askNew('')">+</span>
-    </button>
+    <div class="folders-head">
+      <button type="button" class="folders-toggle" :aria-expanded="open" @click="open = !open">
+        <span class="twisty" aria-hidden="true">{{ open ? "▾" : "▸" }}</span>
+        <span class="folders-name">Folders</span>
+        <span class="count">{{ total }}</span>
+      </button>
+      <button type="button" class="folders-add" title="New top-level folder" aria-label="New top-level folder" data-testid="new-root-folder" @click="askNew('')">+</button>
+    </div>
     <p v-if="error" class="error">{{ error }}</p>
     <ul v-if="open" class="folder-list" data-testid="folder-list">
       <li v-if="rows.length === 0" class="folder-note">No folders yet. Books at the library's top level are not in a folder.</li>
@@ -219,7 +223,7 @@ function planTitle(): string {
     <div v-if="prompt" class="folder-backdrop" @click.self="prompt = null">
       <form class="folder-dialog" role="dialog" :aria-label="prompt.kind === 'new' ? 'New subfolder' : 'Rename folder'" @submit.prevent="submitPrompt">
         <h3>{{ prompt.kind === "new" ? (prompt.path ? `New subfolder in ${prompt.path}` : "New folder") : `Rename ${prompt.path}` }}</h3>
-        <input v-model="prompt.value" type="text" autofocus data-testid="folder-name" spellcheck="false" placeholder="Folder name" />
+        <input v-model="prompt.value" type="text" v-focus data-testid="folder-name" spellcheck="false" placeholder="Folder name" />
         <p v-if="prompt.kind === 'new'" class="hint">An empty folder is made on disk and stays in the tree until you remove it.</p>
         <p v-else class="hint">Every book in it moves, with its sub-folders and file names. You will see the plan first, and can undo it.</p>
         <p v-if="prompt.error" class="error" role="alert">{{ prompt.error }}</p>
@@ -233,7 +237,7 @@ function planTitle(): string {
     <div v-if="flowOpen && state.action" class="folder-backdrop" @click.self="state.phase !== 'running' && closeFlow()">
       <div class="folder-dialog" role="dialog" :aria-label="planTitle()" data-testid="folder-flow">
         <h3>{{ planTitle() }}</h3>
-        <template v-if="state.plan && (state.phase === 'confirm' || state.phase === 'running')">
+        <template v-if="state.plan && (state.phase === 'confirm' || (state.phase === 'running' && !state.report))">
           <p role="status" data-testid="folder-plan">{{ describeFolderPlan(state.action, state.plan) }}</p>
           <ul class="moves">
             <li v-for="(m, i) in state.plan.moves.slice(0, 8)" :key="i"><span class="path">{{ m.from }} → {{ m.to }}</span></li>
@@ -242,13 +246,13 @@ function planTitle(): string {
           <p class="hint">Nothing is overwritten (a name already taken gets a number), and the run can be undone.</p>
         </template>
         <p v-if="state.phase === 'running'" class="hint" role="status">{{ state.progress }}</p>
-        <p v-if="state.report" role="status" data-testid="folder-report">{{ describeFolderReport(state.report) }}</p>
+        <p v-if="state.report && state.phase !== 'running'" role="status" data-testid="folder-report">{{ describeFolderReport(state.report) }}</p>
         <p v-if="state.undone" role="status">{{ state.undone }}</p>
         <p v-if="state.error" class="error" role="alert">{{ state.error }}</p>
         <div class="buttons">
           <button v-if="state.phase === 'confirm'" type="button" data-testid="folder-run" @click="runFlow">{{ state.action.kind === "move" ? "Move" : "Rename" }} {{ state.plan?.books.toLocaleString("en-US") }} book{{ state.plan?.books === 1 ? "" : "s" }}</button>
           <button v-if="state.phase === 'done'" type="button" data-testid="folder-undo" @click="flow.undo()">Undo</button>
-          <button type="button" :disabled="state.phase === 'running'" @click="closeFlow">{{ state.phase === "done" ? "Close" : "Cancel" }}</button>
+          <button type="button" :disabled="state.phase === 'running'" @click="closeFlow">{{ state.phase === "done" || state.undone ? "Close" : "Cancel" }}</button>
         </div>
       </div>
     </div>
@@ -288,8 +292,18 @@ function planTitle(): string {
 .folders-name {
   flex: 1;
 }
+.folders-head {
+  display: flex;
+  align-items: center;
+}
+.folders-head .folders-toggle {
+  flex: 1;
+}
 .folders-add {
-  padding: 0 var(--sp-2);
+  height: 22px;
+  padding: 0 var(--sp-3);
+  border: none;
+  background: none;
   color: var(--fg-muted);
   cursor: pointer;
 }
