@@ -507,7 +507,7 @@ function hint(column: BookColumn): string {
             v-if="getBook(ids[i])"
             :data-id="ids[i]"
             tabindex="0"
-            draggable="true"
+            :draggable="editing?.id === ids[i] ? 'false' : 'true'"
             @dragstart="onRowDragStart(ids[i], $event)"
             :class="{ selected: selectMode ? selectedIds.has(ids[i]) : selectedBookId === ids[i] }"
             :style="rowColors?.[ids[i]] ? { color: rowColors[ids[i]] } : undefined"
