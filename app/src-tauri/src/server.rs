@@ -133,7 +133,10 @@ pub fn resolve_pdfium(app: &AppHandle) -> Option<PathBuf> {
 /// path anyway.
 pub fn spawn(bin: &Path, library_path: &Path, static_dir: &Path, port: u16, pdfium: Option<&Path>, also_serve: &[PathBuf], log: Option<std::fs::File>) -> io::Result<Child> {
     let mut cmd = Command::new(bin);
-    cmd.arg(library_path).arg("--static-dir").arg(static_dir).arg("--port").arg(port.to_string());
+    // Loopback only: the desktop app's server is private to this machine.
+    // The server's own default (0.0.0.0, as calibre's) would expose the
+    // library to the LAN with no login and trigger a firewall prompt.
+    cmd.arg(library_path).arg("--static-dir").arg(static_dir).arg("--port").arg(port.to_string()).arg("--listen-on").arg("127.0.0.1");
     for other in also_serve {
         // A library the user has since deleted or unplugged must not stop
         // the app from starting; `LibraryBroker::new` skips a path with no
