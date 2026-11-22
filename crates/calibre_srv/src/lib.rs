@@ -208,6 +208,7 @@ pub mod library_trash;
 pub mod absorb_library;
 pub mod library_mirror;
 pub mod organize_library;
+pub mod library_folders;
 pub mod retitle_library;
 pub mod import_folder;
 pub mod render_endpoints;
@@ -397,6 +398,11 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/move-books/{library_id}", post(organize_library::move_books))
         .route("/unorganize-library/{library_id}", post(organize_library::unorganize))
         .route("/organize-runs/{library_id}", get(organize_library::runs))
+        .route("/library-folders/{library_id}", get(library_folders::list).post(library_folders::create))
+        .route("/library-folders/delete/{library_id}", post(library_folders::delete))
+        .route("/rename-folder/{library_id}", post(library_folders::rename))
+        .route("/naming/{library_id}", get(library_folders::naming_get).put(library_folders::naming_put))
+        .route("/naming-preview/{library_id}", post(library_folders::naming_preview))
         .route("/mirror-library/{library_id}", post(library_mirror::mirror_library))
         .route("/mirror-targets/{library_id}", get(library_mirror::targets))
         .route("/mirror-targets/remove/{library_id}", post(library_mirror::forget_target))
