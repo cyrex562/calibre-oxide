@@ -3234,6 +3234,7 @@ watch(coloringRules, () => {
             @updated="onDetailsUpdated"
             @deleted="onDetailsDeleted"
             @open-book="selectedBookId = $event"
+            @step-book="onNavigate($event > 0 ? 'ArrowDown' : 'ArrowUp')"
           />
         </aside>
       </template>

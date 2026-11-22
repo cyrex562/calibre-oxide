@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { BookSummary } from "./types";
 
 import { autoFitWidth, CHECK_COLUMN_WIDTH, dropIndex, isDrag, moveKeyBy, moveKeyTo, pickerOrder, resetColumnPrefs, resizedColumnWidth, tableWidth, toggleKey } from "./columnLayout";
 import { clampWidth, columnsFor, DEFAULT_TABLE_PREFS, DEFAULT_VISIBLE_KEYS, formatCell, MAX_COLUMN_WIDTH, MIN_COLUMN_WIDTH, resolveColumns } from "./columns";
@@ -112,8 +113,8 @@ describe("series number column", () => {
     expect(DEFAULT_TABLE_PREFS.columns).toContain("series_index");
   });
   it("formats 2 and 2.5, and is empty without a series", () => {
-    expect(formatCell({ id: 1, title: "x", series: "S", series_index: 2 }, col)).toBe("2");
-    expect(formatCell({ id: 1, title: "x", series: "S", series_index: 2.5 }, col)).toBe("2.5");
-    expect(formatCell({ id: 1, title: "x", series: null, series_index: 1 }, col)).toBe("");
+    expect(formatCell({ id: 1, title: "x", series: "S", series_index: 2 } as BookSummary, col)).toBe("2");
+    expect(formatCell({ id: 1, title: "x", series: "S", series_index: 2.5 } as BookSummary, col)).toBe("2.5");
+    expect(formatCell({ id: 1, title: "x", series: null, series_index: 1 } as BookSummary, col)).toBe("");
   });
 });
