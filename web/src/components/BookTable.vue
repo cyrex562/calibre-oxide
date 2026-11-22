@@ -17,6 +17,7 @@ import { formatCell, MAX_COLUMN_WIDTH, MIN_COLUMN_WIDTH, nextSort, type BookColu
 import { defaultEditKey, editKeyAction, initialText, isEditable, isEmptyCell, neighbourEditableKey, startsEditing, type CommitResult } from "../library/inlineEdit";
 import type { BookSummary } from "../library/types";
 import { windowRange } from "../library/virtualList";
+import { dragIds, setBooksDrag } from "../library/folders";
 
 /** Height of one row, in pixels. Fixed: virtual scrolling depends on it. */
 const ROW_HEIGHT = 30;
@@ -184,6 +185,11 @@ function endResize(event: PointerEvent) {
 // ---------------------------------------------------------------
 // Rows
 // ---------------------------------------------------------------
+
+/** Dragging a row to a folder in the category browser carries the selection (or the row alone). */
+function onRowDragStart(bookId: number, event: DragEvent) {
+  if (event.dataTransfer) setBooksDrag(event.dataTransfer, dragIds(bookId, props.selectedIds, props.selectMode));
+}
 
 function onRowClick(bookId: number, event?: MouseEvent) {
   if (props.selectMode) {
@@ -381,6 +387,8 @@ function hint(column: BookColumn): string {
             v-if="getBook(ids[i])"
             :data-id="ids[i]"
             tabindex="0"
+            draggable="true"
+            @dragstart="onRowDragStart(ids[i], $event)"
             :class="{ selected: selectMode ? selectedIds.has(ids[i]) : selectedBookId === ids[i] }"
             :style="rowColors?.[ids[i]] ? { color: rowColors[ids[i]] } : undefined"
             @click="onRowClick(ids[i], $event)"

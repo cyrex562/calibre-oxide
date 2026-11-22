@@ -13,7 +13,7 @@
 //
 // See docs/UI_DESIGN.md §3.3.
 
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
 
 import { fetchCategories, fetchCategory, renameCategoryItem } from "../library/api";
 import {
@@ -23,8 +23,12 @@ import {
 import { categoryItemToQuery } from "../library/query";
 import type { CategoryEntry, CategoryItem } from "../library/types";
 import ContextMenu, { type ContextMenuEntry } from "./ContextMenu.vue";
+import FoldersTree from "./FoldersTree.vue";
 
-const emit = defineEmits<{ select: [query: string, label: string]; "view-note": [field: string, itemName: string]; renamed: [] }>();
+// `selectedIds` feeds "Move selected books here" in the Folders tree; bumping
+// `refreshKey` reloads the tree and the categories (a column or a move changed them).
+const props = withDefaults(defineProps<{ selectedIds?: number[]; refreshKey?: number }>(), { selectedIds: () => [], refreshKey: 0 });
+const emit = defineEmits<{ select: [query: string, label: string]; "view-note": [field: string, itemName: string]; renamed: []; "folders-changed": [] }>();
 
 const categories = ref<CategoryEntry[]>([]);
 const error = ref<string | null>(null);
@@ -64,6 +68,11 @@ async function load() {
   }
 }
 void load();
+
+watch(() => props.refreshKey, () => {
+  itemsByCategory.value = {};
+  void load();
+});
 
 /** Fetches a category's items once. Repeat calls are free. */
 async function ensureItems(key: CategoryKey) {
@@ -221,6 +230,8 @@ const findOpen = ref(false);
     <p v-if="!error && categories.length === 0" class="cat-empty">
       Nothing to browse yet. Authors, series and tags appear here once the library has books.
     </p>
+
+    <FoldersTree :selected-ids="selectedIds" :refresh-key="refreshKey" @select="(q, l) => emit('select', q, l)" @changed="emit('folders-changed')" />
 
     <ul class="cat-list">
       <li v-for="cat in categories" :key="cat.url">
