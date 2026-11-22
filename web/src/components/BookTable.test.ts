@@ -12,7 +12,7 @@
 // plain props with no router, store or network behind it.
 
 import { createApp, nextTick, shallowReactive, type App } from "vue";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import BookTable from "./BookTable.vue";
 import { columnsFor, resolveColumns, DEFAULT_TABLE_PREFS, type BookColumn } from "../library/columns";
@@ -211,6 +211,94 @@ describe("column widths", () => {
   it("gives every column a resize handle", () => {
     const { el } = mount();
     expect(el.querySelectorAll("thead .resize-handle")).toHaveLength(COLUMNS.length);
+  });
+
+  it("is exactly as wide as its columns, so a wide table scrolls instead of squeezing", () => {
+    const { el } = mount();
+    const sum = COLUMNS.reduce((s, c) => s + c.width, 0);
+    const table = el.querySelector<HTMLElement>("table.book-table")!;
+    expect(table.style.width).toBe(`${sum}px`);
+    expect(el.querySelectorAll("colgroup col")).toHaveLength(COLUMNS.length);
+  });
+});
+
+function pointer(type: string, x: number, y = 0) {
+  return new MouseEvent(type, { clientX: x, clientY: y, bubbles: true, cancelable: true, button: 0 });
+}
+
+describe("resizing", () => {
+  it("grows and shrinks live while dragging a handle, and never sorts", () => {
+    const { el, emitted } = mount();
+    const handle = el.querySelector<HTMLElement>("thead th .resize-handle")!;
+    const start = COLUMNS[0].width;
+    handle.dispatchEvent(pointer("pointerdown", 100));
+    handle.dispatchEvent(pointer("pointermove", 160));
+    handle.dispatchEvent(pointer("pointermove", 40));
+    handle.dispatchEvent(pointer("pointerup", 40));
+    expect(emitted.resize.map((r) => r.width)).toEqual([start + 60, start - 60]);
+    expect(emitted.sortBy).toEqual([]);
+  });
+
+  it("stops at the minimum width", () => {
+    const { el, emitted } = mount();
+    const handle = el.querySelector<HTMLElement>("thead th .resize-handle")!;
+    handle.dispatchEvent(pointer("pointerdown", 1000));
+    handle.dispatchEvent(pointer("pointermove", 0));
+    expect(emitted.resize[emitted.resize.length - 1].width).toBe(40);
+  });
+
+  it("double-click auto-fits to the header and the loaded rows", () => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null);
+    const longTitle = "A very very long title indeed, much longer than the default column";
+    const { el, emitted } = mount({ getBook: (id: number) => ({ ...book(id), title: longTitle }) });
+    el.querySelector<HTMLElement>("thead th .resize-handle")!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    // jsdom has no canvas: 7px per character stands in for the measurement.
+    expect(emitted.resize[emitted.resize.length - 1]).toEqual({ key: COLUMNS[0].key, width: Math.min(900, longTitle.length * 7 + 28) });
+  });
+});
+
+describe("reordering columns", () => {
+  function stubSpans(el: HTMLElement) {
+    el.querySelectorAll<HTMLElement>("thead th[data-key]").forEach((th, i) => {
+      th.getBoundingClientRect = () => ({ left: i * 100, right: i * 100 + 100, top: 0, bottom: 30, width: 100, height: 30, x: i * 100, y: 0, toJSON: () => ({}) });
+    });
+  }
+
+  it("dragging a header past the threshold emits a reorder, not a sort", () => {
+    const reorders: { key: string; index: number }[] = [];
+    const { el, emitted } = mount({ onReorder: (v: { key: string; index: number }) => reorders.push(v) });
+    stubSpans(el);
+    const th = el.querySelector<HTMLElement>("thead th[data-key]")!;
+    th.dispatchEvent(pointer("pointerdown", 50));
+    th.dispatchEvent(pointer("pointermove", 260));
+    th.dispatchEvent(pointer("pointerup", 260));
+    expect(reorders).toEqual([{ key: COLUMNS[0].key, index: 3 }]);
+    th.querySelector("button")!.click(); // the click a browser fires after a drag
+    expect(emitted.sortBy).toEqual([]);
+  });
+
+  it("a press that barely moves is still a click that sorts", () => {
+    const reorders: unknown[] = [];
+    const { el, emitted } = mount({ onReorder: (v: unknown) => reorders.push(v) });
+    stubSpans(el);
+    const th = el.querySelector<HTMLElement>("thead th[data-key]")!;
+    th.dispatchEvent(pointer("pointerdown", 50));
+    th.dispatchEvent(pointer("pointermove", 52));
+    th.dispatchEvent(pointer("pointerup", 52));
+    th.querySelector("button")!.click();
+    expect(reorders).toEqual([]);
+    expect(emitted.sortBy).toHaveLength(1);
+  });
+
+  it("dropping where it already is changes nothing", () => {
+    const reorders: unknown[] = [];
+    const { el } = mount({ onReorder: (v: unknown) => reorders.push(v) });
+    stubSpans(el);
+    const th = el.querySelector<HTMLElement>("thead th[data-key]")!;
+    th.dispatchEvent(pointer("pointerdown", 50));
+    th.dispatchEvent(pointer("pointermove", 70));
+    th.dispatchEvent(pointer("pointerup", 70));
+    expect(reorders).toEqual([]);
   });
 });
 

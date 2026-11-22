@@ -41,6 +41,8 @@ export interface BookColumn {
   sortKey?: string;
   /** Column width in pixels. */
   width: number;
+  /** Hover text for the header, when the label alone is not enough. */
+  tooltip?: string;
   /** How a cell in this column is edited in place; absent means read-only. */
   editor?: CellEditor;
 }
@@ -62,15 +64,15 @@ export type CellEditor =
  * Deliberately not "everything": a first run should be readable, and
  * the rest are one click away in the column picker.
  */
-export const DEFAULT_VISIBLE_KEYS = ["title", "authors", "series", "tags", "publisher", "timestamp", "formats"];
+export const DEFAULT_VISIBLE_KEYS = ["title", "authors", "series", "series_index", "tags", "publisher", "timestamp", "formats"];
 
 /** Per-field display rules, keyed by the book row's own key. */
-const KNOWN_COLUMNS: Record<string, { label: string; kind: ColumnKind; width: number; editor?: CellEditor }> = {
+const KNOWN_COLUMNS: Record<string, { label: string; kind: ColumnKind; width: number; tooltip?: string; editor?: CellEditor }> = {
   title: { label: "Title", kind: "text", width: 320, editor: { type: "text" } },
   authors: { label: "Authors", kind: "list", width: 200, editor: { type: "authors" } },
   author_sort: { label: "Author sort", kind: "text", width: 200 },
   series: { label: "Series", kind: "text", width: 160, editor: { type: "text" } },
-  series_index: { label: "#", kind: "number", width: 60, editor: { type: "number" } },
+  series_index: { label: "Number", kind: "number", width: 70, tooltip: "Number in the series (volume)", editor: { type: "number" } },
   tags: { label: "Tags", kind: "list", width: 180, editor: { type: "list" } },
   publisher: { label: "Publisher", kind: "text", width: 160, editor: { type: "text" } },
   rating: { label: "Rating", kind: "rating", width: 110, editor: { type: "rating" } },
@@ -194,6 +196,9 @@ function isUndefinedDate(d: Date): boolean {
 export function formatCell(book: BookSummary, column: BookColumn): string {
   const value = book[column.key];
   if (value === null || value === undefined) return "";
+  // calibre stores 1.0 for a book that is in no series; showing "1"
+  // there would claim a volume number that does not exist.
+  if (column.key === "series_index" && !book.series) return "";
 
   switch (column.kind) {
     case "list": {
@@ -253,7 +258,7 @@ export interface TablePrefs {
 export const DEFAULT_TABLE_PREFS: TablePrefs = { view: "table", columns: [...DEFAULT_VISIBLE_KEYS], widths: {} };
 
 /** Narrower than this and a column is unreadable; wider is unusable. */
-export const MIN_COLUMN_WIDTH = 60;
+export const MIN_COLUMN_WIDTH = 40;
 export const MAX_COLUMN_WIDTH = 900;
 
 export function clampWidth(width: number): number {

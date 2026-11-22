@@ -235,7 +235,7 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   { id: "test-template", label: "Test template…", group: "book", requires: "single-selection", contextMenu: true, icon: "template_funcs", tooltip: "Try a template against a real book" },
   { id: "send-email", label: "Send…", group: "book", requires: "single-selection", contextMenu: true, icon: "mail", accel: "Ctrl+E", tooltip: "Email a book to a device or address" },
   { id: "replace-cover", label: "Replace cover…", group: "book", requires: "single-selection", contextMenu: true, icon: "default_cover", tooltip: "Replace the cover image" },
-  { id: "open-book-folder", label: "Open containing folder", group: "book", requires: "single-selection", contextMenu: true, desktopOnly: true, icon: "tb_folder", tooltip: "Show this book's files in the file browser" },
+  { id: "open-book-folder", label: "Show in folder", group: "book", requires: "single-selection", contextMenu: true, desktopOnly: true, icon: "tb_folder", tooltip: "Show this book's files in the file browser" },
   { id: "cover-from-pdf", label: "Cover from PDF page 1", group: "book", requires: "single-selection", contextMenu: true, icon: "default_cover", tooltip: "Render the first page of the PDF as the cover" },
   { id: "similar-books", label: "Similar books", group: "book", requires: "single-selection", contextMenu: true, icon: "similar", tooltip: "Find books like this one" },
   // Selection-scoped rather than book-scoped: polishing a batch is

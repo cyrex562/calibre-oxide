@@ -530,6 +530,57 @@ async fn reveal_book_folder(state: State<'_, ServerState>, app: AppHandle, book_
     open_inside_library(&app, &library, &folder)
 }
 
+/// Finds the file for `ext` inside a book folder, comparing extensions
+/// case-insensitively (a library can hold `Book.PDF`).
+fn find_format_file(folder: &std::path::Path, ext: &str) -> Option<std::path::PathBuf> {
+    std::fs::read_dir(folder)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.is_file() && p.extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case(ext)))
+}
+
+/// Opens the system file browser with one book format selected.
+///
+/// Same trust model as [`reveal_book_folder`]: the page supplies only a
+/// book id and a format name (checked by [`checked_ext`]); the path is
+/// resolved here and must canonicalise to somewhere inside the library.
+/// `reveal_item_in_dir` selects the file in Explorer / Finder and falls
+/// back to opening the folder on desktops with no select support.
+#[tauri::command]
+async fn reveal_book_file(state: State<'_, ServerState>, app: AppHandle, book_id: i32, fmt: String) -> Result<(), String> {
+    let port = state.0.lock().unwrap().as_ref().map(|(_, p)| *p).ok_or("no library is currently open")?;
+    let library = settings::load_library_path(&app).ok_or("no library is currently open")?;
+    let ext = checked_ext(&fmt)?;
+
+    let relative = fetch_book_relative_path(port, book_id).await?;
+    let folder = library.join(relative.trim_start_matches(['/', '\\']));
+    let file = find_format_file(&folder, &ext).ok_or_else(|| format!("book {book_id} has no {} file on disk", ext.to_uppercase()))?;
+
+    let real_library = library.canonicalize().map_err(|e| format!("{}: {e}", library.display()))?;
+    let real_file = file.canonicalize().map_err(|e| format!("{}: {e}", file.display()))?;
+    if !real_file.starts_with(&real_library) {
+        return Err(format!("{} is not inside the library", file.display()));
+    }
+    app.opener().reveal_item_in_dir(&real_file).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod reveal_tests {
+    use super::find_format_file;
+
+    #[test]
+    fn finds_format_file_case_insensitively() {
+        let dir = std::env::temp_dir().join(format!("oxide-reveal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Book.PDF"), b"x").unwrap();
+        std::fs::write(dir.join("Book.epub"), b"x").unwrap();
+        assert_eq!(find_format_file(&dir, "pdf").unwrap().file_name().unwrap(), "Book.PDF");
+        assert!(find_format_file(&dir, "mobi").is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
 /// Reads one book's `path` column through the running server.
 async fn fetch_book_relative_path(port: u16, book_id: i32) -> Result<String, String> {
     let url = format!("http://127.0.0.1:{port}/ajax/book/{book_id}");
@@ -904,7 +955,7 @@ pub fn run() {
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(ServerState::default())
         .manage(logs::LaunchFailureState::default())
-        .invoke_handler(tauri::generate_handler![ping, get_launch_failure, open_log_folder, get_persisted_library, choose_library, create_library, choose_import_folder, list_recent_libraries, open_recent_library, get_auto_reopen, set_auto_reopen, import_library_archive, set_menu_actions, open_book_format, unpack_book, repack_book, open_external_url, reveal_library_folder, reveal_book_folder, get_auto_add_folder, choose_auto_add_folder, pick_folder])
+        .invoke_handler(tauri::generate_handler![ping, get_launch_failure, open_log_folder, get_persisted_library, choose_library, create_library, choose_import_folder, list_recent_libraries, open_recent_library, get_auto_reopen, set_auto_reopen, import_library_archive, set_menu_actions, open_book_format, unpack_book, repack_book, open_external_url, reveal_library_folder, reveal_book_folder, reveal_book_file, get_auto_add_folder, choose_auto_add_folder, pick_folder])
         .on_menu_event(|app, event| menu::forward(app, &event))
         // Dropping files onto the window adds them, the same way the
         // folder picker does. This has to be handled natively: Tauri's
