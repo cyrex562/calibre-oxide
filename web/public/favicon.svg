@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- App mark: a book with a cog on its cover, in Lucide's line style
+       (24-unit grid, round caps, white on a flat rounded square). -->
+  <rect width="512" height="512" rx="112" fill="#2a6df4"/>
+  <g transform="translate(76 76) scale(15)" fill="none" stroke="#ffffff" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H19a1 1 0 0 1 1 1v18a1 1 0 0 1-1 1H6.5a1 1 0 0 1 0-5H20"/>
+    <circle cx="12.75" cy="9.5" r="3.1"/>
+    <circle cx="12.75" cy="9.5" r="0.9"/>
+    <path d="M12.75 4.9v1.5M12.75 12.6v1.5M8.15 9.5h1.5M15.85 9.5h1.5M15.01 11.76l1.06 1.06M10.49 7.24L9.43 6.18M15.01 7.24l1.06-1.06M10.49 11.76l-1.06 1.06"/>
+  </g>
+</svg>
