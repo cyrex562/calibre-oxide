@@ -30,6 +30,7 @@
     "allow-repack-book",
     "allow-reveal-library-folder",
     "allow-reveal-book-folder",
+    "allow-reveal-book-file",
     "allow-open-external-url",
     "allow-set-menu-actions",
     "allow-get-auto-reopen",

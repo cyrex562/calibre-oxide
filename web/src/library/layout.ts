@@ -9,7 +9,7 @@
 export const SIDEBAR_MIN = 140;
 export const SIDEBAR_MAX = 520;
 export const DETAILS_MIN = 240;
-export const DETAILS_MAX = 720;
+export const DETAILS_MAX = 900;
 
 export const LAYOUT_KEY = "calibre-oxide.layout";
 

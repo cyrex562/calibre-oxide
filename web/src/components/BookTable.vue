@@ -13,10 +13,12 @@
 
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
-import { formatCell, MAX_COLUMN_WIDTH, MIN_COLUMN_WIDTH, nextSort, type BookColumn } from "../library/columns";
+import { autoFitWidth, CHECK_COLUMN_WIDTH, dropIndex, isDrag, moveKeyTo, resizedColumnWidth, tableWidth } from "../library/columnLayout";
+import { formatCell, nextSort, type BookColumn } from "../library/columns";
 import { defaultEditKey, editKeyAction, initialText, isEditable, isEmptyCell, neighbourEditableKey, startsEditing, type CommitResult } from "../library/inlineEdit";
 import type { BookSummary } from "../library/types";
 import { windowRange } from "../library/virtualList";
+import { dragIds, setBooksDrag } from "../library/folders";
 
 /** Height of one row, in pixels. Fixed: virtual scrolling depends on it. */
 const ROW_HEIGHT = 30;
@@ -53,6 +55,8 @@ const emit = defineEmits<{
   rangeSelect: [bookId: number];
   sortBy: [value: { sort: string; order: "asc" | "desc" }];
   resize: [value: { key: string; width: number }];
+  /** A header was dragged: move column `key` before column slot `index` (pre-move index). */
+  reorder: [value: { key: string; index: number }];
   contextMenu: [value: { bookId: number; x: number; y: number }];
   /** Rows `[first, last)` are rendered (visible plus overscan): load them. */
   range: [value: { first: number; last: number }];
@@ -146,6 +150,7 @@ function sortIndicator(column: BookColumn): "" | "▲" | "▼" {
 }
 
 function onHeaderClick(column: BookColumn) {
+  if (suppressClick) return;
   const next = nextSort(column, props.sort, props.sortOrder);
   if (next) emit("sortBy", next);
 }
@@ -161,18 +166,20 @@ function onHeaderClick(column: BookColumn) {
 
 const resizing = ref<{ key: string; startX: number; startWidth: number } | null>(null);
 
+/** The table is exactly as wide as its columns (see library/columnLayout.ts). */
+const totalWidth = computed(() => tableWidth(props.columns, props.selectMode));
+
 function startResize(event: PointerEvent, column: BookColumn) {
   event.preventDefault();
-  event.stopPropagation(); // never let a resize also sort the column
+  event.stopPropagation(); // never let a resize also sort or drag the column
   resizing.value = { key: column.key, startX: event.clientX, startWidth: column.width };
-  (event.target as HTMLElement).setPointerCapture(event.pointerId);
+  (event.target as HTMLElement).setPointerCapture?.(event.pointerId);
 }
 
 function onResizeMove(event: PointerEvent) {
   const state = resizing.value;
   if (!state) return;
-  const width = Math.min(MAX_COLUMN_WIDTH, Math.max(MIN_COLUMN_WIDTH, state.startWidth + (event.clientX - state.startX)));
-  emit("resize", { key: state.key, width });
+  emit("resize", { key: state.key, width: resizedColumnWidth(state.startWidth, event.clientX - state.startX) });
 }
 
 function endResize(event: PointerEvent) {
@@ -181,9 +188,109 @@ function endResize(event: PointerEvent) {
   resizing.value = null;
 }
 
+let measureCanvas: HTMLCanvasElement | null = null;
+
+/** Pixel width of `text` in the table's own font. */
+function measureText(text: string, font: string): number {
+  try {
+    measureCanvas ??= document.createElement("canvas");
+    const ctx = measureCanvas.getContext("2d");
+    if (ctx) {
+      ctx.font = font;
+      return ctx.measureText(text).width;
+    }
+  } catch {
+    // jsdom has no canvas
+  }
+  return text.length * 7;
+}
+
+/** Double-click on a handle: fit the column to its header and the loaded rows. */
+function autoFit(column: BookColumn) {
+  const el = scroller.value;
+  const sample = el?.querySelector("tbody td") ?? el?.querySelector("thead th");
+  const style = sample ? getComputedStyle(sample) : null;
+  const font = style ? `${style.fontWeight} ${style.fontSize} ${style.fontFamily}` : "13px sans-serif";
+  const cells: string[] = [];
+  for (const id of props.ids) {
+    const book = props.getBook(id);
+    if (book) cells.push(formatCell(book, column));
+  }
+  emit("resize", { key: column.key, width: autoFitWidth(column.label, cells, (t) => measureText(t, font)) });
+}
+
+// ---------------------------------------------------------------
+// Column reordering
+// ---------------------------------------------------------------
+//
+// A press on a header is a click (sort) until the pointer has moved a
+// few pixels; only then does it become a drag. Pointer capture is taken
+// only once it is a drag -- capturing at pointerdown would retarget the
+// eventual click away from the header's button and break sorting.
+
+const headerDrag = ref<{ key: string; startX: number; startY: number; active: boolean; index: number } | null>(null);
+/** Swallows the click the browser fires after a drag ends on a header. */
+let suppressClick = false;
+
+function headerSpans(): { left: number; right: number }[] {
+  const ths = scroller.value?.querySelectorAll<HTMLElement>("thead th[data-key]") ?? [];
+  return Array.from(ths).map((th) => {
+    const r = th.getBoundingClientRect();
+    return { left: r.left, right: r.right };
+  });
+}
+
+function onHeaderPointerDown(event: PointerEvent, column: BookColumn) {
+  if (event.button !== 0) return;
+  headerDrag.value = { key: column.key, startX: event.clientX, startY: event.clientY, active: false, index: -1 };
+}
+
+function onHeaderPointerMove(event: PointerEvent) {
+  const state = headerDrag.value;
+  if (!state) return;
+  if (!state.active) {
+    if (!isDrag(event.clientX - state.startX, event.clientY - state.startY)) return;
+    state.active = true;
+    (event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId);
+  }
+  state.index = dropIndex(headerSpans(), event.clientX);
+}
+
+function onHeaderPointerUp(event: PointerEvent) {
+  const state = headerDrag.value;
+  headerDrag.value = null;
+  if (!state) return;
+  (event.currentTarget as HTMLElement).releasePointerCapture?.(event.pointerId);
+  if (!state.active) return;
+  suppressClick = true;
+  setTimeout(() => (suppressClick = false), 0);
+  const keys = props.columns.map((c) => c.key);
+  if (state.index >= 0 && moveKeyTo(keys, state.key, state.index) !== keys) emit("reorder", { key: state.key, index: state.index });
+}
+
+function onHeaderPointerCancel() {
+  headerDrag.value = null;
+}
+
+/** The slot a drop would land in, as a column index, while dragging. */
+const dropAt = computed(() => (headerDrag.value?.active ? headerDrag.value.index : -1));
+
+/** The header edge to draw the drop indicator on. */
+function dropClass(index: number): string {
+  if (dropAt.value < 0) return "";
+  if (index === dropAt.value) return "drop-before";
+  if (index === props.columns.length - 1 && dropAt.value === props.columns.length) return "drop-after";
+  return "";
+}
+
 // ---------------------------------------------------------------
 // Rows
 // ---------------------------------------------------------------
+
+/** Dragging a row to a folder in the category browser carries the selection (or the row alone). */
+function onRowDragStart(bookId: number, event: DragEvent) {
+  if (event.dataTransfer) setBooksDrag(event.dataTransfer, dragIds(bookId, props.selectedIds, props.selectMode));
+}
 
 function onRowClick(bookId: number, event?: MouseEvent) {
   if (props.selectMode) {
@@ -350,12 +457,29 @@ function hint(column: BookColumn): string {
 
 <template>
   <div ref="scroller" class="table-scroll" tabindex="-1" @scroll.passive="onScroll" @keydown="onListKeydown">
-    <table class="book-table">
+    <table class="book-table" :style="{ width: `${totalWidth}px`, minWidth: `${totalWidth}px` }">
+      <colgroup>
+        <col v-if="selectMode" :style="{ width: `${CHECK_COLUMN_WIDTH}px` }" />
+        <col v-for="column in columns" :key="column.key" :style="{ width: `${column.width}px` }" />
+      </colgroup>
       <thead>
         <tr>
           <th v-if="selectMode" class="check-col" scope="col"></th>
-          <th v-for="column in columns" :key="column.key" scope="col" :style="{ width: `${column.width}px` }" :class="{ sortable: !!column.sortKey }" :aria-sort="sortIndicator(column) === '▲' ? 'ascending' : sortIndicator(column) === '▼' ? 'descending' : 'none'">
-            <button v-if="column.sortKey" type="button" class="header-button" :title="`Sort by ${column.label}`" @click="onHeaderClick(column)">
+          <th
+            v-for="(column, ci) in columns"
+            :key="column.key"
+            scope="col"
+            :data-key="column.key"
+            :style="{ width: `${column.width}px` }"
+            :class="[{ sortable: !!column.sortKey, dragging: headerDrag?.active && headerDrag.key === column.key }, dropClass(ci)]"
+            :title="column.tooltip"
+            :aria-sort="sortIndicator(column) === '▲' ? 'ascending' : sortIndicator(column) === '▼' ? 'descending' : 'none'"
+            @pointerdown="onHeaderPointerDown($event, column)"
+            @pointermove="onHeaderPointerMove"
+            @pointerup="onHeaderPointerUp"
+            @pointercancel="onHeaderPointerCancel"
+          >
+            <button v-if="column.sortKey" type="button" class="header-button" :title="column.tooltip ? `${column.tooltip}. Click to sort` : `Sort by ${column.label}`" @click="onHeaderClick(column)">
               <span class="header-label">{{ column.label }}</span>
               <span class="sort-indicator">{{ sortIndicator(column) }}</span>
             </button>
@@ -369,6 +493,8 @@ function hint(column: BookColumn): string {
               @pointermove="onResizeMove"
               @pointerup="endResize"
               @pointercancel="endResize"
+              @dblclick.stop="autoFit(column)"
+              @click.stop
             ></span>
           </th>
         </tr>
@@ -381,6 +507,8 @@ function hint(column: BookColumn): string {
             v-if="getBook(ids[i])"
             :data-id="ids[i]"
             tabindex="0"
+            :draggable="editing?.id === ids[i] ? 'false' : 'true'"
+            @dragstart="onRowDragStart(ids[i], $event)"
             :class="{ selected: selectMode ? selectedIds.has(ids[i]) : selectedBookId === ids[i] }"
             :style="rowColors?.[ids[i]] ? { color: rowColors[ids[i]] } : undefined"
             @click="onRowClick(ids[i], $event)"
@@ -456,6 +584,10 @@ function hint(column: BookColumn): string {
      the browser re-derives widths from content and resizing appears
      to do nothing. */
   table-layout: fixed;
+  /* The width is set inline to the sum of the column widths. Fixed
+     layout ignores column widths while the table's own width is auto,
+     which is what made resizing appear broken. */
+  max-width: none;
   font-size: var(--fs-body);
 }
 
@@ -583,7 +715,31 @@ function hint(column: BookColumn): string {
 }
 
 .resize-handle:hover {
-  background: var(--fg-faint);
+  background: linear-gradient(to right, transparent 2px, var(--accent) 2px, var(--accent) 4px, transparent 4px);
+}
+/* A faint divider is always visible so the handle can be found. */
+.resize-handle::before {
+  content: "";
+  position: absolute;
+  right: 2px;
+  top: 25%;
+  height: 50%;
+  width: 1px;
+  background: var(--border);
+}
+
+/* Column reordering: the dragged header dims; the drop slot gets a bar. */
+.book-table thead th {
+  cursor: grab;
+}
+.book-table thead th.dragging {
+  opacity: 0.5;
+}
+.book-table thead th.drop-before {
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.book-table thead th.drop-after {
+  box-shadow: inset -3px 0 0 var(--accent);
 }
 
 .book-table tbody tr {

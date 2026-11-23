@@ -39,6 +39,10 @@ import { createDuplicatesStore } from "../library/duplicatesStore";
 import { createResolveController } from "../library/resolve";
 import { createOrganizeController } from "../library/organize";
 import OrganizeDialog from "./OrganizeDialog.vue";
+import NamingDialog from "./NamingDialog.vue";
+import { createNamingController } from "../library/naming";
+import { COLUMN_EXPLANATIONS, COLUMN_PRESETS, columnDraftProblem, createColumn, presetDraft, type ColumnPreset } from "../library/columnPresets";
+import { fetchNaming } from "../library/api";
 import { createMirrorController } from "../library/mirror";
 import MirrorDialog from "./MirrorDialog.vue";
 import { createRetitleController } from "../library/retitle";
@@ -53,6 +57,7 @@ import { applySortChoice, type SortMenuId, sortSummary as summariseSort } from "
 import { activeRules, colorForBook, COLORING_RULES_PROFILE, DEFAULT_COLORING_RULES, type ColoringRule, type ColoringRulesPrefs } from "../library/coloringRules";
 import { evaluateTemplateBulk } from "../library/api";
 import { changesFor, isEmptySpec, REPLACEABLE_FIELDS, validateSpec, type BulkEditSpec } from "../library/bulkEdit";
+import { moveKeyBy, moveKeyTo, pickerOrder, resetColumnPrefs, toggleKey } from "../library/columnLayout";
 import { clampWidth, columnsFor, DEFAULT_TABLE_PREFS, resolveColumns, TABLE_PREFS_PROFILE, type BookColumn, type LibraryViewMode, type TablePrefs } from "../library/columns";
 import { actionEnabled, contextMenuEntries, LIBRARY_ACTIONS, toolbarActionEnabled, TOOLBAR_LAYOUT, type ToolbarEntry, type ToolbarItem, toolbarOverflowIds, visibleToolbarActions, type ActionContext, type LibraryAction, type LibraryActionId } from "../library/actions";
 import { onMenuAction, syncDesktopMenu } from "../library/desktopMenu";
@@ -418,20 +423,39 @@ function startResize(which: Panel, event: PointerEvent) {
 
 const columnPickerOpen = ref(false);
 
-function toggleColumn(key: string) {
-  const current = tablePrefs.value.columns;
-  const next = current.includes(key) ? current.filter((k) => k !== key) : [...current, key];
-  tablePrefs.value = { ...tablePrefs.value, columns: next };
+
+function setColumnKeys(columns: string[]) {
+  tablePrefs.value = { ...tablePrefs.value, columns };
   void saveTablePrefs();
 }
 
+function toggleColumn(key: string) {
+  setColumnKeys(toggleKey(tablePrefs.value.columns, key));
+}
+
 function moveColumn(key: string, delta: number) {
-  const current = [...tablePrefs.value.columns];
-  const from = current.indexOf(key);
-  const to = from + delta;
-  if (from === -1 || to < 0 || to >= current.length) return;
-  [current[from], current[to]] = [current[to], current[from]];
-  tablePrefs.value = { ...tablePrefs.value, columns: current };
+  setColumnKeys(moveKeyBy(tablePrefs.value.columns, key, delta));
+}
+
+/** A header was dragged in the table: reorder what is actually shown. */
+function onColumnReorder(next: { key: string; index: number }) {
+  setColumnKeys(moveKeyTo(visibleColumns.value.map((c) => c.key), next.key, next.index));
+}
+
+/** The picker's rows: shown columns in order, then the hidden ones. */
+const pickerColumns = computed(() => pickerOrder(availableColumns.value, tablePrefs.value.columns));
+const pickerDragKey = ref<string | null>(null);
+
+function onPickerDrop(targetKey: string) {
+  const from = pickerDragKey.value;
+  pickerDragKey.value = null;
+  const keys = tablePrefs.value.columns;
+  if (!from || from === targetKey || !keys.includes(from) || !keys.includes(targetKey)) return;
+  setColumnKeys(moveKeyTo(keys, from, keys.indexOf(targetKey)));
+}
+
+function resetColumns() {
+  tablePrefs.value = resetColumnPrefs(tablePrefs.value);
   void saveTablePrefs();
 }
 
@@ -520,6 +544,13 @@ async function renameSavedSearchPrompt(name: string) {
 // that module's own doc) -- a real, disclosed narrowing rather than a
 // checkbox that would look like it works but doesn't.
 const columnsOpen = ref(false);
+
+// A custom column made (or removed) in the Custom columns dialog must
+// show up in the column picker without a reload: re-read the field
+// metadata when that dialog closes.
+watch(columnsOpen, (open, was) => {
+  if (was && !open) void loadMetadata();
+});
 const columnsError = ref<string | null>(null);
 const customColumns = ref<Record<string, CustomColumnInfo>>({});
 const newColumnLabel = ref("");
@@ -756,6 +787,36 @@ function openNote(field: string, itemName: string) {
   noteTarget.value = { field, itemName };
 }
 
+// One-click presets (edition, game line, volume): pick one, edit the name, create.
+const presetPicked = ref<{ preset: ColumnPreset; label: string; name: string; datatype: string } | null>(null);
+function pickColumnPreset(preset: ColumnPreset) {
+  presetPicked.value = { preset, ...presetDraft(preset) };
+  columnsError.value = null;
+}
+async function createPresetColumn() {
+  const d = presetPicked.value;
+  if (!d) return;
+  const problem = columnDraftProblem(d, Object.keys(customColumns.value));
+  if (problem) {
+    columnsError.value = problem;
+    return;
+  }
+  columnsError.value = null;
+  try {
+    await createColumn(d);
+    presetPicked.value = null;
+    await onColumnsChanged();
+  } catch (e) {
+    columnsError.value = e instanceof Error ? e.message : String(e);
+  }
+}
+/** A column was added or removed: the table's column picker, the category browser and the details follow without a reload. */
+async function onColumnsChanged() {
+  await loadCustomColumns();
+  categoriesRefresh.value++;
+  cacheBust.value++;
+}
+
 async function createCustomColumn() {
   if (!newColumnLabel.value.trim() || !newColumnName.value.trim()) return;
   columnsError.value = null;
@@ -763,7 +824,7 @@ async function createCustomColumn() {
     await addCustomColumn(newColumnLabel.value.trim(), newColumnName.value.trim(), newColumnDatatype.value);
     newColumnLabel.value = "";
     newColumnName.value = "";
-    await loadCustomColumns();
+    await onColumnsChanged();
   } catch (e) {
     columnsError.value = e instanceof Error ? e.message : String(e);
   }
@@ -774,7 +835,7 @@ async function removeCustomColumnClick(label: string) {
   columnsError.value = null;
   try {
     await removeCustomColumn(label);
-    await loadCustomColumns();
+    await onColumnsChanged();
   } catch (e) {
     columnsError.value = e instanceof Error ? e.message : String(e);
   }
@@ -1097,6 +1158,15 @@ function onCategorySelect(categoryQuery: string) {
 
 
 function onDetailsUpdated() {
+  cacheBust.value++;
+  void (ftsMode.value ? runFtsSearch() : runSearch());
+}
+
+/** Bumped to make the category browser (folders and categories) reload. */
+const categoriesRefresh = ref(0);
+
+/** Books were moved or a folder renamed: refresh the list in place (position kept). */
+function onFoldersChanged() {
   cacheBust.value++;
   void (ftsMode.value ? runFtsSearch() : runSearch());
 }
@@ -1513,7 +1583,9 @@ async function openRenameFiles() {
   renameBusy.value = true;
   try {
     const { results } = await renameFiles(ids, "{title}", true);
-    renameTemplate.value = initialRenameTemplate(results.map((r) => r.current));
+    const initial = initialRenameTemplate(results.map((r) => r.current));
+    // Several books (no single current name to start from): the library's convention.
+    renameTemplate.value = initial === DEFAULT_RENAME_TEMPLATE ? ((await conventionFileTemplate()) ?? initial) : initial;
   } catch {
     renameTemplate.value = DEFAULT_RENAME_TEMPLATE;
   } finally {
@@ -1609,9 +1681,40 @@ const organizeController = createOrganizeController();
 const organizeOpen = ref(false);
 /** Organize files: the selected books when there are any (select mode), else the open book is not assumed. */
 const organizeSelection = computed(() => (selectMode.value ? [...selectedIds.value] : []));
-function openOrganize() {
+async function openOrganize(prefill?: { template: string; scope: "selected" | "all" }) {
   organizeController.open(organizeSelection.value.length);
+  if (prefill) {
+    organizeController.state.draft.template = prefill.template;
+    organizeController.state.draft.scope = prefill.scope === "selected" && organizeSelection.value.length > 0 ? "selected" : "all";
+  } else {
+    // The library's naming convention is the default template; the dialog can still override it.
+    try {
+      organizeController.state.draft.template = (await fetchNaming()).combined;
+    } catch {
+      // The built-in default stays.
+    }
+  }
   organizeOpen.value = true;
+}
+
+// File naming: the library's folder and file naming convention.
+const namingController = createNamingController();
+const namingOpen = ref(false);
+const namingSampleIds = computed(() => (selectMode.value && selectedIds.value.size > 0 ? [...selectedIds.value].slice(0, 5) : selectedBookId.value !== null ? [selectedBookId.value] : []));
+function openNaming() {
+  namingOpen.value = true;
+}
+function applyNaming(template: string, scope: "selected" | "all") {
+  namingOpen.value = false;
+  void openOrganize({ template, scope });
+}
+/** The file name template new runs start from (the convention's), or null when it cannot be read. */
+async function conventionFileTemplate(): Promise<string | null> {
+  try {
+    return (await fetchNaming()).file_template;
+  } catch {
+    return null;
+  }
 }
 // Export a copy: a travel copy or a backup mirror to another folder or drive.
 // The scope follows the selection like Organize; nothing in the library changes.
@@ -1631,6 +1734,10 @@ function openRetitle(scope: "all" | "selected") {
   if (scope === "selected" && retitleSelection.value.length === 0) return;
   retitleController.open(scope);
   retitleOpen.value = true;
+  // Its rename template starts from the library's naming convention.
+  void conventionFileTemplate().then((t) => {
+    if (t && retitleController.state.rows.length === 0) retitleController.state.renameTemplate = t;
+  });
 }
 async function onRetitleChanged() {
   cacheBust.value++;
@@ -2164,7 +2271,8 @@ const actionHandlers: Partial<Record<LibraryActionId, () => void>> = {
   "custom-columns": () => openColumns(),
   "check-library": () => openCheckLibrary(),
   "find-duplicates": () => openDuplicates(),
-  "organize-files": () => openOrganize(),
+  "organize-files": () => void openOrganize(),
+  "file-naming": () => openNaming(),
   "export-copy": () => openMirror(),
   "fix-titles": () => openRetitle("all"),
   "fix-titles-selected": () => openRetitle("selected"),
@@ -3099,7 +3207,7 @@ watch(coloringRules, () => {
 
     <div class="body">
       <template v-if="sidebarVisible">
-        <CategoryBrowser class="sidebar" :style="{ width: sidebarWidth + 'px' }" @select="onCategorySelect" @view-note="openNote" @renamed="onCategoryRenamed" />
+        <CategoryBrowser class="sidebar" :style="{ width: sidebarWidth + 'px' }" :selected-ids="renameScope" :refresh-key="categoriesRefresh" @select="onCategorySelect" @view-note="openNote" @renamed="onCategoryRenamed" @folders-changed="onFoldersChanged" />
         <div
           class="splitter"
           role="separator"
@@ -3166,6 +3274,7 @@ watch(coloringRules, () => {
           @range-select="rangeSelect"
           @sort-by="onTableSort"
           @resize="onColumnResize"
+          @reorder="onColumnReorder"
           @context-menu="openContextMenu"
           @range="onRange"
           @navigate="onNavigate"
@@ -3214,6 +3323,7 @@ watch(coloringRules, () => {
             @updated="onDetailsUpdated"
             @deleted="onDetailsDeleted"
             @open-book="selectedBookId = $event"
+            @step-book="onNavigate($event > 0 ? 'ArrowDown' : 'ArrowUp')"
           />
         </aside>
       </template>
@@ -3317,20 +3427,31 @@ watch(coloringRules, () => {
     <div v-if="columnPickerOpen" class="manage-backdrop" @click.self="columnPickerOpen = false">
       <div class="manage-panel">
         <h3>Table columns</h3>
-        <p class="hint">Choose which columns the table shows, and their order.</p>
+        <p class="hint">Choose which columns the table shows, and their order. Drag a row, or use the arrows. You can also drag a column header in the table.</p>
         <ul class="column-list">
-          <li v-for="column in availableColumns" :key="column.key" class="column-row">
+          <li
+            v-for="column in pickerColumns"
+            :key="column.key"
+            class="column-row"
+            :class="{ 'drag-over': pickerDragKey !== null && pickerDragKey !== column.key && tablePrefs.columns.includes(column.key) }"
+            :draggable="tablePrefs.columns.includes(column.key)"
+            @dragstart="pickerDragKey = column.key"
+            @dragend="pickerDragKey = null"
+            @dragover.prevent
+            @drop.prevent="onPickerDrop(column.key)"
+          >
             <label class="field checkbox">
               <input type="checkbox" :checked="tablePrefs.columns.includes(column.key)" @change="toggleColumn(column.key)" />
               {{ column.label }}
               <span v-if="!column.sortKey" class="hint inline">(not sortable)</span>
             </label>
             <template v-if="tablePrefs.columns.includes(column.key)">
-              <button type="button" :disabled="tablePrefs.columns.indexOf(column.key) === 0" title="Move left" @click="moveColumn(column.key, -1)">←</button>
-              <button type="button" :disabled="tablePrefs.columns.indexOf(column.key) === tablePrefs.columns.length - 1" title="Move right" @click="moveColumn(column.key, 1)">→</button>
+              <button type="button" :disabled="tablePrefs.columns.indexOf(column.key) === 0" title="Move up (left in the table)" aria-label="Move up" @click="moveColumn(column.key, -1)">↑</button>
+              <button type="button" :disabled="tablePrefs.columns.indexOf(column.key) === tablePrefs.columns.length - 1" title="Move down (right in the table)" aria-label="Move down" @click="moveColumn(column.key, 1)">↓</button>
             </template>
           </li>
         </ul>
+        <button type="button" @click="resetColumns">Reset to default</button>
         <button type="button" @click="columnPickerOpen = false">Close</button>
       </div>
     </div>
@@ -3349,6 +3470,22 @@ watch(coloringRules, () => {
             </li>
             <li v-if="Object.keys(customColumns).length === 0">No custom columns yet.</li>
           </ul>
+          <div class="column-presets" data-testid="column-presets">
+            <h4>Quick add</h4>
+            <div class="preset-buttons">
+              <button v-for="p in COLUMN_PRESETS" :key="p.id" type="button" :data-testid="`preset-${p.id}`" :disabled="p.label in customColumns" :title="p.label in customColumns ? `#${p.label} already exists` : p.hint" @click="pickColumnPreset(p)">{{ p.title }}</button>
+            </div>
+            <form v-if="presetPicked" class="manage-form" data-testid="preset-form" @submit.prevent="createPresetColumn">
+              <input v-model="presetPicked.name" aria-label="Display name" data-testid="preset-name" required />
+              <code class="manage-query">#{{ presetPicked.label }} ({{ presetPicked.datatype }})</code>
+              <button type="submit" data-testid="preset-create">Create</button>
+            </form>
+            <p v-if="presetPicked" class="hint">Creates the column <code>#{{ presetPicked.label }}</code> as {{ presetPicked.datatype === "int" ? "a whole number" : "text" }}. {{ presetPicked.preset.hint }}</p>
+            <ul class="hint column-notes">
+              <li v-for="line in COLUMN_EXPLANATIONS" :key="line">{{ line }}</li>
+            </ul>
+          </div>
+          <h4>Or make your own</h4>
           <form class="manage-form" @submit.prevent="createCustomColumn">
             <input v-model="newColumnLabel" placeholder="Label (e.g. shelf)" pattern="[a-zA-Z0-9_]+" title="Letters, numbers, and underscores only" required />
             <input v-model="newColumnName" placeholder="Display name (e.g. Shelf)" required />
@@ -3509,6 +3646,7 @@ watch(coloringRules, () => {
     <ResolveDialog v-if="duplicatesOpen && resolveOpen" :store="dupStore" :controller="resolveController" @close="resolveOpen = false" @changed="onDuplicatesChanged" />
     <CompareDuplicates v-if="compareController.state.open" :controller="compareController" @close="compareController.close()" />
     <MirrorDialog v-if="mirrorOpen" :controller="mirrorController" :selected-ids="organizeSelection" @close="mirrorOpen = false" />
+    <NamingDialog v-if="namingOpen" :controller="namingController" :sample-ids="namingSampleIds" :selected-count="organizeSelection.length" @close="namingOpen = false" @apply="applyNaming" />
     <OrganizeDialog v-if="organizeOpen" :controller="organizeController" :selected-ids="organizeSelection" @close="organizeOpen = false" @changed="onDuplicatesChanged" />
     <RetitleDialog v-if="retitleOpen" :controller="retitleController" :selected-ids="retitleSelection" @close="retitleOpen = false" @changed="onRetitleChanged" />
 
@@ -4224,6 +4362,16 @@ watch(coloringRules, () => {
 .manage-remove {
   color: var(--danger);
 }
+.preset-buttons {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.4rem;
+}
+.column-notes {
+  margin: 0.4rem 0;
+  padding-left: 1.1rem;
+}
 .manage-form {
   display: flex;
   gap: 0.5em;
@@ -4328,6 +4476,17 @@ watch(coloringRules, () => {
 }
 .column-row .field {
   flex: 1;
+}
+.column-row .field.checkbox {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.4rem;
+}
+.column-row[draggable="true"] {
+  cursor: grab;
+}
+.column-row.drag-over:hover {
+  box-shadow: inset 0 2px 0 var(--accent);
 }
 .hint.inline {
   font-size: var(--fs-small);

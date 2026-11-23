@@ -60,7 +60,7 @@ pub struct UndoBody {
     pub run_id: String,
 }
 
-fn started(kind: &str, started: Started) -> Response {
+pub(crate) fn started(kind: &str, started: Started) -> Response {
     match started {
         Started::New(job) => (StatusCode::ACCEPTED, Json(json!({"job_id": job.id, "kind": kind, "state": "running", "already_running": false, "status_url": format!("/library-jobs/{}", job.id)}))).into_response(),
         Started::AlreadyRunning(job) => (StatusCode::ACCEPTED, Json(json!({"job_id": job.id, "kind": kind, "state": "running", "already_running": true, "status_url": format!("/library-jobs/{}", job.id)}))).into_response(),
@@ -68,12 +68,12 @@ fn started(kind: &str, started: Started) -> Response {
     }
 }
 
-fn internal(e: impl std::fmt::Display) -> ServerError {
+pub(crate) fn internal(e: impl std::fmt::Display) -> ServerError {
     ServerError::InternalServerError(e.to_string())
 }
 
 /// What a dry run answers.
-fn plan_json(plan: &organize::OrganizePlan) -> Value {
+pub(crate) fn plan_json(plan: &organize::OrganizePlan) -> Value {
     let moves: Vec<Value> = plan.books.iter().flat_map(|b| b.files.iter().map(move |f| json!({"book_id": b.book_id, "title": b.title, "format": f.format, "from": f.from, "to": f.to, "suffixed": b.suffixed}))).take(MAX_MOVES_SHOWN).collect();
     json!({
         "plan_fingerprint": plan.fingerprint,
@@ -90,7 +90,7 @@ fn plan_json(plan: &organize::OrganizePlan) -> Value {
 /// `POST /organize-library/{library_id}`.
 pub async fn organize(State(state): State<AppState>, Path(library_id): Path<String>, Json(body): Json<OrganizeBody>) -> Result<Response, ServerError> {
     let cache = state.cache_for(Some(&library_id)).ok_or_else(|| ServerError::NotFound(format!("no library named {library_id:?}")))?;
-    let template = body.template.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| organize::DEFAULT_TEMPLATE.to_string());
+    let template = body.template.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| calibre_db::naming::load(&cache).combined());
     let scopes = [body.book_ids.is_some(), body.search.is_some(), body.path_prefix.is_some()].iter().filter(|b| **b).count();
     if scopes > 1 {
         return Err(ServerError::BadRequest("give one of book_ids, search or path_prefix (or none for every book)".into()));

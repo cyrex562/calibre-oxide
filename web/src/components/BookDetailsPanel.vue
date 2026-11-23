@@ -1,5 +1,11 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
+import type { PDFDocumentProxy } from "pdfjs-dist";
+import CollapsibleSection from "./CollapsibleSection.vue";
+import ImageViewer from "./ImageViewer.vue";
+import { loadSections, saveSections, toggleSection, type SectionId, type SectionState } from "../library/panelSections";
+import { changesFromForm, cloneForm, DraftStore, formFromBook, isFormDirty, type MetaForm } from "../library/metadataForm";
+import { loadPdfJs, PDF_ASSET_OPTIONS, pdfUrl, renderPage, renderPageToBlob, scaleForWidth } from "../reader/pdf";
 import { useRouter } from "vue-router";
 import FetchMetadataDialog from "./FetchMetadataDialog.vue";
 import TweakEditor from "./TweakEditor.vue";
@@ -9,7 +15,7 @@ import { categoryItemToQuery } from "../library/query";
 import { isTauri, tauriInvoke } from "../tauri";
 import { DEFAULT_SAVED_TEMPLATES, removeTemplate, saveTemplate, SAVED_TEMPLATES_PROFILE, TemplateNameError, wouldOverwrite, type SavedTemplate, type SavedTemplates } from "../library/savedTemplates";
 import { fetchProfile, saveProfile } from "../settings/api";
-import type { BookFieldChanges, BookSummary, FieldMetaEntry } from "../library/types";
+import type { BookSummary, FieldMetaEntry } from "../library/types";
 
 const props = defineProps<{
   bookId: number;
@@ -33,7 +39,7 @@ const props = defineProps<{
   /** Bumped when the book was changed elsewhere (an in-place edit in the list). */
   refreshKey?: number;
 }>();
-const emit = defineEmits<{ close: []; updated: []; deleted: [bookId: number]; "open-book": [bookId: number] }>();
+const emit = defineEmits<{ close: []; updated: []; deleted: [bookId: number]; "open-book": [bookId: number]; "step-book": [delta: number] }>();
 const router = useRouter();
 
 const book = ref<BookSummary | null>(null);
@@ -202,32 +208,50 @@ async function sendShareEmail() {
   }
 }
 
-const editing = ref(false);
+// ---------------------------------------------------------------
+// Sections
+// ---------------------------------------------------------------
+//
+// The panel is a stack of collapsible sections rather than separate
+// views, so the preview and the metadata form can be open together.
+// Which are open is remembered per section (library/panelSections.ts).
+
+const sections = ref<SectionState>(loadSections());
+
+function toggle(id: SectionId) {
+  sections.value = toggleSection(sections.value, id);
+  saveSections(sections.value);
+}
+
+function openSection(id: SectionId) {
+  if (sections.value[id]) return;
+  sections.value = { ...sections.value, [id]: true };
+  saveSections(sections.value);
+}
+
+// ---------------------------------------------------------------
+// Metadata: always-available inline form
+// ---------------------------------------------------------------
+//
+// Unsaved edits when another book is selected: a draft is kept *per
+// book* (see DraftStore) and restored on return. Prompting instead
+// would interrupt every arrow-key step down the list.
+
 const saving = ref(false);
 const saveError = ref<string | null>(null);
-const editTitle = ref("");
-const editAuthors = ref("");
-const editSeries = ref("");
-const editSeriesIndex = ref("");
-const editTags = ref("");
-const editRating = ref(0);
-// Publisher, published date and comments are all standard fields that
-// `Cache::set_field` has always handled -- they were simply never
-// offered by this form, so there was no way to set them from the app.
-const editPublisher = ref("");
-const editPubdate = ref("");
-const editComments = ref("");
+const form = ref<MetaForm | null>(null);
+const baseline = ref<MetaForm | null>(null);
+const drafts = new DraftStore();
 const coverInput = ref<HTMLInputElement | null>(null);
+
+const dirty = computed(() => (form.value && baseline.value ? isFormDirty(form.value, baseline.value) : false));
 
 // Custom columns (issue #720) -- discovered from /ajax/field-metadata
 // (real, already includes custom columns, see that route's own doc),
-// rendered/edited generically alongside the fixed fields above. `key`
-// is "#label" (field-metadata's own namespacing so a custom column
-// can't collide with a standard one); `label` is the bare name that
-// both the book row (Cache::get_data_as_dict) and set-fields'
+// rendered/edited generically alongside the fixed fields. `key` is
+// "#label"; `label` is the bare name the book row and set-fields'
 // `changes` object actually use.
 const customColumnFields = ref<FieldMetaEntry[]>([]);
-const editCustomValues = ref<Record<string, string>>({});
 
 async function loadCustomColumnFields() {
   try {
@@ -239,67 +263,43 @@ async function loadCustomColumnFields() {
 }
 void loadCustomColumnFields();
 
-function startEditing() {
-  const b = book.value;
-  if (!b) return;
-  editTitle.value = b.title;
-  editAuthors.value = (b.authors ?? []).join(" & ");
-  editSeries.value = b.series ?? "";
-  editSeriesIndex.value = b.series_index != null ? String(b.series_index) : "";
-  editTags.value = (b.tags ?? []).join(", ");
-  editRating.value = b.rating ?? 0;
-  editPublisher.value = (b.publisher as string | null) ?? "";
-  // The server sends an ISO timestamp; `<input type="date">` wants
-  // just the date part, and rejects the whole string otherwise.
-  editPubdate.value = typeof b.pubdate === "string" ? b.pubdate.slice(0, 10) : "";
-  editComments.value = (b.comments as string | null) ?? "";
-  editCustomValues.value = {};
-  for (const field of customColumnFields.value) {
-    const raw = b[field.label];
-    // `Cache::get_custom_column_value` reads a real bool column back
-    // as "0"/"1" (an integer column under the hood), never
-    // "true"/"false" -- normalize here so the checkbox's `checked`
-    // binding below (which only recognizes the literal "true") works
-    // for a value that actually came from the server, not just one
-    // this form itself just wrote.
-    if (field.datatype === "bool") {
-      editCustomValues.value[field.label] = raw === "1" || raw === "true" || raw === true ? "true" : "false";
-    } else {
-      editCustomValues.value[field.label] = raw == null ? "" : String(raw);
-    }
-  }
-  saveError.value = null;
-  editing.value = true;
-  void loadDataFiles();
+/** (Re)fills the form from a book, restoring this book's draft if it has one. */
+function fillForm(b: BookSummary) {
+  const fresh = formFromBook(b, customColumnFields.value);
+  baseline.value = fresh;
+  const draft = drafts.take(b.id);
+  form.value = draft ? cloneForm(draft) : cloneForm(fresh);
 }
 
+// Custom column definitions can arrive after the book.
+watch(customColumnFields, () => {
+  if (book.value && !dirty.value) fillForm(book.value);
+});
+
+function revert() {
+  if (!baseline.value) return;
+  form.value = cloneForm(baseline.value);
+  drafts.discard(props.bookId);
+  saveError.value = null;
+}
+
+/** Opens the Metadata section and focuses the title (the "Edit metadata" menu item). */
+function startEditing() {
+  openSection("metadata");
+  void nextTick(() => rootEl.value?.querySelector<HTMLInputElement>("[data-field='title']")?.focus());
+}
+
+const rootEl = ref<HTMLElement | null>(null);
+
 async function saveEdits() {
+  if (!form.value || !dirty.value) return;
   saving.value = true;
   saveError.value = null;
   try {
-    const changes: BookFieldChanges = {
-      title: editTitle.value,
-      authors: editAuthors.value.split("&").map((a) => a.trim()).filter(Boolean),
-      series: editSeries.value,
-      tags: editTags.value.split(",").map((t) => t.trim()).filter(Boolean),
-      rating: editRating.value,
-      publisher: editPublisher.value,
-      comments: editComments.value,
-    };
-    // Sent only when set: an empty string is not a date, and clearing
-    // the field should leave the stored value alone rather than
-    // writing a value the column cannot hold.
-    if (editPubdate.value.trim() !== "") changes.pubdate = editPubdate.value;
-    if (editSeriesIndex.value.trim() !== "") {
-      const idx = Number(editSeriesIndex.value);
-      if (!Number.isNaN(idx)) changes.series_index = idx;
-    }
-    for (const field of customColumnFields.value) {
-      if (!field.is_editable) continue;
-      changes[field.label] = editCustomValues.value[field.label] ?? "";
-    }
-    book.value = await setFields(props.bookId, changes);
-    editing.value = false;
+    const updated = await setFields(props.bookId, changesFromForm(form.value, customColumnFields.value));
+    drafts.discard(props.bookId);
+    book.value = updated;
+    fillForm(updated);
     emit("updated");
   } catch (e) {
     saveError.value = e instanceof Error ? e.message : String(e);
@@ -586,7 +586,6 @@ const readableFormat = computed(() => book.value?.formats.find((f) => READABLE_F
 //
 // Desktop-only: handing a file to the OS default application is
 // exactly what a browser tab cannot do.
-const canOpenExternally = computed(() => isTauri() && (book.value?.formats.length ?? 0) > 0);
 const openingExternally = ref(false);
 const openExternallyError = ref<string | null>(null);
 
@@ -648,6 +647,13 @@ async function repackBook() {
 
 /** Shows this book's files in the system file browser (#886). */
 async function revealBookFolder() {
+  // With a format to point at, select that file; a book with no files
+  // (or an older desktop build) falls back to opening the folder.
+  const fmt = book.value?.formats[0];
+  if (fmt) {
+    await revealFile(fmt);
+    return;
+  }
   openExternallyError.value = null;
   try {
     await tauriInvoke<void>("reveal_book_folder", { bookId: props.bookId });
@@ -656,8 +662,64 @@ async function revealBookFolder() {
   }
 }
 
-async function openExternally() {
-  const fmt = externalFormat.value;
+/** Opens the system file browser with this format's file selected (desktop only). */
+async function revealFile(fmt: string) {
+  openExternallyError.value = null;
+  try {
+    await tauriInvoke<void>("reveal_book_file", { bookId: props.bookId, fmt });
+  } catch (e) {
+    openExternallyError.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
+/** In a plain browser there is no file manager to open, so the path is offered for copying. */
+const desktop = isTauri();
+const copied = ref(false);
+
+async function copyFolderPath() {
+  const path = (book.value?.path as string | undefined) ?? "";
+  try {
+    await navigator.clipboard.writeText(path);
+    copied.value = true;
+    setTimeout(() => (copied.value = false), 1500);
+  } catch {
+    // clipboard unavailable: the path is selectable text anyway
+  }
+}
+
+/** Format sizes, read from the Content-Length of a HEAD request. */
+const formatSizes = ref<Record<string, number>>({});
+
+async function loadFormatSizes() {
+  const id = props.bookId;
+  const links = formatLinks.value;
+  const sizes: Record<string, number> = {};
+  await Promise.all(
+    links.map(async ([fmt, url]) => {
+      try {
+        const r = await fetch(url, { method: "HEAD" });
+        const n = Number(r.headers.get("content-length"));
+        if (r.ok && Number.isFinite(n) && n > 0) sizes[fmt] = n;
+      } catch {
+        // no size shown
+      }
+    }),
+  );
+  if (id === props.bookId) formatSizes.value = sizes;
+}
+
+function humanSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function openFormat(fmt: string) {
+  void openExternally(fmt);
+}
+
+async function openExternally(chosen?: string) {
+  const fmt = chosen ?? externalFormat.value;
   if (!fmt) return;
   openingExternally.value = true;
   openExternallyError.value = null;
@@ -701,7 +763,10 @@ async function load(id: number) {
   loading.value = true;
   error.value = null;
   book.value = null;
-  editing.value = false;
+  form.value = null;
+  baseline.value = null;
+  formatSizes.value = {};
+  dataFiles.value = {};
   convertOpen.value = false;
   shareOpen.value = false;
   quickViewOpen.value = false;
@@ -710,19 +775,30 @@ async function load(id: number) {
   templateResult.value = null;
   templateError.value = null;
   try {
-    book.value = await fetchBook(id);
+    const fetched = await fetchBook(id);
+    if (id !== props.bookId) return; // the selection moved on while this was loading
+    book.value = fetched;
+    fillForm(fetched);
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e);
   } finally {
-    loading.value = false;
+    if (id === props.bookId) loading.value = false;
   }
 }
-watch(() => props.bookId, load, { immediate: true });
-// The list edited this book in place: re-read it without resetting the panel's state.
+watch(
+  () => props.bookId,
+  (id, previous) => {
+    // Keep unsaved edits as a draft for the book being left.
+    if (previous !== undefined && form.value && baseline.value) drafts.stash(previous, form.value, baseline.value);
+    return load(id);
+  },
+  { immediate: true },
+);
+// The list edited this book in place: re-read it. A clean form follows
+// the new values; a dirty one keeps what the user typed.
 watch(
   () => props.refreshKey,
   async () => {
-    if (editing.value) return;
     try {
       book.value = await fetchBook(props.bookId);
     } catch {
@@ -736,18 +812,200 @@ watch(
 // the cached old image. Bust the cache with a query param that
 // changes only when the book data itself was just reloaded.
 const coverVersion = ref(0);
-watch(book, () => coverVersion.value++);
-const coverSrc = computed(() => (book.value ? `${book.value.thumbnail}?v=${coverVersion.value}` : ""));
+watch(book, (b) => {
+  coverVersion.value++;
+  // The book was re-read (an in-place edit in the list, a conversion, a
+  // fetched cover...). A clean form follows the new values; a dirty one
+  // keeps what the user typed and only moves its baseline.
+  if (!b || b.id !== props.bookId || !baseline.value) return;
+  if (dirty.value) baseline.value = formFromBook(b, customColumnFields.value);
+  else fillForm(b);
+});
+const coverSrc = computed(() => (book.value ? `${book.value.cover}?v=${coverVersion.value}` : ""));
+
+// ---------------------------------------------------------------
+// Preview (PDF pages via pdf.js) and the full-window viewer
+// ---------------------------------------------------------------
+//
+// Loaded lazily: nothing is fetched or rendered until the Preview
+// section is open *and* a book is loaded. A page change, a book change
+// or closing the section cancels the render still running, and a token
+// discards a result that arrives after the selection moved on.
+
+const hasPdf = computed(() => (book.value?.formats ?? []).includes("pdf"));
+const previewCanvas = ref<HTMLCanvasElement | null>(null);
+const previewPage = ref(1);
+const previewCount = ref(0);
+const previewBusy = ref(false);
+const previewError = ref<string | null>(null);
+
+let previewDoc: { id: number; promise: Promise<PDFDocumentProxy> } | null = null;
+let previewToken = 0;
+let previewTask: { cancel: () => void } | null = null;
+
+function previewDocument(id: number): Promise<PDFDocumentProxy> {
+  if (previewDoc && previewDoc.id === id) return previewDoc.promise;
+  dropPreviewDoc();
+  const promise = loadPdfJs().then((pdfjs) => pdfjs.getDocument({ url: pdfUrl(String(id)), ...PDF_ASSET_OPTIONS }).promise);
+  previewDoc = { id, promise };
+  promise.catch(() => {
+    if (previewDoc?.promise === promise) previewDoc = null;
+  });
+  return promise;
+}
+
+function dropPreviewDoc() {
+  previewTask?.cancel();
+  previewTask = null;
+  const old = previewDoc;
+  previewDoc = null;
+  void old?.promise.then((d) => d.destroy()).catch(() => undefined);
+}
+
+function isCancel(e: unknown): boolean {
+  return e instanceof Error && e.name === "RenderingCancelledException";
+}
+
+async function renderPreview() {
+  const id = props.bookId;
+  const token = ++previewToken;
+  previewTask?.cancel();
+  previewTask = null;
+  if (!sections.value.preview || !book.value || book.value.id !== id || !hasPdf.value) return;
+  previewBusy.value = true;
+  previewError.value = null;
+  try {
+    const doc = await previewDocument(id);
+    if (token !== previewToken) return;
+    previewCount.value = doc.numPages;
+    const pageNo = Math.min(Math.max(1, previewPage.value), doc.numPages);
+    await nextTick();
+    const canvas = previewCanvas.value;
+    if (!canvas || token !== previewToken) return;
+    const first = await doc.getPage(pageNo);
+    const width = canvas.parentElement?.clientWidth || 320;
+    const scale = scaleForWidth(first.getViewport({ scale: 1 }).width, width);
+    if (token !== previewToken) return;
+    await renderPage(doc, pageNo, { canvas, scale, onTask: (t) => (previewTask = t) });
+  } catch (e) {
+    if (!isCancel(e) && token === previewToken) previewError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    if (token === previewToken) previewBusy.value = false;
+  }
+}
+
+function previewGo(delta: number) {
+  const next = Math.min(Math.max(1, previewPage.value + delta), Math.max(1, previewCount.value));
+  if (next !== previewPage.value) previewPage.value = next;
+}
+
+watch(
+  () => [sections.value.preview, book.value?.id, previewPage.value] as const,
+  () => void renderPreview(),
+);
+// A different book starts at its first page and drops the old document.
+watch(
+  () => props.bookId,
+  () => {
+    previewPage.value = 1;
+    previewCount.value = 0;
+    dropPreviewDoc();
+    closeViewer();
+  },
+);
+// Closing the section stops any render in flight.
+watch(
+  () => sections.value.preview,
+  (open) => {
+    if (!open) {
+      previewToken++;
+      previewTask?.cancel();
+    }
+  },
+);
+onBeforeUnmount(() => {
+  previewToken++;
+  dropPreviewDoc();
+  closeViewer();
+});
+
+// The viewer shows the cover, or the current PDF page rendered large.
+const viewer = ref<null | "cover" | "preview">(null);
+const pageImageUrl = ref("");
+const pageImageBusy = ref(false);
+const VIEWER_PAGE_WIDTH = 2400;
+
+function revokePageImage() {
+  if (pageImageUrl.value) URL.revokeObjectURL(pageImageUrl.value);
+  pageImageUrl.value = "";
+}
+
+async function renderViewerPage() {
+  const id = props.bookId;
+  const pageNo = previewPage.value;
+  pageImageBusy.value = true;
+  try {
+    const doc = await previewDocument(id);
+    const blob = await renderPageToBlob(doc, pageNo, VIEWER_PAGE_WIDTH, "png");
+    if (viewer.value !== "preview" || id !== props.bookId || pageNo !== previewPage.value) return;
+    revokePageImage();
+    pageImageUrl.value = URL.createObjectURL(blob);
+  } catch (e) {
+    previewError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    pageImageBusy.value = false;
+  }
+}
+
+function openCoverViewer() {
+  if (book.value) viewer.value = "cover";
+}
+
+function openPreviewViewer() {
+  if (!hasPdf.value) return;
+  viewer.value = "preview";
+  void renderViewerPage();
+}
+
+function closeViewer() {
+  viewer.value = null;
+  revokePageImage();
+}
+
+watch(previewPage, () => {
+  if (viewer.value === "preview") void renderViewerPage();
+});
+
+function onViewerStep(delta: number) {
+  if (viewer.value === "preview") previewGo(delta);
+  else emit("step-book", delta);
+}
+
+const viewerSrc = computed(() => (viewer.value === "preview" ? pageImageUrl.value : coverSrc.value));
+const viewerCaption = computed(() => (viewer.value === "preview" ? `Page ${previewPage.value} of ${previewCount.value || "?"}` : undefined));
+
+// Data files load once the Files section is open.
+watch(
+  () => [sections.value.files, book.value?.id] as const,
+  ([open, id]) => {
+    if (open && id !== undefined) {
+      void loadDataFiles();
+      void loadFormatSizes();
+    }
+  },
+  { immediate: true },
+);
 
 function read() {
   if (!readableFormat.value) return;
   void router.push({ name: "read", params: { bookId: String(props.bookId), fmt: readableFormat.value } });
 }
 
-const visibleCustomColumnValues = computed(() => {
+/** Custom columns the form cannot edit (computed columns): shown read-only. */
+const readOnlyCustomValues = computed(() => {
   const b = book.value;
   if (!b) return [];
-  return customColumnFields.value.map((f) => ({ field: f, value: b[f.label] })).filter((v) => v.value !== null && v.value !== undefined && v.value !== "");
+  return customColumnFields.value.filter((f) => !f.is_editable).map((f) => ({ field: f, value: b[f.label] })).filter((v) => v.value !== null && v.value !== undefined && v.value !== "");
 });
 
 // ---------------------------------------------------------------
@@ -826,49 +1084,146 @@ watch(
 
 <template>
   <div :class="docked ? 'docked-host' : 'backdrop'" @click.self="!docked && emit('close')">
-    <div class="panel" :class="{ docked }">
+    <div ref="rootEl" class="panel" :class="{ docked }">
       <button class="close" :title="docked ? 'Hide details' : 'Close'" @click="emit('close')">✕</button>
       <p v-if="loading">Loading…</p>
       <p v-else-if="error" class="error">{{ error }}</p>
-      <template v-else-if="book && !editing">
-        <div class="header">
-          <img :src="coverSrc" alt="" class="cover" />
-          <div>
-            <h2>{{ book.title }}</h2>
-            <p class="authors">{{ (book.authors ?? []).join(" & ") }}</p>
-            <p v-if="book.series" class="series">{{ book.series }} #{{ book.series_index }}</p>
-            <p v-if="book.rating" class="rating">{{ "★".repeat(Math.round(book.rating)) }}</p>
-          </div>
+      <template v-else-if="book && form">
+        <div class="title-block">
+          <h2>{{ book.title }}</h2>
+          <p class="authors">{{ (book.authors ?? []).join(" & ") }}</p>
+          <p v-if="book.series" class="series">{{ book.series }} #{{ book.series_index }}</p>
+          <p v-if="book.rating" class="rating">{{ "★".repeat(Math.round(book.rating)) }}</p>
         </div>
-
-        <p v-if="(book.tags ?? []).length" class="tags">{{ (book.tags ?? []).join(", ") }}</p>
-        <dl v-if="visibleCustomColumnValues.length" class="custom-columns">
-          <template v-for="{ field, value } in visibleCustomColumnValues" :key="field.key">
-            <dt>{{ field.name ?? field.label }}</dt>
-            <dd>{{ field.datatype === "bool" ? (value === "1" || value === "true" ? "Yes" : "No") : value }}</dd>
-          </template>
-        </dl>
         <p v-if="deleteError" class="error">{{ deleteError }}</p>
         <p v-if="openExternallyError" class="error">{{ openExternallyError }}</p>
         <p v-if="unpackMessage" class="status">{{ unpackMessage }}</p>
 
-        <div class="formats">
-          <button v-if="readableFormat" class="read" @click="read">Read ({{ readableFormat.toUpperCase() }})</button>
-          <button v-if="canUnpack" class="edit" :disabled="unpacking" @click="unpackBook">{{ unpacking ? "Working…" : `Unpack ${unpackableFormat?.toUpperCase()}…` }}</button>
-          <button v-if="canUnpack" class="edit" :disabled="unpacking" @click="repackBook">Repack…</button>
-          <button v-if="canOpenExternally && externalFormat" class="edit" :disabled="openingExternally" @click="openExternally">
-            {{ openingExternally ? "Opening…" : `Open ${externalFormat.toUpperCase()} externally` }}
+        <CollapsibleSection id="cover" title="Cover" :open="sections.cover" @toggle="toggle('cover')">
+          <button type="button" class="cover-button" title="Click to enlarge" aria-label="Enlarge the cover" @click="openCoverViewer">
+            <img :src="coverSrc" :alt="`Cover of ${book.title}`" class="cover" />
           </button>
-          <a v-for="[fmt, url] in formatLinks" :key="fmt" :href="url" class="download"> Download {{ fmt.toUpperCase() }} </a>
-          <button class="edit" @click="startEditing">Edit metadata</button>
-          <button class="edit" @click="fetchMetadataOpen = true">Fetch metadata online…</button>
-          <button class="edit" @click="openConvert">Convert…</button>
-          <button class="edit" @click="openShare">Send…</button>
-          <button v-if="canTweak" class="edit" @click="tweakOpen = true">Tweak Book…</button>
-          <button class="edit" @click="openQuickView">Quick View…</button>
-          <button class="edit" @click="templateTesterOpen = !templateTesterOpen">Test template…</button>
-          <button class="delete" :disabled="deleting" @click="deleteBook">{{ deleting ? "Deleting…" : "Delete" }}</button>
-        </div>
+          <div class="row">
+            <button type="button" class="edit" @click="coverInput?.click()">Replace cover…</button>
+            <button v-if="canCoverFromPdf" type="button" class="edit" :disabled="saving" title="Render the first page of the PDF as the cover" @click="coverFromPdf">Cover from page 1</button>
+            <input ref="coverInput" type="file" accept="image/jpeg,image/png" class="hidden-file-input" @change="replaceCover" />
+          </div>
+        </CollapsibleSection>
+
+        <CollapsibleSection id="preview" title="Preview" :open="sections.preview" @toggle="toggle('preview')">
+          <template v-if="hasPdf">
+            <div class="row preview-nav">
+              <button type="button" class="edit" :disabled="previewPage <= 1" aria-label="Previous page" @click="previewGo(-1)">‹</button>
+              <label class="page-box">
+                Page
+                <input type="number" min="1" :max="Math.max(1, previewCount)" :value="previewPage" aria-label="Page number" @change="previewPage = Math.min(Math.max(1, Number(($event.target as HTMLInputElement).value) || 1), Math.max(1, previewCount))" />
+                <span v-if="previewCount">of {{ previewCount }}</span>
+              </label>
+              <button type="button" class="edit" :disabled="previewPage >= previewCount" aria-label="Next page" @click="previewGo(1)">›</button>
+            </div>
+            <div class="preview-frame">
+              <canvas ref="previewCanvas" class="preview-canvas" title="Click to enlarge" @click="openPreviewViewer"></canvas>
+              <p v-if="previewBusy" class="hint">Rendering…</p>
+            </div>
+            <p v-if="previewError" class="error">{{ previewError }}</p>
+          </template>
+          <template v-else>
+            <p class="hint">No preview for {{ (book.formats[0] ?? "this book").toUpperCase() }} yet.</p>
+            <button type="button" class="cover-button" title="Click to enlarge" @click="openCoverViewer"><img :src="coverSrc" alt="" class="cover" /></button>
+          </template>
+        </CollapsibleSection>
+
+        <CollapsibleSection id="metadata" title="Metadata" :open="sections.metadata" @toggle="toggle('metadata')">
+          <template #head><span v-if="dirty" class="dirty-mark">unsaved</span></template>
+          <form class="meta-form" @submit.prevent="saveEdits">
+            <div class="fields">
+              <label>Title <input v-model="form.title" data-field="title" required /></label>
+              <label>Authors <input v-model="form.authors" data-field="authors" placeholder="Jane Doe & John Smith" /></label>
+              <label>Series <input v-model="form.series" data-field="series" /></label>
+              <label>Series index <input v-model="form.seriesIndex" data-field="series_index" type="number" step="0.1" /></label>
+              <label>Tags <input v-model="form.tags" data-field="tags" placeholder="scifi, classic" /></label>
+              <label>Rating <input v-model.number="form.rating" data-field="rating" type="number" min="0" max="5" step="1" /></label>
+              <label>Publisher <input v-model="form.publisher" data-field="publisher" /></label>
+              <label>Published <input v-model="form.pubdate" data-field="pubdate" type="date" /></label>
+              <label class="edit-comments">Comments <textarea v-model="form.comments" data-field="comments" rows="4"></textarea></label>
+              <template v-for="field in customColumnFields" :key="field.key">
+                <label v-if="field.is_editable && field.datatype === 'bool'" class="checkbox-field">
+                  <input type="checkbox" :checked="form.custom[field.label] === 'true'" @change="form.custom[field.label] = ($event.target as HTMLInputElement).checked ? 'true' : 'false'" />
+                  {{ field.name ?? field.label }}
+                </label>
+                <label v-else-if="field.is_editable && (field.datatype === 'int' || field.datatype === 'float' || field.datatype === 'rating')">
+                  {{ field.name ?? field.label }}
+                  <input v-model="form.custom[field.label]" :data-field="field.label" type="number" :step="field.datatype === 'int' ? 1 : 0.1" />
+                </label>
+                <label v-else-if="field.is_editable">
+                  {{ field.name ?? field.label }}
+                  <input v-model="form.custom[field.label]" :data-field="field.label" />
+                </label>
+              </template>
+            </div>
+            <p v-if="saveError" class="error">{{ saveError }}</p>
+            <div class="row">
+              <button type="submit" class="read" data-action="save" :disabled="saving || !dirty">{{ saving ? "Saving…" : "Save" }}</button>
+              <button type="button" class="edit" data-action="revert" :disabled="saving || !dirty" @click="revert">Revert</button>
+              <button type="button" class="edit" @click="fetchMetadataOpen = true">Fetch metadata online…</button>
+            </div>
+          </form>
+          <dl v-if="readOnlyCustomValues.length" class="custom-columns">
+            <template v-for="{ field, value } in readOnlyCustomValues" :key="field.key">
+              <dt>{{ field.name ?? field.label }}</dt>
+              <dd>{{ value }}</dd>
+            </template>
+          </dl>
+        </CollapsibleSection>
+
+        <CollapsibleSection id="files" title="Files" :open="sections.files" @toggle="toggle('files')">
+          <ul class="file-list">
+            <li v-for="[fmt, url] in formatLinks" :key="fmt" class="file-row" :data-format="fmt">
+              <span class="file-name">{{ fmt.toUpperCase() }}</span>
+              <span class="file-size">{{ formatSizes[fmt] ? humanSize(formatSizes[fmt]) : "" }}</span>
+              <span class="file-actions">
+                <button v-if="desktop" type="button" class="edit small" data-action="show-in-folder" title="Show this file in the file manager" @click="revealFile(fmt)">Show in folder</button>
+                <button v-if="desktop" type="button" class="edit small" :disabled="openingExternally" @click="openFormat(fmt)">Open</button>
+                <a :href="url" class="download small" :download="`${book.title}.${fmt}`">Download</a>
+                <button type="button" class="format-chip-remove" :disabled="formatBusy" :aria-label="`Remove ${fmt.toUpperCase()}`" title="Remove this format" @click="removeFormatClick(fmt)">✕</button>
+              </span>
+            </li>
+          </ul>
+          <p v-if="formatLinks.length === 0" class="hint">This book has no files.</p>
+          <div class="row">
+            <button type="button" class="edit small" :disabled="formatBusy" @click="formatInput?.click()">{{ formatBusy ? "Working…" : "Add format…" }}</button>
+            <input ref="formatInput" type="file" class="hidden-file-input" @change="addFormatFile" />
+          </div>
+          <div v-if="book.path" class="folder-path">
+            <span class="hint">Folder</span>
+            <code class="path-text" data-testid="folder-path">{{ book.path }}</code>
+            <button type="button" class="edit small" @click="copyFolderPath">{{ copied ? "Copied" : "Copy" }}</button>
+            <button v-if="desktop" type="button" class="edit small" data-action="show-folder" @click="revealBookFolder">Show in folder</button>
+          </div>
+          <div class="format-manager">
+            <span class="format-manager-label">Data files</span>
+            <span v-if="dataFilesLoading" class="hint">Loading…</span>
+            <span v-for="[relpath, stat] in Object.entries(dataFiles)" :key="relpath" class="format-chip" :title="`${stat.size} bytes`">
+              {{ dataFileName(relpath) }}
+              <button type="button" class="format-chip-remove" :disabled="dataFileBusy" :aria-label="`Remove ${dataFileName(relpath)}`" @click="removeDataFileClick(relpath)">✕</button>
+            </span>
+            <button type="button" class="edit small" :disabled="dataFileBusy" @click="dataFileInput?.click()">{{ dataFileBusy ? "Working…" : "Add data file…" }}</button>
+            <input ref="dataFileInput" type="file" class="hidden-file-input" @change="addDataFile" />
+          </div>
+        </CollapsibleSection>
+
+        <CollapsibleSection id="actions" title="Actions" :open="sections.actions" @toggle="toggle('actions')">
+          <div class="actions-row">
+            <button v-if="readableFormat" class="read" @click="read">Read ({{ readableFormat.toUpperCase() }})</button>
+            <button class="edit" @click="openConvert">Convert…</button>
+            <button class="edit" @click="openShare">Send…</button>
+            <button v-if="canTweak" class="edit" @click="tweakOpen = true">Tweak Book…</button>
+            <button class="edit" @click="openQuickView">Quick View…</button>
+            <button class="edit" @click="templateTesterOpen = !templateTesterOpen">Test template…</button>
+            <button v-if="canUnpack" class="edit" :disabled="unpacking" @click="unpackBook">{{ unpacking ? "Working…" : `Unpack ${unpackableFormat?.toUpperCase()}…` }}</button>
+            <button v-if="canUnpack" class="edit" :disabled="unpacking" @click="repackBook">Repack…</button>
+            <button class="delete" :disabled="deleting" @click="deleteBook">{{ deleting ? "Deleting…" : "Delete" }}</button>
+          </div>
 
         <div v-if="templateTesterOpen" class="template-tester">
           <p class="hint">Template Program Mode only (e.g. <code>field('title')</code>) -- the <code>{field}</code> shorthand isn't supported yet.</p>
@@ -1007,76 +1362,15 @@ watch(
           <p v-if="shareDone" class="convert-done">Sent.</p>
           <p v-if="shareError" class="error">{{ shareError }}</p>
         </form>
+        </CollapsibleSection>
       </template>
-
-      <form v-else-if="book && editing" class="edit-form" @submit.prevent="saveEdits">
-        <div class="header">
-          <div class="cover-edit">
-            <img :src="coverSrc" alt="" class="cover" />
-            <button type="button" @click="coverInput?.click()">Replace cover…</button>
-            <button v-if="canCoverFromPdf" type="button" :disabled="saving" title="Render the first page of the PDF as the cover" @click="coverFromPdf">Cover from page 1</button>
-            <input ref="coverInput" type="file" accept="image/jpeg,image/png" class="hidden-file-input" @change="replaceCover" />
-          </div>
-          <div class="fields">
-            <label>Title <input v-model="editTitle" required /></label>
-            <label>Authors <input v-model="editAuthors" placeholder="Jane Doe & John Smith" /></label>
-            <label>Series <input v-model="editSeries" /></label>
-            <label>Series index <input v-model="editSeriesIndex" type="number" step="0.1" /></label>
-            <label>Tags <input v-model="editTags" placeholder="scifi, classic" /></label>
-            <label>Rating <input v-model.number="editRating" type="number" min="0" max="5" step="1" /></label>
-            <label>Publisher <input v-model="editPublisher" /></label>
-            <label>Published <input v-model="editPubdate" type="date" /></label>
-            <label class="edit-comments">Comments <textarea v-model="editComments" rows="4"></textarea></label>
-            <template v-for="field in customColumnFields" :key="field.key">
-              <label v-if="field.is_editable && field.datatype === 'bool'" class="checkbox-field">
-                <input type="checkbox" :checked="editCustomValues[field.label] === 'true'" @change="editCustomValues[field.label] = ($event.target as HTMLInputElement).checked ? 'true' : 'false'" />
-                {{ field.name ?? field.label }}
-              </label>
-              <label v-else-if="field.is_editable && (field.datatype === 'int' || field.datatype === 'float' || field.datatype === 'rating')">
-                {{ field.name ?? field.label }}
-                <input v-model="editCustomValues[field.label]" type="number" :step="field.datatype === 'int' ? 1 : 0.1" />
-              </label>
-              <label v-else-if="field.is_editable">
-                {{ field.name ?? field.label }}
-                <input v-model="editCustomValues[field.label]" />
-              </label>
-            </template>
-          </div>
-        </div>
-
-        <div class="format-manager">
-          <span class="format-manager-label">Formats</span>
-          <span v-for="[fmt] in formatLinks" :key="fmt" class="format-chip">
-            {{ fmt.toUpperCase() }}
-            <button type="button" class="format-chip-remove" :disabled="formatBusy" @click="removeFormatClick(fmt)" :aria-label="`Remove ${fmt.toUpperCase()}`">✕</button>
-          </span>
-          <button type="button" :disabled="formatBusy" @click="formatInput?.click()">{{ formatBusy ? "Working…" : "Add format…" }}</button>
-          <input ref="formatInput" type="file" class="hidden-file-input" @change="addFormatFile" />
-        </div>
-
-        <div class="format-manager">
-          <span class="format-manager-label">Data files</span>
-          <span v-if="dataFilesLoading" class="hint">Loading…</span>
-          <span v-for="[relpath, stat] in Object.entries(dataFiles)" :key="relpath" class="format-chip" :title="`${stat.size} bytes`">
-            {{ dataFileName(relpath) }}
-            <button type="button" class="format-chip-remove" :disabled="dataFileBusy" @click="removeDataFileClick(relpath)" :aria-label="`Remove ${dataFileName(relpath)}`">✕</button>
-          </span>
-          <button type="button" :disabled="dataFileBusy" @click="dataFileInput?.click()">{{ dataFileBusy ? "Working…" : "Add data file…" }}</button>
-          <input ref="dataFileInput" type="file" class="hidden-file-input" @change="addDataFile" />
-        </div>
-
-        <p v-if="saveError" class="error">{{ saveError }}</p>
-
-        <div class="formats">
-          <button type="submit" class="read" :disabled="saving">{{ saving ? "Saving…" : "Save" }}</button>
-          <button type="button" @click="editing = false" :disabled="saving">Cancel</button>
-        </div>
-      </form>
     </div>
   </div>
+  <ImageViewer v-if="viewer" :src="viewerSrc" :title="book?.title ?? ''" :caption="viewerCaption" :loading="pageImageBusy" steppable @close="closeViewer" @step="onViewerStep" />
   <TweakEditor v-if="tweakOpen" :book-id="bookId" @close="tweakOpen = false" @updated="onTweakUpdated" />
   <FetchMetadataDialog v-if="fetchMetadataOpen" :book-id="bookId" :book="book" @close="fetchMetadataOpen = false" @updated="onFetchMetadataUpdated" />
 </template>
+
 
 <style scoped>
 .backdrop {
@@ -1128,9 +1422,122 @@ watch(
   gap: 1em;
 }
 .cover {
-  width: 90px;
-  height: auto;
-  flex-shrink: 0;
+  /* Fits the panel width; the panel itself is resizable. */
+  display: block;
+  width: 100%;
+  max-height: 45vh;
+  object-fit: contain;
+}
+.cover-button {
+  all: unset;
+  display: block;
+  width: 100%;
+  cursor: zoom-in;
+}
+.cover-button:focus-visible {
+  outline: 2px solid var(--accent);
+}
+.title-block h2 {
+  margin: 0 1.5rem 0.2rem 0;
+  font-size: var(--fs-large, 1.15em);
+}
+.title-block p {
+  margin: 0.1rem 0;
+}
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4em;
+  margin-top: 0.5em;
+  align-items: center;
+}
+.preview-frame {
+  margin-top: 0.5em;
+  width: 100%;
+  overflow: hidden;
+}
+.preview-canvas {
+  display: block;
+  max-width: 100%;
+  cursor: zoom-in;
+  border: 1px solid var(--border);
+}
+.page-box {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+  font-size: var(--fs-small);
+}
+.page-box input {
+  width: 4em;
+  font: inherit;
+}
+.meta-form .fields label {
+  display: flex;
+  flex-direction: column;
+}
+.meta-form .fields input,
+.meta-form .fields textarea {
+  font: inherit;
+  padding: 0.35em 0.5em;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.dirty-mark {
+  font-size: var(--fs-small);
+  color: var(--accent);
+}
+.file-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.file-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  padding: 0.25em 0;
+  flex-wrap: wrap;
+}
+.file-name {
+  font-weight: 600;
+  min-width: 3.5em;
+}
+.file-size {
+  color: var(--fg-faint);
+  font-size: var(--fs-small);
+}
+.file-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 0.3em;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.small {
+  padding: 0.2em 0.55em !important;
+  font-size: var(--fs-small);
+}
+.folder-path {
+  display: flex;
+  gap: 0.4em;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 0.6em;
+}
+.path-text {
+  flex: 1;
+  min-width: 0;
+  word-break: break-all;
+  font-size: var(--fs-small);
+}
+.actions-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4em;
+}
+.actions-row .delete {
+  margin-left: 0;
 }
 .authors {
   color: var(--fg-muted);

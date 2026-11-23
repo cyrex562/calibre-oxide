@@ -110,6 +110,7 @@ export type LibraryActionId =
   | "check-library"
   | "find-duplicates"
   | "organize-files"
+  | "file-naming"
   | "export-copy"
   | "fix-titles"
   | "fix-titles-selected"
@@ -189,6 +190,7 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   // library -> Browse for another" reads as "find an existing one".
   { id: "new-library", label: "New library…", group: "library", requires: "none", toolbar: true, desktopOnly: true, primary: true, icon: "lt", tooltip: "Create an empty library and open it" },
   { id: "organize-files", label: "Organize files…", group: "library", requires: "none", icon: "tb_folder", tooltip: "Move books' files inside the library to folders and names from a template" },
+  { id: "file-naming", label: "File naming…", group: "library", requires: "none", icon: "tb_folder", tooltip: "Set the library's folder and file naming convention, the default for Organize, Rename files and Fix titles" },
   { id: "export-copy", label: "Export a copy…", group: "library", requires: "none", icon: "bookshelf", tooltip: "Copy the library (or some books) to another folder or drive: a travel copy you can refresh, or a backup mirror" },
   { id: "fix-titles", label: "Fix titles…", group: "library", requires: "none", icon: "edit_input", tooltip: "Find junk titles in the library, suggest clean ones, and set them (optionally in the files too)" },
   { id: "trash", label: "Trash…", group: "library", requires: "none", icon: "remove_books", tooltip: "Restore or permanently delete books and formats you removed" },
@@ -235,7 +237,7 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   { id: "test-template", label: "Test template…", group: "book", requires: "single-selection", contextMenu: true, icon: "template_funcs", tooltip: "Try a template against a real book" },
   { id: "send-email", label: "Send…", group: "book", requires: "single-selection", contextMenu: true, icon: "mail", accel: "Ctrl+E", tooltip: "Email a book to a device or address" },
   { id: "replace-cover", label: "Replace cover…", group: "book", requires: "single-selection", contextMenu: true, icon: "default_cover", tooltip: "Replace the cover image" },
-  { id: "open-book-folder", label: "Open containing folder", group: "book", requires: "single-selection", contextMenu: true, desktopOnly: true, icon: "tb_folder", tooltip: "Show this book's files in the file browser" },
+  { id: "open-book-folder", label: "Show in folder", group: "book", requires: "single-selection", contextMenu: true, desktopOnly: true, icon: "tb_folder", tooltip: "Show this book's files in the file browser" },
   { id: "cover-from-pdf", label: "Cover from PDF page 1", group: "book", requires: "single-selection", contextMenu: true, icon: "default_cover", tooltip: "Render the first page of the PDF as the cover" },
   { id: "similar-books", label: "Similar books", group: "book", requires: "single-selection", contextMenu: true, icon: "similar", tooltip: "Find books like this one" },
   // Selection-scoped rather than book-scoped: polishing a batch is
@@ -459,7 +461,7 @@ export const TOOLBAR_LAYOUT: ToolbarItem[] = [
   { kind: "spring" },
   // Label is replaced at render time with the open library's name:
   // which library you are in is state, and state belongs on a label.
-  { kind: "menu", id: "library", label: "Library", icon: "lt", menu: ["switch-library", "new-library", "open-library-folder", "-", "$recent-libraries", "-", "check-library", "find-duplicates", "organize-files", "fix-titles", "-", "export-copy", "trash"] },
+  { kind: "menu", id: "library", label: "Library", icon: "lt", menu: ["switch-library", "new-library", "open-library-folder", "-", "$recent-libraries", "-", "check-library", "find-duplicates", "organize-files", "file-naming", "fix-titles", "-", "export-copy", "trash"] },
   { kind: "split", id: "help", menu: ["$shortcuts", "$about"] },
 ];
 

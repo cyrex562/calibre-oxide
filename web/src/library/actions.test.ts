@@ -377,3 +377,12 @@ describe("the trash action", () => {
     expect(trash.desktopOnly).toBeFalsy();
   });
 });
+
+describe("Show in folder", () => {
+  it("is a desktop-only context-menu action named Show in folder", () => {
+    const a = LIBRARY_ACTIONS.find((x) => x.id === "open-book-folder")!;
+    expect(a.label).toBe("Show in folder");
+    expect(a.contextMenu).toBe(true);
+    expect(a.desktopOnly).toBe(true);
+  });
+});

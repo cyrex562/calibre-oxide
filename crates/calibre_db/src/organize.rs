@@ -134,6 +134,16 @@ fn components(cache: &Cache, book_id: i32, template: &str) -> Result<Vec<String>
     Ok(parts)
 }
 
+/// What a template gives one book: its folder (`/`-separated, possibly empty)
+/// and file stem. Empty path segments are dropped (a value that is missing
+/// leaves no `//` and no empty folder); a template that renders to nothing
+/// falls back to the book id.
+pub fn render(cache: &Cache, book_id: i32, template: &str) -> Result<(String, String)> {
+    let parts = components(cache, book_id, template)?;
+    let (stem, dirs) = parts.split_last().expect("components is never empty");
+    Ok((dirs.join("/"), stem.clone()))
+}
+
 fn fingerprint(template: &str, books: &[PlannedBook]) -> String {
     let mut h = blake3::Hasher::new();
     h.update(template.as_bytes());
@@ -175,6 +185,23 @@ pub enum Target<'a> {
     /// One folder, relative to the library (already through [`validate_folder`]);
     /// each file keeps its own name.
     Folder(&'a str),
+    /// Rename a folder: every book at `from` (or below it) moves to the same
+    /// place under `to`, keeping its sub-folders and file names. Both are
+    /// relative to the library, `to` already through [`validate_folder`]. Use
+    /// with [`Scope::PathPrefix`]`(from)`.
+    Rebase { from: &'a str, to: &'a str },
+}
+
+/// `path` with its leading `from` folder replaced by `to` (`None` when `path`
+/// is not at or under `from`). Segment-wise and case-insensitive on `from`.
+fn rebase_path(path: &str, from: &str, to: &str) -> Option<String> {
+    let (p, f) = (path.trim_matches('/'), from.trim_matches('/'));
+    if p.eq_ignore_ascii_case(f) {
+        return Some(to.to_string());
+    }
+    let head = p.get(..f.len())?;
+    let rest = p.get(f.len()..)?.strip_prefix('/')?;
+    head.eq_ignore_ascii_case(f).then(|| join_rel(to, rest))
 }
 
 /// Names Windows will not let a file or folder have.
@@ -253,8 +280,9 @@ pub fn plan_to(cache: &Cache, target: Target<'_>, scope: &Scope) -> Result<Organ
     let label = match target {
         Target::Template(t) => t.to_string(),
         Target::Folder(f) => format!("move to {f}"),
+        Target::Rebase { from, to } => format!("rename folder {from} to {to}"),
     };
-    if let Target::Folder(f) = target {
+    if let Target::Folder(f) | Target::Rebase { to: f, .. } = target {
         if passes_through_link(library, f) {
             return Err(anyhow!("the folder {f} goes through a link out of the library"));
         }
@@ -288,6 +316,13 @@ pub fn plan_to(cache: &Cache, target: Target<'_>, scope: &Scope) -> Result<Organ
                 (dirs.join("/"), Some(stem.clone()))
             }
             Target::Folder(folder) => (folder.to_string(), None),
+            Target::Rebase { from, to } => match rebase_path(&old_path, from, to) {
+                Some(p) => (p, None),
+                None => {
+                    skipped.push(Skipped { book_id, reason: format!("the book is not inside {from}") });
+                    continue;
+                }
+            },
         };
         let stem_for = |old_stem: &str, n: usize| -> String {
             let base = fixed_stem.clone().unwrap_or_else(|| old_stem.to_string());
