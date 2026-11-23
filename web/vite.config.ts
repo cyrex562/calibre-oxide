@@ -8,6 +8,8 @@ import vue from "@vitejs/plugin-vue";
 // upstream calibre's own separation between its desktop GUI and its
 // content-server browser UI. See #432's issue body for the full
 // investigation behind that split.
+const PROXIED = ["/book-manifest", "/book-file", "/book-get-last-read-position", "/book-set-last-read-position", "/book-get-annotations", "/book-update-annotations", "/ajax", "/get"];
+
 export default defineConfig({
   plugins: [vue()],
   test: {
@@ -15,19 +17,20 @@ export default defineConfig({
   },
   server: {
     port: 5180,
-    proxy: {
-      // During `npm run dev`, proxy API calls to a locally running
-      // calibre_srv (see crates/calibre_srv's own README for how to
-      // start it against a test library) so the dev server doesn't
-      // need calibre_srv to also serve the frontend.
-      "/book-manifest": "http://127.0.0.1:8080",
-      "/book-file": "http://127.0.0.1:8080",
-      "/book-get-last-read-position": "http://127.0.0.1:8080",
-      "/book-set-last-read-position": "http://127.0.0.1:8080",
-      "/book-get-annotations": "http://127.0.0.1:8080",
-      "/book-update-annotations": "http://127.0.0.1:8080",
-      "/ajax": "http://127.0.0.1:8080",
-      "/get": "http://127.0.0.1:8080",
-    },
+    // During `npm run dev`, proxy API calls to a locally running
+    // calibre_srv (see crates/calibre_srv's own README for how to
+    // start it against a test library) so the dev server doesn't
+    // need calibre_srv to also serve the frontend. The browser's
+    // `Origin` (the dev server's port) is dropped: calibre_srv refuses
+    // state-changing requests from a foreign origin (guard.rs).
+    proxy: PROXIED.reduce<Record<string, object>>((acc, path) => {
+      acc[path] = {
+        target: "http://127.0.0.1:8080",
+        configure: (proxy: { on: (ev: string, cb: (req: { removeHeader: (h: string) => void }) => void) => void }) => {
+          proxy.on("proxyReq", (req) => req.removeHeader("origin"));
+        },
+      };
+      return acc;
+    }, {}),
   },
 });
