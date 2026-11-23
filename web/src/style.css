@@ -43,7 +43,6 @@
   --ctl-h: 26px;      /* inputs, selects, ordinary buttons       */
   --ctl-h-lg: 30px;   /* primary dialog buttons                  */
   --tb-h: 56px;       /* toolbar, icon above label               */
-  --tb-icon: 24px;
   --row-h: 24px;      /* table row, compact                      */
   --row-h-lg: 30px;   /* table row, comfortable                  */
   --radius: 3px;
@@ -79,7 +78,6 @@
   --shadow-menu: 0 6px 20px rgb(0 0 0 / 18%);
   --shadow-dialog: 0 16px 48px rgb(0 0 0 / 28%);
   --focus-ring: 0 0 0 2px rgb(42 109 244 / 45%);
-  --icon-filter: none;
 }
 
 /*
@@ -120,7 +118,6 @@
     --diff-remove: #3a1d1d;
     --shadow-menu: 0 6px 20px rgb(0 0 0 / 45%);
     --shadow-dialog: 0 16px 48px rgb(0 0 0 / 60%);
-    --icon-filter: invert(1) hue-rotate(180deg) brightness(1.1);
   }
 }
 
@@ -152,7 +149,6 @@
   --diff-remove: #3a1d1d;
   --shadow-menu: 0 6px 20px rgb(0 0 0 / 45%);
   --shadow-dialog: 0 16px 48px rgb(0 0 0 / 60%);
-  --icon-filter: invert(1) hue-rotate(180deg) brightness(1.1);
 }
 
 * {

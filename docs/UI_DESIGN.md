@@ -304,49 +304,56 @@ action.
   button when only one library is known.
 - Menus may nest one level.
 
-### 2.4 Icons: yes
+### 2.4 Icons: yes, Lucide
 
-Use calibre's own — the project is GPL-3 and 192 PNGs are vendored at
-`old_src/resources/images/`. Follow the precedent of
-`web/scripts/copy-pdfjs-assets.mjs` (wired as `prebuild`/`predev`): add
-`web/scripts/copy-icons.mjs` copying a curated ~45-file subset into
+The UI uses [Lucide](https://lucide.dev) (ISC licence) through the
+`lucide-vue-next` package, pinned to an exact version. Calibre's PNG
+icons are no longer shipped: there is no `copy-icons` script and no
 `web/public/icons/`.
 
-| action | file | | action | file |
+All icon names live in one table, `web/src/icons.ts`, keyed by the
+names that `actions.ts` (`icon:`), `TOOLBAR_LAYOUT` and a few components
+already use, so adding a button is "pick a name that is in the table".
+`web/src/components/AppIcon.vue` renders one: an inline SVG that draws
+in `currentColor` (so light and dark themes need no filter), stroke
+width 1.75, 22px in the toolbar, 16px in the category tree, 15px inside
+the search field. `icons.test.ts` fails if any action, toolbar menu or
+hand-picked icon name has no Lucide component.
+
+| icon name | Lucide | | icon name | Lucide |
 |---|---|---|---|---|
-| add-books | `add_book.png` | | polish | `polish.png` |
-| add-folder | `tb_folder.png` | | tweak-book | `tweak.png` |
-| fetch-news | `news.png` | | unpack-book | `unpack-book.png` |
-| edit-metadata | `edit_input.png` | | repack-book | `sync.png` |
-| fetch-metadata | `download-metadata.png` | | quick-view | `quickview.png` |
-| replace-cover | `default_cover.png` | | similar-books | `similar.png` |
-| bulk-edit | `merge_books.png` | | mark-books | `marked.png` |
-| map-metadata | `tags.png` | | delete-book | `remove_books.png` |
-| convert | `convert.png` | | restore-deleted | `edit-undo.png` |
-| read | `view.png` | | switch-library | `lt.png` |
-| open-externally | `external-link.png` | | check-library | `reports.png` |
-| save-to-disk | `save.png` | | find-duplicates | `merge.png` |
-| send-email | `mail.png` | | custom-columns | `column.png` |
-| export-catalog | `catalog.png` | | virtual library | `vl.png` |
-| export-library-archive | `bookshelf.png` | | browse-annotations | `highlight.png` |
-| test-template | `template_funcs.png` | | pick-random | `random.png` |
-| preferences | `config.png` | | help | `help.png` |
-| search | `search.png` | | jobs | `jobs.png` |
-| advanced search | `gear.png` | | full-text search | `fts.png` |
-| saved searches | `folder_saved_search.png` | | sort | `sort.png` |
-| clear VL | `minus.png` | | highlight toggle | `arrow-down.png` |
-| grid view | `grid.png` | | layout button | `layout.png` |
-| search parse error | `dialog_error.png` | | overflow | `h-ellipsis.png` |
+| `add_book` | `BookPlus` | | `polish` | `Sparkles` |
+| `tb_folder` | `FolderOpen` | | `tweak` | `Wrench` |
+| `news` | `Newspaper` | | `unpack-book` | `PackageOpen` |
+| `edit_input` | `SquarePen` | | `sync` | `RefreshCw` |
+| `download-metadata` | `CloudDownload` | | `quickview` | `Eye` |
+| `default_cover` | `Image` | | `similar` | `ScanSearch` |
+| `merge_books` | `Merge` | | `marked` | `BookmarkCheck` |
+| `tags` | `Tags` | | `remove_books` | `Trash2` |
+| `convert` | `ArrowRightLeft` | | `edit-undo` | `Undo2` |
+| `view` | `BookOpen` | | `lt` | `Library` |
+| `external-link` | `ExternalLink` | | `reports` | `ClipboardCheck` |
+| `save` | `Save` | | `merge` | `Copy` |
+| `mail` | `Mail` | | `column` | `Columns3` |
+| `catalog` | `BookText` | | `vl` | `ListFilter` |
+| `bookshelf` | `Archive` | | `highlight` | `Highlighter` |
+| `copy_to_library` | `FolderInput` | | `random` | `Shuffle` |
+| `template_funcs` | `Braces` | | `help` | `CircleHelp` |
+| `config` | `Settings` | | `jobs` | `ListTodo` |
+| `search` | `Search` | | `fts` | `FileSearch` |
+| `gear` | `SlidersHorizontal` | | `folder_saved_search` | `FolderSearch` |
+| `sort` | `ArrowUpDown` | | `minus` | `Minus` |
+| `arrow-down` | `ArrowDown` | | `dialog_error` | `CircleAlert` |
+| `window-close` | `X` | | `grid` | `LayoutGrid` |
+| `layout` | `PanelLeft` | | `h-ellipsis` | `Ellipsis` |
 
-Category icons: `user_profile.png`, `tags.png`, `series.png`,
-`publisher.png`, `languages.png`, `rating.png`. Format pills:
-`old_src/resources/images/mimetypes/`.
+Category icons: `user_profile` `User`, `series` `Layers`, `publisher`
+`Building2`, `languages` `Languages`, `rating` `Star` (`tags` as above).
+Format pills: `old_src/resources/images/mimetypes/` is no longer used.
 
-**Dark-mode caveat:** these are raster PNGs with baked-in dark line art.
-calibre ships `-for-dark-theme` variants for a handful. For the rest,
-apply `filter: var(--icon-filter)` — `invert(1) hue-rotate(180deg)
-brightness(1.1)` in the dark token block. Verify per icon; where
-inversion fails, pull the `-for-dark-theme` file.
+The app's own mark is `app/src-tauri/icons/logo.svg` (a book with a cog
+on a rounded square). `icon.ico` and `icon.png` are generated from it
+with `cargo tauri icon`, and `web/public/favicon.svg` is a copy.
 
 ### 2.5 Labels and sizing
 
@@ -760,7 +767,7 @@ Effort in rough dev-days, one person.
 | # | Item | Files | Days |
 |---|---|---|---|
 | 1 | **Token sheet + mechanical restyle.** §4.1/§4.2 into `style.css`; replace every hardcoded hex and `em` font-size across the 12 components; delete the 12 ad-hoc dark blocks. Fixes the white-body dark-mode bug. | `style.css` + all `.vue` | 1.5 |
-| 2 | **Toolbar + search bar restructure.** Registry schema (§1.1), `TOOLBAR_LAYOUT` (§2.2), `ToolbarButton.vue`, icon vendoring script, row swap, two-stage overflow (§2.6). Plus the search bar rebuild (§2.1) and the one-line §0.2 fix. | `actions.ts`, `LibraryView.vue`, new `ToolbarButton.vue`, `scripts/copy-icons.mjs` | 3 |
+| 2 | **Toolbar + search bar restructure.** Registry schema (§1.1), `TOOLBAR_LAYOUT` (§2.2), `ToolbarButton.vue`, `AppIcon.vue` + `icons.ts` (Lucide), row swap, two-stage overflow (§2.6). Plus the search bar rebuild (§2.1) and the one-line §0.2 fix. | `actions.ts`, `LibraryView.vue`, new `ToolbarButton.vue`, `icons.ts` | 3 |
 | 3 | **Categories panel rewrite** (§3.3). | `CategoryBrowser.vue` | 1.5 |
 | 4 | **Library discoverability** (§5.1): named library menu button, create/open/rename, window title, first-run empty state. | `LibraryView.vue`, `app/src-tauri/src/{settings,lib}.rs` | 1.5 |
 

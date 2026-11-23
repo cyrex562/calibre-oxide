@@ -85,8 +85,7 @@ export interface LibraryAction {
    * everything else is one click away and nothing is lost.
    */
   /**
-   * Icon basename under `/icons`, without the extension. Copied from
-   * calibre's own set by `scripts/copy-icons.mjs`.
+   * Icon name, mapped to a Lucide component by `src/icons.ts`.
    */
   icon?: string;
   /** Display-only accelerator, e.g. `"Ctrl+Shift+E"`. */

@@ -12,6 +12,7 @@ import { commitCellEdit, type CommitResult } from "../library/inlineEdit";
 import { navigateIndex } from "../library/virtualList";
 import ContextMenu, { type ContextMenuEntry } from "./ContextMenu.vue";
 import ToolbarButton from "./ToolbarButton.vue";
+import AppIcon from "./AppIcon.vue";
 import MapperDialog from "./MapperDialog.vue";
 import AnnotationsBrowser from "./AnnotationsBrowser.vue";
 import PolishDialog from "./PolishDialog.vue";
@@ -3040,12 +3041,12 @@ watch(coloringRules, () => {
           :title="ftsMode ? 'Searching inside books — click for metadata search' : 'Search inside book text'"
           @click="ftsMode = !ftsMode"
         >
-          <img src="/icons/fts.png" alt="Full-text search" class="in-field-icon" />
+          <AppIcon name="fts" :size="15" class="in-field-icon" />
         </button>
         <input ref="searchInput" v-model="queryText" type="search" :placeholder="ftsMode ? 'Search book contents…' : 'Search…'" />
         <button v-if="queryText" type="button" class="in-field" title="Clear" @click="queryText = ''; submitSearch()">✕</button>
         <button type="submit" class="search-go" title="Search">
-          <img src="/icons/search.png" alt="Search" class="in-field-icon" />
+          <AppIcon name="search" :size="15" class="in-field-icon" />
         </button>
       </form>
 
@@ -4058,9 +4059,7 @@ watch(coloringRules, () => {
   color: var(--accent);
 }
 .in-field-icon {
-  width: 14px;
-  height: 14px;
-  filter: var(--icon-filter);
+  color: currentColor;
 }
 
 /* The active virtual library is named next to its button, because

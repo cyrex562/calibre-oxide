@@ -10,10 +10,11 @@
 // See docs/UI_DESIGN.md §2.3 for the behaviour this implements.
 
 import { computed, ref } from "vue";
+import AppIcon from "./AppIcon.vue";
 
 const props = defineProps<{
   label: string;
-  /** Icon basename under `/icons`, without extension. */
+  /** App icon name; `src/icons.ts` maps it to a Lucide component. */
   icon?: string;
   /** Renders the chevron and enables the menu affordances. */
   hasMenu?: boolean;
@@ -77,7 +78,6 @@ function onContextMenu(event: MouseEvent) {
 }
 
 const tooltip = computed(() => props.title ?? (props.compact ? props.label : undefined));
-const iconSrc = computed(() => (props.icon ? `/icons/${props.icon}.png` : null));
 </script>
 
 <template>
@@ -95,7 +95,7 @@ const iconSrc = computed(() => (props.icon ? `/icons/${props.icon}.png` : null))
       :aria-pressed="active ? 'true' : undefined"
       @click="onBodyClick"
     >
-      <img v-if="iconSrc" class="tb-icon" :src="iconSrc" alt="" draggable="false" />
+      <AppIcon v-if="icon" class="tb-icon" :name="icon" :size="22" />
       <span v-if="!compact" class="tb-label">{{ label }}</span>
     </button>
     <button
@@ -162,13 +162,7 @@ const iconSrc = computed(() => (props.icon ? `/icons/${props.icon}.png` : null))
 }
 
 .tb-icon {
-  width: var(--tb-icon);
-  height: var(--tb-icon);
-  /* calibre's icons are raster PNGs with dark line art baked in, so
-     dark mode inverts them rather than swapping files. A handful ship
-     a purpose-drawn `-for-dark-theme` variant; those are copied too
-     and can be pointed at individually where inversion looks wrong. */
-  filter: var(--icon-filter);
+  /* Lucide line art draws in currentColor, so it follows the theme. */
   flex-shrink: 0;
 }
 

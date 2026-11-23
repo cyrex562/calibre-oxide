@@ -84,8 +84,8 @@ Beyond the Rust dependency tree (whose licences travel with the crates
 and are overwhelmingly MIT/Apache-2.0), these are checked in or shipped
 inside the binary:
 
-  * `old_src/resources/images/` -- calibre's own icon set. GPL v3, same
-    as the rest of calibre.
+  * `lucide-vue-next` (web UI icons) -- Lucide, ISC licence. Pulled in
+    from npm at build time and bundled into the web UI.
 
   * `crates/calibre_srv/resources/mathjax/` -- MathJax 3.1.4,
     Apache-2.0. Vendored so mathematical content renders offline.

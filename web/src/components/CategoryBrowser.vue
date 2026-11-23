@@ -14,6 +14,7 @@
 // See docs/UI_DESIGN.md §3.3.
 
 import { computed, ref, watch } from "vue";
+import AppIcon from "./AppIcon.vue";
 
 import { fetchCategories, fetchCategory, renameCategoryItem } from "../library/api";
 import {
@@ -186,7 +187,7 @@ async function renameItem(key: CategoryKey, item: CategoryItem) {
   }
 }
 
-/** Icon per standard category, from calibre's own set. */
+/** Icon per standard category (mapped to Lucide in `src/icons.ts`). */
 const CATEGORY_ICONS: Record<string, string> = {
   authors: "user_profile",
   tags: "tags",
@@ -242,7 +243,7 @@ const findOpen = ref(false);
           @click="toggle(cat)"
         >
           <span class="twisty" aria-hidden="true">{{ effectivelyOpen.has(keyOf(cat.url)) ? "▾" : "▸" }}</span>
-          <img v-if="iconFor(keyOf(cat.url))" class="cat-icon" :src="`/icons/${iconFor(keyOf(cat.url))}.png`" alt="" />
+          <AppIcon v-if="iconFor(keyOf(cat.url))" class="cat-icon" :name="iconFor(keyOf(cat.url))" :size="16" />
           <span class="cat-name">{{ cat.name }}</span>
         </button>
 
@@ -375,9 +376,7 @@ const findOpen = ref(false);
   color: var(--fg-faint);
 }
 .cat-icon {
-  width: 16px;
-  height: 16px;
-  filter: var(--icon-filter);
+  color: var(--fg-muted);
   flex-shrink: 0;
 }
 .cat-name {
