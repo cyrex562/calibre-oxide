@@ -94,7 +94,7 @@ function empty() {
 
 <template>
   <div class="manage-backdrop" @click.self="emit('close')">
-    <div class="manage-panel trash-panel" role="dialog" aria-label="Trash">
+    <div class="manage-panel trash-panel" role="dialog" aria-modal="true" aria-label="Trash">
       <h3>Trash</h3>
       <p class="hint">
         Books and formats you removed from the library, kept inside it so they can be put back.
@@ -178,7 +178,7 @@ function empty() {
   cursor: pointer;
 }
 .trash-table tbody tr.chosen {
-  background: var(--selection, rgba(80, 140, 255, 0.18));
+  background: var(--bg-selected);
 }
 .trash-actions {
   display: flex;

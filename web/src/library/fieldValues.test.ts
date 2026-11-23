@@ -158,3 +158,22 @@ describe("value cache", () => {
     expect(await getFieldValues("tags", good)).toEqual([v("A")]);
   });
 });
+
+describe("suggest cost", () => {
+  it("folds each known value once, not again on every keystroke", () => {
+    const values = Array.from({ length: 200 }, (_, i) => v(`Authörs Number ${i}`, i));
+    const spy = vi.spyOn(String.prototype, "normalize");
+    try {
+      suggest(values, "auth");
+      const first = spy.mock.calls.length;
+      suggest(values, "autho");
+      suggest(values, "author");
+      const more = spy.mock.calls.length - first;
+      // Only the typed text is folded again: a few characters, not 200 names of 16.
+      expect(first).toBeGreaterThan(values.length);
+      expect(more).toBeLessThan(40);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});

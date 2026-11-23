@@ -56,7 +56,6 @@ watch(() => props.refreshKey, () => void load());
 
 const roots = computed(() => buildFolderTree(folders.value));
 const rows = computed(() => visibleFolderRows(roots.value, expanded.value));
-const hasChildren = (path: string) => folders.value.some((f) => f.path.startsWith(`${path}/`));
 
 function toggle(path: string) {
   expanded.value = toggleFolder(expanded.value, path);
@@ -208,7 +207,7 @@ function planTitle(): string {
           @drop="onDrop(row.node.path, $event)"
           @contextmenu.prevent="menu = { x: $event.clientX, y: $event.clientY, path: row.node.path }"
         >
-          <button v-if="hasChildren(row.node.path)" type="button" class="twisty-btn" :aria-label="expanded.has(row.node.path) ? 'Collapse' : 'Expand'" @click.stop="toggle(row.node.path)">{{ expanded.has(row.node.path) ? "▾" : "▸" }}</button>
+          <button v-if="row.node.children.length > 0" type="button" class="twisty-btn" :aria-label="expanded.has(row.node.path) ? 'Collapse' : 'Expand'" @click.stop="toggle(row.node.path)">{{ expanded.has(row.node.path) ? "▾" : "▸" }}</button>
           <span v-else class="twisty-btn spacer" aria-hidden="true"></span>
           <button type="button" class="folder-pick" :title="`${row.node.path} — ${row.node.books} book${row.node.books === 1 ? '' : 's'}`" @click="pick(row.node.path)">
             <span class="folder-label" :class="{ empty: row.node.empty }">{{ row.node.name }}</span>
@@ -221,7 +220,7 @@ function planTitle(): string {
     <ContextMenu v-if="menu" :x="menu.x" :y="menu.y" :entries="menuEntries" @choose="onChoose" @close="menu = null" />
 
     <div v-if="prompt" class="folder-backdrop" @click.self="prompt = null">
-      <form class="folder-dialog" role="dialog" :aria-label="prompt.kind === 'new' ? 'New subfolder' : 'Rename folder'" @submit.prevent="submitPrompt">
+      <form class="folder-dialog" role="dialog" aria-modal="true" :aria-label="prompt.kind === 'new' ? 'New subfolder' : 'Rename folder'" @submit.prevent="submitPrompt">
         <h3>{{ prompt.kind === "new" ? (prompt.path ? `New subfolder in ${prompt.path}` : "New folder") : `Rename ${prompt.path}` }}</h3>
         <input v-model="prompt.value" type="text" v-focus data-testid="folder-name" spellcheck="false" placeholder="Folder name" />
         <p v-if="prompt.kind === 'new'" class="hint">An empty folder is made on disk and stays in the tree until you remove it.</p>
@@ -235,7 +234,7 @@ function planTitle(): string {
     </div>
 
     <div v-if="flowOpen && state.action" class="folder-backdrop" @click.self="state.phase !== 'running' && closeFlow()">
-      <div class="folder-dialog" role="dialog" :aria-label="planTitle()" data-testid="folder-flow">
+      <div class="folder-dialog" role="dialog" aria-modal="true" :aria-label="planTitle()" data-testid="folder-flow">
         <h3>{{ planTitle() }}</h3>
         <template v-if="state.plan && (state.phase === 'confirm' || (state.phase === 'running' && !state.report))">
           <p role="status" data-testid="folder-plan">{{ describeFolderPlan(state.action, state.plan) }}</p>

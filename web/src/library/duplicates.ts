@@ -187,6 +187,18 @@ export function trashConfirmText(title: string): string {
   return `Move “${title}” to the library trash? It can be restored from Library → Trash… until the trash is emptied or expires.`;
 }
 
+/**
+ * Cautions to show before deleting one copy from a duplicate group: the copy
+ * the app suggests keeping, or the last one left (deleting it removes the
+ * book from the library altogether, not a duplicate of it).
+ */
+export function deleteCopyWarnings(group: Pick<DuplicateGroup, "books">, book: Pick<DuplicateBook, "book_id">, keeperId: number | null): string[] {
+  const out: string[] = [];
+  if (group.books.length <= 1) out.push("This is the last copy left in the group. Deleting it removes the book from your library.");
+  else if (keeperId !== null && keeperId === book.book_id) out.push("This is the copy suggested to keep.");
+  return out;
+}
+
 /** One line for a plan's totals: "12 groups · 12 books to the trash · 1.4 GB". */
 export function describePlanTotals(totals: { groups: number; books: number; bytes_freed: number }, action: "keep_best_trash_rest" | "merge_as_formats"): string {
   const n = (v: number) => v.toLocaleString("en-US");

@@ -49,7 +49,7 @@ function cancelRun() {
 
 <template>
   <div class="organize-backdrop" @click.self="!busy && emit('close')">
-    <div class="organize-panel" role="dialog" aria-label="Organize files">
+    <div class="organize-panel" role="dialog" aria-modal="true" aria-label="Organize files">
       <button class="organize-close" :disabled="busy" aria-label="Close" @click="emit('close')">✕</button>
       <h3>Organize files</h3>
       <p class="hint">Files are moved on disk, within the library, to the folders and names the template gives. Nothing is overwritten (a name already taken gets a number), nothing is deleted, and a run can be undone.</p>
@@ -92,7 +92,7 @@ function cancelRun() {
           </ul>
         </details>
         <div class="organize-buttons">
-          <button type="button" :disabled="busy || !canRun" data-testid="run-plan" @click="run">Organize {{ state.plan.books.toLocaleString("en-US") }} books</button>
+          <button type="button" class="primary" :disabled="busy || !canRun" data-testid="run-plan" @click="run">Organize {{ state.plan.books.toLocaleString("en-US") }} books</button>
         </div>
       </section>
 
@@ -164,10 +164,10 @@ function cancelRun() {
   margin: 0;
 }
 .warn {
-  color: #bc4c00;
+  color: var(--warning);
 }
 .error {
-  color: var(--error, #cf222e);
+  color: var(--danger);
   margin: 0;
 }
 .field {

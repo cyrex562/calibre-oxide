@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { actionAvailable, actionEnabled, buildMenuSpec, findAction, LIBRARY_ACTIONS, toolbarActionEnabled, TOOLBAR_ACTIONS, TOOLBAR_LAYOUT, toolbarLayoutActionIds, toolbarOverflowIds, visibleToolbarActions, type ActionContext, type LibraryAction, type LibraryActionId } from "./actions";
+import { actionAvailable, actionEnabled, buildMenuSpec, findAction, LIBRARY_ACTIONS, toolbarActionEnabled, TOOLBAR_ACTIONS, TOOLBAR_LAYOUT, toolbarLayoutActionIds, toolbarOverflowEntries, toolbarOverflowIds, visibleToolbarActions, type ActionContext, type LibraryAction, type LibraryActionId } from "./actions";
 
 const DESKTOP: ActionContext = { selectionCount: 0, isDesktop: true };
 const BROWSER: ActionContext = { selectionCount: 0, isDesktop: false };
@@ -354,10 +354,65 @@ describe("toolbar overflow", () => {
     }
   });
 
-  it("keeps book-scoped actions out of the overflow", () => {
-    for (const id of toolbarOverflowIds()) {
-      expect(LIBRARY_ACTIONS.find((a) => a.id === id)!.group).not.toBe("book");
+  // Convert, Read/View and Fetch news lost their slots to the
+  // import / dedupe / organize workflow; nothing was deleted.
+  it("keeps Convert, Read, Fetch news and Save to disk one click away, in More", () => {
+    const overflow = new Set(toolbarOverflowIds());
+    for (const id of ["convert", "read", "open-externally", "quick-view", "fetch-news", "save-to-disk", "polish", "tweak-book", "similar-books"] as LibraryActionId[]) {
+      expect(overflow.has(id), `${id} is not reachable from More`).toBe(true);
     }
+  });
+
+  it("builds the More menu with separators only between entries", () => {
+    const entries = toolbarOverflowEntries();
+    expect(entries[0]).not.toBe("-");
+    expect(entries[entries.length - 1]).not.toBe("-");
+    expect(entries.filter((e) => e !== "-" && !e.startsWith("$")).sort()).toEqual([...toolbarOverflowIds()].sort());
+    for (let i = 1; i < entries.length; i++) expect(entries[i] === "-" && entries[i - 1] === "-").toBe(false);
+  });
+
+  it("only lets the overflow name book-scoped actions that it lists on purpose", () => {
+    for (const id of toolbarOverflowIds()) {
+      const a = LIBRARY_ACTIONS.find((x) => x.id === id)!;
+      if (a.group === "book") expect(a.contextMenu, `${id}`).toBe(true);
+    }
+  });
+});
+
+describe("the workflow toolbar", () => {
+  const slots = () => TOOLBAR_LAYOUT.filter((i) => i.kind === "split" || i.kind === "action");
+
+  it("leads with import, find duplicates, organize, edit metadata, remove, in that order", () => {
+    expect(slots().slice(0, 5).map((s) => ("id" in s ? s.id : ""))).toEqual(["add-books", "find-duplicates", "organize-files", "edit-metadata", "delete-book"]);
+  });
+
+  it("carries Compare, Merge and Resolve under Find duplicates, and File naming, Fix titles and Export under Organize", () => {
+    const menuOf = (id: string) => {
+      const s = TOOLBAR_LAYOUT.find((i) => i.kind === "split" && i.id === id);
+      return s && s.kind === "split" ? s.menu : [];
+    };
+    expect(menuOf("find-duplicates")).toEqual(["compare-duplicates", "merge-books", "resolve-duplicates"]);
+    expect(menuOf("organize-files")).toEqual(["file-naming", "fix-titles", "export-copy"]);
+  });
+
+  it("no longer gives Convert, Read or Fetch news a slot of their own", () => {
+    const ids = slots().map((s) => ("id" in s ? s.id : ""));
+    for (const id of ["convert", "read", "fetch-news", "save-to-disk"]) expect(ids).not.toContain(id);
+  });
+
+  it("shows the layout's book-scoped slots (Edit metadata, Remove) when asked, and never in the flat customizable list", () => {
+    const filter = { handled: ["edit-metadata", "delete-book", "add-books"] as LibraryActionId[], hidden: [], ctx: BROWSER };
+    expect(visibleToolbarActions(filter).map((a) => a.id)).toEqual(["add-books"]);
+    expect(visibleToolbarActions(filter, { includeBook: true }).map((a) => a.id).sort()).toEqual(["add-books", "delete-book", "edit-metadata"]);
+  });
+
+  it("labels the Organize and Remove slots as the workflow words", () => {
+    const labelOf = (id: string) => {
+      const s = TOOLBAR_LAYOUT.find((i) => i.kind === "split" && i.id === id);
+      return s && s.kind === "split" ? s.label : undefined;
+    };
+    expect(labelOf("organize-files")).toBe("Organize");
+    expect(labelOf("delete-book")).toBe("Remove");
   });
 });
 

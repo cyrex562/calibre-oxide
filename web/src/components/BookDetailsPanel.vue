@@ -6,12 +6,13 @@ import ImageViewer from "./ImageViewer.vue";
 import { loadSections, saveSections, toggleSection, type SectionId, type SectionState } from "../library/panelSections";
 import AutocompleteInput from "./AutocompleteInput.vue";
 import { completionForCustom, enumValuesOf, invalidateForChanges } from "../library/fieldValues";
-import { changesFromForm, cloneForm, DraftStore, formFromBook, isFormDirty, type MetaForm } from "../library/metadataForm";
+import { changesFromForm, cloneForm, formFromBook, isFormDirty, rebaseForm, sharedDrafts, type MetaForm } from "../library/metadataForm";
 import { loadPdfJs, PDF_ASSET_OPTIONS, pdfUrl, renderPage, renderPageToBlob, scaleForWidth } from "../reader/pdf";
 import { useRouter } from "vue-router";
 import FetchMetadataDialog from "./FetchMetadataDialog.vue";
 import TweakEditor from "./TweakEditor.vue";
-import { addFormat, coverFromPdfPage, deleteBooks, evaluateTemplate, fetchBook, fetchBooks, fetchConversionBookData, fetchDataFiles, fetchFieldMetadata, getConversionStatus, removeDataFile, removeFormat, search, setCover, setFields, shareEmail, startConversion, uploadDataFile } from "../library/api";
+import { trashBooksFlow } from "../library/deleteFlow";
+import { addFormat, coverFromPdfPage, evaluateTemplate, fetchBook, fetchBooks, fetchConversionBookData, fetchDataFiles, fetchFieldMetadata, getConversionStatus, removeDataFile, removeFormat, search, setCover, setFields, shareEmail, startConversion, uploadDataFile } from "../library/api";
 import type { ConversionOptionsOverride, DataFileStat, SmtpRelayConfig } from "../library/api";
 import { categoryItemToQuery } from "../library/query";
 import { isTauri, tauriInvoke } from "../tauri";
@@ -48,18 +49,27 @@ const book = ref<BookSummary | null>(null);
 const loading = ref(true);
 const error = ref<string | null>(null);
 
+let deletedId: number | null = null;
 const deleting = ref(false);
 const deleteError = ref<string | null>(null);
 
 async function deleteBook() {
+  // The book that is on screen, not whatever props.bookId says by the time
+  // the answer comes back: a stale panel must never delete a different book.
   const b = book.value;
   if (!b) return;
-  if (!confirm(`Delete "${b.title}"? This cannot be undone.`)) return;
+  const id = b.id;
   deleting.value = true;
   deleteError.value = null;
   try {
-    await deleteBooks([props.bookId]);
-    emit("deleted", props.bookId);
+    const result = await trashBooksFlow([{ id, title: b.title }], { onRestored: () => emit("updated") });
+    if (result.cancelled) return;
+    if (result.failureText) deleteError.value = result.failureText;
+    if (result.outcome?.deleted.includes(id)) {
+      drafts.discard(id); // an edit to a book that is gone has nowhere to go
+      deletedId = id;
+      emit("deleted", id);
+    }
   } catch (e) {
     deleteError.value = e instanceof Error ? e.message : String(e);
   } finally {
@@ -243,7 +253,8 @@ const saving = ref(false);
 const saveError = ref<string | null>(null);
 const form = ref<MetaForm | null>(null);
 const baseline = ref<MetaForm | null>(null);
-const drafts = new DraftStore();
+// Module-level, so a draft survives this panel unmounting (collapsed, reader opened...).
+const drafts = sharedDrafts;
 const coverInput = ref<HTMLInputElement | null>(null);
 
 const dirty = computed(() => (form.value && baseline.value ? isFormDirty(form.value, baseline.value) : false));
@@ -269,9 +280,27 @@ void loadCustomColumnFields();
 function fillForm(b: BookSummary) {
   const fresh = formFromBook(b, customColumnFields.value);
   baseline.value = fresh;
-  const draft = drafts.take(b.id);
-  form.value = draft ? cloneForm(draft) : cloneForm(fresh);
+  const draft = drafts.restore(b.id, fresh);
+  form.value = draft ?? cloneForm(fresh);
 }
+
+// The shared store follows the form as it is edited, so the library
+// view's "N unsaved drafts" count is live and nothing depends on a
+// teardown hook running.
+watch(
+  [form, baseline],
+  () => {
+    if (!form.value || !baseline.value || !book.value || book.value.id !== props.bookId || deletedId === props.bookId) return;
+    drafts.stash(props.bookId, form.value, baseline.value);
+  },
+  { deep: true },
+);
+
+// Collapsing the panel, opening the reader or deleting the book unmounts
+// it: the unsaved edits go to the shared store, not nowhere.
+onBeforeUnmount(() => {
+  if (form.value && baseline.value && book.value && book.value.id === props.bookId && deletedId !== props.bookId) drafts.stash(props.bookId, form.value, baseline.value);
+});
 
 // Custom column definitions can arrive after the book.
 watch(customColumnFields, () => {
@@ -295,18 +324,24 @@ const rootEl = ref<HTMLElement | null>(null);
 
 async function saveEdits() {
   if (!form.value || !dirty.value) return;
+  // The book can change while the request is in flight (arrow-key to the
+  // next row): everything after the await is judged against this id.
+  const id = props.bookId;
   saving.value = true;
   saveError.value = null;
   try {
-    const changes = changesFromForm(form.value, customColumnFields.value);
-    const updated = await setFields(props.bookId, changes);
+    // Only the fields edited here are sent, so a later Save cannot revert
+    // a change made elsewhere (a table cell).
+    const changes = changesFromForm(form.value, customColumnFields.value, baseline.value);
+    const updated = await setFields(id, changes);
     invalidateForChanges(changes);
-    drafts.discard(props.bookId);
+    drafts.discard(id);
+    emit("updated");
+    if (id !== props.bookId) return; // moved on: do not paint this book's data over the new one
     book.value = updated;
     fillForm(updated);
-    emit("updated");
   } catch (e) {
-    saveError.value = e instanceof Error ? e.message : String(e);
+    if (id === props.bookId) saveError.value = e instanceof Error ? e.message : String(e);
   } finally {
     saving.value = false;
   }
@@ -315,12 +350,14 @@ async function saveEdits() {
 async function replaceCover(e: Event) {
   const file = (e.target as HTMLInputElement).files?.[0];
   if (!file) return;
+  const id = props.bookId;
   saving.value = true;
   saveError.value = null;
   try {
-    await setCover(props.bookId, file);
-    book.value = await fetchBook(props.bookId);
+    await setCover(id, file);
+    const fresh = await fetchBook(id);
     emit("updated");
+    if (id === props.bookId) book.value = fresh;
   } catch (e) {
     saveError.value = e instanceof Error ? e.message : String(e);
   } finally {
@@ -803,8 +840,10 @@ watch(
 watch(
   () => props.refreshKey,
   async () => {
+    const id = props.bookId;
     try {
-      book.value = await fetchBook(props.bookId);
+      const fresh = await fetchBook(id);
+      if (id === props.bookId) book.value = fresh;
     } catch {
       // The next full load will report it.
     }
@@ -822,8 +861,12 @@ watch(book, (b) => {
   // fetched cover...). A clean form follows the new values; a dirty one
   // keeps what the user typed and only moves its baseline.
   if (!b || b.id !== props.bookId || !baseline.value) return;
-  if (dirty.value) baseline.value = formFromBook(b, customColumnFields.value);
-  else fillForm(b);
+  if (dirty.value && form.value) {
+    // Fields the user did not touch follow the new values; edited ones keep what was typed.
+    const fresh = formFromBook(b, customColumnFields.value);
+    form.value = rebaseForm(form.value, baseline.value, fresh);
+    baseline.value = fresh;
+  } else fillForm(b);
 });
 const coverSrc = computed(() => (book.value ? `${book.value.cover}?v=${coverVersion.value}` : ""));
 
@@ -1088,7 +1131,7 @@ watch(
 
 <template>
   <div :class="docked ? 'docked-host' : 'backdrop'" @click.self="!docked && emit('close')">
-    <div ref="rootEl" class="panel" :class="{ docked }">
+    <div ref="rootEl" class="panel" :class="{ docked }" :role="docked ? undefined : 'dialog'" :aria-modal="docked ? undefined : 'true'">
       <button class="close" :title="docked ? 'Hide details' : 'Close'" @click="emit('close')">✕</button>
       <p v-if="loading">Loading…</p>
       <p v-else-if="error" class="error">{{ error }}</p>
@@ -1227,7 +1270,7 @@ watch(
             <button class="edit" @click="templateTesterOpen = !templateTesterOpen">Test template…</button>
             <button v-if="canUnpack" class="edit" :disabled="unpacking" @click="unpackBook">{{ unpacking ? "Working…" : `Unpack ${unpackableFormat?.toUpperCase()}…` }}</button>
             <button v-if="canUnpack" class="edit" :disabled="unpacking" @click="repackBook">Repack…</button>
-            <button class="delete" :disabled="deleting" @click="deleteBook">{{ deleting ? "Deleting…" : "Delete" }}</button>
+            <button class="delete danger" :disabled="deleting" title="Moves the book to the library Trash" @click="deleteBook">{{ deleting ? "Deleting…" : "Delete" }}</button>
           </div>
 
         <div v-if="templateTesterOpen" class="template-tester">

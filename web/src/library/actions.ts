@@ -108,6 +108,7 @@ export type LibraryActionId =
   | "custom-columns"
   | "check-library"
   | "find-duplicates"
+  | "resolve-duplicates"
   | "organize-files"
   | "file-naming"
   | "export-copy"
@@ -174,6 +175,7 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   { id: "custom-columns", label: "Custom columns…", group: "library", requires: "none", toolbar: true, icon: "column", tooltip: "Add or remove custom columns" },
   { id: "check-library", label: "Check library…", group: "library", requires: "none", toolbar: true, primary: true, icon: "reports", tooltip: "Look for missing or stray files" },
   { id: "find-duplicates", label: "Find duplicates…", group: "library", requires: "none", toolbar: true, primary: true, icon: "merge", accel: "D", tooltip: "Find books that look like duplicates" },
+  { id: "resolve-duplicates", label: "Resolve…", group: "library", requires: "none", icon: "merge", tooltip: "Apply one rule to every duplicate group: keep the best copy, trash or merge the rest" },
   { id: "map-metadata", label: "Map authors/tags…", group: "library", requires: "none", toolbar: true, icon: "tags", tooltip: "Rewrite authors or tags in bulk" },
   { id: "browse-annotations", label: "Annotations…", group: "library", requires: "none", toolbar: true, icon: "highlight", tooltip: "Browse highlights and notes" },
   { id: "pick-random", label: "Random book", group: "library", requires: "none", toolbar: true, icon: "random", tooltip: "Jump to a random book" },
@@ -377,13 +379,15 @@ export function toolbarActionEnabled(action: LibraryAction, ctx: ActionContext):
   return action.requires === "none" || actionEnabled(action, ctx);
 }
 
-export function visibleToolbarActions(filter: ToolbarFilter): LibraryAction[] {
+export function visibleToolbarActions(filter: ToolbarFilter, opts: { includeBook?: boolean } = {}): LibraryAction[] {
   const handled = new Set(filter.handled);
   const hidden = new Set(filter.hidden);
   const suppressed = filter.suppressed ?? new Set<LibraryActionId>();
 
   return LIBRARY_ACTIONS.filter((a) => {
-    if (a.group === "book") return false;
+    // The customizable flat list never has book-scoped actions; the layout's
+    // own slots and menus do (Edit metadata, Remove), so they ask for them.
+    if (a.group === "book" && !opts.includeBook) return false;
     if (!handled.has(a.id)) return false;
     if (hidden.has(a.id)) return false;
     if (suppressed.has(a.id)) return false;
@@ -410,7 +414,7 @@ export type ToolbarItem =
   /** A plain button. */
   | { kind: "action"; id: LibraryActionId }
   /** A button whose body runs `id` and whose chevron opens `menu`. */
-  | { kind: "split"; id: LibraryActionId; menu: ToolbarEntry[] }
+  | { kind: "split"; id: LibraryActionId; menu: ToolbarEntry[]; /** Shown instead of the action's own label ("Organize", "Remove"). */ label?: string }
   /** A named menu that is not itself an action -- the library button. */
   | { kind: "menu"; id: string; label: string; icon: string; menu: ToolbarEntry[] }
   /**
@@ -443,25 +447,35 @@ export type ToolbarItem =
  * See docs/UI_DESIGN.md §2.2.
  */
 export const TOOLBAR_LAYOUT: ToolbarItem[] = [
-  // `fetch-news` is deliberately *not* in here: it has its own slot
-  // below, as it does in calibre's own toolbar. Listing it twice would
-  // make the Add menu look fuller than it is without adding a route.
+  // The job this app is for, left to right: bring books in, find the
+  // duplicates among them, organize the files, fix the metadata, remove
+  // what is left over. Convert, Read/View and Fetch news are in "More".
   { kind: "split", id: "add-books", menu: ["add-folder"] },
+  { kind: "separator" },
+  { kind: "split", id: "find-duplicates", menu: ["compare-duplicates", "merge-books", "resolve-duplicates"] },
+  { kind: "split", id: "organize-files", label: "Organize", menu: ["file-naming", "fix-titles", "export-copy"] },
+  { kind: "separator" },
   { kind: "split", id: "edit-metadata", menu: ["fetch-metadata", "replace-cover", "cover-from-pdf", "-", "bulk-edit", "map-metadata", "-", "test-template"] },
-  { kind: "separator" },
-  { kind: "split", id: "convert", menu: ["polish", "tweak-book", "-", "unpack-book", "repack-book"] },
-  { kind: "split", id: "read", menu: ["open-externally", "quick-view", "-", "$recently-viewed", "-", "similar-books"] },
-  { kind: "separator" },
-  { kind: "split", id: "save-to-disk", menu: ["rename-files", "send-email", "-", "export-catalog", "export-library-archive"] },
-  { kind: "action", id: "fetch-news" },
-  { kind: "separator" },
-  { kind: "split", id: "delete-book", menu: ["-", "$restore-deleted"] },
+  { kind: "split", id: "delete-book", label: "Remove", menu: ["-", "$restore-deleted"] },
   { kind: "overflow" },
   { kind: "spring" },
   // Label is replaced at render time with the open library's name:
   // which library you are in is state, and state belongs on a label.
-  { kind: "menu", id: "library", label: "Library", icon: "lt", menu: ["switch-library", "new-library", "open-library-folder", "-", "$recent-libraries", "-", "check-library", "find-duplicates", "organize-files", "file-naming", "fix-titles", "-", "export-copy", "trash"] },
+  { kind: "menu", id: "library", label: "Library", icon: "lt", menu: ["switch-library", "new-library", "open-library-folder", "-", "$recent-libraries", "-", "check-library", "-", "trash"] },
   { kind: "split", id: "help", menu: ["$shortcuts", "$about"] },
+];
+
+/**
+ * What "More" holds besides the unplaced toolbar-eligible actions: the
+ * relatives of the retired Convert, Read and Save slots, and Fetch news.
+ * Listed, in menu order, so every action stays one click from the toolbar.
+ */
+export const OVERFLOW_LEADING: ToolbarEntry[] = [
+  "read", "open-externally", "quick-view", "similar-books", "-",
+  "convert", "polish", "tweak-book", "unpack-book", "repack-book", "-",
+  "save-to-disk", "rename-files", "send-email", "-",
+  "fetch-news", "-",
+  "select-mode", "mark-books",
 ];
 
 /**
@@ -470,7 +484,23 @@ export const TOOLBAR_LAYOUT: ToolbarItem[] = [
  */
 export function toolbarOverflowIds(): LibraryActionId[] {
   const placed = new Set(toolbarLayoutActionIds());
-  return LIBRARY_ACTIONS.filter((a) => a.toolbar && a.group !== "book" && !placed.has(a.id)).map((a) => a.id);
+  const listed = OVERFLOW_LEADING.filter((e): e is LibraryActionId => e !== "-" && !e.startsWith("$"));
+  const listedSet = new Set(listed);
+  const rest = LIBRARY_ACTIONS.filter((a) => a.toolbar && a.group !== "book" && !placed.has(a.id) && !listedSet.has(a.id)).map((a) => a.id);
+  return [...listed.filter((id) => !placed.has(id)), ...rest];
+}
+
+/** The overflow menu, with its separators: the listed groups first, then whatever else is eligible. */
+export function toolbarOverflowEntries(): ToolbarEntry[] {
+  const ids = new Set(toolbarOverflowIds());
+  const out: ToolbarEntry[] = [];
+  for (const e of OVERFLOW_LEADING) {
+    if (e === "-" || e.startsWith("$") || ids.has(e as LibraryActionId)) out.push(e);
+  }
+  const listed = new Set(OVERFLOW_LEADING);
+  const rest = [...ids].filter((id) => !listed.has(id));
+  if (rest.length > 0) out.push("-", ...rest);
+  return out;
 }
 
 /** Every action id `TOOLBAR_LAYOUT` can reach, on a button or in a menu. */

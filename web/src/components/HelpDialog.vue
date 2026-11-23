@@ -63,7 +63,7 @@ const readerShortcuts = computed(() =>
 
 <template>
   <div class="manage-backdrop" @click.self="emit('close')">
-    <div class="manage-panel help-panel">
+    <div class="manage-panel help-panel" role="dialog" aria-modal="true">
       <h3>Help</h3>
       <p class="hint">Every action this app knows about, with its current keyboard shortcut. Shortcuts are rebindable in Settings.</p>
 
