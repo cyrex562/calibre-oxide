@@ -44,7 +44,7 @@ const props = defineProps<{
    * library/coloringRules.ts for why that matters before a value
    * reaches a style attribute.
    */
-  rowColors?: Record<number, string>;
+  rowColors?: ReadonlyMap<number, string>;
   /** Changes when the list is for a new query: scrolls back to the top. */
   resetKey?: number;
   /** Saves an in-place edit. Without it cells are read-only. */
@@ -55,6 +55,8 @@ const emit = defineEmits<{
   select: [bookId: number];
   toggleSelected: [bookId: number];
   rangeSelect: [bookId: number];
+  /** Ctrl/Cmd+A on the list. */
+  selectAll: [];
   sortBy: [value: { sort: string; order: "asc" | "desc" }];
   resize: [value: { key: string; width: number }];
   /** A header was dragged: move column `key` before column slot `index` (pre-move index). */
@@ -62,8 +64,8 @@ const emit = defineEmits<{
   contextMenu: [value: { bookId: number; x: number; y: number }];
   /** Rows `[first, last)` are rendered (visible plus overscan): load them. */
   range: [value: { first: number; last: number }];
-  /** A navigation key (arrows, page keys, Home/End) on the list. */
-  navigate: [key: string];
+  /** A navigation key (arrows, page keys, Home/End) on the list; `extend` when Shift is held. */
+  navigate: [key: string, extend: boolean];
 }>();
 
 // ---------------------------------------------------------------
@@ -137,12 +139,7 @@ function pageRows(): number {
   return Math.max(1, Math.floor((viewportHeight.value - headerHeight.value) / ROW_HEIGHT));
 }
 
-/** The scroll position's visible rows, for the status bar. */
-function visibleRows() {
-  return { first: range.value.first, last: range.value.last };
-}
-
-defineExpose({ scrollToIndex, pageRows, visibleRows, startEdit: (id: number, key?: string) => startEdit(id, key) });
+defineExpose({ scrollToIndex, pageRows });
 
 /** The column currently driving the sort, if it is one we show. */
 function sortIndicator(column: BookColumn): "" | "▲" | "▼" {
@@ -294,11 +291,15 @@ function onRowDragStart(bookId: number, event: DragEvent) {
   if (event.dataTransfer) setBooksDrag(event.dataTransfer, dragIds(bookId, props.selectedIds, props.selectMode));
 }
 
+/**
+ * Click, Shift-click (a range) and Ctrl/Cmd-click (add or remove one) work
+ * with or without select mode, as in a file manager. In select mode a plain
+ * click also toggles, as before.
+ */
 function onRowClick(bookId: number, event?: MouseEvent) {
-  if (props.selectMode) {
-    if (event?.shiftKey) emit("rangeSelect", bookId);
-    else emit("toggleSelected", bookId);
-  } else emit("select", bookId);
+  if (event?.shiftKey) emit("rangeSelect", bookId);
+  else if (props.selectMode || event?.ctrlKey || event?.metaKey) emit("toggleSelected", bookId);
+  else emit("select", bookId);
 }
 
 /**
@@ -318,10 +319,15 @@ const NAV_KEYS = new Set(["ArrowDown", "ArrowUp", "PageDown", "PageUp", "Home", 
 function onListKeydown(event: KeyboardEvent) {
   const target = event.target as HTMLElement | null;
   if (target && (target.tagName === "INPUT" || target.tagName === "SELECT" || target.tagName === "TEXTAREA")) return;
+  if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "a") {
+    event.preventDefault();
+    emit("selectAll");
+    return;
+  }
   if (event.ctrlKey || event.metaKey || event.altKey) return;
   if (NAV_KEYS.has(event.key)) {
     event.preventDefault();
-    emit("navigate", event.key);
+    emit("navigate", event.key, event.shiftKey);
     scroller.value?.focus({ preventScroll: true });
     return;
   }
@@ -364,12 +370,14 @@ function startEdit(id: number, key?: string) {
   editing.value = { id, key: column.key, text: initialText(book, column), error: null, busy: false };
 }
 
-function onCellClick(event: MouseEvent, book: BookSummary, column: BookColumn) {
+/**
+ * A click only selects the row (the click bubbles to it) and remembers the
+ * cell for F2. It never opens an editor, not even in an empty cell: a click
+ * aimed at the row used to pop an input open and a stray Enter would save.
+ * Editing starts with a double-click, F2 or Enter.
+ */
+function onCellClick(_event: MouseEvent, _book: BookSummary, column: BookColumn) {
   lastCellKey.value = column.key;
-  if (!props.commit || props.selectMode || !isEditable(column)) return;
-  if (event.shiftKey || event.ctrlKey || event.metaKey) return;
-  if (editing.value && editing.value.id === book.id && editing.value.key === column.key) return;
-  if (isEmptyCell(book, column)) startEdit(book.id, column.key);
 }
 
 function onCellDblClick(book: BookSummary, column: BookColumn) {
@@ -453,7 +461,7 @@ const BOOL_OPTIONS = [
 ];
 
 function hint(column: BookColumn): string {
-  return `Set ${column.label.toLowerCase()}…`;
+  return `Double-click to set ${column.label.toLowerCase()}…`;
 }
 </script>
 
@@ -511,8 +519,8 @@ function hint(column: BookColumn): string {
             tabindex="0"
             :draggable="editing?.id === ids[i] ? 'false' : 'true'"
             @dragstart="onRowDragStart(ids[i], $event)"
-            :class="{ selected: selectMode ? selectedIds.has(ids[i]) : selectedBookId === ids[i] }"
-            :style="rowColors?.[ids[i]] ? { color: rowColors[ids[i]] } : undefined"
+            :class="{ selected: selectedIds.has(ids[i]) || (!selectMode && selectedBookId === ids[i]) }"
+            :style="rowColors?.get(ids[i]) ? { color: rowColors.get(ids[i]) } : undefined"
             @click="onRowClick(ids[i], $event)"
             @keydown="onRowKeydown($event, ids[i])"
             @contextmenu.prevent="emit('contextMenu', { bookId: ids[i], x: $event.clientX, y: $event.clientY })"
@@ -663,7 +671,7 @@ function hint(column: BookColumn): string {
   top: 100%;
   z-index: 3;
   background: var(--danger);
-  color: #fff;
+  color: var(--bg);
   font-size: var(--fs-small);
   line-height: 1.3;
   padding: 0.15rem 0.45rem;

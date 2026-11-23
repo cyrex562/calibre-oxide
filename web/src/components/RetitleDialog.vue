@@ -60,7 +60,7 @@ function cancelRun() {
 
 <template>
   <div class="retitle-backdrop" @click.self="!busy && emit('close')">
-    <div class="retitle-panel" role="dialog" aria-label="Fix titles">
+    <div class="retitle-panel" role="dialog" aria-modal="true" aria-label="Fix titles">
       <button class="retitle-close" :disabled="busy" aria-label="Close" @click="emit('close')">✕</button>
       <h3>Fix titles</h3>
       <p class="hint">
@@ -127,7 +127,7 @@ function cancelRun() {
             <button type="button" :disabled="state.page >= pages - 1" @click="c.setPage(state.page + 1)">Next</button>
           </div>
           <div class="retitle-buttons">
-            <button type="button" :disabled="busy || !c.canApply()" data-testid="apply" @click="run">Fix {{ checked.toLocaleString("en-US") }} title{{ checked === 1 ? "" : "s" }}</button>
+            <button type="button" class="primary" :disabled="busy || !c.canApply()" data-testid="apply" @click="run">Fix {{ checked.toLocaleString("en-US") }} title{{ checked === 1 ? "" : "s" }}</button>
           </div>
         </template>
       </section>
@@ -203,7 +203,7 @@ function cancelRun() {
   margin: 0;
 }
 .error {
-  color: var(--error, #cf222e);
+  color: var(--danger);
   margin: 0;
 }
 fieldset {
@@ -251,7 +251,7 @@ td input[type="text"] {
   box-sizing: border-box;
 }
 td input.invalid {
-  border-color: var(--error, #cf222e);
+  border-color: var(--danger);
 }
 .muted {
   color: var(--fg-muted);
@@ -273,17 +273,17 @@ td input.invalid {
   white-space: nowrap;
 }
 .badge.junk {
-  color: #bc4c00;
+  color: var(--warning);
 }
 .badge.template_leftover {
   color: #8250df;
 }
 .badge.no_suggestion {
-  color: var(--error, #cf222e);
+  color: var(--danger);
 }
 .badge.unsure {
   margin-left: 0.25rem;
-  color: var(--muted, #6e7781);
+  color: var(--fg-muted);
 }
 .retitle-done {
   display: flex;

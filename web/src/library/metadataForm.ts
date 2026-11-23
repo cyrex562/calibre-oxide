@@ -3,6 +3,7 @@
 //
 // Pure so the dirty / save / revert rules are tested directly.
 
+import { ref } from "vue";
 import type { BookFieldChanges, BookSummary, FieldMetaEntry } from "./types";
 
 export interface MetaForm {
@@ -62,28 +63,53 @@ export function isFormDirty(form: MetaForm, baseline: MetaForm): boolean {
 }
 
 /** The `set-fields` body for a form: the same one the old edit mode sent. */
-export function changesFromForm(form: MetaForm, customFields: FieldMetaEntry[]): BookFieldChanges {
-  const changes: BookFieldChanges = {
-    title: form.title,
-    authors: form.authors.split("&").map((a) => a.trim()).filter(Boolean),
-    series: form.series,
-    tags: form.tags.split(",").map((t) => t.trim()).filter(Boolean),
-    rating: form.rating,
-    publisher: form.publisher,
-    comments: form.comments,
-  };
+export function changesFromForm(form: MetaForm, customFields: FieldMetaEntry[], baseline?: MetaForm | null): BookFieldChanges {
+  // With a baseline only the fields the user actually edited are sent, so
+  // a save cannot revert a change made elsewhere (a table cell, say).
+  const touched = (key: Exclude<keyof MetaForm, "custom">): boolean =>
+    !baseline || String(form[key] ?? "") !== String(baseline[key] ?? "");
+  const changes: BookFieldChanges = {};
+  if (touched("title")) changes.title = form.title;
+  if (touched("authors")) changes.authors = form.authors.split("&").map((a) => a.trim()).filter(Boolean);
+  if (touched("series")) changes.series = form.series;
+  if (touched("tags")) changes.tags = form.tags.split(",").map((t) => t.trim()).filter(Boolean);
+  if (touched("rating")) changes.rating = form.rating;
+  if (touched("publisher")) changes.publisher = form.publisher;
+  if (touched("comments")) changes.comments = form.comments;
   // Sent only when set: an empty string is not a date, and clearing
   // the field should leave the stored value alone.
-  if (form.pubdate.trim() !== "") changes.pubdate = form.pubdate;
-  if (String(form.seriesIndex ?? "").trim() !== "") {
+  if (touched("pubdate") && form.pubdate.trim() !== "") changes.pubdate = form.pubdate;
+  if (touched("seriesIndex") && String(form.seriesIndex ?? "").trim() !== "") {
     const idx = Number(form.seriesIndex);
     if (!Number.isNaN(idx)) changes.series_index = idx;
   }
   for (const field of customFields) {
     if (!field.is_editable) continue;
-    changes[field.label] = String(form.custom[field.label] ?? "");
+    const value = String(form.custom[field.label] ?? "");
+    if (baseline && value === String(baseline.custom[field.label] ?? "")) continue;
+    changes[field.label] = value;
   }
   return changes;
+}
+
+/**
+ * The form after the book was re-read: fields the user left alone take
+ * the new values, edited fields keep what was typed.
+ */
+export function rebaseForm(form: MetaForm, oldBaseline: MetaForm, newBaseline: MetaForm): MetaForm {
+  const out = cloneForm(newBaseline) as unknown as Record<string, unknown>;
+  const f = form as unknown as Record<string, unknown>;
+  const o = oldBaseline as unknown as Record<string, unknown>;
+  for (const key of Object.keys(newBaseline)) {
+    if (key === "custom") continue;
+    if (String(f[key] ?? "") !== String(o[key] ?? "")) out[key] = f[key];
+  }
+  const custom = { ...newBaseline.custom };
+  for (const key of Object.keys(form.custom)) {
+    if (String(form.custom[key] ?? "") !== String(oldBaseline.custom[key] ?? "")) custom[key] = form.custom[key];
+  }
+  out.custom = custom;
+  return out as unknown as MetaForm;
 }
 
 /**
@@ -93,22 +119,78 @@ export function changesFromForm(form: MetaForm, customFields: FieldMetaEntry[]):
  */
 export class DraftStore {
   private drafts = new Map<number, MetaForm>();
+  private bases = new Map<number, MetaForm>();
 
   /** Stores the form if it is dirty, forgets any draft if it is not. */
   stash(bookId: number, form: MetaForm, baseline: MetaForm): void {
-    if (isFormDirty(form, baseline)) this.drafts.set(bookId, cloneForm(form));
-    else this.drafts.delete(bookId);
+    if (isFormDirty(form, baseline)) {
+      this.drafts.set(bookId, cloneForm(form));
+      this.bases.set(bookId, cloneForm(baseline));
+    } else {
+      this.drafts.delete(bookId);
+      this.bases.delete(bookId);
+    }
   }
 
   take(bookId: number): MetaForm | null {
     return this.drafts.get(bookId) ?? null;
   }
 
+  /**
+   * The draft rebased onto the book's current values: fields the draft
+   * did not touch follow edits made elsewhere since it was stashed.
+   */
+  restore(bookId: number, fresh: MetaForm): MetaForm | null {
+    const draft = this.drafts.get(bookId);
+    if (!draft) return null;
+    const base = this.bases.get(bookId);
+    return base ? rebaseForm(draft, base, fresh) : cloneForm(draft);
+  }
+
   discard(bookId: number): void {
     this.drafts.delete(bookId);
+    this.bases.delete(bookId);
   }
 
   has(bookId: number): boolean {
     return this.drafts.has(bookId);
   }
+
+  /** How many books have an unsaved draft. */
+  get size(): number {
+    return this.drafts.size;
+  }
+
+  ids(): number[] {
+    return [...this.drafts.keys()];
+  }
+
+  clear(): void {
+    this.drafts.clear();
+    this.bases.clear();
+  }
 }
+
+/**
+ * The drafts for the whole library window. Module-level, so collapsing
+ * the details panel, opening the reader or deleting a book does not lose
+ * them; `draftCount` is reactive for the "N unsaved drafts" indicator.
+ */
+class SharedDraftStore extends DraftStore {
+  readonly count = ref(0);
+  override stash(bookId: number, form: MetaForm, baseline: MetaForm): void {
+    super.stash(bookId, form, baseline);
+    this.count.value = this.size;
+  }
+  override discard(bookId: number): void {
+    super.discard(bookId);
+    this.count.value = this.size;
+  }
+  override clear(): void {
+    super.clear();
+    this.count.value = 0;
+  }
+}
+export const sharedDrafts = new SharedDraftStore();
+export const draftCount = sharedDrafts.count;
+

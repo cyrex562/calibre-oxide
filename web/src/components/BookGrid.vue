@@ -29,7 +29,7 @@ const emit = defineEmits<{
   contextMenu: [value: { bookId: number; x: number; y: number }];
   toggleSelected: [bookId: number, event: MouseEvent];
   range: [value: { first: number; last: number }];
-  navigate: [key: string];
+  navigate: [key: string, extend: boolean];
 }>();
 
 const scroller = ref<HTMLElement | null>(null);
@@ -108,7 +108,7 @@ function onKeydown(event: KeyboardEvent) {
   const target = event.target as HTMLElement | null;
   if (target && (target.tagName === "INPUT" || target.tagName === "SELECT")) return;
   event.preventDefault();
-  emit("navigate", event.key);
+  emit("navigate", event.key, event.shiftKey);
   scroller.value?.focus({ preventScroll: true });
 }
 </script>
@@ -121,7 +121,7 @@ function onKeydown(event: KeyboardEvent) {
         <button
           v-if="getBook(ids[i])"
           class="card"
-          :class="{ selected: selectMode ? selectedIds.has(ids[i]) : selectedBookId === ids[i] }"
+          :class="{ selected: selectedIds.has(ids[i]) || (!selectMode && selectedBookId === ids[i]) }"
           @click="emit('select', ids[i], $event)"
           @contextmenu.prevent="emit('contextMenu', { bookId: ids[i], x: $event.clientX, y: $event.clientY })"
         >

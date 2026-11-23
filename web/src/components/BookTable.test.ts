@@ -397,16 +397,20 @@ describe("editing in place", () => {
     input.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true }));
   };
 
-  it("clicking an empty title cell opens an input; Enter saves through set-fields and the row shows the value", async () => {
+  it("a single click in an empty cell only selects the row; double-click opens the input, and Enter saves through set-fields", async () => {
     const calls: [number, BookFieldChanges][] = [];
     const { el, store } = mountEditable([book(1, { title: "" })], async (id, changes) => {
       calls.push([id, changes]);
       return book(id, { title: String(changes.title) });
     });
     expect(cell(el, 0, 0).classList.contains("empty-editable")).toBe(true);
-    expect(cell(el, 0, 0).getAttribute("data-hint")).toBe("Set title…");
+    expect(cell(el, 0, 0).getAttribute("data-hint")).toBe("Double-click to set title…");
 
     cell(el, 0, 0).click();
+    await nextTick();
+    expect(el.querySelector("input.cell-editor")).toBeNull();
+
+    cell(el, 0, 0).dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
     await nextTick();
     expect(el.querySelector("input.cell-editor")).not.toBeNull();
 
@@ -594,5 +598,41 @@ describe("suggestions while editing in place", () => {
     await flush();
     expect(el.querySelector("input.cell-editor")).toBeNull();
     expect(calls).toEqual([]);
+  });
+});
+
+describe("multi-select without select mode", () => {
+  const row = (el: HTMLElement, i: number) => el.querySelectorAll("tbody tr")[i] as HTMLElement;
+  const click = (el: HTMLElement, i: number, init: MouseEventInit = {}) => row(el, i).dispatchEvent(new MouseEvent("click", { bubbles: true, ...init }));
+
+  it("a plain click selects, Ctrl/Cmd-click toggles and Shift-click selects a range, outside select mode", () => {
+    const ranged: number[] = [];
+    const { el, emitted } = mount({ onRangeSelect: (id: number) => ranged.push(id) });
+    click(el, 0);
+    click(el, 1, { ctrlKey: true });
+    click(el, 0, { metaKey: true });
+    click(el, 1, { shiftKey: true });
+    expect(emitted.select).toEqual([1]);
+    expect(emitted.toggleSelected).toEqual([2, 1]);
+    expect(ranged).toEqual([2]);
+  });
+
+  it("Ctrl+A asks to select everything, and Shift+arrow asks to extend", () => {
+    let all = 0;
+    const nav: [string, boolean][] = [];
+    const { el } = mount({ onSelectAll: () => all++, onNavigate: (k: string, extend: boolean) => nav.push([k, extend]) });
+    const scroller = el.querySelector(".table-scroll")!;
+    const prevented = new KeyboardEvent("keydown", { key: "a", ctrlKey: true, bubbles: true, cancelable: true });
+    scroller.dispatchEvent(prevented);
+    expect(all).toBe(1);
+    expect(prevented.defaultPrevented).toBe(true);
+    scroller.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", shiftKey: true, bubbles: true, cancelable: true }));
+    scroller.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true }));
+    expect(nav).toEqual([["ArrowDown", true], ["ArrowDown", false]]);
+  });
+
+  it("marks every ctrl-selected row as selected", () => {
+    const { el } = mount({ selectedIds: new Set([1, 2]), selectedBookId: 2 });
+    expect(el.querySelectorAll("tbody tr.selected")).toHaveLength(2);
   });
 });

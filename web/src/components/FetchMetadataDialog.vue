@@ -194,7 +194,7 @@ async function applyPicked() {
 
 <template>
   <div class="backdrop">
-    <div class="panel">
+    <div class="panel" role="dialog" aria-modal="true">
       <button class="close" @click="emit('close')">✕</button>
       <h3>Fetch metadata online</h3>
 

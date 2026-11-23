@@ -195,9 +195,60 @@ export function summarizeEmbed(response: EmbedMetadataResponse): { embedded: num
   return { embedded, problems: [...unreadable, ...failed, ...missing, ...unwritable] };
 }
 
-export async function deleteBooks(ids: number[]): Promise<void> {
-  if (ids.length === 0) return;
-  await jsonFetch(`/cdb/delete-books/${ids.join(",")}`, { method: "POST" });
+/** What a delete did: the books moved to the library Trash, and the ones that could not be. */
+export interface DeleteOutcome {
+  deleted: number[];
+  failed: { book_id: number; error: string }[];
+}
+
+/**
+ * Normalizes the server's answer. A server that has the partial-failure
+ * reply sends `{deleted, failed}`; an older one sends something else
+ * (or nothing) and a 2xx meant every book went.
+ */
+export function parseDeleteOutcome(ids: number[], body: unknown): DeleteOutcome {
+  const b = (body ?? {}) as { deleted?: unknown; failed?: unknown };
+  if (!Array.isArray(b.deleted) && !Array.isArray(b.failed)) return { deleted: [...ids], failed: [] };
+  const failed = (Array.isArray(b.failed) ? b.failed : []).map((f) => {
+    const e = f as { book_id?: number; error?: string };
+    return { book_id: Number(e.book_id), error: String(e.error ?? "failed") };
+  });
+  const deleted = Array.isArray(b.deleted)
+    ? (b.deleted as unknown[]).map(Number)
+    : ids.filter((id) => !failed.some((f) => f.book_id === id));
+  return { deleted, failed };
+}
+
+/** One line for the failures of a delete, or "" when there were none. */
+export function describeDeleteFailures(outcome: DeleteOutcome): string {
+  if (outcome.failed.length === 0) return "";
+  const shown = outcome.failed.slice(0, 3).map((f) => `book ${f.book_id}: ${f.error}`).join("; ");
+  const more = outcome.failed.length > 3 ? ` (and ${outcome.failed.length - 3} more)` : "";
+  return `${outcome.failed.length} could not be deleted: ${shown}${more}`;
+}
+
+export async function deleteBooks(ids: number[]): Promise<DeleteOutcome> {
+  if (ids.length === 0) return { deleted: [], failed: [] };
+  const body = await jsonFetch<unknown>(`/cdb/delete-books/${ids.join(",")}`, { method: "POST" });
+  return parseDeleteOutcome(ids, body);
+}
+
+/**
+ * Puts books back from the library Trash (the undo of a delete): finds
+ * their whole-book entries and restores each. Returns how many came back.
+ */
+export async function restoreDeletedBooks(ids: number[]): Promise<number> {
+  const wanted = new Set(ids);
+  const listing = await fetchTrash();
+  // A book deleted more than once has several entries: the newest is the one just made.
+  const newest = new Map<number, (typeof listing.entries)[number]>();
+  for (const entry of listing.entries) {
+    if (entry.kind !== "book" || !wanted.has(entry.book_id)) continue;
+    const seen = newest.get(entry.book_id);
+    if (!seen || entry.deleted_at > seen.deleted_at) newest.set(entry.book_id, entry);
+  }
+  for (const entry of newest.values()) await restoreTrashEntry({ kind: "book", key: entry.key });
+  return newest.size;
 }
 
 export function fileToDataUrl(file: File): Promise<string> {
@@ -715,8 +766,19 @@ async function runLibraryJob<R>(startUrl: string, handlers: LibraryJobHandlers<R
   const init: RequestInit = body === undefined ? { method: "POST" } : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
   const started = await jsonFetch<{ job_id: number }>(startUrl, init);
   handlers.onStart?.(started.job_id);
+  // A single failed poll (a dropped connection, a busy server) must not
+  // abandon a job that is still running; give up after three in a row.
+  let failedPolls = 0;
   for (;;) {
-    const job = await fetchLibraryJob<R>(started.job_id);
+    let job: LibraryJob<R>;
+    try {
+      job = await fetchLibraryJob<R>(started.job_id);
+      failedPolls = 0;
+    } catch (e) {
+      if (++failedPolls >= 3) throw e;
+      await new Promise((resolve) => setTimeout(resolve, handlers.intervalMs ?? 500));
+      continue;
+    }
     handlers.onProgress?.(job);
     if (job.state === "failed") throw new Error(job.error ?? "the job failed");
     if (job.state !== "running") return job.report as R;

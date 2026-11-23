@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { type LibraryJob, fetchLibraryJobs, resumableJob, resumeLibraryJob, runningLibraryJob, switchWarning, importFolder, fetchUntracked, fetchTrash, restoreTrashEntry, deleteTrashEntry, emptyTrash, copyToLibrary, describeCopyOutcome, fetchLibraryInfo, embedMetadata, summarizeEmbed, addBook, addFormat, addNewsSchedule, blobToDataUrl, inspectPlugin, installPlugin, listPlugins, removePlugin, setPluginEnabled, catalogDownloadUrl, checkLibrary, coverProxyUrl, deleteBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchCoverProxyBlob, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeDataFile, removeFormat, removeNewsSchedule, renameCategoryItem, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, scanLibrary, fetchOrphans, relocateOrphan, uploadOrphanFile, forgetOrphan, fetchIgnored, unignoreFile, searchMetadataOnline, backfillHashes, fingerprintPdfs, prepareLibrary, prepareStageOfPhase, describePrepareProgress, describePrepareResult, cancelLibraryJob, describeJobProgress, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
+import { type LibraryJob, fetchLibraryJobs, resumableJob, resumeLibraryJob, runningLibraryJob, switchWarning, importFolder, fetchUntracked, fetchTrash, restoreTrashEntry, deleteTrashEntry, emptyTrash, copyToLibrary, describeCopyOutcome, fetchLibraryInfo, embedMetadata, summarizeEmbed, addBook, addFormat, addNewsSchedule, blobToDataUrl, inspectPlugin, installPlugin, listPlugins, removePlugin, setPluginEnabled, catalogDownloadUrl, checkLibrary, coverProxyUrl, deleteBooks, describeDeleteFailures, parseDeleteOutcome, restoreDeletedBooks, deleteSavedSearch, deleteVirtualLibrary, evaluateTemplate, fetchBooks, fetchConversionBookData, fetchCoverProxyBlob, fetchDataFiles, fetchSavedSearches, ftsSearch, ftsSnippets, getConversionStatus, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeDataFile, removeFormat, removeNewsSchedule, renameCategoryItem, renameSavedSearch, runNewsScheduleNow, saveToDisk, scanForDuplicates, scanLibrary, fetchOrphans, relocateOrphan, uploadOrphanFile, forgetOrphan, fetchIgnored, unignoreFile, searchMetadataOnline, backfillHashes, fingerprintPdfs, prepareLibrary, prepareStageOfPhase, describePrepareProgress, describePrepareResult, cancelLibraryJob, describeJobProgress, setCover, setFields, setFtsEnabled, setSavedSearch, setVirtualLibrary, shareEmail, startConversion, startNewsFetch, uploadDataFile } from "./api";
 import { addToManualGroup, createManualGroup, deleteManualGroup, fetchCompare, planMoveBooks, refreshDuplicateBooks, removeFromManualGroup } from "./api";
 import type { BookSummary } from "./types";
 
@@ -138,8 +138,74 @@ describe("deleteBooks", () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 
-    await deleteBooks([]);
+    expect(await deleteBooks([])).toEqual({ deleted: [], failed: [] });
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps the server's failed list instead of dropping it", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => ({ deleted: [1, 3], failed: [{ book_id: 2, error: "file is in use" }] }) }));
+    const outcome = await deleteBooks([1, 2, 3]);
+    expect(outcome.deleted).toEqual([1, 3]);
+    expect(outcome.failed).toEqual([{ book_id: 2, error: "file is in use" }]);
+    expect(describeDeleteFailures(outcome)).toBe("1 could not be deleted: book 2: file is in use");
+  });
+
+  it("still copes with the older reply, which says nothing: every book went", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) }));
+    expect(await deleteBooks([4, 5])).toEqual({ deleted: [4, 5], failed: [] });
+    expect(parseDeleteOutcome([1, 2], null)).toEqual({ deleted: [1, 2], failed: [] });
+    expect(parseDeleteOutcome([1, 2], { failed: [{ book_id: 2, error: "x" }] }).deleted).toEqual([1]);
+    expect(describeDeleteFailures({ deleted: [1], failed: [] })).toBe("");
+  });
+});
+
+describe("restoreDeletedBooks", () => {
+  const entry = (book_id: number, key: string, deleted_at: number, kind = "book") => ({ kind, key, book_id, title: "", authors: "", formats: [], size: 0, deleted_at, expires_at: 0, original_path: "", problem: null });
+
+  it("restores the newest trash entry of each deleted book, and nothing else", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ count: 4, total_size: 0, expire_after_seconds: 0, expired: [], entries: [entry(1, "old1", 10), entry(1, "new1", 20), entry(2, "k2", 5), entry(9, "other", 30), entry(2, "fmt", 40, "format")] }) })
+      .mockResolvedValue({ ok: true, json: async () => ({ book_id: 1 }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    expect(await restoreDeletedBooks([1, 2])).toBe(2);
+
+    const restored = fetchMock.mock.calls.slice(1).map(([, init]) => JSON.parse(init.body).key);
+    expect(restored.sort()).toEqual(["k2", "new1"]);
+  });
+});
+
+describe("a library job that is polled", () => {
+  it("survives one or two failed polls, and gives up on the third in a row", async () => {
+    const flaky = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ job_id: 7 }) })
+      .mockRejectedValueOnce(new Error("network"))
+      .mockResolvedValueOnce({ ok: false, status: 502, statusText: "Bad Gateway" })
+      .mockResolvedValueOnce({ ok: true, json: async () => job("finished", { report: { added: [1], conclusive: true } }) });
+    vi.stubGlobal("fetch", flaky);
+    expect((await scanLibrary({ intervalMs: 0 })).added).toEqual([1]);
+
+    const dead = vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({ job_id: 7 }) }).mockRejectedValue(new Error("network down"));
+    vi.stubGlobal("fetch", dead);
+    await expect(scanLibrary({ intervalMs: 0 })).rejects.toThrow("network down");
+    expect(dead).toHaveBeenCalledTimes(4); // the start, then three polls
+  });
+
+  it("counts only consecutive failures: a good poll in between resets it", async () => {
+    const running = () => ({ ok: true, json: async () => job("running", { progress: progress({}) }) });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ job_id: 7 }) })
+      .mockRejectedValueOnce(new Error("a"))
+      .mockRejectedValueOnce(new Error("b"))
+      .mockResolvedValueOnce(running())
+      .mockRejectedValueOnce(new Error("c"))
+      .mockRejectedValueOnce(new Error("d"))
+      .mockResolvedValueOnce({ ok: true, json: async () => job("finished", { report: { added: [], conclusive: true } }) });
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(scanLibrary({ intervalMs: 0 })).resolves.toBeDefined();
   });
 });
 

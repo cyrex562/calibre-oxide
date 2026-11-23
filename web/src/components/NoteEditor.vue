@@ -119,7 +119,7 @@ async function save() {
 
 <template>
   <div class="backdrop" @click.self="emit('close')">
-    <div class="panel">
+    <div class="panel" role="dialog" aria-modal="true">
       <button class="close" @click="emit('close')">✕</button>
       <h3>{{ itemName }}</h3>
       <p v-if="loading">Loading…</p>

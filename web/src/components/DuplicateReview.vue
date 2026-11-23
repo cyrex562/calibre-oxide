@@ -9,9 +9,9 @@
 
 import { computed, ref } from "vue";
 
-import { deleteBooks } from "../library/api";
+import { trashBooksFlow } from "../library/deleteFlow";
 import type { DuplicateBook, DuplicateGroup, DuplicateReason, DuplicateSort } from "../library/api";
-import { ALL_REASONS, confidencePercent, evidenceLines, fileSummary, formatBytes, formatMtime, isImageOnlyScan, needsReview, pdfLine, primaryPath, reasonBadge, reasonLabel, trashConfirmText } from "../library/duplicates";
+import { ALL_REASONS, confidencePercent, evidenceLines, fileSummary, formatBytes, formatMtime, isImageOnlyScan, needsReview, pdfLine, primaryPath, reasonBadge, reasonLabel, deleteCopyWarnings } from "../library/duplicates";
 import { filtersActive } from "../library/duplicatesStore";
 import type { DuplicatesStore } from "../library/duplicatesStore";
 import { isTauri, tauriInvoke } from "../tauri";
@@ -88,12 +88,19 @@ function merge(group: DuplicateGroup) {
 }
 
 async function remove(group: DuplicateGroup, book: DuplicateBook) {
-  if (!window.confirm(trashConfirmText(book.title))) return;
   actionError.value = null;
   try {
-    await deleteBooks([book.book_id]);
-    if (group.id) await store.resolved([], [book.book_id]);
-    emit("changed");
+    const result = await trashBooksFlow([{ id: book.book_id, title: book.title }], {
+      warnings: deleteCopyWarnings(group, book, store.keeperFor(group)),
+      // Undo puts the copy back in the library; the group is found again by the next scan.
+      onRestored: () => emit("changed"),
+    });
+    if (result.cancelled) return;
+    if (result.failureText) actionError.value = result.failureText;
+    if (result.outcome?.deleted.includes(book.book_id)) {
+      if (group.id) await store.resolved([], [book.book_id]);
+      emit("changed");
+    }
   } catch (e) {
     actionError.value = e instanceof Error ? e.message : String(e);
   }
@@ -196,7 +203,7 @@ function dismissedLabel(e: { members: { title: string }[] }): string {
           <span class="spacer"></span>
           <button type="button" data-testid="compare" :disabled="group.books.length > 8" :title="group.books.length > 8 ? 'Compare takes up to 8 books at once' : 'Look at these copies side by side: pages, files and metadata'" @click="emit('compare', group)">Compare…</button>
           <button type="button" data-testid="dismiss" title="Never suggest these books as duplicates of each other again" @click="dismiss(group)">Not duplicates</button>
-          <button type="button" @click="merge(group)">Merge into…</button>
+          <button type="button" class="primary" @click="merge(group)">Merge into…</button>
         </header>
         <p v-if="keeperNote(group)" class="hint" data-testid="keeper-note">{{ keeperNote(group) }}</p>
 
@@ -222,7 +229,7 @@ function dismissedLabel(e: { members: { title: string }[] }): string {
                 <button v-if="!isKeeper(group, b)" type="button" title="Keep this copy" @click="store.chooseKeeper(group, b.book_id)">Keep this</button>
                 <button v-if="desktop && b.files?.length" type="button" @click="openBook(b)">Open</button>
                 <button v-if="desktop" type="button" @click="reveal(b)">Reveal</button>
-                <button type="button" title="Moves the book to the library trash, from where it can be restored" @click="remove(group, b)">Delete</button>
+                <button type="button" class="danger" title="Moves the book to the library Trash, from where it can be restored" @click="remove(group, b)">Delete</button>
               </div>
             </div>
           </section>
@@ -262,10 +269,10 @@ function dismissedLabel(e: { members: { title: string }[] }): string {
   margin: 0;
 }
 .warn {
-  color: #bc4c00;
+  color: var(--warning);
 }
 .error {
-  color: var(--error, #cf222e);
+  color: var(--danger);
   margin: 0;
 }
 .spacer {
@@ -273,7 +280,7 @@ function dismissedLabel(e: { members: { title: string }[] }): string {
 }
 .dup-banner {
   background: rgba(154, 103, 0, 0.12);
-  border: 1px solid #9a6700;
+  border: 1px solid var(--warning);
   border-radius: 4px;
   padding: 0.4rem 0.6rem;
   margin: 0;
@@ -301,7 +308,7 @@ function dismissedLabel(e: { members: { title: string }[] }): string {
   cursor: pointer;
 }
 .dup-chip.on {
-  background: var(--selection, rgba(80, 140, 255, 0.18));
+  background: var(--bg-selected);
   border-color: currentColor;
 }
 .dup-chip .count {
@@ -349,8 +356,8 @@ function dismissedLabel(e: { members: { title: string }[] }): string {
   min-width: 0;
 }
 .dup-book.keeper {
-  border-color: #1a7f37;
-  box-shadow: 0 0 0 1px #1a7f37 inset;
+  border-color: var(--success);
+  box-shadow: 0 0 0 1px var(--success) inset;
 }
 .dup-cover {
   flex: 0 0 64px;
@@ -387,12 +394,12 @@ function dismissedLabel(e: { members: { title: string }[] }): string {
   text-decoration: underline;
 }
 .dup-keep {
-  color: #1a7f37;
+  color: var(--success);
   font-size: 0.8em;
   font-weight: 600;
 }
 .path {
-  font-family: var(--mono, monospace);
+  font-family: var(--font-mono);
   font-size: 0.8em;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -443,15 +450,15 @@ function dismissedLabel(e: { members: { title: string }[] }): string {
   border: 1px solid currentColor;
 }
 .dup-badge-certain {
-  color: #1a7f37;
+  color: var(--success);
 }
 .dup-badge-strong {
-  color: #0969da;
+  color: var(--accent);
 }
 .dup-badge-likely {
-  color: #9a6700;
+  color: var(--warning);
 }
 .dup-badge-review {
-  color: #bc4c00;
+  color: var(--warning);
 }
 </style>

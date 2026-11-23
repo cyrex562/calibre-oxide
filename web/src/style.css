@@ -69,7 +69,7 @@
   --accent-hover: #1b58d6;
   --accent-soft: #eef2fb;           /* tinted row/badge backgrounds */
   --danger: #b00020;
-  --warning: #a06a00;
+  --warning: #8f5f00;
   --success: #2a7f2a;
   --mark: #d97706;
   --highlight: #fff3a0;             /* search-match background    */
@@ -220,6 +220,18 @@ button.primary:hover:not(:disabled) {
   border-color: var(--accent-hover);
 }
 
+/* The destructive choice (Delete, Move to Trash): red, so it does not read
+   like the safe default next to it. */
+button.danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: var(--bg);
+}
+
+button.danger:hover:not(:disabled) {
+  filter: brightness(1.1);
+}
+
 input[type="text"],
 input[type="search"],
 input[type="number"],
@@ -304,7 +316,7 @@ a {
   margin: 0;
 }
 .manage-panel .error {
-  color: var(--error, #cf222e);
+  color: var(--danger);
   margin: 0;
 }
 .manage-panel .status {

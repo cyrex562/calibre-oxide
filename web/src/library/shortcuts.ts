@@ -63,3 +63,13 @@ export function shortcutFor(event: KeyboardEvent, keymap: ShortcutMap): LibraryA
   }
   return null;
 }
+
+/**
+ * Whether a modal dialog is open anywhere in the document. Dialogs mark
+ * themselves `aria-modal="true"`, so the library shortcuts need not know
+ * each dialog's open flag (a list that kept missing one, so Del with the
+ * Trash open deleted the library book behind it).
+ */
+export function isModalOpen(root: ParentNode = document): boolean {
+  return root.querySelector('[aria-modal="true"]') !== null;
+}

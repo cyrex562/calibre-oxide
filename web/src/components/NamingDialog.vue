@@ -36,7 +36,7 @@ async function saveAndApply(scope: "selected" | "all") {
 
 <template>
   <div class="naming-backdrop" @click.self="emit('close')">
-    <div class="naming-panel" role="dialog" aria-label="File naming">
+    <div class="naming-panel" role="dialog" aria-modal="true" aria-label="File naming">
       <button class="naming-close" aria-label="Close" @click="emit('close')">✕</button>
       <h3>File naming</h3>
       <p class="hint">Where this library's files live and what they are called. Organize, Rename files and Fix titles start from this; any run can still use something else.</p>
@@ -84,7 +84,7 @@ async function saveAndApply(scope: "selected" | "all") {
       </details>
 
       <div class="buttons">
-        <button type="button" :disabled="state.saving || !c.dirty() || c.problem() !== null" data-testid="save-naming" @click="c.save()">{{ state.saving ? "Saving…" : "Save" }}</button>
+        <button type="button" class="primary" :disabled="state.saving || !c.dirty() || c.problem() !== null" data-testid="save-naming" @click="c.save()">{{ state.saving ? "Saving…" : "Save" }}</button>
         <button type="button" :disabled="state.saving || c.problem() !== null || selectedCount === 0" data-testid="apply-selected" @click="saveAndApply('selected')">Apply to the {{ selectedCount }} selected book{{ selectedCount === 1 ? "" : "s" }}…</button>
         <button type="button" :disabled="state.saving || c.problem() !== null" data-testid="apply-all" @click="saveAndApply('all')">Apply to all books…</button>
       </div>
@@ -135,7 +135,7 @@ async function saveAndApply(scope: "selected" | "all") {
   margin: 0;
 }
 .error {
-  color: var(--error, #cf222e);
+  color: var(--danger);
   margin: 0;
 }
 .field {

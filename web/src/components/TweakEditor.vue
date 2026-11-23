@@ -438,7 +438,7 @@ function insertChar(c: SpecialChar) {
 
 <template>
   <div class="backdrop">
-    <div class="panel">
+    <div class="panel" role="dialog" aria-modal="true">
       <button class="close" @click="discardAndClose">✕</button>
       <h3>Tweak Book</h3>
       <p v-if="loading">Loading…</p>
