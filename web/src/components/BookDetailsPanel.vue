@@ -4,6 +4,8 @@ import type { PDFDocumentProxy } from "pdfjs-dist";
 import CollapsibleSection from "./CollapsibleSection.vue";
 import ImageViewer from "./ImageViewer.vue";
 import { loadSections, saveSections, toggleSection, type SectionId, type SectionState } from "../library/panelSections";
+import AutocompleteInput from "./AutocompleteInput.vue";
+import { completionForCustom, enumValuesOf, invalidateForChanges } from "../library/fieldValues";
 import { changesFromForm, cloneForm, DraftStore, formFromBook, isFormDirty, type MetaForm } from "../library/metadataForm";
 import { loadPdfJs, PDF_ASSET_OPTIONS, pdfUrl, renderPage, renderPageToBlob, scaleForWidth } from "../reader/pdf";
 import { useRouter } from "vue-router";
@@ -296,7 +298,9 @@ async function saveEdits() {
   saving.value = true;
   saveError.value = null;
   try {
-    const updated = await setFields(props.bookId, changesFromForm(form.value, customColumnFields.value));
+    const changes = changesFromForm(form.value, customColumnFields.value);
+    const updated = await setFields(props.bookId, changes);
+    invalidateForChanges(changes);
     drafts.discard(props.bookId);
     book.value = updated;
     fillForm(updated);
@@ -1138,12 +1142,12 @@ watch(
           <form class="meta-form" @submit.prevent="saveEdits">
             <div class="fields">
               <label>Title <input v-model="form.title" data-field="title" required /></label>
-              <label>Authors <input v-model="form.authors" data-field="authors" placeholder="Jane Doe & John Smith" /></label>
-              <label>Series <input v-model="form.series" data-field="series" /></label>
+              <label>Authors <AutocompleteInput v-model="form.authors" data-field="authors" field="authors" separator="&" placeholder="Jane Doe & John Smith" /></label>
+              <label>Series <AutocompleteInput v-model="form.series" data-field="series" field="series" /></label>
               <label>Series index <input v-model="form.seriesIndex" data-field="series_index" type="number" step="0.1" /></label>
-              <label>Tags <input v-model="form.tags" data-field="tags" placeholder="scifi, classic" /></label>
+              <label>Tags <AutocompleteInput v-model="form.tags" data-field="tags" field="tags" separator="," placeholder="scifi, classic" /></label>
               <label>Rating <input v-model.number="form.rating" data-field="rating" type="number" min="0" max="5" step="1" /></label>
-              <label>Publisher <input v-model="form.publisher" data-field="publisher" /></label>
+              <label>Publisher <AutocompleteInput v-model="form.publisher" data-field="publisher" field="publisher" /></label>
               <label>Published <input v-model="form.pubdate" data-field="pubdate" type="date" /></label>
               <label class="edit-comments">Comments <textarea v-model="form.comments" data-field="comments" rows="4"></textarea></label>
               <template v-for="field in customColumnFields" :key="field.key">
@@ -1157,7 +1161,8 @@ watch(
                 </label>
                 <label v-else-if="field.is_editable">
                   {{ field.name ?? field.label }}
-                  <input v-model="form.custom[field.label]" :data-field="field.label" />
+                  <AutocompleteInput v-if="completionForCustom(field) || enumValuesOf(field)" v-model="form.custom[field.label]" :data-field="field.label" :field="completionForCustom(field)?.field" :separator="completionForCustom(field)?.separator" :options="enumValuesOf(field) ?? undefined" :min-chars="enumValuesOf(field) ? 1 : undefined" />
+                  <input v-else v-model="form.custom[field.label]" :data-field="field.label" />
                 </label>
               </template>
             </div>

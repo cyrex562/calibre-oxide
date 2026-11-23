@@ -5,6 +5,7 @@ import { createApp, defineComponent, h, nextTick, ref, type App } from "vue";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { BookSummary } from "../library/types";
+import { getFieldValues, invalidateFieldValues } from "../library/fieldValues";
 
 const books: Record<number, BookSummary> = {};
 const apiMocks = vi.hoisted(() => ({
@@ -188,6 +189,30 @@ describe("metadata form", () => {
     expect(apiMocks.setFields.mock.calls[0][1]).toMatchObject({ title: "Changed", authors: ["Ann Lee"] });
     expect(emitted.updated).toHaveLength(1);
     expect(save(el).disabled).toBe(true);
+  });
+
+  it("suggests known authors and tags while typing, and forgets them after a save", async () => {
+    invalidateFieldValues();
+    await getFieldValues("authors", async () => [{ name: "Jane Doe", count: 4 }, { name: "Ann Lovelace", count: 1 }]);
+    const { el } = await mountPanel();
+    const authors = el.querySelector<HTMLInputElement>("[data-field='authors']")!;
+    expect(authors.getAttribute("role")).toBe("combobox");
+    authors.focus();
+    await type(authors, "Ann Lee & ja");
+    await settle();
+    const rows = [...document.body.querySelectorAll<HTMLElement>("[role='option']")];
+    expect(rows.map((r) => r.textContent)).toEqual(["Jane Doe4"]);
+    authors.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true }));
+    await nextTick();
+    authors.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    await settle();
+    expect(authors.value).toBe("Ann Lee & Jane Doe & ");
+
+    save(el).click();
+    await settle();
+    const loader = vi.fn(async () => []);
+    await getFieldValues("authors", loader);
+    expect(loader).toHaveBeenCalledTimes(1); // the save dropped the cached list
   });
 
   it("keeps a per-book draft when another book is selected, and restores it", async () => {

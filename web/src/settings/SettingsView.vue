@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from "vue";
+import { getMinChars, setMinChars } from "../library/fieldValues";
 import { isTauri, tauriInvoke } from "../tauri";
 import { activeRules, COLORING_RULES_PROFILE, DEFAULT_COLORING_RULES, type ColoringRule, type ColoringRulesPrefs } from "../library/coloringRules";
 import { fetchPluginCatalog, inspectPlugin, installFromCatalog, installPlugin, listPlugins, removePlugin, setPluginEnabled, type CatalogPlugin, type InstalledPlugin, getEmailAccount, saveEmailAccount, type EmailAccount } from "../library/api";
 import { DEFAULT_KEYMAP, DEFAULT_LIBRARY_PREFS, DEFAULT_READER_PREFS, DEFAULT_TOOLBAR_PREFS, fetchProfile, KEYMAP_ACTION_LABELS, KEYMAP_PROFILE, LIBRARY_PREFS_PROFILE, READER_PREFS_PROFILE, saveProfile, TOOLBAR_ACTIONS, TOOLBAR_PREFS_PROFILE, type KeymapAction, type KeymapPrefs, type LibraryPrefs, type ReaderPrefs, type ToolbarActionId, type ToolbarPrefs } from "./api";
 
+const suggestMinChars = ref(getMinChars());
 const libraryPrefs = ref<LibraryPrefs>({ ...DEFAULT_LIBRARY_PREFS });
 const readerPrefs = ref<ReaderPrefs>({ ...DEFAULT_READER_PREFS });
 const keymap = ref<KeymapPrefs>({ ...DEFAULT_KEYMAP });
@@ -406,6 +408,15 @@ async function toggleAutoReopen() {
           </select>
         </label>
         <button type="button" @click="saveLibraryPrefs">Save library settings</button>
+      </section>
+
+      <section class="pane">
+        <h3>Typing suggestions</h3>
+        <label class="field">
+          Suggest existing names after this many characters (1 to 5)
+          <input v-model.number="suggestMinChars" type="number" min="1" max="5" step="1" data-field="suggest-min-chars" @change="suggestMinChars = setMinChars(suggestMinChars)" />
+        </label>
+        <p class="hint">Authors, publishers, tags, series and custom columns offer the names already in your library as you type. Applies on this device.</p>
       </section>
 
       <section class="pane">

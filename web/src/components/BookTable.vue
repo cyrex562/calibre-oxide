@@ -14,6 +14,8 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import { autoFitWidth, CHECK_COLUMN_WIDTH, dropIndex, isDrag, moveKeyTo, resizedColumnWidth, tableWidth } from "../library/columnLayout";
+import AutocompleteInput from "./AutocompleteInput.vue";
+import { completionFor } from "../library/fieldValues";
 import { formatCell, nextSort, type BookColumn } from "../library/columns";
 import { defaultEditKey, editKeyAction, initialText, isEditable, isEmptyCell, neighbourEditableKey, startsEditing, type CommitResult } from "../library/inlineEdit";
 import type { BookSummary } from "../library/types";
@@ -538,6 +540,7 @@ function hint(column: BookColumn): string {
                     <option v-for="o in BOOL_OPTIONS" :key="o.value" :value="o.value">{{ o.label }}</option>
                   </template>
                 </select>
+                <AutocompleteInput v-else-if="completionFor(column)" v-model="editing.text" focus-on-mount class="cell-editor" :field="completionFor(column)!.field" :separator="completionFor(column)!.separator" :aria-label="`Edit ${column.label}`" :disabled="editing.busy" @keydown="onEditorKeydown" @blur="onEditorBlur" @click.stop @dblclick.stop />
                 <input v-else v-model="editing.text" v-focus class="cell-editor" :type="column.editor?.type === 'date' ? 'date' : 'text'" :placeholder="column.editor?.type === 'rating' ? '0 to 5' : ''" :disabled="editing.busy" :aria-label="`Edit ${column.label}`" @keydown="onEditorKeydown" @blur="onEditorBlur" @click.stop @dblclick.stop />
                 <span v-if="editing.error" class="cell-error" role="alert">{{ editing.error }}</span>
               </template>

@@ -4,6 +4,8 @@ import CategoryBrowser from "./CategoryBrowser.vue";
 import NoteEditor from "./NoteEditor.vue";
 import BookDetailsPanel from "./BookDetailsPanel.vue";
 import BookTable from "./BookTable.vue";
+import AutocompleteInput from "./AutocompleteInput.vue";
+import { completionForCustom, invalidateFieldValues } from "../library/fieldValues";
 import BookGrid from "./BookGrid.vue";
 import { createBookWindow } from "../library/bookWindow";
 import { commitCellEdit, type CommitResult } from "../library/inlineEdit";
@@ -1315,6 +1317,7 @@ const detailsRefresh = ref(0);
 async function commitEdit(bookId: number, column: BookColumn, raw: string): Promise<CommitResult> {
   const result = await commitCellEdit({ target: win, bookId, column, raw, save: setFields });
   if (result.status === "saved") {
+    invalidateFieldValues();
     if (selectedBookId.value === bookId) detailsRefresh.value++;
     colorChecked.delete(bookId);
     void applyColoringRules();
@@ -1376,6 +1379,7 @@ async function runBulkEdit() {
     }
   }
   bulkBusy.value = false;
+  if (changed > 0) invalidateFieldValues();
   bulkSummary.value = `Updated ${changed} book(s)${skipped ? `, ${skipped} already matched` : ""}${bulkErrors.value.length ? `, ${bulkErrors.value.length} failed` : ""}.`;
 
   if (bulkErrors.value.length === 0) {
@@ -3129,7 +3133,7 @@ watch(coloringRules, () => {
               <option value="remove">Remove</option>
               <option value="replace">Replace with</option>
             </select>
-            <input v-model="bulkSpec.tags!.value" placeholder="scifi, classic" :disabled="bulkBusy" />
+            <AutocompleteInput v-model="bulkSpec.tags!.value" field="tags" separator="," placeholder="scifi, classic" :disabled="bulkBusy" />
           </div>
         </label>
 
@@ -3141,7 +3145,7 @@ watch(coloringRules, () => {
               <option value="remove">Remove</option>
               <option value="replace">Replace with</option>
             </select>
-            <input v-model="bulkSpec.authors!.value" placeholder="Ann Lee, Bo Fox" :disabled="bulkBusy" />
+            <AutocompleteInput v-model="bulkSpec.authors!.value" field="authors" separator="," placeholder="Ann Lee, Bo Fox" :disabled="bulkBusy" />
           </div>
         </label>
 
@@ -3157,8 +3161,8 @@ watch(coloringRules, () => {
           </div>
         </label>
 
-        <label class="bulk-field"><span>Publisher</span><input v-model="bulkSpec.publisher" :disabled="bulkBusy" /></label>
-        <label class="bulk-field"><span>Series</span><input v-model="bulkSpec.series" :disabled="bulkBusy" /></label>
+        <label class="bulk-field"><span>Publisher</span><AutocompleteInput :model-value="bulkSpec.publisher ?? ''" @update:model-value="bulkSpec.publisher = $event" field="publisher" :disabled="bulkBusy" /></label>
+        <label class="bulk-field"><span>Series</span><AutocompleteInput :model-value="bulkSpec.series ?? ''" @update:model-value="bulkSpec.series = $event" field="series" :disabled="bulkBusy" /></label>
         <label class="bulk-field"><span>Published</span><input v-model="bulkSpec.pubdate" type="date" :disabled="bulkBusy" /></label>
         <label class="bulk-field"><span>Comments</span><input v-model="bulkSpec.comments" :disabled="bulkBusy" /></label>
 
@@ -3174,7 +3178,8 @@ watch(coloringRules, () => {
 
         <label v-for="column in bulkCustomColumns" :key="column.label" class="bulk-field">
           <span>{{ column.name || column.label }}</span>
-          <input :value="bulkSpec.custom![column.label] ?? ''" :disabled="bulkBusy" @input="bulkSpec.custom![column.label] = ($event.target as HTMLInputElement).value" />
+          <AutocompleteInput v-if="completionForCustom(column)" :model-value="bulkSpec.custom![column.label] ?? ''" :field="column.key" :separator="completionForCustom(column)!.separator" :disabled="bulkBusy" @update:model-value="bulkSpec.custom![column.label] = $event" />
+          <input v-else :value="bulkSpec.custom![column.label] ?? ''" :disabled="bulkBusy" @input="bulkSpec.custom![column.label] = ($event.target as HTMLInputElement).value" />
         </label>
       </div>
 
