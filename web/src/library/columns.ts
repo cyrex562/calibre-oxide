@@ -43,6 +43,8 @@ export interface BookColumn {
   width: number;
   /** Hover text for the header, when the label alone is not enough. */
   tooltip?: string;
+  /** A custom column's category name (`#label`), which its value suggestions are fetched under. */
+  field?: string;
   /** How a cell in this column is edited in place; absent means read-only. */
   editor?: CellEditor;
 }
@@ -173,6 +175,7 @@ export function columnsFor(fieldMetadata: Record<string, FieldMetaEntry>, sortab
       label: entry.name || key,
       kind: kindForDatatype(entry.datatype),
       width: 140,
+      field: entry.key,
       ...(editor ? { editor } : {}),
       ...(sortableKeys.has(entry.key) ? { sortKey: entry.key } : {}),
     });

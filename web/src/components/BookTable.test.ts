@@ -18,6 +18,7 @@ import BookTable from "./BookTable.vue";
 import { columnsFor, resolveColumns, DEFAULT_TABLE_PREFS, type BookColumn } from "../library/columns";
 import type { BookFieldChanges, BookSummary } from "../library/types";
 import { commitCellEdit } from "../library/inlineEdit";
+import { getFieldValues, invalidateFieldValues } from "../library/fieldValues";
 
 let app: App | null = null;
 let host: HTMLElement | null = null;
@@ -435,6 +436,8 @@ describe("editing in place", () => {
 
   it("F2 edits the title of the selected row", async () => {
     const { el } = mountEditable([book(1, { title: "Old" })], async () => book(1), { selectedBookId: 1 });
+    // Vue ignores an event fired in the same millisecond its listener was attached.
+    await new Promise((r) => setTimeout(r, 5));
     el.querySelector("tbody tr")!.dispatchEvent(new KeyboardEvent("keydown", { key: "F2", bubbles: true }));
     await nextTick();
     expect(el.querySelector<HTMLInputElement>("input.cell-editor")!.value).toBe("Old");
@@ -529,5 +532,67 @@ describe("editing in place", () => {
     el.querySelectorAll<HTMLElement>("tbody tr")[0].querySelectorAll<HTMLElement>("td")[1].click();
     await nextTick();
     expect(el.querySelector(".cell-editor")).toBeNull();
+  });
+});
+
+describe("suggestions while editing in place", () => {
+  const COLS: BookColumn[] = resolveColumns(columnsFor({}, [["title", "Title"], ["authors", "Authors"]]), { ...DEFAULT_TABLE_PREFS, columns: ["title", "authors"] });
+  const flush = async () => {
+    for (let i = 0; i < 4; i++) await Promise.resolve();
+    await nextTick();
+    await nextTick();
+    await new Promise((r) => setTimeout(r, 0));
+  };
+
+  async function open(save: (id: number, changes: BookFieldChanges) => Promise<BookSummary>) {
+    invalidateFieldValues();
+    await getFieldValues("authors", async () => [{ name: "Jane Doe", count: 4 }, { name: "John Smith", count: 2 }]);
+    const store = new Map([[1, book(1, { authors: ["Ann Lee"] })]]);
+    const target = { getById: (id: number) => store.get(id), patch: (id: number) => store.get(id), put: (b: BookSummary) => void store.set(b.id, b) };
+    const m = mount({ columns: COLS, ids: [1], getBook: (id: number) => store.get(id), commit: (bookId: number, column: BookColumn, raw: string) => commitCellEdit({ target, bookId, column, raw, save }) });
+    const cell = m.el.querySelectorAll("tbody tr")[0].querySelectorAll("td")[1] as HTMLElement;
+    cell.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    await nextTick();
+    const input = m.el.querySelector<HTMLInputElement>("input.cell-editor")!;
+    input.value = "Ann Lee & jo";
+    input.dispatchEvent(new Event("input"));
+    await flush();
+    return { ...m, input };
+  }
+  const press = (input: HTMLInputElement, key: string) => input.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
+
+  it("accepting a suggestion with Down+Enter does not save; the next Enter does", async () => {
+    const calls: BookFieldChanges[] = [];
+    const { input } = await open(async (id, changes) => (calls.push(changes), book(id, { authors: changes.authors })));
+    expect(document.body.querySelectorAll('[role="option"]').length).toBe(1);
+    press(input, "ArrowDown");
+    await flush();
+    press(input, "Enter");
+    await flush();
+    expect(calls).toEqual([]);
+    expect(input.value).toBe("Ann Lee & John Smith & ");
+    press(input, "Enter");
+    await flush();
+    expect(calls).toEqual([{ authors: ["Ann Lee", "John Smith"] }]);
+  });
+
+  it("Enter with nothing highlighted saves what was typed", async () => {
+    const calls: BookFieldChanges[] = [];
+    const { input } = await open(async (id, changes) => (calls.push(changes), book(id, { authors: changes.authors })));
+    press(input, "Enter");
+    await flush();
+    expect(calls).toEqual([{ authors: ["Ann Lee", "jo"] }]);
+  });
+
+  it("the first Esc closes the list and the second cancels the edit", async () => {
+    const calls: BookFieldChanges[] = [];
+    const { el, input } = await open(async (id, changes) => (calls.push(changes), book(id)));
+    press(input, "Escape");
+    await flush();
+    expect(el.querySelector("input.cell-editor")).not.toBeNull();
+    press(input, "Escape");
+    await flush();
+    expect(el.querySelector("input.cell-editor")).toBeNull();
+    expect(calls).toEqual([]);
   });
 });

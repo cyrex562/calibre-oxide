@@ -74,6 +74,11 @@ export function fetchCategory(name: string, num = 200): Promise<CategoryPage> {
   return jsonFetch<CategoryPage>(`/ajax/category/${encodeURIComponent(name)}?num=${num}`);
 }
 
+/** Every value of a field with its book count, most-used first (feeds the typing suggestions). */
+export function fetchCategoryValues(field: string): Promise<CategoryPage> {
+  return jsonFetch<CategoryPage>(`/ajax/category/${encodeURIComponent(field)}?num=1000000&offset=0&sort=popularity&sort_order=desc`);
+}
+
 export function fetchBooksIn(category: string, itemId: number, num: number, offset: number): Promise<BooksInPage> {
   return jsonFetch<BooksInPage>(`/ajax/books_in/${encodeURIComponent(category)}/${itemId}?num=${num}&offset=${offset}`);
 }
