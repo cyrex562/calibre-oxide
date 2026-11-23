@@ -58,6 +58,9 @@ pub async fn merge_books_no_library(State(state): State<AppState>, Json(body): J
 async fn handle(state: AppState, library_id: Option<String>, body: MergeBody) -> Result<Json<Value>, ServerError> {
     let cache = cache_for(&state, library_id.as_deref())?;
     let MergeBody { dest, sources, mode, keep_duplicate_formats, dry_run } = body;
+    if !dry_run {
+        crate::library_jobs::ensure_no_file_mover(&cache)?;
+    }
     if !sources.iter().any(|s| *s != dest) {
         return Err(ServerError::BadRequest("sources must name at least one book other than dest".to_string()));
     }

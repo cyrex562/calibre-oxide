@@ -105,6 +105,9 @@ pub async fn rename_files(State(state): State<AppState>, Path(library_id): Path<
     if body.template.trim().is_empty() {
         return Err(ServerError::BadRequest("a name or template is required".to_string()));
     }
+    if !body.dry_run {
+        crate::library_jobs::ensure_no_file_mover(&cache)?;
+    }
 
     let dry_run = body.dry_run;
     let (results, renamed_ids) = tokio::task::spawn_blocking(move || {

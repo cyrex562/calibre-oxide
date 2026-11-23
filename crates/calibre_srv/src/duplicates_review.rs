@@ -1042,6 +1042,7 @@ pub async fn runs(State(state): State<AppState>, Path(library_id): Path<String>)
 /// response says `needs_rescan`.
 pub async fn restore_run(State(state): State<AppState>, Path((library_id, run_id)): Path<(String, String)>) -> Result<Json<Value>, ServerError> {
     let cache = cache_for(&state, &library_id)?;
+    crate::library_jobs::ensure_no_file_mover(&cache)?;
     let out = blocking(move || {
         if cache.trash_entries_for_run(&run_id).map_err(internal)?.is_empty() {
             return Err(ServerError::NotFound(format!("nothing in the trash belongs to run {run_id}")));

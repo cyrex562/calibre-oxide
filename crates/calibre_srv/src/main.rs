@@ -142,8 +142,8 @@ async fn main() -> anyhow::Result<()> {
     // calibre expires its trash on open. Off the main path: a library with a
     // lot in its trash must not delay the server, and on a share every
     // removal is a round trip.
-    {
-        let cache = cache.clone();
+    // This is the only automatic expiry: `GET /trash` is read-only.
+    let expire_on_start = |cache: Arc<Cache>| {
         std::thread::spawn(move || {
             if let Some(report) = cache.expire_trash_if_due() {
                 if !report.removed.is_empty() {
@@ -151,7 +151,8 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         });
-    }
+    };
+    expire_on_start(cache.clone());
     let auth = if cli.opts.auth {
         let users = UserManager::new(&userdb_path(&cli))?;
         Some(Arc::new(AuthGate::new(users, "calibre-oxide".to_string(), cli.opts.ban_for, cli.opts.ban_after)))
@@ -159,7 +160,9 @@ async fn main() -> anyhow::Result<()> {
         None
     };
     let port = cli.opts.port;
-    let listen_on = cli.opts.listen_on.clone().unwrap_or_else(|| "0.0.0.0".to_string());
+    // Loopback unless the user asked otherwise (`--listen-on`) or turned on
+    // `--auth`, which is the sign they mean to expose it.
+    let listen_on = calibre_srv::guard::effective_listen_on(&cli.opts);
     let reader_profiles = calibre_srv::reader_profiles::ProfileStore::new(&cli.library_path.join("reader-profiles.sqlite"))?;
     let book_cache = Arc::new(calibre_srv::books_cache::BookCache::open_default()?);
     let max_jobs = if cli.opts.max_jobs < 1 { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) } else { cli.opts.max_jobs as usize };
@@ -188,16 +191,26 @@ async fn main() -> anyhow::Result<()> {
     };
     // Only built when there is actually more than one library. With a
     // single library `cache_for` short-circuits to `cache` and never
-    // consults a broker, so building one would open the same library a
-    // second time for nothing.
+    // consults a broker.
     let libraries = if cli.extra_libraries.is_empty() {
         None
     } else {
         let mut paths = vec![cli.library_path.clone()];
         paths.extend(cli.extra_libraries.iter().cloned());
-        let broker = Arc::new(calibre_srv::library_broker::LibraryBroker::new(&paths)?);
+        // Seeded with the cache opened above, so `state.cache` and the
+        // broker's default entry are the same `Cache`, not two over one library.
+        let broker = Arc::new(calibre_srv::library_broker::LibraryBroker::new_seeded(&paths, Some((cli.library_path.as_path(), cache.clone())))?);
         for (id, name) in broker.library_map() {
             println!("serving library {id:?} ({name})");
+        }
+        // The other libraries' trash used to be expired by whichever GET
+        // first listed it; now it happens here, once, for each.
+        for id in broker.library_ids() {
+            if let Some(other) = broker.get(Some(id)) {
+                if !Arc::ptr_eq(&other, &cache) {
+                    expire_on_start(other);
+                }
+            }
         }
         Some(broker)
     };

@@ -131,6 +131,21 @@ impl LibraryBroker {
     /// library fails, or if `paths` is empty (there is no library to
     /// use as the default).
     pub fn new(paths: &[PathBuf]) -> Result<Self> {
+        Self::new_seeded(paths, None)
+    }
+
+    /// [`LibraryBroker::new`], except that the library already opened at
+    /// `preopened.0` is reused (`preopened.1`) instead of being opened a
+    /// second time.
+    ///
+    /// There must be exactly one `Cache` per library: each carries its own
+    /// field caches (invalidated by that connection's own change counter),
+    /// its own writer lock and its own change-log chain. Two `Cache`s over one
+    /// library means stale reads, `AlreadyLocked`, and a forked hash chain.
+    /// The server's `AppState::cache` is the default library, so the broker
+    /// has to share it rather than build its own.
+    pub fn new_seeded(paths: &[PathBuf], preopened: Option<(&Path, Arc<Cache>)>) -> Result<Self> {
+        let preopened = preopened.map(|(p, c)| (canonicalize_path(p), c));
         let mut libraries = IndexMap::new();
         let mut names = IndexMap::new();
         let mut seen: Vec<PathBuf> = Vec::new();
@@ -147,10 +162,12 @@ impl LibraryBroker {
             }
 
             let library_id = library_id_from_path(&canonical, &libraries);
-            let cache = Cache::new(&canonical)
-                .with_context(|| format!("failed to open library at {}", canonical.display()))?;
+            let cache = match &preopened {
+                Some((p, c)) if p == &canonical || calibre_utils::filenames::samefile(p, &canonical) => c.clone(),
+                _ => Arc::new(Cache::new(&canonical).with_context(|| format!("failed to open library at {}", canonical.display()))?),
+            };
             names.insert(library_id.clone(), basename(&canonical));
-            libraries.insert(library_id, Arc::new(cache));
+            libraries.insert(library_id, cache);
         }
 
         if libraries.is_empty() {
@@ -200,6 +217,35 @@ mod tests {
         fs::create_dir_all(&lib_dir).unwrap();
         Cache::new(&lib_dir).unwrap(); // creates metadata.db
         lib_dir
+    }
+
+    /// The server's own `Cache` and the broker's default entry must be one
+    /// object: two `Cache`s over one library keep separate field caches (so a
+    /// write through one is invisible to the other), fight over the writer
+    /// lock and fork the change-log hash chain.
+    #[test]
+    fn a_seeded_broker_shares_the_preopened_cache_instead_of_opening_it_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_library(dir.path(), "A");
+        let b = make_library(dir.path(), "B");
+        let preopened = Arc::new(Cache::new(&a).unwrap());
+        let broker = LibraryBroker::new_seeded(&[a.clone(), b], Some((a.as_path(), preopened.clone()))).unwrap();
+
+        let default = broker.get(None).unwrap();
+        assert!(Arc::ptr_eq(&default, &preopened), "the default entry is the pre-opened cache");
+        assert!(Arc::ptr_eq(&broker.get(Some("A")).unwrap(), &preopened));
+        assert!(!Arc::ptr_eq(&broker.get(Some("B")).unwrap(), &preopened), "other libraries are still opened by the broker");
+
+        // And so an edit through one handle is seen through the other.
+        let mut meta = calibre_ebooks::metadata::MetaInformation::default();
+        meta.title = "Seen Everywhere".to_string();
+        meta.authors = vec!["Someone".to_string()];
+        let source = dir.path().join("book.epub");
+        fs::write(&source, b"epub").unwrap();
+        let id = default.add_book(&source, &meta).unwrap();
+        assert_eq!(preopened.field_for(id, "title").unwrap().as_deref(), Some("Seen Everywhere"));
+        preopened.set_field(id, "title", "Renamed").unwrap();
+        assert_eq!(broker.get(Some("A")).unwrap().field_for(id, "title").unwrap().as_deref(), Some("Renamed"));
     }
 
     #[test]

@@ -199,10 +199,13 @@ mod tests {
     /// it) alongside the server's real local address.
     async fn spawn_server() -> (crate::AppState, std::net::SocketAddr, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let state = test_state(dir.path());
-        let router = crate::test_router(state.clone());
+        let mut state = test_state(dir.path());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        // The request guard checks `Host` against the configured port, so the
+        // state has to know the port this listener actually got.
+        state.opts = std::sync::Arc::new(crate::opts::ServerOptions { port: addr.port(), ..crate::opts::ServerOptions::default() });
+        let router = crate::test_router(state.clone());
         tokio::spawn(async move {
             axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
         });

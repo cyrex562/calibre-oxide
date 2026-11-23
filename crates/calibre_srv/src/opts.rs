@@ -74,7 +74,7 @@ pub struct ServerOptions {
     /// Maximum number of ungrouped items in OPDS feeds
     #[arg(long, default_value_t = 100)]
     pub max_opds_ungrouped_items: i64,
-    /// The interface on which to listen for connections
+    /// The interface on which to listen for connections (default: 127.0.0.1, or 0.0.0.0 when --auth is given)
     #[arg(long)]
     pub listen_on: Option<String>,
     /// Fallback to auto-detected interface

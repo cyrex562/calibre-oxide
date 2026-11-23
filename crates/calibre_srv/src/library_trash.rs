@@ -4,10 +4,9 @@
 //! title, author, size and when; Restore; Delete permanently; Empty trash.
 //!
 //! - `GET /trash/{library_id}` -- `{entries, expire_after_seconds, count,
-//!   total_size}`. Entries older than the library's expiry are removed
-//!   first (at most once an hour per library, like calibre's
-//!   `expire_old_trash`), which is also what makes opening the dialog the
-//!   place a stale trash empties itself.
+//!   total_size}`. Read-only: expiry (calibre's `expire_old_trash`) runs
+//!   when the server starts and on `POST /trash/expire`, never as a side
+//!   effect of a GET.
 //! - `POST /trash/restore/{library_id}` -- body `{kind, key, format?}`.
 //!   `kind` is `book` or `format`; a format entry needs the `format` to put back.
 //! - `POST /trash/delete/{library_id}` -- body `{kind, key, format?}`; for ever.
@@ -56,18 +55,17 @@ fn kind_of(body: &EntryBody) -> Result<TrashKind, ServerError> {
 
 /// `GET /trash/{library_id}`.
 pub async fn list(State(state): State<AppState>, Path(library_id): Path<String>) -> Result<Json<Value>, ServerError> {
+    // Read-only: a GET must not delete anything. Expiry runs when the server
+    // starts and on `POST /trash/expire`.
     let cache = cache_for(&state, &library_id)?;
-    let expired = {
-        let cache = cache.clone();
-        tokio::task::spawn_blocking(move || cache.expire_trash_if_due()).await.map_err(|e| ServerError::InternalServerError(e.to_string()))?
-    };
     let (entries, expiry) = blocking(move || Ok((cache.list_trash()?, cache.trash_expiry_seconds()))).await?;
     let total_size: i64 = entries.iter().map(|e| e.size).sum();
     Ok(Json(json!({
         "count": entries.len(),
         "total_size": total_size,
         "expire_after_seconds": expiry,
-        "expired": expired.map(|r| r.removed).unwrap_or_default(),
+        // Kept for the web client's type; a listing expires nothing any more.
+        "expired": Vec::<String>::new(),
         "entries": entries,
     })))
 }
@@ -75,6 +73,7 @@ pub async fn list(State(state): State<AppState>, Path(library_id): Path<String>)
 /// `POST /trash/restore/{library_id}`.
 pub async fn restore(State(state): State<AppState>, Path(library_id): Path<String>, Json(body): Json<EntryBody>) -> Result<Json<Value>, ServerError> {
     let cache = cache_for(&state, &library_id)?;
+    crate::library_jobs::ensure_no_file_mover(&cache)?;
     let kind = kind_of(&body)?;
     let result = blocking(move || -> anyhow::Result<Value> {
         match kind {

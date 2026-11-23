@@ -179,6 +179,7 @@ pub mod duplicates_review;
 pub mod editor_tools;
 pub mod errors;
 pub mod fts;
+pub mod guard;
 pub mod jobs;
 pub mod legacy;
 pub mod library_broker;
@@ -550,7 +551,13 @@ pub fn router(state: AppState) -> axum::Router {
     // before a body is buffered rather than after.
     let body_limit = body_limit_bytes(state.opts.max_request_body_size);
 
-    api.merge(mathjax_routes).with_state(state).layer(DefaultBodyLimit::max(body_limit))
+    // Outermost, so a refused request never reaches auth, a body buffer or a
+    // handler. See `guard`'s module doc.
+    let guard_state = state.clone();
+    api.merge(mathjax_routes)
+        .with_state(state)
+        .layer(DefaultBodyLimit::max(body_limit))
+        .layer(middleware::from_fn_with_state(guard_state, guard::require_same_site))
 }
 
 /// Converts the configured megabyte limit into bytes.
@@ -788,3 +795,6 @@ mod tests {
 #[cfg(test)]
 #[path = "compare_and_move_tests.rs"]
 mod compare_and_move_tests;
+
+#[cfg(test)]
+mod hardening_tests;

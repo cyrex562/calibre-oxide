@@ -126,6 +126,16 @@ pub enum JobKind {
 }
 
 impl JobKind {
+    /// Whether a job of this kind moves, renames or removes files already in
+    /// the library -- the work that a delete, merge, rename or trash restore
+    /// must not interleave with.
+    pub fn moves_files(self) -> bool {
+        matches!(
+            self,
+            JobKind::Import | JobKind::Resolve | JobKind::MergeExact | JobKind::Absorb | JobKind::Unabsorb | JobKind::Organize | JobKind::UndoOrganize | JobKind::Retitle | JobKind::UndoRetitle
+        )
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             JobKind::Scan => "scan",
@@ -494,6 +504,47 @@ impl JobParams {
             map.insert("book_count".into(), json!(plan.books));
         }
         Value::Object(map)
+    }
+}
+
+/// The file-moving job running on `cache`'s library, if any. The routes that
+/// themselves move files (delete, merge, rename, trash restore) refuse with
+/// 409 while one runs, so they cannot pull a file out from under it.
+pub fn running_file_mover(cache: &Cache) -> Option<Arc<LibraryJob>> {
+    let library = cache.backend.library_path.to_string_lossy().to_string();
+    registry().jobs.lock().unwrap().iter().find(|j| j.library == library && j.state() == JobState::Running && j.kind.moves_files()).cloned()
+}
+
+/// Registers a job of `kind` as running on `cache`'s library without starting
+/// any work; the caller ends it with [`finish_pretend`].
+#[cfg(test)]
+pub(crate) fn pretend_running(cache: &Cache, kind: JobKind) -> Arc<LibraryJob> {
+    let reg = registry();
+    let (done, _) = tokio::sync::watch::channel(false);
+    let job = Arc::new(LibraryJob {
+        id: reg.next_id.fetch_add(1, Ordering::SeqCst),
+        kind,
+        library: cache.backend.library_path.to_string_lossy().to_string(),
+        started_at: now_secs(),
+        params: json!({}),
+        control: JobControl::new(),
+        outcome: Mutex::new(Outcome { state: JobState::Running, report: None, error: None, finished_at: None }),
+        done,
+    });
+    reg.jobs.lock().unwrap().push(job.clone());
+    job
+}
+
+#[cfg(test)]
+pub(crate) fn finish_pretend(job: &LibraryJob) {
+    job.outcome.lock().unwrap().state = JobState::Finished;
+}
+
+/// `Err(409)` while a file-moving job runs on this library.
+pub fn ensure_no_file_mover(cache: &Cache) -> Result<(), crate::errors::ServerError> {
+    match running_file_mover(cache) {
+        Some(job) => Err(crate::errors::ServerError::Conflict(format!("a file-moving job is running ({} job {}); wait for it to finish", job.kind.name(), job.id))),
+        None => Ok(()),
     }
 }
 
