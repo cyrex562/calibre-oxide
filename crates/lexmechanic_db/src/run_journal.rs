@@ -16,6 +16,8 @@
 //! - `{"t":"book","v":{..}}`: a book's entry, written before the move. A later
 //!   `book` line for the same `book_id` replaces it (retitle writes the
 //!   intent first and the finished entry after).
+//! - `{"t":"dircase","parent":P,"from":A,"to":B}`: a directory about to be
+//!   renamed only in case, written before the rename; folded into `dir_case`
 //! - `{"t":"done","book_id":N}`: the book's move completed and was recorded
 //! - `{"t":"abandon","book_id":N}`: the move failed and was rolled back
 //! - `{"t":"undone","at":T}`: the run was undone
@@ -170,7 +172,19 @@ impl RunJournal {
     /// Writes a book's entry and waits until it is on disk. Call before
     /// touching the book's files.
     pub(crate) fn append_book<B: Serialize>(&mut self, book: &B) -> Result<()> {
+        #[cfg(test)]
+        if test_hooks::should_fail_book_append() {
+            return Err(anyhow!("injected journal write failure"));
+        }
         self.write_line(&json!({"t": "book", "v": book}), true)
+    }
+
+    /// A directory about to be renamed only in case (`Fiction` to `fiction`),
+    /// written and fsynced **before** the rename, so an undo can always put
+    /// the old spelling back. `parent` is the directory holding it, relative to
+    /// the library root (`""` for the root itself).
+    pub(crate) fn append_dir_case(&mut self, parent: &str, from: &str, to: &str) -> Result<()> {
+        self.write_line(&json!({"t": "dircase", "parent": parent, "from": from, "to": to}), true)
     }
 
     /// The book's move completed and is recorded. Not fsynced: if it is lost
@@ -190,6 +204,37 @@ impl RunJournal {
     }
 }
 
+/// Failure injection for tests: make a chosen [`RunJournal::append_book`] call
+/// fail. Per thread, so tests running in parallel do not see each other's.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static APPENDS_BEFORE_FAILURE: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// The next `n` book appends on this thread succeed and the one after fails
+    /// (once); `None` turns the hook off.
+    pub(crate) fn fail_book_append_after(n: Option<usize>) {
+        APPENDS_BEFORE_FAILURE.with(|c| c.set(n));
+    }
+
+    pub(super) fn should_fail_book_append() -> bool {
+        APPENDS_BEFORE_FAILURE.with(|c| match c.get() {
+            Some(0) => {
+                c.set(None);
+                true
+            }
+            Some(n) => {
+                c.set(Some(n - 1));
+                false
+            }
+            None => false,
+        })
+    }
+}
+
 fn sync_dir(dir: &Path) {
     // Best effort: a directory cannot be opened for sync everywhere.
     if let Ok(f) = File::open(dir) {
@@ -203,6 +248,7 @@ fn fold(text: &str) -> Result<Value> {
     let mut books: Vec<Value> = Vec::new();
     let mut pending: Vec<i64> = Vec::new();
     let mut undone_at: Option<i64> = None;
+    let mut dir_case: Vec<Value> = Vec::new();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         // A line cut short by a crash is the end of what was written.
         let Ok(v) = serde_json::from_str::<Value>(line) else { break };
@@ -233,6 +279,7 @@ fn fold(text: &str) -> Result<Value> {
                     books.retain(|b| id_of(b) != Some(id));
                 }
             }
+            Some("dircase") => dir_case.push(json!({"parent": v.get("parent"), "from": v.get("from"), "to": v.get("to")})),
             Some("undone") => undone_at = v.get("at").and_then(Value::as_i64),
             _ => {}
         }
@@ -244,6 +291,9 @@ fn fold(text: &str) -> Result<Value> {
     }
     if !pending.is_empty() {
         run["pending"] = json!(pending);
+    }
+    if !dir_case.is_empty() {
+        run["dir_case"] = Value::Array(dir_case);
     }
     Ok(run)
 }

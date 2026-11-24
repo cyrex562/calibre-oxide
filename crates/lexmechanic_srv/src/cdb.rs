@@ -589,6 +589,106 @@ async fn set_fields_handle(state: AppState, book_id: i32, library_id: Option<Str
     Ok(Json(Value::Object(ans)))
 }
 
+/// One set of changes and the books it applies to.
+#[derive(Debug, Deserialize)]
+pub struct BatchGroup {
+    book_ids: Vec<i32>,
+    changes: serde_json::Map<String, Value>,
+}
+
+/// Either one `{book_ids, changes}` (the same change for every book) or
+/// `groups`: several of those, for an edit whose result differs per book (adding
+/// a tag gives each book its own list) but is shared by runs of them.
+#[derive(Debug, Deserialize)]
+pub struct SetFieldsBatchBody {
+    #[serde(default)]
+    book_ids: Vec<i32>,
+    #[serde(default)]
+    changes: serde_json::Map<String, Value>,
+    #[serde(default)]
+    groups: Vec<BatchGroup>,
+}
+
+/// How many books one batch commits together. A request may name more (the
+/// web client sends about 200); they are written in runs of this size, so a
+/// huge request never holds the database for the whole of it.
+const BATCH_COMMIT_CHUNK: usize = 200;
+
+/// `POST /cdb/set-fields-batch/{library_id}`: the same field `changes` applied
+/// to many books in one request, for bulk edit.
+///
+/// Body: `{"book_ids": [..], "changes": {..}}`, `changes` shaped as for
+/// `/cdb/set-fields`; or `{"groups": [{"book_ids": [..], "changes": {..}}, ..]}`
+/// for several such sets at once (an edit whose result differs per book but is
+/// shared by runs of them). Covers and format changes are per-book operations and are
+/// refused here. The answer is `{"updated": [ids], "failed": [{"book_id", "error"}]}`:
+/// one book failing (it was deleted meanwhile) does not stop the others.
+pub async fn set_fields_batch(State(state): State<AppState>, Path(library_id): Path<String>, Json(body): Json<SetFieldsBatchBody>) -> Result<Json<Value>, ServerError> {
+    set_fields_batch_handle(state, Some(library_id), body).await
+}
+
+/// [`set_fields_batch`] for a URL with no `{library_id}` segment.
+pub async fn set_fields_batch_no_library(State(state): State<AppState>, Json(body): Json<SetFieldsBatchBody>) -> Result<Json<Value>, ServerError> {
+    set_fields_batch_handle(state, None, body).await
+}
+
+async fn set_fields_batch_handle(state: AppState, library_id: Option<String>, body: SetFieldsBatchBody) -> Result<Json<Value>, ServerError> {
+    let cache = state.cache_for(library_id.as_deref()).ok_or_else(|| ServerError::NotFound(format!("no library named {:?}", library_id.clone().unwrap_or_default())))?;
+    let SetFieldsBatchBody { book_ids, changes, mut groups } = body;
+    if !book_ids.is_empty() || groups.is_empty() {
+        groups.insert(0, BatchGroup { book_ids, changes });
+    }
+
+    // Everything is checked before the first write: a bad group must not leave the ones before it applied.
+    let mut work: Vec<(Vec<i32>, Vec<(String, String)>)> = Vec::new();
+    for group in &groups {
+        let mut updates: Vec<(String, String)> = Vec::new();
+        for (field, value) in &group.changes {
+            if matches!(field.as_str(), "cover" | "added_formats" | "removed_formats") {
+                return Err(ServerError::BadRequest(format!("{field:?} cannot be changed for many books at once")));
+            }
+            let Some(string_value) = value_to_field_string(field, value) else {
+                return Err(ServerError::BadRequest(format!("cannot set field {field:?} to {value}")));
+            };
+            updates.push((field.clone(), string_value));
+        }
+        if updates.is_empty() {
+            return Err(ServerError::BadRequest("no changes to apply".to_string()));
+        }
+        let mut seen = std::collections::HashSet::new();
+        work.push((group.book_ids.iter().copied().filter(|id| seen.insert(*id)).collect(), updates));
+    }
+
+    let mut updated: Vec<i32> = Vec::new();
+    let mut failed: Vec<Value> = Vec::new();
+    for (book_ids, updates) in work {
+        for chunk in book_ids.chunks(BATCH_COMMIT_CHUNK) {
+            let chunk = chunk.to_vec();
+            let (ids, results) = tokio::task::spawn_blocking({
+                let cache = cache.clone();
+                let updates = updates.clone();
+                move || {
+                    let results = cache.set_fields_for_books(&chunk, &updates);
+                    (chunk, results)
+                }
+            })
+            .await
+            .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+            for (id, result) in ids.into_iter().zip(results) {
+                match result {
+                    Ok(()) => updated.push(id),
+                    Err(e) => failed.push(serde_json::json!({ "book_id": id, "error": e.to_string() })),
+                }
+            }
+        }
+    }
+
+    if !updated.is_empty() {
+        web_socket::publish(&state, ChangeEvent::MetadataChanged { book_ids: updated.clone() });
+    }
+    Ok(Json(serde_json::json!({ "updated": updated, "failed": failed })))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CopyToLibraryBody {
     book_ids: Vec<i32>,
@@ -1100,6 +1200,61 @@ mod tests {
         assert_eq!(get_json(&router, "/ajax/book/1").await.0, StatusCode::NOT_FOUND);
         assert_eq!(get_json(&router, "/ajax/book/3").await.0, StatusCode::NOT_FOUND);
         assert_eq!(get_json(&router, "/ajax/book/2").await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn set_fields_batch_applies_one_change_to_many_books_and_reports_a_bad_id_alone() {
+        let (_dir, router) = test_app(3);
+        let (status, body) = post_json(&router, "/cdb/set-fields-batch/default", serde_json::json!({"book_ids": [1, 9999, 3], "changes": {"tags": ["red", "blue"], "publisher": "Acme"}})).await;
+        assert_eq!(status, StatusCode::OK, "got: {body}");
+        assert_eq!(body["updated"], serde_json::json!([1, 3]), "{body}");
+        let failed = body["failed"].as_array().unwrap();
+        assert_eq!(failed.len(), 1, "{body}");
+        assert_eq!(failed[0]["book_id"], 9999);
+        assert!(failed[0]["error"].as_str().is_some_and(|e| !e.is_empty()));
+
+        for id in [1, 3] {
+            let (_, book) = get_json(&router, &format!("/ajax/book/{id}")).await;
+            assert_eq!(book["tags"], serde_json::json!(["red", "blue"]), "{book}");
+            assert_eq!(book["publisher"], "Acme");
+        }
+        let (_, untouched) = get_json(&router, "/ajax/book/2").await;
+        assert_eq!(untouched["tags"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn set_fields_batch_takes_groups_of_books_with_their_own_changes() {
+        let (_dir, router) = test_app(3);
+        let body = serde_json::json!({"groups": [
+            {"book_ids": [1, 2], "changes": {"tags": ["shared"]}},
+            {"book_ids": [3], "changes": {"tags": ["shared", "extra"]}},
+        ]});
+        let (status, resp) = post_json(&router, "/cdb/set-fields-batch", body).await;
+        assert_eq!(status, StatusCode::OK, "got: {resp}");
+        assert_eq!(resp["updated"], serde_json::json!([1, 2, 3]));
+        let (_, third) = get_json(&router, "/ajax/book/3").await;
+        assert_eq!(third["tags"], serde_json::json!(["shared", "extra"]));
+        let (_, first) = get_json(&router, "/ajax/book/1").await;
+        assert_eq!(first["tags"], serde_json::json!(["shared"]));
+
+        // A bad group refuses the whole request before any book is written.
+        let bad = serde_json::json!({"groups": [
+            {"book_ids": [1], "changes": {"publisher": "Nope"}},
+            {"book_ids": [2], "changes": {"cover": "data:"}},
+        ]});
+        let (status, _) = post_json(&router, "/cdb/set-fields-batch", bad).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (_, after) = get_json(&router, "/ajax/book/1").await;
+        assert_ne!(after["publisher"], "Nope", "nothing before the bad group was applied");
+    }
+
+    #[tokio::test]
+    async fn set_fields_batch_refuses_cover_and_format_changes_and_an_empty_change_set() {
+        let (_dir, router) = test_app(1);
+        let (status, _) = post_json(&router, "/cdb/set-fields-batch/default", serde_json::json!({"book_ids": [1], "changes": {"removed_formats": ["epub"]}})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = post_json(&router, "/cdb/set-fields-batch/default", serde_json::json!({"book_ids": [1], "changes": {}})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

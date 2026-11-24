@@ -152,7 +152,64 @@ pub(crate) async fn fetch_rows_from_cache(cache: std::sync::Arc<lexmechanic_db::
 const FAST_SORT_FIELDS: &[&str] = &[
     "title", "sort", "authors", "author_sort", "publisher", "series", "uuid", "comments", "isbn", "identifiers",
     "rating", "size", "series_index", "tags", "languages", "timestamp", "pubdate", "last_modified", "id",
+    "folder", "file_name",
 ];
+
+/// Fields whose values are numbers: compared as numbers, not as the text of
+/// the number (which would put 9 after 10).
+const NUMERIC_SORT_FIELDS: &[&str] = &["size", "rating", "series_index", "id"];
+
+/// A string that sorts, character by character, in the same order as the
+/// number does: zero-padded to a fixed width, with negatives (never seen in
+/// practice) sorting before everything else.
+fn numeric_key(n: f64) -> String {
+    if n.is_nan() {
+        String::new()
+    } else if n < 0.0 {
+        format!("-{:020.6}", (1e13 + n).max(0.0))
+    } else {
+        format!("0{:020.6}", n)
+    }
+}
+
+/// The sort key of `field` for one row: numbers as padded text, the
+/// file-oriented fields from `files`, everything else via [`sort_key_for`].
+fn key_for(row: &Value, field: &str, files: &FileSortData) -> String {
+    let id = row["id"].as_i64().unwrap_or(0) as i32;
+    match field {
+        "folder" => files.folders.get(&id).cloned().unwrap_or_default(),
+        "file_name" => files.names.get(&id).cloned().unwrap_or_default(),
+        f if NUMERIC_SORT_FIELDS.contains(&f) => match &row[f] {
+            Value::Number(n) => n.as_f64().map(numeric_key).unwrap_or_default(),
+            _ => String::new(),
+        },
+        f => sort_key_for(row, f),
+    }
+}
+
+/// What the file-oriented sort fields need beyond a row: the primary file
+/// names (one bulk query) and the folders (in memory), loaded only when the
+/// sort asks for them.
+#[derive(Default)]
+struct FileSortData {
+    names: std::collections::HashMap<i32, String>,
+    folders: std::collections::HashMap<i32, String>,
+}
+
+impl FileSortData {
+    fn load(cache: &lexmechanic_db::cache::Cache, ids: &HashSet<i32>, fields: &[String]) -> anyhow::Result<Self> {
+        let mut data = Self::default();
+        if fields.iter().any(|f| f == "file_name") {
+            data.names = cache.primary_file_names(None)?;
+        }
+        if fields.iter().any(|f| f == "folder") {
+            for id in ids {
+                data.folders.insert(*id, cache.field_for(*id, "path")?.unwrap_or_default());
+            }
+        }
+        Ok(data)
+    }
+}
 
 /// Each matching book's id and its sort keys, one key per sort field.
 ///
@@ -164,19 +221,21 @@ const FAST_SORT_FIELDS: &[&str] = &[
 /// as before. Books without a title are left out, as `get_data_as_dict`
 /// leaves them out.
 async fn sort_keys(cache: &std::sync::Arc<lexmechanic_db::cache::Cache>, ids: HashSet<i32>, fields: &[&str]) -> Result<Vec<(i64, Vec<String>)>, ServerError> {
-    if !fields.iter().all(|f| FAST_SORT_FIELDS.contains(f)) {
-        let rows = fetch_rows_from_cache(cache.clone(), ids).await?;
-        return Ok(rows.iter().map(|r| (r["id"].as_i64().unwrap_or(0), fields.iter().map(|f| sort_key_for(r, f)).collect())).collect());
-    }
+    let fast = fields.iter().all(|f| FAST_SORT_FIELDS.contains(f));
     let cache = cache.clone();
     let fields: Vec<String> = fields.iter().map(|f| f.to_string()).collect();
     tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(i64, Vec<String>)>> {
+        let files = FileSortData::load(&cache, &ids, &fields)?;
+        if !fast {
+            let rows = cache.get_data_as_dict(None, false, Some(&ids), false)?;
+            return Ok(rows.iter().map(|r| (r["id"].as_i64().unwrap_or(0), fields.iter().map(|f| key_for(r, f, &files)).collect())).collect());
+        }
         let mut ids: Vec<i32> = ids.into_iter().collect();
         ids.sort_unstable();
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
             if let Some(row) = sort_row(&cache, id, &fields)? {
-                out.push((id as i64, fields.iter().map(|f| sort_key_for(&row, f)).collect()));
+                out.push((id as i64, fields.iter().map(|f| key_for(&row, f, &files)).collect()));
             }
         }
         Ok(out)
@@ -202,7 +261,8 @@ fn sort_row(cache: &lexmechanic_db::cache::Cache, id: i32, fields: &[String]) ->
             f => f,
         };
         let value = match stored {
-            "id" => continue,
+            // The file-oriented fields are keyed by `key_for` from `FileSortData`.
+            "id" | "folder" | "file_name" => continue,
             "rating" | "series_index" => serde_json::json!(cache.field_for(id, stored)?.and_then(|s| s.parse::<f64>().ok())),
             "size" => serde_json::json!(cache.field_for(id, stored)?.and_then(|s| s.parse::<i64>().ok())),
             "isbn" | "identifiers" => serde_json::json!(cache.field_for(id, stored)?.unwrap_or_default()),
@@ -263,6 +323,27 @@ mod cap_tests {
 #[derive(Debug, Deserialize)]
 pub struct BooksQuery {
     ids: Option<String>,
+    /// `files=1` adds the file-oriented fields the web table's optional
+    /// Size, Folder and File name columns show (see [`add_file_fields`]).
+    /// Absent, the response keeps upstream's shape exactly.
+    files: Option<String>,
+}
+
+/// Adds `size` (largest format, bytes), `folder` (the book's folder relative
+/// to the library root) and `file_name` (primary format's `stem.ext`) to each
+/// row of `rows`. All three come from in-memory tables and one `IN` query, with
+/// no stat of the disk, so a page of 100 books costs the same on a NAS.
+fn add_file_fields(cache: &lexmechanic_db::cache::Cache, rows: &mut [Value]) -> anyhow::Result<()> {
+    let ids: Vec<i32> = rows.iter().filter_map(|r| r["id"].as_i64()).map(|i| i as i32).collect();
+    let names = cache.primary_file_names(Some(&ids))?;
+    for row in rows.iter_mut() {
+        let Some(id) = row["id"].as_i64().map(|i| i as i32) else { continue };
+        let Some(map) = row.as_object_mut() else { continue };
+        map.insert("size".into(), serde_json::json!(cache.field_for(id, "size")?.and_then(|s| s.parse::<i64>().ok())));
+        map.insert("folder".into(), serde_json::json!(cache.field_for(id, "path")?.unwrap_or_default()));
+        map.insert("file_name".into(), serde_json::json!(names.get(&id)));
+    }
+    Ok(())
 }
 
 /// `GET /ajax/books?ids=1,2,3` (or `ids=all`/omitted, capped at
@@ -310,9 +391,17 @@ pub async fn books(State(state): State<AppState>, Query(q): Query<BooksQuery>) -
     for id in &ids {
         ans.insert(id.to_string(), Value::Null);
     }
-    for row in rows {
-        let id = row["id"].as_i64().unwrap_or(0);
-        ans.insert(id.to_string(), book_json(&row));
+    let mut shaped: Vec<Value> = rows.iter().map(book_json).collect();
+    if q.files.as_deref().is_some_and(|f| f != "0" && f != "false") {
+        let cache = state.cache.clone();
+        shaped = tokio::task::spawn_blocking(move || add_file_fields(&cache, &mut shaped).map(|_| shaped))
+            .await
+            .map_err(|e| ServerError::InternalServerError(e.to_string()))?
+            .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+    }
+    for out in shaped {
+        let id = out["id"].as_i64().unwrap_or(0);
+        ans.insert(id.to_string(), out);
     }
     Ok(Json(Value::Object(ans)))
 }
@@ -625,6 +714,8 @@ pub async fn library_info(State(state): State<AppState>) -> Json<Value> {
         // WAL), and any signals that another program has the library
         // open. The web UI shows a banner from this.
         "storage": state.cache.backend.storage_status(),
+        // Whether the change log has missed changes (see `change_log_status`).
+        "change_log": crate::change_log_status::status_json(&state.cache),
     }))
 }
 
@@ -894,13 +985,85 @@ mod tests {
         for field in super::FAST_SORT_FIELDS {
             let mut fast = super::sort_keys(&cache, all.clone(), &[field]).await.unwrap();
             fast.sort_by_key(|(id, _)| *id);
-            let mut full: Vec<(i64, Vec<String>)> = rows.iter().map(|r| (r["id"].as_i64().unwrap(), vec![super::sort_key_for(r, field)])).collect();
+            let files = super::FileSortData::load(&cache, &all, &[field.to_string()]).unwrap();
+            let mut full: Vec<(i64, Vec<String>)> = rows.iter().map(|r| (r["id"].as_i64().unwrap(), vec![super::key_for(r, field, &files)])).collect();
             full.sort_by_key(|(id, _)| *id);
             assert_eq!(fast, full, "sort keys differ for {field}");
         }
         // A field the fast path doesn't know still sorts, through the full rows.
         let other = super::sort_keys(&cache, all.clone(), &["formats"]).await.unwrap();
         assert_eq!(other.len(), all.len());
+    }
+
+    fn app_for(cache: Cache) -> axum::Router {
+        let state = crate::AppState { libraries: None, cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()), book_cache: std::sync::Arc::new(crate::books_cache::BookCache::open_temp()), jobs: std::sync::Arc::new(crate::jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))), render_jobs: std::sync::Arc::new(crate::render_endpoints::RenderJobRegistry::new()), conversion_jobs: std::sync::Arc::new(crate::convert::ConversionJobRegistry::new()), news_jobs: std::sync::Arc::new(crate::news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()), tts_voice: None, plugin_store: None, plugin_registry: std::sync::Arc::new(std::sync::Mutex::new(lexmechanic_customize::registry::PluginRegistry::new())), };
+        crate::test_router(state)
+    }
+
+    /// A book whose one file is `bytes` long, so its size is known.
+    fn add_sized_book(dir: &std::path::Path, cache: &Cache, title: &str, bytes: usize) -> i32 {
+        let source = dir.join(format!("{title}.pdf"));
+        std::fs::write(&source, vec![b'x'; bytes]).unwrap();
+        let mut meta = lexmechanic_ebooks::metadata::MetaInformation::default();
+        meta.title = title.to_string();
+        meta.authors = vec!["Author".to_string()];
+        cache.add_book(&source, &meta).unwrap()
+    }
+
+    #[tokio::test]
+    async fn books_with_files_adds_size_folder_and_file_name_but_the_default_shape_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        let id = add_sized_book(dir.path(), &cache, "Sized", 1234);
+        let folder = cache.field_for(id, "path").unwrap().unwrap();
+        let router = app_for(cache);
+
+        let (_, plain) = get_json(&router, &format!("/ajax/books?ids={id}")).await;
+        assert!(plain[id.to_string()].get("size").is_none(), "the calibre-compatible shape keeps size stripped: {plain}");
+        assert!(plain[id.to_string()].get("folder").is_none());
+        assert!(plain[id.to_string()].get("file_name").is_none());
+
+        let (status, with) = get_json(&router, &format!("/ajax/books?ids={id}&files=1")).await;
+        assert_eq!(status, StatusCode::OK);
+        let row = &with[id.to_string()];
+        assert_eq!(row["size"], 1234);
+        assert_eq!(row["folder"], folder.as_str());
+        assert_eq!(row["file_name"], "Sized.pdf");
+    }
+
+    #[tokio::test]
+    async fn search_sorts_by_size_numerically_and_by_folder_and_file_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        // Sizes chosen so text order (10, 9, 100) differs from numeric (9, 10, 100).
+        let nine = add_sized_book(dir.path(), &cache, "Nine", 9);
+        let ten = add_sized_book(dir.path(), &cache, "Ten", 10);
+        let hundred = add_sized_book(dir.path(), &cache, "Hundred", 100);
+        let router = app_for(cache);
+
+        let (_, asc) = get_json(&router, "/ajax/search?sort=size&sort_order=asc").await;
+        assert_eq!(asc["book_ids"], serde_json::json!([nine, ten, hundred]), "{asc}");
+        let (_, desc) = get_json(&router, "/ajax/search?sort=size&sort_order=desc").await;
+        assert_eq!(desc["book_ids"], serde_json::json!([hundred, ten, nine]), "{desc}");
+
+        // File names are Hundred.pdf < Nine.pdf < Ten.pdf; the folders follow the author/title layout.
+        let (_, by_name) = get_json(&router, "/ajax/search?sort=file_name&sort_order=asc").await;
+        assert_eq!(by_name["book_ids"], serde_json::json!([hundred, nine, ten]), "{by_name}");
+        let (_, by_folder) = get_json(&router, "/ajax/search?sort=folder&sort_order=asc").await;
+        let (_, folders) = get_json(&router, &format!("/ajax/books?ids={nine},{ten},{hundred}&files=1")).await;
+        let order: Vec<String> = by_folder["book_ids"].as_array().unwrap().iter().map(|i| folders[i.to_string()]["folder"].as_str().unwrap().to_string()).collect();
+        let mut sorted = order.clone();
+        sorted.sort();
+        assert_eq!(order, sorted, "folder sort is ascending: {by_folder}");
+    }
+
+    #[test]
+    fn numeric_keys_order_like_the_numbers() {
+        let mut nums = [100.0, 9.0, 10.0, 0.0, 2.5, 1e9];
+        let mut keys: Vec<(String, f64)> = nums.iter().map(|n| (super::numeric_key(*n), *n)).collect();
+        keys.sort_by(|a, b| a.0.cmp(&b.0));
+        nums.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(keys.iter().map(|(_, n)| *n).collect::<Vec<_>>(), nums);
     }
 
     #[tokio::test]

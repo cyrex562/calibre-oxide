@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { clampWidth, columnsFor, DEFAULT_TABLE_PREFS, DEFAULT_VISIBLE_KEYS, formatCell, MAX_COLUMN_WIDTH, MIN_COLUMN_WIDTH, nextSort, resolveColumns, type BookColumn, type TablePrefs } from "./columns";
+import { clampWidth, columnsFor, DEFAULT_TABLE_PREFS, DEFAULT_VISIBLE_KEYS, formatBytes, formatCell, MAX_COLUMN_WIDTH, MIN_COLUMN_WIDTH, nextSort, resolveColumns, type BookColumn, type TablePrefs } from "./columns";
 import type { BookSummary, FieldMetaEntry } from "./types";
 
 /**
@@ -40,6 +40,38 @@ function book(overrides: Partial<BookSummary> = {}): BookSummary {
 function col(key: string, kind: BookColumn["kind"]): BookColumn {
   return { key, label: key, kind, width: 100 };
 }
+
+describe("formatBytes", () => {
+  it("shows bytes below a kilobyte and one decimal above", () => {
+    expect(formatBytes(0)).toBe("0 B");
+    expect(formatBytes(512)).toBe("512 B");
+    expect(formatBytes(1024)).toBe("1.0 KB");
+    expect(formatBytes(1536)).toBe("1.5 KB");
+    expect(formatBytes(12.4 * 1024 * 1024)).toBe("12.4 MB");
+    expect(formatBytes(3 * 1024 ** 3)).toBe("3.0 GB");
+    expect(formatBytes(5 * 1024 ** 4)).toBe("5.0 TB");
+    // Past the largest unit it stays in it.
+    expect(formatBytes(2048 * 1024 ** 4)).toBe("2048.0 TB");
+  });
+
+  it("is empty for anything that is not a size", () => {
+    for (const v of [null, undefined, "", "abc", -1, NaN, {}]) expect(formatBytes(v)).toBe("");
+    expect(formatBytes("2048")).toBe("2.0 KB");
+  });
+
+  it("is what a bytes column shows, and an empty cell when the row has no size", () => {
+    const size = col("size", "bytes");
+    expect(formatCell(book({ size: 1234567 }), size)).toBe("1.2 MB");
+    expect(formatCell(book({ size: null }), size)).toBe("");
+    expect(formatCell(book({}), size)).toBe("");
+  });
+
+  it("shows the folder and file name as plain text", () => {
+    const row = book({ folder: "Fiction/Alpha (1)", file_name: "Alpha.pdf" });
+    expect(formatCell(row, col("folder", "text"))).toBe("Fiction/Alpha (1)");
+    expect(formatCell(row, col("file_name", "text"))).toBe("Alpha.pdf");
+  });
+});
 
 describe("formatCell", () => {
   it("joins authors with an ampersand and tags with commas", () => {
@@ -111,14 +143,26 @@ describe("columnsFor", () => {
   });
 
   // The trap this function exists for. `sortable_fields` contains
-  // `size`, `ondevice` and `cover`, none of which appear in a book
-  // row -- deriving columns from that list gives three columns that
-  // can never show anything.
+  // `ondevice` and `cover`, which never appear in a book row --
+  // deriving columns from that list gives columns that can never
+  // show anything. (`size` is in the row now, but only because the
+  // table asks for it with `files=1`; it is a column on purpose.)
   it("does not invent columns for sortable fields that are not in a book row", () => {
     const keys = columnsFor({}, sortable).map((c) => c.key);
-    expect(keys).not.toContain("size");
     expect(keys).not.toContain("ondevice");
     expect(keys).not.toContain("cover");
+  });
+
+  it("offers Size, Folder and File name as sortable, read-only columns that start hidden", () => {
+    const columns = columnsFor({}, []);
+    for (const [key, kind] of [["size", "bytes"], ["folder", "text"], ["file_name", "text"]] as const) {
+      const c = columns.find((col) => col.key === key);
+      expect(c, key).toBeDefined();
+      expect(c?.kind).toBe(kind);
+      expect(c?.sortKey).toBe(key);
+      expect(c?.editor).toBeUndefined();
+      expect(DEFAULT_VISIBLE_KEYS).not.toContain(key);
+    }
   });
 
   it("includes custom columns under the bare key a book row uses", () => {

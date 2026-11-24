@@ -244,6 +244,13 @@ const CASES: &[Case] = &[
     case!("set_field languages", |c, f| c.set_field(f.first, "languages", "fra").unwrap()),
     case!("set_field authors", |c, f| c.set_field(f.first, "authors", "Brand New Author").unwrap()),
     case!("set_field identifiers", |c, f| c.set_field(f.first, "identifiers", "isbn:9780000000002").unwrap()),
+    // The bulk-edit batch: one transaction for the standard fields, one log entry.
+    case!("set_fields_for_books", |c, f| {
+        let changes = [("tags".to_string(), "bulk one, bulk two".to_string()), ("publisher".to_string(), "Bulk Press".to_string()), ("rating".to_string(), "6".to_string()), ("identifiers".to_string(), "isbn:9780000000019".to_string()), ("comments".to_string(), "bulk comment".to_string())];
+        for r in c.set_fields_for_books(&[f.first, f.second], &changes) {
+            r.unwrap();
+        }
+    }),
     // The others.
     case!("update_book_metadata", |c, f| c.update_book_metadata(f.first, "Via Update", "Via Update Author").unwrap()),
     case!("rename_author", |c, _| {
@@ -553,9 +560,14 @@ use Account::*;
 /// above -- which proves it reaches the log -- or say why it need not.
 const ACCOUNTED: &[(&str, Account)] = &[
     ("cache.rs::set_field_inner", Case("set_field title")),
-    ("cache.rs::set_many_to_one_field", Case("set_field publisher")),
-    ("cache.rs::set_rating_field", Case("set_field rating")),
-    ("cache.rs::set_identifiers_field", Case("set_field identifiers")),
+    // The single-book setters (`set_many_to_one_field`, `set_rating_field`,
+    // `set_identifiers_field`) wrap these `_in` bodies in their own transaction;
+    // the `set_field publisher`/`rating`/`identifiers` cases cover that path and
+    // `set_fields_for_books` the batch one.
+    ("cache.rs::set_field_in_tx", Case("set_fields_for_books")),
+    ("cache.rs::link_many_to_one_in", Case("set_field publisher")),
+    ("cache.rs::set_rating_in", Case("set_field rating")),
+    ("cache.rs::set_identifiers_in", Case("set_field identifiers")),
     ("cache.rs::update_book_metadata", Case("update_book_metadata")),
     ("cache.rs::rename_item_in_db", Case("rename_tag")),
     ("cache.rs::add_custom_column_with_display", Case("add_custom_column")),

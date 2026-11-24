@@ -776,6 +776,7 @@ function hint(column: BookColumn): string {
 }
 
 .kind-number,
+.kind-bytes,
 .kind-rating {
   font-variant-numeric: tabular-nums;
 }

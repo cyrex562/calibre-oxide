@@ -434,6 +434,38 @@ fn a_case_only_folder_rename_renames_the_directory_on_disk() {
     assert!(dir.path().join("fiction/Alpha.pdf").is_file());
 }
 
+/// The undo of a case-only rename puts the directory's old spelling back too,
+/// not just the books' records (tranche 24a).
+#[test]
+fn undoing_a_case_only_folder_rename_restores_the_directory_spelling() {
+    let (dir, cache) = library();
+    write(&dir.path().join("Fiction/Alpha.pdf"), b"%PDF alpha");
+    write(&dir.path().join("Fiction/Beta.pdf"), b"%PDF beta");
+    index(dir.path(), &cache);
+
+    let plan = crate::library_folders::plan_rename(&cache, "Fiction", "fiction").unwrap();
+    let report = organize::execute(&cache, &plan, &JobControl::new()).unwrap();
+    assert_eq!(report.books_moved, 2, "{report:?}");
+    assert!(names_in(dir.path()).contains(&"fiction".to_string()));
+
+    // The rename is in the run's journal, written before it was made.
+    let run = organize::load_run(dir.path(), &report.run_id).unwrap();
+    let on_a_case_insensitive_volume = !run.dir_case.is_empty();
+    if on_a_case_insensitive_volume {
+        assert_eq!(run.dir_case, vec![organize::DirCaseRename { parent: String::new(), from: "Fiction".into(), to: "fiction".into() }]);
+    }
+
+    let undone = organize::undo(&cache, &report.run_id, &JobControl::new()).unwrap();
+    assert_eq!(undone.books_restored, 2, "{undone:?}");
+    assert!(undone.warnings.is_empty(), "{:?}", undone.warnings);
+    let names = names_in(dir.path());
+    assert!(names.contains(&"Fiction".to_string()), "the old spelling is back: {names:?}");
+    assert!(!names.contains(&"fiction".to_string()), "{names:?}");
+    assert!(dir.path().join("Fiction/Alpha.pdf").is_file());
+    let alpha = book_with_title(&cache, "Alpha");
+    assert_eq!(cache.field_for(alpha, "path").unwrap().as_deref(), Some("Fiction"));
+}
+
 // --- 11: delete is one transaction ----------------------------------------
 
 #[test]

@@ -380,6 +380,18 @@ pub fn apply(cache: &Cache, items: &[Item], options: &ApplyOptions, control: &Jo
                 if current.iter().all(|(_, n)| *n == stem) {
                     return Ok(false);
                 }
+                // The rename is written to the undo journal *before* it is made,
+                // the way organize writes its moves: every format is about to be
+                // called `stem`. If the finished entry below cannot be written
+                // this one stands, so undo can still put the files back; if the
+                // rename then does not happen, undo finds the old names in place
+                // and leaves them alone. Without a journal entry for it, the
+                // file is not renamed.
+                let mut planned = book.clone();
+                planned.new_names = current.iter().map(|(format, _)| (format.clone(), stem.clone())).collect();
+                if let Some(j) = journal.as_mut() {
+                    j.append_book(&planned).map_err(|e| format!("could not write its undo entry, so the files were not renamed: {e:#}"))?;
+                }
                 cache.rename_format_files(id, &stem).map(|r| !r.is_empty()).map_err(|e| format!("{e:#}"))
             });
             match renamed {
@@ -389,12 +401,14 @@ pub fn apply(cache: &Cache, items: &[Item], options: &ApplyOptions, control: &Jo
             }
         }
         book.new_names = names(cache, id);
-        // The finished entry (embedded flag, new file names) replaces the intent.
-        // If this fails the intent stands, which undoes the title but not a rename,
-        // so it is worth saying.
+        // The finished entry (embedded flag, the file names as they ended up)
+        // replaces the earlier ones. If this fails, the entries written before
+        // the title and the rename stand, and they are enough to undo both; the
+        // only thing lost is the `embedded` flag if the embed ran, which this
+        // is worth saying.
         if let Some(j) = journal.as_mut() {
             if let Err(e) = j.append_book(&book) {
-                report.skipped.push(Skipped { book_id: id, reason: format!("warning: the final undo entry could not be written ({e:#}); undo will restore the title but may not restore renamed files") });
+                report.skipped.push(Skipped { book_id: id, reason: format!("warning: the final undo entry could not be written ({e:#}); undo still restores the title and file names from the entries written before they changed") });
             }
         }
     }
@@ -467,6 +481,11 @@ pub fn undo(cache: &Cache, run_id: &str, control: &JobControl) -> Result<UndoRep
         for (format, new_stem) in &book.new_names {
             let Some(old_stem) = book.old_names.get(format) else { continue };
             if old_stem == new_stem {
+                continue;
+            }
+            // Still under its old name: the rename this entry planned never
+            // happened (it is journaled before it is made), so nothing to undo.
+            if current_names.get(format) == Some(old_stem) {
                 continue;
             }
             if current_names.get(format) != Some(new_stem) {
@@ -826,6 +845,46 @@ mod tests {
 
         assert!(undo(&cache, &report.run_id, &JobControl::new()).is_err(), "a double undo is refused");
         assert!(list_runs(dir.path())[0].3, "the run is marked undone");
+    }
+
+    /// The last journal write of a book fails (injected). The rename was journaled
+    /// before it was made, so undo still puts the file back, not just the title.
+    #[test]
+    fn undo_restores_renamed_files_even_when_the_final_journal_entry_could_not_be_written() {
+        let (dir, cache) = library();
+        let id = add(dir.path(), &cache, "Dragon_Lore", "Untitled", false);
+        // Appends for the book: the intent (1st), the planned rename (2nd), the finished entry (3rd, fails).
+        crate::run_journal::test_hooks::fail_book_append_after(Some(2));
+        let report = apply(&cache, &[item(&cache, id, "Dragon Lore")], &options(false, true), &JobControl::new()).unwrap();
+        crate::run_journal::test_hooks::fail_book_append_after(None);
+        assert_eq!((report.retitled, report.renamed), (1, 1), "{report:?}");
+        assert!(report.skipped.iter().any(|s| s.reason.contains("final undo entry")), "the failed write is reported: {report:?}");
+        assert!(dir.path().join("Dragon Lore.pdf").is_file());
+
+        let undone = undo(&cache, &report.run_id, &JobControl::new()).unwrap();
+        assert_eq!((undone.titles_restored, undone.files_restored), (1, 1), "{undone:?}");
+        assert_eq!(cache.field_for(id, "title").unwrap().unwrap(), "Untitled");
+        assert_eq!(cache.format_file_stem(id).unwrap().as_deref(), Some("Dragon_Lore"));
+        assert!(dir.path().join("Dragon_Lore.pdf").is_file());
+        assert!(!dir.path().join("Dragon Lore.pdf").exists());
+    }
+
+    /// If the rename's own journal entry cannot be written the files are not
+    /// renamed (the title is still set and undoable).
+    #[test]
+    fn a_rename_whose_journal_entry_cannot_be_written_is_not_made() {
+        let (dir, cache) = library();
+        let id = add(dir.path(), &cache, "Dragon_Lore", "Untitled", false);
+        crate::run_journal::test_hooks::fail_book_append_after(Some(1));
+        let report = apply(&cache, &[item(&cache, id, "Dragon Lore")], &options(false, true), &JobControl::new()).unwrap();
+        crate::run_journal::test_hooks::fail_book_append_after(None);
+        assert_eq!((report.retitled, report.renamed), (1, 0), "{report:?}");
+        assert!(report.failed.iter().any(|f| f.stage == "rename" && f.reason.contains("undo entry")), "{report:?}");
+        assert!(dir.path().join("Dragon_Lore.pdf").is_file(), "the file is where it was");
+
+        let undone = undo(&cache, &report.run_id, &JobControl::new()).unwrap();
+        assert_eq!(undone.titles_restored, 1, "{undone:?}");
+        assert!(undone.skipped.is_empty(), "nothing to complain about for a rename that never happened: {undone:?}");
     }
 
     #[test]
