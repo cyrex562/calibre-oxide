@@ -227,7 +227,7 @@ export function uniformChanges(spec: BulkEditSpec): BookFieldChanges | null {
       if (parseList(edit.value).length > 0) return null;
       continue;
     }
-    changes[key] = parseList(edit.value);
+    changes[key] = dedupe(parseList(edit.value));
   }
   const rest = changesFor({ id: 0 } as BookSummary, { ...spec, tags: undefined, authors: undefined, languages: undefined, searchReplace: undefined });
   Object.assign(changes, rest ?? {});

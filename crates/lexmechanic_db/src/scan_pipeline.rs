@@ -513,6 +513,13 @@ pub struct EnrichReport {
 /// [`PipelineOptions::batch_size`] books, one transaction and one change-log
 /// entry each ([`Cache::write_enrichment_batch`]).
 pub fn enrich_pending(cache: &Cache, options: &PipelineOptions, control: &JobControl) -> Result<EnrichReport> {
+    enrich_pending_except(cache, options, control, &std::collections::HashSet::new())
+}
+
+/// [`enrich_pending`] leaving the books in `skip` queued: what an import passes (the books
+/// that were already waiting before it began), so it renders the covers of the books it added
+/// and not a whole deferred library's worth.
+pub fn enrich_pending_except(cache: &Cache, options: &PipelineOptions, control: &JobControl, skip: &std::collections::HashSet<i32>) -> Result<EnrichReport> {
     use crate::enrich_batch::EnrichmentWrite;
 
     control.set_phase("enriching");
@@ -533,6 +540,7 @@ pub fn enrich_pending(cache: &Cache, options: &PipelineOptions, control: &JobCon
     let suspects: std::collections::HashSet<i32> = store.take_inflight("enrich")?.into_iter().filter_map(|k| k.parse().ok()).collect();
 
     let mut pending = store.pending_enrichment()?;
+    pending.retain(|(book_id, ..)| !skip.contains(book_id));
     pending.sort_by_key(|(book_id, ..)| !suspects.contains(book_id));
     control.total.store(pending.len() as u64, Ordering::Relaxed);
     let pool = if pending.iter().any(|(_, format, _, _)| format.eq_ignore_ascii_case("pdf")) { options.pdf_pool.resolve(options.pdf_workers) } else { None };

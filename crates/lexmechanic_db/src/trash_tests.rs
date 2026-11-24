@@ -553,3 +553,86 @@ fn a_rebuild_from_the_log_agrees_after_a_batch_deletion_and_a_restore() {
     assert_eq!(rebuilt.field_for(id, "rating").unwrap().as_deref(), Some("6"));
     assert_eq!(cache.field_for(back.book_id, "rating").unwrap().as_deref(), Some("6"));
 }
+
+/// A reservation of the kind a batch deletion makes before its transaction commits.
+fn reserve_for(cache: &Cache, id: i32) -> PathBuf {
+    let path = cache.field_for(id, "path").unwrap().unwrap();
+    let dedicated = cache.folder_is_dedicated(id, &path).unwrap();
+    let own = cache.own_files(id, &path, dedicated).unwrap();
+    let title = cache.field_for(id, "title").unwrap().unwrap_or_default();
+    let uuid = cache.book_uuid(id).unwrap();
+    let mut manifest = cache.trash_manifest_for(id, uuid, &title, &path, &own).unwrap();
+    cache.reserve_book_trash(&mut manifest, true).unwrap().expect("a file to keep")
+}
+
+/// Crash safety of a batch (finding 3), before the commit: the manifest is on disk and the
+/// book's row still exists. The half-made entry is invisible, cannot be restored, and recovery
+/// drops it -- the book was never deleted.
+#[test]
+fn a_reservation_whose_batch_never_committed_is_dropped_on_recovery() {
+    let (dir, cache, ids) = mixed_library();
+    let entry = reserve_for(&cache, ids[0]);
+    assert!(entry.join(BOOK_MANIFEST).is_file());
+    assert!(cache.list_trash().unwrap().is_empty(), "a pending entry is not offered");
+    assert!(cache.restore_trashed_book(entry.file_name().unwrap().to_str().unwrap()).is_err());
+
+    assert_eq!(cache.recover_pending_trash().unwrap(), 1);
+    assert!(!entry.exists());
+    assert!(dir.path().join("Receipts/a.pdf").is_file(), "the book's file was never touched");
+    assert!(cache.field_for(ids[0], "title").unwrap().is_some());
+    assert_eq!(cache.recover_pending_trash().unwrap(), 0);
+}
+
+/// ...and after the commit: the rows are gone and no file has moved yet (the crash came
+/// between). Recovery finishes the moves, and the book is restorable from the trash, not
+/// left as loose files for the next scan to re-import.
+#[test]
+fn a_reservation_whose_batch_committed_is_finished_on_recovery() {
+    let (dir, cache, ids) = mixed_library();
+    let uuid = cache.book_uuid(ids[0]).unwrap().unwrap();
+    let entry = reserve_for(&cache, ids[0]);
+    // The batch's commit, without its file moves: the row goes, the file stays where it was.
+    cache.delete_book_with(ids[0], BookFiles::Keep).unwrap();
+    assert!(dir.path().join("Receipts/a.pdf").is_file(), "the crash came before the moves");
+
+    assert_eq!(cache.recover_pending_trash().unwrap(), 1);
+    assert!(!dir.path().join("Receipts/a.pdf").exists(), "moved into the trash");
+    assert!(entry.join("a.pdf").is_file());
+    let listed = cache.list_trash().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].title, "A");
+    let back = cache.restore_trashed_book(&listed[0].key).unwrap();
+    assert_eq!(back.uuid, uuid);
+    assert!(dir.path().join("Receipts/a.pdf").is_file());
+}
+
+/// A finished batch leaves no pending entry behind.
+#[test]
+fn a_finished_batch_leaves_no_pending_entries() {
+    let (_dir, cache, ids) = mixed_library();
+    cache.delete_books_with(&ids[..3], BookFiles::Trash);
+    assert_eq!(cache.list_trash().unwrap().len(), 3);
+    assert_eq!(cache.recover_pending_trash().unwrap(), 0);
+}
+
+/// Two books of one folder deleted together: the folder and its emptied parent go, and the
+/// removal is reported on the book that owned the folder, as one-by-one deletion does (finding 10).
+#[test]
+fn a_batch_tidies_a_shared_folder_and_its_parent_like_one_by_one() {
+    let build = || {
+        let (dir, cache) = library();
+        write(&dir.path().join("P/Sub/a.pdf"), b"%PDF a");
+        write(&dir.path().join("P/Sub/b.pdf"), b"%PDF b");
+        let a = register(&cache, "P/Sub/a.pdf", "A", "Unknown");
+        let b = register(&cache, "P/Sub/b.pdf", "B", "Unknown");
+        (dir, cache, a, b)
+    };
+    let (one_dir, one, a1, b1) = build();
+    let r_a = one.delete_book_with(a1, BookFiles::Trash).unwrap();
+    let r_b = one.delete_book_with(b1, BookFiles::Trash).unwrap();
+    let (many_dir, many, a2, b2) = build();
+    let results: Vec<_> = many.delete_books_with(&[a2, b2], BookFiles::Trash).into_iter().map(|r| r.unwrap()).collect();
+    assert_eq!(tree(one_dir.path()), tree(many_dir.path()));
+    assert_eq!(many_dir.path().join("P").exists(), one_dir.path().join("P").exists(), "the emptied parent goes too");
+    assert_eq!((results[0].folder_removed.clone(), results[1].folder_removed.clone()), (r_a.folder_removed.clone(), r_b.folder_removed.clone()));
+}

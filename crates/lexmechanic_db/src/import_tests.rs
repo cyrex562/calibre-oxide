@@ -762,6 +762,30 @@ fn a_pdfs_cover_is_left_to_the_enrichment_pass_that_ends_the_import() {
     assert!(titles(&cache).contains(&"Doc 0".to_string()));
 }
 
+/// An import's closing pass is for the books it added: a library-wide queue left by a deferred
+/// scan stays queued instead of making a ten-book import render thousands of covers (finding 4).
+#[test]
+fn an_import_does_not_run_the_libraries_older_enrichment_queue() {
+    let (_dir, cache) = library();
+    let first = tempfile::tempdir().unwrap();
+    write(&first.path().join("Old.pdf"), b"%PDF-1.4 old one");
+    let report = run(&cache, first.path(), &ImportOptions::default());
+    let old = report.added[0].book_id;
+    // The book is back in the queue, as after a deferred scan.
+    {
+        let conn = cache.backend.conn.lock().unwrap();
+        crate::checksums::ChecksumStore::queue_enrichment_on(&conn, old, "PDF").unwrap();
+    }
+    assert_eq!(cache.checksums().pending_enrichment().unwrap().len(), 1);
+
+    let second = tempfile::tempdir().unwrap();
+    write(&second.path().join("New.pdf"), b"%PDF-1.4 new one");
+    let report = run(&cache, second.path(), &ImportOptions::default());
+    assert_eq!(report.books_added, 1, "{report:?}");
+    let queued: Vec<i32> = cache.checksums().pending_enrichment().unwrap().into_iter().map(|(id, ..)| id).collect();
+    assert_eq!(queued, vec![old], "the older queue entry is untouched; the new book's was worked off");
+}
+
 /// The queue is what makes a deferred cover safe: a book whose cover was never rendered is
 /// still listed for the pass, so a cancelled import or a restart does not lose it.
 #[test]

@@ -170,9 +170,34 @@ fn plan_key(target: &str, options: &MirrorOptions) -> String {
 }
 
 /// What a remembered plan is valid for: the library's change watermark, plus the
-/// database's `data_version` (a write by another process on the same `metadata.db`).
-fn plan_watermark(cache: &Cache) -> String {
-    format!("{}#{}", cache.change_watermark(), cache.foreign_write_version())
+/// database's `data_version` (a write by another process on the same `metadata.db`), plus a
+/// stamp of the **copy** (see [`target_stamp`]): edits made on a travel copy after the preview
+/// must not be overwritten by a run that reused the preview's plan, because the plan's
+/// `copy_edits` (what gets set aside, and what `overwrite_changed` has to consent to) were
+/// worked out before them.
+///
+/// Not covered: a source file rewritten on disk during the plan's life (a PDF annotated). That
+/// would need a walk of the source, which is what reusing a plan avoids; the run still copies
+/// the file as it is then.
+fn plan_watermark(cache: &Cache, target: &str) -> String {
+    format!("{}#{}#{}", cache.change_watermark(), cache.foreign_write_version(), target_stamp(target))
+}
+
+/// Size and modification time of what a person or another app changes in a copy: its
+/// manifest, its database (and write-ahead log), its change log and snapshots (a directory's
+/// mtime moves when an entry is added or removed). A handful of `stat` calls, however big the copy.
+fn target_stamp(target: &str) -> String {
+    let root = std::path::Path::new(target.trim());
+    let stat = |rel: &str| -> String {
+        match std::fs::metadata(root.join(rel)) {
+            Ok(m) => {
+                let mtime = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos()).unwrap_or(0);
+                format!("{}:{mtime}", m.len())
+            }
+            Err(_) => "-".to_string(),
+        }
+    };
+    [mirror::MANIFEST_NAME, "metadata.db", "metadata.db-wal", ".lexmechanic/changes", ".lexmechanic/snapshots", ".lexmechanic/checksums.db"].iter().map(|rel| stat(rel)).collect::<Vec<_>>().join("|")
 }
 
 fn remember_plan(cache: &Cache, key: &str, watermark: String, plan: &Arc<MirrorPlan>) {
@@ -188,10 +213,10 @@ fn remember_plan(cache: &Cache, key: &str, watermark: String, plan: &Arc<MirrorP
 /// and the library has not changed since. Running the copy then costs nothing to plan
 /// (a plan is 15 to 50 seconds at 60,000 files); anything else plans afresh and the
 /// fingerprint comparison decides, as it always did.
-fn recall_plan(cache: &Cache, key: &str, fingerprint: &str) -> Option<Arc<MirrorPlan>> {
+fn recall_plan(cache: &Cache, target: &str, key: &str, fingerprint: &str) -> Option<Arc<MirrorPlan>> {
     let hit = remembered_plans().lock().unwrap().iter().rev().find(|(at, library, k, _, plan)| at.elapsed() < PLAN_TTL && *library == cache.backend.library_path && k == key && plan.fingerprint == fingerprint).map(|(_, _, _, mark, plan)| (mark.clone(), plan.clone()));
     let (mark, plan) = hit?;
-    (plan_watermark(cache) == mark).then_some(plan)
+    (plan_watermark(cache, target) == mark).then_some(plan)
 }
 
 fn forget_plan(cache: &Cache, key: &str) {
@@ -201,7 +226,7 @@ fn forget_plan(cache: &Cache, key: &str) {
 /// The body of a [`JobKind::MirrorPlan`] job: plans the copy (with progress) and
 /// remembers the plan for the run that follows; the report is the dry run's answer.
 pub fn run_plan_job(cache: &Cache, target: &str, options: &MirrorOptions, control: &JobControl) -> anyhow::Result<Value> {
-    let watermark = plan_watermark(cache);
+    let watermark = plan_watermark(cache, target);
     match mirror::plan_controlled(cache, target, options, Some(control)) {
         Ok(plan) => {
             let plan = Arc::new(plan);
@@ -240,7 +265,7 @@ pub async fn mirror_library(State(state): State<AppState>, Path(library_id): Pat
         return Ok(started_as("mirror_plan", library_jobs::start_with(cache, JobKind::MirrorPlan, None, params)));
     }
     let reused = match (body.dry_run, body.fingerprint.as_deref()) {
-        (false, Some(fingerprint)) => recall_plan(&cache, &key, fingerprint),
+        (false, Some(fingerprint)) => recall_plan(&cache, &body.target, &key, fingerprint),
         _ => None,
     };
     let plan = match reused {
@@ -249,7 +274,7 @@ pub async fn mirror_library(State(state): State<AppState>, Path(library_id): Pat
             let (plan_cache, target, plan_key_) = (cache.clone(), body.target.clone(), key.clone());
             let dry_run = body.dry_run;
             tokio::task::spawn_blocking(move || {
-                let watermark = plan_watermark(&plan_cache);
+                let watermark = plan_watermark(&plan_cache, &target);
                 let plan = Arc::new(mirror::plan(&plan_cache, &target, &options)?);
                 if dry_run {
                     remember_plan(&plan_cache, &plan_key_, watermark, &plan);
@@ -490,6 +515,40 @@ mod tests {
         add(&cache, scratch.path(), "Epsilon", "epsilon");
         let (status, stale) = call(&router, "POST", "/mirror-library/default", body(json!({"dry_run": false, "fingerprint": preview["report"]["fingerprint"]}))).await;
         assert_eq!(status, StatusCode::CONFLICT, "{stale}");
+    }
+
+    /// A copy edited after the preview is a different plan: the run must not reuse the preview's plan
+    /// (whose `copy_edits` predate the edit) and so overwrite the edit unseen (finding 2).
+    #[tokio::test]
+    async fn a_run_does_not_reuse_a_plan_made_before_the_copy_was_edited() {
+        let (_dir, cache, router, _s, ids) = sample();
+        let out = tempfile::tempdir().unwrap();
+        let target = out.path().join("backup");
+        let req = json!({"target": target.to_str().unwrap(), "mode": "travel", "scope": {"all": true}});
+        let (_, dry) = call(&router, "POST", "/mirror-library/default", req.clone()).await;
+        let (_, started) = call(&router, "POST", "/mirror-library/default", json!({"target": target.to_str().unwrap(), "mode": "travel", "scope": {"all": true}, "dry_run": false, "fingerprint": dry["fingerprint"]})).await;
+        assert_eq!(finished(&router, &started).await["report"]["complete"], true);
+
+        // The library moves on, and the preview of refreshing the copy (no copy edits yet) is made...
+        cache.set_field(ids[1], "rating", "2").unwrap();
+        let (_, preview) = call(&router, "POST", "/mirror-library/default", req.clone()).await;
+        // ...then the copy is edited on the laptop.
+        {
+            let copy = Cache::new(&target).unwrap();
+            copy.set_field(ids[0], "rating", "10").unwrap();
+        }
+        let (status, answer) = call(&router, "POST", "/mirror-library/default", json!({"target": target.to_str().unwrap(), "mode": "travel", "scope": {"all": true}, "dry_run": false, "fingerprint": preview["fingerprint"]})).await;
+        // The preview's plan knew nothing of that edit, so it must not be what runs: either the
+        // run is planned afresh and refused (409, preview again) or it sees the edit and leaves the
+        // database alone. Overwriting the edit needs the `overwrite_changed` consent.
+        assert!(status == StatusCode::CONFLICT || status == StatusCode::ACCEPTED, "{status} {answer}");
+        if status == StatusCode::ACCEPTED {
+            let done = finished(&router, &answer).await;
+            let conflicts = done["report"]["conflicts"].as_array().cloned().unwrap_or_default();
+            assert!(conflicts.iter().any(|c| c["path"] == "metadata.db"), "the edited database is reported, not overwritten: {done}");
+        }
+        let copy = Cache::new(&target).unwrap();
+        assert_eq!(copy.field_for(ids[0], "rating").unwrap().as_deref(), Some("10"), "the copy's edit survived");
     }
 
     /// A refused target is a 400 for the synchronous preview and the job's error for the job.

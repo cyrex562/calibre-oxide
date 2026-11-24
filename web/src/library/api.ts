@@ -1092,6 +1092,8 @@ export interface LocateResult {
   candidates: { path: string }[];
   /** How many untracked files of the right kind were compared. */
   checked: number;
+  /** The search stopped early (time or byte budget, or cancelled); a match may have been missed. */
+  truncated?: boolean;
 }
 
 /** Looks for a missing file's content among the library's untracked files. */

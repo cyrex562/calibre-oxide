@@ -249,6 +249,32 @@ struct GroupState {
     writing: bool,
 }
 
+/// Makes the end of a group write certain: on drop it hands every taken ticket its
+/// outcome (an error when the writer unwound before it had one), clears `writing`
+/// and wakes the waiters.
+struct LeaderGuard<'a> {
+    group: &'a Group,
+    tickets: Vec<Ticket>,
+    outcome: Option<std::result::Result<(), String>>,
+}
+
+impl Drop for LeaderGuard<'_> {
+    fn drop(&mut self) {
+        let outcome = self.outcome.take().unwrap_or_else(|| Err("the change log writer failed before it finished".to_string()));
+        for t in &self.tickets {
+            // A poisoned lock still holds a usable (empty) ticket.
+            *t.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome.clone());
+        }
+        let mut state = self.group.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.writing = false;
+        self.group.wake.notify_all();
+    }
+}
+
+/// Test hook: the next group write panics (finding 8).
+#[cfg(test)]
+static PANIC_IN_NEXT_GROUP_WRITE: Mutex<Option<PathBuf>> = Mutex::new(None);
+
 impl ChangeLog {
     /// Opens (creating if needed) the log for a library.
     ///
@@ -457,6 +483,14 @@ impl ChangeLog {
             let taken = std::mem::take(&mut state.pending);
             drop(state);
             let (mut ops, tickets): (Vec<ChangeOp>, Vec<Ticket>) = taken.into_iter().unzip();
+            // However this ends (an error, or a panic inside `append`), the tickets are
+            // filled, `writing` is cleared and the waiters are woken: otherwise one
+            // failed write would leave every later writer waiting forever.
+            let mut leader = LeaderGuard { group: &self.group, tickets, outcome: None };
+            #[cfg(test)]
+            if { let mut hook = PANIC_IN_NEXT_GROUP_WRITE.lock().unwrap(); if hook.as_ref() == Some(&self.changes_dir) { *hook = None; true } else { false } } {
+                panic!("test: the group writer panics");
+            }
             let appended = if ops.len() == 1 {
                 self.append(ops.remove(0))
             } else {
@@ -465,13 +499,9 @@ impl ChangeLog {
                 let flat: Vec<ChangeOp> = ops.into_iter().flat_map(|op| if let ChangeOp::Batch { ops } = op { ops } else { vec![op] }).collect();
                 self.append(ChangeOp::Batch { ops: flat })
             };
-            let outcome: std::result::Result<(), String> = appended.map(|_| ()).map_err(|e| format!("{e:#}"));
-            for t in tickets {
-                *t.lock().unwrap() = Some(outcome.clone());
-            }
+            leader.outcome = Some(appended.map(|_| ()).map_err(|e| format!("{e:#}")));
+            drop(leader);
             state = self.group.state.lock().unwrap();
-            state.writing = false;
-            self.group.wake.notify_all();
         }
     }
 
@@ -765,6 +795,23 @@ mod tests {
 
     fn field(book: &str, field: &str, value: &str) -> ChangeOp {
         ChangeOp::FieldSet { book: book.into(), field: field.into(), value: Some(value.into()) }
+    }
+
+    /// A group writer that panics fails its own write, but does not leave `writing` set:
+    /// the writes after it go through instead of waiting for a writer that is gone.
+    #[test]
+    fn a_panicking_group_writer_does_not_hang_later_writes() {
+        let (_dir, log) = log();
+        let log = std::sync::Arc::new(log);
+        *PANIC_IN_NEXT_GROUP_WRITE.lock().unwrap() = Some(log.changes_dir.clone());
+        let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| log.append_grouped(field("b", "title", "x"))));
+        assert!(first.is_err(), "the writer's panic still propagates");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = log.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(worker.append_grouped(field("b", "title", "y")).is_ok());
+        });
+        assert_eq!(rx.recv_timeout(Duration::from_secs(20)), Ok(true), "a later write must complete");
     }
 
     fn log() -> (tempfile::TempDir, ChangeLog) {

@@ -59,6 +59,14 @@ describe("LocateMissing", () => {
     expect(buttons()).toEqual(["Find it"]);
   });
 
+  it("does not claim there is no match when the search stopped early", async () => {
+    api.locateOrphan.mockResolvedValue({ has_checksum: true, candidates: [], checked: 3, truncated: true });
+    await click("Find it");
+    const note = host.querySelector('[data-testid="locate-none"]')!.textContent!;
+    expect(note).toContain("stopped early");
+    expect(note).not.toContain("No file with the same content");
+  });
+
   it("says so when no checksum was recorded", async () => {
     api.locateOrphan.mockResolvedValue({ has_checksum: false, candidates: [], checked: 0 });
     await click("Find it");

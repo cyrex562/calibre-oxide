@@ -647,6 +647,61 @@ fn row_value(field: &str, raw: Option<String>) -> Value {
     }
 }
 
+/// The custom column a field name means: `#label`, or a bare label (what the web client
+/// and `Cache::set_field` use). `None` for a standard field.
+fn custom_def_of(cache: &lexmechanic_db::cache::Cache, field: &str) -> Option<lexmechanic_db::custom_columns::ColumnDef> {
+    if matches!(field, "id" | "title" | "authors" | "tags" | "languages" | "rating" | "series_index" | "series" | "publisher" | "comments" | "pubdate" | "timestamp" | "identifiers") {
+        return None;
+    }
+    cache.custom_column_def(field).ok().flatten()
+}
+
+/// What a book held in `field` before a write, as the value a write takes back: a
+/// custom column (named bare or `#label`) is read through its own table, with its
+/// list/number/yes-no type.
+fn previous_value(cache: &lexmechanic_db::cache::Cache, id: i32, field: &str) -> Value {
+    if let Some(def) = custom_def_of(cache, field) {
+        let raw = cache.get_custom_column_value(id, &def.label).ok().flatten();
+        let number = |t: &str| t.trim().parse::<f64>().ok().and_then(serde_json::Number::from_f64).map(Value::Number).unwrap_or(Value::Null);
+        return match (raw, def.datatype.as_str()) {
+            (None, _) if def.is_multiple => Value::Array(Vec::new()),
+            (None, _) => Value::Null,
+            (Some(r), _) if def.is_multiple => {
+                let (sep, _) = def.separators();
+                Value::Array(r.split(sep).map(str::trim).filter(|v| !v.is_empty()).map(|v| Value::String(v.to_string())).collect())
+            }
+            (Some(r), "bool") => match r.trim() {
+                "1" | "true" => Value::Bool(true),
+                "0" | "false" => Value::Bool(false),
+                _ => Value::Null,
+            },
+            // A rating stays on the column's own 0-10 scale: that is what a write takes.
+            (Some(r), "int" | "float" | "rating") => number(&r),
+            (Some(r), _) => Value::String(r),
+        };
+    }
+    // `<label>_index` of a series column.
+    if let Some(base) = field.strip_suffix("_index") {
+        if custom_def_of(cache, base).is_some_and(|d| d.datatype == "series") {
+            return cache.get_custom_column_value(id, field).ok().flatten().and_then(|t| t.trim().parse::<f64>().ok()).and_then(serde_json::Number::from_f64).map(Value::Number).unwrap_or(Value::Null);
+        }
+    }
+    row_value(field, cache.field_for(id, field).ok().flatten())
+}
+
+/// A custom column takes its value as text; a list or a yes/no (what `previous` answers
+/// with) is turned back into that text.
+fn custom_write_value(cache: &lexmechanic_db::cache::Cache, field: &str, value: &Value) -> Value {
+    match value {
+        Value::Array(items) => match custom_def_of(cache, field) {
+            Some(def) => Value::String(items.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(def.separators().1)),
+            None => value.clone(),
+        },
+        Value::Bool(b) if custom_def_of(cache, field).is_some() => Value::String(b.to_string()),
+        _ => value.clone(),
+    }
+}
+
 /// How many books one relative (`add`/`remove`) transaction covers.
 const RELATIVE_COMMIT_CHUNK: usize = 1000;
 
@@ -802,6 +857,7 @@ async fn set_fields_batch_handle(state: AppState, library_id: Option<String>, bo
             if matches!(field.as_str(), "cover" | "added_formats" | "removed_formats") {
                 return Err(ServerError::BadRequest(format!("{field:?} cannot be changed for many books at once")));
             }
+            let value = &custom_write_value(&cache, field, value);
             let Some(string_value) = value_to_field_string(field, value) else {
                 return Err(ServerError::BadRequest(format!("cannot set field {field:?} to {value}")));
             };
@@ -822,6 +878,7 @@ async fn set_fields_batch_handle(state: AppState, library_id: Option<String>, bo
     // many small groups with a different value each, and a transaction per
     // group made it 20 times slower than the same books in one group.
     let mut previous = serde_json::Map::new();
+    let mut seen_updated: std::collections::HashSet<i32> = std::collections::HashSet::new();
     let items: Vec<(i32, Vec<(String, String)>)> = work.into_iter().flat_map(|(book_ids, updates)| book_ids.into_iter().map(move |id| (id, updates.clone()))).collect();
     for chunk in items.chunks(BATCH_COMMIT_CHUNK) {
         let chunk = chunk.to_vec();
@@ -830,7 +887,7 @@ async fn set_fields_batch_handle(state: AppState, library_id: Option<String>, bo
             move || {
                 // Read first: after the write the old values are gone.
                 let before: Vec<(i32, serde_json::Map<String, Value>)> = if want_previous {
-                    chunk.iter().map(|(id, updates)| (*id, updates.iter().map(|(field, _)| (field.clone(), row_value(field, cache.field_for(*id, field).ok().flatten()))).collect())).collect()
+                    chunk.iter().map(|(id, updates)| (*id, updates.iter().map(|(field, _)| (field.clone(), previous_value(&cache, *id, field))).collect())).collect()
                 } else {
                     Vec::new()
                 };
@@ -841,12 +898,21 @@ async fn set_fields_batch_handle(state: AppState, library_id: Option<String>, bo
         .await
         .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
         for (id, fields) in before {
-            // A book written by two groups keeps what it held before the first.
-            previous.entry(id.to_string()).or_insert(Value::Object(fields));
+            // A book written by two groups keeps, per field, what it held before the first
+            // write of that field.
+            if let Value::Object(held) = previous.entry(id.to_string()).or_insert_with(|| Value::Object(serde_json::Map::new())) {
+                for (field, value) in fields {
+                    held.entry(field).or_insert(value);
+                }
+            }
         }
         for (id, result) in ids.into_iter().zip(results) {
             match result {
-                Ok(()) => updated.push(id),
+                Ok(()) => {
+                    if seen_updated.insert(id) {
+                        updated.push(id);
+                    }
+                }
                 Err(e) => failed.push(serde_json::json!({ "book_id": id, "error": e.to_string() })),
             }
         }
@@ -1498,6 +1564,48 @@ mod tests {
         assert_eq!(undo["updated"], serde_json::json!([1]), "{undo}");
         let (_, book) = get_json(&router, "/ajax/book/1").await;
         assert_eq!((book["publisher"].as_str(), &book["tags"]), (Some("Old House"), &serde_json::json!(["x", "y"])));
+    }
+
+    /// A custom column named by its bare label (what the bulk panel sends) answers `previous` too,
+    /// and the answer can be written straight back. A book in two groups keeps every field's
+    /// first value and is listed once (findings 1 and 7).
+    #[tokio::test]
+    async fn set_fields_batch_previous_covers_bare_custom_labels_and_duplicate_books() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        cache.add_custom_column("genre", "Genre", "text", true).unwrap();
+        cache.add_custom_column("seen", "Seen", "bool", false).unwrap();
+        cache.add_custom_column("pages", "Pages", "int", false).unwrap();
+        let id = add_test_book(dir.path(), &cache, "T", "A");
+        cache.set_custom_column_value(id, "genre", "scifi, noir").unwrap();
+        cache.set_custom_column_value(id, "seen", "true").unwrap();
+        cache.set_custom_column_value(id, "pages", "300").unwrap();
+        cache.set_field(id, "publisher", "Old House").unwrap();
+        cache.set_field(id, "tags", "x, y").unwrap();
+        let router = crate::test_router(test_state(std::sync::Arc::new(cache)));
+
+        let (status, body) = post_json(&router, "/cdb/set-fields-batch/default", serde_json::json!({
+            "groups": [
+                {"book_ids": [id], "changes": {"genre": ["opera"], "seen": false, "pages": 5, "publisher": "Acme"}},
+                {"book_ids": [id], "changes": {"tags": ["z"], "publisher": "Other"}}
+            ],
+            "previous": true
+        })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["updated"], serde_json::json!([id]), "listed once: {body}");
+        let prev = &body["previous"][id.to_string()];
+        assert_eq!(prev["genre"], serde_json::json!(["scifi", "noir"]), "{body}");
+        assert_eq!(prev["seen"], serde_json::json!(true), "{body}");
+        assert_eq!(prev["pages"].as_f64(), Some(300.0), "{body}");
+        assert_eq!(prev["publisher"], "Old House", "first value wins: {body}");
+        assert_eq!(prev["tags"], serde_json::json!(["x", "y"]), "fields of the second group are kept: {body}");
+
+        // Writing the answer back restores the custom values.
+        let (status, undo) = post_json(&router, "/cdb/set-fields-batch/default", serde_json::json!({"book_ids": [id], "changes": {"genre": prev["genre"], "seen": prev["seen"], "pages": prev["pages"]}})).await;
+        assert_eq!(status, StatusCode::OK, "{undo}");
+        assert_eq!(undo["updated"], serde_json::json!([id]), "{undo}");
+        let (_, again) = post_json(&router, "/cdb/set-fields-batch/default", serde_json::json!({"book_ids": [id], "changes": {"genre": ["x"]}, "previous": true})).await;
+        assert_eq!(again["previous"][id.to_string()]["genre"], serde_json::json!(["scifi", "noir"]), "{again}");
     }
 
     #[tokio::test]

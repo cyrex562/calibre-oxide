@@ -190,6 +190,10 @@ struct PendingDeletion {
     own: Vec<OwnFile>,
     cover_sidecar: Option<PathBuf>,
     manifest: Option<crate::trash::BookManifest>,
+    /// The trash entry reserved for this book before its rows were deleted (a batch
+    /// deletion does that, so the manifest is on disk before the commit); `None`: not
+    /// reserved yet, `Some(None)`: reserved, and there was nothing on disk to keep.
+    reserved: Option<Option<PathBuf>>,
     /// Ignore entries recorded so far (for [`BookFiles::Keep`]).
     outcome: BookDeletion,
 }
@@ -2006,14 +2010,39 @@ impl Cache {
             }
         }
         let doomed: Vec<i32> = pending.iter().map(|(idx, _)| book_ids[*idx]).chain(missing.iter().map(|idx| book_ids[*idx])).collect();
-        match self.delete_book_rows_many(&doomed) {
+        // Crash safety: every trash manifest is on disk (marked pending) before the rows go.
+        // Whatever the process does after the commit, each book is then either still intact
+        // (no commit: recovery drops the reservation) or restorable from its entry (commit:
+        // recovery finishes the moves). Writing them after the commit left a window in which a
+        // crash lost every trace of up to a chunk of books and the next scan re-imported them.
+        let mut reservation_error: Option<String> = None;
+        if files == BookFiles::Trash {
+            for (_, p) in pending.iter_mut() {
+                let Some(manifest) = p.manifest.as_mut() else { continue };
+                match self.reserve_book_trash(manifest, true) {
+                    Ok(dir) => p.reserved = Some(dir),
+                    Err(why) => {
+                        reservation_error = Some(why);
+                        break;
+                    }
+                }
+            }
+        }
+        let outcome = match reservation_error {
+            Some(why) => Err(anyhow::anyhow!("{why}")),
+            None => self.delete_book_rows_many(&doomed),
+        };
+        match outcome {
             Ok(()) => {
                 self.record_many(pending.iter().filter_map(|(_, p)| p.uuid.clone()).map(|book| crate::change_log::ChangeOp::BookRemoved { book }).collect());
                 for idx in missing {
                     results[idx] = Some(Ok(BookDeletion::default()));
                 }
                 let moved = self.finish_moves_parallel(pending, files);
-                for (idx, mut outcome, tidy) in moved {
+                // Tidied last book first: of two books sharing a folder, the later one was judged
+                // to own it (the earlier was "already gone"), so it is the one whose tidy
+                // removes the folder and climbs, as the one-by-one deletion would.
+                for (idx, mut outcome, tidy) in moved.into_iter().rev() {
                     if let Some(tidy) = tidy {
                         self.finish_tidy(tidy, &mut outcome);
                     }
@@ -2022,6 +2051,11 @@ impl Cache {
             }
             Err(e) => {
                 let why = format!("{e:#}");
+                for (_, p) in &pending {
+                    if let Some(Some(dir)) = &p.reserved {
+                        self.abandon_trash_reservation(dir);
+                    }
+                }
                 for (idx, _) in pending {
                     results[idx] = Some(Err(anyhow::anyhow!("{why}")));
                 }
@@ -2097,7 +2131,7 @@ impl Cache {
         // row still exists.
         let manifest = if files == BookFiles::Trash { Some(self.trash_manifest_for(book_id, uuid.clone(), &title, &path_rel, &own)?) } else { None };
 
-        Ok(Some(PendingDeletion { path_rel, title, uuid, dedicated, own, cover_sidecar, manifest, outcome }))
+        Ok(Some(PendingDeletion { path_rel, title, uuid, dedicated, own, cover_sidecar, manifest, reserved: None, outcome }))
     }
 
     /// The file half of a deletion, after the rows are gone.
@@ -2114,7 +2148,7 @@ impl Cache {
     /// removal of folders it emptied, which depends on the other books' files being gone
     /// and so is done afterwards, one book at a time.
     fn finish_moves(&self, pending: PendingDeletion, files: BookFiles) -> (BookDeletion, Option<DeletionTidy>) {
-        let PendingDeletion { path_rel, title, uuid, dedicated, own, cover_sidecar, manifest, mut outcome } = pending;
+        let PendingDeletion { path_rel, title, uuid, dedicated, own, cover_sidecar, manifest, reserved, mut outcome } = pending;
         let mut tidy = None;
         match files {
             // Ignore entries were recorded before the row went.
@@ -2123,7 +2157,12 @@ impl Cache {
                 // Into the library's own `.caltrash`, as calibre does -- see
                 // `crate::trash`. A same-volume rename, so it works on a
                 // network share that has no recycle bin.
-                let moved = self.move_book_to_trash(manifest.expect("built above for Trash"), cover_sidecar.filter(|c| c.is_file()));
+                let manifest = manifest.expect("built above for Trash");
+                let cover = cover_sidecar.filter(|c| c.is_file());
+                let moved = match reserved {
+                    Some(dir) => self.move_into_reserved_trash(manifest, cover, dir),
+                    None => self.move_book_to_trash(manifest, cover),
+                };
                 outcome.trashed = moved.moved;
                 for (rel, why) in moved.failed {
                     if own.iter().any(|f| f.rel == rel && f.is_format) {

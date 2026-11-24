@@ -18,8 +18,12 @@
 //!   touched, and no folder is moved as a whole. `cover.jpg` / `metadata.opf`
 //!   sidecars are left where they are (covers live under `.lexmechanic`);
 //!   an old folder is removed only once it is empty (`remove_dir`, never
-//!   recursive). A book's attached files (`<folder>/data`) are not moved
-//!   either; the plan carries a warning for each book that leaves some behind.
+//!   recursive). A book's attached files (`<folder>/data`, or `data/<uuid>` for
+//!   a book in the library root) move with it when the folder is the book's
+//!   alone and so is its destination (see [`plan_data_dir`]); when it is not
+//!   (another book is in either folder, or another book of the same plan moves
+//!   into the same destination), the files stay where they are and the plan
+//!   carries a warning for each book that leaves some behind.
 //! - **Journaled.** Each rename is `LibraryHandle::rename_atomic` (or its
 //!   `_no_replace` form: the target is never replaced, even by a file that
 //!   appears after the check). The database follows through
@@ -761,6 +765,21 @@ pub fn plan_to(cache: &Cache, target: Target<'_>, scope: &Scope) -> Result<Organ
         }
         let data_dir = plan_data_dir(cache, &mut disk, &mut paths, &mut taken_data, &mut warnings, book_id, &old_path, &new_path)?;
         books.push(PlannedBook { book_id, title, old_path, new_path, old_names, new_names, files, suffixed, data_dir });
+    }
+    // Two books planned into one folder cannot both own its `data/`, whichever is planned first:
+    // the one that took it along would show its attachments on the other (and deleting it would
+    // leave them behind). Each of them keeps its attachments where they are, with a warning.
+    let mut into_folder: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for b in &books {
+        *into_folder.entry(lexmechanic_utils::filenames::path_key(&b.new_path).trim_matches('/').to_string()).or_default() += 1;
+    }
+    for b in books.iter_mut() {
+        let shared = !b.new_path.is_empty() && into_folder.get(lexmechanic_utils::filenames::path_key(&b.new_path).trim_matches('/')).is_some_and(|n| *n > 1);
+        if shared {
+            if let Some(d) = b.data_dir.take() {
+                warnings.push(Skipped { book_id: b.book_id, reason: format!("the files attached to this book in {} stay where they are: other books are moving into {}, and would share them", d.from, b.new_path) });
+            }
+        }
     }
     let fingerprint = fingerprint(&label, &books);
     // A rename of a folder that only changes its case needs the directory
@@ -1552,7 +1571,31 @@ mod tests {
         assert!(dir.path().join("Moved/report.pdf").is_file());
     }
 
-    /// Two books moving into one folder cannot both take a `data/` there: the second keeps its own where it is.
+    /// A book with attachments and a book without, planned into one folder (in either order):
+    /// the attachments do not move into a folder the other book shares (finding 9).
+    #[test]
+    fn attachments_do_not_move_into_a_folder_another_planned_book_shares() {
+        for (first, second) in [("Aaa", "Zzz"), ("Zzz", "Aaa")] {
+            let (dir, cache) = library();
+            // `Aaa` has no attachments, `Zzz` has; the names decide who is planned first.
+            let (plain, with_data) = (first, second);
+            write(&dir.path().join(format!("{plain}/{plain}.pdf")), b"%PDF plain");
+            write(&dir.path().join(format!("{with_data}/{with_data}.pdf")), b"%PDF data");
+            write(&dir.path().join(format!("{with_data}/data/n.dat")), b"n");
+            index(dir.path(), &cache);
+
+            let plan = plan(&cache, "Shared/{title}", &Scope::All).unwrap();
+            assert!(plan.books.iter().all(|b| b.data_dir.is_none()), "{:?}", plan.books.iter().map(|b| (&b.title, &b.data_dir)).collect::<Vec<_>>());
+            assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+            assert!(plan.warnings[0].reason.contains("share"), "{}", plan.warnings[0].reason);
+            let report = execute(&cache, &plan, &JobControl::new()).unwrap();
+            assert!(report.failed.is_empty(), "{report:?}");
+            assert!(!dir.path().join("Shared/data").exists());
+            assert!(dir.path().join(format!("{with_data}/data/n.dat")).is_file(), "left where it was");
+        }
+    }
+
+    /// Two books with attachments moving into one folder: neither can own the `data/` there, so both stay.
     #[test]
     fn two_books_cannot_take_the_same_destination_data_folder() {
         let (dir, cache) = library();
@@ -1563,13 +1606,14 @@ mod tests {
         index(dir.path(), &cache);
 
         let plan = plan(&cache, "Shared/{title}", &Scope::All).unwrap();
-        assert_eq!(plan.books.iter().filter(|b| b.data_dir.is_some()).count(), 1, "{:?}", plan.books.iter().map(|b| &b.data_dir).collect::<Vec<_>>());
-        assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+        assert_eq!(plan.books.iter().filter(|b| b.data_dir.is_some()).count(), 0, "{:?}", plan.books.iter().map(|b| &b.data_dir).collect::<Vec<_>>());
+        assert_eq!(plan.warnings.len(), 2, "{:?}", plan.warnings);
         let report = execute(&cache, &plan, &JobControl::new()).unwrap();
         assert!(report.failed.is_empty(), "{report:?}");
-        assert!(dir.path().join("Shared/data").is_dir());
-        let left = ["One/data/a.dat", "Two/data/b.dat"].iter().filter(|p| dir.path().join(p).is_file()).count();
-        assert_eq!(left, 1, "one book's attachments stayed where they were");
+        assert!(!dir.path().join("Shared/data").exists());
+        for p in ["One/data/a.dat", "Two/data/b.dat"] {
+            assert!(dir.path().join(p).is_file(), "{p} stayed where it was");
+        }
     }
 
     #[test]

@@ -133,7 +133,11 @@ pub async fn locate(State(state): State<AppState>, Path((book_id, format, librar
             let conn = cache.backend.conn.lock().unwrap();
             conn.query_row("SELECT uncompressed_size FROM data WHERE book = ?1 AND upper(format) = upper(?2)", (book_id, &format), |row| row.get::<_, Option<i64>>(0)).ok().flatten().filter(|n| *n > 0).map(|n| n as u64)
         };
-        let check = lexmechanic_db::library_check::check(&cache)?;
+        // The walk is the slow part on a NAS; it stops when the client goes away. A stopped
+        // walk is an incomplete search, not an empty one.
+        let Some(check) = lexmechanic_db::library_check::check_controlled(&cache, &control)? else {
+            return Ok(json!({"has_checksum": true, "candidates": [], "checked": 0, "truncated": true}));
+        };
         let mut candidates: Vec<Value> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut checked = 0usize;

@@ -35,7 +35,7 @@ async function find() {
     <span v-if="error" class="locate-note locate-error" role="alert">{{ error }}</span>
     <template v-else-if="result">
       <span v-if="!result.has_checksum" class="locate-note" data-testid="locate-no-checksum">No checksum was recorded for this file, so it cannot be found by content.</span>
-      <span v-else-if="result.candidates.length === 0" class="locate-note" data-testid="locate-none">No file with the same content was found ({{ result.checked }} checked).</span>
+      <span v-else-if="result.candidates.length === 0" class="locate-note" data-testid="locate-none">{{ result.truncated ? `Search stopped early (${result.checked} checked); try again.` : `No file with the same content was found (${result.checked} checked).` }}</span>
       <span v-for="candidate in result.candidates" v-else :key="candidate.path" class="locate-candidate">
         <code>{{ candidate.path }}</code>
         <button type="button" :disabled="disabled" @click="emit('use', candidate.path)">Use this file</button>
