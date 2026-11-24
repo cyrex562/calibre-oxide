@@ -281,7 +281,7 @@ function dismissedLabel(e: { members: { title: string }[] }): string {
 .dup-banner {
   background: rgba(154, 103, 0, 0.12);
   border: 1px solid var(--warning);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   padding: 0.4rem 0.6rem;
   margin: 0;
 }
@@ -302,7 +302,7 @@ function dismissedLabel(e: { members: { title: string }[] }): string {
 }
 .dup-chip {
   border: 1px solid var(--border);
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   background: none;
   padding: 0.1rem 0.6rem;
   cursor: pointer;
@@ -328,7 +328,7 @@ function dismissedLabel(e: { members: { title: string }[] }): string {
 }
 .dup-group {
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius-lg);
   padding: 0.6rem 0.75rem;
   display: flex;
   flex-direction: column;
@@ -351,7 +351,7 @@ function dismissedLabel(e: { members: { title: string }[] }): string {
   display: flex;
   gap: 0.6rem;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   padding: 0.5rem;
   min-width: 0;
 }
@@ -444,7 +444,7 @@ function dismissedLabel(e: { members: { title: string }[] }): string {
 .dup-badge {
   display: inline-block;
   padding: 0 0.5rem;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   font-size: 0.75em;
   font-weight: 600;
   border: 1px solid currentColor;

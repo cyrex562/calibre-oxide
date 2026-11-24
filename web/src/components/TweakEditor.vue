@@ -646,11 +646,11 @@ function insertChar(c: SpecialChar) {
         </div>
       </template>
 
-      <div class="actions">
-        <button type="button" :disabled="!selectedFile || saving" @click="save">{{ saving ? "Saving…" : "Save file" }}</button>
-        <button type="button" class="read" :disabled="committing" @click="commitAndClose">{{ committing ? "Saving book…" : "Save book" }}</button>
-        <button type="button" :disabled="committing" @click="discardAndClose">Discard all changes</button>
-      </div>
+    </template>
+    <template v-if="!loading && !error" #footer>
+      <button type="button" :disabled="committing" @click="discardAndClose">Discard all changes</button>
+      <button type="button" :disabled="!selectedFile || saving" @click="save">{{ saving ? "Saving…" : "Save file" }}</button>
+      <button type="button" class="primary" :disabled="committing" @click="commitAndClose">{{ committing ? "Saving book…" : "Save book" }}</button>
     </template>
   </Dialog>
 </template>
@@ -675,7 +675,7 @@ function insertChar(c: SpecialChar) {
   flex-shrink: 0;
   overflow: auto;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
 }
 .file-list button {
   display: block;
@@ -720,7 +720,7 @@ function insertChar(c: SpecialChar) {
   flex: 1;
   width: 100%;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   background: #fff;
 }
 .file-content textarea {
@@ -729,20 +729,12 @@ function insertChar(c: SpecialChar) {
   font-size: var(--fs-small);
   padding: 0.5em;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   resize: none;
 }
 .actions {
   display: flex;
   gap: 0.5em;
-}
-.read {
-  background: var(--accent);
-  color: var(--fg-on-accent);
-  border: none;
-  padding: 0.5em 1em;
-  border-radius: 4px;
-  cursor: pointer;
 }
 .error {
   color: var(--danger);
@@ -759,7 +751,7 @@ function insertChar(c: SpecialChar) {
 .mode-tabs button {
   padding: 0.35em 0.75em;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   background: var(--bg-sunken);
   cursor: pointer;
 }
@@ -773,7 +765,7 @@ function insertChar(c: SpecialChar) {
   min-height: 0;
   overflow: auto;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   padding: 0.5em;
 }
 /* Check book and report panes (#3.3 / #3.2). */
@@ -898,7 +890,7 @@ function insertChar(c: SpecialChar) {
   margin: 0;
   padding: 0.4rem 0.6rem;
   background: var(--bg-sunken);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   overflow-x: auto;
   font-size: var(--fs-small);
   line-height: 1.45;
@@ -922,7 +914,7 @@ function insertChar(c: SpecialChar) {
 }
 .char-picker {
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   padding: 0.5rem;
   margin-bottom: 0.4rem;
 }

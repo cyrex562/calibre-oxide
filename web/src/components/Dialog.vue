@@ -128,6 +128,11 @@ function onBackdropClick(event: MouseEvent) {
   if (direct && props.closeOnBackdrop) void requestClose();
 }
 
+// Another dialog is open above this one: the title bar greys out (Classic skin).
+function isUnderneath(): boolean {
+  return id !== null && !isTopDialog(id);
+}
+
 defineExpose({ requestClose });
 </script>
 
@@ -146,8 +151,15 @@ defineExpose({ requestClose });
         :aria-busy="busy || undefined"
         tabindex="-1"
       >
-        <button v-if="showClose" type="button" class="manage-close" aria-label="Close" :disabled="busy" @click="requestClose">✕</button>
-        <h3 v-if="title" :id="titleId" class="dialog-title">{{ title }}</h3>
+        <!-- The title bar. Under the Modern skin it is only the heading, with the ✕ in
+             the corner when `showClose`; under Classic it is the navy bar, and the ✕ is
+             always there, outside the Tab order like a window's own close box (hidden by
+             `.close-auto` in Modern). -->
+        <div v-if="size !== 'bare'" class="dialog-titlebar" :class="{ 'dialog-inactive': isUnderneath() }">
+          <h3 v-if="title" :id="titleId" class="dialog-title">{{ title }}</h3>
+          <span v-else-if="label" class="dialog-title dialog-title-label" aria-hidden="true">{{ label }}</span>
+          <button type="button" class="manage-close" :class="{ 'close-auto': !showClose }" :tabindex="showClose ? undefined : -1" aria-label="Close" :disabled="busy" @click="requestClose">✕</button>
+        </div>
         <div class="dialog-body"><slot /></div>
         <footer v-if="$slots.footer" class="dialog-footer"><slot name="footer" /></footer>
       </div>
@@ -210,9 +222,18 @@ defineExpose({ requestClose });
   gap: 0;
   overflow: hidden;
 }
+/* No box of its own under Modern: the heading and the ✕ lay out exactly as
+   they did before the title bar existed. Classic draws it (skin-classic.css). */
+.dialog-titlebar {
+  display: contents;
+}
 .dialog-title {
   margin: 0;
   font-size: var(--fs-large);
+}
+.dialog-title-label,
+.manage-close.close-auto {
+  display: none;
 }
 .dialog-body {
   display: flex;
@@ -222,6 +243,9 @@ defineExpose({ requestClose });
   overflow: auto;
   flex: 1 1 auto;
 }
+/* The button row every dialog ends with: right-aligned, one gap between
+   buttons, the primary (or destructive) one last. A status line or a tick
+   box in the footer sits on the left (`margin-right: auto`). */
 .dialog-footer {
   display: flex;
   justify-content: flex-end;
@@ -229,5 +253,12 @@ defineExpose({ requestClose });
   flex-wrap: wrap;
   gap: var(--sp-4);
   flex: 0 0 auto;
+}
+.dialog-footer > button.primary,
+.dialog-footer > button.danger {
+  order: 1;
+}
+.dialog-footer > .footer-note {
+  margin-right: auto;
 }
 </style>

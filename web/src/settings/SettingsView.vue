@@ -1,12 +1,18 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from "vue";
 import { getMinChars, setMinChars } from "../library/fieldValues";
+import { getSkin, setSkin, SKINS, type Skin } from "../library/skin";
 import { isTauri, tauriInvoke } from "../tauri";
 import { activeRules, COLORING_RULES_PROFILE, DEFAULT_COLORING_RULES, type ColoringRule, type ColoringRulesPrefs } from "../library/coloringRules";
 import { fetchPluginCatalog, inspectPlugin, installFromCatalog, installPlugin, listPlugins, removePlugin, setPluginEnabled, type CatalogPlugin, type InstalledPlugin, getEmailAccount, saveEmailAccount, type EmailAccount } from "../library/api";
 import { DEFAULT_KEYMAP, DEFAULT_LIBRARY_PREFS, DEFAULT_READER_PREFS, DEFAULT_TOOLBAR_PREFS, fetchProfile, KEYMAP_ACTION_LABELS, KEYMAP_PROFILE, LIBRARY_PREFS_PROFILE, READER_PREFS_PROFILE, saveProfile, TOOLBAR_ACTIONS, TOOLBAR_PREFS_PROFILE, type KeymapAction, type KeymapPrefs, type LibraryPrefs, type ReaderPrefs, type ToolbarActionId, type ToolbarPrefs } from "./api";
 
 const suggestMinChars = ref(getMinChars());
+// The skin applies the moment it is picked and is kept on this device only.
+const skin = ref<Skin>(getSkin());
+function chooseSkin(value: Skin) {
+  skin.value = setSkin(value);
+}
 const libraryPrefs = ref<LibraryPrefs>({ ...DEFAULT_LIBRARY_PREFS });
 const readerPrefs = ref<ReaderPrefs>({ ...DEFAULT_READER_PREFS });
 const keymap = ref<KeymapPrefs>({ ...DEFAULT_KEYMAP });
@@ -378,6 +384,20 @@ async function toggleAutoReopen() {
     <p v-if="error" class="error">{{ error }}</p>
     <p v-if="savedMessage" class="saved">{{ savedMessage }}</p>
 
+    <section class="pane" aria-labelledby="appearance-heading" data-section="appearance">
+      <h3 id="appearance-heading">Appearance</h3>
+      <fieldset class="skin-choice">
+        <legend>Look of the application</legend>
+        <label v-for="s in SKINS" :key="s.value" class="field checkbox skin-option">
+          <input type="radio" name="skin" :value="s.value" :checked="skin === s.value" :data-skin-option="s.value" @change="chooseSkin(s.value)" />
+          <span
+            ><strong>{{ s.label }}</strong> <span class="hint">{{ s.hint }}</span></span
+          >
+        </label>
+      </fieldset>
+      <p class="hint">Applies at once, on this device only.</p>
+    </section>
+
     <template v-if="!loading">
       <section class="pane">
         <h3>Library</h3>
@@ -657,7 +677,7 @@ async function toggleAutoReopen() {
   gap: 0.75em;
   padding: 1em;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius-lg);
 }
 .pane h3 {
   margin: 0;
@@ -670,6 +690,20 @@ async function toggleAutoReopen() {
 .field.checkbox {
   flex-direction: row;
   align-items: center;
+}
+.skin-choice {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5em;
+}
+.skin-option {
+  align-items: flex-start;
+  gap: 0.5em;
+}
+.skin-option .hint {
+  display: block;
+  color: var(--fg-muted);
 }
 .keymap-row {
   flex-direction: row;
@@ -699,7 +733,7 @@ async function toggleAutoReopen() {
 .plugin-preview,
 .plugin-row {
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   padding: 0.75em;
 }
 .plugin-preview h4 {

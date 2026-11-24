@@ -4,7 +4,12 @@ import App from "./App.vue";
 import ReaderView from "./components/ReaderView.vue";
 import LibraryView from "./components/LibraryView.vue";
 import SettingsView from "./settings/SettingsView.vue";
+import { applySavedSkin } from "./library/skin";
 import "./style.css";
+import "./skin-classic.css";
+
+// Before the app mounts, so the first frame is already in the chosen skin.
+applySavedSkin();
 
 const router = createRouter({
   history: createWebHistory(),

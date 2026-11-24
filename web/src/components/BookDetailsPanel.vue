@@ -1517,7 +1517,7 @@ watch(
   font: inherit;
   padding: 0.35em 0.5em;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
 }
 .dirty-mark {
   font-size: var(--fs-small);
@@ -1606,13 +1606,13 @@ watch(
   color: var(--fg-on-accent);
   border: none;
   padding: 0.5em 1em;
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   cursor: pointer;
 }
 .download {
   border: 1px solid var(--border);
   padding: 0.5em 1em;
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   text-decoration: none;
   color: inherit;
 }
@@ -1623,7 +1623,7 @@ watch(
   background: none;
   border: 1px solid var(--border);
   padding: 0.5em 1em;
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   cursor: pointer;
 }
 .delete {
@@ -1631,7 +1631,7 @@ watch(
   border: 1px solid var(--danger);
   color: var(--danger);
   padding: 0.5em 1em;
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   cursor: pointer;
   margin-left: auto;
 }
@@ -1669,7 +1669,7 @@ watch(
   font: inherit;
   padding: 0.35em 0.5em;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
 }
 .checkbox-field {
   flex-direction: row !important;
@@ -1707,7 +1707,7 @@ watch(
   font-size: var(--fs-small);
   padding: 0.4em;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   resize: vertical;
 }
 .template-tester-actions {
@@ -1718,7 +1718,7 @@ watch(
   font-size: var(--fs-small);
   background: var(--bg-bar);
   padding: 0.4em 0.6em;
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   word-break: break-word;
 }
 .quick-view {
@@ -1745,7 +1745,7 @@ watch(
 .quick-view-group button {
   background: none;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   padding: 0.3em 0.6em;
   font: inherit;
   font-size: var(--fs-small);
@@ -1756,7 +1756,7 @@ watch(
   align-items: center;
   gap: 0.3em;
   background: var(--bg-sunken);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   padding: 0.3em 0.5em;
   font-size: var(--fs-small);
 }
@@ -1777,7 +1777,7 @@ watch(
   margin-top: 1em;
   padding: 0.9em;
   background: var(--bg-sunken);
-  border-radius: 6px;
+  border-radius: var(--radius-lg);
 }
 .convert-row {
   display: flex;
@@ -1796,7 +1796,7 @@ watch(
   font: inherit;
   padding: 0.35em 0.5em;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
 }
 .convert-done {
   color: var(--success);
@@ -1831,7 +1831,7 @@ watch(
   font: inherit;
   padding: 0.3em 0.45em;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   width: 100%;
   max-width: 20em;
 }

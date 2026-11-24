@@ -159,7 +159,7 @@ watch(() => [props.x, props.y, props.entries], reposition, { flush: "post" });
   padding: 0.25rem;
   background: var(--bg);
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius-lg);
   box-shadow: 0 6px 20px rgb(0 0 0 / 18%);
   display: flex;
   flex-direction: column;
@@ -173,7 +173,7 @@ watch(() => [props.x, props.y, props.entries], reposition, { flush: "post" });
   all: unset;
   cursor: pointer;
   padding: 0.35rem 0.7rem;
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   font-size: var(--fs-body);
   white-space: nowrap;
 }

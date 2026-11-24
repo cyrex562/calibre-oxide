@@ -72,7 +72,7 @@ function moveDown(i: number) {
   font: inherit;
   padding: 0.25em 0.4em;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
 }
 .toc-dest {
   flex: 1;
@@ -81,7 +81,7 @@ function moveDown(i: number) {
   font-size: var(--fs-small);
   padding: 0.25em 0.4em;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   color: var(--fg-muted);
 }
 .toc-warning {

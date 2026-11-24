@@ -201,13 +201,11 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <Dialog size="full" label="Compare copies" :busy="busy" class="cmp-dialog" data-testid="compare-view" @close="emit('close')">
+  <Dialog size="full" label="Compare copies" :busy="busy" show-close class="cmp-dialog" data-testid="compare-view" @close="emit('close')">
     <div class="cmp-overlay">
     <header class="cmp-top">
       <h3>Compare {{ books.length || state.bookIds.length }} copies</h3>
       <span v-if="state.manualGroupId" class="cmp-badge" data-testid="your-group">Your group</span>
-      <span class="cmp-spacer"></span>
-      <button type="button" class="cmp-x" :disabled="busy" aria-label="Close" @click="emit('close')">✕</button>
     </header>
 
     <p v-if="state.error" class="cmp-error" role="alert" data-testid="compare-error">{{ state.error }}</p>
@@ -340,11 +338,12 @@ onBeforeUnmount(() => {
       </div>
     </template>
 
-    <footer v-if="state.result" class="cmp-decide" data-testid="decide">
+    </div>
+    <template v-if="state.result" #footer>
       <template v-if="state.decision.phase === 'done' && state.decision.runId">
         <span role="status" data-testid="decision-result">{{ state.decision.message }}</span>
         <button type="button" data-testid="undo-decision" @click="c.undoDecision()">Undo</button>
-        <button type="button" @click="emit('close')">Done</button>
+        <button type="button" class="primary" @click="emit('close')">Done</button>
       </template>
       <template v-else>
         <label title="Fold the other copies' tags, identifiers and other missing fields into the kept copy before they are trashed"><input v-model="mergeOthers" type="checkbox" data-testid="merge-others" /> Merge the others' metadata into the kept copy</label>
@@ -354,8 +353,7 @@ onBeforeUnmount(() => {
         <button type="button" class="primary" :disabled="busy || state.keeperId === null || books.length < 2" data-testid="keep-and-trash" @click="decide">Keep selected, trash the others</button>
       </template>
       <span v-if="state.decision.message && state.decision.phase === 'idle'" class="cmp-hint" role="status">{{ state.decision.message }}</span>
-    </footer>
-    </div>
+    </template>
   </Dialog>
 </template>
 
@@ -383,7 +381,7 @@ onBeforeUnmount(() => {
 .cmp-badge {
   border: 1px solid var(--success);
   color: var(--success);
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   padding: 0 0.5rem;
   font-size: 0.75em;
   font-weight: 600;
@@ -423,7 +421,7 @@ onBeforeUnmount(() => {
   margin: 0;
   padding: 0.3rem 0.5rem;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   display: flex;
   flex-direction: column;
   gap: 0.2rem;
@@ -479,7 +477,7 @@ onBeforeUnmount(() => {
   flex: 0 0 auto;
   width: 450px;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius-lg);
   padding: 0.5rem;
   display: flex;
   flex-direction: column;
@@ -549,16 +547,5 @@ onBeforeUnmount(() => {
 .cmp-edit input[type="text"] {
   flex: 1;
   min-width: 0;
-}
-.cmp-decide {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.6rem;
-  align-items: center;
-  border-top: 1px solid var(--border);
-  padding-top: 0.5rem;
-}
-.cmp-x {
-  font-size: 1.1em;
 }
 </style>

@@ -173,12 +173,6 @@ async function cancel() {
     </label>
     <p class="hint">{{ policyHelp }}</p>
 
-    <div class="import-actions">
-      <button type="button" :disabled="busy || !!absorbing || !source.trim() || !!problem" @click="start">{{ busy ? "Importing…" : "Import" }}</button>
-      <button v-if="busy" type="button" @click="cancel">Stop</button>
-      <button type="button" :disabled="busy" @click="emit('close')">Close</button>
-    </div>
-
     <p v-if="progress" class="status" role="status">{{ progress }}</p>
     <p v-if="error" class="error" role="alert">{{ error }}</p>
 
@@ -218,6 +212,11 @@ async function cancel() {
         </ul>
       </details>
     </div>
+    <template #footer>
+      <button type="button" :disabled="busy" @click="emit('close')">Close</button>
+      <button v-if="busy" type="button" @click="cancel">Stop</button>
+      <button type="button" class="primary" :disabled="busy || !!absorbing || !source.trim() || !!problem" @click="start">{{ busy ? "Importing…" : "Import" }}</button>
+    </template>
   </Dialog>
 </template>
 
@@ -233,11 +232,6 @@ async function cancel() {
   flex-direction: row;
   align-items: center;
   gap: 0.4rem;
-}
-.import-actions {
-  display: flex;
-  gap: 0.5rem;
-  margin: 0.75rem 0 0.5rem;
 }
 .absorb-section {
   margin-top: 1rem;

@@ -136,14 +136,6 @@ const scopeLabel = computed(() => (props.bookIds.length > 0 ? `${props.bookIds.l
     </ul>
     <button type="button" :disabled="busy" @click="addRule">+ Add rule</button>
 
-    <div class="mapper-actions">
-      <button type="button" :disabled="busy" @click="runPreview">{{ busy ? "Working…" : "Preview" }}</button>
-      <button type="button" :disabled="busy || !preview || preview.length === 0" :title="preview ? '' : 'Preview first'" @click="runApply">
-        Apply{{ preview && preview.length ? ` to ${preview.length} book(s)` : "" }}
-      </button>
-      <button type="button" :disabled="busy" @click="emit('close')">Close</button>
-    </div>
-
     <p v-if="error" class="error">{{ error }}</p>
     <p v-if="summary" class="status">{{ summary }}</p>
 
@@ -158,6 +150,13 @@ const scopeLabel = computed(() => (props.bookIds.length > 0 ? `${props.bookIds.l
         </li>
       </ul>
     </div>
+    <template #footer>
+      <button type="button" :disabled="busy" @click="emit('close')">Close</button>
+      <button type="button" :disabled="busy" @click="runPreview">{{ busy ? "Working…" : "Preview" }}</button>
+      <button type="button" class="primary" :disabled="busy || !preview || preview.length === 0" :title="preview ? '' : 'Preview first'" @click="runApply">
+        Apply{{ preview && preview.length ? ` to ${preview.length} book(s)` : "" }}
+      </button>
+    </template>
   </Dialog>
 </template>
 
@@ -177,11 +176,6 @@ const scopeLabel = computed(() => (props.bookIds.length > 0 ? `${props.bookIds.l
 .rule-row input {
   flex: 1;
   min-width: 10ch;
-}
-.mapper-actions {
-  display: flex;
-  gap: 0.5rem;
-  margin: 0.75rem 0 0.5rem;
 }
 .preview {
   max-height: 40vh;
