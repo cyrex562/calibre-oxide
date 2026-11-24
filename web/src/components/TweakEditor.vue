@@ -55,6 +55,7 @@ async function saveTocTree() {
   try {
     await saveToc(sessionId.value, tocTree.value);
     tocSaved.value = true;
+    sessionEdited.value = true;
   } catch (e) {
     tocError.value = e instanceof Error ? e.message : String(e);
   } finally {
@@ -63,6 +64,11 @@ async function saveTocTree() {
 }
 
 const dirty = () => content.value !== savedContent.value;
+
+/** Something in the session changed since it was opened (a saved file, the TOC, a fix, a replace): it is lost unless the book is saved. */
+const sessionEdited = ref(false);
+/** Anything that closing now would throw away: Escape and the ✕ ask first, through the dialog's own `dirty` guard. */
+const hasEdits = computed(() => content.value !== savedContent.value || sessionEdited.value);
 
 // Live preview (#960).
 //
@@ -182,6 +188,7 @@ async function save() {
   fileError.value = null;
   try {
     await saveTweakFile(sessionId.value, selectedFile.value, content.value);
+    if (content.value !== savedContent.value) sessionEdited.value = true;
     savedContent.value = content.value;
   } catch (e) {
     fileError.value = e instanceof Error ? e.message : String(e);
@@ -261,6 +268,7 @@ async function runFixes() {
   checkError.value = null;
   try {
     const result = await fixBookChecks(sessionId.value);
+    if (result.changed) sessionEdited.value = true;
     checkMessage.value = result.changed ? `Fixed ${result.attempted} problem(s). Commit to keep the changes.` : "Nothing could be fixed automatically.";
     await runCheck();
   } catch (e) {
@@ -366,6 +374,7 @@ async function runReplaceAll() {
   findError.value = null;
   try {
     const result = await searchReplaceBook(sessionId.value, { find: findText.value, replace: replaceText.value, regex: findRegex.value, caseSensitive: findCaseSensitive.value });
+    if (result.changed_files > 0) sessionEdited.value = true;
     findMessage.value = `Replaced in ${result.changed_files} file(s). Commit to keep the changes.`;
     await runFind();
     // The open file may have been rewritten underneath the editor.
@@ -439,7 +448,7 @@ function insertChar(c: SpecialChar) {
 </script>
 
 <template>
-  <Dialog title="Tweak Book" show-close :close-on-backdrop="false" size="full" @close="discardAndClose">
+  <Dialog title="Tweak Book" show-close :close-on-backdrop="false" :dirty="hasEdits" size="full" @close="discardAndClose">
     <p v-if="loading">Loading…</p>
     <p v-else-if="error" class="error">{{ error }}</p>
     <template v-else>
@@ -584,7 +593,7 @@ function insertChar(c: SpecialChar) {
         <div class="editor">
           <ul class="file-list">
             <li v-for="name in files" :key="name">
-              <button type="button" :class="{ active: name === selectedFile }" @click="selectFile(name)">{{ name }}</button>
+              <button type="button" :class="{ active: name === selectedFile }" @click="selectFile(name)">{{ name }}<span v-if="name === selectedFile && dirty()" class="modified-dot" title="Changed, not saved yet" aria-label="(changed)"> •</span></button>
             </li>
           </ul>
           <div class="file-content">
@@ -649,8 +658,8 @@ function insertChar(c: SpecialChar) {
     </template>
     <template v-if="!loading && !error" #footer>
       <button type="button" :disabled="committing" @click="discardAndClose">Discard all changes</button>
-      <button type="button" :disabled="!selectedFile || saving" @click="save">{{ saving ? "Saving…" : "Save file" }}</button>
-      <button type="button" class="primary" :disabled="committing" @click="commitAndClose">{{ committing ? "Saving book…" : "Save book" }}</button>
+      <button type="button" :disabled="!selectedFile || saving || !dirty()" @click="save">{{ saving ? "Saving…" : "Save file" }}</button>
+      <button type="button" class="primary" :disabled="committing || !hasEdits" @click="commitAndClose">{{ committing ? "Saving book…" : "Save book" }}</button>
     </template>
   </Dialog>
 </template>

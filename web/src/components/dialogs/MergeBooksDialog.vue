@@ -8,7 +8,7 @@ import { computed, ref, watch } from "vue";
 
 import { mergeBooks } from "../../library/api";
 import type { DuplicateBook, MergeMode, MergeResponse } from "../../library/api";
-import { DEFAULT_DESTINATION_HINT, describeMergeResult, describeRecord, MERGE_MODE_LABELS, MERGE_MODE_NOTES, summarizeMerge } from "../../library/merge";
+import { DEFAULT_DESTINATION_HINT, describeMergeResult, describeRecord, MERGE_MODE_LABELS, MERGE_MODE_NOTES, mergeOutcome, summarizeMerge, type MergeOutcome } from "../../library/merge";
 import Dialog from "../Dialog.vue";
 
 const props = defineProps<{
@@ -19,7 +19,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   close: [];
   /** The merge ran; `description` says what it did. */
-  merged: [description: string];
+  merged: [description: string, outcome: MergeOutcome];
 }>();
 
 const mergeDest = ref<number | null>(props.dest);
@@ -56,7 +56,7 @@ async function confirmMerge() {
   try {
     const result = await mergeBooks({ dest: mergeDest.value, sources: props.books.map((b) => b.book_id).filter((id) => id !== mergeDest.value), mode: mergeMode.value, keep_duplicate_formats: mergeKeepDuplicates.value });
     mergePreview.value = null;
-    emit("merged", describeMergeResult(result));
+    emit("merged", describeMergeResult(result), mergeOutcome(result));
   } catch (e) {
     mergeError.value = e instanceof Error ? e.message : String(e);
   } finally {
@@ -70,8 +70,11 @@ async function confirmMerge() {
     <Dialog :title="`Merge books (${books.length})`" show-close size="lg" @close="emit('close')">
       <p class="news-hint">
         Choose the record to keep. The others' formats and any metadata the destination lacks are merged into it.
-        <span :title="DEFAULT_DESTINATION_HINT">(Why is one pre-selected?)</span>
       </p>
+      <details class="news-hint">
+        <summary>Why is one pre-selected?</summary>
+        {{ DEFAULT_DESTINATION_HINT }}
+      </details>
       <ul class="manage-list">
         <li v-for="b in books" :key="b.book_id">
           <label>

@@ -17,6 +17,23 @@ export interface SelectionDeps {
   gridRef: Ref<{ layout(): { columns: number; pageRows: number }; scrollToIndex(index: number): void } | null>;
 }
 
+/**
+ * The selection after some books were removed from the library: they leave the
+ * selection and the open book, so neither the details panel nor an action's scope
+ * ("the 1 selected book") keeps acting on a book that no longer exists. When the
+ * open book was one of them, `show` (the record a merge kept) takes its place.
+ */
+export function dropRemoved(
+  state: { selected: ReadonlySet<number>; openId: number | null },
+  removed: readonly number[],
+  show: number | null = null,
+): { selected: Set<number>; openId: number | null } {
+  const gone = new Set(removed);
+  const selected = new Set([...state.selected].filter((id) => !gone.has(id)));
+  const openId = state.openId !== null && gone.has(state.openId) ? show : state.openId;
+  return { selected, openId };
+}
+
 export function useSelection({ win, selectedBookId, viewMode, tableRef, gridRef }: SelectionDeps) {
   const selectMode = ref(false);
   const selectedIds = ref<Set<number>>(new Set());

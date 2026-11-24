@@ -5,7 +5,7 @@
 // requested only for cards that are actually on screen.
 
 import { useKeepScroll } from "../library/keepScroll";
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 
 import type { BookSummary } from "../library/types";
 import { gridMetrics, gridRowItems, gridRowOf, windowRange } from "../library/virtualList";
@@ -21,6 +21,8 @@ const props = defineProps<{
   selectedIds: Set<number>;
   selectedBookId: number | null;
   markedIds: Set<number>;
+  /** A coloring rule's color per book (Settings > Row colors). */
+  rowColors?: ReadonlyMap<number, string>;
   cacheBust: number;
   resetKey?: number;
 }>();
@@ -38,6 +40,27 @@ useKeepScroll(scroller);
 const width = ref(FALLBACK_WIDTH);
 const height = ref(FALLBACK_HEIGHT);
 const scrollTop = ref(0);
+
+/** Covers that failed to load (a book with none): a placeholder is drawn instead of a broken image. */
+const failedCovers = reactive(new Set<number>());
+watch(
+  () => props.cacheBust,
+  () => failedCovers.clear(),
+);
+
+/**
+ * The one card that is a Tab stop (a roving tabindex, as in the table): the open book when it
+ * is on screen, else the first card drawn. Arrow keys move it; Tab leaves the grid.
+ */
+const currentId = computed<number | null>(() => {
+  const open = props.selectedBookId;
+  if (open !== null) {
+    const at = props.ids.indexOf(open);
+    if (at >= items.value.from && at < items.value.to) return open;
+  }
+  for (let i = items.value.from; i < items.value.to; i++) if (props.getBook(props.ids[i])) return props.ids[i];
+  return null;
+});
 
 const metrics = computed(() => gridMetrics(width.value, props.ids.length, { minCardWidth: 120, gap: GAP, coverRatio: 1.5, captionHeight: 48 }));
 const win = computed(() => windowRange({ count: metrics.value.rows, rowHeight: metrics.value.rowHeight, scrollTop: scrollTop.value, viewportHeight: height.value, overscan: 2 }));
@@ -111,29 +134,38 @@ function onKeydown(event: KeyboardEvent) {
   if (target && (target.tagName === "INPUT" || target.tagName === "SELECT")) return;
   event.preventDefault();
   emit("navigate", event.key, event.shiftKey);
-  scroller.value?.focus({ preventScroll: true });
+  // The new current card is drawn once the selection and the scroll have settled: focus follows it.
+  void nextTick(() => scroller.value?.querySelector<HTMLElement>('.card[tabindex="0"]')?.focus({ preventScroll: true }));
 }
 </script>
 
 <template>
-  <div ref="scroller" class="grid-scroll" tabindex="-1" @scroll.passive="onScroll" @keydown="onKeydown">
+  <div ref="scroller" class="grid-scroll" role="listbox" aria-label="Books" aria-multiselectable="true" tabindex="-1" @scroll.passive="onScroll" @keydown="onKeydown">
     <div class="grid-pad" :style="{ height: `${win.padTop}px` }"></div>
     <div class="grid-rows" :style="{ gridTemplateColumns: `repeat(${metrics.columns}, minmax(0, 1fr))`, columnGap: `${GAP}px`, gridAutoRows: `${metrics.rowHeight}px` }">
       <template v-for="i in rendered" :key="ids[i]">
         <button
           v-if="getBook(ids[i])"
           class="card"
-          :class="{ selected: selectedIds.has(ids[i]) || (!selectMode && selectedBookId === ids[i]) }"
+          role="option"
+          :data-id="ids[i]"
+          :tabindex="ids[i] === currentId ? 0 : -1"
+          :aria-selected="selectedIds.has(ids[i]) || (!selectMode && selectedBookId === ids[i])"
+          :class="{ selected: selectedIds.has(ids[i]) || (!selectMode && selectedBookId === ids[i]), 'row-colored': rowColors?.has(ids[i]) }"
+          :style="rowColors?.get(ids[i]) ? { '--row-color': rowColors.get(ids[i]) } : undefined"
           @click="emit('select', ids[i], $event)"
           @contextmenu.prevent="emit('contextMenu', { bookId: ids[i], x: $event.clientX, y: $event.clientY })"
         >
           <input v-if="selectMode" type="checkbox" class="card-checkbox" :checked="selectedIds.has(ids[i])" @click.stop="emit('toggleSelected', ids[i], $event)" />
           <span v-if="markedIds.has(ids[i])" class="card-mark" title="Marked">●</span>
           <span class="cover" :style="{ height: `${metrics.cardWidth * 1.5}px` }">
-            <img :src="`${getBook(ids[i])!.thumbnail}?v=${cacheBust}`" :alt="getBook(ids[i])!.title" loading="lazy" />
+            <img v-if="!failedCovers.has(ids[i])" :src="`${getBook(ids[i])!.thumbnail}?v=${cacheBust}`" :alt="getBook(ids[i])!.title" loading="lazy" @error="failedCovers.add(ids[i])" />
+            <span v-else class="no-cover">No cover</span>
           </span>
-          <div class="card-title">{{ getBook(ids[i])!.title }}</div>
-          <div class="card-authors">{{ (getBook(ids[i])!.authors ?? []).join(" & ") }}</div>
+          <div class="card-caption">
+            <div class="card-title" :title="getBook(ids[i])!.title">{{ getBook(ids[i])!.title }}</div>
+            <div class="card-authors">{{ (getBook(ids[i])!.authors ?? []).join(" & ") }}</div>
+          </div>
         </button>
         <div v-else class="card placeholder" aria-hidden="true">
           <span class="cover" :style="{ height: `${metrics.cardWidth * 1.5}px` }"></span>
@@ -178,8 +210,28 @@ function onKeydown(event: KeyboardEvent) {
 .cover {
   display: block;
   width: 100%;
-  background: var(--border);
+  /* The letterbox around a cover that is not 2:3 (a rendered page): the panel's own surface, not a black bar. */
+  background: var(--bg-sunken);
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+}
+.no-cover {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  color: var(--fg-muted);
+  font-size: var(--fs-small);
+}
+.card:focus-visible .cover {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+/* A coloring rule's color (Settings > Row colors): a tint and a bar behind the caption. */
+.card.row-colored .card-caption {
+  background: color-mix(in srgb, var(--row-color) var(--row-tint), var(--bg-field));
+  box-shadow: inset 4px 0 0 var(--row-color);
+  padding-left: 8px;
 }
 .card.placeholder {
   cursor: default;

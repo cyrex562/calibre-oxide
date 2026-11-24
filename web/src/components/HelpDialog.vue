@@ -1,25 +1,23 @@
 <script setup lang="ts">
-// In-app help (issue 1.17 of the #816 epic).
+// In-app help.
 //
-// Generated from the action registry and the live keymap rather than
-// written by hand, so it cannot drift: an action added to
-// library/actions.ts appears here automatically, and a rebound key
-// shows its real binding rather than the default it shipped with.
-//
-// That is the whole point. Hand-written shortcut documentation is
-// wrong the first time anyone rebinds a key, and nothing fails when
-// it goes stale.
+// The shortcut list is generated from the action registry and the live keymap rather
+// than written by hand, so it cannot drift: an action added to library/actions.ts appears
+// here automatically, and a rebound key shows its real binding. Above it is a short "how to"
+// for the core workflow (import, find duplicates, organize, export) whose buttons open the
+// dialogs it talks about (library/help.ts).
 
 import Dialog from "./Dialog.vue";
-import { computed } from "vue";
+import { computed, ref } from "vue";
 
-import { LIBRARY_ACTIONS, type ActionGroup, type LibraryAction, type LibraryActionId } from "../library/actions";
+import { type ActionGroup, type LibraryAction, type LibraryActionId } from "../library/actions";
+import { HELP_STEPS, helpActions, OTHER_KEYS } from "../library/help";
 import { isTauri } from "../tauri";
 import { KEYMAP_ACTION_LABELS, type KeymapAction, type KeymapPrefs } from "../settings/api";
 import { formatKey } from "../library/shortcuts";
 
 const props = defineProps<{ keymap: KeymapPrefs }>();
-const emit = defineEmits<{ close: [] }>();
+const emit = defineEmits<{ close: []; run: [id: LibraryActionId] }>();
 
 const GROUP_TITLES: Record<ActionGroup, string> = {
   library: "Library",
@@ -43,16 +41,20 @@ function shortcutFor(id: LibraryActionId): string | null {
   return binding ? formatKey(binding) : null;
 }
 
+const filter = ref("");
+
 // Desktop-only actions are hidden in a browser tab, exactly as they
 // are everywhere else -- documenting something the reader cannot use
 // is just confusing.
-const groups = computed(() =>
-  GROUP_ORDER.map((group) => ({
+const groups = computed(() => {
+  // A label is listed once in the whole list (Fix titles is registered for the library and for the selection).
+  const seen = new Set<string>();
+  return GROUP_ORDER.map((group) => ({
     group,
     title: GROUP_TITLES[group],
-    actions: LIBRARY_ACTIONS.filter((a) => a.group === group && (!a.desktopOnly || isTauri())),
-  })).filter((g) => g.actions.length > 0),
-);
+    actions: helpActions(group, { desktop: isTauri(), filter: filter.value }).filter((a) => !seen.has(a.label) && !!seen.add(a.label)),
+  })).filter((g) => g.actions.length > 0);
+});
 
 /** Reader shortcuts live outside the action registry. */
 const readerShortcuts = computed(() =>
@@ -61,11 +63,29 @@ const readerShortcuts = computed(() =>
     key: props.keymap[action],
   })),
 );
+
+function run(id: LibraryActionId) {
+  emit("run", id);
+}
 </script>
 
 <template>
   <Dialog title="Help" size="lg" @close="emit('close')">
-    <p class="hint">Every action this app knows about, with its current keyboard shortcut. Shortcuts are rebindable in Settings.</p>
+    <section class="help-group" aria-labelledby="help-howto">
+      <h4 id="help-howto">Getting a collection in order</h4>
+      <ol class="help-steps">
+        <li v-for="step in HELP_STEPS" :key="step.title">
+          <strong>{{ step.title }}.</strong>
+          {{ step.text }}
+          <span class="help-run">
+            <button v-for="r in step.run" :key="r.id" type="button" :data-help-run="r.id" @click="run(r.id)">{{ r.label }}</button>
+          </span>
+        </li>
+      </ol>
+    </section>
+
+    <p class="hint">Every action this app knows about, with its current keyboard shortcut. A plain letter is the key on its own (<kbd>d</kbd>); a capital needs Shift (<kbd>Shift+E</kbd>). Shortcuts are rebindable in Settings.</p>
+    <input v-model="filter" type="search" class="help-filter" aria-label="Find an action" placeholder="Find an action…" />
 
     <section v-for="g in groups" :key="g.group" class="help-group">
       <h4>{{ g.title }}</h4>
@@ -78,8 +98,9 @@ const readerShortcuts = computed(() =>
         </li>
       </ul>
     </section>
+    <p v-if="groups.length === 0" class="hint">No action matches “{{ filter }}”.</p>
 
-    <section class="help-group">
+    <section v-if="!filter" class="help-group">
       <h4>Reader</h4>
       <ul class="help-list">
         <li v-for="r in readerShortcuts" :key="r.label">
@@ -90,7 +111,17 @@ const readerShortcuts = computed(() =>
       </ul>
     </section>
 
-    <p class="hint">Right-click a book for its own actions. Shortcuts never fire while you are typing.</p>
+    <section v-if="!filter" class="help-group">
+      <h4>Other keys</h4>
+      <ul class="help-list">
+        <li v-for="k in OTHER_KEYS" :key="k.keys">
+          <kbd>{{ k.keys }}</kbd>
+          <span class="help-label help-span">{{ k.does }}</span>
+        </li>
+      </ul>
+    </section>
+
+    <p class="hint">Right-click a book for its own actions (with two or more selected: Merge, Compare, Bulk edit). Shortcuts never fire while you are typing.</p>
     <template #footer>
       <button type="button" class="primary" @click="emit('close')">Close</button>
     </template>
@@ -112,6 +143,27 @@ const readerShortcuts = computed(() =>
   list-style: none;
   margin: 0;
   padding: 0;
+}
+.help-steps {
+  margin: 0;
+  padding-left: 1.4em;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5em;
+}
+.help-run {
+  display: inline-flex;
+  gap: 0.4em;
+  margin-left: 0.4em;
+  vertical-align: middle;
+  flex-wrap: wrap;
+}
+.help-filter {
+  align-self: flex-start;
+  width: min(100%, 22em);
+}
+.help-span {
+  grid-column: 2 / 4;
 }
 .help-list li {
   display: grid;

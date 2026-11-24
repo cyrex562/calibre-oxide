@@ -81,7 +81,7 @@ describe("the naming controller", () => {
 
 describe("custom column presets", () => {
   it("define edition, game line and volume with existing column types", () => {
-    expect(COLUMN_PRESETS.map((p) => [p.label, p.datatype])).toEqual([["edition", "text"], ["game_line", "text"], ["volume", "int"]]);
+    expect(COLUMN_PRESETS.map((p) => [p.label, p.datatype])).toEqual([["edition", "text"], ["game_line", "text"], ["volume", "int"], ["read_status", "text"], ["source", "text"], ["scan_quality", "text"]]);
     expect(presetDraft(COLUMN_PRESETS[1])).toEqual({ label: "game_line", name: "Game line", datatype: "text" });
   });
 

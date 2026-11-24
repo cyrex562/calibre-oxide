@@ -106,5 +106,5 @@ export function usePanelLayout() {
     handle.addEventListener("pointercancel", onUp);
   }
 
-  return { sidebarVisible, detailsVisible, sidebarWidth, detailsWidth, startResize, narrow, panelShown, setPanel, togglePanel };
+  return { sidebarVisible, detailsVisible, sidebarWidth, detailsWidth, startResize, narrow, drawer, panelShown, setPanel, togglePanel };
 }

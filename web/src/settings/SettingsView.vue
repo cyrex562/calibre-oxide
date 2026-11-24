@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { activeSection } from "./scrollSpy";
+import { formatKey } from "../library/shortcuts";
 import { onBeforeRouteLeave } from "vue-router";
 import { confirmDialog } from "../components/dialogs/confirm";
 import { describeUnsaved, dirtySections, SECTION_LABEL, type SectionKey } from "./dirty";
@@ -43,11 +45,17 @@ function toggleToolbarHidden(id: ToolbarActionId) {
   else next.add(id);
   toolbarHidden.value = next;
 }
+/** What the list shows: an action that only exists in the desktop app is not offered in a browser tab. */
+const shownToolbarOrder = computed(() => toolbarOrder.value.filter((id) => isTauri() || !TOOLBAR_ACTIONS.find((a) => a.id === id)?.desktopOnly));
+/** Moves an entry past its neighbour in what is shown (the hidden desktop-only ones keep their place). */
 function moveToolbarAction(index: number, delta: number) {
+  const shown = shownToolbarOrder.value;
   const to = index + delta;
-  if (to < 0 || to >= toolbarOrder.value.length) return;
+  if (to < 0 || to >= shown.length) return;
   const arr = [...toolbarOrder.value];
-  [arr[index], arr[to]] = [arr[to], arr[index]];
+  const a = arr.indexOf(shown[index]);
+  const b = arr.indexOf(shown[to]);
+  [arr[a], arr[b]] = [arr[b], arr[a]];
   toolbarOrder.value = arr;
 }
 async function saveToolbarPrefs() {
@@ -289,8 +297,20 @@ onMounted(() => {
   void loadColoringRules();
   void loadAutoAddFolder();
   window.addEventListener("keydown", onRebindKeydown);
+  window.addEventListener("scroll", updateActiveNav, { passive: true });
+  // Reading the page by hand ends a click's hold on the mark.
+  window.addEventListener("wheel", unlockNav, { passive: true });
+  window.addEventListener("touchmove", unlockNav, { passive: true });
+  window.addEventListener("keydown", unlockNav);
+  updateActiveNav();
 });
-onBeforeUnmount(() => window.removeEventListener("keydown", onRebindKeydown));
+onBeforeUnmount(() => {
+  window.removeEventListener("keydown", onRebindKeydown);
+  window.removeEventListener("scroll", updateActiveNav);
+  window.removeEventListener("wheel", unlockNav);
+  window.removeEventListener("touchmove", unlockNav);
+  window.removeEventListener("keydown", unlockNav);
+});
 
 async function saveLibraryPrefs() {
   await saveProfile(LIBRARY_PREFS_PROFILE, libraryPrefs.value as unknown as Record<string, unknown>);
@@ -393,7 +413,27 @@ const navSections = computed(() => {
   if (showAppSettings.value) list.push({ id: "app", label: "App" });
   return list;
 });
+// Scroll-spy: the nav marks the section the page is in. A click names its section directly and
+// that stays until the reader scrolls by hand (the last sections are too short to reach the top,
+// so the scroll position alone would hand the mark to the one below).
+const activeNav = ref("appearance");
+let navLocked = false;
+const SPY_LINE = 90;
+function updateActiveNav() {
+  if (navLocked) return;
+  const tops = navSections.value.flatMap((n) => {
+    const el = document.getElementById(`settings-${n.id}`);
+    return el ? [{ id: n.id, top: el.getBoundingClientRect().top }] : [];
+  });
+  const id = activeSection(tops, SPY_LINE);
+  if (id) activeNav.value = id;
+}
+function unlockNav() {
+  navLocked = false;
+}
 function goToSection(id: string) {
+  activeNav.value = id;
+  navLocked = true;
   document.getElementById(`settings-${id}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
@@ -423,7 +463,7 @@ async function toggleAutoReopen() {
     <nav class="settings-nav" aria-label="Settings sections" data-testid="settings-nav">
       <ul>
         <li v-for="n in navSections" :key="n.id">
-          <button type="button" :data-nav="n.id" @click="goToSection(n.id)">
+          <button type="button" :data-nav="n.id" :class="{ current: activeNav === n.id }" :aria-current="activeNav === n.id ? 'location' : undefined" @click="goToSection(n.id)">
             {{ n.label }}<span v-if="n.key && unsaved.includes(n.key)" class="unsaved-dot" title="Unsaved changes" role="img" aria-label="unsaved changes">●</span>
           </button>
         </li>
@@ -505,7 +545,7 @@ async function toggleAutoReopen() {
         <div v-for="(label, action) in KEYMAP_ACTION_LABELS" :key="action" class="field keymap-row">
           <span>{{ label }}</span>
           <button type="button" @click="startRebind(action as KeymapAction)">
-            {{ rebindingAction === action ? "Press a key… (Esc to cancel)" : keymap[action as KeymapAction] }}
+            {{ rebindingAction === action ? "Press a key… (Esc to cancel)" : formatKey(keymap[action as KeymapAction]) }}
           </button>
         </div>
       </section>
@@ -514,13 +554,13 @@ async function toggleAutoReopen() {
         <h3>Toolbar</h3>
         <p class="hint">Show/hide and reorder the library toolbar's own action buttons.</p>
         <ul class="toolbar-list">
-          <li v-for="(id, i) in toolbarOrder" :key="id" class="toolbar-row">
+          <li v-for="(id, i) in shownToolbarOrder" :key="id" class="toolbar-row">
             <label class="field checkbox">
               <input type="checkbox" :checked="!toolbarHidden.has(id)" @change="toggleToolbarHidden(id)" />
               {{ toolbarLabel(id) }}
             </label>
             <button type="button" :disabled="i === 0" :aria-label="`Move ${toolbarLabel(id)} up`" title="Move up" @click="moveToolbarAction(i, -1)">↑</button>
-            <button type="button" :disabled="i === toolbarOrder.length - 1" :aria-label="`Move ${toolbarLabel(id)} down`" title="Move down" @click="moveToolbarAction(i, 1)">↓</button>
+            <button type="button" :disabled="i === shownToolbarOrder.length - 1" :aria-label="`Move ${toolbarLabel(id)} down`" title="Move down" @click="moveToolbarAction(i, 1)">↓</button>
           </li>
         </ul>
       </section>
@@ -562,7 +602,7 @@ async function toggleAutoReopen() {
           <li v-for="(r, i) in coloringRules" :key="i" class="coloring-row">
             <label class="field checkbox"><input type="checkbox" v-model="r.enabled" /></label>
             <input v-model="r.name" class="coloring-name" placeholder="Name" />
-            <input v-model="r.template" class="coloring-template" placeholder="program: test(field('series'), 'blue', '')" />
+            <input v-model="r.template" class="coloring-template" placeholder="e.g. program: test(field('series'), 'blue', '')" />
             <button type="button" :disabled="i === 0" :aria-label="`Move rule ${r.name || i + 1} up`" title="Move up" @click="moveColoringRule(i, -1)">↑</button>
             <button type="button" :disabled="i === coloringRules.length - 1" :aria-label="`Move rule ${r.name || i + 1} down`" title="Move down" @click="moveColoringRule(i, 1)">↓</button>
             <button type="button" :aria-label="`Remove rule ${r.name || i + 1}`" title="Remove" @click="removeColoringRule(i)">✕</button>
@@ -582,7 +622,7 @@ async function toggleAutoReopen() {
           be reached over a network, so a saved password would be readable by more
           people than you would expect. You will be asked for it when you send.
         </p>
-        <label class="field">SMTP server <input v-model="emailAccount.relay" placeholder="smtp.example.com" /></label>
+        <label class="field">SMTP server <input v-model="emailAccount.relay" placeholder="e.g. smtp.example.com" /></label>
         <label class="field">Port <input v-model.number="emailAccount.port" type="number" min="1" max="65535" /></label>
         <label class="field">Username <input v-model="emailAccount.username" /></label>
         <label class="field">
@@ -593,7 +633,7 @@ async function toggleAutoReopen() {
             <option value="none">None</option>
           </select>
         </label>
-        <label class="field">Send from <input v-model="emailAccount.from" type="email" placeholder="you@example.com" /></label>
+        <label class="field">Send from <input v-model="emailAccount.from" type="email" placeholder="e.g. you@example.com" /></label>
       </section>
 
       <section v-if="pluginsAvailable" id="settings-plugins" class="pane">
@@ -634,7 +674,7 @@ async function toggleAutoReopen() {
 
         <label class="field">
           Install from a plugin package (.zip)
-          <input v-model="pluginPath" type="text" placeholder="/path/to/plugin.zip" />
+          <input v-model="pluginPath" type="text" placeholder="e.g. /path/to/plugin.zip" />
         </label>
         <div class="plugin-actions">
           <button type="button" :disabled="pluginBusy || !pluginPath.trim()" @click="inspectPluginPath">
@@ -749,6 +789,10 @@ async function toggleAutoReopen() {
 .settings-nav button:hover,
 .settings-nav button:focus-visible {
   background: var(--bg-selected);
+}
+.settings-nav button.current {
+  font-weight: 700;
+  box-shadow: inset 3px 0 0 var(--accent);
 }
 .unsaved-dot {
   color: var(--warning);

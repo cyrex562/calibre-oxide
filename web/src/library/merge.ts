@@ -109,3 +109,14 @@ export function describeMergeResult(r: MergeResponse): string {
   for (const e of r.errors) parts.push(`Book ${e.book_id} was not merged: ${e.error}`);
   return parts.join(" ");
 }
+
+/** What a merge did to the library: the record that was kept and the ones that no longer exist. */
+export interface MergeOutcome {
+  dest: number;
+  removed: number[];
+}
+
+/** The ids a finished merge deleted (none when the sources were kept), and the destination that took them. */
+export function mergeOutcome(r: MergeResponse): MergeOutcome {
+  return { dest: r.dest, removed: r.results.filter((s) => s.deleted && !s.error).map((s) => s.book_id) };
+}

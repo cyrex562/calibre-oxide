@@ -36,7 +36,8 @@ useKeepScroll(listEl);
 
 // `selectedIds` feeds "Move selected books here" in the Folders tree; bumping
 // `refreshKey` reloads the tree and the categories (a column or a move changed them).
-const props = withDefaults(defineProps<{ selectedIds?: number[]; refreshKey?: number }>(), { selectedIds: () => [], refreshKey: 0 });
+// `virtualLibrary` is the one in use: the server counts categories over the whole library, so the panel says so.
+const props = withDefaults(defineProps<{ selectedIds?: number[]; refreshKey?: number; virtualLibrary?: string }>(), { selectedIds: () => [], refreshKey: 0, virtualLibrary: "" });
 const emit = defineEmits<{ select: [query: string, label: string]; "view-note": [field: string, itemName: string]; renamed: []; "folders-changed": [] }>();
 
 const categories = ref<CategoryEntry[]>([]);
@@ -226,6 +227,8 @@ const findOpen = ref(false);
       @input="onFilterInput"
     />
 
+    <p v-if="virtualLibrary" class="cat-scope-note" data-testid="vl-count-note">Counts are for the whole library, not just “{{ virtualLibrary }}”.</p>
+
     <p v-if="error" class="error">{{ error }}</p>
 
     <!--
@@ -337,6 +340,12 @@ const findOpen = ref(false);
   color: var(--accent);
 }
 
+.cat-scope-note {
+  margin: 0;
+  padding: var(--sp-2) var(--sp-4);
+  font-size: var(--fs-small);
+  color: var(--fg-muted);
+}
 .cat-find {
   margin: var(--sp-2);
   flex-shrink: 0;
