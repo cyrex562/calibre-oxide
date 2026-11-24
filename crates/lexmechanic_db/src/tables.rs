@@ -509,6 +509,7 @@ impl IdentifiersTable {
 /// Every standard field's real, bulk-loaded table, matching
 /// `Cache::field_for`'s (#204) field set exactly. See this module's
 /// docs for what's not wired to anything yet.
+#[derive(Clone)]
 pub struct StandardTables {
     pub title: OneToOneTable,
     pub sort: OneToOneTable,

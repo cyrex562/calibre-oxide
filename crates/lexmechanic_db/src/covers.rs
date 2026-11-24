@@ -36,7 +36,12 @@ pub fn cover_path(cache: &Cache, book_id: i32) -> Result<PathBuf> {
 /// same on both.
 pub fn sidecar_cover_path(cache: &Cache, book_id: i32) -> Result<PathBuf> {
     let uuid = cache.book_uuid(book_id)?.filter(|u| !u.is_empty()).with_context(|| format!("book {book_id} has no uuid to key its cover by"))?;
-    Ok(cache.backend.library_path.join(LIBRARY_HANDLE_DIR_NAME).join("covers").join(format!("{uuid}.jpg")))
+    Ok(sidecar_cover_path_for_uuid(&cache.backend.library_path, &uuid))
+}
+
+/// [`sidecar_cover_path`] for a uuid already in hand.
+pub(crate) fn sidecar_cover_path_for_uuid(library_path: &std::path::Path, uuid: &str) -> PathBuf {
+    library_path.join(LIBRARY_HANDLE_DIR_NAME).join("covers").join(format!("{uuid}.jpg"))
 }
 
 /// Where covers used to live, and still do for any library written

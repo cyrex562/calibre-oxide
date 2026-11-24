@@ -185,14 +185,18 @@ fn primary_contains(query: &str, text: &str) -> bool {
     primary_form(text).contains(&primary_form(query))
 }
 
+/// `primary_form` with punctuation removed: what both sides of a
+/// primary-strength, punctuation-blind `contains` are reduced to. Text that
+/// is pure ASCII skips the Unicode decomposition, which cannot change it.
+pub(crate) fn fold_primary(s: &str) -> String {
+    if s.is_ascii() {
+        return s.chars().filter(|c| c.is_alphanumeric() || c.is_whitespace()).map(|c| c.to_ascii_lowercase()).collect();
+    }
+    primary_form(s).chars().filter(|c| c.is_alphanumeric() || c.is_whitespace()).collect()
+}
+
 fn primary_no_punc_contains(query: &str, text: &str) -> bool {
-    let strip_punc = |s: &str| -> String {
-        primary_form(s)
-            .chars()
-            .filter(|c| c.is_alphanumeric() || c.is_whitespace())
-            .collect()
-    };
-    strip_punc(text).contains(&strip_punc(query))
+    fold_primary(text).contains(&fold_primary(query))
 }
 
 /// Port of `_match`: does `query` match any of `values` under `kind`?
@@ -868,6 +872,19 @@ const ALL_TEXT_LOCATIONS: &[&str] = &[
     "formats",
 ];
 
+/// The folded needle a `contains` search for `q` compares against, when it
+/// can be answered from [`crate::fields::FieldStore::folded_contains`]: only a
+/// plain case-insensitive contains (the kind and strength `text_match` uses
+/// with `use_primary_find_in_search`). `q` is the query `matchkind` returned.
+/// It mirrors `text_match`'s own handling of a leading `..`.
+fn contains_needle(q: &str, kind: MatchKind) -> Option<String> {
+    if kind != MatchKind::Contains {
+        return None;
+    }
+    let effective = if q.starts_with("..") { &q[1..] } else { q };
+    Some(fold_primary(effective))
+}
+
 fn split_multi(sep: &str, joined: &str) -> Vec<String> {
     joined.split(sep).map(|s| s.to_string()).collect()
 }
@@ -878,8 +895,9 @@ fn fetch_grouped(
     candidates: &HashSet<i32>,
 ) -> Result<Vec<(Option<String>, HashSet<i32>)>, SearchError> {
     let mut groups: HashMap<Option<String>, HashSet<i32>> = HashMap::new();
+    let store = cache.fields()?;
     for &book_id in candidates {
-        let val = cache.field_for(book_id, field)?;
+        let val = cache.field_in(&store, book_id, field)?;
         groups.entry(val).or_default().insert(book_id);
     }
     Ok(groups.into_iter().collect())
@@ -891,8 +909,9 @@ fn fetch_identifiers(
     candidates: &HashSet<i32>,
 ) -> Result<Vec<(Vec<(String, String)>, HashSet<i32>)>, SearchError> {
     let mut out = Vec::new();
+    let store = cache.fields()?;
     for &book_id in candidates {
-        let joined = cache.field_for(book_id, field)?;
+        let joined = cache.field_in(&store, book_id, field)?;
         let pairs = joined.as_deref().map(parse_identifiers).unwrap_or_default();
         let mut ids = HashSet::new();
         ids.insert(book_id);
@@ -1009,11 +1028,23 @@ fn get_matches(
         LocationKind::All => {
             let (mk, q) = matchkind(query, false);
             let mut matches = HashSet::new();
+            let needle = contains_needle(&q, mk);
+            let store = if needle.is_some() { Some(cache.fields()?) } else { None };
             for &field in ALL_TEXT_LOCATIONS {
-                let current: HashSet<i32> = candidates.difference(&matches).copied().collect();
-                if current.is_empty() {
+                // Every match is one of the candidates, so all are matched
+                // once the counts agree.
+                if matches.len() == candidates.len() {
                     break;
                 }
+                // The folded lookup is as cheap over all candidates as over
+                // the unmatched ones, and the union comes out the same.
+                if let (Some(needle), Some(store)) = (&needle, &store) {
+                    if let Some(found) = store.folded_contains(field, needle, candidates) {
+                        matches.extend(found);
+                        continue;
+                    }
+                }
+                let current: HashSet<i32> = candidates.difference(&matches).copied().collect();
                 let sep = resolve_location(field).and_then(|k| match k {
                     LocationKind::MultiText(_, sep) => Some(sep),
                     _ => None,
@@ -1064,6 +1095,11 @@ fn get_matches(
         }
         LocationKind::Text(field) => {
             let (mk, q) = matchkind(query, false);
+            if let Some(needle) = contains_needle(&q, mk) {
+                if let Some(found) = cache.fields()?.folded_contains(field, &needle, candidates) {
+                    return Ok(found);
+                }
+            }
             let mut matches = HashSet::new();
             for (val, ids) in fetch_grouped(cache, field, candidates)? {
                 if let Some(v) = val {
@@ -1088,6 +1124,11 @@ fn get_matches(
         }
         LocationKind::MultiText(field, sep) => {
             let (mk, q) = matchkind(query, false);
+            if let Some(needle) = contains_needle(&q, mk) {
+                if let Some(found) = cache.fields()?.folded_contains(field, &needle, candidates) {
+                    return Ok(found);
+                }
+            }
             let mut matches = HashSet::new();
             for (val, ids) in fetch_grouped(cache, field, candidates)? {
                 if let Some(v) = val {
@@ -1803,5 +1844,142 @@ mod tests {
         insert_book(&cache, "Foundation", &["Isaac Asimov"], &[]);
         insert_book(&cache, "Dune", &["Frank Herbert"], &[]);
         assert_eq!(search(&cache, "").unwrap(), vec![1, 2]);
+    }
+
+    // --- folded `contains` search is the per-book search, faster ---
+
+    /// What a text search decided before the folded index: every candidate
+    /// book's value of each field, split on its separator, through
+    /// `text_match`.
+    fn per_book_matches(cache: &Cache, fields: &[&str], query: &str, candidates: &HashSet<i32>) -> HashSet<i32> {
+        let (mk, q) = matchkind(query, false);
+        let mut out = HashSet::new();
+        for &book in candidates {
+            for &field in fields {
+                let sep = match resolve_location(field) {
+                    Some(LocationKind::MultiText(_, sep)) => Some(sep),
+                    _ => None,
+                };
+                let Some(v) = cache.field_for(book, field).unwrap() else { continue };
+                let parts = match sep {
+                    Some(sep) => split_multi(sep, &v),
+                    None => vec![v],
+                };
+                if text_match(&q, &parts, mk, true, false).unwrap() {
+                    out.insert(book);
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    fn seed_varied_library(cache: &Cache, tags: &[&[&str]]) {
+        let titles = ["Café Society", "C++ & Rust: A Guide!", "O'Reilly's Handbook", "ÉMILE ZOLA, collected", "naïve Bayes", "The Cafe", "Plain Title", "Sagas of Zürich", "!!!", "Ünïcödé Test"];
+        let authors: [&[&str]; 10] = [&["Émile Zola"], &["Smith"], &["A & B Smith", "Jose Nunez"], &["José Núñez"], &[], &["Zola, Emile"], &["Anne O'Neil"], &["x &"], &["y"], &["Müller"]];
+        for (i, title) in titles.iter().enumerate() {
+            let t: &[&str] = tags.get(i).copied().unwrap_or(&[]);
+            insert_book(cache, title, authors[i], t);
+        }
+        let conn = cache.backend.conn.lock().unwrap();
+        for (book, text) in [(1, "<p>An ACCENTED tale of café life.</p>"), (2, "Rust, C++ and <b>templates</b>."), (4, ""), (5, "Bayes' theorem: naive or naïve?"), (9, "!!! ??? ...")] {
+            conn.execute("INSERT INTO comments (book, text) VALUES (?, ?)", rusqlite::params![book, text]).unwrap();
+        }
+        for (book, publisher, series, lang, fmts) in [
+            (1, "Éditions Café", "Saga One", "eng", &["EPUB", "PDF"][..]),
+            (2, "O'Reilly Media", "Guides", "eng", &["PDF"][..]),
+            (3, "O'Reilly Media", "", "fra", &["epub"][..]),
+            (6, "Plain House", "Saga One", "eng", &[][..]),
+            (8, "Zürich Verlag", "Sagas", "deu", &["MOBI", "PDF"][..]),
+        ] {
+            if !publisher.is_empty() {
+                conn.execute("INSERT OR IGNORE INTO publishers (name) VALUES (?)", [publisher]).unwrap();
+                let pid: i64 = conn.query_row("SELECT id FROM publishers WHERE name = ?", [publisher], |r| r.get(0)).unwrap();
+                conn.execute("INSERT INTO books_publishers_link (book, publisher) VALUES (?, ?)", rusqlite::params![book, pid]).unwrap();
+            }
+            if !series.is_empty() {
+                conn.execute("INSERT OR IGNORE INTO series (name) VALUES (?)", [series]).unwrap();
+                let sid: i64 = conn.query_row("SELECT id FROM series WHERE name = ?", [series], |r| r.get(0)).unwrap();
+                conn.execute("INSERT INTO books_series_link (book, series) VALUES (?, ?)", rusqlite::params![book, sid]).unwrap();
+            }
+            conn.execute("INSERT OR IGNORE INTO languages (lang_code) VALUES (?)", [lang]).unwrap();
+            let lid: i64 = conn.query_row("SELECT id FROM languages WHERE lang_code = ?", [lang], |r| r.get(0)).unwrap();
+            conn.execute("INSERT INTO books_languages_link (book, lang_code, item_order) VALUES (?, ?, 0)", rusqlite::params![book, lid]).unwrap();
+            for f in fmts {
+                conn.execute("INSERT INTO data (book, format, uncompressed_size, name) VALUES (?, ?, 10, ?)", rusqlite::params![book, f, format!("file{book}")]).unwrap();
+            }
+        }
+        conn.execute("UPDATE books SET path = 'Zürich/Café (1)' WHERE id = 1", []).unwrap();
+        conn.execute("UPDATE books SET path = 'Rust/Guide (2)' WHERE id = 2", []).unwrap();
+    }
+
+    const FOLD_QUERIES: &[&str] = &[
+        "cafe", "CAFÉ", "café", "caf", "émile", "emile", "zola", "c++", "rust", "guide!", "guide", "o'reilly", "oreilly", "reilly's", "!!!", "...", "..rust", ".rust", "..", "naive", "naïve", "bayes", "the", "smith", "a & b", "&", "x", "science", "fiction", "science, fiction", "sci", "epub", "pdf", "mobi", "eng", "fra", "deu", "saga", "sagas one", "zürich", "zurich", "müller", "muller", "nunez", "núñez", "o'neil", "plain", "éditions", "media", "accented", "templates", "ünïcödé", "unicode", "=cafe", "=Café Society", "~caf.", "^cafe", "^café", "\\=x", "title",
+    ];
+
+    fn assert_fold_matches_per_book(cache: &Cache) {
+        let all: HashSet<i32> = cache.all_book_ids().unwrap().into_iter().collect();
+        let subset: HashSet<i32> = all.iter().copied().filter(|b| b % 2 == 1).collect();
+        let few: HashSet<i32> = [2, 7].into_iter().collect();
+        let singles = ["title", "comments", "tags", "authors", "series", "publisher", "languages", "formats", "path", "sort", "author_sort"];
+        for candidates in [&all, &subset, &few] {
+            for q in FOLD_QUERIES {
+                for loc in singles {
+                    let want = per_book_matches(cache, &[loc], q, candidates);
+                    let got = get_matches(cache, loc, q, candidates).unwrap();
+                    assert_eq!(got, want, "location {loc:?} query {q:?} over {} books", candidates.len());
+                }
+                let want = per_book_matches(cache, ALL_TEXT_LOCATIONS, q, candidates);
+                let got = get_matches(cache, "all", q, candidates).unwrap();
+                assert_eq!(got, want, "bare query {q:?} over {} books", candidates.len());
+            }
+        }
+    }
+
+    #[test]
+    fn folded_search_finds_what_the_per_book_search_finds() {
+        let (_dir, cache) = make_cache();
+        seed_varied_library(&cache, &[&["Fiction", "Café"], &["Science", "fiction"], &["history"], &[], &["Naïve"], &["Fiction"]]);
+        assert_fold_matches_per_book(&cache);
+    }
+
+    #[test]
+    fn folded_search_falls_back_when_an_item_holds_the_separator() {
+        let (_dir, cache) = make_cache();
+        // "Science, Fiction" is one tag whose name holds the tag separator,
+        // and "x &" ends with part of the author separator: the joined string
+        // splits differently from the items, so the per-book search decides.
+        seed_varied_library(&cache, &[&["Science, Fiction", "Fiction"], &["Science", "Fiction, Science"], &["x"]]);
+        assert_fold_matches_per_book(&cache);
+        let store = cache.fields().unwrap();
+        let all: HashSet<i32> = cache.all_book_ids().unwrap().into_iter().collect();
+        assert!(store.folded_contains("tags", "science", &all).is_none(), "an ambiguous join is left to the per-book search");
+        assert!(store.folded_contains("authors", "x", &all).is_none());
+        assert!(store.folded_contains("title", "cafe", &all).is_some());
+    }
+
+    #[test]
+    fn folded_search_follows_edits_made_after_the_first_search() {
+        let (_dir, cache) = make_cache();
+        seed_varied_library(&cache, &[&["Fiction"]]);
+        assert_fold_matches_per_book(&cache);
+        cache.set_field(1, "title", "Brand New Zebra").unwrap();
+        cache.set_field(3, "tags", "zebra, Fiction").unwrap();
+        cache.set_field(2, "publisher", "Zebra Press").unwrap();
+        assert_eq!(search(&cache, "zebra").unwrap(), vec![1, 2, 3]);
+        assert_fold_matches_per_book(&cache);
+    }
+
+    #[test]
+    fn fold_primary_is_what_the_old_per_value_folding_made_of_a_string() {
+        // The pre-folded text must be exactly what `primary_no_punc_contains`
+        // used to compute on every comparison.
+        fn old_fold(s: &str) -> String {
+            primary_form(s).chars().filter(|c| c.is_alphanumeric() || c.is_whitespace()).collect()
+        }
+        for s in ["", "plain ascii", "MiXeD Case 123", "punct!!! ... ?? (x) [y] {z}", "tab\tnew\nline\u{0b}vt", "Café déjà vu", "İstanbul ǅ ß ΑΣ", "e\u{301} combining", "日本語 text", "snake_case-and-dash", "x\u{0}y"] {
+            assert_eq!(fold_primary(&icu_lower(s)), old_fold(&icu_lower(s)), "{s:?}");
+            assert_eq!(fold_primary(s), old_fold(s), "{s:?}");
+        }
     }
 }
