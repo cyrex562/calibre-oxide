@@ -72,7 +72,8 @@ export interface LibraryAction {
    *   already exists for it.
    *
    * Actions that only make sense against a specific book
-   * (`group: "book"`) are never toolbar-eligible.
+   * (`group: "book"`) are toolbar-eligible only when the toolbar layout
+   * gives them a place (Convert, in the More menu).
    */
   toolbar?: boolean;
   /**
@@ -188,9 +189,9 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   // working library; there was simply no way to say so. "Switch
   // library -> Browse for another" reads as "find an existing one".
   { id: "new-library", label: "New library…", group: "library", requires: "none", toolbar: true, desktopOnly: true, primary: true, icon: "lt", tooltip: "Create an empty library and open it" },
-  { id: "organize-files", label: "Organize files…", group: "library", requires: "none", icon: "tb_folder", tooltip: "Move books' files inside the library to folders and names from a template" },
+  { id: "organize-files", label: "Organize files…", group: "library", requires: "none", toolbar: true, icon: "tb_folder", tooltip: "Move books' files inside the library to folders and names from a template" },
   { id: "file-naming", label: "File naming…", group: "library", requires: "none", icon: "tb_folder", tooltip: "Set the library's folder and file naming convention, the default for Organize, Rename files and Fix titles" },
-  { id: "export-copy", label: "Export a copy…", group: "library", requires: "none", icon: "bookshelf", tooltip: "Copy the library (or some books) to another folder or drive: a travel copy you can refresh, or a backup mirror" },
+  { id: "export-copy", label: "Export a copy…", group: "library", requires: "none", toolbar: true, icon: "bookshelf", tooltip: "Copy the library (or some books) to another folder or drive: a travel copy you can refresh, or a backup mirror" },
   { id: "fix-titles", label: "Fix titles…", group: "library", requires: "none", icon: "edit_input", tooltip: "Find junk titles in the library, suggest clean ones, and set them (optionally in the files too)" },
   { id: "trash", label: "Open Trash…", group: "library", requires: "none", icon: "remove_books", tooltip: "Restore, or permanently delete, books and formats moved to the Trash" },
   { id: "open-library-folder", label: "Open library folder", group: "library", requires: "none", desktopOnly: true, icon: "tb_folder", tooltip: "Show this library's folder in the file browser" },
@@ -211,7 +212,7 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   { id: "bulk-edit", label: "Bulk edit", group: "selection", requires: "selection", icon: "merge_books", tooltip: "Change a field across every selected book" },
   // Calibre's "Merge book records": the first selected book is the default
   // destination. Needs two books, so it is not offered with one selected.
-  { id: "merge-books", label: "Merge books…", group: "selection", requires: "multi-selection", contextMenu: true, icon: "merge_books", tooltip: "Merge the selected books into one record" },
+  { id: "merge-books", label: "Merge books…", group: "selection", requires: "multi-selection", toolbar: true, contextMenu: true, icon: "merge_books", tooltip: "Merge the selected books into one record" },
   { id: "compare-duplicates", label: "Compare as duplicates…", group: "selection", requires: "multi-selection", contextMenu: true, icon: "merge", tooltip: "Look at 2 to 8 selected books side by side: pages, files and metadata, then keep one" },
   { id: "save-to-disk", label: "Save to disk", group: "selection", requires: "selection", icon: "save", tooltip: "Write book files to a folder" },
   { id: "rename-files", label: "Rename files…", group: "selection", requires: "selection", contextMenu: true, icon: "template_funcs", tooltip: "Rename the files on disk, without changing the title" },
@@ -231,7 +232,7 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   // With several books selected this opens the bulk editor, so it needs one or more.
   { id: "edit-metadata", label: "Edit metadata", group: "book", requires: "selection", contextMenu: true, icon: "edit_input", tooltip: "Edit this book's metadata (with several books selected, edit them together)" },
   { id: "fetch-metadata", label: "Fetch metadata online…", group: "book", requires: "single-selection", contextMenu: true, icon: "download-metadata", tooltip: "Look up metadata and covers online" },
-  { id: "convert", label: "Convert…", group: "book", requires: "single-selection", contextMenu: true, icon: "convert", tooltip: "Convert to another format" },
+  { id: "convert", label: "Convert…", group: "book", requires: "single-selection", toolbar: true, contextMenu: true, icon: "convert", tooltip: "Convert to another format" },
   { id: "tweak-book", label: "Tweak Book…", group: "book", requires: "single-selection", contextMenu: true, icon: "tweak", tooltip: "Edit the book's files directly" },
   { id: "quick-view", label: "Quick View…", group: "book", requires: "single-selection", contextMenu: true, icon: "quickview", tooltip: "Peek at this book without leaving the list" },
   { id: "test-template", label: "Test template…", group: "book", requires: "single-selection", contextMenu: true, icon: "template_funcs", tooltip: "Try a template against a real book" },
@@ -242,7 +243,7 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   { id: "similar-books", label: "Similar books", group: "book", requires: "single-selection", contextMenu: true, icon: "similar", tooltip: "Find books like this one" },
   // Selection-scoped rather than book-scoped: polishing a batch is
   // the normal case, and the engine handles books independently.
-  { id: "polish", label: "Polish…", group: "selection", requires: "selection", icon: "polish", tooltip: "Improve a book without changing its format" },
+  { id: "polish", label: "Polish…", group: "selection", requires: "selection", toolbar: true, icon: "polish", tooltip: "Improve a book without changing its format" },
   { id: "delete-book", label: "Move to Trash", group: "book", requires: "selection", contextMenu: true, icon: "remove_books", tooltip: "Move the selected books to the Trash (they can be restored from there)" },
 ];
 

@@ -549,6 +549,11 @@ pub struct CategoryQuery {
     offset: i64,
     sort: Option<String>,
     sort_order: Option<String>,
+    /// A virtual library (by name) to count over: only its books are counted, and
+    /// only items that some of its books have are listed. Absent or empty: the whole library.
+    vl: Option<String>,
+    /// A search restriction applied on top of `vl`.
+    query: Option<String>,
 }
 
 fn default_num() -> i64 {
@@ -576,11 +581,28 @@ pub async fn category(State(state): State<AppState>, Path(name): Path<String>, Q
 
     // Only the requested category is built (and a standard one is kept until
     // the library changes).
+    let vl = q.vl.clone().unwrap_or_default();
+    let restriction = q.query.clone().unwrap_or_default();
     let cats = tokio::task::spawn_blocking({
         let cache = state.cache.clone();
         let sort = sort.to_string();
         let name = name.clone();
-        move || categories::get_category(&cache, &name, &sort, None).map(Option::unwrap_or_default)
+        move || -> anyhow::Result<std::sync::Arc<Vec<categories::Tag>>> {
+            if vl.is_empty() && restriction.trim().is_empty() {
+                return Ok(categories::get_category(&cache, &name, &sort, None)?.unwrap_or_default());
+            }
+            // Counted over the books of the virtual library (and search): kept per
+            // (library, search, category, sort) until the library changes -- the
+            // library's own query is part of the key, so editing it is seen.
+            let vl_query = if vl.is_empty() { String::new() } else { cache.virtual_library_lookup(&vl)?.unwrap_or_default() };
+            let key = format!("category-vl:{name}:{sort}:{vl_query}{restriction}");
+            let version = cache.fields()?.version();
+            cache.cached_for_version(&key, version, || {
+                let restriction_opt = if restriction.trim().is_empty() { None } else { Some(restriction.as_str()) };
+                let ids: HashSet<i32> = lexmechanic_db::search::books_in_virtual_library(&cache, &vl, restriction_opt)?.into_iter().collect();
+                Ok::<_, anyhow::Error>(categories::get_category(&cache, &name, &sort, Some(&ids))?.map(|t| t.as_ref().clone()).unwrap_or_default())
+            })
+        }
     })
     .await
     .map_err(|e| ServerError::InternalServerError(e.to_string()))?
@@ -961,6 +983,39 @@ mod tests {
         assert_eq!(body["items"].as_array().unwrap().len(), 1);
         assert_eq!(body["items"][0]["count"], 1);
         assert!(body["items"][0]["url"].as_str().unwrap().starts_with("/ajax/books_in/authors/"));
+    }
+
+    #[tokio::test]
+    async fn category_counts_follow_a_virtual_library_and_a_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        add_test_book(dir.path(), &cache, "Alpha One", "Jane Doe");
+        add_test_book(dir.path(), &cache, "Alpha Two", "Jane Doe");
+        add_test_book(dir.path(), &cache, "Beta Three", "John Smith");
+        cache.virtual_library_add("Alphas", "title:Alpha").unwrap();
+        let state = crate::AppState { libraries: None, cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()), book_cache: std::sync::Arc::new(crate::books_cache::BookCache::open_temp()), jobs: std::sync::Arc::new(crate::jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))), render_jobs: std::sync::Arc::new(crate::render_endpoints::RenderJobRegistry::new()), conversion_jobs: std::sync::Arc::new(crate::convert::ConversionJobRegistry::new()), news_jobs: std::sync::Arc::new(crate::news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()), tts_voice: None, plugin_store: None, plugin_registry: std::sync::Arc::new(std::sync::Mutex::new(lexmechanic_customize::registry::PluginRegistry::new())), };
+        let router = crate::test_router(state);
+        let counts = |body: &serde_json::Value| -> Vec<(String, i64)> { body["items"].as_array().unwrap().iter().map(|i| (i["name"].as_str().unwrap().to_string(), i["count"].as_i64().unwrap())).collect() };
+
+        let (_, whole) = get_json(&router, "/ajax/category/authors").await;
+        assert_eq!(counts(&whole), vec![("Jane Doe".to_string(), 2), ("John Smith".to_string(), 1)]);
+
+        // Inside the virtual library only its books count, and John (who has none there) is not listed.
+        let (status, in_vl) = get_json(&router, "/ajax/category/authors?vl=Alphas").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(counts(&in_vl), vec![("Jane Doe".to_string(), 2)]);
+        assert_eq!(in_vl["total_num"], 1);
+
+        // A search on top of the virtual library narrows it further.
+        let (_, narrowed) = get_json(&router, "/ajax/category/authors?vl=Alphas&query=title:Two").await;
+        assert_eq!(counts(&narrowed), vec![("Jane Doe".to_string(), 1)]);
+        // A search alone works without a virtual library.
+        let (_, searched) = get_json(&router, "/ajax/category/authors?query=title:Beta").await;
+        assert_eq!(counts(&searched), vec![("John Smith".to_string(), 1)]);
+
+        // The whole-library answer is unaffected by the restricted ones before it.
+        let (_, again) = get_json(&router, "/ajax/category/authors").await;
+        assert_eq!(counts(&again), counts(&whole));
     }
 
     #[tokio::test]

@@ -77,8 +77,9 @@ export function fetchCategories(): Promise<CategoryEntry[]> {
   return jsonFetch<CategoryEntry[]>("/ajax/categories");
 }
 
-export function fetchCategory(name: string, num = 200): Promise<CategoryPage> {
-  return jsonFetch<CategoryPage>(`/ajax/category/${encodeURIComponent(name)}?num=${num}`);
+export function fetchCategory(name: string, num = 200, vl = ""): Promise<CategoryPage> {
+  const scope = vl ? `&vl=${encodeURIComponent(vl)}` : "";
+  return jsonFetch<CategoryPage>(`/ajax/category/${encodeURIComponent(name)}?num=${num}${scope}`);
 }
 
 /** Every value of a field with its book count, most-used first (feeds the typing suggestions). */
@@ -1064,6 +1065,21 @@ export interface IgnoredFile {
   ignored_at: string;
 }
 
+/** What `POST /orphans/locate/...` found for a missing file, by its recorded checksum. */
+export interface LocateResult {
+  /** False when nothing was recorded for the file, so nothing could be compared. */
+  has_checksum: boolean;
+  /** Library files (relative paths) whose content is the recorded one. */
+  candidates: { path: string }[];
+  /** How many untracked files of the right kind were compared. */
+  checked: number;
+}
+
+/** Looks for a missing file's content among the library's untracked files. */
+export function locateOrphan(bookId: number, format: string): Promise<LocateResult> {
+  return jsonFetch<LocateResult>(`/orphans/locate/${bookId}/${encodeURIComponent(format)}/default`, { method: "POST" });
+}
+
 export function fetchOrphans(): Promise<Orphan[]> {
   return jsonFetch<Orphan[]>("/orphans/default");
 }
@@ -1591,6 +1607,10 @@ export interface OrganizePlan {
   conflicts: number;
   already_organized: number;
   skipped: { book_id: number; reason: string }[];
+  /** Books whose folder of attached files (`data/`) moves with them. */
+  data_folders?: number;
+  /** Things worth knowing about books that still move: attachments left behind, very long paths. */
+  warnings?: { book_id: number; reason: string }[];
   /** At most 500; `books` and `files` are the totals. */
   moves: OrganizeMove[];
 }

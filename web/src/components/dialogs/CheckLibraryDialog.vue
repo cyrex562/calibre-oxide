@@ -12,6 +12,7 @@ import {
 import type { CheckLibraryFinding, CheckLibraryResult, IgnoredFile, Orphan } from "../../library/api";
 import { findingName } from "../../library/checkLibraryView";
 import Dialog from "../Dialog.vue";
+import LocateMissing from "./LocateMissing.vue";
 
 const props = defineProps<{ open: boolean }>();
 const emit = defineEmits<{
@@ -299,6 +300,7 @@ watch(
                       <option v-for="path in untrackedPaths" :key="path" :value="path">{{ path }}</option>
                     </select>
                   </label>
+                  <LocateMissing :book-id="orphan.book_id" :format="orphan.format" :disabled="orphanBusy === orphanKey(orphan)" @use="(path) => relocateTo(orphan, path)" />
                   <label class="orphan-upload">
                     Copy a file back in…
                     <input type="file" :disabled="orphanBusy === orphanKey(orphan)" @change="uploadFor(orphan, $event)" />

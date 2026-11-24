@@ -34,13 +34,33 @@ describe("the registry itself", () => {
     expect(now.filter((id) => before.includes(id))).toEqual(before);
   });
 
-  it("does not offer book-scoped actions in the toolbar", () => {
-    // "Convert…" with no book selected is meaningless as a toolbar
+  it("does not offer book-scoped actions in the toolbar settings, except the ones the layout places", () => {
+    // "Fetch metadata" with no book selected is meaningless as a toolbar
     // button; those actions reach the user through a book's context
-    // menu instead.
-    for (const a of LIBRARY_ACTIONS.filter((a) => a.group === "book")) {
+    // menu instead. Convert is the exception: it has a place in More.
+    const placed = new Set(["convert"]);
+    for (const a of LIBRARY_ACTIONS.filter((a) => a.group === "book" && !placed.has(a.id))) {
       expect(a.toolbar, `${a.id} should not be toolbar-eligible`).not.toBe(true);
     }
+  });
+
+  it("offers every main action in Settings, Toolbar: Convert, Polish, Merge, Export a copy and Organize", () => {
+    const offered = TOOLBAR_ACTIONS.map((a) => a.id);
+    for (const id of ["convert", "polish", "merge-books", "export-copy", "organize-files"] as const) {
+      expect(offered, `${id} is missing from the toolbar settings`).toContain(id);
+      // And the toolbar can actually show it: it is placed in the layout or More.
+      expect([...toolbarLayoutActionIds(), ...toolbarOverflowIds()], `${id} has no place on the toolbar`).toContain(id);
+    }
+  });
+
+  it("hides one of them when the user turns it off", () => {
+    const ctx = { selectionCount: 2, isDesktop: false } as unknown as ActionContext;
+    const handled: LibraryActionId[] = ["convert", "polish", "merge-books", "export-copy", "organize-files"];
+    const shown = (hidden: LibraryActionId[]) => visibleToolbarActions({ handled, hidden, ctx }, { includeBook: true }).map((a) => a.id);
+    expect(shown([])).toEqual(expect.arrayContaining(handled));
+    expect(shown(["polish", "organize-files"])).not.toContain("polish");
+    expect(shown(["polish", "organize-files"])).not.toContain("organize-files");
+    expect(shown(["polish", "organize-files"])).toContain("convert");
   });
 
   it("marks every book-scoped action for the context menu", () => {

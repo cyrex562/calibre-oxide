@@ -36,7 +36,7 @@ useKeepScroll(listEl);
 
 // `selectedIds` feeds "Move selected books here" in the Folders tree; bumping
 // `refreshKey` reloads the tree and the categories (a column or a move changed them).
-// `virtualLibrary` is the one in use: the server counts categories over the whole library, so the panel says so.
+// `virtualLibrary` is the one in use: the category counts (and which items are listed) are over its books.
 const props = withDefaults(defineProps<{ selectedIds?: number[]; refreshKey?: number; virtualLibrary?: string }>(), { selectedIds: () => [], refreshKey: 0, virtualLibrary: "" });
 const emit = defineEmits<{ select: [query: string, label: string]; "view-note": [field: string, itemName: string]; renamed: []; "folders-changed": [] }>();
 
@@ -79,7 +79,7 @@ async function load() {
 }
 void load();
 
-watch(() => props.refreshKey, () => {
+watch(() => [props.refreshKey, props.virtualLibrary], () => {
   itemsByCategory.value = {};
   void load();
 });
@@ -89,7 +89,7 @@ async function ensureItems(key: CategoryKey) {
   if (itemsByCategory.value[key] || loadingCategories.value.has(key)) return;
   loadingCategories.value = new Set(loadingCategories.value).add(key);
   try {
-    const page = await fetchCategory(key);
+    const page = await fetchCategory(key, 200, props.virtualLibrary);
     itemsByCategory.value = { ...itemsByCategory.value, [key]: page.items };
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e);
@@ -185,7 +185,7 @@ async function renameItem(key: CategoryKey, item: CategoryItem) {
   error.value = null;
   try {
     await renameCategoryItem(key, item.name, newName);
-    const page = await fetchCategory(key);
+    const page = await fetchCategory(key, 200, props.virtualLibrary);
     itemsByCategory.value = { ...itemsByCategory.value, [key]: page.items };
     emit("renamed");
   } catch (e) {
@@ -227,7 +227,6 @@ const findOpen = ref(false);
       @input="onFilterInput"
     />
 
-    <p v-if="virtualLibrary" class="cat-scope-note" data-testid="vl-count-note">Counts are for the whole library, not just “{{ virtualLibrary }}”.</p>
 
     <p v-if="error" class="error">{{ error }}</p>
 
@@ -340,12 +339,6 @@ const findOpen = ref(false);
   color: var(--accent);
 }
 
-.cat-scope-note {
-  margin: 0;
-  padding: var(--sp-2) var(--sp-4);
-  font-size: var(--fs-small);
-  color: var(--fg-muted);
-}
 .cat-find {
   margin: var(--sp-2);
   flex-shrink: 0;

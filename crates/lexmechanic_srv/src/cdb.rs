@@ -675,15 +675,22 @@ fn edit_list(current: Vec<String>, remove: &[String], add: &[String]) -> Vec<Str
     kept.chain(add.iter().cloned()).filter(|v| seen.insert(v.to_lowercase())).collect()
 }
 
+/// What a relative edit did to one list of one book: the field, the exact
+/// spellings added to it and the ones taken away, so an undo can put back
+/// exactly those.
+type ListDelta = (String, Vec<String>, Vec<String>);
+
 /// What `add`/`remove` do to one book: the `(field, value)` writes that change
-/// something (none when the book already has the result). `read(field)` gives
+/// something (none when the book already has the result), and for each changed
+/// field what was added and removed. `read(field)` gives
 /// the book's current list; it is called inside the write transaction, so the
 /// result is computed from what the book has when it is written.
-fn relative_updates(read: &dyn Fn(&str) -> anyhow::Result<Vec<String>>, adds: &[(String, Vec<String>)], removes: &[(String, Vec<String>)]) -> anyhow::Result<Vec<(String, String)>> {
+fn relative_edit(read: &dyn Fn(&str) -> anyhow::Result<Vec<String>>, adds: &[(String, Vec<String>)], removes: &[(String, Vec<String>)]) -> anyhow::Result<(Vec<(String, String)>, Vec<ListDelta>)> {
     let mut fields: Vec<&str> = adds.iter().chain(removes.iter()).map(|(f, _)| f.as_str()).collect();
     let mut seen = std::collections::HashSet::new();
     fields.retain(|f| seen.insert(*f));
     let mut updates = Vec::new();
+    let mut deltas: Vec<ListDelta> = Vec::new();
     for field in fields {
         let sep = list_field_separator(field).expect("checked by list_edit_values");
         let mut current: Vec<String> = read(field)?;
@@ -696,10 +703,25 @@ fn relative_updates(read: &dyn Fn(&str) -> anyhow::Result<Vec<String>>, adds: &[
         let add = adds.iter().find(|(f, _)| f == field).map(|(_, v)| v).unwrap_or(&none);
         let next = if add.is_empty() && remove.is_empty() { current.clone() } else { edit_list(current.clone(), remove, add) };
         if next != current {
+            // Multiset difference by exact spelling, in list order.
+            let minus = |from: &[String], other: &[String]| -> Vec<String> {
+                let mut left: Vec<&String> = other.iter().collect();
+                from.iter()
+                    .filter(|v| match left.iter().position(|o| o == v) {
+                        Some(i) => {
+                            left.remove(i);
+                            false
+                        }
+                        None => true,
+                    })
+                    .cloned()
+                    .collect()
+            };
+            deltas.push((field.to_string(), minus(&next, &current), minus(&current, &next)));
             updates.push((field.to_string(), next.join(sep)));
         }
     }
-    Ok(updates)
+    Ok((updates, deltas))
 }
 
 /// How many books one batch commits together. A request may name more (the
@@ -795,16 +817,23 @@ async fn set_fields_batch_handle(state: AppState, library_id: Option<String>, bo
     // Add/remove: one transaction per RELATIVE_COMMIT_CHUNK books, however many
     // different lists that makes.
     let mut unchanged: Vec<i32> = Vec::new();
+    // Per changed book and field, what was added and removed (for an exact undo).
+    let mut changes_out = serde_json::Map::new();
     let mut updated_set: std::collections::HashSet<i32> = updated.iter().copied().collect();
     for chunk in relative_ids.chunks(RELATIVE_COMMIT_CHUNK) {
         let chunk = chunk.to_vec();
         let (adds, removes) = (adds.clone(), removes.clone());
-        let (changed, same, errors) = tokio::task::spawn_blocking({
+        let (changed, same, errors, deltas) = tokio::task::spawn_blocking({
             let cache = cache.clone();
             move || {
                 // Each book's new lists are worked out inside the write
                 // transaction, from what it has at that moment.
-                let results = cache.edit_lists_for_books(&chunk, &|_, read| relative_updates(read, &adds, &removes));
+                let deltas: std::sync::Mutex<std::collections::HashMap<i32, Vec<ListDelta>>> = std::sync::Mutex::new(std::collections::HashMap::new());
+                let results = cache.edit_lists_for_books(&chunk, &|id, read| {
+                    let (updates, delta) = relative_edit(read, &adds, &removes)?;
+                    deltas.lock().unwrap().insert(id, delta);
+                    Ok(updates)
+                });
                 let (mut changed, mut same, mut errors): (Vec<Result<i32, (i32, String)>>, Vec<i32>, Vec<(i32, String)>) = (Vec::new(), Vec::new(), Vec::new());
                 for (id, result) in chunk.iter().copied().zip(results) {
                     match result {
@@ -813,7 +842,7 @@ async fn set_fields_batch_handle(state: AppState, library_id: Option<String>, bo
                         Err(e) => errors.push((id, e.to_string())),
                     }
                 }
-                (changed, same, errors)
+                (changed, same, errors, deltas.into_inner().unwrap())
             }
         })
         .await
@@ -823,6 +852,13 @@ async fn set_fields_batch_handle(state: AppState, library_id: Option<String>, bo
                 Ok(id) => {
                     if updated_set.insert(id) {
                         updated.push(id);
+                    }
+                    if let Some(delta) = deltas.get(&id) {
+                        let mut per_field = serde_json::Map::new();
+                        for (field, added, removed) in delta {
+                            per_field.insert(field.clone(), serde_json::json!({ "added": added, "removed": removed }));
+                        }
+                        changes_out.insert(id.to_string(), Value::Object(per_field));
                     }
                 }
                 Err((id, error)) => failed.push(serde_json::json!({ "book_id": id, "error": error })),
@@ -837,7 +873,7 @@ async fn set_fields_batch_handle(state: AppState, library_id: Option<String>, bo
     if !updated.is_empty() {
         web_socket::publish(&state, ChangeEvent::MetadataChanged { book_ids: updated.clone() });
     }
-    Ok(Json(serde_json::json!({ "updated": updated, "failed": failed, "unchanged": unchanged })))
+    Ok(Json(serde_json::json!({ "updated": updated, "failed": failed, "unchanged": unchanged, "changes": changes_out })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1457,6 +1493,31 @@ mod tests {
         let (_, again) = post_json(&router, "/cdb/set-fields-batch/default", serde_json::json!({"book_ids": [1, 2], "add": {"tags": ["new"]}})).await;
         assert_eq!(again["updated"], serde_json::json!([]), "{again}");
         assert_eq!(again["unchanged"], serde_json::json!([1, 2]), "{again}");
+    }
+
+    /// The answer names, per changed book, the exact spellings an add put in and a
+    /// remove took out -- what an exact undo needs.
+    #[tokio::test]
+    async fn set_fields_batch_reports_what_each_book_gained_and_lost() {
+        let (_dir, router) = test_app(3);
+        for (id, tags) in [(1, serde_json::json!(["Alpha"])), (2, serde_json::json!(["beta", "Gamma"]))] {
+            let (status, _) = post_json(&router, "/cdb/set-fields-batch/default", serde_json::json!({"book_ids": [id], "changes": {"tags": tags}})).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        // Book 1 has "Alpha" already (other case), so it gains only "b"; 2 gains both; 3 gains both.
+        let (_, add) = post_json(&router, "/cdb/set-fields-batch/default", serde_json::json!({"book_ids": [1, 2, 3], "add": {"tags": ["alpha", "b"]}})).await;
+        assert_eq!(add["changes"]["1"]["tags"], serde_json::json!({"added": ["b"], "removed": []}), "{add}");
+        assert_eq!(add["changes"]["2"]["tags"], serde_json::json!({"added": ["alpha", "b"], "removed": []}), "{add}");
+        assert_eq!(add["changes"]["3"]["tags"], serde_json::json!({"added": ["alpha", "b"], "removed": []}), "{add}");
+
+        // Removal ignores case and reports the spelling the book had.
+        let (_, rem) = post_json(&router, "/cdb/set-fields-batch/default", serde_json::json!({"book_ids": [1, 2, 3], "remove": {"tags": ["BETA", "gamma", "ALPHA"]}})).await;
+        assert_eq!(rem["changes"]["1"]["tags"], serde_json::json!({"added": [], "removed": ["Alpha"]}), "{rem}");
+        assert_eq!(rem["changes"]["2"]["tags"], serde_json::json!({"added": [], "removed": ["beta", "Gamma", "Alpha"]}), "{rem}");
+        assert_eq!(rem["changes"]["3"]["tags"], serde_json::json!({"added": [], "removed": ["Alpha"]}), "{rem}");
+        // A book that did not change is not in `changes`.
+        let (_, again) = post_json(&router, "/cdb/set-fields-batch/default", serde_json::json!({"book_ids": [1], "remove": {"tags": ["zzz"]}})).await;
+        assert_eq!(again["changes"], serde_json::json!({}), "{again}");
     }
 
     #[tokio::test]
