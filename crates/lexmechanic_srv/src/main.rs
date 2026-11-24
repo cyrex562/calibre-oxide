@@ -257,7 +257,13 @@ async fn main() -> anyhow::Result<()> {
     // polling the schedule store aggressively in normal operation.
     tokio::spawn(lexmechanic_srv::news_scheduler::run_scheduler_loop(state.clone(), std::time::Duration::from_secs(30)));
 
-    let use_bonjour = state.opts.use_bonjour;
+    // mDNS opens UDP 5353 on every interface (and a Windows Firewall prompt),
+    // so it runs only when asked for and the server is reachable from the
+    // network at all; advertising a loopback-only server is pointless.
+    let use_bonjour = state.opts.use_bonjour && !lexmechanic_srv::guard::is_loopback_listen(&listen_on);
+    if state.opts.use_bonjour && !use_bonjour {
+        eprintln!("Note: --use-bonjour ignored: the server listens on loopback only ({listen_on})");
+    }
     let library_name = cli.library_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "Lexmechanic Library".to_string());
     let app = router(state);
     let addr: SocketAddr = format!("{listen_on}:{port}").parse()?;

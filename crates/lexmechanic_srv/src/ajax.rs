@@ -434,11 +434,21 @@ pub async fn book(State(state): State<AppState>, Path(book_id): Path<String>) ->
     // Each format's file stem (`data.name`), so a client can name the exact
     // file on disk. In a folder shared by several books the extension alone
     // does not say whose file is whose.
+    // Also the book's folder relative to the library root (`books.path`):
+    // the desktop app's "Show in folder" joins it to the library. The row
+    // from `get_data_as_dict` never carried it.
     let cache = state.cache.clone();
-    let names = tokio::task::spawn_blocking(move || cache.format_file_names(book_id)).await.map_err(|e| ServerError::InternalServerError(e.to_string()))?.unwrap_or_default();
+    let (names, folder) = tokio::task::spawn_blocking(move || {
+        let names = cache.format_file_names(book_id).unwrap_or_default();
+        let folder = cache.fields().ok().and_then(|store| store.field_for(book_id, "path"));
+        (names, folder)
+    })
+    .await
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
     let names: serde_json::Map<String, Value> = names.into_iter().map(|(fmt, stem)| (fmt.to_lowercase(), Value::String(stem))).collect();
     if let Some(map) = out.as_object_mut() {
         map.insert("format_file_names".into(), Value::Object(names));
+        map.insert("path".into(), serde_json::json!(folder.unwrap_or_default()));
     }
     Ok(Json(out))
 }
@@ -992,6 +1002,10 @@ mod tests {
         assert_eq!(body["thumbnail"], "/get/thumb/1");
         assert_eq!(body["main_format"], serde_json::json!({"epub": "/get/epub/1"}));
         assert!(body.get("size").is_none(), "size should be stripped like upstream, got: {body}");
+        // The desktop app's "Show in folder" needs the book's folder.
+        let folder = body["path"].as_str().expect("path is sent");
+        // (Empty here: this fixture's files sit in the library root.)
+        assert!(!std::path::Path::new(folder).is_absolute(), "a relative folder: {body}");
     }
 
     #[tokio::test]
