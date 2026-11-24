@@ -251,8 +251,9 @@ pub fn relocate(cache: &Cache, book_id: i32, format: &str, chosen: &Path) -> Res
     let folder = path.parent().map(|p| p.to_string_lossy().replace('\\', "/")).unwrap_or_default();
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
 
-    let bytes = std::fs::read(&chosen_real)?;
-    let hash = blake3::hash(&bytes).to_hex().to_string();
+    // Streamed: a scanned PDF can be gigabytes, and this used to read all of it into memory.
+    let digest = crate::scan_pipeline::hash_stream(&chosen_real, None).with_context(|| format!("reading {}", chosen_real.display()))?;
+    let (hash, size) = (digest.hash, digest.size as i64);
     let (recorded_hash, _) = cache.checksums().recorded_identity(book_id, "format", &format.to_uppercase()).unwrap_or((None, None));
     let outcome = match recorded_hash {
         Some(recorded) if recorded == hash => RelocateOutcome::ContentMatches,
@@ -261,12 +262,12 @@ pub fn relocate(cache: &Cache, book_id: i32, format: &str, chosen: &Path) -> Res
     };
 
     cache.set_book_path(book_id, &folder)?;
-    cache.record_format_row(book_id, format, &stem, bytes.len() as i64, Some(&hash))?;
+    cache.record_format_row(book_id, format, &stem, size, Some(&hash))?;
     // Re-record the identity too, so the next rename of this file is
     // detectable from a `stat` rather than a full read.
     cache
         .checksums()
-        .record_hash_with_identity(book_id, "format", &format.to_uppercase(), &hash, bytes.len() as i64, calibre_utils::filenames::identity(&chosen_real))?;
+        .record_hash_with_identity(book_id, "format", &format.to_uppercase(), &hash, size, calibre_utils::filenames::identity(&chosen_real))?;
     cache.orphans().clear(book_id, format)?;
     Ok(outcome)
 }

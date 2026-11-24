@@ -175,11 +175,11 @@
 //! **Phase 6b** (also issue #257): §6's "two-phase variant of the
 //! journal" for an operation that mutates *multiple* network files at
 //! once -- §6's own named example, and this crate's one real caller,
-//! is a book move (`Cache::rename_book_files`): a directory rename
+//! is a book move (the removed `Cache::rename_book_files`): a directory rename
 //! plus each of its files' own rename. [`LibraryHandle::begin_network_batch`]/
 //! [`NetworkBatch`] journal the *whole* set of steps as one
 //! `OperationDescriptor::Batch` entry before any of them run, then
-//! executes each step in order; `Cache::rename_book_files` uses it
+//! executes each step in order; the removed `Cache::rename_book_files` uses it
 //! whenever the handle's tier is `Network` (discovering every rename
 //! it'll need from the *pre-move* directory listing, since the local-
 //! tier code's "list the directory after moving it" approach doesn't
@@ -301,7 +301,7 @@
 //!   `rename_atomic`/`remove_atomic` -- though the 3-step sequence as
 //!   a whole still isn't one atomic transaction, since this crate's
 //!   journal has no multi-operation batch concept spanning several
-//!   `LibraryHandle` calls; see `Cache::rename_book_files`'s own doc
+//!   `LibraryHandle` calls; see the removed `Cache::rename_book_files`'s own doc
 //!   comment for that disclosure in full); `notes/connection.rs`'s
 //!   `add_resource`/`remove_unreferenced_resources` (which also fixed
 //!   a real pre-existing bug: a failed resource write used to be
@@ -608,7 +608,7 @@ enum OperationDescriptor {
     /// §6's "two-phase variant of the journal" for a
     /// [`StorageTier::Network`] operation that mutates multiple files
     /// as one logical unit -- §6's own named example, and this
-    /// crate's one real caller: a book move (`Cache::rename_book_files`)
+    /// crate's one real caller: a book move (the removed `Cache::rename_book_files`)
     /// is a directory rename plus each of its files' own rename. See
     /// [`NetworkBatch`]'s doc for the full design and why forward-only
     /// idempotent completion (not true rollback) is the right recovery
@@ -620,7 +620,7 @@ enum OperationDescriptor {
 
 /// One step inside an [`OperationDescriptor::Batch`]. Deliberately
 /// narrower than a general transaction primitive -- only what
-/// `Cache::rename_book_files` (the one real caller today) needs.
+/// the removed `Cache::rename_book_files` (the one real caller today) needs.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 enum BatchStep {
     Rename { from: PathBuf, to: PathBuf },
@@ -993,6 +993,7 @@ impl Shared {
         from: &Path,
         to: &Path,
         fail_after: Option<FailPoint>,
+        no_replace: bool,
     ) -> Result<(), LibraryHandleError> {
         self.check_open()?;
         let uuid = Uuid::new_v4();
@@ -1012,9 +1013,21 @@ impl Shared {
             // here is a transient failure (or a server whose rename
             // isn't really atomic/didn't take effect) getting retried
             // instead of surfaced immediately.
+            //
+            // The success check is "the destination is the file that was
+            // renamed", not "`to` exists and `from` does not": on a
+            // case-insensitive share a case-only rename leaves `from`
+            // resolving to the same file, so the old check reported a
+            // rename that had worked as one that had not.
+            let case_only = from.parent() == to.parent()
+                && from.file_name().map(|n| n.to_string_lossy().to_lowercase()) == to.file_name().map(|n| n.to_string_lossy().to_lowercase());
             retry_network_op(&self.network_retry_policy, || {
-                fs::rename(from, to)?;
-                if to.exists() && !from.exists() {
+                if no_replace {
+                    rename_no_replace(from, to)?;
+                } else {
+                    fs::rename(from, to)?;
+                }
+                if rename_took_effect(from, to, case_only) {
                     Ok(())
                 } else {
                     Err(io::Error::other(format!(
@@ -1026,7 +1039,11 @@ impl Shared {
                 }
             })?;
         } else {
-            fs::rename(from, to)?;
+            if no_replace {
+                rename_no_replace(from, to)?;
+            } else {
+                fs::rename(from, to)?;
+            }
             if fail_after == Some(FailPoint::Rename) {
                 return Err(simulated_crash());
             }
@@ -1250,6 +1267,23 @@ impl Shared {
 /// (which deadlocks -- see that module's own doc for the real,
 /// probe-confirmed reason).
 pub(crate) fn checkpoint_wal_best_effort(library_path: &Path) {
+    checkpoint_wals(library_path, true);
+}
+
+/// [`checkpoint_wal_best_effort`] for everything except `metadata.db`, for a
+/// caller that checkpoints that one on its own live connection.
+///
+/// Why that matters: a `TRUNCATE` checkpoint by a second connection makes
+/// SQLite report a changed `PRAGMA data_version` on the first, as it does for
+/// another connection's writes, and the field cache reloads everything on
+/// that signal. A poller that checkpointed every few seconds under a bulk
+/// load would bring back the reload-per-book cost the cache's incremental
+/// patching removed.
+pub(crate) fn checkpoint_sidecar_wals_best_effort(library_path: &Path) {
+    checkpoint_wals(library_path, false);
+}
+
+fn checkpoint_wals(library_path: &Path, include_main: bool) {
     let candidates = [
         library_path.join("metadata.db"),
         library_path
@@ -1258,7 +1292,10 @@ pub(crate) fn checkpoint_wal_best_effort(library_path: &Path) {
         library_path.join(NOTES_DIR_NAME).join(NOTES_DB_NAME),
         library_path.join(FTS_DB_NAME),
     ];
-    for db_path in candidates {
+    for (i, db_path) in candidates.into_iter().enumerate() {
+        if i == 0 && !include_main {
+            continue;
+        }
         if !db_path.exists() {
             continue;
         }
@@ -1278,7 +1315,7 @@ pub(crate) fn checkpoint_wal_best_effort(library_path: &Path) {
 //
 // This section also has §6's "two-phase variant of the journal" for an
 // operation that mutates multiple network files at once (`NetworkBatch`,
-// used by `Cache::rename_book_files` on `Network` tier) -- journals the
+// used by the removed `Cache::rename_book_files` on `Network` tier) -- journals the
 // whole set of steps as one entry before any of them run, then drives
 // them forward to completion, in order. What it deliberately does NOT
 // do: fold the `metadata.db` update ("flip references") into that same
@@ -1886,7 +1923,22 @@ impl LibraryHandle {
     /// journal entry and the durability-relevant fsync of the parent
     /// director(ies) upstream's discipline requires.
     pub fn rename_atomic(&self, from: &Path, to: &Path) -> Result<(), LibraryHandleError> {
-        self.shared.rename_atomic_impl(from, to, None)
+        self.shared.rename_atomic_impl(from, to, None, false)
+    }
+
+    /// [`LibraryHandle::rename_atomic`] that refuses, instead of replacing,
+    /// a file already at `to`: the operating system makes the check and the
+    /// move one step, so another writer cannot slip a file into the gap
+    /// between an `exists()` test and the rename (on Windows a plain rename
+    /// replaces its destination). For every "never overwrite" move.
+    ///
+    /// Fails with [`io::ErrorKind::AlreadyExists`] when `to` is taken. A
+    /// case-only rename of one file (`a.pdf` to `A.pdf`) is not a collision
+    /// but this still reports one on a filesystem that cannot tell the names
+    /// apart; callers use [`LibraryHandle::rename_atomic`] for those, after
+    /// checking `samefile`.
+    pub fn rename_atomic_no_replace(&self, from: &Path, to: &Path) -> Result<(), LibraryHandleError> {
+        self.shared.rename_atomic_impl(from, to, None, true)
     }
 
     /// Real delete primitive: journal, remove (file or directory,
@@ -2331,6 +2383,74 @@ fn sync_file(path: &Path) -> io::Result<()> {
 /// `fsync`s a directory so a just-`rename`d entry survives a crash --
 /// a standard POSIX technique (open the directory like a file, flush
 /// it). No equivalent on Windows (a no-op there; see module doc).
+/// Whether a rename from `from` to `to` took effect.
+fn rename_took_effect(from: &Path, to: &Path, case_only: bool) -> bool {
+    if !to.exists() {
+        return false;
+    }
+    if !from.exists() {
+        return true;
+    }
+    // Both resolve: only fine for a case-only rename on a case-insensitive
+    // volume, where they are one file under two spellings.
+    case_only && calibre_utils::filenames::samefile(from, to)
+}
+
+/// Renames `from` to `to`, failing with `AlreadyExists` instead of replacing
+/// something at `to`; the existence check is made by the operating system as
+/// part of the rename.
+#[cfg(windows)]
+pub(crate) fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+
+    let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain(std::iter::once(0)).collect() };
+    let (f, t) = (wide(from), wide(to));
+    // No MOVEFILE_REPLACE_EXISTING: an existing destination fails the call.
+    // Safety: both buffers are NUL-terminated and live for the call.
+    if unsafe { MoveFileExW(f.as_ptr(), t.as_ptr(), 0) } != 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    // ERROR_ALREADY_EXISTS (183) and ERROR_FILE_EXISTS (80).
+    if matches!(err.raw_os_error(), Some(183) | Some(80)) {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, err));
+    }
+    Err(err)
+}
+
+/// See the Windows version.
+#[cfg(unix)]
+pub(crate) fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e));
+        let (f, t) = (c(from)?, c(to)?);
+        // Safety: both are valid NUL-terminated paths for the call.
+        let rc = unsafe { libc::renameat2(libc::AT_FDCWD, f.as_ptr(), libc::AT_FDCWD, t.as_ptr(), libc::RENAME_NOREPLACE) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        // Not supported by this kernel or filesystem: fall through to link.
+        if !matches!(err.raw_os_error(), Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::ENOTSUP)) {
+            return Err(err);
+        }
+    }
+    // `link` fails with EEXIST rather than replacing; then drop the old name.
+    fs::hard_link(from, to)?;
+    fs::remove_file(from)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    if to.exists() {
+        return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+    }
+    fs::rename(from, to)
+}
+
 fn fsync_dir(dir: Option<&Path>) -> io::Result<()> {
     let Some(dir) = dir else { return Ok(()) };
     if dir.as_os_str().is_empty() {

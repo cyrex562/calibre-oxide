@@ -93,6 +93,11 @@ use crate::constants::TRASH_DIR_NAME;
 pub const EXPIRE_PREF: &str = "expire_old_trash_after";
 /// calibre's `DEFAULT_TRASH_EXPIRY_TIME_SECONDS`.
 pub const DEFAULT_EXPIRY_SECONDS: i64 = 14 * 86400;
+/// How long an entry that belongs to a duplicate-resolve run is kept at least:
+/// "restore run" is how a bad bulk resolve is undone, and it quietly stops
+/// working for any entry that has already expired. 180 days, never less than
+/// the library's own setting.
+pub const RUN_ENTRY_EXPIRY_SECONDS: i64 = 180 * 86400;
 /// calibre never expires sooner than a day, whatever the preference says.
 pub const MIN_EXPIRY_SECONDS: i64 = 86400;
 const BOOK_MANIFEST: &str = "oxide-trash.json";
@@ -106,6 +111,16 @@ const RESTORED_FIELDS: &[&str] = &[
 
 pub(crate) fn now_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// How long an entry is kept: the library's setting for a plain delete, and at
+/// least [`RUN_ENTRY_EXPIRY_SECONDS`] for one tagged with a resolve run.
+pub(crate) fn entry_expiry(run_id: Option<&str>, configured: i64) -> i64 {
+    if run_id.is_some() {
+        configured.max(RUN_ENTRY_EXPIRY_SECONDS)
+    } else {
+        configured
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -350,7 +365,9 @@ impl Cache {
             fs::create_dir_all(parent).map_err(|e| format!("creating {}: {e}", parent.display()))?;
         }
         let handle = self.backend.write_handle().map_err(|e| e.to_string())?;
-        handle.rename_atomic(from, to).map_err(|e| e.to_string())
+        // The check above is for the message; this is what actually refuses to
+        // replace a file that turned up since.
+        handle.rename_atomic_no_replace(from, to).map_err(|e| e.to_string())
     }
 
     /// Everything a restore needs, read while the book still has its row.
@@ -595,7 +612,7 @@ impl Cache {
                 formats: m.files.iter().filter_map(|f| f.format.clone()).collect(),
                 size: m.files.iter().filter(|f| f.format.is_some()).map(|f| f.size).sum(),
                 deleted_at: m.deleted_at,
-                expires_at: m.deleted_at + expiry,
+                expires_at: m.deleted_at + entry_expiry(m.run_id.as_deref(), expiry),
                 original_path: m.path,
                 problem: None,
                 run_id: m.run_id,
@@ -930,7 +947,7 @@ impl Cache {
             return Ok(report);
         }
         for entry in self.list_trash()? {
-            if entry.deleted_at + max_age <= now {
+            if entry.deleted_at + entry_expiry(entry.run_id.as_deref(), max_age) <= now {
                 match self.delete_trash_entry(entry.kind, &entry.key, None) {
                     Ok(()) => report.removed.push(format!("{}/{}", entry.kind.category(), entry.key)),
                     Err(e) => report.failed.push((format!("{}/{}", entry.kind.category(), entry.key), format!("{e:#}"))),

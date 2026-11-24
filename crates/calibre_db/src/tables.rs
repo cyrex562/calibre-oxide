@@ -572,6 +572,195 @@ impl StandardTables {
     }
 }
 
+/// One of the item tables (the ones whose rows are named values shared
+/// between books), for [`StandardTables::reload_item_table`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ItemTable {
+    Series,
+    Publishers,
+    Ratings,
+    Tags,
+    Languages,
+    Authors,
+}
+
+fn forget_in_col_book<K: std::hash::Hash + Eq>(col_book_map: &mut HashMap<K, HashSet<i32>>, item: &K, book: i32) {
+    if let Some(set) = col_book_map.get_mut(item) {
+        set.remove(&book);
+    }
+}
+
+impl ManyToOneTable {
+    fn forget_book(&mut self, book: i32) {
+        if let Some(item) = self.book_col_map.remove(&book) {
+            forget_in_col_book(&mut self.col_book_map, &item, book);
+        }
+    }
+
+    fn read_book(&mut self, conn: &Connection, link_table: &str, link_column: &str, book: i32) -> Result<()> {
+        let sql = format!("SELECT {link_column} FROM {link_table} WHERE book = ?1 ORDER BY id");
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let items: Vec<i32> = stmt.query_map([book], |r| r.get::<_, i32>(0))?.collect::<Result<_>>()?;
+        for item in items {
+            self.col_book_map.entry(item).or_default().insert(book);
+            self.book_col_map.insert(book, item);
+        }
+        Ok(())
+    }
+}
+
+impl ManyToManyTable {
+    fn forget_book(&mut self, book: i32) {
+        if let Some(items) = self.book_col_map.remove(&book) {
+            for item in items {
+                forget_in_col_book(&mut self.col_book_map, &item, book);
+            }
+        }
+    }
+
+    fn read_book(&mut self, conn: &Connection, link_table: &str, link_column: &str, order_by: &str, book: i32) -> Result<()> {
+        let sql = format!("SELECT {link_column} FROM {link_table} WHERE book = ?1 ORDER BY {order_by}");
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let items: Vec<i32> = stmt.query_map([book], |r| r.get::<_, i32>(0))?.collect::<Result<_>>()?;
+        for item in items {
+            self.col_book_map.entry(item).or_default().insert(book);
+            self.book_col_map.entry(book).or_default().push(item);
+        }
+        Ok(())
+    }
+}
+
+impl StandardTables {
+    /// Reloads one whole item table and the links that point at it
+    /// (a rename of an author or tag, say, changes what every book
+    /// with it reads back).
+    pub fn reload_item_table(&mut self, conn: &Connection, which: ItemTable) -> Result<()> {
+        match which {
+            ItemTable::Series => self.series = ManyToOneTable::read(conn, "series", "name", "books_series_link", "series")?,
+            ItemTable::Publishers => self.publisher = ManyToOneTable::read(conn, "publishers", "name", "books_publishers_link", "publisher")?,
+            ItemTable::Ratings => self.rating = read_rating_table(conn)?,
+            ItemTable::Tags => self.tags = ManyToManyTable::read(conn, "tags", "name", "books_tags_link", "tag", "id")?,
+            ItemTable::Languages => self.languages = ManyToManyTable::read(conn, "languages", "lang_code", "books_languages_link", "lang_code", "item_order")?,
+            ItemTable::Authors => self.authors = AuthorsTable::read(conn)?,
+        }
+        Ok(())
+    }
+
+    /// Drops everything this snapshot holds about one book.
+    pub fn forget_book(&mut self, book: i32) {
+        for t in [&mut self.title, &mut self.sort, &mut self.author_sort, &mut self.isbn, &mut self.path, &mut self.timestamp, &mut self.pubdate, &mut self.last_modified, &mut self.series_index, &mut self.comments] {
+            t.book_col_map.remove(&book);
+        }
+        if let Some(uuid) = self.uuid.book_col_map.remove(&book) {
+            if self.uuid.uuid_to_id_map.get(&uuid) == Some(&book) {
+                self.uuid.uuid_to_id_map.remove(&uuid);
+            }
+        }
+        self.size.book_col_map.remove(&book);
+        self.series.forget_book(book);
+        self.publisher.forget_book(book);
+        self.rating.forget_book(book);
+        self.tags.forget_book(book);
+        self.languages.forget_book(book);
+        if let Some(items) = self.authors.book_col_map.remove(&book) {
+            for item in items {
+                forget_in_col_book(&mut self.authors.col_book_map, &item, book);
+            }
+        }
+        self.formats.fname_map.remove(&book);
+        self.formats.size_map.remove(&book);
+        if let Some(fmts) = self.formats.book_col_map.remove(&book) {
+            for f in fmts {
+                forget_in_col_book(&mut self.formats.col_book_map, &f, book);
+            }
+        }
+        if let Some(idents) = self.identifiers.book_col_map.remove(&book) {
+            for (k, _) in idents {
+                forget_in_col_book(&mut self.identifiers.col_book_map, &k, book);
+            }
+        }
+    }
+
+    /// Re-reads one book from the database: forget, then read what is
+    /// there now. A book that no longer exists is simply forgotten. The
+    /// result is what [`StandardTables::read`] would hold for that book,
+    /// at the price of a dozen indexed lookups instead of a scan of
+    /// every table.
+    pub fn reload_book(&mut self, conn: &Connection, book: i32) -> Result<()> {
+        use rusqlite::OptionalExtension;
+        self.forget_book(book);
+
+        let row: Option<Vec<SqlValue>> = conn
+            .prepare_cached("SELECT title, sort, author_sort, isbn, path, timestamp, pubdate, last_modified, series_index, uuid FROM books WHERE id = ?1")?
+            .query_row([book], |r| (0..10).map(|i| r.get::<_, SqlValue>(i)).collect::<Result<Vec<_>>>())
+            .optional()?;
+        let Some(row) = row else { return Ok(()) };
+        let mut it = row.into_iter();
+        let mut next = || sql_value_to_string(it.next().unwrap_or(SqlValue::Null));
+        for t in [&mut self.title, &mut self.sort, &mut self.author_sort, &mut self.isbn, &mut self.path, &mut self.timestamp, &mut self.pubdate, &mut self.last_modified, &mut self.series_index] {
+            if let Some(v) = next() {
+                t.book_col_map.insert(book, v);
+            }
+        }
+        if let Some(uuid) = next() {
+            self.uuid.uuid_to_id_map.insert(uuid.clone(), book);
+            self.uuid.book_col_map.insert(book, uuid);
+        }
+
+        let text: Option<SqlValue> = conn.prepare_cached("SELECT text FROM comments WHERE book = ?1")?.query_row([book], |r| r.get(0)).optional()?;
+        if let Some(s) = text.and_then(sql_value_to_string) {
+            self.comments.book_col_map.insert(book, s);
+        }
+
+        let size: Option<i64> = conn.prepare_cached("SELECT MAX(uncompressed_size) FROM data WHERE book = ?1")?.query_row([book], |r| r.get(0))?;
+        if let Some(size) = size {
+            self.size.book_col_map.insert(book, size);
+        }
+
+        self.series.read_book(conn, "books_series_link", "series", book)?;
+        self.publisher.read_book(conn, "books_publishers_link", "publisher", book)?;
+        self.rating.read_book(conn, "books_ratings_link", "rating", book)?;
+        self.tags.read_book(conn, "books_tags_link", "tag", "id", book)?;
+        self.languages.read_book(conn, "books_languages_link", "lang_code", "item_order", book)?;
+        {
+            let mut stmt = conn.prepare_cached("SELECT author FROM books_authors_link WHERE book = ?1 ORDER BY id")?;
+            let items: Vec<i32> = stmt.query_map([book], |r| r.get::<_, i32>(0))?.collect::<Result<_>>()?;
+            for item in items {
+                self.authors.col_book_map.entry(item).or_default().insert(book);
+                self.authors.book_col_map.entry(book).or_default().push(item);
+            }
+        }
+        {
+            let mut stmt = conn.prepare_cached("SELECT format, name, uncompressed_size FROM data WHERE book = ?1")?;
+            let rows: Vec<(Option<String>, String, i64)> = stmt.query_map([book], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_>>()?;
+            let mut fmts = Vec::new();
+            for (fmt, name, size) in rows {
+                let Some(fmt) = fmt else { continue };
+                let fmt = fmt.to_uppercase();
+                self.formats.col_book_map.entry(fmt.clone()).or_default().insert(book);
+                self.formats.fname_map.entry(book).or_default().insert(fmt.clone(), name);
+                self.formats.size_map.entry(book).or_default().insert(fmt.clone(), size);
+                fmts.push(fmt);
+            }
+            if !fmts.is_empty() {
+                fmts.sort();
+                self.formats.book_col_map.insert(book, fmts);
+            }
+        }
+        {
+            let mut stmt = conn.prepare_cached("SELECT type, val FROM identifiers WHERE book = ?1 ORDER BY id")?;
+            let rows: Vec<(Option<String>, Option<String>)> = stmt.query_map([book], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_>>()?;
+            for (typ, val) in rows {
+                if let (Some(typ), Some(val)) = (typ, val) {
+                    self.identifiers.col_book_map.entry(typ.clone()).or_default().insert(book);
+                    self.identifiers.book_col_map.entry(book).or_default().insert(typ, val);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
