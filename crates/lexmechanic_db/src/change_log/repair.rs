@@ -28,6 +28,15 @@
 //! Books (add and remove), the standard fields, formats (name and size),
 //! the has-cover flag, custom column definitions and values, and
 //! preferences: everything a rebuild restores.
+//!
+//! # Sort keys
+//!
+//! The database derives `books.sort` from the title and `authors.sort` from the
+//! author's name, and a replay re-derives them. So a sort key is compared with
+//! what a replay *would* give it (the logged value, or the derived one), not
+//! with whatever the log happens to hold: a key set straight in the database,
+//! which never reached the log, shows up as a difference and is appended
+//! explicitly. A library whose keys are all derived appends nothing.
 
 use std::collections::{HashMap, HashSet};
 
@@ -67,6 +76,10 @@ struct LoggedBook {
     /// Format (upper case) to `(name, size)`.
     formats: HashMap<String, (String, i64)>,
     cover: bool,
+    /// The title a replay would have set by now (`None` is the `Unknown` a
+    /// fresh row starts with). The database re-derives `sort` whenever the
+    /// title *changes*, so a title set after a `sort` discards that `sort`.
+    title: Option<String>,
 }
 
 /// What replaying the log would produce, as far as the repair compares it.
@@ -75,6 +88,8 @@ struct LoggedState {
     books: HashMap<String, LoggedBook>,
     columns: HashSet<String>,
     prefs: HashMap<String, Option<String>>,
+    /// Author name to the sort key logged for it.
+    author_sorts: HashMap<String, String>,
 }
 
 impl LoggedState {
@@ -89,6 +104,17 @@ impl LoggedState {
             }
             ChangeOp::FieldSet { book, field, value } => {
                 if let Some(b) = self.books.get_mut(book) {
+                    // An empty title or sort is a no-op on replay.
+                    if matches!(field.as_str(), "title" | "sort") && value.as_deref().unwrap_or("").is_empty() {
+                        return;
+                    }
+                    if field == "title" {
+                        let new = value.as_deref().unwrap_or("");
+                        if new != b.title.as_deref().unwrap_or("Unknown") {
+                            b.fields.remove("sort");
+                        }
+                        b.title = Some(new.to_string());
+                    }
                     if field == "has_cover" || field == "cover" {
                         b.cover = matches!(value.as_deref(), Some("1" | "true" | "True"));
                     } else {
@@ -122,7 +148,16 @@ impl LoggedState {
             }
             // A rename composes with the field values already logged; the
             // comparison below simply re-states any value it changed.
-            ChangeOp::ItemRenamed { .. } => {}
+            ChangeOp::ItemRenamed { kind, from, to } => {
+                // The database re-derives an author's sort key from the new name.
+                if kind == "authors" {
+                    self.author_sorts.remove(from);
+                    self.author_sorts.remove(to);
+                }
+            }
+            ChangeOp::AuthorSortSet { name, sort } => {
+                self.author_sorts.insert(name.clone(), sort.clone());
+            }
         }
     }
 }
@@ -201,15 +236,29 @@ impl Cache {
 
             for field in FIELDS {
                 let current = self.field_for(id, field)?.unwrap_or_default();
-                let before = was.fields.get(*field).cloned().flatten().unwrap_or_default();
-                // Empty title/sort are no-ops on replay, so an empty value there is not a difference.
-                if same_value(field, &before, &current) || (current.is_empty() && matches!(*field, "title" | "sort")) {
+                if *field == "sort" {
+                    // What a replay leaves in `sort`: the logged key if nothing since
+                    // changed the title, otherwise the key derived from the title.
+                    if current.is_empty() {
+                        continue;
+                    }
+                    let title = self.field_for(id, "title")?.unwrap_or_default();
+                    let title_changes = !title.is_empty() && title != was.title.as_deref().unwrap_or("Unknown");
+                    let expected = match was.fields.get("sort").cloned().flatten() {
+                        Some(logged) if !title_changes => logged,
+                        _ => self.derived_title_sort(&title)?,
+                    };
+                    if current != expected {
+                        ops.push(ChangeOp::FieldSet { book: uuid.clone(), field: "sort".to_string(), value: Some(current) });
+                        if known.is_some() {
+                            report.other_changes += 1;
+                        }
+                    }
                     continue;
                 }
-                // `sort` is computed by the database from the title unless someone set it
-                // by hand, and only a hand-set one is logged. A book whose log has none
-                // gets the computed one back on replay, so it is not a difference.
-                if *field == "sort" && known.is_some() && !was.fields.contains_key("sort") {
+                let before = was.fields.get(*field).cloned().flatten().unwrap_or_default();
+                // An empty title is a no-op on replay, so an empty value there is not a difference.
+                if same_value(field, &before, &current) || (current.is_empty() && *field == "title") {
                     continue;
                 }
                 ops.push(ChangeOp::FieldSet { book: uuid.clone(), field: (*field).to_string(), value: Some(current) });
@@ -258,6 +307,18 @@ impl Cache {
                         }
                     }
                 }
+            }
+        }
+
+        // Author sort keys, after every book op so the authors exist when they replay.
+        for (name, sort) in self.all_author_sorts()? {
+            let expected = match logged.author_sorts.get(&name) {
+                Some(logged) => logged.clone(),
+                None => self.derived_author_sort(&name)?,
+            };
+            if sort != expected {
+                ops.push(ChangeOp::AuthorSortSet { name, sort });
+                report.other_changes += 1;
             }
         }
 
@@ -312,6 +373,26 @@ impl Cache {
             out.entry(book).or_default().push((format.to_uppercase(), name, size));
         }
         Ok(out)
+    }
+
+    /// `title_sort(title)`, the key the database's triggers derive.
+    fn derived_title_sort(&self, title: &str) -> Result<String> {
+        let conn = self.backend.conn.lock().unwrap();
+        Ok(conn.query_row("SELECT title_sort(?1)", [title], |r| r.get(0))?)
+    }
+
+    /// `author_to_author_sort(name)`, the key the database's triggers derive.
+    fn derived_author_sort(&self, name: &str) -> Result<String> {
+        let conn = self.backend.conn.lock().unwrap();
+        Ok(conn.query_row("SELECT author_to_author_sort(?1)", [name], |r| r.get(0))?)
+    }
+
+    /// Every author as `(name, stored sort key)`, sorted by name.
+    fn all_author_sorts(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.backend.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT name, sort FROM authors ORDER BY name")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default())))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     fn has_cover_flag(&self, book_id: i32) -> Result<bool> {
@@ -448,5 +529,87 @@ mod tests {
         let silent = rebuilt.all_book_ids().unwrap().into_iter().find(|b| rebuilt.field_for(*b, "title").unwrap().as_deref() == Some("Silent")).expect("the missed book is in the rebuilt library");
         assert_eq!(rebuilt.field_for(silent, "path").unwrap().as_deref(), Some("silent"));
         assert_eq!(rebuilt.field_for(silent, "size").unwrap().as_deref(), Some("42"));
+    }
+
+    fn sorts(cache: &Cache) -> Vec<(String, String, String)> {
+        let mut out: Vec<_> = cache
+            .all_book_ids()
+            .unwrap()
+            .into_iter()
+            .map(|id| (cache.field_for(id, "title").unwrap().unwrap_or_default(), cache.field_for(id, "sort").unwrap().unwrap_or_default(), cache.field_for(id, "author_sort").unwrap().unwrap_or_default()))
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn a_hand_set_sort_is_found_and_a_rebuild_reproduces_it() {
+        let (dir, cache) = cache();
+        let plain = add(dir.path(), &cache, "The Plain One");
+        let edited = add(dir.path(), &cache, "Edited");
+        // Set straight in the database: the write never reached the log.
+        {
+            let conn = cache.backend.conn.lock().unwrap();
+            conn.execute("UPDATE books SET sort = 'Zzz Hand Set' WHERE id = ?1", [edited]).unwrap();
+            conn.execute("UPDATE books SET author_sort = 'Hand, Author' WHERE id = ?1", [edited]).unwrap();
+        }
+        let _ = plain;
+        let report = cache.repair_change_log().unwrap();
+        assert!(report.other_changes >= 2, "{report:?}");
+        let (_keep, rebuilt) = rebuilt_from_log_only(dir.path());
+        assert_eq!(sorts(&rebuilt), sorts(&cache));
+        assert!(sorts(&rebuilt).iter().any(|(t, s, a)| t == "Edited" && s == "Zzz Hand Set" && a == "Hand, Author"));
+        assert!(sorts(&rebuilt).iter().any(|(t, s, _)| t == "The Plain One" && s == "Plain One, The"), "derived keys stay derived");
+        // Idempotent: the log is now in step.
+        let log = cache.backend.change_log().unwrap();
+        let before = log.entry_count();
+        cache.repair_change_log().unwrap();
+        assert_eq!(log.entry_count(), before);
+    }
+
+    #[test]
+    fn a_hand_set_sort_next_to_a_logged_one_is_found_too() {
+        let (dir, cache) = cache();
+        let id = add(dir.path(), &cache, "Logged Sort");
+        cache.set_field(id, "sort", "Logged Key").unwrap();
+        {
+            let conn = cache.backend.conn.lock().unwrap();
+            conn.execute("UPDATE books SET sort = 'Raw Key' WHERE id = ?1", [id]).unwrap();
+        }
+        cache.repair_change_log().unwrap();
+        let (_keep, rebuilt) = rebuilt_from_log_only(dir.path());
+        assert_eq!(sorts(&rebuilt), sorts(&cache));
+        assert!(sorts(&rebuilt).iter().any(|(_, s, _)| s == "Raw Key"));
+    }
+
+    #[test]
+    fn a_hand_set_author_sort_key_is_found_and_a_rebuild_reproduces_it() {
+        let (dir, cache) = cache();
+        add(dir.path(), &cache, "By Someone");
+        {
+            let conn = cache.backend.conn.lock().unwrap();
+            conn.execute("UPDATE authors SET sort = 'Author, Hand Set' WHERE name = 'An Author'", []).unwrap();
+        }
+        let report = cache.repair_change_log().unwrap();
+        assert!(report.other_changes >= 1, "{report:?}");
+        let (_keep, rebuilt) = rebuilt_from_log_only(dir.path());
+        assert_eq!(rebuilt.author_sort_for_name("An Author").unwrap().as_deref(), Some("Author, Hand Set"));
+    }
+
+    #[test]
+    fn a_library_with_only_derived_and_logged_sort_keys_gets_nothing_appended() {
+        let (dir, cache) = cache();
+        let a = add(dir.path(), &cache, "The Hobbit");
+        let b = add(dir.path(), &cache, "A Tale");
+        cache.set_field(a, "sort", "Hobbit Special").unwrap();
+        // A title change after a hand-set sort re-derives it, in the database and in a replay.
+        cache.set_field(b, "sort", "Tale Special").unwrap();
+        cache.set_field(b, "title", "An Unusual Tale").unwrap();
+        cache.set_field(a, "author_sort", "Author, An").unwrap();
+        let log = cache.backend.change_log().unwrap();
+        let before = log.entry_count();
+        let report = cache.repair_change_log().unwrap();
+        assert_eq!((report.books_added, report.books_removed, report.other_changes), (0, 0, 0), "{report:?}");
+        assert_eq!(log.entry_count(), before, "nothing to append");
     }
 }

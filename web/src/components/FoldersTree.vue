@@ -4,10 +4,14 @@
 // is below it); right-click for New subfolder, Move selected books here,
 // Rename folder; drop selected rows from the table on a folder to move them.
 // The logic (tree, query, drag payload, move flow) is in ../library/folders.ts.
+//
+// A share can have thousands of folders, so the visible (expanded) tree is
+// flattened to a row list of fixed height and only the rows in the scroll
+// window are drawn, between two spacers (../library/virtualList.ts).
 
 import { useKeepScroll } from "../library/keepScroll";
 import Dialog from "./Dialog.vue";
-import { computed, ref, watch } from "vue";
+import { computed, nextTick, onActivated, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import { createLibraryFolder, deleteLibraryFolder, fetchLibraryFolders, type LibraryFolder } from "../library/api";
 import {
@@ -16,8 +20,20 @@ import {
 } from "../library/folders";
 import ContextMenu, { type ContextMenuEntry } from "./ContextMenu.vue";
 import { getItemCompat } from "../library/legacyStorage";
+import { scrollTopForIndex, windowRange } from "../library/virtualList";
+
+/** Height of one folder row; the `.folder-row` rule says the same. */
+const ROW_HEIGHT = 22;
+/**
+ * The smallest viewport the window is computed for. The section is as tall as its
+ * rows (up to a cap), so its measured height lags behind the rows it is about to
+ * get; assuming at least this much keeps a freshly expanded folder from showing
+ * a few rows and then filling in. It is also the answer where nothing is laid out.
+ */
+const MIN_VIEWPORT = 440;
 
 const rootEl = ref<HTMLElement | null>(null);
+const listEl = ref<HTMLElement | null>(null);
 useKeepScroll(rootEl);
 
 const vFocus = { mounted: (el: HTMLElement) => el.focus() };
@@ -62,6 +78,61 @@ watch(() => props.refreshKey, () => void load());
 
 const roots = computed(() => buildFolderTree(folders.value));
 const rows = computed(() => visibleFolderRows(roots.value, expanded.value));
+
+// --- the window of rows that is drawn ---
+
+const scrollTop = ref(0);
+const viewportHeight = ref(0);
+/** Where the list starts inside the scrolling section (the header sits above it). */
+const listOffset = ref(0);
+
+function measure() {
+  const root = rootEl.value;
+  if (!root) return;
+  scrollTop.value = root.scrollTop;
+  viewportHeight.value = root.clientHeight;
+  const list = listEl.value;
+  listOffset.value = list ? list.getBoundingClientRect().top - root.getBoundingClientRect().top + root.scrollTop : 0;
+}
+
+const windowed = computed(() =>
+  windowRange({ count: rows.value.length, rowHeight: ROW_HEIGHT, scrollTop: Math.max(0, scrollTop.value - listOffset.value), viewportHeight: Math.max(viewportHeight.value, MIN_VIEWPORT) }),
+);
+const visibleRows = computed(() => rows.value.slice(windowed.value.start, windowed.value.end));
+
+let resizeObserver: ResizeObserver | null = null;
+onMounted(() => {
+  measure();
+  if (typeof ResizeObserver !== "undefined" && rootEl.value) {
+    resizeObserver = new ResizeObserver(measure);
+    resizeObserver.observe(rootEl.value);
+  }
+});
+onBeforeUnmount(() => resizeObserver?.disconnect());
+onActivated(() => void nextTick(measure));
+// Reopening the section puts the list back under the header, and a changed row
+// count changes how tall the section is.
+watch(open, () => void nextTick(measure));
+watch(() => rows.value.length, () => void nextTick(measure));
+
+/** Scrolls so the row for `path` is fully visible (nothing happens for a path that is not shown). */
+function revealRow(path: string) {
+  const root = rootEl.value;
+  const index = rows.value.findIndex((r) => r.node.path === path);
+  if (!root || index < 0) return;
+  measure();
+  const next = scrollTopForIndex(index, { count: rows.value.length, rowHeight: ROW_HEIGHT, scrollTop: Math.max(0, scrollTop.value - listOffset.value), viewportHeight: Math.max(0, viewportHeight.value - listOffset.value) });
+  if (next !== Math.max(0, scrollTop.value - listOffset.value)) {
+    root.scrollTop = next + listOffset.value;
+    measure();
+  }
+}
+
+// The current folder stays in view when the tree changes under it (expanding or
+// collapsing above it, a refresh) and when it was chosen from elsewhere.
+watch(activePath, (path) => {
+  if (path) void nextTick(() => revealRow(path));
+});
 
 function toggle(path: string) {
   expanded.value = toggleFolder(expanded.value, path);
@@ -109,6 +180,8 @@ async function submitPrompt() {
       expanded.value = new Set([...expanded.value, ...ancestorsOf(made.path)]);
       persistExpanded();
       await load();
+      await nextTick();
+      revealRow(made.path);
     } catch (e) {
       p.error = e instanceof Error ? e.message : String(e);
       p.busy = false;
@@ -190,7 +263,7 @@ function planTitle(): string {
 </script>
 
 <template>
-  <section ref="rootEl" class="folders" aria-label="Folders">
+  <section ref="rootEl" class="folders" aria-label="Folders" @scroll.passive="measure">
     <div class="folders-head">
       <button type="button" class="folders-toggle" :aria-expanded="open" @click="open = !open">
         <span class="twisty" aria-hidden="true">{{ open ? "▾" : "▸" }}</span>
@@ -200,9 +273,10 @@ function planTitle(): string {
       <button type="button" class="folders-add" title="New top-level folder" aria-label="New top-level folder" data-testid="new-root-folder" @click="askNew('')">+</button>
     </div>
     <p v-if="error" class="error">{{ error }}</p>
-    <ul v-if="open" class="folder-list" data-testid="folder-list">
+    <ul v-if="open" ref="listEl" class="folder-list" data-testid="folder-list">
       <li v-if="rows.length === 0" class="folder-note">No folders yet. Books at the library's top level are not in a folder.</li>
-      <li v-for="row in rows" :key="row.node.path">
+      <li v-if="windowed.padTop > 0" aria-hidden="true" :style="{ height: `${windowed.padTop}px` }"></li>
+      <li v-for="row in visibleRows" :key="row.node.path">
         <div
           class="folder-row"
           :class="{ active: activePath === row.node.path, drop: dropTarget === row.node.path }"
@@ -221,6 +295,7 @@ function planTitle(): string {
           </button>
         </div>
       </li>
+      <li v-if="windowed.padBottom > 0" aria-hidden="true" :style="{ height: `${windowed.padBottom}px` }"></li>
     </ul>
 
     <ContextMenu v-if="menu" :x="menu.x" :y="menu.y" :entries="menuEntries" @choose="onChoose" @close="menu = null" />

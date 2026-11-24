@@ -1,21 +1,17 @@
 <script setup lang="ts">
-import { alertDialog, confirmDialog, promptDialog } from "./dialogs/confirm";
-import Dialog from "./Dialog.vue";
+import { computed, onMounted, ref, watch } from "vue";
+import { alertDialog } from "./dialogs/confirm";
 import ImportDuplicatesDialog from "./dialogs/ImportDuplicatesDialog.vue";
 import NewLibraryDialog from "./dialogs/NewLibraryDialog.vue";
 import SwitchLibraryDialog from "./dialogs/SwitchLibraryDialog.vue";
-import { computed, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref, shallowReactive, watch } from "vue";
-import { libraryEpoch, needsRefresh } from "../library/libraryEpoch";
 import CategoryBrowser from "./CategoryBrowser.vue";
 import NoteEditor from "./NoteEditor.vue";
 import BookDetailsPanel from "./BookDetailsPanel.vue";
 import BookTable from "./BookTable.vue";
-import AutocompleteInput from "./AutocompleteInput.vue";
-import { completionForCustom, invalidateFieldValues } from "../library/fieldValues";
+import { invalidateFieldValues } from "../library/fieldValues";
 import BookGrid from "./BookGrid.vue";
 import { createBookWindow } from "../library/bookWindow";
 import { commitCellEdit, type CommitResult } from "../library/inlineEdit";
-import { navigateIndex } from "../library/virtualList";
 import ContextMenu, { type ContextMenuEntry } from "./ContextMenu.vue";
 import ToolbarButton from "./ToolbarButton.vue";
 import AppIcon from "./AppIcon.vue";
@@ -25,24 +21,9 @@ import PolishDialog from "./PolishDialog.vue";
 import HelpDialog from "./HelpDialog.vue";
 import TrashDialog from "./TrashDialog.vue";
 import ImportFolderDialog from "./ImportFolderDialog.vue";
-import { describeScanOutcome, dismissKey, scanPromptHint, scanPromptText, shouldPrompt, type UntrackedCount } from "../library/scanPrompt";
-import { LAYOUT_KEY, type LayoutPrefs, type Panel, parseLayout, resizedWidth } from "../library/layout";
-import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LIBRARY_LABELS, checkLibrary,
-  type LibraryJob, fetchLibraryJobs, resumableJob, resumeLibraryJob, runningLibraryJob, switchWarning,
-  scanLibrary, prepareLibrary, describePrepareProgress, describePrepareResult, fingerprintPdfs, cancelLibraryJob, describeJobProgress,
-  fetchOrphans,
-  relocateOrphan,
-  uploadOrphanFile,
-  forgetOrphan,
-  fetchIgnored,
-  type EmptyFile, unignoreFile, copyToLibrary, describeCopyOutcome, embedMetadata, summarizeEmbed, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchLibraryInfo, fetchUntracked, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameFiles, renameSavedSearch, runNewsScheduleNow, saveToDisk, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
-import type { PdfScanStatus, CheckLibraryFinding, CheckLibraryResult, CustomRecipeOptions, DuplicateGroup, IgnoredFile, NewsFeedInput, NewsSchedule, Orphan, SaveToDiskResult } from "../library/api";
-import { mergeBooks, fetchChangeLogStatus, repairChangeLog, setFieldsBatch } from "../library/api";
-import { changeLogBanner, type ChangeLogStatus } from "../library/changeLog";
-import { runBulkEdit as runBatchedEdit, type BulkItem } from "../library/bulkBatch";
-import type { DuplicateBook, MergeMode, MergeResponse } from "../library/api";
-import { fingerprintAction } from "../library/duplicates";
-import DuplicateReview from "./DuplicateReview.vue";
+import { scanPromptHint, scanPromptText, shouldPrompt } from "../library/scanPrompt";
+import { addBook, catalogDownloadUrl, fetchBooks, fetchFieldMetadata, fetchNaming, fetchSavedSearches, fetchVirtualLibraries, libraryExportUrl, search, setFields } from "../library/api";
+import type { DuplicateBook, DuplicateGroup } from "../library/api";
 import ResolveDialog from "./ResolveDialog.vue";
 import CompareDuplicates from "./CompareDuplicates.vue";
 import { createCompareController, MAX_BOOKS as COMPARE_MAX } from "../library/compare";
@@ -52,39 +33,50 @@ import { createOrganizeController } from "../library/organize";
 import OrganizeDialog from "./OrganizeDialog.vue";
 import NamingDialog from "./NamingDialog.vue";
 import { createNamingController } from "../library/naming";
-import { COLUMN_EXPLANATIONS, COLUMN_PRESETS, columnDraftProblem, createColumn, presetDraft, type ColumnPreset } from "../library/columnPresets";
-import { fetchNaming } from "../library/api";
 import { createMirrorController } from "../library/mirror";
 import MirrorDialog from "./MirrorDialog.vue";
 import { createRetitleController } from "../library/retitle";
 import RetitleDialog from "./RetitleDialog.vue";
-import { DEFAULT_DESTINATION_HINT, MERGE_MODE_LABELS, MERGE_MODE_NOTES, defaultMergeDestination, describeMergeResult, describeRecord, summarizeMerge } from "../library/merge";
+import { defaultMergeDestination } from "../library/merge";
 import { parseSnippetSegments } from "../library/snippets";
 import { similarBooksQuery } from "../library/query";
 import { pathFromLibraryId, recentLibraryEntries } from "../library/recentLibraries";
-import { storageBanner, type StorageInfo } from "../library/storageBanner";
 import { readSavedChoice, readVlChoice, savedMenuItems, type SavedMenuId, type VlMenuId, vlMenuItems } from "../library/searchMenus";
 import { applySortChoice, type SortMenuId, sortSummary as summariseSort } from "../library/sortMenu";
-import { activeRules, colorForBook, COLORING_RULES_PROFILE, DEFAULT_COLORING_RULES, type ColoringRule, type ColoringRulesPrefs } from "../library/coloringRules";
-import { evaluateTemplateBulk } from "../library/api";
-import { changesFor, isEmptySpec, REPLACEABLE_FIELDS, validateSpec, type BulkEditSpec } from "../library/bulkEdit";
 import { moveKeyBy, moveKeyTo, pickerOrder, resetColumnPrefs, toggleKey } from "../library/columnLayout";
 import { clampWidth, columnsFor, DEFAULT_TABLE_PREFS, resolveColumns, TABLE_PREFS_PROFILE, type BookColumn, type LibraryViewMode, type TablePrefs } from "../library/columns";
 import { actionEnabled, contextMenuEntries, LIBRARY_ACTIONS, toolbarActionEnabled, TOOLBAR_LAYOUT, type ToolbarEntry, type ToolbarItem, toolbarOverflowEntries, toolbarOverflowIds, visibleToolbarActions, type ActionContext, type LibraryAction, type LibraryActionId } from "../library/actions";
-import { onMenuAction, syncDesktopMenu } from "../library/desktopMenu";
+import { syncDesktopMenu } from "../library/desktopMenu";
 import { buildMenuSpec } from "../library/actions";
-import { isModalOpen, shortcutFor } from "../library/shortcuts";
-import { useScope } from "../library/useScope";
 import { addChosenDuplicates, describeImport, importFiles, type PendingDuplicate } from "../library/importFiles";
 import { activeFilters, classifyEmpty, type ActiveFilter } from "../library/emptyState";
 import { draftCount } from "../library/metadataForm";
 import { trashBooksFlow } from "../library/deleteFlow";
 import DeleteConfirm from "./DeleteConfirm.vue";
-import UndoToast from "./UndoToast.vue";import { isTauri, tauriInvoke } from "../tauri";
-import { DEFAULT_KEYMAP, DEFAULT_LIBRARY_PREFS, DEFAULT_SAVE_TO_DISK_TEMPLATE, DEFAULT_TOOLBAR_PREFS, fetchProfile, KEYMAP_PROFILE, libraryShortcuts, LIBRARY_PREFS_PROFILE, saveProfile, TOOLBAR_PREFS_PROFILE, type KeymapPrefs, type LibraryPrefs, type ToolbarPrefs } from "../settings/api";
-import type { CustomColumnInfo, FieldMetaEntry, FtsSnippet, RenameFileResult } from "../library/types";
-import { DEFAULT_RENAME_TEMPLATE, describeRename, initialRenameTemplate, previewIsCurrent, type RenamePreviewKey, summarizeRename } from "../library/renameFiles";
-import { getItemCompat } from "../library/legacyStorage";
+import UndoToast from "./UndoToast.vue";
+import { isTauri, tauriInvoke } from "../tauri";
+import { DEFAULT_LIBRARY_PREFS, DEFAULT_TOOLBAR_PREFS, fetchProfile, LIBRARY_PREFS_PROFILE, saveProfile, TOOLBAR_PREFS_PROFILE, type LibraryPrefs, type ToolbarPrefs } from "../settings/api";
+import type { FieldMetaEntry } from "../library/types";
+import ManageListsDialog from "./dialogs/ManageListsDialog.vue";
+import ColumnPickerDialog from "./dialogs/ColumnPickerDialog.vue";
+import CustomColumnsDialog from "./dialogs/CustomColumnsDialog.vue";
+import CheckLibraryDialog from "./dialogs/CheckLibraryDialog.vue";
+import DuplicatesDialog from "./dialogs/DuplicatesDialog.vue";
+import MergeBooksDialog from "./dialogs/MergeBooksDialog.vue";
+import RenameFilesDialog from "./dialogs/RenameFilesDialog.vue";
+import CopyToLibraryDialog from "./dialogs/CopyToLibraryDialog.vue";
+import EmbedMetadataDialog from "./dialogs/EmbedMetadataDialog.vue";
+import SaveToDiskDialog from "./dialogs/SaveToDiskDialog.vue";
+import NewsDialog from "./dialogs/NewsDialog.vue";
+import BulkEditPanel from "./BulkEditPanel.vue";
+import { useBulkEdit } from "../library/useBulkEdit";
+import { useFtsSearch } from "../library/useFtsSearch";
+import { useLibraryInfo } from "../library/useLibraryInfo";
+import { useLibraryKeyboard } from "../library/useLibraryKeyboard";
+import { usePanelLayout } from "../library/usePanelLayout";
+import { useRowColoring } from "../library/useRowColoring";
+import { useSelection } from "../library/useSelection";
+import { conventionFileTemplate } from "../library/renameFiles";
 
 // Real, persisted default (issue #721) -- overwritten by
 // loadLibraryPrefs() below once its fetch resolves; starts at the
@@ -227,7 +219,6 @@ const sortMenu = ref<{ x: number; y: number } | null>(null);
 function openSortMenu(anchorRect: { x: number; y: number }) {
   sortMenu.value = anchorRect;
 }
-
 // The library list is one continuous, virtualised list. `win` holds the
 // ordered id of every matching book plus a lazy cache of the summaries
 // the viewport has needed (library/bookWindow.ts).
@@ -363,85 +354,11 @@ function onColumnResize(next: { key: string; width: number }) {
   clearTimeout(widthSaveTimer);
   widthSaveTimer = setTimeout(() => void saveTablePrefs(), 400);
 }
-
-// --- Panel layout -------------------------------------------------
-//
-// calibre's window is three columns over a status bar: categories on
-// the left, the book list in the middle, details on the right. Both
-// side panels hide, and the splitters between them drag. Widths
-// persist, because a panel that forgets its size every launch is one
-// the user re-drags every launch.
-//
-// The arithmetic and the stored-blob parsing live in `library/layout`
-// so they can be tested without mounting anything.
-
-const initialLayout = parseLayout(readStoredLayout());
-const sidebarVisible = ref(initialLayout.sidebarVisible);
-const detailsVisible = ref(initialLayout.detailsVisible);
-const sidebarWidth = ref(initialLayout.sidebarWidth);
-const detailsWidth = ref(initialLayout.detailsWidth);
-
-function readStoredLayout(): string | null {
-  try {
-    return getItemCompat(localStorage, LAYOUT_KEY);
-  } catch {
-    // Storage can be unavailable (private mode, disabled cookies);
-    // defaults are a fine answer and not worth failing a render over.
-    return null;
-  }
-}
-
-function saveLayout() {
-  try {
-    localStorage.setItem(
-      LAYOUT_KEY,
-      JSON.stringify({
-        sidebarVisible: sidebarVisible.value,
-        detailsVisible: detailsVisible.value,
-        sidebarWidth: sidebarWidth.value,
-        detailsWidth: detailsWidth.value,
-      } satisfies LayoutPrefs),
-    );
-  } catch {
-    // As above: the layout simply will not persist.
-  }
-}
-
-watch([sidebarVisible, detailsVisible], saveLayout);
-
-/**
- * Drags a splitter.
- *
- * Pointer capture is what makes this reliable: without it a fast drag
- * outruns the 4px handle, the element stops receiving moves, and the
- * panel sticks mid-resize with the button still held.
- */
-function startResize(which: Panel, event: PointerEvent) {
-  event.preventDefault();
-  const handle = event.currentTarget as HTMLElement;
-  const startX = event.clientX;
-  const startWidth = which === "sidebar" ? sidebarWidth.value : detailsWidth.value;
-  handle.setPointerCapture?.(event.pointerId);
-
-  const onMove = (move: PointerEvent) => {
-    const next = resizedWidth(which, startWidth, startX, move.clientX);
-    if (which === "sidebar") sidebarWidth.value = next;
-    else detailsWidth.value = next;
-  };
-  const onUp = (up: PointerEvent) => {
-    handle.releasePointerCapture?.(up.pointerId);
-    handle.removeEventListener("pointermove", onMove);
-    handle.removeEventListener("pointerup", onUp);
-    handle.removeEventListener("pointercancel", onUp);
-    saveLayout();
-  };
-  handle.addEventListener("pointermove", onMove);
-  handle.addEventListener("pointerup", onUp);
-  handle.addEventListener("pointercancel", onUp);
-}
+// The panels beside the list: whether they show, how wide, and the splitters
+// that resize them (../library/usePanelLayout.ts).
+const { sidebarVisible, detailsVisible, sidebarWidth, detailsWidth, startResize } = usePanelLayout();
 
 const columnPickerOpen = ref(false);
-
 
 function setColumnKeys(columns: string[]) {
   tablePrefs.value = { ...tablePrefs.value, columns };
@@ -463,14 +380,12 @@ function onColumnReorder(next: { key: string; index: number }) {
 
 /** The picker's rows: shown columns in order, then the hidden ones. */
 const pickerColumns = computed(() => pickerOrder(availableColumns.value, tablePrefs.value.columns));
-const pickerDragKey = ref<string | null>(null);
 
-function onPickerDrop(targetKey: string) {
-  const from = pickerDragKey.value;
-  pickerDragKey.value = null;
+/** A row of the column picker was dropped on another shown row. */
+function onPickerReorder(from: string, onto: string) {
   const keys = tablePrefs.value.columns;
-  if (!from || from === targetKey || !keys.includes(from) || !keys.includes(targetKey)) return;
-  setColumnKeys(moveKeyTo(keys, from, keys.indexOf(targetKey)));
+  if (from === onto || !keys.includes(from) || !keys.includes(onto)) return;
+  setColumnKeys(moveKeyTo(keys, from, keys.indexOf(onto)));
 }
 
 function resetColumns() {
@@ -478,386 +393,36 @@ function resetColumns() {
   void saveTablePrefs();
 }
 
-// Virtual library / saved search management -- real, new routes (see
-// crates/lexmechanic_srv/src/lists.rs's own doc for why no upstream route
-// exists to port here).
+// The dialogs below are components (../components/dialogs): each owns what it
+// edits and reports what changed, and this view only says which are open.
 const manageOpen = ref(false);
-const manageError = ref<string | null>(null);
-const newVlName = ref("");
-const newVlQuery = ref("");
-const newSearchName = ref("");
-const newSearchQuery = ref("");
 
-function openManage() {
-  newVlQuery.value = activeQuery.value;
-  newSearchQuery.value = activeQuery.value;
-  manageError.value = null;
-  manageOpen.value = true;
+function onVirtualLibraryDeleted(name: string) {
+  if (vl.value === name) vl.value = "";
 }
 
-async function createVirtualLibrary() {
-  if (!newVlName.value.trim() || !newVlQuery.value.trim()) return;
-  manageError.value = null;
-  try {
-    await setVirtualLibrary(newVlName.value.trim(), newVlQuery.value.trim());
-    newVlName.value = "";
-    await loadMetadata();
-  } catch (e) {
-    manageError.value = e instanceof Error ? e.message : String(e);
-  }
-}
-
-async function removeVirtualLibrary(name: string) {
-  if (!(await confirmDialog(`Delete the virtual library "${name}"?`, { confirmLabel: "Delete", danger: true }))) return;
-  manageError.value = null;
-  try {
-    await deleteVirtualLibrary(name);
-    if (vl.value === name) vl.value = "";
-    await loadMetadata();
-  } catch (e) {
-    manageError.value = e instanceof Error ? e.message : String(e);
-  }
-}
-
-async function createSavedSearch() {
-  if (!newSearchName.value.trim() || !newSearchQuery.value.trim()) return;
-  manageError.value = null;
-  try {
-    await setSavedSearch(newSearchName.value.trim(), newSearchQuery.value.trim());
-    newSearchName.value = "";
-    await loadMetadata();
-  } catch (e) {
-    manageError.value = e instanceof Error ? e.message : String(e);
-  }
-}
-
-async function removeSavedSearch(name: string) {
-  if (!(await confirmDialog(`Delete the saved search "${name}"?`, { confirmLabel: "Delete", danger: true }))) return;
-  manageError.value = null;
-  try {
-    await deleteSavedSearch(name);
-    await loadMetadata();
-  } catch (e) {
-    manageError.value = e instanceof Error ? e.message : String(e);
-  }
-}
-
-async function renameSavedSearchPrompt(name: string) {
-  const newName = await promptDialog("Rename saved search to:", name, { title: "Rename saved search", confirmLabel: "Rename" });
-  if (!newName || newName === name) return;
-  manageError.value = null;
-  try {
-    await renameSavedSearch(name, newName);
-    await loadMetadata();
-  } catch (e) {
-    manageError.value = e instanceof Error ? e.message : String(e);
-  }
-}
-
-// Custom column management -- real, new routes (see
-// crates/lexmechanic_srv/src/custom_columns.rs's own doc for why no
-// upstream route exists to port here). `is_multiple` is left out of
-// the create form entirely: it's not a real working combination for
-// any datatype this backend supports yet (text/comments/series reject
-// it outright, and bool/int/float/rating silently ignore it -- see
-// that module's own doc) -- a real, disclosed narrowing rather than a
-// checkbox that would look like it works but doesn't.
 const columnsOpen = ref(false);
 
-// A custom column made (or removed) in the Custom columns dialog must
-// show up in the column picker without a reload: re-read the field
-// metadata when that dialog closes.
-watch(columnsOpen, (open, was) => {
-  if (was && !open) void loadMetadata();
-});
-const columnsError = ref<string | null>(null);
-const customColumns = ref<Record<string, CustomColumnInfo>>({});
-const newColumnLabel = ref("");
-const newColumnName = ref("");
-const newColumnDatatype = ref("text");
-
-async function loadCustomColumns() {
-  try {
-    customColumns.value = await fetchCustomColumns();
-  } catch (e) {
-    columnsError.value = e instanceof Error ? e.message : String(e);
-  }
+// A custom column made (or removed) in the Custom columns dialog must show up in
+// the column picker without a reload: re-read the field metadata when it closes.
+function closeColumns() {
+  columnsOpen.value = false;
+  void loadMetadata();
 }
 
-function openColumns() {
-  columnsError.value = null;
-  columnsOpen.value = true;
-  void loadCustomColumns();
+/** A column was added or removed: the category browser and the details follow without a reload. */
+function onColumnsChanged() {
+  categoriesRefresh.value++;
+  cacheBust.value++;
 }
 
-// Check Library (issue #748) -- real integrity scan, see
-// crates/lexmechanic_srv/src/check_library.rs's own doc.
 const checkLibraryOpen = ref(false);
-const checkLibraryLoading = ref(false);
-const checkLibraryError = ref<string | null>(null);
-const checkLibraryResult = ref<CheckLibraryResult | null>(null);
-
-/**
- * The non-empty categories, in the order `CHECK_LIBRARY_LABELS` lists
- * them — most worth reading first. `conclusive`/`needs_attention` are
- * booleans in the same object and are not categories.
- */
-const checkLibraryNonEmpty = computed(() => {
-  const result = checkLibraryResult.value;
-  if (!result) return [];
-  return Object.keys(CHECK_LIBRARY_LABELS)
-    .map((key) => [key, result[key]] as const)
-    .filter((entry): entry is readonly [string, CheckLibraryFinding[]] => Array.isArray(entry[1]) && entry[1].length > 0);
-});
-
-/**
- * False when a folder could not be read. Saying so matters: the check
- * deliberately computes no missing-file list in that case, and a silent
- * empty list would read as "nothing is missing".
- */
-const checkLibraryConclusive = computed(() => checkLibraryResult.value?.conclusive !== false);
-
-const rescanBusy = ref(false);
-const rescanSummary = ref<string | null>(null);
-/** Live progress line while the scan job runs, and the id Cancel acts on. */
-const rescanProgress = ref<string | null>(null);
-const rescanJobId = ref<number | null>(null);
-
-/** Stops the running scan. It keeps what it has added; scanning again continues. */
-async function cancelRescan() {
-  if (rescanJobId.value === null) return;
-  try {
-    await cancelLibraryJob(rescanJobId.value);
-  } catch (e) {
-    checkLibraryError.value = e instanceof Error ? e.message : String(e);
-  }
-}
-
-/**
- * Untracked files are files the user can see in their own folder that
- * the library does not list — so the check reports them and this puts
- * them in. Offered from the check dialog rather than as its own menu
- * item because that is where the user has just been told they exist.
- *
- * A scan also re-attaches anything that moved, so the check is re-run
- * afterwards instead of assuming what changed.
- */
-async function rescanLibraryFolder() {
-  rescanBusy.value = true;
-  rescanSummary.value = null;
-  rescanProgress.value = null;
-  checkLibraryError.value = null;
-  try {
-    // A scan of a big folder runs for a long time, so it is a background
-    // job: show how far it has got, and let the user stop it.
-    const result = await scanLibrary({
-      onStart: (id) => (rescanJobId.value = id),
-      onProgress: (job) => (rescanProgress.value = describeJobProgress(job.progress)),
-    });
-    const parts: string[] = [];
-    if (result.cancelled) parts.push("stopped early — scan again to continue where it left off");
-    if (result.added.length > 0) parts.push(`${result.added.length} added`);
-    if (result.relocated > 0) parts.push(`${result.relocated} found in a new place`);
-    // Named rather than counted: a file the scan refused to add is
-    // exactly what the user needs to know the name of.
-    if (result.settling.length > 0) parts.push(`still being written: ${result.settling.join(", ")}`);
-    if (result.ignored.length > 0) parts.push(`kept out because you removed them: ${result.ignored.join(", ")}`);
-    for (const failure of result.failed) parts.push(`${failure.path}: ${failure.error}`);
-    if (!result.conclusive) parts.push("a folder could not be read, so this is partial");
-    rescanSummary.value = parts.length > 0 ? parts.join(" · ") : "Nothing to add.";
-    await runSearch();
-    checkLibraryResult.value = await checkLibrary();
-  } catch (e) {
-    checkLibraryError.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    rescanBusy.value = false;
-    rescanProgress.value = null;
-    rescanJobId.value = null;
-  }
-}
-
-/** Whether the check found files on disk that no book claims. */
-const checkLibraryHasUntracked = computed(() => {
-  const untracked = checkLibraryResult.value?.untracked_files;
-  return Array.isArray(untracked) && untracked.length > 0;
-});
-
-/*
- * Orphans and the ignore list (#921).
- *
- * Both are rendered from their own endpoints rather than from the
- * check's findings, because the check reports only `{book_id, title,
- * path}` and resolving an orphan needs its *format* — `relocateOrphan`
- * points at one `(book, format)` pair, not at a book.
- *
- * They live in this dialog because it is where the user has just been
- * told they exist. An orphan is the one state the tracked model requires
- * a person to act on, so reporting it without the three resolutions
- * would be telling somebody their library is broken and offering
- * nothing.
- */
-const orphanList = ref<Orphan[]>([]);
-const ignoredList = ref<IgnoredFile[]>([]);
-const orphanBusy = ref<string | null>(null);
-const orphanMessage = ref<string | null>(null);
-
-/** Keys rendered by their own sections below, so the generic list skips them. */
-const SELF_RENDERED_CHECK_KEYS = new Set(["orphaned_books", "ignored_files"]);
-
-const checkLibraryGenericFindings = computed(() => checkLibraryNonEmpty.value.filter(([key]) => !SELF_RENDERED_CHECK_KEYS.has(key)));
-
-/** The untracked files, offered as relocation candidates for an orphan. */
-const untrackedPaths = computed(() => {
-  const untracked = checkLibraryResult.value?.untracked_files;
-  return Array.isArray(untracked) ? untracked.map((f) => f.path) : [];
-});
-
-function orphanKey(orphan: Orphan) {
-  return `${orphan.book_id}:${orphan.format}`;
-}
-
-async function loadOrphanState() {
-  try {
-    [orphanList.value, ignoredList.value] = await Promise.all([fetchOrphans(), fetchIgnored()]);
-  } catch (e) {
-    checkLibraryError.value = e instanceof Error ? e.message : String(e);
-  }
-}
-
-/**
- * Runs one resolution, then reloads. Every one of them changes both the
- * orphan list and the check's own findings, so nothing here assumes what
- * changed.
- */
-async function resolveOrphan(orphan: Orphan, action: () => Promise<string | null>) {
-  orphanBusy.value = orphanKey(orphan);
-  orphanMessage.value = null;
-  try {
-    orphanMessage.value = await action();
-    await loadOrphanState();
-    await runSearch();
-    checkLibraryResult.value = await checkLibrary();
-  } catch (e) {
-    orphanMessage.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    orphanBusy.value = null;
-  }
-}
-
-function relocateTo(orphan: Orphan, path: string) {
-  if (!path) return;
-  // The verdict is the point of this call, not a detail: the user may
-  // have picked a re-downloaded copy, or the wrong file entirely.
-  void resolveOrphan(orphan, async () => (await relocateOrphan(orphan.book_id, orphan.format, path)).message);
-}
-
-function uploadFor(orphan: Orphan, event: Event) {
-  const file = (event.target as HTMLInputElement).files?.[0];
-  if (!file) return;
-  void resolveOrphan(orphan, async () => (await uploadOrphanFile(orphan.book_id, orphan.format, file)).message);
-}
-
-function forgetOrphanEntry(orphan: Orphan, keepMetadata: boolean) {
-  void resolveOrphan(orphan, async () => {
-    // Named after the file that was lost, so the saved metadata is
-    // findable later without guessing.
-    const name = keepMetadata ? `${orphan.last_known_path.split("/").pop() ?? "book"}.opf` : undefined;
-    const result = await forgetOrphan(orphan.book_id, name);
-    return result.metadata_saved_as ? `Entry removed. Metadata saved as ${result.metadata_saved_as}.` : "Entry removed.";
-  });
-}
-
-async function unignore(file: IgnoredFile) {
-  orphanBusy.value = file.path;
-  orphanMessage.value = null;
-  try {
-    await unignoreFile(file.path);
-    // Deliberately not scanned here: unignoring only lifts the refusal.
-    // The next scan adds the file, and saying so beats appearing to do
-    // nothing.
-    orphanMessage.value = `${file.path} will be picked up by the next scan.`;
-    await loadOrphanState();
-  } catch (e) {
-    orphanMessage.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    orphanBusy.value = null;
-  }
-}
-
-async function openCheckLibrary() {
-  checkLibraryOpen.value = true;
-  checkLibraryError.value = null;
-  checkLibraryLoading.value = true;
-  checkLibraryResult.value = null;
-  try {
-    checkLibraryResult.value = await checkLibrary();
-    await loadOrphanState();
-  } catch (e) {
-    checkLibraryError.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    checkLibraryLoading.value = false;
-  }
-}
 
 // Item notes (issue #732) -- see NoteEditor.vue's own doc.
 const noteTarget = ref<{ field: string; itemName: string } | null>(null);
 
 function openNote(field: string, itemName: string) {
   noteTarget.value = { field, itemName };
-}
-
-// One-click presets (edition, game line, volume): pick one, edit the name, create.
-const presetPicked = ref<{ preset: ColumnPreset; label: string; name: string; datatype: string } | null>(null);
-function pickColumnPreset(preset: ColumnPreset) {
-  presetPicked.value = { preset, ...presetDraft(preset) };
-  columnsError.value = null;
-}
-async function createPresetColumn() {
-  const d = presetPicked.value;
-  if (!d) return;
-  const problem = columnDraftProblem(d, Object.keys(customColumns.value));
-  if (problem) {
-    columnsError.value = problem;
-    return;
-  }
-  columnsError.value = null;
-  try {
-    await createColumn(d);
-    presetPicked.value = null;
-    await onColumnsChanged();
-  } catch (e) {
-    columnsError.value = e instanceof Error ? e.message : String(e);
-  }
-}
-/** A column was added or removed: the table's column picker, the category browser and the details follow without a reload. */
-async function onColumnsChanged() {
-  await loadCustomColumns();
-  categoriesRefresh.value++;
-  cacheBust.value++;
-}
-
-async function createCustomColumn() {
-  if (!newColumnLabel.value.trim() || !newColumnName.value.trim()) return;
-  columnsError.value = null;
-  try {
-    await addCustomColumn(newColumnLabel.value.trim(), newColumnName.value.trim(), newColumnDatatype.value);
-    newColumnLabel.value = "";
-    newColumnName.value = "";
-    await onColumnsChanged();
-  } catch (e) {
-    columnsError.value = e instanceof Error ? e.message : String(e);
-  }
-}
-
-async function removeCustomColumnClick(label: string) {
-  if (!(await confirmDialog(`Delete the custom column "${label}"? Its stored values will be lost.`, { confirmLabel: "Delete", danger: true }))) return;
-  columnsError.value = null;
-  try {
-    await removeCustomColumn(label);
-    await onColumnsChanged();
-  } catch (e) {
-    columnsError.value = e instanceof Error ? e.message : String(e);
-  }
 }
 
 function applySavedSearch(query: string) {
@@ -879,158 +444,7 @@ function exportLibraryArchive() {
   window.open(libraryExportUrl(), "_blank");
 }
 
-// Fetch news/recipes -- a real, generic RSS/Atom feed reader (see
-// crates/lexmechanic_srv/src/news.rs's own doc for why this isn't a
-// catalog of upstream's ~1077 hand-written per-site recipes).
 const newsOpen = ref(false);
-const newsTitle = ref("");
-const newsFeedUrls = ref("");
-const newsOldestArticleDays = ref("");
-const newsMaxArticlesPerFeed = ref("");
-const newsFetching = ref(false);
-const newsError = ref<string | null>(null);
-const newsDone = ref(false);
-
-// Scheduled feeds (#764) -- a saved feed configuration that runs
-// automatically on a real recurring interval via a server-side
-// background task, instead of only this panel's own one-shot fetch.
-const newsSchedules = ref<NewsSchedule[]>([]);
-const scheduleIntervalMinutes = ref("1440");
-const schedulingBusy = ref(false);
-const scheduleError = ref<string | null>(null);
-
-async function loadNewsSchedules() {
-  try {
-    const { schedules } = await listNewsSchedules();
-    newsSchedules.value = schedules;
-  } catch (e) {
-    scheduleError.value = e instanceof Error ? e.message : String(e);
-  }
-}
-
-function openNews() {
-  newsOpen.value = true;
-  newsError.value = null;
-  newsDone.value = false;
-  void loadNewsSchedules();
-}
-
-async function saveNewsSchedule() {
-  // Real, disclosed narrowing: scheduled feeds (#764) only store plain
-  // URLs, not #765's {title, url} sections -- strip any "Title|" prefix
-  // rather than saving a broken literal URL.
-  const feeds = parseFeedLines(newsFeedUrls.value).map((f) => (typeof f === "string" ? f : f.url));
-  const minutes = Number(scheduleIntervalMinutes.value);
-  if (feeds.length === 0 || !Number.isFinite(minutes) || minutes < 1) return;
-  schedulingBusy.value = true;
-  scheduleError.value = null;
-  try {
-    await addNewsSchedule(newsTitle.value.trim(), feeds, Math.round(minutes * 60));
-    await loadNewsSchedules();
-  } catch (e) {
-    scheduleError.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    schedulingBusy.value = false;
-  }
-}
-
-async function deleteNewsSchedule(id: number) {
-  await removeNewsSchedule(id);
-  await loadNewsSchedules();
-}
-
-async function runNewsScheduleNowClick(id: number) {
-  schedulingBusy.value = true;
-  scheduleError.value = null;
-  try {
-    const result = await runNewsScheduleNow(id);
-    if (!result.ok) throw new Error(result.error || "run failed");
-    await libraryChanged();
-    await loadNewsSchedules();
-  } catch (e) {
-    scheduleError.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    schedulingBusy.value = false;
-  }
-}
-
-const opmlInput = ref<HTMLInputElement | null>(null);
-const opmlImporting = ref(false);
-const opmlSummary = ref<string | null>(null);
-
-async function importOpmlFile(e: Event) {
-  const file = (e.target as HTMLInputElement).files?.[0];
-  if (!file) return;
-  opmlImporting.value = true;
-  opmlSummary.value = null;
-  newsError.value = null;
-  try {
-    const text = await file.text();
-    const feeds = await importOpml(text);
-    if (feeds.length === 0) {
-      opmlSummary.value = "No feeds found in that OPML file.";
-      return;
-    }
-    const existing = newsFeedUrls.value.split("\n").map((u) => u.trim()).filter(Boolean);
-    const newUrls = feeds.map((f) => f.feed_url).filter((u) => !existing.includes(u));
-    newsFeedUrls.value = [...existing, ...newUrls].join("\n");
-    opmlSummary.value = `Added ${newUrls.length} feed(s) from OPML${newUrls.length < feeds.length ? ` (${feeds.length - newUrls.length} already listed)` : ""}.`;
-  } catch (e) {
-    newsError.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    opmlImporting.value = false;
-    if (opmlInput.value) opmlInput.value.value = "";
-  }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-// A line may be a bare URL, or "Section Title|https://..." naming its
-// own real recipe section (#765) -- reuses the existing one-line-per-
-// feed textarea rather than a new per-row form for this first slice.
-function parseFeedLines(raw: string): NewsFeedInput[] {
-  return raw
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      const pipe = line.indexOf("|");
-      if (pipe === -1) return line;
-      const title = line.slice(0, pipe).trim();
-      const url = line.slice(pipe + 1).trim();
-      return title && url ? { title, url } : line;
-    });
-}
-
-async function fetchNews() {
-  const feeds = parseFeedLines(newsFeedUrls.value);
-  if (feeds.length === 0) return;
-  newsFetching.value = true;
-  newsError.value = null;
-  newsDone.value = false;
-  try {
-    const options: CustomRecipeOptions = {};
-    if (newsOldestArticleDays.value.trim()) options.oldestArticleDays = Number(newsOldestArticleDays.value);
-    if (newsMaxArticlesPerFeed.value.trim()) options.maxArticlesPerFeed = Number(newsMaxArticlesPerFeed.value);
-    const jobId = await startNewsFetch(newsTitle.value.trim(), feeds, options);
-    for (;;) {
-      const status = await getNewsFetchStatus(jobId);
-      if (!status.running) {
-        if (!status.ok) throw new Error(status.error || "fetch failed");
-        break;
-      }
-      await sleep(1000);
-    }
-    newsDone.value = true;
-    await libraryChanged();
-  } catch (e) {
-    newsError.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    newsFetching.value = false;
-  }
-}
 
 /**
  * Re-run the current query after something changed (an edit, delete,
@@ -1043,7 +457,7 @@ async function runSearch() {
   error.value = null;
   try {
     // Colours are re-evaluated for the rows on screen; the old ones stay until replaced.
-    colorChecked.clear();
+    coloring.forgetAll();
     await win.refresh();
     error.value = win.error.value;
     pruneSelection();
@@ -1074,10 +488,10 @@ function pruneSelection() {
   for (const id of selectedIds.value) if (win.indexOf(id) >= 0) next.add(id);
   if (next.size !== selectedIds.value.size) selectedIds.value = next;
 }
-
-// Declared before the immediate watcher below reads it: a `const` read
-// before its line throws (temporal dead zone) and blanked the whole view.
-const ftsMode = ref(false);
+// Full-text search (../library/useFtsSearch.ts). Declared before the immediate
+// watcher below reads `ftsMode`: a `const` read before its line throws
+// (temporal dead zone) and blanked the whole view.
+const { ftsMode, ftsLoading, ftsError, ftsNotEnabled, ftsEnabling, ftsIndexing, ftsResults, runFtsSearch, enableFts } = useFtsSearch(activeQuery);
 
 // `ftsMode` is a dependency: the list was not touched while full-text results
 // were showing, so leaving that mode must load it again (it may be stale or
@@ -1085,94 +499,6 @@ const ftsMode = ref(false);
 watch([activeQuery, sort, sortOrder, vl, ftsMode], () => {
   if (!ftsMode.value) void resetSearch();
 }, { immediate: true });
-
-// Full-text search -- a separate result shape/backend (crates/lexmechanic_srv/src/fts.rs)
-// from the metadata search above: no pagination/sort/vl, real
-// snippet/highlight text per match, and a real "not enabled yet" state
-// to surface instead of an empty result list.
-interface FtsDisplayResult {
-  bookId: number;
-  title: string;
-  authors: string;
-  formats: string[];
-  snippets: FtsSnippet[];
-}
-
-const ftsLoading = ref(false);
-const ftsError = ref<string | null>(null);
-const ftsNotEnabled = ref(false);
-const ftsEnabling = ref(false);
-const ftsIndexing = ref<{ left: number; total: number } | null>(null);
-const ftsResults = ref<FtsDisplayResult[]>([]);
-
-/** Which full-text search is the latest: a slow earlier one must not overwrite a newer one's results. */
-let ftsToken = 0;
-
-async function runFtsSearch() {
-  const query = activeQuery.value;
-  const token = ++ftsToken;
-  ftsError.value = null;
-  ftsNotEnabled.value = false;
-  ftsIndexing.value = null;
-  if (!query) {
-    ftsResults.value = [];
-    ftsLoading.value = false;
-    return;
-  }
-  ftsLoading.value = true;
-  try {
-    const outcome = await ftsSearch(query);
-    if (token !== ftsToken) return;
-    if (!outcome.enabled) {
-      ftsNotEnabled.value = true;
-      ftsResults.value = [];
-      return;
-    }
-    const { metadata, indexing_status, results } = outcome.result;
-    ftsIndexing.value = indexing_status;
-
-    const formatsByBook = new Map<number, string[]>();
-    for (const r of results) {
-      const list = formatsByBook.get(r.book_id) ?? [];
-      if (!list.includes(r.format)) list.push(r.format);
-      formatsByBook.set(r.book_id, list);
-    }
-    const bookIds = [...formatsByBook.keys()];
-    const snippetsByBook = await ftsSnippets(bookIds, query);
-    if (token !== ftsToken) return;
-
-    ftsResults.value = bookIds.map((bookId) => ({
-      bookId,
-      title: metadata[String(bookId)]?.title ?? `Book ${bookId}`,
-      authors: metadata[String(bookId)]?.authors ?? "",
-      formats: formatsByBook.get(bookId) ?? [],
-      snippets: snippetsByBook[String(bookId)] ?? [],
-    }));
-  } catch (e) {
-    if (token !== ftsToken) return;
-    ftsError.value = e instanceof Error ? e.message : String(e);
-    ftsResults.value = [];
-  } finally {
-    if (token === ftsToken) ftsLoading.value = false;
-  }
-}
-
-watch([activeQuery, ftsMode], () => {
-  if (ftsMode.value) void runFtsSearch();
-});
-
-async function enableFts() {
-  ftsEnabling.value = true;
-  ftsError.value = null;
-  try {
-    await setFtsEnabled(true);
-    await runFtsSearch();
-  } catch (e) {
-    ftsError.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    ftsEnabling.value = false;
-  }
-}
 
 function snippetSegments(text: string) {
   return parseSnippetSegments(text);
@@ -1186,7 +512,6 @@ function onCategorySelect(categoryQuery: string) {
   queryText.value = categoryQuery;
   activeQuery.value = categoryQuery;
 }
-
 
 /** Bumped to make the category browser (folders and categories) reload. */
 const categoriesRefresh = ref(0);
@@ -1226,168 +551,23 @@ function onDetailsDeleted(bookId: number) {
   void libraryChanged();
 }
 
-// Bulk (multi-book) metadata editing -- sent in chunks of ~200 books to the
-// server's batch route (library/bulkBatch.ts), with per-book error
-// aggregation so one bad book doesn't silently swallow the rest. A server
-// without the route gets the old one-request-per-book fan-out.
-const selectMode = ref(false);
-const selectedIds = ref<Set<number>>(new Set());
-/** What actions act on: the selection, else the open book. */
-const scope = useScope(selectedIds, selectedBookId);
-const bulkOpen = ref(false);
-const bulkBusy = ref(false);
-const bulkErrors = ref<string[]>([]);
-/** "12 of 300" while a bulk edit runs. */
-const bulkProgress = ref<{ done: number; total: number } | null>(null);
-let bulkCancelled = false;
-function cancelBulkEdit() {
-  bulkCancelled = true;
-}
-
-// Bulk edit (#1.6). The previous version reached add-tags,
-// remove-tags, set-series and a rating; `Cache::set_field` accepts
-// authors, publisher, languages, pubdate, comments, series_index and
-// any custom column too -- which is most of what tidying an imported
-// pile of PDFs actually needs.
-//
-// The change computation lives in library/bulkEdit.ts: deciding what
-// to write is where the bugs are, and they are invisible here until
-// the wrong thing has already been written to a hundred books.
-function emptySpec(): BulkEditSpec {
-  return {
-    tags: { mode: "add", value: "" },
-    authors: { mode: "add", value: "" },
-    languages: { mode: "add", value: "" },
-    publisher: "",
-    series: "",
-    seriesIndex: null,
-    rating: null,
-    pubdate: "",
-    comments: "",
-    custom: {},
-    searchReplace: { field: "title", find: "", replace: "", useRegex: false },
-  };
-}
-
-const bulkSpec = ref<BulkEditSpec>(emptySpec());
-const bulkApplyRating = ref(false);
-const bulkRating = ref(0);
-const bulkApplySeriesIndex = ref(false);
-const bulkSeriesIndex = ref(1);
-const bulkSummary = ref<string | null>(null);
-
-/** Custom columns offered in the bulk panel, by their row key. */
-const bulkCustomColumns = computed(() => Object.values(fieldMetadata.value).filter((f) => f.is_custom && f.label));
+// Which books are selected (../library/useSelection.ts) and the bulk edit panel
+// that acts on them (../library/useBulkEdit.ts).
+const { selectMode, selectedIds, scope, selectOne, toggleSelected, rangeSelect, selectAll, onCardClick, onNavigate } = useSelection({ win, selectedBookId, viewMode, tableRef, gridRef });
+const bulk = useBulkEdit({ selectedIds, selectMode, fieldMetadata, win, onChanged: libraryChanged });
 
 function toggleSelectMode() {
   selectMode.value = !selectMode.value;
   if (!selectMode.value) {
     selectedIds.value = new Set();
-    bulkOpen.value = false;
+    bulk.open = false;
   }
-}
-
-/** The row a shift-click range starts from: the last one clicked. */
-let selectAnchor: number | null = null;
-
-/** A plain click: this book alone is selected (and open in the details panel). */
-function selectOne(bookId: number) {
-  if (selectedIds.value.size > 0) selectedIds.value = new Set();
-  selectedBookId.value = bookId;
-  selectAnchor = bookId;
-}
-
-/**
- * Ctrl-click (or a tick in select mode): add the book to the selection, or
- * take it out. Without select mode the open book counts as selected, so
- * Ctrl-clicking a second row gives two, as in a file manager.
- */
-function toggleSelected(bookId: number) {
-  const next = new Set(selectedIds.value);
-  if (!selectMode.value && next.size === 0 && selectedBookId.value !== null) next.add(selectedBookId.value);
-  if (next.has(bookId)) next.delete(bookId);
-  else next.add(bookId);
-  selectedIds.value = next;
-  selectAnchor = bookId;
-  if (!selectMode.value) selectedBookId.value = next.has(bookId) ? bookId : ([...next].pop() ?? null);
-}
-
-/**
- * Shift-click: everything between the anchor and this row, loaded or not.
- * In select mode the range is added to the ticks; otherwise it replaces the
- * selection, as in a file manager.
- */
-function rangeSelect(bookId: number) {
-  const anchor = selectAnchor ?? selectedBookId.value;
-  const from = anchor === null ? -1 : win.indexOf(anchor);
-  const to = win.indexOf(bookId);
-  if (from < 0 || to < 0) {
-    if (selectMode.value) toggleSelected(bookId);
-    else selectOne(bookId);
-    return;
-  }
-  const next = selectMode.value ? new Set(selectedIds.value) : new Set<number>();
-  for (const id of win.idsBetween(from, to)) next.add(id);
-  selectedIds.value = next;
-  selectAnchor = anchor;
-  if (!selectMode.value) selectedBookId.value = bookId;
-}
-
-/** Every matching book, by id: the whole list, not just what is loaded. */
-function selectAll() {
-  selectedIds.value = new Set(win.ids.value);
-}
-
-function onCardClick(bookId: number, event?: MouseEvent) {
-  if (event?.shiftKey) rangeSelect(bookId);
-  else if (selectMode.value || event?.ctrlKey || event?.metaKey) toggleSelected(bookId);
-  else selectOne(bookId);
 }
 
 // Which rows the views are showing: load exactly those (plus overscan).
 function onRange(range: { first: number; last: number }) {
   renderedRange.value = range;
   win.setRange(range.first, range.last);
-}
-
-/** Arrow/page/Home/End on the list: move the selected row and keep it in view. */
-function onNavigate(key: string, extend = false) {
-  const n = win.ids.value.length;
-  if (n === 0) return;
-  const current = selectedBookId.value === null ? -1 : win.indexOf(selectedBookId.value);
-  let next: number | null;
-  if (viewMode.value === "table") {
-    next = navigateIndex(key, current, n, tableRef.value?.pageRows() ?? 10);
-  } else {
-    const { columns, pageRows } = gridRef.value?.layout() ?? { columns: 1, pageRows: 3 };
-    const clampTo = (i: number) => Math.min(n - 1, Math.max(0, i));
-    const from = current < 0 ? 0 : current;
-    if (current < 0 && key !== "Home" && key !== "End") next = 0;
-    else if (key === "ArrowLeft") next = clampTo(from - 1);
-    else if (key === "ArrowRight") next = clampTo(from + 1);
-    else if (key === "ArrowUp") next = clampTo(from - columns);
-    else if (key === "ArrowDown") next = clampTo(from + columns);
-    else if (key === "PageUp") next = clampTo(from - columns * Math.max(1, pageRows - 1));
-    else if (key === "PageDown") next = clampTo(from + columns * Math.max(1, pageRows - 1));
-    else if (key === "Home") next = 0;
-    else if (key === "End") next = n - 1;
-    else next = null;
-  }
-  if (next === null) return;
-  const id = win.idAt(next);
-  if (id === undefined) return;
-  if (extend && !selectMode.value) {
-    // Shift+arrow grows the selection from where the walk started.
-    const anchor = selectAnchor ?? selectedBookId.value ?? id;
-    const from = win.indexOf(anchor);
-    selectedIds.value = new Set(win.idsBetween(from < 0 ? next : from, next));
-    selectAnchor = from < 0 ? id : anchor;
-  } else if (!selectMode.value) {
-    if (selectedIds.value.size > 0) selectedIds.value = new Set();
-    selectAnchor = id;
-  }
-  selectedBookId.value = id;
-  (viewMode.value === "table" ? tableRef.value : gridRef.value)?.scrollToIndex(next);
 }
 
 // In-place edits from the table: applied to the row at once, saved with
@@ -1401,227 +581,25 @@ async function commitEdit(bookId: number, column: BookColumn, raw: string): Prom
   if (result.status === "saved") {
     invalidateFieldValues();
     if (selectedBookId.value === bookId) detailsRefresh.value++;
-    colorChecked.delete(bookId);
-    void applyColoringRules();
+    coloring.forget(bookId);
+    void coloring.apply();
   }
   return result;
 }
 
-async function runBulkEdit() {
-  const ids = [...selectedIds.value];
-  if (ids.length === 0) return;
+// Row colouring rules (../library/useRowColoring.ts).
+const coloring = useRowColoring(win);
+const { rowColors, renderedRange } = coloring;
 
-  const spec: BulkEditSpec = {
-    ...bulkSpec.value,
-    rating: bulkApplyRating.value ? bulkRating.value : null,
-    seriesIndex: bulkApplySeriesIndex.value ? bulkSeriesIndex.value : null,
-  };
-
-  // Validate once, before touching a single book -- a bad regex
-  // found on book 57 of 200 leaves the edit half applied.
-  const problem = validateSpec(spec);
-  if (problem) {
-    bulkErrors.value = [problem];
-    return;
-  }
-  if (isEmptySpec(spec)) {
-    bulkErrors.value = ["Nothing to apply -- fill in at least one field."];
-    return;
-  }
-
-  bulkBusy.value = true;
-  bulkErrors.value = [];
-  bulkSummary.value = null;
-
-  let changed = 0;
-  let skipped = 0;
-  // A selection can reach rows that were never scrolled to (select
-  // all, a long shift-range): fetch the ones that are not loaded.
-  try {
-    await win.ensureLoaded(ids);
-  } catch (e) {
-    bulkErrors.value.push(`Could not read the selected books: ${e instanceof Error ? e.message : String(e)}`);
-  }
-  bulkCancelled = false;
-  // What each book needs is worked out here, per book, before anything is sent.
-  const items: BulkItem[] = [];
-  for (const id of ids) {
-    const current = win.getById(id);
-    if (!current) {
-      bulkErrors.value.push(`Book ${id}: could not be loaded`);
-      continue;
-    }
-    try {
-      const changes = changesFor(current, spec);
-      if (changes) items.push({ id, changes });
-      else skipped += 1;
-    } catch (e) {
-      bulkErrors.value.push(`Book ${id}: ${e instanceof Error ? e.message : String(e)}`);
-    }
-  }
-  bulkProgress.value = { done: 0, total: items.length };
-  const pool = await runBatchedEdit(items, {
-    sendBatch: setFieldsBatch,
-    sendOne: setFields,
-    cancelled: () => bulkCancelled,
-    onProgress: (done, total) => (bulkProgress.value = { done, total }),
-  });
-  changed = pool.updated;
-  bulkErrors.value.push(...pool.errors);
-  bulkBusy.value = false;
-  bulkProgress.value = null;
-  const stopped = pool.notStarted > 0 ? `, stopped with ${pool.notStarted} not started` : "";
-  bulkSummary.value = `Updated ${changed} book(s)${skipped ? `, ${skipped} already matched` : ""}${bulkErrors.value.length ? `, ${bulkErrors.value.length} failed` : ""}${stopped}.`;
-
-  if (bulkErrors.value.length === 0 && pool.notStarted === 0) {
-    bulkOpen.value = false;
-    selectMode.value = false;
-    selectedIds.value = new Set();
-    bulkSpec.value = emptySpec();
-    bulkApplyRating.value = false;
-    bulkApplySeriesIndex.value = false;
-  }
-  await libraryChanged();
-}
-
-// Save to disk (#751) -- real POST /save-to-disk against whatever
-// books are currently selected (falls back to the single currently
-// open book if selection mode isn't active), evaluating a real
-// calibre-template-language `{field}`-shorthand path template per
-// book server-side.
+// Dialogs that act on the books the view acts on: the selection, else the open book.
+const renameScope = scope.ids;
 const saveToDiskOpen = ref(false);
-const saveToDiskTemplate = ref(DEFAULT_SAVE_TO_DISK_TEMPLATE);
-const saveToDiskDest = ref("");
-const saveToDiskBusy = ref(false);
-const saveToDiskResults = ref<SaveToDiskResult[]>([]);
-const saveToDiskError = ref<string | null>(null);
-
-// Every library this server hosts, for the copy-to-library target picker
-// (#959). One entry when the server was started with a single library,
-// which is why the action says so rather than opening an empty list.
-const libraryId = ref("");
-const libraryMap = ref<Record<string, string>>({});
-
-const copyTargets = computed(() => Object.entries(libraryMap.value).filter(([id]) => id !== libraryId.value).map(([id, name]) => ({ id, name })));
-
 const copyOpen = ref(false);
-const copyBusy = ref(false);
-const copyTarget = ref("");
-const copyMove = ref(false);
-const copyResults = ref<string[]>([]);
-const copyDone = ref(false);
-const copyError = ref<string | null>(null);
-
-function openCopyToLibrary() {
-  copyOpen.value = true;
-  copyBusy.value = false;
-  copyDone.value = false;
-  copyResults.value = [];
-  copyError.value = null;
-  copyMove.value = false;
-  copyTarget.value = copyTargets.value[0]?.id ?? "";
-}
-
-async function runCopyToLibrary() {
-  const ids = renameScope.value;
-  if (ids.length === 0 || !copyTarget.value) return;
-  copyBusy.value = true;
-  copyError.value = null;
-  try {
-    const response = await copyToLibrary(copyTarget.value, ids, copyMove.value);
-    // Per book, because one already present in the target is skipped
-    // while its neighbours are copied.
-    copyResults.value = Object.entries(response).map(([bookId, outcome]) => describeCopyOutcome(bookId, outcome));
-    copyDone.value = true;
-    // A move takes books out of this library, so the grid is stale.
-    if (copyMove.value) await runSearch();
-  } catch (e) {
-    copyError.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    copyBusy.value = false;
-  }
-}
-
-// Embed metadata into the book files themselves (#958). The counterpart
-// to "Rename files": that changes the name on disk, this changes the
-// metadata *inside* each file, so a reader app shows the title this
-// library has rather than the one the file shipped with.
 const embedOpen = ref(false);
-const embedBusy = ref(false);
-const embedDone = ref(false);
-const embedCount = ref(0);
-const embedProblems = ref<string[]>([]);
-const embedError = ref<string | null>(null);
+const renameOpen = ref(false);
 
-function openEmbedMetadata() {
-  embedOpen.value = true;
-  embedBusy.value = false;
-  embedDone.value = false;
-  embedCount.value = 0;
-  embedProblems.value = [];
-  embedError.value = null;
-}
-
-/**
- * Deliberately behind a confirm step rather than firing on click: this
- * rewrites the user's actual book files, which is not something to do
- * on a mis-click, and unlike most actions here it cannot be undone.
- */
-async function runEmbedMetadata() {
-  const ids = renameScope.value;
-  if (ids.length === 0) return;
-  embedBusy.value = true;
-  embedError.value = null;
-  embedProblems.value = [];
-  try {
-    const summary = summarizeEmbed(await embedMetadata(ids));
-    embedCount.value = summary.embedded;
-    embedProblems.value = summary.problems;
-    embedDone.value = true;
-    // Each rewritten file has a new size on disk, and `embed_metadata`
-    // updates the `data` row to match, so the sizes in the grid are
-    // stale until this reloads them.
-    await runSearch();
-  } catch (e) {
-    embedError.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    embedBusy.value = false;
-  }
-}
-
-function openSaveToDisk() {
-  saveToDiskOpen.value = true;
-  saveToDiskResults.value = [];
-  saveToDiskError.value = null;
-  // Restored here rather than in `loadLibraryPrefs`, which runs
-  // before this ref exists.
-  void restoreSaveTemplate();
-}
-
-/**
- * Brings back the user's own path template (#4.4).
- *
- * The template was always editable, but reset to the default on every
- * open -- so anyone with their own folder layout retyped it each
- * time, which is exactly the kind of small tax that makes a feature
- * feel unfinished.
- */
-async function restoreSaveTemplate() {
-  try {
-    const prefs = await fetchProfile<LibraryPrefs>(LIBRARY_PREFS_PROFILE);
-    if (prefs?.saveToDiskTemplate) saveToDiskTemplate.value = prefs.saveToDiskTemplate;
-  } catch {
-    // Keep the default; this is a convenience, not a requirement.
-  }
-}
-
-async function persistSaveTemplate() {
-  try {
-    const prefs = (await fetchProfile<LibraryPrefs>(LIBRARY_PREFS_PROFILE)) ?? DEFAULT_LIBRARY_PREFS;
-    await saveProfile(LIBRARY_PREFS_PROFILE, { ...prefs, saveToDiskTemplate: saveToDiskTemplate.value });
-  } catch (e) {
-    console.error("failed to remember the save-to-disk template", e);
-  }
+function openRenameFiles() {
+  if (renameScope.value.length > 0) renameOpen.value = true;
 }
 
 /**
@@ -1639,114 +617,10 @@ async function revealLibraryFolder() {
   }
 }
 
-// Rename files (#885). The title of a book and the name of the file
-// holding it are separate things; this changes only the second.
-//
-// Preview is mandatory rather than optional: a rename cannot be
-// undone, so Apply stays disabled until the names on screen were
-// computed for exactly this template and this selection.
-const renameOpen = ref(false);
-const renameTemplate = ref(DEFAULT_RENAME_TEMPLATE);
-const renameBusy = ref(false);
-const renameResults = ref<RenameFileResult[]>([]);
-const renameApplied = ref(false);
-const renameError = ref<string | null>(null);
-const renamePreviewedFor = ref<RenamePreviewKey | null>(null);
-
-const renameScope = scope.ids;
-const renameCanApply = computed(() => !renameBusy.value && !renameApplied.value && previewIsCurrent(renamePreviewedFor.value, renameTemplate.value, renameScope.value) && renameResults.value.some((r) => r.changed));
-const renameSummary = computed(() => (renameResults.value.length ? describeRename(summarizeRename(renameResults.value), renameApplied.value) : ""));
-
-async function openRenameFiles() {
-  const ids = renameScope.value;
-  if (ids.length === 0) return;
-  renameOpen.value = true;
-  renameResults.value = [];
-  renameApplied.value = false;
-  renameError.value = null;
-  renamePreviewedFor.value = null;
-
-  // Prefilling with the book's current filename needs to know what it
-  // is, and a dry run already reports that in `current` for every
-  // book -- whatever template it was asked about. So the dialog opens
-  // with one, purely to read the current names back; the proposal it
-  // also returns is discarded, and no preview is shown until the user
-  // asks for one.
-  // Busy while the probe is in flight, so a fast typist's name cannot
-  // be overwritten by the prefill arriving late.
-  renameBusy.value = true;
-  try {
-    const { results } = await renameFiles(ids, "{title}", true);
-    const initial = initialRenameTemplate(results.map((r) => r.current));
-    // Several books (no single current name to start from): the library's convention.
-    renameTemplate.value = initial === DEFAULT_RENAME_TEMPLATE ? ((await conventionFileTemplate()) ?? initial) : initial;
-  } catch {
-    renameTemplate.value = DEFAULT_RENAME_TEMPLATE;
-  } finally {
-    renameBusy.value = false;
-  }
-}
-
-async function previewRename() {
-  const ids = renameScope.value;
-  if (ids.length === 0 || !renameTemplate.value.trim()) return;
-  renameBusy.value = true;
-  renameError.value = null;
-  renameApplied.value = false;
-  try {
-    const { results } = await renameFiles(ids, renameTemplate.value, true);
-    renameResults.value = results;
-    renamePreviewedFor.value = { template: renameTemplate.value, bookIds: ids };
-  } catch (e) {
-    renameResults.value = [];
-    renamePreviewedFor.value = null;
-    renameError.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    renameBusy.value = false;
-  }
-}
-
-async function applyRename() {
-  if (!renameCanApply.value) return;
-  renameBusy.value = true;
-  renameError.value = null;
-  try {
-    const { results } = await renameFiles(renameScope.value, renameTemplate.value, false);
-    renameResults.value = results;
-    renameApplied.value = true;
-    // The `fmt_*` paths every row carries have moved.
-    await runSearch();
-  } catch (e) {
-    renameError.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    renameBusy.value = false;
-  }
-}
-
-async function runSaveToDisk() {
-  const ids = scope.ids.value;
-  if (ids.length === 0 || !saveToDiskDest.value.trim()) return;
-  saveToDiskBusy.value = true;
-  saveToDiskError.value = null;
-  saveToDiskResults.value = [];
-  try {
-    const { results } = await saveToDisk(ids, saveToDiskTemplate.value, saveToDiskDest.value.trim());
-    saveToDiskResults.value = results;
-    // Remembered only after a save that worked, so a template being
-    // typed and abandoned does not become the stored one.
-    void persistSaveTemplate();
-  } catch (e) {
-    saveToDiskError.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    saveToDiskBusy.value = false;
-  }
-}
-
 // Find duplicates: the server scans the whole library once (a job, with
 // progress), keeps the result, and the panel pages through it. The state and
 // the rules are in ../library/duplicatesStore.ts and ../library/resolve.ts.
 const duplicatesOpen = ref(false);
-const duplicatesError = ref<string | null>(null);
 const dupStore = createDuplicatesStore();
 const resolveController = createResolveController();
 const resolveOpen = ref(false);
@@ -1802,14 +676,6 @@ function applyNaming(template: string, scope: "selected" | "all") {
   namingOpen.value = false;
   void openOrganize({ template, scope });
 }
-/** The file name template new runs start from (the convention's), or null when it cannot be read. */
-async function conventionFileTemplate(): Promise<string | null> {
-  try {
-    return (await fetchNaming()).file_template;
-  } catch {
-    return null;
-  }
-}
 // Export a copy: a travel copy or a backup mirror to another folder or drive.
 // The scope follows the selection like Organize; nothing in the library changes.
 const mirrorController = createMirrorController();
@@ -1836,16 +702,10 @@ function openRetitle(scope: "all" | "selected") {
 async function onRetitleChanged() {
   await libraryChanged();
 }
-// How many PDFs are not yet fingerprinted, for page-content matching.
-const pdfStatus = computed<PdfScanStatus | undefined>(() => dupStore.state.pdf);
-// Zero-byte files: not duplicates of each other, listed separately.
-const emptyFiles = computed<EmptyFile[]>(() => dupStore.state.emptyFiles);
-const pdfAction = computed(() => fingerprintAction(pdfStatus.value));
 
 // Opens the panel on the server's last scan, or scans if there is none.
 async function openDuplicates() {
   duplicatesOpen.value = true;
-  duplicatesError.value = null;
   await dupStore.open();
 }
 
@@ -1860,112 +720,16 @@ async function onDuplicatesChanged() {
   await libraryChanged();
 }
 
-
-// Identical-file detection compares content hashes, and a library opened
-// from real calibre has none. This reads every book file once to record
-// one -- a long job on a big library, so it shows progress, can be
-// cancelled, and picks up where it stopped when run again.
-const prepareBusy = ref(false);
-const prepareProgress = ref<string | null>(null);
-const prepareSummary = ref<string | null>(null);
-const prepareJobId = ref<number | null>(null);
-
-async function prepareForDuplicates() {
-  prepareBusy.value = true;
-  prepareSummary.value = null;
-  prepareProgress.value = null;
-  try {
-    // One job: scan, hash, PDF fingerprints, duplicate scan. Its stage
-    // is kept on the server, so running it again resumes where it stopped.
-    let cancelled = false;
-    const result = await prepareLibrary({
-      onStart: (id) => (prepareJobId.value = id),
-      onProgress: (job) => {
-        prepareProgress.value = describePrepareProgress(job.progress);
-        cancelled = job.progress.cancelled;
-      },
-    });
-    prepareSummary.value = describePrepareResult(result, cancelled);
-    // The chain's last stage already scanned for duplicates; load the groups.
-    await dupStore.scan();
-  } catch (e) {
-    duplicatesError.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    prepareBusy.value = false;
-    prepareProgress.value = null;
-    prepareJobId.value = null;
-  }
-}
-
-async function cancelPrepare() {
-  if (prepareJobId.value === null) return;
-  try {
-    await cancelLibraryJob(prepareJobId.value);
-  } catch (e) {
-    duplicatesError.value = e instanceof Error ? e.message : String(e);
-  }
-}
-
-// Scan-vs-OCR and optimizer re-saves are found from the pages themselves,
-// which means rendering a few pages of every PDF once. A long job on a big
-// library, so: progress, Cancel, and it resumes where it stopped.
-const fingerprintBusy = ref(false);
-const fingerprintProgress = ref<string | null>(null);
-const fingerprintSummary = ref<string | null>(null);
-const fingerprintJobId = ref<number | null>(null);
-
-async function runFingerprint() {
-  fingerprintBusy.value = true;
-  fingerprintSummary.value = null;
-  fingerprintProgress.value = null;
-  try {
-    const result = await fingerprintPdfs({
-      onStart: (id) => (fingerprintJobId.value = id),
-      onProgress: (job) => (fingerprintProgress.value = describeJobProgress(job.progress)),
-    });
-    const parts: string[] = [];
-    if (result.cancelled) parts.push("stopped early — run it again to continue");
-    parts.push(`${result.fingerprinted.toLocaleString("en-US")} of ${result.total.toLocaleString("en-US")} PDFs analysed`);
-    if (result.failed_count > 0) parts.push(`${result.failed_count} could not be read (encrypted or damaged)`);
-    if (result.missing_count > 0) parts.push(`${result.missing_count} listed but not found on disk`);
-    fingerprintSummary.value = parts.join(" · ");
-    await dupStore.scan();
-  } catch (e) {
-    duplicatesError.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    fingerprintBusy.value = false;
-    fingerprintProgress.value = null;
-    fingerprintJobId.value = null;
-  }
-}
-
-async function cancelFingerprint() {
-  if (fingerprintJobId.value === null) return;
-  try {
-    await cancelLibraryJob(fingerprintJobId.value);
-  } catch (e) {
-    duplicatesError.value = e instanceof Error ? e.message : String(e);
-  }
-}
-
 // ---------------------------------------------------------------
 // Merge books: from a duplicate group ("Merge into…") or from a
-// selection of two or more books (the "merge-books" action).
-// The engine is crates/lexmechanic_db/src/merge.rs; this is the review
-// step. Nothing changes until the user has seen a dry run and
-// confirms it.
+// selection of two or more books (the "merge-books" action). The dialog is
+// ../components/dialogs/MergeBooksDialog.vue; this is what it is opened with
+// and what happens once it has merged.
 // ---------------------------------------------------------------
 const mergeOpen = ref(false);
 const mergeBooksList = ref<DuplicateBook[]>([]);
 const mergeDest = ref<number | null>(null);
-const mergeMode = ref<MergeMode>("merge_and_delete");
-const mergeKeepDuplicates = ref(false);
-const mergePreview = ref<MergeResponse | null>(null);
-const mergeBusy = ref(false);
-const mergeError = ref<string | null>(null);
 const mergeDone = ref<string | null>(null);
-const mergeModes = Object.keys(MERGE_MODE_LABELS) as MergeMode[];
-const mergePreviewLines = computed(() => (mergePreview.value ? summarizeMerge(mergePreview.value) : []));
 
 // The duplicate group a merge was opened from, so it can leave the list afterwards.
 const mergeGroupId = ref<string | null>(null);
@@ -1974,10 +738,6 @@ function openMerge(books: DuplicateBook[], dest: number | null, groupId: string 
   mergeGroupId.value = groupId;
   mergeBooksList.value = books;
   mergeDest.value = dest;
-  mergeMode.value = "merge_and_delete";
-  mergeKeepDuplicates.value = false;
-  mergePreview.value = null;
-  mergeError.value = null;
   mergeDone.value = null;
   mergeOpen.value = true;
 }
@@ -1997,44 +757,15 @@ async function openMergeForSelection() {
   );
 }
 
-// Any change to what will be merged invalidates the preview the user saw.
-watch([mergeDest, mergeMode, mergeKeepDuplicates], () => {
-  mergePreview.value = null;
-});
-
-async function reviewMerge() {
-  if (mergeDest.value === null) return;
-  mergeBusy.value = true;
-  mergeError.value = null;
-  try {
-    mergePreview.value = await mergeBooks({ dest: mergeDest.value, sources: mergeBooksList.value.map((b) => b.book_id).filter((id) => id !== mergeDest.value), mode: mergeMode.value, keep_duplicate_formats: mergeKeepDuplicates.value, dry_run: true });
-  } catch (e) {
-    mergeError.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    mergeBusy.value = false;
-  }
-}
-
-async function confirmMerge() {
-  if (mergeDest.value === null || !mergePreview.value) return;
-  mergeBusy.value = true;
-  mergeError.value = null;
-  try {
-    const result = await mergeBooks({ dest: mergeDest.value, sources: mergeBooksList.value.map((b) => b.book_id).filter((id) => id !== mergeDest.value), mode: mergeMode.value, keep_duplicate_formats: mergeKeepDuplicates.value });
-    mergeDone.value = describeMergeResult(result);
-    mergePreview.value = null;
-    mergeOpen.value = false;
-    selectedIds.value = new Set();
-    await libraryChanged();
-    // The merged group leaves the list (and the server's copy of the scan) at
-    // once; the rest of the page stays where it was.
-    if (duplicatesOpen.value && mergeGroupId.value) await dupStore.resolved([mergeGroupId.value]);
-    mergeGroupId.value = null;
-  } catch (e) {
-    mergeError.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    mergeBusy.value = false;
-  }
+async function onMerged(description: string) {
+  mergeDone.value = description;
+  mergeOpen.value = false;
+  selectedIds.value = new Set();
+  await libraryChanged();
+  // The merged group leaves the list (and the server's copy of the scan) at
+  // once; the rest of the page stays where it was.
+  if (duplicatesOpen.value && mergeGroupId.value) await dupStore.resolved([mergeGroupId.value]);
+  mergeGroupId.value = null;
 }
 
 const addSummary = ref<string | null>(null);
@@ -2113,78 +844,17 @@ async function onImported() {
   void loadLibraryInfo();
 }
 
-// The library, as a folder somebody filled: opening it does not scan it, and on
-// a share a scan is long, so ask first. `untracked` is a walk with no reads.
-const untracked = ref<UntrackedCount | null>(null);
-const scanPromptDismissed = ref(false);
-const promptScanBusy = ref(false);
-const promptScanProgress = ref<string | null>(null);
-const promptScanJobId = ref<number | null>(null);
-const promptScanSummary = ref<string | null>(null);
-const promptScanError = ref<string | null>(null);
-
-function readDismissed(path: string): boolean {
-  try {
-    return sessionStorage.getItem(dismissKey(path)) === "1";
-  } catch {
-    return false;
-  }
-}
-
-async function checkUntracked() {
-  try {
-    const found = await fetchUntracked();
-    scanPromptDismissed.value = readDismissed(libraryPath.value);
-    untracked.value = found;
-  } catch {
-    // A prompt is a courtesy; the library works without it.
-  }
-}
-
-function dismissScanPrompt() {
-  scanPromptDismissed.value = true;
-  try {
-    sessionStorage.setItem(dismissKey(libraryPath.value), "1");
-  } catch {
-    // Remembered for this page only.
-  }
-}
-
-function closeScanResult() {
-  promptScanSummary.value = null;
-  promptScanError.value = null;
-  dismissScanPrompt();
-}
-
-async function scanFromPrompt() {
-  promptScanBusy.value = true;
-  promptScanError.value = null;
-  promptScanSummary.value = null;
-  try {
-    const result = await scanLibrary({
-      onStart: (id) => (promptScanJobId.value = id),
-      onProgress: (job) => (promptScanProgress.value = describeJobProgress(job.progress)),
-    });
-    promptScanSummary.value = describeScanOutcome(result);
-    await libraryChanged();
-    await checkUntracked();
-  } catch (e) {
-    promptScanError.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    promptScanBusy.value = false;
-    promptScanProgress.value = null;
-    promptScanJobId.value = null;
-  }
-}
-
-async function stopPromptScan() {
-  if (promptScanJobId.value === null) return;
-  try {
-    await cancelLibraryJob(promptScanJobId.value);
-  } catch (e) {
-    promptScanError.value = e instanceof Error ? e.message : String(e);
-  }
-}
+// What the library says about itself, and the banners and prompts that hang off
+// it (../library/useLibraryInfo.ts).
+const {
+  libraryName, libraryPath, copyTargets, banner, bannerDismissed,
+  changeLogWarning, changeLogRepairBusy, changeLogRepairError, refreshChangeLogStatus, repairChangeLogNow,
+  loadLibraryInfo,
+  untracked, scanPromptDismissed, promptScanBusy, promptScanProgress, promptScanSummary, promptScanError, scanFromPrompt, stopPromptScan, dismissScanPrompt, closeScanResult,
+  interruptedJob, resumeBusy, resumeProgress, resumeError, loadInterruptedJob, resumeInterrupted,
+  newLibraryOpen, newLibraryName, newLibraryError, creatingLibrary, openNewLibrary, createLibrary,
+  switchOpen, recentLibraries, switching, switchError, loadRecentLibraries, openSwitchLibrary, switchToRecent, switchToOther,
+} = useLibraryInfo({ libraryChanged: () => libraryChanged() });
 
 const trashOpen = ref(false);
 
@@ -2212,175 +882,6 @@ function onBooksDropped(event: Event) {
   void libraryChanged();
 }
 
-// Registered in onMounted and removed in onBeforeUnmount (see below): a
-// listener added at setup time would pile up one more copy on every remount.
-
-// Switch-library quick-switch (issue #725, desktop-only). This app
-// stays single-library-per-instance -- "switching" re-spawns
-// lexmechanic_srv against a different path and re-navigates the window
-// (app/src-tauri/src/lib.rs's open_library/open_recent_library), it
-// doesn't serve multiple libraries at once. The list is capped/
-// deduplicated server-side (app/src-tauri/src/settings.rs).
-const libraryName = ref("");
-const libraryPath = ref("");
-const storage = ref<StorageInfo | null>(null);
-const banner = computed(() => storageBanner(storage.value));
-const bannerDismissed = ref(false);
-
-// The change log fell behind the database (an append failed): say so, and
-// offer the repair that makes the log whole again. Checked when the library
-// opens and after anything that changes it (see `libraryChanged`).
-const changeLogStatus = ref<ChangeLogStatus | null>(null);
-const changeLogWarning = computed(() => changeLogBanner(changeLogStatus.value));
-const changeLogRepairBusy = ref(false);
-const changeLogRepairError = ref<string | null>(null);
-
-async function refreshChangeLogStatus() {
-  try {
-    changeLogStatus.value = await fetchChangeLogStatus();
-  } catch {
-    // An older server has no such route, or it is unreachable: no warning.
-  }
-}
-
-async function repairChangeLogNow() {
-  changeLogRepairBusy.value = true;
-  changeLogRepairError.value = null;
-  try {
-    changeLogStatus.value = await repairChangeLog();
-  } catch (e) {
-    changeLogRepairError.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    changeLogRepairBusy.value = false;
-  }
-}
-
-async function loadLibraryInfo() {
-  void refreshChangeLogStatus();
-  try {
-    const info = await fetchLibraryInfo();
-    storage.value = info.storage;
-    libraryName.value = info.name;
-    libraryPath.value = info.path;
-    libraryId.value = info.id;
-    libraryMap.value = info.libraries;
-    void checkUntracked();
-  } catch {
-    // Not worth surfacing: the status bar simply omits the label, and
-    // every other part of the window works without it.
-  }
-}
-
-const newLibraryOpen = ref(false);
-const newLibraryName = ref("");
-const newLibraryError = ref<string | null>(null);
-const creatingLibrary = ref(false);
-
-function openNewLibrary() {
-  newLibraryName.value = "";
-  newLibraryError.value = null;
-  newLibraryOpen.value = true;
-}
-
-/**
- * Creates a library and opens it.
- *
- * The name is collected here and the *parent* folder in the native
- * dialog that follows, rather than asking for one folder: "where shall
- * I put it" and "what is it called" are different questions, and
- * merging them is how a library ends up created at the root of
- * someone's documents folder.
- */
-async function createLibrary() {
-  const name = newLibraryName.value.trim();
-  if (!name) {
-    newLibraryError.value = "Give the library a name.";
-    return;
-  }
-  if (!(await confirmSwitchOverRunningJob())) return;
-  creatingLibrary.value = true;
-  newLibraryError.value = null;
-  try {
-    const created = await tauriInvoke<string | null>("create_library", { name });
-    // `null` means the folder dialog was cancelled, which is not an
-    // error -- leave the prompt open so the name typed is not lost.
-    if (created) newLibraryOpen.value = false;
-  } catch (e) {
-    newLibraryError.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    creatingLibrary.value = false;
-  }
-}
-
-const switchOpen = ref(false);
-const recentLibraries = ref<string[]>([]);
-const switching = ref(false);
-const switchError = ref<string | null>(null);
-
-/**
- * Refreshes the recents list.
- *
- * Failure is swallowed: recents are a convenience, and the dialog and
- * menu both still offer the two real routes without them. A browser
- * tab has no such command at all, which is the common case rather than
- * an error.
- */
-async function loadRecentLibraries() {
-  try {
-    recentLibraries.value = await tauriInvoke<string[]>("list_recent_libraries");
-  } catch {
-    recentLibraries.value = [];
-  }
-}
-
-async function openSwitchLibrary() {
-  switchError.value = null;
-  switchOpen.value = true;
-  await loadRecentLibraries();
-}
-
-/**
- * Replacing the library's server kills whatever job it is running, so ask
- * first. A failed check (an older server, a network blip) does not block
- * the switch: the user asked for it.
- */
-async function confirmSwitchOverRunningJob(): Promise<boolean> {
-  try {
-    const warning = switchWarning(await runningLibraryJob());
-    return warning === null || (await confirmDialog(warning, { title: "Switch library", confirmLabel: "Switch" }));
-  } catch {
-    return true;
-  }
-}
-
-async function switchToRecent(path: string) {
-  if (!(await confirmSwitchOverRunningJob())) return;
-  switching.value = true;
-  switchError.value = null;
-  try {
-    await tauriInvoke<void>("open_recent_library", { path });
-    switchOpen.value = false;
-  } catch (e) {
-    switchError.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    switching.value = false;
-  }
-}
-
-async function switchToOther() {
-  if (!(await confirmSwitchOverRunningJob())) return;
-  switching.value = true;
-  switchError.value = null;
-  try {
-    const picked = await tauriInvoke<boolean>("choose_library");
-    if (picked) switchOpen.value = false;
-  } catch (e) {
-    switchError.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    switching.value = false;
-  }
-}
-
 // ---------------------------------------------------------------
 // Action registry wiring (#817)
 // ---------------------------------------------------------------
@@ -2398,9 +899,15 @@ async function switchToOther() {
 const PANEL_ACTIONS: LibraryActionId[] = ["read", "edit-metadata", "fetch-metadata", "convert", "tweak-book", "quick-view", "test-template", "send-email", "replace-cover", "cover-from-pdf", "open-externally", "open-book-folder", "unpack-book", "repack-book"];
 
 const actionHandlers: Partial<Record<LibraryActionId, () => void>> = {
-  "manage-lists": () => openManage(),
-  "custom-columns": () => openColumns(),
-  "check-library": () => openCheckLibrary(),
+  "manage-lists": () => {
+    manageOpen.value = true;
+  },
+  "custom-columns": () => {
+    columnsOpen.value = true;
+  },
+  "check-library": () => {
+    checkLibraryOpen.value = true;
+  },
   "find-duplicates": () => openDuplicates(),
   "resolve-duplicates": () => void openResolveDuplicates(),
   "organize-files": () => void openOrganize(),
@@ -2426,7 +933,9 @@ const actionHandlers: Partial<Record<LibraryActionId, () => void>> = {
   "clear-marks": () => clearMarks(),
   "export-catalog": () => exportCatalog(),
   "export-library-archive": () => exportLibraryArchive(),
-  "fetch-news": () => openNews(),
+  "fetch-news": () => {
+    newsOpen.value = true;
+  },
   "add-books": () => addInput.value?.click(),
   "add-folder": () => addFolder(),
   trash: () => {
@@ -2436,14 +945,20 @@ const actionHandlers: Partial<Record<LibraryActionId, () => void>> = {
   "new-library": () => openNewLibrary(),
   "select-mode": () => toggleSelectMode(),
   "bulk-edit": () => {
-    bulkOpen.value = true;
+    bulk.open = true;
   },
   "merge-books": () => void openMergeForSelection(),
   "compare-duplicates": () => openCompareForSelection(),
-  "save-to-disk": () => openSaveToDisk(),
+  "save-to-disk": () => {
+    saveToDiskOpen.value = true;
+  },
   "rename-files": () => void openRenameFiles(),
-  "embed-metadata": () => openEmbedMetadata(),
-  "copy-to-library": () => openCopyToLibrary(),
+  "embed-metadata": () => {
+    embedOpen.value = true;
+  },
+  "copy-to-library": () => {
+    copyOpen.value = true;
+  },
   "open-library-folder": () => void revealLibraryFolder(),
   // Book-scoped: the details panel performs these (it owns the controls),
   // so the toolbar and the keyboard reach it the way the context menu does.
@@ -2695,8 +1210,6 @@ function menuEntriesFor(entries: ToolbarEntry[]) {
   return out;
 }
 
-
-
 /**
  * The open toolbar dropdown, if any.
  *
@@ -2740,6 +1253,30 @@ function runAction(id: LibraryActionId) {
   handler();
 }
 
+// Keyboard shortcuts, the native menu and dropped books: window listeners that
+// live only while the view is shown (../library/useLibraryKeyboard.ts).
+const searchInput = ref<HTMLInputElement | null>(null);
+const keyboard = useLibraryKeyboard({
+  runAction,
+  deleteSelectedBooks: () => void deleteSelectedBooks(),
+  focusSearch: () => {
+    searchInput.value?.focus();
+    searchInput.value?.select();
+  },
+  toggleView: () => setViewMode(viewMode.value === "table" ? "grid" : "table"),
+  contextMenuOpen: () => contextMenu.value !== null,
+  onBooksDropped,
+  resumed(stale) {
+    void syncDesktopMenu(Object.keys(actionHandlers) as LibraryActionId[], actionContext.value);
+    if (stale) void libraryChanged();
+  },
+});
+const { keymap } = keyboard;
+onMounted(() => {
+  void loadLibraryInfo();
+  void loadInterruptedJob();
+});
+
 // Keep the desktop app's native menu in step with what this view can
 // currently do. Re-sent whenever enablement could have changed; a
 // no-op in a plain browser tab.
@@ -2747,8 +1284,6 @@ function runAction(id: LibraryActionId) {
 // selection changes on every arrow-key step, but the spec (what is
 // enabled) only rarely does, and each send is an IPC round trip that
 // rebuilds the native menu.
-/** False while the route is elsewhere and this view is parked by <keep-alive>. */
-let viewActive = true;
 const menuSpecKey = computed(() => {
   void ftsMode.value;
   void toolbarPrefs.value;
@@ -2758,13 +1293,11 @@ watch(
   menuSpecKey,
   () => {
     // A view kept alive behind the reader must not rewrite the native menu.
-    if (!viewActive) return;
+    if (!keyboard.isViewActive()) return;
     void syncDesktopMenu(Object.keys(actionHandlers) as LibraryActionId[], actionContext.value);
   },
   { immediate: true },
 );
-
-let unsubscribeMenuAction: (() => void) | null = null;
 
 // ---------------------------------------------------------------
 // Right-click menu (#1.2)
@@ -2841,154 +1374,6 @@ function onContextChoose(id: LibraryActionId) {
   // Everything else belongs to the details panel.
   actionNonce += 1;
   pendingBookAction.value = { id, nonce: actionNonce };
-}
-
-// ---------------------------------------------------------------
-// Keyboard shortcuts (#1.3)
-// ---------------------------------------------------------------
-//
-// The third surface over the registry. Until now the keymap held two
-// bindings, both reader-only, and this view had no keydown handler at
-// all -- so the shortcuts settings panel configured almost nothing.
-//
-// The decision of whether a key press should fire lives in
-// library/shortcuts.ts, because the part worth getting right is when
-// *not* to act: a bare "a" must not steal the letter you are typing
-// into the search box.
-
-const keymap = ref<KeymapPrefs>({ ...DEFAULT_KEYMAP });
-
-async function loadKeymap() {
-  try {
-    const prefs = await fetchProfile<KeymapPrefs>(KEYMAP_PROFILE);
-    if (prefs) keymap.value = { ...DEFAULT_KEYMAP, ...prefs };
-  } catch (e) {
-    console.error("failed to load keyboard shortcuts", e);
-  }
-}
-void loadKeymap();
-
-const searchInput = ref<HTMLInputElement | null>(null);
-
-function onLibraryKeydown(event: KeyboardEvent) {
-  // A modal owns the keyboard while it is open -- firing library
-  // shortcuts underneath one would act on a view the user cannot
-  // currently see.
-  // Asked of the document, not a list of open flags: every dialog marks
-  // itself aria-modal, so a new one cannot be forgotten here.
-  if (contextMenu.value || isModalOpen()) return;
-
-  const id = shortcutFor(event, libraryShortcuts(keymap.value));
-  if (!id) return;
-
-  event.preventDefault();
-  if (id === "focus-search") {
-    searchInput.value?.focus();
-    searchInput.value?.select();
-    return;
-  }
-  if (id === "toggle-view") {
-    setViewMode(viewMode.value === "table" ? "grid" : "table");
-    return;
-  }
-  if (id === "delete-book") {
-    void deleteSelectedBooks();
-    return;
-  }
-  runAction(id);
-}
-
-/**
- * Unsaved metadata drafts live in a module-level store, so collapsing the
- * panel or opening the reader loses nothing; closing or reloading the window
- * does, so that asks first.
- */
-function onBeforeUnload(event: BeforeUnloadEvent) {
-  if (draftCount.value === 0) return;
-  event.preventDefault();
-  event.returnValue = "";
-}
-
-/**
- * The window listeners that act on the library: shortcuts, native-menu
- * clicks and dropped books. Live only while the view is shown. (The
- * beforeunload guard for unsaved drafts stays for as long as the view exists,
- * because closing the window must still ask.)
- */
-function attachLiveListeners() {
-  if (unsubscribeMenuAction !== null) return;
-  window.addEventListener("keydown", onLibraryKeydown);
-  window.addEventListener("lexmechanic:books-added", onBooksDropped);
-  unsubscribeMenuAction = onMenuAction(runAction);
-}
-
-function detachLiveListeners() {
-  window.removeEventListener("keydown", onLibraryKeydown);
-  window.removeEventListener("lexmechanic:books-added", onBooksDropped);
-  unsubscribeMenuAction?.();
-  unsubscribeMenuAction = null;
-}
-
-let leftAt: { epoch: number; at: number } | null = null;
-
-onMounted(() => {
-  window.addEventListener("beforeunload", onBeforeUnload);
-  attachLiveListeners();
-  void loadLibraryInfo();
-  void loadInterruptedJob();
-});
-// <keep-alive> keeps this view (query, scroll, selection, details panel) when
-// the route goes to the reader or settings; it is only parked, not unmounted.
-onDeactivated(() => {
-  viewActive = false;
-  detachLiveListeners();
-  leftAt = { epoch: libraryEpoch(), at: Date.now() };
-});
-onActivated(() => {
-  viewActive = true;
-  attachLiveListeners();
-  const left = leftAt;
-  leftAt = null;
-  if (left === null) return; // the first activation, right after mounting
-  void syncDesktopMenu(Object.keys(actionHandlers) as LibraryActionId[], actionContext.value);
-  if (needsRefresh(left.epoch, left.at)) void libraryChanged();
-});
-onBeforeUnmount(() => {
-  window.removeEventListener("beforeunload", onBeforeUnload);
-  detachLiveListeners();
-});
-
-// A job the previous server process was running when it ended (a crash, or
-// switching library) comes back from `.lexmechanic/jobs.json` as
-// `interrupted`; the resumable kinds offer to continue.
-const interruptedJob = ref<LibraryJob | null>(null);
-const resumeBusy = ref(false);
-const resumeProgress = ref<string | null>(null);
-const resumeError = ref<string | null>(null);
-
-async function loadInterruptedJob() {
-  try {
-    interruptedJob.value = resumableJob(await fetchLibraryJobs());
-  } catch {
-    // An older server has no such route; there is nothing to offer.
-  }
-}
-
-async function resumeInterrupted() {
-  const job = interruptedJob.value;
-  if (!job) return;
-  resumeBusy.value = true;
-  resumeError.value = null;
-  try {
-    await resumeLibraryJob(job, { onProgress: (j) => (resumeProgress.value = describeJobProgress(j.progress)) });
-    interruptedJob.value = null;
-    await loadLibraryInfo();
-  } catch (e) {
-    resumeError.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    resumeBusy.value = false;
-    resumeProgress.value = null;
-  }
 }
 
 // Author/tag mapping (#1.7). The engines -- metadata::author_mapper
@@ -3125,84 +1510,6 @@ async function onPolished() {
 // In-app help (#1.17), generated from the registry and the live
 // keymap so it cannot go stale.
 const helpOpen = ref(false);
-
-// ---------------------------------------------------------------
-// Row colouring rules (#4.1)
-// ---------------------------------------------------------------
-//
-// A rule is a template evaluated per book; a usable colour in the
-// result colours that row. Evaluation goes through the bulk route --
-// one request for the whole page rather than one per row.
-//
-// What a template returns is checked against an allowlist before it
-// reaches a `style` attribute (library/coloringRules.ts): a template
-// is user-authored text and can return anything.
-
-const coloringRules = ref<ColoringRule[]>([]);
-// A reactive Map, changed key by key: a chunk of rows arriving used to copy
-// the whole record (every coloured row of a 50,000-book list) to add a few.
-const rowColors = shallowReactive(new Map<number, string>());
-
-async function loadColoringRules() {
-  try {
-    const prefs = await fetchProfile<ColoringRulesPrefs>(COLORING_RULES_PROFILE);
-    coloringRules.value = prefs?.rules ?? DEFAULT_COLORING_RULES.rules;
-  } catch (e) {
-    console.error("failed to load colouring rules", e);
-  }
-}
-void loadColoringRules();
-
-/** Rows currently rendered (visible plus overscan), as reported by the table/grid. */
-const renderedRange = ref({ first: 0, last: 0 });
-/** Ids already evaluated against the current rules, so scrolling does not re-ask. */
-const colorChecked = new Set<number>();
-let colorGeneration = 0;
-
-async function applyColoringRules() {
-  const rules = activeRules(coloringRules.value);
-  if (rules.length === 0) {
-    rowColors.clear();
-    colorChecked.clear();
-    return;
-  }
-  // Only the rows on screen that have loaded and have not been coloured yet.
-  const { first, last } = renderedRange.value;
-  const ids = win.ids.value.slice(first, last).filter((id) => win.cache.has(id) && !colorChecked.has(id));
-  if (ids.length === 0) return;
-  const generation = colorGeneration;
-  for (const id of ids) colorChecked.add(id);
-  try {
-    // One request per rule, not per book: a rule is the same template
-    // for every row, and the server parses it once.
-    const perRule = await Promise.all(rules.map((r) => evaluateTemplateBulk(r.template, ids)));
-    if (generation !== colorGeneration) return;
-    for (const id of ids) {
-      const color = colorForBook(rules, perRule.map((results) => results[String(id)]));
-      if (color) rowColors.set(id, color);
-      else rowColors.delete(id);
-    }
-  } catch (e) {
-    // Colouring is decoration; a failure must not take down the list.
-    console.error("failed to apply colouring rules", e);
-    for (const id of ids) colorChecked.delete(id);
-  }
-}
-
-// Re-run whenever rows load, the visible set moves, or the rules change.
-watch([win.version, renderedRange], () => void applyColoringRules());
-// A new query: colours belong to the old rows.
-watch(win.resetCount, () => {
-  colorGeneration++;
-  colorChecked.clear();
-  rowColors.clear();
-});
-watch(coloringRules, () => {
-  colorGeneration++;
-  colorChecked.clear();
-  rowColors.clear();
-  void applyColoringRules();
-}, { deep: true });
 </script>
 
 <template>
@@ -3371,90 +1678,7 @@ watch(coloringRules, () => {
       <button v-if="!resumeBusy" type="button" @click="interruptedJob = null">Dismiss</button>
     </div>
 
-    <div v-if="bulkOpen" class="bulk-panel">
-      <div class="bulk-grid">
-        <label class="bulk-field">
-          <span>Tags</span>
-          <div class="bulk-combo">
-            <select v-model="bulkSpec.tags!.mode" :disabled="bulkBusy">
-              <option value="add">Add</option>
-              <option value="remove">Remove</option>
-              <option value="replace">Replace with</option>
-            </select>
-            <AutocompleteInput v-model="bulkSpec.tags!.value" field="tags" separator="," placeholder="scifi, classic" :disabled="bulkBusy" />
-          </div>
-        </label>
-
-        <label class="bulk-field">
-          <span>Authors</span>
-          <div class="bulk-combo">
-            <select v-model="bulkSpec.authors!.mode" :disabled="bulkBusy">
-              <option value="add">Add</option>
-              <option value="remove">Remove</option>
-              <option value="replace">Replace with</option>
-            </select>
-            <AutocompleteInput v-model="bulkSpec.authors!.value" field="authors" separator="," placeholder="Ann Lee, Bo Fox" :disabled="bulkBusy" />
-          </div>
-        </label>
-
-        <label class="bulk-field">
-          <span>Languages</span>
-          <div class="bulk-combo">
-            <select v-model="bulkSpec.languages!.mode" :disabled="bulkBusy">
-              <option value="add">Add</option>
-              <option value="remove">Remove</option>
-              <option value="replace">Replace with</option>
-            </select>
-            <input v-model="bulkSpec.languages!.value" placeholder="eng, fra" :disabled="bulkBusy" />
-          </div>
-        </label>
-
-        <label class="bulk-field"><span>Publisher</span><AutocompleteInput :model-value="bulkSpec.publisher ?? ''" @update:model-value="bulkSpec.publisher = $event" field="publisher" :disabled="bulkBusy" /></label>
-        <label class="bulk-field"><span>Series</span><AutocompleteInput :model-value="bulkSpec.series ?? ''" @update:model-value="bulkSpec.series = $event" field="series" :disabled="bulkBusy" /></label>
-        <label class="bulk-field"><span>Published</span><input v-model="bulkSpec.pubdate" type="date" :disabled="bulkBusy" /></label>
-        <label class="bulk-field"><span>Comments</span><input v-model="bulkSpec.comments" :disabled="bulkBusy" /></label>
-
-        <label class="bulk-field bulk-optional">
-          <span><input type="checkbox" v-model="bulkApplySeriesIndex" :disabled="bulkBusy" /> Series index</span>
-          <input type="number" v-model.number="bulkSeriesIndex" step="1" :disabled="bulkBusy || !bulkApplySeriesIndex" />
-        </label>
-
-        <label class="bulk-field bulk-optional">
-          <span><input type="checkbox" v-model="bulkApplyRating" :disabled="bulkBusy" /> Rating</span>
-          <input type="number" v-model.number="bulkRating" min="0" max="5" step="1" :disabled="bulkBusy || !bulkApplyRating" />
-        </label>
-
-        <label v-for="column in bulkCustomColumns" :key="column.label" class="bulk-field">
-          <span>{{ column.name || column.label }}</span>
-          <AutocompleteInput v-if="completionForCustom(column)" :model-value="bulkSpec.custom![column.label] ?? ''" :field="column.key" :separator="completionForCustom(column)!.separator" :disabled="bulkBusy" @update:model-value="bulkSpec.custom![column.label] = $event" />
-          <input v-else :value="bulkSpec.custom![column.label] ?? ''" :disabled="bulkBusy" @input="bulkSpec.custom![column.label] = ($event.target as HTMLInputElement).value" />
-        </label>
-      </div>
-
-      <fieldset class="bulk-replace">
-        <legend>Search and replace</legend>
-        <div class="bulk-combo">
-          <select v-model="bulkSpec.searchReplace!.field" :disabled="bulkBusy">
-            <option v-for="f in REPLACEABLE_FIELDS" :key="f" :value="f">{{ f }}</option>
-          </select>
-          <input v-model="bulkSpec.searchReplace!.find" placeholder="find…" :disabled="bulkBusy" />
-          <input v-model="bulkSpec.searchReplace!.replace" placeholder="replace with…" :disabled="bulkBusy" />
-          <label class="bulk-regex"><input type="checkbox" v-model="bulkSpec.searchReplace!.useRegex" :disabled="bulkBusy" /> Regex</label>
-        </div>
-      </fieldset>
-
-      <div class="bulk-actions">
-        <button type="button" class="primary" :disabled="bulkBusy" @click="runBulkEdit">
-          {{ bulkProgress ? `Applying… ${bulkProgress.done.toLocaleString("en-US")} of ${bulkProgress.total.toLocaleString("en-US")}` : bulkBusy ? "Applying…" : `Apply to ${selectedIds.size} book(s)` }}
-        </button>
-        <button v-if="bulkBusy" type="button" data-testid="bulk-cancel" @click="cancelBulkEdit">Cancel</button>
-        <button type="button" :disabled="bulkBusy" @click="bulkOpen = false">Close</button>
-      </div>
-      <p v-if="bulkSummary" class="status">{{ bulkSummary }}</p>
-      <ul v-if="bulkErrors.length" class="bulk-errors">
-        <li v-for="(err, i) in bulkErrors" :key="i" class="error">{{ err }}</li>
-      </ul>
-    </div>
+    <BulkEditPanel v-if="bulk.open" :bulk="bulk" :count="selectedIds.size" />
 
     <p v-if="addError" class="error add-error">{{ addError }}</p>
     <p v-if="addSummary" class="status add-summary">{{ addSummary }}</p>
@@ -3666,246 +1890,25 @@ watch(coloringRules, () => {
 
     <NoteEditor v-if="noteTarget" :field="noteTarget.field" :item-name="noteTarget.itemName" @close="noteTarget = null" />
 
-    <Dialog v-if="manageOpen" label="Virtual libraries and saved searches" show-close size="lg" @close="manageOpen = false">
-      <p v-if="manageError" class="error">{{ manageError }}</p>
+    <ManageListsDialog v-if="manageOpen" :virtual-libraries="virtualLibraries" :saved-searches="savedSearches" :query="activeQuery" @close="manageOpen = false" @changed="loadMetadata" @virtual-library-deleted="onVirtualLibraryDeleted" />
 
-      <section>
-        <h3>Virtual libraries</h3>
-        <ul class="manage-list">
-          <li v-for="[name, q] in Object.entries(virtualLibraries)" :key="name">
-            <span class="manage-name">{{ name }}</span>
-            <code class="manage-query">{{ q }}</code>
-            <button type="button" class="manage-remove" @click="removeVirtualLibrary(name)">Delete</button>
-          </li>
-        </ul>
-        <form class="manage-form" @submit.prevent="createVirtualLibrary">
-          <input v-model="newVlName" placeholder="Name" required />
-          <input v-model="newVlQuery" placeholder="Search query" required />
-          <button type="submit">Add</button>
-        </form>
-      </section>
+    <ColumnPickerDialog v-if="columnPickerOpen" :columns="pickerColumns" :shown="tablePrefs.columns" @close="columnPickerOpen = false" @toggle="toggleColumn" @move="moveColumn" @reorder="onPickerReorder" @reset="resetColumns" />
 
-      <section>
-        <h3>Saved searches</h3>
-        <ul class="manage-list">
-          <li v-for="[name, q] in Object.entries(savedSearches)" :key="name">
-            <span class="manage-name">{{ name }}</span>
-            <code class="manage-query">{{ q }}</code>
-            <button type="button" @click="renameSavedSearchPrompt(name)">Rename</button>
-            <button type="button" class="manage-remove" @click="removeSavedSearch(name)">Delete</button>
-          </li>
-        </ul>
-        <form class="manage-form" @submit.prevent="createSavedSearch">
-          <input v-model="newSearchName" placeholder="Name" required />
-          <input v-model="newSearchQuery" placeholder="Search query" required />
-          <button type="submit">Add</button>
-        </form>
-      </section>
-    </Dialog>
+    <CustomColumnsDialog v-if="columnsOpen" @close="closeColumns" @changed="onColumnsChanged" />
 
-    <Dialog v-if="columnPickerOpen" title="Table columns" size="lg" @close="columnPickerOpen = false">
-      <p class="hint">Choose which columns the table shows, and their order. Drag a row, or use the arrows. You can also drag a column header in the table.</p>
-      <ul class="column-list">
-        <li
-          v-for="column in pickerColumns"
-          :key="column.key"
-          class="column-row"
-          :class="{ 'drag-over': pickerDragKey !== null && pickerDragKey !== column.key && tablePrefs.columns.includes(column.key) }"
-          :draggable="tablePrefs.columns.includes(column.key)"
-          @dragstart="pickerDragKey = column.key"
-          @dragend="pickerDragKey = null"
-          @dragover.prevent
-          @drop.prevent="onPickerDrop(column.key)"
-        >
-          <label class="field checkbox">
-            <input type="checkbox" :checked="tablePrefs.columns.includes(column.key)" @change="toggleColumn(column.key)" />
-            {{ column.label }}
-            <span v-if="!column.sortKey" class="hint inline">(not sortable)</span>
-          </label>
-          <template v-if="tablePrefs.columns.includes(column.key)">
-            <button type="button" :disabled="tablePrefs.columns.indexOf(column.key) === 0" title="Move up (left in the table)" aria-label="Move up" @click="moveColumn(column.key, -1)">↑</button>
-            <button type="button" :disabled="tablePrefs.columns.indexOf(column.key) === tablePrefs.columns.length - 1" title="Move down (right in the table)" aria-label="Move down" @click="moveColumn(column.key, 1)">↓</button>
-          </template>
-        </li>
-      </ul>
-      <button type="button" @click="resetColumns">Reset to default</button>
-      <button type="button" @click="columnPickerOpen = false">Close</button>
-    </Dialog>
+    <CheckLibraryDialog :open="checkLibraryOpen" @close="checkLibraryOpen = false" @changed="runSearch" />
 
-    <Dialog v-if="columnsOpen" title="Custom columns" show-close size="lg" @close="columnsOpen = false">
-      <section>
-        <p v-if="columnsError" class="error">{{ columnsError }}</p>
-        <ul class="manage-list">
-          <li v-for="[label, col] in Object.entries(customColumns)" :key="label">
-            <span class="manage-name">{{ col.name }}</span>
-            <code class="manage-query">#{{ label }} ({{ col.datatype }})</code>
-            <button type="button" class="manage-remove" @click="removeCustomColumnClick(label)">Delete</button>
-          </li>
-          <li v-if="Object.keys(customColumns).length === 0">No custom columns yet.</li>
-        </ul>
-        <div class="column-presets" data-testid="column-presets">
-          <h4>Quick add</h4>
-          <div class="preset-buttons">
-            <button v-for="p in COLUMN_PRESETS" :key="p.id" type="button" :data-testid="`preset-${p.id}`" :disabled="p.label in customColumns" :title="p.label in customColumns ? `#${p.label} already exists` : p.hint" @click="pickColumnPreset(p)">{{ p.title }}</button>
-          </div>
-          <form v-if="presetPicked" class="manage-form" data-testid="preset-form" @submit.prevent="createPresetColumn">
-            <input v-model="presetPicked.name" aria-label="Display name" data-testid="preset-name" required />
-            <code class="manage-query">#{{ presetPicked.label }} ({{ presetPicked.datatype }})</code>
-            <button type="submit" data-testid="preset-create">Create</button>
-          </form>
-          <p v-if="presetPicked" class="hint">Creates the column <code>#{{ presetPicked.label }}</code> as {{ presetPicked.datatype === "int" ? "a whole number" : "text" }}. {{ presetPicked.preset.hint }}</p>
-          <ul class="hint column-notes">
-            <li v-for="line in COLUMN_EXPLANATIONS" :key="line">{{ line }}</li>
-          </ul>
-        </div>
-        <h4>Or make your own</h4>
-        <form class="manage-form" @submit.prevent="createCustomColumn">
-          <input v-model="newColumnLabel" placeholder="Label (e.g. shelf)" pattern="[a-zA-Z0-9_]+" title="Letters, numbers, and underscores only" required />
-          <input v-model="newColumnName" placeholder="Display name (e.g. Shelf)" required />
-          <select v-model="newColumnDatatype">
-            <option value="text">Text</option>
-            <option value="comments">Long text</option>
-            <option value="int">Integer</option>
-            <option value="float">Decimal number</option>
-            <option value="bool">Yes/No</option>
-            <option value="rating">Rating</option>
-          </select>
-          <button type="submit">Add</button>
-        </form>
-      </section>
-    </Dialog>
-
-    <Dialog v-if="checkLibraryOpen" title="Check library" show-close size="lg" @close="checkLibraryOpen = false">
-      <section>
-        <p v-if="checkLibraryLoading">Scanning…</p>
-        <p v-else-if="checkLibraryError" class="error">{{ checkLibraryError }}</p>
-        <template v-else-if="checkLibraryResult">
-          <!--
-            An incomplete scan computes no missing-file list at all, so
-            saying "no problems found" would be a lie. Told first,
-            because it changes how everything below should be read.
-          -->
-          <p v-if="!checkLibraryConclusive" class="error">
-            A folder could not be read, so this check is incomplete — nothing is reported as missing, because a file that cannot be seen cannot be told from one that is gone.
-          </p>
-          <p v-if="checkLibraryNonEmpty.length === 0" class="news-hint">{{ checkLibraryConclusive ? "No problems found." : "Nothing else to report." }}</p>
-          <!--
-            Only when there is something to add. A button that does
-            nothing is worse than no button.
-          -->
-          <div v-if="checkLibraryHasUntracked" class="plugin-actions">
-            <button type="button" :disabled="rescanBusy" @click="rescanLibraryFolder">
-              {{ rescanBusy ? "Scanning…" : "Add the untracked files to the library" }}
-            </button>
-            <button v-if="rescanBusy" type="button" @click="cancelRescan">Cancel</button>
-          </div>
-          <p v-if="rescanProgress" class="news-hint" role="status">{{ rescanProgress }}</p>
-          <p v-if="rescanSummary" class="news-hint">{{ rescanSummary }}</p>
-          <div v-for="[key, findings] in checkLibraryGenericFindings" :key="key">
-            <h4>{{ CHECK_LIBRARY_LABELS[key] ?? key }} ({{ findings.length }})</h4>
-            <ul class="manage-list">
-              <li v-for="(f, i) in findings" :key="i">
-                <span class="manage-name">{{ f.title || "—" }}</span>
-                <code class="manage-query">{{ f.path }}</code>
-              </li>
-            </ul>
-          </div>
-
-          <!--
-            An orphan is the one state this model requires a person to
-            act on, so it gets the three resolutions the design
-            promises rather than a line of text.
-          -->
-          <div v-if="orphanList.length > 0">
-            <h4>Books whose file is gone ({{ orphanList.length }})</h4>
-            <ul class="manage-list">
-              <li v-for="orphan in orphanList" :key="orphanKey(orphan)" class="orphan-row">
-                <div>
-                  <span class="manage-name">{{ orphan.format }}</span>
-                  <code class="manage-query">{{ orphan.last_known_path }}</code>
-                </div>
-                <div class="plugin-actions">
-                  <!--
-                    Only offered when there is something to point at.
-                    The candidates are the files the check just found
-                    that no book claims.
-                  -->
-                  <label v-if="untrackedPaths.length > 0">
-                    Point at:
-                    <select :disabled="orphanBusy === orphanKey(orphan)" @change="relocateTo(orphan, ($event.target as HTMLSelectElement).value)">
-                      <option value="">Choose a file…</option>
-                      <option v-for="path in untrackedPaths" :key="path" :value="path">{{ path }}</option>
-                    </select>
-                  </label>
-                  <label class="orphan-upload">
-                    Copy a file back in…
-                    <input type="file" :disabled="orphanBusy === orphanKey(orphan)" @change="uploadFor(orphan, $event)" />
-                  </label>
-                  <button type="button" :disabled="orphanBusy === orphanKey(orphan)" @click="forgetOrphanEntry(orphan, true)">Remove entry, keep metadata</button>
-                  <button type="button" :disabled="orphanBusy === orphanKey(orphan)" @click="forgetOrphanEntry(orphan, false)">Remove entry</button>
-                </div>
-              </li>
-            </ul>
-          </div>
-
-          <!--
-            Visible and undoable: a hidden list of files the app
-            refuses to show is its own kind of bug.
-          -->
-          <div v-if="ignoredList.length > 0">
-            <h4>Removed from the library, kept on disk ({{ ignoredList.length }})</h4>
-            <ul class="manage-list">
-              <li v-for="file in ignoredList" :key="file.path">
-                <span class="manage-name">{{ file.title || "—" }}</span>
-                <code class="manage-query">{{ file.path }}</code>
-                <button type="button" :disabled="orphanBusy === file.path" @click="unignore(file)">Add it back</button>
-              </li>
-            </ul>
-          </div>
-
-          <p v-if="orphanMessage" class="news-hint">{{ orphanMessage }}</p>
-        </template>
-      </section>
-    </Dialog>
-
-    <Dialog v-if="duplicatesOpen" title="Find duplicates" show-close size="full" @close="duplicatesOpen = false">
-      <section>
-        <!--
-          Identical files are found by content hash, which only exist
-          for books this app added or scanned. A library opened from real
-          calibre needs them recorded first.
-        -->
-        <div class="plugin-actions">
-          <button type="button" :disabled="prepareBusy" @click="prepareForDuplicates">
-            {{ prepareBusy ? "Reading files…" : "Prepare for duplicate detection" }}
-          </button>
-          <button v-if="prepareBusy" type="button" @click="cancelPrepare">Cancel</button>
-        </div>
-        <p v-if="prepareProgress" class="news-hint" role="status">{{ prepareProgress }}</p>
-        <p v-if="prepareSummary" class="news-hint">{{ prepareSummary }}</p>
-        <!--
-          A scan and its OCR copy, or a PDF and its optimized copy, share
-          no bytes and often no metadata; they are found from their pages,
-          which have to be analysed once.
-        -->
-        <div v-if="pdfAction || fingerprintBusy" class="plugin-actions">
-          <button type="button" data-testid="fingerprint-pdfs" :disabled="fingerprintBusy" @click="runFingerprint">
-            {{ fingerprintBusy ? "Analysing PDFs…" : pdfAction?.label }}
-          </button>
-          <button v-if="fingerprintBusy" type="button" @click="cancelFingerprint">Cancel</button>
-        </div>
-        <p v-if="pdfAction?.note" class="news-hint">{{ pdfAction.note }}</p>
-        <p v-if="fingerprintProgress" class="news-hint" role="status">{{ fingerprintProgress }}</p>
-        <p v-if="fingerprintSummary" class="news-hint">{{ fingerprintSummary }}</p>
-        <p v-if="emptyFiles.length" class="news-hint" data-testid="empty-files">
-          {{ emptyFiles.length }} empty (0-byte) file{{ emptyFiles.length === 1 ? "" : "s" }}, not counted as duplicates:
-          {{ emptyFiles.slice(0, 5).map((f) => `${f.title} (.${f.format.toLowerCase()})`).join(", ") }}{{ emptyFiles.length > 5 ? ", …" : "" }}
-        </p>
-        <p v-if="duplicatesError" class="error">{{ duplicatesError }}</p>
-        <p v-if="mergeDone" class="news-hint" role="status">{{ mergeDone }}</p>
-        <DuplicateReview :store="dupStore" @merge="openMergeForGroup" @compare="openCompareForGroup" @details="(id) => (selectedBookId = id)" @resolve="resolveOpen = true" @changed="onDuplicatesChanged" />
-      </section>
-    </Dialog>
+    <DuplicatesDialog
+      :open="duplicatesOpen"
+      :store="dupStore"
+      :merge-note="mergeDone"
+      @close="duplicatesOpen = false"
+      @merge="openMergeForGroup"
+      @compare="openCompareForGroup"
+      @details="(id) => (selectedBookId = id)"
+      @resolve="resolveOpen = true"
+      @changed="onDuplicatesChanged"
+    />
 
     <ResolveDialog v-if="duplicatesOpen && resolveOpen" :store="dupStore" :controller="resolveController" @close="resolveOpen = false" @changed="onDuplicatesChanged" />
     <CompareDuplicates v-if="compareController.state.open" :controller="compareController" @close="compareController.close()" />
@@ -3914,208 +1917,17 @@ watch(coloringRules, () => {
     <OrganizeDialog v-if="organizeOpen" :controller="organizeController" :selected-ids="organizeSelection" @close="organizeOpen = false" @changed="onDuplicatesChanged" />
     <RetitleDialog v-if="retitleOpen" :controller="retitleController" :selected-ids="retitleSelection" @close="retitleOpen = false" @changed="onRetitleChanged" />
 
-    <Dialog v-if="mergeOpen" :title="`Merge books (${mergeBooksList.length})`" show-close size="lg" @close="mergeOpen = false">
-      <p class="news-hint">
-        Choose the record to keep. The others' formats and any metadata the destination lacks are merged into it.
-        <span :title="DEFAULT_DESTINATION_HINT">(Why is one pre-selected?)</span>
-      </p>
-      <ul class="manage-list">
-        <li v-for="b in mergeBooksList" :key="b.book_id">
-          <label>
-            <input v-model="mergeDest" type="radio" name="merge-dest" :value="b.book_id" :disabled="mergeBusy" />
-            {{ b.title }} — {{ b.authors.join(", ") }}
-            <small v-if="describeRecord(b)" class="news-hint">({{ describeRecord(b) }})</small>
-          </label>
-        </li>
-      </ul>
-      <label>
-        Mode
-        <select v-model="mergeMode" :disabled="mergeBusy">
-          <option v-for="m in mergeModes" :key="m" :value="m">{{ MERGE_MODE_LABELS[m] }}</option>
-        </select>
-      </label>
-      <p class="news-hint">{{ MERGE_MODE_NOTES[mergeMode] }}</p>
-      <label v-if="mergeMode !== 'merge_keep_sources'">
-        <input v-model="mergeKeepDuplicates" type="checkbox" :disabled="mergeBusy" />
-        Keep a differing copy of a format the destination already has, as a data file
-      </label>
-      <p v-if="mergeError" class="error">{{ mergeError }}</p>
-      <div v-if="mergePreview" role="group" aria-label="What will happen">
-        <h4>This will:</h4>
-        <ul>
-          <li v-for="(line, i) in mergePreviewLines" :key="i">{{ line }}</li>
-        </ul>
-      </div>
-      <div class="plugin-actions">
-        <button v-if="!mergePreview" type="button" :disabled="mergeBusy || mergeDest === null" @click="reviewMerge">Review…</button>
-        <button v-else type="button" class="primary" :disabled="mergeBusy || !mergePreview.ok" @click="confirmMerge">{{ mergeBusy ? "Merging…" : "Merge" }}</button>
-        <button type="button" @click="mergeOpen = false">Cancel</button>
-      </div>
-    </Dialog>
+    <MergeBooksDialog v-if="mergeOpen" :books="mergeBooksList" :dest="mergeDest" @close="mergeOpen = false" @merged="onMerged" />
 
-    <Dialog v-if="renameOpen" :title="`Rename files (${renameScope.length})`" show-close size="lg" @close="renameOpen = false">
-      <p class="news-hint">
-        Renames the book files on disk. The title, author and library folder are not touched — this changes only what the file is called.
-        Type a name, or a template such as <code>{{ '{title} - {authors}' }}</code>; the same fields save-to-disk accepts work here.
-      </p>
-      <form @submit.prevent="previewRename">
-        <label class="news-field">
-          New name or template
-          <input v-model="renameTemplate" placeholder="{title} - {authors}" :disabled="renameBusy" />
-        </label>
-        <div class="bulk-actions">
-          <button type="submit" :disabled="renameBusy || !renameTemplate.trim()">{{ renameBusy ? "Working…" : "Preview" }}</button>
-          <!--
-            Renaming cannot be undone, so this stays disabled until
-            the table below was computed for exactly this template
-            and this selection -- editing either invalidates it.
-          -->
-          <button type="button" class="read primary" :disabled="!renameCanApply" @click="applyRename">Rename</button>
-          <button type="button" :disabled="renameBusy" @click="renameOpen = false">Close</button>
-        </div>
-      </form>
-      <p v-if="renameError" class="error">{{ renameError }}</p>
-      <p v-if="renameSummary" class="news-hint">{{ renameSummary }}</p>
-      <ul v-if="renameResults.length" class="manage-list">
-        <li v-for="r in renameResults" :key="r.book_id">
-          <span v-if="r.error" class="error">{{ r.title }}: {{ r.error }}</span>
-          <span v-else-if="r.changed" class="manage-name">{{ r.current || "(unnamed)" }} → {{ r.proposed }}</span>
-          <span v-else class="manage-name muted">{{ r.current }} (unchanged)</span>
-        </li>
-      </ul>
-    </Dialog>
+    <RenameFilesDialog v-if="renameOpen" :ids="renameScope" @close="renameOpen = false" @renamed="runSearch" />
 
-    <Dialog v-if="copyOpen" title="Copy to library" show-close size="md" @close="copyOpen = false">
-      <p v-if="copyTargets.length === 0" class="news-hint">
-        This server is hosting only this library, so there is nowhere to copy to. Open another library once and it becomes
-        available here.
-      </p>
-      <template v-else>
-        <p class="news-hint">Copies the selected book(s), with their formats and cover, into another library this server hosts.</p>
-        <form @submit.prevent="runCopyToLibrary">
-          <label class="news-field">
-            Destination library
-            <select v-model="copyTarget" :disabled="copyBusy">
-              <option v-for="target in copyTargets" :key="target.id" :value="target.id">{{ target.name }}</option>
-            </select>
-          </label>
-          <label class="news-field">
-            <input v-model="copyMove" type="checkbox" :disabled="copyBusy" />
-            Remove from this library afterwards (move rather than copy)
-          </label>
-          <div class="bulk-actions">
-            <button type="submit" class="read" :disabled="copyBusy || !copyTarget">
-              {{ copyBusy ? "Copying…" : `${copyMove ? "Move" : "Copy"} ${renameScope.length} book(s)` }}
-            </button>
-            <button type="button" :disabled="copyBusy" @click="copyOpen = false">Close</button>
-          </div>
-        </form>
-      </template>
-      <p v-if="copyError" class="error">{{ copyError }}</p>
-      <ul v-if="copyDone && copyResults.length" class="manage-list">
-        <li v-for="(line, i) in copyResults" :key="i"><span class="manage-name">{{ line }}</span></li>
-      </ul>
-    </Dialog>
+    <CopyToLibraryDialog v-if="copyOpen" :ids="renameScope" :targets="copyTargets" @close="copyOpen = false" @moved="runSearch" />
 
-    <Dialog v-if="embedOpen" title="Embed metadata in files" show-close size="lg" @close="embedOpen = false">
-      <p class="news-hint">
-        Writes this library's metadata into the selected book file(s), so another reader app shows the title, authors and
-        cover recorded here rather than whatever the file shipped with. This rewrites the files themselves and cannot be undone.
-        Formats with no metadata writer yet are listed below and left untouched.
-      </p>
-      <div v-if="!embedDone" class="bulk-actions">
-        <button type="button" class="read" :disabled="embedBusy" @click="runEmbedMetadata">
-          {{ embedBusy ? "Embedding…" : `Embed into ${renameScope.length} book(s)` }}
-        </button>
-        <button type="button" :disabled="embedBusy" @click="embedOpen = false">Cancel</button>
-      </div>
-      <template v-else>
-        <p class="manage-name">{{ embedCount }} file(s) updated.</p>
-        <ul v-if="embedProblems.length" class="manage-list">
-          <li v-for="(problem, i) in embedProblems" :key="i"><span class="error">{{ problem }}</span></li>
-        </ul>
-        <div class="bulk-actions">
-          <button type="button" @click="embedOpen = false">Close</button>
-        </div>
-      </template>
-      <p v-if="embedError" class="error">{{ embedError }}</p>
-    </Dialog>
+    <EmbedMetadataDialog v-if="embedOpen" :ids="renameScope" @close="embedOpen = false" @embedded="runSearch" />
 
-    <Dialog v-if="saveToDiskOpen" title="Save to disk" show-close size="lg" @close="saveToDiskOpen = false">
-      <p class="news-hint">Exports the selected book(s) into a folder tree named from a real calibre template. Available fields include {title}, {authors}, {author_sort}, {series}, and any custom column (e.g. {#shelf}).</p>
-      <form @submit.prevent="runSaveToDisk">
-        <label class="news-field">
-          Path template
-          <input v-model="saveToDiskTemplate" placeholder="{author_sort}/{title}/{title} - {authors}" :disabled="saveToDiskBusy" />
-        </label>
-        <label class="news-field">
-          Destination folder (absolute path)
-          <input v-model="saveToDiskDest" placeholder="/home/me/Books" :disabled="saveToDiskBusy" />
-        </label>
-        <div class="bulk-actions">
-          <button type="submit" class="read" :disabled="saveToDiskBusy || !saveToDiskDest.trim()">{{ saveToDiskBusy ? "Saving…" : "Save" }}</button>
-          <button type="button" :disabled="saveToDiskBusy" @click="saveToDiskOpen = false">Close</button>
-        </div>
-      </form>
-      <p v-if="saveToDiskError" class="error">{{ saveToDiskError }}</p>
-      <ul v-if="saveToDiskResults.length" class="manage-list">
-        <li v-for="r in saveToDiskResults" :key="r.book_id">
-          <span v-if="r.ok" class="manage-name">Book {{ r.book_id }}: saved {{ r.paths?.length }} file(s)</span>
-          <span v-else class="error">Book {{ r.book_id }}: {{ r.error }}</span>
-        </li>
-      </ul>
-    </Dialog>
+    <SaveToDiskDialog v-if="saveToDiskOpen" :ids="renameScope" @close="saveToDiskOpen = false" />
 
-    <Dialog v-if="newsOpen" title="Fetch news" show-close size="md" @close="newsOpen = false">
-      <p class="news-hint">Enter one or more RSS/Atom feed URLs, one per line. Prefix a line with "Section Title|" to name that feed's own section in a multi-section recipe. This downloads the latest articles and adds the result as a new book.</p>
-      <form @submit.prevent="fetchNews">
-        <label class="news-field">
-          Title
-          <input v-model="newsTitle" placeholder="My Weekly" :disabled="newsFetching" />
-        </label>
-        <label class="news-field">
-          Feed URLs
-          <textarea v-model="newsFeedUrls" rows="4" placeholder="https://example.com/feed.xml&#10;Tech News|https://example.com/tech.xml" :disabled="newsFetching"></textarea>
-        </label>
-        <div class="bulk-actions">
-          <button type="button" :disabled="newsFetching || opmlImporting" @click="opmlInput?.click()">{{ opmlImporting ? "Importing…" : "Import OPML…" }}</button>
-          <input ref="opmlInput" type="file" accept=".opml,.xml,text/x-opml,text/xml" class="hidden-file-input" @change="importOpmlFile" />
-        </div>
-        <label class="news-field">
-          Oldest article (days)
-          <input v-model="newsOldestArticleDays" type="number" min="0" step="1" placeholder="7" :disabled="newsFetching" />
-        </label>
-        <label class="news-field">
-          Max articles per feed
-          <input v-model="newsMaxArticlesPerFeed" type="number" min="1" step="1" placeholder="100" :disabled="newsFetching" />
-        </label>
-        <label class="news-field">
-          Repeat every (minutes)
-          <input v-model="scheduleIntervalMinutes" type="number" min="1" step="1" :disabled="schedulingBusy" />
-        </label>
-        <div class="bulk-actions">
-          <button type="submit" class="read" :disabled="newsFetching || !newsFeedUrls.trim()">{{ newsFetching ? "Fetching…" : "Fetch once" }}</button>
-          <button type="button" :disabled="schedulingBusy || !newsFeedUrls.trim()" @click="saveNewsSchedule">{{ schedulingBusy ? "Saving…" : "Save schedule…" }}</button>
-          <button type="button" :disabled="newsFetching" @click="newsOpen = false">Close</button>
-        </div>
-      </form>
-      <p v-if="opmlSummary" class="news-hint">{{ opmlSummary }}</p>
-      <p v-if="newsDone" class="news-done">Added the fetched news as a new book.</p>
-      <p v-if="newsError" class="error">{{ newsError }}</p>
-      <p v-if="scheduleError" class="error">{{ scheduleError }}</p>
-
-      <template v-if="newsSchedules.length">
-        <h4>Scheduled feeds</h4>
-        <ul class="manage-list">
-          <li v-for="s in newsSchedules" :key="s.id">
-            <span class="manage-name">{{ s.title }} — every {{ Math.round(s.interval_secs / 60) }} min</span>
-            <code class="manage-query">next: {{ new Date(s.next_run_at).toLocaleString() }}<template v-if="s.last_result"> · last: {{ s.last_result }}</template></code>
-            <button type="button" :disabled="schedulingBusy" @click="runNewsScheduleNowClick(s.id)">Run now</button>
-            <button type="button" :disabled="schedulingBusy" @click="deleteNewsSchedule(s.id)">Delete</button>
-          </li>
-        </ul>
-      </template>
-    </Dialog>
+    <NewsDialog :open="newsOpen" @close="newsOpen = false" @changed="libraryChanged" />
 
     <NewLibraryDialog v-if="newLibraryOpen" v-model:name="newLibraryName" :busy="creatingLibrary" :error="newLibraryError" @close="newLibraryOpen = false" @submit="createLibrary" />
 
@@ -4529,99 +2341,6 @@ watch(coloringRules, () => {
   color: inherit;
   padding: 0 0.1em;
 }
-.bulk-panel {
-  padding: 0.75em 1em;
-  background: var(--bg-sunken);
-  border-bottom: 1px solid var(--border);
-}
-.bulk-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 1em;
-  align-items: flex-end;
-}
-.bulk-row label {
-  display: flex;
-  flex-direction: column;
-  font-size: var(--fs-small);
-  color: var(--fg-muted);
-  gap: 0.2em;
-}
-.bulk-row input[type="text"],
-.bulk-row input:not([type]) {
-  font: inherit;
-  padding: 0.35em 0.5em;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-}
-.bulk-rating {
-  flex-direction: row !important;
-  align-items: center;
-  gap: 0.4em !important;
-}
-.bulk-actions {
-  margin-top: 0.6em;
-  display: flex;
-  gap: 0.5em;
-}
-.bulk-errors {
-  margin: 0.6em 0 0;
-  padding: 0;
-  list-style: none;
-}
-
-/*
- * An orphan row carries four controls, which do not fit on the same line
- * as the path on a narrow panel -- so it stacks rather than overflowing.
- */
-.orphan-row {
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 0.35em;
-}
-
-/* The file input is wide and ugly bare; the label carries the wording. */
-.orphan-upload {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.35em;
-}
-
-.orphan-upload input[type="file"] {
-  max-width: 14em;
-}
-.manage-name {
-  font-weight: 600;
-  flex-shrink: 0;
-}
-/* A rename preview lists every selected book, including the ones
-   already named correctly -- they are context, not the result, and
-   should not read with the same weight as the rows that will move. */
-.manage-name.muted {
-  font-weight: 400;
-  color: var(--fg-muted);
-}
-.manage-query {
-  color: var(--fg-muted);
-  font-size: var(--fs-small);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  flex: 1;
-}
-.manage-remove {
-  color: var(--danger);
-}
-.preset-buttons {
-  display: flex;
-  gap: 0.5rem;
-  flex-wrap: wrap;
-  margin-bottom: 0.4rem;
-}
-.column-notes {
-  margin: 0.4rem 0;
-  padding-left: 1.1rem;
-}
 .dup-filter {
   display: inline-flex;
   gap: 0.4rem;
@@ -4648,26 +2367,6 @@ watch(coloringRules, () => {
 .dup-badge-review {
   color: var(--warning);
 }
-.news-field {
-  display: flex;
-  flex-direction: column;
-  gap: 0.3em;
-  font-size: var(--fs-small);
-  color: var(--fg-muted);
-  margin-bottom: 0.75em;
-}
-.news-field input,
-.news-field textarea {
-  font: inherit;
-  padding: 0.35em 0.5em;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  resize: vertical;
-}
-.news-done {
-  color: var(--success);
-  margin: 0.6em 0 0;
-}
 /* View toggle + column picker (issue 1.1). */
 .view-toggle {
   display: inline-flex;
@@ -4687,87 +2386,6 @@ watch(coloringRules, () => {
 .view-toggle button.active {
   font-weight: 600;
 }
-.column-list {
-  list-style: none;
-  margin: 0 0 1rem;
-  padding: 0;
-  max-height: 55vh;
-  overflow-y: auto;
-}
-.column-row {
-  display: flex;
-  align-items: center;
-  gap: 0.4rem;
-  padding: 0.15rem 0;
-}
-.column-row .field {
-  flex: 1;
-}
-.column-row .field.checkbox {
-  flex-direction: row;
-  align-items: center;
-  gap: 0.4rem;
-}
-.column-row[draggable="true"] {
-  cursor: grab;
-}
-.column-row.drag-over:hover {
-  box-shadow: inset 0 2px 0 var(--accent);
-}
-.hint.inline {
-  font-size: var(--fs-small);
-  opacity: 0.7;
-}
-
-/* Expanded bulk edit (#1.6). */
-.bulk-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-  gap: 0.5rem 1rem;
-  margin-bottom: 0.75rem;
-}
-.bulk-field {
-  display: flex;
-  flex-direction: column;
-  gap: 0.2rem;
-  font-size: var(--fs-small);
-}
-.bulk-field > span {
-  opacity: 0.8;
-}
-.bulk-combo {
-  display: flex;
-  gap: 0.3rem;
-  flex-wrap: wrap;
-}
-.bulk-combo input {
-  flex: 1;
-  min-width: 8ch;
-}
-.bulk-optional > span {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.35rem;
-}
-.bulk-replace {
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 0.5rem 0.75rem 0.75rem;
-  margin-bottom: 0.75rem;
-}
-.bulk-replace legend {
-  font-size: var(--fs-small);
-  opacity: 0.75;
-  padding: 0 0.3rem;
-}
-.bulk-regex {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.3rem;
-  font-size: var(--fs-small);
-  white-space: nowrap;
-}
-
 /* Marks (#1.5). */
 .marks-indicator {
   display: inline-flex;

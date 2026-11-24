@@ -128,6 +128,14 @@ pub enum ChangeOp {
     /// `kind` is `authors`, `tags` or `publishers`, the table renamed.
     ItemRenamed { kind: String, from: String, to: String },
 
+    /// Sets the stored sort key (`authors.sort`) of the author called `name`.
+    ///
+    /// The database derives that key from the name, so it is only logged when
+    /// someone set it to something else; a rebuild then restores it instead of
+    /// re-deriving it. Library-scoped, like [`ChangeOp::ItemRenamed`]: it names
+    /// an item, not a book.
+    AuthorSortSet { name: String, sort: String },
+
     /// Several ops that happened together, durable as **one** entry: one
     /// file, one fsync, one link in the hash chain.
     ///
@@ -161,7 +169,7 @@ impl ChangeOp {
             | ChangeOp::FormatSet { book, .. }
             | ChangeOp::FormatRemoved { book, .. }
             | ChangeOp::CoverSet { book, .. } => ChangeTarget::Book(book.clone()),
-            ChangeOp::PrefSet { .. } | ChangeOp::CustomColumnAdded { .. } | ChangeOp::CustomColumnRemoved { .. } | ChangeOp::ItemRenamed { .. } | ChangeOp::Batch { .. } => ChangeTarget::Library,
+            ChangeOp::PrefSet { .. } | ChangeOp::CustomColumnAdded { .. } | ChangeOp::CustomColumnRemoved { .. } | ChangeOp::ItemRenamed { .. } | ChangeOp::AuthorSortSet { .. } | ChangeOp::Batch { .. } => ChangeTarget::Library,
         }
     }
 
@@ -174,7 +182,7 @@ impl ChangeOp {
             | ChangeOp::FormatSet { book, .. }
             | ChangeOp::FormatRemoved { book, .. }
             | ChangeOp::CoverSet { book, .. } => Some(book),
-            ChangeOp::PrefSet { .. } | ChangeOp::CustomColumnAdded { .. } | ChangeOp::CustomColumnRemoved { .. } | ChangeOp::ItemRenamed { .. } | ChangeOp::Batch { .. } => None,
+            ChangeOp::PrefSet { .. } | ChangeOp::CustomColumnAdded { .. } | ChangeOp::CustomColumnRemoved { .. } | ChangeOp::ItemRenamed { .. } | ChangeOp::AuthorSortSet { .. } | ChangeOp::Batch { .. } => None,
         }
     }
 
@@ -207,6 +215,8 @@ impl ChangeOp {
             // done to the item, and dropping one would leave later ops
             // naming an item that, on replay, still has its old name.
             | ChangeOp::ItemRenamed { .. }
+            // Ordered against renames of the same author, so never dropped.
+            | ChangeOp::AuthorSortSet { .. }
             // A batch is kept whole: it spans books and fields, so there is
             // no single key it supersedes or is superseded by.
             | ChangeOp::Batch { .. } => None,

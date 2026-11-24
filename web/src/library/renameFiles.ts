@@ -10,6 +10,7 @@
 // Apply button that stays enabled after the template changed underneath
 // it would move files to names nobody ever saw.
 
+import { fetchNaming } from "./api";
 import type { RenameFileResult } from "./types";
 
 /**
@@ -91,4 +92,13 @@ export function describeRename(summary: RenameSummary, applied: boolean): string
   if (summary.unchanged > 0) parts.push(`${summary.unchanged} already named correctly`);
   if (summary.failed > 0) parts.push(`${summary.failed} could not be named`);
   return parts.join(", ");
+}
+
+/** The file name template new runs start from (the library convention's), or null when it cannot be read. */
+export async function conventionFileTemplate(): Promise<string | null> {
+  try {
+    return (await fetchNaming()).file_template;
+  } catch {
+    return null;
+  }
 }
