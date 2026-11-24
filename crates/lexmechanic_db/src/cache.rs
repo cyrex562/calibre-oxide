@@ -168,6 +168,32 @@ pub struct BookDeletion {
     pub folder_removed: Option<String>,
 }
 
+/// What is left to do for a book whose files were moved to the trash: tidy its folder.
+struct DeletionTidy {
+    path_rel: String,
+    dedicated: bool,
+    uuid: Option<String>,
+}
+
+/// Books whose files are moved to the trash at once by [`Cache::delete_books_with`]: each
+/// move is a few journaled, fsynced operations, which overlap well.
+fn trash_workers() -> usize {
+    lexmechanic_utils::env::var("LEXMECHANIC_TRASH_WORKERS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(4, |n| n.clamp(1, 16))
+}
+
+/// What [`Cache::prepare_deletion`] read about a book that is about to go.
+struct PendingDeletion {
+    path_rel: String,
+    title: String,
+    uuid: Option<String>,
+    dedicated: bool,
+    own: Vec<OwnFile>,
+    cover_sidecar: Option<PathBuf>,
+    manifest: Option<crate::trash::BookManifest>,
+    /// Ignore entries recorded so far (for [`BookFiles::Keep`]).
+    outcome: BookDeletion,
+}
+
 pub(crate) struct OwnFile {
     pub(crate) rel: String,
     pub(crate) hash: Option<String>,
@@ -254,6 +280,9 @@ pub struct ImportItem {
     /// Where to put the files instead of calibre's `Author/Title (id)`:
     /// "keep the source folder structure" (see [`crate::import`]).
     pub placement: Option<ImportPlacement>,
+    /// The format (uppercase) the book still owes the lazy metadata pass for:
+    /// its cover is rendered later, by the enrichment pass, not while importing.
+    pub queue_enrichment: Option<String>,
 }
 
 /// A fixed place for an imported book's files: the folder it had in the source
@@ -395,6 +424,19 @@ impl Cache {
         Ok(built)
     }
 
+    /// What [`Cache::cached_for_version`] holds for `key` at `version`, if it
+    /// holds that and has finished building it; never builds anything.
+    pub fn cached_if_current<T: Send + Sync + 'static>(&self, key: &str, version: u64) -> Option<std::sync::Arc<T>> {
+        let slot = std::sync::Arc::clone(self.derived_results.lock().unwrap().get(key)?);
+        // A build in progress holds the slot: do not wait for it.
+        let guard = slot.try_lock().ok()?;
+        let (v, value) = guard.as_ref()?;
+        if *v != version {
+            return None;
+        }
+        std::sync::Arc::clone(value).downcast::<T>().ok()
+    }
+
     /// Forces the next [`Cache::field_for`] call to reload the field
     /// snapshot, even if `total_changes()` hasn't moved (there is no
     /// such case in practice -- every write increments it -- but this
@@ -407,7 +449,7 @@ impl Cache {
     /// `.lexmechanic/checksums.db`, sharing this `Cache`'s connection
     /// -- issue #93 §8.
     pub fn checksums(&self) -> crate::checksums::ChecksumStore {
-        crate::checksums::ChecksumStore::new(self.backend.conn.clone(), &self.backend.library_path)
+        crate::checksums::ChecksumStore::new(self.backend.conn.clone(), &self.backend.library_path).with_reader(self.backend.reader())
     }
 
     // ---------------------------------------------------------------
@@ -442,7 +484,7 @@ impl Cache {
         }
         match self.backend.change_log() {
             Ok(log) => {
-                if let Err(e) = log.append(op) {
+                if let Err(e) = log.append_grouped(op) {
                     log::warn!("could not record a change in the library log: {e}");
                     self.note_change_log_gap(&format!("{e}"));
                 }
@@ -762,9 +804,10 @@ impl Cache {
     /// requests are not held up by a long scan; a write made after the
     /// snapshot was taken is not in it.
     pub fn fields(&self) -> Result<std::sync::Arc<FieldStore>> {
-        let conn = self.backend.conn.lock().unwrap();
-        let mut guard = self.field_cache.lock().unwrap();
-        crate::field_feed::refresh(&mut guard, &conn, &self.backend.field_feed, &self.field_full_loads)
+        // The connection is not held across the call: `refresh` takes it for
+        // what it has to read and lets go of it before copying or loading.
+        let reader = self.backend.reader();
+        crate::field_feed::refresh(&self.field_cache, &self.backend.conn, reader.as_deref(), &self.backend.field_feed, &self.field_full_loads)
     }
 
     /// [`Cache::field_for`] against a snapshot from [`Cache::fields`].
@@ -1223,6 +1266,11 @@ impl Cache {
                             )?;
                             crate::checksums::ChecksumStore::record_hash_on(&sp, inserted.id, "format", &format, &file.hash, file.size, lexmechanic_utils::filenames::identity(&dest))?;
                             rows.push((format, file.size, file.hash.clone()));
+                        }
+                        // The cover (and whatever else the file offers) is read later, by
+                        // the enrichment pass, which is not serialized on one lock.
+                        if let Some(format) = &item.queue_enrichment {
+                            crate::checksums::ChecksumStore::queue_enrichment_on(&sp, inserted.id, format)?;
                         }
                         Ok(rows)
                     })();
@@ -1910,19 +1958,127 @@ impl Cache {
     /// is reported in [`BookDeletion::failed`], and is put on the ignore
     /// list so the next scan does not resurrect the book.
     pub fn delete_book_with(&self, book_id: i32, files: BookFiles) -> anyhow::Result<BookDeletion> {
-        let mut outcome = BookDeletion::default();
-        let Some(path_rel) = self.field_for(book_id, "path")? else {
+        let Some(pending) = self.prepare_deletion(book_id, files, &[])? else {
             // No such book: nothing on disk can be attributed to it.
             self.delete_book_rows(book_id)?;
-            return Ok(outcome);
+            return Ok(BookDeletion::default());
+        };
+        self.delete_book_rows(book_id)?;
+        if let Some(uuid) = pending.uuid.clone() {
+            self.record(crate::change_log::ChangeOp::BookRemoved { book: uuid });
+        }
+        Ok(self.finish_deletion(pending, files))
+    }
+
+    /// [`Cache::delete_book_with`] for many books at once, for a bulk run (a
+    /// duplicate resolve): **one** transaction deletes every row, and the change
+    /// log gets **one** batch entry. Deleting one at a time spent a transaction
+    /// commit, a change-log file and its fsyncs on every book: at NAS-library
+    /// scale that is the whole cost of the run.
+    ///
+    /// Each book is read (its folder, files, trash manifest) before any row goes,
+    /// but judged as the one-by-one deletion would judge it, so a file or folder
+    /// shared by two books of the batch is still cleaned up with the last of them.
+    /// The files move to the trash after the rows are gone, as ever.
+    ///
+    /// The result has one entry per id, in order. A book that cannot even be read
+    /// fails alone; if the transaction itself fails, every book that was read
+    /// fails with it and nothing was deleted.
+    pub fn delete_books_with(&self, book_ids: &[i32], files: BookFiles) -> Vec<anyhow::Result<BookDeletion>> {
+        let mut results: Vec<Option<anyhow::Result<BookDeletion>>> = book_ids.iter().map(|_| None).collect();
+        // (position in `book_ids`, what was read) for the books that exist; the ids
+        // that do not exist get the same treatment as `delete_book_with` gives them.
+        let mut pending: Vec<(usize, PendingDeletion)> = Vec::new();
+        let mut gone: Vec<i32> = Vec::new();
+        let mut missing: Vec<usize> = Vec::new();
+        for (idx, id) in book_ids.iter().enumerate() {
+            if gone.contains(id) {
+                results[idx] = Some(Ok(BookDeletion::default()));
+                continue;
+            }
+            match self.prepare_deletion(*id, files, &gone) {
+                Ok(Some(p)) => {
+                    gone.push(*id);
+                    pending.push((idx, p));
+                }
+                Ok(None) => missing.push(idx),
+                Err(e) => results[idx] = Some(Err(e)),
+            }
+        }
+        let doomed: Vec<i32> = pending.iter().map(|(idx, _)| book_ids[*idx]).chain(missing.iter().map(|idx| book_ids[*idx])).collect();
+        match self.delete_book_rows_many(&doomed) {
+            Ok(()) => {
+                self.record_many(pending.iter().filter_map(|(_, p)| p.uuid.clone()).map(|book| crate::change_log::ChangeOp::BookRemoved { book }).collect());
+                for idx in missing {
+                    results[idx] = Some(Ok(BookDeletion::default()));
+                }
+                let moved = self.finish_moves_parallel(pending, files);
+                for (idx, mut outcome, tidy) in moved {
+                    if let Some(tidy) = tidy {
+                        self.finish_tidy(tidy, &mut outcome);
+                    }
+                    results[idx] = Some(Ok(outcome));
+                }
+            }
+            Err(e) => {
+                let why = format!("{e:#}");
+                for (idx, _) in pending {
+                    results[idx] = Some(Err(anyhow::anyhow!("{why}")));
+                }
+                for idx in missing {
+                    results[idx] = Some(Err(anyhow::anyhow!("{why}")));
+                }
+            }
+        }
+        results.into_iter().map(|r| r.unwrap_or_else(|| Ok(BookDeletion::default()))).collect()
+    }
+
+    /// [`Cache::finish_moves`] for a batch: a few books at a time, results in the order given.
+    /// Books are independent here (each has its own trash entry); what depends on the other
+    /// books' files being gone, tidying folders, is left to the caller.
+    fn finish_moves_parallel(&self, pending: Vec<(usize, PendingDeletion)>, files: BookFiles) -> Vec<(usize, BookDeletion, Option<DeletionTidy>)> {
+        let workers = if files == BookFiles::Trash { trash_workers().min(pending.len()) } else { 1 };
+        if workers <= 1 {
+            return pending
+                .into_iter()
+                .map(|(idx, p)| {
+                    let (outcome, tidy) = self.finish_moves(p, files);
+                    (idx, outcome, tidy)
+                })
+                .collect();
+        }
+        let queue = std::sync::Mutex::new(pending.into_iter().enumerate().collect::<Vec<_>>().into_iter());
+        let done = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| loop {
+                    let next = queue.lock().unwrap().next();
+                    let Some((order, (idx, p))) = next else { break };
+                    let (outcome, tidy) = self.finish_moves(p, files);
+                    done.lock().unwrap().push((order, idx, outcome, tidy));
+                });
+            }
+        });
+        let mut done = done.into_inner().unwrap();
+        done.sort_by_key(|(order, ..)| *order);
+        done.into_iter().map(|(_, idx, outcome, tidy)| (idx, outcome, tidy)).collect()
+    }
+
+    /// Everything a deletion needs from the database, read while the row exists.
+    /// `None` when there is no such book. `gone` are books being deleted before
+    /// this one (see [`Cache::delete_books_with`]).
+    fn prepare_deletion(&self, book_id: i32, files: BookFiles, gone: &[i32]) -> anyhow::Result<Option<PendingDeletion>> {
+        let mut outcome = BookDeletion::default();
+        let Some(path_rel) = self.field_for(book_id, "path")? else {
+            return Ok(None);
         };
         let title = self.field_for(book_id, "title")?.unwrap_or_default();
         // Read before the row is deleted: afterwards there is no uuid
         // to record the removal against, and an unrecorded removal
         // comes back on the next rebuild.
         let uuid = self.book_uuid(book_id)?;
-        let dedicated = self.folder_is_dedicated(book_id, &path_rel)?;
-        let own = self.own_files(book_id, &path_rel, dedicated)?;
+        let dedicated = self.folder_is_dedicated_without(book_id, &path_rel, gone)?;
+        let own = self.own_files_without(book_id, &path_rel, dedicated, gone)?;
         let cover_sidecar = crate::covers::sidecar_cover_path(self, book_id).ok();
 
         if files == BookFiles::Keep {
@@ -1941,12 +2097,25 @@ impl Cache {
         // row still exists.
         let manifest = if files == BookFiles::Trash { Some(self.trash_manifest_for(book_id, uuid.clone(), &title, &path_rel, &own)?) } else { None };
 
-        self.delete_book_rows(book_id)?;
-        if let Some(uuid) = uuid.clone() {
-            self.record(crate::change_log::ChangeOp::BookRemoved { book: uuid });
-        }
+        Ok(Some(PendingDeletion { path_rel, title, uuid, dedicated, own, cover_sidecar, manifest, outcome }))
+    }
 
-        let library = self.backend.library_path.clone();
+    /// The file half of a deletion, after the rows are gone.
+    fn finish_deletion(&self, pending: PendingDeletion, files: BookFiles) -> BookDeletion {
+        let (mut outcome, tidy) = self.finish_moves(pending, files);
+        if let Some(tidy) = tidy {
+            self.finish_tidy(tidy, &mut outcome);
+        }
+        outcome
+    }
+
+    /// The part of [`Cache::finish_deletion`] that moves the files (into the trash), which a
+    /// batch does for several books at once; what it leaves for [`Cache::finish_tidy`] is the
+    /// removal of folders it emptied, which depends on the other books' files being gone
+    /// and so is done afterwards, one book at a time.
+    fn finish_moves(&self, pending: PendingDeletion, files: BookFiles) -> (BookDeletion, Option<DeletionTidy>) {
+        let PendingDeletion { path_rel, title, uuid, dedicated, own, cover_sidecar, manifest, mut outcome } = pending;
+        let mut tidy = None;
         match files {
             // Ignore entries were recorded before the row went.
             BookFiles::Keep => {}
@@ -1967,14 +2136,35 @@ impl Cache {
                     outcome.failed.push((rel, why));
                 }
                 if outcome.failed.is_empty() {
-                    // `data/` subfolders emptied by the move would keep the
-                    // folder from going.
-                    self.prune_empty_data_dirs(&path_rel, dedicated, uuid.as_deref());
-                    outcome.folder_removed = self.remove_book_folder_if_empty(&path_rel, dedicated);
+                    tidy = Some(DeletionTidy { path_rel, dedicated, uuid });
                 }
             }
         }
-        Ok(outcome)
+        (outcome, tidy)
+    }
+
+    /// Removes the folder a book's files were moved out of, if that left it empty.
+    fn finish_tidy(&self, tidy: DeletionTidy, outcome: &mut BookDeletion) {
+        // `data/` subfolders emptied by the move would keep the folder from going.
+        self.prune_empty_data_dirs(&tidy.path_rel, tidy.dedicated, tidy.uuid.as_deref());
+        outcome.folder_removed = self.remove_book_folder_if_empty(&tidy.path_rel, tidy.dedicated);
+    }
+
+    /// [`Cache::delete_book_rows`] for several books in one transaction.
+    fn delete_book_rows_many(&self, book_ids: &[i32]) -> anyhow::Result<()> {
+        if book_ids.is_empty() {
+            return Ok(());
+        }
+        self.checksums().initialize()?;
+        let mut conn = self.backend.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        for book_id in book_ids {
+            crate::custom_columns::purge_book(&tx, *book_id)?;
+            tx.execute("DELETE FROM books WHERE id = ?1", (book_id,))?;
+            tx.execute("DELETE FROM checksums_db.file_checksums WHERE book_id = ?1", (book_id,))?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Removes a book's row, its custom-column values and its checksums in
@@ -2032,15 +2222,21 @@ impl Cache {
     /// case-folding filesystem cannot make two books share a folder
     /// unnoticed.
     pub(crate) fn folder_is_dedicated(&self, book_id: i32, path_rel: &str) -> anyhow::Result<bool> {
+        self.folder_is_dedicated_without(book_id, path_rel, &[])
+    }
+
+    /// [`Cache::folder_is_dedicated`] as it would answer if the books in `gone`
+    /// had already been deleted: a batch deletion reads every book's state
+    /// before it deletes any, and must still judge each folder as the one-by-one
+    /// deletion did.
+    pub(crate) fn folder_is_dedicated_without(&self, book_id: i32, path_rel: &str, gone: &[i32]) -> anyhow::Result<bool> {
         if path_rel.is_empty() {
             return Ok(false);
         }
+        // Integers only, so splicing them into the statement is safe.
+        let not_gone = if gone.is_empty() { String::new() } else { format!(" AND id NOT IN ({})", gone.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",")) };
         let conn = self.backend.conn.lock().unwrap();
-        let others: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM books WHERE id != ?1 AND lower(path) = lower(?2)",
-            (book_id, path_rel),
-            |row| row.get(0),
-        )?;
+        let others: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM books WHERE id != ?1 AND lower(path) = lower(?2){not_gone}"), (book_id, path_rel), |row| row.get(0))?;
         if others > 0 {
             return Ok(false);
         }
@@ -2048,8 +2244,10 @@ impl Cache {
         // kept there (or below it) owns that part of the folder: this one's
         // `data/**` would include its files.
         let under_data: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM books WHERE id != ?1
-               AND (lower(path) = lower(?2) || '/data' OR lower(substr(path, 1, length(?2) + 6)) = lower(?2) || '/data/')",
+            &format!(
+                "SELECT COUNT(*) FROM books WHERE id != ?1
+               AND (lower(path) = lower(?2) || '/data' OR lower(substr(path, 1, length(?2) + 6)) = lower(?2) || '/data/'){not_gone}"
+            ),
             (book_id, path_rel),
             |row| row.get(0),
         )?;
@@ -2058,6 +2256,18 @@ impl Cache {
 
     /// The files this book owns on disk, relative to the library root.
     pub(crate) fn own_files(&self, book_id: i32, path_rel: &str, dedicated: bool) -> anyhow::Result<Vec<OwnFile>> {
+        self.own_files_without(book_id, path_rel, dedicated, &[])
+    }
+
+    /// [`Cache::own_files`] as it would answer if the books in `gone` had
+    /// already been deleted (see [`Cache::folder_is_dedicated_without`]).
+    pub(crate) fn own_files_without(&self, book_id: i32, path_rel: &str, dedicated: bool, gone: &[i32]) -> anyhow::Result<Vec<OwnFile>> {
+        let not_gone = if gone.is_empty() { String::new() } else { format!(" AND d.book NOT IN ({})", gone.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",")) };
+        let claimed_sql = format!(
+            "SELECT COUNT(*) FROM data d JOIN books b ON b.id = d.book
+                     WHERE d.book != ?1 AND lower(b.path) = lower(?2)
+                       AND lower(d.name) = lower(?3) AND upper(d.format) = upper(?4){not_gone}"
+        );
         if !path_rel.is_empty() && !path_is_plain(path_rel) {
             log::warn!("book {book_id} has an unusable path {path_rel:?}; none of its files will be touched");
             return Ok(Vec::new());
@@ -2072,13 +2282,7 @@ impl Cache {
             // Another book claiming the very same file must keep it.
             let claimed_elsewhere: bool = {
                 let conn = self.backend.conn.lock().unwrap();
-                conn.query_row(
-                    "SELECT COUNT(*) FROM data d JOIN books b ON b.id = d.book
-                     WHERE d.book != ?1 AND lower(b.path) = lower(?2)
-                       AND lower(d.name) = lower(?3) AND upper(d.format) = upper(?4)",
-                    (book_id, path_rel, &name, &format),
-                    |row| row.get::<_, i64>(0),
-                )? > 0
+                conn.query_row(&claimed_sql, (book_id, path_rel, &name, &format), |row| row.get::<_, i64>(0))? > 0
             };
             if claimed_elsewhere {
                 continue;

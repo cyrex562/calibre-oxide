@@ -1,7 +1,7 @@
 // The narrow layout's drawers (C25): focus goes in, Escape closes, focus comes back.
 
 import { afterEach, describe, expect, it } from "vitest";
-import { createApp, defineComponent, h, nextTick, ref, type App } from "vue";
+import { createApp, defineComponent, h, KeepAlive, nextTick, ref, type App } from "vue";
 
 import type { Panel } from "./layout";
 import { escapeClosesDrawer, useDrawerFocus } from "./useDrawerFocus";
@@ -63,6 +63,38 @@ describe("a narrow drawer", () => {
     const event = new KeyboardEvent("keydown", { key: "Escape", cancelable: true });
     window.dispatchEvent(event);
     expect(event.defaultPrevented).toBe(false);
+  });
+});
+
+describe("a drawer inside <keep-alive>", () => {
+  it("stops answering Escape while parked and answers again when reactivated", async () => {
+    const drawer = ref<Panel | null>("details");
+    const away = ref(false);
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const Library = defineComponent({
+      setup() {
+        useDrawerFocus(drawer, () => (drawer.value = null));
+        return () => h("div", "library");
+      },
+    });
+    app = createApp({ render: () => h(KeepAlive, null, { default: () => (away.value ? h("div", "reader") : h(Library)) }) });
+    app.mount(host);
+    await settle();
+
+    away.value = true;
+    await settle();
+    const parked = new KeyboardEvent("keydown", { key: "Escape", cancelable: true });
+    window.dispatchEvent(parked);
+    expect(parked.defaultPrevented).toBe(false);
+    expect(drawer.value).toBe("details");
+
+    away.value = false;
+    await settle();
+    const back = new KeyboardEvent("keydown", { key: "Escape", cancelable: true });
+    window.dispatchEvent(back);
+    expect(back.defaultPrevented).toBe(true);
+    expect(drawer.value).toBeNull();
   });
 });
 

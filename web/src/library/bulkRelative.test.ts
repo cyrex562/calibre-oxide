@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { emptySpec } from "./useBulkEdit";
-import { RELATIVE_CHUNK, inverseRelativeOp, RelativeUnsupportedError, relativeTagOp, runRelativeEdit, type RelativeOp, type RelativeResponse } from "./bulkRelative";
+import { RELATIVE_CHUNK, inverseRelativeOp, inverseRelativeOps, RelativeUnsupportedError, relativeTagOp, runRelativeEdit, type RelativeOp, type RelativeResponse } from "./bulkRelative";
 
 const op: RelativeOp = { field: "tags", mode: "add", values: ["x"] };
 const ids = (n: number) => Array.from({ length: n }, (_, i) => i + 1);
@@ -65,7 +65,7 @@ describe("runRelativeEdit", () => {
     const result = await runRelativeEdit(ids(4), op, {
       send: async () => ({ updated: [1], unchanged: [2, 3], failed: [{ book_id: 4, error: "gone" }] }),
     });
-    expect(result).toEqual({ updated: 1, updatedIds: [1], unchanged: 2, errors: ["Book 4: gone"], notStarted: 0 });
+    expect(result).toEqual({ updated: 1, updatedIds: [1], deltas: new Map(), unchanged: 2, errors: ["Book 4: gone"], notStarted: 0 });
   });
 
   it("returns null, having sent nothing else, when the server does not know add/remove", async () => {
@@ -109,7 +109,43 @@ describe("inverseRelativeOp", () => {
     expect(inverseRelativeOp({ field: "tags", mode: "add", values: ["travel"] })).toEqual({ field: "tags", mode: "remove", values: ["travel"] });
     expect(inverseRelativeOp({ field: "tags", mode: "remove", values: ["x"] })).toEqual({ field: "tags", mode: "add", values: ["x"] });
   });
-  it("gives no undo for several tags, which could not be exact", () => {
+  it("gives no single-op undo for several tags, which could not be exact", () => {
     expect(inverseRelativeOp({ field: "tags", mode: "add", values: ["a", "b"] })).toBeNull();
+  });
+});
+
+describe("inverseRelativeOps", () => {
+  const delta = (added: string[], removed: string[] = []) => ({ added, removed });
+  it("undoes an add of several tags per book, removing only what that book gained", () => {
+    const add: RelativeOp = { field: "tags", mode: "add", values: ["a", "b"] };
+    const deltas = new Map([
+      [1, delta(["b"])], // had "a" already
+      [2, delta(["a", "b"])],
+      [3, delta(["a", "b"])],
+    ]);
+    expect(inverseRelativeOps(add, { updatedIds: [1, 2, 3], deltas })).toEqual([
+      { ids: [1], op: { field: "tags", mode: "remove", values: ["b"] } },
+      { ids: [2, 3], op: { field: "tags", mode: "remove", values: ["a", "b"] } },
+    ]);
+  });
+  it("undoes a remove by adding back the exact spellings each book lost", () => {
+    const rem: RelativeOp = { field: "tags", mode: "remove", values: ["x", "y"] };
+    const deltas = new Map([
+      [1, delta([], ["X"])],
+      [2, delta([], ["x", "Y"])],
+    ]);
+    expect(inverseRelativeOps(rem, { updatedIds: [1, 2], deltas })).toEqual([
+      { ids: [1], op: { field: "tags", mode: "add", values: ["X"] } },
+      { ids: [2], op: { field: "tags", mode: "add", values: ["x", "Y"] } },
+    ]);
+  });
+  it("falls back to the single-tag inverse without per-book detail, and none for several tags", () => {
+    expect(inverseRelativeOps({ field: "tags", mode: "add", values: ["t"] }, { updatedIds: [1, 2], deltas: new Map() })).toEqual([{ ids: [1, 2], op: { field: "tags", mode: "remove", values: ["t"] } }]);
+    expect(inverseRelativeOps({ field: "tags", mode: "add", values: ["a", "b"] }, { updatedIds: [1], deltas: new Map() })).toBeNull();
+  });
+  it("collects the deltas a run reports", async () => {
+    const result = await runRelativeEdit([1, 2], { field: "tags", mode: "add", values: ["a"] }, { send: async () => ({ updated: [1, 2], failed: [], changes: { "1": { tags: delta(["a"]) } } }) });
+    expect(result?.deltas.get(1)).toEqual(delta(["a"]));
+    expect(result?.deltas.has(2)).toBe(false);
   });
 });

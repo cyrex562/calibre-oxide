@@ -3,7 +3,7 @@ import { createRouter, createWebHistory } from "vue-router";
 import App from "./App.vue";
 import LibraryView from "./components/LibraryView.vue";
 import { applySavedSkin } from "./library/skin";
-import { reloadOnStaleChunk } from "./library/staleChunk";
+import { clearStaleChunkReload, reloadOnStaleChunk } from "./library/staleChunk";
 import "./style.css";
 import "./skin-classic.css";
 
@@ -24,6 +24,9 @@ const router = createRouter({
 // A tab kept open across a server upgrade names script files that no longer exist.
 router.onError((error, to) => {
   reloadOnStaleChunk(error, to);
+});
+router.afterEach((_to, _from, failure) => {
+  if (!failure) clearStaleChunkReload();
 });
 
 createApp(App).use(router).mount("#app");

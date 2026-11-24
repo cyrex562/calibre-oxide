@@ -125,6 +125,17 @@ pub fn detect(cache: &Cache, scan: &ScanReport) -> Result<DriftReport> {
     // edited.
     let owned_identities: HashSet<FileIdentity> = recorded.iter().filter_map(|r| r.identity).collect();
 
+    // The identity of the file at `path`: from the walk, or, when the walk left
+    // identities unread, from one open of just that file (and remembered).
+    let deferred = scan.identity_deferred;
+    let looked_up: std::cell::RefCell<HashMap<String, Option<FileIdentity>>> = Default::default();
+    let identity_at = |path: &str| -> Option<FileIdentity> {
+        if !deferred {
+            return on_disk_facts.get(path).map(|f| f.identity);
+        }
+        *looked_up.borrow_mut().entry(path.to_string()).or_insert_with(|| lexmechanic_utils::filenames::identity(&library.join(path)))
+    };
+
     for record in &recorded {
         if !on_disk.contains(record.path.as_str()) {
             absent.push(record);
@@ -132,8 +143,16 @@ pub fn detect(cache: &Cache, scan: &ScanReport) -> Result<DriftReport> {
         }
 
         let full = library.join(&record.path);
-        // From the walk's own `stat`, not another open of the file.
-        let actual_identity = on_disk_facts.get(record.path.as_str()).map(|f| f.identity);
+        // With identities unread, a file whose size still matches the record is
+        // taken as ours without opening it; only a changed size is a candidate
+        // for the swap check below. (Two files of one size that swapped names
+        // are not noticed by a check that does not open every file.)
+        let size_matches_early = matches!((record.size, on_disk_facts.get(record.path.as_str())), (Some(recorded), Some(actual)) if recorded as u64 == actual.size);
+        if deferred && size_matches_early {
+            report.unchanged += 1;
+            continue;
+        }
+        let actual_identity = identity_at(record.path.as_str());
 
         // Something is at our path, but is it our file? If the identity
         // differs *and* belongs to another record, the files were
@@ -209,9 +228,20 @@ pub fn detect(cache: &Cache, scan: &ScanReport) -> Result<DriftReport> {
     let mut still_absent: Vec<&Recorded> = Vec::new();
 
     let mut by_identity: HashMap<FileIdentity, &str> = HashMap::new();
-    for path in &untracked {
-        if let Some(facts) = on_disk_facts.get(*path) {
-            by_identity.entry(facts.identity).or_insert(path);
+    if !deferred {
+        for path in &untracked {
+            if let Some(facts) = on_disk_facts.get(*path) {
+                by_identity.entry(facts.identity).or_insert(path);
+            }
+        }
+    } else if absent.iter().any(|r| r.identity.is_some()) {
+        // Only when something went missing does an untracked file's identity matter (it
+        // may be that thing, moved or renamed -- even edited since); a folder with
+        // nothing missing, which is the usual check, opens none of them.
+        for path in &untracked {
+            if let Some(identity) = identity_at(path) {
+                by_identity.entry(identity).or_insert(path);
+            }
         }
     }
 
@@ -686,5 +716,93 @@ mod tests {
         let report = detect(&cache, &scan(dir.path())).unwrap();
         assert!(report.hashes.is_empty());
         assert_eq!(report.untracked.len(), 5);
+    }
+
+    // -----------------------------------------------------------------
+    // A walk that leaves identities unread (Check Library, tranche 29c)
+    // -----------------------------------------------------------------
+
+    fn lazy_scan(dir: &Path) -> ScanReport {
+        walk(dir, &ScanOptions { lazy_identity: true, ..ScanOptions::default() }, SystemTime::now() + Duration::from_secs(3600)).unwrap()
+    }
+
+    /// The same library, eagerly and lazily, must give the same answer: that is what makes
+    /// the cheap walk safe to use for the check.
+    fn same_answer(cache: &Cache, dir: &Path) -> DriftReport {
+        let eager = detect(cache, &scan(dir)).unwrap();
+        let lazy = detect(cache, &lazy_scan(dir)).unwrap();
+        assert_eq!(eager.unchanged, lazy.unchanged);
+        assert_eq!(eager.edited, lazy.edited);
+        assert_eq!(eager.moved, lazy.moved);
+        assert_eq!(eager.untracked, lazy.untracked);
+        assert_eq!(eager.missing, lazy.missing);
+        assert_eq!(eager.conclusive, lazy.conclusive);
+        lazy
+    }
+
+    #[test]
+    fn a_lazy_walk_reads_no_identity_and_says_so() {
+        let (dir, cache) = library();
+        write(&dir.path().join("a.pdf"), b"%PDF one");
+        index(dir.path(), &cache);
+        let report = lazy_scan(dir.path());
+        assert!(report.identity_deferred);
+        assert!(report.files.iter().all(|f| f.facts.identity == FileIdentity { volume: 0, index: 0 } && f.facts.size > 0));
+        assert!(!scan(dir.path()).identity_deferred);
+    }
+
+    /// Every kind of change at once: untouched, edited (new size), renamed, renamed and
+    /// edited, deleted, and a new file.
+    #[test]
+    fn a_lazy_walk_finds_what_an_eager_one_finds() {
+        let (dir, cache) = library();
+        for name in ["same", "edited", "renamed", "renamed-edited", "deleted"] {
+            write(&dir.path().join(format!("{name}.pdf")), format!("%PDF original {name} content").as_bytes());
+        }
+        write(&dir.path().join("sub/deep.pdf"), b"%PDF deep original");
+        index(dir.path(), &cache);
+
+        write(&dir.path().join("edited.pdf"), b"%PDF edited with annotations added");
+        std::fs::rename(dir.path().join("renamed.pdf"), dir.path().join("sub/renamed elsewhere.pdf")).unwrap();
+        std::fs::rename(dir.path().join("renamed-edited.pdf"), dir.path().join("renamed-edited-new.pdf")).unwrap();
+        write(&dir.path().join("renamed-edited-new.pdf"), b"%PDF this one was renamed and edited as well");
+        std::fs::remove_file(dir.path().join("deleted.pdf")).unwrap();
+        write(&dir.path().join("brand new.pdf"), b"%PDF new");
+
+        let lazy = same_answer(&cache, dir.path());
+        assert_eq!(lazy.moved.len(), 2, "{lazy:?}");
+        assert_eq!(lazy.edited.len(), 1);
+        assert_eq!(lazy.missing.len(), 1);
+        assert_eq!(lazy.untracked, vec!["brand new.pdf".to_string()]);
+    }
+
+    /// Files that differ in size are still caught when two swap names.
+    #[test]
+    fn a_lazy_walk_still_sees_a_swap_of_files_of_different_sizes() {
+        let (dir, cache) = library();
+        write(&dir.path().join("a.pdf"), b"%PDF the first, short");
+        write(&dir.path().join("b.pdf"), b"%PDF the second one is a good deal longer than the first");
+        index(dir.path(), &cache);
+        std::fs::rename(dir.path().join("a.pdf"), dir.path().join("tmp.pdf")).unwrap();
+        std::fs::rename(dir.path().join("b.pdf"), dir.path().join("a.pdf")).unwrap();
+        std::fs::rename(dir.path().join("tmp.pdf"), dir.path().join("b.pdf")).unwrap();
+
+        let lazy = same_answer(&cache, dir.path());
+        assert!(lazy.edited.is_empty() && lazy.missing.is_empty(), "{lazy:?}");
+        assert_eq!(lazy.moved.len(), 2);
+    }
+
+    /// With nothing missing no file needs its identity, however many there are (the eager
+    /// walk opened every one); the answer is the same.
+    #[test]
+    fn a_lazy_check_of_an_unchanged_library_finds_nothing_to_report() {
+        let (dir, cache) = library();
+        for i in 0..20 {
+            write(&dir.path().join(format!("f{i}.pdf")), format!("%PDF number {i}").as_bytes());
+        }
+        index(dir.path(), &cache);
+        let report = detect(&cache, &lazy_scan(dir.path())).unwrap();
+        assert_eq!(report.unchanged, 20);
+        assert!(report.moved.is_empty() && report.missing.is_empty() && report.untracked.is_empty());
     }
 }

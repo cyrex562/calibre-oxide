@@ -330,11 +330,18 @@ const CASES: &[Case] = &[
             metadata: meta,
             files: vec![crate::cache::ImportFile { staged: staged.join("imported.pdf"), ext: "pdf".to_string(), size: 13, hash: blake3::hash(b"%PDF imported").to_hex().to_string() }],
             placement: None,
+            queue_enrichment: None,
         };
         c.import_books_batch(&[item]).remove(0).unwrap();
     }),
     case!("trash_book (stays removed)", |c, f| {
         c.delete_book_with(f.first, crate::cache::BookFiles::Trash).unwrap();
+        c.empty_trash().unwrap();
+    }),
+    case!("delete_books_with (batch, stays removed)", |c, f| {
+        for result in c.delete_books_with(&[f.first, f.second], crate::cache::BookFiles::Trash) {
+            result.unwrap();
+        }
         c.empty_trash().unwrap();
     }),
     case!("rename_format_files", |c, f| { c.rename_format_files(f.first, "renamed-on-disk").unwrap(); }),
@@ -595,6 +602,7 @@ const ACCOUNTED: &[(&str, Account)] = &[
     ("cache.rs::add_format", Case("add_format")),
     ("cache.rs::remove_format_inner", Case("remove_format")),
     ("cache.rs::delete_book_rows", Case("delete_book")),
+    ("cache.rs::delete_book_rows_many", Case("delete_books_with (batch, stays removed)")),
     ("cache.rs::set_book_location", Case("set_book_location")),
     ("cache.rs::rename_format_files", Case("rename_format_files")),
     ("cache.rs::register_books_in_place", Case("register_books_in_place (batch)")),
@@ -634,6 +642,7 @@ const ACCOUNTED: &[(&str, Account)] = &[
 const EXCLUDED: &[(&str, &str)] = &[
     ("field_feed_tests.rs", "tests of the field snapshot, which write rows with raw SQL on purpose"),
     ("t26a_tests.rs", "tests that backdate last_modified with raw SQL to see it move"),
+    ("t29b_tests.rs", "tests and timing probes that build a library with raw SQL on purpose"),
     ("schema_upgrades.rs", "one-time schema migrations"),
     ("checksums.rs", "the checksum sidecar db"),
     ("orphans.rs", "the checksum sidecar db"),

@@ -1,15 +1,13 @@
 // Details of the round-2 fixes that no component test renders (no layout in jsdom), held by
 // reading the sources: the sticky first column, placeholders that read as examples, and the
-// category panel's note about counts under a virtual library.
+// (the category panel's counts under a virtual library are in CategoryBrowser.vl.test.ts).
 
-import { afterEach, describe, expect, it } from "vitest";
-import { createApp, nextTick, type App } from "vue";
+import { describe, expect, it } from "vitest";
 
 import cssSource from "../style.css?raw";
 import detailsSource from "./BookDetailsPanel.vue?raw";
 import tableSource from "./BookTable.vue?raw";
 import settingsSource from "../settings/SettingsView.vue?raw";
-import CategoryBrowser from "./CategoryBrowser.vue";
 
 describe("the table's sticky first column (U17)", () => {
   it("marks the first column's header and cells, and pins them left over their own surface", () => {
@@ -34,34 +32,5 @@ describe("placeholders (U15)", () => {
         if (/@|example\.com|scifi|Jane Doe|\.zip|\/\/h:|^\d+$|program:/.test(text)) expect(text, `placeholder "${text}"`).toMatch(/^e\.g\. /);
       }
     }
-  });
-});
-
-describe("the category panel under a virtual library (C19)", () => {
-  let app: App | null = null;
-  afterEach(() => {
-    app?.unmount();
-    app = null;
-    document.body.replaceChildren();
-  });
-
-  async function mount(virtualLibrary: string) {
-    const host = document.createElement("div");
-    document.body.appendChild(host);
-    app = createApp(CategoryBrowser, { virtualLibrary });
-    app.mount(host);
-    await nextTick();
-    return host;
-  }
-
-  it("says the counts are for the whole library", async () => {
-    const el = await mount("Travel shelf");
-    expect(el.querySelector('[data-testid="vl-count-note"]')!.textContent).toContain("whole library");
-    expect(el.querySelector('[data-testid="vl-count-note"]')!.textContent).toContain("Travel shelf");
-  });
-
-  it("says nothing without one", async () => {
-    const el = await mount("");
-    expect(el.querySelector('[data-testid="vl-count-note"]')).toBeNull();
   });
 });

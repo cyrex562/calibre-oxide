@@ -23,7 +23,7 @@
 //! does a full reload, as does any event that cannot be attributed to a book.
 
 use crate::fields::FieldStore;
-use crate::tables::ItemTable;
+use crate::tables::{ItemTable, StandardTables};
 use rusqlite::hooks::Action;
 use rusqlite::{Connection, OptionalExtension, Result};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -162,6 +162,36 @@ impl FieldFeed {
     }
 }
 
+/// A hasher for the `(table, row id)` keys of [`Loaded::reverse`], which has
+/// 400,000 of them at 50,000 books and is filled on every full load. The
+/// standard SipHash costs more there than the queries that feed it; these keys
+/// are this process's own row ids, not input anyone can choose to collide.
+#[derive(Default)]
+pub(crate) struct RowHasher(u64);
+
+impl std::hash::Hasher for RowHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(5) ^ u64::from(b)).wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+    }
+    fn write_u8(&mut self, i: u8) {
+        self.0 = (self.0.rotate_left(5) ^ u64::from(i)).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    fn write_i64(&mut self, i: i64) {
+        self.write_u64(i as u64);
+    }
+    fn write_isize(&mut self, i: isize) {
+        self.write_u64(i as u64);
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
 /// A snapshot of the standard fields and what is needed to keep it current.
 pub(crate) struct Loaded {
     data_version: i64,
@@ -169,7 +199,7 @@ pub(crate) struct Loaded {
     pub(crate) store: Arc<FieldStore>,
     /// Row id -> book, for the tables with a `book` column. A delete event
     /// carries only the row id, and by then the row is gone.
-    reverse: HashMap<(FeedTable, i64), i32>,
+    reverse: HashMap<(FeedTable, i64), i32, std::hash::BuildHasherDefault<RowHasher>>,
 }
 
 fn data_version(conn: &Connection) -> i64 {
@@ -180,13 +210,13 @@ fn data_version(conn: &Connection) -> i64 {
     }
 }
 
-fn full_load(conn: &Connection, feed: &FieldFeed) -> Result<Loaded> {
-    // The position is taken first: an event raised while loading is then
-    // read again later, which costs a redundant patch, never a missed one.
-    let pos = feed.position();
-    let data_version = data_version(conn);
+/// Loads everything from `conn`, for a snapshot to be known as of `pos` and
+/// `data_version` (both read **before** the load: an event raised while
+/// loading is then read again later, which costs a redundant patch, never a
+/// missed one).
+fn full_load_on(conn: &Connection, pos: u64, data_version: i64) -> Result<Loaded> {
     let store = Arc::new(FieldStore::load(conn)?);
-    let mut reverse = HashMap::new();
+    let mut reverse: HashMap<(FeedTable, i64), i32, _> = HashMap::default();
     for t in KEYED {
         let name = t.keyed_name().unwrap();
         let mut stmt = conn.prepare(&format!("SELECT id, book FROM {name}"))?;
@@ -199,40 +229,112 @@ fn full_load(conn: &Connection, feed: &FieldFeed) -> Result<Loaded> {
     Ok(Loaded { data_version, pos, store, reverse })
 }
 
+/// [`full_load_on`] on the reading connection, in one read transaction: every
+/// table is read from the same moment, however long the load takes, and the
+/// main connection is not held for any of it.
+fn full_load_on_reader(reader: &Mutex<Connection>, pos: u64, data_version: i64) -> Result<Loaded> {
+    let conn = reader.lock().unwrap();
+    conn.execute_batch("BEGIN")?;
+    let loaded = full_load_on(&conn, pos, data_version);
+    let _ = conn.execute_batch("ROLLBACK");
+    loaded
+}
+
+/// What a refresh found out while it held the connection.
+enum Plan {
+    /// Nothing happened since: this snapshot is current.
+    Current(Arc<FieldStore>),
+    /// These books and item tables changed, read afresh from the database.
+    Patch { pos: u64, books: Vec<(i32, StandardTables)>, items: Vec<(ItemTable, StandardTables)> },
+    /// The snapshot cannot be patched: load it all again, as of `pos` and `data_version`.
+    Full { pos: u64, data_version: i64 },
+}
+
 /// Brings `slot` up to date with `conn` and returns the snapshot. `full_loads`
 /// counts the full reloads. The snapshot is shared: a reader keeps using it
-/// after the lock is released, and a later patch copies it first rather than
-/// changing what that reader sees.
-pub(crate) fn refresh(
-    slot: &mut Option<Loaded>,
-    conn: &Connection,
-    feed: &FieldFeed,
-    full_loads: &std::sync::atomic::AtomicUsize,
-) -> Result<Arc<FieldStore>> {
-    let mut need_full = true;
+/// after the lock is released, and a later patch copies what it changes
+/// (never what it does not: see `StandardTables`) rather than changing what
+/// that reader sees.
+///
+/// The connection is held only for what has to be read from it. Patching is
+/// done after it is let go: it copies the changed tables, which with the
+/// snapshot shared by a reader in flight used to be a 120 ms deep copy of
+/// the whole store, done under the connection lock where every request
+/// waited for it. A full load is done on `reader`, the library's second,
+/// reading connection, when there is one (see `Backend::reader`), so it does
+/// not hold the connection for its 0.5-0.9 s either. `slot` is held
+/// throughout, so refreshes are one at a time and each sees the last one's
+/// result.
+pub(crate) fn refresh(slot: &Mutex<Option<Loaded>>, conn: &Mutex<Connection>, reader: Option<&Mutex<Connection>>, feed: &FieldFeed, full_loads: &std::sync::atomic::AtomicUsize) -> Result<Arc<FieldStore>> {
+    let mut slot = slot.lock().unwrap();
+    let conn_guard = conn.lock().unwrap();
+    let plan = plan(&mut slot, &conn_guard, feed)?;
+    match plan {
+        Plan::Current(store) => Ok(store),
+        Plan::Patch { pos, books, items } => {
+            drop(conn_guard);
+            let loaded = slot.as_mut().expect("a patch is planned against a loaded snapshot");
+            if !books.is_empty() || !items.is_empty() {
+                // Copies the store (its tables are shared, so only the
+                // table handles) only if a reader still holds it.
+                let store = Arc::make_mut(&mut loaded.store);
+                for (item, fresh) in &items {
+                    store.adopt_item_table(fresh, *item);
+                }
+                for (book, fresh) in &books {
+                    store.adopt_book(fresh, *book);
+                }
+            }
+            loaded.pos = pos;
+            Ok(Arc::clone(&loaded.store))
+        }
+        Plan::Full { pos, data_version } => {
+            let loaded = match reader {
+                Some(reader) => {
+                    drop(conn_guard);
+                    // A load that cannot run on the reader (it deletes the
+                    // ratings of 0 it finds, which a reader may not) is done
+                    // on the main connection, as it always was.
+                    match full_load_on_reader(reader, pos, data_version) {
+                        Ok(loaded) => loaded,
+                        Err(_) => {
+                            let conn = conn.lock().unwrap();
+                            full_load_on(&conn, feed.position(), self::data_version(&conn))?
+                        }
+                    }
+                }
+                None => full_load_on(&conn_guard, pos, data_version)?,
+            };
+            *slot = Some(loaded);
+            full_loads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(Arc::clone(&slot.as_ref().unwrap().store))
+        }
+    }
+}
+
+fn plan(slot: &mut Option<Loaded>, conn: &Connection, feed: &FieldFeed) -> Result<Plan> {
+    let data_version = data_version(conn);
+    let pos = feed.position();
     if let Some(loaded) = slot.as_mut() {
-        if loaded.data_version == data_version(conn) {
-            let pos = feed.position();
+        if loaded.data_version == data_version {
             if pos == loaded.pos {
-                need_full = false;
-            } else if let Some(events) = feed.since(loaded.pos) {
-                if apply(loaded, conn, events)? {
-                    loaded.pos = pos;
-                    need_full = false;
+                return Ok(Plan::Current(Arc::clone(&loaded.store)));
+            }
+            if let Some(events) = feed.since(loaded.pos) {
+                if let Some((books, items)) = attribute(loaded, conn, events)? {
+                    return Ok(Plan::Patch { pos, books, items });
                 }
             }
         }
     }
-    if need_full {
-        *slot = Some(full_load(conn, feed)?);
-        full_loads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-    Ok(Arc::clone(&slot.as_ref().unwrap().store))
+    Ok(Plan::Full { pos, data_version })
 }
 
-/// Patches the snapshot for `events`. `Ok(false)` means they cannot be
-/// attributed and the caller must reload in full.
-fn apply(loaded: &mut Loaded, conn: &Connection, events: Vec<RowEvent>) -> Result<bool> {
+/// Works out from `events` which books and item tables changed, and reads
+/// them. `Ok(None)` means they cannot be attributed and the caller must
+/// reload in full.
+#[allow(clippy::type_complexity)]
+fn attribute(loaded: &mut Loaded, conn: &Connection, events: Vec<RowEvent>) -> Result<Option<(Vec<(i32, StandardTables)>, Vec<(ItemTable, StandardTables)>)>> {
     let mut books: BTreeSet<i32> = BTreeSet::new();
     let mut items: HashSet<ItemTable> = HashSet::new();
     // Rows inserted and deleted again inside this batch were never in the
@@ -256,7 +358,7 @@ fn apply(loaded: &mut Loaded, conn: &Connection, events: Vec<RowEvent>) -> Resul
                         }
                         None => {
                             if !transient.remove(&key) {
-                                return Ok(false);
+                                return Ok(None);
                             }
                         }
                     }
@@ -280,20 +382,21 @@ fn apply(loaded: &mut Loaded, conn: &Connection, events: Vec<RowEvent>) -> Resul
             }
         }
         if books.len() > MAX_PATCHED_BOOKS {
-            return Ok(false);
+            return Ok(None);
         }
     }
 
-    if items.is_empty() && books.is_empty() {
-        return Ok(true);
-    }
-    // Copies the snapshot only if a reader still holds it.
-    let store = Arc::make_mut(&mut loaded.store);
+    let mut fresh_items = Vec::with_capacity(items.len());
     for item in items {
-        store.reload_item_table(conn, item)?;
+        let mut fresh = StandardTables::empty();
+        fresh.read_item_table(conn, item)?;
+        fresh_items.push((item, fresh));
     }
+    let mut fresh_books = Vec::with_capacity(books.len());
     for book in books {
-        store.reload_book(conn, book)?;
+        let mut fresh = StandardTables::empty();
+        fresh.read_book_rows(conn, book)?;
+        fresh_books.push((book, fresh));
     }
-    Ok(true)
+    Ok(Some((fresh_books, fresh_items)))
 }

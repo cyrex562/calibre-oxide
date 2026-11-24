@@ -31,7 +31,9 @@ async fn a_folder_is_imported_as_a_job_with_a_report() {
     assert_eq!(job["state"], "finished", "{job}");
     assert_eq!(job["report"]["books_added"], 3, "{job}");
     assert_eq!(job["report"]["conclusive"], true);
-    assert_eq!(job["progress"]["phase"], "importing");
+    // The import ends with the pass that renders the covers it left for later.
+    assert_eq!(job["progress"]["phase"], "enriching");
+    assert!(job["report"]["enrichment"].is_object(), "{job}");
     assert_eq!(cache.all_book_ids().unwrap().len(), 3);
     // Copied in, in calibre's layout, with the source left alone.
     let ids = cache.all_book_ids().unwrap();

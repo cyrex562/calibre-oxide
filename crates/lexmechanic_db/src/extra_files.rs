@@ -143,32 +143,62 @@ fn data_dir(cache: &Cache, book_id: i32) -> anyhow::Result<Option<PathBuf>> {
     Ok(Some(cache.backend.library_path.join(DATA_DIR_NAME).join(uuid)))
 }
 
-/// True when `path` belongs to another book: it is a book's tracked format
-/// file, or it sits directly in another book's folder. A source tree with
-/// `Reports/report.pdf` and `Reports/data/dataset.pdf` gives two books the
-/// paths `Reports` and `Reports/data`, and the first book's `data/` directory
-/// is then the second book's folder -- its files are not attached data files.
-fn claimed_by_other_book(cache: &Cache, book_id: i32, path: &Path) -> bool {
-    let Ok(rel) = path.strip_prefix(&cache.backend.library_path) else { return false };
-    let rel = rel.to_string_lossy().replace('\\', "/");
-    let parent = rel.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
-    let conn = cache.backend.conn.lock().unwrap();
-    let is_format: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM data d JOIN books b ON b.id = d.book
-             WHERE lower(CASE WHEN b.path = '' THEN '' ELSE b.path || '/' END || d.name || '.' || d.format) = lower(?1)",
-            [&rel],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    if is_format > 0 {
-        return true;
+/// Which paths under a book's data directory belong to some other book.
+///
+/// A path does when it is a tracked format file, or when it sits anywhere below another book's
+/// folder: a source tree with `Reports/report.pdf` and `Reports/data/dataset.pdf` gives two books
+/// the paths `Reports` and `Reports/data`, and the first book's `data/` directory is then the
+/// second book's folder -- its files, and those of its own `data/` below, are not attached data
+/// files, however deep the second book is nested.
+///
+/// Loaded once per call (two queries over the whole library), not asked per file: a book with
+/// hundreds of attachments in a library of 100k books would otherwise scan the table twice each.
+struct Claims {
+    library: PathBuf,
+    /// The data directory relative to the library, lower-cased: only folders at or below it count.
+    scope_len: usize,
+    formats: std::collections::HashSet<String>,
+    folders: std::collections::HashSet<String>,
+}
+
+impl Claims {
+    fn load(cache: &Cache, book_id: i32, dir: &Path) -> Self {
+        let library = cache.backend.library_path.clone();
+        let scope = dir.strip_prefix(&library).map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+        let mut formats = std::collections::HashSet::new();
+        let mut folders = std::collections::HashSet::new();
+        let conn = cache.backend.conn.lock().unwrap();
+        if let Ok(mut stmt) = conn.prepare("SELECT lower(CASE WHEN b.path = '' THEN '' ELSE b.path || '/' END || d.name || '.' || d.format) FROM data d JOIN books b ON b.id = d.book") {
+            if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
+                formats.extend(rows.flatten());
+            }
+        }
+        if let Ok(mut stmt) = conn.prepare("SELECT lower(path) FROM books WHERE id != ?1 AND path != ''") {
+            if let Ok(rows) = stmt.query_map([book_id], |row| row.get::<_, String>(0)) {
+                folders.extend(rows.flatten());
+            }
+        }
+        Claims { library, scope_len: scope.to_lowercase().len(), formats, folders }
     }
-    if parent.is_empty() {
-        return false;
+
+    fn claims(&self, path: &Path) -> bool {
+        let Ok(rel) = path.strip_prefix(&self.library) else { return false };
+        let rel = rel.to_string_lossy().replace('\\', "/").to_lowercase();
+        if self.formats.contains(&rel) {
+            return true;
+        }
+        let mut parent = rel.as_str();
+        while let Some((up, _)) = parent.rsplit_once('/') {
+            if up.len() < self.scope_len {
+                break;
+            }
+            if self.folders.contains(up) {
+                return true;
+            }
+            parent = up;
+        }
+        false
     }
-    let in_other_folder: i64 = conn.query_row("SELECT COUNT(*) FROM books WHERE id != ?1 AND lower(path) = lower(?2)", (book_id, parent), |row| row.get(0)).unwrap_or(0);
-    in_other_folder > 0
 }
 
 /// Resolves one API relpath to a real path inside `dir`, rejecting
@@ -206,9 +236,10 @@ pub fn list_extra_files(cache: &Cache, book_id: i32, pattern: &str) -> anyhow::R
     // went with it.
     let _ = pattern;
 
+    let claims = Claims::load(cache, book_id, &dir);
     let mut out = Vec::new();
     for path in walk_dir(&dir) {
-        if !path.is_file() || claimed_by_other_book(cache, book_id, &path) {
+        if !path.is_file() || claims.claims(&path) {
             continue;
         }
         let Some(relpath) = api_relpath(&dir, &path) else { continue };
@@ -309,11 +340,12 @@ pub fn remove_extra_files(cache: &Cache, book_id: i32, relpaths: &[String], _per
         return Ok(relpaths.iter().map(|r| (r.clone(), None)).collect());
     };
     let mut errors = HashMap::new();
+    let claims = Claims::load(cache, book_id, &dir);
     for relpath in relpaths {
         let Some(path) = on_disk(&dir, relpath) else {
             continue; // matches upstream: an escaping path is silently skipped, not an error
         };
-        if claimed_by_other_book(cache, book_id, &path) {
+        if claims.claims(&path) {
             errors.insert(relpath.clone(), Some("that file belongs to another book".to_string()));
             continue;
         }

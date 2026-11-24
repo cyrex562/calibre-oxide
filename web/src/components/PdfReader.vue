@@ -230,7 +230,16 @@ async function draw() {
   }
 }
 
+// Each load takes a number; one that is no longer the newest finishes quietly, so a slow open
+// of a previous book can neither replace the current document nor restore its position.
+let loadSeq = 0;
+
 async function load() {
+  const token = ++loadSeq;
+  const stale = () => token !== loadSeq;
+  scanRun += 1; // a search still running on the old document must not feed hits into the new one
+  scanning.value = false;
+  searchedKey = "";
   loading.value = true;
   error.value = null;
   renderer.cancel();
@@ -242,6 +251,10 @@ async function load() {
     const pdfjs = await loadPdfJs();
     const task = pdfjs.getDocument({ url: pdfUrl(props.bookId), ...PDF_ASSET_OPTIONS, ...PDF_LOAD_OPTIONS });
     const loaded = await task.promise;
+    if (stale()) {
+      void loaded.destroy();
+      return;
+    }
     void doc.value?.destroy();
     doc.value = loaded;
     pageCount.value = loaded.numPages;
@@ -273,6 +286,7 @@ async function load() {
     try {
       // Positions come back one per device; prefer this device's own.
       const positions = await getLastReadPositions(props.bookId, "pdf");
+      if (stale()) return;
       const mine = positions.find((p) => p.device === deviceId()) ?? positions[0];
       const restored = mine?.cfi ? Number.parseInt(mine.cfi, 10) : Number.NaN;
       start = clampPage(restored, loaded.numPages);
@@ -283,11 +297,12 @@ async function load() {
     // The one and only draw of a freshly opened book.
     loading.value = false;
     await nextTick();
+    if (stale()) return;
     await draw();
   } catch (e) {
-    error.value = humanError(e);
+    if (!stale()) error.value = humanError(e);
   } finally {
-    loading.value = false;
+    if (!stale()) loading.value = false;
   }
 }
 

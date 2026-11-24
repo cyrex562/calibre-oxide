@@ -218,6 +218,9 @@ fn spawn_checkpoint_thread(
         });
 }
 
+/// The busy timeout of the library's connections (see `Backend::new`).
+pub(crate) const BUSY_TIMEOUT_MS: u64 = 5000;
+
 fn refuse_open(msg: String) -> SqlError {
     SqlError::SqliteFailure(
         rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
@@ -244,6 +247,16 @@ fn configure_journal_mode(
     let want = JournalMode::for_tier(tier);
     let current: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
     if want == JournalMode::Wal {
+        // `synchronous=FULL`, not `NORMAL`, deliberately (tranche 29 looked at
+        // it as part of the per-write cost). In WAL mode NORMAL does not sync
+        // the log at commit, only when it is checkpointed: a commit survives
+        // the application dying but not a power cut or a crash of the system,
+        // which can lose the last few acknowledged writes. Calibre's own
+        // default (FULL) does not, and a write acknowledged to a client is a
+        // promise. What was sped up instead is everything *around* that one
+        // sync: one transaction and one change-log entry per request, not per
+        // group (`set-fields-batch`), and one change-log sync shared by the
+        // writers who arrive together (`ChangeLog::append_grouped`).
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
         return Ok("wal".to_string());
     }
@@ -332,6 +345,9 @@ pub struct Backend {
     /// Keeps this process's "this path is open" registration alive for
     /// as long as any clone of this `Backend` is.
     _open_guard: Arc<crate::storage_safety::ProcessOpenGuard>,
+    /// The second, read-only connection of [`Backend::reader`], opened the
+    /// first time it is asked for.
+    reader: Arc<Mutex<Option<Arc<Mutex<Connection>>>>>,
 }
 
 /// What the server and UI show about where the library lives (#258).
@@ -421,6 +437,15 @@ impl Backend {
 
         let mut conn = Connection::open(&db_path)?;
 
+        // How long a statement waits for another connection's lock before
+        // failing with "database is locked": 5 s, on this connection and on
+        // [`Backend::reader`]'s, set here rather than left to the library's
+        // default so it is a decision made once and tested. (A fingerprint
+        // job that ran for an hour died of that error with no timeout set on
+        // the connection it used; the longer waits a job can meet are retried
+        // by the job itself, see `checksums::retry_on_busy`.)
+        conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
+
         // Port of `Connection.__init__`'s pragmas.
         conn.execute_batch(
             "PRAGMA cache_size=-5000; PRAGMA temp_store=2; PRAGMA foreign_keys=ON;",
@@ -491,6 +516,7 @@ impl Backend {
             checkpoint_thread_running: false,
             in_use: Arc::new(in_use),
             _open_guard: Arc::new(open_guard),
+            reader: Arc::new(Mutex::new(None)),
         };
 
         // Port of `DB.__init__`'s `self.library_id` access: "Guarantee
@@ -556,6 +582,43 @@ impl Backend {
     /// `"wal"` or `"delete"`: the journal mode `metadata.db` is in.
     pub fn journal_mode(&self) -> &str {
         &self.journal_mode
+    }
+
+    /// A second connection to the library, for **reading** (`query_only`),
+    /// opened the first time it is asked for and shared by every clone.
+    ///
+    /// In WAL mode a reader does not wait for the writer or the other way
+    /// round, so the library-wide reads that used to take the main
+    /// connection's lock for seconds (the duplicate scan's checksum queries,
+    /// the field snapshot's full load) run here and every other request
+    /// carries on. A read sees what has been committed: it never sees the
+    /// main connection's open transaction, which is why nothing that reads
+    /// its own uncommitted writes may use it.
+    ///
+    /// `None` on the network tier (journal mode `delete`: there readers and
+    /// the writer exclude each other, so a second connection would only add
+    /// contention over the network), and if it cannot be opened. Callers
+    /// fall back to the main connection.
+    pub fn reader(&self) -> Option<Arc<Mutex<Connection>>> {
+        if self.journal_mode != "wal" {
+            return None;
+        }
+        let mut slot = self.reader.lock().unwrap();
+        if slot.is_none() {
+            let opened = Connection::open(&self.db_path).and_then(|conn| {
+                conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
+                conn.execute_batch("PRAGMA query_only=ON; PRAGMA cache_size=-5000; PRAGMA temp_store=2;")?;
+                Ok(conn)
+            });
+            match opened {
+                Ok(conn) => *slot = Some(Arc::new(Mutex::new(conn))),
+                Err(e) => {
+                    log::warn!("could not open a reading connection to {}: {e}", self.db_path.display());
+                    return None;
+                }
+            }
+        }
+        slot.clone()
     }
 
     /// Whether the background WAL checkpoint thread was started.

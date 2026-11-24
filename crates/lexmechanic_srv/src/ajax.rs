@@ -278,17 +278,66 @@ fn bytewise_order_matches_icu<'a>(keys: impl Iterator<Item = &'a str>) -> bool {
 /// [`bytewise_order_matches_icu`]), the rest with ICU collation. The sort is
 /// stable, so equal keys stay in the order they came in.
 fn sort_keyed(keyed: &mut [(i64, Vec<String>)], fields: usize, descending: bool) {
-    let bytewise: Vec<bool> = (0..fields).map(|j| bytewise_order_matches_icu(keyed.iter().map(|(_, keys)| keys[j].as_str()))).collect();
-    keyed.sort_by(|(_, a), (_, b)| {
-        for ((ka, kb), bytes) in a.iter().zip(b.iter()).zip(bytewise.iter()) {
-            let (x, y) = if descending { (kb, ka) } else { (ka, kb) };
-            let cmp = if *bytes { x.as_bytes().cmp(y.as_bytes()) } else { lexmechanic_utils::icu::strcmp(x, y) };
-            if cmp != std::cmp::Ordering::Equal {
-                return cmp;
+    let bytewise = bytewise_columns(keyed, fields);
+    keyed.sort_by(|(_, a), (_, b)| compare_keys(a, b, &bytewise, descending));
+}
+
+/// Which of the `fields` columns of `keyed` are compared as bytes (see [`bytewise_order_matches_icu`]).
+fn bytewise_columns(keyed: &[(i64, Vec<String>)], fields: usize) -> Vec<bool> {
+    (0..fields).map(|j| bytewise_order_matches_icu(keyed.iter().map(|(_, keys)| keys[j].as_str()))).collect()
+}
+
+/// The order of two rows' keys, field by field.
+fn compare_keys(a: &[String], b: &[String], bytewise: &[bool], descending: bool) -> std::cmp::Ordering {
+    for ((ka, kb), bytes) in a.iter().zip(b.iter()).zip(bytewise.iter()) {
+        let (x, y) = if descending { (kb, ka) } else { (ka, kb) };
+        let cmp = if *bytes { x.as_bytes().cmp(y.as_bytes()) } else { lexmechanic_utils::icu::strcmp(x, y) };
+        if cmp != std::cmp::Ordering::Equal {
+            return cmp;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// A library's ids in ascending sort order, with where each run of rows whose
+/// keys compare equal begins. Rows with equal keys stay in id order in a
+/// stable sort whichever way it runs, so the *descending* order is the same
+/// runs taken last to first, each still in its own order: it is not simply
+/// this order reversed, which would put the ties in descending id order.
+/// Keeping this one order serves both directions.
+struct SortedOrder {
+    ids: Vec<i64>,
+    run_starts: Vec<usize>,
+}
+
+impl SortedOrder {
+    /// Sorts `keyed` ascending, which must already be in id order.
+    fn build(mut keyed: Vec<(i64, Vec<String>)>, fields: usize) -> Self {
+        let bytewise = bytewise_columns(&keyed, fields);
+        keyed.sort_by(|(_, a), (_, b)| compare_keys(a, b, &bytewise, false));
+        let mut run_starts = Vec::new();
+        for i in 0..keyed.len() {
+            if i == 0 || compare_keys(&keyed[i - 1].1, &keyed[i].1, &bytewise, false) != std::cmp::Ordering::Equal {
+                run_starts.push(i);
             }
         }
-        std::cmp::Ordering::Equal
-    });
+        SortedOrder { ids: keyed.into_iter().map(|(id, _)| id).collect(), run_starts }
+    }
+
+    /// The ids in the order asked for, those in `keep` only.
+    fn filtered(&self, descending: bool, keep: &HashSet<i32>) -> Vec<i64> {
+        let wanted = |id: &&i64| keep.contains(&(**id as i32));
+        if !descending {
+            return self.ids.iter().filter(wanted).copied().collect();
+        }
+        let mut out = Vec::with_capacity(keep.len());
+        let mut end = self.ids.len();
+        for &start in self.run_starts.iter().rev() {
+            out.extend(self.ids[start..end].iter().filter(wanted).copied());
+            end = start;
+        }
+        out
+    }
 }
 
 /// The ids of `ids` in sort order. When the result is most of the library
@@ -307,7 +356,7 @@ async fn sorted_ids(cache: &std::sync::Arc<lexmechanic_db::cache::Cache>, ids: H
     let field_list: Vec<String> = fields.iter().map(|f| f.to_string()).collect();
     tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<i64>> {
         let store = cache.fields()?;
-        let build = |ids: HashSet<i32>| -> anyhow::Result<Vec<i64>> {
+        let keys_of = |ids: HashSet<i32>| -> anyhow::Result<Vec<(i64, Vec<String>)>> {
             let files = FileSortData::load(&cache, &ids, &field_list)?;
             let mut ids: Vec<i32> = ids.into_iter().collect();
             ids.sort_unstable();
@@ -317,15 +366,26 @@ async fn sorted_ids(cache: &std::sync::Arc<lexmechanic_db::cache::Cache>, ids: H
                     keyed.push((id as i64, field_list.iter().map(|f| key_for(&row, f, &files)).collect::<Vec<String>>()));
                 }
             }
-            sort_keyed(&mut keyed, field_list.len(), descending);
-            Ok(keyed.into_iter().map(|(id, _)| id).collect())
+            Ok(keyed)
         };
+        // The order of the whole library is kept, ascending (descending is
+        // taken from it, see `SortedOrder`), for as long as nothing the sort
+        // reads has changed: an edit to a rating no longer throws away the
+        // order of titles. A search that matches a small part of the library
+        // is sorted on its own, unless the whole order is already kept.
+        let field_refs: Vec<&str> = field_list.iter().map(String::as_str).collect();
+        let version = store.fields_version(&field_refs);
+        let key = format!("sort:{}", field_list.join(","));
         if ids.len() * 4 < store.book_count() {
-            return build(ids);
+            if let Some(everything) = cache.cached_if_current::<SortedOrder>(&key, version) {
+                return Ok(everything.filtered(descending, &ids));
+            }
+            let mut keyed = keys_of(ids)?;
+            sort_keyed(&mut keyed, field_list.len(), descending);
+            return Ok(keyed.into_iter().map(|(id, _)| id).collect());
         }
-        let key = format!("sort:{}:{}", field_list.join(","), descending);
-        let everything = cache.cached_for_version(&key, store.version(), || build(cache.all_book_ids()?.into_iter().collect()))?;
-        Ok(everything.iter().copied().filter(|id| ids.contains(&(*id as i32))).collect())
+        let everything = cache.cached_for_version(&key, version, || keys_of(cache.all_book_ids()?.into_iter().collect()).map(|keyed| SortedOrder::build(keyed, field_list.len())))?;
+        Ok(everything.filtered(descending, &ids))
     })
     .await
     .map_err(|e| ServerError::InternalServerError(e.to_string()))?
@@ -549,6 +609,11 @@ pub struct CategoryQuery {
     offset: i64,
     sort: Option<String>,
     sort_order: Option<String>,
+    /// A virtual library (by name) to count over: only its books are counted, and
+    /// only items that some of its books have are listed. Absent or empty: the whole library.
+    vl: Option<String>,
+    /// A search restriction applied on top of `vl`.
+    query: Option<String>,
 }
 
 fn default_num() -> i64 {
@@ -576,11 +641,28 @@ pub async fn category(State(state): State<AppState>, Path(name): Path<String>, Q
 
     // Only the requested category is built (and a standard one is kept until
     // the library changes).
+    let vl = q.vl.clone().unwrap_or_default();
+    let restriction = q.query.clone().unwrap_or_default();
     let cats = tokio::task::spawn_blocking({
         let cache = state.cache.clone();
         let sort = sort.to_string();
         let name = name.clone();
-        move || categories::get_category(&cache, &name, &sort, None).map(Option::unwrap_or_default)
+        move || -> anyhow::Result<std::sync::Arc<Vec<categories::Tag>>> {
+            if vl.is_empty() && restriction.trim().is_empty() {
+                return Ok(categories::get_category(&cache, &name, &sort, None)?.unwrap_or_default());
+            }
+            // Counted over the books of the virtual library (and search): kept per
+            // (library, search, category, sort) until the library changes -- the
+            // library's own query is part of the key, so editing it is seen.
+            let vl_query = if vl.is_empty() { String::new() } else { cache.virtual_library_lookup(&vl)?.unwrap_or_default() };
+            let key = format!("category-vl:{name}:{sort}:{vl_query}{restriction}");
+            let version = cache.fields()?.version();
+            cache.cached_for_version(&key, version, || {
+                let restriction_opt = if restriction.trim().is_empty() { None } else { Some(restriction.as_str()) };
+                let ids: HashSet<i32> = lexmechanic_db::search::books_in_virtual_library(&cache, &vl, restriction_opt)?.into_iter().collect();
+                Ok::<_, anyhow::Error>(categories::get_category(&cache, &name, &sort, Some(&ids))?.map(|t| t.as_ref().clone()).unwrap_or_default())
+            })
+        }
     })
     .await
     .map_err(|e| ServerError::InternalServerError(e.to_string()))?
@@ -961,6 +1043,39 @@ mod tests {
         assert_eq!(body["items"].as_array().unwrap().len(), 1);
         assert_eq!(body["items"][0]["count"], 1);
         assert!(body["items"][0]["url"].as_str().unwrap().starts_with("/ajax/books_in/authors/"));
+    }
+
+    #[tokio::test]
+    async fn category_counts_follow_a_virtual_library_and_a_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        add_test_book(dir.path(), &cache, "Alpha One", "Jane Doe");
+        add_test_book(dir.path(), &cache, "Alpha Two", "Jane Doe");
+        add_test_book(dir.path(), &cache, "Beta Three", "John Smith");
+        cache.virtual_library_add("Alphas", "title:Alpha").unwrap();
+        let state = crate::AppState { libraries: None, cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()), book_cache: std::sync::Arc::new(crate::books_cache::BookCache::open_temp()), jobs: std::sync::Arc::new(crate::jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))), render_jobs: std::sync::Arc::new(crate::render_endpoints::RenderJobRegistry::new()), conversion_jobs: std::sync::Arc::new(crate::convert::ConversionJobRegistry::new()), news_jobs: std::sync::Arc::new(crate::news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()), tts_voice: None, plugin_store: None, plugin_registry: std::sync::Arc::new(std::sync::Mutex::new(lexmechanic_customize::registry::PluginRegistry::new())), };
+        let router = crate::test_router(state);
+        let counts = |body: &serde_json::Value| -> Vec<(String, i64)> { body["items"].as_array().unwrap().iter().map(|i| (i["name"].as_str().unwrap().to_string(), i["count"].as_i64().unwrap())).collect() };
+
+        let (_, whole) = get_json(&router, "/ajax/category/authors").await;
+        assert_eq!(counts(&whole), vec![("Jane Doe".to_string(), 2), ("John Smith".to_string(), 1)]);
+
+        // Inside the virtual library only its books count, and John (who has none there) is not listed.
+        let (status, in_vl) = get_json(&router, "/ajax/category/authors?vl=Alphas").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(counts(&in_vl), vec![("Jane Doe".to_string(), 2)]);
+        assert_eq!(in_vl["total_num"], 1);
+
+        // A search on top of the virtual library narrows it further.
+        let (_, narrowed) = get_json(&router, "/ajax/category/authors?vl=Alphas&query=title:Two").await;
+        assert_eq!(counts(&narrowed), vec![("Jane Doe".to_string(), 1)]);
+        // A search alone works without a virtual library.
+        let (_, searched) = get_json(&router, "/ajax/category/authors?query=title:Beta").await;
+        assert_eq!(counts(&searched), vec![("John Smith".to_string(), 1)]);
+
+        // The whole-library answer is unaffected by the restricted ones before it.
+        let (_, again) = get_json(&router, "/ajax/category/authors").await;
+        assert_eq!(counts(&again), counts(&whole));
     }
 
     #[tokio::test]
@@ -1500,7 +1615,7 @@ mod tests {
             cache.set_field(*id, "rating", &((i % 6) * 2).to_string()).unwrap();
         }
         let cache = std::sync::Arc::new(cache);
-        for fields in [vec!["title"], vec!["authors", "title"], vec!["pubdate"], vec!["rating", "title"], vec!["size"]] {
+        for fields in [vec!["title"], vec!["authors", "title"], vec!["pubdate"], vec!["rating", "title"], vec!["size"], vec!["authors"], vec!["rating"], vec!["publisher"]] {
             for descending in [false, true] {
                 let everything: std::collections::HashSet<i32> = ids.iter().copied().collect();
                 let many: std::collections::HashSet<i32> = ids.iter().copied().filter(|i| i % 3 != 0).collect();
@@ -1519,6 +1634,44 @@ mod tests {
         let after = super::sorted_ids(&cache, all.clone(), &["title"], false).await.unwrap();
         assert_ne!(before, after);
         assert_eq!(after[0], ids[0] as i64);
+        assert_eq!(after, icu_only_order(super::sort_keys(&cache, all, &["title"]).await.unwrap(), false));
+    }
+
+    /// The kept order is keyed by what the sort reads: an edit to another
+    /// field leaves it standing, an edit to a field it sorts on replaces it.
+    /// Descending is taken from the ascending order, ties and all.
+    #[tokio::test]
+    async fn the_kept_order_survives_edits_to_fields_it_does_not_sort_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        // Several books with the very same title and author, so there are ties to keep in id order.
+        let titles = ["Same", "Same", "Other", "Same", "Zed", "Other", "Aardvark", "Same"];
+        let ids: Vec<i32> = titles.iter().enumerate().map(|(i, t)| add_test_book(dir.path(), &cache, t, if i % 2 == 0 { "Ann" } else { "Bob" })).collect();
+        let cache = std::sync::Arc::new(cache);
+        let all: std::collections::HashSet<i32> = ids.iter().copied().collect();
+        let kept = |cache: &Cache, fields: &[&str]| {
+            let store = cache.fields().unwrap();
+            cache.cached_if_current::<super::SortedOrder>(&format!("sort:{}", fields.join(",")), store.fields_version(fields)).is_some()
+        };
+        for fields in [vec!["title"], vec!["authors"], vec!["title", "authors"]] {
+            let asc = super::sorted_ids(&cache, all.clone(), &fields, false).await.unwrap();
+            let desc = super::sorted_ids(&cache, all.clone(), &fields, true).await.unwrap();
+            let want_desc = icu_only_order(super::sort_keys(&cache, all.clone(), &fields).await.unwrap(), true);
+            assert_eq!(desc, want_desc, "{fields:?}: descending from the kept order keeps ties in id order");
+            assert_ne!(desc, asc.iter().rev().copied().collect::<Vec<_>>(), "{fields:?}: not simply reversed, or the ties would run backwards");
+            assert!(kept(&cache, &fields));
+        }
+        cache.set_field(ids[0], "rating", "4").unwrap();
+        cache.set_field(ids[1], "comments", "<p>about</p>").unwrap();
+        cache.set_field(ids[2], "tags", "red").unwrap();
+        for fields in [vec!["title"], vec!["authors"], vec!["title", "authors"]] {
+            assert!(kept(&cache, &fields), "{fields:?} is still kept after edits to rating, comments and tags");
+        }
+        assert!(!kept(&cache, &["rating"]), "nothing was kept for rating");
+        cache.set_field(ids[0], "title", "Aaa").unwrap();
+        assert!(!kept(&cache, &["title"]), "a title edit replaces the order of titles");
+        assert!(kept(&cache, &["authors"]), "...and not the order of authors");
+        let after = super::sorted_ids(&cache, all.clone(), &["title"], false).await.unwrap();
         assert_eq!(after, icu_only_order(super::sort_keys(&cache, all, &["title"]).await.unwrap(), false));
     }
 

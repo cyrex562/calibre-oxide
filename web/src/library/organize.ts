@@ -70,6 +70,8 @@ export function describePlan(p: OrganizePlan): string {
   if (p.already_organized > 0) parts.push(`${n(p.already_organized)} already in place`);
   if (p.conflicts > 0) parts.push(`${plural(p.conflicts, "name")} taken, so numbered`);
   if (p.skipped.length > 0) parts.push(`${n(p.skipped.length)} skipped`);
+  if (p.data_folders) parts.push(`${plural(p.data_folders, "attachments folder")} move${p.data_folders === 1 ? "s" : ""} too`);
+  if (p.warnings?.some((w) => w.reason.includes("stay where they are"))) parts.push("some attachments stay behind");
   return parts.join(" · ");
 }
 

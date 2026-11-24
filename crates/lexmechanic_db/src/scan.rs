@@ -105,12 +105,19 @@ pub struct ScanOptions {
     /// which on Windows opens the file. Files are reported with a placeholder
     /// identity, so a report made this way is for counting, not for tracking.
     pub names_only: bool,
+    /// Report each file's size and mtime (which the directory listing carries
+    /// for free) but leave its identity unread: on Windows reading it opens the
+    /// file, which costs milliseconds each on a scanned disk or a share.
+    /// [`ScanReport::identity_deferred`] is then set, and a consumer that needs
+    /// an identity (the drift pass, for a few candidate files) asks for it.
+    pub lazy_identity: bool,
 }
 
 impl Default for ScanOptions {
     fn default() -> Self {
         ScanOptions {
             names_only: false,
+            lazy_identity: false,
             settle: DEFAULT_SETTLE,
             // `metadata_extensions` is the list this crate already
             // treats as "a book file", minus `opf`, which is metadata
@@ -154,6 +161,9 @@ pub struct ScanReport {
     /// instead of reading the files again; each is valid only for the size the
     /// walk saw.
     pub precomputed: std::collections::HashMap<String, crate::scan_pipeline::FileDigest>,
+    /// The files' identities were not read (see [`ScanOptions::lazy_identity`]);
+    /// each `facts.identity` is a placeholder and must not be compared.
+    pub identity_deferred: bool,
 }
 
 impl ScanReport {
@@ -180,7 +190,7 @@ pub fn walk(library_path: &Path, options: &ScanOptions, now: SystemTime) -> Resu
 /// (with the partial report) when it is cancelled. The caller must check
 /// `control.is_cancelled()` before treating a report as a whole scan.
 pub fn walk_controlled(library_path: &Path, options: &ScanOptions, now: SystemTime, control: Option<&crate::scan_pipeline::JobControl>) -> Result<ScanReport> {
-    let mut report = ScanReport::default();
+    let mut report = ScanReport { identity_deferred: options.lazy_identity && !options.names_only, ..Default::default() };
     // The root failing is different from a subdirectory failing: there
     // is nothing to report on, and returning an empty report would say
     // "this library has no books".
@@ -329,7 +339,8 @@ fn walk_dir(root: &Path, dir: &Path, options: &ScanOptions, now: SystemTime, rep
             report.offline.push(relative_to(root, &path));
             continue;
         }
-        let Some(facts) = file_facts_from_metadata(&path, &metadata) else {
+        let facts = if options.lazy_identity { Some(cheap_facts(&metadata)) } else { file_facts_from_metadata(&path, &metadata) };
+        let Some(facts) = facts else {
             // Present in the listing but not stat-able: another
             // unreadable condition, not an absent file.
             report.unreadable.push(relative_to(root, dir));
@@ -426,6 +437,12 @@ fn is_offline_metadata(metadata: &std::fs::Metadata) -> bool {
         let _ = metadata;
         false
     }
+}
+
+/// A file's size and mtime from metadata alone, with a placeholder identity.
+fn cheap_facts(metadata: &std::fs::Metadata) -> FileFacts {
+    let mtime_ms = metadata.modified().ok().and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok()).map(|d| d.as_millis() as u64);
+    FileFacts { identity: FileIdentity { volume: 0, index: 0 }, size: metadata.len(), mtime_ms }
 }
 
 fn settling_by_mtime(metadata: &std::fs::Metadata, settle: Duration, now: SystemTime) -> bool {
@@ -602,12 +619,32 @@ pub fn rescan(cache: &crate::cache::Cache, now: SystemTime) -> Result<Rescan> {
 /// and the caller must not conclude anything from it.
 pub fn rescan_files(cache: &crate::cache::Cache, now: SystemTime, options: &crate::scan_pipeline::PipelineOptions, control: &crate::scan_pipeline::JobControl) -> Result<Rescan> {
     let library = cache.backend.library_path.clone();
+    let (mut scanned, relocated, drifted_hashes) = match walk_and_relocate(cache, now, control)? {
+        Walked::Cancelled(scanned) => return Ok(Rescan { scanned, relocated: 0, indexed: IndexReport { cancelled: true, ..Default::default() } }),
+        Walked::Done { scanned, relocated, hashes } => (scanned, relocated, hashes),
+    };
+    // Anything the drift pass had to read is not read again by indexing.
+    scanned.precomputed = drifted_hashes;
+
+    let indexed = crate::scan_pipeline::index_files(cache, &library, &scanned, options, control);
+    Ok(Rescan { scanned, relocated, indexed })
+}
+
+enum Walked {
+    Cancelled(ScanReport),
+    Done { scanned: ScanReport, relocated: usize, hashes: std::collections::HashMap<String, crate::scan_pipeline::FileDigest> },
+}
+
+/// The walk and the re-attachment of moved files, shared by [`rescan_files`] and
+/// [`reattach_and_count`]: no indexing.
+fn walk_and_relocate(cache: &crate::cache::Cache, now: SystemTime, control: &crate::scan_pipeline::JobControl) -> Result<Walked> {
+    let library = cache.backend.library_path.clone();
     control.set_phase("walking");
     let walk_started = std::time::Instant::now();
-    let mut scanned = walk_controlled(&library, &ScanOptions::default(), now, Some(control))?;
+    let scanned = walk_controlled(&library, &ScanOptions::default(), now, Some(control))?;
     control.add_time("walk", walk_started.elapsed());
     if control.is_cancelled() {
-        return Ok(Rescan { scanned, relocated: 0, indexed: IndexReport { cancelled: true, ..Default::default() } });
+        return Ok(Walked::Cancelled(scanned));
     }
 
     // Safe on an incomplete scan: a relocation is concluded from a file
@@ -617,11 +654,45 @@ pub fn rescan_files(cache: &crate::cache::Cache, now: SystemTime, options: &crat
     let drifted = crate::drift::detect(cache, &scanned)?;
     let relocated = crate::drift::apply_relocations(cache, &drifted)?;
     control.add_time("drift", drift_started.elapsed());
-    // Anything the drift pass had to read is not read again by indexing.
-    scanned.precomputed = drifted.hashes;
+    Ok(Walked::Done { scanned, relocated, hashes: drifted.hashes })
+}
 
-    let indexed = crate::scan_pipeline::index_files(cache, &library, &scanned, options, control);
-    Ok(Rescan { scanned, relocated, indexed })
+/// What [`reattach_and_count`] found.
+#[derive(Debug)]
+pub struct Reattached {
+    pub scanned: ScanReport,
+    /// Books whose recorded path was corrected to where the file now is.
+    pub relocated: usize,
+    /// Files no book claims, counted from the same walk after the relocations (so a moved
+    /// file is not one of them). Never capped or time-limited: `at_least` is always false and
+    /// `conclusive` says whether every folder was read and the walk ran to the end.
+    pub untracked: UntrackedCount,
+}
+
+/// The scan stage of preparing a library: walk it once, re-attach books whose files were
+/// moved on disk, and count (never index) the files nothing claims. Importing them stays the
+/// user's explicit action. Without the re-attachment a moved book looks missing to every
+/// later stage (hashing, fingerprints, duplicate detection).
+pub fn reattach_and_count(cache: &crate::cache::Cache, now: SystemTime, control: &crate::scan_pipeline::JobControl) -> Result<Reattached> {
+    let (scanned, relocated) = match walk_and_relocate(cache, now, control)? {
+        Walked::Cancelled(scanned) => {
+            let untracked = UntrackedCount { untracked: 0, at_least: false, tracked: 0, conclusive: false };
+            return Ok(Reattached { scanned, relocated: 0, untracked });
+        }
+        Walked::Done { scanned, relocated, .. } => (scanned, relocated),
+    };
+    let known = cache.indexed_file_keys()?;
+    let (ignored_paths, _) = cache.ignored().snapshot()?;
+    let (mut untracked, mut tracked) = (0, 0);
+    for file in &scanned.files {
+        if known.contains(&crate::cache::file_key(&file.folder, &file.stem, &file.extension)) {
+            tracked += 1;
+        } else if !ignored_paths.contains(&file.relative_path) {
+            untracked += 1;
+        }
+    }
+    let conclusive = scanned.is_complete() && !control.is_cancelled();
+    Ok(Reattached { scanned, relocated, untracked: UntrackedCount { untracked, at_least: false, tracked, conclusive } })
 }
 
 #[cfg(test)]

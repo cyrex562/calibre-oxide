@@ -100,3 +100,44 @@ describe("BookGrid", () => {
     expect(cards()[0].querySelector("img")).toBeNull();
   });
 });
+
+describe("BookGrid keyboard focus under virtualisation (T29a)", () => {
+  const many = Array.from({ length: 400 }, (_, i) => i + 1);
+  async function mountMany(getBook: (id: number) => BookSummary | undefined) {
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    app = createApp(
+      defineComponent({
+        setup: () => () =>
+          h(BookGrid, { ids: many, getBook, selectMode: false, selectedIds: new Set<number>(), selectedBookId: null, markedIds: new Set<number>(), cacheBust: 0 }),
+      }),
+    );
+    app.mount(host);
+    await settle();
+    return document.body.querySelector<HTMLElement>(".grid-scroll")!;
+  }
+  const scrollTo = async (el: HTMLElement, top: number) => {
+    el.scrollTop = top;
+    el.dispatchEvent(new Event("scroll"));
+    await settle();
+  };
+
+  it("keeps focus on the grid when the focused card scrolls out of the window", async () => {
+    const scroller = await mountMany((id) => ({ id, title: `Book ${id}`, authors: [], thumbnail: `/t/${id}` }) as unknown as BookSummary);
+    const first = cards()[0];
+    first.focus();
+    expect(document.activeElement).toBe(first);
+
+    await scrollTo(scroller, 30000); // far past the first rows
+    expect(first.isConnected).toBe(false);
+    expect(document.activeElement).toBe(scroller); // not <body>: arrow keys still reach the grid
+    // and a card of the new window is the single Tab stop
+    expect(cards().filter((c) => c.tabIndex === 0)).toHaveLength(1);
+  });
+
+  it("has a Tab stop while every visible card is still a placeholder", async () => {
+    const scroller = await mountMany(() => undefined);
+    expect(cards()).toHaveLength(0);
+    expect(scroller.tabIndex).toBe(0);
+  });
+});

@@ -131,6 +131,10 @@ pub(crate) fn plan_json(plan: &organize::OrganizePlan) -> Value {
         "conflicts": plan.conflicts(),
         "already_organized": plan.already_organized,
         "skipped": plan.skipped,
+        // Books whose `data/` folder of attached files moves with them, and what
+        // could not be handled (attachments left behind, paths too long).
+        "data_folders": plan.books.iter().filter(|b| b.data_dir.is_some()).count(),
+        "warnings": plan.warnings,
         "moves": moves,
     })
 }

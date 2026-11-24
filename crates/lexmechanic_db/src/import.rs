@@ -217,6 +217,9 @@ pub struct ImportReport {
     /// False if the walk had errors or the job was cancelled: the source was
     /// not entirely seen.
     pub conclusive: bool,
+    /// What the pass that follows an import did: covers (and any title or author
+    /// still missing) read from the books just added.
+    pub enrichment: Option<crate::scan_pipeline::EnrichReport>,
 }
 
 fn capped<T>(list: &mut Vec<T>, item: T) {
@@ -632,6 +635,16 @@ pub fn import_folder(cache: &Cache, source: &Path, options: &ImportOptions, pipe
     result?;
 
     report.cancelled = control.is_cancelled();
+    // The covers the batches deferred, rendered through the PDF worker pool.
+    // A failure here does not undo the import: the books are in, and the pass
+    // is resumable (`POST /enrich-library`).
+    if !report.cancelled && report.books_added > 0 {
+        match crate::scan_pipeline::enrich_pending(cache, pipeline, control) {
+            Ok(enriched) => report.enrichment = Some(enriched),
+            Err(e) => log::warn!("the import is done but its covers could not be rendered: {e:#}"),
+        }
+        report.cancelled = control.is_cancelled();
+    }
     report.conclusive = report.walk_errors.is_empty() && !report.cancelled;
     Ok(report)
 }
@@ -768,8 +781,17 @@ fn import_batch(
     //    format. In parallel: a PDF cover render is not free.
     let metas = crate::scan_pipeline::parallel_map(&planned, pipeline.workers, control, |p| {
         let best = p.keep.iter().min_by_key(|(fi, _)| metadata_priority(&batch[p.group].files[*fi].ext)).expect("a plan keeps at least one file");
-        let embedded = lexmechanic_ebooks::metadata::get_metadata(&best.1.path).ok();
-        (embedded, read_sidecars(&batch[p.group]))
+        let ext = &batch[p.group].files[best.0].ext;
+        // A PDF's cover is a page render, which takes PDFium's one process-wide
+        // lock: done here, for every file, it made the whole import single-threaded
+        // (about 30 ms a file). The Info strings are read now, the cover later, by
+        // the enrichment pass, which renders through the PDF worker pool.
+        let (embedded, cover_owed) = if ext.eq_ignore_ascii_case("pdf") {
+            (lexmechanic_ebooks::metadata::pdf::get_metadata_from_path_at(&best.1.path, None).ok(), Some(ext.to_uppercase()))
+        } else {
+            (lexmechanic_ebooks::metadata::get_metadata(&best.1.path).ok(), None)
+        };
+        (embedded, read_sidecars(&batch[p.group]), cover_owed)
     });
     if control.is_cancelled() {
         return Ok(false);
@@ -788,7 +810,8 @@ fn import_batch(
         // Embedded metadata first, then the sidecar OPF over it (calibre's
         // add does the same). Everything below -- duplicate checks and the
         // book itself -- sees the final values.
-        if let Some((embedded, sidecar)) = meta {
+        let mut queue_enrichment = None;
+        if let Some((embedded, sidecar, cover_owed)) = meta {
             if let Some(found) = embedded {
                 overlay(&mut mi, &found);
             }
@@ -799,6 +822,10 @@ fn import_batch(
                 if let Some(cover) = sidecar.cover {
                     mi.cover_data = (Some(cover.0), cover.1);
                 }
+            }
+            // A cover the book's own folder supplied needs no render.
+            if mi.cover_data.1.is_empty() {
+                queue_enrichment = cover_owed;
             }
         }
 
@@ -843,7 +870,7 @@ fn import_batch(
             let first = &g.files[plan.keep[0].0];
             crate::cache::ImportPlacement { folder: kept_folder(source, &first.dir), stem: first.stem.clone() }
         });
-        items.push(ImportItem { metadata: mi, files, placement });
+        items.push(ImportItem { metadata: mi, files, placement, queue_enrichment });
         item_sources.push(sources);
     }
 

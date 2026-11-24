@@ -44,6 +44,16 @@ const emit = defineEmits<{ select: [query: string, label: string]; changed: [] }
 
 const folders = ref<LibraryFolder[]>([]);
 const total = ref(0);
+/** How many of calibre's author folders the library has, and whether the tree lists them. */
+const authorFolders = ref(0);
+const showAuthors = ref(readShowAuthors());
+function readShowAuthors(): boolean {
+  try {
+    return localStorage.getItem("lexmechanic.folders.authors") === "1";
+  } catch {
+    return false;
+  }
+}
 const error = ref<string | null>(null);
 const open = ref(true);
 const expanded = ref<Set<string>>(readExpanded());
@@ -66,9 +76,10 @@ function persistExpanded() {
 
 async function load() {
   try {
-    const r = await fetchLibraryFolders();
+    const r = await fetchLibraryFolders(showAuthors.value);
     folders.value = r.folders;
     total.value = r.total;
+    authorFolders.value = r.author_folders ?? 0;
     error.value = null;
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e);
@@ -76,6 +87,14 @@ async function load() {
 }
 void load();
 watch(() => props.refreshKey, () => void load());
+watch(showAuthors, (on) => {
+  try {
+    localStorage.setItem("lexmechanic.folders.authors", on ? "1" : "0");
+  } catch {
+    // The choice simply will not survive a restart.
+  }
+  void load();
+});
 
 const roots = computed(() => buildFolderTree(folders.value));
 const rows = computed(() => visibleFolderRows(roots.value, expanded.value));
@@ -390,6 +409,10 @@ function planTitle(): string {
       <button type="button" class="folders-add" title="New top-level folder" aria-label="New top-level folder" data-testid="new-root-folder" @click="askNew('')">+</button>
     </div>
     <p v-if="error" class="error">{{ error }}</p>
+    <label v-if="open && authorFolders > 0" class="folders-authors" data-testid="author-folders-toggle" title="calibre keeps each author's books in a folder named for the author. Show them in this tree.">
+      <input v-model="showAuthors" type="checkbox" />
+      Author folders ({{ authorFolders.toLocaleString("en-US") }})
+    </label>
     <ul v-if="open" ref="listEl" class="folder-list" :role="rows.length > 0 ? 'tree' : undefined" aria-label="Folders" data-testid="folder-list">
       <li v-if="rows.length === 0" class="folder-note">No folders yet. Books at the library's top level are not in a folder.</li>
       <li v-if="windowed.padTop > 0" aria-hidden="true" :style="{ height: `${windowed.padTop}px` }"></li>
@@ -579,6 +602,15 @@ function planTitle(): string {
   font-size: var(--fs-micro);
   color: var(--fg-faint);
   font-variant-numeric: tabular-nums;
+}
+.folders-authors {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-1) var(--sp-3);
+  font-size: var(--fs-small);
+  color: var(--fg-muted);
+  cursor: pointer;
 }
 .folder-note {
   padding: var(--sp-1) var(--sp-3);

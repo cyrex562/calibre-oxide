@@ -397,6 +397,9 @@ pub struct MirrorPlan {
     pub travel_origin: Option<String>,
     pub travel_library_id: Option<String>,
     _scratch: Arc<tempfile::TempDir>,
+    /// Scratch folders of earlier plans whose database snapshot this plan reuses
+    /// (see [`checksums_snapshot`]); kept alive as long as the plan is.
+    _reused: Vec<Arc<tempfile::TempDir>>,
 }
 
 impl MirrorPlan {
@@ -927,6 +930,20 @@ fn walk_files(root: &Path) -> Vec<PathBuf> {
 /// Plans a run: what a copy of `cache`'s library at `target` would have to do.
 /// Changes nothing at `target` and never opens a database there.
 pub fn plan(cache: &Cache, target: &str, options: &MirrorOptions) -> Result<MirrorPlan> {
+    plan_controlled(cache, target, options, None)
+}
+
+/// [`plan`] as a job: names what it is doing on `control` (`mirror_listing`,
+/// `mirror_databases`, `mirror_comparing`) and counts the files it has listed in
+/// `seen`, and stops (with an error) when cancelled.
+pub fn plan_controlled(cache: &Cache, target: &str, options: &MirrorOptions, control: Option<&JobControl>) -> Result<MirrorPlan> {
+    let phase = |name: &str| {
+        if let Some(c) = control {
+            c.set_phase(name);
+        }
+    };
+    let cancelled = || control.is_some_and(|c| c.is_cancelled());
+    phase("mirror_listing");
     let source = cache.backend.library_path.clone();
     let target = validate_target(&source, target)?;
     if options.mode == Mode::Mirror && options.scope != MirrorScope::All {
@@ -965,6 +982,7 @@ pub fn plan(cache: &Cache, target: &str, options: &MirrorOptions) -> Result<Mirr
     let travel = options.mode == Mode::Travel;
     let subset = travel && options.scope != MirrorScope::All;
     let mut scratch = Scratch { dir: Arc::new(tempfile::tempdir().map_err(anyhow::Error::from)?), counter: 0 };
+    let mut reused: Vec<Arc<tempfile::TempDir>> = Vec::new();
 
     let (books, formats) = load_books(cache)?;
     let chosen = choose(&books, if travel { &options.scope } else { &MirrorScope::All });
@@ -985,7 +1003,16 @@ pub fn plan(cache: &Cache, target: &str, options: &MirrorOptions) -> Result<Mirr
 
     // Book files.
     let mut seen_dirs: HashSet<String> = HashSet::new();
+    if let Some(c) = control {
+        c.total.store(chosen.ids.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
     for book in books.iter().filter(|b| chosen.ids.contains(&b.id)) {
+        if cancelled() {
+            return refuse("cancelled");
+        }
+        if let Some(c) = control {
+            c.seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let Some(dir) = clean_rel(&book.path) else { continue };
         for (name, format) in formats.get(&book.id).into_iter().flatten() {
             let lower = join_rel(&dir, &format!("{name}.{}", format.to_lowercase()));
@@ -1024,6 +1051,7 @@ pub fn plan(cache: &Cache, target: &str, options: &MirrorOptions) -> Result<Mirr
     }
 
     // `.lexmechanic/`: covers, the log, other durable state, checksums.db.
+    phase("mirror_reading");
     let state_dir = source.join(LIBRARY_HANDLE_DIR_NAME);
     let mut generated: Vec<SourceFile> = Vec::new();
     let mut checksums_scratch: Option<PathBuf> = None;
@@ -1039,8 +1067,15 @@ pub fn plan(cache: &Cache, target: &str, options: &MirrorOptions) -> Result<Mirr
             if subset && name != CHECKSUMS_DB_NAME {
                 continue;
             }
-            let dest = scratch.next(name);
-            snapshot_database(&path, &dest)?;
+            // A whole-library plan reads the checksum database as it is, so an unchanged one
+            // need not be snapshotted again; a subset prunes its copy, so makes its own.
+            let dest = if name == CHECKSUMS_DB_NAME && keep_ids.is_none() {
+                checksums_snapshot(cache, &path, &mut scratch, name, &mut reused)?
+            } else {
+                let dest = scratch.next(name);
+                snapshot_database(&path, &dest)?;
+                dest
+            };
             if name == CHECKSUMS_DB_NAME {
                 if let (Some(ids), Some(uuids)) = (keep_ids, keep_uuids) {
                     prune_checksums(&dest, ids, uuids)?;
@@ -1150,6 +1185,10 @@ pub fn plan(cache: &Cache, target: &str, options: &MirrorOptions) -> Result<Mirr
         }
     }
 
+    if cancelled() {
+        return refuse("cancelled");
+    }
+    phase("mirror_comparing");
     let items = diff(&files, &target, old_manifest.as_ref(), options, &copy_edits);
     let totals = totals_of(&items);
     let fingerprint = fingerprint_of(&target, &source_id, options, &items);
@@ -1169,7 +1208,63 @@ pub fn plan(cache: &Cache, target: &str, options: &MirrorOptions) -> Result<Mirr
         travel_origin,
         travel_library_id,
         _scratch: scratch.dir,
+        _reused: reused,
     })
+}
+
+/// The last snapshot of `checksums.db` a plan made, and what the library looked
+/// like then. `VACUUM INTO` of a library-sized checksum database takes seconds
+/// (3.5 s for 51 MB), and every preview and every run planned afresh: the same
+/// snapshot, again, when nothing had written to it.
+struct CachedSnapshot {
+    source: PathBuf,
+    stamp: String,
+    dir: Arc<tempfile::TempDir>,
+    file: PathBuf,
+}
+
+fn snapshot_cache() -> &'static std::sync::Mutex<Option<CachedSnapshot>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<CachedSnapshot>>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// What `checksums.db` looks like from here: this connection's own change count
+/// (it writes the attached database), the database's `data_version` (which moves
+/// when any *other* connection commits), and the file sizes. `None` when the
+/// sidecar is not attached, which means no caching.
+fn checksums_stamp(cache: &Cache, path: &Path) -> Option<String> {
+    let (changes, version) = {
+        let conn = cache.backend.conn.lock().unwrap();
+        let version: i64 = conn.query_row("PRAGMA checksums_db.data_version", [], |r| r.get(0)).ok()?;
+        let changes: i64 = conn.query_row("SELECT total_changes()", [], |r| r.get(0)).ok()?;
+        (changes, version)
+    };
+    let len = |p: &Path| fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    Some(format!("{changes}/{version}/{}/{}", len(path), len(Path::new(&wal))))
+}
+
+/// A snapshot of `checksums.db` for a plan: the one made for the last plan when
+/// the stamp says nothing wrote since, else a new one (which is remembered).
+/// The folder to keep alive is pushed on `reused` when an old one is used.
+fn checksums_snapshot(cache: &Cache, src: &Path, scratch: &mut Scratch, name: &str, reused: &mut Vec<Arc<tempfile::TempDir>>) -> anyhow::Result<PathBuf> {
+    let stamp = checksums_stamp(cache, src);
+    if let Some(stamp) = &stamp {
+        let held = snapshot_cache().lock().unwrap();
+        if let Some(c) = held.as_ref().filter(|c| c.source == src && c.stamp == *stamp && c.file.is_file()) {
+            reused.push(c.dir.clone());
+            return Ok(c.file.clone());
+        }
+    }
+    let dest = scratch.next(name);
+    snapshot_database(src, &dest)?;
+    if let Some(stamp) = stamp {
+        // The stamp was read before the snapshot: a write in between makes the
+        // next stamp differ, so the worst case is one snapshot too many.
+        *snapshot_cache().lock().unwrap() = Some(CachedSnapshot { source: src.to_path_buf(), stamp, dir: scratch.dir.clone(), file: dest.clone() });
+    }
+    Ok(dest)
 }
 
 /// How a source file compares with what the manifest says was written.
@@ -1472,12 +1567,14 @@ fn copy_one(item: &PlanItem, dest: &Path, tier: StorageTier, control: &JobContro
 
 /// Moves `rel` from the copy into `.mirror-trash/<run>/`, then tidies the folders
 /// it leaves empty.
-fn set_aside(target: &Path, rel: &str, run_id: &str) -> io::Result<()> {
+fn set_aside(target: &Path, rel: &str, run_id: &str, park_history: bool) -> io::Result<()> {
     let from = abs(target, rel);
-    if is_history_snapshot(rel) {
+    if is_history_snapshot(rel) && !park_history {
         // An older history snapshot, replaced by the one this run writes: internal
         // state, not the user's file. Deleted outright; parking a library-sized
         // snapshot in `.mirror-trash` on every refresh would fill the copy's disk.
+        // (Only called once the new one has copied. When the copy's own edits were set
+        // aside this run, the caller parks it with them instead: they chain to it.)
         return fs::remove_file(&from);
     }
     let to = abs(&target.join(MIRROR_TRASH_DIR).join(run_id), rel);
@@ -1499,16 +1596,32 @@ fn target_reachable(target: &Path) -> bool {
     fs::metadata(target).is_ok()
 }
 
+/// Files copied at once: `LEXMECHANIC_MIRROR_WORKERS` if set (1 to 16), else 6 on a
+/// network target (where each copy mostly waits) and 4 on a local one. A copy
+/// is still written to a temporary name, fsynced, and renamed into place, so a
+/// file cut short is never taken for a finished one; the fsyncs overlap instead
+/// of queueing.
+fn copy_workers(tier: StorageTier) -> usize {
+    if let Some(n) = lexmechanic_utils::env::var("LEXMECHANIC_MIRROR_WORKERS").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+        return n.clamp(1, 16);
+    }
+    if tier == StorageTier::Network {
+        6
+    } else {
+        4
+    }
+}
+
 /// Runs `plan`: copies and updates what it says, sets aside what it removes,
 /// then writes the databases and, last, the manifest. A cancel stops between
 /// files (what is done is recorded); the target becoming unreachable aborts the
 /// run with an error rather than treating anything as missing.
 pub fn execute(cache: &Cache, plan: &MirrorPlan, control: &JobControl) -> anyhow::Result<MirrorReport> {
     let every = (plan.items.len() / 20).max(500);
-    execute_inner(cache, plan, control, every, None)
+    execute_inner(cache, plan, control, every, None, copy_workers(plan.tier))
 }
 
-fn execute_inner(_cache: &Cache, plan: &MirrorPlan, control: &JobControl, checkpoint_every: usize, after_file: Option<&dyn Fn(usize)>) -> anyhow::Result<MirrorReport> {
+fn execute_inner(_cache: &Cache, plan: &MirrorPlan, control: &JobControl, checkpoint_every: usize, after_file: Option<&dyn Fn(usize)>, workers: usize) -> anyhow::Result<MirrorReport> {
     let target = &plan.target;
     fs::create_dir_all(target).with_context(|| format!("creating {}", target.display()))?;
     let run_id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
@@ -1553,7 +1666,7 @@ fn execute_inner(_cache: &Cache, plan: &MirrorPlan, control: &JobControl, checkp
     // On request, the copy's own edits make way for the refreshed database.
     if plan.options.overwrite_changed && !plan.copy_edits.is_empty() && dbs.iter().any(|i| i.rel == "metadata.db") {
         for rel in &plan.copy_edits {
-            if set_aside(target, rel, &run_id).is_ok() {
+            if set_aside(target, rel, &run_id, false).is_ok() {
                 report.edits_set_aside += 1;
             }
         }
@@ -1565,12 +1678,10 @@ fn execute_inner(_cache: &Cache, plan: &MirrorPlan, control: &JobControl, checkp
     control.set_phase("mirror_files");
     for (phase, group) in [("mirror_files", &books), ("mirror_databases", &dbs)] {
         control.set_phase(phase);
-        for item in group {
-            if control.is_cancelled() {
-                break;
-            }
-            let dest = abs(target, &item.rel);
-            match copy_one(item, &dest, plan.tier, control) {
+        // What becomes of one finished copy. Returns false to stop the group
+        // (a cancel, or the target gone).
+        let mut record = |item: &PlanItem, result: io::Result<(u64, String)>| -> bool {
+            match result {
                 Ok((size, hash)) => {
                     entries.insert(item.rel.clone(), ManifestFile { path: item.rel.clone(), size, mtime_ms: item.mtime_ms, blake3: hash, kind: item.kind });
                     if item.action == Action::CopyNew {
@@ -1590,17 +1701,65 @@ fn execute_inner(_cache: &Cache, plan: &MirrorPlan, control: &JobControl, checkp
                         since_checkpoint = 0;
                         let _ = write_manifest(target, &manifest_of(&entries, false));
                     }
+                    true
                 }
-                Err(e) if is_marked(&e) && e.to_string() == "cancelled" => break,
+                Err(e) if is_marked(&e) && e.to_string() == "cancelled" => false,
                 Err(e) => {
                     control.errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if !is_marked(&e) && !target_reachable(target) {
                         aborted = Some(format!("{} stopped answering while {} was being written: {e}", target.display(), item.rel));
-                        break;
+                        return false;
                     }
                     report.failures.push(Problem { path: item.rel.clone(), message: e.to_string() });
+                    true
                 }
             }
+        };
+
+        if workers <= 1 || group.len() <= 1 {
+            for item in group {
+                if control.is_cancelled() {
+                    break;
+                }
+                let result = copy_one(item, &abs(target, &item.rel), plan.tier, control);
+                if !record(item, result) {
+                    break;
+                }
+            }
+        } else {
+            // A bounded pool: on a share each copy spends most of its time waiting
+            // for the far end (an open, a write, an fsync), so several in flight
+            // is several times the files a second. Results come back to this
+            // thread, which alone updates the report and the manifest, so a
+            // checkpoint still lists only files that were fully written and
+            // renamed into place.
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            let (tx, rx) = std::sync::mpsc::channel::<(usize, io::Result<(u64, String)>)>();
+            std::thread::scope(|scope| {
+                let (next, stop) = (&next, &stop);
+                for _ in 0..workers.min(group.len()) {
+                    let tx = tx.clone();
+                    scope.spawn(move || loop {
+                        if stop.load(std::sync::atomic::Ordering::Relaxed) || control.is_cancelled() {
+                            break;
+                        }
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(item) = group.get(i) else { break };
+                        let result = copy_one(item, &abs(target, &item.rel), plan.tier, control);
+                        if tx.send((i, result)).is_err() {
+                            break;
+                        }
+                    });
+                }
+                drop(tx);
+                for (i, result) in rx {
+                    // Keep draining after a stop: copies already in flight finish and are recorded.
+                    if !record(&group[i], result) {
+                        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            });
         }
         if aborted.is_some() || control.is_cancelled() {
             break;
@@ -1611,15 +1770,22 @@ fn execute_inner(_cache: &Cache, plan: &MirrorPlan, control: &JobControl, checkp
         anyhow::bail!("{message}. The copy was not finished; run it again when the folder is back (what was written is kept).");
     }
 
-    // Removals, only if the run was not cut short.
-    if !control.is_cancelled() {
+    // Removals, only if the run was neither cut short nor failed to copy something: the old
+    // history snapshot goes only once its replacement has landed, and a failed copy (a full
+    // disk) must leave the copy with the snapshot it has. They stay planned for the next run.
+    if !control.is_cancelled() && report.failures.is_empty() {
         control.set_phase("mirror_removing");
+        // Edits made on the copy chain to the snapshot being replaced: park it with them.
+        let park_history = report.edits_set_aside > 0;
+        let mut parked_history = false;
         for item in plan.items.iter().filter(|i| i.action == Action::Remove) {
-            match set_aside(target, &item.rel, &run_id) {
+            match set_aside(target, &item.rel, &run_id, park_history) {
                 Ok(()) => {
                     entries.remove(&item.rel);
                     if !is_history_snapshot(&item.rel) {
                         report.removed += 1;
+                    } else if park_history {
+                        parked_history = true;
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -1628,7 +1794,7 @@ fn execute_inner(_cache: &Cache, plan: &MirrorPlan, control: &JobControl, checkp
                 Err(e) => report.failures.push(Problem { path: item.rel.clone(), message: format!("could not move it to {MIRROR_TRASH_DIR}: {e}") }),
             }
         }
-        if report.removed > 0 || report.edits_set_aside > 0 {
+        if report.removed > 0 || report.edits_set_aside > 0 || parked_history {
             report.trash = Some(format!("{MIRROR_TRASH_DIR}/{run_id}"));
         }
     }
@@ -2197,6 +2363,71 @@ mod tests {
         assert!(old.iter().all(|i| !target.path().join(&i.rel).exists()), "the old snapshot is gone");
     }
 
+    fn snapshot_rels(root: &Path) -> Vec<String> {
+        let dir = root.join(LIBRARY_HANDLE_DIR_NAME).join("snapshots");
+        let mut out: Vec<String> = std::fs::read_dir(dir).map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
+        out.sort();
+        out
+    }
+
+    /// T29a #3: set-aside edits chain to the old snapshot, so an overwrite parks it with them
+    /// rather than deleting it.
+    #[test]
+    fn an_overwrite_parks_the_old_history_snapshot_with_the_set_aside_edits() {
+        let (_dir, cache, _s, ids) = sample();
+        let target = target_dir();
+        let opts = travel_opts(MirrorScope::All);
+        run(&cache, target.path(), &opts);
+        let old = snapshot_rels(target.path());
+        assert!(!old.is_empty());
+        {
+            let copy = Cache::new(target.path()).unwrap();
+            copy.set_field(ids[0], "rating", "10").unwrap();
+        }
+        let before = cache.field_for(ids[1], "rating").unwrap();
+        cache.set_field(ids[1], "rating", "2").unwrap();
+        cache.set_field(ids[1], "rating", before.as_deref().unwrap_or("")).unwrap();
+
+        let forced = MirrorOptions { overwrite_changed: true, ..opts };
+        let (_, report) = run(&cache, target.path(), &forced);
+        assert!(report.complete && report.edits_set_aside > 0, "{report:?}");
+        let now = snapshot_rels(target.path());
+        let gone: Vec<&String> = old.iter().filter(|n| !now.contains(n)).collect();
+        assert!(!gone.is_empty(), "the history changed, so the baseline was renamed: {old:?} -> {now:?}");
+        let parked = target.path().join(MIRROR_TRASH_DIR).join(&report.run_id).join(LIBRARY_HANDLE_DIR_NAME).join("snapshots");
+        for name in gone {
+            assert!(parked.join(name).is_file(), "{name} was deleted instead of parked next to the edits it anchors");
+        }
+        assert!(report.trash.is_some());
+    }
+
+    /// T29a #3: a new snapshot that failed to copy must not cost the copy its old one.
+    #[test]
+    fn a_failed_snapshot_copy_leaves_the_old_snapshot_in_place() {
+        let (_dir, cache, _s, ids) = sample();
+        let target = target_dir();
+        let opts = travel_opts(MirrorScope::All);
+        run(&cache, target.path(), &opts);
+        let old = snapshot_rels(target.path());
+        let before = cache.field_for(ids[1], "rating").unwrap();
+        cache.set_field(ids[1], "rating", "2").unwrap();
+        cache.set_field(ids[1], "rating", before.as_deref().unwrap_or("")).unwrap();
+
+        let plan = plan(&cache, target.path().to_str().unwrap(), &opts).unwrap();
+        let fresh: Vec<&PlanItem> = plan.items.iter().filter(|i| i.rel.contains("/snapshots/") && i.action == Action::CopyNew).collect();
+        assert!(!fresh.is_empty());
+        // Something the new snapshot cannot be written over (as a full disk would stop it).
+        for item in &fresh {
+            std::fs::create_dir_all(target.path().join(&item.rel)).unwrap();
+        }
+        let report = execute(&cache, &plan, &JobControl::new()).unwrap();
+        assert!(!report.failures.is_empty(), "{report:?}");
+        assert!(!report.complete);
+        for name in &old {
+            assert!(target.path().join(LIBRARY_HANDLE_DIR_NAME).join("snapshots").join(name).is_file(), "{name} was deleted though its replacement never landed");
+        }
+    }
+
     #[test]
     fn a_leftover_pre_rename_state_folder_is_never_copied() {
         assert!(is_excluded(".calibre-oxide/snapshots/1.jsonl"));
@@ -2218,7 +2449,7 @@ mod tests {
             if done == 4 {
                 stopper.cancel();
             }
-        }))
+        }), 1)
         .unwrap();
         assert!(report.cancelled && !report.complete);
         assert_eq!(report.copied, 4);

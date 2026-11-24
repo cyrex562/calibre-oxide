@@ -146,13 +146,45 @@ describe("useBulkEdit", () => {
     expect(changed).toHaveBeenCalledTimes(1);
   });
 
-  it("reports a selected book that could not be loaded", async () => {
+  it("reports a selected book that could not be loaded, when the edit depends on what the book has", async () => {
     api.setFieldsBatch.mockResolvedValue({ updated: [1], failed: [] });
     const { bulk } = setup([1, 2], [book(1)]);
-    bulk.spec.publisher = "Acme";
+    bulk.spec.tags = { mode: "add", value: "travel" };
     await bulk.run();
     expect(bulk.errors).toEqual(["Book 2: could not be loaded"]);
     expect(bulk.open).toBe(true);
+  });
+
+  it("sets a publisher on every selected book without reading any of them, and undoes it from what the server says it replaced", async () => {
+    api.setFieldsBatch.mockResolvedValue({ updated: [1, 2], failed: [], previous: { "1": { publisher: "Old House" }, "2": { publisher: null } } });
+    const ensureLoaded = vi.fn(async () => []);
+    const selectedIds = ref(new Set([1, 2]));
+    const bulk = useBulkEdit({ selectedIds, selectMode: ref(true), fieldMetadata: ref({}), win: { ensureLoaded, getById: () => undefined }, onChanged: async () => {} });
+    bulk.spec.publisher = "Acme";
+    await bulk.run();
+
+    expect(ensureLoaded).not.toHaveBeenCalled();
+    expect(api.setFieldsBatch).toHaveBeenCalledWith([{ book_ids: [1, 2], changes: { publisher: "Acme" } }], { previous: true });
+    expect(bulk.errors).toEqual([]);
+    // Undo writes each book's own old value back.
+    api.setFieldsBatch.mockClear();
+    api.setFieldsBatch.mockResolvedValue({ updated: [1, 2], failed: [] });
+    await runToastAction();
+    const sent = api.setFieldsBatch.mock.calls[0][0] as { book_ids: number[]; changes: { publisher: string } }[];
+    expect(sent.find((g) => g.book_ids.includes(1))!.changes).toEqual({ publisher: "Old House" });
+    expect(sent.find((g) => g.book_ids.includes(2))!.changes).toEqual({ publisher: "" });
+  });
+
+  it("sends a big uniform edit in requests of about 200 books and reads no rows", async () => {
+    api.setFieldsBatch.mockImplementation(async (groups: { book_ids: number[] }[]) => ({ updated: groups.flatMap((g) => g.book_ids), failed: [] }));
+    const ids = Array.from({ length: 450 }, (_, i) => i + 1);
+    const ensureLoaded = vi.fn(async () => []);
+    const bulk = useBulkEdit({ selectedIds: ref(new Set(ids)), selectMode: ref(true), fieldMetadata: ref({}), win: { ensureLoaded, getById: () => undefined }, onChanged: async () => {} });
+    bulk.spec.series = "Saga";
+    await bulk.run();
+    expect(ensureLoaded).not.toHaveBeenCalled();
+    expect(api.setFieldsBatch).toHaveBeenCalledTimes(3);
+    expect(bulk.summary).toBe("Updated 450 book(s).");
   });
 
   it("applies a rating or series index only when its box is ticked", async () => {
@@ -191,6 +223,25 @@ describe("useBulkEdit", () => {
     expect(groups).toEqual([{ book_ids: [1], changes: { tags: ["a", "b"], publisher: "Old Press" } }]);
     expect(toastState.toast?.result).toBe("Put back the old values on 1 book");
     expect(changed).toHaveBeenCalledTimes(2);
+  });
+
+  it("Undo of adding several tags removes only the tags each book gained", async () => {
+    api.setFieldsRelative.mockResolvedValueOnce({
+      updated: [1, 2],
+      failed: [],
+      changes: { "1": { tags: { added: ["b"], removed: [] } }, "2": { tags: { added: ["a", "b"], removed: [] } } },
+    });
+    const { bulk } = setup([1, 2], []);
+    bulk.spec.tags = { mode: "add", value: "a, b" };
+    await bulk.run();
+    expect(toastState.toast?.actionLabel).toBe("Undo");
+    api.setFieldsRelative.mockImplementation(async (ids: number[]) => ({ updated: ids, failed: [] }));
+    await runToastAction();
+    expect(api.setFieldsRelative.mock.calls.slice(1)).toEqual([
+      [[1], { field: "tags", mode: "remove", values: ["b"] }],
+      [[2], { field: "tags", mode: "remove", values: ["a", "b"] }],
+    ]);
+    expect(toastState.toast?.result).toBe("Put back the tags on 2 books");
   });
 
   it("says which field an Undo cannot put back", async () => {

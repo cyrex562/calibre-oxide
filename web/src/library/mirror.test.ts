@@ -226,14 +226,14 @@ describe("remembered targets", () => {
     await c.refresh(target({ mode: "travel", scope: { book_ids: [7, 8] }, remove_missing: false, overwrite_changed: false, target: "D:\\Laptop" }), [1]);
     expect(c.state.draft).toMatchObject({ mode: "travel", target: "D:\\Laptop", scope: "selected", removeMissing: false });
     // The remembered books, not today's selection, are what the preview and run use.
-    expect(api.planMirror).toHaveBeenCalledWith({ target: "D:\\Laptop", mode: "travel", scope: { book_ids: [7, 8] }, remove_missing: false, overwrite_changed: false });
+    expect(api.planMirror).toHaveBeenCalledWith({ target: "D:\\Laptop", mode: "travel", scope: { book_ids: [7, 8] }, remove_missing: false, overwrite_changed: false }, expect.anything());
     expect(c.state.phase).toBe("planned");
     expect(c.planIsCurrent([1])).toBe(true);
 
     // A run that overwrote the copy's edits does not make the next refresh do so.
     await c.refresh(target({ mode: "travel", scope: "all", remove_missing: true, overwrite_changed: true, target: "D:\\Laptop" }), [1]);
     expect(c.state.draft.overwriteChanged).toBe(false);
-    expect(api.planMirror).toHaveBeenLastCalledWith(expect.objectContaining({ overwrite_changed: false }));
+    expect(api.planMirror).toHaveBeenLastCalledWith(expect.objectContaining({ overwrite_changed: false }), expect.anything());
 
     await c.forget("D:\\Laptop");
     expect(api.forgetMirrorTarget).toHaveBeenCalledWith("D:\\Laptop");

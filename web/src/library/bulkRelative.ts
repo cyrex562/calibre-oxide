@@ -27,6 +27,8 @@ export interface RelativeResponse {
   failed: { book_id: number; error: string }[];
   /** Books that already had the result. */
   unchanged?: number[];
+  /** Per changed book, the exact spellings the edit added to and removed from each list. */
+  changes?: Record<string, Record<string, { added: string[]; removed: string[] }>>;
 }
 
 /** Thrown by a sender when the server does not know add/remove (an older server). */
@@ -68,6 +70,8 @@ export interface RelativeRunResult {
   updated: number;
   /** The books the server changed, for an undo of exactly those. */
   updatedIds: number[];
+  /** What each changed book gained and lost in the field (absent from an older server). */
+  deltas: Map<number, { added: string[]; removed: string[] }>;
   unchanged: number;
   errors: string[];
   notStarted: number;
@@ -81,7 +85,7 @@ export interface RelativeRunResult {
  */
 export async function runRelativeEdit(ids: readonly number[], op: RelativeOp, deps: RelativeRunDeps): Promise<RelativeRunResult | null> {
   const size = Math.max(1, deps.chunkSize ?? RELATIVE_CHUNK);
-  const result: RelativeRunResult = { updated: 0, updatedIds: [], unchanged: 0, errors: [], notStarted: 0 };
+  const result: RelativeRunResult = { updated: 0, updatedIds: [], deltas: new Map(), unchanged: 0, errors: [], notStarted: 0 };
   let at = 0;
   let sentAny = false;
   while (at < ids.length) {
@@ -95,6 +99,10 @@ export async function runRelativeEdit(ids: readonly number[], op: RelativeOp, de
       sentAny = true;
       result.updated += response.updated.length;
       result.updatedIds.push(...response.updated);
+      for (const [id, fields] of Object.entries(response.changes ?? {})) {
+        const delta = fields[op.field];
+        if (delta) result.deltas.set(Number(id), delta);
+      }
       result.unchanged += response.unchanged?.length ?? 0;
       for (const f of response.failed) result.errors.push(`Book ${f.book_id}: ${f.error}`);
     } catch (e) {
@@ -112,9 +120,43 @@ export async function runRelativeEdit(ids: readonly number[], op: RelativeOp, de
 /**
  * The op that undoes `op` on the books it changed, or `null` when that cannot
  * be exact: adding two tags to a book that had one of them changes the book,
- * and removing both again would take away the one it already had.
+ * and removing both again would take away the one it already had. Only the
+ * single-tag case is exact without knowing what each book gained or lost; see
+ * {@link inverseRelativeOps} for the exact, per-book undo.
  */
 export function inverseRelativeOp(op: RelativeOp): RelativeOp | null {
   if (op.values.length !== 1) return null;
   return { ...op, mode: op.mode === "add" ? "remove" : "add" };
+}
+
+export interface RelativeUndoStep {
+  ids: number[];
+  op: RelativeOp;
+}
+
+/**
+ * The steps that undo a finished relative edit exactly: per book, an add is
+ * undone by removing only the spellings that book gained, a remove by adding
+ * back only the spellings it lost. Books with the same delta share a step.
+ * Falls back to the single-tag inverse for a server that did not say what each
+ * book gained and lost; `null` when no exact undo exists.
+ */
+export function inverseRelativeOps(op: RelativeOp, result: Pick<RelativeRunResult, "updatedIds" | "deltas">): RelativeUndoStep[] | null {
+  if (result.deltas.size === 0) {
+    const inverse = inverseRelativeOp(op);
+    return inverse ? [{ ids: result.updatedIds, op: inverse }] : null;
+  }
+  const mode = op.mode === "add" ? "remove" : "add";
+  const groups = new Map<string, RelativeUndoStep>();
+  for (const id of result.updatedIds) {
+    const delta = result.deltas.get(id);
+    if (!delta) return null; // a changed book we know nothing about: no exact undo
+    const values = op.mode === "add" ? delta.added : delta.removed;
+    if (values.length === 0) continue;
+    const key = JSON.stringify(values);
+    const group = groups.get(key);
+    if (group) group.ids.push(id);
+    else groups.set(key, { ids: [id], op: { ...op, mode, values } });
+  }
+  return [...groups.values()];
 }

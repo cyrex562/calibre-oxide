@@ -579,6 +579,31 @@ mod tests {
         assert_eq!(after["total_num"], before["total_num"], "{after}");
     }
 
+    /// T29a #2: a tracked book moved on disk is re-attached by the prepare chain (every later
+    /// stage reads its file), not reported as missing plus a stray untracked file.
+    #[tokio::test]
+    async fn prepare_reattaches_a_book_moved_on_disk_and_does_not_count_it_as_untracked() {
+        let (dir, router) = test_app();
+        html_book(dir.path(), "wanderer.html", "Wanderer");
+        let (_, scanned) = post_json(&router, "/scan-library/default?wait=true").await;
+        assert_eq!(scanned["added"].as_array().unwrap().len(), 1, "{scanned}");
+        std::fs::create_dir_all(dir.path().join("Moved")).unwrap();
+        std::fs::rename(dir.path().join("wanderer.html"), dir.path().join("Moved/wanderer.html")).unwrap();
+
+        let (status, body) = post_json(&router, "/prepare-library/default?wait=true").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let scan = &body["stages"]["scan"];
+        assert_eq!(scan["relocated"], 1, "{body}");
+        assert_eq!(scan["untracked"], 0, "{body}");
+        assert_eq!(scan["at_least"], false, "no cap: the count is exact: {body}");
+        assert_eq!(scan["added"].as_array().unwrap().len(), 0, "{body}");
+        let (_, ajax) = get_json(&router, "/ajax/book/1").await;
+        assert_eq!(ajax["title"], "Wanderer", "still the one book, not a second: {ajax}");
+        let (_, all) = get_json(&router, "/ajax/search?num=100").await;
+        assert_eq!(all["total_num"], 1, "{all}");
+        assert!(dir.path().join("Moved/wanderer.html").is_file());
+    }
+
     /// The chained job runs every stage, and a rerun picks up at the stage the
     /// last one reached.
     #[tokio::test]

@@ -52,6 +52,9 @@ pub struct FolderEntry {
     pub books_here: usize,
     /// The user made it and it holds no books yet.
     pub empty: bool,
+    /// An author folder (calibre's `Author/Title (id)` layout): see [`list_with`].
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub author: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -60,6 +63,10 @@ pub struct FolderTree {
     pub total: usize,
     /// Sorted by path, case-insensitively; every parent precedes its children.
     pub folders: Vec<FolderEntry>,
+    /// How many author folders the library has (listed or not).
+    pub author_folders: usize,
+    /// The author folders were left out of `folders`.
+    pub author_folders_hidden: bool,
 }
 
 /// A folder as stored: `/`-separated, no leading or trailing separator.
@@ -121,7 +128,19 @@ fn per_book_dir_title(segment: &str) -> Option<&str> {
 /// holding formats named `Title - Author`, as calibre names them. A folder
 /// someone called `Dune (1965)` with a plain `Dune.pdf` in it is not one.
 pub fn list(cache: &Cache) -> Result<FolderTree> {
-    let paths: Vec<String> = {
+    list_with(cache, true)
+}
+
+/// [`list`], optionally without the **author folders**: a folder whose books
+/// all sit in per-book directories below it and that holds nothing else (calibre's
+/// `Author/Title (id)`). They are storage, not folders anyone made, and in a library
+/// with thousands of authors they were most of the tree (3,800 of 13,000 nodes at
+/// 50,000 books). With `include_author_folders` false they are left out and counted
+/// in [`FolderTree::hidden_author_folders`]; the books still count toward the total
+/// and every parent folder.
+pub fn list_with(cache: &Cache, include_author_folders: bool) -> Result<FolderTree> {
+    // (the folder a book is shown in, whether that was reached by dropping a per-book directory)
+    let paths: Vec<(String, bool)> = {
         let conn = cache.backend.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT id, path FROM books")?;
         let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -145,7 +164,7 @@ pub fn list(cache: &Cache) -> Result<FolderTree> {
                 let p = p.unwrap_or_default();
                 let by_id = folder_of(id, &p);
                 if by_id != norm(&p) {
-                    return by_id;
+                    return (by_id, true);
                 }
                 let parts: Vec<&str> = p.split(['/', '\\']).map(str::trim).filter(|p| !p.is_empty() && *p != ".").collect();
                 if let Some((last, rest)) = parts.split_last() {
@@ -154,22 +173,28 @@ pub fn list(cache: &Cache) -> Result<FolderTree> {
                         let alone = occupied.get(&key) == Some(&1) && !ancestors.contains(&key);
                         let prefix = format!("{} - ", title.to_lowercase());
                         if alone && names.get(&id).is_some_and(|n| n.iter().any(|n| n.starts_with(&prefix))) {
-                            return rest.join("/");
+                            return (rest.join("/"), true);
                         }
                     }
                 }
-                by_id
+                (by_id, false)
             })
             .collect()
     };
     let total = paths.len();
     // lower-cased path -> entry
     let mut map: BTreeMap<String, FolderEntry> = BTreeMap::new();
-    for path in &paths {
+    // lower-cased path -> books directly there that were in a per-book directory
+    let mut in_book_dirs: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (path, from_book_dir) in &paths {
         let parts: Vec<&str> = path.split(['/', '\\']).map(str::trim).filter(|p| !p.is_empty() && *p != ".").collect();
         for depth in 1..=parts.len() {
             let here = parts[..depth].join("/");
-            let entry = map.entry(path_key(&here)).or_insert_with(|| FolderEntry { path: here, books: 0, books_here: 0, empty: false });
+            let key = path_key(&here);
+            if depth == parts.len() && *from_book_dir {
+                *in_book_dirs.entry(key.clone()).or_default() += 1;
+            }
+            let entry = map.entry(key).or_insert_with(|| FolderEntry { path: here, books: 0, books_here: 0, empty: false, author: false });
             entry.books += 1;
             if depth == parts.len() {
                 entry.books_here += 1;
@@ -181,14 +206,24 @@ pub fn list(cache: &Cache) -> Result<FolderTree> {
         for depth in 1..=parts.len() {
             let here = parts[..depth].join("/");
             let leaf = depth == parts.len();
-            let entry = map.entry(path_key(&here)).or_insert_with(|| FolderEntry { path: here, books: 0, books_here: 0, empty: false });
+            let entry = map.entry(path_key(&here)).or_insert_with(|| FolderEntry { path: here, books: 0, books_here: 0, empty: false, author: false });
             entry.empty = entry.empty || (leaf && entry.books == 0);
         }
     }
+    // An author folder: every book directly in it is in a per-book directory, and it
+    // has no subfolders (a user-made folder inside it makes it a real folder).
+    let parents: std::collections::HashSet<String> = map.keys().filter_map(|k| k.rsplit_once('/').map(|(parent, _)| parent.to_string())).collect();
+    for (key, entry) in map.iter_mut() {
+        entry.author = entry.books_here > 0 && in_book_dirs.get(key) == Some(&entry.books_here) && !parents.contains(key);
+    }
     let mut folders: Vec<FolderEntry> = map.into_values().collect();
+    let author_folders = folders.iter().filter(|f| f.author).count();
+    if !include_author_folders {
+        folders.retain(|f| !f.author);
+    }
     // `a/b` must come right after `a`, before `a-x`: sort by the segments.
     folders.sort_by_key(|f| path_key(&f.path).split('/').map(String::from).collect::<Vec<_>>());
-    Ok(FolderTree { total, folders })
+    Ok(FolderTree { total, folders, author_folders, author_folders_hidden: !include_author_folders })
 }
 
 fn escapes_library(library: &Path, folder: &str) -> bool {
@@ -531,5 +566,33 @@ mod tests {
         let tree = list(&cache).unwrap();
         assert!(tree.folders.iter().any(|f| f.path == "Games/Later" && f.empty));
         assert!(!tree.folders.iter().any(|f| f.path.starts_with("Gaming")));
+    }
+
+    /// calibre's `Author/Title (id)` layout makes a folder per author that nobody made: left
+    /// out on request (a third of the tree at 50,000 books), counted, and still there otherwise.
+    #[test]
+    fn author_folders_can_be_left_out_of_the_tree() {
+        let (dir, cache) = library();
+        for name in ["One", "Two", "Three", "Four"] {
+            write(&dir.path().join(format!("inbox/{name}.pdf")), name.as_bytes());
+        }
+        index(dir.path(), &cache);
+        let (one, two, three, four) = (id(&cache, "One"), id(&cache, "Two"), id(&cache, "Three"), id(&cache, "Four"));
+        cache.set_book_path(one, &format!("Herbert, Frank/One ({one})")).unwrap();
+        cache.set_book_path(two, &format!("Herbert, Frank/Two ({two})")).unwrap();
+        cache.set_book_path(three, "Novels").unwrap();
+        // An author folder that holds a folder somebody made is a real folder.
+        cache.set_book_path(four, &format!("Asimov, Isaac/Four ({four})")).unwrap();
+        create_folder(&cache, "Asimov, Isaac/Drafts").unwrap();
+
+        let all = list_with(&cache, true).unwrap();
+        assert_eq!(all.folders.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), vec!["Asimov, Isaac", "Asimov, Isaac/Drafts", "Herbert, Frank", "Novels"]);
+        assert_eq!((all.author_folders, all.author_folders_hidden), (1, false));
+        assert!(all.folders.iter().find(|f| f.path == "Herbert, Frank").unwrap().author);
+
+        let tree = list_with(&cache, false).unwrap();
+        assert_eq!(tree.total, 4, "hiding folders never hides books");
+        assert_eq!(tree.folders.iter().map(|f| (f.path.as_str(), f.books)).collect::<Vec<_>>(), vec![("Asimov, Isaac", 1), ("Asimov, Isaac/Drafts", 0), ("Novels", 1)]);
+        assert_eq!((tree.author_folders, tree.author_folders_hidden), (1, true));
     }
 }

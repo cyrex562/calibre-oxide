@@ -144,7 +144,7 @@ const canBrowse = computed(() => c.canBrowse());
       </template>
     </section>
 
-    <p v-if="state.phase === 'running'" class="hint" role="status" data-testid="progress">{{ state.progress }}</p>
+    <p v-if="state.phase === 'running' || state.phase === 'planning'" class="hint" role="status" data-testid="progress">{{ state.progress }}</p>
 
     <section v-if="state.report" class="mirror-done" aria-label="Result" data-testid="report">
       <p role="status">{{ describeReport(state.report) }}</p>
@@ -158,7 +158,7 @@ const canBrowse = computed(() => c.canBrowse());
     </section>
     <template #footer>
       <button type="button" :disabled="busy" @click="emit('close')">Close</button>
-      <button v-if="state.phase === 'running' && state.jobId !== null" type="button" data-testid="cancel" @click="cancelRun">Cancel</button>
+      <button v-if="(state.phase === 'running' || state.phase === 'planning') && state.jobId !== null" type="button" data-testid="cancel" @click="cancelRun">Cancel</button>
       <button type="button" :disabled="busy || problem !== null" data-testid="preview" @click="preview">{{ state.phase === "planning" ? "Previewing…" : "Preview" }}</button>
       <button v-if="state.plan" type="button" class="primary" :disabled="busy || !canRun" data-testid="run-plan" @click="run">{{ state.plan.new_target ? "Copy" : "Refresh" }}</button>
     </template>

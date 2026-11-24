@@ -38,6 +38,11 @@ export interface BatchGroup {
 export interface BatchResponse {
   updated: number[];
   failed: { book_id: number; error: string }[];
+  /**
+   * What each written field held before, by book id, when the request asked for it
+   * (`previous: true`): the types a book row has. Absent from an older server.
+   */
+  previous?: Record<string, Record<string, unknown>>;
 }
 
 /** Thrown by a sender when the server has no batch route (an older server). */
@@ -80,6 +85,8 @@ export interface BulkRunResult {
   notStarted: number;
   /** Whether the per-book route was used because the server has no batch one. */
   usedFallback: boolean;
+  /** What the written books held before (see [`BatchResponse.previous`]), for the ones the server told. */
+  previous: Map<number, Record<string, unknown>>;
 }
 
 function message(e: unknown): string {
@@ -89,7 +96,7 @@ function message(e: unknown): string {
 /** Sends `items` to the server, chunk by chunk. A failure is recorded for the books it hit and the run goes on. */
 export async function runBulkEdit(items: readonly BulkItem[], deps: BulkRunDeps): Promise<BulkRunResult> {
   const chunkSize = Math.max(1, deps.chunkSize ?? BATCH_CHUNK);
-  const result: BulkRunResult = { updated: 0, errors: [], notStarted: 0, usedFallback: false };
+  const result: BulkRunResult = { updated: 0, errors: [], notStarted: 0, usedFallback: false, previous: new Map() };
   const total = items.length;
   let done = 0;
   let at = 0;
@@ -101,6 +108,7 @@ export async function runBulkEdit(items: readonly BulkItem[], deps: BulkRunDeps)
       const response = await deps.sendBatch(groupByChanges(chunk));
       result.updated += response.updated.length;
       for (const f of response.failed) result.errors.push(`Book ${f.book_id}: ${f.error}`);
+      for (const [id, row] of Object.entries(response.previous ?? {})) result.previous.set(Number(id), row);
     } catch (e) {
       if (e instanceof BatchUnsupportedError) {
         result.usedFallback = true;

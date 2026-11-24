@@ -61,6 +61,12 @@ describe("describing", () => {
     expect(planListIsPartial(plan())).toBe(true);
     expect(planListIsPartial(plan({ files: 1 }))).toBe(false);
   });
+  it("says when attachments folders move with their books, or have to stay behind", () => {
+    expect(describePlan(plan({ data_folders: 1 }))).toContain("1 attachments folder moves too");
+    expect(describePlan(plan({ data_folders: 3 }))).toContain("3 attachments folders move too");
+    expect(describePlan(plan({ warnings: [{ book_id: 1, reason: "the files attached to this book in a/data stay where they are: x" }] }))).toContain("some attachments stay behind");
+    expect(describePlan(plan({ warnings: [{ book_id: 1, reason: "the new path is 300 characters long" }] }))).not.toContain("attachments");
+  });
   it("summarises a run and its undo", () => {
     expect(describeReport(report())).toBe("2 books of 2 organized · 3 files moved");
     expect(describeReport(report({ cancelled: true, failed: [{ book_id: 1, reason: "x" }] }))).toContain("stopped early");

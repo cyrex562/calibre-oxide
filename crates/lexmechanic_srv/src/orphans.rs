@@ -97,39 +97,81 @@ pub async fn relocate(State(state): State<AppState>, Path((book_id, format, libr
     Ok(Json(json!({"outcome": code, "message": message})))
 }
 
-/// `GET /orphans/locate/{book_id}/{format}/{library_id}` -- "find the file by its
+/// How long, and how many bytes, one `locate` call may spend hashing candidates.
+const LOCATE_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+const LOCATE_BYTE_BUDGET: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Cancels the hashing when the request is dropped (the client went away).
+struct CancelOnDrop(std::sync::Arc<lexmechanic_db::scan_pipeline::JobControl>);
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// `POST /orphans/locate/{book_id}/{format}/{library_id}` -- "find the file by its
 /// checksum". Reads the library's untracked files (the ones the check found)
 /// and answers with those whose content is the one recorded for the missing
 /// file, so the person can confirm one and `relocate` to it. `has_checksum:
 /// false` means nothing was recorded to compare with.
+///
+/// It does real work (a whole-library check, then hashing), so it is a `POST`, not
+/// something a prefetch or a retry may repeat. Candidates whose size differs from the
+/// recorded one are not read; the hashing stops when the client disconnects, or at a
+/// time or byte budget, and then `truncated` is true and `checked` says how far it got.
 pub async fn locate(State(state): State<AppState>, Path((book_id, format, library_id)): Path<(i32, String, String)>) -> Result<Json<Value>, ServerError> {
     let cache = cache_or_404(&state, &library_id)?;
+    let control = lexmechanic_db::scan_pipeline::JobControl::new();
+    let _cancel_when_dropped = CancelOnDrop(control.clone());
     let found = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
         let (recorded, _) = cache.checksums().recorded_identity(book_id, "format", &format.to_uppercase()).unwrap_or((None, None));
         let Some(recorded) = recorded else {
-            return Ok(json!({"has_checksum": false, "candidates": [], "checked": 0}));
+            return Ok(json!({"has_checksum": false, "candidates": [], "checked": 0, "truncated": false}));
+        };
+        // The recorded size, when the library has one: a file of another size is another file.
+        let recorded_size: Option<u64> = {
+            let conn = cache.backend.conn.lock().unwrap();
+            conn.query_row("SELECT uncompressed_size FROM data WHERE book = ?1 AND upper(format) = upper(?2)", (book_id, &format), |row| row.get::<_, Option<i64>>(0)).ok().flatten().filter(|n| *n > 0).map(|n| n as u64)
         };
         let check = lexmechanic_db::library_check::check(&cache)?;
-        let mut candidates = Vec::new();
+        let mut candidates: Vec<Value> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut checked = 0usize;
+        let mut truncated = false;
         // The check already matched some by content: this book's file, found elsewhere.
         for file in check.moved_files.iter().filter(|f| f.book_id == Some(book_id)) {
-            candidates.push(json!({"path": file.path}));
+            if seen.insert(file.path.clone()) {
+                candidates.push(json!({"path": file.path}));
+            }
         }
+        let started = std::time::Instant::now();
+        let mut hashed = 0u64;
         for file in &check.untracked_files {
+            if seen.contains(&file.path) {
+                continue;
+            }
             let path = cache.backend.library_path.join(&file.path);
             // Only a file of the same kind can be the same book file.
             if !path.extension().is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case(&format)) {
                 continue;
             }
+            let Ok(meta) = std::fs::metadata(&path) else { continue };
+            if recorded_size.is_some_and(|n| n != meta.len()) {
+                continue;
+            }
+            if control.is_cancelled() || started.elapsed() > LOCATE_TIME_BUDGET || hashed.saturating_add(meta.len()) > LOCATE_BYTE_BUDGET {
+                truncated = true;
+                break;
+            }
             checked += 1;
-            if let Ok(digest) = lexmechanic_db::scan_pipeline::hash_stream(&path, None) {
-                if digest.hash == recorded {
+            hashed += meta.len();
+            if let Ok(digest) = lexmechanic_db::scan_pipeline::hash_stream(&path, Some(&control)) {
+                if digest.hash == recorded && seen.insert(file.path.clone()) {
                     candidates.push(json!({"path": file.path}));
                 }
             }
         }
-        Ok(json!({"has_checksum": true, "candidates": candidates, "checked": checked}))
+        Ok(json!({"has_checksum": true, "candidates": candidates, "checked": checked, "truncated": truncated}))
     })
     .await
     .map_err(|e| ServerError::InternalServerError(e.to_string()))?
@@ -366,11 +408,22 @@ mod tests {
             filetime::set_file_mtime(dir.path().join(name), filetime::FileTime::from_system_time(old)).unwrap();
         }
 
-        let (status, body) = get_json(&router, &format!("/orphans/locate/{book_id}/PDF/default")).await;
+        // The same size as the recorded file but other bytes: read, and not offered.
+        std::fs::write(dir.path().join("decoy.pdf"), b"%PDF-1.4 xxxxxx").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        filetime::set_file_mtime(dir.path().join("decoy.pdf"), filetime::FileTime::from_system_time(old)).unwrap();
+
+        // It hashes files, so it is a POST: a GET (a prefetch, a retry) is refused.
+        let (status, _) = get_json(&router, &format!("/orphans/locate/{book_id}/PDF/default")).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        let (status, body) = post_body(&router, &format!("/orphans/locate/{book_id}/PDF/default"), "application/json", Vec::new()).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["has_checksum"], true, "{body}");
+        assert_eq!(body["truncated"], false, "{body}");
         let paths: Vec<&str> = body["candidates"].as_array().unwrap().iter().map(|c| c["path"].as_str().unwrap()).collect();
         assert_eq!(paths, vec!["boiler-manual-v2.pdf"], "{body}");
+        // The renamed copy came from the check (already matched); of the untracked files only the decoy has the recorded size, so only it was read.
+        assert_eq!(body["checked"], 1, "{body}");
     }
 
     /// A different file is allowed but must be *said*. Silently accepting

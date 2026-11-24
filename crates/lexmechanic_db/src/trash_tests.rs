@@ -320,3 +320,236 @@ fn entry_keys_cannot_climb_out_of_the_trash() {
     assert!(cache.restore_trashed_book("../..").is_err());
     assert!(cache.delete_trash_entry(TrashKind::Book, "..", None).is_err());
 }
+
+// ---------------------------------------------------------------------
+// Batch deletion (tranche 29c): one transaction and one log entry per run
+// ---------------------------------------------------------------------
+
+/// Every file under `root` (relative, sorted) with its size, leaving out the library's own state.
+fn tree(root: &Path) -> Vec<(String, u64)> {
+    fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, u64)>) {
+        for entry in fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            let rel = path.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
+            if rel.starts_with(".lexmechanic") || rel == "metadata.db" || rel.starts_with("metadata.db-") {
+                continue;
+            }
+            if path.is_dir() {
+                walk(&path, root, out);
+                out.push((format!("{rel}/"), 0));
+            } else if !rel.ends_with(BOOK_MANIFEST) {
+                out.push((rel, path.metadata().unwrap().len()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+/// A library with books in a shared folder, a folder of their own and the root.
+fn mixed_library() -> (tempfile::TempDir, Cache, Vec<i32>) {
+    let (dir, cache) = library();
+    let mut ids = Vec::new();
+    for (rel, title) in [("Receipts/a.pdf", "A"), ("Receipts/b.pdf", "B"), ("Receipts/c.pdf", "C"), ("Own/Dune (7)/d.pdf", "D"), ("root.pdf", "R"), ("Reports/e.pdf", "E"), ("Reports/f.pdf", "F")] {
+        write(&dir.path().join(rel), format!("%PDF {title}").as_bytes());
+        ids.push(register(&cache, rel, title, "Unknown"));
+    }
+    (dir, cache, ids)
+}
+
+/// The batch is the one-by-one deletion, done in one transaction: the same books gone,
+/// the same files in the same places, the same folders removed.
+#[test]
+fn deleting_many_books_at_once_leaves_what_deleting_them_one_by_one_does() {
+    let (one_dir, one, one_ids) = mixed_library();
+    let (many_dir, many, many_ids) = mixed_library();
+    // Both of a shared folder's books, a book of its own, and one more.
+    let pick = |ids: &[i32]| vec![ids[0], ids[1], ids[2], ids[3], ids[5], ids[6]];
+
+    for id in pick(&one_ids) {
+        one.delete_book_with(id, BookFiles::Trash).unwrap();
+    }
+    let results = many.delete_books_with(&pick(&many_ids), BookFiles::Trash);
+    assert!(results.iter().all(|r| r.is_ok()), "{results:?}");
+
+    assert_eq!(tree(one_dir.path()), tree(many_dir.path()));
+    assert_eq!(one.all_book_ids().unwrap(), many.all_book_ids().unwrap());
+    let titles = |c: &Cache| {
+        let mut v: Vec<(String, i64)> = c.list_trash().unwrap().into_iter().map(|e| (e.title, e.size)).collect();
+        v.sort();
+        v
+    };
+    assert_eq!(titles(&one), titles(&many));
+    // The folders the books were alone in went with the last of them.
+    assert!(!many_dir.path().join("Reports").exists());
+    assert!(!many_dir.path().join("Own").exists());
+    assert!(many_dir.path().join("root.pdf").exists());
+}
+
+/// What a batch trashed comes back, with the same uuids.
+#[test]
+fn what_a_batch_trashed_can_be_restored() {
+    let (dir, cache, ids) = mixed_library();
+    let mut expected: Vec<Option<String>> = ids.iter().map(|id| cache.book_uuid(*id).unwrap()).collect();
+    let results = cache.delete_books_with(&ids[..3], BookFiles::Trash);
+    assert!(results.iter().all(|r| r.is_ok()));
+    assert!(!dir.path().join("Receipts/a.pdf").exists());
+
+    for entry in cache.list_trash().unwrap() {
+        cache.restore_trashed_book(&entry.key).unwrap();
+    }
+    for rel in ["Receipts/a.pdf", "Receipts/b.pdf", "Receipts/c.pdf"] {
+        assert!(dir.path().join(rel).exists(), "{rel}");
+    }
+    let mut restored: Vec<Option<String>> = cache.all_book_ids().unwrap().into_iter().map(|id| cache.book_uuid(id).unwrap()).collect();
+    restored.sort();
+    expected.sort();
+    assert_eq!(restored, expected);
+}
+
+/// One change-log entry for the batch, however many books: that is the saving (an
+/// entry is its own file and two fsyncs).
+#[test]
+fn a_batch_deletion_writes_one_change_log_entry() {
+    let (_dir, cache, ids) = mixed_library();
+    let before = cache.backend.change_log().unwrap().next_sequence();
+    cache.delete_books_with(&ids[..4], BookFiles::Trash);
+    let after = cache.backend.change_log().unwrap().next_sequence();
+    assert_eq!(after - before, 1, "one batch entry for four books");
+}
+
+/// A book that is not there is a no-op for itself and harms nothing else.
+#[test]
+fn a_batch_with_an_unknown_id_and_a_repeat_deletes_the_rest() {
+    let (dir, cache, ids) = mixed_library();
+    let results = cache.delete_books_with(&[ids[0], 9999, ids[0], ids[1]], BookFiles::Trash);
+    assert_eq!(results.len(), 4);
+    assert!(results.iter().all(|r| r.is_ok()));
+    assert!(!dir.path().join("Receipts/a.pdf").exists());
+    assert!(!dir.path().join("Receipts/b.pdf").exists());
+    assert!(dir.path().join("Receipts/c.pdf").exists());
+}
+
+/// A run's restore reports progress, and stops between books when cancelled.
+#[test]
+fn restoring_a_run_counts_its_books_and_stops_when_cancelled() {
+    let (_dir, cache, ids) = mixed_library();
+    crate::trash::with_trash_run("run-test", || cache.delete_books_with(&ids[..3], BookFiles::Trash));
+    assert_eq!(cache.trash_entries_for_run("run-test").unwrap().len(), 3);
+
+    let control = crate::scan_pipeline::JobControl::new();
+    control.cancel();
+    let none = cache.restore_trash_run_controlled("run-test", &control).unwrap();
+    assert!(none.restored.is_empty(), "a cancelled restore starts nothing");
+    assert_eq!(control.snapshot().total, 3);
+
+    let control = crate::scan_pipeline::JobControl::new();
+    let all = cache.restore_trash_run_controlled("run-test", &control).unwrap();
+    assert_eq!(all.restored.len(), 3, "{:?}", all.failed);
+    assert_eq!(control.snapshot().seen, 3);
+}
+
+/// Windows strips a trailing dot when it creates a folder, so the folder a book
+/// was recorded in (`Joseph P. J.`) is on disk as `Joseph P. J`. A path spelled with
+/// the dot and made extended-length (as a canonical library path is) names nothing.
+/// The trash must move the file all the same.
+#[cfg(windows)]
+#[test]
+fn a_folder_recorded_with_a_trailing_dot_is_trashed_by_the_name_it_has_on_disk() {
+    let (dir, cache) = library();
+    write(&dir.path().join("Joseph P. J.").join("a.pdf"), b"%PDF dot");
+    assert!(dir.path().join("Joseph P. J").join("a.pdf").is_file(), "Windows made the folder without its dot");
+    let id = register(&cache, "Joseph P. J./a.pdf", "Dot", "Unknown");
+
+    let outcome = cache.delete_book_with(id, BookFiles::Trash).unwrap();
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    assert_eq!(outcome.trashed, vec!["Joseph P. J./a.pdf".to_string()]);
+    assert!(!dir.path().join("Joseph P. J").join("a.pdf").exists());
+    let key = cache.list_trash().unwrap().remove(0).key;
+    cache.restore_trashed_book(&key).unwrap();
+    assert!(dir.path().join("Joseph P. J").join("a.pdf").is_file());
+}
+
+/// The raw Win32 rename the journaled handle makes has no long-path support of its own.
+#[cfg(windows)]
+#[test]
+fn a_book_in_a_very_deep_folder_is_trashed_and_restored() {
+    let (dir, cache) = library();
+    let mut rel = String::new();
+    for i in 0..9 {
+        rel.push_str(&format!("a-fairly-long-folder-name-number-{i:02}-xxxxxxxxxxxx/"));
+    }
+    rel.push_str("deep.pdf");
+    assert!(dir.path().join(&rel).to_string_lossy().len() > 300);
+    write(&dir.path().join(&rel), b"%PDF deep");
+    let id = register(&cache, &rel, "Deep", "Unknown");
+
+    let outcome = cache.delete_book_with(id, BookFiles::Trash).unwrap();
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    assert!(!dir.path().join(&rel).exists());
+    let key = cache.list_trash().unwrap().remove(0).key;
+    cache.restore_trashed_book(&key).unwrap();
+    assert!(dir.path().join(&rel).is_file());
+}
+
+/// The rename itself, on the spelling the library path takes when it is canonical
+/// (`\\?\`): there the dot is taken literally.
+#[cfg(windows)]
+#[test]
+fn an_extended_length_path_with_a_trailing_dot_is_found_by_the_stripped_name() {
+    let dir = tempfile::tempdir().unwrap();
+    write(&dir.path().join("Joseph P. J.").join("a.pdf"), b"x");
+    let root = dir.path().canonicalize().unwrap();
+    assert!(root.to_string_lossy().starts_with(r"\\?\"));
+    let from = root.join("Joseph P. J.").join("a.pdf");
+    assert!(!from.exists(), "an extended-length path is not normalised");
+    crate::library_handle::rename_no_replace(&from, &root.join("moved.pdf")).unwrap();
+    assert!(root.join("moved.pdf").is_file());
+}
+
+/// A batch deletion and a restore (with its one-transaction field write) must leave a log that
+/// rebuilds the same library: the books deleted together stay deleted, the one restored is back
+/// with the fields it had.
+#[test]
+fn a_rebuild_from_the_log_agrees_after_a_batch_deletion_and_a_restore() {
+    let (dir, cache, ids) = mixed_library();
+    let uuid_of = |id: i32| cache.book_uuid(id).unwrap().unwrap();
+    let restored_uuid = uuid_of(ids[1]);
+    cache.set_field(ids[1], "publisher", "Bench House").unwrap();
+    cache.set_field(ids[1], "tags", "kept, and, restored").unwrap();
+    cache.set_field(ids[1], "rating", "6").unwrap();
+    cache.delete_books_with(&[ids[0], ids[1], ids[2]], BookFiles::Trash);
+    let key = cache.list_trash().unwrap().into_iter().find(|e| e.book_id == ids[1]).unwrap().key;
+    let back = cache.restore_trashed_book(&key).unwrap();
+
+    let rebuilt_dir = tempfile::tempdir().unwrap();
+    let state = crate::constants::LIBRARY_HANDLE_DIR_NAME;
+    for sub in ["changes", "snapshots"] {
+        let to = rebuilt_dir.path().join(state).join(sub);
+        fs::create_dir_all(&to).unwrap();
+        if let Ok(read) = fs::read_dir(dir.path().join(state).join(sub)) {
+            for e in read.flatten() {
+                fs::copy(e.path(), to.join(e.file_name())).unwrap();
+            }
+        }
+    }
+    fs::copy(dir.path().join(state).join("install-id"), rebuilt_dir.path().join(state).join("install-id")).ok();
+    let rebuilt = Cache::new(rebuilt_dir.path()).unwrap();
+    rebuilt.rebuild_from_change_log().unwrap();
+
+    // Seven books, three deleted together, one of them brought back.
+    let mut live: Vec<String> = cache.all_book_ids().unwrap().into_iter().map(|id| uuid_of(id)).collect();
+    let mut rebuilt_live: Vec<String> = rebuilt.all_book_ids().unwrap().into_iter().map(|id| rebuilt.book_uuid(id).unwrap().unwrap()).collect();
+    live.sort();
+    rebuilt_live.sort();
+    assert_eq!(live.len(), 5);
+    assert_eq!(rebuilt_live, live);
+    assert!(rebuilt_live.contains(&restored_uuid));
+    let id = rebuilt.book_id_for_uuid(&restored_uuid).unwrap().unwrap();
+    assert_eq!(rebuilt.field_for(id, "publisher").unwrap().as_deref(), Some("Bench House"));
+    assert_eq!(rebuilt.field_for(id, "tags").unwrap().as_deref(), Some("kept, and, restored"));
+    assert_eq!(rebuilt.field_for(id, "rating").unwrap().as_deref(), Some("6"));
+    assert_eq!(cache.field_for(back.book_id, "rating").unwrap().as_deref(), Some("6"));
+}

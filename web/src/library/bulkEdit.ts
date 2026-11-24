@@ -208,6 +208,32 @@ export function changesFor(book: BookSummary, spec: BulkEditSpec): BookFieldChan
   return Object.keys(changes).length > 0 ? changes : null;
 }
 
+/**
+ * The one change set a spec gives **every** book, when what it writes does not depend on what a
+ * book has now; `null` when it does (adding or removing list values, a search-and-replace).
+ * Such an edit needs no book read first: setting a publisher on 60,000 books used to fetch
+ * all 60,000 rows (600 requests) before the first write.
+ *
+ * Like `changesFor`, single-valued fields are written whenever they are filled in; a list in
+ * "replace" mode is written even when it is empty (that clears it).
+ */
+export function uniformChanges(spec: BulkEditSpec): BookFieldChanges | null {
+  if (spec.searchReplace?.find) return null;
+  const changes: BookFieldChanges = {};
+  for (const key of ["tags", "authors", "languages"] as const) {
+    const edit = spec[key];
+    if (!edit) continue;
+    if (edit.mode !== "replace") {
+      if (parseList(edit.value).length > 0) return null;
+      continue;
+    }
+    changes[key] = parseList(edit.value);
+  }
+  const rest = changesFor({ id: 0 } as BookSummary, { ...spec, tags: undefined, authors: undefined, languages: undefined, searchReplace: undefined });
+  Object.assign(changes, rest ?? {});
+  return Object.keys(changes).length > 0 ? changes : null;
+}
+
 /** What a bulk edit changed, and what putting it back needs. */
 export interface InverseChanges {
   /** The old values of exactly the fields `changes` wrote. */
