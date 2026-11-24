@@ -274,7 +274,7 @@ function parts(s: Suggestion): [string, string, string] {
   background: var(--bg-raised);
   color: var(--fg);
   border: 1px solid var(--border-strong);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   box-shadow: var(--shadow-menu);
   font-size: var(--fs-body);
 }

@@ -2817,6 +2817,15 @@ impl Cache {
         Ok(())
     }
 
+    /// Writes the stored sort key of the author called `name`, or does nothing
+    /// when there is no such author. Replay of [`crate::change_log::ChangeOp::AuthorSortSet`];
+    /// not logged itself.
+    pub(crate) fn set_author_sort_key(&self, name: &str, sort: &str) -> anyhow::Result<()> {
+        let conn = self.backend.conn.lock().unwrap();
+        conn.execute("UPDATE authors SET sort = ?1 WHERE name = ?2", (sort, name))?;
+        Ok(())
+    }
+
     pub fn rename_author(&self, old_id: i32, new_name: &str) -> anyhow::Result<()> {
         self.rename_item("authors", "books_authors_link", "author", old_id, new_name)
     }

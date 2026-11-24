@@ -193,6 +193,12 @@ fn apply_op(cache: &Cache, op: &ChangeOp) -> Result<bool> {
             }
             Ok(true)
         }
+        ChangeOp::AuthorSortSet { name, sort } => {
+            // An author that is not here has nothing to set: the rename or
+            // removal that took it away is the desired end state.
+            cache.set_author_sort_key(name, sort)?;
+            Ok(true)
+        }
         ChangeOp::CustomColumnRemoved { label } => {
             if cache.custom_column_id(label)?.is_none() {
                 // Already the desired end state.

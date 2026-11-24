@@ -46,7 +46,9 @@
   --row-h: 24px;      /* table row, compact                      */
   --row-h-lg: 30px;   /* table row, comfortable                  */
   --radius: 3px;
+  --radius-md: 4px;   /* panels, cards, chips, menu items        */
   --radius-lg: 6px;   /* dialogs and menus only                  */
+  --radius-pill: 999px; /* badges and filter chips               */
 
   /* Stacking. One scale, so a dialog never loses to a stray z-index. A
      dialog opened over another is appended to <body> later, so it paints
@@ -87,6 +89,11 @@
   --shadow-menu: 0 6px 20px rgb(0 0 0 / 18%);
   --shadow-dialog: 0 16px 48px rgb(0 0 0 / 28%);
   --focus-ring: 0 0 0 2px rgb(42 109 244 / 45%);
+  /* Where Classic tells them apart: the face of a window or a button versus
+     the inside of a text box or a list. Modern uses one colour for both, as
+     it always did. */
+  --bg-field: var(--bg);
+  --fg-on-selected: var(--fg);
 }
 
 /*
@@ -158,6 +165,109 @@
   --diff-remove: #3a1d1d;
   --shadow-menu: 0 6px 20px rgb(0 0 0 / 45%);
   --shadow-dialog: 0 16px 48px rgb(0 0 0 / 60%);
+}
+
+/*
+  The Classic skin: the Windows 2000 look with an XP-ish title bar, in dark.
+
+  It is a skin, not a theme: `data-skin="classic"` on <html> (set from the
+  saved choice by index.html and main.ts, see library/skin.ts) swaps the
+  tokens below, and skin-classic.css draws the bevels. The Modern skin is
+  everything above and below this block, untouched; it keeps following the
+  system's light / dark setting.
+
+  Specificity: `:root[data-skin="classic"]` ties with the Modern dark blocks
+  (`:root:not([data-theme="light"])`, `:root[data-theme="dark"]`), and this
+  block comes after them, so Classic wins whatever the system says.
+
+  Contrast (WCAG AA, 4.5:1 for text), checked with the WCAG formula:
+  --fg 10.9:1, --fg-muted 6.5:1 and --fg-faint 4.8:1 on the face (#2f2f33);
+  --fg on a field (#1b1b1e) 14.1:1; white on the selection navy (#0a246a)
+  14.3:1; --accent (links) 6.0:1 on the face; white on the title bar's lighter
+  end (#3a6ea5) 5.3:1; --danger 5.3:1, --warning 7.8:1 and --success 7.7:1 on
+  the face, so the three stay apart by hue and by lightness.
+*/
+:root[data-skin="classic"] {
+  --font-ui: Tahoma, "Segoe UI", Verdana, sans-serif;
+  --fs-micro: 10px;
+  --fs-small: 11px;
+  --fs-body: 12px;
+  --fs-medium: 13px;
+  --fs-large: 13px;   /* dialog titles: bold, in the title bar    */
+  --lh-body: 1.4;
+
+  --ctl-h-sm: 20px;
+  --ctl-h: 23px;      /* the classic 23px push button             */
+  --ctl-h-lg: 25px;
+  --tb-h: 50px;
+
+  /* Square, except the title bar's top corners (skin-classic.css). */
+  --radius: 0;
+  --radius-md: 0;
+  --radius-lg: 0;
+  --radius-pill: 0;
+
+  /* The face and the windows' insides. */
+  --bg: #2f2f33;               /* window / button face            */
+  --bg-field: #1b1b1e;         /* text boxes, lists, the table    */
+  --bg-sunken: #26262a;        /* side panels (sunken, see css)   */
+  --bg-bar: #2f2f33;           /* toolbar, status bar, headers    */
+  --bg-raised: #2f2f33;        /* menus, dialogs                  */
+  --bg-row-alt: #212125;
+  --bg-hover: #3b3b42;
+  --bg-active: #26262a;
+  --bg-selected: #0a246a;      /* the classic navy highlight      */
+  --bg-selected-inactive: #45454d;
+  --bg-backdrop: rgb(0 0 0 / 45%);
+  --fg: #e8e8ec;
+  --fg-muted: #b4b4bc;
+  --fg-faint: #9a9aa3;
+  --fg-on-accent: #ffffff;
+  --fg-on-selected: #ffffff;
+  --border: #111114;
+  --border-strong: #6a6a73;
+  --accent: #7cb0ff;
+  --accent-hover: #a6c9ff;
+  --accent-soft: #1d2a4d;
+  --danger: #ff7b7b;
+  --warning: #f0c040;
+  --success: #6fdc78;
+  --mark: #f0b44a;
+  --highlight: #6b5a1f;
+  --diff-add: #14301f;
+  --diff-remove: #3a1d1d;
+  --shadow-menu: 2px 2px 0 rgb(0 0 0 / 55%);
+  --shadow-dialog: 3px 3px 0 rgb(0 0 0 / 55%);
+  --focus-ring: none;          /* the focus rectangle is dotted   */
+
+  /* The four edge tones of a bevel, light to dark: the outer top-left edge,
+     the inner top-left edge, the inner bottom-right edge, the outer
+     bottom-right edge. A raised thing shows them as written; a sunken one
+     swaps the two diagonals. */
+  --bevel-hi: #7a7a84;
+  --bevel-light: #4e4e57;
+  --bevel-shadow: #1c1c20;
+  --bevel-dark: #08080a;
+  --bevel-raised:
+    inset -1px -1px 0 var(--bevel-dark), inset 1px 1px 0 var(--bevel-hi),
+    inset -2px -2px 0 var(--bevel-shadow), inset 2px 2px 0 var(--bevel-light);
+  --bevel-sunken:
+    inset -1px -1px 0 var(--bevel-hi), inset 1px 1px 0 var(--bevel-shadow),
+    inset -2px -2px 0 var(--bevel-light), inset 2px 2px 0 var(--bevel-dark);
+  /* A pressed button: the raised bevel turned inside out. */
+  --bevel-pressed:
+    inset -1px -1px 0 var(--bevel-hi), inset 1px 1px 0 var(--bevel-dark),
+    inset -2px -2px 0 var(--bevel-light), inset 2px 2px 0 var(--bevel-shadow);
+  /* The one-pixel bevels of a flat toolbar button under the pointer. */
+  --bevel-thin-raised: inset -1px -1px 0 var(--bevel-dark), inset 1px 1px 0 var(--bevel-hi);
+  --bevel-thin-sunken: inset -1px -1px 0 var(--bevel-hi), inset 1px 1px 0 var(--bevel-dark);
+
+  /* Title bars: navy to steel blue when active, grey when not. */
+  --title-from: #0a246a;
+  --title-to: #3a6ea5;
+  --title-inactive-from: #3a3a43;
+  --title-inactive-to: #5d5d68;
+  --title-fg: #ffffff;
 }
 
 * {
@@ -279,7 +389,7 @@ a {
    dialog's content needs no copy of them. (The backdrop is Dialog's own.) */
 .manage-panel {
   background: var(--bg);
-  border-radius: 6px;
+  border-radius: var(--radius-lg);
   padding: 1.5em;
   max-width: 560px;
   width: 90%;

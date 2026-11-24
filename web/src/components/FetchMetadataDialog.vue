@@ -255,7 +255,10 @@ async function applyPicked() {
       </table>
       <p v-if="applyError" class="error">{{ applyError }}</p>
       <p v-if="applyDone" class="saved">Applied.</p>
-      <button type="button" :disabled="applying" @click="applyPicked">{{ applying ? "Applying…" : "Apply selected fields" }}</button>
+    </template>
+    <template #footer>
+      <button type="button" @click="emit('close')">Close</button>
+      <button v-if="pickerCandidate" type="button" class="primary" :disabled="applying" @click="applyPicked">{{ applying ? "Applying…" : "Apply selected fields" }}</button>
     </template>
   </Dialog>
 </template>
@@ -291,7 +294,7 @@ async function applyPicked() {
   align-items: center;
   gap: 0.75em;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   padding: 0.5em;
 }
 .thumb {

@@ -90,7 +90,9 @@ const readerShortcuts = computed(() =>
     </section>
 
     <p class="hint">Right-click a book for its own actions. Shortcuts never fire while you are typing.</p>
-    <button type="button" @click="emit('close')">Close</button>
+    <template #footer>
+      <button type="button" class="primary" @click="emit('close')">Close</button>
+    </template>
   </Dialog>
 </template>
 
@@ -130,7 +132,7 @@ kbd {
   font-size: var(--fs-small);
   border: 1px solid var(--border);
   border-bottom-width: 2px;
-  border-radius: 3px;
+  border-radius: var(--radius);
   padding: 0.05em 0.4em;
   justify-self: start;
 }

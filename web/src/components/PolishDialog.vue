@@ -104,11 +104,6 @@ async function run() {
       </label>
     </fieldset>
 
-    <div class="polish-buttons">
-      <button type="button" :disabled="busy" @click="run">{{ busy ? "Polishing…" : "Polish" }}</button>
-      <button type="button" :disabled="busy" @click="emit('close')">Close</button>
-    </div>
-
     <p v-if="error" class="error">{{ error }}</p>
     <p v-if="summary" class="status">{{ summary }}</p>
 
@@ -120,6 +115,10 @@ async function run() {
         <span v-else class="polish-report">{{ (r.report ?? []).join(" · ") }}</span>
       </li>
     </ul>
+    <template #footer>
+      <button type="button" :disabled="busy" @click="emit('close')">Close</button>
+      <button type="button" class="primary" :disabled="busy" @click="run">{{ busy ? "Polishing…" : "Polish" }}</button>
+    </template>
   </Dialog>
 </template>
 
@@ -143,18 +142,13 @@ async function run() {
 }
 .polish-css {
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   padding: 0.4rem 0.7rem 0.6rem;
   margin-bottom: 0.6rem;
 }
 .polish-css legend {
   font-size: var(--fs-small);
   opacity: 0.75;
-}
-.polish-buttons {
-  display: flex;
-  gap: 0.5rem;
-  margin-bottom: 0.5rem;
 }
 .polish-results {
   list-style: none;

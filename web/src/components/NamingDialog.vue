@@ -81,13 +81,13 @@ async function saveAndApply(scope: "selected" | "all") {
       <p class="hint">A book with no value for a token leaves no empty folder and no stray separator. A name already taken gets a number.</p>
     </details>
 
-    <div class="buttons">
-      <button type="button" class="primary" :disabled="state.saving || !c.dirty() || c.problem() !== null" data-testid="save-naming" @click="c.save()">{{ state.saving ? "Saving…" : "Save" }}</button>
-      <button type="button" :disabled="state.saving || c.problem() !== null || selectedCount === 0" data-testid="apply-selected" @click="saveAndApply('selected')">Apply to the {{ selectedCount }} selected book{{ selectedCount === 1 ? "" : "s" }}…</button>
-      <button type="button" :disabled="state.saving || c.problem() !== null" data-testid="apply-all" @click="saveAndApply('all')">Apply to all books…</button>
-    </div>
     <p v-if="state.note" class="hint" role="status">{{ state.note }}</p>
     <p class="hint">“Apply” opens Organize with this convention filled in: you see the dry run first, and can undo the run.</p>
+    <template #footer>
+      <button type="button" :disabled="state.saving || c.problem() !== null" data-testid="apply-all" @click="saveAndApply('all')">Apply to all books…</button>
+      <button type="button" :disabled="state.saving || c.problem() !== null || selectedCount === 0" data-testid="apply-selected" @click="saveAndApply('selected')">Apply to the {{ selectedCount }} selected book{{ selectedCount === 1 ? "" : "s" }}…</button>
+      <button type="button" class="primary" :disabled="state.saving || !c.dirty() || c.problem() !== null" data-testid="save-naming" @click="c.save()">{{ state.saving ? "Saving…" : "Save" }}</button>
+    </template>
   </Dialog>
 </template>
 
@@ -119,7 +119,7 @@ h4 {
 }
 .preview {
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   padding: 0.6rem 0.8rem;
 }
 .preview ul {

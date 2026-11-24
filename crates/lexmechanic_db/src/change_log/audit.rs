@@ -605,6 +605,7 @@ const ACCOUNTED: &[(&str, Account)] = &[
     ("cache.rs::set_format_name", Replay("records a FormatSet; exercised by the rename_format_files case")),
     ("cache.rs::forget_format_row", Replay("replay's FormatRemoved applier; records the op it applies")),
     ("cache.rs::insert_book_with_uuid", Replay("creates the row a replayed BookAdded describes")),
+    ("cache.rs::set_author_sort_key", Replay("applies a replayed AuthorSortSet; the repair appends it (repair.rs tests)")),
     ("backend.rs::new_inner", Repair("seeds the default preferences and schema when a library is first opened")),
     ("backend.rs::library_id", Repair("get-or-create of the database file's own id on first read; identity of the cache, not library content")),
     ("tables.rs::read_rating_table", Repair("deletes legacy rating-0 rows while loading; idempotent self-healing, not a user write")),

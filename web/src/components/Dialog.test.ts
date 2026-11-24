@@ -75,6 +75,65 @@ describe("Dialog", () => {
     expect(el.closest("[data-dialog-backdrop]")!.parentElement).toBe(document.body);
   });
 
+  it("puts the title and a close box in a title bar, and the footer after the body", async () => {
+    const { open, closed } = host(() => h("input", { id: "a" }));
+    open.value = true;
+    await flushPromises();
+    const el = panel()!;
+    const bar = el.querySelector(".dialog-titlebar")!;
+    expect(bar.querySelector(".dialog-title")!.textContent).toBe("Title");
+    const x = bar.querySelector<HTMLButtonElement>("button.manage-close")!;
+    expect(x.getAttribute("aria-label")).toBe("Close");
+    // Without `showClose` the box is for the Classic skin only: it is hidden by
+    // `.close-auto` in Modern, and is no Tab stop, like a window's own close box.
+    expect(x.classList.contains("close-auto")).toBe(true);
+    expect(x.tabIndex).toBe(-1);
+    // The body comes before the footer, and the footer's buttons keep their order.
+    const kids = [...el.children].map((c) => c.className.split(" ")[0]);
+    expect(kids).toEqual(["dialog-titlebar", "dialog-body", "dialog-footer"]);
+    // Focus starts in the content, not on the close box.
+    expect(document.activeElement!.id).toBe("a");
+    x.click();
+    await flushPromises();
+    expect(closed.value).toBe(1);
+  });
+
+  it("makes the close box a real Tab stop when `showClose` is set", async () => {
+    const { open } = host(() => h("input", { id: "a" }), { showClose: true });
+    open.value = true;
+    await flushPromises();
+    const x = panel()!.querySelector<HTMLButtonElement>("button.manage-close")!;
+    expect(x.classList.contains("close-auto")).toBe(false);
+    expect(x.tabIndex).toBe(0);
+    expect(document.activeElement!.id).toBe("a");
+  });
+
+  it("greys the title bar of a dialog that has another dialog open above it", async () => {
+    const upper = ref(false);
+    mount(
+      defineComponent({
+        setup: () => () =>
+          h("div", [
+            h(Dialog, { open: true, title: "Lower" }, { default: () => h("input") }),
+            h(Dialog, { open: upper.value, title: "Upper" }, { default: () => h("input") }),
+          ]),
+      }),
+    );
+    await flushPromises();
+    const bars = () => [...document.body.querySelectorAll(".dialog-titlebar")];
+    expect(bars().map((b) => b.classList.contains("dialog-inactive"))).toEqual([false]);
+    upper.value = true;
+    await flushPromises();
+    expect(bars().map((b) => b.classList.contains("dialog-inactive"))).toEqual([true, false]);
+  });
+
+  it("draws no title bar for a bare, full-window dialog", async () => {
+    const { open } = host(() => h("input"), { size: "bare", title: undefined, label: "Viewer" });
+    open.value = true;
+    await nextTick();
+    expect(panel()!.querySelector(".dialog-titlebar")).toBeNull();
+  });
+
   it("uses `label` as the accessible name when it has no title", async () => {
     const { open } = host(() => h("input"), { title: undefined, label: "Help" });
     open.value = true;

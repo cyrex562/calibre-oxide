@@ -113,9 +113,6 @@ const canBrowse = computed(() => c.canBrowse());
       <p v-if="state.draft.overwriteChanged" class="warn" role="alert" data-testid="overwrite-warning">Edits made in the copy since the last refresh will be lost, including changes made to a travel copy's library on another computer.</p>
     </fieldset>
 
-    <div class="row">
-      <button type="button" :disabled="busy || problem !== null" data-testid="preview" @click="preview">{{ state.phase === "planning" ? "Previewing…" : "Preview" }}</button>
-    </div>
     <p v-if="problem && state.draft.target.trim() !== ''" class="hint">{{ problem }}</p>
     <p v-if="state.notice" class="hint" role="status">{{ state.notice }}</p>
     <p v-if="state.error" class="error" role="alert">{{ state.error }}</p>
@@ -138,15 +135,9 @@ const canBrowse = computed(() => c.canBrowse());
           <p v-if="listIsPartial(state.plan, s.action)" class="hint">Showing the first {{ state.plan.items[s.action].length.toLocaleString("en-US") }}.</p>
         </details>
       </template>
-      <div class="row">
-        <button type="button" class="primary" :disabled="busy || !canRun" data-testid="run-plan" @click="run">{{ state.plan.new_target ? "Copy" : "Refresh" }}</button>
-      </div>
     </section>
 
-    <div v-if="state.phase === 'running'" class="row">
-      <p class="hint" role="status" data-testid="progress">{{ state.progress }}</p>
-      <button v-if="state.jobId !== null" type="button" data-testid="cancel" @click="cancelRun">Cancel</button>
-    </div>
+    <p v-if="state.phase === 'running'" class="hint" role="status" data-testid="progress">{{ state.progress }}</p>
 
     <section v-if="state.report" class="mirror-done" aria-label="Result" data-testid="report">
       <p role="status">{{ describeReport(state.report) }}</p>
@@ -158,6 +149,12 @@ const canBrowse = computed(() => c.canBrowse());
       </ul>
       <p v-if="state.report.edits_set_aside > 0" class="hint">{{ state.report.edits_set_aside }} change{{ state.report.edits_set_aside === 1 ? "" : "s" }} made in the copy were set aside in {{ state.report.trash }}.</p>
     </section>
+    <template #footer>
+      <button type="button" :disabled="busy" @click="emit('close')">Close</button>
+      <button v-if="state.phase === 'running' && state.jobId !== null" type="button" data-testid="cancel" @click="cancelRun">Cancel</button>
+      <button type="button" :disabled="busy || problem !== null" data-testid="preview" @click="preview">{{ state.phase === "planning" ? "Previewing…" : "Preview" }}</button>
+      <button v-if="state.plan" type="button" class="primary" :disabled="busy || !canRun" data-testid="run-plan" @click="run">{{ state.plan.new_target ? "Copy" : "Refresh" }}</button>
+    </template>
   </Dialog>
 </template>
 
@@ -197,7 +194,7 @@ h4 {
 }
 fieldset {
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   display: flex;
   flex-direction: column;
   gap: 0.3rem;
@@ -219,7 +216,7 @@ fieldset {
 }
 .badge {
   font-size: var(--fs-body);
-  border-radius: 10px;
+  border-radius: var(--radius-pill);
   padding: 0 0.5rem;
   border: 1px solid var(--border);
 }
@@ -231,7 +228,7 @@ fieldset {
 }
 .mirror-plan {
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   padding: 0.6rem 0.8rem;
   display: flex;
   flex-direction: column;
