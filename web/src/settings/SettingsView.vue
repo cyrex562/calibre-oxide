@@ -1,5 +1,8 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { onBeforeRouteLeave } from "vue-router";
+import { confirmDialog } from "../components/dialogs/confirm";
+import { describeUnsaved, dirtySections, SECTION_LABEL, type SectionKey } from "./dirty";
 import { getMinChars, setMinChars } from "../library/fieldValues";
 import { getSkin, setSkin, SKINS, type Skin } from "../library/skin";
 import { isTauri, tauriInvoke } from "../tauri";
@@ -48,15 +51,8 @@ function moveToolbarAction(index: number, delta: number) {
   toolbarOrder.value = arr;
 }
 async function saveToolbarPrefs() {
-  savedMessage.value = null;
-  error.value = null;
-  try {
-    const prefs: ToolbarPrefs = { hidden: [...toolbarHidden.value], order: toolbarOrder.value };
-    await saveProfile(TOOLBAR_PREFS_PROFILE, prefs as unknown as Record<string, unknown>);
-    savedMessage.value = "Toolbar layout saved.";
-  } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e);
-  }
+  const prefs: ToolbarPrefs = { hidden: [...toolbarHidden.value], order: toolbarOrder.value };
+  await saveProfile(TOOLBAR_PREFS_PROFILE, prefs as unknown as Record<string, unknown>);
 }
 // Plugin management (#801). Plugins run in a WASM sandbox with no
 // filesystem and no network unless their own manifest asks for it, so
@@ -132,15 +128,14 @@ async function chooseAutoAddFolder(clear: boolean) {
 // book; a usable colour in the result colours that row. First enabled
 // matching rule wins, so this list's order is the precedence.
 const coloringRules = ref<ColoringRule[]>([]);
-const coloringSaved = ref(false);
-const coloringError = ref<string | null>(null);
 
 async function loadColoringRules() {
   try {
     const prefs = await fetchProfile<ColoringRulesPrefs>(COLORING_RULES_PROFILE);
     coloringRules.value = prefs?.rules ?? DEFAULT_COLORING_RULES.rules;
+    markClean("colors");
   } catch (e) {
-    console.error("failed to load colouring rules", e);
+    console.error("failed to load row color rules", e);
   }
 }
 
@@ -161,44 +156,26 @@ function moveColoringRule(index: number, delta: number) {
 }
 
 async function saveColoringRules() {
-  coloringError.value = null;
-  coloringSaved.value = false;
-  try {
-    await saveProfile(COLORING_RULES_PROFILE, { rules: coloringRules.value });
-    coloringSaved.value = true;
-  } catch (e) {
-    coloringError.value = e instanceof Error ? e.message : String(e);
-  }
+  await saveProfile(COLORING_RULES_PROFILE, { rules: coloringRules.value });
 }
 
 // Email account (#4.2). Everything but the password is persisted --
 // see the route's own doc for why the credential is deliberately not.
 const emailAccount = ref<EmailAccount>({ relay: "", port: 587, username: "", encryption: "tls", from: "" });
-const emailBusy = ref(false);
-const emailError = ref<string | null>(null);
-const emailSaved = ref(false);
 
 async function loadEmailAccount() {
   try {
     const account = await getEmailAccount();
     if (account) emailAccount.value = { port: 587, encryption: "tls", ...account };
+    markClean("email");
   } catch (e) {
     console.error("failed to load the email account", e);
   }
 }
 
 async function persistEmailAccount() {
-  emailBusy.value = true;
-  emailError.value = null;
-  emailSaved.value = false;
-  try {
-    await saveEmailAccount(emailAccount.value);
-    emailSaved.value = true;
-  } catch (e) {
-    emailError.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    emailBusy.value = false;
-  }
+  if (!emailAccount.value.relay.trim()) throw new Error("enter the SMTP server");
+  await saveEmailAccount(emailAccount.value);
 }
 
 const pluginPath = ref("");
@@ -293,6 +270,7 @@ async function load() {
       const missing = TOOLBAR_ACTIONS.map((a) => a.id).filter((id) => !saved.includes(id));
       toolbarOrder.value = [...saved, ...missing];
     }
+    markClean("library", "reading", "keyboard", "toolbar");
     await loadPlugins();
     if (isTauri()) {
       showAppSettings.value = true;
@@ -315,25 +293,11 @@ onMounted(() => {
 onBeforeUnmount(() => window.removeEventListener("keydown", onRebindKeydown));
 
 async function saveLibraryPrefs() {
-  savedMessage.value = null;
-  error.value = null;
-  try {
-    await saveProfile(LIBRARY_PREFS_PROFILE, libraryPrefs.value as unknown as Record<string, unknown>);
-    savedMessage.value = "Library preferences saved.";
-  } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e);
-  }
+  await saveProfile(LIBRARY_PREFS_PROFILE, libraryPrefs.value as unknown as Record<string, unknown>);
 }
 
 async function saveReaderPrefs() {
-  savedMessage.value = null;
-  error.value = null;
-  try {
-    await saveProfile(READER_PREFS_PROFILE, readerPrefs.value as unknown as Record<string, unknown>);
-    savedMessage.value = "Reading preferences saved.";
-  } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e);
-  }
+  await saveProfile(READER_PREFS_PROFILE, readerPrefs.value as unknown as Record<string, unknown>);
 }
 
 function startRebind(action: KeymapAction) {
@@ -352,14 +316,85 @@ function onRebindKeydown(e: KeyboardEvent) {
 }
 
 async function saveKeymap() {
+  await saveProfile(KEYMAP_PROFILE, keymap.value as unknown as Record<string, unknown>);
+}
+
+// ---- One Save for the sections that are saved together ----
+//
+// Library, Reading, Keyboard, Toolbar, Row colors and Email are edited freely
+// and saved by the one bar at the bottom, which says what is unsaved. Appearance,
+// typing suggestions, the auto-add folder, plugins and the app options apply the
+// moment they are changed, and say so.
+
+const current = computed<Record<SectionKey, string>>(() => ({
+  library: JSON.stringify(libraryPrefs.value),
+  reading: JSON.stringify(readerPrefs.value),
+  keyboard: JSON.stringify(keymap.value),
+  toolbar: JSON.stringify({ hidden: [...toolbarHidden.value].sort(), order: toolbarOrder.value }),
+  colors: JSON.stringify(coloringRules.value),
+  email: JSON.stringify(emailAccount.value),
+}));
+const baseline = ref<Partial<Record<SectionKey, string>>>({});
+function markClean(...keys: SectionKey[]) {
+  const next = { ...baseline.value };
+  for (const k of keys) next[k] = current.value[k];
+  baseline.value = next;
+}
+const unsaved = computed(() => dirtySections(baseline.value, current.value));
+const saving = ref(false);
+const savers: Record<SectionKey, () => Promise<void>> = { library: saveLibraryPrefs, reading: saveReaderPrefs, keyboard: saveKeymap, toolbar: saveToolbarPrefs, colors: saveColoringRules, email: persistEmailAccount };
+
+/** Saves every section with unsaved edits; the ones that fail stay unsaved, with the reason. */
+async function saveAll() {
+  saving.value = true;
   savedMessage.value = null;
   error.value = null;
-  try {
-    await saveProfile(KEYMAP_PROFILE, keymap.value as unknown as Record<string, unknown>);
-    savedMessage.value = "Keyboard shortcuts saved.";
-  } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e);
+  const saved: string[] = [];
+  const failed: string[] = [];
+  for (const key of unsaved.value) {
+    try {
+      await savers[key]();
+      markClean(key);
+      saved.push(SECTION_LABEL[key]);
+    } catch (e) {
+      failed.push(`${SECTION_LABEL[key]}: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
+  if (saved.length > 0) savedMessage.value = `Saved ${saved.join(", ")}.`;
+  if (failed.length > 0) error.value = `Not saved: ${failed.join("; ")}`;
+  saving.value = false;
+}
+
+/** Throws away the edits and reads the saved settings again. */
+async function discardAll() {
+  savedMessage.value = null;
+  error.value = null;
+  await Promise.all([load(), loadColoringRules(), loadEmailAccount()]);
+}
+
+onBeforeRouteLeave(async () => {
+  if (unsaved.value.length === 0) return true;
+  return confirmDialog(`${describeUnsaved(unsaved.value)}. Leave without saving?`, { title: "Unsaved settings", confirmLabel: "Leave", danger: true });
+});
+
+// The nav: the sections in page order, a click scrolls to one.
+const navSections = computed(() => {
+  const list: { id: string; label: string; key?: SectionKey }[] = [
+    { id: "appearance", label: "Appearance" },
+    { id: "library", label: "Library", key: "library" },
+    { id: "typing", label: "Typing suggestions" },
+    { id: "reading", label: "Reading", key: "reading" },
+    { id: "keyboard", label: "Keyboard shortcuts", key: "keyboard" },
+    { id: "toolbar", label: "Toolbar", key: "toolbar" },
+  ];
+  if (pluginsAvailable.value) list.push({ id: "auto-add", label: "Auto-add folder" });
+  list.push({ id: "colors", label: "Row colors", key: "colors" }, { id: "email", label: "Email", key: "email" });
+  if (pluginsAvailable.value) list.push({ id: "plugins", label: "Plugins" });
+  if (showAppSettings.value) list.push({ id: "app", label: "App" });
+  return list;
+});
+function goToSection(id: string) {
+  document.getElementById(`settings-${id}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
 async function toggleAutoReopen() {
@@ -384,7 +419,18 @@ async function toggleAutoReopen() {
     <p v-if="error" class="error">{{ error }}</p>
     <p v-if="savedMessage" class="saved">{{ savedMessage }}</p>
 
-    <section class="pane" aria-labelledby="appearance-heading" data-section="appearance">
+    <div class="settings-body">
+    <nav class="settings-nav" aria-label="Settings sections" data-testid="settings-nav">
+      <ul>
+        <li v-for="n in navSections" :key="n.id">
+          <button type="button" :data-nav="n.id" @click="goToSection(n.id)">
+            {{ n.label }}<span v-if="n.key && unsaved.includes(n.key)" class="unsaved-dot" title="Unsaved changes" role="img" aria-label="unsaved changes">●</span>
+          </button>
+        </li>
+      </ul>
+    </nav>
+    <div class="settings-main">
+    <section id="settings-appearance" class="pane" aria-labelledby="appearance-heading" data-section="appearance">
       <h3 id="appearance-heading">Appearance</h3>
       <fieldset class="skin-choice">
         <legend>Look of the application</legend>
@@ -399,7 +445,7 @@ async function toggleAutoReopen() {
     </section>
 
     <template v-if="!loading">
-      <section class="pane">
+      <section id="settings-library" class="pane">
         <h3>Library</h3>
         <label class="field">
           Default sort
@@ -427,19 +473,18 @@ async function toggleAutoReopen() {
             <option value="skip">Always skip it</option>
           </select>
         </label>
-        <button type="button" @click="saveLibraryPrefs">Save library settings</button>
       </section>
 
-      <section class="pane">
+      <section id="settings-typing" class="pane">
         <h3>Typing suggestions</h3>
         <label class="field">
           Suggest existing names after this many characters (1 to 5)
           <input v-model.number="suggestMinChars" type="number" min="1" max="5" step="1" data-field="suggest-min-chars" @change="suggestMinChars = setMinChars(suggestMinChars)" />
         </label>
-        <p class="hint">Authors, publishers, tags, series and custom columns offer the names already in your library as you type. Applies on this device.</p>
+        <p class="hint">Authors, publishers, tags, series and custom columns offer the names already in your library as you type. Applies at once, on this device.</p>
       </section>
 
-      <section class="pane">
+      <section id="settings-reading" class="pane">
         <h3>Reading</h3>
         <label class="field">
           Font size ({{ readerPrefs.fontSizePercent }}%)
@@ -453,10 +498,9 @@ async function toggleAutoReopen() {
             <option value="sepia">Sepia</option>
           </select>
         </label>
-        <button type="button" @click="saveReaderPrefs">Save reading settings</button>
       </section>
 
-      <section class="pane">
+      <section id="settings-keyboard" class="pane">
         <h3>Keyboard shortcuts</h3>
         <div v-for="(label, action) in KEYMAP_ACTION_LABELS" :key="action" class="field keymap-row">
           <span>{{ label }}</span>
@@ -464,10 +508,9 @@ async function toggleAutoReopen() {
             {{ rebindingAction === action ? "Press a key… (Esc to cancel)" : keymap[action as KeymapAction] }}
           </button>
         </div>
-        <button type="button" @click="saveKeymap">Save keyboard shortcuts</button>
       </section>
 
-      <section class="pane">
+      <section id="settings-toolbar" class="pane">
         <h3>Toolbar</h3>
         <p class="hint">Show/hide and reorder the library toolbar's own action buttons.</p>
         <ul class="toolbar-list">
@@ -476,14 +519,13 @@ async function toggleAutoReopen() {
               <input type="checkbox" :checked="!toolbarHidden.has(id)" @change="toggleToolbarHidden(id)" />
               {{ toolbarLabel(id) }}
             </label>
-            <button type="button" :disabled="i === 0" @click="moveToolbarAction(i, -1)" title="Move up">↑</button>
-            <button type="button" :disabled="i === toolbarOrder.length - 1" @click="moveToolbarAction(i, 1)" title="Move down">↓</button>
+            <button type="button" :disabled="i === 0" :aria-label="`Move ${toolbarLabel(id)} up`" title="Move up" @click="moveToolbarAction(i, -1)">↑</button>
+            <button type="button" :disabled="i === toolbarOrder.length - 1" :aria-label="`Move ${toolbarLabel(id)} down`" title="Move down" @click="moveToolbarAction(i, 1)">↓</button>
           </li>
         </ul>
-        <button type="button" @click="saveToolbarPrefs">Save toolbar layout</button>
       </section>
 
-      <section v-if="pluginsAvailable" class="pane">
+      <section v-if="pluginsAvailable" id="settings-auto-add" class="pane">
         <h3>Auto-add folder</h3>
         <template v-if="isTauri()">
           <p class="hint">
@@ -509,8 +551,8 @@ async function toggleAutoReopen() {
         <p v-else class="hint">Watching a folder needs filesystem access, so it is only available in the desktop app.</p>
       </section>
 
-      <section class="pane">
-        <h3>Row colours</h3>
+      <section id="settings-colors" class="pane">
+        <h3>Row colors</h3>
         <p class="hint">
           Each rule is a template evaluated against every book; if it returns a colour
           name or a hex value, that book's row takes it. The first enabled rule that
@@ -521,20 +563,18 @@ async function toggleAutoReopen() {
             <label class="field checkbox"><input type="checkbox" v-model="r.enabled" /></label>
             <input v-model="r.name" class="coloring-name" placeholder="Name" />
             <input v-model="r.template" class="coloring-template" placeholder="program: test(field('series'), 'blue', '')" />
-            <button type="button" :disabled="i === 0" title="Move up" @click="moveColoringRule(i, -1)">↑</button>
-            <button type="button" :disabled="i === coloringRules.length - 1" title="Move down" @click="moveColoringRule(i, 1)">↓</button>
-            <button type="button" title="Remove" @click="removeColoringRule(i)">✕</button>
+            <button type="button" :disabled="i === 0" :aria-label="`Move rule ${r.name || i + 1} up`" title="Move up" @click="moveColoringRule(i, -1)">↑</button>
+            <button type="button" :disabled="i === coloringRules.length - 1" :aria-label="`Move rule ${r.name || i + 1} down`" title="Move down" @click="moveColoringRule(i, 1)">↓</button>
+            <button type="button" :aria-label="`Remove rule ${r.name || i + 1}`" title="Remove" @click="removeColoringRule(i)">✕</button>
           </li>
         </ul>
         <div class="plugin-actions">
           <button type="button" @click="addColoringRule">+ Add rule</button>
-          <button type="button" @click="saveColoringRules">Save colour rules</button>
         </div>
-        <p v-if="coloringError" class="error">{{ coloringError }}</p>
-        <p v-else-if="coloringSaved" class="status">Saved. {{ activeRules(coloringRules).length }} rule(s) active.</p>
+        <p class="hint">{{ activeRules(coloringRules).length }} rule{{ activeRules(coloringRules).length === 1 ? "" : "s" }} active.</p>
       </section>
 
-      <section class="pane">
+      <section id="settings-email" class="pane">
         <h3>Email</h3>
         <p class="hint">
           Used when sending a book by email. Everything here is saved except the
@@ -542,27 +582,23 @@ async function toggleAutoReopen() {
           be reached over a network, so a saved password would be readable by more
           people than you would expect. You will be asked for it when you send.
         </p>
-        <label class="field">SMTP server <input v-model="emailAccount.relay" placeholder="smtp.example.com" :disabled="emailBusy" /></label>
-        <label class="field">Port <input v-model.number="emailAccount.port" type="number" min="1" max="65535" :disabled="emailBusy" /></label>
-        <label class="field">Username <input v-model="emailAccount.username" :disabled="emailBusy" /></label>
+        <label class="field">SMTP server <input v-model="emailAccount.relay" placeholder="smtp.example.com" /></label>
+        <label class="field">Port <input v-model.number="emailAccount.port" type="number" min="1" max="65535" /></label>
+        <label class="field">Username <input v-model="emailAccount.username" /></label>
         <label class="field">
           Encryption
-          <select v-model="emailAccount.encryption" :disabled="emailBusy">
+          <select v-model="emailAccount.encryption">
             <option value="tls">STARTTLS</option>
             <option value="ssl">SSL/TLS</option>
             <option value="none">None</option>
           </select>
         </label>
-        <label class="field">Send from <input v-model="emailAccount.from" type="email" placeholder="you@example.com" :disabled="emailBusy" /></label>
-        <button type="button" :disabled="emailBusy || !emailAccount.relay.trim()" @click="persistEmailAccount">
-          {{ emailBusy ? "Saving…" : "Save email settings" }}
-        </button>
-        <p v-if="emailError" class="error">{{ emailError }}</p>
-        <p v-else-if="emailSaved" class="status">Saved.</p>
+        <label class="field">Send from <input v-model="emailAccount.from" type="email" placeholder="you@example.com" /></label>
       </section>
 
-      <section class="pane">
+      <section v-if="pluginsAvailable" id="settings-plugins" class="pane">
         <h3>Plugins</h3>
+        <p class="hint">Installing, enabling and removing a plugin takes effect at once.</p>
         <p class="hint">
           Plugins run in a WebAssembly sandbox. They have no access to your files or the
           network unless they ask for it, and anything they ask for is shown below before
@@ -643,7 +679,7 @@ async function toggleAutoReopen() {
         <p v-else class="hint">No plugins installed.</p>
       </section>
 
-      <section v-if="showAppSettings" class="pane">
+      <section v-if="showAppSettings" id="settings-app" class="pane">
         <h3>App</h3>
         <label class="field checkbox">
           <input v-model="autoReopen" type="checkbox" @change="toggleAutoReopen" />
@@ -651,12 +687,23 @@ async function toggleAutoReopen() {
         </label>
       </section>
     </template>
+    </div>
+    </div>
+
+    <!-- One Save for the sections above that are saved together: it says what is unsaved and stays in view. -->
+    <div class="save-bar" role="region" aria-label="Save changes" data-testid="save-bar">
+      <span class="save-status" role="status" data-testid="save-status">{{ unsaved.length > 0 ? describeUnsaved(unsaved) : savedMessage || "All changes saved." }}</span>
+      <span v-if="unsaved.length > 0 && savedMessage" class="saved">{{ savedMessage }}</span>
+      <span class="spacer"></span>
+      <button type="button" :disabled="saving || unsaved.length === 0" data-testid="discard" @click="discardAll">Discard changes</button>
+      <button type="button" class="primary" :disabled="saving || unsaved.length === 0" data-testid="save-all" @click="saveAll">{{ saving ? "Saving…" : "Save changes" }}</button>
+    </div>
   </div>
 </template>
 
 <style scoped>
 .settings {
-  max-width: 640px;
+  max-width: 1000px;
   margin: 0 auto;
   padding: 1em;
   display: flex;
@@ -667,6 +714,77 @@ async function toggleAutoReopen() {
   display: flex;
   align-items: center;
   gap: 1em;
+}
+.settings-body {
+  display: grid;
+  grid-template-columns: 11rem minmax(0, 720px);
+  gap: 1.25em;
+  align-items: start;
+}
+.settings-main {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25em;
+  min-width: 0;
+}
+.settings-nav {
+  position: sticky;
+  top: 0.5em;
+}
+.settings-nav ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15em;
+}
+.settings-nav button {
+  width: 100%;
+  text-align: left;
+  justify-content: flex-start;
+  background: none;
+  border-color: transparent;
+}
+.settings-nav button:hover,
+.settings-nav button:focus-visible {
+  background: var(--bg-selected);
+}
+.unsaved-dot {
+  color: var(--warning);
+  margin-left: 0.35em;
+  font-size: 0.7em;
+}
+.save-bar {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.75em;
+  flex-wrap: wrap;
+  padding: 0.6em 1em;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  z-index: 2;
+}
+.save-bar .spacer {
+  flex: 1;
+}
+@media (max-width: 720px) {
+  .settings-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .settings-nav {
+    position: static;
+  }
+  .settings-nav ul {
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+  .settings-nav button {
+    width: auto;
+  }
 }
 .toolbar h2 {
   margin: 0;

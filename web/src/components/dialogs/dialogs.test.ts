@@ -250,7 +250,8 @@ describe("the dialogs taken out of the library view", () => {
     await settle();
     expect(dialog()).not.toBeNull();
     expect(dialog()!.textContent).toContain("Merged 2 books.");
-    expect(dialog()!.textContent).toContain("Prepare for duplicate detection");
+    expect(dialog()!.textContent).toContain("Analyse library");
+    expect(dialog()!.textContent).not.toContain("Fingerprint PDFs");
     open.value = false;
     await settle();
     expect(dialog()).toBeNull();

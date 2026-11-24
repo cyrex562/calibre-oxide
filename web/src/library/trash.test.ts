@@ -127,4 +127,11 @@ describe("describeTrash", () => {
     expect(describeTrash({ count: 2, total_size: 2048, expire_after_seconds: 14 * 86400, expired: [], entries: [] })).toBe("2 items, 2.0 KB. Items are deleted for good after 14 days.");
     expect(describeTrash({ count: 1, total_size: 10, expire_after_seconds: 86400, expired: [], entries: [] })).toContain("after 1 day.");
   });
+
+  it("explains the longer keeping of books an undoable run removed, so no row contradicts the header", () => {
+    const kept = entry({ expires_at: 1_700_000_000 + 180 * 86400 });
+    const text = describeTrash({ count: 2, total_size: 2048, expire_after_seconds: 14 * 86400, expired: [], entries: [entry(), kept] });
+    expect(text).toBe("2 items, 2.0 KB. Items are deleted for good after 14 days (180 days for books a duplicate run removed, so that run can still be undone).");
+    expect(describeTrash({ count: 1, total_size: 2048, expire_after_seconds: 14 * 86400, expired: [], entries: [entry()] })).toBe("1 item, 2.0 KB. Items are deleted for good after 14 days.");
+  });
 });

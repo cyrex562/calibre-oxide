@@ -30,6 +30,16 @@ export interface ListEdit {
 export const REPLACEABLE_FIELDS = ["title", "authors", "series", "publisher", "tags", "comments"] as const;
 export type ReplaceableField = (typeof REPLACEABLE_FIELDS)[number];
 
+/** The names the panel shows for those fields, not the raw keys. */
+export const REPLACEABLE_FIELD_LABELS: Record<ReplaceableField, string> = {
+  title: "Title",
+  authors: "Authors",
+  series: "Series",
+  publisher: "Publisher",
+  tags: "Tags",
+  comments: "Comments",
+};
+
 export interface SearchReplace {
   field: ReplaceableField;
   find: string;
@@ -196,6 +206,95 @@ export function changesFor(book: BookSummary, spec: BulkEditSpec): BookFieldChan
   }
 
   return Object.keys(changes).length > 0 ? changes : null;
+}
+
+/** What a bulk edit changed, and what putting it back needs. */
+export interface InverseChanges {
+  /** The old values of exactly the fields `changes` wrote. */
+  changes: BookFieldChanges;
+  /** Fields whose old value cannot be written back (an unset date, an empty author list). */
+  lost: string[];
+}
+
+/**
+ * The changes that put one book's fields back to what `book` holds now, for the
+ * fields `changes` is about to write: a bulk edit's undo is these, sent through
+ * the same batch route. Only fields the server can be told to set again are
+ * included; a field that was unset (no publication date, no custom value) has no
+ * way to be written back as "nothing", so it is named in `lost` instead.
+ */
+export function inverseChanges(book: BookSummary, changes: BookFieldChanges): InverseChanges {
+  const out: Record<string, unknown> = {};
+  const lost: string[] = [];
+  for (const key of Object.keys(changes)) {
+    const old = book[key];
+    switch (key) {
+      case "tags":
+      case "languages":
+        out[key] = currentList(book, key);
+        break;
+      case "authors": {
+        const authors = currentList(book, key);
+        if (authors.length > 0) out[key] = authors;
+        else lost.push(key);
+        break;
+      }
+      case "series":
+      case "publisher":
+      case "comments":
+      case "title":
+        out[key] = typeof old === "string" ? old : "";
+        break;
+      case "series_index":
+        out[key] = typeof old === "number" ? old : 1;
+        break;
+      case "rating":
+        out[key] = typeof old === "number" ? old : 0;
+        break;
+      case "pubdate":
+        if (typeof old === "string" && old.length >= 10 && !old.startsWith("0101-01-01")) out[key] = old.slice(0, 10);
+        else lost.push(key);
+        break;
+      default:
+        // A custom column: written back as it was; one that had no value cannot be.
+        if (old === undefined || old === null) lost.push(key);
+        else out[key] = old;
+    }
+  }
+  return { changes: out as BookFieldChanges, lost };
+}
+
+/** The fields a spec writes, in the words the panel uses. */
+export function fieldsOf(spec: BulkEditSpec): string[] {
+  const fields: string[] = [];
+  const hasList = (e?: ListEdit) => !!e && (e.mode === "replace" || parseList(e.value).length > 0);
+  if (hasList(spec.tags)) fields.push("tags");
+  if (hasList(spec.authors)) fields.push("authors");
+  if (hasList(spec.languages)) fields.push("languages");
+  if (spec.publisher) fields.push("publisher");
+  if (spec.series) fields.push("series");
+  if (spec.seriesIndex !== null && spec.seriesIndex !== undefined) fields.push("series number");
+  if (spec.rating !== null && spec.rating !== undefined) fields.push("rating");
+  if (spec.pubdate) fields.push("publication date");
+  if (spec.comments) fields.push("comments");
+  fields.push(...Object.entries(spec.custom ?? {}).filter(([, v]) => v !== "").map(([k]) => k));
+  if (spec.searchReplace?.find) fields.push(spec.searchReplace.field);
+  return fields;
+}
+
+/** "Added tag “travel” to 5 books", "Updated publisher and series on 5 books": the toast after a bulk edit. */
+export function describeBulkResult(spec: BulkEditSpec, books: number): string {
+  const n = `${books.toLocaleString("en-US")} ${books === 1 ? "book" : "books"}`;
+  const fields = fieldsOf(spec);
+  const tags = spec.tags;
+  if (fields.length === 1 && fields[0] === "tags" && tags && tags.mode !== "replace") {
+    const values = parseList(tags.value);
+    const named = values.length === 1 ? `tag “${values[0]}”` : `${values.length} tags`;
+    return tags.mode === "add" ? `Added ${named} to ${n}` : `Removed ${named} from ${n}`;
+  }
+  if (fields.length === 0) return `Updated ${n}`;
+  const list = fields.length === 1 ? fields[0] : `${fields.slice(0, -1).join(", ")} and ${fields[fields.length - 1]}`;
+  return `Updated ${list} on ${n}`;
 }
 
 function stringifyChange(value: unknown): string {

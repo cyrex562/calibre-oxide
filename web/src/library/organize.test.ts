@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createOrganizeController, DEFAULT_ORGANIZE_TEMPLATE, defaultDraft, describePlan, describeReport, describeUndo, draftProblem, draftToScope, planKey, planListIsPartial } from "./organize";
+import { createOrganizeController, DEFAULT_ORGANIZE_TEMPLATE, defaultDraft, describePlan, describeReport, describeRun, describeUndo, draftProblem, draftToScope, planKey, planListIsPartial } from "./organize";
 import type { OrganizeApi } from "./organize";
 import { fetchOrganizeRuns, planOrganize, runOrganize, undoOrganize } from "./api";
 import type { OrganizePlan, OrganizeReport } from "./api";
@@ -202,5 +202,43 @@ describe("the client functions", () => {
     expect(out.books_restored).toBe(1);
     expect(await fetchOrganizeRuns()).toEqual({ runs: [] });
     expect(calls[2].url).toContain("/organize-runs/default");
+  });
+});
+
+describe("describeRun", () => {
+  it("tells a drag-move, a folder rename and a template run apart", () => {
+    expect(describeRun({ books: 1, template: "move to Fiction" })).toBe("Moved 1 book to Fiction");
+    expect(describeRun({ books: 12, template: "rename folder Fiction to Novels" })).toBe("Renamed folder Fiction → Novels (12 books)");
+    expect(describeRun({ books: 60, template: "{author_sort}/{title}" })).toBe("Organized 60 books with {author_sort}/{title}");
+  });
+  it("falls back to the count when the server did not say", () => {
+    expect(describeRun({ books: 2 })).toBe("2 books");
+    expect(describeRun({ books: 1, template: "" })).toBe("1 book");
+  });
+});
+
+describe("the current search as a scope", () => {
+  it("is the default when a search is active and nothing is selected; a selection still wins", () => {
+    expect(defaultDraft(0, true).scope).toBe("search");
+    expect(defaultDraft(0, false).scope).toBe("all");
+    expect(defaultDraft(2, true).scope).toBe("selected");
+  });
+
+  it("sends the search's books as the scope, and refuses an empty search", () => {
+    const d = defaultDraft(0, true);
+    expect(draftToScope(d, [4, 5])).toEqual({ bookIds: [4, 5] });
+    expect(draftProblem(d, [])).toBe("No books match the current search.");
+    expect(draftProblem(d, [4])).toBeNull();
+    expect(planKey(d, [4, 5])).not.toBe(planKey(d, [4]));
+  });
+
+  it("previews with those ids", async () => {
+    const api = { planOrganize: vi.fn(async () => plan()), runOrganize: vi.fn(), fetchOrganizeRuns: vi.fn(async () => ({ runs: [] })), undoOrganize: vi.fn() } as unknown as OrganizeApi;
+    const c = createOrganizeController(api);
+    c.open(0, true);
+    await c.preview([4, 5]);
+    expect(api.planOrganize).toHaveBeenCalledWith(DEFAULT_ORGANIZE_TEMPLATE, { bookIds: [4, 5] });
+    expect(c.planIsCurrent([4, 5])).toBe(true);
+    expect(c.planIsCurrent([4])).toBe(false);
   });
 });

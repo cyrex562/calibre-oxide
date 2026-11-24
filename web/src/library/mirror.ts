@@ -30,7 +30,7 @@ export const realEnv: MirrorEnv = {
   pickFolder: () => tauriInvoke<string | null>("pick_folder"),
 };
 
-export type MirrorScopeKind = "all" | "selected" | "folder";
+export type MirrorScopeKind = "all" | "selected" | "search" | "folder";
 
 export interface MirrorDraft {
   mode: MirrorMode;
@@ -48,9 +48,9 @@ export const MODE_LABELS: Record<MirrorMode, { title: string; hint: string }> = 
   mirror: { title: "Backup mirror: an exact copy for safekeeping, e.g. on the NAS", hint: "A one-way copy of the whole library, kept up to date by running it again. Restore by opening the folder." },
 };
 
-/** What a dialog opens with: a travel copy of the selection when there is one, else everything. */
-export function defaultDraft(selectedCount = 0): MirrorDraft {
-  return { mode: "travel", target: "", scope: selectedCount > 0 ? "selected" : "all", folderPrefix: "", removeMissing: true, overwriteChanged: false };
+/** What a dialog opens with: a travel copy of the selection when there is one, else of the active search, else everything. */
+export function defaultDraft(selectedCount = 0, searchActive = false): MirrorDraft {
+  return { mode: "travel", target: "", scope: selectedCount > 0 ? "selected" : searchActive ? "search" : "all", folderPrefix: "", removeMissing: true, overwriteChanged: false };
 }
 
 /** Whether to offer the native folder dialog. Only the desktop app has one. */
@@ -61,7 +61,8 @@ export function browseVisible(isDesktop: boolean): boolean {
 /** The scope the server is asked for. A backup mirror is always the whole library. */
 export function draftToScope(d: MirrorDraft, selectedIds: number[]): MirrorScope {
   if (d.mode === "mirror" || d.scope === "all") return { all: true };
-  if (d.scope === "selected") return { book_ids: [...selectedIds] };
+  // "search" is the ids of the books the list shows, passed where the selection is.
+  if (d.scope === "selected" || d.scope === "search") return { book_ids: [...selectedIds] };
   return { folder_prefix: d.folderPrefix.trim().replace(/^[\\/]+|[\\/]+$/g, "") };
 }
 
@@ -78,6 +79,7 @@ export function draftProblem(d: MirrorDraft, selectedIds: number[]): string | nu
   if (!looksAbsolute(target)) return "Give the whole path of the folder, starting from a drive (D:\\Library) or a share (\\\\nas\\share\\Library).";
   if (/(^|[\\/])\.\.([\\/]|$)/.test(target)) return "The path cannot contain “..”.";
   if (d.mode === "travel" && d.scope === "selected" && selectedIds.length === 0) return "No books are selected.";
+  if (d.mode === "travel" && d.scope === "search" && selectedIds.length === 0) return "No books match the current search.";
   if (d.mode === "travel" && d.scope === "folder" && draftToScope(d, selectedIds).folder_prefix === "") return "Enter the folder whose books go in the copy.";
   return null;
 }
@@ -106,11 +108,22 @@ export function formatBytes(bytes: number): string {
 /** The totals line of a preview: new, updated, unchanged, to remove, conflicts, and what would be copied. */
 export function describePlan(p: MirrorPlan): string {
   const t = p.totals;
-  const parts = [`${n(t.copy_new.files)} new`, `${n(t.update.files)} updated`, `${n(t.unchanged.files)} unchanged`];
+  // Files, not books: "124 new" next to "61 books" read as a mismatch.
+  const parts = [`${plural(t.copy_new.files, "new file")}`, `${n(t.update.files)} updated`, `${n(t.unchanged.files)} unchanged`];
   if (t.remove.files > 0) parts.push(`${n(t.remove.files)} to remove`);
   if (t.conflict.files > 0) parts.push(`${plural(t.conflict.files, "conflict")}`);
   parts.push(t.bytes_to_copy > 0 ? `${formatBytes(t.bytes_to_copy)} to copy` : "nothing to copy");
   return parts.join(" · ");
+}
+
+/**
+ * Whether running the previewed plan needs a second "are you sure". A copy that
+ * only adds files to an empty or untouched place changes nothing it could lose;
+ * one that overwrites (an update, an overwrite of the copy's own edits) or moves
+ * files to .mirror-trash is asked about first.
+ */
+export function needsConfirmation(plan: MirrorPlan, d: Pick<MirrorDraft, "overwriteChanged">): boolean {
+  return d.overwriteChanged || plan.totals.update.files > 0 || plan.totals.remove.files > 0;
 }
 
 /** True when a listed section is shorter than its total (the server caps each list). */
@@ -223,8 +236,8 @@ export function createMirrorController(api: MirrorApi = realApi, env: MirrorEnv 
   const canBrowse = () => browseVisible(env.isDesktop());
 
   /** Opens fresh: the scope follows the selection, nothing previewed. */
-  function open(selectedCount: number): void {
-    state.draft = defaultDraft(selectedCount);
+  function open(selectedCount: number, searchActive = false): void {
+    state.draft = defaultDraft(selectedCount, searchActive);
     state.phase = "idle";
     state.plan = null;
     state.planKey = "";

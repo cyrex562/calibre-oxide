@@ -1,11 +1,13 @@
 // What Apply does in the bulk edit panel: validate before touching a book, send
 // only the books that need a change, report what happened, and reset the panel
-// (and the selection) only after a clean run.
+// only after a clean run, keep the selection, and offer an Undo that puts the
+// old values back.
 
 import { ref } from "vue";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { BookSummary, FieldMetaEntry } from "./types";
+import { dismissToast, runToastAction, toastState } from "./deleteFlow";
 import { useBulkEdit } from "./useBulkEdit";
 
 const api = vi.hoisted(() => ({ setFields: vi.fn(), setFieldsBatch: vi.fn() }));
@@ -33,6 +35,7 @@ function setup(ids: number[], books: BookSummary[]) {
 }
 
 beforeEach(() => {
+  dismissToast();
   api.setFields.mockReset();
   api.setFieldsBatch.mockReset();
 });
@@ -63,7 +66,7 @@ describe("useBulkEdit", () => {
     expect(bulk.summary).toBeNull();
   });
 
-  it("sends the books that need a change, then closes the panel and clears the selection", async () => {
+  it("sends the books that need a change, then closes the panel and keeps the selection", async () => {
     api.setFieldsBatch.mockImplementation(async (groups: { book_ids: number[] }[]) => ({ updated: groups.flatMap((g) => g.book_ids), failed: [] }));
     const { bulk, selectedIds, selectMode, changed } = setup([1, 2, 3], [book(1, ["a"]), book(2, ["b"]), book(3, ["scifi"])]);
     bulk.spec.tags = { mode: "add", value: "scifi" };
@@ -74,9 +77,12 @@ describe("useBulkEdit", () => {
     expect(groups.flatMap((g) => g.book_ids).sort()).toEqual([1, 2]);
     expect(bulk.summary).toBe("Updated 2 book(s), 1 already matched.");
     expect(bulk.open).toBe(false);
-    expect(selectMode.value).toBe(false);
-    expect(selectedIds.value.size).toBe(0);
+    // The same books can be edited again: the selection and select mode stay.
+    expect(selectMode.value).toBe(true);
+    expect([...selectedIds.value]).toEqual([1, 2, 3]);
     expect(bulk.spec.tags?.value).toBe("");
+    expect(toastState.toast?.message).toBe("Added tag “scifi” to 2 books");
+    expect(toastState.toast?.actionLabel).toBe("Undo");
     expect(changed).toHaveBeenCalledTimes(1);
     expect(bulk.busy).toBe(false);
     expect(bulk.progress).toBeNull();
@@ -124,5 +130,31 @@ describe("useBulkEdit", () => {
       title: { is_custom: false, label: "title", name: "Title" } as unknown as FieldMetaEntry,
     };
     expect(bulk.customColumns.map((c) => c.label)).toEqual(["shelf"]);
+  });
+
+  it("Undo writes each book's old values back, through the batch route, and leaves the failed ones alone", async () => {
+    api.setFieldsBatch.mockResolvedValueOnce({ updated: [1], failed: [{ book_id: 2, error: "locked" }] });
+    const { bulk, changed } = setup([1, 2], [{ ...book(1, ["a", "b"]), publisher: "Old Press" } as BookSummary, book(2, ["c"])]);
+    bulk.spec.publisher = "Acme";
+    bulk.spec.tags = { mode: "add", value: "travel" };
+    await bulk.run();
+    // A failure keeps the panel open, but what was written can still be undone.
+    expect(toastState.toast?.actionLabel).toBe("Undo");
+    api.setFieldsBatch.mockResolvedValueOnce({ updated: [1], failed: [] });
+    await runToastAction();
+    const groups = api.setFieldsBatch.mock.calls[1][0] as { book_ids: number[]; changes: Record<string, unknown> }[];
+    expect(groups).toEqual([{ book_ids: [1], changes: { tags: ["a", "b"], publisher: "Old Press" } }]);
+    expect(toastState.toast?.result).toBe("Put back the old values on 1 book");
+    expect(changed).toHaveBeenCalledTimes(2);
+  });
+
+  it("says which field an Undo cannot put back", async () => {
+    api.setFieldsBatch.mockImplementation(async (groups: { book_ids: number[] }[]) => ({ updated: groups.flatMap((g) => g.book_ids), failed: [] }));
+    const { bulk } = setup([1], [book(1)]);
+    bulk.spec.pubdate = "2020-01-01";
+    await bulk.run();
+    // The only field written had no value before: nothing to put back, so no Undo.
+    expect(toastState.toast?.message).toBe("Updated publication date on 1 book");
+    expect(toastState.toast?.actionLabel).toBeNull();
   });
 });

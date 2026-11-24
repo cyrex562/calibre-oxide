@@ -596,6 +596,9 @@ async fn move_books_applies_as_a_job_is_recorded_and_is_undone_by_unorganize() {
     // Recorded, and undone through the organize routes.
     let (_, runs) = l.get("/organize-runs/default").await;
     assert!(runs["runs"].as_array().unwrap().iter().any(|r| r["run_id"] == run_id.as_str() && r["undone"] == false), "{runs}");
+    // The listing says what the run did, so a move is not mistaken for a rename.
+    let listed = runs["runs"].as_array().unwrap().iter().find(|r| r["run_id"] == run_id.as_str()).unwrap();
+    assert_eq!(listed["template"], "move to Keep/These", "{runs}");
     let (status, undo) = l.post("/unorganize-library/default", json!({"run_id": run_id})).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{undo}");
     let done = l.wait_job(&undo).await;
