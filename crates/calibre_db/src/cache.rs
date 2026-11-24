@@ -142,6 +142,17 @@ pub enum BookFiles {
     Keep,
 }
 
+/// Changes that reached `metadata.db` but not the change log; see
+/// [`Cache::change_log_gap`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChangeLogGap {
+    /// How many appends failed.
+    pub missed: u64,
+    /// When the first one did (unix seconds).
+    pub first_at: i64,
+    pub last_error: String,
+}
+
 /// What a book removal did on disk. Paths are relative to the library
 /// root and `/`-separated.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -292,7 +303,10 @@ pub struct Cache {
     /// `legacy.rs`/test fixtures throughout the whole crate) to
     /// remember to call an explicit invalidation method. See this
     /// file's module doc for the full cutover story.
-    field_cache: Mutex<Option<(i64, FieldStore)>>,
+    field_cache: Mutex<Option<crate::field_feed::Loaded>>,
+    /// How many times the whole snapshot has been (re)loaded, as opposed to
+    /// patched for the books a write touched.
+    field_full_loads: std::sync::atomic::AtomicUsize,
 }
 
 impl Cache {
@@ -310,6 +324,7 @@ impl Cache {
         Cache {
             backend,
             field_cache: Mutex::new(None),
+            field_full_loads: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -344,12 +359,16 @@ impl Cache {
     /// Appends `op` to the change log, unless a replay is feeding us
     /// changes that are already in it.
     ///
-    /// A failure to append is logged and swallowed rather than failing
-    /// the write. The alternative -- refusing to edit metadata because
-    /// history could not be recorded -- makes an unwritable log
-    /// directory into an unusable library, and the database write that
-    /// follows is still perfectly good. `ChangeLog::verify` and the
-    /// rebuild path are where a damaged log is meant to surface.
+    /// A failure to append does not fail the write: refusing to edit
+    /// metadata because history could not be recorded would make an
+    /// unwritable log directory into an unusable library, and the
+    /// database write that has already been committed is still good.
+    ///
+    /// It is not forgotten either. The failure is written to a persistent
+    /// marker (see [`Cache::change_log_gap`]), and a rebuild from the log
+    /// refuses while the marker stands, because a rebuild would silently
+    /// drop every change the log never received -- and `metadata.db` is then
+    /// the only copy of them.
     fn record(&self, op: crate::change_log::ChangeOp) {
         if self.backend.is_replaying() {
             return;
@@ -358,9 +377,52 @@ impl Cache {
             Ok(log) => {
                 if let Err(e) = log.append(op) {
                     log::warn!("could not record a change in the library log: {e}");
+                    self.note_change_log_gap(&format!("{e}"));
                 }
             }
-            Err(e) => log::warn!("could not open the library change log: {e}"),
+            Err(e) => {
+                log::warn!("could not open the library change log: {e}");
+                self.note_change_log_gap(&format!("{e}"));
+            }
+        }
+    }
+
+    fn change_log_gap_path(&self) -> PathBuf {
+        self.backend.library_path.join(crate::constants::LIBRARY_HANDLE_DIR_NAME).join("change-log-behind.json")
+    }
+
+    /// Records, durably, that a change reached `metadata.db` but not the log.
+    fn note_change_log_gap(&self, error: &str) {
+        let path = self.change_log_gap_path();
+        let mut gap = self.change_log_gap().unwrap_or(ChangeLogGap { missed: 0, first_at: crate::trash::now_secs(), last_error: String::new() });
+        gap.missed += 1;
+        gap.last_error = error.to_string();
+        let written = path
+            .parent()
+            .map(fs::create_dir_all)
+            .transpose()
+            .and_then(|_| serde_json::to_vec_pretty(&gap).map_err(std::io::Error::other))
+            .and_then(|bytes| fs::write(&path, bytes));
+        if let Err(e) = written {
+            log::error!("the change log is behind metadata.db and that could not be recorded either ({e}); the last error was: {error}");
+        }
+    }
+
+    /// Whether changes have reached `metadata.db` without reaching the change
+    /// log (an append failed), and how many. While this is `Some`, a rebuild
+    /// from the log would lose them.
+    pub fn change_log_gap(&self) -> Option<ChangeLogGap> {
+        serde_json::from_slice(&fs::read(self.change_log_gap_path()).ok()?).ok()
+    }
+
+    /// Clears the marker [`Cache::change_log_gap`] reads. Call it once
+    /// `metadata.db` has been backed up (or the changes are accepted as
+    /// lost to a rebuild); it does not make the log whole.
+    pub fn clear_change_log_gap(&self) -> anyhow::Result<()> {
+        match fs::remove_file(self.change_log_gap_path()) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -404,7 +466,10 @@ impl Cache {
         match self.book_uuid(book_id) {
             Ok(Some(uuid)) => self.record(build(uuid)),
             Ok(None) => log::warn!("no uuid for book {book_id}; change not recorded"),
-            Err(e) => log::warn!("could not read the uuid for book {book_id}: {e}"),
+            Err(e) => {
+                log::warn!("could not read the uuid for book {book_id}: {e}");
+                self.note_change_log_gap(&format!("could not read the uuid for book {book_id}: {e}"));
+            }
         }
     }
 
@@ -489,6 +554,46 @@ impl Cache {
         Ok(())
     }
 
+    /// Where a book's files now are, written as one unit: `books.path` (when
+    /// `path` is given) and `data.name` for each of `names` (format to stem), in
+    /// one transaction, and logged as one batch entry. Organize used to write
+    /// each format's name and then the path as separate commits, so a failure
+    /// part-way left names from the new layout beside a path from the old one.
+    ///
+    /// Nothing is written if any of it fails.
+    pub fn set_book_location(&self, book_id: i32, path: Option<&str>, names: &std::collections::BTreeMap<String, String>) -> anyhow::Result<()> {
+        let mut sizes: Vec<(String, String, i64)> = Vec::new();
+        {
+            let mut conn = self.backend.conn.lock().unwrap();
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if let Some(path) = path {
+                tx.execute("UPDATE books SET path = ?1 WHERE id = ?2", (path, book_id))?;
+            }
+            for (format, stem) in names {
+                let format = format.to_uppercase();
+                let changed = tx.execute("UPDATE data SET name = ?1 WHERE book = ?2 AND format = ?3", (stem, book_id, &format))?;
+                if changed == 0 {
+                    // No such format row: nothing to rename (as set_format_name).
+                    continue;
+                }
+                let size: i64 = tx.query_row("SELECT uncompressed_size FROM data WHERE book = ?1 AND format = ?2", (book_id, &format), |r| r.get(0)).unwrap_or(0);
+                sizes.push((format, stem.clone(), size));
+            }
+            tx.commit()?;
+        }
+        let Some(uuid) = self.book_uuid(book_id)? else { return Ok(()) };
+        let mut ops = Vec::new();
+        if let Some(path) = path {
+            ops.push(crate::change_log::ChangeOp::FieldSet { book: uuid.clone(), field: "path".to_string(), value: Some(path.to_string()) });
+        }
+        for (format, name, size) in sizes {
+            let (hash, _) = self.checksums().recorded_identity(book_id, "format", &format).unwrap_or((None, None));
+            ops.push(crate::change_log::ChangeOp::FormatSet { book: uuid.clone(), format, name, size, hash });
+        }
+        self.record_many(ops);
+        Ok(())
+    }
+
     /// Writes a `data` row without touching the filesystem.
     ///
     /// Replay's counterpart to [`Cache::add_format`], which copies a
@@ -548,37 +653,40 @@ impl Cache {
     ///
     /// The recovery path the whole design rests on: `metadata.db` is a
     /// cache, so losing it costs a rebuild rather than the library.
+    ///
+    /// Refuses while [`Cache::change_log_gap`] says the log is missing changes
+    /// that only `metadata.db` has: rebuilding would erase them.
     pub fn rebuild_from_change_log(&self) -> anyhow::Result<crate::change_log::ReplayReport> {
+        if let Some(gap) = self.change_log_gap() {
+            anyhow::bail!(
+                "the change log is behind metadata.db: {} change(s) were applied there but could not be recorded in the log (last error: {}). Rebuilding from the log would lose them; back up metadata.db, then call clear_change_log_gap to proceed anyway",
+                gap.missed,
+                gap.last_error
+            );
+        }
         let log = self.backend.change_log()?;
         crate::change_log::replay_into(self, &log)
     }
 
-    /// `SELECT total_changes()` -- SQLite's built-in running count of
-    /// every row inserted/updated/deleted on this connection since it
-    /// was opened (a real SQL function, not just a C API -- no extra
-    /// rusqlite wrapper needed). Used as a cheap, robust staleness
-    /// check: *any* write through this connection, by *any* code path
-    /// (this file's own methods, raw SQL elsewhere in the crate, test
-    /// fixtures), moves this number, so there is no missed-invalidation
-    /// class of bug to chase down call site by call site.
-    fn total_changes(conn: &rusqlite::Connection) -> i64 {
-        conn.query_row("SELECT total_changes()", [], |r| r.get(0))
-            .unwrap_or(0)
+    /// How many times the field snapshot has been loaded in full (rather
+    /// than patched for the books a write touched). A bulk loop that keeps
+    /// this flat is not doing work proportional to the library per book.
+    pub fn field_cache_full_loads(&self) -> usize {
+        self.field_full_loads.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Runs `f` over an up-to-date field snapshot.
+    ///
+    /// Current means: loaded once in full, then patched for just the books
+    /// (and item tables) that writes through this connection touched since,
+    /// found via SQLite's update hook; a write by another connection or
+    /// process is caught by `PRAGMA data_version` and reloads everything.
+    /// See `field_feed`.
     fn with_field_store<T>(&self, f: impl FnOnce(&FieldStore) -> T) -> Result<T> {
         let conn = self.backend.conn.lock().unwrap();
-        let current = Self::total_changes(&conn);
         let mut guard = self.field_cache.lock().unwrap();
-        let stale = match &*guard {
-            Some((loaded_at, _)) => *loaded_at != current,
-            None => true,
-        };
-        if stale {
-            let store = FieldStore::load(&conn)?;
-            *guard = Some((current, store));
-        }
-        Ok(f(&guard.as_ref().unwrap().1))
+        let store = crate::field_feed::refresh(&mut guard, &conn, &self.backend.field_feed, &self.field_full_loads)?;
+        Ok(f(store))
     }
 
     pub fn library_id(&self) -> String {
@@ -1003,7 +1111,8 @@ impl Cache {
                             if let Some(parent) = dest.parent() {
                                 fs::create_dir_all(parent)?;
                             }
-                            handle.rename_atomic(&file.staged, &dest)?;
+                            // Never replaces: the check above is for the message.
+                            handle.rename_atomic_no_replace(&file.staged, &dest)?;
                             moved.push((file.staged.clone(), dest.clone()));
                             let format = file.ext.to_uppercase();
                             sp.execute(
@@ -1678,10 +1787,7 @@ impl Cache {
         let mut outcome = BookDeletion::default();
         let Some(path_rel) = self.field_for(book_id, "path")? else {
             // No such book: nothing on disk can be attributed to it.
-            self.checksums().remove_all_for_book(book_id)?;
-            let conn = self.backend.conn.lock().unwrap();
-            crate::custom_columns::purge_book(&conn, book_id)?;
-            conn.execute("DELETE FROM books WHERE id = ?1", (book_id,))?;
+            self.delete_book_rows(book_id)?;
             return Ok(outcome);
         };
         let title = self.field_for(book_id, "title")?.unwrap_or_default();
@@ -1709,12 +1815,7 @@ impl Cache {
         // row still exists.
         let manifest = if files == BookFiles::Trash { Some(self.trash_manifest_for(book_id, uuid.clone(), &title, &path_rel, &own)?) } else { None };
 
-        self.checksums().remove_all_for_book(book_id)?;
-        {
-            let conn = self.backend.conn.lock().unwrap();
-            crate::custom_columns::purge_book(&conn, book_id)?;
-            conn.execute("DELETE FROM books WHERE id = ?1", (book_id,))?;
-        }
+        self.delete_book_rows(book_id)?;
         if let Some(uuid) = uuid.clone() {
             self.record(crate::change_log::ChangeOp::BookRemoved { book: uuid });
         }
@@ -1748,6 +1849,27 @@ impl Cache {
             }
         }
         Ok(outcome)
+    }
+
+    /// Removes a book's row, its custom-column values and its checksums in
+    /// one immediate transaction: either all of it goes or none does. As three
+    /// separate statements, a failure between them left a book with no hashes
+    /// (so nothing could verify its files) or custom values with no book.
+    ///
+    /// The checksums live in an attached sidecar database, which SQLite
+    /// commits separately from `metadata.db` in WAL mode, so that delete is
+    /// issued last: the worst a crash can then leave is a hash for a book
+    /// that is gone, never a book that has lost its hashes.
+    fn delete_book_rows(&self, book_id: i32) -> anyhow::Result<()> {
+        // Attaches the sidecar if need be; ATTACH cannot run inside a transaction.
+        self.checksums().initialize()?;
+        let mut conn = self.backend.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        crate::custom_columns::purge_book(&tx, book_id)?;
+        tx.execute("DELETE FROM books WHERE id = ?1", (book_id,))?;
+        tx.execute("DELETE FROM checksums_db.file_checksums WHERE book_id = ?1", (book_id,))?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Removes directories left empty under the book's `data/` (or
@@ -1885,196 +2007,6 @@ impl Cache {
         removed
     }
 
-    /// Moves a book's folder to match a new title/author and renames
-    /// its non-special files (`cover.jpg`/`metadata.opf` are left
-    /// alone) to match the new title, then updates the `path` column.
-    /// A no-op if the book has no path yet, or the computed new folder
-    /// is identical to the old one.
-    ///
-    /// Port of issue #93's crate-wide write-path retrofit: every
-    /// individual rename/removal below goes through the real
-    /// `LibraryHandle` (journaled, crash-safe, recovery-verified on
-    /// the next open) instead of a raw `fs::rename`/`fs::remove_dir`.
-    ///
-    /// On [`crate::library_handle::StorageTier::Network`] (issue
-    /// #257's remaining scope), the directory rename, every file's own
-    /// rename, and the empty-old-directory cleanup are staged and
-    /// committed as one real two-phase batch via
-    /// [`crate::library_handle::LibraryHandle::begin_network_batch`] --
-    /// a crash mid-batch is recovered by finishing whichever steps
-    /// hadn't completed yet, not left as an inconsistent intermediate
-    /// state. On every other tier, each rename/removal below is its
-    /// own independently-recoverable `LibraryHandle` call, same as
-    /// before -- a crash between two of them can still leave a book
-    /// with its directory moved but not every file inside renamed yet,
-    /// same window this method always had on local storage (a multi-
-    /// operation journal transaction spanning several `LibraryHandle`
-    /// calls doesn't exist for the local-tier path, unlike the network
-    /// one). On **every** tier, the DB `path` update at the end is
-    /// still its own separate step after the file-level work
-    /// succeeds -- `LibraryHandle` has no connection to the SQLite
-    /// database at all (issue #260's territory), so a crash between a
-    /// successful rename/batch and the DB update is a real, smaller,
-    /// separate gap not addressed here.
-    /// Moves a book's folder to `<new_author>/<new_title>` and renames
-    /// every format inside it.
-    ///
-    /// **Nothing calls this automatically.** It used to run on every
-    /// title or author change via [`Cache::update_book_metadata`], which
-    /// meant correcting a typo rearranged files the user had placed
-    /// deliberately (#893). It is now an operation in its own right, the
-    /// folder-level counterpart to
-    /// [`Cache::rename_format_files`]'s filename-level one.
-    ///
-    /// Public rather than private because it has no automatic caller
-    /// left: the only way to reach it is to ask for it.
-    pub fn rename_book_files(
-        &self,
-        book_id: i32,
-        new_title: &str,
-        new_author: &str,
-    ) -> anyhow::Result<()> {
-        let old_rel_path = self.field_for(book_id, "path")?.unwrap_or_default();
-        // Deliberate, unlike the three guards `book_dir` replaced: a book
-        // whose files sit in the library root has no folder of its own to
-        // move, and moving the library into a subfolder of itself is not
-        // what anybody means by this.
-        if old_rel_path.is_empty() {
-            return Ok(());
-        }
-        let library_path = &self.backend.library_path;
-        let old_full_dir = library_path.join(&old_rel_path);
-        if !old_full_dir.exists() {
-            return Ok(());
-        }
-
-        let new_author_folder = sanitize_file_name(new_author);
-        let new_title_folder = sanitize_file_name(new_title);
-        let new_rel_path = Path::new(&new_author_folder).join(&new_title_folder);
-        let new_full_dir = library_path.join(&new_rel_path);
-
-        if old_full_dir == new_full_dir {
-            return Ok(());
-        }
-
-        let new_author_full_path = library_path.join(&new_author_folder);
-        if !new_author_full_path.exists() {
-            fs::create_dir_all(&new_author_full_path)?;
-        }
-
-        let handle = self.backend.write_handle()?;
-
-        if handle.tier() == crate::library_handle::StorageTier::Network {
-            // Issue #257's remaining scope: §6's own named example is
-            // exactly this operation (a book move = a directory rename
-            // plus each of its files' own rename). Every step has to be
-            // discovered and staged *before* anything moves -- listing
-            // `new_full_dir`'s contents (the local-tier approach just
-            // below) only works because the directory rename has
-            // already happened by the time it runs; on network storage
-            // that would defeat the whole point of staging the batch
-            // atomically up front. See `NetworkBatch`'s doc for the
-            // full design.
-            let mut batch = handle.begin_network_batch();
-            batch.stage_rename(&old_full_dir, &new_full_dir);
-
-            for entry in fs::read_dir(&old_full_dir)? {
-                let entry = entry?;
-                let old_path = entry.path();
-                if old_path.is_file() {
-                    if let Some(file_name) = old_path.file_name().and_then(|n| n.to_str()) {
-                        if file_name == "cover.jpg" || file_name == "metadata.opf" {
-                            continue;
-                        }
-                        if let Some(extension) = old_path.extension().and_then(|e| e.to_str()) {
-                            let new_file_name =
-                                format!("{}.{}", sanitize_file_name(new_title), extension);
-                            // Where this file will be immediately after
-                            // the directory-rename step above (which
-                            // runs first within this same batch) -- not
-                            // its current path under `old_full_dir`.
-                            let post_dir_move_path = new_full_dir.join(file_name);
-                            let new_file_path = new_full_dir.join(new_file_name);
-                            if post_dir_move_path != new_file_path {
-                                batch.stage_rename(&post_dir_move_path, &new_file_path);
-                            }
-                        }
-                    }
-                }
-            }
-
-            if let Some(parent) = old_full_dir.parent() {
-                if parent.exists() && fs::read_dir(parent)?.count() == 1 {
-                    // `old_full_dir` is the only entry under `parent`
-                    // right now -- it'll be empty once the directory
-                    // rename above takes effect, so stage its removal
-                    // as the batch's final step.
-                    batch.stage_remove(parent);
-                }
-            }
-
-            batch.commit()?;
-        } else {
-            handle.rename_atomic(&old_full_dir, &new_full_dir)?;
-
-            for entry in fs::read_dir(&new_full_dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.is_file() {
-                    if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                        if file_name == "cover.jpg" || file_name == "metadata.opf" {
-                            continue;
-                        }
-                        if let Some(extension) = path.extension().and_then(|e| e.to_str()) {
-                            let new_file_name =
-                                format!("{}.{}", sanitize_file_name(new_title), extension);
-                            let new_file_path = new_full_dir.join(new_file_name);
-                            if path != new_file_path {
-                                if let Err(e) = handle.rename_atomic(&path, &new_file_path) {
-                                    eprintln!(
-                                        "Warning: failed to rename {path:?} to {new_file_path:?}: {e}"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if let Some(parent) = old_full_dir.parent() {
-                if parent.exists() && fs::read_dir(parent)?.next().is_none() {
-                    if let Err(e) = handle.remove_atomic(parent) {
-                        eprintln!("Warning: failed to remove empty directory {parent:?}: {e}");
-                    }
-                }
-            }
-        }
-
-        let new_rel_path_str = new_rel_path.to_string_lossy().replace('\\', "/");
-
-        // Through `set_book_path` and `set_format_name`, which write the
-        // same rows and also append to the change log. This used to run
-        // both `UPDATE`s itself, so a folder rename left the log saying
-        // the book was still at its old path -- a rebuild put it back
-        // where no file was.
-        self.set_book_path(book_id, &new_rel_path_str)?;
-
-        // Both branches above renamed every format file to
-        // `sanitize(new_title).<ext>`; `data.name` has to say so.
-        //
-        // It did not, and that was a real latent bug: `data.name` is
-        // what `get_data_as_dict` builds `fmt_<ext>` paths from, so
-        // after a title change through here the database pointed at
-        // the pre-rename filename and every route that serves a book
-        // would 404. The same mismatch, from the other direction, is
-        // what `a_renamed_book_can_still_be_opened` was added for.
-        let new_stem = sanitize_file_name(new_title);
-        for (format, _) in self.format_file_names(book_id)? {
-            self.set_format_name(book_id, &format, &new_stem)?;
-        }
-        Ok(())
-    }
-
     /// Every format this book has, as `(FORMAT, filename stem)` --
     /// `data.name` being calibre's own record of what each format is
     /// actually called on disk.
@@ -2149,8 +2081,9 @@ impl Cache {
     /// which are metadata-derived and have their own operations.
     ///
     /// Driven by the `data` table rather than by listing the
-    /// directory, which is what [`Cache::rename_book_files`] does.
-    /// That is the point: the rows and the files have to end up
+    /// directory (the removed `rename_book_files` swept up every file in
+    /// a folder, which is wrong for a folder shared by several books).
+    /// The rows and the files have to end up
     /// agreeing, and iterating the rows means a file this does not
     /// know about (`cover.jpg`, `metadata.opf`, anything a user
     /// dropped in the folder) is left alone rather than swept up by a
@@ -2185,14 +2118,24 @@ impl Cache {
             let old_path = book_dir.join(format!("{old_stem}.{ext}"));
             let new_path = book_dir.join(format!("{new_stem}.{ext}"));
 
-            if new_path.exists() {
+            // On a case-insensitive volume `the hobbit.pdf` and
+            // `The Hobbit.pdf` are one file, so `new_path` "existing" is
+            // not a collision when it is the file being renamed.
+            let same_file = new_path.exists() && calibre_utils::filenames::samefile(&old_path, &new_path);
+            if new_path.exists() && !same_file {
                 anyhow::bail!("{} already exists", new_path.display());
             }
             // A `data` row whose file is missing is not a reason to
             // abandon the rename: the row still has to be corrected,
             // or it keeps pointing at a name nothing will ever have.
             if old_path.exists() {
-                handle.rename_atomic(&old_path, &new_path)?;
+                if same_file {
+                    handle.rename_atomic(&old_path, &new_path)?;
+                } else {
+                    // The check above and the move are one step here, so a
+                    // file created in between is refused, not replaced.
+                    handle.rename_atomic_no_replace(&old_path, &new_path)?;
+                }
             }
 
             {
@@ -2217,8 +2160,7 @@ impl Cache {
         Ok(renamed)
     }
 
-    /// Renames the book's folder/files (via [`Cache::rename_book_files`])
-    /// then updates `title`/`author_sort` and the `authors`/
+    /// Updates `title`/`author_sort` and the `authors`/
     /// `books_authors_link` rows to match.
     pub fn update_book_metadata(
         &self,
@@ -2228,7 +2170,8 @@ impl Cache {
     ) -> anyhow::Result<()> {
         // Deliberately no longer renames the book's files (#893).
         //
-        // It used to call `rename_book_files` first, which moved the
+        // It used to rename the book's files first (the since-removed
+        // `rename_book_files`), which moved the
         // book's folder to `<new author>/<new title>` and renamed every
         // format inside it. That made the two inseparable in the other
         // direction from #885: correcting a typo in a title silently
@@ -2236,10 +2179,9 @@ impl Cache {
         // on a library synced or backed up by path it rewrote history
         // that other tools were tracking.
         //
-        // Moving a book's files is still available as its own operation
-        // (`rename_book_files` for the folder, `rename_format_files` for
-        // the filenames) -- it is just no longer a side effect of editing
-        // metadata.
+        // Moving a book's files is its own operation (organize for the
+        // folder, `rename_format_files` for the filenames) -- never a
+        // side effect of editing metadata.
         let mut conn = self.backend.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
@@ -4569,120 +4511,6 @@ mod tests {
     }
 
     #[test]
-    fn moving_a_books_folder_renames_it_on_disk_and_updates_the_path() {
-        let (dir, cache) = open_test_cache();
-        let book_id = add_pdf_in_its_own_folder(dir.path(), &cache, "Old Title", "Old Author", "src");
-
-        cache
-            .rename_book_files(book_id, "New Title", "New Author")
-            .unwrap();
-
-        // The metadata is deliberately untouched: moving a book's files
-        // and editing its title are separate operations since #893, and
-        // this one is only the move.
-        assert_eq!(cache.field_for(book_id, "title").unwrap(), Some("Old Title".to_string()));
-        assert!(dir.path().join("New Author/New Title").exists());
-        assert!(!dir.path().join("Old Author").exists());
-
-        // The book's own file was renamed to match the new title too,
-        // not just the directory.
-        assert!(dir
-            .path()
-            .join("New Author/New Title/New Title.pdf")
-            .exists());
-        assert!(!dir
-            .path()
-            .join("New Author/New Title/src.pdf")
-            .exists());
-
-        // rename_book_files now goes through the real LibraryHandle
-        // (issue #93's crate-wide write-path retrofit), not raw
-        // `fs::rename`/`fs::remove_dir` calls -- prove it by checking
-        // real journaled entries landed: one `RenameFile` for the
-        // directory move, one more for the book file's own rename,
-        // and one `DeleteFile` for the now-empty old author directory
-        // (`add_book`'s own initial `add_format` also journals a
-        // `WriteFile`, which is why this doesn't just count every
-        // `.op` file -- see `journaled_op_count`'s doc comment).
-        assert_eq!(journaled_op_count(dir.path(), "RenameFile"), 2);
-        assert_eq!(journaled_delete_count(dir.path()), 1);
-    }
-
-    #[test]
-    fn moving_a_book_leaves_the_old_author_directory_when_another_book_still_uses_it() {
-        let (dir, cache) = open_test_cache();
-
-        let book_a = add_pdf_in_its_own_folder(dir.path(), &cache, "Book A", "Shared Author", "a");
-
-        // A second book under the same author, so the author directory
-        // is not empty after Book A moves out.
-        add_pdf_in_its_own_folder(dir.path(), &cache, "Book B", "Shared Author", "b");
-
-        cache
-            .rename_book_files(book_a, "Book A", "Solo Author")
-            .unwrap();
-
-        // "Shared Author" is still not empty (Book B's directory is
-        // still under it) -- the empty-parent cleanup must not remove
-        // it.
-        assert!(dir.path().join("Shared Author/Book B").exists());
-        assert!(dir.path().join("Solo Author/Book A").exists());
-    }
-
-    #[test]
-    fn rename_book_files_on_network_tier_uses_a_two_phase_batch() {
-        let (dir, cache) = open_test_cache();
-
-        // Force the cached write handle to report Network tier
-        // *before* any real handle has ever been opened on this
-        // `Backend` -- issue #257's remaining scope, the two-phase
-        // multi-file batch case. Installing it first (rather than
-        // after `add_book` already opened a real one) avoids a
-        // release-then-immediately-reacquire sequence on the same
-        // lock file, which a heavily parallel `cargo test` run can
-        // make `try_lock()` spuriously report `WouldBlock` for (see
-        // `flock_test_guard`'s own doc comment for the full
-        // investigation this project already did into that).
-        cache.backend.install_network_tier_handle_for_test();
-
-        let book_id = add_pdf_in_its_own_folder(dir.path(), &cache, "Old Title", "Old Author", "src");
-
-        cache
-            .rename_book_files(book_id, "New Title", "New Author")
-            .unwrap();
-
-        // Only the files moved -- the title is not this operation's
-        // business (#893).
-        assert_eq!(cache.field_for(book_id, "title").unwrap(), Some("Old Title".to_string()));
-        assert!(dir.path().join("New Author/New Title").exists());
-        assert!(!dir.path().join("Old Author").exists());
-        assert!(dir
-            .path()
-            .join("New Author/New Title/New Title.pdf")
-            .exists());
-        assert!(!dir
-            .path()
-            .join("New Author/New Title/src.pdf")
-            .exists());
-
-        // A real Batch entry landed (not a series of individual
-        // RenameFile entries) -- proves the Network-tier branch
-        // actually ran, not just that the end state happens to match.
-        let journal_dir = dir.path().join(".calibre-oxide").join("journal");
-        let batch_entries: Vec<_> = fs::read_dir(&journal_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("op"))
-            .filter(|e| {
-                fs::read_to_string(e.path())
-                    .map(|content| content.contains("Batch"))
-                    .unwrap_or(false)
-            })
-            .collect();
-        assert_eq!(batch_entries.len(), 1, "expected exactly one Batch entry");
-    }
-
-    #[test]
     fn clone_to_recursively_copies_the_library_directory() {
         let (dir, cache) = open_test_cache();
         let source = write_temp_file(dir.path(), "src.epub", b"x");
@@ -4892,7 +4720,7 @@ mod tests {
     /// calibre-style library is laid out.
     ///
     /// `add_book` no longer creates one (#893), so a test whose *subject*
-    /// is per-book folders -- `rename_book_files`, the legacy cover
+    /// is per-book folders -- the legacy cover
     /// location -- has to construct that layout explicitly rather than
     /// relying on it as a side effect.
     fn add_pdf_in_its_own_folder(dir: &Path, cache: &Cache, title: &str, author: &str, stem: &str) -> i32 {
@@ -5229,26 +5057,6 @@ mod tests {
         assert!(!stem.contains('/') && !stem.contains('\\'), "got {stem}");
         let path = cache.get_data_as_dict(None, false, None, false).unwrap()[0]["fmt_pdf"].as_str().unwrap().to_string();
         assert!(Path::new(&path).starts_with(dir.path()), "{path} escaped the library");
-    }
-
-    /// `rename_book_files` moves every format to `<new title>.<ext>`
-    /// but used not to say so in `data.name`, so afterwards the database
-    /// pointed at the old filename -- the same 404
-    /// `a_renamed_book_can_still_be_opened` covers, reached from the
-    /// other side.
-    ///
-    /// Calls `rename_book_files` directly: since #893 a metadata change
-    /// no longer triggers it.
-    #[test]
-    fn moving_a_books_folder_keeps_the_recorded_name_in_step() {
-        let (dir, cache) = open_test_cache();
-        let id = add_pdf_in_its_own_folder(dir.path(), &cache, "Old Title", "Old Author", "Old Title");
-
-        cache.rename_book_files(id, "New Title", "New Author").unwrap();
-
-        assert_eq!(cache.format_file_stem(id).unwrap().as_deref(), Some("New Title"));
-        let path = cache.get_data_as_dict(None, false, None, false).unwrap()[0]["fmt_pdf"].as_str().expect("the format must still resolve").to_string();
-        assert!(Path::new(&path).exists(), "the recorded path {path} does not exist");
     }
 
     #[test]

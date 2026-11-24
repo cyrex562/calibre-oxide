@@ -47,6 +47,16 @@ impl FieldStore {
         })
     }
 
+    /// Re-reads one book (see [`StandardTables::reload_book`]).
+    pub fn reload_book(&mut self, conn: &Connection, book_id: i32) -> Result<()> {
+        self.tables.reload_book(conn, book_id)
+    }
+
+    /// Re-reads one whole item table (see [`StandardTables::reload_item_table`]).
+    pub fn reload_item_table(&mut self, conn: &Connection, which: crate::tables::ItemTable) -> Result<()> {
+        self.tables.reload_item_table(conn, which)
+    }
+
     /// Every field [`crate::cache::Cache::field_for`] supports, except
     /// `"id"` -- there's no dedicated `id` table to bulk-load (a
     /// book's id *is* every table's map key), so that one stays a

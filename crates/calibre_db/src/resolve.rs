@@ -198,7 +198,7 @@ pub fn plan_fingerprint(action: ResolveAction, plan: &[PlannedResolve], watermar
 
 /// A fresh run id: `run-<unix seconds>-<4 hex>`.
 pub fn new_run_id() -> String {
-    format!("run-{}-{}", crate::trash::now_secs(), &uuid::Uuid::new_v4().simple().to_string()[..4])
+    crate::run_journal::new_run_id("run")
 }
 
 /// What a run did.

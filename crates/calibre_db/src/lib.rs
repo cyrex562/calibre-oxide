@@ -35,6 +35,12 @@ pub mod extra_files;
 pub mod field_metadata;
 pub mod drift;
 pub mod fields;
+pub(crate) mod field_feed;
+pub(crate) mod run_journal;
+#[cfg(test)]
+mod field_feed_tests;
+#[cfg(test)]
+mod integrity_tests;
 pub mod formatter_functions;
 pub mod fts;
 pub mod lazy;

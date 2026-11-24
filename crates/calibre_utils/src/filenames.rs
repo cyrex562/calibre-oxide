@@ -331,6 +331,66 @@ fn identity_of(_path: &Path, _metadata: &std::fs::Metadata) -> Option<FileIdenti
     None
 }
 
+/// Whether `name` (one path component) is a name Windows reserves for a
+/// device: `CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`, with or
+/// without an extension, in any case.
+pub fn is_windows_reserved_name(name: &str) -> bool {
+    const RESERVED: [&str; 22] = [
+        "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    ];
+    let stem = name.split('.').next().unwrap_or(name).trim_end().to_lowercase();
+    RESERVED.contains(&stem.as_str())
+}
+
+/// One rendered path component made safe to create on any platform: a
+/// reserved device name gets a leading underscore (`CON` becomes `_CON`),
+/// the way calibre's save-to-disk avoids them, and trailing dots and spaces
+/// (which Windows strips, so two names would collide) are dropped.
+pub fn safe_component(name: &str) -> String {
+    let trimmed = name.trim().trim_end_matches(['.', ' ']);
+    if is_windows_reserved_name(trimmed) {
+        format!("_{trimmed}")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// The one folding rule for comparing paths, so that whether two paths are
+/// "the same folder" does not depend on which module asked: Unicode
+/// lower-casing (not ASCII only), separators normalised to `/`.
+pub fn path_key(path: &str) -> String {
+    path.replace('\\', "/").to_lowercase()
+}
+
+/// Whether `path` is `folder` or inside it, segment-wise, under [`path_key`].
+pub fn path_is_within(path: &str, folder: &str) -> bool {
+    let (p, f) = (path_key(path), path_key(folder));
+    let (p, f) = (p.trim_matches('/'), f.trim_matches('/'));
+    f.is_empty() || p == f || p.strip_prefix(f).is_some_and(|rest| rest.starts_with('/'))
+}
+
+#[cfg(test)]
+mod path_key_tests {
+    use super::*;
+
+    #[test]
+    fn reserved_device_names_are_mapped_aside() {
+        assert_eq!(safe_component("CON"), "_CON");
+        assert_eq!(safe_component("nul.txt"), "_nul.txt");
+        assert_eq!(safe_component("Com1"), "_Com1");
+        assert_eq!(safe_component("Console"), "Console");
+        assert_eq!(safe_component("Dune."), "Dune");
+    }
+
+    #[test]
+    fn one_folding_rule_for_paths() {
+        assert_eq!(path_key("Fiction\\ÉCOLE"), "fiction/école");
+        assert!(path_is_within("Fiction/École/a", "fiction/école"));
+        assert!(path_is_within("fiction", "FICTION"));
+        assert!(!path_is_within("fiction-x/a", "fiction"));
+    }
+}
+
 #[cfg(test)]
 mod identity_tests {
     use super::*;

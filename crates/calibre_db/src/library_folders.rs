@@ -35,6 +35,7 @@ use std::path::Path;
 use anyhow::{anyhow, bail, Result};
 use serde::Serialize;
 
+use calibre_utils::filenames::{path_is_within, path_key};
 use crate::cache::Cache;
 use crate::organize::{self, OrganizePlan, Scope, Target};
 
@@ -71,8 +72,8 @@ fn remembered(cache: &Cache) -> Vec<String> {
 }
 
 fn save_remembered(cache: &Cache, mut folders: Vec<String>) -> Result<()> {
-    folders.sort_by_key(|f| f.to_lowercase());
-    folders.dedup_by_key(|f| f.to_lowercase());
+    folders.sort_by_key(|f| path_key(f));
+    folders.dedup_by_key(|f| path_key(f));
     if folders.is_empty() {
         cache.clear_preference(EMPTY_FOLDERS_PREF)
     } else {
@@ -82,8 +83,7 @@ fn save_remembered(cache: &Cache, mut folders: Vec<String>) -> Result<()> {
 
 /// Whether `path` is `folder` or inside it (segment-wise, case-insensitive).
 fn within(path: &str, folder: &str) -> bool {
-    let (p, f) = (path.to_lowercase(), folder.to_lowercase());
-    p == f || p.strip_prefix(&f).is_some_and(|rest| rest.starts_with('/'))
+    path_is_within(path, folder)
 }
 
 /// The folder tree: one query, no disk access.
@@ -101,7 +101,7 @@ pub fn list(cache: &Cache) -> Result<FolderTree> {
         let parts: Vec<&str> = path.split(['/', '\\']).map(str::trim).filter(|p| !p.is_empty() && *p != ".").collect();
         for depth in 1..=parts.len() {
             let here = parts[..depth].join("/");
-            let entry = map.entry(here.to_lowercase()).or_insert_with(|| FolderEntry { path: here, books: 0, books_here: 0, empty: false });
+            let entry = map.entry(path_key(&here)).or_insert_with(|| FolderEntry { path: here, books: 0, books_here: 0, empty: false });
             entry.books += 1;
             if depth == parts.len() {
                 entry.books_here += 1;
@@ -113,13 +113,13 @@ pub fn list(cache: &Cache) -> Result<FolderTree> {
         for depth in 1..=parts.len() {
             let here = parts[..depth].join("/");
             let leaf = depth == parts.len();
-            let entry = map.entry(here.to_lowercase()).or_insert_with(|| FolderEntry { path: here, books: 0, books_here: 0, empty: false });
+            let entry = map.entry(path_key(&here)).or_insert_with(|| FolderEntry { path: here, books: 0, books_here: 0, empty: false });
             entry.empty = entry.empty || (leaf && entry.books == 0);
         }
     }
     let mut folders: Vec<FolderEntry> = map.into_values().collect();
     // `a/b` must come right after `a`, before `a-x`: sort by the segments.
-    folders.sort_by_key(|f| f.path.to_lowercase().split('/').map(String::from).collect::<Vec<_>>());
+    folders.sort_by_key(|f| path_key(&f.path).split('/').map(String::from).collect::<Vec<_>>());
     Ok(FolderTree { total, folders })
 }
 
@@ -146,7 +146,7 @@ pub fn create_folder(cache: &Cache, folder: &str) -> Result<String> {
     }
     std::fs::create_dir_all(library.join(&folder))?;
     let mut all = remembered(cache);
-    if !all.iter().any(|f| f.eq_ignore_ascii_case(&folder)) {
+    if !all.iter().any(|f| path_key(f) == path_key(&folder)) {
         all.push(folder.clone());
         save_remembered(cache, all)?;
     }
@@ -159,7 +159,7 @@ pub fn create_folder(cache: &Cache, folder: &str) -> Result<String> {
 pub fn delete_empty_folder(cache: &Cache, folder: &str) -> Result<()> {
     let folder = organize::validate_folder(folder).map_err(|e| anyhow!(e))?;
     let tree = list(cache)?;
-    if tree.folders.iter().any(|f| f.path.eq_ignore_ascii_case(&folder) && f.books > 0) {
+    if tree.folders.iter().any(|f| path_key(&f.path) == path_key(&folder) && f.books > 0) {
         bail!("the folder {folder} still has books in it");
     }
     let library = &cache.backend.library_path;
@@ -187,12 +187,12 @@ pub fn plan_rename(cache: &Cache, from: &str, to: &str) -> Result<OrganizePlan> 
     if from == to {
         bail!("that is already the folder's name");
     }
-    if within(&to, &from) && !to.eq_ignore_ascii_case(&from) {
+    if within(&to, &from) && path_key(&to) != path_key(&from) {
         bail!("a folder cannot be renamed to a place inside itself");
     }
-    if !to.eq_ignore_ascii_case(&from) {
+    if path_key(&to) != path_key(&from) {
         let tree = list(cache)?;
-        if tree.folders.iter().any(|f| f.path.eq_ignore_ascii_case(&to)) || cache.backend.library_path.join(&to).exists() {
+        if tree.folders.iter().any(|f| path_key(&f.path) == path_key(&to)) || cache.backend.library_path.join(&to).exists() {
             bail!("a folder named {to} already exists; move the books into it instead");
         }
     }
@@ -210,12 +210,28 @@ pub fn move_remembered(cache: &Cache, from: &str, to: &str) -> Result<()> {
         if !within(folder, &from) {
             continue;
         }
-        let rest = folder[from.len()..].trim_start_matches('/').to_string();
+        // Folding can change a name's byte length, so cut by segments.
+        let skip = from.split('/').filter(|s| !s.is_empty()).count();
+        let rest = folder.split('/').skip(skip).collect::<Vec<_>>().join("/");
         let new = if rest.is_empty() { to.clone() } else { format!("{to}/{rest}") };
-        if !escapes_library(library, &new) {
-            let _ = std::fs::create_dir_all(library.join(&new));
+        if path_key(&new) == path_key(folder) {
+            // Only the case changes: the directory is the same one, so it is
+            // renamed (through a temporary name; a direct rename to a name that
+            // differs only in case is refused or ignored on some volumes), not
+            // created anew and removed.
+            let (old_abs, new_abs) = (library.join(&*folder), library.join(&new));
+            if old_abs.is_dir() && !escapes_library(library, &new) {
+                let temp = old_abs.with_file_name(format!("{}.case-{}", old_abs.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(), &uuid::Uuid::new_v4().simple().to_string()[..6]));
+                if std::fs::rename(&old_abs, &temp).is_ok() && std::fs::rename(&temp, &new_abs).is_err() {
+                    let _ = std::fs::rename(&temp, &old_abs);
+                }
+            }
+        } else {
+            if !escapes_library(library, &new) {
+                let _ = std::fs::create_dir_all(library.join(&new));
+            }
+            let _ = std::fs::remove_dir(library.join(&*folder));
         }
-        let _ = std::fs::remove_dir(library.join(&*folder));
         *folder = new;
         changed = true;
     }

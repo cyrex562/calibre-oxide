@@ -278,45 +278,14 @@ pub struct RetitleReport {
     pub cancelled: bool,
 }
 
-fn runs_dir(library: &Path) -> std::path::PathBuf {
-    library.join(crate::constants::LIBRARY_HANDLE_DIR_NAME).join("retitle-runs")
-}
-
-fn save_run(library: &Path, run: &RetitleRun) -> Result<()> {
-    let dir = runs_dir(library);
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{}.json", run.run_id));
-    let temp = path.with_extension("json.partial");
-    std::fs::write(&temp, serde_json::to_vec_pretty(run)?)?;
-    std::fs::rename(&temp, &path)?;
-    Ok(())
-}
-
+/// The run's undo record (an append-only journal; see [`crate::run_journal`]).
 pub fn load_run(library: &Path, run_id: &str) -> Result<RetitleRun> {
-    if run_id.is_empty() || !run_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-        return Err(anyhow!("not a run id"));
-    }
-    let text = std::fs::read_to_string(runs_dir(library).join(format!("{run_id}.json"))).with_context(|| format!("no retitle run {run_id}"))?;
-    Ok(serde_json::from_str(&text)?)
+    crate::run_journal::RETITLE_RUNS.load(library, run_id)
 }
 
 /// Runs, newest first: `(run_id, created_at, books, undone)`.
 pub fn list_runs(library: &Path) -> Vec<(String, i64, usize, bool)> {
-    let mut out: Vec<(String, i64, usize, bool)> = std::fs::read_dir(runs_dir(library))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
-        .filter_map(|t| serde_json::from_str::<RetitleRun>(&t).ok())
-        .map(|r| (r.run_id, r.created_at, r.books.len(), r.undone_at.is_some()))
-        .collect();
-    out.sort_by_key(|r| std::cmp::Reverse(r.1));
-    out
-}
-
-fn new_run_id() -> String {
-    format!("ret-{}-{}", crate::trash::now_secs(), &uuid::Uuid::new_v4().simple().to_string()[..4])
+    crate::run_journal::RETITLE_RUNS.list(library)
 }
 
 fn names(cache: &Cache, book_id: i32) -> BTreeMap<String, String> {
@@ -327,8 +296,10 @@ fn names(cache: &Cache, book_id: i32) -> BTreeMap<String, String> {
 pub fn apply(cache: &Cache, items: &[Item], options: &ApplyOptions, control: &JobControl) -> Result<RetitleReport> {
     use std::sync::atomic::Ordering;
     let library = cache.backend.library_path.clone();
-    let mut run = RetitleRun { run_id: new_run_id(), created_at: crate::trash::now_secs(), embed: options.embed, rename_files: options.rename_files, rename_template: options.rename_template.clone(), ..Default::default() };
-    let mut report = RetitleReport { run_id: run.run_id.clone(), books_planned: items.len(), ..Default::default() };
+    let header = RetitleRun { run_id: crate::run_journal::RETITLE_RUNS.new_run_id(), created_at: crate::trash::now_secs(), embed: options.embed, rename_files: options.rename_files, rename_template: options.rename_template.clone(), ..Default::default() };
+    let mut report = RetitleReport { run_id: header.run_id.clone(), books_planned: items.len(), ..Default::default() };
+    // Opened on the first book that changes, so a run that changes nothing leaves no file.
+    let mut journal: Option<crate::run_journal::RunJournal> = None;
     let template = if options.rename_template.trim().is_empty() { DEFAULT_RENAME_TEMPLATE } else { options.rename_template.as_str() };
     let mut claimed: HashSet<(String, String)> = HashSet::new();
     control.set_phase("retitling");
@@ -357,6 +328,20 @@ pub fn apply(cache: &Cache, items: &[Item], options: &ApplyOptions, control: &Jo
         }
 
         let old_names = names(cache, id);
+
+        // The undo entry is on disk before anything is changed: a crash after the
+        // title is set (or a file renamed) must not leave a change nobody can undo.
+        // The entry says what is about to be changed; the finished one replaces it.
+        if journal.is_none() {
+            journal = Some(crate::run_journal::RETITLE_RUNS.begin(&library, &header.run_id, &header).context("could not start the undo journal, so nothing was changed")?);
+        }
+        let j = journal.as_mut().expect("opened above");
+        let intent = RunBook { book_id: id, old_title: stored.clone(), new_title: new_title.to_string(), old_names: old_names.clone(), new_names: BTreeMap::new(), embedded: false };
+        if let Err(e) = j.append_book(&intent) {
+            control.errors.fetch_add(1, Ordering::Relaxed);
+            report.failed.push(Failure { book_id: id, stage: "title".into(), reason: format!("could not write its undo entry, so it was not changed: {e:#}"), title_set: false });
+            continue;
+        }
         if let Err(e) = cache.set_field(id, "title", new_title) {
             control.errors.fetch_add(1, Ordering::Relaxed);
             report.failed.push(Failure { book_id: id, stage: "title".into(), reason: format!("{e:#}"), title_set: false });
@@ -404,13 +389,14 @@ pub fn apply(cache: &Cache, items: &[Item], options: &ApplyOptions, control: &Jo
             }
         }
         book.new_names = names(cache, id);
-        run.books.push(book);
-        if run.books.len() % 100 == 0 {
-            let _ = save_run(&library, &run);
+        // The finished entry (embedded flag, new file names) replaces the intent.
+        // If this fails the intent stands, which undoes the title but not a rename,
+        // so it is worth saying.
+        if let Some(j) = journal.as_mut() {
+            if let Err(e) = j.append_book(&book) {
+                report.skipped.push(Skipped { book_id: id, reason: format!("warning: the final undo entry could not be written ({e:#}); undo will restore the title but may not restore renamed files") });
+            }
         }
-    }
-    if !run.books.is_empty() {
-        save_run(&library, &run).context("recording the run")?;
     }
     Ok(report)
 }
@@ -436,11 +422,19 @@ fn rename_one_format(cache: &Cache, book_id: i32, format: &str, from: &str, to: 
     let dir = cache.book_dir(book_id)?.ok_or_else(|| anyhow!("no such book"))?;
     let ext = format.to_lowercase();
     let (old_path, new_path) = (dir.join(format!("{from}.{ext}")), dir.join(format!("{to}.{ext}")));
-    if new_path.exists() && from.to_lowercase() != to.to_lowercase() {
+    // The same file under another spelling (a case-only rename on a
+    // case-insensitive volume) is not a collision.
+    let same_file = new_path.exists() && calibre_utils::filenames::samefile(&old_path, &new_path);
+    if new_path.exists() && !same_file {
         return Err(anyhow!("{} already exists", new_path.display()));
     }
     if old_path.exists() {
-        cache.backend.write_handle()?.rename_atomic(&old_path, &new_path)?;
+        let handle = cache.backend.write_handle()?;
+        if same_file {
+            handle.rename_atomic(&old_path, &new_path)?;
+        } else {
+            handle.rename_atomic_no_replace(&old_path, &new_path)?;
+        }
     }
     cache.set_format_name(book_id, format, to)?;
     Ok(())
@@ -449,7 +443,7 @@ fn rename_one_format(cache: &Cache, book_id: i32, format: &str, from: &str, to: 
 /// Puts a run's titles and file names back where they were still the run's.
 pub fn undo(cache: &Cache, run_id: &str, control: &JobControl) -> Result<UndoReport> {
     let library = cache.backend.library_path.clone();
-    let mut run = load_run(&library, run_id)?;
+    let run = load_run(&library, run_id)?;
     if run.undone_at.is_some() {
         return Err(anyhow!("run {run_id} was already undone"));
     }
@@ -508,8 +502,10 @@ pub fn undo(cache: &Cache, run_id: &str, control: &JobControl) -> Result<UndoRep
     // Once undone, always undone: a book left alone stays changed, so a second
     // pass would only repeat the same skips (and report restored books as changed).
     if !report.cancelled {
-        run.undone_at = Some(crate::trash::now_secs());
-        save_run(&library, &run)?;
+        // The undo is done; failing to say so must not turn it into an error.
+        if let Err(e) = crate::run_journal::RETITLE_RUNS.mark_undone(&library, run_id, crate::trash::now_secs()) {
+            report.skipped.push(Skipped { book_id: 0, reason: format!("warning: the run could not be marked undone: {e:#}") });
+        }
     }
     Ok(report)
 }
