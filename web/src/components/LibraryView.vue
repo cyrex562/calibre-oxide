@@ -478,7 +478,7 @@ async function runSearch() {
   loading.value = true;
   error.value = null;
   try {
-    // Colours are re-evaluated for the rows on screen; the old ones stay until replaced.
+    // Colors are re-evaluated for the rows on screen; the old ones stay until replaced.
     coloring.forgetAll();
     await win.refresh();
     error.value = win.error.value ? humanError(win.error.value) : null;
@@ -632,7 +632,7 @@ async function commitEdit(bookId: number, column: BookColumn, raw: string): Prom
   return result;
 }
 
-// Row colouring rules (../library/useRowColoring.ts).
+// Row coloring rules (../library/useRowColoring.ts).
 const coloring = useRowColoring(win);
 const { rowColors, renderedRange } = coloring;
 

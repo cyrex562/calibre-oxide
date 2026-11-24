@@ -1601,7 +1601,7 @@ watch(
   gap: 0.5em;
   flex-wrap: wrap;
 }
-/* Colour, border and the disabled look come from the global `button.primary` (and the
+/* Color, border and the disabled look come from the global `button.primary` (and the
    Classic skin's rules for it): a flat borderless button here left a disabled Save looking
    enabled, at 2.2:1 contrast in Classic. */
 .read {

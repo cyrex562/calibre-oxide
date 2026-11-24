@@ -46,7 +46,7 @@ function isPdf(b: CompareBook): boolean {
 }
 
 const facts = computed(() => factRows(books.value));
-const notAnalysed = computed(() => (state.result ? state.result.pdf.books - state.result.pdf.fingerprinted : 0));
+const notAnalyzed = computed(() => (state.result ? state.result.pdf.books - state.result.pdf.fingerprinted : 0));
 
 function pairName(p: ComparePair): string {
   return `${labelOf(p.a)} and ${labelOf(p.b)}`;
@@ -278,7 +278,7 @@ onBeforeUnmount(() => {
           <span v-if="c.pairStatus(p) === 'matched'" class="cmp-on" data-testid="pair-matched">These pages are a matched sample pair</span>
           <span v-else-if="c.pairStatus(p) === 'different'" class="cmp-off">These pages were compared and differ</span>
         </div>
-        <p v-if="notAnalysed > 0" class="cmp-hint" data-testid="not-analysed">{{ notAnalysed }} PDF{{ notAnalysed === 1 ? "" : "s" }} not analysed yet, so {{ notAnalysed === 1 ? "its" : "their" }} pages cannot be compared. Use “Analyse library” in Find duplicates.</p>
+        <p v-if="notAnalyzed > 0" class="cmp-hint" data-testid="not-analyzed">{{ notAnalyzed }} PDF{{ notAnalyzed === 1 ? "" : "s" }} not analyzed yet, so {{ notAnalyzed === 1 ? "its" : "their" }} pages cannot be compared. Use “Analyze library” in Find duplicates.</p>
       </section>
 
       <div class="cmp-columns" data-testid="columns">

@@ -2,14 +2,14 @@
 // Find duplicates: the server scans the whole library once (a job, with
 // progress), keeps the result, and the panel pages through it. The state and the
 // rules are in ../../library/duplicatesStore.ts and ../../library/resolve.ts.
-// It stays mounted while closed, so "Analyse library" keeps its progress and
+// It stays mounted while closed, so "Analyze library" keeps its progress and
 // Cancel if the dialog is closed and opened again.
 
 import { computed, ref, watch } from "vue";
 
 import { cancelLibraryJob, describePrepareProgress, describePrepareResult, prepareLibrary } from "../../library/api";
 import type { DuplicateGroup, EmptyFile, PdfScanStatus } from "../../library/api";
-import { analyseLabelFor, fingerprintAction, pageMatchNoteFor } from "../../library/duplicates";
+import { analyzeLabelFor, fingerprintAction, pageMatchNoteFor } from "../../library/duplicates";
 import { filtersActive } from "../../library/duplicatesStore";
 import type { DuplicatesStore } from "../../library/duplicatesStore";
 import Dialog from "../Dialog.vue";
@@ -48,12 +48,12 @@ const pdfAction = computed(() => fingerprintAction(pdfStatus.value));
 // One button does all the preparation. Identical-file detection compares
 // content hashes (a library opened from real calibre has none), and a PDF and
 // its re-saved or OCR copy are found from their pages, which have to be
-// analysed once. The server runs it as one job -- read the files, analyse the
+// analyzed once. The server runs it as one job -- read the files, analyze the
 // PDFs, scan for duplicates -- that shows progress, can be cancelled, and picks
 // up where it stopped when run again. The groups are loaded when it finishes.
-const analyseBusy = ref(false);
-const analyseProgress = ref<string | null>(null);
-const analyseJobId = ref<number | null>(null);
+const analyzeBusy = ref(false);
+const analyzeProgress = ref<string | null>(null);
+const analyzeJobId = ref<number | null>(null);
 // What the last job (or the last merge) did. One line, replaced each time
 // rather than stacked under the earlier ones.
 const statusLine = ref<string | null>(null);
@@ -65,19 +65,19 @@ watch(
   { immediate: true },
 );
 
-const analyseLabel = computed(() => (analyseBusy.value ? "Analysing…" : analyseLabelFor(pdfStatus.value)));
+const analyzeLabel = computed(() => (analyzeBusy.value ? "Analyzing…" : analyzeLabelFor(pdfStatus.value)));
 
-async function analyseLibrary() {
-  analyseBusy.value = true;
+async function analyzeLibrary() {
+  analyzeBusy.value = true;
   statusLine.value = null;
-  analyseProgress.value = null;
+  analyzeProgress.value = null;
   duplicatesError.value = null;
   try {
     let cancelled = false;
     const result = await prepareLibrary({
-      onStart: (id) => (analyseJobId.value = id),
+      onStart: (id) => (analyzeJobId.value = id),
       onProgress: (job) => {
-        analyseProgress.value = describePrepareProgress(job.progress);
+        analyzeProgress.value = describePrepareProgress(job.progress);
         cancelled = job.progress.cancelled;
       },
     });
@@ -87,16 +87,16 @@ async function analyseLibrary() {
   } catch (e) {
     duplicatesError.value = e instanceof Error ? e.message : String(e);
   } finally {
-    analyseBusy.value = false;
-    analyseProgress.value = null;
-    analyseJobId.value = null;
+    analyzeBusy.value = false;
+    analyzeProgress.value = null;
+    analyzeJobId.value = null;
   }
 }
 
-async function cancelAnalyse() {
-  if (analyseJobId.value === null) return;
+async function cancelAnalyze() {
+  if (analyzeJobId.value === null) return;
   try {
-    await cancelLibraryJob(analyseJobId.value);
+    await cancelLibraryJob(analyzeJobId.value);
   } catch (e) {
     duplicatesError.value = e instanceof Error ? e.message : String(e);
   }
@@ -111,11 +111,11 @@ const pageMatchNote = computed(() => pageMatchNoteFor(pdfStatus.value, props.sto
     <Dialog :open="open" title="Find duplicates" show-close size="full" @close="emit('close')">
       <section>
         <div class="plugin-actions">
-          <button type="button" data-testid="analyse-library" :disabled="analyseBusy" title="Reads every book file once, looks at the pages of every PDF, then looks for duplicates. It can be stopped and picks up where it stopped." @click="analyseLibrary">{{ analyseLabel }}</button>
-          <button v-if="analyseBusy" type="button" @click="cancelAnalyse">Cancel</button>
+          <button type="button" data-testid="analyze-library" :disabled="analyzeBusy" title="Reads every book file once, looks at the pages of every PDF, then looks for duplicates. It can be stopped and picks up where it stopped." @click="analyzeLibrary">{{ analyzeLabel }}</button>
+          <button v-if="analyzeBusy" type="button" @click="cancelAnalyze">Cancel</button>
         </div>
-        <p v-if="pdfAction?.note && !analyseBusy" class="news-hint">{{ pdfAction.note }}</p>
-        <p v-if="analyseProgress" class="news-hint" role="status">{{ analyseProgress }}</p>
+        <p v-if="pdfAction?.note && !analyzeBusy" class="news-hint">{{ pdfAction.note }}</p>
+        <p v-if="analyzeProgress" class="news-hint" role="status">{{ analyzeProgress }}</p>
         <p v-if="statusLine" class="news-hint" role="status" data-testid="status-line">{{ statusLine }}</p>
         <p v-if="pageMatchNote" class="news-hint" data-testid="page-match-note">{{ pageMatchNote }}</p>
         <p v-if="emptyFiles.length" class="news-hint" data-testid="empty-files">

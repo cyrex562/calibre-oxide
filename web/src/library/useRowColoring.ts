@@ -1,7 +1,7 @@
-// Row colouring rules (#4.1).
+// Row coloring rules (#4.1).
 //
-// A rule is a template evaluated per book; a usable colour in the result
-// colours that row. Evaluation goes through the bulk route -- one request for
+// A rule is a template evaluated per book; a usable color in the result
+// colors that row. Evaluation goes through the bulk route -- one request for
 // the whole page rather than one per row.
 //
 // What a template returns is checked against an allowlist before it reaches a
@@ -18,7 +18,7 @@ import { activeRules, colorForBook, COLORING_RULES_PROFILE, DEFAULT_COLORING_RUL
 export function useRowColoring(win: BookWindow) {
   const coloringRules = ref<ColoringRule[]>([]);
   // A reactive Map, changed key by key: a chunk of rows arriving used to copy
-  // the whole record (every coloured row of a 50,000-book list) to add a few.
+  // the whole record (every colored row of a 50,000-book list) to add a few.
   const rowColors = shallowReactive(new Map<number, string>());
 
   async function loadColoringRules() {
@@ -26,7 +26,7 @@ export function useRowColoring(win: BookWindow) {
       const prefs = await fetchProfile<ColoringRulesPrefs>(COLORING_RULES_PROFILE);
       coloringRules.value = prefs?.rules ?? DEFAULT_COLORING_RULES.rules;
     } catch (e) {
-      console.error("failed to load colouring rules", e);
+      console.error("failed to load coloring rules", e);
     }
   }
   void loadColoringRules();
@@ -44,7 +44,7 @@ export function useRowColoring(win: BookWindow) {
       colorChecked.clear();
       return;
     }
-    // Only the rows on screen that have loaded and have not been coloured yet.
+    // Only the rows on screen that have loaded and have not been colored yet.
     const { first, last } = renderedRange.value;
     const ids = win.ids.value.slice(first, last).filter((id) => win.cache.has(id) && !colorChecked.has(id));
     if (ids.length === 0) return;
@@ -61,15 +61,15 @@ export function useRowColoring(win: BookWindow) {
         else rowColors.delete(id);
       }
     } catch (e) {
-      // Colouring is decoration; a failure must not take down the list.
-      console.error("failed to apply colouring rules", e);
+      // Coloring is decoration; a failure must not take down the list.
+      console.error("failed to apply coloring rules", e);
       for (const id of ids) colorChecked.delete(id);
     }
   }
 
   // Re-run whenever rows load, the visible set moves, or the rules change.
   watch([win.version, renderedRange], () => void applyColoringRules());
-  // A new query: colours belong to the old rows.
+  // A new query: colors belong to the old rows.
   watch(win.resetCount, () => {
     colorGeneration++;
     colorChecked.clear();
@@ -86,7 +86,7 @@ export function useRowColoring(win: BookWindow) {
     rowColors,
     /** Rows currently rendered, as reported by the table/grid. */
     renderedRange,
-    /** The rows' colours are stale (the list reloaded): ask again for the ones on screen. */
+    /** The rows' colors are stale (the list reloaded): ask again for the ones on screen. */
     forgetAll: () => colorChecked.clear(),
     /** One row's values changed: ask again for it. */
     forget: (id: number) => colorChecked.delete(id),

@@ -132,33 +132,33 @@ export function formatBytes(n: number): string {
 
 /**
  * The label of the action that runs the fingerprint job, or null when there is
- * nothing for it to do. `pending` is what the job would analyse; PDFs with no
- * content hash yet are read first by the same "Analyse library" job.
+ * nothing for it to do. `pending` is what the job would analyze; PDFs with no
+ * content hash yet are read first by the same "Analyze library" job.
  */
 export function fingerprintAction(status: PdfScanStatus | undefined): { label: string; note: string | null } | null {
   if (!status || status.pending === 0) return null;
   const n = status.pending.toLocaleString("en-US");
   return {
-    label: `Analyse library (${n} not yet analysed)`,
-    note: status.unhashed > 0 ? `${status.unhashed.toLocaleString("en-US")} more PDFs have no content hash yet; “Analyse library” reads those first.` : null,
+    label: `Analyze library (${n} not yet analyzed)`,
+    note: status.unhashed > 0 ? `${status.unhashed.toLocaleString("en-US")} more PDFs have no content hash yet; “Analyze library” reads those first.` : null,
   };
 }
 
 /**
- * The one "prepare" button's label: it reads the files, analyses the PDFs'
- * pages and looks for duplicates, so it says how much is still to analyse.
+ * The one "prepare" button's label: it reads the files, analyzes the PDFs'
+ * pages and looks for duplicates, so it says how much is still to analyze.
  */
-export function analyseLabelFor(status: PdfScanStatus | undefined): string {
+export function analyzeLabelFor(status: PdfScanStatus | undefined): string {
   const todo = status ? status.pending + status.unhashed : 0;
-  return todo > 0 ? `Analyse library (${todo.toLocaleString("en-US")} PDF${todo === 1 ? "" : "s"} not yet analysed)` : "Analyse library";
+  return todo > 0 ? `Analyze library (${todo.toLocaleString("en-US")} PDF${todo === 1 ? "" : "s"} not yet analyzed)` : "Analyze library";
 }
 
 const PDF_REASONS: DuplicateReason[] = ["pdf_resave", "pdf_ocr_variant", "pdf_text_match"];
 
 /**
- * Said above the groups when every PDF has been analysed and no group rests on
+ * Said above the groups when every PDF has been analyzed and no group rests on
  * the pages, so an empty "same PDF, re-saved" kind is not mistaken for a step
- * that was skipped. Null while there is more to analyse, while a filter hides
+ * that was skipped. Null while there is more to analyze, while a filter hides
  * groups, or when some page-based group exists.
  */
 export function pageMatchNoteFor(status: PdfScanStatus | undefined, facets: Partial<Record<DuplicateReason, number>>, filtered = false): string | null {
@@ -166,7 +166,7 @@ export function pageMatchNoteFor(status: PdfScanStatus | undefined, facets: Part
   const parts: string[] = [];
   const found = PDF_REASONS.some((r) => (facets[r] ?? 0) > 0);
   if (status.fingerprinted > 0 && !found) {
-    parts.push(`All ${status.fingerprinted.toLocaleString("en-US")} PDFs were analysed page by page and none matches another as a re-save or a scan and its OCR copy.`);
+    parts.push(`All ${status.fingerprinted.toLocaleString("en-US")} PDFs were analyzed page by page and none matches another as a re-save or a scan and its OCR copy.`);
   }
   if (status.failed > 0) {
     parts.push(`${status.failed.toLocaleString("en-US")} PDF${status.failed === 1 ? "" : "s"} could not be read (encrypted or damaged), so ${status.failed === 1 ? "it is" : "they are"} not matched by pages.`);

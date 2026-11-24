@@ -1,6 +1,6 @@
-// The colour tokens, held to WCAG AA (4.5:1 for text). The review found Modern's faint text
+// The color tokens, held to WCAG AA (4.5:1 for text). The review found Modern's faint text
 // at 2.8 to 3.9:1 and white on the dark accent at 3.4:1, which no test would have caught:
-// the colours are CSS, and nothing renders them in CI. So this reads the token blocks from
+// the colors are CSS, and nothing renders them in CI. So this reads the token blocks from
 // style.css and computes the ratios itself.
 
 import rawCss from "./style.css?raw";
@@ -66,7 +66,7 @@ describe("text contrast", () => {
     expect(contrast(t["fg-on-accent"], t["accent-solid-hover"])).toBeGreaterThanOrEqual(4.5);
   });
 
-  it("the primary button uses the accent fill, not the lighter link colour", () => {
+  it("the primary button uses the accent fill, not the lighter link color", () => {
     expect(css).toMatch(/button\.primary \{\s*background: var\(--accent-solid\);/);
   });
 });

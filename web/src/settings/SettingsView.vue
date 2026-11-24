@@ -124,8 +124,8 @@ async function chooseAutoAddFolder(clear: boolean) {
   }
 }
 
-// Row colouring rules (#4.1). A rule is a template evaluated per
-// book; a usable colour in the result colours that row. First enabled
+// Row coloring rules (#4.1). A rule is a template evaluated per
+// book; a usable color in the result colors that row. First enabled
 // matching rule wins, so this list's order is the precedence.
 const coloringRules = ref<ColoringRule[]>([]);
 
@@ -554,7 +554,7 @@ async function toggleAutoReopen() {
       <section id="settings-colors" class="pane">
         <h3>Row colors</h3>
         <p class="hint">
-          Each rule is a template evaluated against every book; if it returns a colour
+          Each rule is a template evaluated against every book; if it returns a color
           name or a hex value, that book's row takes it. The first enabled rule that
           matches wins, so order matters — anything else is ignored.
         </p>
@@ -948,7 +948,7 @@ async function toggleAutoReopen() {
   font-size: var(--fs-small);
 }
 
-/* Colouring rules (#4.1). */
+/* Coloring rules (#4.1). */
 .coloring-list {
   list-style: none;
   margin: 0 0 0.5rem;

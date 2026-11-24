@@ -43,7 +43,7 @@ const props = defineProps<{
   sort: string;
   sortOrder: "asc" | "desc";
   /**
-   * Row colours from the colouring rules (#4.1), keyed by book id.
+   * Row colors from the coloring rules (#4.1), keyed by book id.
    * Already validated against an allowlist -- see
    * library/coloringRules.ts for why that matters before a value
    * reaches a style attribute.

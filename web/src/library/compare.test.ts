@@ -167,7 +167,7 @@ describe("the evidence of a pair", () => {
 
   it("says what was measured, and says so when nothing was", () => {
     expect(pdfLine(pair(1, 2))).toBe("91% · same scan, with and without OCR text · 5 of 5 sample pages match · text similarity 0.93");
-    expect(pdfLine(pair(1, 2, { pdf: { fingerprinted: false } }))).toContain("Pages not analysed yet");
+    expect(pdfLine(pair(1, 2, { pdf: { fingerprinted: false } }))).toContain("Pages not analyzed yet");
     expect(pdfLine(pair(1, 2, { pdf: { fingerprinted: true, kind: null, confidence: null, compared: 4, matched: 0 } }))).toBe("The pages do not match · 0 of 4 sample pages match");
     expect(pdfLine(pair(1, 2, { pdf: null }))).toBe("");
   });
@@ -656,7 +656,7 @@ describe("the facts table", () => {
     expect(factRows([book(1, { pdf: undefined }), book(2, { pdf: undefined })]).map((r) => r.key)).not.toContain("pages");
   });
 
-  it("does not repeat the not-analysed warning under every pair", () => {
-    expect(pairLines(pair(1, 2, { pdf: { fingerprinted: false } })).join(" ")).not.toContain("not analysed");
+  it("does not repeat the not-analyzed warning under every pair", () => {
+    expect(pairLines(pair(1, 2, { pdf: { fingerprinted: false } })).join(" ")).not.toContain("not analyzed");
   });
 });

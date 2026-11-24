@@ -909,7 +909,7 @@ export function describePrepareResult(r: PrepareResult, cancelled = false): stri
     parts.push(hash.total === 0 ? "every file already had a hash" : `${(hash.hashed ?? 0).toLocaleString("en-US")} of ${hash.total.toLocaleString("en-US")} files hashed`);
   }
   const fp = r.stages.fingerprint as { fingerprinted?: number; failed_count?: number } | undefined;
-  if (fp && typeof fp.fingerprinted === "number" && fp.fingerprinted > 0) parts.push(`${fp.fingerprinted.toLocaleString("en-US")} PDFs analysed`);
+  if (fp && typeof fp.fingerprinted === "number" && fp.fingerprinted > 0) parts.push(`${fp.fingerprinted.toLocaleString("en-US")} PDFs analyzed`);
   if (fp && (fp.failed_count ?? 0) > 0) parts.push(`${fp.failed_count} PDFs could not be read`);
   return parts.length ? parts.join(" · ") : "Ready for duplicate detection.";
 }
@@ -927,7 +927,7 @@ export function describeJobProgress(p: LibraryJobProgress): string {
     case "hashing":
       return `Reading files… ${n(p.hashed + p.errors)} of ${n(p.total)}`;
     case "fingerprinting":
-      return `Analysing PDF pages… ${n((p.fingerprinted ?? 0) + p.errors)} of ${n(p.total)}`;
+      return `Analyzing PDF pages… ${n((p.fingerprinted ?? 0) + p.errors)} of ${n(p.total)}`;
     case "importing":
       return `Importing… ${n(p.hashed + p.already_known + p.errors)} of ${n(p.total)} files · ${n(p.added)} books added${p.ignored ? ` · ${n(p.ignored)} duplicates skipped` : ""}`;
     case "checking":
@@ -1440,7 +1440,7 @@ export interface ComparePageMatch {
 }
 
 export interface ComparePdf {
-  /** False until both PDFs have been analysed (not an error). */
+  /** False until both PDFs have been analyzed (not an error). */
   fingerprinted: boolean;
   missing?: number[];
   /** The `pdf_*` reason the library scan would give the pair, or null if it is not a match. */
@@ -2249,7 +2249,7 @@ export function saveEmailAccount(account: EmailAccount): Promise<{ ok: boolean }
   });
 }
 
-// Bulk template evaluation (#816 item 4.1). Colouring a page of rows
+// Bulk template evaluation (#816 item 4.1). Coloring a page of rows
 // is one evaluation per row; the per-book route would be a request
 // per row.
 export async function evaluateTemplateBulk(template: string, bookIds: number[]): Promise<Record<string, string>> {
@@ -2259,7 +2259,7 @@ export async function evaluateTemplateBulk(template: string, bookIds: number[]):
     body: JSON.stringify({ template, book_ids: bookIds }),
   });
   // A broken template is an expected outcome while a rule is being
-  // written; the caller treats it as "this rule colours nothing".
+  // written; the caller treats it as "this rule colors nothing".
   return data.ok && data.results ? data.results : {};
 }
 

@@ -142,7 +142,7 @@ function similarity(j: number): string {
 export function pdfLine(pair: ComparePair): string {
   const p = pair.pdf;
   if (!p) return "";
-  if (!p.fingerprinted) return "Pages not analysed yet: use “Analyse library” in Find duplicates to compare them.";
+  if (!p.fingerprinted) return "Pages not analyzed yet: use “Analyze library” in Find duplicates to compare them.";
   const parts: string[] = [];
   if (p.kind && p.confidence != null) parts.push(`${confidencePercent(p.confidence)} · ${reasonLabel(p.kind)}`);
   else parts.push("The pages do not match");
@@ -156,7 +156,7 @@ export function pairLines(pair: ComparePair): string[] {
   const lines: string[] = [];
   if (pair.identical_bytes === true) lines.push(`Identical files (${pair.identical_formats.join(", ") || "same bytes"})`);
   else if (pair.identical_bytes === false) lines.push("The files differ");
-  // "Pages not analysed yet" is said once for the whole view (the evidence block's note), not under every pair.
+  // "Pages not analyzed yet" is said once for the whole view (the evidence block's note), not under every pair.
   const pdf = pair.pdf && !pair.pdf.fingerprinted ? "" : pdfLine(pair);
   if (pdf) lines.push(pdf);
   for (const e of pair.evidence) lines.push(`${reasonLabel(e.reason)} (${confidencePercent(e.confidence)}): ${e.detail}`);

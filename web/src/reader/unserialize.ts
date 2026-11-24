@@ -1,5 +1,5 @@
 // Port of resources.pyj's `unserialize_html` + `load_resources`/
-// `finalize_resources` -- turns the reader_json tree
+// `finalyze_resources` -- turns the reader_json tree
 // (lexmechanic_ebooks::reader_json::serialize_document's real output
 // shape) into a live DOM inside the reader iframe's own document, and
 // resolves every virtualized resource reference (img/link src/href,
