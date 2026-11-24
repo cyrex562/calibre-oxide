@@ -53,6 +53,42 @@ pub async fn scan(State(state): State<AppState>, Path(library_id): Path<String>,
 pub struct UntrackedQuery {
     /// Stop counting at this many. The default is enough to say "lots".
     pub max: Option<usize>,
+    /// Walk again even if a recent answer is remembered.
+    pub fresh: Option<bool>,
+}
+
+/// How long a count is trusted when the library has not changed. Files appear
+/// in the folder without the library knowing, so the answer is not kept for ever.
+const UNTRACKED_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+type UntrackedKey = (std::path::PathBuf, usize);
+type UntrackedEntry = (std::time::Instant, String, serde_json::Value);
+
+/// The last answer per library and cap: `(when, change watermark, answer)`. The
+/// walk is long on a big or remote library, and the page asks on every load.
+fn untracked_memo() -> &'static std::sync::Mutex<std::collections::HashMap<UntrackedKey, UntrackedEntry>> {
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<UntrackedKey, UntrackedEntry>>> = std::sync::OnceLock::new();
+    MEMO.get_or_init(Default::default)
+}
+
+/// The count for `cache`, from the memo when the library has not changed and the
+/// answer is recent; otherwise a (name-only) walk, which is then remembered.
+pub(crate) fn untracked_cached(cache: &lexmechanic_db::cache::Cache, cap: usize, fresh: bool) -> anyhow::Result<serde_json::Value> {
+    let key = (cache.backend.library_path.clone(), cap);
+    // Read before walking: a change during the walk then makes the next
+    // request walk again instead of trusting a count that may predate it.
+    let watermark = cache.change_watermark();
+    if !fresh {
+        if let Some((at, mark, value)) = untracked_memo().lock().unwrap().get(&key) {
+            if *mark == watermark && at.elapsed() < UNTRACKED_TTL {
+                return Ok(value.clone());
+            }
+        }
+    }
+    let count = lexmechanic_db::scan::count_untracked(cache, std::time::SystemTime::now(), cap)?;
+    let value = serde_json::to_value(count).unwrap_or_default();
+    untracked_memo().lock().unwrap().insert(key, (std::time::Instant::now(), watermark, value.clone()));
+    Ok(value)
 }
 
 /// `GET /library-untracked/{library_id}` -- how many book files in the
@@ -65,11 +101,12 @@ pub struct UntrackedQuery {
 pub async fn untracked(State(state): State<AppState>, Path(library_id): Path<String>, Query(query): Query<UntrackedQuery>) -> Result<axum::Json<serde_json::Value>, ServerError> {
     let cache = state.cache_for(Some(&library_id)).ok_or_else(|| ServerError::NotFound(format!("no library named {library_id:?}")))?;
     let cap = query.max.unwrap_or(10_000).clamp(1, 1_000_000);
-    let count = tokio::task::spawn_blocking(move || lexmechanic_db::scan::count_untracked(&cache, std::time::SystemTime::now(), cap))
+    let fresh = query.fresh.unwrap_or(false);
+    let value = tokio::task::spawn_blocking(move || untracked_cached(&cache, cap, fresh))
         .await
         .map_err(|e| ServerError::InternalServerError(e.to_string()))?
         .map_err(|e| ServerError::InternalServerError(format!("{e:#}")))?;
-    Ok(axum::Json(serde_json::to_value(count).unwrap_or_default()))
+    Ok(axum::Json(value))
 }
 
 #[cfg(test)]
@@ -153,7 +190,7 @@ mod tests {
             std::fs::write(&path, b"%PDF x").unwrap();
             make_settled(&path);
         }
-        let (_, body) = get_json(&router, "/library-untracked/-").await;
+        let (_, body) = get_json(&router, "/library-untracked/-?fresh=true").await;
         assert_eq!(body["untracked"], 3, "{body}");
         assert_eq!(body["tracked"], 0);
         assert_eq!(body["at_least"], false);
@@ -170,6 +207,30 @@ mod tests {
         let (_, after) = get_json(&router, "/library-untracked/-").await;
         assert_eq!(after["untracked"], 0);
         assert_eq!(after["tracked"], 3);
+    }
+
+    /// The page asks on every load and the walk is long on a big or remote library:
+    /// a recent answer is reused while the library is unchanged, a change to the
+    /// library or `fresh=true` walks again.
+    #[tokio::test]
+    async fn the_untracked_count_is_remembered_until_the_library_changes() {
+        let (dir, router) = test_app();
+        let (_, first) = get_json(&router, "/library-untracked/default").await;
+        assert_eq!(first["untracked"], 0);
+
+        let path = dir.path().join("late.pdf");
+        std::fs::write(&path, b"%PDF x").unwrap();
+        make_settled(&path);
+        let (_, again) = get_json(&router, "/library-untracked/default").await;
+        assert_eq!(again["untracked"], 0, "answered from the remembered count, no walk: {again}");
+        let (_, fresh) = get_json(&router, "/library-untracked/default?fresh=true").await;
+        assert_eq!(fresh["untracked"], 1, "{fresh}");
+
+        // A change to the library (the scan adds the book) invalidates it by itself.
+        let (_, _) = post_json(&router, "/scan-library/default?wait=true").await;
+        let (_, after) = get_json(&router, "/library-untracked/default").await;
+        assert_eq!(after["untracked"], 0, "{after}");
+        assert_eq!(after["tracked"], 1, "{after}");
     }
 
     #[tokio::test]

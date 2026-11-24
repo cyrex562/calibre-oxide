@@ -74,7 +74,7 @@ export function useLibraryInfo({ libraryChanged }: { libraryChanged: () => Promi
       libraryPath.value = info.path;
       libraryId.value = info.id;
       libraryMap.value = info.libraries;
-      void checkUntracked();
+      requestUntracked();
     } catch {
       // Not worth surfacing: the status bar simply omits the label, and
       // every other part of the window works without it.
@@ -96,6 +96,24 @@ export function useLibraryInfo({ libraryChanged }: { libraryChanged: () => Promi
       return sessionStorage.getItem(dismissKey(path)) === "1";
     } catch {
       return false;
+    }
+  }
+
+  // The untracked count walks the library folder on the server, so it waits for
+  // the first rows (`markRowsReady`) instead of competing with them at start-up.
+  let rowsReady = false;
+  let untrackedWanted = false;
+
+  function requestUntracked() {
+    if (rowsReady) void checkUntracked();
+    else untrackedWanted = true;
+  }
+
+  function markRowsReady() {
+    rowsReady = true;
+    if (untrackedWanted) {
+      untrackedWanted = false;
+      void checkUntracked();
     }
   }
 
@@ -300,7 +318,7 @@ export function useLibraryInfo({ libraryChanged }: { libraryChanged: () => Promi
   return {
     libraryName, libraryPath, libraryId, libraryMap, copyTargets, storage, banner, bannerDismissed,
     changeLogWarning, changeLogRepairBusy, changeLogRepairError, refreshChangeLogStatus, repairChangeLogNow,
-    loadLibraryInfo,
+    loadLibraryInfo, markRowsReady,
     untracked, scanPromptDismissed, promptScanBusy, promptScanProgress, promptScanSummary, promptScanError, scanFromPrompt, stopPromptScan, dismissScanPrompt, closeScanResult,
     interruptedJob, resumeBusy, resumeProgress, resumeError, loadInterruptedJob, resumeInterrupted,
     newLibraryOpen, newLibraryName, newLibraryError, creatingLibrary, openNewLibrary, createLibrary,

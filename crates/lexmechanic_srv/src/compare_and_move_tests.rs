@@ -634,6 +634,44 @@ async fn move_books_numbers_a_taken_name_and_the_move_survives_a_rebuild() {
     }
 }
 
+/// Applying a plan that was just previewed reuses it (no second planning pass)
+/// while the library has not changed; once it has, the plan is made again and
+/// the fingerprint decides, as it always did.
+#[tokio::test]
+async fn a_previewed_plan_is_reused_to_apply_until_the_library_changes() {
+    let l = lib();
+    let a = l.add("a.txt", "Alpha Primer", "Ada Lovelace", b"alpha");
+    let (_, plan) = l.post("/organize-library/default", json!({"book_ids": [a], "template": "Sorted/{title}"})).await;
+    let fingerprint = plan["plan_fingerprint"].as_str().unwrap().to_string();
+    let key = json!({"organize": "Sorted/{title}", "book_ids": [a], "search": null, "path_prefix": null}).to_string();
+    let remembered = crate::organize_library::recall_plan(&l.cache, &key, &fingerprint).expect("the dry run's plan is remembered");
+    assert_eq!(remembered.fingerprint, fingerprint);
+    assert!(crate::organize_library::recall_plan(&l.cache, &key, "other").is_none());
+    let other_request = json!({"organize": "Other/{title}", "book_ids": [a], "search": null, "path_prefix": null}).to_string();
+    assert!(crate::organize_library::recall_plan(&l.cache, &other_request, &fingerprint).is_none(), "a plan is only reused for the request that made it");
+
+    // The library changes: the remembered plan is no longer trusted.
+    l.add("b.txt", "Totally Different", "Bob Writer", b"bravo");
+    assert!(crate::organize_library::recall_plan(&l.cache, &key, &fingerprint).is_none());
+
+    // Applying still works (it plans again and finds the same fingerprint) ...
+    let (status, started) = l.post("/organize-library/default", json!({"book_ids": [a], "template": "Sorted/{title}", "dry_run": false, "plan_fingerprint": fingerprint})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{started}");
+    let job = l.wait_job(&started).await;
+    assert_eq!(job["report"]["books_moved"], 1, "{job}");
+    assert!(l.path.join("Sorted/Alpha Primer.txt").is_file());
+
+    // ... and the same with an unchanged library: preview, then apply straight away.
+    let (_, plan) = l.post("/organize-library/default", json!({"book_ids": [a], "template": "Moved/{title}"})).await;
+    let key = json!({"organize": "Moved/{title}", "book_ids": [a], "search": null, "path_prefix": null}).to_string();
+    assert!(crate::organize_library::recall_plan(&l.cache, &key, plan["plan_fingerprint"].as_str().unwrap()).is_some());
+    let (status, started) = l.post("/organize-library/default", json!({"book_ids": [a], "template": "Moved/{title}", "dry_run": false, "plan_fingerprint": plan["plan_fingerprint"]})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{started}");
+    let job = l.wait_job(&started).await;
+    assert_eq!(job["report"]["books_moved"], 1, "{job}");
+    assert!(l.path.join("Moved/Alpha Primer.txt").is_file());
+}
+
 // ---------------------------------------------------------------------------
 // Folders and the naming convention (tranche 19b)
 // ---------------------------------------------------------------------------

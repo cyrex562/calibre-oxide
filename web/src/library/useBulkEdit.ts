@@ -16,8 +16,9 @@
 import { computed, reactive, ref, type Ref } from "vue";
 
 import type { BookSummary, FieldMetaEntry } from "./types";
-import { setFields, setFieldsBatch } from "./api";
+import { setFields, setFieldsBatch, setFieldsRelative } from "./api";
 import { runBulkEdit as runBatchedEdit, type BulkItem } from "./bulkBatch";
+import { relativeTagOp, runRelativeEdit, type RelativeOp } from "./bulkRelative";
 import { changesFor, isEmptySpec, validateSpec, type BulkEditSpec } from "./bulkEdit";
 
 export interface BulkEditDeps {
@@ -67,6 +68,40 @@ export function useBulkEdit({ selectedIds, selectMode, fieldMetadata, win, onCha
   /** Custom columns offered in the bulk panel, by their row key. */
   const customColumns = computed(() => Object.values(fieldMetadata.value).filter((f) => f.is_custom && f.label));
 
+  /**
+   * "Add tags" / "remove tags" alone: the server reads each book's tags, so none
+   * are fetched here (./bulkRelative.ts). False when the server cannot do it,
+   * and nothing was changed: the caller then edits the old way.
+   */
+  async function runRelative(ids: number[], op: RelativeOp): Promise<boolean> {
+    busy.value = true;
+    errors.value = [];
+    summary.value = null;
+    cancelled = false;
+    progress.value = { done: 0, total: ids.length };
+    const pool = await runRelativeEdit(ids, op, {
+      send: setFieldsRelative,
+      cancelled: () => cancelled,
+      onProgress: (done, total) => (progress.value = { done, total }),
+    });
+    busy.value = false;
+    progress.value = null;
+    if (!pool) return false;
+    errors.value.push(...pool.errors);
+    const stopped = pool.notStarted > 0 ? `, stopped with ${pool.notStarted} not started` : "";
+    summary.value = `Updated ${pool.updated} book(s)${pool.unchanged ? `, ${pool.unchanged} already matched` : ""}${errors.value.length ? `, ${errors.value.length} failed` : ""}${stopped}.`;
+    if (errors.value.length === 0 && pool.notStarted === 0) {
+      open.value = false;
+      selectMode.value = false;
+      selectedIds.value = new Set();
+      spec.value = emptySpec();
+      applyRating.value = false;
+      applySeriesIndex.value = false;
+    }
+    await onChanged();
+    return true;
+  }
+
   async function run() {
     const ids = [...selectedIds.value];
     if (ids.length === 0) return;
@@ -88,6 +123,8 @@ export function useBulkEdit({ selectedIds, selectMode, fieldMetadata, win, onCha
       errors.value = ["Nothing to apply -- fill in at least one field."];
       return;
     }
+    const relative = relativeTagOp(edit);
+    if (relative && (await runRelative(ids, relative))) return;
 
     busy.value = true;
     errors.value = [];

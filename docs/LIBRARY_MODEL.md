@@ -193,7 +193,11 @@ in-process workers had killed the whole server. What changed (tranche 13):
   (`ScanReport::precomputed`), so nothing is read twice. Opening a library with
   `GET /library-untracked` stops walking after four seconds and reports "at
   least" (`at_least: true`); a fully tracked library no
-  longer costs a full walk each time it is opened.
+  longer costs a full walk each time it is opened. The count is a **name-only**
+  walk (no file is opened or `stat`ed for its identity), its answer is kept
+  for a minute while the library's change watermark is unchanged
+  (`?fresh=true` walks again), and the web UI asks for it only after the first
+  rows are on screen.
 - **One chained job.** `POST /prepare-library` runs scan, hash backfill, PDF
   fingerprints and the duplicate scan in order. The stage it reached is written
   to `.lexmechanic/prepare-stage.json` before it starts, so a rerun resumes at

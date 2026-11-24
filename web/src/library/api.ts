@@ -6,6 +6,7 @@
 import { markLibraryChanged } from "./libraryEpoch";
 import type { AbsorbReport, AbsorbableList } from "./absorb";
 import { BatchUnsupportedError, type BatchGroup, type BatchResponse } from "./bulkBatch";
+import { RelativeUnsupportedError, type RelativeOp, type RelativeResponse } from "./bulkRelative";
 import { parseChangeLogStatus, type ChangeLogStatus } from "./changeLog";
 import { importBody, type ImportFolderRequest, type ImportReport } from "./importFolder";
 import type { UntrackedCount } from "./scanPrompt";
@@ -133,6 +134,23 @@ export async function setFieldsBatch(groups: BatchGroup[]): Promise<BatchRespons
   if (resp.status === 404 || resp.status === 405) throw new BatchUnsupportedError();
   if (!resp.ok) throw new Error(`POST /cdb/set-fields-batch failed: ${resp.status} ${resp.statusText}${await failureDetail(resp)}`);
   return (await resp.json()) as BatchResponse;
+}
+
+/**
+ * Adds values to, or removes them from, a multi-value field of many books in one
+ * request: the server reads each book's current list. An older server answers
+ * 404 or 400 (it does not know `add`/`remove`), which throws
+ * [`RelativeUnsupportedError`] so the caller can edit the old way.
+ */
+export async function setFieldsRelative(bookIds: number[], op: RelativeOp): Promise<RelativeResponse> {
+  const resp = await fetch("/cdb/set-fields-batch/default", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ book_ids: bookIds, [op.mode]: { [op.field]: op.values } }),
+  });
+  if (resp.status === 404 || resp.status === 405 || resp.status === 400) throw new RelativeUnsupportedError();
+  if (!resp.ok) throw new Error(`POST /cdb/set-fields-batch failed: ${resp.status} ${resp.statusText}${await failureDetail(resp)}`);
+  return (await resp.json()) as RelativeResponse;
 }
 
 /** `GET /change-log/status/{lib}`: whether the library's change log missed changes. Null from an older server. */
