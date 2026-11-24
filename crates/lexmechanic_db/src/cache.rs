@@ -2899,7 +2899,7 @@ impl Cache {
     /// here).
     pub fn format_files(&self, book_id: i32) -> anyhow::Result<Vec<(String, String)>> {
         let conn = self.backend.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT name, format FROM data WHERE book = ?1")?;
+        let mut stmt = conn.prepare_cached("SELECT name, format FROM data WHERE book = ?1")?;
         let rows = stmt.query_map([book_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
         let mut formats = Vec::new();
         for row in rows {

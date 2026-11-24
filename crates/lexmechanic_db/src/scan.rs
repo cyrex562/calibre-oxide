@@ -204,6 +204,20 @@ fn walk_dir(root: &Path, dir: &Path, options: &ScanOptions, now: SystemTime, rep
         }
     };
 
+    // A name-only walk (a count) learns a folder is a library of its own from the
+    // folder's own listing, instead of three `stat`s per folder from the parent:
+    // on a share that is the difference between one round trip per folder and four.
+    let entries: Box<dyn Iterator<Item = std::io::Result<std::fs::DirEntry>>> = if options.names_only {
+        let all: Vec<std::io::Result<std::fs::DirEntry>> = entries.collect();
+        if dir != root && lists_a_library(&all) {
+            report.nested_libraries.push(relative_to(root, dir));
+            return;
+        }
+        Box::new(all.into_iter())
+    } else {
+        Box::new(entries)
+    };
+
     let mut subdirs = Vec::new();
     for entry in entries {
         let Ok(entry) = entry else {
@@ -244,7 +258,7 @@ fn walk_dir(root: &Path, dir: &Path, options: &ScanOptions, now: SystemTime, rep
             if dir == root && lower == DATA_DIR_NAME {
                 continue;
             }
-            if holds_its_own_library(&path) {
+            if !options.names_only && holds_its_own_library(&path) {
                 report.nested_libraries.push(relative_to(root, &path));
                 continue;
             }
@@ -355,6 +369,21 @@ fn walk_dir(root: &Path, dir: &Path, options: &ScanOptions, now: SystemTime, rep
 /// back is the undo.
 fn holds_its_own_library(dir: &Path) -> bool {
     dir.join("metadata.db").exists() || dir.join(LIBRARY_HANDLE_DIR_NAME).is_dir() || dir.join(crate::constants::LEGACY_LIBRARY_HANDLE_DIR_NAME).is_dir()
+}
+
+/// [`holds_its_own_library`], answered from the folder's own listing: it has a
+/// `metadata.db`, or a library state folder. Names are matched the way
+/// `Path::exists` matches them on the platform: ignoring case on Windows.
+fn lists_a_library(entries: &[std::io::Result<std::fs::DirEntry>]) -> bool {
+    let same = |a: &str, b: &str| if cfg!(windows) { a.eq_ignore_ascii_case(b) } else { a == b };
+    entries.iter().flatten().any(|e| {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { return false };
+        if same(name, "metadata.db") {
+            return true;
+        }
+        (same(name, LIBRARY_HANDLE_DIR_NAME) || same(name, crate::constants::LEGACY_LIBRARY_HANDLE_DIR_NAME)) && e.file_type().is_ok_and(|t| t.is_dir())
+    })
 }
 
 /// The real filename an iCloud placeholder stands in for.
@@ -633,6 +662,10 @@ mod tests {
         write(&dir.path().join("#recycle/Gone.pdf"), b"%PDF");
         write(&dir.path().join("nested/metadata.db"), b"db");
         write(&dir.path().join("nested/Inside.pdf"), b"%PDF");
+        write(&dir.path().join("nested2/.lexmechanic/state.json"), b"{}");
+        write(&dir.path().join("nested2/Inside2.pdf"), b"%PDF");
+        write(&dir.path().join("a/b/nested3/METADATA.DB"), b"db");
+        write(&dir.path().join("a/b/nested3/Inside3.pdf"), b"%PDF");
         write(&dir.path().join("data/attached.epub"), b"PK");
         write(&dir.path().join("z/.Evicted.pdf.icloud"), b"");
 
@@ -641,7 +674,13 @@ mod tests {
         let key = |r: &ScanReport| r.files.iter().map(|f| (f.relative_path.clone(), f.folder.clone(), f.stem.clone(), f.extension.clone())).collect::<Vec<_>>();
         assert_eq!(key(&names_only), key(&full));
         assert!(!names_only.files.is_empty());
-        assert_eq!(names_only.nested_libraries, full.nested_libraries);
+        let sorted = |v: &[String]| {
+            let mut v = v.to_vec();
+            v.sort();
+            v
+        };
+        assert_eq!(sorted(&names_only.nested_libraries), sorted(&full.nested_libraries));
+        assert_eq!(names_only.nested_libraries.len(), 3);
         assert_eq!(names_only.offline, full.offline);
         assert_eq!(names_only.is_complete(), full.is_complete());
     }

@@ -362,7 +362,12 @@ impl DiskView {
         let (dir, name) = Self::split(rel);
         let dir_key = if self.fold { dir.to_lowercase() } else { dir.to_string() };
         if !self.dirs.contains_key(&dir_key) {
-            let listing = match std::fs::read_dir(self.library.join(dir)) {
+            // A folder its parent's listing does not have is not there: no need to ask for it.
+            let absent_by_parent = !dir.is_empty() && matches!(self.entry(dir), Ok(None));
+            let listing = if absent_by_parent {
+                Listing::Absent
+            } else {
+                match std::fs::read_dir(self.library.join(dir)) {
                 Ok(rd) => {
                     let mut map = std::collections::HashMap::new();
                     let mut failed = false;
@@ -392,6 +397,7 @@ impl DiskView {
                 }
                 Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => Listing::Absent,
                 Err(_) => Listing::Unreadable,
+                }
             };
             self.dirs.insert(dir_key.clone(), listing);
         }
@@ -431,10 +437,17 @@ impl DiskView {
             let state = match self.links.get(&prefix) {
                 Some(s) => *s,
                 None => {
-                    let s = match std::fs::symlink_metadata(self.library.join(&prefix)) {
-                        Ok(m) if m.file_type().is_symlink() => LinkState::Link,
-                        Ok(_) => LinkState::Plain,
-                        Err(_) => LinkState::Missing,
+                    // From the folder's listing (one read per folder) rather than
+                    // an `lstat` per path; only an unreadable folder is asked about.
+                    let s = match self.entry(&prefix) {
+                        Ok(Some(EntryKind::Link)) => LinkState::Link,
+                        Ok(Some(_)) => LinkState::Plain,
+                        Ok(None) => LinkState::Missing,
+                        Err(()) => match std::fs::symlink_metadata(self.library.join(&prefix)) {
+                            Ok(m) if m.file_type().is_symlink() => LinkState::Link,
+                            Ok(_) => LinkState::Plain,
+                            Err(_) => LinkState::Missing,
+                        },
                     };
                     self.links.insert(prefix.clone(), s);
                     s
@@ -1134,9 +1147,20 @@ mod tests {
     fn the_disk_view_remembers_link_checks_per_prefix() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("real/inner")).unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        // A symlink needs a privilege on some systems; where it cannot be made, only the plain cases run.
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(elsewhere.path(), dir.path().join("link")).is_ok();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(elsewhere.path(), dir.path().join("link")).is_ok();
+        #[cfg(not(any(unix, windows)))]
+        let linked = false;
         let mut view = DiskView::new(dir.path());
-        for rel in ["real", "real/inner", "real/inner/new", "missing/deeper", ""] {
-            assert_eq!(view.passes_through_link(rel), passes_through_link(dir.path(), rel), "{rel}");
+        for rel in ["real", "real/inner", "real/inner/new", "missing/deeper", "", "link", "link/inner", "link/inner/deeper"] {
+            assert_eq!(view.passes_through_link(rel), passes_through_link(dir.path(), rel), "{rel} (symlink made: {linked})");
+        }
+        if linked {
+            assert!(view.passes_through_link("link/inner"));
         }
     }
 
