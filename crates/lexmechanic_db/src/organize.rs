@@ -1310,9 +1310,8 @@ mod tests {
         assert!(super::plan(&cache, "Sorted/{title}", &Scope::Ids(vec![alpha])).unwrap().books.is_empty());
     }
 
-    /// T29a #12: a book's `data/` attachments do not follow it, so the plan says so instead of
-    /// leaving them behind silently; a `data` folder that is another book's own folder is not
-    /// "attachments".
+    /// T29a #12 / T29d: a book's own `data/` attachments now move with it (and the plan says
+    /// so); a `data` folder that is another book's own folder is not "attachments".
     #[test]
     fn the_plan_names_attachments_that_would_stay_behind() {
         let (dir, cache) = library();
@@ -1323,10 +1322,11 @@ mod tests {
 
         let p = plan(&cache, "Sorted/{title}", &Scope::Ids(vec![alpha])).unwrap();
         assert_eq!(p.books.len(), 1);
-        assert!(p.warnings.iter().any(|w| w.book_id == alpha && w.reason.contains("inbox/data") && w.reason.contains("Sorted/data")), "{:?}", p.warnings);
+        let moved = p.books[0].data_dir.clone().expect("the attachments folder moves with the book");
+        assert_eq!(moved.from, "inbox/data");
         let report = execute(&cache, &p, &JobControl::new()).unwrap();
         assert_eq!(report.books_moved, 1);
-        assert!(dir.path().join("inbox/data/notes.xyz").is_file(), "left where it was, never deleted");
+        assert!(dir.path().join(&moved.to).join("notes.xyz").is_file(), "moved with the book, never deleted");
 
         // A book of its own at `<folder>/data` is not an attachments folder.
         let (dir, cache) = library();
