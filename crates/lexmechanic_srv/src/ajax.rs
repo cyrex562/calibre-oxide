@@ -142,7 +142,7 @@ pub(crate) async fn fetch_rows(state: &AppState, ids: HashSet<i32>) -> Result<Ve
 /// `Cache` via [`AppState::cache_for`] rather than always using the
 /// default [`AppState::cache`].
 pub(crate) async fn fetch_rows_from_cache(cache: std::sync::Arc<lexmechanic_db::cache::Cache>, ids: HashSet<i32>) -> Result<Vec<Value>, ServerError> {
-    tokio::task::spawn_blocking(move || cache.get_data_as_dict(None, false, Some(&ids), false))
+    tokio::task::spawn_blocking(move || cache.get_data_as_dict_unchecked(None, false, Some(&ids), false))
         .await
         .map_err(|e| ServerError::InternalServerError(e.to_string()))?
         .map_err(|e| ServerError::InternalServerError(e.to_string()))
@@ -203,8 +203,9 @@ impl FileSortData {
             data.names = cache.primary_file_names(None)?;
         }
         if fields.iter().any(|f| f == "folder") {
+            let store = cache.fields()?;
             for id in ids {
-                data.folders.insert(*id, cache.field_for(*id, "path")?.unwrap_or_default());
+                data.folders.insert(*id, store.field_for(*id, "path").unwrap_or_default());
             }
         }
         Ok(data)
@@ -227,14 +228,16 @@ async fn sort_keys(cache: &std::sync::Arc<lexmechanic_db::cache::Cache>, ids: Ha
     tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(i64, Vec<String>)>> {
         let files = FileSortData::load(&cache, &ids, &fields)?;
         if !fast {
-            let rows = cache.get_data_as_dict(None, false, Some(&ids), false)?;
+            // Only a sort on `formats` reads what is on disk.
+            let rows = if fields.iter().any(|f| f == "formats") { cache.get_data_as_dict(None, false, Some(&ids), false)? } else { cache.get_data_as_dict_unchecked(None, false, Some(&ids), false)? };
             return Ok(rows.iter().map(|r| (r["id"].as_i64().unwrap_or(0), fields.iter().map(|f| key_for(r, f, &files)).collect())).collect());
         }
         let mut ids: Vec<i32> = ids.into_iter().collect();
         ids.sort_unstable();
+        let store = cache.fields()?;
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
-            if let Some(row) = sort_row(&cache, id, &fields)? {
+            if let Some(row) = sort_row(&store, id, &fields)? {
                 out.push((id as i64, fields.iter().map(|f| key_for(&row, f, &files)).collect()));
             }
         }
@@ -245,11 +248,95 @@ async fn sort_keys(cache: &std::sync::Arc<lexmechanic_db::cache::Cache>, ids: Ha
     .map_err(|e| ServerError::InternalServerError(e.to_string()))
 }
 
+/// Whether comparing these keys as bytes orders them exactly as ICU collation
+/// would: every non-empty key has the same length and the same non-digit
+/// characters in the same places, so they differ only in digits, which both
+/// orders put in numeric order. That is the shape of the zero-padded numbers
+/// and fixed-format dates and times these columns hold. Anything else (a date
+/// with a different number of fractional digits, a sign) is left to ICU, where
+/// a punctuation character can sort differently from its byte value.
+fn bytewise_order_matches_icu<'a>(keys: impl Iterator<Item = &'a str>) -> bool {
+    let mut template: Option<&str> = None;
+    for key in keys {
+        if key.is_empty() {
+            continue;
+        }
+        match template {
+            None => template = Some(key),
+            Some(t) => {
+                if t.len() != key.len() || !t.bytes().zip(key.bytes()).all(|(a, b)| a == b || (a.is_ascii_digit() && b.is_ascii_digit())) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Sorts `keyed` by its keys, field by field. A column whose keys are
+/// numbers or dates of one fixed shape is compared as bytes (see
+/// [`bytewise_order_matches_icu`]), the rest with ICU collation. The sort is
+/// stable, so equal keys stay in the order they came in.
+fn sort_keyed(keyed: &mut [(i64, Vec<String>)], fields: usize, descending: bool) {
+    let bytewise: Vec<bool> = (0..fields).map(|j| bytewise_order_matches_icu(keyed.iter().map(|(_, keys)| keys[j].as_str()))).collect();
+    keyed.sort_by(|(_, a), (_, b)| {
+        for ((ka, kb), bytes) in a.iter().zip(b.iter()).zip(bytewise.iter()) {
+            let (x, y) = if descending { (kb, ka) } else { (ka, kb) };
+            let cmp = if *bytes { x.as_bytes().cmp(y.as_bytes()) } else { lexmechanic_utils::icu::strcmp(x, y) };
+            if cmp != std::cmp::Ordering::Equal {
+                return cmp;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+}
+
+/// The ids of `ids` in sort order. When the result is most of the library
+/// the order of the *whole* library is built once per library version and
+/// kept, and each search just filters it (a sub-sequence of a stable sort is
+/// the stable sort of the sub-set), so changing the query or paging does not
+/// sort again.
+async fn sorted_ids(cache: &std::sync::Arc<lexmechanic_db::cache::Cache>, ids: HashSet<i32>, fields: &[&str], descending: bool) -> Result<Vec<i64>, ServerError> {
+    let fast = fields.iter().all(|f| FAST_SORT_FIELDS.contains(f));
+    if !fast {
+        let mut keyed = sort_keys(cache, ids, fields).await?;
+        sort_keyed(&mut keyed, fields.len(), descending);
+        return Ok(keyed.into_iter().map(|(id, _)| id).collect());
+    }
+    let cache = cache.clone();
+    let field_list: Vec<String> = fields.iter().map(|f| f.to_string()).collect();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<i64>> {
+        let store = cache.fields()?;
+        let build = |ids: HashSet<i32>| -> anyhow::Result<Vec<i64>> {
+            let files = FileSortData::load(&cache, &ids, &field_list)?;
+            let mut ids: Vec<i32> = ids.into_iter().collect();
+            ids.sort_unstable();
+            let mut keyed = Vec::with_capacity(ids.len());
+            for id in ids {
+                if let Some(row) = sort_row(&store, id, &field_list)? {
+                    keyed.push((id as i64, field_list.iter().map(|f| key_for(&row, f, &files)).collect::<Vec<String>>()));
+                }
+            }
+            sort_keyed(&mut keyed, field_list.len(), descending);
+            Ok(keyed.into_iter().map(|(id, _)| id).collect())
+        };
+        if ids.len() * 4 < store.book_count() {
+            return build(ids);
+        }
+        let key = format!("sort:{}:{}", field_list.join(","), descending);
+        let everything = cache.cached_for_version(&key, store.version(), || build(cache.all_book_ids()?.into_iter().collect()))?;
+        Ok(everything.iter().copied().filter(|id| ids.contains(&(*id as i32))).collect())
+    })
+    .await
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))?
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))
+}
+
 /// The part of `get_data_as_dict`'s row that `fields` sort on, built the
 /// same way (same field, same parsing), so [`sort_key_for`] gives the same
 /// key. `None` for a book without a title.
-fn sort_row(cache: &lexmechanic_db::cache::Cache, id: i32, fields: &[String]) -> anyhow::Result<Option<Value>> {
-    let Some(title) = cache.field_for(id, "title")? else { return Ok(None) };
+fn sort_row(store: &lexmechanic_db::fields::FieldStore, id: i32, fields: &[String]) -> anyhow::Result<Option<Value>> {
+    let Some(title) = store.field_for(id, "title") else { return Ok(None) };
     let mut row = serde_json::Map::new();
     row.insert("id".into(), serde_json::json!(id));
     row.insert("title".into(), serde_json::json!(title));
@@ -263,12 +350,12 @@ fn sort_row(cache: &lexmechanic_db::cache::Cache, id: i32, fields: &[String]) ->
         let value = match stored {
             // The file-oriented fields are keyed by `key_for` from `FileSortData`.
             "id" | "folder" | "file_name" => continue,
-            "rating" | "series_index" => serde_json::json!(cache.field_for(id, stored)?.and_then(|s| s.parse::<f64>().ok())),
-            "size" => serde_json::json!(cache.field_for(id, stored)?.and_then(|s| s.parse::<i64>().ok())),
-            "isbn" | "identifiers" => serde_json::json!(cache.field_for(id, stored)?.unwrap_or_default()),
-            "tags" => serde_json::json!(cache.field_for(id, stored)?.map(|s| s.split(", ").map(|t| t.trim().to_string()).collect::<Vec<_>>()).unwrap_or_default()),
-            "languages" => serde_json::json!(cache.field_for(id, stored)?.map(|s| s.split(", ").map(str::to_string).collect::<Vec<_>>()).unwrap_or_default()),
-            _ => serde_json::json!(cache.field_for(id, stored)?),
+            "rating" | "series_index" => serde_json::json!(store.field_for(id, stored).and_then(|s| s.parse::<f64>().ok())),
+            "size" => serde_json::json!(store.field_for(id, stored).and_then(|s| s.parse::<i64>().ok())),
+            "isbn" | "identifiers" => serde_json::json!(store.field_for(id, stored).unwrap_or_default()),
+            "tags" => serde_json::json!(store.field_for(id, stored).map(|s| s.split(", ").map(|t| t.trim().to_string()).collect::<Vec<_>>()).unwrap_or_default()),
+            "languages" => serde_json::json!(store.field_for(id, stored).map(|s| s.split(", ").map(str::to_string).collect::<Vec<_>>()).unwrap_or_default()),
+            _ => serde_json::json!(store.field_for(id, stored)),
         };
         row.insert(stored.to_string(), value);
     }
@@ -336,11 +423,12 @@ pub struct BooksQuery {
 fn add_file_fields(cache: &lexmechanic_db::cache::Cache, rows: &mut [Value]) -> anyhow::Result<()> {
     let ids: Vec<i32> = rows.iter().filter_map(|r| r["id"].as_i64()).map(|i| i as i32).collect();
     let names = cache.primary_file_names(Some(&ids))?;
+    let store = cache.fields()?;
     for row in rows.iter_mut() {
         let Some(id) = row["id"].as_i64().map(|i| i as i32) else { continue };
         let Some(map) = row.as_object_mut() else { continue };
-        map.insert("size".into(), serde_json::json!(cache.field_for(id, "size")?.and_then(|s| s.parse::<i64>().ok())));
-        map.insert("folder".into(), serde_json::json!(cache.field_for(id, "path")?.unwrap_or_default()));
+        map.insert("size".into(), serde_json::json!(store.field_for(id, "size").and_then(|s| s.parse::<i64>().ok())));
+        map.insert("folder".into(), serde_json::json!(store.field_for(id, "path").unwrap_or_default()));
         map.insert("file_name".into(), serde_json::json!(names.get(&id)));
     }
     Ok(())
@@ -420,9 +508,10 @@ fn custom_category_names(cache: &lexmechanic_db::cache::Cache) -> std::collectio
 /// `GET /ajax/categories`. Port of `categories`, narrowed per module
 /// doc (no icons, no "All books"/"Newest" pseudo-entries).
 pub async fn categories_list(State(state): State<AppState>) -> Result<Json<Value>, ServerError> {
-    let cats = tokio::task::spawn_blocking({
+    // Only which categories have items is needed, not the items.
+    let keys = tokio::task::spawn_blocking({
         let cache = state.cache.clone();
-        move || categories::get_categories(&cache, "name", None)
+        move || categories::non_empty_category_keys(&cache)
     })
     .await
     .map_err(|e| ServerError::InternalServerError(e.to_string()))?
@@ -430,7 +519,7 @@ pub async fn categories_list(State(state): State<AppState>) -> Result<Json<Value
 
     let mut ans: Vec<Value> = Vec::new();
     for &(key, name) in crate::opds::CATEGORY_NAMES {
-        if cats.get(key).map(|v| v.is_empty()).unwrap_or(true) {
+        if !keys.iter().any(|k| k == key) {
             continue;
         }
         ans.push(serde_json::json!({
@@ -442,10 +531,7 @@ pub async fn categories_list(State(state): State<AppState>) -> Result<Json<Value
     // A normalized custom column (text, series, ...) with values is a category
     // too, keyed `#label`, shown under the column's own name.
     let names = custom_category_names(&state.cache);
-    for (key, items) in cats.iter().filter(|(k, _)| k.starts_with('#')) {
-        if items.is_empty() {
-            continue;
-        }
+    for key in keys.iter().filter(|k| k.starts_with('#')) {
         ans.push(serde_json::json!({
             "url": format!("/ajax/category/{key}"),
             "name": names.get(key.as_str()).cloned().unwrap_or_else(|| key.clone()),
@@ -488,21 +574,21 @@ pub async fn category(State(state): State<AppState>, Path(name): Path<String>, Q
         return Err(ServerError::NotFound(format!("Category {name:?} not found")));
     };
 
-    let mut cats = tokio::task::spawn_blocking({
+    // Only the requested category is built (and a standard one is kept until
+    // the library changes).
+    let cats = tokio::task::spawn_blocking({
         let cache = state.cache.clone();
         let sort = sort.to_string();
         let name = name.clone();
-        move || categories::get_categories(&cache, &sort, None).map(|m| m.get(&name).cloned().unwrap_or_default())
+        move || categories::get_category(&cache, &name, &sort, None).map(Option::unwrap_or_default)
     })
     .await
     .map_err(|e| ServerError::InternalServerError(e.to_string()))?
     .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
 
-    if sort_order == "desc" {
-        cats.reverse();
-    }
     let total_num = cats.len() as i64;
-    let page: Vec<_> = cats.into_iter().skip(offset.max(0) as usize).take(num.max(0) as usize).collect();
+    let (skip, take) = (offset.max(0) as usize, num.max(0) as usize);
+    let page: Vec<&categories::Tag> = if sort_order == "desc" { cats.iter().rev().skip(skip).take(take).collect() } else { cats.iter().skip(skip).take(take).collect() };
 
     let items: Vec<Value> = page
         .iter()
@@ -641,20 +727,12 @@ pub async fn search(State(state): State<AppState>, Query(q): Query<SearchQuery>)
     .into_iter()
     .collect();
 
-    // Each row's sort keys are built once, not once per comparison.
-    let mut keyed = sort_keys(&state.cache, ids, &sort_fields).await?;
-    keyed.sort_by(|(_, a), (_, b)| {
-        for (ka, kb) in a.iter().zip(b.iter()) {
-            let cmp = if sort_order == "asc" { lexmechanic_utils::icu::strcmp(ka, kb) } else { lexmechanic_utils::icu::strcmp(kb, ka) };
-            if cmp != std::cmp::Ordering::Equal {
-                return cmp;
-            }
-        }
-        std::cmp::Ordering::Equal
-    });
+    // Each row's sort keys are built once, not once per comparison, and the
+    // library's order for this sort is kept between requests.
+    let ordered = sorted_ids(&state.cache, ids, &sort_fields, sort_order != "asc").await?;
 
-    let total_num = keyed.len() as i64;
-    let page: Vec<i64> = keyed.into_iter().skip(offset.max(0) as usize).take(num.max(0) as usize).map(|(id, _)| id).collect();
+    let total_num = ordered.len() as i64;
+    let page: Vec<i64> = ordered.into_iter().skip(offset.max(0) as usize).take(num.max(0) as usize).collect();
 
     Ok(Json(serde_json::json!({
         "total_num": total_num,
@@ -1340,5 +1418,149 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["default_library"], super::LIBRARY_ID, "{body}");
         assert_eq!(body["library_map"].as_object().unwrap().len(), 1, "{body}");
+    }
+
+    // --- sorting: typed comparison and the kept order ---
+
+    /// The sort this module did before: every key through ICU collation.
+    fn icu_only_order(mut keyed: Vec<(i64, Vec<String>)>, descending: bool) -> Vec<i64> {
+        keyed.sort_by(|(_, a), (_, b)| {
+            for (ka, kb) in a.iter().zip(b.iter()) {
+                let cmp = if descending { lexmechanic_utils::icu::strcmp(kb, ka) } else { lexmechanic_utils::icu::strcmp(ka, kb) };
+                if cmp != std::cmp::Ordering::Equal {
+                    return cmp;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+        keyed.into_iter().map(|(id, _)| id).collect()
+    }
+
+    #[test]
+    fn bytewise_comparison_is_used_only_for_keys_of_one_fixed_shape() {
+        use super::bytewise_order_matches_icu as ok;
+        assert!(ok(["2020-01-02T03:04:05+00:00", "", "1999-12-31T23:59:59+00:00"].into_iter()));
+        assert!(ok(["0000000000000012.340000", "0000000000000002.500000"].into_iter()));
+        assert!(ok(std::iter::empty()));
+        assert!(!ok(["2020-01-02T03:04:05+00:00", "2020-01-02T03:04:05.123456+00:00"].into_iter()), "different fractional digits: '+' and '.' sort differently in ICU");
+        assert!(!ok(["2020-01-02T03:04:05+00:00", "2020-01-02T03:04:05-05:00"].into_iter()), "a sign differs");
+        assert!(!ok(["-000000000000001.000000", "0000000000000001.000000"].into_iter()));
+        assert!(!ok(["apple", "Apple"].into_iter()), "text is collated");
+    }
+
+    #[test]
+    fn typed_sort_orders_exactly_as_icu_collation_does() {
+        // A small deterministic generator, so a failure repeats.
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let words = ["apple", "Apple", "banana", "Éclair", "eclair", "zebra", "Zebra", "café", "cafe", "", "x-ray", "x ray"];
+        for shape in 0..3 {
+            let mut keyed: Vec<(i64, Vec<String>)> = Vec::new();
+            for id in 1..=300i64 {
+                let date = match shape {
+                    // One fixed shape: sorted bytewise.
+                    0 => format!("20{:02}-{:02}-{:02}T{:02}:{:02}:00+00:00", next(30), 1 + next(12), 1 + next(28), next(24), next(60)),
+                    // Mixed fractional digits and zones: left to ICU.
+                    1 => match next(3) {
+                        0 => format!("20{:02}-01-01T00:00:00+00:00", next(30)),
+                        1 => format!("20{:02}-01-01T00:00:00.{:06}+00:00", next(30), next(1_000_000)),
+                        _ => String::new(),
+                    },
+                    _ => format!("{:020.6}", next(5) as f64 / 2.0),
+                };
+                let num = format!("0{:020.6}", next(40) as f64 / 4.0);
+                keyed.push((id, vec![words[next(words.len() as u64) as usize].to_string(), date, num]));
+            }
+            for descending in [false, true] {
+                for columns in [1usize, 2, 3] {
+                    let want = icu_only_order(keyed.iter().map(|(id, k)| (*id, k[..columns].to_vec())).collect(), descending);
+                    let mut got: Vec<(i64, Vec<String>)> = keyed.iter().map(|(id, k)| (*id, k[..columns].to_vec())).collect();
+                    super::sort_keyed(&mut got, columns, descending);
+                    assert_eq!(got.into_iter().map(|(id, _)| id).collect::<Vec<_>>(), want, "shape {shape}, {columns} column(s), descending {descending}");
+                }
+            }
+        }
+    }
+
+    /// The order kept for the whole library, filtered by a search, is the
+    /// order of sorting that search's books alone -- and an edit is seen.
+    #[tokio::test]
+    async fn the_kept_library_order_filtered_equals_sorting_the_result_directly() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        let titles = ["The Zebra", "apple", "Apple", "Éclair", "banana", "A Cat", "Cat", "dog", "Dog Days", "emu", "Fox", "grape", "Hat", "ice", "Jam", "kite", "Lamp", "moon", "Nut", "owl"];
+        let ids: Vec<i32> = titles.iter().enumerate().map(|(i, t)| add_test_book(dir.path(), &cache, t, if i % 3 == 0 { "Same Author" } else { "Other Person" })).collect();
+        for (i, id) in ids.iter().enumerate() {
+            cache.set_field(*id, "pubdate", &format!("20{:02}-0{}-1{}T00:00:00+00:00", 10 + (i * 7) % 13, 1 + i % 9, i % 10)).unwrap();
+            cache.set_field(*id, "rating", &((i % 6) * 2).to_string()).unwrap();
+        }
+        let cache = std::sync::Arc::new(cache);
+        for fields in [vec!["title"], vec!["authors", "title"], vec!["pubdate"], vec!["rating", "title"], vec!["size"]] {
+            for descending in [false, true] {
+                let everything: std::collections::HashSet<i32> = ids.iter().copied().collect();
+                let many: std::collections::HashSet<i32> = ids.iter().copied().filter(|i| i % 3 != 0).collect();
+                let few: std::collections::HashSet<i32> = ids.iter().copied().take(4).collect();
+                for subset in [&everything, &many, &few] {
+                    let want = icu_only_order(super::sort_keys(&cache, subset.clone(), &fields).await.unwrap(), descending);
+                    let got = super::sorted_ids(&cache, subset.clone(), &fields, descending).await.unwrap();
+                    assert_eq!(got, want, "{fields:?} descending {descending} over {} books", subset.len());
+                }
+            }
+        }
+        // An edit moves the book, in the kept order too.
+        let all: std::collections::HashSet<i32> = ids.iter().copied().collect();
+        let before = super::sorted_ids(&cache, all.clone(), &["title"], false).await.unwrap();
+        cache.set_field(ids[0], "title", "AAA first").unwrap();
+        let after = super::sorted_ids(&cache, all.clone(), &["title"], false).await.unwrap();
+        assert_ne!(before, after);
+        assert_eq!(after[0], ids[0] as i64);
+        assert_eq!(after, icu_only_order(super::sort_keys(&cache, all, &["title"]).await.unwrap(), false));
+    }
+
+    /// Only the requested category is built, and the list of categories is
+    /// the same one the full computation gave.
+    #[tokio::test]
+    async fn category_endpoints_answer_from_one_category_and_agree_with_the_full_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        let a = add_test_book(dir.path(), &cache, "One", "Ann Author");
+        let b = add_test_book(dir.path(), &cache, "Two", "Ann Author");
+        add_test_book(dir.path(), &cache, "Three", "Émile Zola");
+        cache.set_field(a, "tags", "red, blue").unwrap();
+        cache.set_field(b, "tags", "red").unwrap();
+        let state = crate::AppState { libraries: None, cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()), book_cache: std::sync::Arc::new(crate::books_cache::BookCache::open_temp()), jobs: std::sync::Arc::new(crate::jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))), render_jobs: std::sync::Arc::new(crate::render_endpoints::RenderJobRegistry::new()), conversion_jobs: std::sync::Arc::new(crate::convert::ConversionJobRegistry::new()), news_jobs: std::sync::Arc::new(crate::news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()), tts_voice: None, plugin_store: None, plugin_registry: std::sync::Arc::new(std::sync::Mutex::new(lexmechanic_customize::registry::PluginRegistry::new())), };
+        let full = lexmechanic_db::categories::get_categories(&state.cache, "name", None).unwrap();
+        let cache_handle = state.cache.clone();
+        let router = crate::test_router(state);
+
+        let (status, list) = get_json(&router, "/ajax/categories").await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        let urls: Vec<&str> = list.as_array().unwrap().iter().map(|c| c["url"].as_str().unwrap()).collect();
+        let want: Vec<String> = crate::opds::CATEGORY_NAMES.iter().filter(|(k, _)| full.get(*k).is_some_and(|v| !v.is_empty())).map(|(k, _)| format!("/ajax/category/{k}")).collect();
+        assert_eq!(urls, want.iter().map(String::as_str).collect::<Vec<_>>());
+        assert!(!urls.contains(&"/ajax/category/series"), "an empty category is not listed");
+
+        for (name, sort_order) in [("authors", "asc"), ("authors", "desc"), ("tags", "asc")] {
+            let (status, body) = get_json(&router, &format!("/ajax/category/{name}?sort_order={sort_order}")).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let mut expected: Vec<(String, usize)> = full[name].iter().map(|t| (t.name.clone(), t.count)).collect();
+            if sort_order == "desc" {
+                expected.reverse();
+            }
+            let got: Vec<(String, usize)> = body["items"].as_array().unwrap().iter().map(|i| (i["name"].as_str().unwrap().to_string(), i["count"].as_u64().unwrap() as usize)).collect();
+            assert_eq!(got, expected, "{name} {sort_order}");
+            assert_eq!(body["total_num"], expected.len());
+        }
+        // A write is seen by the next request, not an old kept answer.
+        let (_, before) = get_json(&router, "/ajax/category/tags").await;
+        assert_eq!(before["total_num"], 2);
+        cache_handle.set_field(a, "tags", "red, blue, green").unwrap();
+        let (_, after) = get_json(&router, "/ajax/category/tags").await;
+        assert_eq!(after["total_num"], 3, "{after}");
     }
 }

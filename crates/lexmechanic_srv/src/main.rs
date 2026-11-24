@@ -139,6 +139,15 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let cache = Arc::new(Cache::new(&cli.library_path)?);
+    // Load the field snapshot now, in the background, rather than on the first
+    // request (a large library takes a good half second to read in). A request
+    // that arrives meanwhile waits for it instead of starting a second load.
+    {
+        let cache = cache.clone();
+        std::thread::spawn(move || {
+            let _ = cache.fields();
+        });
+    }
     // calibre expires its trash on open. Off the main path: a library with a
     // lot in its trash must not delay the server, and on a share every
     // removal is a round trip.

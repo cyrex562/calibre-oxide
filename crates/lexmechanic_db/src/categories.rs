@@ -172,54 +172,115 @@ fn category_tables(conn: &rusqlite::Connection, key: &str) -> Result<Option<(Str
     Ok(None)
 }
 
+/// `book -> rating` for every rated book (the average rating of an item
+/// is taken over these).
+fn all_ratings(conn: &rusqlite::Connection) -> Result<HashMap<i32, i32>> {
+    let mut ratings: HashMap<i32, i32> = HashMap::new();
+    let mut stmt = conn.prepare(
+        "SELECT books_ratings_link.book, ratings.rating          FROM books_ratings_link JOIN ratings ON ratings.id = books_ratings_link.rating",
+    )?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, i32>(0)?, row.get::<_, i32>(1)?)))?;
+    for row in rows {
+        let (book_id, rating) = row?;
+        ratings.insert(book_id, rating);
+    }
+    Ok(ratings)
+}
+
+fn check_sort(sort: &str) -> Result<()> {
+    if !matches!(sort, "name" | "popularity" | "rating") {
+        bail!("sort {sort} not a valid value");
+    }
+    Ok(())
+}
+
+/// One category's items, sorted. The database is read under the connection
+/// lock, which is released before the (comparatively slow) collation sort.
+/// `None` when `key` is neither a standard category nor a normalized custom
+/// column.
+fn compute_category(cache: &Cache, key: &str, sort: &str, book_ids: Option<&HashSet<i32>>) -> Result<Option<Vec<Tag>>> {
+    let mut tags = {
+        let conn = cache.backend.conn.lock().unwrap();
+        let Some((link_table, link_column, item_table, name_column)) = category_tables(&conn, key)? else {
+            return Ok(None);
+        };
+        let ratings = all_ratings(&conn)?;
+        category_from_link_table(&conn, &link_table, &link_column, &item_table, &name_column, book_ids, &ratings)?
+    };
+    sort_tags(&mut tags, sort);
+    Ok(Some(tags))
+}
+
+/// One category (a standard key or a normalized custom column's `#label`),
+/// computed alone rather than with every other category as
+/// [`get_categories`] does. A standard category over the whole library is
+/// kept until a write changes the library's fields (so paging through it, or
+/// switching between categories, does not redo the query and the sort); a
+/// custom column's and any `book_ids`-restricted one is computed each time.
+/// `None` for an unknown key.
+pub fn get_category(cache: &Cache, key: &str, sort: &str, book_ids: Option<&HashSet<i32>>) -> Result<Option<std::sync::Arc<Vec<Tag>>>> {
+    check_sort(sort)?;
+    let standard = STANDARD_CATEGORIES.iter().any(|(k, ..)| *k == key);
+    if standard && book_ids.is_none() {
+        let version = cache.fields()?.version();
+        let cached = cache.cached_for_version(&format!("category:{key}:{sort}"), version, || Ok::<_, anyhow::Error>(compute_category(cache, key, sort, None)?.unwrap_or_default()))?;
+        return Ok(Some(cached));
+    }
+    Ok(compute_category(cache, key, sort, book_ids)?.map(std::sync::Arc::new))
+}
+
+/// The keys of the categories that have at least one item, in display order
+/// (the standard ones, then normalized custom columns), without building any
+/// of them: one `EXISTS` per category.
+pub fn non_empty_category_keys(cache: &Cache) -> Result<Vec<String>> {
+    let conn = cache.backend.conn.lock().unwrap();
+    let mut keys = Vec::new();
+    let exists = |link_table: &str, link_column: &str, item_table: &str| -> Result<bool> {
+        let sql = format!("SELECT EXISTS (SELECT 1 FROM {link_table} JOIN {item_table} ON {item_table}.id = {link_table}.{link_column})");
+        Ok(conn.query_row(&sql, [], |r| r.get::<_, i64>(0))? != 0)
+    };
+    for &(key, link_table, link_column, item_table, _) in STANDARD_CATEGORIES {
+        if exists(link_table, link_column, item_table)? {
+            keys.push(key.to_string());
+        }
+    }
+    for def in crate::custom_columns::all_columns(&conn)?.into_iter().filter(|d| d.normalized) {
+        if exists(&def.link_table(), "value", &def.table())? {
+            keys.push(format!("#{}", def.label));
+        }
+    }
+    Ok(keys)
+}
+
 /// Real per-category, per-item tag-browser data. `sort` must be one
 /// of `"name"` (default upstream)/`"popularity"`/`"rating"`, matching
 /// upstream's `CATEGORY_SORTS`; anything else is an error, same as
 /// upstream's own `raise ValueError`. `book_ids` restricts the count
 /// to a subset of books (e.g. a search result), matching upstream's
 /// own optional filter.
+///
+/// Builds every category; a caller that wants one should use
+/// [`get_category`].
 pub fn get_categories(cache: &Cache, sort: &str, book_ids: Option<&HashSet<i32>>) -> Result<IndexMap<String, Vec<Tag>>> {
-    if !matches!(sort, "name" | "popularity" | "rating") {
-        bail!("sort {sort} not a valid value");
-    }
-
-    let conn = cache.backend.conn.lock().unwrap();
-
-    let mut ratings: HashMap<i32, i32> = HashMap::new();
-    {
-        let mut stmt = conn.prepare(
-            "SELECT books_ratings_link.book, ratings.rating \
-             FROM books_ratings_link JOIN ratings ON ratings.id = books_ratings_link.rating",
-        )?;
-        let rows = stmt.query_map([], |row| Ok((row.get::<_, i32>(0)?, row.get::<_, i32>(1)?)))?;
-        for row in rows {
-            let (book_id, rating) = row?;
-            ratings.insert(book_id, rating);
-        }
-    }
+    check_sort(sort)?;
 
     let mut categories = IndexMap::new();
-    for &(key, link_table, link_column, item_table, name_column) in STANDARD_CATEGORIES {
-        let mut tags = category_from_link_table(
-            &conn,
-            link_table,
-            link_column,
-            item_table,
-            name_column,
-            book_ids,
-            &ratings,
-        )?;
-        sort_tags(&mut tags, sort);
+    for &(key, ..) in STANDARD_CATEGORIES {
+        let tags = get_category(cache, key, sort, book_ids)?.map(|t| t.as_ref().clone()).unwrap_or_default();
         categories.insert(key.to_string(), tags);
     }
 
     // Every normalized custom column is a category too (`#label`), as
     // upstream's `is_category` flag on a normalized column makes it: its
     // items are the value table's rows, its books the link table's.
-    for def in crate::custom_columns::all_columns(&conn)?.into_iter().filter(|d| d.normalized) {
-        let mut tags = category_from_link_table(&conn, &def.link_table(), "value", &def.table(), "value", book_ids, &ratings)?;
-        sort_tags(&mut tags, sort);
-        categories.insert(format!("#{}", def.label), tags);
+    let labels: Vec<String> = {
+        let conn = cache.backend.conn.lock().unwrap();
+        crate::custom_columns::all_columns(&conn)?.into_iter().filter(|d| d.normalized).map(|d| d.label).collect()
+    };
+    for label in labels {
+        let key = format!("#{label}");
+        let tags = get_category(cache, &key, sort, book_ids)?.map(|t| t.as_ref().clone()).unwrap_or_default();
+        categories.insert(key, tags);
     }
 
     Ok(categories)

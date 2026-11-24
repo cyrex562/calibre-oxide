@@ -310,7 +310,13 @@ pub struct Cache {
     /// How many times the whole snapshot has been (re)loaded, as opposed to
     /// patched for the books a write touched.
     field_full_loads: std::sync::atomic::AtomicUsize,
+    /// Results derived from the field snapshot that are costly to rebuild
+    /// (a sorted id order, the category lists), each valid for one
+    /// `FieldStore::version`. See `Cache::cached_for_version`.
+    derived_results: Mutex<HashMap<String, std::sync::Arc<DerivedSlot>>>,
 }
+
+type DerivedSlot = Mutex<Option<(u64, std::sync::Arc<dyn std::any::Any + Send + Sync>)>>;
 
 impl Cache {
     pub fn new<P: AsRef<Path>>(library_path: P) -> Result<Self> {
@@ -328,7 +334,33 @@ impl Cache {
             backend,
             field_cache: Mutex::new(None),
             field_full_loads: std::sync::atomic::AtomicUsize::new(0),
+            derived_results: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The result `build` makes for `key`, kept for as long as `version`
+    /// (from `FieldStore::version`) stays the same. Callers asking for the
+    /// same key at the same time share one `build`: the second waits for the
+    /// first rather than repeating the work.
+    pub fn cached_for_version<T: Send + Sync + 'static, E>(&self, key: &str, version: u64, build: impl FnOnce() -> std::result::Result<T, E>) -> std::result::Result<std::sync::Arc<T>, E> {
+        let slot = {
+            let mut map = self.derived_results.lock().unwrap();
+            if map.len() >= 32 && !map.contains_key(key) {
+                map.clear();
+            }
+            std::sync::Arc::clone(map.entry(key.to_string()).or_default())
+        };
+        let mut guard = slot.lock().unwrap();
+        if let Some((v, value)) = guard.as_ref() {
+            if *v == version {
+                if let Ok(hit) = std::sync::Arc::clone(value).downcast::<T>() {
+                    return Ok(hit);
+                }
+            }
+        }
+        let built = std::sync::Arc::new(build()?);
+        *guard = Some((version, built.clone() as std::sync::Arc<dyn std::any::Any + Send + Sync>));
+        Ok(built)
     }
 
     /// Forces the next [`Cache::field_for`] call to reload the field
@@ -686,10 +718,29 @@ impl Cache {
     /// process is caught by `PRAGMA data_version` and reloads everything.
     /// See `field_feed`.
     fn with_field_store<T>(&self, f: impl FnOnce(&FieldStore) -> T) -> Result<T> {
+        let store = self.fields()?;
+        Ok(f(&store))
+    }
+
+    /// An up-to-date snapshot of the standard fields, to read many values
+    /// from without paying the freshness check (a `PRAGMA data_version` query
+    /// and two locks) per value. Take one per request or operation, then loop
+    /// over it with [`Cache::field_in`]. The connection lock is held only while
+    /// the snapshot is brought up to date, never while it is read, so other
+    /// requests are not held up by a long scan; a write made after the
+    /// snapshot was taken is not in it.
+    pub fn fields(&self) -> Result<std::sync::Arc<FieldStore>> {
         let conn = self.backend.conn.lock().unwrap();
         let mut guard = self.field_cache.lock().unwrap();
-        let store = crate::field_feed::refresh(&mut guard, &conn, &self.backend.field_feed, &self.field_full_loads)?;
-        Ok(f(store))
+        crate::field_feed::refresh(&mut guard, &conn, &self.backend.field_feed, &self.field_full_loads)
+    }
+
+    /// [`Cache::field_for`] against a snapshot from [`Cache::fields`].
+    pub fn field_in(&self, store: &FieldStore, book_id: i32, field_name: &str) -> Result<Option<String>> {
+        if field_name == "id" || field_name.starts_with('#') {
+            return self.field_for(book_id, field_name);
+        }
+        Ok(store.field_for(book_id, field_name))
     }
 
     pub fn library_id(&self) -> String {
@@ -2314,6 +2365,60 @@ impl Cache {
         ids: Option<&std::collections::HashSet<i32>>,
         convert_to_local_tz: bool,
     ) -> anyhow::Result<Vec<serde_json::Value>> {
+        self.data_as_dict(prefix, authors_as_string, ids, convert_to_local_tz, true)
+    }
+
+    /// [`Cache::get_data_as_dict`] for rows that are shown, not opened: the
+    /// formats and the cover are taken from what the database records instead
+    /// of checking each file on disk, so building a page of rows costs no
+    /// per-file calls (on a network share each one is a round trip). A format
+    /// whose file has gone missing still appears in `formats` and `fmt_*`
+    /// here; it does not in [`Cache::get_data_as_dict`]. `available_formats`
+    /// is the same in both. The `cover` path is the sidecar location, without
+    /// looking for a legacy `cover.jpg` beside the book.
+    pub fn get_data_as_dict_unchecked(
+        &self,
+        prefix: Option<&Path>,
+        authors_as_string: bool,
+        ids: Option<&std::collections::HashSet<i32>>,
+        convert_to_local_tz: bool,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        self.data_as_dict(prefix, authors_as_string, ids, convert_to_local_tz, false)
+    }
+
+    /// `has_cover` per book and each book's `(format, name)` data rows (in
+    /// row order), for `book_ids`, in a few queries instead of two per book.
+    #[allow(clippy::type_complexity)]
+    fn cover_flags_and_format_rows(&self, book_ids: &[i32]) -> anyhow::Result<(HashMap<i32, bool>, HashMap<i32, Vec<(String, String)>>)> {
+        let mut covers = HashMap::with_capacity(book_ids.len());
+        let mut formats: HashMap<i32, Vec<(String, String)>> = HashMap::new();
+        let conn = self.backend.conn.lock().unwrap();
+        for chunk in book_ids.chunks(500) {
+            let marks = vec!["?"; chunk.len()].join(",");
+            let mut stmt = conn.prepare_cached(&format!("SELECT id, has_cover FROM books WHERE id IN ({marks})"))?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| Ok((r.get::<_, i32>(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(0) != 0)))?;
+            for row in rows {
+                let (id, has) = row?;
+                covers.insert(id, has);
+            }
+            let mut stmt = conn.prepare_cached(&format!("SELECT book, format, name FROM data WHERE book IN ({marks}) ORDER BY id"))?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+            for row in rows {
+                let (book, fmt, name) = row?;
+                formats.entry(book).or_default().push((fmt, name));
+            }
+        }
+        Ok((covers, formats))
+    }
+
+    fn data_as_dict(
+        &self,
+        prefix: Option<&Path>,
+        authors_as_string: bool,
+        ids: Option<&std::collections::HashSet<i32>>,
+        convert_to_local_tz: bool,
+        check_disk: bool,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
         let library_path = self.backend.library_path.clone();
         let prefix = prefix
             .map(|p| p.to_path_buf())
@@ -2329,9 +2434,15 @@ impl Cache {
             None => self.all_book_ids()?,
         };
 
+        // One snapshot for every field of every row, and the per-book facts
+        // that live outside it (cover flag, format files) fetched for the
+        // whole window at once rather than with two queries per book.
+        let store = self.fields()?;
+        let (has_cover_by_book, formats_by_book) = self.cover_flags_and_format_rows(&book_ids)?;
+
         let mut out = Vec::with_capacity(book_ids.len());
         for book_id in book_ids {
-            let Some(title) = self.field_for(book_id, "title")? else {
+            let Some(title) = store.field_for(book_id, "title") else {
                 continue;
             };
             let mut x = serde_json::Map::new();
@@ -2339,56 +2450,53 @@ impl Cache {
             x.insert("title".into(), serde_json::json!(title));
             x.insert(
                 "sort".into(),
-                serde_json::json!(self.field_for(book_id, "sort")?),
+                serde_json::json!(store.field_for(book_id, "sort")),
             );
             x.insert(
                 "author_sort".into(),
-                serde_json::json!(self.field_for(book_id, "author_sort")?),
+                serde_json::json!(store.field_for(book_id, "author_sort")),
             );
             x.insert(
                 "publisher".into(),
-                serde_json::json!(self.field_for(book_id, "publisher")?),
+                serde_json::json!(store.field_for(book_id, "publisher")),
             );
             x.insert(
                 "rating".into(),
-                serde_json::json!(self
-                    .field_for(book_id, "rating")?
+                serde_json::json!(store.field_for(book_id, "rating")
                     .and_then(|s| s.parse::<f64>().ok())),
             );
             x.insert(
                 "size".into(),
-                serde_json::json!(self
-                    .field_for(book_id, "size")?
+                serde_json::json!(store.field_for(book_id, "size")
                     .and_then(|s| s.parse::<i64>().ok())),
             );
             x.insert(
                 "series".into(),
-                serde_json::json!(self.field_for(book_id, "series")?),
+                serde_json::json!(store.field_for(book_id, "series")),
             );
             x.insert(
                 "series_index".into(),
-                serde_json::json!(self
-                    .field_for(book_id, "series_index")?
+                serde_json::json!(store.field_for(book_id, "series_index")
                     .and_then(|s| s.parse::<f64>().ok())),
             );
             x.insert(
                 "uuid".into(),
-                serde_json::json!(self.field_for(book_id, "uuid")?),
+                serde_json::json!(store.field_for(book_id, "uuid")),
             );
             x.insert(
                 "comments".into(),
-                serde_json::json!(self.field_for(book_id, "comments")?),
+                serde_json::json!(store.field_for(book_id, "comments")),
             );
             x.insert(
                 "isbn".into(),
-                serde_json::json!(self.field_for(book_id, "isbn")?.unwrap_or_default()),
+                serde_json::json!(store.field_for(book_id, "isbn").unwrap_or_default()),
             );
             x.insert(
                 "identifiers".into(),
-                serde_json::json!(self.field_for(book_id, "identifiers")?.unwrap_or_default()),
+                serde_json::json!(store.field_for(book_id, "identifiers").unwrap_or_default()),
             );
 
-            let authors: Vec<String> = match self.field_for(book_id, "authors")? {
+            let authors: Vec<String> = match store.field_for(book_id, "authors") {
                 Some(s) if !s.is_empty() => s.split(" & ").map(|a| a.to_string()).collect(),
                 _ => vec!["Unknown".to_string()],
             };
@@ -2401,20 +2509,18 @@ impl Cache {
                 },
             );
 
-            let tags: Vec<String> = self
-                .field_for(book_id, "tags")?
+            let tags: Vec<String> = store.field_for(book_id, "tags")
                 .map(|s| s.split(", ").map(|t| t.trim().to_string()).collect())
                 .unwrap_or_default();
             x.insert("tags".into(), serde_json::json!(tags));
 
-            let languages: Vec<String> = self
-                .field_for(book_id, "languages")?
+            let languages: Vec<String> = store.field_for(book_id, "languages")
                 .map(|s| s.split(", ").map(|t| t.to_string()).collect())
                 .unwrap_or_default();
             x.insert("languages".into(), serde_json::json!(languages));
 
             for field in ["timestamp", "pubdate", "last_modified"] {
-                let raw = self.field_for(book_id, field)?;
+                let raw = store.field_for(book_id, field);
                 let value = if convert_to_local_tz {
                     raw.as_deref()
                         .and_then(|s| lexmechanic_utils::date::parse_date(s, true))
@@ -2425,18 +2531,8 @@ impl Cache {
                 x.insert(field.into(), serde_json::json!(value));
             }
 
-            let path_rel = self.field_for(book_id, "path")?.unwrap_or_default();
-            let has_cover: bool = {
-                let conn = self.backend.conn.lock().unwrap();
-                conn.query_row(
-                    "SELECT has_cover FROM books WHERE id = ?1",
-                    [book_id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()?
-                .unwrap_or(0)
-                    != 0
-            };
+            let path_rel = store.field_for(book_id, "path").unwrap_or_default();
+            let has_cover = has_cover_by_book.get(&book_id).copied().unwrap_or(false);
             x.insert(
                 "cover".into(),
                 serde_json::json!(if has_cover {
@@ -2444,8 +2540,13 @@ impl Cache {
                     // or a legacy `<folder>/cover.jpg` (see `covers::cover_path`).
                     // Hard-coding `<folder>/cover.jpg` 404'd every cover in a
                     // scanned library. Re-rooted under `prefix` like the rest.
-                    let real = crate::covers::cover_path(self, book_id)
-                        .unwrap_or_else(|_| library_path.join(&path_rel).join("cover.jpg"));
+                    let located = if check_disk {
+                        crate::covers::cover_path(self, book_id)
+                    } else {
+                        // From the snapshot's uuid: no query, no stat.
+                        store.field_for(book_id, "uuid").filter(|u| !u.is_empty()).map(|u| crate::covers::sidecar_cover_path_for_uuid(&library_path, &u)).ok_or_else(|| anyhow::anyhow!("book {book_id} has no uuid to key its cover by"))
+                    };
+                    let real = located.unwrap_or_else(|_| library_path.join(&path_rel).join("cover.jpg"));
                     let rel = real.strip_prefix(&library_path).map(Path::to_path_buf).unwrap_or(real);
                     Some(prefix.join(rel).to_string_lossy().to_string())
                 } else {
@@ -2464,16 +2565,9 @@ impl Cache {
             // Every route that serves a book (`/get/{fmt}`, convert,
             // open-externally, download) reads these keys, so all of
             // them 404'd at once.
-            let mut data_formats: Vec<(String, String)> = Vec::new();
-            {
-                let conn = self.backend.conn.lock().unwrap();
-                let mut stmt = conn.prepare("SELECT format, name FROM data WHERE book = ?1")?;
-                let rows = stmt.query_map([book_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
-                for row in rows {
-                    data_formats.push(row?);
-                }
-            }
-            for (fmt, stem) in &data_formats {
+            let no_formats = Vec::new();
+            let data_formats = formats_by_book.get(&book_id).unwrap_or(&no_formats);
+            for (fmt, stem) in data_formats {
                 available_formats.push(fmt.to_uppercase());
                 // An older row, or one written before `name` was
                 // populated, falls back to the title -- which is what
@@ -2481,7 +2575,7 @@ impl Cache {
                 let stem = if stem.is_empty() { sanitize_file_name(&title) } else { stem.clone() };
                 let file_name = format!("{}.{}", stem, fmt.to_lowercase());
                 let abs_path = library_path.join(&path_rel).join(&file_name);
-                if abs_path.exists() {
+                if !check_disk || abs_path.exists() {
                     let out_path = if prefix != library_path {
                         match abs_path.strip_prefix(&library_path) {
                             Ok(rel) => prefix.join(rel),
@@ -5565,5 +5659,85 @@ mod tests {
             ops.iter().any(|op| matches!(op, crate::change_log::ChangeOp::CustomColumnRemoved { label } if label == "shelf")),
             "{ops:?}"
         );
+    }
+
+    // --- field snapshot, derived-result cache and listing rows ---
+
+    fn three_books_with_files(dir: &Path, cache: &Cache) -> Vec<i32> {
+        let mut ids = Vec::new();
+        for (i, title) in ["Alpha", "Bravo", "Charlie"].iter().enumerate() {
+            let source = write_temp_file(dir, &format!("src{i}.epub"), b"epub bytes");
+            let mut meta = MetaInformation::default();
+            meta.title = title.to_string();
+            meta.authors = vec![format!("Author {i}")];
+            ids.push(cache.add_book(&source, &meta).unwrap());
+        }
+        let pdf = write_temp_file(dir, "extra.pdf", b"%PDF-1.4");
+        cache.add_format(ids[1], &pdf, "PDF", true).unwrap();
+        crate::covers::set_cover(cache, ids[0], b"jpeg bytes").unwrap();
+        cache.set_field(ids[2], "tags", "one, two").unwrap();
+        ids
+    }
+
+    #[test]
+    fn unchecked_rows_are_the_checked_rows_when_every_file_is_there() {
+        let (dir, cache) = open_test_cache();
+        let ids = three_books_with_files(dir.path(), &cache);
+        assert_eq!(cache.get_data_as_dict_unchecked(None, false, None, false).unwrap(), cache.get_data_as_dict(None, false, None, false).unwrap());
+        let some: std::collections::HashSet<i32> = [ids[0], ids[2]].into_iter().collect();
+        assert_eq!(cache.get_data_as_dict_unchecked(None, true, Some(&some), true).unwrap(), cache.get_data_as_dict(None, true, Some(&some), true).unwrap());
+    }
+
+    #[test]
+    fn unchecked_rows_list_a_format_whose_file_is_gone_and_checked_rows_do_not() {
+        let (dir, cache) = open_test_cache();
+        let ids = three_books_with_files(dir.path(), &cache);
+        let path_rel = cache.field_for(ids[1], "path").unwrap().unwrap_or_default();
+        let name = cache.format_files(ids[1]).unwrap().into_iter().find(|(_, f)| f.eq_ignore_ascii_case("pdf")).unwrap().0;
+        std::fs::remove_file(cache.backend.library_path.join(path_rel).join(format!("{name}.pdf"))).unwrap();
+
+        let checked = cache.get_data_as_dict(None, false, Some(&[ids[1]].into_iter().collect()), false).unwrap();
+        let unchecked = cache.get_data_as_dict_unchecked(None, false, Some(&[ids[1]].into_iter().collect()), false).unwrap();
+        assert_eq!(checked[0]["available_formats"], unchecked[0]["available_formats"], "the formats the library records do not depend on the disk");
+        assert!(checked[0].get("fmt_pdf").is_none());
+        assert!(unchecked[0].get("fmt_pdf").is_some());
+        assert_eq!(checked[0]["formats"].as_array().unwrap().len(), 1);
+        assert_eq!(unchecked[0]["formats"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_field_snapshot_keeps_its_values_across_a_later_write_and_the_next_one_sees_it() {
+        let (_dir, cache) = open_test_cache();
+        let id = insert_book(&cache, "Before");
+        let first = cache.fields().unwrap();
+        assert_eq!(cache.fields().unwrap().version(), first.version(), "nothing changed: the same snapshot version");
+        cache.set_field(id, "title", "After").unwrap();
+        assert_eq!(cache.field_in(&first, id, "title").unwrap().as_deref(), Some("Before"), "a snapshot already taken does not move");
+        let second = cache.fields().unwrap();
+        assert_eq!(cache.field_in(&second, id, "title").unwrap().as_deref(), Some("After"));
+        assert_ne!(first.version(), second.version());
+        assert_eq!(cache.field_cache_full_loads(), 1, "patched, not reloaded");
+    }
+
+    #[test]
+    fn a_derived_result_is_rebuilt_only_when_the_version_changes_and_built_once_when_asked_together() {
+        let (_dir, cache) = open_test_cache();
+        let cache = std::sync::Arc::new(cache);
+        let builds = std::sync::atomic::AtomicUsize::new(0);
+        let build = || {
+            builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            Ok::<_, rusqlite::Error>(vec![1, 2, 3])
+        };
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| assert_eq!(*cache.cached_for_version("k", 7, build).unwrap(), vec![1, 2, 3]));
+            }
+        });
+        assert_eq!(builds.load(std::sync::atomic::Ordering::SeqCst), 1, "four callers at once share one build");
+        cache.cached_for_version("k", 7, build).unwrap();
+        assert_eq!(builds.load(std::sync::atomic::Ordering::SeqCst), 1, "same version: served from the cache");
+        cache.cached_for_version("k", 8, build).unwrap();
+        assert_eq!(builds.load(std::sync::atomic::Ordering::SeqCst), 2, "new version: rebuilt");
     }
 }
