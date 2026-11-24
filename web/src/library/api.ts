@@ -5,6 +5,8 @@
 
 import { markLibraryChanged } from "./libraryEpoch";
 import type { AbsorbReport, AbsorbableList } from "./absorb";
+import { BatchUnsupportedError, type BatchGroup, type BatchResponse } from "./bulkBatch";
+import { parseChangeLogStatus, type ChangeLogStatus } from "./changeLog";
 import { importBody, type ImportFolderRequest, type ImportReport } from "./importFolder";
 import type { UntrackedCount } from "./scanPrompt";
 import { parseStorageInfo, type StorageInfo } from "./storageBanner";
@@ -59,7 +61,8 @@ export function search(p: SearchParams): Promise<SearchResult> {
 
 export async function fetchBooks(ids: number[]): Promise<BookSummary[]> {
   if (ids.length === 0) return [];
-  const data = await jsonFetch<Record<string, BookSummary | null>>(`/ajax/books?ids=${ids.join(",")}`);
+  // `files=1` adds the Size, Folder and File name fields the optional table columns show.
+  const data = await jsonFetch<Record<string, BookSummary | null>>(`/ajax/books?ids=${ids.join(",")}&files=1`);
   // Preserve the order `ids` (and therefore the page's sort order) was
   // requested in -- the response is an id-keyed object, unordered.
   return ids.map((id) => data[String(id)]).filter((b): b is BookSummary => b !== null && b !== undefined);
@@ -114,6 +117,39 @@ export async function setFields(bookId: number, changes: BookFieldChanges): Prom
     body: JSON.stringify({ changes }),
   });
   return data[String(bookId)];
+}
+
+/**
+ * Applies field changes to many books in one request (bulk edit), as groups of
+ * books that share a change set. A server without the route answers 404 and
+ * this throws [`BatchUnsupportedError`] so the caller can go book by book.
+ */
+export async function setFieldsBatch(groups: BatchGroup[]): Promise<BatchResponse> {
+  const resp = await fetch("/cdb/set-fields-batch/default", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ groups }),
+  });
+  if (resp.status === 404 || resp.status === 405) throw new BatchUnsupportedError();
+  if (!resp.ok) throw new Error(`POST /cdb/set-fields-batch failed: ${resp.status} ${resp.statusText}${await failureDetail(resp)}`);
+  return (await resp.json()) as BatchResponse;
+}
+
+/** `GET /change-log/status/{lib}`: whether the library's change log missed changes. Null from an older server. */
+export async function fetchChangeLogStatus(): Promise<ChangeLogStatus | null> {
+  const resp = await fetch("/change-log/status/default");
+  if (!resp.ok) return null;
+  return parseChangeLogStatus(await resp.json());
+}
+
+/** `POST /change-log/repair/{lib}`: makes the log whole again, then clears the warning. Returns the new status. */
+export async function repairChangeLog(): Promise<ChangeLogStatus | null> {
+  const data = await jsonFetch<unknown>("/change-log/repair/default", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+  return parseChangeLogStatus(data);
 }
 
 export async function setCover(bookId: number, file: File): Promise<void> {

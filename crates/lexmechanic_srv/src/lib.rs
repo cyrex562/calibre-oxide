@@ -201,6 +201,7 @@ pub mod opml;
 pub mod opts;
 pub mod reader_profiles;
 pub mod rename;
+pub mod change_log_status;
 pub mod orphans;
 pub mod rename_files;
 pub mod scan_library;
@@ -418,6 +419,8 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/library-jobs", get(library_jobs::list))
         .route("/library-jobs/{job_id}", get(library_jobs::status))
         .route("/library-jobs/{job_id}/cancel", post(library_jobs::cancel))
+        .route("/change-log/status/{library_id}", get(change_log_status::status))
+        .route("/change-log/repair/{library_id}", post(change_log_status::repair))
         .route("/orphans/{library_id}", get(orphans::list))
         .route("/orphans/relocate/{book_id}/{format}/{library_id}", post(orphans::relocate))
         .route("/orphans/upload/{book_id}/{format}/{library_id}/{filename}", post(orphans::upload))
@@ -467,6 +470,8 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/cdb/cover-from-pdf-page/{book_id}/{page}", post(cdb::cover_from_pdf_page))
         .route("/cdb/set-fields/{book_id}/{library_id}", post(cdb::set_fields))
         .route("/cdb/set-fields/{book_id}", post(cdb::set_fields_no_library))
+        .route("/cdb/set-fields-batch/{library_id}", post(cdb::set_fields_batch))
+        .route("/cdb/set-fields-batch", post(cdb::set_fields_batch_no_library))
         .route("/cdb/embed-metadata/{book_ids}/{library_id}", post(cdb::embed_metadata))
         .route("/cdb/embed-metadata/{book_ids}", post(cdb::embed_metadata_no_library))
         .route("/cdb/copy-to-library/{target_library_id}/{library_id}", post(cdb::copy_to_library))

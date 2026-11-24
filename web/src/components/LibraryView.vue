@@ -37,7 +37,9 @@ import { addBook, addCustomColumn, addNewsSchedule, catalogDownloadUrl, CHECK_LI
   fetchIgnored,
   type EmptyFile, unignoreFile, copyToLibrary, describeCopyOutcome, embedMetadata, summarizeEmbed, deleteSavedSearch, deleteVirtualLibrary, fetchBooks, fetchCustomColumns, fetchFieldMetadata, fetchLibraryInfo, fetchUntracked, fetchSavedSearches, fetchVirtualLibraries, ftsSearch, ftsSnippets, getNewsFetchStatus, importOpml, libraryExportUrl, listNewsSchedules, removeCustomColumn, removeNewsSchedule, renameFiles, renameSavedSearch, runNewsScheduleNow, saveToDisk, search, setFields, setFtsEnabled, setSavedSearch, startNewsFetch, setVirtualLibrary } from "../library/api";
 import type { PdfScanStatus, CheckLibraryFinding, CheckLibraryResult, CustomRecipeOptions, DuplicateGroup, IgnoredFile, NewsFeedInput, NewsSchedule, Orphan, SaveToDiskResult } from "../library/api";
-import { mergeBooks } from "../library/api";
+import { mergeBooks, fetchChangeLogStatus, repairChangeLog, setFieldsBatch } from "../library/api";
+import { changeLogBanner, type ChangeLogStatus } from "../library/changeLog";
+import { runBulkEdit as runBatchedEdit, type BulkItem } from "../library/bulkBatch";
 import type { DuplicateBook, MergeMode, MergeResponse } from "../library/api";
 import { fingerprintAction } from "../library/duplicates";
 import DuplicateReview from "./DuplicateReview.vue";
@@ -73,7 +75,6 @@ import { onMenuAction, syncDesktopMenu } from "../library/desktopMenu";
 import { buildMenuSpec } from "../library/actions";
 import { isModalOpen, shortcutFor } from "../library/shortcuts";
 import { useScope } from "../library/useScope";
-import { runPool } from "../library/pool";
 import { addChosenDuplicates, describeImport, importFiles, type PendingDuplicate } from "../library/importFiles";
 import { activeFilters, classifyEmpty, type ActiveFilter } from "../library/emptyState";
 import { draftCount } from "../library/metadataForm";
@@ -1202,6 +1203,7 @@ function libraryChanged(): Promise<void> {
   categoriesRefresh.value++;
   invalidateFieldValues();
   cacheBust.value++;
+  void refreshChangeLogStatus();
   return ftsMode.value ? runFtsSearch() : runSearch();
 }
 
@@ -1224,11 +1226,10 @@ function onDetailsDeleted(bookId: number) {
   void libraryChanged();
 }
 
-// Bulk (multi-book) metadata editing -- client-side fan-out over the
-// existing per-book /cdb/set-fields, matching #716's own scope: no
-// bulk server endpoint exists (or is needed yet), just N real
-// requests with real per-book error aggregation so one bad book
-// doesn't silently swallow the rest.
+// Bulk (multi-book) metadata editing -- sent in chunks of ~200 books to the
+// server's batch route (library/bulkBatch.ts), with per-book error
+// aggregation so one bad book doesn't silently swallow the rest. A server
+// without the route gets the old one-request-per-book fan-out.
 const selectMode = ref(false);
 const selectedIds = ref<Set<number>>(new Set());
 /** What actions act on: the selection, else the open book. */
@@ -1239,9 +1240,6 @@ const bulkErrors = ref<string[]>([]);
 /** "12 of 300" while a bulk edit runs. */
 const bulkProgress = ref<{ done: number; total: number } | null>(null);
 let bulkCancelled = false;
-/** Requests in flight at once. A server batch endpoint would replace the fan-out; it does not exist yet. */
-const BULK_CONCURRENCY = 4;
-
 function cancelBulkEdit() {
   bulkCancelled = true;
 }
@@ -1445,35 +1443,37 @@ async function runBulkEdit() {
     bulkErrors.value.push(`Could not read the selected books: ${e instanceof Error ? e.message : String(e)}`);
   }
   bulkCancelled = false;
-  bulkProgress.value = { done: 0, total: ids.length };
-  const pool = await runPool(
-    ids,
-    async (id) => {
-      const current = win.getById(id);
-      if (!current) {
-        bulkErrors.value.push(`Book ${id}: could not be loaded`);
-        return;
-      }
-      try {
-        const changes = changesFor(current, spec);
-        if (!changes) {
-          skipped += 1;
-          return;
-        }
-        await setFields(id, changes);
-        changed += 1;
-      } catch (e) {
-        bulkErrors.value.push(`Book ${id}: ${e instanceof Error ? e.message : String(e)}`);
-      }
-    },
-    { concurrency: BULK_CONCURRENCY, cancelled: () => bulkCancelled, onProgress: (done, total) => (bulkProgress.value = { done, total }) },
-  );
+  // What each book needs is worked out here, per book, before anything is sent.
+  const items: BulkItem[] = [];
+  for (const id of ids) {
+    const current = win.getById(id);
+    if (!current) {
+      bulkErrors.value.push(`Book ${id}: could not be loaded`);
+      continue;
+    }
+    try {
+      const changes = changesFor(current, spec);
+      if (changes) items.push({ id, changes });
+      else skipped += 1;
+    } catch (e) {
+      bulkErrors.value.push(`Book ${id}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  bulkProgress.value = { done: 0, total: items.length };
+  const pool = await runBatchedEdit(items, {
+    sendBatch: setFieldsBatch,
+    sendOne: setFields,
+    cancelled: () => bulkCancelled,
+    onProgress: (done, total) => (bulkProgress.value = { done, total }),
+  });
+  changed = pool.updated;
+  bulkErrors.value.push(...pool.errors);
   bulkBusy.value = false;
   bulkProgress.value = null;
-  const stopped = pool.skipped > 0 ? `, stopped with ${pool.skipped} not started` : "";
+  const stopped = pool.notStarted > 0 ? `, stopped with ${pool.notStarted} not started` : "";
   bulkSummary.value = `Updated ${changed} book(s)${skipped ? `, ${skipped} already matched` : ""}${bulkErrors.value.length ? `, ${bulkErrors.value.length} failed` : ""}${stopped}.`;
 
-  if (bulkErrors.value.length === 0 && pool.skipped === 0) {
+  if (bulkErrors.value.length === 0 && pool.notStarted === 0) {
     bulkOpen.value = false;
     selectMode.value = false;
     selectedIds.value = new Set();
@@ -2227,7 +2227,36 @@ const storage = ref<StorageInfo | null>(null);
 const banner = computed(() => storageBanner(storage.value));
 const bannerDismissed = ref(false);
 
+// The change log fell behind the database (an append failed): say so, and
+// offer the repair that makes the log whole again. Checked when the library
+// opens and after anything that changes it (see `libraryChanged`).
+const changeLogStatus = ref<ChangeLogStatus | null>(null);
+const changeLogWarning = computed(() => changeLogBanner(changeLogStatus.value));
+const changeLogRepairBusy = ref(false);
+const changeLogRepairError = ref<string | null>(null);
+
+async function refreshChangeLogStatus() {
+  try {
+    changeLogStatus.value = await fetchChangeLogStatus();
+  } catch {
+    // An older server has no such route, or it is unreachable: no warning.
+  }
+}
+
+async function repairChangeLogNow() {
+  changeLogRepairBusy.value = true;
+  changeLogRepairError.value = null;
+  try {
+    changeLogStatus.value = await repairChangeLog();
+  } catch (e) {
+    changeLogRepairError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    changeLogRepairBusy.value = false;
+  }
+}
+
 async function loadLibraryInfo() {
+  void refreshChangeLogStatus();
   try {
     const info = await fetchLibraryInfo();
     storage.value = info.storage;
@@ -3299,6 +3328,16 @@ watch(coloringRules, () => {
     <div v-if="banner && !bannerDismissed" class="storage-banner" :class="banner.level" role="status">
       <span class="storage-banner-text"><strong>{{ banner.title }}.</strong> {{ banner.detail }}</span>
       <button type="button" class="storage-banner-close" title="Dismiss" aria-label="Dismiss" @click="bannerDismissed = true">×</button>
+    </div>
+
+    <!-- The change log missed changes the database has: a rebuild from it would lose them. Repair appends them. -->
+    <div v-if="changeLogWarning" class="storage-banner warning change-log-banner" role="alert">
+      <span class="storage-banner-text">
+        <strong>{{ changeLogWarning.text }}</strong>
+        <template v-if="changeLogRepairError"> Repair failed: {{ changeLogRepairError }}</template>
+        <template v-else> Repairing records them so the log is whole again.</template>
+      </span>
+      <button type="button" :disabled="changeLogRepairBusy" @click="repairChangeLogNow">{{ changeLogRepairBusy ? "Repairing…" : "Repair" }}</button>
     </div>
 
     <!--

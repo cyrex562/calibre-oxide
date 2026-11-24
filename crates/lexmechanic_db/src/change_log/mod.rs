@@ -63,9 +63,11 @@ pub mod apply;
 mod audit;
 pub mod change;
 pub mod hlc;
+pub mod repair;
 pub mod store;
 
 pub use apply::{replay_into, ReplayReport};
 pub use change::{Change, ChangeOp, ChangeParseError, ChangeTarget};
 pub use hlc::{Hlc, HlcClock};
+pub use repair::RepairReport;
 pub use store::{ChangeLog, CompactionReport, InstallId, Replay, SnapshotHeader, VerifyReport, Watermark, DEFAULT_COMPACT_THRESHOLD, DEFAULT_RETENTION};
