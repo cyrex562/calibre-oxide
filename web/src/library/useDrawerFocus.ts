@@ -5,7 +5,7 @@
 // focus goes back to what opened it (the status bar's toggle). The drawer element carries
 // `data-drawer="sidebar" | "details"` and `tabindex="-1"`.
 
-import { nextTick, onBeforeUnmount, onMounted, watch, type Ref } from "vue";
+import { nextTick, onActivated, onBeforeUnmount, onDeactivated, onMounted, watch, type Ref } from "vue";
 
 import { isModalOpen } from "./shortcuts";
 import type { Panel } from "./layout";
@@ -37,6 +37,12 @@ export function useDrawerFocus(drawer: Ref<Panel | null>, close: () => void) {
     event.preventDefault();
     close();
   }
-  onMounted(() => window.addEventListener("keydown", onKeydown));
-  onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
+  // Listening only while the view is on screen: <keep-alive> parks it without unmounting.
+  // (addEventListener ignores the same listener twice, so mount + activate is harmless.)
+  const listen = () => window.addEventListener("keydown", onKeydown);
+  const unlisten = () => window.removeEventListener("keydown", onKeydown);
+  onMounted(listen);
+  onActivated(listen);
+  onDeactivated(unlisten);
+  onBeforeUnmount(unlisten);
 }

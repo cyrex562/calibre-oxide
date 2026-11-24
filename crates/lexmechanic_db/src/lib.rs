@@ -43,6 +43,8 @@ mod field_feed_tests;
 mod integrity_tests;
 #[cfg(test)]
 mod t26a_tests;
+#[cfg(test)]
+mod t29a_tests;
 pub mod formatter_functions;
 pub mod fts;
 pub mod lazy;

@@ -4,14 +4,12 @@
 //!
 //! # Disclosed simplifications
 //!
-//! - **No conditional-GET/etag caching.** Upstream's `create_file_copy`
-//!   does `If-None-Match`/`If-Modified-Since` handling and streams a
-//!   cached copy from a temp-file cache keyed by content hash. This
-//!   port re-reads the file from the library on every request and
-//!   always returns `200 OK` with the full body -- correct, just not
-//!   bandwidth-optimal for repeat requests. A real improvement here
-//!   (proper `ETag`/`Last-Modified` conditional responses) is a natural
-//!   next increment, not attempted yet.
+//! - **Validators, not a copy cache.** Upstream's `create_file_copy` streams a cached
+//!   copy keyed by content hash. This port reads the library file on every request, but
+//!   sends `ETag` (size and modification time) and `Last-Modified`, answers
+//!   `If-None-Match` / `If-Modified-Since` with `304`, and honours `If-Range`: a range
+//!   request whose validator no longer matches gets the whole (current) file, never bytes
+//!   of two versions of a rewritten PDF stitched together.
 //! - **No thumbnail resizing.** `thumb` returns the same full-size cover
 //!   as `cover` -- upstream's `sz=WxH` resizing (reusing
 //!   `oeb::transforms::rescale`-equivalent logic, already ported and
@@ -114,10 +112,81 @@ fn file_body(file: tokio::fs::File, len: u64) -> Body {
     Body::from_stream(stream)
 }
 
-async fn serve_path(path: std::path::PathBuf, content_type: &str, download_name: Option<&str>, range: Option<&str>) -> Result<Response, ServerError> {
+/// The request headers that make a `GET` conditional or ranged.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct Conditions<'a> {
+    range: Option<&'a str>,
+    if_range: Option<&'a str>,
+    if_none_match: Option<&'a str>,
+    if_modified_since: Option<&'a str>,
+}
+
+impl<'a> Conditions<'a> {
+    fn from_headers(headers: &'a HeaderMap) -> Self {
+        let get = |name| headers.get(name).and_then(|v| v.to_str().ok());
+        Conditions { range: get(header::RANGE), if_range: get(header::IF_RANGE), if_none_match: get(header::IF_NONE_MATCH), if_modified_since: get(header::IF_MODIFIED_SINCE) }
+    }
+}
+
+/// `ETag` (size and modification time, to the nanosecond) and `Last-Modified` for a file.
+fn validators(meta: &std::fs::Metadata) -> Option<(String, String, i64)> {
+    let modified = meta.modified().ok()?;
+    let since = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    let etag = format!("\"{:x}-{:x}{:09x}\"", meta.len(), since.as_secs(), since.subsec_nanos());
+    let secs = since.as_secs() as i64;
+    let date = chrono::DateTime::from_timestamp(secs, 0)?.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+    Some((etag, date, secs))
+}
+
+/// Whether an `If-None-Match` value names `etag` (weak comparison, so `W/` is ignored) or is `*`.
+fn none_match_hits(header: &str, etag: &str) -> bool {
+    header.split(',').map(str::trim).any(|t| t == "*" || t.trim_start_matches("W/") == etag)
+}
+
+fn http_date_secs(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc2822(value.trim()).ok().map(|d| d.timestamp())
+}
+
+async fn serve_path(path: std::path::PathBuf, content_type: &str, download_name: Option<&str>, cond: Conditions<'_>) -> Result<Response, ServerError> {
     use tokio::io::AsyncSeekExt;
     let mut file = tokio::fs::File::open(&path).await.map_err(|_| ServerError::NotFound("Not found".to_string()))?;
-    let total = file.metadata().await.map_err(|_| ServerError::NotFound("Not found".to_string()))?.len();
+    let meta = file.metadata().await.map_err(|_| ServerError::NotFound("Not found".to_string()))?;
+    let total = meta.len();
+    let tags = validators(&meta);
+    let put_validators = |headers: &mut HeaderMap| {
+        if let Some((etag, date, _)) = &tags {
+            if let Ok(v) = HeaderValue::from_str(etag) {
+                headers.insert(header::ETAG, v);
+            }
+            if let Ok(v) = HeaderValue::from_str(date) {
+                headers.insert(header::LAST_MODIFIED, v);
+            }
+        }
+    };
+    if let Some((etag, _, secs)) = &tags {
+        // If-None-Match wins over If-Modified-Since (RFC 9110 13.1.3).
+        let unchanged = match (cond.if_none_match, cond.if_modified_since) {
+            (Some(inm), _) => none_match_hits(inm, etag),
+            (None, Some(ims)) => http_date_secs(ims).is_some_and(|since| *secs <= since),
+            (None, None) => false,
+        };
+        if unchanged {
+            let mut resp = Response::new(Body::empty());
+            *resp.status_mut() = StatusCode::NOT_MODIFIED;
+            put_validators(resp.headers_mut());
+            resp.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+            return Ok(resp);
+        }
+    }
+    // A ranged request that says "only if still this version": a changed (or unknowable)
+    // file gets the whole of what is there now.
+    let range = match (cond.range, cond.if_range) {
+        (Some(r), Some(wanted)) => match &tags {
+            Some((etag, date, _)) if wanted.trim() == etag || wanted.trim() == date => Some(r),
+            _ => None,
+        },
+        (r, _) => r,
+    };
     let (status, start, length) = match parse_range(range, total) {
         RangeRequest::Full => (StatusCode::OK, 0, total),
         RangeRequest::Partial { start, end } => (StatusCode::PARTIAL_CONTENT, start, end - start + 1),
@@ -138,6 +207,9 @@ async fn serve_path(path: std::path::PathBuf, content_type: &str, download_name:
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(content_type).unwrap_or(HeaderValue::from_static("application/octet-stream")));
     headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     headers.insert(header::CONTENT_LENGTH, HeaderValue::from(length));
+    put_validators(headers);
+    // Revalidate on every use (a cheap 304), so a replaced file is never served from a stale cache.
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     if status == StatusCode::PARTIAL_CONTENT {
         headers.insert(header::CONTENT_RANGE, HeaderValue::from_str(&format!("bytes {start}-{}/{total}", start + length - 1)).unwrap());
     }
@@ -169,11 +241,11 @@ pub(crate) async fn fetch_book_row(cache: std::sync::Arc<lexmechanic_db::cache::
 /// `Content-Disposition` for old Kindle browsers) rather than just
 /// dispatching to the public [`get`]/[`get_no_library`] handlers.
 pub(crate) async fn handle(state: AppState, what: String, book_id_raw: String, library_id: Option<&str>) -> Result<Response, ServerError> {
-    handle_ranged(state, what, book_id_raw, library_id, None).await
+    handle_ranged(state, what, book_id_raw, library_id, Conditions::default()).await
 }
 
 /// [`handle`] honouring a `Range` header value.
-pub(crate) async fn handle_ranged(state: AppState, what: String, book_id_raw: String, library_id: Option<&str>, range: Option<&str>) -> Result<Response, ServerError> {
+pub(crate) async fn handle_ranged(state: AppState, what: String, book_id_raw: String, library_id: Option<&str>, cond: Conditions<'_>) -> Result<Response, ServerError> {
     let book_id = book_id_from_path_segment(&book_id_raw)?;
     let cache = state.cache_for(library_id).ok_or_else(|| ServerError::NotFound(format!("no library named {:?}", library_id.unwrap_or(""))))?;
     let book = fetch_book_row(cache, book_id).await?;
@@ -183,7 +255,7 @@ pub(crate) async fn handle_ranged(state: AppState, what: String, book_id_raw: St
             let Some(cover) = book["cover"].as_str() else {
                 return Err(ServerError::NotFound("No cover for this book".to_string()));
             };
-            serve_path(std::path::PathBuf::from(cover), "image/jpeg", None, range).await
+            serve_path(std::path::PathBuf::from(cover), "image/jpeg", None, cond).await
         }
         fmt => {
             let key = format!("fmt_{}", fmt.to_lowercase());
@@ -193,13 +265,9 @@ pub(crate) async fn handle_ranged(state: AppState, what: String, book_id_raw: St
             let title = book["title"].as_str().unwrap_or("Unknown");
             let name = format!("{}.{}", title.chars().take(60).collect::<String>().replace(['"', '/'], "_"), fmt.to_lowercase());
             let mime = mime_guess::from_ext(&fmt.to_lowercase()).first_raw().unwrap_or("application/octet-stream");
-            serve_path(std::path::PathBuf::from(path), mime, Some(&name), range).await
+            serve_path(std::path::PathBuf::from(path), mime, Some(&name), cond).await
         }
     }
-}
-
-fn range_header(headers: &HeaderMap) -> Option<&str> {
-    headers.get(header::RANGE).and_then(|v| v.to_str().ok())
 }
 
 /// `GET /get/{what}/{book_id}/{library_id}`. Port of `content.get`
@@ -209,13 +277,13 @@ fn range_header(headers: &HeaderMap) -> Option<&str> {
 /// `None`) it's accepted (matching upstream's URL shape, which OPDS
 /// acquisition links always include) but has no effect.
 pub async fn get(State(state): State<AppState>, headers: HeaderMap, Path((what, book_id, library_id)): Path<(String, String, String)>) -> Result<Response, ServerError> {
-    handle_ranged(state, what, book_id, Some(&library_id), range_header(&headers)).await
+    handle_ranged(state, what, book_id, Some(&library_id), Conditions::from_headers(&headers)).await
 }
 
 /// Same as [`get`], for a URL with no trailing `/{library_id}` segment
 /// -- always serves the default library.
 pub async fn get_no_library(State(state): State<AppState>, headers: HeaderMap, Path((what, book_id)): Path<(String, String)>) -> Result<Response, ServerError> {
-    handle_ranged(state, what, book_id, None, range_header(&headers)).await
+    handle_ranged(state, what, book_id, None, Conditions::from_headers(&headers)).await
 }
 
 #[cfg(test)]
@@ -360,6 +428,55 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::OK, "{ignored}");
             assert_eq!(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()[..], b"0123456789");
         }
+    }
+
+    async fn get_with_headers(router: &axum::Router, uri: &str, headers: &[(&str, &str)]) -> axum::response::Response {
+        let mut req = Request::builder().uri(uri);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        router.clone().oneshot(req.body(Body::empty()).unwrap()).await.unwrap()
+    }
+
+    /// T29a #7: validators, 304s and If-Range.
+    #[tokio::test]
+    async fn get_sends_validators_and_honours_if_none_match_and_if_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = lexmechanic_db::cache::Cache::new(dir.path()).unwrap();
+        let id = add_test_book_with_content(dir.path(), &cache, "Validated", b"0123456789");
+        let state = crate::AppState { libraries: None, cache: std::sync::Arc::new(cache), opts: std::sync::Arc::new(crate::opts::ServerOptions::default()), auth: None, changes: crate::web_socket::new_change_broadcaster(), reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()), book_cache: std::sync::Arc::new(crate::books_cache::BookCache::open_temp()), jobs: std::sync::Arc::new(crate::jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))), render_jobs: std::sync::Arc::new(crate::render_endpoints::RenderJobRegistry::new()), conversion_jobs: std::sync::Arc::new(crate::convert::ConversionJobRegistry::new()), news_jobs: std::sync::Arc::new(crate::news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()), tts_voice: None, plugin_store: None, plugin_registry: std::sync::Arc::new(std::sync::Mutex::new(lexmechanic_customize::registry::PluginRegistry::new())), };
+        let router = crate::test_router(state);
+        let uri = format!("/get/epub/{id}");
+
+        let resp = get_with_headers(&router, &uri, &[]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let etag = resp.headers()["etag"].to_str().unwrap().to_string();
+        let modified = resp.headers()["last-modified"].to_str().unwrap().to_string();
+        assert!(etag.starts_with('"') && etag.ends_with('"'), "{etag}");
+        assert!(modified.ends_with(" GMT"), "{modified}");
+        assert_eq!(resp.headers()["cache-control"], "no-cache");
+
+        // A cache holding this version gets a 304 and no body; another version gets the file.
+        let resp = get_with_headers(&router, &uri, &[("if-none-match", &etag)]).await;
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(resp.headers()["etag"], etag.as_str());
+        assert!(to_bytes(resp.into_body(), usize::MAX).await.unwrap().is_empty());
+        let resp = get_with_headers(&router, &uri, &[("if-none-match", "\"other\"")]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = get_with_headers(&router, &uri, &[("if-modified-since", &modified)]).await;
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+        let resp = get_with_headers(&router, &uri, &[("if-modified-since", "Mon, 01 Jan 1990 00:00:00 GMT")]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // If-Range: this version continues the range; a different one restarts at 200 with all of it.
+        let resp = get_with_headers(&router, &uri, &[("range", "bytes=2-5"), ("if-range", &etag)]).await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()[..], b"2345");
+        let resp = get_with_headers(&router, &uri, &[("range", "bytes=2-5"), ("if-range", "\"stale\"")]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()[..], b"0123456789");
+        let resp = get_with_headers(&router, &uri, &[("range", "bytes=2-5"), ("if-range", "Mon, 01 Jan 1990 00:00:00 GMT")]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[test]

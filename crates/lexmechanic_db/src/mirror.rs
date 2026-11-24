@@ -1472,12 +1472,14 @@ fn copy_one(item: &PlanItem, dest: &Path, tier: StorageTier, control: &JobContro
 
 /// Moves `rel` from the copy into `.mirror-trash/<run>/`, then tidies the folders
 /// it leaves empty.
-fn set_aside(target: &Path, rel: &str, run_id: &str) -> io::Result<()> {
+fn set_aside(target: &Path, rel: &str, run_id: &str, park_history: bool) -> io::Result<()> {
     let from = abs(target, rel);
-    if is_history_snapshot(rel) {
+    if is_history_snapshot(rel) && !park_history {
         // An older history snapshot, replaced by the one this run writes: internal
         // state, not the user's file. Deleted outright; parking a library-sized
         // snapshot in `.mirror-trash` on every refresh would fill the copy's disk.
+        // (Only called once the new one has copied. When the copy's own edits were set
+        // aside this run, the caller parks it with them instead: they chain to it.)
         return fs::remove_file(&from);
     }
     let to = abs(&target.join(MIRROR_TRASH_DIR).join(run_id), rel);
@@ -1553,7 +1555,7 @@ fn execute_inner(_cache: &Cache, plan: &MirrorPlan, control: &JobControl, checkp
     // On request, the copy's own edits make way for the refreshed database.
     if plan.options.overwrite_changed && !plan.copy_edits.is_empty() && dbs.iter().any(|i| i.rel == "metadata.db") {
         for rel in &plan.copy_edits {
-            if set_aside(target, rel, &run_id).is_ok() {
+            if set_aside(target, rel, &run_id, false).is_ok() {
                 report.edits_set_aside += 1;
             }
         }
@@ -1611,15 +1613,22 @@ fn execute_inner(_cache: &Cache, plan: &MirrorPlan, control: &JobControl, checkp
         anyhow::bail!("{message}. The copy was not finished; run it again when the folder is back (what was written is kept).");
     }
 
-    // Removals, only if the run was not cut short.
-    if !control.is_cancelled() {
+    // Removals, only if the run was neither cut short nor failed to copy something: the old
+    // history snapshot goes only once its replacement has landed, and a failed copy (a full
+    // disk) must leave the copy with the snapshot it has. They stay planned for the next run.
+    if !control.is_cancelled() && report.failures.is_empty() {
         control.set_phase("mirror_removing");
+        // Edits made on the copy chain to the snapshot being replaced: park it with them.
+        let park_history = report.edits_set_aside > 0;
+        let mut parked_history = false;
         for item in plan.items.iter().filter(|i| i.action == Action::Remove) {
-            match set_aside(target, &item.rel, &run_id) {
+            match set_aside(target, &item.rel, &run_id, park_history) {
                 Ok(()) => {
                     entries.remove(&item.rel);
                     if !is_history_snapshot(&item.rel) {
                         report.removed += 1;
+                    } else if park_history {
+                        parked_history = true;
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -1628,7 +1637,7 @@ fn execute_inner(_cache: &Cache, plan: &MirrorPlan, control: &JobControl, checkp
                 Err(e) => report.failures.push(Problem { path: item.rel.clone(), message: format!("could not move it to {MIRROR_TRASH_DIR}: {e}") }),
             }
         }
-        if report.removed > 0 || report.edits_set_aside > 0 {
+        if report.removed > 0 || report.edits_set_aside > 0 || parked_history {
             report.trash = Some(format!("{MIRROR_TRASH_DIR}/{run_id}"));
         }
     }
@@ -2195,6 +2204,71 @@ mod tests {
         assert!(report.trash.is_none(), "{report:?}");
         assert!(!target.path().join(MIRROR_TRASH_DIR).exists());
         assert!(old.iter().all(|i| !target.path().join(&i.rel).exists()), "the old snapshot is gone");
+    }
+
+    fn snapshot_rels(root: &Path) -> Vec<String> {
+        let dir = root.join(LIBRARY_HANDLE_DIR_NAME).join("snapshots");
+        let mut out: Vec<String> = std::fs::read_dir(dir).map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
+        out.sort();
+        out
+    }
+
+    /// T29a #3: set-aside edits chain to the old snapshot, so an overwrite parks it with them
+    /// rather than deleting it.
+    #[test]
+    fn an_overwrite_parks_the_old_history_snapshot_with_the_set_aside_edits() {
+        let (_dir, cache, _s, ids) = sample();
+        let target = target_dir();
+        let opts = travel_opts(MirrorScope::All);
+        run(&cache, target.path(), &opts);
+        let old = snapshot_rels(target.path());
+        assert!(!old.is_empty());
+        {
+            let copy = Cache::new(target.path()).unwrap();
+            copy.set_field(ids[0], "rating", "10").unwrap();
+        }
+        let before = cache.field_for(ids[1], "rating").unwrap();
+        cache.set_field(ids[1], "rating", "2").unwrap();
+        cache.set_field(ids[1], "rating", before.as_deref().unwrap_or("")).unwrap();
+
+        let forced = MirrorOptions { overwrite_changed: true, ..opts };
+        let (_, report) = run(&cache, target.path(), &forced);
+        assert!(report.complete && report.edits_set_aside > 0, "{report:?}");
+        let now = snapshot_rels(target.path());
+        let gone: Vec<&String> = old.iter().filter(|n| !now.contains(n)).collect();
+        assert!(!gone.is_empty(), "the history changed, so the baseline was renamed: {old:?} -> {now:?}");
+        let parked = target.path().join(MIRROR_TRASH_DIR).join(&report.run_id).join(LIBRARY_HANDLE_DIR_NAME).join("snapshots");
+        for name in gone {
+            assert!(parked.join(name).is_file(), "{name} was deleted instead of parked next to the edits it anchors");
+        }
+        assert!(report.trash.is_some());
+    }
+
+    /// T29a #3: a new snapshot that failed to copy must not cost the copy its old one.
+    #[test]
+    fn a_failed_snapshot_copy_leaves_the_old_snapshot_in_place() {
+        let (_dir, cache, _s, ids) = sample();
+        let target = target_dir();
+        let opts = travel_opts(MirrorScope::All);
+        run(&cache, target.path(), &opts);
+        let old = snapshot_rels(target.path());
+        let before = cache.field_for(ids[1], "rating").unwrap();
+        cache.set_field(ids[1], "rating", "2").unwrap();
+        cache.set_field(ids[1], "rating", before.as_deref().unwrap_or("")).unwrap();
+
+        let plan = plan(&cache, target.path().to_str().unwrap(), &opts).unwrap();
+        let fresh: Vec<&PlanItem> = plan.items.iter().filter(|i| i.rel.contains("/snapshots/") && i.action == Action::CopyNew).collect();
+        assert!(!fresh.is_empty());
+        // Something the new snapshot cannot be written over (as a full disk would stop it).
+        for item in &fresh {
+            std::fs::create_dir_all(target.path().join(&item.rel)).unwrap();
+        }
+        let report = execute(&cache, &plan, &JobControl::new()).unwrap();
+        assert!(!report.failures.is_empty(), "{report:?}");
+        assert!(!report.complete);
+        for name in &old {
+            assert!(target.path().join(LIBRARY_HANDLE_DIR_NAME).join("snapshots").join(name).is_file(), "{name} was deleted though its replacement never landed");
+        }
     }
 
     #[test]

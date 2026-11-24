@@ -46,10 +46,11 @@ use crate::cache::Cache;
 use crate::change_log::ChangeOp;
 
 /// The standard fields a book's log state is compared on, as `set_field` names
-/// them. `uuid` is the book's identity and `last_modified` is stamped by the
+/// them. `authors` comes before `author_sort`: setting the authors re-derives the sort, so a
+/// hand-set sort has to be replayed after it (the order `book_added_ops` uses too). `uuid` is the book's identity and `last_modified` is stamped by the
 /// database itself, so neither is replayed.
 const FIELDS: &[&str] = &[
-    "title", "sort", "author_sort", "authors", "path", "series", "series_index", "publisher", "rating", "tags", "languages", "comments", "isbn", "identifiers", "timestamp", "pubdate",
+    "title", "sort", "authors", "author_sort", "path", "series", "series_index", "publisher", "rating", "tags", "languages", "comments", "isbn", "identifiers", "timestamp", "pubdate",
 ];
 
 /// How many ops go into one logged batch entry.
@@ -234,6 +235,7 @@ impl Cache {
             }
             let was = known.unwrap_or(&empty);
 
+            let mut authors_restated = false;
             for field in FIELDS {
                 let current = self.field_for(id, field)?.unwrap_or_default();
                 if *field == "sort" {
@@ -258,8 +260,14 @@ impl Cache {
                 }
                 let before = was.fields.get(*field).cloned().flatten().unwrap_or_default();
                 // An empty title is a no-op on replay, so an empty value there is not a difference.
-                if same_value(field, &before, &current) || (current.is_empty() && *field == "title") {
+                // Replaying new authors re-derives the sort, which then no longer matches the
+                // database's even when the logged sort equals it: state it again after the authors.
+                let forced = *field == "author_sort" && authors_restated && !current.is_empty();
+                if !forced && (same_value(field, &before, &current) || (current.is_empty() && *field == "title")) {
                     continue;
+                }
+                if *field == "authors" {
+                    authors_restated = true;
                 }
                 ops.push(ChangeOp::FieldSet { book: uuid.clone(), field: (*field).to_string(), value: Some(current) });
                 if known.is_some() {
@@ -594,6 +602,29 @@ mod tests {
         assert!(report.other_changes >= 1, "{report:?}");
         let (_keep, rebuilt) = rebuilt_from_log_only(dir.path());
         assert_eq!(rebuilt.author_sort_for_name("An Author").unwrap().as_deref(), Some("Author, Hand Set"));
+    }
+
+    /// A foreign writer changed a book's authors and hand-set its `author_sort`: replaying
+    /// `authors` re-derives the sort, so the hand-set one has to come after it.
+    #[test]
+    fn a_hand_set_author_sort_survives_a_replay_of_changed_authors() {
+        let (dir, cache) = cache();
+        let id = add(dir.path(), &cache, "Re-authored");
+        {
+            let conn = cache.backend.conn.lock().unwrap();
+            conn.execute("INSERT INTO authors (name, sort) VALUES ('New Writer', 'Writer, New')", []).unwrap();
+            conn.execute("UPDATE books_authors_link SET author = (SELECT id FROM authors WHERE name = 'New Writer') WHERE book = ?1", [id]).unwrap();
+            conn.execute("UPDATE books SET author_sort = 'Hand, Set' WHERE id = ?1", [id]).unwrap();
+        }
+        cache.repair_change_log().unwrap();
+        let (_keep, rebuilt) = rebuilt_from_log_only(dir.path());
+        assert_eq!(view(&rebuilt), view(&cache));
+        assert_eq!(sorts(&rebuilt), sorts(&cache));
+        assert!(sorts(&rebuilt).iter().any(|(t, _, a)| t == "Re-authored" && a == "Hand, Set"), "{:?}", sorts(&rebuilt));
+        let log = cache.backend.change_log().unwrap();
+        let before = log.entry_count();
+        cache.repair_change_log().unwrap();
+        assert_eq!(log.entry_count(), before, "idempotent");
     }
 
     #[test]

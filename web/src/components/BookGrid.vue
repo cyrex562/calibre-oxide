@@ -54,10 +54,8 @@ watch(
  */
 const currentId = computed<number | null>(() => {
   const open = props.selectedBookId;
-  if (open !== null) {
-    const at = props.ids.indexOf(open);
-    if (at >= items.value.from && at < items.value.to) return open;
-  }
+  // Looks only through the rendered window, never the whole list: this reruns on every scroll step.
+  if (open !== null) for (let i = items.value.from; i < items.value.to; i++) if (props.ids[i] === open) return open;
   for (let i = items.value.from; i < items.value.to; i++) if (props.getBook(props.ids[i])) return props.ids[i];
   return null;
 });
@@ -94,6 +92,25 @@ onMounted(() => {
   }
 });
 onBeforeUnmount(() => observer?.disconnect());
+
+/**
+ * The focused card is removed from the page when its row leaves the rendered window, and the
+ * browser would then drop focus on <body>: arrow keys (handled on the scroller) would go dead.
+ * Before that render, park focus on the scroller itself; the next arrow key moves it back onto
+ * the new current card.
+ */
+watch(
+  () => [items.value.from, items.value.to] as const,
+  ([from, to]) => {
+    const root = scroller.value;
+    const active = document.activeElement;
+    if (!root || !(active instanceof HTMLElement) || !root.contains(active) || !active.classList.contains("card")) return;
+    const id = Number(active.dataset.id);
+    for (let i = from; i < to; i++) if (props.ids[i] === id) return;
+    root.focus({ preventScroll: true });
+  },
+  { flush: "pre" },
+);
 
 function onScroll() {
   if (scroller.value) scrollTop.value = scroller.value.scrollTop;
@@ -140,7 +157,7 @@ function onKeydown(event: KeyboardEvent) {
 </script>
 
 <template>
-  <div ref="scroller" class="grid-scroll" role="listbox" aria-label="Books" aria-multiselectable="true" tabindex="-1" @scroll.passive="onScroll" @keydown="onKeydown">
+  <div ref="scroller" class="grid-scroll" role="listbox" aria-label="Books" aria-multiselectable="true" :tabindex="currentId === null ? 0 : -1" @scroll.passive="onScroll" @keydown="onKeydown">
     <div class="grid-pad" :style="{ height: `${win.padTop}px` }"></div>
     <div class="grid-rows" :style="{ gridTemplateColumns: `repeat(${metrics.columns}, minmax(0, 1fr))`, columnGap: `${GAP}px`, gridAutoRows: `${metrics.rowHeight}px` }">
       <template v-for="i in rendered" :key="ids[i]">

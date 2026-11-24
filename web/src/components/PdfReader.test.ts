@@ -3,7 +3,7 @@
 // faithfully where it matters: a canvas takes one render() at a time,
 // and a cancelled render rejects with RenderingCancelledException.
 
-import { createApp, defineComponent, h, nextTick, type App } from "vue";
+import { createApp, defineComponent, h, nextTick, ref, type App } from "vue";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const state = vi.hoisted(() => ({
@@ -12,6 +12,7 @@ const state = vi.hoisted(() => ({
   concurrentErrors: 0,
   stored: [] as { device: string; cfi: string | null }[],
   setPosition: undefined as unknown as ReturnType<typeof import("vitest").vi.fn>,
+  openDoc: undefined as undefined | (() => { promise: Promise<unknown> }),
 }));
 
 function makePage(n: number) {
@@ -65,7 +66,7 @@ const fakeDoc = {
 vi.mock("../reader/pdf", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../reader/pdf")>()),
   loadPdfJs: vi.fn(async () => ({
-    getDocument: () => ({ promise: Promise.resolve(fakeDoc) }),
+    getDocument: () => state.openDoc?.() ?? { promise: Promise.resolve(fakeDoc) },
     TextLayer: class {
       textDivs: HTMLElement[] = [];
       constructor(opts: { container: HTMLElement }) {
@@ -118,6 +119,7 @@ const key = (k: string, init: KeyboardEventInit = {}) => window.dispatchEvent(ne
 
 beforeEach(() => {
   state.active = false;
+  state.openDoc = undefined;
   state.drawn = [];
   state.concurrentErrors = 0;
   localStorage.clear();
@@ -230,5 +232,40 @@ describe("PdfReader as a reader (C10)", () => {
     await flush(6);
     expect(api.addBookmark).toHaveBeenCalledWith("7", "pdf", "Start of part two", "1");
     expect(buttonByText("Bookmarks").textContent).toContain("(1)");
+  });
+});
+
+describe("PdfReader load ordering (T29a)", () => {
+  it("a slow open of the previous book neither replaces the current document nor survives", async () => {
+    const bookId = ref("7");
+    const slowDestroy = vi.fn(async () => {});
+    const quickDestroy = vi.fn(async () => {});
+    let releaseSlow: (d: unknown) => void = () => {};
+    const slow = { ...fakeDoc, numPages: 5, destroy: slowDestroy };
+    const quick = { ...fakeDoc, numPages: 12, destroy: quickDestroy };
+    let opens = 0;
+    state.openDoc = () => {
+      opens += 1;
+      return opens === 1 ? { promise: new Promise((r) => (releaseSlow = r)) } : { promise: Promise.resolve(quick) };
+    };
+
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    app = createApp(defineComponent({ render: () => h(PdfReader, { bookId: bookId.value }) }));
+    app.component("router-link", defineComponent({ render() { return h("a", this.$slots.default?.()); } }));
+    app.mount(host);
+    await flush(4);
+
+    bookId.value = "8"; // switch books while the first is still opening
+    await flush();
+    expect(canvasEl().dataset.page).toBe("1");
+    expect(host.textContent).toContain("/ 12");
+
+    releaseSlow(slow); // the old open finally resolves
+    await flush();
+    expect(slowDestroy).toHaveBeenCalledTimes(1); // discarded
+    expect(quickDestroy).not.toHaveBeenCalled(); // the current document is untouched
+    expect(host.textContent).toContain("/ 12");
+    expect(host.querySelector(".error")).toBeNull();
   });
 });

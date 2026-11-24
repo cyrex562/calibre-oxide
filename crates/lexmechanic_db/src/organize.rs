@@ -18,7 +18,8 @@
 //!   touched, and no folder is moved as a whole. `cover.jpg` / `metadata.opf`
 //!   sidecars are left where they are (covers live under `.lexmechanic`);
 //!   an old folder is removed only once it is empty (`remove_dir`, never
-//!   recursive).
+//!   recursive). A book's attached files (`<folder>/data`) are not moved
+//!   either; the plan carries a warning for each book that leaves some behind.
 //! - **Journaled.** Each rename is `LibraryHandle::rename_atomic` (or its
 //!   `_no_replace` form: the target is never replaced, even by a file that
 //!   appears after the check). The database follows through
@@ -347,15 +348,34 @@ enum LinkState {
 fn volume_ignores_case(library: &Path) -> bool {
     let platform = cfg!(windows) || cfg!(target_os = "macos");
     let Ok(entries) = std::fs::read_dir(library) else { return platform };
-    let names: Vec<String> = entries.flatten().take(200).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
-    for name in &names {
+    let mut names: Vec<String> = entries.flatten().take(200).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    // `metadata.db` is in every library root and is plain ASCII: the safest name to flip. It goes
+    // first, even when the folder lists more than 200 entries.
+    if !names.iter().any(|n| n == "metadata.db") && library.join("metadata.db").exists() {
+        names.insert(0, "metadata.db".to_string());
+    }
+    if let Some(at) = names.iter().position(|n| n == "metadata.db") {
+        names.swap(0, at);
+    }
+    probe_case(library, &names).unwrap_or(platform)
+}
+
+/// Looks one of `names` up under its other case. A name whose upper-casing is not a plain
+/// per-letter mapping (`Straße` -> `STRASSE`, ligatures, the Turkish dotless i) is skipped: a
+/// volume that folds case by its own table would not find that spelling and the answer would be
+/// "case-sensitive" on a folding volume.
+fn probe_case(library: &Path, names: &[String]) -> Option<bool> {
+    for name in names {
+        if !name.is_ascii() {
+            continue;
+        }
         let alt = if name.to_uppercase() != *name { name.to_uppercase() } else { name.to_lowercase() };
         if alt == *name || names.iter().any(|n| n != name && n.to_lowercase() == alt.to_lowercase()) {
             continue;
         }
-        return std::fs::symlink_metadata(library.join(&alt)).is_ok();
+        return Some(std::fs::symlink_metadata(library.join(&alt)).is_ok());
     }
-    platform
+    None
 }
 
 impl DiskView {
@@ -624,6 +644,15 @@ pub fn plan_to(cache: &Cache, target: Target<'_>, scope: &Scope) -> Result<Organ
             already += 1;
             continue;
         }
+        // The files attached to the book live in `<its folder>/data`, which follows `books.path`:
+        // once the book moves they are no longer found. Organize moves format files only, so the
+        // attachments are left in the old folder and named here instead of being lost quietly.
+        if !old_path.is_empty() && new_path != old_path {
+            let attached = join_rel(&old_path, crate::constants::DATA_DIR_NAME);
+            if matches!(disk.entry(&attached), Ok(Some(EntryKind::Dir))) && !another_book_is_at(cache, book_id, &attached) {
+                warnings.push(Skipped { book_id, reason: format!("the files attached to this book in {attached} stay where they are and will no longer show as its data files; move them by hand to {}", join_rel(&new_path, crate::constants::DATA_DIR_NAME)) });
+            }
+        }
         books.push(PlannedBook { book_id, title, old_path, new_path, old_names, new_names, files, suffixed });
     }
     let fingerprint = fingerprint(&label, &books);
@@ -634,6 +663,13 @@ pub fn plan_to(cache: &Cache, target: Target<'_>, scope: &Scope) -> Result<Organ
         _ => None,
     };
     Ok(OrganizePlan { template: label, books, skipped, already_organized: already, fingerprint, warnings, case_fix_folder })
+}
+
+/// Whether another book's folder is exactly `rel` (a `data` folder that is a book of its own,
+/// not an attachments folder).
+fn another_book_is_at(cache: &Cache, book_id: i32, rel: &str) -> bool {
+    let conn = cache.backend.conn.lock().unwrap();
+    conn.query_row("SELECT COUNT(*) FROM books WHERE id != ?1 AND lower(path) = lower(?2)", (book_id, rel), |row| row.get::<_, i64>(0)).map(|n| n > 0).unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1091,6 +1127,34 @@ mod tests {
         assert!(super::plan(&cache, "Sorted/{title}", &Scope::Ids(vec![alpha])).unwrap().books.is_empty());
     }
 
+    /// T29a #12: a book's `data/` attachments do not follow it, so the plan says so instead of
+    /// leaving them behind silently; a `data` folder that is another book's own folder is not
+    /// "attachments".
+    #[test]
+    fn the_plan_names_attachments_that_would_stay_behind() {
+        let (dir, cache) = library();
+        write(&dir.path().join("inbox/Alpha.pdf"), b"%PDF alpha");
+        write(&dir.path().join("inbox/data/notes.xyz"), b"attached");
+        index(dir.path(), &cache);
+        let alpha = book_with_title(&cache, "Alpha");
+
+        let p = plan(&cache, "Sorted/{title}", &Scope::Ids(vec![alpha])).unwrap();
+        assert_eq!(p.books.len(), 1);
+        assert!(p.warnings.iter().any(|w| w.book_id == alpha && w.reason.contains("inbox/data") && w.reason.contains("Sorted/data")), "{:?}", p.warnings);
+        let report = execute(&cache, &p, &JobControl::new()).unwrap();
+        assert_eq!(report.books_moved, 1);
+        assert!(dir.path().join("inbox/data/notes.xyz").is_file(), "left where it was, never deleted");
+
+        // A book of its own at `<folder>/data` is not an attachments folder.
+        let (dir, cache) = library();
+        write(&dir.path().join("Reports/report.pdf"), b"%PDF report");
+        write(&dir.path().join("Reports/data/dataset.pdf"), b"%PDF dataset");
+        index(dir.path(), &cache);
+        let report_book = book_with_title(&cache, "report");
+        let p = plan(&cache, "Sorted/{title}", &Scope::Ids(vec![report_book])).unwrap();
+        assert!(p.warnings.iter().all(|w| !w.reason.contains("attached")), "{:?}", p.warnings);
+    }
+
     /// An absorbed calibre book keeps its cover as `<folder>/cover.jpg`, found
     /// through `books.path`. Organizing leaves that file in place, so the cover
     /// must still resolve after the move (and after an undo).
@@ -1146,6 +1210,23 @@ mod tests {
             assert!(!volume_ignores_case(dir.path()));
         }
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), if ignores { 1 } else { 2 });
+    }
+
+    /// A name with a non-letter-for-letter case mapping is no evidence either way, and the
+    /// library's own `metadata.db` is what the probe asks first.
+    #[test]
+    fn the_case_probe_skips_irregular_names_and_asks_metadata_db_first() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("metadata.db"), b"x");
+        let ignores = std::fs::metadata(dir.path().join("METADATA.DB")).is_ok();
+        // `Straße` upper-cases to `STRASSE`: a volume that folds case would not find it under that spelling.
+        write(&dir.path().join("Straße"), b"x");
+        assert_eq!(probe_case(dir.path(), &["Straße".to_string()]), None);
+        assert_eq!(probe_case(dir.path(), &["Straße".to_string(), "metadata.db".to_string()]), Some(ignores));
+        for i in 0..250 {
+            write(&dir.path().join(format!("Entry{i:03}.txt")), b"x");
+        }
+        assert_eq!(volume_ignores_case(dir.path()), ignores);
     }
 
     /// The directory-listing view must answer what `is_file()`/`exists()` on the
