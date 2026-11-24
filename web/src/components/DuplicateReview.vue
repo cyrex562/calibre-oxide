@@ -9,7 +9,7 @@
 
 import { computed, ref } from "vue";
 
-import { keepAndTrashGroup, keepAndTrashLabel, offerRunUndo, trashedCopiesMessage } from "../library/dedupe";
+import { keepAndTrashGroup, keepAndTrashLabel, offerRunUndo, partialTrashMessage, trashedCopiesMessage } from "../library/dedupe";
 import { trashBooksFlow } from "../library/deleteFlow";
 import { confirmDialog } from "./dialogs/confirm";
 import type { DuplicateBook, DuplicateGroup, DuplicateReason, DuplicateSort } from "../library/api";
@@ -129,6 +129,17 @@ async function keepAndTrash(group: DuplicateGroup) {
   working.value = new Set(working.value).add(group.id);
   try {
     const out = await keepAndTrashGroup(group, keeper);
+    if (out.partial) {
+      // Some copies are already in the Trash: offer the run's Undo, show why the rest stayed, and look again.
+      offerRunUndo(partialTrashMessage(out.trashedCount ?? 0, others.length, keeperTitle(group)), out.runId, () => {
+        emit("changed");
+        void store.scan();
+      });
+      actionError.value = out.error ?? "Not every other copy could be trashed.";
+      emit("changed");
+      void store.scan();
+      return;
+    }
     // Undo brings the copies back, so the group is found again: rescan.
     offerRunUndo(trashedCopiesMessage(out.trashedIds.length, keeperTitle(group)), out.runId, () => {
       emit("changed");

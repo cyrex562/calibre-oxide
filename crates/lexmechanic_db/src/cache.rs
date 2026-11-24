@@ -212,6 +212,9 @@ pub(crate) struct InsertedBook {
     pub uuid: Option<String>,
     pub timestamp: String,
     pub pubdate: String,
+    /// The `author_sort` actually stored, so the change log records the same
+    /// string rather than a second derivation of it.
+    pub author_sort: String,
 }
 
 /// One file already inside the library, ready to become a book:
@@ -788,6 +791,16 @@ impl Cache {
         let books: i64 = conn.query_row("SELECT COUNT(*) FROM books", [], |r| r.get(0)).unwrap_or(-1);
         let formats: i64 = conn.query_row("SELECT COUNT(*) FROM data", [], |r| r.get(0)).unwrap_or(-1);
         format!("{seq}.{books}.{formats}")
+    }
+
+    /// SQLite's `data_version` for this connection: it moves when *another*
+    /// connection or process (calibre desktop on the same `metadata.db`)
+    /// commits, which neither the change log nor the row counts of
+    /// [`Cache::change_watermark`] see. A number for comparing within one run,
+    /// never to be stored.
+    pub fn foreign_write_version(&self) -> i64 {
+        let conn = self.backend.conn.lock().unwrap();
+        conn.query_row("PRAGMA data_version", [], |r| r.get(0)).unwrap_or(-1)
     }
 
     /// Port of `Cache.all_book_ids`. Previously nonexistent -- callers
@@ -1527,8 +1540,20 @@ impl Cache {
             )?;
         }
 
+        // `author_sort` is what the row got above (the first author's display
+        // name) until now: "Frank Herbert" instead of "Herbert, Frank". The
+        // metadata's own sort string wins when it has one; otherwise it is
+        // derived from the linked authors, as every later change of authors does.
+        match metadata.author_sort.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(explicit) => {
+                tx.execute("UPDATE books SET author_sort = ?1 WHERE id = ?2", (explicit, book_id))?;
+            }
+            None => Self::sync_author_sort_in(tx, book_id)?,
+        }
+        let author_sort: String = tx.query_row("SELECT author_sort FROM books WHERE id = ?1", (book_id,), |row| row.get(0))?;
+
         let uuid: Option<String> = tx.query_row("SELECT uuid FROM books WHERE id = ?1", (book_id,), |row| row.get::<_, Option<String>>(0)).ok().flatten();
-        Ok(InsertedBook { id: book_id, uuid, timestamp, pubdate })
+        Ok(InsertedBook { id: book_id, uuid, timestamp, pubdate, author_sort })
     }
 
     /// The change-log entries for a book [`Cache::insert_book_in_tx`] just
@@ -1541,10 +1566,9 @@ impl Cache {
     pub(crate) fn book_added_ops(inserted: &InsertedBook, metadata: &MetaInformation, rel_path: &str) -> Vec<crate::change_log::ChangeOp> {
         use crate::change_log::ChangeOp;
         let Some(uuid) = inserted.uuid.clone() else { return Vec::new() };
-        let author_name = metadata.authors.first().map(|s| s.as_str()).unwrap_or("Unknown");
         let mut fields: Vec<(&str, String)> = vec![
             ("title", metadata.title.clone()),
-            ("author_sort", author_name.to_string()),
+            ("author_sort", inserted.author_sort.clone()),
             ("path", rel_path.to_string()),
             ("series_index", metadata.series_index.to_string()),
             ("timestamp", inserted.timestamp.clone()),
@@ -2017,7 +2041,19 @@ impl Cache {
             (book_id, path_rel),
             |row| row.get(0),
         )?;
-        Ok(others == 0)
+        if others > 0 {
+            return Ok(false);
+        }
+        // `<path>/data` is where this book's attached files live, so a book
+        // kept there (or below it) owns that part of the folder: this one's
+        // `data/**` would include its files.
+        let under_data: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM books WHERE id != ?1
+               AND (lower(path) = lower(?2) || '/data' OR lower(substr(path, 1, length(?2) + 6)) = lower(?2) || '/data/')",
+            (book_id, path_rel),
+            |row| row.get(0),
+        )?;
+        Ok(under_data == 0)
     }
 
     /// The files this book owns on disk, relative to the library root.
@@ -2335,8 +2371,8 @@ impl Cache {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
         tx.execute(
-            "UPDATE books SET title = ?1, author_sort = ?2 WHERE id = ?3",
-            (title, author, book_id),
+            "UPDATE books SET title = ?1 WHERE id = ?2",
+            (title, book_id),
         )?;
         tx.execute("DELETE FROM books_authors_link WHERE book = ?1", (book_id,))?;
 
@@ -2354,6 +2390,10 @@ impl Cache {
             "INSERT INTO books_authors_link (book, author) VALUES (?1, ?2)",
             (book_id, author_id),
         )?;
+        // The sort string of the author, "Herbert, Frank" -- not the display
+        // name this used to store, which filed the book under the first name.
+        Self::sync_author_sort_in(&tx, book_id)?;
+        let author_sort: String = tx.query_row("SELECT author_sort FROM books WHERE id = ?1", (book_id,), |row| row.get(0))?;
         Self::touch_last_modified_in(&tx, book_id)?;
 
         tx.commit()?;
@@ -2371,8 +2411,8 @@ impl Cache {
         self.record_for_book(book_id, |book| crate::change_log::ChangeOp::FieldSet { book, field: "title".to_string(), value: Some(title) });
         // `authors` first, then `author_sort`: replaying `authors`
         // re-derives the sort, and the explicit one must be applied last.
-        self.record_for_book(book_id, |book| crate::change_log::ChangeOp::FieldSet { book, field: "authors".to_string(), value: Some(author.clone()) });
-        self.record_for_book(book_id, |book| crate::change_log::ChangeOp::FieldSet { book, field: "author_sort".to_string(), value: Some(author) });
+        self.record_for_book(book_id, |book| crate::change_log::ChangeOp::FieldSet { book, field: "authors".to_string(), value: Some(author) });
+        self.record_for_book(book_id, |book| crate::change_log::ChangeOp::FieldSet { book, field: "author_sort".to_string(), value: Some(author_sort) });
         Ok(())
     }
 
@@ -2948,6 +2988,9 @@ impl Cache {
         let mut conn = self.backend.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let existing: Option<i32> = tx.query_row(&format!("SELECT id FROM {table} WHERE name = ?1 AND id != ?2"), (new_name, old_id), |row| row.get(0)).optional()?;
+        // The books whose author_sort the rename changes: read before a merge
+        // re-points the links.
+        let affected = if table == "authors" { Self::books_of_author_in(&tx, old_id)? } else { Vec::new() };
         match existing {
             Some(target_id) => {
                 tx.execute(&format!("UPDATE OR IGNORE {link_table} SET {link_col} = ?1 WHERE {link_col} = ?2"), (target_id, old_id))?;
@@ -2956,7 +2999,19 @@ impl Cache {
             }
             None => {
                 tx.execute(&format!("UPDATE {table} SET name = ?1 WHERE id = ?2"), (new_name, old_id))?;
+                if table == "authors" {
+                    // The sort key followed the old name ("Doe, Jon"); the new
+                    // name gets its own, as calibre's author rename does.
+                    tx.execute("UPDATE authors SET sort = author_to_author_sort(?1) WHERE id = ?2", (new_name, old_id))?;
+                }
             }
+        }
+        // Every linked book's sort string and modification stamp, in the same
+        // transaction: Organize's `{author_sort}` and the author sort order
+        // read them.
+        for book_id in affected {
+            Self::sync_author_sort_in(&tx, book_id)?;
+            Self::touch_last_modified_in(&tx, book_id)?;
         }
         tx.commit()?;
         Ok(())
@@ -2966,8 +3021,25 @@ impl Cache {
     /// when there is no such author. Replay of [`crate::change_log::ChangeOp::AuthorSortSet`];
     /// not logged itself.
     pub(crate) fn set_author_sort_key(&self, name: &str, sort: &str) -> anyhow::Result<()> {
-        let conn = self.backend.conn.lock().unwrap();
-        conn.execute("UPDATE authors SET sort = ?1 WHERE name = ?2", (sort, name))?;
+        let mut conn = self.backend.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let Some(author_id) = tx.query_row("SELECT id FROM authors WHERE name = ?1", [name], |row| row.get::<_, i32>(0)).optional()? else { return Ok(()) };
+        // A book whose author_sort is the plain derivation follows the new key
+        // (calibre's `set_sort_for_authors`); one set by hand keeps its own.
+        let books = Self::books_of_author_in(&tx, author_id)?;
+        let mut following = Vec::new();
+        for book_id in books {
+            let current: String = tx.query_row("SELECT author_sort FROM books WHERE id = ?1", [book_id], |row| row.get(0))?;
+            if current == Self::derived_author_sort_in(&tx, book_id)? {
+                following.push(book_id);
+            }
+        }
+        tx.execute("UPDATE authors SET sort = ?1 WHERE id = ?2", (sort, author_id))?;
+        for book_id in following {
+            Self::sync_author_sort_in(&tx, book_id)?;
+            Self::touch_last_modified_in(&tx, book_id)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -3132,14 +3204,25 @@ impl Cache {
     /// (calibre's `author_sort_from_authors`). A book with no authors gets
     /// `"Unknown"`, the name calibre links in that case.
     pub(crate) fn sync_author_sort_in(conn: &rusqlite::Connection, book_id: i32) -> anyhow::Result<()> {
+        let author_sort = Self::derived_author_sort_in(conn, book_id)?;
+        conn.execute("UPDATE books SET author_sort = ?1 WHERE id = ?2", (author_sort, book_id))?;
+        Ok(())
+    }
+
+    /// What [`Cache::sync_author_sort_in`] would store for the book.
+    fn derived_author_sort_in(conn: &rusqlite::Connection, book_id: i32) -> anyhow::Result<String> {
         let mut stmt = conn.prepare(
             "SELECT COALESCE(NULLIF(a.sort, ''), author_to_author_sort(a.name)) FROM books_authors_link l JOIN authors a ON a.id = l.author WHERE l.book = ?1 ORDER BY l.id",
         )?;
         let sorts: Vec<String> = stmt.query_map([book_id], |r| r.get::<_, String>(0))?.collect::<Result<_, _>>()?;
-        drop(stmt);
-        let author_sort = if sorts.is_empty() { "Unknown".to_string() } else { sorts.join(" & ") };
-        conn.execute("UPDATE books SET author_sort = ?1 WHERE id = ?2", (author_sort, book_id))?;
-        Ok(())
+        Ok(if sorts.is_empty() { "Unknown".to_string() } else { sorts.join(" & ") })
+    }
+
+    /// The books linked to author `author_id`.
+    fn books_of_author_in(conn: &rusqlite::Connection, author_id: i32) -> anyhow::Result<Vec<i32>> {
+        let mut stmt = conn.prepare("SELECT book FROM books_authors_link WHERE author = ?1")?;
+        let ids = stmt.query_map([author_id], |r| r.get::<_, i32>(0))?.collect::<Result<_, _>>()?;
+        Ok(ids)
     }
 
     fn write_field_only(&self, book_id: i32, field: &str, value: &str) -> anyhow::Result<()> {
@@ -3561,18 +3644,59 @@ impl Cache {
     ///
     /// The result has one entry per item, in order.
     pub fn set_fields_per_book(&self, items: &[(i32, Vec<(String, String)>)]) -> Vec<anyhow::Result<()>> {
-        let mut results: Vec<anyhow::Result<()>> = Vec::with_capacity(items.len());
+        let ids: Vec<i32> = items.iter().map(|(id, _)| *id).collect();
+        self.set_fields_per_book_computed(&ids, false, &|idx, _, _| Ok(items[idx].1.clone())).into_iter().map(|r| r.map(|_| ())).collect()
+    }
+
+    /// [`Cache::set_fields_per_book`] for edits that depend on what a book has
+    /// *now*: `compute(index, book id, read)` is called **inside** the write
+    /// transaction, with `read(field)` returning the book's current `tags`,
+    /// `authors` or `languages`, and gives the `(field, value)` writes for it.
+    /// A relative edit ("add this tag") computed from a list read earlier, and
+    /// written later, silently reverted whatever another request wrote in
+    /// between. A book whose `compute` gives no writes is left alone (not
+    /// stamped, not logged).
+    ///
+    /// The result has one entry per id: the writes applied (empty: unchanged), or
+    /// the error.
+    pub fn edit_lists_for_books(&self, ids: &[i32], compute: &dyn Fn(i32, &dyn Fn(&str) -> anyhow::Result<Vec<String>>) -> anyhow::Result<Vec<(String, String)>>) -> Vec<anyhow::Result<Vec<(String, String)>>> {
+        self.set_fields_per_book_computed(ids, true, &|_, id, read| compute(id, read))
+    }
+
+    /// The current `tags`, `authors` or `languages` of a book, in stored order,
+    /// read on the caller's transaction.
+    fn list_field_in(conn: &rusqlite::Connection, book_id: i32, field: &str) -> anyhow::Result<Vec<String>> {
+        let sql = match field {
+            "tags" => "SELECT t.name FROM books_tags_link l JOIN tags t ON t.id = l.tag WHERE l.book = ?1 ORDER BY l.id",
+            "authors" => "SELECT a.name FROM books_authors_link l JOIN authors a ON a.id = l.author WHERE l.book = ?1 ORDER BY l.id",
+            "languages" => "SELECT g.lang_code FROM books_languages_link l JOIN languages g ON g.id = l.lang_code WHERE l.book = ?1 ORDER BY l.item_order",
+            other => anyhow::bail!("{other:?} is not a list field"),
+        };
+        let mut stmt = conn.prepare_cached(sql)?;
+        let names = stmt.query_map([book_id], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+        Ok(names)
+    }
+
+    fn set_fields_per_book_computed(
+        &self,
+        ids: &[i32],
+        skip_unchanged: bool,
+        compute: &dyn Fn(usize, i32, &dyn Fn(&str) -> anyhow::Result<Vec<String>>) -> anyhow::Result<Vec<(String, String)>>,
+    ) -> Vec<anyhow::Result<Vec<(String, String)>>> {
+        let mut results: Vec<anyhow::Result<Vec<(String, String)>>> = Vec::with_capacity(ids.len());
         let uuids: Vec<Option<String>> = {
             let conn = self.backend.conn.lock().unwrap();
             let mut stmt = match conn.prepare_cached("SELECT uuid FROM books WHERE id = ?1") {
                 Ok(s) => s,
                 Err(e) => {
                     let msg = format!("{e}");
-                    return items.iter().map(|_| Err(anyhow::anyhow!("{msg}"))).collect();
+                    return ids.iter().map(|_| Err(anyhow::anyhow!("{msg}"))).collect();
                 }
             };
-            items.iter().map(|(id, _)| stmt.query_row((id,), |row| row.get::<_, Option<String>>(0)).ok().flatten()).collect()
+            ids.iter().map(|id| stmt.query_row((id,), |row| row.get::<_, Option<String>>(0)).ok().flatten()).collect()
         };
+        // What was applied per book, for the log and the custom-column pass.
+        let mut applied: Vec<Vec<(String, String)>> = vec![Vec::new(); ids.len()];
 
         {
             let mut conn = self.backend.conn.lock().unwrap();
@@ -3580,15 +3704,19 @@ impl Cache {
                 Ok(tx) => tx,
                 Err(e) => {
                     let msg = format!("{e}");
-                    return items.iter().map(|_| Err(anyhow::anyhow!("{msg}"))).collect();
+                    return ids.iter().map(|_| Err(anyhow::anyhow!("{msg}"))).collect();
                 }
             };
-            for (idx, (id, changes)) in items.iter().enumerate() {
-                let one = (|| -> anyhow::Result<()> {
+            for (idx, id) in ids.iter().enumerate() {
+                let one = (|| -> anyhow::Result<Vec<(String, String)>> {
                     if uuids[idx].is_none() {
                         anyhow::bail!("Book {id} not found");
                     }
                     let sp = tx.savepoint()?;
+                    let changes = compute(idx, *id, &|field| Self::list_field_in(&sp, *id, field))?;
+                    if skip_unchanged && changes.is_empty() {
+                        return Ok(changes);
+                    }
                     // An explicit `author_sort` wins over the one a change of
                     // authors derives, as in `set_fields_for_books`.
                     let mut batchable: Vec<&(String, String)> = changes.iter().filter(|(f, _)| Self::is_batchable_field(f)).collect();
@@ -3598,19 +3726,22 @@ impl Cache {
                     }
                     Self::touch_last_modified_in(&sp, *id)?;
                     sp.commit()?;
-                    Ok(())
+                    Ok(changes)
                 })();
+                if let Ok(changes) = &one {
+                    applied[idx] = changes.clone();
+                }
                 results.push(one);
             }
             if let Err(e) = tx.commit() {
                 let msg = format!("{e}");
-                return items.iter().map(|_| Err(anyhow::anyhow!("{msg}"))).collect();
+                return ids.iter().map(|_| Err(anyhow::anyhow!("{msg}"))).collect();
             }
         }
 
         let mut ops = Vec::new();
-        for (idx, (_, changes)) in items.iter().enumerate() {
-            if let (Ok(()), Some(uuid)) = (&results[idx], &uuids[idx]) {
+        for (idx, changes) in applied.iter().enumerate() {
+            if let (Ok(_), Some(uuid)) = (&results[idx], &uuids[idx]) {
                 let mut batchable: Vec<&(String, String)> = changes.iter().filter(|(f, _)| Self::is_batchable_field(f)).collect();
                 batchable.sort_by_key(|c| c.0 == "author_sort");
                 for (field, value) in batchable {
@@ -3620,11 +3751,11 @@ impl Cache {
         }
         self.record_many(ops);
 
-        for (idx, (id, changes)) in items.iter().enumerate() {
+        for (idx, id) in ids.iter().enumerate() {
             if results[idx].is_err() {
                 continue;
             }
-            for (field, value) in changes.iter().filter(|(f, _)| !Self::is_batchable_field(f)) {
+            for (field, value) in applied[idx].iter().filter(|(f, _)| !Self::is_batchable_field(f)) {
                 if let Err(e) = self.set_field(*id, field, value) {
                     results[idx] = Err(e);
                     break;

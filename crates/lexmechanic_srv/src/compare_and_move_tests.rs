@@ -675,6 +675,33 @@ async fn a_previewed_plan_is_reused_to_apply_until_the_library_changes() {
     assert!(l.path.join("Moved/Alpha Primer.txt").is_file());
 }
 
+/// A write by another process (calibre desktop on the same `metadata.db`)
+/// moves neither the change log nor the row counts; a remembered plan must not
+/// survive it. And an applied plan is spent.
+#[tokio::test]
+async fn a_remembered_plan_is_dropped_after_another_process_writes_and_after_it_is_applied() {
+    let l = lib();
+    let a = l.add("a.txt", "Alpha Primer", "Ada Lovelace", b"alpha");
+    let request = |template: &str| json!({"organize": template, "book_ids": [a], "search": null, "path_prefix": null}).to_string();
+
+    let (_, plan) = l.post("/organize-library/default", json!({"book_ids": [a], "template": "Sorted/{title}"})).await;
+    let fingerprint = plan["plan_fingerprint"].as_str().unwrap().to_string();
+    assert!(crate::organize_library::recall_plan(&l.cache, &request("Sorted/{title}"), &fingerprint).is_some());
+    {
+        let other = rusqlite::Connection::open(l.path.join("metadata.db")).unwrap();
+        other.execute("INSERT INTO tags (name) VALUES ('written by another process')", []).unwrap();
+    }
+    assert!(crate::organize_library::recall_plan(&l.cache, &request("Sorted/{title}"), &fingerprint).is_none(), "an edit from another process invalidates the plan");
+
+    let (_, plan) = l.post("/organize-library/default", json!({"book_ids": [a], "template": "Moved/{title}"})).await;
+    let fingerprint = plan["plan_fingerprint"].as_str().unwrap().to_string();
+    assert!(crate::organize_library::recall_plan(&l.cache, &request("Moved/{title}"), &fingerprint).is_some());
+    let (status, started) = l.post("/organize-library/default", json!({"book_ids": [a], "template": "Moved/{title}", "dry_run": false, "plan_fingerprint": fingerprint})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{started}");
+    assert!(crate::organize_library::recall_plan(&l.cache, &request("Moved/{title}"), &fingerprint).is_none(), "an applied plan is forgotten");
+    l.wait_job(&started).await;
+}
+
 // ---------------------------------------------------------------------------
 // Folders and the naming convention (tranche 19b)
 // ---------------------------------------------------------------------------

@@ -644,3 +644,95 @@ fn duplicate_checks_use_the_opf_title_and_authors() {
     assert_eq!(report.skipped_duplicate_title, 1, "{report:?}");
     assert_eq!(report.books_added, 0);
 }
+
+/// A minimal PDF whose Info dictionary names `author`.
+fn pdf_with_author(title: &str, author: &str) -> Vec<u8> {
+    let objs = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>".to_string(),
+        format!("<< /Title ({title}) /Author ({author}) >>"),
+    ];
+    let mut out = String::from("%PDF-1.4\n");
+    let mut offsets = Vec::new();
+    for (i, o) in objs.iter().enumerate() {
+        offsets.push(out.len());
+        out.push_str(&format!("{} 0 obj\n{o}\nendobj\n", i + 1));
+    }
+    let xref = out.len();
+    out.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1));
+    for off in offsets {
+        out.push_str(&format!("{off:010} 00000 n \n"));
+    }
+    out.push_str(&format!("trailer\n<< /Size {} /Root 1 0 R /Info 4 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1));
+    out.into_bytes()
+}
+
+/// An imported book was filed under its first author's display name:
+/// `author_sort` "Frank Herbert", so `{author_sort}/{title}` and the sort by
+/// author both used the first name.
+#[test]
+fn an_imported_books_author_sort_is_the_sort_string_not_the_display_name() {
+    let (lib, cache) = library();
+    let src = tempfile::tempdir().unwrap();
+    write(&src.path().join("dune.pdf"), &pdf_with_author("Dune", "Frank Herbert"));
+    write(&src.path().join("two.epub"), &epub("Two Authors", "Jane Doe", "ts"));
+
+    let report = run(&cache, src.path(), &ImportOptions::default());
+    assert_eq!(report.books_added, 2, "{report:?}");
+
+    let id = report.added.iter().find(|a| a.title == "Dune").unwrap().book_id;
+    assert_eq!(field(&cache, id, "authors"), "Frank Herbert");
+    assert_eq!(field(&cache, id, "author_sort"), "Herbert, Frank");
+    let other = report.added.iter().find(|a| a.title == "Two Authors").unwrap().book_id;
+    assert_eq!(field(&cache, other, "author_sort"), "Doe, Jane");
+
+    // The log records what was stored, so a rebuild reproduces it.
+    let rebuilt_dir = tempfile::tempdir().unwrap();
+    let from = lib.path().join(crate::constants::LIBRARY_HANDLE_DIR_NAME);
+    let to = rebuilt_dir.path().join(crate::constants::LIBRARY_HANDLE_DIR_NAME);
+    for sub in ["changes", "snapshots"] {
+        fs::create_dir_all(to.join(sub)).unwrap();
+        if let Ok(entries) = fs::read_dir(from.join(sub)) {
+            for e in entries.flatten() {
+                fs::copy(e.path(), to.join(sub).join(e.file_name())).unwrap();
+            }
+        }
+    }
+    if let Ok(id) = fs::read(from.join("install-id")) {
+        fs::write(to.join("install-id"), id).unwrap();
+    }
+    let rebuilt = Cache::new(rebuilt_dir.path()).unwrap();
+    rebuilt.rebuild_from_change_log().unwrap();
+    let by_title = |t: &str| rebuilt.all_book_ids().unwrap().into_iter().find(|id| rebuilt.field_for(*id, "title").unwrap().as_deref() == Some(t)).unwrap();
+    assert_eq!(field(&rebuilt, by_title("Dune"), "author_sort"), "Herbert, Frank");
+}
+
+/// A source folder called `data` would put one book's file in the folder that
+/// holds another book's attached files; it is renamed like `.caltrash`.
+#[test]
+fn a_source_folder_named_data_is_kept_under_another_name() {
+    let src = Path::new("/src");
+    assert_eq!(kept_folder(src, Path::new("/src/Reports/data")), "Reports/_data");
+    assert_eq!(kept_folder(src, Path::new("/src/Reports/DATA/x")), "Reports/_DATA/x");
+    assert_eq!(kept_folder(src, Path::new("/src/mydata")), "mydata");
+}
+
+#[test]
+fn trashing_a_book_leaves_the_book_kept_in_its_data_folder_alone() {
+    let (lib, cache) = library();
+    let src = tempfile::tempdir().unwrap();
+    write(&src.path().join("Reports/report.pdf"), b"%PDF report");
+    write(&src.path().join("Reports/data/dataset.pdf"), b"%PDF dataset");
+
+    let report = run(&cache, src.path(), &ImportOptions { keep_structure: true, ..Default::default() });
+    assert_eq!(report.books_added, 2, "{report:?}");
+    let id_of = |t: &str| cache.all_book_ids().unwrap().into_iter().find(|id| cache.field_for(*id, "title").unwrap().as_deref() == Some(t)).unwrap();
+    let (a, b) = (id_of("report"), id_of("dataset"));
+    assert_eq!(cache.field_for(b, "path").unwrap().as_deref(), Some("Reports/_data"));
+
+    cache.delete_book(a).unwrap();
+    assert!(!lib.path().join("Reports/report.pdf").exists());
+    assert!(lib.path().join("Reports/_data/dataset.pdf").is_file(), "the other book's file stays");
+    assert!(cache.all_book_ids().unwrap().contains(&b));
+}

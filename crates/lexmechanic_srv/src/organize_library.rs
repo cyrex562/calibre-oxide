@@ -103,7 +103,21 @@ fn remember_plan(cache: &lexmechanic_db::cache::Cache, key: &str, watermark: Str
 pub(crate) fn recall_plan(cache: &lexmechanic_db::cache::Cache, key: &str, fingerprint: &str) -> Option<organize::OrganizePlan> {
     let hit = remembered_plans().lock().unwrap().iter().rev().find(|(at, library, k, _, plan)| at.elapsed() < PLAN_TTL && *library == cache.backend.library_path && k == key && plan.fingerprint == fingerprint).map(|(_, _, _, mark, plan)| (mark.clone(), plan.clone()));
     let (mark, plan) = hit?;
-    (cache.change_watermark() == mark).then_some(plan)
+    (plan_watermark(cache) == mark).then_some(plan)
+}
+
+/// What a remembered plan is valid for: the library's change watermark, plus
+/// the database's `data_version`, which moves when another process (calibre
+/// desktop on the same `metadata.db`) writes -- a write the change log and the
+/// row counts do not see.
+fn plan_watermark(cache: &lexmechanic_db::cache::Cache) -> String {
+    format!("{}#{}", cache.change_watermark(), cache.foreign_write_version())
+}
+
+/// Forgets the plans remembered for this request: an applied plan is spent, and
+/// a second apply of it plans afresh.
+fn forget_plan(cache: &lexmechanic_db::cache::Cache, key: &str) {
+    remembered_plans().lock().unwrap().retain(|(_, library, k, ..)| !(*library == cache.backend.library_path && k == key));
 }
 
 /// What a dry run answers.
@@ -142,13 +156,13 @@ pub async fn organize(State(state): State<AppState>, Path(library_id): Path<Stri
         }
         _ => None,
     };
-    let (plan_cache, plan_template) = (cache.clone(), template.clone());
+    let (plan_cache, plan_template, plan_key) = (cache.clone(), template.clone(), key.clone());
     let plan = if let Some(plan) = reused {
         plan
     } else {
         let dry_run = body.dry_run;
         tokio::task::spawn_blocking(move || -> Result<organize::OrganizePlan, ServerError> {
-        let watermark = plan_cache.change_watermark();
+        let watermark = plan_watermark(&plan_cache);
         let scope = if let Some(ids) = body.book_ids {
             Scope::Ids(ids)
         } else if let Some(query) = body.search {
@@ -160,7 +174,7 @@ pub async fn organize(State(state): State<AppState>, Path(library_id): Path<Stri
         };
         let plan = organize::plan(&plan_cache, &plan_template, &scope).map_err(internal)?;
         if dry_run {
-            remember_plan(&plan_cache, &key, watermark, &plan);
+            remember_plan(&plan_cache, &plan_key, watermark, &plan);
         }
         Ok(plan)
         })
@@ -178,6 +192,7 @@ pub async fn organize(State(state): State<AppState>, Path(library_id): Path<Stri
     if plan.books.is_empty() {
         return Ok(Json(json!({"error": "nothing to organize", "books": 0})).into_response());
     }
+    forget_plan(&cache, &key);
     let params = JobParams { organize: Some(plan), ..Default::default() };
     Ok(started("organize", library_jobs::start_with(cache, JobKind::Organize, None, params)))
 }
@@ -258,13 +273,13 @@ pub async fn move_books(State(state): State<AppState>, Path(library_id): Path<St
         }
         _ => None,
     };
-    let (plan_cache, plan_folder) = (cache.clone(), folder.clone());
+    let (plan_cache, plan_folder, plan_key) = (cache.clone(), folder.clone(), key.clone());
     let plan = if let Some(plan) = reused {
         plan
     } else {
         let dry_run = body.dry_run;
         tokio::task::spawn_blocking(move || -> Result<organize::OrganizePlan, ServerError> {
-        let watermark = plan_cache.change_watermark();
+        let watermark = plan_watermark(&plan_cache);
         for id in &ids {
             if plan_cache.field_for(*id, "path").map_err(internal)?.is_none() {
                 return Err(ServerError::NotFound(format!("no book with id {id}")));
@@ -272,7 +287,7 @@ pub async fn move_books(State(state): State<AppState>, Path(library_id): Path<St
         }
         let plan = organize::plan_to(&plan_cache, organize::Target::Folder(&plan_folder), &Scope::Ids(ids)).map_err(|e| ServerError::BadRequest(format!("{e:#}")))?;
         if dry_run {
-            remember_plan(&plan_cache, &key, watermark, &plan);
+            remember_plan(&plan_cache, &plan_key, watermark, &plan);
         }
         Ok(plan)
         })
@@ -291,6 +306,7 @@ pub async fn move_books(State(state): State<AppState>, Path(library_id): Path<St
     if plan.books.is_empty() {
         return Err(ServerError::BadRequest("nothing to move: the books are already in that folder, or cannot be moved (see skipped in the dry run)".into()));
     }
+    forget_plan(&cache, &key);
     let params = JobParams { organize: Some(plan), ..Default::default() };
     Ok(started("organize", library_jobs::start_with(cache, JobKind::Organize, None, params)))
 }

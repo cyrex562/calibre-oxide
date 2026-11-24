@@ -61,8 +61,14 @@ describe("keepAndTrashGroup", () => {
     expect(api.runResolve).not.toHaveBeenCalled();
   });
 
-  it("says so when not every other copy was trashed", async () => {
+  it("returns the run with what went wrong when only some copies were trashed, so its Undo can still be offered", async () => {
     const api = fakeApi({ runResolve: vi.fn(async () => ({ run_id: "r", action: "keep_best_trash_rest", groups_planned: 1, groups_done: 0, done_groups: [], books_trashed: 1, bytes_freed: 0, trashed_files: [], errors: [["g1", "locked"]], cancelled: false, fully_restorable: true })) as unknown as DedupeApi["runResolve"] });
+    const out = await keepAndTrashGroup(group([1, 2, 3]), 2, api);
+    expect(out).toMatchObject({ runId: "r", partial: true, trashedCount: 1, error: "locked" });
+  });
+
+  it("is a plain failure when nothing was trashed", async () => {
+    const api = fakeApi({ runResolve: vi.fn(async () => ({ run_id: "r", action: "keep_best_trash_rest", groups_planned: 1, groups_done: 0, done_groups: [], books_trashed: 0, bytes_freed: 0, trashed_files: [], errors: [["g1", "locked"]], cancelled: false, fully_restorable: true })) as unknown as DedupeApi["runResolve"] });
     await expect(keepAndTrashGroup(group([1, 2, 3]), 2, api)).rejects.toThrow("locked");
   });
 

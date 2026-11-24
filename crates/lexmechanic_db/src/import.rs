@@ -147,7 +147,10 @@ impl Default for ImportOptions {
 /// The folder of `dir` under `source`, as a library-relative path: each part
 /// made safe as a folder name (characters a platform refuses become `_`, a
 /// trailing dot or space goes, a reserved name gets a `_`), `""` for `source`
-/// itself. A part that would be the library's own state folder is renamed too.
+/// itself. A part that would be the library's own state folder is renamed too,
+/// and so is `data`: a book's attached files live in `<its folder>/data`, so a
+/// source folder of that name would hold another book's files in the
+/// first book's data directory.
 pub fn kept_folder(source: &Path, dir: &Path) -> String {
     let Ok(rel) = dir.strip_prefix(source) else { return String::new() };
     let mut parts: Vec<String> = Vec::new();
@@ -158,7 +161,7 @@ pub fn kept_folder(source: &Path, dir: &Path) -> String {
             name = "_".to_string();
         }
         let lower = name.to_lowercase();
-        if lexmechanic_utils::filenames::is_windows_reserved_name(&name) || lower == LIBRARY_HANDLE_DIR_NAME.to_lowercase() || lower == crate::constants::LEGACY_LIBRARY_HANDLE_DIR_NAME || lower == ".caltrash" {
+        if lexmechanic_utils::filenames::is_windows_reserved_name(&name) || lower == LIBRARY_HANDLE_DIR_NAME.to_lowercase() || lower == crate::constants::LEGACY_LIBRARY_HANDLE_DIR_NAME || lower == ".caltrash" || lower == crate::constants::DATA_DIR_NAME {
             name = format!("_{name}");
         }
         parts.push(name.chars().take(120).collect());

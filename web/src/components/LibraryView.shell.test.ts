@@ -315,6 +315,31 @@ describe("sorting", () => {
   });
 });
 
+describe("sorting against the stored preferences", () => {
+  it("is not undone by the stored sort arriving after a header click, and quick clicks save in order", async () => {
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((r) => (release = r));
+    settingsMocks.fetchProfile.mockImplementation(async (name: string) => {
+      if (name !== "library-prefs") return null;
+      await held;
+      return { sort: "timestamp", sortOrder: "desc", duplicateDefault: "skip" };
+    });
+    const el = await mountView();
+    const title = el.querySelector<HTMLElement>("th[data-key='title'] .header-button")!;
+    click(title); // ascending
+    await settle();
+    click(title); // descending
+    await settle();
+    release();
+    await settle();
+    // The header still shows what the user chose, not the stored sort that arrived late.
+    expect(el.querySelector("th[data-key='title']")!.getAttribute("aria-sort")).toBe("descending");
+    const saved = settingsMocks.saveProfile.mock.calls.filter((c) => c[0] === "library-prefs").map((c) => c[1] as { sort: string; sortOrder: string });
+    expect(saved.length).toBeGreaterThanOrEqual(1);
+    expect(saved[saved.length - 1]).toMatchObject({ sort: "title", sortOrder: "desc" });
+  });
+});
+
 describe("narrow windows", () => {
   it("keeps the table at full width and opens each side panel as a drawer over it", async () => {
     window.innerWidth = 900;

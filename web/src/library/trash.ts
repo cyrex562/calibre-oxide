@@ -121,7 +121,8 @@ export function describeTrash(listing: TrashListing): string {
   const days = Math.round(listing.expire_after_seconds / 86400);
   const base = `${listing.count} item${listing.count === 1 ? "" : "s"}, ${formatSize(listing.total_size)}. Items are deleted for good after ${days} day${days === 1 ? "" : "s"}`;
   // Books a duplicate run removed are kept far longer, so its Undo keeps working: say so, or a row's "179 days left" contradicts the header.
-  const longest = Math.max(0, ...listing.entries.map((e) => e.expires_at - e.deleted_at));
+  // reduce, not Math.max(...): spreading a hundred thousand entries throws a RangeError.
+  const longest = listing.entries.reduce((most, e) => Math.max(most, e.expires_at - e.deleted_at), 0);
   if (longest > listing.expire_after_seconds * 1.5) {
     const long = Math.round(longest / 86400);
     return `${base} (${long} days for books a duplicate run removed, so that run can still be undone).`;

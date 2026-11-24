@@ -104,13 +104,63 @@ pub fn folder_of(book_id: i64, path: &str) -> String {
     }
 }
 
-/// The folder tree: one query, no disk access.
+/// `Title (n)` -> `Title`: the text of a calibre-style per-book directory
+/// name, or `None` when the segment does not end in ` (digits)`.
+fn per_book_dir_title(segment: &str) -> Option<&str> {
+    let inner = segment.strip_suffix(')')?;
+    let (title, digits) = inner.rsplit_once(" (")?;
+    (!title.is_empty() && !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then_some(title)
+}
+
+/// The folder tree: two queries, no disk access.
+///
+/// A per-book directory is recognised by its name ending in the book's own id
+/// ([`folder_of`]), or -- for books whose id changed since the directory was
+/// named (an absorbed library keeps the source's ids, a restore may get a new
+/// one) -- by its shape: `Title (n)` that no other book shares or sits under,
+/// holding formats named `Title - Author`, as calibre names them. A folder
+/// someone called `Dune (1965)` with a plain `Dune.pdf` in it is not one.
 pub fn list(cache: &Cache) -> Result<FolderTree> {
     let paths: Vec<String> = {
         let conn = cache.backend.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT id, path FROM books")?;
-        let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().map(|(id, p)| folder_of(id, &p.unwrap_or_default())).collect()
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut names: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+        let mut stmt = conn.prepare("SELECT book, name FROM data")?;
+        for row in stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))? {
+            let (book, name) = row?;
+            names.entry(book).or_default().push(name.to_lowercase());
+        }
+        let mut occupied: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut ancestors: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (_, p) in &rows {
+            let parts: Vec<&str> = p.as_deref().unwrap_or("").split(['/', '\\']).map(str::trim).filter(|p| !p.is_empty() && *p != ".").collect();
+            *occupied.entry(path_key(&parts.join("/"))).or_default() += 1;
+            for depth in 1..parts.len() {
+                ancestors.insert(path_key(&parts[..depth].join("/")));
+            }
+        }
+        rows.into_iter()
+            .map(|(id, p)| {
+                let p = p.unwrap_or_default();
+                let by_id = folder_of(id, &p);
+                if by_id != norm(&p) {
+                    return by_id;
+                }
+                let parts: Vec<&str> = p.split(['/', '\\']).map(str::trim).filter(|p| !p.is_empty() && *p != ".").collect();
+                if let Some((last, rest)) = parts.split_last() {
+                    if let Some(title) = per_book_dir_title(last) {
+                        let key = path_key(&parts.join("/"));
+                        let alone = occupied.get(&key) == Some(&1) && !ancestors.contains(&key);
+                        let prefix = format!("{} - ", title.to_lowercase());
+                        if alone && names.get(&id).is_some_and(|n| n.iter().any(|n| n.starts_with(&prefix))) {
+                            return rest.join("/");
+                        }
+                    }
+                }
+                by_id
+            })
+            .collect()
     };
     let total = paths.len();
     // lower-cased path -> entry
@@ -317,6 +367,28 @@ mod tests {
         let tree = list(&cache).unwrap();
         assert_eq!(tree.total, 3);
         assert_eq!(rows(&tree), vec![("Novels".to_string(), 1, 1), ("Unknown".to_string(), 2, 2)], "one node per real folder, none per book");
+    }
+
+    #[test]
+    fn a_per_book_directory_is_recognised_by_its_shape_when_its_number_is_not_the_books_id() {
+        let (dir, cache) = library();
+        for name in ["Absorbed", "Dune", "Shared A", "Shared B"] {
+            write(&dir.path().join(format!("inbox/{name}.pdf")), name.as_bytes());
+        }
+        index(dir.path(), &cache);
+        let (absorbed, dune, a, b) = (id(&cache, "Absorbed"), id(&cache, "Dune"), id(&cache, "Shared A"), id(&cache, "Shared B"));
+        // An absorbed book keeps the source library's id in its directory name.
+        cache.set_book_path(absorbed, "Herbert, Frank/Absorbed (9001)").unwrap();
+        cache.backend.conn.lock().unwrap().execute("UPDATE data SET name = 'Absorbed - Frank Herbert' WHERE book = ?1", [absorbed]).unwrap();
+        // A folder a person made, holding a plainly named file, is a folder.
+        cache.set_book_path(dune, "Fiction/Dune (1965)").unwrap();
+        // Two books in one `Title (n)` directory: it is shared, so it is a folder.
+        cache.set_book_path(a, "Shelf/Pair (7)").unwrap();
+        cache.set_book_path(b, "Shelf/Pair (7)").unwrap();
+        cache.backend.conn.lock().unwrap().execute("UPDATE data SET name = 'Pair - Someone' WHERE book IN (?1, ?2)", [a, b]).unwrap();
+
+        let paths: Vec<String> = list(&cache).unwrap().folders.into_iter().map(|f| f.path).collect();
+        assert_eq!(paths, vec!["Fiction", "Fiction/Dune (1965)", "Herbert, Frank", "Shelf", "Shelf/Pair (7)"]);
     }
 
     #[test]

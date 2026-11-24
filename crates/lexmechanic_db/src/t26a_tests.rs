@@ -156,3 +156,118 @@ fn an_imported_book_with_no_publication_date_has_the_undefined_date() {
     let timestamp = cache.field_for(id, "timestamp").unwrap().unwrap_or_default();
     assert!(!timestamp.starts_with("0101"), "{timestamp:?}");
 }
+
+// --- #1 of the PR #1000 review: a book at `<path>/data` is not the data files of `<path>` ---
+
+#[test]
+fn a_book_scanned_in_a_data_subfolder_is_not_deleted_with_the_book_above_it() {
+    let (dir, cache) = library();
+    write(&dir.path().join("Reports/report.pdf"), b"%PDF report");
+    write(&dir.path().join("Reports/data/dataset.pdf"), b"%PDF dataset");
+    index(dir.path(), &cache);
+    let ids = cache.all_book_ids().unwrap();
+    assert_eq!(ids.len(), 2);
+    let id_of = |t: &str| ids.iter().copied().find(|id| cache.field_for(*id, "title").unwrap().as_deref() == Some(t)).unwrap();
+    let (a, b) = (id_of("report"), id_of("dataset"));
+    assert_eq!(cache.field_for(b, "path").unwrap().as_deref(), Some("Reports/data"));
+
+    assert!(!cache.folder_is_dedicated(a, "Reports").unwrap(), "a book lives under Reports/data");
+    assert!(crate::extra_files::list_extra_files(&cache, a, crate::constants::DATA_FILE_PATTERN).unwrap().is_empty(), "dataset.pdf is a book's format, not an attached file");
+    let own: Vec<String> = cache.own_files(a, "Reports", false).unwrap().into_iter().map(|f| f.rel).collect();
+    assert_eq!(own, vec!["Reports/report.pdf".to_string()]);
+
+    cache.delete_book(a).unwrap();
+    assert!(!dir.path().join("Reports/report.pdf").exists());
+    assert!(dir.path().join("Reports/data/dataset.pdf").is_file(), "the other book's file was trashed with this one");
+}
+
+// --- #2: add paths store the sort string ----------------------------------
+
+#[test]
+fn add_book_and_update_metadata_store_the_sort_string_and_a_rebuild_agrees() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = {
+        let cache = Cache::new(dir.path()).unwrap();
+        let source = dir.path().join("x.pdf");
+        write(&source, b"%PDF x");
+        let mut meta = lexmechanic_ebooks::metadata::MetaInformation::default();
+        meta.title = "Pair".to_string();
+        meta.authors = vec!["Frank Herbert".to_string(), "Jane Doe".to_string()];
+        let id = cache.add_book(&source, &meta).unwrap();
+        assert_eq!(cache.field_for(id, "author_sort").unwrap().as_deref(), Some("Herbert, Frank & Doe, Jane"));
+
+        cache.update_book_metadata(id, "Pair", "Mary Smith").unwrap();
+        assert_eq!(cache.field_for(id, "author_sort").unwrap().as_deref(), Some("Smith, Mary"));
+        id
+    };
+    let cache = Cache::new(dir.path()).unwrap();
+    let before = cache.field_for(id, "author_sort").unwrap();
+    cache.rebuild_from_change_log().unwrap();
+    let id = cache.all_book_ids().unwrap()[0];
+    assert_eq!(cache.field_for(id, "author_sort").unwrap(), before);
+}
+
+// --- #3: renaming or merging an author updates the books -------------------
+
+#[test]
+fn renaming_or_merging_an_author_updates_the_books_sort_and_stamp() {
+    let (dir, cache) = library();
+    write(&dir.path().join("inbox/One.pdf"), b"%PDF one");
+    write(&dir.path().join("inbox/Two.pdf"), b"%PDF two");
+    index(dir.path(), &cache);
+    let ids = cache.all_book_ids().unwrap();
+    cache.set_field(ids[0], "authors", "Jon Doe").unwrap();
+    cache.set_field(ids[1], "authors", "Ann Lee").unwrap();
+    assert_eq!(cache.field_for(ids[0], "author_sort").unwrap().as_deref(), Some("Doe, Jon"));
+    let stamp = cache.field_for(ids[0], "last_modified").unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+
+    let jon = cache.item_id_by_name("authors", "Jon Doe").unwrap().unwrap();
+    cache.rename_author(jon, "Mary Smith").unwrap();
+    assert_eq!(cache.field_for(ids[0], "author_sort").unwrap().as_deref(), Some("Smith, Mary"));
+    assert_ne!(cache.field_for(ids[0], "last_modified").unwrap(), stamp);
+
+    // Merge into an existing author.
+    let mary = cache.item_id_by_name("authors", "Mary Smith").unwrap().unwrap();
+    cache.rename_author(mary, "Ann Lee").unwrap();
+    assert_eq!(cache.field_for(ids[0], "author_sort").unwrap().as_deref(), Some("Lee, Ann"));
+
+    // A changed sort key reaches the books that follow it.
+    cache.set_author_sort_key("Ann Lee", "Lee-Key, Ann").unwrap();
+    assert_eq!(cache.field_for(ids[0], "author_sort").unwrap().as_deref(), Some("Lee-Key, Ann"));
+    assert_eq!(cache.field_for(ids[1], "author_sort").unwrap().as_deref(), Some("Lee-Key, Ann"));
+}
+
+// --- #6: a relative list edit is computed inside the write transaction ------
+
+#[test]
+fn a_relative_list_edit_is_computed_from_what_the_book_has_when_it_is_written() {
+    let (dir, cache) = library();
+    write(&dir.path().join("inbox/One.pdf"), b"%PDF one");
+    write(&dir.path().join("inbox/Two.pdf"), b"%PDF two");
+    index(dir.path(), &cache);
+    let ids = cache.all_book_ids().unwrap();
+    cache.set_field(ids[0], "tags", "a, b").unwrap();
+    // Written after any read the caller might have made earlier.
+    cache.set_field(ids[1], "tags", "keep, me").unwrap();
+
+    let results = cache.edit_lists_for_books(&ids, &|_, read| {
+        let mut tags = read("tags")?;
+        if tags.iter().any(|t| t == "b") {
+            tags.retain(|t| t != "b");
+            tags.push("c".to_string());
+            Ok(vec![("tags".to_string(), tags.join(", "))])
+        } else {
+            Ok(Vec::new())
+        }
+    });
+    assert_eq!(results[0].as_ref().unwrap().len(), 1);
+    assert!(results[1].as_ref().unwrap().is_empty(), "nothing to change is not a write");
+    assert_eq!(cache.field_for(ids[0], "tags").unwrap().as_deref(), Some("a, c"));
+    assert_eq!(cache.field_for(ids[1], "tags").unwrap().as_deref(), Some("keep, me"));
+
+    // A rebuild reproduces it.
+    cache.rebuild_from_change_log().unwrap();
+    let id = cache.all_book_ids().unwrap()[0];
+    assert_eq!(cache.field_for(id, "tags").unwrap().as_deref(), Some("a, c"));
+}
