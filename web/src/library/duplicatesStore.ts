@@ -94,15 +94,25 @@ export function createDuplicatesStore(api: DuplicatesApi = realApi, pageSize = P
     state.exemptionsApplied = page.exemptions_applied ?? 0;
   }
 
+  /**
+   * Which page read is the latest one. Filters and pages change faster than
+   * the server answers; a reply for a request that has since been replaced
+   * must not overwrite the newer page (the way `listToken` guards the book list).
+   */
+  let pageToken = 0;
+
   /** Reads the current page from the server. A page past the end (after groups left) steps back. */
   async function load(): Promise<void> {
+    const token = ++pageToken;
     state.loading = true;
     state.error = null;
     try {
       let page = await api.fetchDuplicateGroups(filtersToQuery(state.filters, state.offset, state.pageSize));
+      if (token !== pageToken) return;
       if (page.has_scan && page.total > 0 && page.groups.length === 0 && state.offset > 0) {
         const last = Math.floor((page.total - 1) / state.pageSize) * state.pageSize;
         page = await api.fetchDuplicateGroups(filtersToQuery(state.filters, last, state.pageSize));
+        if (token !== pageToken) return;
       }
       if (!page.has_scan) {
         state.hasScan = false;
@@ -113,9 +123,9 @@ export function createDuplicatesStore(api: DuplicatesApi = realApi, pageSize = P
       }
       apply(page);
     } catch (e) {
-      state.error = e instanceof Error ? e.message : String(e);
+      if (token === pageToken) state.error = e instanceof Error ? e.message : String(e);
     } finally {
-      state.loading = false;
+      if (token === pageToken) state.loading = false;
     }
   }
 
@@ -192,8 +202,11 @@ export function createDuplicatesStore(api: DuplicatesApi = realApi, pageSize = P
 
   /** Re-reads the current page quietly so it fills up again from the next groups. */
   async function refill(): Promise<void> {
+    const token = ++pageToken;
     try {
       const page = await api.fetchDuplicateGroups(filtersToQuery(state.filters, state.offset, state.pageSize));
+      if (token !== pageToken) return;
+      state.loading = false;
       if (page.has_scan) {
         if (page.groups.length === 0 && page.total > 0 && state.offset > 0) {
           state.offset = Math.floor((page.total - 1) / state.pageSize) * state.pageSize;

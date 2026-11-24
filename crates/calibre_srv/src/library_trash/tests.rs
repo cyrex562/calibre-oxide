@@ -62,7 +62,7 @@ async fn delete_lists_in_the_trash_and_restores_through_the_routes() {
 
     let (status, body) = call(&router, "POST", &format!("/cdb/delete-books/{id}"), None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body, json!({}), "nothing failed: it went into .caltrash, not an OS bin");
+    assert_eq!(body, json!({"deleted": [id]}), "nothing failed: it went into .caltrash, not an OS bin");
     assert!(!dir.path().join("Shelf/a.pdf").exists());
 
     let (status, listing) = call(&router, "GET", "/trash/-", None).await;
@@ -128,6 +128,47 @@ async fn a_removed_format_is_restored_by_naming_the_format() {
     let (status, body) = call(&router, "POST", "/trash/restore/-", Some(json!({"kind": "format", "key": entry["key"], "format": "EPUB"}))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(std::fs::read(dir.path().join("a.epub")).unwrap(), b"epub");
+}
+
+/// Listing the trash must not delete anything, however old an entry is; only
+/// the explicit expire route does.
+#[tokio::test]
+async fn a_get_never_expires_old_entries_but_the_post_does() {
+    let (dir, cache, router) = app();
+    let id = book(&cache, dir.path(), "a.pdf", "A");
+    cache.delete_book(id).unwrap();
+
+    // Age the entry to the epoch.
+    let manifest = walk_for(&dir.path().join(".caltrash"), "oxide-trash.json").expect("a trash manifest");
+    let text = std::fs::read_to_string(&manifest).unwrap();
+    let mut value: Value = serde_json::from_str(&text).unwrap();
+    value["deleted_at"] = json!(1);
+    std::fs::write(&manifest, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+    for _ in 0..2 {
+        let (status, listing) = call(&router, "GET", "/trash/-", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listing["count"], 1, "a read must not expire: {listing}");
+    }
+    let (status, body) = call(&router, "POST", "/trash/expire/-", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["removed"].as_array().map(Vec::len), Some(1), "{body}");
+    let (_, listing) = call(&router, "GET", "/trash/-", None).await;
+    assert_eq!(listing["count"], 0);
+}
+
+fn walk_for(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            if let Some(found) = walk_for(&p, name) {
+                return Some(found);
+            }
+        } else if p.file_name().is_some_and(|n| n == name) {
+            return Some(p);
+        }
+    }
+    None
 }
 
 #[tokio::test]

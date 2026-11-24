@@ -132,6 +132,30 @@ function fold(text: string): { s: string; map: number[] } {
 
 const isWordChar = (c: string) => /[\p{L}\p{N}]/u.test(c);
 
+interface Folded {
+  s: string;
+  map: number[];
+  /** First letters of the words, for matching "wwn" against "Worlds Without Number". */
+  initials: string;
+}
+
+/**
+ * A value's folded form, computed once per value object. `suggest` runs on
+ * every keystroke over every known value (tens of thousands of authors);
+ * folding each of them each time was most of its cost.
+ */
+const foldedCache = new WeakMap<FieldValue, Folded>();
+
+function foldedOf(v: FieldValue): Folded {
+  let f = foldedCache.get(v);
+  if (!f) {
+    const { s, map } = fold(v.name);
+    f = { s, map, initials: s.split(/[^\p{L}\p{N}]+/u).filter(Boolean).map((w) => w[0]).join("") };
+    foldedCache.set(v, f);
+  }
+  return f;
+}
+
 /** Splits text into the segments before the last separator and the one being typed. */
 export function splitSegments(text: string, separator: string | null): { before: string[]; current: string } {
   if (!separator) return { before: [], current: text };
@@ -170,7 +194,7 @@ export function suggest(values: FieldValue[], text: string, opts: SuggestOptions
 
   for (const v of values) {
     if (v.name === typed) continue;
-    const { s, map } = fold(v.name);
+    const { s, map, initials } = foldedOf(v);
     if (used.has(s)) continue;
     const range = (from: number): [number, number] => [map[from], map[from + q.length]];
     let rank = -1;
@@ -187,7 +211,6 @@ export function suggest(values: FieldValue[], text: string, opts: SuggestOptions
         }
       }
       if (rank < 0 && compact) {
-        const initials = s.split(/[^\p{L}\p{N}]+/u).filter(Boolean).map((w) => w[0]).join("");
         if (initials.startsWith(q)) rank = 2;
       }
       if (rank < 0) {
@@ -227,7 +250,10 @@ const cache = new Map<string, Promise<FieldValue[]>>();
 
 async function load(field: string): Promise<FieldValue[]> {
   const page = await fetchCategoryValues(field);
-  return page.items.map((i) => ({ name: i.name, count: i.count }));
+  const values = page.items.map((i) => ({ name: i.name, count: i.count }));
+  // Folded now, once, so the first keystroke does not pay for all of them.
+  for (const v of values) foldedOf(v);
+  return values;
 }
 
 /**

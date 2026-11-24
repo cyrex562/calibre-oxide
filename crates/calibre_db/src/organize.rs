@@ -19,10 +19,12 @@
 //!   sidecars are left where they are (covers live under `.calibre-oxide`);
 //!   an old folder is removed only once it is empty (`remove_dir`, never
 //!   recursive).
-//! - **Journaled.** Each rename is `LibraryHandle::rename_atomic`. The
-//!   database follows through `Cache::set_book_path` and
-//!   `Cache::set_format_name`, which write the change log, so a rebuild
-//!   reproduces the result.
+//! - **Journaled.** Each rename is `LibraryHandle::rename_atomic` (or its
+//!   `_no_replace` form: the target is never replaced, even by a file that
+//!   appears after the check). The database follows through
+//!   `Cache::set_book_location`, which writes the folder and every format's
+//!   name in one transaction and one change-log entry, so a rebuild reproduces
+//!   the result and a failure leaves no half-written names.
 //! - **One book at a time, all or nothing.** If a rename of one book's files
 //!   fails (a different volume behind a junction, a locked file), the files of
 //!   that book already moved go back and the book is reported as failed; nothing
@@ -34,9 +36,11 @@
 //!   other (`POST /move-books`, `POST /unorganize-library`). The folder is
 //!   checked by [`validate_folder`]: relative to the library, no `..`, nothing
 //!   reserved, no symlink on the way out.
-//! - **Undoable.** Every run writes `.calibre-oxide/organize-runs/<run_id>.json`
+//! - **Undoable.** Every run writes `.calibre-oxide/organize-runs/<run_id>.jsonl`
 //!   with each book's old and new place; [`undo`] reverses it, skipping books
-//!   changed since.
+//!   changed since. The journal is append-only and each book's entry is on disk
+//!   *before* its files move (see [`crate::run_journal`]), so a crash leaves no
+//!   move without an undo entry.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
@@ -98,6 +102,13 @@ pub struct OrganizePlan {
     /// Books already where the template puts them.
     pub already_organized: usize,
     pub fingerprint: String,
+    /// Things worth knowing about books that are still planned (a path so long
+    /// Windows tools may refuse it).
+    pub warnings: Vec<Skipped>,
+    /// A folder rename that only changes case: the directory itself is renamed
+    /// (through a temporary name) after the books move, because on a
+    /// case-insensitive volume moving the files leaves the old spelling.
+    pub case_fix_folder: Option<String>,
 }
 
 impl OrganizePlan {
@@ -112,10 +123,16 @@ impl OrganizePlan {
 fn join_rel(dir: &str, file: &str) -> String {
     if dir.is_empty() {
         file.to_string()
+    } else if file.is_empty() {
+        dir.to_string()
     } else {
         format!("{dir}/{file}")
     }
 }
+
+/// Absolute paths longer than this get a warning in the plan: Windows tools
+/// that predate long-path support stop at 260.
+const MAX_COMFORTABLE_PATH: usize = 240;
 
 fn clip(component: &str) -> String {
     component.chars().take(120).collect::<String>().trim().trim_end_matches('.').to_string()
@@ -127,7 +144,18 @@ fn components(cache: &Cache, book_id: i32, template: &str) -> Result<Vec<String>
     let values = CacheValueSource::new(cache, book_id)?;
     let functions = CacheFunctions::new(cache, book_id);
     let rendered = string_format::evaluate_template(template, &values, &CacheCatalog, &functions).map_err(|e| anyhow!("{e}"))?;
-    let mut parts: Vec<String> = rendered.split(['/', '\\']).map(str::trim).filter(|s| !s.is_empty()).map(sanitize_file_name).map(|s| clip(&s)).filter(|s| !s.is_empty() && s != "..").collect();
+    // Each component gets the checks a typed-in folder gets (`validate_folder`):
+    // a device name like CON or NUL is not creatable on Windows, so it is mapped
+    // aside (`_CON`) the way calibre's save-to-disk does.
+    let mut parts: Vec<String> = rendered
+        .split(['/', '\\'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(sanitize_file_name)
+        .map(|s| clip(&s))
+        .map(|s| calibre_utils::filenames::safe_component(&s))
+        .filter(|s| !s.is_empty() && s != "..")
+        .collect();
     if parts.is_empty() {
         parts.push(book_id.to_string());
     }
@@ -161,11 +189,10 @@ fn in_scope(cache: &Cache, scope: &Scope) -> Result<Vec<i32>> {
         Scope::All => cache.all_book_ids()?,
         Scope::Ids(ids) => ids.clone(),
         Scope::PathPrefix(prefix) => {
-            let prefix = prefix.trim_matches(['/', '\\']).replace('\\', "/").to_lowercase();
             let mut out = Vec::new();
             for id in cache.all_book_ids()? {
-                let path = cache.field_for(id, "path")?.unwrap_or_default().replace('\\', "/").to_lowercase();
-                if prefix.is_empty() || path == prefix || path.starts_with(&format!("{prefix}/")) {
+                let path = cache.field_for(id, "path")?.unwrap_or_default();
+                if calibre_utils::filenames::path_is_within(&path, prefix) {
                     out.push(id);
                 }
             }
@@ -193,19 +220,18 @@ pub enum Target<'a> {
 }
 
 /// `path` with its leading `from` folder replaced by `to` (`None` when `path`
-/// is not at or under `from`). Segment-wise and case-insensitive on `from`.
+/// is not at or under `from`). Segment-wise, under the one path folding rule
+/// ([`calibre_utils::filenames::path_key`]).
 fn rebase_path(path: &str, from: &str, to: &str) -> Option<String> {
     let (p, f) = (path.trim_matches('/'), from.trim_matches('/'));
-    if p.eq_ignore_ascii_case(f) {
-        return Some(to.to_string());
+    if !calibre_utils::filenames::path_is_within(p, f) {
+        return None;
     }
-    let head = p.get(..f.len())?;
-    let rest = p.get(f.len()..)?.strip_prefix('/')?;
-    head.eq_ignore_ascii_case(f).then(|| join_rel(to, rest))
+    // Folding keeps the number of segments, but not the number of bytes.
+    let skip = f.split('/').filter(|s| !s.is_empty()).count();
+    let rest: Vec<&str> = p.split('/').skip(skip).collect();
+    Some(join_rel(to, &rest.join("/")))
 }
-
-/// Names Windows will not let a file or folder have.
-const RESERVED: [&str; 22] = ["con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9"];
 
 /// A destination folder from the user, checked and normalised: `/`-separated,
 /// relative to the library root. Rejects an empty path, an absolute one (a
@@ -235,8 +261,7 @@ pub fn validate_folder(folder: &str) -> std::result::Result<String, String> {
         if part.ends_with('.') || part.ends_with(' ') {
             return Err(format!("`{part}` ends with a dot or a space"));
         }
-        let stem = part.split('.').next().unwrap_or(part).to_lowercase();
-        if RESERVED.contains(&stem.as_str()) {
+        if calibre_utils::filenames::is_windows_reserved_name(part) {
             return Err(format!("`{part}` is a reserved name"));
         }
         let lower = part.to_lowercase();
@@ -289,7 +314,10 @@ pub fn plan_to(cache: &Cache, target: Target<'_>, scope: &Scope) -> Result<Organ
     }
     let mut books = Vec::new();
     let mut skipped = Vec::new();
+    let mut warnings = Vec::new();
     let mut already = 0usize;
+    // Destination folders already checked for a link out of the library.
+    let mut link_checked: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     // Lower-cased relative targets taken by earlier books in this plan.
     let mut taken: HashSet<String> = HashSet::new();
 
@@ -324,6 +352,12 @@ pub fn plan_to(cache: &Cache, target: Target<'_>, scope: &Scope) -> Result<Organ
                 }
             },
         };
+        // Every kind of target, not just a typed-in folder: a template can render
+        // into a folder that is a symlink or junction to somewhere else.
+        if *link_checked.entry(new_path.clone()).or_insert_with(|| passes_through_link(library, &new_path)) {
+            skipped.push(Skipped { book_id, reason: format!("the folder {new_path} goes through a link out of the library") });
+            continue;
+        }
         let stem_for = |old_stem: &str, n: usize| -> String {
             let base = fixed_stem.clone().unwrap_or_else(|| old_stem.to_string());
             if n == 0 {
@@ -356,7 +390,7 @@ pub fn plan_to(cache: &Cache, target: Target<'_>, scope: &Scope) -> Result<Organ
         for n in 0..1000 {
             let ok = current.iter().all(|(_, old_stem, ext, from)| {
                 let to = join_rel(&new_path, &format!("{}.{ext}", stem_for(old_stem, n)));
-                let (to_l, from_l) = (to.to_lowercase(), from.to_lowercase());
+                let (to_l, from_l) = (calibre_utils::filenames::path_key(&to), calibre_utils::filenames::path_key(from));
                 to_l == from_l || (!taken.contains(&to_l) && !library.join(&to).exists())
             });
             if ok {
@@ -374,7 +408,11 @@ pub fn plan_to(cache: &Cache, target: Target<'_>, scope: &Scope) -> Result<Organ
         for (format, old_stem, ext, from) in &current {
             let new_stem = stem_for(old_stem, suffix_n);
             let to = join_rel(&new_path, &format!("{new_stem}.{ext}"));
-            taken.insert(to.to_lowercase());
+            taken.insert(calibre_utils::filenames::path_key(&to));
+            let absolute_len = library.join(&to).to_string_lossy().chars().count();
+            if absolute_len > MAX_COMFORTABLE_PATH {
+                warnings.push(Skipped { book_id, reason: format!("the new path is {absolute_len} characters long; some Windows programs refuse paths over {MAX_COMFORTABLE_PATH}: {to}") });
+            }
             old_names.insert(format.clone(), old_stem.clone());
             new_names.insert(format.clone(), new_stem);
             if &to != from {
@@ -388,7 +426,13 @@ pub fn plan_to(cache: &Cache, target: Target<'_>, scope: &Scope) -> Result<Organ
         books.push(PlannedBook { book_id, title, old_path, new_path, old_names, new_names, files, suffixed });
     }
     let fingerprint = fingerprint(&label, &books);
-    Ok(OrganizePlan { template: label, books, skipped, already_organized: already, fingerprint })
+    // A rename of a folder that only changes its case needs the directory
+    // renamed too (`execute` does it once the books are in place).
+    let case_fix_folder = match target {
+        Target::Rebase { from, to } if from != to && calibre_utils::filenames::path_key(from) == calibre_utils::filenames::path_key(to) => Some(to.to_string()),
+        _ => None,
+    };
+    Ok(OrganizePlan { template: label, books, skipped, already_organized: already, fingerprint, warnings, case_fix_folder })
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -399,6 +443,11 @@ pub struct OrganizeRun {
     pub books: Vec<PlannedBook>,
     #[serde(default)]
     pub undone_at: Option<i64>,
+    /// Books with an entry in the journal whose move was never confirmed: the
+    /// process died somewhere between writing the entry and recording the move.
+    /// Their files may be in either place; [`undo`] looks.
+    #[serde(default)]
+    pub pending: Vec<i32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -409,46 +458,19 @@ pub struct OrganizeReport {
     pub files_moved: usize,
     pub failed: Vec<Skipped>,
     pub cancelled: bool,
+    /// Things that went wrong without making the run fail (a follow-up write
+    /// that did not land). The moves themselves are all in the undo journal.
+    pub warnings: Vec<String>,
 }
 
-fn runs_dir(library: &Path) -> std::path::PathBuf {
-    library.join(crate::constants::LIBRARY_HANDLE_DIR_NAME).join("organize-runs")
-}
-
-fn save_run(library: &Path, run: &OrganizeRun) -> Result<()> {
-    let dir = runs_dir(library);
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{}.json", run.run_id));
-    let temp = path.with_extension("json.partial");
-    std::fs::write(&temp, serde_json::to_vec_pretty(run)?)?;
-    std::fs::rename(&temp, &path)?;
-    Ok(())
-}
-
+/// The run's undo record. A run that moved nothing leaves none.
 pub fn load_run(library: &Path, run_id: &str) -> Result<OrganizeRun> {
-    if run_id.is_empty() || !run_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-        return Err(anyhow!("not a run id"));
-    }
-    let text = std::fs::read_to_string(runs_dir(library).join(format!("{run_id}.json"))).with_context(|| format!("no organize run {run_id}"))?;
-    Ok(serde_json::from_str(&text)?)
+    crate::run_journal::ORGANIZE_RUNS.load(library, run_id)
 }
 
 /// Runs, newest first: `(run_id, created_at, books, undone)`.
 pub fn list_runs(library: &Path) -> Vec<(String, i64, usize, bool)> {
-    let mut out: Vec<(String, i64, usize, bool)> = std::fs::read_dir(runs_dir(library))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
-        .filter_map(|t| serde_json::from_str::<OrganizeRun>(&t).ok())
-        .map(|r| (r.run_id, r.created_at, r.books.len(), r.undone_at.is_some()))
-        .collect();
-    out.sort_by_key(|r| std::cmp::Reverse(r.1));
-    out
-}
-
-fn new_run_id() -> String {
-    format!("org-{}-{}", crate::trash::now_secs(), &uuid::Uuid::new_v4().simple().to_string()[..4])
+    crate::run_journal::ORGANIZE_RUNS.list(library)
 }
 
 /// Removes `rel` (a folder inside the library) and its parents while they are
@@ -466,7 +488,42 @@ fn prune_empty_dirs(library: &Path, rel: &str) {
     }
 }
 
-/// Moves the book's files, all or none. Returns the number moved.
+/// Makes the directories along `rel` carry exactly `rel`'s spelling.
+///
+/// A folder rename that only changes case (`fiction` to `Fiction`) moves the
+/// books' files, but on a case-insensitive volume the files land in the
+/// directory that is already there and it keeps its old spelling. Renaming a
+/// directory to a name that differs only in case is refused by some
+/// filesystems and a no-op on others, so it goes through a temporary name.
+fn fix_dir_case(cache: &Cache, rel: &str) -> Result<()> {
+    let library = &cache.backend.library_path;
+    let handle = cache.backend.write_handle()?;
+    let mut at = library.to_path_buf();
+    for part in rel.split('/').filter(|p| !p.is_empty()) {
+        let key = calibre_utils::filenames::path_key(part);
+        let mut exact = false;
+        let mut other: Option<String> = None;
+        for entry in std::fs::read_dir(&at)?.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == part {
+                exact = true;
+            } else if calibre_utils::filenames::path_key(&name) == key && entry.path().is_dir() {
+                other = Some(name);
+            }
+        }
+        if let (false, Some(name)) = (exact, other) {
+            let temp = at.join(format!("{part}.case-{}", &uuid::Uuid::new_v4().simple().to_string()[..6]));
+            handle.rename_atomic(&at.join(&name), &temp).with_context(|| format!("renaming {name} aside"))?;
+            handle.rename_atomic_no_replace(&temp, &at.join(part)).with_context(|| format!("renaming {name} to {part}"))?;
+        }
+        at.push(part);
+    }
+    Ok(())
+}
+
+/// Moves the book's files, all or none. If a move fails, the ones already done
+/// are put back, and anything that could not be put back is named in the error
+/// (the files are then split between the two places, and the person has to know).
 fn move_files(cache: &Cache, files: &[(String, String)]) -> Result<()> {
     let library = &cache.backend.library_path;
     let handle = cache.backend.write_handle()?;
@@ -477,20 +534,35 @@ fn move_files(cache: &Cache, files: &[(String, String)]) -> Result<()> {
             if !from_abs.is_file() {
                 return Err(anyhow!("{from} is not there"));
             }
-            // Case-only renames name the same file on a case-insensitive volume.
-            if to_abs.exists() && from.to_lowercase() != to.to_lowercase() {
+            // A case-only rename names the same file on a case-insensitive
+            // volume; anything else already at the target is somebody's file.
+            let same_file = to_abs.exists() && calibre_utils::filenames::samefile(&from_abs, &to_abs);
+            if to_abs.exists() && !same_file {
                 return Err(anyhow!("{to} already exists"));
             }
             if let Some(parent) = to_abs.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            handle.rename_atomic(&from_abs, &to_abs).map_err(|e| anyhow!("could not move {from} to {to} (a rename cannot cross volumes): {e}"))
+            let moved = if same_file {
+                handle.rename_atomic(&from_abs, &to_abs)
+            } else {
+                // The check above and the move are one step here, so a file
+                // that appears in between is refused, not replaced.
+                handle.rename_atomic_no_replace(&from_abs, &to_abs)
+            };
+            moved.map_err(|e| anyhow!("could not move {from} to {to} (a rename cannot cross volumes): {e}"))
         })();
         if let Err(e) = step {
+            let mut stuck = Vec::new();
             for (f, t) in done.into_iter().rev() {
-                let _ = handle.rename_atomic(&library.join(t), &library.join(f));
+                if let Err(why) = handle.rename_atomic(&library.join(t), &library.join(f)) {
+                    stuck.push(format!("{t} could not be put back to {f}: {why}"));
+                }
             }
-            return Err(e);
+            if stuck.is_empty() {
+                return Err(e);
+            }
+            return Err(anyhow!("{e:#}; the files already moved were not all put back: {}", stuck.join("; ")));
         }
         done.push((from, to));
     }
@@ -517,22 +589,22 @@ fn keep_cover(cache: &Cache, book_id: i32) -> Result<()> {
     Ok(())
 }
 
+/// Records where a book's files are now: the folder and every format's name in
+/// one transaction (and one change-log entry), or nothing.
 fn record(cache: &Cache, book_id: i32, path: &str, names: &BTreeMap<String, String>, current_path: &str) -> Result<()> {
-    for (format, stem) in names {
-        cache.set_format_name(book_id, format, stem)?;
-    }
-    if path != current_path {
-        cache.set_book_path(book_id, path)?;
-    }
-    Ok(())
+    cache.set_book_location(book_id, (path != current_path).then_some(path), names)
 }
 
 /// Carries out a plan made by [`plan`] (the caller has checked its
 /// fingerprint). A cancel stops between books.
+///
+/// Each book's undo entry is written, and fsynced, before its first file moves;
+/// a book whose entry cannot be written is not moved.
 pub fn execute(cache: &Cache, plan: &OrganizePlan, control: &JobControl) -> Result<OrganizeReport> {
     let library = cache.backend.library_path.clone();
-    let mut run = OrganizeRun { run_id: new_run_id(), template: plan.template.clone(), created_at: crate::trash::now_secs(), ..Default::default() };
-    let mut report = OrganizeReport { run_id: run.run_id.clone(), books_planned: plan.books.len(), ..Default::default() };
+    let header = OrganizeRun { run_id: crate::run_journal::ORGANIZE_RUNS.new_run_id(), template: plan.template.clone(), created_at: crate::trash::now_secs(), ..Default::default() };
+    let mut report = OrganizeReport { run_id: header.run_id.clone(), books_planned: plan.books.len(), ..Default::default() };
+    let mut journal: Option<crate::run_journal::RunJournal> = None;
     let mut old_dirs: HashSet<String> = HashSet::new();
     for book in &plan.books {
         if control.is_cancelled() {
@@ -544,30 +616,55 @@ pub fn execute(cache: &Cache, plan: &OrganizePlan, control: &JobControl) -> Resu
             report.failed.push(Skipped { book_id: book.book_id, reason: format!("could not keep its cover: {e:#}") });
             continue;
         }
+        // The undo entry goes to disk first. The journal itself is opened on the
+        // first book, so a run that moves nothing leaves no file; if it cannot be
+        // opened nothing has moved yet and the run stops.
+        if journal.is_none() {
+            journal = Some(crate::run_journal::ORGANIZE_RUNS.begin(&library, &header.run_id, &header).context("could not start the undo journal, so nothing was moved")?);
+        }
+        let j = journal.as_mut().expect("opened above");
+        if let Err(e) = j.append_book(book) {
+            report.failed.push(Skipped { book_id: book.book_id, reason: format!("could not write its undo entry, so it was not moved: {e:#}") });
+            continue;
+        }
         if let Err(e) = move_files(cache, &pairs) {
+            // move_files put back what it had moved; if it could not, the error says so
+            // and the entry stays pending for undo to look at.
+            if !format!("{e:#}").contains("not all put back") {
+                let _ = j.abandon(book.book_id);
+            }
             report.failed.push(Skipped { book_id: book.book_id, reason: format!("{e:#}") });
             continue;
         }
         if let Err(e) = record(cache, book.book_id, &book.new_path, &book.new_names, &book.old_path) {
             // The files moved and the rows did not: put the files back.
             let back: Vec<(String, String)> = pairs.iter().map(|(f, t)| (t.clone(), f.clone())).collect();
-            let _ = move_files(cache, &back);
-            report.failed.push(Skipped { book_id: book.book_id, reason: format!("the library could not record the move: {e:#}") });
+            let mut reason = format!("the library could not record the move: {e:#}");
+            match move_files(cache, &back) {
+                Ok(()) => {
+                    let _ = j.abandon(book.book_id);
+                }
+                Err(rollback) => reason.push_str(&format!("; and the files could not be put back: {rollback:#}")),
+            }
+            report.failed.push(Skipped { book_id: book.book_id, reason });
             continue;
+        }
+        if let Err(e) = j.mark_done(book.book_id) {
+            report.warnings.push(format!("could not mark book {} done in the undo journal (undo will still find it): {e:#}", book.book_id));
         }
         old_dirs.insert(book.old_path.clone());
         report.books_moved += 1;
         report.files_moved += pairs.len();
-        run.books.push(book.clone());
-        if run.books.len() % 100 == 0 {
-            let _ = save_run(&library, &run);
-        }
     }
     for dir in &old_dirs {
         prune_empty_dirs(&library, dir);
     }
-    if !run.books.is_empty() {
-        save_run(&library, &run).context("recording the run")?;
+    if let Some(folder) = &plan.case_fix_folder {
+        if report.books_moved > 0 && !report.cancelled {
+            if let Err(e) = fix_dir_case(cache, folder) {
+                report.warnings.push(format!("the books were moved but the folder could not be renamed to {folder}: {e:#}"));
+            }
+        }
     }
     Ok(report)
 }
@@ -579,12 +676,14 @@ pub struct UndoReport {
     pub files_restored: usize,
     /// Books left alone, and why (changed since the run).
     pub skipped: Vec<Skipped>,
+    /// Follow-up writes that failed without making the undo fail.
+    pub warnings: Vec<String>,
 }
 
 /// Puts a run's books back where they were.
 pub fn undo(cache: &Cache, run_id: &str, control: &JobControl) -> Result<UndoReport> {
     let library = cache.backend.library_path.clone();
-    let mut run = load_run(&library, run_id)?;
+    let run = load_run(&library, run_id)?;
     if run.undone_at.is_some() {
         return Err(anyhow!("run {run_id} was already undone"));
     }
@@ -595,6 +694,26 @@ pub fn undo(cache: &Cache, run_id: &str, control: &JobControl) -> Result<UndoRep
             break;
         }
         let current = cache.field_for(book.book_id, "path").ok().flatten().unwrap_or_default().replace('\\', "/");
+        if run.pending.contains(&book.book_id) && current == book.old_path {
+            // The entry was written and the process died before the move was
+            // confirmed: the files may be at the new place with the rows still at
+            // the old. Move back whatever is at the new place; there is nothing
+            // to record, the rows never changed.
+            let handle = cache.backend.write_handle()?;
+            let mut restored = 0;
+            for f in &book.files {
+                let (to_abs, from_abs) = (library.join(&f.to), library.join(&f.from));
+                if to_abs.is_file() && !from_abs.exists() && handle.rename_atomic_no_replace(&to_abs, &from_abs).is_ok() {
+                    restored += 1;
+                }
+            }
+            if restored > 0 {
+                report.books_restored += 1;
+                report.files_restored += restored;
+                new_dirs.insert(book.new_path.clone());
+            }
+            continue;
+        }
         if current != book.new_path {
             report.skipped.push(Skipped { book_id: book.book_id, reason: "the book has been moved or removed since".into() });
             continue;
@@ -606,8 +725,11 @@ pub fn undo(cache: &Cache, run_id: &str, control: &JobControl) -> Result<UndoRep
         }
         if let Err(e) = record(cache, book.book_id, &book.old_path, &book.old_names, &book.new_path) {
             let fwd: Vec<(String, String)> = back.iter().map(|(f, t)| (t.clone(), f.clone())).collect();
-            let _ = move_files(cache, &fwd);
-            report.skipped.push(Skipped { book_id: book.book_id, reason: format!("the library could not record the move: {e:#}") });
+            let mut reason = format!("the library could not record the move: {e:#}");
+            if let Err(rollback) = move_files(cache, &fwd) {
+                reason.push_str(&format!("; and the files could not be put back: {rollback:#}"));
+            }
+            report.skipped.push(Skipped { book_id: book.book_id, reason });
             continue;
         }
         new_dirs.insert(book.new_path.clone());
@@ -618,8 +740,10 @@ pub fn undo(cache: &Cache, run_id: &str, control: &JobControl) -> Result<UndoRep
         prune_empty_dirs(&library, dir);
     }
     if report.skipped.is_empty() && !control.is_cancelled() {
-        run.undone_at = Some(crate::trash::now_secs());
-        save_run(&library, &run)?;
+        // The undo itself is done; failing to say so must not make it an error.
+        if let Err(e) = crate::run_journal::ORGANIZE_RUNS.mark_undone(&library, run_id, crate::trash::now_secs()) {
+            report.warnings.push(format!("the books are restored but the run could not be marked undone: {e:#}"));
+        }
     }
     Ok(report)
 }

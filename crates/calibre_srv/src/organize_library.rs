@@ -166,6 +166,9 @@ pub struct MoveBody {
 pub async fn move_books(State(state): State<AppState>, Path(library_id): Path<String>, Json(body): Json<MoveBody>) -> Result<Response, ServerError> {
     let cache = state.cache_for(Some(&library_id)).ok_or_else(|| ServerError::NotFound(format!("no library named {library_id:?}")))?;
     let folder = organize::validate_folder(&body.folder).map_err(ServerError::BadRequest)?;
+    if !body.dry_run && body.plan_fingerprint.is_none() {
+        return Err(ServerError::BadRequest("executing needs the plan_fingerprint of the dry run the user confirmed".into()));
+    }
     let mut ids = body.book_ids.clone();
     ids.sort_unstable();
     ids.dedup();
@@ -193,10 +196,8 @@ pub async fn move_books(State(state): State<AppState>, Path(library_id): Path<St
         out["folder"] = json!(folder);
         return Ok(Json(out).into_response());
     }
-    if let Some(confirmed) = body.plan_fingerprint.as_deref() {
-        if confirmed != plan.fingerprint {
-            return Ok((StatusCode::CONFLICT, Json(json!({"error": "the plan is no longer what was previewed (the library or the selection changed); run the dry run again", "plan_fingerprint": plan.fingerprint}))).into_response());
-        }
+    if body.plan_fingerprint.as_deref() != Some(plan.fingerprint.as_str()) {
+        return Ok((StatusCode::CONFLICT, Json(json!({"error": "the plan is no longer what was previewed (the library or the selection changed); run the dry run again", "plan_fingerprint": plan.fingerprint}))).into_response());
     }
     if plan.books.is_empty() {
         return Err(ServerError::BadRequest("nothing to move: the books are already in that folder, or cannot be moved (see skipped in the dry run)".into()));

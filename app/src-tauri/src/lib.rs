@@ -242,7 +242,32 @@ fn list_recent_libraries(app: AppHandle) -> Vec<String> {
 /// through the folder-picker dialog again.
 #[tauri::command]
 async fn open_recent_library(app: AppHandle, path: String) -> Result<(), String> {
-    open_library(&app, std::path::PathBuf::from(path))
+    // The page is a web page: whatever script runs in it can call this with
+    // any string. Only a path the user has already opened (through the folder
+    // picker, which is what puts it in the list) may be reopened this way.
+    let recent = settings::list_recent_libraries(&app);
+    let path = std::path::PathBuf::from(path);
+    if !is_recent_library(&recent, &path) {
+        return Err(format!("{} is not one of the recent libraries", path.display()));
+    }
+    open_library(&app, path)
+}
+
+/// Whether `path` names one of `recent`, compared as the same folder (case on
+/// Windows, separators and a trailing slash don't matter).
+fn is_recent_library(recent: &[std::path::PathBuf], path: &std::path::Path) -> bool {
+    fn key(p: &std::path::Path) -> String {
+        let canonical = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let s = canonical.to_string_lossy().replace('\\', "/");
+        let s = s.trim_end_matches('/').to_string();
+        if cfg!(windows) {
+            s.to_lowercase()
+        } else {
+            s
+        }
+    }
+    let wanted = key(path);
+    recent.iter().any(|r| key(r) == wanted)
 }
 
 /// Creates a new library and opens it.
@@ -530,14 +555,27 @@ async fn reveal_book_folder(state: State<'_, ServerState>, app: AppHandle, book_
     open_inside_library(&app, &library, &folder)
 }
 
-/// Finds the file for `ext` inside a book folder, comparing extensions
-/// case-insensitively (a library can hold `Book.PDF`).
-fn find_format_file(folder: &std::path::Path, ext: &str) -> Option<std::path::PathBuf> {
-    std::fs::read_dir(folder)
+/// Finds one book's file for `ext` inside its folder.
+///
+/// `stem` is the book's own file name from `data.name`; the match is on that
+/// name and the extension, both case-insensitively (a library can hold
+/// `Book.PDF`). Matching on the extension alone picked whichever file the
+/// directory listed first, which in a folder shared by several books is
+/// usually another book's. With no `stem` (a server too old to send one) a
+/// file is returned only when it is the folder's single file of that type.
+/// `None` when it is not there, and the caller falls back to the folder.
+fn find_format_file(folder: &std::path::Path, stem: Option<&str>, ext: &str) -> Option<std::path::PathBuf> {
+    let with_ext: Vec<std::path::PathBuf> = std::fs::read_dir(folder)
         .ok()?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .find(|p| p.is_file() && p.extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case(ext)))
+        .filter(|p| p.is_file() && p.extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case(ext)))
+        .collect();
+    match stem {
+        Some(stem) => with_ext.into_iter().find(|p| p.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.eq_ignore_ascii_case(stem))),
+        None if with_ext.len() == 1 => with_ext.into_iter().next(),
+        None => None,
+    }
 }
 
 /// Opens the system file browser with one book format selected.
@@ -553,9 +591,13 @@ async fn reveal_book_file(state: State<'_, ServerState>, app: AppHandle, book_id
     let library = settings::load_library_path(&app).ok_or("no library is currently open")?;
     let ext = checked_ext(&fmt)?;
 
-    let relative = fetch_book_relative_path(port, book_id).await?;
+    let (relative, stems) = fetch_book_location(port, book_id).await?;
     let folder = library.join(relative.trim_start_matches(['/', '\\']));
-    let file = find_format_file(&folder, &ext).ok_or_else(|| format!("book {book_id} has no {} file on disk", ext.to_uppercase()))?;
+    let Some(file) = find_format_file(&folder, stems.get(&ext).map(String::as_str), &ext) else {
+        // The file is not where the database says: show the folder instead of
+        // guessing at another book's file.
+        return open_inside_library(&app, &library, &folder);
+    };
 
     let real_library = library.canonicalize().map_err(|e| format!("{}: {e}", library.display()))?;
     let real_file = file.canonicalize().map_err(|e| format!("{}: {e}", file.display()))?;
@@ -567,7 +609,8 @@ async fn reveal_book_file(state: State<'_, ServerState>, app: AppHandle, book_id
 
 #[cfg(test)]
 mod reveal_tests {
-    use super::find_format_file;
+    use super::{find_format_file, is_recent_library};
+    use std::path::PathBuf;
 
     #[test]
     fn finds_format_file_case_insensitively() {
@@ -575,21 +618,58 @@ mod reveal_tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("Book.PDF"), b"x").unwrap();
         std::fs::write(dir.join("Book.epub"), b"x").unwrap();
-        assert_eq!(find_format_file(&dir, "pdf").unwrap().file_name().unwrap(), "Book.PDF");
-        assert!(find_format_file(&dir, "mobi").is_none());
+        assert_eq!(find_format_file(&dir, Some("book"), "pdf").unwrap().file_name().unwrap(), "Book.PDF");
+        assert!(find_format_file(&dir, Some("Book"), "mobi").is_none());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A folder shared by several books: the right one is picked by name, not
+    /// by being first in the listing.
+    #[test]
+    fn picks_the_books_own_file_in_a_shared_folder() {
+        let dir = std::env::temp_dir().join(format!("oxide-reveal-shared-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["Aardvark.pdf", "Mine.pdf", "Zebra.pdf"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        assert_eq!(find_format_file(&dir, Some("Mine"), "pdf").unwrap().file_name().unwrap(), "Mine.pdf");
+        assert!(find_format_file(&dir, Some("Missing"), "pdf").is_none(), "a missing file is None, never a neighbour's");
+        assert!(find_format_file(&dir, None, "pdf").is_none(), "with no name, an ambiguous folder gives nothing");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn only_a_recent_library_may_be_reopened() {
+        let recent = vec![PathBuf::from("/books/one"), PathBuf::from("/books/two")];
+        assert!(is_recent_library(&recent, &PathBuf::from("/books/two")));
+        assert!(is_recent_library(&recent, &PathBuf::from("/books/two/")));
+        assert!(!is_recent_library(&recent, &PathBuf::from("/etc")));
+        assert!(!is_recent_library(&recent, &PathBuf::from("/books")));
+        assert!(!is_recent_library(&[], &PathBuf::from("/books/one")));
     }
 }
 
 /// Reads one book's `path` column through the running server.
 async fn fetch_book_relative_path(port: u16, book_id: i32) -> Result<String, String> {
+    fetch_book_location(port, book_id).await.map(|(path, _)| path)
+}
+
+/// One book's `path` column and each format's file stem (`data.name`, keyed
+/// by lowercase format), through the running server.
+async fn fetch_book_location(port: u16, book_id: i32) -> Result<(String, std::collections::HashMap<String, String>), String> {
     let url = format!("http://127.0.0.1:{port}/ajax/book/{book_id}");
     let response = reqwest::get(&url).await.map_err(|e| e.to_string())?;
     if !response.status().is_success() {
         return Err(format!("no book with id {book_id}"));
     }
     let row: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
-    row.get("path").and_then(|v| v.as_str()).map(str::to_string).ok_or_else(|| format!("book {book_id} has no folder recorded"))
+    let path = row.get("path").and_then(|v| v.as_str()).map(str::to_string).ok_or_else(|| format!("book {book_id} has no folder recorded"))?;
+    let stems = row
+        .get("format_file_names")
+        .and_then(|v| v.as_object())
+        .map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.to_lowercase(), s.to_string()))).collect())
+        .unwrap_or_default();
+    Ok((path, stems))
 }
 
 /// Fetches one of a book's formats from the running `calibre_srv`.

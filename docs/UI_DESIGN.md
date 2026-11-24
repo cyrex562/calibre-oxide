@@ -242,28 +242,26 @@ one slot carry a family. Define the layout as data, not a flag:
 ```ts
 export type ToolbarItem =
   | { kind: "action";    id: LibraryActionId }
-  | { kind: "split";     id: LibraryActionId; menu: (LibraryActionId | "-" | DynamicId)[] }
+  | { kind: "split";     id: LibraryActionId; menu: (LibraryActionId | "-" | DynamicId)[]; label?: string }
   | { kind: "menu";      id: string; label: string; icon: IconKey; menu: ... }
   | { kind: "separator" }
   | { kind: "spring" };
 
 export const TOOLBAR_LAYOUT: ToolbarItem[] = [
-  { kind: "split", id: "add-books",     menu: ["add-folder", "-", "fetch-news"] },
-  { kind: "split", id: "edit-metadata", menu: ["fetch-metadata", "replace-cover", "-",
-                                               "bulk-edit", "map-metadata", "-",
-                                               "test-template"] },
+  // Left to right, the job this app is for: import, find duplicates,
+  // organize, fix metadata, remove (tranche 22c).
+  { kind: "split", id: "add-books",       menu: ["add-folder"] },
   { kind: "separator" },
-  { kind: "split", id: "convert",       menu: ["polish", "tweak-book", "-",
-                                               "unpack-book", "repack-book"] },
-  { kind: "split", id: "read",          menu: ["open-externally", "quick-view", "-",
-                                               "$recently-viewed", "-",
-                                               "similar-books"] },
+  { kind: "split", id: "find-duplicates", menu: ["compare-duplicates", "merge-books",
+                                                 "resolve-duplicates"] },
+  { kind: "split", id: "organize-files",  label: "Organize",
+                                          menu: ["file-naming", "fix-titles", "export-copy"] },
   { kind: "separator" },
-  { kind: "split", id: "save-to-disk",  menu: ["send-email", "-",
-                                               "export-catalog", "export-library-archive"] },
-  { kind: "action", id: "fetch-news" },
-  { kind: "separator" },
-  { kind: "split", id: "delete-book",   menu: ["-", "$restore-deleted"] },
+  { kind: "split", id: "edit-metadata",   menu: ["fetch-metadata", "replace-cover",
+                                                 "cover-from-pdf", "-", "bulk-edit",
+                                                 "map-metadata", "-", "test-template"] },
+  { kind: "split", id: "delete-book",     label: "Remove", menu: ["-", "$restore-deleted"] },
+  { kind: "overflow" },   // "More": Read/View, Convert, Save to disk, Fetch news, Select…
   { kind: "spring" },
   { kind: "menu",   id: "library",      label: "<current library name>",
                     icon: "lt",         menu: /* §5.1 */ },
@@ -272,8 +270,26 @@ export const TOOLBAR_LAYOUT: ToolbarItem[] = [
 ];
 ```
 
-Twelve visible slots reaching ~30 actions. `$`-prefixed ids are dynamic
+Eight visible slots reaching ~30 actions. `$`-prefixed ids are dynamic
 blocks resolved at open time.
+
+**Why the workflow order (tranche 22c).** The first version of this layout
+copied calibre's own toolbar (Add, Edit, Convert, View, Save, Fetch news,
+Remove). That is a reader's toolbar. This app's user imports a large pile of
+PDFs, finds and merges the duplicates, organizes the files into folders and
+fixes metadata, and those steps were three menus deep in the Library menu. They
+now have the slots; **Convert, Read/View, Save to disk and Fetch news moved
+into the "More" menu** (`OVERFLOW_LEADING` in `actions.ts`, then whatever
+toolbar-eligible action is not placed), and nothing was removed: every action
+that had a slot is still one click from the toolbar. The Library menu keeps
+switching libraries, Check library and Trash.
+
+Book-scoped slots (Edit metadata, Remove) used to be dropped from the rendered
+toolbar altogether, because the flat "customizable" list never contains
+book-scoped actions and the layout was filtered against it. The view now
+handles them (`runPanelAction`, which hands the action to the details panel the
+way the context menu does) and asks `visibleToolbarActions(…, { includeBook:
+true })`.
 
 Two upstream patterns worth copying verbatim:
 
@@ -821,3 +837,13 @@ setting · remove-formats / remove-covers · cover browser (optional).
    32px and fits more buttons before overflow. The recommendation is
    icon-above at 24px as the default, with the setting shipped
    immediately rather than deferred.
+
+## 7. Tranche 22c: what changed after the design review
+
+- **Selection.** Ctrl/Cmd-click toggles a row, Shift-click selects a range, Ctrl+A selects everything and Shift+Up/Down extends, all without select mode (select mode still works, and is in More). The open book counts as selected, so Ctrl-clicking a second row gives two.
+- **Delete.** One confirm everywhere ("Move N books to the library Trash?"), naming up to five titles and saying how many are hidden by the current search, then a "Moved N books to Trash · Undo" toast. Undo restores through the Trash API. Deleting a duplicate group's suggested keeper, or its last copy, adds a warning. Logic: `library/deleteFlow.ts`.
+- **Buttons.** `button.primary` for the step that does the work (Run, Apply, Merge, Rename), `button.danger` (new) for Delete.
+- **Colour tokens.** `--danger`, `--warning` and `--bg-selected` are the only tokens for errors, warnings and selection; `--error`, `--selection`, `--muted` and `--mono` never existed, so every use fell back to a literal that ignored dark mode. Banner and status colours (`#bc4c00`, `#9a6700`, `#1a7f37`, `#0969da`) now use the tokens.
+- **Editing in the table.** A single click only selects the row, in an empty cell too. Double-click, F2 or Enter edits, and the hover hint says "Double-click to set …".
+- **Empty states.** An empty library offers Add books / Add folder; an empty search lists the active filters (search, folder, virtual library, marked only), each with a one-click clear; a load error has Retry. Logic: `library/emptyState.ts`.
+- **Import duplicates.** The picker collects files that look like existing books and asks once at the end (Skip all / Add all / per-file ticks) instead of one native confirm per file. The server has no "add the file I already sent" route, so a duplicate the user chooses to add is uploaded again; skipped ones are never re-uploaded.

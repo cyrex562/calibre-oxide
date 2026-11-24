@@ -110,7 +110,7 @@ const scopeLabel = computed(() => (props.bookIds.length > 0 ? `${props.bookIds.l
 
 <template>
   <div class="manage-backdrop" @click.self="emit('close')">
-    <div class="manage-panel mapper-panel">
+    <div class="manage-panel mapper-panel" role="dialog" aria-modal="true">
       <h3>Map {{ field }}</h3>
       <p class="hint">Rewrite {{ field }} in bulk across {{ scopeLabel }}. Nothing is written until you preview.</p>
 

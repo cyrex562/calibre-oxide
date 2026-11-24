@@ -83,7 +83,7 @@ async function run() {
 
 <template>
   <div class="manage-backdrop" @click.self="emit('close')">
-    <div class="manage-panel polish-panel">
+    <div class="manage-panel polish-panel" role="dialog" aria-modal="true">
       <h3>Polish {{ bookIds.length }} book(s)</h3>
       <p class="hint">Rewrites the EPUB in place. Books without an EPUB format are skipped and reported.</p>
 

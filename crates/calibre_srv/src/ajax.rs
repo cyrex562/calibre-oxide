@@ -223,7 +223,41 @@ pub async fn book(State(state): State<AppState>, Path(book_id): Path<String>) ->
     };
     let rows = fetch_rows(&state, std::iter::once(book_id).collect()).await?;
     let row = rows.into_iter().next().ok_or_else(|| ServerError::book_not_found(book_id, LIBRARY_ID))?;
-    Ok(Json(book_json(&row)))
+    let mut out = book_json(&row);
+    // Each format's file stem (`data.name`), so a client can name the exact
+    // file on disk. In a folder shared by several books the extension alone
+    // does not say whose file is whose.
+    let cache = state.cache.clone();
+    let names = tokio::task::spawn_blocking(move || cache.format_file_names(book_id)).await.map_err(|e| ServerError::InternalServerError(e.to_string()))?.unwrap_or_default();
+    let names: serde_json::Map<String, Value> = names.into_iter().map(|(fmt, stem)| (fmt.to_lowercase(), Value::String(stem))).collect();
+    if let Some(map) = out.as_object_mut() {
+        map.insert("format_file_names".into(), Value::Object(names));
+    }
+    Ok(Json(out))
+}
+
+/// How many books `/ajax/books` returns when no `ids` are given.
+const MAX_BOOKS_WITHOUT_IDS: usize = 1000;
+
+/// The `limit` lowest ids of `all`.
+fn cap_all(all: &HashSet<i32>, limit: usize) -> HashSet<i32> {
+    let mut sorted: Vec<i32> = all.iter().copied().collect();
+    sorted.sort_unstable();
+    sorted.truncate(limit);
+    sorted.into_iter().collect()
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+
+    #[test]
+    fn a_bare_books_request_is_capped_to_the_lowest_ids() {
+        let all: HashSet<i32> = (1..=50).collect();
+        let capped = cap_all(&all, 10);
+        assert_eq!(capped, (1..=10).collect::<HashSet<i32>>());
+        assert_eq!(cap_all(&all, 100).len(), 50, "a small library is returned whole");
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -231,7 +265,8 @@ pub struct BooksQuery {
     ids: Option<String>,
 }
 
-/// `GET /ajax/books?ids=1,2,3` (or `ids=all`/omitted). Port of
+/// `GET /ajax/books?ids=1,2,3` (or `ids=all`/omitted, capped at
+/// [`MAX_BOOKS_WITHOUT_IDS`]). Port of
 /// `books`. Ids that don't exist map to `null`, matching upstream's
 /// own `ans[book_id] = None` for ids outside `allowed_book_ids`.
 pub async fn books(State(state): State<AppState>, Query(q): Query<BooksQuery>) -> Result<Json<Value>, ServerError> {
@@ -263,7 +298,11 @@ pub async fn books(State(state): State<AppState>, Query(q): Query<BooksQuery>) -
     .into_iter()
     .collect();
 
-    let ids = requested.unwrap_or_else(|| all_ids.clone());
+    // Asking for "every book" is capped: on a library of hundreds of thousands
+    // a bare `/ajax/books` built the whole JSON for all of them. The web UI
+    // always names its ids, so nothing relies on the uncapped form; a caller
+    // that wants more pages through explicit `ids`.
+    let ids = requested.unwrap_or_else(|| cap_all(&all_ids, MAX_BOOKS_WITHOUT_IDS));
     let found: HashSet<i32> = ids.intersection(&all_ids).copied().collect();
     let rows = fetch_rows(&state, found).await?;
 

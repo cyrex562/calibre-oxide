@@ -90,7 +90,7 @@ function cancelRun() {
 
 <template>
   <div class="resolve-backdrop" @click.self="!busy && emit('close')">
-    <div class="resolve-panel" role="dialog" aria-label="Resolve duplicates">
+    <div class="resolve-panel" role="dialog" aria-modal="true" aria-label="Resolve duplicates">
       <button class="resolve-close" :disabled="busy" aria-label="Close" @click="emit('close')">✕</button>
       <h3>Resolve duplicates</h3>
       <p class="hint">Pick which kinds of match to trust. Nothing changes until you have seen the plan and run it.</p>
@@ -160,7 +160,7 @@ function cancelRun() {
         <p v-for="s in state.plan.skipped" :key="s.group_id" class="hint">Skipped a group: {{ s.reason }}.</p>
         <p v-if="!state.plan.fully_restorable" class="hint warn">{{ state.plan.note }}</p>
         <div class="resolve-buttons">
-          <button type="button" :disabled="busy || state.plan.totals.groups === 0" data-testid="run-plan" @click="run">
+          <button type="button" class="primary" :disabled="busy || state.plan.totals.groups === 0" data-testid="run-plan" @click="run">
             {{ state.phase === "running" ? "Running…" : `Resolve ${state.plan.totals.groups.toLocaleString("en-US")} groups` }}
           </button>
           <button v-if="state.phase === 'running'" type="button" @click="cancelRun">Cancel</button>
@@ -229,10 +229,10 @@ function cancelRun() {
   margin: 0;
 }
 .warn {
-  color: #bc4c00;
+  color: var(--warning);
 }
 .error {
-  color: var(--error, #cf222e);
+  color: var(--danger);
   margin: 0;
 }
 fieldset {
@@ -244,7 +244,7 @@ fieldset {
   padding: 0.5rem 0.75rem;
 }
 .risky {
-  color: #9a6700;
+  color: var(--warning);
 }
 .resolve-row {
   display: flex;

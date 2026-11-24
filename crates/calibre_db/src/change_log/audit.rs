@@ -415,10 +415,9 @@ const CASES: &[Case] = &[
         meta.authors = vec!["Loose Author".to_string()];
         c.register_book_in_place("Loose Book.pdf", &meta).unwrap();
     }),
-    // A book in the old `<author>/<title>/` layout, so there is a real
-    // folder to rename. `path` and `data.name` were both written with raw
-    // SQL here.
-    case!("rename_book_files", |c, f| {
+    // A book in the old `<author>/<title>/` layout, relocated to a new
+    // folder (what organize does). `path` was written with raw SQL here.
+    case!("set_book_path (relocation)", |c, f| {
         let library = c.backend.library_path.clone();
         let (format, stem) = c.format_file_names(f.first).unwrap().remove(0);
         let rel = "Shared Author/First Book";
@@ -426,7 +425,12 @@ const CASES: &[Case] = &[
         let name = format!("{stem}.{}", format.to_lowercase());
         std::fs::rename(library.join(&name), library.join(rel).join(&name)).unwrap();
         c.set_book_path(f.first, rel).unwrap();
-        c.rename_book_files(f.first, "Retitled", "Shared Author").unwrap();
+        c.set_book_path(f.first, "Shared Author/Retitled").unwrap();
+    }),
+    case!("set_book_location", |c, f| {
+        let (format, _) = c.format_file_names(f.first).unwrap().remove(0);
+        let names: std::collections::BTreeMap<String, String> = [(format, "Relocated".to_string())].into();
+        c.set_book_location(f.first, Some("Shared Author/Relocated"), &names).unwrap();
     }),
     case!("place_book_in_folder", |c, f| c.place_book_in_folder(f.first, "Shared Author/First Book (1)").unwrap()),
     // A calibre library nested in this one, brought in place: its book with
@@ -567,7 +571,8 @@ const ACCOUNTED: &[(&str, Account)] = &[
     ("cache.rs::clear_preference", Case("clear_preference")),
     ("cache.rs::add_format", Case("add_format")),
     ("cache.rs::remove_format_inner", Case("remove_format")),
-    ("cache.rs::delete_book_with", Case("delete_book")),
+    ("cache.rs::delete_book_rows", Case("delete_book")),
+    ("cache.rs::set_book_location", Case("set_book_location")),
     ("cache.rs::rename_format_files", Case("rename_format_files")),
     ("cache.rs::register_books_in_place", Case("register_books_in_place (batch)")),
     ("enrich_batch.rs::write_enrichment_batch", Case("write_enrichment_batch")),
@@ -583,7 +588,7 @@ const ACCOUNTED: &[(&str, Account)] = &[
     ("absorb.rs::unabsorb_library", Case("unabsorb_library")),
     ("covers.rs::set_cover", Case("covers::set_cover")),
     ("backend.rs::set_pref", Case("Cache::set_pref (plain key)")),
-    ("cache.rs::set_book_path", Replay("records a `path` FieldSet itself; exercised by the rename_book_files case")),
+    ("cache.rs::set_book_path", Replay("records a `path` FieldSet itself; exercised by the set_book_path (relocation) case")),
     ("cache.rs::record_format_row", Replay("replay's FormatSet applier; records the op it applies")),
     ("cache.rs::set_format_name", Replay("records a FormatSet; exercised by the rename_format_files case")),
     ("cache.rs::forget_format_row", Replay("replay's FormatRemoved applier; records the op it applies")),
@@ -603,6 +608,7 @@ const ACCOUNTED: &[(&str, Account)] = &[
 /// Files whose writes are not to `metadata.db`'s library content, so the
 /// scan skips them -- each is its own durable store with its own recovery.
 const EXCLUDED: &[(&str, &str)] = &[
+    ("field_feed_tests.rs", "tests of the field snapshot, which write rows with raw SQL on purpose"),
     ("schema_upgrades.rs", "one-time schema migrations"),
     ("checksums.rs", "the checksum sidecar db"),
     ("orphans.rs", "the checksum sidecar db"),
@@ -634,7 +640,8 @@ fn mutating_functions() -> Vec<String> {
             if EXCLUDED.iter().any(|(prefix, _)| relative == *prefix || relative.starts_with(prefix)) {
                 continue;
             }
-            let source = std::fs::read_to_string(&path).unwrap();
+            // CRLF checkouts (Windows, autocrlf) would hide the test-module marker below.
+            let source = std::fs::read_to_string(&path).unwrap().replace("\r\n", "\n");
             // Everything before the test module; the files that have one
             // put it last.
             let production = source.split("\n#[cfg(test)]\nmod ").next().unwrap();

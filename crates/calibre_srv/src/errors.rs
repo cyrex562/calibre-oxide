@@ -23,6 +23,9 @@ pub enum ServerError {
     Unauthorized,
     #[error("{0}")]
     FailedDependency(String),
+    /// 409: the request is fine but the library is busy (a file-moving job is running).
+    #[error("{0}")]
+    Conflict(String),
     #[error("{0}")]
     PreconditionRequired(String),
     #[error("{0}")]
@@ -59,6 +62,7 @@ impl IntoResponse for ServerError {
             ServerError::Unauthorized => {
                 (StatusCode::UNAUTHORIZED, [("WWW-Authenticate", "Basic realm=\"calibre server\"")], "authentication required").into_response()
             }
+            ServerError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
             ServerError::FailedDependency(msg) => (StatusCode::FAILED_DEPENDENCY, msg).into_response(),
             ServerError::PreconditionRequired(msg) => (StatusCode::PRECONDITION_REQUIRED, msg).into_response(),
             ServerError::UnprocessableEntity(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg).into_response(),

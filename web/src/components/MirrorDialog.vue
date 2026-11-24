@@ -59,7 +59,7 @@ const canBrowse = computed(() => c.canBrowse());
 
 <template>
   <div class="mirror-backdrop" @click.self="!busy && emit('close')">
-    <div class="mirror-panel" role="dialog" aria-label="Export a copy">
+    <div class="mirror-panel" role="dialog" aria-modal="true" aria-label="Export a copy">
       <button class="mirror-close" :disabled="busy" aria-label="Close" @click="emit('close')">✕</button>
       <h3>Export a copy</h3>
       <p class="hint">Copies the library to another folder or drive. The library itself is not changed, and nothing in the copy is ever deleted: what is removed from it goes to .mirror-trash.</p>
@@ -140,7 +140,7 @@ const canBrowse = computed(() => c.canBrowse());
           </details>
         </template>
         <div class="row">
-          <button type="button" :disabled="busy || !canRun" data-testid="run-plan" @click="run">{{ state.plan.new_target ? "Copy" : "Refresh" }}</button>
+          <button type="button" class="primary" :disabled="busy || !canRun" data-testid="run-plan" @click="run">{{ state.plan.new_target ? "Copy" : "Refresh" }}</button>
         </div>
       </section>
 
@@ -208,11 +208,11 @@ const canBrowse = computed(() => c.canBrowse());
   margin-left: 1.4rem;
 }
 .warn {
-  color: #bc4c00;
+  color: var(--warning);
   margin: 0;
 }
 .error {
-  color: var(--error, #cf222e);
+  color: var(--danger);
   margin: 0;
 }
 .field {
@@ -257,7 +257,7 @@ fieldset {
   border: 1px solid var(--border);
 }
 .badge.ok {
-  color: #1a7f37;
+  color: var(--success);
 }
 .badge.off {
   color: var(--fg-muted);

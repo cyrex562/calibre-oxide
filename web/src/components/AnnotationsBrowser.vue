@@ -52,7 +52,7 @@ onMounted(load);
 
 <template>
   <div class="manage-backdrop" @click.self="emit('close')">
-    <div class="manage-panel annotations-panel">
+    <div class="manage-panel annotations-panel" role="dialog" aria-modal="true">
       <h3>Annotations</h3>
 
       <div class="annot-controls">

@@ -574,6 +574,11 @@ async fn move_books_applies_as_a_job_is_recorded_and_is_undone_by_unorganize() {
     // A wrong fingerprint is refused.
     let (status, _) = l.post("/move-books/default", json!({"book_ids": [a], "folder": "Keep/These", "dry_run": false, "plan_fingerprint": "nope"})).await;
     assert_eq!(status, StatusCode::CONFLICT);
+    // So is executing with no fingerprint at all: that is moving files
+    // without a confirmed preview.
+    let (status, _) = l.post("/move-books/default", json!({"book_ids": [a], "folder": "Keep/These", "dry_run": false})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(l.folder_of(a), old_a, "nothing moved");
     let (status, started) = l.post("/move-books/default", json!({"book_ids": [a], "folder": "Keep/These", "dry_run": false, "plan_fingerprint": plan["plan_fingerprint"]})).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{started}");
     let job = l.wait_job(&started).await;

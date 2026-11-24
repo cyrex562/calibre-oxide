@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ALL_REASONS, DEFAULT_RESOLVE_TIERS, MIN_OPTIONS, confidencePercent, countByReason, evidenceLines, filterGroups, fileSummary, fingerprintAction, formatMtime, isImageOnlyScan, isMetadataOnly, isSuggested, needsReview, pdfLine, primaryPath, reasonBadge, reasonLabel } from "./duplicates";
+import { ALL_REASONS, DEFAULT_RESOLVE_TIERS, MIN_OPTIONS, confidencePercent, countByReason, evidenceLines, filterGroups, fileSummary, fingerprintAction, formatMtime, isImageOnlyScan, isMetadataOnly, isSuggested, needsReview, pdfLine, primaryPath, reasonBadge, reasonLabel, deleteCopyWarnings } from "./duplicates";
 import type { DuplicateGroup, DuplicateReason } from "./api";
 
 const group = (reason: DuplicateReason, confidence = 0.9): DuplicateGroup => ({ books: [], reason, confidence });
@@ -177,5 +177,21 @@ describe("the user's own groups", () => {
     expect(confidencePercent(0.9132)).toBe("91%");
     expect(confidencePercent(0.5)).toBe("50%");
     expect(confidencePercent(0.97)).toBe("97%");
+  });
+});
+
+describe("deleteCopyWarnings", () => {
+  const group = (ids: number[]) => ({ books: ids.map((book_id) => ({ book_id, title: `T${book_id}`, authors: [] })) });
+  it("warns before deleting the copy suggested to keep", () => {
+    expect(deleteCopyWarnings(group([1, 2]), { book_id: 1 }, 1)).toEqual(["This is the copy suggested to keep."]);
+  });
+  it("warns before deleting the last copy left in a group", () => {
+    const w = deleteCopyWarnings(group([5]), { book_id: 5 }, 5);
+    expect(w).toHaveLength(1);
+    expect(w[0]).toContain("last copy");
+  });
+  it("says nothing for an ordinary extra copy", () => {
+    expect(deleteCopyWarnings(group([1, 2]), { book_id: 2 }, 1)).toEqual([]);
+    expect(deleteCopyWarnings(group([1, 2]), { book_id: 2 }, null)).toEqual([]);
   });
 });

@@ -166,35 +166,56 @@ async fn delete_books_handle(state: AppState, book_ids: String, library_id: Opti
         };
         ids.push(id);
     }
+    crate::library_jobs::ensure_no_file_mover(&cache)?;
 
     // Files go to the library's own trash, `.caltrash` (calibre's semantics
     // for "delete": recoverable, and it exists on a network share, which has
     // no recycle bin), and only the files each book owns: never a whole
     // folder, since books found in one folder share a `path`. A file that
     // could not be moved is left in place and reported, not hard-deleted.
-    let failed = tokio::task::spawn_blocking({
+    // One book failing must not abort the rest, and the ones that did go must
+    // still be announced: a clean `?` out of the loop used to leave them
+    // deleted but unannounced, with the request reporting a 500.
+    let (deleted, failed) = tokio::task::spawn_blocking({
         let cache = cache.clone();
         let ids = ids.clone();
-        move || -> anyhow::Result<Vec<(i32, String, String)>> {
-            let mut failed = Vec::new();
+        move || {
+            let mut deleted: Vec<i32> = Vec::new();
+            // (book_id, path, error); `path` is null when the whole book failed.
+            let mut failed: Vec<(i32, Option<String>, String)> = Vec::new();
             for id in ids {
-                let report = calibre_db::removal::delete_with_file(&cache, id)?;
-                failed.extend(report.failed.into_iter().map(|(path, why)| (id, path, why)));
+                // The engine treats an unknown id as already gone; report it
+                // rather than announcing a deletion that never happened.
+                if !matches!(cache.field_for(id, "path"), Ok(Some(_))) {
+                    failed.push((id, None, format!("no book with id {id}")));
+                    continue;
+                }
+                match calibre_db::removal::delete_with_file(&cache, id) {
+                    Ok(report) => {
+                        deleted.push(id);
+                        failed.extend(report.failed.into_iter().map(|(path, why)| (id, Some(path), why)));
+                    }
+                    Err(e) => failed.push((id, None, format!("{e:#}"))),
+                }
             }
-            Ok(failed)
+            (deleted, failed)
         }
     })
     .await
-    .map_err(|e| ServerError::InternalServerError(e.to_string()))?
-    .map_err(|e| ServerError::InternalServerError(format!("{e:#}")))?;
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
 
-    web_socket::publish(&state, ChangeEvent::BooksDeleted { book_ids: ids });
-    if failed.is_empty() {
-        Ok(Json(serde_json::json!({})))
-    } else {
-        let failed: Vec<Value> = failed.into_iter().map(|(id, path, why)| serde_json::json!({"book_id": id, "path": path, "error": why})).collect();
-        Ok(Json(serde_json::json!({"failed": failed})))
+    if !deleted.is_empty() {
+        web_socket::publish(&state, ChangeEvent::BooksDeleted { book_ids: deleted.clone() });
     }
+    if failed.is_empty() {
+        return Ok(Json(serde_json::json!({"deleted": deleted})));
+    }
+    let failed_json: Vec<Value> = failed.into_iter().map(|(id, path, why)| serde_json::json!({"book_id": id, "path": path, "error": why})).collect();
+    if deleted.is_empty() {
+        // Nothing went: a plain error, whose message names what failed.
+        return Err(ServerError::InternalServerError(serde_json::json!({"deleted": deleted, "failed": failed_json}).to_string()));
+    }
+    Ok(Json(serde_json::json!({"deleted": deleted, "failed": failed_json})))
 }
 
 /// `POST /cdb/embed-metadata/{book_ids}/{library_id}` (#958).
@@ -846,7 +867,17 @@ pub struct CmdQuery {
 /// authentication, so upstream's own `readonly`-gated
 /// `ctx.check_for_write_access` call has nothing to port here -- see
 /// [`RemoteCommand`]'s own doc.
-pub async fn cmd(State(state): State<AppState>, Path((which, version)): Path<(String, String)>, Query(q): Query<CmdQuery>, body: Bytes) -> Result<Json<Value>, ServerError> {
+pub async fn cmd(State(state): State<AppState>, Path((which, version)): Path<(String, String)>, Query(q): Query<CmdQuery>, headers: axum::http::HeaderMap, body: Bytes) -> Result<Json<Value>, ServerError> {
+    // The body is parsed as JSON whatever it claims to be, so a cross-site
+    // `text/plain` form post (which needs no CORS preflight) would be a valid
+    // command. Requiring the JSON type forces a preflight, which this server
+    // never grants.
+    if !body.is_empty() {
+        let is_json = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|ct| ct.trim().to_ascii_lowercase().starts_with("application/json"));
+        if !is_json {
+            return Err(ServerError::BadRequest("Content-Type must be application/json".to_string()));
+        }
+    }
     let Some(command) = remote_command(&which) else {
         return Err(ServerError::NotFound(format!("No module named: {which}")));
     };
@@ -1051,6 +1082,24 @@ mod tests {
         let (status, book2) = get_json(&router, "/ajax/book/2").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(book2["title"], "Book 1");
+    }
+
+    /// A failing book in the middle of a bulk delete must not stop the books
+    /// after it, and the ones that did go are reported (so announced).
+    #[tokio::test]
+    async fn a_bulk_delete_survives_one_failing_book() {
+        let (_dir, router) = test_app(3);
+        let (status, body) = post_json(&router, "/cdb/delete-books/1,9999,3", serde_json::json!(null)).await;
+        assert_eq!(status, StatusCode::OK, "got: {body}");
+        assert_eq!(body["deleted"], serde_json::json!([1, 3]), "{body}");
+        let failed = body["failed"].as_array().expect("a failed list");
+        assert_eq!(failed.len(), 1, "{body}");
+        assert_eq!(failed[0]["book_id"], 9999);
+        assert!(failed[0]["error"].as_str().is_some_and(|e| !e.is_empty()));
+
+        assert_eq!(get_json(&router, "/ajax/book/1").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(get_json(&router, "/ajax/book/3").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(get_json(&router, "/ajax/book/2").await.0, StatusCode::OK);
     }
 
     #[tokio::test]

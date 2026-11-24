@@ -230,3 +230,30 @@ describe("which copy to keep", () => {
     expect(store.state.keepers[g.id!]).toBeUndefined();
   });
 });
+
+describe("out-of-order replies", () => {
+  it("ignores a page that arrives after a newer request was made", async () => {
+    const server = fakeServer(many(120));
+    const real = server.api.fetchDuplicateGroups as ReturnType<typeof vi.fn>;
+    const impl = real.getMockImplementation() as (q?: DuplicatesQuery) => Promise<DuplicatePageOrNone>;
+    const gates: (() => void)[] = [];
+    let call = 0;
+    real.mockImplementation(async (q: DuplicatesQuery = {}) => {
+      const mine = ++call;
+      const page = await impl(q);
+      // The first request answers last.
+      if (mine === 1) await new Promise<void>((r) => gates.push(r));
+      return page;
+    });
+    const store = createDuplicatesStore(server.api, 50);
+    const first = store.load(); // offset 0, slow
+    store.state.offset = 50;
+    await store.load(); // the newer request
+    expect(store.state.groups[0].id).toBe("g050");
+    gates.forEach((g) => g());
+    await first;
+    // The late reply for page 0 did not overwrite page 2, and loading is not stuck on.
+    expect(store.state.groups[0].id).toBe("g050");
+    expect(store.state.loading).toBe(false);
+  });
+});

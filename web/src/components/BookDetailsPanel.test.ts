@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { BookSummary } from "../library/types";
 import { getFieldValues, invalidateFieldValues } from "../library/fieldValues";
+import { sharedDrafts } from "../library/metadataForm";
 
 const books: Record<number, BookSummary> = {};
 const apiMocks = vi.hoisted(() => ({
@@ -92,6 +93,7 @@ async function mountPanel(initial = 1, extra: Record<string, unknown> = {}) {
 
 beforeEach(() => {
   localStorage.clear();
+  sharedDrafts.clear();
   books[1] = makeBook(1, ["pdf"]);
   books[2] = makeBook(2, ["epub"]);
   apiMocks.fetchBook.mockImplementation(async (id: number) => structuredClone(books[id]));
@@ -186,7 +188,8 @@ describe("metadata form", () => {
     await settle();
     expect(apiMocks.setFields).toHaveBeenCalledTimes(1);
     expect(apiMocks.setFields.mock.calls[0][0]).toBe(1);
-    expect(apiMocks.setFields.mock.calls[0][1]).toMatchObject({ title: "Changed", authors: ["Ann Lee"] });
+    // Only the edited field travels, so the save cannot revert anything else.
+    expect(apiMocks.setFields.mock.calls[0][1]).toEqual({ title: "Changed" });
     expect(emitted.updated).toHaveLength(1);
     expect(save(el).disabled).toBe(true);
   });
@@ -235,6 +238,63 @@ describe("metadata form", () => {
     await settle();
     expect(titleInput(el).value).toBe("Edited in the table");
     expect(save(el).disabled).toBe(true);
+  });
+
+  it("does not paint a saved book's data over the book selected while the save was in flight", async () => {
+    const { el, bookId } = await mountPanel();
+    let finish!: (b: BookSummary) => void;
+    apiMocks.setFields.mockImplementationOnce(() => new Promise<BookSummary>((resolve) => (finish = resolve)));
+    await type(titleInput(el), "A saved");
+    save(el).click();
+    await settle();
+    bookId.value = 2; // arrow-key to the next row while the save runs
+    await settle();
+    expect(titleInput(el).value).toBe("Book 2");
+    finish({ ...books[1], title: "A saved" });
+    await settle();
+    // Still book 2's data, and Save has nothing to write onto it.
+    expect(titleInput(el).value).toBe("Book 2");
+    expect(save(el).disabled).toBe(true);
+    // The draft of book 1 was discarded by id, not carried to book 2.
+    expect(sharedDrafts.has(1)).toBe(false);
+    expect(sharedDrafts.has(2)).toBe(false);
+  });
+
+  it("ignores a refresh that arrives after the selection moved on", async () => {
+    const { el, bookId, refreshKey } = await mountPanel();
+    let finish!: (b: BookSummary) => void;
+    apiMocks.fetchBook.mockImplementationOnce(() => new Promise<BookSummary>((resolve) => (finish = resolve)));
+    refreshKey.value++;
+    await settle();
+    bookId.value = 2;
+    await settle();
+    finish(makeBook(1, ["pdf"], "Stale refresh of 1"));
+    await settle();
+    expect(titleInput(el).value).toBe("Book 2");
+  });
+
+  it("sends only the fields edited here, so a table edit made meanwhile is not reverted", async () => {
+    const { el, refreshKey } = await mountPanel();
+    // The title is edited in the table; the panel's baseline still has the old one.
+    books[1] = makeBook(1, ["pdf"], "Edited in the table");
+    refreshKey.value++;
+    await settle();
+    const publisher = el.querySelector<HTMLInputElement>("[data-field='publisher']")!;
+    await type(publisher, "Acme");
+    save(el).click();
+    await settle();
+    expect(apiMocks.setFields.mock.calls[0][1]).toEqual({ publisher: "Acme" });
+  });
+
+  it("keeps drafts when the panel unmounts, and restores them on the next mount", async () => {
+    const first = await mountPanel();
+    await type(titleInput(first.el), "Unsaved title");
+    // Unmounting with a dirty form (the panel collapsed, the reader opened) stashes the draft.
+    app?.unmount();
+    host?.remove();
+    expect(sharedDrafts.has(1)).toBe(true);
+    const second = await mountPanel(1);
+    expect(titleInput(second.el).value).toBe("Unsaved title");
   });
 
   it("keeps what was typed when the list edits the book meanwhile", async () => {

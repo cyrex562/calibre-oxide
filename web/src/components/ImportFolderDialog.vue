@@ -140,7 +140,7 @@ async function cancel() {
 
 <template>
   <div class="manage-backdrop" @click.self="!busy && emit('close')">
-    <div class="manage-panel import-panel" role="dialog" aria-label="Add folder">
+    <div class="manage-panel import-panel" role="dialog" aria-modal="true" aria-label="Add folder">
       <h3>Add folder</h3>
       <p class="hint">Copies the books in a folder into this library, filing each as Author/Title. The folder itself is never changed.</p>
 
@@ -246,7 +246,7 @@ async function cancel() {
 }
 .absorb-section {
   margin-top: 1rem;
-  border-top: 1px solid var(--border, #8884);
+  border-top: 1px solid var(--border);
   padding-top: 0.5rem;
 }
 .absorb-list {

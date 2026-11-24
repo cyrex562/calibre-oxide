@@ -386,8 +386,8 @@ onBeforeUnmount(() => {
   flex: 1;
 }
 .cmp-badge {
-  border: 1px solid #1a7f37;
-  color: #1a7f37;
+  border: 1px solid var(--success);
+  color: var(--success);
   border-radius: 999px;
   padding: 0 0.5rem;
   font-size: 0.75em;
@@ -399,11 +399,11 @@ onBeforeUnmount(() => {
   margin: 0;
 }
 .cmp-error {
-  color: var(--error, #cf222e);
+  color: var(--danger);
   margin: 0;
 }
 .warn {
-  color: #bc4c00;
+  color: var(--warning);
 }
 .cmp-bar {
   display: flex;
@@ -456,21 +456,21 @@ onBeforeUnmount(() => {
   padding-left: 0.5rem;
 }
 .cmp-pair.on-matched {
-  border-left-color: #1a7f37;
+  border-left-color: var(--success);
   background: rgba(26, 127, 55, 0.08);
 }
 .cmp-pair.on-different {
-  border-left-color: #bc4c00;
+  border-left-color: var(--warning);
 }
 .cmp-pair-line {
   color: var(--fg-muted);
 }
 .cmp-on {
-  color: #1a7f37;
+  color: var(--success);
   font-weight: 600;
 }
 .cmp-off {
-  color: #bc4c00;
+  color: var(--warning);
 }
 .cmp-columns {
   flex: 1;
@@ -491,8 +491,8 @@ onBeforeUnmount(() => {
   gap: 0.4rem;
 }
 .cmp-col.keeper {
-  border-color: #1a7f37;
-  box-shadow: 0 0 0 1px #1a7f37 inset;
+  border-color: var(--success);
+  box-shadow: 0 0 0 1px var(--success) inset;
 }
 .cmp-col-head {
   display: flex;
@@ -503,7 +503,7 @@ onBeforeUnmount(() => {
   font-size: 1.1em;
 }
 .cmp-keep {
-  color: #1a7f37;
+  color: var(--success);
   font-weight: 600;
   font-size: 0.85em;
 }

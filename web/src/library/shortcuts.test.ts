@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { isTypingTarget, shortcutFor, type ShortcutMap } from "./shortcuts";
+import { isTypingTarget, shortcutFor, type ShortcutMap, isModalOpen } from "./shortcuts";
 import { DEFAULT_KEYMAP, libraryShortcuts } from "../settings/api";
 
 const MAP: ShortcutMap = { "add-books": "a", "focus-search": "/", "save-to-disk": "S", "delete-book": "Delete" };
@@ -116,5 +116,16 @@ describe("the default keymap", () => {
     for (const [action, binding] of Object.entries(map)) {
       expect(shortcutFor(key(binding!), map)).toBe(action);
     }
+  });
+});
+
+describe("isModalOpen", () => {
+  it("sees any open aria-modal dialog, whichever dialog it is", () => {
+    const host = document.createElement("div");
+    expect(isModalOpen(host)).toBe(false);
+    host.innerHTML = '<div role="dialog" aria-label="Trash" aria-modal="true"></div>';
+    expect(isModalOpen(host)).toBe(true);
+    host.innerHTML = '<div role="dialog" aria-modal="false"></div><aside></aside>';
+    expect(isModalOpen(host)).toBe(false);
   });
 });

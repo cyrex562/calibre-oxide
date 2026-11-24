@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { changesFromForm, cloneForm, DraftStore, formFromBook, isFormDirty } from "./metadataForm";
+import { changesFromForm, cloneForm, draftCount, DraftStore, formFromBook, isFormDirty, rebaseForm, sharedDrafts } from "./metadataForm";
 import type { BookSummary, FieldMetaEntry } from "./types";
 
 const edition = { key: "#edition", label: "edition", name: "Edition", datatype: "text", is_custom: true, is_editable: true } as FieldMetaEntry;
@@ -93,5 +93,68 @@ describe("number inputs", () => {
     form.seriesIndex = 2.5;
     expect(isFormDirty(form as never, base)).toBe(true);
     expect(changesFromForm(form as never, []).series_index).toBe(2.5);
+  });
+});
+
+describe("sending only what was edited", () => {
+  it("sends just the fields that differ from the baseline", () => {
+    const base = formFromBook(book, [edition]);
+    const form = { ...cloneForm(base), title: "Dune Messiah" };
+    expect(changesFromForm(form, [edition], base)).toEqual({ title: "Dune Messiah" });
+    const form2 = { ...cloneForm(base), custom: { edition: "Second" }, rating: 2 };
+    expect(changesFromForm(form2, [edition], base)).toEqual({ rating: 2, edition: "Second" });
+  });
+
+  it("sends nothing for an untouched form, and everything without a baseline (the old behaviour)", () => {
+    const base = formFromBook(book, [edition]);
+    expect(changesFromForm(cloneForm(base), [edition], base)).toEqual({});
+    expect(Object.keys(changesFromForm(cloneForm(base), [edition]))).toContain("authors");
+  });
+
+  it("does not read a number input handing back 1 for the string '1' as an edit", () => {
+    const base = formFromBook(book, []);
+    const form = cloneForm(base) as unknown as Record<string, unknown>;
+    form.seriesIndex = 1;
+    expect(changesFromForm(form as never, [], base)).toEqual({});
+  });
+});
+
+describe("rebasing a form onto a re-read book", () => {
+  it("lets untouched fields follow the new values and keeps the edited ones", () => {
+    const oldBase = formFromBook(book, [edition]);
+    const form = { ...cloneForm(oldBase), publisher: "Typed" };
+    const reread = formFromBook({ ...book, title: "Edited in the table", edition: "Third" } as BookSummary, [edition]);
+    const out = rebaseForm(form, oldBase, reread);
+    expect(out.title).toBe("Edited in the table");
+    expect(out.custom.edition).toBe("Third");
+    expect(out.publisher).toBe("Typed");
+    // ... so the next save sends only the publisher.
+    expect(changesFromForm(out, [edition], reread)).toEqual({ publisher: "Typed" });
+  });
+});
+
+describe("drafts that outlive the panel", () => {
+  it("restores a draft onto the book's current values", () => {
+    const store = new DraftStore();
+    const base = formFromBook(book, []);
+    store.stash(1, { ...cloneForm(base), publisher: "Typed" }, base);
+    const fresh = formFromBook({ ...book, title: "Changed meanwhile" } as BookSummary, []);
+    const restored = store.restore(1, fresh)!;
+    expect(restored.title).toBe("Changed meanwhile");
+    expect(restored.publisher).toBe("Typed");
+    expect(store.restore(2, fresh)).toBeNull();
+  });
+
+  it("keeps a module-level store with a live count for the 'N unsaved drafts' indicator", () => {
+    sharedDrafts.clear();
+    const base = formFromBook(book, []);
+    expect(draftCount.value).toBe(0);
+    sharedDrafts.stash(1, { ...cloneForm(base), title: "a" }, base);
+    sharedDrafts.stash(2, { ...cloneForm(base), title: "b" }, base);
+    expect(draftCount.value).toBe(2);
+    sharedDrafts.discard(1);
+    expect(draftCount.value).toBe(1);
+    sharedDrafts.stash(2, cloneForm(base), base); // edited back to the original
+    expect(draftCount.value).toBe(0);
   });
 });

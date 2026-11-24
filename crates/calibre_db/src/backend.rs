@@ -171,6 +171,7 @@ fn spawn_checkpoint_thread(
     tier: crate::library_handle::StorageTier,
     cadence: CheckpointCadencePolicy,
     state: std::sync::Weak<Mutex<CheckpointCadenceState>>,
+    conn: std::sync::Weak<Mutex<Connection>>,
 ) {
     let _ = std::thread::Builder::new()
         .name("calibre-oxide-wal-checkpoint".to_string())
@@ -198,7 +199,18 @@ fn spawn_checkpoint_thread(
             };
             if due {
                 // Do the real I/O without holding the state lock.
-                crate::library_handle::checkpoint_wal_best_effort(&library_path);
+                // `metadata.db` is checkpointed on the live connection, from this
+                // thread, after the writer that triggered the poll has let go of
+                // it (so none of the commit-hook hazards above apply). A second
+                // connection doing it would show up as "somebody else wrote" to the
+                // field cache; see `checkpoint_sidecar_wals_best_effort`.
+                match conn.upgrade() {
+                    Some(conn) => {
+                        let _ = conn.lock().unwrap().execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+                        crate::library_handle::checkpoint_sidecar_wals_best_effort(&library_path);
+                    }
+                    None => return,
+                }
                 let mut guard = state.lock().unwrap();
                 guard.writes_since_checkpoint = 0;
                 guard.last_checkpoint = Instant::now();
@@ -303,6 +315,9 @@ pub struct Backend {
     /// fed. Without it, rebuilding the database would double every
     /// entry in the log it was rebuilt from.
     replaying: Arc<AtomicBool>,
+    /// Row changes made through `conn`, for keeping `Cache`'s field
+    /// snapshot current without reloading it (see `field_feed`).
+    pub(crate) field_feed: Arc<crate::field_feed::FieldFeed>,
     /// The tier this library was classified as when opened (#258).
     storage_tier: crate::library_handle::StorageTier,
     /// `metadata.db`'s journal mode as actually in effect (`"wal"` or
@@ -446,6 +461,11 @@ impl Backend {
              UPDATE authors SET sort=author_to_author_sort(name) WHERE sort IS NULL;",
         )?;
 
+        // Registered after the schema work above, so the bootstrap writes
+        // are not queued as events nobody will read.
+        let field_feed = Arc::new(crate::field_feed::FieldFeed::new());
+        field_feed.install(&conn);
+
         let mut backend = Backend {
             library_path,
             db_path,
@@ -455,6 +475,7 @@ impl Backend {
             write_handle: Arc::new(Mutex::new(None)),
             change_log: Arc::new(Mutex::new(None)),
             replaying: Arc::new(AtomicBool::new(false)),
+            field_feed,
             storage_tier: tier,
             journal_mode: journal_mode.clone(),
             checkpoint_thread_running: false,
@@ -502,6 +523,7 @@ impl Backend {
                 tier,
                 cadence,
                 Arc::downgrade(&cadence_state),
+                Arc::downgrade(&backend.conn),
             );
             {
                 let cadence_state = Arc::clone(&cadence_state);
@@ -607,7 +629,7 @@ impl Backend {
     /// Test-only: pre-seeds this `Backend`'s cached write handle with
     /// one forced to report [`crate::library_handle::StorageTier::Network`],
     /// so a later real [`Backend::write_handle`] call (e.g. from
-    /// `Cache::rename_book_files`) returns it instead of opening a
+    /// the removed `Cache::rename_book_files`) returns it instead of opening a
     /// fresh, really-classified handle -- lets a caller's tier-
     /// branching logic be exercised end to end against a real
     /// `Network`-tier handle without needing an actual network mount.
