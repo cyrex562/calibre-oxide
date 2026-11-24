@@ -606,6 +606,10 @@ pub fn import_folder(cache: &Cache, source: &Path, options: &ImportOptions, pipe
     let _ = fs::remove_dir_all(&staging_root);
     fs::create_dir_all(&staging_root).with_context(|| format!("creating {}", staging_root.display()))?;
 
+    // Books already waiting for their covers (a deferred scan, an earlier cancelled run) are not
+    // this import's: its closing pass leaves them queued.
+    let queued_before: std::collections::HashSet<i32> = cache.checksums().pending_enrichment().map(|rows| rows.into_iter().map(|(id, ..)| id).collect()).unwrap_or_default();
+
     control.set_phase("importing");
     control.total.store(groups.iter().map(|g| g.files.len() as u64).sum(), Ordering::Relaxed);
 
@@ -639,7 +643,7 @@ pub fn import_folder(cache: &Cache, source: &Path, options: &ImportOptions, pipe
     // A failure here does not undo the import: the books are in, and the pass
     // is resumable (`POST /enrich-library`).
     if !report.cancelled && report.books_added > 0 {
-        match crate::scan_pipeline::enrich_pending(cache, pipeline, control) {
+        match crate::scan_pipeline::enrich_pending_except(cache, pipeline, control, &queued_before) {
             Ok(enriched) => report.enrichment = Some(enriched),
             Err(e) => log::warn!("the import is done but its covers could not be rendered: {e:#}"),
         }

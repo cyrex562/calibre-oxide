@@ -154,6 +154,13 @@ async fn main() -> anyhow::Result<()> {
     // This is the only automatic expiry: `GET /trash` is read-only.
     let expire_on_start = |cache: Arc<Cache>| {
         std::thread::spawn(move || {
+            // A bulk delete that was cut short leaves trash entries half made; settle them
+            // before anything expires.
+            match cache.recover_pending_trash() {
+                Ok(0) => {}
+                Ok(n) => println!("settled {n} unfinished trash entr{}", if n == 1 { "y" } else { "ies" }),
+                Err(e) => eprintln!("could not settle unfinished trash entries: {e:#}"),
+            }
             if let Some(report) = cache.expire_trash_if_due() {
                 if !report.removed.is_empty() {
                     println!("expired {} old item(s) from the library trash", report.removed.len());

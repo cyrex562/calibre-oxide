@@ -24,6 +24,7 @@ import ImportFolderDialog from "./ImportFolderDialog.vue";
 import { scanPromptHint, scanPromptText, shouldPrompt } from "../library/scanPrompt";
 import { addBook, catalogDownloadUrl, fetchBooks, fetchFieldMetadata, fetchNaming, fetchSavedSearches, fetchVirtualLibraries, libraryExportUrl, search, setFields, setSavedSearch, setVirtualLibrary } from "../library/api";
 import type { DuplicateBook, DuplicateGroup } from "../library/api";
+import type { BookSummary } from "../library/types";
 import ResolveDialog from "./ResolveDialog.vue";
 import CompareDuplicates from "./CompareDuplicates.vue";
 import { createCompareController, MAX_BOOKS as COMPARE_MAX } from "../library/compare";
@@ -1532,8 +1533,9 @@ function openContextMenu(payload: { bookId: number; x: number; y: number }) {
 async function deleteSelectedBooks() {
   const ids = scope.ids.value;
   if (ids.length === 0) return;
-  await win.ensureLoaded(ids).catch(() => []);
-  const items = ids.map((id) => ({ id, title: win.getById(id)?.title ?? `Book ${id}` }));
+  // The rows `ensureLoaded` returns are the answer: the cache is capped and may have evicted some.
+  const loaded = new Map((await win.ensureLoaded(ids).catch(() => [] as BookSummary[])).map((b) => [b.id, b]));
+  const items = ids.map((id) => ({ id, title: loaded.get(id)?.title ?? win.getById(id)?.title ?? `Book ${id}` }));
   // The selection can hold books the current search no longer shows.
   const hiddenCount = ids.filter((id) => win.indexOf(id) < 0).length;
   try {

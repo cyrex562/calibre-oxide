@@ -84,6 +84,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 use crate::cache::{path_is_plain, Cache, OwnFile};
@@ -181,6 +182,13 @@ pub(crate) struct BookManifest {
     /// so a whole run can be undone at once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     run_id: Option<String>,
+    /// Set while the entry is reserved but its files are not all in it yet. A batch
+    /// deletion reserves every entry *before* its transaction commits (so a crash can
+    /// never leave a deleted book with no trace of where its files are), moves the files
+    /// after, and clears this last. A pending entry is hidden from the trash listing;
+    /// [`Cache::recover_pending_trash`] settles any a crash left behind.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pending: bool,
 }
 
 thread_local! {
@@ -472,6 +480,7 @@ impl Cache {
             has_cover: self.has_cover(book_id).unwrap_or(false),
             stored_cover: false,
             run_id: current_trash_run(),
+            pending: false,
         })
     }
 
@@ -486,10 +495,52 @@ impl Cache {
     /// left where they are and reported; if nothing ends up in the trash no
     /// entry is kept (calibre too: nothing to restore from).
     pub(crate) fn move_book_to_trash(&self, mut manifest: BookManifest, sidecar_cover: Option<PathBuf>) -> MoveOutcome {
+        match self.reserve_book_trash(&mut manifest, false) {
+            Ok(dir) => self.move_into_reserved_trash(manifest, sidecar_cover, dir),
+            Err(why) => {
+                let mut outcome = MoveOutcome::default();
+                for f in manifest.files {
+                    outcome.failed.push((f.rel, why.clone()));
+                }
+                outcome
+            }
+        }
+    }
+
+    /// Allocates the trash entry for a book and writes its manifest, listing only the files
+    /// that are on disk (`manifest.files` is cut down to them). `Ok(None)`: nothing to keep.
+    ///
+    /// A batch deletion calls this with `pending` **before** its transaction commits: the
+    /// manifest then exists whatever happens next, so a crash never leaves a deleted book's
+    /// files in the library with nothing saying whose they were.
+    pub(crate) fn reserve_book_trash(&self, manifest: &mut BookManifest, pending: bool) -> Result<Option<PathBuf>, String> {
+        let library = self.backend.library_path.clone();
+        manifest.files.retain(|f| file_present(&library, &f.rel));
+        if manifest.files.is_empty() {
+            return Ok(None);
+        }
+        let (_, dir) = self.allocate_entry("b", manifest.book_id).map_err(|e| format!("could not create the trash entry: {e:#}"))?;
+        manifest.pending = pending;
+        if let Err(e) = self.write_manifest(&dir.join(BOOK_MANIFEST), manifest) {
+            let _ = fs::remove_dir(&dir);
+            return Err(format!("could not write the trash entry: {e:#}"));
+        }
+        Ok(Some(dir))
+    }
+
+    /// Drops an entry [`Cache::reserve_book_trash`] made when the deletion it was for did not happen.
+    pub(crate) fn abandon_trash_reservation(&self, dir: &Path) {
+        if let Ok(handle) = self.backend.write_handle() {
+            let _ = handle.remove_atomic(dir);
+        }
+    }
+
+    /// The moving half of [`Cache::move_book_to_trash`], into the entry
+    /// [`Cache::reserve_book_trash`] made (`None`: there was nothing on disk to keep).
+    pub(crate) fn move_into_reserved_trash(&self, mut manifest: BookManifest, sidecar_cover: Option<PathBuf>, dir: Option<PathBuf>) -> MoveOutcome {
         let mut outcome = MoveOutcome::default();
         let library = self.backend.library_path.clone();
-        let present: Vec<TrashedFile> = manifest.files.iter().filter(|f| file_present(&library, &f.rel)).cloned().collect();
-        if present.is_empty() {
+        let Some(dir) = dir else {
             // Nothing on disk to keep. The sidecar cover is index state of
             // the deleted book; drop it as before.
             if let Some(cover) = sidecar_cover {
@@ -498,25 +549,9 @@ impl Cache {
                 }
             }
             return outcome;
-        }
-
-        let dir = match self.allocate_entry("b", manifest.book_id) {
-            Ok((_, dir)) => dir,
-            Err(e) => {
-                for f in present {
-                    outcome.failed.push((f.rel, format!("could not create the trash entry: {e:#}")));
-                }
-                return outcome;
-            }
         };
-        manifest.files = present;
-        if let Err(e) = self.write_manifest(&dir.join(BOOK_MANIFEST), &manifest) {
-            let _ = fs::remove_dir(&dir);
-            for f in &manifest.files {
-                outcome.failed.push((f.rel.clone(), format!("could not write the trash entry: {e:#}")));
-            }
-            return outcome;
-        }
+        let was_pending = manifest.pending;
+        manifest.pending = false;
 
         let mut kept = Vec::new();
         for file in &manifest.files {
@@ -539,7 +574,7 @@ impl Cache {
             if let Ok(handle) = self.backend.write_handle() {
                 let _ = handle.remove_atomic(&dir);
             }
-        } else if !outcome.failed.is_empty() || manifest.stored_cover {
+        } else if was_pending || !outcome.failed.is_empty() || manifest.stored_cover {
             manifest.files = kept;
             if let Err(e) = self.write_manifest(&dir.join(BOOK_MANIFEST), &manifest) {
                 log::warn!("could not update the trash manifest in {}: {e:#}", dir.display());
@@ -642,6 +677,8 @@ impl Cache {
     fn describe_book_entry(key: &str, dir: &Path, expiry: i64) -> Option<TrashEntry> {
         let book_id: i32 = key.split('.').next()?.parse().ok()?;
         match read_json::<BookManifest>(&manifest_path(dir)) {
+            // Still being filled by a batch deletion (or left by a crash, until recovered).
+            Ok(m) if m.pending => None,
             Ok(m) => Some(TrashEntry {
                 kind: TrashKind::Book,
                 key: key.to_string(),
@@ -733,6 +770,9 @@ impl Cache {
     pub fn restore_trashed_book(&self, key: &str) -> Result<RestoredBook> {
         let dir = self.entry_dir(TrashKind::Book, key)?;
         let manifest: BookManifest = read_json(&manifest_path(&dir)).context("this trash entry cannot be restored by this app (no lexmechanic-trash.json)")?;
+        if manifest.pending {
+            bail!("\"{}\" is still being moved to the trash", manifest.title);
+        }
         if self.book_id_for_uuid(&manifest.uuid)?.is_some() {
             bail!("\"{}\" is already in the library", manifest.title);
         }
@@ -1023,6 +1063,60 @@ impl Cache {
                 None
             }
         }
+    }
+}
+
+impl Cache {
+    /// Settles the trash entries a crash left half-made (see [`BookManifest::pending`]).
+    /// Call it when a library is opened, before anything deletes: an entry still marked
+    /// pending is otherwise either in flight or abandoned, and from here they cannot be told apart.
+    ///
+    /// * The book still has its row: the batch never committed, so no file moved. The
+    ///   reservation is dropped and the book is as it was.
+    /// * The row is gone: the batch committed and the process died while moving files. The
+    ///   moves are finished (a file already in the entry stays, one still in the library goes
+    ///   in), and the entry becomes an ordinary restorable one.
+    ///
+    /// Returns how many entries were settled.
+    pub fn recover_pending_trash(&self) -> Result<usize> {
+        let base = self.trash_dir().join("b");
+        let Ok(read) = fs::read_dir(&base) else { return Ok(0) };
+        let library = self.backend.library_path.clone();
+        let mut settled = 0;
+        for entry in read.flatten() {
+            let dir = entry.path();
+            let Ok(mut manifest) = read_json::<BookManifest>(&manifest_path(&dir)) else { continue };
+            if !manifest.pending {
+                continue;
+            }
+            let row_exists = {
+                let conn = self.backend.conn.lock().unwrap();
+                conn.query_row("SELECT 1 FROM books WHERE id = ?1 OR uuid = ?2", (manifest.book_id, &manifest.uuid), |_| Ok(())).optional()?.is_some()
+            };
+            if row_exists {
+                self.abandon_trash_reservation(&dir);
+                settled += 1;
+                continue;
+            }
+            let mut kept = Vec::new();
+            for file in &manifest.files {
+                let stored = dir.join(&file.stored);
+                if stored.exists() {
+                    kept.push(file.clone());
+                } else if file_present(&library, &file.rel) && self.move_journaled(&library.join(&file.rel), &stored).is_ok() {
+                    kept.push(file.clone());
+                }
+            }
+            if kept.is_empty() {
+                self.abandon_trash_reservation(&dir);
+            } else {
+                manifest.files = kept;
+                manifest.pending = false;
+                self.write_manifest(&dir.join(BOOK_MANIFEST), &manifest)?;
+            }
+            settled += 1;
+        }
+        Ok(settled)
     }
 }
 

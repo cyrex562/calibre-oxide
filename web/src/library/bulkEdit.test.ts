@@ -257,6 +257,10 @@ describe("uniformChanges", () => {
     expect(uniformChanges({ ...EMPTY, comments: "Read it", custom: { "#shelf": "A3" } })).toEqual({ comments: "Read it", "#shelf": "A3" });
   });
 
+  it("drops case-duplicate values of a replaced list", () => {
+    expect(uniformChanges({ ...EMPTY, tags: { mode: "replace", value: "scifi, SciFi, noir" } })).toEqual({ tags: ["scifi", "noir"] });
+  });
+
   it("includes a list replaced outright, even with nothing in it (that clears it)", () => {
     expect(uniformChanges({ ...EMPTY, tags: { mode: "replace", value: "a, b" } })).toEqual({ tags: ["a", "b"] });
     expect(uniformChanges({ ...EMPTY, tags: { mode: "replace", value: "" } })).toEqual({ tags: [] });
