@@ -6,6 +6,8 @@
 // the template, the PDF page drawing (pdf.js, lazily, one canvas a column) and
 // the wiring. A page change cancels the renders still running.
 
+import Dialog from "./Dialog.vue";
+import { confirmDialog } from "./dialogs/confirm";
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 
@@ -69,7 +71,7 @@ function dirty(id: number, field: DraftField): boolean {
 }
 
 async function decide() {
-  await c.keepAndTrash({ mergeOthers: mergeOthers.value, confirm: (summary) => window.confirm(summary) });
+  await c.keepAndTrash({ mergeOthers: mergeOthers.value, confirm: (summary) => confirmDialog(summary, { title: "Keep and trash", confirmLabel: "Continue", danger: true }) });
 }
 
 function cancelWork() {
@@ -177,12 +179,7 @@ watch(
   },
 );
 
-function onKey(e: KeyboardEvent) {
-  if (e.key === "Escape" && !busy.value) emit("close");
-}
-
 onMounted(() => {
-  window.addEventListener("keydown", onKey);
   if (typeof IntersectionObserver !== "undefined") {
     // A column scrolled out of view does not draw until it is in view.
     observer = new IntersectionObserver((entries) => {
@@ -198,14 +195,14 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
-  window.removeEventListener("keydown", onKey);
   observer?.disconnect();
   forget([...docs.keys()]);
 });
 </script>
 
 <template>
-  <div class="cmp-overlay" role="dialog" aria-modal="true" aria-label="Compare copies" data-testid="compare-view">
+  <Dialog size="full" label="Compare copies" :busy="busy" class="cmp-dialog" data-testid="compare-view" @close="emit('close')">
+    <div class="cmp-overlay">
     <header class="cmp-top">
       <h3>Compare {{ books.length || state.bookIds.length }} copies</h3>
       <span v-if="state.manualGroupId" class="cmp-badge" data-testid="your-group">Your group</span>
@@ -358,20 +355,18 @@ onBeforeUnmount(() => {
       </template>
       <span v-if="state.decision.message && state.decision.phase === 'idle'" class="cmp-hint" role="status">{{ state.decision.message }}</span>
     </footer>
-  </div>
+    </div>
+  </Dialog>
 </template>
 
 <style scoped>
 .cmp-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 60;
-  background: var(--bg);
+  flex: 1;
+  min-height: 0;
   color: var(--fg);
   display: flex;
   flex-direction: column;
   gap: 0.6rem;
-  padding: 0.75rem 1rem;
   overflow: hidden;
 }
 .cmp-top {

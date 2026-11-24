@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { promptDialog } from "./dialogs/confirm";
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute } from "vue-router";
 import { addBookmark, addHighlight, fetchBookFileText, fetchManifest, getAnnotations, getLastReadPositions, setLastReadPosition } from "../reader/api";
@@ -490,7 +491,7 @@ async function bookmarkCurrentPage() {
   const m = manifest.value;
   if (!m) return;
   const suggested = tocEntries.value.find((e) => m.spine.indexOf(e.dest ?? "") === spineIndex.value)?.title ?? `Page ${spineIndex.value + 1}`;
-  const title = prompt("Bookmark title:", suggested);
+  const title = await promptDialog("Bookmark title:", suggested, { title: "Add bookmark", confirmLabel: "Add" });
   if (!title) return;
   bookmarkError.value = null;
   try {

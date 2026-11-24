@@ -5,6 +5,8 @@
 // Rename folder; drop selected rows from the table on a folder to move them.
 // The logic (tree, query, drag payload, move flow) is in ../library/folders.ts.
 
+import { useKeepScroll } from "../library/keepScroll";
+import Dialog from "./Dialog.vue";
 import { computed, ref, watch } from "vue";
 
 import { createLibraryFolder, deleteLibraryFolder, fetchLibraryFolders, type LibraryFolder } from "../library/api";
@@ -14,6 +16,9 @@ import {
 } from "../library/folders";
 import ContextMenu, { type ContextMenuEntry } from "./ContextMenu.vue";
 import { getItemCompat } from "../library/legacyStorage";
+
+const rootEl = ref<HTMLElement | null>(null);
+useKeepScroll(rootEl);
 
 const vFocus = { mounted: (el: HTMLElement) => el.focus() };
 
@@ -185,7 +190,7 @@ function planTitle(): string {
 </script>
 
 <template>
-  <section class="folders" aria-label="Folders">
+  <section ref="rootEl" class="folders" aria-label="Folders">
     <div class="folders-head">
       <button type="button" class="folders-toggle" :aria-expanded="open" @click="open = !open">
         <span class="twisty" aria-hidden="true">{{ open ? "▾" : "▸" }}</span>
@@ -220,42 +225,44 @@ function planTitle(): string {
 
     <ContextMenu v-if="menu" :x="menu.x" :y="menu.y" :entries="menuEntries" @choose="onChoose" @close="menu = null" />
 
-    <div v-if="prompt" class="folder-backdrop" @click.self="prompt = null">
-      <form class="folder-dialog" role="dialog" aria-modal="true" :aria-label="prompt.kind === 'new' ? 'New subfolder' : 'Rename folder'" @submit.prevent="submitPrompt">
-        <h3>{{ prompt.kind === "new" ? (prompt.path ? `New subfolder in ${prompt.path}` : "New folder") : `Rename ${prompt.path}` }}</h3>
+    <Dialog
+      v-if="prompt"
+      :title="prompt.kind === 'new' ? (prompt.path ? `New subfolder in ${prompt.path}` : 'New folder') : `Rename ${prompt.path}`"
+      :busy="prompt.busy"
+      size="sm"
+      @close="prompt = null"
+    >
+      <form class="folder-form" @submit.prevent="submitPrompt">
         <input v-model="prompt.value" type="text" v-focus data-testid="folder-name" spellcheck="false" placeholder="Folder name" />
         <p v-if="prompt.kind === 'new'" class="hint">An empty folder is made on disk and stays in the tree until you remove it.</p>
         <p v-else class="hint">Every book in it moves, with its sub-folders and file names. You will see the plan first, and can undo it.</p>
         <p v-if="prompt.error" class="error" role="alert">{{ prompt.error }}</p>
         <div class="buttons">
-          <button type="submit" :disabled="prompt.busy" data-testid="folder-name-ok">{{ prompt.kind === "new" ? "Create" : "Preview" }}</button>
+          <button type="submit" class="primary" :disabled="prompt.busy" data-testid="folder-name-ok">{{ prompt.kind === "new" ? "Create" : "Preview" }}</button>
           <button type="button" @click="prompt = null">Cancel</button>
         </div>
       </form>
-    </div>
+    </Dialog>
 
-    <div v-if="flowOpen && state.action" class="folder-backdrop" @click.self="state.phase !== 'running' && closeFlow()">
-      <div class="folder-dialog" role="dialog" aria-modal="true" :aria-label="planTitle()" data-testid="folder-flow">
-        <h3>{{ planTitle() }}</h3>
-        <template v-if="state.plan && (state.phase === 'confirm' || (state.phase === 'running' && !state.report))">
-          <p role="status" data-testid="folder-plan">{{ describeFolderPlan(state.action, state.plan) }}</p>
-          <ul class="moves">
-            <li v-for="(m, i) in state.plan.moves.slice(0, 8)" :key="i"><span class="path">{{ m.from }} → {{ m.to }}</span></li>
-          </ul>
-          <p v-if="state.plan.moves.length > 8" class="hint">…and {{ (state.plan.files - 8).toLocaleString("en-US") }} more files.</p>
-          <p class="hint">Nothing is overwritten (a name already taken gets a number), and the run can be undone.</p>
-        </template>
-        <p v-if="state.phase === 'running'" class="hint" role="status">{{ state.progress }}</p>
-        <p v-if="state.report && state.phase !== 'running'" role="status" data-testid="folder-report">{{ describeFolderReport(state.report) }}</p>
-        <p v-if="state.undone" role="status">{{ state.undone }}</p>
-        <p v-if="state.error" class="error" role="alert">{{ state.error }}</p>
-        <div class="buttons">
-          <button v-if="state.phase === 'confirm'" type="button" data-testid="folder-run" @click="runFlow">{{ state.action.kind === "move" ? "Move" : "Rename" }} {{ state.plan?.books.toLocaleString("en-US") }} book{{ state.plan?.books === 1 ? "" : "s" }}</button>
-          <button v-if="state.phase === 'done'" type="button" data-testid="folder-undo" @click="flow.undo()">Undo</button>
-          <button type="button" :disabled="state.phase === 'running'" @click="closeFlow">{{ state.phase === "done" || state.undone ? "Close" : "Cancel" }}</button>
-        </div>
-      </div>
-    </div>
+    <Dialog v-if="flowOpen && state.action" :title="planTitle()" :busy="state.phase === 'running'" size="md" data-testid="folder-flow" @close="closeFlow">
+      <template v-if="state.plan && (state.phase === 'confirm' || (state.phase === 'running' && !state.report))">
+        <p role="status" data-testid="folder-plan">{{ describeFolderPlan(state.action, state.plan) }}</p>
+        <ul class="moves">
+          <li v-for="(m, i) in state.plan.moves.slice(0, 8)" :key="i"><span class="path">{{ m.from }} → {{ m.to }}</span></li>
+        </ul>
+        <p v-if="state.plan.moves.length > 8" class="hint">…and {{ (state.plan.files - 8).toLocaleString("en-US") }} more files.</p>
+        <p class="hint">Nothing is overwritten (a name already taken gets a number), and the run can be undone.</p>
+      </template>
+      <p v-if="state.phase === 'running'" class="hint" role="status">{{ state.progress }}</p>
+      <p v-if="state.report && state.phase !== 'running'" role="status" data-testid="folder-report">{{ describeFolderReport(state.report) }}</p>
+      <p v-if="state.undone" role="status">{{ state.undone }}</p>
+      <p v-if="state.error" class="error" role="alert">{{ state.error }}</p>
+      <template #footer>
+        <button v-if="state.phase === 'confirm'" type="button" class="primary" data-testid="folder-run" @click="runFlow">{{ state.action.kind === "move" ? "Move" : "Rename" }} {{ state.plan?.books.toLocaleString("en-US") }} book{{ state.plan?.books === 1 ? "" : "s" }}</button>
+        <button v-if="state.phase === 'done'" type="button" data-testid="folder-undo" @click="flow.undo()">Undo</button>
+        <button type="button" :disabled="state.phase === 'running'" @click="closeFlow">{{ state.phase === "done" || state.undone ? "Close" : "Cancel" }}</button>
+      </template>
+    </Dialog>
   </section>
 </template>
 
@@ -380,28 +387,10 @@ function planTitle(): string {
   color: var(--danger);
   font-size: var(--fs-small);
 }
-.folder-backdrop {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.45);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 30;
-}
-.folder-dialog {
-  background: var(--bg);
-  border-radius: 6px;
-  padding: 1.1rem 1.4rem;
-  width: min(560px, 94vw);
-  max-height: 80vh;
-  overflow: auto;
+form.folder-form {
   display: flex;
   flex-direction: column;
   gap: 0.7rem;
-}
-.folder-dialog h3 {
-  margin: 0;
 }
 .hint {
   margin: 0;

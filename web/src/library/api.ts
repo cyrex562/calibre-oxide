@@ -3,6 +3,7 @@
 // role for this slice, narrowed to only what the library-browser MVP
 // needs.
 
+import { markLibraryChanged } from "./libraryEpoch";
 import type { AbsorbReport, AbsorbableList } from "./absorb";
 import { importBody, type ImportFolderRequest, type ImportReport } from "./importFolder";
 import type { UntrackedCount } from "./scanPrompt";
@@ -30,6 +31,8 @@ async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
   if (!resp.ok) {
     throw new Error(`${init?.method ?? "GET"} ${url} failed: ${resp.status} ${resp.statusText}${await failureDetail(resp)}`);
   }
+  // A write: a library view kept alive behind the reader reloads when shown again.
+  if (init?.method && init.method.toUpperCase() !== "GET") markLibraryChanged();
   return (await resp.json()) as T;
 }
 

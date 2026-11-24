@@ -7,6 +7,7 @@
 // the rule rewrote it. The Apply button stays disabled until a
 // preview has run, so "apply" always means "apply what I just read".
 
+import Dialog from "./Dialog.vue";
 import { computed, ref } from "vue";
 
 import { applyMapper, previewMapper, type MappedBook, type MapperRule } from "../library/api";
@@ -109,64 +110,58 @@ const scopeLabel = computed(() => (props.bookIds.length > 0 ? `${props.bookIds.l
 </script>
 
 <template>
-  <div class="manage-backdrop" @click.self="emit('close')">
-    <div class="manage-panel mapper-panel" role="dialog" aria-modal="true">
-      <h3>Map {{ field }}</h3>
-      <p class="hint">Rewrite {{ field }} in bulk across {{ scopeLabel }}. Nothing is written until you preview.</p>
+  <Dialog :title="`Map ${field}`" :busy="busy" size="lg" @close="emit('close')">
+    <p class="hint">Rewrite {{ field }} in bulk across {{ scopeLabel }}. Nothing is written until you preview.</p>
 
-      <label class="field">
-        Field
-        <select v-model="field" :disabled="busy" @change="onFieldChange">
-          <option value="authors">Authors</option>
-          <option value="tags">Tags</option>
+    <label class="field">
+      Field
+      <select v-model="field" :disabled="busy" @change="onFieldChange">
+        <option value="authors">Authors</option>
+        <option value="tags">Tags</option>
+      </select>
+    </label>
+
+    <ul class="rule-list">
+      <li v-for="(rule, i) in rules" :key="i" class="rule-row">
+        <select v-model="rule.match_type" :disabled="busy" @change="preview = null">
+          <option v-for="m in MATCH_TYPES" :key="m.value" :value="m.value">{{ m.label }}</option>
         </select>
-      </label>
+        <input v-model="rule.query" placeholder="value or pattern…" :disabled="busy" @input="preview = null" />
+        <select v-model="rule.action" :disabled="busy" @change="preview = null">
+          <option v-for="a in actions" :key="a.value" :value="a.value">{{ a.label }}</option>
+        </select>
+        <input v-if="rule.action === 'replace'" v-model="rule.replace" placeholder="replacement…" :disabled="busy" @input="preview = null" />
+        <button type="button" :disabled="busy" title="Remove this rule" @click="removeRule(i)">✕</button>
+      </li>
+    </ul>
+    <button type="button" :disabled="busy" @click="addRule">+ Add rule</button>
 
-      <ul class="rule-list">
-        <li v-for="(rule, i) in rules" :key="i" class="rule-row">
-          <select v-model="rule.match_type" :disabled="busy" @change="preview = null">
-            <option v-for="m in MATCH_TYPES" :key="m.value" :value="m.value">{{ m.label }}</option>
-          </select>
-          <input v-model="rule.query" placeholder="value or pattern…" :disabled="busy" @input="preview = null" />
-          <select v-model="rule.action" :disabled="busy" @change="preview = null">
-            <option v-for="a in actions" :key="a.value" :value="a.value">{{ a.label }}</option>
-          </select>
-          <input v-if="rule.action === 'replace'" v-model="rule.replace" placeholder="replacement…" :disabled="busy" @input="preview = null" />
-          <button type="button" :disabled="busy" title="Remove this rule" @click="removeRule(i)">✕</button>
+    <div class="mapper-actions">
+      <button type="button" :disabled="busy" @click="runPreview">{{ busy ? "Working…" : "Preview" }}</button>
+      <button type="button" :disabled="busy || !preview || preview.length === 0" :title="preview ? '' : 'Preview first'" @click="runApply">
+        Apply{{ preview && preview.length ? ` to ${preview.length} book(s)` : "" }}
+      </button>
+      <button type="button" :disabled="busy" @click="emit('close')">Close</button>
+    </div>
+
+    <p v-if="error" class="error">{{ error }}</p>
+    <p v-if="summary" class="status">{{ summary }}</p>
+
+    <div v-if="preview && preview.length" class="preview">
+      <p class="hint">{{ preview.length }} book(s) would change:</p>
+      <ul class="preview-list">
+        <li v-for="b in preview" :key="b.book_id">
+          <span class="preview-title">{{ b.title }}</span>
+          <span class="preview-before">{{ b.before.join(field === "authors" ? " & " : ", ") }}</span>
+          <span class="preview-arrow">→</span>
+          <span class="preview-after">{{ b.after.join(field === "authors" ? " & " : ", ") }}</span>
         </li>
       </ul>
-      <button type="button" :disabled="busy" @click="addRule">+ Add rule</button>
-
-      <div class="mapper-actions">
-        <button type="button" :disabled="busy" @click="runPreview">{{ busy ? "Working…" : "Preview" }}</button>
-        <button type="button" :disabled="busy || !preview || preview.length === 0" :title="preview ? '' : 'Preview first'" @click="runApply">
-          Apply{{ preview && preview.length ? ` to ${preview.length} book(s)` : "" }}
-        </button>
-        <button type="button" :disabled="busy" @click="emit('close')">Close</button>
-      </div>
-
-      <p v-if="error" class="error">{{ error }}</p>
-      <p v-if="summary" class="status">{{ summary }}</p>
-
-      <div v-if="preview && preview.length" class="preview">
-        <p class="hint">{{ preview.length }} book(s) would change:</p>
-        <ul class="preview-list">
-          <li v-for="b in preview" :key="b.book_id">
-            <span class="preview-title">{{ b.title }}</span>
-            <span class="preview-before">{{ b.before.join(field === "authors" ? " & " : ", ") }}</span>
-            <span class="preview-arrow">→</span>
-            <span class="preview-after">{{ b.after.join(field === "authors" ? " & " : ", ") }}</span>
-          </li>
-        </ul>
-      </div>
     </div>
-  </div>
+  </Dialog>
 </template>
 
 <style scoped>
-.mapper-panel {
-  min-width: min(760px, 92vw);
-}
 .rule-list {
   list-style: none;
   margin: 0.5rem 0;

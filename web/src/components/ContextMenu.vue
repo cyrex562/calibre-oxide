@@ -154,7 +154,7 @@ watch(() => [props.x, props.y, props.entries], reposition, { flush: "post" });
 
 .context-menu {
   position: fixed;
-  z-index: 1000;
+  z-index: var(--z-menu);
   min-width: 190px;
   padding: 0.25rem;
   background: var(--bg);

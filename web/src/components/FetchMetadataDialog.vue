@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import Dialog from "./Dialog.vue";
 import { computed, ref } from "vue";
 import { blobToDataUrl, coverProxyUrl, fetchCoverProxyBlob, searchMetadataOnline, setFields, type MetadataCandidate } from "../library/api";
 import type { BookFieldChanges, BookSummary } from "../library/types";
@@ -193,112 +194,73 @@ async function applyPicked() {
 </script>
 
 <template>
-  <div class="backdrop">
-    <div class="panel" role="dialog" aria-modal="true">
-      <button class="close" @click="emit('close')">✕</button>
-      <h3>Fetch metadata online</h3>
+  <Dialog title="Fetch metadata online" :busy="searching || applying" show-close size="lg" @close="emit('close')">
+    <template v-if="!pickerCandidate">
+      <form class="search-form" @submit.prevent="runSearch">
+        <label class="field">
+          Title
+          <input v-model="searchTitle" type="text" />
+        </label>
+        <label class="field">
+          Authors
+          <input v-model="searchAuthors" type="text" />
+        </label>
+        <label class="field">
+          ISBN
+          <input v-model="searchIsbn" type="text" placeholder="overrides title/authors when set" />
+        </label>
+        <button type="submit" :disabled="searching">{{ searching ? "Searching…" : "Search" }}</button>
+      </form>
 
-      <template v-if="!pickerCandidate">
-        <form class="search-form" @submit.prevent="runSearch">
-          <label class="field">
-            Title
-            <input v-model="searchTitle" type="text" />
-          </label>
-          <label class="field">
-            Authors
-            <input v-model="searchAuthors" type="text" />
-          </label>
-          <label class="field">
-            ISBN
-            <input v-model="searchIsbn" type="text" placeholder="overrides title/authors when set" />
-          </label>
-          <button type="submit" :disabled="searching">{{ searching ? "Searching…" : "Search" }}</button>
-        </form>
+      <p v-if="searchError" class="error">{{ searchError }}</p>
+      <p v-if="sourceErrors.length" class="hint">Some sources didn't respond: {{ sourceErrors.join("; ") }}</p>
 
-        <p v-if="searchError" class="error">{{ searchError }}</p>
-        <p v-if="sourceErrors.length" class="hint">Some sources didn't respond: {{ sourceErrors.join("; ") }}</p>
+      <ul v-if="searched" class="candidates">
+        <li v-if="candidates.length === 0" class="hint">No results.</li>
+        <li v-for="(c, i) in candidates" :key="i" class="candidate">
+          <img v-if="c.cover_url" class="thumb" :src="coverProxyUrl(c.cover_url)" alt="" />
+          <div class="candidate-body">
+            <div class="candidate-title">{{ c.title ?? "(untitled)" }}</div>
+            <div class="candidate-authors">{{ c.authors.join(", ") }}</div>
+            <div class="candidate-source">{{ c.source }}</div>
+          </div>
+          <button type="button" @click="openPicker(c)">Review & apply…</button>
+        </li>
+      </ul>
+    </template>
 
-        <ul v-if="searched" class="candidates">
-          <li v-if="candidates.length === 0" class="hint">No results.</li>
-          <li v-for="(c, i) in candidates" :key="i" class="candidate">
-            <img v-if="c.cover_url" class="thumb" :src="coverProxyUrl(c.cover_url)" alt="" />
-            <div class="candidate-body">
-              <div class="candidate-title">{{ c.title ?? "(untitled)" }}</div>
-              <div class="candidate-authors">{{ c.authors.join(", ") }}</div>
-              <div class="candidate-source">{{ c.source }}</div>
-            </div>
-            <button type="button" @click="openPicker(c)">Review & apply…</button>
-          </li>
-        </ul>
-      </template>
-
-      <template v-else>
-        <button type="button" class="back" @click="pickerCandidate = null">← Back to results</button>
-        <p class="hint">Choose which fields to apply from {{ pickerCandidate.source }}.</p>
-        <table class="picker">
-          <thead>
-            <tr>
-              <th></th>
-              <th>Field</th>
-              <th>Current</th>
-              <th>{{ pickerCandidate.source }}</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="{ field, label } in pickerRows" :key="field">
-              <td><input v-model="fieldsToApply[field]" type="checkbox" /></td>
-              <td>{{ label }}</td>
-              <td class="value">{{ currentFieldText(field) }}</td>
-              <td class="value">
-                <img v-if="field === 'cover'" class="thumb" :src="coverProxyUrl(pickerCandidate.cover_url!)" alt="" />
-                <template v-else>{{ candidateFieldText(pickerCandidate, field) }}</template>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-        <p v-if="applyError" class="error">{{ applyError }}</p>
-        <p v-if="applyDone" class="saved">Applied.</p>
-        <button type="button" :disabled="applying" @click="applyPicked">{{ applying ? "Applying…" : "Apply selected fields" }}</button>
-      </template>
-    </div>
-  </div>
+    <template v-else>
+      <button type="button" class="back" @click="pickerCandidate = null">← Back to results</button>
+      <p class="hint">Choose which fields to apply from {{ pickerCandidate.source }}.</p>
+      <table class="picker">
+        <thead>
+          <tr>
+            <th></th>
+            <th>Field</th>
+            <th>Current</th>
+            <th>{{ pickerCandidate.source }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="{ field, label } in pickerRows" :key="field">
+            <td><input v-model="fieldsToApply[field]" type="checkbox" /></td>
+            <td>{{ label }}</td>
+            <td class="value">{{ currentFieldText(field) }}</td>
+            <td class="value">
+              <img v-if="field === 'cover'" class="thumb" :src="coverProxyUrl(pickerCandidate.cover_url!)" alt="" />
+              <template v-else>{{ candidateFieldText(pickerCandidate, field) }}</template>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <p v-if="applyError" class="error">{{ applyError }}</p>
+      <p v-if="applyDone" class="saved">Applied.</p>
+      <button type="button" :disabled="applying" @click="applyPicked">{{ applying ? "Applying…" : "Apply selected fields" }}</button>
+    </template>
+  </Dialog>
 </template>
 
 <style scoped>
-.backdrop {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.4);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 10;
-}
-.panel {
-  background: var(--bg);
-  border-radius: 6px;
-  padding: 1.5em;
-  width: 90%;
-  max-width: 720px;
-  max-height: 80vh;
-  overflow: auto;
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  gap: 0.75em;
-}
-.close {
-  position: absolute;
-  top: 0.5em;
-  right: 0.5em;
-  border: none;
-  background: none;
-  font-size: var(--fs-medium);
-  cursor: pointer;
-}
-h3 {
-  margin: 0;
-}
 .hint {
   color: var(--fg-faint);
   font-size: var(--fs-small);

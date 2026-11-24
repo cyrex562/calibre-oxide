@@ -1,5 +1,11 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, shallowReactive, watch } from "vue";
+import { alertDialog, confirmDialog, promptDialog } from "./dialogs/confirm";
+import Dialog from "./Dialog.vue";
+import ImportDuplicatesDialog from "./dialogs/ImportDuplicatesDialog.vue";
+import NewLibraryDialog from "./dialogs/NewLibraryDialog.vue";
+import SwitchLibraryDialog from "./dialogs/SwitchLibraryDialog.vue";
+import { computed, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref, shallowReactive, watch } from "vue";
+import { libraryEpoch, needsRefresh } from "../library/libraryEpoch";
 import CategoryBrowser from "./CategoryBrowser.vue";
 import NoteEditor from "./NoteEditor.vue";
 import BookDetailsPanel from "./BookDetailsPanel.vue";
@@ -501,7 +507,7 @@ async function createVirtualLibrary() {
 }
 
 async function removeVirtualLibrary(name: string) {
-  if (!confirm(`Delete the virtual library "${name}"?`)) return;
+  if (!(await confirmDialog(`Delete the virtual library "${name}"?`, { confirmLabel: "Delete", danger: true }))) return;
   manageError.value = null;
   try {
     await deleteVirtualLibrary(name);
@@ -525,7 +531,7 @@ async function createSavedSearch() {
 }
 
 async function removeSavedSearch(name: string) {
-  if (!confirm(`Delete the saved search "${name}"?`)) return;
+  if (!(await confirmDialog(`Delete the saved search "${name}"?`, { confirmLabel: "Delete", danger: true }))) return;
   manageError.value = null;
   try {
     await deleteSavedSearch(name);
@@ -536,7 +542,7 @@ async function removeSavedSearch(name: string) {
 }
 
 async function renameSavedSearchPrompt(name: string) {
-  const newName = prompt("Rename saved search to:", name);
+  const newName = await promptDialog("Rename saved search to:", name, { title: "Rename saved search", confirmLabel: "Rename" });
   if (!newName || newName === name) return;
   manageError.value = null;
   try {
@@ -843,7 +849,7 @@ async function createCustomColumn() {
 }
 
 async function removeCustomColumnClick(label: string) {
-  if (!confirm(`Delete the custom column "${label}"? Its stored values will be lost.`)) return;
+  if (!(await confirmDialog(`Delete the custom column "${label}"? Its stored values will be lost.`, { confirmLabel: "Delete", danger: true }))) return;
   columnsError.value = null;
   try {
     await removeCustomColumn(label);
@@ -1760,7 +1766,7 @@ function openCompareForSelection() {
   const ids = [...selectedIds.value];
   if (ids.length < 2) return;
   if (ids.length > COMPARE_MAX) {
-    window.alert(`Compare takes 2 to ${COMPARE_MAX} books at once (${ids.length} are selected).`);
+    void alertDialog(`Compare takes 2 to ${COMPARE_MAX} books at once (${ids.length} are selected).`, { title: "Compare" });
     return;
   }
   void compareController.open(ids);
@@ -2312,7 +2318,7 @@ async function openSwitchLibrary() {
 async function confirmSwitchOverRunningJob(): Promise<boolean> {
   try {
     const warning = switchWarning(await runningLibraryJob());
-    return warning === null || window.confirm(warning);
+    return warning === null || (await confirmDialog(warning, { title: "Switch library", confirmLabel: "Switch" }));
   } catch {
     return true;
   }
@@ -2712,6 +2718,8 @@ function runAction(id: LibraryActionId) {
 // selection changes on every arrow-key step, but the spec (what is
 // enabled) only rarely does, and each send is an IPC round trip that
 // rebuilds the native menu.
+/** False while the route is elsewhere and this view is parked by <keep-alive>. */
+let viewActive = true;
 const menuSpecKey = computed(() => {
   void ftsMode.value;
   void toolbarPrefs.value;
@@ -2720,6 +2728,8 @@ const menuSpecKey = computed(() => {
 watch(
   menuSpecKey,
   () => {
+    // A view kept alive behind the reader must not rewrite the native menu.
+    if (!viewActive) return;
     void syncDesktopMenu(Object.keys(actionHandlers) as LibraryActionId[], actionContext.value);
   },
   { immediate: true },
@@ -2870,20 +2880,53 @@ function onBeforeUnload(event: BeforeUnloadEvent) {
   event.returnValue = "";
 }
 
-onMounted(() => {
-  window.addEventListener("beforeunload", onBeforeUnload);
+/**
+ * The window listeners that act on the library: shortcuts, native-menu
+ * clicks and dropped books. Live only while the view is shown. (The
+ * beforeunload guard for unsaved drafts stays for as long as the view exists,
+ * because closing the window must still ask.)
+ */
+function attachLiveListeners() {
+  if (unsubscribeMenuAction !== null) return;
   window.addEventListener("keydown", onLibraryKeydown);
   window.addEventListener("lexmechanic:books-added", onBooksDropped);
   unsubscribeMenuAction = onMenuAction(runAction);
-  void loadLibraryInfo();
-  void loadInterruptedJob();
-});
-onBeforeUnmount(() => {
-  window.removeEventListener("beforeunload", onBeforeUnload);
+}
+
+function detachLiveListeners() {
   window.removeEventListener("keydown", onLibraryKeydown);
   window.removeEventListener("lexmechanic:books-added", onBooksDropped);
   unsubscribeMenuAction?.();
   unsubscribeMenuAction = null;
+}
+
+let leftAt: { epoch: number; at: number } | null = null;
+
+onMounted(() => {
+  window.addEventListener("beforeunload", onBeforeUnload);
+  attachLiveListeners();
+  void loadLibraryInfo();
+  void loadInterruptedJob();
+});
+// <keep-alive> keeps this view (query, scroll, selection, details panel) when
+// the route goes to the reader or settings; it is only parked, not unmounted.
+onDeactivated(() => {
+  viewActive = false;
+  detachLiveListeners();
+  leftAt = { epoch: libraryEpoch(), at: Date.now() };
+});
+onActivated(() => {
+  viewActive = true;
+  attachLiveListeners();
+  const left = leftAt;
+  leftAt = null;
+  if (left === null) return; // the first activation, right after mounting
+  void syncDesktopMenu(Object.keys(actionHandlers) as LibraryActionId[], actionContext.value);
+  if (needsRefresh(left.epoch, left.at)) void libraryChanged();
+});
+onBeforeUnmount(() => {
+  window.removeEventListener("beforeunload", onBeforeUnload);
+  detachLiveListeners();
 });
 
 // A job the previous server process was running when it ended (a crash, or
@@ -3406,7 +3449,7 @@ watch(coloringRules, () => {
           <p v-else-if="!activeQuery" class="status">Enter a search to look through book contents.</p>
 
           <ul class="fts-results">
-            <li v-for="r in ftsResults" :key="r.bookId" class="fts-result" @click="selectedBookId = r.bookId">
+            <li v-for="r in ftsResults" :key="r.bookId" class="fts-result" tabindex="0" :aria-label="`Open ${r.title}`" @click="selectedBookId = r.bookId" @keydown.enter.self.prevent="selectedBookId = r.bookId" @keydown.space.self.prevent="selectedBookId = r.bookId">
               <div class="fts-result-header">
                 <span class="fts-result-title">{{ r.title }}</span>
                 <span class="fts-result-authors">{{ r.authors }}</span>
@@ -3555,28 +3598,7 @@ watch(coloringRules, () => {
       <button type="button" class="status-toggle" :class="{ active: detailsVisible }" :aria-pressed="detailsVisible" title="Show or hide book details" @click="detailsVisible = !detailsVisible">Details</button>
     </footer>
 
-    <div v-if="importDupes" class="manage-backdrop">
-      <div class="manage-panel dupes-panel" role="dialog" aria-modal="true" aria-labelledby="import-dupes-title" data-testid="import-dupes">
-        <h3 id="import-dupes-title">{{ importDupes.length.toLocaleString("en-US") }} {{ importDupes.length === 1 ? "file looks" : "files look" }} like books already in the library</h3>
-        <p class="hint">Tick the ones to add anyway. The rest are skipped.</p>
-        <ul class="dupes-list">
-          <li v-for="d in importDupes" :key="d.file.name" class="dupe">
-            <label>
-              <input v-model="d.checked" type="checkbox" :disabled="importDupesBusy" />
-              <span class="dupe-name">{{ d.file.name }}</span>
-            </label>
-            <span class="hint">already: {{ d.existing.join(", ") }}</span>
-          </li>
-        </ul>
-        <div class="dupes-actions">
-          <button type="button" :disabled="importDupesBusy" data-testid="dupes-skip-all" @click="resolveImportDupes('skip-all')">Skip all</button>
-          <button type="button" :disabled="importDupesBusy" data-testid="dupes-add-all" @click="resolveImportDupes('add-all')">Add all</button>
-          <button type="button" class="primary" :disabled="importDupesBusy || !importDupes.some((d) => d.checked)" data-testid="dupes-add-checked" @click="resolveImportDupes('checked')">
-            {{ importDupesBusy ? "Adding…" : `Add ${importDupes.filter((d) => d.checked).length} ticked` }}
-          </button>
-        </div>
-      </div>
-    </div>
+    <ImportDuplicatesDialog v-if="importDupes" :duplicates="importDupes" :busy="importDupesBusy" @resolve="resolveImportDupes" />
 
     <DeleteConfirm />
     <UndoToast />
@@ -3605,264 +3627,246 @@ watch(coloringRules, () => {
 
     <NoteEditor v-if="noteTarget" :field="noteTarget.field" :item-name="noteTarget.itemName" @close="noteTarget = null" />
 
-    <div v-if="manageOpen" class="manage-backdrop" @click.self="manageOpen = false">
-      <div class="manage-panel" role="dialog" aria-modal="true">
-        <button class="manage-close" @click="manageOpen = false">✕</button>
-        <p v-if="manageError" class="error">{{ manageError }}</p>
+    <Dialog v-if="manageOpen" label="Virtual libraries and saved searches" show-close size="lg" @close="manageOpen = false">
+      <p v-if="manageError" class="error">{{ manageError }}</p>
 
-        <section>
-          <h3>Virtual libraries</h3>
-          <ul class="manage-list">
-            <li v-for="[name, q] in Object.entries(virtualLibraries)" :key="name">
-              <span class="manage-name">{{ name }}</span>
-              <code class="manage-query">{{ q }}</code>
-              <button type="button" class="manage-remove" @click="removeVirtualLibrary(name)">Delete</button>
-            </li>
-          </ul>
-          <form class="manage-form" @submit.prevent="createVirtualLibrary">
-            <input v-model="newVlName" placeholder="Name" required />
-            <input v-model="newVlQuery" placeholder="Search query" required />
-            <button type="submit">Add</button>
-          </form>
-        </section>
-
-        <section>
-          <h3>Saved searches</h3>
-          <ul class="manage-list">
-            <li v-for="[name, q] in Object.entries(savedSearches)" :key="name">
-              <span class="manage-name">{{ name }}</span>
-              <code class="manage-query">{{ q }}</code>
-              <button type="button" @click="renameSavedSearchPrompt(name)">Rename</button>
-              <button type="button" class="manage-remove" @click="removeSavedSearch(name)">Delete</button>
-            </li>
-          </ul>
-          <form class="manage-form" @submit.prevent="createSavedSearch">
-            <input v-model="newSearchName" placeholder="Name" required />
-            <input v-model="newSearchQuery" placeholder="Search query" required />
-            <button type="submit">Add</button>
-          </form>
-        </section>
-      </div>
-    </div>
-
-    <div v-if="columnPickerOpen" class="manage-backdrop" @click.self="columnPickerOpen = false">
-      <div class="manage-panel" role="dialog" aria-modal="true">
-        <h3>Table columns</h3>
-        <p class="hint">Choose which columns the table shows, and their order. Drag a row, or use the arrows. You can also drag a column header in the table.</p>
-        <ul class="column-list">
-          <li
-            v-for="column in pickerColumns"
-            :key="column.key"
-            class="column-row"
-            :class="{ 'drag-over': pickerDragKey !== null && pickerDragKey !== column.key && tablePrefs.columns.includes(column.key) }"
-            :draggable="tablePrefs.columns.includes(column.key)"
-            @dragstart="pickerDragKey = column.key"
-            @dragend="pickerDragKey = null"
-            @dragover.prevent
-            @drop.prevent="onPickerDrop(column.key)"
-          >
-            <label class="field checkbox">
-              <input type="checkbox" :checked="tablePrefs.columns.includes(column.key)" @change="toggleColumn(column.key)" />
-              {{ column.label }}
-              <span v-if="!column.sortKey" class="hint inline">(not sortable)</span>
-            </label>
-            <template v-if="tablePrefs.columns.includes(column.key)">
-              <button type="button" :disabled="tablePrefs.columns.indexOf(column.key) === 0" title="Move up (left in the table)" aria-label="Move up" @click="moveColumn(column.key, -1)">↑</button>
-              <button type="button" :disabled="tablePrefs.columns.indexOf(column.key) === tablePrefs.columns.length - 1" title="Move down (right in the table)" aria-label="Move down" @click="moveColumn(column.key, 1)">↓</button>
-            </template>
+      <section>
+        <h3>Virtual libraries</h3>
+        <ul class="manage-list">
+          <li v-for="[name, q] in Object.entries(virtualLibraries)" :key="name">
+            <span class="manage-name">{{ name }}</span>
+            <code class="manage-query">{{ q }}</code>
+            <button type="button" class="manage-remove" @click="removeVirtualLibrary(name)">Delete</button>
           </li>
         </ul>
-        <button type="button" @click="resetColumns">Reset to default</button>
-        <button type="button" @click="columnPickerOpen = false">Close</button>
-      </div>
-    </div>
+        <form class="manage-form" @submit.prevent="createVirtualLibrary">
+          <input v-model="newVlName" placeholder="Name" required />
+          <input v-model="newVlQuery" placeholder="Search query" required />
+          <button type="submit">Add</button>
+        </form>
+      </section>
 
-    <div v-if="columnsOpen" class="manage-backdrop" @click.self="columnsOpen = false">
-      <div class="manage-panel" role="dialog" aria-modal="true">
-        <button class="manage-close" @click="columnsOpen = false">✕</button>
-        <section>
-          <h3>Custom columns</h3>
-          <p v-if="columnsError" class="error">{{ columnsError }}</p>
-          <ul class="manage-list">
-            <li v-for="[label, col] in Object.entries(customColumns)" :key="label">
-              <span class="manage-name">{{ col.name }}</span>
-              <code class="manage-query">#{{ label }} ({{ col.datatype }})</code>
-              <button type="button" class="manage-remove" @click="removeCustomColumnClick(label)">Delete</button>
-            </li>
-            <li v-if="Object.keys(customColumns).length === 0">No custom columns yet.</li>
+      <section>
+        <h3>Saved searches</h3>
+        <ul class="manage-list">
+          <li v-for="[name, q] in Object.entries(savedSearches)" :key="name">
+            <span class="manage-name">{{ name }}</span>
+            <code class="manage-query">{{ q }}</code>
+            <button type="button" @click="renameSavedSearchPrompt(name)">Rename</button>
+            <button type="button" class="manage-remove" @click="removeSavedSearch(name)">Delete</button>
+          </li>
+        </ul>
+        <form class="manage-form" @submit.prevent="createSavedSearch">
+          <input v-model="newSearchName" placeholder="Name" required />
+          <input v-model="newSearchQuery" placeholder="Search query" required />
+          <button type="submit">Add</button>
+        </form>
+      </section>
+    </Dialog>
+
+    <Dialog v-if="columnPickerOpen" title="Table columns" size="lg" @close="columnPickerOpen = false">
+      <p class="hint">Choose which columns the table shows, and their order. Drag a row, or use the arrows. You can also drag a column header in the table.</p>
+      <ul class="column-list">
+        <li
+          v-for="column in pickerColumns"
+          :key="column.key"
+          class="column-row"
+          :class="{ 'drag-over': pickerDragKey !== null && pickerDragKey !== column.key && tablePrefs.columns.includes(column.key) }"
+          :draggable="tablePrefs.columns.includes(column.key)"
+          @dragstart="pickerDragKey = column.key"
+          @dragend="pickerDragKey = null"
+          @dragover.prevent
+          @drop.prevent="onPickerDrop(column.key)"
+        >
+          <label class="field checkbox">
+            <input type="checkbox" :checked="tablePrefs.columns.includes(column.key)" @change="toggleColumn(column.key)" />
+            {{ column.label }}
+            <span v-if="!column.sortKey" class="hint inline">(not sortable)</span>
+          </label>
+          <template v-if="tablePrefs.columns.includes(column.key)">
+            <button type="button" :disabled="tablePrefs.columns.indexOf(column.key) === 0" title="Move up (left in the table)" aria-label="Move up" @click="moveColumn(column.key, -1)">↑</button>
+            <button type="button" :disabled="tablePrefs.columns.indexOf(column.key) === tablePrefs.columns.length - 1" title="Move down (right in the table)" aria-label="Move down" @click="moveColumn(column.key, 1)">↓</button>
+          </template>
+        </li>
+      </ul>
+      <button type="button" @click="resetColumns">Reset to default</button>
+      <button type="button" @click="columnPickerOpen = false">Close</button>
+    </Dialog>
+
+    <Dialog v-if="columnsOpen" title="Custom columns" show-close size="lg" @close="columnsOpen = false">
+      <section>
+        <p v-if="columnsError" class="error">{{ columnsError }}</p>
+        <ul class="manage-list">
+          <li v-for="[label, col] in Object.entries(customColumns)" :key="label">
+            <span class="manage-name">{{ col.name }}</span>
+            <code class="manage-query">#{{ label }} ({{ col.datatype }})</code>
+            <button type="button" class="manage-remove" @click="removeCustomColumnClick(label)">Delete</button>
+          </li>
+          <li v-if="Object.keys(customColumns).length === 0">No custom columns yet.</li>
+        </ul>
+        <div class="column-presets" data-testid="column-presets">
+          <h4>Quick add</h4>
+          <div class="preset-buttons">
+            <button v-for="p in COLUMN_PRESETS" :key="p.id" type="button" :data-testid="`preset-${p.id}`" :disabled="p.label in customColumns" :title="p.label in customColumns ? `#${p.label} already exists` : p.hint" @click="pickColumnPreset(p)">{{ p.title }}</button>
+          </div>
+          <form v-if="presetPicked" class="manage-form" data-testid="preset-form" @submit.prevent="createPresetColumn">
+            <input v-model="presetPicked.name" aria-label="Display name" data-testid="preset-name" required />
+            <code class="manage-query">#{{ presetPicked.label }} ({{ presetPicked.datatype }})</code>
+            <button type="submit" data-testid="preset-create">Create</button>
+          </form>
+          <p v-if="presetPicked" class="hint">Creates the column <code>#{{ presetPicked.label }}</code> as {{ presetPicked.datatype === "int" ? "a whole number" : "text" }}. {{ presetPicked.preset.hint }}</p>
+          <ul class="hint column-notes">
+            <li v-for="line in COLUMN_EXPLANATIONS" :key="line">{{ line }}</li>
           </ul>
-          <div class="column-presets" data-testid="column-presets">
-            <h4>Quick add</h4>
-            <div class="preset-buttons">
-              <button v-for="p in COLUMN_PRESETS" :key="p.id" type="button" :data-testid="`preset-${p.id}`" :disabled="p.label in customColumns" :title="p.label in customColumns ? `#${p.label} already exists` : p.hint" @click="pickColumnPreset(p)">{{ p.title }}</button>
-            </div>
-            <form v-if="presetPicked" class="manage-form" data-testid="preset-form" @submit.prevent="createPresetColumn">
-              <input v-model="presetPicked.name" aria-label="Display name" data-testid="preset-name" required />
-              <code class="manage-query">#{{ presetPicked.label }} ({{ presetPicked.datatype }})</code>
-              <button type="submit" data-testid="preset-create">Create</button>
-            </form>
-            <p v-if="presetPicked" class="hint">Creates the column <code>#{{ presetPicked.label }}</code> as {{ presetPicked.datatype === "int" ? "a whole number" : "text" }}. {{ presetPicked.preset.hint }}</p>
-            <ul class="hint column-notes">
-              <li v-for="line in COLUMN_EXPLANATIONS" :key="line">{{ line }}</li>
+        </div>
+        <h4>Or make your own</h4>
+        <form class="manage-form" @submit.prevent="createCustomColumn">
+          <input v-model="newColumnLabel" placeholder="Label (e.g. shelf)" pattern="[a-zA-Z0-9_]+" title="Letters, numbers, and underscores only" required />
+          <input v-model="newColumnName" placeholder="Display name (e.g. Shelf)" required />
+          <select v-model="newColumnDatatype">
+            <option value="text">Text</option>
+            <option value="comments">Long text</option>
+            <option value="int">Integer</option>
+            <option value="float">Decimal number</option>
+            <option value="bool">Yes/No</option>
+            <option value="rating">Rating</option>
+          </select>
+          <button type="submit">Add</button>
+        </form>
+      </section>
+    </Dialog>
+
+    <Dialog v-if="checkLibraryOpen" title="Check library" show-close size="lg" @close="checkLibraryOpen = false">
+      <section>
+        <p v-if="checkLibraryLoading">Scanning…</p>
+        <p v-else-if="checkLibraryError" class="error">{{ checkLibraryError }}</p>
+        <template v-else-if="checkLibraryResult">
+          <!--
+            An incomplete scan computes no missing-file list at all, so
+            saying "no problems found" would be a lie. Told first,
+            because it changes how everything below should be read.
+          -->
+          <p v-if="!checkLibraryConclusive" class="error">
+            A folder could not be read, so this check is incomplete — nothing is reported as missing, because a file that cannot be seen cannot be told from one that is gone.
+          </p>
+          <p v-if="checkLibraryNonEmpty.length === 0" class="news-hint">{{ checkLibraryConclusive ? "No problems found." : "Nothing else to report." }}</p>
+          <!--
+            Only when there is something to add. A button that does
+            nothing is worse than no button.
+          -->
+          <div v-if="checkLibraryHasUntracked" class="plugin-actions">
+            <button type="button" :disabled="rescanBusy" @click="rescanLibraryFolder">
+              {{ rescanBusy ? "Scanning…" : "Add the untracked files to the library" }}
+            </button>
+            <button v-if="rescanBusy" type="button" @click="cancelRescan">Cancel</button>
+          </div>
+          <p v-if="rescanProgress" class="news-hint" role="status">{{ rescanProgress }}</p>
+          <p v-if="rescanSummary" class="news-hint">{{ rescanSummary }}</p>
+          <div v-for="[key, findings] in checkLibraryGenericFindings" :key="key">
+            <h4>{{ CHECK_LIBRARY_LABELS[key] ?? key }} ({{ findings.length }})</h4>
+            <ul class="manage-list">
+              <li v-for="(f, i) in findings" :key="i">
+                <span class="manage-name">{{ f.title || "—" }}</span>
+                <code class="manage-query">{{ f.path }}</code>
+              </li>
             </ul>
           </div>
-          <h4>Or make your own</h4>
-          <form class="manage-form" @submit.prevent="createCustomColumn">
-            <input v-model="newColumnLabel" placeholder="Label (e.g. shelf)" pattern="[a-zA-Z0-9_]+" title="Letters, numbers, and underscores only" required />
-            <input v-model="newColumnName" placeholder="Display name (e.g. Shelf)" required />
-            <select v-model="newColumnDatatype">
-              <option value="text">Text</option>
-              <option value="comments">Long text</option>
-              <option value="int">Integer</option>
-              <option value="float">Decimal number</option>
-              <option value="bool">Yes/No</option>
-              <option value="rating">Rating</option>
-            </select>
-            <button type="submit">Add</button>
-          </form>
-        </section>
-      </div>
-    </div>
 
-    <div v-if="checkLibraryOpen" class="manage-backdrop" @click.self="checkLibraryOpen = false">
-      <div class="manage-panel" role="dialog" aria-modal="true">
-        <button class="manage-close" @click="checkLibraryOpen = false">✕</button>
-        <section>
-          <h3>Check library</h3>
-          <p v-if="checkLibraryLoading">Scanning…</p>
-          <p v-else-if="checkLibraryError" class="error">{{ checkLibraryError }}</p>
-          <template v-else-if="checkLibraryResult">
-            <!--
-              An incomplete scan computes no missing-file list at all, so
-              saying "no problems found" would be a lie. Told first,
-              because it changes how everything below should be read.
-            -->
-            <p v-if="!checkLibraryConclusive" class="error">
-              A folder could not be read, so this check is incomplete — nothing is reported as missing, because a file that cannot be seen cannot be told from one that is gone.
-            </p>
-            <p v-if="checkLibraryNonEmpty.length === 0" class="news-hint">{{ checkLibraryConclusive ? "No problems found." : "Nothing else to report." }}</p>
-            <!--
-              Only when there is something to add. A button that does
-              nothing is worse than no button.
-            -->
-            <div v-if="checkLibraryHasUntracked" class="plugin-actions">
-              <button type="button" :disabled="rescanBusy" @click="rescanLibraryFolder">
-                {{ rescanBusy ? "Scanning…" : "Add the untracked files to the library" }}
-              </button>
-              <button v-if="rescanBusy" type="button" @click="cancelRescan">Cancel</button>
-            </div>
-            <p v-if="rescanProgress" class="news-hint" role="status">{{ rescanProgress }}</p>
-            <p v-if="rescanSummary" class="news-hint">{{ rescanSummary }}</p>
-            <div v-for="[key, findings] in checkLibraryGenericFindings" :key="key">
-              <h4>{{ CHECK_LIBRARY_LABELS[key] ?? key }} ({{ findings.length }})</h4>
-              <ul class="manage-list">
-                <li v-for="(f, i) in findings" :key="i">
-                  <span class="manage-name">{{ f.title || "—" }}</span>
-                  <code class="manage-query">{{ f.path }}</code>
-                </li>
-              </ul>
-            </div>
-
-            <!--
-              An orphan is the one state this model requires a person to
-              act on, so it gets the three resolutions the design
-              promises rather than a line of text.
-            -->
-            <div v-if="orphanList.length > 0">
-              <h4>Books whose file is gone ({{ orphanList.length }})</h4>
-              <ul class="manage-list">
-                <li v-for="orphan in orphanList" :key="orphanKey(orphan)" class="orphan-row">
-                  <div>
-                    <span class="manage-name">{{ orphan.format }}</span>
-                    <code class="manage-query">{{ orphan.last_known_path }}</code>
-                  </div>
-                  <div class="plugin-actions">
-                    <!--
-                      Only offered when there is something to point at.
-                      The candidates are the files the check just found
-                      that no book claims.
-                    -->
-                    <label v-if="untrackedPaths.length > 0">
-                      Point at:
-                      <select :disabled="orphanBusy === orphanKey(orphan)" @change="relocateTo(orphan, ($event.target as HTMLSelectElement).value)">
-                        <option value="">Choose a file…</option>
-                        <option v-for="path in untrackedPaths" :key="path" :value="path">{{ path }}</option>
-                      </select>
-                    </label>
-                    <label class="orphan-upload">
-                      Copy a file back in…
-                      <input type="file" :disabled="orphanBusy === orphanKey(orphan)" @change="uploadFor(orphan, $event)" />
-                    </label>
-                    <button type="button" :disabled="orphanBusy === orphanKey(orphan)" @click="forgetOrphanEntry(orphan, true)">Remove entry, keep metadata</button>
-                    <button type="button" :disabled="orphanBusy === orphanKey(orphan)" @click="forgetOrphanEntry(orphan, false)">Remove entry</button>
-                  </div>
-                </li>
-              </ul>
-            </div>
-
-            <!--
-              Visible and undoable: a hidden list of files the app
-              refuses to show is its own kind of bug.
-            -->
-            <div v-if="ignoredList.length > 0">
-              <h4>Removed from the library, kept on disk ({{ ignoredList.length }})</h4>
-              <ul class="manage-list">
-                <li v-for="file in ignoredList" :key="file.path">
-                  <span class="manage-name">{{ file.title || "—" }}</span>
-                  <code class="manage-query">{{ file.path }}</code>
-                  <button type="button" :disabled="orphanBusy === file.path" @click="unignore(file)">Add it back</button>
-                </li>
-              </ul>
-            </div>
-
-            <p v-if="orphanMessage" class="news-hint">{{ orphanMessage }}</p>
-          </template>
-        </section>
-      </div>
-    </div>
-
-    <div v-if="duplicatesOpen" class="manage-backdrop" @click.self="duplicatesOpen = false">
-      <div class="manage-panel dup-panel" role="dialog" aria-modal="true">
-        <button class="manage-close" @click="duplicatesOpen = false">✕</button>
-        <section>
-          <h3>Find duplicates</h3>
           <!--
-            Identical files are found by content hash, which only exist
-            for books this app added or scanned. A library opened from real
-            calibre needs them recorded first.
+            An orphan is the one state this model requires a person to
+            act on, so it gets the three resolutions the design
+            promises rather than a line of text.
           -->
-          <div class="plugin-actions">
-            <button type="button" :disabled="prepareBusy" @click="prepareForDuplicates">
-              {{ prepareBusy ? "Reading files…" : "Prepare for duplicate detection" }}
-            </button>
-            <button v-if="prepareBusy" type="button" @click="cancelPrepare">Cancel</button>
+          <div v-if="orphanList.length > 0">
+            <h4>Books whose file is gone ({{ orphanList.length }})</h4>
+            <ul class="manage-list">
+              <li v-for="orphan in orphanList" :key="orphanKey(orphan)" class="orphan-row">
+                <div>
+                  <span class="manage-name">{{ orphan.format }}</span>
+                  <code class="manage-query">{{ orphan.last_known_path }}</code>
+                </div>
+                <div class="plugin-actions">
+                  <!--
+                    Only offered when there is something to point at.
+                    The candidates are the files the check just found
+                    that no book claims.
+                  -->
+                  <label v-if="untrackedPaths.length > 0">
+                    Point at:
+                    <select :disabled="orphanBusy === orphanKey(orphan)" @change="relocateTo(orphan, ($event.target as HTMLSelectElement).value)">
+                      <option value="">Choose a file…</option>
+                      <option v-for="path in untrackedPaths" :key="path" :value="path">{{ path }}</option>
+                    </select>
+                  </label>
+                  <label class="orphan-upload">
+                    Copy a file back in…
+                    <input type="file" :disabled="orphanBusy === orphanKey(orphan)" @change="uploadFor(orphan, $event)" />
+                  </label>
+                  <button type="button" :disabled="orphanBusy === orphanKey(orphan)" @click="forgetOrphanEntry(orphan, true)">Remove entry, keep metadata</button>
+                  <button type="button" :disabled="orphanBusy === orphanKey(orphan)" @click="forgetOrphanEntry(orphan, false)">Remove entry</button>
+                </div>
+              </li>
+            </ul>
           </div>
-          <p v-if="prepareProgress" class="news-hint" role="status">{{ prepareProgress }}</p>
-          <p v-if="prepareSummary" class="news-hint">{{ prepareSummary }}</p>
+
           <!--
-            A scan and its OCR copy, or a PDF and its optimized copy, share
-            no bytes and often no metadata; they are found from their pages,
-            which have to be analysed once.
+            Visible and undoable: a hidden list of files the app
+            refuses to show is its own kind of bug.
           -->
-          <div v-if="pdfAction || fingerprintBusy" class="plugin-actions">
-            <button type="button" data-testid="fingerprint-pdfs" :disabled="fingerprintBusy" @click="runFingerprint">
-              {{ fingerprintBusy ? "Analysing PDFs…" : pdfAction?.label }}
-            </button>
-            <button v-if="fingerprintBusy" type="button" @click="cancelFingerprint">Cancel</button>
+          <div v-if="ignoredList.length > 0">
+            <h4>Removed from the library, kept on disk ({{ ignoredList.length }})</h4>
+            <ul class="manage-list">
+              <li v-for="file in ignoredList" :key="file.path">
+                <span class="manage-name">{{ file.title || "—" }}</span>
+                <code class="manage-query">{{ file.path }}</code>
+                <button type="button" :disabled="orphanBusy === file.path" @click="unignore(file)">Add it back</button>
+              </li>
+            </ul>
           </div>
-          <p v-if="pdfAction?.note" class="news-hint">{{ pdfAction.note }}</p>
-          <p v-if="fingerprintProgress" class="news-hint" role="status">{{ fingerprintProgress }}</p>
-          <p v-if="fingerprintSummary" class="news-hint">{{ fingerprintSummary }}</p>
-          <p v-if="emptyFiles.length" class="news-hint" data-testid="empty-files">
-            {{ emptyFiles.length }} empty (0-byte) file{{ emptyFiles.length === 1 ? "" : "s" }}, not counted as duplicates:
-            {{ emptyFiles.slice(0, 5).map((f) => `${f.title} (.${f.format.toLowerCase()})`).join(", ") }}{{ emptyFiles.length > 5 ? ", …" : "" }}
-          </p>
-          <p v-if="duplicatesError" class="error">{{ duplicatesError }}</p>
-          <p v-if="mergeDone" class="news-hint" role="status">{{ mergeDone }}</p>
-          <DuplicateReview :store="dupStore" @merge="openMergeForGroup" @compare="openCompareForGroup" @details="(id) => (selectedBookId = id)" @resolve="resolveOpen = true" @changed="onDuplicatesChanged" />
-        </section>
-      </div>
-    </div>
+
+          <p v-if="orphanMessage" class="news-hint">{{ orphanMessage }}</p>
+        </template>
+      </section>
+    </Dialog>
+
+    <Dialog v-if="duplicatesOpen" title="Find duplicates" show-close size="full" @close="duplicatesOpen = false">
+      <section>
+        <!--
+          Identical files are found by content hash, which only exist
+          for books this app added or scanned. A library opened from real
+          calibre needs them recorded first.
+        -->
+        <div class="plugin-actions">
+          <button type="button" :disabled="prepareBusy" @click="prepareForDuplicates">
+            {{ prepareBusy ? "Reading files…" : "Prepare for duplicate detection" }}
+          </button>
+          <button v-if="prepareBusy" type="button" @click="cancelPrepare">Cancel</button>
+        </div>
+        <p v-if="prepareProgress" class="news-hint" role="status">{{ prepareProgress }}</p>
+        <p v-if="prepareSummary" class="news-hint">{{ prepareSummary }}</p>
+        <!--
+          A scan and its OCR copy, or a PDF and its optimized copy, share
+          no bytes and often no metadata; they are found from their pages,
+          which have to be analysed once.
+        -->
+        <div v-if="pdfAction || fingerprintBusy" class="plugin-actions">
+          <button type="button" data-testid="fingerprint-pdfs" :disabled="fingerprintBusy" @click="runFingerprint">
+            {{ fingerprintBusy ? "Analysing PDFs…" : pdfAction?.label }}
+          </button>
+          <button v-if="fingerprintBusy" type="button" @click="cancelFingerprint">Cancel</button>
+        </div>
+        <p v-if="pdfAction?.note" class="news-hint">{{ pdfAction.note }}</p>
+        <p v-if="fingerprintProgress" class="news-hint" role="status">{{ fingerprintProgress }}</p>
+        <p v-if="fingerprintSummary" class="news-hint">{{ fingerprintSummary }}</p>
+        <p v-if="emptyFiles.length" class="news-hint" data-testid="empty-files">
+          {{ emptyFiles.length }} empty (0-byte) file{{ emptyFiles.length === 1 ? "" : "s" }}, not counted as duplicates:
+          {{ emptyFiles.slice(0, 5).map((f) => `${f.title} (.${f.format.toLowerCase()})`).join(", ") }}{{ emptyFiles.length > 5 ? ", …" : "" }}
+        </p>
+        <p v-if="duplicatesError" class="error">{{ duplicatesError }}</p>
+        <p v-if="mergeDone" class="news-hint" role="status">{{ mergeDone }}</p>
+        <DuplicateReview :store="dupStore" @merge="openMergeForGroup" @compare="openCompareForGroup" @details="(id) => (selectedBookId = id)" @resolve="resolveOpen = true" @changed="onDuplicatesChanged" />
+      </section>
+    </Dialog>
 
     <ResolveDialog v-if="duplicatesOpen && resolveOpen" :store="dupStore" :controller="resolveController" @close="resolveOpen = false" @changed="onDuplicatesChanged" />
     <CompareDuplicates v-if="compareController.state.open" :controller="compareController" @close="compareController.close()" />
@@ -3871,265 +3875,212 @@ watch(coloringRules, () => {
     <OrganizeDialog v-if="organizeOpen" :controller="organizeController" :selected-ids="organizeSelection" @close="organizeOpen = false" @changed="onDuplicatesChanged" />
     <RetitleDialog v-if="retitleOpen" :controller="retitleController" :selected-ids="retitleSelection" @close="retitleOpen = false" @changed="onRetitleChanged" />
 
-    <div v-if="mergeOpen" class="manage-backdrop" @click.self="mergeOpen = false">
-      <div class="manage-panel" role="dialog" aria-modal="true" aria-label="Merge books">
-        <button class="manage-close" @click="mergeOpen = false">✕</button>
-        <h3>Merge books ({{ mergeBooksList.length }})</h3>
-        <p class="news-hint">
-          Choose the record to keep. The others' formats and any metadata the destination lacks are merged into it.
-          <span :title="DEFAULT_DESTINATION_HINT">(Why is one pre-selected?)</span>
-        </p>
-        <ul class="manage-list">
-          <li v-for="b in mergeBooksList" :key="b.book_id">
-            <label>
-              <input v-model="mergeDest" type="radio" name="merge-dest" :value="b.book_id" :disabled="mergeBusy" />
-              {{ b.title }} — {{ b.authors.join(", ") }}
-              <small v-if="describeRecord(b)" class="news-hint">({{ describeRecord(b) }})</small>
-            </label>
-          </li>
+    <Dialog v-if="mergeOpen" :title="`Merge books (${mergeBooksList.length})`" show-close size="lg" @close="mergeOpen = false">
+      <p class="news-hint">
+        Choose the record to keep. The others' formats and any metadata the destination lacks are merged into it.
+        <span :title="DEFAULT_DESTINATION_HINT">(Why is one pre-selected?)</span>
+      </p>
+      <ul class="manage-list">
+        <li v-for="b in mergeBooksList" :key="b.book_id">
+          <label>
+            <input v-model="mergeDest" type="radio" name="merge-dest" :value="b.book_id" :disabled="mergeBusy" />
+            {{ b.title }} — {{ b.authors.join(", ") }}
+            <small v-if="describeRecord(b)" class="news-hint">({{ describeRecord(b) }})</small>
+          </label>
+        </li>
+      </ul>
+      <label>
+        Mode
+        <select v-model="mergeMode" :disabled="mergeBusy">
+          <option v-for="m in mergeModes" :key="m" :value="m">{{ MERGE_MODE_LABELS[m] }}</option>
+        </select>
+      </label>
+      <p class="news-hint">{{ MERGE_MODE_NOTES[mergeMode] }}</p>
+      <label v-if="mergeMode !== 'merge_keep_sources'">
+        <input v-model="mergeKeepDuplicates" type="checkbox" :disabled="mergeBusy" />
+        Keep a differing copy of a format the destination already has, as a data file
+      </label>
+      <p v-if="mergeError" class="error">{{ mergeError }}</p>
+      <div v-if="mergePreview" role="group" aria-label="What will happen">
+        <h4>This will:</h4>
+        <ul>
+          <li v-for="(line, i) in mergePreviewLines" :key="i">{{ line }}</li>
         </ul>
-        <label>
-          Mode
-          <select v-model="mergeMode" :disabled="mergeBusy">
-            <option v-for="m in mergeModes" :key="m" :value="m">{{ MERGE_MODE_LABELS[m] }}</option>
-          </select>
+      </div>
+      <div class="plugin-actions">
+        <button v-if="!mergePreview" type="button" :disabled="mergeBusy || mergeDest === null" @click="reviewMerge">Review…</button>
+        <button v-else type="button" class="primary" :disabled="mergeBusy || !mergePreview.ok" @click="confirmMerge">{{ mergeBusy ? "Merging…" : "Merge" }}</button>
+        <button type="button" @click="mergeOpen = false">Cancel</button>
+      </div>
+    </Dialog>
+
+    <Dialog v-if="renameOpen" :title="`Rename files (${renameScope.length})`" show-close size="lg" @close="renameOpen = false">
+      <p class="news-hint">
+        Renames the book files on disk. The title, author and library folder are not touched — this changes only what the file is called.
+        Type a name, or a template such as <code>{{ '{title} - {authors}' }}</code>; the same fields save-to-disk accepts work here.
+      </p>
+      <form @submit.prevent="previewRename">
+        <label class="news-field">
+          New name or template
+          <input v-model="renameTemplate" placeholder="{title} - {authors}" :disabled="renameBusy" />
         </label>
-        <p class="news-hint">{{ MERGE_MODE_NOTES[mergeMode] }}</p>
-        <label v-if="mergeMode !== 'merge_keep_sources'">
-          <input v-model="mergeKeepDuplicates" type="checkbox" :disabled="mergeBusy" />
-          Keep a differing copy of a format the destination already has, as a data file
-        </label>
-        <p v-if="mergeError" class="error">{{ mergeError }}</p>
-        <div v-if="mergePreview" role="group" aria-label="What will happen">
-          <h4>This will:</h4>
-          <ul>
-            <li v-for="(line, i) in mergePreviewLines" :key="i">{{ line }}</li>
-          </ul>
-        </div>
-        <div class="plugin-actions">
-          <button v-if="!mergePreview" type="button" :disabled="mergeBusy || mergeDest === null" @click="reviewMerge">Review…</button>
-          <button v-else type="button" class="primary" :disabled="mergeBusy || !mergePreview.ok" @click="confirmMerge">{{ mergeBusy ? "Merging…" : "Merge" }}</button>
-          <button type="button" @click="mergeOpen = false">Cancel</button>
-        </div>
-      </div>
-    </div>
-
-    <div v-if="renameOpen" class="manage-backdrop" @click.self="renameOpen = false">
-      <div class="manage-panel" role="dialog" aria-modal="true">
-        <button class="manage-close" @click="renameOpen = false">✕</button>
-        <h3>Rename files ({{ renameScope.length }})</h3>
-        <p class="news-hint">
-          Renames the book files on disk. The title, author and library folder are not touched — this changes only what the file is called.
-          Type a name, or a template such as <code>{{ '{title} - {authors}' }}</code>; the same fields save-to-disk accepts work here.
-        </p>
-        <form @submit.prevent="previewRename">
-          <label class="news-field">
-            New name or template
-            <input v-model="renameTemplate" placeholder="{title} - {authors}" :disabled="renameBusy" />
-          </label>
-          <div class="bulk-actions">
-            <button type="submit" :disabled="renameBusy || !renameTemplate.trim()">{{ renameBusy ? "Working…" : "Preview" }}</button>
-            <!--
-              Renaming cannot be undone, so this stays disabled until
-              the table below was computed for exactly this template
-              and this selection -- editing either invalidates it.
-            -->
-            <button type="button" class="read primary" :disabled="!renameCanApply" @click="applyRename">Rename</button>
-            <button type="button" :disabled="renameBusy" @click="renameOpen = false">Close</button>
-          </div>
-        </form>
-        <p v-if="renameError" class="error">{{ renameError }}</p>
-        <p v-if="renameSummary" class="news-hint">{{ renameSummary }}</p>
-        <ul v-if="renameResults.length" class="manage-list">
-          <li v-for="r in renameResults" :key="r.book_id">
-            <span v-if="r.error" class="error">{{ r.title }}: {{ r.error }}</span>
-            <span v-else-if="r.changed" class="manage-name">{{ r.current || "(unnamed)" }} → {{ r.proposed }}</span>
-            <span v-else class="manage-name muted">{{ r.current }} (unchanged)</span>
-          </li>
-        </ul>
-      </div>
-    </div>
-
-    <div v-if="copyOpen" class="manage-backdrop" @click.self="copyOpen = false">
-      <div class="manage-panel" role="dialog" aria-modal="true">
-        <button class="manage-close" @click="copyOpen = false">✕</button>
-        <h3>Copy to library</h3>
-        <p v-if="copyTargets.length === 0" class="news-hint">
-          This server is hosting only this library, so there is nowhere to copy to. Open another library once and it becomes
-          available here.
-        </p>
-        <template v-else>
-          <p class="news-hint">Copies the selected book(s), with their formats and cover, into another library this server hosts.</p>
-          <form @submit.prevent="runCopyToLibrary">
-            <label class="news-field">
-              Destination library
-              <select v-model="copyTarget" :disabled="copyBusy">
-                <option v-for="target in copyTargets" :key="target.id" :value="target.id">{{ target.name }}</option>
-              </select>
-            </label>
-            <label class="news-field">
-              <input v-model="copyMove" type="checkbox" :disabled="copyBusy" />
-              Remove from this library afterwards (move rather than copy)
-            </label>
-            <div class="bulk-actions">
-              <button type="submit" class="read" :disabled="copyBusy || !copyTarget">
-                {{ copyBusy ? "Copying…" : `${copyMove ? "Move" : "Copy"} ${renameScope.length} book(s)` }}
-              </button>
-              <button type="button" :disabled="copyBusy" @click="copyOpen = false">Close</button>
-            </div>
-          </form>
-        </template>
-        <p v-if="copyError" class="error">{{ copyError }}</p>
-        <ul v-if="copyDone && copyResults.length" class="manage-list">
-          <li v-for="(line, i) in copyResults" :key="i"><span class="manage-name">{{ line }}</span></li>
-        </ul>
-      </div>
-    </div>
-
-    <div v-if="embedOpen" class="manage-backdrop" @click.self="embedOpen = false">
-      <div class="manage-panel" role="dialog" aria-modal="true">
-        <button class="manage-close" @click="embedOpen = false">✕</button>
-        <h3>Embed metadata in files</h3>
-        <p class="news-hint">
-          Writes this library's metadata into the selected book file(s), so another reader app shows the title, authors and
-          cover recorded here rather than whatever the file shipped with. This rewrites the files themselves and cannot be undone.
-          Formats with no metadata writer yet are listed below and left untouched.
-        </p>
-        <div v-if="!embedDone" class="bulk-actions">
-          <button type="button" class="read" :disabled="embedBusy" @click="runEmbedMetadata">
-            {{ embedBusy ? "Embedding…" : `Embed into ${renameScope.length} book(s)` }}
-          </button>
-          <button type="button" :disabled="embedBusy" @click="embedOpen = false">Cancel</button>
-        </div>
-        <template v-else>
-          <p class="manage-name">{{ embedCount }} file(s) updated.</p>
-          <ul v-if="embedProblems.length" class="manage-list">
-            <li v-for="(problem, i) in embedProblems" :key="i"><span class="error">{{ problem }}</span></li>
-          </ul>
-          <div class="bulk-actions">
-            <button type="button" @click="embedOpen = false">Close</button>
-          </div>
-        </template>
-        <p v-if="embedError" class="error">{{ embedError }}</p>
-      </div>
-    </div>
-
-    <div v-if="saveToDiskOpen" class="manage-backdrop" @click.self="saveToDiskOpen = false">
-      <div class="manage-panel" role="dialog" aria-modal="true">
-        <button class="manage-close" @click="saveToDiskOpen = false">✕</button>
-        <h3>Save to disk</h3>
-        <p class="news-hint">Exports the selected book(s) into a folder tree named from a real calibre template. Available fields include {title}, {authors}, {author_sort}, {series}, and any custom column (e.g. {#shelf}).</p>
-        <form @submit.prevent="runSaveToDisk">
-          <label class="news-field">
-            Path template
-            <input v-model="saveToDiskTemplate" placeholder="{author_sort}/{title}/{title} - {authors}" :disabled="saveToDiskBusy" />
-          </label>
-          <label class="news-field">
-            Destination folder (absolute path)
-            <input v-model="saveToDiskDest" placeholder="/home/me/Books" :disabled="saveToDiskBusy" />
-          </label>
-          <div class="bulk-actions">
-            <button type="submit" class="read" :disabled="saveToDiskBusy || !saveToDiskDest.trim()">{{ saveToDiskBusy ? "Saving…" : "Save" }}</button>
-            <button type="button" :disabled="saveToDiskBusy" @click="saveToDiskOpen = false">Close</button>
-          </div>
-        </form>
-        <p v-if="saveToDiskError" class="error">{{ saveToDiskError }}</p>
-        <ul v-if="saveToDiskResults.length" class="manage-list">
-          <li v-for="r in saveToDiskResults" :key="r.book_id">
-            <span v-if="r.ok" class="manage-name">Book {{ r.book_id }}: saved {{ r.paths?.length }} file(s)</span>
-            <span v-else class="error">Book {{ r.book_id }}: {{ r.error }}</span>
-          </li>
-        </ul>
-      </div>
-    </div>
-
-    <div v-if="newsOpen" class="manage-backdrop" @click.self="newsOpen = false">
-      <div class="manage-panel news-panel" role="dialog" aria-modal="true">
-        <button class="manage-close" @click="newsOpen = false">✕</button>
-        <h3>Fetch news</h3>
-        <p class="news-hint">Enter one or more RSS/Atom feed URLs, one per line. Prefix a line with "Section Title|" to name that feed's own section in a multi-section recipe. This downloads the latest articles and adds the result as a new book.</p>
-        <form @submit.prevent="fetchNews">
-          <label class="news-field">
-            Title
-            <input v-model="newsTitle" placeholder="My Weekly" :disabled="newsFetching" />
-          </label>
-          <label class="news-field">
-            Feed URLs
-            <textarea v-model="newsFeedUrls" rows="4" placeholder="https://example.com/feed.xml&#10;Tech News|https://example.com/tech.xml" :disabled="newsFetching"></textarea>
-          </label>
-          <div class="bulk-actions">
-            <button type="button" :disabled="newsFetching || opmlImporting" @click="opmlInput?.click()">{{ opmlImporting ? "Importing…" : "Import OPML…" }}</button>
-            <input ref="opmlInput" type="file" accept=".opml,.xml,text/x-opml,text/xml" class="hidden-file-input" @change="importOpmlFile" />
-          </div>
-          <label class="news-field">
-            Oldest article (days)
-            <input v-model="newsOldestArticleDays" type="number" min="0" step="1" placeholder="7" :disabled="newsFetching" />
-          </label>
-          <label class="news-field">
-            Max articles per feed
-            <input v-model="newsMaxArticlesPerFeed" type="number" min="1" step="1" placeholder="100" :disabled="newsFetching" />
-          </label>
-          <label class="news-field">
-            Repeat every (minutes)
-            <input v-model="scheduleIntervalMinutes" type="number" min="1" step="1" :disabled="schedulingBusy" />
-          </label>
-          <div class="bulk-actions">
-            <button type="submit" class="read" :disabled="newsFetching || !newsFeedUrls.trim()">{{ newsFetching ? "Fetching…" : "Fetch once" }}</button>
-            <button type="button" :disabled="schedulingBusy || !newsFeedUrls.trim()" @click="saveNewsSchedule">{{ schedulingBusy ? "Saving…" : "Save schedule…" }}</button>
-            <button type="button" :disabled="newsFetching" @click="newsOpen = false">Close</button>
-          </div>
-        </form>
-        <p v-if="opmlSummary" class="news-hint">{{ opmlSummary }}</p>
-        <p v-if="newsDone" class="news-done">Added the fetched news as a new book.</p>
-        <p v-if="newsError" class="error">{{ newsError }}</p>
-        <p v-if="scheduleError" class="error">{{ scheduleError }}</p>
-
-        <template v-if="newsSchedules.length">
-          <h4>Scheduled feeds</h4>
-          <ul class="manage-list">
-            <li v-for="s in newsSchedules" :key="s.id">
-              <span class="manage-name">{{ s.title }} — every {{ Math.round(s.interval_secs / 60) }} min</span>
-              <code class="manage-query">next: {{ new Date(s.next_run_at).toLocaleString() }}<template v-if="s.last_result"> · last: {{ s.last_result }}</template></code>
-              <button type="button" :disabled="schedulingBusy" @click="runNewsScheduleNowClick(s.id)">Run now</button>
-              <button type="button" :disabled="schedulingBusy" @click="deleteNewsSchedule(s.id)">Delete</button>
-            </li>
-          </ul>
-        </template>
-      </div>
-    </div>
-
-    <div v-if="newLibraryOpen" class="manage-backdrop" @click.self="newLibraryOpen = false">
-      <div class="manage-panel" role="dialog" aria-modal="true">
-        <button class="manage-close" @click="newLibraryOpen = false">✕</button>
-        <h3>New library</h3>
-        <p class="hint">Name the library, then choose the folder to create it in. It opens straight away, empty and ready for books.</p>
-        <form class="manage-form" @submit.prevent="createLibrary">
-          <input v-model="newLibraryName" placeholder="Library name" :disabled="creatingLibrary" autofocus />
-          <button type="submit" :disabled="creatingLibrary || !newLibraryName.trim()">
-            {{ creatingLibrary ? "Creating…" : "Choose folder…" }}
-          </button>
-        </form>
-        <p v-if="newLibraryError" class="error">{{ newLibraryError }}</p>
-      </div>
-    </div>
-
-    <div v-if="switchOpen" class="manage-backdrop" @click.self="switchOpen = false">
-      <div class="manage-panel" role="dialog" aria-modal="true">
-        <button class="manage-close" @click="switchOpen = false">✕</button>
-        <h3>Switch library</h3>
-        <ul v-if="recentLibraries.length" class="manage-list">
-          <li v-for="path in recentLibraries" :key="path">
-            <button type="button" :disabled="switching" @click="switchToRecent(path)">{{ path }}</button>
-          </li>
-        </ul>
-        <p v-else class="news-hint">No other recently-opened libraries yet.</p>
         <div class="bulk-actions">
-          <button type="button" class="read" :disabled="switching" @click="switchToOther">Browse for another…</button>
-          <button type="button" :disabled="switching" @click="switchOpen = false">Close</button>
+          <button type="submit" :disabled="renameBusy || !renameTemplate.trim()">{{ renameBusy ? "Working…" : "Preview" }}</button>
+          <!--
+            Renaming cannot be undone, so this stays disabled until
+            the table below was computed for exactly this template
+            and this selection -- editing either invalidates it.
+          -->
+          <button type="button" class="read primary" :disabled="!renameCanApply" @click="applyRename">Rename</button>
+          <button type="button" :disabled="renameBusy" @click="renameOpen = false">Close</button>
         </div>
-        <p v-if="switchError" class="error">{{ switchError }}</p>
+      </form>
+      <p v-if="renameError" class="error">{{ renameError }}</p>
+      <p v-if="renameSummary" class="news-hint">{{ renameSummary }}</p>
+      <ul v-if="renameResults.length" class="manage-list">
+        <li v-for="r in renameResults" :key="r.book_id">
+          <span v-if="r.error" class="error">{{ r.title }}: {{ r.error }}</span>
+          <span v-else-if="r.changed" class="manage-name">{{ r.current || "(unnamed)" }} → {{ r.proposed }}</span>
+          <span v-else class="manage-name muted">{{ r.current }} (unchanged)</span>
+        </li>
+      </ul>
+    </Dialog>
+
+    <Dialog v-if="copyOpen" title="Copy to library" show-close size="md" @close="copyOpen = false">
+      <p v-if="copyTargets.length === 0" class="news-hint">
+        This server is hosting only this library, so there is nowhere to copy to. Open another library once and it becomes
+        available here.
+      </p>
+      <template v-else>
+        <p class="news-hint">Copies the selected book(s), with their formats and cover, into another library this server hosts.</p>
+        <form @submit.prevent="runCopyToLibrary">
+          <label class="news-field">
+            Destination library
+            <select v-model="copyTarget" :disabled="copyBusy">
+              <option v-for="target in copyTargets" :key="target.id" :value="target.id">{{ target.name }}</option>
+            </select>
+          </label>
+          <label class="news-field">
+            <input v-model="copyMove" type="checkbox" :disabled="copyBusy" />
+            Remove from this library afterwards (move rather than copy)
+          </label>
+          <div class="bulk-actions">
+            <button type="submit" class="read" :disabled="copyBusy || !copyTarget">
+              {{ copyBusy ? "Copying…" : `${copyMove ? "Move" : "Copy"} ${renameScope.length} book(s)` }}
+            </button>
+            <button type="button" :disabled="copyBusy" @click="copyOpen = false">Close</button>
+          </div>
+        </form>
+      </template>
+      <p v-if="copyError" class="error">{{ copyError }}</p>
+      <ul v-if="copyDone && copyResults.length" class="manage-list">
+        <li v-for="(line, i) in copyResults" :key="i"><span class="manage-name">{{ line }}</span></li>
+      </ul>
+    </Dialog>
+
+    <Dialog v-if="embedOpen" title="Embed metadata in files" show-close size="lg" @close="embedOpen = false">
+      <p class="news-hint">
+        Writes this library's metadata into the selected book file(s), so another reader app shows the title, authors and
+        cover recorded here rather than whatever the file shipped with. This rewrites the files themselves and cannot be undone.
+        Formats with no metadata writer yet are listed below and left untouched.
+      </p>
+      <div v-if="!embedDone" class="bulk-actions">
+        <button type="button" class="read" :disabled="embedBusy" @click="runEmbedMetadata">
+          {{ embedBusy ? "Embedding…" : `Embed into ${renameScope.length} book(s)` }}
+        </button>
+        <button type="button" :disabled="embedBusy" @click="embedOpen = false">Cancel</button>
       </div>
-    </div>
+      <template v-else>
+        <p class="manage-name">{{ embedCount }} file(s) updated.</p>
+        <ul v-if="embedProblems.length" class="manage-list">
+          <li v-for="(problem, i) in embedProblems" :key="i"><span class="error">{{ problem }}</span></li>
+        </ul>
+        <div class="bulk-actions">
+          <button type="button" @click="embedOpen = false">Close</button>
+        </div>
+      </template>
+      <p v-if="embedError" class="error">{{ embedError }}</p>
+    </Dialog>
+
+    <Dialog v-if="saveToDiskOpen" title="Save to disk" show-close size="lg" @close="saveToDiskOpen = false">
+      <p class="news-hint">Exports the selected book(s) into a folder tree named from a real calibre template. Available fields include {title}, {authors}, {author_sort}, {series}, and any custom column (e.g. {#shelf}).</p>
+      <form @submit.prevent="runSaveToDisk">
+        <label class="news-field">
+          Path template
+          <input v-model="saveToDiskTemplate" placeholder="{author_sort}/{title}/{title} - {authors}" :disabled="saveToDiskBusy" />
+        </label>
+        <label class="news-field">
+          Destination folder (absolute path)
+          <input v-model="saveToDiskDest" placeholder="/home/me/Books" :disabled="saveToDiskBusy" />
+        </label>
+        <div class="bulk-actions">
+          <button type="submit" class="read" :disabled="saveToDiskBusy || !saveToDiskDest.trim()">{{ saveToDiskBusy ? "Saving…" : "Save" }}</button>
+          <button type="button" :disabled="saveToDiskBusy" @click="saveToDiskOpen = false">Close</button>
+        </div>
+      </form>
+      <p v-if="saveToDiskError" class="error">{{ saveToDiskError }}</p>
+      <ul v-if="saveToDiskResults.length" class="manage-list">
+        <li v-for="r in saveToDiskResults" :key="r.book_id">
+          <span v-if="r.ok" class="manage-name">Book {{ r.book_id }}: saved {{ r.paths?.length }} file(s)</span>
+          <span v-else class="error">Book {{ r.book_id }}: {{ r.error }}</span>
+        </li>
+      </ul>
+    </Dialog>
+
+    <Dialog v-if="newsOpen" title="Fetch news" show-close size="md" @close="newsOpen = false">
+      <p class="news-hint">Enter one or more RSS/Atom feed URLs, one per line. Prefix a line with "Section Title|" to name that feed's own section in a multi-section recipe. This downloads the latest articles and adds the result as a new book.</p>
+      <form @submit.prevent="fetchNews">
+        <label class="news-field">
+          Title
+          <input v-model="newsTitle" placeholder="My Weekly" :disabled="newsFetching" />
+        </label>
+        <label class="news-field">
+          Feed URLs
+          <textarea v-model="newsFeedUrls" rows="4" placeholder="https://example.com/feed.xml&#10;Tech News|https://example.com/tech.xml" :disabled="newsFetching"></textarea>
+        </label>
+        <div class="bulk-actions">
+          <button type="button" :disabled="newsFetching || opmlImporting" @click="opmlInput?.click()">{{ opmlImporting ? "Importing…" : "Import OPML…" }}</button>
+          <input ref="opmlInput" type="file" accept=".opml,.xml,text/x-opml,text/xml" class="hidden-file-input" @change="importOpmlFile" />
+        </div>
+        <label class="news-field">
+          Oldest article (days)
+          <input v-model="newsOldestArticleDays" type="number" min="0" step="1" placeholder="7" :disabled="newsFetching" />
+        </label>
+        <label class="news-field">
+          Max articles per feed
+          <input v-model="newsMaxArticlesPerFeed" type="number" min="1" step="1" placeholder="100" :disabled="newsFetching" />
+        </label>
+        <label class="news-field">
+          Repeat every (minutes)
+          <input v-model="scheduleIntervalMinutes" type="number" min="1" step="1" :disabled="schedulingBusy" />
+        </label>
+        <div class="bulk-actions">
+          <button type="submit" class="read" :disabled="newsFetching || !newsFeedUrls.trim()">{{ newsFetching ? "Fetching…" : "Fetch once" }}</button>
+          <button type="button" :disabled="schedulingBusy || !newsFeedUrls.trim()" @click="saveNewsSchedule">{{ schedulingBusy ? "Saving…" : "Save schedule…" }}</button>
+          <button type="button" :disabled="newsFetching" @click="newsOpen = false">Close</button>
+        </div>
+      </form>
+      <p v-if="opmlSummary" class="news-hint">{{ opmlSummary }}</p>
+      <p v-if="newsDone" class="news-done">Added the fetched news as a new book.</p>
+      <p v-if="newsError" class="error">{{ newsError }}</p>
+      <p v-if="scheduleError" class="error">{{ scheduleError }}</p>
+
+      <template v-if="newsSchedules.length">
+        <h4>Scheduled feeds</h4>
+        <ul class="manage-list">
+          <li v-for="s in newsSchedules" :key="s.id">
+            <span class="manage-name">{{ s.title }} — every {{ Math.round(s.interval_secs / 60) }} min</span>
+            <code class="manage-query">next: {{ new Date(s.next_run_at).toLocaleString() }}<template v-if="s.last_result"> · last: {{ s.last_result }}</template></code>
+            <button type="button" :disabled="schedulingBusy" @click="runNewsScheduleNowClick(s.id)">Run now</button>
+            <button type="button" :disabled="schedulingBusy" @click="deleteNewsSchedule(s.id)">Delete</button>
+          </li>
+        </ul>
+      </template>
+    </Dialog>
+
+    <NewLibraryDialog v-if="newLibraryOpen" v-model:name="newLibraryName" :busy="creatingLibrary" :error="newLibraryError" @close="newLibraryOpen = false" @submit="createLibrary" />
+
+    <SwitchLibraryDialog v-if="switchOpen" :recent="recentLibraries" :switching="switching" :error="switchError" @close="switchOpen = false" @choose-recent="switchToRecent" @browse="switchToOther" />
   </div>
 </template>
 
@@ -4384,31 +4335,6 @@ watch(coloringRules, () => {
 .status-sel {
   opacity: 0.75;
 }
-.dupes-panel {
-  max-width: 600px;
-}
-.dupes-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  max-height: 40vh;
-  overflow: auto;
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-3);
-}
-.dupe {
-  display: flex;
-  flex-direction: column;
-}
-.dupe-name {
-  font-weight: 600;
-}
-.dupes-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: var(--sp-4);
-}
 .status-draft {
   opacity: 1;
   color: var(--warning);
@@ -4604,19 +4530,6 @@ watch(coloringRules, () => {
   padding: 0;
   list-style: none;
 }
-.manage-list {
-  list-style: none;
-  margin: 0 0 0.75em;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 0.4em;
-}
-.manage-list li {
-  display: flex;
-  align-items: center;
-  gap: 0.5em;
-}
 
 /*
  * An orphan row carries four controls, which do not fit on the same line
@@ -4670,25 +4583,6 @@ watch(coloringRules, () => {
   margin: 0.4rem 0;
   padding-left: 1.1rem;
 }
-.manage-form {
-  display: flex;
-  gap: 0.5em;
-}
-.manage-form input {
-  flex: 1;
-  font: inherit;
-  padding: 0.35em 0.5em;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-}
-.news-panel {
-  max-width: 480px;
-}
-/* The duplicate review lays copies out side by side, so it needs the room. */
-.dup-panel {
-  max-width: min(1200px, 96vw);
-  width: 96vw;
-}
 .dup-filter {
   display: inline-flex;
   gap: 0.4rem;
@@ -4714,11 +4608,6 @@ watch(coloringRules, () => {
 }
 .dup-badge-review {
   color: var(--warning);
-}
-.news-hint {
-  color: var(--fg-muted);
-  font-size: var(--fs-body);
-  margin: 0;
 }
 .news-field {
   display: flex;

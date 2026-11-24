@@ -3,7 +3,7 @@
 // native-menu sync. The pure parts of each are tested in src/library/*.test.ts;
 // these pin the wiring, which is where the regressions were.
 
-import { createApp, defineComponent, h, nextTick, type App } from "vue";
+import { createApp, defineComponent, h, KeepAlive, nextTick, ref, type App } from "vue";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { BookSummary } from "../library/types";
@@ -37,6 +37,7 @@ vi.mock("./TrashDialog.vue", () => ({
 import LibraryView from "./LibraryView.vue";
 import { answerTrashConfirm, confirmState, dismissToast, toastState } from "../library/deleteFlow";
 import { MENU_ACTION_EVENT } from "../library/desktopMenu";
+import { markLibraryChanged } from "../library/libraryEpoch";
 
 const makeBook = (id: number): BookSummary =>
   ({
@@ -329,5 +330,71 @@ describe("drafts", () => {
     await settle();
     expect(el.querySelector("[data-testid='draft-count']")!.textContent).toContain("1 unsaved draft");
     sharedDrafts.clear();
+  });
+});
+
+describe("kept alive behind another route", () => {
+  /** The library view inside <keep-alive>, with a switch that parks it as the reader would. */
+  async function mountKept() {
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    const away = ref(false);
+    app = createApp({ render: () => h(KeepAlive, null, { default: () => (away.value ? h("div", { "data-testid": "reader" }) : h(LibraryView)) }) });
+    app.component("router-link", RouterLinkStub);
+    app.mount(host);
+    await settle();
+    return { el: host, away };
+  }
+
+  it("keeps the query, the rows and the selection, and does not reload when nothing changed", async () => {
+    const { el, away } = await mountKept();
+    await search(el, "title:one");
+    click(rows(el)[0]);
+    await settle();
+    expect(rows(el)[0].classList.contains("selected")).toBe(true);
+    const searches = apiMocks.search.mock.calls.length;
+
+    away.value = true;
+    await settle();
+    expect(el.querySelector('[data-testid="reader"]')).not.toBeNull();
+    away.value = false;
+    await settle();
+
+    expect(el.querySelector<HTMLInputElement>("form.search input[type='search']")!.value).toBe("title:one");
+    expect(rows(el)).toHaveLength(1);
+    expect(rows(el)[0].classList.contains("selected")).toBe(true);
+    expect(el.querySelector('[data-testid="details-stub"]')?.textContent).toBe("details 1");
+    expect(apiMocks.search.mock.calls.length).toBe(searches);
+  });
+
+  it("does not react to Del or menu actions while parked, and does again once shown", async () => {
+    const { el, away } = await mountKept();
+    click(rows(el)[0]);
+    await settle();
+    away.value = true;
+    await settle();
+
+    key("Delete");
+    window.dispatchEvent(new CustomEvent(MENU_ACTION_EVENT, { detail: { id: "delete-book" } }));
+    await settle();
+    expect(confirmState.open).toBe(false);
+
+    away.value = false;
+    await settle();
+    key("Delete");
+    await settle();
+    expect(confirmState.open).toBe(true);
+  });
+
+  it("reloads its list on return when something was written while it was away", async () => {
+    const { el, away } = await mountKept();
+    const searches = apiMocks.search.mock.calls.length;
+    away.value = true;
+    await settle();
+    markLibraryChanged();
+    away.value = false;
+    await settle();
+    expect(apiMocks.search.mock.calls.length).toBeGreaterThan(searches);
+    expect(rows(el)).toHaveLength(6);
   });
 });

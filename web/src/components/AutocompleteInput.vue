@@ -265,7 +265,7 @@ function parts(s: Suggestion): [string, string, string] {
 <style>
 .ac-list {
   position: fixed;
-  z-index: 3000;
+  z-index: var(--z-suggest);
   margin: 0;
   padding: 2px 0;
   list-style: none;

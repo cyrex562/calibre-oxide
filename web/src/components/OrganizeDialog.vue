@@ -3,6 +3,8 @@
 // says. Preview first; only that previewed plan can be run; a finished run can
 // be undone. The state machine is in ../library/organize.ts (tested there).
 
+import { confirmDialog } from "./dialogs/confirm";
+import Dialog from "./Dialog.vue";
 import { computed, onMounted, watch } from "vue";
 
 import { cancelLibraryJob } from "../library/api";
@@ -33,7 +35,7 @@ async function preview() {
 async function run() {
   const plan = state.plan;
   if (!plan) return;
-  const sure = window.confirm(`Move the files of ${plan.books.toLocaleString("en-US")} books (${plan.files.toLocaleString("en-US")} files) inside the library? Nothing is overwritten, and you can undo this run afterwards.`);
+  const sure = await confirmDialog(`Move the files of ${plan.books.toLocaleString("en-US")} books (${plan.files.toLocaleString("en-US")} files) inside the library? Nothing is overwritten, and you can undo this run afterwards.`, { title: "Organize files", confirmLabel: "Move files" });
   if (!sure) return;
   if (await c.run(props.selectedIds)) emit("changed");
 }
@@ -48,115 +50,80 @@ function cancelRun() {
 </script>
 
 <template>
-  <div class="organize-backdrop" @click.self="!busy && emit('close')">
-    <div class="organize-panel" role="dialog" aria-modal="true" aria-label="Organize files">
-      <button class="organize-close" :disabled="busy" aria-label="Close" @click="emit('close')">✕</button>
-      <h3>Organize files</h3>
-      <p class="hint">Files are moved on disk, within the library, to the folders and names the template gives. Nothing is overwritten (a name already taken gets a number), nothing is deleted, and a run can be undone.</p>
+  <Dialog title="Organize files" :busy="busy" show-close size="lg" @close="emit('close')">
+    <p class="hint">Files are moved on disk, within the library, to the folders and names the template gives. Nothing is overwritten (a name already taken gets a number), nothing is deleted, and a run can be undone.</p>
 
-      <label class="field">
-        Template
-        <input v-model="state.draft.template" type="text" :disabled="busy" data-testid="template" spellcheck="false" />
-        <span class="hint">For example {author_sort}/{title}: folder Author, file Title.ext</span>
-      </label>
+    <label class="field">
+      Template
+      <input v-model="state.draft.template" type="text" :disabled="busy" data-testid="template" spellcheck="false" />
+      <span class="hint">For example {author_sort}/{title}: folder Author, file Title.ext</span>
+    </label>
 
-      <fieldset class="organize-scope" :disabled="busy">
-        <legend>Which books</legend>
-        <label><input v-model="state.draft.scope" type="radio" value="selected" :disabled="selectedIds.length === 0" /> The {{ selectedIds.length.toLocaleString("en-US") }} selected book{{ selectedIds.length === 1 ? "" : "s" }}</label>
-        <label><input v-model="state.draft.scope" type="radio" value="folder" /> Books in a folder</label>
-        <input v-if="state.draft.scope === 'folder'" v-model="state.draft.pathPrefix" type="text" placeholder="Folder, relative to the library (e.g. Fiction/Old)" data-testid="path-prefix" />
-        <label><input v-model="state.draft.scope" type="radio" value="all" /> Every book in the library</label>
-      </fieldset>
+    <fieldset class="organize-scope" :disabled="busy">
+      <legend>Which books</legend>
+      <label><input v-model="state.draft.scope" type="radio" value="selected" :disabled="selectedIds.length === 0" /> The {{ selectedIds.length.toLocaleString("en-US") }} selected book{{ selectedIds.length === 1 ? "" : "s" }}</label>
+      <label><input v-model="state.draft.scope" type="radio" value="folder" /> Books in a folder</label>
+      <input v-if="state.draft.scope === 'folder'" v-model="state.draft.pathPrefix" type="text" placeholder="Folder, relative to the library (e.g. Fiction/Old)" data-testid="path-prefix" />
+      <label><input v-model="state.draft.scope" type="radio" value="all" /> Every book in the library</label>
+    </fieldset>
 
-      <div class="organize-buttons">
-        <button type="button" :disabled="busy || problem !== null" data-testid="preview" @click="preview">{{ state.phase === "planning" ? "Previewing…" : "Preview" }}</button>
-      </div>
-      <p v-if="problem" class="hint">{{ problem }}</p>
-      <p v-if="state.error" class="error" role="alert">{{ state.error }}</p>
-
-      <section v-if="state.plan" class="organize-plan" aria-label="Preview" data-testid="plan">
-        <p role="status">{{ describePlan(state.plan) }}</p>
-        <p v-if="state.plan.books === 0" class="hint">Nothing to move.</p>
-        <ul v-else class="organize-moves">
-          <li v-for="(m, i) in state.plan.moves" :key="i">
-            <span class="title">{{ m.title }}</span> <span class="hint">({{ m.format }})</span>
-            <span v-if="m.suffixed" class="warn" title="The target name was taken, so the file gets a number"> numbered</span>
-            <div class="path">{{ m.from }} → {{ m.to }}</div>
-          </li>
-        </ul>
-        <p v-if="planListIsPartial(state.plan)" class="hint">Showing the first {{ state.plan.moves.length.toLocaleString("en-US") }} of {{ state.plan.files.toLocaleString("en-US") }} files.</p>
-        <details v-if="state.plan.skipped.length > 0">
-          <summary>{{ state.plan.skipped.length }} skipped</summary>
-          <ul>
-            <li v-for="s in state.plan.skipped.slice(0, 50)" :key="s.book_id">Book {{ s.book_id }}: {{ s.reason }}</li>
-          </ul>
-        </details>
-        <div class="organize-buttons">
-          <button type="button" class="primary" :disabled="busy || !canRun" data-testid="run-plan" @click="run">Organize {{ state.plan.books.toLocaleString("en-US") }} books</button>
-        </div>
-      </section>
-
-      <div v-if="state.phase === 'running'" class="organize-buttons">
-        <p class="hint" role="status">{{ state.progress }}</p>
-        <button v-if="state.jobId !== null" type="button" @click="cancelRun">Cancel</button>
-      </div>
-
-      <section v-if="state.report" class="organize-done" aria-label="Result" data-testid="report">
-        <p role="status">{{ describeReport(state.report) }}</p>
-        <ul v-if="state.report.failed.length > 0">
-          <li v-for="f in state.report.failed.slice(0, 5)" :key="f.book_id">Book {{ f.book_id }}: {{ f.reason }}</li>
-        </ul>
-        <button type="button" :disabled="busy" data-testid="undo-run" @click="undo(state.report.run_id)">Undo this run</button>
-      </section>
-      <p v-if="state.undone" class="hint" role="status">{{ state.undone }}</p>
-
-      <section v-if="state.runs.length > 0 && !state.report" class="organize-runs">
-        <h4>Earlier runs</h4>
-        <ul>
-          <li v-for="r in state.runs.slice(0, 5)" :key="r.run_id">
-            {{ r.books.toLocaleString("en-US") }} book{{ r.books === 1 ? "" : "s" }} · <span class="hint">{{ new Date(r.created_at * 1000).toLocaleString() }}</span>
-            <button type="button" :disabled="busy" @click="undo(r.run_id)">Undo</button>
-          </li>
-        </ul>
-      </section>
+    <div class="organize-buttons">
+      <button type="button" :disabled="busy || problem !== null" data-testid="preview" @click="preview">{{ state.phase === "planning" ? "Previewing…" : "Preview" }}</button>
     </div>
-  </div>
+    <p v-if="problem" class="hint">{{ problem }}</p>
+    <p v-if="state.error" class="error" role="alert">{{ state.error }}</p>
+
+    <section v-if="state.plan" class="organize-plan" aria-label="Preview" data-testid="plan">
+      <p role="status">{{ describePlan(state.plan) }}</p>
+      <p v-if="state.plan.books === 0" class="hint">Nothing to move.</p>
+      <ul v-else class="organize-moves">
+        <li v-for="(m, i) in state.plan.moves" :key="i">
+          <span class="title">{{ m.title }}</span> <span class="hint">({{ m.format }})</span>
+          <span v-if="m.suffixed" class="warn" title="The target name was taken, so the file gets a number"> numbered</span>
+          <div class="path">{{ m.from }} → {{ m.to }}</div>
+        </li>
+      </ul>
+      <p v-if="planListIsPartial(state.plan)" class="hint">Showing the first {{ state.plan.moves.length.toLocaleString("en-US") }} of {{ state.plan.files.toLocaleString("en-US") }} files.</p>
+      <details v-if="state.plan.skipped.length > 0">
+        <summary>{{ state.plan.skipped.length }} skipped</summary>
+        <ul>
+          <li v-for="s in state.plan.skipped.slice(0, 50)" :key="s.book_id">Book {{ s.book_id }}: {{ s.reason }}</li>
+        </ul>
+      </details>
+      <div class="organize-buttons">
+        <button type="button" class="primary" :disabled="busy || !canRun" data-testid="run-plan" @click="run">Organize {{ state.plan.books.toLocaleString("en-US") }} books</button>
+      </div>
+    </section>
+
+    <div v-if="state.phase === 'running'" class="organize-buttons">
+      <p class="hint" role="status">{{ state.progress }}</p>
+      <button v-if="state.jobId !== null" type="button" @click="cancelRun">Cancel</button>
+    </div>
+
+    <section v-if="state.report" class="organize-done" aria-label="Result" data-testid="report">
+      <p role="status">{{ describeReport(state.report) }}</p>
+      <ul v-if="state.report.failed.length > 0">
+        <li v-for="f in state.report.failed.slice(0, 5)" :key="f.book_id">Book {{ f.book_id }}: {{ f.reason }}</li>
+      </ul>
+      <button type="button" :disabled="busy" data-testid="undo-run" @click="undo(state.report.run_id)">Undo this run</button>
+    </section>
+    <p v-if="state.undone" class="hint" role="status">{{ state.undone }}</p>
+
+    <section v-if="state.runs.length > 0 && !state.report" class="organize-runs">
+      <h4>Earlier runs</h4>
+      <ul>
+        <li v-for="r in state.runs.slice(0, 5)" :key="r.run_id">
+          {{ r.books.toLocaleString("en-US") }} book{{ r.books === 1 ? "" : "s" }} · <span class="hint">{{ new Date(r.created_at * 1000).toLocaleString() }}</span>
+          <button type="button" :disabled="busy" @click="undo(r.run_id)">Undo</button>
+        </li>
+      </ul>
+    </section>
+  </Dialog>
 </template>
 
 <style scoped>
-.organize-backdrop {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.45);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 20;
-}
-.organize-panel {
-  position: relative;
-  background: var(--bg);
-  border-radius: 6px;
-  padding: 1.25rem 1.5rem;
-  width: min(720px, 94vw);
-  max-height: 88vh;
-  overflow: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 0.9rem;
-}
-.organize-panel h3,
-.organize-panel h4 {
+h4 {
   margin: 0;
-}
-.organize-close {
-  position: absolute;
-  top: 0.4rem;
-  right: 0.5rem;
-  border: none;
-  background: none;
-  cursor: pointer;
-  font-size: var(--fs-medium);
 }
 .hint {
   color: var(--fg-muted);

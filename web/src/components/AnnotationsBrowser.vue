@@ -8,6 +8,7 @@
 // to be ported for this; despite what that module's doc implied, it
 // did not exist.
 
+import Dialog from "./Dialog.vue";
 import { computed, onMounted, ref } from "vue";
 
 import { fetchAllAnnotations, type LibraryAnnotation } from "../library/api";
@@ -51,42 +52,35 @@ onMounted(load);
 </script>
 
 <template>
-  <div class="manage-backdrop" @click.self="emit('close')">
-    <div class="manage-panel annotations-panel" role="dialog" aria-modal="true">
-      <h3>Annotations</h3>
-
-      <div class="annot-controls">
-        <select v-model="typeFilter" :disabled="loading" @change="load">
-          <option value="">All types</option>
-          <option value="highlight">Highlights</option>
-          <option value="bookmark">Bookmarks</option>
-        </select>
-        <input v-model="search" type="search" placeholder="Filter…" :disabled="loading" />
-        <button type="button" :disabled="loading" @click="load">{{ loading ? "Loading…" : "Refresh" }}</button>
-        <button type="button" @click="emit('close')">Close</button>
-      </div>
-
-      <p v-if="error" class="error">{{ error }}</p>
-      <p v-else-if="loading" class="status">Loading…</p>
-      <p v-else-if="annotations.length === 0" class="status">No annotations in this library yet.</p>
-      <p v-else-if="shown.length === 0" class="status">Nothing matches that filter.</p>
-
-      <ul v-if="!loading && shown.length" class="annot-list">
-        <li v-for="a in shown" :key="a.id" class="annot-row">
-          <button type="button" class="annot-book" :title="`Open ${a.title}`" @click="emit('open-book', a.book_id)">{{ a.title }}</button>
-          <span class="annot-type">{{ a.type }}</span>
-          <span class="annot-text">{{ a.text || "(no text)" }}</span>
-          <span class="annot-date">{{ formatDate(a.timestamp) }}</span>
-        </li>
-      </ul>
+  <Dialog title="Annotations" size="lg" @close="emit('close')">
+    <div class="annot-controls">
+      <select v-model="typeFilter" :disabled="loading" @change="load">
+        <option value="">All types</option>
+        <option value="highlight">Highlights</option>
+        <option value="bookmark">Bookmarks</option>
+      </select>
+      <input v-model="search" type="search" placeholder="Filter…" :disabled="loading" />
+      <button type="button" :disabled="loading" @click="load">{{ loading ? "Loading…" : "Refresh" }}</button>
+      <button type="button" @click="emit('close')">Close</button>
     </div>
-  </div>
+
+    <p v-if="error" class="error">{{ error }}</p>
+    <p v-else-if="loading" class="status">Loading…</p>
+    <p v-else-if="annotations.length === 0" class="status">No annotations in this library yet.</p>
+    <p v-else-if="shown.length === 0" class="status">Nothing matches that filter.</p>
+
+    <ul v-if="!loading && shown.length" class="annot-list">
+      <li v-for="a in shown" :key="a.id" class="annot-row">
+        <button type="button" class="annot-book" :title="`Open ${a.title}`" @click="emit('open-book', a.book_id)">{{ a.title }}</button>
+        <span class="annot-type">{{ a.type }}</span>
+        <span class="annot-text">{{ a.text || "(no text)" }}</span>
+        <span class="annot-date">{{ formatDate(a.timestamp) }}</span>
+      </li>
+    </ul>
+  </Dialog>
 </template>
 
 <style scoped>
-.annotations-panel {
-  min-width: min(820px, 94vw);
-}
 .annot-controls {
   display: flex;
   gap: 0.4rem;

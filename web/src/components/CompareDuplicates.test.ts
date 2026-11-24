@@ -58,42 +58,42 @@ async function mount() {
 describe("the compare view", () => {
   it("shows a column per copy with its facts, a cover, and the pair evidence", async () => {
     await mount();
-    expect(host!.querySelectorAll('[data-testid="column"]')).toHaveLength(3);
-    expect(host!.querySelectorAll('[data-testid="cover-image"]')).toHaveLength(3);
-    const facts = host!.querySelector('[data-testid="facts"]')!.textContent!;
+    expect(document.body.querySelectorAll('[data-testid="column"]')).toHaveLength(3);
+    expect(document.body.querySelectorAll('[data-testid="cover-image"]')).toHaveLength(3);
+    const facts = document.body.querySelector('[data-testid="facts"]')!.textContent!;
     expect(facts).toContain("Book 1.epub");
     expect(facts).toContain("Ann Author/Folder");
-    expect(host!.querySelector('[data-testid="evidence"]')!.textContent).toContain("Identical files");
+    expect(document.body.querySelector('[data-testid="evidence"]')!.textContent).toContain("Identical files");
     // No PDFs: no page control.
-    expect(host!.querySelector('[data-testid="page-first"]')).toBeNull();
+    expect(document.body.querySelector('[data-testid="page-first"]')).toBeNull();
   });
 
   it("marks the suggested copy and lets the person choose another", async () => {
     const { controller } = await mount();
-    expect(host!.querySelectorAll('[data-testid="keeper-mark"]')).toHaveLength(1);
-    (host!.querySelectorAll('[data-testid="keep-this"]')[0] as HTMLButtonElement).click();
+    expect(document.body.querySelectorAll('[data-testid="keeper-mark"]')).toHaveLength(1);
+    (document.body.querySelectorAll('[data-testid="keep-this"]')[0] as HTMLButtonElement).click();
     await nextTick();
     expect(controller.state.keeperId).toBe(2);
-    expect(host!.querySelector('[data-testid="keeper-mark"]')!.textContent).toContain("Your choice");
+    expect(document.body.querySelector('[data-testid="keeper-mark"]')!.textContent).toContain("Your choice");
   });
 
   it("saves an edited title through the controller", async () => {
     const { controller, api } = await mount();
-    const input = host!.querySelector('[data-testid="edit-title"]') as HTMLInputElement;
+    const input = document.body.querySelector('[data-testid="edit-title"]') as HTMLInputElement;
     input.value = "New Title";
     input.dispatchEvent(new Event("input"));
     await nextTick();
     expect(controller.state.drafts[1].title).toBe("New Title");
-    (host!.querySelector('[data-testid="save-metadata"]') as HTMLButtonElement).click();
+    (document.body.querySelector('[data-testid="save-metadata"]') as HTMLButtonElement).click();
     await vi.waitFor(() => expect(api.setFields).toHaveBeenCalledWith(1, { title: "New Title" }));
   });
 
   it("offers Save as my group until the set is one", async () => {
     const { controller } = await mount();
-    expect(host!.querySelector('[data-testid="save-group"]')).not.toBeNull();
+    expect(document.body.querySelector('[data-testid="save-group"]')).not.toBeNull();
     controller.state.manualGroupId = "mg-1";
     await nextTick();
-    expect(host!.querySelector('[data-testid="save-group"]')).toBeNull();
-    expect(host!.querySelector('[data-testid="your-group"]')).not.toBeNull();
+    expect(document.body.querySelector('[data-testid="save-group"]')).toBeNull();
+    expect(document.body.querySelector('[data-testid="your-group"]')).not.toBeNull();
   });
 });

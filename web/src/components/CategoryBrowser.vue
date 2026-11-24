@@ -13,6 +13,8 @@
 //
 // See docs/UI_DESIGN.md §3.3.
 
+import { useKeepScroll } from "../library/keepScroll";
+import { promptDialog } from "./dialogs/confirm";
 import { computed, ref, watch } from "vue";
 import AppIcon from "./AppIcon.vue";
 
@@ -26,6 +28,11 @@ import type { CategoryEntry, CategoryItem } from "../library/types";
 import ContextMenu, { type ContextMenuEntry } from "./ContextMenu.vue";
 import FoldersTree from "./FoldersTree.vue";
 import { getItemCompat } from "../library/legacyStorage";
+
+const rootNav = ref<HTMLElement | null>(null);
+const listEl = ref<HTMLElement | null>(null);
+useKeepScroll(rootNav);
+useKeepScroll(listEl);
 
 // `selectedIds` feeds "Move selected books here" in the Folders tree; bumping
 // `refreshKey` reloads the tree and the categories (a column or a move changed them).
@@ -172,10 +179,7 @@ async function onItemMenuChoose(id: ItemMenuId) {
 }
 
 async function renameItem(key: CategoryKey, item: CategoryItem) {
-  // `prompt` is a known tell and is on the list to replace with a real
-  // dialog (docs/UI_DESIGN.md §5.5); left here so this rewrite stays
-  // about the tree rather than growing a dialog primitive too.
-  const newName = prompt(`Rename "${item.name}" to:`, item.name);
+  const newName = await promptDialog(`Rename "${item.name}" to:`, item.name, { title: "Rename", confirmLabel: "Rename" });
   if (!newName || newName === item.name) return;
   error.value = null;
   try {
@@ -206,7 +210,7 @@ const findOpen = ref(false);
 </script>
 
 <template>
-  <nav class="category-browser">
+  <nav ref="rootNav" class="category-browser">
     <header class="cat-header">
       <h2>Categories</h2>
       <button type="button" class="cat-tool" :class="{ active: findOpen }" title="Find a category or item" @click="findOpen = !findOpen">⌕</button>
@@ -235,7 +239,7 @@ const findOpen = ref(false);
 
     <FoldersTree :selected-ids="selectedIds" :refresh-key="refreshKey" @select="(q, l) => emit('select', q, l)" @changed="emit('folders-changed')" />
 
-    <ul class="cat-list">
+    <ul ref="listEl" class="cat-list">
       <li v-for="cat in categories" :key="cat.url">
         <button
           type="button"

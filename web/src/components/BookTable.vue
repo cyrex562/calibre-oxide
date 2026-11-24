@@ -11,12 +11,13 @@
 // which rows exist and which are loaded lives in library/bookWindow.ts.
 // This component does layout, pointer handling and events.
 
+import { useKeepScroll } from "../library/keepScroll";
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import { autoFitWidth, CHECK_COLUMN_WIDTH, dropIndex, isDrag, moveKeyTo, resizedColumnWidth, tableWidth } from "../library/columnLayout";
 import AutocompleteInput from "./AutocompleteInput.vue";
 import { completionFor } from "../library/fieldValues";
-import { formatCell, nextSort, type BookColumn } from "../library/columns";
+import { formatCell, MAX_COLUMN_WIDTH, MIN_COLUMN_WIDTH, nextSort, type BookColumn } from "../library/columns";
 import { defaultEditKey, editKeyAction, initialText, isEditable, isEmptyCell, neighbourEditableKey, startsEditing, type CommitResult } from "../library/inlineEdit";
 import type { BookSummary } from "../library/types";
 import { windowRange } from "../library/virtualList";
@@ -24,6 +25,9 @@ import { dragIds, setBooksDrag } from "../library/folders";
 
 /** Height of one row, in pixels. Fixed: virtual scrolling depends on it. */
 const ROW_HEIGHT = 30;
+/** Pixels a column grows or shrinks per arrow press on its resize handle, and with Shift. */
+const RESIZE_STEP = 10;
+const RESIZE_STEP_BIG = 50;
 /** Used until the scroller has been measured (and in jsdom, which never measures). */
 const FALLBACK_VIEWPORT = 600;
 
@@ -73,6 +77,7 @@ const emit = defineEmits<{
 // ---------------------------------------------------------------
 
 const scroller = ref<HTMLElement | null>(null);
+useKeepScroll(scroller);
 const scrollTop = ref(0);
 const viewportHeight = ref(FALLBACK_VIEWPORT);
 const headerHeight = ref(0);
@@ -141,6 +146,47 @@ function pageRows(): number {
 
 defineExpose({ scrollToIndex, pageRows });
 
+// ---------------------------------------------------------------
+// Roving tabindex
+// ---------------------------------------------------------------
+//
+// Exactly one row is in the Tab order: the current one (the selected book
+// when it is on screen, else the first loaded row on screen), so Tab enters
+// the table once and leaves it in one more step. The arrows move the current
+// row; focus follows it.
+
+const currentId = computed<number | null>(() => {
+  let first: number | null = null;
+  for (const i of rowIndexes.value) {
+    const id = props.ids[i];
+    if (!props.getBook(id)) continue;
+    if (id === props.selectedBookId) return id;
+    first ??= id;
+  }
+  return first;
+});
+
+function rowEl(id: number | null): HTMLElement | null {
+  if (id === null) return null;
+  return scroller.value?.querySelector<HTMLElement>(`tbody tr[data-id="${id}"]`) ?? null;
+}
+
+// Focus follows the current row when the table already has it.
+watch(currentId, async (id, was) => {
+  if (id === was || id === null) return;
+  const active = document.activeElement;
+  const hadFocus = active !== null && scroller.value !== null && scroller.value.contains(active) && !(active as HTMLElement).closest(".cell-editor, input, select, textarea");
+  if (!hadFocus) return;
+  for (let tries = 0; tries < 3; tries++) {
+    await nextTick();
+    const el = rowEl(id);
+    if (el) {
+      el.focus({ preventScroll: true });
+      return;
+    }
+  }
+});
+
 /** The column currently driving the sort, if it is one we show. */
 function sortIndicator(column: BookColumn): "" | "▲" | "▼" {
   if (!column.sortKey) return "";
@@ -185,6 +231,15 @@ function endResize(event: PointerEvent) {
   if (!resizing.value) return;
   (event.target as HTMLElement).releasePointerCapture?.(event.pointerId);
   resizing.value = null;
+}
+
+/** Left/Right on a focused handle: 10px a step, 50px with Shift. */
+function onResizeKey(event: KeyboardEvent, column: BookColumn) {
+  if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+  event.preventDefault();
+  event.stopPropagation(); // the row and list key handlers must not see it
+  const step = event.shiftKey ? RESIZE_STEP_BIG : RESIZE_STEP;
+  emit("resize", { key: column.key, width: resizedColumnWidth(column.width, event.key === "ArrowLeft" ? -step : step) });
 }
 
 let measureCanvas: HTMLCanvasElement | null = null;
@@ -328,7 +383,8 @@ function onListKeydown(event: KeyboardEvent) {
   if (NAV_KEYS.has(event.key)) {
     event.preventDefault();
     emit("navigate", event.key, event.shiftKey);
-    scroller.value?.focus({ preventScroll: true });
+    // Keep focus in the table; the row it lands on is focused once it is current.
+    if (!rowEl(currentId.value)) scroller.value?.focus({ preventScroll: true });
     return;
   }
   if (startsEditing(event) && props.commit) {
@@ -421,7 +477,12 @@ async function finishEdit(then: "stay" | "next" | "prev" = "stay") {
 function cancelEdit() {
   closing = true;
   editing.value = null;
-  void nextTick(() => scroller.value?.focus({ preventScroll: true }));
+  void nextTick(() => focusCurrent());
+}
+
+/** Focus the current row, or the scroller when none is rendered. */
+function focusCurrent() {
+  (rowEl(editing.value?.id ?? props.selectedBookId) ?? rowEl(currentId.value) ?? scroller.value)?.focus({ preventScroll: true });
 }
 
 function onEditorKeydown(event: KeyboardEvent) {
@@ -430,7 +491,7 @@ function onEditorKeydown(event: KeyboardEvent) {
   event.preventDefault();
   event.stopPropagation();
   if (action === "cancel") cancelEdit();
-  else if (action === "save") void finishEdit("stay").then(() => scroller.value?.focus({ preventScroll: true }));
+  else if (action === "save") void finishEdit("stay").then(() => focusCurrent());
   else void finishEdit(action);
 }
 
@@ -467,7 +528,7 @@ function hint(column: BookColumn): string {
 
 <template>
   <div ref="scroller" class="table-scroll" tabindex="-1" @scroll.passive="onScroll" @keydown="onListKeydown">
-    <table class="book-table" :style="{ width: `${totalWidth}px`, minWidth: `${totalWidth}px` }">
+    <table class="book-table" role="grid" aria-label="Books" aria-multiselectable="true" :aria-rowcount="ids.length" :aria-colcount="columns.length + (selectMode ? 1 : 0)" :style="{ width: `${totalWidth}px`, minWidth: `${totalWidth}px` }">
       <colgroup>
         <col v-if="selectMode" :style="{ width: `${CHECK_COLUMN_WIDTH}px` }" />
         <col v-for="column in columns" :key="column.key" :style="{ width: `${column.width}px` }" />
@@ -484,6 +545,7 @@ function hint(column: BookColumn): string {
             :class="[{ sortable: !!column.sortKey, dragging: headerDrag?.active && headerDrag.key === column.key }, dropClass(ci)]"
             :title="column.tooltip"
             :aria-sort="sortIndicator(column) === '▲' ? 'ascending' : sortIndicator(column) === '▼' ? 'descending' : 'none'"
+            :aria-colindex="ci + 1 + (selectMode ? 1 : 0)"
             @pointerdown="onHeaderPointerDown($event, column)"
             @pointermove="onHeaderPointerMove"
             @pointerup="onHeaderPointerUp"
@@ -498,7 +560,13 @@ function hint(column: BookColumn): string {
             <span
               class="resize-handle"
               role="separator"
+              aria-orientation="vertical"
+              tabindex="0"
               :aria-label="`Resize ${column.label}`"
+              :aria-valuenow="column.width"
+              :aria-valuemin="MIN_COLUMN_WIDTH"
+              :aria-valuemax="MAX_COLUMN_WIDTH"
+              @keydown="onResizeKey($event, column)"
               @pointerdown="startResize($event, column)"
               @pointermove="onResizeMove"
               @pointerup="endResize"
@@ -516,7 +584,9 @@ function hint(column: BookColumn): string {
           <tr
             v-if="getBook(ids[i])"
             :data-id="ids[i]"
-            tabindex="0"
+            :tabindex="ids[i] === currentId ? 0 : -1"
+            :aria-rowindex="i + 1"
+            :aria-selected="selectedIds.has(ids[i]) || (!selectMode && selectedBookId === ids[i])"
             :draggable="editing?.id === ids[i] ? 'false' : 'true'"
             @dragstart="onRowDragStart(ids[i], $event)"
             :class="{ selected: selectedIds.has(ids[i]) || (!selectMode && selectedBookId === ids[i]) }"
@@ -555,7 +625,7 @@ function hint(column: BookColumn): string {
               <template v-else>{{ formatCell(getBook(ids[i])!, column) }}</template>
             </td>
           </tr>
-          <tr v-else class="placeholder" :data-id="ids[i]" aria-hidden="true">
+          <tr v-else class="placeholder" :data-id="ids[i]" :aria-rowindex="i + 1" aria-hidden="true">
             <td v-if="selectMode" class="check-col"></td>
             <td v-for="column in columns" :key="column.key" :style="{ width: `${column.width}px` }"><span class="ph"></span></td>
           </tr>
@@ -669,7 +739,7 @@ function hint(column: BookColumn): string {
   position: absolute;
   left: 2px;
   top: 100%;
-  z-index: 3;
+  z-index: var(--z-sticky);
   background: var(--danger);
   color: var(--bg);
   font-size: var(--fs-small);
@@ -725,6 +795,9 @@ function hint(column: BookColumn): string {
   touch-action: none;
 }
 
+.resize-handle:focus-visible {
+  background: var(--accent);
+}
 .resize-handle:hover {
   background: linear-gradient(to right, transparent 2px, var(--accent) 2px, var(--accent) 4px, transparent 4px);
 }

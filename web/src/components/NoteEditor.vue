@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import Dialog from "./Dialog.vue";
 import DOMPurify from "dompurify";
 import { computed, nextTick, ref, watch } from "vue";
 import { fileToDataUrl } from "../library/api";
@@ -118,69 +119,31 @@ async function save() {
 </script>
 
 <template>
-  <div class="backdrop" @click.self="emit('close')">
-    <div class="panel" role="dialog" aria-modal="true">
-      <button class="close" @click="emit('close')">✕</button>
-      <h3>{{ itemName }}</h3>
-      <p v-if="loading">Loading…</p>
-      <p v-else-if="error" class="error">{{ error }}</p>
-      <template v-else>
-        <div v-if="!editing" class="note-view" v-html="sanitizedHtml"></div>
-        <div v-else ref="editorEl" class="note-view note-edit" contenteditable="true"></div>
+  <Dialog :title="itemName" show-close size="md" @close="emit('close')">
+    <p v-if="loading">Loading…</p>
+    <p v-else-if="error" class="error">{{ error }}</p>
+    <template v-else>
+      <div v-if="!editing" class="note-view" v-html="sanitizedHtml"></div>
+      <div v-else ref="editorEl" class="note-view note-edit" contenteditable="true"></div>
 
-        <p v-if="saveError" class="error">{{ saveError }}</p>
+      <p v-if="saveError" class="error">{{ saveError }}</p>
 
-        <div class="actions">
-          <template v-if="!editing">
-            <button type="button" @click="startEditing">Edit note</button>
-          </template>
-          <template v-else>
-            <button type="button" @click="imageInput?.click()">Insert image…</button>
-            <input ref="imageInput" type="file" accept="image/*" class="hidden-file-input" @change="insertImage" />
-            <button type="button" class="read" :disabled="saving" @click="save">{{ saving ? "Saving…" : "Save" }}</button>
-            <button type="button" :disabled="saving" @click="editing = false">Cancel</button>
-          </template>
-        </div>
-      </template>
-    </div>
-  </div>
+      <div class="actions">
+        <template v-if="!editing">
+          <button type="button" @click="startEditing">Edit note</button>
+        </template>
+        <template v-else>
+          <button type="button" @click="imageInput?.click()">Insert image…</button>
+          <input ref="imageInput" type="file" accept="image/*" class="hidden-file-input" @change="insertImage" />
+          <button type="button" class="read" :disabled="saving" @click="save">{{ saving ? "Saving…" : "Save" }}</button>
+          <button type="button" :disabled="saving" @click="editing = false">Cancel</button>
+        </template>
+      </div>
+    </template>
+  </Dialog>
 </template>
 
 <style scoped>
-.backdrop {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.4);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 10;
-}
-.panel {
-  background: var(--bg);
-  border-radius: 6px;
-  padding: 1.5em;
-  max-width: 640px;
-  width: 90%;
-  max-height: 85vh;
-  overflow: auto;
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  gap: 1em;
-}
-.close {
-  position: absolute;
-  top: 0.5em;
-  right: 0.5em;
-  border: none;
-  background: none;
-  font-size: var(--fs-medium);
-  cursor: pointer;
-}
-h3 {
-  margin: 0;
-}
 .note-view {
   min-height: 6em;
   line-height: 1.5;
