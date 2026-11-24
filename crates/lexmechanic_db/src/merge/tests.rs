@@ -155,6 +155,57 @@ fn formats_only_mode_leaves_the_destinations_metadata_alone() {
     assert!(!l.exists(src));
 }
 
+/// The review lists every field that will change, and the preview is exactly what
+/// the real merge then does (languages and tags are both unions).
+#[test]
+fn the_dry_run_previews_every_metadata_change_the_merge_makes() {
+    let l = lib();
+    let dest = l.book("d", "pdf", "d", "Dest", "A");
+    let src = l.book("s", "epub", "s", "Src", "A");
+    let c = &l.cache;
+    c.set_field(dest, "languages", "eng").unwrap();
+    c.set_field(dest, "tags", "Rust, Nebula Award").unwrap();
+    c.set_field(src, "languages", "spa").unwrap();
+    c.set_field(src, "tags", "Textbook, Economics, Favorites").unwrap();
+    c.set_field(src, "publisher", "Pub").unwrap();
+
+    let dry = merge_books(c, dest, &[src], &MergeOptions { dry_run: true, ..Default::default() }).unwrap();
+    assert_eq!(l.field(dest, "tags"), "Rust, Nebula Award", "a dry run writes nothing");
+    assert_eq!(l.field(dest, "languages"), "eng");
+    assert_eq!(l.field(dest, "publisher"), "");
+    let mut changed = dry.metadata_changed.clone();
+    changed.sort();
+    assert_eq!(changed, vec!["languages", "publisher", "tags"], "{dry:?}");
+    let tags = dry.metadata_preview.iter().find(|m| m.field == "tags").unwrap();
+    assert_eq!((tags.before.as_str(), tags.after.as_str()), ("Rust, Nebula Award", "Rust, Nebula Award, Textbook, Economics, Favorites"));
+
+    let real = merge_books(c, dest, &[src], &opts(MergeMode::MergeAndDelete)).unwrap();
+    assert_eq!(real.metadata_changed, dry.metadata_changed);
+    assert_eq!(real.metadata_preview, dry.metadata_preview);
+    // Nothing the source had is lost: the tags are a union, as are the languages.
+    assert_eq!(l.field(dest, "tags"), tags.after);
+    assert_eq!(l.field(dest, "languages"), "eng, spa");
+}
+
+/// A dry run folds several sources against each other like the real thing, and
+/// leaves custom columns and the cover alone.
+#[test]
+fn the_dry_run_preview_matches_the_real_merge_for_several_sources() {
+    let l = lib();
+    let dest = l.book("d", "pdf", "d", "Unknown", "Unknown");
+    let s1 = l.book("s1", "epub", "s1", "Real Title", "Ada");
+    let s2 = l.book("s2", "mobi", "s2", "Other", "Bob");
+    l.cache.set_field(s1, "tags", "x").unwrap();
+    l.cache.set_field(s2, "tags", "x, y").unwrap();
+    l.cache.set_field(s1, "comments", "one").unwrap();
+    let dry = merge_books(&l.cache, dest, &[s1, s2], &MergeOptions { dry_run: true, ..Default::default() }).unwrap();
+    let real = merge_books(&l.cache, dest, &[s1, s2], &opts(MergeMode::MergeAndDelete)).unwrap();
+    assert_eq!(dry.metadata_changed, real.metadata_changed, "{dry:?} vs {real:?}");
+    assert_eq!(dry.metadata_preview, real.metadata_preview);
+    assert!(dry.metadata_changed.contains(&"title".to_string()) && dry.metadata_changed.contains(&"tags".to_string()));
+    assert_eq!(l.field(dest, "tags"), "x, y");
+}
+
 #[test]
 fn metadata_follows_calibres_rules() {
     let l = lib();

@@ -98,6 +98,7 @@ async fn handle(state: AppState, library_id: Option<String>, body: MergeBody) ->
         "mode": report.mode,
         "results": report.sources,
         "metadata_changed": report.metadata_changed,
+        "metadata_preview": report.metadata_preview,
         "cover_from": report.cover_from,
         "trashed": report.trashed(),
         "failed": failed,

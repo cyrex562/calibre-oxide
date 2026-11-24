@@ -738,9 +738,13 @@ fn run_prepare(cache: &Cache, options: &PipelineOptions, control: &JobControl, p
         persist_prepare_stage(cache, stage);
         let began = std::time::Instant::now();
         let outcome: anyhow::Result<Value> = match stage {
+            // Count-only: preparing for duplicate detection is not consent to
+            // import whatever else sits in the folder (notes, partial downloads).
+            // Importing untracked files stays the user's explicit action.
             "scan" => (|| {
-                let rescan = lexmechanic_db::scan::rescan_files(cache, SystemTime::now(), options, control)?;
-                let mut report = scan_report(&rescan, control.is_cancelled());
+                control.set_phase("walking");
+                let counted = lexmechanic_db::scan::count_untracked(cache, SystemTime::now(), usize::MAX / 4)?;
+                let mut report = json!({"added": [], "untracked": counted.untracked, "at_least": counted.at_least, "tracked": counted.tracked, "conclusive": counted.conclusive, "cancelled": control.is_cancelled()});
                 if params.defer_enrichment {
                     report["enrichment_deferred"] = json!(true);
                 } else if !control.is_cancelled() {
