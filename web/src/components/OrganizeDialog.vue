@@ -8,17 +8,19 @@ import Dialog from "./Dialog.vue";
 import { computed, onMounted, watch } from "vue";
 
 import { cancelLibraryJob } from "../library/api";
-import { describePlan, describeReport, draftProblem, planListIsPartial, type OrganizeController } from "../library/organize";
+import { describePlan, describeReport, describeRun, draftProblem, planListIsPartial, type OrganizeController } from "../library/organize";
 
-const props = defineProps<{ controller: OrganizeController; selectedIds: number[] }>();
+const props = withDefaults(defineProps<{ controller: OrganizeController; selectedIds: number[]; /** The books the list shows now, when a search or filter is active. */ searchIds?: number[]; searchActive?: boolean }>(), { searchIds: () => [], searchActive: false });
 const emit = defineEmits<{ close: []; changed: [] }>();
 
 const c = props.controller;
 const state = c.state;
 
 const busy = computed(() => state.phase === "planning" || state.phase === "running");
-const problem = computed(() => draftProblem(state.draft, props.selectedIds));
-const canRun = computed(() => state.phase === "planned" && state.plan !== null && state.plan.books > 0 && c.planIsCurrent(props.selectedIds));
+// The books a "selected" or "search" scope covers.
+const scopeIds = computed(() => (state.draft.scope === "search" ? props.searchIds : props.selectedIds));
+const problem = computed(() => draftProblem(state.draft, scopeIds.value));
+const canRun = computed(() => state.phase === "planned" && state.plan !== null && state.plan.books > 0 && c.planIsCurrent(scopeIds.value));
 
 // Any edit of the choices voids the preview.
 watch(
@@ -29,7 +31,7 @@ watch(
 onMounted(() => void c.loadRuns());
 
 async function preview() {
-  await c.preview(props.selectedIds);
+  await c.preview(scopeIds.value);
 }
 
 async function run() {
@@ -37,7 +39,7 @@ async function run() {
   if (!plan) return;
   const sure = await confirmDialog(`Move the files of ${plan.books.toLocaleString("en-US")} books (${plan.files.toLocaleString("en-US")} files) inside the library? Nothing is overwritten, and you can undo this run afterwards.`, { title: "Organize files", confirmLabel: "Move files" });
   if (!sure) return;
-  if (await c.run(props.selectedIds)) emit("changed");
+  if (await c.run(scopeIds.value)) emit("changed");
 }
 
 async function undo(runId: string) {
@@ -62,6 +64,7 @@ function cancelRun() {
     <fieldset class="organize-scope" :disabled="busy">
       <legend>Which books</legend>
       <label><input v-model="state.draft.scope" type="radio" value="selected" :disabled="selectedIds.length === 0" /> The {{ selectedIds.length.toLocaleString("en-US") }} selected book{{ selectedIds.length === 1 ? "" : "s" }}</label>
+      <label v-if="searchActive"><input v-model="state.draft.scope" type="radio" value="search" data-testid="scope-search" :disabled="searchIds.length === 0" /> The {{ searchIds.length.toLocaleString("en-US") }} book{{ searchIds.length === 1 ? "" : "s" }} in the current search or filter</label>
       <label><input v-model="state.draft.scope" type="radio" value="folder" /> Books in a folder</label>
       <input v-if="state.draft.scope === 'folder'" v-model="state.draft.pathPrefix" type="text" placeholder="Folder, relative to the library (e.g. Fiction/Old)" data-testid="path-prefix" />
       <label><input v-model="state.draft.scope" type="radio" value="all" /> Every book in the library</label>
@@ -104,7 +107,7 @@ function cancelRun() {
       <h4>Earlier runs</h4>
       <ul>
         <li v-for="r in state.runs.slice(0, 5)" :key="r.run_id">
-          {{ r.books.toLocaleString("en-US") }} book{{ r.books === 1 ? "" : "s" }} · <span class="hint">{{ new Date(r.created_at * 1000).toLocaleString() }}</span>
+          <span data-testid="run-line">{{ describeRun(r) }}</span> · <span class="hint">{{ new Date(r.created_at * 1000).toLocaleString() }}</span>
           <button type="button" :disabled="busy" @click="undo(r.run_id)">Undo</button>
         </li>
       </ul>

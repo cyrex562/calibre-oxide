@@ -153,7 +153,7 @@ describe("how things are described", () => {
   });
 
   it("summarises a run's report and its problems", () => {
-    expect(describeReport(report())).toBe("3 of 3 groups resolved · 4 books moved to the trash · about 1 KB freed");
+    expect(describeReport(report())).toBe("3 of 3 groups resolved · 4 books moved to the trash · about 1 KB in the Trash (freed once the Trash is emptied or expires)");
     const bad = describeReport(report({ groups_done: 2, cancelled: true, errors: [["abcdef123", "the keeper has no file"]] }));
     expect(bad).toContain("2 of 3 groups resolved");
     expect(bad).toContain("stopped early");
@@ -162,8 +162,8 @@ describe("how things are described", () => {
   });
 
   it("totals a plan in groups, books and gigabytes", () => {
-    expect(describePlanTotals({ groups: 12, books: 14, bytes_freed: 1.5 * 1024 ** 3 }, "keep_best_trash_rest")).toBe("12 groups · 14 books moved to the trash · about 1.5 GB freed");
-    expect(describePlanTotals({ groups: 1, books: 1, bytes_freed: 10 }, "merge_as_formats")).toBe("1 group · 1 book merged into their keepers · about 10 B freed");
+    expect(describePlanTotals({ groups: 12, books: 14, bytes_freed: 1.5 * 1024 ** 3 }, "keep_best_trash_rest")).toBe("12 groups · 14 books moved to the trash · about 1.5 GB to the Trash (freed once the Trash is emptied or expires)");
+    expect(describePlanTotals({ groups: 1, books: 1, bytes_freed: 10 }, "merge_as_formats")).toBe("1 group · 1 book merged into their keepers · about 10 B to the Trash (freed once the Trash is emptied or expires)");
   });
 
   it("says that delete goes to the trash and can be undone", () => {

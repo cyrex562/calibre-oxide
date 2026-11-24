@@ -1599,6 +1599,8 @@ export interface OrganizeRun {
   created_at: number;
   books: number;
   undone: boolean;
+  /** What the run was asked to do: a template, `move to Fiction` or `rename folder A to B`. Empty on an older server. */
+  template?: string;
 }
 
 function organizeBody(template: string, scope: OrganizeScope, extra: Record<string, unknown>): string {

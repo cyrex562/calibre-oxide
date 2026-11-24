@@ -9,7 +9,9 @@
 
 import { computed, ref } from "vue";
 
+import { keepAndTrashGroup, keepAndTrashLabel, offerRunUndo, trashedCopiesMessage } from "../library/dedupe";
 import { trashBooksFlow } from "../library/deleteFlow";
+import { confirmDialog } from "./dialogs/confirm";
 import type { DuplicateBook, DuplicateGroup, DuplicateReason, DuplicateSort } from "../library/api";
 import { ALL_REASONS, confidencePercent, evidenceLines, fileSummary, formatBytes, formatMtime, isImageOnlyScan, needsReview, pdfLine, primaryPath, reasonBadge, reasonLabel, deleteCopyWarnings } from "../library/duplicates";
 import { filtersActive } from "../library/duplicatesStore";
@@ -103,6 +105,43 @@ async function remove(group: DuplicateGroup, book: DuplicateBook) {
     }
   } catch (e) {
     actionError.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
+// Groups a one-click "keep this, trash the others" is running for.
+const working = ref<Set<string>>(new Set());
+
+function keeperTitle(group: DuplicateGroup): string {
+  return group.books.find((b) => b.book_id === store.keeperFor(group))?.title ?? "";
+}
+
+/**
+ * One click per group: keep the chosen (or suggested) copy and trash the rest,
+ * then the same Undo toast as every other de-dup action. A group that may not be
+ * the same book (a title match only) asks first.
+ */
+async function keepAndTrash(group: DuplicateGroup) {
+  const keeper = store.keeperFor(group);
+  if (keeper === null || !group.id || working.value.has(group.id)) return;
+  actionError.value = null;
+  const others = group.books.filter((b) => b.book_id !== keeper);
+  if (needsReview(group) && !(await confirmDialog(`These books are grouped on their titles and authors alone, so they may not be the same book. Keep “${keeperTitle(group)}” and move ${others.length === 1 ? "the other one" : `the other ${others.length}`} to the library Trash?`, { title: "Keep and trash", confirmLabel: "Keep and trash", danger: true }))) return;
+  working.value = new Set(working.value).add(group.id);
+  try {
+    const out = await keepAndTrashGroup(group, keeper);
+    // Undo brings the copies back, so the group is found again: rescan.
+    offerRunUndo(trashedCopiesMessage(out.trashedIds.length, keeperTitle(group)), out.runId, () => {
+      emit("changed");
+      void store.scan();
+    });
+    await store.resolved([group.id], out.trashedIds);
+    emit("changed");
+  } catch (e) {
+    actionError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    const next = new Set(working.value);
+    next.delete(group.id);
+    working.value = next;
   }
 }
 
@@ -203,7 +242,8 @@ function dismissedLabel(e: { members: { title: string }[] }): string {
           <span class="spacer"></span>
           <button type="button" data-testid="compare" :disabled="group.books.length > 8" :title="group.books.length > 8 ? 'Compare takes up to 8 books at once' : 'Look at these copies side by side: pages, files and metadata'" @click="emit('compare', group)">Compare…</button>
           <button type="button" data-testid="dismiss" title="Never suggest these books as duplicates of each other again" @click="dismiss(group)">Not duplicates</button>
-          <button type="button" class="primary" @click="merge(group)">Merge into…</button>
+          <button type="button" data-testid="merge" title="Combine these into one record, moving formats and missing details across. This cannot be undone." @click="merge(group)">Merge into…</button>
+          <button type="button" class="primary" data-testid="keep-and-trash" :disabled="!group.id || store.keeperFor(group) === null || working.has(group.id)" :title="`Keep “${keeperTitle(group)}” and move the other copies to the library Trash. You can undo it right after.`" @click="keepAndTrash(group)">{{ working.has(group.id ?? "") ? "Trashing…" : keepAndTrashLabel(group) }}</button>
         </header>
         <p v-if="keeperNote(group)" class="hint" data-testid="keeper-note">{{ keeperNote(group) }}</p>
 
@@ -214,7 +254,7 @@ function dismissedLabel(e: { members: { title: string }[] }): string {
               <span v-else class="no-cover">no cover</span>
             </div>
             <div class="dup-info">
-              <button type="button" class="link title" @click="emit('details', b.book_id)">{{ b.title }}</button>
+              <button type="button" class="link title" :title="b.title" @click="emit('details', b.book_id)"><span class="clamp">{{ b.title }}</span></button>
               <div class="hint">{{ b.authors.join(", ") }}</div>
               <div v-if="isKeeper(group, b)" class="dup-keep" :title="group.keeper_reason">{{ group.id && state.keepers[group.id] !== undefined ? "Your choice to keep" : "Suggested to keep" }}</div>
               <div class="path" :title="primaryPath(b)" data-testid="dup-path">{{ primaryPath(b) || "—" }}</div>
@@ -384,6 +424,24 @@ function dismissedLabel(e: { members: { title: string }[] }): string {
 .dup-info .title {
   font-weight: 600;
   text-align: left;
+  /* Not the global fixed button height: a long title takes its own lines. */
+  height: auto;
+  min-height: 0;
+  white-space: normal;
+  line-height: 1.3;
+}
+.dup-info .title .clamp {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+.dup-info .hint {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .link {
   background: none;

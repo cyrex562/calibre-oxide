@@ -13,6 +13,7 @@ import Dialog from "./Dialog.vue";
 import { computed, onMounted, watch } from "vue";
 
 import { cancelLibraryJob } from "../library/api";
+import { offerRunUndo } from "../library/dedupe";
 import type { ResolveAction } from "../library/api";
 import { ALL_REASONS, confidencePercent, describePlanTotals, formatBytes, isMetadataOnly, reasonLabel } from "../library/duplicates";
 import type { DuplicatesStore } from "../library/duplicatesStore";
@@ -84,6 +85,21 @@ async function undo(runId: string) {
   }
 }
 
+/**
+ * Closing after a run: the dialog's own "Undo this run" goes away with it, so
+ * the same Undo is offered as a toast, like every other de-dup action.
+ */
+function closeView() {
+  const r = state.report;
+  if (r && r.books_trashed > 0 && r.run_id) {
+    offerRunUndo(describeReport(r), r.run_id, () => {
+      emit("changed");
+      void props.store.scan();
+    });
+  }
+  emit("close");
+}
+
 function cancelRun() {
   // The job is cancelled from its own route; the dialog just stops waiting for more.
   if (state.jobId !== null) void cancelLibraryJob(state.jobId);
@@ -92,7 +108,7 @@ function cancelRun() {
 </script>
 
 <template>
-  <Dialog title="Resolve duplicates" :busy="busy" show-close size="lg" @close="emit('close')">
+  <Dialog title="Resolve duplicates" :busy="busy" show-close size="lg" @close="closeView">
     <p class="hint">Pick which kinds of match to trust. Nothing changes until you have seen the plan and run it.</p>
 
     <fieldset class="resolve-tiers" :disabled="busy">
@@ -101,7 +117,8 @@ function cancelRun() {
         <input type="checkbox" :checked="state.draft.tiers.includes(r)" :data-testid="`tier-${r}`" @change="toggleTier(r)" />
         {{ reasonLabel(r) }}
         <span class="hint">({{ (store.state.facets[r] ?? 0).toLocaleString("en-US") }})</span>
-        <span v-if="isMetadataOnly(r)" class="hint">— metadata only: two different books can match, so check before ticking</span>
+        <span v-if="isMetadataOnly(r) && r !== 'manual'" class="hint">— metadata only: two different books can match, so check before ticking</span>
+        <span v-if="r === 'manual'" class="hint">— books you marked as duplicates yourself, in Compare</span>
       </label>
     </fieldset>
 
@@ -175,7 +192,7 @@ function cancelRun() {
       </ul>
     </section>
     <template #footer>
-      <button type="button" :disabled="busy" @click="emit('close')">Close</button>
+      <button type="button" :disabled="busy" @click="closeView">Close</button>
       <button v-if="state.phase === 'running'" type="button" @click="cancelRun">Cancel</button>
       <button type="button" :disabled="busy || state.draft.tiers.length === 0" data-testid="preview-plan" @click="preview">{{ state.phase === "planning" ? "Working out the plan…" : "Preview plan…" }}</button>
       <button v-if="state.plan" type="button" class="primary" :disabled="busy || state.plan.totals.groups === 0" data-testid="run-plan" @click="run">

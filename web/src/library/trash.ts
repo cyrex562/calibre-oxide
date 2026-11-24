@@ -119,7 +119,14 @@ export function confirmEmpty(listing: Pick<TrashListing, "count" | "total_size">
 export function describeTrash(listing: TrashListing): string {
   if (listing.count === 0) return "The trash is empty.";
   const days = Math.round(listing.expire_after_seconds / 86400);
-  return `${listing.count} item${listing.count === 1 ? "" : "s"}, ${formatSize(listing.total_size)}. Items are deleted for good after ${days} day${days === 1 ? "" : "s"}.`;
+  const base = `${listing.count} item${listing.count === 1 ? "" : "s"}, ${formatSize(listing.total_size)}. Items are deleted for good after ${days} day${days === 1 ? "" : "s"}`;
+  // Books a duplicate run removed are kept far longer, so its Undo keeps working: say so, or a row's "179 days left" contradicts the header.
+  const longest = Math.max(0, ...listing.entries.map((e) => e.expires_at - e.deleted_at));
+  if (longest > listing.expire_after_seconds * 1.5) {
+    const long = Math.round(longest / 86400);
+    return `${base} (${long} days for books a duplicate run removed, so that run can still be undone).`;
+  }
+  return `${base}.`;
 }
 
 /** What a restore did, for the status line. */

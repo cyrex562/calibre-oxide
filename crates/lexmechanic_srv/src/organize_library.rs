@@ -20,7 +20,8 @@
 //!   plan, like organize; `dry_run: false` starts an `organize` job (202), and
 //!   with a `plan_fingerprint` is refused (409) if the plan changed.
 //! - `POST /unorganize-library/{library_id}` `{run_id}` -- an `undo_organize` job.
-//! - `GET /organize-runs/{library_id}` -- the runs that can be undone.
+//! - `GET /organize-runs/{library_id}` -- the runs that can be undone, each with
+//!   `template`: what it was asked to do (a template, `move to X`, `rename folder A to B`).
 //!
 //! The default template is `{author_sort}/{title}`; the scope is the selected
 //! ids, a search, or a folder prefix (relative to the library), else every book.
@@ -146,8 +147,26 @@ pub async fn unorganize(State(state): State<AppState>, Path(library_id): Path<St
 pub async fn runs(State(state): State<AppState>, Path(library_id): Path<String>) -> Result<Json<Value>, ServerError> {
     let cache = state.cache_for(Some(&library_id)).ok_or_else(|| ServerError::NotFound(format!("no library named {library_id:?}")))?;
     let library = cache.backend.library_path.clone();
-    let runs = tokio::task::spawn_blocking(move || organize::list_runs(&library)).await.map_err(internal)?;
-    Ok(Json(json!({"runs": runs.into_iter().map(|(run_id, created_at, books, undone)| json!({"run_id": run_id, "created_at": created_at, "books": books, "undone": undone})).collect::<Vec<_>>()})))
+    let runs = tokio::task::spawn_blocking(move || describe_runs(&library)).await.map_err(internal)?;
+    Ok(Json(json!({"runs": runs})))
+}
+
+/// How many of the newest runs are opened to say what each one did. The dialog
+/// shows a handful; the rest are listed bare rather than read from disk.
+const DESCRIBED_RUNS: usize = 20;
+
+/// The undoable runs, newest first. Each carries `template`: what the run was
+/// asked to do, as the plan labelled it (a template, `move to Fiction` or
+/// `rename folder Fiction to Novels`), so two runs of one book can be told apart.
+fn describe_runs(library: &std::path::Path) -> Vec<Value> {
+    organize::list_runs(library)
+        .into_iter()
+        .enumerate()
+        .map(|(i, (run_id, created_at, books, undone))| {
+            let template = if i < DESCRIBED_RUNS { organize::load_run(library, &run_id).map(|r| r.template).unwrap_or_default() } else { String::new() };
+            json!({"run_id": run_id, "created_at": created_at, "books": books, "undone": undone, "template": template})
+        })
+        .collect()
 }
 
 

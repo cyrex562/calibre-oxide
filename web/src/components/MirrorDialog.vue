@@ -10,18 +10,20 @@ import { computed, onMounted, watch } from "vue";
 
 import { cancelLibraryJob } from "../library/api";
 import type { MirrorAction } from "../library/api";
-import { conflictText, conflictsNote, describePlan, describeReport, describeScope, describeTarget, draftProblem, formatBytes, listIsPartial, MODE_LABELS, networkNote, reachableLabel, type MirrorController } from "../library/mirror";
+import { conflictText, conflictsNote, describePlan, needsConfirmation, describeReport, describeScope, describeTarget, draftProblem, formatBytes, listIsPartial, MODE_LABELS, networkNote, reachableLabel, type MirrorController } from "../library/mirror";
 
-const props = defineProps<{ controller: MirrorController; selectedIds: number[] }>();
+const props = withDefaults(defineProps<{ controller: MirrorController; selectedIds: number[]; /** The books the list shows now, when a search or filter is active. */ searchIds?: number[]; searchActive?: boolean }>(), { searchIds: () => [], searchActive: false });
 const emit = defineEmits<{ close: [] }>();
 
 const c = props.controller;
 const state = c.state;
 
 const busy = computed(() => state.phase === "planning" || state.phase === "running");
-const ids = computed(() => state.rememberedIds ?? props.selectedIds);
+// The books a "selected" or "search" scope covers (a refresh of an earlier copy reuses the ones it held).
+const scopeIds = computed(() => (state.draft.scope === "search" ? props.searchIds : props.selectedIds));
+const ids = computed(() => state.rememberedIds ?? scopeIds.value);
 const problem = computed(() => draftProblem(state.draft, ids.value));
-const canRun = computed(() => state.phase === "planned" && state.plan !== null && c.planIsCurrent(props.selectedIds));
+const canRun = computed(() => state.phase === "planned" && state.plan !== null && c.planIsCurrent(scopeIds.value));
 const isTravel = computed(() => state.draft.mode === "travel");
 
 // Any edit of the choices voids the preview.
@@ -40,16 +42,20 @@ const sections: { action: MirrorAction; title: string }[] = [
 ];
 
 async function preview() {
-  await c.preview(props.selectedIds);
+  await c.preview(scopeIds.value);
 }
 
 async function run() {
   const plan = state.plan;
   if (!plan) return;
-  const warn = state.draft.overwriteChanged ? " Files changed in the copy will be overwritten." : "";
-  const sure = await confirmDialog(`Copy ${plan.totals.copy_new.files + plan.totals.update.files} files (${formatBytes(plan.totals.bytes_to_copy)}) to ${plan.target}?${warn} Nothing in the library changes.`, { title: "Export a copy", confirmLabel: "Copy" });
-  if (!sure) return;
-  await c.run(props.selectedIds);
+  // Only adding files to a new place loses nothing, so the Copy click is the decision. Overwrites and removals are asked about.
+  if (needsConfirmation(plan, state.draft)) {
+    const warn = state.draft.overwriteChanged ? " Files changed in the copy will be overwritten." : "";
+    const gone = plan.totals.remove.files > 0 ? ` ${plan.totals.remove.files.toLocaleString("en-US")} file${plan.totals.remove.files === 1 ? "" : "s"} no longer in the library will be moved to .mirror-trash in the copy.` : "";
+    const sure = await confirmDialog(`Copy ${(plan.totals.copy_new.files + plan.totals.update.files).toLocaleString("en-US")} files (${formatBytes(plan.totals.bytes_to_copy)}) to ${plan.target}?${warn}${gone} Nothing in the library changes.`, { title: "Export a copy", confirmLabel: "Copy" });
+    if (!sure) return;
+  }
+  await c.run(scopeIds.value);
 }
 
 function cancelRun() {
@@ -61,7 +67,7 @@ const canBrowse = computed(() => c.canBrowse());
 
 <template>
   <Dialog title="Export a copy" :busy="busy" show-close size="lg" @close="emit('close')">
-    <p class="hint">Copies the library to another folder or drive. The library itself is not changed, and nothing in the copy is ever deleted: what is removed from it goes to .mirror-trash.</p>
+    <p class="hint">Copies the library to another folder or drive. The library itself is not changed, and nothing in the copy is deleted: files the library no longer has are moved to .mirror-trash inside the copy, never erased.</p>
 
     <section v-if="state.targets.length > 0" class="mirror-targets" aria-label="Earlier copies" data-testid="targets">
       <h4>Earlier copies</h4>
@@ -73,7 +79,7 @@ const canBrowse = computed(() => c.canBrowse());
           </div>
           <div class="hint">{{ t.mode === "travel" ? "Travel copy" : "Backup mirror" }} · {{ describeScope(t.scope) }} · {{ describeTarget(t) }}</div>
           <div class="row">
-            <button type="button" :disabled="busy || !t.reachable" data-testid="refresh-target" @click="c.refresh(t, props.selectedIds)">Refresh</button>
+            <button type="button" :disabled="busy || !t.reachable" data-testid="refresh-target" @click="c.refresh(t, scopeIds)">Refresh</button>
             <button type="button" :disabled="busy" data-testid="forget-target" title="Forget this folder. Its files stay where they are." @click="c.forget(t.target)">Forget</button>
           </div>
         </li>
@@ -100,7 +106,8 @@ const canBrowse = computed(() => c.canBrowse());
 
     <fieldset v-if="isTravel" class="mirror-scope" :disabled="busy">
       <legend>Which books</legend>
-      <label><input v-model="state.draft.scope" type="radio" value="selected" :disabled="ids.length === 0" /> The {{ ids.length.toLocaleString("en-US") }} selected book{{ ids.length === 1 ? "" : "s" }}</label>
+      <label><input v-model="state.draft.scope" type="radio" value="selected" :disabled="(state.rememberedIds ?? selectedIds).length === 0" /> The {{ (state.rememberedIds ?? selectedIds).length.toLocaleString("en-US") }} selected book{{ (state.rememberedIds ?? selectedIds).length === 1 ? "" : "s" }}</label>
+      <label v-if="searchActive"><input v-model="state.draft.scope" type="radio" value="search" data-testid="scope-search" :disabled="searchIds.length === 0" /> The {{ searchIds.length.toLocaleString("en-US") }} book{{ searchIds.length === 1 ? "" : "s" }} in the current search or filter</label>
       <label><input v-model="state.draft.scope" type="radio" value="folder" /> Books in a folder</label>
       <input v-if="state.draft.scope === 'folder'" v-model="state.draft.folderPrefix" type="text" placeholder="Folder, relative to the library (e.g. Fiction/Old)" data-testid="folder-prefix" />
       <label><input v-model="state.draft.scope" type="radio" value="all" /> Every book in the library</label>
@@ -108,7 +115,7 @@ const canBrowse = computed(() => c.canBrowse());
 
     <fieldset class="mirror-options" :disabled="busy">
       <legend>Options</legend>
-      <label><input v-model="state.draft.removeMissing" type="checkbox" data-testid="remove-missing" /> Remove files the library no longer has (moved to .mirror-trash in the copy)</label>
+      <label><input v-model="state.draft.removeMissing" type="checkbox" data-testid="remove-missing" /> Move files the library no longer has to .mirror-trash in the copy (nothing is deleted)</label>
       <label><input v-model="state.draft.overwriteChanged" type="checkbox" data-testid="overwrite-changed" /> Overwrite files changed in the copy</label>
       <p v-if="state.draft.overwriteChanged" class="warn" role="alert" data-testid="overwrite-warning">Edits made in the copy since the last refresh will be lost, including changes made to a travel copy's library on another computer.</p>
     </fieldset>
@@ -119,7 +126,7 @@ const canBrowse = computed(() => c.canBrowse());
 
     <section v-if="state.plan" class="mirror-plan" aria-label="Preview" data-testid="plan">
       <p role="status" data-testid="plan-summary">{{ describePlan(state.plan) }}</p>
-      <p class="hint">{{ state.plan.books.toLocaleString("en-US") }} book{{ state.plan.books === 1 ? "" : "s" }} · {{ state.plan.scope }} · {{ state.plan.new_target ? "a new copy" : "refreshing an earlier copy" }}</p>
+      <p class="hint">{{ state.plan.books.toLocaleString("en-US") }} book{{ state.plan.books === 1 ? "" : "s" }} in the copy · {{ state.plan.scope }} · {{ state.plan.new_target ? "a new copy" : "refreshing an earlier copy" }}</p>
       <p v-if="networkNote(state.plan)" class="hint" data-testid="network-note">{{ networkNote(state.plan) }}</p>
       <p v-if="conflictsNote(state.plan)" class="warn" role="alert" data-testid="conflicts-note">{{ conflictsNote(state.plan) }}</p>
       <p v-if="state.plan.missing_sources.count > 0" class="hint">{{ state.plan.missing_sources.count.toLocaleString("en-US") }} file{{ state.plan.missing_sources.count === 1 ? " the library lists is" : "s the library lists are" }} not on disk and cannot be copied.</p>

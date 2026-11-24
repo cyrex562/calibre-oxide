@@ -111,6 +111,7 @@ async function empty() {
             <th><input type="checkbox" :checked="selected.size === entries.length" aria-label="Select all" @change="toggleAll" /></th>
             <th>Title</th>
             <th>Author</th>
+            <th>From folder</th>
             <th>What</th>
             <th>Size</th>
             <th>Deleted</th>
@@ -122,6 +123,7 @@ async function empty() {
             <td><input type="checkbox" :checked="selected.has(entryId(entry))" :aria-label="`Select ${entry.title}`" @click.stop @change="toggle(entry)" /></td>
             <td class="trash-title" :title="entry.original_path">{{ entry.title }}</td>
             <td>{{ entry.authors }}</td>
+            <td class="trash-from" :title="entry.original_path">{{ entry.original_path || "—" }}</td>
             <td>{{ describeKind(entry) }}</td>
             <td class="num">{{ formatSize(entry.size) }}</td>
             <td>{{ formatDeleted(entry) }}</td>
@@ -166,6 +168,12 @@ async function empty() {
   overflow: hidden;
   text-overflow: ellipsis;
   font-weight: 600;
+}
+.trash-table .trash-from {
+  max-width: 24ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--fg-muted);
 }
 .trash-table .num {
   text-align: right;

@@ -36,7 +36,7 @@ export const MIN_OPTIONS: { value: DuplicateMin; label: string }[] = [
 ];
 
 const LABELS: Record<DuplicateReason, string> = {
-  manual: "your group",
+  manual: "groups I made by hand",
   content: "identical files",
   identifier: "same ISBN or identifier",
   title_author_exact: "same title and author",
@@ -56,7 +56,7 @@ export type BadgeTone = "certain" | "strong" | "likely" | "review";
 export function reasonBadge(reason: DuplicateReason): { text: string; tone: BadgeTone } {
   switch (reason) {
     case "manual":
-      return { text: "Your group", tone: "certain" };
+      return { text: "Marked by you", tone: "certain" };
     case "content":
       return { text: "Identical file", tone: "certain" };
     case "identifier":
@@ -133,15 +133,45 @@ export function formatBytes(n: number): string {
 /**
  * The label of the action that runs the fingerprint job, or null when there is
  * nothing for it to do. `pending` is what the job would analyse; PDFs with no
- * content hash yet need "Prepare for duplicate detection" first.
+ * content hash yet are read first by the same "Analyse library" job.
  */
 export function fingerprintAction(status: PdfScanStatus | undefined): { label: string; note: string | null } | null {
   if (!status || status.pending === 0) return null;
   const n = status.pending.toLocaleString("en-US");
   return {
-    label: `Fingerprint PDFs (${n} not yet analysed)`,
-    note: status.unhashed > 0 ? `${status.unhashed.toLocaleString("en-US")} more PDFs have no content hash yet; use “Prepare for duplicate detection” for those.` : null,
+    label: `Analyse library (${n} not yet analysed)`,
+    note: status.unhashed > 0 ? `${status.unhashed.toLocaleString("en-US")} more PDFs have no content hash yet; “Analyse library” reads those first.` : null,
   };
+}
+
+/**
+ * The one "prepare" button's label: it reads the files, analyses the PDFs'
+ * pages and looks for duplicates, so it says how much is still to analyse.
+ */
+export function analyseLabelFor(status: PdfScanStatus | undefined): string {
+  const todo = status ? status.pending + status.unhashed : 0;
+  return todo > 0 ? `Analyse library (${todo.toLocaleString("en-US")} PDF${todo === 1 ? "" : "s"} not yet analysed)` : "Analyse library";
+}
+
+const PDF_REASONS: DuplicateReason[] = ["pdf_resave", "pdf_ocr_variant", "pdf_text_match"];
+
+/**
+ * Said above the groups when every PDF has been analysed and no group rests on
+ * the pages, so an empty "same PDF, re-saved" kind is not mistaken for a step
+ * that was skipped. Null while there is more to analyse, while a filter hides
+ * groups, or when some page-based group exists.
+ */
+export function pageMatchNoteFor(status: PdfScanStatus | undefined, facets: Partial<Record<DuplicateReason, number>>, filtered = false): string | null {
+  if (!status || filtered || status.pending > 0 || status.unhashed > 0) return null;
+  const parts: string[] = [];
+  const found = PDF_REASONS.some((r) => (facets[r] ?? 0) > 0);
+  if (status.fingerprinted > 0 && !found) {
+    parts.push(`All ${status.fingerprinted.toLocaleString("en-US")} PDFs were analysed page by page and none matches another as a re-save or a scan and its OCR copy.`);
+  }
+  if (status.failed > 0) {
+    parts.push(`${status.failed.toLocaleString("en-US")} PDF${status.failed === 1 ? "" : "s"} could not be read (encrypted or damaged), so ${status.failed === 1 ? "it is" : "they are"} not matched by pages.`);
+  }
+  return parts.length > 0 ? parts.join(" ") : null;
 }
 
 /** Every reason, strongest first: the order the filter chips and the resolve dialog list them in. */
@@ -203,7 +233,7 @@ export function deleteCopyWarnings(group: Pick<DuplicateGroup, "books">, book: P
 export function describePlanTotals(totals: { groups: number; books: number; bytes_freed: number }, action: "keep_best_trash_rest" | "merge_as_formats"): string {
   const n = (v: number) => v.toLocaleString("en-US");
   const books = action === "merge_as_formats" ? `${n(totals.books)} book${totals.books === 1 ? "" : "s"} merged into their keepers` : `${n(totals.books)} book${totals.books === 1 ? "" : "s"} moved to the trash`;
-  return `${n(totals.groups)} group${totals.groups === 1 ? "" : "s"} · ${books} · about ${formatBytes(totals.bytes_freed)} freed`;
+  return `${n(totals.groups)} group${totals.groups === 1 ? "" : "s"} · ${books} · about ${formatBytes(totals.bytes_freed)} to the Trash (freed once the Trash is emptied or expires)`;
 }
 
 /** Whether the choice of which copy to keep is the server's (a PDF group) and so worth labelling. */

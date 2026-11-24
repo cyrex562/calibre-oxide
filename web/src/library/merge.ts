@@ -46,13 +46,13 @@ export function describeRecord(b: DuplicateBook): string {
 }
 
 export const MERGE_MODE_LABELS: Record<MergeMode, string> = {
-  merge_and_delete: "Merge into the destination and delete the others",
+  merge_and_delete: "Merge into the destination and remove the others",
   merge_keep_sources: "Merge into the destination, keep the others",
-  formats_only: "Move only the formats, delete the others",
+  formats_only: "Move only the formats, remove the others",
 };
 
 export const MERGE_MODE_NOTES: Record<MergeMode, string> = {
-  merge_and_delete: "Formats and missing metadata move to the destination. The other books are removed and their leftover files go to the library trash (Library → Trash…).",
+  merge_and_delete: "Formats and missing metadata move to the destination. The other books are removed from the library, and their leftover files go to the library trash (Library → Trash…). A merge cannot be undone as a whole: to keep one copy and be able to undo, use “Keep this, trash the others” instead.",
   merge_keep_sources: "Formats and missing metadata are copied to the destination. The other books are not changed or deleted.",
   formats_only: "Only formats move. The destination's metadata is not touched, and the other books are removed with their leftover files going to the library trash.",
 };

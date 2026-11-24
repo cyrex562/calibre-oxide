@@ -51,7 +51,7 @@ import { buildMenuSpec } from "../library/actions";
 import { addChosenDuplicates, describeImport, importFiles, type PendingDuplicate } from "../library/importFiles";
 import { activeFilters, classifyEmpty, type ActiveFilter } from "../library/emptyState";
 import { draftCount } from "../library/metadataForm";
-import { trashBooksFlow } from "../library/deleteFlow";
+import { showToast, trashBooksFlow } from "../library/deleteFlow";
 import DeleteConfirm from "./DeleteConfirm.vue";
 import UndoToast from "./UndoToast.vue";
 import { isTauri, tauriInvoke } from "../tauri";
@@ -645,12 +645,16 @@ function openCompareForSelection() {
   }
   void compareController.open(ids);
 }
+// "The books in the current search": what Organize, Export a copy and Fix titles can be limited to.
+// The ids are the list's own, so every kind of filter (a search, a virtual library, a category, the marked books) counts.
+const searchScopeIds = computed(() => win.ids.value);
+const searchScopeActive = computed(() => !ftsMode.value && activeFilters({ query: activeQuery.value, virtualLibrary: vl.value, showMarkedOnly: showMarkedOnly.value }).length > 0);
 const organizeController = createOrganizeController();
 const organizeOpen = ref(false);
 /** Organize files: the selected books when there are any (select mode), else the open book is not assumed. */
 const organizeSelection = computed(() => scope.ids.value);
 async function openOrganize(prefill?: { template: string; scope: "selected" | "all" }) {
-  organizeController.open(organizeSelection.value.length);
+  organizeController.open(organizeSelection.value.length, searchScopeActive.value);
   if (prefill) {
     organizeController.state.draft.template = prefill.template;
     organizeController.state.draft.scope = prefill.scope === "selected" && organizeSelection.value.length > 0 ? "selected" : "all";
@@ -681,7 +685,7 @@ function applyNaming(template: string, scope: "selected" | "all") {
 const mirrorController = createMirrorController();
 const mirrorOpen = ref(false);
 function openMirror() {
-  mirrorController.open(organizeSelection.value.length);
+  mirrorController.open(organizeSelection.value.length, searchScopeActive.value);
   mirrorOpen.value = true;
 }
 // Fix titles: find junk titles, suggest clean ones, set / embed / rename in one
@@ -692,7 +696,8 @@ const retitleOpen = ref(false);
 const retitleSelection = scope.ids;
 function openRetitle(scope: "all" | "selected") {
   if (scope === "selected" && retitleSelection.value.length === 0) return;
-  retitleController.open(scope);
+  // From the Library menu ("every book"), a search or filter that is on means the books in it.
+  retitleController.open(scope === "all" && searchScopeActive.value ? "search" : scope);
   retitleOpen.value = true;
   // Its rename template starts from the library's naming convention.
   void conventionFileTemplate().then((t) => {
@@ -759,6 +764,8 @@ async function openMergeForSelection() {
 
 async function onMerged(description: string) {
   mergeDone.value = description;
+  // A merge is not undoable (the merged-away records are deleted), so the toast says so rather than offering an Undo.
+  showToast(`${description} A merge cannot be undone.`, undefined, 15000);
   mergeOpen.value = false;
   selectedIds.value = new Set();
   await libraryChanged();
@@ -1912,10 +1919,10 @@ const helpOpen = ref(false);
 
     <ResolveDialog v-if="duplicatesOpen && resolveOpen" :store="dupStore" :controller="resolveController" @close="resolveOpen = false" @changed="onDuplicatesChanged" />
     <CompareDuplicates v-if="compareController.state.open" :controller="compareController" @close="compareController.close()" />
-    <MirrorDialog v-if="mirrorOpen" :controller="mirrorController" :selected-ids="organizeSelection" @close="mirrorOpen = false" />
+    <MirrorDialog v-if="mirrorOpen" :controller="mirrorController" :selected-ids="organizeSelection" :search-ids="searchScopeIds" :search-active="searchScopeActive" @close="mirrorOpen = false" />
     <NamingDialog v-if="namingOpen" :controller="namingController" :sample-ids="namingSampleIds" :selected-count="organizeSelection.length" @close="namingOpen = false" @apply="applyNaming" />
-    <OrganizeDialog v-if="organizeOpen" :controller="organizeController" :selected-ids="organizeSelection" @close="organizeOpen = false" @changed="onDuplicatesChanged" />
-    <RetitleDialog v-if="retitleOpen" :controller="retitleController" :selected-ids="retitleSelection" @close="retitleOpen = false" @changed="onRetitleChanged" />
+    <OrganizeDialog v-if="organizeOpen" :controller="organizeController" :selected-ids="organizeSelection" :search-ids="searchScopeIds" :search-active="searchScopeActive" @close="organizeOpen = false" @changed="onDuplicatesChanged" />
+    <RetitleDialog v-if="retitleOpen" :controller="retitleController" :selected-ids="retitleSelection" :search-ids="searchScopeIds" :search-active="searchScopeActive" @close="retitleOpen = false" @changed="onRetitleChanged" />
 
     <MergeBooksDialog v-if="mergeOpen" :books="mergeBooksList" :dest="mergeDest" @close="mergeOpen = false" @merged="onMerged" />
 

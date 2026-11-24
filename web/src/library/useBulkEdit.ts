@@ -18,7 +18,8 @@ import { computed, reactive, ref, type Ref } from "vue";
 import type { BookSummary, FieldMetaEntry } from "./types";
 import { setFields, setFieldsBatch } from "./api";
 import { runBulkEdit as runBatchedEdit, type BulkItem } from "./bulkBatch";
-import { changesFor, isEmptySpec, validateSpec, type BulkEditSpec } from "./bulkEdit";
+import { changesFor, describeBulkResult, inverseChanges, isEmptySpec, validateSpec, type BulkEditSpec } from "./bulkEdit";
+import { showToast } from "./deleteFlow";
 
 export interface BulkEditDeps {
   selectedIds: Ref<Set<number>>;
@@ -46,7 +47,7 @@ export function emptySpec(): BulkEditSpec {
   };
 }
 
-export function useBulkEdit({ selectedIds, selectMode, fieldMetadata, win, onChanged }: BulkEditDeps) {
+export function useBulkEdit({ selectedIds, fieldMetadata, win, onChanged }: BulkEditDeps) {
   const open = ref(false);
   const busy = ref(false);
   const errors = ref<string[]>([]);
@@ -105,6 +106,9 @@ export function useBulkEdit({ selectedIds, selectMode, fieldMetadata, win, onCha
     cancelled = false;
     // What each book needs is worked out here, per book, before anything is sent.
     const items: BulkItem[] = [];
+    // What each written book held before, so the edit can be undone: the old value of exactly the fields written.
+    const before: BulkItem[] = [];
+    let lostFields = new Set<string>();
     for (const id of ids) {
       const current = win.getById(id);
       if (!current) {
@@ -113,8 +117,12 @@ export function useBulkEdit({ selectedIds, selectMode, fieldMetadata, win, onCha
       }
       try {
         const changes = changesFor(current, edit);
-        if (changes) items.push({ id, changes });
-        else skipped += 1;
+        if (changes) {
+          items.push({ id, changes });
+          const inverse = inverseChanges(current, changes);
+          if (Object.keys(inverse.changes).length > 0) before.push({ id, changes: inverse.changes });
+          lostFields = new Set([...lostFields, ...inverse.lost]);
+        } else skipped += 1;
       } catch (e) {
         errors.value.push(`Book ${id}: ${e instanceof Error ? e.message : String(e)}`);
       }
@@ -134,14 +142,41 @@ export function useBulkEdit({ selectedIds, selectMode, fieldMetadata, win, onCha
     summary.value = `Updated ${changed} book(s)${skipped ? `, ${skipped} already matched` : ""}${errors.value.length ? `, ${errors.value.length} failed` : ""}${stopped}.`;
 
     if (errors.value.length === 0 && pool.notStarted === 0) {
+      // The selection stays: the same books are often edited again (a tag, then a series), and a toast is the feedback.
       open.value = false;
-      selectMode.value = false;
-      selectedIds.value = new Set();
       spec.value = emptySpec();
       applyRating.value = false;
       applySeriesIndex.value = false;
     }
     await onChanged();
+    if (changed > 0) announce(describeBulkResult(edit, changed), before, pool.errors, lostFields);
+  }
+
+  /**
+   * The toast after an edit: what was done, with an Undo that writes the old
+   * values back through the same batch route. Books that failed are left out.
+   */
+  function announce(message: string, before: BulkItem[], failures: string[], lost: Set<string>) {
+    const failed = new Set(failures.map((f) => /^Book (\d+):/.exec(f)?.[1]).filter((id): id is string => !!id).map(Number));
+    const restore = before.filter((b) => !failed.has(b.id));
+    if (restore.length === 0) {
+      showToast(message, undefined, 15000);
+      return;
+    }
+    const note = lost.size > 0 ? ` (${[...lost].join(", ")} cannot be unset, so Undo leaves ${lost.size === 1 ? "it" : "them"} as edited)` : "";
+    showToast(
+      message,
+      {
+        label: "Undo",
+        run: async () => {
+          const back = await runBatchedEdit(restore, { sendBatch: setFieldsBatch, sendOne: setFields });
+          await onChanged();
+          if (back.errors.length > 0) throw new Error(`Put back ${back.updated} of ${restore.length}: ${back.errors[0]}`);
+          return `Put back the old values on ${back.updated.toLocaleString("en-US")} ${back.updated === 1 ? "book" : "books"}${note}`;
+        },
+      },
+      20000,
+    );
   }
 
   // Reactive, so a template (and a component given this as a prop) reads and
