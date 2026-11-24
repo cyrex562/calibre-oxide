@@ -105,6 +105,76 @@ fn the_layout_is_calibres_and_the_metadata_is_the_files_own() {
     assert_eq!(snapshot(src.path()), before, "the source tree was modified");
 }
 
+#[test]
+fn a_book_whose_file_has_no_date_is_not_published_on_the_day_it_was_imported() {
+    let (_lib, cache) = library();
+    let src = tempfile::tempdir().unwrap();
+    write(&src.path().join("dune.epub"), &epub("Dune", "Frank Herbert", "d1"));
+    write(&src.path().join("dated.epub"), &epub_with("Dated", "Some One", "d2", "<dc:date>1999-05-06T00:00:00+00:00</dc:date>"));
+
+    let report = run(&cache, src.path(), &ImportOptions::default());
+    assert_eq!(report.books_added, 2, "{report:?}");
+
+    let pubdate = |title: &str| {
+        let id = cache.all_book_ids().unwrap().into_iter().find(|id| cache.field_for(*id, "title").unwrap().as_deref() == Some(title)).unwrap();
+        cache.field_for(id, "pubdate").unwrap().unwrap()
+    };
+    assert!(pubdate("Dune").starts_with("0101-01-01"), "no date in the file, so none: {}", pubdate("Dune"));
+    assert!(pubdate("Dated").starts_with("1999-05-06"), "the file's own date is kept: {}", pubdate("Dated"));
+}
+
+#[test]
+fn keep_structure_puts_each_book_where_it_was_and_never_replaces() {
+    let (lib, cache) = library();
+    let src = tempfile::tempdir().unwrap();
+    write(&src.path().join("Fiction/SciFi/Dune.epub"), &epub("Dune", "Frank Herbert", "k1"));
+    write(&src.path().join("Fiction/SciFi/Dune.pdf"), b"%PDF dune");
+    write(&src.path().join("Tech/Programming/Rust/Book.pdf"), b"%PDF rust");
+    write(&src.path().join("Top.pdf"), b"%PDF top");
+    // A file already at the destination, which an import must not touch.
+    write(&lib.path().join("Tech/Programming/Rust/Book.pdf"), b"already here");
+    let before = snapshot(src.path());
+
+    let report = run(&cache, src.path(), &ImportOptions { keep_structure: true, ..Default::default() });
+
+    assert_eq!(report.books_added, 3, "{report:?}");
+    let by_title = |t: &str| cache.all_book_ids().unwrap().into_iter().find(|id| cache.field_for(*id, "title").unwrap().as_deref() == Some(t)).unwrap_or_else(|| panic!("no {t}"));
+    let dune = by_title("Dune");
+    assert_eq!(cache.field_for(dune, "path").unwrap().as_deref(), Some("Fiction/SciFi"));
+    assert!(lib.path().join("Fiction/SciFi/Dune.epub").is_file());
+    assert!(lib.path().join("Fiction/SciFi/Dune.pdf").is_file(), "both formats of the book, side by side");
+    let mut names = cache.format_file_names(dune).unwrap();
+    names.sort();
+    assert_eq!(names, vec![("EPUB".to_string(), "Dune".to_string()), ("PDF".to_string(), "Dune".to_string())]);
+
+    let book = by_title("Book");
+    assert_eq!(cache.field_for(book, "path").unwrap().as_deref(), Some("Tech/Programming/Rust"));
+    assert_eq!(fs::read(lib.path().join("Tech/Programming/Rust/Book.pdf")).unwrap(), b"already here", "the file that was there is untouched");
+    assert_eq!(fs::read(lib.path().join("Tech/Programming/Rust/Book (1).pdf")).unwrap(), b"%PDF rust");
+
+    let top = by_title("Top");
+    assert_eq!(cache.field_for(top, "path").unwrap().as_deref(), Some(""), "a file at the source's top is at the library's top");
+    assert_eq!(fs::read(lib.path().join("Top.pdf")).unwrap(), b"%PDF top");
+    assert_eq!(snapshot(src.path()), before, "the source is only read");
+
+    // The hash on record is the copy's, and the folders show in the tree.
+    let (hash, _) = cache.checksums().recorded_identity(dune, "format", "PDF").unwrap();
+    assert_eq!(hash.as_deref(), Some(blake3::hash(b"%PDF dune").to_hex().as_str()));
+    let tree = crate::library_folders::list(&cache).unwrap();
+    let paths: Vec<&str> = tree.folders.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, vec!["Fiction", "Fiction/SciFi", "Tech", "Tech/Programming", "Tech/Programming/Rust"]);
+}
+
+#[test]
+fn kept_folder_names_are_safe_and_stay_inside_the_library() {
+    let src = Path::new("/src");
+    assert_eq!(kept_folder(src, Path::new("/src")), "");
+    assert_eq!(kept_folder(src, Path::new("/src/A/B")), "A/B");
+    assert_eq!(kept_folder(src, Path::new("/src/What? Why*/x.")), "What_ Why_/x");
+    assert_eq!(kept_folder(src, Path::new("/src/CON/.lexmechanic")), "_CON/_.lexmechanic");
+    assert_eq!(kept_folder(src, Path::new("/elsewhere")), "");
+}
+
 fn nested_tree(root: &Path) {
     write(&root.join("x.pdf"), b"%PDF x");
     write(&root.join("sub/a.pdf"), b"%PDF a");

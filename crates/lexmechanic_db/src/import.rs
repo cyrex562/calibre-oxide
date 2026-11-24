@@ -131,12 +131,39 @@ pub struct ImportOptions {
     pub policy: DuplicatePolicy,
     /// Descend into subfolders. Off: only the folder itself.
     pub recursive: bool,
+    /// Keep the source's folders: a book from `<source>/Fiction/SciFi/Dune.pdf`
+    /// goes to `<library>/Fiction/SciFi/Dune.pdf` instead of calibre's
+    /// `Author/Title (id)/Title - Author.pdf`. A name already taken there gets a
+    /// number (`Dune (1).pdf`); nothing is replaced.
+    pub keep_structure: bool,
 }
 
 impl Default for ImportOptions {
     fn default() -> Self {
-        ImportOptions { mode: ImportMode::default(), policy: DuplicatePolicy::default(), recursive: true }
+        ImportOptions { mode: ImportMode::default(), policy: DuplicatePolicy::default(), recursive: true, keep_structure: false }
     }
+}
+
+/// The folder of `dir` under `source`, as a library-relative path: each part
+/// made safe as a folder name (characters a platform refuses become `_`, a
+/// trailing dot or space goes, a reserved name gets a `_`), `""` for `source`
+/// itself. A part that would be the library's own state folder is renamed too.
+pub fn kept_folder(source: &Path, dir: &Path) -> String {
+    let Ok(rel) = dir.strip_prefix(source) else { return String::new() };
+    let mut parts: Vec<String> = Vec::new();
+    for part in rel.components().filter_map(|c| c.as_os_str().to_str()) {
+        let mut name: String = part.chars().map(|c| if c.is_control() || "<>:\"|?*/\\".contains(c) { '_' } else { c }).collect();
+        name = name.trim().trim_end_matches(['.', ' ']).to_string();
+        if name.is_empty() {
+            name = "_".to_string();
+        }
+        let lower = name.to_lowercase();
+        if lexmechanic_utils::filenames::is_windows_reserved_name(&name) || lower == LIBRARY_HANDLE_DIR_NAME.to_lowercase() || lower == crate::constants::LEGACY_LIBRARY_HANDLE_DIR_NAME || lower == ".caltrash" {
+            name = format!("_{name}");
+        }
+        parts.push(name.chars().take(120).collect());
+    }
+    parts.join("/")
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -589,7 +616,7 @@ pub fn import_folder(cache: &Cache, source: &Path, options: &ImportOptions, pipe
                 break;
             }
             let staging = staging_root.join(batch_no.to_string());
-            let done = import_batch(cache, batch, &staging, options, pipeline, control, &mut title_index, &mut run_hashes, &mut report)?;
+            let done = import_batch(cache, batch, &source, &staging, options, pipeline, control, &mut title_index, &mut run_hashes, &mut report)?;
             let _ = fs::remove_dir_all(&staging);
             if !done {
                 break;
@@ -612,6 +639,7 @@ pub fn import_folder(cache: &Cache, source: &Path, options: &ImportOptions, pipe
 fn import_batch(
     cache: &Cache,
     batch: &[Group],
+    source: &Path,
     staging: &Path,
     options: &ImportOptions,
     pipeline: &PipelineOptions,
@@ -808,7 +836,11 @@ fn import_batch(
             files.push(ImportFile { staged: staged.path.clone(), ext: file.ext.clone(), size: staged.digest.size as i64, hash: staged.digest.hash.clone() });
             sources.push((plan.group, *fi));
         }
-        items.push(ImportItem { metadata: mi, files });
+        let placement = options.keep_structure.then(|| {
+            let first = &g.files[plan.keep[0].0];
+            crate::cache::ImportPlacement { folder: kept_folder(source, &first.dir), stem: first.stem.clone() }
+        });
+        items.push(ImportItem { metadata: mi, files, placement });
         item_sources.push(sources);
     }
 

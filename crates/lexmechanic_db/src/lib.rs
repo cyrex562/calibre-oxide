@@ -41,6 +41,8 @@ pub(crate) mod run_journal;
 mod field_feed_tests;
 #[cfg(test)]
 mod integrity_tests;
+#[cfg(test)]
+mod t26a_tests;
 pub mod formatter_functions;
 pub mod fts;
 pub mod lazy;

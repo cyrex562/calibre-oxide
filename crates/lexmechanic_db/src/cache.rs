@@ -202,6 +202,10 @@ thread_local! {
     pub(crate) static FORCE_TRASH_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// calibre's "undefined date" (`UNDEFINED_DATE`, 0101-01-01 UTC): what a
+/// book's `pubdate` holds when nothing says when it was published.
+pub const UNDEFINED_DATE: &str = "0101-01-01T00:00:00+00:00";
+
 /// What [`Cache::insert_book_in_tx`] created.
 pub(crate) struct InsertedBook {
     pub id: i32,
@@ -244,6 +248,31 @@ pub struct ImportFile {
 pub struct ImportItem {
     pub metadata: MetaInformation,
     pub files: Vec<ImportFile>,
+    /// Where to put the files instead of calibre's `Author/Title (id)`:
+    /// "keep the source folder structure" (see [`crate::import`]).
+    pub placement: Option<ImportPlacement>,
+}
+
+/// A fixed place for an imported book's files: the folder it had in the source
+/// (relative to the library root, `""` for the root itself) and the file name
+/// it had there, minus the extension.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportPlacement {
+    pub folder: String,
+    pub stem: String,
+}
+
+/// `stem`, or `stem (1)`, `stem (2)`, ... -- the first name under which none of
+/// `exts` exists in `dir` yet. An imported file never replaces one already there.
+fn unique_stem(dir: &Path, stem: &str, exts: &[&str]) -> String {
+    let mut n = 0u32;
+    loop {
+        let candidate = if n == 0 { stem.to_string() } else { format!("{stem} ({n})") };
+        if exts.iter().all(|e| !dir.join(format!("{candidate}.{e}")).exists()) {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 /// A book [`Cache::import_books_batch`] created.
@@ -1100,7 +1129,13 @@ impl Cache {
                     metadata.uuid = None;
                     let inserted = Self::insert_book_in_tx(&sp, &metadata, "", None)?;
                     let author = metadata.authors.first().map(String::as_str).unwrap_or("Unknown");
-                    let (folder, stem) = import_names(inserted.id, &metadata.title, author);
+                    let (folder, stem) = match &item.placement {
+                        Some(place) => {
+                            let exts: Vec<&str> = item.files.iter().map(|f| f.ext.as_str()).collect();
+                            (place.folder.clone(), unique_stem(&library.join(&place.folder), &place.stem, &exts))
+                        }
+                        None => import_names(inserted.id, &metadata.title, author),
+                    };
                     sp.execute("UPDATE books SET path = ?1 WHERE id = ?2", (&folder, inserted.id))?;
 
                     let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
@@ -1135,10 +1170,13 @@ impl Cache {
                             for (from, to) in moved.iter().rev() {
                                 let _ = handle.rename_atomic(to, from);
                             }
-                            let dir = library.join(&folder);
-                            let _ = fs::remove_dir(&dir);
-                            if let Some(parent) = dir.parent() {
-                                let _ = fs::remove_dir(parent);
+                            // A folder the source had is not ours to remove.
+                            if item.placement.is_none() {
+                                let dir = library.join(&folder);
+                                let _ = fs::remove_dir(&dir);
+                                if let Some(parent) = dir.parent() {
+                                    let _ = fs::remove_dir(parent);
+                                }
                             }
                             return Err(e);
                         }
@@ -1150,7 +1188,7 @@ impl Cache {
                             ops.push(crate::change_log::ChangeOp::FormatSet { book: uuid.clone(), format: format.clone(), name: stem.clone(), size: *size, hash: Some(hash.clone()) });
                         }
                     }
-                    let files = item.files.iter().map(|f| format!("{folder}/{stem}.{}", f.ext)).collect();
+                    let files = item.files.iter().map(|f| if folder.is_empty() { format!("{stem}.{}", f.ext) } else { format!("{folder}/{stem}.{}", f.ext) }).collect();
                     Ok(Done { book: ImportedBook { id: inserted.id, uuid: inserted.uuid, folder, files }, ops })
                 })();
                 outcomes.push(one);
@@ -1355,13 +1393,19 @@ impl Cache {
         // a rebuild gave every book the schema's default timestamps, so a
         // real publication date from the book's own metadata was lost.
         let timestamp = metadata.timestamp.unwrap_or_else(chrono::Utc::now).to_rfc3339();
-        let pubdate = metadata.pubdate.unwrap_or_else(chrono::Utc::now).to_rfc3339();
+        // A book whose metadata carries no publication date has none, as
+        // in calibre: it is stored as the "undefined date" (0101-01-01),
+        // which every view shows as empty. It used to default to the
+        // import time, which made every imported book look "published"
+        // the day it was added.
+        let pubdate = metadata.pubdate.map(|d| d.to_rfc3339()).unwrap_or_else(|| UNDEFINED_DATE.to_string());
+        let modified = Self::now_stamp();
 
         let book_id = match taken_id {
             Some(id) => {
                 tx.execute(
-                    "INSERT INTO books (id, title, author_sort, path, has_cover, timestamp, pubdate, series_index)
-                     VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7)",
+                    "INSERT INTO books (id, title, author_sort, path, has_cover, timestamp, pubdate, series_index, last_modified)
+                     VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8)",
                     (
                         id,
                         &metadata.title,
@@ -1370,14 +1414,15 @@ impl Cache {
                         &timestamp,
                         &pubdate,
                         metadata.series_index,
+                        &modified,
                     ),
                 )?;
                 id
             }
             None => {
                 tx.execute(
-                    "INSERT INTO books (title, author_sort, path, has_cover, timestamp, pubdate, series_index)
-                     VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)",
+                    "INSERT INTO books (title, author_sort, path, has_cover, timestamp, pubdate, series_index, last_modified)
+                     VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7)",
                     (
                         &metadata.title,
                         author_name,
@@ -1385,6 +1430,7 @@ impl Cache {
                         &timestamp,
                         &pubdate,
                         metadata.series_index,
+                        &modified,
                     ),
                 )?;
                 tx.last_insert_rowid() as i32
@@ -1460,11 +1506,13 @@ impl Cache {
             fields.push(("sort", sort.to_string()));
         }
         let mut ops = vec![ChangeOp::BookAdded { book: uuid.clone() }];
+        // `authors` first: replaying it re-derives `author_sort`, so the
+        // explicit `author_sort` has to come after it to be the one kept.
+        if !metadata.authors.is_empty() {
+            ops.push(ChangeOp::FieldSet { book: uuid.clone(), field: "authors".to_string(), value: Some(metadata.authors.join(" & ")) });
+        }
         for (field, value) in fields {
             ops.push(ChangeOp::FieldSet { book: uuid.clone(), field: field.to_string(), value: Some(value) });
-        }
-        if !metadata.authors.is_empty() {
-            ops.push(ChangeOp::FieldSet { book: uuid, field: "authors".to_string(), value: Some(metadata.authors.join(" & ")) });
         }
         ops
     }
@@ -2255,6 +2303,7 @@ impl Cache {
             "INSERT INTO books_authors_link (book, author) VALUES (?1, ?2)",
             (book_id, author_id),
         )?;
+        Self::touch_last_modified_in(&tx, book_id)?;
 
         tx.commit()?;
         drop(conn);
@@ -2269,8 +2318,10 @@ impl Cache {
         // same string, exactly as the statements above do.
         let (title, author) = (title.to_string(), author.to_string());
         self.record_for_book(book_id, |book| crate::change_log::ChangeOp::FieldSet { book, field: "title".to_string(), value: Some(title) });
-        self.record_for_book(book_id, |book| crate::change_log::ChangeOp::FieldSet { book, field: "author_sort".to_string(), value: Some(author.clone()) });
-        self.record_for_book(book_id, |book| crate::change_log::ChangeOp::FieldSet { book, field: "authors".to_string(), value: Some(author) });
+        // `authors` first, then `author_sort`: replaying `authors`
+        // re-derives the sort, and the explicit one must be applied last.
+        self.record_for_book(book_id, |book| crate::change_log::ChangeOp::FieldSet { book, field: "authors".to_string(), value: Some(author.clone()) });
+        self.record_for_book(book_id, |book| crate::change_log::ChangeOp::FieldSet { book, field: "author_sort".to_string(), value: Some(author) });
         Ok(())
     }
 
@@ -2936,8 +2987,10 @@ impl Cache {
     ///   `allow_case_change` merge-on-rename behavior.
     /// - `identifiers` takes the same `"type:val,type:val"` string
     ///   [`Cache::field_for`] returns and replaces the entire set.
-    /// - No dirtying/notification, no composite-field recalculation
-    ///   (e.g. setting `authors` does not recompute `author_sort`).
+    /// - No dirtying/notification, no composite-field recalculation,
+    ///   apart from two: setting `authors` re-derives `author_sort` from
+    ///   the authors' own sort strings (an `author_sort` written after it
+    ///   overrides that), and every write stamps `last_modified`.
     pub fn set_field(&self, book_id: i32, field: &str, value: &str) -> anyhow::Result<()> {
         self.set_field_inner(book_id, field, value)?;
         // Recorded after the write, not before: a change that was
@@ -2949,11 +3002,54 @@ impl Cache {
     }
 
     fn set_field_inner(&self, book_id: i32, field: &str, value: &str) -> anyhow::Result<()> {
+        // Matches upstream: these three fields silently no-op on an empty
+        // value rather than clearing it, and a no-op is not a write, so it
+        // does not touch `last_modified`.
+        if matches!(field, "title" | "sort" | "uuid") && value.is_empty() {
+            return Ok(());
+        }
+        self.write_field_only(book_id, field, value)?;
+        // Every write stamps `last_modified`, and a change of authors
+        // re-derives the book's `author_sort` from them, as calibre's
+        // `set_authors` does. An `author_sort` written afterwards (an
+        // explicit one in the same change) simply overwrites it, which is
+        // also the order the change log replays them in.
+        let conn = self.backend.conn.lock().unwrap();
+        if field == "authors" {
+            Self::sync_author_sort_in(&conn, book_id)?;
+        }
+        Self::touch_last_modified_in(&conn, book_id)?;
+        Ok(())
+    }
+
+    /// `last_modified` in the format calibre stores it in.
+    pub(crate) fn now_stamp() -> String {
+        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.6f+00:00").to_string()
+    }
+
+    /// Stamps `last_modified` on one book.
+    pub(crate) fn touch_last_modified_in(conn: &rusqlite::Connection, book_id: i32) -> anyhow::Result<()> {
+        conn.execute("UPDATE books SET last_modified = ?1 WHERE id = ?2", (Self::now_stamp(), book_id))?;
+        Ok(())
+    }
+
+    /// Sets `books.author_sort` from the book's current authors: each
+    /// author's own sort string, in link order, joined with `" & "`
+    /// (calibre's `author_sort_from_authors`). A book with no authors gets
+    /// `"Unknown"`, the name calibre links in that case.
+    pub(crate) fn sync_author_sort_in(conn: &rusqlite::Connection, book_id: i32) -> anyhow::Result<()> {
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(NULLIF(a.sort, ''), author_to_author_sort(a.name)) FROM books_authors_link l JOIN authors a ON a.id = l.author WHERE l.book = ?1 ORDER BY l.id",
+        )?;
+        let sorts: Vec<String> = stmt.query_map([book_id], |r| r.get::<_, String>(0))?.collect::<Result<_, _>>()?;
+        drop(stmt);
+        let author_sort = if sorts.is_empty() { "Unknown".to_string() } else { sorts.join(" & ") };
+        conn.execute("UPDATE books SET author_sort = ?1 WHERE id = ?2", (author_sort, book_id))?;
+        Ok(())
+    }
+
+    fn write_field_only(&self, book_id: i32, field: &str, value: &str) -> anyhow::Result<()> {
         match field {
-            "title" | "sort" | "uuid" if value.is_empty() => {
-                // Matches upstream: these three fields silently no-op
-                // on an empty value rather than clearing it.
-            }
             // `isbn` and `lccn` are legacy `books` columns calibre keeps for
             // compatibility. `Library::set_metadata` wrote them with raw SQL
             // because `set_field` had no arm for them, which is also how
@@ -3268,7 +3364,10 @@ impl Cache {
             "rating" => Self::set_rating_in(tx, book_id, value)?,
             "tags" => Self::link_many_to_many_in(tx, book_id, "tags", "name", "books_tags_link", "tag", ", ", value)?,
             "languages" => Self::link_many_to_many_in(tx, book_id, "languages", "lang_code", "books_languages_link", "lang_code", ", ", value)?,
-            "authors" => Self::link_many_to_many_in(tx, book_id, "authors", "name", "books_authors_link", "author", " & ", value)?,
+            "authors" => {
+                Self::link_many_to_many_in(tx, book_id, "authors", "name", "books_authors_link", "author", " & ", value)?;
+                Self::sync_author_sort_in(tx, book_id)?;
+            }
             "identifiers" => Self::set_identifiers_in(tx, book_id, value)?,
             other => anyhow::bail!("Field '{other}' is not writable by this port's set_field"),
         }
@@ -3290,7 +3389,11 @@ impl Cache {
     /// The result has one entry per id, in order: `Ok` when every field of that
     /// book was written.
     pub fn set_fields_for_books(&self, book_ids: &[i32], changes: &[(String, String)]) -> Vec<anyhow::Result<()>> {
-        let (batchable, other): (Vec<&(String, String)>, Vec<&(String, String)>) = changes.iter().partition(|(f, _)| Self::is_batchable_field(f));
+        let (mut batchable, other): (Vec<&(String, String)>, Vec<&(String, String)>) = changes.iter().partition(|(f, _)| Self::is_batchable_field(f));
+        // An explicit `author_sort` wins over the one a change of authors
+        // derives, so it is written (and logged, which is the order replay
+        // applies) after every other field. The sort is stable.
+        batchable.sort_by_key(|c| c.0 == "author_sort");
         let mut results: Vec<anyhow::Result<()>> = Vec::with_capacity(book_ids.len());
         let mut uuids: Vec<Option<String>> = Vec::with_capacity(book_ids.len());
         for id in book_ids {
@@ -3315,6 +3418,7 @@ impl Cache {
                     for (field, value) in &batchable {
                         Self::set_field_in_tx(&sp, *id, field, value)?;
                     }
+                    Self::touch_last_modified_in(&sp, *id)?;
                     sp.commit()?;
                     Ok(())
                 })();

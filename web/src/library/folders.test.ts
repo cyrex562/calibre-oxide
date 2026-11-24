@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { LibraryFolder, OrganizePlan, OrganizeReport } from "./api";
 import {
-  ancestorsOf, BOOKS_DRAG_TYPE, buildFolderTree, createFolderFlow, dragIds, folderNameProblem, folderQuery, hasBooksDrag,
+  ancestorsOf, BOOKS_DRAG_TYPE, buildFolderTree, createFolderFlow, describeQuickMove, dragIds, isQuickMove, folderNameProblem, folderQuery, hasBooksDrag,
   readBooksDrag, renamedPath, setBooksDrag, toggleFolder, visibleFolderRows, type FolderApi,
 } from "./folders";
 
@@ -111,6 +111,59 @@ describe("the move flow: dry run, then run, then refresh", () => {
     expect(api.undoOrganize).toHaveBeenCalledWith("org-1");
     expect(flow.state.undone).toContain("2 books put back");
     expect(changed).toHaveBeenCalledTimes(2);
+  });
+
+  it("moves a few books at once, with no preview, and says so for a toast", async () => {
+    const api = fakeApi({ planMoveBooks: vi.fn(async () => plan(1)) as never, runMoveBooks: vi.fn(async () => ({ ...report, books_moved: 1 })) as never });
+    const changed = vi.fn();
+    const flow = createFolderFlow(api, changed);
+    const phases: string[] = [];
+    // The dialog is closed while the plan is made and the move runs.
+    const watching = api.planMoveBooks as ReturnType<typeof vi.fn>;
+    watching.mockImplementationOnce(async () => {
+      phases.push(`quiet=${flow.state.quiet}`);
+      return plan(1);
+    });
+    expect(await flow.begin({ kind: "move", ids: [7], folder: "Novels" }, { quick: true })).toBe(true);
+    expect(phases).toEqual(["quiet=true"]);
+    expect(api.runMoveBooks).toHaveBeenCalledWith([7], "Novels", "fp", expect.anything());
+    expect(flow.state.phase).toBe("done");
+    expect(flow.state.quick).toBe(true);
+    expect(flow.state.quiet).toBe(false);
+    expect(changed).toHaveBeenCalledTimes(1);
+    expect(describeQuickMove({ books_moved: 1 }, "Novels")).toBe("Moved 1 book to Novels");
+  });
+
+  it("still previews a move that is large, has collisions, or skips books", async () => {
+    const asked = async (ids: number[], p: OrganizePlan) => {
+      const api = fakeApi({ planMoveBooks: vi.fn(async () => p) as never });
+      const flow = createFolderFlow(api);
+      await flow.begin({ kind: "move", ids, folder: "X" }, { quick: true });
+      expect(api.runMoveBooks).not.toHaveBeenCalled();
+      expect(flow.state.quiet).toBe(false);
+      return flow.state.phase;
+    };
+    expect(await asked(Array.from({ length: 25 }, (_, i) => i), plan(25))).toBe("confirm");
+    expect(await asked([1, 2], plan(2, { conflicts: 1 }))).toBe("confirm");
+    expect(await asked([1, 2], plan(2, { skipped: [{ book_id: 3, reason: "x" }] }))).toBe("confirm");
+    // A rename is never quick.
+    const api = fakeApi();
+    const flow = createFolderFlow(api);
+    await flow.begin({ kind: "rename", from: "A", to: "B" }, { quick: true });
+    expect(flow.state.phase).toBe("confirm");
+    expect(isQuickMove(plan(19))).toBe(true);
+    expect(isQuickMove(plan(20))).toBe(false);
+  });
+
+  it("falls back to the dialog when a quick move fails or leaves a book behind", async () => {
+    const failing = createFolderFlow(fakeApi({ planMoveBooks: vi.fn(async () => plan(1)) as never, runMoveBooks: vi.fn(async () => Promise.reject(new Error("the library changed"))) as never }));
+    await failing.begin({ kind: "move", ids: [1], folder: "X" }, { quick: true });
+    expect(failing.state.quick).toBe(false);
+    expect(failing.state.error).toBe("the library changed");
+    const partial = createFolderFlow(fakeApi({ planMoveBooks: vi.fn(async () => plan(1)) as never, runMoveBooks: vi.fn(async () => ({ ...report, failed: [{ book_id: 1, reason: "locked" }] })) as never }));
+    await partial.begin({ kind: "move", ids: [1], folder: "X" }, { quick: true });
+    expect(partial.state.quick).toBe(false);
+    expect(partial.state.phase).toBe("done");
   });
 
   it("says why when there is nothing to move, and when the server refuses", async () => {

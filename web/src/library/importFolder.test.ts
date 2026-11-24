@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { DEFAULT_IMPORT, DUPLICATE_POLICIES, IMPORT_MODES, describeImport, importBody, importProblems, validateSource, type ImportReport } from "./importFolder";
+import { DEFAULT_IMPORT, DUPLICATE_POLICIES, IMPORT_LAYOUTS, IMPORT_MODES, describeImport, importBody, importProblems, validateSource, type ImportReport } from "./importFolder";
 
 function report(over: Partial<ImportReport> = {}): ImportReport {
   return {
@@ -26,7 +26,7 @@ function report(over: Partial<ImportReport> = {}): ImportReport {
 
 describe("the choices", () => {
   it("defaults to calibre's grouping by name, skipping identical files, descending into subfolders", () => {
-    expect(DEFAULT_IMPORT).toEqual({ mode: "multiple_books_per_folder", policy: "skip_exact_content", recursive: true });
+    expect(DEFAULT_IMPORT).toEqual({ mode: "multiple_books_per_folder", policy: "skip_exact_content", recursive: true, keepStructure: false });
   });
 
   it("offers every mode and policy the server knows, each explained", () => {
@@ -57,13 +57,23 @@ describe("validateSource", () => {
 });
 
 describe("importBody", () => {
-  it("trims the path and sends exactly the four choices", () => {
-    expect(importBody({ source: "  /books  ", mode: "one_book_per_folder", policy: "add_anyway", recursive: false })).toEqual({
+  it("trims the path and sends exactly the five choices", () => {
+    expect(importBody({ source: "  /books  ", mode: "one_book_per_folder", policy: "add_anyway", recursive: false, keep_structure: true })).toEqual({
       source: "/books",
       mode: "one_book_per_folder",
       policy: "add_anyway",
       recursive: false,
+      keep_structure: true,
     });
+  });
+
+  it("says plainly what each layout produces, and keeps calibre's by default", () => {
+    expect(IMPORT_LAYOUTS.map((l) => l.keep)).toEqual([false, true]);
+    expect(IMPORT_LAYOUTS[0].keep).toBe(DEFAULT_IMPORT.keepStructure);
+    expect(IMPORT_LAYOUTS[0].help).toContain("Author/Title (id)");
+    expect(IMPORT_LAYOUTS[0].help).toContain("not kept");
+    expect(IMPORT_LAYOUTS[1].help).toContain("Fiction/SciFi/Dune.pdf");
+    expect(IMPORT_LAYOUTS[1].help).toContain("nothing is replaced");
   });
 });
 

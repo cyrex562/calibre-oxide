@@ -13,9 +13,10 @@ import { useKeepScroll } from "../library/keepScroll";
 import Dialog from "./Dialog.vue";
 import { computed, nextTick, onActivated, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
-import { createLibraryFolder, deleteLibraryFolder, fetchLibraryFolders, type LibraryFolder } from "../library/api";
+import { createLibraryFolder, deleteLibraryFolder, fetchLibraryFolders, undoOrganize, type LibraryFolder } from "../library/api";
+import { showToast } from "../library/deleteFlow";
 import {
-  ancestorsOf, buildFolderTree, createFolderFlow, describeFolderPlan, describeFolderReport, folderNameProblem, folderQuery, FOLDERS_EXPANDED_KEY,
+  ancestorsOf, buildFolderTree, createFolderFlow, describeFolderPlan, describeFolderReport, describeFolderUndo, describeQuickMove, folderNameProblem, folderQuery, FOLDERS_EXPANDED_KEY,
   hasBooksDrag, joinFolder, parseExpandedFolders, readBooksDrag, renamedPath, toggleFolder, visibleFolderRows,
 } from "../library/folders";
 import ContextMenu, { type ContextMenuEntry } from "./ContextMenu.vue";
@@ -144,6 +145,103 @@ function pick(path: string) {
   emit("select", folderQuery(path), path);
 }
 
+// --- keyboard: the ARIA tree pattern ---
+//
+// The tree is one Tab stop. The row that holds it (`tabStop`) is the one last
+// focused, else the picked folder, else the first row; arrow keys move focus
+// between rows and expand / collapse, Enter or Space picks. The twisty and name
+// buttons inside a row are for the mouse only (tabindex -1), so Tab goes past
+// the whole tree instead of stopping at every folder.
+
+const focusedPath = ref<string | null>(null);
+
+/** The row that is in the Tab order; always one that is drawn, so the tree can never be skipped. */
+const tabStop = computed<string | null>(() => {
+  const drawn = visibleRows.value;
+  if (drawn.length === 0) return null;
+  for (const wanted of [focusedPath.value, activePath.value]) {
+    if (wanted && drawn.some((r) => r.node.path === wanted)) return wanted;
+  }
+  return drawn[0].node.path;
+});
+
+function rowElement(path: string): HTMLElement | null {
+  const els = listEl.value?.querySelectorAll<HTMLElement>("[data-folder]") ?? [];
+  for (const el of els) if (el.dataset.folder === path) return el;
+  return null;
+}
+
+/** Moves keyboard focus to a row, scrolling it into the drawn window first. */
+async function focusRow(path: string) {
+  focusedPath.value = path;
+  revealRow(path);
+  await nextTick();
+  rowElement(path)?.focus();
+}
+
+function parentOf(path: string): string | null {
+  const cut = path.lastIndexOf("/");
+  return cut < 0 ? null : path.slice(0, cut);
+}
+
+function onTreeKey(row: { node: { path: string; children: unknown[] } }, event: KeyboardEvent) {
+  // Keys that reach the row from a control inside it (the buttons are not in
+  // the Tab order, but a click focuses them) are not the row's to answer.
+  if (event.target !== event.currentTarget || event.altKey || event.ctrlKey || event.metaKey) return;
+  const path = row.node.path;
+  const list = rows.value;
+  const at = list.findIndex((r) => r.node.path === path);
+  const hasChildren = row.node.children.length > 0;
+  const go = (index: number) => {
+    const target = list[Math.min(list.length - 1, Math.max(0, index))];
+    if (target) void focusRow(target.node.path);
+  };
+  switch (event.key) {
+    case "ArrowDown":
+      go(at + 1);
+      break;
+    case "ArrowUp":
+      go(at - 1);
+      break;
+    case "Home":
+      go(0);
+      break;
+    case "End":
+      go(list.length - 1);
+      break;
+    case "ArrowRight":
+      if (hasChildren && !expanded.value.has(path)) toggle(path);
+      else if (hasChildren) go(at + 1);
+      break;
+    case "ArrowLeft": {
+      const parent = parentOf(path);
+      if (hasChildren && expanded.value.has(path)) toggle(path);
+      else if (parent !== null) void focusRow(parent);
+      break;
+    }
+    case "Enter":
+    case " ":
+      pick(path);
+      break;
+    case "ContextMenu":
+    case "F10": {
+      if (event.key === "F10" && !event.shiftKey) return;
+      const box = (event.currentTarget as HTMLElement).getBoundingClientRect();
+      menu.value = { x: box.left + 24, y: box.bottom, path };
+      break;
+    }
+    default:
+      return;
+  }
+  event.preventDefault();
+}
+
+/** A click on a row's own buttons also puts keyboard focus on the row, so the arrows work from there. */
+function focusOwnRow(event: Event, path: string) {
+  focusedPath.value = path;
+  (event.currentTarget as HTMLElement).closest<HTMLElement>("[role=treeitem]")?.focus();
+}
+
 // --- the move / rename flow ---
 
 const flow = createFolderFlow(undefined, async () => {
@@ -151,7 +249,26 @@ const flow = createFolderFlow(undefined, async () => {
   emit("changed");
 });
 const state = flow.state;
-const flowOpen = computed(() => state.action !== null && (state.phase !== "idle" || state.error !== null || state.undone !== null));
+// A quick move (a few books, no collisions) has no dialog: it is reported in a toast.
+const flowOpen = computed(() => state.action !== null && !state.quiet && !(state.quick && state.phase === "done") && (state.phase !== "idle" || state.error !== null || state.undone !== null));
+
+/** Moves books into a folder: at once and with an Undo toast when that is small and clean, else after a preview. */
+async function beginMove(ids: number[], folder: string) {
+  await flow.begin({ kind: "move", ids, folder }, { quick: true });
+  const report = state.report;
+  if (state.quick && state.phase === "done" && report) {
+    flow.reset();
+    showToast(describeQuickMove(report, folder), {
+      label: "Undo",
+      run: async () => {
+        const done = await undoOrganize(report.run_id);
+        await load();
+        emit("changed");
+        return describeFolderUndo(done);
+      },
+    });
+  }
+}
 
 // --- prompts: New subfolder, Rename folder ---
 
@@ -218,7 +335,7 @@ async function onChoose(id: MenuId) {
   if (id === "show") pick(target.path);
   else if (id === "new") askNew(target.path);
   else if (id === "rename") askRename(target.path);
-  else if (id === "move") await flow.begin({ kind: "move", ids: [...props.selectedIds], folder: target.path });
+  else if (id === "move") await beginMove([...props.selectedIds], target.path);
   else {
     try {
       await deleteLibraryFolder(target.path);
@@ -245,7 +362,7 @@ async function onDrop(path: string, event: DragEvent) {
   if (!event.dataTransfer || !hasBooksDrag(event.dataTransfer)) return;
   event.preventDefault();
   const ids = readBooksDrag(event.dataTransfer);
-  if (ids.length > 0) await flow.begin({ kind: "move", ids, folder: path });
+  if (ids.length > 0) await beginMove(ids, path);
 }
 
 async function runFlow() {
@@ -273,23 +390,31 @@ function planTitle(): string {
       <button type="button" class="folders-add" title="New top-level folder" aria-label="New top-level folder" data-testid="new-root-folder" @click="askNew('')">+</button>
     </div>
     <p v-if="error" class="error">{{ error }}</p>
-    <ul v-if="open" ref="listEl" class="folder-list" data-testid="folder-list">
+    <ul v-if="open" ref="listEl" class="folder-list" :role="rows.length > 0 ? 'tree' : undefined" aria-label="Folders" data-testid="folder-list">
       <li v-if="rows.length === 0" class="folder-note">No folders yet. Books at the library's top level are not in a folder.</li>
       <li v-if="windowed.padTop > 0" aria-hidden="true" :style="{ height: `${windowed.padTop}px` }"></li>
-      <li v-for="row in visibleRows" :key="row.node.path">
+      <li v-for="row in visibleRows" :key="row.node.path" role="none">
         <div
           class="folder-row"
+          role="treeitem"
           :class="{ active: activePath === row.node.path, drop: dropTarget === row.node.path }"
           :style="{ paddingLeft: `calc(var(--sp-3) + ${row.depth * 12}px)` }"
           :data-folder="row.node.path"
+          :tabindex="tabStop === row.node.path ? 0 : -1"
+          :aria-level="row.depth + 1"
+          :aria-expanded="row.node.children.length > 0 ? expanded.has(row.node.path) : undefined"
+          :aria-selected="activePath === row.node.path"
+          :aria-label="`${row.node.name}, ${row.node.books} book${row.node.books === 1 ? '' : 's'}`"
+          @focus="focusedPath = row.node.path"
+          @keydown="onTreeKey(row, $event)"
           @dragover="onDragOver(row.node.path, $event)"
           @dragleave="dropTarget = null"
           @drop="onDrop(row.node.path, $event)"
           @contextmenu.prevent="menu = { x: $event.clientX, y: $event.clientY, path: row.node.path }"
         >
-          <button v-if="row.node.children.length > 0" type="button" class="twisty-btn" :aria-label="expanded.has(row.node.path) ? 'Collapse' : 'Expand'" @click.stop="toggle(row.node.path)">{{ expanded.has(row.node.path) ? "▾" : "▸" }}</button>
+          <button v-if="row.node.children.length > 0" type="button" class="twisty-btn" tabindex="-1" aria-hidden="true" :aria-label="expanded.has(row.node.path) ? 'Collapse' : 'Expand'" :title="expanded.has(row.node.path) ? 'Collapse' : 'Expand'" @click.stop="toggle(row.node.path); focusOwnRow($event, row.node.path)">{{ expanded.has(row.node.path) ? "▾" : "▸" }}</button>
           <span v-else class="twisty-btn spacer" aria-hidden="true"></span>
-          <button type="button" class="folder-pick" :title="`${row.node.path} — ${row.node.books} book${row.node.books === 1 ? '' : 's'}`" @click="pick(row.node.path)">
+          <button type="button" class="folder-pick" tabindex="-1" aria-hidden="true" :title="`${row.node.path} — ${row.node.books} book${row.node.books === 1 ? '' : 's'}`" @click="pick(row.node.path); focusOwnRow($event, row.node.path)">
             <span class="folder-label" :class="{ empty: row.node.empty }">{{ row.node.name }}</span>
             <span class="count">{{ row.node.books }}</span>
           </button>
@@ -402,6 +527,10 @@ function planTitle(): string {
   align-items: center;
   height: 22px;
   padding-right: var(--sp-3);
+}
+.folder-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 .folder-row.active {
   background: var(--accent-soft);
