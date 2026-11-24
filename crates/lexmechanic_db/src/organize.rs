@@ -448,6 +448,19 @@ pub struct OrganizeRun {
     /// Their files may be in either place; [`undo`] looks.
     #[serde(default)]
     pub pending: Vec<i32>,
+    /// Directories renamed only in case at the end of the run (`Fiction` to
+    /// `fiction`), journaled before each rename. [`undo`] renames them back.
+    #[serde(default)]
+    pub dir_case: Vec<DirCaseRename>,
+}
+
+/// One directory renamed only in case: `from` to `to`, inside `parent` (relative
+/// to the library root, `""` for the root).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirCaseRename {
+    pub parent: String,
+    pub from: String,
+    pub to: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -495,10 +508,15 @@ fn prune_empty_dirs(library: &Path, rel: &str) {
 /// directory that is already there and it keeps its old spelling. Renaming a
 /// directory to a name that differs only in case is refused by some
 /// filesystems and a no-op on others, so it goes through a temporary name.
-fn fix_dir_case(cache: &Cache, rel: &str) -> Result<()> {
+///
+/// Each rename is written to the run's undo `journal` (and fsynced) before it
+/// is made, so undoing the run can restore the old spelling. If that entry
+/// cannot be written the directory is left as it is.
+fn fix_dir_case(cache: &Cache, rel: &str, journal: &mut crate::run_journal::RunJournal) -> Result<()> {
     let library = &cache.backend.library_path;
     let handle = cache.backend.write_handle()?;
     let mut at = library.to_path_buf();
+    let mut parent_rel = String::new();
     for part in rel.split('/').filter(|p| !p.is_empty()) {
         let key = lexmechanic_utils::filenames::path_key(part);
         let mut exact = false;
@@ -512,13 +530,48 @@ fn fix_dir_case(cache: &Cache, rel: &str) -> Result<()> {
             }
         }
         if let (false, Some(name)) = (exact, other) {
-            let temp = at.join(format!("{part}.case-{}", &uuid::Uuid::new_v4().simple().to_string()[..6]));
-            handle.rename_atomic(&at.join(&name), &temp).with_context(|| format!("renaming {name} aside"))?;
-            handle.rename_atomic_no_replace(&temp, &at.join(part)).with_context(|| format!("renaming {name} to {part}"))?;
+            journal.append_dir_case(&parent_rel, &name, part).context("could not write the undo entry for the folder's new spelling, so it was not renamed")?;
+            rename_dir_case(&handle, &at, &name, part)?;
         }
         at.push(part);
+        if !parent_rel.is_empty() {
+            parent_rel.push('/');
+        }
+        parent_rel.push_str(part);
     }
     Ok(())
+}
+
+/// Renames the directory `from` inside `parent` to `to` (a name differing only
+/// in case) through a temporary name.
+fn rename_dir_case(handle: &crate::library_handle::LibraryHandle, parent: &Path, from: &str, to: &str) -> Result<()> {
+    let temp = parent.join(format!("{to}.case-{}", &uuid::Uuid::new_v4().simple().to_string()[..6]));
+    handle.rename_atomic(&parent.join(from), &temp).with_context(|| format!("renaming {from} aside"))?;
+    handle.rename_atomic_no_replace(&temp, &parent.join(to)).with_context(|| format!("renaming {from} to {to}"))?;
+    Ok(())
+}
+
+/// Puts a directory's old spelling back (undo of [`fix_dir_case`]): when
+/// `parent` holds a directory named exactly `rename.to` and none named exactly
+/// `rename.from`. Returns whether it renamed anything.
+fn restore_dir_case(cache: &Cache, rename: &DirCaseRename) -> Result<bool> {
+    let parent = cache.backend.library_path.join(&rename.parent);
+    let (mut has_to, mut has_from) = (false, false);
+    for entry in std::fs::read_dir(&parent)?.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == rename.to && entry.path().is_dir() {
+            has_to = true;
+        }
+        if name == rename.from {
+            has_from = true;
+        }
+    }
+    if !has_to || has_from {
+        return Ok(false);
+    }
+    let handle = cache.backend.write_handle()?;
+    rename_dir_case(&handle, &parent, &rename.to, &rename.from)?;
+    Ok(true)
 }
 
 /// Moves the book's files, all or none. If a move fails, the ones already done
@@ -661,8 +714,11 @@ pub fn execute(cache: &Cache, plan: &OrganizePlan, control: &JobControl) -> Resu
     }
     if let Some(folder) = &plan.case_fix_folder {
         if report.books_moved > 0 && !report.cancelled {
-            if let Err(e) = fix_dir_case(cache, folder) {
-                report.warnings.push(format!("the books were moved but the folder could not be renamed to {folder}: {e:#}"));
+            // The journal was opened for the first book, so it exists whenever one moved.
+            if let Some(j) = journal.as_mut() {
+                if let Err(e) = fix_dir_case(cache, folder, j) {
+                    report.warnings.push(format!("the books were moved but the folder could not be renamed to {folder}: {e:#}"));
+                }
             }
         }
     }
@@ -738,6 +794,17 @@ pub fn undo(cache: &Cache, run_id: &str, control: &JobControl) -> Result<UndoRep
     }
     for dir in &new_dirs {
         prune_empty_dirs(&library, dir);
+    }
+    // Directories the run renamed only in case get their old spelling back, last
+    // renamed first (a child was renamed under its parent's new spelling). Only
+    // when every book came back: with books left behind, the folder they are in
+    // keeps the name their records use.
+    if report.skipped.is_empty() && !control.is_cancelled() {
+        for rename in run.dir_case.iter().rev() {
+            if let Err(e) = restore_dir_case(cache, rename) {
+                report.warnings.push(format!("the books are back but the folder {} could not be renamed back to {}: {e:#}", rename.to, rename.from));
+            }
+        }
     }
     if report.skipped.is_empty() && !control.is_cancelled() {
         // The undo itself is done; failing to say so must not make it an error.

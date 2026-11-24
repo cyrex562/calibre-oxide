@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import { useKeepScroll } from "../library/keepScroll";
+import Dialog from "./Dialog.vue";
+import { confirmDialog } from "./dialogs/confirm";
 import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import CollapsibleSection from "./CollapsibleSection.vue";
@@ -322,6 +325,7 @@ function startEditing() {
 }
 
 const rootEl = ref<HTMLElement | null>(null);
+useKeepScroll(rootEl);
 
 async function saveEdits() {
   if (!form.value || !dirty.value) return;
@@ -417,7 +421,7 @@ async function addFormatFile(e: Event) {
 }
 
 async function removeFormatClick(ext: string) {
-  if (!confirm(`Remove the ${ext.toUpperCase()} format from this book?`)) return;
+  if (!(await confirmDialog(`Remove the ${ext.toUpperCase()} format from this book?`, { confirmLabel: "Remove", danger: true }))) return;
   formatBusy.value = true;
   saveError.value = null;
   try {
@@ -474,7 +478,7 @@ async function addDataFile(e: Event) {
 }
 
 async function removeDataFileClick(relpath: string) {
-  if (!confirm(`Remove "${dataFileName(relpath)}" from this book?`)) return;
+  if (!(await confirmDialog(`Remove "${dataFileName(relpath)}" from this book?`, { confirmLabel: "Remove", danger: true }))) return;
   dataFileBusy.value = true;
   saveError.value = null;
   try {
@@ -577,7 +581,7 @@ async function saveCurrentTemplate() {
   templateSaveError.value = null;
   const name = templateNameInput.value;
   // Say so *before* overwriting, not after.
-  if (wouldOverwrite(savedTemplates.value, name) && !window.confirm(`Replace the saved template "${name.trim()}"?`)) return;
+  if (wouldOverwrite(savedTemplates.value, name) && !(await confirmDialog(`Replace the saved template "${name.trim()}"?`, { confirmLabel: "Replace" }))) return;
   try {
     await persistTemplates(saveTemplate(savedTemplates.value, name, templateInput.value));
     templateNameInput.value = "";
@@ -1131,8 +1135,9 @@ watch(
 </script>
 
 <template>
-  <div :class="docked ? 'docked-host' : 'backdrop'" @click.self="!docked && emit('close')">
-    <div ref="rootEl" class="panel" :class="{ docked }" :role="docked ? undefined : 'dialog'" :aria-modal="docked ? undefined : 'true'">
+  <!-- Docked it is the details column; otherwise a modal Dialog around the same panel. -->
+  <component :is="docked ? 'div' : Dialog" v-bind="docked ? { class: 'docked-host' } : { size: 'md', label: 'Book details', onClose: () => emit('close') }">
+    <div ref="rootEl" class="panel" :class="{ docked }">
       <button class="close" :title="docked ? 'Hide details' : 'Close'" @click="emit('close')">✕</button>
       <p v-if="loading">Loading…</p>
       <p v-else-if="error" class="error">{{ error }}</p>
@@ -1414,7 +1419,7 @@ watch(
         </CollapsibleSection>
       </template>
     </div>
-  </div>
+</component>
   <ImageViewer v-if="viewer" :src="viewerSrc" :title="book?.title ?? ''" :caption="viewerCaption" :loading="pageImageBusy" steppable @close="closeViewer" @step="onViewerStep" />
   <TweakEditor v-if="tweakOpen" :book-id="bookId" @close="tweakOpen = false" @updated="onTweakUpdated" />
   <FetchMetadataDialog v-if="fetchMetadataOpen" :book-id="bookId" :book="book" @close="fetchMetadataOpen = false" @updated="onFetchMetadataUpdated" />
@@ -1422,23 +1427,7 @@ watch(
 
 
 <style scoped>
-.backdrop {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.4);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 10;
-}
 .panel {
-  background: var(--bg);
-  border-radius: 6px;
-  padding: 1.5em;
-  max-width: 520px;
-  width: 90%;
-  max-height: 85vh;
-  overflow: auto;
   position: relative;
 }
 /* Docked: the panel *is* the column, so the modal's centring, rounding
@@ -1449,10 +1438,8 @@ watch(
   min-height: 0;
 }
 .panel.docked {
-  border-radius: 0;
-  max-width: none;
+  background: var(--bg);
   width: 100%;
-  max-height: none;
   height: 100%;
   padding: 1em;
   overflow-y: auto;

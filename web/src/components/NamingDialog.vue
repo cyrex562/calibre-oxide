@@ -4,6 +4,7 @@
 // "Apply" button that opens Organize with the convention filled in (so the dry
 // run, the run and the undo all come from there). State: ../library/naming.ts.
 
+import Dialog from "./Dialog.vue";
 import { onBeforeUnmount, onMounted, watch } from "vue";
 
 import { combinedTemplate, NAMING_TOKENS, type NamingController } from "../library/naming";
@@ -35,99 +36,64 @@ async function saveAndApply(scope: "selected" | "all") {
 </script>
 
 <template>
-  <div class="naming-backdrop" @click.self="emit('close')">
-    <div class="naming-panel" role="dialog" aria-modal="true" aria-label="File naming">
-      <button class="naming-close" aria-label="Close" @click="emit('close')">✕</button>
-      <h3>File naming</h3>
-      <p class="hint">Where this library's files live and what they are called. Organize, Rename files and Fix titles start from this; any run can still use something else.</p>
+  <Dialog title="File naming" :dirty="c.dirty()" show-close size="lg" @close="emit('close')">
+    <p class="hint">Where this library's files live and what they are called. Organize, Rename files and Fix titles start from this; any run can still use something else.</p>
 
-      <label class="field">
-        Folder
-        <input v-model="state.folder" type="text" data-testid="folder-template" spellcheck="false" placeholder="e.g. Gaming/RPG/{#game_line}" />
-        <span class="hint">Leave empty to keep every file at the top of the library.</span>
-      </label>
-      <label class="field">
-        File name (the extension is added)
-        <input v-model="state.file" type="text" data-testid="file-template" spellcheck="false" placeholder="e.g. {series:|| }{title}" />
-      </label>
-      <div class="buttons">
-        <button type="button" data-testid="use-example" @click="c.useExample()">Use the RPG example</button>
-        <button type="button" @click="c.resetToDefaults()">Reset to the default</button>
-      </div>
-
-      <p v-if="state.error" class="error" role="alert" data-testid="naming-error">{{ state.error }}</p>
-
-      <section class="preview" aria-label="Preview">
-        <h4>Preview {{ sampleIds.length > 0 ? "(selected books)" : "(sample books)" }}</h4>
-        <p v-if="state.previews.length === 0 && !state.error" class="hint">No books to preview yet.</p>
-        <ul data-testid="naming-preview">
-          <li v-for="p in state.previews" :key="p.book_id">
-            <span class="path">{{ p.path ?? "—" }}</span>
-            <span v-if="p.error" class="error"> {{ p.error }}</span>
-            <span class="hint title">{{ p.title }}</span>
-          </li>
-        </ul>
-      </section>
-
-      <details class="tokens" open>
-        <summary>Template reference</summary>
-        <div v-for="g in NAMING_TOKENS" :key="g.title" class="token-group">
-          <h4>{{ g.title }}</h4>
-          <dl>
-            <template v-for="r in g.rows" :key="r.token">
-              <dt><code>{{ r.token }}</code></dt>
-              <dd>{{ r.meaning }}</dd>
-            </template>
-          </dl>
-        </div>
-        <p class="hint">A book with no value for a token leaves no empty folder and no stray separator. A name already taken gets a number.</p>
-      </details>
-
-      <div class="buttons">
-        <button type="button" class="primary" :disabled="state.saving || !c.dirty() || c.problem() !== null" data-testid="save-naming" @click="c.save()">{{ state.saving ? "Saving…" : "Save" }}</button>
-        <button type="button" :disabled="state.saving || c.problem() !== null || selectedCount === 0" data-testid="apply-selected" @click="saveAndApply('selected')">Apply to the {{ selectedCount }} selected book{{ selectedCount === 1 ? "" : "s" }}…</button>
-        <button type="button" :disabled="state.saving || c.problem() !== null" data-testid="apply-all" @click="saveAndApply('all')">Apply to all books…</button>
-      </div>
-      <p v-if="state.note" class="hint" role="status">{{ state.note }}</p>
-      <p class="hint">“Apply” opens Organize with this convention filled in: you see the dry run first, and can undo the run.</p>
+    <label class="field">
+      Folder
+      <input v-model="state.folder" type="text" data-testid="folder-template" spellcheck="false" placeholder="e.g. Gaming/RPG/{#game_line}" />
+      <span class="hint">Leave empty to keep every file at the top of the library.</span>
+    </label>
+    <label class="field">
+      File name (the extension is added)
+      <input v-model="state.file" type="text" data-testid="file-template" spellcheck="false" placeholder="e.g. {series:|| }{title}" />
+    </label>
+    <div class="buttons">
+      <button type="button" data-testid="use-example" @click="c.useExample()">Use the RPG example</button>
+      <button type="button" @click="c.resetToDefaults()">Reset to the default</button>
     </div>
-  </div>
+
+    <p v-if="state.error" class="error" role="alert" data-testid="naming-error">{{ state.error }}</p>
+
+    <section class="preview" aria-label="Preview">
+      <h4>Preview {{ sampleIds.length > 0 ? "(selected books)" : "(sample books)" }}</h4>
+      <p v-if="state.previews.length === 0 && !state.error" class="hint">No books to preview yet.</p>
+      <ul data-testid="naming-preview">
+        <li v-for="p in state.previews" :key="p.book_id">
+          <span class="path">{{ p.path ?? "—" }}</span>
+          <span v-if="p.error" class="error"> {{ p.error }}</span>
+          <span class="hint title">{{ p.title }}</span>
+        </li>
+      </ul>
+    </section>
+
+    <details class="tokens" open>
+      <summary>Template reference</summary>
+      <div v-for="g in NAMING_TOKENS" :key="g.title" class="token-group">
+        <h4>{{ g.title }}</h4>
+        <dl>
+          <template v-for="r in g.rows" :key="r.token">
+            <dt><code>{{ r.token }}</code></dt>
+            <dd>{{ r.meaning }}</dd>
+          </template>
+        </dl>
+      </div>
+      <p class="hint">A book with no value for a token leaves no empty folder and no stray separator. A name already taken gets a number.</p>
+    </details>
+
+    <div class="buttons">
+      <button type="button" class="primary" :disabled="state.saving || !c.dirty() || c.problem() !== null" data-testid="save-naming" @click="c.save()">{{ state.saving ? "Saving…" : "Save" }}</button>
+      <button type="button" :disabled="state.saving || c.problem() !== null || selectedCount === 0" data-testid="apply-selected" @click="saveAndApply('selected')">Apply to the {{ selectedCount }} selected book{{ selectedCount === 1 ? "" : "s" }}…</button>
+      <button type="button" :disabled="state.saving || c.problem() !== null" data-testid="apply-all" @click="saveAndApply('all')">Apply to all books…</button>
+    </div>
+    <p v-if="state.note" class="hint" role="status">{{ state.note }}</p>
+    <p class="hint">“Apply” opens Organize with this convention filled in: you see the dry run first, and can undo the run.</p>
+  </Dialog>
 </template>
 
 <style scoped>
-.naming-backdrop {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.45);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 20;
-}
-.naming-panel {
-  position: relative;
-  background: var(--bg);
-  border-radius: 6px;
-  padding: 1.25rem 1.5rem;
-  width: min(760px, 94vw);
-  max-height: 90vh;
-  overflow: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 0.8rem;
-}
-.naming-panel h3,
-.naming-panel h4 {
+h4 {
   margin: 0;
-}
-.naming-close {
-  position: absolute;
-  top: 0.4rem;
-  right: 0.5rem;
-  border: none;
-  background: none;
-  cursor: pointer;
-  font-size: var(--fs-medium);
 }
 .hint {
   color: var(--fg-muted);

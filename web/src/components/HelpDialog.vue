@@ -10,6 +10,7 @@
 // wrong the first time anyone rebinds a key, and nothing fails when
 // it goes stale.
 
+import Dialog from "./Dialog.vue";
 import { computed } from "vue";
 
 import { LIBRARY_ACTIONS, type ActionGroup, type LibraryAction, type LibraryActionId } from "../library/actions";
@@ -62,46 +63,38 @@ const readerShortcuts = computed(() =>
 </script>
 
 <template>
-  <div class="manage-backdrop" @click.self="emit('close')">
-    <div class="manage-panel help-panel" role="dialog" aria-modal="true">
-      <h3>Help</h3>
-      <p class="hint">Every action this app knows about, with its current keyboard shortcut. Shortcuts are rebindable in Settings.</p>
+  <Dialog title="Help" size="lg" @close="emit('close')">
+    <p class="hint">Every action this app knows about, with its current keyboard shortcut. Shortcuts are rebindable in Settings.</p>
 
-      <section v-for="g in groups" :key="g.group" class="help-group">
-        <h4>{{ g.title }}</h4>
-        <ul class="help-list">
-          <li v-for="a in g.actions" :key="a.id">
-            <span class="help-label">{{ a.label }}</span>
-            <kbd v-if="shortcutFor(a.id)">{{ shortcutFor(a.id) }}</kbd>
-            <span v-else class="help-nokey">—</span>
-            <span class="help-note">{{ REQUIREMENT_NOTES[a.requires] }}</span>
-          </li>
-        </ul>
-      </section>
+    <section v-for="g in groups" :key="g.group" class="help-group">
+      <h4>{{ g.title }}</h4>
+      <ul class="help-list">
+        <li v-for="a in g.actions" :key="a.id">
+          <span class="help-label">{{ a.label }}</span>
+          <kbd v-if="shortcutFor(a.id)">{{ shortcutFor(a.id) }}</kbd>
+          <span v-else class="help-nokey">—</span>
+          <span class="help-note">{{ REQUIREMENT_NOTES[a.requires] }}</span>
+        </li>
+      </ul>
+    </section>
 
-      <section class="help-group">
-        <h4>Reader</h4>
-        <ul class="help-list">
-          <li v-for="r in readerShortcuts" :key="r.label">
-            <span class="help-label">{{ r.label }}</span>
-            <kbd>{{ r.key }}</kbd>
-            <span class="help-note"></span>
-          </li>
-        </ul>
-      </section>
+    <section class="help-group">
+      <h4>Reader</h4>
+      <ul class="help-list">
+        <li v-for="r in readerShortcuts" :key="r.label">
+          <span class="help-label">{{ r.label }}</span>
+          <kbd>{{ r.key }}</kbd>
+          <span class="help-note"></span>
+        </li>
+      </ul>
+    </section>
 
-      <p class="hint">Right-click a book for its own actions. Shortcuts never fire while you are typing.</p>
-      <button type="button" @click="emit('close')">Close</button>
-    </div>
-  </div>
+    <p class="hint">Right-click a book for its own actions. Shortcuts never fire while you are typing.</p>
+    <button type="button" @click="emit('close')">Close</button>
+  </Dialog>
 </template>
 
 <style scoped>
-.help-panel {
-  min-width: min(640px, 92vw);
-  max-height: 84vh;
-  overflow-y: auto;
-}
 .help-group {
   margin-bottom: 0.9rem;
 }

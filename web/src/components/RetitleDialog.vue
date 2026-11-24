@@ -4,6 +4,8 @@
 // into the files and rename the files. A finished run can be undone. The state
 // machine is in ../library/retitle.ts (tested there).
 
+import { confirmDialog } from "./dialogs/confirm";
+import Dialog from "./Dialog.vue";
 import { computed, onMounted, ref, watchEffect } from "vue";
 
 import { cancelLibraryJob } from "../library/api";
@@ -44,7 +46,7 @@ async function find() {
 }
 
 async function run() {
-  const sure = window.confirm(`Apply ${describeConfirm(checked.value, { embed: state.embed, renameFiles: state.renameFiles, renameTemplate: state.renameTemplate })}`);
+  const sure = await confirmDialog(`Apply ${describeConfirm(checked.value, { embed: state.embed, renameFiles: state.renameFiles, renameTemplate: state.renameTemplate })}`, { title: "Fix titles", confirmLabel: "Apply" });
   if (!sure) return;
   if (await c.apply()) emit("changed");
 }
@@ -59,143 +61,108 @@ function cancelRun() {
 </script>
 
 <template>
-  <div class="retitle-backdrop" @click.self="!busy && emit('close')">
-    <div class="retitle-panel" role="dialog" aria-modal="true" aria-label="Fix titles">
-      <button class="retitle-close" :disabled="busy" aria-label="Close" @click="emit('close')">✕</button>
-      <h3>Fix titles</h3>
-      <p class="hint">
-        Finds books whose title is junk (a print job, "Microsoft Word - …", a bare file name, or one title copied onto many different files) and suggests a clean one. Check or edit each, then apply: the titles are set, optionally written into the files, and the files optionally
-        renamed. A run can be undone.
-      </p>
-      <p class="hint" data-testid="scope">{{ state.scope === "selected" ? `Looking at the ${selectedIds.length.toLocaleString("en-US")} selected book${selectedIds.length === 1 ? "" : "s"}.` : "Looking at every book in the library." }}</p>
+  <Dialog title="Fix titles" :busy="busy" show-close size="lg" @close="emit('close')">
+    <p class="hint">
+      Finds books whose title is junk (a print job, "Microsoft Word - …", a bare file name, or one title copied onto many different files) and suggests a clean one. Check or edit each, then apply: the titles are set, optionally written into the files, and the files optionally
+      renamed. A run can be undone.
+    </p>
+    <p class="hint" data-testid="scope">{{ state.scope === "selected" ? `Looking at the ${selectedIds.length.toLocaleString("en-US")} selected book${selectedIds.length === 1 ? "" : "s"}.` : "Looking at every book in the library." }}</p>
 
-      <fieldset class="retitle-options" :disabled="busy">
-        <legend>When applying</legend>
-        <label title="Rewrites each book file (PDF, EPUB, …) so its own metadata carries the title. The file's contents change, so its checksum does too; an undo writes the old title back, but the bytes will not be identical to before."
-          ><input v-model="state.embed" type="checkbox" data-testid="embed" /> Write the title into the files</label
-        >
-        <label><input v-model="state.renameFiles" type="checkbox" data-testid="rename" /> Rename files</label>
-        <input v-if="state.renameFiles" v-model="state.renameTemplate" type="text" spellcheck="false" aria-label="File name template" data-testid="template" />
-        <span v-if="state.renameFiles" class="hint">A template such as {title} or {title} - {authors}. A name already taken gets a number.</span>
-      </fieldset>
+    <fieldset class="retitle-options" :disabled="busy">
+      <legend>When applying</legend>
+      <label title="Rewrites each book file (PDF, EPUB, …) so its own metadata carries the title. The file's contents change, so its checksum does too; an undo writes the old title back, but the bytes will not be identical to before."
+        ><input v-model="state.embed" type="checkbox" data-testid="embed" /> Write the title into the files</label
+      >
+      <label><input v-model="state.renameFiles" type="checkbox" data-testid="rename" /> Rename files</label>
+      <input v-if="state.renameFiles" v-model="state.renameTemplate" type="text" spellcheck="false" aria-label="File name template" data-testid="template" />
+      <span v-if="state.renameFiles" class="hint">A template such as {title} or {title} - {authors}. A name already taken gets a number.</span>
+    </fieldset>
 
-      <div class="retitle-buttons">
-        <button type="button" :disabled="busy" data-testid="find" @click="find">{{ state.phase === "finding" ? "Looking…" : state.rows.length > 0 ? "Find again" : "Find titles to fix" }}</button>
-        <span v-if="c.proposedIsStale()" class="hint" role="status">The file names below are for the old template; find again to refresh them. They follow the template when applied.</span>
-      </div>
-      <p v-if="state.error" class="error" role="alert">{{ state.error }}</p>
-
-      <section v-if="state.phase === 'ready'" class="retitle-table" aria-label="Titles to fix" data-testid="table">
-        <p v-if="state.rows.length === 0" role="status" class="hint">No titles need fixing.</p>
-        <template v-else>
-          <div class="retitle-toolbar">
-            <select v-model="state.filter" aria-label="Filter by reason" data-testid="filter" @change="c.setFilter(state.filter)">
-              <option v-for="f in filters" :key="f.value" :value="f.value">{{ f.label }}</option>
-            </select>
-            <span role="status" class="hint" data-testid="count">{{ rowsLine }}</span>
-          </div>
-          <table>
-            <thead>
-              <tr>
-                <th><input ref="headerBox" type="checkbox" :checked="headerState === 'all'" aria-label="Select all" data-testid="select-all" @change="c.setAllChecked(($event.target as HTMLInputElement).checked)" /></th>
-                <th>Current title</th>
-                <th>New title</th>
-                <th>Why</th>
-                <th>File</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="r in shown" :key="r.bookId" data-testid="row">
-                <td><input v-model="r.checked" type="checkbox" :aria-label="`Fix book ${r.bookId}`" /></td>
-                <td class="muted">{{ r.currentTitle }}</td>
-                <td>
-                  <input v-model="r.title" type="text" :class="{ invalid: rowProblem(r) }" :placeholder="r.reason === 'no_suggestion' ? 'Type a title' : ''" :title="rowProblem(r) ?? ''" />
-                </td>
-                <td>
-                  <span class="badge" :class="r.reason">{{ REASON_LABEL[r.reason] }}</span>
-                  <span v-if="!r.confident && r.reason !== 'ok' && r.reason !== 'no_suggestion'" class="badge unsure" title="Suggested from a file name that looks like a catalogue number, so not selected: check it first">check</span>
-                </td>
-                <td class="path">
-                  {{ r.currentFile }}<template v-if="state.renameFiles && r.proposedFile && r.proposedFile !== r.currentFile"> → {{ r.proposedFile }}</template>
-                </td>
-              </tr>
-            </tbody>
-          </table>
-          <div v-if="pages > 1" class="retitle-pager">
-            <button type="button" :disabled="state.page === 0" @click="c.setPage(state.page - 1)">Previous</button>
-            <span class="hint">Page {{ state.page + 1 }} of {{ pages }}</span>
-            <button type="button" :disabled="state.page >= pages - 1" @click="c.setPage(state.page + 1)">Next</button>
-          </div>
-          <div class="retitle-buttons">
-            <button type="button" class="primary" :disabled="busy || !c.canApply()" data-testid="apply" @click="run">Fix {{ checked.toLocaleString("en-US") }} title{{ checked === 1 ? "" : "s" }}</button>
-          </div>
-        </template>
-      </section>
-
-      <div v-if="state.phase === 'running'" class="retitle-buttons">
-        <p class="hint" role="status">{{ state.progress }}</p>
-        <button v-if="state.jobId !== null" type="button" @click="cancelRun">Cancel</button>
-      </div>
-
-      <section v-if="state.report" class="retitle-done" aria-label="Result" data-testid="report">
-        <p role="status">{{ describeReport(state.report) }}</p>
-        <ul v-if="state.report.skipped.length > 0">
-          <li v-for="s in state.report.skipped.slice(0, 5)" :key="s.book_id">Book {{ s.book_id }} skipped: {{ describeSkip(s.reason) }}</li>
-        </ul>
-        <ul v-if="state.report.failed.length > 0" class="error">
-          <li v-for="(f, i) in state.report.failed.slice(0, 5)" :key="i">Book {{ f.book_id }}: {{ describeFailure(f) }}</li>
-        </ul>
-        <button type="button" :disabled="busy" data-testid="undo-run" @click="undo(state.report.run_id)">Undo this run</button>
-      </section>
-      <p v-if="state.undone" class="hint" role="status">{{ state.undone }}</p>
-
-      <section v-if="state.runs.length > 0 && !state.report" class="retitle-runs">
-        <h4>Earlier runs</h4>
-        <ul>
-          <li v-for="r in state.runs.slice(0, 5)" :key="r.run_id">
-            {{ r.books.toLocaleString("en-US") }} book{{ r.books === 1 ? "" : "s" }} · <span class="hint">{{ new Date(r.created_at * 1000).toLocaleString() }}</span>
-            <button type="button" :disabled="busy" @click="undo(r.run_id)">Undo</button>
-          </li>
-        </ul>
-      </section>
+    <div class="retitle-buttons">
+      <button type="button" :disabled="busy" data-testid="find" @click="find">{{ state.phase === "finding" ? "Looking…" : state.rows.length > 0 ? "Find again" : "Find titles to fix" }}</button>
+      <span v-if="c.proposedIsStale()" class="hint" role="status">The file names below are for the old template; find again to refresh them. They follow the template when applied.</span>
     </div>
-  </div>
+    <p v-if="state.error" class="error" role="alert">{{ state.error }}</p>
+
+    <section v-if="state.phase === 'ready'" class="retitle-table" aria-label="Titles to fix" data-testid="table">
+      <p v-if="state.rows.length === 0" role="status" class="hint">No titles need fixing.</p>
+      <template v-else>
+        <div class="retitle-toolbar">
+          <select v-model="state.filter" aria-label="Filter by reason" data-testid="filter" @change="c.setFilter(state.filter)">
+            <option v-for="f in filters" :key="f.value" :value="f.value">{{ f.label }}</option>
+          </select>
+          <span role="status" class="hint" data-testid="count">{{ rowsLine }}</span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th><input ref="headerBox" type="checkbox" :checked="headerState === 'all'" aria-label="Select all" data-testid="select-all" @change="c.setAllChecked(($event.target as HTMLInputElement).checked)" /></th>
+              <th>Current title</th>
+              <th>New title</th>
+              <th>Why</th>
+              <th>File</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="r in shown" :key="r.bookId" data-testid="row">
+              <td><input v-model="r.checked" type="checkbox" :aria-label="`Fix book ${r.bookId}`" /></td>
+              <td class="muted">{{ r.currentTitle }}</td>
+              <td>
+                <input v-model="r.title" type="text" :class="{ invalid: rowProblem(r) }" :placeholder="r.reason === 'no_suggestion' ? 'Type a title' : ''" :title="rowProblem(r) ?? ''" />
+              </td>
+              <td>
+                <span class="badge" :class="r.reason">{{ REASON_LABEL[r.reason] }}</span>
+                <span v-if="!r.confident && r.reason !== 'ok' && r.reason !== 'no_suggestion'" class="badge unsure" title="Suggested from a file name that looks like a catalogue number, so not selected: check it first">check</span>
+              </td>
+              <td class="path">
+                {{ r.currentFile }}<template v-if="state.renameFiles && r.proposedFile && r.proposedFile !== r.currentFile"> → {{ r.proposedFile }}</template>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-if="pages > 1" class="retitle-pager">
+          <button type="button" :disabled="state.page === 0" @click="c.setPage(state.page - 1)">Previous</button>
+          <span class="hint">Page {{ state.page + 1 }} of {{ pages }}</span>
+          <button type="button" :disabled="state.page >= pages - 1" @click="c.setPage(state.page + 1)">Next</button>
+        </div>
+        <div class="retitle-buttons">
+          <button type="button" class="primary" :disabled="busy || !c.canApply()" data-testid="apply" @click="run">Fix {{ checked.toLocaleString("en-US") }} title{{ checked === 1 ? "" : "s" }}</button>
+        </div>
+      </template>
+    </section>
+
+    <div v-if="state.phase === 'running'" class="retitle-buttons">
+      <p class="hint" role="status">{{ state.progress }}</p>
+      <button v-if="state.jobId !== null" type="button" @click="cancelRun">Cancel</button>
+    </div>
+
+    <section v-if="state.report" class="retitle-done" aria-label="Result" data-testid="report">
+      <p role="status">{{ describeReport(state.report) }}</p>
+      <ul v-if="state.report.skipped.length > 0">
+        <li v-for="s in state.report.skipped.slice(0, 5)" :key="s.book_id">Book {{ s.book_id }} skipped: {{ describeSkip(s.reason) }}</li>
+      </ul>
+      <ul v-if="state.report.failed.length > 0" class="error">
+        <li v-for="(f, i) in state.report.failed.slice(0, 5)" :key="i">Book {{ f.book_id }}: {{ describeFailure(f) }}</li>
+      </ul>
+      <button type="button" :disabled="busy" data-testid="undo-run" @click="undo(state.report.run_id)">Undo this run</button>
+    </section>
+    <p v-if="state.undone" class="hint" role="status">{{ state.undone }}</p>
+
+    <section v-if="state.runs.length > 0 && !state.report" class="retitle-runs">
+      <h4>Earlier runs</h4>
+      <ul>
+        <li v-for="r in state.runs.slice(0, 5)" :key="r.run_id">
+          {{ r.books.toLocaleString("en-US") }} book{{ r.books === 1 ? "" : "s" }} · <span class="hint">{{ new Date(r.created_at * 1000).toLocaleString() }}</span>
+          <button type="button" :disabled="busy" @click="undo(r.run_id)">Undo</button>
+        </li>
+      </ul>
+    </section>
+  </Dialog>
 </template>
 
 <style scoped>
-.retitle-backdrop {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.45);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 20;
-}
-.retitle-panel {
-  position: relative;
-  background: var(--bg);
-  border-radius: 6px;
-  padding: 1.25rem 1.5rem;
-  width: min(1100px, 96vw);
-  max-height: 90vh;
-  overflow: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 0.9rem;
-}
-.retitle-panel h3,
-.retitle-panel h4 {
+h4 {
   margin: 0;
-}
-.retitle-close {
-  position: absolute;
-  top: 0.4rem;
-  right: 0.5rem;
-  border: none;
-  background: none;
-  cursor: pointer;
-  font-size: var(--fs-medium);
 }
 .hint {
   color: var(--fg-muted);

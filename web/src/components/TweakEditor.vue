@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import Dialog from "./Dialog.vue";
+import { confirmDialog } from "./dialogs/confirm";
 import { insertAt, searchChars, type SpecialChar } from "../library/charSelect";
 import { computed, nextTick, onBeforeUnmount, ref } from "vue";
 import { commitTweakSession, discardTweakSession, fetchToc, fetchTweakFile, openTweakSession, saveToc, saveTweakFile, type TocNode } from "../library/tweak";
@@ -155,7 +157,7 @@ void open();
 
 async function selectFile(name: string) {
   if (!sessionId.value) return;
-  if (dirty() && !confirm(`Discard unsaved changes to "${selectedFile.value}"?`)) return;
+  if (dirty() && !(await confirmDialog(`Discard unsaved changes to "${selectedFile.value}"?`, { confirmLabel: "Discard", danger: true }))) return;
   fileError.value = null;
   try {
     const text = await fetchTweakFile(sessionId.value, name);
@@ -190,7 +192,7 @@ async function save() {
 
 async function commitAndClose() {
   if (!sessionId.value) return;
-  if (dirty() && !confirm("You have unsaved changes to the current file. Save them before committing?")) return;
+  if (dirty() && !(await confirmDialog("You have unsaved changes to the current file. Save them before committing?", { confirmLabel: "Save and commit" }))) return;
   committing.value = true;
   fileError.value = null;
   try {
@@ -358,7 +360,7 @@ async function runFind() {
 async function runReplaceAll() {
   if (!sessionId.value || !findText.value || !findResult.value) return;
   const n = findResult.value.matches;
-  if (!window.confirm(`Replace ${n} occurrence(s) across ${findResult.value.files.length} file(s)? You can still discard the whole session afterwards.`)) return;
+  if (!(await confirmDialog(`Replace ${n} occurrence(s) across ${findResult.value.files.length} file(s)? You can still discard the whole session afterwards.`, { confirmLabel: "Replace all" }))) return;
 
   findBusy.value = true;
   findError.value = null;
@@ -437,261 +439,223 @@ function insertChar(c: SpecialChar) {
 </script>
 
 <template>
-  <div class="backdrop">
-    <div class="panel" role="dialog" aria-modal="true">
-      <button class="close" @click="discardAndClose">✕</button>
-      <h3>Tweak Book</h3>
-      <p v-if="loading">Loading…</p>
-      <p v-else-if="error" class="error">{{ error }}</p>
-      <template v-else>
-        <div class="mode-tabs">
-          <button type="button" :class="{ active: tab === 'files' }" @click="openTab('files')">Files</button>
-          <button type="button" :class="{ active: tab === 'toc' }" @click="openTab('toc')">Table of contents</button>
-          <button type="button" :class="{ active: tab === 'check' }" @click="openTab('check')">Check book</button>
-          <button type="button" :class="{ active: tab === 'report' }" @click="openTab('report')">Report</button>
-          <button type="button" :class="{ active: tab === 'spell' }" @click="openTab('spell')">Spelling</button>
-          <button type="button" :class="{ active: tab === 'find' }" @click="openTab('find')">Find &amp; replace</button>
-          <button type="button" :class="{ active: tab === 'fonts' }" @click="openTab('fonts')">Fonts</button>
-          <button type="button" :class="{ active: tab === 'diff' }" @click="openTab('diff')">Changes</button>
+  <Dialog title="Tweak Book" show-close :close-on-backdrop="false" size="full" @close="discardAndClose">
+    <p v-if="loading">Loading…</p>
+    <p v-else-if="error" class="error">{{ error }}</p>
+    <template v-else>
+      <div class="mode-tabs">
+        <button type="button" :class="{ active: tab === 'files' }" @click="openTab('files')">Files</button>
+        <button type="button" :class="{ active: tab === 'toc' }" @click="openTab('toc')">Table of contents</button>
+        <button type="button" :class="{ active: tab === 'check' }" @click="openTab('check')">Check book</button>
+        <button type="button" :class="{ active: tab === 'report' }" @click="openTab('report')">Report</button>
+        <button type="button" :class="{ active: tab === 'spell' }" @click="openTab('spell')">Spelling</button>
+        <button type="button" :class="{ active: tab === 'find' }" @click="openTab('find')">Find &amp; replace</button>
+        <button type="button" :class="{ active: tab === 'fonts' }" @click="openTab('fonts')">Fonts</button>
+        <button type="button" :class="{ active: tab === 'diff' }" @click="openTab('diff')">Changes</button>
+      </div>
+
+      <section v-if="tab === 'fonts'" class="editor-tool">
+        <div class="tool-actions">
+          <button type="button" :disabled="fontsBusy" @click="loadFonts">{{ fontsBusy ? "Loading…" : "Refresh" }}</button>
+        </div>
+        <p class="hint">A family this book asks for but does not embed renders as whatever the reading device happens to have.</p>
+        <p v-if="fontsError" class="error">{{ fontsError }}</p>
+        <p v-else-if="!fontsBusy && fontFamilies.length === 0" class="status">This book specifies no font families.</p>
+        <ul v-else class="check-list">
+          <li v-for="f in fontFamilies" :key="f.family" :class="f.embedded ? '' : 'level-warning'">
+            <span class="check-level">{{ f.embedded ? "embedded" : "missing" }}</span>
+            <span class="check-where">{{ f.family }}</span>
+            <span class="check-msg">{{ f.embedded ? "Shipped with the book." : "Not embedded — falls back to a device font." }}</span>
+            <span></span>
+          </li>
+        </ul>
+      </section>
+
+      <section v-else-if="tab === 'diff'" class="editor-tool">
+        <div class="tool-actions">
+          <button type="button" :disabled="diffBusy" @click="loadDiff">{{ diffBusy ? "Comparing…" : "Refresh" }}</button>
+        </div>
+        <p class="hint">Everything changed in this session — by hand, by find &amp; replace, or by the TOC editor — compared with the saved book.</p>
+        <p v-if="diffError" class="error">{{ diffError }}</p>
+        <p v-else-if="!diffBusy && diffFiles.length === 0" class="status">No changes yet.</p>
+        <div v-for="f in diffFiles" :key="f.name" class="diff-file">
+          <h4>{{ f.name }} <span class="diff-status">{{ f.status }}</span></h4>
+          <pre v-if="f.lines"><code><span v-for="(l, i) in f.lines" :key="i" :class="`diff-${l.tag}`">{{ l.tag === "add" ? "+" : l.tag === "remove" ? "-" : " " }} {{ l.text }}
+</span></code></pre>
+        </div>
+      </section>
+
+      <section v-else-if="tab === 'find'" class="editor-tool">
+        <form class="find-form" @submit.prevent="runFind">
+          <input v-model="findText" placeholder="Find…" :disabled="findBusy" />
+          <input v-model="replaceText" placeholder="Replace with…" :disabled="findBusy" />
+          <button type="submit" :disabled="findBusy || !findText">{{ findBusy ? "Searching…" : "Find" }}</button>
+          <button type="button" :disabled="findBusy || !findResult?.matches" title="Search first to see what will change" @click="runReplaceAll">
+            Replace all{{ findResult?.matches ? ` (${findResult.matches})` : "" }}
+          </button>
+        </form>
+        <div class="find-options">
+          <label><input v-model="findRegex" type="checkbox" /> Regex</label>
+          <label><input v-model="findCaseSensitive" type="checkbox" /> Match case</label>
         </div>
 
-        <section v-if="tab === 'fonts'" class="editor-tool">
-          <div class="tool-actions">
-            <button type="button" :disabled="fontsBusy" @click="loadFonts">{{ fontsBusy ? "Loading…" : "Refresh" }}</button>
-          </div>
-          <p class="hint">A family this book asks for but does not embed renders as whatever the reading device happens to have.</p>
-          <p v-if="fontsError" class="error">{{ fontsError }}</p>
-          <p v-else-if="!fontsBusy && fontFamilies.length === 0" class="status">This book specifies no font families.</p>
-          <ul v-else class="check-list">
-            <li v-for="f in fontFamilies" :key="f.family" :class="f.embedded ? '' : 'level-warning'">
-              <span class="check-level">{{ f.embedded ? "embedded" : "missing" }}</span>
-              <span class="check-where">{{ f.family }}</span>
-              <span class="check-msg">{{ f.embedded ? "Shipped with the book." : "Not embedded — falls back to a device font." }}</span>
-              <span></span>
+        <p v-if="findError" class="error">{{ findError }}</p>
+        <p v-if="findMessage" class="status">{{ findMessage }}</p>
+        <p v-else-if="findResult && findResult.matches === 0" class="status">No matches.</p>
+        <p v-else-if="findResult" class="status">{{ findResult.matches }} match(es) in {{ findResult.files.length }} file(s)</p>
+
+        <ul v-if="findResult?.files.length" class="check-list">
+          <li v-for="f in findResult.files" :key="f.name">
+            <span class="check-level">{{ f.count }}×</span>
+            <span class="check-where">
+              <button type="button" class="saved-template-name" @click="openTab('files'); selectFile(f.name)">{{ f.name }}</button>
+            </span>
+            <span class="check-msg">{{ f.samples.map((s) => `${s.line}: ${s.context}`).join(" · ") }}</span>
+            <span></span>
+          </li>
+        </ul>
+      </section>
+
+      <section v-else-if="tab === 'spell'" class="editor-tool">
+        <div class="tool-actions">
+          <button type="button" :disabled="spellBusy" @click="runSpellCheck">{{ spellBusy ? "Checking…" : "Re-check" }}</button>
+        </div>
+        <p class="hint">Checked against the en-US dictionary shipped with the app.</p>
+        <p v-if="spellError" class="error">{{ spellError }}</p>
+        <p v-else-if="!spellBusy && spellWords.length === 0" class="status">No misspellings found.</p>
+        <p v-else-if="spellWords.length" class="status">{{ spellWords.length }} word(s) not recognised</p>
+        <ul v-if="spellWords.length" class="check-list">
+          <li v-for="w in spellWords" :key="w.word">
+            <span class="check-level">{{ w.count }}×</span>
+            <span class="check-where">{{ w.files.join(", ") }}</span>
+            <span class="check-msg"><strong>{{ w.word }}</strong><template v-if="w.suggestions.length"> — {{ w.suggestions.join(", ") }}</template></span>
+            <span></span>
+          </li>
+        </ul>
+      </section>
+
+      <section v-else-if="tab === 'check'" class="editor-tool">
+        <div class="tool-actions">
+          <button type="button" :disabled="checkBusy" @click="runCheck">{{ checkBusy ? "Checking…" : "Re-check" }}</button>
+          <button type="button" :disabled="checkBusy || !checkResult?.fixable" @click="runFixes">
+            Fix {{ checkResult?.fixable ?? 0 }} automatically
+          </button>
+        </div>
+        <p v-if="checkError" class="error">{{ checkError }}</p>
+        <p v-if="checkMessage" class="status">{{ checkMessage }}</p>
+        <p v-if="checkResult && checkResult.count === 0" class="status">No problems found.</p>
+        <p v-else-if="checkResult" class="status">{{ checkResult.count }} item(s), {{ checkResult.errors }} error(s)</p>
+        <ul v-if="checkResult?.items.length" class="check-list">
+          <li v-for="(item, i) in checkResult.items" :key="i" :class="`level-${item.level}`">
+            <span class="check-level">{{ item.level }}</span>
+            <span class="check-where">{{ item.file }}<template v-if="item.line">:{{ item.line }}</template></span>
+            <span class="check-msg" :title="item.help">{{ item.message }}</span>
+            <span v-if="item.fixable" class="check-fixable">auto-fixable</span>
+          </li>
+        </ul>
+      </section>
+
+      <section v-else-if="tab === 'report'" class="editor-tool">
+        <div class="tool-actions">
+          <button type="button" :disabled="reportBusy" @click="loadReport">{{ reportBusy ? "Loading…" : "Refresh" }}</button>
+        </div>
+        <p v-if="reportError" class="error">{{ reportError }}</p>
+        <template v-else-if="report">
+          <p class="status">{{ report.files.count }} file(s), {{ formatSize(report.files.total_size) }} total · {{ report.images.count }} image(s)</p>
+          <ul class="report-list">
+            <li v-for="f in report.files.items" :key="f.name">
+              <span class="report-name">{{ f.name }}</span>
+              <span class="report-category">{{ f.category }}</span>
+              <span class="report-size">{{ formatSize(f.size) }}</span>
             </li>
           </ul>
-        </section>
-
-        <section v-else-if="tab === 'diff'" class="editor-tool">
-          <div class="tool-actions">
-            <button type="button" :disabled="diffBusy" @click="loadDiff">{{ diffBusy ? "Comparing…" : "Refresh" }}</button>
-          </div>
-          <p class="hint">Everything changed in this session — by hand, by find &amp; replace, or by the TOC editor — compared with the saved book.</p>
-          <p v-if="diffError" class="error">{{ diffError }}</p>
-          <p v-else-if="!diffBusy && diffFiles.length === 0" class="status">No changes yet.</p>
-          <div v-for="f in diffFiles" :key="f.name" class="diff-file">
-            <h4>{{ f.name }} <span class="diff-status">{{ f.status }}</span></h4>
-            <pre v-if="f.lines"><code><span v-for="(l, i) in f.lines" :key="i" :class="`diff-${l.tag}`">{{ l.tag === "add" ? "+" : l.tag === "remove" ? "-" : " " }} {{ l.text }}
-</span></code></pre>
-          </div>
-        </section>
-
-        <section v-else-if="tab === 'find'" class="editor-tool">
-          <form class="find-form" @submit.prevent="runFind">
-            <input v-model="findText" placeholder="Find…" :disabled="findBusy" />
-            <input v-model="replaceText" placeholder="Replace with…" :disabled="findBusy" />
-            <button type="submit" :disabled="findBusy || !findText">{{ findBusy ? "Searching…" : "Find" }}</button>
-            <button type="button" :disabled="findBusy || !findResult?.matches" title="Search first to see what will change" @click="runReplaceAll">
-              Replace all{{ findResult?.matches ? ` (${findResult.matches})` : "" }}
-            </button>
-          </form>
-          <div class="find-options">
-            <label><input v-model="findRegex" type="checkbox" /> Regex</label>
-            <label><input v-model="findCaseSensitive" type="checkbox" /> Match case</label>
-          </div>
-
-          <p v-if="findError" class="error">{{ findError }}</p>
-          <p v-if="findMessage" class="status">{{ findMessage }}</p>
-          <p v-else-if="findResult && findResult.matches === 0" class="status">No matches.</p>
-          <p v-else-if="findResult" class="status">{{ findResult.matches }} match(es) in {{ findResult.files.length }} file(s)</p>
-
-          <ul v-if="findResult?.files.length" class="check-list">
-            <li v-for="f in findResult.files" :key="f.name">
-              <span class="check-level">{{ f.count }}×</span>
-              <span class="check-where">
-                <button type="button" class="saved-template-name" @click="openTab('files'); selectFile(f.name)">{{ f.name }}</button>
-              </span>
-              <span class="check-msg">{{ f.samples.map((s) => `${s.line}: ${s.context}`).join(" · ") }}</span>
-              <span></span>
+          <ul v-if="report.images.items.length" class="report-list">
+            <li v-for="img in report.images.items" :key="img.name">
+              <span class="report-name">{{ img.name }}</span>
+              <span class="report-category">{{ img.width }}×{{ img.height }}</span>
+              <span class="report-size">{{ formatSize(img.size) }} · used {{ img.usage }}×</span>
             </li>
           </ul>
-        </section>
+        </template>
+      </section>
 
-        <section v-else-if="tab === 'spell'" class="editor-tool">
-          <div class="tool-actions">
-            <button type="button" :disabled="spellBusy" @click="runSpellCheck">{{ spellBusy ? "Checking…" : "Re-check" }}</button>
-          </div>
-          <p class="hint">Checked against the en-US dictionary shipped with the app.</p>
-          <p v-if="spellError" class="error">{{ spellError }}</p>
-          <p v-else-if="!spellBusy && spellWords.length === 0" class="status">No misspellings found.</p>
-          <p v-else-if="spellWords.length" class="status">{{ spellWords.length }} word(s) not recognised</p>
-          <ul v-if="spellWords.length" class="check-list">
-            <li v-for="w in spellWords" :key="w.word">
-              <span class="check-level">{{ w.count }}×</span>
-              <span class="check-where">{{ w.files.join(", ") }}</span>
-              <span class="check-msg"><strong>{{ w.word }}</strong><template v-if="w.suggestions.length"> — {{ w.suggestions.join(", ") }}</template></span>
-              <span></span>
+      <template v-if="tab === 'files'">
+        <p class="hint">Plain-text editing of this EPUB's own internal files. Turn on the preview to see your changes rendered as you type.</p>
+        <div class="editor">
+          <ul class="file-list">
+            <li v-for="name in files" :key="name">
+              <button type="button" :class="{ active: name === selectedFile }" @click="selectFile(name)">{{ name }}</button>
             </li>
           </ul>
-        </section>
-
-        <section v-else-if="tab === 'check'" class="editor-tool">
-          <div class="tool-actions">
-            <button type="button" :disabled="checkBusy" @click="runCheck">{{ checkBusy ? "Checking…" : "Re-check" }}</button>
-            <button type="button" :disabled="checkBusy || !checkResult?.fixable" @click="runFixes">
-              Fix {{ checkResult?.fixable ?? 0 }} automatically
-            </button>
-          </div>
-          <p v-if="checkError" class="error">{{ checkError }}</p>
-          <p v-if="checkMessage" class="status">{{ checkMessage }}</p>
-          <p v-if="checkResult && checkResult.count === 0" class="status">No problems found.</p>
-          <p v-else-if="checkResult" class="status">{{ checkResult.count }} item(s), {{ checkResult.errors }} error(s)</p>
-          <ul v-if="checkResult?.items.length" class="check-list">
-            <li v-for="(item, i) in checkResult.items" :key="i" :class="`level-${item.level}`">
-              <span class="check-level">{{ item.level }}</span>
-              <span class="check-where">{{ item.file }}<template v-if="item.line">:{{ item.line }}</template></span>
-              <span class="check-msg" :title="item.help">{{ item.message }}</span>
-              <span v-if="item.fixable" class="check-fixable">auto-fixable</span>
-            </li>
-          </ul>
-        </section>
-
-        <section v-else-if="tab === 'report'" class="editor-tool">
-          <div class="tool-actions">
-            <button type="button" :disabled="reportBusy" @click="loadReport">{{ reportBusy ? "Loading…" : "Refresh" }}</button>
-          </div>
-          <p v-if="reportError" class="error">{{ reportError }}</p>
-          <template v-else-if="report">
-            <p class="status">{{ report.files.count }} file(s), {{ formatSize(report.files.total_size) }} total · {{ report.images.count }} image(s)</p>
-            <ul class="report-list">
-              <li v-for="f in report.files.items" :key="f.name">
-                <span class="report-name">{{ f.name }}</span>
-                <span class="report-category">{{ f.category }}</span>
-                <span class="report-size">{{ formatSize(f.size) }}</span>
-              </li>
-            </ul>
-            <ul v-if="report.images.items.length" class="report-list">
-              <li v-for="img in report.images.items" :key="img.name">
-                <span class="report-name">{{ img.name }}</span>
-                <span class="report-category">{{ img.width }}×{{ img.height }}</span>
-                <span class="report-size">{{ formatSize(img.size) }} · used {{ img.usage }}×</span>
-              </li>
-            </ul>
-          </template>
-        </section>
-
-        <template v-if="tab === 'files'">
-          <p class="hint">Plain-text editing of this EPUB's own internal files. Turn on the preview to see your changes rendered as you type.</p>
-          <div class="editor">
-            <ul class="file-list">
-              <li v-for="name in files" :key="name">
-                <button type="button" :class="{ active: name === selectedFile }" @click="selectFile(name)">{{ name }}</button>
-              </li>
-            </ul>
-            <div class="file-content">
-              <p v-if="!selectedFile" class="hint">Select a file to edit.</p>
-              <template v-else>
-                <div class="char-bar">
-                  <button type="button" :class="{ active: charPickerOpen }" @click="charPickerOpen = !charPickerOpen">Ω Special characters</button>
-                  <button type="button" :class="{ active: previewOpen }" @click="togglePreview">
-                    {{ previewOpen ? "Hide preview" : "Show preview" }}
+          <div class="file-content">
+            <p v-if="!selectedFile" class="hint">Select a file to edit.</p>
+            <template v-else>
+              <div class="char-bar">
+                <button type="button" :class="{ active: charPickerOpen }" @click="charPickerOpen = !charPickerOpen">Ω Special characters</button>
+                <button type="button" :class="{ active: previewOpen }" @click="togglePreview">
+                  {{ previewOpen ? "Hide preview" : "Show preview" }}
+                </button>
+                <label v-if="previewOpen && previewTargets.length > 1">
+                  Previewing
+                  <select v-model="previewTarget" @change="renderPreview">
+                    <option v-for="name in previewTargets" :key="name" :value="name">{{ name }}</option>
+                  </select>
+                </label>
+              </div>
+              <div v-if="charPickerOpen" class="char-picker">
+                <input v-model="charQuery" type="search" placeholder="Search by name… (try &quot;nbsp&quot; or &quot;em dash&quot;)" />
+                <p v-if="visibleChars.length === 0" class="hint">Nothing matches.</p>
+                <div v-else class="char-grid">
+                  <button v-for="c in visibleChars" :key="c.char" type="button" :title="c.name" @click="insertChar(c)">
+                    <span class="char-glyph">{{ c.char }}</span>
+                    <span class="char-name">{{ c.name }}</span>
                   </button>
-                  <label v-if="previewOpen && previewTargets.length > 1">
-                    Previewing
-                    <select v-model="previewTarget" @change="renderPreview">
-                      <option v-for="name in previewTargets" :key="name" :value="name">{{ name }}</option>
-                    </select>
-                  </label>
                 </div>
-                <div v-if="charPickerOpen" class="char-picker">
-                  <input v-model="charQuery" type="search" placeholder="Search by name… (try &quot;nbsp&quot; or &quot;em dash&quot;)" />
-                  <p v-if="visibleChars.length === 0" class="hint">Nothing matches.</p>
-                  <div v-else class="char-grid">
-                    <button v-for="c in visibleChars" :key="c.char" type="button" :title="c.name" @click="insertChar(c)">
-                      <span class="char-glyph">{{ c.char }}</span>
-                      <span class="char-name">{{ c.name }}</span>
-                    </button>
-                  </div>
+              </div>
+              <div class="edit-and-preview" :class="{ 'with-preview': previewOpen }">
+                <textarea ref="contentArea" v-model="content" spellcheck="false" @input="schedulePreview"></textarea>
+                <div v-if="previewOpen" class="preview-pane">
+                  <p v-if="previewTargets.length === 0" class="hint">This book has no content file to preview.</p>
+                  <!-- Sandboxed: a book's own scripts must not reach the
+                       editor around them. `allow-same-origin` is needed for
+                       the document to be written into at all. -->
+                  <iframe ref="previewFrame" class="preview-frame" sandbox="allow-same-origin" title="Preview"></iframe>
+                  <p v-if="previewError" class="error">{{ previewError }}</p>
                 </div>
-                <div class="edit-and-preview" :class="{ 'with-preview': previewOpen }">
-                  <textarea ref="contentArea" v-model="content" spellcheck="false" @input="schedulePreview"></textarea>
-                  <div v-if="previewOpen" class="preview-pane">
-                    <p v-if="previewTargets.length === 0" class="hint">This book has no content file to preview.</p>
-                    <!-- Sandboxed: a book's own scripts must not reach the
-                         editor around them. `allow-same-origin` is needed for
-                         the document to be written into at all. -->
-                    <iframe ref="previewFrame" class="preview-frame" sandbox="allow-same-origin" title="Preview"></iframe>
-                    <p v-if="previewError" class="error">{{ previewError }}</p>
-                  </div>
-                </div>
-              </template>
-            </div>
+              </div>
+            </template>
           </div>
-          <p v-if="fileError" class="error">{{ fileError }}</p>
-        </template>
+        </div>
+        <p v-if="fileError" class="error">{{ fileError }}</p>
+      </template>
 
-        <template v-else-if="tab === 'toc'">
-          <p class="hint">Add, remove, reorder, and rename real table-of-contents entries. A destination points at a file in this book (e.g. "chapter1.xhtml"); ⚠ marks a destination that no longer exists.</p>
-          <p v-if="tocLoading">Loading…</p>
-          <template v-else>
-            <div class="toc-editor">
-              <p v-if="tocTree.length === 0" class="hint">No entries yet.</p>
-              <TocTreeNode v-model="tocTree" />
-              <button type="button" @click="tocTree.push({ title: 'New Entry', dest: null, frag: null, children: [] })">+ Add top-level entry</button>
-            </div>
-            <p v-if="tocError" class="error">{{ tocError }}</p>
-            <p v-if="tocSaved" class="saved">Saved to this session -- click "Save book" to write it to the library.</p>
-          </template>
-          <div class="actions">
-            <button type="button" :disabled="tocLoading || tocSaving" @click="saveTocTree">{{ tocSaving ? "Saving…" : "Save table of contents" }}</button>
+      <template v-else-if="tab === 'toc'">
+        <p class="hint">Add, remove, reorder, and rename real table-of-contents entries. A destination points at a file in this book (e.g. "chapter1.xhtml"); ⚠ marks a destination that no longer exists.</p>
+        <p v-if="tocLoading">Loading…</p>
+        <template v-else>
+          <div class="toc-editor">
+            <p v-if="tocTree.length === 0" class="hint">No entries yet.</p>
+            <TocTreeNode v-model="tocTree" />
+            <button type="button" @click="tocTree.push({ title: 'New Entry', dest: null, frag: null, children: [] })">+ Add top-level entry</button>
           </div>
+          <p v-if="tocError" class="error">{{ tocError }}</p>
+          <p v-if="tocSaved" class="saved">Saved to this session -- click "Save book" to write it to the library.</p>
         </template>
-
         <div class="actions">
-          <button type="button" :disabled="!selectedFile || saving" @click="save">{{ saving ? "Saving…" : "Save file" }}</button>
-          <button type="button" class="read" :disabled="committing" @click="commitAndClose">{{ committing ? "Saving book…" : "Save book" }}</button>
-          <button type="button" :disabled="committing" @click="discardAndClose">Discard all changes</button>
+          <button type="button" :disabled="tocLoading || tocSaving" @click="saveTocTree">{{ tocSaving ? "Saving…" : "Save table of contents" }}</button>
         </div>
       </template>
-    </div>
-  </div>
+
+      <div class="actions">
+        <button type="button" :disabled="!selectedFile || saving" @click="save">{{ saving ? "Saving…" : "Save file" }}</button>
+        <button type="button" class="read" :disabled="committing" @click="commitAndClose">{{ committing ? "Saving book…" : "Save book" }}</button>
+        <button type="button" :disabled="committing" @click="discardAndClose">Discard all changes</button>
+      </div>
+    </template>
+  </Dialog>
 </template>
 
 <style scoped>
-.backdrop {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.4);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 10;
-}
-.panel {
-  background: var(--bg);
-  border-radius: 6px;
-  padding: 1.5em;
-  width: 90%;
-  max-width: 900px;
-  height: 80vh;
-  overflow: hidden;
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  gap: 0.75em;
-}
-.close {
-  position: absolute;
-  top: 0.5em;
-  right: 0.5em;
-  border: none;
-  background: none;
-  font-size: var(--fs-medium);
-  cursor: pointer;
-}
-h3 {
-  margin: 0;
-}
 .hint {
   color: var(--fg-faint);
   font-size: var(--fs-small);

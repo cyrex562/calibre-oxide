@@ -3,6 +3,7 @@
 // Esc to close. Used for the cover and for a rendered PDF page, so a
 // title page can be read. The maths is in library/imageViewer.ts.
 
+import Dialog from "./Dialog.vue";
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import { actualSizeState, fitState, panBy, wheelFactor, zoomAt, type Size, type ViewState } from "../library/imageViewer";
@@ -156,7 +157,8 @@ const imgStyle = computed(() => ({
 </script>
 
 <template>
-  <div class="viewer" role="dialog" aria-modal="true" :aria-label="`Image viewer: ${title}`">
+  <Dialog size="bare" :label="`Image viewer: ${title}`" @close="emit('close')">
+  <div class="viewer">
     <div class="bar">
       <span class="title">{{ title }}<span v-if="caption" class="caption"> · {{ caption }}</span></span>
       <span class="spacer"></span>
@@ -174,13 +176,13 @@ const imgStyle = computed(() => ({
       <img v-if="src" :src="src" :alt="title" class="picture" draggable="false" :style="imgStyle" @load="onLoad" />
     </div>
   </div>
+  </Dialog>
 </template>
 
 <style scoped>
 .viewer {
-  position: fixed;
-  inset: 0;
-  z-index: 100;
+  flex: 1;
+  min-height: 0;
   background: rgba(0, 0, 0, 0.92);
   display: flex;
   flex-direction: column;

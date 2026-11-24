@@ -27,7 +27,7 @@
 import type { BookSummary, FieldMetaEntry } from "./types";
 
 /** How a cell's value should be turned into text. */
-export type ColumnKind = "text" | "list" | "date" | "rating" | "formats" | "number";
+export type ColumnKind = "text" | "list" | "date" | "rating" | "formats" | "number" | "bytes";
 
 export interface BookColumn {
   /** Key into the book row. */
@@ -69,7 +69,7 @@ export type CellEditor =
 export const DEFAULT_VISIBLE_KEYS = ["title", "authors", "series", "series_index", "tags", "publisher", "timestamp", "formats"];
 
 /** Per-field display rules, keyed by the book row's own key. */
-const KNOWN_COLUMNS: Record<string, { label: string; kind: ColumnKind; width: number; tooltip?: string; editor?: CellEditor }> = {
+const KNOWN_COLUMNS: Record<string, { label: string; kind: ColumnKind; width: number; tooltip?: string; editor?: CellEditor; sortKey?: string }> = {
   title: { label: "Title", kind: "text", width: 320, editor: { type: "text" } },
   authors: { label: "Authors", kind: "list", width: 200, editor: { type: "authors" } },
   author_sort: { label: "Author sort", kind: "text", width: 200 },
@@ -88,7 +88,32 @@ const KNOWN_COLUMNS: Record<string, { label: string; kind: ColumnKind; width: nu
   comments: { label: "Comments", kind: "text", width: 260 },
   id: { label: "ID", kind: "number", width: 70 },
   uuid: { label: "UUID", kind: "text", width: 260 },
+  // File-oriented columns, for managing a collection of files. The server adds
+  // these three to a row when asked (`/ajax/books?files=1`) and sorts by them
+  // itself; they are read-only and hidden until picked in the column chooser.
+  size: { label: "Size", kind: "bytes", width: 90, tooltip: "Size of the book's largest file", sortKey: "size" },
+  folder: { label: "Folder", kind: "text", width: 240, tooltip: "The book's folder, relative to the library", sortKey: "folder" },
+  file_name: { label: "File name", kind: "text", width: 260, tooltip: "File name of the book's first format", sortKey: "file_name" },
 };
+
+/**
+ * A byte count for people: `0 B`, `512 B`, `12.4 KB`, `3.0 MB`. Powers of
+ * 1024, one decimal above a kilobyte, which is how calibre shows a size.
+ * Anything that is not a non-negative number gives "".
+ */
+export function formatBytes(value: unknown): string {
+  const n = typeof value === "number" ? value : typeof value === "string" && value.trim() !== "" ? Number(value) : NaN;
+  if (!Number.isFinite(n) || n < 0) return "";
+  if (n < 1024) return `${Math.round(n)} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let v = n / 1024;
+  let unit = 0;
+  while (v >= 1024 && unit < units.length - 1) {
+    v /= 1024;
+    unit += 1;
+  }
+  return `${v.toFixed(1)} ${units[unit]}`;
+}
 
 /**
  * Row keys that exist but must never become columns: internal
@@ -228,6 +253,8 @@ export function formatCell(book: BookSummary, column: BookColumn): string {
       const n = Number(value);
       return Number.isFinite(n) ? String(n) : "";
     }
+    case "bytes":
+      return formatBytes(value);
     case "text":
     default: {
       if (Array.isArray(value)) return value.join(", ");

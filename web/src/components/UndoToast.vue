@@ -29,7 +29,7 @@ import { dismissToast, runToastAction, toastState } from "../library/deleteFlow"
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-menu);
-  z-index: 30;
+  z-index: var(--z-popover);
 }
 .link {
   border: none;

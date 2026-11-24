@@ -8,6 +8,7 @@
 // EPUB only, matching what the server can open. Books without an EPUB
 // are reported per book rather than failing the batch.
 
+import Dialog from "./Dialog.vue";
 import { ref } from "vue";
 
 import { polishBooks, type PolishBookResult, type PolishOptions } from "../library/api";
@@ -82,53 +83,47 @@ async function run() {
 </script>
 
 <template>
-  <div class="manage-backdrop" @click.self="emit('close')">
-    <div class="manage-panel polish-panel" role="dialog" aria-modal="true">
-      <h3>Polish {{ bookIds.length }} book(s)</h3>
-      <p class="hint">Rewrites the EPUB in place. Books without an EPUB format are skipped and reported.</p>
+  <Dialog :title="`Polish ${bookIds.length} book(s)`" :busy="busy" size="md" @close="emit('close')">
+    <p class="hint">Rewrites the EPUB in place. Books without an EPUB format are skipped and reported.</p>
 
-      <ul class="polish-actions">
-        <li v-for="a in ACTIONS" :key="a.key">
-          <label class="field checkbox">
-            <input type="checkbox" :checked="!!selected[a.key]" :disabled="busy" @change="toggle(a.key)" />
-            {{ a.label }}
-            <span v-if="a.hint" class="hint inline">{{ a.hint }}</span>
-          </label>
-        </li>
-      </ul>
-
-      <fieldset v-if="selected.remove_unused_css" class="polish-css">
-        <legend>CSS options</legend>
-        <label v-for="c in CSS_CUSTOMIZATION" :key="c.key" class="field checkbox">
-          <input type="checkbox" :checked="!!selected[c.key]" :disabled="busy" @change="toggle(c.key)" />
-          {{ c.label }}
+    <ul class="polish-actions">
+      <li v-for="a in ACTIONS" :key="a.key">
+        <label class="field checkbox">
+          <input type="checkbox" :checked="!!selected[a.key]" :disabled="busy" @change="toggle(a.key)" />
+          {{ a.label }}
+          <span v-if="a.hint" class="hint inline">{{ a.hint }}</span>
         </label>
-      </fieldset>
+      </li>
+    </ul>
 
-      <div class="polish-buttons">
-        <button type="button" :disabled="busy" @click="run">{{ busy ? "Polishing…" : "Polish" }}</button>
-        <button type="button" :disabled="busy" @click="emit('close')">Close</button>
-      </div>
+    <fieldset v-if="selected.remove_unused_css" class="polish-css">
+      <legend>CSS options</legend>
+      <label v-for="c in CSS_CUSTOMIZATION" :key="c.key" class="field checkbox">
+        <input type="checkbox" :checked="!!selected[c.key]" :disabled="busy" @change="toggle(c.key)" />
+        {{ c.label }}
+      </label>
+    </fieldset>
 
-      <p v-if="error" class="error">{{ error }}</p>
-      <p v-if="summary" class="status">{{ summary }}</p>
-
-      <ul v-if="results" class="polish-results">
-        <li v-for="r in results" :key="r.book_id" :class="{ failed: !!r.error }">
-          <strong>Book {{ r.book_id }}</strong>
-          <span v-if="r.error" class="error">{{ r.error }}</span>
-          <span v-else-if="!r.changed" class="hint">nothing to change</span>
-          <span v-else class="polish-report">{{ (r.report ?? []).join(" · ") }}</span>
-        </li>
-      </ul>
+    <div class="polish-buttons">
+      <button type="button" :disabled="busy" @click="run">{{ busy ? "Polishing…" : "Polish" }}</button>
+      <button type="button" :disabled="busy" @click="emit('close')">Close</button>
     </div>
-  </div>
+
+    <p v-if="error" class="error">{{ error }}</p>
+    <p v-if="summary" class="status">{{ summary }}</p>
+
+    <ul v-if="results" class="polish-results">
+      <li v-for="r in results" :key="r.book_id" :class="{ failed: !!r.error }">
+        <strong>Book {{ r.book_id }}</strong>
+        <span v-if="r.error" class="error">{{ r.error }}</span>
+        <span v-else-if="!r.changed" class="hint">nothing to change</span>
+        <span v-else class="polish-report">{{ (r.report ?? []).join(" · ") }}</span>
+      </li>
+    </ul>
+  </Dialog>
 </template>
 
 <style scoped>
-.polish-panel {
-  min-width: min(640px, 92vw);
-}
 .polish-actions {
   list-style: none;
   margin: 0 0 0.5rem;

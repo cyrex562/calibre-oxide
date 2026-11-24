@@ -48,6 +48,15 @@
   --radius: 3px;
   --radius-lg: 6px;   /* dialogs and menus only                  */
 
+  /* Stacking. One scale, so a dialog never loses to a stray z-index. A
+     dialog opened over another is appended to <body> later, so it paints
+     above it at the same level. */
+  --z-sticky: 3;      /* table header, sticky cells              */
+  --z-popover: 30;    /* toasts, folder-tree flyouts             */
+  --z-dialog: 100;    /* every modal dialog                      */
+  --z-menu: 1000;     /* context menus, which open over dialogs  */
+  --z-suggest: 3000;  /* autocomplete lists                      */
+
   /* Colour — light. */
   --bg: #ffffff;
   --bg-sunken: #f2f3f5;             /* side panels                */
@@ -265,19 +274,9 @@ a {
   color: var(--accent);
 }
 
-/* The shared modal frame: LibraryView and the dialog components it opens
-   (Add folder, Help, Trash, Polish, Mapper, Annotations) all use these
-   classes, so they live here -- a scoped copy in LibraryView never reached
-   the child components, which then rendered without a frame or backdrop. */
-.manage-backdrop {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.4);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 10;
-}
+/* The shared modal frame. Dialog.vue puts `.manage-panel` on every dialog's
+   panel, and the rules for the form rows and notes inside it live here, so a
+   dialog's content needs no copy of them. (The backdrop is Dialog's own.) */
 .manage-panel {
   background: var(--bg);
   border-radius: 6px;
@@ -320,5 +319,36 @@ a {
   margin: 0;
 }
 .manage-panel .status {
+  margin: 0;
+}
+
+/* Rows and notes several dialogs share (the library manager, Switch / New library). */
+.manage-panel .manage-list {
+  list-style: none;
+  margin: 0 0 0.75em;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4em;
+}
+.manage-panel .manage-list li {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+}
+.manage-panel .manage-form {
+  display: flex;
+  gap: 0.5em;
+}
+.manage-panel .manage-form input {
+  flex: 1;
+  font: inherit;
+  padding: 0.35em 0.5em;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.manage-panel .news-hint {
+  color: var(--fg-muted);
+  font-size: var(--fs-body);
   margin: 0;
 }

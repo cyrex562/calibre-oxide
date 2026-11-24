@@ -5,6 +5,8 @@
 // The wording and arithmetic live in ../library/trash.ts. Deleting for good
 // and emptying both ask first; restoring does not, since it undoes a deletion.
 
+import Dialog from "./Dialog.vue";
+import { confirmDialog } from "./dialogs/confirm";
 import { computed, onMounted, ref } from "vue";
 
 import { deleteTrashEntry, emptyTrash, fetchTrash, restoreTrashEntry, type RestoreResult } from "../library/api";
@@ -74,17 +76,17 @@ function restore() {
   });
 }
 
-function deleteForever() {
+async function deleteForever() {
   const targets = chosen.value;
-  if (targets.length === 0 || !window.confirm(confirmDeleteForever(targets))) return;
+  if (targets.length === 0 || !(await confirmDialog(confirmDeleteForever(targets), { confirmLabel: "Delete permanently", danger: true }))) return;
   void run(async () => {
     for (const entry of targets) await deleteTrashEntry({ kind: entry.kind, key: entry.key });
     return `Permanently deleted ${targets.length} item${targets.length === 1 ? "" : "s"}.`;
   });
 }
 
-function empty() {
-  if (!listing.value || listing.value.count === 0 || !window.confirm(confirmEmpty(listing.value))) return;
+async function empty() {
+  if (!listing.value || listing.value.count === 0 || !(await confirmDialog(confirmEmpty(listing.value), { confirmLabel: "Empty the trash", danger: true }))) return;
   void run(async () => {
     const { removed } = await emptyTrash();
     return `Emptied the trash (${removed} item${removed === 1 ? "" : "s"}).`;
@@ -93,61 +95,55 @@ function empty() {
 </script>
 
 <template>
-  <div class="manage-backdrop" @click.self="emit('close')">
-    <div class="manage-panel trash-panel" role="dialog" aria-modal="true" aria-label="Trash">
-      <h3>Trash</h3>
-      <p class="hint">
-        Books and formats you removed from the library, kept inside it so they can be put back.
-        <template v-if="listing"> {{ describeTrash(listing) }}</template>
-      </p>
+  <Dialog title="Trash" :busy="busy" size="lg" @close="emit('close')">
+    <p class="hint">
+      Books and formats you removed from the library, kept inside it so they can be put back.
+      <template v-if="listing"> {{ describeTrash(listing) }}</template>
+    </p>
 
-      <p v-if="error" class="error" role="alert">{{ error }}</p>
-      <p v-if="status" class="status" role="status">{{ status }}</p>
+    <p v-if="error" class="error" role="alert">{{ error }}</p>
+    <p v-if="status" class="status" role="status">{{ status }}</p>
 
-      <div v-if="listing && entries.length" class="trash-table-wrap">
-        <table class="trash-table">
-          <thead>
-            <tr>
-              <th><input type="checkbox" :checked="selected.size === entries.length" aria-label="Select all" @change="toggleAll" /></th>
-              <th>Title</th>
-              <th>Author</th>
-              <th>What</th>
-              <th>Size</th>
-              <th>Deleted</th>
-              <th>Expires</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="entry in entries" :key="entryId(entry)" :class="{ chosen: selected.has(entryId(entry)) }" @click="toggle(entry)">
-              <td><input type="checkbox" :checked="selected.has(entryId(entry))" :aria-label="`Select ${entry.title}`" @click.stop @change="toggle(entry)" /></td>
-              <td class="trash-title" :title="entry.original_path">{{ entry.title }}</td>
-              <td>{{ entry.authors }}</td>
-              <td>{{ describeKind(entry) }}</td>
-              <td class="num">{{ formatSize(entry.size) }}</td>
-              <td>{{ formatDeleted(entry) }}</td>
-              <td :title="entry.problem ?? ''">{{ entry.problem ? "can’t restore here" : timeLeft(entry, nowSeconds) }}</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-      <p v-else-if="listing" class="hint">Nothing here.</p>
-      <p v-else-if="!error" class="hint">Loading…</p>
-
-      <div class="trash-actions">
-        <button type="button" :disabled="busy || chosen.length === 0 || chosen.every((e) => e.problem !== null)" @click="restore">Restore{{ chosen.length ? ` (${chosen.length})` : "" }}</button>
-        <button type="button" :disabled="busy || chosen.length === 0" @click="deleteForever">Delete permanently…</button>
-        <button type="button" :disabled="busy || !listing || listing.count === 0" @click="empty">Empty trash…</button>
-        <span class="trash-spacer"></span>
-        <button type="button" :disabled="busy" @click="emit('close')">Close</button>
-      </div>
+    <div v-if="listing && entries.length" class="trash-table-wrap">
+      <table class="trash-table">
+        <thead>
+          <tr>
+            <th><input type="checkbox" :checked="selected.size === entries.length" aria-label="Select all" @change="toggleAll" /></th>
+            <th>Title</th>
+            <th>Author</th>
+            <th>What</th>
+            <th>Size</th>
+            <th>Deleted</th>
+            <th>Expires</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="entry in entries" :key="entryId(entry)" :class="{ chosen: selected.has(entryId(entry)) }" @click="toggle(entry)">
+            <td><input type="checkbox" :checked="selected.has(entryId(entry))" :aria-label="`Select ${entry.title}`" @click.stop @change="toggle(entry)" /></td>
+            <td class="trash-title" :title="entry.original_path">{{ entry.title }}</td>
+            <td>{{ entry.authors }}</td>
+            <td>{{ describeKind(entry) }}</td>
+            <td class="num">{{ formatSize(entry.size) }}</td>
+            <td>{{ formatDeleted(entry) }}</td>
+            <td :title="entry.problem ?? ''">{{ entry.problem ? "can’t restore here" : timeLeft(entry, nowSeconds) }}</td>
+          </tr>
+        </tbody>
+      </table>
     </div>
-  </div>
+    <p v-else-if="listing" class="hint">Nothing here.</p>
+    <p v-else-if="!error" class="hint">Loading…</p>
+
+    <div class="trash-actions">
+      <button type="button" :disabled="busy || chosen.length === 0 || chosen.every((e) => e.problem !== null)" @click="restore">Restore{{ chosen.length ? ` (${chosen.length})` : "" }}</button>
+      <button type="button" :disabled="busy || chosen.length === 0" @click="deleteForever">Delete permanently…</button>
+      <button type="button" :disabled="busy || !listing || listing.count === 0" @click="empty">Empty trash…</button>
+      <span class="trash-spacer"></span>
+      <button type="button" :disabled="busy" @click="emit('close')">Close</button>
+    </div>
+  </Dialog>
 </template>
 
 <style scoped>
-.trash-panel {
-  min-width: min(900px, 94vw);
-}
 .trash-table-wrap {
   max-height: 50vh;
   overflow: auto;

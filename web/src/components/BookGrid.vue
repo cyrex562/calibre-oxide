@@ -4,6 +4,7 @@
 // are rendered (see library/virtualList.ts). Thumbnails are therefore
 // requested only for cards that are actually on screen.
 
+import { useKeepScroll } from "../library/keepScroll";
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import type { BookSummary } from "../library/types";
@@ -33,6 +34,7 @@ const emit = defineEmits<{
 }>();
 
 const scroller = ref<HTMLElement | null>(null);
+useKeepScroll(scroller);
 const width = ref(FALLBACK_WIDTH);
 const height = ref(FALLBACK_HEIGHT);
 const scrollTop = ref(0);

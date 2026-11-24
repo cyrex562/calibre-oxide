@@ -395,7 +395,7 @@ impl Cache {
     }
 
     /// Records, durably, that a change reached `metadata.db` but not the log.
-    fn note_change_log_gap(&self, error: &str) {
+    pub(crate) fn note_change_log_gap(&self, error: &str) {
         let path = self.change_log_gap_path();
         let mut gap = self.change_log_gap().unwrap_or(ChangeLogGap { missed: 0, first_at: crate::trash::now_secs(), last_error: String::new() });
         gap.missed += 1;
@@ -2024,6 +2024,53 @@ impl Cache {
         Ok(out)
     }
 
+    /// The file name (`stem.ext`, extension lowercase) of each book's
+    /// primary format, for the table's File name column and its sort.
+    ///
+    /// "Primary" is the first format in alphabetical order, the same one the
+    /// JSON API calls `main_format`. `ids` of `None` means every book; it is
+    /// one query either way (an `IN` list in chunks for a given set), never one
+    /// per book and never a stat of the disk, so it stays cheap on 100k books.
+    /// A format whose `data.name` is empty falls back to the sanitized title,
+    /// as [`Cache::get_data_as_dict`] does.
+    pub fn primary_file_names(&self, ids: Option<&[i32]>) -> Result<HashMap<i32, String>> {
+        let mut best: HashMap<i32, (String, String)> = HashMap::new();
+        let mut take = |book: i32, fmt: String, name: String| {
+            let better = best.get(&book).is_none_or(|(f, _)| fmt < *f);
+            if better {
+                best.insert(book, (fmt, name));
+            }
+        };
+        {
+            let conn = self.backend.conn.lock().unwrap();
+            match ids {
+                None => {
+                    let mut stmt = conn.prepare("SELECT book, lower(format), name FROM data")?;
+                    for row in stmt.query_map([], |r| Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))? {
+                        let (b, f, n) = row?;
+                        take(b, f, n);
+                    }
+                }
+                Some(ids) => {
+                    for chunk in ids.chunks(500) {
+                        let marks = vec!["?"; chunk.len()].join(",");
+                        let mut stmt = conn.prepare(&format!("SELECT book, lower(format), name FROM data WHERE book IN ({marks})"))?;
+                        for row in stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))? {
+                            let (b, f, n) = row?;
+                            take(b, f, n);
+                        }
+                    }
+                }
+            }
+        }
+        let mut out = HashMap::with_capacity(best.len());
+        for (book, (fmt, name)) in best {
+            let stem = if name.is_empty() { self.field_for(book, "title")?.map(|t| sanitize_file_name(&t)).unwrap_or_default() } else { name };
+            out.insert(book, format!("{stem}.{fmt}"));
+        }
+        Ok(out)
+    }
+
     /// The stem this book's format files share, if they share one.
     ///
     /// `None` when the book has no formats, or when two formats
@@ -3011,6 +3058,14 @@ impl Cache {
     ) -> anyhow::Result<()> {
         let mut conn = self.backend.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        Self::link_many_to_one_in(&tx, book_id, table, link_table, link_col, value)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The body of [`Cache::set_many_to_one_field`] on a transaction the
+    /// caller owns, so a batch of books can share one commit.
+    pub(crate) fn link_many_to_one_in(tx: &rusqlite::Connection, book_id: i32, table: &str, link_table: &str, link_col: &str, value: &str) -> anyhow::Result<()> {
         tx.execute(
             &format!("DELETE FROM {link_table} WHERE book = ?1"),
             (book_id,),
@@ -3032,7 +3087,6 @@ impl Cache {
                 (book_id, item_id),
             )?;
         }
-        tx.commit()?;
         Ok(())
     }
 
@@ -3107,9 +3161,16 @@ impl Cache {
     }
 
     fn set_rating_field(&self, book_id: i32, value: &str) -> anyhow::Result<()> {
-        let rating: i32 = value.parse().unwrap_or(0);
         let mut conn = self.backend.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        Self::set_rating_in(&tx, book_id, value)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The body of [`Cache::set_rating_field`] on a transaction the caller owns.
+    pub(crate) fn set_rating_in(tx: &rusqlite::Connection, book_id: i32, value: &str) -> anyhow::Result<()> {
+        let rating: i32 = value.parse().unwrap_or(0);
         tx.execute("DELETE FROM books_ratings_link WHERE book = ?1", (book_id,))?;
         if rating > 0 {
             let rating_id: i32 = {
@@ -3127,13 +3188,19 @@ impl Cache {
                 (book_id, rating_id),
             )?;
         }
-        tx.commit()?;
         Ok(())
     }
 
     fn set_identifiers_field(&self, book_id: i32, value: &str) -> anyhow::Result<()> {
         let mut conn = self.backend.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        Self::set_identifiers_in(&tx, book_id, value)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The body of [`Cache::set_identifiers_field`] on a transaction the caller owns.
+    pub(crate) fn set_identifiers_in(tx: &rusqlite::Connection, book_id: i32, value: &str) -> anyhow::Result<()> {
         tx.execute("DELETE FROM identifiers WHERE book = ?1", (book_id,))?;
         for pair in value.split(',') {
             let pair = pair.trim();
@@ -3149,8 +3216,132 @@ impl Cache {
                 }
             }
         }
-        tx.commit()?;
         Ok(())
+    }
+
+    /// The fields [`Cache::set_fields_for_books`] writes inside its one
+    /// transaction. Anything else (custom columns, whose writes run their own
+    /// transaction) goes through [`Cache::set_field`] per book.
+    fn is_batchable_field(field: &str) -> bool {
+        matches!(
+            field,
+            "title" | "sort" | "author_sort" | "isbn" | "series_index" | "timestamp" | "pubdate" | "comments" | "has_cover" | "series" | "publisher" | "rating" | "tags" | "languages" | "authors" | "identifiers"
+        )
+    }
+
+    /// [`Cache::set_field_inner`] for the batchable fields, on a transaction the
+    /// caller owns. Same writes, same value rules.
+    fn set_field_in_tx(tx: &rusqlite::Connection, book_id: i32, field: &str, value: &str) -> anyhow::Result<()> {
+        match field {
+            "title" | "sort" if value.is_empty() => {}
+            "title" | "sort" | "author_sort" | "isbn" => {
+                tx.execute(&format!("UPDATE books SET {field} = ?1 WHERE id = ?2"), (value, book_id))?;
+            }
+            "series_index" => {
+                let val: f64 = value.parse().unwrap_or(1.0);
+                tx.execute("UPDATE books SET series_index = ?1 WHERE id = ?2", (val, book_id))?;
+            }
+            "timestamp" | "pubdate" => {
+                tx.execute(&format!("UPDATE books SET {field} = ?1 WHERE id = ?2"), (value, book_id))?;
+            }
+            "comments" => {
+                tx.execute("DELETE FROM comments WHERE book = ?1", (book_id,))?;
+                if !value.is_empty() {
+                    tx.execute("INSERT INTO comments (book, text) VALUES (?1, ?2)", (book_id, value))?;
+                }
+            }
+            "has_cover" => {
+                let flag = matches!(value, "1" | "true" | "True");
+                tx.execute("UPDATE books SET has_cover = ?1 WHERE id = ?2", (flag as i32, book_id))?;
+            }
+            "series" => Self::link_many_to_one_in(tx, book_id, "series", "books_series_link", "series", value)?,
+            "publisher" => Self::link_many_to_one_in(tx, book_id, "publishers", "books_publishers_link", "publisher", value)?,
+            "rating" => Self::set_rating_in(tx, book_id, value)?,
+            "tags" => Self::link_many_to_many_in(tx, book_id, "tags", "name", "books_tags_link", "tag", ", ", value)?,
+            "languages" => Self::link_many_to_many_in(tx, book_id, "languages", "lang_code", "books_languages_link", "lang_code", ", ", value)?,
+            "authors" => Self::link_many_to_many_in(tx, book_id, "authors", "name", "books_authors_link", "author", " & ", value)?,
+            "identifiers" => Self::set_identifiers_in(tx, book_id, value)?,
+            other => anyhow::bail!("Field '{other}' is not writable by this port's set_field"),
+        }
+        Ok(())
+    }
+
+    /// Applies the same `changes` (`(field, value)` as [`Cache::set_field`]
+    /// takes them) to many books, for the bulk-edit batch route.
+    ///
+    /// The standard fields of every book are written in **one** `BEGIN
+    /// IMMEDIATE` transaction with a savepoint per book, so a book that fails is
+    /// rolled back on its own and the rest commit together -- one journal sync
+    /// per call instead of one per field per book, which is what makes editing
+    /// 30,000 books on a network share tolerable. The change log gets one batch
+    /// entry for the lot (database first, log second, as every write here).
+    /// Fields the transaction cannot take (custom columns) are then applied per
+    /// book through [`Cache::set_field`].
+    ///
+    /// The result has one entry per id, in order: `Ok` when every field of that
+    /// book was written.
+    pub fn set_fields_for_books(&self, book_ids: &[i32], changes: &[(String, String)]) -> Vec<anyhow::Result<()>> {
+        let (batchable, other): (Vec<&(String, String)>, Vec<&(String, String)>) = changes.iter().partition(|(f, _)| Self::is_batchable_field(f));
+        let mut results: Vec<anyhow::Result<()>> = Vec::with_capacity(book_ids.len());
+        let mut uuids: Vec<Option<String>> = Vec::with_capacity(book_ids.len());
+        for id in book_ids {
+            uuids.push(self.book_uuid(*id).ok().flatten());
+        }
+
+        if !batchable.is_empty() {
+            let mut conn = self.backend.conn.lock().unwrap();
+            let mut tx = match conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
+                Ok(tx) => tx,
+                Err(e) => {
+                    let msg = format!("{e}");
+                    return book_ids.iter().map(|_| Err(anyhow::anyhow!("{msg}"))).collect();
+                }
+            };
+            for (idx, id) in book_ids.iter().enumerate() {
+                let one = (|| -> anyhow::Result<()> {
+                    if uuids[idx].is_none() {
+                        anyhow::bail!("Book {id} not found");
+                    }
+                    let sp = tx.savepoint()?;
+                    for (field, value) in &batchable {
+                        Self::set_field_in_tx(&sp, *id, field, value)?;
+                    }
+                    sp.commit()?;
+                    Ok(())
+                })();
+                results.push(one);
+            }
+            if let Err(e) = tx.commit() {
+                let msg = format!("{e}");
+                return book_ids.iter().map(|_| Err(anyhow::anyhow!("{msg}"))).collect();
+            }
+            drop(conn);
+
+            let mut ops = Vec::new();
+            for (idx, result) in results.iter().enumerate() {
+                if let (Ok(()), Some(uuid)) = (result, &uuids[idx]) {
+                    for (field, value) in &batchable {
+                        ops.push(crate::change_log::ChangeOp::FieldSet { book: uuid.clone(), field: field.clone(), value: Some(value.clone()) });
+                    }
+                }
+            }
+            self.record_many(ops);
+        } else {
+            results.extend(book_ids.iter().map(|_| Ok(())));
+        }
+
+        for (idx, id) in book_ids.iter().enumerate() {
+            if results[idx].is_err() {
+                continue;
+            }
+            for (field, value) in &other {
+                if let Err(e) = self.set_field(*id, field, value) {
+                    results[idx] = Err(e);
+                    break;
+                }
+            }
+        }
+        results
     }
 
     /// Port of `db.get_last_read_positions` -- every recorded reading
@@ -3682,6 +3873,46 @@ mod tests {
         let id1 = insert_book(&cache, "One");
         let id2 = insert_book(&cache, "Two");
         assert_eq!(cache.all_book_ids().unwrap(), vec![id1, id2]);
+    }
+
+    fn add_pdf_book(dir: &Path, cache: &Cache, title: &str) -> i32 {
+        let source = dir.join(format!("{title}.pdf"));
+        fs::write(&source, title.as_bytes()).unwrap();
+        let mut meta = MetaInformation::default();
+        meta.title = title.to_string();
+        meta.authors = vec!["An Author".to_string()];
+        cache.add_book(&source, &meta).unwrap()
+    }
+
+    #[test]
+    fn set_fields_for_books_applies_to_every_book_in_one_log_entry_and_fails_a_bad_id_alone() {
+        let (dir, cache) = open_test_cache();
+        let a = add_pdf_book(dir.path(), &cache, "A");
+        let b = add_pdf_book(dir.path(), &cache, "B");
+        let log = cache.backend.change_log().unwrap();
+        let entries_before = log.entry_count();
+
+        let changes = vec![("tags".to_string(), "red, blue".to_string()), ("publisher".to_string(), "Acme".to_string()), ("rating".to_string(), "8".to_string())];
+        let results = cache.set_fields_for_books(&[a, 9999, b], &changes);
+        assert!(results[0].is_ok() && results[2].is_ok());
+        assert!(results[1].is_err(), "an unknown book fails on its own");
+        for id in [a, b] {
+            assert_eq!(cache.field_for(id, "tags").unwrap().as_deref(), Some("red, blue"));
+            assert_eq!(cache.field_for(id, "publisher").unwrap().as_deref(), Some("Acme"));
+            assert_eq!(cache.field_for(id, "rating").unwrap().as_deref(), Some("8"));
+        }
+        assert_eq!(log.entry_count(), entries_before + 1, "one batch entry for every book and field");
+    }
+
+    #[test]
+    fn set_fields_for_books_sends_custom_columns_through_the_per_book_path() {
+        let (dir, cache) = open_test_cache();
+        let a = add_pdf_book(dir.path(), &cache, "A");
+        cache.add_custom_column("shelf", "Shelf", "text", false).unwrap();
+        let results = cache.set_fields_for_books(&[a], &[("#shelf".to_string(), "top".to_string()), ("series".to_string(), "Saga".to_string())]);
+        assert!(results[0].is_ok(), "{:?}", results[0]);
+        assert_eq!(cache.field_for(a, "series").unwrap().as_deref(), Some("Saga"));
+        assert_eq!(cache.get_custom_column_value(a, "#shelf").unwrap().as_deref(), Some("top"));
     }
 
     #[test]

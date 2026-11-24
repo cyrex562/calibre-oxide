@@ -11,7 +11,7 @@
 // mounts into a jsdom element perfectly well, and the component takes
 // plain props with no router, store or network behind it.
 
-import { createApp, nextTick, shallowReactive, type App } from "vue";
+import { createApp, h, nextTick, shallowReactive, type App } from "vue";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import BookTable from "./BookTable.vue";
@@ -634,5 +634,99 @@ describe("multi-select without select mode", () => {
   it("marks every ctrl-selected row as selected", () => {
     const { el } = mount({ selectedIds: new Set([1, 2]), selectedBookId: 2 });
     expect(el.querySelectorAll("tbody tr.selected")).toHaveLength(2);
+  });
+});
+
+describe("keyboard and screen reader access", () => {
+  const rowsOf = (el: HTMLElement) => [...el.querySelectorAll<HTMLElement>("tbody tr[data-id]")];
+
+  it("is a grid with the book count, and every row knows its place", () => {
+    const { el } = mount({ ids: [1, 2, 3], getBook: (id: number) => book(id) });
+    const table = el.querySelector("table")!;
+    expect(table.getAttribute("role")).toBe("grid");
+    expect(table.getAttribute("aria-rowcount")).toBe("3");
+    expect(rowsOf(el).map((r) => r.getAttribute("aria-rowindex"))).toEqual(["1", "2", "3"]);
+  });
+
+  it("reports the whole list's size, not just the rendered rows", () => {
+    const ids = Array.from({ length: 50000 }, (_, i) => i + 1);
+    const { el } = mount({ ids, getBook: (id: number) => book(id) });
+    expect(el.querySelector("table")!.getAttribute("aria-rowcount")).toBe("50000");
+    expect(rowsOf(el).length).toBeLessThan(200);
+  });
+
+  it("marks selected rows with aria-selected", () => {
+    const { el } = mount({ selectedIds: new Set([2]), selectMode: true });
+    const [first, second] = rowsOf(el);
+    expect(first.getAttribute("aria-selected")).toBe("false");
+    expect(second.getAttribute("aria-selected")).toBe("true");
+  });
+
+  it("puts exactly one row in the Tab order: the current one", () => {
+    const { el } = mount({ ids: [1, 2, 3], getBook: (id: number) => book(id), selectedBookId: 2 });
+    expect(rowsOf(el).filter((r) => r.tabIndex === 0).map((r) => r.dataset.id)).toEqual(["2"]);
+    expect(rowsOf(el).filter((r) => r.getAttribute("tabindex") === "-1")).toHaveLength(2);
+  });
+
+  it("falls back to the first loaded row when nothing is selected", () => {
+    const { el } = mount({ ids: [1, 2, 3], getBook: (id: number) => (id === 1 ? undefined : book(id)), selectedBookId: null });
+    expect(rowsOf(el).filter((r) => r.tabIndex === 0).map((r) => r.dataset.id)).toEqual(["2"]);
+  });
+
+  it("moves the Tab stop, and focus with it, when the current row changes", async () => {
+    const selected = shallowReactive({ id: 1 as number | null });
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    app = createApp({ render: () => h(BookTable, { ids: [1, 2, 3], getBook: (id: number) => book(id), columns: COLUMNS, selectMode: false, selectedIds: new Set<number>(), selectedBookId: selected.id, sort: "timestamp", sortOrder: "desc" as const }) });
+    app.mount(host);
+    const rows = () => rowsOf(host!);
+    rows()[0].focus();
+    expect(document.activeElement).toBe(rows()[0]);
+    selected.id = 2;
+    for (let i = 0; i < 4; i++) await nextTick();
+    expect(rows().filter((r) => r.tabIndex === 0).map((r) => r.dataset.id)).toEqual(["2"]);
+    expect(document.activeElement).toBe(rows()[1]);
+  });
+
+  it("gives every header an aria-sort", () => {
+    const { el } = mount();
+    for (const th of el.querySelectorAll("thead th")) expect(["ascending", "descending", "none"]).toContain(th.getAttribute("aria-sort"));
+  });
+
+  it("makes each resize handle a focusable separator that reports its width", () => {
+    const { el } = mount();
+    const handles = [...el.querySelectorAll<HTMLElement>('[role="separator"]')];
+    expect(handles).toHaveLength(COLUMNS.length);
+    handles.forEach((handle, i) => {
+      expect(handle.tabIndex).toBe(0);
+      expect(handle.getAttribute("aria-valuenow")).toBe(String(COLUMNS[i].width));
+    });
+  });
+
+  it("resizes with Left and Right, and in bigger steps with Shift", () => {
+    const { el, emitted } = mount();
+    const handle = el.querySelector<HTMLElement>('[role="separator"]')!;
+    const width = COLUMNS[0].width;
+    const press = (key: string, shiftKey = false) => handle.dispatchEvent(new KeyboardEvent("keydown", { key, shiftKey, bubbles: true, cancelable: true }));
+    press("ArrowRight");
+    press("ArrowLeft");
+    press("ArrowRight", true);
+    press("ArrowLeft", true);
+    expect(emitted.resize).toEqual([
+      { key: COLUMNS[0].key, width: width + 10 },
+      { key: COLUMNS[0].key, width: width - 10 },
+      { key: COLUMNS[0].key, width: width + 50 },
+      { key: COLUMNS[0].key, width: width - 50 },
+    ]);
+    // Other keys leave the width alone.
+    press("ArrowUp");
+    expect(emitted.resize).toHaveLength(4);
+  });
+
+  it("does not let a resize key reach the list's key handling", () => {
+    const { el, emitted } = mount();
+    const handle = el.querySelector<HTMLElement>('[role="separator"]')!;
+    handle.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true }));
+    expect(emitted.select).toEqual([]);
   });
 });
