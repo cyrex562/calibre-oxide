@@ -5,7 +5,7 @@ import type { BookSummary, FieldMetaEntry } from "./types";
 
 /**
  * A book row shaped exactly like a real one from `/ajax/books` --
- * captured from a live `calibre_srv` against a real library rather
+ * captured from a live `lexmechanic_srv` against a real library rather
  * than invented, since the point of most of these tests is that the
  * formatter matches what the server actually sends.
  */

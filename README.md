@@ -1,10 +1,10 @@
-# calibre-oxide
+# Lexmechanic
 
 A Rust port of [calibre](https://calibre-ebook.com/) — ebook library
 management, format conversion, a content server, and a desktop app.
 
 > **This is a derivative work of calibre**, which is copyright Kovid
-> Goyal and the calibre contributors and licensed GPL v3. calibre-oxide
+> Goyal and the calibre contributors and licensed GPL v3. Lexmechanic
 > is GPL v3 for that reason. See [LICENSE](LICENSE) and
 > [NOTICE](NOTICE).
 
@@ -68,8 +68,9 @@ That downloads the prebuilt library for your platform from
 [pdfium-binaries](https://github.com/bblanchon/pdfium-binaries)
 (Apache-2.0) and puts it beside the built binaries, where they look for
 it. It is a separate command precisely so that `build` keeps working
-offline. `CALIBRE_OXIDE_PDFIUM` overrides where it is looked for, if
-you have a copy elsewhere.
+offline. `LEXMECHANIC_PDFIUM` overrides where it is looked for, if
+you have a copy elsewhere. Every `LEXMECHANIC_*` setting also still reads
+its old `CALIBRE_OXIDE_*` name when the new one is not set.
 
 `build` stops at a runnable application and needs no network.
 `package` is separate on purpose: producing installers is the part that
@@ -81,8 +82,8 @@ Binaries land in `target/release/`:
 
 | | |
 |---|---|
-| `calibre_oxide_app` | the desktop application |
-| `calibre_srv` | the content server (the app spawns this) |
+| `lexmechanic_app` | the desktop application |
+| `lexmechanic_srv` | the content server (the app spawns this) |
 | `calibredb` | library management from the command line |
 | `ebook-convert` | format conversion |
 | `ebook-meta` | metadata inspection and editing |
@@ -102,17 +103,17 @@ A real calibre library still opens and reads correctly.
 
 ```
 crates/
-  calibre_db            library database, and the calibredb CLI
-  calibre_ebooks        formats, metadata, OEB, polish, TTS — the largest crate
-  calibre_conversion    the conversion pipeline and ebook-convert
-  calibre_srv           content server (HTTP API, OPDS, reader backend)
-  calibre_utils         shared utilities
-  calibre_customize     plugin registry
-  calibre_plugins_wasm  sandboxed WASM plugin host
-  calibre_devices       device drivers
-  calibre_scraper_worker  headless webview worker for recipe scraping
-  calibre_ai            AI provider integrations
-web/                    the Vue frontend, served by calibre_srv
+  lexmechanic_db            library database, and the calibredb CLI
+  lexmechanic_ebooks        formats, metadata, OEB, polish, TTS — the largest crate
+  lexmechanic_conversion    the conversion pipeline and ebook-convert
+  lexmechanic_srv           content server (HTTP API, OPDS, reader backend)
+  lexmechanic_utils         shared utilities
+  lexmechanic_customize     plugin registry
+  lexmechanic_plugins_wasm  sandboxed WASM plugin host
+  lexmechanic_devices       device drivers
+  lexmechanic_scraper_worker  headless webview worker for recipe scraping
+  lexmechanic_ai            AI provider integrations
+web/                    the Vue frontend, served by lexmechanic_srv
 app/src-tauri/          the Tauri desktop shell
 e2e/                    end-to-end tests against real built binaries
 tools/harness/          development harness

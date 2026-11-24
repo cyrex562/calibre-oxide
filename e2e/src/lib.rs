@@ -1,4 +1,4 @@
-//! Real, black-box end-to-end test helpers for calibre-oxide.
+//! Real, black-box end-to-end test helpers for Lexmechanic.
 //!
 //! Unlike the unit/integration tests inside each crate (which call
 //! Rust functions directly), everything here drives the actual
@@ -12,7 +12,7 @@
 //!
 //! Not a workspace member other crates depend on -- `[dependencies]`
 //! only pulls in what building real test libraries needs
-//! (`calibre_db`); everything else (spawning the real binaries) is
+//! (`lexmechanic_db`); everything else (spawning the real binaries) is
 //! plain `std::process`.
 
 use std::io::BufRead;
@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 /// `target/<profile>/<name>`). Tries `debug` then `release` so this
 /// works whichever profile `cargo build`/`cargo test` was last run
 /// with for that binary.
-pub fn oxide_bin(name: &str) -> PathBuf {
+pub fn lexmechanic_bin(name: &str) -> PathBuf {
     let exe_name = if cfg!(windows) { format!("{name}.exe") } else { name.to_string() };
     // Next to this very test binary (`target/<profile>/deps/<test>.exe` ->
     // `target/<profile>/`), so a relocated `CARGO_TARGET_DIR` is honoured.
@@ -47,7 +47,7 @@ pub fn oxide_bin(name: &str) -> PathBuf {
 }
 
 /// A real, on-disk, empty calibre library (a real `metadata.db` via
-/// `calibre_db::Library::create`) that outlives as long as this
+/// `lexmechanic_db::Library::create`) that outlives as long as this
 /// struct does, then cleans itself up (`tempfile::TempDir`'s own
 /// `Drop`).
 pub struct TestLibrary {
@@ -57,7 +57,7 @@ pub struct TestLibrary {
 impl TestLibrary {
     pub fn new() -> Self {
         let dir = tempfile::tempdir().expect("failed to create a temp dir for a test library");
-        calibre_db::Library::create(dir.path().to_path_buf()).expect("failed to create a real test library");
+        lexmechanic_db::Library::create(dir.path().to_path_buf()).expect("failed to create a real test library");
         Self { dir }
     }
 
@@ -67,7 +67,7 @@ impl TestLibrary {
 }
 
 /// Kills and reaps the wrapped child on drop, so a panicking assertion
-/// in a test body never leaks a running `calibre_srv`/worker process.
+/// in a test body never leaks a running `lexmechanic_srv`/worker process.
 pub struct ChildGuard(pub Child);
 
 impl Drop for ChildGuard {
@@ -80,19 +80,19 @@ impl Drop for ChildGuard {
 /// Binds an OS-assigned free port, then releases it -- the same
 /// find-a-free-port technique `app/src-tauri/src/server.rs` uses for
 /// the real desktop app, reused here so tests don't collide with a
-/// developer's own `calibre_srv` on the default port.
+/// developer's own `lexmechanic_srv` on the default port.
 pub fn find_free_port() -> u16 {
     let listener = std::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("failed to bind a free port");
     listener.local_addr().unwrap().port()
 }
 
-/// Spawns the real, compiled `calibre_srv` binary against `library`,
+/// Spawns the real, compiled `lexmechanic_srv` binary against `library`,
 /// with `--static-dir static_dir --port port` -- the exact same
 /// shape `app/src-tauri/src/server.rs::spawn` uses, so this is really
 /// testing the same startup path the desktop app takes, not a
 /// parallel one.
-pub fn spawn_calibre_srv(library: &Path, static_dir: &Path, port: u16) -> ChildGuard {
-    let child = Command::new(oxide_bin("calibre_srv"))
+pub fn spawn_lexmechanic_srv(library: &Path, static_dir: &Path, port: u16) -> ChildGuard {
+    let child = Command::new(lexmechanic_bin("lexmechanic_srv"))
         .arg(library)
         .arg("--static-dir")
         .arg(static_dir)
@@ -101,26 +101,26 @@ pub fn spawn_calibre_srv(library: &Path, static_dir: &Path, port: u16) -> ChildG
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn calibre_srv");
+        .expect("failed to spawn lexmechanic_srv");
     ChildGuard(child)
 }
 
-/// Same as [`spawn_calibre_srv`], hosting `extra` additional libraries
+/// Same as [`spawn_lexmechanic_srv`], hosting `extra` additional libraries
 /// alongside `library` (which stays the default).
 ///
 /// The `--library` flag this passes is what makes a `library_id` in a URL
 /// mean anything: with one library the server ignores it entirely.
-pub fn spawn_calibre_srv_with_libraries(library: &Path, extra: &[&Path], static_dir: &Path, port: u16) -> ChildGuard {
-    let mut command = Command::new(oxide_bin("calibre_srv"));
+pub fn spawn_lexmechanic_srv_with_libraries(library: &Path, extra: &[&Path], static_dir: &Path, port: u16) -> ChildGuard {
+    let mut command = Command::new(lexmechanic_bin("lexmechanic_srv"));
     command.arg(library).arg("--static-dir").arg(static_dir).arg("--port").arg(port.to_string());
     for path in extra {
         command.arg("--library").arg(path);
     }
-    let child = command.stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("failed to spawn calibre_srv");
+    let child = command.stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("failed to spawn lexmechanic_srv");
     ChildGuard(child)
 }
 
-/// Polls a real TCP connect until `calibre_srv` (or anything else
+/// Polls a real TCP connect until `lexmechanic_srv` (or anything else
 /// listening on `port`) is actually accepting connections.
 pub fn wait_until_ready(port: u16, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
@@ -136,7 +136,7 @@ pub fn wait_until_ready(port: u16, timeout: Duration) -> bool {
 
 /// Locates a real, installed upstream `calibredb` on `PATH` (e.g. via
 /// `apt install calibre`) distinct from this port's own compiled
-/// `calibredb` (resolved separately via [`oxide_bin`], never via
+/// `calibredb` (resolved separately via [`lexmechanic_bin`], never via
 /// `PATH`) -- `None` on a box without real calibre installed, so
 /// live-comparison tests can skip gracefully rather than fail.
 pub fn upstream_calibredb() -> Option<PathBuf> {
@@ -160,7 +160,7 @@ pub fn upstream_calibredb() -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// Runs the real `calibre_scraper_worker` binary's JSON-lines
+/// Runs the real `lexmechanic_scraper_worker` binary's JSON-lines
 /// protocol (see that crate's own module doc) to fetch `url` through
 /// a real, JS-capable OS webview -- the same stack `app/src-tauri`
 /// itself uses -- and returns the loaded document's outer HTML.
@@ -173,7 +173,7 @@ pub fn webview_fetch(url: &str, timeout: Duration) -> Option<String> {
     use std::io::Write;
 
     let mut child = ChildGuard(
-        Command::new(oxide_bin("calibre_scraper_worker")).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?,
+        Command::new(lexmechanic_bin("lexmechanic_scraper_worker")).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?,
     );
 
     let request = serde_json::json!({

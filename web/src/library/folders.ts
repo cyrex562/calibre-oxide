@@ -1,7 +1,7 @@
 // The "Folders" category of the category browser: the library's on-disk folder
 // tree, filtering by a folder, and moving books or renaming a folder.
 //
-// The server (crates/calibre_srv/src/library_folders.rs) lists the folders with
+// The server (crates/lexmechanic_srv/src/library_folders.rs) lists the folders with
 // counts that include sub-folders and plans every move; this module holds what
 // is worth testing without a browser: building the tree from the flat list,
 // which rows are visible, the `folder:` search a click makes, the drag payload,
@@ -13,9 +13,9 @@ import * as realApi from "./api";
 import { describeJobProgress } from "./api";
 import type { LibraryFolder, OrganizePlan, OrganizeReport, OrganizeUndoReport } from "./api";
 
-export const FOLDERS_EXPANDED_KEY = "calibre-oxide.folders.expanded";
+export const FOLDERS_EXPANDED_KEY = "lexmechanic.folders.expanded";
 /** The drag data type carrying book ids from the table to a folder. */
-export const BOOKS_DRAG_TYPE = "application/x-calibre-oxide-books";
+export const BOOKS_DRAG_TYPE = "application/x-lexmechanic-books";
 
 export interface FolderNode {
   /** Full path, `/`-separated. */

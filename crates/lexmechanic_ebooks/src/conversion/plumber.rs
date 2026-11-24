@@ -1,0 +1,593 @@
+use crate::conversion::options::ConversionOptions;
+use crate::oeb::book::OEBBook;
+use anyhow::{bail, Context, Result};
+use std::fs;
+use std::path::{Path, PathBuf};
+use tempfile::tempdir;
+
+/// Dispatch `input_path` to the input plugin matching its file extension
+/// and return the resulting in-memory [`OEBBook`], extracting any
+/// archive/binary content the plugin needs into `extract_dir`.
+///
+/// Port of the input-plugin-selection step inlined in Python's
+/// `Plumber.run` (`calibre/ebooks/conversion/plumber.py`), pulled out
+/// into its own function so callers other than [`Plumber::run`] --
+/// notably `oeb::iterator::book::extract_book` (issue #38, the
+/// `EbookIterator` port) -- can reuse the same format-dispatch table
+/// instead of duplicating it. Every input plugin in this crate shares
+/// the signature `convert(&self, input_path: &Path, output_dir: &Path)
+/// -> Result<OEBBook>`, so this function is just that shared dispatch,
+/// unchanged from what used to be the first half of `Plumber::run`.
+pub fn convert_to_oebbook(input_path: &Path, extract_dir: &Path) -> Result<OEBBook> {
+    let input_ext = input_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_lowercase())
+        .unwrap_or_default();
+
+    fs::create_dir_all(extract_dir)?;
+
+    let plugin = crate::conversion::input_plugin::resolve_input_plugin(crate::conversion::input_plugin::builtin_input_registry(), &input_ext)
+        .ok_or_else(|| anyhow::anyhow!("Unsupported input format: {}", input_ext))?;
+    let book = plugin.convert(input_path, extract_dir)?;
+
+    Ok(book)
+}
+
+/// Runs only the input stage of a conversion and writes the resulting
+/// book out as a real OPF-plus-content-files directory at `dump_dir`.
+///
+/// Port of `Plumber.run(..., abort_after_input_dump=True)`: real
+/// upstream runs the input plugin, then stops before any output stage,
+/// leaving `tdir/input/` holding the parsed book as a plain directory
+/// (an OPF, its manifest files, and -- when the input format produces
+/// one -- an NCX). `ebooks/html/to_zip.py`'s own `run()` is this
+/// function's real, single caller-of-note (issue #147): it re-packages
+/// that directory into a zip. This port collapses upstream's two-level
+/// `tdir` / `tdir/input` scratch layout into one caller-supplied
+/// `dump_dir`, since the outer/inner split has no effect the caller can
+/// observe -- only `dump_dir`'s own contents (what `package_dump`
+/// reads) are.
+///
+/// **Not yet threaded through**: real upstream's own `run()` passes
+/// `input_encoding`/`breadth_first`/`allow_local_files_outside_root`
+/// `OptionRecommendation`s down into this stage; this port calls
+/// [`convert_to_oebbook`] with each input plugin's own defaults, since
+/// generic `OptionRecommendation` plumbing is issue #126's own separate
+/// scope (this issue's own body draws the same line). A future #126
+/// lands with a way to pass per-plugin options through this call.
+pub fn dump_input(input_path: &Path, dump_dir: &Path) -> Result<()> {
+    let extract_dir = tempdir()?;
+    let mut book = convert_to_oebbook(input_path, extract_dir.path())?;
+    fs::create_dir_all(dump_dir)?;
+    crate::oeb::writer::OEBWriter::new().write_book(&mut book, dump_dir)?;
+    Ok(())
+}
+
+pub struct Plumber {
+    input_path: PathBuf,
+    output_path: PathBuf,
+    opts: ConversionOptions,
+}
+
+impl Plumber {
+    pub fn new<P: AsRef<Path>>(input: P, output: P) -> Self {
+        Self::with_options(input, output, ConversionOptions::default())
+    }
+
+    /// Real upstream's `Plumber` always carries a live `self.opts`,
+    /// populated from every plugin's `OptionRecommendation` defaults
+    /// (`setup_options`) and then overridden by whatever the CLI/GUI
+    /// parsed. This port has no CLI option parser yet (issue #126's own
+    /// scope) -- `Plumber::new` uses [`ConversionOptions::default`]
+    /// (the real upstream default values), and this constructor is for
+    /// callers that already have a customized [`ConversionOptions`].
+    pub fn with_options<P: AsRef<Path>>(input: P, output: P, opts: ConversionOptions) -> Self {
+        Self {
+            input_path: input.as_ref().to_path_buf(),
+            output_path: output.as_ref().to_path_buf(),
+            opts,
+        }
+    }
+
+    pub fn run(&self) -> Result<()> {
+        // 1. Setup Request
+        println!(
+            "Conversion: {:?} -> {:?}",
+            self.input_path, self.output_path
+        );
+
+        // 2. Input Plugin
+        // We use a temp dir for intermediate extraction if needed,
+        // but EPUBInput also takes a destination.
+        // In the original python plumber, there is a complex temp dir management.
+        // Here, EPUBInput needs a place to extract to.
+        let temp_dir = tempdir()?;
+        let extract_path = temp_dir.path().join("source");
+        let mut book = convert_to_oebbook(&self.input_path, &extract_path)?;
+
+        // 3. Transforms
+        let output_ext = self.output_path.extension().and_then(|s| s.to_str()).map(|s| s.to_lowercase()).unwrap_or_default();
+        self.run_transforms(&mut book, &output_ext)?;
+
+        // 4. Output Plugin
+        self.write_output(book)?;
+
+        println!("Done.");
+        Ok(())
+    }
+
+    /// Port of real `Plumber.run`'s transform stage (`plumber.py`'s own
+    /// real sequence, `old_src/src/calibre/ebooks/conversion/plumber.py:1115-1247`):
+    /// `DataURL` -> `Clean` (guide) -> `RemoveFirstImage`/`MergeMetadata`
+    /// (jacket.py/metadata.py) -> `DetectStructure` -> `Jacket` ->
+    /// `AddAltText` -> `LinearizeTables` -> `UnsmartenPunctuation` ->
+    /// `CSSFlattener` -> `RemoveFakeMargins`/`RemoveAdobeMargins` ->
+    /// `EmbedFonts` -> `SubsetFonts` -> `ManifestTrimmer` ->
+    /// `toc.rationalize_play_orders()`, using `self.opts` (real upstream
+    /// default values absent any CLI override -- see
+    /// [`ConversionOptions`]'s own module doc).
+    ///
+    /// **Real, disclosed narrowings, not silently dropped**:
+    /// `user_metadata` (real upstream's `read_user_metadata`) is always
+    /// [`crate::metadata::meta::MetaInformation::default`] here -- real
+    /// upstream's own default (absent `--read-metadata-from-opf` or any
+    /// `--title`/`--authors`/etc. CLI override) is exactly the same
+    /// blank `MetaInformation(None, [])`, so this is faithful for the
+    /// no-CLI-yet case, not a shortcut. The non-EPUB/KePub "remove the
+    /// TOC's own reference to the HTML cover" step
+    /// (`item_that_refers_to_cover`) has no Rust equivalent on
+    /// `crate::oeb::toc::TOC` yet -- a real, narrow, cosmetic gap (a
+    /// stray NCX entry pointing at the cover page for non-EPUB
+    /// outputs), not attempted here. No named output/input profile
+    /// catalog exists (see [`ConversionOptions`]'s own module doc) --
+    /// every profile-derived value uses the real *default* profile's
+    /// own constants. `mi.cover`-is-a-URL/on-disk-path handling
+    /// (`download_cover`, explicit `--cover` CLI flag) doesn't apply
+    /// since `user_metadata` is always blank here.
+    fn run_transforms(&self, book: &mut OEBBook, output_ext: &str) -> Result<()> {
+        use crate::metadata::meta::MetaInformation;
+        use crate::oeb::transforms::alt_text::AddAltText;
+        use crate::oeb::transforms::data_url::DataURL;
+        use crate::oeb::transforms::embed_fonts::EmbedFonts;
+        use crate::oeb::transforms::flatcss::CSSFlattener;
+        use crate::oeb::transforms::guide::Clean;
+        use crate::oeb::transforms::jacket::{JacketTransform, RemoveFirstImage};
+        use crate::oeb::transforms::linearize_tables::LinearizeTables;
+        use crate::oeb::transforms::metadata::MergeMetadata;
+        use crate::oeb::transforms::page_margin::{RemoveAdobeMargins, RemoveFakeMargins};
+        use crate::oeb::transforms::structure::DetectStructure;
+        use crate::oeb::transforms::subset::SubsetFonts;
+        use crate::oeb::transforms::trimmanifest::ManifestTrimmer;
+        use crate::oeb::transforms::unsmarten::UnsmartenPunctuation;
+
+        let opts = &self.opts;
+        let mut report = |msg: &str| println!("{msg}");
+        // Upstream's `read_user_metadata`: the OPF's metadata when
+        // `--read-metadata-from-opf` was given, and otherwise blank, which
+        // leaves `MergeMetadata` carrying through whatever the input file
+        // already said.
+        //
+        // A failure to read the OPF is *not* swallowed. Being asked to
+        // apply specific metadata and silently applying none would produce
+        // a book that looks converted and has the wrong title on it.
+        let user_metadata = match &opts.read_metadata_from_opf {
+            Some(path) => {
+                let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+                crate::opf::parse_opf(&text).with_context(|| format!("parsing {}", path.display()))?
+            }
+            None => MetaInformation::default(),
+        };
+        let jacket_opts = opts.jacket_options();
+
+        DataURL.call(book);
+        Clean.call(book);
+        RemoveFirstImage.call(book, &jacket_opts, &mut report);
+        MergeMetadata.call(book, &user_metadata, opts.prefer_metadata_cover, output_ext, false);
+        DetectStructure.call(book, &opts.structure);
+        JacketTransform.call(book, &jacket_opts, &user_metadata, &mut report)?;
+
+        if opts.add_alt_text_to_img {
+            AddAltText.call(book);
+        }
+        if opts.linearize_tables && !matches!(output_ext, "mobi" | "lrf") {
+            LinearizeTables.call(book);
+        }
+        if opts.unsmarten_punctuation {
+            UnsmartenPunctuation.call(book);
+        }
+
+        let flattener = CSSFlattener::new(opts.flattener_options(output_ext));
+        let ctx = opts.flatten_context(output_ext);
+        flattener.call(book, &ctx, &mut report)?;
+
+        RemoveFakeMargins.call(book, opts.remove_fake_margins);
+        RemoveAdobeMargins.call(book);
+
+        if opts.embed_all_fonts {
+            EmbedFonts::new().call(book, &mut report)?;
+        }
+        if opts.subset_embedded_fonts && output_ext != "pdf" {
+            SubsetFonts::new().call(book, &mut report)?;
+        }
+
+        ManifestTrimmer.call(book);
+        book.toc.rationalize_play_orders();
+        Ok(())
+    }
+
+    fn write_output(&self, mut book: crate::oeb::book::OEBBook) -> Result<()> {
+        println!("Writing output...");
+
+        let output_ext = self
+            .output_path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+
+        // Resolve the writer from the real output-plugin registry
+        // (#797) instead of a hardcoded chain. The `create_dir_all`
+        // boilerplate every branch used to repeat is hoisted here.
+        match crate::conversion::output_plugin::resolve_output_plugin(crate::conversion::output_plugin::builtin_output_registry(), &output_ext) {
+            Some(plugin) => {
+                if let Some(parent) = self.output_path.parent() {
+                    if !parent.exists() {
+                        fs::create_dir_all(parent)?;
+                    }
+                }
+                for warning in plugin.convert(&mut book, &self.output_path, &self.opts)? {
+                    eprintln!("Warning: {warning}");
+                }
+            }
+            None => {
+                // Preserved verbatim from the chain this replaces: an
+                // unrecognized extension is NOT an error, it falls back
+                // to OEB directory output.
+                if !self.output_path.exists() {
+                    fs::create_dir_all(&self.output_path)?;
+                }
+                let writer = crate::oeb::writer::OEBWriter::new();
+                writer.write_book(&mut book, &self.output_path)?;
+            }
+        }
+
+        println!("Done.");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod dump_input_tests {
+    use super::*;
+
+    #[test]
+    fn dump_input_writes_a_real_opf_and_content_directory() {
+        let src = tempdir().unwrap();
+        let html_path = src.path().join("index.html");
+        fs::write(
+            &html_path,
+            "<html><head><title>A Loose Page</title></head><body><h1>Hello</h1></body></html>",
+        )
+        .unwrap();
+
+        let dump = tempdir().unwrap();
+        let dump_dir = dump.path().join("input");
+        dump_input(&html_path, &dump_dir).unwrap();
+
+        let entries: Vec<String> = fs::read_dir(&dump_dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect();
+        assert!(entries.iter().any(|e| e.ends_with(".opf")), "{entries:?}");
+
+        let opf_text = fs::read_to_string(dump_dir.join("content.opf")).unwrap();
+        assert!(opf_text.contains("<manifest>"));
+        // `<spine toc="...">` rather than a bare `<spine>`: EPUB 2 requires
+        // the spine to name an NCX, so asserting the bare form was
+        // asserting the invalid shape.
+        assert!(opf_text.contains("<spine toc="), "the spine should name an NCX:\n{opf_text}");
+    }
+}
+
+#[cfg(test)]
+mod run_transforms_tests {
+    use super::*;
+    use base64::Engine;
+    use crate::oeb::transforms::test_support::Builder;
+
+    /// Exercises `Plumber::run_transforms`'s real wired-in prefix
+    /// end-to-end against one `OEBBook`: a `data:` URI image (DataURL),
+    /// an unrecognized guide reference type (Clean), and an orphaned
+    /// manifest item unreachable from metadata/guide/spine/links
+    /// (ManifestTrimmer) should all be handled for real, not left
+    /// untouched by a no-op placeholder.
+    #[test]
+    fn run_transforms_actually_runs_the_wired_in_pipeline_prefix() {
+        let png_1x1_transparent = base64::engine::general_purpose::STANDARD.decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+        ).unwrap();
+        let data_uri = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&png_1x1_transparent)
+        );
+        let mut oeb = Builder::new()
+            .page("a.html", &format!(r#"<img src="{data_uri}"/>"#))
+            .part("orphan.txt", "text/plain", b"unreachable", false)
+            .build();
+        oeb.guide.add("some-unrecognized-type", None, "a.html");
+
+        let plumber = Plumber::new("in.html", "out.epub");
+        plumber.run_transforms(&mut oeb, "epub").unwrap();
+
+        // DataURL: the inline data: URI became a real manifest item.
+        let raw = oeb.container.read("a.html").unwrap();
+        let html = String::from_utf8_lossy(&raw);
+        assert!(!html.contains("data:image"), "{html}");
+        assert!(oeb.manifest.iter().any(|i| i.media_type == "image/png"));
+
+        // Clean: the unrecognized guide type is gone.
+        assert!(!oeb.guide.references.contains_key("some-unrecognized-type"));
+
+        // ManifestTrimmer: the orphaned item was dropped.
+        assert!(!oeb.manifest.iter().any(|i| i.href == "orphan.txt"));
+    }
+
+    /// A genuine end-to-end conversion through the public `Plumber::run`
+    /// entry point (HTML -> EPUB, on real files on disk), proving the
+    /// full wired-in pipeline -- not just `run_transforms` in isolation
+    /// -- actually flattens CSS for real. Before this issue, this
+    /// conversion produced an EPUB with the *unmodified* input markup
+    /// (no `stylesheet.css`, no `calibre*` classes); this test would
+    /// have failed against that pre-existing behavior.
+    #[test]
+    fn a_real_html_to_epub_conversion_flattens_css_end_to_end() {
+        let src = tempdir().unwrap();
+        let html_path = src.path().join("book.html");
+        fs::write(&html_path, "<html><head><title>A Book</title></head><body><h1>Ch 1</h1><p>Hello.</p></body></html>").unwrap();
+
+        let out_dir = tempdir().unwrap();
+        let epub_path = out_dir.path().join("book.epub");
+        Plumber::new(&html_path, &epub_path).run().unwrap();
+
+        let file = fs::File::open(&epub_path).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        let names: Vec<String> = (0..zip.len()).map(|i| zip.by_index(i).unwrap().name().to_string()).collect();
+        assert!(names.iter().any(|n| n.ends_with(".css")), "{names:?}");
+
+        let html_entry = names.iter().find(|n| n.ends_with(".html")).cloned().unwrap();
+        let mut html_bytes = Vec::new();
+        std::io::Read::read_to_end(&mut zip.by_name(&html_entry).unwrap(), &mut html_bytes).unwrap();
+        let html = String::from_utf8_lossy(&html_bytes);
+        assert!(html.contains("class=\"calibre"), "CSSFlattener should have added real classes: {html}");
+    }
+}
+
+#[cfg(test)]
+mod write_output_threads_opts_tests {
+    use super::*;
+
+    /// Issue #690's own definition of done: `Plumber::write_output`
+    /// really threads `&self.opts` through to the output plugin it
+    /// dispatches to, exercised here through the public `Plumber` API
+    /// end-to-end (not by calling `MOBIOutput::convert` directly, the
+    /// way `mobi_output_test.rs`'s own option test does) -- a real
+    /// `.mobi` conversion with `opts.mobi.dont_compress = true` set on
+    /// the `Plumber` itself produces real uncompressed output.
+    /// EPUB 2 requires `dc:title`, `dc:identifier` and `dc:language`, and
+    /// requires `package/@unique-identifier` to name the identifier's
+    /// `id`. None of the three was emitted, so every book this produced
+    /// was invalid -- a validating reader refuses it outright.
+    #[test]
+    fn a_converted_epub_has_the_elements_epub2_requires() {
+        let src = tempdir().unwrap();
+        let html_path = src.path().join("book.html");
+        // No metadata beyond the title: the worst case, and the common one.
+        fs::write(&html_path, "<html><head><title>A Book</title></head><body><p>Text.</p></body></html>").unwrap();
+
+        let out_dir = tempdir().unwrap();
+        let epub_path = out_dir.path().join("book.epub");
+        Plumber::new(&html_path, &epub_path).run().unwrap();
+
+        let mut zip = zip::ZipArchive::new(fs::File::open(&epub_path).unwrap()).unwrap();
+        let opf_name = (0..zip.len()).map(|i| zip.by_index(i).unwrap().name().to_string()).find(|n| n.ends_with(".opf")).expect("there should be an OPF");
+        let mut opf = String::new();
+        {
+            use std::io::Read;
+            zip.by_name(&opf_name).unwrap().read_to_string(&mut opf).unwrap();
+        }
+
+        assert!(opf.contains("<dc:title>"), "no dc:title:\n{opf}");
+        assert!(opf.contains("<dc:identifier"), "no dc:identifier:\n{opf}");
+        assert!(opf.contains("<dc:language>"), "no dc:language:\n{opf}");
+
+        // The attribute must name an id that actually exists on an
+        // identifier -- a dangling one is as invalid as none at all.
+        let unique_id = opf.split(r#"unique-identifier=""#).nth(1).and_then(|rest| rest.split('"').next()).expect("no unique-identifier attribute").to_string();
+        assert!(!unique_id.is_empty(), "the unique-identifier attribute is empty:\n{opf}");
+        assert!(opf.contains(&format!(r#"id="{unique_id}""#)), "unique-identifier={unique_id:?} names no element:\n{opf}");
+    }
+
+    /// When the book has its own identifier, that one is named rather than
+    /// a freshly invented one -- otherwise a round trip would give the book
+    /// a new identity each time.
+    #[test]
+    fn an_existing_identifier_is_kept_as_the_unique_one() {
+        let src = tempdir().unwrap();
+        let html_path = src.path().join("book.html");
+        fs::write(&html_path, "<html><head><title>A Book</title></head><body><p>Text.</p></body></html>").unwrap();
+
+        let opf_path = src.path().join("metadata.opf");
+        fs::write(
+            &opf_path,
+            r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="uid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>A Book</dc:title>
+    <dc:identifier id="uid">urn:uuid:11111111-1111-1111-1111-111111111111</dc:identifier>
+  </metadata>
+  <manifest/><spine/>
+</package>"#,
+        )
+        .unwrap();
+
+        let out_dir = tempdir().unwrap();
+        let epub_path = out_dir.path().join("book.epub");
+        let mut opts = ConversionOptions::default();
+        opts.read_metadata_from_opf = Some(opf_path);
+        Plumber::with_options(&html_path, &epub_path, opts).run().unwrap();
+
+        let mut zip = zip::ZipArchive::new(fs::File::open(&epub_path).unwrap()).unwrap();
+        let mut opf = String::new();
+        {
+            use std::io::Read;
+            zip.by_name("content.opf").unwrap().read_to_string(&mut opf).unwrap();
+        }
+        assert!(opf.contains("11111111-1111-1111-1111-111111111111"), "the book's own identifier should have been carried through:\n{opf}");
+    }
+
+    /// `--read-metadata-from-opf` is how calibre's own GUI puts *library*
+    /// metadata into a converted file. Without it a conversion keeps
+    /// whatever the input said, so a title corrected in the library never
+    /// reaches the output.
+    #[test]
+    fn read_metadata_from_opf_overrides_the_inputs_own_title() {
+        let src = tempdir().unwrap();
+        let html_path = src.path().join("book.html");
+        fs::write(&html_path, "<html><head><title>The Input's Own Title</title></head><body><p>Text.</p></body></html>").unwrap();
+
+        let opf_path = src.path().join("metadata.opf");
+        fs::write(
+            &opf_path,
+            r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="uid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
+    <dc:title>The Library's Corrected Title</dc:title>
+    <dc:creator opf:role="aut">Ann Author</dc:creator>
+    <dc:identifier id="uid">urn:uuid:test</dc:identifier>
+  </metadata>
+  <manifest/>
+  <spine/>
+</package>"#,
+        )
+        .unwrap();
+
+        let out_dir = tempdir().unwrap();
+        let epub_path = out_dir.path().join("book.epub");
+
+        let mut opts = ConversionOptions::default();
+        opts.read_metadata_from_opf = Some(opf_path);
+        Plumber::with_options(&html_path, &epub_path, opts).run().unwrap();
+
+        let produced = crate::metadata::get_metadata(&epub_path).unwrap();
+        assert_eq!(produced.title, "The Library's Corrected Title", "the OPF's title should have won over the input's");
+        assert!(produced.authors.contains(&"Ann Author".to_string()), "the OPF's author should have reached the output: {:?}", produced.authors);
+    }
+
+    /// Without the flag, the input's own metadata is what comes through --
+    /// the behaviour every existing conversion relies on.
+    #[test]
+    fn without_the_flag_the_inputs_own_metadata_is_kept() {
+        let src = tempdir().unwrap();
+        let html_path = src.path().join("book.html");
+        fs::write(&html_path, "<html><head><title>The Input's Own Title</title></head><body><p>Text.</p></body></html>").unwrap();
+
+        let out_dir = tempdir().unwrap();
+        let epub_path = out_dir.path().join("book.epub");
+        Plumber::new(&html_path, &epub_path).run().unwrap();
+
+        assert_eq!(crate::metadata::get_metadata(&epub_path).unwrap().title, "The Input's Own Title");
+    }
+
+    /// Being asked to apply specific metadata and silently applying none
+    /// would produce a book that looks converted and carries the wrong
+    /// title. So a missing OPF fails the conversion.
+    #[test]
+    fn a_missing_opf_fails_rather_than_being_ignored() {
+        let src = tempdir().unwrap();
+        let html_path = src.path().join("book.html");
+        fs::write(&html_path, "<html><body><p>Text.</p></body></html>").unwrap();
+
+        let out_dir = tempdir().unwrap();
+        let epub_path = out_dir.path().join("book.epub");
+
+        let mut opts = ConversionOptions::default();
+        opts.read_metadata_from_opf = Some(src.path().join("not-there.opf"));
+        let err = Plumber::with_options(&html_path, &epub_path, opts).run().expect_err("a missing OPF should fail the conversion");
+        assert!(format!("{err:#}").contains("not-there.opf"), "the error should name the file: {err:#}");
+    }
+
+    /// An OPF that is not parseable is the same class of problem.
+    #[test]
+    fn an_unparseable_opf_fails_rather_than_being_ignored() {
+        let src = tempdir().unwrap();
+        let html_path = src.path().join("book.html");
+        fs::write(&html_path, "<html><body><p>Text.</p></body></html>").unwrap();
+        let opf_path = src.path().join("broken.opf");
+        fs::write(&opf_path, "<package><metadata>unclosed").unwrap();
+
+        let out_dir = tempdir().unwrap();
+        let epub_path = out_dir.path().join("book.epub");
+
+        let mut opts = ConversionOptions::default();
+        opts.read_metadata_from_opf = Some(opf_path);
+        assert!(Plumber::with_options(&html_path, &epub_path, opts).run().is_err(), "an unparseable OPF should fail the conversion");
+    }
+
+    #[test]
+    fn plumber_threads_a_real_mobi_option_from_conversion_options_through_to_the_output_file() {
+        let src = tempdir().unwrap();
+        let html_path = src.path().join("book.html");
+        let paragraph = "The quick brown fox jumps over the lazy dog. ".repeat(200);
+        fs::write(&html_path, format!("<html><body><p>{paragraph}</p></body></html>")).unwrap();
+
+        let out_dir = tempdir().unwrap();
+        let mobi_path = out_dir.path().join("book.mobi");
+
+        let mut opts = ConversionOptions::default();
+        opts.mobi.dont_compress = true;
+        Plumber::with_options(&html_path, &mobi_path, opts).run().unwrap();
+
+        let bytes = fs::read(&mobi_path).unwrap();
+        let record0_offset = u32::from_be_bytes(bytes[78..82].try_into().unwrap()) as usize;
+        let compression = u16::from_be_bytes(bytes[record0_offset..record0_offset + 2].try_into().unwrap());
+        const UNCOMPRESSED: u16 = 1;
+        assert_eq!(compression, UNCOMPRESSED, "Plumber's own opts.mobi.dont_compress should have really reached MOBIOutput::convert, not a default MobiWriterOpts");
+    }
+
+    /// EPUB -> EPUB through the real `Plumber::run`, against a real,
+    /// non-synthetic EPUB (calibre's own shipped Quick Start Guide,
+    /// `old_src/resources/quick_start/eng.epub` -- 20 entries, a real
+    /// OPF, NCX, cover image and 15 content documents), rather than the
+    /// small hand-written HTML the other tests in this module build.
+    ///
+    /// Ported here from `lexmechanic_conversion/tests/{pipeline,identity_conversion}_test.rs`
+    /// (issue #794). Those tested the separate trait-based conversion
+    /// engine deleted under #476 and had not compiled since; the files
+    /// are gone, but this assertion -- "a real-world EPUB survives a
+    /// round trip with its metadata and EPUB structure intact" -- was
+    /// genuinely not covered anywhere against the *real* pipeline, so it
+    /// moves here instead of being dropped with them.
+    #[test]
+    fn a_real_world_epub_survives_an_epub_to_epub_round_trip() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../old_src/resources/quick_start/eng.epub");
+        assert!(fixture.exists(), "real EPUB fixture missing at {}", fixture.display());
+
+        let out_dir = tempdir().unwrap();
+        let out_path = out_dir.path().join("round-tripped.epub");
+        Plumber::new(&fixture, &out_path).run().unwrap();
+
+        assert!(out_path.exists(), "no output EPUB was produced");
+        let mut archive = zip::ZipArchive::new(fs::File::open(&out_path).unwrap()).unwrap();
+
+        // Real EPUB container structure, not just "a zip exists".
+        assert!(archive.by_name("META-INF/container.xml").is_ok(), "output is missing META-INF/container.xml");
+
+        let names: Vec<String> = archive.file_names().map(str::to_string).collect();
+        let opf_name = names.iter().find(|n| n.ends_with(".opf")).unwrap_or_else(|| panic!("output has no OPF at all, entries: {names:?}")).clone();
+
+        let mut opf = String::new();
+        std::io::Read::read_to_string(&mut archive.by_name(&opf_name).unwrap(), &mut opf).unwrap();
+        assert!(opf.contains("Quick Start Guide"), "the real title did not survive the round trip; OPF was:\n{opf}");
+    }
+}

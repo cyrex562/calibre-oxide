@@ -3,7 +3,7 @@ import vue from "@vitejs/plugin-vue";
 
 // https://vite.dev/config/
 //
-// Served as calibre_srv's own browser UI (issue #432/#498) -- a
+// Served as lexmechanic_srv's own browser UI (issue #432/#498) -- a
 // separate SPA from `app/` (the Tauri desktop shell), matching
 // upstream calibre's own separation between its desktop GUI and its
 // content-server browser UI. See #432's issue body for the full
@@ -18,10 +18,10 @@ export default defineConfig({
   server: {
     port: 5180,
     // During `npm run dev`, proxy API calls to a locally running
-    // calibre_srv (see crates/calibre_srv's own README for how to
+    // lexmechanic_srv (see crates/lexmechanic_srv's own README for how to
     // start it against a test library) so the dev server doesn't
-    // need calibre_srv to also serve the frontend. The browser's
-    // `Origin` (the dev server's port) is dropped: calibre_srv refuses
+    // need lexmechanic_srv to also serve the frontend. The browser's
+    // `Origin` (the dev server's port) is dropped: lexmechanic_srv refuses
     // state-changing requests from a foreign origin (guard.rs).
     proxy: PROXIED.reduce<Record<string, object>>((acc, path) => {
       acc[path] = {

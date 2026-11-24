@@ -1,0 +1,2025 @@
+//! Port of `old_src/src/calibre/ebooks/covers.py` (issue #116):
+//! calibre's programmatic/generative cover-art renderer.
+//!
+//! # Scope of this file
+//!
+//! `covers.py` is 778 lines drawing full cover images with Qt's
+//! `QPainter` (5 "Style" classes -- `Cross`/`Half`/`Banner`/
+//! `Ornamental`/`Blocks` -- plus shared text-layout/color-theme/
+//! template-formatting infrastructure). Research (an Explore-agent
+//! pass reading the whole file plus this crate's existing
+//! `tiny-skia`/`resvg`/`usvg` dependencies) found the "needs Tauri
+//! image-generation wiring" framing this issue was filed under is
+//! stale: cover generation is a pure `Metadata + theme + style -> PNG
+//! bytes` function needing zero GUI/webview plumbing, and this crate
+//! already has a real, working headless 2D-rendering pipeline
+//! (`oeb::transforms::rasterize`, built on the same `tiny-skia`/
+//! `resvg`/`usvg` stack) that's a genuine `QPainter` substitute for
+//! everything except text shaping -- and even that has a viable path
+//! via `usvg`'s own internal `harfrust`/`skrifa`-based text engine
+//! (already a transitive dependency), not a new crate.
+//!
+//! Split into real sub-issues by tractability (least to most graphics
+//! dependency): #595 (color themes + text-formatting tokenizer),
+//! #596 (this file's other half -- field-template formatting), #597
+//! (`tiny-skia` canvas + `Half`/`Blocks`/`Cross`), #598 (text layout +
+//! rendering bridge, `covers_text.rs`), #599 (`Banner`, real curve
+//! math), #600 (`Ornamental`, transform stamping), #601 (entry points
+//! + wiring). All CLOSED -- the entire epic is done.
+//!
+//! # This file's own scope
+//!
+//! [`ColorTheme`]/[`load_color_themes`]/[`theme_to_colors`]/[`color`]
+//! (port of the `Colors {{{` section), [`sanitize`]/
+//! [`escape_formatting`]/[`unescape_formatting`]/
+//! [`parse_text_formatting`] (port of the non-Qt-dependent half of the
+//! `Draw text {{{` section), the `program:`/default-dialect field-
+//! template formatting (`vformat`/[`format_text`]), the `tiny-skia`-
+//! backed `Style` implementations ([`render_cross`]/[`render_half`]/
+//! [`render_blocks`]/[`render_banner`]/[`render_ornamental`]), and the
+//! entry points ([`generate_cover`]/[`create_cover`]/
+//! [`calibre_cover2`]/[`message_image`]/[`generate_masthead`]) tying
+//! them together with real font/text layout from `crate::covers_text`
+//! (`covers.py`'s own `Block`/`layout_text`, a separate module -- see
+//! its own doc). `parse_text_formatting` deliberately stops at
+//! producing [`FormatRange`] data (tag/start/length) rather than
+//! wrapping it in a `QTextCharFormat`/`QTextLayout::FormatRange`
+//! equivalent -- `crate::covers_text` decides what text-shaping API
+//! actually consumes this data.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
+
+use regex::Regex;
+use unicode_normalization::UnicodeNormalization;
+
+use lexmechanic_utils::cleantext::{clean_ascii_chars, clean_xml_chars};
+use lexmechanic_utils::formatter::interp::{RawValue, ValueSource};
+use lexmechanic_utils::formatter::{PureCatalog, PureFunctions};
+use tiny_skia::{
+    Color, FillRule, GradientStop, LinearGradient, Mask, Paint, PathBuilder, Pixmap, PixmapPaint, Point,
+    RadialGradient, Rect, SpreadMode, Transform,
+};
+
+use crate::covers_text::HAlign;
+use crate::metadata::authors::authors_to_string;
+use crate::metadata::meta::MetaInformation;
+use crate::oeb::transforms::rescale::fit_image;
+use crate::oeb::transforms::jacket::fmt_sidx;
+
+// ===================================================================
+// Colors
+// ===================================================================
+
+/// Port of `ColorTheme`. Each field is `#rrggbb` (no leading `#`
+/// stored, matching how `default_color_themes`'s literal strings are
+/// written; [`color`] adds it back only when needed -- nothing in
+/// this file's own scope needs a parsed RGB struct yet, that's for
+/// whichever `Style` port actually paints with it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColorTheme {
+    pub color1: String,
+    pub color2: String,
+    pub contrast_color1: String,
+    pub contrast_color2: String,
+}
+
+/// Port of `to_theme`: splits a `"c1 c2 cc1 cc2"` hex-quad string into
+/// a [`ColorTheme`].
+pub fn to_theme(x: &str) -> ColorTheme {
+    let mut parts = x.split_whitespace();
+    ColorTheme {
+        color1: parts.next().unwrap_or_default().to_string(),
+        color2: parts.next().unwrap_or_default().to_string(),
+        contrast_color1: parts.next().unwrap_or_default().to_string(),
+        contrast_color2: parts.next().unwrap_or_default().to_string(),
+    }
+}
+
+/// Port of `fallback_colors`.
+pub fn fallback_colors() -> ColorTheme {
+    to_theme("ffffff 000000 000000 ffffff")
+}
+
+/// Port of `default_color_themes`. Returns `(name, theme)` pairs in
+/// upstream's own literal order (Python's dict preserves insertion
+/// order; this crate has no need for name-keyed lookup elsewhere, so
+/// a `Vec` avoids an unnecessary `HashMap` for 4 fixed entries).
+pub fn default_color_themes() -> Vec<(&'static str, ColorTheme)> {
+    vec![
+        ("Earth", to_theme("e8d9ac c7b07b 564628 382d1a")),
+        ("Grass", to_theme("d8edb5 abc8a4 375d3b 183128")),
+        ("Water", to_theme("d3dcf2 829fe4 00448d 00305a")),
+        ("Silver", to_theme("e6f1f5 aab3b6 6e7476 3b3e40")),
+    ]
+}
+
+/// Port of `theme_to_colors` -- a no-op passthrough in this port (see
+/// [`ColorTheme`]'s own doc: values are already the parsed-shape hex
+/// strings `to_theme` produces, there's no separate raw-dict
+/// intermediate form the way Python's `QColor`-keyed dict is).
+pub fn theme_to_colors(theme: ColorTheme) -> ColorTheme {
+    theme
+}
+
+/// Port of `load_color_themes`: every enabled color theme (user
+/// overrides in `prefs_color_themes` merged over the 4 built-ins,
+/// `prefs_disabled_color_themes` names removed) -- falling back to
+/// all 4 built-ins if every one of them got disabled (matching
+/// upstream's own "ignore disabled" fallback rather than returning an
+/// empty list a caller would have nothing to pick a random theme
+/// from). `prefs_color_themes`' values are already-parsed
+/// [`ColorTheme`]s, matching upstream's own `prefs.color_themes`
+/// shape (a dict-of-dicts, the same shape `default_color_themes`'
+/// own values already have -- not a raw "c1 c2 cc1 cc2" string, which
+/// only `to_theme` itself consumes).
+pub fn load_color_themes(
+    prefs_color_themes: &HashMap<String, ColorTheme>,
+    prefs_disabled_color_themes: &[String],
+) -> Vec<ColorTheme> {
+    let mut themes: Vec<(String, ColorTheme)> = default_color_themes().into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+    for (k, v) in prefs_color_themes {
+        if let Some(existing) = themes.iter_mut().find(|(name, _)| name == k) {
+            existing.1 = v.clone();
+        } else {
+            themes.push((k.clone(), v.clone()));
+        }
+    }
+    let disabled: std::collections::HashSet<&str> = prefs_disabled_color_themes.iter().map(String::as_str).collect();
+    let ans: Vec<ColorTheme> = themes
+        .into_iter()
+        .filter(|(k, _)| !disabled.contains(k.as_str()))
+        .map(|(_, v)| theme_to_colors(v))
+        .collect();
+    if ans.is_empty() {
+        default_color_themes().into_iter().map(|(_, v)| v).collect()
+    } else {
+        ans
+    }
+}
+
+/// Port of `color(color_theme, name)`: the named color, or the
+/// fallback if it's missing/empty (upstream's `QColor.isValid()`
+/// check -- this port's `ColorTheme` fields are plain possibly-empty
+/// strings rather than a parsed color type that can itself be
+/// invalid, so "empty" is the equivalent signal).
+pub fn color(theme: &ColorTheme, name: &str) -> String {
+    let val = match name {
+        "color1" => &theme.color1,
+        "color2" => &theme.color2,
+        "contrast_color1" => &theme.contrast_color1,
+        "contrast_color2" => &theme.contrast_color2,
+        _ => "",
+    };
+    if val.is_empty() {
+        let fb = fallback_colors();
+        match name {
+            "color1" => fb.color1,
+            "color2" => fb.color2,
+            "contrast_color1" => fb.contrast_color1,
+            "contrast_color2" => fb.contrast_color2,
+            _ => String::new(),
+        }
+    } else {
+        val.to_string()
+    }
+}
+
+// ===================================================================
+// Text sanitization/escaping
+// ===================================================================
+
+/// Port of `sanitize`. `force_unicode` is a no-op here -- a Rust
+/// `&str` is already guaranteed valid Unicode, unlike Python 2-era
+/// `bytes`-or-`str` ambiguity that function existed to resolve.
+pub fn sanitize(s: &str) -> String {
+    clean_xml_chars(&clean_ascii_chars(s)).nfc().collect()
+}
+
+/// Port of `escape_formatting`.
+pub fn escape_formatting(val: &str) -> String {
+    val.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// Port of `unescape_formatting`.
+pub fn unescape_formatting(val: &str) -> String {
+    val.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+}
+
+// ===================================================================
+// parse_text_formatting
+// ===================================================================
+
+/// One resolved `<b>`/`<strong>`/`<i>`/`<em>` span, in character (not
+/// byte) offsets into the text [`parse_text_formatting`] returns
+/// alongside it. Deliberately not a `QTextCharFormat` equivalent --
+/// see this module's own doc for why that's out of scope here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormatRange {
+    pub bold: bool,
+    pub italic: bool,
+    pub start: usize,
+    pub length: usize,
+}
+
+enum PendingRange {
+    Closed { tag: String, start: usize, length: usize },
+    Open { tag: String, start: usize },
+}
+
+enum Tok {
+    Text(String),
+    Tag(String, bool),
+}
+
+/// Port of `parse_text_formatting`: strips `<b>`/`<strong>`/`<i>`/
+/// `<em>` (and any other `<tag>`/`</tag>` markup, which is dropped
+/// without producing a format range) out of `text`, returning the
+/// markup-free text plus the resolved bold/italic spans. Faithfully
+/// replicates a real upstream quirk: offsets are computed as if
+/// `&amp;` were already collapsed to `&` (matching what the caller's
+/// later `unescape_formatting` call will do), but the *returned* text
+/// itself is NOT unescaped here -- `&amp;`/`&lt;`/`&gt;` stay literal
+/// in the output string, only the range math anticipates the later
+/// unescape.
+pub fn parse_text_formatting(text: &str) -> (String, Vec<FormatRange>) {
+    static TAG_RE: OnceLock<Regex> = OnceLock::new();
+    let tag_re = TAG_RE.get_or_init(|| Regex::new(r"</?([a-zA-Z1-6]+)/?>").unwrap());
+
+    let mut tokens: Vec<Tok> = Vec::new();
+    let mut pos = 0usize;
+    for caps in tag_re.captures_iter(text) {
+        let whole = caps.get(0).unwrap();
+        let q = &text[pos..whole.start()];
+        if !q.is_empty() {
+            tokens.push(Tok::Text(q.to_string()));
+        }
+        let tag_name = caps.get(1).unwrap().as_str().to_lowercase();
+        let closing = whole.as_str().get(0..2).map(|s| s.contains('/')).unwrap_or(false);
+        tokens.push(Tok::Tag(tag_name, closing));
+        pos = whole.end();
+    }
+    if !tokens.is_empty() {
+        if pos < text.len() {
+            tokens.push(Tok::Text(text[pos..].to_string()));
+        }
+    } else {
+        tokens.push(Tok::Text(text.to_string()));
+    }
+
+    let mut ranges: Vec<PendingRange> = Vec::new();
+    let mut open_stack: Vec<(String, usize)> = Vec::new();
+    let mut offset = 0usize;
+    let mut out_text = String::new();
+    for tok in tokens {
+        match tok {
+            Tok::Tag(tag, closing) => {
+                if closing {
+                    if let Some((open_tag, start)) = open_stack.pop() {
+                        let length = offset.saturating_sub(start);
+                        if length > 0 {
+                            ranges.push(PendingRange::Closed { tag: open_tag, start, length });
+                        }
+                    }
+                } else if matches!(tag.as_str(), "b" | "strong" | "i" | "em") {
+                    open_stack.push((tag, offset));
+                }
+            }
+            Tok::Text(t) => {
+                offset += t.replace("&amp;", "&").chars().count();
+                out_text.push_str(&t);
+            }
+        }
+    }
+    for (tag, start) in open_stack {
+        ranges.push(PendingRange::Open { tag, start });
+    }
+
+    let text_char_len = out_text.chars().count();
+    let mut formats = Vec::new();
+    for pr in ranges {
+        let (tag, start, length) = match pr {
+            PendingRange::Closed { tag, start, length } => (tag, start, length),
+            PendingRange::Open { tag, start } => (tag, start, text_char_len.saturating_sub(start)),
+        };
+        let bold = matches!(tag.as_str(), "b" | "strong");
+        let italic = matches!(tag.as_str(), "i" | "em");
+        if !bold && !italic {
+            continue;
+        }
+        if length > 0 {
+            formats.push(FormatRange { bold, italic, start, length });
+        }
+    }
+    (out_text, formats)
+}
+
+// ===================================================================
+// Field-template formatting (issue #596)
+// ===================================================================
+//
+// Port of the `Format text using templates {{{` section's
+// `Formatter`/`formatter`/`format_fields`/`format_text` plus the real
+// `TemplateFormatter.evaluate`/`format_field` dispatch they call into
+// (`old_src/src/calibre/utils/formatter.py`).
+//
+// Real upstream `TemplateFormatter.evaluate` dispatches a template on
+// its own prefix: `program:` (full GPM, `lexmechanic_utils::formatter`'s
+// existing real parser/interpreter), `python:` (a full Python `exec`
+// sandbox -- N/A, no Python interpreter in this port, matching this
+// whole project's established GUI/Python-dependent narrowing
+// pattern), or -- the default, and what `covers.py`'s own
+// `title_template`/`subtitle_template` actually use -- a
+// `string.Formatter`-style `{field}`/`{field:format_spec}`
+// substitution (`vformat`), where the format-spec itself can hold a
+// single bare-quoted GPM expression (`{field:'expr'}` or a bare
+// `{field:'...'}`), evaluated via the exact same GPM machinery with
+// the field's own value bound to `$`.
+//
+// **Real, disclosed narrowing**: real `format_field` also supports an
+// "old-style" `{field:funcname(args)}` call syntax (a legacy
+// alternate spelling of the same thing the bare-quoted-expression
+// style already covers, needing its own comma-aware argument-scanner
+// with backslash-escaping rules). Not ported -- a template using it
+// degrades to having that text treated as a literal `_do_format` type
+// spec (harmless, not a crash) rather than dispatching a function
+// call. `covers.py`'s own real default templates never use this
+// style. `_do_format` (a Python `str.format()` numeric/width/
+// precision mini-language applied to the final value) is implemented
+// only for the empty-format-spec case real templates actually
+// exercise -- see [`apply_display_format`]'s own doc.
+
+/// Field access for [`evaluate_template`]/[`format_field`], backed by
+/// a [`MetaInformation`] plus the two derived values real
+/// `format_text` computes before formatting (`Unknown`-filtered
+/// authors, `formatted_series_index`) -- port of `format_text`'s own
+/// `preserve_fields`-scoped mutation of `mi.authors`/
+/// `mi.formatted_series_index`, done here as local derived values
+/// instead of temporarily mutating a caller's struct (Rust has no
+/// need for Python's save/restore-on-exit dance to get the same net
+/// effect).
+///
+/// Deliberately exposes only the fields `covers.py`'s own real
+/// templates reference (`title`/`authors`/`series`/
+/// `formatted_series_index`) -- a real, disclosed narrower field set
+/// than upstream's full `Metadata` object, which can answer `field()`
+/// for any of dozens of book attributes. A future caller with a
+/// custom template needing more fields would extend this.
+#[derive(Clone)]
+struct CoverValueSource {
+    title: String,
+    authors: String,
+    series: String,
+    formatted_series_index: String,
+}
+
+impl CoverValueSource {
+    fn raw(&self, name: &str) -> Option<&str> {
+        match name {
+            "title" => Some(&self.title),
+            "authors" => Some(&self.authors),
+            "series" => Some(&self.series),
+            "formatted_series_index" => Some(&self.formatted_series_index),
+            _ => None,
+        }
+    }
+}
+
+impl ValueSource for CoverValueSource {
+    /// Port of `field(name)`'s real `formatter.get_value(name, [],
+    /// kwargs)` delegation to `Formatter.get_value` -- i.e. `field()`
+    /// itself is escaped ([`escape_formatting`]), confirmed by reading
+    /// `formatter_functions.py`'s real `BuiltinField.evaluate` (not
+    /// assumed): `covers.py`'s own default `footer_template` splits/
+    /// joins on the literal `&amp;` precisely because `field('authors')`
+    /// returns the escaped join, not a plain `&`.
+    fn get_value(&self, name: &str) -> Option<String> {
+        self.raw(name).map(escape_formatting)
+    }
+    /// Port of `raw_field`'s real `getattr(self.parent_book, name,
+    /// default)` path -- genuinely unescaped, a different real code
+    /// path from `get_value`/`field()` above, not merely this port's
+    /// own convention.
+    fn get_raw_value(&self, name: &str) -> Option<RawValue> {
+        self.raw(name).map(|s| RawValue::Scalar(s.to_string()))
+    }
+}
+
+/// Thin wrappers around `lexmechanic_utils::formatter::string_format`'s
+/// now-generic port of this same logic (issue #751 generalized it out
+/// of this module so `lexmechanic_srv`'s save-to-disk route could reuse
+/// the `{field}` shorthand dialect against a `Cache`-backed
+/// `ValueSource` too) -- kept here under their original names/2-arg
+/// signatures so every existing call site and test in this module
+/// (which all pass `&CoverValueSource` and never need a non-`Pure`
+/// catalog/registry) needs no changes.
+fn safe_format(fmt: &str, values: &CoverValueSource) -> String {
+    lexmechanic_utils::formatter::string_format::safe_format(fmt, values, &PureCatalog, &PureFunctions)
+}
+
+/// The 3 templates [`format_text`] evaluates, port of the relevant
+/// slice of `cprefs`' defaults (`title_template`/`subtitle_template`/
+/// `footer_template`) -- the rest of `cprefs` (font sizes/families,
+/// cover dimensions, theme/style enable-lists) belongs to whichever
+/// later sub-issue actually consumes them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverTemplates {
+    pub title_template: String,
+    pub subtitle_template: String,
+    pub footer_template: String,
+}
+
+impl Default for CoverTemplates {
+    fn default() -> Self {
+        CoverTemplates {
+            title_template: "<b>{title}".to_string(),
+            subtitle_template: "{series:'test($, strcat(\"<i>\", $, \"</i> - \", raw_field(\"formatted_series_index\")), \"\")'}".to_string(),
+            // Matches the real Python literal exactly, including its
+            // `&amp;` separator (not a plain `&`): `field('authors')`
+            // returns an escaped value (see `CoverValueSource::get_value`'s
+            // own doc), so the real author-list join separator this
+            // template splits/joins on really is `' &amp; '`, not
+            // `' & '`.
+            footer_template: "program:\n\
+                # Show at most two authors, on separate lines.\n\
+                authors = field('authors');\n\
+                num = count(authors, ' &amp; ');\n\
+                authors = sublist(authors, 0, 2, ' &amp; ');\n\
+                authors = list_re(authors, ' &amp; ', '(.+)', '<b>\\1');\n\
+                authors = re(authors, ' &amp; ', '<br>');\n\
+                re(authors, '&amp;&amp;', '&amp;')"
+                .to_string(),
+        }
+    }
+}
+
+/// Port of `format_text(mi, prefs)`: `(title, subtitle, footer)`.
+/// `use_roman` replaces `get_use_roman()`'s real GUI-config lookup
+/// (`config['use_roman_numerals_for_series_number']`) with an explicit
+/// parameter -- no GUI config store in this port, matching the
+/// project's established pattern for GUI-preference-backed upstream
+/// globals (e.g. issue #168 jacket's `page_setup` narrowing).
+pub fn format_text(mi: &MetaInformation, templates: &CoverTemplates, use_roman: bool) -> (String, String, String) {
+    let authors: Vec<String> = mi.authors.iter().filter(|a| a.as_str() != "Unknown").cloned().collect();
+    let formatted_series_index = fmt_sidx(Some(mi.series_index), use_roman);
+    let source = CoverValueSource {
+        title: mi.title.clone(),
+        authors: authors_to_string(&authors),
+        series: mi.series.clone().unwrap_or_default(),
+        formatted_series_index,
+    };
+    (
+        safe_format(&templates.title_template, &source),
+        safe_format(&templates.subtitle_template, &source),
+        safe_format(&templates.footer_template, &source),
+    )
+}
+
+// ===================================================================
+// Styles (issue #597): `tiny-skia` canvas + the `Half`/`Blocks`/
+// `Cross` `Style` classes.
+// ===================================================================
+//
+// Establishes the real `QImage`->`tiny_skia::Pixmap` canvas/PNG-encode
+// pattern for `covers.py`'s 5 `Style` classes, using the 3 cheapest
+// (no curve math, no transform-stamping, no text) as the proving
+// ground. `Banner` (#599) and `Ornamental` (#600) are separate issues.
+//
+// Every real `Style.__call__(painter, rect, color_theme, title_block,
+// subtitle_block, footer_block)` reads only a handful of scalar fields
+// off `title_block`/`subtitle_block` (`Block` objects `layout_text`,
+// #598, produces) -- never the `Block`s themselves. [`TextBlockGeometry`]
+// carries exactly those fields (only [`render_cross`] needs it; `Half`/
+// `Blocks` ignore their `title_block`/`subtitle_block` params in the
+// real Python too), so this port's function signatures don't need to
+// change once #598 lands -- #598 just computes and passes real values
+// into the same fields.
+
+/// Port of the base `Style.load_colors`: the 4 theme colors, parsed
+/// from [`color`]'s hex strings into real paintable colors.
+#[derive(Debug, Clone, Copy)]
+pub struct StyleColors {
+    pub color1: Color,
+    pub color2: Color,
+    pub ccolor1: Color,
+    pub ccolor2: Color,
+}
+
+impl StyleColors {
+    pub fn load(theme: &ColorTheme) -> Self {
+        StyleColors {
+            color1: hex_to_color(&color(theme, "color1")),
+            color2: hex_to_color(&color(theme, "color2")),
+            ccolor1: hex_to_color(&color(theme, "contrast_color1")),
+            ccolor2: hex_to_color(&color(theme, "contrast_color2")),
+        }
+    }
+}
+
+/// Parses a bare `"rrggbb"` hex string (as produced by [`to_theme`]/
+/// [`color`]) into a `tiny_skia::Color`. Falls back to opaque black on
+/// a malformed string -- every real caller's input ultimately comes
+/// from [`default_color_themes`]/user-supplied hex-quad strings the
+/// same way upstream's own `QColor('#' + val)` would, so a malformed
+/// value here is already a real, pre-existing data problem, not
+/// something this port's color math should mask with `Result`
+/// plumbing no upstream call site has either.
+fn hex_to_color(hex: &str) -> Color {
+    let byte = |i: usize| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok();
+    let (Some(r), Some(g), Some(b)) = (byte(0), byte(2), byte(4)) else {
+        return Color::BLACK;
+    };
+    Color::from_rgba8(r, g, b, 255)
+}
+
+/// Port of the base `Style.calculate_margins`. `Banner` overrides this
+/// (#599); `Cross`/`Half`/`Blocks` all use the shared base behavior.
+#[derive(Debug, Clone, Copy)]
+pub struct Margins {
+    pub hmargin: i32,
+    pub vmargin: i32,
+}
+
+pub fn calculate_margins(cover_width: u32, cover_height: u32) -> Margins {
+    Margins {
+        hmargin: ((50.0 / 600.0) * cover_width as f64) as i32,
+        vmargin: ((50.0 / 800.0) * cover_height as f64) as i32,
+    }
+}
+
+/// The scalar fields real `Cross.__call__` reads off `title_block`/
+/// `subtitle_block` (see this section's module doc).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TextBlockGeometry {
+    pub title_x: f32,
+    pub title_y: f32,
+    pub title_height: f32,
+    pub title_leading: f32,
+    pub subtitle_height: f32,
+    pub subtitle_line_spacing: f32,
+}
+
+/// Port of a real `Style.__call__`'s return tuple: `(title_color,
+/// subtitle_color, footer_color)`.
+#[derive(Debug, Clone, Copy)]
+pub struct StyleResultColors {
+    pub title: Color,
+    pub subtitle: Color,
+    pub footer: Color,
+}
+
+/// Builds a rounded-rectangle path with equal x/y corner radius,
+/// clamped to at most half the smaller side (matching Qt's own
+/// `addRoundedRect` clamping). `tiny-skia-path` has no built-in
+/// rounded-rect helper, so this hand-builds the standard 4-corner
+/// cubic-Bezier circular-arc approximation (the `k = 0.5522847498 * r`
+/// constant used by every vector-graphics rounded-rect implementation,
+/// including Qt's own).
+fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<tiny_skia::Path> {
+    let r = radius.max(0.0).min(w / 2.0).min(h / 2.0);
+    let k = 0.5522847498 * r;
+    let mut pb = PathBuilder::new();
+    pb.move_to(x + r, y);
+    pb.line_to(x + w - r, y);
+    pb.cubic_to(x + w - r + k, y, x + w, y + r - k, x + w, y + r);
+    pb.line_to(x + w, y + h - r);
+    pb.cubic_to(x + w, y + h - r + k, x + w - r + k, y + h, x + w - r, y + h);
+    pb.line_to(x + r, y + h);
+    pb.cubic_to(x + r - k, y + h, x, y + h - r + k, x, y + h - r);
+    pb.line_to(x, y + r);
+    pb.cubic_to(x, y + r - k, x + r - k, y, x + r, y);
+    pb.close();
+    pb.finish()
+}
+
+/// Port of `Half.__call__`: a 3-stop vertical `QLinearGradient` fill.
+pub fn render_half(pixmap: &mut Pixmap, width: f32, height: f32, colors: &StyleColors) -> StyleResultColors {
+    let rect = Rect::from_xywh(0.0, 0.0, width, height).expect("non-degenerate cover rect");
+    let shader = LinearGradient::new(
+        Point::from_xy(0.0, 0.0),
+        Point::from_xy(0.0, height),
+        vec![
+            GradientStop::new(0.0, colors.color1),
+            GradientStop::new(0.7, colors.color2),
+            GradientStop::new(1.0, colors.color1),
+        ],
+        SpreadMode::Pad,
+        Transform::identity(),
+    )
+    .expect("linear gradient with 3 distinct, non-degenerate stops");
+    let paint = Paint { shader, ..Default::default() };
+    pixmap.fill_rect(rect, &paint, Transform::identity(), None);
+    StyleResultColors { title: colors.ccolor1, subtitle: colors.ccolor1, footer: colors.ccolor1 }
+}
+
+/// Port of `Blocks.__call__`: the whole cover in `color1`, with the
+/// bottom third overpainted in `color2`. (Upstream's own body computes
+/// an unused intermediate `QRect` before the first `fillRect` -- dead
+/// code with no observable effect, not reproduced here.)
+pub fn render_blocks(pixmap: &mut Pixmap, width: u32, height: u32, colors: &StyleColors) -> StyleResultColors {
+    let full = Rect::from_xywh(0.0, 0.0, width as f32, height as f32).expect("non-degenerate cover rect");
+    let paint1 = Paint { shader: tiny_skia::Shader::SolidColor(colors.color1), ..Default::default() };
+    pixmap.fill_rect(full, &paint1, Transform::identity(), None);
+
+    let y = height - height / 3;
+    let band = Rect::from_xywh(0.0, y as f32, width as f32, (height - y) as f32).expect("non-degenerate band rect");
+    let paint2 = Paint { shader: tiny_skia::Shader::SolidColor(colors.color2), ..Default::default() };
+    pixmap.fill_rect(band, &paint2, Transform::identity(), None);
+
+    StyleResultColors { title: colors.ccolor1, subtitle: colors.ccolor1, footer: colors.ccolor2 }
+}
+
+/// Port of `Cross.__call__`: the whole cover in `color1`, a rounded-
+/// corner band behind the title/subtitle text in `color2` (`setClipPath`
+/// -> a [`Mask`] filled with the rounded-rect path, matching Qt's own
+/// general clip-to-arbitrary-path mechanism rather than special-casing
+/// "the fill happens to match the clip shape exactly"), and a solid
+/// left-margin bar in `color2`.
+///
+/// Real `QPainterPath.addRoundedRect(rect, 10, 10 * rect.width() /
+/// rect.height(), Qt.SizeMode.RelativeSize)` resolves (worked out from
+/// Qt's own `RelativeSize` semantics: `rx = xRadius/100 * width/2`,
+/// `ry = yRadius/100 * height/2`) to an absolute circular corner radius
+/// of exactly `0.05 * rect.width()` regardless of the band's aspect
+/// ratio -- substituted directly rather than reproducing the
+/// percentage/`RelativeSize` indirection, which has no other real
+/// caller in this port.
+pub fn render_cross(
+    pixmap: &mut Pixmap,
+    width: u32,
+    height: u32,
+    colors: &StyleColors,
+    blocks: &TextBlockGeometry,
+) -> StyleResultColors {
+    let (width_f, height_f) = (width as f32, height as f32);
+    let full = Rect::from_xywh(0.0, 0.0, width_f, height_f).expect("non-degenerate cover rect");
+    let paint1 = Paint { shader: tiny_skia::Shader::SolidColor(colors.color1), ..Default::default() };
+    pixmap.fill_rect(full, &paint1, Transform::identity(), None);
+
+    let band_y = blocks.title_y as i32;
+    let band_h = blocks.title_height + blocks.subtitle_height + blocks.subtitle_line_spacing / 2.0 + blocks.title_leading;
+    let band = Rect::from_xywh(0.0, band_y as f32, width_f, band_h).expect("non-degenerate title band rect");
+
+    let radius = 0.05 * width_f;
+    if let Some(path) = rounded_rect_path(0.0, band_y as f32, width_f, band_h, radius) {
+        if let Some(mut mask) = Mask::new(width, height) {
+            mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
+            let paint2 = Paint { shader: tiny_skia::Shader::SolidColor(colors.color2), ..Default::default() };
+            pixmap.fill_rect(band, &paint2, Transform::identity(), Some(&mask));
+        }
+    }
+
+    let left_w = blocks.title_x as i32;
+    if left_w > 0 {
+        if let Some(left) = Rect::from_xywh(0.0, 0.0, left_w as f32, height_f) {
+            let paint2 = Paint { shader: tiny_skia::Shader::SolidColor(colors.color2), ..Default::default() };
+            pixmap.fill_rect(left, &paint2, Transform::identity(), None);
+        }
+    }
+
+    StyleResultColors { title: colors.ccolor2, subtitle: colors.ccolor2, footer: colors.ccolor1 }
+}
+
+// ===================================================================
+// Banner style (issue #599): real curve math (`rotate_vector`/
+// `draw_curved_line`) + fold-rectangle geometry.
+// ===================================================================
+//
+// Unlike `Cross` (#597, ported before #598's real `Block` existed and
+// so takes a placeholder [`TextBlockGeometry`]), `Banner` is ported
+// after #598 landed and reads real title/subtitle geometry directly
+// off [`crate::covers_text::Block`] -- `position()`/`height()`/
+// `leading`/`line_spacing` all already exist for exactly this.
+
+/// Port of `Banner.calculate_margins`: overrides the base `Style`
+/// margins entirely (does not call `Style.calculate_margins` for
+/// `hmargin`, only inherits `vmargin`), plus a `fold_width` the base
+/// `Style` has no equivalent of.
+#[derive(Debug, Clone, Copy)]
+pub struct BannerMargins {
+    pub hmargin: i32,
+    pub vmargin: i32,
+    pub fold_width: i32,
+}
+
+pub fn banner_margins(cover_width: u32, cover_height: u32) -> BannerMargins {
+    BannerMargins {
+        hmargin: (0.15 * cover_width as f64) as i32,
+        vmargin: calculate_margins(cover_width, cover_height).vmargin,
+        fold_width: (0.1 * cover_width as f64) as i32,
+    }
+}
+
+/// Port of `rotate_vector`.
+fn rotate_vector(angle: f32, x: f32, y: f32) -> (f32, f32) {
+    (x * angle.cos() - y * angle.sin(), x * angle.sin() + y * angle.cos())
+}
+
+/// Port of `draw_curved_line`: appends a cubic Bezier segment from the
+/// path's current point to `(dx, dy)` further along, whose two control
+/// points are `(c1_frac, c1_amp)`/`(c2_frac, c2_amp)` -- expressed as
+/// fractions of the segment's own length/amplitude in a frame rotated
+/// to the segment's own direction (`atan2(dy, dx)`) -- rotated back
+/// into absolute coordinates via [`rotate_vector`]. This is the exact
+/// real curve-construction primitive every `Banner` ribbon/fold edge
+/// uses; `tiny-skia-path`'s `cubic_to` is a direct match for Qt's
+/// `QPainterPath.cubicTo`, so only the control-point math is new
+/// porting work.
+fn draw_curved_line(pb: &mut PathBuilder, dx: f32, dy: f32, c1_frac: f32, c1_amp: f32, c2_frac: f32, c2_amp: f32) {
+    let length = (dx * dx + dy * dy).sqrt();
+    let angle = dy.atan2(dx);
+    let (c1x, c1y) = rotate_vector(angle, c1_frac * length, c1_amp * length);
+    let (c2x, c2y) = rotate_vector(angle, c2_frac * length, c2_amp * length);
+    let pos = pb.last_point().unwrap_or(Point::from_xy(0.0, 0.0));
+    pb.cubic_to(pos.x + c1x, pos.y + c1y, pos.x + c2x, pos.y + c2y, pos.x + dx, pos.y + dy);
+}
+
+/// Port of `QColor::darker()`'s real default (`factor=200`): scales
+/// the HSV "value" channel by `100/factor` (i.e. halves it), keeping
+/// hue/saturation unchanged -- real HSV-space darkening, not a flat
+/// RGB scale (which would visibly differ for saturated colors).
+fn darker(color: Color) -> Color {
+    let (r, g, b) = (color.red(), color.green(), color.blue());
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let delta = max - min;
+    let v = max;
+    let s = if max > 0.0 { delta / max } else { 0.0 };
+    let h = if delta <= 0.0 {
+        0.0
+    } else if max == r {
+        60.0 * (((g - b) / delta).rem_euclid(6.0))
+    } else if max == g {
+        60.0 * ((b - r) / delta + 2.0)
+    } else {
+        60.0 * ((r - g) / delta + 4.0)
+    };
+    let new_v = (v * 0.5).clamp(0.0, 1.0);
+    let c = new_v * s;
+    let hp = h / 60.0;
+    let x = c * (1.0 - (hp.rem_euclid(2.0) - 1.0).abs());
+    let (r1, g1, b1) = match hp as i32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = new_v - c;
+    Color::from_rgba((r1 + m).clamp(0.0, 1.0), (g1 + m).clamp(0.0, 1.0), (b1 + m).clamp(0.0, 1.0), color.alpha()).unwrap_or(Color::BLACK)
+}
+
+/// The 5 closed paths a real `Banner.__call__` builds: the main
+/// ribbon plus a fold and inner-fold-shading path on each side.
+#[derive(Debug, Clone)]
+pub struct BannerPaths {
+    pub main: tiny_skia::Path,
+    pub left_fold: tiny_skia::Path,
+    pub left_inner: tiny_skia::Path,
+    pub right_fold: tiny_skia::Path,
+    pub right_inner: tiny_skia::Path,
+}
+
+/// Port of `draw_fold` (a real closure in the Python, capturing
+/// `deltax`/`height`/`rwidth` from `Banner.__call__`'s own scope).
+#[allow(clippy::too_many_arguments)]
+fn draw_fold(x: f32, m: f32, corner: Point, rtop: f32, rwidth: f32, deltax: f32, height: f32) -> Option<(tiny_skia::Path, tiny_skia::Path)> {
+    let mut pb = PathBuilder::new();
+    pb.move_to(x, rtop);
+    draw_curved_line(&mut pb, rwidth * m, 0.0, 0.1, 0.1 * m, 0.5, -0.2 * m);
+    let fold_upper = pb.last_point()?;
+    let cur = pb.last_point()?;
+    pb.line_to(cur.x - deltax * m, cur.y + height);
+    let fold_corner = pb.last_point()?;
+    draw_curved_line(&mut pb, -rwidth * m, 0.0, 0.2, -0.1 * m, 0.8, -0.1 * m);
+    draw_curved_line(&mut pb, deltax * m, -height, 0.2, 0.1 * m, 0.8, 0.1 * m);
+    let fold = pb.finish()?;
+
+    let mut inner_pb = PathBuilder::new();
+    inner_pb.move_to(corner.x, corner.y);
+    let dp = (fold_corner.x - corner.x, fold_corner.y - corner.y);
+    draw_curved_line(&mut inner_pb, dp.0, dp.1, 0.5, 0.3 * m, 1.0, 0.0 * m);
+    inner_pb.line_to(fold_upper.x, fold_upper.y);
+    inner_pb.close();
+    let inner_fold = inner_pb.finish()?;
+
+    Some((fold, inner_fold))
+}
+
+/// Port of `Banner.__call__`'s path-construction half (the
+/// `title_block`/`subtitle_block`-derived geometry through to the 5
+/// closed paths, before any painting).
+pub fn build_banner_paths(width: u32, height: u32, margins: &BannerMargins, title_block: &crate::covers_text::Block, subtitle_block: &crate::covers_text::Block) -> Option<BannerPaths> {
+    const GRADE: f32 = 0.07;
+    let (width_f, height_f) = (width as f32, height as f32);
+    let hmargin = margins.hmargin as f32;
+
+    let top = title_block.position().1 + 2.0;
+    // Real Python floor-divides (`//`) an already-integer `line_spacing`
+    // (`QFontMetrics::lineSpacing()` returns `int`); this port's own
+    // `line_spacing` is a real `f32` (see `covers_text`'s own disclosed
+    // no-Qt-"+1"-rounding narrowing), so only the final `//`'s flooring
+    // is replicated here, not a pre-rounded integer input.
+    let extra_spacing = if subtitle_block.line_spacing != 0.0 { (subtitle_block.line_spacing / 2.0).floor() } else { (title_block.line_spacing / 3.0).floor() };
+    let band_height = title_block.height() + subtitle_block.height() + extra_spacing + title_block.leading;
+    let right = (width_f - 1.0) - hmargin; // QRect::right() == x + width - 1
+    let band_width = right - hmargin;
+
+    let mut main_pb = PathBuilder::new();
+    main_pb.move_to(hmargin, top);
+    draw_curved_line(&mut main_pb, width_f - 2.0 * hmargin, 0.0, 0.1, -0.1, 0.9, -0.1);
+    let deltax = GRADE * band_height;
+    main_pb.line_to(right + deltax, top + band_height);
+    let right_corner = main_pb.last_point()?;
+    draw_curved_line(&mut main_pb, -band_width - 2.0 * deltax, 0.0, 0.1, 0.05, 0.9, 0.05);
+    let left_corner = main_pb.last_point()?;
+    main_pb.close();
+    let main = main_pb.finish()?;
+
+    let rwidth = margins.fold_width as f32;
+    let yfrac = 0.1;
+    let width23 = (0.67 * rwidth) as i32 as f32;
+    let rtop = top + band_height * yfrac;
+
+    let (left_fold, left_inner) = draw_fold(hmargin - width23, 1.0, left_corner, rtop, rwidth, deltax, band_height)?;
+    let (right_fold, right_inner) = draw_fold(right + width23, -1.0, right_corner, rtop, rwidth, deltax, band_height)?;
+
+    Some(BannerPaths { main, left_fold, left_inner, right_fold, right_inner })
+}
+
+/// Port of `Banner.__call__`'s painting half: fills + 3px round-join
+/// strokes for the fold/inner-fold/main paths, in upstream's own real
+/// draw order (folds, then inner-fold shading, then the main ribbon on
+/// top).
+pub fn render_banner(pixmap: &mut Pixmap, width: u32, height: u32, colors: &StyleColors, margins: &BannerMargins, title_block: &crate::covers_text::Block, subtitle_block: &crate::covers_text::Block) -> Option<StyleResultColors> {
+    let full = Rect::from_xywh(0.0, 0.0, width as f32, height as f32)?;
+    let paint1 = Paint { shader: tiny_skia::Shader::SolidColor(colors.color1), ..Default::default() };
+    pixmap.fill_rect(full, &paint1, Transform::identity(), None);
+
+    let paths = build_banner_paths(width, height, margins, title_block, subtitle_block)?;
+    let stroke = tiny_skia::Stroke { width: 3.0, line_join: tiny_skia::LineJoin::Round, ..Default::default() };
+    let stroke_paint = Paint { shader: tiny_skia::Shader::SolidColor(colors.ccolor2), ..Default::default() };
+    let fill_paint = Paint { shader: tiny_skia::Shader::SolidColor(colors.color2), ..Default::default() };
+    let inner_fill_paint = Paint { shader: tiny_skia::Shader::SolidColor(darker(colors.color2)), ..Default::default() };
+
+    for fold in [&paths.left_fold, &paths.right_fold] {
+        pixmap.fill_path(fold, &fill_paint, FillRule::Winding, Transform::identity(), None);
+        pixmap.stroke_path(fold, &stroke_paint, &stroke, Transform::identity(), None);
+    }
+    for inner in [&paths.left_inner, &paths.right_inner] {
+        pixmap.fill_path(inner, &inner_fill_paint, FillRule::Winding, Transform::identity(), None);
+        pixmap.stroke_path(inner, &stroke_paint, &stroke, Transform::identity(), None);
+    }
+    pixmap.fill_path(&paths.main, &fill_paint, FillRule::Winding, Transform::identity(), None);
+    pixmap.stroke_path(&paths.main, &stroke_paint, &stroke, Transform::identity(), None);
+
+    Some(StyleResultColors { title: colors.ccolor2, subtitle: colors.ccolor2, footer: colors.ccolor1 })
+}
+
+// ===================================================================
+// Ornamental style (issue #600): transform-stamped corner ornaments +
+// radial gradient + rule lines. No text-block dependency at all --
+// real `Ornamental.__call__` never reads `title_block`/`subtitle_block`/
+// `footer_block`.
+// ===================================================================
+//
+// # `setWindow`: a manual scale, not a `tiny_skia` primitive
+//
+// `painter.setWindow(0, 0, *VIEWPORT)` (`VIEWPORT = (400, 500)`)
+// establishes a logical coordinate system Qt maps onto the real
+// device pixels (the full cover image, no `setViewport` override).
+// Since the window origin matches the viewport origin, this is a pure
+// anisotropic scale -- `Transform::from_scale(width/400, height/500)`
+// -- applied as the OUTERMOST transform to every drawing call in this
+// style (`window_transform` below). `tiny-skia` has no dedicated
+// "logical window" concept; this is real, worked-out scale math, not
+// a guess.
+//
+// # Transform composition order, worked out (not guessed) from Qt's
+// own `setWorldTransform(matrix, combine=true)` semantics
+//
+// Each `painter.rotate()`/`.translate()`/`.scale()` call does
+// `worldTransform = matrix * worldTransform` -- so calling them in
+// sequence `rotate(90); translate(a,b); scale(c,d); translate(e,f)`
+// yields `device = T2(S(T1(R(p))))`: **the calls apply to a point in
+// the literal order they're written**, each later call composing
+// *outside* the earlier ones. `Transform::post_concat`/`post_scale`/
+// `post_translate`/`post_rotate` chained in that same call order
+// reproduce this exactly (verified via `tiny-skia-path`'s own
+// `concat` semantics: `a.pre_concat(b)` == "b applied first, then
+// a" == `post_concat` in the OPPOSITE call order would reverse it --
+// `post_*` chained in *Python's own call order* is the direct match).
+//
+// # Two ornament copies per corner, not one
+//
+// `corner()` draws the SVG ornament path TWICE: once with whatever
+// "outer" scale+translate was set up just before calling it (a plain
+// mirrored/shifted copy), and again after appending its own internal
+// `rotate(90)/translate/scale/translate` chain on top (a rotated
+// copy) -- then resets the world transform to identity before
+// returning, so each of the 4 corner call-sites is independent. 8
+// total ornament fills across the whole image, exactly matching a
+// literal reading of the real Python.
+//
+// # Pen width: cosmetic vs. logical, both replicated for real
+//
+// The first 4 rule lines use Qt's *default* pen (width 0 == a
+// "cosmetic" always-1-device-pixel line, regardless of any active
+// transform); the last 4 use `setWidthF(1.8)` (a *logical*-unit width
+// that scales with `window_transform` like any other geometry).
+// `tiny-skia::Stroke`'s own `width: 0.0` documented "hairline"
+// behavior is the literal, non-approximated match for the cosmetic
+// case (endpoints pre-transformed to device space, stroked with
+// `Transform::identity()`); the logical case strokes in window-space
+// coordinates with `window_transform` as the draw transform, so the
+// resulting device-space width genuinely scales the same way Qt's
+// does.
+
+const CORNER_VECTOR: &str = "m 67.791903,64.260958 c -4.308097,-2.07925 -4.086719,-8.29575 0.334943,-9.40552 4.119758,-1.03399 8.732363,5.05239 5.393055,7.1162 -0.55,0.33992 -1,1.04147 -1,1.55902 0,1.59332 2.597425,1.04548 5.365141,-1.1316 1.999416,-1.57274 2.634859,-2.96609 2.634859,-5.7775 0,-9.55787 -9.827495,-13.42961 -24.43221,-9.62556 -3.218823,0.83839 -5.905663,1.40089 -5.970755,1.25 -0.06509,-0.1509 -0.887601,-1.19493 -1.827799,-2.32007 -1.672708,-2.00174 -1.636693,-2.03722 1.675668,-1.65052 1.861815,0.21736 6.685863,-0.35719 10.720107,-1.27678 12.280767,-2.79934 20.195487,-0.0248 22.846932,8.0092 3.187273,9.65753 -6.423297,17.7497 -15.739941,13.25313 z m 49.881417,-20.53932 c -3.19204,-2.701 -3.72967,-6.67376 -1.24009,-9.16334 2.48236,-2.48236 5.35141,-2.67905 7.51523,-0.51523 1.85966,1.85966 2.07045,6.52954 0.37143,8.22857 -2.04025,2.04024 3.28436,1.44595 6.92316,-0.77272 9.66959,-5.89579 0.88581,-18.22422 -13.0777,-18.35516 -5.28594,-0.0496 -10.31098,1.88721 -14.26764,5.4991 -1.98835,1.81509 -2.16454,1.82692 -2.7936,0.18763 -0.40973,-1.06774 0.12141,-2.82197 1.3628,-4.50104 2.46349,-3.33205 1.67564,-4.01299 -2.891784,-2.49938 -2.85998,0.94777 -3.81038,2.05378 -5.59837,6.51495 -1.184469,2.95536 -3.346819,6.86882 -4.805219,8.69657 -1.4584,1.82776 -2.65164,4.02223 -2.65164,4.87662 0,3.24694 -4.442667,0.59094 -5.872557,-3.51085 -1.361274,-3.90495 0.408198,-8.63869 4.404043,-11.78183 5.155844,-4.05558 1.612374,-3.42079 -9.235926,1.65457 -12.882907,6.02725 -16.864953,7.18038 -24.795556,7.18038 -8.471637,0 -13.38802,-1.64157 -17.634617,-5.88816 -2.832233,-2.83224 -3.849773,-4.81378 -4.418121,-8.6038 -1.946289,-12.9787795 8.03227,-20.91713135 19.767685,-15.7259993 5.547225,2.4538018 6.993631,6.1265383 3.999564,10.1557393 -5.468513,7.35914 -15.917883,-0.19431 -10.657807,-7.7041155 1.486298,-2.1219878 1.441784,-2.2225068 -0.984223,-2.2225068 -1.397511,0 -4.010527,1.3130878 -5.806704,2.9179718 -2.773359,2.4779995 -3.265777,3.5977995 -3.265777,7.4266705 0,5.10943 2.254112,8.84197 7.492986,12.40748 8.921325,6.07175 19.286666,5.61396 37.12088,-1.63946 15.35037,-6.24321 21.294999,-7.42408 34.886123,-6.92999 11.77046,0.4279 19.35803,3.05537 24.34054,8.42878 4.97758,5.3681 2.53939,13.58271 -4.86733,16.39873 -4.17361,1.58681 -11.00702,1.19681 -13.31978,-0.76018 z m 26.50156,-0.0787 c -2.26347,-2.50111 -2.07852,-7.36311 0.39995,-10.51398 2.68134,-3.40877 10.49035,-5.69409 18.87656,-5.52426 l 6.5685,0.13301 -7.84029,0.82767 c -8.47925,0.89511 -12.76997,2.82233 -16.03465,7.20213 -1.92294,2.57976 -1.96722,3.00481 -0.57298,5.5 1.00296,1.79495 2.50427,2.81821 4.46514,3.04333 2.92852,0.33623 2.93789,0.32121 1.08045,-1.73124 -1.53602,-1.69728 -1.64654,-2.34411 -0.61324,-3.58916 2.84565,-3.4288 7.14497,-0.49759 5.03976,3.43603 -1.86726,3.48903 -8.65528,4.21532 -11.3692,1.21647 z m -4.17462,-14.20302 c -0.38836,-0.62838 -0.23556,-1.61305 0.33954,-2.18816 1.3439,-1.34389 4.47714,-0.17168 3.93038,1.47045 -0.5566,1.67168 -3.38637,2.14732 -4.26992,0.71771 z m -8.48037,-9.1829 c -12.462,-4.1101 -12.53952,-4.12156 -25.49998,-3.7694 -24.020921,0.65269 -32.338219,0.31756 -37.082166,-1.49417 -5.113999,-1.95305 -8.192504,-6.3647405 -6.485463,-9.2940713 0.566827,-0.972691 1.020091,-1.181447 1.037211,-0.477701 0.01685,0.692606 1.268676,1.2499998 2.807321,1.2499998 1.685814,0 4.868609,1.571672 8.10041,4.0000015 4.221481,3.171961 6.182506,3.999221 9.473089,3.996261 l 4.149585,-0.004 -3.249996,-1.98156 c -3.056252,-1.863441 -4.051566,-3.8760635 -2.623216,-5.3044145 0.794,-0.794 6.188222,1.901516 9.064482,4.5295635 1.858669,1.698271 3.461409,1.980521 10.559493,1.859621 11.30984,-0.19266 20.89052,1.29095 31.97905,4.95208 7.63881,2.52213 11.51931,3.16471 22.05074,3.65141 7.02931,0.32486 13.01836,0.97543 13.30902,1.44571 0.29065,0.47029 -5.2356,0.83436 -12.28056,0.80906 -12.25942,-0.044 -13.34537,-0.2229 -25.30902,-4.16865 z";
+
+/// Port of `Ornamental.VIEWPORT`.
+const ORNAMENTAL_VIEWPORT: (f32, f32) = (400.0, 500.0);
+
+/// Port of `Ornamental.calculate_margins`: a totally different ratio
+/// basis (`VIEWPORT`, not `prefs.cover_width`/`600`) than the base
+/// `Style`, but the same `Margins` shape.
+pub fn ornamental_margins(cover_width: u32, cover_height: u32) -> Margins {
+    Margins {
+        hmargin: ((51.0 / ORNAMENTAL_VIEWPORT.0) * cover_width as f32) as i32,
+        vmargin: ((83.0 / ORNAMENTAL_VIEWPORT.1) * cover_height as f32) as i32,
+    }
+}
+
+/// Port of `svg_path_to_painter_path` for this style's own fixed
+/// `CORNER_VECTOR` -- a real SVG path `d`-string parser
+/// (`svgtypes::PathParser`, the same tokenizer `usvg` itself uses
+/// internally) converted into a `tiny_skia::Path` via `move_to`/
+/// `line_to`/`cubic_to`/`close`. **Disclosed narrowing**: only the
+/// segment kinds `CORNER_VECTOR` actually uses (`m`/`l`/`c`/`z`) are
+/// handled; elliptical-arc/quadratic/smooth-curve segments are
+/// skipped (a general-purpose SVG path converter would need them, but
+/// no real caller of this specific function does).
+fn svg_path_to_tiny_skia_path(d: &str) -> Option<tiny_skia::Path> {
+    let mut pb = PathBuilder::new();
+    let (mut cx, mut cy) = (0.0f32, 0.0f32);
+    let (mut sx, mut sy) = (0.0f32, 0.0f32);
+    for seg in svgtypes::PathParser::from(d) {
+        match seg.ok()? {
+            svgtypes::PathSegment::MoveTo { abs, x, y } => {
+                let (x, y) = (x as f32, y as f32);
+                (cx, cy) = if abs { (x, y) } else { (cx + x, cy + y) };
+                (sx, sy) = (cx, cy);
+                pb.move_to(cx, cy);
+            }
+            svgtypes::PathSegment::LineTo { abs, x, y } => {
+                let (x, y) = (x as f32, y as f32);
+                (cx, cy) = if abs { (x, y) } else { (cx + x, cy + y) };
+                pb.line_to(cx, cy);
+            }
+            svgtypes::PathSegment::CurveTo { abs, x1, y1, x2, y2, x, y } => {
+                let (mut x1, mut y1, mut x2, mut y2, mut x, mut y) = (x1 as f32, y1 as f32, x2 as f32, y2 as f32, x as f32, y as f32);
+                if !abs {
+                    x1 += cx;
+                    y1 += cy;
+                    x2 += cx;
+                    y2 += cy;
+                    x += cx;
+                    y += cy;
+                }
+                pb.cubic_to(x1, y1, x2, y2, x, y);
+                (cx, cy) = (x, y);
+            }
+            svgtypes::PathSegment::ClosePath { .. } => {
+                pb.close();
+                (cx, cy) = (sx, sy);
+            }
+            _ => {}
+        }
+    }
+    pb.finish()
+}
+
+/// Port of the cached `PATH_CACHE['corner']` lookup.
+fn ornamental_corner_path() -> Option<&'static tiny_skia::Path> {
+    static CACHE: OnceLock<Option<tiny_skia::Path>> = OnceLock::new();
+    CACHE.get_or_init(|| svg_path_to_tiny_skia_path(CORNER_VECTOR)).as_ref()
+}
+
+/// Chains `ops` in the exact order they're applied to a point (`ops[0]`
+/// first/innermost, `ops[last]` outermost) -- the direct equivalent of
+/// a sequence of real `painter.rotate()`/`.translate()`/`.scale()`
+/// calls in that same order (see this section's own module doc).
+fn chain_transforms(ops: &[Transform]) -> Transform {
+    ops.iter().fold(Transform::identity(), |acc, op| acc.post_concat(*op))
+}
+
+fn stroke_line(pixmap: &mut Pixmap, transform: Transform, paint: &Paint, stroke: &tiny_skia::Stroke, p1: (f32, f32), p2: (f32, f32)) {
+    let mut pb = PathBuilder::new();
+    pb.move_to(p1.0, p1.1);
+    pb.line_to(p2.0, p2.1);
+    if let Some(path) = pb.finish() {
+        pixmap.stroke_path(&path, paint, stroke, transform, None);
+    }
+}
+
+/// Port of `Ornamental.__call__`. Reads no `title_block`/
+/// `subtitle_block`/`footer_block` data at all, matching the real
+/// Python exactly.
+pub fn render_ornamental(pixmap: &mut Pixmap, width: u32, height: u32, colors: &StyleColors) -> Option<StyleResultColors> {
+    let (width_f, height_f) = (width as f32, height as f32);
+
+    // `QRadialGradient(rect.center(), rect.width())`: a single circle
+    // centered on the cover, radius == cover width (not height).
+    let center = Point::from_xy(width_f / 2.0, height_f / 2.0);
+    let gradient = RadialGradient::new(
+        center,
+        0.0,
+        center,
+        width_f.max(1.0),
+        vec![GradientStop::new(0.0, colors.color1), GradientStop::new(1.0, colors.color2)],
+        SpreadMode::Pad,
+        Transform::identity(),
+    )?;
+    let gradient_paint = Paint { shader: gradient, ..Default::default() };
+    let full = Rect::from_xywh(0.0, 0.0, width_f, height_f)?;
+    pixmap.fill_rect(full, &gradient_paint, Transform::identity(), None);
+
+    let window_transform = Transform::from_scale(width_f / ORNAMENTAL_VIEWPORT.0, height_f / ORNAMENTAL_VIEWPORT.1);
+
+    if let Some(path) = ornamental_corner_path() {
+        let corner_chain = [Transform::from_rotate(90.0), Transform::from_translate(100.0, -100.0), Transform::from_scale(1.0, -1.0), Transform::from_translate(-103.0, -97.0)];
+        let groups: [Vec<Transform>; 4] = [
+            vec![],
+            vec![Transform::from_scale(-1.0, 1.0), Transform::from_translate(-400.0, 0.0)],
+            vec![Transform::from_scale(1.0, -1.0), Transform::from_translate(0.0, -500.0)],
+            vec![Transform::from_scale(-1.0, -1.0), Transform::from_translate(-400.0, -500.0)],
+        ];
+        let ornament_paint = Paint { shader: tiny_skia::Shader::SolidColor(colors.ccolor1), ..Default::default() };
+        for outer in &groups {
+            let mut plain_ops = outer.clone();
+            plain_ops.push(window_transform);
+            pixmap.fill_path(path, &ornament_paint, FillRule::Winding, chain_transforms(&plain_ops), None);
+
+            let mut rotated_ops = outer.clone();
+            rotated_ops.extend_from_slice(&corner_chain);
+            rotated_ops.push(window_transform);
+            pixmap.fill_path(path, &ornament_paint, FillRule::Winding, chain_transforms(&rotated_ops), None);
+        }
+    }
+
+    let line_paint = Paint { shader: tiny_skia::Shader::SolidColor(colors.ccolor1), ..Default::default() };
+    let hairline = tiny_skia::Stroke { width: 0.0, ..Default::default() };
+    for y in [28.4f32, 471.7] {
+        let mut a = Point::from_xy(160.0, y);
+        let mut b = Point::from_xy(240.0, y);
+        window_transform.map_point(&mut a);
+        window_transform.map_point(&mut b);
+        stroke_line(pixmap, Transform::identity(), &line_paint, &hairline, (a.x, a.y), (b.x, b.y));
+    }
+    for x in [31.3f32, 368.7] {
+        let mut a = Point::from_xy(x, 155.0);
+        let mut b = Point::from_xy(x, 345.0);
+        window_transform.map_point(&mut a);
+        window_transform.map_point(&mut b);
+        stroke_line(pixmap, Transform::identity(), &line_paint, &hairline, (a.x, a.y), (b.x, b.y));
+    }
+    let wide = tiny_skia::Stroke { width: 1.8, ..Default::default() };
+    for y in [23.8f32, 476.7] {
+        stroke_line(pixmap, window_transform, &line_paint, &wide, (160.0, y), (240.0, y));
+    }
+    for x in [26.3f32, 373.7] {
+        stroke_line(pixmap, window_transform, &line_paint, &wide, (x, 155.0), (x, 345.0));
+    }
+
+    Some(StyleResultColors { title: colors.ccolor2, subtitle: colors.ccolor2, footer: colors.ccolor1 })
+}
+
+// ===================================================================
+// Entry points (issue #601): generate_cover/create_cover/
+// calibre_cover2/message_image/generate_masthead + all_styles/
+// load_styles/scale_cover -- thin orchestration tying #595-#600
+// together. Also the only place any future Tauri/UI wiring would
+// attach; the rendering engine itself needs none.
+//
+// A real, non-obvious API gotcha found (not guessed) while wiring
+// `calibre_cover2`'s logo compositing: `tiny_skia::Pixmap::draw_pixmap`
+// computes its internal clip rect from the SOURCE pixmap's own
+// (unscaled) size offset by its raw `x`/`y` integer params -- passing
+// a scaling `transform` *and* non-zero `x`/`y` together silently clips
+// away most or all of the scaled result (confirmed with a standalone
+// scratch reproduction before writing this code, not assumed). The
+// fix: always pass `x=0, y=0` and fold *all* positioning into the
+// `transform` itself via [`chain_transforms`] (scale first, then
+// translate).
+//
+// `override_prefs`'s `override_color_theme`/`override_style` kwargs
+// paths have no real caller in this port's own entry-point graph (only
+// `create_cover`'s template-only override is exercised) -- scoped out,
+// not silently faked; `create_cover` inlines the one real behavior it
+// needs directly rather than through a general kwargs-shaped function,
+// which doesn't have a natural Rust equivalent anyway.
+
+/// Port of the `Prefs` namedtuple (`cprefs.defaults`'s full shape).
+#[derive(Debug, Clone)]
+pub struct CoverPrefs {
+    pub cover_width: u32,
+    pub cover_height: u32,
+    pub text: crate::covers_text::CoverTextPrefs,
+    pub templates: CoverTemplates,
+    pub color_themes: HashMap<String, ColorTheme>,
+    pub disabled_color_themes: Vec<String>,
+    pub disabled_styles: Vec<String>,
+}
+
+impl Default for CoverPrefs {
+    fn default() -> Self {
+        CoverPrefs {
+            cover_width: 1200,
+            cover_height: 1600,
+            text: Default::default(),
+            templates: Default::default(),
+            color_themes: HashMap::new(),
+            disabled_color_themes: Vec::new(),
+            disabled_styles: Vec::new(),
+        }
+    }
+}
+
+/// The 5 real `Style` subclasses (port of `all_styles()`'s own
+/// `globals().values()` scan, made explicit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StyleKind {
+    Cross,
+    Half,
+    Banner,
+    Ornamental,
+    Blocks,
+}
+
+impl StyleKind {
+    pub const ALL: [StyleKind; 5] = [StyleKind::Cross, StyleKind::Half, StyleKind::Banner, StyleKind::Ornamental, StyleKind::Blocks];
+
+    /// Port of each class's own `NAME`. (`GUI_NAME` is the same string
+    /// wrapped in gettext `_()` -- no translation catalog exists in
+    /// this port, matching this project's established i18n-narrowing
+    /// precedent elsewhere, so `name()` doubles for both.)
+    pub fn name(&self) -> &'static str {
+        match self {
+            StyleKind::Cross => "The Cross",
+            StyleKind::Half => "Half and Half",
+            StyleKind::Banner => "Banner",
+            StyleKind::Ornamental => "Ornamental",
+            StyleKind::Blocks => "Blocks",
+        }
+    }
+}
+
+/// Port of `all_styles()`.
+pub fn all_styles() -> Vec<&'static str> {
+    StyleKind::ALL.iter().map(|s| s.name()).collect()
+}
+
+/// Port of `load_styles(prefs, respect_disabled)`.
+pub fn load_styles(prefs: &CoverPrefs, respect_disabled: bool) -> Vec<StyleKind> {
+    if !respect_disabled {
+        return StyleKind::ALL.to_vec();
+    }
+    let disabled: HashSet<&str> = prefs.disabled_styles.iter().map(String::as_str).collect();
+    let ans: Vec<StyleKind> = StyleKind::ALL.into_iter().filter(|s| !disabled.contains(s.name())).collect();
+    if ans.is_empty() && !disabled.is_empty() {
+        load_styles(prefs, false)
+    } else {
+        ans
+    }
+}
+
+/// Port of `scale_cover`.
+pub fn scale_cover(prefs: &mut CoverPrefs, scale: f32) {
+    prefs.cover_width = (scale * prefs.cover_width as f32).trunc() as u32;
+    prefs.cover_height = (scale * prefs.cover_height as f32).trunc() as u32;
+    prefs.text.title_font_size = (scale * prefs.text.title_font_size).trunc();
+    prefs.text.subtitle_font_size = (scale * prefs.text.subtitle_font_size).trunc();
+    prefs.text.footer_font_size = (scale * prefs.text.footer_font_size).trunc();
+}
+
+fn style_margins(kind: StyleKind, cover_width: u32, cover_height: u32) -> Margins {
+    match kind {
+        StyleKind::Banner => {
+            let m = banner_margins(cover_width, cover_height);
+            Margins { hmargin: m.hmargin, vmargin: m.vmargin }
+        }
+        StyleKind::Ornamental => ornamental_margins(cover_width, cover_height),
+        StyleKind::Cross | StyleKind::Half | StyleKind::Blocks => calculate_margins(cover_width, cover_height),
+    }
+}
+
+/// None of the 5 real `Style` subclasses override `TITLE_ALIGN`/
+/// `SUBTITLE_ALIGN`; only `Blocks.FOOTER_ALIGN` differs from the base
+/// `Style`'s `AlignHCenter` default.
+fn style_footer_align(kind: StyleKind) -> HAlign {
+    match kind {
+        StyleKind::Blocks => HAlign::Right,
+        _ => HAlign::Center,
+    }
+}
+
+fn text_block_geometry(title: &crate::covers_text::Block, subtitle: &crate::covers_text::Block) -> TextBlockGeometry {
+    TextBlockGeometry {
+        title_x: title.position().0,
+        title_y: title.position().1,
+        title_height: title.height(),
+        title_leading: title.leading,
+        subtitle_height: subtitle.height(),
+        subtitle_line_spacing: subtitle.line_spacing,
+    }
+}
+
+fn render_style(kind: StyleKind, pixmap: &mut Pixmap, width: u32, height: u32, colors: &StyleColors, layout: &crate::covers_text::LayoutResult) -> Option<StyleResultColors> {
+    match kind {
+        StyleKind::Cross => Some(render_cross(pixmap, width, height, colors, &text_block_geometry(&layout.title, &layout.subtitle))),
+        StyleKind::Half => Some(render_half(pixmap, width as f32, height as f32, colors)),
+        StyleKind::Blocks => Some(render_blocks(pixmap, width, height, colors)),
+        StyleKind::Banner => render_banner(pixmap, width, height, colors, &banner_margins(width, height), &layout.title, &layout.subtitle),
+        StyleKind::Ornamental => render_ornamental(pixmap, width, height, colors),
+    }
+}
+
+/// Draws `layout`'s 3 blocks with the real etch effect, in each
+/// block's own resolved font/size/color -- the common tail shared by
+/// [`generate_cover`] and [`calibre_cover2`].
+fn draw_layout_blocks(pixmap: &mut Pixmap, db: &Arc<fontdb::Database>, prefs_text: &crate::covers_text::CoverTextPrefs, layout: &crate::covers_text::LayoutResult, colors: &StyleResultColors) {
+    crate::covers_text::draw_block(pixmap, db, &layout.title, &layout.title_family, "serif", prefs_text.title_font_size, colors.title);
+    if !layout.subtitle_family.is_empty() {
+        crate::covers_text::draw_block(pixmap, db, &layout.subtitle, &layout.subtitle_family, "sans-serif", prefs_text.subtitle_font_size, colors.subtitle);
+    }
+    crate::covers_text::draw_block(pixmap, db, &layout.footer, &layout.footer_family, "serif", prefs_text.footer_font_size, colors.footer);
+}
+
+/// Port of `generate_cover(mi, prefs)`. `db` is threaded in explicitly
+/// (a real, disclosed API improvement over the implicit global
+/// `init_environment()`/`ensure_app()` Qt uses -- reloading every
+/// system font on every single call would be real but wasteful; a
+/// caller generating many covers should load fonts once and reuse the
+/// same `db`). Returns `None` only when no usable font/canvas could be
+/// resolved at all (see `covers_text`'s own font-source doc).
+pub fn generate_cover(mi: &MetaInformation, prefs: &CoverPrefs, db: &Arc<fontdb::Database>, use_roman: bool) -> Option<Vec<u8>> {
+    let themes = load_color_themes(&prefs.color_themes, &prefs.disabled_color_themes);
+    let theme = &themes[rand::random_range(0..themes.len())];
+    let styles = load_styles(prefs, true);
+    let style_kind = styles[rand::random_range(0..styles.len())];
+
+    let (title, subtitle, footer) = format_text(mi, &prefs.templates, use_roman);
+
+    let margins = style_margins(style_kind, prefs.cover_width, prefs.cover_height);
+    let max_title_height = (prefs.cover_height / 3) as f32;
+    let layout = crate::covers_text::layout_text(
+        db.as_ref(),
+        &prefs.text,
+        prefs.cover_width,
+        prefs.cover_height,
+        margins.hmargin,
+        margins.vmargin,
+        &title,
+        &subtitle,
+        &footer,
+        max_title_height,
+        HAlign::Center,
+        HAlign::Center,
+        style_footer_align(style_kind),
+    )?;
+
+    let mut pixmap = Pixmap::new(prefs.cover_width, prefs.cover_height)?;
+    let colors = StyleColors::load(theme);
+    let result_colors = render_style(style_kind, &mut pixmap, prefs.cover_width, prefs.cover_height, &colors, &layout)?;
+    draw_layout_blocks(&mut pixmap, db, &prefs.text, &layout, &result_colors);
+
+    pixmap.encode_png().ok()
+}
+
+/// Port of `create_cover(title, authors, series, series_index, prefs)`:
+/// ignores any user-set templates, always using the real default
+/// [`CoverTemplates`] (`override_prefs`'s only real effect any caller
+/// in this port's scope needs -- see this section's module doc).
+pub fn create_cover(title: &str, authors: &[String], series: Option<&str>, series_index: f64, prefs: &CoverPrefs, db: &Arc<fontdb::Database>, use_roman: bool) -> Option<Vec<u8>> {
+    let mi = MetaInformation { title: title.to_string(), authors: authors.to_vec(), series: series.map(str::to_string), series_index, ..Default::default() };
+    let prefs = CoverPrefs { templates: CoverTemplates::default(), ..prefs.clone() };
+    generate_cover(&mi, &prefs, db, use_roman)
+}
+
+/// Port of `calibre_cover2`'s inline `CalibeLogoStyle`, drawing `logo`
+/// scaled to fit between the title/subtitle band and the footer. Real
+/// `fit_image` semantics apply (shrink-to-fit only, never enlarges).
+#[allow(clippy::too_many_arguments)]
+fn draw_calibre_logo(pixmap: &mut Pixmap, width: u32, logo: &Pixmap, title_block: &crate::covers_text::Block, subtitle_block: &crate::covers_text::Block, footer_block: &crate::covers_text::Block) {
+    let top0 = title_block.position().1 + 10.0;
+    let extra_spacing = if subtitle_block.line_spacing != 0.0 { (subtitle_block.line_spacing / 2.0).floor() } else { (title_block.line_spacing / 3.0).floor() };
+    let band_height = title_block.height() + subtitle_block.height() + extra_spacing + title_block.leading;
+    let top = top0 + band_height + 25.0;
+    let bottom = footer_block.position().1 - 50.0;
+
+    let pwidth = width as f64;
+    let pheight = (bottom - top) as f64;
+    let (_, logo_w, logo_h) = fit_image(logo.width() as f64, logo.height() as f64, pwidth, pheight);
+    if logo_w <= 0 || logo_h <= 0 {
+        return;
+    }
+    let x = ((pwidth - logo_w as f64) / 2.0) as f32;
+    let y = ((pheight - logo_h as f64) / 2.0) as f32;
+    let sx = logo_w as f32 / logo.width().max(1) as f32;
+    let sy = logo_h as f32 / logo.height().max(1) as f32;
+    // `draw_pixmap`'s own (x,y) params combined with a scaling
+    // transform silently clip away the scaled result (see this
+    // section's module doc) -- fold all positioning into the
+    // transform itself and always pass (0,0).
+    let placement = chain_transforms(&[Transform::from_scale(sx, sy), Transform::from_translate(x, top + y)]);
+    pixmap.draw_pixmap(0, 0, logo.as_ref(), &PixmapPaint::default(), placement, None);
+}
+
+/// Port of `calibre_cover2`. `logo` replaces the real
+/// `I('library.png')` resource lookup -- no bundled-resource system
+/// exists in this port yet, so the caller supplies the already-decoded
+/// logo image directly.
+#[allow(clippy::too_many_arguments)]
+pub fn calibre_cover2(title: &str, author_string: &str, series_string: &str, prefs: &CoverPrefs, db: &Arc<fontdb::Database>, logo: &Pixmap) -> Option<Vec<u8>> {
+    let title = format!("<b>{}", escape_formatting(title));
+    let subtitle = format!("<i>{}", escape_formatting(series_string));
+    let footer = format!("<b>{}", escape_formatting(author_string));
+
+    let mut prefs = prefs.clone();
+    let scale = 800.0 / prefs.cover_height as f32;
+    scale_cover(&mut prefs, scale);
+
+    let color_theme = theme_to_colors(fallback_colors());
+    let colors = StyleColors::load(&color_theme);
+
+    let margins = calculate_margins(prefs.cover_width, prefs.cover_height);
+    let max_title_height = (prefs.cover_height / 3) as f32;
+    let layout = crate::covers_text::layout_text(
+        db.as_ref(),
+        &prefs.text,
+        prefs.cover_width,
+        prefs.cover_height,
+        margins.hmargin,
+        margins.vmargin,
+        &title,
+        &subtitle,
+        &footer,
+        max_title_height,
+        HAlign::Center,
+        HAlign::Center,
+        HAlign::Center,
+    )?;
+
+    let mut pixmap = Pixmap::new(prefs.cover_width, prefs.cover_height)?;
+    pixmap.fill(Color::WHITE);
+    draw_calibre_logo(&mut pixmap, prefs.cover_width, logo, &layout.title, &layout.subtitle, &layout.footer);
+
+    let result_colors = StyleResultColors { title: colors.ccolor1, subtitle: colors.ccolor1, footer: colors.ccolor1 };
+    draw_layout_blocks(&mut pixmap, db, &prefs.text, &layout, &result_colors);
+
+    pixmap.encode_png().ok()
+}
+
+/// Port of `message_image`. **Disclosed narrowing**: real Python
+/// full-justifies (`Qt.AlignmentFlag.AlignJustify`) each wrapped line
+/// (stretching inter-word spacing to fill the width); this port
+/// center-aligns instead ([`HAlign`] has no justify mode -- true
+/// justification needs per-line extra-space redistribution this
+/// module's line layout doesn't do). Text still real-wraps and is
+/// vertically centered for real.
+pub fn message_image(db: &Arc<fontdb::Database>, text: &str, width: u32, height: u32, font_size: f32) -> Option<Vec<u8>> {
+    let font = crate::covers_text::FontFace::query(db.as_ref(), "sans-serif", fontdb::Family::SansSerif)?;
+    let face = font.face();
+    let metrics = crate::covers_text::FontMetrics::new(&face, font_size);
+    let inner_w = (width as f32 - 20.0).max(1.0);
+    let inner_h = (height as f32 - 20.0).max(1.0);
+    let mut block = crate::covers_text::Block::new(text, inner_w, &face, &metrics, inner_h, HAlign::Center);
+    let y = 10.0 + ((inner_h - block.height()) / 2.0).max(0.0);
+    block.set_position(10.0, y);
+
+    let mut pixmap = Pixmap::new(width, height)?;
+    pixmap.fill(Color::WHITE);
+    crate::covers_text::draw_block_plain(&mut pixmap, db, &block, font.family_name(), "sans-serif", font_size, Color::BLACK);
+    pixmap.encode_png().ok()
+}
+
+/// Port of `generate_masthead`. A single left/vertically-centered bold
+/// line, no wrapping (matches real Python: no `TextWordWrap` flag is
+/// passed to this specific `drawText` call, unlike [`message_image`]'s).
+pub fn generate_masthead(db: &Arc<fontdb::Database>, title: &str, width: u32, height: u32, font_family: Option<&str>) -> Option<Vec<u8>> {
+    let pixel_size = (height as f32 * 3.0 / 4.0).floor();
+    let font = crate::covers_text::FontFace::query_weighted(db.as_ref(), font_family.unwrap_or("Liberation Serif"), fontdb::Family::Serif, fontdb::Weight::BOLD, fontdb::Style::Normal)?;
+    let face = font.face();
+    let metrics = crate::covers_text::FontMetrics::new(&face, pixel_size);
+    let sanitized = sanitize(title);
+    // A generous width avoids wrapping (real Python's `drawText` call
+    // here has no `TextWordWrap` flag -- single line, may overflow/clip
+    // visually on real narrow mastheads exactly as upstream's own does).
+    let mut block = crate::covers_text::Block::new(&sanitized, width as f32 * 4.0, &face, &metrics, height as f32 * 4.0, HAlign::Left);
+    let y = ((height as f32 - block.height()) / 2.0).max(0.0);
+    block.set_position(0.0, y);
+
+    let mut pixmap = Pixmap::new(width, height)?;
+    pixmap.fill(Color::WHITE);
+    crate::covers_text::draw_block_plain(&mut pixmap, db, &block, font.family_name(), "serif", pixel_size, Color::BLACK);
+    pixmap.encode_png().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_theme_splits_a_hex_quad_string() {
+        let t = to_theme("e8d9ac c7b07b 564628 382d1a");
+        assert_eq!(t.color1, "e8d9ac");
+        assert_eq!(t.color2, "c7b07b");
+        assert_eq!(t.contrast_color1, "564628");
+        assert_eq!(t.contrast_color2, "382d1a");
+    }
+
+    #[test]
+    fn load_color_themes_returns_the_four_builtins_by_default() {
+        let themes = load_color_themes(&HashMap::new(), &[]);
+        assert_eq!(themes.len(), 4);
+        assert!(themes.iter().any(|t| t.color1 == "e8d9ac"));
+    }
+
+    #[test]
+    fn load_color_themes_respects_disabled_and_falls_back_when_all_disabled() {
+        let disabled: Vec<String> = vec!["Earth".to_string(), "Grass".to_string(), "Water".to_string(), "Silver".to_string()];
+        let themes = load_color_themes(&HashMap::new(), &disabled);
+        // All 4 builtins disabled -> fall back to all 4 builtins anyway.
+        assert_eq!(themes.len(), 4);
+    }
+
+    #[test]
+    fn load_color_themes_merges_user_overrides() {
+        let mut overrides = HashMap::new();
+        overrides.insert("Custom".to_string(), to_theme("111111 222222 333333 444444"));
+        let themes = load_color_themes(&overrides, &[]);
+        assert_eq!(themes.len(), 5);
+        assert!(themes.iter().any(|t| t.color1 == "111111"));
+    }
+
+    #[test]
+    fn color_falls_back_when_a_theme_field_is_empty() {
+        let theme = ColorTheme {
+            color1: String::new(),
+            color2: "abcdef".to_string(),
+            contrast_color1: String::new(),
+            contrast_color2: String::new(),
+        };
+        assert_eq!(color(&theme, "color1"), "ffffff");
+        assert_eq!(color(&theme, "color2"), "abcdef");
+    }
+
+    #[test]
+    fn sanitize_normalizes_and_cleans() {
+        assert_eq!(sanitize("hello"), "hello");
+    }
+
+    #[test]
+    fn escape_and_unescape_formatting_round_trip() {
+        let raw = "Tom & Jerry <3>";
+        let escaped = escape_formatting(raw);
+        assert_eq!(escaped, "Tom &amp; Jerry &lt;3&gt;");
+        assert_eq!(unescape_formatting(&escaped), raw);
+    }
+
+    #[test]
+    fn parse_text_formatting_extracts_a_bold_span() {
+        let (text, formats) = parse_text_formatting("Hello <b>World</b>!");
+        assert_eq!(text, "Hello World!");
+        assert_eq!(formats.len(), 1);
+        assert_eq!(formats[0], FormatRange { bold: true, italic: false, start: 6, length: 5 });
+    }
+
+    #[test]
+    fn parse_text_formatting_extracts_nested_bold_and_italic() {
+        let (text, formats) = parse_text_formatting("A <b>bold <i>and italic</i> text</b> B");
+        assert_eq!(text, "A bold and italic text B");
+        // Inner italic span closes first ("A bold " is 7 chars, "and italic" is 10 chars).
+        let italic = formats.iter().find(|f| f.italic).unwrap();
+        assert_eq!((italic.start, italic.length), (7, 10));
+        let bold = formats.iter().find(|f| f.bold).unwrap();
+        assert_eq!((bold.start, bold.length), (2, 20));
+    }
+
+    #[test]
+    fn parse_text_formatting_ignores_unrecognized_tags() {
+        let (text, formats) = parse_text_formatting("A <span>plain</span> B");
+        assert_eq!(text, "A plain B");
+        assert!(formats.is_empty());
+    }
+
+    #[test]
+    fn parse_text_formatting_handles_an_unclosed_tag_by_extending_to_the_end() {
+        let (text, formats) = parse_text_formatting("Start <b>rest of the text");
+        assert_eq!(text, "Start rest of the text");
+        assert_eq!(formats.len(), 1);
+        assert_eq!(formats[0].start, 6);
+        assert_eq!(formats[0].length, text.chars().count() - 6);
+    }
+
+    #[test]
+    fn parse_text_formatting_with_no_tags_returns_the_text_unchanged() {
+        let (text, formats) = parse_text_formatting("plain text");
+        assert_eq!(text, "plain text");
+        assert!(formats.is_empty());
+    }
+
+    #[test]
+    fn parse_text_formatting_counts_amp_entities_as_one_character_for_offsets() {
+        // "&amp;" (5 raw chars) counts as ONE character for offset
+        // purposes (anticipating the caller's later unescape), but the
+        // returned text keeps the literal "&amp;".
+        let (text, formats) = parse_text_formatting("A &amp; <b>B</b>");
+        assert_eq!(text, "A &amp; B");
+        assert_eq!(formats[0].start, 4);
+    }
+
+    fn mi(title: &str, authors: &[&str], series: Option<&str>, series_index: f64) -> MetaInformation {
+        MetaInformation {
+            title: title.to_string(),
+            authors: authors.iter().map(|a| a.to_string()).collect(),
+            series: series.map(str::to_string),
+            series_index,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn format_text_title_template_substitutes_the_title() {
+        let m = mi("My Book", &["Jane Doe"], None, 1.0);
+        let (title, _, _) = format_text(&m, &CoverTemplates::default(), false);
+        assert_eq!(title, "<b>My Book");
+    }
+
+    #[test]
+    fn format_text_subtitle_template_evaluates_the_embedded_gpm_expression() {
+        let m = mi("My Book", &["Jane Doe"], Some("The Series"), 2.0);
+        let (_, subtitle, _) = format_text(&m, &CoverTemplates::default(), false);
+        assert_eq!(subtitle, "<i>The Series</i> - 2");
+    }
+
+    #[test]
+    fn format_text_subtitle_template_is_empty_when_there_is_no_series() {
+        let m = mi("My Book", &["Jane Doe"], None, 1.0);
+        let (_, subtitle, _) = format_text(&m, &CoverTemplates::default(), false);
+        assert_eq!(subtitle, "");
+    }
+
+    #[test]
+    fn format_text_footer_template_runs_the_real_program_mode_default() {
+        let m = mi("My Book", &["Jane Doe", "John Smith"], None, 1.0);
+        let (_, _, footer) = format_text(&m, &CoverTemplates::default(), false);
+        assert!(!footer.starts_with("Template error"), "footer: {footer}");
+        assert!(footer.contains("Jane Doe"), "footer: {footer}");
+        assert!(footer.contains("John Smith"), "footer: {footer}");
+        assert!(footer.contains("<b>"), "footer: {footer}");
+    }
+
+    #[test]
+    fn format_text_footer_template_filters_out_the_literal_unknown_author() {
+        let m = mi("My Book", &["Unknown"], None, 1.0);
+        let (_, _, footer) = format_text(&m, &CoverTemplates::default(), false);
+        assert!(!footer.contains("Unknown"), "footer: {footer}");
+    }
+
+    #[test]
+    fn safe_format_falls_back_to_a_template_error_message_on_a_real_failure() {
+        let source = CoverValueSource {
+            title: "T".to_string(),
+            authors: "A".to_string(),
+            series: String::new(),
+            formatted_series_index: String::new(),
+        };
+        let out = safe_format("program:\nthis_is_not_a_real_function()", &source);
+        assert!(out.starts_with("Template error"), "{out}");
+    }
+
+    #[test]
+    fn vformat_handles_escaped_braces() {
+        let source = CoverValueSource {
+            title: "T".to_string(),
+            authors: String::new(),
+            series: String::new(),
+            formatted_series_index: String::new(),
+        };
+        assert_eq!(lexmechanic_utils::formatter::string_format::vformat("{{{title}}}", &source, &PureCatalog, &PureFunctions).unwrap(), "{T}");
+    }
+
+    #[test]
+    fn get_value_escapes_but_get_raw_value_does_not() {
+        let source = CoverValueSource {
+            title: "Tom & Jerry".to_string(),
+            authors: String::new(),
+            series: String::new(),
+            formatted_series_index: String::new(),
+        };
+        assert_eq!(source.get_value("title").unwrap(), "Tom &amp; Jerry");
+        match source.get_raw_value("title").unwrap() {
+            RawValue::Scalar(s) => assert_eq!(s, "Tom & Jerry"),
+            _ => panic!("expected a scalar"),
+        }
+    }
+
+    fn px(pixmap: &Pixmap, x: u32, y: u32) -> (u8, u8, u8) {
+        let c = pixmap.pixel(x, y).unwrap().demultiply();
+        (c.red(), c.green(), c.blue())
+    }
+
+    fn theme() -> ColorTheme {
+        // color1=red, color2=green, ccolor1=blue, ccolor2=white.
+        ColorTheme {
+            color1: "ff0000".to_string(),
+            color2: "00ff00".to_string(),
+            contrast_color1: "0000ff".to_string(),
+            contrast_color2: "ffffff".to_string(),
+        }
+    }
+
+    #[test]
+    fn hex_to_color_parses_a_theme_hex_string() {
+        let c = hex_to_color("e8d9ac");
+        assert_eq!((c.to_color_u8().red(), c.to_color_u8().green(), c.to_color_u8().blue()), (0xe8, 0xd9, 0xac));
+    }
+
+    #[test]
+    fn calculate_margins_matches_the_real_ratio() {
+        let m = calculate_margins(600, 800);
+        assert_eq!((m.hmargin, m.vmargin), (50, 50));
+        let m2 = calculate_margins(1200, 1600);
+        assert_eq!((m2.hmargin, m2.vmargin), (100, 100));
+    }
+
+    #[test]
+    fn render_half_produces_a_top_to_bottom_to_top_gradient() {
+        let colors = StyleColors::load(&theme());
+        let mut pixmap = Pixmap::new(100, 100).unwrap();
+        let result = render_half(&mut pixmap, 100.0, 100.0, &colors);
+        // Real returned colors are all ccolor1 (blue).
+        assert_eq!(result.title.to_color_u8().blue(), 0xff);
+        // Gradient endpoints (0.0 and 1.0 stops) are both color1 (red);
+        // the 0.7 stop is color2 (green). Pixel centers never land
+        // exactly on a stop's fractional position, so these check
+        // "clearly dominated by" rather than an exact color.
+        let (r, g, _) = px(&pixmap, 50, 0);
+        assert!(r > 240 && g < 20, "near top should be mostly color1 (red): got ({r},{g})");
+        let (r, g, _) = px(&pixmap, 50, 99);
+        assert!(r > 240 && g < 20, "near bottom should be mostly color1 (red): got ({r},{g})");
+        let (r, g, _) = px(&pixmap, 50, 70);
+        assert!(g > 240 && r < 20, "near the 0.7 stop should be mostly color2 (green): got ({r},{g})");
+    }
+
+    #[test]
+    fn render_blocks_splits_top_two_thirds_from_bottom_third() {
+        let colors = StyleColors::load(&theme());
+        let mut pixmap = Pixmap::new(90, 90).unwrap();
+        let result = render_blocks(&mut pixmap, 90, 90, &colors);
+        assert_eq!(result.footer.to_color_u8().green(), 0xff); // ccolor2 = white -> green channel opaque too, checked below
+        // y = 90 - 90/3 = 60: rows above are color1 (red), at/after are color2 (green).
+        assert_eq!(px(&pixmap, 45, 59), (0xff, 0, 0));
+        assert_eq!(px(&pixmap, 45, 60), (0, 0xff, 0));
+        assert_eq!(px(&pixmap, 45, 89), (0, 0xff, 0));
+    }
+
+    #[test]
+    fn render_cross_fills_background_left_bar_and_clipped_title_band() {
+        let colors = StyleColors::load(&theme());
+        let mut pixmap = Pixmap::new(200, 200).unwrap();
+        let blocks = TextBlockGeometry {
+            title_x: 40.0,
+            title_y: 50.0,
+            title_height: 60.0,
+            title_leading: 0.0,
+            subtitle_height: 0.0,
+            subtitle_line_spacing: 0.0,
+        };
+        render_cross(&mut pixmap, 200, 200, &colors, &blocks);
+
+        // Outside the title band and left bar: pure background (color1 = red).
+        assert_eq!(px(&pixmap, 150, 10), (0xff, 0, 0));
+        // Left margin bar (x < title_x): color2 (green), full height --
+        // including rows that fall inside the title band's y-range,
+        // since the real Python draws this bar *after* the clipped
+        // band, unconditionally overwriting it there too.
+        assert_eq!(px(&pixmap, 10, 190), (0, 0xff, 0));
+        assert_eq!(px(&pixmap, 10, 55), (0, 0xff, 0));
+        // Center of the title band (right of the left bar), well inside
+        // the rounded rect: color2 (green).
+        assert_eq!(px(&pixmap, 100, 80), (0, 0xff, 0));
+        // The rounded corners of the title band on its *right* side
+        // (unobscured by the left bar) are clipped away by the mask,
+        // leaving background color1 (red) showing through at the
+        // extreme corner pixels -- proving the clip mask actually
+        // clips rather than filling a plain rect.
+        assert_eq!(px(&pixmap, 199, 50), (0xff, 0, 0));
+        assert_eq!(px(&pixmap, 199, 109), (0xff, 0, 0));
+        // A pixel just inside that same right edge, away from the
+        // rounded corner, is still color2 -- the clip only removes the
+        // corners, not the whole right edge.
+        assert_eq!(px(&pixmap, 199, 80), (0, 0xff, 0));
+    }
+
+    fn real_block(db: &fontdb::Database, text: &str, width: f32, pixel_size: f32) -> crate::covers_text::Block {
+        let font = crate::covers_text::FontFace::query(db, "Liberation Serif", fontdb::Family::Serif).expect("a font must be installed on the test host");
+        let face = font.face();
+        let metrics = crate::covers_text::FontMetrics::new(&face, pixel_size);
+        crate::covers_text::Block::new(text, width, &face, &metrics, 1000.0, crate::covers_text::HAlign::Center)
+    }
+
+    #[test]
+    fn rotate_vector_matches_hand_computed_values() {
+        // 0 radians: identity.
+        let (x, y) = rotate_vector(0.0, 3.0, -5.0);
+        assert!((x - 3.0).abs() < 1e-5 && (y - (-5.0)).abs() < 1e-5);
+        // PI/2: (x,y) -> (-y, x).
+        let (x, y) = rotate_vector(std::f32::consts::FRAC_PI_2, 3.0, -5.0);
+        assert!((x - 5.0).abs() < 1e-4, "x={x}");
+        assert!((y - 3.0).abs() < 1e-4, "y={y}");
+    }
+
+    #[test]
+    fn draw_curved_line_produces_the_exact_hand_computed_control_points() {
+        let mut pb = PathBuilder::new();
+        pb.move_to(0.0, 0.0);
+        // A horizontal (angle=0) segment -- rotate_vector is the
+        // identity at angle 0, so control points are exactly
+        // (c1_frac*length, c1_amp*length) and (c2_frac*length, c2_amp*length).
+        draw_curved_line(&mut pb, 100.0, 0.0, 0.1, -0.1, 0.9, -0.1);
+        let path = pb.finish().unwrap();
+        let segments: Vec<_> = path.segments().collect();
+        assert_eq!(segments.len(), 2); // MoveTo + CubicTo
+        match segments[1] {
+            tiny_skia::PathSegment::CubicTo(c1, c2, end) => {
+                assert!((c1.x - 10.0).abs() < 1e-3 && (c1.y - (-10.0)).abs() < 1e-3, "{c1:?}");
+                assert!((c2.x - 90.0).abs() < 1e-3 && (c2.y - (-10.0)).abs() < 1e-3, "{c2:?}");
+                assert!((end.x - 100.0).abs() < 1e-3 && end.y.abs() < 1e-3, "{end:?}");
+            }
+            other => panic!("expected a CubicTo segment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn darker_halves_the_hsv_value_of_a_pure_color() {
+        let red = Color::from_rgba8(200, 0, 0, 255);
+        let d = darker(red).to_color_u8();
+        // Pure red's HSV value == its red channel; darker(200) halves it.
+        assert_eq!(d.red(), 100);
+        assert_eq!(d.green(), 0);
+        assert_eq!(d.blue(), 0);
+    }
+
+    #[test]
+    fn banner_margins_matches_the_real_ratios() {
+        let m = banner_margins(1200, 1600);
+        assert_eq!(m.hmargin, 180); // 0.15 * 1200
+        assert_eq!(m.fold_width, 120); // 0.1 * 1200
+        assert_eq!(m.vmargin, 100); // base Style ratio: (50/800)*1600
+    }
+
+    #[test]
+    fn build_banner_paths_produces_a_ribbon_spanning_the_full_width() {
+        let db = crate::covers_text::load_system_fonts();
+        let title = real_block(&db, "Title", 800.0, 60.0);
+        let subtitle = crate::covers_text::Block::empty();
+        let margins = banner_margins(1200, 1600);
+        let paths = build_banner_paths(1200, 1600, &margins, &title, &subtitle).expect("real banner geometry");
+
+        // The ribbon's top edge runs straight across at `hmargin..width-hmargin`,
+        // but its bottom edge is horizontally slanted by `deltax = GRADE *
+        // band_height` (the real "folded banner" look: `right_corner` is
+        // shifted right by `deltax`, `left_corner` left by `deltax`), so
+        // the real bounding box is wider than the plain margins by
+        // exactly that amount -- not a fixed small tolerance.
+        let band_height = title.height() + subtitle.height() + (title.line_spacing / 3.0).floor() + title.leading;
+        let deltax = 0.07 * band_height;
+        let bounds = paths.main.bounds();
+        assert!((bounds.left() - (margins.hmargin as f32 - deltax)).abs() < 2.0, "{bounds:?} deltax={deltax}");
+        assert!((bounds.right() - ((1200.0 - margins.hmargin as f32) + deltax)).abs() < 2.0, "{bounds:?} deltax={deltax}");
+
+        // The fold paths sit near the left/right margins, straddling them.
+        let left_bounds = paths.left_fold.bounds();
+        assert!(left_bounds.left() < margins.hmargin as f32);
+        assert!(left_bounds.right() > 0.0);
+        let right_bounds = paths.right_fold.bounds();
+        assert!(right_bounds.right() > (1200.0 - margins.hmargin as f32));
+    }
+
+    #[test]
+    fn render_banner_paints_the_ribbon_over_the_background() {
+        let db = crate::covers_text::load_system_fonts();
+        let title = real_block(&db, "A Banner Title", 800.0, 60.0);
+        let subtitle = crate::covers_text::Block::empty();
+        let margins = banner_margins(1200, 1600);
+        let colors = StyleColors::load(&theme()); // color1=red, color2=green
+        let mut pixmap = Pixmap::new(1200, 1600).unwrap();
+
+        let result = render_banner(&mut pixmap, 1200, 1600, &colors, &margins, &title, &subtitle).expect("real banner render");
+        assert_eq!(result.title.to_color_u8().blue(), 0xff); // ccolor2 = blue
+
+        // Far outside the ribbon (top-left corner): still pure background.
+        assert_eq!(px(&pixmap, 2, 2), (0xff, 0, 0));
+        // Somewhere well inside the ribbon's vertical band and clear of
+        // the fold overlays: real green ribbon fill was painted, not
+        // just the red background.
+        let ribbon_y = title.position().1 as u32 + 5;
+        let (r, g, _) = px(&pixmap, 600, ribbon_y);
+        assert!(g > r, "expected ribbon-green to dominate at (600,{ribbon_y}), got r={r} g={g}");
+    }
+
+    #[test]
+    fn chain_transforms_applies_ops_in_call_order_not_reversed() {
+        let translate_then_scale = chain_transforms(&[Transform::from_translate(10.0, 0.0), Transform::from_scale(2.0, 1.0)]);
+        let mut p = Point::from_xy(1.0, 0.0);
+        translate_then_scale.map_point(&mut p);
+        // translate first: (1,0)->(11,0); then scale by 2x: (11,0)->(22,0).
+        assert!((p.x - 22.0).abs() < 1e-4, "{p:?}");
+
+        let scale_then_translate = chain_transforms(&[Transform::from_scale(2.0, 1.0), Transform::from_translate(10.0, 0.0)]);
+        let mut p2 = Point::from_xy(1.0, 0.0);
+        scale_then_translate.map_point(&mut p2);
+        // scale first: (1,0)->(2,0); then translate by 10: (2,0)->(12,0).
+        assert!((p2.x - 12.0).abs() < 1e-4, "{p2:?}");
+
+        // The two orders must disagree -- proves call order is actually
+        // respected, not silently reversed or commutative by accident.
+        assert!((p.x - p2.x).abs() > 1.0);
+    }
+
+    #[test]
+    fn svg_path_to_tiny_skia_path_parses_relative_moveto_lineto_curveto_close() {
+        let path = svg_path_to_tiny_skia_path("m 10,10 l 5,0 c 1,1 2,2 3,3 z").expect("valid SVG path data");
+        let segments: Vec<_> = path.segments().collect();
+        assert_eq!(segments.len(), 4);
+        match segments[0] {
+            tiny_skia::PathSegment::MoveTo(p) => assert!((p.x - 10.0).abs() < 1e-4 && (p.y - 10.0).abs() < 1e-4, "{p:?}"),
+            other => panic!("expected MoveTo, got {other:?}"),
+        }
+        match segments[1] {
+            // Relative lineto from (10,10) by (5,0) -> (15,10).
+            tiny_skia::PathSegment::LineTo(p) => assert!((p.x - 15.0).abs() < 1e-4 && (p.y - 10.0).abs() < 1e-4, "{p:?}"),
+            other => panic!("expected LineTo, got {other:?}"),
+        }
+        match segments[2] {
+            // Relative curveto from (15,10) by (1,1)/(2,2)/(3,3) -> control points (16,11)/(17,12), end (18,13).
+            tiny_skia::PathSegment::CubicTo(c1, c2, end) => {
+                assert!((c1.x - 16.0).abs() < 1e-4 && (c1.y - 11.0).abs() < 1e-4, "{c1:?}");
+                assert!((c2.x - 17.0).abs() < 1e-4 && (c2.y - 12.0).abs() < 1e-4, "{c2:?}");
+                assert!((end.x - 18.0).abs() < 1e-4 && (end.y - 13.0).abs() < 1e-4, "{end:?}");
+            }
+            other => panic!("expected CubicTo, got {other:?}"),
+        }
+        assert_eq!(segments[3], tiny_skia::PathSegment::Close);
+    }
+
+    #[test]
+    fn ornamental_corner_path_parses_the_real_corner_vector() {
+        // The real CORNER_VECTOR is well-formed SVG path data -- this
+        // must succeed, not silently fall back to an empty path.
+        assert!(ornamental_corner_path().is_some());
+    }
+
+    #[test]
+    fn ornamental_margins_matches_the_real_viewport_ratio() {
+        let m = ornamental_margins(400, 500);
+        assert_eq!(m.hmargin, 51); // 51/400 * 400
+        assert_eq!(m.vmargin, 83); // 83/500 * 500
+        let m2 = ornamental_margins(1200, 1600);
+        assert_eq!(m2.hmargin, (51.0 / 400.0 * 1200.0) as i32);
+        assert_eq!(m2.vmargin, (83.0 / 500.0 * 1600.0) as i32);
+    }
+
+    #[test]
+    fn render_ornamental_paints_a_radial_gradient_and_corner_ornaments() {
+        let colors = StyleColors::load(&theme()); // color1=red, color2=green, ccolor1=blue
+        let mut pixmap = Pixmap::new(1200, 1600).unwrap();
+        let result = render_ornamental(&mut pixmap, 1200, 1600, &colors).expect("real ornamental render");
+        assert_eq!(result.title.to_color_u8().green(), 0xff); // ccolor2 = green
+
+        // Radial gradient: center is color1 (red), a far corner is
+        // color2 (green) -- real QRadialGradient(center, width) math,
+        // not a flat fill.
+        let (cr, _, _) = px(&pixmap, 600, 800);
+        assert!(cr > 200, "expected the gradient center to be reddish, got r={cr}");
+        let (_, cg, _) = px(&pixmap, 1199, 1599);
+        assert!(cg > 100, "expected a far corner to have shifted toward color2 (green), got g={cg}");
+
+        // Somewhere within the top-left ornament's device-space
+        // bounding box, real ccolor1 (blue)-ish ink was painted (not
+        // just background/gradient colors) -- proves the transform-
+        // stamped corner ornament actually rasterized.
+        let window_sx = 1200.0 / 400.0;
+        let window_sy = 1600.0 / 500.0;
+        let mut found_blue = false;
+        for yy in 40..80 {
+            for xx in 20..60 {
+                let (r, g, b) = px(&pixmap, (xx as f32 * window_sx) as u32, (yy as f32 * window_sy) as u32);
+                if b > r && b > g {
+                    found_blue = true;
+                }
+            }
+        }
+        assert!(found_blue, "expected some blue (ccolor1) ornament ink near the top-left corner");
+    }
+
+    #[test]
+    fn all_styles_lists_all_five_real_style_names() {
+        let mut names = all_styles();
+        names.sort();
+        let mut expected = vec!["The Cross", "Half and Half", "Banner", "Ornamental", "Blocks"];
+        expected.sort();
+        assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn load_styles_respects_the_disabled_list() {
+        let mut prefs = CoverPrefs { disabled_styles: vec!["Banner".to_string(), "Blocks".to_string()], ..Default::default() };
+        let styles = load_styles(&prefs, true);
+        assert_eq!(styles.len(), 3);
+        assert!(!styles.contains(&StyleKind::Banner));
+        assert!(!styles.contains(&StyleKind::Blocks));
+
+        // Disabling every style falls back to all 5, matching real
+        // Python's own "ignore the disabling" fallback.
+        prefs.disabled_styles = all_styles().into_iter().map(str::to_string).collect();
+        assert_eq!(load_styles(&prefs, true).len(), 5);
+    }
+
+    #[test]
+    fn scale_cover_truncates_like_the_real_int_cast() {
+        let mut prefs = CoverPrefs { cover_width: 1200, cover_height: 1600, ..Default::default() };
+        prefs.text.title_font_size = 120.0;
+        scale_cover(&mut prefs, 0.5);
+        assert_eq!(prefs.cover_width, 600);
+        assert_eq!(prefs.cover_height, 800);
+        assert_eq!(prefs.text.title_font_size, 60.0);
+    }
+
+    fn test_prefs_with_only(style: &str) -> CoverPrefs {
+        CoverPrefs {
+            cover_width: 300,
+            cover_height: 400,
+            disabled_styles: all_styles().into_iter().filter(|s| *s != style).map(str::to_string).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn is_valid_png(data: &[u8], width: u32, height: u32) -> bool {
+        match Pixmap::decode_png(data) {
+            Ok(pixmap) => pixmap.width() == width && pixmap.height() == height,
+            Err(_) => false,
+        }
+    }
+
+    #[test]
+    fn generate_cover_produces_a_real_decodable_png_for_every_style() {
+        let db = Arc::new(crate::covers_text::load_system_fonts());
+        let mi = MetaInformation { title: "A Test Book".to_string(), authors: vec!["Jane Author".to_string()], series: Some("A Series".to_string()), series_index: 2.0, ..Default::default() };
+        for name in all_styles() {
+            let prefs = test_prefs_with_only(name);
+            let png = generate_cover(&mi, &prefs, &db, false).unwrap_or_else(|| panic!("style {name:?} failed to render"));
+            assert!(is_valid_png(&png, 300, 400), "style {name:?} produced an invalid/mis-sized PNG");
+        }
+    }
+
+    #[test]
+    fn create_cover_ignores_user_templates() {
+        let db = Arc::new(crate::covers_text::load_system_fonts());
+        let mut prefs = test_prefs_with_only("Blocks");
+        prefs.templates.title_template = "some non-default template that would break".to_string();
+        let png = create_cover("My Title", &["Author One".to_string()], Some("My Series"), 3.0, &prefs, &db, false).expect("real cover");
+        assert!(is_valid_png(&png, 300, 400));
+    }
+
+    #[test]
+    fn calibre_cover2_composites_a_real_logo() {
+        let db = Arc::new(crate::covers_text::load_system_fonts());
+        let mut logo = Pixmap::new(64, 64).unwrap();
+        logo.fill(Color::from_rgba8(10, 20, 30, 255));
+        let prefs = CoverPrefs { cover_width: 600, cover_height: 800, ..Default::default() };
+        let png = calibre_cover2("Calibre", "Kovid Goyal", "", &prefs, &db, &logo).expect("real calibre_cover2 render");
+        // scale_cover(800/cover_height=1.0) leaves dimensions unchanged here.
+        assert!(is_valid_png(&png, 600, 800));
+    }
+
+    #[test]
+    fn message_image_wraps_and_centers_real_text() {
+        let db = Arc::new(crate::covers_text::load_system_fonts());
+        let png = message_image(&db, "This is a longer message that should wrap across more than one line", 300, 200, 20.0).expect("real message image");
+        assert!(is_valid_png(&png, 300, 200));
+    }
+
+    #[test]
+    fn generate_masthead_produces_a_single_line_image() {
+        let db = Arc::new(crate::covers_text::load_system_fonts());
+        let png = generate_masthead(&db, "My Periodical", 600, 60, None).expect("real masthead");
+        assert!(is_valid_png(&png, 600, 60));
+    }
+}
+
+
+

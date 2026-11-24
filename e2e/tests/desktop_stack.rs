@@ -1,6 +1,6 @@
 //! Real, black-box test of the full desktop-app stack: the compiled
 //! `calibredb` binary adds a book into a real library, the compiled
-//! `calibre_srv` binary is spawned against it exactly the way
+//! `lexmechanic_srv` binary is spawned against it exactly the way
 //! `app/src-tauri/src/server.rs::spawn` spawns it for the real
 //! desktop app (same args), and the result is checked two ways:
 //!
@@ -8,9 +8,9 @@
 //!   `library/api.ts` consumes (`search` then `fetchBooks`) -- a
 //!   deterministic check that the real library-browsing UI would
 //!   really show the real added book.
-//! - A real OS webview (via the already-real `calibre_scraper_worker`
+//! - A real OS webview (via the already-real `lexmechanic_scraper_worker`
 //!   binary, the same stack `app/src-tauri` itself renders with)
-//!   loading the served page -- confirms calibre_srv's `--static-dir`
+//!   loading the served page -- confirms lexmechanic_srv's `--static-dir`
 //!   serving of `web/dist` is really reachable by a real browser
 //!   engine, not just `curl`. Skipped, not failed, if `web/dist`
 //!   hasn't been built (`npm run build` in `web/`) or no display (real
@@ -20,7 +20,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use calibre_oxide_e2e::{find_free_port, oxide_bin, spawn_calibre_srv, wait_until_ready, webview_fetch, TestLibrary};
+use lexmechanic_e2e::{find_free_port, lexmechanic_bin, spawn_lexmechanic_srv, wait_until_ready, webview_fetch, TestLibrary};
 
 fn web_dist() -> Option<PathBuf> {
     let dist = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../web/dist");
@@ -28,7 +28,7 @@ fn web_dist() -> Option<PathBuf> {
 }
 
 #[test]
-fn calibre_srv_serves_a_book_added_via_calibredb_through_the_real_ajax_api() {
+fn lexmechanic_srv_serves_a_book_added_via_calibredb_through_the_real_ajax_api() {
     let Some(static_dir) = web_dist() else {
         eprintln!("skipping: web/dist not built -- run `npm run build` in web/ first");
         return;
@@ -38,12 +38,12 @@ fn calibre_srv_serves_a_book_added_via_calibredb_through_the_real_ajax_api() {
     let book = lib.path().join("Stack Test Book.txt");
     std::fs::write(&book, "Stack Test Book\n\n\nJane Doe\n").unwrap();
 
-    let add = std::process::Command::new(oxide_bin("calibredb")).arg("add").arg(&book).arg("--with-library").arg(lib.path()).output().expect("failed to run calibredb");
+    let add = std::process::Command::new(lexmechanic_bin("calibredb")).arg("add").arg(&book).arg("--with-library").arg(lib.path()).output().expect("failed to run calibredb");
     assert!(add.status.success(), "calibredb add failed: {}", String::from_utf8_lossy(&add.stderr));
 
     let port = find_free_port();
-    let _srv = spawn_calibre_srv(lib.path(), &static_dir, port);
-    assert!(wait_until_ready(port, Duration::from_secs(10)), "calibre_srv never became ready on port {port}");
+    let _srv = spawn_lexmechanic_srv(lib.path(), &static_dir, port);
+    assert!(wait_until_ready(port, Duration::from_secs(10)), "lexmechanic_srv never became ready on port {port}");
 
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::blocking::Client::new();
@@ -80,11 +80,11 @@ fn a_real_os_webview_can_load_the_served_ui() {
 
     let lib = TestLibrary::new();
     let port = find_free_port();
-    let _srv = spawn_calibre_srv(lib.path(), &static_dir, port);
-    assert!(wait_until_ready(port, Duration::from_secs(10)), "calibre_srv never became ready on port {port}");
+    let _srv = spawn_lexmechanic_srv(lib.path(), &static_dir, port);
+    assert!(wait_until_ready(port, Duration::from_secs(10)), "lexmechanic_srv never became ready on port {port}");
 
     let Some(html) = webview_fetch(&format!("http://127.0.0.1:{port}/"), Duration::from_secs(15)) else {
-        eprintln!("skipping: calibre_scraper_worker could not start a real webview (no display?)");
+        eprintln!("skipping: lexmechanic_scraper_worker could not start a real webview (no display?)");
         return;
     };
 

@@ -21,3 +21,10 @@ describe("position encode/decode", () => {
     expect(decodePosition(undefined)).toBeNull();
   });
 });
+
+describe("positions saved before the rename", () => {
+  it("still decode", () => {
+    expect(decodePosition("calibre-oxide-simple-pos:4:intro")).toEqual({ spineIndex: 4, frag: "intro" });
+    expect(decodePosition("lexmechanic-simple-pos:4:intro")).toEqual({ spineIndex: 4, frag: "intro" });
+  });
+});

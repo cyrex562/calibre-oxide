@@ -13,6 +13,7 @@ import {
   hasBooksDrag, joinFolder, parseExpandedFolders, readBooksDrag, renamedPath, toggleFolder, visibleFolderRows,
 } from "../library/folders";
 import ContextMenu, { type ContextMenuEntry } from "./ContextMenu.vue";
+import { getItemCompat } from "../library/legacyStorage";
 
 const vFocus = { mounted: (el: HTMLElement) => el.focus() };
 
@@ -28,7 +29,7 @@ const activePath = ref<string | null>(null);
 
 function readExpanded(): Set<string> {
   try {
-    return parseExpandedFolders(localStorage.getItem(FOLDERS_EXPANDED_KEY));
+    return parseExpandedFolders(getItemCompat(localStorage, FOLDERS_EXPANDED_KEY));
   } catch {
     return new Set();
   }

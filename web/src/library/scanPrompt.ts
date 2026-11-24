@@ -34,7 +34,7 @@ export function scanPromptHint(c: UntrackedCount): string {
 
 /** The sessionStorage key under which "not now" is remembered for one library. */
 export function dismissKey(libraryPath: string): string {
-  return `oxide:scan-prompt-dismissed:${libraryPath}`;
+  return `lexmechanic:scan-prompt-dismissed:${libraryPath}`;
 }
 
 /**

@@ -1,0 +1,48 @@
+pub const COVER_FILE_NAME: &str = "cover.jpg";
+pub const METADATA_FILE_NAME: &str = "metadata.opf";
+pub const DEFAULT_TRASH_EXPIRY_TIME_SECONDS: u64 = 14 * 86400;
+pub const TRASH_DIR_NAME: &str = ".caltrash";
+pub const NOTES_DIR_NAME: &str = ".calnotes";
+pub const NOTES_DB_NAME: &str = "notes.db";
+/// Sibling of `metadata.db`, directly under the library root (not
+/// under `.lexmechanic/` or `.calnotes/` like the other sidecars).
+pub const FTS_DB_NAME: &str = "full-text-search.db";
+/// Port of `docs/FAULT_TOLERANCE.md`'s `<library>/.lexmechanic/`
+/// convention (issue #93) -- home for [`crate::library_handle::LibraryHandle`]'s
+/// writer lock and write-ahead journal.
+pub const LIBRARY_HANDLE_DIR_NAME: &str = ".lexmechanic";
+/// What [`LIBRARY_HANDLE_DIR_NAME`] was called before the project was
+/// renamed. Only the migration in
+/// [`crate::library_handle::migrate_legacy_state_dir`] (and the checks that
+/// recognise an un-migrated library nested inside another) use it.
+pub const LEGACY_LIBRARY_HANDLE_DIR_NAME: &str = ".calibre-oxide";
+pub const WRITER_LOCK_FILE_NAME: &str = "writer.lock";
+pub const JOURNAL_DIR_NAME: &str = "journal";
+pub const JOURNAL_CHECKPOINT_FILE_NAME: &str = "journal_checkpoint";
+/// Port of `docs/FAULT_TOLERANCE.md` §8's book-file/cover/sidecar
+/// checksum store (issue #93) -- sits alongside the writer lock and
+/// journal under `<library>/.lexmechanic/`.
+pub const CHECKSUMS_DB_NAME: &str = "checksums.db";
+/// Port of `docs/FAULT_TOLERANCE.md` §5's resume-time "mount
+/// fingerprint" check -- this library's own persisted identity,
+/// generated once and compared verbatim across a suspend/resume
+/// cycle alongside the real device id/filesystem UUID.
+pub const LIBRARY_ID_FILE_NAME: &str = "library.id";
+pub const DATA_DIR_NAME: &str = "data";
+// DATA_FILE_PATTERN needs format! or similar if usage requires it, but constant strings are fine here.
+// In Rust, we can't easily do f-string constants with runtime vars, but this looks static.
+pub const DATA_FILE_PATTERN: &str = "data/**/*";
+pub const BOOK_ID_PATH_TEMPLATE: &str = " ({})";
+pub const RESOURCE_URL_SCHEME: &str = "calres";
+pub const TEMPLATE_ICON_INDICATOR: &str = " template ";
+pub const NO_SEARCH_LINK: &str = "__no_link__";
+
+#[derive(Debug, Clone)]
+pub struct TrashEntry {
+    pub book_id: i32,
+    pub title: String,
+    pub author: String,
+    pub cover_path: String,
+    pub mtime: f64,
+    pub formats: Vec<String>,
+}

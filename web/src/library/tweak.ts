@@ -1,5 +1,5 @@
-// Real fetch wrappers for calibre_srv's book-container editor (see
-// crates/calibre_srv/src/tweak.rs's own doc) -- EPUB only for this
+// Real fetch wrappers for lexmechanic_srv's book-container editor (see
+// crates/lexmechanic_srv/src/tweak.rs's own doc) -- EPUB only for this
 // first slice. Kept separate from library/api.ts: file read/write
 // bodies are raw text, not JSON.
 
@@ -49,7 +49,7 @@ export async function discardTweakSession(sessionId: string): Promise<void> {
 }
 
 // Real visual TOC tree editor (issue #760) -- see
-// crates/calibre_srv/src/tweak.rs's own doc for the "whole-tree
+// crates/lexmechanic_srv/src/tweak.rs's own doc for the "whole-tree
 // replace" design (the tree UI edits its own local copy, then this
 // posts the whole thing once, same "edit locally, then commit" shape
 // the plain-text editor above already uses).

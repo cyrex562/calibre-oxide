@@ -17,7 +17,7 @@ machine, which is the whole argument for that job.
 
 What is still unverified is the app actually *running*: CI builds and
 tests, it does not launch a window. Starting up, rendering, and spawning
-`calibre_srv` all still want a human on a real desktop.
+`lexmechanic_srv` all still want a human on a real desktop.
 
 ## Prerequisites
 
@@ -35,21 +35,21 @@ issue — that would mean something changed.
 
 ## Build and run
 
-The app spawns `calibre_srv` as a child process and points it at the built
+The app spawns `lexmechanic_srv` as a child process and points it at the built
 `web/` frontend, so both have to exist before the app will start. It looks
 for a bundled resource first and falls back to the workspace's own
 `target/` and `web/dist`.
 
 **The order below is mandatory, not advisory.** `tauri build` declares
-`calibre_srv.exe` and `web/dist` as bundle resources, and a declared
+`lexmechanic_srv.exe` and `web/dist` as bundle resources, and a declared
 resource that does not exist is a hard bundle error — so steps 1 and 2
 have to have happened first. That is deliberate: the alternative is a
 packaged app that builds happily and then cannot find its own backend at
 runtime.
 
 ```powershell
-git clone https://github.com/cyrex562/calibre-oxide.git
-cd calibre-oxide
+git clone https://github.com/cyrex562/lexmechanic.git
+cd Lexmechanic
 
 cargo xtask build
 ```
@@ -57,7 +57,7 @@ cargo xtask build
 That runs the three steps in order — Rust workspace, web UI, desktop
 app — which is the whole reason it exists: getting the order wrong
 fails somewhere that does not mention the order. It ends at a runnable
-`calibre_oxide_app.exe`.
+`lexmechanic_app.exe`.
 
 `cargo xtask package` additionally produces the MSI and NSIS
 installers; `cargo xtask help` lists the rest.
@@ -65,7 +65,7 @@ installers; `cargo xtask help` lists the rest.
 By hand, if you want only one of them:
 
 ```powershell
-cargo build --release --workspace        # includes calibre_srv, which the app spawns
+cargo build --release --workspace        # includes lexmechanic_srv, which the app spawns
 cd web  ; npm install ; npm run build    # the UI the app displays
 cd ..\app ; npm install ; npm run tauri:build
 ```
@@ -90,7 +90,7 @@ installer to carry it — the packaging step bundles it when present and
 warns when it is not.
 
 Nothing else depends on it. Skipping this leaves every other feature
-working; PDFs just import without covers. `CALIBRE_OXIDE_PDFIUM` points
+working; PDFs just import without covers. `LEXMECHANIC_PDFIUM` points
 at a copy kept somewhere else.
 
 It uses `curl.exe` and `tar.exe`, both of which ship with Windows 10
@@ -99,14 +99,14 @@ It uses `curl.exe` and `tar.exe`, both of which ship with Windows 10
 ### The PDF worker
 
 Scanning and enrichment render PDFs in a separate process,
-`calibre_pdf_worker.exe` (a second binary of `calibre_srv`, so a crash in
-PDFium cannot take the server down). `calibre_srv` finds it **next to
+`lexmechanic_pdf_worker.exe` (a second binary of `lexmechanic_srv`, so a crash in
+PDFium cannot take the server down). `lexmechanic_srv` finds it **next to
 its own exe**; without it the server falls back to slow in-process
 PDFium. `app/scripts/bundle-config.mjs` therefore bundles
-`calibre_srv.exe`, `calibre_pdf_worker.exe` and `pdfium.dll` flat in the
-resource directory, and the app runs `calibre_srv` from there, so both
+`lexmechanic_srv.exe`, `lexmechanic_pdf_worker.exe` and `pdfium.dll` flat in the
+resource directory, and the app runs `lexmechanic_srv` from there, so both
 the worker and the DLL are found (the worker also inherits
-`CALIBRE_OXIDE_PDFIUM` from the server). Packaging fails if the worker
+`LEXMECHANIC_PDFIUM` from the server). Packaging fails if the worker
 is not built (`cargo build --release --workspace`). The file list is
 in `app/scripts/bundle-resources.mjs`, tested by `npm test` in `app/`.
 
@@ -121,9 +121,13 @@ Two things make that safe, and both are deliberate:
 installation by its MSI `UpgradeCode`, and Tauri otherwise *derives*
 one from the product name — so renaming the product would silently turn
 future installers into a second app alongside the first rather than an
-upgrade. `tauri.conf.json` pins it to the value already derived for
-`calibre-oxide`, which is why installs made before it was pinned still
-upgrade cleanly rather than duplicating.
+upgrade. `tauri.conf.json` pins it to the value derived for the product's
+original name (calibre-oxide), which is why installs made before it was
+pinned, and before the rename to Lexmechanic, still upgrade cleanly rather
+than duplicating. That applies to the MSI. The NSIS installer has no such
+code: it keys on the product name and identifier, so the first Lexmechanic
+setup installs beside a calibre-oxide one, and the old app should be
+uninstalled afterwards (see `app/README.md`).
 
 **No user data lives in the install directory.** Nothing here writes
 beside its own executable. Libraries live wherever you put them, and
@@ -213,10 +217,10 @@ rather than keep retrying.
   mapped drive, or a `subst` drive pointing at one is classified as network
   storage (#258): the library uses SQLite's rollback journal instead of WAL,
   writes are retried and verified, and the UI shows a banner recommending a
-  local copy for large edits. If calibre (or oxide on another computer) has
-  the library open, oxide refuses to write and says why. This has been
+  local copy for large edits. If calibre (or Lexmechanic on another computer) has
+  the library open, Lexmechanic refuses to write and says why. This has been
   unit-tested but not against a real SMB share on Windows. A share the OS
-  reports as local can be forced with `CALIBRE_OXIDE_STORAGE_TIER=network`.
+  reports as local can be forced with `LEXMECHANIC_STORAGE_TIER=network`.
 - **Platform integration is Linux-only by design**, and degrades rather than
   breaks: device-removal and sleep/resume monitors (#258, still open), "Open With"
   application discovery, and the system font directories all fall back to

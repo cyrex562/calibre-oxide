@@ -1,6 +1,6 @@
 // Port of the client side of render_book.py's `encode_url`/`decode_url`
 // virtualization scheme, real signatures matching
-// calibre_ebooks::link_virtualize::{encode_url,decode_url} exactly.
+// lexmechanic_ebooks::link_virtualize::{encode_url,decode_url} exactly.
 //
 // A virtualized reference looks like `link_uid|base64(name)[#frag]|`
 // (see that module's own doc for why). Used for non-anchor attributes

@@ -1,6 +1,6 @@
 // Generic named-JSON-blob storage for web-only settings, built on
-// calibre_srv's already-real `/reader-profiles/*` routes
-// (crates/calibre_srv/src/reader_profiles.rs). That module's own doc
+// lexmechanic_srv's already-real `/reader-profiles/*` routes
+// (crates/lexmechanic_srv/src/reader_profiles.rs). That module's own doc
 // already frames it as "named, per-user JSON blobs of in-browser
 // settings (font size, theme, etc.)" -- a real, existing fit for
 // library-view and reading preferences, not just the reader's own

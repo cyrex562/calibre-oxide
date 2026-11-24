@@ -19,6 +19,7 @@ import { isTauri, tauriInvoke } from "../tauri";
 import { DEFAULT_SAVED_TEMPLATES, removeTemplate, saveTemplate, SAVED_TEMPLATES_PROFILE, TemplateNameError, wouldOverwrite, type SavedTemplate, type SavedTemplates } from "../library/savedTemplates";
 import { fetchProfile, saveProfile } from "../settings/api";
 import type { BookSummary, FieldMetaEntry } from "../library/types";
+import { getItemCompat } from "../library/legacyStorage";
 
 const props = defineProps<{
   bookId: number;
@@ -88,7 +89,7 @@ const convertError = ref<string | null>(null);
 const convertDone = ref(false);
 
 // A real, deliberate first-slice subset of upstream's ~40 conversion
-// options -- see crates/calibre_srv/src/convert.rs's own doc for why.
+// options -- see crates/lexmechanic_srv/src/convert.rs's own doc for why.
 const convertUnsmartenPunctuation = ref(false);
 const convertLinearizeTables = ref(false);
 const convertInsertMetadata = ref(false);
@@ -168,15 +169,15 @@ async function runConversion() {
 }
 
 // Send via email -- real POST /share/email. No persisted SMTP account
-// server-side yet (crates/calibre_srv/src/share.rs's own doc: ties
+// server-side yet (crates/lexmechanic_srv/src/share.rs's own doc: ties
 // into the not-yet-built preferences epic), so the relay config is
 // remembered client-side in localStorage instead, purely for this
 // browser's own convenience across sends.
-const RELAY_STORAGE_KEY = "calibre-oxide-smtp-relay";
+const RELAY_STORAGE_KEY = "lexmechanic-smtp-relay";
 
 function loadSavedRelay(): SmtpRelayConfig {
   try {
-    const raw = localStorage.getItem(RELAY_STORAGE_KEY);
+    const raw = getItemCompat(localStorage, RELAY_STORAGE_KEY);
     if (raw) return JSON.parse(raw) as SmtpRelayConfig;
   } catch {
     // Ignore a corrupt/unavailable localStorage entry -- fall through
@@ -621,7 +622,7 @@ const READABLE_FORMATS = ["epub", "kepub", "pdf"];
 const readableFormat = computed(() => book.value?.formats.find((f) => READABLE_FORMATS.includes(f)) ?? null);
 
 // "Open externally" (#818). The in-app reader handles EPUB/KEPUB only
-// (`is_viewable_format` in calibre_srv), so for a PDF-first library
+// (`is_viewable_format` in lexmechanic_srv), so for a PDF-first library
 // this is the only way to actually open a book -- and it stays useful
 // for any format the reader will never render.
 //
@@ -646,7 +647,7 @@ const externalFormat = computed(() => {
 const unpacking = ref(false);
 const unpackMessage = ref<string | null>(null);
 
-/** Only formats `calibre_ebooks::tweak::get_tools` knows how to explode. */
+/** Only formats `lexmechanic_ebooks::tweak::get_tools` knows how to explode. */
 const UNPACKABLE_FORMATS = ["epub", "azw3", "mobi", "azw", "docx", "htmlz"];
 const unpackableFormat = computed(() => book.value?.formats.find((f) => UNPACKABLE_FORMATS.includes(f)) ?? null);
 const canUnpack = computed(() => isTauri() && unpackableFormat.value !== null);
@@ -773,7 +774,7 @@ async function openExternally(chosen?: string) {
   }
 }
 
-// Tweak Book (issue #719) -- crates/calibre_srv/src/tweak.rs's own
+// Tweak Book (issue #719) -- crates/lexmechanic_srv/src/tweak.rs's own
 // scope is real-EPUB-container-only for this first slice, so the
 // action is only offered when the book actually has that format.
 const canTweak = computed(() => book.value?.formats.includes("epub") ?? false);

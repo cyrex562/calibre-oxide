@@ -9,7 +9,7 @@ function el(n: string, opts: { x?: string; l?: string; a?: [string, string][]; c
 
 /**
  * The exact serialized shape this project's own stack produces for a
- * standard EPUB 3 footnote -- captured from a live `calibre_srv`
+ * standard EPUB 3 footnote -- captured from a live `lexmechanic_srv`
  * serving a real EPUB, not invented.
  */
 const REAL_TREE: SerializedNode = el("body", {

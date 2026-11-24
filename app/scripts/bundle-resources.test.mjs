@@ -10,8 +10,8 @@ test("the bundle ships the PDF worker, PDFium and web UI next to the server, fla
     const res = bundleResources(platform, { releaseDir: rel, pdfium: "C:/t/pdfium/bin/x" });
     const dests = Object.values(res);
     const sfx = platform === "win32" ? ".exe" : "";
-    assert.ok(dests.includes(`calibre_srv${sfx}`));
-    assert.ok(dests.includes(`calibre_pdf_worker${sfx}`));
+    assert.ok(dests.includes(`lexmechanic_srv${sfx}`));
+    assert.ok(dests.includes(`lexmechanic_pdf_worker${sfx}`));
     assert.ok(dests.includes("web-dist/"));
     // Flat: the worker and PDFium must be beside the server.
     for (const d of dests.filter((d) => !d.endsWith("/"))) assert.ok(!d.includes("/"));
@@ -75,8 +75,8 @@ test("PDFium: other platforms look for their own library name in lib/", () => {
 
 const sys = "C:/Windows/System32";
 const imports = {
-  "calibre_srv.exe": ["KERNEL32.dll", "DirectML.dll", "api-ms-win-crt-string-l1-1-0.dll", "VCRUNTIME140.dll", "dxgi.dll"],
-  "calibre_pdf_worker.exe": ["kernel32.dll", "directml.DLL", "MSVCP140_1.dll"],
+  "lexmechanic_srv.exe": ["KERNEL32.dll", "DirectML.dll", "api-ms-win-crt-string-l1-1-0.dll", "VCRUNTIME140.dll", "dxgi.dll"],
+  "lexmechanic_pdf_worker.exe": ["kernel32.dll", "directml.DLL", "MSVCP140_1.dll"],
 };
 const ortCache = "C:/Users/x/AppData/Local/ort.pyke.io/DirectML.dll";
 
@@ -112,7 +112,7 @@ test("a dangling DirectML link is a failure that names the DLL and who needs it"
   });
   assert.equal(plan.unresolved.length, 1);
   assert.equal(plan.unresolved[0].dll, "DirectML.dll");
-  assert.deepEqual(plan.unresolved[0].neededBy.sort(), ["calibre_pdf_worker.exe", "calibre_srv.exe"]);
+  assert.deepEqual(plan.unresolved[0].neededBy.sort(), ["lexmechanic_pdf_worker.exe", "lexmechanic_srv.exe"]);
 });
 
 test("an import found nowhere is unresolved", () => {

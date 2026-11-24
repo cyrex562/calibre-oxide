@@ -1,5 +1,5 @@
 // The library's naming convention: a folder template and a file template,
-// stored per library on the server (`oxide.naming`).
+// stored per library on the server (`lexmechanic.naming`).
 //
 // It is the default wherever a template is asked for (Organize, Rename files,
 // Fix titles); a run can still override it. This module holds the dialog's

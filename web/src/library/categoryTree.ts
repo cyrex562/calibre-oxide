@@ -12,7 +12,7 @@
 /** Category key, e.g. `"authors"` — the last path segment of its URL. */
 export type CategoryKey = string;
 
-export const EXPANDED_KEY = "calibre-oxide.categories.expanded";
+export const EXPANDED_KEY = "lexmechanic.categories.expanded";
 
 /** The key a category's URL identifies it by. */
 export function keyOf(url: string): CategoryKey {

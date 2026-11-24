@@ -1,5 +1,5 @@
-// Real JSON shapes produced by calibre_ebooks::render_book /
-// calibre_ebooks::reader_json -- see those modules' own doc comments
+// Real JSON shapes produced by lexmechanic_ebooks::render_book /
+// lexmechanic_ebooks::reader_json -- see those modules' own doc comments
 // for exactly what each field means. Kept as plain interfaces (not
 // runtime-validated) since this is a trusted, same-origin server.
 
@@ -60,11 +60,11 @@ export interface BookManifest {
   job_id?: number;
 }
 
-// Real shape `calibre_db::annotations`'s own `annot_db_data`/merge
+// Real shape `lexmechanic_db::annotations`'s own `annot_db_data`/merge
 // logic expects for a bookmark (see that module's own `MERGE_FIELDS`:
 // `title` is the merge key, so re-bookmarking under the same title
 // replaces rather than duplicates). `pos_type` here is
-// "calibre-oxide-simple-pos" rather than real upstream's "epubcfi" --
+// "lexmechanic-simple-pos" rather than real upstream's "epubcfi" --
 // this reader has no real CFI implementation yet (see position.ts's
 // own doc), and the server never parses this field itself, only
 // stores/returns it verbatim, so an honestly-different pos_type is
@@ -77,7 +77,7 @@ export interface Bookmark {
   pos_type: string;
 }
 
-// Real shape `calibre_db::annotations` expects for a highlight (see
+// Real shape `lexmechanic_db::annotations` expects for a highlight (see
 // that module's own `MERGE_FIELDS`: `uuid` is the merge key, so
 // re-saving the same uuid replaces rather than duplicates). `start_cfi`/
 // `end_cfi` use this reader's own real (non-CFI) range-anchoring

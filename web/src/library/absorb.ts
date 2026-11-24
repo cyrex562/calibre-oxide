@@ -1,10 +1,10 @@
 // "Calibre libraries inside this library": bringing a calibre library that sits
 // in a subfolder in, in place.
 //
-// What the server does is described in crates/calibre_db/src/absorb.rs: each
+// What the server does is described in crates/lexmechanic_db/src/absorb.rs: each
 // book of the nested `metadata.db` is registered where its files already are
 // (nothing is moved or copied), with its metadata and custom columns, and the
-// nested database is renamed to `metadata.db.absorbed-by-calibre-oxide` when
+// nested database is renamed to `metadata.db.absorbed-by-lexmechanic` when
 // every book is in. This is the part the panel needs: the types, and the words
 // for what came of it.
 
@@ -74,7 +74,7 @@ export function describeAbsorb(r: AbsorbReport): string[] {
   else lines.push(`Brought in ${plural(r.absorbed, "book")} (${plural(r.formats, "file")}${r.covers ? `, ${plural(r.covers, "cover")}` : ""}${r.custom_values ? `, ${plural(r.custom_values, "custom value")}` : ""}).`);
   if (r.already_absorbed > 0 && r.absorbed > 0) lines.push(`${plural(r.already_absorbed, "book")} had been brought in before.`);
   if (r.cancelled) lines.push("Stopped early. Absorb the library again to carry on where it left off.");
-  if (r.renamed) lines.push("Done. Its metadata.db was renamed to metadata.db.absorbed-by-calibre-oxide, so a scan treats the folder as ordinary. Rename it back to undo.");
+  if (r.renamed) lines.push("Done. Its metadata.db was renamed to metadata.db.absorbed-by-lexmechanic, so a scan treats the folder as ordinary. Rename it back to undo.");
   else if (r.not_renamed_because) lines.push(r.not_renamed_because.charAt(0).toUpperCase() + r.not_renamed_because.slice(1) + (r.not_renamed_because.endsWith(".") ? "" : "."));
   if (r.custom_columns_created.length) lines.push(`Created ${plural(r.custom_columns_created.length, "custom column")}: ${r.custom_columns_created.map((c) => `#${c}`).join(", ")}.`);
   if (r.uuid_remapped.length) lines.push(`${plural(r.uuid_remapped.length, "book")} already had its uuid here and got a new one.`);

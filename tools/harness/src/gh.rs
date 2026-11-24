@@ -16,7 +16,7 @@ pub fn ensure_gh_available() -> Result<()> {
     Ok(())
 }
 
-/// Return the origin remote's owner/repo, e.g. `cyrex562/calibre-oxide`.
+/// Return the origin remote's owner/repo, e.g. `cyrex562/lexmechanic`.
 ///
 /// Deliberately does NOT use `gh repo view`: when the repo is a fork with
 /// an `upstream` remote pointing at the parent, `gh` returns the parent's
@@ -58,20 +58,20 @@ mod tests {
     #[test]
     fn parse_slug_https() {
         assert_eq!(
-            parse_repo_slug("https://github.com/cyrex562/calibre-oxide.git"),
-            Some("cyrex562/calibre-oxide".to_string())
+            parse_repo_slug("https://github.com/cyrex562/lexmechanic.git"),
+            Some("cyrex562/lexmechanic".to_string())
         );
         assert_eq!(
-            parse_repo_slug("https://github.com/cyrex562/calibre-oxide"),
-            Some("cyrex562/calibre-oxide".to_string())
+            parse_repo_slug("https://github.com/cyrex562/lexmechanic"),
+            Some("cyrex562/lexmechanic".to_string())
         );
     }
 
     #[test]
     fn parse_slug_ssh() {
         assert_eq!(
-            parse_repo_slug("git@github.com:cyrex562/calibre-oxide.git"),
-            Some("cyrex562/calibre-oxide".to_string())
+            parse_repo_slug("git@github.com:cyrex562/lexmechanic.git"),
+            Some("cyrex562/lexmechanic".to_string())
         );
     }
 

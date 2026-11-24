@@ -1,16 +1,16 @@
 //! Real, black-box tests of the compiled `calibredb` binary (#704) --
 //! run through an actual subprocess against an actual on-disk
-//! library, not `calibre_db::cli::main_dispatch::run_command` called
+//! library, not `lexmechanic_db::cli::main_dispatch::run_command` called
 //! in-process. This is the layer that would have caught `"add"` being
 //! a hardcoded stub: `cmd_add.rs`'s own unit test called `CmdAdd::run`
 //! directly and stayed green the whole time.
 
 use std::process::Command;
 
-use calibre_oxide_e2e::{oxide_bin, upstream_calibredb, TestLibrary};
+use lexmechanic_e2e::{lexmechanic_bin, upstream_calibredb, TestLibrary};
 
 fn run_calibredb(library: &std::path::Path, args: &[&str]) -> std::process::Output {
-    Command::new(oxide_bin("calibredb")).args(args).arg("--with-library").arg(library).output().expect("failed to run the compiled calibredb binary")
+    Command::new(lexmechanic_bin("calibredb")).args(args).arg("--with-library").arg(library).output().expect("failed to run the compiled calibredb binary")
 }
 
 #[test]
@@ -44,7 +44,7 @@ fn reports_an_unknown_command_as_a_real_process_failure() {
 
 #[test]
 fn fails_clearly_against_a_library_path_that_does_not_exist() {
-    let out = Command::new(oxide_bin("calibredb")).args(["list", "--with-library"]).arg("/no/such/path/at/all").output().unwrap();
+    let out = Command::new(lexmechanic_bin("calibredb")).args(["list", "--with-library"]).arg("/no/such/path/at/all").output().unwrap();
     assert!(!out.status.success());
 }
 
@@ -55,7 +55,7 @@ fn fails_clearly_against_a_library_path_that_does_not_exist() {
 /// gets added, falling back to the filename as title and "Unknown" as
 /// author) rather than exact CLI output formatting, which this port's
 /// `calibredb list` deliberately doesn't attempt to match byte-for-
-/// byte (see crates/calibre_db/src/bin/calibredb.rs's own module doc).
+/// byte (see crates/lexmechanic_db/src/bin/calibredb.rs's own module doc).
 #[test]
 fn upstream_calibredb_shows_the_same_filename_fallback_behavior() {
     let Some(upstream) = upstream_calibredb() else {

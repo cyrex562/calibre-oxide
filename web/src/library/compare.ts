@@ -1,7 +1,7 @@
 // The compare view: 2 to 8 copies of a book side by side, to look at, edit,
 // move and decide between (tranche 16).
 //
-// The server does the facts (crates/calibre_srv/src/duplicates_compare.rs:
+// The server does the facts (crates/lexmechanic_srv/src/duplicates_compare.rs:
 // every book's files and PDF facts, and per pair whether the bytes are
 // identical and what the cached page fingerprints say). Everything else the
 // view does goes through routes that already existed: `setFields` for the

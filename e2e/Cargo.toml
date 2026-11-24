@@ -1,12 +1,12 @@
 [package]
-name = "calibre_oxide_e2e"
+name = "lexmechanic_e2e"
 version = "0.1.0"
 edition = "2021"
 license.workspace = true
 publish = false
 
 [dependencies]
-calibre_db = { path = "../crates/calibre_db" }
+lexmechanic_db = { path = "../crates/lexmechanic_db" }
 reqwest = { version = "0.11", features = ["blocking", "json"] }
 serde_json = "1.0"
 tempfile = "3"

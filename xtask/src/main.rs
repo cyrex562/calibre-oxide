@@ -2,7 +2,7 @@
 //!
 //! Producing the desktop app takes three steps in two languages, and
 //! they have to happen in order: the Rust workspace builds
-//! `calibre_srv`, `web/` builds the UI the app displays, and only then
+//! `lexmechanic_srv`, `web/` builds the UI the app displays, and only then
 //! can `tauri build` package the two together. Getting that order wrong
 //! fails somewhere unhelpful, so it lives here instead of in a README
 //! that nobody reads twice.
@@ -54,7 +54,7 @@ fn print_help() {
     eprintln!(
         "\ncargo xtask <task>\n\n\
          \x20 build     everything, in order: Rust workspace, web UI, then the desktop app\n\
-         \x20 server    just the Rust workspace (includes calibre_srv and the CLIs)\n\
+         \x20 server    just the Rust workspace (includes lexmechanic_srv and the CLIs)\n\
          \x20 web       just the web UI that the app displays\n\
          \x20 app       the desktop app, assuming the two above are already built\n\
          \x20 package   build everything, then produce installers (needs network)\n\
@@ -171,7 +171,7 @@ fn build_app(release: bool) -> Result<()> {
     // downloads its tooling from GitHub at build time, so `build` would
     // otherwise need working network to a specific host to finish.
     npm(&["run", "tauri:build"], &app).context("building the desktop app failed")?;
-    let exe = root().join("target").join("release").join(if cfg!(windows) { "calibre_oxide_app.exe" } else { "calibre_oxide_app" });
+    let exe = root().join("target").join("release").join(if cfg!(windows) { "lexmechanic_app.exe" } else { "lexmechanic_app" });
     eprintln!("\n  built {}", exe.display());
     Ok(())
 }
@@ -198,7 +198,7 @@ fn package() -> Result<()> {
 ///
 /// PDF page rendering -- covers from page 1, exporting a page as an
 /// image -- needs Google's PDFium, a C++ library with no pure-Rust
-/// equivalent. It is bound at *run* time (`crates/calibre_ebooks/src/
+/// equivalent. It is bound at *run* time (`crates/lexmechanic_ebooks/src/
 /// pdf/rasterize.rs` explains why), so nothing here is needed to
 /// compile or test the workspace: without it, PDFs simply import
 /// without covers.
@@ -331,7 +331,7 @@ fn test_all() -> Result<()> {
         failures.push(format!("web: could not prepare ({e:#})"));
     }
 
-    // `e2e/` spawns the compiled binaries (calibredb, calibre_srv, ...);
+    // `e2e/` spawns the compiled binaries (calibredb, lexmechanic_srv, ...);
     // `cargo test` only builds the binaries of the package under test.
     step("building the workspace binaries (the e2e tests spawn them)");
     if let Err(e) = cargo(&["build", "--workspace", "--bins"], &root()) {
@@ -448,7 +448,7 @@ fn run_cargo_tests(packages: &std::collections::HashMap<String, String>) -> (boo
         println!("{line}");
         let t = line.trim_start();
         if let Some(rest) = t.strip_prefix("Running ") {
-            // `Running unittests src/lib.rs (target\debug\deps\calibre_db-0123abcd.exe)`
+            // `Running unittests src/lib.rs (target\debug\deps\lexmechanic_db-0123abcd.exe)`
             let exe = rest.rsplit(['\\', '/']).next().unwrap_or("").trim_end_matches(')');
             let stem = exe.trim_end_matches(".exe");
             let target = stem.rsplit_once('-').map(|(n, _)| n).unwrap_or(stem);

@@ -1,7 +1,7 @@
-# Porting Plan: Calibre-Oxide
+# Porting Plan: Lexmechanic
 
 ## Goal
-Port the legacy Python-based Calibre codebase (`old_src`) to a modern, high-performance Rust application ("Calibre-Oxide") using `iced` (or `egui`) for the GUI.
+Port the legacy Python-based Calibre codebase (`old_src`) to a modern, high-performance Rust application ("Lexmechanic") using `iced` (or `egui`) for the GUI.
 
 ## Source Analysis
 The `old_src` directory contains a massive Python codebase.
@@ -15,14 +15,14 @@ Key challenges:
 ### 1. Workspace Structure
 We will use a Rust Workspace to modularize the port.
 ```
-calibre-oxide/
+lexmechanic/
 ├── Cargo.toml (workspace root)
 ├── src/ (main binary)
 ├── crates/
-│   ├── calibre_db/      # Port of src/calibre/db
-│   ├── calibre_ebooks/  # Port of src/calibre/ebooks
-│   ├── calibre_devices/ # Port of src/calibre/devices
-│   ├── calibre_utils/   # Port of src/calibre/utils
+│   ├── lexmechanic_db/      # Port of src/calibre/db
+│   ├── lexmechanic_ebooks/  # Port of src/calibre/ebooks
+│   ├── lexmechanic_devices/ # Port of src/calibre/devices
+│   ├── lexmechanic_utils/   # Port of src/calibre/utils
 │   └── calibre_gui/     # New Iced/Egui application
 ```
 
@@ -38,14 +38,14 @@ calibre-oxide/
 - **Goal**: Establish the workspace and core types.
 - **Tasks**:
     - Set up `Cargo.toml` workspace.
-    - Port `src/calibre/constants.py` and basic `src/calibre/utils` to `calibre_utils` crate.
+    - Port `src/calibre/constants.py` and basic `src/calibre/utils` to `lexmechanic_utils` crate.
     - Implement logging and configuration loading.
 
 #### Phase 2: The Data Layer (Database)
 - **Goal**: Read the existing metadata.db (SQLite).
 - **Tasks**:
     - Analyze `src/calibre/db`.
-    - Create `calibre_db` crate using `rusqlite`.
+    - Create `lexmechanic_db` crate using `rusqlite`.
     - Implement the schema compatibility to read existing Calibre libraries.
     - **Deliverable**: CLI tool to list books from a library.
 
@@ -61,7 +61,7 @@ calibre-oxide/
 - **Tasks**:
     - Initialize `iced` application in `calibre_gui`.
     - Implement the Main Window (Library View).
-    - Connect `calibre_db` to the GUI for listing books.
+    - Connect `lexmechanic_db` to the GUI for listing books.
     - Implement Book Details panel.
     - **Deliverable**: Minimal functional GUI showing the library.
 

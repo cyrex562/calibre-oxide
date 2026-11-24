@@ -4,13 +4,13 @@
 //! The GUI build has no console, so before this existed a server that
 //! failed to start left nothing at all: no window, no message, no file.
 //!
-//! * `server.log` -- the spawned `calibre_srv`'s stdout and stderr, for the
+//! * `server.log` -- the spawned `lexmechanic_srv`'s stdout and stderr, for the
 //!   current run. The run before it is kept as `server.prev.log`, so a
 //!   crash followed by a relaunch does not destroy the evidence.
 //! * `app.log` -- the app's own errors, appended to.
 //!
 //! Both live in Tauri's `app_log_dir` (on Windows
-//! `%APPDATA%\com.cyrex.calibre-oxide\logs`).
+//! `%APPDATA%\com.cyrex.lexmechanic\logs`).
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -31,7 +31,7 @@ pub const TAIL_LINES: usize = 20;
 /// The log directory; falls back to a folder under the temp dir if Tauri
 /// cannot say, so logging never becomes a reason not to start.
 pub fn log_dir(app: &AppHandle) -> PathBuf {
-    app.path().app_log_dir().unwrap_or_else(|_| std::env::temp_dir().join("calibre-oxide-logs"))
+    app.path().app_log_dir().unwrap_or_else(|_| std::env::temp_dir().join("lexmechanic-logs"))
 }
 
 /// Starts a fresh `server.log`, keeping the previous one as

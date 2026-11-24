@@ -4,10 +4,12 @@
 // and written inside try/catch: storage can be missing, full or
 // blocked (private windows, previews), and the panel must still render.
 
+import { getItemCompat } from "./legacyStorage";
+
 export const SECTION_IDS = ["cover", "preview", "metadata", "files", "actions"] as const;
 export type SectionId = (typeof SECTION_IDS)[number];
 
-export const SECTIONS_KEY = "calibre-oxide.details-sections";
+export const SECTIONS_KEY = "lexmechanic.details-sections";
 
 export type SectionState = Record<SectionId, boolean>;
 
@@ -28,7 +30,7 @@ function defaultStorage(): StorageLike | null {
 export function loadSections(storage: StorageLike | null = defaultStorage()): SectionState {
   const out = { ...DEFAULT_SECTIONS };
   try {
-    const raw = storage?.getItem(SECTIONS_KEY);
+    const raw = storage ? getItemCompat(storage, SECTIONS_KEY) : null;
     if (!raw) return out;
     const parsed = JSON.parse(raw) as Record<string, unknown>;
     if (typeof parsed !== "object" || parsed === null) return out;

@@ -3,7 +3,7 @@
 // optionally write it into the book files and optionally rename the files from
 // a template. A run can be undone.
 //
-// The server is the authority (crates/calibre_srv/src/retitle_library.rs): it
+// The server is the authority (crates/lexmechanic_srv/src/retitle_library.rs): it
 // finds and suggests (dry run), skips a book whose title changed since the
 // preview, isolates errors per book and records every run. This module holds the
 // dialog's state machine so its rules can be tested:

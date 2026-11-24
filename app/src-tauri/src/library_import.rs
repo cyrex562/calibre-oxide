@@ -1,5 +1,5 @@
 //! Real "import a whole-library archive" (issue #761): the desktop-app
-//! half of the export/import pair -- `crates/calibre_srv/src/library_export.rs`
+//! half of the export/import pair -- `crates/lexmechanic_srv/src/library_export.rs`
 //! streams the real zip archive of a library's own on-disk layout;
 //! this module extracts one back to a real local path, then `lib.rs`'s
 //! own `open_library` ("open a library at a path", issue #725) opens
@@ -12,7 +12,7 @@
 //! absolute path (real, in the `zip` crate itself). This adds a
 //! second, symlink-resolved check beyond that -- matches this
 //! project's established path-traversal-hardening pattern (see
-//! `crates/calibre_srv/src/save_to_disk.rs`'s own doc for the same
+//! `crates/lexmechanic_srv/src/save_to_disk.rs`'s own doc for the same
 //! two-layer shape and why a lexical check alone isn't enough): a
 //! symlink pre-planted inside the destination (by a previous partial
 //! extraction, for instance) could otherwise redirect a lexically-safe

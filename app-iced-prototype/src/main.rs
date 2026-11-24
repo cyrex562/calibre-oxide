@@ -1,6 +1,6 @@
-use calibre_db::{Book, Library};
-use calibre_ebooks::epub::read_epub_metadata;
-use calibre_utils::logging;
+use lexmechanic_db::{Book, Library};
+use lexmechanic_ebooks::epub::read_epub_metadata;
+use lexmechanic_utils::logging;
 use iced::widget::{button, column, container, row, scrollable, text, text_input};
 use iced::{executor, Application, Command, Element, Length, Settings, Theme};
 use std::path::PathBuf;
@@ -93,7 +93,7 @@ impl Application for CalibreApp {
     }
 
     fn title(&self) -> String {
-        String::from("Calibre Oxide")
+        String::from("Lexmechanic")
     }
 
     fn update(&mut self, message: Message) -> Command<Message> {

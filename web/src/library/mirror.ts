@@ -1,7 +1,7 @@
 // The "Export a copy…" dialog: a travel copy you can refresh, or a one-way
 // backup mirror, written to another folder or drive.
 //
-// The server is the authority (crates/calibre_srv/src/library_mirror.rs): it
+// The server is the authority (crates/lexmechanic_srv/src/library_mirror.rs): it
 // plans the copy, protects edits made in the copy (a conflict is skipped unless
 // overwriting is asked for), moves what it removes to `.mirror-trash` in the
 // copy, and refuses to run a plan that was not previewed. This module holds the

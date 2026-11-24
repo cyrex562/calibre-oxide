@@ -35,7 +35,7 @@ fn canonicalize_and_check(p: &Path) -> Result<PathBuf> {
     let c = p.canonicalize()
         .with_context(|| format!("failed to canonicalize {:?}", p))?;
     if !is_repo_root(&c) {
-        return Err(anyhow!("{:?} does not look like the calibre-oxide repo root", c));
+        return Err(anyhow!("{:?} does not look like the Lexmechanic repo root", c));
     }
     Ok(c)
 }

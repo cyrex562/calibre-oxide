@@ -1,14 +1,14 @@
 [package]
-name = "calibre_oxide"
+name = "lexmechanic"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 log = "0.4"
 env_logger = "0.10"
-calibre_utils = { path = "../crates/calibre_utils" }
-calibre_db = { path = "../crates/calibre_db" }
-calibre_ebooks = { path = "../crates/calibre_ebooks" }
+lexmechanic_utils = { path = "../crates/lexmechanic_utils" }
+lexmechanic_db = { path = "../crates/lexmechanic_db" }
+lexmechanic_ebooks = { path = "../crates/lexmechanic_ebooks" }
 iced = { version = "0.12", features = ["debug", "image"] }
 wry = "0.24"
 tao = "0.16"                                               # Underlying windowing library often used with wry
@@ -16,5 +16,5 @@ mime_guess = "2.0"
 url = "2.5"
 
 [[bin]]
-name = "calibre_oxide"
+name = "lexmechanic"
 # path = "src/main.rs" # Standard layout

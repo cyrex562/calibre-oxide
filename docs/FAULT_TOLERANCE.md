@@ -1,6 +1,6 @@
 # Fault-Tolerance Design Contract
 
-Every port and every new feature in calibre-oxide **must** respect the rules
+Every port and every new feature in Lexmechanic **must** respect the rules
 in this document. The harness's judge agent uses this as the review rubric
 for any code that touches disk, device, or network state. A PR that violates
 these rules is rejected regardless of whether tests pass.
@@ -9,7 +9,7 @@ these rules is rejected regardless of whether tests pass.
 
 August 2026 — user was working with Calibre against a library on an external
 SSD at an airport. Laptop lid closed with the SSD attached. On wake, the
-Calibre library folder was corrupted and unreadable. Calibre-oxide must not
+Calibre library folder was corrupted and unreadable. Lexmechanic must not
 have this failure mode.
 
 The rest of this document is the specific engineering that prevents it.
@@ -40,7 +40,7 @@ As implemented (issue #258, classification half; `storage_safety.rs`):
   to a UNC path is Network.
 - **Linux**: the `/proc/mounts` fstype (`nfs`, `nfs4`, `cifs`, `smb3`,
   `fuse.sshfs`, ...).
-- **Override**: `CALIBRE_OXIDE_STORAGE_TIER=network|external|local` forces
+- **Override**: `LEXMECHANIC_STORAGE_TIER=network|external|local` forces
   the tier, for a share the OS reports as local.
 - Out of scope, still open in #258: the device-removal and sleep/resume
   monitors on Windows. Cloud-sync folders (OneDrive, Dropbox) are not
@@ -53,7 +53,7 @@ this sequence. No exceptions.
 
 1. Compute the operation. Do not touch the target yet.
 2. Serialize the operation to a **journal entry** in
-   `<library>/.calibre-oxide/journal/<uuid>.op` — the entry contains a
+   `<library>/.lexmechanic/journal/<uuid>.op` — the entry contains a
    monotonic sequence number, the previous head, an operation descriptor,
    and a BLAKE3 of the descriptor. `fsync` the journal file. `fsync` the
    journal directory.
@@ -81,7 +81,7 @@ identified by uuid).
   documented as unsupported on network filesystems, so it can corrupt the
   database or fail to lock there. Sidecars follow `metadata.db`'s mode.
   A database found in WAL mode on a network tier (first opened locally, or
-  by an older oxide) is switched back to DELETE on open, but only while this
+  by an older Lexmechanic) is switched back to DELETE on open, but only while this
   process holds the writer lock and only if SQLite confirms the switch; if
   it cannot, the open is refused with a message rather than continuing in
   WAL over the network.
@@ -124,7 +124,7 @@ identified by uuid).
      30 s waiting for `PBT_APMRESUMEAUTOMATIC`, then errors.
 - On resume: revalidate every `LibraryHandle` by re-`statfs`ing the mount
   and reading the journal head. If the mount fingerprint (device id +
-  filesystem uuid + top-level `.calibre-oxide/library.id`) does not match
+  filesystem uuid + top-level `.lexmechanic/library.id`) does not match
   what we recorded pre-suspend, the handle transitions to `Detached`.
   This is the codified answer to the airport-SSD incident.
 
@@ -134,7 +134,7 @@ Real calibre writes no marker into the library. Its GUI, `calibre-server`
 and `calibredb` share a per-user, per-machine named mutex
 (`calibre-singleinstance-<user>-db`; `utils/lock.py`), which excludes them
 from each other on one machine and says nothing about *which* library or
-about other machines. Oxide therefore combines what is detectable
+about other machines. Lexmechanic therefore combines what is detectable
 (`storage_safety.rs`), all at open time:
 
 | Signal | Platform | Effect |
@@ -142,7 +142,7 @@ about other machines. Oxide therefore combines what is detectable
 | `metadata.db` cannot be opened with share mode 0 (another process has it open; retried ~0.6 s to ride out an antivirus scan) | Windows, local and SMB | refuses writes |
 | `BEGIN EXCLUSIVE` returns busy (another connection is mid-transaction) | all | refuses writes |
 | calibre's named mutex is held | Windows | warning only (it is not tied to a library) |
-| writer lock held, record in `.calibre-oxide/writer.owner` names a different process or host | all | refuses writes, names the host and pid |
+| writer lock held, record in `.lexmechanic/writer.owner` names a different process or host | all | refuses writes, names the host and pid |
 
 `writer.owner` holds host, pid and a timestamp refreshed every 30 s on the
 Network tier. If the OS lock is free but the record names another host and
@@ -151,7 +151,7 @@ mtimes, so clock skew between machines does not matter), the file server is
 not enforcing locks across clients and that host is probably still writing,
 so the open is refused. An older record is treated as left by a crash and
 taken over with a warning. A second `Backend` in the same process never
-trips these probes. `CALIBRE_OXIDE_ALLOW_SHARED_LIBRARY=1` skips the probes.
+trips these probes. `LEXMECHANIC_ALLOW_SHARED_LIBRARY=1` skips the probes.
 The server reports all of this in `/ajax/library-info` under `storage`.
 
 ## 6. Network storage
@@ -279,7 +279,7 @@ Not yet validated against a real mount: Google Drive desktop sync
 ## 7. Concurrency
 
 - One writer per library. Enforced by `flock`-style exclusive lock on
-  `<library>/.calibre-oxide/writer.lock` acquired at handle open.
+  `<library>/.lexmechanic/writer.lock` acquired at handle open.
 - Read handles are unlimited but see snapshots — no dirty reads across
   the write boundary. SQLite WAL gives us this naturally; for filesystem
   reads, materialize path lists through the read side of the journal.
@@ -311,7 +311,7 @@ The judge agent enforces these by grep and by test:
 
 - `grep -R "std::fs::rename" crates/` on a library path → reject unless
   inside `LibraryHandle::rename_atomic`.
-- `grep -R "\.unwrap()" crates/calibre_db crates/calibre_ebooks/**/library/` → reject.
+- `grep -R "\.unwrap()" crates/lexmechanic_db crates/lexmechanic_ebooks/**/library/` → reject.
 - Every write-path test must include a "kill process at random point"
   variant — we use `fail::cfg` (the `fail` crate) to inject panics between
   every step of §2, and assert recovery is clean.

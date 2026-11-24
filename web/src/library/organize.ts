@@ -1,7 +1,7 @@
 // The "Organize files…" dialog: move each book's own files inside the library
 // to where a template says, see the plan, run it, undo it.
 //
-// The server is the authority (crates/calibre_srv/src/organize_library.rs): it
+// The server is the authority (crates/lexmechanic_srv/src/organize_library.rs): it
 // plans the moves, never overwrites (a taken name gets " (2)"), and refuses to
 // execute a plan that was not previewed. This module holds the dialog's state
 // machine so its rules can be tested:

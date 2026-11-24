@@ -3,7 +3,7 @@
 // # Why a renderer at all
 //
 // PDFs could not be opened in-app at all: `is_viewable_format` in
-// `calibre_srv` is EPUB/KEPUB only, and the desktop webview is
+// `lexmechanic_srv` is EPUB/KEPUB only, and the desktop webview is
 // WebKitGTK, which ships no built-in PDF viewer -- so `<embed>` or an
 // iframe, which would work in Chrome or Firefox, renders nothing in
 // the app this is actually for. For a library whose primary content

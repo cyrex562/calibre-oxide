@@ -1,4 +1,4 @@
-# calibre-oxide desktop UI/UX specification
+# Lexmechanic desktop UI/UX specification
 
 Produced by a design pass against the running application and the
 upstream calibre sources. All repo paths are relative to the repository
@@ -144,7 +144,7 @@ marks ─ Random book
 `gui2/central.py:375-378`, `gui2/init.py:333`.)
 
 **Help** — Help… `F1` · Keyboard shortcuts… `Ctrl+/` ─ About
-calibre-oxide…
+Lexmechanic…
 
 **Browser mode.** `web/` must keep working as a plain browser tab, so
 build an in-app `MenuBar.vue` from the same `MenuPlacement` data,
@@ -706,7 +706,7 @@ library's folder name, modelled on
 **Adaptive popup** (§2.3): with only one library known, drop the
 chevron and open the chooser directly.
 
-Also: **library name in the window title** (`calibre-oxide — Fiction`),
+Also: **library name in the window title** (`Lexmechanic — Fiction`),
 and a **first-run empty state** when no library is open — a centred
 card with Create / Open / recent list. Today that renders as an empty
 book table with no explanation.
@@ -726,7 +726,7 @@ fetches, metadata downloads and polish runs all happen behind a
 ### 5.3 Status bar
 
 ```
-calibre-oxide 0.1.0    [1,284 books, 3 selected]  …  [⬆] [▦ Layout ▾] [⋯] [◴ Jobs: 2]
+Lexmechanic 0.1.0    [1,284 books, 3 selected]  …  [⬆] [▦ Layout ▾] [⋯] [◴ Jobs: 2]
 ```
 
 - **Left label** is one string (upstream `_set_label`,

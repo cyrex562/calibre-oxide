@@ -3,12 +3,17 @@
 // ~1000 lines of range/point CFI computation against live DOM
 // measurements -- out of scope here, see issue #499's own doc for
 // what's deferred). Stored in the same `cfi` string field
-// `book-set/get-last-read-position` already expose (calibre_srv
+// `book-set/get-last-read-position` already expose (lexmechanic_srv
 // itself never parses this field as a real CFI, it's opaque text to
 // the backend either way), so this is forward-compatible with a real
 // CFI implementation landing later without a schema change.
 
-const PREFIX = "calibre-oxide-simple-pos:";
+import { getItemCompat } from "../library/legacyStorage";
+
+const PREFIX = "lexmechanic-simple-pos:";
+// Positions saved before the rename carry this prefix. They are still read
+// (they are stored in the library, so they outlive any one build), never written.
+const LEGACY_PREFIX = "calibre-oxide-simple-pos:";
 
 export interface SimplePosition {
   spineIndex: number;
@@ -20,8 +25,10 @@ export function encodePosition(pos: SimplePosition): string {
 }
 
 export function decodePosition(cfi: string | null | undefined): SimplePosition | null {
-  if (!cfi || !cfi.startsWith(PREFIX)) return null;
-  const rest = cfi.slice(PREFIX.length);
+  if (!cfi) return null;
+  const prefix = cfi.startsWith(PREFIX) ? PREFIX : cfi.startsWith(LEGACY_PREFIX) ? LEGACY_PREFIX : null;
+  if (prefix === null) return null;
+  const rest = cfi.slice(prefix.length);
   const sep = rest.indexOf(":");
   if (sep === -1) return null;
   const spineIndex = Number.parseInt(rest.slice(0, sep), 10);
@@ -38,8 +45,8 @@ export function decodePosition(cfi: string | null | undefined): SimplePosition |
  * ids for the same browser.
  */
 export function deviceId(): string {
-  const key = "calibre-oxide-device-id";
-  let id = localStorage.getItem(key);
+  const key = "lexmechanic-device-id";
+  let id = getItemCompat(localStorage, key);
   if (!id) {
     id = crypto.randomUUID();
     localStorage.setItem(key, id);

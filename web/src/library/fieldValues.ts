@@ -10,6 +10,7 @@
 import { fetchCategoryValues } from "./api";
 import type { BookColumn } from "./columns";
 import type { BookFieldChanges, FieldMetaEntry } from "./types";
+import { getItemCompat } from "./legacyStorage";
 
 export interface FieldValue {
   name: string;
@@ -79,7 +80,7 @@ export function completionFor(column: BookColumn): Completion | null {
 
 export const MIN_CHARS_DEFAULT = 2;
 export const MIN_CHARS_RANGE: [number, number] = [1, 5];
-export const MIN_CHARS_KEY = "calibre-oxide.suggestMinChars";
+export const MIN_CHARS_KEY = "lexmechanic.suggestMinChars";
 
 export function clampMinChars(n: number): number {
   if (!Number.isFinite(n)) return MIN_CHARS_DEFAULT;
@@ -89,7 +90,7 @@ export function clampMinChars(n: number): number {
 /** The "Suggest after N characters" setting. Read on every use so a change applies at once. */
 export function getMinChars(): number {
   try {
-    const raw = localStorage.getItem(MIN_CHARS_KEY);
+    const raw = getItemCompat(localStorage, MIN_CHARS_KEY);
     if (raw === null) return MIN_CHARS_DEFAULT;
     return clampMinChars(Number(raw));
   } catch {
