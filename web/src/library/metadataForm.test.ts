@@ -158,3 +158,15 @@ describe("drafts that outlive the panel", () => {
     expect(draftCount.value).toBe(0);
   });
 });
+
+describe("a book with no publication date", () => {
+  it("shows calibre's undefined date (0101-01-01) as an empty field, so nothing bogus can be written back", () => {
+    const undated = { ...book, pubdate: "0101-01-01T00:00:00+00:00" } as BookSummary;
+    const baseline = formFromBook(undated, []);
+    expect(baseline.pubdate).toBe("");
+    // Saving some other field sends no date at all.
+    const form = cloneForm(baseline);
+    form.title = "Dune Messiah";
+    expect(changesFromForm(form, [], baseline)).toEqual({ title: "Dune Messiah" });
+  });
+});

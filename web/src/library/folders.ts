@@ -159,6 +159,19 @@ export type FolderApi = Pick<typeof realApi, "planMoveBooks" | "runMoveBooks" | 
 export type FolderAction = { kind: "move"; ids: number[]; folder: string } | { kind: "rename"; from: string; to: string };
 export type FolderFlowPhase = "idle" | "planning" | "confirm" | "running" | "done";
 
+/** A move of fewer books than this, with no name collisions, runs without a preview. */
+export const QUICK_MOVE_BOOKS = 20;
+
+/** Whether a planned move is small and clean enough to do at once (it is still undoable). */
+export function isQuickMove(p: Pick<OrganizePlan, "books" | "conflicts" | "skipped">): boolean {
+  return p.books > 0 && p.books < QUICK_MOVE_BOOKS && p.conflicts === 0 && p.skipped.length === 0;
+}
+
+/** The toast after a quick move. */
+export function describeQuickMove(r: Pick<OrganizeReport, "books_moved">, folder: string): string {
+  return `Moved ${plural(r.books_moved, "book")} to ${folder}`;
+}
+
 const n = (v: number) => v.toLocaleString("en-US");
 const plural = (v: number, one: string) => `${n(v)} ${one}${v === 1 ? "" : "s"}`;
 
@@ -195,9 +208,15 @@ export function createFolderFlow(api: FolderApi = realApi, onChanged: () => void
     progress: "",
     error: null as string | null,
     undone: null as string | null,
+    /** A small move is being planned or run without its dialog; see `begin`. */
+    quiet: false,
+    /** The last run was a quick move, so it is reported in a toast. */
+    quick: false,
   });
 
   function reset(): void {
+    state.quiet = false;
+    state.quick = false;
     state.phase = "idle";
     state.action = null;
     state.plan = null;
@@ -207,19 +226,37 @@ export function createFolderFlow(api: FolderApi = realApi, onChanged: () => void
     state.undone = null;
   }
 
-  /** Starts a flow and previews it. Ends in `confirm`, or back in `idle` with an error shown. */
-  async function begin(action: FolderAction): Promise<boolean> {
+  /**
+   * Starts a flow and previews it. Ends in `confirm`, or back in `idle` with an error shown.
+   *
+   * With `quick`, a small, clean move (see [`isQuickMove`]) is not previewed at
+   * all: it runs at once and ends in `done` with `state.quick` set, and the
+   * caller says so in a toast with an Undo. A move that is large or has
+   * collisions falls back to the preview, as does any failure.
+   */
+  async function begin(action: FolderAction, options: { quick?: boolean } = {}): Promise<boolean> {
     reset();
     state.action = action;
     state.phase = "planning";
+    state.quiet = !!options.quick && action.kind === "move" && action.ids.length < QUICK_MOVE_BOOKS;
     try {
       state.plan = action.kind === "move" ? await api.planMoveBooks(action.ids, action.folder) : await api.planRenameFolder(action.from, action.to);
       state.phase = state.plan.books === 0 ? "idle" : "confirm";
       if (state.plan.books === 0) state.error = state.plan.skipped[0]?.reason ?? "Nothing to move: the books are already there.";
+      if (state.quiet && state.plan.books > 0 && isQuickMove(state.plan)) {
+        state.quick = true;
+        const ran = await run();
+        // A failure, or books that could not be moved, is for the dialog to show.
+        state.quiet = false;
+        if (!ran || (state.report?.failed.length ?? 0) > 0) state.quick = false;
+        return ran;
+      }
+      state.quiet = false;
       return state.plan.books > 0;
     } catch (e) {
       state.plan = null;
       state.phase = "idle";
+      state.quiet = false;
       state.error = e instanceof Error ? e.message : String(e);
       return false;
     }

@@ -167,7 +167,9 @@ export function describeUndo(r: RetitleUndoReport): string {
 export function createRetitleController(api: RetitleApi = realApi) {
   const state = reactive({
     scope: "all" as RetitleScopeKind,
-    embed: true,
+    // Off by default: writing the title into a file changes its bytes, so its hash,
+    // and so no longer matches the copy on the NAS or an identical-files duplicate check.
+    embed: false,
     renameFiles: true,
     renameTemplate: DEFAULT_RETITLE_TEMPLATE,
     phase: "idle" as RetitlePhase,

@@ -157,12 +157,17 @@ describe("the controller", () => {
         { book_id: 1, expected_title: "Untitled", title: "Dragon Lore (edited)" },
         { book_id: 2, expected_title: "Scan", title: "Typed by hand" },
       ],
-      { embed: true, renameFiles: true, renameTemplate: "{title}" },
+      { embed: false, renameFiles: true, renameTemplate: "{title}" },
       expect.anything(),
     );
     expect(c.state.phase).toBe("done");
     expect(c.state.rows).toEqual([]);
     expect(c.state.runs.map((x) => x.run_id)).toEqual(["r0"]);
+  });
+
+  it("does not write titles into the files unless asked: that changes their hashes", () => {
+    const c = createRetitleController(fakeApi());
+    expect(c.state.embed).toBe(false);
   });
 
   it("passes the options the user chose", async () => {

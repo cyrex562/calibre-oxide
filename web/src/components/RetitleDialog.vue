@@ -80,6 +80,8 @@ function cancelRun() {
       <label title="Rewrites each book file (PDF, EPUB, …) so its own metadata carries the title. The file's contents change, so its checksum does too; an undo writes the old title back, but the bytes will not be identical to before."
         ><input v-model="state.embed" type="checkbox" data-testid="embed" /> Write the title into the files</label
       >
+      <span v-if="state.embed" class="hint" role="note" data-testid="embed-warning">Rewrites the files, so each one gets a new checksum: it will no longer match the copy on your NAS, and "identical files" duplicate detection will not see it as the same file.</span>
+      <span v-else class="hint" data-testid="embed-note">Off: only the library's title changes; your files are not touched, so their checksums stay the same.</span>
       <label><input v-model="state.renameFiles" type="checkbox" data-testid="rename" /> Rename files</label>
       <input v-if="state.renameFiles" v-model="state.renameTemplate" type="text" spellcheck="false" aria-label="File name template" data-testid="template" />
       <span v-if="state.renameFiles" class="hint">A template such as {title} or {title} - {authors}. A name already taken gets a number.</span>

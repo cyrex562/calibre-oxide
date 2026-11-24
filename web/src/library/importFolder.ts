@@ -14,6 +14,8 @@ export interface ImportFolderRequest {
   mode: ImportMode;
   policy: DuplicatePolicy;
   recursive: boolean;
+  /** Put each book in the folder it came from, instead of calibre's Author/Title (id). */
+  keep_structure: boolean;
 }
 
 export interface Choice<T extends string> {
@@ -58,10 +60,25 @@ export const DUPLICATE_POLICIES: Choice<DuplicatePolicy>[] = [
   },
 ];
 
+/** Where the copies are put. What each produces is spelled out for the dialog. */
+export const IMPORT_LAYOUTS: { keep: boolean; label: string; help: string }[] = [
+  {
+    keep: false,
+    label: "Author / Title (calibre's layout)",
+    help: "Each book becomes its own folder: Author/Title (id)/Title - Author.pdf. Your source folders are not kept, but the library can find and sort every book from its metadata.",
+  },
+  {
+    keep: true,
+    label: "Keep my folders",
+    help: "Each book is copied to the same place under the library: Fiction/SciFi/Dune.pdf in the source becomes Fiction/SciFi/Dune.pdf here. A name already taken gets a number, and nothing is replaced. Organize can still re-file them later.",
+  },
+];
+
 export const DEFAULT_IMPORT = {
   mode: "multiple_books_per_folder" as ImportMode,
   policy: "skip_exact_content" as DuplicatePolicy,
   recursive: true,
+  keepStructure: false,
 };
 
 /**
@@ -77,7 +94,7 @@ export function validateSource(path: string): string | null {
 }
 
 export function importBody(req: ImportFolderRequest): ImportFolderRequest {
-  return { source: req.source.trim(), mode: req.mode, policy: req.policy, recursive: req.recursive };
+  return { source: req.source.trim(), mode: req.mode, policy: req.policy, recursive: req.recursive, keep_structure: req.keep_structure };
 }
 
 export interface ImportProblem {

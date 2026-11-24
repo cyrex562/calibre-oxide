@@ -70,8 +70,11 @@ fn setters_round_trip_through_getters_for_every_standard_field() {
 
     db.set_title(id, "New Title").unwrap();
     db.set_title_sort(id, "Title, New").unwrap();
-    db.set_author_sort(id, "Doe, Jane").unwrap();
+    // Authors first: setting them re-derives author_sort (as calibre does), so
+    // an explicit author_sort has to come after to be the one kept.
     db.set_authors(id, "Jane Doe & John Roe").unwrap();
+    assert_eq!(db.author_sort(id, true), Some("Doe, Jane & Roe, John".to_string()));
+    db.set_author_sort(id, "Doe, Jane").unwrap();
     db.set_comment(id, "Great read").unwrap();
     db.set_has_cover(id, true).unwrap();
     db.set_identifiers(id, "isbn:1234567890,doi:abc").unwrap();

@@ -11,6 +11,10 @@
 //!   `skip_title_author`, `add_formats_to_existing` (calibre's "automerge")
 //!   or `add_anyway`.
 //! - `recursive` -- descend into subfolders (default true).
+//! - `keep_structure` -- put each book where it was in the source
+//!   (`<library>/<folder in source>/<file>`) instead of calibre's
+//!   `Author/Title (id)/Title - Author.ext` (default false). A name already
+//!   taken gets a number; nothing is replaced.
 //!
 //! Answers `202` with the job's id; progress, cancel and the final report are
 //! on `/library-jobs/{id}` ([`crate::library_jobs`]). A rerun on the same
@@ -41,6 +45,9 @@ pub struct ImportBody {
     pub policy: DuplicatePolicy,
     #[serde(default = "default_true")]
     pub recursive: bool,
+    /// Keep the source's folder structure instead of calibre's .
+    #[serde(default)]
+    pub keep_structure: bool,
 }
 
 fn default_true() -> bool {
@@ -64,7 +71,7 @@ pub async fn import(State(state): State<AppState>, Path(library_id): Path<String
             return Err(ServerError::BadRequest("that folder is inside the library already; scan the library to add the books in it".to_string()));
         }
     }
-    let options = ImportOptions { mode: body.mode, policy: body.policy, recursive: body.recursive };
+    let options = ImportOptions { mode: body.mode, policy: body.policy, recursive: body.recursive, keep_structure: body.keep_structure };
     let params = JobParams { import: Some((source, options)), ..Default::default() };
     Ok(match library_jobs::start_with(cache, JobKind::Import, None, params) {
         Started::New(job) => (StatusCode::ACCEPTED, Json(json!({"job_id": job.id, "kind": "import", "state": "running", "already_running": false, "status_url": format!("/library-jobs/{}", job.id)}))).into_response(),

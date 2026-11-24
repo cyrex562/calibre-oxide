@@ -550,6 +550,10 @@ async fn set_fields_handle(state: AppState, book_id: i32, library_id: Option<Str
         };
         field_updates.push((field.clone(), string_value));
     }
+    // An explicit `author_sort` is written after `authors`, which re-derives it:
+    // the request is a map, so its own order says nothing ("author_sort" sorts
+    // before "authors").
+    field_updates.sort_by_key(|(field, _)| field == "author_sort");
     if !field_updates.is_empty() {
         tokio::task::spawn_blocking({
             let cache = cache.clone();

@@ -101,14 +101,59 @@ pub fn humanize_stem(stem: &str) -> String {
 /// The clean title to suggest for a book, if there is one: the cleaned
 /// embedded title when it differs from the current one, else the first usable
 /// humanised file stem (stems are tried in the order given).
-pub fn suggest_title(current_title: &str, stems: &[String]) -> Option<String> {
+///
+/// A library names a book's file `Title - Author`, so a stem read back from it
+/// carries the author the library put there ("book_6 - Unknown" for a book
+/// with no author at all). [`strip_author_suffix`] takes that off before the
+/// stem is humanised, and a candidate that still names the placeholder author,
+/// or is only an internal file name (`book_6`), is never suggested: a worse
+/// title than the one the book has is not a suggestion.
+pub fn suggest_title(current_title: &str, stems: &[String], authors: &[String]) -> Option<String> {
     let current = current_title.trim();
     if let Some(cleaned) = clean_title(current) {
-        if cleaned != current {
+        if cleaned != current && is_usable_suggestion(&cleaned) {
             return Some(cleaned);
         }
     }
-    stems.iter().map(|s| humanize_stem(s)).find(|h| !h.is_empty() && !is_junk_title(h) && !h.eq_ignore_ascii_case(current))
+    stems.iter().map(|s| humanize_stem(&strip_author_suffix(s, authors))).find(|h| !h.is_empty() && !is_junk_title(h) && is_usable_suggestion(h) && !h.eq_ignore_ascii_case(current))
+}
+
+/// `Title - Author` back to `Title`, for each of `authors` and the placeholder
+/// "Unknown" the library files an author-less book under. Repeated, since a
+/// book with two authors may carry both.
+pub fn strip_author_suffix(stem: &str, authors: &[String]) -> String {
+    let mut s = stem.trim().to_string();
+    // Each author alone, and all of them as the library's own `A & B` joins them.
+    let joined = authors.iter().map(|a| a.trim()).filter(|a| !a.is_empty()).collect::<Vec<_>>().join(" & ");
+    let tails: Vec<&str> = std::iter::once(joined.as_str()).chain(authors.iter().map(String::as_str)).chain(std::iter::once("Unknown")).map(str::trim).filter(|a| !a.is_empty()).collect();
+    loop {
+        let lower = s.to_lowercase();
+        let hit = tails.iter().find_map(|a| {
+            let tail = format!(" - {}", a.to_lowercase());
+            lower.ends_with(&tail).then(|| s.len() - tail.len())
+        });
+        match hit {
+            Some(cut) if cut > 0 && s.is_char_boundary(cut) => s.truncate(cut),
+            _ => break,
+        }
+        s = s.trim_end().to_string();
+    }
+    s
+}
+
+lazy_static! {
+    /// The name the library itself gave a book on import: `book_6`, `file 12`, `scan0001`.
+    static ref INTERNAL_NAME: Regex = Regex::new(r"(?i)^(book|file|scan|doc|document|img|image|page|untitled|new)[\s_-]*\d*$").unwrap();
+    /// The placeholder author as a title part ("x - Unknown", "Unknown - x", just "Unknown"),
+    /// which is not the same as a real title containing the word ("The Unknown Soldier").
+    static ref UNKNOWN_WORD: Regex = Regex::new(r"(?i)(^unknown$|\s-\s*unknown\b|\bunknown\s*-\s)").unwrap();
+}
+
+/// Whether a candidate title is worth offering at all: it does not name the
+/// placeholder author and is not just an internal file name.
+fn is_usable_suggestion(candidate: &str) -> bool {
+    let c = candidate.trim();
+    !UNKNOWN_WORD.is_match(c) && !INTERNAL_NAME.is_match(c)
 }
 
 /// Whether a suggested title reads like a title rather than a code.
@@ -191,7 +236,7 @@ pub fn suggest(cache: &Cache, scope: &Scope, rename_template: &str) -> Result<Su
         stems.dedup();
         let (reason, suggested) = match status {
             Reason::Ok => (Reason::Ok, record.title.clone()),
-            _ => match suggest_title(&record.title, &stems) {
+            _ => match suggest_title(&record.title, &stems, &record.authors) {
                 Some(t) => (status, t),
                 None => (Reason::NoSuggestion, String::new()),
             },
@@ -595,28 +640,47 @@ mod tests {
 
     #[test]
     fn a_junk_title_gets_its_file_stem() {
-        assert_eq!(suggest_title("Untitled", &stems_of(&["Dragon_Lore (1)"])).as_deref(), Some("Dragon Lore"));
-        assert_eq!(suggest_title("ACDSee 32 print job", &stems_of(&["Boiler_Manual"])).as_deref(), Some("Boiler Manual"));
+        assert_eq!(suggest_title("Untitled", &stems_of(&["Dragon_Lore (1)"]), &[]).as_deref(), Some("Dragon Lore"));
+        assert_eq!(suggest_title("ACDSee 32 print job", &stems_of(&["Boiler_Manual"]), &[]).as_deref(), Some("Boiler Manual"));
     }
 
     #[test]
     fn a_word_prefix_is_cleaned_instead_of_using_the_file_name() {
-        assert_eq!(suggest_title("Microsoft Word - Dragon Lore.doc", &stems_of(&["scan0001"])).as_deref(), Some("Dragon Lore"));
+        assert_eq!(suggest_title("Microsoft Word - Dragon Lore.doc", &stems_of(&["scan0001"]), &[]).as_deref(), Some("Dragon Lore"));
     }
 
     #[test]
     fn with_no_usable_stem_there_is_no_suggestion() {
-        assert_eq!(suggest_title("Untitled", &stems_of(&["Document1"])), None);
-        assert_eq!(suggest_title("Untitled", &stems_of(&["untitled"])), None);
-        assert_eq!(suggest_title("Untitled", &[]), None);
+        assert_eq!(suggest_title("Untitled", &stems_of(&["Document1"]), &[]), None);
+        assert_eq!(suggest_title("Untitled", &stems_of(&["untitled"]), &[]), None);
+        assert_eq!(suggest_title("Untitled", &[], &[]), None);
         // A stem that is only a copy counter or an extension is empty.
-        assert_eq!(suggest_title("Untitled", &stems_of(&["(1)"])), None);
+        assert_eq!(suggest_title("Untitled", &stems_of(&["(1)"]), &[]), None);
     }
 
     #[test]
     fn the_first_usable_stem_wins_and_one_equal_to_the_title_is_no_help() {
-        assert_eq!(suggest_title("Untitled", &stems_of(&["Document1", "Real Name"])).as_deref(), Some("Real Name"));
-        assert_eq!(suggest_title("Some Title", &stems_of(&["Some_Title"])), None);
+        assert_eq!(suggest_title("Untitled", &stems_of(&["Document1", "Real Name"]), &[]).as_deref(), Some("Real Name"));
+        assert_eq!(suggest_title("Some Title", &stems_of(&["Some_Title"]), &[]), None);
+    }
+
+    #[test]
+    fn the_author_the_library_put_in_the_file_name_is_not_part_of_the_suggestion() {
+        // "book_6 - Unknown" is what the library names an author-less book's file.
+        assert_eq!(suggest_title("Untitled", &stems_of(&["book_6 - Unknown"]), &[]), None, "an internal name is not a title");
+        assert_eq!(suggest_title("Untitled", &stems_of(&["Dragon_Lore - Unknown"]), &[]).as_deref(), Some("Dragon Lore"));
+        let authors = vec!["Jane Doe".to_string(), "John Smith".to_string()];
+        assert_eq!(suggest_title("Untitled", &stems_of(&["Dragon_Lore - Jane Doe & John Smith"]), &authors).as_deref(), Some("Dragon Lore"), "both authors, joined the way the library joins them");
+        assert_eq!(suggest_title("Untitled", &stems_of(&["Dragon_Lore - Jane Doe - John Smith"]), &authors).as_deref(), Some("Dragon Lore"));
+        assert_eq!(strip_author_suffix("Dune - frank herbert", &["Frank Herbert".to_string()]), "Dune");
+        // Never a title that is the placeholder, or ends in it by another route.
+        assert_eq!(suggest_title("Untitled", &stems_of(&["Unknown"]), &[]), None);
+        assert_eq!(suggest_title("Untitled", &stems_of(&["Dragon Lore - UNKNOWN"]), &[]).as_deref(), Some("Dragon Lore"));
+        // A real title that merely contains the word is fine.
+        assert_eq!(suggest_title("Untitled", &stems_of(&["The Unknown Soldier"]), &[]).as_deref(), Some("The Unknown Soldier"));
+        for internal in ["book_6", "Book 12", "file_3", "scan0001", "img 04"] {
+            assert_eq!(suggest_title("Untitled", &stems_of(&[internal]), &[]), None, "{internal}");
+        }
     }
 
     // --- the suggestion pass --------------------------------------------
@@ -685,6 +749,19 @@ mod tests {
             add(dir4.path(), &cache4, stem, leftover, false);
         }
         assert_eq!(all(&cache4).total, 0);
+    }
+
+    #[test]
+    fn a_book_filed_as_title_dash_unknown_never_gets_that_as_its_suggestion() {
+        let (dir, cache) = library();
+        let internal = add(dir.path(), &cache, "book_6 - Unknown", "Untitled", false);
+        let named = add(dir.path(), &cache, "Dragon_Lore - Unknown", "Untitled", false);
+        let s = all(&cache);
+        let by_id: HashMap<i32, &SuggestedRow> = s.rows.iter().map(|r| (r.book_id, r)).collect();
+        assert_eq!(by_id[&internal].reason, Reason::NoSuggestion, "{:?}", by_id[&internal]);
+        assert_eq!(by_id[&internal].suggested_title, "");
+        assert_eq!(by_id[&named].suggested_title, "Dragon Lore");
+        assert!(s.rows.iter().all(|r| !r.suggested_title.to_lowercase().contains("unknown")), "{:?}", s.rows);
     }
 
     #[test]

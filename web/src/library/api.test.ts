@@ -1157,12 +1157,12 @@ describe("importFolder", () => {
     vi.stubGlobal("fetch", fetchMock);
     const phases: string[] = [];
 
-    const result = await importFolder({ source: " /books ", mode: "one_book_per_folder", policy: "add_anyway", recursive: false }, { intervalMs: 0, onProgress: (j) => phases.push(j.progress.phase) });
+    const result = await importFolder({ source: " /books ", mode: "one_book_per_folder", policy: "add_anyway", recursive: false, keep_structure: false }, { intervalMs: 0, onProgress: (j) => phases.push(j.progress.phase) });
 
     expect(fetchMock).toHaveBeenNthCalledWith(1, "/import-folder/-", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ source: "/books", mode: "one_book_per_folder", policy: "add_anyway", recursive: false }),
+      body: JSON.stringify({ source: "/books", mode: "one_book_per_folder", policy: "add_anyway", recursive: false, keep_structure: false }),
     });
     expect(phases).toEqual(["importing", "indexing"]);
     expect(result).toEqual(report);
@@ -1170,7 +1170,7 @@ describe("importFolder", () => {
 
   it("carries the server's reason when it refuses to start", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 400, statusText: "Bad Request", text: async () => "that folder is inside the library already; scan the library to add the books in it" }));
-    await expect(importFolder({ source: "/lib/x", mode: "multiple_books_per_folder", policy: "skip_exact_content", recursive: true })).rejects.toThrow(/400 Bad Request — that folder is inside the library already/);
+    await expect(importFolder({ source: "/lib/x", mode: "multiple_books_per_folder", policy: "skip_exact_content", recursive: true, keep_structure: false })).rejects.toThrow(/400 Bad Request — that folder is inside the library already/);
   });
 
   it("describes its progress by files, books and skipped duplicates", () => {

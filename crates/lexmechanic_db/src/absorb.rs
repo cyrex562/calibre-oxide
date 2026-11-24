@@ -633,7 +633,6 @@ fn register_one(tx: &Connection, src: &SourceBook, prefixed: &str, columns: &[(C
     if let Some(sort) = src.sort.as_deref().filter(|s| !s.is_empty()) {
         field("sort", sort.to_string());
     }
-    field("author_sort", src.author_sort.clone().unwrap_or_else(|| first_author.to_string()));
     field("path", prefixed.to_string());
     field("series_index", src.series_index.to_string());
     let (ts, pd): (String, String) = tx.query_row("SELECT timestamp, pubdate FROM books WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))?;
@@ -663,6 +662,9 @@ fn register_one(tx: &Connection, src: &SourceBook, prefixed: &str, columns: &[(C
         names.push("Unknown".to_string());
     }
     field("authors", names.join(" & "));
+    // After `authors`: replaying that re-derives the sort, and the source's
+    // own `author_sort` is the one to keep.
+    field("author_sort", src.author_sort.clone().unwrap_or_else(|| first_author.to_string()));
 
     if let Some((name, sort, link)) = &src.series {
         let sid = intern(tx, "series", "name", name, sort.as_deref(), link, true)?;

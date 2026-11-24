@@ -221,7 +221,7 @@ export function columnsFor(fieldMetadata: Record<string, FieldMetaEntry>, sortab
  * Calibre stores "no date" as year 101, which naively formats as
  * "1/1/101" and looks like corrupt data in a column of real dates.
  */
-function isUndefinedDate(d: Date): boolean {
+export function isUndefinedDate(d: Date): boolean {
   return d.getUTCFullYear() <= 101;
 }
 

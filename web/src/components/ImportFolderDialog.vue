@@ -3,7 +3,8 @@
 //
 // The folder is chosen with the desktop app's own picker (a path on this
 // machine) or typed. Nothing in the source folder is changed: files are
-// copied, verified, and laid out as Author/Title (id). Cancel stops after the
+// copied, verified, and laid out as Author/Title (id) or, if asked, in the
+// folders they came from. Cancel stops after the
 // batch in flight; importing the same folder again carries on where it left
 // off. Choices and wording: ../library/importFolder.ts.
 
@@ -12,7 +13,7 @@ import { computed, onMounted, ref } from "vue";
 
 import { absorbLibrary, cancelLibraryJob, describeJobProgress, fetchAbsorbable, importFolder } from "../library/api";
 import { absorbProblems, describeAbsorb, describeAbsorbable, type AbsorbReport, type AbsorbableLibrary } from "../library/absorb";
-import { DEFAULT_IMPORT, DUPLICATE_POLICIES, IMPORT_MODES, describeImport, importProblems, validateSource, type DuplicatePolicy, type ImportMode, type ImportReport } from "../library/importFolder";
+import { DEFAULT_IMPORT, DUPLICATE_POLICIES, IMPORT_LAYOUTS, IMPORT_MODES, describeImport, importProblems, validateSource, type DuplicatePolicy, type ImportMode, type ImportReport } from "../library/importFolder";
 import { isTauri, tauriInvoke } from "../tauri";
 
 const props = defineProps<{ initialSource?: string }>();
@@ -22,6 +23,8 @@ const source = ref(props.initialSource ?? "");
 const mode = ref<ImportMode>(DEFAULT_IMPORT.mode);
 const policy = ref<DuplicatePolicy>(DEFAULT_IMPORT.policy);
 const recursive = ref(DEFAULT_IMPORT.recursive);
+const keepStructure = ref(DEFAULT_IMPORT.keepStructure);
+const layoutHelp = computed(() => IMPORT_LAYOUTS.find((l) => l.keep === keepStructure.value)?.help ?? "");
 
 const busy = ref(false);
 const jobId = ref<number | null>(null);
@@ -112,7 +115,7 @@ async function start() {
   progress.value = null;
   try {
     report.value = await importFolder(
-      { source: source.value, mode: mode.value, policy: policy.value, recursive: recursive.value },
+      { source: source.value, mode: mode.value, policy: policy.value, recursive: recursive.value, keep_structure: keepStructure.value },
       {
         onStart: (id) => (jobId.value = id),
         onProgress: (job) => (progress.value = describeJobProgress(job.progress)),
@@ -141,7 +144,7 @@ async function cancel() {
 
 <template>
   <Dialog title="Add folder" :busy="busy" size="lg" @close="emit('close')">
-    <p class="hint">Copies the books in a folder into this library, filing each as Author/Title. The folder itself is never changed.</p>
+    <p class="hint">Copies the books in a folder into this library. The folder you pick is only read: nothing in it is moved or changed.</p>
 
     <label class="field">
       Folder
@@ -151,6 +154,15 @@ async function cancel() {
       </span>
     </label>
     <p v-if="problem" class="error" role="alert">{{ problem }}</p>
+
+    <label class="field">
+      Where the copies go
+      <select v-model="keepStructure" :disabled="busy" data-testid="layout">
+        <option v-for="l in IMPORT_LAYOUTS" :key="String(l.keep)" :value="l.keep">{{ l.label }}</option>
+      </select>
+    </label>
+    <p class="hint" data-testid="layout-help">{{ layoutHelp }}</p>
+    <p class="hint">Already have the files where you want them? Open that folder as the library instead, and use Check library to add what is in it, in place.</p>
 
     <label class="field">
       Look inside folders
