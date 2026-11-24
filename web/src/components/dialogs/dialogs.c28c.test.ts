@@ -11,6 +11,7 @@ import MergeBooksDialog from "./MergeBooksDialog.vue";
 
 const api = vi.hoisted(() => ({
   checkLibrary: vi.fn(),
+  cancelLibraryJob: vi.fn(async () => ({})),
   fetchOrphans: vi.fn(),
   fetchIgnored: vi.fn(),
   fetchCustomColumns: vi.fn(),
@@ -78,6 +79,67 @@ describe("Check library", () => {
     expect(shown).toHaveBeenCalledWith(30);
     expect(document.body.textContent).toContain("stray notes.txt");
     expect(document.body.textContent).not.toMatch(/—\s*Tech\/stray/);
+  });
+});
+
+describe("Check library as a job", () => {
+  /** A check the test finishes by hand. */
+  function pendingCheck() {
+    let finish: (v: unknown) => void = () => {};
+    let progress: ((job: unknown) => void) | undefined;
+    let started: ((id: number) => void) | undefined;
+    api.checkLibrary.mockImplementation((handlers: { onStart?: (id: number) => void; onProgress?: (job: unknown) => void }) => {
+      started = handlers.onStart;
+      progress = handlers.onProgress;
+      return new Promise((resolve) => (finish = resolve));
+    });
+    return { finish: (v: unknown) => finish(v), progress: (job: unknown) => progress?.(job), started: (id: number) => started?.(id) };
+  }
+
+  it("shows how far the check has got, and Cancel stops that job", async () => {
+    api.fetchOrphans.mockResolvedValue([]);
+    api.fetchIgnored.mockResolvedValue([]);
+    const check = pendingCheck();
+    await mount(CheckLibraryDialog, { open: true });
+    expect(document.body.querySelector("[data-testid=check-progress]")!.textContent).toContain("Scanning");
+
+    check.started(41);
+    check.progress({ progress: { phase: "walking", seen: 12345, total: 0 } });
+    await settle();
+    expect(document.body.querySelector("[data-testid=check-progress]")!.textContent).toContain("12,345 files so far");
+
+    document.body.querySelector<HTMLButtonElement>("[data-testid=check-cancel]")!.click();
+    await settle();
+    expect(api.cancelLibraryJob).toHaveBeenCalledWith(41);
+
+    check.finish({ cancelled: true, conclusive: false });
+    await settle();
+    expect(document.body.querySelector("[role=dialog]")!.textContent).toContain("The check was stopped");
+    expect(document.body.querySelector("[data-testid=check-progress]")).toBeNull();
+  });
+
+  it("opening the dialog again while a check runs follows it instead of starting another", async () => {
+    api.fetchOrphans.mockResolvedValue([]);
+    api.fetchIgnored.mockResolvedValue([]);
+    const check = pendingCheck();
+    const open = ref(true);
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    app = createApp({ setup: () => () => h(CheckLibraryDialog, { open: open.value }) });
+    app.mount(host);
+    await settle();
+    expect(api.checkLibrary).toHaveBeenCalledTimes(1);
+
+    open.value = false;
+    await settle();
+    open.value = true;
+    await settle();
+    expect(api.checkLibrary).toHaveBeenCalledTimes(1);
+    expect(document.body.querySelector("[data-testid=check-progress]")).not.toBeNull();
+
+    check.finish({ conclusive: true });
+    await settle();
+    expect(document.body.querySelector("[role=dialog]")!.textContent).toContain("No problems found.");
   });
 });
 

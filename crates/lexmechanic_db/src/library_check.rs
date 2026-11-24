@@ -103,10 +103,39 @@ impl LibraryCheck {
 
 /// Runs a full check.
 pub fn check(cache: &Cache) -> Result<LibraryCheck> {
+    Ok(check_controlled(cache, &crate::scan_pipeline::JobControl::default())?.unwrap_or_default())
+}
+
+/// [`check`] as a job: reports progress on `control` and stops when it is
+/// cancelled (`Ok(None)`).
+///
+/// The walk reads names, sizes and mtimes only, which a directory listing
+/// carries for free. Opening every file to read its identity, as the default
+/// walk does on Windows, cost about 5 ms per file on a scanned disk, so a
+/// 70,000 file library took nine minutes to check; here a file is opened only
+/// when it is a candidate (its size changed, or it is missing or extra).
+pub fn check_controlled(cache: &Cache, control: &crate::scan_pipeline::JobControl) -> Result<Option<LibraryCheck>> {
     let library = cache.backend.library_path.clone();
-    let scanned = scan::walk(&library, &ScanOptions::default(), std::time::SystemTime::now())?;
+    control.set_phase("walking");
+    let began = std::time::Instant::now();
+    let scanned = scan::walk_controlled(&library, &ScanOptions { lazy_identity: true, ..ScanOptions::default() }, std::time::SystemTime::now(), Some(control))?;
+    control.add_time("walk", began.elapsed());
+    if control.is_cancelled() {
+        return Ok(None);
+    }
+    control.set_phase("comparing");
+    control.total.store(scanned.files.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    let began = std::time::Instant::now();
     let drifted = drift::detect(cache, &scanned)?;
-    Ok(assemble(cache, &scanned, &drifted))
+    control.add_time("drift", began.elapsed());
+    if control.is_cancelled() {
+        return Ok(None);
+    }
+    control.set_phase("assembling");
+    let began = std::time::Instant::now();
+    let check = assemble(cache, &scanned, &drifted);
+    control.add_time("assemble", began.elapsed());
+    Ok(Some(check))
 }
 
 /// Builds the report from an already-computed scan and drift.
@@ -151,13 +180,27 @@ pub fn assemble(cache: &Cache, scanned: &ScanReport, drifted: &DriftReport) -> L
     // cover file with `has_cover` unset -- is not checked, because a
     // cover now lives in the state directory under the book's uuid and
     // cannot be there without having been written for that book.
-    if let Ok(ids) = cache.all_book_ids() {
-        for book_id in ids {
-            if cache.has_cover(book_id).unwrap_or(false) {
-                let exists = crate::covers::cover_path(cache, book_id).map(|p| p.is_file()).unwrap_or(false);
-                if !exists {
-                    check.missing_covers.push(Finding { book_id: Some(book_id), title: title_of(book_id), path: "cover".to_string() });
-                }
+    //
+    // One query for the books with a cover and one listing of the covers folder,
+    // instead of a query, a lookup of the book's folder and one or two `stat`s per
+    // book: a file is looked for on disk only when its cover is not in the listing
+    // (a cover still beside its book, from before covers moved to the state folder).
+    let with_cover: Vec<i32> = {
+        let conn = cache.backend.conn.lock().unwrap();
+        conn.prepare("SELECT id FROM books WHERE has_cover != 0 ORDER BY id").and_then(|mut stmt| stmt.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<Vec<i32>>>()).unwrap_or_default()
+    };
+    if !with_cover.is_empty() {
+        let listed: std::collections::HashSet<String> = std::fs::read_dir(cache.backend.library_path.join(crate::constants::LIBRARY_HANDLE_DIR_NAME).join("covers"))
+            .map(|entries| entries.flatten().filter_map(|e| e.file_name().to_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        for book_id in with_cover {
+            let sidecar = cache.book_uuid(book_id).ok().flatten().filter(|u| !u.is_empty()).map(|u| format!("{u}.jpg"));
+            if sidecar.is_some_and(|name| listed.contains(&name)) {
+                continue;
+            }
+            let exists = crate::covers::cover_path(cache, book_id).map(|p| p.is_file()).unwrap_or(false);
+            if !exists {
+                check.missing_covers.push(Finding { book_id: Some(book_id), title: title_of(book_id), path: "cover".to_string() });
             }
         }
     }

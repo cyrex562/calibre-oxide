@@ -1,8 +1,10 @@
 <script setup lang="ts">
 // Check library (issue #748) -- a real integrity scan, see
-// crates/lexmechanic_srv/src/check_library.rs's own doc. It stays mounted while
-// closed so a scan the user started keeps its progress and Cancel if the dialog
-// is closed and opened again; opening it runs the check afresh.
+// crates/lexmechanic_srv/src/check_library.rs's own doc. The check is a library
+// job (a big library takes minutes to walk): this follows it, shows how far it
+// has got and offers Cancel. It stays mounted while closed, so a check the user
+// started keeps its progress and Cancel if the dialog is closed and opened
+// again; opening it while one runs follows that one, and otherwise starts afresh.
 
 import { computed, ref, watch } from "vue";
 
@@ -23,6 +25,10 @@ const emit = defineEmits<{
 }>();
 
 const checkLibraryLoading = ref(false);
+/** Live progress line while the check job runs, and the id Cancel acts on. */
+const checkProgress = ref<string | null>(null);
+const checkJobId = ref<number | null>(null);
+const checkCancelled = ref(false);
 const checkLibraryError = ref<string | null>(null);
 const checkLibraryResult = ref<CheckLibraryResult | null>(null);
 
@@ -51,6 +57,16 @@ const rescanSummary = ref<string | null>(null);
 /** Live progress line while the scan job runs, and the id Cancel acts on. */
 const rescanProgress = ref<string | null>(null);
 const rescanJobId = ref<number | null>(null);
+
+/** Stops the running check. It only reads, so nothing is left half-done. */
+async function cancelCheck() {
+  if (checkJobId.value === null) return;
+  try {
+    await cancelLibraryJob(checkJobId.value);
+  } catch (e) {
+    checkLibraryError.value = e instanceof Error ? e.message : String(e);
+  }
+}
 
 /** Stops the running scan. It keeps what it has added; scanning again continues. */
 async function cancelRescan() {
@@ -95,7 +111,7 @@ async function rescanLibraryFolder() {
     if (!result.conclusive) parts.push("a folder could not be read, so this is partial");
     rescanSummary.value = parts.length > 0 ? parts.join(" · ") : "Nothing to add.";
     emit("changed");
-    checkLibraryResult.value = await checkLibrary();
+    await runCheck();
   } catch (e) {
     checkLibraryError.value = e instanceof Error ? e.message : String(e);
   } finally {
@@ -165,7 +181,7 @@ async function resolveOrphan(orphan: Orphan, action: () => Promise<string | null
     orphanMessage.value = await action();
     await loadOrphanState();
     emit("changed");
-    checkLibraryResult.value = await checkLibrary();
+    await runCheck();
   } catch (e) {
     orphanMessage.value = e instanceof Error ? e.message : String(e);
   } finally {
@@ -214,16 +230,28 @@ async function unignore(file: IgnoredFile) {
 }
 
 async function runCheck() {
+  // One at a time: the dialog being opened again while a check runs follows that one.
+  if (checkLibraryLoading.value) return;
   checkLibraryError.value = null;
   checkLibraryLoading.value = true;
+  checkCancelled.value = false;
+  checkProgress.value = null;
   checkLibraryResult.value = null;
   try {
-    checkLibraryResult.value = await checkLibrary();
+    const result = await checkLibrary({
+      onStart: (id) => (checkJobId.value = id),
+      onProgress: (job) => (checkProgress.value = describeJobProgress(job.progress)),
+    });
+    // A cancelled check concluded nothing, so there is nothing to show but that.
+    if (result.cancelled === true) checkCancelled.value = true;
+    else checkLibraryResult.value = result;
     await loadOrphanState();
   } catch (e) {
     checkLibraryError.value = e instanceof Error ? e.message : String(e);
   } finally {
     checkLibraryLoading.value = false;
+    checkProgress.value = null;
+    checkJobId.value = null;
   }
 }
 watch(
@@ -238,8 +266,14 @@ watch(
 <template>
     <Dialog :open="open" title="Check library" show-close size="lg" @close="emit('close')">
       <section>
-        <p v-if="checkLibraryLoading">Scanning…</p>
+        <template v-if="checkLibraryLoading">
+          <p role="status" data-testid="check-progress">{{ checkProgress ?? "Scanning…" }}</p>
+          <div class="plugin-actions">
+            <button type="button" data-testid="check-cancel" @click="cancelCheck">Cancel</button>
+          </div>
+        </template>
         <p v-else-if="checkLibraryError" class="error">{{ checkLibraryError }}</p>
+        <p v-else-if="checkCancelled" class="news-hint">The check was stopped. Check again to run it.</p>
         <template v-else-if="checkLibraryResult">
           <!--
             An incomplete scan computes no missing-file list at all, so

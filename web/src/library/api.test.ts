@@ -681,15 +681,55 @@ describe("renameCategoryItem", () => {
 });
 
 describe("checkLibrary", () => {
-  it("posts to the real single-library route and returns the parsed result", async () => {
-    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ invalid_authors: [{ a: "junk.bin", b: "junk.bin", book_id: 0 }], extra_formats: [] }) });
+  const report = { invalid_authors: [{ a: "junk.bin", b: "junk.bin", book_id: 0 }], extra_formats: [] };
+  const jobBody = (state: string, extra: object = {}) => ({ ok: true, json: async () => ({ job_id: 7, id: 7, kind: "check_library", state, progress: { phase: "walking", seen: 12, total: 0 }, ...extra }) });
+
+  it("starts the check as a job, follows it, and returns its report", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(jobBody("running")).mockResolvedValueOnce(jobBody("running")).mockResolvedValueOnce(jobBody("finished", { report }));
     vi.stubGlobal("fetch", fetchMock);
+    const seen: string[] = [];
+    let started = 0;
 
-    const result = await checkLibrary();
+    const result = await checkLibrary({ intervalMs: 1, onStart: (id) => (started = id), onProgress: (job) => seen.push(job.state) });
 
-    expect(fetchMock).toHaveBeenCalledWith("/check-library/default", { method: "POST" });
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/check-library/default", { method: "POST" });
+    expect(fetchMock.mock.calls[1][0]).toBe("/library-jobs/7");
+    expect(started).toBe(7);
+    expect(seen).toEqual(["running", "finished"]);
     expect(result.invalid_authors).toHaveLength(1);
     expect(result.extra_formats).toEqual([]);
+  });
+
+  it("rejects with the job's own error when it fails", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(jobBody("running")).mockResolvedValueOnce(jobBody("failed", { error: "the library folder is gone" })));
+    await expect(checkLibrary({ intervalMs: 1 })).rejects.toThrow("the library folder is gone");
+  });
+
+  it("hands a cancelled check's report back, saying so", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(jobBody("running")).mockResolvedValueOnce(jobBody("cancelled", { report: { cancelled: true, conclusive: false } })));
+    expect((await checkLibrary({ intervalMs: 1 })).cancelled).toBe(true);
+  });
+});
+
+describe("restoring a resolve run", () => {
+  it("is a job whose report is what the route used to answer", async () => {
+    const report = { run_id: "run-1", restored: [{ book_id: 3, title: "T" }], failed: [], needs_rescan: true };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ job_id: 9 }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ id: 9, state: "finished", progress: { phase: "restoring" }, report }) });
+    vi.stubGlobal("fetch", fetchMock);
+    const { restoreResolveRun } = await import("./api");
+
+    const done = await restoreResolveRun("run-1");
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/duplicates/runs/default/run-1/restore", { method: "POST" });
+    expect(done.restored).toHaveLength(1);
+  });
+
+  it("describes the restore's progress", () => {
+    expect(describeJobProgress({ phase: "restoring", seen: 3, total: 10 } as never)).toBe("Putting books back… 3 of 10");
+    expect(describeJobProgress({ phase: "mirror_listing", seen: 5, total: 50 } as never)).toContain("5 of 50 books");
   });
 });
 

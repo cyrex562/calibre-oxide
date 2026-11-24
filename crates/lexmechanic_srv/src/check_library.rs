@@ -16,10 +16,9 @@
 //! real pre-existing false-positive found and fixed along the way
 //! (WAL-mode SQLite sidecar files were reported as "invalid authors").
 
-use axum::extract::{Path, State};
-use axum::Json;
+use axum::extract::{Path, Query, State};
+use axum::response::Response;
 use serde_json::{json, Value};
-
 
 use crate::errors::ServerError;
 use crate::AppState;
@@ -28,39 +27,54 @@ fn encode(findings: &[lexmechanic_db::library_check::Finding]) -> Value {
     json!(findings.iter().map(|f| json!({"book_id": f.book_id, "title": f.title, "path": f.path})).collect::<Vec<_>>())
 }
 
-/// `POST /check-library/{library_id}`.
-pub async fn check(State(state): State<AppState>, Path(library_id): Path<String>) -> Result<Json<Value>, ServerError> {
-    let cache = state.cache_for(Some(&library_id)).ok_or_else(|| ServerError::NotFound(format!("no library named {library_id:?}")))?;
-
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
-        // `library_check` rather than the `check_library` port (#897).
-        // That port recognised book folders by calibre's `Title (id)`
-        // naming, which this project never produced, and reported every
-        // edited file as a corrupted one -- so half its answers were
-        // unreliable and the other half cried wolf. See its module docs.
-        let check = lexmechanic_db::library_check::check(&cache)?;
-        Ok(json!({
-            "missing_files": encode(&check.missing_files),
-            "untracked_files": encode(&check.untracked_files),
-            "moved_files": encode(&check.moved_files),
-            "changed_files": encode(&check.changed_files),
-            "missing_covers": encode(&check.missing_covers),
-            "unreadable_folders": encode(&check.unreadable_folders),
-            "orphaned_books": encode(&check.orphaned_books),
-            "ignored_files": encode(&check.ignored_files),
-            "nested_libraries": encode(&check.nested_libraries),
-            // Whether the scan saw the whole library. False means
-            // `missing_files` was not computed at all, and the UI has to
-            // say so rather than implying nothing is missing.
-            "conclusive": check.conclusive,
-            "needs_attention": check.needs_attention(),
-        }))
+/// The check's report, in the shape `POST /check-library` has always returned.
+fn report_json(check: &lexmechanic_db::library_check::LibraryCheck) -> Value {
+    json!({
+        "missing_files": encode(&check.missing_files),
+        "untracked_files": encode(&check.untracked_files),
+        "moved_files": encode(&check.moved_files),
+        "changed_files": encode(&check.changed_files),
+        "missing_covers": encode(&check.missing_covers),
+        "unreadable_folders": encode(&check.unreadable_folders),
+        "orphaned_books": encode(&check.orphaned_books),
+        "ignored_files": encode(&check.ignored_files),
+        "nested_libraries": encode(&check.nested_libraries),
+        // Whether the scan saw the whole library. False means
+        // `missing_files` was not computed at all, and the UI has to
+        // say so rather than implying nothing is missing.
+        "conclusive": check.conclusive,
+        "needs_attention": check.needs_attention(),
+        "cancelled": false,
     })
-    .await
-    .map_err(|e| ServerError::InternalServerError(e.to_string()))?
-    .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+}
 
-    Ok(Json(result))
+/// The body of a [`crate::library_jobs::JobKind::CheckLibrary`] job.
+///
+/// `library_check` rather than the `check_library` port (#897). That port
+/// recognised book folders by calibre's `Title (id)` naming, which this
+/// project never produced, and reported every edited file as a corrupted one
+/// -- so half its answers were unreliable and the other half cried wolf. See
+/// its module docs.
+pub fn run_job(cache: &lexmechanic_db::cache::Cache, control: &lexmechanic_db::scan_pipeline::JobControl) -> anyhow::Result<Value> {
+    match lexmechanic_db::library_check::check_controlled(cache, control)? {
+        Some(check) => Ok(report_json(&check)),
+        // Cancelled part-way: nothing was concluded, and the report says so.
+        None => {
+            let mut empty = report_json(&lexmechanic_db::library_check::LibraryCheck::default());
+            empty["cancelled"] = json!(true);
+            Ok(empty)
+        }
+    }
+}
+
+/// `POST /check-library/{library_id}` -- starts the check as a library job (it
+/// walks the whole folder: minutes on a large library, so never one request).
+/// Answers 202 with the job's id; poll `GET /library-jobs/{id}` for progress and
+/// the report, `POST /library-jobs/{id}/cancel` to stop it. `?wait=true` holds
+/// the response until the job ends and answers with the report itself.
+pub async fn check(State(state): State<AppState>, Path(library_id): Path<String>, Query(query): Query<crate::library_jobs::StartQuery>) -> Result<Response, ServerError> {
+    let cache = state.cache_for(Some(&library_id)).ok_or_else(|| ServerError::NotFound(format!("no library named {library_id:?}")))?;
+    Ok(crate::library_jobs::respond(cache, crate::library_jobs::JobKind::CheckLibrary, &query).await)
 }
 
 #[cfg(test)]
@@ -101,10 +115,109 @@ mod tests {
         (status, value)
     }
 
+    async fn get_with(router: &axum::Router, uri: &str, accept_encoding: Option<&str>) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let mut builder = Request::builder().uri(uri);
+        if let Some(enc) = accept_encoding {
+            builder = builder.header("accept-encoding", enc);
+        }
+        let resp = router.clone().oneshot(builder.body(Body::empty()).unwrap()).await.unwrap();
+        let (status, headers) = (resp.status(), resp.headers().clone());
+        (status, headers, to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec())
+    }
+
+    async fn get_json(router: &axum::Router, uri: &str) -> serde_json::Value {
+        serde_json::from_slice(&get_with(router, uri, None).await.2).unwrap_or(serde_json::Value::Null)
+    }
+
+    /// The check is a library job: 202 and an id at once, progress and the report on the job, and the
+    /// job list says there is a report without carrying it.
+    #[tokio::test]
+    async fn the_check_is_a_job_with_a_report_the_list_does_not_carry() {
+        let (dir, router) = test_app();
+        std::fs::write(dir.path().join("dropped in.epub"), b"epub bytes").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        filetime::set_file_mtime(dir.path().join("dropped in.epub"), filetime::FileTime::from_system_time(old)).ok();
+
+        let (status, started) = post_json(&router, "/check-library/default").await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{started}");
+        assert_eq!(started["kind"], "check_library");
+        let url = started["status_url"].as_str().unwrap().to_string();
+        let mut job = serde_json::Value::Null;
+        for _ in 0..400 {
+            job = get_json(&router, &url).await;
+            if job["state"] != "running" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(job["state"], "finished", "{job}");
+        assert!(job["report"]["untracked_files"].as_array().unwrap().iter().any(|v| v["path"] == "dropped in.epub"), "{job}");
+        assert_eq!(job["report"]["cancelled"], false);
+        assert_eq!(job["progress"]["phase"], "assembling");
+        assert!(job["progress"]["timings_ms"]["walk"].is_number(), "{job}");
+
+        let listed = get_json(&router, "/library-jobs").await;
+        let entry = listed["jobs"].as_array().unwrap().iter().find(|j| j["id"] == job["id"]).unwrap();
+        assert!(entry["report"].is_null(), "the list carries no report: {entry}");
+        assert_eq!(entry["has_report"], true);
+        // ...and a request for the reports gets them.
+        let with_reports = get_json(&router, "/library-jobs?reports=true").await;
+        assert!(with_reports["jobs"].as_array().unwrap().iter().any(|j| j["report"]["untracked_files"].is_array()));
+    }
+
+    /// Asking again while a check runs follows it, as for every library job.
+    #[tokio::test]
+    async fn a_second_request_while_one_runs_is_the_same_job() {
+        let (_dir, router) = test_app();
+        let (_, first) = post_json(&router, "/check-library/default").await;
+        let (_, second) = post_json(&router, "/check-library/default").await;
+        // Either the first was already done (a new job) or the second joined it.
+        if second["already_running"] == true {
+            assert_eq!(first["job_id"], second["job_id"]);
+        }
+    }
+
+    /// JSON over a kilobyte is gzipped for a client that takes it, and only then; a small
+    /// answer is left alone.
+    #[tokio::test]
+    async fn big_json_is_gzipped_for_a_client_that_accepts_it() {
+        let (dir, router) = test_app();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        for i in 0..60 {
+            let path = dir.path().join(format!("a rather long file name to make the report big {i:03}.epub"));
+            std::fs::write(&path, format!("epub {i}")).unwrap();
+            filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(old)).ok();
+        }
+        let (status, headers, packed) = {
+            let req = Request::builder().method("POST").uri("/check-library/default?wait=true").header("accept-encoding", "gzip").body(Body::empty()).unwrap();
+            let resp = router.clone().oneshot(req).await.unwrap();
+            let (status, headers) = (resp.status(), resp.headers().clone());
+            (status, headers, to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec())
+        };
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("content-encoding").map(|v| v.to_str().unwrap()), Some("gzip"), "{headers:?}");
+        assert_eq!(&packed[..2], &[0x1f, 0x8b], "a gzip stream");
+
+        // Not asked for: not sent.
+        let (_, plain_headers, plain) = {
+            let req = Request::builder().method("POST").uri("/check-library/default?wait=true").body(Body::empty()).unwrap();
+            let resp = router.clone().oneshot(req).await.unwrap();
+            let headers = resp.headers().clone();
+            (resp.status(), headers, to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec())
+        };
+        assert!(plain_headers.get("content-encoding").is_none());
+        assert!(plain.len() > 1024 && packed.len() < plain.len() / 2, "{} gzipped against {}", packed.len(), plain.len());
+        assert!(serde_json::from_slice::<serde_json::Value>(&plain).is_ok());
+
+        // A small answer is not worth compressing.
+        let (_, small_headers, _) = get_with(&router, "/prepare-library/default", Some("gzip")).await;
+        assert!(small_headers.get("content-encoding").is_none(), "{small_headers:?}");
+    }
+
     #[tokio::test]
     async fn a_real_clean_library_reports_no_findings() {
         let (_dir, router) = test_app();
-        let (status, body) = post_json(&router, "/check-library/default").await;
+        let (status, body) = post_json(&router, "/check-library/default?wait=true").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["missing_files"], serde_json::json!([]));
         assert_eq!(body["untracked_files"], serde_json::json!([]));
@@ -123,7 +236,7 @@ mod tests {
         let (dir, router) = test_app();
         std::fs::write(dir.path().join("not_a_real_calibre_file.bin"), b"junk").unwrap();
 
-        let (status, body) = post_json(&router, "/check-library/default").await;
+        let (status, body) = post_json(&router, "/check-library/default?wait=true").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["untracked_files"], serde_json::json!([]), "{body}");
         assert_eq!(body["needs_attention"], false, "{body}");
@@ -139,7 +252,7 @@ mod tests {
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
         filetime::set_file_mtime(dir.path().join("dropped in.epub"), filetime::FileTime::from_system_time(old)).ok();
 
-        let (status, body) = post_json(&router, "/check-library/default").await;
+        let (status, body) = post_json(&router, "/check-library/default?wait=true").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let untracked = body["untracked_files"].as_array().unwrap();
         assert!(untracked.iter().any(|v| v["path"] == "dropped in.epub"), "{body}");
@@ -175,7 +288,7 @@ mod tests {
         };
         let router = crate::test_router(state);
 
-        let (status, _) = post_json(&router, "/check-library/no-such-library").await;
+        let (status, _) = post_json(&router, "/check-library/no-such-library?wait=true").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }

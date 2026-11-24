@@ -2456,6 +2456,67 @@ fn rename_took_effect(from: &Path, to: &Path, case_only: bool) -> bool {
 /// part of the rename.
 #[cfg(windows)]
 pub(crate) fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    match move_no_replace_windows(&extended_length(from), &extended_length(to)) {
+        // "The system cannot find the path specified" / "...the file": a folder or file
+        // whose name ends in a dot or a space. Windows strips those when it *creates* one, so
+        // the thing on disk has the shorter name; a path spelled with the dot is found only
+        // while Windows is normalising it, and not at all once the path is an extended-length
+        // (`\\?\`) one. Try the spelling the disk has.
+        Err(e) if matches!(e.raw_os_error(), Some(2) | Some(3)) => {
+            let (stripped_from, stripped_to) = (without_trailing_dots(from), without_trailing_dots(to));
+            if stripped_from != from || stripped_to != to {
+                move_no_replace_windows(&extended_length(&stripped_from), &extended_length(&stripped_to)).map_err(|second| if matches!(second.raw_os_error(), Some(2) | Some(3)) { e } else { second })
+            } else {
+                Err(e)
+            }
+        }
+        other => other,
+    }
+}
+
+/// `path` as an extended-length (`\\?\`) path when it is long enough to need it. The
+/// raw Win32 call below (unlike `std::fs`, which does this itself) fails with "cannot
+/// find the path" past 260 characters, which is what a deep `Author/Title/` folder
+/// plus a long file name comes to.
+#[cfg(windows)]
+pub(crate) fn extended_length(path: &Path) -> PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+    if text.len() < 240 || text.starts_with(r"\\?\") || text.starts_with(r"\\.\") {
+        return path.to_path_buf();
+    }
+    match std::path::absolute(path) {
+        Ok(abs) => {
+            let abs = abs.to_string_lossy().into_owned();
+            match abs.strip_prefix(r"\\") {
+                Some(unc) => PathBuf::from(format!(r"\\?\UNC\{unc}")),
+                None => PathBuf::from(format!(r"\\?\{abs}")),
+            }
+        }
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+/// `path` with the trailing dots and spaces of each folder and file name removed, the way
+/// Windows does when it creates one (so the result is the name that exists on disk).
+#[cfg(windows)]
+pub(crate) fn without_trailing_dots(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(name) => {
+                let text = name.to_string_lossy();
+                let trimmed = text.trim_end_matches(['.', ' ']);
+                out.push(if trimmed.is_empty() { name.to_os_string() } else { std::ffi::OsString::from(trimmed) });
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+#[cfg(windows)]
+fn move_no_replace_windows(from: &Path, to: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
 

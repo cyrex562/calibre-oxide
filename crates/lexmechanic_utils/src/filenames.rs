@@ -216,11 +216,17 @@ pub fn samefile(a: &Path, b: &Path) -> bool {
 /// pass. Callers fall back to comparing canonical paths there.
 #[cfg(windows)]
 fn windows_file_identity(path: &Path) -> Option<(u32, u64)> {
+    let file = std::fs::File::open(path).ok()?;
+    windows_file_identity_of(&file)
+}
+
+/// [`windows_file_identity`] for a file that is already open: no second open.
+#[cfg(windows)]
+fn windows_file_identity_of(file: &std::fs::File) -> Option<(u32, u64)> {
     use std::os::windows::io::AsRawHandle;
 
     use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
 
-    let file = std::fs::File::open(path).ok()?;
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     // Safety: `file` owns a live handle for the duration of the call,
     // and `info` is a correctly-sized, writable output buffer.
@@ -305,6 +311,28 @@ pub fn file_facts_from_metadata(path: &Path, metadata: &std::fs::Metadata) -> Op
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_millis() as u64);
     Some(FileFacts { identity: identity_of(path, metadata)?, size: metadata.len(), mtime_ms })
+}
+
+/// The identity of a file that is **already open** (one handle query on
+/// Windows, one `fstat` elsewhere), for a caller that is about to read the
+/// file anyway: opening it a second time just to ask costs milliseconds on a
+/// scanned disk or a share.
+pub fn identity_of_open_file(file: &std::fs::File) -> Option<FileIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata().ok()?;
+        Some(FileIdentity { volume: metadata.dev(), index: metadata.ino() })
+    }
+    #[cfg(windows)]
+    {
+        windows_file_identity_of(file).map(|(volume, index)| FileIdentity { volume: u64::from(volume), index })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        None
+    }
 }
 
 /// Just the identity, for callers that already have the size elsewhere.

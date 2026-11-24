@@ -334,6 +334,23 @@ fn plain_name(name: &str) -> bool {
     !name.is_empty() && !name.contains(['/', '\\']) && name != "." && name != ".." && !name.contains(':')
 }
 
+/// Whether `rel` is a file under `library`. On Windows a folder or file recorded with
+/// a trailing dot or space exists on disk without it (Windows strips them when it
+/// creates one), so that spelling counts too.
+fn file_present(library: &Path, rel: &str) -> bool {
+    let path = library.join(rel);
+    if path.is_file() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        let stripped = crate::library_handle::without_trailing_dots(&path);
+        return stripped != path && stripped.is_file();
+    }
+    #[cfg(not(windows))]
+    false
+}
+
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     let raw = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_slice(&raw).with_context(|| format!("parsing {}", path.display()))
@@ -471,7 +488,7 @@ impl Cache {
     pub(crate) fn move_book_to_trash(&self, mut manifest: BookManifest, sidecar_cover: Option<PathBuf>) -> MoveOutcome {
         let mut outcome = MoveOutcome::default();
         let library = self.backend.library_path.clone();
-        let present: Vec<TrashedFile> = manifest.files.iter().filter(|f| library.join(&f.rel).is_file()).cloned().collect();
+        let present: Vec<TrashedFile> = manifest.files.iter().filter(|f| file_present(&library, &f.rel)).cloned().collect();
         if present.is_empty() {
             // Nothing on disk to keep. The sidecar cover is index state of
             // the deleted book; drop it as before.
@@ -799,14 +816,20 @@ impl Cache {
         }
 
         // Metadata. Each is an ordinary logged write.
-        let mut set = |field: &str, value: &str| {
-            if let Err(e) = self.set_field(book_id, field, value) {
-                log::warn!("restoring \"{}\": could not set {field}: {e:#}", manifest.title);
-            }
-        };
-        for field in RESTORED_FIELDS {
-            if let Some(value) = manifest.fields.get(*field) {
-                set(field, value);
+        // One transaction and one log entry for all of them: one commit and one
+        // log file per field is what made a restore of a run cost a third of a
+        // second per book.
+        let field_changes: Vec<(String, String)> = RESTORED_FIELDS.iter().filter_map(|field| manifest.fields.get(*field).map(|value| ((*field).to_string(), value.clone()))).collect();
+        if !field_changes.is_empty() {
+            if let Some(Err(e)) = self.set_fields_per_book(&[(book_id, field_changes.clone())]).into_iter().next() {
+                // The batch is all-or-nothing for a book: fall back to field by field so one
+                // field the library will not take does not cost the others.
+                log::warn!("restoring \"{}\": could not set its fields together ({e:#}); trying one at a time", manifest.title);
+                for (field, value) in &field_changes {
+                    if let Err(e) = self.set_field(book_id, field, value) {
+                        log::warn!("restoring \"{}\": could not set {field}: {e:#}", manifest.title);
+                    }
+                }
             }
         }
         for (label, value) in &manifest.custom {
@@ -1048,12 +1071,29 @@ impl Cache {
     /// the rest. **This does not undo a merge's changes to the keeper** (formats
     /// copied in, metadata folded in); it only brings the trashed books back.
     pub fn restore_trash_run(&self, run_id: &str) -> Result<RunRestore> {
+        self.restore_trash_run_controlled(run_id, &crate::scan_pipeline::JobControl::default())
+    }
+
+    /// [`Cache::restore_trash_run`] as a job: counts the books on `control` and
+    /// stops between books when it is cancelled (what was restored stays
+    /// restored; the rest stays in the trash for another go).
+    pub fn restore_trash_run_controlled(&self, run_id: &str, control: &crate::scan_pipeline::JobControl) -> Result<RunRestore> {
         let mut out = RunRestore::default();
-        for entry in self.trash_entries_for_run(run_id)? {
+        let entries = self.trash_entries_for_run(run_id)?;
+        control.set_phase("restoring");
+        control.total.store(entries.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        for entry in entries {
+            if control.is_cancelled() {
+                break;
+            }
             match self.restore_trashed_book(&entry.key) {
                 Ok(book) => out.restored.push(book),
-                Err(e) => out.failed.push((entry.key, format!("{e:#}"))),
+                Err(e) => {
+                    control.errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    out.failed.push((entry.key, format!("{e:#}")));
+                }
             }
+            control.seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(out)
     }

@@ -125,11 +125,12 @@ export async function setFields(bookId: number, changes: BookFieldChanges): Prom
  * books that share a change set. A server without the route answers 404 and
  * this throws [`BatchUnsupportedError`] so the caller can go book by book.
  */
-export async function setFieldsBatch(groups: BatchGroup[]): Promise<BatchResponse> {
+export async function setFieldsBatch(groups: BatchGroup[], options: { previous?: boolean } = {}): Promise<BatchResponse> {
   const resp = await fetch("/cdb/set-fields-batch/default", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ groups }),
+    // `previous`: also answer with what the written fields held before, so Undo needs no read of the books.
+    body: JSON.stringify(options.previous ? { groups, previous: true } : { groups }),
   });
   if (resp.status === 404 || resp.status === 405) throw new BatchUnsupportedError();
   if (!resp.ok) throw new Error(`POST /cdb/set-fields-batch failed: ${resp.status} ${resp.statusText}${await failureDetail(resp)}`);
@@ -687,8 +688,14 @@ export const CHECK_LIBRARY_LABELS: Record<string, string> = {
   nested_libraries: "Folders skipped — they are libraries of their own",
 };
 
-export function checkLibrary(): Promise<CheckLibraryResult> {
-  return jsonFetch<CheckLibraryResult>("/check-library/default", { method: "POST" });
+/**
+ * Checks the folder against the library, as a job: walking a big library takes minutes,
+ * so the server answers at once with a job to follow (`handlers.onProgress` sees its
+ * counters, `cancelLibraryJob` stops it). Asking again while one runs follows that one.
+ * The result is the same shape the check always had, plus `cancelled`.
+ */
+export function checkLibrary(handlers: LibraryJobHandlers<CheckLibraryResult> = {}): Promise<CheckLibraryResult> {
+  return runLibraryJob<CheckLibraryResult>("/check-library/default", handlers);
 }
 
 /**
@@ -748,7 +755,7 @@ export interface LibraryJobProgress {
 
 export interface LibraryJob<R = unknown> {
   id: number;
-  kind: "scan" | "enrich" | "hash_backfill" | "pdf_fingerprint" | "merge_exact" | "import" | "dedupe" | "resolve" | "prepare" | "absorb" | "unabsorb" | "copy" | "organize" | "undo_organize" | "retitle" | "undo_retitle" | "mirror";
+  kind: "scan" | "enrich" | "hash_backfill" | "pdf_fingerprint" | "merge_exact" | "import" | "dedupe" | "resolve" | "prepare" | "absorb" | "unabsorb" | "copy" | "organize" | "undo_organize" | "retitle" | "undo_retitle" | "mirror" | "mirror_plan" | "check_library" | "restore_run";
   /** `interrupted`: the server process ended while it ran (read back from `.lexmechanic/jobs.json`). */
   state: "running" | "finished" | "cancelled" | "failed" | "interrupted";
   /** Interrupted and able to continue by itself: POST `/<resume_route>/default`. */
@@ -967,6 +974,18 @@ export function describeJobProgress(p: LibraryJobProgress): string {
       return `Fixing titles… ${n(p.seen)} of ${n(p.total)} books`;
     case "resolving":
       return `Resolving… ${n(p.seen)} of ${n(p.total)} groups`;
+    case "restoring":
+      return `Putting books back… ${n(p.seen)} of ${n(p.total)}`;
+    case "comparing":
+      return `Comparing the folder with the library… ${n(p.total)} files`;
+    case "assembling":
+      return "Writing up what was found…";
+    case "mirror_listing":
+      return `Planning the copy… ${n(p.seen)} of ${n(p.total)} books listed`;
+    case "mirror_reading":
+      return "Planning the copy… reading the databases";
+    case "mirror_comparing":
+      return "Planning the copy… comparing with what is already there";
     default:
       return "Working…";
   }
@@ -1441,9 +1460,21 @@ export function fetchResolveRuns(): Promise<{ runs: ResolveRun[] }> {
   return jsonFetch("/duplicates/runs/default");
 }
 
-/** Puts back every book the run trashed. */
-export function restoreResolveRun(runId: string): Promise<{ run_id: string; restored: { book_id: number; title: string }[]; failed: [string, string][]; needs_rescan: boolean }> {
-  return jsonFetch(`/duplicates/runs/default/${encodeURIComponent(runId)}/restore`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+export interface RestoreRunReport {
+  run_id: string;
+  restored: { book_id: number; title: string }[];
+  failed: [string, string][];
+  needs_rescan: boolean;
+  /** The restore was stopped part-way; what was put back stays, the rest is still in the trash. */
+  cancelled?: boolean;
+}
+
+/**
+ * Puts back every book the run trashed. A run can hold thousands of books, so this is a job:
+ * the promise settles when it ends, and `handlers.onProgress` sees `seen` of `total` books.
+ */
+export function restoreResolveRun(runId: string, handlers: LibraryJobHandlers<RestoreRunReport> = {}): Promise<RestoreRunReport> {
+  return runLibraryJob<RestoreRunReport>(`/duplicates/runs/default/${encodeURIComponent(runId)}/restore`, handlers);
 }
 
 // ---- Comparing duplicates, the user's groups, moving books (crates/lexmechanic_srv/src/duplicates_compare.rs) ----
@@ -2468,9 +2499,13 @@ export interface MirrorTarget {
   reachable: boolean;
 }
 
-/** The dry run: what the copy would do. Changes nothing. */
-export function planMirror(request: MirrorRequest): Promise<MirrorPlan> {
-  return jsonFetch<MirrorPlan>("/mirror-library/default", { ...JSON_POST, body: JSON.stringify({ ...request, dry_run: true }) });
+/**
+ * The dry run: what the copy would do. Changes nothing. Planning a big library takes tens of
+ * seconds, so it is a job (`mirror_plan`) the promise follows; the run that comes next reuses
+ * its plan while the library is unchanged.
+ */
+export function planMirror(request: MirrorRequest, handlers: LibraryJobHandlers<MirrorPlan> = {}): Promise<MirrorPlan> {
+  return runLibraryJob<MirrorPlan>("/mirror-library/default?job=true", handlers, { ...request, dry_run: true });
 }
 
 /** Runs the previewed copy as a job. The server answers 409 if it is no longer that plan. */
@@ -2498,11 +2533,18 @@ export interface LibraryFolder {
   books_here: number;
   /** Made by the user and holding no books yet. */
   empty: boolean;
+  /** calibre's `Author/Title (id)` layout made this folder: it holds only per-book directories. */
+  author?: boolean;
 }
 
-/** The library's folder tree: one pass over the books' folders, counts include sub-folders. */
-export function fetchLibraryFolders(): Promise<{ total: number; folders: LibraryFolder[] }> {
-  return jsonFetch("/library-folders/default");
+/**
+ * The library's folder tree: one pass over the books' folders, counts include sub-folders.
+ * calibre's author folders are left out unless `includeAuthorFolders`: nobody made them, and
+ * in a library with thousands of authors they were a third of the tree. `author_folders` says
+ * how many there are, so the tree can offer to show them.
+ */
+export function fetchLibraryFolders(includeAuthorFolders = false): Promise<{ total: number; folders: LibraryFolder[]; author_folders?: number }> {
+  return jsonFetch(`/library-folders/default${includeAuthorFolders ? "?author_folders=true" : ""}`);
 }
 
 /** Makes an empty folder (the directory is created and remembered). */

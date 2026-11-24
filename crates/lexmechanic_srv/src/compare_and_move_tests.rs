@@ -791,3 +791,25 @@ async fn a_text_custom_column_with_values_is_a_category_without_a_reload() {
     assert_eq!(status, StatusCode::OK, "{page}");
     assert_eq!((page["category_name"].as_str(), page["items"][0]["name"].as_str(), page["items"][0]["count"].as_i64()), (Some("Game line"), Some("Rifts"), Some(1)));
 }
+
+/// calibre's `Author/Title (id)` folders are storage, not folders anyone made: the tree leaves them out
+/// unless asked, and says how many there are so the page can offer them.
+#[tokio::test]
+async fn library_folders_leaves_out_author_folders_unless_asked() {
+    let l = lib();
+    let a = l.add("a.txt", "Alpha Primer", "Ada Lovelace", b"alpha");
+    let b = l.add("b.txt", "Totally Different", "Bob Writer", b"bravo");
+    l.cache.set_book_path(a, &format!("Lovelace, Ada/Alpha Primer ({a})")).unwrap();
+    move_into(&l, b, "Gaming").await;
+
+    let (_, tree) = l.get("/library-folders/default").await;
+    let paths = |t: &serde_json::Value| t["folders"].as_array().unwrap().iter().map(|f| f["path"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    assert_eq!(paths(&tree), ["Gaming"], "{tree}");
+    assert_eq!(tree["total"], 2, "the books are all still counted");
+    assert_eq!((tree["author_folders"].as_u64(), tree["author_folders_hidden"].as_bool()), (Some(1), Some(true)));
+
+    let (_, all) = l.get("/library-folders/default?author_folders=true").await;
+    assert_eq!(paths(&all), ["Gaming", "Lovelace, Ada"], "{all}");
+    assert!(all["folders"][1]["author"].as_bool().unwrap());
+    assert!(all["folders"][0].get("author").is_none(), "only an author folder says so");
+}

@@ -425,12 +425,12 @@ async fn keep_best_trash_rest_trashes_the_others_and_the_run_can_be_restored() {
     assert_eq!((page["total"].as_u64(), page["stale"].as_bool()), (Some(3), Some(false)), "{page}");
 
     // Undo this run.
-    let (status, restored) = l.post(&format!("/duplicates/runs/default/{run_id}/restore"), json!({})).await;
+    let (status, restored) = l.post(&format!("/duplicates/runs/default/{run_id}/restore?wait=true"), json!({})).await;
     assert_eq!(status, StatusCode::OK, "{restored}");
     assert_eq!(restored["restored"].as_array().unwrap().len(), 1);
     assert_eq!(restored["needs_rescan"], true);
     assert_eq!(l.cache.all_book_ids().unwrap().len(), 9, "everything is back");
-    let (status, _) = l.post(&format!("/duplicates/runs/default/{run_id}/restore"), json!({})).await;
+    let (status, _) = l.post(&format!("/duplicates/runs/default/{run_id}/restore?wait=true"), json!({})).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "the run has nothing left in the trash");
 }
 
@@ -478,4 +478,33 @@ async fn merge_as_formats_merges_into_the_keeper_and_says_it_is_not_fully_undoab
     let left = l.cache.all_book_ids().unwrap();
     assert_eq!(left, vec![keeper], "{a} {b}");
     assert_eq!(l.cache.format_file_info(keeper).unwrap().len(), 2);
+}
+
+/// Undo of a run is a job: 202 and an id at once, the books come back as it runs, and the report is
+/// what the synchronous route used to answer.
+#[tokio::test]
+async fn restoring_a_run_is_a_job_with_progress_and_the_old_report() {
+    let l = lib();
+    let (content, ..) = mixed(&l).await;
+    l.scan().await;
+    let plan = dry_run(&l, json!({"action": "keep_best_trash_rest"})).await;
+    let keeper = plan["groups"][0]["keeper"]["book_id"].as_i64().unwrap() as i32;
+    let other = *content.iter().find(|c| **c != keeper).unwrap();
+    let (_, started) = l.post("/duplicates/resolve/default", json!({"dry_run": false, "action": "keep_best_trash_rest", "plan_fingerprint": plan["plan_fingerprint"]})).await;
+    let run_id = started["run_id"].as_str().unwrap().to_string();
+    l.wait_job(&started).await;
+    assert!(!l.cache.all_book_ids().unwrap().contains(&other));
+
+    let (status, restoring) = l.post(&format!("/duplicates/runs/default/{run_id}/restore"), json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{restoring}");
+    assert_eq!(restoring["run_id"], run_id.as_str());
+    let job = l.wait_job(&restoring).await;
+    assert_eq!(job["kind"], "restore_run");
+    assert_eq!(job["report"]["restored"].as_array().unwrap().len(), 1, "{job}");
+    assert_eq!(job["report"]["needs_rescan"], true);
+    assert_eq!(job["report"]["cancelled"], false);
+    assert_eq!(job["progress"]["total"], 1);
+    assert_eq!(job["progress"]["seen"], 1);
+    assert_eq!(job["progress"]["phase"], "restoring");
+    assert!(l.cache.all_book_ids().unwrap().contains(&other) || l.cache.all_book_ids().unwrap().len() == 9);
 }

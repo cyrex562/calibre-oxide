@@ -34,10 +34,21 @@ fn cache(state: &AppState, id: &str) -> Result<std::sync::Arc<lexmechanic_db::ca
 }
 
 /// `GET /library-folders/{library_id}`.
-pub async fn list(State(state): State<AppState>, Path(id): Path<String>) -> Result<Json<Value>, ServerError> {
+///
+/// calibre's author folders (`Author/` holding only per-book directories) are left
+/// out unless `?author_folders=true`: they are storage, not folders anyone made, and
+/// were a third of the tree. The response says how many there are
+/// (`author_folders`) so the UI can offer to show them.
+pub async fn list(State(state): State<AppState>, Path(id): Path<String>, axum::extract::Query(query): axum::extract::Query<ListQuery>) -> Result<Json<Value>, ServerError> {
     let cache = cache(&state, &id)?;
-    let tree = tokio::task::spawn_blocking(move || library_folders::list(&cache)).await.map_err(internal)?.map_err(internal)?;
+    let include = query.author_folders.unwrap_or(false);
+    let tree = tokio::task::spawn_blocking(move || library_folders::list_with(&cache, include)).await.map_err(internal)?.map_err(internal)?;
     Ok(Json(serde_json::to_value(tree).map_err(internal)?))
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ListQuery {
+    pub author_folders: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

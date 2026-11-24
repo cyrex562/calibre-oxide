@@ -54,7 +54,15 @@
 //! - `POST /mirror-library/{library_id}` -- a travel copy or a backup mirror
 //!   to another folder ([`crate::library_mirror`]); remembered targets at
 //!   `GET /mirror-targets/{library_id}`
-//! - `GET /library-jobs`, `GET /library-jobs/{id}`, `POST /library-jobs/{id}/cancel`
+//! - `POST /check-library/{library_id}` -- compare the folder with the library's
+//!   records ([`crate::check_library`]); the report is the job's report
+//! - `POST /duplicates/runs/{library_id}/{run_id}/restore` -- put a resolve run's
+//!   trashed books back ([`crate::duplicates_review`])
+//! - `POST /mirror-library/{library_id}?job=true` with `dry_run` -- the copy's
+//!   preview as a job ([`crate::library_mirror`])
+//! - `GET /library-jobs` (running jobs and the newest few, without their reports:
+//!   `has_report` says there is one; `?all=true`, `?reports=true`),
+//!   `GET /library-jobs/{id}` (with the report), `POST /library-jobs/{id}/cancel`
 //!
 //! # Surviving a restart
 //!
@@ -123,6 +131,13 @@ pub enum JobKind {
     /// (`POST /mirror-library`). Continued by running it again: what it
     /// finished is in the copy's manifest.
     Mirror,
+    /// Plan a copy of the library to another folder, for the preview
+    /// (`POST /mirror-library?job=true` with `dry_run`).
+    MirrorPlan,
+    /// Compare the folder with the library's records (`POST /check-library`).
+    CheckLibrary,
+    /// Put a resolve run's trashed books back (`POST /duplicates/runs/.../restore`).
+    RestoreRun,
 }
 
 impl JobKind {
@@ -132,7 +147,7 @@ impl JobKind {
     pub fn moves_files(self) -> bool {
         matches!(
             self,
-            JobKind::Import | JobKind::Resolve | JobKind::MergeExact | JobKind::Absorb | JobKind::Unabsorb | JobKind::Organize | JobKind::UndoOrganize | JobKind::Retitle | JobKind::UndoRetitle
+            JobKind::Import | JobKind::Resolve | JobKind::RestoreRun | JobKind::MergeExact | JobKind::Absorb | JobKind::Unabsorb | JobKind::Organize | JobKind::UndoOrganize | JobKind::Retitle | JobKind::UndoRetitle
         )
     }
 
@@ -155,6 +170,9 @@ impl JobKind {
             JobKind::Retitle => "retitle",
             JobKind::UndoRetitle => "undo_retitle",
             JobKind::Mirror => "mirror",
+            JobKind::CheckLibrary => "check_library",
+            JobKind::RestoreRun => "restore_run",
+            JobKind::MirrorPlan => "mirror_plan",
         }
     }
 
@@ -177,6 +195,9 @@ impl JobKind {
             JobKind::Retitle,
             JobKind::UndoRetitle,
             JobKind::Mirror,
+            JobKind::CheckLibrary,
+            JobKind::RestoreRun,
+            JobKind::MirrorPlan,
         ]
         .into_iter()
         .find(|k| k.name() == name)
@@ -262,6 +283,10 @@ impl LibraryJob {
     /// The job as the status routes show it. `report` is present only
     /// once the job has ended.
     pub fn to_json(&self) -> Value {
+        self.json_with(true)
+    }
+
+    fn json_with(&self, with_report: bool) -> Value {
         let outcome = self.outcome.lock().unwrap();
         json!({
             "id": self.id,
@@ -269,7 +294,8 @@ impl LibraryJob {
             "library": self.library,
             "state": outcome.state.name(),
             "progress": self.control.snapshot(),
-            "report": outcome.report,
+            "report": if with_report { outcome.report.clone() } else { None },
+            "has_report": outcome.report.is_some(),
             "error": outcome.error,
             "started_at": self.started_at,
             "finished_at": outcome.finished_at,
@@ -279,6 +305,11 @@ impl LibraryJob {
             "resumable": outcome.state == JobState::Interrupted && self.kind.resume_route().is_some(),
             "resume_route": self.kind.resume_route(),
         })
+    }
+
+    /// [`LibraryJob::to_json`] without the report (`has_report` says there is one).
+    pub fn to_summary_json(&self) -> Value {
+        self.json_with(false)
     }
 
     /// The record written to `jobs.json`: the job's state as of now.
@@ -451,6 +482,8 @@ pub struct JobParams {
     pub retitle: Option<RetitleJob>,
     /// The confirmed plan of a [`JobKind::Mirror`] job.
     pub mirror: Option<Arc<lexmechanic_db::mirror::MirrorPlan>>,
+    /// The target and options a [`JobKind::MirrorPlan`] job plans.
+    pub mirror_request: Option<(String, lexmechanic_db::mirror::MirrorOptions)>,
 }
 
 /// The approved titles of a retitle run and what to do besides setting them.
@@ -677,6 +710,15 @@ fn run(cache: &Cache, kind: JobKind, options: &PipelineOptions, control: &JobCon
         JobKind::UndoRetitle => {
             let run_id = params.undo_run.as_ref().ok_or_else(|| anyhow::anyhow!("an undo needs a run id"))?;
             Ok(serde_json::to_value(lexmechanic_db::retitle::undo(cache, run_id, control)?)?)
+        }
+        JobKind::CheckLibrary => crate::check_library::run_job(cache, control),
+        JobKind::MirrorPlan => {
+            let (target, mirror_options) = params.mirror_request.as_ref().ok_or_else(|| anyhow::anyhow!("a mirror plan needs its request"))?;
+            crate::library_mirror::run_plan_job(cache, target, mirror_options, control)
+        }
+        JobKind::RestoreRun => {
+            let run_id = params.undo_run.as_ref().ok_or_else(|| anyhow::anyhow!("a restore needs a run id"))?;
+            crate::duplicates_review::run_restore_job(cache, run_id, control)
         }
         JobKind::Mirror => {
             let plan = params.mirror.as_ref().ok_or_else(|| anyhow::anyhow!("a mirror job needs its plan"))?;
@@ -907,13 +949,38 @@ pub async fn prepare_status(State(state): State<AppState>, Path(library_id): Pat
 }
 
 /// `GET /library-jobs` -- newest first.
-pub async fn list(State(state): State<AppState>) -> Json<Value> {
+///
+/// **A summary**, not the reports: each job's report can run to hundreds of KB (a
+/// scan lists its files) and the page load that asks for this list needs only the
+/// state. Each entry says `has_report`; `GET /library-jobs/{id}` has the report.
+/// Only running jobs and the [`LIST_RECENT`] newest others are listed
+/// (`?all=true` lists the lot, `?reports=true` keeps the reports in).
+pub async fn list(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Json<Value> {
     // Bring back what an earlier process left in this library's jobs.json, so
     // a job it was running shows as interrupted.
     restore(&state.cache.backend.library_path.to_string_lossy());
     let mut jobs: Vec<Arc<LibraryJob>> = registry().jobs.lock().unwrap().clone();
     jobs.sort_by_key(|j| std::cmp::Reverse(j.id));
-    Json(json!({"jobs": jobs.iter().map(|j| j.to_json()).collect::<Vec<_>>()}))
+    let mut quiet = 0;
+    let all = query.all == Some(true);
+    jobs.retain(|j| {
+        if all || j.state() == JobState::Running {
+            return true;
+        }
+        quiet += 1;
+        quiet <= LIST_RECENT
+    });
+    let with_reports = query.reports == Some(true);
+    Json(json!({"jobs": jobs.iter().map(|j| if with_reports { j.to_json() } else { j.to_summary_json() }).collect::<Vec<_>>()}))
+}
+
+/// Jobs that are not running which `GET /library-jobs` lists.
+const LIST_RECENT: usize = 10;
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ListQuery {
+    pub all: Option<bool>,
+    pub reports: Option<bool>,
 }
 
 fn find(id: u64) -> Result<Arc<LibraryJob>, ServerError> {

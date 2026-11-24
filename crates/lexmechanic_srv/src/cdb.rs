@@ -621,6 +621,30 @@ pub struct SetFieldsBatchBody {
     /// case). Applied before `add` when both name the same field.
     #[serde(default)]
     remove: serde_json::Map<String, Value>,
+    /// Ask for the values the written fields held before this request, in the
+    /// answer's `previous` (`{"<book id>": {"<field>": value}}`, the types a book row
+    /// has: lists for tags, authors and languages, numbers for rating and series
+    /// index, `null` for no value), so the caller can offer Undo without reading every
+    /// book first.
+    #[serde(default)]
+    previous: bool,
+}
+
+/// What a book's `field` held, as the value a book row has for it (see
+/// [`SetFieldsBatchBody::previous`]).
+fn row_value(field: &str, raw: Option<String>) -> Value {
+    let number = |n: f64| serde_json::Number::from_f64(n).map(Value::Number).unwrap_or(Value::Null);
+    match field {
+        // A book with none reads as an empty list, as in a book row.
+        "tags" | "languages" | "authors" => {
+            let sep = list_field_separator(field).expect("a list field");
+            Value::Array(raw.unwrap_or_default().split(sep).map(str::trim).filter(|v| !v.is_empty()).map(|v| Value::String(v.to_string())).collect())
+        }
+        // Stored as 0-10; a row (and a write) says stars, 0-5.
+        "rating" => raw.and_then(|r| r.trim().parse::<f64>().ok()).map(|r| number(r / 2.0)).unwrap_or(Value::Null),
+        "series_index" => raw.and_then(|r| r.trim().parse::<f64>().ok()).map(number).unwrap_or(Value::Null),
+        _ => raw.map(Value::String).unwrap_or(Value::Null),
+    }
 }
 
 /// How many books one relative (`add`/`remove`) transaction covers.
@@ -727,7 +751,7 @@ pub async fn set_fields_batch_no_library(State(state): State<AppState>, Json(bod
 
 async fn set_fields_batch_handle(state: AppState, library_id: Option<String>, body: SetFieldsBatchBody) -> Result<Json<Value>, ServerError> {
     let cache = state.cache_for(library_id.as_deref()).ok_or_else(|| ServerError::NotFound(format!("no library named {:?}", library_id.clone().unwrap_or_default())))?;
-    let SetFieldsBatchBody { book_ids, changes, mut groups, add, remove } = body;
+    let SetFieldsBatchBody { book_ids, changes, mut groups, add, remove, previous: want_previous } = body;
     let adds = list_edit_values("add", &add)?;
     let removes = list_edit_values("remove", &remove)?;
     let relative = !adds.is_empty() || !removes.is_empty();
@@ -770,19 +794,30 @@ async fn set_fields_batch_handle(state: AppState, library_id: Option<String>, bo
 
     let mut updated: Vec<i32> = Vec::new();
     let mut failed: Vec<Value> = Vec::new();
+    let mut previous = serde_json::Map::new();
     for (book_ids, updates) in work {
         for chunk in book_ids.chunks(BATCH_COMMIT_CHUNK) {
             let chunk = chunk.to_vec();
-            let (ids, results) = tokio::task::spawn_blocking({
+            let (ids, results, before) = tokio::task::spawn_blocking({
                 let cache = cache.clone();
                 let updates = updates.clone();
                 move || {
+                    // Read first: after the write the old values are gone.
+                    let before: Vec<(i32, serde_json::Map<String, Value>)> = if want_previous {
+                        chunk.iter().map(|id| (*id, updates.iter().map(|(field, _)| (field.clone(), row_value(field, cache.field_for(*id, field).ok().flatten()))).collect())).collect()
+                    } else {
+                        Vec::new()
+                    };
                     let results = cache.set_fields_for_books(&chunk, &updates);
-                    (chunk, results)
+                    (chunk, results, before)
                 }
             })
             .await
             .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+            for (id, fields) in before {
+                // A book written by two groups keeps what it held before the first.
+                previous.entry(id.to_string()).or_insert(Value::Object(fields));
+            }
             for (id, result) in ids.into_iter().zip(results) {
                 match result {
                     Ok(()) => updated.push(id),
@@ -837,7 +872,11 @@ async fn set_fields_batch_handle(state: AppState, library_id: Option<String>, bo
     if !updated.is_empty() {
         web_socket::publish(&state, ChangeEvent::MetadataChanged { book_ids: updated.clone() });
     }
-    Ok(Json(serde_json::json!({ "updated": updated, "failed": failed, "unchanged": unchanged })))
+    let mut answer = serde_json::json!({ "updated": updated, "failed": failed, "unchanged": unchanged });
+    if want_previous {
+        answer["previous"] = Value::Object(previous);
+    }
+    Ok(Json(answer))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1371,6 +1410,35 @@ mod tests {
         }
         let (_, untouched) = get_json(&router, "/ajax/book/2").await;
         assert_eq!(untouched["tags"], serde_json::json!([]));
+    }
+
+    /// `previous: true` answers with what the written fields held, in the types a book row has, so a
+    /// bulk edit can offer Undo without reading every book first; writing those values back restores them.
+    #[tokio::test]
+    async fn set_fields_batch_can_answer_with_the_values_it_replaced() {
+        let (_dir, router) = test_app(3);
+        // Give books 1 and 2 something to replace.
+        post_json(&router, "/cdb/set-fields-batch/default", serde_json::json!({"book_ids": [1], "changes": {"publisher": "Old House", "tags": ["x", "y"], "rating": 3}})).await;
+
+        let (status, body) = post_json(&router, "/cdb/set-fields-batch/default", serde_json::json!({"book_ids": [1, 2], "changes": {"publisher": "Acme", "tags": ["z"], "rating": 4}, "previous": true})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["updated"], serde_json::json!([1, 2]), "{body}");
+        assert_eq!(body["previous"]["1"]["publisher"], "Old House", "{body}");
+        assert_eq!(body["previous"]["1"]["tags"], serde_json::json!(["x", "y"]));
+        assert_eq!(body["previous"]["1"]["rating"].as_f64(), Some(3.0), "stars, as a book row says them");
+        // A book that had nothing reads as nothing: no publisher is `null`, no tags is an empty list.
+        assert!(body["previous"]["2"]["publisher"].is_null() || body["previous"]["2"]["publisher"] == "", "{body}");
+        assert_eq!(body["previous"]["2"]["tags"], serde_json::json!([]));
+
+        // Not asked for: not sent.
+        let (_, plain) = post_json(&router, "/cdb/set-fields-batch/default", serde_json::json!({"book_ids": [3], "changes": {"publisher": "Acme"}})).await;
+        assert!(plain.get("previous").is_none(), "{plain}");
+
+        // And the values are what writing them back needs.
+        let (_, undo) = post_json(&router, "/cdb/set-fields-batch/default", serde_json::json!({"book_ids": [1], "changes": {"publisher": body["previous"]["1"]["publisher"], "tags": body["previous"]["1"]["tags"], "rating": body["previous"]["1"]["rating"]}})).await;
+        assert_eq!(undo["updated"], serde_json::json!([1]), "{undo}");
+        let (_, book) = get_json(&router, "/ajax/book/1").await;
+        assert_eq!((book["publisher"].as_str(), &book["tags"]), (Some("Old House"), &serde_json::json!(["x", "y"])));
     }
 
     #[tokio::test]

@@ -275,6 +275,54 @@ describe("selection over rows that are not loaded", () => {
   });
 });
 
+describe("the row cache is capped", () => {
+  it("drops the chunks scrolled furthest back, never the ones in view", async () => {
+    // A small cap so the test needs few chunks: 4 chunks' worth of rows.
+    const win = createBookWindow({ chunkSize: 100, maxInFlight: 4, maxCachedRows: 400, fetchIds: async () => ({ ids: Array.from({ length: 3000 }, (_, i) => i + 1), total: 3000 }), fetchBooks: async (ids) => ids.map((id) => summary(id)) });
+    await win.reset();
+    for (let chunk = 0; chunk < 12; chunk++) {
+      win.setRange(chunk * 100, chunk * 100 + 30);
+      await tick();
+    }
+    expect(win.cache.size).toBeLessThanOrEqual(400);
+    // What is on screen is there.
+    expect(win.getById(1150)).toBeDefined();
+    // The first chunk was dropped, and scrolling back fetches it again.
+    expect(win.getById(5)).toBeUndefined();
+    win.setRange(0, 30);
+    await tick();
+    expect(win.getById(5)?.id).toBe(5);
+  });
+
+  it("ensureLoaded returns every row asked for even when the cache cannot keep them all", async () => {
+    const win = createBookWindow({ chunkSize: 100, maxCachedRows: 400, fetchIds: async () => ({ ids: Array.from({ length: 2000 }, (_, i) => i + 1), total: 2000 }), fetchBooks: async (ids) => ids.map((id) => summary(id)) });
+    await win.reset();
+    win.setRange(0, 20);
+    await tick();
+    const want = Array.from({ length: 1500 }, (_, i) => i + 1);
+    const rows = await win.ensureLoaded(want);
+    expect(rows.map((r) => r.id)).toEqual(want);
+    expect(win.cache.size).toBeLessThanOrEqual(400);
+    // The rows on screen survived the sweep.
+    expect(win.getById(10)).toBeDefined();
+  });
+
+  it("a dropped chunk is loaded again when it is wanted, not left blank", async () => {
+    const calls: number[][] = [];
+    const win = createBookWindow({ chunkSize: 100, maxCachedRows: 400, fetchIds: async () => ({ ids: Array.from({ length: 2000 }, (_, i) => i + 1), total: 2000 }), fetchBooks: async (ids) => (calls.push(ids), ids.map((id) => summary(id))) });
+    await win.reset();
+    for (let chunk = 0; chunk < 10; chunk++) {
+      win.setRange(chunk * 100, chunk * 100 + 10);
+      await tick();
+    }
+    calls.length = 0;
+    win.setRange(0, 10);
+    await tick();
+    expect(calls).toHaveLength(1);
+    expect(calls[0][0]).toBe(1);
+  });
+});
+
 describe("edits", () => {
   it("patches a cached row and returns the previous one for rollback", async () => {
     const h = harness(10);

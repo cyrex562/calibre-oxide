@@ -1040,18 +1040,53 @@ pub async fn runs(State(state): State<AppState>, Path(library_id): Path<String>)
 /// `POST /duplicates/runs/{library_id}/{run_id}/restore` -- puts back every
 /// book the run trashed. The snapshot goes stale (the library changed), so the
 /// response says `needs_rescan`.
-pub async fn restore_run(State(state): State<AppState>, Path((library_id, run_id)): Path<(String, String)>) -> Result<Json<Value>, ServerError> {
+///
+/// A run can hold thousands of books and each restore is real file and
+/// database work, so this is a library job (`restore_run`): the answer is 202
+/// with the job's id, `GET /library-jobs/{id}` has the progress and the report
+/// (the shape this route used to answer with), and cancelling stops between
+/// books. `?wait=true` holds the response until the job ends and answers with
+/// the report.
+pub async fn restore_run(State(state): State<AppState>, Path((library_id, run_id)): Path<(String, String)>, Query(query): Query<RestoreQuery>) -> Result<Response, ServerError> {
     let cache = cache_for(&state, &library_id)?;
     crate::library_jobs::ensure_no_file_mover(&cache)?;
-    let out = blocking(move || {
-        if cache.trash_entries_for_run(&run_id).map_err(internal)?.is_empty() {
-            return Err(ServerError::NotFound(format!("nothing in the trash belongs to run {run_id}")));
-        }
-        let restored = cache.restore_trash_run(&run_id).map_err(internal)?;
-        Ok(json!({"run_id": run_id, "restored": restored.restored, "failed": restored.failed, "needs_rescan": !restored.restored.is_empty()}))
-    })
-    .await?;
-    Ok(Json(out))
+    {
+        let (cache, run_id) = (cache.clone(), run_id.clone());
+        blocking(move || {
+            if cache.trash_entries_for_run(&run_id).map_err(internal)?.is_empty() {
+                return Err(ServerError::NotFound(format!("nothing in the trash belongs to run {run_id}")));
+            }
+            Ok(())
+        })
+        .await?;
+    }
+    let params = JobParams { undo_run: Some(run_id.clone()), ..Default::default() };
+    let job = match library_jobs::start_with(cache, JobKind::RestoreRun, None, params) {
+        Started::New(job) => job,
+        Started::AlreadyRunning(job) => return Ok(conflict(json!({"error": "a restore is already running on this library", "job_id": job.id}))),
+        Started::Busy(active) => return Ok(conflict(json!({"error": format!("a {} job is already running on this library", active.kind.name()), "job_id": active.id}))),
+    };
+    if query.wait == Some(true) {
+        job.wait().await;
+        return match (job.state(), job.report()) {
+            (library_jobs::JobState::Failed, _) | (_, None) => Err(ServerError::InternalServerError(format!("the restore of run {run_id} failed"))),
+            (_, Some(report)) => Ok(Json(report).into_response()),
+        };
+    }
+    Ok((StatusCode::ACCEPTED, Json(json!({"job_id": job.id, "run_id": run_id, "state": "running", "already_running": false, "status_url": format!("/library-jobs/{}", job.id)}))).into_response())
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct RestoreQuery {
+    pub wait: Option<bool>,
+}
+
+/// What a `restore_run` library job runs: every book of the run, one at a time,
+/// with progress, stopping between books when cancelled. The snapshot is stale
+/// afterwards (the library changed), which the report says as `needs_rescan`.
+pub fn run_restore_job(cache: &Cache, run_id: &str, control: &JobControl) -> anyhow::Result<Value> {
+    let restored = cache.restore_trash_run_controlled(run_id, control)?;
+    Ok(json!({"run_id": run_id, "restored": restored.restored, "failed": restored.failed, "needs_rescan": !restored.restored.is_empty(), "cancelled": control.is_cancelled()}))
 }
 
 

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { applyListEdit, changesFor, describeBulkResult, InvalidPatternError, inverseChanges, isEmptySpec, parseList, replaceIn, validateSpec, type BulkEditSpec } from "./bulkEdit";
+import { applyListEdit, changesFor, describeBulkResult, uniformChanges, InvalidPatternError, inverseChanges, isEmptySpec, parseList, replaceIn, validateSpec, type BulkEditSpec } from "./bulkEdit";
 import type { BookSummary } from "./types";
 
 function book(overrides: Partial<BookSummary> = {}): BookSummary {
@@ -247,5 +247,34 @@ describe("describeBulkResult", () => {
     expect(describeBulkResult(spec({ publisher: "Acme", series: "S" }), 3)).toBe("Updated publisher and series on 3 books");
     expect(describeBulkResult(spec({ tags: { mode: "replace", value: "x" } }), 2)).toBe("Updated tags on 2 books");
     expect(describeBulkResult(spec({ publisher: "A", series: "B", comments: "C" }), 2)).toBe("Updated publisher, series and comments on 2 books");
+  });
+});
+
+describe("uniformChanges", () => {
+  it("is the one change set of an edit that does not depend on the book", () => {
+    expect(uniformChanges({ ...EMPTY, publisher: "Acme", series: "Saga" })).toEqual({ publisher: "Acme", series: "Saga" });
+    expect(uniformChanges({ ...EMPTY, rating: 8 })).toEqual({ rating: 8 });
+    expect(uniformChanges({ ...EMPTY, comments: "Read it", custom: { "#shelf": "A3" } })).toEqual({ comments: "Read it", "#shelf": "A3" });
+  });
+
+  it("includes a list replaced outright, even with nothing in it (that clears it)", () => {
+    expect(uniformChanges({ ...EMPTY, tags: { mode: "replace", value: "a, b" } })).toEqual({ tags: ["a", "b"] });
+    expect(uniformChanges({ ...EMPTY, tags: { mode: "replace", value: "" } })).toEqual({ tags: [] });
+  });
+
+  it("is null when what is written depends on what the book has", () => {
+    expect(uniformChanges({ ...EMPTY, tags: { mode: "add", value: "travel" } })).toBeNull();
+    expect(uniformChanges({ ...EMPTY, publisher: "Acme", authors: { mode: "remove", value: "Ann" } })).toBeNull();
+    expect(uniformChanges({ ...EMPTY, searchReplace: { field: "title", find: "x", replace: "y", useRegex: false } })).toBeNull();
+  });
+
+  it("is null for an edit that writes nothing, and ignores an empty add or remove", () => {
+    expect(uniformChanges(EMPTY)).toBeNull();
+    expect(uniformChanges({ ...EMPTY, tags: { mode: "add", value: "" }, publisher: "Acme" })).toEqual({ publisher: "Acme" });
+  });
+
+  it("gives every book what changesFor gives a book that has none of it", () => {
+    const spec: BulkEditSpec = { ...EMPTY, publisher: "Acme", series: "Saga", rating: 6, pubdate: "2020-02-03", languages: { mode: "replace", value: "eng" } };
+    expect(uniformChanges(spec)).toEqual(changesFor(book({ publisher: null, series: null, languages: [] } as never), spec));
   });
 });
