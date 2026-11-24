@@ -309,14 +309,28 @@ export function createMirrorController(api: MirrorApi = realApi, env: MirrorEnv 
     state.phase = "planning";
     state.error = null;
     state.report = null;
+    state.progress = "Starting…";
     try {
-      state.plan = await api.planMirror(draftToRequest(state.draft, ids));
+      // Planning a big library takes tens of seconds, so it is a job with progress and Cancel.
+      const plan = await api.planMirror(draftToRequest(state.draft, ids), {
+        onStart: (id) => (state.jobId = id),
+        onProgress: (job) => (state.progress = realApi.describeJobProgress(job.progress)),
+      });
+      if ((plan as { cancelled?: boolean }).cancelled) {
+        state.plan = null;
+        state.phase = "idle";
+        return;
+      }
+      state.plan = plan;
       state.planKey = key;
       state.phase = "planned";
     } catch (e) {
       state.plan = null;
       state.phase = "idle";
       state.error = e instanceof Error ? e.message : String(e);
+    } finally {
+      state.jobId = null;
+      state.progress = "";
     }
   }
 

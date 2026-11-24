@@ -144,21 +144,123 @@ pub fn plan_json(plan: &MirrorPlan) -> Value {
 }
 
 fn started(job: library_jobs::Started) -> Response {
+    started_as("mirror", job)
+}
+
+fn started_as(kind: &str, job: library_jobs::Started) -> Response {
     match job {
-        library_jobs::Started::New(job) | library_jobs::Started::AlreadyRunning(job) => (StatusCode::ACCEPTED, Json(json!({"job_id": job.id, "kind": "mirror", "state": "running", "status_url": format!("/library-jobs/{}", job.id)}))).into_response(),
+        library_jobs::Started::New(job) | library_jobs::Started::AlreadyRunning(job) => (StatusCode::ACCEPTED, Json(json!({"job_id": job.id, "kind": kind, "state": "running", "status_url": format!("/library-jobs/{}", job.id)}))).into_response(),
         library_jobs::Started::Busy(active) => (StatusCode::CONFLICT, Json(json!({"error": "another job is already running on this library", "job_id": active.id, "kind": active.kind.name()}))).into_response(),
     }
 }
 
+/// How long a previewed plan can be used again by the run that follows it.
+const PLAN_TTL: Duration = Duration::from_secs(10 * 60);
+
+type RememberedPlan = (std::time::Instant, std::path::PathBuf, String, String, Arc<MirrorPlan>);
+
+fn remembered_plans() -> &'static std::sync::Mutex<Vec<RememberedPlan>> {
+    static PLANS: std::sync::OnceLock<std::sync::Mutex<Vec<RememberedPlan>>> = std::sync::OnceLock::new();
+    PLANS.get_or_init(Default::default)
+}
+
+/// What a plan was made for: the request, so the run that follows a preview finds it.
+fn plan_key(target: &str, options: &MirrorOptions) -> String {
+    format!("{}|{}|{}|{}|{}", target.trim(), options.mode.name(), serde_json::to_string(&options.scope).unwrap_or_default(), options.remove_missing, options.overwrite_changed)
+}
+
+/// What a remembered plan is valid for: the library's change watermark, plus the
+/// database's `data_version` (a write by another process on the same `metadata.db`).
+fn plan_watermark(cache: &Cache) -> String {
+    format!("{}#{}", cache.change_watermark(), cache.foreign_write_version())
+}
+
+fn remember_plan(cache: &Cache, key: &str, watermark: String, plan: &Arc<MirrorPlan>) {
+    let mut plans = remembered_plans().lock().unwrap();
+    plans.retain(|(at, ..)| at.elapsed() < PLAN_TTL);
+    plans.push((std::time::Instant::now(), cache.backend.library_path.clone(), key.to_string(), watermark, plan.clone()));
+    if plans.len() > 3 {
+        plans.remove(0);
+    }
+}
+
+/// The plan a preview of this very request made, if it is recent, has this fingerprint
+/// and the library has not changed since. Running the copy then costs nothing to plan
+/// (a plan is 15 to 50 seconds at 60,000 files); anything else plans afresh and the
+/// fingerprint comparison decides, as it always did.
+fn recall_plan(cache: &Cache, key: &str, fingerprint: &str) -> Option<Arc<MirrorPlan>> {
+    let hit = remembered_plans().lock().unwrap().iter().rev().find(|(at, library, k, _, plan)| at.elapsed() < PLAN_TTL && *library == cache.backend.library_path && k == key && plan.fingerprint == fingerprint).map(|(_, _, _, mark, plan)| (mark.clone(), plan.clone()));
+    let (mark, plan) = hit?;
+    (plan_watermark(cache) == mark).then_some(plan)
+}
+
+fn forget_plan(cache: &Cache, key: &str) {
+    remembered_plans().lock().unwrap().retain(|(_, library, k, ..)| !(*library == cache.backend.library_path && k == key));
+}
+
+/// The body of a [`JobKind::MirrorPlan`] job: plans the copy (with progress) and
+/// remembers the plan for the run that follows; the report is the dry run's answer.
+pub fn run_plan_job(cache: &Cache, target: &str, options: &MirrorOptions, control: &JobControl) -> anyhow::Result<Value> {
+    let watermark = plan_watermark(cache);
+    match mirror::plan_controlled(cache, target, options, Some(control)) {
+        Ok(plan) => {
+            let plan = Arc::new(plan);
+            remember_plan(cache, &plan_key(target, options), watermark, &plan);
+            Ok(plan_json(&plan))
+        }
+        Err(_) if control.is_cancelled() => Ok(json!({"cancelled": true})),
+        // The reason a target is refused is the answer, not a crash: it reaches the dialog as the job's error.
+        Err(MirrorError::Refused(message)) => anyhow::bail!("{message}"),
+        Err(MirrorError::Other(e)) => Err(e),
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct MirrorQuery {
+    /// With `dry_run`: make the preview a library job (202, progress, cancel, the
+    /// answer in the job's report) instead of holding the request until it is planned.
+    pub job: Option<bool>,
+}
+
 /// `POST /mirror-library/{library_id}`.
-pub async fn mirror_library(State(state): State<AppState>, Path(library_id): Path<String>, Json(body): Json<MirrorBody>) -> Result<Response, ServerError> {
+///
+/// A preview of a big library takes tens of seconds, so `?job=true` makes it a job
+/// (`mirror_plan`): the answer is 202 with the job's id, and the job's report is what
+/// the synchronous preview answers. The run that follows a preview of the same request
+/// reuses its plan while the library is unchanged.
+pub async fn mirror_library(State(state): State<AppState>, Path(library_id): Path<String>, axum::extract::Query(query): axum::extract::Query<MirrorQuery>, Json(body): Json<MirrorBody>) -> Result<Response, ServerError> {
     let cache = state.cache_for(Some(&library_id)).ok_or_else(|| ServerError::NotFound(format!("no library named {library_id:?}")))?;
     let options = options_of(&body)?;
     if !body.dry_run && body.fingerprint.is_none() {
         return Err(ServerError::BadRequest("executing needs the fingerprint of the dry run the user confirmed".into()));
     }
-    let (plan_cache, target) = (cache.clone(), body.target.clone());
-    let plan = tokio::task::spawn_blocking(move || mirror::plan(&plan_cache, &target, &options)).await.map_err(internal)?.map_err(plan_error)?;
+    let key = plan_key(&body.target, &options);
+    if body.dry_run && query.job == Some(true) {
+        let params = JobParams { mirror_request: Some((body.target.clone(), options)), ..Default::default() };
+        return Ok(started_as("mirror_plan", library_jobs::start_with(cache, JobKind::MirrorPlan, None, params)));
+    }
+    let reused = match (body.dry_run, body.fingerprint.as_deref()) {
+        (false, Some(fingerprint)) => recall_plan(&cache, &key, fingerprint),
+        _ => None,
+    };
+    let plan = match reused {
+        Some(plan) => plan,
+        None => {
+            let (plan_cache, target, plan_key_) = (cache.clone(), body.target.clone(), key.clone());
+            let dry_run = body.dry_run;
+            tokio::task::spawn_blocking(move || {
+                let watermark = plan_watermark(&plan_cache);
+                let plan = Arc::new(mirror::plan(&plan_cache, &target, &options)?);
+                if dry_run {
+                    remember_plan(&plan_cache, &plan_key_, watermark, &plan);
+                }
+                Ok::<_, MirrorError>(plan)
+            })
+            .await
+            .map_err(internal)?
+            .map_err(plan_error)?
+        }
+    };
 
     if body.dry_run {
         return Ok(Json(plan_json(&plan)).into_response());
@@ -166,7 +268,9 @@ pub async fn mirror_library(State(state): State<AppState>, Path(library_id): Pat
     if body.fingerprint.as_deref() != Some(plan.fingerprint.as_str()) {
         return Ok((StatusCode::CONFLICT, Json(json!({"error": "the copy would no longer be what was previewed (the library or the copy changed); preview it again", "fingerprint": plan.fingerprint}))).into_response());
     }
-    let params = JobParams { mirror: Some(Arc::new(plan)), ..Default::default() };
+    // A plan is spent by the run it started: the next run plans afresh.
+    forget_plan(&cache, &key);
+    let params = JobParams { mirror: Some(plan), ..Default::default() };
     Ok(started(library_jobs::start_with(cache, JobKind::Mirror, None, params)))
 }
 
@@ -346,6 +450,65 @@ mod tests {
         let scratch = tempfile::tempdir().unwrap();
         let ids = vec![add(&cache, scratch.path(), "Alpha", "alpha"), add(&cache, scratch.path(), "Beta", "beta"), add(&cache, scratch.path(), "Gamma", "gamma")];
         (dir, cache, router, scratch, ids)
+    }
+
+    /// The preview as a job: 202 and an id, the dry run's answer as the job's report, and the run
+    /// that follows it reuses that plan (it does not plan again) while the library is unchanged.
+    #[tokio::test]
+    async fn the_preview_can_be_a_job_and_the_run_reuses_its_plan() {
+        let (_dir, cache, router, scratch, _ids) = sample();
+        let out = tempfile::tempdir().unwrap();
+        let target = out.path().join("backup");
+        let body = |extra: Value| {
+            let mut b = json!({"target": target.to_str().unwrap(), "mode": "mirror"});
+            for (k, v) in extra.as_object().unwrap() {
+                b[k] = v.clone();
+            }
+            b
+        };
+        let (status, started) = call(&router, "POST", "/mirror-library/default?job=true", body(json!({}))).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{started}");
+        assert_eq!(started["kind"], "mirror_plan");
+        let job = finished(&router, &started).await;
+        assert_eq!(job["state"], "finished", "{job}");
+        let plan = &job["report"];
+        assert_eq!(plan["books"], 3, "{job}");
+        assert!(plan["fingerprint"].is_string());
+        assert_eq!(job["progress"]["phase"], "mirror_comparing");
+        assert!(!target.exists(), "a preview writes nothing");
+
+        // The run takes the remembered plan: it is the very one the preview made.
+        let (status, run) = call(&router, "POST", "/mirror-library/default", body(json!({"dry_run": false, "fingerprint": plan["fingerprint"]}))).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{run}");
+        let done = finished(&router, &run).await;
+        assert_eq!(done["report"]["complete"], true, "{done}");
+        assert!(target.join(".lexmechanic-mirror.json").exists());
+
+        // A plan is spent by its run; and a changed library is a different plan.
+        let (_, again) = call(&router, "POST", "/mirror-library/default?job=true", body(json!({}))).await;
+        let preview = finished(&router, &again).await;
+        add(&cache, scratch.path(), "Epsilon", "epsilon");
+        let (status, stale) = call(&router, "POST", "/mirror-library/default", body(json!({"dry_run": false, "fingerprint": preview["report"]["fingerprint"]}))).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{stale}");
+    }
+
+    /// A refused target is a 400 for the synchronous preview and the job's error for the job.
+    #[tokio::test]
+    async fn a_refused_target_fails_the_preview_job_with_the_reason() {
+        let (dir, _cache, router, _s, _ids) = sample();
+        let (status, started) = call(&router, "POST", "/mirror-library/default?job=true", json!({"target": dir.path().join("inside").to_str().unwrap(), "mode": "mirror"})).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{started}");
+        let id = started["job_id"].as_u64().unwrap();
+        let mut job = Value::Null;
+        for _ in 0..200 {
+            job = get(&router, &format!("/library-jobs/{id}")).await;
+            if job["state"] != "running" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(job["state"], "failed", "{job}");
+        assert!(job["error"].as_str().unwrap().to_lowercase().contains("library"), "{job}");
     }
 
     #[tokio::test]

@@ -15,6 +15,12 @@ import type { BookSummary } from "./types";
 export const CHUNK_SIZE = 100;
 /** Chunk requests in flight at once; the rest wait in a queue that a scroll replaces. */
 export const MAX_IN_FLIGHT = 2;
+/**
+ * Most summaries kept at once. Scrolling a 60,000-book library used to cache every row it
+ * ever showed (the heap grew to the whole library); past this the chunks scrolled
+ * furthest back are dropped and fetched again if the user returns to them.
+ */
+export const MAX_CACHED_ROWS = 5000;
 
 export interface IdList {
   ids: number[];
@@ -28,6 +34,8 @@ export interface BookWindowOptions {
   fetchBooks: (ids: number[]) => Promise<BookSummary[]>;
   chunkSize?: number;
   maxInFlight?: number;
+  /** Most rows kept (default [`MAX_CACHED_ROWS`]); the ones around the viewport are never dropped. */
+  maxCachedRows?: number;
 }
 
 export interface BookWindow {
@@ -53,7 +61,10 @@ export interface BookWindow {
   getById(id: number): BookSummary | undefined;
   /** Ids in `[from, to]` (either order), inclusive, loaded or not. */
   idsBetween(a: number, b: number): number[];
-  /** Fetch any of these ids that are not cached, then return their summaries. */
+  /**
+   * Fetch any of these ids that are not cached, then return their summaries (in order, those
+   * that exist). The returned rows are the answer: the cache may not keep them all.
+   */
   ensureLoaded(ids: number[]): Promise<BookSummary[]>;
   /** Replace a cached summary (an edit), returning the previous one. */
   patch(id: number, changes: Partial<BookSummary>): BookSummary | undefined;
@@ -67,6 +78,7 @@ export interface BookWindow {
 export function createBookWindow(options: BookWindowOptions): BookWindow {
   const chunkSize = options.chunkSize ?? CHUNK_SIZE;
   const maxInFlight = options.maxInFlight ?? MAX_IN_FLIGHT;
+  const maxRows = Math.max(chunkSize * 4, options.maxCachedRows ?? MAX_CACHED_ROWS);
 
   const ids = shallowRef<number[]>([]);
   const total = shallowRef(0);
@@ -85,6 +97,36 @@ export function createBookWindow(options: BookWindowOptions): BookWindow {
   let queue: number[] = [];
   let wanted = { first: 0, last: 0 };
   let listToken = 0;
+  /** When each chunk was last wanted or loaded, for dropping the least recently used. */
+  const lastUsed = new Map<number, number>();
+  let tick = 0;
+
+  /**
+   * Keeps the cache within `maxRows` by dropping whole chunks (a row dropped from a chunk
+   * that still counts as loaded would stay blank for good), least recently used first and
+   * never the ones around the viewport.
+   */
+  function enforceCap() {
+    if (cache.size <= maxRows) return;
+    const near = new Set(chunksFor(wanted.first - chunkSize, wanted.last + chunkSize));
+    const order = [...lastUsed.entries()].filter(([c]) => !near.has(c)).sort((a, b) => a[1] - b[1]);
+    for (const [chunk] of order) {
+      if (cache.size <= maxRows) break;
+      for (const id of ids.value.slice(chunk * chunkSize, (chunk + 1) * chunkSize)) cache.delete(id);
+      loadedChunks.delete(chunk);
+      lastUsed.delete(chunk);
+    }
+    if (cache.size <= maxRows) return;
+    // Rows that arrived outside any loaded chunk (a selection's ensureLoaded, a put):
+    // oldest first, again sparing the viewport.
+    for (const id of [...cache.keys()]) {
+      if (cache.size <= maxRows) break;
+      const at = indexById.get(id);
+      if (at !== undefined && near.has(Math.floor(at / chunkSize))) continue;
+      cache.delete(id);
+      if (at !== undefined) loadedChunks.delete(Math.floor(at / chunkSize));
+    }
+  }
 
   function bump() {
     version.value += 1;
@@ -120,6 +162,8 @@ export function createBookWindow(options: BookWindowOptions): BookWindow {
       if (gen !== generation) return;
       for (const b of books) cache.set(b.id, b);
       loadedChunks.add(chunk);
+      lastUsed.set(chunk, ++tick);
+      enforceCap();
       bump();
     } catch (e) {
       if (gen === generation) error.value = e instanceof Error ? e.message : String(e);
@@ -131,6 +175,7 @@ export function createBookWindow(options: BookWindowOptions): BookWindow {
 
   function setRange(first: number, last: number) {
     wanted = { first, last };
+    for (const c of chunksFor(first, last)) if (loadedChunks.has(c)) lastUsed.set(c, ++tick);
     const needed = chunksFor(first, last).filter((c) => !loadedChunks.has(c));
     // A scroll replaces the queue outright: chunks the viewport has
     // left are never started. (Ones already in flight finish and are
@@ -151,6 +196,7 @@ export function createBookWindow(options: BookWindowOptions): BookWindow {
       total.value = result.total;
       indexById = new Map(result.ids.map((id, i) => [id, i]));
       loadedChunks = new Set();
+      lastUsed.clear();
       inFlight.clear();
       queue = [];
       if (!keep) cache.clear();
@@ -165,6 +211,7 @@ export function createBookWindow(options: BookWindowOptions): BookWindow {
       total.value = 0;
       indexById = new Map();
       loadedChunks = new Set();
+      lastUsed.clear();
       queue = [];
       cache.clear();
       bump();
@@ -205,13 +252,25 @@ export function createBookWindow(options: BookWindowOptions): BookWindow {
       return hi < lo ? [] : ids.value.slice(lo, hi + 1);
     },
     async ensureLoaded(want) {
-      const missing = want.filter((id) => !cache.has(id));
+      // What is asked for is collected here, not read back from the cache afterwards:
+      // the cache is capped, and loading 60,000 rows into it would push the first ones out.
+      const got = new Map<number, BookSummary>();
+      const missing: number[] = [];
+      for (const id of want) {
+        const have = cache.get(id);
+        if (have) got.set(id, have);
+        else missing.push(id);
+      }
       for (let i = 0; i < missing.length; i += chunkSize) {
         const books = await options.fetchBooks(missing.slice(i, i + chunkSize));
-        for (const b of books) cache.set(b.id, b);
+        for (const b of books) {
+          got.set(b.id, b);
+          cache.set(b.id, b);
+        }
+        enforceCap();
       }
       if (missing.length > 0) bump();
-      return want.map((id) => cache.get(id)).filter((b): b is BookSummary => b !== undefined);
+      return want.map((id) => got.get(id)).filter((b): b is BookSummary => b !== undefined);
     },
     patch(id, changes) {
       const before = cache.get(id);

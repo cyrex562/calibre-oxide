@@ -736,3 +736,46 @@ fn trashing_a_book_leaves_the_book_kept_in_its_data_folder_alone() {
     assert!(lib.path().join("Reports/_data/dataset.pdf").is_file(), "the other book's file stays");
     assert!(cache.all_book_ids().unwrap().contains(&b));
 }
+
+/// A PDF's cover is not rendered while importing (a render takes PDFium's one process-wide lock,
+/// so doing it per file made the whole import single-threaded): the book is queued for the
+/// enrichment pass, which the import runs when its batches are done.
+#[test]
+fn a_pdfs_cover_is_left_to_the_enrichment_pass_that_ends_the_import() {
+    let (_dir, cache) = library();
+    let source = tempfile::tempdir().unwrap();
+    for i in 0..3 {
+        write(&source.path().join(format!("Doc {i}.pdf")), format!("%PDF-1.4 not really a pdf {i}").as_bytes());
+    }
+    write(&source.path().join("Real.epub"), &epub("A Real Book", "Some Author", "n1"));
+
+    let control = JobControl::new();
+    let pipeline = PipelineOptions::with_workers(2);
+    let report = import_folder(&cache, source.path(), &ImportOptions::default(), &pipeline, &control).unwrap();
+
+    assert_eq!(report.books_added, 4, "{report:?}");
+    let enrichment = report.enrichment.as_ref().expect("the import ends with the enrichment pass");
+    assert_eq!(enrichment.remaining, 0, "{enrichment:?}");
+    assert!(cache.checksums().pending_enrichment().unwrap().is_empty(), "the queue is empty once the pass ran");
+    // The EPUB was read in full while importing; the PDFs offered no title and keep their file names.
+    assert!(titles(&cache).contains(&"A Real Book".to_string()));
+    assert!(titles(&cache).contains(&"Doc 0".to_string()));
+}
+
+/// The queue is what makes a deferred cover safe: a book whose cover was never rendered is
+/// still listed for the pass, so a cancelled import or a restart does not lose it.
+#[test]
+fn an_imported_pdf_is_queued_for_its_cover_until_the_pass_runs() {
+    let (_dir, cache) = library();
+    let staged = tempfile::tempdir().unwrap();
+    write(&staged.path().join("one.pdf"), b"%PDF one");
+    let meta = lexmechanic_ebooks::metadata::MetaInformation { title: "One".to_string(), authors: vec!["Ann".to_string()], ..Default::default() };
+    let item = |queue: Option<&str>| crate::cache::ImportItem {
+        metadata: meta.clone(),
+        files: vec![crate::cache::ImportFile { staged: staged.path().join("one.pdf"), ext: "pdf".into(), size: 8, hash: blake3::hash(b"%PDF one").to_hex().to_string() }],
+        placement: None,
+        queue_enrichment: queue.map(String::from),
+    };
+    let book = cache.import_books_batch(&[item(Some("PDF"))]).remove(0).unwrap();
+    assert_eq!(cache.checksums().pending_enrichment().unwrap().iter().map(|(id, f, ..)| (*id, f.clone())).collect::<Vec<_>>(), vec![(book.id, "PDF".to_string())]);
+}

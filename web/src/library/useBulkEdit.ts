@@ -19,15 +19,15 @@ import type { BookSummary, FieldMetaEntry } from "./types";
 import { setFields, setFieldsBatch, setFieldsRelative } from "./api";
 import { runBulkEdit as runBatchedEdit, type BulkItem } from "./bulkBatch";
 import { inverseRelativeOps, relativeTagOp, runRelativeEdit, type RelativeOp } from "./bulkRelative";
-import { changesFor, describeBulkResult, inverseChanges, isEmptySpec, validateSpec, type BulkEditSpec } from "./bulkEdit";
+import { changesFor, describeBulkResult, inverseChanges, isEmptySpec, uniformChanges, validateSpec, type BulkEditSpec } from "./bulkEdit";
 import { showToast } from "./deleteFlow";
 
 export interface BulkEditDeps {
   selectedIds: Ref<Set<number>>;
   selectMode: Ref<boolean>;
   fieldMetadata: Ref<Record<string, FieldMetaEntry>>;
-  /** The loaded books: `ensureLoaded` fetches the ones a selection reached without scrolling to them. */
-  win: { ensureLoaded(ids: number[]): Promise<unknown>; getById(id: number): BookSummary | undefined };
+  /** The loaded books: `ensureLoaded` fetches the ones a selection reached without scrolling to them (and returns them: the cache is capped). */
+  win: { ensureLoaded(ids: number[]): Promise<BookSummary[]>; getById(id: number): BookSummary | undefined };
   /** The edit changed books: bring every view up to date. */
   onChanged: () => Promise<void>;
 }
@@ -163,44 +163,60 @@ export function useBulkEdit({ selectedIds, fieldMetadata, win, onChanged }: Bulk
 
     let changed = 0;
     let skipped = 0;
-    // A selection can reach rows that were never scrolled to (select
-    // all, a long shift-range): fetch the ones that are not loaded.
-    try {
-      await win.ensureLoaded(ids);
-    } catch (e) {
-      errors.value.push(`Could not read the selected books: ${e instanceof Error ? e.message : String(e)}`);
-    }
     cancelled = false;
     // What each book needs is worked out here, per book, before anything is sent.
     const items: BulkItem[] = [];
     // What each written book held before, so the edit can be undone: the old value of exactly the fields written.
     const before: BulkItem[] = [];
     let lostFields = new Set<string>();
-    for (const id of ids) {
-      const current = win.getById(id);
-      if (!current) {
-        errors.value.push(`Book ${id}: could not be loaded`);
-        continue;
-      }
+    // An edit that gives every book the same values (set the publisher, the series, a rating...) does
+    // not depend on what a book has now: no row is read first, and the server says what it replaced.
+    const uniform = uniformChanges(edit);
+    if (uniform) {
+      for (const id of ids) items.push({ id, changes: uniform });
+    } else {
+      // A selection can reach rows that were never scrolled to (select
+      // all, a long shift-range): fetch the ones that are not loaded.
+      let loaded = new Map<number, BookSummary>();
       try {
-        const changes = changesFor(current, edit);
-        if (changes) {
-          items.push({ id, changes });
-          const inverse = inverseChanges(current, changes);
-          if (Object.keys(inverse.changes).length > 0) before.push({ id, changes: inverse.changes });
-          lostFields = new Set([...lostFields, ...inverse.lost]);
-        } else skipped += 1;
+        loaded = new Map((await win.ensureLoaded(ids)).map((b) => [b.id, b]));
       } catch (e) {
-        errors.value.push(`Book ${id}: ${e instanceof Error ? e.message : String(e)}`);
+        errors.value.push(`Could not read the selected books: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      for (const id of ids) {
+        const current = loaded.get(id) ?? win.getById(id);
+        if (!current) {
+          errors.value.push(`Book ${id}: could not be loaded`);
+          continue;
+        }
+        try {
+          const changes = changesFor(current, edit);
+          if (changes) {
+            items.push({ id, changes });
+            const inverse = inverseChanges(current, changes);
+            if (Object.keys(inverse.changes).length > 0) before.push({ id, changes: inverse.changes });
+            lostFields = new Set([...lostFields, ...inverse.lost]);
+          } else skipped += 1;
+        } catch (e) {
+          errors.value.push(`Book ${id}: ${e instanceof Error ? e.message : String(e)}`);
+        }
       }
     }
     progress.value = { done: 0, total: items.length };
     const pool = await runBatchedEdit(items, {
-      sendBatch: setFieldsBatch,
+      sendBatch: uniform ? (groups) => setFieldsBatch(groups, { previous: true }) : (groups) => setFieldsBatch(groups),
       sendOne: setFields,
       cancelled: () => cancelled,
       onProgress: (done, total) => (progress.value = { done, total }),
     });
+    if (uniform) {
+      // Undo from what the server said each book held (a server that does not say leaves no Undo).
+      for (const [id, row] of pool.previous) {
+        const inverse = inverseChanges({ id, ...row } as BookSummary, uniform);
+        if (Object.keys(inverse.changes).length > 0) before.push({ id, changes: inverse.changes });
+        lostFields = new Set([...lostFields, ...inverse.lost]);
+      }
+    }
     changed = pool.updated;
     errors.value.push(...pool.errors);
     busy.value = false;

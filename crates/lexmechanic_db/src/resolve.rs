@@ -228,32 +228,93 @@ pub fn execute_resolve(cache: &Cache, run_id: &str, action: ResolveAction, plan:
     let mut out = ResolveReport { run_id: run_id.to_string(), action: action.name().to_string(), groups_planned: plan.len(), ..Default::default() };
     control.total.store(plan.len() as u64, Ordering::Relaxed);
     control.set_phase("resolving");
-    for group in plan {
+    // Trashing is done a chunk of groups at a time: one transaction and one
+    // change-log entry per chunk instead of per book (see
+    // `Cache::delete_books_with`). A merge does its own per-group work.
+    let chunk_size = if action == ResolveAction::KeepBestTrashRest { TRASH_CHUNK_GROUPS } else { 1 };
+    for chunk in plan.chunks(chunk_size) {
         if control.is_cancelled() {
             out.cancelled = true;
             break;
         }
-        match resolve_group(cache, run_id, action, group, keep_duplicate_formats) {
-            Ok(done) => {
-                out.books_trashed += done.trashed_books;
-                out.trashed_files.extend(done.files);
-                if done.errors.is_empty() {
-                    out.groups_done += 1;
-                    out.done_groups.push(group.group_id.clone());
-                    out.bytes_freed += group.bytes_freed;
-                } else {
+        let results: Vec<Result<GroupDone>> = if action == ResolveAction::KeepBestTrashRest { resolve_trash_chunk(cache, run_id, chunk) } else { chunk.iter().map(|g| resolve_group(cache, run_id, action, g, keep_duplicate_formats)).collect() };
+        for (group, result) in chunk.iter().zip(results) {
+            match result {
+                Ok(done) => {
+                    out.books_trashed += done.trashed_books;
+                    out.trashed_files.extend(done.files);
+                    if done.errors.is_empty() {
+                        out.groups_done += 1;
+                        out.done_groups.push(group.group_id.clone());
+                        out.bytes_freed += group.bytes_freed;
+                    } else {
+                        control.errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                    out.errors.extend(done.errors.into_iter().map(|e| (group.group_id.clone(), e)));
+                }
+                Err(e) => {
+                    out.errors.push((group.group_id.clone(), format!("{e:#}")));
                     control.errors.fetch_add(1, Ordering::Relaxed);
                 }
-                out.errors.extend(done.errors.into_iter().map(|e| (group.group_id.clone(), e)));
             }
-            Err(e) => {
-                out.errors.push((group.group_id.clone(), format!("{e:#}")));
-                control.errors.fetch_add(1, Ordering::Relaxed);
-            }
+            control.seen.fetch_add(1, Ordering::Relaxed);
         }
-        control.seen.fetch_add(1, Ordering::Relaxed);
     }
     out
+}
+
+/// Groups trashed per transaction. Small enough that a cancel lands within a
+/// second or two and a crash leaves few trashed-but-unlogged books.
+const TRASH_CHUNK_GROUPS: usize = 25;
+
+/// [`resolve_group`] for [`ResolveAction::KeepBestTrashRest`], over several
+/// groups: each group's keeper is checked as before, then every other book of
+/// every group that passed is deleted in one batch. One result per group.
+fn resolve_trash_chunk(cache: &Cache, run_id: &str, groups: &[PlannedResolve]) -> Vec<Result<GroupDone>> {
+    let mut results: Vec<Option<Result<GroupDone>>> = groups.iter().map(|_| None).collect();
+    // (group index, book id) for every book to delete, in order.
+    let mut doomed: Vec<(usize, i32)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (idx, group) in groups.iter().enumerate() {
+        let head = (|| -> Result<Option<String>> {
+            if cache.field_for(group.keeper, "path")?.is_none() {
+                return Ok(Some(format!("the keeper (book {}) is no longer in the library; nothing was changed", group.keeper)));
+            }
+            if !has_file_on_disk(cache, group.keeper)? {
+                return Ok(Some(format!("the keeper (book {}) has no file on disk; nothing was changed", group.keeper)));
+            }
+            for id in group.others.iter().copied().filter(|id| *id != group.keeper) {
+                if cache.field_for(id, "path")?.is_none() {
+                    continue; // already gone
+                }
+                if seen.insert(id) {
+                    doomed.push((idx, id));
+                }
+            }
+            Ok(None)
+        })();
+        match head {
+            Ok(None) => results[idx] = Some(Ok(GroupDone::default())),
+            Ok(Some(why)) => results[idx] = Some(Ok(GroupDone { errors: vec![why], ..Default::default() })),
+            Err(e) => results[idx] = Some(Err(e)),
+        }
+    }
+    let ids: Vec<i32> = doomed.iter().map(|(_, id)| *id).collect();
+    let deletions = crate::trash::with_trash_run(run_id, || crate::removal::delete_many_with_file(cache, &ids));
+    for ((idx, id), deletion) in doomed.into_iter().zip(deletions) {
+        let Some(Ok(done)) = results[idx].as_mut() else { continue };
+        match deletion {
+            Ok(report) => {
+                done.trashed_books += 1;
+                done.files.extend(report.deleted);
+                for (path, why) in report.failed {
+                    done.errors.push(format!("book {id}: {path} could not be moved to the trash: {why}"));
+                }
+            }
+            Err(e) => done.errors.push(format!("book {id}: {e:#}")),
+        }
+    }
+    results.into_iter().map(|r| r.unwrap_or_else(|| Ok(GroupDone::default()))).collect()
 }
 
 #[derive(Default)]
@@ -533,5 +594,74 @@ mod tests {
         assert_ne!(base, plan_fingerprint(ResolveAction::MergeAsFormats, &p, "w1"));
         assert_ne!(base, plan_fingerprint(ResolveAction::KeepBestTrashRest, &p, "w2"));
         assert_ne!(base, plan_fingerprint(ResolveAction::KeepBestTrashRest, &plan(2, &[1, 3]), "w1"));
+    }
+
+    /// More groups than one chunk: every other book is trashed under the run id, a group whose
+    /// keeper has no file is left alone and reported, and the trashing is batched (a few
+    /// change-log entries, not one per book).
+    #[test]
+    fn a_run_of_many_groups_is_trashed_in_chunks_with_the_same_results() {
+        let lib = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let cache = Cache::new(lib.path()).unwrap();
+        let mut plan = Vec::new();
+        let mut doomed = Vec::new();
+        let mut bad_keeper = 0;
+        for g in 0..(TRASH_CHUNK_GROUPS + 5) {
+            let keeper = add_book(src.path(), &cache, &format!("k{g}.txt"), &format!("Keep {g}"), format!("keeper {g}").as_bytes());
+            let a = add_book(src.path(), &cache, &format!("a{g}.txt"), &format!("Extra A{g}"), format!("a {g}").as_bytes());
+            let b = add_book(src.path(), &cache, &format!("b{g}.txt"), &format!("Extra B{g}"), format!("b {g}").as_bytes());
+            if g == 3 {
+                // A keeper whose file is gone: nothing in its group is touched.
+                std::fs::remove_file(cache.format_file_info(keeper).unwrap()[0].path.clone()).unwrap();
+                bad_keeper = keeper;
+            } else {
+                doomed.extend([a, b]);
+            }
+            plan.push(PlannedResolve { group_id: format!("g{g}"), keeper, keeper_reason: "test".into(), others: vec![a, b], bytes_freed: 5 });
+        }
+        let before = cache.backend.change_log().unwrap().next_sequence();
+        let control = JobControl::new();
+        let report = execute_resolve(&cache, "run-chunks", ResolveAction::KeepBestTrashRest, &plan, false, &control);
+        let entries = cache.backend.change_log().unwrap().next_sequence() - before;
+
+        assert_eq!(report.groups_planned, plan.len());
+        assert_eq!(report.groups_done, plan.len() - 1, "{report:?}");
+        assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+        assert_eq!(report.errors[0].0, "g3");
+        assert_eq!(report.books_trashed, doomed.len());
+        assert_eq!(control.snapshot().seen as usize, plan.len());
+        let remaining = cache.all_book_ids().unwrap();
+        for id in &doomed {
+            assert!(!remaining.contains(id), "book {id} should be trashed");
+        }
+        assert!(remaining.contains(&bad_keeper));
+        assert_eq!(cache.trash_entries_for_run("run-chunks").unwrap().len(), doomed.len());
+        assert!(entries <= 2, "{entries} change-log entries for {} books: one per chunk, not per book", doomed.len());
+
+        // And the whole run restores.
+        let restored = cache.restore_trash_run("run-chunks").unwrap();
+        assert!(restored.failed.is_empty(), "{:?}", restored.failed);
+        assert_eq!(restored.restored.len(), doomed.len());
+    }
+
+    /// A cancel lands between chunks and what was done stays done.
+    #[test]
+    fn a_cancelled_run_stops_before_the_next_chunk() {
+        let lib = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let cache = Cache::new(lib.path()).unwrap();
+        let mut plan = Vec::new();
+        for g in 0..3 {
+            let keeper = add_book(src.path(), &cache, &format!("k{g}.txt"), &format!("Keep {g}"), format!("keeper {g}").as_bytes());
+            let a = add_book(src.path(), &cache, &format!("a{g}.txt"), &format!("Extra A{g}"), format!("a {g}").as_bytes());
+            plan.push(PlannedResolve { group_id: format!("g{g}"), keeper, keeper_reason: "test".into(), others: vec![a], bytes_freed: 1 });
+        }
+        let control = JobControl::new();
+        control.cancel();
+        let report = execute_resolve(&cache, "run-cancel", ResolveAction::KeepBestTrashRest, &plan, false, &control);
+        assert!(report.cancelled);
+        assert_eq!(report.books_trashed, 0);
+        assert_eq!(cache.all_book_ids().unwrap().len(), 6);
     }
 }

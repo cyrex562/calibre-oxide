@@ -538,6 +538,18 @@ pub fn router(state: AppState) -> axum::Router {
     // matching the standard SPA-serving pattern. Behind the same auth
     // layer as everything else, matching upstream's own `index()`
     // endpoint (`auth_required=True`).
+    // JSON answers over 1 KB are gzipped for a client that accepts it: the folder
+    // tree, a page of books or a job report is hundreds of KB of repetitive text
+    // and a LAN client waits on every byte. Only `application/json`: book files,
+    // covers, page images and event streams are left exactly as they were. (The
+    // static files below are compressed by their own layer.)
+    let api = {
+        use tower_http::compression::Predicate as _;
+        let json_only = |_: axum::http::StatusCode, _: axum::http::Version, headers: &axum::http::HeaderMap, _: &axum::http::Extensions| {
+            headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|ct| ct.trim_start().to_ascii_lowercase().starts_with("application/json"))
+        };
+        api.layer(tower_http::compression::CompressionLayer::new().gzip(true).compress_when(tower_http::compression::predicate::SizeAbove::new(1024).and(json_only)))
+    };
     let api = match state.opts.static_dir.as_deref().map(std::path::Path::new).filter(|d| d.is_dir()) {
         Some(dir) => {
             // `ServeDir::not_found_service` (tower_http's other

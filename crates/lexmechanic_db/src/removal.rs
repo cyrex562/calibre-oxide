@@ -213,6 +213,25 @@ pub fn delete_with_file(cache: &Cache, book_id: i32) -> Result<RemovalReport> {
     Ok(report)
 }
 
+/// [`delete_with_file`] for many books: one transaction for the rows and one
+/// change-log entry for the lot ([`Cache::delete_books_with`]). One result per
+/// id, in order.
+pub fn delete_many_with_file(cache: &Cache, book_ids: &[i32]) -> Vec<Result<RemovalReport>> {
+    let mut cleared: Vec<Result<()>> = book_ids.iter().map(|id| cache.orphans().clear_all_for_book(*id)).collect();
+    // A book whose orphan entries could not be cleared is not deleted, as in
+    // `delete_with_file`.
+    let ok_ids: Vec<i32> = book_ids.iter().zip(&cleared).filter(|(_, c)| c.is_ok()).map(|(id, _)| *id).collect();
+    let mut deletions = cache.delete_books_with(&ok_ids, crate::cache::BookFiles::Trash).into_iter();
+    book_ids
+        .iter()
+        .zip(cleared.iter_mut())
+        .map(|(_, c)| match std::mem::replace(c, Ok(())) {
+            Err(e) => Err(e),
+            Ok(()) => deletions.next().expect("one deletion per cleared book").map(|outcome| RemovalReport { deleted: outcome.trashed, ignored: outcome.ignored, failed: outcome.failed }),
+        })
+        .collect()
+}
+
 /// Reads a file's hash for an ignore check, or `None` if it cannot be
 /// read.
 pub fn hash_for_ignore_check(path: &Path) -> Option<String> {

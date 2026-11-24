@@ -20,6 +20,24 @@ describe("groupByChanges", () => {
   });
 });
 
+describe("runBulkEdit previous values", () => {
+  it("collects what the server says each written book held before", async () => {
+    const result = await runBulkEdit(items(3), {
+      sendBatch: async (groups) => ({ updated: groups.flatMap((g) => g.book_ids), failed: [], previous: { "1": { publisher: "A" }, "2": { publisher: null }, "3": { publisher: "C" } } }),
+      sendOne: async () => ({}),
+    });
+    expect([...result.previous.entries()]).toEqual([
+      [1, { publisher: "A" }],
+      [2, { publisher: null }],
+      [3, { publisher: "C" }],
+    ]);
+  });
+
+  it("has none from a server that does not say", async () => {
+    expect((await runBulkEdit(items(3), { sendBatch: everyoneUpdated, sendOne: async () => ({}) })).previous.size).toBe(0);
+  });
+});
+
 describe("runBulkEdit", () => {
   it("sends about 200 books per request and reports progress per chunk", async () => {
     const sizes: number[] = [];
@@ -37,7 +55,7 @@ describe("runBulkEdit", () => {
     expect(BATCH_CHUNK).toBe(200);
     expect(sizes).toEqual([200, 200, 50]);
     expect(progress).toEqual([[200, 450], [400, 450], [450, 450]]);
-    expect(result).toEqual({ updated: 450, errors: [], notStarted: 0, usedFallback: false });
+    expect(result).toEqual({ updated: 450, errors: [], notStarted: 0, usedFallback: false, previous: new Map() });
   });
 
   it("sends one group per distinct change set within a chunk", async () => {
@@ -107,7 +125,7 @@ describe("runBulkEdit", () => {
       onProgress: (d) => progress.push(d),
     });
     expect(sent.sort((a, b) => a - b)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-    expect(result).toEqual({ updated: 10, errors: [], notStarted: 0, usedFallback: true });
+    expect(result).toEqual({ updated: 10, errors: [], notStarted: 0, usedFallback: true, previous: new Map() });
     expect(progress[progress.length - 1]).toBe(10);
   });
 
@@ -132,6 +150,6 @@ describe("runBulkEdit", () => {
 
   it("does nothing for an empty list", async () => {
     const result = await runBulkEdit([], { sendBatch: everyoneUpdated, sendOne: async () => undefined });
-    expect(result).toEqual({ updated: 0, errors: [], notStarted: 0, usedFallback: false });
+    expect(result).toEqual({ updated: 0, errors: [], notStarted: 0, usedFallback: false, previous: new Map() });
   });
 });

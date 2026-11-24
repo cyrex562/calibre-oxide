@@ -77,7 +77,16 @@ pub struct FileDigest {
 /// cancel is noticed between chunks, surfacing as
 /// [`io::ErrorKind::Interrupted`].
 pub fn hash_stream(path: &Path, control: Option<&JobControl>) -> io::Result<FileDigest> {
+    hash_stream_with_identity(path, control).map(|(digest, _)| digest)
+}
+
+/// [`hash_stream`], also answering the file's filesystem identity from the
+/// **same** open handle. Asking for it with a separate `identity(path)` opened
+/// every file twice, which on a scanned disk or a share is most of what hashing
+/// a library of small files costs.
+pub fn hash_stream_with_identity(path: &Path, control: Option<&JobControl>) -> io::Result<(FileDigest, Option<lexmechanic_utils::filenames::FileIdentity>)> {
     let mut file = std::fs::File::open(path)?;
+    let identity = lexmechanic_utils::filenames::identity_of_open_file(&file);
     if let Some(control) = control {
         control.file_opens.fetch_add(1, Ordering::Relaxed);
     }
@@ -100,7 +109,7 @@ pub fn hash_stream(path: &Path, control: Option<&JobControl>) -> io::Result<File
             control.bytes_hashed.fetch_add(n as u64, Ordering::Relaxed);
         }
     }
-    Ok(FileDigest { hash: hasher.finalize().to_hex().to_string(), size })
+    Ok((FileDigest { hash: hasher.finalize().to_hex().to_string(), size }, identity))
 }
 
 /// Tuning for the pipeline.
@@ -728,8 +737,8 @@ pub fn backfill_hashes(cache: &Cache, options: &PipelineOptions, control: &JobCo
         let digests = parallel_map(chunk, options.workers, control, |(_, format, name, folder)| match format_file_path(&library, folder, name, format) {
             None => Err(None),
             Some(path) => {
-                let identity = lexmechanic_utils::filenames::identity(&path);
-                hash_stream(&path, Some(control)).map(|digest| (digest, identity)).map_err(Some)
+                // One open for both the content and the identity.
+                hash_stream_with_identity(&path, Some(control)).map_err(Some)
             }
         });
 
@@ -1420,5 +1429,20 @@ mod tests {
         for phase in ["walk", "drift", "index_hash", "index_write", "enrich_read", "enrich_write", "covers"] {
             assert!(timings.contains_key(phase), "no {phase} timing in {timings:?}");
         }
+    }
+
+    /// One open gives the content hash and the identity: the same answers the two calls it
+    /// replaces gave (each of which opened the file).
+    #[test]
+    fn hashing_reads_the_identity_from_the_same_open_handle() {
+        let (dir, _cache) = library();
+        write(&dir.path().join("a.pdf"), b"%PDF identity");
+        let path = dir.path().join("a.pdf");
+        let control = JobControl::default();
+        let (digest, identity) = hash_stream_with_identity(&path, Some(&control)).unwrap();
+        assert_eq!(digest, hash_stream(&path, None).unwrap());
+        assert!(identity.is_some());
+        assert_eq!(identity, lexmechanic_utils::filenames::identity(&path));
+        assert_eq!(control.file_opens.load(Ordering::Relaxed), 1);
     }
 }

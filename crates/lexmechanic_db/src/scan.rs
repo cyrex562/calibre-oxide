@@ -105,12 +105,19 @@ pub struct ScanOptions {
     /// which on Windows opens the file. Files are reported with a placeholder
     /// identity, so a report made this way is for counting, not for tracking.
     pub names_only: bool,
+    /// Report each file's size and mtime (which the directory listing carries
+    /// for free) but leave its identity unread: on Windows reading it opens the
+    /// file, which costs milliseconds each on a scanned disk or a share.
+    /// [`ScanReport::identity_deferred`] is then set, and a consumer that needs
+    /// an identity (the drift pass, for a few candidate files) asks for it.
+    pub lazy_identity: bool,
 }
 
 impl Default for ScanOptions {
     fn default() -> Self {
         ScanOptions {
             names_only: false,
+            lazy_identity: false,
             settle: DEFAULT_SETTLE,
             // `metadata_extensions` is the list this crate already
             // treats as "a book file", minus `opf`, which is metadata
@@ -154,6 +161,9 @@ pub struct ScanReport {
     /// instead of reading the files again; each is valid only for the size the
     /// walk saw.
     pub precomputed: std::collections::HashMap<String, crate::scan_pipeline::FileDigest>,
+    /// The files' identities were not read (see [`ScanOptions::lazy_identity`]);
+    /// each `facts.identity` is a placeholder and must not be compared.
+    pub identity_deferred: bool,
 }
 
 impl ScanReport {
@@ -180,7 +190,7 @@ pub fn walk(library_path: &Path, options: &ScanOptions, now: SystemTime) -> Resu
 /// (with the partial report) when it is cancelled. The caller must check
 /// `control.is_cancelled()` before treating a report as a whole scan.
 pub fn walk_controlled(library_path: &Path, options: &ScanOptions, now: SystemTime, control: Option<&crate::scan_pipeline::JobControl>) -> Result<ScanReport> {
-    let mut report = ScanReport::default();
+    let mut report = ScanReport { identity_deferred: options.lazy_identity && !options.names_only, ..Default::default() };
     // The root failing is different from a subdirectory failing: there
     // is nothing to report on, and returning an empty report would say
     // "this library has no books".
@@ -329,7 +339,8 @@ fn walk_dir(root: &Path, dir: &Path, options: &ScanOptions, now: SystemTime, rep
             report.offline.push(relative_to(root, &path));
             continue;
         }
-        let Some(facts) = file_facts_from_metadata(&path, &metadata) else {
+        let facts = if options.lazy_identity { Some(cheap_facts(&metadata)) } else { file_facts_from_metadata(&path, &metadata) };
+        let Some(facts) = facts else {
             // Present in the listing but not stat-able: another
             // unreadable condition, not an absent file.
             report.unreadable.push(relative_to(root, dir));
@@ -426,6 +437,12 @@ fn is_offline_metadata(metadata: &std::fs::Metadata) -> bool {
         let _ = metadata;
         false
     }
+}
+
+/// A file's size and mtime from metadata alone, with a placeholder identity.
+fn cheap_facts(metadata: &std::fs::Metadata) -> FileFacts {
+    let mtime_ms = metadata.modified().ok().and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok()).map(|d| d.as_millis() as u64);
+    FileFacts { identity: FileIdentity { volume: 0, index: 0 }, size: metadata.len(), mtime_ms }
 }
 
 fn settling_by_mtime(metadata: &std::fs::Metadata, settle: Duration, now: SystemTime) -> bool {
