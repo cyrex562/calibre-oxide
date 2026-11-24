@@ -620,6 +620,20 @@ async function bookmarkCurrentPage() {
   }
 }
 
+/**
+ * Removes a bookmark, as the PDF reader does: it is saved again, newer, with
+ * `removed: true` so the deletion syncs, and leaves the list here.
+ */
+async function deleteBookmark(bookmark: Bookmark) {
+  bookmarkError.value = null;
+  try {
+    await removeAnnotation(bookId.value, fmt.value, "bookmark", bookmark);
+    bookmarks.value = bookmarks.value.filter((b) => b.title !== bookmark.title);
+  } catch (e) {
+    bookmarkError.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
 function goToBookmark(bookmark: Bookmark) {
   const pos = decodePosition(bookmark.pos);
   if (!pos) return;
@@ -1142,8 +1156,9 @@ function onReaderResize() {
     <nav v-if="showBookmarks" class="toc" :style="{ top: `${panelTop}px` }" aria-label="Bookmarks">
       <p v-if="bookmarks.length === 0" class="empty">No bookmarks yet.</p>
       <ul v-else>
-        <li v-for="b in bookmarks" :key="b.title">
+        <li v-for="b in bookmarks" :key="b.title" class="bookmark-row">
           <a href="#" @click.prevent="goToBookmark(b)">{{ b.title }}</a>
+          <button type="button" class="bookmark-remove" :aria-label="`Remove bookmark ${b.title}`" title="Remove this bookmark" @click="deleteBookmark(b)">✕</button>
         </li>
       </ul>
     </nav>
@@ -1183,6 +1198,18 @@ function onReaderResize() {
   list-style: none;
   margin: 0;
   padding: 0;
+}
+.bookmark-row {
+  display: flex;
+  align-items: center;
+}
+.bookmark-row a {
+  flex: 1;
+  min-width: 0;
+}
+.bookmark-remove {
+  flex: none;
+  padding: 0 0.35rem;
 }
 .toc a {
   display: block;

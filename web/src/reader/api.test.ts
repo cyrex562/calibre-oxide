@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { addBookmark, getAnnotations } from "./api";
+import { addBookmark, getAnnotations, removeAnnotation } from "./api";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -51,5 +51,27 @@ describe("addBookmark", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(addBookmark("999", "epub", "x", "p")).rejects.toThrow(/404/);
+  });
+});
+
+describe("removeAnnotation", () => {
+  it("re-saves an EPUB bookmark as removed, with a newer timestamp", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+    vi.stubGlobal("fetch", fetchMock);
+    const bookmark = { type: "bookmark" as const, title: "Ch 1", timestamp: "2020-01-01T00:00:00.000Z", pos: "p", pos_type: "lexmechanic-simple-pos" as const };
+    await removeAnnotation("7", "epub", "bookmark", bookmark);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/book-update-annotations/default/7/epub");
+    const sent = JSON.parse(init.body).bookmark[0];
+    expect(sent).toMatchObject({ title: "Ch 1", pos: "p", removed: true });
+    expect(Date.parse(sent.timestamp)).toBeGreaterThan(Date.parse(bookmark.timestamp));
+  });
+
+  it("stays newer than a bookmark stamped in the future", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+    vi.stubGlobal("fetch", fetchMock);
+    const future = new Date(Date.now() + 3_600_000).toISOString();
+    await removeAnnotation("7", "epub", "bookmark", { type: "bookmark", title: "x", timestamp: future, pos: "p", pos_type: "lexmechanic-simple-pos" });
+    expect(Date.parse(JSON.parse(fetchMock.mock.calls[0][1].body).bookmark[0].timestamp)).toBeGreaterThan(Date.parse(future));
   });
 });

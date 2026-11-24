@@ -90,7 +90,10 @@ export async function addBookmark(bookId: string, fmt: string, title: string, po
  * every reader here filters out.
  */
 export async function removeAnnotation(bookId: string, fmt: string, kind: "bookmark" | "highlight", annotation: Bookmark | Highlight): Promise<void> {
-  const gone = { ...annotation, removed: true, timestamp: new Date().toISOString() };
+  // Newer than the annotation, even if this clock runs behind the one that wrote it.
+  const then = Date.parse(annotation.timestamp);
+  const stamp = Number.isFinite(then) ? Math.max(Date.now(), then + 1) : Date.now();
+  const gone = { ...annotation, removed: true, timestamp: new Date(stamp).toISOString() };
   const resp = await fetch(`/book-update-annotations/${LIBRARY_ID}/${bookId}/${fmt}`, {
     method: "POST",
     headers: { "content-type": "application/json" },

@@ -86,6 +86,17 @@ pub struct PlannedBook {
     pub files: Vec<PlannedFile>,
     /// The name had to be suffixed to avoid an existing or planned file.
     pub suffixed: bool,
+    /// The book's own `data/` folder of attached files, moved with it (see
+    /// [`plan_data_dir`]). Journaled with the book, so an undo moves it back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_dir: Option<PlannedDir>,
+}
+
+/// A folder that moves with a book: `from` and `to`, relative to the library.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlannedDir {
+    pub from: String,
+    pub to: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -179,6 +190,9 @@ fn fingerprint(template: &str, books: &[PlannedBook]) -> String {
         h.update(format!("{}:{}>{};", b.book_id, b.old_path, b.new_path).as_bytes());
         for f in &b.files {
             h.update(format!("{}:{}>{};", f.format, f.from, f.to).as_bytes());
+        }
+        if let Some(d) = &b.data_dir {
+            h.update(format!("data:{}>{};", d.from, d.to).as_bytes());
         }
     }
     h.finalize().to_hex().to_string()[..16].to_string()
@@ -485,6 +499,103 @@ impl DiskView {
     }
 }
 
+/// Every book's folder (lower-cased, `/`-separated) with its id, read once and
+/// only when a plan meets a book with attachments to think about.
+#[derive(Default)]
+struct BookPaths {
+    all: Option<Vec<(String, i32)>>,
+}
+
+impl BookPaths {
+    fn get(&mut self, cache: &Cache) -> Result<&[(String, i32)]> {
+        if self.all.is_none() {
+            let conn = cache.backend.conn.lock().unwrap();
+            let mut stmt = conn.prepare("SELECT id, path FROM books")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, i32>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default())))?;
+            let mut all = Vec::new();
+            for row in rows {
+                let (id, path) = row?;
+                all.push((lexmechanic_utils::filenames::path_key(&path).trim_matches('/').to_string(), id));
+            }
+            self.all = Some(all);
+        }
+        Ok(self.all.as_deref().unwrap_or(&[]))
+    }
+}
+
+/// Where a book's attached files live (see `extra_files::data_dir`): the `data`
+/// folder of its own folder, or `data/<uuid>` for a book in the library root.
+fn data_rel(path: &str, uuid: &str) -> String {
+    if path.is_empty() {
+        format!("data/{uuid}")
+    } else {
+        format!("{path}/data")
+    }
+}
+
+/// The attachments folder that moves with a book, if there is one and the move is
+/// safe; otherwise `None`, with a plan warning when the folder is the book's but
+/// cannot be handled.
+///
+/// The folder is the book's own when no other book has it as its folder (a source
+/// tree's `Reports/data` can be a book's folder, its files not attachments), the
+/// book's folder is not shared with other books (they would lose it), nothing
+/// inside it is another book's folder, and the destination is free (no folder
+/// there, no other book already in the destination folder, which would share
+/// the attachments).
+#[allow(clippy::too_many_arguments)]
+fn plan_data_dir(cache: &Cache, disk: &mut DiskView, paths: &mut BookPaths, taken_data: &mut HashSet<String>, warnings: &mut Vec<Skipped>, book_id: i32, old_path: &str, new_path: &str) -> Result<Option<PlannedDir>> {
+    use lexmechanic_utils::filenames::path_key;
+    if path_key(old_path) == path_key(new_path) {
+        return Ok(None);
+    }
+    let uuid = cache.book_uuid(book_id)?.unwrap_or_default();
+    if uuid.is_empty() && (old_path.is_empty() || new_path.is_empty()) {
+        return Ok(None);
+    }
+    let (from, to) = (data_rel(old_path, &uuid), data_rel(new_path, &uuid));
+    match disk.entry(&from) {
+        Ok(Some(EntryKind::Dir)) => {}
+        Ok(Some(EntryKind::Link)) => {
+            warnings.push(Skipped { book_id, reason: format!("{from} is a link, so the files attached to this book there were not moved with it") });
+            return Ok(None);
+        }
+        _ => return Ok(None),
+    }
+    let warn = |warnings: &mut Vec<Skipped>, why: &str| warnings.push(Skipped { book_id, reason: format!("the files attached to this book in {from} stay where they are: {why}") });
+    if !old_path.is_empty() {
+        let from_key = path_key(&from);
+        let own_key = path_key(old_path).trim_matches('/').to_string();
+        let nested = format!("{from_key}/");
+        let others = paths.get(cache)?;
+        if others.iter().any(|(k, id)| *id != book_id && *k == from_key) {
+            // Another book's folder: what is in it are that book's files.
+            return Ok(None);
+        }
+        if others.iter().any(|(k, id)| *id != book_id && k.starts_with(&nested)) {
+            warn(warnings, "other books' folders are inside it");
+            return Ok(None);
+        }
+        if others.iter().any(|(k, id)| *id != book_id && *k == own_key) {
+            warn(warnings, "other books share this book's folder, and the attachments are shared with them");
+            return Ok(None);
+        }
+    }
+    if !new_path.is_empty() {
+        let dest_key = path_key(new_path).trim_matches('/').to_string();
+        if paths.get(cache)?.iter().any(|(k, id)| *id != book_id && *k == dest_key) {
+            warn(warnings, &format!("other books are already in {new_path}, and would share them"));
+            return Ok(None);
+        }
+    }
+    if taken_data.contains(&path_key(&to)) || disk.exists(&to) {
+        warn(warnings, &format!("{to} is already taken"));
+        return Ok(None);
+    }
+    taken_data.insert(path_key(&to));
+    Ok(Some(PlannedDir { from, to }))
+}
+
 /// The dry run: what [`execute`] would do. Changes nothing.
 pub fn plan(cache: &Cache, template: &str, scope: &Scope) -> Result<OrganizePlan> {
     plan_to(cache, Target::Template(template), scope)
@@ -513,6 +624,10 @@ pub fn plan_to(cache: &Cache, target: Target<'_>, scope: &Scope) -> Result<Organ
     let mut link_checked: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     // Lower-cased relative targets taken by earlier books in this plan.
     let mut taken: HashSet<String> = HashSet::new();
+    // Lower-cased `data/` folders earlier books in this plan take along, and every
+    // book's folder (read only if some book has attachments to move).
+    let mut taken_data: HashSet<String> = HashSet::new();
+    let mut paths = BookPaths::default();
 
     for book_id in in_scope(cache, scope)? {
         let old_path = cache.field_for(book_id, "path")?.unwrap_or_default().replace('\\', "/").trim_matches('/').to_string();
@@ -624,7 +739,8 @@ pub fn plan_to(cache: &Cache, target: Target<'_>, scope: &Scope) -> Result<Organ
             already += 1;
             continue;
         }
-        books.push(PlannedBook { book_id, title, old_path, new_path, old_names, new_names, files, suffixed });
+        let data_dir = plan_data_dir(cache, &mut disk, &mut paths, &mut taken_data, &mut warnings, book_id, &old_path, &new_path)?;
+        books.push(PlannedBook { book_id, title, old_path, new_path, old_names, new_names, files, suffixed, data_dir });
     }
     let fingerprint = fingerprint(&label, &books);
     // A rename of a folder that only changes its case needs the directory
@@ -823,6 +939,30 @@ fn move_files(cache: &Cache, files: &[(String, String)]) -> Result<()> {
     Ok(())
 }
 
+/// Moves a book's attachments folder from `from` to `to` (relative to the
+/// library), never into a place that is taken. `must_exist` false makes a
+/// missing `from` a no-op (an undo, when the folder has been deleted since);
+/// returns whether anything moved.
+fn move_dir(cache: &Cache, from: &str, to: &str, must_exist: bool) -> Result<bool> {
+    let library = &cache.backend.library_path;
+    let (from_abs, to_abs) = (library.join(from), library.join(to));
+    if !from_abs.is_dir() {
+        if must_exist {
+            return Err(anyhow!("{from} is not there"));
+        }
+        return Ok(false);
+    }
+    if to_abs.exists() {
+        return Err(anyhow!("{to} already exists"));
+    }
+    if let Some(parent) = to_abs.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let handle = cache.backend.write_handle()?;
+    handle.rename_atomic_no_replace(&from_abs, &to_abs).map_err(|e| anyhow!("could not move {from} to {to} (a rename cannot cross volumes): {e}"))?;
+    Ok(true)
+}
+
 /// A cover kept the calibre way, as `<book folder>/cover.jpg` (absorbed calibre
 /// libraries), is found through `books.path`. The move leaves `cover.jpg` where
 /// it is (the folder may be shared), so once the path changes the cover would be
@@ -890,10 +1030,33 @@ pub fn execute(cache: &Cache, plan: &OrganizePlan, control: &JobControl) -> Resu
             report.failed.push(Skipped { book_id: book.book_id, reason: format!("{e:#}") });
             continue;
         }
+        let back: Vec<(String, String)> = pairs.iter().map(|(f, t)| (t.clone(), f.clone())).collect();
+        // The attachments go with the book (the entry above names them too).
+        let mut data_moved = false;
+        if let Some(d) = &book.data_dir {
+            match move_dir(cache, &d.from, &d.to, true) {
+                Ok(moved) => data_moved = moved,
+                Err(e) => {
+                    let mut reason = format!("its attached files could not be moved: {e:#}");
+                    match move_files(cache, &back) {
+                        Ok(()) => {
+                            let _ = j.abandon(book.book_id);
+                        }
+                        Err(rollback) => reason.push_str(&format!("; and the files could not be put back: {rollback:#}")),
+                    }
+                    report.failed.push(Skipped { book_id: book.book_id, reason });
+                    continue;
+                }
+            }
+        }
         if let Err(e) = record(cache, book.book_id, &book.new_path, &book.new_names, &book.old_path) {
             // The files moved and the rows did not: put the files back.
-            let back: Vec<(String, String)> = pairs.iter().map(|(f, t)| (t.clone(), f.clone())).collect();
             let mut reason = format!("the library could not record the move: {e:#}");
+            if let (true, Some(d)) = (data_moved, &book.data_dir) {
+                if let Err(rollback) = move_dir(cache, &d.to, &d.from, false) {
+                    reason.push_str(&format!("; and the attached files could not be put back: {rollback:#}"));
+                }
+            }
             match move_files(cache, &back) {
                 Ok(()) => {
                     let _ = j.abandon(book.book_id);
@@ -964,7 +1127,12 @@ pub fn undo(cache: &Cache, run_id: &str, control: &JobControl) -> Result<UndoRep
                     restored += 1;
                 }
             }
-            if restored > 0 {
+            // The attachments, if the run got as far as moving them.
+            let data_back = match &book.data_dir {
+                Some(d) if library.join(&d.to).is_dir() && !library.join(&d.from).exists() => move_dir(cache, &d.to, &d.from, false).unwrap_or(false),
+                _ => false,
+            };
+            if restored > 0 || data_back {
                 report.books_restored += 1;
                 report.files_restored += restored;
                 new_dirs.insert(book.new_path.clone());
@@ -976,13 +1144,37 @@ pub fn undo(cache: &Cache, run_id: &str, control: &JobControl) -> Result<UndoRep
             continue;
         }
         let back: Vec<(String, String)> = book.files.iter().map(|f| (f.to.clone(), f.from.clone())).collect();
+        // The attachments first, the reverse of the run: if the files then cannot
+        // move, the attachments go forward again and the book is left as it was.
+        // A folder deleted since is not an error.
+        let mut data_back = false;
+        if let Some(d) = &book.data_dir {
+            match move_dir(cache, &d.to, &d.from, false) {
+                Ok(moved) => data_back = moved,
+                Err(e) => {
+                    report.skipped.push(Skipped { book_id: book.book_id, reason: format!("its attached files could not be moved back: {e:#}") });
+                    continue;
+                }
+            }
+        }
         if let Err(e) = move_files(cache, &back) {
-            report.skipped.push(Skipped { book_id: book.book_id, reason: format!("{e:#}") });
+            let mut reason = format!("{e:#}");
+            if let (true, Some(d)) = (data_back, &book.data_dir) {
+                if let Err(rollback) = move_dir(cache, &d.from, &d.to, false) {
+                    reason.push_str(&format!("; and the attached files could not be put back: {rollback:#}"));
+                }
+            }
+            report.skipped.push(Skipped { book_id: book.book_id, reason });
             continue;
         }
         if let Err(e) = record(cache, book.book_id, &book.old_path, &book.old_names, &book.new_path) {
             let fwd: Vec<(String, String)> = back.iter().map(|(f, t)| (t.clone(), f.clone())).collect();
             let mut reason = format!("the library could not record the move: {e:#}");
+            if let (true, Some(d)) = (data_back, &book.data_dir) {
+                if let Err(rollback) = move_dir(cache, &d.from, &d.to, false) {
+                    reason.push_str(&format!("; and the attached files could not be put back: {rollback:#}"));
+                }
+            }
             if let Err(rollback) = move_files(cache, &fwd) {
                 reason.push_str(&format!("; and the files could not be put back: {rollback:#}"));
             }
@@ -1182,6 +1374,130 @@ mod tests {
                 assert_eq!(view.exists(rel), dir.path().join(rel).exists(), "exists({rel})");
             }
         }
+    }
+
+    fn attached(cache: &Cache, id: i32) -> Vec<String> {
+        let mut names: Vec<String> = crate::extra_files::list_extra_files(cache, id, crate::constants::DATA_FILE_PATTERN).unwrap().into_iter().map(|f| f.relpath).collect();
+        names.sort();
+        names
+    }
+
+    /// A book with a folder of its own takes its `data/` attachments along, the
+    /// run journal records it, and Undo brings it back.
+    #[test]
+    fn the_attachments_folder_moves_with_its_book_and_comes_back_on_undo() {
+        let (dir, cache) = library();
+        write(&dir.path().join("Alpha/Alpha.pdf"), b"%PDF alpha");
+        write(&dir.path().join("Alpha/data/notes.dat"), b"notes");
+        write(&dir.path().join("Alpha/data/sub/deep.dat"), b"deep");
+        write(&dir.path().join("Beta/Beta.pdf"), b"%PDF beta");
+        index(dir.path(), &cache);
+        let alpha = book_with_title(&cache, "Alpha");
+        assert_eq!(attached(&cache, alpha), ["data/notes.dat", "data/sub/deep.dat"]);
+
+        let plan = plan(&cache, "Moved/{title}/{title}", &Scope::All).unwrap();
+        let planned = plan.books.iter().find(|b| b.book_id == alpha).unwrap();
+        assert_eq!(planned.data_dir, Some(PlannedDir { from: "Alpha/data".into(), to: "Moved/Alpha/data".into() }));
+        assert!(plan.books.iter().find(|b| b.title == "Beta").unwrap().data_dir.is_none(), "a book with no attachments plans none");
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+        assert!(dir.path().join("Alpha/data/notes.dat").exists(), "a dry run moves nothing");
+        let report = execute(&cache, &plan, &JobControl::new()).unwrap();
+        assert!(report.failed.is_empty(), "{report:?}");
+
+        assert_eq!(std::fs::read(dir.path().join("Moved/Alpha/data/notes.dat")).unwrap(), b"notes");
+        assert_eq!(std::fs::read(dir.path().join("Moved/Alpha/data/sub/deep.dat")).unwrap(), b"deep");
+        assert!(!dir.path().join("Alpha").exists(), "the old folder is gone once it is empty");
+        assert_eq!(attached(&cache, alpha), ["data/notes.dat", "data/sub/deep.dat"], "the book still finds its attachments");
+        assert_eq!(load_run(dir.path(), &report.run_id).unwrap().books.iter().find(|b| b.book_id == alpha).unwrap().data_dir, planned.data_dir, "journaled");
+
+        let undone = undo(&cache, &report.run_id, &JobControl::new()).unwrap();
+        assert!(undone.skipped.is_empty(), "{undone:?}");
+        assert_eq!(std::fs::read(dir.path().join("Alpha/data/notes.dat")).unwrap(), b"notes");
+        assert_eq!(std::fs::read(dir.path().join("Alpha/data/sub/deep.dat")).unwrap(), b"deep");
+        assert!(!dir.path().join("Moved/Alpha").exists());
+        assert_eq!(attached(&cache, alpha), ["data/notes.dat", "data/sub/deep.dat"]);
+    }
+
+    /// A book in the library root keeps its attachments under `data/<uuid>`; they
+    /// follow it into a folder (and back).
+    #[test]
+    fn a_root_books_attachments_follow_it_into_a_folder_and_back() {
+        let (dir, cache) = library();
+        write(&dir.path().join("Solo.pdf"), b"%PDF solo");
+        index(dir.path(), &cache);
+        let solo = book_with_title(&cache, "Solo");
+        crate::extra_files::add_extra_files(&cache, solo, &std::collections::HashMap::from([("data/note.dat".to_string(), b"hi".to_vec())]), false).unwrap();
+        assert_eq!(attached(&cache, solo), ["data/note.dat"]);
+
+        let (_, report) = run(&cache, "Sorted/{title}");
+        assert!(report.failed.is_empty(), "{report:?}");
+        assert_eq!(cache.field_for(solo, "path").unwrap().unwrap(), "Sorted");
+        assert_eq!(attached(&cache, solo), ["data/note.dat"], "found in the new folder's data/");
+        assert!(dir.path().join("Sorted/data/note.dat").is_file());
+
+        undo(&cache, &report.run_id, &JobControl::new()).unwrap();
+        assert_eq!(attached(&cache, solo), ["data/note.dat"]);
+        assert!(dir.path().join("Solo.pdf").is_file());
+        assert!(!dir.path().join("Sorted/data").exists());
+    }
+
+    /// What it cannot move it says: a folder shared with other books keeps its
+    /// attachments, and the plan warns.
+    #[test]
+    fn a_shared_folders_attachments_stay_and_the_plan_says_so() {
+        let (dir, cache) = library();
+        write(&dir.path().join("inbox/A.pdf"), b"%PDF a");
+        write(&dir.path().join("inbox/B.pdf"), b"%PDF b");
+        write(&dir.path().join("inbox/data/x.dat"), b"x");
+        index(dir.path(), &cache);
+        let a = book_with_title(&cache, "A");
+
+        let plan = plan(&cache, "Sorted/{title}", &Scope::Ids(vec![a])).unwrap();
+        assert!(plan.books[0].data_dir.is_none());
+        assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+        assert!(plan.warnings[0].reason.contains("inbox/data") && plan.warnings[0].reason.contains("share"), "{}", plan.warnings[0].reason);
+        let report = execute(&cache, &plan, &JobControl::new()).unwrap();
+        assert!(report.failed.is_empty(), "{report:?}");
+        assert!(dir.path().join("inbox/data/x.dat").is_file(), "left where it was");
+    }
+
+    /// `Reports/data` can be another book's folder: its files are that book's, not
+    /// attachments, and nothing of it moves or is warned about.
+    #[test]
+    fn another_books_data_folder_is_not_taken() {
+        let (dir, cache) = library();
+        write(&dir.path().join("Reports/report.pdf"), b"%PDF report");
+        write(&dir.path().join("Reports/data/dataset.pdf"), b"%PDF dataset");
+        index(dir.path(), &cache);
+        let report_id = book_with_title(&cache, "report");
+
+        let plan = plan(&cache, "Moved/{title}", &Scope::Ids(vec![report_id])).unwrap();
+        assert_eq!(plan.books.len(), 1);
+        assert!(plan.books[0].data_dir.is_none());
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+        execute(&cache, &plan, &JobControl::new()).unwrap();
+        assert!(dir.path().join("Reports/data/dataset.pdf").is_file());
+        assert!(dir.path().join("Moved/report.pdf").is_file());
+    }
+
+    /// Two books moving into one folder cannot both take a `data/` there: the second keeps its own where it is.
+    #[test]
+    fn two_books_cannot_take_the_same_destination_data_folder() {
+        let (dir, cache) = library();
+        write(&dir.path().join("One/One.pdf"), b"%PDF one");
+        write(&dir.path().join("One/data/a.dat"), b"a");
+        write(&dir.path().join("Two/Two.pdf"), b"%PDF two");
+        write(&dir.path().join("Two/data/b.dat"), b"b");
+        index(dir.path(), &cache);
+
+        let plan = plan(&cache, "Shared/{title}", &Scope::All).unwrap();
+        assert_eq!(plan.books.iter().filter(|b| b.data_dir.is_some()).count(), 1, "{:?}", plan.books.iter().map(|b| &b.data_dir).collect::<Vec<_>>());
+        assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+        let report = execute(&cache, &plan, &JobControl::new()).unwrap();
+        assert!(report.failed.is_empty(), "{report:?}");
+        assert!(dir.path().join("Shared/data").is_dir());
+        let left = ["One/data/a.dat", "Two/data/b.dat"].iter().filter(|p| dir.path().join(p).is_file()).count();
+        assert_eq!(left, 1, "one book's attachments stayed where they were");
     }
 
     #[test]

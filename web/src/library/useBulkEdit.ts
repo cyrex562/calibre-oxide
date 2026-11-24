@@ -18,7 +18,7 @@ import { computed, reactive, ref, type Ref } from "vue";
 import type { BookSummary, FieldMetaEntry } from "./types";
 import { setFields, setFieldsBatch, setFieldsRelative } from "./api";
 import { runBulkEdit as runBatchedEdit, type BulkItem } from "./bulkBatch";
-import { inverseRelativeOp, relativeTagOp, runRelativeEdit, type RelativeOp } from "./bulkRelative";
+import { inverseRelativeOps, relativeTagOp, runRelativeEdit, type RelativeOp } from "./bulkRelative";
 import { changesFor, describeBulkResult, inverseChanges, isEmptySpec, validateSpec, type BulkEditSpec } from "./bulkEdit";
 import { showToast } from "./deleteFlow";
 
@@ -101,20 +101,30 @@ export function useBulkEdit({ selectedIds, fieldMetadata, win, onChanged }: Bulk
     await onChanged();
     if (pool.updated > 0) {
       const message = describeBulkResult(edit, pool.updated);
-      const inverse = inverseRelativeOp(op);
+      const steps = inverseRelativeOps(op, pool);
       const changedIds = pool.updatedIds;
-      if (!inverse) showToast(message, undefined, 15000);
+      if (!steps) showToast(message, undefined, 15000);
       else
         showToast(
           message,
           {
             label: "Undo",
             run: async () => {
-              const back = await runRelativeEdit(changedIds, inverse, { send: setFieldsRelative });
+              // Each step puts back exactly the spellings its books gained or lost.
+              let put = 0;
+              const problems: string[] = [];
+              for (const step of steps) {
+                const back = await runRelativeEdit(step.ids, step.op, { send: setFieldsRelative });
+                if (!back) {
+                  problems.push("The server could not undo this edit");
+                  break;
+                }
+                put += back.updated + back.unchanged;
+                problems.push(...back.errors);
+              }
               await onChanged();
-              if (!back) throw new Error("The server could not undo this edit");
-              if (back.errors.length > 0) throw new Error(`Put back ${back.updated} of ${changedIds.length}: ${back.errors[0]}`);
-              return `Put back the tags on ${back.updated.toLocaleString("en-US")} ${back.updated === 1 ? "book" : "books"}`;
+              if (problems.length > 0) throw new Error(`Put back ${put} of ${changedIds.length}: ${problems[0]}`);
+              return `Put back the tags on ${put.toLocaleString("en-US")} ${put === 1 ? "book" : "books"}`;
             },
           },
           20000,

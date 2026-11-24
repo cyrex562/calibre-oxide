@@ -193,6 +193,25 @@ describe("useBulkEdit", () => {
     expect(changed).toHaveBeenCalledTimes(2);
   });
 
+  it("Undo of adding several tags removes only the tags each book gained", async () => {
+    api.setFieldsRelative.mockResolvedValueOnce({
+      updated: [1, 2],
+      failed: [],
+      changes: { "1": { tags: { added: ["b"], removed: [] } }, "2": { tags: { added: ["a", "b"], removed: [] } } },
+    });
+    const { bulk } = setup([1, 2], []);
+    bulk.spec.tags = { mode: "add", value: "a, b" };
+    await bulk.run();
+    expect(toastState.toast?.actionLabel).toBe("Undo");
+    api.setFieldsRelative.mockImplementation(async (ids: number[]) => ({ updated: ids, failed: [] }));
+    await runToastAction();
+    expect(api.setFieldsRelative.mock.calls.slice(1)).toEqual([
+      [[1], { field: "tags", mode: "remove", values: ["b"] }],
+      [[2], { field: "tags", mode: "remove", values: ["a", "b"] }],
+    ]);
+    expect(toastState.toast?.result).toBe("Put back the tags on 2 books");
+  });
+
   it("says which field an Undo cannot put back", async () => {
     api.setFieldsBatch.mockImplementation(async (groups: { book_ids: number[] }[]) => ({ updated: groups.flatMap((g) => g.book_ids), failed: [] }));
     const { bulk } = setup([1], [book(1)]);
