@@ -159,7 +159,8 @@ describe("Enter and Space", () => {
 
 describe("shortcut hints", () => {
   it("writes a key the way a keycap shows it", () => {
-    expect(formatKey("d")).toBe("D");
+    expect(formatKey("d")).toBe("d");
+    expect(formatKey("ArrowRight")).toBe("→");
     expect(formatKey("S")).toBe("Shift+S");
     expect(formatKey("Delete")).toBe("Del");
     expect(formatKey(" ")).toBe("Space");
@@ -172,11 +173,11 @@ describe("shortcut hints", () => {
   // opened Bulk edit, "Add books (Ctrl+A)" for a chord nothing handled.
   it("is read from the keymap in force, so a rebinding shows and an unbound action shows nothing", () => {
     const map = libraryShortcuts(DEFAULT_KEYMAP);
-    expect(shortcutHint("find-duplicates", map)).toBe("D");
-    expect(shortcutHint("edit-metadata", map)).toBe("E");
+    expect(shortcutHint("find-duplicates", map)).toBe("d");
+    expect(shortcutHint("edit-metadata", map)).toBe("e");
     expect(shortcutHint("bulk-edit", map)).toBe("Shift+E");
     expect(shortcutHint("read", map)).toBe("Enter");
-    expect(shortcutHint("find-duplicates", { ...map, "find-duplicates": "g" })).toBe("G");
+    expect(shortcutHint("find-duplicates", { ...map, "find-duplicates": "g" })).toBe("g");
     expect(shortcutHint("organize-files", map)).toBeNull();
   });
 

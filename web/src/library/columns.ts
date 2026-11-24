@@ -195,6 +195,13 @@ export function columnsFor(fieldMetadata: Record<string, FieldMetaEntry>, sortab
   for (const [key, spec] of Object.entries(KNOWN_COLUMNS)) {
     columns.push({ key, ...spec, ...(sortableKeys.has(key) ? { sortKey: key } : {}) });
   }
+  // "Number" sorts the way a shelf is read: by series, then by the number in it. The server takes the
+  // two fields as one multi-field sort, so it needs only that Series is sortable.
+  const number = columns.find((c) => c.key === "series_index");
+  if (number && !number.sortKey && sortableKeys.has("series")) {
+    number.sortKey = NUMBER_SORT;
+    delete number.sortNote;
+  }
 
   // Custom columns arrive as `#label` keys in the field metadata; the
   // book row stores them under the bare `label`.
@@ -331,9 +338,22 @@ export function resolveColumns(available: BookColumn[], prefs: TablePrefs): Book
  */
 export function nextSort(column: BookColumn, currentSort: string, currentOrder: "asc" | "desc"): { sort: string; order: "asc" | "desc" } | null {
   if (!column.sortKey) return null;
-  const primary = currentSort.split(",")[0]?.trim();
-  if (primary === column.sortKey) {
+  if (sortsBy(column, currentSort)) {
     return { sort: currentSort, order: currentOrder === "asc" ? "desc" : "asc" };
   }
   return { sort: column.sortKey, order: column.kind === "date" ? "desc" : "asc" };
+}
+
+/** The Number column's sort: series, then the number in the series. */
+export const NUMBER_SORT = "series,series_index";
+
+/**
+ * Whether `currentSort` is this column's sort. A plain sort key is the first field of the sort (a
+ * second field after it does not matter); the composite Number sort is the whole thing, so Series
+ * sorted on its own is not Number.
+ */
+export function sortsBy(column: Pick<BookColumn, "sortKey">, currentSort: string): boolean {
+  if (!column.sortKey) return false;
+  if (column.sortKey.includes(",")) return currentSort.replace(/\s+/g, "") === column.sortKey;
+  return currentSort.split(",")[0]?.trim() === column.sortKey;
 }

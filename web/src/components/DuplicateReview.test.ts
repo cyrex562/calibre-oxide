@@ -98,6 +98,18 @@ describe("Keep this, trash the others", () => {
     expect(toastState.toast).toBeNull();
   });
 
+  it("still offers the Undo, shows the reason and looks again when only some copies were trashed", async () => {
+    dedupe.keepAndTrashGroup.mockResolvedValue({ runId: "run-9", trashedIds: [], partial: true, trashedCount: 1, error: "locked" });
+    const { store, changed } = await mount(group());
+    const scan = vi.spyOn(store, "scan").mockResolvedValue(undefined as never);
+    button().click();
+    await vi.waitFor(() => expect(toastState.toast?.actionLabel).toBe("Undo"));
+    expect(toastState.toast?.message).toBe("Kept “Dune”, but moved only 1 of 2 other copies to Trash");
+    expect(host!.querySelector('[role="alert"]')?.textContent).toContain("locked");
+    expect(changed).toHaveBeenCalled();
+    expect(scan).toHaveBeenCalled();
+  });
+
   it("is off for a group that is not in the last scan", async () => {
     await mount(group({ id: undefined, suggested_dest: 2 }));
     expect(button().disabled).toBe(true);

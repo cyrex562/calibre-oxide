@@ -60,6 +60,10 @@ export function loadPdfJs(): Promise<typeof import("pdfjs-dist")> {
   if (!pdfjsPromise) {
     pdfjsPromise = import("pdfjs-dist").then((pdfjs) => {
       pdfjs.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url).href;
+      // The text layer's own stylesheet (positioning, transparent text,
+      // selection colour). Loaded here, with the library, so it is split
+      // out of the main bundle along with it.
+      void import("pdfjs-dist/web/pdf_viewer.css");
       return pdfjs;
     });
   }
@@ -87,6 +91,26 @@ export const PDF_ASSET_OPTIONS = {
   standardFontDataUrl: "/pdfjs/standard_fonts/",
   cMapUrl: "/pdfjs/cmaps/",
   cMapPacked: true,
+  // `/get/pdf/{id}` answers Range requests (206), so a big PDF on a NAS shows
+  // its first page without downloading the whole file: fetch in 1 MiB pieces,
+  // and only the pieces a page needs (no background download of the rest).
+  rangeChunkSize: 1 << 20,
+  disableAutoFetch: true,
+} as const;
+
+/**
+ * How a document is fetched.
+ *
+ * Range requests stay on (PDF.js's default) and `disableAutoFetch`
+ * stops it reading the rest of the file in the background once the
+ * first pages are up. On a NAS a 500 MB scan then shows page 1 after
+ * the first few chunks arrive, instead of after the whole file has
+ * been pulled over the network.
+ */
+export const PDF_LOAD_OPTIONS = {
+  disableAutoFetch: true,
+  disableRange: false,
+  disableStream: false,
 } as const;
 
 /** The URL a book's PDF is served from. */
@@ -94,9 +118,83 @@ export function pdfUrl(bookId: string): string {
   return `/get/pdf/${bookId}`;
 }
 
+/**
+ * What PDF.js rejects a cancelled render with. Thrown by [`renderPage`]
+ * itself when it notices it has been superseded before drawing, so a
+ * caller handles one kind of "cancelled" either way.
+ */
+export class RenderCancelled extends Error {
+  constructor() {
+    super("Rendering cancelled");
+    this.name = "RenderingCancelledException";
+  }
+}
+
+/** Whether `error` is a render that was cancelled on purpose, not a failure. */
+export function isRenderCancelled(error: unknown): boolean {
+  return typeof error === "object" && error !== null && (error as { name?: unknown }).name === "RenderingCancelledException";
+}
+
+/**
+ * Runs page renders one at a time, newest wins.
+ *
+ * A canvas cannot take two `render()` calls at once ("Cannot use the
+ * same canvas during multiple render() operations"), and calling
+ * `cancel()` only *asks* the old render to stop: its promise settles
+ * later. So a new request cancels the running task, waits for it to
+ * settle, and only then starts. A request that is itself replaced
+ * while waiting never starts at all, which is what makes holding
+ * Next down cheap instead of queueing every intermediate page.
+ */
+export class LatestRenderer {
+  private token = 0;
+  private task: { cancel: () => void } | null = null;
+  private inflight: Promise<unknown> = Promise.resolve();
+
+  /**
+   * Runs `render`, passing a hook to register its PDF.js task and a
+   * predicate telling it whether it has been superseded. Resolves
+   * `true` if this call's render completed and is still the newest,
+   * `false` if it was cancelled or superseded; rejects only for real
+   * failures.
+   */
+  async run(render: (hooks: { onTask: (task: { cancel: () => void }) => void; isStale: () => boolean }) => Promise<void>): Promise<boolean> {
+    const mine = ++this.token;
+    this.task?.cancel();
+    await this.inflight.catch(() => {});
+    if (mine !== this.token) return false;
+
+    const running = render({
+      onTask: (task) => {
+        this.task = task;
+      },
+      isStale: () => mine !== this.token,
+    });
+    this.inflight = running;
+    try {
+      await running;
+    } catch (e) {
+      if (isRenderCancelled(e)) return false;
+      if (mine !== this.token) return false;
+      throw e;
+    } finally {
+      if (mine === this.token) this.task = null;
+    }
+    return mine === this.token;
+  }
+
+  /** Cancels whatever is running and invalidates anything waiting. */
+  cancel(): void {
+    this.token += 1;
+    this.task?.cancel();
+  }
+}
+
 export interface RenderTarget {
   canvas: HTMLCanvasElement;
   scale: number;
+  /** Checked after the page is fetched; when true the render is abandoned with [`RenderCancelled`]. */
+  isStale?: () => boolean;
   /**
    * Called with the render task as soon as it exists, so a caller that is
    * about to show another page can `cancel()` this one (the promise then
@@ -116,6 +214,7 @@ export interface RenderTarget {
  */
 export async function renderPage(doc: PDFDocumentProxy, pageNumber: number, target: RenderTarget): Promise<void> {
   const page = await doc.getPage(pageNumber);
+  if (target.isStale?.()) throw new RenderCancelled();
   const ratio = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
   const viewport = page.getViewport({ scale: target.scale * ratio });
 

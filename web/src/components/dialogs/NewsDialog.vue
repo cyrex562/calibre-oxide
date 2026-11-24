@@ -178,11 +178,11 @@ async function fetchNews() {
       <form :id="formId" @submit.prevent="fetchNews">
         <label class="news-field">
           Title
-          <input v-model="newsTitle" placeholder="My Weekly" :disabled="newsFetching" />
+          <input v-model="newsTitle" placeholder="e.g. My Weekly" :disabled="newsFetching" />
         </label>
         <label class="news-field">
           Feed URLs
-          <textarea v-model="newsFeedUrls" rows="4" placeholder="https://example.com/feed.xml&#10;Tech News|https://example.com/tech.xml" :disabled="newsFetching"></textarea>
+          <textarea v-model="newsFeedUrls" rows="4" placeholder="e.g. https://example.com/feed.xml&#10;Tech News|https://example.com/tech.xml" :disabled="newsFetching"></textarea>
         </label>
         <div class="bulk-actions">
           <button type="button" :disabled="newsFetching || opmlImporting" @click="opmlInput?.click()">{{ opmlImporting ? "Importing…" : "Import OPML…" }}</button>

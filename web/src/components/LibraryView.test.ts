@@ -26,7 +26,8 @@ const apiMocks = vi.hoisted(() => ({
 const tauriMocks = vi.hoisted(() => ({ invoke: vi.fn(async (_cmd: string, _args?: unknown): Promise<undefined> => undefined) }));
 
 vi.mock("../library/api", async (importOriginal) => ({ ...(await importOriginal<typeof import("../library/api")>()), ...apiMocks }));
-vi.mock("../settings/api", async (importOriginal) => ({ ...(await importOriginal<typeof import("../settings/api")>()), fetchProfile: vi.fn(async () => null), saveProfile: vi.fn(async () => undefined) }));
+const settingsMocks = vi.hoisted(() => ({ fetchProfile: vi.fn(async (_name: string): Promise<unknown> => null) }));
+vi.mock("../settings/api", async (importOriginal) => ({ ...(await importOriginal<typeof import("../settings/api")>()), fetchProfile: settingsMocks.fetchProfile, saveProfile: vi.fn(async () => undefined) }));
 vi.mock("../tauri", () => ({ isTauri: () => state.tauri, tauriInvoke: tauriMocks.invoke }));
 vi.mock("./BookDetailsPanel.vue", () => ({ default: defineComponent({ props: ["bookId"], setup: (p) => () => h("aside", { "data-testid": "details-stub" }, `details ${p.bookId}`) }) }));
 vi.mock("./CategoryBrowser.vue", () => ({ default: defineComponent({ setup: () => () => h("nav", { "data-testid": "categories-stub" }) }) }));
@@ -386,6 +387,24 @@ describe("kept alive behind another route", () => {
     key("Delete");
     await settle();
     expect(confirmState.open).toBe(true);
+  });
+
+  it("reads the shortcuts, toolbar and library preferences again on return, without changing the sort", async () => {
+    const { away } = await mountKept();
+    const reads = (name: string) => settingsMocks.fetchProfile.mock.calls.filter((c) => c[0] === name).length;
+    const before = { keymap: reads("keymap"), toolbar: reads("toolbar-prefs"), library: reads("library-prefs") };
+    // Settings changed the stored default sort while the view was parked.
+    settingsMocks.fetchProfile.mockImplementation(async (name: string) => (name === "library-prefs" ? { sort: "timestamp", sortOrder: "desc", duplicateDefault: "skip" } : null));
+    const searches = apiMocks.search.mock.calls.length;
+    away.value = true;
+    await settle();
+    away.value = false;
+    await settle();
+    expect(reads("keymap")).toBe(before.keymap + 1);
+    expect(reads("toolbar-prefs")).toBe(before.toolbar + 1);
+    expect(reads("library-prefs")).toBe(before.library + 1);
+    expect(apiMocks.search.mock.calls.length).toBe(searches);
+    settingsMocks.fetchProfile.mockImplementation(async () => null);
   });
 
   it("reloads its list on return when something was written while it was away", async () => {

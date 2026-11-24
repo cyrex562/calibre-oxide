@@ -40,6 +40,16 @@ export function restoredMessage(count: number): string {
 export interface KeepTrashResult {
   runId: string;
   trashedIds: number[];
+  /** Only some of the other copies were trashed: `trashedCount` of them, and `error` says why not the rest. The run still has an Undo. */
+  partial?: boolean;
+  trashedCount?: number;
+  error?: string;
+}
+
+/** The toast text after a run that trashed only some of a group's other copies. */
+export function partialTrashMessage(trashed: number, wanted: number, keeperTitle: string): string {
+  const title = keeperTitle ? ` “${keeperTitle}”` : "";
+  return `Kept${title}, but moved only ${n(trashed)} of ${n(wanted)} other copies to Trash`;
 }
 
 /**
@@ -61,7 +71,13 @@ export async function keepAndTrashGroup(group: Pick<DuplicateGroup, "id" | "book
     throw new Error(plan.skipped[0]?.reason ?? "The server's plan is not for exactly these books, so nothing was trashed. Rescan and try again.");
   }
   const report = await api.runResolve(selection, plan.plan_fingerprint);
-  if (report.books_trashed < others.length) throw new Error(report.errors[0]?.[1] ?? "Not every other copy could be trashed.");
+  if (report.books_trashed < others.length) {
+    const error = report.errors[0]?.[1] ?? "Not every other copy could be trashed.";
+    // Nothing was trashed: nothing to undo, so it is just a failure.
+    if (report.books_trashed <= 0) throw new Error(error);
+    // Some copies are already in the Trash. Say so, with the run, so the caller can still offer its Undo.
+    return { runId: report.run_id, trashedIds: [], partial: true, trashedCount: report.books_trashed, error };
+  }
   return { runId: report.run_id, trashedIds: others };
 }
 

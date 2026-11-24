@@ -42,7 +42,7 @@ fn store(state: &AppState) -> Result<&PluginStore, ServerError> {
     state
         .plugin_store
         .as_deref()
-        .ok_or_else(|| ServerError::ServiceUnavailable("plugins are not enabled on this server -- start it with --plugin-dir <path>".to_string()))
+        .ok_or_else(|| ServerError::FeatureDisabled { code: "plugins_disabled", message: "Plugins are not turned on for this server.".to_string() })
 }
 
 /// Serializes a package for the UI, including everything needed to

@@ -676,17 +676,17 @@ fn edit_list(current: Vec<String>, remove: &[String], add: &[String]) -> Vec<Str
 }
 
 /// What `add`/`remove` do to one book: the `(field, value)` writes that change
-/// something (none when the book already has the result).
-fn relative_updates(cache: &lexmechanic_db::cache::Cache, book_id: i32, adds: &[(String, Vec<String>)], removes: &[(String, Vec<String>)]) -> anyhow::Result<Vec<(String, String)>> {
+/// something (none when the book already has the result). `read(field)` gives
+/// the book's current list; it is called inside the write transaction, so the
+/// result is computed from what the book has when it is written.
+fn relative_updates(read: &dyn Fn(&str) -> anyhow::Result<Vec<String>>, adds: &[(String, Vec<String>)], removes: &[(String, Vec<String>)]) -> anyhow::Result<Vec<(String, String)>> {
     let mut fields: Vec<&str> = adds.iter().chain(removes.iter()).map(|(f, _)| f.as_str()).collect();
-    fields.dedup();
     let mut seen = std::collections::HashSet::new();
     fields.retain(|f| seen.insert(*f));
     let mut updates = Vec::new();
     for field in fields {
         let sep = list_field_separator(field).expect("checked by list_edit_values");
-        let stored = cache.field_for(book_id, field)?.unwrap_or_default();
-        let mut current: Vec<String> = if stored.is_empty() { Vec::new() } else { stored.split(sep).map(|v| v.trim().to_string()).collect() };
+        let mut current: Vec<String> = read(field)?;
         if field == "authors" && current.is_empty() {
             // A book with no author reads as "Unknown" everywhere else.
             current.push("Unknown".to_string());
@@ -802,20 +802,15 @@ async fn set_fields_batch_handle(state: AppState, library_id: Option<String>, bo
         let (changed, same, errors) = tokio::task::spawn_blocking({
             let cache = cache.clone();
             move || {
-                let (mut items, mut same, mut errors) = (Vec::new(), Vec::new(), Vec::new());
-                for id in chunk {
-                    match relative_updates(&cache, id, &adds, &removes) {
-                        Ok(updates) if updates.is_empty() => same.push(id),
-                        Ok(updates) => items.push((id, updates)),
-                        Err(e) => errors.push((id, e.to_string())),
-                    }
-                }
-                let results = cache.set_fields_per_book(&items);
-                let mut changed = Vec::new();
-                for ((id, _), result) in items.into_iter().zip(results) {
+                // Each book's new lists are worked out inside the write
+                // transaction, from what it has at that moment.
+                let results = cache.edit_lists_for_books(&chunk, &|_, read| relative_updates(read, &adds, &removes));
+                let (mut changed, mut same, mut errors): (Vec<Result<i32, (i32, String)>>, Vec<i32>, Vec<(i32, String)>) = (Vec::new(), Vec::new(), Vec::new());
+                for (id, result) in chunk.iter().copied().zip(results) {
                     match result {
-                        Ok(()) => changed.push(Ok(id)),
-                        Err(e) => changed.push(Err((id, e.to_string()))),
+                        Ok(updates) if updates.is_empty() => same.push(id),
+                        Ok(_) => changed.push(Ok(id)),
+                        Err(e) => errors.push((id, e.to_string())),
                     }
                 }
                 (changed, same, errors)

@@ -2,13 +2,17 @@
 import { promptDialog } from "./dialogs/confirm";
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute } from "vue-router";
-import { addBookmark, addHighlight, fetchBookFileText, fetchManifest, getAnnotations, getLastReadPositions, setLastReadPosition } from "../reader/api";
+import { addBookmark, addHighlight, fetchBookFileText, fetchManifest, getAnnotations, getLastReadPositions, removeAnnotation, setLastReadPosition } from "../reader/api";
 import { loadSpineFileInto, type ResolveContext } from "../reader/unserialize";
 import { anchorLinkData } from "../reader/virtualLinks";
 import { decodePosition, deviceId, encodePosition } from "../reader/position";
 import { flattenToc } from "../reader/toc";
 import { encodeBoundary, rangeFromEncoded } from "../reader/highlightRange";
-import { wrapHighlightRange } from "../reader/highlightDom";
+import { unwrapHighlight, wrapHighlightRange } from "../reader/highlightDom";
+import { createSelectionBar, FOCUS_BAR_KEY, type SelectionBar } from "../reader/selectionBar";
+import { indexText, pickMatch, rangeForOffsets } from "../reader/domText";
+import { ttsErrorText } from "../reader/tts";
+import ReaderToolbar from "./ReaderToolbar.vue";
 import PdfReader from "./PdfReader.vue";
 import { extractText, findMatches, totalMatches, type SpineMatches } from "../reader/search";
 import { isNoteReference, noteTextFor } from "../reader/footnotes";
@@ -149,7 +153,39 @@ function renderHighlights() {
   if (!doc) return;
   for (const h of highlights.value) {
     const range = rangeFromEncoded(doc, spineIndex.value, h.start_cfi, h.end_cfi);
-    if (range) wrapHighlightRange(range, "cx-highlight", { uuid: h.uuid });
+    if (range) {
+      wrapHighlightRange(range, "cx-highlight", { uuid: h.uuid });
+      makeHighlightReachable(doc, h.uuid);
+    }
+  }
+}
+
+/**
+ * A highlight can be removed with the keyboard too: its marks take focus,
+ * Enter opens the "Remove highlight" bar and Delete removes it directly.
+ */
+function makeHighlightReachable(doc: Document, uuid: string) {
+  for (const mark of Array.from(doc.querySelectorAll<HTMLElement>("mark.cx-highlight"))) {
+    if (mark.dataset.uuid !== uuid) continue;
+    mark.tabIndex = 0;
+    mark.title = "Highlight. Click, or press Enter, to remove it.";
+    mark.setAttribute("aria-label", "Highlighted text. Press Enter for actions, Delete to remove.");
+  }
+}
+
+/** Takes a highlight out of the book and out of the page. */
+async function removeHighlight(uuid: string) {
+  const found = highlights.value.find((h) => h.uuid === uuid);
+  if (!found) return;
+  highlightError.value = null;
+  try {
+    await removeAnnotation(bookId.value, fmt.value, "highlight", found);
+    highlights.value = highlights.value.filter((h) => h.uuid !== uuid);
+    const doc = iframeEl.value?.contentDocument;
+    if (doc) unwrapHighlight(doc, uuid);
+    statusMessage.value = "Highlight removed.";
+  } catch (e) {
+    highlightError.value = e instanceof Error ? e.message : String(e);
   }
 }
 
@@ -202,45 +238,89 @@ function installSelectionHandler() {
   // A bar rather than a lone button (#2.4): highlighting was the only
   // thing a selection could do, and copying a quotation is at least
   // as common.
-  const popover = doc.createElement("div");
-  popover.id = HIGHLIGHT_POPOVER_ID;
-  popover.style.cssText = "position:absolute;z-index:1000;display:none;gap:1px;border-radius:4px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.3);font:14px sans-serif;";
-
-  const makeButton = (label: string, onClick: () => void) => {
-    const button = doc.createElement("button");
-    button.type = "button";
-    button.textContent = label;
-    button.style.cssText = "padding:0.3em 0.7em;border:none;background:#2a6df4;color:#fff;cursor:pointer;font:inherit;";
-    // Without this, the mousedown on the button itself would collapse
-    // the very selection it is meant to act on before the click
-    // handler ever runs.
-    button.addEventListener("mousedown", (e) => e.preventDefault());
-    button.addEventListener("click", onClick);
-    popover.appendChild(button);
-    return button;
-  };
-
-  makeButton("Highlight", () => void createHighlightFromSelection());
-  makeButton("Copy", () => void copySelection(doc, popover));
-  makeButton("Look up", () => void lookUpSelection(doc, popover));
+  // Keyboard users get the same bar: it also appears after selecting
+  // with Shift+arrows, Alt+H moves focus into it, and Escape closes it.
+  const bar: SelectionBar = createSelectionBar(doc, HIGHLIGHT_POPOVER_ID, "Selection actions");
+  const popover = bar.el;
+  const selectionActions = [
+    { label: "Highlight", description: "Highlight the selected text", run: () => void createHighlightFromSelection() },
+    { label: "Copy", description: "Copy the selected text", run: () => void copySelection(doc, popover) },
+    { label: "Look up", description: "Look the selected word up in a dictionary", run: () => void lookUpSelection(doc, popover) },
+  ];
   doc.body.appendChild(popover);
 
-  doc.addEventListener("mouseup", () => {
+  const place = (rect: DOMRect) => {
+    const view = doc.defaultView;
+    bar.showAt(rect.left + (view?.scrollX ?? 0), rect.top + (view?.scrollY ?? 0) - 32);
+  };
+
+  const showForSelection = () => {
     const sel = doc.getSelection();
     if (!sel || sel.isCollapsed || sel.rangeCount === 0 || !sel.toString().trim()) {
-      popover.style.display = "none";
+      // Focus on the bar's own button collapses nothing; only hide when focus is elsewhere.
+      if (!popover.contains(doc.activeElement)) bar.hide();
       return;
     }
     const rect = sel.getRangeAt(0).getBoundingClientRect();
     if (rect.width === 0 && rect.height === 0) {
-      popover.style.display = "none";
+      bar.hide();
       return;
     }
-    const view = doc.defaultView;
-    popover.style.left = `${rect.left + (view?.scrollX ?? 0)}px`;
-    popover.style.top = `${rect.top + (view?.scrollY ?? 0) - 32}px`;
-    popover.style.display = "flex";
+    bar.setActions(selectionActions);
+    place(rect);
+  };
+
+  doc.addEventListener("mouseup", showForSelection);
+  doc.addEventListener("keyup", (event) => {
+    // Shift+arrows, Ctrl+A and friends change the selection without a mouse.
+    if (event.key === "Shift" || event.key.startsWith("Arrow") || event.key === "Home" || event.key === "End" || event.key.toLowerCase() === "a") showForSelection();
   });
+
+  doc.addEventListener("keydown", (event) => {
+    if (event.altKey && event.key.toLowerCase() === FOCUS_BAR_KEY) {
+      if (bar.focusFirst()) event.preventDefault();
+      return;
+    }
+    if (event.key === "Escape" && bar.isVisible()) {
+      bar.hide();
+      return;
+    }
+    const mark = (event.target as Element | null)?.closest?.("mark.cx-highlight") as HTMLElement | null;
+    if (!mark?.dataset.uuid) return;
+    if (event.key === "Delete" || event.key === "Backspace") {
+      event.preventDefault();
+      void removeHighlight(mark.dataset.uuid);
+    } else if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      showRemoveBar(doc, bar, mark);
+    }
+  });
+
+  // Clicking an existing highlight offers to remove it.
+  doc.addEventListener("click", (event) => {
+    const mark = (event.target as Element | null)?.closest?.("mark.cx-highlight") as HTMLElement | null;
+    const sel = doc.getSelection();
+    if (!mark?.dataset.uuid || (sel && !sel.isCollapsed)) return;
+    showRemoveBar(doc, bar, mark);
+  });
+}
+
+function showRemoveBar(doc: Document, bar: SelectionBar, mark: HTMLElement) {
+  const uuid = mark.dataset.uuid;
+  if (!uuid) return;
+  const view = doc.defaultView;
+  const rect = mark.getBoundingClientRect();
+  bar.setActions([
+    {
+      label: "Remove highlight",
+      run: () => {
+        bar.hide();
+        void removeHighlight(uuid);
+      },
+    },
+  ]);
+  bar.showAt(rect.left + (view?.scrollX ?? 0), rect.top + (view?.scrollY ?? 0) - 32);
+  bar.focusFirst();
 }
 
 /**
@@ -320,6 +400,7 @@ async function createHighlightFromSelection() {
     const highlight = await addHighlight(bookId.value, fmt.value, startCfi, endCfi, text);
     highlights.value = [...highlights.value, highlight];
     wrapHighlightRange(range, "cx-highlight", { uuid: highlight.uuid });
+    makeHighlightReachable(doc, highlight.uuid);
     sel.removeAllRanges();
   } catch (e) {
     highlightError.value = e instanceof Error ? e.message : String(e);
@@ -355,8 +436,8 @@ async function init() {
     // of truth here regardless of auth state.
     try {
       const map = await getAnnotations(bookId.value, fmt.value);
-      bookmarks.value = map.bookmark ?? [];
-      highlights.value = map.highlight ?? [];
+      bookmarks.value = (map.bookmark ?? []).filter((b) => !b.removed);
+      highlights.value = (map.highlight ?? []).filter((h) => !h.removed);
     } catch (e) {
       console.error("failed to load bookmarks", e);
     }
@@ -417,7 +498,7 @@ async function synthesizeAndPlayCurrentPage() {
   readAloudError.value = null;
   try {
     const resp = await fetch("/tts/synthesize", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
-    if (!resp.ok) throw new Error((await resp.text()) || `${resp.status} ${resp.statusText}`);
+    if (!resp.ok) throw Object.assign(new Error((await resp.text()) || `${resp.status} ${resp.statusText}`), { status: resp.status });
     const blob = await resp.blob();
     releaseAudioUrl();
     currentAudioUrl = URL.createObjectURL(blob);
@@ -427,7 +508,7 @@ async function synthesizeAndPlayCurrentPage() {
       await audioEl.value.play();
     }
   } catch (e) {
-    readAloudError.value = e instanceof Error ? e.message : String(e);
+    readAloudError.value = ttsErrorText(e, (e as { status?: number }).status ?? null);
     readAloudActive.value = false;
   } finally {
     readAloudLoading.value = false;
@@ -459,7 +540,41 @@ function toggleReadAloud() {
 
 onBeforeUnmount(() => releaseAudioUrl());
 
+// The panels hang below the toolbar, which wraps onto a second row in a
+// narrow window; their top edge follows its real height.
+const toolbarRef = ref<InstanceType<typeof ReaderToolbar> | null>(null);
+const panelTop = ref(48);
+const bookTitle = computed(() => String(manifest.value?.metadata?.title ?? ""));
+let toolbarObserver: ResizeObserver | null = null;
+
+function measureToolbar() {
+  const el = toolbarRef.value?.$el as HTMLElement | undefined;
+  if (el) panelTop.value = el.offsetHeight || 48;
+}
+
+onMounted(() => {
+  void nextTick(() => {
+    measureToolbar();
+    const el = toolbarRef.value?.$el as HTMLElement | undefined;
+    if (el && typeof ResizeObserver !== "undefined") {
+      toolbarObserver = new ResizeObserver(measureToolbar);
+      toolbarObserver.observe(el);
+    }
+  });
+});
+onBeforeUnmount(() => toolbarObserver?.disconnect());
+
 function onKeydown(e: KeyboardEvent) {
+  // This view is not the library, so it owns Ctrl+F: it opens the book's search.
+  if (!isPdf.value && (e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === "f") {
+    e.preventDefault();
+    showToc.value = false;
+    showBookmarks.value = false;
+    searchOpen.value = true;
+    void nextTick(() => searchInput.value?.select());
+    return;
+  }
+  if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
   if (e.key === keymap.value.readerNext) nextPage();
   else if (e.key === keymap.value.readerPrev) prevPage();
 }
@@ -577,10 +692,58 @@ async function runBookSearch() {
   }
 }
 
-async function goToSearchHit(result: SpineMatches) {
+const searchInput = ref<HTMLInputElement | null>(null);
+const expandedSections = ref<Set<number>>(new Set());
+
+// Opening the panel puts the cursor in the box: a search panel that
+// needs a click before typing is a panel that was opened to type in.
+watch(searchOpen, (open) => {
+  if (!open) return;
+  void nextTick(() => {
+    searchInput.value?.focus();
+    searchInput.value?.select();
+  });
+});
+
+function visibleHits(result: SpineMatches) {
+  const all = result.matches.map((m, i) => ({ m, i }));
+  return expandedSections.value.has(result.spineIndex) ? all : all.slice(0, 5);
+}
+
+/**
+ * Opens the chapter a hit is in and moves to the hit itself.
+ *
+ * The same query is run over the text the chapter actually shows, and the
+ * n-th match there is the n-th one the search listed; that range is
+ * scrolled into view (or its page turned to, in paged mode) and selected.
+ * Without a matching hit it opens the chapter, which is the old behaviour.
+ */
+async function goToSearchHit(result: SpineMatches, matchIndex = -1) {
   showToc.value = false;
   showBookmarks.value = false;
   await loadSpine(result.spineIndex);
+  const doc = iframeEl.value?.contentDocument;
+  const listed = result.matches[matchIndex];
+  if (!doc?.body || !listed) return;
+
+  const index = indexText(doc.body);
+  const found = findMatches(index.text, searchQuery.value, { wholeWord: searchWholeWord.value, caseSensitive: searchCaseSensitive.value });
+  const hit = pickMatch(found, matchIndex, listed, result.matches.length);
+  if (!hit) return;
+  const range = rangeForOffsets(doc, index, hit.index, hit.index + hit.text.length);
+  if (!range) return;
+
+  const rect = range.getBoundingClientRect();
+  const vp = pagedViewport();
+  if (pagedMode.value && vp) {
+    goToPage(pageForScroll(rect.left + (doc.documentElement.scrollLeft || 0), vp.width));
+  } else {
+    range.startContainer.parentElement?.scrollIntoView({ block: "center" });
+  }
+  const sel = doc.getSelection();
+  sel?.removeAllRanges();
+  sel?.addRange(range);
+  // Focus stays in the panel, so the next hit is one keypress away.
 }
 
 // ---------------------------------------------------------------
@@ -880,44 +1043,51 @@ function onReaderResize() {
 
 <template>
   <!--
-    A PDF shares only the "Library" link with the EPUB reader: no
-    contents, bookmarks, spine navigation or read-aloud apply to it,
-    so it gets its own view rather than a toolbar full of disabled
-    buttons.
+    A PDF has its own reader (PdfReader: pages, zoom, outline, text
+    search), but both readers share one toolbar component, so the
+    controls they have in common sit in the same place in the same order.
   -->
   <div v-if="isPdf" class="reader">
-    <header class="toolbar">
-      <router-link to="/" class="back">Library</router-link>
-      <span class="title">{{ pdfTitle || "PDF" }}</span>
-    </header>
     <PdfReader :book-id="bookId" @title="pdfTitle = $event" />
   </div>
 
   <div v-else class="reader">
-    <header class="toolbar">
-      <router-link to="/" class="back">Library</router-link>
-      <button @click="showBookmarks = false; showToc = !showToc" :disabled="!manifest">Contents</button>
-      <button @click="showToc = false; showBookmarks = !showBookmarks" :disabled="!manifest">Bookmarks ({{ bookmarks.length }})</button>
-      <button @click="showToc = false; showBookmarks = false; searchOpen = !searchOpen" :disabled="!manifest" :class="{ active: searchOpen }">Search</button>
-      <button @click="bookmarkCurrentPage" :disabled="!manifest">Bookmark this page</button>
-      <button @click="prevPage" :disabled="!pagedMode && spineIndex <= 0">◀ Prev</button>
-      <span class="title">{{ manifest?.metadata?.title ?? "" }}</span>
-      <button @click="nextPage" :disabled="!manifest || (!pagedMode && spineIndex >= manifest.spine.length - 1)">Next ▶</button>
-      <button @click="togglePagedMode" :disabled="!manifest" :class="{ active: pagedMode }" title="Switch between paged and scrolling">{{ pagedMode ? "Paged" : "Scrolling" }}</button>
-      <span v-if="pagedMode" class="page-indicator">{{ currentPage + 1 }} / {{ pagesInSection }}</span>
-      <button @click="printCurrentSection" :disabled="!manifest" title="Print the section on screen">Print</button>
-      <span class="autoscroll" :class="{ active: autoScrolling }">
-        <button @click="toggleAutoScroll" :disabled="!manifest">{{ autoScrolling ? "⏸ Auto-scroll" : "▶ Auto-scroll" }}</button>
-        <template v-if="autoScrolling">
-          <button @click="changeAutoScrollSpeed(-1)" title="Slower">−</button>
-          <span class="autoscroll-speed">{{ autoScrollSpeed }}×</span>
-          <button @click="changeAutoScrollSpeed(1)" title="Faster">+</button>
-        </template>
-      </span>
-      <button @click="toggleReadAloud" :disabled="!manifest" :class="{ active: readAloudActive }">
-        {{ readAloudLoading ? "Synthesizing…" : readAloudActive ? "⏹ Stop reading" : "🔊 Read aloud" }}
-      </button>
-    </header>
+    <ReaderToolbar
+      ref="toolbarRef"
+      :title="bookTitle"
+      :disabled="!manifest"
+      :bookmark-count="bookmarks.length"
+      :contents-active="showToc"
+      :bookmarks-active="showBookmarks"
+      :search-active="searchOpen"
+      :can-prev="pagedMode || spineIndex > 0"
+      :can-next="!!manifest && (pagedMode || spineIndex < manifest.spine.length - 1)"
+      @contents="showBookmarks = false; showToc = !showToc"
+      @bookmarks="showToc = false; showBookmarks = !showBookmarks"
+      @search="showToc = false; showBookmarks = false; searchOpen = !searchOpen"
+      @bookmark="bookmarkCurrentPage"
+      @prev="prevPage"
+      @next="nextPage"
+    >
+      <template #position>
+        <span v-if="pagedMode" class="page-indicator">{{ currentPage + 1 }} / {{ pagesInSection }}</span>
+      </template>
+      <template #extra>
+        <button type="button" @click="togglePagedMode" :disabled="!manifest" :class="{ active: pagedMode }" title="Switch between paged and scrolling">{{ pagedMode ? "Paged" : "Scrolling" }}</button>
+        <button type="button" @click="printCurrentSection" :disabled="!manifest" title="Print the section on screen">Print</button>
+        <span class="autoscroll" :class="{ active: autoScrolling }">
+          <button type="button" @click="toggleAutoScroll" :disabled="!manifest">{{ autoScrolling ? "⏸ Auto-scroll" : "▶ Auto-scroll" }}</button>
+          <template v-if="autoScrolling">
+            <button type="button" @click="changeAutoScrollSpeed(-1)" title="Slower">−</button>
+            <span class="autoscroll-speed">{{ autoScrollSpeed }}×</span>
+            <button type="button" @click="changeAutoScrollSpeed(1)" title="Faster">+</button>
+          </template>
+        </span>
+        <button type="button" @click="toggleReadAloud" :disabled="!manifest" :class="{ active: readAloudActive }">
+          {{ readAloudLoading ? "Synthesizing…" : readAloudActive ? "⏹ Stop reading" : "🔊 Read aloud" }}
+        </button>
+      </template>
+    </ReaderToolbar>
 
     <p v-if="!bookId" class="empty">Open a book via <code>/read/&lt;book_id&gt;/&lt;fmt&gt;</code>.</p>
     <p v-else-if="loadError" class="error">{{ loadError }}</p>
@@ -927,9 +1097,9 @@ function onReaderResize() {
     <p v-if="readAloudError" class="error">{{ readAloudError }}</p>
     <audio v-show="readAloudActive" ref="audioEl" controls @ended="onReadAloudEnded" class="read-aloud-player" />
 
-    <aside v-if="searchOpen" class="book-search">
+    <aside v-if="searchOpen" class="book-search" :style="{ top: `${panelTop}px` }" @keydown.esc.prevent="searchOpen = false">
       <form class="book-search-form" @submit.prevent="runBookSearch">
-        <input v-model="searchQuery" type="search" placeholder="Search this book…" autofocus />
+        <input ref="searchInput" v-model="searchQuery" type="search" aria-label="Search this book" placeholder="Search this book…" />
         <button type="submit" :disabled="searching || !searchQuery.trim()">{{ searching ? "Searching…" : "Search" }}</button>
       </form>
       <div class="book-search-options">
@@ -948,16 +1118,20 @@ function onReaderResize() {
             Section {{ result.spineIndex + 1 }} — {{ result.matches.length }} match(es)
           </button>
           <ul class="book-search-hits">
-            <li v-for="(m, i) in result.matches.slice(0, 5)" :key="i" @click="goToSearchHit(result)">
-              <span>{{ m.context.slice(0, m.contextOffset) }}</span><mark>{{ m.text }}</mark><span>{{ m.context.slice(m.contextOffset + m.text.length) }}</span>
+            <li v-for="{ m, i } in visibleHits(result)" :key="i">
+              <button type="button" class="book-search-hit" @click="goToSearchHit(result, i)">
+                <span>{{ m.context.slice(0, m.contextOffset) }}</span><mark>{{ m.text }}</mark><span>{{ m.context.slice(m.contextOffset + m.text.length) }}</span>
+              </button>
             </li>
-            <li v-if="result.matches.length > 5" class="book-search-more">+{{ result.matches.length - 5 }} more in this section</li>
+            <li v-if="result.matches.length > 5 && !expandedSections.has(result.spineIndex)" class="book-search-more">
+              <button type="button" class="book-search-hit" @click="expandedSections = new Set(expandedSections).add(result.spineIndex)">+{{ result.matches.length - 5 }} more in this section</button>
+            </li>
           </ul>
         </li>
       </ul>
     </aside>
 
-    <nav v-if="showToc" class="toc">
+    <nav v-if="showToc" class="toc" :style="{ top: `${panelTop}px` }" aria-label="Contents">
       <ul>
         <li v-for="(entry, i) in tocEntries" :key="i" :style="{ paddingLeft: `${entry.depth}em` }">
           <a href="#" @click.prevent="goToTocEntry(entry.dest, entry.frag)">{{ entry.title }}</a>
@@ -965,7 +1139,7 @@ function onReaderResize() {
       </ul>
     </nav>
 
-    <nav v-if="showBookmarks" class="toc">
+    <nav v-if="showBookmarks" class="toc" :style="{ top: `${panelTop}px` }" aria-label="Bookmarks">
       <p v-if="bookmarks.length === 0" class="empty">No bookmarks yet.</p>
       <ul v-else>
         <li v-for="b in bookmarks" :key="b.title">
@@ -980,28 +1154,10 @@ function onReaderResize() {
 
 <style scoped>
 .reader {
+  position: relative;
   display: flex;
   flex-direction: column;
   height: 100vh;
-}
-.toolbar {
-  display: flex;
-  align-items: center;
-  gap: 0.5em;
-  padding: 0.5em;
-  border-bottom: 1px solid var(--border);
-}
-.toolbar .title {
-  flex: 1;
-  text-align: center;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.toolbar button.active {
-  background: var(--accent);
-  color: var(--fg-on-accent);
-  border-color: var(--accent);
 }
 .read-aloud-player {
   width: 100%;
@@ -1107,6 +1263,20 @@ function onReaderResize() {
 }
 .book-search-hits li:hover {
   background: var(--accent-soft);
+}
+/* A hit is a real button: focusable and operable from the keyboard. */
+.book-search-hit {
+  all: unset;
+  box-sizing: border-box;
+  display: block;
+  width: 100%;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.book-search-hit:focus-visible {
+  outline: 2px solid var(--accent);
 }
 .book-search-more {
   opacity: 0.6;

@@ -304,8 +304,8 @@ fn passes_through_link(library: &Path, rel: &str) -> bool {
 /// about and kept for the plan (a plan changes nothing on disk, and
 /// [`execute`] re-checks as it moves: it never replaces an existing file).
 ///
-/// Names are matched the way the platform's file system does: ignoring case on
-/// Windows and macOS, exactly elsewhere.
+/// Names are matched the way the library's volume does: ignoring case when a
+/// probe of the volume says it does ([`volume_ignores_case`]).
 struct DiskView {
     library: std::path::PathBuf,
     fold: bool,
@@ -336,9 +336,31 @@ enum LinkState {
     Missing,
 }
 
+/// Whether the volume holding `library` treats `Name` and `name` as one file.
+///
+/// The server's own platform does not say: a Linux server can mount a
+/// case-insensitive SMB share, and a Windows one a case-sensitive folder. It
+/// is asked of the volume itself, without writing anything: an entry of the
+/// library's top folder is looked up under its other case, unless that
+/// spelling is also listed (two real entries, so the answer would be a lie).
+/// An empty or unreadable library falls back to the platform's usual rule.
+fn volume_ignores_case(library: &Path) -> bool {
+    let platform = cfg!(windows) || cfg!(target_os = "macos");
+    let Ok(entries) = std::fs::read_dir(library) else { return platform };
+    let names: Vec<String> = entries.flatten().take(200).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    for name in &names {
+        let alt = if name.to_uppercase() != *name { name.to_uppercase() } else { name.to_lowercase() };
+        if alt == *name || names.iter().any(|n| n != name && n.to_lowercase() == alt.to_lowercase()) {
+            continue;
+        }
+        return std::fs::symlink_metadata(library.join(&alt)).is_ok();
+    }
+    platform
+}
+
 impl DiskView {
     fn new(library: &Path) -> Self {
-        DiskView { library: library.to_path_buf(), fold: cfg!(windows) || cfg!(target_os = "macos"), dirs: Default::default(), links: Default::default() }
+        DiskView { library: library.to_path_buf(), fold: volume_ignores_case(library), dirs: Default::default(), links: Default::default() }
     }
 
     fn fold_name(&self, name: &str) -> String {
@@ -1105,6 +1127,25 @@ mod tests {
         names.sort();
         assert_eq!(names.len(), 3, "{names:?}");
         assert_eq!(std::fs::read(dir.path().join("Sorted/Same.pdf")).unwrap(), b"%PDF already here", "the file that was there is untouched");
+    }
+
+    /// Case folding is the volume's, found by looking an entry up under its other
+    /// case -- not the server's operating system -- and nothing is written.
+    #[test]
+    fn the_disk_view_folds_case_as_the_volume_does() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nothing to ask the volume about: the platform's usual rule.
+        assert_eq!(volume_ignores_case(dir.path()), cfg!(windows) || cfg!(target_os = "macos"));
+        write(&dir.path().join("Probe.txt"), b"x");
+        let ignores = std::fs::metadata(dir.path().join("PROBE.TXT")).is_ok();
+        assert_eq!(volume_ignores_case(dir.path()), ignores);
+        assert_eq!(DiskView::new(dir.path()).fold, ignores);
+        // Both spellings listed (a case-sensitive volume): no answer from them, and none written.
+        if !ignores {
+            write(&dir.path().join("PROBE.TXT"), b"y");
+            assert!(!volume_ignores_case(dir.path()));
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), if ignores { 1 } else { 2 });
     }
 
     /// The directory-listing view must answer what `is_file()`/`exists()` on the

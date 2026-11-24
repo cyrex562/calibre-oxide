@@ -75,6 +75,8 @@ export interface Bookmark {
   timestamp: string;
   pos: string;
   pos_type: string;
+  /** Set when the bookmark was deleted; kept (newer) so the deletion syncs. */
+  removed?: boolean;
 }
 
 // Real shape `lexmechanic_db::annotations` expects for a highlight (see
@@ -90,6 +92,8 @@ export interface Highlight {
   start_cfi: string;
   end_cfi: string;
   highlighted_text: string;
+  /** Set when the highlight was deleted; kept (newer) so the deletion syncs. */
+  removed?: boolean;
 }
 
 export interface LastReadPosition {

@@ -442,6 +442,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/change-log/repair/{library_id}", post(change_log_status::repair))
         .route("/orphans/{library_id}", get(orphans::list))
         .route("/orphans/relocate/{book_id}/{format}/{library_id}", post(orphans::relocate))
+        .route("/orphans/locate/{book_id}/{format}/{library_id}", get(orphans::locate))
         .route("/orphans/upload/{book_id}/{format}/{library_id}/{filename}", post(orphans::upload))
         .route("/orphans/forget/{book_id}/{library_id}", post(orphans::forget))
         .route("/ignored/{library_id}", get(orphans::ignored))

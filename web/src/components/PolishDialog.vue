@@ -83,7 +83,7 @@ async function run() {
 </script>
 
 <template>
-  <Dialog :title="`Polish ${bookIds.length} book(s)`" :busy="busy" size="md" @close="emit('close')">
+  <Dialog :title="`Polish ${bookIds.length} ${bookIds.length === 1 ? 'book' : 'books'}`" :busy="busy" size="md" @close="emit('close')">
     <p class="hint">Rewrites the EPUB in place. Books without an EPUB format are skipped and reported.</p>
 
     <ul class="polish-actions">
@@ -117,7 +117,7 @@ async function run() {
     </ul>
     <template #footer>
       <button type="button" :disabled="busy" @click="emit('close')">Close</button>
-      <button type="button" class="primary" :disabled="busy" @click="run">{{ busy ? "Polishing…" : "Polish" }}</button>
+      <button type="button" class="primary" :disabled="busy || !anyActionSelected()" :title="anyActionSelected() ? undefined : 'Tick at least one action first'" @click="run">{{ busy ? "Polishing…" : "Polish" }}</button>
     </template>
   </Dialog>
 </template>
@@ -134,7 +134,12 @@ async function run() {
   break-inside: avoid;
   margin-bottom: 0.2rem;
 }
+/* The hint goes under its option, indented past the box. */
+.polish-actions .field {
+  flex-wrap: wrap;
+}
 .hint.inline {
+  flex: 1 0 100%;
   display: block;
   font-size: var(--fs-small);
   opacity: 0.65;

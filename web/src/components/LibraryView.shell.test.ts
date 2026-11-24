@@ -179,7 +179,7 @@ describe("toolbar menus", () => {
     }
     const names = arrows.map((a) => a.getAttribute("aria-label"));
     expect(names).toContain("Virtual library options");
-    expect(names).toContain("Saved searches");
+    expect(names).toContain("Saved searches options");
     expect(names).toContain("More actions");
     const first = el.querySelector<HTMLElement>(".toolbar-actions .tb-chevron")!;
     click(first);
@@ -192,16 +192,16 @@ describe("shortcuts", () => {
   it("shows the key that is really bound in each tooltip, and no Ctrl chord nothing handles", async () => {
     const el = await mountView();
     const title = (label: string) => slot(el, label).querySelector<HTMLElement>(".tb-body")!.title;
-    expect(title("Find duplicates…")).toContain("(D)");
-    expect(title("Edit metadata")).toContain("(E)");
+    expect(title("Find duplicates…")).toContain("(d)");
+    expect(title("Edit metadata")).toContain("(e)");
     expect(title("Add Books…")).not.toContain("Ctrl");
-    expect(title("Add Books…")).toContain("(A)");
+    expect(title("Add Books…")).toContain("(a)");
   });
 
   it("shows a rebound key, not the one it shipped with", async () => {
     settingsMocks.fetchProfile.mockImplementation(async (name: string) => (name === "keymap" ? { "find-duplicates": "g" } : null));
     const el = await mountView();
-    expect(slot(el, "Find duplicates…").querySelector<HTMLElement>(".tb-body")!.title).toContain("(G)");
+    expect(slot(el, "Find duplicates…").querySelector<HTMLElement>(".tb-body")!.title).toContain("(g)");
   });
 
   it("Ctrl+A is not Add books, and Ctrl+A in the table selects every book", async () => {
@@ -312,6 +312,31 @@ describe("sorting", () => {
     click(title);
     await settle();
     expect(settingsMocks.saveProfile).toHaveBeenCalledWith("library-prefs", expect.objectContaining({ sort: "title", sortOrder: "asc", duplicateDefault: "skip" }));
+  });
+});
+
+describe("sorting against the stored preferences", () => {
+  it("is not undone by the stored sort arriving after a header click, and quick clicks save in order", async () => {
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((r) => (release = r));
+    settingsMocks.fetchProfile.mockImplementation(async (name: string) => {
+      if (name !== "library-prefs") return null;
+      await held;
+      return { sort: "timestamp", sortOrder: "desc", duplicateDefault: "skip" };
+    });
+    const el = await mountView();
+    const title = el.querySelector<HTMLElement>("th[data-key='title'] .header-button")!;
+    click(title); // ascending
+    await settle();
+    click(title); // descending
+    await settle();
+    release();
+    await settle();
+    // The header still shows what the user chose, not the stored sort that arrived late.
+    expect(el.querySelector("th[data-key='title']")!.getAttribute("aria-sort")).toBe("descending");
+    const saved = settingsMocks.saveProfile.mock.calls.filter((c) => c[0] === "library-prefs").map((c) => c[1] as { sort: string; sortOrder: string });
+    expect(saved.length).toBeGreaterThanOrEqual(1);
+    expect(saved[saved.length - 1]).toMatchObject({ sort: "title", sortOrder: "desc" });
   });
 });
 

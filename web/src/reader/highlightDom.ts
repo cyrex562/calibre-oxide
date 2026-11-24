@@ -32,6 +32,26 @@ function collectTextNodesInRange(range: Range): Text[] {
 /// so a later "remove highlight" action can find every fragment of a
 /// multi-node highlight, even though this slice doesn't implement
 /// that action yet).
+/**
+ * Takes a highlight back out of a document: every `<mark>` carrying the
+ * highlight's `data-uuid` is replaced by its own contents, and the text
+ * nodes it had split are joined again. Returns how many fragments it
+ * removed (0 means the highlight was not in this document).
+ */
+export function unwrapHighlight(doc: Document, uuid: string): number {
+  let removed = 0;
+  for (const mark of Array.from(doc.querySelectorAll<HTMLElement>("mark[data-uuid]"))) {
+    if (mark.dataset.uuid !== uuid) continue;
+    const parent = mark.parentNode;
+    if (!parent) continue;
+    while (mark.firstChild) parent.insertBefore(mark.firstChild, mark);
+    parent.removeChild(mark);
+    parent.normalize();
+    removed += 1;
+  }
+  return removed;
+}
+
 export function wrapHighlightRange(range: Range, className: string, dataset: Record<string, string> = {}): void {
   const nodes = collectTextNodesInRange(range);
   for (const textNode of nodes) {

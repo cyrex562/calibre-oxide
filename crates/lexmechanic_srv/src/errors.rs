@@ -38,6 +38,11 @@ pub enum ServerError {
     /// startup.
     #[error("{0}")]
     ServiceUnavailable(String),
+    /// 503: an optional feature this server was not started with. `message` is
+    /// plain words for a reader (never a command-line flag), `code` is a stable
+    /// machine name the web UI can switch on (sent as the `X-Error-Code` header).
+    #[error("{message}")]
+    FeatureDisabled { code: &'static str, message: String },
     /// Port of `HTTPRedirect`/`HTTPTempRedirect`. `permanent` selects
     /// between them (301 vs 307).
     #[error("redirect to {location}")]
@@ -68,6 +73,7 @@ impl IntoResponse for ServerError {
             ServerError::UnprocessableEntity(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg).into_response(),
             ServerError::InternalServerError(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
             ServerError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg).into_response(),
+            ServerError::FeatureDisabled { code, message } => (StatusCode::SERVICE_UNAVAILABLE, [("x-error-code", code)], message).into_response(),
             ServerError::Redirect { location, permanent } => {
                 if permanent {
                     Redirect::permanent(&location).into_response()
@@ -96,5 +102,12 @@ mod tests {
         assert_eq!(ServerError::BadRequest("x".into()).into_response().status(), StatusCode::BAD_REQUEST);
         assert_eq!(ServerError::Unauthorized.into_response().status(), StatusCode::UNAUTHORIZED);
         assert_eq!(ServerError::Forbidden("x".into()).into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn a_disabled_feature_is_a_503_with_a_machine_code() {
+        let resp = ServerError::FeatureDisabled { code: "tts_not_configured", message: "Read aloud is not set up on this server.".into() }.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers()["x-error-code"], "tts_not_configured");
     }
 }

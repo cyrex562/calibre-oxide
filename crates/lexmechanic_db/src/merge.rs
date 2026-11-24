@@ -155,6 +155,14 @@ pub struct SourceReport {
     pub warnings: Vec<String>,
 }
 
+/// One destination field a merge changes: its value now, and after the merge.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MetadataChange {
+    pub field: String,
+    pub before: String,
+    pub after: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct MergeReport {
     pub dest_id: i32,
@@ -163,6 +171,9 @@ pub struct MergeReport {
     pub sources: Vec<SourceReport>,
     /// Fields of the destination that changed (`#label` for custom columns).
     pub metadata_changed: Vec<String>,
+    /// What each of those becomes (also filled by a dry run, so a review can
+    /// show it before anything is written). A cover has no entry.
+    pub metadata_preview: Vec<MetadataChange>,
     /// The source whose cover the destination took.
     pub cover_from: Option<i32>,
     pub warnings: Vec<String>,
@@ -299,10 +310,12 @@ pub fn merge_books(cache: &Cache, dest_id: i32, src_ids: &[i32], opts: &MergeOpt
     }
 
     // ---- 3. metadata, data files --------------------------------------
-    if !dry && opts.mode != MergeMode::FormatsOnly {
+    if opts.mode != MergeMode::FormatsOnly {
         let ids: Vec<i32> = report.sources.iter().map(|s| s.book_id).collect();
-        merge_metadata(cache, dest_id, &ids, &mut report)?;
-        checkpoint("after_metadata")?;
+        merge_metadata(cache, dest_id, &ids, dry, &mut report)?;
+        if !dry {
+            checkpoint("after_metadata")?;
+        }
     }
     if opts.mode == MergeMode::MergeAndDelete {
         for sr in report.sources.iter_mut().filter(|s| s.error.is_none()) {
@@ -476,17 +489,48 @@ fn append_comments(dest: Option<String>, orig_dest: &Option<String>, src: Option
 }
 
 /// `merge_book_metadata`: see the module docs for the rules.
-fn merge_metadata(cache: &Cache, dest: i32, sources: &[i32], report: &mut MergeReport) -> Result<()> {
+///
+/// With `dry`, nothing is written: the destination's would-be values live in an
+/// overlay that later sources are merged against, exactly as in a real merge, so
+/// the preview lists every field that will change (and what it becomes).
+fn merge_metadata(cache: &Cache, dest: i32, sources: &[i32], dry: bool, report: &mut MergeReport) -> Result<()> {
+    use std::cell::RefCell;
     let mut changed: Vec<String> = Vec::new();
+    // The destination's values as the merge leaves them (dry runs only read these).
+    let overlay: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    // First value each changed field had, and the last one it was given.
+    let originals: RefCell<HashMap<String, Option<String>>> = RefCell::new(HashMap::new());
+    let finals: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    let note = |key: &str, before: Option<String>, after: &str| {
+        originals.borrow_mut().entry(key.to_string()).or_insert(before);
+        finals.borrow_mut().insert(key.to_string(), after.to_string());
+    };
+    let get = |id: i32, field: &str| -> Result<Option<String>> {
+        if dry && id == dest {
+            if let Some(v) = overlay.borrow().get(field) {
+                return Ok(clean(Some(v.clone())));
+            }
+        }
+        Ok(clean(cache.field_for(id, field)?))
+    };
     let mut set = |cache: &Cache, field: &str, value: &str| -> Result<()> {
-        cache.set_field(dest, field, value)?;
+        note(field, cache.field_for(dest, field)?, value);
+        if dry {
+            overlay.borrow_mut().insert(field.to_string(), value.to_string());
+        } else {
+            cache.set_field(dest, field, value)?;
+        }
         if !changed.iter().any(|c| c == field) {
             changed.push(field.to_string());
         }
         Ok(())
     };
-    let get = |id: i32, field: &str| -> Result<Option<String>> { Ok(clean(cache.field_for(id, field)?)) };
 
+    // Setting a title or authors rewrites their sort values as a side effect;
+    // remember those as they are now, so a live merge reports what a dry run does.
+    for derived in ["sort", "author_sort"] {
+        originals.borrow_mut().insert(derived.to_string(), cache.field_for(dest, derived)?);
+    }
     let orig_comments = get(dest, "comments")?;
     for &src in sources {
         if let Some(c) = append_comments(get(dest, "comments")?, &orig_comments, get(src, "comments")?) {
@@ -555,8 +599,10 @@ fn merge_metadata(cache: &Cache, dest: i32, sources: &[i32], report: &mut MergeR
     if !cover_present(cache, dest) {
         for &src in sources {
             if cover_present(cache, src) {
-                let bytes = std::fs::read(crate::covers::cover_path(cache, src)?)?;
-                crate::covers::set_cover(cache, dest, &bytes)?;
+                if !dry {
+                    let bytes = std::fs::read(crate::covers::cover_path(cache, src)?)?;
+                    crate::covers::set_cover(cache, dest, &bytes)?;
+                }
                 changed.push("cover".to_string());
                 report.cover_from = Some(src);
                 break;
@@ -574,12 +620,27 @@ fn merge_metadata(cache: &Cache, dest: i32, sources: &[i32], report: &mut MergeR
             continue;
         }
         let key = format!("#{label}");
-        let read = |id: i32| -> Result<Option<String>> { Ok(clean(cache.get_custom_column_value(id, &label)?)) };
+        let read = |id: i32| -> Result<Option<String>> {
+            if dry && id == dest {
+                if let Some(v) = overlay.borrow().get(&key) {
+                    return Ok(clean(Some(v.clone())));
+                }
+            }
+            Ok(clean(cache.get_custom_column_value(id, &label)?))
+        };
         let orig = read(dest)?;
         for &src in sources {
             let (dv, sv) = (read(dest)?, read(src)?);
             let Some(sv) = sv else { continue };
-            let write = |value: &str| -> Result<()> { cache.set_custom_column_value(dest, &label, value) };
+            let write = |value: &str| -> Result<()> {
+                note(&key, orig.clone(), value);
+                if dry {
+                    overlay.borrow_mut().insert(key.clone(), value.to_string());
+                    Ok(())
+                } else {
+                    cache.set_custom_column_value(dest, &label, value)
+                }
+            };
             let wrote = match datatype.as_str() {
                 "comments" => match append_comments(dv.clone(), &orig, Some(sv.clone())) {
                     Some(c) => {
@@ -595,7 +656,9 @@ fn merge_metadata(cache: &Cache, dest: i32, sources: &[i32], report: &mut MergeR
                 "series" if dv.is_none() => {
                     write(&sv)?;
                     if let Some(idx) = cache.get_custom_series_index(src, &label)? {
-                        cache.set_custom_column_value(dest, &format!("{label}_index"), &idx.to_string())?;
+                        if !dry {
+                            cache.set_custom_column_value(dest, &format!("{label}_index"), &idx.to_string())?;
+                        }
                     }
                     true
                 }
@@ -622,6 +685,14 @@ fn merge_metadata(cache: &Cache, dest: i32, sources: &[i32], report: &mut MergeR
             }
         }
     }
+    report.metadata_preview = changed
+        .iter()
+        .filter_map(|field| {
+            let after = finals.borrow().get(field)?.clone();
+            let before = originals.borrow().get(field).cloned().flatten().unwrap_or_default();
+            Some(MetadataChange { field: field.clone(), before, after })
+        })
+        .collect();
     report.metadata_changed = changed;
     Ok(())
 }

@@ -97,6 +97,46 @@ pub async fn relocate(State(state): State<AppState>, Path((book_id, format, libr
     Ok(Json(json!({"outcome": code, "message": message})))
 }
 
+/// `GET /orphans/locate/{book_id}/{format}/{library_id}` -- "find the file by its
+/// checksum". Reads the library's untracked files (the ones the check found)
+/// and answers with those whose content is the one recorded for the missing
+/// file, so the person can confirm one and `relocate` to it. `has_checksum:
+/// false` means nothing was recorded to compare with.
+pub async fn locate(State(state): State<AppState>, Path((book_id, format, library_id)): Path<(i32, String, String)>) -> Result<Json<Value>, ServerError> {
+    let cache = cache_or_404(&state, &library_id)?;
+    let found = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+        let (recorded, _) = cache.checksums().recorded_identity(book_id, "format", &format.to_uppercase()).unwrap_or((None, None));
+        let Some(recorded) = recorded else {
+            return Ok(json!({"has_checksum": false, "candidates": [], "checked": 0}));
+        };
+        let check = lexmechanic_db::library_check::check(&cache)?;
+        let mut candidates = Vec::new();
+        let mut checked = 0usize;
+        // The check already matched some by content: this book's file, found elsewhere.
+        for file in check.moved_files.iter().filter(|f| f.book_id == Some(book_id)) {
+            candidates.push(json!({"path": file.path}));
+        }
+        for file in &check.untracked_files {
+            let path = cache.backend.library_path.join(&file.path);
+            // Only a file of the same kind can be the same book file.
+            if !path.extension().is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case(&format)) {
+                continue;
+            }
+            checked += 1;
+            if let Ok(digest) = lexmechanic_db::scan_pipeline::hash_stream(&path, None) {
+                if digest.hash == recorded {
+                    candidates.push(json!({"path": file.path}));
+                }
+            }
+        }
+        Ok(json!({"has_checksum": true, "candidates": candidates, "checked": checked}))
+    })
+    .await
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))?
+    .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+    Ok(Json(found))
+}
+
 /// `POST /orphans/upload/{book_id}/{format}/{library_id}/{filename}`.
 ///
 /// The "copy the file back in" resolution. The bytes are written to the
@@ -311,6 +351,26 @@ mod tests {
 
         let (_, orphans) = get_json(&router, "/orphans/default").await;
         assert_eq!(orphans.as_array().unwrap().len(), 0, "the orphan should be resolved: {orphans}");
+    }
+
+    /// "Find the file by its checksum": the renamed copy is offered, a different
+    /// file is not.
+    #[tokio::test]
+    async fn locating_by_checksum_offers_the_renamed_copy_only() {
+        let (dir, router, book_id) = library_with_an_orphan();
+        std::fs::write(dir.path().join("boiler-manual-v2.pdf"), b"%PDF-1.4 boiler").unwrap();
+        std::fs::write(dir.path().join("something-else.pdf"), b"%PDF-1.4 a different book entirely").unwrap();
+        // Past the scanner's settle window, or the check treats them as still being copied.
+        for name in ["boiler-manual-v2.pdf", "something-else.pdf"] {
+            let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+            filetime::set_file_mtime(dir.path().join(name), filetime::FileTime::from_system_time(old)).unwrap();
+        }
+
+        let (status, body) = get_json(&router, &format!("/orphans/locate/{book_id}/PDF/default")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["has_checksum"], true, "{body}");
+        let paths: Vec<&str> = body["candidates"].as_array().unwrap().iter().map(|c| c["path"].as_str().unwrap()).collect();
+        assert_eq!(paths, vec!["boiler-manual-v2.pdf"], "{body}");
     }
 
     /// A different file is allowed but must be *said*. Silently accepting

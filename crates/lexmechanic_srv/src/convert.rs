@@ -225,6 +225,18 @@ pub struct StartConversionBody {
     options: ConversionOptionsBody,
 }
 
+/// The file stem a converted copy is written under: the stem of the book's
+/// existing file for the input format. Never the converter's scratch name; falls
+/// back to `converted` only if the file has no usable stem. Cannot collide with
+/// the scratch input `input.<fmt>` (the same-format case).
+fn output_stem(src_on_disk: &std::path::Path, same_format: bool) -> String {
+    let stem = src_on_disk.file_stem().and_then(|s| s.to_str()).map(lexmechanic_utils::filenames::sanitize_file_name).filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "converted".to_string());
+    if same_format && stem.eq_ignore_ascii_case("input") {
+        return "converted".to_string();
+    }
+    stem
+}
+
 /// `POST /conversion/start/{book_id}`. Port of `start_conversion`/
 /// `queue_job`.
 pub async fn start_conversion(State(state): State<AppState>, AxumPath(book_id): AxumPath<i32>, Json(body): Json<StartConversionBody>) -> Result<Json<Value>, ServerError> {
@@ -259,7 +271,10 @@ pub async fn start_conversion(State(state): State<AppState>, AxumPath(book_id): 
     let tdir = tempfile::tempdir().map_err(|e| ServerError::InternalServerError(e.to_string()))?.keep();
     let src_path = tdir.join(format!("input.{input_fmt_lower}"));
     tokio::fs::copy(&src_on_disk, &src_path).await.map_err(|e| ServerError::InternalServerError(e.to_string()))?;
-    let output_path = tdir.join(format!("output.{output_fmt_lower}"));
+    // The converted file keeps the book's own file name (`add_format` names a
+    // format after the file it is given), so the user's folder gets
+    // `<name>.epub` beside `<name>.pdf`, not `output.epub`.
+    let output_path = tdir.join(format!("{}.{output_fmt_lower}", output_stem(&src_on_disk, input_fmt_lower == output_fmt_lower)));
 
     let opts = body.options.apply(lexmechanic_ebooks::conversion::options::ConversionOptions::default());
 
@@ -480,6 +495,41 @@ mod tests {
         let (_status, data) = get_json(&router, &format!("/conversion/book-data/{book_id}")).await;
         let formats: Vec<String> = data["input_formats"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
         assert!(formats.contains(&"TXT".to_string()), "converted TXT format should now be listed: {formats:?}");
+    }
+
+    /// The converted file is named after the book's own file, not `output.txt`.
+    #[tokio::test]
+    async fn a_converted_format_keeps_the_books_file_name() {
+        let (dir, router, book_id) = test_app();
+        let (_, job_id) = post_json(&router, &format!("/conversion/start/{book_id}"), serde_json::json!({"input_fmt": "epub", "output_fmt": "txt"})).await;
+        let result = poll_until_done(&router, job_id.as_i64().unwrap()).await;
+        assert_eq!(result["ok"], true, "{result}");
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    if !e.file_name().to_string_lossy().starts_with('.') {
+                        walk(&p, out);
+                    }
+                } else {
+                    out.push(p);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(dir.path(), &mut files);
+        let stem_of = |ext: &str| files.iter().filter(|p| p.extension().is_some_and(|e| e == ext)).map(|p| p.file_stem().unwrap().to_string_lossy().to_string()).collect::<Vec<_>>();
+        let (txt, epub) = (stem_of("txt"), stem_of("epub"));
+        assert_eq!(txt.len(), 1, "{files:?}");
+        assert!(txt.iter().all(|s| !s.starts_with("output")), "scratch name leaked into the library: {files:?}");
+        assert_eq!(txt, epub, "the txt is named after the epub: {files:?}");
+    }
+
+    #[test]
+    fn the_output_stem_follows_the_source_and_cannot_collide_with_the_scratch_input() {
+        assert_eq!(super::output_stem(std::path::Path::new("/lib/Fiction/copy of code_silence_0.pdf"), false), "copy of code_silence_0");
+        assert_eq!(super::output_stem(std::path::Path::new("/lib/x/input.epub"), true), "converted");
+        assert_eq!(super::output_stem(std::path::Path::new("/lib/x/input.pdf"), false), "input");
     }
 
     #[tokio::test]

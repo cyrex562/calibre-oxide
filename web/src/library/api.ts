@@ -1806,6 +1806,8 @@ export interface MergeResponse {
   mode: MergeMode;
   results: MergeSourceResult[];
   metadata_changed: string[];
+  /** What each changed field becomes (also on a dry run); a cover has no entry. */
+  metadata_preview?: { field: string; before: string; after: string }[];
   cover_from: number | null;
   /** Everything moved to the library trash. */
   trashed: string[];

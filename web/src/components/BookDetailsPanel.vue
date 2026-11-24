@@ -23,6 +23,9 @@ import { DEFAULT_SAVED_TEMPLATES, removeTemplate, saveTemplate, SAVED_TEMPLATES_
 import { fetchProfile, saveProfile } from "../settings/api";
 import type { BookSummary, FieldMetaEntry } from "../library/types";
 import { getItemCompat } from "../library/legacyStorage";
+import { bookFolder, formatLocation } from "../library/fileLocation";
+import { convertTargets, defaultTarget } from "../library/convertTargets";
+import { formatBytes } from "../library/columns";
 
 const props = defineProps<{
   bookId: number;
@@ -123,13 +126,25 @@ async function openConvert() {
     // Default to a real format the book doesn't already have, so
     // starting a conversion produces a genuinely new format rather
     // than one already sitting in the format list.
-    convertOutputFmt.value = data.output_formats.find((f) => !data.input_formats.includes(f)) ?? data.output_formats[0] ?? "";
+    convertOutputFmt.value = defaultTarget(convertTargets(data.output_formats, convertInputFmt.value), book.value?.formats ?? data.input_formats);
   } catch (e) {
     convertError.value = e instanceof Error ? e.message : String(e);
   } finally {
     convertLoadingFormats.value = false;
   }
+  // The block opens below the metadata form, often off screen: bring it into view, on "To".
+  await nextTick();
+  convertPanel.value?.scrollIntoView?.({ block: "nearest" });
+  convertTo.value?.focus({ preventScroll: true });
 }
+
+const convertPanel = ref<HTMLElement | null>(null);
+const convertTo = ref<HTMLSelectElement | null>(null);
+/** What the book can be converted to: not the format it is converted from, no obsolete or duplicate names. */
+const convertTargetList = computed(() => convertTargets(convertOutputFormats.value, convertInputFmt.value));
+watch(convertInputFmt, () => {
+  if (!convertTargetList.value.includes(convertOutputFmt.value)) convertOutputFmt.value = defaultTarget(convertTargetList.value, book.value?.formats ?? []);
+});
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -721,17 +736,54 @@ async function revealFile(fmt: string) {
 /** In a plain browser there is no file manager to open, so the path is offered for copying. */
 const desktop = isTauri();
 const copied = ref(false);
+/** The format whose path was just copied (its button says "Copied"). */
+const copiedFormat = ref<string | null>(null);
 
-async function copyFolderPath() {
-  const path = (book.value?.path as string | undefined) ?? "";
+/** Where the files are: the table's Folder and File name columns, for this book. */
+const fileInfo = ref<{ folder: string | null; fileName: string | null } | null>(null);
+const folderPath = computed(() => bookFolder(book.value?.path, fileInfo.value?.folder));
+
+async function loadFileInfo() {
+  const id = props.bookId;
   try {
-    await navigator.clipboard.writeText(path);
-    copied.value = true;
-    setTimeout(() => (copied.value = false), 1500);
+    const [row] = await fetchBooks([id]);
+    if (id !== props.bookId) return;
+    fileInfo.value = row ? { folder: (row.folder as string | undefined) ?? null, fileName: (row.file_name as string | null | undefined) ?? null } : null;
   } catch {
-    // clipboard unavailable: the path is selectable text anyway
+    // The paths are a convenience: the format rows still list without them.
   }
 }
+
+function locationOf(fmt: string): string {
+  return formatLocation(folderPath.value, fileInfo.value?.fileName, fmt);
+}
+
+async function copyText(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    // clipboard unavailable: the path is selectable text anyway
+    return false;
+  }
+}
+
+async function copyFolderPath() {
+  if (await copyText(folderPath.value)) {
+    copied.value = true;
+    setTimeout(() => (copied.value = false), 1500);
+  }
+}
+
+async function copyFormatPath(fmt: string) {
+  if (await copyText(locationOf(fmt))) {
+    copiedFormat.value = fmt;
+    setTimeout(() => (copiedFormat.value = null), 1500);
+  }
+}
+
+/** A book with no cover (or a cover that failed to load) shows a placeholder, not a broken image. */
+const coverFailed = ref(false);
 
 /** Format sizes, read from the Content-Length of a HEAD request. */
 const formatSizes = ref<Record<string, number>>({});
@@ -752,12 +804,6 @@ async function loadFormatSizes() {
     }),
   );
   if (id === props.bookId) formatSizes.value = sizes;
-}
-
-function humanSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function openFormat(fmt: string) {
@@ -812,6 +858,8 @@ async function load(id: number) {
   form.value = null;
   baseline.value = null;
   formatSizes.value = {};
+  fileInfo.value = null;
+  coverFailed.value = false;
   dataFiles.value = {};
   convertOpen.value = false;
   shareOpen.value = false;
@@ -1043,10 +1091,16 @@ watch(
     if (open && id !== undefined) {
       void loadDataFiles();
       void loadFormatSizes();
+      void loadFileInfo();
     }
   },
   { immediate: true },
 );
+
+/** After a conversion: open the format that was just made. */
+function readConverted() {
+  void router.push({ name: "read", params: { bookId: String(props.bookId), fmt: convertOutputFmt.value.toLowerCase() } });
+}
 
 function read() {
   if (!readableFormat.value) return;
@@ -1154,7 +1208,8 @@ watch(
 
         <CollapsibleSection id="cover" title="Cover" :open="sections.cover" @toggle="toggle('cover')">
           <button type="button" class="cover-button" title="Click to enlarge" aria-label="Enlarge the cover" @click="openCoverViewer">
-            <img :src="coverSrc" :alt="`Cover of ${book.title}`" class="cover" />
+            <img v-if="!coverFailed" :src="coverSrc" :alt="`Cover of ${book.title}`" class="cover" @error="coverFailed = true" />
+            <span v-else class="cover cover-missing" role="img" :aria-label="`${book.title} has no cover`">No cover</span>
           </button>
           <div class="row">
             <button type="button" class="edit" @click="coverInput?.click()">Replace cover…</button>
@@ -1182,7 +1237,7 @@ watch(
           </template>
           <template v-else>
             <p class="hint">No preview for {{ (book.formats[0] ?? "this book").toUpperCase() }} yet.</p>
-            <button type="button" class="cover-button" title="Click to enlarge" @click="openCoverViewer"><img :src="coverSrc" alt="" class="cover" /></button>
+            <button v-if="!coverFailed" type="button" class="cover-button" title="Click to enlarge" @click="openCoverViewer"><img :src="coverSrc" alt="" class="cover" @error="coverFailed = true" /></button>
           </template>
         </CollapsibleSection>
 
@@ -1191,10 +1246,10 @@ watch(
           <form class="meta-form" @submit.prevent="saveEdits">
             <div class="fields">
               <label>Title <input v-model="form.title" data-field="title" required /></label>
-              <label>Authors <AutocompleteInput v-model="form.authors" data-field="authors" field="authors" separator="&" placeholder="Jane Doe & John Smith" /></label>
+              <label>Authors <AutocompleteInput v-model="form.authors" data-field="authors" field="authors" separator="&" placeholder="e.g. Jane Doe & John Smith" /></label>
               <label>Series <AutocompleteInput v-model="form.series" data-field="series" field="series" /></label>
               <label>Series index <input v-model="form.seriesIndex" data-field="series_index" type="number" step="0.1" /></label>
-              <label>Tags <AutocompleteInput v-model="form.tags" data-field="tags" field="tags" separator="," placeholder="scifi, classic" /></label>
+              <label>Tags <AutocompleteInput v-model="form.tags" data-field="tags" field="tags" separator="," placeholder="e.g. scifi, classic" /></label>
               <label>Rating <input v-model.number="form.rating" data-field="rating" type="number" min="0" max="5" step="1" /></label>
               <label>Publisher <AutocompleteInput v-model="form.publisher" data-field="publisher" field="publisher" /></label>
               <label>Published <input v-model="form.pubdate" data-field="pubdate" type="date" /></label>
@@ -1234,12 +1289,16 @@ watch(
           <ul class="file-list">
             <li v-for="[fmt, url] in formatLinks" :key="fmt" class="file-row" :data-format="fmt">
               <span class="file-name">{{ fmt.toUpperCase() }}</span>
-              <span class="file-size">{{ formatSizes[fmt] ? humanSize(formatSizes[fmt]) : "" }}</span>
+              <span class="file-size">{{ formatSizes[fmt] ? formatBytes(formatSizes[fmt]) : "" }}</span>
               <span class="file-actions">
                 <button v-if="desktop" type="button" class="edit small" data-action="show-in-folder" title="Show this file in the file manager" @click="revealFile(fmt)">Show in folder</button>
                 <button v-if="desktop" type="button" class="edit small" :disabled="openingExternally" @click="openFormat(fmt)">Open</button>
                 <a :href="url" class="download small" :download="`${book.title}.${fmt}`">Download</a>
                 <button type="button" class="format-chip-remove" :disabled="formatBusy" :aria-label="`Remove ${fmt.toUpperCase()}`" title="Remove this format" @click="removeFormatClick(fmt)">✕</button>
+              </span>
+              <span v-if="locationOf(fmt)" class="file-path" data-testid="file-path">
+                <code class="path-text" :title="locationOf(fmt)">{{ locationOf(fmt) }}</code>
+                <button type="button" class="edit small" data-action="copy-path" :aria-label="`Copy the path of the ${fmt.toUpperCase()} file`" @click="copyFormatPath(fmt)">{{ copiedFormat === fmt ? "Copied" : "Copy path" }}</button>
               </span>
             </li>
           </ul>
@@ -1248,9 +1307,9 @@ watch(
             <button type="button" class="edit small" :disabled="formatBusy" @click="formatInput?.click()">{{ formatBusy ? "Working…" : "Add format…" }}</button>
             <input ref="formatInput" type="file" class="hidden-file-input" @change="addFormatFile" />
           </div>
-          <div v-if="book.path" class="folder-path">
+          <div v-if="folderPath" class="folder-path">
             <span class="hint">Folder</span>
-            <code class="path-text" data-testid="folder-path">{{ book.path }}</code>
+            <code class="path-text" data-testid="folder-path">{{ folderPath }}</code>
             <button type="button" class="edit small" @click="copyFolderPath">{{ copied ? "Copied" : "Copy" }}</button>
             <button v-if="desktop" type="button" class="edit small" data-action="show-folder" @click="revealBookFolder">Show in folder</button>
           </div>
@@ -1316,7 +1375,7 @@ watch(
           </div>
         </div>
 
-        <div v-if="convertOpen" class="convert-panel">
+        <div v-if="convertOpen" ref="convertPanel" class="convert-panel">
           <p v-if="convertLoadingFormats">Loading formats…</p>
           <template v-else>
             <div class="convert-row">
@@ -1328,8 +1387,8 @@ watch(
               </label>
               <label>
                 To
-                <select v-model="convertOutputFmt" :disabled="converting">
-                  <option v-for="fmt in convertOutputFormats" :key="fmt" :value="fmt">{{ fmt }}</option>
+                <select ref="convertTo" v-model="convertOutputFmt" :disabled="converting">
+                  <option v-for="fmt in convertTargetList" :key="fmt" :value="fmt">{{ fmt.toUpperCase() }}</option>
                 </select>
               </label>
               <button type="button" class="read primary" :disabled="converting || !convertInputFmt || !convertOutputFmt" @click="runConversion">
@@ -1347,7 +1406,7 @@ watch(
                 <label><input type="checkbox" v-model="convertUseAutoToc" :disabled="converting" /> Force auto-generated table of contents</label>
                 <label class="convert-options-text">
                   Chapter detection XPath
-                  <input type="text" v-model="convertChapter" :disabled="converting" placeholder="//h:h1 | //h:h2" />
+                  <input type="text" v-model="convertChapter" :disabled="converting" placeholder="e.g. //h:h1 | //h:h2" />
                 </label>
                 <label class="convert-options-text">
                   Max TOC links
@@ -1359,7 +1418,10 @@ watch(
                 </label>
               </div>
             </details>
-            <p v-if="convertDone" class="convert-done">Converted to {{ convertOutputFmt }} -- format added to this book.</p>
+            <p v-if="convertDone" class="convert-done" role="status">
+              Converted to {{ convertOutputFmt.toUpperCase() }}. The new format is in this book's files.
+              <button v-if="READABLE_FORMATS.includes(convertOutputFmt.toLowerCase())" type="button" class="edit small" @click="readConverted">Read it</button>
+            </p>
           </template>
           <p v-if="convertError" class="error">{{ convertError }}</p>
         </div>
@@ -1374,21 +1436,21 @@ watch(
             </label>
             <label>
               From
-              <input v-model="shareFrom" type="email" placeholder="me@example.com" required :disabled="sharing" />
+              <input v-model="shareFrom" type="email" placeholder="e.g. me@example.com" required :disabled="sharing" />
             </label>
             <label>
               To
-              <input v-model="shareTo" type="email" placeholder="you@example.com" required :disabled="sharing" />
+              <input v-model="shareTo" type="email" placeholder="e.g. you@example.com" required :disabled="sharing" />
             </label>
           </div>
           <div class="convert-row">
             <label>
               SMTP relay
-              <input v-model="shareRelay.relay" placeholder="smtp.example.com" required :disabled="sharing" />
+              <input v-model="shareRelay.relay" placeholder="e.g. smtp.example.com" required :disabled="sharing" />
             </label>
             <label>
               Port
-              <input v-model.number="shareRelay.port" type="number" placeholder="587" :disabled="sharing" />
+              <input v-model.number="shareRelay.port" type="number" placeholder="e.g. 587" :disabled="sharing" />
             </label>
             <label>
               Encryption
@@ -1541,6 +1603,22 @@ watch(
 }
 .file-size {
   color: var(--fg-faint);
+  font-size: var(--fs-small);
+}
+.file-path {
+  flex: 1 0 100%;
+  display: flex;
+  align-items: center;
+  gap: 0.4em;
+}
+.cover-missing {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 8em;
+  background: var(--bg-sunken);
+  border: 1px dashed var(--border-strong);
+  color: var(--fg-muted);
   font-size: var(--fs-small);
 }
 .file-actions {

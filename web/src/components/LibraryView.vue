@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue";
-import { alertDialog } from "./dialogs/confirm";
+import { computed, nextTick, onMounted, ref, watch } from "vue";
+import { alertDialog, confirmDialog, promptDialog } from "./dialogs/confirm";
 import ImportDuplicatesDialog from "./dialogs/ImportDuplicatesDialog.vue";
 import NewLibraryDialog from "./dialogs/NewLibraryDialog.vue";
 import SwitchLibraryDialog from "./dialogs/SwitchLibraryDialog.vue";
@@ -22,7 +22,7 @@ import HelpDialog from "./HelpDialog.vue";
 import TrashDialog from "./TrashDialog.vue";
 import ImportFolderDialog from "./ImportFolderDialog.vue";
 import { scanPromptHint, scanPromptText, shouldPrompt } from "../library/scanPrompt";
-import { addBook, catalogDownloadUrl, fetchBooks, fetchFieldMetadata, fetchNaming, fetchSavedSearches, fetchVirtualLibraries, libraryExportUrl, search, setFields } from "../library/api";
+import { addBook, catalogDownloadUrl, fetchBooks, fetchFieldMetadata, fetchNaming, fetchSavedSearches, fetchVirtualLibraries, libraryExportUrl, search, setFields, setSavedSearch, setVirtualLibrary } from "../library/api";
 import type { DuplicateBook, DuplicateGroup } from "../library/api";
 import ResolveDialog from "./ResolveDialog.vue";
 import CompareDuplicates from "./CompareDuplicates.vue";
@@ -37,7 +37,7 @@ import { createMirrorController } from "../library/mirror";
 import MirrorDialog from "./MirrorDialog.vue";
 import { createRetitleController } from "../library/retitle";
 import RetitleDialog from "./RetitleDialog.vue";
-import { defaultMergeDestination } from "../library/merge";
+import { defaultMergeDestination, type MergeOutcome } from "../library/merge";
 import { parseSnippetSegments } from "../library/snippets";
 import { similarBooksQuery } from "../library/query";
 import { pathFromLibraryId, recentLibraryEntries } from "../library/recentLibraries";
@@ -76,9 +76,11 @@ import { useFtsSearch } from "../library/useFtsSearch";
 import { useLibraryInfo } from "../library/useLibraryInfo";
 import { useLibraryKeyboard } from "../library/useLibraryKeyboard";
 import { usePanelLayout } from "../library/usePanelLayout";
+import { useDrawerFocus } from "../library/useDrawerFocus";
 import { useRowColoring } from "../library/useRowColoring";
-import { useSelection } from "../library/useSelection";
+import { dropRemoved, useSelection } from "../library/useSelection";
 import { conventionFileTemplate } from "../library/renameFiles";
+import { libraryShortName } from "../library/fileLocation";
 
 // Real, persisted default (issue #721) -- overwritten by
 // loadLibraryPrefs() below once its fetch resolves; starts at the
@@ -182,13 +184,25 @@ function onSortMenuChoose(id: SortMenuId) {
  * sort, the one a reload or a trip to Settings or the reader comes back to. It is
  * the same stored value as Settings > Default sort, so the two never disagree.
  */
-async function rememberSort() {
-  try {
-    const stored = await fetchProfile<LibraryPrefs>(LIBRARY_PREFS_PROFILE);
-    await saveProfile(LIBRARY_PREFS_PROFILE, { ...DEFAULT_LIBRARY_PREFS, ...stored, sort: sort.value, sortOrder: sortOrder.value });
-  } catch (e) {
-    console.error("failed to save the sort order", e);
-  }
+// True once the user has picked a sort this session: the startup preferences load
+// must not put the stored one back over it.
+let userSorted = false;
+// Each save reads the whole profile and writes it back, so two saves in flight can
+// land out of order and keep the older sort. They run one after the other, and
+// each saves the sort as it is when its turn comes.
+let sortSaves: Promise<void> = Promise.resolve();
+
+function rememberSort(): Promise<void> {
+  userSorted = true;
+  sortSaves = sortSaves.then(async () => {
+    try {
+      const stored = await fetchProfile<LibraryPrefs>(LIBRARY_PREFS_PROFILE);
+      await saveProfile(LIBRARY_PREFS_PROFILE, { ...DEFAULT_LIBRARY_PREFS, ...stored, sort: sort.value, sortOrder: sortOrder.value });
+    } catch (e) {
+      console.error("failed to save the sort order", e);
+    }
+  });
+  return sortSaves;
 }
 
 /**
@@ -198,7 +212,7 @@ async function rememberSort() {
  * virtual library lived in a separate "Manage lists" dialog with no
  * relationship to the control that applies one. The menu carries both.
  */
-const vlMenuEntries = computed(() => vlMenuItems(Object.keys(virtualLibraries.value), vl.value));
+const vlMenuEntries = computed(() => vlMenuItems(Object.keys(virtualLibraries.value), vl.value, activeQuery.value));
 
 const vlMenu = ref<{ x: number; y: number } | null>(null);
 
@@ -206,7 +220,40 @@ function onVlMenuChoose(id: VlMenuId) {
   vlMenu.value = null;
   const choice = readVlChoice(id);
   if (choice.kind === "manage") manageOpen.value = true;
+  else if (choice.kind === "from-search") void makeVirtualLibraryFromSearch();
   else vl.value = choice.name;
+}
+
+/** The search on screen, kept under a name the user picks; the menus show it at once. */
+async function saveCurrentSearch() {
+  const query = activeQuery.value.trim();
+  if (!query) return;
+  const name = (await promptDialog("Save this search as:", "", { title: "Save this search", confirmLabel: "Save" }))?.trim();
+  if (!name) return;
+  if (name in savedSearches.value && !(await confirmDialog(`A saved search called "${name}" exists. Replace it?`, { confirmLabel: "Replace" }))) return;
+  try {
+    await setSavedSearch(name, query);
+    await loadMetadata();
+    showToast(`Saved the search “${name}”. It is in the saved searches menu.`);
+  } catch (e) {
+    error.value = humanError(e);
+  }
+}
+
+/** The search on screen as a virtual library: it then shows in the menu and scopes everything. */
+async function makeVirtualLibraryFromSearch() {
+  const query = activeQuery.value.trim();
+  if (!query) return;
+  const name = (await promptDialog("Name the virtual library:", "", { title: "Make a virtual library", confirmLabel: "Create" }))?.trim();
+  if (!name) return;
+  if (name in virtualLibraries.value && !(await confirmDialog(`A virtual library called "${name}" exists. Replace it?`, { confirmLabel: "Replace" }))) return;
+  try {
+    await setVirtualLibrary(name, query);
+    await loadMetadata();
+    showToast(`Made the virtual library “${name}”. Choose it from the virtual library menu.`);
+  } catch (e) {
+    error.value = humanError(e);
+  }
 }
 
 /** The label the virtual-library button wears: the active one, or all. */
@@ -219,7 +266,7 @@ const vlLabel = computed(() => vl.value || "All books");
  * label, which is the standard workaround for a select that acts like
  * a menu -- and a sign it should have been a menu.
  */
-const savedMenuEntries = computed(() => savedMenuItems(Object.keys(savedSearches.value)));
+const savedMenuEntries = computed(() => savedMenuItems(Object.keys(savedSearches.value), activeQuery.value));
 
 const savedMenu = ref<{ x: number; y: number } | null>(null);
 
@@ -228,6 +275,10 @@ function onSavedMenuChoose(id: SavedMenuId) {
   const choice = readSavedChoice(id);
   if (choice.kind === "manage") {
     manageOpen.value = true;
+    return;
+  }
+  if (choice.kind === "save") {
+    void saveCurrentSearch();
     return;
   }
   const query = savedSearches.value[choice.name];
@@ -280,12 +331,19 @@ async function loadMetadata() {
 }
 void loadMetadata();
 
-async function loadLibraryPrefs() {
+/**
+ * `applySort` is true at startup only: coming back from Settings must not change
+ * the sort the user is looking at, and a header click made before the stored
+ * preferences arrived is not undone by them.
+ */
+async function loadLibraryPrefs(applySort = true) {
   try {
     const prefs = await fetchProfile<LibraryPrefs>(LIBRARY_PREFS_PROFILE);
     if (!prefs) return;
-    sort.value = prefs.sort;
-    sortOrder.value = prefs.sortOrder;
+    if (applySort && !userSorted) {
+      sort.value = prefs.sort;
+      sortOrder.value = prefs.sortOrder;
+    }
     duplicateDefault.value = prefs.duplicateDefault;
   } catch (e) {
     // Non-fatal -- the grid still works with the built-in defaults.
@@ -377,7 +435,9 @@ function onColumnResize(next: { key: string; width: number }) {
 }
 // The panels beside the list: whether they show, how wide, and the splitters
 // that resize them (../library/usePanelLayout.ts).
-const { sidebarWidth, detailsWidth, startResize, narrow, panelShown, setPanel, togglePanel } = usePanelLayout();
+const { sidebarWidth, detailsWidth, startResize, narrow, drawer, panelShown, setPanel, togglePanel } = usePanelLayout();
+// A narrow window's drawers take focus when they open, close on Escape and give focus back.
+useDrawerFocus(drawer, () => (drawer.value = null));
 const sidebarShown = computed(() => panelShown("sidebar"));
 const detailsShown = computed(() => panelShown("details"));
 
@@ -437,9 +497,18 @@ function closeColumns() {
 function onColumnsChanged() {
   categoriesRefresh.value++;
   cacheBust.value++;
+  // The column picker, the sort menu and the table's columns come from the field metadata.
+  void loadMetadata();
 }
 
 const checkLibraryOpen = ref(false);
+
+/** "Show book" on a finding of Check library: close it and open the book in the details panel. */
+function onCheckShowBook(bookId: number) {
+  checkLibraryOpen.value = false;
+  setPanel("details", true);
+  selectedBookId.value = bookId;
+}
 
 // Item notes (issue #732) -- see NoteEditor.vue's own doc.
 const noteTarget = ref<{ field: string; itemName: string } | null>(null);
@@ -484,6 +553,7 @@ async function runSearch() {
     await win.refresh();
     error.value = win.error.value ? humanError(win.error.value) : null;
     pruneSelection();
+    await dropVanishedBook();
   } finally {
     loading.value = false;
   }
@@ -526,6 +596,22 @@ async function refreshLibraryTotal() {
     libraryTotal.value = (await search({ query: "", num: 1, offset: 0, sort: "id", sortOrder: "asc", vl: "" })).total_num;
   } catch {
     libraryTotal.value = null;
+  }
+}
+
+/**
+ * The open book is gone from the list after a refresh. If it was only filtered out
+ * (an edit that no longer matches the search) it stays open; if the library no longer
+ * has it (a merge, a resolve, a delete elsewhere) the panel and the scopes drop it.
+ */
+async function dropVanishedBook() {
+  const id = selectedBookId.value;
+  if (id === null || win.error.value || win.indexOf(id) >= 0) return;
+  try {
+    const found = await fetchBooks([id]);
+    if (found.length === 0 && selectedBookId.value === id) selectedBookId.value = null;
+  } catch {
+    // Cannot tell: leave the panel as it is.
   }
 }
 
@@ -810,12 +896,19 @@ async function openMergeForSelection() {
   );
 }
 
-async function onMerged(description: string) {
+async function onMerged(description: string, outcome?: MergeOutcome) {
   mergeDone.value = description;
   // A merge is not undoable (the merged-away records are deleted), so the toast says so rather than offering an Undo.
   showToast(`${description} A merge cannot be undone.`, undefined, 15000);
   mergeOpen.value = false;
   selectedIds.value = new Set();
+  if (outcome && outcome.removed.length > 0) {
+    // The merged-away records no longer exist: the panel and every dialog scope drop them,
+    // and the record that took their place is what the user looks at next.
+    const next = dropRemoved({ selected: selectedIds.value, openId: selectedBookId.value }, outcome.removed, outcome.dest);
+    selectedIds.value = next.selected;
+    selectedBookId.value = outcome.dest;
+  }
   await libraryChanged();
   // The merged group leaves the list (and the server's copy of the scan) at
   // once; the rest of the page stays where it was.
@@ -1201,7 +1294,7 @@ function itemLabel(item: ToolbarItem): string {
   if (item.kind === "separator" || item.kind === "spring") return "";
   // The library slot wears the open library's name: which library you
   // are in is state, and state belongs on a label.
-  if (item.kind === "menu") return item.id === "library" ? libraryName.value || "Library" : item.label ?? "";
+  if (item.kind === "menu") return item.id === "library" ? (libraryName.value ? libraryShortName(libraryName.value) : "Library") : item.label ?? "";
   if (item.kind === "split" && item.label) return item.label;
   const action = actionFor(item.id as LibraryActionId);
   return action ? actionLabel(action) : "";
@@ -1369,6 +1462,11 @@ const keyboard = useLibraryKeyboard({
   contextMenuOpen: () => contextMenu.value !== null,
   onBooksDropped,
   resumed(stale) {
+    // Settings may have changed what the view reads once at startup. (The keymap
+    // is reloaded by the keyboard composable itself.)
+    void loadToolbarPrefs();
+    void loadTablePrefs();
+    void loadLibraryPrefs(false);
     void syncDesktopMenu(Object.keys(actionHandlers) as LibraryActionId[], actionContext.value);
     if (stale) void libraryChanged();
   },
@@ -1415,7 +1513,7 @@ const pendingBookAction = ref<{ id: string; nonce: number } | null>(null);
 let actionNonce = 0;
 
 const contextEntries = computed(() =>
-  contextMenuEntries([...PANEL_ACTIONS, "similar-books", "mark-books", "polish", "bulk-edit", "save-to-disk", "delete-book"], actionContext.value).map((entry) => {
+  contextMenuEntries([...PANEL_ACTIONS, "similar-books", "mark-books", "polish", "bulk-edit", "save-to-disk", "merge-books", "compare-duplicates", "delete-book"], actionContext.value).map((entry) => {
     const hint = shortcutHint(entry.id, keymap.value);
     return hint ? { ...entry, accel: hint } : entry;
   }),
@@ -1474,7 +1572,7 @@ function onContextChoose(id: LibraryActionId) {
     void deleteSelectedBooks();
     return;
   }
-  if (id === "bulk-edit" || id === "save-to-disk" || id === "edit-metadata") {
+  if (id === "bulk-edit" || id === "save-to-disk" || id === "edit-metadata" || id === "merge-books" || id === "compare-duplicates") {
     runAction(id);
     return;
   }
@@ -1573,7 +1671,7 @@ const countText = computed(() => {
  */
 function skipToList() {
   const root = document.getElementById("book-list");
-  const target = root?.querySelector<HTMLElement>('tr[tabindex="0"]') ?? root?.querySelector<HTMLElement>(".table-scroll, .book-card") ?? root;
+  const target = root?.querySelector<HTMLElement>('tr[tabindex="0"], .card[tabindex="0"]') ?? root?.querySelector<HTMLElement>(".table-scroll, .grid-scroll") ?? root;
   target?.focus({ preventScroll: true });
 }
 
@@ -1643,6 +1741,12 @@ async function onPolished() {
 // In-app help (#1.17), generated from the registry and the live
 // keymap so it cannot go stale.
 const helpOpen = ref(false);
+
+/** A button in Help's "how to": close Help, then open the dialog it names. */
+function onHelpRun(id: LibraryActionId) {
+  helpOpen.value = false;
+  void nextTick(() => runAction(id));
+}
 </script>
 
 <template>
@@ -1734,6 +1838,7 @@ const helpOpen = ref(false);
           <AppIcon name="search" :size="15" class="in-field-icon" />
         </button>
       </form>
+      <button v-if="!ftsMode && activeQuery.trim()" type="button" class="save-search" data-testid="save-search" title="Keep this search under a name, to run again from the saved searches menu" @click="saveCurrentSearch">Save this search…</button>
 
       <template v-if="!ftsMode">
         <!--
@@ -1758,7 +1863,7 @@ const helpOpen = ref(false);
           compact
           has-menu
           title="Saved searches"
-          menu-label="Saved searches"
+          menu-label="Saved searches options"
           :expanded="savedMenu !== null"
           body-opens-menu
           @run="savedMenu = $event"
@@ -1830,8 +1935,10 @@ const helpOpen = ref(false);
     <p v-if="addSummary" class="status add-summary" role="status">{{ addSummary }}</p>
 
     <div class="body" :class="{ 'body-narrow': narrow }">
+      <!-- Behind a drawer: a click outside it closes it, and the list behind no longer looks active. -->
+      <div v-if="narrow && drawer" class="drawer-backdrop" data-testid="drawer-backdrop" @click="drawer = null"></div>
       <template v-if="sidebarShown">
-        <CategoryBrowser class="sidebar" :class="{ 'sidebar-drawer': narrow }" :style="{ width: sidebarWidth + 'px' }" :selected-ids="renameScope" :refresh-key="categoriesRefresh" @select="onCategorySelect" @view-note="openNote" @renamed="onCategoryRenamed" @folders-changed="onFoldersChanged" />
+        <CategoryBrowser class="sidebar" :class="{ 'sidebar-drawer': narrow }" :virtual-library="vl" :data-drawer="narrow ? 'sidebar' : undefined" :tabindex="narrow ? -1 : undefined" :style="{ width: sidebarWidth + 'px' }" :selected-ids="renameScope" :refresh-key="categoriesRefresh" @select="onCategorySelect" @view-note="openNote" @renamed="onCategoryRenamed" @folders-changed="onFoldersChanged" />
         <div
           v-if="!narrow"
           class="splitter"
@@ -1937,6 +2044,7 @@ const helpOpen = ref(false);
           :selected-ids="selectedIds"
           :selected-book-id="selectedBookId"
           :marked-ids="markedIds"
+          :row-colors="rowColors"
           :cache-bust="cacheBust"
           :reset-key="win.resetCount.value"
           @select="onCardClick"
@@ -1969,7 +2077,7 @@ const helpOpen = ref(false);
           title="Drag to resize"
           @pointerdown="startResize('details', $event)"
         ></div>
-        <aside class="details-column" :class="{ 'details-drawer': narrow }" aria-label="Book details" :style="narrow ? undefined : { width: detailsWidth + 'px' }">
+        <aside class="details-column" :class="{ 'details-drawer': narrow }" :data-drawer="narrow ? 'details' : undefined" :tabindex="narrow ? -1 : undefined" aria-label="Book details" :style="narrow ? undefined : { width: detailsWidth + 'px' }">
           <BookDetailsPanel
             :book-id="selectedBookId"
             :pending-action="pendingBookAction"
@@ -2001,12 +2109,13 @@ const helpOpen = ref(false);
         type="button"
         class="status-library"
         :title="libraryPath ? `${libraryPath}\nClick to switch library` : 'Click to switch library'"
+        :aria-label="`Library: ${libraryShortName(libraryName)}. Switch library`"
         @click="openSwitchLibrary"
       >
-        📚 {{ libraryName }}
+        📚 {{ libraryShortName(libraryName) }}
       </button>
       <span class="status-count" role="status" aria-live="polite">{{ countText }}</span>
-      <span v-if="totalNum > 0 && renderedRange.last > renderedRange.first" class="status-sort status-rows" title="Rows currently loaded around the viewport">rows {{ (renderedRange.first + 1).toLocaleString() }}–{{ renderedRange.last.toLocaleString() }}</span>
+      <span v-if="totalNum > 0 && renderedRange.last > renderedRange.first" class="status-sort status-rows" title="Rows currently loaded around the viewport">{{ viewMode === "grid" ? "books" : "rows" }} {{ (renderedRange.first + 1).toLocaleString() }}–{{ renderedRange.last.toLocaleString() }}</span>
       <button v-if="selectMode && totalNum > 0" type="button" class="status-toggle" title="Select every matching book" @click="selectAll">Select all {{ totalNum.toLocaleString() }}</button>
       <span v-if="draftCount > 0" class="status-sel status-draft" data-testid="draft-count" title="Edits in the details panel that were not saved">{{ draftCount }} unsaved {{ draftCount === 1 ? "draft" : "drafts" }}</span>
       <span v-if="selectedIds.size > 0" class="status-sel">{{ selectedIds.size.toLocaleString() }} selected</span>
@@ -2022,7 +2131,7 @@ const helpOpen = ref(false);
     <DeleteConfirm />
     <UndoToast />
 
-    <HelpDialog v-if="helpOpen" :keymap="keymap" @close="helpOpen = false" />
+    <HelpDialog v-if="helpOpen" :keymap="keymap" @close="helpOpen = false" @run="onHelpRun" />
 
     <TrashDialog v-if="trashOpen" @close="trashOpen = false" @changed="onTrashChanged" />
 
@@ -2052,7 +2161,7 @@ const helpOpen = ref(false);
 
     <CustomColumnsDialog v-if="columnsOpen" @close="closeColumns" @changed="onColumnsChanged" />
 
-    <CheckLibraryDialog :open="checkLibraryOpen" @close="checkLibraryOpen = false" @changed="runSearch" />
+    <CheckLibraryDialog :open="checkLibraryOpen" @close="checkLibraryOpen = false" @changed="runSearch" @show-book="onCheckShowBook" />
 
     <DuplicatesDialog
       :open="duplicatesOpen"
@@ -2461,6 +2570,16 @@ const helpOpen = ref(false);
    drawer over it, from the status bar's Categories / Details buttons. */
 .body {
   position: relative;
+}
+.drawer-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: calc(var(--z-popover) - 1);
+  background: var(--bg-backdrop);
+}
+.sidebar-drawer:focus,
+.details-drawer:focus {
+  outline: none;
 }
 .sidebar-drawer,
 .details-drawer {

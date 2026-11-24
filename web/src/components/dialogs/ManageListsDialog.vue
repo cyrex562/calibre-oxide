@@ -93,6 +93,7 @@ async function renameSavedSearchPrompt(name: string) {
 <template>
   <Dialog label="Virtual libraries and saved searches" show-close size="lg" @close="emit('close')">
     <p v-if="manageError" class="error">{{ manageError }}</p>
+    <p class="hint">A virtual library limits everything you see (the list, the counts in the status bar) to the books matching its search. A saved search is a search you run again from the search box&rsquo;s menu; it changes only the list.</p>
 
     <section>
       <h3>Virtual libraries</h3>
@@ -126,6 +127,9 @@ async function renameSavedSearchPrompt(name: string) {
         <button type="submit">Add</button>
       </form>
     </section>
+    <template #footer>
+      <button type="button" class="primary" @click="emit('close')">Close</button>
+    </template>
   </Dialog>
 </template>
 
