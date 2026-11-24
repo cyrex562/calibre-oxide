@@ -184,13 +184,25 @@ function onSortMenuChoose(id: SortMenuId) {
  * sort, the one a reload or a trip to Settings or the reader comes back to. It is
  * the same stored value as Settings > Default sort, so the two never disagree.
  */
-async function rememberSort() {
-  try {
-    const stored = await fetchProfile<LibraryPrefs>(LIBRARY_PREFS_PROFILE);
-    await saveProfile(LIBRARY_PREFS_PROFILE, { ...DEFAULT_LIBRARY_PREFS, ...stored, sort: sort.value, sortOrder: sortOrder.value });
-  } catch (e) {
-    console.error("failed to save the sort order", e);
-  }
+// True once the user has picked a sort this session: the startup preferences load
+// must not put the stored one back over it.
+let userSorted = false;
+// Each save reads the whole profile and writes it back, so two saves in flight can
+// land out of order and keep the older sort. They run one after the other, and
+// each saves the sort as it is when its turn comes.
+let sortSaves: Promise<void> = Promise.resolve();
+
+function rememberSort(): Promise<void> {
+  userSorted = true;
+  sortSaves = sortSaves.then(async () => {
+    try {
+      const stored = await fetchProfile<LibraryPrefs>(LIBRARY_PREFS_PROFILE);
+      await saveProfile(LIBRARY_PREFS_PROFILE, { ...DEFAULT_LIBRARY_PREFS, ...stored, sort: sort.value, sortOrder: sortOrder.value });
+    } catch (e) {
+      console.error("failed to save the sort order", e);
+    }
+  });
+  return sortSaves;
 }
 
 /**
@@ -319,12 +331,19 @@ async function loadMetadata() {
 }
 void loadMetadata();
 
-async function loadLibraryPrefs() {
+/**
+ * `applySort` is true at startup only: coming back from Settings must not change
+ * the sort the user is looking at, and a header click made before the stored
+ * preferences arrived is not undone by them.
+ */
+async function loadLibraryPrefs(applySort = true) {
   try {
     const prefs = await fetchProfile<LibraryPrefs>(LIBRARY_PREFS_PROFILE);
     if (!prefs) return;
-    sort.value = prefs.sort;
-    sortOrder.value = prefs.sortOrder;
+    if (applySort && !userSorted) {
+      sort.value = prefs.sort;
+      sortOrder.value = prefs.sortOrder;
+    }
     duplicateDefault.value = prefs.duplicateDefault;
   } catch (e) {
     // Non-fatal -- the grid still works with the built-in defaults.
@@ -1443,6 +1462,11 @@ const keyboard = useLibraryKeyboard({
   contextMenuOpen: () => contextMenu.value !== null,
   onBooksDropped,
   resumed(stale) {
+    // Settings may have changed what the view reads once at startup. (The keymap
+    // is reloaded by the keyboard composable itself.)
+    void loadToolbarPrefs();
+    void loadTablePrefs();
+    void loadLibraryPrefs(false);
     void syncDesktopMenu(Object.keys(actionHandlers) as LibraryActionId[], actionContext.value);
     if (stale) void libraryChanged();
   },

@@ -124,6 +124,8 @@ export function useLibraryKeyboard(deps: LibraryKeyboardDeps) {
     const left = leftAt;
     leftAt = null;
     if (left === null) return; // the first activation, right after mounting
+    // The view was parked, not remounted: shortcuts rebound in Settings are read again.
+    void loadKeymap();
     deps.resumed(needsRefresh(left.epoch, left.at));
   });
   onBeforeUnmount(() => {

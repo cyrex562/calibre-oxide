@@ -127,11 +127,10 @@ pub fn strip_author_suffix(stem: &str, authors: &[String]) -> String {
     let joined = authors.iter().map(|a| a.trim()).filter(|a| !a.is_empty()).collect::<Vec<_>>().join(" & ");
     let tails: Vec<&str> = std::iter::once(joined.as_str()).chain(authors.iter().map(String::as_str)).chain(std::iter::once("Unknown")).map(str::trim).filter(|a| !a.is_empty()).collect();
     loop {
-        let lower = s.to_lowercase();
-        let hit = tails.iter().find_map(|a| {
-            let tail = format!(" - {}", a.to_lowercase());
-            lower.ends_with(&tail).then(|| s.len() - tail.len())
-        });
+        // The cut is found in `s` itself: lowercasing changes a string's byte
+        // length for some characters (`İ`, `ẞ`, the Kelvin sign), so an offset
+        // taken from a lowercased copy lands in the wrong place.
+        let hit = tails.iter().find_map(|a| tail_start_ignoring_case(&s, &format!(" - {a}")));
         match hit {
             Some(cut) if cut > 0 && s.is_char_boundary(cut) => s.truncate(cut),
             _ => break,
@@ -141,12 +140,32 @@ pub fn strip_author_suffix(stem: &str, authors: &[String]) -> String {
     s
 }
 
+/// The byte offset in `s` where its ending equals `tail`, ignoring case
+/// character by character; `None` when it does not end with it.
+fn tail_start_ignoring_case(s: &str, tail: &str) -> Option<usize> {
+    let want: Vec<char> = tail.chars().flat_map(char::to_lowercase).collect();
+    let mut left = want.len();
+    let mut start = s.len();
+    for (index, c) in s.char_indices().rev() {
+        if left == 0 {
+            break;
+        }
+        let lower: Vec<char> = c.to_lowercase().collect();
+        if lower.len() > left || want[left - lower.len()..left] != lower[..] {
+            return None;
+        }
+        left -= lower.len();
+        start = index;
+    }
+    (left == 0).then_some(start)
+}
+
 lazy_static! {
     /// The name the library itself gave a book on import: `book_6`, `file 12`, `scan0001`.
     static ref INTERNAL_NAME: Regex = Regex::new(r"(?i)^(book|file|scan|doc|document|img|image|page|untitled|new)[\s_-]*\d*$").unwrap();
     /// The placeholder author as a title part ("x - Unknown", "Unknown - x", just "Unknown"),
     /// which is not the same as a real title containing the word ("The Unknown Soldier").
-    static ref UNKNOWN_WORD: Regex = Regex::new(r"(?i)(^unknown$|\s-\s*unknown\b|\bunknown\s*-\s)").unwrap();
+    static ref UNKNOWN_WORD: Regex = Regex::new(r"(?i)(^unknown$|\s-\s*unknown$)").unwrap();
 }
 
 /// Whether a candidate title is worth offering at all: it does not name the
@@ -662,6 +681,18 @@ mod tests {
     fn the_first_usable_stem_wins_and_one_equal_to_the_title_is_no_help() {
         assert_eq!(suggest_title("Untitled", &stems_of(&["Document1", "Real Name"]), &[]).as_deref(), Some("Real Name"));
         assert_eq!(suggest_title("Some Title", &stems_of(&["Some_Title"]), &[]), None);
+    }
+
+    #[test]
+    fn the_author_suffix_is_cut_where_it_starts_even_when_lowercasing_changes_lengths() {
+        // `İ` lowercases to two characters (three bytes), so a cut taken from the
+        // lowercased copy was off by one and ate the title's last letter.
+        assert_eq!(strip_author_suffix("Dİne - Frank Herbert", &["Frank Herbert".to_string()]), "Dİne");
+        assert_eq!(strip_author_suffix("İstanbul - İ Author", &["İ Author".to_string()]), "İstanbul");
+        assert_eq!(strip_author_suffix("Dune - FRANK herbert", &["Frank Herbert".to_string()]), "Dune");
+        assert_eq!(strip_author_suffix("Dune", &["Frank Herbert".to_string()]), "Dune");
+        // A real title that begins with the word is still a title.
+        assert_eq!(suggest_title("Untitled", &stems_of(&["Unknown - A Memoir"]), &[]).as_deref(), Some("Unknown - A Memoir"));
     }
 
     #[test]

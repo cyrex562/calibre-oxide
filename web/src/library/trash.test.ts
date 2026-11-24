@@ -121,6 +121,14 @@ describe("confirmations", () => {
   });
 });
 
+describe("describeTrash with a huge trash", () => {
+  it("does not throw for hundreds of thousands of entries", () => {
+    const entries = Array.from({ length: 300_000 }, (_, i) => entry({ deleted_at: 1000, expires_at: 1000 + 14 * 86400 + (i === 7 ? 100 * 86400 : 0) }));
+    const text = describeTrash({ count: entries.length, total_size: 1, expire_after_seconds: 14 * 86400, expired: [], entries });
+    expect(text).toContain("114 days for books a duplicate run removed");
+  });
+});
+
 describe("describeTrash", () => {
   it("says it is empty, or how long things last", () => {
     expect(describeTrash({ count: 0, total_size: 0, expire_after_seconds: 14 * 86400, expired: [], entries: [] })).toBe("The trash is empty.");

@@ -727,7 +727,8 @@ mod tests {
         let book = lib.get_book(book_id).unwrap().unwrap();
 
         assert_eq!(book.title, "New Title");
-        assert_eq!(book.author_sort, Some("New Author".to_string()));
+        // The sort string, "Author, New" -- not the display name, which filed the book under its first name.
+        assert_eq!(book.author_sort, Some("Author, New".to_string()));
 
         // Verify Author Link
         let auth_name: String = lib.conn().query_row(

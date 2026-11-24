@@ -143,6 +143,34 @@ fn data_dir(cache: &Cache, book_id: i32) -> anyhow::Result<Option<PathBuf>> {
     Ok(Some(cache.backend.library_path.join(DATA_DIR_NAME).join(uuid)))
 }
 
+/// True when `path` belongs to another book: it is a book's tracked format
+/// file, or it sits directly in another book's folder. A source tree with
+/// `Reports/report.pdf` and `Reports/data/dataset.pdf` gives two books the
+/// paths `Reports` and `Reports/data`, and the first book's `data/` directory
+/// is then the second book's folder -- its files are not attached data files.
+fn claimed_by_other_book(cache: &Cache, book_id: i32, path: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(&cache.backend.library_path) else { return false };
+    let rel = rel.to_string_lossy().replace('\\', "/");
+    let parent = rel.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+    let conn = cache.backend.conn.lock().unwrap();
+    let is_format: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM data d JOIN books b ON b.id = d.book
+             WHERE lower(CASE WHEN b.path = '' THEN '' ELSE b.path || '/' END || d.name || '.' || d.format) = lower(?1)",
+            [&rel],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if is_format > 0 {
+        return true;
+    }
+    if parent.is_empty() {
+        return false;
+    }
+    let in_other_folder: i64 = conn.query_row("SELECT COUNT(*) FROM books WHERE id != ?1 AND lower(path) = lower(?2)", (book_id, parent), |row| row.get(0)).unwrap_or(0);
+    in_other_folder > 0
+}
+
 /// Resolves one API relpath to a real path inside `dir`, rejecting
 /// anything that would escape it.
 fn on_disk(dir: &Path, relpath: &str) -> Option<PathBuf> {
@@ -180,7 +208,7 @@ pub fn list_extra_files(cache: &Cache, book_id: i32, pattern: &str) -> anyhow::R
 
     let mut out = Vec::new();
     for path in walk_dir(&dir) {
-        if !path.is_file() {
+        if !path.is_file() || claimed_by_other_book(cache, book_id, &path) {
             continue;
         }
         let Some(relpath) = api_relpath(&dir, &path) else { continue };
@@ -285,6 +313,10 @@ pub fn remove_extra_files(cache: &Cache, book_id: i32, relpaths: &[String], _per
         let Some(path) = on_disk(&dir, relpath) else {
             continue; // matches upstream: an escaping path is silently skipped, not an error
         };
+        if claimed_by_other_book(cache, book_id, &path) {
+            errors.insert(relpath.clone(), Some("that file belongs to another book".to_string()));
+            continue;
+        }
         match cache.backend.write_handle().and_then(|h| h.remove_atomic(&path).map_err(Into::into)) {
             Ok(()) => {}
             Err(e) if path.exists() => {
