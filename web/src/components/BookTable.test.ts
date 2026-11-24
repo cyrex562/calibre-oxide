@@ -52,7 +52,7 @@ function book(id: number, overrides: Partial<BookSummary> = {}): BookSummary {
   } as BookSummary;
 }
 
-const COLUMNS: BookColumn[] = resolveColumns(columnsFor({}, [["title", "Title"], ["authors", "Authors"], ["timestamp", "Date added"]]), DEFAULT_TABLE_PREFS);
+const COLUMNS: BookColumn[] = resolveColumns(columnsFor({}, [["title", "Title"], ["authors", "Authors"], ["timestamp", "Date added"]]), { ...DEFAULT_TABLE_PREFS, columns: [...DEFAULT_TABLE_PREFS.columns, "publisher"] });
 
 interface Emitted {
   select: number[];
@@ -192,6 +192,17 @@ describe("selection", () => {
     const row = el.querySelector("tbody tr")!;
     row.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
     expect(emitted.select).toEqual([1]);
+  });
+
+  // Enter opens the book through the library's "read" shortcut (a window listener). The row
+  // only has to be current, and must not collapse a selection that already includes it.
+  it("Enter on the current row leaves the selection alone, and does not swallow the key", () => {
+    const { el, emitted } = mount({ selectedBookId: 1 });
+    const row = el.querySelector("tbody tr")!;
+    const event = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+    row.dispatchEvent(event);
+    expect(emitted.select).toEqual([]);
+    expect(event.defaultPrevented).toBe(false);
   });
 
   it("ignores keys that are not activation keys", () => {

@@ -7,10 +7,10 @@
 // The arithmetic and the stored-blob parsing live in ./layout so they can be
 // tested without mounting anything.
 
-import { ref, watch } from "vue";
+import { onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import { getItemCompat } from "./legacyStorage";
-import { LAYOUT_KEY, type LayoutPrefs, type Panel, parseLayout, resizedWidth } from "./layout";
+import { isNarrow, LAYOUT_KEY, type LayoutPrefs, type Panel, parseLayout, resizedWidth } from "./layout";
 
 export function usePanelLayout() {
   const initialLayout = parseLayout(readStoredLayout());
@@ -47,6 +47,34 @@ export function usePanelLayout() {
 
   watch([sidebarVisible, detailsVisible], saveLayout);
 
+  // A narrow window shows one side panel at a time, over the list, and starts with
+  // both closed: the saved "visible" flags describe the wide layout and are left
+  // alone (opening a drawer is not a decision to keep the panel on for next time).
+  const narrow = ref(typeof window !== "undefined" && isNarrow(window.innerWidth));
+  const drawer = ref<Panel | null>(null);
+  function onWindowResize() {
+    narrow.value = isNarrow(window.innerWidth);
+    if (!narrow.value) drawer.value = null;
+  }
+  onMounted(() => window.addEventListener("resize", onWindowResize));
+  onBeforeUnmount(() => window.removeEventListener("resize", onWindowResize));
+
+  /** Whether a panel is on screen: its saved flag when wide, the open drawer when narrow. */
+  function panelShown(which: Panel): boolean {
+    if (narrow.value) return drawer.value === which;
+    return which === "sidebar" ? sidebarVisible.value : detailsVisible.value;
+  }
+
+  function setPanel(which: Panel, open: boolean) {
+    if (narrow.value) drawer.value = open ? which : drawer.value === which ? null : drawer.value;
+    else if (which === "sidebar") sidebarVisible.value = open;
+    else detailsVisible.value = open;
+  }
+
+  function togglePanel(which: Panel) {
+    setPanel(which, !panelShown(which));
+  }
+
   /**
    * Drags a splitter.
    *
@@ -78,5 +106,5 @@ export function usePanelLayout() {
     handle.addEventListener("pointercancel", onUp);
   }
 
-  return { sidebarVisible, detailsVisible, sidebarWidth, detailsWidth, startResize };
+  return { sidebarVisible, detailsVisible, sidebarWidth, detailsWidth, startResize, narrow, panelShown, setPanel, togglePanel };
 }

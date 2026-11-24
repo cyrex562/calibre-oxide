@@ -157,12 +157,17 @@ describe("the controller", () => {
         { book_id: 1, expected_title: "Untitled", title: "Dragon Lore (edited)" },
         { book_id: 2, expected_title: "Scan", title: "Typed by hand" },
       ],
-      { embed: true, renameFiles: true, renameTemplate: "{title}" },
+      { embed: false, renameFiles: true, renameTemplate: "{title}" },
       expect.anything(),
     );
     expect(c.state.phase).toBe("done");
     expect(c.state.rows).toEqual([]);
     expect(c.state.runs.map((x) => x.run_id)).toEqual(["r0"]);
+  });
+
+  it("does not write titles into the files unless asked: that changes their hashes", () => {
+    const c = createRetitleController(fakeApi());
+    expect(c.state.embed).toBe(false);
   });
 
   it("passes the options the user chose", async () => {
@@ -328,5 +333,36 @@ describe("the client functions", () => {
     expect(out.titles_restored).toBe(1);
     await fetchRetitleRuns();
     expect(calls[2].url).toContain("/retitle-runs/default");
+  });
+});
+
+describe("the current search as a scope", () => {
+  it("asks for exactly the books of the search", async () => {
+    const api = { suggestRetitles: vi.fn(async () => ({ rename_template: "{title}", total: 0, truncated: false, rows: [] })), runRetitle: vi.fn(), fetchRetitleRuns: vi.fn(async () => ({ runs: [] })), undoRetitle: vi.fn() } as unknown as RetitleApi;
+    const c = createRetitleController(api);
+    c.open("search");
+    await c.find([3, 4, 5]);
+    expect(api.suggestRetitles).toHaveBeenCalledWith({ bookIds: [3, 4, 5] }, "{title}");
+  });
+
+  it("refuses an empty search instead of fixing every book", async () => {
+    const api = { suggestRetitles: vi.fn() } as unknown as RetitleApi;
+    const c = createRetitleController(api);
+    c.open("search");
+    await c.find([]);
+    expect(api.suggestRetitles).not.toHaveBeenCalled();
+    expect(c.state.error).toBe("No books match the current search.");
+  });
+
+  it("drops the rows found for another scope when the scope changes", async () => {
+    const api = { suggestRetitles: vi.fn(async () => ({ rename_template: "{title}", total: 1, truncated: false, rows: [{ book_id: 1, current_title: "a", suggested_title: "A", reason: "junk", confident: true, current_file: "a", proposed_file: "A", formats: ["PDF"] }] })) } as unknown as RetitleApi;
+    const c = createRetitleController(api);
+    c.open("all");
+    await c.find([]);
+    expect(c.state.rows.length).toBe(1);
+    c.setScope("search");
+    expect(c.state.rows).toEqual([]);
+    expect(c.state.phase).toBe("idle");
+    expect(c.state.scope).toBe("search");
   });
 });

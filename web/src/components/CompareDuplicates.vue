@@ -13,8 +13,8 @@ import type { PDFDocumentProxy } from "pdfjs-dist";
 
 import type { CompareBook, ComparePair } from "../library/api";
 import { cancelLibraryJob } from "../library/api";
-import { fileSummary, formatBytes, formatMtime } from "../library/duplicates";
-import { isDirty, pairLines, PREVIEW_WIDTH } from "../library/compare";
+import { offerRunUndo } from "../library/dedupe";
+import { factRows, isDirty, pairLines, PREVIEW_WIDTH } from "../library/compare";
 import type { CompareController, DraftField } from "../library/compare";
 import { loadPdfJs, PDF_ASSET_OPTIONS, pdfUrl, renderPage, scaleForWidth } from "../reader/pdf";
 
@@ -45,16 +45,8 @@ function isPdf(b: CompareBook): boolean {
   return (b.pdf?.pages ?? 0) > 0 && (b.format_list ?? []).some((f) => f.toUpperCase() === "PDF");
 }
 
-function fileName(b: CompareBook): string {
-  const p = b.files?.[0]?.path ?? "";
-  return p.replace(/\\/g, "/").split("/").pop() ?? "";
-}
-
-function textLayer(b: CompareBook): string {
-  if (!b.pdf) return "";
-  if (b.pdf.has_text) return "text layer";
-  return b.pdf.image_only || b.pdf.scanned ? "image only" : "no text";
-}
+const facts = computed(() => factRows(books.value));
+const notAnalyzed = computed(() => (state.result ? state.result.pdf.books - state.result.pdf.fingerprinted : 0));
 
 function pairName(p: ComparePair): string {
   return `${labelOf(p.a)} and ${labelOf(p.b)}`;
@@ -72,6 +64,16 @@ function dirty(id: number, field: DraftField): boolean {
 
 async function decide() {
   await c.keepAndTrash({ mergeOthers: mergeOthers.value, confirm: (summary) => confirmDialog(summary, { title: "Keep and trash", confirmLabel: "Continue", danger: true }) });
+}
+
+/**
+ * Closing after a keep-and-trash: the footer's Undo goes away with the dialog,
+ * so the same Undo is offered as a toast (the one every de-dup action shows).
+ */
+function closeView() {
+  const d = state.decision;
+  if (d.phase === "done" && d.runId && d.trashedIds.length > 0) offerRunUndo(d.message, d.runId, () => c.refreshAfterUndo());
+  emit("close");
 }
 
 function cancelWork() {
@@ -201,11 +203,11 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <Dialog size="full" label="Compare copies" :busy="busy" show-close class="cmp-dialog" data-testid="compare-view" @close="emit('close')">
+  <Dialog size="full" label="Compare copies" :busy="busy" show-close class="cmp-dialog" data-testid="compare-view" @close="closeView">
     <div class="cmp-overlay">
     <header class="cmp-top">
       <h3>Compare {{ books.length || state.bookIds.length }} copies</h3>
-      <span v-if="state.manualGroupId" class="cmp-badge" data-testid="your-group">Your group</span>
+      <span v-if="state.manualGroupId" class="cmp-badge" data-testid="your-group" title="You marked these books as duplicates of each other">Marked as duplicates</span>
     </header>
 
     <p v-if="state.error" class="cmp-error" role="alert" data-testid="compare-error">{{ state.error }}</p>
@@ -213,6 +215,29 @@ onBeforeUnmount(() => {
     <p v-if="state.loading && !state.result" role="status">Loading…</p>
 
     <template v-if="state.result">
+      <!--
+        The facts that tell the copies apart, one row per fact and one column per
+        copy, above the page images so they are on screen when it opens. A row the
+        copies disagree on is highlighted.
+      -->
+      <table class="cmp-table" data-testid="facts" aria-label="The copies side by side">
+        <thead>
+          <tr>
+            <th scope="col"><span class="cmp-sr">Fact</span></th>
+            <th v-for="(b, i) in books" :key="b.book_id" scope="col" :class="{ keeper: state.keeperId === b.book_id }">
+              {{ label(i) }}<span v-if="state.keeperId === b.book_id" class="cmp-keep"> · keep</span>
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="row in facts" :key="row.key" :class="{ differs: row.differs }" :data-fact="row.key">
+            <th scope="row">{{ row.label }}</th>
+            <td v-for="(v, i) in row.values" :key="i" :title="v">{{ v }}</td>
+          </tr>
+        </tbody>
+      </table>
+      <p v-if="state.result.keeper_reason && !state.keeperChosen && state.keeperId !== null" class="cmp-hint" data-testid="keeper-reason">Suggested to keep {{ labelOf(state.keeperId) }}: {{ state.result.keeper_reason }}.</p>
+
       <section class="cmp-bar" aria-label="Page and group controls">
         <div v-if="hasPdf" class="cmp-pages" role="group" aria-label="Page">
           <button type="button" data-testid="page-first" @click="c.first()">First</button>
@@ -230,10 +255,10 @@ onBeforeUnmount(() => {
 
         <div class="cmp-group-tools">
           <form class="cmp-add" @submit.prevent="c.searchBooks(searchText)">
-            <input v-model="searchText" type="search" placeholder="Add a book… (search the library)" aria-label="Search for a book to add" data-testid="add-search" :disabled="state.bookIds.length >= 8" />
+            <input v-model="searchText" type="search" placeholder="Add a book…" aria-label="Search for a book to add" data-testid="add-search" :disabled="state.bookIds.length >= 8" />
             <button type="submit" :disabled="!searchText.trim() || state.search.busy">Search</button>
           </form>
-          <button v-if="!state.manualGroupId" type="button" :disabled="state.groupBusy" title="Keep these books together as a group of your own in the review list" data-testid="save-group" @click="c.saveAsGroup()">Save as my group</button>
+          <button v-if="!state.manualGroupId" type="button" :disabled="state.groupBusy" title="Keep these books together as one group in the Find duplicates list, even if the scan would not match them" data-testid="save-group" @click="c.saveAsGroup()">Mark these as duplicates</button>
           <button type="button" title="Never suggest these books as duplicates of each other again" data-testid="not-duplicates" @click="c.notDuplicates()">Not duplicates</button>
         </div>
       </section>
@@ -253,7 +278,7 @@ onBeforeUnmount(() => {
           <span v-if="c.pairStatus(p) === 'matched'" class="cmp-on" data-testid="pair-matched">These pages are a matched sample pair</span>
           <span v-else-if="c.pairStatus(p) === 'different'" class="cmp-off">These pages were compared and differ</span>
         </div>
-        <p v-if="state.result.pdf.books > state.result.pdf.fingerprinted" class="cmp-hint">{{ state.result.pdf.books - state.result.pdf.fingerprinted }} PDF(s) not fingerprinted yet, so their pages cannot be compared.</p>
+        <p v-if="notAnalyzed > 0" class="cmp-hint" data-testid="not-analyzed">{{ notAnalyzed }} PDF{{ notAnalyzed === 1 ? "" : "s" }} not analyzed yet, so {{ notAnalyzed === 1 ? "its" : "their" }} pages cannot be compared. Use “Analyze library” in Find duplicates.</p>
       </section>
 
       <div class="cmp-columns" data-testid="columns">
@@ -265,9 +290,8 @@ onBeforeUnmount(() => {
             <button v-if="state.keeperId !== b.book_id" type="button" data-testid="keep-this" @click="c.chooseKeeper(b.book_id)">Keep this</button>
             <button type="button" title="Take this book out of the comparison" :disabled="books.length <= 2" data-testid="remove-book" @click="c.removeBook(b.book_id)">Remove</button>
           </header>
-          <p v-if="state.keeperId === b.book_id && state.result.keeper_reason && !state.keeperChosen" class="cmp-hint">{{ state.result.keeper_reason }}</p>
 
-          <div :ref="(el) => setPreview(b.book_id, el)" class="cmp-preview" :style="{ width: `${PREVIEW_WIDTH}px` }">
+          <div :ref="(el) => setPreview(b.book_id, el)" class="cmp-preview" :style="{ maxWidth: `${PREVIEW_WIDTH}px` }">
             <template v-if="isPdf(b)">
               <canvas :ref="(el) => setCanvas(b.book_id, el)" :aria-label="`Page ${c.pageFor(b.book_id)} of ${b.title}`" data-testid="page-canvas"></canvas>
               <p class="cmp-page-label">page {{ c.pageFor(b.book_id) }} of {{ b.pdf?.pages }}<template v-if="rendering[b.book_id]"> · drawing…</template></p>
@@ -276,23 +300,6 @@ onBeforeUnmount(() => {
             <img v-else-if="b.cover_url" :src="b.cover_url" :alt="`Cover of ${b.title}`" data-testid="cover-image" />
             <p v-else class="cmp-hint">No preview ({{ (b.format_list ?? []).join(", ") || "no file" }}).</p>
           </div>
-
-          <dl class="cmp-facts" data-testid="facts">
-            <dt>File</dt>
-            <dd :title="b.files?.[0]?.path">{{ fileName(b) || "—" }}</dd>
-            <dt>Folder</dt>
-            <dd>{{ b.path || "(library root)" }}</dd>
-            <dt>Size</dt>
-            <dd>{{ formatBytes(b.size ?? 0) }} <span class="cmp-hint">{{ fileSummary(b) }}</span></dd>
-            <template v-if="b.pdf">
-              <dt>Pages</dt>
-              <dd>{{ b.pdf.pages }}</dd>
-              <dt>Text</dt>
-              <dd :class="{ warn: !b.pdf.has_text }">{{ textLayer(b) }}</dd>
-            </template>
-            <dt>Modified</dt>
-            <dd>{{ formatMtime(b.mtime) || "—" }}</dd>
-          </dl>
 
           <form v-if="state.drafts[b.book_id]" class="cmp-edit" @submit.prevent>
             <label>
@@ -343,7 +350,7 @@ onBeforeUnmount(() => {
       <template v-if="state.decision.phase === 'done' && state.decision.runId">
         <span role="status" data-testid="decision-result">{{ state.decision.message }}</span>
         <button type="button" data-testid="undo-decision" @click="c.undoDecision()">Undo</button>
-        <button type="button" class="primary" @click="emit('close')">Done</button>
+        <button type="button" class="primary" @click="closeView">Done</button>
       </template>
       <template v-else>
         <label title="Fold the other copies' tags, identifiers and other missing fields into the kept copy before they are trashed"><input v-model="mergeOthers" type="checkbox" data-testid="merge-others" /> Merge the others' metadata into the kept copy</label>
@@ -474,8 +481,9 @@ onBeforeUnmount(() => {
   align-items: flex-start;
 }
 .cmp-col {
-  flex: 0 0 auto;
-  width: 450px;
+  /* The copies share the whole width instead of sitting in fixed 450px columns. */
+  flex: 1 1 0;
+  min-width: 300px;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   padding: 0.5rem;
@@ -517,21 +525,41 @@ onBeforeUnmount(() => {
   font-size: 0.8em;
   color: var(--fg-muted);
 }
-.cmp-facts {
-  display: grid;
-  grid-template-columns: max-content 1fr;
-  gap: 0.1rem 0.6rem;
-  margin: 0;
+.cmp-table {
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: collapse;
   font-size: 0.9em;
+  flex: 0 0 auto;
 }
-.cmp-facts dt {
-  color: var(--fg-muted);
-}
-.cmp-facts dd {
-  margin: 0;
-  min-width: 0;
+.cmp-table th,
+.cmp-table td {
+  text-align: left;
+  padding: 0.15rem 0.5rem;
+  border-bottom: 1px solid var(--border);
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cmp-table thead th:first-child,
+.cmp-table tbody th {
+  width: 6.5rem;
+  color: var(--fg-muted);
+  font-weight: normal;
+}
+.cmp-table thead th.keeper {
+  color: var(--success);
+}
+.cmp-table tr.differs td {
+  font-weight: 600;
+  background: rgba(154, 103, 0, 0.1);
+}
+.cmp-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
 }
 .cmp-edit {
   display: flex;

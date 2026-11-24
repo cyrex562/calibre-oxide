@@ -27,7 +27,7 @@ use crate::tables::ItemTable;
 use rusqlite::hooks::Action;
 use rusqlite::{Connection, OptionalExtension, Result};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// More than this many events unread and the oldest are dropped; a reader
 /// that missed them reloads in full.
@@ -166,14 +166,18 @@ impl FieldFeed {
 pub(crate) struct Loaded {
     data_version: i64,
     pos: u64,
-    pub(crate) store: FieldStore,
+    pub(crate) store: Arc<FieldStore>,
     /// Row id -> book, for the tables with a `book` column. A delete event
     /// carries only the row id, and by then the row is gone.
     reverse: HashMap<(FeedTable, i64), i32>,
 }
 
 fn data_version(conn: &Connection) -> i64 {
-    conn.query_row("PRAGMA data_version", [], |r| r.get(0)).unwrap_or(0)
+    // Checked on every snapshot request, so the statement is kept prepared.
+    match conn.prepare_cached("PRAGMA data_version") {
+        Ok(mut stmt) => stmt.query_row([], |r| r.get(0)).unwrap_or(0),
+        Err(_) => conn.query_row("PRAGMA data_version", [], |r| r.get(0)).unwrap_or(0),
+    }
 }
 
 fn full_load(conn: &Connection, feed: &FieldFeed) -> Result<Loaded> {
@@ -181,7 +185,7 @@ fn full_load(conn: &Connection, feed: &FieldFeed) -> Result<Loaded> {
     // read again later, which costs a redundant patch, never a missed one.
     let pos = feed.position();
     let data_version = data_version(conn);
-    let store = FieldStore::load(conn)?;
+    let store = Arc::new(FieldStore::load(conn)?);
     let mut reverse = HashMap::new();
     for t in KEYED {
         let name = t.keyed_name().unwrap();
@@ -195,13 +199,16 @@ fn full_load(conn: &Connection, feed: &FieldFeed) -> Result<Loaded> {
     Ok(Loaded { data_version, pos, store, reverse })
 }
 
-/// Brings `slot` up to date with `conn`. `full_loads` counts the full reloads.
-pub(crate) fn refresh<'a>(
-    slot: &'a mut Option<Loaded>,
+/// Brings `slot` up to date with `conn` and returns the snapshot. `full_loads`
+/// counts the full reloads. The snapshot is shared: a reader keeps using it
+/// after the lock is released, and a later patch copies it first rather than
+/// changing what that reader sees.
+pub(crate) fn refresh(
+    slot: &mut Option<Loaded>,
     conn: &Connection,
     feed: &FieldFeed,
     full_loads: &std::sync::atomic::AtomicUsize,
-) -> Result<&'a FieldStore> {
+) -> Result<Arc<FieldStore>> {
     let mut need_full = true;
     if let Some(loaded) = slot.as_mut() {
         if loaded.data_version == data_version(conn) {
@@ -220,7 +227,7 @@ pub(crate) fn refresh<'a>(
         *slot = Some(full_load(conn, feed)?);
         full_loads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    Ok(&slot.as_ref().unwrap().store)
+    Ok(Arc::clone(&slot.as_ref().unwrap().store))
 }
 
 /// Patches the snapshot for `events`. `Ok(false)` means they cannot be
@@ -277,11 +284,16 @@ fn apply(loaded: &mut Loaded, conn: &Connection, events: Vec<RowEvent>) -> Resul
         }
     }
 
+    if items.is_empty() && books.is_empty() {
+        return Ok(true);
+    }
+    // Copies the snapshot only if a reader still holds it.
+    let store = Arc::make_mut(&mut loaded.store);
     for item in items {
-        loaded.store.reload_item_table(conn, item)?;
+        store.reload_item_table(conn, item)?;
     }
     for book in books {
-        loaded.store.reload_book(conn, book)?;
+        store.reload_book(conn, book)?;
     }
     Ok(true)
 }

@@ -550,6 +550,10 @@ async fn set_fields_handle(state: AppState, book_id: i32, library_id: Option<Str
         };
         field_updates.push((field.clone(), string_value));
     }
+    // An explicit `author_sort` is written after `authors`, which re-derives it:
+    // the request is a map, so its own order says nothing ("author_sort" sorts
+    // before "authors").
+    field_updates.sort_by_key(|(field, _)| field == "author_sort");
     if !field_updates.is_empty() {
         tokio::task::spawn_blocking({
             let cache = cache.clone();
@@ -607,6 +611,95 @@ pub struct SetFieldsBatchBody {
     changes: serde_json::Map<String, Value>,
     #[serde(default)]
     groups: Vec<BatchGroup>,
+    /// Values to add to a multi-value field of each of `book_ids` (`{"tags":
+    /// ["a", "b"]}`; tags, authors, languages). The server reads each book's
+    /// current list, so the client need not fetch them first. A value the book
+    /// already has (ignoring case) is not added twice.
+    #[serde(default)]
+    add: serde_json::Map<String, Value>,
+    /// Values to remove from a multi-value field of each of `book_ids` (ignoring
+    /// case). Applied before `add` when both name the same field.
+    #[serde(default)]
+    remove: serde_json::Map<String, Value>,
+}
+
+/// How many books one relative (`add`/`remove`) transaction covers.
+const RELATIVE_COMMIT_CHUNK: usize = 1000;
+
+/// The multi-value fields `add`/`remove` work on, with the separator their
+/// stored value uses.
+fn list_field_separator(field: &str) -> Option<&'static str> {
+    match field {
+        "tags" | "languages" => Some(", "),
+        "authors" => Some(" & "),
+        _ => None,
+    }
+}
+
+/// `{"tags": ["a", ...]}` as `(field, trimmed non-empty values)`.
+fn list_edit_values(what: &str, edits: &serde_json::Map<String, Value>) -> Result<Vec<(String, Vec<String>)>, ServerError> {
+    let mut out = Vec::new();
+    for (field, value) in edits {
+        if list_field_separator(field).is_none() {
+            return Err(ServerError::BadRequest(format!("{what} works on tags, authors and languages, not {field:?}")));
+        }
+        let Some(items) = value.as_array() else {
+            return Err(ServerError::BadRequest(format!("{what}.{field} must be a list of strings")));
+        };
+        let mut values = Vec::new();
+        for item in items {
+            let Some(text) = item.as_str() else {
+                return Err(ServerError::BadRequest(format!("{what}.{field} must be a list of strings")));
+            };
+            let text = text.trim();
+            if !text.is_empty() {
+                values.push(text.to_string());
+            }
+        }
+        out.push((field.clone(), values));
+    }
+    Ok(out)
+}
+
+/// A book's list after removing and adding values: removal ignores case, and the
+/// result has no duplicates (ignoring case), first spelling kept -- what the
+/// bulk-edit panel has always computed in the browser.
+fn edit_list(current: Vec<String>, remove: &[String], add: &[String]) -> Vec<String> {
+    let drop: std::collections::HashSet<String> = remove.iter().map(|v| v.to_lowercase()).collect();
+    let kept = current.into_iter().filter(|v| !drop.contains(&v.to_lowercase()));
+    if add.is_empty() {
+        // A removal alone leaves what remains exactly as it was.
+        return kept.collect();
+    }
+    let mut seen = std::collections::HashSet::new();
+    kept.chain(add.iter().cloned()).filter(|v| seen.insert(v.to_lowercase())).collect()
+}
+
+/// What `add`/`remove` do to one book: the `(field, value)` writes that change
+/// something (none when the book already has the result).
+fn relative_updates(cache: &lexmechanic_db::cache::Cache, book_id: i32, adds: &[(String, Vec<String>)], removes: &[(String, Vec<String>)]) -> anyhow::Result<Vec<(String, String)>> {
+    let mut fields: Vec<&str> = adds.iter().chain(removes.iter()).map(|(f, _)| f.as_str()).collect();
+    fields.dedup();
+    let mut seen = std::collections::HashSet::new();
+    fields.retain(|f| seen.insert(*f));
+    let mut updates = Vec::new();
+    for field in fields {
+        let sep = list_field_separator(field).expect("checked by list_edit_values");
+        let stored = cache.field_for(book_id, field)?.unwrap_or_default();
+        let mut current: Vec<String> = if stored.is_empty() { Vec::new() } else { stored.split(sep).map(|v| v.trim().to_string()).collect() };
+        if field == "authors" && current.is_empty() {
+            // A book with no author reads as "Unknown" everywhere else.
+            current.push("Unknown".to_string());
+        }
+        let none = Vec::new();
+        let remove = removes.iter().find(|(f, _)| f == field).map(|(_, v)| v).unwrap_or(&none);
+        let add = adds.iter().find(|(f, _)| f == field).map(|(_, v)| v).unwrap_or(&none);
+        let next = if add.is_empty() && remove.is_empty() { current.clone() } else { edit_list(current.clone(), remove, add) };
+        if next != current {
+            updates.push((field.to_string(), next.join(sep)));
+        }
+    }
+    Ok(updates)
 }
 
 /// How many books one batch commits together. A request may name more (the
@@ -634,8 +727,24 @@ pub async fn set_fields_batch_no_library(State(state): State<AppState>, Json(bod
 
 async fn set_fields_batch_handle(state: AppState, library_id: Option<String>, body: SetFieldsBatchBody) -> Result<Json<Value>, ServerError> {
     let cache = state.cache_for(library_id.as_deref()).ok_or_else(|| ServerError::NotFound(format!("no library named {:?}", library_id.clone().unwrap_or_default())))?;
-    let SetFieldsBatchBody { book_ids, changes, mut groups } = body;
-    if !book_ids.is_empty() || groups.is_empty() {
+    let SetFieldsBatchBody { book_ids, changes, mut groups, add, remove } = body;
+    let adds = list_edit_values("add", &add)?;
+    let removes = list_edit_values("remove", &remove)?;
+    let relative = !adds.is_empty() || !removes.is_empty();
+    let mut relative_ids: Vec<i32> = Vec::new();
+    if relative {
+        if book_ids.is_empty() {
+            return Err(ServerError::BadRequest("add/remove need book_ids".to_string()));
+        }
+        if let Some(field) = changes.keys().find(|f| add.contains_key(*f) || remove.contains_key(*f)) {
+            return Err(ServerError::BadRequest(format!("{field:?} is both set and added to or removed from")));
+        }
+        let mut seen = std::collections::HashSet::new();
+        relative_ids = book_ids.iter().copied().filter(|id| seen.insert(*id)).collect();
+        if !changes.is_empty() {
+            groups.insert(0, BatchGroup { book_ids, changes });
+        }
+    } else if !book_ids.is_empty() || groups.is_empty() {
         groups.insert(0, BatchGroup { book_ids, changes });
     }
 
@@ -683,10 +792,57 @@ async fn set_fields_batch_handle(state: AppState, library_id: Option<String>, bo
         }
     }
 
+    // Add/remove: one transaction per RELATIVE_COMMIT_CHUNK books, however many
+    // different lists that makes.
+    let mut unchanged: Vec<i32> = Vec::new();
+    let mut updated_set: std::collections::HashSet<i32> = updated.iter().copied().collect();
+    for chunk in relative_ids.chunks(RELATIVE_COMMIT_CHUNK) {
+        let chunk = chunk.to_vec();
+        let (adds, removes) = (adds.clone(), removes.clone());
+        let (changed, same, errors) = tokio::task::spawn_blocking({
+            let cache = cache.clone();
+            move || {
+                let (mut items, mut same, mut errors) = (Vec::new(), Vec::new(), Vec::new());
+                for id in chunk {
+                    match relative_updates(&cache, id, &adds, &removes) {
+                        Ok(updates) if updates.is_empty() => same.push(id),
+                        Ok(updates) => items.push((id, updates)),
+                        Err(e) => errors.push((id, e.to_string())),
+                    }
+                }
+                let results = cache.set_fields_per_book(&items);
+                let mut changed = Vec::new();
+                for ((id, _), result) in items.into_iter().zip(results) {
+                    match result {
+                        Ok(()) => changed.push(Ok(id)),
+                        Err(e) => changed.push(Err((id, e.to_string()))),
+                    }
+                }
+                (changed, same, errors)
+            }
+        })
+        .await
+        .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+        for result in changed {
+            match result {
+                Ok(id) => {
+                    if updated_set.insert(id) {
+                        updated.push(id);
+                    }
+                }
+                Err((id, error)) => failed.push(serde_json::json!({ "book_id": id, "error": error })),
+            }
+        }
+        for (id, error) in errors {
+            failed.push(serde_json::json!({ "book_id": id, "error": error }));
+        }
+        unchanged.extend(same);
+    }
+
     if !updated.is_empty() {
         web_socket::publish(&state, ChangeEvent::MetadataChanged { book_ids: updated.clone() });
     }
-    Ok(Json(serde_json::json!({ "updated": updated, "failed": failed })))
+    Ok(Json(serde_json::json!({ "updated": updated, "failed": failed, "unchanged": unchanged })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1255,6 +1411,85 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let (status, _) = post_json(&router, "/cdb/set-fields-batch/default", serde_json::json!({"book_ids": [1], "changes": {}})).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// `edit_list` is what the bulk-edit panel has always computed in the browser
+    /// (`applyListEdit`): removal ignores case, no duplicates (ignoring case), first
+    /// spelling and order kept. Pin it against a literal copy of that algorithm.
+    #[test]
+    fn edit_list_matches_the_browsers_apply_list_edit() {
+        fn browser(current: &[&str], mode: &str, values: &[&str]) -> Vec<String> {
+            match mode {
+                "add" => {
+                    let mut seen = std::collections::HashSet::new();
+                    current.iter().chain(values.iter()).filter(|v| seen.insert(v.to_lowercase())).map(|v| v.to_string()).collect()
+                }
+                _ => {
+                    let drop: std::collections::HashSet<String> = values.iter().map(|v| v.to_lowercase()).collect();
+                    current.iter().filter(|v| !drop.contains(&v.to_lowercase())).map(|v| v.to_string()).collect()
+                }
+            }
+        }
+        let cases: [(&[&str], &[&str]); 5] = [(&[], &["a"]), (&["a", "B", "c"], &["b", "D"]), (&["x", "X", "y"], &["Y"]), (&["Fiction", "History"], &["fiction", "fiction"]), (&["é", "É"], &["É", "z"])];
+        for (current, values) in cases {
+            let owned: Vec<String> = current.iter().map(|s| s.to_string()).collect();
+            let vals: Vec<String> = values.iter().map(|s| s.to_string()).collect();
+            assert_eq!(super::edit_list(owned.clone(), &[], &vals), browser(current, "add", values), "add {values:?} to {current:?}");
+            assert_eq!(super::edit_list(owned, &vals, &[]), browser(current, "remove", values), "remove {values:?} from {current:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn set_fields_batch_adds_and_removes_values_without_the_client_reading_the_books() {
+        let (_dir, router) = test_app(4);
+        // Give the books different tag lists, as they would have in a real library.
+        for (id, tags) in [(1, serde_json::json!(["Sci-Fi", "old"])), (2, serde_json::json!(["old"])), (3, serde_json::json!(["new"]))] {
+            let (status, _) = post_json(&router, "/cdb/set-fields-batch/default", serde_json::json!({"book_ids": [id], "changes": {"tags": tags}})).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        let (status, body) = post_json(&router, "/cdb/set-fields-batch/default", serde_json::json!({"book_ids": [1, 2, 3, 4, 9999], "add": {"tags": ["new", " Brand "]}, "remove": {"tags": ["OLD"]}})).await;
+        assert_eq!(status, StatusCode::OK, "got: {body}");
+        // Book 3 already has "new" and no "old", but still gets "Brand".
+        assert_eq!(body["updated"], serde_json::json!([1, 2, 3, 4]), "{body}");
+        assert_eq!(body["failed"].as_array().unwrap().len(), 1, "{body}");
+        for (id, want) in [(1, serde_json::json!(["Sci-Fi", "new", "Brand"])), (2, serde_json::json!(["new", "Brand"])), (3, serde_json::json!(["new", "Brand"])), (4, serde_json::json!(["new", "Brand"]))] {
+            let (_, book) = get_json(&router, &format!("/ajax/book/{id}")).await;
+            assert_eq!(book["tags"], want, "book {id}: {book}");
+        }
+
+        // Doing it again changes nothing: reported as unchanged, not as updated.
+        let (_, again) = post_json(&router, "/cdb/set-fields-batch/default", serde_json::json!({"book_ids": [1, 2], "add": {"tags": ["new"]}})).await;
+        assert_eq!(again["updated"], serde_json::json!([]), "{again}");
+        assert_eq!(again["unchanged"], serde_json::json!([1, 2]), "{again}");
+    }
+
+    #[tokio::test]
+    async fn set_fields_batch_add_remove_covers_authors_and_refuses_what_it_cannot_do() {
+        let (_dir, router) = test_app(1);
+        let (_, before) = get_json(&router, "/ajax/book/1").await;
+        let (status, body) = post_json(&router, "/cdb/set-fields-batch/default", serde_json::json!({"book_ids": [1], "add": {"authors": ["Extra Person"]}})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, after) = get_json(&router, "/ajax/book/1").await;
+        let mut want = before["authors"].as_array().cloned().unwrap_or_default();
+        want.push(serde_json::json!("Extra Person"));
+        assert_eq!(after["authors"], serde_json::Value::Array(want), "{after}");
+
+        for bad in [serde_json::json!({"book_ids": [1], "add": {"title": ["x"]}}), serde_json::json!({"book_ids": [1], "add": {"tags": "x"}}), serde_json::json!({"add": {"tags": ["x"]}}), serde_json::json!({"book_ids": [1], "changes": {"tags": ["y"]}, "add": {"tags": ["x"]}})] {
+            let (status, _) = post_json(&router, "/cdb/set-fields-batch/default", bad.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn set_fields_batch_add_can_be_combined_with_a_plain_change_for_the_same_books() {
+        let (_dir, router) = test_app(2);
+        let (status, body) = post_json(&router, "/cdb/set-fields-batch/default", serde_json::json!({"book_ids": [1, 2], "changes": {"publisher": "Acme"}, "add": {"tags": ["t"]}})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["updated"], serde_json::json!([1, 2]), "each book once: {body}");
+        let (_, book) = get_json(&router, "/ajax/book/2").await;
+        assert_eq!(book["publisher"], "Acme");
+        assert_eq!(book["tags"], serde_json::json!(["t"]));
     }
 
     #[tokio::test]

@@ -1,15 +1,18 @@
 // What Apply does in the bulk edit panel: validate before touching a book, send
 // only the books that need a change, report what happened, and reset the panel
-// (and the selection) only after a clean run.
+// only after a clean run, keep the selection, and offer an Undo that puts the
+// old values back.
 
 import { ref } from "vue";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { BookSummary, FieldMetaEntry } from "./types";
+import { dismissToast, runToastAction, toastState } from "./deleteFlow";
+import { RelativeUnsupportedError } from "./bulkRelative";
 import { useBulkEdit } from "./useBulkEdit";
 
-const api = vi.hoisted(() => ({ setFields: vi.fn(), setFieldsBatch: vi.fn() }));
-vi.mock("./api", async (importOriginal) => ({ ...(await importOriginal<typeof import("./api")>()), setFields: api.setFields, setFieldsBatch: api.setFieldsBatch }));
+const api = vi.hoisted(() => ({ setFields: vi.fn(), setFieldsBatch: vi.fn(), setFieldsRelative: vi.fn() }));
+vi.mock("./api", async (importOriginal) => ({ ...(await importOriginal<typeof import("./api")>()), setFields: api.setFields, setFieldsBatch: api.setFieldsBatch, setFieldsRelative: api.setFieldsRelative }));
 
 function book(id: number, tags: string[] = []): BookSummary {
   return { id, title: `Book ${id}`, authors: ["Ann Lee"], tags } as unknown as BookSummary;
@@ -33,8 +36,12 @@ function setup(ids: number[], books: BookSummary[]) {
 }
 
 beforeEach(() => {
+  dismissToast();
   api.setFields.mockReset();
   api.setFieldsBatch.mockReset();
+  // An older server: add/remove tags falls back to computing each book's list here.
+  api.setFieldsRelative.mockReset();
+  api.setFieldsRelative.mockRejectedValue(new RelativeUnsupportedError());
 });
 
 describe("useBulkEdit", () => {
@@ -63,7 +70,7 @@ describe("useBulkEdit", () => {
     expect(bulk.summary).toBeNull();
   });
 
-  it("sends the books that need a change, then closes the panel and clears the selection", async () => {
+  it("sends the books that need a change, then closes the panel and keeps the selection", async () => {
     api.setFieldsBatch.mockImplementation(async (groups: { book_ids: number[] }[]) => ({ updated: groups.flatMap((g) => g.book_ids), failed: [] }));
     const { bulk, selectedIds, selectMode, changed } = setup([1, 2, 3], [book(1, ["a"]), book(2, ["b"]), book(3, ["scifi"])]);
     bulk.spec.tags = { mode: "add", value: "scifi" };
@@ -74,12 +81,56 @@ describe("useBulkEdit", () => {
     expect(groups.flatMap((g) => g.book_ids).sort()).toEqual([1, 2]);
     expect(bulk.summary).toBe("Updated 2 book(s), 1 already matched.");
     expect(bulk.open).toBe(false);
-    expect(selectMode.value).toBe(false);
-    expect(selectedIds.value.size).toBe(0);
+    // The same books can be edited again: the selection and select mode stay.
+    expect(selectMode.value).toBe(true);
+    expect([...selectedIds.value]).toEqual([1, 2, 3]);
     expect(bulk.spec.tags?.value).toBe("");
+    expect(toastState.toast?.message).toBe("Added tag “scifi” to 2 books");
+    expect(toastState.toast?.actionLabel).toBe("Undo");
     expect(changed).toHaveBeenCalledTimes(1);
     expect(bulk.busy).toBe(false);
     expect(bulk.progress).toBeNull();
+  });
+
+  it("adds tags through the server's add operation, reading no book first", async () => {
+    api.setFieldsRelative.mockImplementation(async (ids: number[]) => ({ updated: ids.slice(0, 2), unchanged: ids.slice(2), failed: [] }));
+    const ensureLoaded = vi.fn(async () => []);
+    const selectedIds = ref(new Set([1, 2, 3]));
+    const selectMode = ref(true);
+    const changed = vi.fn(async () => {});
+    const bulk = useBulkEdit({ selectedIds, selectMode, fieldMetadata: ref({}), win: { ensureLoaded, getById: () => undefined }, onChanged: changed });
+    bulk.open = true;
+    bulk.spec.tags = { mode: "add", value: "scifi, new" };
+    await bulk.run();
+    expect(api.setFieldsRelative).toHaveBeenCalledTimes(1);
+    expect(api.setFieldsRelative.mock.calls[0]).toEqual([[1, 2, 3], { field: "tags", mode: "add", values: ["scifi", "new"] }]);
+    expect(ensureLoaded).not.toHaveBeenCalled();
+    expect(api.setFieldsBatch).not.toHaveBeenCalled();
+    expect(bulk.summary).toBe("Updated 2 book(s), 1 already matched.");
+    expect(bulk.open).toBe(false);
+    expect(selectedIds.value.size).toBe(3); // the selection stays after a bulk edit
+    expect(changed).toHaveBeenCalledTimes(1);
+  });
+
+  it("removes tags through the server too, and keeps the panel open when a book fails", async () => {
+    api.setFieldsRelative.mockResolvedValue({ updated: [1], failed: [{ book_id: 2, error: "locked" }] });
+    const { bulk, selectedIds } = setup([1, 2], []);
+    bulk.spec.tags = { mode: "remove", value: "old" };
+    await bulk.run();
+    expect(api.setFieldsRelative.mock.calls[0][1]).toEqual({ field: "tags", mode: "remove", values: ["old"] });
+    expect(bulk.errors).toEqual(["Book 2: locked"]);
+    expect(bulk.open).toBe(true);
+    expect(selectedIds.value.size).toBe(2);
+  });
+
+  it("does not use the add operation when anything else is edited too", async () => {
+    api.setFieldsBatch.mockImplementation(async (groups: { book_ids: number[] }[]) => ({ updated: groups.flatMap((g) => g.book_ids), failed: [] }));
+    const { bulk } = setup([1], [book(1)]);
+    bulk.spec.tags = { mode: "add", value: "x" };
+    bulk.spec.publisher = "Acme";
+    await bulk.run();
+    expect(api.setFieldsRelative).not.toHaveBeenCalled();
+    expect(api.setFieldsBatch).toHaveBeenCalledTimes(1);
   });
 
   it("keeps the panel and the selection open when a book fails", async () => {
@@ -124,5 +175,31 @@ describe("useBulkEdit", () => {
       title: { is_custom: false, label: "title", name: "Title" } as unknown as FieldMetaEntry,
     };
     expect(bulk.customColumns.map((c) => c.label)).toEqual(["shelf"]);
+  });
+
+  it("Undo writes each book's old values back, through the batch route, and leaves the failed ones alone", async () => {
+    api.setFieldsBatch.mockResolvedValueOnce({ updated: [1], failed: [{ book_id: 2, error: "locked" }] });
+    const { bulk, changed } = setup([1, 2], [{ ...book(1, ["a", "b"]), publisher: "Old Press" } as BookSummary, book(2, ["c"])]);
+    bulk.spec.publisher = "Acme";
+    bulk.spec.tags = { mode: "add", value: "travel" };
+    await bulk.run();
+    // A failure keeps the panel open, but what was written can still be undone.
+    expect(toastState.toast?.actionLabel).toBe("Undo");
+    api.setFieldsBatch.mockResolvedValueOnce({ updated: [1], failed: [] });
+    await runToastAction();
+    const groups = api.setFieldsBatch.mock.calls[1][0] as { book_ids: number[]; changes: Record<string, unknown> }[];
+    expect(groups).toEqual([{ book_ids: [1], changes: { tags: ["a", "b"], publisher: "Old Press" } }]);
+    expect(toastState.toast?.result).toBe("Put back the old values on 1 book");
+    expect(changed).toHaveBeenCalledTimes(2);
+  });
+
+  it("says which field an Undo cannot put back", async () => {
+    api.setFieldsBatch.mockImplementation(async (groups: { book_ids: number[] }[]) => ({ updated: groups.flatMap((g) => g.book_ids), failed: [] }));
+    const { bulk } = setup([1], [book(1)]);
+    bulk.spec.pubdate = "2020-01-01";
+    await bulk.run();
+    // The only field written had no value before: nothing to put back, so no Undo.
+    expect(toastState.toast?.message).toBe("Updated publication date on 1 book");
+    expect(toastState.toast?.actionLabel).toBeNull();
   });
 });

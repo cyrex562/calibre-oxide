@@ -6,6 +6,7 @@
 import { markLibraryChanged } from "./libraryEpoch";
 import type { AbsorbReport, AbsorbableList } from "./absorb";
 import { BatchUnsupportedError, type BatchGroup, type BatchResponse } from "./bulkBatch";
+import { RelativeUnsupportedError, type RelativeOp, type RelativeResponse } from "./bulkRelative";
 import { parseChangeLogStatus, type ChangeLogStatus } from "./changeLog";
 import { importBody, type ImportFolderRequest, type ImportReport } from "./importFolder";
 import type { UntrackedCount } from "./scanPrompt";
@@ -133,6 +134,23 @@ export async function setFieldsBatch(groups: BatchGroup[]): Promise<BatchRespons
   if (resp.status === 404 || resp.status === 405) throw new BatchUnsupportedError();
   if (!resp.ok) throw new Error(`POST /cdb/set-fields-batch failed: ${resp.status} ${resp.statusText}${await failureDetail(resp)}`);
   return (await resp.json()) as BatchResponse;
+}
+
+/**
+ * Adds values to, or removes them from, a multi-value field of many books in one
+ * request: the server reads each book's current list. An older server answers
+ * 404 or 400 (it does not know `add`/`remove`), which throws
+ * [`RelativeUnsupportedError`] so the caller can edit the old way.
+ */
+export async function setFieldsRelative(bookIds: number[], op: RelativeOp): Promise<RelativeResponse> {
+  const resp = await fetch("/cdb/set-fields-batch/default", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ book_ids: bookIds, [op.mode]: { [op.field]: op.values } }),
+  });
+  if (resp.status === 404 || resp.status === 405 || resp.status === 400) throw new RelativeUnsupportedError();
+  if (!resp.ok) throw new Error(`POST /cdb/set-fields-batch failed: ${resp.status} ${resp.statusText}${await failureDetail(resp)}`);
+  return (await resp.json()) as RelativeResponse;
 }
 
 /** `GET /change-log/status/{lib}`: whether the library's change log missed changes. Null from an older server. */
@@ -909,7 +927,7 @@ export function describePrepareResult(r: PrepareResult, cancelled = false): stri
     parts.push(hash.total === 0 ? "every file already had a hash" : `${(hash.hashed ?? 0).toLocaleString("en-US")} of ${hash.total.toLocaleString("en-US")} files hashed`);
   }
   const fp = r.stages.fingerprint as { fingerprinted?: number; failed_count?: number } | undefined;
-  if (fp && typeof fp.fingerprinted === "number" && fp.fingerprinted > 0) parts.push(`${fp.fingerprinted.toLocaleString("en-US")} PDFs analysed`);
+  if (fp && typeof fp.fingerprinted === "number" && fp.fingerprinted > 0) parts.push(`${fp.fingerprinted.toLocaleString("en-US")} PDFs analyzed`);
   if (fp && (fp.failed_count ?? 0) > 0) parts.push(`${fp.failed_count} PDFs could not be read`);
   return parts.length ? parts.join(" · ") : "Ready for duplicate detection.";
 }
@@ -927,7 +945,7 @@ export function describeJobProgress(p: LibraryJobProgress): string {
     case "hashing":
       return `Reading files… ${n(p.hashed + p.errors)} of ${n(p.total)}`;
     case "fingerprinting":
-      return `Analysing PDF pages… ${n((p.fingerprinted ?? 0) + p.errors)} of ${n(p.total)}`;
+      return `Analyzing PDF pages… ${n((p.fingerprinted ?? 0) + p.errors)} of ${n(p.total)}`;
     case "importing":
       return `Importing… ${n(p.hashed + p.already_known + p.errors)} of ${n(p.total)} files · ${n(p.added)} books added${p.ignored ? ` · ${n(p.ignored)} duplicates skipped` : ""}`;
     case "checking":
@@ -1440,7 +1458,7 @@ export interface ComparePageMatch {
 }
 
 export interface ComparePdf {
-  /** False until both PDFs have been analysed (not an error). */
+  /** False until both PDFs have been analyzed (not an error). */
   fingerprinted: boolean;
   missing?: number[];
   /** The `pdf_*` reason the library scan would give the pair, or null if it is not a match. */
@@ -1599,6 +1617,8 @@ export interface OrganizeRun {
   created_at: number;
   books: number;
   undone: boolean;
+  /** What the run was asked to do: a template, `move to Fiction` or `rename folder A to B`. Empty on an older server. */
+  template?: string;
 }
 
 function organizeBody(template: string, scope: OrganizeScope, extra: Record<string, unknown>): string {
@@ -2247,7 +2267,7 @@ export function saveEmailAccount(account: EmailAccount): Promise<{ ok: boolean }
   });
 }
 
-// Bulk template evaluation (#816 item 4.1). Colouring a page of rows
+// Bulk template evaluation (#816 item 4.1). Coloring a page of rows
 // is one evaluation per row; the per-book route would be a request
 // per row.
 export async function evaluateTemplateBulk(template: string, bookIds: number[]): Promise<Record<string, string>> {
@@ -2257,7 +2277,7 @@ export async function evaluateTemplateBulk(template: string, bookIds: number[]):
     body: JSON.stringify({ template, book_ids: bookIds }),
   });
   // A broken template is an expected outcome while a rule is being
-  // written; the caller treats it as "this rule colours nothing".
+  // written; the caller treats it as "this rule colors nothing".
   return data.ok && data.results ? data.results : {};
 }
 

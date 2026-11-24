@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ALL_REASONS, DEFAULT_RESOLVE_TIERS, MIN_OPTIONS, confidencePercent, countByReason, evidenceLines, filterGroups, fileSummary, fingerprintAction, formatMtime, isImageOnlyScan, isMetadataOnly, isSuggested, needsReview, pdfLine, primaryPath, reasonBadge, reasonLabel, deleteCopyWarnings } from "./duplicates";
+import { ALL_REASONS, analyzeLabelFor, pageMatchNoteFor, DEFAULT_RESOLVE_TIERS, MIN_OPTIONS, confidencePercent, countByReason, evidenceLines, filterGroups, fileSummary, fingerprintAction, formatMtime, isImageOnlyScan, isMetadataOnly, isSuggested, needsReview, pdfLine, primaryPath, reasonBadge, reasonLabel, deleteCopyWarnings } from "./duplicates";
 import type { DuplicateGroup, DuplicateReason } from "./api";
 
 const group = (reason: DuplicateReason, confidence = 0.9): DuplicateGroup => ({ books: [], reason, confidence });
@@ -110,13 +110,13 @@ describe("pdfLine", () => {
 });
 
 describe("fingerprintAction", () => {
-  it("offers the job with the count of PDFs not yet analysed", () => {
-    expect(fingerprintAction({ fingerprinted: 10, failed: 0, pending: 1234, unhashed: 0 })).toEqual({ label: "Fingerprint PDFs (1,234 not yet analysed)", note: null });
+  it("offers the job with the count of PDFs not yet analyzed", () => {
+    expect(fingerprintAction({ fingerprinted: 10, failed: 0, pending: 1234, unhashed: 0 })).toEqual({ label: "Analyze library (1,234 not yet analyzed)", note: null });
   });
   it("says what to do about PDFs that have no hash yet", () => {
-    expect(fingerprintAction({ fingerprinted: 0, failed: 0, pending: 5, unhashed: 7 })?.note).toContain("Prepare for duplicate detection");
+    expect(fingerprintAction({ fingerprinted: 0, failed: 0, pending: 5, unhashed: 7 })?.note).toContain("Analyze library");
   });
-  it("offers nothing when everything is analysed, or the server did not say", () => {
+  it("offers nothing when everything is analyzed, or the server did not say", () => {
     expect(fingerprintAction({ fingerprinted: 10, failed: 2, pending: 0, unhashed: 0 })).toBeNull();
     expect(fingerprintAction(undefined)).toBeNull();
   });
@@ -156,8 +156,8 @@ describe("the compare card's lines (tranche 12)", () => {
 
 describe("the user's own groups", () => {
   it("are badged as yours, certain, and labelled", () => {
-    expect(reasonBadge("manual")).toEqual({ text: "Your group", tone: "certain" });
-    expect(reasonLabel("manual")).toBe("your group");
+    expect(reasonBadge("manual")).toEqual({ text: "Marked by you", tone: "certain" });
+    expect(reasonLabel("manual")).toBe("groups I made by hand");
     expect(needsReview({ reason: "manual" })).toBe(false);
   });
 
@@ -193,5 +193,32 @@ describe("deleteCopyWarnings", () => {
   it("says nothing for an ordinary extra copy", () => {
     expect(deleteCopyWarnings(group([1, 2]), { book_id: 2 }, 1)).toEqual([]);
     expect(deleteCopyWarnings(group([1, 2]), { book_id: 2 }, null)).toEqual([]);
+  });
+});
+
+describe("analyzeLabelFor", () => {
+  it("names how many PDFs are still to analyze, counting the ones not yet hashed", () => {
+    expect(analyzeLabelFor({ fingerprinted: 10, failed: 0, pending: 60, unhashed: 0 })).toBe("Analyze library (60 PDFs not yet analyzed)");
+    expect(analyzeLabelFor({ fingerprinted: 0, failed: 0, pending: 0, unhashed: 1 })).toBe("Analyze library (1 PDF not yet analyzed)");
+  });
+  it("is a plain label when nothing is left or the server did not say", () => {
+    expect(analyzeLabelFor({ fingerprinted: 10, failed: 0, pending: 0, unhashed: 0 })).toBe("Analyze library");
+    expect(analyzeLabelFor(undefined)).toBe("Analyze library");
+  });
+});
+
+describe("pageMatchNoteFor", () => {
+  const done = { fingerprinted: 57, failed: 0, pending: 0, unhashed: 0 };
+  it("says the pages were analyzed when no group rests on them", () => {
+    expect(pageMatchNoteFor(done, { content: 4 })).toContain("All 57 PDFs were analyzed page by page");
+  });
+  it("stays quiet when a page-based group exists, while PDFs are left to analyze, or when a filter hides groups", () => {
+    expect(pageMatchNoteFor(done, { pdf_resave: 1 })).toBeNull();
+    expect(pageMatchNoteFor({ ...done, pending: 3 }, {})).toBeNull();
+    expect(pageMatchNoteFor(done, {}, true)).toBeNull();
+    expect(pageMatchNoteFor(undefined, {})).toBeNull();
+  });
+  it("says which PDFs could not be read", () => {
+    expect(pageMatchNoteFor({ ...done, failed: 2 }, { pdf_text_match: 1 })).toBe("2 PDFs could not be read (encrypted or damaged), so they are not matched by pages.");
   });
 });

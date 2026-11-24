@@ -12,7 +12,7 @@ export type Skin = "classic" | "modern";
 export const SKIN_KEY = "lexmechanic.skin";
 export const DEFAULT_SKIN: Skin = "classic";
 export const SKINS: { value: Skin; label: string; hint: string }[] = [
-  { value: "classic", label: "Classic", hint: "Beveled controls and navy title bars, in the style of Windows 2000 and XP, in dark colours." },
+  { value: "classic", label: "Classic", hint: "Beveled controls and navy title bars, in the style of Windows 2000 and XP, in dark colors." },
   { value: "modern", label: "Modern", hint: "Flat controls. Follows the system's light or dark setting." },
 ];
 

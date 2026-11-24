@@ -5,7 +5,7 @@ import { activeRules, ALLOWED_COLORS, colorForBook, colorFromResult, type Colori
 const rule = (name: string, template = "program: 'red'", enabled = true): ColoringRule => ({ name, template, enabled });
 
 describe("colorFromResult", () => {
-  it("accepts every named colour", () => {
+  it("accepts every named color", () => {
     for (const c of ALLOWED_COLORS) expect(colorFromResult(c), c).toBe(c);
   });
 
@@ -27,16 +27,16 @@ describe("colorFromResult", () => {
 
   // The value goes into a `style` attribute and a template is
   // user-authored text that can return anything. An allowlist means
-  // nothing else gets through; a regex over CSS colour syntax could
+  // nothing else gets through; a regex over CSS color syntax could
   // not promise that.
-  it("refuses anything that is not plainly a colour", () => {
+  it("refuses anything that is not plainly a color", () => {
     expect(colorFromResult("red; background: url(http://evil)")).toBeNull();
     expect(colorFromResult("expression(alert(1))")).toBeNull();
     expect(colorFromResult("rgb(255,0,0)")).toBeNull();
     expect(colorFromResult("var(--x)")).toBeNull();
     expect(colorFromResult("#ff")).toBeNull();
     expect(colorFromResult("#gggggg")).toBeNull();
-    expect(colorFromResult("notacolour")).toBeNull();
+    expect(colorFromResult("notacolor")).toBeNull();
   });
 });
 
@@ -58,7 +58,7 @@ describe("colorForBook", () => {
   });
 
   // A rule whose output cannot be shown should fall through rather
-  // than swallowing the row's colour entirely.
+  // than swallowing the row's color entirely.
   it("falls through a rule that returned something unusable", () => {
     expect(colorForBook([rule("a"), rule("b")], ["url(evil)", "green"])).toBe("green");
   });

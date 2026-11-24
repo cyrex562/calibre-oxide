@@ -16,6 +16,7 @@ import {
   formatBytes,
   listIsPartial,
   looksAbsolute,
+  needsConfirmation,
   networkNote,
   planKey,
   reachableLabel,
@@ -130,9 +131,9 @@ describe("scope mapping", () => {
 
 describe("describing a plan", () => {
   it("summarises new, updated, unchanged, to remove, conflicts and bytes", () => {
-    expect(describePlan(plan())).toBe("12 new · 2 updated · 400 unchanged · 1 to remove · 3.0 MB to copy");
+    expect(describePlan(plan())).toBe("12 new files · 2 updated · 400 unchanged · 1 to remove · 3.0 MB to copy");
     const withConflict = plan({ totals: { ...plan().totals, conflict: count(2), copy_new: count(), update: count(), bytes_to_copy: 0 } });
-    expect(describePlan(withConflict)).toBe("0 new · 0 updated · 400 unchanged · 1 to remove · 2 conflicts · nothing to copy");
+    expect(describePlan(withConflict)).toBe("0 new files · 0 updated · 400 unchanged · 1 to remove · 2 conflicts · nothing to copy");
     expect(describePlan(plan({ totals: { ...plan().totals, conflict: count(1) } }))).toContain("1 conflict ·");
   });
 
@@ -347,5 +348,47 @@ describe("the controller", () => {
     expect(c.state.report).toBeNull();
     expect(c.state.draft.scope).toBe("selected");
     expect(c.state.draft.target).toBe("");
+  });
+});
+
+describe("the current search as a scope", () => {
+  it("is the default when a search is active and nothing is selected, and the selection still wins", () => {
+    expect(defaultDraft(0, true).scope).toBe("search");
+    expect(defaultDraft(0, false).scope).toBe("all");
+    expect(defaultDraft(3, true).scope).toBe("selected");
+  });
+
+  it("asks the server for exactly the books of the search", () => {
+    const d = { ...defaultDraft(0, true), target: "D:\\Travel" };
+    expect(draftToScope(d, [7, 8, 9])).toEqual({ book_ids: [7, 8, 9] });
+    expect(draftToRequest(d, [7, 8, 9]).scope).toEqual({ book_ids: [7, 8, 9] });
+    expect(planKey(d, [7, 8, 9])).not.toBe(planKey(d, [7, 8]));
+  });
+
+  it("refuses an empty search and a backup mirror ignores it", () => {
+    const d = { ...defaultDraft(0, true), target: "D:\\Travel" };
+    expect(draftProblem(d, [])).toBe("No books match the current search.");
+    expect(draftProblem(d, [1])).toBeNull();
+    expect(draftToScope({ ...d, mode: "mirror" }, [1])).toEqual({ all: true });
+  });
+
+  it("opens on the search scope and forgets a remembered selection", () => {
+    const c = createMirrorController({} as MirrorApi, { isDesktop: () => false, pickFolder: async () => null });
+    c.open(0, true);
+    expect(c.state.draft.scope).toBe("search");
+    expect(c.state.rememberedIds).toBeNull();
+  });
+});
+
+describe("when Copy needs a second confirmation", () => {
+  it("does not for a plain copy of new files", () => {
+    const p = plan({ totals: { ...plan().totals, update: count(), remove: count() } });
+    expect(needsConfirmation(p, { overwriteChanged: false })).toBe(false);
+  });
+  it("does when files are overwritten, updated or moved to .mirror-trash", () => {
+    const base = plan().totals;
+    expect(needsConfirmation(plan({ totals: { ...base, update: count(2), remove: count() } }), { overwriteChanged: false })).toBe(true);
+    expect(needsConfirmation(plan({ totals: { ...base, update: count(), remove: count(1) } }), { overwriteChanged: false })).toBe(true);
+    expect(needsConfirmation(plan({ totals: { ...base, update: count(), remove: count() } }), { overwriteChanged: true })).toBe(true);
   });
 });

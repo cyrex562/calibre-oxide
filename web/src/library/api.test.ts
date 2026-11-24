@@ -904,7 +904,7 @@ describe("describeJobProgress", () => {
     expect(describeJobProgress(progress({ phase: "indexing", added: 900, errors: 1, total: 5000 }))).toBe("Adding books… 901 of 5,000 new files");
     expect(describeJobProgress(progress({ phase: "enriching", enriched: 10, total: 40 }))).toBe("Reading titles and covers… 10 of 40");
     expect(describeJobProgress(progress({ phase: "hashing", hashed: 3, total: 1000 }))).toBe("Reading files… 3 of 1,000");
-    expect(describeJobProgress(progress({ phase: "fingerprinting", fingerprinted: 3, errors: 1, total: 2000 }))).toBe("Analysing PDF pages… 4 of 2,000");
+    expect(describeJobProgress(progress({ phase: "fingerprinting", fingerprinted: 3, errors: 1, total: 2000 }))).toBe("Analyzing PDF pages… 4 of 2,000");
     expect(describeJobProgress(progress({ phase: "absorbing", added: 10, already_known: 5, errors: 1, total: 1200 }))).toBe("Bringing in books… 16 of 1,200 (5 already in)");
     expect(describeJobProgress(progress({ phase: "copying", added: 3, already_known: 1, total: 8 }))).toBe("Copying… 4 of 8 books · 1 duplicates skipped");
     expect(describeJobProgress(progress({ phase: "" }))).toBe("Working…");
@@ -1157,12 +1157,12 @@ describe("importFolder", () => {
     vi.stubGlobal("fetch", fetchMock);
     const phases: string[] = [];
 
-    const result = await importFolder({ source: " /books ", mode: "one_book_per_folder", policy: "add_anyway", recursive: false }, { intervalMs: 0, onProgress: (j) => phases.push(j.progress.phase) });
+    const result = await importFolder({ source: " /books ", mode: "one_book_per_folder", policy: "add_anyway", recursive: false, keep_structure: false }, { intervalMs: 0, onProgress: (j) => phases.push(j.progress.phase) });
 
     expect(fetchMock).toHaveBeenNthCalledWith(1, "/import-folder/-", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ source: "/books", mode: "one_book_per_folder", policy: "add_anyway", recursive: false }),
+      body: JSON.stringify({ source: "/books", mode: "one_book_per_folder", policy: "add_anyway", recursive: false, keep_structure: false }),
     });
     expect(phases).toEqual(["importing", "indexing"]);
     expect(result).toEqual(report);
@@ -1170,7 +1170,7 @@ describe("importFolder", () => {
 
   it("carries the server's reason when it refuses to start", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 400, statusText: "Bad Request", text: async () => "that folder is inside the library already; scan the library to add the books in it" }));
-    await expect(importFolder({ source: "/lib/x", mode: "multiple_books_per_folder", policy: "skip_exact_content", recursive: true })).rejects.toThrow(/400 Bad Request — that folder is inside the library already/);
+    await expect(importFolder({ source: "/lib/x", mode: "multiple_books_per_folder", policy: "skip_exact_content", recursive: true, keep_structure: false })).rejects.toThrow(/400 Bad Request — that folder is inside the library already/);
   });
 
   it("describes its progress by files, books and skipped duplicates", () => {
@@ -1256,7 +1256,7 @@ describe("prepare progress and summary", () => {
 
   it("summarises a finished run, naming failed stages", () => {
     const ok = { started_at_stage: "scan", finished: true, stages: { hash: { hashed: 2, total: 5 }, fingerprint: { fingerprinted: 7, failed_count: 1 } } } as never;
-    expect(describePrepareResult(ok)).toBe("2 of 5 files hashed · 7 PDFs analysed · 1 PDFs could not be read");
+    expect(describePrepareResult(ok)).toBe("2 of 5 files hashed · 7 PDFs analyzed · 1 PDFs could not be read");
     const failed = { started_at_stage: "scan", finished: true, stages: { fingerprint: { error: "no PDFium" } } } as never;
     expect(describePrepareResult(failed)).toContain("fingerprint failed: no PDFium");
     expect(describePrepareResult({ started_at_stage: "hash", finished: false, stages: {} } as never)).toContain("stopped early");

@@ -12,7 +12,9 @@ import { cancelLibraryJob } from "../library/api";
 import type { RetitleFilter } from "../library/retitle";
 import { checkState, describeConfirm, describeFailure, describeReport, describeRows, describeSkip, pageCount, REASON_LABEL, rowProblem, visibleRows, type RetitleController } from "../library/retitle";
 
-const props = defineProps<{ controller: RetitleController; selectedIds: number[] }>();
+const props = withDefaults(defineProps<{ controller: RetitleController; selectedIds: number[]; /** The books the list shows now, when a search or filter is active. */ searchIds?: number[]; searchActive?: boolean }>(), { searchIds: () => [], searchActive: false });
+// The books a "selected" or "search" scope covers.
+const scopeIds = computed(() => (state.scope === "search" ? props.searchIds : props.selectedIds));
 const emit = defineEmits<{ close: []; changed: [] }>();
 
 const c = props.controller;
@@ -42,7 +44,7 @@ watchEffect(() => {
 onMounted(() => void c.loadRuns());
 
 async function find() {
-  await c.find(props.selectedIds);
+  await c.find(scopeIds.value);
 }
 
 async function run() {
@@ -66,13 +68,20 @@ function cancelRun() {
       Finds books whose title is junk (a print job, "Microsoft Word - …", a bare file name, or one title copied onto many different files) and suggests a clean one. Check or edit each, then apply: the titles are set, optionally written into the files, and the files optionally
       renamed. A run can be undone.
     </p>
-    <p class="hint" data-testid="scope">{{ state.scope === "selected" ? `Looking at the ${selectedIds.length.toLocaleString("en-US")} selected book${selectedIds.length === 1 ? "" : "s"}.` : "Looking at every book in the library." }}</p>
+    <fieldset class="retitle-scope" :disabled="busy" data-testid="scope">
+      <legend>Which books</legend>
+      <label><input type="radio" name="retitle-scope" :checked="state.scope === 'selected'" :disabled="selectedIds.length === 0" @change="c.setScope('selected')" /> The {{ selectedIds.length.toLocaleString("en-US") }} selected book{{ selectedIds.length === 1 ? "" : "s" }}</label>
+      <label v-if="searchActive"><input type="radio" name="retitle-scope" data-testid="scope-search" :checked="state.scope === 'search'" :disabled="searchIds.length === 0" @change="c.setScope('search')" /> The {{ searchIds.length.toLocaleString("en-US") }} book{{ searchIds.length === 1 ? "" : "s" }} in the current search or filter</label>
+      <label><input type="radio" name="retitle-scope" :checked="state.scope === 'all'" @change="c.setScope('all')" /> Every book in the library</label>
+    </fieldset>
 
     <fieldset class="retitle-options" :disabled="busy">
       <legend>When applying</legend>
       <label title="Rewrites each book file (PDF, EPUB, …) so its own metadata carries the title. The file's contents change, so its checksum does too; an undo writes the old title back, but the bytes will not be identical to before."
         ><input v-model="state.embed" type="checkbox" data-testid="embed" /> Write the title into the files</label
       >
+      <span v-if="state.embed" class="hint" role="note" data-testid="embed-warning">Rewrites the files, so each one gets a new checksum: it will no longer match the copy on your NAS, and "identical files" duplicate detection will not see it as the same file.</span>
+      <span v-else class="hint" data-testid="embed-note">Off: only the library's title changes; your files are not touched, so their checksums stay the same.</span>
       <label><input v-model="state.renameFiles" type="checkbox" data-testid="rename" /> Rename files</label>
       <input v-if="state.renameFiles" v-model="state.renameTemplate" type="text" spellcheck="false" aria-label="File name template" data-testid="template" />
       <span v-if="state.renameFiles" class="hint">A template such as {title} or {title} - {authors}. A name already taken gets a number.</span>

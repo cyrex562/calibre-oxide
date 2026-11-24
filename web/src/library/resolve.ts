@@ -59,7 +59,7 @@ export function actionNote(action: ResolveAction): string {
 
 export function describeReport(r: ResolveReport): string {
   const n = (v: number) => v.toLocaleString("en-US");
-  const parts = [`${n(r.groups_done)} of ${n(r.groups_planned)} groups resolved`, `${n(r.books_trashed)} book${r.books_trashed === 1 ? "" : "s"} ${r.action === "merge_as_formats" ? "merged and trashed" : "moved to the trash"}`, `about ${formatBytes(r.bytes_freed)} freed`];
+  const parts = [`${n(r.groups_done)} of ${n(r.groups_planned)} groups resolved`, `${n(r.books_trashed)} book${r.books_trashed === 1 ? "" : "s"} ${r.action === "merge_as_formats" ? "merged and trashed" : "moved to the trash"}`, `about ${formatBytes(r.bytes_freed)} in the Trash (freed once the Trash is emptied or expires)`];
   if (r.cancelled) parts.push("stopped early");
   if (r.errors.length > 0) parts.push(`${n(r.errors.length)} problem${r.errors.length === 1 ? "" : "s"}: ${r.errors.slice(0, 2).map(([g, why]) => `${g.slice(0, 6)}… ${why}`).join("; ")}`);
   return parts.join(" · ");

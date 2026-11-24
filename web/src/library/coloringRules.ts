@@ -1,22 +1,22 @@
-// Row colouring rules (issue 4.1 of the #816 epic).
+// Row coloring rules (issue 4.1 of the #816 epic).
 //
 // A rule is a template evaluated against each book; whatever it
-// returns is the colour for that row. That is upstream's own model,
-// and it is why colouring needed the bulk template-evaluation route
+// returns is the color for that row. That is upstream's own model,
+// and it is why coloring needed the bulk template-evaluation route
 // -- a page of results is one evaluation per row.
 //
 // # Why the matching is pure
 //
 // The interesting cases are all about precedence and trust: which
 // rule wins when several match, and what happens when a template
-// returns something that is not a colour at all. A template can
+// returns something that is not a color at all. A template can
 // return any string, and that string ends up in a `style` attribute
 // -- so it has to be checked, not interpolated hopefully.
 
 export interface ColoringRule {
   /** Shown in the settings list. */
   name: string;
-  /** A calibre template. A non-empty result colours the row. */
+  /** A calibre template. A non-empty result colors the row. */
   template: string;
   enabled: boolean;
 }
@@ -30,13 +30,13 @@ export interface ColoringRulesPrefs {
 export const DEFAULT_COLORING_RULES: ColoringRulesPrefs = { rules: [] };
 
 /**
- * Colours a template may return.
+ * Colors a template may return.
  *
  * An allowlist rather than a syntax check: the value goes into a
  * `style` attribute, and a template is user-authored text that could
  * return anything -- `red; background: url(...)` among them. Naming
  * the acceptable values means nothing else can get through, which a
- * regex over CSS colour syntax could not promise.
+ * regex over CSS color syntax could not promise.
  */
 export const ALLOWED_COLORS = [
   "red",
@@ -62,12 +62,12 @@ export const ALLOWED_COLORS = [
 const ALLOWED = new Set<string>(ALLOWED_COLORS);
 
 /**
- * The colour a template result denotes, or `null`.
+ * The color a template result denotes, or `null`.
  *
  * `null` covers both "this rule did not match" (an empty result) and
- * "this rule returned something that is not a colour" -- the caller
+ * "this rule returned something that is not a color" -- the caller
  * treats them the same, because a rule whose output cannot be shown
- * should fall through to the next rule rather than colouring a row
+ * should fall through to the next rule rather than coloring a row
  * wrongly or not at all.
  */
 export function colorFromResult(result: string | undefined | null): string | null {
@@ -81,9 +81,9 @@ export function colorFromResult(result: string | undefined | null): string | nul
 }
 
 /**
- * The colour for one book, given each rule's evaluated result.
+ * The color for one book, given each rule's evaluated result.
  *
- * First enabled rule that yields a usable colour wins, so the list
+ * First enabled rule that yields a usable color wins, so the list
  * order in settings *is* the precedence -- which is what a user
  * reordering that list expects.
  */

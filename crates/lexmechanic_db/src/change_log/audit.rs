@@ -244,6 +244,14 @@ const CASES: &[Case] = &[
     case!("set_field languages", |c, f| c.set_field(f.first, "languages", "fra").unwrap()),
     case!("set_field authors", |c, f| c.set_field(f.first, "authors", "Brand New Author").unwrap()),
     case!("set_field identifiers", |c, f| c.set_field(f.first, "identifiers", "isbn:9780000000002").unwrap()),
+    // An explicit `author_sort` listed *before* the authors it goes with: it
+    // must still win, and replay must agree.
+    case!("set_fields_for_books (author_sort and authors)", |c, f| {
+        let changes = [("author_sort".to_string(), "Typed, Explicitly".to_string()), ("authors".to_string(), "First Person & Second Person".to_string())];
+        for r in c.set_fields_for_books(&[f.first, f.second], &changes) {
+            r.unwrap();
+        }
+    }),
     // The bulk-edit batch: one transaction for the standard fields, one log entry.
     case!("set_fields_for_books", |c, f| {
         let changes = [("tags".to_string(), "bulk one, bulk two".to_string()), ("publisher".to_string(), "Bulk Press".to_string()), ("rating".to_string(), "6".to_string()), ("identifiers".to_string(), "isbn:9780000000019".to_string()), ("comments".to_string(), "bulk comment".to_string())];
@@ -321,6 +329,7 @@ const CASES: &[Case] = &[
         let item = crate::cache::ImportItem {
             metadata: meta,
             files: vec![crate::cache::ImportFile { staged: staged.join("imported.pdf"), ext: "pdf".to_string(), size: 13, hash: blake3::hash(b"%PDF imported").to_hex().to_string() }],
+            placement: None,
         };
         c.import_books_batch(&[item]).remove(0).unwrap();
     }),
@@ -559,7 +568,9 @@ use Account::*;
 /// That is the point: the failure is the prompt to either give it a [`Case`]
 /// above -- which proves it reaches the log -- or say why it need not.
 const ACCOUNTED: &[(&str, Account)] = &[
-    ("cache.rs::set_field_inner", Case("set_field title")),
+    ("cache.rs::write_field_only", Case("set_field title")),
+    ("cache.rs::sync_author_sort_in", Case("set_field authors")),
+    ("cache.rs::touch_last_modified_in", Case("set_field title")),
     // The single-book setters (`set_many_to_one_field`, `set_rating_field`,
     // `set_identifiers_field`) wrap these `_in` bodies in their own transaction;
     // the `set_field publisher`/`rating`/`identifiers` cases cover that path and
@@ -622,6 +633,7 @@ const ACCOUNTED: &[(&str, Account)] = &[
 /// scan skips them -- each is its own durable store with its own recovery.
 const EXCLUDED: &[(&str, &str)] = &[
     ("field_feed_tests.rs", "tests of the field snapshot, which write rows with raw SQL on purpose"),
+    ("t26a_tests.rs", "tests that backdate last_modified with raw SQL to see it move"),
     ("schema_upgrades.rs", "one-time schema migrations"),
     ("checksums.rs", "the checksum sidecar db"),
     ("orphans.rs", "the checksum sidecar db"),

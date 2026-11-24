@@ -82,3 +82,16 @@ function toNumber(value: unknown, fallback: number): number {
   const n = typeof value === "number" ? value : Number(value);
   return Number.isFinite(n) ? n : fallback;
 }
+
+/**
+ * Below this window width the side panels stop sharing the row with the list.
+ * At 900px the categories (about 215px) and the details (about 355px) left the
+ * table 240px, so only the Title column showed and the details were wider than
+ * the list they described.
+ */
+export const NARROW_BELOW = 1100;
+
+/** Whether a window this wide is too narrow for three columns. */
+export function isNarrow(width: number): boolean {
+  return Number.isFinite(width) && width < NARROW_BELOW;
+}

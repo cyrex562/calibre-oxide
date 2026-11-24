@@ -1138,7 +1138,7 @@ watch(
   <!-- Docked it is the details column; otherwise a modal Dialog around the same panel. -->
   <component :is="docked ? 'div' : Dialog" v-bind="docked ? { class: 'docked-host' } : { size: 'md', label: 'Book details', onClose: () => emit('close') }">
     <div ref="rootEl" class="panel" :class="{ docked }">
-      <button class="close" :title="docked ? 'Hide details' : 'Close'" @click="emit('close')">✕</button>
+      <button class="close" :title="docked ? 'Hide details' : 'Close'" :aria-label="docked ? 'Hide details' : 'Close details'" @click="emit('close')">✕</button>
       <p v-if="loading">Loading…</p>
       <p v-else-if="error" class="error">{{ error }}</p>
       <template v-else-if="book && form">
@@ -1217,7 +1217,7 @@ watch(
             </div>
             <p v-if="saveError" class="error">{{ saveError }}</p>
             <div class="row">
-              <button type="submit" class="read" data-action="save" :disabled="saving || !dirty">{{ saving ? "Saving…" : "Save" }}</button>
+              <button type="submit" class="read primary" data-action="save" :disabled="saving || !dirty">{{ saving ? "Saving…" : "Save" }}</button>
               <button type="button" class="edit" data-action="revert" :disabled="saving || !dirty" @click="revert">Revert</button>
               <button type="button" class="edit" @click="fetchMetadataOpen = true">Fetch metadata online…</button>
             </div>
@@ -1268,7 +1268,7 @@ watch(
 
         <CollapsibleSection id="actions" title="Actions" :open="sections.actions" @toggle="toggle('actions')">
           <div class="actions-row">
-            <button v-if="readableFormat" class="read" @click="read">Read ({{ readableFormat.toUpperCase() }})</button>
+            <button v-if="readableFormat" class="read primary" @click="read">Read ({{ readableFormat.toUpperCase() }})</button>
             <button class="edit" @click="openConvert">Convert…</button>
             <button class="edit" @click="openShare">Send…</button>
             <button v-if="canTweak" class="edit" @click="tweakOpen = true">Tweak Book…</button>
@@ -1276,7 +1276,7 @@ watch(
             <button class="edit" @click="templateTesterOpen = !templateTesterOpen">Test template…</button>
             <button v-if="canUnpack" class="edit" :disabled="unpacking" @click="unpackBook">{{ unpacking ? "Working…" : `Unpack ${unpackableFormat?.toUpperCase()}…` }}</button>
             <button v-if="canUnpack" class="edit" :disabled="unpacking" @click="repackBook">Repack…</button>
-            <button class="delete danger" :disabled="deleting" title="Moves the book to the library Trash" @click="deleteBook">{{ deleting ? "Deleting…" : "Delete" }}</button>
+            <button class="delete danger" :disabled="deleting" title="Moves the book to the library Trash; it can be restored from there" @click="deleteBook">{{ deleting ? "Moving…" : "Move to Trash" }}</button>
           </div>
 
         <div v-if="templateTesterOpen" class="template-tester">
@@ -1332,7 +1332,7 @@ watch(
                   <option v-for="fmt in convertOutputFormats" :key="fmt" :value="fmt">{{ fmt }}</option>
                 </select>
               </label>
-              <button type="button" class="read" :disabled="converting || !convertInputFmt || !convertOutputFmt" @click="runConversion">
+              <button type="button" class="read primary" :disabled="converting || !convertInputFmt || !convertOutputFmt" @click="runConversion">
                 {{ converting ? "Converting…" : "Start" }}
               </button>
               <button type="button" :disabled="converting" @click="convertOpen = false">Close</button>
@@ -1410,7 +1410,7 @@ watch(
             </label>
           </div>
           <div class="convert-row">
-            <button type="submit" class="read" :disabled="sharing">{{ sharing ? "Sending…" : "Send" }}</button>
+            <button type="submit" class="read primary" :disabled="sharing">{{ sharing ? "Sending…" : "Send" }}</button>
             <button type="button" :disabled="sharing" @click="shareOpen = false">Close</button>
           </div>
           <p v-if="shareDone" class="convert-done">Sent.</p>
@@ -1601,13 +1601,11 @@ watch(
   gap: 0.5em;
   flex-wrap: wrap;
 }
+/* Color, border and the disabled look come from the global `button.primary` (and the
+   Classic skin's rules for it): a flat borderless button here left a disabled Save looking
+   enabled, at 2.2:1 contrast in Classic. */
 .read {
-  background: var(--accent);
-  color: var(--fg-on-accent);
-  border: none;
   padding: 0.5em 1em;
-  border-radius: var(--radius-md);
-  cursor: pointer;
 }
 .download {
   border: 1px solid var(--border);

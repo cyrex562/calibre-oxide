@@ -29,7 +29,8 @@ import { dismissToast, runToastAction, toastState } from "../library/deleteFlow"
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-menu);
-  z-index: var(--z-popover);
+  /* Above the modal dialogs: Undo is offered while the Find duplicates dialog is still open. */
+  z-index: calc(var(--z-dialog) + 5);
 }
 .link {
   border: none;

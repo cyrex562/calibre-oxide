@@ -4,15 +4,20 @@
 // a dialog, so the selection it acts on stays in view.
 
 import { completionForCustom } from "../library/fieldValues";
-import { REPLACEABLE_FIELDS } from "../library/bulkEdit";
+import { REPLACEABLE_FIELDS, REPLACEABLE_FIELD_LABELS } from "../library/bulkEdit";
 import type { BulkEdit } from "../library/useBulkEdit";
 import AutocompleteInput from "./AutocompleteInput.vue";
 
 defineProps<{ bulk: BulkEdit; count: number }>();
+
+// An example is shown as one ("e.g. …"), so it is not mistaken for a value already typed.
+const EXAMPLE = { tags: "e.g. scifi, classic", authors: "e.g. Ann Lee, Bo Fox", languages: "e.g. eng, fra" };
 </script>
 
 <template>
-<div class="bulk-panel">
+<div class="bulk-panel" role="region" aria-label="Bulk edit">
+  <h3 class="bulk-title" data-testid="bulk-title">Bulk edit — {{ count.toLocaleString("en-US") }} {{ count === 1 ? "book" : "books" }}</h3>
+  <p class="bulk-hint">Only the fields you fill in are changed. You can undo the edit right after.</p>
   <div class="bulk-grid">
     <label class="bulk-field">
       <span>Tags</span>
@@ -22,7 +27,7 @@ defineProps<{ bulk: BulkEdit; count: number }>();
           <option value="remove">Remove</option>
           <option value="replace">Replace with</option>
         </select>
-        <AutocompleteInput v-model="bulk.spec.tags!.value" field="tags" separator="," placeholder="scifi, classic" :disabled="bulk.busy" />
+        <AutocompleteInput v-model="bulk.spec.tags!.value" field="tags" separator="," :placeholder="EXAMPLE.tags" :disabled="bulk.busy" />
       </div>
     </label>
 
@@ -34,7 +39,7 @@ defineProps<{ bulk: BulkEdit; count: number }>();
           <option value="remove">Remove</option>
           <option value="replace">Replace with</option>
         </select>
-        <AutocompleteInput v-model="bulk.spec.authors!.value" field="authors" separator="," placeholder="Ann Lee, Bo Fox" :disabled="bulk.busy" />
+        <AutocompleteInput v-model="bulk.spec.authors!.value" field="authors" separator="," :placeholder="EXAMPLE.authors" :disabled="bulk.busy" />
       </div>
     </label>
 
@@ -46,7 +51,7 @@ defineProps<{ bulk: BulkEdit; count: number }>();
           <option value="remove">Remove</option>
           <option value="replace">Replace with</option>
         </select>
-        <input v-model="bulk.spec.languages!.value" placeholder="eng, fra" :disabled="bulk.busy" />
+        <input v-model="bulk.spec.languages!.value" :placeholder="EXAMPLE.languages" :disabled="bulk.busy" />
       </div>
     </label>
 
@@ -75,11 +80,11 @@ defineProps<{ bulk: BulkEdit; count: number }>();
   <fieldset class="bulk-replace">
     <legend>Search and replace</legend>
     <div class="bulk-combo">
-      <select v-model="bulk.spec.searchReplace!.field" :disabled="bulk.busy">
-        <option v-for="f in REPLACEABLE_FIELDS" :key="f" :value="f">{{ f }}</option>
+      <select v-model="bulk.spec.searchReplace!.field" aria-label="Field to search and replace in" :disabled="bulk.busy">
+        <option v-for="f in REPLACEABLE_FIELDS" :key="f" :value="f">{{ REPLACEABLE_FIELD_LABELS[f] }}</option>
       </select>
-      <input v-model="bulk.spec.searchReplace!.find" placeholder="find…" :disabled="bulk.busy" />
-      <input v-model="bulk.spec.searchReplace!.replace" placeholder="replace with…" :disabled="bulk.busy" />
+      <input v-model="bulk.spec.searchReplace!.find" placeholder="find…" aria-label="Text to find" :disabled="bulk.busy" />
+      <input v-model="bulk.spec.searchReplace!.replace" placeholder="replace with…" aria-label="Text to replace it with" :disabled="bulk.busy" />
       <label class="bulk-regex"><input type="checkbox" v-model="bulk.spec.searchReplace!.useRegex" :disabled="bulk.busy" /> Regex</label>
     </div>
   </fieldset>
@@ -103,6 +108,15 @@ defineProps<{ bulk: BulkEdit; count: number }>();
   padding: 0.75em 1em;
   background: var(--bg-sunken);
   border-bottom: 1px solid var(--border);
+}
+.bulk-title {
+  margin: 0 0 0.15em;
+  font-size: var(--fs-body);
+}
+.bulk-hint {
+  margin: 0 0 0.6em;
+  color: var(--fg-muted);
+  font-size: var(--fs-small);
 }
 .bulk-actions {
   margin-top: 0.6em;
@@ -142,7 +156,7 @@ defineProps<{ bulk: BulkEdit; count: number }>();
   gap: 0.3rem;
   flex-wrap: wrap;
 }
-.bulk-combo input {
+.bulk-combo input:not([type="checkbox"]) {
   flex: 1;
   min-width: 8ch;
 }

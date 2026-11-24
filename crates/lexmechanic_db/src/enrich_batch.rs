@@ -161,7 +161,13 @@ impl Cache {
                     }
                     if let Some(authors) = &plan.authors {
                         Cache::link_many_to_many_in(&sp, plan.book_id, "authors", "name", "books_authors_link", "author", " & ", authors)?;
+                        // The same derivation `set_field("authors")` makes, which
+                        // is what replaying the logged `authors` write does.
+                        Cache::sync_author_sort_in(&sp, plan.book_id)?;
                         changed = true;
+                    }
+                    if changed {
+                        Cache::touch_last_modified_in(&sp, plan.book_id)?;
                     }
                     if let Some((bytes, hash)) = &plan.cover {
                         crate::checksums::ChecksumStore::record_hash_on(&sp, plan.book_id, "cover", "", hash, bytes.len() as i64, None)?;

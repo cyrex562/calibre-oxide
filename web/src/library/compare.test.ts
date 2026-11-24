@@ -3,6 +3,7 @@ import {
   createCompareController,
   cursorForNumber,
   cursorNumber,
+  factRows,
   FIRST,
   folderOf,
   LAST,
@@ -166,7 +167,7 @@ describe("the evidence of a pair", () => {
 
   it("says what was measured, and says so when nothing was", () => {
     expect(pdfLine(pair(1, 2))).toBe("91% · same scan, with and without OCR text · 5 of 5 sample pages match · text similarity 0.93");
-    expect(pdfLine(pair(1, 2, { pdf: { fingerprinted: false } }))).toContain("Not fingerprinted yet");
+    expect(pdfLine(pair(1, 2, { pdf: { fingerprinted: false } }))).toContain("Pages not analyzed yet");
     expect(pdfLine(pair(1, 2, { pdf: { fingerprinted: true, kind: null, confidence: null, compared: 4, matched: 0 } }))).toBe("The pages do not match · 0 of 4 sample pages match");
     expect(pdfLine(pair(1, 2, { pdf: null }))).toBe("");
   });
@@ -625,6 +626,37 @@ describe("the set and the user's group", () => {
     await c.open([1, 2]);
     await c.saveAsGroup();
     expect(c.state.bookIds).toEqual([1, 2, 3, 4]);
-    expect(c.state.note).toContain("already in your group");
+    expect(c.state.note).toContain("already marked as duplicates");
+  });
+});
+
+describe("the facts table", () => {
+  const rows = (books: CompareBook[]) => Object.fromEntries(factRows(books).map((r) => [r.key, r]));
+
+  it("has one row per fact and one value per copy, and marks only the rows the copies disagree on", () => {
+    const r = rows([book(1), book(2, { title: "Book 1", size: 1000 })]);
+    expect(r.title.values).toEqual(["Book 1", "Book 1"]);
+    expect(r.title.differs).toBe(false);
+    expect(r.file.values).toEqual(["Book 1.pdf", "Book 2.pdf"]);
+    expect(r.file.differs).toBe(true);
+    expect(r.pages.values).toEqual(["100", "100"]);
+    expect(r.text.values).toEqual(["image only", "text layer"]);
+    expect(r.text.differs).toBe(true);
+  });
+
+  it("says the size once, and shows a dash for what a copy does not have", () => {
+    const r = rows([book(1, { size: 915 }), book(2, { size: 915, pdf: undefined, format_list: [] })]);
+    expect(r.size.values).toEqual(["915 B", "915 B"]);
+    expect(r.size.differs).toBe(false);
+    expect(r.pages.values).toEqual(["100", "—"]);
+    expect(r.formats.values).toEqual(["—", "—"]);
+  });
+
+  it("leaves the page rows out when no copy is a PDF", () => {
+    expect(factRows([book(1, { pdf: undefined }), book(2, { pdf: undefined })]).map((r) => r.key)).not.toContain("pages");
+  });
+
+  it("does not repeat the not-analyzed warning under every pair", () => {
+    expect(pairLines(pair(1, 2, { pdf: { fingerprinted: false } })).join(" ")).not.toContain("not analyzed");
   });
 });

@@ -88,8 +88,6 @@ export interface LibraryAction {
    * Icon name, mapped to a Lucide component by `src/icons.ts`.
    */
   icon?: string;
-  /** Display-only accelerator, e.g. `"Ctrl+Shift+E"`. */
-  accel?: string;
   /** One-line hover hint. */
   tooltip?: string;
   /**
@@ -174,18 +172,18 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   { id: "manage-lists", label: "Manage lists…", group: "library", requires: "none", toolbar: true, icon: "vl", tooltip: "Manage virtual libraries and saved searches" },
   { id: "custom-columns", label: "Custom columns…", group: "library", requires: "none", toolbar: true, icon: "column", tooltip: "Add or remove custom columns" },
   { id: "check-library", label: "Check library…", group: "library", requires: "none", toolbar: true, primary: true, icon: "reports", tooltip: "Look for missing or stray files" },
-  { id: "find-duplicates", label: "Find duplicates…", group: "library", requires: "none", toolbar: true, primary: true, icon: "merge", accel: "D", tooltip: "Find books that look like duplicates" },
+  { id: "find-duplicates", label: "Find duplicates…", group: "library", requires: "none", toolbar: true, primary: true, icon: "merge", tooltip: "Find books that look like duplicates" },
   { id: "resolve-duplicates", label: "Resolve…", group: "library", requires: "none", icon: "merge", tooltip: "Apply one rule to every duplicate group: keep the best copy, trash or merge the rest" },
   { id: "map-metadata", label: "Map authors/tags…", group: "library", requires: "none", toolbar: true, icon: "tags", tooltip: "Rewrite authors or tags in bulk" },
   { id: "browse-annotations", label: "Annotations…", group: "library", requires: "none", toolbar: true, icon: "highlight", tooltip: "Browse highlights and notes" },
   { id: "pick-random", label: "Random book", group: "library", requires: "none", toolbar: true, icon: "random", tooltip: "Jump to a random book" },
-  { id: "help", label: "Help…", group: "library", requires: "none", toolbar: true, icon: "help", accel: "F1", tooltip: "Open the documentation" },
+  { id: "help", label: "Help…", group: "library", requires: "none", toolbar: true, icon: "help", tooltip: "Open the documentation" },
   { id: "export-catalog", label: "Export catalog…", group: "library", requires: "none", toolbar: true, icon: "catalog", tooltip: "List this library as CSV, EPUB or XML" },
   { id: "export-library-archive", label: "Export library archive…", group: "library", requires: "none", toolbar: true, icon: "bookshelf", tooltip: "Zip the whole library" },
-  { id: "fetch-news", label: "Fetch news…", group: "library", requires: "none", toolbar: true, primary: true, icon: "news", accel: "Ctrl+N", tooltip: "Download news as a book" },
-  { id: "add-books", label: "Add Books…", group: "library", requires: "none", toolbar: true, primary: true, icon: "add_book", accel: "Ctrl+A", tooltip: "Add book files to this library" },
-  { id: "add-folder", label: "Add Folder…", group: "library", requires: "none", toolbar: true, desktopOnly: true, primary: true, icon: "tb_folder", accel: "Ctrl+Shift+A", tooltip: "Add every book in a folder" },
-  { id: "switch-library", label: "Switch library…", group: "library", requires: "none", toolbar: true, desktopOnly: true, primary: true, icon: "lt", accel: "Ctrl+L", tooltip: "Open a different library" },
+  { id: "fetch-news", label: "Fetch news…", group: "library", requires: "none", toolbar: true, primary: true, icon: "news", tooltip: "Download news as a book" },
+  { id: "add-books", label: "Add Books…", group: "library", requires: "none", toolbar: true, primary: true, icon: "add_book", tooltip: "Add book files to this library" },
+  { id: "add-folder", label: "Add Folder…", group: "library", requires: "none", toolbar: true, primary: true, icon: "tb_folder", tooltip: "Add every book in a folder (type its path; the desktop app has a Browse button)" },
+  { id: "switch-library", label: "Switch library…", group: "library", requires: "none", toolbar: true, desktopOnly: true, primary: true, icon: "lt", tooltip: "Open a different library" },
   // Pointing the server at an empty folder has always produced a
   // working library; there was simply no way to say so. "Switch
   // library -> Browse for another" reads as "find an existing one".
@@ -194,28 +192,28 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   { id: "file-naming", label: "File naming…", group: "library", requires: "none", icon: "tb_folder", tooltip: "Set the library's folder and file naming convention, the default for Organize, Rename files and Fix titles" },
   { id: "export-copy", label: "Export a copy…", group: "library", requires: "none", icon: "bookshelf", tooltip: "Copy the library (or some books) to another folder or drive: a travel copy you can refresh, or a backup mirror" },
   { id: "fix-titles", label: "Fix titles…", group: "library", requires: "none", icon: "edit_input", tooltip: "Find junk titles in the library, suggest clean ones, and set them (optionally in the files too)" },
-  { id: "trash", label: "Trash…", group: "library", requires: "none", icon: "remove_books", tooltip: "Restore or permanently delete books and formats you removed" },
+  { id: "trash", label: "Open Trash…", group: "library", requires: "none", icon: "remove_books", tooltip: "Restore, or permanently delete, books and formats moved to the Trash" },
   { id: "open-library-folder", label: "Open library folder", group: "library", requires: "none", desktopOnly: true, icon: "tb_folder", tooltip: "Show this library's folder in the file browser" },
 
   { id: "select-mode", label: "Select…", group: "view", requires: "none" },
   // Marks are the thing selection is not: they survive a new search,
   // so books can be gathered across several queries and acted on
   // together. Session-only, matching upstream.
-  { id: "mark-books", label: "Mark", group: "selection", requires: "selection", icon: "marked", accel: "M", tooltip: "Mark books to gather them across searches" },
+  { id: "mark-books", label: "Mark", group: "selection", requires: "selection", icon: "marked", tooltip: "Mark books to gather them across searches" },
   { id: "show-marked", label: "Show marked", group: "view", requires: "none", toolbar: false },
   { id: "clear-marks", label: "Clear marks", group: "view", requires: "none", toolbar: false },
   // `toolbar: false` because both already have dedicated controls --
   // the search box and the Table/Grid switch. They are registry
   // entries so a keyboard shortcut can bind to a real action id
   // rather than needing a catalogue of its own.
-  { id: "focus-search", label: "Search", group: "view", requires: "none", toolbar: false, icon: "search", accel: "Ctrl+F" },
+  { id: "focus-search", label: "Search", group: "view", requires: "none", toolbar: false, icon: "search" },
   { id: "toggle-view", label: "Switch table/grid", group: "view", requires: "none", toolbar: false, icon: "grid" },
-  { id: "bulk-edit", label: "Bulk edit", group: "selection", requires: "selection", icon: "merge_books", accel: "Ctrl+Shift+E", tooltip: "Change a field across every selected book" },
+  { id: "bulk-edit", label: "Bulk edit", group: "selection", requires: "selection", icon: "merge_books", tooltip: "Change a field across every selected book" },
   // Calibre's "Merge book records": the first selected book is the default
   // destination. Needs two books, so it is not offered with one selected.
   { id: "merge-books", label: "Merge books…", group: "selection", requires: "multi-selection", contextMenu: true, icon: "merge_books", tooltip: "Merge the selected books into one record" },
   { id: "compare-duplicates", label: "Compare as duplicates…", group: "selection", requires: "multi-selection", contextMenu: true, icon: "merge", tooltip: "Look at 2 to 8 selected books side by side: pages, files and metadata, then keep one" },
-  { id: "save-to-disk", label: "Save to disk", group: "selection", requires: "selection", icon: "save", accel: "Ctrl+S", tooltip: "Write book files to a folder" },
+  { id: "save-to-disk", label: "Save to disk", group: "selection", requires: "selection", icon: "save", tooltip: "Write book files to a folder" },
   { id: "rename-files", label: "Rename files…", group: "selection", requires: "selection", contextMenu: true, icon: "template_funcs", tooltip: "Rename the files on disk, without changing the title" },
   { id: "fix-titles-selected", label: "Fix titles…", group: "selection", requires: "selection", contextMenu: true, icon: "edit_input", tooltip: "Suggest clean titles for the selected books, then set them, write them into the files and rename the files" },
   // The counterpart to "Rename files": that changes the name on disk,
@@ -224,27 +222,28 @@ export const LIBRARY_ACTIONS: LibraryAction[] = [
   { id: "embed-metadata", label: "Embed metadata in files", group: "selection", requires: "selection", contextMenu: true, icon: "save", tooltip: "Write this library's metadata into the book files themselves" },
   { id: "copy-to-library", label: "Copy to library…", group: "selection", requires: "selection", contextMenu: true, icon: "copy_to_library", tooltip: "Copy or move the selected books into another library" },
 
-  { id: "read", label: "Read", group: "book", requires: "single-selection", contextMenu: true, icon: "view", accel: "Enter", tooltip: "Open in the built-in reader" },
-  { id: "open-externally", label: "Open externally", group: "book", requires: "single-selection", contextMenu: true, desktopOnly: true, icon: "external-link", accel: "Ctrl+Enter", tooltip: "Open in the system's default application" },
+  { id: "read", label: "Read", group: "book", requires: "single-selection", contextMenu: true, icon: "view", tooltip: "Open in the built-in reader" },
+  { id: "open-externally", label: "Open externally", group: "book", requires: "single-selection", contextMenu: true, desktopOnly: true, icon: "external-link", tooltip: "Open in the system's default application" },
   // Unpack/repack hand a book to whatever editor the user prefers.
   // Desktop-only: both need a real folder and real filesystem access.
   { id: "unpack-book", label: "Unpack to folder…", group: "book", requires: "single-selection", contextMenu: true, desktopOnly: true, icon: "unpack-book", tooltip: "Unpack into a folder for external editing" },
   { id: "repack-book", label: "Repack from folder…", group: "book", requires: "single-selection", contextMenu: true, desktopOnly: true, icon: "sync", tooltip: "Repack from its folder" },
-  { id: "edit-metadata", label: "Edit metadata", group: "book", requires: "single-selection", contextMenu: true, icon: "edit_input", accel: "E", tooltip: "Edit this book's metadata" },
-  { id: "fetch-metadata", label: "Fetch metadata online…", group: "book", requires: "single-selection", contextMenu: true, icon: "download-metadata", accel: "Ctrl+D", tooltip: "Look up metadata and covers online" },
-  { id: "convert", label: "Convert…", group: "book", requires: "single-selection", contextMenu: true, icon: "convert", accel: "C", tooltip: "Convert to another format" },
-  { id: "tweak-book", label: "Tweak Book…", group: "book", requires: "single-selection", contextMenu: true, icon: "tweak", accel: "T", tooltip: "Edit the book's files directly" },
-  { id: "quick-view", label: "Quick View…", group: "book", requires: "single-selection", contextMenu: true, icon: "quickview", accel: "Q", tooltip: "Peek at this book without leaving the list" },
+  // With several books selected this opens the bulk editor, so it needs one or more.
+  { id: "edit-metadata", label: "Edit metadata", group: "book", requires: "selection", contextMenu: true, icon: "edit_input", tooltip: "Edit this book's metadata (with several books selected, edit them together)" },
+  { id: "fetch-metadata", label: "Fetch metadata online…", group: "book", requires: "single-selection", contextMenu: true, icon: "download-metadata", tooltip: "Look up metadata and covers online" },
+  { id: "convert", label: "Convert…", group: "book", requires: "single-selection", contextMenu: true, icon: "convert", tooltip: "Convert to another format" },
+  { id: "tweak-book", label: "Tweak Book…", group: "book", requires: "single-selection", contextMenu: true, icon: "tweak", tooltip: "Edit the book's files directly" },
+  { id: "quick-view", label: "Quick View…", group: "book", requires: "single-selection", contextMenu: true, icon: "quickview", tooltip: "Peek at this book without leaving the list" },
   { id: "test-template", label: "Test template…", group: "book", requires: "single-selection", contextMenu: true, icon: "template_funcs", tooltip: "Try a template against a real book" },
-  { id: "send-email", label: "Send…", group: "book", requires: "single-selection", contextMenu: true, icon: "mail", accel: "Ctrl+E", tooltip: "Email a book to a device or address" },
+  { id: "send-email", label: "Send…", group: "book", requires: "single-selection", contextMenu: true, icon: "mail", tooltip: "Email a book to a device or address" },
   { id: "replace-cover", label: "Replace cover…", group: "book", requires: "single-selection", contextMenu: true, icon: "default_cover", tooltip: "Replace the cover image" },
   { id: "open-book-folder", label: "Show in folder", group: "book", requires: "single-selection", contextMenu: true, desktopOnly: true, icon: "tb_folder", tooltip: "Show this book's files in the file browser" },
   { id: "cover-from-pdf", label: "Cover from PDF page 1", group: "book", requires: "single-selection", contextMenu: true, icon: "default_cover", tooltip: "Render the first page of the PDF as the cover" },
   { id: "similar-books", label: "Similar books", group: "book", requires: "single-selection", contextMenu: true, icon: "similar", tooltip: "Find books like this one" },
   // Selection-scoped rather than book-scoped: polishing a batch is
   // the normal case, and the engine handles books independently.
-  { id: "polish", label: "Polish…", group: "selection", requires: "selection", icon: "polish", accel: "P", tooltip: "Improve a book without changing its format" },
-  { id: "delete-book", label: "Delete", group: "book", requires: "selection", contextMenu: true, icon: "remove_books", accel: "Del", tooltip: "Remove from the library" },
+  { id: "polish", label: "Polish…", group: "selection", requires: "selection", icon: "polish", tooltip: "Improve a book without changing its format" },
+  { id: "delete-book", label: "Move to Trash", group: "book", requires: "selection", contextMenu: true, icon: "remove_books", tooltip: "Move the selected books to the Trash (they can be restored from there)" },
 ];
 
 const BY_ID = new Map<LibraryActionId, LibraryAction>(LIBRARY_ACTIONS.map((a) => [a.id, a]));
@@ -285,6 +284,26 @@ export function actionEnabled(action: LibraryAction, ctx: ActionContext): boolea
   }
 }
 
+
+/**
+ * Why an action cannot run now, in a sentence: "Read needs exactly one book
+ * selected." A click that does nothing says this instead of being dropped
+ * silently (the empty library's "Add folder…" was, in a browser).
+ */
+export function refusalText(action: LibraryAction, ctx: ActionContext): string {
+  const label = action.label.replace(/…$/, "");
+  if (!actionAvailable(action, ctx)) return `${label} is only available in the desktop app.`;
+  switch (action.requires) {
+    case "selection":
+      return `${label} needs at least one book selected.`;
+    case "single-selection":
+      return `${label} needs exactly one book selected.`;
+    case "multi-selection":
+      return `${label} needs two or more books selected.`;
+    default:
+      return `${label} is not available right now.`;
+  }
+}
 
 /** One entry of a right-click menu. */
 export interface ContextMenuEntry {
@@ -456,13 +475,14 @@ export const TOOLBAR_LAYOUT: ToolbarItem[] = [
   { kind: "split", id: "organize-files", label: "Organize", menu: ["file-naming", "fix-titles", "export-copy"] },
   { kind: "separator" },
   { kind: "split", id: "edit-metadata", menu: ["fetch-metadata", "replace-cover", "cover-from-pdf", "-", "bulk-edit", "map-metadata", "-", "test-template"] },
-  { kind: "split", id: "delete-book", label: "Remove", menu: ["-", "$restore-deleted"] },
+  { kind: "split", id: "delete-book", label: "Move to Trash", menu: ["trash"] },
   { kind: "overflow" },
   { kind: "spring" },
   // Label is replaced at render time with the open library's name:
   // which library you are in is state, and state belongs on a label.
-  { kind: "menu", id: "library", label: "Library", icon: "lt", menu: ["switch-library", "new-library", "open-library-folder", "-", "$recent-libraries", "-", "check-library", "-", "trash"] },
-  { kind: "split", id: "help", menu: ["$shortcuts", "$about"] },
+  { kind: "menu", id: "library", label: "Library", icon: "lt", menu: ["switch-library", "new-library", "open-library-folder", "-", "$recent-libraries", "-", "check-library"] },
+  // Help has no relatives to hold: the dialog lists every action with its key.
+  { kind: "action", id: "help" },
 ];
 
 /**

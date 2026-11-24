@@ -20,7 +20,8 @@
 //!   plan, like organize; `dry_run: false` starts an `organize` job (202), and
 //!   with a `plan_fingerprint` is refused (409) if the plan changed.
 //! - `POST /unorganize-library/{library_id}` `{run_id}` -- an `undo_organize` job.
-//! - `GET /organize-runs/{library_id}` -- the runs that can be undone.
+//! - `GET /organize-runs/{library_id}` -- the runs that can be undone, each with
+//!   `template`: what it was asked to do (a template, `move to X`, `rename folder A to B`).
 //!
 //! The default template is `{author_sort}/{title}`; the scope is the selected
 //! ids, a search, or a folder prefix (relative to the library), else every book.
@@ -72,6 +73,39 @@ pub(crate) fn internal(e: impl std::fmt::Display) -> ServerError {
     ServerError::InternalServerError(e.to_string())
 }
 
+/// How long a previewed plan may be applied without planning again.
+const PLAN_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Plans a dry run produced, so that applying one need not compute it again
+/// (planning every book of a big library takes seconds, and the preview and
+/// the apply would each pay it). Newest last; only a few are kept.
+type RememberedPlan = (std::time::Instant, std::path::PathBuf, String, String, organize::OrganizePlan);
+
+fn remembered_plans() -> &'static std::sync::Mutex<Vec<RememberedPlan>> {
+    static PLANS: std::sync::OnceLock<std::sync::Mutex<Vec<RememberedPlan>>> = std::sync::OnceLock::new();
+    PLANS.get_or_init(Default::default)
+}
+
+/// Remembers `plan`, made for the request `key` while the library's change
+/// watermark was `watermark`.
+fn remember_plan(cache: &lexmechanic_db::cache::Cache, key: &str, watermark: String, plan: &organize::OrganizePlan) {
+    let mut plans = remembered_plans().lock().unwrap();
+    plans.retain(|(at, ..)| at.elapsed() < PLAN_TTL);
+    plans.push((std::time::Instant::now(), cache.backend.library_path.clone(), key.to_string(), watermark, plan.clone()));
+    if plans.len() > 4 {
+        plans.remove(0);
+    }
+}
+
+/// The remembered plan for this very request (`key`) with this fingerprint, if it
+/// is recent and the library has not changed since it was made; otherwise the
+/// caller plans again (and the fingerprint comparison decides, as it always did).
+pub(crate) fn recall_plan(cache: &lexmechanic_db::cache::Cache, key: &str, fingerprint: &str) -> Option<organize::OrganizePlan> {
+    let hit = remembered_plans().lock().unwrap().iter().rev().find(|(at, library, k, _, plan)| at.elapsed() < PLAN_TTL && *library == cache.backend.library_path && k == key && plan.fingerprint == fingerprint).map(|(_, _, _, mark, plan)| (mark.clone(), plan.clone()));
+    let (mark, plan) = hit?;
+    (cache.change_watermark() == mark).then_some(plan)
+}
+
 /// What a dry run answers.
 pub(crate) fn plan_json(plan: &organize::OrganizePlan) -> Value {
     let moves: Vec<Value> = plan.books.iter().flat_map(|b| b.files.iter().map(move |f| json!({"book_id": b.book_id, "title": b.title, "format": f.format, "from": f.from, "to": f.to, "suffixed": b.suffixed}))).take(MAX_MOVES_SHOWN).collect();
@@ -99,8 +133,22 @@ pub async fn organize(State(state): State<AppState>, Path(library_id): Path<Stri
         return Err(ServerError::BadRequest("executing needs the plan_fingerprint of the dry run the user confirmed".into()));
     }
 
+    // Applying a plan that was just previewed, for this same request, with nothing changed since: use it.
+    let key = json!({"organize": template, "book_ids": body.book_ids, "search": body.search, "path_prefix": body.path_prefix}).to_string();
+    let reused = match (body.dry_run, body.plan_fingerprint.as_deref()) {
+        (false, Some(fp)) => {
+            let (c, key, fp) = (cache.clone(), key.clone(), fp.to_string());
+            tokio::task::spawn_blocking(move || recall_plan(&c, &key, &fp)).await.map_err(internal)?
+        }
+        _ => None,
+    };
     let (plan_cache, plan_template) = (cache.clone(), template.clone());
-    let plan = tokio::task::spawn_blocking(move || -> Result<organize::OrganizePlan, ServerError> {
+    let plan = if let Some(plan) = reused {
+        plan
+    } else {
+        let dry_run = body.dry_run;
+        tokio::task::spawn_blocking(move || -> Result<organize::OrganizePlan, ServerError> {
+        let watermark = plan_cache.change_watermark();
         let scope = if let Some(ids) = body.book_ids {
             Scope::Ids(ids)
         } else if let Some(query) = body.search {
@@ -110,10 +158,15 @@ pub async fn organize(State(state): State<AppState>, Path(library_id): Path<Stri
         } else {
             Scope::All
         };
-        organize::plan(&plan_cache, &plan_template, &scope).map_err(internal)
-    })
-    .await
-    .map_err(internal)??;
+        let plan = organize::plan(&plan_cache, &plan_template, &scope).map_err(internal)?;
+        if dry_run {
+            remember_plan(&plan_cache, &key, watermark, &plan);
+        }
+        Ok(plan)
+        })
+        .await
+        .map_err(internal)??
+    };
 
     if body.dry_run {
         return Ok(Json(plan_json(&plan)).into_response());
@@ -146,8 +199,26 @@ pub async fn unorganize(State(state): State<AppState>, Path(library_id): Path<St
 pub async fn runs(State(state): State<AppState>, Path(library_id): Path<String>) -> Result<Json<Value>, ServerError> {
     let cache = state.cache_for(Some(&library_id)).ok_or_else(|| ServerError::NotFound(format!("no library named {library_id:?}")))?;
     let library = cache.backend.library_path.clone();
-    let runs = tokio::task::spawn_blocking(move || organize::list_runs(&library)).await.map_err(internal)?;
-    Ok(Json(json!({"runs": runs.into_iter().map(|(run_id, created_at, books, undone)| json!({"run_id": run_id, "created_at": created_at, "books": books, "undone": undone})).collect::<Vec<_>>()})))
+    let runs = tokio::task::spawn_blocking(move || describe_runs(&library)).await.map_err(internal)?;
+    Ok(Json(json!({"runs": runs})))
+}
+
+/// How many of the newest runs are opened to say what each one did. The dialog
+/// shows a handful; the rest are listed bare rather than read from disk.
+const DESCRIBED_RUNS: usize = 20;
+
+/// The undoable runs, newest first. Each carries `template`: what the run was
+/// asked to do, as the plan labelled it (a template, `move to Fiction` or
+/// `rename folder Fiction to Novels`), so two runs of one book can be told apart.
+fn describe_runs(library: &std::path::Path) -> Vec<Value> {
+    organize::list_runs(library)
+        .into_iter()
+        .enumerate()
+        .map(|(i, (run_id, created_at, books, undone))| {
+            let template = if i < DESCRIBED_RUNS { organize::load_run(library, &run_id).map(|r| r.template).unwrap_or_default() } else { String::new() };
+            json!({"run_id": run_id, "created_at": created_at, "books": books, "undone": undone, "template": template})
+        })
+        .collect()
 }
 
 
@@ -179,17 +250,35 @@ pub async fn move_books(State(state): State<AppState>, Path(library_id): Path<St
         return Err(ServerError::BadRequest(format!("at most {MAX_MOVE_BOOKS} books can be moved in one request (got {})", ids.len())));
     }
 
+    let key = json!({"move": folder, "book_ids": ids}).to_string();
+    let reused = match (body.dry_run, body.plan_fingerprint.as_deref()) {
+        (false, Some(fp)) => {
+            let (c, key, fp) = (cache.clone(), key.clone(), fp.to_string());
+            tokio::task::spawn_blocking(move || recall_plan(&c, &key, &fp)).await.map_err(internal)?
+        }
+        _ => None,
+    };
     let (plan_cache, plan_folder) = (cache.clone(), folder.clone());
-    let plan = tokio::task::spawn_blocking(move || -> Result<organize::OrganizePlan, ServerError> {
+    let plan = if let Some(plan) = reused {
+        plan
+    } else {
+        let dry_run = body.dry_run;
+        tokio::task::spawn_blocking(move || -> Result<organize::OrganizePlan, ServerError> {
+        let watermark = plan_cache.change_watermark();
         for id in &ids {
             if plan_cache.field_for(*id, "path").map_err(internal)?.is_none() {
                 return Err(ServerError::NotFound(format!("no book with id {id}")));
             }
         }
-        organize::plan_to(&plan_cache, organize::Target::Folder(&plan_folder), &Scope::Ids(ids)).map_err(|e| ServerError::BadRequest(format!("{e:#}")))
-    })
-    .await
-    .map_err(internal)??;
+        let plan = organize::plan_to(&plan_cache, organize::Target::Folder(&plan_folder), &Scope::Ids(ids)).map_err(|e| ServerError::BadRequest(format!("{e:#}")))?;
+        if dry_run {
+            remember_plan(&plan_cache, &key, watermark, &plan);
+        }
+        Ok(plan)
+        })
+        .await
+        .map_err(internal)??
+    };
 
     if body.dry_run {
         let mut out = plan_json(&plan);

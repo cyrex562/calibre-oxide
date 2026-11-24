@@ -156,3 +156,65 @@ describe("the Folders tree", () => {
     expect(menu!.textContent).toContain("Move 1 selected book here");
   });
 });
+
+describe("the Folders tree as an ARIA tree", () => {
+  const key = async (el: HTMLElement, k: string) => {
+    el.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true, cancelable: true }));
+    await settle();
+  };
+  const tabStops = () => Array.from(host!.querySelectorAll<HTMLElement>("[data-folder],button")).filter((e) => e.tabIndex >= 0);
+
+  it("is a tree of treeitems with level and expanded state", async () => {
+    await mount([folder("a", 2), folder("a/b"), folder("z")]);
+    const tree = host!.querySelector("[role=tree]");
+    expect(tree).not.toBeNull();
+    const items = Array.from(tree!.querySelectorAll<HTMLElement>("[role=treeitem]"));
+    expect(items.map((i) => i.dataset.folder)).toEqual(["a", "z"]);
+    expect(items[0].getAttribute("aria-level")).toBe("1");
+    expect(items[0].getAttribute("aria-expanded")).toBe("false");
+    expect(items[1].hasAttribute("aria-expanded")).toBe(false);
+    await key(items[0], "ArrowRight");
+    const after = Array.from(tree!.querySelectorAll<HTMLElement>("[role=treeitem]"));
+    expect(after.map((i) => i.dataset.folder)).toEqual(["a", "a/b", "z"]);
+    expect(after[0].getAttribute("aria-expanded")).toBe("true");
+    expect(after[1].getAttribute("aria-level")).toBe("2");
+  });
+
+  it("is one Tab stop, however many folders there are", async () => {
+    await mount(Array.from({ length: 300 }, (_, i) => folder(`f${String(i).padStart(3, "0")}`)));
+    const rows = rowEls();
+    expect(rows.length).toBeGreaterThan(1);
+    expect(rows.filter((r) => r.tabIndex === 0)).toHaveLength(1);
+    // The header buttons are the only other stops; no folder button is one.
+    expect(tabStops().filter((e) => e.matches(".folder-pick,.twisty-btn"))).toHaveLength(0);
+  });
+
+  it("moves with the arrows, expands with right, collapses and climbs with left, and picks with Enter", async () => {
+    const emitted: unknown[][] = [];
+    api.folders = [folder("a", 2), folder("a/b"), folder("z")];
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    app = createApp(FoldersTree, { selectedIds: [], refreshKey: 0, onSelect: (...args: unknown[]) => emitted.push(args) });
+    app.mount(host);
+    await settle();
+
+    rowEls()[0].focus();
+    await key(rowEls()[0], "ArrowRight");
+    expect(rowPaths()).toEqual(["a", "a/b", "z"]);
+    await key(rowEls()[0], "ArrowRight");
+    expect(document.activeElement).toBe(rowEls()[1]);
+    await key(rowEls()[1], "ArrowDown");
+    expect(document.activeElement).toBe(rowEls()[2]);
+    expect(rowEls()[2].tabIndex).toBe(0);
+    expect(rowEls()[0].tabIndex).toBe(-1);
+    await key(rowEls()[2], "ArrowUp");
+    await key(rowEls()[1], "ArrowLeft");
+    expect(document.activeElement).toBe(rowEls()[0]);
+    await key(rowEls()[0], "ArrowLeft");
+    expect(rowPaths()).toEqual(["a", "z"]);
+    await key(rowEls()[1], "Enter");
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0][1]).toBe("z");
+    expect(rowEls()[1].getAttribute("aria-selected")).toBe("true");
+  });
+});

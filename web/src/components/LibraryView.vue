@@ -45,16 +45,18 @@ import { readSavedChoice, readVlChoice, savedMenuItems, type SavedMenuId, type V
 import { applySortChoice, type SortMenuId, sortSummary as summariseSort } from "../library/sortMenu";
 import { moveKeyBy, moveKeyTo, pickerOrder, resetColumnPrefs, toggleKey } from "../library/columnLayout";
 import { clampWidth, columnsFor, DEFAULT_TABLE_PREFS, resolveColumns, TABLE_PREFS_PROFILE, type BookColumn, type LibraryViewMode, type TablePrefs } from "../library/columns";
-import { actionEnabled, contextMenuEntries, LIBRARY_ACTIONS, toolbarActionEnabled, TOOLBAR_LAYOUT, type ToolbarEntry, type ToolbarItem, toolbarOverflowEntries, toolbarOverflowIds, visibleToolbarActions, type ActionContext, type LibraryAction, type LibraryActionId } from "../library/actions";
+import { actionEnabled, contextMenuEntries, refusalText, LIBRARY_ACTIONS, toolbarActionEnabled, TOOLBAR_LAYOUT, type ToolbarEntry, type ToolbarItem, toolbarOverflowEntries, toolbarOverflowIds, visibleToolbarActions, type ActionContext, type LibraryAction, type LibraryActionId } from "../library/actions";
 import { syncDesktopMenu } from "../library/desktopMenu";
 import { buildMenuSpec } from "../library/actions";
 import { addChosenDuplicates, describeImport, importFiles, type PendingDuplicate } from "../library/importFiles";
 import { activeFilters, classifyEmpty, type ActiveFilter } from "../library/emptyState";
 import { draftCount } from "../library/metadataForm";
-import { trashBooksFlow } from "../library/deleteFlow";
+import { showToast, trashBooksFlow } from "../library/deleteFlow";
 import DeleteConfirm from "./DeleteConfirm.vue";
 import UndoToast from "./UndoToast.vue";
 import { isTauri, tauriInvoke } from "../tauri";
+import { humanError } from "../library/errorText";
+import { shortcutHint } from "../library/shortcuts";
 import { DEFAULT_LIBRARY_PREFS, DEFAULT_TOOLBAR_PREFS, fetchProfile, LIBRARY_PREFS_PROFILE, saveProfile, TOOLBAR_PREFS_PROFILE, type LibraryPrefs, type ToolbarPrefs } from "../settings/api";
 import type { FieldMetaEntry } from "../library/types";
 import ManageListsDialog from "./dialogs/ManageListsDialog.vue";
@@ -94,6 +96,8 @@ const activeQuery = ref(""); // committed query -- what's actually sent, vs. the
 const sort = ref(DEFAULT_LIBRARY_PREFS.sort);
 const sortOrder = ref<"asc" | "desc">(DEFAULT_LIBRARY_PREFS.sortOrder);
 const vl = ref("");
+/** Every book the library has, whatever the current search (for "0 of 61 books"); null until known. */
+const libraryTotal = ref<number | null>(null);
 
 const sortableFields = ref<[string, string][]>([]);
 const fieldMetadata = ref<Record<string, FieldMetaEntry>>({});
@@ -168,7 +172,23 @@ function onSortMenuChoose(id: SortMenuId) {
   const next = applySortChoice({ sort: sort.value, order: sortOrder.value }, id);
   sort.value = next.sort;
   sortOrder.value = next.order;
-  void runSearch();
+  // No explicit search here: the watcher on `sort`/`sortOrder` resets the list,
+  // and a second call would fire an identical /ajax/search twice.
+  void rememberSort();
+}
+
+/**
+ * Keeps the last sort the user chose (header click or Sort menu) as the library's
+ * sort, the one a reload or a trip to Settings or the reader comes back to. It is
+ * the same stored value as Settings > Default sort, so the two never disagree.
+ */
+async function rememberSort() {
+  try {
+    const stored = await fetchProfile<LibraryPrefs>(LIBRARY_PREFS_PROFILE);
+    await saveProfile(LIBRARY_PREFS_PROFILE, { ...DEFAULT_LIBRARY_PREFS, ...stored, sort: sort.value, sortOrder: sortOrder.value });
+  } catch (e) {
+    console.error("failed to save the sort order", e);
+  }
 }
 
 /**
@@ -341,7 +361,8 @@ function setViewMode(mode: LibraryViewMode) {
 function onTableSort(next: { sort: string; order: "asc" | "desc" }) {
   sort.value = next.sort;
   sortOrder.value = next.order;
-  void runSearch();
+  // The watcher on `sort`/`sortOrder` resets the list: no second search here.
+  void rememberSort();
 }
 
 // Resizing fires continuously during a drag, so the width is applied
@@ -356,7 +377,9 @@ function onColumnResize(next: { key: string; width: number }) {
 }
 // The panels beside the list: whether they show, how wide, and the splitters
 // that resize them (../library/usePanelLayout.ts).
-const { sidebarVisible, detailsVisible, sidebarWidth, detailsWidth, startResize } = usePanelLayout();
+const { sidebarWidth, detailsWidth, startResize, narrow, panelShown, setPanel, togglePanel } = usePanelLayout();
+const sidebarShown = computed(() => panelShown("sidebar"));
+const detailsShown = computed(() => panelShown("details"));
 
 const columnPickerOpen = ref(false);
 
@@ -456,10 +479,10 @@ async function runSearch() {
   loading.value = true;
   error.value = null;
   try {
-    // Colours are re-evaluated for the rows on screen; the old ones stay until replaced.
+    // Colors are re-evaluated for the rows on screen; the old ones stay until replaced.
     coloring.forgetAll();
     await win.refresh();
-    error.value = win.error.value;
+    error.value = win.error.value ? humanError(win.error.value) : null;
     pruneSelection();
   } finally {
     loading.value = false;
@@ -472,12 +495,37 @@ async function resetSearch() {
   error.value = null;
   try {
     await win.reset();
-    error.value = win.error.value;
+    error.value = win.error.value ? humanError(win.error.value) : null;
     // The selection must not outlive the results it was made in: a delete
     // would count books the new search hides.
     pruneSelection();
+    // Nor may the open book: the details panel would keep Save, Delete and Read
+    // live on a book no row shows. (A failed load shows nothing either way, so
+    // it keeps what was open.)
+    if (!win.error.value && selectedBookId.value !== null && win.indexOf(selectedBookId.value) < 0) selectedBookId.value = null;
+    void refreshLibraryTotal();
   } finally {
     loading.value = false;
+    // First rows are in: now the slow untracked-files count may be asked for.
+    markRowsReady();
+  }
+}
+
+/**
+ * How many books the whole library holds, for the status bar's "0 of 61 books".
+ * With no search or filter the list's own total is the answer; otherwise it is
+ * asked once (one id, not the list).
+ */
+async function refreshLibraryTotal() {
+  const filtered = activeFilters({ query: activeQuery.value, virtualLibrary: vl.value, showMarkedOnly: showMarkedOnly.value }).length > 0;
+  if (!filtered) {
+    libraryTotal.value = totalNum.value;
+    return;
+  }
+  try {
+    libraryTotal.value = (await search({ query: "", num: 1, offset: 0, sort: "id", sortOrder: "asc", vl: "" })).total_num;
+  } catch {
+    libraryTotal.value = null;
   }
 }
 
@@ -587,7 +635,7 @@ async function commitEdit(bookId: number, column: BookColumn, raw: string): Prom
   return result;
 }
 
-// Row colouring rules (../library/useRowColoring.ts).
+// Row coloring rules (../library/useRowColoring.ts).
 const coloring = useRowColoring(win);
 const { rowColors, renderedRange } = coloring;
 
@@ -613,7 +661,7 @@ async function revealLibraryFolder() {
   try {
     await tauriInvoke<void>("reveal_library_folder");
   } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e);
+    error.value = humanError(e);
   }
 }
 
@@ -645,12 +693,16 @@ function openCompareForSelection() {
   }
   void compareController.open(ids);
 }
+// "The books in the current search": what Organize, Export a copy and Fix titles can be limited to.
+// The ids are the list's own, so every kind of filter (a search, a virtual library, a category, the marked books) counts.
+const searchScopeIds = computed(() => win.ids.value);
+const searchScopeActive = computed(() => !ftsMode.value && activeFilters({ query: activeQuery.value, virtualLibrary: vl.value, showMarkedOnly: showMarkedOnly.value }).length > 0);
 const organizeController = createOrganizeController();
 const organizeOpen = ref(false);
 /** Organize files: the selected books when there are any (select mode), else the open book is not assumed. */
 const organizeSelection = computed(() => scope.ids.value);
 async function openOrganize(prefill?: { template: string; scope: "selected" | "all" }) {
-  organizeController.open(organizeSelection.value.length);
+  organizeController.open(organizeSelection.value.length, searchScopeActive.value);
   if (prefill) {
     organizeController.state.draft.template = prefill.template;
     organizeController.state.draft.scope = prefill.scope === "selected" && organizeSelection.value.length > 0 ? "selected" : "all";
@@ -681,7 +733,7 @@ function applyNaming(template: string, scope: "selected" | "all") {
 const mirrorController = createMirrorController();
 const mirrorOpen = ref(false);
 function openMirror() {
-  mirrorController.open(organizeSelection.value.length);
+  mirrorController.open(organizeSelection.value.length, searchScopeActive.value);
   mirrorOpen.value = true;
 }
 // Fix titles: find junk titles, suggest clean ones, set / embed / rename in one
@@ -692,7 +744,8 @@ const retitleOpen = ref(false);
 const retitleSelection = scope.ids;
 function openRetitle(scope: "all" | "selected") {
   if (scope === "selected" && retitleSelection.value.length === 0) return;
-  retitleController.open(scope);
+  // From the Library menu ("every book"), a search or filter that is on means the books in it.
+  retitleController.open(scope === "all" && searchScopeActive.value ? "search" : scope);
   retitleOpen.value = true;
   // Its rename template starts from the library's naming convention.
   void conventionFileTemplate().then((t) => {
@@ -759,6 +812,8 @@ async function openMergeForSelection() {
 
 async function onMerged(description: string) {
   mergeDone.value = description;
+  // A merge is not undoable (the merged-away records are deleted), so the toast says so rather than offering an Undo.
+  showToast(`${description} A merge cannot be undone.`, undefined, 15000);
   mergeOpen.value = false;
   selectedIds.value = new Set();
   await libraryChanged();
@@ -849,7 +904,7 @@ async function onImported() {
 const {
   libraryName, libraryPath, copyTargets, banner, bannerDismissed,
   changeLogWarning, changeLogRepairBusy, changeLogRepairError, refreshChangeLogStatus, repairChangeLogNow,
-  loadLibraryInfo,
+  loadLibraryInfo, markRowsReady,
   untracked, scanPromptDismissed, promptScanBusy, promptScanProgress, promptScanSummary, promptScanError, scanFromPrompt, stopPromptScan, dismissScanPrompt, closeScanResult,
   interruptedJob, resumeBusy, resumeProgress, resumeError, loadInterruptedJob, resumeInterrupted,
   newLibraryOpen, newLibraryName, newLibraryError, creatingLibrary, openNewLibrary, createLibrary,
@@ -963,6 +1018,11 @@ const actionHandlers: Partial<Record<LibraryActionId, () => void>> = {
   // Book-scoped: the details panel performs these (it owns the controls),
   // so the toolbar and the keyboard reach it the way the context menu does.
   ...Object.fromEntries(PANEL_ACTIONS.map((id) => [id, () => runPanelAction(id)])),
+  // With several books selected the metadata editor is the bulk editor.
+  "edit-metadata": () => {
+    if (actionContext.value.selectionCount > 1) bulk.open = true;
+    else runPanelAction("edit-metadata");
+  },
   "similar-books": () => {
     if (selectedBookId.value !== null) void showSimilarBooks(selectedBookId.value);
   },
@@ -1018,6 +1078,8 @@ function actionLabel(action: LibraryAction): string {
       return adding.value ? "Adding…" : action.label;
     case "select-mode":
       return selectMode.value ? "Cancel selection" : action.label;
+    case "edit-metadata":
+      return scope.count.value > 1 ? `${action.label} (${scope.count.value})` : action.label;
     case "bulk-edit":
     case "save-to-disk":
     case "rename-files":
@@ -1103,19 +1165,35 @@ function itemHasMenu(item: ToolbarItem): boolean {
   return item.kind === "split" || item.kind === "menu" || item.kind === "overflow";
 }
 
-/** The body was clicked. A pure menu slot opens its menu instead. */
-function onItemRun(item: ToolbarItem) {
+/**
+ * The body was clicked. A pure menu slot opens its menu instead, beneath the
+ * button: `anchor` is the button's own corner (ToolbarButton reports it), because
+ * a menu opened at (0, 0) landed on top of the first buttons of the toolbar.
+ */
+function onItemRun(item: ToolbarItem, anchor: { x: number; y: number }, key = "") {
   if (item.kind === "action" || item.kind === "split") {
     runAction(item.id);
     return;
   }
   // A pure menu has no primary action, so clicking its body opens it.
-  onItemMenu(item, { x: 0, y: 0 });
+  onItemMenu(item, anchor, key);
 }
 
-function onItemMenu(item: ToolbarItem, anchor: { x: number; y: number }) {
-  if (item.kind === "split" || item.kind === "menu") void openSlotMenu(item.menu, anchor);
-  else if (item.kind === "overflow") void openSlotMenu(toolbarOverflowEntries(), anchor);
+function onItemMenu(item: ToolbarItem, anchor: { x: number; y: number }, key = "") {
+  if (item.kind === "split" || item.kind === "menu") void openSlotMenu(item.menu, anchor, key);
+  else if (item.kind === "overflow") void openSlotMenu(toolbarOverflowEntries(), anchor, key);
+}
+
+/** Whether this slot's own dropdown is the one showing (for `aria-expanded`). */
+function itemExpanded(key: string): boolean {
+  return toolbarMenu.value !== null && toolbarMenu.value.owner === key;
+}
+
+/** What a screen reader calls a slot's arrow, where the label alone would not say. */
+function itemMenuLabel(item: ToolbarItem): string | undefined {
+  if (item.kind === "overflow") return "More actions";
+  if (item.kind === "menu" && item.id === "library") return "Library menu";
+  return undefined;
 }
 
 function itemLabel(item: ToolbarItem): string {
@@ -1148,8 +1226,11 @@ function itemTitle(item: ToolbarItem): string | undefined {
   if (!("id" in item)) return undefined;
   const action = actionFor(item.id as LibraryActionId);
   if (!action) return undefined;
+  // The key comes from the keymap in force, not from text written beside the
+  // action: that text said "Ctrl+A" and "E" for keys that did something else.
   const parts = [action.tooltip ?? action.label];
-  if (action.accel) parts.push(`(${action.accel})`);
+  const hint = shortcutHint(action.id, keymap.value);
+  if (hint) parts.push(`(${hint})`);
   return parts.join(" ");
 }
 
@@ -1176,10 +1257,10 @@ type SlotMenuId = LibraryActionId | `lib:${string}`;
 
 function menuEntriesFor(entries: ToolbarEntry[]) {
   const handled = new Set(toolbarActions.value.map((a) => a.id));
-  const out: { id: SlotMenuId; label: string; enabled: boolean; startsGroup?: boolean }[] = [];
+  const out: { id: SlotMenuId; label: string; enabled: boolean; startsGroup?: boolean; accel?: string }[] = [];
   let pendingSeparator = false;
 
-  const push = (entry: { id: SlotMenuId; label: string; enabled: boolean }) => {
+  const push = (entry: { id: SlotMenuId; label: string; enabled: boolean; accel?: string }) => {
     out.push({ ...entry, startsGroup: pendingSeparator });
     pendingSeparator = false;
   };
@@ -1205,7 +1286,8 @@ function menuEntriesFor(entries: ToolbarEntry[]) {
     const id = entry as LibraryActionId;
     const action = actionFor(id);
     if (!action || !handled.has(id)) continue;
-    push({ id, label: actionLabel(action), enabled: !actionDisabled(action) });
+    const hint = shortcutHint(id, keymap.value);
+    push({ id, label: actionLabel(action), enabled: !actionDisabled(action), ...(hint ? { accel: hint } : {}) });
   }
   return out;
 }
@@ -1220,19 +1302,21 @@ function menuEntriesFor(entries: ToolbarEntry[]) {
 const toolbarMenu = ref<{
   x: number;
   y: number;
-  entries: { id: SlotMenuId; label: string; enabled: boolean; startsGroup?: boolean }[];
+  /** The slot that opened it, so only that slot's arrow reads as expanded. */
+  owner: string;
+  entries: { id: SlotMenuId; label: string; enabled: boolean; startsGroup?: boolean; accel?: string }[];
 } | null>(null);
 
 const toolbarMenuEntries = computed(() => toolbarMenu.value?.entries ?? []);
 
 /** Opens a slot's dropdown, anchored beneath it. */
-async function openSlotMenu(entries: ToolbarEntry[], anchor: { x: number; y: number }) {
+async function openSlotMenu(entries: ToolbarEntry[], anchor: { x: number; y: number }, owner = "") {
   // Refreshed on open rather than cached: another window may have
   // opened a library since this one last looked.
   if (entries.includes("$recent-libraries")) await loadRecentLibraries();
   const resolved = menuEntriesFor(entries);
   if (resolved.length === 0) return;
-  toolbarMenu.value = { ...anchor, entries: resolved };
+  toolbarMenu.value = { ...anchor, owner, entries: resolved };
 }
 
 function onToolbarMenuChoose(id: SlotMenuId) {
@@ -1245,11 +1329,29 @@ function onToolbarMenuChoose(id: SlotMenuId) {
   runAction(id as LibraryActionId);
 }
 
-function runAction(id: LibraryActionId) {
+/** A short message under the toolbar that says why a click did nothing; it clears itself. */
+const actionNotice = ref<string | null>(null);
+let actionNoticeTimer: ReturnType<typeof setTimeout> | undefined;
+
+function showActionNotice(text: string) {
+  actionNotice.value = text;
+  clearTimeout(actionNoticeTimer);
+  actionNoticeTimer = setTimeout(() => (actionNotice.value = null), 5000);
+}
+
+/**
+ * Runs an action. A click that cannot do anything says why instead of being
+ * dropped silently; a key press (`quiet`) does not, since a stray key is not a
+ * request.
+ */
+function runAction(id: LibraryActionId, quiet = false) {
   const handler = actionHandlers[id];
   if (!handler) return;
   const action = LIBRARY_ACTIONS.find((a) => a.id === id);
-  if (action && !actionEnabled(action, actionContext.value)) return;
+  if (action && !actionEnabled(action, actionContext.value)) {
+    if (!quiet) showActionNotice(refusalText(action, actionContext.value));
+    return;
+  }
   handler();
 }
 
@@ -1257,7 +1359,7 @@ function runAction(id: LibraryActionId) {
 // live only while the view is shown (../library/useLibraryKeyboard.ts).
 const searchInput = ref<HTMLInputElement | null>(null);
 const keyboard = useLibraryKeyboard({
-  runAction,
+  runAction: (id) => runAction(id, true),
   deleteSelectedBooks: () => void deleteSelectedBooks(),
   focusSearch: () => {
     searchInput.value?.focus();
@@ -1312,7 +1414,12 @@ const contextMenu = ref<{ x: number; y: number } | null>(null);
 const pendingBookAction = ref<{ id: string; nonce: number } | null>(null);
 let actionNonce = 0;
 
-const contextEntries = computed(() => contextMenuEntries([...PANEL_ACTIONS, "similar-books", "mark-books", "polish", "bulk-edit", "save-to-disk", "delete-book"], actionContext.value));
+const contextEntries = computed(() =>
+  contextMenuEntries([...PANEL_ACTIONS, "similar-books", "mark-books", "polish", "bulk-edit", "save-to-disk", "delete-book"], actionContext.value).map((entry) => {
+    const hint = shortcutHint(entry.id, keymap.value);
+    return hint ? { ...entry, accel: hint } : entry;
+  }),
+);
 
 function openContextMenu(payload: { bookId: number; x: number; y: number }) {
   // Right-clicking a row that is not part of the current selection
@@ -1342,14 +1449,14 @@ async function deleteSelectedBooks() {
     // refresh, which would otherwise clear it.
     if (result.failureText) error.value = result.failureText;
   } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e);
+    error.value = humanError(e);
   }
 }
 
 /** Hands a book action to the details panel, opening the panel if it is closed. */
 function runPanelAction(id: LibraryActionId) {
   if (selectedBookId.value === null) return;
-  detailsVisible.value = true;
+  setPanel("details", true);
   actionNonce += 1;
   pendingBookAction.value = { id, nonce: actionNonce };
 }
@@ -1367,7 +1474,7 @@ function onContextChoose(id: LibraryActionId) {
     void deleteSelectedBooks();
     return;
   }
-  if (id === "bulk-edit" || id === "save-to-disk") {
+  if (id === "bulk-edit" || id === "save-to-disk" || id === "edit-metadata") {
     runAction(id);
     return;
   }
@@ -1444,6 +1551,32 @@ const emptyKind = computed(() =>
   classifyEmpty({ loading: loading.value, error: error.value, total: totalNum.value, query: activeQuery.value, virtualLibrary: vl.value, showMarkedOnly: showMarkedOnly.value }),
 );
 
+/** The list is not offered while it has nothing to say: an empty header over a message is clutter. */
+const showList = computed(() => emptyKind.value !== "error" && emptyKind.value !== "empty-library" && emptyKind.value !== "no-results");
+
+/** The library could not be loaded: nothing on screen is current, so nothing on screen is editable. */
+const offline = computed(() => win.error.value !== null && emptyKind.value === "error");
+
+/** The status bar's count: "61 books", or "0 of 61 books" when a search or filter hides some. */
+const countText = computed(() => {
+  if (offline.value) return "—";
+  const n = totalNum.value;
+  const noun = (count: number) => `book${count === 1 ? "" : "s"}`;
+  const filtered = activeFilters({ query: activeQuery.value, virtualLibrary: vl.value, showMarkedOnly: showMarkedOnly.value }).length > 0;
+  if (filtered && libraryTotal.value !== null && libraryTotal.value !== n) return `${n.toLocaleString()} of ${libraryTotal.value.toLocaleString()} books`;
+  return `${n.toLocaleString()} ${noun(n)}`;
+});
+
+/**
+ * "Skip to book list": from the first Tab stop straight to the current row, past the
+ * toolbar's dozen buttons and the whole category tree.
+ */
+function skipToList() {
+  const root = document.getElementById("book-list");
+  const target = root?.querySelector<HTMLElement>('tr[tabindex="0"]') ?? root?.querySelector<HTMLElement>(".table-scroll, .book-card") ?? root;
+  target?.focus({ preventScroll: true });
+}
+
 /** One click removes one filter. */
 function clearFilter(id: ActiveFilter["id"]) {
   if (id === "search" || id === "folder") {
@@ -1493,7 +1626,7 @@ async function pickRandomBook() {
     const id = all.book_ids[Math.floor(Math.random() * all.book_ids.length)];
     selectedBookId.value = id;
   } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e);
+    error.value = humanError(e);
   }
 }
 
@@ -1514,6 +1647,7 @@ const helpOpen = ref(false);
 
 <template>
   <div class="library">
+    <a class="skip-link" href="#book-list" @click.prevent="skipToList">Skip to book list</a>
     <header class="toolbar">
       <div class="toolbar-row toolbar-actions">
       <!--
@@ -1533,8 +1667,11 @@ const helpOpen = ref(false);
           :disabled="itemDisabled(item)"
           :active="itemActive(item)"
           :title="itemTitle(item)"
-          @run="onItemRun(item)"
-          @menu="onItemMenu(item, $event)"
+          :menu-label="itemMenuLabel(item)"
+          :expanded="itemExpanded(itemKey(item, i))"
+          :body-opens-menu="item.kind === 'menu' || item.kind === 'overflow'"
+          @run="onItemRun(item, $event, itemKey(item, i))"
+          @menu="onItemMenu(item, $event, itemKey(item, i))"
         />
       </template>
 
@@ -1565,11 +1702,14 @@ const helpOpen = ref(false);
         compact
         has-menu
         :title="`Virtual library: ${vlLabel}`"
-        @run="vlMenu = { x: 0, y: 0 }"
+        menu-label="Virtual library options"
+        :expanded="vlMenu !== null"
+        body-opens-menu
+        @run="vlMenu = $event"
         @menu="vlMenu = $event"
       />
       <span class="vl-name" :class="{ active: vl !== '' }">{{ vlLabel }}</span>
-      <button v-if="vl !== ''" type="button" class="vl-clear" title="Show all books again" @click="vl = ''">✕</button>
+      <button v-if="vl !== ''" type="button" class="vl-clear" title="Show all books again" aria-label="Show all books again" @click="vl = ''">✕</button>
 
       <!--
         The search field owns its own mode. Full-text search used to be
@@ -1583,13 +1723,14 @@ const helpOpen = ref(false);
           :class="{ active: ftsMode }"
           :aria-pressed="ftsMode"
           :title="ftsMode ? 'Searching inside books — click for metadata search' : 'Search inside book text'"
+          :aria-label="ftsMode ? 'Search inside books (on)' : 'Search inside books'"
           @click="ftsMode = !ftsMode"
         >
           <AppIcon name="fts" :size="15" class="in-field-icon" />
         </button>
-        <input ref="searchInput" v-model="queryText" type="search" :placeholder="ftsMode ? 'Search book contents…' : 'Search…'" />
-        <button v-if="queryText" type="button" class="in-field" title="Clear" @click="queryText = ''; submitSearch()">✕</button>
-        <button type="submit" class="search-go" title="Search">
+        <input ref="searchInput" v-model="queryText" type="search" :aria-label="ftsMode ? 'Search inside books' : 'Search library'" :placeholder="ftsMode ? 'Search book contents…' : 'Search…'" />
+        <button v-if="queryText" type="button" class="in-field" title="Clear search" aria-label="Clear search" @click="queryText = ''; submitSearch()">✕</button>
+        <button type="submit" class="search-go" title="Search" aria-label="Search">
           <AppIcon name="search" :size="15" class="in-field-icon" />
         </button>
       </form>
@@ -1605,7 +1746,10 @@ const helpOpen = ref(false);
           compact
           has-menu
           :title="`Sorted by ${sortSummary}`"
-          @run="openSortMenu({ x: 0, y: 0 })"
+          menu-label="Sort options"
+          :expanded="sortMenu !== null"
+          body-opens-menu
+          @run="openSortMenu($event)"
           @menu="openSortMenu($event)"
         />
         <ToolbarButton
@@ -1614,7 +1758,10 @@ const helpOpen = ref(false);
           compact
           has-menu
           title="Saved searches"
-          @run="savedMenu = { x: 0, y: 0 }"
+          menu-label="Saved searches"
+          :expanded="savedMenu !== null"
+          body-opens-menu
+          @run="savedMenu = $event"
           @menu="savedMenu = $event"
         />
         <div class="view-toggle" role="group" aria-label="Library view">
@@ -1678,15 +1825,15 @@ const helpOpen = ref(false);
       <button v-if="!resumeBusy" type="button" @click="interruptedJob = null">Dismiss</button>
     </div>
 
-    <BulkEditPanel v-if="bulk.open" :bulk="bulk" :count="selectedIds.size" />
+    <p v-if="actionNotice" class="status action-notice" role="status">{{ actionNotice }}</p>
+    <p v-if="addError" class="error add-error" role="alert">{{ addError }}</p>
+    <p v-if="addSummary" class="status add-summary" role="status">{{ addSummary }}</p>
 
-    <p v-if="addError" class="error add-error">{{ addError }}</p>
-    <p v-if="addSummary" class="status add-summary">{{ addSummary }}</p>
-
-    <div class="body">
-      <template v-if="sidebarVisible">
-        <CategoryBrowser class="sidebar" :style="{ width: sidebarWidth + 'px' }" :selected-ids="renameScope" :refresh-key="categoriesRefresh" @select="onCategorySelect" @view-note="openNote" @renamed="onCategoryRenamed" @folders-changed="onFoldersChanged" />
+    <div class="body" :class="{ 'body-narrow': narrow }">
+      <template v-if="sidebarShown">
+        <CategoryBrowser class="sidebar" :class="{ 'sidebar-drawer': narrow }" :style="{ width: sidebarWidth + 'px' }" :selected-ids="renameScope" :refresh-key="categoriesRefresh" @select="onCategorySelect" @view-note="openNote" @renamed="onCategoryRenamed" @folders-changed="onFoldersChanged" />
         <div
+          v-if="!narrow"
           class="splitter"
           role="separator"
           aria-orientation="vertical"
@@ -1729,8 +1876,8 @@ const helpOpen = ref(false);
         </template>
       </main>
 
-      <main v-else class="grid-area">
-        <div v-if="emptyKind === 'error'" class="empty-state" data-testid="empty-error">
+      <main v-else id="book-list" class="grid-area" aria-label="Books" tabindex="-1">
+        <div v-if="emptyKind === 'error'" class="empty-state" data-testid="empty-error" role="alert">
           <p class="error">{{ error }}</p>
           <div class="empty-actions"><button type="button" class="primary" data-testid="empty-retry" @click="retryLoad">Retry</button></div>
         </div>
@@ -1743,20 +1890,20 @@ const helpOpen = ref(false);
             <button type="button" data-testid="empty-add-folder" @click="runAction('add-folder')">Add folder…</button>
           </div>
         </div>
-        <div v-else-if="emptyKind === 'no-results'" class="empty-state" data-testid="empty-results">
-          <h3>No books match</h3>
-          <p class="hint">These are hiding every book:</p>
+        <div v-else-if="emptyKind === 'no-results'" class="empty-state" data-testid="empty-results" role="status">
+          <h3>No books match your search</h3>
+          <p class="hint">{{ emptyFilters.length > 1 ? "These filters are hiding every book:" : "This is hiding every book:" }}</p>
           <ul class="filter-chips">
             <li v-for="f in emptyFilters" :key="f.id" class="filter-chip" :data-filter="f.id">
               <span>{{ f.label }}</span>
               <button type="button" :aria-label="`Clear ${f.label}`" :title="`Clear ${f.label}`" @click="clearFilter(f.id)">✕</button>
             </li>
           </ul>
-          <div v-if="emptyFilters.length > 1" class="empty-actions"><button type="button" data-testid="empty-clear-all" @click="clearAllFilters">Clear all</button></div>
+          <div class="empty-actions"><button type="button" class="primary" data-testid="empty-clear-all" @click="clearAllFilters">{{ emptyFilters.length > 1 ? "Clear all filters" : "Clear search" }}</button></div>
         </div>
 
         <BookTable
-          v-if="viewMode === 'table'"
+          v-if="viewMode === 'table' && showList"
           ref="tableRef"
           :ids="win.ids.value"
           :get-book="win.getById"
@@ -1782,7 +1929,7 @@ const helpOpen = ref(false);
         />
 
         <BookGrid
-          v-else
+          v-else-if="viewMode === 'grid' && showList"
           ref="gridRef"
           :ids="win.ids.value"
           :get-book="win.getById"
@@ -1801,25 +1948,34 @@ const helpOpen = ref(false);
       </main>
 
       <!--
+        Bulk edit takes the details panel's place instead of opening above the
+        whole window, which pushed the sidebar and the list 140px down and back up.
+      -->
+      <aside v-if="bulk.open" class="details-column bulk-dock" :class="{ 'details-drawer': narrow }" aria-label="Bulk edit" :style="narrow ? undefined : { width: Math.max(detailsWidth, 400) + 'px' }">
+        <BulkEditPanel :bulk="bulk" :count="selectedIds.size" />
+      </aside>
+
+      <!--
         Docked, not overlaid: calibre keeps details beside the list so
         arrowing down the rows updates them continuously. As a modal it
         covered the very list it describes.
       -->
-      <template v-if="detailsVisible && selectedBookId !== null">
+      <template v-if="detailsShown && selectedBookId !== null && !offline && !bulk.open">
         <div
+          v-if="!narrow"
           class="splitter"
           role="separator"
           aria-orientation="vertical"
           title="Drag to resize"
           @pointerdown="startResize('details', $event)"
         ></div>
-        <aside class="details-column" :style="{ width: detailsWidth + 'px' }">
+        <aside class="details-column" :class="{ 'details-drawer': narrow }" aria-label="Book details" :style="narrow ? undefined : { width: detailsWidth + 'px' }">
           <BookDetailsPanel
             :book-id="selectedBookId"
             :pending-action="pendingBookAction"
             :refresh-key="detailsRefresh"
             docked
-            @close="detailsVisible = false"
+            @close="setPanel('details', false)"
             @updated="onDetailsUpdated"
             @deleted="onDetailsDeleted"
             @open-book="selectedBookId = $event"
@@ -1849,7 +2005,7 @@ const helpOpen = ref(false);
       >
         📚 {{ libraryName }}
       </button>
-      <span class="status-count">{{ totalNum.toLocaleString() }} book<span v-if="totalNum !== 1">s</span></span>
+      <span class="status-count" role="status" aria-live="polite">{{ countText }}</span>
       <span v-if="totalNum > 0 && renderedRange.last > renderedRange.first" class="status-sort status-rows" title="Rows currently loaded around the viewport">rows {{ (renderedRange.first + 1).toLocaleString() }}–{{ renderedRange.last.toLocaleString() }}</span>
       <button v-if="selectMode && totalNum > 0" type="button" class="status-toggle" title="Select every matching book" @click="selectAll">Select all {{ totalNum.toLocaleString() }}</button>
       <span v-if="draftCount > 0" class="status-sel status-draft" data-testid="draft-count" title="Edits in the details panel that were not saved">{{ draftCount }} unsaved {{ draftCount === 1 ? "draft" : "drafts" }}</span>
@@ -1857,8 +2013,8 @@ const helpOpen = ref(false);
       <span v-if="markedIds.size > 0" class="status-sel">{{ markedIds.size }} marked</span>
       <span class="status-spacer"></span>
       <span class="status-sort">Sorted by {{ sortSummary }}</span>
-      <button type="button" class="status-toggle" :class="{ active: sidebarVisible }" :aria-pressed="sidebarVisible" title="Show or hide the category browser" @click="sidebarVisible = !sidebarVisible">Categories</button>
-      <button type="button" class="status-toggle" :class="{ active: detailsVisible }" :aria-pressed="detailsVisible" title="Show or hide book details" @click="detailsVisible = !detailsVisible">Details</button>
+      <button type="button" class="status-toggle" :class="{ active: sidebarShown }" :aria-pressed="sidebarShown" title="Show or hide the category browser" @click="togglePanel('sidebar')">Categories</button>
+      <button type="button" class="status-toggle" :class="{ active: detailsShown }" :aria-pressed="detailsShown" title="Show or hide book details" @click="togglePanel('details')">Details</button>
     </footer>
 
     <ImportDuplicatesDialog v-if="importDupes" :duplicates="importDupes" :busy="importDupesBusy" @resolve="resolveImportDupes" />
@@ -1912,10 +2068,10 @@ const helpOpen = ref(false);
 
     <ResolveDialog v-if="duplicatesOpen && resolveOpen" :store="dupStore" :controller="resolveController" @close="resolveOpen = false" @changed="onDuplicatesChanged" />
     <CompareDuplicates v-if="compareController.state.open" :controller="compareController" @close="compareController.close()" />
-    <MirrorDialog v-if="mirrorOpen" :controller="mirrorController" :selected-ids="organizeSelection" @close="mirrorOpen = false" />
+    <MirrorDialog v-if="mirrorOpen" :controller="mirrorController" :selected-ids="organizeSelection" :search-ids="searchScopeIds" :search-active="searchScopeActive" @close="mirrorOpen = false" />
     <NamingDialog v-if="namingOpen" :controller="namingController" :sample-ids="namingSampleIds" :selected-count="organizeSelection.length" @close="namingOpen = false" @apply="applyNaming" />
-    <OrganizeDialog v-if="organizeOpen" :controller="organizeController" :selected-ids="organizeSelection" @close="organizeOpen = false" @changed="onDuplicatesChanged" />
-    <RetitleDialog v-if="retitleOpen" :controller="retitleController" :selected-ids="retitleSelection" @close="retitleOpen = false" @changed="onRetitleChanged" />
+    <OrganizeDialog v-if="organizeOpen" :controller="organizeController" :selected-ids="organizeSelection" :search-ids="searchScopeIds" :search-active="searchScopeActive" @close="organizeOpen = false" @changed="onDuplicatesChanged" />
+    <RetitleDialog v-if="retitleOpen" :controller="retitleController" :selected-ids="retitleSelection" :search-ids="searchScopeIds" :search-active="searchScopeActive" @close="retitleOpen = false" @changed="onRetitleChanged" />
 
     <MergeBooksDialog v-if="mergeOpen" :books="mergeBooksList" :dest="mergeDest" @close="mergeOpen = false" @merged="onMerged" />
 
@@ -2276,9 +2432,57 @@ const helpOpen = ref(false);
   display: none;
 }
 .toolbar button.active {
-  background: var(--accent);
+  background: var(--accent-solid);
   color: var(--fg-on-accent);
-  border-color: var(--accent);
+  border-color: var(--accent-solid);
+}
+/* Reachable by keyboard only: the first Tab stop, jumping past the toolbar and the category tree. */
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  z-index: var(--z-popover);
+  padding: var(--sp-3) var(--sp-5);
+  background: var(--bg-raised);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+}
+.skip-link:focus {
+  left: var(--sp-4);
+  top: var(--sp-4);
+}
+.action-notice {
+  margin: 0;
+  padding: var(--sp-2) var(--sp-4);
+  background: var(--accent-soft);
+  border-bottom: 1px solid var(--border);
+}
+/* In a narrow window the side panels do not share the row with the list: each opens as a
+   drawer over it, from the status bar's Categories / Details buttons. */
+.body {
+  position: relative;
+}
+.sidebar-drawer,
+.details-drawer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: var(--z-popover);
+  background: var(--bg);
+  box-shadow: var(--shadow-menu);
+  max-width: 92vw;
+}
+.sidebar-drawer {
+  left: 0;
+  max-width: 85vw;
+}
+.details-drawer {
+  right: 0;
+  width: min(400px, 92vw);
+}
+.bulk-dock {
+  overflow: auto;
+  background: var(--bg-sunken);
 }
 .settings-link {
   padding: 0.35em 0.7em;

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import { isTypingTarget, shortcutFor, type ShortcutMap, isModalOpen } from "./shortcuts";
+import { formatKey, isTypingTarget, shortcutFor, shortcutHint, type ShortcutMap, isModalOpen } from "./shortcuts";
+import { LIBRARY_ACTIONS } from "./actions";
 import { DEFAULT_KEYMAP, libraryShortcuts } from "../settings/api";
 
 const MAP: ShortcutMap = { "add-books": "a", "focus-search": "/", "save-to-disk": "S", "delete-book": "Delete" };
@@ -127,5 +128,71 @@ describe("isModalOpen", () => {
     expect(isModalOpen(host)).toBe(true);
     host.innerHTML = '<div role="dialog" aria-modal="false"></div><aside></aside>';
     expect(isModalOpen(host)).toBe(false);
+  });
+});
+
+describe("Enter and Space", () => {
+  const MAP_ENTER: ShortcutMap = { read: "Enter", "select-mode": " " };
+
+  it("opens the book from a table row or from nothing in particular", () => {
+    expect(shortcutFor(key("Enter", { target: el("tr", { role: "row" }) }), MAP_ENTER)).toBe("read");
+    expect(shortcutFor(key("Enter"), MAP_ENTER)).toBe("read");
+  });
+
+  // Enter on a focused toolbar button presses the button; a binding on Enter must not
+  // turn every toolbar click-by-keyboard into "read the open book".
+  it("leaves Enter and Space to a focused button, link or menu item", () => {
+    for (const target of [el("button"), el("a", { href: "#" }), el("div", { role: "menuitem" }), el("div", { role: "button" })]) {
+      expect(shortcutFor(key("Enter", { target }), MAP_ENTER)).toBeNull();
+      expect(shortcutFor(key(" ", { target }), MAP_ENTER)).toBeNull();
+    }
+  });
+
+  it("still leaves Enter to a text box (an open cell editor, the search box)", () => {
+    expect(shortcutFor(key("Enter", { target: el("input") }), MAP_ENTER)).toBeNull();
+  });
+
+  it("only guards Enter and Space: a letter bound while a button has focus still fires", () => {
+    expect(shortcutFor(key("a", { target: el("button") }), MAP)).toBe("add-books");
+  });
+});
+
+describe("shortcut hints", () => {
+  it("writes a key the way a keycap shows it", () => {
+    expect(formatKey("d")).toBe("D");
+    expect(formatKey("S")).toBe("Shift+S");
+    expect(formatKey("Delete")).toBe("Del");
+    expect(formatKey(" ")).toBe("Space");
+    expect(formatKey("Enter")).toBe("Enter");
+    expect(formatKey("/")).toBe("/");
+    expect(formatKey("")).toBe("");
+  });
+
+  // The tooltips used to carry text written beside each action: "Edit metadata (E)" for a key that
+  // opened Bulk edit, "Add books (Ctrl+A)" for a chord nothing handled.
+  it("is read from the keymap in force, so a rebinding shows and an unbound action shows nothing", () => {
+    const map = libraryShortcuts(DEFAULT_KEYMAP);
+    expect(shortcutHint("find-duplicates", map)).toBe("D");
+    expect(shortcutHint("edit-metadata", map)).toBe("E");
+    expect(shortcutHint("bulk-edit", map)).toBe("Shift+E");
+    expect(shortcutHint("read", map)).toBe("Enter");
+    expect(shortcutHint("find-duplicates", { ...map, "find-duplicates": "g" })).toBe("G");
+    expect(shortcutHint("organize-files", map)).toBeNull();
+  });
+
+  it("agrees with what pressing the key does, for every default binding", () => {
+    const map = libraryShortcuts(DEFAULT_KEYMAP);
+    for (const [id, binding] of Object.entries(map)) {
+      expect(shortcutFor(key(binding!), map), `${id}: its hint says ${shortcutHint(id as never, map)}`).toBe(id);
+    }
+  });
+
+  it("is not written beside the actions any more: no Ctrl chord appears in the registry", () => {
+    for (const a of LIBRARY_ACTIONS) expect((a as { accel?: string }).accel, a.id).toBeUndefined();
+  });
+
+  it("binds Enter to Read and e to Edit metadata", () => {
+    expect(DEFAULT_KEYMAP.read).toBe("Enter");
+    expect(DEFAULT_KEYMAP["edit-metadata"]).toBe("e");
   });
 });

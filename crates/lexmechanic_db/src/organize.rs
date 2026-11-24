@@ -294,6 +294,175 @@ fn passes_through_link(library: &Path, rel: &str) -> bool {
     false
 }
 
+/// What a plan needs to know about the disk, answered from one directory
+/// listing per folder instead of one `stat` per file.
+///
+/// Planning asks "is this source file there?" for every format of every book
+/// and "is this target taken?" for every candidate name. On a share each of
+/// those is a round trip; a folder listing answers all the questions about
+/// that folder at once. Listings are read the first time a folder is asked
+/// about and kept for the plan (a plan changes nothing on disk, and
+/// [`execute`] re-checks as it moves: it never replaces an existing file).
+///
+/// Names are matched the way the platform's file system does: ignoring case on
+/// Windows and macOS, exactly elsewhere.
+struct DiskView {
+    library: std::path::PathBuf,
+    fold: bool,
+    dirs: std::collections::HashMap<String, Listing>,
+    links: std::collections::HashMap<String, LinkState>,
+}
+
+enum Listing {
+    /// The folder does not exist (or is not a folder): nothing is in it.
+    Absent,
+    /// It could not be listed; ask the file system about each name instead.
+    Unreadable,
+    Entries(std::collections::HashMap<String, EntryKind>),
+}
+
+#[derive(Clone, Copy)]
+enum EntryKind {
+    File,
+    Dir,
+    /// A symlink: only the file system knows what it points at.
+    Link,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LinkState {
+    Link,
+    Plain,
+    Missing,
+}
+
+impl DiskView {
+    fn new(library: &Path) -> Self {
+        DiskView { library: library.to_path_buf(), fold: cfg!(windows) || cfg!(target_os = "macos"), dirs: Default::default(), links: Default::default() }
+    }
+
+    fn fold_name(&self, name: &str) -> String {
+        if self.fold {
+            name.to_lowercase()
+        } else {
+            name.to_string()
+        }
+    }
+
+    fn split(rel: &str) -> (&str, &str) {
+        match rel.rfind('/') {
+            Some(i) => (&rel[..i], &rel[i + 1..]),
+            None => ("", rel),
+        }
+    }
+
+    /// The entry named by `rel` (a `/`-separated path under the library), as
+    /// the folder listing has it. `Err(())`: the folder could not be listed.
+    fn entry(&mut self, rel: &str) -> std::result::Result<Option<EntryKind>, ()> {
+        let (dir, name) = Self::split(rel);
+        let dir_key = if self.fold { dir.to_lowercase() } else { dir.to_string() };
+        if !self.dirs.contains_key(&dir_key) {
+            // A folder its parent's listing does not have is not there: no need to ask for it.
+            let absent_by_parent = !dir.is_empty() && matches!(self.entry(dir), Ok(None));
+            let listing = if absent_by_parent {
+                Listing::Absent
+            } else {
+                match std::fs::read_dir(self.library.join(dir)) {
+                Ok(rd) => {
+                    let mut map = std::collections::HashMap::new();
+                    let mut failed = false;
+                    for e in rd {
+                        let Ok(e) = e else {
+                            failed = true;
+                            break;
+                        };
+                        let Ok(ft) = e.file_type() else {
+                            failed = true;
+                            break;
+                        };
+                        let kind = if ft.is_symlink() {
+                            EntryKind::Link
+                        } else if ft.is_dir() {
+                            EntryKind::Dir
+                        } else {
+                            EntryKind::File
+                        };
+                        map.insert(self.fold_name(&e.file_name().to_string_lossy()), kind);
+                    }
+                    if failed {
+                        Listing::Unreadable
+                    } else {
+                        Listing::Entries(map)
+                    }
+                }
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => Listing::Absent,
+                Err(_) => Listing::Unreadable,
+                }
+            };
+            self.dirs.insert(dir_key.clone(), listing);
+        }
+        match &self.dirs[&dir_key] {
+            Listing::Absent => Ok(None),
+            Listing::Unreadable => Err(()),
+            Listing::Entries(map) => Ok(map.get(&self.fold_name(name)).copied()),
+        }
+    }
+
+    /// `library/rel` is a file (a symlink counts when it points at one).
+    fn is_file(&mut self, rel: &str) -> bool {
+        match self.entry(rel) {
+            Ok(Some(EntryKind::File)) => true,
+            Ok(Some(EntryKind::Dir)) | Ok(None) => false,
+            Ok(Some(EntryKind::Link)) | Err(()) => self.library.join(rel).is_file(),
+        }
+    }
+
+    /// `library/rel` exists (a broken symlink does not).
+    fn exists(&mut self, rel: &str) -> bool {
+        match self.entry(rel) {
+            Ok(Some(EntryKind::File)) | Ok(Some(EntryKind::Dir)) => true,
+            Ok(None) => false,
+            Ok(Some(EntryKind::Link)) | Err(()) => self.library.join(rel).exists(),
+        }
+    }
+
+    /// [`passes_through_link`], remembering what each path prefix was.
+    fn passes_through_link(&mut self, rel: &str) -> bool {
+        let mut prefix = String::new();
+        for part in rel.split('/').filter(|p| !p.is_empty()) {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(part);
+            let state = match self.links.get(&prefix) {
+                Some(s) => *s,
+                None => {
+                    // From the folder's listing (one read per folder) rather than
+                    // an `lstat` per path; only an unreadable folder is asked about.
+                    let s = match self.entry(&prefix) {
+                        Ok(Some(EntryKind::Link)) => LinkState::Link,
+                        Ok(Some(_)) => LinkState::Plain,
+                        Ok(None) => LinkState::Missing,
+                        Err(()) => match std::fs::symlink_metadata(self.library.join(&prefix)) {
+                            Ok(m) if m.file_type().is_symlink() => LinkState::Link,
+                            Ok(_) => LinkState::Plain,
+                            Err(_) => LinkState::Missing,
+                        },
+                    };
+                    self.links.insert(prefix.clone(), s);
+                    s
+                }
+            };
+            match state {
+                LinkState::Link => return true,
+                LinkState::Plain => {}
+                LinkState::Missing => break,
+            }
+        }
+        false
+    }
+}
+
 /// The dry run: what [`execute`] would do. Changes nothing.
 pub fn plan(cache: &Cache, template: &str, scope: &Scope) -> Result<OrganizePlan> {
     plan_to(cache, Target::Template(template), scope)
@@ -316,6 +485,8 @@ pub fn plan_to(cache: &Cache, target: Target<'_>, scope: &Scope) -> Result<Organ
     let mut skipped = Vec::new();
     let mut warnings = Vec::new();
     let mut already = 0usize;
+    // Folder listings and link checks, read once per folder for the whole plan.
+    let mut disk = DiskView::new(library);
     // Destination folders already checked for a link out of the library.
     let mut link_checked: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     // Lower-cased relative targets taken by earlier books in this plan.
@@ -354,7 +525,15 @@ pub fn plan_to(cache: &Cache, target: Target<'_>, scope: &Scope) -> Result<Organ
         };
         // Every kind of target, not just a typed-in folder: a template can render
         // into a folder that is a symlink or junction to somewhere else.
-        if *link_checked.entry(new_path.clone()).or_insert_with(|| passes_through_link(library, &new_path)) {
+        let linked = match link_checked.get(&new_path) {
+            Some(l) => *l,
+            None => {
+                let l = disk.passes_through_link(&new_path);
+                link_checked.insert(new_path.clone(), l);
+                l
+            }
+        };
+        if linked {
             skipped.push(Skipped { book_id, reason: format!("the folder {new_path} goes through a link out of the library") });
             continue;
         }
@@ -371,7 +550,7 @@ pub fn plan_to(cache: &Cache, target: Target<'_>, scope: &Scope) -> Result<Organ
         let mut current: Vec<(String, String, String, String)> = Vec::new(); // (FORMAT, old stem, ext, from rel)
         let mut missing = None;
         for (name, format) in &formats {
-            let found = [format.to_lowercase(), format.to_uppercase()].into_iter().find(|ext| library.join(join_rel(&old_path, &format!("{name}.{ext}"))).is_file());
+            let found = [format.to_lowercase(), format.to_uppercase()].into_iter().find(|ext| disk.is_file(&join_rel(&old_path, &format!("{name}.{ext}"))));
             match found {
                 Some(ext) => current.push((format.to_uppercase(), name.clone(), ext.clone(), join_rel(&old_path, &format!("{name}.{ext}")))),
                 None => {
@@ -391,7 +570,7 @@ pub fn plan_to(cache: &Cache, target: Target<'_>, scope: &Scope) -> Result<Organ
             let ok = current.iter().all(|(_, old_stem, ext, from)| {
                 let to = join_rel(&new_path, &format!("{}.{ext}", stem_for(old_stem, n)));
                 let (to_l, from_l) = (lexmechanic_utils::filenames::path_key(&to), lexmechanic_utils::filenames::path_key(from));
-                to_l == from_l || (!taken.contains(&to_l) && !library.join(&to).exists())
+                to_l == from_l || (!taken.contains(&to_l) && !disk.exists(&to))
             });
             if ok {
                 chosen = Some((n, n > 0));
@@ -926,6 +1105,96 @@ mod tests {
         names.sort();
         assert_eq!(names.len(), 3, "{names:?}");
         assert_eq!(std::fs::read(dir.path().join("Sorted/Same.pdf")).unwrap(), b"%PDF already here", "the file that was there is untouched");
+    }
+
+    /// The directory-listing view must answer what `is_file()`/`exists()` on the
+    /// real path would: files, folders, missing names, names in a missing folder,
+    /// names that differ only in case, and the root.
+    #[test]
+    fn the_disk_view_answers_like_the_file_system() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("a/b/Book.pdf"), b"x");
+        write(&dir.path().join("a/b/Other.PDF"), b"x");
+        write(&dir.path().join("Root.epub"), b"x");
+        std::fs::create_dir_all(dir.path().join("a/b/Sub.pdf")).unwrap();
+        let mut view = DiskView::new(dir.path());
+        for rel in [
+            "a/b/Book.pdf",
+            "a/b/book.pdf",
+            "A/B/BOOK.PDF",
+            "a/b/Other.PDF",
+            "a/b/other.pdf",
+            "a/b/Sub.pdf",
+            "a/b/Missing.pdf",
+            "a/b",
+            "a",
+            "nope/Book.pdf",
+            "nope/deeper/Book.pdf",
+            "Root.epub",
+            "root.EPUB",
+            "Missing.epub",
+            "a/b/Book.pdf/inside",
+        ] {
+            // Asked twice: the second answer comes from the remembered listing.
+            for _ in 0..2 {
+                assert_eq!(view.is_file(rel), dir.path().join(rel).is_file(), "is_file({rel})");
+                assert_eq!(view.exists(rel), dir.path().join(rel).exists(), "exists({rel})");
+            }
+        }
+    }
+
+    #[test]
+    fn the_disk_view_remembers_link_checks_per_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("real/inner")).unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        // A symlink needs a privilege on some systems; where it cannot be made, only the plain cases run.
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(elsewhere.path(), dir.path().join("link")).is_ok();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(elsewhere.path(), dir.path().join("link")).is_ok();
+        #[cfg(not(any(unix, windows)))]
+        let linked = false;
+        let mut view = DiskView::new(dir.path());
+        for rel in ["real", "real/inner", "real/inner/new", "missing/deeper", "", "link", "link/inner", "link/inner/deeper"] {
+            assert_eq!(view.passes_through_link(rel), passes_through_link(dir.path(), rel), "{rel} (symlink made: {linked})");
+        }
+        if linked {
+            assert!(view.passes_through_link("link/inner"));
+        }
+    }
+
+    /// Many books into one target folder, with files already there (one differing
+    /// only in case from a target): every target is free or suffixed, nothing
+    /// planned lands on an existing file, and the plan is stable.
+    #[test]
+    fn a_big_plan_avoids_every_existing_file_and_every_other_target() {
+        let (dir, cache) = library();
+        for i in 0..40 {
+            write(&dir.path().join(format!("in{i}/Same.pdf")), format!("%PDF {i}").as_bytes());
+        }
+        for i in 0..40 {
+            write(&dir.path().join(format!("in{}/Other{i}.pdf", i % 4)), format!("%PDF o{i}").as_bytes());
+        }
+        write(&dir.path().join("Sorted/Same.pdf"), b"%PDF already here");
+        write(&dir.path().join("Sorted/other3.PDF"), b"%PDF already here too");
+        index(dir.path(), &cache);
+
+        let first = plan(&cache, "Sorted/{title}", &Scope::All).unwrap();
+        assert_eq!(first.fingerprint, plan(&cache, "Sorted/{title}", &Scope::All).unwrap().fingerprint);
+        let mut taken: HashSet<String> = HashSet::new();
+        for file in first.books.iter().flat_map(|b| b.files.iter()) {
+            let key = lexmechanic_utils::filenames::path_key(&file.to);
+            assert!(taken.insert(key), "two planned moves to {}", file.to);
+            // Whatever the platform's file system calls "the same name" is not planned over.
+            if dir.path().join(&file.to).exists() {
+                assert_eq!(file.to, file.from, "{} already exists and is not the book's own", file.to);
+            }
+        }
+        assert!(first.conflicts() >= 40, "all the `Same` books but one, and the case-clash, are numbered: {}", first.conflicts());
+        let report = execute(&cache, &first, &JobControl::new()).unwrap();
+        assert_eq!(report.failed.len(), 0, "{report:?}");
+        assert_eq!(std::fs::read(dir.path().join("Sorted/Same.pdf")).unwrap(), b"%PDF already here");
     }
 
     #[test]

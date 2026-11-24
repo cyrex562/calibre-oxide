@@ -24,7 +24,7 @@ export type RetitleApi = Pick<typeof realApi, "suggestRetitles" | "runRetitle" |
 export const DEFAULT_RETITLE_TEMPLATE = "{title}";
 export const RETITLE_PAGE_SIZE = 200;
 
-export type RetitleScopeKind = "all" | "selected";
+export type RetitleScopeKind = "all" | "selected" | "search";
 export type RetitleFilter = "all" | RetitleReason;
 export type RetitlePhase = "idle" | "finding" | "ready" | "running" | "done";
 
@@ -75,8 +75,9 @@ export const REASON_LABEL: Record<RetitleReason, string> = {
   no_suggestion: "Needs a title",
 };
 
+/** `ids` are the selection for "selected" and the current search's books for "search". */
 export function scopeFor(kind: RetitleScopeKind, selectedIds: number[]): RetitleScope {
-  return kind === "selected" ? { bookIds: [...selectedIds] } : { all: true };
+  return kind === "selected" || kind === "search" ? { bookIds: [...selectedIds] } : { all: true };
 }
 
 export function visibleRows(rows: RetitleRowState[], filter: RetitleFilter): RetitleRowState[] {
@@ -166,7 +167,9 @@ export function describeUndo(r: RetitleUndoReport): string {
 export function createRetitleController(api: RetitleApi = realApi) {
   const state = reactive({
     scope: "all" as RetitleScopeKind,
-    embed: true,
+    // Off by default: writing the title into a file changes its bytes, so its hash,
+    // and so no longer matches the copy on the NAS or an identical-files duplicate check.
+    embed: false,
     renameFiles: true,
     renameTemplate: DEFAULT_RETITLE_TEMPLATE,
     phase: "idle" as RetitlePhase,
@@ -185,6 +188,21 @@ export function createRetitleController(api: RetitleApi = realApi) {
     error: null as string | null,
     runs: [] as RetitleRun[],
   });
+
+  /** Changes which books are looked at; the rows found for the old scope no longer apply. */
+  function setScope(scope: RetitleScopeKind): void {
+    if (state.scope === scope) return;
+    state.scope = scope;
+    if (state.phase === "ready" || state.phase === "idle") {
+      state.phase = "idle";
+      state.rows = [];
+      state.serverTotal = 0;
+      state.truncated = false;
+      state.filter = "all";
+      state.page = 0;
+      state.error = null;
+    }
+  }
 
   /** Opens fresh. "selected" with nothing selected falls back to every book. */
   function open(scope: RetitleScopeKind): void {
@@ -244,6 +262,10 @@ export function createRetitleController(api: RetitleApi = realApi) {
   async function find(selectedIds: number[]): Promise<void> {
     if (state.scope === "selected" && selectedIds.length === 0) {
       state.error = "No books are selected.";
+      return;
+    }
+    if (state.scope === "search" && selectedIds.length === 0) {
+      state.error = "No books match the current search.";
       return;
     }
     state.phase = "finding";
@@ -329,7 +351,7 @@ export function createRetitleController(api: RetitleApi = realApi) {
     }
   }
 
-  return { state, open, find, apply, undo, loadRuns, pageRows, setFilter, setPage, setAllChecked, checkedCount, proposedIsStale, canApply };
+  return { state, open, setScope, find, apply, undo, loadRuns, pageRows, setFilter, setPage, setAllChecked, checkedCount, proposedIsStale, canApply };
 }
 
 export type RetitleController = ReturnType<typeof createRetitleController>;

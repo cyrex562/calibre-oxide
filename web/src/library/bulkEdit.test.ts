@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { applyListEdit, changesFor, InvalidPatternError, isEmptySpec, parseList, replaceIn, validateSpec, type BulkEditSpec } from "./bulkEdit";
+import { applyListEdit, changesFor, describeBulkResult, InvalidPatternError, inverseChanges, isEmptySpec, parseList, replaceIn, validateSpec, type BulkEditSpec } from "./bulkEdit";
 import type { BookSummary } from "./types";
 
 function book(overrides: Partial<BookSummary> = {}): BookSummary {
@@ -209,5 +209,43 @@ describe("isEmptySpec", () => {
     expect(isEmptySpec({ ...EMPTY, rating: 0 })).toBe(false);
     // "Replace with nothing" is a real edit: it clears the field.
     expect(isEmptySpec({ ...EMPTY, tags: { mode: "replace", value: "" } })).toBe(false);
+  });
+});
+
+describe("inverseChanges", () => {
+  it("holds the old value of exactly the fields written", () => {
+    const b = book({ series: "Dune", series_index: 2, rating: 4, comments: "old" });
+    const inverse = inverseChanges(b, { tags: ["x"], publisher: "New", series: "Other", series_index: 9, rating: 1, comments: "new" });
+    expect(inverse.changes).toEqual({ tags: ["focus", "SciFi"], publisher: "Acme", series: "Dune", series_index: 2, rating: 4, comments: "old" });
+    expect(inverse.lost).toEqual([]);
+  });
+
+  it("writes back empty for a field that had no value, where empty is a value the server takes", () => {
+    const inverse = inverseChanges(book({ series: null, series_index: null, rating: null, comments: null, publisher: undefined }), { series: "S", series_index: 3, rating: 5, comments: "c", publisher: "P" });
+    expect(inverse.changes).toEqual({ series: "", series_index: 1, rating: 0, comments: "", publisher: "" });
+  });
+
+  it("names the fields that cannot be unset instead of inventing a value", () => {
+    const inverse = inverseChanges(book({ pubdate: null, authors: [] }), { pubdate: "2020-01-01", authors: ["A"], shelf: "x" });
+    expect(inverse.changes).toEqual({});
+    expect(inverse.lost).toEqual(["pubdate", "authors", "shelf"]);
+  });
+
+  it("puts an old date back, but not the placeholder 'undefined' date", () => {
+    expect(inverseChanges(book({ pubdate: "2019-05-04T00:00:00+00:00" }), { pubdate: "2020-01-01" }).changes).toEqual({ pubdate: "2019-05-04" });
+    expect(inverseChanges(book({ pubdate: "0101-01-01T00:00:00+00:00" }), { pubdate: "2020-01-01" }).lost).toEqual(["pubdate"]);
+  });
+});
+
+describe("describeBulkResult", () => {
+  const spec = (over: Partial<BulkEditSpec>): BulkEditSpec => ({ ...EMPTY, ...over });
+  it("names a single added or removed tag", () => {
+    expect(describeBulkResult(spec({ tags: { mode: "add", value: "travel" } }), 5)).toBe("Added tag “travel” to 5 books");
+    expect(describeBulkResult(spec({ tags: { mode: "remove", value: "a, b" } }), 1)).toBe("Removed 2 tags from 1 book");
+  });
+  it("lists the fields otherwise", () => {
+    expect(describeBulkResult(spec({ publisher: "Acme", series: "S" }), 3)).toBe("Updated publisher and series on 3 books");
+    expect(describeBulkResult(spec({ tags: { mode: "replace", value: "x" } }), 2)).toBe("Updated tags on 2 books");
+    expect(describeBulkResult(spec({ publisher: "A", series: "B", comments: "C" }), 2)).toBe("Updated publisher, series and comments on 2 books");
   });
 });

@@ -4,6 +4,7 @@
 // Pure so the dirty / save / revert rules are tested directly.
 
 import { ref } from "vue";
+import { isUndefinedDate } from "./columns";
 import type { BookFieldChanges, BookSummary, FieldMetaEntry } from "./types";
 
 export interface MetaForm {
@@ -18,6 +19,13 @@ export interface MetaForm {
   comments: string;
   /** Custom column values keyed by the column's bare label, as strings. */
   custom: Record<string, string>;
+}
+
+function pubdateText(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const d = new Date(value);
+  if (!Number.isNaN(d.getTime()) && isUndefinedDate(d)) return "";
+  return value.slice(0, 10);
 }
 
 /** Fills the form from a book row. */
@@ -40,7 +48,8 @@ export function formFromBook(b: BookSummary, customFields: FieldMetaEntry[]): Me
     publisher: (b.publisher as string | null) ?? "",
     // The server sends an ISO timestamp; `<input type="date">` wants
     // just the date part and rejects the whole string.
-    pubdate: typeof b.pubdate === "string" ? b.pubdate.slice(0, 10) : "",
+    // calibre's "no date" (0101-01-01) is an empty field, not a date.
+    pubdate: pubdateText(b.pubdate),
     comments: (b.comments as string | null) ?? "",
     custom,
   };

@@ -16,9 +16,11 @@
 import { computed, reactive, ref, type Ref } from "vue";
 
 import type { BookSummary, FieldMetaEntry } from "./types";
-import { setFields, setFieldsBatch } from "./api";
+import { setFields, setFieldsBatch, setFieldsRelative } from "./api";
 import { runBulkEdit as runBatchedEdit, type BulkItem } from "./bulkBatch";
-import { changesFor, isEmptySpec, validateSpec, type BulkEditSpec } from "./bulkEdit";
+import { inverseRelativeOp, relativeTagOp, runRelativeEdit, type RelativeOp } from "./bulkRelative";
+import { changesFor, describeBulkResult, inverseChanges, isEmptySpec, validateSpec, type BulkEditSpec } from "./bulkEdit";
+import { showToast } from "./deleteFlow";
 
 export interface BulkEditDeps {
   selectedIds: Ref<Set<number>>;
@@ -46,7 +48,7 @@ export function emptySpec(): BulkEditSpec {
   };
 }
 
-export function useBulkEdit({ selectedIds, selectMode, fieldMetadata, win, onChanged }: BulkEditDeps) {
+export function useBulkEdit({ selectedIds, fieldMetadata, win, onChanged }: BulkEditDeps) {
   const open = ref(false);
   const busy = ref(false);
   const errors = ref<string[]>([]);
@@ -66,6 +68,60 @@ export function useBulkEdit({ selectedIds, selectMode, fieldMetadata, win, onCha
 
   /** Custom columns offered in the bulk panel, by their row key. */
   const customColumns = computed(() => Object.values(fieldMetadata.value).filter((f) => f.is_custom && f.label));
+
+  /**
+   * "Add tags" / "remove tags" alone: the server reads each book's tags, so none
+   * are fetched here (./bulkRelative.ts). False when the server cannot do it,
+   * and nothing was changed: the caller then edits the old way.
+   */
+  async function runRelative(ids: number[], op: RelativeOp, edit: BulkEditSpec): Promise<boolean> {
+    busy.value = true;
+    errors.value = [];
+    summary.value = null;
+    cancelled = false;
+    progress.value = { done: 0, total: ids.length };
+    const pool = await runRelativeEdit(ids, op, {
+      send: setFieldsRelative,
+      cancelled: () => cancelled,
+      onProgress: (done, total) => (progress.value = { done, total }),
+    });
+    busy.value = false;
+    progress.value = null;
+    if (!pool) return false;
+    errors.value.push(...pool.errors);
+    const stopped = pool.notStarted > 0 ? `, stopped with ${pool.notStarted} not started` : "";
+    summary.value = `Updated ${pool.updated} book(s)${pool.unchanged ? `, ${pool.unchanged} already matched` : ""}${errors.value.length ? `, ${errors.value.length} failed` : ""}${stopped}.`;
+    if (errors.value.length === 0 && pool.notStarted === 0) {
+      // The selection stays, as after any other bulk edit: a toast is the feedback.
+      open.value = false;
+      spec.value = emptySpec();
+      applyRating.value = false;
+      applySeriesIndex.value = false;
+    }
+    await onChanged();
+    if (pool.updated > 0) {
+      const message = describeBulkResult(edit, pool.updated);
+      const inverse = inverseRelativeOp(op);
+      const changedIds = pool.updatedIds;
+      if (!inverse) showToast(message, undefined, 15000);
+      else
+        showToast(
+          message,
+          {
+            label: "Undo",
+            run: async () => {
+              const back = await runRelativeEdit(changedIds, inverse, { send: setFieldsRelative });
+              await onChanged();
+              if (!back) throw new Error("The server could not undo this edit");
+              if (back.errors.length > 0) throw new Error(`Put back ${back.updated} of ${changedIds.length}: ${back.errors[0]}`);
+              return `Put back the tags on ${back.updated.toLocaleString("en-US")} ${back.updated === 1 ? "book" : "books"}`;
+            },
+          },
+          20000,
+        );
+    }
+    return true;
+  }
 
   async function run() {
     const ids = [...selectedIds.value];
@@ -88,6 +144,8 @@ export function useBulkEdit({ selectedIds, selectMode, fieldMetadata, win, onCha
       errors.value = ["Nothing to apply -- fill in at least one field."];
       return;
     }
+    const relative = relativeTagOp(edit);
+    if (relative && (await runRelative(ids, relative, edit))) return;
 
     busy.value = true;
     errors.value = [];
@@ -105,6 +163,9 @@ export function useBulkEdit({ selectedIds, selectMode, fieldMetadata, win, onCha
     cancelled = false;
     // What each book needs is worked out here, per book, before anything is sent.
     const items: BulkItem[] = [];
+    // What each written book held before, so the edit can be undone: the old value of exactly the fields written.
+    const before: BulkItem[] = [];
+    let lostFields = new Set<string>();
     for (const id of ids) {
       const current = win.getById(id);
       if (!current) {
@@ -113,8 +174,12 @@ export function useBulkEdit({ selectedIds, selectMode, fieldMetadata, win, onCha
       }
       try {
         const changes = changesFor(current, edit);
-        if (changes) items.push({ id, changes });
-        else skipped += 1;
+        if (changes) {
+          items.push({ id, changes });
+          const inverse = inverseChanges(current, changes);
+          if (Object.keys(inverse.changes).length > 0) before.push({ id, changes: inverse.changes });
+          lostFields = new Set([...lostFields, ...inverse.lost]);
+        } else skipped += 1;
       } catch (e) {
         errors.value.push(`Book ${id}: ${e instanceof Error ? e.message : String(e)}`);
       }
@@ -134,14 +199,41 @@ export function useBulkEdit({ selectedIds, selectMode, fieldMetadata, win, onCha
     summary.value = `Updated ${changed} book(s)${skipped ? `, ${skipped} already matched` : ""}${errors.value.length ? `, ${errors.value.length} failed` : ""}${stopped}.`;
 
     if (errors.value.length === 0 && pool.notStarted === 0) {
+      // The selection stays: the same books are often edited again (a tag, then a series), and a toast is the feedback.
       open.value = false;
-      selectMode.value = false;
-      selectedIds.value = new Set();
       spec.value = emptySpec();
       applyRating.value = false;
       applySeriesIndex.value = false;
     }
     await onChanged();
+    if (changed > 0) announce(describeBulkResult(edit, changed), before, pool.errors, lostFields);
+  }
+
+  /**
+   * The toast after an edit: what was done, with an Undo that writes the old
+   * values back through the same batch route. Books that failed are left out.
+   */
+  function announce(message: string, before: BulkItem[], failures: string[], lost: Set<string>) {
+    const failed = new Set(failures.map((f) => /^Book (\d+):/.exec(f)?.[1]).filter((id): id is string => !!id).map(Number));
+    const restore = before.filter((b) => !failed.has(b.id));
+    if (restore.length === 0) {
+      showToast(message, undefined, 15000);
+      return;
+    }
+    const note = lost.size > 0 ? ` (${[...lost].join(", ")} cannot be unset, so Undo leaves ${lost.size === 1 ? "it" : "them"} as edited)` : "";
+    showToast(
+      message,
+      {
+        label: "Undo",
+        run: async () => {
+          const back = await runBatchedEdit(restore, { sendBatch: setFieldsBatch, sendOne: setFields });
+          await onChanged();
+          if (back.errors.length > 0) throw new Error(`Put back ${back.updated} of ${restore.length}: ${back.errors[0]}`);
+          return `Put back the old values on ${back.updated.toLocaleString("en-US")} ${back.updated === 1 ? "book" : "books"}${note}`;
+        },
+      },
+      20000,
+    );
   }
 
   // Reactive, so a template (and a component given this as a prop) reads and

@@ -34,7 +34,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 
-use lexmechanic_utils::filenames::{file_facts_from_metadata, FileFacts};
+use lexmechanic_utils::filenames::{file_facts_from_metadata, FileFacts, FileIdentity};
 
 use crate::constants::{DATA_DIR_NAME, LIBRARY_HANDLE_DIR_NAME, NOTES_DIR_NAME, TRASH_DIR_NAME};
 
@@ -101,11 +101,16 @@ pub struct ScanOptions {
     pub settle: Duration,
     /// Extensions worth indexing, lowercase and without the dot.
     pub extensions: HashSet<String>,
+    /// Only the names matter (a count): do not read each file's identity,
+    /// which on Windows opens the file. Files are reported with a placeholder
+    /// identity, so a report made this way is for counting, not for tracking.
+    pub names_only: bool,
 }
 
 impl Default for ScanOptions {
     fn default() -> Self {
         ScanOptions {
+            names_only: false,
             settle: DEFAULT_SETTLE,
             // `metadata_extensions` is the list this crate already
             // treats as "a book file", minus `opf`, which is metadata
@@ -199,6 +204,20 @@ fn walk_dir(root: &Path, dir: &Path, options: &ScanOptions, now: SystemTime, rep
         }
     };
 
+    // A name-only walk (a count) learns a folder is a library of its own from the
+    // folder's own listing, instead of three `stat`s per folder from the parent:
+    // on a share that is the difference between one round trip per folder and four.
+    let entries: Box<dyn Iterator<Item = std::io::Result<std::fs::DirEntry>>> = if options.names_only {
+        let all: Vec<std::io::Result<std::fs::DirEntry>> = entries.collect();
+        if dir != root && lists_a_library(&all) {
+            report.nested_libraries.push(relative_to(root, dir));
+            return;
+        }
+        Box::new(all.into_iter())
+    } else {
+        Box::new(entries)
+    };
+
     let mut subdirs = Vec::new();
     for entry in entries {
         let Ok(entry) = entry else {
@@ -239,7 +258,7 @@ fn walk_dir(root: &Path, dir: &Path, options: &ScanOptions, now: SystemTime, rep
             if dir == root && lower == DATA_DIR_NAME {
                 continue;
             }
-            if holds_its_own_library(&path) {
+            if !options.names_only && holds_its_own_library(&path) {
                 report.nested_libraries.push(relative_to(root, &path));
                 continue;
             }
@@ -279,6 +298,28 @@ fn walk_dir(root: &Path, dir: &Path, options: &ScanOptions, now: SystemTime, rep
         // One `stat` for the entry, shared by the offline check and the facts
         // (on Windows the directory listing already carried it). A symlink
         // is followed, as it always was.
+        if options.names_only {
+            // A count needs the name; a settling or offline file is not counted.
+            // Windows hands the metadata over with the listing, so judging
+            // those costs nothing there; elsewhere it would be a `stat` per
+            // file, which a count does not spend.
+            let skip = cfg!(windows) && {
+                let md = if file_type.is_symlink() { std::fs::metadata(&path) } else { entry.metadata() };
+                md.as_ref().is_ok_and(|m| is_offline_metadata(m) || settling_by_mtime(m, options.settle, now))
+            };
+            if skip {
+                continue;
+            }
+            let relative_path = relative_to(root, &path);
+            let folder = relative_to(root, dir);
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(name).to_string();
+            let facts = FileFacts { identity: FileIdentity { volume: 0, index: 0 }, size: 0, mtime_ms: None };
+            report.files.push(DiscoveredFile { relative_path, folder, stem, extension, facts });
+            if let Some(control) = control {
+                control.seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            continue;
+        }
         let metadata = if file_type.is_symlink() { std::fs::metadata(&path) } else { entry.metadata() };
         let Ok(metadata) = metadata else {
             report.unreadable.push(relative_to(root, dir));
@@ -330,6 +371,21 @@ fn holds_its_own_library(dir: &Path) -> bool {
     dir.join("metadata.db").exists() || dir.join(LIBRARY_HANDLE_DIR_NAME).is_dir() || dir.join(crate::constants::LEGACY_LIBRARY_HANDLE_DIR_NAME).is_dir()
 }
 
+/// [`holds_its_own_library`], answered from the folder's own listing: it has a
+/// `metadata.db`, or a library state folder. Names are matched the way
+/// `Path::exists` matches them on the platform: ignoring case on Windows.
+fn lists_a_library(entries: &[std::io::Result<std::fs::DirEntry>]) -> bool {
+    let same = |a: &str, b: &str| if cfg!(windows) { a.eq_ignore_ascii_case(b) } else { a == b };
+    entries.iter().flatten().any(|e| {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { return false };
+        if same(name, "metadata.db") {
+            return true;
+        }
+        (same(name, LIBRARY_HANDLE_DIR_NAME) || same(name, crate::constants::LEGACY_LIBRARY_HANDLE_DIR_NAME)) && e.file_type().is_ok_and(|t| t.is_dir())
+    })
+}
+
 /// The real filename an iCloud placeholder stands in for.
 ///
 /// macOS evicts `Big Scan.pdf` by replacing it with
@@ -370,6 +426,11 @@ fn is_offline_metadata(metadata: &std::fs::Metadata) -> bool {
         let _ = metadata;
         false
     }
+}
+
+fn settling_by_mtime(metadata: &std::fs::Metadata, settle: Duration, now: SystemTime) -> bool {
+    let mtime_ms = metadata.modified().ok().and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok()).map(|d| d.as_millis() as u64);
+    is_settling(&FileFacts { identity: FileIdentity { volume: 0, index: 0 }, size: 0, mtime_ms }, settle, now)
 }
 
 fn is_settling(facts: &FileFacts, settle: Duration, now: SystemTime) -> bool {
@@ -478,7 +539,7 @@ pub fn count_untracked(cache: &crate::cache::Cache, now: SystemTime, cap: usize)
     // A fully tracked library has nothing to stop the walk early on, so it is
     // also bounded by time: a count that ran out of it is a lower bound.
     control.set_walk_budget(UNTRACKED_COUNT_BUDGET);
-    let scanned = walk_controlled(&library, &ScanOptions::default(), now, Some(&control))?;
+    let scanned = walk_controlled(&library, &ScanOptions { names_only: true, ..ScanOptions::default() }, now, Some(&control))?;
     let (mut untracked, mut tracked) = (0, 0);
     for file in &scanned.files {
         if known.contains(&crate::cache::file_key(&file.folder, &file.stem, &file.extension)) {
@@ -585,6 +646,43 @@ mod tests {
 
     fn names(report: &ScanReport) -> Vec<&str> {
         report.files.iter().map(|f| f.relative_path.as_str()).collect()
+    }
+
+    /// A name-only walk (what the untracked count uses) finds the same files, with
+    /// the same folders and stems, as the full walk: it only skips the per-file
+    /// identity read.
+    #[test]
+    fn a_names_only_walk_finds_what_the_full_walk_finds() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("Root.pdf"), b"%PDF");
+        write(&dir.path().join("a/b/Deep Book.epub"), b"PK");
+        write(&dir.path().join("a/Plain.PDF"), b"%PDF");
+        write(&dir.path().join("a/notes.txt"), b"no");
+        write(&dir.path().join("a/cover.jpg"), b"no");
+        write(&dir.path().join("#recycle/Gone.pdf"), b"%PDF");
+        write(&dir.path().join("nested/metadata.db"), b"db");
+        write(&dir.path().join("nested/Inside.pdf"), b"%PDF");
+        write(&dir.path().join("nested2/.lexmechanic/state.json"), b"{}");
+        write(&dir.path().join("nested2/Inside2.pdf"), b"%PDF");
+        write(&dir.path().join("a/b/nested3/METADATA.DB"), b"db");
+        write(&dir.path().join("a/b/nested3/Inside3.pdf"), b"%PDF");
+        write(&dir.path().join("data/attached.epub"), b"PK");
+        write(&dir.path().join("z/.Evicted.pdf.icloud"), b"");
+
+        let full = scan(dir.path());
+        let names_only = walk(dir.path(), &ScanOptions { names_only: true, ..ScanOptions::default() }, much_later()).unwrap();
+        let key = |r: &ScanReport| r.files.iter().map(|f| (f.relative_path.clone(), f.folder.clone(), f.stem.clone(), f.extension.clone())).collect::<Vec<_>>();
+        assert_eq!(key(&names_only), key(&full));
+        assert!(!names_only.files.is_empty());
+        let sorted = |v: &[String]| {
+            let mut v = v.to_vec();
+            v.sort();
+            v
+        };
+        assert_eq!(sorted(&names_only.nested_libraries), sorted(&full.nested_libraries));
+        assert_eq!(names_only.nested_libraries.len(), 3);
+        assert_eq!(names_only.offline, full.offline);
+        assert_eq!(names_only.is_complete(), full.is_complete());
     }
 
     #[test]

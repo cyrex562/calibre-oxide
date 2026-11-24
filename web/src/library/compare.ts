@@ -27,7 +27,7 @@ import * as realApi from "./api";
 import { describeJobProgress } from "./api";
 import type { BookFieldChanges } from "./types";
 import type { CompareBook, ComparePair, CompareResult, DuplicateGroup, ManualGroupResult, ResolvePlan, ResolveSelection } from "./api";
-import { confidencePercent, reasonLabel } from "./duplicates";
+import { confidencePercent, formatBytes, formatMtime, reasonLabel } from "./duplicates";
 
 export type CompareApi = Pick<
   typeof realApi,
@@ -142,7 +142,7 @@ function similarity(j: number): string {
 export function pdfLine(pair: ComparePair): string {
   const p = pair.pdf;
   if (!p) return "";
-  if (!p.fingerprinted) return "Not fingerprinted yet: use “Fingerprint PDFs” in Find duplicates to compare their pages.";
+  if (!p.fingerprinted) return "Pages not analyzed yet: use “Analyze library” in Find duplicates to compare them.";
   const parts: string[] = [];
   if (p.kind && p.confidence != null) parts.push(`${confidencePercent(p.confidence)} · ${reasonLabel(p.kind)}`);
   else parts.push("The pages do not match");
@@ -156,11 +156,65 @@ export function pairLines(pair: ComparePair): string[] {
   const lines: string[] = [];
   if (pair.identical_bytes === true) lines.push(`Identical files (${pair.identical_formats.join(", ") || "same bytes"})`);
   else if (pair.identical_bytes === false) lines.push("The files differ");
-  const pdf = pdfLine(pair);
+  // "Pages not analyzed yet" is said once for the whole view (the evidence block's note), not under every pair.
+  const pdf = pair.pdf && !pair.pdf.fingerprinted ? "" : pdfLine(pair);
   if (pdf) lines.push(pdf);
   for (const e of pair.evidence) lines.push(`${reasonLabel(e.reason)} (${confidencePercent(e.confidence)}): ${e.detail}`);
   if (pair.exempt) lines.push("You marked these as not duplicates");
   return lines;
+}
+
+// ---------------------------------------------------------------------------
+// The key facts, one row per fact and one column per copy
+// ---------------------------------------------------------------------------
+
+/** What a PDF's text layer is, in a word. */
+export function textLayerOf(b: Pick<CompareBook, "pdf">): string {
+  if (!b.pdf) return "";
+  if (b.pdf.has_text) return "text layer";
+  return b.pdf.image_only || b.pdf.scanned ? "image only" : "no text";
+}
+
+/** The file name (with extension) of a book's first file. */
+export function fileNameOf(b: Pick<CompareBook, "files">): string {
+  return (b.files?.[0]?.path ?? "").replace(/\\/g, "/").split("/").pop() ?? "";
+}
+
+export interface FactRow {
+  key: string;
+  label: string;
+  /** One value per book, in the books' order; "—" where there is none. */
+  values: string[];
+  /** The copies do not all agree: the row is highlighted. */
+  differs: boolean;
+}
+
+/**
+ * The compact table the view opens with: the facts that tell copies apart,
+ * lined up so a difference is one glance. Rows every copy agrees on are marked
+ * so they can be quieted; the size is shown once (not once for the book and
+ * once for the file).
+ */
+export function factRows(books: readonly CompareBook[]): FactRow[] {
+  const dash = (v: string) => (v.trim() === "" ? "—" : v);
+  const row = (key: string, label: string, get: (b: CompareBook) => string): FactRow => {
+    const values = books.map((b) => dash(get(b)));
+    return { key, label, values, differs: new Set(values).size > 1 };
+  };
+  const rows: FactRow[] = [
+    row("title", "Title", (b) => b.title),
+    row("authors", "Authors", (b) => b.authors.join(" & ")),
+    row("file", "File", fileNameOf),
+    row("folder", "Folder", (b) => b.path ?? folderOf(b)),
+    row("size", "Size", (b) => (b.size === undefined ? "" : formatBytes(b.size))),
+    row("formats", "Formats", (b) => (b.format_list ?? []).join(", ")),
+  ];
+  if (books.some((b) => b.pdf)) {
+    rows.push(row("pages", "Pages", (b) => (b.pdf ? String(b.pdf.pages) : "")));
+    rows.push(row("text", "Text", textLayerOf));
+  }
+  rows.push(row("modified", "Modified", (b) => formatMtime(b.mtime)));
+  return rows;
 }
 
 // ---------------------------------------------------------------------------
@@ -655,7 +709,7 @@ export function createCompareController(api: CompareApi = realApi, hooks: Compar
     }
   }
 
-  /** "Save as my group": the set becomes a group of the user's own. */
+  /** "Mark these as duplicates": the set becomes a group of the user's own. */
   async function saveAsGroup(): Promise<boolean> {
     state.error = null;
     state.groupBusy = true;
@@ -669,10 +723,10 @@ export function createCompareController(api: CompareApi = realApi, hooks: Compar
       if (extra.length > 0) {
         // The books were in a group already: it is shown whole.
         state.bookIds = [...state.bookIds, ...extra].slice(0, MAX_BOOKS);
-        state.note = `Some of these books were already in your group, so it now shows all ${members.length} of its books.`;
+        state.note = `Some of these books were already marked as duplicates together, so this now shows all ${members.length} of that set.`;
         await load();
       } else {
-        state.note = "Saved as your group. It is in the review list as “Your group”.";
+        state.note = "Marked as duplicates. They are in the review list as “Marked by you”.";
       }
       hooks.groupsChanged?.();
       return true;
@@ -829,10 +883,17 @@ export function createCompareController(api: CompareApi = realApi, hooks: Compar
     }
   }
 
+  /** After an Undo made outside the view (the toast shown when it closed): the library and the review list changed. */
+  async function refreshAfterUndo(): Promise<void> {
+    hooks.libraryChanged?.();
+    await hooks.groupsChanged?.();
+  }
+
   return {
     state,
     open,
     close,
+    refreshAfterUndo,
     load,
     pagesOf,
     pageFor,

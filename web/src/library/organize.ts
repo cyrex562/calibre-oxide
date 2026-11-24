@@ -7,7 +7,11 @@
 // machine so its rules can be tested:
 //
 // * a run needs a preview of exactly this template and scope (any edit drops it);
-// * the scope is the selected books when there are any, else everything.
+// * the scope is the selected books when there are any, else the books of the
+//   current search or filter when one is active, else everything. A "search"
+//   scope is sent as the ids of the books the list shows (the dialog passes them
+//   where it passes the selection), so it covers every kind of filter: a search,
+//   a virtual library, a category pick, the marked books.
 
 import { reactive } from "vue";
 import * as realApi from "./api";
@@ -18,7 +22,7 @@ export type OrganizeApi = Pick<typeof realApi, "planOrganize" | "runOrganize" | 
 
 export const DEFAULT_ORGANIZE_TEMPLATE = "{author_sort}/{title}";
 
-export type OrganizeScopeKind = "selected" | "folder" | "all";
+export type OrganizeScopeKind = "selected" | "search" | "folder" | "all";
 
 export interface OrganizeDraft {
   template: string;
@@ -27,14 +31,18 @@ export interface OrganizeDraft {
   pathPrefix: string;
 }
 
-/** The scope a dialog opens with: the selection when there is one. */
-export function defaultDraft(selectedCount = 0): OrganizeDraft {
-  return { template: DEFAULT_ORGANIZE_TEMPLATE, scope: selectedCount > 0 ? "selected" : "all", pathPrefix: "" };
+/** The scope a dialog opens with: the selection when there is one, else the current search when one is active. */
+export function defaultDraft(selectedCount = 0, searchActive = false): OrganizeDraft {
+  return { template: DEFAULT_ORGANIZE_TEMPLATE, scope: selectedCount > 0 ? "selected" : searchActive ? "search" : "all", pathPrefix: "" };
 }
 
-/** What the server is asked to cover. A "selected" scope with nothing selected is not offered. */
+/**
+ * What the server is asked to cover. `ids` are the books of the "selected" or
+ * "search" scope: the dialog passes the selection for one and the current
+ * search's books for the other.
+ */
 export function draftToScope(d: OrganizeDraft, selectedIds: number[]): OrganizeScope {
-  if (d.scope === "selected") return { bookIds: [...selectedIds] };
+  if (d.scope === "selected" || d.scope === "search") return { bookIds: [...selectedIds] };
   if (d.scope === "folder") return { pathPrefix: d.pathPrefix.trim().replace(/^[\\/]+|[\\/]+$/g, "") };
   return {};
 }
@@ -42,6 +50,7 @@ export function draftToScope(d: OrganizeDraft, selectedIds: number[]): OrganizeS
 /** Whether the draft can be previewed at all. */
 export function draftProblem(d: OrganizeDraft, selectedIds: number[]): string | null {
   if (d.scope === "selected" && selectedIds.length === 0) return "No books are selected.";
+  if (d.scope === "search" && selectedIds.length === 0) return "No books match the current search.";
   if (d.scope === "folder" && d.pathPrefix.trim() === "") return "Enter the folder to organize.";
   return null;
 }
@@ -76,6 +85,21 @@ export function describeReport(r: OrganizeReport): string {
   return parts.join(" · ");
 }
 
+/**
+ * One line saying what an earlier run did, so a drag-move and a folder rename
+ * (both "1 book") can be told apart in the list.
+ */
+export function describeRun(r: Pick<OrganizeRun, "books" | "template">): string {
+  const books = plural(r.books, "book");
+  const t = (r.template ?? "").trim();
+  const move = /^move to (.+)$/.exec(t);
+  if (move) return `Moved ${books} to ${move[1]}`;
+  const rename = /^rename folder (.+) to (.+)$/.exec(t);
+  if (rename) return `Renamed folder ${rename[1]} → ${rename[2]} (${books})`;
+  if (t) return `Organized ${books} with ${t}`;
+  return books;
+}
+
 export function describeUndo(r: OrganizeUndoReport): string {
   const parts = [`${plural(r.books_restored, "book")} put back (${plural(r.files_restored, "file")})`];
   if (r.skipped.length > 0) parts.push(`${n(r.skipped.length)} left alone because they changed since`);
@@ -99,9 +123,9 @@ export function createOrganizeController(api: OrganizeApi = realApi) {
     runs: [] as OrganizeRun[],
   });
 
-  /** Opens fresh: scope follows the selection, nothing previewed. */
-  function open(selectedCount: number): void {
-    state.draft = defaultDraft(selectedCount);
+  /** Opens fresh: scope follows the selection, else the active search; nothing previewed. */
+  function open(selectedCount: number, searchActive = false): void {
+    state.draft = defaultDraft(selectedCount, searchActive);
     state.phase = "idle";
     state.plan = null;
     state.planKey = "";

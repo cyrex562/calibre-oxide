@@ -153,7 +153,7 @@ describe("columnsFor", () => {
     expect(keys).not.toContain("cover");
   });
 
-  it("offers Size, Folder and File name as sortable, read-only columns that start hidden", () => {
+  it("offers Size, Folder and File name as sortable, read-only columns; Folder and File name start hidden, Size is a default", () => {
     const columns = columnsFor({}, []);
     for (const [key, kind] of [["size", "bytes"], ["folder", "text"], ["file_name", "text"]] as const) {
       const c = columns.find((col) => col.key === key);
@@ -161,8 +161,26 @@ describe("columnsFor", () => {
       expect(c?.kind).toBe(kind);
       expect(c?.sortKey).toBe(key);
       expect(c?.editor).toBeUndefined();
-      expect(DEFAULT_VISIBLE_KEYS).not.toContain(key);
+      if (key === "size") expect(DEFAULT_VISIBLE_KEYS).toContain(key);
+      else expect(DEFAULT_VISIBLE_KEYS).not.toContain(key);
     }
+  });
+
+  // Finding the copy to keep among duplicates turns on file size and format, so a first run shows them.
+  it("shows Size and Formats by default, and is no wider than it was with Publisher in their place", () => {
+    expect(DEFAULT_VISIBLE_KEYS).toEqual(expect.arrayContaining(["formats", "size"]));
+    const width = (keys: string[]) => keys.reduce((sum, k) => sum + (columnsFor({}, []).find((c) => c.key === k)?.width ?? 0), 0);
+    const before = ["title", "authors", "series", "series_index", "tags", "publisher", "timestamp", "formats"];
+    expect(width(DEFAULT_VISIBLE_KEYS)).toBeLessThanOrEqual(width(before));
+  });
+
+  // The server has no separate sort for these two, so the picker says where to sort instead
+  // of the bare "(not sortable)" that made series-heavy libraries look unsortable.
+  it("tells Number and Author sort where to sort instead", () => {
+    const columns = columnsFor({}, [["series", "Series"], ["authors", "Authors"]]);
+    expect(columns.find((c) => c.key === "series_index")?.sortNote).toMatch(/Series/);
+    expect(columns.find((c) => c.key === "author_sort")?.sortNote).toMatch(/Authors/);
+    expect(columns.find((c) => c.key === "title")?.sortNote).toBeUndefined();
   });
 
   it("includes custom columns under the bare key a book row uses", () => {

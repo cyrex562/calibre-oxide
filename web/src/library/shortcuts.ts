@@ -57,11 +57,48 @@ export function isTypingTarget(target: EventTarget | null): boolean {
 export function shortcutFor(event: KeyboardEvent, keymap: ShortcutMap): LibraryActionId | null {
   if (event.ctrlKey || event.metaKey || event.altKey) return null;
   if (isTypingTarget(event.target)) return null;
+  // Enter and Space already mean "press" on a focused button or link: a binding
+  // on them must not turn pressing a toolbar button into something else.
+  if ((event.key === "Enter" || event.key === " ") && isActivatable(event.target)) return null;
 
   for (const [id, key] of Object.entries(keymap)) {
     if (key && key === event.key) return id as LibraryActionId;
   }
   return null;
+}
+
+/** Whether the element is something Enter or Space presses (a button, a link, a menu item). */
+export function isActivatable(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  const tag = target.tagName;
+  if (tag === "BUTTON" || tag === "A" || tag === "SUMMARY") return true;
+  const role = target.getAttribute("role");
+  return role === "button" || role === "link" || role === "menuitem" || role === "menuitemcheckbox" || role === "option" || role === "tab" || role === "switch";
+}
+
+/**
+ * A key as it is written on a keycap or in a tooltip: "D" for "d", "Shift+S"
+ * for "S", "Del", "Space". The binding is the real `KeyboardEvent.key`; this
+ * is only how it is shown.
+ */
+export function formatKey(key: string): string {
+  if (!key) return "";
+  if (key === " ") return "Space";
+  if (key === "Delete") return "Del";
+  if (key.length === 1 && key >= "a" && key <= "z") return key.toUpperCase();
+  if (key.length === 1 && key >= "A" && key <= "Z") return `Shift+${key}`;
+  return key;
+}
+
+/**
+ * The shortcut hint for an action, from the keymap that is actually in
+ * force (the defaults plus the user's rebinding), or `null` when the action
+ * has no key. Tooltips and menus show this instead of text written by hand,
+ * which went stale the first time a binding changed.
+ */
+export function shortcutHint(id: LibraryActionId, keymap: ShortcutMap): string | null {
+  const key = keymap[id];
+  return key ? formatKey(key) : null;
 }
 
 /**

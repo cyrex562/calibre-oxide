@@ -63,6 +63,14 @@ describe("the compare view", () => {
     const facts = document.body.querySelector('[data-testid="facts"]')!.textContent!;
     expect(facts).toContain("Book 1.epub");
     expect(facts).toContain("Ann Author/Folder");
+    // The facts are one aligned table, in the page before the columns, and the size is said once.
+    const table = document.body.querySelector('[data-testid="facts"]')!;
+    expect(table.tagName).toBe("TABLE");
+    expect(table.compareDocumentPosition(document.body.querySelector('[data-testid="columns"]')!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(table.querySelectorAll('tr[data-fact="size"] td')).toHaveLength(3);
+    expect(table.querySelector('tr[data-fact="title"]')!.classList.contains("differs")).toBe(true);
+    expect(table.querySelector('tr[data-fact="size"]')!.classList.contains("differs")).toBe(false);
+    expect(document.body.querySelector('[data-testid="your-group"]')).toBeNull();
     expect(document.body.querySelector('[data-testid="evidence"]')!.textContent).toContain("Identical files");
     // No PDFs: no page control.
     expect(document.body.querySelector('[data-testid="page-first"]')).toBeNull();
@@ -88,7 +96,7 @@ describe("the compare view", () => {
     await vi.waitFor(() => expect(api.setFields).toHaveBeenCalledWith(1, { title: "New Title" }));
   });
 
-  it("offers Save as my group until the set is one", async () => {
+  it("offers Mark these as duplicates until the set is one", async () => {
     const { controller } = await mount();
     expect(document.body.querySelector('[data-testid="save-group"]')).not.toBeNull();
     controller.state.manualGroupId = "mg-1";

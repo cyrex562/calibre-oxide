@@ -86,13 +86,31 @@ fn within(path: &str, folder: &str) -> bool {
     path_is_within(path, folder)
 }
 
+/// The folder a book sits in, as the tree shows it.
+///
+/// calibre keeps each book in its own directory named `Title (id)`
+/// (`Author/Title (42)`), which is storage, not a folder anyone made: listing
+/// one node per book turns a 50,000-book library into a 50,000-row tree. That
+/// last segment is left out, so the book counts toward `Author`. A book that
+/// was moved in flat (`Novels/Dune.pdf`, whose `path` is `Novels`) has no such
+/// directory and keeps its folder as it is. The directory is recognised by its
+/// name ending in the book's *own* id, so a folder someone called `Chapter (3)`
+/// is not mistaken for one.
+pub fn folder_of(book_id: i64, path: &str) -> String {
+    let parts: Vec<&str> = path.split(['/', '\\']).map(str::trim).filter(|p| !p.is_empty() && *p != ".").collect();
+    match parts.split_last() {
+        Some((last, rest)) if last.ends_with(&format!(" ({book_id})")) => rest.join("/"),
+        _ => parts.join("/"),
+    }
+}
+
 /// The folder tree: one query, no disk access.
 pub fn list(cache: &Cache) -> Result<FolderTree> {
     let paths: Vec<String> = {
         let conn = cache.backend.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT path FROM books")?;
-        let rows = stmt.query_map([], |row| row.get::<_, Option<String>>(0))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().map(|p| p.unwrap_or_default()).collect()
+        let mut stmt = conn.prepare("SELECT id, path FROM books")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().map(|(id, p)| folder_of(id, &p.unwrap_or_default())).collect()
     };
     let total = paths.len();
     // lower-cased path -> entry
@@ -270,6 +288,35 @@ mod tests {
 
     fn rows(tree: &FolderTree) -> Vec<(String, usize, usize)> {
         tree.folders.iter().map(|f| (f.path.clone(), f.books, f.books_here)).collect()
+    }
+
+    #[test]
+    fn per_book_directories_are_not_folders_of_the_tree() {
+        assert_eq!(folder_of(11, "Unknown/book_1 (11)"), "Unknown");
+        assert_eq!(folder_of(4, "Author/Title (4)"), "Author");
+        assert_eq!(folder_of(4, "Title (4)"), "", "a book at the root has no folder");
+        // Another book's id, or a folder that merely looks like one, is a real folder.
+        assert_eq!(folder_of(5, "Author/Title (4)"), "Author/Title (4)");
+        assert_eq!(folder_of(3, "Novels/Chapter (3)/Extras"), "Novels/Chapter (3)/Extras");
+        assert_eq!(folder_of(0, "Novels"), "Novels", "a book moved in flat keeps its folder");
+        assert_eq!(folder_of(7, "a\\b\\T (7)"), "a/b");
+
+        let (dir, cache) = library();
+        for (i, name) in ["One", "Two", "Three"].iter().enumerate() {
+            write(&dir.path().join(format!("inbox/{name}.pdf")), format!("%PDF {i}").as_bytes());
+        }
+        index(dir.path(), &cache);
+        // The layout calibre gives books: Author/Title (id).
+        let one = id(&cache, "One");
+        let two = id(&cache, "Two");
+        let three = id(&cache, "Three");
+        cache.set_book_path(one, &format!("Unknown/One ({one})")).unwrap();
+        cache.set_book_path(two, &format!("Unknown/Two ({two})")).unwrap();
+        cache.set_book_path(three, "Novels").unwrap();
+
+        let tree = list(&cache).unwrap();
+        assert_eq!(tree.total, 3);
+        assert_eq!(rows(&tree), vec![("Novels".to_string(), 1, 1), ("Unknown".to_string(), 2, 2)], "one node per real folder, none per book");
     }
 
     #[test]
