@@ -83,6 +83,22 @@ export async function addBookmark(bookId: string, fmt: string, title: string, po
   return bookmark;
 }
 
+/**
+ * Removes a bookmark or highlight. Annotations are never deleted
+ * outright (they sync between devices); one is re-saved, newer, with
+ * `removed: true`, which is what calibre's own merge expects and what
+ * every reader here filters out.
+ */
+export async function removeAnnotation(bookId: string, fmt: string, kind: "bookmark" | "highlight", annotation: Bookmark | Highlight): Promise<void> {
+  const gone = { ...annotation, removed: true, timestamp: new Date().toISOString() };
+  const resp = await fetch(`/book-update-annotations/${LIBRARY_ID}/${bookId}/${fmt}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ [kind]: [gone] }),
+  });
+  if (!resp.ok) throw new Error(`POST /book-update-annotations failed: ${resp.status} ${resp.statusText}`);
+}
+
 export async function addHighlight(bookId: string, fmt: string, startCfi: string, endCfi: string, highlightedText: string): Promise<Highlight> {
   const highlight: Highlight = { type: "highlight", uuid: crypto.randomUUID(), timestamp: new Date().toISOString(), start_cfi: startCfi, end_cfi: endCfi, highlighted_text: highlightedText };
   const resp = await fetch(`/book-update-annotations/${LIBRARY_ID}/${bookId}/${fmt}`, {
