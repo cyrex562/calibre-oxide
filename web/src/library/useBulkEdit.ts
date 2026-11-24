@@ -16,8 +16,9 @@
 import { computed, reactive, ref, type Ref } from "vue";
 
 import type { BookSummary, FieldMetaEntry } from "./types";
-import { setFields, setFieldsBatch } from "./api";
+import { setFields, setFieldsBatch, setFieldsRelative } from "./api";
 import { runBulkEdit as runBatchedEdit, type BulkItem } from "./bulkBatch";
+import { inverseRelativeOp, relativeTagOp, runRelativeEdit, type RelativeOp } from "./bulkRelative";
 import { changesFor, describeBulkResult, inverseChanges, isEmptySpec, validateSpec, type BulkEditSpec } from "./bulkEdit";
 import { showToast } from "./deleteFlow";
 
@@ -68,6 +69,60 @@ export function useBulkEdit({ selectedIds, fieldMetadata, win, onChanged }: Bulk
   /** Custom columns offered in the bulk panel, by their row key. */
   const customColumns = computed(() => Object.values(fieldMetadata.value).filter((f) => f.is_custom && f.label));
 
+  /**
+   * "Add tags" / "remove tags" alone: the server reads each book's tags, so none
+   * are fetched here (./bulkRelative.ts). False when the server cannot do it,
+   * and nothing was changed: the caller then edits the old way.
+   */
+  async function runRelative(ids: number[], op: RelativeOp, edit: BulkEditSpec): Promise<boolean> {
+    busy.value = true;
+    errors.value = [];
+    summary.value = null;
+    cancelled = false;
+    progress.value = { done: 0, total: ids.length };
+    const pool = await runRelativeEdit(ids, op, {
+      send: setFieldsRelative,
+      cancelled: () => cancelled,
+      onProgress: (done, total) => (progress.value = { done, total }),
+    });
+    busy.value = false;
+    progress.value = null;
+    if (!pool) return false;
+    errors.value.push(...pool.errors);
+    const stopped = pool.notStarted > 0 ? `, stopped with ${pool.notStarted} not started` : "";
+    summary.value = `Updated ${pool.updated} book(s)${pool.unchanged ? `, ${pool.unchanged} already matched` : ""}${errors.value.length ? `, ${errors.value.length} failed` : ""}${stopped}.`;
+    if (errors.value.length === 0 && pool.notStarted === 0) {
+      // The selection stays, as after any other bulk edit: a toast is the feedback.
+      open.value = false;
+      spec.value = emptySpec();
+      applyRating.value = false;
+      applySeriesIndex.value = false;
+    }
+    await onChanged();
+    if (pool.updated > 0) {
+      const message = describeBulkResult(edit, pool.updated);
+      const inverse = inverseRelativeOp(op);
+      const changedIds = pool.updatedIds;
+      if (!inverse) showToast(message, undefined, 15000);
+      else
+        showToast(
+          message,
+          {
+            label: "Undo",
+            run: async () => {
+              const back = await runRelativeEdit(changedIds, inverse, { send: setFieldsRelative });
+              await onChanged();
+              if (!back) throw new Error("The server could not undo this edit");
+              if (back.errors.length > 0) throw new Error(`Put back ${back.updated} of ${changedIds.length}: ${back.errors[0]}`);
+              return `Put back the tags on ${back.updated.toLocaleString("en-US")} ${back.updated === 1 ? "book" : "books"}`;
+            },
+          },
+          20000,
+        );
+    }
+    return true;
+  }
+
   async function run() {
     const ids = [...selectedIds.value];
     if (ids.length === 0) return;
@@ -89,6 +144,8 @@ export function useBulkEdit({ selectedIds, fieldMetadata, win, onChanged }: Bulk
       errors.value = ["Nothing to apply -- fill in at least one field."];
       return;
     }
+    const relative = relativeTagOp(edit);
+    if (relative && (await runRelative(ids, relative, edit))) return;
 
     busy.value = true;
     errors.value = [];

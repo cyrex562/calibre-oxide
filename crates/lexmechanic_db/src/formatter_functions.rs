@@ -93,42 +93,172 @@ use lexmechanic_utils::formatter::parser::FunctionCatalog;
 use lexmechanic_utils::icu::strcmp;
 use regex::RegexBuilder;
 use std::path::Path;
-use std::collections::{BTreeSet, HashSet};
+use std::cell::{OnceCell, RefCell};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use rusqlite::OptionalExtension;
+use lexmechanic_utils::filenames::sanitize_file_name;
 
-/// Real field access, backed by one book's row from
-/// `Cache::get_data_as_dict` (fetched once at construction, not once
-/// per field access -- a template typically reads many fields for the
-/// same book).
+/// Real field access for one book, read lazily.
+///
+/// The values are the ones `Cache::get_data_as_dict` puts in a book's row
+/// (the equivalence test pins every key), but each is fetched the first time a
+/// template asks for it and remembered. A template like `{author_sort}/{title}`
+/// therefore reads two fields instead of building a whole row (about 20 field
+/// reads, three SQL queries and a disk check per format), which dominated an
+/// organize plan of a large library.
 pub struct CacheValueSource<'a> {
-    row: serde_json::Value,
-    _cache: &'a Cache,
+    cache: &'a Cache,
+    book_id: i32,
+    title: String,
+    /// Values given by [`Self::with_override`]; they win over the library.
+    overrides: HashMap<String, serde_json::Value>,
+    /// Row keys already read (`None`: the row has no such key).
+    memo: RefCell<HashMap<String, Option<serde_json::Value>>>,
+    /// `formats`, `available_formats` and the `fmt_*` keys come from one read.
+    formats: OnceCell<FormatGroup>,
+    custom: OnceCell<HashMap<String, serde_json::Value>>,
 }
+
+/// Existing format files (full paths), every format's name, and the `fmt_<ext>` keys.
+type FormatGroup = (Vec<String>, Vec<String>, Vec<(String, String)>);
 
 impl<'a> CacheValueSource<'a> {
     pub fn new(cache: &'a Cache, book_id: i32) -> anyhow::Result<Self> {
-        let ids: HashSet<i32> = std::iter::once(book_id).collect();
-        let rows = cache.get_data_as_dict(None, false, Some(&ids), false)?;
-        let mut row = rows.into_iter().next().ok_or_else(|| anyhow::anyhow!("Unknown book id {book_id}"))?;
-        // A book outside any series has the placeholder index 1.0; as calibre's
-        // save-to-disk does, a template sees it as empty, so `{series_index}`
-        // (and `{series_index:|| - }`) print nothing for a book with no series.
-        if let Some(obj) = row.as_object_mut() {
-            let in_series = obj.get("series").is_some_and(|s| s.as_str().is_some_and(|s| !s.is_empty()));
-            if !in_series && obj.contains_key("series_index") {
-                obj.insert("series_index".into(), serde_json::Value::String(String::new()));
-            }
-        }
-        Ok(Self { row, _cache: cache })
+        let title = cache.field_for(book_id, "title")?.ok_or_else(|| anyhow::anyhow!("Unknown book id {book_id}"))?;
+        Ok(Self { cache, book_id, title, overrides: HashMap::new(), memo: RefCell::new(HashMap::new()), formats: OnceCell::new(), custom: OnceCell::new() })
     }
 
     /// The same source with one field's value replaced, so a template can be
     /// evaluated for a value the book does not hold yet (the file name a
     /// *suggested* title would give). Nothing is written to the library.
     pub fn with_override(mut self, field: &str, value: &str) -> Self {
-        if let Some(row) = self.row.as_object_mut() {
-            row.insert(field.trim_start_matches('#').to_string(), serde_json::Value::String(value.to_string()));
-        }
+        self.overrides.insert(field.trim_start_matches('#').to_string(), serde_json::Value::String(value.to_string()));
         self
+    }
+
+    /// The value `get_data_as_dict` would hold under `key` (`None`: no such key).
+    pub(crate) fn row_value(&self, key: &str) -> Option<serde_json::Value> {
+        if let Some(v) = self.overrides.get(key) {
+            return Some(v.clone());
+        }
+        if let Some(hit) = self.memo.borrow().get(key) {
+            return hit.clone();
+        }
+        let value = self.compute(key).unwrap_or(None);
+        self.memo.borrow_mut().insert(key.to_string(), value.clone());
+        value
+    }
+
+    fn field_json(&self, field: &str) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::json!(self.cache.field_for(self.book_id, field)?))
+    }
+
+    fn compute(&self, key: &str) -> anyhow::Result<Option<serde_json::Value>> {
+        let (cache, id) = (self.cache, self.book_id);
+        Ok(Some(match key {
+            "id" => serde_json::json!(id),
+            "title" => serde_json::json!(self.title),
+            "sort" | "author_sort" | "publisher" | "series" | "uuid" | "comments" | "timestamp" | "pubdate" | "last_modified" => self.field_json(key)?,
+            "rating" => serde_json::json!(cache.field_for(id, "rating")?.and_then(|s| s.parse::<f64>().ok())),
+            "size" => serde_json::json!(cache.field_for(id, "size")?.and_then(|s| s.parse::<i64>().ok())),
+            "series_index" => {
+                // A book outside any series has the placeholder index 1.0; as
+                // calibre's save-to-disk does, a template sees it as empty, so
+                // `{series_index}` prints nothing for a book with no series.
+                // (Decided from the library's series, not from an override.)
+                let in_series = cache.field_for(id, "series")?.is_some_and(|s| !s.is_empty());
+                if in_series {
+                    serde_json::json!(cache.field_for(id, "series_index")?.and_then(|s| s.parse::<f64>().ok()))
+                } else {
+                    serde_json::Value::String(String::new())
+                }
+            }
+            "isbn" | "identifiers" => serde_json::json!(cache.field_for(id, key)?.unwrap_or_default()),
+            "authors" => {
+                let authors: Vec<String> = match cache.field_for(id, "authors")? {
+                    Some(s) if !s.is_empty() => s.split(" & ").map(|a| a.to_string()).collect(),
+                    _ => vec!["Unknown".to_string()],
+                };
+                serde_json::json!(authors)
+            }
+            "tags" => {
+                let tags: Vec<String> = cache.field_for(id, "tags")?.map(|s| s.split(", ").map(|t| t.trim().to_string()).collect()).unwrap_or_default();
+                serde_json::json!(tags)
+            }
+            "languages" => {
+                let languages: Vec<String> = cache.field_for(id, "languages")?.map(|s| s.split(", ").map(|t| t.to_string()).collect()).unwrap_or_default();
+                serde_json::json!(languages)
+            }
+            "cover" => {
+                let library_path = &cache.backend.library_path;
+                let has_cover = {
+                    let conn = cache.backend.conn.lock().unwrap();
+                    conn.query_row("SELECT has_cover FROM books WHERE id = ?1", [id], |row| row.get::<_, i64>(0)).optional()?.unwrap_or(0) != 0
+                };
+                if has_cover {
+                    let path_rel = cache.field_for(id, "path")?.unwrap_or_default();
+                    let real = crate::covers::cover_path(cache, id).unwrap_or_else(|_| library_path.join(&path_rel).join("cover.jpg"));
+                    let rel = real.strip_prefix(library_path).map(Path::to_path_buf).unwrap_or(real);
+                    serde_json::json!(library_path.join(rel).to_string_lossy().to_string())
+                } else {
+                    serde_json::Value::Null
+                }
+            }
+            "formats" => serde_json::json!(self.format_group()?.0),
+            "available_formats" => serde_json::json!(self.format_group()?.1),
+            k if k.starts_with("fmt_") => match self.format_group()?.2.iter().find(|(name, _)| name == k) {
+                Some((_, path)) => serde_json::json!(path),
+                None => return self.compute_custom(k),
+            },
+            k => return self.compute_custom(k),
+        }))
+    }
+
+    fn format_group(&self) -> anyhow::Result<&FormatGroup> {
+        if let Some(g) = self.formats.get() {
+            return Ok(g);
+        }
+        let library_path = &self.cache.backend.library_path;
+        let path_rel = self.cache.field_for(self.book_id, "path")?.unwrap_or_default();
+        let mut data_formats: Vec<(String, String)> = Vec::new();
+        {
+            let conn = self.cache.backend.conn.lock().unwrap();
+            let mut stmt = conn.prepare("SELECT format, name FROM data WHERE book = ?1")?;
+            let rows = stmt.query_map([self.book_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+            for row in rows {
+                data_formats.push(row?);
+            }
+        }
+        let (mut formats, mut available, mut keyed) = (Vec::new(), Vec::new(), Vec::new());
+        for (fmt, stem) in &data_formats {
+            available.push(fmt.to_uppercase());
+            let stem = if stem.is_empty() { sanitize_file_name(&self.title) } else { stem.clone() };
+            let abs_path = library_path.join(&path_rel).join(format!("{}.{}", stem, fmt.to_lowercase()));
+            if abs_path.exists() {
+                let out = abs_path.to_string_lossy().to_string();
+                keyed.push((format!("fmt_{}", fmt.to_lowercase()), out.clone()));
+                formats.push(out);
+            }
+        }
+        Ok(self.formats.get_or_init(|| (formats, available, keyed)))
+    }
+
+    /// A custom column (bare label), or a series column's `<label>_index`.
+    fn compute_custom(&self, key: &str) -> anyhow::Result<Option<serde_json::Value>> {
+        if self.custom.get().is_none() {
+            let map = self.cache.custom_column_label_map()?;
+            let _ = self.custom.set(map);
+        }
+        let columns = self.custom.get().expect("just set");
+        if columns.contains_key(key) {
+            return Ok(Some(serde_json::json!(self.cache.get_custom_column_value(self.book_id, key)?)));
+        }
+        if let Some(label) = key.strip_suffix("_index") {
+            if columns.get(label).is_some_and(|c| c["datatype"] == "series") {
+                return Ok(Some(serde_json::json!(self.cache.get_custom_series_index(self.book_id, label)?)));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -156,12 +286,12 @@ fn json_scalar_or_join(v: &serde_json::Value) -> Option<String> {
 /// (they only ever used standard, non-`#` field names).
 impl ValueSource for CacheValueSource<'_> {
     fn get_value(&self, name: &str) -> Option<String> {
-        self.row.get(name.trim_start_matches('#')).and_then(json_scalar_or_join)
+        self.row_value(name.trim_start_matches('#')).as_ref().and_then(json_scalar_or_join)
     }
 
     fn get_raw_value(&self, name: &str) -> Option<RawValue> {
         let name = name.trim_start_matches('#');
-        match self.row.get(name)? {
+        match &self.row_value(name)? {
             serde_json::Value::Array(items) => Some(RawValue::List(items.iter().filter_map(|i| i.as_str().map(str::to_string)).collect())),
             serde_json::Value::String(s) => Some(RawValue::Scalar(s.clone())),
             serde_json::Value::Number(n) => Some(RawValue::Scalar(n.to_string())),
@@ -549,7 +679,7 @@ impl<'a> CacheFunctions<'a> {
         let fm = FieldMetadata::from_cache(self.cache).map_err(|e| e.to_string())?;
         let is_bool_field = fm.get(field_key).map(|i| i.datatype.as_deref() == Some("bool")).unwrap_or(false);
         let vs = CacheValueSource::new(self.cache, self.book_id).map_err(|e| e.to_string())?;
-        match vs.row.get(row_key) {
+        match vs.row_value(row_key).as_ref() {
             None | Some(serde_json::Value::Null) => Ok(if args[1] == "1" { "Yes".to_string() } else { String::new() }),
             Some(_) if !is_bool_field => Err("check_yes_no requires the field be a Yes/No custom column".to_string()),
             Some(serde_json::Value::String(s)) => {
@@ -602,7 +732,7 @@ impl<'a> CacheFunctions<'a> {
             return Err("format_date_field: 'from_number' cannot be used on a real date field (matches a real upstream bug -- calling float() on an already-parsed datetime raises there too)".to_string());
         }
         let vs = CacheValueSource::new(self.cache, self.book_id).map_err(|e| e.to_string())?;
-        let val_str = match vs.row.get(field.trim_start_matches('#')) {
+        let val_str = match vs.row_value(field.trim_start_matches('#')).as_ref() {
             None | Some(serde_json::Value::Null) => return Ok(String::new()),
             Some(serde_json::Value::String(s)) => s.clone(),
             _ => return Ok(String::new()),
@@ -1207,5 +1337,81 @@ mod tests {
         let id = add_book(&cache, "Book", &["Author"]);
         let f = CacheFunctions::new(&cache, id);
         assert!(f.call("is_marked", &[]).is_err());
+    }
+
+    /// The lazy [`CacheValueSource`] must answer exactly what the row
+    /// `get_data_as_dict` builds would (the source it replaced), for every key,
+    /// including the ones that are absent.
+    #[test]
+    fn the_lazy_value_source_matches_the_full_row_for_every_key() {
+        let (_dir, cache) = make_cache();
+        let rich = add_book(&cache, "A Rich Book", &["Zora Zed", "Amy Ant"]);
+        cache.set_field(rich, "series", "The Series").unwrap();
+        cache.set_field(rich, "series_index", "3.5").unwrap();
+        cache.set_field(rich, "publisher", "Acme Press").unwrap();
+        cache.set_field(rich, "rating", "8").unwrap();
+        cache.set_field(rich, "comments", "<p>Some <b>comments</b></p>").unwrap();
+        cache.set_field(rich, "isbn", "9781234567897").unwrap();
+        cache.set_field(rich, "languages", "eng, deu").unwrap();
+        cache.set_field(rich, "pubdate", "2020-05-17T00:00:00+00:00").unwrap();
+        crate::covers::set_cover(&cache, rich, b"cover bytes").unwrap();
+        cache.add_custom_column("myflag", "My Flag", "bool", false).unwrap();
+        cache.add_custom_column("mytext", "My Text", "text", false).unwrap();
+        cache.add_custom_column("myseries", "My Series", "series", false).unwrap();
+        cache.set_custom_column_value(rich, "myflag", "1").unwrap();
+        cache.set_custom_column_value(rich, "mytext", "hello").unwrap();
+        cache.set_custom_column_value(rich, "myseries", "Other Series").unwrap();
+        // One more format that exists, and one whose file is gone from disk.
+        let extra = tempfile::tempdir().unwrap();
+        let pdf = extra.path().join("x.pdf");
+        std::fs::write(&pdf, b"%PDF fake").unwrap();
+        cache.add_format(rich, &pdf, "pdf", true).unwrap();
+        let ghost = extra.path().join("g.mobi");
+        std::fs::write(&ghost, b"mobi fake").unwrap();
+        cache.add_format(rich, &ghost, "mobi", true).unwrap();
+        let path = cache.field_for(rich, "path").unwrap().unwrap_or_default();
+        let name = cache.format_files(rich).unwrap().into_iter().find(|(_, f)| f.eq_ignore_ascii_case("mobi")).unwrap().0;
+        std::fs::remove_file(cache.backend.library_path.join(&path).join(format!("{name}.mobi"))).unwrap();
+
+        let bare = add_book(&cache, "Bare", &[]);
+        cache.set_field(bare, "tags", "").unwrap();
+        cache.set_field(bare, "series", "").unwrap();
+
+        for id in [rich, bare] {
+            let ids: HashSet<i32> = std::iter::once(id).collect();
+            let mut row = cache.get_data_as_dict(None, false, Some(&ids), false).unwrap().into_iter().next().unwrap();
+            // The old source blanked the placeholder index of a book outside any series.
+            let in_series = row["series"].as_str().is_some_and(|s| !s.is_empty());
+            if !in_series {
+                row["series_index"] = serde_json::Value::String(String::new());
+            }
+            let lazy = CacheValueSource::new(&cache, id).unwrap();
+            let mut keys: Vec<String> = row.as_object().unwrap().keys().cloned().collect();
+            keys.extend(["nosuchkey", "fmt_epub", "fmt_pdf", "fmt_mobi", "fmt_azw3", "myseries_index", "mytext_index", "formats"].map(String::from));
+            for key in keys {
+                let want = row.get(&key).cloned();
+                assert_eq!(lazy.row_value(&key), want, "book {id}, key {key:?}");
+                assert_eq!(lazy.get_value(&key), want.as_ref().and_then(json_scalar_or_join), "book {id}, get_value({key:?})");
+            }
+        }
+        // `with_override` still wins over the library, and the series placeholder is decided by the library.
+        let over = CacheValueSource::new(&cache, bare).unwrap().with_override("title", "Other").with_override("series", "S");
+        assert_eq!(over.get_value("title").as_deref(), Some("Other"));
+        assert_eq!(over.get_value("series").as_deref(), Some("S"));
+        assert_eq!(over.get_value("series_index").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn a_lazy_value_source_reads_only_the_fields_a_template_names() {
+        let (_dir, cache) = make_cache();
+        let id = add_book(&cache, "Book", &["Author"]);
+        let source = CacheValueSource::new(&cache, id).unwrap();
+        assert!(source.memo.borrow().is_empty(), "nothing is read until asked");
+        let out = lexmechanic_utils::formatter::string_format::evaluate_template("{author_sort}/{title}", &source, &CacheCatalog, &CacheFunctions::new(&cache, id)).unwrap();
+        assert_eq!(out, "Author/Book");
+        let mut read: Vec<String> = source.memo.borrow().keys().cloned().collect();
+        read.sort();
+        assert_eq!(read, ["author_sort", "title"]);
+        assert!(source.formats.get().is_none(), "no format or disk read for this template");
     }
 }

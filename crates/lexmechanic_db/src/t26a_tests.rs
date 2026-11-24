@@ -113,6 +113,32 @@ fn every_field_write_bumps_last_modified() {
         r.unwrap();
     }
     assert!(!modified(&cache).starts_with("2000-01-01"), "the batch path too, got {}", modified(&cache));
+
+    {
+        let conn = cache.backend.conn.lock().unwrap();
+        conn.execute("UPDATE books SET last_modified = '2000-01-01 00:00:00+00:00' WHERE id = ?1", [id]).unwrap();
+    }
+    for r in cache.set_fields_per_book(&[(id, vec![("tags".to_string(), "one, two".to_string())])]) {
+        r.unwrap();
+    }
+    assert!(!modified(&cache).starts_with("2000-01-01"), "the per-book batch path too, got {}", modified(&cache));
+}
+
+#[test]
+fn per_book_batch_rederives_author_sort_and_an_explicit_one_wins() {
+    let (dir, cache) = library();
+    write(&dir.path().join("inbox/Dune.pdf"), b"%PDF dune");
+    index(dir.path(), &cache);
+    let id = only_book(&cache);
+    for r in cache.set_fields_per_book(&[(id, vec![("authors".to_string(), "Frank Herbert".to_string())])]) {
+        r.unwrap();
+    }
+    assert_eq!(cache.field_for(id, "author_sort").unwrap().as_deref(), Some("Herbert, Frank"));
+    let changes = vec![("author_sort".to_string(), "Custom".to_string()), ("authors".to_string(), "Ann Other".to_string())];
+    for r in cache.set_fields_per_book(&[(id, changes)]) {
+        r.unwrap();
+    }
+    assert_eq!(cache.field_for(id, "author_sort").unwrap().as_deref(), Some("Custom"));
 }
 
 // --- B9: pubdate stays undefined when the file has none --------------------

@@ -400,3 +400,31 @@ describe("kept alive behind another route", () => {
     expect(rows(el)).toHaveLength(6);
   });
 });
+
+describe("load and sort cost", () => {
+  it("a header click runs exactly one search, not two identical ones", async () => {
+    apiMocks.fetchFieldMetadata.mockResolvedValue({ field_metadata: {}, sortable_fields: [["title", "Title"]] });
+    const el = await mountView();
+    const before = apiMocks.search.mock.calls.length;
+    el.querySelector<HTMLButtonElement>("thead button.header-button")!.click();
+    await settle();
+    expect(apiMocks.search.mock.calls.length - before).toBe(1);
+  });
+
+  it("asks for the untracked-file count only after the first rows are shown", async () => {
+    // The first search is held open: the count must not be asked for meanwhile.
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((r) => (release = r));
+    apiMocks.search.mockImplementation(async () => {
+      await held;
+      return { book_ids: [1, 2, 3], total_num: 3 };
+    });
+    await mountView();
+    expect(apiMocks.search).toHaveBeenCalled();
+    expect(apiMocks.fetchLibraryInfo).toHaveBeenCalled();
+    expect(apiMocks.fetchUntracked).not.toHaveBeenCalled();
+    release();
+    await settle();
+    expect(apiMocks.fetchUntracked).toHaveBeenCalledTimes(1);
+  });
+});

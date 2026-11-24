@@ -172,7 +172,8 @@ function onSortMenuChoose(id: SortMenuId) {
   const next = applySortChoice({ sort: sort.value, order: sortOrder.value }, id);
   sort.value = next.sort;
   sortOrder.value = next.order;
-  void runSearch();
+  // No explicit search here: the watcher on `sort`/`sortOrder` resets the list,
+  // and a second call would fire an identical /ajax/search twice.
   void rememberSort();
 }
 
@@ -360,7 +361,7 @@ function setViewMode(mode: LibraryViewMode) {
 function onTableSort(next: { sort: string; order: "asc" | "desc" }) {
   sort.value = next.sort;
   sortOrder.value = next.order;
-  void runSearch();
+  // The watcher on `sort`/`sortOrder` resets the list: no second search here.
   void rememberSort();
 }
 
@@ -505,6 +506,8 @@ async function resetSearch() {
     void refreshLibraryTotal();
   } finally {
     loading.value = false;
+    // First rows are in: now the slow untracked-files count may be asked for.
+    markRowsReady();
   }
 }
 
@@ -901,7 +904,7 @@ async function onImported() {
 const {
   libraryName, libraryPath, copyTargets, banner, bannerDismissed,
   changeLogWarning, changeLogRepairBusy, changeLogRepairError, refreshChangeLogStatus, repairChangeLogNow,
-  loadLibraryInfo,
+  loadLibraryInfo, markRowsReady,
   untracked, scanPromptDismissed, promptScanBusy, promptScanProgress, promptScanSummary, promptScanError, scanFromPrompt, stopPromptScan, dismissScanPrompt, closeScanResult,
   interruptedJob, resumeBusy, resumeProgress, resumeError, loadInterruptedJob, resumeInterrupted,
   newLibraryOpen, newLibraryName, newLibraryError, creatingLibrary, openNewLibrary, createLibrary,

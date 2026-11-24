@@ -3044,7 +3044,7 @@ impl Cache {
     /// here).
     pub fn format_files(&self, book_id: i32) -> anyhow::Result<Vec<(String, String)>> {
         let conn = self.backend.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT name, format FROM data WHERE book = ?1")?;
+        let mut stmt = conn.prepare_cached("SELECT name, format FROM data WHERE book = ?1")?;
         let rows = stmt.query_map([book_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
         let mut formats = Vec::new();
         for row in rows {
@@ -3542,6 +3542,89 @@ impl Cache {
                 continue;
             }
             for (field, value) in &other {
+                if let Err(e) = self.set_field(*id, field, value) {
+                    results[idx] = Err(e);
+                    break;
+                }
+            }
+        }
+        results
+    }
+
+    /// [`Cache::set_fields_for_books`] for changes that differ per book:
+    /// `items` is `(book id, [(field, value)])`. The standard fields of all the
+    /// books are written in **one** `BEGIN IMMEDIATE` transaction (a savepoint
+    /// per book, so one that fails is rolled back alone) and logged as one batch,
+    /// however many different values there are -- "add a tag" gives every book
+    /// its own list, which as one transaction per distinct list took minutes for
+    /// tens of thousands of books. Custom columns go per book afterwards.
+    ///
+    /// The result has one entry per item, in order.
+    pub fn set_fields_per_book(&self, items: &[(i32, Vec<(String, String)>)]) -> Vec<anyhow::Result<()>> {
+        let mut results: Vec<anyhow::Result<()>> = Vec::with_capacity(items.len());
+        let uuids: Vec<Option<String>> = {
+            let conn = self.backend.conn.lock().unwrap();
+            let mut stmt = match conn.prepare_cached("SELECT uuid FROM books WHERE id = ?1") {
+                Ok(s) => s,
+                Err(e) => {
+                    let msg = format!("{e}");
+                    return items.iter().map(|_| Err(anyhow::anyhow!("{msg}"))).collect();
+                }
+            };
+            items.iter().map(|(id, _)| stmt.query_row((id,), |row| row.get::<_, Option<String>>(0)).ok().flatten()).collect()
+        };
+
+        {
+            let mut conn = self.backend.conn.lock().unwrap();
+            let mut tx = match conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
+                Ok(tx) => tx,
+                Err(e) => {
+                    let msg = format!("{e}");
+                    return items.iter().map(|_| Err(anyhow::anyhow!("{msg}"))).collect();
+                }
+            };
+            for (idx, (id, changes)) in items.iter().enumerate() {
+                let one = (|| -> anyhow::Result<()> {
+                    if uuids[idx].is_none() {
+                        anyhow::bail!("Book {id} not found");
+                    }
+                    let sp = tx.savepoint()?;
+                    // An explicit `author_sort` wins over the one a change of
+                    // authors derives, as in `set_fields_for_books`.
+                    let mut batchable: Vec<&(String, String)> = changes.iter().filter(|(f, _)| Self::is_batchable_field(f)).collect();
+                    batchable.sort_by_key(|c| c.0 == "author_sort");
+                    for (field, value) in batchable {
+                        Self::set_field_in_tx(&sp, *id, field, value)?;
+                    }
+                    Self::touch_last_modified_in(&sp, *id)?;
+                    sp.commit()?;
+                    Ok(())
+                })();
+                results.push(one);
+            }
+            if let Err(e) = tx.commit() {
+                let msg = format!("{e}");
+                return items.iter().map(|_| Err(anyhow::anyhow!("{msg}"))).collect();
+            }
+        }
+
+        let mut ops = Vec::new();
+        for (idx, (_, changes)) in items.iter().enumerate() {
+            if let (Ok(()), Some(uuid)) = (&results[idx], &uuids[idx]) {
+                let mut batchable: Vec<&(String, String)> = changes.iter().filter(|(f, _)| Self::is_batchable_field(f)).collect();
+                batchable.sort_by_key(|c| c.0 == "author_sort");
+                for (field, value) in batchable {
+                    ops.push(crate::change_log::ChangeOp::FieldSet { book: uuid.clone(), field: field.clone(), value: Some(value.clone()) });
+                }
+            }
+        }
+        self.record_many(ops);
+
+        for (idx, (id, changes)) in items.iter().enumerate() {
+            if results[idx].is_err() {
+                continue;
+            }
+            for (field, value) in changes.iter().filter(|(f, _)| !Self::is_batchable_field(f)) {
                 if let Err(e) = self.set_field(*id, field, value) {
                     results[idx] = Err(e);
                     break;

@@ -320,6 +320,25 @@ impl AppState {
     }
 }
 
+/// `Cache-Control` for what the static-file service answers. Build output under
+/// `assets/` has a hash in its name, so a given URL never changes: keep it for a
+/// year. Everything else (`index.html`, which names those files, and the
+/// unhashed ones) must be asked about each time; `ServeDir`'s validators make
+/// that a cheap `304`.
+async fn static_cache_headers(request: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+    let under_assets = request.uri().path().starts_with("/assets/");
+    let mut response = next.run(request).await;
+    // A missing asset falls back to `index.html` (the SPA fallback): that must not be kept.
+    let is_html = response.headers().get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/html"));
+    let hashed = under_assets && !is_html;
+    let ok = response.status().is_success() || response.status() == axum::http::StatusCode::NOT_MODIFIED;
+    if ok && !response.headers().contains_key(axum::http::header::CACHE_CONTROL) {
+        let value = if hashed { "public, max-age=31536000, immutable" } else { "no-cache" };
+        response.headers_mut().insert(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static(value));
+    }
+    response
+}
+
 /// Builds the `axum::Router` for this increment's endpoints. When
 /// `state.auth` is set, every route requires HTTP Basic credentials
 /// (see `auth::require_auth`) -- there are no public/unauthenticated
@@ -527,7 +546,15 @@ pub fn router(state: AppState) -> axum::Router {
             // `200` response. `fallback` (not `not_found_service`)
             // leaves `ServeFile`'s own natural `200` status alone.
             let serve_dir = tower_http::services::ServeDir::new(dir).fallback(tower_http::services::ServeFile::new(dir.join("index.html")));
-            api.fallback_service(serve_dir)
+            // The files are compressed on the way out and told how long they
+            // may be kept (see `static_cache_headers`): a 650 KB script that is
+            // fetched again on every page load is what a LAN client waits on.
+            use tower_http::compression::Predicate as _;
+            let compress = tower_http::compression::CompressionLayer::new()
+                .gzip(true)
+                .compress_when(tower_http::compression::predicate::DefaultPredicate::new().and(tower_http::compression::predicate::NotForContentType::const_new("font/")));
+            let statics = axum::Router::new().fallback_service(serve_dir).layer(middleware::from_fn(static_cache_headers)).layer(compress);
+            api.fallback_service(statics)
         }
         None => api,
     };
@@ -751,6 +778,49 @@ mod tests {
         let (status, body) = get(&router, "/read/123/epub").await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("the reader app"));
+    }
+
+    async fn get_with(router: &axum::Router, uri: &str, headers: &[(&str, &str)]) -> axum::response::Response {
+        let mut req = Request::builder().uri(uri);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        router.clone().oneshot(req.body(Body::empty()).unwrap()).await.unwrap()
+    }
+
+    /// Hashed build output is kept for a year, `index.html` (and the SPA fallback
+    /// that serves it) is revalidated, scripts are gzipped for a client that asks.
+    #[tokio::test]
+    async fn static_files_are_compressed_and_cached_by_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<html>the reader app</html>").unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        let script = "console.log('hello hello hello hello');
+".repeat(200);
+        std::fs::write(dir.path().join("assets/app-abc123.js"), &script).unwrap();
+        std::fs::write(dir.path().join("favicon.svg"), "<svg xmlns='http://www.w3.org/2000/svg'/>").unwrap();
+        let router = test_router(test_state_with_static_dir(dir.path()));
+
+        let js = get_with(&router, "/assets/app-abc123.js", &[("accept-encoding", "gzip")]).await;
+        assert_eq!(js.status(), StatusCode::OK);
+        assert_eq!(js.headers()["cache-control"], "public, max-age=31536000, immutable");
+        assert_eq!(js.headers()["content-encoding"], "gzip");
+        let bytes = to_bytes(js.into_body(), usize::MAX).await.unwrap();
+        assert!(bytes.len() < script.len() / 4, "gzipped: {} of {}", bytes.len(), script.len());
+        assert_eq!(&bytes[..2], &[0x1f, 0x8b], "a gzip stream");
+
+        // A client that does not ask for gzip gets the plain bytes.
+        let plain = get_with(&router, "/assets/app-abc123.js", &[]).await;
+        assert!(plain.headers().get("content-encoding").is_none());
+        assert_eq!(to_bytes(plain.into_body(), usize::MAX).await.unwrap(), script.as_bytes());
+
+        for uri in ["/", "/index.html", "/read/12/pdf", "/favicon.svg"] {
+            let r = get_with(&router, uri, &[]).await;
+            assert_eq!(r.headers()["cache-control"], "no-cache", "{uri}");
+        }
+        // A hashed name that is gone falls back to index.html: that must not be kept for a year.
+        let missing = get_with(&router, "/assets/old-deadbeef.js", &[]).await;
+        assert_eq!(missing.headers()["cache-control"], "no-cache");
     }
 
     #[tokio::test]
