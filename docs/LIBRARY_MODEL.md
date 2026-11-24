@@ -786,7 +786,9 @@ library.
   example a junction onto another volume, which a rename cannot cross) the
   book's files already moved go back and it is reported failed. Nothing is
   copied across volumes.
-* Each run is recorded in `.calibre-oxide/organize-runs/<run_id>.json`;
+* Each run is recorded in an append-only journal, `.calibre-oxide/organize-runs/<run_id>.jsonl`
+  (`run_journal.rs`): a book's entry is written and fsynced before its files move, so a
+  crash leaves nothing undo cannot see. Older `.json` records still load;
   undo skips books that were moved since.
 
 ## Behaviour decided
