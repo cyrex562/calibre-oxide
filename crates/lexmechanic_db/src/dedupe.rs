@@ -1290,7 +1290,21 @@ fn fuzzy_edges(records: &[BookRecord], prepared: &[Prepared], exact_pairs: &Hash
 /// Every book's id, title, authors and identifiers: four table scans, no
 /// per-book queries.
 pub fn load_records(cache: &Cache) -> Result<Vec<BookRecord>> {
-    let conn = cache.backend.conn.lock().unwrap();
+    // On the reading connection when there is one, so the scan does not hold
+    // the main one (and every request with it) while it reads 4 tables.
+    let reader = cache.backend.reader();
+    let reader_guard = reader.as_ref().map(|r| r.lock().unwrap());
+    let main_guard;
+    let conn: &rusqlite::Connection = match &reader_guard {
+        Some(guard) => guard,
+        None => {
+            main_guard = cache.backend.conn.lock().unwrap();
+            &main_guard
+        }
+    };
+    // One snapshot for the four reads: a book written in between would have no authors.
+    let snapshot = reader_guard.is_some() && conn.execute_batch("BEGIN").is_ok();
+    let records = (|| -> Result<Vec<BookRecord>> {
     let mut authors: HashMap<i32, Vec<String>> = HashMap::new();
     {
         let mut stmt = conn.prepare("SELECT l.book, a.name FROM books_authors_link l JOIN authors a ON a.id = l.author ORDER BY l.id")?;
@@ -1322,6 +1336,11 @@ pub fn load_records(cache: &Cache) -> Result<Vec<BookRecord>> {
         records.push(BookRecord { id, title, authors: authors.remove(&id).unwrap_or_default(), identifiers: identifiers.remove(&id).unwrap_or_default(), stems: stems.remove(&id).unwrap_or_default(), uuid });
     }
     Ok(records)
+    })();
+    if snapshot {
+        let _ = conn.execute_batch("ROLLBACK");
+    }
+    records
 }
 
 /// What the scan knows about a book's PDF, for showing and for choosing

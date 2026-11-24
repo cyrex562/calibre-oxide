@@ -177,8 +177,43 @@ pub struct PendingPdf {
     pub folder: String,
 }
 
+/// Whether `error` is SQLite saying another connection holds a lock
+/// (`SQLITE_BUSY`, `SQLITE_LOCKED`): the one failure that is worth trying
+/// again, because the other connection lets go.
+pub fn is_busy_error(error: &rusqlite::Error) -> bool {
+    matches!(error, rusqlite::Error::SqliteFailure(e, _) if matches!(e.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+}
+
+/// How long [`retry_on_busy`] keeps trying.
+const BUSY_RETRY_FOR: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Runs `f` (a whole transaction: it is begun again on each try), trying
+/// again with a growing pause while it fails because the database is locked.
+/// SQLite's own busy timeout (5 s on every connection here) covers a lock
+/// held briefly; a job that writes for an hour will meet a longer one (a
+/// WAL checkpoint waiting on a reader, another program's transaction), and
+/// failing the job on it threw away the whole run.
+fn retry_on_busy<T>(mut f: impl FnMut() -> Result<T, ChecksumError>) -> Result<T, ChecksumError> {
+    let started = std::time::Instant::now();
+    let mut pause = std::time::Duration::from_millis(100);
+    loop {
+        match f() {
+            Err(ChecksumError::Sqlite(e)) if is_busy_error(&e) && started.elapsed() < BUSY_RETRY_FOR => {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(std::time::Duration::from_secs(2));
+            }
+            other => return other,
+        }
+    }
+}
+
 pub struct ChecksumStore {
     conn: Arc<Mutex<Connection>>,
+    /// A second, read-only connection to the same library (see
+    /// [`crate::backend::Backend::reader`]). The library-wide reads below
+    /// run on it, so a duplicate scan does not hold the main connection's
+    /// lock -- and with it every other request -- while it reads.
+    reader: Option<Arc<Mutex<Connection>>>,
     db_path: PathBuf,
 }
 
@@ -187,7 +222,35 @@ impl ChecksumStore {
         let db_path = library_path
             .join(LIBRARY_HANDLE_DIR_NAME)
             .join(CHECKSUMS_DB_NAME);
-        ChecksumStore { conn, db_path }
+        ChecksumStore { conn, reader: None, db_path }
+    }
+
+    /// Runs the library-wide reads on `reader` instead of the main connection.
+    pub fn with_reader(mut self, reader: Option<Arc<Mutex<Connection>>>) -> Self {
+        self.reader = reader;
+        self
+    }
+
+    /// The connection a library-wide read runs on: the reader when there is
+    /// one (with the sidecar attached to it), else the main connection.
+    /// The main connection's [`ChecksumStore::initialize`] runs first, so the
+    /// sidecar's tables exist.
+    fn read_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, ChecksumError> {
+        let Some(reader) = &self.reader else {
+            self.initialize()?;
+            return Ok(self.conn.lock().unwrap());
+        };
+        let conn = reader.lock().unwrap();
+        let attached: i32 = conn.query_row("SELECT count(*) FROM pragma_database_list WHERE name='checksums_db'", [], |row| row.get(0)).unwrap_or(0);
+        if attached == 0 {
+            // Only now is the main connection needed: it creates the
+            // sidecar's tables. Once the reader has the sidecar attached,
+            // that has been done, and a read never touches the main
+            // connection again.
+            self.initialize()?;
+            conn.execute("ATTACH DATABASE ? AS checksums_db", [self.db_path.to_str().unwrap()])?;
+        }
+        Ok(conn)
     }
 
     /// Attaches `checksums.db` (if not already) and creates the real
@@ -280,8 +343,12 @@ impl ChecksumStore {
                     PRIMARY KEY (kind, key)
                 );",
             )?;
-        }
 
+        // The columns below are checked only when the sidecar is first
+        // attached to this connection (a call that finds it attached has
+        // nothing to add): `initialize` runs before every query, and three
+        // `pragma_table_info` lookups each time were a cost of their own.
+        //
         // `(volume, file_index)` -- the filesystem's own identity for the
         // file, from `lexmechanic_utils::filenames::identity`. Added after
         // the table existed, so an existing sidecar needs the columns
@@ -311,6 +378,7 @@ impl ChecksumStore {
             .unwrap_or(false);
         if !has_scanned {
             let _ = conn.execute("ALTER TABLE checksums_db.pdf_fingerprints ADD COLUMN scanned INTEGER NOT NULL DEFAULT 0", ());
+        }
         }
         Ok(())
     }
@@ -436,6 +504,53 @@ impl ChecksumStore {
         Ok(())
     }
 
+    /// [`ChecksumStore::mark_inflight`] for many keys, in one transaction (one
+    /// commit rather than one per file). Durable before it returns, so the
+    /// marks are on disk before any of the files is read.
+    pub fn mark_inflight_many(&self, kind: &str, keys: &[&str]) -> Result<(), ChecksumError> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        self.initialize()?;
+        retry_on_busy(|| {
+            let mut conn = self.conn.lock().unwrap();
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            {
+                let mut stmt = tx.prepare_cached("INSERT OR REPLACE INTO checksums_db.inflight (kind, key, started_at) VALUES (?1, ?2, datetime('now'))")?;
+                for key in keys {
+                    stmt.execute((kind, key))?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Records the outcome of every file of one batch and removes their
+    /// in-flight marks, in one transaction: a crash leaves either the marks
+    /// (the files are suspects) or the results, never a file with neither.
+    pub fn finish_pdf_fingerprints(&self, kind: &str, outcomes: &[(&str, Result<crate::pdf_similarity::PdfFingerprint, String>)], cleared: &[&str]) -> Result<(), ChecksumError> {
+        if outcomes.is_empty() && cleared.is_empty() {
+            return Ok(());
+        }
+        self.initialize()?;
+        retry_on_busy(|| {
+            let mut conn = self.conn.lock().unwrap();
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            for (hash, outcome) in outcomes {
+                Self::record_pdf_fingerprint_on(&tx, hash, outcome)?;
+            }
+            {
+                let mut stmt = tx.prepare_cached("DELETE FROM checksums_db.inflight WHERE kind = ?1 AND key = ?2")?;
+                for key in cleared {
+                    stmt.execute((kind, key))?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     /// Every key of `kind` still marked in flight, removing the marks. Called
     /// at the start of a job, when nothing of that kind can really be in
     /// flight (one job per library), so what is found was left by a run that
@@ -499,8 +614,7 @@ impl ChecksumStore {
     /// never writes this sidecar. One query for the whole library rather
     /// than a lookup per file.
     pub fn formats_without_hash(&self) -> Result<Vec<(i32, String, String, String)>, ChecksumError> {
-        self.initialize()?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn()?;
         let mut stmt = conn.prepare(
             "SELECT d.book, d.format, d.name, b.path
              FROM data d JOIN books b ON b.id = d.book
@@ -549,8 +663,7 @@ impl ChecksumStore {
     /// of the pass.
     #[allow(clippy::type_complexity)]
     pub fn all_format_records(&self) -> Result<std::collections::HashMap<(i32, String), (String, i64, Option<lexmechanic_utils::filenames::FileIdentity>)>, ChecksumError> {
-        self.initialize()?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn()?;
         let mut stmt = conn.prepare("SELECT book_id, key, blake3_hex, size, volume, file_index FROM checksums_db.file_checksums WHERE kind = 'format'")?;
         let rows = stmt.query_map([], |row| {
             let identity = match (row.get::<_, Option<i64>>(4)?, row.get::<_, Option<i64>>(5)?) {
@@ -686,8 +799,7 @@ impl ChecksumStore {
     /// book whose cover happens to match another book's format file,
     /// which is meaningless.
     pub fn books_sharing_content(&self, kind: &str) -> Result<Vec<(String, Vec<i32>)>, ChecksumError> {
-        self.initialize()?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn()?;
         let mut stmt = conn.prepare(
             "SELECT blake3_hex, book_id FROM checksums_db.file_checksums
              WHERE kind = ?1 AND size > 0
@@ -724,8 +836,7 @@ impl ChecksumStore {
     /// kept **out** of [`Self::books_sharing_content`]: two empty files are
     /// not the same book. They are reported on their own instead.
     pub fn empty_files(&self, kind: &str) -> Result<Vec<(i32, String)>, ChecksumError> {
-        self.initialize()?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn()?;
         let mut stmt = conn.prepare("SELECT book_id, key FROM checksums_db.file_checksums WHERE kind = ?1 AND size = 0 ORDER BY book_id, key")?;
         let rows = stmt.query_map([kind], |row| Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?)))?;
         let mut out = Vec::new();
@@ -804,8 +915,7 @@ impl ChecksumStore {
     /// PDF formats with a content hash and no current-version fingerprint
     /// (neither a good one nor a recorded failure).
     pub fn pdf_fingerprints_pending(&self) -> Result<Vec<PendingPdf>, ChecksumError> {
-        self.initialize()?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn()?;
         let mut stmt = conn.prepare(
             "SELECT c.book_id, c.key, c.blake3_hex, d.name, b.path
              FROM checksums_db.file_checksums c
@@ -826,6 +936,12 @@ impl ChecksumStore {
     pub fn record_pdf_fingerprint(&self, hash: &str, outcome: &Result<crate::pdf_similarity::PdfFingerprint, String>) -> Result<(), ChecksumError> {
         self.initialize()?;
         let conn = self.conn.lock().unwrap();
+        Ok(Self::record_pdf_fingerprint_on(&conn, hash, outcome)?)
+    }
+
+    /// The statement behind [`ChecksumStore::record_pdf_fingerprint`], on a
+    /// connection (or transaction) the caller holds.
+    fn record_pdf_fingerprint_on(conn: &Connection, hash: &str, outcome: &Result<crate::pdf_similarity::PdfFingerprint, String>) -> SqlResult<()> {
         let version = crate::pdf_similarity::FINGERPRINT_VERSION;
         match outcome {
             Ok(fp) => conn.execute(
@@ -874,8 +990,7 @@ impl ChecksumStore {
     /// Every good, current fingerprint with the books that hold that content.
     pub fn pdf_fingerprints(&self) -> Result<Vec<crate::pdf_similarity::LibraryFingerprint>, ChecksumError> {
         use crate::pdf_similarity::{LibraryFingerprint, PdfFingerprint};
-        self.initialize()?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn()?;
         let mut books: std::collections::HashMap<String, (Vec<i32>, i64)> = std::collections::HashMap::new();
         {
             let mut stmt = conn.prepare(
@@ -906,16 +1021,32 @@ impl ChecksumStore {
     /// How many of the library's PDF formats are fingerprinted, failed, owed
     /// a fingerprint, or have no hash to key one by.
     pub fn pdf_status(&self) -> Result<crate::pdf_similarity::PdfStatus, ChecksumError> {
-        self.initialize()?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn()?;
+        Self::pdf_status_on(&conn)
+    }
+
+    /// [`ChecksumStore::pdf_status`] in one pass: every PDF row of `data`
+    /// once, left-joined to its hash and then to its fingerprint (each of
+    /// which has at most one row per PDF: the hash by `(book, kind, key)`,
+    /// the fingerprint by hash), counted with conditional sums. It was four
+    /// `count(*)` queries, three of them joins, which took 1.6 s at 60,000
+    /// PDFs. `data.format` is `COLLATE NOCASE`, so `= 'PDF'` matches the
+    /// same rows `UPPER(format) = 'PDF'` did, and can use the index.
+    fn pdf_status_on(conn: &Connection) -> Result<crate::pdf_similarity::PdfStatus, ChecksumError> {
         let version = crate::pdf_similarity::FINGERPRINT_VERSION;
-        let count = |sql: &str| -> SqlResult<usize> { conn.query_row(sql, [version], |r| r.get::<_, i64>(0)).map(|n| n as usize) };
-        let hashed_join = "FROM data d JOIN checksums_db.file_checksums c ON c.book_id = d.book AND c.kind = 'format' AND c.key = d.format";
-        let fp_join = "JOIN checksums_db.pdf_fingerprints p ON p.blake3_hex = c.blake3_hex AND p.version = ?1";
-        let fingerprinted = count(&format!("SELECT count(*) {hashed_join} {fp_join} WHERE UPPER(d.format) = 'PDF' AND p.status = 'ok'"))?;
-        let failed = count(&format!("SELECT count(*) {hashed_join} {fp_join} WHERE UPPER(d.format) = 'PDF' AND p.status = 'failed'"))?;
-        let hashed = count(&format!("SELECT count(*) {hashed_join} WHERE UPPER(d.format) = 'PDF' AND ?1 = ?1"))?;
-        let all = count("SELECT count(*) FROM data d WHERE UPPER(d.format) = 'PDF' AND ?1 = ?1")?;
+        let (all, hashed, fingerprinted, failed): (i64, i64, i64, i64) = conn.query_row(
+            "SELECT count(*),
+                    count(c.blake3_hex),
+                    coalesce(sum(p.status = 'ok'), 0),
+                    coalesce(sum(p.status = 'failed'), 0)
+             FROM data d
+             LEFT JOIN checksums_db.file_checksums c ON c.book_id = d.book AND c.kind = 'format' AND c.key = d.format
+             LEFT JOIN checksums_db.pdf_fingerprints p ON p.blake3_hex = c.blake3_hex AND p.version = ?1
+             WHERE d.format = 'PDF'",
+            [version],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+        let (all, hashed, fingerprinted, failed) = (all as usize, hashed as usize, fingerprinted as usize, failed as usize);
         Ok(crate::pdf_similarity::PdfStatus { fingerprinted, failed, pending: hashed.saturating_sub(fingerprinted + failed), unhashed: all.saturating_sub(hashed) })
     }
 

@@ -45,6 +45,7 @@ mod integrity_tests;
 mod t26a_tests;
 #[cfg(test)]
 mod t29a_tests;
+mod t29b_tests;
 pub mod formatter_functions;
 pub mod fts;
 pub mod lazy;
