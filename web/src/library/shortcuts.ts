@@ -77,15 +77,25 @@ export function isActivatable(target: EventTarget | null): boolean {
 }
 
 /**
- * A key as it is written on a keycap or in a tooltip: "D" for "d", "Shift+S"
- * for "S", "Del", "Space". The binding is the real `KeyboardEvent.key`; this
- * is only how it is shown.
+ * A key as it is shown in a tooltip, a menu or Help: "d" for "d", "Shift+S"
+ * for "S", "Del", "Space", "→". The binding is the real `KeyboardEvent.key`;
+ * this is only how it is shown.
  */
+const KEY_NAMES: Record<string, string> = {
+  " ": "Space",
+  Delete: "Del",
+  Escape: "Esc",
+  ArrowRight: "→",
+  ArrowLeft: "←",
+  ArrowUp: "↑",
+  ArrowDown: "↓",
+};
+
 export function formatKey(key: string): string {
   if (!key) return "";
-  if (key === " ") return "Space";
-  if (key === "Delete") return "Del";
-  if (key.length === 1 && key >= "a" && key <= "z") return key.toUpperCase();
+  if (KEY_NAMES[key]) return KEY_NAMES[key];
+  // A plain letter is written as it is typed (`d`), and a capital as the chord it is
+  // (`Shift+E`), so the two never read alike.
   if (key.length === 1 && key >= "A" && key <= "Z") return `Shift+${key}`;
   return key;
 }

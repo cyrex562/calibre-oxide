@@ -17,6 +17,9 @@
 */
 
 :root {
+  /* Native controls (scrollbars, date pickers, tick boxes, select popups) follow the theme. */
+  color-scheme: light;
+
   /* Spacing — 2px base, 4px rhythm. */
   --sp-1: 2px;
   --sp-2: 4px;
@@ -98,6 +101,8 @@
      it always did. */
   --bg-field: var(--bg);
   --fg-on-selected: var(--fg);
+  /* How much of a coloring rule's color tints its row; the text stays --fg (readable for any color). */
+  --row-tint: 22%;
 }
 
 /*
@@ -111,6 +116,7 @@
 */
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
+    color-scheme: dark;
     --bg: #1b1e23;
     --bg-sunken: #16181c;
     --bg-bar: #22262c;
@@ -144,6 +150,7 @@
 }
 
 :root[data-theme="dark"] {
+  color-scheme: dark;
   --bg: #1b1e23;
   --bg-sunken: #16181c;
   --bg-bar: #22262c;
@@ -429,6 +436,15 @@ a {
   flex-direction: column;
   gap: 0.2rem;
 }
+/* A tick box or a radio button sits beside its label, not above it. */
+.manage-panel .field.checkbox,
+.manage-panel .field.import-check,
+.manage-panel .field:has(> input[type="checkbox"]),
+.manage-panel .field:has(> input[type="radio"]) {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.4em;
+}
 .manage-panel .hint {
   color: var(--fg-muted);
   font-size: var(--fs-body);
@@ -466,6 +482,13 @@ a {
   padding: 0.35em 0.5em;
   border: 1px solid var(--border);
   border-radius: 4px;
+}
+/* A placeholder is an example, never a value: faint and italic everywhere, and the
+   examples themselves start "e.g." (a test reads the panel's own). */
+::placeholder {
+  color: var(--fg-faint);
+  font-style: italic;
+  opacity: 1;
 }
 .manage-panel .news-hint {
   color: var(--fg-muted);

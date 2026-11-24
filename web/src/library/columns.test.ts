@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { clampWidth, columnsFor, DEFAULT_TABLE_PREFS, DEFAULT_VISIBLE_KEYS, formatBytes, formatCell, MAX_COLUMN_WIDTH, MIN_COLUMN_WIDTH, nextSort, resolveColumns, type BookColumn, type TablePrefs } from "./columns";
+import { clampWidth, columnsFor, DEFAULT_TABLE_PREFS, DEFAULT_VISIBLE_KEYS, formatBytes, formatCell, MAX_COLUMN_WIDTH, MIN_COLUMN_WIDTH, nextSort, resolveColumns, sortsBy, type BookColumn, type TablePrefs } from "./columns";
 import type { BookSummary, FieldMetaEntry } from "./types";
 
 /**
@@ -177,8 +177,9 @@ describe("columnsFor", () => {
   // The server has no separate sort for these two, so the picker says where to sort instead
   // of the bare "(not sortable)" that made series-heavy libraries look unsortable.
   it("tells Number and Author sort where to sort instead", () => {
+    // With no Series sort to lean on, Number still points there.
+    expect(columnsFor({}, [["authors", "Authors"]]).find((c) => c.key === "series_index")?.sortNote).toMatch(/Series/);
     const columns = columnsFor({}, [["series", "Series"], ["authors", "Authors"]]);
-    expect(columns.find((c) => c.key === "series_index")?.sortNote).toMatch(/Series/);
     expect(columns.find((c) => c.key === "author_sort")?.sortNote).toMatch(/Authors/);
     expect(columns.find((c) => c.key === "title")?.sortNote).toBeUndefined();
   });
@@ -286,5 +287,26 @@ describe("defaults", () => {
     // The deliberate choice for a PDF-first library, where covers
     // carry almost no information.
     expect(DEFAULT_TABLE_PREFS.view).toBe("table");
+  });
+});
+
+describe("the Number column sorts by series, then number (U18)", () => {
+  const columns = columnsFor({}, [["series", "Series"], ["title", "Title"]]);
+  const number = columns.find((c) => c.key === "series_index")!;
+  const series = columns.find((c) => c.key === "series")!;
+
+  it("is sortable once Series is, with no note left", () => {
+    expect(number.sortKey).toBe("series,series_index");
+    expect(number.sortNote).toBeUndefined();
+  });
+  it("sorts both fields on a first click, and flips on the second", () => {
+    expect(nextSort(number, "title", "asc")).toEqual({ sort: "series,series_index", order: "asc" });
+    expect(nextSort(number, "series,series_index", "asc")).toEqual({ sort: "series,series_index", order: "desc" });
+  });
+  it("is not what a Series-only sort is, and a Series click while sorted by Number just flips", () => {
+    expect(sortsBy(number, "series")).toBe(false);
+    expect(sortsBy(series, "series,series_index")).toBe(true);
+    expect(sortsBy(number, "series, series_index")).toBe(true);
+    expect(nextSort(number, "series", "asc")).toEqual({ sort: "series,series_index", order: "asc" });
   });
 });

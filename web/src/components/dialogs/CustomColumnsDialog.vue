@@ -8,10 +8,10 @@
 // real, disclosed narrowing rather than a checkbox that would look like it
 // works but doesn't.
 
-import { onMounted, ref } from "vue";
+import { onMounted, ref, watch } from "vue";
 
 import { addCustomColumn, fetchCustomColumns, removeCustomColumn } from "../../library/api";
-import { COLUMN_EXPLANATIONS, COLUMN_PRESETS, columnDraftProblem, createColumn, presetDraft, type ColumnPreset } from "../../library/columnPresets";
+import { COLUMN_EXPLANATIONS, COLUMN_PRESETS, columnDraftProblem, createColumn, labelFromName, presetDraft, type ColumnPreset } from "../../library/columnPresets";
 import type { CustomColumnInfo } from "../../library/types";
 import Dialog from "../Dialog.vue";
 import { confirmDialog } from "./confirm";
@@ -27,6 +27,11 @@ const customColumns = ref<Record<string, CustomColumnInfo>>({});
 const newColumnLabel = ref("");
 const newColumnName = ref("");
 const newColumnDatatype = ref("text");
+// The label (what the column is called in searches and templates) follows the display name until it is edited by hand.
+const labelEdited = ref(false);
+watch(newColumnName, (name) => {
+  if (!labelEdited.value) newColumnLabel.value = labelFromName(name);
+});
 
 async function loadCustomColumns() {
   try {
@@ -72,6 +77,7 @@ async function createCustomColumn() {
     await addCustomColumn(newColumnLabel.value.trim(), newColumnName.value.trim(), newColumnDatatype.value);
     newColumnLabel.value = "";
     newColumnName.value = "";
+    labelEdited.value = false;
     await onColumnsChanged();
   } catch (e) {
     columnsError.value = e instanceof Error ? e.message : String(e);
@@ -119,8 +125,7 @@ async function removeCustomColumnClick(label: string) {
       </div>
       <h4>Or make your own</h4>
       <form class="manage-form" @submit.prevent="createCustomColumn">
-        <input v-model="newColumnLabel" placeholder="Label (e.g. shelf)" pattern="[a-zA-Z0-9_]+" title="Letters, numbers, and underscores only" required />
-        <input v-model="newColumnName" placeholder="Display name (e.g. Shelf)" required />
+        <input v-model="newColumnName" placeholder="Name, e.g. Scan quality" aria-label="Display name" required />
         <select v-model="newColumnDatatype">
           <option value="text">Text</option>
           <option value="comments">Long text</option>
@@ -130,6 +135,13 @@ async function removeCustomColumnClick(label: string) {
           <option value="rating">Rating</option>
         </select>
         <button type="submit">Add</button>
+        <details class="column-advanced">
+          <summary>Label</summary>
+          <label class="field">
+            Used in searches and templates as <code>#{{ newColumnLabel || "label" }}</code>
+            <input v-model="newColumnLabel" aria-label="Label" pattern="[a-z0-9_]+" title="Lower case letters, numbers and underscores only" required @input="labelEdited = true" />
+          </label>
+        </details>
       </form>
     </section>
   </Dialog>
@@ -160,6 +172,13 @@ async function removeCustomColumnClick(label: string) {
   gap: 0.5rem;
   flex-wrap: wrap;
   margin-bottom: 0.4rem;
+}
+.manage-form {
+  flex-wrap: wrap;
+}
+.column-advanced {
+  flex: 1 0 100%;
+  font-size: var(--fs-small);
 }
 .column-notes {
   margin: 0.4rem 0;

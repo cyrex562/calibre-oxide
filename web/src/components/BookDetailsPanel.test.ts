@@ -14,6 +14,8 @@ const apiMocks = vi.hoisted(() => ({
   setFields: vi.fn(),
   fetchFieldMetadata: vi.fn(),
   fetchDataFiles: vi.fn(),
+  fetchBooks: vi.fn(),
+  fetchConversionBookData: vi.fn(),
 }));
 const pdfMocks = vi.hoisted(() => ({
   getDocument: vi.fn(),
@@ -100,6 +102,7 @@ beforeEach(() => {
   apiMocks.setFields.mockImplementation(async (id: number, changes: Record<string, unknown>) => ({ ...books[id], ...changes, authors: books[id].authors }));
   apiMocks.fetchFieldMetadata.mockResolvedValue({ field_metadata: {}, sortable_fields: [] });
   apiMocks.fetchDataFiles.mockResolvedValue({});
+  apiMocks.fetchBooks.mockResolvedValue([]);
   pdfMocks.getDocument.mockImplementation(() => ({
     promise: Promise.resolve({ numPages: 3, getPage: async () => ({ getViewport: () => ({ width: 600 }) }), destroy: vi.fn() }),
   }));
@@ -388,11 +391,56 @@ describe("preview", () => {
   });
 });
 
+describe("the Convert block", () => {
+  it("offers only real targets, and focuses To when it opens", async () => {
+    apiMocks.fetchConversionBookData.mockResolvedValue({ input_formats: ["pdf"], output_formats: ["azw3", "epub", "lit", "lrf", "markdown", "md", "pdf", "text", "txt"] });
+    const { el } = await mountPanel();
+    const convert = Array.from(el.querySelectorAll<HTMLButtonElement>("button")).find((b) => b.textContent?.trim() === "Convert…")!;
+    convert.click();
+    await settle();
+    const to = el.querySelectorAll<HTMLSelectElement>(".convert-panel select")[1];
+    expect(Array.from(to.options).map((o) => o.value)).toEqual(["azw3", "epub", "markdown", "txt"]);
+    expect(to.value).toBe("azw3");
+    expect(document.activeElement).toBe(to);
+  });
+});
+
 describe("files and Show in folder", () => {
   it("lists each format with the book's folder path", async () => {
     const { el } = await mountPanel();
     expect(section(el, "files")!.querySelector("[data-format='pdf']")).not.toBeNull();
     expect(el.querySelector("[data-testid='folder-path']")!.textContent).toBe("Ann Lee/Book 1 (1)");
+  });
+
+  it("shows where each file is (folder and file name), with a Copy path button, and the table's size format", async () => {
+    apiMocks.fetchBooks.mockResolvedValue([{ ...books[1], folder: "Unsorted/dupes", file_name: "copy of code_silence_0.pdf" }]);
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, headers: new Headers({ "content-length": "23768" }) })));
+    const written: string[] = [];
+    Object.defineProperty(navigator, "clipboard", { value: { writeText: async (t: string) => void written.push(t) }, configurable: true });
+    const { el } = await mountPanel();
+    const row = section(el, "files")!.querySelector("[data-format='pdf']")!;
+    expect(row.querySelector("[data-testid='file-path']")!.textContent).toContain("Ann Lee/Book 1 (1)/copy of code_silence_0.pdf");
+    expect(row.querySelector(".file-size")!.textContent).toBe("23.2 KB");
+    row.querySelector<HTMLButtonElement>("[data-action='copy-path']")!.click();
+    await settle();
+    expect(written).toEqual(["Ann Lee/Book 1 (1)/copy of code_silence_0.pdf"]);
+  });
+
+  it("falls back to the folder the file row gives when the book itself has no path", async () => {
+    books[1] = { ...makeBook(1, ["pdf"]), path: undefined } as unknown as BookSummary;
+    apiMocks.fetchBooks.mockResolvedValue([{ ...books[1], folder: "Scans", file_name: "scan0030.pdf" }]);
+    const { el } = await mountPanel();
+    expect(el.querySelector("[data-testid='folder-path']")!.textContent).toBe("Scans");
+    expect(el.querySelector("[data-testid='file-path'] code")!.textContent).toBe("Scans/scan0030.pdf");
+  });
+
+  it("draws a placeholder when the cover does not load, not a broken image", async () => {
+    const { el } = await mountPanel();
+    const img = section(el, "cover")!.querySelector<HTMLImageElement>("img.cover")!;
+    img.dispatchEvent(new Event("error"));
+    await settle();
+    expect(section(el, "cover")!.querySelector("img.cover")).toBeNull();
+    expect(section(el, "cover")!.querySelector(".cover-missing")!.textContent).toBe("No cover");
   });
 
   it("hides Show in folder in a plain browser", async () => {

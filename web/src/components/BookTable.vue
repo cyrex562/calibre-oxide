@@ -17,7 +17,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { autoFitWidth, CHECK_COLUMN_WIDTH, dropIndex, isDrag, moveKeyTo, resizedColumnWidth, tableWidth } from "../library/columnLayout";
 import AutocompleteInput from "./AutocompleteInput.vue";
 import { completionFor } from "../library/fieldValues";
-import { formatCell, MAX_COLUMN_WIDTH, MIN_COLUMN_WIDTH, nextSort, type BookColumn } from "../library/columns";
+import { formatCell, MAX_COLUMN_WIDTH, MIN_COLUMN_WIDTH, nextSort, sortsBy, type BookColumn } from "../library/columns";
 import { defaultEditKey, editKeyAction, initialText, isEditable, isEmptyCell, neighbourEditableKey, startsEditing, type CommitResult } from "../library/inlineEdit";
 import type { BookSummary } from "../library/types";
 import { windowRange } from "../library/virtualList";
@@ -189,8 +189,7 @@ watch(currentId, async (id, was) => {
 
 /** The column currently driving the sort, if it is one we show. */
 function sortIndicator(column: BookColumn): "" | "▲" | "▼" {
-  if (!column.sortKey) return "";
-  if (props.sort.split(",")[0]?.trim() !== column.sortKey) return "";
+  if (!sortsBy(column, props.sort)) return "";
   return props.sortOrder === "asc" ? "▲" : "▼";
 }
 
@@ -535,7 +534,7 @@ function hint(column: BookColumn): string {
 
 <template>
   <div ref="scroller" class="table-scroll" tabindex="-1" @scroll.passive="onScroll" @keydown="onListKeydown">
-    <table class="book-table" role="grid" aria-label="Books" aria-multiselectable="true" :aria-rowcount="ids.length" :aria-colcount="columns.length + (selectMode ? 1 : 0)" :style="{ width: `${totalWidth}px`, minWidth: `${totalWidth}px` }">
+    <table class="book-table" role="grid" aria-label="Books" aria-multiselectable="true" :aria-rowcount="ids.length" :aria-colcount="columns.length + (selectMode ? 1 : 0)" :style="{ width: `${totalWidth}px`, minWidth: `${totalWidth}px`, '--sticky-left': selectMode ? `${CHECK_COLUMN_WIDTH}px` : '0px' }">
       <colgroup>
         <col v-if="selectMode" :style="{ width: `${CHECK_COLUMN_WIDTH}px` }" />
         <col v-for="column in columns" :key="column.key" :style="{ width: `${column.width}px` }" />
@@ -549,7 +548,7 @@ function hint(column: BookColumn): string {
             scope="col"
             :data-key="column.key"
             :style="{ width: `${column.width}px` }"
-            :class="[{ sortable: !!column.sortKey, dragging: headerDrag?.active && headerDrag.key === column.key }, dropClass(ci)]"
+            :class="[{ sortable: !!column.sortKey, dragging: headerDrag?.active && headerDrag.key === column.key, 'sticky-col': ci === 0 }, dropClass(ci)]"
             :title="column.tooltip"
             :aria-sort="sortIndicator(column) === '▲' ? 'ascending' : sortIndicator(column) === '▼' ? 'descending' : 'none'"
             :aria-colindex="ci + 1 + (selectMode ? 1 : 0)"
@@ -596,8 +595,8 @@ function hint(column: BookColumn): string {
             :aria-selected="selectedIds.has(ids[i]) || (!selectMode && selectedBookId === ids[i])"
             :draggable="editing?.id === ids[i] ? 'false' : 'true'"
             @dragstart="onRowDragStart(ids[i], $event)"
-            :class="{ selected: selectedIds.has(ids[i]) || (!selectMode && selectedBookId === ids[i]) }"
-            :style="rowColors?.get(ids[i]) ? { color: rowColors.get(ids[i]) } : undefined"
+            :class="{ selected: selectedIds.has(ids[i]) || (!selectMode && selectedBookId === ids[i]), 'row-colored': rowColors?.has(ids[i]) }"
+            :style="rowColors?.get(ids[i]) ? { '--row-color': rowColors.get(ids[i]) } : undefined"
             @click="onRowClick(ids[i], $event)"
             @keydown="onRowKeydown($event, ids[i])"
             @contextmenu.prevent="emit('contextMenu', { bookId: ids[i], x: $event.clientX, y: $event.clientY })"
@@ -606,10 +605,10 @@ function hint(column: BookColumn): string {
               <input type="checkbox" :checked="selectedIds.has(ids[i])" :aria-label="`Select ${getBook(ids[i])!.title}`" @click.stop="onRowClick(ids[i], $event)" />
             </td>
             <td
-              v-for="column in columns"
+              v-for="(column, ci) in columns"
               :key="column.key"
               :style="{ width: `${column.width}px` }"
-              :class="[`kind-${column.kind}`, { editable: commit && isEditable(column), 'empty-editable': commit && isEditable(column) && isEmptyCell(getBook(ids[i])!, column), editing: isEditingCell(ids[i], column), 'has-error': isEditingCell(ids[i], column) && editing?.error }]"
+              :class="[`kind-${column.kind}`, { 'sticky-col': ci === 0, editable: commit && isEditable(column), 'empty-editable': commit && isEditable(column) && isEmptyCell(getBook(ids[i])!, column), editing: isEditingCell(ids[i], column), 'has-error': isEditingCell(ids[i], column) && editing?.error }]"
               :data-hint="commit && isEditable(column) ? hint(column) : undefined"
               :title="isEditingCell(ids[i], column) && editing?.error ? editing.error : formatCell(getBook(ids[i])!, column)"
               @click="onCellClick($event, getBook(ids[i])!, column)"
@@ -845,6 +844,41 @@ function hint(column: BookColumn): string {
   background: var(--bg-selected);
 }
 
+/* The first column (Title) stays put while the others scroll sideways, so a row can always
+   be told from the next. It needs a surface of its own, or the cells passing under it show
+   through; each row state paints the same surface the row itself has. */
+.book-table td.sticky-col,
+.book-table th.sticky-col {
+  position: sticky;
+  left: var(--sticky-left, 0px);
+}
+.book-table td.sticky-col {
+  z-index: 1;
+  background: var(--bg-field);
+}
+.book-table thead th.sticky-col {
+  z-index: 2;
+}
+.book-table tbody tr:hover td.sticky-col {
+  background: var(--accent-soft);
+}
+.book-table tbody tr.selected td.sticky-col {
+  background: var(--bg-selected);
+}
+
+/* A coloring rule's color (Settings > Row colors): a tint behind the row and a bar at its
+   left edge, with the text left in the theme's own color, so it reads on every skin. The tint
+   share is --row-tint (style.css), which a test holds to 4.5:1 for any color on every theme. */
+.book-table tbody tr.row-colored:not(.selected) td {
+  background: color-mix(in srgb, var(--row-color) var(--row-tint), var(--bg-field));
+}
+.book-table tbody tr.row-colored:not(.selected):hover td {
+  background: color-mix(in srgb, var(--row-color) calc(var(--row-tint) + 10%), var(--bg-field));
+}
+.book-table tbody tr.row-colored td:first-child {
+  box-shadow: inset 4px 0 0 var(--row-color);
+}
+
 .book-table tbody tr:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
@@ -853,6 +887,22 @@ function hint(column: BookColumn): string {
 .check-col {
   width: 34px;
   min-width: 34px;
+}
+/* The tick column stays with the sticky first column. */
+.book-table td.check-col,
+.book-table th.check-col {
+  position: sticky;
+  left: 0;
+}
+.book-table td.check-col {
+  z-index: 1;
+  background: var(--bg-field);
+}
+.book-table thead th.check-col {
+  z-index: 2;
+}
+.book-table tbody tr.selected td.check-col {
+  background: var(--bg-selected);
 }
 
 .kind-number,

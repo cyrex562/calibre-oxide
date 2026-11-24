@@ -10,6 +10,7 @@ import {
   CHECK_LIBRARY_LABELS, cancelLibraryJob, checkLibrary, describeJobProgress, fetchIgnored, fetchOrphans, forgetOrphan, relocateOrphan, scanLibrary, unignoreFile, uploadOrphanFile,
 } from "../../library/api";
 import type { CheckLibraryFinding, CheckLibraryResult, IgnoredFile, Orphan } from "../../library/api";
+import { findingName } from "../../library/checkLibraryView";
 import Dialog from "../Dialog.vue";
 
 const props = defineProps<{ open: boolean }>();
@@ -17,6 +18,8 @@ const emit = defineEmits<{
   close: [];
   /** Books were added or changed: the list is stale. */
   changed: [];
+  /** A finding names a book: close and open it in the details panel. */
+  "show-book": [bookId: number];
 }>();
 
 const checkLibraryLoading = ref(false);
@@ -263,8 +266,9 @@ watch(
             <h4>{{ CHECK_LIBRARY_LABELS[key] ?? key }} ({{ findings.length }})</h4>
             <ul class="manage-list">
               <li v-for="(f, i) in findings" :key="i">
-                <span class="manage-name">{{ f.title || "—" }}</span>
-                <code class="manage-query">{{ f.path }}</code>
+                <span class="manage-name">{{ findingName(f) }}</span>
+                <code class="manage-query" :title="f.path">{{ f.path }}</code>
+                <button v-if="f.book_id !== null" type="button" data-action="show-book" @click="emit('show-book', f.book_id)">Show book</button>
               </li>
             </ul>
           </div>
@@ -324,6 +328,10 @@ watch(
           <p v-if="orphanMessage" class="news-hint">{{ orphanMessage }}</p>
         </template>
       </section>
+      <template #footer>
+        <button type="button" data-action="recheck" :disabled="checkLibraryLoading || rescanBusy" @click="runCheck">{{ checkLibraryLoading ? "Checking…" : "Check again" }}</button>
+        <button type="button" class="primary" @click="emit('close')">Close</button>
+      </template>
     </Dialog>
 </template>
 

@@ -269,7 +269,7 @@ function dismissedLabel(e: { members: { title: string }[] }): string {
                 <button v-if="!isKeeper(group, b)" type="button" title="Keep this copy" @click="store.chooseKeeper(group, b.book_id)">Keep this</button>
                 <button v-if="desktop && b.files?.length" type="button" @click="openBook(b)">Open</button>
                 <button v-if="desktop" type="button" @click="reveal(b)">Reveal</button>
-                <button type="button" class="danger" title="Moves the book to the library Trash, from where it can be restored" @click="remove(group, b)">Delete</button>
+                <button type="button" class="danger" title="Moves the book to the library Trash, from where it can be restored" @click="remove(group, b)">Move to Trash</button>
               </div>
             </div>
           </section>
