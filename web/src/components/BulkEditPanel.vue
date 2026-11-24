@@ -142,7 +142,7 @@ defineProps<{ bulk: BulkEdit; count: number }>();
   gap: 0.3rem;
   flex-wrap: wrap;
 }
-.bulk-combo input {
+.bulk-combo input:not([type="checkbox"]) {
   flex: 1;
   min-width: 8ch;
 }

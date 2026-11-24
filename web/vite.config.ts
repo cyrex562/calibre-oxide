@@ -14,6 +14,8 @@ export default defineConfig({
   plugins: [vue()],
   test: {
     environment: "jsdom",
+    // style.test.ts reads the colour tokens out of style.css; every other stylesheet stays unprocessed.
+    css: { include: [/[\\/]style\.css/] },
   },
   server: {
     port: 5180,

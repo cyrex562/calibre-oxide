@@ -4,6 +4,8 @@ import {
   clamp,
   DETAILS_MAX,
   DETAILS_MIN,
+  isNarrow,
+  NARROW_BELOW,
   LAYOUT_DEFAULTS,
   parseLayout,
   resizedWidth,
@@ -76,6 +78,16 @@ describe("parseLayout", () => {
     const out = parseLayout(stored);
     expect(out.sidebarWidth).toBe(SIDEBAR_MAX);
     expect(out.detailsWidth).toBe(DETAILS_MIN);
+  });
+
+  // At 900px, 215 + 355 of sidebar and details left the table 240px: one column of a book table.
+  it("calls a window narrow below 1100px, where the side panels become drawers", () => {
+    expect(NARROW_BELOW).toBe(1100);
+    expect(isNarrow(900)).toBe(true);
+    expect(isNarrow(1099)).toBe(true);
+    expect(isNarrow(1100)).toBe(false);
+    expect(isNarrow(1920)).toBe(false);
+    expect(isNarrow(Number.NaN)).toBe(false);
   });
 
   it("falls back per field, keeping the good ones", () => {

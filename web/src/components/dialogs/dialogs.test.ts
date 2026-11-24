@@ -168,8 +168,11 @@ describe("the dialogs taken out of the library view", () => {
     expect(rows).toHaveLength(3);
     rows[0].querySelector<HTMLInputElement>("input[type=checkbox]")!.dispatchEvent(new Event("change"));
     expect(toggle).toHaveBeenCalledWith("title");
-    rows[0].querySelector<HTMLButtonElement>("button[aria-label='Move down']")!.click();
+    rows[0].querySelector<HTMLButtonElement>("button[aria-label='Move Title down']")!.click();
     expect(move).toHaveBeenCalledWith("title", 1);
+    // Every row has its two arrows, so a ticked row is no taller than an unticked one; a hidden column's are disabled.
+    for (const row of rows) expect(row.querySelectorAll("button")).toHaveLength(2);
+    expect([...rows[2].querySelectorAll("button")].every((b) => b.disabled)).toBe(true);
     rows[0].dispatchEvent(new Event("dragstart"));
     rows[1].dispatchEvent(new Event("drop", { cancelable: true }));
     expect(reorder).toHaveBeenCalledWith("title", "authors");

@@ -364,7 +364,14 @@ function onRowClick(bookId: number, event?: MouseEvent) {
  */
 function onRowKeydown(event: KeyboardEvent, bookId: number) {
   if (editing.value) return;
-  if (event.key !== "Enter" && event.key !== " ") return;
+  if (event.key === "Enter") {
+    // Enter opens the book (the library's "read" shortcut, which listens on the window).
+    // All that is needed here is that the row it was pressed on is the current one; the
+    // selection is left alone when it already is, so Enter does not collapse a multi-selection.
+    if (props.selectedBookId !== bookId) onRowClick(bookId);
+    return;
+  }
+  if (event.key !== " ") return;
   event.preventDefault();
   onRowClick(bookId);
 }

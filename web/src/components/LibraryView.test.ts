@@ -93,6 +93,8 @@ function unmountView() {
 }
 
 beforeEach(() => {
+  // jsdom's window is 1024px wide, which is "narrow" (side panels as drawers); these tests are the wide layout.
+  window.innerWidth = 1400;
   localStorage.clear();
   sessionStorage.clear();
   state.tauri = false;

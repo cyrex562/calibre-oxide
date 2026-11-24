@@ -49,12 +49,11 @@ function onDrop(targetKey: string) {
         <label class="field checkbox">
           <input type="checkbox" :checked="props.shown.includes(column.key)" @change="emit('toggle', column.key)" />
           {{ column.label }}
-          <span v-if="!column.sortKey" class="hint inline">(not sortable)</span>
+          <span v-if="!column.sortKey" class="hint inline">({{ column.sortNote ?? "not sortable" }})</span>
         </label>
-        <template v-if="props.shown.includes(column.key)">
-          <button type="button" :disabled="props.shown.indexOf(column.key) === 0" title="Move up (left in the table)" aria-label="Move up" @click="emit('move', column.key, -1)">↑</button>
-          <button type="button" :disabled="props.shown.indexOf(column.key) === props.shown.length - 1" title="Move down (right in the table)" aria-label="Move down" @click="emit('move', column.key, 1)">↓</button>
-        </template>
+        <!-- On every row, disabled for a hidden column, so a ticked row is no taller than an unticked one. -->
+        <button type="button" :disabled="!props.shown.includes(column.key) || props.shown.indexOf(column.key) === 0" title="Move up (left in the table)" :aria-label="`Move ${column.label} up`" @click="emit('move', column.key, -1)">↑</button>
+        <button type="button" :disabled="!props.shown.includes(column.key) || props.shown.indexOf(column.key) === props.shown.length - 1" title="Move down (right in the table)" :aria-label="`Move ${column.label} down`" @click="emit('move', column.key, 1)">↓</button>
       </li>
     </ul>
     <template #footer>

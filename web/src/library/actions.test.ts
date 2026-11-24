@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { actionAvailable, actionEnabled, buildMenuSpec, findAction, LIBRARY_ACTIONS, toolbarActionEnabled, TOOLBAR_ACTIONS, TOOLBAR_LAYOUT, toolbarLayoutActionIds, toolbarOverflowEntries, toolbarOverflowIds, visibleToolbarActions, type ActionContext, type LibraryAction, type LibraryActionId } from "./actions";
+import { actionAvailable, actionEnabled, buildMenuSpec, findAction, LIBRARY_ACTIONS, refusalText, toolbarActionEnabled, TOOLBAR_ACTIONS, TOOLBAR_LAYOUT, toolbarLayoutActionIds, toolbarOverflowEntries, toolbarOverflowIds, visibleToolbarActions, type ActionContext, type LibraryAction, type LibraryActionId } from "./actions";
 
 const DESKTOP: ActionContext = { selectionCount: 0, isDesktop: true };
 const BROWSER: ActionContext = { selectionCount: 0, isDesktop: false };
@@ -54,14 +54,20 @@ describe("availability", () => {
   it("hides desktop-only actions in a browser tab rather than disabling them", () => {
     // Greying these out would promise something a browser tab can
     // never deliver no matter what the user does.
-    expect(actionAvailable(action("add-folder"), BROWSER)).toBe(false);
     expect(actionAvailable(action("switch-library"), BROWSER)).toBe(false);
-    expect(actionEnabled(action("add-folder"), BROWSER)).toBe(false);
+    expect(actionEnabled(action("switch-library"), BROWSER)).toBe(false);
   });
 
   it("allows desktop-only actions inside the desktop app", () => {
-    expect(actionAvailable(action("add-folder"), DESKTOP)).toBe(true);
-    expect(actionEnabled(action("add-folder"), DESKTOP)).toBe(true);
+    expect(actionAvailable(action("switch-library"), DESKTOP)).toBe(true);
+    expect(actionEnabled(action("switch-library"), DESKTOP)).toBe(true);
+  });
+
+  // The folder dialog takes a typed path, so a browser tab can add a folder too.
+  // It used to be desktop-only, which left the empty library's second button dead.
+  it("offers Add folder in a browser tab", () => {
+    expect(actionAvailable(action("add-folder"), BROWSER)).toBe(true);
+    expect(actionEnabled(action("add-folder"), BROWSER)).toBe(true);
   });
 
   it("leaves non-desktop actions available everywhere", () => {
@@ -143,7 +149,7 @@ describe("the native menu spec", () => {
   });
 
   it("drops unavailable actions entirely", () => {
-    expect(buildMenuSpec(["add-folder"], BROWSER)).toEqual([]);
+    expect(buildMenuSpec(["switch-library"], BROWSER)).toEqual([]);
   });
 
   it("ignores ids that are not in the registry", () => {
@@ -181,9 +187,9 @@ describe("what the toolbar renders", () => {
     ]);
   });
 
-  it("drops the two desktop-only actions in a browser tab", () => {
+  it("drops the desktop-only actions in a browser tab", () => {
     const ids = visibleToolbarActions({ ...base, ctx: BROWSER }).map((a) => a.id);
-    expect(ids).not.toContain("add-folder");
+    expect(ids).toContain("add-folder");
     expect(ids).not.toContain("switch-library");
     expect(ids).toContain("add-books");
   });
@@ -412,19 +418,37 @@ describe("the workflow toolbar", () => {
       return s && s.kind === "split" ? s.label : undefined;
     };
     expect(labelOf("organize-files")).toBe("Organize");
-    expect(labelOf("delete-book")).toBe("Remove");
+    expect(labelOf("delete-book")).toBe("Move to Trash");
+  });
+});
+
+describe("refusalText", () => {
+  it("says what the action needs, so a click that does nothing can explain itself", () => {
+    expect(refusalText(action("read"), BROWSER)).toBe("Read needs exactly one book selected.");
+    expect(refusalText(action("merge-books"), BROWSER)).toBe("Merge books needs two or more books selected.");
+    expect(refusalText(action("save-to-disk"), BROWSER)).toBe("Save to disk needs at least one book selected.");
+    expect(refusalText(action("switch-library"), BROWSER)).toBe("Switch library is only available in the desktop app.");
+  });
+});
+
+describe("one word for removing a book", () => {
+  it("calls every reversible removal Move to Trash, and keeps Delete for the Trash dialog", () => {
+    expect(action("delete-book").label).toBe("Move to Trash");
+    expect(action("trash").label).toBe("Open Trash…");
+    const labels = LIBRARY_ACTIONS.map((a) => a.label);
+    expect(labels.filter((l) => /^(Delete|Remove)\b/.test(l))).toEqual([]);
   });
 });
 
 describe("the trash action", () => {
-  it("is available everywhere, needs no selection, and lives in the Library menu rather than the toolbar", () => {
+  it("is available everywhere, needs no selection, and lives in the Move to Trash menu rather than the toolbar", () => {
     const trash = LIBRARY_ACTIONS.find((a) => a.id === "trash")!;
     expect(trash).toBeDefined();
     expect(trash.requires).toBe("none");
     expect(trash.toolbar).toBeFalsy();
     expect(TOOLBAR_ACTIONS.map((a) => a.id)).not.toContain("trash");
-    const library = TOOLBAR_LAYOUT.find((i) => i.kind === "menu" && i.id === "library");
-    expect(library && "menu" in library ? library.menu : []).toContain("trash");
+    const remove = TOOLBAR_LAYOUT.find((i) => i.kind === "split" && i.id === "delete-book");
+    expect(remove && "menu" in remove ? remove.menu : []).toContain("trash");
   });
 
   it("is not suppressed by being a browser tab: restoring a deleted book works the same there", () => {

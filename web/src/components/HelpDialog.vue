@@ -16,6 +16,7 @@ import { computed } from "vue";
 import { LIBRARY_ACTIONS, type ActionGroup, type LibraryAction, type LibraryActionId } from "../library/actions";
 import { isTauri } from "../tauri";
 import { KEYMAP_ACTION_LABELS, type KeymapAction, type KeymapPrefs } from "../settings/api";
+import { formatKey } from "../library/shortcuts";
 
 const props = defineProps<{ keymap: KeymapPrefs }>();
 const emit = defineEmits<{ close: [] }>();
@@ -39,7 +40,7 @@ const REQUIREMENT_NOTES: Record<LibraryAction["requires"], string> = {
 /** The binding for an action, if it has one. */
 function shortcutFor(id: LibraryActionId): string | null {
   const binding = (props.keymap as Record<string, string | undefined>)[id];
-  return binding || null;
+  return binding ? formatKey(binding) : null;
 }
 
 // Desktop-only actions are hidden in a browser tab, exactly as they
@@ -83,7 +84,7 @@ const readerShortcuts = computed(() =>
       <ul class="help-list">
         <li v-for="r in readerShortcuts" :key="r.label">
           <span class="help-label">{{ r.label }}</span>
-          <kbd>{{ r.key }}</kbd>
+          <kbd>{{ formatKey(r.key) }}</kbd>
           <span class="help-note"></span>
         </li>
       </ul>

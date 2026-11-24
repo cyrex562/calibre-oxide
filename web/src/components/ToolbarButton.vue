@@ -24,11 +24,21 @@ const props = defineProps<{
   title?: string;
   /** Icon-only, for a narrow window. The label becomes the tooltip. */
   compact?: boolean;
+  /** What the arrow is called to a screen reader ("Virtual library options"); defaults to the label. */
+  menuLabel?: string;
+  /** The menu this button opens is showing right now. */
+  expanded?: boolean;
+  /** The body itself opens the menu (a menu slot, "More"), so it is the popup trigger too. */
+  bodyOpensMenu?: boolean;
 }>();
 
 const emit = defineEmits<{
-  /** The body was clicked: run the primary action. */
-  run: [];
+  /**
+   * The body was clicked: run the primary action. Carries the button's anchor,
+   * for a slot whose body opens a menu: the menu belongs under the button, not
+   * at the window's corner.
+   */
+  run: [anchor: { x: number; y: number }];
   /** The menu should open, anchored to this rectangle. */
   menu: [anchor: { x: number; y: number }];
 }>();
@@ -54,7 +64,7 @@ function openMenu() {
 
 function onBodyClick() {
   if (props.disabled) return;
-  emit("run");
+  emit("run", anchorRect());
 }
 
 /**
@@ -78,6 +88,12 @@ function onContextMenu(event: MouseEvent) {
 }
 
 const tooltip = computed(() => props.title ?? (props.compact ? props.label : undefined));
+
+/** "Add Books options", "Virtual library options": never an empty or doubled name. */
+const chevronName = computed(() => {
+  const base = (props.menuLabel ?? (props.label || props.title || "More")).replace(/…$/, "").trim();
+  return props.menuLabel ? base : `${base} options`;
+});
 </script>
 
 <template>
@@ -93,6 +109,8 @@ const tooltip = computed(() => props.title ?? (props.compact ? props.label : und
       :disabled="disabled"
       :title="tooltip"
       :aria-pressed="active ? 'true' : undefined"
+      :aria-haspopup="bodyOpensMenu ? 'menu' : undefined"
+      :aria-expanded="bodyOpensMenu ? (expanded ? 'true' : 'false') : undefined"
       @click="onBodyClick"
     >
       <AppIcon v-if="icon" class="tb-icon" :name="icon" :size="22" />
@@ -102,10 +120,12 @@ const tooltip = computed(() => props.title ?? (props.compact ? props.label : und
       v-if="hasMenu"
       type="button"
       class="tb-chevron"
-      :title="`More ${label.toLowerCase().replace(/…$/, '')} actions`"
-      :aria-label="`More ${label} actions`"
+      :title="chevronName"
+      :aria-label="chevronName"
+      aria-haspopup="menu"
+      :aria-expanded="expanded ? 'true' : 'false'"
       @click="onChevronClick"
-    >▾</button>
+    ><AppIcon name="chevron-down" :size="12" :stroke-width="2.25" /></button>
   </div>
 </template>
 
@@ -150,8 +170,9 @@ const tooltip = computed(() => props.title ?? (props.compact ? props.label : und
   justify-content: center;
   gap: var(--sp-1);
   padding: var(--sp-2) var(--sp-4);
+  /* Sized to the label, not to a fixed width: "Find duplicates…" was cut to
+     "Find duplicate…" by a 96px cap. The label still never wraps. */
   min-width: 56px;
-  max-width: 96px;
   height: var(--tb-h);
 }
 .compact .tb-body {
@@ -182,8 +203,8 @@ const tooltip = computed(() => props.title ?? (props.compact ? props.label : und
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 14px;
-  font-size: var(--fs-micro);
+  /* 22px wide: the arrow is its own click target and 14px was too small to hit. */
+  width: 22px;
   color: var(--fg-muted);
   flex-shrink: 0;
 }

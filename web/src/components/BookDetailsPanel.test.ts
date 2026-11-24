@@ -172,6 +172,18 @@ describe("metadata form", () => {
     expect(revert(el).disabled).toBe(false);
   });
 
+  // A flat, borderless blue box left a disabled Save looking enabled in Classic. The buttons
+  // are the skin's default (`primary`) buttons now, which both skins draw, disabled included.
+  it("draws Save and Read as the skin's default buttons, and names the removal 'Move to Trash'", async () => {
+    const { el } = await mountPanel();
+    expect(save(el).classList.contains("primary")).toBe(true);
+    const read = [...el.querySelectorAll<HTMLButtonElement>("button.read")].find((b) => b.textContent?.startsWith("Read"));
+    expect(read?.classList.contains("primary")).toBe(true);
+    const remove = el.querySelector<HTMLButtonElement>("button.delete");
+    expect(remove?.textContent?.trim()).toBe("Move to Trash");
+    expect(el.querySelector("button.close")?.getAttribute("aria-label")).toBe("Hide details");
+  });
+
   it("reverts to the saved values", async () => {
     const { el } = await mountPanel();
     await type(titleInput(el), "Changed");

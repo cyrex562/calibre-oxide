@@ -77,11 +77,12 @@
   color: var(--fg-faint);
   text-shadow: 1px 1px 0 var(--bevel-dark);
 }
-/* The default button wears the extra black frame. */
+/* The default button wears the extra black frame, and bold text, as it did in Windows 2000. */
 :where(:root[data-skin="classic"]) button.primary {
   border-color: var(--edge-raised);
   background: var(--face-raised);
   color: var(--fg);
+  font-weight: 700;
   box-shadow: 0 0 0 1px var(--bevel-dark);
   margin: 1px;
 }
@@ -92,6 +93,12 @@
 :where(:root[data-skin="classic"]) button.primary:active:not(:disabled) {
   border-color: var(--edge-pressed);
   background: var(--face-pressed);
+}
+/* A disabled default button is greyed text like any other: bold white would read as live. */
+:where(:root[data-skin="classic"]) button.primary:disabled {
+  color: var(--fg-faint);
+  font-weight: 400;
+  text-shadow: 1px 1px 0 var(--bevel-dark);
 }
 :where(:root[data-skin="classic"]) button.danger {
   background: var(--face-raised);

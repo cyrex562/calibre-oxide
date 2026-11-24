@@ -14,17 +14,43 @@ async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
   return (await resp.json()) as T;
 }
 
+// Every preference blob comes from the one `get-all` call, and a library page
+// reads six of them at start-up (library, toolbar, table, keymap, layout...), so
+// the response is shared: one request per page load, not one per blob. A failed
+// request is not remembered (the next read tries again), and a save forgets it
+// so the next read sees what was written.
+let allProfiles: Promise<Record<string, unknown>> | null = null;
+
+/** Forgets the shared `get-all` response, so the next read asks the server again. */
+export function forgetProfiles(): void {
+  allProfiles = null;
+}
+
 export async function fetchProfile<T>(name: string): Promise<T | null> {
-  const all = await jsonFetch<Record<string, T | null>>("/reader-profiles/get-all");
+  if (allProfiles === null) {
+    const request = jsonFetch<Record<string, unknown>>("/reader-profiles/get-all");
+    allProfiles = request;
+    request.catch(() => {
+      if (allProfiles === request) allProfiles = null;
+    });
+  }
+  const all = (await allProfiles) as Record<string, T | null>;
   return all[name] ?? null;
 }
 
 export async function saveProfile(name: string, profile: Record<string, unknown>): Promise<void> {
-  await jsonFetch<boolean>("/reader-profiles/save", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, profile }),
-  });
+  // Forgotten before and after: a read that starts while the save is in flight
+  // must not be served the blob it is about to replace.
+  forgetProfiles();
+  try {
+    await jsonFetch<boolean>("/reader-profiles/save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, profile }),
+    });
+  } finally {
+    forgetProfiles();
+  }
 }
 
 export interface LibraryPrefs {
@@ -76,7 +102,7 @@ export const READER_PREFS_PROFILE = "reader-prefs";
 // binding always points at a real action and the three surfaces
 // (toolbar, context menu, shortcuts) cannot disagree about what
 // exists.
-export type LibraryKeymapAction = Extract<LibraryActionId, "focus-search" | "add-books" | "select-mode" | "bulk-edit" | "save-to-disk" | "delete-book" | "toggle-view" | "find-duplicates">;
+export type LibraryKeymapAction = Extract<LibraryActionId, "focus-search" | "add-books" | "select-mode" | "bulk-edit" | "save-to-disk" | "delete-book" | "toggle-view" | "find-duplicates" | "read" | "edit-metadata">;
 
 export type KeymapAction = "readerNext" | "readerPrev" | LibraryKeymapAction;
 
@@ -94,7 +120,12 @@ export const DEFAULT_KEYMAP: KeymapPrefs = {
   "focus-search": "/",
   "add-books": "a",
   "select-mode": "s",
-  "bulk-edit": "e",
+  // "e" edits the metadata of the book, or of every selected book when there
+  // are several (the same bulk editor, which "E" still opens directly).
+  "edit-metadata": "e",
+  "bulk-edit": "E",
+  // Enter on a row opens the book, unless a cell editor or a button has it.
+  read: "Enter",
   "save-to-disk": "S",
   "delete-book": "Delete",
   "toggle-view": "v",
@@ -107,7 +138,9 @@ export const KEYMAP_ACTION_LABELS: Record<KeymapAction, string> = {
   "focus-search": "Library: focus search",
   "add-books": "Library: add books",
   "select-mode": "Library: toggle select mode",
+  "edit-metadata": "Library: edit metadata (several books: bulk edit)",
   "bulk-edit": "Library: bulk edit selection",
+  read: "Library: read the current book",
   "save-to-disk": "Library: save selection to disk",
   "delete-book": "Library: delete selection",
   "toggle-view": "Library: switch table/grid",

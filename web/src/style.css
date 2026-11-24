@@ -72,12 +72,16 @@
   --bg-backdrop: rgb(0 0 0 / 40%);
   --fg: #1a1d21;
   --fg-muted: #5c6470;
-  --fg-faint: #8b929c;
+  /* 5.4:1 on white, 4.5:1 on a hovered row; #8b929c was 3.1:1. */
+  --fg-faint: #626976;
   --fg-on-accent: #ffffff;
   --border: #d3d7dd;
   --border-strong: #b4bac2;
   --accent: #2a6df4;
   --accent-hover: #1b58d6;
+  /* A fill that carries --fg-on-accent text (primary buttons, the active toggle): 4.5:1 or better. */
+  --accent-solid: #2a6df4;
+  --accent-solid-hover: #1b58d6;
   --accent-soft: #eef2fb;           /* tinted row/badge backgrounds */
   --danger: #b00020;
   --warning: #8f5f00;
@@ -119,11 +123,13 @@
     --bg-backdrop: rgb(0 0 0 / 60%);
     --fg: #e4e6ea;
     --fg-muted: #a0a7b2;
-    --fg-faint: #6f7783;
+    --fg-faint: #939aa6;
     --border: #3a3d44;
     --border-strong: #4a4e57;
     --accent: #4d86ff;
     --accent-hover: #6a9aff;
+    --accent-solid: #2f6fe0;
+    --accent-solid-hover: #2a64d0;
     --accent-soft: #232c3d;
     --danger: #ff6b7f;
     --warning: #e0a44a;
@@ -150,11 +156,13 @@
   --bg-backdrop: rgb(0 0 0 / 60%);
   --fg: #e4e6ea;
   --fg-muted: #a0a7b2;
-  --fg-faint: #6f7783;
+  --fg-faint: #939aa6;
   --border: #3a3d44;
   --border-strong: #4a4e57;
   --accent: #4d86ff;
   --accent-hover: #6a9aff;
+  --accent-solid: #2f6fe0;
+  --accent-solid-hover: #2a64d0;
   --accent-soft: #232c3d;
   --danger: #ff6b7f;
   --warning: #e0a44a;
@@ -228,6 +236,8 @@
   --border-strong: #6a6a73;
   --accent: #7cb0ff;
   --accent-hover: #a6c9ff;
+  --accent-solid: #3a6ea5;      /* white on it 5.3:1: the title bar's lighter end */
+  --accent-solid-hover: #2f5f94;
   --accent-soft: #1d2a4d;
   --danger: #ff7b7b;
   --warning: #f0c040;
@@ -329,14 +339,14 @@ button:disabled {
 }
 
 button.primary {
-  background: var(--accent);
-  border-color: var(--accent);
+  background: var(--accent-solid);
+  border-color: var(--accent-solid);
   color: var(--fg-on-accent);
 }
 
 button.primary:hover:not(:disabled) {
-  background: var(--accent-hover);
-  border-color: var(--accent-hover);
+  background: var(--accent-solid-hover);
+  border-color: var(--accent-solid-hover);
 }
 
 /* The destructive choice (Delete, Move to Trash): red, so it does not read

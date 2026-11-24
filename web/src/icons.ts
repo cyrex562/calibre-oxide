@@ -7,7 +7,7 @@
 
 import {
   Archive, ArrowDown, ArrowRightLeft, ArrowUpDown, BookOpen, BookPlus, BookText,
-  BookmarkCheck, Braces, Building2, CircleAlert, CircleHelp, ClipboardCheck,
+  BookmarkCheck, Braces, Building2, ChevronDown, CircleAlert, CircleHelp, ClipboardCheck,
   CloudDownload, Columns3, Copy, Ellipsis, Eye, ExternalLink, FileSearch,
   FolderInput, FolderOpen, FolderSearch, Highlighter, Image, Languages,
   LayoutGrid, Layers, Library, ListFilter, ListTodo, Mail, Merge,
@@ -68,6 +68,7 @@ export const ICONS: Record<string, Component> = {
   grid: LayoutGrid,
   layout: PanelLeft,
   "h-ellipsis": Ellipsis,
+  "chevron-down": ChevronDown,
   // Library tools
   reports: ClipboardCheck,
   merge: Copy,

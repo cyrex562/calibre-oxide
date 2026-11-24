@@ -47,6 +47,11 @@ export interface BookColumn {
   field?: string;
   /** How a cell in this column is edited in place; absent means read-only. */
   editor?: CellEditor;
+  /**
+   * What to tell someone who cannot sort by this column itself: the server has
+   * no separate sort for it, but another column covers it ("use Series").
+   */
+  sortNote?: string;
 }
 
 /** The in-place editor a column offers (see inlineEdit.ts for parsing). */
@@ -64,17 +69,20 @@ export type CellEditor =
  * Columns shown to someone who has never configured any, in order.
  *
  * Deliberately not "everything": a first run should be readable, and
- * the rest are one click away in the column picker.
+ * the rest are one click away in the column picker. Size and Formats are
+ * here because the work this app is for (finding the copy to keep among
+ * duplicates) turns on them; Publisher, which an unorganised PDF collection
+ * rarely has, made room, so the defaults are no wider than before.
  */
-export const DEFAULT_VISIBLE_KEYS = ["title", "authors", "series", "series_index", "tags", "publisher", "timestamp", "formats"];
+export const DEFAULT_VISIBLE_KEYS = ["title", "authors", "series", "series_index", "tags", "timestamp", "formats", "size"];
 
 /** Per-field display rules, keyed by the book row's own key. */
-const KNOWN_COLUMNS: Record<string, { label: string; kind: ColumnKind; width: number; tooltip?: string; editor?: CellEditor; sortKey?: string }> = {
+const KNOWN_COLUMNS: Record<string, { label: string; kind: ColumnKind; width: number; tooltip?: string; editor?: CellEditor; sortKey?: string; sortNote?: string }> = {
   title: { label: "Title", kind: "text", width: 320, editor: { type: "text" } },
   authors: { label: "Authors", kind: "list", width: 200, editor: { type: "authors" } },
-  author_sort: { label: "Author sort", kind: "text", width: 200 },
+  author_sort: { label: "Author sort", kind: "text", width: 200, sortNote: "sort by Authors instead" },
   series: { label: "Series", kind: "text", width: 160, editor: { type: "text" } },
-  series_index: { label: "Number", kind: "number", width: 70, tooltip: "Number in the series (volume)", editor: { type: "number" } },
+  series_index: { label: "Number", kind: "number", width: 70, tooltip: "Number in the series (volume)", editor: { type: "number" }, sortNote: "sort by Series instead" },
   tags: { label: "Tags", kind: "list", width: 180, editor: { type: "list" } },
   publisher: { label: "Publisher", kind: "text", width: 160, editor: { type: "text" } },
   rating: { label: "Rating", kind: "rating", width: 110, editor: { type: "rating" } },

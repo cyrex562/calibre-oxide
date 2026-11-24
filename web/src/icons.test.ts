@@ -7,7 +7,7 @@ import { LIBRARY_ACTIONS, TOOLBAR_LAYOUT } from "./library/actions";
 // Icon names that components pass by hand rather than via an action.
 const HAND_PICKED = [
   "vl", "sort", "folder_saved_search", "fts", "search", "h-ellipsis",
-  "user_profile", "tags", "series", "publisher", "languages", "rating",
+  "user_profile", "tags", "series", "publisher", "languages", "rating", "chevron-down",
 ];
 
 describe("icon mapping", () => {
