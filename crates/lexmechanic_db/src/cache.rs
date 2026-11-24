@@ -395,6 +395,19 @@ impl Cache {
         Ok(built)
     }
 
+    /// What [`Cache::cached_for_version`] holds for `key` at `version`, if it
+    /// holds that and has finished building it; never builds anything.
+    pub fn cached_if_current<T: Send + Sync + 'static>(&self, key: &str, version: u64) -> Option<std::sync::Arc<T>> {
+        let slot = std::sync::Arc::clone(self.derived_results.lock().unwrap().get(key)?);
+        // A build in progress holds the slot: do not wait for it.
+        let guard = slot.try_lock().ok()?;
+        let (v, value) = guard.as_ref()?;
+        if *v != version {
+            return None;
+        }
+        std::sync::Arc::clone(value).downcast::<T>().ok()
+    }
+
     /// Forces the next [`Cache::field_for`] call to reload the field
     /// snapshot, even if `total_changes()` hasn't moved (there is no
     /// such case in practice -- every write increments it -- but this
@@ -407,7 +420,7 @@ impl Cache {
     /// `.lexmechanic/checksums.db`, sharing this `Cache`'s connection
     /// -- issue #93 §8.
     pub fn checksums(&self) -> crate::checksums::ChecksumStore {
-        crate::checksums::ChecksumStore::new(self.backend.conn.clone(), &self.backend.library_path)
+        crate::checksums::ChecksumStore::new(self.backend.conn.clone(), &self.backend.library_path).with_reader(self.backend.reader())
     }
 
     // ---------------------------------------------------------------
@@ -442,7 +455,7 @@ impl Cache {
         }
         match self.backend.change_log() {
             Ok(log) => {
-                if let Err(e) = log.append(op) {
+                if let Err(e) = log.append_grouped(op) {
                     log::warn!("could not record a change in the library log: {e}");
                     self.note_change_log_gap(&format!("{e}"));
                 }
@@ -762,9 +775,10 @@ impl Cache {
     /// requests are not held up by a long scan; a write made after the
     /// snapshot was taken is not in it.
     pub fn fields(&self) -> Result<std::sync::Arc<FieldStore>> {
-        let conn = self.backend.conn.lock().unwrap();
-        let mut guard = self.field_cache.lock().unwrap();
-        crate::field_feed::refresh(&mut guard, &conn, &self.backend.field_feed, &self.field_full_loads)
+        // The connection is not held across the call: `refresh` takes it for
+        // what it has to read and lets go of it before copying or loading.
+        let reader = self.backend.reader();
+        crate::field_feed::refresh(&self.field_cache, &self.backend.conn, reader.as_deref(), &self.backend.field_feed, &self.field_full_loads)
     }
 
     /// [`Cache::field_for`] against a snapshot from [`Cache::fields`].

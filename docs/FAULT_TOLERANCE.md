@@ -93,6 +93,25 @@ identified by uuid).
   commits durably on every transaction.
 - Never open the SQLite file with `journal_mode=MEMORY` or
   `synchronous=OFF` on any tier.
+- **`synchronous=FULL`, not `NORMAL`, is kept on purpose.** In WAL mode
+  `NORMAL` skips the log sync at commit: a write survives the application
+  dying but not a power cut, and can lose the last few acknowledged writes.
+  A write acknowledged to a client is a promise, so the per-write cost is
+  reduced around that one sync instead of by weakening it: one transaction and
+  one change-log entry per request (`/cdb/set-fields-batch` writes all its
+  groups of a run of 200 books together), and one change-log sync shared by
+  writers who arrive together (`ChangeLog::append_grouped`: the ops waiting
+  while another writer syncs go into the next entry as one `Batch`; each caller
+  still returns only once its own entry is on disk).
+- Every connection waits up to 5 s (`busy_timeout`) for another connection's
+  lock. A job that writes for longer than that retries a transaction that fails
+  on a lock for up to a minute, and one that still fails is reported
+  `interrupted` (resumable) rather than `failed`.
+- A second, **read-only** connection (`Backend::reader`, WAL only) serves the
+  library-wide reads that used to hold the main connection for seconds: the
+  duplicate scan's checksum queries and record load, and the field snapshot's
+  full load. It sees what has been committed, never the main connection's open
+  transaction, and is not used on the Network tier.
 
 ## 4. Device-disappearance handling
 

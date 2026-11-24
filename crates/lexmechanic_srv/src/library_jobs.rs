@@ -397,6 +397,15 @@ pub fn restore(library: &str) {
     }
 }
 
+/// Whether `error` is SQLite reporting a lock another connection held for
+/// longer than the job could wait (`database is locked`).
+fn is_lock_error(error: &anyhow::Error) -> bool {
+    use lexmechanic_db::checksums::{is_busy_error, ChecksumError};
+    error.chain().any(|c| {
+        c.downcast_ref::<rusqlite::Error>().is_some_and(is_busy_error) || matches!(c.downcast_ref::<ChecksumError>(), Some(ChecksumError::Sqlite(e)) if is_busy_error(e))
+    })
+}
+
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -599,6 +608,11 @@ pub fn start_with(cache: Arc<Cache>, kind: JobKind, workers: Option<usize>, para
                 }
                 (state, Some(report), None)
             }
+            // A job that met a lock it could not outwait (another program in
+            // the database, a checkpoint) stopped part-way, with what it had
+            // done kept: a resumable kind says where to continue it, as it
+            // does for one the process was cut off in.
+            Ok(Err(e)) if kind.resume_route().is_some() && is_lock_error(&e) => (JobState::Interrupted, None, Some(format!("{e:#}"))),
             Ok(Err(e)) => (JobState::Failed, None, Some(format!("{e:#}"))),
             Err(_) => (JobState::Failed, None, Some("the job panicked".to_string())),
         };
@@ -934,4 +948,24 @@ pub async fn cancel(Path(job_id): Path<u64>) -> Result<Json<Value>, ServerError>
         job.control.cancel();
     }
     Ok(Json(job.to_json()))
+}
+
+#[cfg(test)]
+mod lock_error_tests {
+    use super::is_lock_error;
+    use lexmechanic_db::checksums::ChecksumError;
+
+    fn busy() -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY), Some("database is locked".to_string()))
+    }
+
+    /// A job that ran into a lock it could not outwait is reported as interrupted (so resumable), not failed.
+    #[test]
+    fn a_database_that_stayed_locked_is_told_apart_from_other_errors() {
+        assert!(is_lock_error(&anyhow::Error::from(ChecksumError::Sqlite(busy()))));
+        assert!(is_lock_error(&anyhow::Error::from(busy())));
+        assert!(is_lock_error(&anyhow::Error::from(ChecksumError::Sqlite(busy())).context("recording a fingerprint")));
+        assert!(!is_lock_error(&anyhow::anyhow!("PDFium was not found")));
+        assert!(!is_lock_error(&anyhow::Error::from(ChecksumError::Sqlite(rusqlite::Error::QueryReturnedNoRows))));
+    }
 }

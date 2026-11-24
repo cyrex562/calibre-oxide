@@ -26,7 +26,7 @@
 //! had no real callers anywhere in the crate and added no value over
 //! using [`crate::tables::TableType`] directly.
 
-use crate::tables::StandardTables;
+use crate::tables::{StandardTables, TableSet};
 use rusqlite::{Connection, Result};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,6 +52,9 @@ fn next_version() -> u64 {
 pub struct FieldStore {
     tables: StandardTables,
     version: u64,
+    /// When each table last changed, as a [`FieldStore::version`] value
+    /// (see [`FieldStore::fields_version`]).
+    table_versions: [u64; TableSet::COUNT],
     derived: Derived,
 }
 
@@ -102,13 +105,62 @@ fn join_is_unambiguous<'a>(items: impl Iterator<Item = &'a String>, sep: &str) -
     items.all(|name| !name.contains(sep) && !prefixes.iter().any(|p| name.ends_with(p)) && !suffixes.iter().any(|s| name.starts_with(s)))
 }
 
+/// The tables the sort key of `field` is read from (see
+/// `ajax::sort_row`: `title` sorts on `sort`, `authors` on `author_sort`).
+/// `None` for a field not known here.
+fn sort_field_tables(field: &str) -> Option<TableSet> {
+    Some(match field {
+        "title" | "sort" => TableSet::SORT,
+        "authors" | "author_sort" => TableSet::AUTHOR_SORT,
+        "publisher" => TableSet::PUBLISHER,
+        "series" => TableSet::SERIES,
+        "uuid" => TableSet::UUID,
+        "comments" => TableSet::COMMENTS,
+        "isbn" => TableSet::ISBN,
+        "identifiers" => TableSet::IDENTIFIERS,
+        "rating" => TableSet::RATING,
+        "size" => TableSet::SIZE,
+        "series_index" => TableSet::SERIES_INDEX,
+        "tags" => TableSet::TAGS,
+        "languages" => TableSet::LANGUAGES,
+        "timestamp" => TableSet::TIMESTAMP,
+        "pubdate" => TableSet::PUBDATE,
+        "last_modified" => TableSet::LAST_MODIFIED,
+        "id" => TableSet::default(),
+        "folder" => TableSet::PATH,
+        "file_name" => TableSet::FORMATS,
+        _ => return None,
+    })
+}
+
+/// The tables the folded text of a searchable field is derived from.
+fn folded_field_tables(field: &str) -> TableSet {
+    match field {
+        "title" => TableSet::TITLE,
+        "sort" => TableSet::SORT,
+        "author_sort" => TableSet::AUTHOR_SORT,
+        "comments" => TableSet::COMMENTS,
+        "path" => TableSet::PATH,
+        "series" => TableSet::SERIES,
+        "publisher" => TableSet::PUBLISHER,
+        "tags" => TableSet::TAGS,
+        "languages" => TableSet::LANGUAGES,
+        "authors" => TableSet::AUTHORS,
+        "formats" => TableSet::FORMATS,
+        // Not one of the known fields: drop it with anything.
+        _ => TableSet::ALL,
+    }
+}
+
 impl FieldStore {
     pub fn load(conn: &Connection) -> Result<Self> {
-        Ok(Self {
-            tables: StandardTables::read(conn)?,
-            version: next_version(),
-            derived: Derived::default(),
-        })
+        Ok(Self::from_tables(StandardTables::read(conn)?))
+    }
+
+    /// A store holding `tables`, every table as new as the store.
+    pub fn from_tables(tables: StandardTables) -> Self {
+        let version = next_version();
+        Self { tables, version, table_versions: [version; TableSet::COUNT], derived: Derived::default() }
     }
 
     /// Identifies this exact content: a different value after any load or
@@ -118,26 +170,97 @@ impl FieldStore {
         self.version
     }
 
+    /// The tables, to see which of them two snapshots share.
+    #[cfg(test)]
+    pub(crate) fn tables(&self) -> &StandardTables {
+        &self.tables
+    }
+
     /// How many books have a title (the books `get_data_as_dict` lists).
     pub fn book_count(&self) -> usize {
         self.tables.title.book_col_map.len()
     }
 
-    fn changed(&mut self) {
+    /// Notes that `tables` changed: a new store version, the tables' own
+    /// versions, and the folded text derived from them dropped (the rest of
+    /// it is still good).
+    fn changed(&mut self, tables: TableSet) {
+        if tables.is_empty() {
+            return;
+        }
         self.version = next_version();
-        self.derived.folded.lock().unwrap().clear();
+        for i in tables.indices() {
+            self.table_versions[i] = self.version;
+        }
+        let mut folded = self.derived.folded.lock().unwrap();
+        folded.retain(|field, _| !folded_field_tables(field).indices().any(|i| tables.indices().any(|j| i == j)));
     }
 
-    /// Re-reads one book (see [`StandardTables::reload_book`]).
+    /// Re-reads one book (see [`StandardTables::reload_book`]). The store's
+    /// version moves only if something in the book's rows changed.
     pub fn reload_book(&mut self, conn: &Connection, book_id: i32) -> Result<()> {
-        self.changed();
-        self.tables.reload_book(conn, book_id)
+        let changed = self.tables.reload_book(conn, book_id)?;
+        self.changed(changed);
+        Ok(())
+    }
+
+    /// [`FieldStore::reload_book`] for a book already read into `fresh` (see
+    /// [`StandardTables::read_book_rows`]): no database access, so it can be
+    /// done without holding the connection.
+    pub fn adopt_book(&mut self, fresh: &StandardTables, book_id: i32) {
+        let changed = self.tables.adopt_book(fresh, book_id);
+        self.changed(changed);
     }
 
     /// Re-reads one whole item table (see [`StandardTables::reload_item_table`]).
     pub fn reload_item_table(&mut self, conn: &Connection, which: crate::tables::ItemTable) -> Result<()> {
-        self.changed();
-        self.tables.reload_item_table(conn, which)
+        let changed = self.tables.reload_item_table(conn, which)?;
+        self.changed(changed);
+        Ok(())
+    }
+
+    /// Replaces one item table with the one in `fresh`, read earlier.
+    pub fn adopt_item_table(&mut self, fresh: &StandardTables, which: crate::tables::ItemTable) {
+        use crate::tables::ItemTable;
+        let mut changed = TableSet::default();
+        macro_rules! take {
+            ($field:ident, $bit:expr) => {
+                if *self.tables.$field != *fresh.$field {
+                    self.tables.$field = fresh.$field.clone();
+                    changed.insert($bit);
+                }
+            };
+        }
+        match which {
+            ItemTable::Series => take!(series, TableSet::SERIES),
+            ItemTable::Publishers => take!(publisher, TableSet::PUBLISHER),
+            ItemTable::Ratings => take!(rating, TableSet::RATING),
+            ItemTable::Tags => take!(tags, TableSet::TAGS),
+            ItemTable::Languages => take!(languages, TableSet::LANGUAGES),
+            ItemTable::Authors => take!(authors, TableSet::AUTHORS),
+        }
+        self.changed(changed);
+    }
+
+    /// Identifies this content **as far as `fields` are concerned**: it
+    /// changes only when a table those fields are read from does, where
+    /// [`FieldStore::version`] changes with every edit to every field. A sort
+    /// order built from `fields` can be kept for as long as this stays the
+    /// same, through edits to other fields (a rating, a comment). Which books are
+    /// listed (those with a title) counts too: a book appearing or going moves
+    /// every sort, a title being edited does not.
+    ///
+    /// Falls back to the store's whole version for a field this does not know
+    /// the tables of.
+    pub fn fields_version(&self, fields: &[&str]) -> u64 {
+        let mut tables = TableSet::MEMBERS;
+        for field in fields {
+            match sort_field_tables(field) {
+                Some(t) => tables.insert(t),
+                None => return self.version,
+            }
+        }
+        tables.indices().map(|i| self.table_versions[i]).max().unwrap_or(self.version)
     }
 
     /// The pre-folded text of `field`, built on first use.

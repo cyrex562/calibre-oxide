@@ -73,6 +73,7 @@ use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TableType {
@@ -91,11 +92,30 @@ fn sql_value_to_string(v: SqlValue) -> Option<String> {
     }
 }
 
+/// `books.title, sort, author_sort, isbn, path, timestamp, pubdate,
+/// last_modified, series_index, uuid` as ten [`OneToOneTable`]s, from one
+/// scan of `books`. Exactly what ten calls of [`OneToOneTable::read`] give:
+/// a book whose value is NULL has no entry in that column's table.
+pub(crate) fn read_book_columns(conn: &Connection) -> Result<[OneToOneTable; 10]> {
+    let mut stmt = conn.prepare("SELECT id, title, sort, author_sort, isbn, path, timestamp, pubdate, last_modified, series_index, uuid FROM books")?;
+    let mut tables: [OneToOneTable; 10] = Default::default();
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let id: i32 = row.get(0)?;
+        for (i, table) in tables.iter_mut().enumerate() {
+            if let Some(s) = sql_value_to_string(row.get::<_, SqlValue>(i + 1)?) {
+                table.book_col_map.insert(id, s);
+            }
+        }
+    }
+    Ok(tables)
+}
+
 /// Port of `OneToOneTable`: one value per book (`book_col_map`).
 /// `id_column` is `"id"` for the `books` table itself, `"book"` for
 /// every satellite one-to-one table (`comments`), matching upstream's
 /// `idcol = 'id' if table == 'books' else 'book'`.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct OneToOneTable {
     pub book_col_map: HashMap<i32, String>,
 }
@@ -125,7 +145,7 @@ impl OneToOneTable {
 
 /// Port of `SizeTable`: `MAX(uncompressed_size)` across a book's
 /// formats.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct SizeTable {
     pub book_col_map: HashMap<i32, i64>,
 }
@@ -151,7 +171,7 @@ impl SizeTable {
 
 /// Port of `UUIDTable`: adds a reverse `uuid_to_id_map` lookup on top
 /// of the plain one-to-one `book_col_map`.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct UuidTable {
     pub book_col_map: HashMap<i32, String>,
     pub uuid_to_id_map: HashMap<String, i32>,
@@ -159,16 +179,20 @@ pub struct UuidTable {
 
 impl UuidTable {
     pub fn read(conn: &Connection) -> Result<Self> {
-        let inner = OneToOneTable::read(conn, "books", "id", "uuid")?;
+        Ok(Self::from_one_to_one(OneToOneTable::read(conn, "books", "id", "uuid")?))
+    }
+
+    /// The table for `inner`, a book -> uuid map.
+    fn from_one_to_one(inner: OneToOneTable) -> Self {
         let uuid_to_id_map = inner
             .book_col_map
             .iter()
             .map(|(&id, uuid)| (uuid.clone(), id))
             .collect();
-        Ok(Self {
+        Self {
             book_col_map: inner.book_col_map,
             uuid_to_id_map,
-        })
+        }
     }
 
     pub fn lookup_by_uuid(&self, uuid: &str) -> Option<i32> {
@@ -178,7 +202,7 @@ impl UuidTable {
 
 /// Port of `ManyToOneTable`: each book has at most one value, each
 /// value can apply to many books (`series`/`publisher`/`rating`).
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct ManyToOneTable {
     pub id_map: HashMap<i32, String>,
     pub link_map: HashMap<i32, String>,
@@ -275,7 +299,7 @@ pub fn read_rating_table(conn: &Connection) -> Result<ManyToOneTable> {
 /// value can apply to many books (`tags`/`languages`). `book_col_map`
 /// is ordered by link-table `id` (insertion order), matching
 /// upstream's `ORDER BY id`.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct ManyToManyTable {
     pub id_map: HashMap<i32, String>,
     pub link_map: HashMap<i32, String>,
@@ -346,7 +370,7 @@ impl ManyToManyTable {
 /// Port of `AuthorsTable`: a [`ManyToManyTable`] over `authors`, plus
 /// the `asort_map` (per-author sort value, falling back to a computed
 /// `author_to_author_sort` when the stored `sort` is empty).
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct AuthorsTable {
     pub id_map: HashMap<i32, String>,
     pub link_map: HashMap<i32, String>,
@@ -411,7 +435,7 @@ impl AuthorsTable {
 /// Port of `FormatsTable`: keyed by format string (e.g. `"EPUB"`),
 /// not an integer item id -- there's no `formats` item table, `data`
 /// rows *are* the items.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct FormatsTable {
     pub fname_map: HashMap<i32, HashMap<String, String>>,
     pub size_map: HashMap<i32, HashMap<String, i64>>,
@@ -472,7 +496,7 @@ impl FormatsTable {
 /// a book's identifiers into a single string (`Cache::field_for`'s
 /// `"type:val,type:val"` contract) gets a deterministic, insertion-
 /// order result instead of `HashMap`'s unspecified iteration order.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct IdentifiersTable {
     pub book_col_map: HashMap<i32, IndexMap<String, String>>,
     pub col_book_map: HashMap<String, HashSet<i32>>,
@@ -511,64 +535,66 @@ impl IdentifiersTable {
 /// docs for what's not wired to anything yet.
 #[derive(Clone)]
 pub struct StandardTables {
-    pub title: OneToOneTable,
-    pub sort: OneToOneTable,
-    pub author_sort: OneToOneTable,
-    pub isbn: OneToOneTable,
-    pub path: OneToOneTable,
-    pub timestamp: OneToOneTable,
-    pub pubdate: OneToOneTable,
-    pub last_modified: OneToOneTable,
-    pub series_index: OneToOneTable,
-    pub comments: OneToOneTable,
-    pub uuid: UuidTable,
-    pub size: SizeTable,
-    pub series: ManyToOneTable,
-    pub publisher: ManyToOneTable,
-    pub rating: ManyToOneTable,
-    pub tags: ManyToManyTable,
-    pub languages: ManyToManyTable,
-    pub authors: AuthorsTable,
-    pub formats: FormatsTable,
-    pub identifiers: IdentifiersTable,
+    pub title: Arc<OneToOneTable>,
+    pub sort: Arc<OneToOneTable>,
+    pub author_sort: Arc<OneToOneTable>,
+    pub isbn: Arc<OneToOneTable>,
+    pub path: Arc<OneToOneTable>,
+    pub timestamp: Arc<OneToOneTable>,
+    pub pubdate: Arc<OneToOneTable>,
+    pub last_modified: Arc<OneToOneTable>,
+    pub series_index: Arc<OneToOneTable>,
+    pub comments: Arc<OneToOneTable>,
+    pub uuid: Arc<UuidTable>,
+    pub size: Arc<SizeTable>,
+    pub series: Arc<ManyToOneTable>,
+    pub publisher: Arc<ManyToOneTable>,
+    pub rating: Arc<ManyToOneTable>,
+    pub tags: Arc<ManyToManyTable>,
+    pub languages: Arc<ManyToManyTable>,
+    pub authors: Arc<AuthorsTable>,
+    pub formats: Arc<FormatsTable>,
+    pub identifiers: Arc<IdentifiersTable>,
 }
 
 impl StandardTables {
     pub fn read(conn: &Connection) -> Result<Self> {
+        // The ten columns of `books` in one scan of it (it was ten scans).
+        let [title, sort, author_sort, isbn, path, timestamp, pubdate, last_modified, series_index, uuid] = read_book_columns(conn)?;
         Ok(Self {
-            title: OneToOneTable::read(conn, "books", "id", "title")?,
-            sort: OneToOneTable::read(conn, "books", "id", "sort")?,
-            author_sort: OneToOneTable::read(conn, "books", "id", "author_sort")?,
-            isbn: OneToOneTable::read(conn, "books", "id", "isbn")?,
-            path: OneToOneTable::read(conn, "books", "id", "path")?,
-            timestamp: OneToOneTable::read(conn, "books", "id", "timestamp")?,
-            pubdate: OneToOneTable::read(conn, "books", "id", "pubdate")?,
-            last_modified: OneToOneTable::read(conn, "books", "id", "last_modified")?,
-            series_index: OneToOneTable::read(conn, "books", "id", "series_index")?,
-            comments: OneToOneTable::read(conn, "comments", "book", "text")?,
-            uuid: UuidTable::read(conn)?,
-            size: SizeTable::read(conn)?,
-            series: ManyToOneTable::read(conn, "series", "name", "books_series_link", "series")?,
-            publisher: ManyToOneTable::read(
+            title: Arc::new(title),
+            sort: Arc::new(sort),
+            author_sort: Arc::new(author_sort),
+            isbn: Arc::new(isbn),
+            path: Arc::new(path),
+            timestamp: Arc::new(timestamp),
+            pubdate: Arc::new(pubdate),
+            last_modified: Arc::new(last_modified),
+            series_index: Arc::new(series_index),
+            comments: Arc::new(OneToOneTable::read(conn, "comments", "book", "text")?),
+            uuid: Arc::new(UuidTable::from_one_to_one(uuid)),
+            size: Arc::new(SizeTable::read(conn)?),
+            series: Arc::new(ManyToOneTable::read(conn, "series", "name", "books_series_link", "series")?),
+            publisher: Arc::new(ManyToOneTable::read(
                 conn,
                 "publishers",
                 "name",
                 "books_publishers_link",
                 "publisher",
-            )?,
-            rating: read_rating_table(conn)?,
-            tags: ManyToManyTable::read(conn, "tags", "name", "books_tags_link", "tag", "id")?,
-            languages: ManyToManyTable::read(
+            )?),
+            rating: Arc::new(read_rating_table(conn)?),
+            tags: Arc::new(ManyToManyTable::read(conn, "tags", "name", "books_tags_link", "tag", "id")?),
+            languages: Arc::new(ManyToManyTable::read(
                 conn,
                 "languages",
                 "lang_code",
                 "books_languages_link",
                 "lang_code",
                 "item_order",
-            )?,
-            authors: AuthorsTable::read(conn)?,
-            formats: FormatsTable::read(conn)?,
-            identifiers: IdentifiersTable::read(conn)?,
+            )?),
+            authors: Arc::new(AuthorsTable::read(conn)?),
+            formats: Arc::new(FormatsTable::read(conn)?),
+            identifiers: Arc::new(IdentifiersTable::read(conn)?),
         })
     }
 }
@@ -631,65 +657,374 @@ impl ManyToManyTable {
     }
 }
 
+/// Which of [`StandardTables`]' tables a change touched: the answer
+/// [`StandardTables::reload_book`] and [`StandardTables::reload_item_table`]
+/// give, for the owner to version its tables by.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TableSet(u32);
+
+macro_rules! table_bits {
+    ($($name:ident = $bit:expr),* $(,)?) => {
+        impl TableSet {
+            $(pub const $name: TableSet = TableSet(1 << $bit);)*
+            /// Every table.
+            pub const ALL: TableSet = TableSet(0 $(| (1 << $bit))*);
+        }
+    };
+}
+
+table_bits!(
+    TITLE = 0, SORT = 1, AUTHOR_SORT = 2, ISBN = 3, PATH = 4, TIMESTAMP = 5, PUBDATE = 6, LAST_MODIFIED = 7, SERIES_INDEX = 8, COMMENTS = 9, UUID = 10, SIZE = 11, SERIES = 12, PUBLISHER = 13,
+    RATING = 14, TAGS = 15, LANGUAGES = 16, AUTHORS = 17, FORMATS = 18, IDENTIFIERS = 19, MEMBERS = 20,
+);
+
+impl TableSet {
+    /// How many tables there are.
+    pub const COUNT: usize = 21;
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub fn insert(&mut self, other: TableSet) {
+        self.0 |= other.0;
+    }
+
+    pub fn union(self, other: TableSet) -> TableSet {
+        TableSet(self.0 | other.0)
+    }
+
+    /// The position of each table in the set, for indexing an array of
+    /// [`TableSet::COUNT`].
+    pub fn indices(self) -> impl Iterator<Item = usize> {
+        (0..Self::COUNT).filter(move |i| self.0 & (1 << i) != 0)
+    }
+}
+
+/// What it takes to swap one book's rows in or out of a table without
+/// touching any other book's: [`StandardTables::reload_book`] compares each
+/// table's rows for the book with a fresh read and copies the table (it is
+/// shared, see [`StandardTables`]) only if they differ.
+trait BookSlice {
+    /// Whether `self` and `other` hold the same for `book`.
+    fn same_for(&self, other: &Self, book: i32) -> bool;
+    /// Drops everything held for `book`.
+    fn forget(&mut self, book: i32);
+    /// Takes over what `other` holds for `book` (which `self` no longer does).
+    fn adopt(&mut self, other: &Self, book: i32);
+}
+
+impl BookSlice for OneToOneTable {
+    fn same_for(&self, other: &Self, book: i32) -> bool {
+        self.book_col_map.get(&book) == other.book_col_map.get(&book)
+    }
+    fn forget(&mut self, book: i32) {
+        self.book_col_map.remove(&book);
+    }
+    fn adopt(&mut self, other: &Self, book: i32) {
+        if let Some(v) = other.book_col_map.get(&book) {
+            self.book_col_map.insert(book, v.clone());
+        }
+    }
+}
+
+impl BookSlice for UuidTable {
+    fn same_for(&self, other: &Self, book: i32) -> bool {
+        self.book_col_map.get(&book) == other.book_col_map.get(&book)
+    }
+    fn forget(&mut self, book: i32) {
+        if let Some(uuid) = self.book_col_map.remove(&book) {
+            if self.uuid_to_id_map.get(&uuid) == Some(&book) {
+                self.uuid_to_id_map.remove(&uuid);
+            }
+        }
+    }
+    fn adopt(&mut self, other: &Self, book: i32) {
+        if let Some(uuid) = other.book_col_map.get(&book) {
+            self.uuid_to_id_map.insert(uuid.clone(), book);
+            self.book_col_map.insert(book, uuid.clone());
+        }
+    }
+}
+
+impl BookSlice for SizeTable {
+    fn same_for(&self, other: &Self, book: i32) -> bool {
+        self.book_col_map.get(&book) == other.book_col_map.get(&book)
+    }
+    fn forget(&mut self, book: i32) {
+        self.book_col_map.remove(&book);
+    }
+    fn adopt(&mut self, other: &Self, book: i32) {
+        if let Some(v) = other.book_col_map.get(&book) {
+            self.book_col_map.insert(book, *v);
+        }
+    }
+}
+
+impl BookSlice for ManyToOneTable {
+    fn same_for(&self, other: &Self, book: i32) -> bool {
+        self.book_col_map.get(&book) == other.book_col_map.get(&book)
+    }
+    fn forget(&mut self, book: i32) {
+        self.forget_book(book);
+    }
+    fn adopt(&mut self, other: &Self, book: i32) {
+        if let Some(&item) = other.book_col_map.get(&book) {
+            self.col_book_map.entry(item).or_default().insert(book);
+            self.book_col_map.insert(book, item);
+        }
+    }
+}
+
+impl BookSlice for ManyToManyTable {
+    fn same_for(&self, other: &Self, book: i32) -> bool {
+        self.book_col_map.get(&book) == other.book_col_map.get(&book)
+    }
+    fn forget(&mut self, book: i32) {
+        self.forget_book(book);
+    }
+    fn adopt(&mut self, other: &Self, book: i32) {
+        if let Some(items) = other.book_col_map.get(&book) {
+            for &item in items {
+                self.col_book_map.entry(item).or_default().insert(book);
+            }
+            self.book_col_map.insert(book, items.clone());
+        }
+    }
+}
+
+impl BookSlice for AuthorsTable {
+    fn same_for(&self, other: &Self, book: i32) -> bool {
+        self.book_col_map.get(&book) == other.book_col_map.get(&book)
+    }
+    fn forget(&mut self, book: i32) {
+        if let Some(items) = self.book_col_map.remove(&book) {
+            for item in items {
+                forget_in_col_book(&mut self.col_book_map, &item, book);
+            }
+        }
+    }
+    fn adopt(&mut self, other: &Self, book: i32) {
+        if let Some(items) = other.book_col_map.get(&book) {
+            for &item in items {
+                self.col_book_map.entry(item).or_default().insert(book);
+            }
+            self.book_col_map.insert(book, items.clone());
+        }
+    }
+}
+
+impl BookSlice for FormatsTable {
+    fn same_for(&self, other: &Self, book: i32) -> bool {
+        self.fname_map.get(&book) == other.fname_map.get(&book) && self.size_map.get(&book) == other.size_map.get(&book) && self.book_col_map.get(&book) == other.book_col_map.get(&book)
+    }
+    fn forget(&mut self, book: i32) {
+        self.fname_map.remove(&book);
+        self.size_map.remove(&book);
+        if let Some(fmts) = self.book_col_map.remove(&book) {
+            for f in fmts {
+                forget_in_col_book(&mut self.col_book_map, &f, book);
+            }
+        }
+    }
+    fn adopt(&mut self, other: &Self, book: i32) {
+        if let Some(names) = other.fname_map.get(&book) {
+            for fmt in names.keys() {
+                self.col_book_map.entry(fmt.clone()).or_default().insert(book);
+            }
+            self.fname_map.insert(book, names.clone());
+        }
+        if let Some(sizes) = other.size_map.get(&book) {
+            self.size_map.insert(book, sizes.clone());
+        }
+        if let Some(fmts) = other.book_col_map.get(&book) {
+            self.book_col_map.insert(book, fmts.clone());
+        }
+    }
+}
+
+impl BookSlice for IdentifiersTable {
+    fn same_for(&self, other: &Self, book: i32) -> bool {
+        // In stored order: an `IndexMap` compares equal whatever the order of its keys, and the order is what the field shows.
+        match (self.book_col_map.get(&book), other.book_col_map.get(&book)) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.iter().eq(b.iter()),
+            _ => false,
+        }
+    }
+    fn forget(&mut self, book: i32) {
+        if let Some(idents) = self.book_col_map.remove(&book) {
+            for (k, _) in idents {
+                forget_in_col_book(&mut self.col_book_map, &k, book);
+            }
+        }
+    }
+    fn adopt(&mut self, other: &Self, book: i32) {
+        if let Some(idents) = other.book_col_map.get(&book) {
+            for k in idents.keys() {
+                self.col_book_map.entry(k.clone()).or_default().insert(book);
+            }
+            self.book_col_map.insert(book, idents.clone());
+        }
+    }
+}
+
+/// Copies `fresh`'s rows for `book` into `table` if they differ from what
+/// `table` has, copying `table` itself first only if something else shares it.
+fn sync_book<T: BookSlice + Clone>(table: &mut Arc<T>, fresh: &Arc<T>, book: i32, bit: TableSet, changed: &mut TableSet) {
+    if table.same_for(fresh, book) {
+        return;
+    }
+    let owned = Arc::make_mut(table);
+    owned.forget(book);
+    owned.adopt(fresh, book);
+    changed.insert(bit);
+}
+
+/// Replaces `table` with `fresh` unless they are equal.
+fn swap_table<T: PartialEq>(table: &mut Arc<T>, fresh: T, bit: TableSet, changed: &mut TableSet) {
+    if **table != fresh {
+        *table = Arc::new(fresh);
+        changed.insert(bit);
+    }
+}
+
 impl StandardTables {
+    /// Every table empty.
+    pub fn empty() -> Self {
+        Self {
+            title: Default::default(),
+            sort: Default::default(),
+            author_sort: Default::default(),
+            isbn: Default::default(),
+            path: Default::default(),
+            timestamp: Default::default(),
+            pubdate: Default::default(),
+            last_modified: Default::default(),
+            series_index: Default::default(),
+            comments: Default::default(),
+            uuid: Default::default(),
+            size: Default::default(),
+            series: Default::default(),
+            publisher: Default::default(),
+            rating: Default::default(),
+            tags: Default::default(),
+            languages: Default::default(),
+            authors: Default::default(),
+            formats: Default::default(),
+            identifiers: Default::default(),
+        }
+    }
+
     /// Reloads one whole item table and the links that point at it
     /// (a rename of an author or tag, say, changes what every book
-    /// with it reads back).
-    pub fn reload_item_table(&mut self, conn: &Connection, which: ItemTable) -> Result<()> {
+    /// with it reads back). Says which table changed: none if what was
+    /// read is what was already held.
+    pub fn reload_item_table(&mut self, conn: &Connection, which: ItemTable) -> Result<TableSet> {
+        let mut changed = TableSet::default();
         match which {
-            ItemTable::Series => self.series = ManyToOneTable::read(conn, "series", "name", "books_series_link", "series")?,
-            ItemTable::Publishers => self.publisher = ManyToOneTable::read(conn, "publishers", "name", "books_publishers_link", "publisher")?,
-            ItemTable::Ratings => self.rating = read_rating_table(conn)?,
-            ItemTable::Tags => self.tags = ManyToManyTable::read(conn, "tags", "name", "books_tags_link", "tag", "id")?,
-            ItemTable::Languages => self.languages = ManyToManyTable::read(conn, "languages", "lang_code", "books_languages_link", "lang_code", "item_order")?,
-            ItemTable::Authors => self.authors = AuthorsTable::read(conn)?,
+            ItemTable::Series => swap_table(&mut self.series, ManyToOneTable::read(conn, "series", "name", "books_series_link", "series")?, TableSet::SERIES, &mut changed),
+            ItemTable::Publishers => swap_table(&mut self.publisher, ManyToOneTable::read(conn, "publishers", "name", "books_publishers_link", "publisher")?, TableSet::PUBLISHER, &mut changed),
+            ItemTable::Ratings => swap_table(&mut self.rating, read_rating_table(conn)?, TableSet::RATING, &mut changed),
+            ItemTable::Tags => swap_table(&mut self.tags, ManyToManyTable::read(conn, "tags", "name", "books_tags_link", "tag", "id")?, TableSet::TAGS, &mut changed),
+            ItemTable::Languages => swap_table(&mut self.languages, ManyToManyTable::read(conn, "languages", "lang_code", "books_languages_link", "lang_code", "item_order")?, TableSet::LANGUAGES, &mut changed),
+            ItemTable::Authors => swap_table(&mut self.authors, AuthorsTable::read(conn)?, TableSet::AUTHORS, &mut changed),
+        }
+        Ok(changed)
+    }
+
+    /// Reads one whole item table into `self` (and nothing else): the
+    /// connection half of [`StandardTables::reload_item_table`], for an owner
+    /// that applies the result later, away from the connection.
+    pub fn read_item_table(&mut self, conn: &Connection, which: ItemTable) -> Result<()> {
+        match which {
+            ItemTable::Series => self.series = Arc::new(ManyToOneTable::read(conn, "series", "name", "books_series_link", "series")?),
+            ItemTable::Publishers => self.publisher = Arc::new(ManyToOneTable::read(conn, "publishers", "name", "books_publishers_link", "publisher")?),
+            ItemTable::Ratings => self.rating = Arc::new(read_rating_table(conn)?),
+            ItemTable::Tags => self.tags = Arc::new(ManyToManyTable::read(conn, "tags", "name", "books_tags_link", "tag", "id")?),
+            ItemTable::Languages => self.languages = Arc::new(ManyToManyTable::read(conn, "languages", "lang_code", "books_languages_link", "lang_code", "item_order")?),
+            ItemTable::Authors => self.authors = Arc::new(AuthorsTable::read(conn)?),
         }
         Ok(())
     }
 
     /// Drops everything this snapshot holds about one book.
     pub fn forget_book(&mut self, book: i32) {
+        fn forget<T: BookSlice + Clone>(table: &mut Arc<T>, book: i32) {
+            Arc::make_mut(table).forget(book);
+        }
         for t in [&mut self.title, &mut self.sort, &mut self.author_sort, &mut self.isbn, &mut self.path, &mut self.timestamp, &mut self.pubdate, &mut self.last_modified, &mut self.series_index, &mut self.comments] {
-            t.book_col_map.remove(&book);
+            forget(t, book);
         }
-        if let Some(uuid) = self.uuid.book_col_map.remove(&book) {
-            if self.uuid.uuid_to_id_map.get(&uuid) == Some(&book) {
-                self.uuid.uuid_to_id_map.remove(&uuid);
-            }
-        }
-        self.size.book_col_map.remove(&book);
-        self.series.forget_book(book);
-        self.publisher.forget_book(book);
-        self.rating.forget_book(book);
-        self.tags.forget_book(book);
-        self.languages.forget_book(book);
-        if let Some(items) = self.authors.book_col_map.remove(&book) {
-            for item in items {
-                forget_in_col_book(&mut self.authors.col_book_map, &item, book);
-            }
-        }
-        self.formats.fname_map.remove(&book);
-        self.formats.size_map.remove(&book);
-        if let Some(fmts) = self.formats.book_col_map.remove(&book) {
-            for f in fmts {
-                forget_in_col_book(&mut self.formats.col_book_map, &f, book);
-            }
-        }
-        if let Some(idents) = self.identifiers.book_col_map.remove(&book) {
-            for (k, _) in idents {
-                forget_in_col_book(&mut self.identifiers.col_book_map, &k, book);
-            }
-        }
+        forget(&mut self.uuid, book);
+        forget(&mut self.size, book);
+        forget(&mut self.series, book);
+        forget(&mut self.publisher, book);
+        forget(&mut self.rating, book);
+        forget(&mut self.tags, book);
+        forget(&mut self.languages, book);
+        forget(&mut self.authors, book);
+        forget(&mut self.formats, book);
+        forget(&mut self.identifiers, book);
     }
 
-    /// Re-reads one book from the database: forget, then read what is
-    /// there now. A book that no longer exists is simply forgotten. The
-    /// result is what [`StandardTables::read`] would hold for that book,
-    /// at the price of a dozen indexed lookups instead of a scan of
-    /// every table.
-    pub fn reload_book(&mut self, conn: &Connection, book: i32) -> Result<()> {
+    /// Re-reads one book from the database and brings this snapshot to what
+    /// [`StandardTables::read`] would hold for that book, at the price of a
+    /// dozen indexed lookups instead of a scan of every table. A book that no
+    /// longer exists is simply forgotten.
+    ///
+    /// Only the tables whose rows for the book actually changed are touched
+    /// (and so copied, when another snapshot shares them): editing a rating
+    /// copies the rating table, not the fifty thousand titles beside it. The
+    /// tables that changed are returned.
+    pub fn reload_book(&mut self, conn: &Connection, book: i32) -> Result<TableSet> {
+        let mut fresh = StandardTables::empty();
+        fresh.read_book_rows(conn, book)?;
+        Ok(self.adopt_book(&fresh, book))
+    }
+
+    /// What [`StandardTables::reload_book`] does once the book is read: makes
+    /// this snapshot hold, for `book`, what `fresh` (read from the database
+    /// for that one book) holds.
+    pub fn adopt_book(&mut self, fresh: &StandardTables, book: i32) -> TableSet {
+        let mut changed = TableSet::default();
+        // Whether the book is one the library lists (has a title) is what every
+        // sort order depends on beyond the field it sorts by: `MEMBERS` moves
+        // when a book appears or goes, not when its title changes.
+        let listed = self.title.book_col_map.contains_key(&book);
+        sync_book(&mut self.title, &fresh.title, book, TableSet::TITLE, &mut changed);
+        if listed != self.title.book_col_map.contains_key(&book) {
+            changed.insert(TableSet::MEMBERS);
+        }
+        sync_book(&mut self.sort, &fresh.sort, book, TableSet::SORT, &mut changed);
+        sync_book(&mut self.author_sort, &fresh.author_sort, book, TableSet::AUTHOR_SORT, &mut changed);
+        sync_book(&mut self.isbn, &fresh.isbn, book, TableSet::ISBN, &mut changed);
+        sync_book(&mut self.path, &fresh.path, book, TableSet::PATH, &mut changed);
+        sync_book(&mut self.timestamp, &fresh.timestamp, book, TableSet::TIMESTAMP, &mut changed);
+        sync_book(&mut self.pubdate, &fresh.pubdate, book, TableSet::PUBDATE, &mut changed);
+        sync_book(&mut self.last_modified, &fresh.last_modified, book, TableSet::LAST_MODIFIED, &mut changed);
+        sync_book(&mut self.series_index, &fresh.series_index, book, TableSet::SERIES_INDEX, &mut changed);
+        sync_book(&mut self.comments, &fresh.comments, book, TableSet::COMMENTS, &mut changed);
+        sync_book(&mut self.uuid, &fresh.uuid, book, TableSet::UUID, &mut changed);
+        sync_book(&mut self.size, &fresh.size, book, TableSet::SIZE, &mut changed);
+        sync_book(&mut self.series, &fresh.series, book, TableSet::SERIES, &mut changed);
+        sync_book(&mut self.publisher, &fresh.publisher, book, TableSet::PUBLISHER, &mut changed);
+        sync_book(&mut self.rating, &fresh.rating, book, TableSet::RATING, &mut changed);
+        sync_book(&mut self.tags, &fresh.tags, book, TableSet::TAGS, &mut changed);
+        sync_book(&mut self.languages, &fresh.languages, book, TableSet::LANGUAGES, &mut changed);
+        sync_book(&mut self.authors, &fresh.authors, book, TableSet::AUTHORS, &mut changed);
+        sync_book(&mut self.formats, &fresh.formats, book, TableSet::FORMATS, &mut changed);
+        sync_book(&mut self.identifiers, &fresh.identifiers, book, TableSet::IDENTIFIERS, &mut changed);
+        changed
+    }
+
+    /// Reads what the database holds for one book into `self`, which must
+    /// hold nothing for it (a fresh [`StandardTables::empty`]).
+    pub fn read_book_rows(&mut self, conn: &Connection, book: i32) -> Result<()> {
         use rusqlite::OptionalExtension;
-        self.forget_book(book);
+        fn own<T: Clone>(table: &mut Arc<T>) -> &mut T {
+            Arc::make_mut(table)
+        }
 
         let row: Option<Vec<SqlValue>> = conn
             .prepare_cached("SELECT title, sort, author_sort, isbn, path, timestamp, pubdate, last_modified, series_index, uuid FROM books WHERE id = ?1")?
@@ -700,61 +1035,65 @@ impl StandardTables {
         let mut next = || sql_value_to_string(it.next().unwrap_or(SqlValue::Null));
         for t in [&mut self.title, &mut self.sort, &mut self.author_sort, &mut self.isbn, &mut self.path, &mut self.timestamp, &mut self.pubdate, &mut self.last_modified, &mut self.series_index] {
             if let Some(v) = next() {
-                t.book_col_map.insert(book, v);
+                own(t).book_col_map.insert(book, v);
             }
         }
         if let Some(uuid) = next() {
-            self.uuid.uuid_to_id_map.insert(uuid.clone(), book);
-            self.uuid.book_col_map.insert(book, uuid);
+            let t = own(&mut self.uuid);
+            t.uuid_to_id_map.insert(uuid.clone(), book);
+            t.book_col_map.insert(book, uuid);
         }
 
         let text: Option<SqlValue> = conn.prepare_cached("SELECT text FROM comments WHERE book = ?1")?.query_row([book], |r| r.get(0)).optional()?;
         if let Some(s) = text.and_then(sql_value_to_string) {
-            self.comments.book_col_map.insert(book, s);
+            own(&mut self.comments).book_col_map.insert(book, s);
         }
 
         let size: Option<i64> = conn.prepare_cached("SELECT MAX(uncompressed_size) FROM data WHERE book = ?1")?.query_row([book], |r| r.get(0))?;
         if let Some(size) = size {
-            self.size.book_col_map.insert(book, size);
+            own(&mut self.size).book_col_map.insert(book, size);
         }
 
-        self.series.read_book(conn, "books_series_link", "series", book)?;
-        self.publisher.read_book(conn, "books_publishers_link", "publisher", book)?;
-        self.rating.read_book(conn, "books_ratings_link", "rating", book)?;
-        self.tags.read_book(conn, "books_tags_link", "tag", "id", book)?;
-        self.languages.read_book(conn, "books_languages_link", "lang_code", "item_order", book)?;
+        own(&mut self.series).read_book(conn, "books_series_link", "series", book)?;
+        own(&mut self.publisher).read_book(conn, "books_publishers_link", "publisher", book)?;
+        own(&mut self.rating).read_book(conn, "books_ratings_link", "rating", book)?;
+        own(&mut self.tags).read_book(conn, "books_tags_link", "tag", "id", book)?;
+        own(&mut self.languages).read_book(conn, "books_languages_link", "lang_code", "item_order", book)?;
         {
             let mut stmt = conn.prepare_cached("SELECT author FROM books_authors_link WHERE book = ?1 ORDER BY id")?;
             let items: Vec<i32> = stmt.query_map([book], |r| r.get::<_, i32>(0))?.collect::<Result<_>>()?;
+            let authors = own(&mut self.authors);
             for item in items {
-                self.authors.col_book_map.entry(item).or_default().insert(book);
-                self.authors.book_col_map.entry(book).or_default().push(item);
+                authors.col_book_map.entry(item).or_default().insert(book);
+                authors.book_col_map.entry(book).or_default().push(item);
             }
         }
         {
             let mut stmt = conn.prepare_cached("SELECT format, name, uncompressed_size FROM data WHERE book = ?1")?;
             let rows: Vec<(Option<String>, String, i64)> = stmt.query_map([book], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_>>()?;
+            let formats = own(&mut self.formats);
             let mut fmts = Vec::new();
             for (fmt, name, size) in rows {
                 let Some(fmt) = fmt else { continue };
                 let fmt = fmt.to_uppercase();
-                self.formats.col_book_map.entry(fmt.clone()).or_default().insert(book);
-                self.formats.fname_map.entry(book).or_default().insert(fmt.clone(), name);
-                self.formats.size_map.entry(book).or_default().insert(fmt.clone(), size);
+                formats.col_book_map.entry(fmt.clone()).or_default().insert(book);
+                formats.fname_map.entry(book).or_default().insert(fmt.clone(), name);
+                formats.size_map.entry(book).or_default().insert(fmt.clone(), size);
                 fmts.push(fmt);
             }
             if !fmts.is_empty() {
                 fmts.sort();
-                self.formats.book_col_map.insert(book, fmts);
+                formats.book_col_map.insert(book, fmts);
             }
         }
         {
             let mut stmt = conn.prepare_cached("SELECT type, val FROM identifiers WHERE book = ?1 ORDER BY id")?;
             let rows: Vec<(Option<String>, Option<String>)> = stmt.query_map([book], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_>>()?;
+            let identifiers = own(&mut self.identifiers);
             for (typ, val) in rows {
                 if let (Some(typ), Some(val)) = (typ, val) {
-                    self.identifiers.col_book_map.entry(typ.clone()).or_default().insert(book);
-                    self.identifiers.book_col_map.entry(book).or_default().insert(typ, val);
+                    identifiers.col_book_map.entry(typ.clone()).or_default().insert(book);
+                    identifiers.book_col_map.entry(book).or_default().insert(typ, val);
                 }
             }
         }

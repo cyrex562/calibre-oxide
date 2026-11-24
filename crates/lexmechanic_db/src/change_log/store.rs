@@ -228,6 +228,25 @@ pub struct ChangeLog {
     snapshots_dir: PathBuf,
     origin: InstallId,
     state: Mutex<LocalState>,
+    group: Group,
+}
+
+/// What a writer of [`ChangeLog::append_grouped`] waits for: its ops
+/// durable, or the reason they are not.
+type Ticket = std::sync::Arc<Mutex<Option<std::result::Result<(), String>>>>;
+
+/// The writers of [`ChangeLog::append_grouped`] waiting for their turn.
+#[derive(Default)]
+struct Group {
+    state: Mutex<GroupState>,
+    wake: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct GroupState {
+    pending: Vec<(ChangeOp, Ticket)>,
+    /// A writer is writing a group right now.
+    writing: bool,
 }
 
 impl ChangeLog {
@@ -250,6 +269,7 @@ impl ChangeLog {
             snapshots_dir,
             origin,
             state: Mutex::new(LocalState { clock: HlcClock::resuming_from(Hlc::ZERO), next_seq: 1, prev_hash: None }),
+            group: Group::default(),
         };
 
         // Normally the tip is found from the newest snapshot's header and the
@@ -404,6 +424,55 @@ impl ChangeLog {
         state.next_seq = change.seq + 1;
         state.prev_hash = Some(change.hash.clone());
         Ok(change)
+    }
+
+    /// [`ChangeLog::append`] for writers that may come at the same time
+    /// (requests on several threads): the ops of those waiting together are
+    /// written as **one** entry -- one file, one fsync -- instead of one
+    /// each. Each caller still returns only once its own ops are durable,
+    /// so nothing a client was told succeeded can be lost; they simply share
+    /// the cost of making it so, the way a database groups commits.
+    ///
+    /// The first writer to find nobody writing becomes the one that writes:
+    /// it takes everything waiting, appends it (a single op as itself, several
+    /// as a [`ChangeOp::Batch`], in the order they arrived, which a replay
+    /// applies in order), hands the result to each waiter and steps down. A
+    /// writer whose ops were taken by another waits for that result; one
+    /// that arrived during a write writes the next group. A lone writer pays
+    /// nothing extra and writes the entry [`ChangeLog::append`] would.
+    pub fn append_grouped(&self, op: ChangeOp) -> Result<()> {
+        let ticket: Ticket = std::sync::Arc::new(Mutex::new(None));
+        let mut state = self.group.state.lock().unwrap();
+        state.pending.push((op, ticket.clone()));
+        loop {
+            if let Some(result) = ticket.lock().unwrap().take() {
+                return result.map_err(|e| anyhow::anyhow!(e));
+            }
+            if state.writing {
+                state = self.group.wake.wait(state).unwrap();
+                continue;
+            }
+            // Our turn to write: everything waiting goes in one entry.
+            state.writing = true;
+            let taken = std::mem::take(&mut state.pending);
+            drop(state);
+            let (mut ops, tickets): (Vec<ChangeOp>, Vec<Ticket>) = taken.into_iter().unzip();
+            let appended = if ops.len() == 1 {
+                self.append(ops.remove(0))
+            } else {
+                // A batch among them is spread into the group's, which is one
+                // flat list in arrival order.
+                let flat: Vec<ChangeOp> = ops.into_iter().flat_map(|op| if let ChangeOp::Batch { ops } = op { ops } else { vec![op] }).collect();
+                self.append(ChangeOp::Batch { ops: flat })
+            };
+            let outcome: std::result::Result<(), String> = appended.map(|_| ()).map_err(|e| format!("{e:#}"));
+            for t in tickets {
+                *t.lock().unwrap() = Some(outcome.clone());
+            }
+            state = self.group.state.lock().unwrap();
+            state.writing = false;
+            self.group.wake.notify_all();
+        }
     }
 
     /// Everything needed to rebuild the database, in apply order.
@@ -861,7 +930,7 @@ mod tests {
         let check = |expect_snapshot: bool| {
             let full = {
                 // The slow path, forced by hand.
-                let reopened = ChangeLog { changes_dir: log.changes_dir.clone(), snapshots_dir: log.snapshots_dir.clone(), origin: log.origin.clone(), state: Mutex::new(LocalState { clock: HlcClock::resuming_from(Hlc::ZERO), next_seq: 1, prev_hash: None }) };
+                let reopened = ChangeLog { changes_dir: log.changes_dir.clone(), snapshots_dir: log.snapshots_dir.clone(), origin: log.origin.clone(), state: Mutex::new(LocalState { clock: HlcClock::resuming_from(Hlc::ZERO), next_seq: 1, prev_hash: None }), group: Group::default() };
                 let replay = reopened.replay().unwrap();
                 let mut state = reopened.state.lock().unwrap();
                 for change in replay.changes() {

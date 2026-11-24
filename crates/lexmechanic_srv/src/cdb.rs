@@ -770,24 +770,27 @@ async fn set_fields_batch_handle(state: AppState, library_id: Option<String>, bo
 
     let mut updated: Vec<i32> = Vec::new();
     let mut failed: Vec<Value> = Vec::new();
-    for (book_ids, updates) in work {
-        for chunk in book_ids.chunks(BATCH_COMMIT_CHUNK) {
-            let chunk = chunk.to_vec();
-            let (ids, results) = tokio::task::spawn_blocking({
-                let cache = cache.clone();
-                let updates = updates.clone();
-                move || {
-                    let results = cache.set_fields_for_books(&chunk, &updates);
-                    (chunk, results)
-                }
-            })
-            .await
-            .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
-            for (id, result) in ids.into_iter().zip(results) {
-                match result {
-                    Ok(()) => updated.push(id),
-                    Err(e) => failed.push(serde_json::json!({ "book_id": id, "error": e.to_string() })),
-                }
+    // Every (book, changes) of every group, in order, written in runs of
+    // BATCH_COMMIT_CHUNK books: one transaction (and one change-log entry) per
+    // run however many groups it spans. An undo of a bulk edit is shaped as
+    // many small groups with a different value each, and a transaction per
+    // group made it 20 times slower than the same books in one group.
+    let items: Vec<(i32, Vec<(String, String)>)> = work.into_iter().flat_map(|(book_ids, updates)| book_ids.into_iter().map(move |id| (id, updates.clone()))).collect();
+    for chunk in items.chunks(BATCH_COMMIT_CHUNK) {
+        let chunk = chunk.to_vec();
+        let (ids, results) = tokio::task::spawn_blocking({
+            let cache = cache.clone();
+            move || {
+                let results = cache.set_fields_per_book(&chunk);
+                (chunk.into_iter().map(|(id, _)| id).collect::<Vec<i32>>(), results)
+            }
+        })
+        .await
+        .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+        for (id, result) in ids.into_iter().zip(results) {
+            match result {
+                Ok(()) => updated.push(id),
+                Err(e) => failed.push(serde_json::json!({ "book_id": id, "error": e.to_string() })),
             }
         }
     }
@@ -1371,6 +1374,26 @@ mod tests {
         }
         let (_, untouched) = get_json(&router, "/ajax/book/2").await;
         assert_eq!(untouched["tags"], serde_json::json!([]));
+    }
+
+    /// Many groups in one request are one transaction and one change-log
+    /// entry (per run of 200 books), not one of each per group -- the shape
+    /// of an undo of a bulk edit, which was 20 times slower than the same
+    /// books in one group.
+    #[tokio::test]
+    async fn set_fields_batch_writes_all_its_groups_as_one_logged_batch() {
+        let (dir, router) = test_app(6);
+        let entries = || std::fs::read_dir(dir.path().join(".lexmechanic").join("changes")).map(|d| d.flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".json")).count()).unwrap_or(0);
+        let before = entries();
+        let groups: Vec<serde_json::Value> = (1..=6).map(|id| serde_json::json!({"book_ids": [id], "changes": {"publisher": format!("House {id}"), "tags": [format!("tag {id}")]}})).collect();
+        let (status, resp) = post_json(&router, "/cdb/set-fields-batch", serde_json::json!({ "groups": groups })).await;
+        assert_eq!(status, StatusCode::OK, "got: {resp}");
+        assert_eq!(resp["updated"], serde_json::json!([1, 2, 3, 4, 5, 6]));
+        assert_eq!(entries() - before, 1, "six groups, one change-log entry");
+        for id in 1..=6 {
+            let (_, book) = get_json(&router, &format!("/ajax/book/{id}")).await;
+            assert_eq!(book["publisher"], format!("House {id}"), "{book}");
+        }
     }
 
     #[tokio::test]

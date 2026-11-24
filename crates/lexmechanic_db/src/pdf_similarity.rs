@@ -1234,11 +1234,18 @@ pub fn fingerprint_pdfs(cache: &Cache, options: &PipelineOptions, control: &JobC
         let kind = if suspect { "fingerprint-suspect" } else { "fingerprint" };
         let workers = if suspect { 1 } else { workers };
         let batch_pool: Option<std::sync::Arc<crate::pdf_worker::Pool>> = if suspect { pool.as_ref().map(|p| std::sync::Arc::new(p.isolated())) } else { pool.clone() };
+        // The whole batch is marked in flight in one durable transaction before
+        // any of it is read (one commit, where there used to be one per file),
+        // and unmarked together with the recording of the results below. A
+        // crash in between leaves the batch's marks, so each of its files is a
+        // suspect on the next run and is read once more on its own: slower
+        // after a crash, never wrong.
+        let batch_keys: Vec<&str> = chunk.iter().map(|(hash, _)| hash.as_str()).collect();
+        store.mark_inflight_many(kind, &batch_keys)?;
         let results = parallel_map(chunk, workers, control, |(hash, locations)| -> Result<Option<(String, Result<PdfFingerprint>)>> {
             for (folder, name, format) in locations {
                 let Some(path) = format_file_path(&library, folder, name, format) else { continue };
                 let display = path.display().to_string();
-                store.mark_inflight(kind, hash)?;
                 let outcome = match &batch_pool {
                     Some(pool) => fingerprint_via_pool(pool, &path),
                     None => fingerprint_file(&path),
@@ -1250,7 +1257,6 @@ pub fn fingerprint_pdfs(cache: &Cache, options: &PipelineOptions, control: &JobC
                         store.record_pdf_fingerprint(hash, &Err(format!("{e:#}")))?;
                     }
                 }
-                store.clear_inflight(kind, hash)?;
                 return match outcome {
                     Ok(fp) => Ok(Some((display, Ok(fp)))),
                     Err(e) if is_unavailable(&e) => Err(e),
@@ -1259,6 +1265,8 @@ pub fn fingerprint_pdfs(cache: &Cache, options: &PipelineOptions, control: &JobC
             }
             Ok(None)
         });
+        // Counted as the results come in, written once for the whole batch.
+        let mut outcomes: Vec<(&str, std::result::Result<PdfFingerprint, String>)> = Vec::new();
         for ((hash, locations), result) in chunk.iter().zip(results) {
             let Some(result) = result else { continue };
             match result {
@@ -1274,15 +1282,14 @@ pub fn fingerprint_pdfs(cache: &Cache, options: &PipelineOptions, control: &JobC
                         report.missing.push(format!("{folder}/{name}.{}", format.to_ascii_lowercase()));
                     }
                 }
-                Ok(Some((path, Ok(fp)))) => {
-                    cache.checksums().record_pdf_fingerprint(hash, &Ok(fp))?;
+                Ok(Some((_path, Ok(fp)))) => {
+                    outcomes.push((hash.as_str(), Ok(fp)));
                     control.fingerprinted.fetch_add(1, Ordering::Relaxed);
                     report.fingerprinted += 1;
-                    let _ = path;
                 }
                 Ok(Some((path, Err(e)))) => {
                     let why = format!("{e:#}");
-                    cache.checksums().record_pdf_fingerprint(hash, &Err(why.clone()))?;
+                    outcomes.push((hash.as_str(), Err(why.clone())));
                     control.errors.fetch_add(1, Ordering::Relaxed);
                     report.failed_count += 1;
                     if report.failed.len() < 100 {
@@ -1291,6 +1298,10 @@ pub fn fingerprint_pdfs(cache: &Cache, options: &PipelineOptions, control: &JobC
                 }
             }
         }
+        // One transaction: the batch's results and the removal of its marks.
+        // Every file of the batch is unmarked, those not reached (cancelled,
+        // or an abort) and those that were not found included.
+        store.finish_pdf_fingerprints(kind, &outcomes, &batch_keys)?;
         if let Some(e) = abort.take() {
             return Err(anyhow!("{e:#}"));
         }

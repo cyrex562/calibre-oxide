@@ -634,6 +634,7 @@ const ACCOUNTED: &[(&str, Account)] = &[
 const EXCLUDED: &[(&str, &str)] = &[
     ("field_feed_tests.rs", "tests of the field snapshot, which write rows with raw SQL on purpose"),
     ("t26a_tests.rs", "tests that backdate last_modified with raw SQL to see it move"),
+    ("t29b_tests.rs", "tests and timing probes that build a library with raw SQL on purpose"),
     ("schema_upgrades.rs", "one-time schema migrations"),
     ("checksums.rs", "the checksum sidecar db"),
     ("orphans.rs", "the checksum sidecar db"),
