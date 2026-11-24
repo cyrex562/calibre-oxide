@@ -82,6 +82,7 @@ mod tests {
     /// `ServiceDaemon::new()` failure or an empty resolve within the
     /// timeout is treated as "can't verify here", not "broken".
     #[test]
+    #[ignore = "opens UDP 5353 on every interface (a Windows Firewall prompt per test binary); run with --ignored"]
     fn register_then_discover_over_real_mdns() {
         let port = 18_773;
         let bonjour = match Bonjour::start("Lexmechanic test library", port, "/opds") {

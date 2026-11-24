@@ -538,10 +538,9 @@ fn reveal_library_folder(app: AppHandle) -> Result<(), String> {
 
 /// Opens the folder holding one book's files.
 ///
-/// The book's folder is `<library>/<books.path>`, and `books.path` is
-/// already in every book row -- `ajax::book_json` strips the internal
-/// `fmt_<ext>` absolute paths before they reach a client but keeps
-/// `path`, so this needs no new route.
+/// The book's folder is `<library>/<books.path>`; `/ajax/book/{id}` sends
+/// `books.path` as `path` (relative, never the internal absolute
+/// `fmt_<ext>` paths), so this needs no new route.
 #[tauri::command]
 async fn reveal_book_folder(state: State<'_, ServerState>, app: AppHandle, book_id: i32) -> Result<(), String> {
     let port = state.0.lock().unwrap().as_ref().map(|(_, p)| *p).ok_or("no library is currently open")?;

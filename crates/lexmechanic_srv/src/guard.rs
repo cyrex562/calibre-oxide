@@ -51,6 +51,13 @@ pub fn effective_listen_on(opts: &ServerOptions) -> String {
     }
 }
 
+/// True when `addr` (an `effective_listen_on` value) only accepts connections
+/// from this machine. Network-facing extras (mDNS) stay off for such servers.
+pub fn is_loopback_listen(addr: &str) -> bool {
+    let a = addr.trim().trim_start_matches('[').trim_end_matches(']');
+    a.eq_ignore_ascii_case("localhost") || a.parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
+}
+
 /// Splits `host[:port]` (IPv6 literals in brackets) into a lowercase host and
 /// an optional port.
 fn split_authority(authority: &str) -> (String, Option<u16>) {
@@ -228,5 +235,10 @@ mod tests {
         assert_eq!(effective_listen_on(&opts(1, None, false)), "127.0.0.1");
         assert_eq!(effective_listen_on(&opts(1, None, true)), "0.0.0.0");
         assert_eq!(effective_listen_on(&opts(1, Some("10.0.0.1"), false)), "10.0.0.1");
+        assert!(is_loopback_listen("127.0.0.1"));
+        assert!(is_loopback_listen("[::1]"));
+        assert!(is_loopback_listen("localhost"));
+        assert!(!is_loopback_listen("0.0.0.0"));
+        assert!(!is_loopback_listen("10.0.0.1"));
     }
 }

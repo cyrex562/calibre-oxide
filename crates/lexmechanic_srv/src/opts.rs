@@ -65,8 +65,11 @@ pub struct ServerOptions {
     /// Number of books to show in a single page
     #[arg(long, default_value_t = 50)]
     pub num_per_page: i64,
-    /// Advertise OPDS feeds via BonJour
-    #[arg(long, default_value_t = true)]
+    /// Advertise OPDS feeds via BonJour (mDNS). Off by default: it opens UDP
+    /// port 5353 on every network interface, which makes Windows Firewall ask
+    /// for permission. Only takes effect when the server listens on a
+    /// non-loopback address.
+    #[arg(long, default_value_t = false)]
     pub use_bonjour: bool,
     /// Maximum number of books in OPDS feeds
     #[arg(long, default_value_t = 30)]
@@ -166,7 +169,7 @@ mod tests {
         assert_eq!(opts.max_opds_items, 30);
         assert_eq!(opts.max_opds_ungrouped_items, 100);
         assert_eq!(opts.num_per_page, 50);
-        assert!(opts.use_bonjour);
+        assert!(!opts.use_bonjour, "mDNS must be opt-in: it opens a port on every interface");
         assert!(!opts.auth);
         assert_eq!(opts.auth_mode, "auto");
         assert_eq!(opts.book_list_mode, "cover_grid");
