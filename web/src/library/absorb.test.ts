@@ -44,7 +44,7 @@ describe("describeAbsorb", () => {
   it("reports what came in and that the database was renamed", () => {
     const lines = describeAbsorb(report());
     expect(lines[0]).toBe("Brought in 4 books (5 files, 3 covers, 20 custom values).");
-    expect(lines.join(" ")).toContain("metadata.db.absorbed-by-calibre-oxide");
+    expect(lines.join(" ")).toContain("metadata.db.absorbed-by-lexmechanic");
   });
 
   it("says when nothing was new, and when it was stopped", () => {

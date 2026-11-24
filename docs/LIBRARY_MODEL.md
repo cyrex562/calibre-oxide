@@ -12,7 +12,9 @@ and the tree encodes author and title.
 
 This project's model: **the folder is yours, and the database is an index of
 what is in it.** Files are never moved or renamed unless you ask. App state
-lives in a `.calibre-oxide/` subdirectory alongside the index.
+lives in a `.lexmechanic/` subdirectory alongside the index. (Before the
+project was renamed that folder was `.calibre-oxide/`; opening a library
+renames it, and if both exist `.lexmechanic/` is used and a warning logged.)
 
 ```
 ~/Scans/                          <- the library is just this folder
@@ -21,7 +23,7 @@ lives in a `.calibre-oxide/` subdirectory alongside the index.
 ├── Receipts/
 │   └── 2019 invoice.pdf          books.path = "Receipts"
 ├── metadata.db                   a DERIVED query cache -- disposable, see below
-└── .calibre-oxide/
+└── .lexmechanic/
     ├── changes/                  the authoritative append-only change log
     ├── snapshots/                periodic compaction of the log
     ├── covers/<uuid>.jpg         covers, keyed by book uuid
@@ -77,12 +79,12 @@ different costs:
 | Size + mtime | same `stat` | cheap "has this changed?" gate; skip rehashing when both match | edits preserving both; coarse timestamps |
 | Content hash | reads the whole file | everything, including cross-volume moves | nothing — but it can take hours |
 
-`calibre_utils::filenames::file_identity` already implements the first
+`lexmechanic_utils::filenames::file_identity` already implements the first
 (`GetFileInformationByHandle` on Windows, the Unix equivalent elsewhere). It is
 currently private and used only for a same-file check; it needs making public.
 
 **The hash is BLAKE3, not SHA256.** The tree already stores BLAKE3 per
-`(book_id, kind, key)` in `.calibre-oxide/checksums.db`, and BLAKE3 is several
+`(book_id, kind, key)` in `.lexmechanic/checksums.db`, and BLAKE3 is several
 times faster on large files — which is the difference between minutes and an
 hour on a folder of 200 MB scans. Nothing hashes twice. The existing store must
 gain a **content → book** lookup, which it does not have today: it can answer
@@ -100,8 +102,8 @@ is minutes to hours of I/O. The scan must not block on it:
 2. **In the background** — hash each file, then apply the hash-derived
    conclusions: duplicate pairs and format grouping. These appear as they land.
 
-As built (`calibre_db::scan_pipeline`, run as a cancellable job by
-`calibre_srv::library_jobs`), the split sits in a different place, because the
+As built (`lexmechanic_db::scan_pipeline`, run as a cancellable job by
+`lexmechanic_srv::library_jobs`), the split sits in a different place, because the
 hash turned out to be the cheap half to do *once* and the embedded metadata the
 expensive half to do lazily:
 
@@ -133,17 +135,17 @@ Measured on a 9,767-file, 114 GB folder: the scan took about an hour and the
 PDF fingerprints 67 minutes on one worker, and a native PDFium crash with two
 in-process workers had killed the whole server. What changed (tranche 13):
 
-- **PDFium runs in worker processes** (`calibre_pdf_worker`, `calibre_db::pdf_worker`).
+- **PDFium runs in worker processes** (`lexmechanic_pdf_worker`, `lexmechanic_db::pdf_worker`).
   The enrichment pass and the fingerprint job send each PDF to a pool of
-  workers (default half the cores, at most 4; `CALIBRE_OXIDE_PDF_WORKERS`, or
+  workers (default half the cores, at most 4; `LEXMECHANIC_PDF_WORKERS`, or
   `?pdf_workers=` on the job routes; `0` means "read in the server, one at a
   time", the old way). A crash kills one worker, never the server: the file is
-  recorded as `crashed` (or `timed out` after `CALIBRE_OXIDE_PDF_TIMEOUT_SECS`,
+  recorded as `crashed` (or `timed out` after `LEXMECHANIC_PDF_TIMEOUT_SECS`,
   default 120), a fresh worker takes over and the run goes on. A fingerprinted
   file is never read again until `FINGERPRINT_VERSION` changes, so a poison file
   is read once. The worker binary is looked for next to the running executable
-  (it is built and shipped with `calibre_srv`), or at
-  `CALIBRE_OXIDE_PDF_WORKER`; without it the in-process path is used.
+  (it is built and shipped with `lexmechanic_srv`), or at
+  `LEXMECHANIC_PDF_WORKER`; without it the in-process path is used.
 - **In-flight marks and suspects.** Before a PDF is handed to a reader it is
   written to `checksums_db.inflight` (kind `enrich` by book id, `fingerprint` by
   content hash). A worker crash or timeout is recorded the moment it happens.
@@ -161,7 +163,7 @@ in-process workers had killed the whole server. What changed (tranche 13):
   when the file's content hash is known and it has no fingerprint, so the scan
   leaves the PDFs fingerprinted and the separate job has little left to do.
 - **Smaller covers.** Covers rendered by the scan are 600 px wide
-  (`CALIBRE_OXIDE_SCAN_COVER_WIDTH`, or `?cover_width=`), down from 1,000: plenty
+  (`LEXMECHANIC_SCAN_COVER_WIDTH`, or `?cover_width=`), down from 1,000: plenty
   for the grid and the detail pane, and about a third cheaper to render.
   Covers added any other way keep their size.
 - **Enrichment writes in batches.** Reads stay in small chunks (a cancel is
@@ -194,14 +196,14 @@ in-process workers had killed the whole server. What changed (tranche 13):
   longer costs a full walk each time it is opened.
 - **One chained job.** `POST /prepare-library` runs scan, hash backfill, PDF
   fingerprints and the duplicate scan in order. The stage it reached is written
-  to `.calibre-oxide/prepare-stage.json` before it starts, so a rerun resumes at
+  to `.lexmechanic/prepare-stage.json` before it starts, so a rerun resumes at
   that stage (each stage also resumes itself); `?restart=true` begins again at
   the scan, and `GET /prepare-library` reports the stage. The duplicates panel's
   "Prepare for duplicate detection" button starts it, shows "Step n of 4" and
   loads the groups when it ends. A stage that fails (no
   PDFium for the fingerprints) is reported and the chain carries on.
 
-Reads run on a small bounded pool (default 3; `CALIBRE_OXIDE_SCAN_WORKERS`, or
+Reads run on a small bounded pool (default 3; `LEXMECHANIC_SCAN_WORKERS`, or
 `?workers=` on the route); every database write stays on one thread in sorted
 order, so the result does not depend on the thread count. Cancel is checked
 between read chunks. A batch is committed whole or not at all, so a cancelled or
@@ -241,7 +243,7 @@ Two constraints shape this:
 
 Content hashes find the same *file*. The same *book* is often recorded
 differently: `The Hobbit` / `Hobbit, The (z-lib.org)`, `J.R.R. Tolkien` /
-`Tolkien, J. R. R.`, an ISBN-10 and its ISBN-13. `calibre_db::dedupe` finds
+`Tolkien, J. R. R.`, an ISBN-10 and its ISBN-13. `lexmechanic_db::dedupe` finds
 those, and `POST /duplicates/scan/{library_id}` reports each group with its
 strongest `reason`, a `confidence`, and the per-pair `evidence`:
 
@@ -266,7 +268,7 @@ Rules that keep this from flooding the user:
   `Document1`, or a bare filename such as `F:\On Hold\1-45.tif`, and an author
   such as `Admin`, `Administrator`, `Owner` or `User`, is treated as absent, so
   the filename title applies. One short documented list
-  (`calibre_db::junk_metadata`) serves both extraction and dedupe, so libraries
+  (`lexmechanic_db::junk_metadata`) serves both extraction and dedupe, so libraries
   imported before it benefit too. PDF Info strings in UTF-16 (BOM `FE FF` /
   `FF FE`) are decoded, not rendered as `?? G U R P S`.
 - **Content vetoes a title match.** A title-tier pair (`title_author_exact`,
@@ -314,7 +316,7 @@ Rules that keep this from flooding the user:
 
 The normalisation (what differs from calibre's `fuzzy_title` and
 `find_identical_books`, and why Jaro-Winkler is not used) is documented in
-`crates/calibre_db/src/dedupe.rs`.
+`crates/lexmechanic_db/src/dedupe.rs`.
 
 ## Finding the same PDF saved differently
 
@@ -323,11 +325,11 @@ Neither hashes nor titles see two kinds of duplicate: a **scan and its OCR copy*
 re-encoded too) and an **optimizer re-save** (downsampled images, re-encoded
 streams, stripped metadata). They share no bytes and often no title or author
 (or have only a filename-derived title), so they are found from the *pages*.
-`calibre_db::pdf_similarity` does it; calibre has no such feature, so nothing
+`lexmechanic_db::pdf_similarity` does it; calibre has no such feature, so nothing
 is ported.
 
 **Fingerprint.** One per distinct file content, computed once from the file on
-disk through PDFium and cached in `.calibre-oxide/checksums.db` (table
+disk through PDFium and cached in `.lexmechanic/checksums.db` (table
 `pdf_fingerprints`, keyed by the BLAKE3 the scan recorded, with a `version`
 column and a recorded `failed` status for PDFs PDFium cannot open). It is a
 sidecar cache like the hashes themselves: not library metadata, not in the
@@ -353,7 +355,7 @@ take two, among documents whose page counts are within two), and a text MinHash 
 the sampled pages are aligned (a cover added or dropped shifts the front, not
 the end) and compared at a distance of at most 48 of 256 bits (disagreements among the
 bits both pages trust). Measured on real PDFium renders (the ignored
-benchmark `crates/calibre_db/tests/pdf_signature_benchmark.rs`), a page
+benchmark `crates/lexmechanic_db/tests/pdf_signature_benchmark.rs`), a page
 and its scan, OCR copy or optimizer re-encode are at most 17 apart and
 different pages at least 60. Two *independent* scans of one book with
 different skew do not match by pixels; their OCR text can (`pdf_text_match`). A pair matches when
@@ -414,8 +416,8 @@ re-saves is the original).
 
 A real library gives hundreds of groups (467 on 9,767 books), so the panel
 works a page at a time and can act on many groups at once. The code is
-`calibre_db::dedupe_exemptions`, `calibre_db::resolve` and
-`calibre_srv::duplicates_review`.
+`lexmechanic_db::dedupe_exemptions`, `lexmechanic_db::resolve` and
+`lexmechanic_srv::duplicates_review`.
 
 ### "Not duplicates" (exemptions)
 
@@ -423,7 +425,7 @@ An exemption is a *set* of books that are pairwise not duplicates (marking a
 group of 50 is one entry, not 1,225 pairs). Each member is recorded by its
 **uuid** and by the **content hashes** of its files (never the hash of an empty
 file), so a book that is deleted and imported again (new uuid, same bytes) stays
-exempt. They live in one JSON library preference, `oxide.duplicate_exemptions`,
+exempt. They live in one JSON library preference, `lexmechanic.duplicate_exemptions`,
 written through `set_preference`, so they are in the **change log** (a
 `PrefSet`): they survive restarts, rescans and a database rebuild from the log.
 No new table or log op.
@@ -456,7 +458,7 @@ disappears; a partly exempt one splits.
   (`{a, b, distance, matched}`), `compared`, `matched`, `mean_distance`,
   `text_jaccard`, `page_counts`.
 * **Manual groups** (`dedupe_manual_groups.rs`): sets of books the user put
-  together, in the preference `oxide.duplicate_manual_groups` by book uuid (like
+  together, in the preference `lexmechanic.duplicate_manual_groups` by book uuid (like
   exemptions). `POST /duplicates/manual-groups/{lib}` `{book_ids}` creates (books
   already in a group of the user's join it), `{group_id, add: [..]}` /
   `{group_id, remove: [..]}` change it; `POST /duplicates/manual-groups/remove/{lib}`
@@ -597,7 +599,7 @@ files when the folder is its alone or the book lives in the library root under
 `data/<uuid>/`), as `delete_book_with` has always done. Merge deletes its
 sources the same way, so a merged-away book's extra files travel in its trash
 entry (restorable with it) and its emptied folder goes; the OS recycle bin is
-never involved. The entry holds them flat, with an `oxide-trash.json` manifest:
+never involved. The entry holds them flat, with an `lexmechanic-trash.json` manifest:
 the original relative path of each file, the uuid, the metadata a restore
 writes back. A trashed in-place file is restorable to its **original relative
 path**; if something has taken the name since it comes back as
@@ -616,7 +618,7 @@ path**; if something has taken the name since it comes back as
 
 ## Importing a folder tree
 
-`POST /import-folder` (`calibre_db::import`) copies a folder tree *into* the
+`POST /import-folder` (`lexmechanic_db::import`) copies a folder tree *into* the
 library — the counterpart of scanning, which indexes files already there.
 
 * Modes (calibre's): *several books per folder* (files sharing a stem are one
@@ -624,7 +626,7 @@ library — the counterpart of scanning, which indexes files already there.
 * Duplicate policies: skip identical content (default), also skip same
   title+author, add new formats to the matching book (calibre's "automerge"),
   or add everything.
-* One read per source file: copied into `.calibre-oxide/import-staging` while
+* One read per source file: copied into `.lexmechanic/import-staging` while
   being hashed, the copy re-read and compared (size + BLAKE3), then **renamed**
   into `Author/Title (id)/Title - Author.ext` in one transaction per batch.
 * Metadata is carried over, not just title/author: from the embedded metadata
@@ -644,11 +646,11 @@ library — the counterpart of scanning, which indexes files already there.
 ## Absorbing a calibre library that sits inside the library
 
 A NAS root often holds several calibre libraries next to loose folders of
-books. One oxide library rooted at the share should see all of it, so that
+books. One Lexmechanic library rooted at the share should see all of it, so that
 duplicates are found *across* it. The scan steps around a folder with a live
 `metadata.db` (E2), and the folder import refuses a source inside the library,
 so a nested calibre library gets in by **absorbing** it
-(`calibre_db::absorb`):
+(`lexmechanic_db::absorb`):
 
 * `GET /absorbable-libraries/{lib}` lists the nested calibre libraries (a
   bounded, time-budgeted walk of folders only, like the untracked count), each
@@ -658,7 +660,7 @@ so a nested calibre library gets in by **absorbing** it
   inside it) is a library job: progress, cancel and a final report on
   `/library-jobs/{id}`. `POST /unabsorb-library/{lib}` `{path}` is the undo.
   Refusals (`400`, before any job): a path outside the library, the library
-  itself, no `metadata.db`, an oxide library, a database calibre appears to
+  itself, no `metadata.db`, a Lexmechanic library, a database calibre appears to
   have open (tranche 3's in-use probes, or a non-empty `-journal`/`-wal`).
 
 **What it does.** The nested `metadata.db` is opened `SQLITE_OPEN_READ_ONLY` and
@@ -677,7 +679,7 @@ positions.
 * *Covers* are not copied: calibre's `cover.jpg` is
   `<book folder>/cover.jpg`, exactly the legacy location
   `covers::legacy_cover_path` already reads, so the book points at it. Setting
-  a new cover later writes the `.calibre-oxide/covers/<uuid>.jpg` sidecar and
+  a new cover later writes the `.lexmechanic/covers/<uuid>.jpg` sidecar and
   retires the old file, as for any other book.
 * *Custom columns*: a column this library lacks is created with the same label,
   name, type, `is_multiple` and display; values (normalized ones included) are
@@ -687,7 +689,7 @@ positions.
 * *Uuids* are kept unless this library already has the uuid (the same library
   copied twice): the book then keeps the fresh uuid its row got, and
   `{source_uuid: new_uuid}` is reported (`uuid_remapped`) and recorded in
-  `.calibre-oxide/absorbed-libraries.json`.
+  `.lexmechanic/absorbed-libraries.json`.
 * *Hashes*: every format (and the cover) is streamed through BLAKE3 in the
   job's own read, in parallel and bounded like the scan's, and recorded in the
   same transaction. The content-duplicate tier sees the books at once and the
@@ -714,7 +716,7 @@ chunks; a batch whose reading was interrupted writes nothing.
 
 **Finishing.** When every book is in (none failed, not cancelled) the nested
 `metadata.db` — and its `-wal`/`-shm`/`-journal` — is renamed to
-`metadata.db.absorbed-by-calibre-oxide`. From then on the folder is not "a
+`metadata.db.absorbed-by-lexmechanic`. From then on the folder is not "a
 library of its own" (`scan::holds_its_own_library` only honours a **live**
 `metadata.db`): the scan descends into it, finds every absorbed file already
 tracked (0 untracked, no duplicates of the absorbed books) and picks up a loose
@@ -722,9 +724,9 @@ file dropped in later. With failures the database is left in place so the
 absorb can be retried, unless `allow_failures` asks to finish anyway (the
 failed books' files are then found as loose files).
 
-**Undo.** Rename `metadata.db.absorbed-by-calibre-oxide` back to
+**Undo.** Rename `metadata.db.absorbed-by-lexmechanic` back to
 `metadata.db` and the folder is a calibre library again that the scan steps
-around — but its books are still in the oxide database until removed. The
+around — but its books are still in the Lexmechanic database until removed. The
 `POST /unabsorb-library` job does both: it renames the file back and removes
 the books under that folder from the database (**rows only, never a file**,
 and nothing goes on the ignore list).
@@ -751,7 +753,7 @@ open libraries through the destination's own write paths. Since tranche 14a:
 
 The job registry used to live only in memory. The last state of every job
 (kind, summarized params, state, report, timestamps) is now written to
-`.calibre-oxide/jobs.json` on each state change (temp file + rename; reports
+`.lexmechanic/jobs.json` on each state change (temp file + rename; reports
 over 256 KB are dropped from the file). When a server opens a library it reads
 the file back: a job recorded `running` by a process that is gone is reported
 `interrupted` (`GET /library-jobs`, with `resumable` and `resume_route` for the
@@ -760,11 +762,11 @@ backfill, PDF fingerprint, prepare). Restored jobs get new ids
 (`params.previous_id` keeps the old one). The web UI shows "Resume <job>" on
 open, and the desktop app's library switch (which kills the server) asks first
 when `GET /library-jobs` reports a running job. The app waits up to 60 s
-(`CALIBRE_OXIDE_READY_TIMEOUT_SECS`) for the server to come up.
+(`LEXMECHANIC_READY_TIMEOUT_SECS`) for the server to come up.
 
 ## Organizing files by template
 
-Books scanned in place keep their original paths. `calibre_db::organize` moves
+Books scanned in place keep their original paths. `lexmechanic_db::organize` moves
 each book's **own format files** to where a save-to-disk style template says
 (default `{author_sort}/{title}`: folder `Author`, file `Title.ext`), inside the
 library.
@@ -786,7 +788,7 @@ library.
   example a junction onto another volume, which a rename cannot cross) the
   book's files already moved go back and it is reported failed. Nothing is
   copied across volumes.
-* Each run is recorded in an append-only journal, `.calibre-oxide/organize-runs/<run_id>.jsonl`
+* Each run is recorded in an append-only journal, `.lexmechanic/organize-runs/<run_id>.jsonl`
   (`run_journal.rs`): a book's entry is written and fsynced before its files move, so a
   crash leaves nothing undo cannot see. Older `.json` records still load;
   undo skips books that were moved since.
@@ -801,7 +803,7 @@ library.
 | Auto-add drop folder (outside the library) | a file that was *added* is **moved** into `<drop folder>/.added/` (renamed `name (1).ext` on a collision, never overwritten) — never deleted, and not the OS bin, which an SMB share lacks. Which files were added is decided per exact path from the add result, not by matching names in messages. Duplicates and failures stay in the drop folder. |
 | Change detection | scan on open and on demand. A filesystem watcher is a later addition, for local volumes only — it is a new dependency and unreliable on network shares and at scale. |
 | Moving between libraries | ask move-or-copy once per operation. |
-| Covers | `.calibre-oxide/covers/<id>.jpg`. `<book dir>/cover.jpg` collides for every book in a flat folder. |
+| Covers | `.lexmechanic/covers/<id>.jpg`. `<book dir>/cover.jpg` collides for every book in a flat folder. |
 | Retitling | touches nothing on disk. `rename_book_files` must not run. |
 | Filenames | never derived from the title. `add_format` currently names by title and must stop. |
 
@@ -815,7 +817,7 @@ hides someone's books.
 | # | Case | Handling |
 | --- | --- | --- |
 | E1 | Subfolders | recurse; record the subfolder in `books.path` |
-| E2 | A subfolder that is itself a library — **risk** | skip any directory containing a **live** `metadata.db` or `.calibre-oxide/`; descending into one double-tracks every book in it. A calibre library is brought in deliberately by **absorbing** it (see "Absorbing a calibre library that sits inside the library"), after which its database is renamed and the folder is ordinary |
+| E2 | A subfolder that is itself a library — **risk** | skip any directory containing a **live** `metadata.db` or `.lexmechanic/`; descending into one double-tracks every book in it. A calibre library is brought in deliberately by **absorbing** it (see "Absorbing a calibre library that sits inside the library"), after which its database is renamed and the folder is ordinary |
 | E3 | Grouping | see "When two files are one book" |
 | E4 | Non-book files | extension allowlist; a sibling image with a matching stem is a candidate cover |
 | E5 | OS junk — `.DS_Store`, `Thumbs.db`, `@eaDir` | ignore list, extending `check_library`'s existing one |
@@ -863,7 +865,7 @@ one of those failures is likely.
 | Undo a bulk edit | no | nearly free |
 | Two app instances writing | no help | safe by construction |
 
-**`.calibre-oxide/changes/` is the authority; `metadata.db` is a derived query
+**`.lexmechanic/changes/` is the authority; `metadata.db` is a derived query
 cache.** Delete the database and it rebuilds exactly from a snapshot plus the
 log tail. Corruption stops being data loss and becomes an inconvenience.
 
@@ -874,7 +876,7 @@ Three reasons this beats sidecars:
    two machines through a file-sync service corrupts — no locking, no
    coordination, two versions of one binary file. A log of one-file-per-change
    merges under naive sync; a database file does not.
-2. **The pattern is already in the tree.** `.calibre-oxide/journal/` is an
+2. **The pattern is already in the tree.** `.lexmechanic/journal/` is an
    append-only, BLAKE3-chained, one-file-per-entry log with sequence numbers,
    commit markers, recovery on open, and a broken chain reported as hard
    corruption. Extending that shape one layer up is consistent, and the hard
@@ -929,7 +931,7 @@ the two to the same tip.
 the retention horizon (60 days), so a peer that was away keeps its edits -- but
 it now writes no snapshot when nothing is past the horizon. A finished library
 job calls `compact_if_needed`: when more than 2,000 loose entries are lying
-around (`CALIBRE_OXIDE_CHANGE_LOG_COMPACT_AT`) it compacts, which on a young
+around (`LEXMECHANIC_CHANGE_LOG_COMPACT_AT`) it compacts, which on a young
 library is a no-op by design. What keeps a fresh 100,000-file scan from
 leaving 100,000 entries is the batching above: a few thousand entries, not
 hundreds of thousands. `a_compacted_and_reopened_log_still_rebuilds_the_library`
@@ -993,7 +995,7 @@ writing to files on read-only volumes and to cloud placeholders.
   Currently keyed by book uuid rather than content hash; content-addressing
   is a later refinement, and the uuid is already stable across machines.
 - **Anything durable in the state directory must be exported.** The library
-  export skipped `.calibre-oxide/` wholesale, which was correct only while
+  export skipped `.lexmechanic/` wholesale, which was correct only while
   nothing durable lived there. It now holds the change log, so a blanket skip
   produced a backup that could not be rebuilt. The rule is a *denylist* —
   `writer.lock` and `journal/` are excluded, everything else is included —
@@ -1011,14 +1013,14 @@ writing to files on read-only volumes and to cloud placeholders.
 | `Cache::add_format` | stop naming files after the title; take the name from the source |
 | `Cache::add_book` | record in place; copy in only from outside the library |
 | `Cache::rename_book_files` | no longer runs on a title change |
-| `covers::cover_path` | **done:** `.calibre-oxide/covers/<uuid>.jpg`, keyed by uuid rather than the local autoincrement `id` so two machines cannot mint the same cover filename. Reads fall back to a legacy `<book dir>/cover.jpg` until the next write, which retires it. |
+| `covers::cover_path` | **done:** `.lexmechanic/covers/<uuid>.jpg`, keyed by uuid rather than the local autoincrement `id` so two machines cannot mint the same cover filename. Reads fall back to a legacy `<book dir>/cover.jpg` until the next write, which retires it. |
 | `check_library` | drop the `Title (id)` folder regex, which this project never produced; make the content-mismatch check an *edit*, not corruption (E14) |
 | `checksums.rs` | add a content → book lookup |
 | every `Cache` write method | append to the change log — the same crate-wide retrofit shape as #93's "every durable write goes through `LibraryHandle`". **Partly done:** the location primitives (`set_book_path`, `record_format_row`, `forget_format_row`, `set_format_name`) now log, which closed a real bug — `apply_relocations` wrote `data.name` with raw SQL, so a moved file was re-attached in the database and never recorded, and the next rebuild undid it. Appends happen with the connection lock released. Custom columns, prefs and covers still need new `ChangeOp` variants; see #901. |
 | `filenames::file_identity` | make public |
 | `adding.rs` | `find_books_in_directory`'s stem grouping is no longer the grouping rule |
 | auto-add watcher | **done:** a watched folder *inside* the library is scanned in place; only one outside it is still drained after import. The old unconditional delete-after-import would have deleted the book's own file, and watching the library root would have deleted every book it indexed. Re-adding is prevented by the records plus the ignore list (E12), which is what made the delete trick unnecessary. New: `scan::rescan`, `POST /scan-library/{library_id}`. |
-| `duplicates.rs` | **done:** content hash (#892), then identifiers and normalised/fuzzy title+author (`calibre_db::dedupe`, with `reason`, `confidence`, `evidence` and `?min=`) |
+| `duplicates.rs` | **done:** content hash (#892), then identifiers and normalised/fuzzy title+author (`lexmechanic_db::dedupe`, with `reason`, `confidence`, `evidence` and `?min=`) |
 
 ### Rescan ordering
 

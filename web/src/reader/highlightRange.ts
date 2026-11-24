@@ -13,7 +13,7 @@
 // text node, plus a character offset within it -- a standard, simple
 // range-anchoring technique. Stored in the same opaque start_cfi/
 // end_cfi string fields real upstream's own CFI would use --
-// calibre_db::annotations never parses these fields itself, only
+// lexmechanic_db::annotations never parses these fields itself, only
 // stores/returns them verbatim (matching position.ts's identical
 // precedent for the `cfi` field), so an honestly-different format is
 // the disclosed-narrowing choice here too, not a silent mismatch.
@@ -22,7 +22,9 @@
 // identically on every load (the same HTML parsed the same way) --
 // true here since a spine file's content never changes between loads.
 
-const PREFIX = "calibre-oxide-simple-range:";
+const PREFIX = "lexmechanic-simple-range:";
+// Highlights saved before the rename carry this prefix: still read, never written.
+const LEGACY_PREFIX = "calibre-oxide-simple-range:";
 
 function pathTo(root: Node, node: Node): string | null {
   const indices: number[] = [];
@@ -65,8 +67,9 @@ export interface DecodedBoundary {
 }
 
 export function decodeBoundary(encoded: string): DecodedBoundary | null {
-  if (!encoded.startsWith(PREFIX)) return null;
-  const rest = encoded.slice(PREFIX.length);
+  const prefix = encoded.startsWith(PREFIX) ? PREFIX : encoded.startsWith(LEGACY_PREFIX) ? LEGACY_PREFIX : null;
+  if (prefix === null) return null;
+  const rest = encoded.slice(prefix.length);
   const parts = rest.split(":");
   if (parts.length !== 3) return null;
   const spineIndex = Number.parseInt(parts[0], 10);

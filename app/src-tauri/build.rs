@@ -3,7 +3,7 @@
 // # Why this is needed at all
 //
 // The window does not display a bundled frontend. It navigates to
-// `http://127.0.0.1:<port>/`, served by the `calibre_srv` the app
+// `http://127.0.0.1:<port>/`, served by the `lexmechanic_srv` the app
 // spawns — so as far as Tauri is concerned the page is *remote*
 // content, not local. `Webview::on_message` (tauri/src/webview/mod.rs)
 // rejects every command from a non-local origin unless an explicit

@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    calibre_oxide_app_lib::run()
+    lexmechanic_app_lib::run()
 }

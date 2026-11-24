@@ -98,6 +98,6 @@ mod tests {
 
     #[test]
     fn event_names_are_escaped_too() {
-        assert_eq!(serde_json::to_string("oxide:menu-action").unwrap(), "\"oxide:menu-action\"");
+        assert_eq!(serde_json::to_string("lexmechanic:menu-action").unwrap(), "\"lexmechanic:menu-action\"");
     }
 }

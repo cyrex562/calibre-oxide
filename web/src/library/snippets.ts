@@ -2,7 +2,7 @@
 // from api.ts so it's unit-testable without a network layer, matching
 // query.ts's own precedent.
 //
-// crates/calibre_srv/src/fts.rs's own default highlight_start/_end are
+// crates/lexmechanic_srv/src/fts.rs's own default highlight_start/_end are
 // the ASCII File Separator (0x1C) / Record Separator (0x1E) control
 // characters, chosen upstream specifically because real book text
 // never contains them -- safe, unambiguous split points, unlike

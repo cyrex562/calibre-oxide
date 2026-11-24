@@ -9,7 +9,7 @@
 use std::io::Write;
 use std::process::Command;
 
-use calibre_oxide_e2e::oxide_bin;
+use lexmechanic_e2e::lexmechanic_bin;
 
 /// A real, minimal, valid EPUB — enough for `EpubContainer::open_zip` to
 /// accept and for polishing to have something to act on.
@@ -40,7 +40,7 @@ fn write_minimal_epub(path: &std::path::Path) {
 #[test]
 fn every_console_tool_has_a_usable_help() {
     for tool in ["ebook-polish", "fetch-ebook-metadata", "web2disk", "calibre-smtp"] {
-        let out = Command::new(oxide_bin(tool)).arg("--help").output().unwrap_or_else(|e| panic!("could not run {tool}: {e}"));
+        let out = Command::new(lexmechanic_bin(tool)).arg("--help").output().unwrap_or_else(|e| panic!("could not run {tool}: {e}"));
         assert!(out.status.success(), "{tool} --help failed: {}", String::from_utf8_lossy(&out.stderr));
         assert!(!out.stdout.is_empty(), "{tool} --help printed nothing");
     }
@@ -54,7 +54,7 @@ fn ebook_polish_smartens_punctuation_in_a_real_epub() {
     write_minimal_epub(&book);
     let before = std::fs::read(&book).unwrap();
 
-    let out = Command::new(oxide_bin("ebook-polish")).arg(&book).arg("--smarten-punctuation").output().unwrap();
+    let out = Command::new(lexmechanic_bin("ebook-polish")).arg(&book).arg("--smarten-punctuation").output().unwrap();
     assert!(out.status.success(), "ebook-polish failed: {}", String::from_utf8_lossy(&out.stderr));
 
     let after = std::fs::read(&book).unwrap();
@@ -70,7 +70,7 @@ fn ebook_polish_dry_run_leaves_the_file_alone() {
     write_minimal_epub(&book);
     let before = std::fs::read(&book).unwrap();
 
-    let out = Command::new(oxide_bin("ebook-polish")).arg(&book).arg("--smarten-punctuation").arg("--dry-run").output().unwrap();
+    let out = Command::new(lexmechanic_bin("ebook-polish")).arg(&book).arg("--smarten-punctuation").arg("--dry-run").output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(std::fs::read(&book).unwrap(), before, "--dry-run must not rewrite the book");
 }
@@ -84,7 +84,7 @@ fn ebook_polish_can_write_to_a_separate_file() {
     write_minimal_epub(&book);
     let before = std::fs::read(&book).unwrap();
 
-    let out = Command::new(oxide_bin("ebook-polish")).arg(&book).arg("--smarten-punctuation").arg("--output").arg(&destination).output().unwrap();
+    let out = Command::new(lexmechanic_bin("ebook-polish")).arg(&book).arg("--smarten-punctuation").arg("--output").arg(&destination).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 
     assert!(destination.is_file(), "the output file should exist");
@@ -100,21 +100,21 @@ fn ebook_polish_refuses_when_no_work_was_requested() {
     let book = dir.path().join("book.epub");
     write_minimal_epub(&book);
 
-    let out = Command::new(oxide_bin("ebook-polish")).arg(&book).output().unwrap();
+    let out = Command::new(lexmechanic_bin("ebook-polish")).arg(&book).output().unwrap();
     assert!(!out.status.success(), "polishing with no options should be an error");
     assert!(String::from_utf8_lossy(&out.stderr).contains("nothing to do"), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
 #[test]
 fn fetch_ebook_metadata_refuses_an_empty_query() {
-    let out = Command::new(oxide_bin("fetch-ebook-metadata")).output().unwrap();
+    let out = Command::new(lexmechanic_bin("fetch-ebook-metadata")).output().unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("nothing to search for"), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
 #[test]
 fn web2disk_refuses_a_non_http_url() {
-    let out = Command::new(oxide_bin("web2disk")).arg("ftp://example.invalid/x").output().unwrap();
+    let out = Command::new(lexmechanic_bin("web2disk")).arg("ftp://example.invalid/x").output().unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("not an http(s) URL"), "{}", String::from_utf8_lossy(&out.stderr));
 }
@@ -123,7 +123,7 @@ fn web2disk_refuses_a_non_http_url() {
 /// otherwise the user retries against the network for no reason.
 #[test]
 fn web2disk_reports_a_bad_regex_before_touching_the_network() {
-    let out = Command::new(oxide_bin("web2disk")).arg("http://example.invalid/").arg("--match-regexp").arg("[unclosed").output().unwrap();
+    let out = Command::new(lexmechanic_bin("web2disk")).arg("http://example.invalid/").arg("--match-regexp").arg("[unclosed").output().unwrap();
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("match-regexp"), "the error should name the offending option: {stderr}");
@@ -131,13 +131,13 @@ fn web2disk_reports_a_bad_regex_before_touching_the_network() {
 
 #[test]
 fn calibre_smtp_requires_a_relay() {
-    let out = Command::new(oxide_bin("calibre-smtp")).arg("--from").arg("a@example.invalid").arg("--to").arg("b@example.invalid").arg("--text").arg("hi").output().unwrap();
+    let out = Command::new(lexmechanic_bin("calibre-smtp")).arg("--from").arg("a@example.invalid").arg("--to").arg("b@example.invalid").arg("--text").arg("hi").output().unwrap();
     assert!(!out.status.success(), "direct-to-MX delivery is not implemented, so --relay is required");
 }
 
 #[test]
 fn calibre_smtp_rejects_an_unknown_encryption_mode() {
-    let out = Command::new(oxide_bin("calibre-smtp"))
+    let out = Command::new(lexmechanic_bin("calibre-smtp"))
         .args(["--from", "a@example.invalid", "--to", "b@example.invalid", "--text", "hi", "--relay", "mail.example.invalid", "--encryption", "rot13"])
         .output()
         .unwrap();

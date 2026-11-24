@@ -16,7 +16,7 @@
         - [x] Parse `content.opf` to populate `OebBook.spine` (reading order).
         - [x] Extract `guide` (references) and `toc` (Table of Contents). (Partially done via OPF)
     - [ ] **Implement `EpubOutput` Plugin**:
-        - [ ] Create `calibre_conversion/src/plugins/epub_output.rs`.
+        - [ ] Create `lexmechanic_conversion/src/plugins/epub_output.rs`.
         - [ ] Implement `write` method to zip `OebBook` contents into a valid EPUB.
         - [ ] Generate `content.opf` from `OebBook` metadata and manifest.
         - [ ] Generate `toc.ncx` and `nav.xhtml`.

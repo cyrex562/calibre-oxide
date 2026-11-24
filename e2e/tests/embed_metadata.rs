@@ -7,17 +7,17 @@
 //! test stays green while the binary is missing or its argument parsing is
 //! wrong.
 //!
-//! The chain: CLI dispatch -> `calibre_db::embed` -> metadata assembled from
-//! the database -> `calibre_ebooks::metadata::set_metadata` -> the format
+//! The chain: CLI dispatch -> `lexmechanic_db::embed` -> metadata assembled from
+//! the database -> `lexmechanic_ebooks::metadata::set_metadata` -> the format
 //! writer -> checksum re-recorded.
 
 use std::io::Write;
 use std::process::Command;
 
-use calibre_oxide_e2e::{oxide_bin, TestLibrary};
+use lexmechanic_e2e::{lexmechanic_bin, TestLibrary};
 
 fn run(library: &std::path::Path, args: &[&str]) -> std::process::Output {
-    Command::new(oxide_bin("calibredb"))
+    Command::new(lexmechanic_bin("calibredb"))
         .args(args)
         .arg("--with-library")
         .arg(library)
@@ -182,13 +182,13 @@ fn an_edit_outside_the_app_is_reported_as_corrupted() {
 
 /// The route the UI calls, through the really-spawned server (#958).
 ///
-/// The in-process route tests in `calibre_srv` cover its logic; this is
+/// The in-process route tests in `lexmechanic_srv` cover its logic; this is
 /// the layer that would catch the route not being registered at all, or
 /// registered at a path the client does not use.
 #[test]
 fn the_real_server_embeds_metadata_over_http() {
     use std::time::Duration;
-    use calibre_oxide_e2e::{find_free_port, spawn_calibre_srv, wait_until_ready};
+    use lexmechanic_e2e::{find_free_port, spawn_lexmechanic_srv, wait_until_ready};
 
     let Some(static_dir) = web_dist() else {
         eprintln!("skipping: web/dist not built -- run `npm run build` in web/ first");
@@ -202,8 +202,8 @@ fn the_real_server_embeds_metadata_over_http() {
     assert!(run(lib.path(), &["set_metadata", "1", "title", "Corrected Over HTTP"]).status.success());
 
     let port = find_free_port();
-    let _srv = spawn_calibre_srv(lib.path(), &static_dir, port);
-    assert!(wait_until_ready(port, Duration::from_secs(10)), "calibre_srv never became ready on port {port}");
+    let _srv = spawn_lexmechanic_srv(lib.path(), &static_dir, port);
+    assert!(wait_until_ready(port, Duration::from_secs(10)), "lexmechanic_srv never became ready on port {port}");
 
     // Exactly what web/src/library/api.ts::embedMetadata() sends.
     let client = reqwest::blocking::Client::new();

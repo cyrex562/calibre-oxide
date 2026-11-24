@@ -1,7 +1,7 @@
 // Merge books: choosing a destination, and saying what a merge will do.
 //
 // Pure functions only, so the rules can be tested without a component.
-// The server decides what is actually done (crates/calibre_db/src/merge.rs);
+// The server decides what is actually done (crates/lexmechanic_db/src/merge.rs);
 // this module (a) pre-selects the record a person is most likely to want
 // to keep and (b) turns a dry-run response into a confirmation they can
 // read before anything is changed.
@@ -10,7 +10,7 @@ import type { DuplicateBook, MergeMode, MergeResponse } from "./api";
 
 /**
  * The record to merge the others into. Mirrors
- * `calibre_db::merge::best_destination`: most formats, then most filled-in
+ * `lexmechanic_db::merge::best_destination`: most formats, then most filled-in
  * metadata, then has a cover, then the oldest (lowest id). A person can
  * always pick another; this is only the default.
  */

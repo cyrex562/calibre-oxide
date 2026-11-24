@@ -4,10 +4,10 @@
 // system takes its lookups as arguments for the same reason.
 //
 // Everything lands flat in the resource directory, next to the server:
-// `calibre_srv` looks for `calibre_pdf_worker` (the out-of-process PDF
-// worker, `calibre_db::pdf_worker::locate_worker`) and for `pdfium.dll`
+// `lexmechanic_srv` looks for `lexmechanic_pdf_worker` (the out-of-process PDF
+// worker, `lexmechanic_db::pdf_worker::locate_worker`) and for `pdfium.dll`
 // (`rasterize::candidate_library_paths`) in its OWN directory. The app
-// runs `calibre_srv` straight out of the resource directory
+// runs `lexmechanic_srv` straight out of the resource directory
 // (`server.rs::resolve_calibre_srv_binary`), so putting the worker,
 // PDFium and any DLL the exes import beside it is what makes them found.
 // Without the worker the server silently falls back to slow in-process
@@ -18,8 +18,8 @@ import { readPeImports } from "./pe-imports.mjs";
 export function platformNames(platform) {
   const win = platform === "win32";
   return {
-    serverExe: win ? "calibre_srv.exe" : "calibre_srv",
-    workerExe: win ? "calibre_pdf_worker.exe" : "calibre_pdf_worker",
+    serverExe: win ? "lexmechanic_srv.exe" : "lexmechanic_srv",
+    workerExe: win ? "lexmechanic_pdf_worker.exe" : "lexmechanic_pdf_worker",
     pdfiumLib: win ? "pdfium.dll" : platform === "darwin" ? "libpdfium.dylib" : "libpdfium.so",
   };
 }
@@ -29,13 +29,13 @@ const join = (...parts) => parts.map(slash).join("/").replace(/\/+/g, "/");
 
 /**
  * Where PDFium may be, in the order it is looked for, and the first that
- * holds the library. `$CALIBRE_OXIDE_PDFIUM` first because it is what the
+ * holds the library. `$LEXMECHANIC_PDFIUM` first because it is what the
  * rest of the workspace reads (`rasterize::LIBRARY_PATH_VAR`) and so what
  * a developer has already set; it may name the directory or the file.
  *
  * @param {object} o
  * @param {string} o.platform
- * @param {string | undefined} o.envDir  value of CALIBRE_OXIDE_PDFIUM
+ * @param {string | undefined} o.envDir  value of LEXMECHANIC_PDFIUM
  * @param {string[]} o.targetDirs        cargo target dirs, most specific first
  * @param {(p: string) => boolean} o.exists
  * @returns {{path: string | null, tried: string[]}}

@@ -1,5 +1,5 @@
-// Real fetch wrappers against calibre_srv's already-real endpoints
-// (calibre_srv::render_endpoints / calibre_srv::books). Port of
+// Real fetch wrappers against lexmechanic_srv's already-real endpoints
+// (lexmechanic_srv::render_endpoints / lexmechanic_srv::books). Port of
 // old_src/src/pyj/ajax.pyj's role for this slice, narrowed to only
 // what the reader MVP needs (no generic XHR-progress/upload support).
 
@@ -73,7 +73,7 @@ export async function getAnnotations(bookId: string, fmt: string): Promise<{ boo
 }
 
 export async function addBookmark(bookId: string, fmt: string, title: string, pos: string): Promise<Bookmark> {
-  const bookmark: Bookmark = { type: "bookmark", title, timestamp: new Date().toISOString(), pos, pos_type: "calibre-oxide-simple-pos" };
+  const bookmark: Bookmark = { type: "bookmark", title, timestamp: new Date().toISOString(), pos, pos_type: "lexmechanic-simple-pos" };
   const resp = await fetch(`/book-update-annotations/${LIBRARY_ID}/${bookId}/${fmt}`, {
     method: "POST",
     headers: { "content-type": "application/json" },

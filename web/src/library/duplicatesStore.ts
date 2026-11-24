@@ -2,7 +2,7 @@
 // user's keeper choices, and the "dismissed" list.
 //
 // The server keeps the last scan in memory and serves it in pages (see
-// crates/calibre_srv/src/duplicates_review.rs); this store holds one page at a
+// crates/lexmechanic_srv/src/duplicates_review.rs); this store holds one page at a
 // time. Acting on a group (dismiss, merge, delete, resolve) removes it here at
 // once and on the server, then re-reads the *same* page offset, so the person
 // keeps their place instead of rescanning a 10,000-book library.

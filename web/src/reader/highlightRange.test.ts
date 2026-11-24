@@ -25,7 +25,7 @@ describe("encodeBoundary / decodeBoundary", () => {
 
   it("returns null for a malformed string", () => {
     expect(decodeBoundary("not-a-real-encoding")).toBeNull();
-    expect(decodeBoundary("calibre-oxide-simple-range:abc:0.0:1")).toBeNull();
+    expect(decodeBoundary("lexmechanic-simple-range:abc:0.0:1")).toBeNull();
   });
 });
 
@@ -49,8 +49,14 @@ describe("rangeFromEncoded", () => {
 
   it("returns null when the path no longer resolves against this document", () => {
     const doc = buildDoc("<p>Hello world</p>");
-    const start = "calibre-oxide-simple-range:0:0.0:0";
-    const end = "calibre-oxide-simple-range:0:9.9:1"; // no such path in this doc
+    const start = "lexmechanic-simple-range:0:0.0:0";
+    const end = "lexmechanic-simple-range:0:9.9:1"; // no such path in this doc
     expect(rangeFromEncoded(doc, 0, start, end)).toBeNull();
+  });
+});
+
+describe("highlights saved before the rename", () => {
+  it("still decode", () => {
+    expect(decodeBoundary("calibre-oxide-simple-range:3:0.0:2")).toEqual({ spineIndex: 3, path: "0.0", offset: 2 });
   });
 });

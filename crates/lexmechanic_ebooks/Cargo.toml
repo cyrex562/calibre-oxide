@@ -1,0 +1,76 @@
+[package]
+name = "lexmechanic_ebooks"
+version = "0.1.0"
+edition = "2021"
+
+license.workspace = true
+[dependencies]
+# Bakes the vendored spell dictionaries into the binary (#865),
+# the same convention lexmechanic_srv uses for MathJax.
+include_dir = "0.7"
+lexmechanic_utils = { path = "../lexmechanic_utils" }
+lexmechanic_customize = { path = "../lexmechanic_customize" }
+uuid = { version = "1.0", features = ["v4"] }
+roxmltree = "0.18"
+zip = "0.6"
+thiserror = "1.0"
+anyhow = "1.0"
+log = "0.4"
+regex = "1.10"
+fancy-regex = "0.19"
+lazy_static = "1.4"
+indexmap = "2"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+byteorder = "1.5.0"
+flate2 = "1.0"
+base64 = "0.21"
+lopdf = "0.38.0"
+# Rasterizing PDF pages (covers, page export). Bound dynamically at
+# runtime -- deliberately NOT a build-time dependency on a native
+# library; see `src/pdf/rasterize.rs` for why. `default-features`
+# off drops its optional `image` 0.25 bridge, which would pull a
+# second copy of `image` in beside this crate's own 0.24.
+pdfium-render = { version = "0.9", default-features = false, features = ["pdfium_latest", "thread_safe"] }
+bzip2 = "0.4"
+clap = { version = "4.4", features = ["derive"] }
+url = "2.5"
+ignore = "0.4.25"
+encoding_rs = "0.8"
+tempfile = "3.24.0"
+walkdir = "2.4"
+urlencoding = "2.1.3"
+pulldown-cmark = "0.13.0"
+pathdiff = "0.2"
+mime_guess = "2.0"
+html-escape = "0.2"
+chardetng = "1.0"
+hyphenation = { version = "0.8", features = ["embed_en-us"] }
+libchm = "0.2.0"
+html5ever = "0.26"
+markup5ever_rcdom = "0.2"
+rand = "0.9"
+unicode-normalization = "0.1"
+reqwest = { version = "0.11", features = ["blocking", "cookies", "gzip"] }
+cssparser = "0.37.0"
+unicode-segmentation = "1.11"
+image = { version = "0.24", default-features = false, features = ["png", "jpeg", "gif"] }
+jpeg-decoder = "0.3"
+sha2 = "0.10"
+resvg = "0.48"
+usvg = "0.48"
+tiny-skia = "0.12"
+fontdb = "0.24"
+ttf-parser = "0.25"
+svgtypes = "0.16"
+espeak-ng = { version = "0.2", default-features = false, features = ["bundled-data-en"] }
+feed-rs = "2"
+ort = "=2.0.0-rc.12"
+spellbook = "0.4"
+oxideav-aac = "0.1.7"
+oxideav-mp4 = "0.0.10"
+oxideav-core = "0.1.36"
+hound = "3.5.1"
+
+[dev-dependencies]

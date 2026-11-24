@@ -1,9 +1,9 @@
 // What the Find duplicates panel says about a group: how strong the evidence
 // is, how to filter by it, and what it is called.
 //
-// The server (crates/calibre_srv/src/duplicates.rs) reports every group it
+// The server (crates/lexmechanic_srv/src/duplicates.rs) reports every group it
 // finds with a `reason`, a `confidence` and the `evidence` that joined it;
-// the rules for what counts as evidence are in crates/calibre_db/src/dedupe.rs.
+// the rules for what counts as evidence are in crates/lexmechanic_db/src/dedupe.rs.
 // Everything the panel needs to *decide* lives here, away from the template,
 // so it can be tested.
 

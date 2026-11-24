@@ -195,7 +195,7 @@ describe("AutocompleteInput", () => {
   });
 
   it("follows the minChars setting", async () => {
-    localStorage.setItem("calibre-oxide.suggestMinChars", "4");
+    localStorage.setItem("lexmechanic.suggestMinChars", "4");
     const input = mount();
     await type(input, "joh");
     expect(listOpen()).toBe(false);

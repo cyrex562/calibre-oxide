@@ -4,7 +4,7 @@
 // Per-book annotations were always reachable, but nothing could
 // answer "what have I highlighted across this whole library" -- which
 // is the question that makes keeping highlights worthwhile. The
-// engine behind it (`calibre_db::annotations::all_annotations`) had
+// engine behind it (`lexmechanic_db::annotations::all_annotations`) had
 // to be ported for this; despite what that module's doc implied, it
 // did not exist.
 

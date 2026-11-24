@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use calibre_db::library_handle::{classify_storage_tier, StorageTier};
+use lexmechanic_db::library_handle::{classify_storage_tier, StorageTier};
 
 /// Asked when the picked folder has no `metadata.db`.
 pub const NEW_LIBRARY_PROMPT: &str = "This folder has no library yet. Create a new library here? Your files stay where they are; you can then scan the folder to add them.";

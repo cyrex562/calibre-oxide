@@ -1,6 +1,6 @@
-//! Spawns and manages the real `calibre_srv` process this app's
+//! Spawns and manages the real `lexmechanic_srv` process this app's
 //! window is a native shell around, and locates the two things it
-//! needs to find on disk: the compiled `calibre_srv` binary and the
+//! needs to find on disk: the compiled `lexmechanic_srv` binary and the
 //! built `web/dist` frontend it serves.
 //!
 //! # Disclosed narrowing
@@ -8,7 +8,7 @@
 //! Real Tauri "sidecar" bundling (`bundle.externalBin` +
 //! `tauri-plugin-shell`, with the platform-specific target-triple
 //! binary naming that mechanism requires) isn't set up here -- this
-//! spawns `calibre_srv` via a plain [`std::process::Command`], looked
+//! spawns `lexmechanic_srv` via a plain [`std::process::Command`], looked
 //! up either as a bundled resource (a packaged app) or a
 //! `CARGO_MANIFEST_DIR`-relative dev build (`cargo tauri dev`/a local
 //! debug build). Real, sufficient for this app to actually run today;
@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 
 /// Binds to an OS-assigned free port, then releases it immediately so
-/// `calibre_srv` (a separate process) can bind it instead. Real, if
+/// `lexmechanic_srv` (a separate process) can bind it instead. Real, if
 /// technically racy against another process grabbing the same port in
 /// between -- an acceptable, standard "find a free port" technique for
 /// a local desktop app talking only to its own spawned backend.
@@ -38,12 +38,12 @@ fn dev_workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// Locates the compiled `calibre_srv` binary: a bundled resource
-/// (`resources/calibre_srv`, a real packaged app) if present, else the
-/// dev workspace's own `target/debug/calibre_srv` (or `release/`, for
+/// Locates the compiled `lexmechanic_srv` binary: a bundled resource
+/// (`resources/lexmechanic_srv`, a real packaged app) if present, else the
+/// dev workspace's own `target/debug/lexmechanic_srv` (or `release/`, for
 /// a local release build run outside `tauri dev`).
 pub fn resolve_calibre_srv_binary(app: &AppHandle) -> io::Result<PathBuf> {
-    let exe_name = if cfg!(windows) { "calibre_srv.exe" } else { "calibre_srv" };
+    let exe_name = if cfg!(windows) { "lexmechanic_srv.exe" } else { "lexmechanic_srv" };
 
     if let Ok(resource_dir) = app.path().resource_dir() {
         let candidate = resource_dir.join(exe_name);
@@ -59,7 +59,7 @@ pub fn resolve_calibre_srv_binary(app: &AppHandle) -> io::Result<PathBuf> {
             return Ok(candidate);
         }
     }
-    Err(io::Error::new(io::ErrorKind::NotFound, "calibre_srv binary not found -- run `cargo build --workspace` first"))
+    Err(io::Error::new(io::ErrorKind::NotFound, "lexmechanic_srv binary not found -- run `cargo build --workspace` first"))
 }
 
 /// Locates the built `web/dist` frontend the same way: bundled
@@ -119,8 +119,8 @@ pub fn resolve_pdfium(app: &AppHandle) -> Option<PathBuf> {
     None
 }
 
-/// Spawns `calibre_srv <library_path> --static-dir <static_dir> --port
-/// <port>` -- real auth stays off (`calibre_srv`'s own default with no
+/// Spawns `lexmechanic_srv <library_path> --static-dir <static_dir> --port
+/// <port>` -- real auth stays off (`lexmechanic_srv`'s own default with no
 /// `--add-user` ever called): a locally-spawned server that only this
 /// app's own window ever talks to has nothing to authenticate against.
 /// `also_serve` are the user's other known libraries, passed as
@@ -147,12 +147,12 @@ pub fn spawn(bin: &Path, library_path: &Path, static_dir: &Path, port: u16, pdfi
         }
     }
     if let Some(pdfium) = pdfium {
-        // Read by `calibre_ebooks::pdf::rasterize`. An environment
+        // Read by `lexmechanic_ebooks::pdf::rasterize`. An environment
         // variable rather than a flag because every binary in the
         // workspace that can render a PDF reads the same one --
         // `calibredb` included -- and only one of them has a CLI this
         // app constructs.
-        cmd.env(calibre_ebooks::pdf::rasterize::LIBRARY_PATH_VAR, pdfium);
+        cmd.env(lexmechanic_ebooks::pdf::rasterize::LIBRARY_PATH_VAR, pdfium);
     }
     // With no console (see below) stdout/stderr go nowhere, and a server
     // that fails to start would die silently. Both streams go to the same
@@ -167,7 +167,7 @@ pub fn spawn(bin: &Path, library_path: &Path, static_dir: &Path, port: u16, pdfi
 
 /// Keeps Windows from opening a console window for the server.
 ///
-/// `calibre_srv` is a console-subsystem binary, so launching it from a
+/// `lexmechanic_srv` is a console-subsystem binary, so launching it from a
 /// GUI app hands it a fresh console -- a second window that sits behind
 /// the app announcing "content server listening on ...". The app itself
 /// never had this problem (`main.rs` sets `windows_subsystem`); the
@@ -188,9 +188,9 @@ fn no_console_window(cmd: &mut Command) {
 fn no_console_window(_cmd: &mut Command) {}
 
 /// How long to wait for the server to accept connections: 60 s, or
-/// `CALIBRE_OXIDE_READY_TIMEOUT_SECS`.
+/// `LEXMECHANIC_READY_TIMEOUT_SECS`.
 pub fn ready_timeout() -> Duration {
-    parse_ready_timeout(std::env::var("CALIBRE_OXIDE_READY_TIMEOUT_SECS").ok().as_deref())
+    parse_ready_timeout(lexmechanic_utils::env::var("LEXMECHANIC_READY_TIMEOUT_SECS").ok().as_deref())
 }
 
 fn parse_ready_timeout(raw: Option<&str>) -> Duration {
@@ -222,7 +222,7 @@ pub enum Readiness {
 /// Polls a real TCP connect to `127.0.0.1:<port>` until it succeeds,
 /// `exited` reports the process is gone, or `timeout` elapses. A
 /// successful connect is a real readiness signal here (not just "the
-/// process exists"): `calibre_srv`'s own startup only binds the listener
+/// process exists"): `lexmechanic_srv`'s own startup only binds the listener
 /// once its router/state setup has already completed, so nothing accepts
 /// a connection before it's actually ready to serve requests.
 ///

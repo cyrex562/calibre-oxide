@@ -336,8 +336,8 @@ pub fn c() {}
         let repo = tmp.path();
         std::fs::create_dir_all(repo.join("docs")).unwrap();
         let entries = vec![Placeholder {
-            crate_name: "calibre_db".to_string(),
-            path: "crates/calibre_db/src/foo.rs".to_string(),
+            crate_name: "lexmechanic_db".to_string(),
+            path: "crates/lexmechanic_db/src/foo.rs".to_string(),
             line: 42,
             kind: PlaceholderKind::TodoMacro,
             reason: "needs schema info".to_string(),

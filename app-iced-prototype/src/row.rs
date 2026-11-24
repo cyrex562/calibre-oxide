@@ -1,4 +1,4 @@
-use calibre_db::Book;
+use lexmechanic_db::Book;
 use iced::widget::image; // Import module/function to avoid ambiguity in list
 use iced::widget::{button, column, row, text};
 use iced::{Element, Length};

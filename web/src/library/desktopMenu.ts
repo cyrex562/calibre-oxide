@@ -26,7 +26,7 @@ import { isTauri, tauriInvoke } from "../tauri";
 import { buildMenuSpec, type ActionContext, type LibraryActionId, type MenuActionSpec } from "./actions";
 
 /** The `CustomEvent` name the Rust side dispatches on menu activation. */
-export const MENU_ACTION_EVENT = "oxide:menu-action";
+export const MENU_ACTION_EVENT = "lexmechanic:menu-action";
 
 /**
  * Pushes the current menu spec to the desktop app.

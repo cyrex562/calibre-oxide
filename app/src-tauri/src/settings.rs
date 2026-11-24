@@ -6,15 +6,15 @@
 //! # Real architecture decision (issue #725)
 //!
 //! This app is, and remains, single-library-per-running-instance: one
-//! spawned `calibre_srv` process serves exactly one library at a time
+//! spawned `lexmechanic_srv` process serves exactly one library at a time
 //! (see `open_library` in `lib.rs`). There is no concurrent
-//! multi-library serving here, and none is planned -- `calibre_srv`'s
+//! multi-library serving here, and none is planned -- `lexmechanic_srv`'s
 //! own `LibraryBroker`/`AppState.libraries` broker mode exists in the
-//! crate (used by a handful of `calibre_srv` routes, e.g.
+//! crate (used by a handful of `lexmechanic_srv` routes, e.g.
 //! `cdb::copy_to_library`) but has no CLI flag wiring it up in the
-//! real shipped `calibre_srv` binary today, and this app doesn't add
+//! real shipped `lexmechanic_srv` binary today, and this app doesn't add
 //! one. "Switching libraries" here means: kill the current
-//! `calibre_srv` child, spawn a fresh one against a different library
+//! `lexmechanic_srv` child, spawn a fresh one against a different library
 //! path, and re-navigate the window -- exactly what `open_library`
 //! already does for the very first library choice, just re-triggered
 //! for a previously-used path instead of a freshly-picked one. This

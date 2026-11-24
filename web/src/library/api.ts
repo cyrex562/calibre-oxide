@@ -1,5 +1,5 @@
-// Real fetch wrappers against calibre_srv's `/ajax/*` REST API (see
-// crates/calibre_srv/src/ajax.rs). Port of old_src/src/pyj/ajax.pyj's
+// Real fetch wrappers against lexmechanic_srv's `/ajax/*` REST API (see
+// crates/lexmechanic_srv/src/ajax.rs). Port of old_src/src/pyj/ajax.pyj's
 // role for this slice, narrowed to only what the library-browser MVP
 // needs.
 
@@ -91,8 +91,8 @@ export function fetchVirtualLibraries(): Promise<VirtualLibraries> {
   return jsonFetch<VirtualLibraries>("/ajax/virtual-libraries");
 }
 
-// Real write endpoints -- see crates/calibre_srv/src/cdb.rs. This app
-// only ever runs against a single-library calibre_srv (spawned by the
+// Real write endpoints -- see crates/lexmechanic_srv/src/cdb.rs. This app
+// only ever runs against a single-library lexmechanic_srv (spawned by the
 // desktop app for one chosen library, see app/src-tauri/src/server.rs),
 // so the routes below use the no-library_id-segment variants where
 // available; `add_book` has no such variant, so a placeholder segment
@@ -272,14 +272,14 @@ export function removeFormat(bookId: number, ext: string): Promise<BookSummary> 
   return setFields(bookId, { removed_formats: [ext] });
 }
 
-// Real conversion endpoints -- see crates/calibre_srv/src/convert.rs.
+// Real conversion endpoints -- see crates/lexmechanic_srv/src/convert.rs.
 
 export function fetchConversionBookData(bookId: number): Promise<ConversionBookData> {
   return jsonFetch<ConversionBookData>(`/conversion/book-data/${bookId}`);
 }
 
 // Real, fixed subset of the ~40 real upstream ConversionOptions fields
-// -- see crates/calibre_srv/src/convert.rs's own doc for why this is a
+// -- see crates/lexmechanic_srv/src/convert.rs's own doc for why this is a
 // deliberate slice, not the full set. Omitted fields keep the real
 // upstream default server-side.
 export type ConversionOptionsOverride = {
@@ -305,7 +305,7 @@ export function getConversionStatus(jobId: number): Promise<ConversionStatus> {
   return jsonFetch<ConversionStatus>(`/conversion/status/${jobId}`);
 }
 
-// Real full-text-search endpoints -- see crates/calibre_srv/src/fts.rs.
+// Real full-text-search endpoints -- see crates/lexmechanic_srv/src/fts.rs.
 
 export type FtsSearchOutcome = { enabled: true; result: FtsSearchResult } | { enabled: false };
 
@@ -316,7 +316,7 @@ export type FtsSearchOutcome = { enabled: true; result: FtsSearchResult } | { en
 // (428, not 412 -- ServerError::PreconditionRequired maps to axum's
 // StatusCode::PRECONDITION_REQUIRED, RFC 6585's 428; 412 is a
 // different status, PRECONDITION_FAILED, not used here. Confirmed
-// against a real running calibre_srv, not just the type name.)
+// against a real running lexmechanic_srv, not just the type name.)
 export async function ftsSearch(query: string): Promise<FtsSearchOutcome> {
   const resp = await fetch(`/fts/search?${new URLSearchParams({ query })}`);
   if (resp.status === 428) return { enabled: false };
@@ -333,7 +333,7 @@ export async function ftsSnippets(bookIds: number[], query: string): Promise<Rec
 
 // Virtual library / saved search management -- real, new routes (no
 // upstream calibre.srv route exists for either; both are GUI-only
-// preferences editing there). See crates/calibre_srv/src/lists.rs's
+// preferences editing there). See crates/lexmechanic_srv/src/lists.rs's
 // own doc for why this is a real addition, not a port.
 
 export function fetchSavedSearches(): Promise<Record<string, string>> {
@@ -375,7 +375,7 @@ export function renameSavedSearch(oldName: string, newName: string): Promise<voi
   return postNoBody(`/saved-search/rename/${encodeURIComponent(oldName)}/${encodeURIComponent(newName)}`);
 }
 
-// Real, new route -- see crates/calibre_srv/src/catalog.rs's own doc
+// Real, new route -- see crates/lexmechanic_srv/src/catalog.rs's own doc
 // for why (catalog generation is CLI/GUI-only in real upstream
 // calibre, never exposed over HTTP there). A plain GET URL rather
 // than a fetch+blob dance: the response's own real Content-Disposition:
@@ -385,14 +385,14 @@ export function catalogDownloadUrl(search: string): string {
   return `/catalog/generate${qs}`;
 }
 
-// Real, new route -- see crates/calibre_srv/src/library_export.rs's
+// Real, new route -- see crates/lexmechanic_srv/src/library_export.rs's
 // own doc (real upstream's whole-library export is a Qt GUI action,
 // never exposed over HTTP there).
 export function libraryExportUrl(): string {
   return "/library/export/default";
 }
 
-// Real, new route -- see crates/calibre_srv/src/news.rs's own doc for
+// Real, new route -- see crates/lexmechanic_srv/src/news.rs's own doc for
 // why (fetching news/recipes is CLI/GUI-only in real upstream calibre,
 // never exposed over HTTP there). A real, generic RSS/Atom feed
 // reader, not a catalog of upstream's ~1077 hand-written per-site
@@ -406,7 +406,7 @@ export interface NewsFetchStatus {
 
 // A feed entry can be a bare URL string, or a real {title, url} object
 // naming its own section within the recipe -- see
-// crates/calibre_srv/src/news.rs's own FeedInput (issue #765).
+// crates/lexmechanic_srv/src/news.rs's own FeedInput (issue #765).
 export type NewsFeedInput = string | { title: string; url: string };
 
 export interface CustomRecipeOptions {
@@ -433,7 +433,7 @@ export function getNewsFetchStatus(jobId: number): Promise<NewsFetchStatus> {
   return jsonFetch<NewsFetchStatus>(`/news/status/${jobId}`);
 }
 
-// Real, new route -- see crates/calibre_srv/src/share.rs's own doc for
+// Real, new route -- see crates/lexmechanic_srv/src/share.rs's own doc for
 // why (real upstream's own "send to email" feature is desktop-GUI-only,
 // never exposed over HTTP there). No persisted SMTP account server-side
 // yet (ties into the not-yet-built preferences epic) -- the relay
@@ -456,7 +456,7 @@ export async function shareEmail(bookId: number, format: string, from: string, t
   });
 }
 
-// Real, new routes -- see crates/calibre_srv/src/custom_columns.rs's
+// Real, new routes -- see crates/lexmechanic_srv/src/custom_columns.rs's
 // own doc for why (custom-column management is CLI-layer-only in real
 // upstream calibre, and its own remote-command `implementation()` is
 // unimplemented there too, never exposed over HTTP either way).
@@ -490,7 +490,7 @@ export async function setFtsEnabled(enabled: boolean): Promise<void> {
   if (!resp.ok) throw new Error(`POST /fts/indexing failed: ${resp.status} ${resp.statusText}`);
 }
 
-// Real, new routes -- see crates/calibre_srv/src/data_files.rs's own
+// Real, new routes -- see crates/lexmechanic_srv/src/data_files.rs's own
 // doc for why (extra files attached to a book outside its standard
 // formats, issue #418, with a real "list what's already attached"
 // route added for issue #757 -- upload/remove already returned this
@@ -530,7 +530,7 @@ export async function removeDataFile(bookId: number, relpath: string): Promise<R
   return r.data_files;
 }
 
-// Real, new route -- see crates/calibre_srv/src/template_tester.rs's
+// Real, new route -- see crates/lexmechanic_srv/src/template_tester.rs's
 // own doc for why (real upstream's Template Tester dialog is Qt
 // GUI-only, never exposed over HTTP there) and for the real,
 // disclosed narrowing: only Template Program Mode syntax
@@ -550,7 +550,7 @@ export function evaluateTemplate(bookId: number, template: string): Promise<Temp
   });
 }
 
-// Real, new route -- see crates/calibre_srv/src/opml.rs's own doc for
+// Real, new route -- see crates/lexmechanic_srv/src/opml.rs's own doc for
 // why (no OPML support exists anywhere in this port otherwise). Pairs
 // with startNewsFetch above: parses a real OPML export into a flat
 // feed list the news-fetch panel can offer to add.
@@ -568,9 +568,9 @@ export async function importOpml(opml: string): Promise<OpmlFeed[]> {
   return r.feeds;
 }
 
-// Real, new route -- see crates/calibre_srv/src/rename.rs's own doc
+// Real, new route -- see crates/lexmechanic_srv/src/rename.rs's own doc
 // for why (real rename/merge logic already existed but only on a
-// LibraryDatabase-compatibility type calibre_srv could never reach
+// LibraryDatabase-compatibility type lexmechanic_srv could never reach
 // without opening a second connection to the same library). Renaming
 // to an existing item of the same category is a real merge, not an
 // error -- the server handles that, this is a plain rename call
@@ -584,7 +584,7 @@ export async function renameCategoryItem(category: string, itemName: string, new
   if (!resp.ok) throw new Error((await resp.text()) || `${resp.status} ${resp.statusText}`);
 }
 
-// Real, new route -- see crates/calibre_srv/src/check_library.rs's
+// Real, new route -- see crates/lexmechanic_srv/src/check_library.rs's
 // own doc for why (real upstream's "Check Library" dialog is Qt
 // GUI-only, never exposed over HTTP there).
 export interface CheckLibraryFinding {
@@ -605,7 +605,7 @@ export interface CheckLibraryFinding {
 export type CheckLibraryResult = Record<string, CheckLibraryFinding[] | boolean>;
 
 // Human-readable labels for each real result key, matching
-// calibre_db::cli::cmd_check_library's own upstream-derived labels.
+// lexmechanic_db::cli::cmd_check_library's own upstream-derived labels.
 /**
  * What the library check reports, in the order it is worth reading (#897).
  *
@@ -692,7 +692,7 @@ export interface LibraryJobProgress {
 export interface LibraryJob<R = unknown> {
   id: number;
   kind: "scan" | "enrich" | "hash_backfill" | "pdf_fingerprint" | "merge_exact" | "import" | "dedupe" | "resolve" | "prepare" | "absorb" | "unabsorb" | "copy" | "organize" | "undo_organize" | "retitle" | "undo_retitle" | "mirror";
-  /** `interrupted`: the server process ended while it ran (read back from `.calibre-oxide/jobs.json`). */
+  /** `interrupted`: the server process ended while it ran (read back from `.lexmechanic/jobs.json`). */
   state: "running" | "finished" | "cancelled" | "failed" | "interrupted";
   /** Interrupted and able to continue by itself: POST `/<resume_route>/default`. */
   resumable?: boolean;
@@ -1054,7 +1054,7 @@ export function unignoreFile(path: string): Promise<void> {
   });
 }
 
-// Real, new route -- see crates/calibre_srv/src/save_to_disk.rs's own
+// Real, new route -- see crates/lexmechanic_srv/src/save_to_disk.rs's own
 // doc (real upstream's "Save to disk" is a Qt GUI action, never
 // exposed over HTTP there).
 export interface SaveToDiskResult {
@@ -1072,7 +1072,7 @@ export function saveToDisk(bookIds: number[], template: string, dest: string, fo
   });
 }
 
-// Real, new route -- see crates/calibre_srv/src/duplicates.rs's own
+// Real, new route -- see crates/lexmechanic_srv/src/duplicates.rs's own
 // doc (real upstream's "Find duplicates" is a Qt GUI action, never
 // exposed over HTTP there).
 export interface DuplicateBook {
@@ -1116,7 +1116,7 @@ export interface DuplicateFile {
  * strong identifier. `title_author_exact`: equal after normalisation (case,
  * diacritics, articles, `(z-lib.org)` noise, "Last, First", initials).
  * `title_author_fuzzy`: probably the same book, but a person has to say so.
- * See crates/calibre_db/src/dedupe.rs.
+ * See crates/lexmechanic_db/src/dedupe.rs.
  */
 export type DuplicateReason =
   | "content"
@@ -1183,7 +1183,7 @@ export function scanForDuplicates(min?: "content" | "identifier" | "exact" | "pd
   return jsonFetch<{ groups: DuplicateGroup[]; pdf?: PdfScanStatus; pdf_unfingerprinted?: number; empty_files?: EmptyFile[] }>(`/duplicates/scan/default${query}`, { method: "POST" });
 }
 
-// ---- Reviewing and resolving duplicates at scale (crates/calibre_srv/src/duplicates_review.rs) ----
+// ---- Reviewing and resolving duplicates at scale (crates/lexmechanic_srv/src/duplicates_review.rs) ----
 
 export type DuplicateSort = "confidence" | "size" | "reason" | "reclaimable";
 
@@ -1389,7 +1389,7 @@ export function restoreResolveRun(runId: string): Promise<{ run_id: string; rest
   return jsonFetch(`/duplicates/runs/default/${encodeURIComponent(runId)}/restore`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
 }
 
-// ---- Comparing duplicates, the user's groups, moving books (crates/calibre_srv/src/duplicates_compare.rs) ----
+// ---- Comparing duplicates, the user's groups, moving books (crates/lexmechanic_srv/src/duplicates_compare.rs) ----
 
 export interface ComparePageMatch {
   /** 0-based sample pages of the first and second book. */
@@ -1711,7 +1711,7 @@ export function fingerprintPdfs(handlers: LibraryJobHandlers<PdfFingerprintResul
   return runLibraryJob<PdfFingerprintResult>("/pdf-fingerprint/default", handlers);
 }
 
-// ---- Merge books (crates/calibre_srv/src/merge_books.rs) ----
+// ---- Merge books (crates/lexmechanic_srv/src/merge_books.rs) ----
 
 export type MergeMode = "merge_and_delete" | "merge_keep_sources" | "formats_only";
 
@@ -1805,7 +1805,7 @@ export function runBulkMerge(planFingerprint: string, keepDuplicateFormats: bool
   return runLibraryJob<BulkMergeReport>("/duplicates/merge-exact/default", handlers, { dry_run: false, plan_fingerprint: planFingerprint, keep_duplicate_formats: keepDuplicateFormats });
 }
 
-// Real, new routes -- see crates/calibre_srv/src/news_scheduler.rs's
+// Real, new routes -- see crates/lexmechanic_srv/src/news_scheduler.rs's
 // own doc (real upstream schedules recurring recipe fetches inside
 // its own GUI job scheduler, never exposed over HTTP there).
 export interface NewsSchedule {
@@ -1838,7 +1838,7 @@ export function runNewsScheduleNow(id: number): Promise<{ ok: boolean; book_id?:
   return jsonFetch<{ ok: boolean; book_id?: number; error?: string }>(`/news/schedules/run-now/${id}`, { method: "POST" });
 }
 
-// Real, new routes -- see crates/calibre_srv/src/metadata_search.rs's
+// Real, new routes -- see crates/lexmechanic_srv/src/metadata_search.rs's
 // own doc. Part of the #750 epic: fetch a book's metadata/cover from
 // real online sources (Google Books, Open Library) for the user to
 // review and merge in, per-field, into the book's own record.
@@ -1896,7 +1896,7 @@ export function blobToDataUrl(blob: Blob): Promise<string> {
 }
 
 // Plugin management (#801, closing the #754 epic). See
-// crates/calibre_srv/src/plugins.rs.
+// crates/lexmechanic_srv/src/plugins.rs.
 //
 // `capabilities` is the security-relevant part: a plugin runs in a
 // WASM sandbox with no filesystem and no network unless its own
@@ -2184,7 +2184,7 @@ export function bookDiff(sessionId: string): Promise<{ changed: number; files: D
 
 // Persisted email account (#816 item 4.2). Everything but the
 // password: the store is a plain JSON blob on the server and
-// calibre_srv can be served over a network, so a credential written
+// lexmechanic_srv can be served over a network, so a credential written
 // there would be readable by more people than a user configuring an
 // email account would expect.
 export interface EmailAccount {

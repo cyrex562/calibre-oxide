@@ -14,7 +14,7 @@ pub fn open_viewer(url: String) {
     thread::spawn(move || {
         let event_loop = EventLoop::new();
         let window = WindowBuilder::new()
-            .with_title("Calibre-Oxide Viewer")
+            .with_title("Lexmechanic Viewer")
             .build(&event_loop)
             .unwrap();
 

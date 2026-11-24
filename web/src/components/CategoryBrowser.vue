@@ -25,6 +25,7 @@ import { categoryItemToQuery } from "../library/query";
 import type { CategoryEntry, CategoryItem } from "../library/types";
 import ContextMenu, { type ContextMenuEntry } from "./ContextMenu.vue";
 import FoldersTree from "./FoldersTree.vue";
+import { getItemCompat } from "../library/legacyStorage";
 
 // `selectedIds` feeds "Move selected books here" in the Folders tree; bumping
 // `refreshKey` reloads the tree and the categories (a column or a move changed them).
@@ -43,7 +44,7 @@ const filter = ref("");
 
 function readExpanded(): Set<CategoryKey> {
   try {
-    return parseExpanded(localStorage.getItem(EXPANDED_KEY));
+    return parseExpanded(getItemCompat(localStorage, EXPANDED_KEY));
   } catch {
     return new Set();
   }

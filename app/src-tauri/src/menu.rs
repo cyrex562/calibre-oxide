@@ -29,7 +29,7 @@ use crate::page_event;
 
 /// The `CustomEvent` name dispatched into the page. Must match
 /// `MENU_ACTION_EVENT` in `web/src/library/desktopMenu.ts`.
-const MENU_ACTION_EVENT: &str = "oxide:menu-action";
+const MENU_ACTION_EVENT: &str = "lexmechanic:menu-action";
 
 /// One action as described by the page. Mirrors `MenuActionSpec` in
 /// `web/src/library/actions.ts`.

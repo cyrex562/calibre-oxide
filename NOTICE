@@ -1,7 +1,8 @@
-calibre-oxide
-=============
+Lexmechanic
+===========
 
-A Rust port of calibre <https://calibre-ebook.com/>.
+Lexmechanic is a derivative of calibre <https://calibre-ebook.com/>, a Rust
+port of it, and was previously named calibre-oxide.
 
 Copyright of the original work is held by Kovid Goyal and the calibre
 contributors. calibre is licensed GPL v3, and this project is a
@@ -71,8 +72,8 @@ What this does and does not affect:
     distributions will not package it.
 
 To get a binary without that constraint, drop the `unrar` dependency
-from `calibre_utils` and the RAR/CBR paths using it
-(`calibre_utils::unrar`, `calibre_ebooks::metadata::rar`,
+from `lexmechanic_utils` and the RAR/CBR paths using it
+(`lexmechanic_utils::unrar`, `lexmechanic_ebooks::metadata::rar`,
 `input::rar_input`, and the RAR arm of `comic::input`). Everything else
 is GPL-clean.
 
@@ -87,7 +88,7 @@ inside the binary:
   * `lucide-vue-next` (web UI icons) -- Lucide, ISC licence. Pulled in
     from npm at build time and bundled into the web UI.
 
-  * `crates/calibre_srv/resources/mathjax/` -- MathJax 3.1.4,
+  * `crates/lexmechanic_srv/resources/mathjax/` -- MathJax 3.1.4,
     Apache-2.0. Vendored so mathematical content renders offline.
 
   * `web/public/pdfjs/` -- PDF.js runtime data (character maps and the
@@ -95,7 +96,7 @@ inside the binary:
     carry their own terms; `LICENSE_FOXIT` and `LICENSE_LIBERATION`
     sit beside them.
 
-  * `crates/calibre_ebooks/resources/dictionaries/` -- Hunspell
+  * `crates/lexmechanic_ebooks/resources/dictionaries/` -- Hunspell
     dictionaries. en-US is SCOWL (Kevin Atkinson, permissive); en-GB is
     LGPL. Provenance for both was established from the files rather
     than assumed -- see the NOTICE in that directory, which also

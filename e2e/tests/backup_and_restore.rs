@@ -9,10 +9,10 @@
 use std::io::Write;
 use std::process::Command;
 
-use calibre_oxide_e2e::{oxide_bin, TestLibrary};
+use lexmechanic_e2e::{lexmechanic_bin, TestLibrary};
 
 fn run(library: &std::path::Path, args: &[&str]) -> std::process::Output {
-    Command::new(oxide_bin("calibredb"))
+    Command::new(lexmechanic_bin("calibredb"))
         .args(args)
         .arg("--with-library")
         .arg(library)
@@ -81,11 +81,11 @@ fn two_books_sharing_an_identifier_keep_their_own_covers() {
         assert!(run(lib.path(), &["add", path.to_str().unwrap()]).status.success());
     }
 
-    let library = calibre_db::Library::open(lib.path().to_path_buf()).unwrap();
+    let library = lexmechanic_db::Library::open(lib.path().to_path_buf()).unwrap();
     let cache = library.as_cache();
 
-    let first = calibre_db::covers::cover_path(&cache, 1).unwrap();
-    let second = calibre_db::covers::cover_path(&cache, 2).unwrap();
+    let first = lexmechanic_db::covers::cover_path(&cache, 1).unwrap();
+    let second = lexmechanic_db::covers::cover_path(&cache, 2).unwrap();
     assert_ne!(first, second, "both books resolved to one cover file");
 
     // Each book kept the cover that was embedded in its own file.
@@ -118,7 +118,7 @@ fn backing_up_metadata_writes_a_sidecar_per_book_and_says_how_many() {
     let text = stdout_of(&out);
     assert!(text.contains("Backed up 2 books"), "the summary must count what was written, got: {text}");
 
-    let sidecars: Vec<_> = std::fs::read_dir(lib.path().join(".calibre-oxide/opf"))
+    let sidecars: Vec<_> = std::fs::read_dir(lib.path().join(".lexmechanic/opf"))
         .expect("no OPF sidecar directory was created")
         .filter_map(Result::ok)
         .collect();

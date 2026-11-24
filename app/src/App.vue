@@ -140,12 +140,12 @@ onUnmounted(() => clearInterval(failurePoll));
 <template>
   <main class="splash">
     <div v-if="status === 'checking' || status === 'opening'" class="waiting">
-      <h1>calibre-oxide</h1>
+      <h1>Lexmechanic</h1>
       <p class="hint">{{ status === "checking" ? "Looking for your library…" : "Starting your library…" }}</p>
     </div>
 
     <div v-else class="card">
-      <h1>calibre-oxide</h1>
+      <h1>Lexmechanic</h1>
 
       <div v-if="status === 'error'" class="failure" role="alert">
         <p class="error">Could not open that library: {{ errorMessage }}</p>

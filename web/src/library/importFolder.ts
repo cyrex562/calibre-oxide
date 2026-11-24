@@ -1,6 +1,6 @@
 // "Add folder": copying a folder tree into the library as a job.
 //
-// What the server does is described in crates/calibre_db/src/import.rs; this
+// What the server does is described in crates/lexmechanic_db/src/import.rs; this
 // is the part the dialog needs: the choices (calibre's two ways of reading a
 // folder, and what to do about duplicates), the request, and the words for
 // what came of it.

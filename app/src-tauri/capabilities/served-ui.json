@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "served-ui",
-  "description": "The library UI served by the calibre_srv this app spawns. It runs on a loopback origin with a port chosen at startup, so it is remote content by Tauri's reckoning and needs its commands granted explicitly.",
+  "description": "The library UI served by the lexmechanic_srv this app spawns. It runs on a loopback origin with a port chosen at startup, so it is remote content by Tauri's reckoning and needs its commands granted explicitly.",
   "windows": [
     "main"
   ],

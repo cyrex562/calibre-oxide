@@ -45,7 +45,7 @@ const { serverExe, workerExe, pdfiumLib } = platformNames(platform);
 // Tauri fail later with a bare "resource path doesn't exist".
 const missing = [];
 for (const exe of [serverExe, workerExe]) {
-  // The worker is a second binary of calibre_srv; without it the server
+  // The worker is a second binary of lexmechanic_srv; without it the server
   // falls back to slow in-process PDFium, so it is required, not optional.
   if (!existsSync(join(releaseDir, exe))) {
     missing.push(`  ${exe} in ${releaseDir} -- run: cargo build --release --workspace`);
@@ -61,12 +61,12 @@ if (!existsSync(join(repoRoot, "web", "dist", "index.html"))) {
 // none the build stops and says where it looked.
 const pdfium = findPdfium({
   platform,
-  envDir: process.env.CALIBRE_OXIDE_PDFIUM,
+  envDir: process.env.LEXMECHANIC_PDFIUM ?? process.env.CALIBRE_OXIDE_PDFIUM,
   targetDirs: [...new Set([targetDir, resolve(join(repoRoot, "target"))])],
   exists: existsSync,
 });
 if (!pdfium.path) {
-  missing.push(`  ${pdfiumLib} -- looked in:\n${pdfium.tried.map((t) => `      ${t}`).join("\n")}\n    run: cargo xtask fetch-pdfium   (or point CALIBRE_OXIDE_PDFIUM at the folder holding it)`);
+  missing.push(`  ${pdfiumLib} -- looked in:\n${pdfium.tried.map((t) => `      ${t}`).join("\n")}\n    run: cargo xtask fetch-pdfium   (or point LEXMECHANIC_PDFIUM at the folder holding it)`);
 }
 
 // Non-system DLLs the exes import (on Windows: DirectML.dll, pulled in by

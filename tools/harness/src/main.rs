@@ -1,4 +1,4 @@
-//! calibre-oxide iterative-porting harness.
+//! Lexmechanic iterative-porting harness.
 //!
 //! See `docs/HARNESS.md` for architecture. This binary is invoked by the
 //! developer to seed GitHub issues, scan the codebase for placeholders,
@@ -16,7 +16,7 @@ mod state;
 
 #[derive(Parser)]
 #[command(name = "harness")]
-#[command(about = "calibre-oxide porting harness", long_about = None)]
+#[command(about = "Lexmechanic porting harness", long_about = None)]
 struct Cli {
     /// Path to the repo root. Defaults to CARGO_MANIFEST_DIR/../../ resolved
     /// or the current working directory.

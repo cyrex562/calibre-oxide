@@ -1,7 +1,7 @@
 // The "Resolve…" dialog: choose which duplicate groups to act on and how, see
 // the plan, run it, undo it.
 //
-// The server is the authority (crates/calibre_srv/src/duplicates_review.rs):
+// The server is the authority (crates/lexmechanic_srv/src/duplicates_review.rs):
 // it picks the groups, picks each group's keeper and says why, and refuses to
 // execute a plan the person has not previewed. This module holds the dialog's
 // state machine so its rules can be tested:

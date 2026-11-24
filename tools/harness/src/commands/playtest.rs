@@ -25,7 +25,7 @@
 //!
 //! Fetching each commit's originating PR's `cluster:*` label would need
 //! one `gh` API call per commit. Since every real cluster in this repo
-//! already corresponds 1:1 with a crate directory (`crates/calibre_db`
+//! already corresponds 1:1 with a crate directory (`crates/lexmechanic_db`
 //! -> `db`, etc. — the same mapping `seed_issues.rs`'s own
 //! `cluster_label` uses, duplicated here in [`cluster_for_path`] since
 //! that one is private to its own module), inferring cluster from the
@@ -129,12 +129,12 @@ fn cluster_for_path(path: &str) -> String {
     let mut parts = path.split('/');
     match parts.next() {
         Some("crates") => match parts.next().unwrap_or("unknown") {
-            "calibre_db" => "db".to_string(),
-            "calibre_devices" => "devices".to_string(),
-            "calibre_ebooks" => "ebooks".to_string(),
-            "calibre_utils" => "utils".to_string(),
-            "calibre_srv" => "srv".to_string(),
-            "calibre_conversion" => "conversion".to_string(),
+            "lexmechanic_db" => "db".to_string(),
+            "lexmechanic_devices" => "devices".to_string(),
+            "lexmechanic_ebooks" => "ebooks".to_string(),
+            "lexmechanic_utils" => "utils".to_string(),
+            "lexmechanic_srv" => "srv".to_string(),
+            "lexmechanic_conversion" => "conversion".to_string(),
             other => other.strip_prefix("calibre_").unwrap_or(other).to_string(),
         },
         Some("tools") => "harness".to_string(),
@@ -226,10 +226,10 @@ mod tests {
 
     #[test]
     fn cluster_for_path_maps_real_crate_names() {
-        assert_eq!(cluster_for_path("crates/calibre_db/src/lib.rs"), "db");
-        assert_eq!(cluster_for_path("crates/calibre_ebooks/src/css_selectors/select.rs"), "ebooks");
-        assert_eq!(cluster_for_path("crates/calibre_utils/src/podofo.rs"), "utils");
-        assert_eq!(cluster_for_path("crates/calibre_srv/src/lib.rs"), "srv");
+        assert_eq!(cluster_for_path("crates/lexmechanic_db/src/lib.rs"), "db");
+        assert_eq!(cluster_for_path("crates/lexmechanic_ebooks/src/css_selectors/select.rs"), "ebooks");
+        assert_eq!(cluster_for_path("crates/lexmechanic_utils/src/podofo.rs"), "utils");
+        assert_eq!(cluster_for_path("crates/lexmechanic_srv/src/lib.rs"), "srv");
         assert_eq!(cluster_for_path("crates/some_other_crate/src/lib.rs"), "some_other_crate");
         assert_eq!(cluster_for_path("tools/harness/src/main.rs"), "harness");
         assert_eq!(cluster_for_path("docs/modules_to_port.md"), "docs");
@@ -239,8 +239,8 @@ mod tests {
     #[test]
     fn infer_cluster_picks_the_majority_touched_cluster() {
         let files = vec![
-            "crates/calibre_ebooks/src/a.rs".to_string(),
-            "crates/calibre_ebooks/src/b.rs".to_string(),
+            "crates/lexmechanic_ebooks/src/a.rs".to_string(),
+            "crates/lexmechanic_ebooks/src/b.rs".to_string(),
             "docs/modules_to_port.md".to_string(),
         ];
         assert_eq!(infer_cluster(&files), "ebooks");
@@ -277,7 +277,7 @@ mod tests {
                 sha: "abcdef1234567890".to_string(),
                 subject: "port: thing (#1)".to_string(),
                 summary: vec!["did the thing".to_string()],
-                files: vec!["crates/calibre_ebooks/src/a.rs".to_string()],
+                files: vec!["crates/lexmechanic_ebooks/src/a.rs".to_string()],
             }],
         );
         let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").unwrap().with_timezone(&chrono::Utc);
@@ -285,7 +285,7 @@ mod tests {
         assert!(md.contains("## ebooks (1 commit)"));
         assert!(md.contains("- [ ] `abcdef123456` port: thing (#1)"));
         assert!(md.contains("did the thing"));
-        assert!(md.contains("Files: crates/calibre_ebooks/src/a.rs"));
+        assert!(md.contains("Files: crates/lexmechanic_ebooks/src/a.rs"));
     }
 
     fn run_git(repo: &Path, args: &[&str]) {
@@ -300,18 +300,18 @@ mod tests {
         run_git(repo, &["config", "user.email", "test@example.com"]);
         run_git(repo, &["config", "user.name", "Test"]);
 
-        std::fs::create_dir_all(repo.join("crates/calibre_ebooks/src")).unwrap();
-        std::fs::write(repo.join("crates/calibre_ebooks/src/a.rs"), "// a\n").unwrap();
+        std::fs::create_dir_all(repo.join("crates/lexmechanic_ebooks/src")).unwrap();
+        std::fs::write(repo.join("crates/lexmechanic_ebooks/src/a.rs"), "// a\n").unwrap();
         run_git(repo, &["add", "."]);
         run_git(repo, &["commit", "-q", "-m", "initial commit"]);
         run_git(repo, &["tag", "playtest-0"]);
 
-        std::fs::write(repo.join("crates/calibre_ebooks/src/a.rs"), "// a v2\n").unwrap();
+        std::fs::write(repo.join("crates/lexmechanic_ebooks/src/a.rs"), "// a v2\n").unwrap();
         run_git(repo, &["add", "."]);
         run_git(repo, &["commit", "-q", "-m", "port: ebooks thing (#42)\n\n## Summary\n- did the ebooks thing\n"]);
 
-        std::fs::create_dir_all(repo.join("crates/calibre_utils/src")).unwrap();
-        std::fs::write(repo.join("crates/calibre_utils/src/b.rs"), "// b\n").unwrap();
+        std::fs::create_dir_all(repo.join("crates/lexmechanic_utils/src")).unwrap();
+        std::fs::write(repo.join("crates/lexmechanic_utils/src/b.rs"), "// b\n").unwrap();
         run_git(repo, &["add", "."]);
         run_git(repo, &["commit", "-q", "-m", "port: utils thing (#43)\n\n## Summary\n- did the utils thing\n"]);
 

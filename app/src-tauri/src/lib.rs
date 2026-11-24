@@ -1,14 +1,14 @@
-//! calibre-oxide desktop app — Tauri backend.
+//! Lexmechanic desktop app — Tauri backend.
 //!
 //! This app is a native shell around the real, already-working
-//! `web/` browser UI and `calibre_srv` backend (issue: real desktop
+//! `web/` browser UI and `lexmechanic_srv` backend (issue: real desktop
 //! app + E2E testing plan) rather than a separate frontend talking to
-//! `calibre_db`/`calibre_ebooks` in-process. On startup (or once a
-//! library is chosen), this spawns the compiled `calibre_srv` binary
+//! `lexmechanic_db`/`lexmechanic_ebooks` in-process. On startup (or once a
+//! library is chosen), this spawns the compiled `lexmechanic_srv` binary
 //! pointed at the chosen library with `--static-dir` set to the built
 //! `web/dist`, waits for it to be ready, and navigates the window to
 //! it. From that point on, the real `web/` UI (library browsing,
-//! reading, add/edit) talks to that spawned `calibre_srv` exactly the
+//! reading, add/edit) talks to that spawned `lexmechanic_srv` exactly the
 //! way it already does when served directly -- no new frontend code,
 //! no duplicated UI.
 //!
@@ -17,6 +17,7 @@
 //! check/shutdown, binary/asset resolution) and [`settings`]
 //! (persisted library path).
 
+mod data_migration;
 mod folder_check;
 mod library_import;
 mod logs;
@@ -34,10 +35,10 @@ use tauri_plugin_opener::OpenerExt;
 
 #[tauri::command]
 fn ping() -> String {
-    format!("calibre-oxide backend v{} online", env!("CARGO_PKG_VERSION"))
+    format!("Lexmechanic backend v{} online", env!("CARGO_PKG_VERSION"))
 }
 
-/// Holds the spawned `calibre_srv` child process (if any) and the
+/// Holds the spawned `lexmechanic_srv` child process (if any) and the
 /// port it's listening on, so it can be killed on app exit and so
 /// repeated "open library" calls replace rather than leak a previous
 /// server.
@@ -53,7 +54,7 @@ impl ServerState {
     }
 }
 
-/// Spawns `calibre_srv` for `library_path`, waits for it to be ready,
+/// Spawns `lexmechanic_srv` for `library_path`, waits for it to be ready,
 /// and navigates the main window to it. Shared by app startup (a
 /// previously-persisted library) and the "choose library" flow (a
 /// freshly-picked one).
@@ -102,12 +103,12 @@ fn start_library(app: &AppHandle, library_path: std::path::PathBuf) -> Result<()
         server::Readiness::Ready => {}
         server::Readiness::Exited(how) => {
             let _ = child.wait();
-            return Err(format!("calibre_srv stopped while starting ({how})"));
+            return Err(format!("lexmechanic_srv stopped while starting ({how})"));
         }
         server::Readiness::TimedOut => {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(format!("calibre_srv did not become ready on port {port} within {}s", ready_within.as_secs()));
+            return Err(format!("lexmechanic_srv did not become ready on port {port} within {}s", ready_within.as_secs()));
         }
     }
     *state.0.lock().unwrap() = Some((child, port));
@@ -124,7 +125,7 @@ fn start_library(app: &AppHandle, library_path: std::path::PathBuf) -> Result<()
         .map(|n| n.to_string_lossy().into_owned())
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| library_path.to_string_lossy().into_owned());
-    let _ = window.set_title(&format!("calibre-oxide — {name}"));
+    let _ = window.set_title(&format!("Lexmechanic — {name}"));
 
     let _ = settings::save_library_path(app, &library_path);
     Ok(())
@@ -140,7 +141,7 @@ fn get_persisted_library(app: AppHandle) -> Option<String> {
 }
 
 /// Opens a real native folder-picker dialog; on a real pick, spawns
-/// `calibre_srv` for it and navigates the window there.
+/// `lexmechanic_srv` for it and navigates the window there.
 #[tauri::command]
 async fn choose_library(app: AppHandle) -> Result<bool, String> {
     let (tx, mut rx) = tauri::async_runtime::channel(1);
@@ -191,7 +192,7 @@ fn open_log_folder(app: AppHandle) -> Result<(), String> {
 
 /// Real whole-library import (issue #761): picks a real `.zip` archive
 /// (the export side, `GET /library/export/{library_id}` on
-/// `calibre_srv`, produces exactly this shape -- a zip of the
+/// `lexmechanic_srv`, produces exactly this shape -- a zip of the
 /// library's own on-disk layout), then a real destination parent
 /// folder, extracts the archive into a new subfolder there named
 /// after the archive's own filename, and opens it exactly like a
@@ -231,7 +232,7 @@ async fn import_library_archive(app: AppHandle) -> Result<bool, String> {
 /// Real "switch library" quick-switch UI's data source (issue #725):
 /// most-recently-opened libraries, newest first. This app stays
 /// single-library-per-instance (see `settings.rs`'s own doc) --
-/// switching means re-spawning `calibre_srv` against a different
+/// switching means re-spawning `lexmechanic_srv` against a different
 /// path, not serving several libraries at once.
 #[tauri::command]
 fn list_recent_libraries(app: AppHandle) -> Vec<String> {
@@ -272,7 +273,7 @@ fn is_recent_library(recent: &[std::path::PathBuf], path: &std::path::Path) -> b
 
 /// Creates a new library and opens it.
 ///
-/// Pointing `calibre_srv` at an empty directory already produces a
+/// Pointing `lexmechanic_srv` at an empty directory already produces a
 /// working library -- it creates `metadata.db` and its sidecars on
 /// first run. What was missing was any way to *say* that: the only
 /// library affordance was "Switch library -> Browse for another",
@@ -334,8 +335,8 @@ fn set_auto_reopen(app: AppHandle, enabled: bool) -> Result<(), String> {
     settings::set_auto_reopen(&app, enabled).map_err(|e| e.to_string())
 }
 
-/// Real extensions `calibre_ebooks::metadata::get_metadata`'s own
-/// dispatch table understands (`crates/calibre_ebooks/src/metadata/mod.rs`)
+/// Real extensions `lexmechanic_ebooks::metadata::get_metadata`'s own
+/// dispatch table understands (`crates/lexmechanic_ebooks/src/metadata/mod.rs`)
 /// -- sourced from that match arm list directly, not invented, so a
 /// folder-import scan only picks up files the add-book pipeline can
 /// actually read metadata from.
@@ -353,7 +354,7 @@ fn simple_job_id() -> String {
 
 /// `CustomEvent` name announcing a completed drag-and-drop add. Must
 /// match the listener in `web/src/components/LibraryView.vue`.
-const BOOKS_ADDED_EVENT: &str = "oxide:books-added";
+const BOOKS_ADDED_EVENT: &str = "lexmechanic:books-added";
 
 #[derive(serde::Serialize, Default)]
 struct AddFolderResult {
@@ -404,7 +405,7 @@ async fn pick_folder(app: AppHandle) -> Result<Option<String>, String> {
     Ok(Some(dir.to_string_lossy().into_owned()))
 }
 
-/// Uploads each file to the running `calibre_srv`'s `/cdb/add-book`,
+/// Uploads each file to the running `lexmechanic_srv`'s `/cdb/add-book`,
 /// exactly as `web/`'s own per-file `addBook()` does.
 ///
 /// Shared by the folder picker above and the drag-and-drop handler
@@ -469,10 +470,10 @@ fn set_menu_actions(app: AppHandle, actions: Vec<menu::MenuActionSpec>) -> Resul
 /// Opens one of a book's formats in the OS default application.
 ///
 /// This is how PDFs are read today: the in-app reader is EPUB/KEPUB
-/// only (`is_viewable_format` in `calibre_srv`), so without this a
+/// only (`is_viewable_format` in `lexmechanic_srv`), so without this a
 /// PDF-first library has no way to open its own books.
 ///
-/// The bytes come from the running `calibre_srv` rather than from the
+/// The bytes come from the running `lexmechanic_srv` rather than from the
 /// library folder directly, because `/ajax/book` deliberately strips
 /// the internal `fmt_<ext>` absolute paths before they reach the page
 /// -- correct for an API that can be served over a network, and not
@@ -487,7 +488,7 @@ async fn open_book_format(state: State<'_, ServerState>, app: AppHandle, book_id
 
     let bytes = fetch_book_format(port, book_id, &ext).await?;
 
-    let dir = std::env::temp_dir().join("calibre-oxide-open");
+    let dir = std::env::temp_dir().join("lexmechanic-open");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     // `book_id` is an integer and `ext` is alphanumeric-checked above,
     // so this name cannot escape `dir`.
@@ -614,7 +615,7 @@ mod reveal_tests {
 
     #[test]
     fn finds_format_file_case_insensitively() {
-        let dir = std::env::temp_dir().join(format!("oxide-reveal-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lexmechanic-reveal-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("Book.PDF"), b"x").unwrap();
         std::fs::write(dir.join("Book.epub"), b"x").unwrap();
@@ -627,7 +628,7 @@ mod reveal_tests {
     /// by being first in the listing.
     #[test]
     fn picks_the_books_own_file_in_a_shared_folder() {
-        let dir = std::env::temp_dir().join(format!("oxide-reveal-shared-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lexmechanic-reveal-shared-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         for name in ["Aardvark.pdf", "Mine.pdf", "Zebra.pdf"] {
             std::fs::write(dir.join(name), b"x").unwrap();
@@ -672,7 +673,7 @@ async fn fetch_book_location(port: u16, book_id: i32) -> Result<(String, std::co
     Ok((path, stems))
 }
 
-/// Fetches one of a book's formats from the running `calibre_srv`.
+/// Fetches one of a book's formats from the running `lexmechanic_srv`.
 ///
 /// Shared by [`open_book_format`] and [`unpack_book`]. Goes through
 /// the server rather than the library folder because `/ajax/book`
@@ -717,7 +718,7 @@ struct UnpackResult {
 /// Unpacks a book into a folder the user picks, for editing with
 /// whatever tools they prefer (issue #816 item 1.12).
 ///
-/// `calibre_ebooks::tweak::explode` leaves a hidden marker file
+/// `lexmechanic_ebooks::tweak::explode` leaves a hidden marker file
 /// recording the source format; [`repack_book`] refuses to rebuild
 /// from a folder that has no marker, or whose marker disagrees with
 /// the target format. That check is upstream's own, and it is what
@@ -737,7 +738,7 @@ async fn unpack_book(state: State<'_, ServerState>, app: AppHandle, book_id: i32
 
     let bytes = fetch_book_format(port, book_id, &ext).await?;
 
-    let tmp = std::env::temp_dir().join(format!("calibre-oxide-unpack-{book_id}.{ext}"));
+    let tmp = std::env::temp_dir().join(format!("lexmechanic-unpack-{book_id}.{ext}"));
     std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
 
     let dest = parent.join(format!("book-{book_id}-{ext}"));
@@ -748,7 +749,7 @@ async fn unpack_book(state: State<'_, ServerState>, app: AppHandle, book_id: i32
     // The `question` callback answers the joint MOBI6+KF8 prompt.
     // Answering yes is right here: the user explicitly asked to
     // unpack this book, and declining would silently do nothing.
-    calibre_ebooks::tweak::explode(&tmp, &dest, |_| true).map_err(|e| e.to_string())?.ok_or_else(|| "that book could not be unpacked".to_string())?;
+    lexmechanic_ebooks::tweak::explode(&tmp, &dest, |_| true).map_err(|e| e.to_string())?.ok_or_else(|| "that book could not be unpacked".to_string())?;
     let _ = std::fs::remove_file(&tmp);
 
     let _ = app.opener().reveal_item_in_dir(&dest);
@@ -766,12 +767,12 @@ async fn repack_book(state: State<'_, ServerState>, app: AppHandle, book_id: i32
         return Ok(false);
     };
 
-    let rebuilt = std::env::temp_dir().join(format!("calibre-oxide-repack-{book_id}.{ext}"));
+    let rebuilt = std::env::temp_dir().join(format!("lexmechanic-repack-{book_id}.{ext}"));
     let _ = std::fs::remove_file(&rebuilt);
     // `implode` verifies its own marker file, so a folder that was
     // not produced by unpacking -- or was unpacked from a different
     // format -- is refused here rather than producing a broken book.
-    calibre_ebooks::tweak::implode(&dir, &rebuilt).map_err(|e| e.to_string())?;
+    lexmechanic_ebooks::tweak::implode(&dir, &rebuilt).map_err(|e| e.to_string())?;
 
     let bytes = std::fs::read(&rebuilt).map_err(|e| e.to_string())?;
     let data_url = format!("data:application/octet-stream;base64,{}", base64_encode(&bytes));
@@ -1029,6 +1030,9 @@ fn spawn_auto_add_watcher(app: AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Before Tauri resolves its config/log/web-view folders: they are named
+    // after the bundle identifier, which changed with the project's name.
+    data_migration::migrate_app_data();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -1058,7 +1062,7 @@ pub fn run() {
             };
             tauri::async_runtime::spawn(async move {
                 let result = add_files_via_server(port, &files).await;
-                // The web UI does not listen on calibre_srv's
+                // The web UI does not listen on lexmechanic_srv's
                 // websocket, so the grid will not refresh on its own
                 // -- tell the page directly.
                 page_event::dispatch(&webview, BOOKS_ADDED_EVENT, &result);
@@ -1138,7 +1142,7 @@ mod unpack_tests {
         std::fs::write(&src, real_epub_bytes()).unwrap();
 
         let exploded = dir.path().join("exploded");
-        calibre_ebooks::tweak::explode(&src, &exploded, |_| true).unwrap().expect("explode should succeed");
+        lexmechanic_ebooks::tweak::explode(&src, &exploded, |_| true).unwrap().expect("explode should succeed");
         assert!(exploded.join("content.opf").exists(), "the OPF should be on disk for external editing");
 
         // Edit it the way a user would, with their own tools.
@@ -1147,7 +1151,7 @@ mod unpack_tests {
         std::fs::write(&chapter, &edited).unwrap();
 
         let rebuilt = dir.path().join("rebuilt.epub");
-        calibre_ebooks::tweak::implode(&exploded, &rebuilt).unwrap();
+        lexmechanic_ebooks::tweak::implode(&exploded, &rebuilt).unwrap();
 
         let mut zip = zip::ZipArchive::new(std::fs::File::open(&rebuilt).unwrap()).unwrap();
         let mut text = String::new();
@@ -1169,7 +1173,7 @@ mod unpack_tests {
         std::fs::write(plain.join("something.txt"), b"x").unwrap();
 
         let out = dir.path().join("out.epub");
-        assert!(calibre_ebooks::tweak::implode(&plain, &out).is_err());
+        assert!(lexmechanic_ebooks::tweak::implode(&plain, &out).is_err());
     }
 
     fn real_epub_bytes() -> Vec<u8> {
@@ -1315,7 +1319,7 @@ mod auto_add_tests {
 
 /// Guards the access-control wiring.
 ///
-/// The window navigates to the `calibre_srv` it spawns, so its page is
+/// The window navigates to the `lexmechanic_srv` it spawns, so its page is
 /// *remote* content and every command it invokes needs an explicit
 /// capability. Getting that wrong does not fail to compile and does not
 /// fail any other test -- it fails at runtime, in the user's hands,

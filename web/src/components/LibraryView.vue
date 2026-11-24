@@ -77,6 +77,7 @@ import UndoToast from "./UndoToast.vue";import { isTauri, tauriInvoke } from "..
 import { DEFAULT_KEYMAP, DEFAULT_LIBRARY_PREFS, DEFAULT_SAVE_TO_DISK_TEMPLATE, DEFAULT_TOOLBAR_PREFS, fetchProfile, KEYMAP_PROFILE, libraryShortcuts, LIBRARY_PREFS_PROFILE, saveProfile, TOOLBAR_PREFS_PROFILE, type KeymapPrefs, type LibraryPrefs, type ToolbarPrefs } from "../settings/api";
 import type { CustomColumnInfo, FieldMetaEntry, FtsSnippet, RenameFileResult } from "../library/types";
 import { DEFAULT_RENAME_TEMPLATE, describeRename, initialRenameTemplate, previewIsCurrent, type RenamePreviewKey, summarizeRename } from "../library/renameFiles";
+import { getItemCompat } from "../library/legacyStorage";
 
 // Real, persisted default (issue #721) -- overwritten by
 // loadLibraryPrefs() below once its fetch resolves; starts at the
@@ -375,7 +376,7 @@ const detailsWidth = ref(initialLayout.detailsWidth);
 
 function readStoredLayout(): string | null {
   try {
-    return localStorage.getItem(LAYOUT_KEY);
+    return getItemCompat(localStorage, LAYOUT_KEY);
   } catch {
     // Storage can be unavailable (private mode, disabled cookies);
     // defaults are a fine answer and not worth failing a render over.
@@ -471,7 +472,7 @@ function resetColumns() {
 }
 
 // Virtual library / saved search management -- real, new routes (see
-// crates/calibre_srv/src/lists.rs's own doc for why no upstream route
+// crates/lexmechanic_srv/src/lists.rs's own doc for why no upstream route
 // exists to port here).
 const manageOpen = ref(false);
 const manageError = ref<string | null>(null);
@@ -547,7 +548,7 @@ async function renameSavedSearchPrompt(name: string) {
 }
 
 // Custom column management -- real, new routes (see
-// crates/calibre_srv/src/custom_columns.rs's own doc for why no
+// crates/lexmechanic_srv/src/custom_columns.rs's own doc for why no
 // upstream route exists to port here). `is_multiple` is left out of
 // the create form entirely: it's not a real working combination for
 // any datatype this backend supports yet (text/comments/series reject
@@ -583,7 +584,7 @@ function openColumns() {
 }
 
 // Check Library (issue #748) -- real integrity scan, see
-// crates/calibre_srv/src/check_library.rs's own doc.
+// crates/lexmechanic_srv/src/check_library.rs's own doc.
 const checkLibraryOpen = ref(false);
 const checkLibraryLoading = ref(false);
 const checkLibraryError = ref<string | null>(null);
@@ -872,7 +873,7 @@ function exportLibraryArchive() {
 }
 
 // Fetch news/recipes -- a real, generic RSS/Atom feed reader (see
-// crates/calibre_srv/src/news.rs's own doc for why this isn't a
+// crates/lexmechanic_srv/src/news.rs's own doc for why this isn't a
 // catalog of upstream's ~1077 hand-written per-site recipes).
 const newsOpen = ref(false);
 const newsTitle = ref("");
@@ -1078,7 +1079,7 @@ watch([activeQuery, sort, sortOrder, vl, ftsMode], () => {
   if (!ftsMode.value) void resetSearch();
 }, { immediate: true });
 
-// Full-text search -- a separate result shape/backend (crates/calibre_srv/src/fts.rs)
+// Full-text search -- a separate result shape/backend (crates/lexmechanic_srv/src/fts.rs)
 // from the metadata search above: no pagination/sort/vl, real
 // snippet/highlight text per match, and a real "not enabled yet" state
 // to surface instead of an empty result list.
@@ -1944,7 +1945,7 @@ async function cancelFingerprint() {
 // ---------------------------------------------------------------
 // Merge books: from a duplicate group ("Merge into…") or from a
 // selection of two or more books (the "merge-books" action).
-// The engine is crates/calibre_db/src/merge.rs; this is the review
+// The engine is crates/lexmechanic_db/src/merge.rs; this is the review
 // step. Nothing changes until the user has seen a dry run and
 // confirms it.
 // ---------------------------------------------------------------
@@ -2191,7 +2192,7 @@ async function onTrashChanged() {
 // Rust side has already done the work and says so here.
 //
 // The page has to be told explicitly because it does not subscribe to
-// calibre_srv's websocket, so the `BooksAdded` change event the add
+// lexmechanic_srv's websocket, so the `BooksAdded` change event the add
 // endpoint publishes never reaches it.
 function onBooksDropped(event: Event) {
   const detail = (event as CustomEvent<AddFolderResult & { error?: string }>).detail;
@@ -2210,7 +2211,7 @@ function onBooksDropped(event: Event) {
 
 // Switch-library quick-switch (issue #725, desktop-only). This app
 // stays single-library-per-instance -- "switching" re-spawns
-// calibre_srv against a different path and re-navigates the window
+// lexmechanic_srv against a different path and re-navigates the window
 // (app/src-tauri/src/lib.rs's open_library/open_recent_library), it
 // doesn't serve multiple libraries at once. The list is capped/
 // deduplicated server-side (app/src-tauri/src/settings.rs).
@@ -2872,7 +2873,7 @@ function onBeforeUnload(event: BeforeUnloadEvent) {
 onMounted(() => {
   window.addEventListener("beforeunload", onBeforeUnload);
   window.addEventListener("keydown", onLibraryKeydown);
-  window.addEventListener("oxide:books-added", onBooksDropped);
+  window.addEventListener("lexmechanic:books-added", onBooksDropped);
   unsubscribeMenuAction = onMenuAction(runAction);
   void loadLibraryInfo();
   void loadInterruptedJob();
@@ -2880,13 +2881,13 @@ onMounted(() => {
 onBeforeUnmount(() => {
   window.removeEventListener("beforeunload", onBeforeUnload);
   window.removeEventListener("keydown", onLibraryKeydown);
-  window.removeEventListener("oxide:books-added", onBooksDropped);
+  window.removeEventListener("lexmechanic:books-added", onBooksDropped);
   unsubscribeMenuAction?.();
   unsubscribeMenuAction = null;
 });
 
 // A job the previous server process was running when it ended (a crash, or
-// switching library) comes back from `.calibre-oxide/jobs.json` as
+// switching library) comes back from `.lexmechanic/jobs.json` as
 // `interrupted`; the resumable kinds offer to continue.
 const interruptedJob = ref<LibraryJob | null>(null);
 const resumeBusy = ref(false);

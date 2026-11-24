@@ -2,7 +2,7 @@
 //
 // web/ is deliberately not a Tauri-aware package (no @tauri-apps/api
 // dependency, see package.json) -- it's a plain browser SPA served
-// directly by calibre_srv, reused as-is by the desktop app, which
+// directly by lexmechanic_srv, reused as-is by the desktop app, which
 // just navigates its own webview to this same served content
 // (app/src-tauri/src/server.rs). Tauri still injects a real
 // `window.__TAURI_INTERNALS__` global into any page loaded in that

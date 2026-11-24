@@ -286,7 +286,7 @@ describe("window listeners", () => {
     const removed = vi.spyOn(window, "removeEventListener");
     await mountView();
     unmountView();
-    for (const name of ["oxide:books-added", MENU_ACTION_EVENT, "keydown", "beforeunload"]) {
+    for (const name of ["lexmechanic:books-added", MENU_ACTION_EVENT, "keydown", "beforeunload"]) {
       const adds = added.mock.calls.filter(([n]) => n === name).length;
       const removes = removed.mock.calls.filter(([n]) => n === name).length;
       expect(adds, `${name} was never added`).toBeGreaterThan(0);

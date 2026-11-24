@@ -79,7 +79,7 @@ const THEME_COLORS: Record<ReaderPrefs["theme"], { bg: string; fg: string }> = {
   sepia: { bg: "#f4ecd8", fg: "#3b3226" },
 };
 
-const READER_PREFS_STYLE_ID = "calibre-oxide-reading-prefs";
+const READER_PREFS_STYLE_ID = "lexmechanic-reading-prefs";
 
 function applyReaderPrefs() {
   const doc = iframeEl.value?.contentDocument;
@@ -182,7 +182,7 @@ function installAnchorHandler(m: BookManifest) {
   });
 }
 
-const HIGHLIGHT_POPOVER_ID = "calibre-oxide-highlight-popover";
+const HIGHLIGHT_POPOVER_ID = "lexmechanic-highlight-popover";
 
 // Real text-selection -> highlight creation flow (issue #731). The
 // popover button is real content injected directly into the iframe's
@@ -347,7 +347,7 @@ async function init() {
     // Not `m.annotations_map`: `render_endpoints.rs` only populates
     // that field when the request is authenticated
     // (`is_authenticated` gate), and this app's own spawned
-    // `calibre_srv` runs with auth disabled by default -- the
+    // `lexmechanic_srv` runs with auth disabled by default -- the
     // manifest's copy would silently always be empty in real use.
     // `/book-get-annotations` has no such gate (its `effective_user`
     // falls back to the anonymous user id), so it's the real source
@@ -382,8 +382,8 @@ function prev() {
 }
 
 // Real "Read aloud" TTS (#756) -- built on the new POST /tts/synthesize
-// route (crates/calibre_srv/src/tts.rs), which itself reuses
-// calibre_ebooks::tts::batch::text_to_raw_audio_data (already wraps
+// route (crates/lexmechanic_srv/src/tts.rs), which itself reuses
+// lexmechanic_ebooks::tts::batch::text_to_raw_audio_data (already wraps
 // stream::Piper for exactly this "synthesize on demand" shape). Real,
 // disclosed narrowing: this synthesizes the current spine file's whole
 // visible text in one request/one WAV rather than per-sentence/per-
@@ -591,7 +591,7 @@ async function goToSearchHit(result: SpineMatches) {
 // survives serialization verbatim, so the marker really is there to
 // match on.
 
-const FOOTNOTE_POPOVER_ID = "calibre-oxide-footnote-popover";
+const FOOTNOTE_POPOVER_ID = "lexmechanic-footnote-popover";
 
 async function showFootnote(m: BookManifest, name: string, frag: string, anchor: Element) {
   const doc = iframeEl.value?.contentDocument;
@@ -783,7 +783,7 @@ function printCurrentSection() {
 // the book's own stylesheet still applies. The arithmetic lives in
 // reader/paged.ts, where its off-by-ones can be stated and tested.
 
-const PAGED_STYLE_ID = "calibre-oxide-paged-mode";
+const PAGED_STYLE_ID = "lexmechanic-paged-mode";
 
 const pagedMode = ref(false);
 const currentPage = ref(0);

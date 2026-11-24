@@ -1,4 +1,4 @@
-//! Black-box tests of a really-spawned `calibre_srv` hosting more than
+//! Black-box tests of a really-spawned `lexmechanic_srv` hosting more than
 //! one library (#959, #816 item 1.4).
 //!
 //! The route and the broker were both real and unit-tested before this;
@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use calibre_oxide_e2e::{find_free_port, oxide_bin, spawn_calibre_srv_with_libraries, wait_until_ready, TestLibrary};
+use lexmechanic_e2e::{find_free_port, lexmechanic_bin, spawn_lexmechanic_srv_with_libraries, wait_until_ready, TestLibrary};
 
 fn web_dist() -> Option<PathBuf> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent()?.join("web").join("dist");
@@ -19,7 +19,7 @@ fn web_dist() -> Option<PathBuf> {
 fn add_book(library: &Path, name: &str) {
     let book = library.join(format!("{name}.txt"));
     std::fs::write(&book, format!("{name}\n\n\nJane Doe\n")).unwrap();
-    let out = std::process::Command::new(oxide_bin("calibredb"))
+    let out = std::process::Command::new(lexmechanic_bin("calibredb"))
         .arg("add")
         .arg(&book)
         .arg("--with-library")
@@ -47,8 +47,8 @@ fn a_real_server_copies_a_book_between_two_hosted_libraries() {
     let archive_id = archive.path().file_name().unwrap().to_str().unwrap().replace(' ', "_");
 
     let port = find_free_port();
-    let _srv = spawn_calibre_srv_with_libraries(home.path(), &[archive.path()], &static_dir, port);
-    assert!(wait_until_ready(port, Duration::from_secs(10)), "calibre_srv never became ready on port {port}");
+    let _srv = spawn_lexmechanic_srv_with_libraries(home.path(), &[archive.path()], &static_dir, port);
+    assert!(wait_until_ready(port, Duration::from_secs(10)), "lexmechanic_srv never became ready on port {port}");
 
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::blocking::Client::new();
@@ -73,7 +73,7 @@ fn a_real_server_copies_a_book_between_two_hosted_libraries() {
     // Really in the other library, read back through a second server
     // pointed at it -- not from the response that claimed success.
     let check_port = find_free_port();
-    let _check = spawn_calibre_srv_with_libraries(archive.path(), &[], &static_dir, check_port);
+    let _check = spawn_lexmechanic_srv_with_libraries(archive.path(), &[], &static_dir, check_port);
     assert!(wait_until_ready(check_port, Duration::from_secs(10)), "the checking server never became ready");
     let search: serde_json::Value = client
         .get(format!("http://127.0.0.1:{check_port}/ajax/search"))
@@ -100,8 +100,8 @@ fn a_dash_library_id_still_reaches_the_default_library_over_http() {
     add_book(home.path(), "Default Library Book");
 
     let port = find_free_port();
-    let _srv = spawn_calibre_srv_with_libraries(home.path(), &[archive.path()], &static_dir, port);
-    assert!(wait_until_ready(port, Duration::from_secs(10)), "calibre_srv never became ready on port {port}");
+    let _srv = spawn_lexmechanic_srv_with_libraries(home.path(), &[archive.path()], &static_dir, port);
+    assert!(wait_until_ready(port, Duration::from_secs(10)), "lexmechanic_srv never became ready on port {port}");
 
     // `/orphans/{library_id}` is a real library_id-taking route that
     // returns JSON, and the UI calls this family with `-`.

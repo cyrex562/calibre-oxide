@@ -1,5 +1,5 @@
-// Real fetch wrappers for calibre_srv's notes feature (see
-// crates/calibre_srv/src/notes.rs's own doc) -- free-form HTML notes
+// Real fetch wrappers for lexmechanic_srv's notes feature (see
+// crates/lexmechanic_srv/src/notes.rs's own doc) -- free-form HTML notes
 // attachable to a category item (author/tag/series/publisher/
 // language), with embedded image resources. Kept separate from
 // library/api.ts (which is JSON-only): `POST /set-note` returns a raw

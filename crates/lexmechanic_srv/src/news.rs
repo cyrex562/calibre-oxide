@@ -1,0 +1,556 @@
+//! Real, **new** routes -- no upstream `calibre.srv` route exists for
+//! fetching news/recipes either (same story as [`crate::lists`] and
+//! [`crate::catalog`]: it's a desktop-GUI-only feature there). This
+//! is the first HTTP-reachable use of the real, already-ported
+//! `lexmechanic_ebooks::web::feeds` pipeline (issue #81's cluster) --
+//! confirmed via a full grep of `lexmechanic_srv` finding zero prior
+//! references to that module.
+//!
+//! # Scope: a real, generic feed reader, not a recipe catalog
+//!
+//! Real upstream ships ~1077 hand-written, site-specific `.recipe`
+//! Python scripts (custom scraping/cleanup logic per news source).
+//! Building or porting a catalog of those is real, separate,
+//! substantial scope, not attempted here. What this route offers
+//! instead is exactly [`lexmechanic_ebooks::web::feeds::recipe::RecipeConfig`]'s
+//! own generic path: a user-supplied title plus one or more plain
+//! RSS/Atom feed URLs, using every one of `NewsRecipeHooks`/
+//! `NewsRecipePostprocessHooks`'s real default implementations (both
+//! traits' only non-defaulted item is `config()`) -- a real, working
+//! "custom news source" matching what real upstream's own GUI offers
+//! for a feed URL with no hand-written recipe, not a stub.
+//!
+//! # Pipeline
+//!
+//! `POST /news/fetch` queues a real background job (mirroring
+//! [`crate::convert`]'s own job-registry pattern) that: builds a
+//! [`RecipeConfig`] from the request, runs
+//! [`lexmechanic_ebooks::web::feeds::download::build_index`] (real
+//! network fetches against the given feed URLs -- this route
+//! genuinely needs internet access to do anything, unlike the rest of
+//! this crate), converts the resulting OEB directory to a real EPUB
+//! via [`lexmechanic_ebooks::conversion::plumber::Plumber`] (the same
+//! engine `convert.rs` already uses), and adds it to the library via
+//! `Cache::add_book` on success -- publishing the same
+//! [`crate::web_socket::ChangeEvent::BooksAdded`] event `cdb::add_book`
+//! does, so the new issue shows up in a connected UI without a manual
+//! refresh.
+//!
+//! `GET /news/status/{job_id}` polls it, matching `convert.rs`'s own
+//! one-shot status contract (a job's status can only be read once).
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+
+use axum::extract::{Path as AxumPath, State};
+use axum::Json;
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use lexmechanic_ebooks::scraper::browser::Browser;
+use lexmechanic_ebooks::web::feeds::download::build_index;
+use lexmechanic_ebooks::web::feeds::postprocess::NewsRecipePostprocessHooks;
+use lexmechanic_ebooks::web::feeds::recipe::{NewsRecipeHooks, RecipeConfig};
+
+use crate::errors::ServerError;
+use crate::jobs::{JobId, JobStatus};
+use crate::web_socket::{self, ChangeEvent};
+use crate::AppState;
+
+pub(crate) struct GenericRecipe(pub RecipeConfig);
+
+impl NewsRecipeHooks for GenericRecipe {
+    fn config(&self) -> &RecipeConfig {
+        &self.0
+    }
+}
+
+impl NewsRecipePostprocessHooks for GenericRecipe {}
+
+/// Lazily loads the system font database once per process -- matches
+/// `lexmechanic_ebooks::web::feeds::download`'s own test helper exactly
+/// (`test_db`), needed by `build_index` for real default-cover/
+/// masthead-image generation.
+pub(crate) fn fontdb() -> &'static std::sync::Arc<fontdb::Database> {
+    static DB: OnceLock<std::sync::Arc<fontdb::Database>> = OnceLock::new();
+    DB.get_or_init(|| {
+        let mut db = fontdb::Database::new();
+        db.load_system_fonts();
+        std::sync::Arc::new(db)
+    })
+}
+
+struct NewsJobMeta {
+    title: String,
+    output_path: PathBuf,
+    tdir: PathBuf,
+}
+
+#[derive(Default)]
+pub struct NewsJobRegistry {
+    jobs: Mutex<HashMap<JobId, NewsJobMeta>>,
+}
+
+impl NewsJobRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn insert(&self, job_id: JobId, meta: NewsJobMeta) {
+        self.jobs.lock().unwrap().insert(job_id, meta);
+    }
+
+    fn contains(&self, job_id: JobId) -> bool {
+        self.jobs.lock().unwrap().contains_key(&job_id)
+    }
+
+    fn take(&self, job_id: JobId) -> Option<NewsJobMeta> {
+        self.jobs.lock().unwrap().remove(&job_id)
+    }
+}
+
+/// One requested feed -- either a bare URL string (title defaults to
+/// the feed's own, matching `RecipeConfig::feeds`'s own `None`-title
+/// convention) or a real `{title, url}` object, for the real
+/// multi-section-feeds-with-per-section-titles config `RecipeConfig`
+/// already supports but the original `Vec<String>` shape this route
+/// started with had no way to ask for (issue #765).
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum FeedInput {
+    Url(String),
+    WithTitle { title: Option<String>, url: String },
+}
+
+impl FeedInput {
+    fn url(&self) -> &str {
+        match self {
+            FeedInput::Url(u) => u,
+            FeedInput::WithTitle { url, .. } => url,
+        }
+    }
+
+    fn into_pair(self) -> (Option<String>, String) {
+        match self {
+            FeedInput::Url(u) => (None, u),
+            FeedInput::WithTitle { title, url } => (title, url),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FetchNewsBody {
+    title: String,
+    feeds: Vec<FeedInput>,
+    /// Real `RecipeConfig::oldest_article` override, in days -- `None`
+    /// keeps the real upstream default (7.0). See issue #765: this
+    /// route's own prerequisite check found `RecipeConfig` already had
+    /// more real, wired fields than the original title+feeds-only body
+    /// exposed.
+    #[serde(default)]
+    oldest_article_days: Option<f64>,
+    /// Real `RecipeConfig::max_articles_per_feed` override -- `None`
+    /// keeps the real upstream default (100).
+    #[serde(default)]
+    max_articles_per_feed: Option<usize>,
+}
+
+/// Real-DNS-resolves `url`'s host and rejects it if the scheme isn't
+/// `http`/`https` or any resolved address is disallowed (see
+/// [`crate::net_guard::is_disallowed_ip`]). Real, disclosed narrowing:
+/// this only validates the *initial* request -- `Browser`'s own
+/// `reqwest::Client` (shared with other real callers, e.g. the
+/// scraper) follows up to 10 redirects with no per-hop revalidation
+/// hook exposed to this caller, so a URL that only redirects to a
+/// disallowed address *after* this check passes isn't caught here. A
+/// real, separate follow-up if that gap ever matters in practice (a
+/// public feed URL redirecting somewhere internal is an unusual,
+/// low-likelihood attack shape compared to a directly-supplied
+/// internal URL, which this does stop).
+async fn validate_feed_url(url: &str) -> Result<(), String> {
+    let parsed = url::Url::parse(url).map_err(|e| format!("{url}: invalid URL ({e})"))?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err(format!("{url}: only http/https feed URLs are allowed"));
+    }
+    let host = parsed.host_str().ok_or_else(|| format!("{url}: no host"))?;
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    crate::net_guard::resolve_and_check(host, port).await.map_err(|e| format!("{url}: {e}"))
+}
+
+/// `POST /news/fetch`.
+pub async fn fetch_news(State(state): State<AppState>, Json(body): Json<FetchNewsBody>) -> Result<Json<Value>, ServerError> {
+    if body.feeds.is_empty() {
+        return Err(ServerError::BadRequest("at least one feed URL is required".to_string()));
+    }
+    for feed in &body.feeds {
+        if let Err(e) = validate_feed_url(feed.url()).await {
+            return Err(ServerError::BadRequest(e));
+        }
+    }
+    let title = if body.title.trim().is_empty() { "Custom News Source".to_string() } else { body.title.trim().to_string() };
+
+    let tdir = tempfile::tempdir().map_err(|e| ServerError::InternalServerError(e.to_string()))?.keep();
+    let output_dir = tdir.join("index");
+    let output_epub = tdir.join("output.epub");
+
+    let job_id = {
+        let output_dir = output_dir.clone();
+        let output_epub = output_epub.clone();
+        let feeds = body.feeds;
+        let oldest_article_days = body.oldest_article_days;
+        let max_articles_per_feed = body.max_articles_per_feed;
+        let title_for_job = title.clone();
+        state
+            .jobs
+            .start_job(move || async move {
+                let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    let mut cfg = RecipeConfig { title: title_for_job, feeds: Some(feeds.into_iter().map(FeedInput::into_pair).collect()), ..Default::default() };
+                    if let Some(oldest) = oldest_article_days {
+                        cfg.oldest_article = oldest;
+                    }
+                    if let Some(max) = max_articles_per_feed {
+                        cfg.max_articles_per_feed = max;
+                    }
+                    cfg.simultaneous_downloads = cfg.simultaneous_downloads.max(1);
+                    let simultaneous_downloads = cfg.simultaneous_downloads;
+                    let recipe = GenericRecipe(cfg);
+                    let browser = Browser::new("", &[], true);
+
+                    let index_html = build_index(&recipe, &browser, &output_dir, false, simultaneous_downloads, fontdb())?;
+                    lexmechanic_ebooks::conversion::plumber::Plumber::new(&index_html, &output_epub).run()?;
+                    Ok(())
+                })
+                .await;
+                match result {
+                    Ok(Ok(())) => Ok("ok".to_string()),
+                    Ok(Err(e)) => Err(format!("{e:#}")),
+                    Err(join_err) => Err(join_err.to_string()),
+                }
+            })
+            .await
+    };
+
+    state.news_jobs.insert(job_id, NewsJobMeta { title, output_path: output_epub, tdir });
+    Ok(Json(json!(job_id)))
+}
+
+/// `GET/POST /news/status/{job_id}`.
+pub async fn news_status(State(state): State<AppState>, AxumPath(job_id): AxumPath<JobId>) -> Result<Json<Value>, ServerError> {
+    if !state.news_jobs.contains(job_id) {
+        return Err(ServerError::NotFound(format!("No job with id: {job_id}")));
+    }
+
+    let status = state.jobs.status(job_id).await;
+    if matches!(status, JobStatus::Waiting | JobStatus::Running) {
+        return Ok(Json(json!({"running": true})));
+    }
+
+    let Some(meta) = state.news_jobs.take(job_id) else {
+        return Ok(Json(json!({"running": false, "ok": false, "error": "job status is no longer known"})));
+    };
+    let (ok, error) = match &status {
+        JobStatus::Finished { .. } => (true, String::new()),
+        JobStatus::Failed { error, .. } => (false, error.clone()),
+        _ => (false, "job status is no longer known".to_string()),
+    };
+
+    let mut ans = json!({"running": false, "ok": ok, "error": error});
+    if ok {
+        let book_id = tokio::task::spawn_blocking({
+            let cache = state.cache.clone();
+            let output_path = meta.output_path.clone();
+            // Not lexmechanic_ebooks::metadata::get_metadata: the built
+            // EPUB carries no real `<dc:title>` (its own OEBBook came
+            // from parsing generated HTML with no metadata of its
+            // own), so format-sniffing would silently fall back to
+            // MetaInformation::default()'s "Unknown" -- the recipe's
+            // real title is already known here, use it directly
+            // rather than trying to re-derive it from the file.
+            let title = meta.title.clone();
+            move || -> anyhow::Result<i32> {
+                let meta_info = lexmechanic_ebooks::metadata::MetaInformation { title, pubdate: Some(chrono::Utc::now()), ..Default::default() };
+                cache.add_book(&output_path, &meta_info)
+            }
+        })
+        .await
+        .map_err(|e| ServerError::InternalServerError(e.to_string()))?
+        .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
+
+        web_socket::publish(&state, ChangeEvent::BooksAdded { book_ids: vec![book_id] });
+        ans["book_id"] = json!(book_id);
+    }
+
+    let _ = tokio::fs::remove_dir_all(&meta.tdir).await;
+    Ok(Json(ans))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
+
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    use lexmechanic_db::cache::Cache;
+
+    /// A tiny multi-route single-threaded HTTP/1.1 test server --
+    /// matches `lexmechanic_ebooks::web::feeds::download`'s own private
+    /// `TestSite` helper exactly (test helpers aren't shared across
+    /// crates' private `#[cfg(test)]` blocks).
+    struct TestSite {
+        addr: std::net::SocketAddr,
+    }
+
+    impl TestSite {
+        fn start(routes: HashMap<&'static str, (&'static str, &'static [u8])>) -> TestSite {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    let mut stream: TcpStream = stream;
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        continue;
+                    }
+                    let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    loop {
+                        let mut l = String::new();
+                        if reader.read_line(&mut l).is_err() || l.trim().is_empty() {
+                            break;
+                        }
+                    }
+                    match routes.get(path.as_str()) {
+                        Some((ctype, body)) => {
+                            let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                            let _ = stream.write_all(resp.as_bytes());
+                            let _ = stream.write_all(body);
+                        }
+                        None => {
+                            let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                            let _ = stream.write_all(resp.as_bytes());
+                        }
+                    }
+                }
+            });
+            TestSite { addr }
+        }
+
+        fn url(&self, path: &str) -> String {
+            format!("http://{}{}", self.addr, path)
+        }
+    }
+
+    fn test_app() -> (tempfile::TempDir, axum::Router) {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        let state = crate::AppState {
+            libraries: None,
+            cache: std::sync::Arc::new(cache),
+            opts: std::sync::Arc::new(crate::opts::ServerOptions::default()),
+            auth: None,
+            changes: crate::web_socket::new_change_broadcaster(),
+            reader_profiles: std::sync::Arc::new(crate::reader_profiles::ProfileStore::new_in_memory().unwrap()),
+            book_cache: std::sync::Arc::new(crate::books_cache::BookCache::open_temp()),
+            jobs: std::sync::Arc::new(crate::jobs::JobsManager::new(4, std::time::Duration::from_secs(3600))),
+            render_jobs: std::sync::Arc::new(crate::render_endpoints::RenderJobRegistry::new()),
+            conversion_jobs: std::sync::Arc::new(crate::convert::ConversionJobRegistry::new()),
+            news_jobs: std::sync::Arc::new(crate::news::NewsJobRegistry::new()), tweak_sessions: std::sync::Arc::new(crate::tweak::TweakSessionRegistry::new()), news_schedules: std::sync::Arc::new(crate::news_scheduler::NewsScheduleStore::new_in_memory().unwrap()), tts_voice: None, plugin_store: None, plugin_registry: std::sync::Arc::new(std::sync::Mutex::new(lexmechanic_customize::registry::PluginRegistry::new())),
+        };
+        let router = crate::test_router(state);
+        (dir, router)
+    }
+
+    async fn post_json(router: &axum::Router, uri: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder().method("POST").uri(uri).header("content-type", "application/json").body(Body::from(body.to_string())).unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let value = if bytes.is_empty() { serde_json::Value::Null } else { serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null) };
+        (status, value)
+    }
+
+    async fn get_json(router: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let value = if bytes.is_empty() { serde_json::Value::Null } else { serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null) };
+        (status, value)
+    }
+
+    /// Waits for a news job, which does real feed parsing and a real
+    /// OEB-to-EPUB conversion.
+    ///
+    /// The budget was 200 x 20ms = 4s, which is close enough to the
+    /// actual work that the suite flaked under parallel load -- a
+    /// different test tripping each run, while every one of them
+    /// passed in isolation at ~4s. That is a budget problem, not a
+    /// correctness one, so it is now 30s: still a real ceiling, far
+    /// enough above the work to stop reporting load as failure.
+    async fn poll_until_done(router: &axum::Router, job_id: i64) -> serde_json::Value {
+        for _ in 0..600 {
+            let (status, body) = get_json(router, &format!("/news/status/{job_id}")).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            if body["running"] == false {
+                return body;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("news job never finished within the 30s polling budget");
+    }
+
+    fn rss_feed() -> &'static [u8] {
+        br#"<?xml version="1.0"?>
+<rss version="2.0"><channel><title>Test Feed</title><description>d</description>
+<item><title>Article One</title><link>/article1</link><description>Summary one</description></item>
+</channel></rss>"#
+    }
+
+    #[tokio::test]
+    async fn fetch_news_downloads_a_real_feed_and_adds_it_as_a_real_book() {
+        let mut routes = HashMap::new();
+        routes.insert("/feed.xml", ("application/rss+xml", rss_feed()));
+        routes.insert("/article1", ("text/html", b"<html><body><p>Full text of article one.</p></body></html>".as_slice()));
+        let site = TestSite::start(routes);
+
+        let (_dir, router) = test_app();
+        let (status, job_id) = post_json(&router, "/news/fetch", serde_json::json!({"title": "My Weekly", "feeds": [site.url("/feed.xml")]})).await;
+        assert_eq!(status, StatusCode::OK, "{job_id}");
+        let job_id = job_id.as_i64().unwrap();
+
+        let result = poll_until_done(&router, job_id).await;
+        assert_eq!(result["ok"], true, "{result}");
+        let book_id = result["book_id"].as_i64().expect("expected a real book_id");
+
+        let (_, book) = get_json(&router, &format!("/ajax/book/{book_id}")).await;
+        assert_eq!(book["title"], "My Weekly");
+    }
+
+    #[tokio::test]
+    async fn fetch_news_accepts_a_real_multi_section_feed_list_with_per_section_titles() {
+        // Real, new (#765): a feed entry can be a bare URL string
+        // (title defaults) OR a {title, url} object naming its own
+        // section -- both shapes in the same request, matching what a
+        // real multi-section custom recipe needs.
+        let mut routes = HashMap::new();
+        routes.insert("/feed1.xml", ("application/rss+xml", rss_feed()));
+        routes.insert("/feed2.xml", ("application/rss+xml", rss_feed()));
+        routes.insert("/article1", ("text/html", b"<html><body><p>Full text of article one.</p></body></html>".as_slice()));
+        let site = TestSite::start(routes);
+
+        let (_dir, router) = test_app();
+        let (status, job_id) = post_json(
+            &router,
+            "/news/fetch",
+            serde_json::json!({
+                "title": "My Digest",
+                "feeds": [
+                    site.url("/feed1.xml"),
+                    {"title": "Tech News", "url": site.url("/feed2.xml")},
+                ],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{job_id}");
+        let job_id = job_id.as_i64().unwrap();
+
+        let result = poll_until_done(&router, job_id).await;
+        assert_eq!(result["ok"], true, "{result}");
+        assert!(result["book_id"].as_i64().is_some());
+    }
+
+    #[tokio::test]
+    async fn fetch_news_accepts_real_oldest_article_and_max_articles_overrides() {
+        let mut routes = HashMap::new();
+        routes.insert("/feed.xml", ("application/rss+xml", rss_feed()));
+        routes.insert("/article1", ("text/html", b"<html><body><p>Full text of article one.</p></body></html>".as_slice()));
+        let site = TestSite::start(routes);
+
+        let (_dir, router) = test_app();
+        let (status, job_id) = post_json(
+            &router,
+            "/news/fetch",
+            serde_json::json!({"title": "My Weekly", "feeds": [site.url("/feed.xml")], "oldest_article_days": 30, "max_articles_per_feed": 1}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{job_id}");
+        let job_id = job_id.as_i64().unwrap();
+
+        let result = poll_until_done(&router, job_id).await;
+        assert_eq!(result["ok"], true, "{result}");
+    }
+
+    #[tokio::test]
+    async fn fetch_news_rejects_an_empty_feed_list() {
+        let (_dir, router) = test_app();
+        let (status, _) = post_json(&router, "/news/fetch", serde_json::json!({"title": "x", "feeds": []})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // ===============================================================
+    // SSRF protection
+    // ===============================================================
+
+    #[tokio::test]
+    async fn rejects_a_non_http_scheme() {
+        assert!(super::validate_feed_url("file:///etc/passwd").await.is_err());
+        assert!(super::validate_feed_url("ftp://example.com/feed.xml").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_a_link_local_address_like_cloud_metadata() {
+        let err = super::validate_feed_url("http://169.254.169.254/latest/meta-data/").await.unwrap_err();
+        assert!(err.contains("disallowed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn rejects_private_rfc1918_addresses() {
+        assert!(super::validate_feed_url("http://10.0.0.5/feed.xml").await.is_err());
+        assert!(super::validate_feed_url("http://172.16.0.5/feed.xml").await.is_err());
+        assert!(super::validate_feed_url("http://192.168.1.5/feed.xml").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_news_rejects_a_disallowed_feed_url_before_ever_queuing_a_job() {
+        let (_dir, router) = test_app();
+        let (status, body) = post_json(&router, "/news/fetch", serde_json::json!({"title": "x", "feeds": ["http://169.254.169.254/latest/meta-data/"]})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    #[tokio::test]
+    async fn news_status_404s_for_an_unknown_job_id() {
+        let (_dir, router) = test_app();
+        let (status, _) = get_json(&router, "/news/status/999999").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_feed_url_that_404s_degrades_to_a_real_empty_issue_rather_than_erroring() {
+        // Found while writing this test: a feed URL that 404s does
+        // NOT hit build_index's "No articles found, aborting" bail --
+        // that only fires when the *feed list itself* ends up empty,
+        // not when a listed feed's own fetch fails and yields zero
+        // articles. lexmechanic_ebooks::web::feeds::download's own real,
+        // pre-existing behavior tolerates an unfetchable feed as an
+        // empty one, so this route's job still reports success. Not a
+        // bug in this route (or in that module) to fix -- documented
+        // here so a future reader doesn't assume the opposite.
+        let site = TestSite::start(HashMap::new());
+        let (_dir, router) = test_app();
+        let (status, job_id) = post_json(&router, "/news/fetch", serde_json::json!({"title": "Empty Issue", "feeds": [site.url("/missing.xml")]})).await;
+        assert_eq!(status, StatusCode::OK);
+        let job_id = job_id.as_i64().unwrap();
+
+        let result = poll_until_done(&router, job_id).await;
+        assert_eq!(result["ok"], true, "{result}");
+        let book_id = result["book_id"].as_i64().expect("expected a real book_id even for an empty issue");
+        let (_, book) = get_json(&router, &format!("/ajax/book/{book_id}")).await;
+        assert_eq!(book["title"], "Empty Issue");
+    }
+}

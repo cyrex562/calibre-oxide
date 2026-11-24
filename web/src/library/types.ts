@@ -1,5 +1,5 @@
-// Real JSON shapes produced by calibre_srv::ajax -- see
-// crates/calibre_srv/src/ajax.rs's own doc comment and per-handler
+// Real JSON shapes produced by lexmechanic_srv::ajax -- see
+// crates/lexmechanic_srv/src/ajax.rs's own doc comment and per-handler
 // docs for exactly what each field means. Kept as plain interfaces
 // (not runtime-validated) since this is a trusted, same-origin server.
 
@@ -75,7 +75,7 @@ export interface BooksInPage {
 }
 
 // One entry of `/ajax/field-metadata`'s `field_metadata` map -- real
-// shape from calibre_db::field_metadata::FieldInfo. Only the keys
+// shape from lexmechanic_db::field_metadata::FieldInfo. Only the keys
 // this port's UI actually reads are named; the rest passes through.
 export interface FieldMetaEntry {
   key: string; // bare name for standard fields, "#label" for custom ones
@@ -89,12 +89,12 @@ export interface FieldMetaEntry {
 
 export interface FieldMetadataResponse {
   field_metadata: Record<string, FieldMetaEntry>;
-  // [key, display_label] pairs -- calibre_db::field_metadata::FieldMetadata::ui_sortable_field_keys.
+  // [key, display_label] pairs -- lexmechanic_db::field_metadata::FieldMetadata::ui_sortable_field_keys.
   sortable_fields: [string, string][];
 }
 
 // One entry of `GET /custom-columns` -- real shape from
-// calibre_db::cache::Cache::custom_column_label_map.
+// lexmechanic_db::cache::Cache::custom_column_label_map.
 export interface CustomColumnInfo {
   num: number;
   label: string;
@@ -106,10 +106,10 @@ export interface CustomColumnInfo {
   normalized: boolean;
 }
 
-// { name: query } -- calibre_db::cache::Cache::virtual_library_map.
+// { name: query } -- lexmechanic_db::cache::Cache::virtual_library_map.
 export type VirtualLibraries = Record<string, string>;
 
-// Response shape of `POST /cdb/add-book/...` -- see crates/calibre_srv/src/cdb.rs::add_book.
+// Response shape of `POST /cdb/add-book/...` -- see crates/lexmechanic_srv/src/cdb.rs::add_book.
 // `book_id` is present on a real add; `duplicates` is present instead
 // when a same-title/author match already exists and `add_duplicates`
 // wasn't set.
@@ -123,7 +123,7 @@ export interface AddBookResult {
   duplicates?: { title: string; authors: string[] }[];
 }
 
-// Real shapes from crates/calibre_srv/src/convert.rs. `book-data`'s
+// Real shapes from crates/lexmechanic_srv/src/convert.rs. `book-data`'s
 // `input_formats`/`output_formats` entries are always upper-case
 // extensions (e.g. "EPUB"), matching what `/ajax/book`'s own `formats`
 // field would need `.toUpperCase()`-ing to compare against.
@@ -151,7 +151,7 @@ export interface ConversionStatus {
   fmt?: string;
 }
 
-// Real shapes from crates/calibre_srv/src/fts.rs.
+// Real shapes from crates/lexmechanic_srv/src/fts.rs.
 export interface FtsHit {
   book_id: number;
   format: string;
@@ -191,7 +191,7 @@ export interface BookFieldChanges {
   // not plain metadata fields, but accepted in the same `changes` object.
   added_formats?: { ext: string; data_url: string; name?: string }[];
   removed_formats?: string[];
-  // Custom column values, keyed by their bare label (calibre_db::cache::Cache::set_field's
+  // Custom column values, keyed by their bare label (lexmechanic_db::cache::Cache::set_field's
   // fallback dispatches any name matching a real custom_columns row -- see issue #720).
   [key: string]: unknown;
 }

@@ -2,7 +2,7 @@
 //
 // calibre moves a deleted book into a trash folder inside the library
 // instead of the OS recycle bin, which does not exist on a network share
-// (see crates/calibre_db/src/trash.rs). Entries stay for a number of days
+// (see crates/lexmechanic_db/src/trash.rs). Entries stay for a number of days
 // (14 unless the library says otherwise) and can be restored until then.
 //
 // All the wording and arithmetic lives here, away from the dialog, so it can

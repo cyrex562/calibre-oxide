@@ -304,10 +304,10 @@ fn cluster_label(cluster: &str) -> Option<String> {
         "db" | "devices" | "ebooks" | "utils" | "srv" | "conversion" | "mobi" => {
             Some(format!("cluster:{}", cluster))
         }
-        "calibre_db" => Some("cluster:db".into()),
-        "calibre_devices" => Some("cluster:devices".into()),
-        "calibre_ebooks" => Some("cluster:ebooks".into()),
-        "calibre_utils" => Some("cluster:utils".into()),
+        "lexmechanic_db" => Some("cluster:db".into()),
+        "lexmechanic_devices" => Some("cluster:devices".into()),
+        "lexmechanic_ebooks" => Some("cluster:ebooks".into()),
+        "lexmechanic_utils" => Some("cluster:utils".into()),
         _ => None,
     }
 }
@@ -341,7 +341,7 @@ fn is_deferred(stack: &[String], file: &str) -> bool {
     if full.split('/').any(|s| s == "headless") {
         return true;
     }
-    // Legacy library backend (database2.py etc.) — replaced by calibre_db.
+    // Legacy library backend (database2.py etc.) — replaced by lexmechanic_db.
     if full.split('/').any(|s| s == "library") && !full.contains("catalogs") {
         // catalogs stay in scope (they generate output)
         // library itself is old Python API — defer.
@@ -358,7 +358,7 @@ fn is_deferred(stack: &[String], file: &str) -> bool {
         // MTP unix / windows native drivers — will wire Android via ADB, not raw MTP.
         "mtp",
         // macOS-only IOKit extension. get_usb_devices is superseded by
-        // the cross-platform calibre_devices::libusb port; the other
+        // the cross-platform lexmechanic_devices::libusb port; the other
         // functions (mounted-filesystem enumeration, locale, MTP probe)
         // are macOS-specific and out of scope for the user's
         // Windows/Linux/Android platforms.
@@ -423,7 +423,7 @@ mod tests {
     #[test]
     fn cluster_label_maps_known_clusters() {
         assert_eq!(cluster_label("db"), Some("cluster:db".into()));
-        assert_eq!(cluster_label("calibre_ebooks"), Some("cluster:ebooks".into()));
+        assert_eq!(cluster_label("lexmechanic_ebooks"), Some("cluster:ebooks".into()));
         assert_eq!(cluster_label("unknown"), None);
     }
 }

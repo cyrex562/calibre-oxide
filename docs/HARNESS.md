@@ -80,7 +80,7 @@ The user-agreed anti-stub rule:
   the body as:
 
   ```rust
-  #[calibre_oxide_macros::placeholder(reason = "<why>", python_ref = "old_src/…")]
+  #[lexmechanic_macros::placeholder(reason = "<why>", python_ref = "old_src/…")]
   fn foo(&self, x: Bar) -> Result<Baz> {
       todo!("placeholder: <one-line description>")
   }
@@ -92,7 +92,7 @@ The user-agreed anti-stub rule:
 - Placeholder registry entry schema:
 
   ```jsonl
-  {"crate":"calibre_ebooks","path":"src/mobi/mobiml.rs","symbol":"MobiMlizer::process","python_ref":"old_src/src/calibre/ebooks/mobi/mobiml.py","reason":"XHTML→MobiML transform pending","created":"2026-08-11T23:12:00Z","priority":"medium"}
+  {"crate":"lexmechanic_ebooks","path":"src/mobi/mobiml.rs","symbol":"MobiMlizer::process","python_ref":"old_src/src/calibre/ebooks/mobi/mobiml.py","reason":"XHTML→MobiML transform pending","created":"2026-08-11T23:12:00Z","priority":"medium"}
   ```
 
 - Every iteration, the harness prioritizes clearing existing placeholders
@@ -164,7 +164,7 @@ Cross-validation pattern per format:
 1. Fixture files live in `.harness/fixtures/<subsystem>/`.
 2. For each fixture, the harness runs both:
    - `calibre-debug -c "<py snippet that prints canonical JSON>"`
-   - The Rust equivalent (e.g. `cargo run -p calibre_ebooks --bin ebook-meta`).
+   - The Rust equivalent (e.g. `cargo run -p lexmechanic_ebooks --bin ebook-meta`).
 3. Diff outputs. Byte-for-byte where the format is deterministic (JSON
    with sorted keys, sorted OPF, etc.); structural diff otherwise.
 4. The judge sees the diff and either accepts (semantic match) or
@@ -185,7 +185,7 @@ it:
    repo is a squash commit, never a two-parent merge commit, so this is
    the real analogue of "walk merges since `since`".
 3. Groups each commit by cluster, inferred from its changed files'
-   crate directory (`crates/calibre_db` -> `db`, etc. — the same
+   crate directory (`crates/lexmechanic_db` -> `db`, etc. — the same
    mapping `seed-issues` uses for placeholders).
 4. Emits `.harness/playtest/<timestamp>.md`: each commit's subject, its
    `## Summary` bullets if its body has one (real content when the

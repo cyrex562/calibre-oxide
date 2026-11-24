@@ -1,0 +1,52 @@
+[package]
+name = "lexmechanic_db"
+version = "0.1.0"
+edition = "2021"
+
+license.workspace = true
+[dependencies]
+lexmechanic_utils = { path = "../lexmechanic_utils" }
+rusqlite = { version = "0.30", features = ["bundled", "functions", "collation", "hooks"] }
+thiserror = "1.0"
+log = "0.4"
+anyhow = "1.0"
+lexmechanic_ebooks = { path = "../lexmechanic_ebooks" }
+uuid = { version = "1.0", features = ["v4"] }
+regex = "1.10"
+lazy_static = "1.4"
+indexmap = { version = "2.1", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+unicode-width = "0.2.2"
+walkdir = "2.5.0"
+clap = { version = "4.5.54", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+csv = "1.3"
+unicode-segmentation = "1.11"
+unicode-normalization = "0.1"
+rust-stemmers = "1.2"
+base64 = "0.21"
+urlencoding = "2.1.3"
+mime_guess = "2.0"
+blake3 = "1.5"
+unicode_names2 = "2.0.0"
+image = { version = "0.24", default-features = false, features = ["png", "jpeg", "gif"] }
+zip = "0.6"
+# Sending a removed book's file to the system wastebasket rather than
+# erasing it (#896). MIT, so GPL-compatible.
+trash = "5.2"
+# Scratch folders for the database snapshots the mirror/export builds.
+tempfile = "3.10"
+
+# Windows storage-tier classification (GetDriveTypeW / QueryDosDeviceW)
+# and the calibre-running mutex probe (#258). Same version as the one
+# already in the tree.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+zbus = { version = "5", features = ["blocking"] }
+
+[dev-dependencies]
+tempfile = "3.10"
