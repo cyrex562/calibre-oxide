@@ -67,9 +67,6 @@ function cancelRun() {
       <label><input v-model="state.draft.scope" type="radio" value="all" /> Every book in the library</label>
     </fieldset>
 
-    <div class="organize-buttons">
-      <button type="button" :disabled="busy || problem !== null" data-testid="preview" @click="preview">{{ state.phase === "planning" ? "Previewing…" : "Preview" }}</button>
-    </div>
     <p v-if="problem" class="hint">{{ problem }}</p>
     <p v-if="state.error" class="error" role="alert">{{ state.error }}</p>
 
@@ -90,15 +87,9 @@ function cancelRun() {
           <li v-for="s in state.plan.skipped.slice(0, 50)" :key="s.book_id">Book {{ s.book_id }}: {{ s.reason }}</li>
         </ul>
       </details>
-      <div class="organize-buttons">
-        <button type="button" class="primary" :disabled="busy || !canRun" data-testid="run-plan" @click="run">Organize {{ state.plan.books.toLocaleString("en-US") }} books</button>
-      </div>
     </section>
 
-    <div v-if="state.phase === 'running'" class="organize-buttons">
-      <p class="hint" role="status">{{ state.progress }}</p>
-      <button v-if="state.jobId !== null" type="button" @click="cancelRun">Cancel</button>
-    </div>
+    <p v-if="state.phase === 'running'" class="hint" role="status">{{ state.progress }}</p>
 
     <section v-if="state.report" class="organize-done" aria-label="Result" data-testid="report">
       <p role="status">{{ describeReport(state.report) }}</p>
@@ -118,6 +109,12 @@ function cancelRun() {
         </li>
       </ul>
     </section>
+    <template #footer>
+      <button type="button" :disabled="busy" @click="emit('close')">Close</button>
+      <button v-if="state.phase === 'running' && state.jobId !== null" type="button" @click="cancelRun">Cancel</button>
+      <button type="button" :disabled="busy || problem !== null" data-testid="preview" @click="preview">{{ state.phase === "planning" ? "Previewing…" : "Preview" }}</button>
+      <button v-if="state.plan" type="button" class="primary" :disabled="busy || !canRun" data-testid="run-plan" @click="run">Organize {{ state.plan.books.toLocaleString("en-US") }} books</button>
+    </template>
   </Dialog>
 </template>
 
@@ -144,20 +141,15 @@ h4 {
 }
 fieldset {
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   display: flex;
   flex-direction: column;
   gap: 0.3rem;
   padding: 0.5rem 0.75rem;
 }
-.organize-buttons {
-  display: flex;
-  gap: 0.5rem;
-  align-items: center;
-}
 .organize-plan {
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   padding: 0.6rem 0.8rem;
   display: flex;
   flex-direction: column;

@@ -153,7 +153,7 @@ defineProps<{ bulk: BulkEdit; count: number }>();
 }
 .bulk-replace {
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   padding: 0.5rem 0.75rem 0.75rem;
   margin-bottom: 0.75rem;
 }

@@ -128,17 +128,17 @@ async function save() {
 
       <p v-if="saveError" class="error">{{ saveError }}</p>
 
-      <div class="actions">
-        <template v-if="!editing">
-          <button type="button" @click="startEditing">Edit note</button>
-        </template>
-        <template v-else>
-          <button type="button" @click="imageInput?.click()">Insert image…</button>
-          <input ref="imageInput" type="file" accept="image/*" class="hidden-file-input" @change="insertImage" />
-          <button type="button" class="read" :disabled="saving" @click="save">{{ saving ? "Saving…" : "Save" }}</button>
-          <button type="button" :disabled="saving" @click="editing = false">Cancel</button>
-        </template>
-      </div>
+    </template>
+    <template v-if="!loading && !error" #footer>
+      <template v-if="!editing">
+        <button type="button" class="primary" @click="startEditing">Edit note</button>
+      </template>
+      <template v-else>
+        <button type="button" @click="imageInput?.click()">Insert image…</button>
+        <input ref="imageInput" type="file" accept="image/*" class="hidden-file-input" @change="insertImage" />
+        <button type="button" :disabled="saving" @click="editing = false">Cancel</button>
+        <button type="button" class="primary" :disabled="saving" @click="save">{{ saving ? "Saving…" : "Save" }}</button>
+      </template>
     </template>
   </Dialog>
 </template>
@@ -153,7 +153,7 @@ async function save() {
 }
 .note-edit {
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   padding: 0.5em;
 }
 .note-edit:focus {
@@ -161,19 +161,6 @@ async function save() {
 }
 .hidden-file-input {
   display: none;
-}
-.actions {
-  display: flex;
-  gap: 0.5em;
-  flex-wrap: wrap;
-}
-.read {
-  background: var(--accent);
-  color: var(--fg-on-accent);
-  border: none;
-  padding: 0.5em 1em;
-  border-radius: 4px;
-  cursor: pointer;
 }
 .error {
   color: var(--danger);

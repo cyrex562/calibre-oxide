@@ -1121,7 +1121,7 @@ function onReaderResize() {
 }
 .autoscroll.active {
   outline: 1px solid currentColor;
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   padding: 0 0.15rem;
 }
 .autoscroll-speed {

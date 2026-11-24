@@ -2000,7 +2000,7 @@ const helpOpen = ref(false);
   align-items: center;
   gap: 0.25em;
   background: var(--accent-soft);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   padding: 0.2em 0.4em;
   font-size: var(--fs-small);
 }
@@ -2230,7 +2230,7 @@ const helpOpen = ref(false);
   padding: 0 var(--sp-3) 0 var(--sp-4);
   height: var(--ctl-h);
   border: 1px solid var(--border-strong);
-  border-radius: var(--ctl-h);
+  border-radius: var(--radius-pill);
   background: var(--bg-sunken);
 }
 .filter-chip button {
@@ -2283,7 +2283,7 @@ const helpOpen = ref(false);
 .settings-link {
   padding: 0.35em 0.7em;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   color: inherit;
   text-decoration: none;
 }
@@ -2350,7 +2350,7 @@ const helpOpen = ref(false);
 .dup-badge {
   display: inline-block;
   padding: 0 0.5rem;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   font-size: 0.75em;
   font-weight: 600;
   border: 1px solid currentColor;
@@ -2393,7 +2393,7 @@ const helpOpen = ref(false);
   gap: 0.35rem;
   padding: 0.15rem 0.45rem;
   border: 1px solid var(--border-strong);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
 }
 .marks-count {
   font-size: var(--fs-small);

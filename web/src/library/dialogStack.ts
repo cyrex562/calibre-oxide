@@ -60,5 +60,7 @@ export function trapTab(panel: HTMLElement, event: { shiftKey: boolean }, active
 
 /** Where focus goes when a dialog opens: the [autofocus] element, the first focusable one, else the panel. */
 export function initialFocusTarget(panel: HTMLElement): HTMLElement {
-  return panel.querySelector<HTMLElement>("[autofocus]") ?? focusableIn(panel)[0] ?? panel;
+  const items = focusableIn(panel);
+  // The title bar's close button is not where anyone wants to start typing.
+  return panel.querySelector<HTMLElement>("[autofocus]") ?? items.find((el) => el.closest(".dialog-titlebar") === null) ?? panel;
 }

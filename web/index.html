@@ -6,6 +6,15 @@
     <meta name="robots" content="noindex" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>Lexmechanic</title>
+    <script>
+      // The skin is set before the first paint (main.ts sets it again; see library/skin.ts).
+      try {
+        var skin = localStorage.getItem("lexmechanic.skin");
+        document.documentElement.setAttribute("data-skin", skin === "modern" ? "modern" : "classic");
+      } catch (e) {
+        document.documentElement.setAttribute("data-skin", "classic");
+      }
+    </script>
   </head>
   <body>
     <div id="app"></div>

@@ -153,7 +153,7 @@ async function applyRename() {
   font: inherit;
   padding: 0.35em 0.5em;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   resize: vertical;
 }
 .manage-name.muted {

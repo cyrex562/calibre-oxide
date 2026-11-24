@@ -1,0 +1,677 @@
+/*
+  The Classic skin's widgets: bevelled buttons, sunken fields, navy title
+  bars, classic scrollbars and menus. The colours, sizes and the four bevel
+  tones are tokens in style.css (`:root[data-skin="classic"]`); this file
+  only draws with them. Nothing here applies under the Modern skin.
+
+  Two selector prefixes are used on purpose:
+
+    :where(:root[data-skin="classic"]) X   has the specificity of X alone,
+        so it replaces style.css's plain element rules (`button`, `input`)
+        but any component rule that sets its own background or border still
+        wins. That is what lets a flat toolbar button stay flat.
+    :root[data-skin="classic"] X           outranks a component's scoped
+        rule, for the chrome that must look the same everywhere (the dialog
+        frame, menus, table headers, panels).
+
+  A button's bevel is a 1px border (outer edge) plus four 1px gradient lines
+  (inner edge). A component that wants a flat button already writes
+  `border: none; background: none`, which removes both; the bevel is not a
+  box-shadow precisely so that it does.
+*/
+
+:root[data-skin="classic"] {
+  color-scheme: dark;
+
+  /* The inner edge of a raised / sunken box, as four gradient lines. */
+  --ring-raised: linear-gradient(var(--bevel-light), var(--bevel-light)) 0 0 / calc(100% - 1px) 1px no-repeat,
+    linear-gradient(var(--bevel-light), var(--bevel-light)) 0 0 / 1px calc(100% - 1px) no-repeat,
+    linear-gradient(var(--bevel-shadow), var(--bevel-shadow)) 100% 100% / 100% 1px no-repeat,
+    linear-gradient(var(--bevel-shadow), var(--bevel-shadow)) 100% 100% / 1px 100% no-repeat;
+  --ring-sunken: linear-gradient(var(--bevel-dark), var(--bevel-dark)) 0 0 / calc(100% - 1px) 1px no-repeat,
+    linear-gradient(var(--bevel-dark), var(--bevel-dark)) 0 0 / 1px calc(100% - 1px) no-repeat,
+    linear-gradient(var(--bevel-light), var(--bevel-light)) 100% 100% / 100% 1px no-repeat,
+    linear-gradient(var(--bevel-light), var(--bevel-light)) 100% 100% / 1px 100% no-repeat;
+  --ring-pressed: linear-gradient(var(--bevel-shadow), var(--bevel-shadow)) 0 0 / calc(100% - 1px) 1px no-repeat,
+    linear-gradient(var(--bevel-shadow), var(--bevel-shadow)) 0 0 / 1px calc(100% - 1px) no-repeat,
+    linear-gradient(var(--bevel-light), var(--bevel-light)) 100% 100% / 100% 1px no-repeat,
+    linear-gradient(var(--bevel-light), var(--bevel-light)) 100% 100% / 1px 100% no-repeat;
+  --face-raised: var(--ring-raised), var(--bg);
+  --face-pressed: var(--ring-pressed), var(--bg);
+  --face-field: var(--ring-sunken), var(--bg-field);
+  --edge-raised: var(--bevel-hi) var(--bevel-dark) var(--bevel-dark) var(--bevel-hi);
+  --edge-sunken: var(--bevel-shadow) var(--bevel-hi) var(--bevel-hi) var(--bevel-shadow);
+  --edge-pressed: var(--bevel-dark) var(--bevel-hi) var(--bevel-hi) var(--bevel-dark);
+}
+
+:root[data-skin="classic"] ::selection {
+  background: var(--bg-selected);
+  color: var(--fg-on-selected);
+}
+
+:root[data-skin="classic"] body {
+  /* Tahoma at 12px has no use for the smoothing the Modern skin asks for. */
+  -webkit-font-smoothing: auto;
+}
+
+/* ---- Push buttons ---------------------------------------------------- */
+
+:where(:root[data-skin="classic"]) button {
+  min-width: 0;
+  padding: 0 var(--sp-5);
+  border: 1px solid;
+  border-color: var(--edge-raised);
+  border-radius: 0;
+  background: var(--face-raised);
+  color: var(--fg);
+}
+:where(:root[data-skin="classic"]) button:hover:not(:disabled) {
+  background: var(--face-raised);
+}
+:where(:root[data-skin="classic"]) button:active:not(:disabled) {
+  border-color: var(--edge-pressed);
+  background: var(--face-pressed);
+}
+:where(:root[data-skin="classic"]) button:disabled {
+  opacity: 1;
+  color: var(--fg-faint);
+  text-shadow: 1px 1px 0 var(--bevel-dark);
+}
+/* The default button wears the extra black frame. */
+:where(:root[data-skin="classic"]) button.primary {
+  border-color: var(--edge-raised);
+  background: var(--face-raised);
+  color: var(--fg);
+  box-shadow: 0 0 0 1px var(--bevel-dark);
+  margin: 1px;
+}
+:where(:root[data-skin="classic"]) button.primary:hover:not(:disabled) {
+  background: var(--face-raised);
+  border-color: var(--edge-raised);
+}
+:where(:root[data-skin="classic"]) button.primary:active:not(:disabled) {
+  border-color: var(--edge-pressed);
+  background: var(--face-pressed);
+}
+:where(:root[data-skin="classic"]) button.danger {
+  background: var(--face-raised);
+  border-color: var(--edge-raised);
+  color: var(--danger);
+  font-weight: 600;
+  box-shadow: 0 0 0 1px var(--bevel-dark);
+  margin: 1px;
+}
+:where(:root[data-skin="classic"]) button.danger:hover:not(:disabled) {
+  filter: none;
+}
+/* The focus rectangle sits inside the face, dotted, like the original. */
+:root[data-skin="classic"] button:focus-visible {
+  outline: 1px dotted var(--fg);
+  outline-offset: -4px;
+}
+:root[data-skin="classic"] :focus-visible {
+  box-shadow: none;
+}
+:root[data-skin="classic"] button.primary:focus-visible,
+:root[data-skin="classic"] button.danger:focus-visible {
+  box-shadow: 0 0 0 1px var(--bevel-dark);
+}
+:root[data-skin="classic"] a:focus-visible,
+:root[data-skin="classic"] summary:focus-visible,
+:root[data-skin="classic"] [tabindex]:focus-visible {
+  outline: 1px dotted var(--fg);
+  outline-offset: 1px;
+}
+
+/* ---- Fields ---------------------------------------------------------- */
+
+:where(:root[data-skin="classic"]) input[type="text"],
+:where(:root[data-skin="classic"]) input[type="search"],
+:where(:root[data-skin="classic"]) input[type="number"],
+:where(:root[data-skin="classic"]) input[type="date"],
+:where(:root[data-skin="classic"]) input[type="email"],
+:where(:root[data-skin="classic"]) input[type="password"],
+:where(:root[data-skin="classic"]) input[type="url"],
+:where(:root[data-skin="classic"]) input:not([type]),
+:where(:root[data-skin="classic"]) textarea {
+  border: 1px solid;
+  border-color: var(--edge-sunken);
+  border-radius: 0;
+  background: var(--face-field);
+  color: var(--fg);
+}
+:where(:root[data-skin="classic"]) select {
+  appearance: none;
+  padding-right: 20px;
+  border: 1px solid;
+  border-color: var(--edge-sunken);
+  border-radius: 0;
+  /* The drop-down button is drawn into the field: a raised square with an arrow. */
+  background:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='17' viewBox='0 0 16 17'%3E%3Crect width='16' height='17' fill='%232f2f33'/%3E%3Cpath d='M0 0h16v1H1v15H0z' fill='%237a7a84'/%3E%3Cpath d='M1 1h14v1H2v13H1z' fill='%234e4e57'/%3E%3Cpath d='M0 16h16V0h-1v15H0z' fill='%2308080a'/%3E%3Cpath d='M1 15h14V1h-1v13H1z' fill='%231c1c20'/%3E%3Cpath d='M4 6h8l-4 4z' fill='%23e8e8ec'/%3E%3C/svg%3E")
+      right 1px center / 16px 17px no-repeat,
+    var(--face-field);
+  color: var(--fg);
+}
+:where(:root[data-skin="classic"]) select:disabled {
+  color: var(--fg-faint);
+}
+:where(:root[data-skin="classic"]) select option {
+  background: var(--bg-field);
+  color: var(--fg);
+}
+:where(:root[data-skin="classic"]) input:disabled,
+:where(:root[data-skin="classic"]) textarea:disabled {
+  color: var(--fg-faint);
+}
+:root[data-skin="classic"] input:focus-visible,
+:root[data-skin="classic"] select:focus-visible,
+:root[data-skin="classic"] textarea:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -3px;
+}
+:where(:root[data-skin="classic"]) ::placeholder {
+  color: var(--fg-faint);
+  opacity: 1;
+}
+
+/* Check boxes and radio buttons: real inputs, drawn by hand. */
+:where(:root[data-skin="classic"]) input[type="checkbox"],
+:where(:root[data-skin="classic"]) input[type="radio"] {
+  appearance: none;
+  position: relative;
+  flex: 0 0 auto;
+  width: 13px;
+  height: 13px;
+  margin: 2px 4px 2px 0;
+  padding: 0;
+  vertical-align: middle;
+  background: var(--bg-field);
+  border: 0;
+  border-radius: 0;
+  box-shadow: var(--bevel-sunken);
+  cursor: pointer;
+}
+:where(:root[data-skin="classic"]) input[type="radio"] {
+  border-radius: 50%;
+  box-shadow: inset 1px 1px 0 var(--bevel-dark), inset -1px -1px 0 var(--bevel-hi), inset 2px 2px 0 var(--bevel-shadow), inset -2px -2px 0 var(--bevel-light);
+}
+:where(:root[data-skin="classic"]) input[type="checkbox"]:checked::after {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 1px;
+  width: 3px;
+  height: 7px;
+  border: solid var(--fg);
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+:where(:root[data-skin="classic"]) input[type="checkbox"]:indeterminate::after {
+  content: "";
+  position: absolute;
+  left: 3px;
+  top: 5px;
+  width: 7px;
+  height: 3px;
+  background: var(--fg);
+}
+:where(:root[data-skin="classic"]) input[type="radio"]:checked::after {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 4px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--fg);
+}
+:where(:root[data-skin="classic"]) input[type="checkbox"]:disabled,
+:where(:root[data-skin="classic"]) input[type="radio"]:disabled {
+  opacity: 1;
+  background: var(--bg);
+  cursor: default;
+}
+:where(:root[data-skin="classic"]) input[type="checkbox"]:disabled:checked::after {
+  border-color: var(--fg-faint);
+}
+:where(:root[data-skin="classic"]) input[type="radio"]:disabled:checked::after {
+  background: var(--fg-faint);
+}
+:root[data-skin="classic"] input[type="checkbox"]:focus-visible,
+:root[data-skin="classic"] input[type="radio"]:focus-visible {
+  outline: 1px dotted var(--fg);
+  outline-offset: 2px;
+}
+
+/* Sliders keep the native control, tinted. */
+:where(:root[data-skin="classic"]) input[type="range"] {
+  accent-color: var(--bg-selected);
+}
+
+/* ---- Group boxes ------------------------------------------------------ */
+
+:where(:root[data-skin="classic"]) fieldset {
+  min-width: 0;
+  border: 1px solid var(--bevel-shadow);
+  border-radius: 0;
+  box-shadow: 1px 1px 0 var(--bevel-hi), inset 1px 1px 0 var(--bevel-hi);
+}
+:where(:root[data-skin="classic"]) legend {
+  padding: 0 3px;
+  background: var(--bg);
+}
+:where(:root[data-skin="classic"]) hr {
+  height: 0;
+  border: 0;
+  border-top: 1px solid var(--bevel-shadow);
+  border-bottom: 1px solid var(--bevel-hi);
+}
+:where(:root[data-skin="classic"]) progress {
+  appearance: none;
+  height: 16px;
+  border: 0;
+  box-shadow: var(--bevel-sunken);
+  background: var(--bg-field);
+}
+:where(:root[data-skin="classic"]) progress::-webkit-progress-bar {
+  background: var(--bg-field);
+}
+/* Segmented blocks, as the classic progress bar draws them. */
+:where(:root[data-skin="classic"]) progress::-webkit-progress-value {
+  background: repeating-linear-gradient(90deg, var(--bg-selected) 0 8px, transparent 8px 10px);
+}
+
+/* ---- Dialogs ----------------------------------------------------------- */
+
+:root[data-skin="classic"] .dialog-backdrop {
+  background: var(--bg-backdrop);
+}
+:root[data-skin="classic"] .dialog-panel:not(.dialog-bare) {
+  padding: 3px;
+  gap: 0;
+  overflow: hidden;
+  border-radius: 0;
+  background: var(--bg);
+  color: var(--fg);
+  box-shadow: var(--bevel-raised), var(--shadow-dialog);
+}
+:root[data-skin="classic"] .dialog-titlebar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  height: 22px;
+  padding: 0 2px 0 5px;
+  border-radius: 5px 5px 0 0;
+  background: linear-gradient(90deg, var(--title-from), var(--title-to));
+  color: var(--title-fg);
+}
+:root[data-skin="classic"] .dialog-titlebar.dialog-inactive {
+  background: linear-gradient(90deg, var(--title-inactive-from), var(--title-inactive-to));
+}
+:root[data-skin="classic"] .dialog-titlebar .dialog-title {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-large);
+  font-weight: 700;
+  color: var(--title-fg);
+  text-shadow: 1px 1px 0 rgb(0 0 0 / 45%);
+}
+/* The close box: a small raised square, always present. */
+:root[data-skin="classic"] .dialog-titlebar .manage-close {
+  position: static;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 16px;
+  height: 14px;
+  min-width: 0;
+  margin: 0;
+  padding: 0 0 1px;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--fg);
+  border: 1px solid;
+  border-color: var(--edge-raised);
+  background: var(--face-raised);
+}
+:root[data-skin="classic"] .dialog-titlebar .manage-close:active:not(:disabled) {
+  border-color: var(--edge-pressed);
+  background: var(--face-pressed);
+}
+:root[data-skin="classic"] .dialog-body {
+  padding: 12px 12px 6px;
+  gap: 12px;
+}
+:root[data-skin="classic"] .dialog-footer {
+  padding: 6px 12px 12px;
+  gap: 6px;
+}
+:root[data-skin="classic"] .dialog-footer > button {
+  min-width: 75px;
+}
+:root[data-skin="classic"] .dialog-body > .hint,
+:root[data-skin="classic"] .dialog-panel .hint {
+  color: var(--fg-muted);
+}
+
+/* ---- Menus ------------------------------------------------------------ */
+
+:root[data-skin="classic"] .context-menu {
+  padding: 2px;
+  border: 0;
+  background: var(--bg);
+  box-shadow: var(--bevel-raised), var(--shadow-menu);
+}
+:root[data-skin="classic"] .context-menu .item {
+  padding: 3px 16px 3px 4px;
+  color: var(--fg);
+}
+:root[data-skin="classic"] .context-menu .item:hover:not(:disabled),
+:root[data-skin="classic"] .context-menu .item:focus-visible {
+  background: var(--bg-selected);
+  color: var(--fg-on-selected);
+  outline: none;
+}
+:root[data-skin="classic"] .context-menu .item:hover:not(:disabled) .tick,
+:root[data-skin="classic"] .context-menu .item:hover:not(:disabled) .accel,
+:root[data-skin="classic"] .context-menu .item:focus-visible .tick,
+:root[data-skin="classic"] .context-menu .item:focus-visible .accel {
+  color: inherit;
+}
+:root[data-skin="classic"] .context-menu .item:disabled {
+  opacity: 1;
+  color: var(--fg-faint);
+  text-shadow: 1px 1px 0 var(--bevel-dark);
+}
+:root[data-skin="classic"] .context-menu .tick {
+  color: var(--fg);
+}
+:root[data-skin="classic"] .context-menu .sep {
+  margin: 3px 2px;
+  height: 0;
+  border: 0;
+  border-top: 1px solid var(--bevel-shadow);
+  border-bottom: 1px solid var(--bevel-hi);
+}
+:root[data-skin="classic"] .context-menu .empty {
+  opacity: 1;
+  color: var(--fg-faint);
+}
+
+/* ---- The library window ------------------------------------------------- */
+
+/* The toolbar is a coolbar: a raised strip whose buttons are flat until the pointer is over them. */
+:root[data-skin="classic"] .toolbar {
+  border-bottom: 0;
+  background: var(--bg);
+  box-shadow: inset 0 1px 0 var(--bevel-hi), inset 0 -1px 0 var(--bevel-shadow);
+}
+:root[data-skin="classic"] .tb-button {
+  border: 1px solid transparent;
+}
+:root[data-skin="classic"] .tb-button:hover:not(.disabled) {
+  background: none;
+  border-color: var(--edge-raised);
+  border-color: var(--bevel-hi) var(--bevel-shadow) var(--bevel-shadow) var(--bevel-hi);
+}
+:root[data-skin="classic"] .tb-button:active:not(.disabled),
+:root[data-skin="classic"] .tb-button.active {
+  background: var(--bg-active);
+  border-color: var(--bevel-shadow) var(--bevel-hi) var(--bevel-hi) var(--bevel-shadow);
+}
+:root[data-skin="classic"] .tb-button:hover .tb-chevron {
+  border-left-color: var(--bevel-shadow);
+}
+:root[data-skin="classic"] .tb-body,
+:root[data-skin="classic"] .tb-chevron {
+  box-shadow: none;
+}
+:root[data-skin="classic"] .tb-icon {
+  width: 16px;
+  height: 16px;
+}
+:root[data-skin="classic"] .toolbar button.active {
+  background: var(--bg-active);
+  color: var(--fg);
+  border-color: var(--edge-pressed);
+}
+:root[data-skin="classic"] .tb-sep {
+  flex-basis: 2px;
+  background: linear-gradient(90deg, var(--bevel-shadow) 50%, var(--bevel-hi) 50%);
+}
+:root[data-skin="classic"] .search {
+  border: 1px solid;
+  border-color: var(--edge-sunken);
+  background: var(--face-field);
+}
+:root[data-skin="classic"] .search:focus-within {
+  border-color: var(--edge-sunken);
+  box-shadow: none;
+  outline: 1px solid var(--accent);
+  outline-offset: -3px;
+}
+:root[data-skin="classic"] .search input {
+  box-shadow: none;
+  outline: none;
+}
+:root[data-skin="classic"] .in-field.active {
+  background: var(--bg-active);
+  color: var(--fg);
+  box-shadow: var(--bevel-thin-sunken);
+}
+:root[data-skin="classic"] .in-field:hover,
+:root[data-skin="classic"] .search-go:hover {
+  background: none;
+  box-shadow: var(--bevel-thin-raised);
+}
+:root[data-skin="classic"] .sort-chip,
+:root[data-skin="classic"] .filter-chip,
+:root[data-skin="classic"] .marks-indicator {
+  border: 1px solid;
+  border-color: var(--edge-sunken);
+  background: var(--bg-sunken);
+}
+:root[data-skin="classic"] .splitter {
+  background: var(--bg);
+}
+:root[data-skin="classic"] .splitter:hover,
+:root[data-skin="classic"] .splitter:active {
+  background: var(--bg-selected);
+}
+/* Side panels and the book list are sunken, like a list box. */
+:root[data-skin="classic"] .sidebar {
+  background: var(--bg-field);
+  box-shadow: var(--bevel-sunken);
+  margin: 2px 0 2px 2px;
+}
+:root[data-skin="classic"] .details-column {
+  border-left: 0;
+  background: var(--bg-field);
+  box-shadow: var(--bevel-sunken);
+  margin: 2px 2px 2px 0;
+}
+:root[data-skin="classic"] .grid-area {
+  padding: 2px;
+}
+:root[data-skin="classic"] .table-scroll {
+  padding: 2px;
+  background: var(--bg-field);
+  box-shadow: var(--bevel-sunken);
+}
+:root[data-skin="classic"] .status-bar {
+  gap: 3px;
+  padding: 2px 3px;
+  border-top: 0;
+  background: var(--bg);
+}
+:root[data-skin="classic"] .status-bar > span:not(.status-spacer),
+:root[data-skin="classic"] .status-bar > button {
+  min-height: 19px;
+  padding: 1px 8px;
+  display: inline-flex;
+  align-items: center;
+  box-shadow: var(--bevel-thin-sunken);
+  border: 0;
+  background: none;
+}
+:root[data-skin="classic"] .status-bar > button:hover {
+  background: var(--bg-hover);
+}
+:root[data-skin="classic"] .status-bar > .status-spacer {
+  flex: 1;
+}
+:root[data-skin="classic"] .status-sort,
+:root[data-skin="classic"] .status-sel {
+  opacity: 1;
+}
+:root[data-skin="classic"] .storage-banner {
+  border-bottom: 0;
+  box-shadow: var(--bevel-raised);
+}
+
+/* The book table. */
+:root[data-skin="classic"] .book-table thead th {
+  background: var(--bg);
+  border-bottom: 0;
+  box-shadow: var(--bevel-raised);
+  font-weight: 400;
+}
+:root[data-skin="classic"] .book-table thead th.drop-before {
+  box-shadow: inset 3px 0 0 var(--accent), var(--bevel-raised);
+}
+:root[data-skin="classic"] .book-table thead th.drop-after {
+  box-shadow: inset -3px 0 0 var(--accent), var(--bevel-raised);
+}
+:root[data-skin="classic"] .book-table tbody tr.selected td,
+:root[data-skin="classic"] .book-table tbody tr.selected a {
+  color: var(--fg-on-selected);
+}
+:root[data-skin="classic"] .book-table tbody tr:focus-visible {
+  outline: 1px dotted var(--fg-on-selected);
+  outline-offset: -2px;
+}
+:root[data-skin="classic"] .book-table tbody tr:hover:not(.selected) {
+  background: var(--accent-soft);
+}
+:root[data-skin="classic"] .cell-editor {
+  border-radius: 0;
+}
+
+/* ---- Panels, tabs, tables inside dialogs ------------------------------- */
+
+:root[data-skin="classic"] .pane,
+:root[data-skin="classic"] .plugin-preview,
+:root[data-skin="classic"] .plugin-row {
+  border: 1px solid var(--bevel-shadow);
+  box-shadow: 1px 1px 0 var(--bevel-hi), inset 1px 1px 0 var(--bevel-hi);
+}
+:root[data-skin="classic"] .pane > h3 {
+  font-size: var(--fs-medium);
+}
+/* Classic tabs: the active one stands a little proud and joins the page below. */
+:root[data-skin="classic"] .mode-tabs {
+  gap: 0;
+  align-items: flex-end;
+  padding: 0 2px;
+  border-bottom: 1px solid var(--bevel-hi);
+}
+:root[data-skin="classic"] .mode-tabs button {
+  height: 21px;
+  margin: 0 -1px -1px 0;
+  padding: 0 10px;
+  border: 1px solid;
+  border-color: var(--bevel-hi) var(--bevel-dark) transparent var(--bevel-hi);
+  border-radius: 3px 3px 0 0;
+  background: var(--bg);
+}
+:root[data-skin="classic"] .mode-tabs button.active {
+  position: relative;
+  z-index: 1;
+  height: 24px;
+  margin-bottom: -1px;
+  background: var(--bg);
+  font-weight: 400;
+  color: var(--fg);
+}
+:root[data-skin="classic"] .mode-tabs button.active:focus-visible {
+  outline-offset: -4px;
+}
+:root[data-skin="classic"] .trash-table-wrap {
+  border: 1px solid;
+  border-color: var(--edge-sunken);
+  background: var(--bg-field);
+}
+:root[data-skin="classic"] .dialog-panel table th {
+  font-weight: 400;
+}
+:root[data-skin="classic"] .dialog-panel details > summary {
+  cursor: pointer;
+}
+
+/* ---- Scrollbars --------------------------------------------------------- */
+
+:root[data-skin="classic"] ::-webkit-scrollbar {
+  width: 16px;
+  height: 16px;
+}
+/* The dithered track: alternate pixels of two close greys. */
+:root[data-skin="classic"] ::-webkit-scrollbar-track {
+  background-color: var(--bg);
+  background-image: conic-gradient(var(--bg-hover) 25%, var(--bg) 0 50%, var(--bg-hover) 0 75%, var(--bg) 0);
+  background-size: 2px 2px;
+}
+:root[data-skin="classic"] ::-webkit-scrollbar-track:active {
+  background-image: conic-gradient(var(--bg-field) 25%, var(--bg) 0 50%, var(--bg-field) 0 75%, var(--bg) 0);
+}
+:root[data-skin="classic"] ::-webkit-scrollbar-thumb {
+  background-color: var(--bg);
+  border: 1px solid;
+  border-color: var(--edge-raised);
+  box-shadow: inset 1px 1px 0 var(--bevel-light), inset -1px -1px 0 var(--bevel-shadow);
+}
+:root[data-skin="classic"] ::-webkit-scrollbar-corner {
+  background: var(--bg);
+}
+:root[data-skin="classic"] ::-webkit-scrollbar-button:single-button {
+  display: block;
+  width: 16px;
+  height: 16px;
+  background-color: var(--bg);
+  background-repeat: no-repeat;
+  background-position: center;
+  border: 1px solid;
+  border-color: var(--edge-raised);
+  box-shadow: inset 1px 1px 0 var(--bevel-light), inset -1px -1px 0 var(--bevel-shadow);
+}
+:root[data-skin="classic"] ::-webkit-scrollbar-button:single-button:active {
+  border-color: var(--edge-pressed);
+  box-shadow: inset 1px 1px 0 var(--bevel-shadow);
+}
+:root[data-skin="classic"] ::-webkit-scrollbar-button:single-button:vertical:decrement {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8'%3E%3Cpath d='M0 6h8L4 2z' fill='%23e8e8ec'/%3E%3C/svg%3E");
+}
+:root[data-skin="classic"] ::-webkit-scrollbar-button:single-button:vertical:increment {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8'%3E%3Cpath d='M0 2h8L4 6z' fill='%23e8e8ec'/%3E%3C/svg%3E");
+}
+:root[data-skin="classic"] ::-webkit-scrollbar-button:single-button:horizontal:decrement {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8'%3E%3Cpath d='M6 0v8L2 4z' fill='%23e8e8ec'/%3E%3C/svg%3E");
+}
+:root[data-skin="classic"] ::-webkit-scrollbar-button:single-button:horizontal:increment {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8'%3E%3Cpath d='M2 0v8l4-4z' fill='%23e8e8ec'/%3E%3C/svg%3E");
+}
+
+/* ---- Settings ------------------------------------------------------------ */
+
+/* A pane is a flex column, which would stretch a push button across it. */
+:root[data-skin="classic"] .pane > button {
+  align-self: flex-start;
+}

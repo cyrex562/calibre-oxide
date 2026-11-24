@@ -199,7 +199,7 @@ const imgStyle = computed(() => ({
   background: rgba(255, 255, 255, 0.12);
   color: #fff;
   border: 1px solid rgba(255, 255, 255, 0.25);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   padding: 0.25rem 0.7rem;
   cursor: pointer;
   font: inherit;

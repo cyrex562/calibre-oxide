@@ -706,7 +706,7 @@ function hint(column: BookColumn): string {
   display: inline-block;
   width: 60%;
   height: 0.7em;
-  border-radius: 3px;
+  border-radius: var(--radius);
   background: var(--border);
   vertical-align: middle;
 }
@@ -745,7 +745,7 @@ function hint(column: BookColumn): string {
   font-size: var(--fs-small);
   line-height: 1.3;
   padding: 0.15rem 0.45rem;
-  border-radius: 3px;
+  border-radius: var(--radius);
   white-space: normal;
   max-width: 320px;
 }

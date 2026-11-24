@@ -133,13 +133,13 @@ async function empty() {
     <p v-else-if="listing" class="hint">Nothing here.</p>
     <p v-else-if="!error" class="hint">Loading…</p>
 
-    <div class="trash-actions">
+    <template #footer>
       <button type="button" :disabled="busy || chosen.length === 0 || chosen.every((e) => e.problem !== null)" @click="restore">Restore{{ chosen.length ? ` (${chosen.length})` : "" }}</button>
       <button type="button" :disabled="busy || chosen.length === 0" @click="deleteForever">Delete permanently…</button>
       <button type="button" :disabled="busy || !listing || listing.count === 0" @click="empty">Empty trash…</button>
       <span class="trash-spacer"></span>
-      <button type="button" :disabled="busy" @click="emit('close')">Close</button>
-    </div>
+      <button type="button" class="primary" :disabled="busy" @click="emit('close')">Close</button>
+    </template>
   </Dialog>
 </template>
 
@@ -175,12 +175,6 @@ async function empty() {
 }
 .trash-table tbody tr.chosen {
   background: var(--bg-selected);
-}
-.trash-actions {
-  display: flex;
-  gap: 0.5rem;
-  margin-top: 0.75rem;
-  align-items: center;
 }
 .trash-spacer {
   flex: 1;

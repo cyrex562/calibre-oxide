@@ -12,12 +12,15 @@ const emit = defineEmits<{ close: []; submit: [] }>();
 <template>
   <Dialog title="New library" show-close :busy="busy" size="md" @close="emit('close')">
     <p class="hint">Name the library, then choose the folder to create it in. It opens straight away, empty and ready for books.</p>
-    <form class="manage-form" @submit.prevent="emit('submit')">
+    <form id="new-library-form" class="manage-form" @submit.prevent="emit('submit')">
       <input v-model="name" placeholder="Library name" :disabled="busy" autofocus />
-      <button type="submit" :disabled="busy || !name.trim()">
-        {{ busy ? "Creating…" : "Choose folder…" }}
-      </button>
     </form>
     <p v-if="error" class="error">{{ error }}</p>
+    <template #footer>
+      <button type="button" :disabled="busy" @click="emit('close')">Cancel</button>
+      <button type="submit" form="new-library-form" class="primary" :disabled="busy || !name.trim()">
+        {{ busy ? "Creating…" : "Choose folder…" }}
+      </button>
+    </template>
   </Dialog>
 </template>

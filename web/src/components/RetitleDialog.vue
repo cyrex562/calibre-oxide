@@ -78,10 +78,7 @@ function cancelRun() {
       <span v-if="state.renameFiles" class="hint">A template such as {title} or {title} - {authors}. A name already taken gets a number.</span>
     </fieldset>
 
-    <div class="retitle-buttons">
-      <button type="button" :disabled="busy" data-testid="find" @click="find">{{ state.phase === "finding" ? "Looking…" : state.rows.length > 0 ? "Find again" : "Find titles to fix" }}</button>
-      <span v-if="c.proposedIsStale()" class="hint" role="status">The file names below are for the old template; find again to refresh them. They follow the template when applied.</span>
-    </div>
+    <p v-if="c.proposedIsStale()" class="hint" role="status">The file names below are for the old template; find again to refresh them. They follow the template when applied.</p>
     <p v-if="state.error" class="error" role="alert">{{ state.error }}</p>
 
     <section v-if="state.phase === 'ready'" class="retitle-table" aria-label="Titles to fix" data-testid="table">
@@ -125,16 +122,10 @@ function cancelRun() {
           <span class="hint">Page {{ state.page + 1 }} of {{ pages }}</span>
           <button type="button" :disabled="state.page >= pages - 1" @click="c.setPage(state.page + 1)">Next</button>
         </div>
-        <div class="retitle-buttons">
-          <button type="button" class="primary" :disabled="busy || !c.canApply()" data-testid="apply" @click="run">Fix {{ checked.toLocaleString("en-US") }} title{{ checked === 1 ? "" : "s" }}</button>
-        </div>
       </template>
     </section>
 
-    <div v-if="state.phase === 'running'" class="retitle-buttons">
-      <p class="hint" role="status">{{ state.progress }}</p>
-      <button v-if="state.jobId !== null" type="button" @click="cancelRun">Cancel</button>
-    </div>
+    <p v-if="state.phase === 'running'" class="hint" role="status">{{ state.progress }}</p>
 
     <section v-if="state.report" class="retitle-done" aria-label="Result" data-testid="report">
       <p role="status">{{ describeReport(state.report) }}</p>
@@ -157,6 +148,12 @@ function cancelRun() {
         </li>
       </ul>
     </section>
+    <template #footer>
+      <button type="button" :disabled="busy" @click="emit('close')">Close</button>
+      <button v-if="state.phase === 'running' && state.jobId !== null" type="button" @click="cancelRun">Cancel</button>
+      <button type="button" :disabled="busy" data-testid="find" @click="find">{{ state.phase === "finding" ? "Looking…" : state.rows.length > 0 ? "Find again" : "Find titles to fix" }}</button>
+      <button v-if="state.phase === 'ready' && state.rows.length > 0" type="button" class="primary" :disabled="busy || !c.canApply()" data-testid="apply" @click="run">Fix {{ checked.toLocaleString("en-US") }} title{{ checked === 1 ? "" : "s" }}</button>
+    </template>
   </Dialog>
 </template>
 
@@ -175,13 +172,12 @@ h4 {
 }
 fieldset {
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   display: flex;
   flex-direction: column;
   gap: 0.3rem;
   padding: 0.5rem 0.75rem;
 }
-.retitle-buttons,
 .retitle-toolbar,
 .retitle-pager {
   display: flex;
@@ -191,7 +187,7 @@ fieldset {
 }
 .retitle-table {
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   padding: 0.6rem 0.8rem;
   display: flex;
   flex-direction: column;
@@ -234,7 +230,7 @@ td input.invalid {
 .badge {
   display: inline-block;
   padding: 0 0.4rem;
-  border-radius: 3px;
+  border-radius: var(--radius);
   border: 1px solid var(--border);
   font-size: var(--fs-body);
   white-space: nowrap;

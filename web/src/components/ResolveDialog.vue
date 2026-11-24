@@ -137,10 +137,6 @@ function cancelRun() {
 
     <p v-if="state.error" class="error" role="alert">{{ state.error }}</p>
 
-    <div class="resolve-buttons">
-      <button type="button" :disabled="busy || state.draft.tiers.length === 0" data-testid="preview-plan" @click="preview">{{ state.phase === "planning" ? "Working out the plan…" : "Preview plan…" }}</button>
-    </div>
-
     <section v-if="state.plan" class="resolve-plan" aria-label="The plan" data-testid="plan">
       <p>
         <strong>{{ describePlanTotals(state.plan.totals, state.plan.action) }}</strong>
@@ -159,12 +155,6 @@ function cancelRun() {
       </ul>
       <p v-for="s in state.plan.skipped" :key="s.group_id" class="hint">Skipped a group: {{ s.reason }}.</p>
       <p v-if="!state.plan.fully_restorable" class="hint warn">{{ state.plan.note }}</p>
-      <div class="resolve-buttons">
-        <button type="button" class="primary" :disabled="busy || state.plan.totals.groups === 0" data-testid="run-plan" @click="run">
-          {{ state.phase === "running" ? "Running…" : `Resolve ${state.plan.totals.groups.toLocaleString("en-US")} groups` }}
-        </button>
-        <button v-if="state.phase === 'running'" type="button" @click="cancelRun">Cancel</button>
-      </div>
       <p v-if="state.progress" class="hint" role="status">{{ state.progress }}</p>
     </section>
 
@@ -184,6 +174,14 @@ function cancelRun() {
         </li>
       </ul>
     </section>
+    <template #footer>
+      <button type="button" :disabled="busy" @click="emit('close')">Close</button>
+      <button v-if="state.phase === 'running'" type="button" @click="cancelRun">Cancel</button>
+      <button type="button" :disabled="busy || state.draft.tiers.length === 0" data-testid="preview-plan" @click="preview">{{ state.phase === "planning" ? "Working out the plan…" : "Preview plan…" }}</button>
+      <button v-if="state.plan" type="button" class="primary" :disabled="busy || state.plan.totals.groups === 0" data-testid="run-plan" @click="run">
+        {{ state.phase === "running" ? "Running…" : `Resolve ${state.plan.totals.groups.toLocaleString("en-US")} groups` }}
+      </button>
+    </template>
   </Dialog>
 </template>
 
@@ -205,7 +203,7 @@ h4 {
 }
 fieldset {
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   display: flex;
   flex-direction: column;
   gap: 0.3rem;
@@ -227,13 +225,9 @@ fieldset {
 .resolve-row .grow {
   flex: 1;
 }
-.resolve-buttons {
-  display: flex;
-  gap: 0.5rem;
-}
 .resolve-plan {
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   padding: 0.6rem 0.8rem;
   display: flex;
   flex-direction: column;

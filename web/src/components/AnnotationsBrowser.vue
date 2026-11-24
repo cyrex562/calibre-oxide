@@ -61,7 +61,6 @@ onMounted(load);
       </select>
       <input v-model="search" type="search" placeholder="Filter…" :disabled="loading" />
       <button type="button" :disabled="loading" @click="load">{{ loading ? "Loading…" : "Refresh" }}</button>
-      <button type="button" @click="emit('close')">Close</button>
     </div>
 
     <p v-if="error" class="error">{{ error }}</p>
@@ -77,6 +76,9 @@ onMounted(load);
         <span class="annot-date">{{ formatDate(a.timestamp) }}</span>
       </li>
     </ul>
+    <template #footer>
+      <button type="button" @click="emit('close')">Close</button>
+    </template>
   </Dialog>
 </template>
 
