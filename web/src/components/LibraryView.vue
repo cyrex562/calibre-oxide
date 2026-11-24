@@ -648,7 +648,7 @@ function openCompareForSelection() {
 const organizeController = createOrganizeController();
 const organizeOpen = ref(false);
 /** Organize files: the selected books when there are any (select mode), else the open book is not assumed. */
-const organizeSelection = computed(() => [...selectedIds.value]);
+const organizeSelection = computed(() => scope.ids.value);
 async function openOrganize(prefill?: { template: string; scope: "selected" | "all" }) {
   organizeController.open(organizeSelection.value.length);
   if (prefill) {
