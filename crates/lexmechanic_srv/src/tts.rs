@@ -84,7 +84,8 @@ pub async fn synthesize(State(state): State<AppState>, Json(body): Json<Synthesi
         return Err(ServerError::BadRequest("text must not be empty".to_string()));
     }
     let Some(voice) = state.tts_voice.clone() else {
-        return Err(ServerError::ServiceUnavailable("TTS is not configured on this server -- start it with --tts-voice <path-to-voice.onnx>".to_string()));
+        // The flag that turns it on is for whoever runs the server, not for the reader.
+        return Err(ServerError::FeatureDisabled { code: "tts_not_configured", message: "Read aloud is not set up on this server.".to_string() });
     };
 
     let wav = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {

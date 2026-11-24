@@ -91,6 +91,11 @@ export const PDF_ASSET_OPTIONS = {
   standardFontDataUrl: "/pdfjs/standard_fonts/",
   cMapUrl: "/pdfjs/cmaps/",
   cMapPacked: true,
+  // `/get/pdf/{id}` answers Range requests (206), so a big PDF on a NAS shows
+  // its first page without downloading the whole file: fetch in 1 MiB pieces,
+  // and only the pieces a page needs (no background download of the rest).
+  rangeChunkSize: 1 << 20,
+  disableAutoFetch: true,
 } as const;
 
 /**

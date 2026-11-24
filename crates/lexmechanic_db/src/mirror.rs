@@ -137,6 +137,11 @@ pub fn is_excluded(rel: &str) -> bool {
     if parts.len() == 1 && (*name == MANIFEST_NAME || *name == LEGACY_MANIFEST_NAME) {
         return true;
     }
+    // The pre-rename state folder is migrated into `.lexmechanic` on open; a
+    // leftover one is never copied.
+    if parts[0] == crate::constants::LEGACY_LIBRARY_HANDLE_DIR_NAME {
+        return true;
+    }
     if parts[0] == LIBRARY_HANDLE_DIR_NAME {
         if let Some(inside) = parts.get(1) {
             if EXCLUDED_STATE.contains(inside) || (parts.len() == 2 && inside.ends_with(".partial")) {
@@ -148,6 +153,13 @@ pub fn is_excluded(rel: &str) -> bool {
         return true;
     }
     ["-wal", "-shm", "-journal"].iter().any(|suffix| name.strip_suffix(suffix).is_some_and(|base| base.ends_with(".db")))
+}
+
+/// A change-log history snapshot (`.lexmechanic/snapshots/*`). Its name changes
+/// whenever the library's history does, so a refresh writes the new one and drops
+/// the old one; that is internal bookkeeping the user should never see or confirm.
+fn is_history_snapshot(rel: &str) -> bool {
+    rel.replace('\\', "/").to_ascii_lowercase().starts_with(&format!("{LIBRARY_HANDLE_DIR_NAME}/snapshots/"))
 }
 
 /// A consistent copy of a SQLite database at `dest` (`VACUUM INTO`: one read
@@ -1322,6 +1334,9 @@ fn totals_of(items: &[PlanItem]) -> Totals {
                 bump(&mut t.unchanged);
                 bump(&mut kind.unchanged);
             }
+            // An older history snapshot being replaced is housekeeping, not a
+            // file the user lost: never in "to remove", never a confirmation.
+            Action::Remove if is_history_snapshot(&item.rel) => {}
             Action::Remove => {
                 bump(&mut t.remove);
                 bump(&mut kind.remove);
@@ -1459,6 +1474,12 @@ fn copy_one(item: &PlanItem, dest: &Path, tier: StorageTier, control: &JobContro
 /// it leaves empty.
 fn set_aside(target: &Path, rel: &str, run_id: &str) -> io::Result<()> {
     let from = abs(target, rel);
+    if is_history_snapshot(rel) {
+        // An older history snapshot, replaced by the one this run writes: internal
+        // state, not the user's file. Deleted outright; parking a library-sized
+        // snapshot in `.mirror-trash` on every refresh would fill the copy's disk.
+        return fs::remove_file(&from);
+    }
     let to = abs(&target.join(MIRROR_TRASH_DIR).join(run_id), rel);
     if let Some(parent) = to.parent() {
         fs::create_dir_all(parent)?;
@@ -1597,7 +1618,9 @@ fn execute_inner(_cache: &Cache, plan: &MirrorPlan, control: &JobControl, checkp
             match set_aside(target, &item.rel, &run_id) {
                 Ok(()) => {
                     entries.remove(&item.rel);
-                    report.removed += 1;
+                    if !is_history_snapshot(&item.rel) {
+                        report.removed += 1;
+                    }
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
                     entries.remove(&item.rel);
@@ -2148,6 +2171,37 @@ mod tests {
         assert!(report.complete && report.edits_set_aside > 0, "{report:?}");
         let copy = Cache::new(target.path()).unwrap();
         assert_ne!(copy.field_for(ids[0], "rating").unwrap().as_deref(), Some("10"));
+    }
+
+    /// A refresh after any edit gives the copy's baseline snapshot a new name.
+    /// Dropping the old one is internal housekeeping: not "to remove", no
+    /// confirmation, and nothing parked in `.mirror-trash`.
+    #[test]
+    fn a_replaced_history_snapshot_is_not_a_removal_and_is_not_trashed() {
+        let (_dir, cache, _s, ids) = sample();
+        let target = target_dir();
+        let opts = travel_opts(MirrorScope::All);
+        run(&cache, target.path(), &opts);
+        let before = cache.field_for(ids[1], "rating").unwrap();
+        cache.set_field(ids[1], "rating", "2").unwrap();
+        cache.set_field(ids[1], "rating", before.as_deref().unwrap_or("")).unwrap();
+
+        let plan = plan(&cache, target.path().to_str().unwrap(), &opts).unwrap();
+        let old: Vec<&PlanItem> = plan.items.iter().filter(|i| i.rel.contains("/snapshots/") && i.action == Action::Remove).collect();
+        assert!(!old.is_empty(), "the old baseline is dropped: {:?}", plan.items.iter().map(|i| (&i.rel, i.action)).collect::<Vec<_>>());
+        assert_eq!(plan.totals.remove.files, 0, "{:?}", plan.totals);
+        let report = execute(&cache, &plan, &JobControl::new()).unwrap();
+        assert_eq!(report.removed, 0);
+        assert!(report.trash.is_none(), "{report:?}");
+        assert!(!target.path().join(MIRROR_TRASH_DIR).exists());
+        assert!(old.iter().all(|i| !target.path().join(&i.rel).exists()), "the old snapshot is gone");
+    }
+
+    #[test]
+    fn a_leftover_pre_rename_state_folder_is_never_copied() {
+        assert!(is_excluded(".calibre-oxide/snapshots/1.jsonl"));
+        assert!(is_excluded(".calibre-oxide"));
+        assert!(!is_excluded(".lexmechanic/covers/a.jpg"));
     }
 
     #[test]

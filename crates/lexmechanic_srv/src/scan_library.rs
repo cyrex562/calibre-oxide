@@ -556,6 +556,29 @@ mod tests {
         assert_eq!(ajax["title"], "Real Title", "{ajax}");
     }
 
+    /// Analyze (prepare) must never add books: untracked files in the folder
+    /// (a note, a stray PDF) are counted, not imported.
+    #[tokio::test]
+    async fn prepare_never_imports_untracked_files() {
+        let (dir, router) = test_app();
+        html_book(dir.path(), "tracked.html", "Tracked");
+        post_json(&router, "/scan-library/default?wait=true").await;
+        let books = |v: &serde_json::Value| v["book_ids"].as_array().map(|a| a.len());
+        let (_, before) = get_json(&router, "/ajax/search?num=100").await;
+        let n_before = books(&before);
+        std::fs::write(dir.path().join("stray notes.txt"), b"just a note").unwrap();
+        make_settled(&dir.path().join("stray notes.txt"));
+        std::fs::write(dir.path().join("stray.pdf"), b"%PDF-1.4 stray").unwrap();
+        make_settled(&dir.path().join("stray.pdf"));
+        let (status, body) = post_json(&router, "/prepare-library/default?wait=true").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["stages"]["scan"]["added"].as_array().unwrap().len(), 0, "{body}");
+        assert!(body["stages"]["scan"]["untracked"].as_u64().unwrap() >= 1, "{body}");
+        let (_, after) = get_json(&router, "/ajax/search?num=100").await;
+        assert_eq!(books(&after), n_before, "prepare added books: {after}");
+        assert_eq!(after["total_num"], before["total_num"], "{after}");
+    }
+
     /// The chained job runs every stage, and a rerun picks up at the stage the
     /// last one reached.
     #[tokio::test]
@@ -570,7 +593,9 @@ mod tests {
         for stage in ["scan", "hash", "fingerprint", "dedupe"] {
             assert!(body["stages"][stage].is_object(), "no {stage} in {body}");
         }
-        assert_eq!(body["stages"]["scan"]["added"].as_array().unwrap().len(), 1, "{body}");
+        // Preparing never imports: the scan stage only counts what is untracked.
+        assert_eq!(body["stages"]["scan"]["added"].as_array().unwrap().len(), 0, "{body}");
+        assert_eq!(body["stages"]["scan"]["untracked"], 1, "{body}");
         let (_, status_body) = get_json(&router, "/prepare-library/default").await;
         assert_eq!(status_body["stage"], "scan", "a finished chain starts over at the scan: {status_body}");
 
