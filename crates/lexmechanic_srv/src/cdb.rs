@@ -583,11 +583,20 @@ async fn set_fields_handle(state: AppState, book_id: i32, library_id: Option<Str
     // both are still accepted (and validated) for request-shape
     // compatibility, they just can't change the answer in this port.
     let _ = (loaded_book_ids, all_dirtied);
-    let rows = crate::ajax::fetch_rows_from_cache(cache, std::iter::once(book_id).collect()).await?;
+    let rows = crate::ajax::fetch_rows_from_cache(cache.clone(), std::iter::once(book_id).collect()).await?;
+    // The web table replaces its row with this one, so it carries the same
+    // file fields (`size`, `folder`, `file_name`) as `/ajax/books?files=1`:
+    // without them the Size, Folder and File name columns went blank after
+    // an edit. They can also change here (a title edit renames the files).
+    let mut shaped: Vec<Value> = rows.iter().map(book_json).collect();
+    let shaped = tokio::task::spawn_blocking(move || crate::ajax::add_file_fields(&cache, &mut shaped).map(|_| shaped))
+        .await
+        .map_err(|e| ServerError::InternalServerError(e.to_string()))?
+        .map_err(|e| ServerError::InternalServerError(e.to_string()))?;
     let mut ans = serde_json::Map::new();
-    for row in rows {
+    for row in shaped {
         let id = row["id"].as_i64().unwrap_or(0);
-        ans.insert(id.to_string(), book_json(&row));
+        ans.insert(id.to_string(), row);
     }
     web_socket::publish(&state, ChangeEvent::MetadataChanged { book_ids: vec![book_id] });
     Ok(Json(Value::Object(ans)))
@@ -1809,6 +1818,19 @@ mod tests {
 
         let (_, book) = get_json(&router, "/ajax/book/1").await;
         assert_eq!(book["title"], "New Title");
+    }
+
+    #[tokio::test]
+    async fn set_fields_returns_the_file_fields_the_table_columns_show() {
+        let (_dir, router) = test_app(1);
+        let (_, listed) = get_json(&router, "/ajax/books?ids=1&files=1").await;
+        let before = &listed["1"];
+        assert!(before["size"].is_number(), "fixture has a sized format: {before}");
+        let (status, body) = post_json(&router, "/cdb/set-fields/1", serde_json::json!({"changes": {"publisher": "Acme"}})).await;
+        assert_eq!(status, StatusCode::OK, "got: {body}");
+        for field in ["size", "folder", "file_name"] {
+            assert_eq!(body["1"][field], before[field], "{field} kept after an edit: {body}");
+        }
     }
 
     #[tokio::test]
