@@ -490,7 +490,7 @@ pub struct BooksQuery {
 /// to the library root) and `file_name` (primary format's `stem.ext`) to each
 /// row of `rows`. All three come from in-memory tables and one `IN` query, with
 /// no stat of the disk, so a page of 100 books costs the same on a NAS.
-fn add_file_fields(cache: &lexmechanic_db::cache::Cache, rows: &mut [Value]) -> anyhow::Result<()> {
+pub(crate) fn add_file_fields(cache: &lexmechanic_db::cache::Cache, rows: &mut [Value]) -> anyhow::Result<()> {
     let ids: Vec<i32> = rows.iter().filter_map(|r| r["id"].as_i64()).map(|i| i as i32).collect();
     let names = cache.primary_file_names(Some(&ids))?;
     let store = cache.fields()?;
