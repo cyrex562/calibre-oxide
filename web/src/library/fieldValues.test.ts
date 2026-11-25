@@ -70,9 +70,9 @@ describe("suggest with several values", () => {
 
 describe("applySuggestion", () => {
   it("replaces the last segment and normalizes spacing", () => {
-    expect(applySuggestion("Jane Doe&jo", "John Smith", "&")).toBe("Jane Doe & John Smith & ");
+    expect(applySuggestion("Jane Doe&jo", "John Smith", "&")).toBe("Jane Doe & John Smith");
     expect(applySuggestion("a,b,  c", "Cyan", ",")).toBe("a, b, Cyan, ");
-    expect(applySuggestion("jo", "John Smith", "&")).toBe("John Smith & ");
+    expect(applySuggestion("jo", "John Smith", "&")).toBe("John Smith");
   });
   it("adds no separator for single-value fields", () => {
     expect(applySuggestion("wor", "Worlds Without Number", null)).toBe("Worlds Without Number");

@@ -476,7 +476,17 @@ async function finishEdit(then: "stay" | "next" | "prev" = "stay") {
   editing.value = null;
   if (then !== "stay") {
     const nextKey = neighbourEditableKey(props.columns, state.key, then === "next" ? 1 : -1);
-    if (nextKey) startEdit(state.id, nextKey);
+    if (!nextKey) {
+      void nextTick(() => focusCurrent());
+      return;
+    }
+    startEdit(state.id, nextKey);
+    // The saved cell's editor is removed in the next render, and a real
+    // browser fires its blur as it goes. That blur belongs to the edit just
+    // saved: without this it would save and close the editor that Tab opened.
+    closing = true;
+    await nextTick();
+    closing = false;
   }
 }
 
@@ -734,6 +744,10 @@ function hint(column: BookColumn): string {
 .cell-editor {
   box-sizing: border-box;
   width: 100%;
+  /* Date pickers and selects have a wide built-in minimum: keep them inside
+     their column, so the next cell stays clickable. */
+  min-width: 0;
+  max-width: 100%;
   height: 26px;
   font: inherit;
   padding: 0 0.4rem;

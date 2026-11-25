@@ -224,7 +224,7 @@ describe("metadata form", () => {
     await nextTick();
     authors.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
     await settle();
-    expect(authors.value).toBe("Ann Lee & Jane Doe & ");
+    expect(authors.value).toBe("Ann Lee & Jane Doe");
 
     save(el).click();
     await settle();

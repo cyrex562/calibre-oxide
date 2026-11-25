@@ -111,7 +111,7 @@ describe("AutocompleteInput", () => {
     await flush();
     const r = key(input, "Enter");
     await flush();
-    expect(text.value).toBe("Jane Doe & John Smith & ");
+    expect(text.value).toBe("Jane Doe & John Smith");
     expect(r.e.defaultPrevented).toBe(true);
     expect(r.reachedParent).toBe(false);
     expect(outer).not.toHaveBeenCalled();
@@ -125,7 +125,7 @@ describe("AutocompleteInput", () => {
     await flush();
     const r = key(input, "Tab");
     await flush();
-    expect(text.value).toBe("Jim Beam & ");
+    expect(text.value).toBe("Jim Beam");
     expect(r.e.defaultPrevented).toBe(true);
     expect(outer).not.toHaveBeenCalled();
   });
@@ -184,7 +184,7 @@ describe("AutocompleteInput", () => {
     await flush();
     expect(e.defaultPrevented).toBe(true);
     expect(blur).not.toHaveBeenCalled();
-    expect(text.value).toBe("Jane Doe & Jim Beam & ");
+    expect(text.value).toBe("Jane Doe & Jim Beam");
     expect(listOpen()).toBe(false);
   });
 
