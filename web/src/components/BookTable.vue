@@ -741,7 +741,10 @@ function hint(column: BookColumn): string {
   overflow: visible;
   position: relative;
 }
-.cell-editor {
+/* :deep so it also reaches AutocompleteInput's <input> (Authors, Publisher,
+   Series, Tags), which carries no scope attribute: without it that editor
+   kept the browser's default ~157px width and covered the next columns. */
+.book-table :deep(.cell-editor) {
   box-sizing: border-box;
   width: 100%;
   /* Date pickers and selects have a wide built-in minimum: keep them inside
@@ -752,7 +755,7 @@ function hint(column: BookColumn): string {
   font: inherit;
   padding: 0 0.4rem;
 }
-.book-table td.has-error .cell-editor {
+.book-table td.has-error :deep(.cell-editor) {
   outline: 2px solid var(--danger);
 }
 .cell-error {
