@@ -481,6 +481,25 @@ describe("editing in place", () => {
     expect(cell(el, 0, 1).querySelector("input.cell-editor")).not.toBeNull();
   });
 
+  it("Tab keeps the next editor open when the old one's removal fires blur, as browsers do", async () => {
+    const { el } = mountEditable([book(1, { title: "Same" })], async (id) => book(id));
+    // jsdom does not blur an element as it is removed; a real browser does.
+    const original = Node.prototype.removeChild;
+    Node.prototype.removeChild = function <T extends Node>(this: Node, child: T): T {
+      if (child instanceof HTMLElement && child.matches("input.cell-editor")) child.dispatchEvent(new Event("blur"));
+      return original.call(this, child) as T;
+    };
+    try {
+      cell(el, 0, 0).dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+      await nextTick();
+      type(el, "Same", "Tab");
+      await flush();
+      expect(cell(el, 0, 1).querySelector("input.cell-editor")).not.toBeNull();
+    } finally {
+      Node.prototype.removeChild = original;
+    }
+  });
+
   it("blur with an unchanged value closes the editor without calling the API", async () => {
     let calls = 0;
     const { el } = mountEditable([book(1, { title: "Same" })], async () => ((calls += 1), book(1)));
@@ -585,7 +604,7 @@ describe("suggestions while editing in place", () => {
     press(input, "Enter");
     await flush();
     expect(calls).toEqual([]);
-    expect(input.value).toBe("Ann Lee & John Smith & ");
+    expect(input.value).toBe("Ann Lee & John Smith");
     press(input, "Enter");
     await flush();
     expect(calls).toEqual([{ authors: ["Ann Lee", "John Smith"] }]);

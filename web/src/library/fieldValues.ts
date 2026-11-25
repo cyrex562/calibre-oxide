@@ -238,7 +238,10 @@ export function applySuggestion(text: string, value: string, separator: string |
   if (!separator) return value;
   const { before } = splitSegments(text, separator);
   const glue = separator === "&" ? " & " : ", ";
-  return [...before, value].join(glue) + glue;
+  // Authors get no trailing " & ": most books have one, and a dangling
+  // separator reads as a missing second author. Type "&" to add another.
+  // Tags keep calibre's trailing ", " since several are the norm.
+  return [...before, value].join(glue) + (separator === "&" ? "" : glue);
 }
 
 // ---------------------------------------------------------------

@@ -84,10 +84,11 @@ use pdfium_render::prelude::{PdfRenderConfig, Pdfium};
 /// than a thumbnail that looks soft at any useful size.
 pub const DEFAULT_COVER_WIDTH: u32 = 1000;
 
-/// Width the library scan renders PDF covers at. Plenty for the cover grid and
-/// the detail pane, and a render at 600 is roughly a third cheaper than at
-/// 1000. Override with `LEXMECHANIC_SCAN_COVER_WIDTH`.
-pub const SCAN_COVER_WIDTH: u32 = 600;
+/// Width the library scan and import render PDF covers at: the same as
+/// [`DEFAULT_COVER_WIDTH`]. At 600 the small print on a cover was not
+/// legible once the cover was enlarged, which outweighs the render being
+/// about a third cheaper. Override with `LEXMECHANIC_SCAN_COVER_WIDTH`.
+pub const SCAN_COVER_WIDTH: u32 = DEFAULT_COVER_WIDTH;
 
 /// Upper bound on a render, so a bad number cannot reach the
 /// allocator. A letter page at this width is ~5,200px tall and ~83MB
